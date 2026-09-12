@@ -10,6 +10,12 @@
 #   migration      → supersedes a legacy <PR>.json that belongs to this repo
 #   collision-safe → does NOT delete a legacy <PR>.json from ANOTHER repo
 #   repo-less      → legacy <PR>.json (backward compat, no repo field)
+#   #633 stale-run → a re-record on an already-marker'd body re-runs the
+#                    head's NEWEST completed-RED gate check run (singular,
+#                    id-for-id with the rerun POST — the recency/livelock
+#                    guards in record-review.sh decide it), so the stale red
+#                    rollup row is replaced by a fresh attempt; fail-soft
+#                    when nothing to re-run / the API refuses
 
 set -euo pipefail
 
@@ -32,20 +38,39 @@ trap 'rm -rf "$T"' EXIT
 SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 
 # Stubbed gh: answers the stale-sha head query + PR-body read/PATCH + the
-# #513 clean-micro tier guard's body/labels queries.
-#   head    (--jq .head.sha)      → ${STUB_HEAD_SHA:-40×a}
-#   body    (--jq .body)          → {"body": "${STUB_BODY:-PR body}"}  (PR body text)
-#   labels  (--jq '.[].name')     → ${STUB_LABELS:-} lines, or the per-issue
+# #513 clean-micro tier guard's body/labels queries + the #633 stale-run
+# remediation's check-runs query + job rerun POST.
+#   head        (--jq .head.sha)   → ${STUB_HEAD_SHA:-40×a}
+#   body        (--jq .body)       → {"body": "${STUB_BODY:-PR body}"}  (PR body text)
+#   labels      (--jq '.[].name')  → ${STUB_LABELS:-} lines, or the per-issue
 #                                   file ${STUB_LABELS_DIR}/<issue-num> when it
 #                                   exists; exit 1 when STUB_LABELS_FAIL=1
-#   PATCH (-X PATCH … --input -)  → swallow stdin
+#   check-runs  (URL has /check-runs) → {"check_runs": ${STUB_CHECK_RUNS:-[]}}
+#                                   (RAW payload for ANY /check-runs call —
+#                                   ignores the script's -f check_name filter,
+#                                   so the LOCAL belt name filter in the
+#                                   script stays genuinely exercised; exit 1
+#                                   when STUB_CHECK_RUNS_FAIL=1)
+#   PATCH (-X PATCH … --input -)    → swallow stdin; exit 1 when
+#                                     STUB_PATCH_FAIL=1
+#   POST rerun (-X POST … /rerun)   → swallow stdin (201); exit 1 when
+#                                     STUB_RERUN_FAIL=1
 mkdir -p "$T/bin"
 cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
 if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
-    # PATCH body — read stdin, swallow
-    cat >/dev/null
+    # PATCH body / job rerun POST. Fail the evidence PATCH or the rerun on
+    # demand (#633 fail-soft + no-marker pins). Consume piped stdin (PATCH
+    # feeds it via --input -) WITHOUT blocking on an inherited terminal/stdin
+    # — the rerun POST pipes nothing, so a bare `cat` would hang the suite
+    # when run interactively.
+    if printf '%s' "$*" | grep -qF -- "/rerun"; then
+        [ "${STUB_RERUN_FAIL:-0}" = "1" ] && exit 1
+    elif printf '%s' "$*" | grep -qF -- "-X PATCH"; then
+        [ "${STUB_PATCH_FAIL:-0}" = "1" ] && exit 1
+    fi
+    if [ -t 0 ]; then :; else cat >/dev/null; fi
     exit 0
 fi
 if [ "$1" = "api" ]; then
@@ -65,6 +90,13 @@ if [ "$1" = "api" ]; then
             exit 0
         fi
         printf '%s\n' "${STUB_LABELS:-}"
+        exit 0
+    fi
+    if printf '%s' "$*" | grep -qF -- "/check-runs"; then
+        # RAW envelope — the script applies its own local jq (no --jq in
+        # argv). Exit 1 on demand to pin the #633 loud-API-failure path.
+        [ "${STUB_CHECK_RUNS_FAIL:-0}" = "1" ] && exit 1
+        printf '{"check_runs": %s}' "${STUB_CHECK_RUNS:-[]}"
         exit 0
     fi
     printf '{"body": "PR body"}' ; exit 0
@@ -94,6 +126,22 @@ run_record_rc() { # <repo-or-empty> <pr> <sha> — captures rc in $RECORD_RC
         else
             bash "$RECORD" "$pr" "$sha" clean || rc=$?
         fi
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+}
+
+run_record_stale() { # <repo> <pr> <sha> — records with --force-stale (head
+    # answers STUB_HEAD_SHA ≠ recorded sha, so the stale-sha guard would
+    # refuse without the flag). Captures rc in $RECORD_RC.
+    local repo="$1" pr="$2" sha="$3" rcfile="$T/rc"
+    : > "$LOG"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        rc=0
+        bash "$RECORD" "$pr" "$sha" clean "$repo" --force-stale || rc=$?
         printf '%s' "$rc" > "$rcfile"
     ) 2>/dev/null
     RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
@@ -276,12 +324,19 @@ STUB_BODY="Fixes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/424316" run
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
 
-# 8.10 clean verdict: ZERO extra gh calls (no labels query in the log).
+# 8.10 clean verdict call budget (#513/#568 + #633): no gh LABELS call and no
+# job rerun — the #633 remediation's check-runs query is bounded (no rerun
+# POST when nothing failed on the head).
 run_record "daniel-ospina/agent-infra" 424315
 if grep -q "labels" "$LOG"; then
     bad "clean verdict adds no gh labels call"
 else
     ok "clean verdict adds no gh labels call"
+fi
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "clean verdict adds no job rerun when nothing failed (log: $(cat "$LOG"))"
+else
+    ok "clean verdict adds no job rerun when nothing failed"
 fi
 
 # 8.11 parser-parity corpus (check-pipeline-compliance parse_issue_ref semantics).
@@ -301,6 +356,173 @@ assert_contains "$OUT" "#42" "parser: narrative prose-verb class matches (parse_
 run_record_verdict clean-micro "" 424316
 [ "$RECORD_RC" = "0" ] && ok "repo-less clean-micro fails open (rc 0)" || bad "repo-less clean-micro (rc=$RECORD_RC)"
 assert_contains "$RECORD_ERR" "UNVERIFIED" "repo-less clean-micro warns the tier is unverified"
+
+# #633: recompute the exact signed marker record-review.sh posts for a
+# PR/repo at $SHA under AI_REVIEW_GATE_KEY=testkey (same openssl call).
+signed_marker() { # <pr> <repo> [verdict]
+    local pr="$1" repo="$2" verdict="${3:-clean}" m sig
+    m="review recorded: reviews/${pr}.json verdict=${verdict} @ ${SHA} (${repo})"
+    sig="$(printf '%s' "$m" | openssl dgst -sha256 -hmac "testkey" 2>/dev/null | awk '{print $NF}')"
+    printf '%s sig=%s' "$m" "$sig"
+}
+
+echo "── 9. #633 stale gate-run remediation ───────────────────────────"
+# 9.1 Re-record on an already-marker'd body: the marker is present, so the
+#     body is left untouched (no PATCH — no body spam on re-record), but the
+#     completed-FAILURE gate job on the head MUST be re-run so the stale red
+#     rollup row is replaced by a fresh SUCCESS attempt. RED pre-fix: the old
+#     idempotency guard made a same-sha re-record a silent no-op (no PATCH, no
+#     edited event, no fresh gate run) — the documented remediation "re-run
+#     record-review.sh to retry" did nothing.
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":777}]' \
+AI_REVIEW_GATE_KEY="testkey" run_record "daniel-ospina/agent-infra" 424320
+if grep -qF -- "actions/jobs/777/rerun" "$LOG"; then
+    ok "9.1 re-record re-runs the stale FAILURE gate job (no more silent no-op)"
+else
+    bad "9.1 re-record re-runs the stale FAILURE gate job (log: $(cat "$LOG"))"
+fi
+if grep -qF -- "-X PATCH" "$LOG"; then
+    bad "9.1 re-record leaves the marker'd body untouched (no PATCH)"
+else
+    ok "9.1 re-record leaves the marker'd body untouched (no PATCH)"
+fi
+if grep -qF -- "commits/$SHA/check-runs" "$LOG"; then
+    ok "9.1 remediation queries the RECORDED head's check runs"
+else
+    bad "9.1 remediation queries the RECORDED head's check runs (log: $(cat "$LOG"))"
+fi
+
+# 9.2 Fresh record (marker absent) with a stale FAILURE on the head: posts
+#     the marker AND re-runs the failed gate job in the same call.
+STUB_BODY="PR body" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":778}]' \
+AI_REVIEW_GATE_KEY="testkey" run_record "daniel-ospina/agent-infra" 424321
+grep -qF -- "-X PATCH" "$LOG" && ok "9.2 fresh record still posts the marker" || bad "9.2 fresh record posts the marker (log: $(cat "$LOG"))"
+grep -qF -- "actions/jobs/778/rerun" "$LOG" && ok "9.2 fresh record also re-runs the stale FAILURE job" || bad "9.2 fresh record re-runs the stale FAILURE job (log: $(cat "$LOG"))"
+
+# 9.3 Nothing failed on the head → no rerun call (no needless Actions runs),
+#     marker still posted.
+STUB_BODY="PR body" STUB_CHECK_RUNS='[]' AI_REVIEW_GATE_KEY="testkey" run_record "daniel-ospina/agent-infra" 424322
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.3 no rerun when nothing failed (log: $(cat "$LOG"))"
+else
+    ok "9.3 no rerun when nothing failed"
+fi
+grep -qF -- "-X PATCH" "$LOG" && ok "9.3 marker still posted" || bad "9.3 marker still posted"
+
+# 9.4 A failed run of a DIFFERENT check name is never re-run (name filter) —
+#     and the zero-match case fires the loud rename hint on stderr: a wrong
+#     AI_REVIEW_GATE_CHECK_NAME must not read as "nothing to remediate".
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='[{"name":"other-gate","status":"completed","conclusion":"failure","id":779}]' \
+AI_REVIEW_GATE_KEY="testkey" run_record_verdict clean "daniel-ospina/agent-infra" 424320
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.4 foreign check name not re-run (log: $(cat "$LOG"))"
+else
+    ok "9.4 foreign check name not re-run"
+fi
+assert_contains "$RECORD_ERR" "no check run named 'ai-review-gate'" "9.4 zero-match fires the loud rename hint"
+
+# 9.5 Rerun API refusal → fail-soft: record saved, exit 0, loud warning.
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":780}]' \
+STUB_RERUN_FAIL=1 AI_REVIEW_GATE_KEY="testkey" run_record_verdict clean "daniel-ospina/agent-infra" 424323
+[ "$RECORD_RC" = "0" ] && ok "9.5 rerun refusal fails soft (rc 0, record saved)" || bad "9.5 rerun refusal fails soft (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424323.json" ] && ok "9.5 record written despite rerun refusal" || bad "9.5 record written despite rerun refusal"
+assert_contains "$RECORD_ERR" "could not re-run stale" "9.5 refusal warns on stderr"
+
+# 9.6 Recency guard: a newer SUCCESS for the gate name on the same head
+#     already satisfies the required check — the normal green end-state — so
+#     the older FAILURE must NOT trigger a rerun (no needless Actions churn
+#     on every re-record of an already-green head; matches diagnosis #1 that
+#     the FAILURE+SUCCESS pair is harmless).
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":100},{"name":"ai-review-gate","status":"completed","conclusion":"success","id":200}]' \
+AI_REVIEW_GATE_KEY="testkey" run_record "daniel-ospina/agent-infra" 424320
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.6 newer SUCCESS suppresses the rerun (log: $(cat "$LOG"))"
+else
+    ok "9.6 newer SUCCESS suppresses the rerun"
+fi
+
+# 9.7 --force-stale is never remediated: a deliberately stale sha's gate
+#     state is unresolvable by design (#2133 escape hatch), and a rerun in
+#     the PR's per-PR concurrency group could cancel the REAL head's
+#     in-flight gate run — so force-stale records skip the remediation
+#     entirely (no check-runs query, no rerun) but still save the record.
+STUB_HEAD_SHA="$(printf 'c%.0s' $(seq 1 40))" \
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":300}]' \
+AI_REVIEW_GATE_KEY="testkey" run_record_stale "daniel-ospina/agent-infra" 424320 "$(printf 'b%.0s' $(seq 1 40))"
+[ "$RECORD_RC" = "0" ] && ok "9.7 force-stale record still saves (rc 0)" || bad "9.7 force-stale record still saves (rc=$RECORD_RC)"
+if grep -qF -- "/check-runs" "$LOG" || grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.7 force-stale skips the stale-run remediation (log: $(cat "$LOG"))"
+else
+    ok "9.7 force-stale skips the stale-run remediation"
+fi
+
+# 9.8 check-runs query failure (gh/API error): warns LOUDLY on stderr and
+#     skips the rerun — a transient API failure must never read as "no red
+#     run" (the #405 silent-no-op class, one level down). Record still saves,
+#     exit 0 (best-effort).
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":400}]' \
+STUB_CHECK_RUNS_FAIL=1 AI_REVIEW_GATE_KEY="testkey" run_record_verdict clean "daniel-ospina/agent-infra" 424324
+[ "$RECORD_RC" = "0" ] && ok "9.8 check-runs query failure fails soft (rc 0)" || bad "9.8 check-runs query failure fails soft (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424324.json" ] && ok "9.8 record written despite query failure" || bad "9.8 record written despite query failure"
+assert_contains "$RECORD_ERR" "could not read check runs" "9.8 query failure warns loudly on stderr"
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.8 no rerun on query failure (log: $(cat "$LOG"))"
+else
+    ok "9.8 no rerun on query failure"
+fi
+
+# 9.9 Livelock guard: when the newest run for the gate name is queued/
+#     in_progress (a rerun the remediation itself fired, or the `edited` run
+#     a fresh PATCH just started), the OLDER completed red run is NOT re-run —
+#     firing a second job would cancel the in-flight fresh run through the
+#     PR's per-PR concurrency group (cancel-in-progress) and self-perpetuate.
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":100},{"name":"ai-review-gate","status":"in_progress","conclusion":null,"id":900}]' \
+AI_REVIEW_GATE_KEY="testkey" run_record "daniel-ospina/agent-infra" 424320
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.9 in-flight gate run suppresses the rerun (log: $(cat "$LOG"))"
+else
+    ok "9.9 in-flight gate run suppresses the rerun"
+fi
+
+# 9.10 No signed marker posted (evidence PATCH API failure) → remediation
+#      MUST NOT fire: a rerun of a marker-less body re-evaluates to a
+#      guaranteed red, churning Actions for nothing. Record still saves
+#      (best-effort).
+STUB_BODY="PR body — no review evidence yet" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":500}]' \
+STUB_PATCH_FAIL=1 AI_REVIEW_GATE_KEY="testkey" run_record_verdict clean "daniel-ospina/agent-infra" 424325
+[ "$RECORD_RC" = "0" ] && ok "9.10 PATCH failure still saves the record (rc 0)" || bad "9.10 PATCH failure saves record (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424325.json" ] && ok "9.10 record written despite PATCH failure" || bad "9.10 record written despite PATCH failure"
+assert_contains "$RECORD_ERR" "could not post review evidence" "9.10 PATCH failure notes on stderr"
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.10 no rerun without a posted marker (log: $(cat "$LOG"))"
+else
+    ok "9.10 no rerun without a posted marker"
+fi
+
+# 9.11 gh-200 whose payload fails the LOCAL jq stage (shape drift, broken
+#      jq): the parse failure warns loudly and skips — record saved, rc 0,
+#      no rerun. (9.8 pins the transport-failure stage; this pins the parse
+#      stage, which a bare `2>/dev/null || true` or a dropped `if !` guard
+#      would silently swallow or turn into an errexit kill after the save.)
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='{"check_runs": [BROKEN' AI_REVIEW_GATE_KEY="testkey" run_record_verdict clean "daniel-ospina/agent-infra" 424326
+[ "$RECORD_RC" = "0" ] && ok "9.11 unparseable payload fails soft (rc 0)" || bad "9.11 unparseable payload fails soft (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424326.json" ] && ok "9.11 record written despite parse failure" || bad "9.11 record written despite parse failure"
+assert_contains "$RECORD_ERR" "could not parse the check-runs payload" "9.11 parse failure warns loudly on stderr"
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.11 no rerun on parse failure (log: $(cat "$LOG"))"
+else
+    ok "9.11 no rerun on parse failure"
+fi
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
