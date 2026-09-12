@@ -465,6 +465,44 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 - The gate extracts file paths from the prompt, not the response — make sure paths are correct
 - `ELDATO_SKIP_VGATE=1` at session start disables this gate entirely (`AGENT_ALLOW_MAIN_EDITS=1` no longer does — #7470)
 
+### Scope subtraction (#755)
+
+VGATE **subtracts** a path from the scope it asks you to verify when that path's
+recorded entry is byte-identical to the same path's blob in the named trusted base
+(`refs/remotes/<remote>/<branch>`, falling back to `refs/remotes/origin/main`).
+The **recorded entry** is per arm — there is no single answer, because the arms
+differ structurally rather than by a runtime flag:
+
+| arm | recorded entry |
+|---|---|
+| `staged` (bare commit) | the **index** blob |
+| `worktree` (sweep / `git commit -a`) | the **working-tree** entry |
+| `wtPath` (`git commit <pathspec>`) | the **working-tree** entry for the named paths |
+| `branch` (the `gh`/branch-chain arm) | **`HEAD`**'s blob |
+| `push` | the resolved **`srcRef`** OID. This equals `HEAD` for a bare push, for a no-colon `HEAD` refspec, and for a refspec whose *source* is the checked-out branch; it differs when the source names another branch, and the comparison then runs against that branch's blob. (A colon-form refspec like `HEAD:main` does not resolve at all and falls back to the staged scope.) |
+
+This is why a merge that pulls in a large upstream delta no longer demands verification
+coverage for every upstream file: recorded incidents went from 39 staged files to 5,
+48 to 6, and 14 to 0.
+
+- It **only narrows** what you are asked to verify. It never marks anything verified,
+  never writes to `verifiedSet` or the bridge, and never changes `clean`.
+- It is **fail-closed**: any probe that cannot be resolved (shallow clone, unresolvable
+  base, more than one merge base, unparseable diff output) ⇒ **no subtraction** ⇒ the
+  previous, larger scope. The failure mode is extra work, not a missed file.
+- It leaves a `gate_skip` line with `reason: base_identical_satisfied` naming the
+  subtracted paths, so an audit can always distinguish *verified* from *mechanically
+  discounted*.
+- **Ships always-on and is invisible in a PR diff** — you will not see it in a diff review.
+- **Opt out:** `ELDATO_VGATE_NO_SUBTRACT=1` restores the previous (larger) scope and is
+  audited as `subtract_disabled_by_env`. Unlike `ELDATO_SKIP_VGATE` this moves in the
+  **stricter** direction, so a task sub-agent is permitted to set it: it can cost time,
+  never coverage.
+
+Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
+`git push` (tier A only; the tier-B/C paths keep their pre-#755 behaviour). Tier-C push
+fallback and rebase/cherry-pick push-leg de-flooding (#737) are deliberate non-goals.
+
 ### VGATE ceremony diagnostics & recovery (#561)
 
 > Behavior change: after a [VGATE] dispatch that did NOT verify your files, the NEXT blocked git op appends a state-bearing diagnostics block naming the prior failure class + remedy + attempt count, escalating at the 3-strike threshold. If you see `⚠️ Previous VGATE dispatch did not verify these files (…)` or `⛔ Escalation: N consecutive malformed VGATE dispatches`, READ the remedy line — it tells you exactly what to fix; do NOT re-dispatch the same verifier shape blindly.
