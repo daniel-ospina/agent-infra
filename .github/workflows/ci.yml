@@ -138,6 +138,19 @@ jobs:
         run: python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Merge-scope subtraction suite (#755, SDK-free)
+        # #755 — zero-dependency by construction: subtract-scope.test.ts imports
+        # ./index.js as a TYPE only (erased by tsx) and drives real git in temp
+        # repos. It MUST run here, in the job that performs no `npm ci` — that is
+        # exactly the property being pinned. The parser row-family pins live in
+        # index.test.ts instead, which DOES need the SDK.
+        run: npx tsx extensions/verification-gate/subtract-scope.test.ts
+      - name: Merge-scope tripwire (#755)
+        # Zero-dep plain node: guards the deleted-symbol class, the one-statement-
+        # per-mechanism property for the seam and the reason vocabulary, and the
+        # two anchors the rule's safety depends on (`:2204`'s tracking, and the
+        # push/commit discrimination at the scope-resolution site).
+        run: node extensions/verification-gate/test-subtract-scope.mjs
       - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
         # VISIBLE, not merge-blocking (only pipeline-compliance is required).
         # The blocking backstop is ci-main.yml's extension-tests job, same

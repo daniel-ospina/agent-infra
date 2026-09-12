@@ -115,6 +115,11 @@ jobs:
           npx tsx extensions/verification-gate/index.test.ts || failures=$((failures+1))
         echo "== extensions/verification-gate/index.e2e.test.ts =="
         npx tsx extensions/verification-gate/index.e2e.test.ts || failures=$((failures+1))
+        # #755 — the merge-scope subtraction suite. SDK-FREE by construction
+        # (index.js is a TYPE-only import), so it runs off the npm ci above with
+        # no extra dependency.
+        echo "== extensions/verification-gate/subtract-scope.test.ts =="
+        npx tsx extensions/verification-gate/subtract-scope.test.ts || failures=$((failures+1))
         # #476 — provider-exhaustion failover suites (the shared/provider-failover*
         # suites are auto-picked by the shared glob above; the consumer-side
         # suites live under builtin-tools/ + the extension root). The parity suite
