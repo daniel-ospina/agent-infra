@@ -171,12 +171,15 @@ python `open()` ARE gated); **(c)** `bash /dev/stdin < script.sh`, where the
 script operand is a FIFO so the bounded walk reads nothing and the `<` operand
 is not reached. None of the three is in the `pi -p` fixer's ordinary path.
 
-Two fail-closed COSTS are accepted alongside them: a feeder-fed bare `git`
-(`printf 'status\n' | xargs git`) blocks while the tree is dirty, because a
-null-verb `git` under an `xargs`/`find -exec` feeder has its subcommand supplied
-at runtime and the textual probe for it was evadable (`printf 'check\'\'out -- f`,
-`printf 'check\x6fut -- f`); and an opaque `-c` payload sharing a command with a
-discard verb blocks even when the visible invocation is legitimate.
+Two fail-closed COSTS are accepted alongside them: any NULL-VERB `git` in a
+command that mentions a feeder (`printf 'status\n' | xargs git`, and even
+`echo 'use xargs to batch' && git --version`) blocks while the tree is dirty,
+because a null-verb `git` under an `xargs`/`find -exec` feeder has its
+subcommand supplied at runtime (the walker consumes terminal global flags, so
+`--version` is indistinguishable from the bare form) and the textual probe for
+it was evadable (`printf 'check\'\'out -- f`, `printf 'check\x6fut -- f`); and
+an opaque `-c` payload sharing a command with a discard verb blocks even when
+the visible invocation is legitimate.
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 

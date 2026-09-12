@@ -2544,6 +2544,11 @@ function _wtSubstSpans(text) {
 
 /** The verbs `extractWorkingTreeDiscards` keys on (a feeder-fed invocation of
  *  one of these with no resolvable pathspec is conservatively whole-tree). */
+/** Terminal global flags: `git --version` can NEVER take a feeder-supplied
+ *  subcommand (reviewer round-11 P2) — but the walker consumes such flags, so
+ *  the invocation arrives with EMPTY args and is indistinguishable from the
+ *  bare feeder-fed `git` this arm exists for. The narrow fail-closed cost is
+ *  documented in the README instead of guessed at here. */
 const _WT_FAMILY_VERBS = new Set(["checkout", "restore", "switch", "reset", "checkout-index", "rm", "read-tree", "apply"]);
 
 /**
@@ -2679,13 +2684,17 @@ export function joinContinuations(command) {
  */
 export function wtPipelineFeedsShell(command) {
   const STDIN_ALIAS = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
+  // A REDIRECTION is not an operand either (`… | bash 2>/dev/null` executes the
+  // pipe as code; treating `2>/dev/null` as a script operand silently disabled
+  // the whole arm — reviewer round-11 P0).
+  const REDIRECT = /^[0-9]*(?:>>?|<<?|<>|>&|<&|&>)/;
   return String(command ?? "").split("|").slice(1).some((seg) => {
     const head = _wtHeadInterpreter(seg);
     if (head === null) return false;
     const base = basename(String(head));
     const toks = _wtShellWords(seg);
     const idx = toks.findIndex((t) => basename(String(t)) === base);
-    return toks.slice(idx + 1).every((t) => t.startsWith("-") || STDIN_ALIAS.test(t));
+    return toks.slice(idx + 1).every((t) => t.startsWith("-") || STDIN_ALIAS.test(t) || REDIRECT.test(t));
   });
 }
 
@@ -2758,7 +2767,7 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
     // positionals and returns null (reviewer round-5 P2). When the command
     // carries a feeder and a family verb produced no descriptor, fall back to
     // the conservative whole-tree descriptor — the effect probe still decides.
-    if (/(?:^|[\s|;&(])xargs\b/.test(String(command ?? "")) || /\bfind\b[\s\S]*?-exec\b/.test(String(command ?? ""))) {
+    if (/(?:^|[\s|;&(])(?:[\w./-]*\/)?\\?["']?xargs["']?(?![A-Za-z0-9_.-])/.test(String(command ?? "")) || /\bfind\b[\s\S]*?-exec\b/.test(String(command ?? ""))) {
       // The FEEDER can also supply the VERB itself (`printf 'checkout -- f\n' |
       // xargs git`) — the walker then sees a bare `git` invocation with no verb,
       // which is not in `unhandled` keyed on a family verb, so nothing was

@@ -1219,10 +1219,11 @@ function _wtXargsPlaceholders(command: unknown): string[] {
   // program too often to harvest globally (`grep -I clean.txt` false-blocked a
   // clean checkout, reviewer round-10 P2).
   for (const seg of String(command ?? "").split(/[|;&]/)) {
-    // Accept a PATH-QUALIFIED or QUOTED feeder word (`/usr/bin/xargs`, `"xargs"`)
-    // — scoping to a literal `xargs` word let those spellings hide their `-I`
-    // placeholder and re-opened the round-9 bypass (reviewer round-10 P1).
-    if (!/(?:^|[\s(])(?:[\w./-]*\/)?["']?xargs["']?/.test(seg)) continue;
+    // Accept a PATH-QUALIFIED, QUOTED or BACKSLASH-ESCAPED feeder word
+    // (`/usr/bin/xargs`, `"xargs"`, `\xargs`) — scoping to a literal `xargs`
+    // word let each spelling hide its `-I` placeholder and re-opened the
+    // round-9 bypass (reviewer round-10 P1 / round-11 P1).
+    if (!/(?:^|[\s(])(?:[\w./-]*\/)?\\?["']?xargs["']?(?![A-Za-z0-9_.-])/.test(seg)) continue;
     // `-J` is BSD xargs' replstr (macOS); `-I` is the POSIX/GNU one.
     for (const m of seg.matchAll(/(?:^|\s)-[IJ]\s*("[^"]*"|'[^']*'|\S+)/g)) {
       const tok = String(m[1] ?? "").replace(/^["']|["']$/g, "");
@@ -1518,8 +1519,14 @@ function _worktreeDiscardBlock(command: string): string | null {
           // Equality OR a whole path SEGMENT — the placeholder is usually
           // interpolated INTO a path (`src/@`), but a bare substring test made
           // `-I c`/`-I .` match nearly every pathspec (`clean.txt`) and blocked a
-          // clean target (reviewer round-10 P2).
-          return xargsPlaceholders.some((t) => t && (bare === t || bare.includes(`${t}/`) || bare.includes(`/${t}`)));
+          // clean target (reviewer round-10 P2). A PLACEHOLDER-SIGNIFICANT token
+          // (multi-character, or one of the classic replstrs) may also appear as
+          // a prefix/suffix (`@.txt`, `f@` — reviewer round-11 P1).
+          return xargsPlaceholders.some((t) => {
+            if (!t) return false;
+            const significant = t.length > 1 || /^(?:@|%|\+|\{\})$/.test(t);
+            return bare === t || bare.includes(`${t}/`) || bare.includes(`/${t}`) || (significant && bare.includes(t));
+          });
         }) ||
         d.pathspecs.some((p) => wtIsPlaceholderPathspec(p));
       if (unresolvable) {

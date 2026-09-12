@@ -544,6 +544,12 @@ async function partB() {
       ["BSD `-J` replstr (`… | xargs -J@ git checkout -- @`)", "printf 'dirty.txt\\n' | xargs -J@ git checkout -- @"],
       ["stdin-alias script operand (`printf … | python3 /dev/stdin`)", "printf 'import subprocess\\nsubprocess.run([\"git\",\"checkout\",\"--\",\"dirty.txt\"])\\n' | python3 /dev/stdin"],
       ["stdin-alias script operand (`printf … | node /dev/stdin`)", "printf 'require(\"child_process\").execSync(\"git checkout -- dirty.txt\")\\n' | node /dev/stdin"],
+      // ── reviewer round-11 closures ──
+      ["redirect after the piped shell (`… | bash 2>/dev/null`)", "printf 'git checkout -- dirty.txt\\n' | bash 2>/dev/null"],
+      ["redirect after the piped shell (`… | sh -s &>/dev/null`)", "printf 'git checkout -- dirty.txt\\n' | sh -s &>/dev/null"],
+      ["escaped feeder word (`… | \\xargs -I@ git checkout -- @`)", "printf 'dirty.txt\\n' | \\xargs -I@ git checkout -- @"],
+      ["placeholder as a filename suffix (`… | xargs -I@ git checkout -- @.txt`)", "printf 'dirty\\n' | xargs -I@ git checkout -- @.txt"],
+      ["multi-char placeholder as a prefix (`… | xargs -I PERCENT git checkout -- PERCENT.txt`)", "printf 'dirty\\n' | xargs -I PERCENT git checkout -- PERCENT.txt"],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
@@ -588,6 +594,12 @@ async function partB() {
       allowed(await bash("grep -c checkout clean.txt | bash -c 'wc -l' | tee /tmp/709-tee2.log", wt)), "was blocked");
     expectTrue("B6l: `printf 'x\\n' | xargs -I c echo c ; git checkout -- clean.txt` ALLOWED (single-char replstr is not a substring match)",
       allowed(await bash("printf 'x\\n' | xargs -I c echo c ; git checkout -- clean.txt", wt)), "was blocked");
+    // Reviewer round-11 P2 — DOCUMENTED FAIL-CLOSED COST, not a bug: the walker
+    // consumes `--version`, so this null-verb invocation is indistinguishable
+    // from the bare feeder-fed `git` the arm exists for. It only fires when the
+    // tree is dirty and the command mentions a feeder word (see README).
+    expectTrue("B6l: `echo 'use xargs to batch' && git --version` BLOCKED (documented fail-closed cost)",
+      blocked(await bash("echo 'use xargs to batch' && git --version", wt)), "was allowed");
     rmSync(execUndo, { force: true });
     rmSync(patch, { force: true });
     rmSync(verbPath, { force: true });
