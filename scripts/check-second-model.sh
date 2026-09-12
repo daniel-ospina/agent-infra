@@ -465,6 +465,13 @@ def is_equivalent(mid, eq):
         # `**DEGRADED`) is likewise never an independent reviewer — check (f)
         # and record-review.sh read exit 0 as build-equivalent/fail.
         return True
+    if n[-1] in "-_.":
+        # I4: a trailing separator means this is not a real model id. pi
+        # fuzzy-matches an unknown bare id onto a real one (`deepseek-` →
+        # deepseek/deepseek-v4-pro, `deepseek-v4-`, `deep`), so such a token
+        # would dispatch as the primary's build while reading INDEPENDENT —
+        # the same false pass as the A3 empty-normalization case. Fail closed.
+        return True
     if n in {str(x).lower() for x in eq.get("normalized", []) if isinstance(x, str)}:
         return True
     for fam in eq.get("families", []):

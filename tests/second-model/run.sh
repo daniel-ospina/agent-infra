@@ -422,6 +422,15 @@ for m in openrouter/google/gemini-2.5-pro moonshot/kimi-k3 openrouter/anthropic/
   rc="$(equiv_rc "$m")"
   if [ "$rc" -eq 1 ]; then pass "negative control $m → INDEPENDENT"; else fail "negative control $m was wrongly classified equivalent (rc=$rc)"; fi
 done
+# I4: a token with a trailing separator is never a real model id — pi's resolver
+# fuzzy-matches it onto a real one (`deepseek-` → deepseek/deepseek-v4-pro, the
+# primary's build), so reading it INDEPENDENT is the same false pass as the A3
+# empty-normalization case. Must classify EQUIVALENT. `deep` is included as the
+# negative control that pins the rule to the trailing separator, not to depth.
+for m in deepseek- deepseek-v4- deepseek. deepseek_; do
+  rc="$(equiv_rc "$m")"
+  if [ "$rc" -eq 0 ]; then pass "I4 trailing-separator $m → EQUIVALENT"; else fail "I4 trailing-separator $m read INDEPENDENT (rc=$rc) — fuzzy-matched to the primary's build"; fi
+done
 # A whole fixture built on the negative control must PASS (proves the guard
 # tests build equivalence, not membership in a DeepSeek allowlist).
 run_guard 0 "near-miss-negative fixture" --check --live-dir "$FIX/near-miss-negative"
