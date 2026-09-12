@@ -323,6 +323,15 @@ for marker in \
   "pass 6c: check (f) blocked independent=NO" \
   "pass 6d: check (f) blocked a build-equivalent recorded id" \
   "pass 6y: check (f) blocks the bare deepseek shorthand as independent=yes" \
+  "pass 6i2: check (f) blocks a conflicting pair whose DEGRADED line has a | in trailing prose" \
+  "pass 6i3: check (f) blocks a conflicting markdown-table-cell marker (trailing |)" \
+  "pass 6i4: check (f) blocks model=none| (a | in the MODEL slot is not a placeholder)" \
+  "pass 6i5: check (f) blocks a glued-pipe DEGRADED line (| in the INDEPENDENT slot)" \
+  "pass 6z: check (f) passes when the body quotes the marker format alongside a valid marker" \
+  "pass 6z2: check (f) FAILS on a genuine garbage marker line" \
+  "pass 6z3: check (f) passes when the body quotes model=<id> independent=yes" \
+  "pass 6z3b: check (f) passes when the body quotes model=<resolved provider/id>" \
+  "pass 6z4: check (f) passes when a quoted line has a concrete model + quoted independent" \
   "pass 6e: check (f) blocked a missing marker" \
   "pass 6f: check (f) bootstrap exemption WARN" \
   "pass 6g: check (f) enforcement on once the file exists on base" \

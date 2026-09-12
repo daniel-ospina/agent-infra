@@ -1113,10 +1113,10 @@ ${smline}"
   # that quotes the contract as written must still pass its own gate.
   # NOTE: `model=<resolved provider/id>` truncates the slot at the internal
   # space to `<resolved`, which also starts with `<` — covered by 6z3b.
-  sm_case 6z3 "passes when the body quotes `model=<id> independent=yes`" \
+  sm_case 6z3 'passes when the body quotes model=<id> independent=yes' \
     $'[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ '"$SM_SIM_SHA"$'\nRecord it as `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>`.' \
     "$SM_SIM_SHIPPED" 1 "second-model gate recorded"
-  sm_case 6z3b "passes when the body quotes `model=<resolved provider/id>`" \
+  sm_case 6z3b 'passes when the body quotes model=<resolved provider/id>' \
     $'[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ '"$SM_SIM_SHA"$'\nRecord it as `[SECOND-MODEL-GATE] model=<resolved provider/id> independent=yes @ <head-sha>`.' \
     "$SM_SIM_SHIPPED" 1 "second-model gate recorded"
   # Pins the INDEPENDENT-slot arm specifically: a line that DOES carry the

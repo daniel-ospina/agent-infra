@@ -373,10 +373,10 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   # head/model must supersede the old line (append-and-never-remove made a
   # stale `independent=DEGRADED` fatal to the gate forever).
   MISSING=""
-  if ! printf '%s' "$BODY" | grep -qF "$MARKER"; then
+  if ! grep -qF "$MARKER" <<<"$BODY"; then
     MISSING="$MARKER"
   fi
-  if [ -n "$SM_MARKER" ] && ! printf '%s' "$BODY" | grep -qF "$SM_MARKER"; then
+  if [ -n "$SM_MARKER" ] && ! grep -qF "$SM_MARKER" <<<"$BODY"; then
     BODY="$(printf '%s\n' "$BODY" | grep -v -F '[SECOND-MODEL-GATE]' || true)"
     if [ -n "$MISSING" ]; then
       MISSING="${MISSING}
