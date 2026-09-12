@@ -177,7 +177,7 @@
  * lock: PR-editable code, conspicuous in the diff, and worth nothing against a
  * PR that edits the checker itself.
  *
- * `--head-ref <sha>` MODE (used by .github/workflows/workflow-lock.yml): fetch
+ * `--head-ref <ref>` MODE (used by .github/workflows/workflow-lock.yml): fetch
  * the recursive git TREE at that ref (`gh api …/git/trees/<sha>?recursive=1`),
  * reject any of the three workflow paths that is not committed as a REGULAR FILE
  * — git mode `100644` or `100755` (a symlink `120000` or submodule `160000` is a
@@ -195,6 +195,19 @@
  * SKIPPED in this mode by design — this leg provides ZERO lock enforcement (see
  * the authoritative trust-split statement above). `--repo <owner/name>` overrides
  * the repo (else it is derived from `git remote get-url origin`).
+ *
+ * WHAT REF THE CALLER SHOULD PASS, AND WHY IT IS NOT THE HEAD (#821). The flag
+ * name is historical; the contract is "the ref whose tree would LAND".
+ * `workflow-lock.yml` passes `pull_request.merge_commit_sha` — the merge result —
+ * and asserts that it does (see the wiring test). Validating `head.sha` instead
+ * was a FALSE RED generator: the head is the pre-merge state, so any branch cut
+ * before a guarded workflow changed carried the OLD files, failed assertions for
+ * files it never touched, and was told to "restore the line" it had never
+ * removed — while the merge would in fact have left the BASE branch's valid
+ * copies in place. The merge result is also the only ref where "the PR changed
+ * this file AND the base branch changed it since" exists at all. A ref whose tree
+ * lacks a guarded path is a MISSING finding (fail-closed), so a caller that
+ * passes a bad or stale ref gets RED rather than a silent pass.
  *
  * WHY THE ACCUMULATOR, NOT `&&` (#675 P2-2): shell `&&` short-circuits, so a
  * frontmatter-validator failure would skip this suite entirely and its verdict
@@ -676,15 +689,15 @@ function runHeadRefMode(ref, repo) {
   }
   if (findings.length > 0) {
     console.error(
-      `❌ the PR's workflow files no longer satisfy the narrow structural guard ` +
-        `(${repo}@${ref.slice(0, 12)}):`
+      `❌ the workflow files at ${repo}@${ref.slice(0, 12)} no longer satisfy the narrow ` +
+        "structural guard (this ref should be the MERGE RESULT — what would land — not the PR head):"
     );
     for (const msg of findings) console.error(`   - ${msg}`);
     process.exit(1);
   }
   console.log(
-    `✅ the PR's workflow files still satisfy the narrow structural guard ` +
-      `(${repo}@${ref.slice(0, 12)}); the content lock is skipped in --head-ref mode by design`
+    `✅ the workflow files at ${repo}@${ref.slice(0, 12)} still satisfy the narrow structural ` +
+      "guard; the content lock is skipped in --head-ref mode by design"
   );
   process.exit(0);
 }
@@ -767,7 +780,7 @@ const REQUIRED_TESTS = Object.freeze([
   "the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)",
   "workflow coverage: an unclassified new workflow is RED (#675 P2-d)",
   "workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)",
-  "workflow-lock.yml exists and is wired (pull_request_target + --head-ref) (#675 P2-g)",
+  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)",
   "a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)",
   "a symlinked locked workflow is RED from lockFindings (#675 P1-2)",
   "the lock CLI is RED for a symlinked locked workflow (#675 P1-2)",
@@ -2119,7 +2132,7 @@ test("--update-lock on a symlinked locked file fails instead of printing an upda
 // #675 P2-g — the trusted leg is bootstrapped by the NEXT PR after it lands
 // (pull_request_target resolves from the default branch). Nothing writes
 // post-merge evidence, so this is the assertion that deleting/unwiring it is RED.
-test("workflow-lock.yml exists and is wired (pull_request_target + --head-ref) (#675 P2-g)", () => {
+test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)", () => {
   const rel = ".github/workflows/workflow-lock.yml";
   const abs = path.join(REPO_ROOT, rel);
   assert.ok(fs.existsSync(abs), `${rel} must exist — it is the trusted structural leg`);
@@ -2130,10 +2143,27 @@ test("workflow-lock.yml exists and is wired (pull_request_target + --head-ref) (
     isMap(doc.on) && Object.hasOwn(doc.on, "pull_request_target"),
     `${rel} must still trigger on \`pull_request_target\` — that is the base-branch trigger`
   );
+  // #821 — THE VALIDATED REF MUST BE THE MERGE RESULT, NOT THE HEAD.
+  // The head is the pre-merge state. Validating it made every branch cut before a
+  // guarded workflow changed fail against files it never touched — and never will
+  // change, because merging leaves the BASE branch's copies in place. The merge
+  // result is also the only ref where "PR change + a base branch that changed the
+  // same file since" exists at all, which is the case that actually matters.
+  const steps = doc.jobs["workflow-lock"].steps;
+  const step = steps.find(
+    (s) => typeof s.run === "string" && s.run.includes("check-pi-pin-lockstep.mjs --head-ref")
+  );
+  assert.ok(step, `${rel} must still invoke the checker with --head-ref`);
+  assert.equal(
+    step.env?.MERGE_SHA,
+    "${{ github.event.pull_request.merge_commit_sha }}",
+    `${rel} must validate \`pull_request.merge_commit_sha\` — the merge result is what lands (#821)`
+  );
   assert.match(
-    text,
-    /node scripts\/check-pi-pin-lockstep\.mjs --head-ref/,
-    `${rel} must still invoke the checker with --head-ref`
+    String(step.run),
+    /-z "\$MERGE_SHA"/,
+    `${rel} must fail closed with its own message when \`merge_commit_sha\` is empty (a conflicted ` +
+      "PR has no merge result to validate — that must not be reported as a workflow finding)"
   );
   assert.ok(
     isMap(doc.permissions) && Object.hasOwn(doc.permissions, "contents"),
