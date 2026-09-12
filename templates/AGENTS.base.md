@@ -232,20 +232,25 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
 - **Never use `git add -A`** — always stage specific files.
 - **Prefer the `edit` tool over `write`** for targeted changes to existing files.
 - **Commit messages: always `git commit -F <file>` — never `-m`, never a heredoc.** The message
-  file lives in the repo's own git dir, never a shared `/tmp/commit-msg-<branch>.md` — a branch
-  name is unique per repo, not globally, so concurrent sessions in different repos silently
-  overwrite each other's message (#729). The path is
-  `$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md` —
-  write the message there with the `write` tool, then commit with `-F`.
+  message file goes in a **repo- and worktree-unique temp directory**, never a shared
+  `/tmp/commit-msg-<branch>.md` — a branch name is unique per repo, not globally, so concurrent
+  sessions in different repos silently overwrite each other's message (#729). The path is
+  `${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md` —
+  `write` the message there (the write tool creates the directory), then commit with `-F`.
   `--absolute-git-dir` is per-repo AND worktree-aware — a linked worktree gets *its own* gitdir —
-  so cross-repo and cross-worktree collisions are impossible. (Two sessions in the *same* worktree
-  on the *same* branch still share the file; that case was always racy at the index level anyway.)
+  and its `cksum` names the directory, so cross-repo and cross-worktree collisions are impossible.
+  ⛔ **Never put it under `.git/`.** That was the first attempt and it is refused: the
+  `main-worktree-guard` extension freezes any `.git/…` write as *hub git-metadata* for every
+  unhatched session — the fleet default for `task` children — so the mandated `write` would be
+  blocked and the agent left to improvise. `$TMPDIR` keyed by the git-dir checksum gives the same
+  uniqueness, entirely outside every checkout. (Two sessions in the *same* worktree on the *same*
+  branch still share the file; that case was always racy at the index level anyway.)
   ⛔ **Every bash tool call is a FRESH SHELL, and one call must not both assign and commit.** A
   `MSG=…` set in one call is **unset** in the next, so a later `git commit -F "$MSG"` commits from
   an **empty path** and `rm -f "$MSG"` silently removes nothing (both verified). Assigning `MSG`
   in the same call as the commit is *also* refused by the verification gate ("in-batch mutation
   chain"). So put the substitution **inline in the commit command** — no variable:
-  `git commit -F "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"`,
+  `git commit -F "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"`,
   then delete the message file in a **separate** call, re-deriving the path the same way.
   Both `-m "…"` and heredocs pass the message
   through the shell first — backticked spans run as command substitution, `$VAR`/`$(…)` expand,

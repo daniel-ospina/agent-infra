@@ -16,12 +16,17 @@ git add <relevant files>
 #    message before git sees it — see "⛔ Commit messages" below.
 # #729: never /tmp/commit-msg-<branch>.md — a branch name is unique per repo,
 #       not globally, so concurrent sessions in different repos collide there.
-#       The file belongs in the repo's OWN git dir: `--absolute-git-dir` is
-#       per-repo AND worktree-aware, `tr '/' '-'` sanitizes the branch name.
+#       The file goes in a REPO+WORKTREE-UNIQUE temp dir, keyed by the cksum of
+#       the absolute git dir.
+#       ⛔ NOT under `.git/`: main-worktree-guard freezes `.git/…` writes as
+#          "hub git-metadata" for every unhatched session (the fleet default for
+#          `task` children), so that write is blocked.
 
 # ── CALL 1 of 4: learn the path ─────────────────────────────────────
-git rev-parse --absolute-git-dir   # → /repo/.git   (worktree: /repo/.git/worktrees/<n>)
-# message file = <that dir>/COMMIT_MSG_<branch with / → ->.md
+echo "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+# → e.g. /var/folders/…/T/pi-commit-msg-3198440152/fix-729-commit-msg-path.md
+#   `tr '/' '-'` sanitizes a slash-bearing branch; the cksum is per-repo AND
+#   per-worktree (`--absolute-git-dir` differs per linked worktree).
 
 # ── CALL 2 of 4: `write` the message to that path (the write tool bypasses bash) ──
 #   <type>(<scope>): <subject>
@@ -36,10 +41,10 @@ git rev-parse --absolute-git-dir   # → /repo/.git   (worktree: /repo/.git/work
 #    (b) assigning a variable in the same call as the commit is refused by the
 #        verification gate as an "in-batch mutation chain".
 #    Inline the substitution instead — self-contained and gate-safe:
-git commit -F "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+git commit -F "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 
 # ── CALL 4 of 4: delete the message file (re-derive; never reuse a variable) ──
-rm -f "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+rm -f "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 ```
 
 **IMPORTANT — commit timeout:** Always run `git commit` **foreground** with `timeout: 300000` (5 minutes minimum). Never set `run_in_background: true` for `git commit`. Never use a timeout below 300 seconds. The pre-commit hook (lint-staged running ESLint on staged TS files) takes 20–90 seconds. Killing it mid-run orphans the lint-staged backup stash and leaves `.git/index.lock` behind — causing exit code 128 on every subsequent commit until the lock is manually removed. This timeout rule also applies to all fix-loop `git commit` calls in Steps 2 and 2.5.
@@ -75,8 +80,8 @@ entirely, so nothing in the message is ever interpreted:
 # Echo the substitution rather than assigning a variable: a `MSG=…` set here
 # would be UNSET in the call that commits, which is how the empty-path bug
 # happened in the first place.
-echo "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
-# → /repo/.git/COMMIT_MSG_fix-668-commit-msg.md
+echo "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+# → /var/folders/…/T/pi-commit-msg-3198440152/fix-668-commit-msg.md
 #   (in a linked worktree: that worktree's own gitdir under .git/worktrees/)
 ```
 
@@ -97,10 +102,10 @@ write  <the absolute path printed above>
 # then, in bash — the message never appears on the command line.
 # This is a SEPARATE call, so no variable survives: inline the substitution.
 # (Assigning MSG here would ALSO be refused by the verification gate.)
-git commit -F "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+git commit -F "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 
 # separate call — re-derive the path, never reuse a variable:
-rm -f "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+rm -f "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 ```
 
 `git commit -m` and heredocs are forbidden **everywhere** (commit messages, PR
@@ -122,7 +127,7 @@ On a hit:
    # `write` the corrected message to the same path first, then amend.
    # Inline the substitution: a separate call, and no variable assignment
    # may share a call with the commit (#729).
-   git commit --amend -F "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+   git commit --amend -F "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
    ```
 2. **Pushed, branch under review** — do **not** silently force-push the
    rewritten message. Post a correction note on the PR/issue (what was wrong,
@@ -138,8 +143,12 @@ git push -u origin <branch>
 # ⛔ Same rule as the commit message: never pass the PR body through the shell.
 #    `--body "…"` and `--body "$(cat <<'EOF' …)"` both let the shell eat
 #    backticked spans / expand `$()` and `{{ }}`. Write the PR body to a temp
-#    file with the `write` tool and pass --body-file, then remove the file:
-#   /tmp/pr-body-<branch>.md
+#    file with the `write` tool and pass --body-file, then remove the file.
+#    ⛔ NOT /tmp/pr-body-<branch>.md (#729): a branch name is unique per repo, not
+#       globally, so four repos on `fix/700-review-cap` collide there and
+#       `gh pr create` publishes ANOTHER repo's PR description. Same derivation
+#       as the commit message, with a distinct `pi-pr-body-` prefix:
+#   ${TMPDIR:-/tmp}/pi-pr-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md
 #   ## Summary
 #   - <bullet 1>
 #   - <bullet 2>
@@ -148,8 +157,8 @@ git push -u origin <branch>
 gh pr create --draft \
   --base main \
   --title "<title>" \
-  --body-file /tmp/pr-body-<branch>.md
-rm -f /tmp/pr-body-<branch>.md
+  --body-file "${TMPDIR:-/tmp}/pi-pr-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+rm -f "${TMPDIR:-/tmp}/pi-pr-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 ```
 
 The PostToolUse hook fires on `gh pr merge` as a safety net for manual merges outside commit-workflow. Step 2 is the primary code-review gate.

@@ -120,6 +120,13 @@ assert_empty "$HOOK_OUT" "clean multi-line message: no output"
 run "$T/unbalanced.md"
 assert_contains "$HOOK_OUT" "unbalanced backticks" "unbalanced backticks flagged"
 assert_contains "$HOOK_OUT" "git commit -F" "flag names the -F remedy"
+# #729: the remedy must not drift back to a `.git/` path — main-worktree-guard
+# freezes `.git/…` writes as hub git-metadata for every unhatched session.
+assert_contains "$HOOK_OUT" "absolute-git-dir" "flag names the --absolute-git-dir derivation"
+assert_not_contains() {
+    if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi
+}
+assert_not_contains "$HOOK_OUT" "COMMIT_MSG_" "flag no longer recommends a .git/COMMIT_MSG_ path"
 assert_eq "$HOOK_RC" "0" "unbalanced backticks: warn-only (exit 0)"
 
 # 3. Planted doubled-space substitution gap: flagged, warn-only.
