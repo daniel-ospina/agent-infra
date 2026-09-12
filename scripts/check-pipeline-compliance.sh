@@ -675,10 +675,26 @@ run_checks() {
             sm_mslot="${sm_tail#*model=}"
             sm_mslot="${sm_mslot%%[[:space:]]*}"
           fi
-          if [[ "$sm_islot" == "<"* || "$sm_islot" == *"|"* \
-                || ( "$sm_mslot" == "<"* && "$sm_mslot" == *"/"* ) ]]; then
-            continue
-          fi
+          # I3: skip a QUOTED PLACEHOLDER only — an explicit allowlist, never a
+          # blanket "starts with <" test. A blanket test swallowed the C3(a)
+          # non-id control (`model=<script>` must still fail as a non-model
+          # value), and the earlier `|`-in-slot test let a genuine conflicting
+          # line (`independent=DEGRADED|`, or a markdown table cell) be skipped,
+          # defeating the conflict check. Both slots must be RECOGNISED
+          # placeholders to skip; anything else falls through and fails closed.
+          # `sm_mslot` is whitespace-truncated, so `model=<resolved provider/id>`
+          # arrives as `<resolved` — the stem is compared after stripping `<>`.
+          sm_ph="${sm_mslot%>}"; sm_ph="${sm_ph#<}"
+
+          case "$sm_ph" in
+            id|model|model-id|provider|provider/id|resolved|resolved-provider/id|head-sha|head|sha) continue ;;
+          esac
+          # The INDEPENDENT slot needs only the angle-bracket test: a real value
+          # (`yes`/`NO`/`DEGRADED`) never starts with `<`, so this skips exactly
+          # the quoted alternation `independent=<yes|NO|DEGRADED>`. Never list the
+          # bare values here — that would skip a genuine marker and make check
+          # (f) report `recorded <none>`.
+          case "$sm_islot" in "<"*) continue ;; esac
         fi
         # H5: exactly ONE `independent=` token per line. A duplicated token
         # (`independent=yes independent=NO`) would let the FIRST value win —
@@ -1087,6 +1103,37 @@ ${smline}"
   # H6: genuine garbage is still malformed (the quoting skip must not swallow it).
   sm_case 6z2 "FAILS on a genuine garbage marker line" \
     "[SECOND-MODEL-GATE] this is not a marker at all" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
+  # I3: 6z above passes via the ISLOT arm (its quoted line carries
+  # `independent=<yes|NO|DEGRADED>`, and `|` no longer triggers the skip — it
+  # passes because the islot is angle-bracketed). This case is the one that
+  # actually pins the MODEL-slot arm: the quoted line carries an
+  # angle-bracketed model placeholder AND a concrete `independent=yes` (no
+  # `|`, no `<` in the islot). It is the exact documented success form from
+  # AGENTS.md / the base template / providers.md / the four skills, so a PR
+  # that quotes the contract as written must still pass its own gate.
+  # NOTE: `model=<resolved provider/id>` truncates the slot at the internal
+  # space to `<resolved`, which also starts with `<` — covered by 6z3b.
+  sm_case 6z3 "passes when the body quotes `model=<id> independent=yes`" \
+    $'[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ '"$SM_SIM_SHA"$'\nRecord it as `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>`.' \
+    "$SM_SIM_SHIPPED" 1 "second-model gate recorded"
+  sm_case 6z3b "passes when the body quotes `model=<resolved provider/id>`" \
+    $'[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ '"$SM_SIM_SHA"$'\nRecord it as `[SECOND-MODEL-GATE] model=<resolved provider/id> independent=yes @ <head-sha>`.' \
+    "$SM_SIM_SHIPPED" 1 "second-model gate recorded"
+  # Pins the INDEPENDENT-slot arm specifically: a line that DOES carry the
+  # marker token and a CONCRETE model, with only the independence value quoted.
+  # Without that arm this line reads as malformed and blocks a PR that
+  # documents the contract. (The quoting line must contain the marker token,
+  # or the placeholder block is never reached at all.)
+  sm_case 6z4 "passes when a quoted line has a concrete model + quoted independent" \
+    $'[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ '"$SM_SIM_SHA"$'\nThe value is `[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=<yes|NO|DEGRADED> @ <head-sha>`.' \
+    "$SM_SIM_SHIPPED" 1 "second-model gate recorded"
+  # I3 residual: a pipe GLUED to a real independence value (`DEGRADED|`) must
+  # NOT be read as a placeholder — otherwise the conflict check is defeated by
+  # a narrower spelling of the I2 fail-open. The line is either malformed or
+  # conflicting; either way the gate must FAIL with an honest DEGRADED present.
+  sm_case 6i5 "blocks a glued-pipe DEGRADED line (| in the INDEPENDENT slot)" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=DEGRADED| @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "\[SECOND-MODEL-GATE\]" \
+    "" 1 "complexity:standard" "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ $SM_SIM_SHA"
   # C3(c): the line must be bound to the PR head.
   sm_case 6l "blocks a marker bound to another head" \
     "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ 1111111111111111111111111111111111111111" "$SM_SIM_SHIPPED" 0 "not bound to the PR head"
