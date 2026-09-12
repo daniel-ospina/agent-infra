@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -3268,6 +3268,42 @@ test("#755 E: empty output is clean with an empty map (vacuous, not an anomaly)"
   deepEqual(e.scope, { files: [], renameOldPaths: [], clean: true });
   equal(e.statuses.size, 0);
 });
+// ── #3255: worktree-aware root resolution ─────────────
+// The cwd's git root is the HUB when the change lives in a linked worktree,
+// while the bridge's compound keys are keyed on the WORKTREE (verification is
+// dispatched with the worktree as project root). Adopting the sibling root is
+// what stops the hub-vs-worktree hash comparison that blocks every push.
+const sameRepo3255 = (r: string) => (r.startsWith("/repo") ? "/repo/.git" : "/other/.git");
+
+test("pickVerifiedRoot: adopts a same-repo worktree root when the cwd root has no entries", () => {
+  equal(pickVerifiedRoot("/repo", ["/repo/.worktrees/feat"], sameRepo3255), "/repo/.worktrees/feat");
+});
+
+test("pickVerifiedRoot: status quo when the cwd root has its own entries", () => {
+  equal(
+    pickVerifiedRoot("/repo", ["/repo", "/repo/.worktrees/feat"], sameRepo3255),
+    null,
+    "the hub's own entries mean there is nothing to adopt",
+  );
+});
+
+test("pickVerifiedRoot: never adopts a DIFFERENT repository's root", () => {
+  equal(
+    pickVerifiedRoot("/other", ["/repo/.worktrees/feat"], sameRepo3255),
+    null,
+    "a foreign repo's verified entries must stay inert",
+  );
+});
+
+test("pickVerifiedRoot: ambiguous siblings fall back to the status quo (fail-closed)", () => {
+  equal(pickVerifiedRoot("/repo/hub", ["/repo/w1", "/repo/w2"], () => "/repo/.git"), null);
+});
+
+test("pickVerifiedRoot: no entries, or an unresolvable repo, falls back", () => {
+  equal(pickVerifiedRoot("/repo", [], sameRepo3255), null);
+  equal(pickVerifiedRoot("/repo", ["/repo/w1"], () => null), null);
+});
+
 // ── Results ───────────────────────────────────────────
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
