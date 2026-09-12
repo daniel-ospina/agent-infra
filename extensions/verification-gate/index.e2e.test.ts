@@ -4003,6 +4003,62 @@ async function main() {
       "#755: control — the SAME fixture without the flag IS de-flooded (proves 78's difference is the flag, not the fixture)");
   });
 
+  test("scenario 80 (#755): the PUSH leg subtracts a base-identical path on a FEATURE-branch push", async () => {
+    // Geometry that makes the push arm non-inert (traced, not assumed):
+    //   tier A scope  = diff <tracking> <srcRef>   = origin/feature .. feature
+    //   subtraction T = resolveTrustedBase()       = origin/main   (DIFFERENT ref)
+    // When the pushed branch IS the current branch AND T == tracking (the
+    // `git push origin main` case) condition (1) is the exact complement of
+    // scope membership, so nothing can ever be subtracted. The arm only does
+    // work when the two refs differ — i.e. the common feature-branch push.
+    const repo = join(TEST_ROOT, "repo-755-80");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "basesub.ts"), "v1\n");
+    writeFileSync(join(repo, "kept.ts"), "k1\n");
+    git(repo, "add .");
+    git(repo, "commit -m c0");
+    const c0 = git(repo, "rev-parse HEAD");
+    // Upstream advances basesub.ts to v2 — this becomes origin/main.
+    git(repo, "checkout -q -b upstream");
+    writeFileSync(join(repo, "basesub.ts"), "v2\n");
+    git(repo, "add .");
+    git(repo, "commit -m upstream-basesub-v2");
+    const cm = git(repo, "rev-parse HEAD");
+    git(repo, "update-ref refs/remotes/origin/main " + cm);
+    // The feature branch: authored work, then it merges upstream in.
+    git(repo, "checkout -q -b feature " + c0);
+    writeFileSync(join(repo, "feat80.ts"), "f1\n");
+    git(repo, "add .");
+    git(repo, "commit -m feature-work");
+    // The feature's own previously-pushed tip (the previously-pushed tip must be
+    // an ANCESTOR of the merge's first parent, or guard (5) fails).
+    git(repo, "update-ref refs/remotes/origin/feature " + c0);
+    git(repo, "merge --no-ff -m merge-upstream upstream");
+    // Sanity: the merge really did pull the base-identical content in.
+    equal(git(repo, "rev-parse HEAD:basesub.ts"), git(repo, "rev-parse origin/main:basesub.ts"),
+      "80: (fixture) the merge result's basesub.ts is byte-identical to the trusted base's");
+    await fire("session_start", {});
+    const before = skipCount("base_identical_satisfied");
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin feature", cwd: repo },
+    });
+    const after = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "base_identical_satisfied");
+    ok(after.length > before, "80: the PUSH leg emits base_identical_satisfied (pre-this-scenario the push leg had NO e2e pin at all)");
+    const last = after[after.length - 1] as any;
+    ok(Array.isArray(last.subtractedPaths) && last.subtractedPaths.includes("basesub.ts"),
+      "80: push leg subtracts the base-identical path");
+    ok(!last.subtractedPaths.includes("feat80.ts"),
+      "80: the branch-authored path is NOT subtracted");
+    ok(res && res.block === true, "80: still blocks on the unverified authored file");
+    ok(res.reason.includes("feat80.ts"), "80: the block names the branch-authored file");
+    ok(!res.reason.includes("basesub.ts"),
+      "80: and does NOT name the base-identical incoming path — the push-leg de-flood");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

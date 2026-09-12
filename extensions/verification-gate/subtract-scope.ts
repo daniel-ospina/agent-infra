@@ -23,8 +23,14 @@ import { execFileSync } from "node:child_process";
 export type ArmLabel = "staged" | "worktree" | "wtPath" | "branch" | "push";
 export type RecordedSide = "index" | "worktree" | "wtPath" | "ref";
 
-/** gate_skip reasons contributed by this module. Each literal is written in
- *  EXACTLY ONE place (index.ts spreads this into GATE_SKIP_REASONS). */
+/** gate_skip reasons contributed by this module. `index.ts` spreads this into
+ *  GATE_SKIP_REASONS, so this ARRAY is the single definition of the vocabulary —
+ *  but note the emit sites still spell the string, because `GateSkipReason` is a
+ *  string-literal union and a literal always typechecks against it. The tripwire
+ *  guards "no literal is listed twice in the arrays", NOT "the literal appears
+ *  only here"; renaming a member below would silently leave an emit site
+ *  emitting the old string. Kept as literals (not `SUBTRACT_SKIP_REASONS[1]`)
+ *  so the audit JSON stays greppable. */
 export const SUBTRACT_SKIP_REASONS = [
   "base_identical_satisfied",
   "subtract_disabled_by_env",
@@ -84,8 +90,12 @@ export interface SubCtx {
    *  `128`/other/throw⇒null. Guard (3) passes only on explicit `false`;
    *  guards (4)/(5) only on explicit `true`. */
   isAncestorOrEqual(a: string, b: string): boolean | null;
-  /** Parent list INCLUDING token 0 (the commit itself) is dropped here. */
-  parentRefs(ref: string): string[];
+  /** Parent list, resolved from the OID pinned at ctx build — NEVER from a bare
+   *  ref name, which a concurrent `update-ref`/`reset` could retarget between
+   *  ctx build and this probe (that would let guard (4) pass against a different
+   *  commit than guards (1)-(3) were evaluated against ⇒ under-gate). Token 0
+   *  (the commit itself) is dropped. */
+  parentRefs(): string[];
   /** Sentinel on failure: `true` (never subtract). */
   isShallowRepository(): boolean;
   srcRef(): string | null;
@@ -126,12 +136,14 @@ export function passesGuards(
   // build, so a concurrent `update-ref` cannot tear the read.
   if (ctx.isAncestorOrEqual(ctx.b().oid, ctx.t().oid) !== false) return false;
   if (pushArm) {
-    // (4) T is ancestor-or-equal of some NON-FIRST parent of srcRef
-    const src = ctx.srcRef();
-    if (src === null) return false;
-    const parents = ctx.parentRefs(src);
+    // (4) T is ancestor-or-equal of some NON-FIRST parent of srcRef.
+    //     The parent list comes off the OID pinned at ctx build, so a
+    //     concurrent update-ref cannot retarget it (see SubCtx.parentRefs).
+    //     `parentRefs()` returns the parents with token 0 already dropped, so
+    //     `.slice(1)` drops the FIRST parent — guard (4) is about a merge's
+    //     non-first parent, because the first parent is the branch's own side.
     const tOid = ctx.t().oid;
-    if (!parents.slice(1).some((r) => ctx.isAncestorOrEqual(tOid, r) === true)) return false;
+    if (!ctx.parentRefs().slice(1).some((r) => ctx.isAncestorOrEqual(tOid, r) === true)) return false;
     // (5) trackingRef is ancestor-or-equal of B — only an explicit `true`
     // passes. A missing tracking OID is unprovable ⇒ no subtraction.
     const trOid = ctx.trackingRefOid();
@@ -194,10 +206,8 @@ function run(scope: DiffScope, statuses: Map<string, string>, ctx: SubCtx | null
 }
 
 function secondParentCheck(ctx: SubCtx): boolean | null {
-  const src = ctx.srcRef();
-  if (src === null) return null;
   const tOid = ctx.t().oid;
-  const parents = ctx.parentRefs(src).slice(1);
+  const parents = ctx.parentRefs().slice(1);
   if (parents.length === 0) return null;
   const verdicts = parents.map((r) => ctx.isAncestorOrEqual(tOid, r));
   if (verdicts.some((v) => v === true)) return true;
@@ -275,6 +285,13 @@ function symbolicRefShort(cwd: string): string | null {
  *  A parse that MISSES a path makes it look unlisted ⇒ conditions (1) AND (2)
  *  hold ⇒ it IS subtracted ⇒ UNDER-GATE. Hence: unknown ⇒ null, never empty. */
 function parseRawZ(out: string): Set<string> | null {
+  // An EMPTY stream is a PROVABLY empty diff, not a parse failure: git emitted
+  // zero bytes, so zero paths changed. Treating it as a failure would make
+  // conditions (1) and (2) return the fail-closed `true` for EVERY path
+  // whenever the recorded side is wholly identical to T — exactly the strongest
+  // form of the property this rule exists to detect (e.g. `git checkout <T> -- .`
+  // with HEAD still diverged) — silently defeating the whole subtraction.
+  if (out === "") return new Set();
   if (!out.endsWith("\0")) return null; // truncated
   const toks = out.split("\0");
   if (toks.length > 0 && toks[toks.length - 1] === "") toks.pop();
@@ -293,6 +310,8 @@ function parseRawZ(out: string): Set<string> | null {
 /** `ls-tree -r -z`: `<mode> SP <type> SP <sha> TAB <path> NUL`. Split on NUL,
  *  then split each record at the FIRST TAB (a path may contain a TAB). */
 function parseLsTreeZ(out: string): Map<string, { mode: string; blob: string }> | null {
+  // An empty base tree is a valid tree with zero entries, not a parse failure.
+  if (out === "") return new Map();
   if (!out.endsWith("\0")) return null;
   const toks = out.split("\0");
   if (toks.length > 0 && toks[toks.length - 1] === "") toks.pop();
@@ -308,7 +327,13 @@ function parseLsTreeZ(out: string): Map<string, { mode: string; blob: string }> 
     const mode = meta.slice(0, sp1);
     const type = meta.slice(sp1 + 1, sp2);
     const blob = meta.slice(sp2 + 1);
-    if (type !== "blob") return null; // commit/tree entries are not files
+    // Non-blob entries (commit/tree) are SKIPPED, not fatal. A gitlink is a
+    // normal thing for a trusted base to contain, and guard (F) already
+    // excludes such a path per-path. Returning null here would make
+    // makeSubBundle return null and silently disable subtraction for the WHOLE
+    // op in any repo whose base tree contains a submodule — a silent no-op for
+    // that repo, with no audit line.
+    if (type !== "blob") continue;
     map.set(path, { mode, blob });
   }
   return map;
@@ -381,7 +406,6 @@ export interface MakeCtxArgs {
   pathspecs?: string[];
   srcRef?: string;
   trackingRef?: string;
-  parents?: string[];
 }
 
 /** Built INSIDE each producer. `SubCtx` values never cross a function
@@ -469,8 +493,11 @@ export function makeGitSubCtx(cwd: string, args: MakeCtxArgs): SubCtx | null {
     baseEntry: (p) => bundle.baseEntries.get(p) ?? null,
     mergeBaseCount: () => thisPair.mergeBaseCount,
     isAncestorOrEqual: (a, b) => ancestor(a, b),
-    parentRefs: (ref) => {
-      const out = gitOut(cwd, ["rev-list", "--parents", "-n", "1", ref]);
+    parentRefs: () => {
+      // rOid is the recorded side's OID, pinned at ctx build. Both arms that
+      // reach guard (4) use recordedSide "ref", so this is the src OID.
+      if (rOid === null) return [];
+      const out = gitOut(cwd, ["rev-list", "--parents", "-n", "1", rOid]);
       if (out === null) return [];
       const toks = out.trim().split(/\s+/).filter((s) => s !== "");
       return toks.slice(1); // token 0 is the commit itself

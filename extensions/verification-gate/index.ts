@@ -2264,8 +2264,9 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     const parsed = parseDiffNameStatusDetailed(diffOut);
     // #755: per-refspec subtraction, BEFORE the union (subtraction is per-arm,
     // pre-union — there is no union-level eligibility rule and no consumer for
-    // one). `trackingRef` is `tracking` exactly as computed at :2204 above —
-    // that local is ALSO the tier input, so it is never re-derived from srcRef.
+    // one). `trackingRef` is `tracking` exactly as derived from `dst` inside
+    // `resolvePushRangeScope` — that local is ALSO the tier input, so it is
+    // never re-derived from srcRef.
     const subbed = subtractForArm(cwd, parsed.scope, parsed.statuses, sub, {
       arm: "push",
       recordedSide: "ref",
@@ -2283,7 +2284,11 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // #755: suppress push_range_empty when the emptiness was CAUSED by
     // subtraction — the single emitted line is then the handler's richer
     // base_identical_satisfied (which carries T/B/merge-base/guard-5 OIDs and
-    // the paths). Emitting both would violate "at most one reason per op";
+    // the paths). The rule it would violate is the one stated at the emit site
+    // below: "at most one base_identical_satisfied per op; it may co-exist with
+    // a per-path reason". A per-path reason and this op-level line CAN both
+    // appear; push_range_empty must not, because it occupies the SAME op-level
+    // slot and would misreport a full subtraction as an up-to-date push.
     // emitting only the bare push_range_empty would make a forged-T full
     // subtraction indistinguishable from a legitimate up-to-date push.
     // `subtractions` is ABSENT (not []) on the ordinary no-subtraction push,
@@ -3382,7 +3387,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // #755 audit — emitted here, AFTER the chain closes and BEFORE
-    // applyScopeGate (:3350), so the full-subtraction ⇒ empty-allow case is
+    // applyScopeGate, so the full-subtraction ⇒ empty-allow case is
     // still audited. ⛔ Do not anchor this inside the push branch: that would
     // skip every commit arm. At most one base_identical_satisfied per op; it
     // may co-exist with a per-path reason for the same op.

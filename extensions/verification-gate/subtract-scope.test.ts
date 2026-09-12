@@ -413,6 +413,34 @@ test("#755 REAL GIT — resolveTrustedBase prefers the tracking remote, else ori
   }
 });
 
+test("#755 REAL GIT — the tracking remote WINS over the origin/main fallback", () => {
+  // The half that was untested: a regression that ignored branch.<cur>.remote /
+  // branch.<cur>.merge would still pass the origin/main-fallback test above.
+  const dir = mkRepo();
+  try {
+    write(dir, "a.ts", "a\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "base"]);
+    const branch = git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+    // Both candidate refs exist and point at DIFFERENT commits, so which one is
+    // chosen is observable.
+    write(dir, "b.ts", "b\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "second"]);
+    git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(dir, ["update-ref", "refs/remotes/upstream/main", "HEAD~"]);
+    git(dir, ["config", `branch.${branch}.remote`, "upstream"]);
+    git(dir, ["config", `branch.${branch}.merge`, "refs/heads/main"]);
+    const base = resolveTrustedBase(dir);
+    assert.notEqual(base, null);
+    assert.equal(base!.ref, "refs/remotes/upstream/main",
+      "the configured tracking remote must win over the origin/main fallback");
+    assert.equal(base!.oid, git(dir, ["rev-parse", "refs/remotes/upstream/main"]).trim());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("#755 REAL GIT — an unresolvable trusted base ⇒ no bundle ⇒ no subtraction", () => {
   const dir = mkRepo();
   try {
@@ -468,7 +496,40 @@ test("#755 REAL GIT — a hostile filename (space, $, quote, newline) is subtrac
   }
 });
 
-test("#755 REAL GIT — the bundle's baseEntries exclude non-blob entries", () => {
+test("#755 REAL GIT — a GITLINK in the trusted base is SKIPPED, not fatal", () => {
+  // A real gitlink (`160000 commit`) in the base tree used to make parseLsTreeZ
+  // return null → makeSubBundle null → subtraction silently DISABLED for the
+  // whole repo, with no audit line, in any repo whose base contains a submodule.
+  // The sibling regular file must still reach baseEntries (the eligibility
+  // precondition guard (F) reads) — the pin proves presence + regular mode, not
+  // that a subtraction happened.
+  const dir = mkRepo();
+  try {
+    write(dir, "a.ts", "a\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "base"]);
+    // The gitlink must be COMMITTED into the tree origin/main points at:
+    // makeSubBundle reads `ls-tree -r -z <oid>`, i.e. a committed tree. Writing
+    // the index alone (update-index without commit) leaves NO non-blob record in
+    // that stream, so the test would pass against the old `return null` — it was
+    // vacuous until this commit line was added.
+    git(dir, ["update-index", "--add", "--cacheinfo", "160000,0000000000000000000000000000000000000001,submod"]);
+    git(dir, ["commit", "-qm", "add-gitlink"]);
+    git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    // Anti-vacuity: prove the non-blob record really is in the trusted base tree.
+    const tree = git(dir, ["ls-tree", "-r", "-z", "refs/remotes/origin/main"]);
+    assert.ok(tree.includes("160000 commit"),
+      "fixture must actually place a non-blob record in the trusted base tree");
+    const bundle = makeSubBundle(dir);
+    assert.notEqual(bundle, null, "a gitlink must NOT disable the whole bundle");
+    assert.equal(bundle!.baseEntries.get("submod"), undefined, "the gitlink entry is skipped");
+    assert.equal(bundle!.baseEntries.get("a.ts")!.mode, "100644", "the sibling regular file survives");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#755 REAL GIT — the bundle's baseEntries carry mode + blob for a regular file", () => {
   const dir = mkRepo();
   try {
     write(dir, "a.ts", "a\n");
@@ -479,6 +540,54 @@ test("#755 REAL GIT — the bundle's baseEntries exclude non-blob entries", () =
     assert.notEqual(bundle, null);
     assert.equal(bundle!.baseEntries.get("a.ts")!.mode, "100644");
     assert.equal(bundle!.baseEntries.get("a.ts")!.blob.length, 40);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#755 REAL GIT — a WHOLLY identical recorded side still subtracts (empty diff is not a parse failure)", () => {
+  // The strongest form of the property: the recorded side equals T for the whole
+  // tree, so `diff <T> <recordedSide>` is EMPTY. Treating an empty stream as a
+  // parse failure made conditions (1)/(2) return the fail-closed `true` for every
+  // path — silently defeating subtraction exactly where it should fire hardest
+  // (e.g. `git checkout <T> -- .` with HEAD still diverged).
+  const dir = mkRepo();
+  try {
+    write(dir, "a.ts", "a\n");
+    write(dir, "b.ts", "b\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "base"]);
+    git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    // Diverge HEAD with a branch-only file, then make the index EXACTLY T's tree.
+    write(dir, "c.ts", "c\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "diverge"]);
+    // --no-overlay is REQUIRED: a plain `checkout <T> -- .` is an OVERLAY, so it
+    // restores a.ts/b.ts but leaves the branch-only c.ts in the index — the
+    // per-arm diff is then non-empty and the `out === ""` path is never reached
+    // (that made this pin vacuous against the old `return null`).
+    git(dir, ["checkout", "--no-overlay", "refs/remotes/origin/main", "--", "."]);
+    // Anti-vacuity: the per-arm diff really is zero bytes.
+    assert.equal(git(dir, ["diff", "--no-renames", "--raw", "-z", "refs/remotes/origin/main", "--cached"]), "",
+      "fixture must actually produce an EMPTY per-arm diff");
+    const bundle = makeSubBundle(dir);
+    assert.notEqual(bundle, null);
+    const ctx = makeGitSubCtx(dir, { bundle: bundle!, arm: "staged", recordedSide: "index" });
+    assert.notEqual(ctx, null);
+    // With a PROVABLY empty diff the path genuinely does not differ from T, so
+    // `differsFromBase` is `false` — NOT the fail-closed `true` that a failed
+    // probe yields. The fail-closed `true` is a different code path, pinned
+    // separately.
+    assert.equal(ctx!.differsFromBase("a.ts"), false,
+      "an empty diff means nothing differs — not a parse failure");
+    // Guards (0)/(1)/(2) all hold for the whole restored tree, so EVERY eligible
+    // path is subtracted. Under the old code this returned the full list.
+    const scope: DiffScope = { files: ["a.ts", "b.ts"], renameOldPaths: [], clean: true };
+    const r = subtractCommitArm(scope, new Map([["a.ts", "M"], ["b.ts", "M"]]), ctx);
+    assert.deepEqual(r.scope.files, [],
+      "an all-identical recorded side must subtract every eligible path, not none");
+    assert.deepEqual(r.audit?.perArmSubtracted, ["a.ts", "b.ts"],
+      "and the audit records them (anti-vacuity: a no-op would leave this absent)");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
