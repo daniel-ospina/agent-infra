@@ -116,10 +116,10 @@ const fakePi: any = {
     handlers.get(evt)!.push(h);
   },
 };
-async function fire(evt: string, event: any): Promise<any> {
+async function fire(evt: string, event: any, ctx: any = {}): Promise<any> {
   let result: any = undefined;
   for (const h of handlers.get(evt) ?? []) {
-    const r = await h(event, {});
+    const r = await h(event, ctx);
     if (r !== undefined) result = r;
   }
   return result;
@@ -4057,6 +4057,45 @@ async function main() {
     ok(res.reason.includes("feat80.ts"), "80: the block names the branch-authored file");
     ok(!res.reason.includes("basesub.ts"),
       "80: and does NOT name the base-identical incoming path — the push-leg de-flood");
+  });
+
+  // ── #3255: the git-op root must come from the cwd the runtime actually spawns
+  // the command in (ctx.cwd), NOT process.cwd(). The first attempt at this fix
+  // instead INFERRED the root from the verification bridge, which let a clean
+  // adopted tree produce an empty scope and silently ALLOW an op whose
+  // unverified content lived in the session's real tree. This pins the plumbing
+  // that replaced it: with no `input.cwd`, the root follows `ctx.cwd`. Ignoring
+  // ctx (falling back to process.cwd()) must turn this red.
+  test("scenario #3255: ctx.cwd decides the git-op root when input carries no cwd", async () => {
+    const hub = join(TEST_ROOT, "cwd-hub");
+    const wt = join(TEST_ROOT, "cwd-wt");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -q -b main");
+    writeFileSync(join(hub, "base.txt"), "base\n");
+    git(hub, "add base.txt");
+    git(hub, "commit -m baseline");
+    git(hub, `worktree add -q ${wt} -b wtbranch`);
+
+    // An unverified staged change exists in the WORKTREE ...
+    writeFileSync(join(wt, "wtfile.txt"), "v1\n");
+    git(wt, "add wtfile.txt");
+
+    // ... while the HUB has nothing staged, so the two roots are observably different.
+    const fromWt = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ctx'" }, // no input.cwd — ctx.cwd is the only signal
+    }, { cwd: wt });
+    ok(fromWt && fromWt.block === true,
+      "ctx.cwd=worktree must scope the op to the worktree and BLOCK on its unverified staged file");
+    ok(fromWt.reason.includes("wtfile.txt"),
+      "the block must name the worktree's own file, not another tree's");
+
+    const fromHub = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ctx'" },
+    }, { cwd: hub });
+    equal(fromHub, undefined,
+      "ctx.cwd=hub is clean → allowed; the two fires must DIFFER (identical results would mean ctx is ignored)");
   });
 
 } // main: plugin loaded; tests run sequentially via runAll()

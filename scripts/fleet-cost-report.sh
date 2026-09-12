@@ -162,7 +162,7 @@ for line in sys.stdin:
 fi
 
 python3 - "$SUMMARY_JSONL" "$CACHE_FLOOR" "$REGIME_TB" <<'PYEOF'
-import json, sys, statistics
+import json, sys, statistics, math
 
 raw, floor, regime_tb = (sys.argv[1], float(sys.argv[2]), float(sys.argv[3]))
 rows = [json.loads(l) for l in raw.splitlines() if l.strip()]
@@ -208,6 +208,52 @@ for r in rows:
 n_len = sum(r["genuine_len_stops"] for r in rows)
 n_len_sess = sum(1 for r in rows if r["genuine_len_stops"] > 0)
 
+# (d) peak/off-peak spend split (#634). DeepSeek bills 2x during 01:00-04:00
+# and 06:00-10:00 UTC, Mon-Fri; weekends are off-peak. The parser buckets
+# every costed call by its own timestamp, so the split is measured, not
+# modelled.
+#
+# THE RECORDED COST IS *NOT* WHAT WE WERE BILLED. models.json carries the
+# OFF-PEAK card and pi has no time-of-day cost logic (models.js calculateCost()
+# bills rates+tiers only), so a peak call logged at L was actually billed 2L.
+# Deferring that call to off-peak bills L — so the saving is the FULL logged
+# peak amount, NOT half of it. Evidence: the logged peak/off ratio per call is
+# ~0.98 (a real 2x would read ~2.0), i.e. every record is stamped at one flat
+# (off-peak) rate. NOTE that is a ratio of $ PER CALL, not of dollar totals —
+# the totals differ by call volume. (Whether the flash figure in models.json
+# and the research doc's rate card agree is a separate open question; the
+# structural premise here rests on the pro row, which matches off-peak exactly
+# and is half its documented peak.)
+peak_cost = sum(r.get("msg_cost_peak", 0) for r in rows)
+off_cost = sum(r.get("msg_cost_off", 0) for r in rows)
+undated_cost = sum(r.get("msg_cost_undated", 0) for r in rows)
+peak_calls = sum(r.get("msg_calls_peak", 0) for r in rows)
+off_calls = sum(r.get("msg_calls_off", 0) for r in rows)
+undated_calls = sum(r.get("msg_calls_undated", 0) for r in rows)
+if not all(math.isfinite(v) and v >= 0 for v in (peak_cost, off_cost, undated_cost)):
+    # An absurd aggregate (NaN, inf, or NEGATIVE) must not silently render as
+    # "no data" — this script fail-closes elsewhere on the same principle (a
+    # report that shows healthy absence while data exists is worse than a loud
+    # failure). Zero still flows to the genuine-absence path below.
+    print("ERROR: non-finite or negative cost aggregate (peak=%r off=%r) — "
+          "refusing to render a split that would read as data absence" % (peak_cost, off_cost),
+          file=sys.stderr)
+    sys.exit(2)
+split_total = peak_cost + off_cost
+peak_share = peak_cost / split_total if split_total > 0 else None
+# Billed view: peak dollars are doubled, off-peak are as logged.
+peak_billed = 2 * peak_cost
+billed_total = peak_billed + off_cost
+billed_share = peak_billed / billed_total if billed_total > 0 else None
+# Perfect deferral moves every peak call to off-peak: it saves the peak
+# premium, which is exactly the (doubled minus flat) difference = the logged
+# peak amount.
+premium_ceiling = peak_cost
+by_hour = {}
+for r in rows:
+    for h, v in (r.get("msg_cost_by_hour") or {}).items():
+        by_hour[h] = by_hour.get(h, 0.0) + v
+
 # ── render ──────────────────────────────────────────────────────────────────
 CEILING_TB = 900000   # must match session-postmortem.sh's parser constant
 print(f"# Fleet cost report — {len(rows)} session(s) in window "
@@ -245,6 +291,31 @@ if trend:
           f"range: {min(trend):.1%}–{max(trend):.1%}   (n={len(trend)} sessions)")
 else:
     print("- no usage data")
+
+print("")
+print("## (d) Peak/off-peak spend split (#634 — DeepSeek 2x windows)")
+if peak_share is None:
+    print("- no time-stamped cost data in this window")
+    if undated_calls:
+        print(f"- ALERT: {undated_calls:,} costed call(s) (${undated_cost:.2f}) carry no "
+              "usable timestamp, so the split is not merely empty — it is unmeasurable")
+else:
+    print("- recorded dollars are stamped at the OFF-PEAK card, so a peak call was")
+    print("  actually billed 2x what is logged here — both views are shown:")
+    print(f"- peak:     ${peak_cost:9.2f} logged  ${peak_billed:9.2f} billed   "
+          f"{peak_calls:,} calls")
+    print(f"- off-peak: ${off_cost:9.2f} logged                "
+          f"{off_calls:,} calls")
+    print(f"- share of logged spend: {peak_share:.1%}      "
+          f"share of BILLED spend: {billed_share:.1%}")
+    if undated_calls:
+        print(f"- undated calls excluded from the split: {undated_calls:,} (${undated_cost:.2f})")
+    print(f"- deferrable premium ceiling: ${premium_ceiling:.2f}   "
+          "(moving every peak call off-peak saves its full logged amount)")
+    print("  windows: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri")
+    top = sorted(by_hour.items(), key=lambda kv: -kv[1])[:5]
+    if top:
+        print("  busiest UTC hours: " + "   ".join(f"{h}Z ${v:.2f}" for h, v in top))
 
 print("")
 print("## Compaction + cost vs regenerated Aug baseline")
