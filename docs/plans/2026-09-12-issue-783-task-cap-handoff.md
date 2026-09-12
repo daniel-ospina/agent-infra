@@ -1,3 +1,14 @@
+---
+title: "Task-tool cap: recoverable handoff Implementation Plan (#783)"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-09-12
+aboutSubjects: organisation-design-team
+aboutObjects: agent-infra, builtin-tools, issue-783, task-tool, hard-cap, dispatch-record, task-sessions
+---
+
 # Task-tool cap: recoverable handoff Implementation Plan — **rev 10**
 
 <!-- research-path: skip -->

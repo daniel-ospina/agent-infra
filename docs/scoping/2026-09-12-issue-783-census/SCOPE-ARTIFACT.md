@@ -1,3 +1,14 @@
+---
+title: "#783 scope artifact — task-cap handoff (census + problem definition)"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-09-12
+aboutSubjects: organisation-design-team
+aboutObjects: agent-infra, issue-783, task-tool, hard-cap, census, problem-verify
+---
+
 # #783 — SCOPE ARTIFACT (issue-scoping v5.1, Standard tier) — **rev 10 (problem-verify CLEAN)**
 
 Repo: daniel-ospina/agent-infra · Branch: `fix/783-task-cap-handoff` · Date: 2026-09-12
