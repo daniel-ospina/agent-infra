@@ -1544,6 +1544,7 @@ const ITEM6_CWD_DIRS = Object.freeze([
   "extensions/verification-gate",
   "extensions/builtin-tools",
   "extensions/subagent",
+  "extensions/mcp-client",
 ]);
 // `bash -e <script>` is GitHub's default Linux invocation. Resolved to an ABSOLUTE
 // path because the stub directory below shadows `bash` on the child's PATH.

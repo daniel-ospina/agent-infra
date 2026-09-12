@@ -302,6 +302,88 @@ export const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 /** How often the idle sweep checks for lazy servers past their idle timeout. */
 export const IDLE_SWEEP_INTERVAL_MS = 60 * 1000;
 
+// ── Eager-connect retry (#802) ─────────────────────────────────────
+//
+// A remote server is cold on its first request after idle: measured against
+// the hosted Tortoise MCP, the first request after ~45s idle took 15.55s
+// (right at the 15s budget) and after ~100s idle it stalled 35.4s then
+// returned a zero-byte 503, while warm latency was 0.30s. The cold path thus
+// straddles the default budget BY DESIGN, so a single timeout is not evidence
+// the server is down — it is evidence the server was woken.
+//
+// Fix: retry a failed eager connect once. Attempt 1 warms the server; attempt
+// 2 (after a short pause) lands on the warm path. The retry is deliberately
+// bounded to one attempt so total startup can never exceed 2× the per-server
+// `timeoutMs` (15s default → ≤30s worst case, before transport teardown) —
+// startup must not hang. Operators raising `timeoutMs` raise BOTH attempt
+// budgets; it remains the cold-start budget knob.
+
+/** Max attempts per eager server connect (1 initial + 1 retry). */
+export const EAGER_CONNECT_MAX_ATTEMPTS = 2;
+/** Pause before the eager retry — the first attempt already woke the server. */
+export const EAGER_CONNECT_RETRY_DELAY_MS = 250;
+
+/**
+ * #802: deterministic errors — retrying cannot change the outcome, so skip the
+ * retry and fail immediately (no pointless startup delay). Covers missing
+ * transport config and auth outcomes (a retry would re-emit the OAuth URL with
+ * a fresh PKCE verifier).
+ */
+export function isRetryableEagerConnectError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Missing transport config — deterministic.
+  if (/has neither 'command' nor 'url'/.test(msg)) return false;
+  // Auth outcomes (401/403, OAuth-required) are deterministic too, and a retry
+  // rebuilds the OAuth provider with a FRESH PKCE verifier: it emits the
+  // browser auth URL a second time and overwrites the stored verifier, while
+  // the user is most likely acting on the first URL. Do not retry auth.
+  if (err instanceof UnauthorizedError) return false;
+  if (/\b(401|403)\b/.test(msg) || /unauthorized/i.test(msg)) return false;
+  return true;
+}
+
+/**
+ * #802: connect one eager server, retrying a transient failure once.
+ *
+ * Exported (named) so the retry policy is testable without a live server.
+ * `connect` is injected so callers can wrap `connectServer`. Throws the last
+ * error after the attempt budget is spent.
+ */
+export async function connectEagerWithRetry(
+  name: string,
+  connect: () => Promise<void>,
+  opts: { maxAttempts?: number; retryDelayMs?: number } = {}
+): Promise<{ attempts: number }> {
+  const requestedAttempts = opts.maxAttempts ?? EAGER_CONNECT_MAX_ATTEMPTS;
+  // Guard against a caller passing 0/negative/NaN — an empty loop would throw
+  // an undefined `lastErr` and surface as "...: undefined" in the log.
+  const maxAttempts =
+    Number.isFinite(requestedAttempts) && requestedAttempts >= 1
+      ? Math.floor(requestedAttempts)
+      : 1;
+  const retryDelayMs = opts.retryDelayMs ?? EAGER_CONNECT_RETRY_DELAY_MS;
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await connect();
+      return { attempts: attempt };
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= maxAttempts || !isRetryableEagerConnectError(err)) break;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(
+        `[mcp-client] Eager connect to '${name}' failed (attempt ${attempt}/${maxAttempts}): ${msg} — retrying in ${retryDelayMs}ms`
+      );
+      if (retryDelayMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+    }
+  }
+
+  throw lastErr;
+}
+
 // ── Types ──────────────────────────────────────────────────────────
 
 interface McpServerConfig {
@@ -671,13 +753,19 @@ export class McpServerManager {
 
     // Connect to all eager servers in parallel with per-server timeout.
     // Each server can override via timeoutMs in .mcp.json (e.g. tortoise needs ~30s for warm-up).
+    // #802: a failed attempt is retried ONCE — remote servers are cold on first
+    // use and the failure is expected, not exceptional (see connectEagerWithRetry).
     // Track server names alongside results so error logs identify which server failed.
     const results = await Promise.allSettled(
       eager.map(async ([serverName, serverConfig]) => {
         const startTime = Date.now();
         const timeoutMs = serverConfig.timeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
-        await this.connectServer(serverName, serverConfig, timeoutMs);
-        console.log(`[mcp-client] Connected to '${serverName}' (${Date.now() - startTime}ms)`);
+        const { attempts } = await connectEagerWithRetry(serverName, () =>
+          this.connectServer(serverName, serverConfig, timeoutMs)
+        );
+        console.log(
+          `[mcp-client] Connected to '${serverName}' (${Date.now() - startTime}ms${attempts > 1 ? `, attempt ${attempts}` : ""})`
+        );
         return serverName;
       })
     );
@@ -694,8 +782,13 @@ export class McpServerManager {
         );
         // #36: Fail-fast — MCP unavailable, continuing without it.
         // Sub-agents already work without MCP; hanging at exit wastes ~8min.
+        // #802: name the recovery command — the agent/user cannot call a
+        // health tool for a server whose tools never registered, so the log
+        // line is the only signal. mcp_load retries the connection on demand
+        // and registers the tools for the rest of the session.
         console.log(
-          `[mcp-client] MCP server '${serverName}' unavailable — continuing without it`
+          `[mcp-client] MCP server '${serverName}' unavailable — continuing without it. ` +
+            `Recover with: mcp_load ${serverName} (or raise "timeoutMs" in .mcp.json for a slow cold start).`
         );
       } else {
         succeeded++;

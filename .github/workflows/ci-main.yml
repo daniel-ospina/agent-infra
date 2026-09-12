@@ -167,6 +167,21 @@ jobs:
         echo "== extensions/builtin-tools/subagent-e2e-smoke.test.ts =="
         PATH="$PWD/extensions/subagent/node_modules/.bin:$PATH" \
           npx tsx extensions/builtin-tools/subagent-e2e-smoke.test.ts || failures=$((failures+1))
+        # #802 — mcp-client suites were never wired into CI (the extension had
+        # node_modules deps but no job). eager-retry.test.ts is the #802
+        # regression guard: eager connect must retry a cold/stalling server
+        # once and name `mcp_load <server>` when it still fails. The suites
+        # import @modelcontextprotocol/sdk + typebox (real runtime deps), so
+        # npm ci once (same route as builtin-tools/subagent above), then run
+        # from the repo root — resolution.test.ts reads templates/ via cwd.
+        (cd extensions/mcp-client && npm ci --no-audit --no-fund --loglevel=error) || failures=$((failures+1))
+        for t in resolution.test.ts lifecycle.test.ts oauth.test.ts eager-retry.test.ts oauth-refresh.integration.test.ts; do
+          echo "== extensions/mcp-client/$t =="
+          npx tsx "extensions/mcp-client/$t" || failures=$((failures+1))
+        done
+        echo "== extensions/mcp-client/mcp-load.integration.test.ts =="
+        npx tsx extensions/mcp-client/mcp-load.integration.test.ts || failures=$((failures+1))
+
         if [ $failures -gt 0 ]; then
           echo "❌ $failures extension test file(s) failed"
           exit 1
