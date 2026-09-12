@@ -178,6 +178,17 @@ jobs:
         # invocation.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~30s.
         run: node extensions/main-worktree-guard/test-module-load.mjs
+      - name: main-worktree-guard working-tree-discard gate (#709)
+        # The discard family used to be gated on git ARGV, so `git checkout --
+        # <path>` (the 2026-09-10 incident verb) classified `allow` and every
+        # other discard verb was exempt in linked worktrees — exactly where the
+        # `pi -p` review fixers run. #709 keys the gate on the EFFECT instead.
+        # Behavioral: loads the REAL index.ts through module-load-hooks.mjs and
+        # drives the tool_call handler against a hermetic hub + linked worktree.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s. Its own
+        # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
+        # not PR-triggered); perf-parity with the #744 step above.
+        run: node extensions/main-worktree-guard/test-discard-gate.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
