@@ -62,12 +62,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch PR base ref (#716 check (f) reads the base designation file)
-        # check (f) reads pi-bootstrap/pi-config/second-model.json from the PR's
-        # BASE via `git show <base>:<path>` — a default depth-1 checkout does
-        # not carry the base object, and an unresolvable base would fall back
-        # to the bootstrap WARN. Fetch the exact base commit so enforcement is
-        # real as soon as the designation file exists on main. (No-op for
+      - name: Fetch PR base ref (#977 archived check (f) reads the base designation file)
+        # The ARCHIVED check (f) still reads
+        # pi-bootstrap/pi-config/second-model.json from the PR's BASE via
+        # `git show <base>:<path>` to report the base state (the bootstrap
+        # exemption). It no longer blocks a merge (#977), so this fetch is for
+        # report accuracy, not enforcement: without the base object the check
+        # reports an unresolvable base as a non-blocking warning. (No-op for
         # workflow_call, where the base-sha context is empty.)
         if: ${{ github.event.pull_request.base.sha != '' }}
         run: git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"

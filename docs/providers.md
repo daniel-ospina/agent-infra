@@ -112,32 +112,41 @@ stderr notice naming it a *candidate, not a resolution* (#910 defect 1); it
 must never be the dispatch source. The guard header and the four gate skills
 state this same rule.
 
-**Fail-closed DEGRADED.** When `--probe` exits non-zero (the probe prints
-plain `DEGRADED` and exits 1) — or, for a malformed/unusable authority,
-`--print` emits `**DEGRADED` — the gate
-does NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in
-task-subagent default) or any build-equivalent model would be a same-build
-"independent" review, the #716 defect. The governing trigger is the **`--probe`
-exit code**; the `--print` token is secondary and fires only where it can
-genuinely fire (a malformed/unusable authority — insolvency is undetectable
-offline). Do NOT record a degraded marker — check (f) hard-fails **both**
-forms: `model=**DEGRADED` is rejected as a reserved value (before the
-independence field is read), and `independent=DEGRADED` is rejected by design
-(see the check (f) list below). STOP and escalate to a human: a guarded-surface
-change cannot merge until an independent model is funded or the operator
-authorizes a bypass (#860).
+**DEGRADED is RECORDED, not enforced (#977).** When `--probe` exits non-zero
+(the probe prints plain `DEGRADED` and exits 1) — or, for a malformed/unusable
+authority, `--print` emits `**DEGRADED` — the gate does NOT dispatch a
+substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default)
+or any build-equivalent model would be a same-build "independent" review, the
+#716 defect. That prohibition stays, and is enforced **offline** by the
+designation guard
+(`bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --check --shipped-only`),
+which still runs in `.husky/pre-commit`, `ci.yml`, `ci-main.yml` and `sync.sh`.
+The governing trigger is the **`--probe` exit code**; the `--print` token is
+secondary and fires only where it can genuinely fire (a malformed/unusable
+authority — insolvency is undetectable offline). The PR-time DISPATCH check
+(check (f)) is **ARCHIVED** (#977) and no longer blocks a merge: it required a
+funded independent model that is not funded (#860), it was the only thing
+blocking the entire guarded surface, it could not repair itself, and its
+`[SECOND-MODEL-GATE]` marker is unsigned raw text that never verified
+independence. A DEGRADED window is therefore recorded honestly — as
+`independent=DEGRADED`, with `model=**DEGRADED` still reported as a reserved
+value — and surfaced as a non-blocking `⚠️` warning. Escalate to a human for
+the funding or override decision (#860), but the merge is not mechanically
+blocked.
 
 **Success path — record the marker.** When the probe resolves
 (`RESOLVED=<provider/id>`), record the success form on the same idempotent
 channel: `SECOND_MODEL_GATE_MODEL=<RESOLVED id>
 SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh`, which appends
 `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>` to the PR body.
-`scripts/check-pipeline-compliance.sh` check (f) is the mechanical consumer: on
-a diff touching the guarded surface it requires the line and fails on
-`independent=NO` / `independent=DEGRADED` / a build-equivalent id / a reserved
-or non-id model (including the reserved placeholders `none`/`null`/`n/a`/
-`unknown`, not just `**DEGRADED`) / conflicting markers / a line not bound to
-the PR head. `$SECOND_MODEL` remains an
+`scripts/check-pipeline-compliance.sh` check (f) is now an **informational
+consumer only** (#977, ARCHIVED): on a diff touching the guarded surface it
+still DETECTS and prints `independent=NO` / `independent=DEGRADED` / a
+build-equivalent id / a reserved or non-id model (including the reserved
+placeholders `none`/`null`/`n/a`/`unknown`, not just `**DEGRADED`) /
+conflicting markers / a line not bound to the PR head, and a valid marker still
+prints its `pass f` line — but none of those findings blocks the merge any
+more. `$SECOND_MODEL` remains an
 operator override (config-default fail-closed,
 operator-override-open-by-design) and is annotated, never blocked; the probe
 certifies only the override id (see the dispatch contract above), so the
@@ -174,15 +183,19 @@ override cannot authorize a designation that does not exist. Sanctioned only
 for the documented bootstrap/rollback window (#716): the one-time install of
 the designation in a repo whose base lacks it, or rolling the config back after
 a bad candidate. It is not a general merge bypass — outside that window, fund a
-candidate or fix the config instead.
+candidate or fix the config instead. It affects the **offline designation
+guard** only: the archived PR-time check (f) has no override and no merge
+effect (#977).
 
 **Bootstrap exemption.** Check (f) is a loud WARN until
 `pi-bootstrap/pi-config/second-model.json` POSITIVELY exists on the PR's base
 ref — a one-time carve-out keyed only on the file's absence on base (never a
 branch name, PR number, or commit range; never obtainable by a diff touching
 the file). An UNRESOLVABLE base ref (a shallow clone, or the CI workflow's
-base-fetch step removed) is a FAIL, not a WARN: a base that cannot be read
-cannot prove the file was ever absent.
+base-fetch step removed) is reported as a non-blocking warning — a base that
+cannot be read cannot prove the file was ever absent, so the report says so
+rather than silently reading it as absent. (Before #977 this was a FAIL; it is
+now informational only.)
 
 **Why.** From 2026-09-14 12:00 Beijing, `deepseek-v4-pro` is served by the same
 V4.1 Flash build as the primary session, so a provider-qualified id check alone

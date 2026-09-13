@@ -24,9 +24,11 @@
 #      carries the override-hatch text (A7)
 #  11. missing-runtimeVia → fail closed (exit 2); missing/empty
 #      `unreachablePatterns` → fail closed (exit 2, D1)
-#  12. check (f) simulation (pipeline-compliance) → pass/fail/bootstrap cases,
-#      including the C1 (unresolvable base), C2 (rename + newly guarded paths)
-#      and C3 (laundering / boundary / head-binding) bypasses
+#  12. check (f) simulation (pipeline-compliance) → #977 ARCHIVED: every
+#      guarded-surface finding still DETECTED (detection unchanged) but now
+#      contributes ZERO failures (informational, non-blocking) — plus the
+#      bootstrap WARN. Covers the C1 (unresolvable base), C2 (rename + newly
+#      guarded paths) and C3 (laundering / boundary / head-binding) findings.
 #  12b. hermeticity: a corrupt or backdoor ambient $HOME config never leaks into
 #      a pinned assertion (D2)
 #  13. non-vacuity + the full normalization matrix (A3/D8); duplicate
@@ -333,50 +335,50 @@ code=$?
 if [ "$code" -eq 1 ]; then pass "simulation ran (exit 1 by design)"; else fail "simulation expected exit 1, got $code"; sed -n '1,40p' "$OUT"; fi
 for marker in \
   "pass 6: check (f) passed" \
-  "pass 6b: check (f) blocked DEGRADED" \
-  "pass 6c: check (f) blocked independent=NO" \
-  "pass 6d: check (f) blocked a build-equivalent recorded id" \
-  "pass 6y: check (f) blocks the bare deepseek shorthand as independent=yes" \
-  "pass 6i2: check (f) blocks a conflicting pair whose DEGRADED line has a | in trailing prose" \
-  "pass 6i3: check (f) blocks a conflicting markdown-table-cell marker (trailing |)" \
-  "pass 6i4: check (f) blocks model=none| (a | in the MODEL slot is not a placeholder)" \
-  "pass 6i5: check (f) blocks a glued-pipe DEGRADED line (| in the INDEPENDENT slot)" \
+  "pass 6b: check (f) warns (archived): DEGRADED recorded" \
+  "pass 6c: check (f) warns (archived): independent=NO recorded" \
+  "pass 6d: check (f) warns (archived): a build-equivalent recorded id" \
+  "pass 6y: check (f) warns (archived): the bare deepseek shorthand as independent=yes" \
+  "pass 6i2: check (f) warns (archived): a conflicting pair whose DEGRADED line has a | in trailing prose" \
+  "pass 6i3: check (f) warns (archived): a conflicting markdown-table-cell marker (trailing |)" \
+  "pass 6i4: check (f) warns (archived): model=none| (a | in the MODEL slot is not a placeholder)" \
+  "pass 6i5: check (f) warns (archived): a glued-pipe DEGRADED line (| in the INDEPENDENT slot)" \
   "pass 6z: check (f) passes when the body quotes the marker format alongside a valid marker" \
-  "pass 6z2: check (f) FAILS on a genuine garbage marker line" \
+  "pass 6z2: check (f) warns (archived): a genuine garbage marker line" \
   "pass 6z3: check (f) passes when the body quotes model=<id> independent=yes" \
   "pass 6z3b: check (f) passes when the body quotes model=<resolved provider/id>" \
   "pass 6z4: check (f) passes when a quoted line has a concrete model + quoted independent" \
-  "pass 6e: check (f) blocked a missing marker" \
+  "pass 6e: check (f) warns (archived): a missing marker" \
   "pass 6f: check (f) bootstrap exemption WARN" \
-  "pass 6g: check (f) enforcement on once the file exists on base" \
-  "pass 6h: check (f) FAILS on an unresolvable base" \
-  "pass 6i: check (f) enforces across a rename OUT of the guarded surface" \
-  "pass 6p-_github_workflows_pipeline-compliance_yml: check (f) enforces on a change to .github/workflows/pipeline-compliance.yml" \
-  "pass 6p-pi-bootstrap_setup_sh: check (f) enforces on a change to pi-bootstrap/setup.sh" \
-  "pass 6p-sync_sh: check (f) enforces on a change to sync.sh" \
-  "pass 6p-pi-bootstrap_pi-config_models_json: check (f) enforces on a change to pi-bootstrap/pi-config/models.json" \
-  "pass 6j: check (f) blocks a reserved model laundered as independent=yes" \
-  "pass 6o: check (f) blocks the bare DEGRADED token as a model value" \
-  "pass 6k: check (f) blocks a trailing-boundary bypass" \
-  "pass 6k1: check (f) blocks a numeric-suffixed boundary bypass (independent=yes1)" \
-  "pass 6k2: check (f) blocks a hyphen-suffixed boundary bypass (independent=yes-foo)" \
-  "pass 6k3: check (f) blocks an underscore-suffixed boundary bypass (independent=yes_foo)" \
-  "pass 6k5: check (f) blocks a punctuation-suffixed boundary bypass (independent=yes.)" \
-  "pass 6k4: check (f) blocks a duplicated independent= token" \
+  "pass 6g: check (f) warns (archived): the finding once the file exists on base" \
+  "pass 6h: check (f) warns (archived): an unresolvable base (deleted base-fetch / shallow clone)" \
+  "pass 6i: check (f) warns (archived): a rename OUT of the guarded surface" \
+  "pass 6p-_github_workflows_pipeline-compliance_yml: check (f) warns (archived): a change to .github/workflows/pipeline-compliance.yml" \
+  "pass 6p-pi-bootstrap_setup_sh: check (f) warns (archived): a change to pi-bootstrap/setup.sh" \
+  "pass 6p-sync_sh: check (f) warns (archived): a change to sync.sh" \
+  "pass 6p-pi-bootstrap_pi-config_models_json: check (f) warns (archived): a change to pi-bootstrap/pi-config/models.json" \
+  "pass 6j: check (f) warns (archived): a reserved model laundered as independent=yes" \
+  "pass 6o: check (f) warns (archived): the bare DEGRADED token as a model value" \
+  "pass 6k: check (f) warns (archived): a trailing-boundary bypass (independent=yesx)" \
+  "pass 6k1: check (f) warns (archived): a numeric-suffixed boundary bypass (independent=yes1)" \
+  "pass 6k2: check (f) warns (archived): a hyphen-suffixed boundary bypass (independent=yes-foo)" \
+  "pass 6k3: check (f) warns (archived): an underscore-suffixed boundary bypass (independent=yes_foo)" \
+  "pass 6k5: check (f) warns (archived): a punctuation-suffixed boundary bypass (independent=yes.)" \
+  "pass 6k4: check (f) warns (archived): a duplicated independent= token" \
   "pass 6z: check (f) passes when the body quotes the marker format alongside a valid marker" \
-  "pass 6z2: check (f) FAILS on a genuine garbage marker line" \
-  "pass 6l: check (f) blocks a marker bound to another head" \
-  "pass 6m: check (f) blocks a marker with no head binding" \
-  "pass 6n: check (f) blocks a non-id model value" \
-  "pass 6p-_github_workflows_ci_yml: check (f) enforces on a change to .github/workflows/ci.yml" \
-  "pass 6p-_github_workflows_ci-main_yml: check (f) enforces on a change to .github/workflows/ci-main.yml" \
-  "pass 6p-tests_second-model_run_sh: check (f) enforces on a change to tests/second-model/run.sh" \
-  "pass 6q: check (f) FAILS on a malformed file row (micro PR, no b-e)" \
-  "pass 6r: check (f) FAILS on a FILES_EXPECTED mismatch (micro PR, no b-e)" \
-  "pass 6s: check (f) blocks a reserved none-token model laundered as independent=yes" \
-  "pass 6t: check (f) blocks a reserved null-token model laundered as independent=yes" \
-  "pass 6u: check (f) blocks conflicting markers (later yes must not override DEGRADED)" \
-  "pass 6v: check (f) blocks two distinct recorded model ids"; do
+  "pass 6z2: check (f) warns (archived): a genuine garbage marker line" \
+  "pass 6l: check (f) warns (archived): a marker bound to another head" \
+  "pass 6m: check (f) warns (archived): a marker with no head binding" \
+  "pass 6n: check (f) warns (archived): a non-id model value" \
+  "pass 6p-_github_workflows_ci_yml: check (f) warns (archived): a change to .github/workflows/ci.yml" \
+  "pass 6p-_github_workflows_ci-main_yml: check (f) warns (archived): a change to .github/workflows/ci-main.yml" \
+  "pass 6p-tests_second-model_run_sh: check (f) warns (archived): a change to tests/second-model/run.sh" \
+  "pass 6q: check (f) warns (archived): a malformed file row (micro PR, no b-e)" \
+  "pass 6r: check (f) warns (archived): a FILES_EXPECTED mismatch (micro PR, no b-e)" \
+  "pass 6s: check (f) warns (archived): a reserved none-token model laundered as independent=yes" \
+  "pass 6t: check (f) warns (archived): a reserved null-token model laundered as independent=yes" \
+  "pass 6u: check (f) warns (archived): conflicting markers (later yes must not override DEGRADED)" \
+  "pass 6v: check (f) warns (archived): two distinct recorded model ids"; do
   grep -q "✅ $marker" "$OUT" && pass "$marker" || { fail "missing simulation marker: $marker"; tail -5 "$OUT"; }
 done
 
@@ -407,8 +409,8 @@ PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 PIPELINE_SECOND_MOD
 code=$?
 if [ "$code" -eq 1 ]; then pass "real-git FAIL_ALL simulation ran (exit 1 by design)"; else fail "real-git simulation expected exit 1, got $code"; tail -25 "$OUT"; fi
 for marker in \
-  "pass 6w: check (f) FAILS on an absent-but-well-formed real GITHUB_BASE_SHA (real git path)" \
-  "pass 6x: check (f) FAILS when a raw-sha PIPELINE_BASE_REF is absent and a fallback ref resolves but lacks the file"; do
+  "pass 6w: check (f) warns (archived) on an absent-but-well-formed real GITHUB_BASE_SHA (real git path)" \
+  "pass 6x: check (f) warns (archived) when a raw-sha PIPELINE_BASE_REF is absent and a fallback ref resolves but lacks the file"; do
   grep -q "✅ $marker" "$OUT" && pass "$marker" || { fail "missing real-git marker: $marker"; tail -15 "$OUT"; }
 done
 rm -rf "$TMPREPO"
