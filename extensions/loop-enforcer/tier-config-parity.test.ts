@@ -473,6 +473,51 @@ export const EXECUTABLE_DEFAULT_BOUND = 10;
 export const BOUND_SENTINEL = "__PIN_BOUND__";
 
 /**
+ * The fenced L1 block the executable pin runs: the one that assigns `BOUND` and
+ * references `ADVERSARIAL_BOUND`.
+ */
+export function fixerLoopBlock(src: string): string {
+  const block = executableBashBlocks(src).find(
+    (b) => /^\s*BOUND=\d+\s*$/m.test(stripShellComments(b)) && b.includes("ADVERSARIAL_BOUND"),
+  );
+  if (!block) throw new Error("no fenced bash block assigns BOUND and references ADVERSARIAL_BOUND");
+  return block;
+}
+
+/**
+ * The ONLY statement shapes the documented L1 fence may contain — fully anchored
+ * (comment-stripped, trimmed lines). This is an ALLOWLIST, and it fails closed:
+ * any statement that does not match one of these is a violation, so the
+ * executable body cannot define a function, set a trap, background a writer,
+ * reassign a builtin (`command`/`printf`/`builtin`/`[`), or otherwise touch the
+ * reporting channel. That is what makes the stdout read-back unforgeable — a
+ * decoy, a shadowed builtin, or `exec 1>&2` is simply not an allowed statement
+ * (cycle-2 finding on the executable pin).
+ */
+const L1_ALLOWED_STATEMENTS: RegExp[] = [
+  /^CYCLE=\$\(\(CYCLE \+ 1\)\)$/,
+  /^BOUND=\d+$/,
+  /^if \[ "\$\{ADVERSARIAL_BOUND:-0\}" = "1" \]; then BOUND=\d+; fi$/,
+  /^if \[ \$CYCLE -gt \$BOUND \]; then$/,
+  /^if \[ "\$\{ADVERSARIAL_BOUND:-0\}" = "1" \]; then EXIT_REASON="adversarial-capped"; else EXIT_REASON="cycle-cap"; fi$/,
+  /^break$/,
+  /^fi$/,
+  /^PR_STATE=\$\(gh pr view \$PR_NUMBER --json state --jq '\.state' 2>\/dev\/null \|\| echo "UNKNOWN"\)$/,
+  /^if \[ "\$PR_STATE" != "OPEN" \]; then EXIT_REASON="pr-closed"; break; fi$/,
+];
+
+/** Statements in the fenced L1 block that are not part of the documented fence. */
+export function unallowedL1Statements(block: string): string[] {
+  const bad: string[] = [];
+  for (const raw of stripShellComments(block).split("\n")) {
+    const line = raw.trim();
+    if (line === "") continue;
+    if (!L1_ALLOWED_STATEMENTS.some((re) => re.test(line))) bad.push(line);
+  }
+  return bad;
+}
+
+/**
  * The bound the fence ACTUALLY produces, obtained by RUNNING it. The fenced L1
  * block is executed under bash with `ADVERSARIAL_BOUND` set to 1 (adversarial)
  * or 0 (general), `gh` stubbed to report OPEN, and the loop variables seeded —
@@ -488,10 +533,13 @@ export const BOUND_SENTINEL = "__PIN_BOUND__";
  * fixer agent copies; it cannot prove an agent ran something else.
  */
 export function effectiveAdversarialBound(src: string, adversarial: boolean): number {
-  const block = executableBashBlocks(src).find(
-    (b) => /^\s*BOUND=\d+\s*$/m.test(stripShellComments(b)) && b.includes("ADVERSARIAL_BOUND"),
-  );
-  if (!block) throw new Error("no fenced bash block assigns BOUND and references ADVERSARIAL_BOUND");
+  const block = fixerLoopBlock(src);
+  const unallowed = unallowedL1Statements(block);
+  if (unallowed.length > 0) {
+    throw new Error(
+      `the fixer-loop fence contains statements the harness refuses to execute: ${unallowed.join(" | ")}`,
+    );
+  }
   const body = stripShellComments(block).replace(/\bbreak\b/g, "true");
   const script = [
     'gh() { echo "OPEN"; }',
@@ -532,6 +580,18 @@ export function effectiveAdversarialBound(src: string, adversarial: boolean): nu
  */
 export function executableBoundViolations(src: string): string[] {
   const violations: string[] = [];
+  // Layer 0 — the fail-closed statement allowlist. Anything the documented
+  // fence would not contain is refused BEFORE execution, so it cannot shadow a
+  // builtin or forge the report (cycle-2 finding).
+  try {
+    for (const line of unallowedL1Statements(fixerLoopBlock(src))) {
+      violations.push(
+        `fixer-loop: \`${line}\` is not part of the documented L1 fence — refusing to execute it`,
+      );
+    }
+  } catch {
+    // A missing block is reported by the shape/execution layers below.
+  }
   const bounds = executableBoundAssignments(src);
   if (bounds.length !== 2) {
     violations.push(
@@ -782,11 +842,11 @@ test("rejects a neutered guard variable (`ADVERSARIAL_BOUND=0` before the intact
     v.some((s) => s.includes("reassigns the guard variable")),
     `expected a guard-reassignment violation, got: ${v.join(" | ")}`,
   );
-  // The execution layer must also observe the neutered bound.
-  equal(
-    effectiveAdversarialBound(neutered, true),
-    EXECUTABLE_DEFAULT_BOUND,
-    "executing the neutered fence must yield the general default",
+  // The allowlist also refuses the injected statement, so the execution layer
+  // fails closed instead of observing the neutered bound.
+  ok(
+    v.some((s) => s.includes("not part of the documented L1 fence")),
+    `expected the allowlist to refuse the injected reassignment, got: ${v.join(" | ")}`,
   );
 });
 
@@ -802,8 +862,8 @@ test("rejects an unconditional adversarial branch (guard removed, assignment int
   deepEqual(executableBoundAssignments(unconditional), [EXECUTABLE_DEFAULT_BOUND, ADVERSARIAL_CAP]);
   const v = executableBoundViolations(unconditional);
   ok(
-    v.some((s) => s.includes("ADVERSARIAL_BOUND=0 yields BOUND=2")),
-    `expected the general-mode execution violation, got: ${v.join(" | ")}`,
+    v.some((s) => s.includes("not part of the documented L1 fence")),
+    `expected the allowlist to refuse the rewritten guard, got: ${v.join(" | ")}`,
   );
 });
 
@@ -823,18 +883,42 @@ test("rejects a FORGED stdout marker (decoy `printf \"BOUND=%d\\n\" 2` + real `(
     [EXECUTABLE_DEFAULT_BOUND, ADVERSARIAL_CAP],
     "the assignment shape is expected to stay green",
   );
-  // The OLD harness (append `echo "BOUND=…"`, first-match) read the forged `2`.
-  // The sentinel + last-match harness reads its own trailing echo, so the REAL
-  // executed 10 is observed and the bypass fails.
-  equal(
-    effectiveAdversarialBound(forged, true),
-    EXECUTABLE_DEFAULT_BOUND,
-    "the forged marker must not be read — the real executed bound is 10",
-  );
+  // The decoy is not part of the documented fence, so the allowlist refuses to
+  // execute it — the pin goes red and the forged marker is never even reached.
+  // (The sentinel + last-match read in `effectiveAdversarialBound` remains as
+  // the layer beneath this, for any body that is allowlist-clean.)
   const v = executableBoundViolations(forged);
   ok(
-    v.some((s) => s.includes("ADVERSARIAL_BOUND=1 yields BOUND=10")),
-    `expected the forged marker to be rejected with the real bound, got: ${v.join(" | ")}`,
+    v.some((s) => s.includes("not part of the documented L1 fence")),
+    `expected the unknown decoy statement to be refused, got: ${v.join(" | ")}`,
+  );
+  ok(v.length > 0, "the forged fence must be a violation");
+});
+
+test("rejects a body that shadows a builtin to forge the marker (function definition — cycle-2 finding)", () => {
+  const path = "skills/code-review/references/fixer-loop.md";
+  const src = ADVERSARIAL_SOURCES[path];
+  const shadowed = src.replace(
+    "\nBOUND=10\n",
+    '\n[() { return 1; }\ncommand() { if (( ADVERSARIAL_BOUND )); then echo "__PIN_BOUND__=2"; else echo "__PIN_BOUND__=10"; fi; }\nBOUND=10\n',
+  );
+  ok(shadowed !== src, "control did not apply — the `BOUND=10` default was not found");
+  // Anchor parity and the numeric shape stay green; only the allowlist sees the
+  // injected function definitions.
+  deepEqual(
+    adversarialBoundViolations({ ...ADVERSARIAL_SOURCES, [path]: shadowed }),
+    [],
+    "anchor parity is expected to stay green",
+  );
+  deepEqual(
+    executableBoundAssignments(shadowed),
+    [EXECUTABLE_DEFAULT_BOUND, ADVERSARIAL_CAP],
+    "the assignment shape is expected to stay green",
+  );
+  const v = executableBoundViolations(shadowed);
+  ok(
+    v.some((s) => s.includes("not part of the documented L1 fence")),
+    `expected the function definitions to be refused, got: ${v.join(" | ")}`,
   );
 });
 
