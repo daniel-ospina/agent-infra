@@ -415,12 +415,12 @@ For each cycle:
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
-**Stuckness detection:** recurrence = `|current ∩ prev| / |prev|` (the fraction of the previous cycle's issues that recurred).
-- **Fingerprint-stall:** recurrence ≥ `stall_threshold` (default `0.8`) → escalate to human. Recurrence alone is sufficient to fire.
-- **Honest-stuck:** recurrence ≥ `stall_threshold` **AND** new issues present **AND** issue count non-decreasing 3 consecutive cycles → escalate to human.
+**Stuckness detection:** recurrence = `|current ∩ prev| / |prev|` (the fraction of the previous cycle's issues that recurred). Fingerprints are taken over `location + severity` — **not** `description`/`suggestion`, which a fresh reviewer re-words every cycle.
+- **Fingerprint-stall:** recurrence ≥ `stall_threshold` (default `0.8`) → escalate to human.
+- **Honest-stuck:** issue count non-decreasing for 3 consecutive cycles → escalate to human. **Independent signal — fires regardless of recurrence** (a one-for-one churn has low recurrence but is not converging).
 - **Zero-progress:** no files changed 2 consecutive cycles → escalate to human.
 
-> Do NOT phrase honest-stuck as "non-decreasing count **+ different fingerprints**" — that two-sided phrasing leaves the `[0, threshold)` band satisfying *neither* detector. Recurrence gates *whether* we fire; the new-issue test gates only the *label*. The executable predicate lives in `code-review/references/fixer-loop.md`.
+> **Fire if `recurrence ≥ stall_threshold` OR the count is non-decreasing for 3 cycles.** Either alone is sufficient. Recurrence picks the *label* only (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`) — never a precondition for the count signal. The executable predicate lives in `code-review/references/fixer-loop.md`.
 
 **Hard cap: 10 cycles.** Test review is narrower scope than plan review. On cap:
 ```

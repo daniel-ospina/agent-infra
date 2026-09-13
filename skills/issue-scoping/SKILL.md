@@ -967,7 +967,7 @@ Each review cycle dispatches FRESH `task` sub-agents.
 
 **Stuckness detection:**
 - Fingerprint-stall: recurrence `|current ∩ prev| / |prev|` ≥ `stall_threshold` (default `0.8`) → escalate
-- Honest-stuck: recurrence ≥ `stall_threshold` **AND** new issues present **AND** non-decreasing issue count for 3 cycles → escalate
+- Honest-stuck: issue count non-decreasing for 3 cycles → escalate. **Independent signal — fires regardless of recurrence** (a one-for-one churn has low recurrence but is not converging)
 - Zero-progress: plan unchanged for 2 cycles → escalate
 - Convergence: strict subset of prior cycle → escalate with remaining issues
 **Safety cap:** 10 cycles.

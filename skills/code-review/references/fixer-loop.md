@@ -1,4 +1,4 @@
-> **Source:** Canonical copy at `skills/code-review/references/fixer-loop.md``.
+> **Source:** Canonical copy at `skills/code-review/references/fixer-loop.md`.
 
 # Fixer Loop — Reference
 
@@ -221,7 +221,14 @@ current_issues = json.loads(os.environ['__CURR_ISSUES'])
 prev_fps = set(json.loads(os.environ['__PREV_FPS']))
 current_fps = set()
 for issue in current_issues:
-    raw = issue.get('location','') + ':' + issue.get('description','') + ':' + issue.get('suggestion','')
+    # Fingerprint = the defect's STABLE IDENTITY, not its wording. Hashing
+    # description plus suggestion made recurrence depend on how a fresh,
+    # memoryless reviewer happened to phrase things: the same defect re-described
+    # in new words hashed differently, so recurrence read as zero on a cycle
+    # where nothing had been fixed. That is the most common real stall, and it
+    # made the primary detector blind to it. location plus severity identifies
+    # the defect; the prose is the part the LLM varies.
+    raw = issue.get('location','') + ':' + issue.get('severity','')
     current_fps.add(hashlib.sha256(raw.encode()).hexdigest())
 # Recurrence = the fraction of LAST cycle's issues that came back. This is the
 # stall signal, and the denominator is deliberately len(prev_fps) -- did the
@@ -232,9 +239,7 @@ for issue in current_issues:
 # NOTE: this comment lives INSIDE a double-quoted shell string -- never use a
 # double quote or a backtick here; both break the invocation silently.
 recurrence = (len(current_fps & prev_fps) / len(prev_fps)) if prev_fps else 0.0
-# New issues this cycle -- used only to label WHY we are stuck, never to decide
-# WHETHER we are. A recurrence that also has new inflow is honest-stuck; a
-# recurrence with no new inflow is a plain stall. Both escalate.
+# New issues this cycle -- a diagnostic count carried in the audit record.
 new_count = len(current_fps - prev_fps)
 thr = float(os.environ.get('__STALL_THRESHOLD') or 0.8)
 print(json.dumps({'recurrence': recurrence, 'new_count': new_count, 'threshold': thr, 'fingerprints': sorted(current_fps)}))
@@ -265,20 +270,19 @@ else:
 unset __HONEST_ISSUES
 
 # ── Classification ───────────────────────────────────────────────────────────
-# ONE recurrence test decides WHETHER we are stuck; a second signal decides only
-# HOW to label it. This is what fixes the original defect without opening a new
-# one: previously `fingerprint-stall` broke before the count test ran, so a
-# cycle with heavy recurrence AND heavy new inflow was mislabelled a plain stall
-# (its new issues invisible). Moving the label earlier without changing WHICH
-# cycles fire would have been the wrong fix — it would have traded a mislabel
-# for a silent pass.
+# TWO INDEPENDENT stall signals. Either one is sufficient to fire.
 #
-#   recurrence >= threshold AND new issues arriving AND count up 3×
-#                                            → honest-stuck (stuck AND growing)
-#   recurrence >= threshold, otherwise       → fingerprint-stall (stuck, same set)
-#   recurrence <  threshold                  → no exit (ordinary churn)
-# No cycle with heavy recurrence is left undiagnosed: `recurrence >= thr` is
-# sufficient on its own to fire.
+#   (1) recurrence >= threshold   -- the same issues came back
+#   (2) count non-decreasing 3x   -- the loop is not shrinking, whatever the cause
+#
+# (2) is deliberately NOT gated on (1). Gating honest-stuck behind recurrence was
+# itself a regression: a loop that churns one-for-one (every issue fixed, a new
+# one appearing in its place) has LOW recurrence but is not converging, and the
+# recurrence gate left it undiagnosed — it fell through to the cycle cap.
+#
+# Label: honest-stuck when the count is not shrinking; otherwise fingerprint-stall
+# (the narrower, more specific finding). Precedence exists only for the LABEL —
+# both signals fire, so no non-convergent cycle is left undiagnosed.
 export __RECURRENCE="$STALL_RECURRENCE"
 export __NEW_COUNT="$STALL_NEW_COUNT"
 export __HONEST="$HONEST_STUCK"
@@ -289,8 +293,8 @@ recurrence = float(os.environ['__RECURRENCE'] or 0)
 new_count = int(os.environ['__NEW_COUNT'] or 0)
 honest = os.environ['__HONEST'] == 'true'
 thr = float(os.environ.get('__STALL_THRESHOLD') or 0.8)
-if recurrence >= thr:
-    print('honest-stuck' if (new_count > 0 and honest) else 'fingerprint-stall')
+if recurrence >= thr or honest:
+    print('honest-stuck' if honest else 'fingerprint-stall')
 else:
     print('')
 ")
@@ -319,15 +323,15 @@ er = '$EXIT_REASON'
 entry = {
   'ts': datetime.now(timezone.utc).isoformat(),
   'skill': 'code-review', 'version': '1.8.0',
-  'pr_number': $PR_NUMBER,
+  'pr_number': ${PR_NUMBER:-0},
   'fix_loop_enabled': '$FIXER_ENABLED' == 'true',
-  'fix_loop_cycles': $CYCLE,
+  'fix_loop_cycles': ${CYCLE:-0},
   'fix_loop_exit_reason': er or None,
   'fix_loop_issues_per_cycle': json.loads('$ISSUES_PER_CYCLE_JSON'),
   'fix_loop_files_changed_per_cycle': json.loads('$FILES_CHANGED_PER_CYCLE_JSON')
 }
 print(json.dumps(entry, ensure_ascii=False))
-" >> operations/logs/code-review-fix-loop.jsonl
+" >> operations/logs/code-review-fix-loop.jsonl || echo 'warn: fix-loop JSONL not appended (see stderr above)' >&2
 ```
 
 Log dir: `operations/logs/` (NOT `operations/ai-workflow-tools/logs/`). The file is created on first run — do not pre-create it.
@@ -367,8 +371,8 @@ with open('operations/logs/cycle-status.yaml', 'w') as f:
 
 - `EXIT_REASON == "fingerprint-stall"`: `⚠️ Auto-fix stalled after ${CYCLE} cycles — requires human review\n\n`
 - `EXIT_REASON == "zero-progress"`: `⚠️ Auto-fix made no changes for 2 consecutive cycles (zero-progress) — requires human review\n\n`
-- `EXIT_REASON == "convergence"` or `"stall-guard"`: `⚠️ Auto-fix exited via ${EXIT_REASON} with issues unresolved — requires human review\n\n`
-- `EXIT_REASON == "honest-stuck"`: `⚠️ Auto-fix stuck (honest-stuck — new issues each cycle, non-decreasing 3×) — requires human review\n\n`
+- `EXIT_REASON == "convergence"` (**agent-judged** — the loop never sets this; the agent posts it after reading the remaining issue set): `⚠️ Auto-fix converged with issues unresolved — requires human review\n\n`
+- `EXIT_REASON == "honest-stuck"`: `⚠️ Auto-fix stuck (honest-stuck — issue count not shrinking for 3 cycles) — requires human review\n\n`
 - `EXIT_REASON == "cycle-cap"`: `⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain; escalate to a human\n\n`
 - `EXIT_REASON == "tool-unavailable"` or `"push-failed"` or `"git-error"` or `"pr-closed"`: `⚠️ Auto-fix aborted (${EXIT_REASON}) — issues require human review\n\n`
 - `EXIT_REASON == "clean"`: no prefix

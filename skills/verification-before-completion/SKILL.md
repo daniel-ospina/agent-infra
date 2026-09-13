@@ -178,11 +178,12 @@ When the verifier sub-agent returns issues: fix flagged issues → re-dispatch �
 
 | Signal | Threshold | Action |
 |--------|-----------|--------|
+| Fingerprint `location + severity` — **never** `description`/`suggestion` (a fresh reviewer re-words the same defect; hashing the wording makes recurrence read ~0 on a real stall) | — | — |
 | Recurrence `|current ∩ prev| / |prev|` ≥ `stall_threshold` (default `0.8`) | Fingerprint-stall | Escalate to human with stuck issue + attempted fixes |
-| Recurrence ≥ `stall_threshold` **AND** new issues present **AND** issue count non-decreasing 3 cycles | Honest-stuck | Fixer repeating known issues while adding new ones — escalate |
+| Issue count non-decreasing 3 consecutive cycles — **fires on its own, regardless of recurrence** | Honest-stuck | The loop is not shrinking (churn, or issues outpace fixes) — escalate |
 | No file changes 2 cycles | Zero-progress | Fixer making no progress — escalate |
 
-> Do not phrase honest-stuck as "non-decreasing count **+ different issues**". That describes the `[0, threshold)` band, which under the old two-sided phrasing satisfied *neither* detector — leaving a non-convergent loop undiagnosed. Recurrence gates *whether* we fire; the new-issue test gates only the *label*.
+> **Fire if `recurrence ≥ stall_threshold` OR the count is non-decreasing for 3 cycles.** Either alone is sufficient; they are independent signals for different pathologies. Recurrence picks the *label* only (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`) — never a precondition for the count signal.
 
 **Exit outcomes:** CLEAN (zero issues), Convergence (shrinking set → escalate), Stall, Honest-stuck, Capped (10 cycles).
 
