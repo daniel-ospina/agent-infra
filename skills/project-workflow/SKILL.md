@@ -100,7 +100,7 @@ fi
 
 Same 2-gate pattern as epic, but proportional — faster review cycles:
 
-### Approval Routing
+### Approval Routing (inlined from human-input-framework v2.1.1)
 
 > **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
 > Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session

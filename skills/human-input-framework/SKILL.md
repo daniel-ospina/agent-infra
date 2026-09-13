@@ -5,7 +5,7 @@ description: "Reference taxonomy for when coding workflow skills should pause fo
 subjects.team: organisation-design-team
 type: reference
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
-version: 2.1.0
+version: 2.1.1
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
@@ -146,7 +146,7 @@ When a P0 gate is hit, research is still conducted and presented, but the decisi
 > **This is the canonical copy** — consuming skills inline a short operational excerpt and cite this
 > section (consumer registry in "Inlining Instructions" at the end of this file).
 > Verified against `$SWARM_ROOT/operations/coordination/approval.py` (swarm `origin/main`, 011d69e4)
-> and `extensions/slack-bridge/index.ts` + `socket-mode.ts` — 2026-09-13.
+> and `agent-infra/extensions/slack-bridge/index.ts` + `socket-mode.ts` — 2026-09-13.
 
 When a human gate fires, the agent surfaces the request by invoking the approval router.
 
@@ -164,7 +164,7 @@ print('Approval request created')
 
 ⛔ The bare `from operations.coordination.approval import …` resolves only when CWD *is* the swarm
 checkout — from an agent-infra checkout it raises `ModuleNotFoundError: No module named 'operations'`.
-Always use the `sys.path` form above. For hierarchy routing instead of auto-approval, prefix the
+Always use the `sys.path` form above. For escalation-chain routing instead of auto-approval, prefix the
 invocation with the env var: `APPROVAL_AUTO_APPROVE=0 python3 -c "…"` (see semantics below).
 
 ### One store, two transports
@@ -173,7 +173,7 @@ invocation with the env var: `APPROVAL_AUTO_APPROVE=0 python3 -c "…"` (see sem
 |---|---|
 | **Store** | `~/.swarm/approvals/<slug>.json` (0600, per-repo; `SLACK_APPROVAL_FILE` overrides). ⚠️ **The two sides derive `<slug>` differently, so by default they do NOT share a file** — the Python router uses the `owner/repo` form (`_detect_repo()` → `daniel-ospina/agent-infra` → `daniel-ospina_agent-infra.json`), the slack-bridge uses the bare repo name (`repoNameFromUrl()` → `agent-infra.json`). **Pin `SLACK_APPROVAL_FILE` to one path if you are relying on Slack** — otherwise the bridge never sees the router's request, and the gate stalls (agent-infra #956). |
 | **Transport A — file** | `request_approval()` writes the record; `review_approval(id, 'approved'\|'rejected', feedback)` writes the verdict. |
-| **Transport B — Slack (optional)** | The slack-bridge approval poller posts `pending` records **whose reviewer is `human` or unset** (`index.ts:855` — VSM-chain pendings resolve in-process and are never Slack-bound) to `SLACK_APPROVAL_CHANNEL` / `SLACK_CHANNEL` every `SLACK_APPROVAL_POLL_MS` (default 5000ms) when `SLACK_BOT_TOKEN` is set. Accept/Reject buttons (Socket Mode, needs `SLACK_APP_TOKEN`) write the verdict into the store. Only `pending` records are posted — auto-approved ones never reach Slack. |
+| **Transport B — Slack (optional)** | The slack-bridge approval poller posts `pending` records **whose reviewer is `human` or unset** (`index.ts:855`) to `SLACK_APPROVAL_CHANNEL` / `SLACK_CHANNEL` every `SLACK_APPROVAL_POLL_MS` (default 5000ms) when `SLACK_BOT_TOKEN` is set. A chain-routed pending is Slack-bound only when the role it was assigned *is* `human` — true for a top-of-chain requester like `team-strategist`; one assigned a role (e.g. `product-strategist`) is seen but not posted. Accept/Reject buttons (Socket Mode, needs `SLACK_APP_TOKEN`) write the verdict into the store. Only `pending` records are posted — auto-approved ones never reach Slack. |
 
 The poller starts independently of `SLACK_BRIDGE_DISABLE` (stopped only by `SLACK_APPROVAL_DISABLE=1` or
 pi print mode — i.e. task sub-agents get no Slack). The Socket Mode button receiver additionally
@@ -186,11 +186,13 @@ requires `SLACK_BRIDGE_DISABLE != 1`.
 | `requires_human=True` | `human` / `pending` | **Yes** — hard checkpoint, never auto-approved |
 | Escalation keyword (`delete`, `deploy`, `destroy`, `migrate`, `release`) in `artifact`/`context` | `human` / `pending` | **Yes** |
 | Default — `APPROVAL_AUTO_APPROVE` unset (it **defaults to `1`**) | `policy:auto` / `approved` | **No** — resolved immediately, at request time |
-| `APPROVAL_AUTO_APPROVE=0` | next role in the VSM chain (`chain[1]`) / `pending` | **Not directly** — pends for the requester's `reports_to` role (e.g. `product-strategist` for `product-implementer`). Only `chain[1]` is ever assigned (`approval.py:301`), so nothing walks the chain further; the remaining entries are unused for that request. |
+| `APPROVAL_AUTO_APPROVE=0` | next role in the escalation chain (`chain[1]`) / `pending` | **Depends on the requester** — it pends for `reports_to` (`approval.py:301`): `product-strategist` for `product-implementer`, but **`human` directly** for a top-of-chain role such as `team-strategist`. Only `chain[1]` is ever assigned, so nothing walks the chain further. |
 
 ⚠️ **`requires_human=False` under the default config does NOT create a human checkpoint** — it
 auto-approves, unless an escalation keyword appears (row above). A gate that must genuinely wait for a
-human MUST pass `requires_human=True`.
+human MUST pass `requires_human=True`. **Human gates are never rate-limited and never auto-approved**:
+`requires_human=True` pends unconditionally, and nothing throttles a gate — `_notify()` accepts a
+`rate_key` and ignores it.
 
 ### The notification is a banner, not a dialog
 
@@ -324,5 +326,10 @@ not know it will wait for a Slack answer that cannot come), and — where the ga
 **derivation internals** (`_detect_repo` vs `repoNameFromUrl`), the **status table**, and the **Slack
 enablement details** (`SLACK_APPROVAL_POLL_MS`, Socket Mode, kill switches). Restating those is how the
 original six copies drifted apart.
+
+The five active consumers carry the version pin in their heading (`### Approval Routing (inlined
+from human-input-framework v<version>)`) so a stale excerpt is detectable when this file is bumped;
+`issue-scoping` does not yet — it sits on the guarded surface, see the registry above.
+
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

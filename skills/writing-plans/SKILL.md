@@ -106,7 +106,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 
 The plan-review gate (`workflow/05-review-handoff.md`) runs the `plan-review` skill loop; its human point fires when the loop exits `capped` or `stalled`. A capped/stalled plan-review result is NOT clean — the plan must not proceed to Execution Handoff until the user fixes the remaining issues or explicitly approves the plan as-is.
 
-### Approval Routing
+### Approval Routing (inlined from human-input-framework v2.1.1)
 
 > **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
 > Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session

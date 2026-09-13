@@ -645,7 +645,7 @@ If not in a worktree: skip silently.
 
 The `commit` step (Step 6 handoff) is a `human_approval` gate in this skill's frontmatter, and the checkpoint stops below ("When to Stop and Ask") are its checkpoint gates — every stop surfaces a request for human input.
 
-### Approval Routing
+### Approval Routing (inlined from human-input-framework v2.1.1)
 
 > **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
 > Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session
@@ -669,8 +669,8 @@ print('Approval request created')
 
 ⚠️ **This excerpt passes `requires_human=False`**, so under the default config
 (`APPROVAL_AUTO_APPROVE` unset, which means `1`) the request **auto-approves to `policy:auto` and
-touches no human** — it does *not* route through the VSM hierarchy. Hierarchy routing happens only
-with `APPROVAL_AUTO_APPROVE=0`; a genuine human checkpoint needs `requires_human=True`.
+touches no human** — it does *not* route to the escalation chain (`reports_to`). Escalation-chain
+routing happens only with `APPROVAL_AUTO_APPROVE=0`; a genuine human checkpoint needs `requires_human=True`.
 
 ⛔ **No dialog pops — do not wait for one.** A `pending` request fires a macOS *notification banner*
 (`osascript … display notification`), which has no buttons and no answer path; it is best-effort and

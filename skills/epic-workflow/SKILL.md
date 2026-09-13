@@ -65,7 +65,7 @@ Routes an epic through the full 6-stage fractal planning pipeline. Each stage in
 
 ## Human Gates
 
-### Approval Routing
+### Approval Routing (inlined from human-input-framework v2.1.1)
 
 > **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
 > Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session
