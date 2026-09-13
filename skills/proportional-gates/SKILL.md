@@ -83,7 +83,7 @@ Before deciding what gates to run, classify the change:
 
 | Risk | Reviewers | Max Cycles |
 |------|-----------|------------|
-| Low | 0 (skip review) | — |
+| Low | 1 reviewer | — |
 | Low-Medium (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |
 | Medium-High (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
 | High (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 10 |
@@ -181,8 +181,6 @@ For review gates that dispatch sub-agent reviewers, route proportionally based o
 | Level | Dispatch | Rationale |
 |-------|----------|-----------|
 | **Epic** | Sub-agent reviewer (fresh context) | Full adversarial check needed; scope justifies dispatch cost |
-| **Project** | Inline review (current context) | Targeted check; dispatch overhead exceeds marginal value |
-| **Task** | Inline self-check | Lightweight; no separate review needed |
 
 **Fallback:** If Level is missing or unrecognized, default to sub-agent review (safe default = full review, never skip).
 
