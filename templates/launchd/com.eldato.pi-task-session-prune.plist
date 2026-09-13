@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- pi-task-session-prune (#783 Task 6): hourly retention sweep for the
+         durable child-session transcripts Task 1 writes to
+         ~/.pi/agent/task-sessions/<childId>/<ts>_<childId>.jsonl. Bounds:
+         TASK_SESSION_MAX_AGE_DAYS (7) OR TASK_SESSION_MAX_BYTES (2 GiB),
+         whichever binds first, evicting the OLDEST NON-LIVE transcript first.
+         Liveness is derived from `ps -axo pid=,command=` matching the child's
+         session-id / session-dir argv (task children are spawned
+         detached with no tty, so the #469 reaper's tty gate can never see
+         them); the probe is FAIL-CLOSED and re-run immediately before every
+         unlink. Files only — a per-child dir is rmdir'd only when empty AND
+         its child is not live.
+         ⚠️ SHIPS DISARMED (TASK_SESSION_PRUNE_DRY_RUN=1): the job exists and
+         runs hourly, but reports only. ARMING IS A SEPARATE, MANUAL, OWNED
+         STEP — the owner is the organisation-design-team operator on call for
+         agent-infra, and arming requires a dated trigger (see the plan's
+         Task 7.4 AGENTS.md contract note). Do NOT flip this to 0 in a routine
+         template bump: the prune deletes transcripts, and an unowned always-on
+         deleter is exactly what the retention contract forbids.
+         Canonical script: agent-infra/scripts/pi-task-session-prune.sh
+         (COPIED to ~/.pi/agent/scripts/ by pi-bootstrap/setup.sh scripts
+         farm; #427: launchd cannot read ~/Documents repos under macOS TCC).
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
+    <key>Label</key>
+    <string>com.eldato.pi-task-session-prune</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/pi-task-session-prune.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>TASK_SESSION_PRUNE_DRY_RUN</key>
+        <string>1</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+</dict>
+</plist>

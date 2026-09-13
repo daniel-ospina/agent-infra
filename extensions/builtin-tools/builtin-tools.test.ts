@@ -12,7 +12,8 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine } from "./index.js";
+import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
@@ -24,9 +25,10 @@ const childFactory: (pi: any) => void =
 import type { ModelRegistry } from "./index.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   resolveDispatchLeg,
@@ -1067,14 +1069,42 @@ test("getHeartbeatIntervalMs — TASK_HEARTBEAT_INTERVAL_MS override, clamped", 
 test("stall-bound getters — defaults + ≥60s clamp", () => {
   withEnv({ TASK_STREAM_STALL_MS: undefined, TASK_TOOL_STALL_MS: undefined, TASK_FIRST_MESSAGE_MS: undefined }, () => {
     equal(getStreamStallMs(), DEFAULT_STREAM_STALL_MS);
-    equal(getToolStallMs(), DEFAULT_TOOL_STALL_MS);
+    // #783 fix 4: the task path's tool-stall default is DERIVED from the
+    // effective hard cap (2/3 → 4h at the 6h default), while the exported
+    // DEFAULT_TOOL_STALL_MS stays frozen at 6h for extensions/subagent/index.ts.
+    equal(getToolStallMs(), 14_400_000);
+    equal(DEFAULT_TOOL_STALL_MS, 21_600_000);
     equal(getFirstMessageMs(), DEFAULT_FIRST_MESSAGE_MS);
+  });
+  // #783 §6.6 (P2): the bound MUST stay below the cap for any TASK_HARD_CAP_MS,
+  // or a lowered cap silently disarms the detector — the exact pre-#783 bug,
+  // where the bound equalled the cap and so could never fire first. A fixed
+  // default does exactly that; a derived one cannot.
+  withEnv({ TASK_HARD_CAP_MS: String(2 * 3_600_000), TASK_TOOL_STALL_MS: undefined }, () => {
+    equal(getTaskHardCapMs(), 7_200_000, "cap override applied");
+    equal(getToolStallMs(), 4_800_000, "bound TRACKS a lowered cap (2/3 of it)");
+    ok(getToolStallMs() < getTaskHardCapMs(), "the detector can still fire before the cap it pre-empts");
   });
   withEnv({ TASK_STREAM_STALL_MS: "5", TASK_TOOL_STALL_MS: "-1", TASK_FIRST_MESSAGE_MS: "NaN" }, () => {
     equal(getStreamStallMs(), 60_000);
-    equal(getToolStallMs(), 60_000);
+    // #783 fix 4 (review): a non-positive override fails CLOSED to the task
+    // default rather than being clamped up (the finiteness gate's contract).
+    equal(getToolStallMs(), 14_400_000);
     equal(getFirstMessageMs(), DEFAULT_FIRST_MESSAGE_MS); // NaN → default
   });
+  // a POSITIVE finite override still clamps to ≥60s (a sub-60s bound could
+  // kill a productive agent between two ticks).
+  withEnv({ TASK_TOOL_STALL_MS: "1000" }, () =>
+    equal(getToolStallMs(), 60_000, "a positive sub-60s override is clamped to 60s"));
+  // #783 fix 4 (review): a NON-FINITE override must fail CLOSED to the default.
+  // `Number("Infinity")` / `Number("1e400")` are truthy and survive Math.max,
+  // which would leave the wedged-tool detector permanently disarmed.
+  withEnv({ TASK_TOOL_STALL_MS: "Infinity" }, () =>
+    equal(getToolStallMs(), 14_400_000, "non-finite override fails closed to the derived task default"));
+  withEnv({ TASK_TOOL_STALL_MS: "1e400" }, () =>
+    equal(getToolStallMs(), 14_400_000, "overflowing override fails closed to the derived task default"));
+  withEnv({ TASK_TOOL_STALL_MS: "10800000" }, () =>
+    equal(getToolStallMs(), 10_800_000, "a finite positive override is honoured"));
   withEnv({ TASK_STREAM_STALL_MS: "120000" }, () => equal(getStreamStallMs(), 120_000));
 });
 
@@ -1370,6 +1400,36 @@ test("#191: ANSI-decorated session_end still fires the edge", () => {
   ok(ctx.state.sessionEnded);
 });
 
+test("#783: fresh --session-id warning is known-noise — never flips hasOutput", () => {
+  // pi prints this on stderr for a --session-id that does not exist yet
+  // (main.js:338-344). If it counted as real output, resolveUndefined =
+  // !hasOutput would be permanently false and every zero-output settle dead.
+  const warn =
+    "Warning: No project session found with id '0192a3f0-1b2c-7def-8abc-0123456789ab'; creating a new session with that id.";
+  const { ctx, acc, real, life } = makeIngest();
+  ingestHeartbeatChunk(warn + "\n", ctx, 1);
+  equal(real(), false, "warning must NOT flip hasOutput");
+  equal(acc(), "", "known-noise is filtered out of the stderr accumulator");
+  equal(life(), 1, "byte arrival is still a life sign");
+  equal(ctx.state.markerCount, 0, "not a heartbeat marker");
+
+  // ANSI-wrapped (chalk.yellow when stderr is a TTY) still matches.
+  const { ctx: c2, real: real2 } = makeIngest();
+  ingestHeartbeatChunk("\u001b[33m" + warn + "\u001b[39m\n", c2, 1);
+  equal(real2(), false, "ANSI-decorated warning filtered too");
+
+  // Same warning arriving as trailing residue (no newline) on flush/kill.
+  const { ctx: c3, real: real3 } = makeIngest();
+  ingestHeartbeatChunk(warn, c3, 1);
+  equal(flushHeartbeatLineBuf(c3), "", "warning residue dropped on flush");
+  equal(real3(), false);
+
+  // A genuine child error line still flips hasOutput.
+  const { ctx: c4, real: real4 } = makeIngest();
+  ingestHeartbeatChunk(warn + "\nreal child error line\n", c4, 2);
+  ok(real4(), "genuine stderr still flips hasOutput");
+});
+
 section("#176 heartbeat — heartbeatKillDecision (E1–E3, E5–E7, E9–E13)");
 
 const T = 60_000;   // test heartbeat timeout (direct input — env clamp not involved)
@@ -1519,6 +1579,124 @@ test("E10: preflight tool-stall bound min(L,T) + precedence over silence", () =>
   // below the bound (effective age = toolAge + markerAge) → no kill
   const st2 = { ...st, toolAgeMaxMs: T - 1_000 };
   equal(heartbeatKillDecision(dinput({ now: 400_000 + 10, lastLifeSignAt: 400_000, state: st2 })).kill, false);
+});
+
+// ── #783 §6.6: tool-silence is the PRIMARY in-flight-tool detector ──────────
+// The three shapes the design has to separate. Before the split, "in-flight
+// tool" had exactly ONE bound (total age), so a dead tool and a slow-but-
+// working tool were indistinguishable — which forced the bound to be generous
+// enough for the slowest legitimate tool, making it simultaneously too slow for
+// the dead one and a kill risk for the slow one. Silence collapses that.
+
+test("E-silence-1: WEDGED tool in flight → killed at the SILENCE bound, not the age bound", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = S + 60_000; // far BELOW L (1h in fixtures)
+  st.streamAgeMs = S + 1;       // …but no output for S: the wedge signal
+  st.toolUpdates = true;        // the tool HAD been producing output, then stopped
+  st.lastMarkerAt = 500_000;
+  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
+  equal(d.kill, true, "a silent in-flight tool is killed at the SILENCE bound");
+  equal(d.reason, "tool-silence", "reason is distinct from the age backstop");
+  ok(S + 60_000 < L, "fixture sanity: this shape sits far below the age bound");
+});
+
+test("E-silence-2: WORKING tool in flight → output keeps arriving → never killed, however long", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = L - 1_000; // nearly at the age bound…
+  st.streamAgeMs = 1_000;      // …but still emitting (`tool_execution_update`)
+  st.toolUpdates = true;
+  st.lastMarkerAt = 9_000_000;
+  const d = heartbeatKillDecision(dinput({ now: 9_000_010, lastLifeSignAt: 9_000_000, state: st }));
+  equal(d.kill, false, "a tool that keeps producing output is never killed merely for being slow");
+});
+
+test("E-silence-3: RUNAWAY tool — streams forever, never finishes → the age backstop owns it", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = L + 1;  // past the age bound
+  st.streamAgeMs = 1_000;   // still streaming → invisible to tool-silence
+  st.toolUpdates = true;
+  st.lastMarkerAt = 9_000_000;
+  const d = heartbeatKillDecision(dinput({ now: 9_000_010, lastLifeSignAt: 9_000_000, state: st }));
+  equal(d.kill, true, "the runaway shape is precisely what the age backstop exists for");
+  equal(d.reason, "tool-stall", "backstop reason stays distinct from tool-silence");
+});
+
+test("E-silence-4: NESTED TASK in flight (never emits output) → silence must NOT kill it", () => {
+  // The P1 the §6.6 verifier found against the first cut of this clause. `task`
+  // — like read/edit/write — passes `_onUpdate` UNUSED, so an outer agent
+  // awaiting a nested child emits no `tool_execution_update` for the WHOLE child
+  // duration and stream_age grows past S by construction (E279a2 pins the same
+  // shape). Without the toolUpdates gate this killed that healthy child at S
+  // and — because hasOutput is true — reported it as a DEFINED SUCCESS with the
+  // in-flight nested work treeKilled: the #363/#489 kill-productive-agents
+  // class, reintroduced by the fix meant to remove it.
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = S + 600_000; // well past S…
+  st.streamAgeMs = S + 1;        // …and silent, exactly like a nested task
+  st.toolUpdates = false;        // …but this tool has NEVER produced output
+  st.lastMarkerAt = 500_000;
+  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
+  equal(d.kill, false, "a tool that never emits output is not judged by output silence");
+  // Still bounded — by the age backstop, exactly as before this change.
+  const stAged = { ...st, toolAgeMaxMs: L + 1 };
+  equal(
+    heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: stAged })).reason,
+    "tool-stall",
+    "the age backstop still owns the never-emits shape (no regression)",
+  );
+});
+
+test("E-silence-5: MIXED round (one tool emitted and ended, one still silent) → NOT a wedge", () => {
+  // P1 from the §6.6 verifier against the first cut of the toolUpdates gate.
+  // The latch was existential over the ROUND: any tool emitting set it, and it
+  // was cleared only when the round went empty. Shape [bash (emits, ends),
+  // nested task (in flight)] therefore left the latch TRUE, and the clause's
+  // inference — "the tool that went silent is wedged" — was applied to a tool
+  // (the nested `task`) that never emits at all → healthy child killed at S with
+  // resolveUndefined=false. Per-tool tracking makes the direction UNIVERSAL: a
+  // round counts as output-live only when EVERY in-flight tool has emitted.
+  equal(
+    childHb.computeToolUpdates(["bash-1", "task-2"], new Set(["bash-1"])),
+    false,
+    "one silent never-emitting tool in flight ⇒ the round is NOT output-live",
+  );
+  equal(
+    childHb.computeToolUpdates(["bash-1"], new Set(["bash-1"])),
+    true,
+    "every in-flight tool emitted ⇒ silence means a wedge, not an unlucky pick",
+  );
+  equal(
+    childHb.computeToolUpdates([], new Set(["bash-1"])),
+    false,
+    "no tools in flight ⇒ no in-flight liveness claim (gates the clause off)",
+  );
+  equal(
+    childHb.computeToolUpdates(["a"], new Set()),
+    false,
+    "a tool yet to emit ⇒ not live (the nested-`task` shape)",
+  );
+  // And the parent cannot kill on the mixed round: the bit it receives is false.
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 2;
+  st.toolAgeMaxMs = S + 600_000;
+  st.streamAgeMs = S + 1;
+  st.toolUpdates = childHb.computeToolUpdates(["bash-1", "task-2"], new Set(["bash-1"]));
+  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
+  equal(d.kill, false, "the healthy nested child survives the mixed round");
 });
 
 test("E11: between-turn wedge — ticks stop → silence at T (S > max(2T,2×interval) pin)", () => {
@@ -2189,11 +2367,13 @@ test("full-format round-trip: every child formatter parses through the parent pa
   ok(st.everSawRealActivity, "formatToolStart latches through the parent parser");
   equal(parseHeartbeatLine(childHb.formatTurnStart(N, 3), st, 3, N), true);
   ok(st.turnActive);
-  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, sawMsg: true, sawTool: false }), st, 4, N), true);
+  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, toolUpdates: true, sawMsg: true, sawTool: false }), st, 4, N), true);
   equal(st.toolsInFlight, 1);
   equal(st.turnActive, true);
   equal(st.streamAgeMs, 4242);
   equal(st.toolAgeMaxMs, 2424);
+  // #783 §6.6: the output-liveness latch crosses the wire (gates tool-silence).
+  equal(st.toolUpdates, true, "tool_updates=1 parses into the state latch");
   equal(st.turnSawMessage, true);
   equal(st.turnSawTool, false);
   equal(parseHeartbeatLine(childHb.formatToolEnd(N, "call-1"), st, 5, N), true);
@@ -2287,6 +2467,47 @@ testAsync("child lifecycle — ready, tool-Set semantics, per-turn flags, tick f
     });
   } finally {
     restore();
+  }
+});
+
+testAsync("child lifecycle (review fix): a lost tool_execution_end must NOT leak liveness into a later turn", async () => {
+  // #783 code review (P1). `turn_end` clears `outstandingTools` to bound a lost
+  // `tool_execution_end` to one turn, but the sibling `updatedToolIds` Set was
+  // only pruned per-id in `tool_execution_end`. So after ANY lost end, a
+  // streamed tool's id survived into later turns — and a subsequent
+  // NON-streaming tool reusing that toolCallId (plausible for providers that
+  // emit positional ids like `call_0`) made `computeToolUpdates` report a tool
+  // that has never emitted as live. The child then ticked `tool_updates=1`, and
+  // the parent's PRIMARY `tool-silence` clause would kill the healthy silent
+  // child at S (20 min): the exact false-liveness direction the gate exists to
+  // close, re-created inside the new Set. Fails if the `turn_end` clear is
+  // reverted, which is the only thing that closes it.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  try {
+    await withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: "leaknonce" }, async () => {
+      childFactory(api);
+      await handlers.session_start({} as any);
+      await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+      // A streaming tool that emits, then its end is LOST (never delivered).
+      await handlers.tool_execution_start({ toolCallId: "call_0", toolName: "bash", args: {} });
+      await handlers.tool_execution_update({ toolCallId: "call_0", toolName: "bash", args: {}, partialResult: "out" });
+      await handlers.turn_end({ turnIndex: 1, message: {}, toolResults: [] });
+      // Next turn: a NON-streaming tool (a nested `task` never emits updates)
+      // happens to reuse the same id.
+      await handlers.turn_start({ turnIndex: 2, timestamp: Date.now() });
+      await handlers.tool_execution_start({ toolCallId: "call_0", toolName: "task", args: {} });
+      await sleep(5_300);
+      const tick = lines.filter((l) => l.startsWith("[task-heartbeat] tick")).pop() ?? "";
+      ok(tick.includes("tools=1"), `one tool in flight: ${tick}`);
+      ok(tick.includes("tool_updates=0"), `a reused id must NOT inherit the previous turn's liveness (tool-silence gate stays off): ${tick}`);
+      await handlers.session_shutdown({} as any);
+    });
+  } finally {
+    console.error = origErr;
   }
 });
 
@@ -2469,8 +2690,33 @@ test("E271g: detached spawn + treeKill heartbeat kill + backstop + hard-cap retr
   // verifier P2: hard-cap composition carries the same retryability contract
   ok(source.includes("reason: \"hard-cap\", hardCapMs: getTaskHardCapMs()"), "hard-cap composition preserved (#221)");
   ok(source.includes("exceeded the hard cap with no real output — retryable (#271)"), "hard-cap resolveUndefined = !hasOutput (#271 verifier P2)");
-  // source-drift pin: tool-stall NOT lowered (align condition 3)
-  ok(source.includes("export const DEFAULT_TOOL_STALL_MS = 21_600_000;"), "DEFAULT_TOOL_STALL_MS unchanged (6h)");
+  // #783 fix 4 re-pin (align condition 3, corrected): the property this guards
+  // is the EFFECTIVE task-path bound, not the untouched exported literal.
+  // Pinning ONLY the literal stayed green while getToolStallMs() returned 2h —
+  // so assert BOTH: the frozen export stays 6h for extensions/subagent/, and
+  // the task path resolves the derived 2/3-of-cap bound (4h at the 6h default).
+  ok(source.includes("export const DEFAULT_TOOL_STALL_MS = 21_600_000;"), "DEFAULT_TOOL_STALL_MS unchanged (6h, subagent path)");
+  withEnv({ TASK_TOOL_STALL_MS: undefined }, () =>
+    equal(getToolStallMs(), 14_400_000, "the task path's EFFECTIVE tool-stall is the derived 2/3-of-cap bound (the deliberate #208 condition-3 override)"));
+  // #783 §6.6 (P2): a non-finite TASK_HARD_CAP_MS used to resolve the cap to
+  // Infinity — and with the bound derived from it, the age backstop too, so the
+  // runaway-streaming shape became unbounded. Must fail CLOSED to the default.
+  withEnv({ TASK_HARD_CAP_MS: "Infinity", TASK_TOOL_STALL_MS: undefined }, () => {
+    equal(getTaskHardCapMs(), 21_600_000, "non-finite cap fails closed to the 6h default");
+    equal(getToolStallMs(), 14_400_000, "…and the derived bound stays finite with it");
+  });
+});
+
+test("#783 §6.6: dispatch outcome row preserves UNKNOWN dirtyPaths as null (never [])", () => {
+  // repo-freshness returns `paths: null` for a failed status probe ON PURPOSE
+  // ("A failed status probe MUST NOT become a confident `dirty=false`"), but the
+  // call site coalesced `?? []` and the row type declared `string[]` — so the
+  // JSONL row asserted "zero dirty paths" for a tree nobody observed.
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  ok(src.includes("dirtyPaths: repoState?.paths ?? null"), "the row must carry null (UNKNOWN)");
+  ok(!src.includes("dirtyPaths: repoState?.paths ?? []"), "the laundering form must be gone");
+  const rec = readFileSync(resolve(__dirname, "../shared/dispatch-record.ts"), "utf-8");
+  ok(rec.includes("dirtyPaths: string[] | null;"), "the row type must admit null");
 });
 
 section("#191 completion watchdog — spawnSubAgent wiring (source assertions)");
@@ -3811,8 +4057,14 @@ test("#512 second-model P2 (SM2): the venice-route append runs AFTER the first s
   //   2. the recordVeniceRoute call site sits AFTER it
   //   3. the never-spawned discriminator (circuit_open && retries === 0) sits
   //      between them and gates the append
-  const spawnRetryIdx = source.indexOf("let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);");
-  ok(spawnRetryIdx > 0, "first-spawn retry present in source");
+  // #783 Task 4 REPIN: the first-spawn retry now threads `retry()`'s attempt
+  // ordinal into the spawn (and thence into the durable outcome record) —
+  // `retry(() => spawnLeg(dispatchLeg), …)` became
+  // `retry((attempt) => spawnLeg(dispatchLeg, attempt), …)`. The property this
+  // pin guards (the venice-route append runs AFTER the first spawn attempt) is
+  // unchanged; only the call's text moved.
+  const spawnRetryIdx = source.indexOf("let result = await retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions);");
+  ok(spawnRetryIdx > 0, "first-spawn retry (attempt-threading shape, #783 Task 4) present in source");
   const routeCallIdx = source.lastIndexOf("recordVeniceRoute(");
   ok(spawnRetryIdx < routeCallIdx, "venice-route append runs AFTER the first spawn attempt (no row for a never-spawned dispatch)");
   const neverSpawnedIdx = source.indexOf("result.status === \"circuit_open\" && result.retries === 0");
@@ -3869,6 +4121,101 @@ test("scanStderrForUsage: line-anchored + nonce-validated; LAST occurrence wins"
 });
 
 
+
+// ── #783 Task 1/2 — durable child session + parent-reported repo state ──
+
+section("#783 Task 1 — durable child session per spawn (source pins)");
+
+test("#783/T1: both spawn arg vectors mint a fresh session per attempt", () => {
+  ok(source.includes("const buildArgs = (leg: LegRef): string[] =>"), "primary arg vector built per attempt");
+  ok(source.includes("const buildFbArgs = (): string[] =>"), "fallback arg vector built per attempt");
+  ok(!/const fbArgs\s*=/.test(source), "the fallback vector is NOT a hoisted const (retry attempt 2 would append)");
+  ok(source.includes("...childSessionArgs()"), "session flags come from the per-call minter");
+  ok(!source.includes('"--no-session"'), "no arg vector hardcodes --no-session (the degrade vector lives in session-id.ts)");
+});
+
+test("#783/T1: ctx supplies parent session identity (never the env ancestor-id channel)", () => {
+  ok(source.includes("async execute(_toolCallId, params, signal, _onUpdate, ctx)"), "task tool execute takes the extension ctx");
+  ok(source.includes("ctx?.sessionManager?.getSessionId()"), "parent session id read from ctx");
+  ok(source.includes("ctx?.sessionManager?.getSessionDir()"), "parent session dir read from ctx");
+  ok(!source.includes("process.env.PI_SESSION_ID"), "PI_SESSION_ID is never read (ancestor-id misattribution)");
+});
+
+test("#783/T1: root failure degrades to --no-session with a non-retryable class", () => {
+  ok(source.includes("ensureTaskSessionRoot(resolveTaskSessionRoot(subAgentEnv))"), "root resolved + created once per dispatch");
+  ok(source.includes("task-session-root-unwritable"), "degrade class surfaced in the payload");
+  ok(source.includes('status: "invalid-session-id", retryable: false'), "invalid id is a non-retryable refusal");
+});
+
+section("#783 Task 2 — the parent reports where the child ran");
+
+test("#783/T2: renderRepoStateLine — name=value, single line, detached HEAD → branch=null", () => {
+  const line = renderRepoStateLine({ branch: "fix/x", headSha: "abc123", dirty: true, paths: ["a", "b"] }, "/tmp/wt");
+  equal(line, "branch=fix/x headSha=abc123 worktree=/tmp/wt dirty=true dirtyPaths=2");
+  ok(!line.includes("\n"), "never a newline — the Alive state line stays single-line");
+  ok(/(^|\s)branch=/.test(" " + line), "census-visible name=value form");
+  const detached = renderRepoStateLine({ branch: null, headSha: "deadbeef", dirty: false, paths: [] }, "/tmp/wt");
+  equal(detached, "branch=null headSha=deadbeef worktree=/tmp/wt dirty=false dirtyPaths=0");
+  ok(detached.includes("worktree=/tmp/wt"), "detached HEAD still names the recovery key");
+  equal(
+    renderRepoStateLine(null, "/tmp/wt"),
+    "branch=unknown headSha=unknown worktree=/tmp/wt dirty=unknown dirtyPaths=unknown",
+    "unresolved probe renders unknown, never a bare number",
+  );
+});
+
+test("#783/T2: every Alive state template appends the cached repo state (source pin)", () => {
+  const aliveTemplates = source.match(/Alive state: toolsInFlight=[^\n]*/g) ?? [];
+  ok(aliveTemplates.length >= 4, `four abnormal-exit Alive state sites (found ${aliveTemplates.length})`);
+  for (const site of aliveTemplates) {
+    ok(site.includes("${repoStateText()}"), "every Alive state line appends branch/headSha/worktree/dirty");
+  }
+  ok(source.includes("let repoState: RepoState | null = null;"), "per-dispatch cached repoState");
+  ok(source.includes("void asyncRepoState(process.cwd(), { signal })"), "probed ONCE at spawn");
+});
+
+testAsync("#783/T2: asyncRepoState reads branch/headSha/dirty/paths from a real repo", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t2-repo-"));
+  try {
+    execSync("git init -q", { cwd: dir });
+    execSync("git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: dir });
+    const clean = await asyncRepoState(dir);
+    ok(clean, "clean repo probed");
+    ok(typeof clean!.branch === "string" && clean!.branch.length > 0, "branch read");
+    ok(/^[0-9a-f]{40}$/.test(clean!.headSha ?? ""), `headSha is a full sha (got ${clean!.headSha})`);
+    equal(clean!.dirty, false);
+    deepEqual(clean!.paths, []);
+
+    writeFileSync(join(dir, "a.txt"), "x");
+    const dirty = await asyncRepoState(dir);
+    equal(dirty!.dirty, true, "untracked file makes the tree dirty");
+    deepEqual(dirty!.paths, ["a.txt"], "the changed path is reported");
+    equal(dirty!.headSha, clean!.headSha, "headSha unchanged by a worktree edit");
+
+    execSync("git checkout -q --detach", { cwd: dir });
+    const detached = await asyncRepoState(dir);
+    equal(detached!.branch, null, "detached HEAD → branch=null (worktree is the recovery key)");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+testAsync("#783/T2 (review fix): a failed status probe is UNKNOWN, never a confident clean", async () => {
+  const fakeExec = async (_cmd: string, args: string[]) => {
+    if (args.includes("--show-current")) return { code: 0, stdout: "main\n", stderr: "", timedOut: false };
+    if (args.includes("HEAD")) return { code: 0, stdout: `${"a".repeat(40)}\n`, stderr: "", timedOut: false };
+    return { code: 128, stdout: "", stderr: "fatal: status failed", timedOut: false };
+  };
+  const st = await asyncRepoState("/tmp", { exec: fakeExec });
+  ok(st, "branch/sha are still probed when only the status probe fails");
+  equal(st!.dirty, null, "failed status probe → dirty UNKNOWN (null), never a confident false");
+  equal(st!.paths, null, "failed status probe → paths UNKNOWN (null), never []");
+  equal(
+    renderRepoStateLine(st, "/tmp"),
+    `branch=main headSha=${"a".repeat(40)} worktree=/tmp dirty=unknown dirtyPaths=unknown`,
+    "the render shows dirty=unknown dirtyPaths=unknown (name=value format preserved)",
+  );
+});
 
   for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
