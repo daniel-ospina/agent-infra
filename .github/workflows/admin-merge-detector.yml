@@ -13,9 +13,18 @@ name: Admin-merge detector
 # is a detector that will be disabled the first time it false-blocks.
 #
 # What it does, after "CI on main" completes for a push to main:
-#   1. the merged commit's failing set      → scripts/ci-failure-set.sh --commit <sha>
-#   2. main's PRIOR failing set (union)     → scripts/ci-failure-set.sh --main-union N --exclude <sha>
+#   1. the merged commit's failing set      → scripts/ci-failure-set.sh --commit <sha> --workflow <lane>
+#   2. main's PRIOR failing set (union)     → scripts/ci-failure-set.sh --main-union N --exclude <sha> --workflow <lane>
 #   3. the shared comparison                → scripts/ci-failure-set.sh --diff
+#
+# THE LANE (WORKFLOW below) must name the TEST workflow. `gh run list --branch
+# main` returns whatever ran most, not the test lane — measured on tortoise main
+# 2026-09-13, of the last 30 runs 11 were `availability-watchdog` and only 2
+# were the test lane. An unfiltered window of 10 can contain ZERO test runs, so
+# the baseline extracts EMPTY while main is red. That is the bogus zero: the
+# pre-merge rail false-blocks on it, and this detector would file a FALSE issue
+# for it (a detector that cries wolf gets disabled). Set WORKFLOW to the test
+# lane of the repo this file is materialized into.
 #   4. unique non-empty → file an issue; always exit 0.
 #
 # `templates/.github/workflows/admin-merge-detector.yml` is the source of truth
@@ -49,6 +58,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MAIN_RUNS: "10"
+          # The TEST workflow both sides are read from — see THE LANE above. A
+          # lane with no runs on main makes every comparison vacuous.
+          WORKFLOW: "python-ci.yml"
           MERGE_SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha }}
         run: |
           set -uo pipefail
@@ -64,12 +76,12 @@ jobs:
           # An EXTRACTION FAILURE (parser exit 1) means "cannot certify", never
           # "nothing is unique". For a detector the honest response is a loud log
           # line, not a silent pass — but still exit 0 (never block).
-          if ! bash scripts/ci-failure-set.sh --commit "$MERGE_SHA" > merged-fails.txt 2>extract-err.txt; then
+          if ! bash scripts/ci-failure-set.sh --commit "$MERGE_SHA" --workflow "$WORKFLOW" > merged-fails.txt 2>extract-err.txt; then
             echo "::warning::admin-merge detector: could not extract the merged commit's failing set"
             sed 's/^/  /' extract-err.txt
             exit 0
           fi
-          if ! bash scripts/ci-failure-set.sh --main-union "$MAIN_RUNS" --exclude "$MERGE_SHA" \
+          if ! bash scripts/ci-failure-set.sh --main-union "$MAIN_RUNS" --exclude "$MERGE_SHA" --workflow "$WORKFLOW" \
                 --provenance main-runs.txt > main-fails.txt 2>>extract-err.txt; then
             echo "::warning::admin-merge detector: could not extract main's prior failing set"
             sed 's/^/  /' extract-err.txt

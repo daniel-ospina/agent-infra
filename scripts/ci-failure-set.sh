@@ -29,6 +29,13 @@
 # Options:
 #   --exclude <sha>           (--main-union) drop runs whose headSha is <sha>
 #   --repo <owner/repo>       repo for the gh calls (default: gh's own resolution)
+#   --workflow <file|name>    restrict the run listing to ONE workflow (default
+#                             `python-ci.yml`, or $CI_FAILURE_SET_WORKFLOW).
+#                             See THE BOGUS ZERO below — this is not optional in
+#                             a repo whose main also runs cron/watchdog lanes.
+#   --any-workflow            drop the workflow filter (opt-out; re-opens the
+#                             bogus zero — use only when the test lane is the
+#                             repo's only failing surface)
 #   --provenance <file>       write the examined failing runs as `<sha>:<run-id>`
 #   --runs-report <file>      write `examined=<n>` / `extracted=<n>` counts
 #   --help
@@ -50,22 +57,43 @@
 #   hard-block a safe merge. A gate that false-blocks once gets disabled, and
 #   then we are back to a convention. Hence the union over the last N runs.
 #
+# THE BOGUS ZERO (the second trap this design exists to avoid):
+#   `gh run list --branch main` returns whatever ran most, NOT the test lane.
+#   tortoise main, measured 2026-09-13: of the last 30 runs on main, 11 were
+#   `availability-watchdog`, 3 `Inbound relay`, 3 `redis-guard`, 3
+#   `welcome-e2e-monitor`, 2 `registry-backup-cron` — and only 2 were `Python CI`.
+#   So a window of the last 10 runs can contain ZERO test runs, the baseline
+#   extracts EMPTY, and every failing test in the PR reads as NEW. That is a
+#   vacuous baseline, and it false-blocks: the same failure mode as #3469, just
+#   from the other side. Resolve the baseline from the TEST workflow.
+#
+#   The filter also applies to `--pr`/`--commit`: the PR side and the main side
+#   must come from the SAME lane, or `comm -23` compares two different things.
+#
 # Env seams (tests only):
-#   CI_FAILURE_SET_GH   the gh command to run (default: `gh`)
+#   CI_FAILURE_SET_GH         the gh command to run (default: `gh`)
+#   CI_FAILURE_SET_WORKFLOW   the workflow filter (default: `python-ci.yml`)
 
 set -uo pipefail
 
 GH="${CI_FAILURE_SET_GH:-gh}"
 DEFAULT_MAIN_RUNS=10
+DEFAULT_WORKFLOW="python-ci.yml"
+
+# Populated by main() before any selector runs. Bash locals are dynamically
+# scoped, but these are deliberately global: every helper below (and every
+# helper they call) must route --repo and --workflow identically, or one call
+# site silently drops a flag — which is how the bogus zero happened the first
+# time (--repo was accepted and then never forwarded to `gh run list`).
+REPO_ARGS=()
+WORKFLOW_ARGS=()
 
 # A failing check run. `cancelled` is deliberately EXCLUDED: ci.yml uses
 # `cancel-in-progress`, so a superseded run is cancelled, not failed — counting
 # it as red would pollute every baseline with noise.
 FAILING_RUN_JQ='.[] | select(.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="startup_failure") | "\(.headSha):\(.databaseId)"'
 
-usage() {
-  sed -n '1,60p' "$0" | sed -n 's/^# \{0,1\}//p'
-}
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
 say_err() { printf '%s\n' "$*" >&2; }
 
@@ -78,6 +106,7 @@ list_failing_runs() {
   local flag="$1" value="$2" limit="$3"
   # shellcheck disable=SC2086
   $GH run list "$flag" "$value" --limit "$limit" \
+    ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} \
     --json databaseId,conclusion,headSha --jq "$FAILING_RUN_JQ"
 }
 
@@ -87,7 +116,8 @@ list_failing_runs() {
 # the vacuous pass this rail exists to prevent.
 extract_failed_tests() {
   local run_id="$1" log
-  if ! log="$($GH run view "$run_id" --log-failed 2>/dev/null)"; then
+  # shellcheck disable=SC2086
+  if ! log="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>/dev/null)"; then
     say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set"
     return 1
   fi
@@ -133,6 +163,7 @@ collect_union() {
 main() {
   local mode="" pr="" commit="" main_runs="$DEFAULT_MAIN_RUNS"
   local exclude="" repo="" provenance="" report="" diff_a="" diff_b=""
+  local workflow="${CI_FAILURE_SET_WORKFLOW:-$DEFAULT_WORKFLOW}" any_workflow=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -148,6 +179,8 @@ main() {
       --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 ;;
       --exclude) exclude="${2:-}"; shift 2 ;;
       --repo) repo="${2:-}"; shift 2 ;;
+      --workflow) workflow="${2:-}"; shift 2 ;;
+      --any-workflow) any_workflow=1; shift ;;
       --provenance) provenance="${2:-}"; shift 2 ;;
       --runs-report) report="${2:-}"; shift 2 ;;
       --help|-h) usage; exit 0 ;;
@@ -155,8 +188,15 @@ main() {
     esac
   done
 
-  local repo_args=()
-  [ -n "$repo" ] && repo_args=(--repo "$repo")
+  REPO_ARGS=()
+  [ -n "$repo" ] && REPO_ARGS=(--repo "$repo")
+  WORKFLOW_ARGS=()
+  # An empty --workflow (or --any-workflow) means no filter. Filtering by the
+  # TEST lane is the default because an unfiltered window is how the baseline
+  # reads EMPTY while main is red — see THE BOGUS ZERO in the header.
+  if [ "$any_workflow" -eq 0 ] && [ -n "$workflow" ]; then
+    WORKFLOW_ARGS=(--workflow "$workflow")
+  fi
 
   case "$mode" in
     diff)
@@ -174,7 +214,7 @@ main() {
       # shellcheck disable=SC2086
       # `${repo_args[@]+…}` — bash 3.2 (macOS /bin/bash) errors on `"${arr[@]}"`
       # for an empty array under `set -u`.
-      head="$($GH pr view "$pr" ${repo_args[@]+"${repo_args[@]}"} --json headRefOid --jq .headRefOid 2>/dev/null)" || {
+      head="$($GH pr view "$pr" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --json headRefOid --jq .headRefOid 2>/dev/null)" || {
         say_err "ci-failure-set: ✗ could not resolve head of PR #$pr"; exit 1; }
       [ -n "$head" ] || { say_err "ci-failure-set: ✗ empty head for PR #$pr"; exit 1; }
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"

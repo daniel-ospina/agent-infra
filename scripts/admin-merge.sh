@@ -16,7 +16,6 @@
 #   pr-fails.txt   ← scripts/ci-failure-set.sh --pr <N>
 #   main-fails.txt ← scripts/ci-failure-set.sh --main-union N
 #   unique         ← scripts/ci-failure-set.sh --diff pr-fails.txt main-fails.txt
-#
 #   unique EMPTY            → post head-bound evidence, then merge
 #   unique NON-EMPTY        → re-run the PR's failed jobs ONCE; anything that
 #                             passes on retry is flaky, not new (recorded in the
@@ -25,12 +24,20 @@
 #
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
+#                              [--workflow <file|name>] [--any-workflow]
 #                              [--no-rerun] [--rerun-timeout S] [--dry-run]
 #                              [-- <extra gh pr merge flags>]
 #
 #   --main-runs N        union over main's last N runs (default 10 — see the
 #                        #3469 trap in ci-failure-set.sh; a single run is not a
 #                        baseline)
+#   --workflow <f>       the TEST lane both sides are read from (default
+#                        `python-ci.yml`). NOT cosmetic: an unfiltered main
+#                        window is dominated by cron/watchdog lanes and can
+#                        contain ZERO test runs, so the baseline extracts EMPTY
+#                        and every PR failure reads as new — the bogus zero. See
+#                        THE BOGUS ZERO in ci-failure-set.sh.
+#   --any-workflow       drop the lane filter (opt-out; re-opens the bogus zero)
 #   --no-rerun           skip the flake re-run classification (a non-empty
 #                        unique set then blocks immediately)
 #   --dry-run            compute + print the decision, post nothing, merge nothing
@@ -94,11 +101,12 @@ wait_for_run() {
 # to ONE head SHA: every push invalidates it, and the merge gate matches on it.
 build_evidence() {
   local head="$1" main_prov="$2" pr_count="$3" main_count="$4"
-  local unique_raw="$5" flake_line="$6" analyzed="$7"
+  local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
-  printf 'main compared (union of %s runs): %s\n' "$MAIN_RUNS" "$(tr '\n' ' ' < "$main_prov" | sed 's/ *$//' | tr ' ' ',' | sed 's/,,*/,/g' | sed 's/,$//')"
+  printf 'test lane: %s\n' "$lane"
+  printf 'main compared (union of %s runs of %s): %s\n' "$MAIN_RUNS" "$lane" "$(tr '\n' ' ' < "$main_prov" | sed 's/ *$//' | tr ' ' ',' | sed 's/,,*/,/g' | sed 's/,$//')"
   printf 'PR failing: %s | main failing: %s | unique to this PR: 0\n' "$pr_count" "$main_count"
   printf '%s\n' "$analyzed"
   printf '<details><summary>raw `comm -23` output</summary>\n\n```\n%s\n```\n</details>\n' "${unique_raw:-}"
@@ -107,6 +115,7 @@ build_evidence() {
 
 main() {
   local PR="" MAIN_RUNS="${MAIN_RUNS:-10}" REPO="" DRY_RUN=0 NO_RERUN=0
+  local WORKFLOW="${CI_FAILURE_SET_WORKFLOW:-python-ci.yml}" ANY_WORKFLOW=0
   RERUN_TIMEOUT="${RERUN_TIMEOUT:-1800}"
   local MERGE_ARGS=()
 
@@ -114,6 +123,8 @@ main() {
     case "$1" in
       --main-runs) MAIN_RUNS="${2:-}"; shift 2 ;;
       --repo) REPO="${2:-}"; shift 2 ;;
+      --workflow) WORKFLOW="${2:-}"; shift 2 ;;
+      --any-workflow) ANY_WORKFLOW=1; shift ;;
       --rerun-timeout) RERUN_TIMEOUT="${2:-}"; shift 2 ;;
       --no-rerun) NO_RERUN=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
@@ -135,6 +146,16 @@ main() {
   local repo_args=()
   [ -n "$REPO" ] && repo_args=(--repo "$REPO")
 
+  # The lane both sides are read from. An unfiltered main window is how the
+  # baseline reads EMPTY while main is red (the bogus zero) — so the filter is
+  # the default and the opt-out is explicit.
+  local wf_args=() lane="$WORKFLOW"
+  if [ "$ANY_WORKFLOW" -eq 1 ] || [ -z "$WORKFLOW" ]; then
+    wf_args=(--any-workflow); lane="any workflow"
+  else
+    wf_args=(--workflow "$WORKFLOW")
+  fi
+
   local TMP
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")"
   trap 'rm -rf "$TMP"' EXIT
@@ -147,7 +168,7 @@ main() {
 
   # ── 1. the PR's failing set, with provenance for the flake re-run ────────
   local pr_status=0
-  run_failure_set --pr "$PR" ${repo_args[@]+"${repo_args[@]}"} \
+  run_failure_set --pr "$PR" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
     --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" > "$TMP/pr-fails.txt" || pr_status=$?
   if [ "$pr_status" -ne 0 ]; then
     say_err "admin-merge: ✗ BLOCK — could not extract the PR's failing set (parser exit $pr_status)."
@@ -157,7 +178,7 @@ main() {
 
   # ── 2. main's baseline: the UNION over the last N runs ───────────────────
   local main_status=0
-  run_failure_set --main-union "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} \
+  run_failure_set --main-union "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
     --exclude "$head" --provenance "$TMP/main-runs.txt" --runs-report "$TMP/main-report.txt" \
     > "$TMP/main-fails.txt" || main_status=$?
   if [ "$main_status" -ne 0 ]; then
@@ -210,7 +231,7 @@ main() {
     fi
 
     local pr_status2=0
-    run_failure_set --pr "$PR" ${repo_args[@]+"${repo_args[@]}"} \
+    run_failure_set --pr "$PR" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
       --runs-report "$TMP/pr-report2.txt" > "$TMP/pr-fails2.txt" || pr_status2=$?
     [ "$pr_status2" -eq 0 ] || { say_err "admin-merge: ✗ BLOCK — PR failing set unreadable after re-run"; exit 1; }
     run_failure_set --diff "$TMP/pr-fails2.txt" "$TMP/main-fails.txt" > "$TMP/unique2.txt"
@@ -238,10 +259,20 @@ main() {
     "$(report_value "$TMP/pr-report2.txt" examined)" "$(report_value "$TMP/main-report.txt" examined)" \
     "$(report_value "$TMP/pr-report2.txt" extracted)" "$(report_value "$TMP/main-report.txt" extracted)")"
 
+  # A vacuous comparison is STATED, never implied. Both sides empty is usually a
+  # correct outcome (the lane is green on both sides) — but it is also exactly
+  # what a WRONG lane selector looks like, so the two must be distinguishable by
+  # a reader of the evidence. See the bogus-zero trap in ci-failure-set.sh.
+  if [ "$pr_count" -eq 0 ] && [ "$main_count" -eq 0 ]; then
+    analyzed="$analyzed
+⚠️ vacuous comparison: no failing runs were observed on EITHER side, so nothing was actually compared. Correct when the lane is green on both sides — but if the lane selector is wrong (--workflow), this certifies nothing."
+    info "admin-merge: ⚠️  vacuous comparison — no failing runs on either side; nothing was compared (lane: $lane)"
+  fi
+
   info "admin-merge: PR failing: $pr_count | main failing: $main_count | unique to this PR: 0"
 
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
-    "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" > "$TMP/evidence.md"
+    "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"
