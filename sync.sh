@@ -42,6 +42,16 @@ if [ -x ./scripts/check-cost-config.sh ]; then
   bash ./scripts/check-cost-config.sh
 fi
 
+# #716 — second-model gate designation, LIVE pass (runs after setup.sh
+# installed the shipped designation). OFFLINE `--check`: asserts the ordered
+# preference is not build-equivalent to the primary and that every candidate
+# declares its `runtimeVia` dispatch authority. The network probe (`--probe`)
+# is CI / gate-time only — a suspended provider must never block a sync.
+if [ -x ./scripts/check-second-model.sh ]; then
+  echo "==> second-model gate (live pass)"
+  bash ./scripts/check-second-model.sh --check
+fi
+
 # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
 # every extensions/ top-level entry except *.test.ts must be farm-wired into
 # pi-bootstrap/pi-config/extensions (single source of truth) AND listed in

@@ -1977,7 +1977,21 @@ export default function (pi: ExtensionAPI) {
             return { block: true, reason: gate.reason ?? "" };
           }
           if (gate.verdict === "recovery" || gate.verdict === "allowed") {
-            return undefined; // sanctioned recovery / read-only / worktree-isolated — done
+            // #805: M4's recovery allowlist sanctions `git push
+            // <checked-out-branch>` for WIP preservation. M4 cannot see the
+            // SESSION's baseline — pushing whatever branch the SHARED hub
+            // happens to be on is exactly the cross-session contamination
+            // (#265) the branch-ownership gate exists to refuse. Never let
+            // this early-return swallow a push: fall through to the
+            // ownership/M2 path below (which allows the session's OWN branch
+            // and blocks foreign ones, incl. bare/`HEAD`/remote-only pushes).
+            const pushDet = classifyGitCommandDetailed(command);
+            const gateablePush = pushDet?.verdict === "block:push" ||
+              pushDet?.verdict === "block:force-push" ||
+              pushDet?.verdict === "block:push-delete";
+            if (!gateablePush) {
+              return undefined; // sanctioned recovery / read-only / non-push — done
+            }
           }
         }
       } else if (isWrite || isEdit) {
@@ -2238,6 +2252,15 @@ export default function (pi: ExtensionAPI) {
               reason: "⛔ Branch-state command blocked — could not resolve the effective repo (fail-closed; #265).",
             };
           }
+          // #805: an UNRESOLVED target (bare cd / unexpandable $VAR / `-C`
+          // sentinel) must never be worktree-exempted — the command may run in
+          // the shared hub. Same fail-closed rule as M2.
+          if (muEff.unresolvedTarget) {
+            return {
+              block: true,
+              reason: "⛔ Branch-state command blocked — the command's target repository is unresolved (fail-closed; #805).",
+            };
+          }
           if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
           const baseline = baselines.get(pid);
           const isInfra = isAgentInfraRepo(muEff.effectiveCwd);
@@ -2458,10 +2481,20 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const baseline = baselines.get(pid);
+        // #805 P1: with NO baseline, decideM2 must know whether the resolved
+        // MAIN checkout is THIS session's own (a worktree shares its common
+        // dir, so `repoKey` equality identifies it) or the agent-infra hub —
+        // only those two are refused; a different repo's MAIN checkout is
+        // ordinary cross-repo work and stays allowed. Both probes spawn git, so
+        // they run only in the (rare, anomalous) no-baseline case.
         const m2 = branchOwnership.decideM2({
           effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
           pushDst: det.pushDst, pushTargets: det.pushTargets,
           verdict: det.verdict, allowActive: false,
+          ...(baseline ? {} : {
+            sessionRepoKey: branchOwnership.repoKey(process.cwd()) ?? null,
+            effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd),
+          }),
         });
         if (m2?.block) return { block: true, reason: m2.reason };
         return undefined; // on-baseline or unverifiable-but-exempt

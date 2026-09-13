@@ -1,0 +1,22 @@
+{
+  "moonshot/kimi-k3": {
+    "offer": {
+      "httpCode": 200,
+      "body": "{\"data\":[{\"id\":\"kimi-k3\"}]}"
+    },
+    "solvency": {
+      "httpCode": 200,
+      "body": "{\"available_balance\": 8.5}"
+    }
+  },
+  "openrouter/anthropic/claude-opus-4.8": {
+    "offer": {
+      "httpCode": 200,
+      "body": "{\"data\":[{\"id\":\"anthropic/claude-opus-4.8\"}]}"
+    },
+    "solvency": {
+      "httpCode": 200,
+      "body": "{\"data\":{\"limit\":100,\"limit_remaining\":50}}"
+    }
+  }
+}

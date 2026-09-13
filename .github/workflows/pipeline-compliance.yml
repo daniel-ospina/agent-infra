@@ -62,10 +62,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch PR base ref (#716 check (f) reads the base designation file)
+        # check (f) reads pi-bootstrap/pi-config/second-model.json from the PR's
+        # BASE via `git show <base>:<path>` — a default depth-1 checkout does
+        # not carry the base object, and an unresolvable base would fall back
+        # to the bootstrap WARN. Fetch the exact base commit so enforcement is
+        # real as soon as the designation file exists on main. (No-op for
+        # workflow_call, where the base-sha context is empty.)
+        if: ${{ github.event.pull_request.base.sha != '' }}
+        run: git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
       - name: Run pipeline compliance gate
         env:
           GH_REPO: ${{ inputs.repo || github.repository }}
           PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number }}
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PIPELINE_COMPLIANCE_SKIP: ${{ inputs.skip && '1' || '0' }}
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -576,13 +576,18 @@ try {
 // at the SOURCE level (comment text stripped first — a doc mention must not
 // false-trip). TRIPWIRE, NOT PROOF: naive/spaced/literal reintroductions of
 // the #99 carve-outs are caught (banned strings + whitespace-tolerant
-// call-site count + the surviving call pinned to its M3 decideM3 role), but
+// call-site count + each surviving call pinned to its role), but
 // deliberate rewrites (alias indirection, comment-split spellings, a guard
 // inserted between the isInfra assignment and decideM3, or restoring a
 // skipInfra option in classify-git) can evade source pins — index.ts is not
 // importable, so behavioral pins on it are impossible. A deliberate reverter
 // can delete the pins anyway; these exist to catch accidental/merge-confusion
 // reverts (verified: literal reverts of every removed hunk fail the suite).
+//
+// #805 P1: the count is TWO, both pinned to their role — the M3 ceremony
+// assignment and the M2 no-baseline `effectiveIsAgentInfra` argument. Any
+// THIRD call site (the write-tail exemption these pins exist to forbid) still
+// trips both count assertions below.
 const guardIndexSrc = readFileSync(
   join(PROJECT_CWD, "extensions", "main-worktree-guard", "index.ts"), "utf8");
 const pinSrc = guardIndexSrc.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
@@ -590,8 +595,12 @@ for (const banned of ["Downgraded agent-infra", "isAgentInfraRepo()) return unde
   expectBool(`#615 source pin: index.ts has no ${JSON.stringify(banned)}`, !pinSrc.includes(banned), true);
 }
 const infraCallSites = (pinSrc.match(/isAgentInfraRepo\s*\(/g) ?? []).length;
-expectBool("#615 source pin: only the M3 ceremony isAgentInfraRepo( call remains (index.ts)", infraCallSites === 1, true);
-const m3AssignIdx = pinSrc.indexOf("isInfra = isAgentInfraRepo(muEff.effectiveCwd)");
+const M3_INFRA_CALL = "isInfra = isAgentInfraRepo(muEff.effectiveCwd)";
+const M2_INFRA_CALL = "effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd)";
+expectBool("#615 source pin: only the M3 ceremony + the M2 no-baseline isAgentInfraRepo( calls remain (index.ts)", infraCallSites === 2, true);
+expectBool("#615 source pin: every isAgentInfraRepo( call site is one of the two known roles",
+  pinSrc.includes(M3_INFRA_CALL) && pinSrc.includes(M2_INFRA_CALL), true);
+const m3AssignIdx = pinSrc.indexOf(M3_INFRA_CALL);
 expectBool("#615 source pin: the surviving call is the M3 isInfra assignment", m3AssignIdx !== -1, true);
 const afterM3 = m3AssignIdx !== -1 ? pinSrc.slice(m3AssignIdx, m3AssignIdx + 2500) : "";
 expectBool("#615 source pin: isInfra feeds decideM3 (isAgentInfra: isInfra) — not an exemption guard", afterM3.includes("isAgentInfra: isInfra"), true);
@@ -611,7 +620,7 @@ expectBool("#618 source pin: write gate imports resolveTargetCheckout", pinSrc.i
 expectBool("#618 source pin: write gate classifies the target checkout (_checkoutOf)", pinSrc.includes("_checkoutOf(tgtReal)"), true);
 expectBool("#618 source pin: cross-cwd tracked-hub block wired (_targetTrackedAt)", pinSrc.includes("_targetTrackedAt(tgtCheck.top, tgtReal)"), true);
 expectBool("#618 source pin: cross-cwd block reason helper exists (_hubTargetWriteBlockReason)", pinSrc.includes("_hubTargetWriteBlockReason"), true);
-expectBool("#621 source pin: no isAgentInfraRepo gate in the write tail (stays ONE M3 ceremony call site)", infraCallSites === 1, true);
+expectBool("#621 source pin: no isAgentInfraRepo gate in the write tail (stays the M3 ceremony + M2 ownership call sites)", infraCallSites === 2, true);
 
 // ── 2026-09-09 review fold-in source pins (index.ts + classify-git.mjs) ────
 // Two fresh-context reviewers (correctness + adversarial bypass-surface)
