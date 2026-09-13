@@ -48,6 +48,13 @@ CYCLE=0
 FILES_CHANGED_PER_CYCLE_JSON='[]'
 ISSUES_PER_CYCLE_JSON='[]'
 PREV_FINGERPRINTS_JSON='[]'
+STALL_RECALL=0
+DETECTOR_FIRED=""
+# The skill's stall_threshold default, defined here so the value interpolated into
+# python can never be empty. An empty value reached python as `recall >= ` — a
+# SyntaxError — which produced an empty DETECTOR_FIRED and therefore NO exit at all
+# (fail-open: the loop walked to cycle-cap with no diagnosis).
+STALL_THRESHOLD="${STALL_THRESHOLD:-0.8}"
 EXIT_REASON=""
 ```
 
@@ -140,7 +147,7 @@ lst.append(int('$CYCLE_FILE_COUNT') if '$CYCLE_FILE_COUNT'.isdigit() else 0)
 print(json.dumps(lst))
 ")
 
-# Zero-progress detection: files changed = 0 for 2 consecutive cycles → fingerprint-stall
+# Zero-progress detection: files changed = 0 for 2 consecutive cycles → zero-progress
 ZERO_PROGRESS=$(python3 -c "
 import json
 lst = json.loads('$FILES_CHANGED_PER_CYCLE_JSON')
@@ -149,7 +156,13 @@ if len(lst) >= 2 and lst[-1] == 0 and lst[-2] == 0:
 else:
     print('false')
 ")
-if [ "$ZERO_PROGRESS" = "true" ]; then EXIT_REASON="fingerprint-stall"; break; fi
+# Its own exit label: mapping zero-progress onto "fingerprint-stall" made three
+# distinct conditions (identical issues recurring / new issues outpacing fixes /
+# the fixer writing nothing at all) indistinguishable in the persisted record.
+# DETECTOR_FIRED is set here too — it is an audit field, and a layer DID fire.
+# Leaving it empty made cycle-status.yaml record `exit_reason: zero-progress`
+# alongside `detector_fired: ''`, which reads as "no detector fired".
+if [ "$ZERO_PROGRESS" = "true" ]; then DETECTOR_FIRED="zero-progress"; EXIT_REASON="zero-progress"; break; fi
 ```
 
 Call `mcp__ai-workflow-tools__code_review_pattern_scan` with `gh pr diff $PR_NUMBER`. Store result as `PATTERN_SCAN_RAW`. Parse via `os.environ`:
@@ -180,6 +193,7 @@ Fingerprint stall detection (all multi-field JSON via `os.environ` — avoids ba
 ```bash
 export __CURR_ISSUES="$CURRENT_ISSUES_JSON"
 export __PREV_FPS="$PREV_FINGERPRINTS_JSON"
+export __STALL_THRESHOLD="$STALL_THRESHOLD"
 STALL_RESULT=$(python3 -c "
 import os, json, hashlib
 current_issues = json.loads(os.environ['__CURR_ISSUES'])
@@ -188,22 +202,31 @@ current_fps = set()
 for issue in current_issues:
     raw = issue.get('location','') + ':' + issue.get('description','') + ':' + issue.get('suggestion','')
     current_fps.add(hashlib.sha256(raw.encode()).hexdigest())
-stalled = bool(prev_fps) and (len(current_fps & prev_fps) / len(prev_fps)) >= $STALL_THRESHOLD
-print(json.dumps({'stalled': stalled, 'fingerprints': sorted(current_fps)}))
+# Symmetric denominator. Recurrence is measured against the LARGER of the two
+# issue sets, not against the previous cycle alone. With len(prev_fps) as the
+# denominator, a cycle that repeats all 10 prior issues AND adds 20 new ones
+# scores 10/10 = 1.0 and is reported as a stall — suppressing the 20 new issues
+# and, because the stall branch used to break first, honest-stuck entirely.
+recall = (len(current_fps & prev_fps) / max(len(current_fps), len(prev_fps))) if (current_fps and prev_fps) else 0.0
+thr = float(os.environ.get('__STALL_THRESHOLD') or 0.8)
+stalled = bool(prev_fps) and recall >= thr
+print(json.dumps({'stalled': stalled, 'recall': recall, 'threshold': thr, 'fingerprints': sorted(current_fps)}))
 ")
-unset __CURR_ISSUES __PREV_FPS
+unset __CURR_ISSUES __PREV_FPS __STALL_THRESHOLD
 
 export __STALL_RESULT="$STALL_RESULT"
-STALLED=$(python3 -c "import json,os; d=json.loads(os.environ['__STALL_RESULT']); print('true' if d['stalled'] else 'false')")
+# `stalled` is intentionally not extracted: classification below reads `recall`
+# and applies the threshold itself, so a separate boolean would be dead state.
+STALL_RECALL=$(python3 -c "import json,os; print(json.loads(os.environ['__STALL_RESULT'])['recall'])")
 PREV_FINGERPRINTS_JSON=$(python3 -c "import json,os; print(json.dumps(json.loads(os.environ['__STALL_RESULT'])['fingerprints']))")
 unset __STALL_RESULT
 
-if [ "$STALLED" = "true" ]; then EXIT_REASON="fingerprint-stall"; break; fi
-
-# Honest-stuck detection: issue count non-decreasing 3 consecutive cycles
-# (fingerprint-stall above already catches same-fingerprint cycles, so if we
-# reach here with non-decreasing count, the fingerprints genuinely differ —
-# meaning the fixer is introducing new issues faster than resolving existing ones)
+# Honest-stuck detection: issue count non-decreasing 3 consecutive cycles.
+# The count test is computed BEFORE any detector breaks — see classification
+# below. It is deliberately NOT predicated on "the fingerprints differ":
+# fingerprint-stall fires at recall >= the threshold, so a recall anywhere in
+# [0, threshold) previously satisfied NEITHER detector, and a cycle in that band
+# could not be diagnosed at all.
 export __HONEST_ISSUES="$ISSUES_PER_CYCLE_JSON"
 HONEST_STUCK=$(python3 -c "
 import os, json
@@ -216,7 +239,32 @@ else:
     print('true' if non_decreasing else 'false')
 ")
 unset __HONEST_ISSUES
-if [ "$HONEST_STUCK" = "true" ]; then EXIT_REASON="honest-stuck"; break; fi
+
+# ── Classification ───────────────────────────────────────────────────────────
+# Both signals are computed before either may exit. fingerprint-stall must NOT
+# break first: a cycle that repeats old issues AND adds new ones would be
+# reported as a stall, with the new issues suppressed and the persisted
+# exit_reason wrong.
+#   recall >= threshold                 → fingerprint-stall (same issues recurring)
+#   recall <  threshold AND count up 3× → honest-stuck      (new issues outpace fixes)
+#   recall <  threshold AND count not up→ no exit           (ordinary churn)
+export __RECALL="$STALL_RECALL"
+export __HONEST="$HONEST_STUCK"
+export __STALL_THRESHOLD="$STALL_THRESHOLD"
+DETECTOR_FIRED=$(python3 -c "
+import os
+recall = float(os.environ['__RECALL'] or 0)
+honest = os.environ['__HONEST'] == 'true'
+thr = float(os.environ.get('__STALL_THRESHOLD') or 0.8)
+if recall >= thr:
+    print('fingerprint-stall')
+elif honest:
+    print('honest-stuck')
+else:
+    print('')
+")
+unset __RECALL __HONEST __STALL_THRESHOLD
+if [ -n "$DETECTOR_FIRED" ]; then EXIT_REASON="$DETECTOR_FIRED"; break; fi
 ```
 
 ### L7 — Update surviving issues
@@ -265,6 +313,11 @@ status = {
   'issues_per_cycle': json.loads('$ISSUES_PER_CYCLE_JSON'),
   'files_changed_per_cycle': json.loads('$FILES_CHANGED_PER_CYCLE_JSON'),
   'pr_number': $PR_NUMBER,
+  # Auditable detector inputs. Without these, "why did the loop exit?" cannot be
+  # answered after the fact — the predicate's inputs are gone, which is exactly
+  # what made the #755 plan-review non-convergence undiagnosable.
+  'detector_fired': '$DETECTOR_FIRED',
+  'fingerprint_recall_last_cycle': ${STALL_RECALL:-0},
   'ts': datetime.now(timezone.utc).isoformat(),
 }
 os.makedirs('operations/logs', exist_ok=True)
@@ -278,6 +331,7 @@ with open('operations/logs/cycle-status.yaml', 'w') as f:
 ## PR comment prefix (prepended to Step 8 comment body)
 
 - `EXIT_REASON == "fingerprint-stall"`: `⚠️ Auto-fix stalled after ${CYCLE} cycles — requires human review\n\n`
+- `EXIT_REASON == "zero-progress"`: `⚠️ Auto-fix made no changes for 2 consecutive cycles (zero-progress) — requires human review\n\n`
 - `EXIT_REASON == "honest-stuck"`: `⚠️ Auto-fix stuck (honest-stuck — new issues each cycle, non-decreasing 3×) — requires human review\n\n`
 - `EXIT_REASON == "cycle-cap"`: `⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain; escalate to a human\n\n`
 - `EXIT_REASON == "tool-unavailable"` or `"push-failed"` or `"git-error"` or `"pr-closed"`: `⚠️ Auto-fix aborted (${EXIT_REASON}) — issues require human review\n\n`

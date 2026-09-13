@@ -475,6 +475,8 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 - [ ] Last cycle's reviewers #1–#4 all returned "NO ISSUES FOUND" (verbatim, not paraphrased)
 - [ ] Reviewer #5 (if dispatched) was parsed against its **full** token and dispositioned per the table above — `NO ISSUES FOUND — CLEAN`, `— DEGRADED (<source>)` recorded as a caveat, or `ISSUES:` recorded with its verdicts. None of these blocks the cycle; all three satisfy this box. Substring-matching `NO ISSUES FOUND` and reading `— DEGRADED` as clean fails this box.
+
+  ⚠️ **This box gates *proceeding*, not *cleanliness* — the two are different predicates and this is the one place a reader mid-loop consults.** All three dispositions satisfy it, but only `NO ISSUES FOUND — CLEAN` yields a **clean** exit. `ISSUES:` (and a `— DEGRADED` recorded as a caveat) yields an **escalation** exit: proceed to Phase 5 with the surviving issues documented and carried into the escalation payload, and **never report it as clean or complete**. Per `AGENTS.md` §Hard Cap, an exit that leaves issues unresolved is an escalation exit, not a completion.
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
@@ -482,22 +484,28 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **Stuckness detection (3-layer algorithm)**:
 
-a. **Fingerprint-stall**: Hash each surviving issue's dimension+location+description+suggestion (SHA256). If ≥80% of fingerprints match the previous cycle → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
+a. **Fingerprint-stall**: Hash each surviving issue's dimension+location+description+suggestion (SHA256). **Recall is `|current ∩ prev| / max(|current|, |prev|)`** — the denominator is the *larger* of the two issue sets, never the previous cycle alone. (With `|prev|` as the denominator, a cycle that repeats all 10 prior issues **and adds 20 new ones** scores 10/10 = 1.0 and is misreported as a stall, suppressing the 20 new issues.) If recall ≥ the stall threshold → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
 
-b. **Honest-stuck**: Track `issues_per_cycle` (number of issues surviving after each cycle). If issue count is **non-decreasing for 3 consecutive cycles** AND the fingerprints differ from prior cycles (genuinely new issues each time), the fixer is introducing new issues faster than it resolves existing ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem.
+b. **Honest-stuck**: Track `issues_per_cycle` (number of issues surviving after each cycle) **and the fingerprint recall of each cycle against the previous one — the same symmetric ratio `fingerprint-stall` uses.** If recall is **below the stall threshold** AND issue count is **non-decreasing for 3 consecutive cycles**, the fixer is introducing new issues faster than it resolves existing ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.**
 
-c. **Zero-progress**: Track whether the plan doc was modified each cycle. If plan doc unchanged for 2 consecutive cycles, the fixer is making zero progress — treat as fingerprint-stall and escalate.
+   ⚠️ The predicate is **`recall < threshold`**, *not* "the fingerprints differ". Those are not equivalent: `fingerprint-stall` fires at `recall >= threshold`, so a cycle whose recall falls anywhere in `[0, threshold)` would satisfy **neither** detector if this conjunct were phrased as "fingerprints differ" — leaving a band in which a non-convergent loop goes completely undiagnosed. State both detectors as ratios over the same denominator so they are mutually exhaustive.
+
+c. **Zero-progress**: Track whether the plan doc was modified each cycle. If the plan doc is unchanged for 2 consecutive cycles, the fixer is making zero progress. Exit reason = `zero-progress`. Escalate to human. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.** (Previously mapped onto `fingerprint-stall`, which made three distinct conditions — identical issues recurring, new issues outpacing fixes, and the fixer writing nothing at all — indistinguishable in the persisted record.)
 
 **Convergence rule:** If cycle N issues are a strict subset of cycle N-1 issues (no new dimensions or locations, only previously-flagged items remain), the reviewer is in a refinement loop — fixes are shrinking the problem space but not eliminating it. Log convergence and escalate to human: present remaining issues with attempted fixes. Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.
 
 **Cycle-status YAML**: Write `operations/logs/cycle-status.yaml` on loop exit:
 
 ```yaml
-exit_reason: <clean|fingerprint-stall|honest-stuck|cycle-cap|convergence>
+exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|convergence>
 cycles: <N>
 issues_per_cycle: <json array>
 plan_modified_per_cycle: <json array of booleans>
+detector_fired: <fingerprint-stall|honest-stuck|zero-progress|''>   # which layer fired, or empty
+fingerprint_recall_last_cycle: <0.0-1.0>   # the predicate's actual input
 ```
+
+> **Why `detector_fired` and `fingerprint_recall_last_cycle` are recorded:** without them, "why did this loop exit?" cannot be answered after the fact — the predicate's inputs are gone and only the verdict survives. That is what made a real non-convergent run undiagnosable.
 
 **Progress report:** After each cycle, output: "Plan review cycle N: X issues found across N reviewers, Y fixed, Z remaining."
 
