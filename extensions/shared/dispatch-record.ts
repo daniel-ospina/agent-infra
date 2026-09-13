@@ -76,7 +76,12 @@ export interface DispatchOutcomeRow {
   branch: string | null;
   headSha: string | null;
   dirty: boolean | null;
-  dirtyPaths: string[];
+  /** Dirty paths, or null when the status probe FAILED (#783 §6.6). NULL IS
+   * NOT `[]`: `[]` is a confident "zero dirty paths" that a machine consumer
+   * would read as a clean tree, which is exactly what repo-freshness refuses to
+   * report (it returns `paths: null` for the same reason). Only the human
+   * renderer had been corrected before; this aligns the row with it. */
+  dirtyPaths: string[] | null;
   /** Why the attempt ended: "hard-cap" | "cut" | "backstop" | "failed" |
    * the heartbeat `decision.reason`. */
   reason: string;
@@ -106,7 +111,7 @@ export interface DispatchOutcomeInput {
   branch: string | null;
   headSha: string | null;
   dirty: boolean | null;
-  dirtyPaths: string[];
+  dirtyPaths: string[] | null;
   reason: string;
   toolAgeMaxMs: number | null;
   toolsInFlight: number | null;

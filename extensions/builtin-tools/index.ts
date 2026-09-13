@@ -16,8 +16,10 @@
  *     (tool start/end, turn start/end, 30s ticks carrying in-flight state +
  *     stream age). The kill fires only on genuine silence — no in-flight tool,
  *     no active turn with fresh stream activity, no output — with bounded
- *     backstops: stream-stall (20 min), tool-stall (2h on the task path —
- *     DEFAULT_TASK_TOOL_STALL_MS, #783; min(L,T) preflight; the exported
+ *     backstops: stream-stall (20 min), tool-silence / tool-stall (every
+ *     in-flight tool silent for 20 min, else an age backstop at 2/3 of the
+ *     effective hard cap — 4h at the 6h default, task path, #783; min(L,T)
+ *     preflight; the exported
  *     DEFAULT_TOOL_STALL_MS stays 6h for extensions/subagent/),
  *     first-message (300s). Markers never contaminate results (filtered at
  *     ingestion). Absent the emitter → exact legacy byte-silence behavior.
@@ -1476,11 +1478,18 @@ export function scanStderrForUsage(
 //     completion watchdog (Tier 4) so a completed child stuck in cleanup is
 //     rescued promptly and its output returned as success.
 //
-// Kill clauses (precedence: tool-stall → stream-stall → silence → cut →
-// first-message → max-dispatch):
-//   tool-stall ........ in-flight tool older than TASK_TOOL_STALL_MS (2h on
-//                       the task path — DEFAULT_TASK_TOOL_STALL_MS, #783;
-//                       min(L, T) when turnActive=false — preflight-stuck)
+// Kill clauses (precedence: tool-silence → tool-stall → stream-stall →
+// silence → cut → first-message → max-dispatch):
+//   tool-silence ...... in-flight tool with NO OUTPUT for
+//                       TASK_STREAM_STALL_MS (20 min) — the PRIMARY wedged-tool
+//                       detector. A working tool keeps emitting
+//                       `tool_execution_update`, so silence ⇒ wedged, and a
+//                       healthy tool survives however long it runs (#783 §6.6)
+//   tool-stall ........ in-flight tool older than 2/3 of the effective hard cap
+//                       (4h at the 6h default, task path — #783;
+//                       min(L, T) when turnActive=false — preflight-stuck).
+//                       AGE BACKSTOP only: the runaway-loop shape that streams
+//                       forever and so is invisible to tool-silence
 //   stream-stall ...... no tools, stream idle > TASK_STREAM_STALL_MS (20 min)
 //                       — also bounds between-turn wedges with flowing ticks
 //   silence ........... no bytes/markers for HEARTBEAT_TIMEOUT_MS unless
@@ -1515,16 +1524,25 @@ export const DEFAULT_STREAM_STALL_MS = 1_200_000;
  * to the task bound below — that would silently drag the subagent backstop
  * below the hard cap. */
 export const DEFAULT_TOOL_STALL_MS = 21_600_000;
-/** #783 fix 4: the TASK-path tool-stall bound (2h), split off from the frozen
- * export above. Before the split it equalled DEFAULT_HARD_CAP_MS (both 6h), so
- * the in-flight-tool bound gave no margin over the cap and could not fire
- * meaningfully earlier. 2h is chosen against this repo's real single-tool
- * durations — ~20 min for a cold `npm ci`, ~40 min for the longest full
- * `npx tsx` suite — 3× headroom, while still firing 4h BEFORE the 6h cap.
- * Clause 1 deliberately has no !everSawRealActivity gate (it is the wedged-TOOL
- * detector, and markers stay fresh while a tool runs), so the bound MUST exceed
- * any legitimate single-tool duration or it kills healthy children and destroys
- * in-flight work: a bound below ~1h is a behaviour change, not a tuning tweak.
+/** #783 fix 4: fraction of the EFFECTIVE hard cap that one in-flight tool may
+ * consume before the task-path wedged-tool detector fires. 2/3 → 4h at the 6h
+ * default: 6× this repo's longest observed single tool (~40 min for the full
+ * `npx tsx` suite; a cold `npm ci` is ~20 min), and still a 2h handoff window
+ * before the cap would otherwise fire.
+ *
+ * It is a FRACTION of the cap, not a fixed constant, for two reasons:
+ *  · COHERENCE — the bound must stay strictly below the cap for any cap ABOVE
+ *    the 60s floor (at the floor itself they collide, since the minimum bound is
+ *    the same 60s — measure-zero, and that floor exists so a sub-60s bound can
+ *    never kill between two ticks). A fixed bound that an override pushes above
+ *    the cap re-creates the exact pre-#783 bug: a detector that can never fire
+ *    before the cap it exists to pre-empt.
+ *  · the #363/#489 kill-productive-agents class. The bound MUST exceed any
+ *    legitimate single-tool duration or it destroys in-flight work, and clause
+ *    1 deliberately has no !everSawRealActivity gate (it is the wedged-TOOL
+ *    detector, and markers stay fresh while a tool runs), so there is nothing
+ *    else to stop it. A bound below ~1h is a behaviour change, not a tuning
+ *    tweak.
  * Task-local (unexported) — subagent/ keeps the frozen 6h constant above.
  *
  * ⚠️ DELIBERATE OVERRIDE of the #208 align-condition-3 decision ("Keep the
@@ -1535,13 +1553,18 @@ export const DEFAULT_TOOL_STALL_MS = 21_600_000;
  * bounds are now DECOUPLED: this is the task-path tool-stall only, the hard
  * cap stays 6h, and the exported DEFAULT_TOOL_STALL_MS stays 6h so the
  * subagent backstop cannot be dragged below the cap. Justification: a tool
- * wedged >2h is already pathological in this repo, and firing at 2h gives the
- * parent a recoverable cut 4h before the cap would otherwise fire.
- * Accepted risk (explicit, not silent): one legitimately long tool >2h WILL be
- * killed. Because clause 1 resolves a DEFINED payload whenever hasOutput is
- * true, retry() treats that cut as success — the attempt is NOT retried, so a
+ * wedged for 2/3 of the entire run budget is already pathological, and firing
+ * there gives the parent a recoverable cut well before the cap would fire.
+ * Accepted risk (explicit, not silent): one legitimately long tool exceeding
+ * 2/3 of the cap WILL be killed. Originally set to a fixed 2h; the §6.6
+ * second-model gate rejected that as too close to real single-tool durations
+ * for a general sub-agent tool (it undid #363 from the other direction), and
+ * the derived 2/3 form both restores the headroom and keeps the bound below
+ * the cap under any TASK_HARD_CAP_MS override.
+ * Because clause 1 resolves a DEFINED payload whenever hasOutput is true,
+ * retry() treats that cut as success — the attempt is NOT retried, so a
  * killed-but-productive dispatch is surfaced to the parent rather than lost.*/
-const DEFAULT_TASK_TOOL_STALL_MS = 7_200_000;
+const TASK_TOOL_STALL_FRACTION = 2 / 3;
 export const DEFAULT_FIRST_MESSAGE_MS = 300_000;
 
 /** Clamp a raw interval into [5s, 300s]; non-finite/≤0 → default. Identical
@@ -1563,13 +1586,19 @@ export function getStreamStallMs(): number {
   return Math.max(60_000, Number(process.env.TASK_STREAM_STALL_MS) || DEFAULT_STREAM_STALL_MS);
 }
 export function getToolStallMs(): number {
-  // #783 fix 4: the task path resolves the task-local 2h default; the exported
-  // DEFAULT_TOOL_STALL_MS stays 6h for extensions/subagent/index.ts.
+  // #783 fix 4: the task path resolves a bound DERIVED from the effective hard
+  // cap (2/3 → 4h at the 6h default). It must not read the exported
+  // DEFAULT_TOOL_STALL_MS above, which stays FROZEN at 6h for
+  // extensions/subagent/index.ts — that would drag this back to 6h and re-create
+  // the pre-#783 "bound can never fire before the cap" bug.
   // Fail-CLOSED on a non-finite override: `Number("1e400")`/"Infinity" are
   // truthy and survive Math.max, which would leave the wedged-tool detector
   // permanently disarmed. Only a positive finite value overrides the default.
   const n = Number(process.env.TASK_TOOL_STALL_MS);
-  return Number.isFinite(n) && n > 0 ? Math.max(60_000, n) : DEFAULT_TASK_TOOL_STALL_MS;
+  if (Number.isFinite(n) && n > 0) return Math.max(60_000, n);
+  // Derived, so the bound tracks TASK_HARD_CAP_MS: a fixed default would end up
+  // >= a lowered cap and silently dead (the detector could never fire first).
+  return Math.max(60_000, Math.floor(getTaskHardCapMs() * TASK_TOOL_STALL_FRACTION));
 }
 /**
  * #209: system load probe — 1-minute load average. Reads /proc/loadavg
@@ -1634,7 +1663,13 @@ export const DEFAULT_MAX_DISPATCH_MS = 0;
 // frozen-agent hangs).
 export const DEFAULT_HARD_CAP_MS = 21_600_000; // 6h (was 2h, #363): full-pipeline sub-agent runs (scope→verify→plan→implement→review) exceed 2h; 2h killed mid-pipeline workers. Env-overridable (TASK_HARD_CAP_MS, 60s floor).
 export function getTaskHardCapMs(): number {
-  return Math.max(60_000, Number(process.env.TASK_HARD_CAP_MS) || DEFAULT_HARD_CAP_MS);
+  // #783 §6.6 (P2): fail CLOSED on a non-finite override. `Number("1e400")` and
+  // `Number("Infinity")` are truthy and survive Math.max, so the cap resolved to
+  // Infinity — which disarmed the hard cap AND, once the tool-stall bound was
+  // derived from it, the age backstop with it, leaving the runaway-streaming
+  // shape unbounded. Same finiteness gate the sibling bounds already use.
+  const n = Number(process.env.TASK_HARD_CAP_MS);
+  return Number.isFinite(n) && n > 0 ? Math.max(60_000, n) : DEFAULT_HARD_CAP_MS;
 }
 export function getTaskMaxDispatchMs(): number {
   const raw = Number(process.env.TASK_MAX_DISPATCH_MS);
@@ -1667,13 +1702,13 @@ export function getCutGapMs(): number {
 //
 // #783 fix 4 — DELIBERATE DECOUPLING: the backstop derives from the FROZEN
 // exported DEFAULT_TOOL_STALL_MS (6h) + margin (6h30m), NOT from the task
-// path's own tool-stall bound (DEFAULT_TASK_TOOL_STALL_MS, now 2h). It is no
+// path's own derived tool-stall bound (2/3 of the cap — 4h at the 6h default). It is no
 // longer literally "task tool-stall + margin". It must stay ABOVE the 6h hard
 // cap so the cap remains the last resort; deriving it from the 2h task bound
 // would drag it to 2h30m and pre-empt the cap.
 
 /** #271 D4: backstop margin over the FROZEN DEFAULT_TOOL_STALL_MS (30 min).
- * #783 fix 4: deliberately NOT the task path's DEFAULT_TASK_TOOL_STALL_MS. */
+ * #783 fix 4: deliberately NOT the task path's derived tool-stall bound. */
 export const DEFAULT_BACKSTOP_MARGIN_MS = 1_800_000;
 
 /** Grace between the child's `exit` event and the exit-settle fallback — if
@@ -1767,6 +1802,14 @@ export interface HeartbeatState {
    * time-to-first-observable-activity, comparable to the child's own
    * time-to-first-activity measured from session logs (#282 sweep). */
   firstActivityAt: number;
+  /** #783 §6.6: the in-flight tool round has emitted at least one update
+   * (child `tool_updates=1`). Gates the tool-silence clause — output silence is
+   * only a valid wedge signal for a tool that has PROVEN it produces output.
+   * Only streaming tools emit `tool_execution_update` (`bash` does; `task`,
+   * `read`, `edit`, `write` pass `_onUpdate` unused), so without this gate an
+   * outer agent awaiting a nested task — silent by construction for the whole
+   * child duration, see E279a2 — is misread as wedged and killed at S. */
+  toolUpdates: boolean;
   /** High-water mark of toolsInFlight ever parsed. */
   toolsMaxInFlight: number;
   /** First-N marker kinds in parse order (bounded, oldest kept) — the run's
@@ -1781,6 +1824,7 @@ export function createHeartbeatState(): HeartbeatState {
     turnActive: false,
     streamAgeMs: 0,
     toolAgeMaxMs: 0,
+    toolUpdates: false,
     turnSawMessage: false,
     turnSawTool: false,
     everSawWork: false,
@@ -1863,6 +1907,8 @@ export function parseHeartbeatLine(
       state.sessionEnded = true;
       break;
     case "tool_start":
+      // #783 §6.6: a round starting from idle resets the output-liveness latch.
+      if (state.toolsInFlight === 0) state.toolUpdates = false;
       state.toolsInFlight += 1;
       state.toolsMaxInFlight = Math.max(state.toolsMaxInFlight, state.toolsInFlight);
       state.everSawTool = true;
@@ -1883,6 +1929,7 @@ export function parseHeartbeatLine(
       break;
     case "tool_end":
       state.toolsInFlight = Math.max(0, state.toolsInFlight - 1);
+      if (state.toolsInFlight === 0) state.toolUpdates = false;
       // #279 (P1-1 hardening): a parsed tool_end provably implies PRIOR model
       // activity — a streamed assistant message produced a tool call (even a
       // failed/blocked/truncated one emits tool_execution_end in pi). Closes
@@ -1913,7 +1960,8 @@ export function parseHeartbeatLine(
       // parent tick overwrites it, and turn_start/turn_end hard-reset it to 0.
       // Any stale value below the bound comes by construction from a tool that
       // had not tripped that same bound; it is at most the task path's
-      // DEFAULT_TASK_TOOL_STALL_MS (2h, #783) — NOT the >6h age the pre-split
+      // task path's derived tool-stall bound (2/3 of the cap — 4h at the 6h
+      // default, #783) — NOT the >6h age the pre-split
       // safety argument assumed.
       state.streamAgeMs = 0;
       break;
@@ -1966,6 +2014,9 @@ export function parseHeartbeatLine(
           case "turn": state.turnActive = v === 1; break;
           case "stream_age_ms": state.streamAgeMs = v; break;
           case "tool_age_max_ms": state.toolAgeMaxMs = v; break;
+          // #783 §6.6: absent on an older child → stays false → the silence
+          // clause cannot fire (fails SAFE to the age backstop).
+          case "tool_updates": state.toolUpdates = v === 1; break;
           case "saw_msg": state.turnSawMessage = v === 1; break;
           case "saw_tool": state.turnSawTool = v === 1; break;
         }
@@ -2045,7 +2096,15 @@ export interface HeartbeatIngestContext {
  * `!hasOutput` arm (the zero-output settles) would be dead code.
  */
 export const KNOWN_STDERR_NOISE: RegExp[] = [
-  /^Warning: No project session found with id '[^']*'; creating a new session with that id\.$/,
+  // Anchored on the STABLE CORE only — deliberately no tail (#783 §6.6 review).
+  // The version-coupled sentence after the id (`; creating a new session with
+  // that id.`) is prose pi may reword; matching it exactly meant a reword would
+  // silently no-op this filter, and since the whole retryability contract is
+  // `resolveUndefined = !hasOutput`, every fresh --session-id spawn would then
+  // count as real output and every zero-output settle would become dead code —
+  // the #783 silent-loss failure mode under a new name. The `^` anchor is what
+  // keeps this precise: only a line BEGINNING with the warning is noise.
+  /^Warning: No project session found with id '[^']*'/,
 ];
 
 /** True when a complete stderr line/residue is known pi-CLI noise
@@ -2133,6 +2192,7 @@ export type HeartbeatKillReason =
   | "zero-output"
   | "silence-threshold"
   | "stream-stall"
+  | "tool-silence"
   | "tool-stall"
   | "first-message-stall"
   | "max-dispatch"
@@ -2187,8 +2247,9 @@ export interface HeartbeatDecisionInput {
 }
 
 /**
- * The idle detector (#176): tier-1 + the four kill clauses. Precedence
- * (pinned, E10): tool-stall → stream-stall → silence → first-message.
+ * The idle detector (#176): tier-1 + the seven kill clauses. Precedence
+ * (pinned, E10): tool-silence → tool-stall → stream-stall → silence → cut →
+ * first-message → max-dispatch.
  * Every clause is bounded; with no markers at all the decision degrades to
  * exact legacy behavior (tier-1 + byte-silence at T).
  */
@@ -2256,8 +2317,38 @@ export function heartbeatKillDecision(
     return { kill: false, resolveUndefined: false, firstMessageMs: effFirstMessageMs };
   }
 
-  // 1. tool-stall — desynced-counter / absurd-hang bound. Preflight-stuck
-  //    children (turnActive=false) get the tighter min(L, T) ceiling.
+  // 1. tool-silence — the PRIMARY in-flight-tool detector (#783 §6.6 review).
+  //    A tool that is genuinely still working keeps producing output: pi fires
+  //    `tool_execution_update` on every chunk, and the child folds each into
+  //    `touchActivity()` → `stream_age_ms` (task-heartbeat.ts). So silence
+  //    WHILE a tool is in flight is the real "wedged" signal, and the tool's
+  //    DURATION stops mattering — a healthy tool is protected by its own
+  //    output however long it runs, while a dead one is caught in S rather than
+  //    waiting out a minute-scale age bound.
+  //    Until this clause existed, the silence detector was gated
+  //    `toolsInFlight === 0` — switched OFF exactly when a tool was running —
+  //    and the crude total-age bound below stood in for it. That gate is what
+  //    forced the age bound to be generous enough for the slowest legitimate
+  //    tool, which made it simultaneously too slow for a dead tool and a
+  //    kill risk for a slow one. Silence collapses that trade-off: a 3h test
+  //    suite that keeps printing is never touched, a tool that has gone quiet
+  //    for S is gone.
+  //    Accepted trade-off: a tool that BUFFERS all its output (a suite that
+  //    prints only at the end) emits no `tool_execution_update` at all, so
+  //    `tool_updates` stays 0 and this clause cannot fire — such a tool is
+  //    bounded instead by the age backstop below (and by the no-tool silence
+  //    clause once it ends). That is deliberate: the clause only ever kills a
+  //    tool that has DEMONSTRATED it streams and then stopped, so silence is
+  //    evidence of a wedge rather than of a quiet-but-working tool.
+  if (stateFresh && st.toolsInFlight > 0 && st.toolUpdates && effStreamAge > i.streamStallMs) {
+    return kill("tool-silence");
+  }
+
+  // 2. tool-stall — AGE BACKSTOP, demoted from primary detector. It now owns
+  //    only the pathological shape tool-silence cannot see: a tool that streams
+  //    FOREVER but never finishes (runaway loop), where stream age stays fresh
+  //    by construction. Preflight-stuck children (turnActive=false) keep the
+  //    tighter min(L, T) ceiling.
   if (stateFresh && st.toolsInFlight > 0) {
     const bound = st.turnActive
       ? i.toolStallMs
@@ -2265,7 +2356,7 @@ export function heartbeatKillDecision(
     if (effToolAge > bound) return kill("tool-stall");
   }
 
-  // 2. stream-stall — no tools, stream idle beyond S. No turnActive
+  // 3. stream-stall — no tools, stream idle beyond S. No turnActive
   //    requirement: also bounds between-turn wedges with flowing ticks.
   if (stateFresh && st.toolsInFlight === 0 && effStreamAge > i.streamStallMs) {
     return kill("stream-stall");
@@ -2451,7 +2542,7 @@ interface AbnormalExitSection {
 /** Per-killer presentation for `composeAbnormalExit`. `reason` alone cannot
  * reproduce any of the four — the stderr/stdout laws and the headline differ. */
 interface AbnormalExitCtx {
-  /** Killer headline. The heartbeat killer has SIX, keyed by
+  /** Killer headline. The heartbeat killer has SEVEN, keyed by
    * `decision.reason`; there is no single headline for that arm. */
   headline: string;
   /** Single-line alive-state summary, already rendered — it ends with the
@@ -2728,7 +2819,13 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           branch: repoState?.branch ?? null,
           headSha: repoState?.headSha ?? null,
           dirty: repoState?.dirty ?? null,
-          dirtyPaths: repoState?.paths ?? [],
+          // MUST stay null when the status probe failed, not `[]` (#783 §6.6
+          // review): repo-freshness returns `paths: null` for UNKNOWN
+          // deliberately ("A failed status probe MUST NOT become a confident
+          // `dirty=false`"), and `?? []` laundered that UNKNOWN back into a
+          // confident "zero dirty paths" for any machine consumer of the JSONL
+          // row. The human renderer was already correct; this aligns the row.
+          dirtyPaths: repoState?.paths ?? null,
           reason,
           toolAgeMaxMs: hbCtx.state.toolAgeMaxMs,
           toolsInFlight: hbCtx.state.toolsInFlight,
@@ -3068,9 +3165,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // pi-CLI noise the flusher filters; marker residue discarded).
       flushHeartbeatLineBuf(hbCtx);
       // Tier 1 + tier 2 (#176): one idle detector — tier-1 first-output
-      // (startup hangs, retryable), then tool-stall → stream-stall →
-      // silence → cut → first-message → max-dispatch over the parsed alive
-      // state. sessionEnded short-circuits at the top of the decision.
+      // (startup hangs, retryable), then tool-silence → tool-stall →
+      // stream-stall → silence → cut → first-message → max-dispatch over the
+      // parsed alive state. sessionEnded short-circuits at the top of the
+      // decision.
       const load1 = getLoad1();
       const decision = heartbeatKillDecision({
         now,
@@ -3154,6 +3252,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s) — treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(hbCtx.state.toolAgeMaxMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,

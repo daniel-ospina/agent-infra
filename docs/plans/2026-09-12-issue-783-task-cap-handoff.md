@@ -469,11 +469,32 @@ tick (`:1888`, `case "tool_age_max_ms"`), and clause 1 already requires `st.tool
 the **scope** states (`:88`): `DEFAULT_TOOL_STALL_MS` (`:1482`) == `DEFAULT_HARD_CAP_MS`
 (`:1567`), so the bound provides no margin.
 
-**The change:** add a task-local `DEFAULT_TASK_TOOL_STALL_MS = 7_200_000` **(2 h)**, env-overridable
-as `TASK_TOOL_STALL_MS`, consumed by `getToolStallMs()` (`:1503`) and reaching clause 1 via
-`hbThresholds.toolStallMs` (`:2548`).
+**The change:** add a task-local in-flight-tool bound, env-overridable as `TASK_TOOL_STALL_MS`,
+consumed by `getToolStallMs()` (`:1503`) and reaching the clause via `hbThresholds.toolStallMs`
+(`:2548`).
 
-**Why 2 h, and why the value matters more than the mechanism.** Clause 1 kills whenever
+> **⚠️ SUPERSEDED AT REVIEW (§6.6 second-model gate) — the plan below is the rev-3 design, not
+> what shipped.** Rev 3 went to a fixed 2 h literal (`DEFAULT_TASK_TOOL_STALL_MS = 7_200_000`) and
+> kept the *age* clause as the primary in-flight detector. The §6.6 gate rejected that on two
+> grounds, both of which rev 3's own safety argument supports:
+> 1. **A fixed bound is not coherent with an overridable cap.** `TASK_HARD_CAP_MS` is env-tunable;
+>    a fixed 2 h bound above a lowered cap re-creates the exact pre-#783 bug (a detector that can
+>    never fire before the cap it exists to pre-empt). Shipped instead: **`TASK_TOOL_STALL_FRACTION
+>    = 2 / 3`**, so the bound is `2/3 × getTaskHardCapMs()` (4 h at the 6 h default) and stays
+>    strictly below the cap for any cap above the 60 s floor. `getTaskHardCapMs()` also gained the
+>    finiteness gate its siblings had (`Number("1e400")` → the cap resolved to `Infinity`).
+> 2. **Age is the wrong signal for a wedge.** Rev 3 measured "how long has this tool been running",
+>    which cannot distinguish a slow-but-working tool from a dead one — the dilemma that forced the
+>    bound to be generous, which is what made it too slow for the #783 cases. Shipped instead: a new
+>    **`tool-silence`** clause (child emits `tool_updates`, parent fires when every in-flight tool
+>    has gone S=20 min without output), with the age bound **demoted to a backstop** for the
+>    runaway-streaming shape only. See the clause doc-comments in `extensions/builtin-tools/index.ts`.
+>
+> Two P1s were found against the `tool-silence` gate itself and fixed (a nested `task` never emits
+> `tool_execution_update`, so it must not be gated on "some update seen" — the gate is UNIVERSAL
+> over in-flight tools: `computeToolUpdates()`). Recorded on PR #873.
+
+**Why the bound value matters more than the mechanism.** The clause kills whenever
 `stateFresh && st.toolsInFlight > 0 && effToolAge > bound` (`:2151-2157`), and **it deliberately has
 no `!everSawRealActivity` gate** — it is the wedged-*tool* detector, and a child keeps its markers
 fresh while a tool runs. So the bound must exceed any legitimate single-tool duration, or it kills
@@ -734,7 +755,7 @@ is delivered by **#840**, not here.
 
 | Task | Deliverable | Verified |
 |---|---|---|
-| 5 | Task-local 2 h alarm, **constant split only** | `DEFAULT_TASK_TOOL_STALL_MS = 7_200_000` (`:1527`); export still `21_600_000` (`:1515`); `getToolStallMs()` returns the task-local value with env override + 60 s clamp; **`git diff --stat extensions/subagent/` empty** |
+| 5 | Task-local in-flight-tool bound, **constant split only** | ⚠️ **rev-3 plan said a fixed 2 h literal; shipped as the `2/3 × cap` derivation** (`TASK_TOOL_STALL_FRACTION`, unexported) per the §6.6 gate — see the SUPERSEDED block above. Frozen export still `21_600_000`; `getToolStallMs()` returns the derived value with env override + 60 s clamp; **`git diff --stat extensions/subagent/` empty** |
 | 6 | Retention: prune script + launchd plist, live-child safe | `scripts/pi-task-session-prune.sh`, `templates/launchd/com.eldato.pi-task-session-prune.plist`, `scripts/pi-task-session-prune.test.sh`; plist ships **`TASK_SESSION_PRUNE_DRY_RUN=1`** + `StartInterval 3600`; `install-launchd.test.sh` count 5→**6**; `pi-bootstrap/setup.sh` `fleet_srcs` |
 | 7 | Regression sweep, CI wiring, reaper/prune interaction, contract note | CI `ci-main.yml:133` (task-cap-handoff), `:162` (subagent-parity), `:220` (prune shell test); `extensions/subagent/subagent-parity.test.ts` (9/0, zero-dep source pin); `AGENTS.md:182` contract section |
 

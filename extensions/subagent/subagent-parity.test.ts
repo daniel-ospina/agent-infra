@@ -2,8 +2,10 @@
  * subagent-parity.test.ts — #783 Task 7.3 parity pin for extensions/subagent/
  *
  * WHY THIS EXISTS: #783 Task 5 split the builtin-tools tool-stall constant. The
- * TASK path now resolves `DEFAULT_TASK_TOOL_STALL_MS` (2 h, unexported, env
- * `TASK_TOOL_STALL_MS`), while `DEFAULT_TOOL_STALL_MS` stays FROZEN at 6 h
+ * TASK path now resolves its own bound — since #783 §6.6 a 2/3-of-effective-cap
+ * DERIVATION (`TASK_TOOL_STALL_FRACTION`, unexported, env
+ * `TASK_TOOL_STALL_MS`) rather than a fixed 2 h literal — while
+ * `DEFAULT_TOOL_STALL_MS` stays FROZEN at 6 h
  * precisely BECAUSE extensions/subagent/index.ts imports it and derives its own
  * backstop from it. The regression this pins: lowering the frozen export to the
  * task bound would silently drag the SUBAGENT backstop below the hard cap. This
@@ -140,7 +142,8 @@ test("--no-session is RETAINED at the documented arg vector (ephemeral children 
 section("NOT dragged along by #783 Task 5's constant split");
 
 test("subagent never references the task-path bound or its resolver", () => {
-  lacks(subagent, `DEFAULT_TASK_TOOL_STALL_MS`, "task-path 2h constant");
+  lacks(subagent, `DEFAULT_TASK_TOOL_STALL_MS`, "task-path bound (the removed fixed-2h constant)");
+  lacks(subagent, `TASK_TOOL_STALL_FRACTION`, "task-path bound (its 2/3-of-cap derivation)");
   lacks(subagent, `TASK_TOOL_STALL_MS`, "task-path env override");
   lacks(subagent, `getToolStallMs`, "task-path resolver");
   lacks(subagent, `getTaskHardCapMs`, "task hard cap resolver");
@@ -154,11 +157,22 @@ test("the frozen export is still 6h and still exported", () => {
   }
 });
 
-test("the task-path bound is real, 2h, and TASK-LOCAL (unexported)", () => {
+test("the task-path bound is real, is TASK-LOCAL (unexported), and cannot drag the subagent down", () => {
   positiveChecks++;
-  if (!/^const DEFAULT_TASK_TOOL_STALL_MS = 7_200_000;/m.test(builtin)) {
-    throw new Error("builtin-tools DEFAULT_TASK_TOOL_STALL_MS is not the 2h task-local constant");
+  // #783 §6.6 (P2): the task-path bound is now DERIVED from the effective hard
+  // cap (2/3 → 4h at the 6h default) instead of a fixed 2h literal, so the
+  // symbol changed. The PROPERTY this guards is unchanged — the subagent path
+  // must not be dragged along — so pin the derivation instead of the literal.
+  if (!/^const TASK_TOOL_STALL_FRACTION = 2 \/ 3;/m.test(builtin)) {
+    throw new Error("builtin-tools TASK_TOOL_STALL_FRACTION is not the 2/3 task-local derivation");
   }
+  lacks(
+    builtin,
+    `export const TASK_TOOL_STALL_FRACTION`,
+    "task-local derivation must stay unexported (subagent must not import it)",
+  );
+  // The old fixed constant must be GONE, not merely unused: leaving it behind
+  // is how a fixed default silently outlives the derivation that replaced it.
   lacks(
     builtin,
     `export const DEFAULT_TASK_TOOL_STALL_MS`,

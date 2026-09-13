@@ -1069,18 +1069,27 @@ test("getHeartbeatIntervalMs — TASK_HEARTBEAT_INTERVAL_MS override, clamped", 
 test("stall-bound getters — defaults + ≥60s clamp", () => {
   withEnv({ TASK_STREAM_STALL_MS: undefined, TASK_TOOL_STALL_MS: undefined, TASK_FIRST_MESSAGE_MS: undefined }, () => {
     equal(getStreamStallMs(), DEFAULT_STREAM_STALL_MS);
-    // #783 fix 4: the task path's tool-stall default is the task-local 2h
-    // (DEFAULT_TASK_TOOL_STALL_MS), while the exported DEFAULT_TOOL_STALL_MS
-    // stays frozen at 6h for extensions/subagent/index.ts.
-    equal(getToolStallMs(), 7_200_000);
+    // #783 fix 4: the task path's tool-stall default is DERIVED from the
+    // effective hard cap (2/3 → 4h at the 6h default), while the exported
+    // DEFAULT_TOOL_STALL_MS stays frozen at 6h for extensions/subagent/index.ts.
+    equal(getToolStallMs(), 14_400_000);
     equal(DEFAULT_TOOL_STALL_MS, 21_600_000);
     equal(getFirstMessageMs(), DEFAULT_FIRST_MESSAGE_MS);
+  });
+  // #783 §6.6 (P2): the bound MUST stay below the cap for any TASK_HARD_CAP_MS,
+  // or a lowered cap silently disarms the detector — the exact pre-#783 bug,
+  // where the bound equalled the cap and so could never fire first. A fixed
+  // default does exactly that; a derived one cannot.
+  withEnv({ TASK_HARD_CAP_MS: String(2 * 3_600_000), TASK_TOOL_STALL_MS: undefined }, () => {
+    equal(getTaskHardCapMs(), 7_200_000, "cap override applied");
+    equal(getToolStallMs(), 4_800_000, "bound TRACKS a lowered cap (2/3 of it)");
+    ok(getToolStallMs() < getTaskHardCapMs(), "the detector can still fire before the cap it pre-empts");
   });
   withEnv({ TASK_STREAM_STALL_MS: "5", TASK_TOOL_STALL_MS: "-1", TASK_FIRST_MESSAGE_MS: "NaN" }, () => {
     equal(getStreamStallMs(), 60_000);
     // #783 fix 4 (review): a non-positive override fails CLOSED to the task
     // default rather than being clamped up (the finiteness gate's contract).
-    equal(getToolStallMs(), 7_200_000);
+    equal(getToolStallMs(), 14_400_000);
     equal(getFirstMessageMs(), DEFAULT_FIRST_MESSAGE_MS); // NaN → default
   });
   // a POSITIVE finite override still clamps to ≥60s (a sub-60s bound could
@@ -1091,9 +1100,9 @@ test("stall-bound getters — defaults + ≥60s clamp", () => {
   // `Number("Infinity")` / `Number("1e400")` are truthy and survive Math.max,
   // which would leave the wedged-tool detector permanently disarmed.
   withEnv({ TASK_TOOL_STALL_MS: "Infinity" }, () =>
-    equal(getToolStallMs(), 7_200_000, "non-finite override fails closed to the 2h task default"));
+    equal(getToolStallMs(), 14_400_000, "non-finite override fails closed to the derived task default"));
   withEnv({ TASK_TOOL_STALL_MS: "1e400" }, () =>
-    equal(getToolStallMs(), 7_200_000, "overflowing override fails closed to the 2h task default"));
+    equal(getToolStallMs(), 14_400_000, "overflowing override fails closed to the derived task default"));
   withEnv({ TASK_TOOL_STALL_MS: "10800000" }, () =>
     equal(getToolStallMs(), 10_800_000, "a finite positive override is honoured"));
   withEnv({ TASK_STREAM_STALL_MS: "120000" }, () => equal(getStreamStallMs(), 120_000));
@@ -1570,6 +1579,124 @@ test("E10: preflight tool-stall bound min(L,T) + precedence over silence", () =>
   // below the bound (effective age = toolAge + markerAge) → no kill
   const st2 = { ...st, toolAgeMaxMs: T - 1_000 };
   equal(heartbeatKillDecision(dinput({ now: 400_000 + 10, lastLifeSignAt: 400_000, state: st2 })).kill, false);
+});
+
+// ── #783 §6.6: tool-silence is the PRIMARY in-flight-tool detector ──────────
+// The three shapes the design has to separate. Before the split, "in-flight
+// tool" had exactly ONE bound (total age), so a dead tool and a slow-but-
+// working tool were indistinguishable — which forced the bound to be generous
+// enough for the slowest legitimate tool, making it simultaneously too slow for
+// the dead one and a kill risk for the slow one. Silence collapses that.
+
+test("E-silence-1: WEDGED tool in flight → killed at the SILENCE bound, not the age bound", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = S + 60_000; // far BELOW L (1h in fixtures)
+  st.streamAgeMs = S + 1;       // …but no output for S: the wedge signal
+  st.toolUpdates = true;        // the tool HAD been producing output, then stopped
+  st.lastMarkerAt = 500_000;
+  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
+  equal(d.kill, true, "a silent in-flight tool is killed at the SILENCE bound");
+  equal(d.reason, "tool-silence", "reason is distinct from the age backstop");
+  ok(S + 60_000 < L, "fixture sanity: this shape sits far below the age bound");
+});
+
+test("E-silence-2: WORKING tool in flight → output keeps arriving → never killed, however long", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = L - 1_000; // nearly at the age bound…
+  st.streamAgeMs = 1_000;      // …but still emitting (`tool_execution_update`)
+  st.toolUpdates = true;
+  st.lastMarkerAt = 9_000_000;
+  const d = heartbeatKillDecision(dinput({ now: 9_000_010, lastLifeSignAt: 9_000_000, state: st }));
+  equal(d.kill, false, "a tool that keeps producing output is never killed merely for being slow");
+});
+
+test("E-silence-3: RUNAWAY tool — streams forever, never finishes → the age backstop owns it", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = L + 1;  // past the age bound
+  st.streamAgeMs = 1_000;   // still streaming → invisible to tool-silence
+  st.toolUpdates = true;
+  st.lastMarkerAt = 9_000_000;
+  const d = heartbeatKillDecision(dinput({ now: 9_000_010, lastLifeSignAt: 9_000_000, state: st }));
+  equal(d.kill, true, "the runaway shape is precisely what the age backstop exists for");
+  equal(d.reason, "tool-stall", "backstop reason stays distinct from tool-silence");
+});
+
+test("E-silence-4: NESTED TASK in flight (never emits output) → silence must NOT kill it", () => {
+  // The P1 the §6.6 verifier found against the first cut of this clause. `task`
+  // — like read/edit/write — passes `_onUpdate` UNUSED, so an outer agent
+  // awaiting a nested child emits no `tool_execution_update` for the WHOLE child
+  // duration and stream_age grows past S by construction (E279a2 pins the same
+  // shape). Without the toolUpdates gate this killed that healthy child at S
+  // and — because hasOutput is true — reported it as a DEFINED SUCCESS with the
+  // in-flight nested work treeKilled: the #363/#489 kill-productive-agents
+  // class, reintroduced by the fix meant to remove it.
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = S + 600_000; // well past S…
+  st.streamAgeMs = S + 1;        // …and silent, exactly like a nested task
+  st.toolUpdates = false;        // …but this tool has NEVER produced output
+  st.lastMarkerAt = 500_000;
+  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
+  equal(d.kill, false, "a tool that never emits output is not judged by output silence");
+  // Still bounded — by the age backstop, exactly as before this change.
+  const stAged = { ...st, toolAgeMaxMs: L + 1 };
+  equal(
+    heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: stAged })).reason,
+    "tool-stall",
+    "the age backstop still owns the never-emits shape (no regression)",
+  );
+});
+
+test("E-silence-5: MIXED round (one tool emitted and ended, one still silent) → NOT a wedge", () => {
+  // P1 from the §6.6 verifier against the first cut of the toolUpdates gate.
+  // The latch was existential over the ROUND: any tool emitting set it, and it
+  // was cleared only when the round went empty. Shape [bash (emits, ends),
+  // nested task (in flight)] therefore left the latch TRUE, and the clause's
+  // inference — "the tool that went silent is wedged" — was applied to a tool
+  // (the nested `task`) that never emits at all → healthy child killed at S with
+  // resolveUndefined=false. Per-tool tracking makes the direction UNIVERSAL: a
+  // round counts as output-live only when EVERY in-flight tool has emitted.
+  equal(
+    childHb.computeToolUpdates(["bash-1", "task-2"], new Set(["bash-1"])),
+    false,
+    "one silent never-emitting tool in flight ⇒ the round is NOT output-live",
+  );
+  equal(
+    childHb.computeToolUpdates(["bash-1"], new Set(["bash-1"])),
+    true,
+    "every in-flight tool emitted ⇒ silence means a wedge, not an unlucky pick",
+  );
+  equal(
+    childHb.computeToolUpdates([], new Set(["bash-1"])),
+    false,
+    "no tools in flight ⇒ no in-flight liveness claim (gates the clause off)",
+  );
+  equal(
+    childHb.computeToolUpdates(["a"], new Set()),
+    false,
+    "a tool yet to emit ⇒ not live (the nested-`task` shape)",
+  );
+  // And the parent cannot kill on the mixed round: the bit it receives is false.
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 2;
+  st.toolAgeMaxMs = S + 600_000;
+  st.streamAgeMs = S + 1;
+  st.toolUpdates = childHb.computeToolUpdates(["bash-1", "task-2"], new Set(["bash-1"]));
+  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
+  equal(d.kill, false, "the healthy nested child survives the mixed round");
 });
 
 test("E11: between-turn wedge — ticks stop → silence at T (S > max(2T,2×interval) pin)", () => {
@@ -2240,11 +2367,13 @@ test("full-format round-trip: every child formatter parses through the parent pa
   ok(st.everSawRealActivity, "formatToolStart latches through the parent parser");
   equal(parseHeartbeatLine(childHb.formatTurnStart(N, 3), st, 3, N), true);
   ok(st.turnActive);
-  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, sawMsg: true, sawTool: false }), st, 4, N), true);
+  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, toolUpdates: true, sawMsg: true, sawTool: false }), st, 4, N), true);
   equal(st.toolsInFlight, 1);
   equal(st.turnActive, true);
   equal(st.streamAgeMs, 4242);
   equal(st.toolAgeMaxMs, 2424);
+  // #783 §6.6: the output-liveness latch crosses the wire (gates tool-silence).
+  equal(st.toolUpdates, true, "tool_updates=1 parses into the state latch");
   equal(st.turnSawMessage, true);
   equal(st.turnSawTool, false);
   equal(parseHeartbeatLine(childHb.formatToolEnd(N, "call-1"), st, 5, N), true);
@@ -2524,10 +2653,29 @@ test("E271g: detached spawn + treeKill heartbeat kill + backstop + hard-cap retr
   // is the EFFECTIVE task-path bound, not the untouched exported literal.
   // Pinning ONLY the literal stayed green while getToolStallMs() returned 2h —
   // so assert BOTH: the frozen export stays 6h for extensions/subagent/, and
-  // the task path resolves the deliberate 2h DEFAULT_TASK_TOOL_STALL_MS.
+  // the task path resolves the derived 2/3-of-cap bound (4h at the 6h default).
   ok(source.includes("export const DEFAULT_TOOL_STALL_MS = 21_600_000;"), "DEFAULT_TOOL_STALL_MS unchanged (6h, subagent path)");
   withEnv({ TASK_TOOL_STALL_MS: undefined }, () =>
-    equal(getToolStallMs(), 7_200_000, "the task path's EFFECTIVE tool-stall is the 2h task-local default (the deliberate #208 condition-3 override)"));
+    equal(getToolStallMs(), 14_400_000, "the task path's EFFECTIVE tool-stall is the derived 2/3-of-cap bound (the deliberate #208 condition-3 override)"));
+  // #783 §6.6 (P2): a non-finite TASK_HARD_CAP_MS used to resolve the cap to
+  // Infinity — and with the bound derived from it, the age backstop too, so the
+  // runaway-streaming shape became unbounded. Must fail CLOSED to the default.
+  withEnv({ TASK_HARD_CAP_MS: "Infinity", TASK_TOOL_STALL_MS: undefined }, () => {
+    equal(getTaskHardCapMs(), 21_600_000, "non-finite cap fails closed to the 6h default");
+    equal(getToolStallMs(), 14_400_000, "…and the derived bound stays finite with it");
+  });
+});
+
+test("#783 §6.6: dispatch outcome row preserves UNKNOWN dirtyPaths as null (never [])", () => {
+  // repo-freshness returns `paths: null` for a failed status probe ON PURPOSE
+  // ("A failed status probe MUST NOT become a confident `dirty=false`"), but the
+  // call site coalesced `?? []` and the row type declared `string[]` — so the
+  // JSONL row asserted "zero dirty paths" for a tree nobody observed.
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  ok(src.includes("dirtyPaths: repoState?.paths ?? null"), "the row must carry null (UNKNOWN)");
+  ok(!src.includes("dirtyPaths: repoState?.paths ?? []"), "the laundering form must be gone");
+  const rec = readFileSync(resolve(__dirname, "../shared/dispatch-record.ts"), "utf-8");
+  ok(rec.includes("dirtyPaths: string[] | null;"), "the row type must admit null");
 });
 
 section("#191 completion watchdog — spawnSubAgent wiring (source assertions)");
