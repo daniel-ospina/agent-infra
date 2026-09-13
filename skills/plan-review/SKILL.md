@@ -69,6 +69,8 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
 
+**Adversarial domain — declared threat surface (bound: 2 cycles, orthogonal to the rows above).** When the scoping comment carries an `### Adversarial Threat Surface` declaration (gate/enforcement code whose correctness is "an attacker cannot make it fail open"), the plan review is bounded by that surface, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) is a **clean exit** for this domain — a literal `NO ISSUES FOUND` is not required, and when the merge rests on threat-list coverage the PR body must disclose it (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
+
 **Level-based routing:** For Project-level issues (Level: project in issue body), prefer inline review in the current context over sub-agent dispatch. For Epic-level issues (Level: epic), use fresh-context sub-agent reviewers (default). If Level is missing, default to sub-agent review (safe default). See `proportional-gates` skill for the canonical routing table.
 
 ## Input Resolution
@@ -464,7 +466,7 @@ of prior cycles, no investment in defending prior fixes. This prevents confirmat
 
 For each cycle:
 1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions), **plus Reviewer #5** when its trigger fires (new component / new write path / new shared-state owner / new vocabulary definition) or on the final cycle. #5 is dispatched **alongside** the proportional set, never instead of it — N does not drop because #5 fired. If the trigger does not fire, the cycle runs the proportional N only, and the cycle log records `#5: not triggered`.
-2. Parse responses. Reviewers #1–#4: all return `NO ISSUES FOUND` → exit clean; issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
+2. Parse responses. Reviewers #1–#4: all return `NO ISSUES FOUND` → exit clean (adversarial domain: `THREAT SURFACE COVERED` from a fresh reviewer substitutes — see the bounded subsection below); issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
 3. After fixes applied, go to step 1 (repeat cycle)
 
 **Why task sub-agents:** `pi -p` spawns a fresh session. The reviewer has no context
@@ -479,8 +481,9 @@ current plan text with fresh eyes — the closest available proxy for an indepen
   ⚠️ **This box gates *proceeding*, not *cleanliness* — the two are different predicates and this is the one place a reader mid-loop consults.** All three dispositions satisfy it, but only `NO ISSUES FOUND — CLEAN` yields a **clean** exit. `ISSUES:` (and a `— DEGRADED` recorded as a caveat) yields an **escalation** exit: proceed to Phase 5 with the surviving issues documented and carried into the escalation payload, and **never report it as clean or complete**. Per `AGENTS.md` §Hard Cap, an exit that leaves issues unresolved is an escalation exit, not a completion.
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
+- [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
-**No hard cap.** The loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (runaway prevention, not a quality gate).
+**No hard cap.** The loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (runaway prevention, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
 
 **Stuckness detection (3-layer algorithm)**:
 
@@ -497,7 +500,7 @@ c. **Zero-progress**: Track whether the plan doc was modified each cycle. If the
 **Cycle-status YAML**: Write `operations/logs/cycle-status.yaml` on loop exit:
 
 ```yaml
-exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|convergence>
+exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|adversarial-capped|convergence>
 cycles: <N>
 issues_per_cycle: <json array>
 plan_modified_per_cycle: <json array of booleans>
@@ -515,7 +518,7 @@ fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual inp
   This IS skipping the review. Fixing without re-reviewing = no review.
 
 - ❌ Self-declare "I addressed the feedback" as completion
-  Only "NO ISSUES FOUND" from all fresh reviewers is a valid exit signal.
+  Only "NO ISSUES FOUND" from all fresh reviewers is a valid exit signal — except in the adversarial domain, where a fresh reviewer's `THREAT SURFACE COVERED` substitutes (see "Adversarial domain" above).
 
 - ❌ Re-review in the same conversation context
   Confirmation bias makes same-context re-review unreliable.
