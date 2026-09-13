@@ -272,7 +272,10 @@ checkout when present, else from `$AGENT_INFRA_PATH`:
 GATE="${AGENT_INFRA_PATH:-}/scripts/check-pipeline-compliance.sh"
 [ -f scripts/check-pipeline-compliance.sh ] && GATE="scripts/check-pipeline-compliance.sh"
 if [ "$ISSUE_NUMBER" = "none" ]; then
-  echo "⚠️ pipeline preflight SKIPPED — no linked issue on this branch, so there is no issue-side artifact to evaluate. This is NOT a pass: check (a) still requires a linked issue at merge time." >&2
+  # Nothing was evaluated, so this must not exit 0: the table below maps 0 to
+  # "the gate ran and passed". exit 2 = could not run, same as a missing gate.
+  echo "⚠️ pipeline preflight SKIPPED (exit 2) — no linked issue on this branch, so there is no issue-side artifact to evaluate. This is NOT a pass: check (a) still requires a linked issue at merge time." >&2
+  exit 2
 elif [ ! -f "$GATE" ]; then
   # Never let an unfound gate fall through to 0. Both lookups failed, so nothing was run.
   echo "❌ pipeline preflight could not RUN — no scripts/check-pipeline-compliance.sh in $(pwd), and none under AGENT_INFRA_PATH=${AGENT_INFRA_PATH:-unset}." >&2
@@ -287,14 +290,14 @@ fi
 ```
 
 Read the **exit code**; do not infer the verdict from the absence of a printed error. Exit 0
-means *the gate ran and passed* — if the block printed `SKIPPED` or `could not RUN`, nothing
-was evaluated, and the table below (or an explicit `exit 2`) governs:
+means *the gate ran and passed* — every path that did not run the gate (no linked issue, gate
+not found, malformed invocation) exits 2, so 0 can never mean "skipped":
 
 | Exit | Meaning | Action |
 |------|---------|--------|
-| **0** | the gate ran and the issue-side artifacts are present (or exempt at this tier) | proceed |
+| **0** | the gate **ran** and the issue-side artifacts are present (or exempt at this tier) | proceed |
 | **1** | **BLOCK** — the artifacts are missing; the script prints the remedy and the producing skill | fix before implementing (see below) |
-| **2** | the check could not **RUN** (malformed target, missing `gh`/`jq`, a `gh api` failure, or the gate was not found) | fix the invocation, then re-run — never read it as a pass |
+| **2** | the check could not **RUN** — no linked issue to evaluate, gate not found, malformed target, missing `gh`/`jq`, or a `gh api` failure | fix the cause, then re-run — never read it as a pass |
 
 `--issue-only` evaluates **exactly the checks that need no PR** and skips the rest, reusing
 the same code path and tier rules as the merge-time run (check (d)'s merge-time remedy text

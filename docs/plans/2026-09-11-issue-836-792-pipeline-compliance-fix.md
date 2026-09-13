@@ -26,7 +26,7 @@ While this PR was open, **#863** (`91275a9`/`317c4a0`) landed
 `scripts/check-no-sigpipe-grep.sh` — a **repo-wide** guard for the same
 `printf/echo … | quiet-grep` idiom whose `SCAN_DIRS=(scripts .husky pi-bootstrap)` put this
 script in its scan set — plus `tests/sigpipe-grep/run.sh`, which pins that guard's detection
-of the joined (`-q`), separated (`-i -q`) and `--quiet` spellings, its negation controls, the
+of the joined (`-q`), combined (`-Fqx`) and `--quiet` spellings, its negation controls, the
 `\`-continued form, comment exclusion and its own self-scan. Two pins for one idiom are two
 sources of truth free to drift, so commit **`820ff66` removed this PR's local static pin and
 its positive control** (15 insertions / 58 deletions, this file only).
@@ -39,9 +39,10 @@ Indicator 2 is owned by `scripts/check-no-sigpipe-grep.sh` from now on.
 The handover is **not** total: the repo-wide guard is narrower than the pin removed here — it
 requires `grep` immediately after the pipe (a post-pipe env prefix is a MISS), knows only the
 `printf`/`echo` producers (`cat` is a MISS) and looks for the quiet flag before the pattern
-(`grep x -q` is a MISS); and nothing executes it (no workflow or hook invokes it, and
-`tests/sigpipe-grep/run.sh` is not wired into `ci.yml`/`ci-main.yml`). Both gaps are filed as
-**#877**. Everything else this PR delivers — the hoisted `has_*` matchers, the large-input
+(`grep x -q` is a MISS); its suite also does not pin the separated `grep -i -q` spelling (the
+guard detects it, but no fixture exercises it); and nothing executes the guard (no workflow or
+hook invokes it, and `tests/sigpipe-grep/run.sh` is not wired into `ci.yml`/`ci-main.yml`). All
+of it is filed as **#877**. Everything else this PR delivers — the hoisted `has_*` matchers, the large-input
 positive/negative controls, the `run_checks` end-to-end vector, the `pr_is_docs_only` fail-OPEN
 vector and the whole of #792 — is unchanged and still covered by the verification below.
 
@@ -79,8 +80,11 @@ audit; no insertion total is quoted here, since it changes with every edit to th
 
 A fix with no pin regresses — that is the whole history of this gate (`#692`, `#708`, `#744`
 are all "a gate silently degraded and no test noticed"). The measured RED evidence below is
-against the **pre-#716 idiom**: the test is a pin whose RED was demonstrated, so a revert to
-`printf | grep -q` (in this file or a new site) fails the suite instead of merging green.
+against the **pre-#716 idiom**: the test is a pin whose RED was demonstrated, so a revert of the
+hoisted `has_*` matchers (the only size-stressed call sites) fails the regression vectors
+instead of merging green. **[Scope note, `820ff66`: a reverted site ELSEWHERE in the file, or a
+brand-new `printf | grep -q` site, is no longer caught by this file's own tests — the source
+scan was the removed static pin. See §Supersession / #877.]**
 
 ## 1. #836 — the mechanism, and what is now pinned
 

@@ -1645,7 +1645,7 @@ $big_filler"
   # — a repo-wide guard for this same `printf/echo | grep -q` SIGPIPE idiom
   # whose SCAN_DIRS include `scripts/`, so THIS file is in its scan set — plus
   # `tests/sigpipe-grep/run.sh`, which pins that guard's detection of the joined
-  # (`-q`), separated (`-i -q`) and `--quiet` spellings, its negation controls
+  # (`-q`), combined (`-Fqx`) and `--quiet` spellings, its negation controls
   # (here-string, `case`, a non-quiet `| grep`), the `\`-continued form, comment
   # exclusion, and the guard's own self-scan. A second copy of that scan living
   # in this self-test would be a second source of truth for one idiom, free to
@@ -1662,7 +1662,9 @@ $big_filler"
   # three spellings exists on this head, so nothing regresses today — the gap is
   # tracked in issue #877, together with the fact that neither the guard nor its
   # suite is invoked by any workflow today (so neither pin was machine-enforced
-  # — same class as #865 for this script's own self-test).
+  # — same class as #865 for this script's own self-test) and that run.sh has no
+  # separated `grep -i -q` fixture (the guard's has_quiet() does detect that
+  # spelling; the suite simply does not pin it).
   #
   # The behavioural half of #836 (large-input regression vectors below, incl. the
   # fail-OPEN `pr_is_docs_only` site) is unaffected and still lives here, because
