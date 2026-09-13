@@ -44,15 +44,23 @@
  * and in the post-merge ci-main.yml `extension-tests` job (the blocking
  * backstop, same split as the other extension suites).
  *
+ * #847 extends the same suite to the stall threshold. `STALL_THRESHOLD` in
+ * `termination.ts` is a MIRROR of the skills' `stall_threshold` default, so
+ * `stallThresholdViolations()` parses every declared default out of the live
+ * skill tree and fails on a divergent value, a de-listed surface, or an
+ * undeclared one (the #723 rule applies to this constant too). The predicate
+ * it configures was made faithful FIRST — pinning 0.8 while the detector
+ * reduced to a boolean would have certified decoration.
+ *
  * Run: npx tsx extensions/loop-enforcer/tier-config-parity.test.ts
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { evaluateTermination, REVIEW_CYCLE_CAPS, TIER_CONFIG, type CycleData } from "./termination.ts";
+import { evaluateTermination, REVIEW_CYCLE_CAPS, STALL_THRESHOLD, TIER_CONFIG, type CycleData } from "./termination.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..");
@@ -60,8 +68,8 @@ const SKILL_PATH = join(REPO_ROOT, "skills", "proportional-gates", "SKILL.md");
 const INDEX_SRC = readFileSync(join(HERE, "index.ts"), "utf-8");
 
 /** Minimal cycle factory for the behavioural live-cap assertions. */
-function cycle(n: number, issues: number, verdict = "NEEDS_FIX", fingerprint?: string, issuesFixed = 0): CycleData {
-  return { cycleNumber: n, issuesFound: issues, issuesFixed, verdict, fingerprint, filesChanged: 0, wallClockMs: 0 };
+function cycle(n: number, issues: number, verdict = "NEEDS_FIX", fingerprints?: string[], issuesFixed = 0): CycleData {
+  return { cycleNumber: n, issuesFound: issues, issuesFixed, verdict, fingerprints, filesChanged: 0, wallClockMs: 0 };
 }
 
 let passed = 0;
@@ -922,6 +930,141 @@ test("the exact-text pin is not vacuous: an empty / unrelated doc is rejected", 
 });
 
 // ── The runtime mapping ─────────────────────────────────────────────────────
+
+section("Stall-threshold parity (#847)");
+
+/**
+ * The stall-detector surfaces that declare a numeric `stall_threshold`
+ * default. `STALL_THRESHOLD` in `termination.ts` is a MIRROR of these, not the
+ * source, so drift BETWEEN them is the failure pinned here — the same class
+ * #723 caught for the runtime tiers ("a comment is not a guard").
+ *
+ * The anchor is the value itself rather than a marker comment: every surface
+ * writes a numeric default, so one scan both (a) proves each declared default
+ * equals the runtime constant and (b) proves no surface was added or de-listed
+ * silently. `ARCHIVE-*` paths are excluded deliberately — an archived skill is
+ * a historical record, not a live statement of the rule.
+ *
+ * Ordering note (#847 review): a parity pin is only worth having once the
+ * predicate it configures is faithful. Pinning 0.8 while the detector reduced
+ * to a boolean would have certified decoration; the predicate was fixed first.
+ */
+export const STALL_THRESHOLD_SURFACES: readonly string[] = [
+  "skills/carousel-designer/SKILL.md",
+  "skills/code-review/SKILL.md",
+  "skills/code-review/references/fixer-loop.md",
+  "skills/issue-scoping/SKILL.md",
+  "skills/plan-review/SKILL.md",
+  "skills/test-review/SKILL.md",
+  "skills/verification-before-completion/SKILL.md",
+];
+
+/**
+ * Every `stall_threshold` occurrence followed by a numeric default, as
+ * `{path, value}`. Deliberately over-inclusive: a match that captures the
+ * WRONG number in a sentence fails the value assertion loudly rather than
+ * passing quietly, which is the safe direction for a drift guard.
+ */
+export function stallThresholdDeclarations(
+  files: ReadonlyArray<{ path: string; markdown: string }>,
+): Array<{ path: string; value: string }> {
+  const out: Array<{ path: string; value: string }> = [];
+  for (const file of files) {
+    const re = /`?stall_threshold`?/gi;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(file.markdown)) !== null) {
+      const window = file.markdown.slice(m.index + m[0].length, m.index + m[0].length + 120);
+      const numeric = window.match(/(\d+\.\d+)/);
+      if (numeric) out.push({ path: file.path, value: numeric[1] });
+    }
+  }
+  return out;
+}
+
+/**
+ * Violations of the stall-threshold contract: a declared default that differs
+ * from `STALL_THRESHOLD`, a declared surface that stopped declaring, an
+ * undeclared surface that started, or a scan that found nothing at all (the
+ * vacuity hole). An empty array is the only clean result.
+ */
+export function stallThresholdViolations(
+  files: ReadonlyArray<{ path: string; markdown: string }>,
+): string[] {
+  const declarations = stallThresholdDeclarations(files);
+  const violations: string[] = [];
+  for (const d of declarations) {
+    if (Number(d.value) !== STALL_THRESHOLD) {
+      violations.push(`${d.path}: declares stall_threshold ${d.value}, runtime STALL_THRESHOLD is ${STALL_THRESHOLD}`);
+    }
+  }
+  const declaring = new Set(declarations.map((d) => d.path));
+  for (const path of STALL_THRESHOLD_SURFACES) {
+    if (!declaring.has(path)) {
+      violations.push(`${path}: no numeric stall_threshold default found (de-listed, or the declaration was removed)`);
+    }
+  }
+  for (const path of declaring) {
+    if (!STALL_THRESHOLD_SURFACES.includes(path)) {
+      violations.push(`${path}: declares a stall_threshold default but is not in STALL_THRESHOLD_SURFACES`);
+    }
+  }
+  if (declarations.length === 0) {
+    violations.push("no stall_threshold declaration found anywhere — the scan is vacuous");
+  }
+  return violations;
+}
+
+/** Every live skill markdown, minus the archive. */
+function skillMarkdownFiles(): Array<{ path: string; markdown: string }> {
+  const skillsRoot = join(REPO_ROOT, "skills");
+  return (readdirSync(skillsRoot, { recursive: true }) as string[])
+    .map((rel) => rel.replace(/\\/g, "/"))
+    .filter((rel) => rel.endsWith(".md"))
+    .filter((rel) => !rel.split("/").some((seg) => seg.startsWith("ARCHIVE")))
+    .sort()
+    .map((rel) => ({ path: `skills/${rel}`, markdown: readFileSync(join(skillsRoot, rel), "utf-8") }));
+}
+
+test("every declared stall_threshold equals the runtime constant, and the surface set is exact", () => {
+  const files = skillMarkdownFiles();
+  const declarations = stallThresholdDeclarations(files);
+  ok(declarations.length >= STALL_THRESHOLD_SURFACES.length, `expected a declaration per surface, found ${declarations.length}`);
+  deepEqual(stallThresholdViolations(files), [], "the live skill tree must agree with STALL_THRESHOLD");
+});
+
+test("rejects a divergent declared default (the drift this pins)", () => {
+  const v = stallThresholdViolations([
+    { path: "skills/plan-review/SKILL.md", markdown: "recurrence ≥ `stall_threshold` (default `0.9`) → escalate" },
+  ]);
+  ok(v.some((s) => s.includes("0.9")), `expected a value violation, got: ${v.join(" | ")}`);
+});
+
+test("rejects a surface that stopped declaring a numeric default", () => {
+  const files = skillMarkdownFiles().filter((f) => f.path !== "skills/plan-review/SKILL.md");
+  const v = stallThresholdViolations(files);
+  ok(
+    v.some((s) => s.startsWith("skills/plan-review/SKILL.md")),
+    `expected the de-listed surface to be reported, got: ${v.join(" | ")}`,
+  );
+});
+
+test("rejects an undeclared surface that starts declaring", () => {
+  const v = stallThresholdViolations([
+    { path: "skills/brand-new/SKILL.md", markdown: "`stall_threshold` defaults to `0.8`" },
+  ]);
+  ok(v.some((s) => s.includes("brand-new") && s.includes("not in STALL_THRESHOLD_SURFACES")), `expected an undeclared-surface violation, got: ${v.join(" | ")}`);
+});
+
+test("rejects an empty scan — a greedy glob must not read as clean", () => {
+  ok(stallThresholdViolations([]).some((s) => s.includes("vacuous")), "an empty file list must be a violation, not a pass");
+});
+
+test("rejects a surface that mentions stall_threshold without a number", () => {
+  const v = stallThresholdViolations([
+    { path: "skills/plan-review/SKILL.md", markdown: "recurrence ≥ `stall_threshold` → escalate" },
+  ]);
+  ok(v.some((s) => s.includes("no numeric stall_threshold default")), `expected a missing-default violation, got: ${v.join(" | ")}`);
+});
 
 section("Runtime mapping parity");
 
