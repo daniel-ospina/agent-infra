@@ -86,8 +86,21 @@ closing_issue_refs() {
 
 # ── main (guarded — executable when run, inert when sourced for tests) ────
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# ── #980: the second-model subsystem was removed ────────────────────────
+# These env vars used to feed the [SECOND-MODEL-GATE] marker. Ignoring them
+# SILENTLY would write a plain `clean` record while the caller believes
+# second-model evidence was captured — a false green. Refuse instead.
+for _v in SECOND_MODEL_GATE_MODEL SECOND_MODEL_GATE_INDEPENDENT; do
+  if [ -n "${!_v:-}" ]; then
+    echo "record-review.sh: \$${_v} is set, but the second-model gate was removed (#980/#979) — it would be silently ignored, so this record would not carry the evidence you expect. Unset it and re-run." >&2
+    exit 2
+  fi
+done
+
 # Scan args for --force-stale (any position); everything else stays
-# positional.
+# positional — but an UNKNOWN option is REFUSED, never silently dropped.
+# Only $1..$4 are read, so a dropped trailing flag used to shift the repo
+# position and still write a record with rc=0.
 FORCE_STALE=0
 POSITIONAL=()
 _argv=("$@")
@@ -96,10 +109,19 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
   _arg="${_argv[$_i]}"
   case "$_arg" in
     --force-stale) FORCE_STALE=1 ;;
+    --second-model|--second-model-independent)
+      echo "record-review.sh: '$_arg' was removed with the second-model subsystem (#980/#979) — this repo is single-model; refusing to record. Drop it from the invocation." >&2
+      exit 2 ;;
+    -*) echo "record-review.sh: unknown option '$_arg' — the second-model gate was removed (#980/#979). usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]" >&2
+        exit 2 ;;
     *) POSITIONAL+=("$_arg") ;;
   esac
   _i=$((_i + 1))
 done
+if [ "${#POSITIONAL[@]}" -gt 4 ]; then
+  echo "record-review.sh: too many arguments (${#POSITIONAL[@]}) — usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]" >&2
+  exit 2
+fi
 if [ "${#POSITIONAL[@]}" -gt 0 ]; then
   set -- "${POSITIONAL[@]}"
 else
