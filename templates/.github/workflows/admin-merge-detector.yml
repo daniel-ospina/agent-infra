@@ -92,13 +92,14 @@ jobs:
           # An EXTRACTION FAILURE (parser exit 1) means "cannot certify", never
           # "nothing is unique". Loud, and non-zero: a silent pass here would
           # report a clean loop for a comparison that never happened.
-          if ! bash scripts/ci-failure-set.sh --commit "$MERGE_SHA" --workflow "$WORKFLOW" > merged-fails.txt 2>extract-err.txt; then
+          if ! bash scripts/ci-failure-set.sh --commit "$MERGE_SHA" --workflow "$WORKFLOW" \
+                --runs-report merged-report.txt > merged-fails.txt 2>extract-err.txt; then
             echo "::error::admin-merge detector: could not extract the merged commit's failing set — cannot certify this merge"
             sed 's/^/  /' extract-err.txt
             exit 1
           fi
           if ! bash scripts/ci-failure-set.sh --main-union "$MAIN_RUNS" --exclude "$MERGE_SHA" --workflow "$WORKFLOW" \
-                --provenance main-runs.txt > main-fails.txt 2>>extract-err.txt; then
+                --provenance main-runs.txt --runs-report main-report.txt > main-fails.txt 2>>extract-err.txt; then
             echo "::error::admin-merge detector: could not extract main's prior failing set — cannot certify this merge"
             sed 's/^/  /' extract-err.txt
             exit 1
@@ -109,6 +110,19 @@ jobs:
           if ! bash scripts/ci-failure-set.sh --diff merged-fails.txt main-fails.txt > unique.txt 2>>extract-err.txt; then
             echo "::error::admin-merge detector: the shared comparison failed — cannot certify this merge"
             sed 's/^/  /' extract-err.txt
+            exit 1
+          fi
+          # VACUITY GUARD (fresh review P1-3). An EMPTY failing set is only
+          # meaningful if the lane actually RAN. A lane that produced no run at all
+          # — a wrong workflow name, a `workflow_call`-only reusable whose runs are
+          # attributed to its caller, a pipeline that never triggered — yields
+          # unique_count=0 and would report "no unique failures" for a comparison
+          # that never happened: the "cannot run reads as found nothing" hole this
+          # file's own header forbids. `tested` counts success|failure|timed_out.
+          merged_tested="$(awk -F= '$1=="tested"{print $2}' merged-report.txt)"
+          merged_pending="$(awk -F= '$1=="pending"{print $2}' merged-report.txt)"
+          if [ "${merged_tested:-0}" -eq 0 ] || [ "${merged_pending:-0}" -gt 0 ]; then
+            echo "::error::admin-merge detector: lane '$WORKFLOW' has no TESTED run of $MERGE_SHA (tested=${merged_tested:-0}, pending=${merged_pending:-0}) — this comparison cannot certify the merge"
             exit 1
           fi
           unique_count="$(wc -l < unique.txt | tr -d ' ')"

@@ -147,9 +147,28 @@ function hasUnresolvableConstruct(command: string): boolean {
  * then applies the admin gate, which is itself fail-closed, so a false hit costs
  * a retry while a miss is an unevidenced admin merge.
  */
+/**
+ * gh's GLOBAL `-R/--repo <value>` flag may sit between any two gh words, so
+ * `gh -R owner/repo pr merge 123` is a valid spelling of `gh pr merge 123`.
+ * (The repo already fixed this for the merge-scope recogniser in
+ * `extensions/verification-gate/index.ts` - `GH_PR_MERGE_VERB`, #204 - and #930
+ * did not carry it over, so the most realistic spelling for a multi-repo
+ * operator skipped BOTH gates.)
+ *
+ * Removing the repo pair up front makes every downstream shape compare against
+ * the same canonical text, rather than teaching each of four patterns about an
+ * optional flag in a different position.
+ */
+function stripRepoArgs(command: string): string {
+  return command.replace(/(^|\s)(?:-R|--repo)(?:=|\s+)[A-Za-z0-9_.\/-]+/g, "$1");
+}
+
 export function isGhPrMergeCommand(command: string): boolean {
-  const probe = normalizeForFlagScan(command);
-  if (/(^|\s)gh\s+pr\s+merge(?=\s|$)/.test(probe)) return true;
+  const bare = stripRepoArgs(command);
+  const probe = normalizeForFlagScan(bare);
+  // `[^\w]` rather than `\s` before `gh`: a separator GLUED to the word
+  // (`true;gh pr merge 1`, `(gh pr merge 1`) leaves no whitespace to anchor on.
+  if (/(^|[\s;&|(){!])gh\s+pr\s+merge(?=\s|$)/.test(probe)) return true;
   if (!hasUnresolvableConstruct(command)) return false;
   // `[^\w]` rather than `\s` before each word: after stripping quotes a spliced
   // word keeps its residue, so the probe holds `$merge` / `$pr` — a
@@ -157,7 +176,7 @@ export function isGhPrMergeCommand(command: string): boolean {
   // (VGATE round 6).
   const hasPr = /(^|[^\w])pr\b/.test(probe);
   const hasMerge = /(^|[^\w])merge\b/.test(probe);
-  const hasGh = /(^|\W)gh\b/.test(command) || /(^|\W)gh\b/.test(probe);
+  const hasGh = /(^|\W)gh\b/.test(bare) || /(^|\W)gh\b/.test(probe);
   // Requiring BOTH verb words misses a splice INSIDE a word: `gh pr m$'erge'`
   // normalizes to `m$erge`, where `merge` never appears contiguously. So
   // `gh` + `pr` under a construct is enough to treat the text as a merge too.
@@ -166,25 +185,8 @@ export function isGhPrMergeCommand(command: string): boolean {
   return (hasPr && hasMerge) || (hasGh && hasPr);
 }
 
-const GH_PR_PATTERN = /(^|\s)gh\s+pr\s+(create|merge)(?=\s|$)/;
+const GH_PR_PATTERN = /(^|[\s;&|(){!])gh\s+pr\s+(create|merge)(?=\s|$)/;
 
-// Exported so the test suite can pin this predicate DIRECTLY. VGATE round 7
-// showed that an unexported `isGitOp` could have its conjunction dropped — the
-// exact round-4 regression — while the shipped suite stayed green, because the
-// test replicated the predicate instead of exercising it.
-/**
- * The rail's ADMIN-GATE relevance test. `isGitOp` and the `tool_call` gate BOTH
- * use this one function — they cannot disagree. VGATE round 9 caught exactly that
- * failure: `isGitOp` said yes (so the handler ran) while the caller's separate
- * `isGhPrMergeCommand && hasAdminMergeFlag` said no, and `gh p$'r' merge 123
- * --admin=true` was ALLOWED with no head-bound evidence. One predicate, one answer.
- *
- * `hasAdminMergeFlag` is fail-closed, so on its own it is far too broad to be a
- * relevance test — it returns true for `echo $'hello'` (ANSI-C quoting) and for
- * `echo "admin $USER"` (a construct plus the word `admin`), and using it as one
- * blocked ordinary shell commands at zero dispatches (round 9). It must therefore
- * be conjoined with a shape test.
- */
 /**
  * Which characters of `command` sit OUTSIDE a quoted region?
  *
@@ -242,34 +244,66 @@ function unquotedMask(command: string): boolean[] {
  * ("at least one character outside a quoted region") admitted `''gh` and `g"h"`
  * while excluding `"gh"`, an inconsistency inside one family.
  */
-const COMMAND_INTRODUCERS = /^(command|sudo|env|exec|nohup|nice|time|xargs|do|then|else)$/;
+const COMMAND_INTRODUCERS =
+  /^(command|sudo|env|exec|nohup|nice|time|xargs|do|then|else|eval|sh|bash|zsh|dash|ksh)$/;
+
+/** A separator GLUED to the following word: `true;gh pr merge 1`, `(gh pr merge 1`. */
+const GLUED_SEPARATOR = /^[;&|(){!]+/;
 
 function hasBareGhWord(command: string): boolean {
   // bash removes a backslash-newline outright, so `g\<newline>h` is the command
   // `gh`. Do the same before tokenizing, or the continuation splits the name.
-  const joined = command.replace(/\\\r?\n/g, "");
+  const joined = stripRepoArgs(command).replace(/\\\r?\n/g, "");
   const mask = unquotedMask(joined);
-  const tokens = joined.split(/\s+/).filter((t) => t.length > 0);
+  // Split on separators as well as whitespace. `true;gh pr merge 1` is two
+  // commands with no space between them and `(gh pr merge 1` is one - a
+  // whitespace-only split leaves `;gh` / `(gh` as single tokens that never equal
+  // `gh`, so the glued-separator spellings skipped both gates.
+  const tokens = joined.split(/[\s;&|(){!]+/).filter((t) => t.length > 0);
   let at = 0;
   let prev: string | null = null;
+  let prevEnd = 0;
   for (const tok of tokens) {
     const start = joined.indexOf(tok, at);
     at = start + tok.length;
-    if (tok.replace(/["'\\]/g, "") === "gh") {
+    // The text between the previous token and this one. The separators are NOT
+    // part of a token (and `joined` normalisation is not applied here), so a
+    // separator is only visible in this gap: `true && "gh" ...` has prev=`true`
+    // but `&&` in the gap, and `true;gh ...` is the same command with no space.
+    const gap = joined.slice(prevEnd, start);
+    if (tok.replace(/["'\\]/g, "").replace(GLUED_SEPARATOR, "") === "gh") {
       const partiallyUnquoted = [...tok].some((_, i) => mask[start + i]);
       const commandPosition =
-        prev === null || /[;&|(){!]$/.test(prev) || COMMAND_INTRODUCERS.test(prev);
+        prev === null ||
+        /[;&|(){!]/.test(gap) ||
+        COMMAND_INTRODUCERS.test(prev) ||
+        /^-[a-z]*c$/.test(prev); // `sh -c '...'`, `bash -lc '...'`
       if (partiallyUnquoted || commandPosition) return true;
     }
     prev = tok;
+    prevEnd = start + tok.length;
   }
   return false;
 }
 
+/**
+ * The rail's ADMIN-GATE relevance test. `isGitOp` and the `tool_call` gate BOTH
+ * use this one function — they cannot disagree. VGATE round 9 caught exactly that
+ * failure: `isGitOp` said yes (so the handler ran) while the caller's separate
+ * `isGhPrMergeCommand && hasAdminMergeFlag` said no, and `gh p$'r' merge 123
+ * --admin=true` was ALLOWED with no head-bound evidence. One predicate, one answer.
+ *
+ * `hasAdminMergeFlag` is fail-closed, so on its own it is far too broad to be a
+ * relevance test — it returns true for `echo $'hello'` (ANSI-C quoting) and for
+ * `echo "admin $USER"` (a construct plus the word `admin`), and using it as one
+ * blocked ordinary shell commands at zero dispatches (round 9). It must therefore
+ * be conjoined with a shape test.
+ */
 export function isAdminMergeCommand(command: string): boolean {
   if (!hasAdminMergeFlag(command)) return false;
-  const probe = normalizeForFlagScan(command);
-  if (hasUnresolvableConstruct(command)) {
+  const bare = stripRepoArgs(command);
+  const probe = normalizeForFlagScan(bare);
+  if (hasUnresolvableConstruct(bare)) {
     // Unreadable AND possibly a merge: a `gh` word, or both `pr` and `merge`.
     // This is what catches `gh p$'r' merge …`, `$'gh' pr merge …`, `g$'h' pr
     // merge …` WITHOUT the word list that rounds 6-8 kept re-finding a seam in.
@@ -284,9 +318,13 @@ export function isAdminMergeCommand(command: string): boolean {
   // --admin=true"`, `rg 'gh pr merge' scripts/` — outside the gate; gating those
   // was a real over-block that fired on heredocs and greps (VGATE round 8).
   const bareGh = hasBareGhWord(command);
-  return bareGh && /(^|\s)gh\s+pr\s+merge/.test(probe);
+  return bareGh && /(^|[\s;&|(){!])gh\s+pr\s+merge/.test(probe);
 }
 
+// Exported so the test suite can pin this predicate DIRECTLY. VGATE round 7
+// showed that an unexported `isGitOp` could have its conjunction dropped — the
+// exact round-4 regression — while the shipped suite stayed green, because the
+// test replicated the predicate instead of exercising it.
 export function isGitOp(command: string): boolean {
   // RAW, as before. Normalizing here made a quoted MENTION look like an
   // operation (`echo "git commit -m x"`, `rg 'gh pr merge' scripts/` matched
@@ -1004,10 +1042,25 @@ const GO_FALSE = new Set(["0", "f", "F", "FALSE", "false", "False"]);
  * branch) — a null answer must FAIL CLOSED for an admin merge, never fall
  * through to the dispatch-count path.
  */
+/**
+ * How many `gh pr merge` verbs the command carries.
+ *
+ * `extractMergePrNumber` deliberately truncates at the first `;`/`&&`/`||`/`|`,
+ * and the gate evaluates exactly ONE PR - so a compound
+ * `gh pr merge 111 --admin; gh pr merge 999 --admin` is judged against 111's
+ * evidence and then merges 999 with `--admin` and no evidence at all. The caller
+ * treats >1 as a fail-closed block rather than guessing which PR was meant.
+ */
+export function countMergeVerbs(command: string): number {
+  const bare = stripRepoArgs(command).replace(/\\\r?\n/g, " ");
+  return (bare.match(/(^|[\s;&|(){!])gh\s+pr\s+merge(?=\s|$)/g) ?? []).length;
+}
+
 export function extractMergePrNumber(command: string): number | null {
-  const idx = command.search(/gh\s+pr\s+merge\b/);
+  const canonical = stripRepoArgs(command);
+  const idx = canonical.search(/gh\s+pr\s+merge\b/);
   if (idx === -1) return null;
-  const rest = command.slice(idx).replace(/^gh\s+pr\s+merge\b/, "");
+  const rest = canonical.slice(idx).replace(/^gh\s+pr\s+merge\b/, "");
   const segment = rest.split(/;|&&|\|\||\||\n/)[0] ?? "";
   const tokens = segment.split(/\s+/).filter(Boolean);
   const valueFlags = new Set([
@@ -1337,6 +1390,20 @@ export default function (pi: ExtensionAPI) {
       // FALLS THROUGH to the merge-registry gate — the two gates are
       // independent and both must pass.
       if (isAdminMergeCommand(command)) {
+        // P1 (fresh review): a compound command is judged against ONE PR, so
+        // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
+        // and then merge 999 unevidenced. Fail closed.
+        if (countMergeVerbs(command) > 1) {
+          console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge)");
+          logGateEvent("merge_gate_block", { reason: "admin_merge_compound_command" });
+          return {
+            block: true,
+            reason:
+              "This command contains more than one `gh pr merge`. The admin-merge evidence " +
+              "gate can only certify ONE PR per call, so it cannot prove the others are " +
+              "evidenced. Run them as separate commands.",
+          };
+        }
         const adminPr = extractMergePrNumber(command);
         // #426 context resolution, reuse: --repo / GH_REPO / cd / fallback.
         const adminCtx = resolveRepoContext(command, null);

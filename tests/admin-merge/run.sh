@@ -64,7 +64,6 @@ trap cleanup EXIT
 
 pass() { checks=$((checks + 1)); echo "   ✅ $1"; }
 fail() { checks=$((checks + 1)); echo "   ❌ $1"; failures=$((failures + 1)); }
-note() { echo "   ·  $1"; }
 
 [ -f "$CFS" ] || { echo "❌ missing $CFS"; exit 1; }
 [ -f "$ADM" ] || { echo "❌ missing $ADM"; exit 1; }
@@ -751,8 +750,13 @@ grep -q "re-opens the bogus zero" "$TMP/help.txt" && pass "--help prints the ful
 echo "== 21. the detector does not swallow a filing failure =="
 DET="$ROOT/templates/.github/workflows/admin-merge-detector.yml"
 grep -q 'if ! gh issue create' "$DET" && pass "the detector branches on the issue-creation result" || fail "the detector still swallows a filing failure"
-grep -q 'could not file the detector issue"' "$DET" && fail "the warning-then-exit-0 shape survived" || pass "no warning-then-exit-0 fallback remains"
 grep -q 'UNREPORTED' "$DET" && pass "the failure is announced as UNREPORTED" || fail "expected an ::error:: naming the unreported merge"
+# P2-2 (fresh review): the previous assertion grepped for a string that exists
+# NOWHERE in the detector, so it passed unconditionally. Assert the property that
+# actually matters and can fail: after announcing UNREPORTED, the step exits 1.
+awk '/UNREPORTED/{seen=1} seen && /^[[:space:]]*exit 1$/{ok=1} END{exit !ok}' "$DET" \
+  && pass "the detector EXITS 1 after announcing the unreported merge" \
+  || fail "the detector announces UNREPORTED but does not exit non-zero — the merge stays unreported"
 
 # ── 22. PARITY: the materialized detector is its template ───────────────────
 # The template is the source of truth (sync-ci-workflows.sh copies it). A drifted
@@ -765,6 +769,18 @@ else
 fi
 
 echo ""
+# ── 23. VACUITY: the detector refuses a comparison that never happened ──────
+# Fresh review P1-3. An empty failing set only means "clean" if the lane actually
+# RAN. With no vacuity guard a lane that produced zero runs (python-ci.yml is a
+# `workflow_call`-only reusable — its runs are attributed to the CALLER) yields
+# unique_count=0 and the detector reports a clean loop for a comparison it never
+# performed. The guard must read `--runs-report` and exit non-zero.
+echo "== 23. the detector refuses to certify a lane that never ran =="
+grep -q -- '--runs-report merged-report.txt' "$DET" && pass "the detector collects the merged commit's run report" || fail "no --runs-report on the merged-commit call — the vacuity guard cannot exist"
+grep -q 'merged_tested=' "$DET" && pass "the detector reads the \`tested\` count" || fail "the detector never inspects \`tested\`"
+grep -q 'merged_tested:-0}" -eq 0' "$DET" && pass "a lane with tested=0 is refused" || fail "tested=0 would read as 'no unique failures' — the vacuity hole"
+grep -q 'merged_pending:-0}" -gt 0' "$DET" && pass "a lane with a pending run is refused" || fail "a pending run would be treated as tested"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1

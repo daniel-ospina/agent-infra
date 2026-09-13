@@ -72,6 +72,9 @@
 
 set -uo pipefail
 
+# File-scope so the EXIT trap can read it after `main` returns (P1-2).
+TMP=""
+
 GH="${ADMIN_MERGE_GH:-gh}"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
@@ -176,9 +179,13 @@ main() {
     wf_args=(--workflow "$WORKFLOW")
   fi
 
-  local TMP
+  # P1-2 (fresh review): `local TMP` + a trap that READS it is broken — bash runs
+  # the EXIT trap after `main` returns, when the local is already out of scope, so
+  # under `set -u` the trap aborted with "TMP: unbound variable" and cleanup never
+  # ran (729 stale `admin-merge.*` directories, 21 MB, on the reviewing machine).
+  # Assign the FILE-SCOPE `TMP` declared below and expand it at trap-set time.
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")"
-  trap 'rm -rf "$TMP"' EXIT
+  trap 'rm -rf "${TMP:-}"' EXIT
 
   local head
   # shellcheck disable=SC2086

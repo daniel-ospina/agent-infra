@@ -42,6 +42,7 @@ import {
   hasAdminMergeFlag,
   isGhPrMergeCommand,
   isAdminMergeCommand,
+  countMergeVerbs,
   isGitOp,
   extractMergePrNumber,
   evidenceBodyIsCertifying,
@@ -3032,6 +3033,21 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   ok(!hasAdminMergeFlag("gh pr merge 123 --no-admin"), "`--no-admin` is not the flag");
 });
 
+test("countMergeVerbs: a compound command must fail closed", () => {
+  // Fresh review P1-1: `extractMergePrNumber` deliberately truncates at the first
+  // separator and the gate evaluates ONE PR, so `gh pr merge 111 --admin; gh pr
+  // merge 999 --admin` was judged against 111's evidence and then merged 999 with
+  // no evidence at all. The caller blocks when the count exceeds 1.
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh pr merge 999 --admin") === 2, "two merges are counted");
+  ok(countMergeVerbs("gh pr merge 111 --admin && gh pr merge 999 --admin") === 2, "&& counts too");
+  ok(countMergeVerbs("gh pr merge 111 --admin\ngh pr merge 999 --admin") === 2, "a newline counts too");
+  ok(countMergeVerbs("gh pr merge 123 --admin") === 1, "a single merge is one");
+  ok(countMergeVerbs("gh pr merge 123 --squash") === 1, "a non-admin merge still counts (the registry gate sees it)");
+  ok(countMergeVerbs("gh pr view 1") === 0, "a non-merge is zero");
+  ok(countMergeVerbs("gh pr merge 1 --admin; gh pr list") === 1, "a trailing unrelated gh call is not a second merge");
+  ok(countMergeVerbs("gh -R o/r pr merge 1 --admin") === 1, "the global -R flag does not hide the verb");
+});
+
 test("extractMergePrNumber: flag order never hides the PR number", () => {
   equal(extractMergePrNumber("gh pr merge 123"), 123);
   equal(extractMergePrNumber("gh pr merge --admin 123"), 123, "flag before the number (the evasion)");
@@ -3151,6 +3167,20 @@ for (const [label, command] of [
   ["a fully-quoted `gh` command name", `"gh" pr merge ${PR_ADMIN} --admin=true`],
   ["a single-quoted `gh` command name", `'gh' pr merge ${PR_ADMIN} --admin=true`],
   ["a fully-quoted `gh` after a separator", `true && "gh" pr merge ${PR_ADMIN} --admin=true`],
+  // Fresh independent review, P0-1: gh's GLOBAL `-R/--repo` may sit between
+  // `gh` and `pr` — the most realistic spelling for a multi-repo operator, and
+  // one this rail's own script advertises. Both gates skipped it entirely.
+  ["gh's global -R flag before the verb", `gh -R owner/repo pr merge ${PR_ADMIN} --admin`],
+  ["gh's global --repo flag before the verb", `gh --repo owner/repo pr merge ${PR_ADMIN} --admin`],
+  ["gh's --repo= form before the verb", `gh --repo=owner/repo pr merge ${PR_ADMIN} --admin`],
+  // Fresh review P0-2: a separator GLUED to the `gh` word leaves no whitespace
+  // for a `(^|\s)gh` anchor, and splitting only on whitespace left `;gh` as a
+  // token that never equals `gh`.
+  ["a separator glued to the `gh` word", `(gh pr merge ${PR_ADMIN} --admin)`],
+  ["a semicolon with no space", `true;gh pr merge ${PR_ADMIN} --admin`],
+  ["a `sh -c` wrapper", `sh -c 'gh pr merge ${PR_ADMIN} --admin'`],
+  ["a `bash -lc` wrapper", `bash -lc 'gh pr merge ${PR_ADMIN} --admin'`],
+  ["an `eval` wrapper", `eval 'gh pr merge ${PR_ADMIN} --admin'`],
 ] as const) {
   testAsync(`#930 refusal: ${label} without evidence is BLOCKED`, async () => {
     await withTempHome(async () => {
