@@ -281,11 +281,17 @@ CLEAN_MICRO_MARKER_RE='verdict=clean-micro @ [0-9a-f]{40}'
 # sites for the two evidence patterns — the SELF_TEST #836 fixtures call them
 # directly, which is what makes the regression test a pin on the real code.
 #
-# The direction of the bug differed per site, which is why every
-# `printf … | grep -q` in this script was replaced in the same pass:
-# pr_is_docs_only's `! printf … | grep -qvE` and the #513 clean-micro binding
-# were FAIL-OPEN (a raced pipeline read as "docs-only" / "marker absent"),
-# while checks (b), (c), (d) and (e) were fail-closed false BLOCKS.
+# The direction of the bug differed per site: pr_is_docs_only's
+# `! printf … | grep -qvE` and the #513 clean-micro binding were FAIL-OPEN (a
+# raced pipeline read as "docs-only" / "marker absent"), while checks (b), (c),
+# (d) and (e) were fail-closed false BLOCKS.
+#
+# WHO CONVERTED WHAT: #716 (`0542c6d`, follow-ups `4230ffc`, `25a51e7`) already
+# moved all eight sites to here-strings on `main`, so THIS change is the pin,
+# not the conversion — it hoists the patterns above so the regression vectors
+# exercise the production matchers, and adds the large-input controls. Every
+# RED measurement quoted in this file (20/25 at 66 KB, 30/30 at 256 KB and
+# 1 MB) is against the PRE-#716 idiom, not against this PR's diff.
 has_review_evidence() { grep -qiE "$REVIEW_EVIDENCE_RE" <<<"$1"; }
 has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
 has_clean_micro_marker() { grep -qE "$CLEAN_MICRO_MARKER_RE" <<<"$1"; }
@@ -1641,13 +1647,26 @@ $big_filler"
   # `tests/sigpipe-grep/run.sh`, which pins that guard's detection of the joined
   # (`-q`), separated (`-i -q`) and `--quiet` spellings, its negation controls
   # (here-string, `case`, a non-quiet `| grep`), the `\`-continued form, comment
-  # exclusion, and the guard's own self-scan. A second, weaker copy of that scan
-  # living in this self-test would be a second source of truth for one idiom,
-  # free to drift from the guard that actually owns it — so the local pin was
-  # removed rather than duplicated (#841, #863). The behavioural half of #836
-  # (large-input regression vectors below, incl. the fail-OPEN `pr_is_docs_only`
-  # site) is unaffected and still lives here, because no repo-wide guard can
-  # express it.
+  # exclusion, and the guard's own self-scan. A second copy of that scan living
+  # in this self-test would be a second source of truth for one idiom, free to
+  # drift from the guard that owns it, so the local pin was removed rather than
+  # duplicated (#841, #863).
+  #
+  # The handover is NOT total, and the difference is recorded instead of
+  # glossed: the repo-wide guard's matcher is narrower than the pin deleted
+  # here. It requires `grep` immediately after the pipe (so a post-pipe env
+  # prefix — `printf … | LC_ALL=C grep -q x` — is a MISS), knows only the
+  # `printf`/`echo` producers (so a `cat file | grep -q x` is a MISS; its header
+  # scopes non-builtin producers out deliberately), and looks for the quiet flag
+  # before the pattern (so `grep x -q` is a MISS). No live occurrence of those
+  # three spellings exists on this head, so nothing regresses today — the gap is
+  # tracked in issue #877, together with the fact that neither the guard nor its
+  # suite is invoked by any workflow today (so neither pin was machine-enforced
+  # — same class as #865 for this script's own self-test).
+  #
+  # The behavioural half of #836 (large-input regression vectors below, incl. the
+  # fail-OPEN `pr_is_docs_only` site) is unaffected and still lives here, because
+  # no repo-wide grep guard can express it.
   #
   # `${BASH_SOURCE[0]:-$0}` — under `set -u` BASH_SOURCE is unset for a
   # stdin/`eval` invocation, which used to abort the whole self-test before the
@@ -1789,7 +1808,13 @@ $big_filler"
     PR_BODY=""; COMMIT_MSGS=""; FILES=""; FILES_EXPECTED=""
     FAILURES=0
     IO_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-792-io.XXXXXX")"
-    run_checks > "$IO_LOG" 2>&1 || true
+    # summarize() is captured too, so a vector can assert the preflight's PASS
+    # line — the only reader of B_CHECKED/D_CHECKED. Without it, deleting
+    # `B_CHECKED="yes"`/`D_CHECKED="yes"` left every vector green while a
+    # standard issue that passed on both artifacts was reported as "no
+    # issue-side artifact is required at this tier" (review catch: the
+    # report-only-what-was-evaluated claim was unpinned).
+    { run_checks || true; summarize || true; } > "$IO_LOG" 2>&1
     IO_FAILURES="$FAILURES"
     ISSUE_ONLY=0
   }
@@ -1817,6 +1842,9 @@ $big_filler"
   run_io "complexity:micro" ""
   io_report 'micro issue with no artifacts → 0 failures (b–e exempt)' \
     "$([[ "$IO_FAILURES" -eq 0 ]] && echo 1 || echo 0)"
+  # ...and the PASS line must say the tier is exempt, not that (b)/(d) were read.
+  io_report 'micro PASS line reports the tier exemption, not a (b)/(d) read' \
+    "$(grep -qF 'PASS — no issue-side artifact is required at this tier (b/d exempt)' "$IO_LOG" && echo 1 || echo 0)"
   io_cleanup
 
   # 2. standard + marker + Wiring → 0 failures, and a/c/e/f each named as
@@ -1825,6 +1853,11 @@ $big_filler"
   run_io "complexity:standard" "$WIRING_SCOPING"
   io_report 'standard + marker + Wiring → 0 failures' \
     "$([[ "$IO_FAILURES" -eq 0 ]] && echo 1 || echo 0)"
+  # The PASS line must name BOTH artifacts it actually read — this is what makes
+  # B_CHECKED/D_CHECKED load-bearing: clearing either flag on the passing path
+  # now fails this vector instead of silently downgrading the reported evidence.
+  io_report 'standard PASS line names (b) and (d) as the artifacts actually read' \
+    "$(grep -qF 'PASS — (b) scoping comment present, (d) plan evidence via the Wiring table' "$IO_LOG" && echo 1 || echo 0)"
   IO_SKIPS="$(grep -cE '\[[acef]\] Skipped: --issue-only mode' "$IO_LOG" || true)"
   io_report 'checks a/c/e/f are SKIPPED with a named reason (4 skip lines)' \
     "$([[ "$IO_SKIPS" -eq 4 ]] && echo 1 || echo 0)"

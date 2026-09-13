@@ -20,6 +20,31 @@ aboutObjects: agent-infra, issue-836, issue-792, issue-716, issue-823, issue-745
 One PR, because both issues are the **same mechanism**: `scripts/check-pipeline-compliance.sh`.
 #836 is about what the gate computes and how it is proven; #792 is about *when* it is consulted.
 
+## Supersession — `820ff66` removed the local static pin (indicator 2)
+
+While this PR was open, **#863** (`91275a9`/`317c4a0`) landed
+`scripts/check-no-sigpipe-grep.sh` — a **repo-wide** guard for the same
+`printf/echo … | quiet-grep` idiom whose `SCAN_DIRS=(scripts .husky pi-bootstrap)` put this
+script in its scan set — plus `tests/sigpipe-grep/run.sh`, which pins that guard's detection
+of the joined (`-q`), separated (`-i -q`) and `--quiet` spellings, its negation controls, the
+`\`-continued form, comment exclusion and its own self-scan. Two pins for one idiom are two
+sources of truth free to drift, so commit **`820ff66` removed this PR's local static pin and
+its positive control** (15 insertions / 58 deletions, this file only).
+
+Consequences for the claims below — **§1 item 3**, the pin rows in §3's Wiring table, task 4
+in §4, the pin bullet in §5 and the pin risk in §6 are all **historical**: the head contains no
+static pin (`anti`/`anti_a`/`anti_b`/`pipe_hits`/`pin_hit` are gone) and no `#863`-era pin either.
+Indicator 2 is owned by `scripts/check-no-sigpipe-grep.sh` from now on.
+
+The handover is **not** total: the repo-wide guard is narrower than the pin removed here — it
+requires `grep` immediately after the pipe (a post-pipe env prefix is a MISS), knows only the
+`printf`/`echo` producers (`cat` is a MISS) and looks for the quiet flag before the pattern
+(`grep x -q` is a MISS); and nothing executes it (no workflow or hook invokes it, and
+`tests/sigpipe-grep/run.sh` is not wired into `ci.yml`/`ci-main.yml`). Both gaps are filed as
+**#877**. Everything else this PR delivers — the hoisted `has_*` matchers, the large-input
+positive/negative controls, the `run_checks` end-to-end vector, the `pr_is_docs_only` fail-OPEN
+vector and the whole of #792 — is unchanged and still covered by the verification below.
+
 ## 0. Base drift — #716 landed the #836 *fix* while this PR was in flight
 
 This PR was opened against `72d2185`. `origin/main` then advanced **31 commits** (`cc288d5`,
@@ -42,7 +67,10 @@ still unmet on main:
 **This PR's remaining scope, after the reconciliation:** supply indicators 2–3 as tests that
 pin the *production* code path; add the behavioural vector for the one site whose failure mode
 is fail-**OPEN** (unreachable by any assertion on the fixed code, so it needs its own large-input
-pin); and deliver #792 in full. It does **not** re-do #716's edit: the reconciled diff contains
+pin); and deliver #792 in full. **[Scope note, `820ff66`: indicator 2's *static* half is no
+longer in this PR — it was removed in favour of #863's repo-wide guard, see §Supersession. Its
+behavioural half (the large-input vectors, incl. the fail-OPEN `pr_is_docs_only` one) is what
+this PR still delivers.]** It does **not** re-do #716's edit: the reconciled diff contains
 no site change that main already made, and a diff audit (`git diff origin/main -- <script>`)
 rewrites exactly 18 of main's lines to the same behaviour, removing nothing (see §5 for the
 audit; no insertion total is quoted here, since it changes with every edit to the file).
@@ -109,7 +137,8 @@ hazards: the producer's status is discarded and `head` has already printed the c
    of the real `run_checks` end-to-end** on a `complexity:standard` issue with full evidence —
    `FAILURES` must be 0 every time. A fixture-size assertion (>65536 bytes) keeps it from
    silently degrading.
-3. **The static pin** (indicator 2): no live *quiet* `grep` may be fed by a
+3. **[SUPERSEDED at `820ff66` — see §Supersession: the pin was removed; indicator 2 is owned
+   by `scripts/check-no-sigpipe-grep.sh` (#863) from now on.]** ~~The static pin~~ (indicator 2): no live *quiet* `grep` may be fed by a
    `printf`/`echo`/`cat` pipeline on a non-comment line, in every spelling — env-prefixed
    (`LC_ALL=C grep -q`), joined (`grep -q`), separated (`grep -i -q`) and `--quiet`. It fails
    **loudly** if it cannot read its own source, and it carries its own **positive control**
@@ -166,8 +195,8 @@ one message.
 | Interface / artifact | Producer | Consumer | Verified by |
 |---|---|---|---|
 | `REVIEW_EVIDENCE_RE` / `TEST_EVIDENCE_RE` / `CLEAN_MICRO_MARKER_RE` constants | this PR | checks (c), (e) and the #513 binding in `run_checks` | SELF_TEST #836 block — production path, 25 reps, >64 KB, positive + negative controls |
-| `has_review_evidence()` / `has_test_evidence()` / `has_clean_micro_marker()` | this PR | checks (c)/(e) call sites; the SELF_TEST regression | SELF_TEST #836 block + static pin |
-| The #836 static pin (no quiet-grep pipeline) | this PR | the whole script source; protects #716's fix from regression | positive control: matches all four spellings and ignores a here-string; catches all 8 pre-#716 sites; 0 hits on the reconciled head |
+| `has_review_evidence()` / `has_test_evidence()` / `has_clean_micro_marker()` | this PR | checks (c)/(e) call sites; the SELF_TEST regression | SELF_TEST #836 block (the pin that used to share this row moved to #863 at `820ff66`) |
+| ~~The #836 static pin (no quiet-grep pipeline)~~ **REMOVED at `820ff66`** — see §Supersession | this PR | the whole script source; protects #716's fix from regression | positive control (deleted with the pin): matched all four spellings and ignored a here-string; caught all 8 pre-#716 sites; 0 hits on the reconciled head |
 | `pr_is_docs_only` large-input vector | this PR | the fail-OPEN site in `pr_is_docs_only` | 25 reps at >64 KB, non-docs row first |
 | `--issue-only <N\|owner/repo#N>` CLI mode | this PR | `skills/commit-workflow/workflow/01-preflight.md` | SELF_TEST vectors: micro (0 failures) / standard+Wiring (0) / standard w/o Wiring (1, local remedy) / no marker (1, b) / unlabeled (1, b) |
 | `resolve_issue_only_ref()` + the CLI/env contract | this PR | the issue-only dispatch block | SELF_TEST `expect_io_ref` vectors + 10 subprocess exit-code vectors (8 rejections: no target, malformed, surplus, misordered, bad `owner/repo#N`, malformed env target, env+positional, env+argv; 2 successes: the env form and the PR path with the env seam set) |
@@ -186,7 +215,8 @@ one message.
 3. Add the `--issue-only` mode: args/env parsing with argv validation, mode-aware guards, the
    issue-side fetch, the `ISSUE_ONLY` branches for a/c/e/**f** and the issue-only (d) arm, the
    mode-aware `summarize`, the `DRY_RUN` arm, `usage()`.
-4. Add the SELF_TEST #836 block (regression + controls + e2e + fail-OPEN vector + static pin),
+4. Add the SELF_TEST #836 block (regression + controls + e2e + fail-OPEN vector + static pin —
+   the pin half removed at `820ff66`, see §Supersession),
    the `resolve_issue_only_ref` vectors, and the 5 issue-only vectors.
 5. Wire the preflight BLOCK step (consumer-safe path, `GH_REPO`, exit-code contract) into
    `01-preflight.md`.
@@ -212,7 +242,7 @@ one message.
   exits 0) and assert the diagnostic text. Verified against a mutant: disarming the four
   `ISSUE_ARGV_ERR` assignments plus the two target guards makes exactly the 8 negative
   vectors fail (RC 2, 83 assertion ✅ lines) while the positive vectors and the rest stay green.
-- The static pin has a **positive control**: the ban pattern must still match the
+- **[REMOVED at `820ff66` — see §Supersession.]** The static pin has a **positive control**: the ban pattern must still match the
   env-prefixed (`LC_ALL=C grep -q` after the pipe), joined (`grep -q`), separated
   (`grep -i -q`) and `--quiet` spellings and must NOT match a here-string — otherwise a
   pattern edit could disarm the pin silently and a green scan would prove nothing. The samples
@@ -257,7 +287,7 @@ one message.
 - **Non-goal:** #792's option 2/3.
 - Risk: `--issue-only`'s plan-doc branch is unprovable pre-PR by construction, so preflight
   accepts the `Wiring` alternative only. Stated in the mode's output, the doc, and this plan.
-- Risk: the static pin's documented limits (multi-stage pipelines, continuations, quoted-text
+- **[REMOVED at `820ff66` — see §Supersession.]** Risk: the static pin's documented limits (multi-stage pipelines, continuations, quoted-text
   false positives). The message names the line number, so a hit is a one-line clarification.
 - Residual (filed as a follow-up issue): **nothing in CI runs
   `PIPELINE_COMPLIANCE_SELF_TEST=1`**, so these new assertions are exercised by hand and by
