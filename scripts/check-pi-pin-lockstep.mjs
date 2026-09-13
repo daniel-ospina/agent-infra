@@ -282,11 +282,149 @@ import {
 // is the path the handler exists for. (`--head-ref` mode is excluded: it decides
 // its own findings and exit status, and its success path must still exit 0.)
 const ARGS = process.argv.slice(2);
-function argValue(flag) {
-  const i = ARGS.indexOf(flag);
-  return i >= 0 ? (ARGS[i + 1] ?? null) : null;
+
+// ── #858 — AN UNUSABLE INVOCATION MUST FAIL CLOSED, NOT RUN THE LOCAL SUITE ──
+// `HEAD_REF === null` means "not in --head-ref mode", which runs the LOCAL suite and
+// exits 0. The original `argValue("--head-ref")` returned `null` for BOTH "flag absent"
+// and "flag present with no value", so each of these VALIDATED THE LOCAL CHECKOUT AND
+// REPORTED SUCCESS on `origin/main`'s script — measured, exit 0:
+//
+//     node scripts/check-pi-pin-lockstep.mjs --head-ref
+//     VAR=""; node scripts/check-pi-pin-lockstep.mjs --head-ref $VAR   # shell drops it
+//     node scripts/check-pi-pin-lockstep.mjs --head-ref=$VAR
+//     node scripts/check-pi-pin-lockstep.mjs --headRef x          # any near-miss spelling
+//
+// NOT every unusable invocation was a fail-open. `--head-ref --repo x/y` set `HEAD_REF`
+// to the string `--repo` and exited 2 from the SHA validator, as did an explicitly empty
+// value and a duplicated `--head-ref`. Eight of the eleven argv forms in the test table
+// below were fail-opens; those three were already refused and are listed there so the fix
+// does not regress them. (An earlier revision of this comment said all of them exited 0.)
+//
+// The second is the one that matters: `--head-ref $VAR` is the natural way to write a
+// shell wrapper, and an empty `$VAR` makes the argument vanish entirely — the trusted leg
+// then reports success having validated nothing but main's own tree.
+//
+// Patching only the exact token `--head-ref` would leave the same hole in the `=` spelling,
+// which is the conventional form and the natural output of `--head-ref=$SHA`. So the parser
+// is strict over the WHOLE argument vector: `--head-ref` and `--repo` are the only arguments
+// this tool has ever accepted (checked across every caller, workflow, fixture and doc in the
+// repo — plus the `=` spelling), and nothing else is treated as "no --head-ref".
+//
+// NOTE ON ORDERING: this refusal sits BEFORE the `exit` handler is registered, so
+// `process.exit(2)` terminates without that handler ever existing. A flag threaded into the
+// handler to guard it would therefore be dead code (measured — removing one changed
+// nothing). The consequence is that the `headRef: null` invariant below cannot be observed by
+// calling the CLI and reading a parsed field: the process exits before it can. What CAN be
+// observed is a VIOLATION of it, because the refusal block asserts the shape at runtime and
+// exits 3 on a violation while a correct refusal exits 2 — so the invariant is pinned
+// behaviourally through that difference, not by inspecting the parsed object.
+const KNOWN_FLAGS = ["--head-ref", "--repo"];
+// The initialized shape. Every error path gets a COPY of it rather than a bare `{ error }`:
+// the guards below test `HEAD_REF !== null`, and an OMITTED key is `undefined`, which is
+// `!== null`. A bare `{ error }` would therefore make "we refused this invocation"
+// indistinguishable from "this is a --head-ref run" to anything reading a parsed field.
+// Not hypothetical: an earlier revision of this block returned a bare `{ error }`.
+const EMPTY_ARGS = Object.freeze({ headRef: null, repo: null });
+function usageError(message) {
+  return { ...EMPTY_ARGS, ok: false, error: message };
 }
-const HEAD_REF = argValue("--head-ref");
+function parseArgs(argv) {
+  const parsed = { ...EMPTY_ARGS };
+  for (let i = 0; i < argv.length; i += 1) {
+    const raw = argv[i];
+    let name = raw;
+    let inline = null;
+    const eq = raw.indexOf("=");
+    if (raw.startsWith("--") && eq > 2) {
+      name = raw.slice(0, eq);
+      inline = raw.slice(eq + 1);
+    }
+    if (!KNOWN_FLAGS.includes(name)) {
+      return usageError(
+        `unrecognised argument ${JSON.stringify(raw)} — this tool accepts only ` +
+          `${KNOWN_FLAGS.join(" and ")}, written \`--head-ref <sha>\` or \`--head-ref=<sha>\`.`
+      );
+    }
+    const value = inline !== null ? inline : (argv[i + 1] ?? null);
+    if (inline === null) i += 1;
+    if (value === null || value === "" || value.startsWith("-")) {
+      return usageError(
+        `${name} was passed with no usable value (got ` +
+          `${value === null ? "nothing" : JSON.stringify(value)}).`
+      );
+    }
+    if (name === "--head-ref") {
+      // Duplicates are REFUSED rather than resolved. The previous `argValue` used
+      // `ARGS.indexOf(flag)` and therefore silently took the FIRST value, which is one
+      // more way to validate a tree the caller did not mean to validate; "last wins"
+      // (the usual CLI convention) is no better. Neither is right, so neither is offered.
+      if (parsed.headRef !== null) {
+        return usageError(
+          "--head-ref was passed more than once — refusing to guess which value to validate."
+        );
+      }
+      parsed.headRef = value;
+    } else {
+      if (parsed.repo !== null) {
+        return usageError(
+          "--repo was passed more than once — refusing to guess which repository to read."
+        );
+      }
+      parsed.repo = value;
+    }
+  }
+  // `--repo` only selects WHICH repository a --head-ref tree is read from. On its own
+  // there is no tree to read, so it would fall through to local-suite mode and validate
+  // THIS checkout and exit 0 — the same shape as every other case in this block.
+  if (parsed.repo !== null && parsed.headRef === null) {
+    return usageError(
+      "--repo was passed without --head-ref — it only selects which repository to read a " +
+        "--head-ref tree from, so alone it would silently validate THIS checkout."
+    );
+  }
+  return { ...parsed, ok: true };
+}
+// EVERY error path above returns through `usageError`, which copies `EMPTY_ARGS` (so an error
+// result always carries `headRef: null` / `repo: null`) and sets `ok: false` (so the refusal
+// gate does not depend on the truthiness of a message string). That is load-bearing rather
+// than tidy: the guards below test `HEAD_REF !== null`, and an OMITTED key is `undefined`,
+// which is `!== null`. A bare `{ error }` therefore made "we refused this invocation"
+// indistinguishable from "this is a --head-ref run", which silently broke the
+// moved-refusal control on an earlier revision of this block. It is asserted AT RUNTIME in the
+// refusal block below, and that assertion is pinned BEHAVIOURALLY: it exits 3, not the refusal's
+// 2, so a wrongly-built result fails the CLI test instead of passing as a refusal.
+//
+// The gate is `PARSED.ok`, an explicit sentinel, NOT the truthiness of `PARSED.error`. Keying it
+// on the message would mean a falsy message (`""`) skipped both the refusal and the shape
+// assertion and fell through to local-suite mode — not reachable today, since every message is a
+// non-empty literal, but the sentinel makes the gate independent of message content.
+const PARSED = parseArgs(ARGS);
+if (!PARSED.ok) {
+  // The invariant, asserted at the only place it is observable — the refusal exits before any
+  // other read of a parsed field. An error result with a non-null headRef/repo means something
+  // bypassed `usageError`, and the `HEAD_REF !== null` guards below would then read "we refused
+  // this" as "this is a --head-ref run".
+  if (PARSED.headRef !== null || PARSED.repo !== null) {
+    console.error(
+      "❌ internal: a refused parse must carry headRef: null and repo: null — an omitted " +
+        "key is `undefined`, which passes the `!== null` guards and would make this refusal " +
+        "indistinguishable from a --head-ref run (#858)."
+    );
+    process.exit(3);
+  }
+  // RESIDUAL BOUND (stated, not defended): deleting the check above is not detected by any
+  // test. It is source code, and like every guard in this file its PRESENCE is a property of
+  // the source — a commit that removed it while building a bare `{ error }` elsewhere would be
+  // GREEN. The deliberate class for that is branch protection (#646), not a longer test.
+  console.error(
+    `❌ ${PARSED.error}\n` +
+      "   Refusing to continue: falling back to local-suite mode here would validate THIS\n" +
+      "   checkout and exit 0, which is a fail-open in the trusted leg. Pass an explicit\n" +
+      '   commit SHA — `--head-ref "$MERGE_SHA"` — and check the variable is non-empty.'
+  );
+  process.exit(2);
+}
+const HEAD_REF = PARSED.headRef;
 
 process.on("exit", () => {
   if (HEAD_REF !== null) return;
@@ -751,7 +889,7 @@ function runHeadRefMode(ref, repo) {
   process.exit(0);
 }
 
-if (HEAD_REF !== null) runHeadRefMode(HEAD_REF, argValue("--repo") ?? resolveRepo());
+if (HEAD_REF !== null) runHeadRefMode(HEAD_REF, PARSED.repo ?? resolveRepo());
 
 let passed = 0;
 let failed = 0;
@@ -845,6 +983,10 @@ const REQUIRED_TESTS = Object.freeze([
   "--head-ref is RED end-to-end when a workflow is committed as a symlink (mode 120000) (#675 P1-2)",
   "--head-ref is GREEN end-to-end for a regular-file tree (mode 100644) (#675 P1-2)",
   "an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)",
+  // #858 — the arg parser must not turn a usage error into local-suite mode, and the
+  // `=` spelling must be honoured rather than ignored.
+  "--head-ref with a missing or empty value fails CLOSED instead of running the local suite (#858)",
+  "the `=` spelling of --head-ref is HONOURED end-to-end, not ignored (#858 P1)",
   // #666 third revision — the ci-main.yml STRUCTURAL shape (value assertions)
   "ci-main structural: losing the `extension-tests` job is RED (#666 third revision)",
   "ci-main structural: an extra `with:` key is RED (#666 third revision)",
@@ -895,8 +1037,9 @@ const REQUIRED_TESTS = Object.freeze([
 // before the guard, and a guard inside a never-taken `case` arm), plus the pinned
 // stub-keyed bound. All four are in the roster above as well, so deleting one by
 // name is RED independently of this floor. #843 cycle 3: 120 → 121 — the
-// behavioural workflow-lock test, also in the roster.)
-const MIN_EXPECTED_PASSING = 121;
+// behavioural workflow-lock test, also in the roster. #858: 121 → 123 — the
+// `--head-ref` usage-error test and the `=` spelling test, both in the roster.)
+const MIN_EXPECTED_PASSING = 123;
 
 let finalized = false;
 function finalize() {
@@ -2959,7 +3102,7 @@ test("head-ref tree: a truncated tree payload throws (fail-closed) (#675 P1-2)",
 });
 
 /** Build a stubbed `gh` (git tree + git blobs) and run the REAL --head-ref CLI against it. */
-function runHeadRefWithStub(treeObj, blobMap) {
+function runHeadRefWithStub(treeObj, blobMap, flagStyle = "space") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pin-headref-stub-"));
   const bin = path.join(dir, "bin");
   const blobDir = path.join(dir, "blobs");
@@ -2993,15 +3136,17 @@ function runHeadRefWithStub(treeObj, blobMap) {
   fs.chmodSync(stub, 0o755);
   const treePath = path.join(dir, "tree.json");
   fs.writeFileSync(treePath, JSON.stringify(treeObj));
+  const headSha = "a".repeat(40);
+  // #858 P1 — the `=` spelling is the conventional form (`--head-ref=$SHA`). Running it
+  // through the same stub proves it is HONOURED, not merely refused: if it were still
+  // ignored, this spawn would run the local suite and exit 0.
+  const argv =
+    flagStyle === "equals"
+      ? [`--head-ref=${headSha}`, "--repo=owner/repo"]
+      : ["--head-ref", headSha, "--repo", "owner/repo"];
   return spawnSync(
     process.execPath,
-    [
-      path.join(REPO_ROOT, "scripts", "check-pi-pin-lockstep.mjs"),
-      "--head-ref",
-      "a".repeat(40),
-      "--repo",
-      "owner/repo",
-    ],
+    [path.join(REPO_ROOT, "scripts", "check-pi-pin-lockstep.mjs"), ...argv],
     {
       encoding: "utf8",
       env: {
@@ -4005,6 +4150,125 @@ test("the live workflow corpus parses (the subset is adequate for this repo)", (
 // inside a try/catch that sets `process.exitCode = 1`. Both injection points are
 // exercised — mid-suite (the old fixture) and the TOP of the module body, which is
 // the earliest point the handler can catch.
+// #858 — A USAGE ERROR MUST NOT BECOME LOCAL-SUITE MODE.
+// Any invocation that is not a well-formed one used to fall through to "not in --head-ref
+// mode", which runs THIS suite and exits 0. Measured against `origin/main`'s script: EIGHT of
+// the eleven forms below ran the local suite and exited 0 — not all eleven. The other three
+// (an explicitly empty value, another flag where the value belongs, a duplicated `--head-ref`)
+// reached `runHeadRefMode` with a bad value and exited 2 from the SHA validator, so they were
+// already refused; they are in the table because the fix must not regress them. The
+// unquoted-empty-variable form is the one a real caller hits (the shell drops the argument
+// entirely, so the flag looks absent); the `=` and near-miss spellings are what the first fix
+// attempt still missed, because it matched the exact token `--head-ref`.
+test("--head-ref with a missing or empty value fails CLOSED instead of running the local suite (#858)", () => {
+  const suite = path.join(REPO_ROOT, "scripts", "check-pi-pin-lockstep.mjs");
+  const NO_VALUE = /was passed with no usable value/;
+  const UNKNOWN = /unrecognised argument/;
+  // [label, argv, expected-message regex]
+  const cases = [
+    ["no value at all", ["--head-ref"], NO_VALUE],
+    ["an explicitly empty value", ["--head-ref", ""], NO_VALUE],
+    ["another flag where the value belongs", ["--head-ref", "--repo", "o/r"], NO_VALUE],
+    ["the `=` form with an empty value", ["--head-ref="], NO_VALUE],
+    ["a near-miss spelling (--headRef)", ["--headRef", "abc"], UNKNOWN],
+    ["a single-dash spelling (-head-ref)", ["-head-ref", "abc"], UNKNOWN],
+    ["a prefixed spelling (--head-refx)", ["--head-refx", "abc"], UNKNOWN],
+    ["a bare positional argument", ["abc"], UNKNOWN],
+    ["a flag this tool has never accepted", ["--version"], UNKNOWN],
+    ["a duplicated --head-ref", ["--head-ref", "a", "--head-ref", "b"], /more than once/],
+    ["--repo with no --head-ref", ["--repo", "o/r"], /without --head-ref/],
+  ];
+  for (const [label, args, expected] of cases) {
+    // The timeout is a DETECTOR, not just a guard: without the fix the child runs the
+    // local suite, so the one thing we must never do is read a timed-out child as
+    // "not zero, therefore fixed". A regression must surface as an explicit message.
+    const res = spawnSync(process.execPath, [suite, ...args], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: 30_000,
+    });
+    const out = `${res.stdout ?? ""}${res.stderr ?? ""}`;
+    assert.notEqual(
+      res.error?.code,
+      "ETIMEDOUT",
+      `${label}: RAN THE LOCAL SUITE instead of refusing — it never finished, which is the ` +
+        "fail-open this test exists for (#858)"
+    );
+    assert.equal(res.error ?? null, null, `${label}: could not spawn the suite (${res.error?.message})`);
+    // The EXACT code is asserted, not "non-zero". `assert.notEqual(status, 0)` is TRUE for
+    // `status === null`, which is what a spawn failure or a signal-killed child produces — the
+    // same anti-pattern this file documents and fixes for `assertStepCanFail`. Pinning 2 also
+    // makes the runtime shape assertion observable: a wrongly-built parse result exits 3.
+    assert.equal(res.signal ?? null, null, `${label}: the child must not be killed by a signal`);
+    assert.equal(
+      res.status,
+      2,
+      `${label}: must FAIL CLOSED with the documented usage-error code 2 (3 means the parse ` +
+        `result was built without the null headRef/repo shape, and 0 is the fail-open this ` +
+        `test exists for). status=${res.status}`
+    );
+    assert.match(
+      out,
+      expected,
+      `${label}: the refusal must say what was wrong (expected ${expected}), not just exit non-zero`
+    );
+    assert.ok(
+      !/ALL TESTS PASSED/.test(out),
+      `${label}: must NOT run the local suite — running it is the fail-open`
+    );
+    // Pin that the refusal is not followed by a report about a suite that never ran. The
+    // refusal exits before the `exit` handler is registered, so this output must be ONLY
+    // the refusal. It cannot be pinned through the handler in either direction: with the
+    // error path's `headRef: null` the handler would reach `finalize()` and throw on the TDZ
+    // binding, and with a bare `{ error }` it would early-return instead — and neither is
+    // reachable from here, because `process.exit(2)` precedes both. The runtime assertion in
+    // the refusal block is what makes the shape observable, via its exit code of 3.
+    assert.ok(
+      !/passed, \d+ failed/.test(out) && !/floor and roster were initialized/.test(out),
+      `${label}: the refusal must not be followed by a summary of a suite that never ran. ` +
+        `Got: ${JSON.stringify(out.slice(0, 200))}`
+    );
+  }
+});
+
+// #858 P1 — the first fix matched the exact token `--head-ref`, so `--head-ref=<sha>` was
+// still invisible and still fell through to local-suite mode. This is the counter-test:
+// the `=` spelling must be HONOURED end-to-end (stubbed, so it runs no PR content and
+// touches no network), not merely refused.
+test("the `=` spelling of --head-ref is HONOURED end-to-end, not ignored (#858 P1)", () => {
+  const res = runHeadRefWithStub(
+    {
+      truncated: false,
+      tree: [
+        { path: ".github/workflows/ci.yml", mode: "100644", type: "blob", sha: "c" },
+        { path: ".github/workflows/node-ci.yml", mode: "100644", type: "blob", sha: "n" },
+        { path: ".github/workflows/ci-main.yml", mode: "100644", type: "blob", sha: "m" },
+      ],
+    },
+    { c: FIXTURE_CALLER, n: FIXTURE_CALLEE, m: FIXTURE_CI_MAIN },
+    "equals"
+  );
+  assert.equal(
+    res.status,
+    0,
+    `\`--head-ref=<sha>\` must be honoured and GREEN on a valid tree; got status ${res.status}, ` +
+      `stdout=${JSON.stringify(res.stdout)}, stderr=${JSON.stringify(res.stderr)}`
+  );
+  assert.match(
+    res.stdout,
+    /still satisfy the narrow structural guard/,
+    "the `=` form must reach --head-ref mode (if it were ignored, this would be a local-suite run)"
+  );
+});
+
+// #858 — NOTE ON THE REMOVED STRUCTURAL TEST. An earlier revision pinned the parse-error shape
+// by reading this file's own source and asserting there is no literal `return {` in `parseArgs`.
+// Review cycle 3 falsified it: the same defect written as `const bare = { error }; return bare;`
+// evaded the regex and left the suite GREEN. A regex over source is not enforcement. It is
+// replaced by the runtime assertion in the refusal block (exit 3) plus the `status === 2`
+// assertion in the test above — both behavioural, and neither claims more than it checks.
+
 test("an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)", () => {
   const injections = [
     [
