@@ -99,6 +99,19 @@ jobs:
         # gate reading it). Mirrors the per-PR verify-job step in ci.yml.
         echo "== extensions/loop-enforcer/tier-config-parity.test.ts =="
         npx tsx extensions/loop-enforcer/tier-config-parity.test.ts || failures=$((failures+1))
+        # #847 — the OTHER four loop-enforcer suites were wired nowhere: the L3
+        # stall predicates (`termination.test.ts`) could not have caught the
+        # inverted-predicate regression in CI at all. Same shape as the shared/
+        # glob above; `tier-config-parity.test.ts` is skipped here because it is
+        # explicitly listed (and per-PR wired) just above.
+        for t in extensions/loop-enforcer/*.test.ts; do
+          [ -f "$t" ] || continue
+          case "$t" in
+            extensions/loop-enforcer/tier-config-parity.test.ts) continue ;;
+          esac
+          echo "== $t =="
+          npx tsx "$t" || failures=$((failures+1))
+        done
         # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
         # in CI (the never-passable checkpoint contract shipped untested, 08-12).
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
