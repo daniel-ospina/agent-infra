@@ -39,6 +39,11 @@ import {
   rateLimitMaxWaitMs,
   getPrHeadShaViaRest,
   getPrHeadSha,
+  hasAdminMergeFlag,
+  extractMergePrNumber,
+  evidenceBodyIsCertifying,
+  evaluateAdminMergeGate,
+  getPrComments,
   _setRunGhOverride,
   BLOCK_MESSAGE,
   MICRO_BLOCK_MESSAGE,
@@ -2835,6 +2840,232 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
       `index.ts must not contain ${pattern} — a micro warn re-label re-drifted in inflected form (#745)`
     );
   }
+});
+
+// ── #930 admin-merge evidence gate ─────────────────────────────────────────
+// The adversarial declaration (issue #930 scoping comment) names five in-scope
+// threat classes. Each has a test here that FAILS without the fix:
+//   1. stale evidence           — marker at head X accepted at head Y
+//   2. forgery/vacuity          — marker present but computed over an empty/
+//                                 unparsed failing set
+//   3. flake escape             — re-run classification laundering a real
+//                                 failure into "flaky" (tests/admin-merge/run.sh)
+//   4. arg-order evasion        — `--admin` before the PR number, `--admin=true`
+//   5. parity drift             — pre-merge gate vs post-merge detector
+//                                 (tests/admin-merge/run.sh §9: one `comm -23`)
+
+section("#930 admin-merge — flag detection and arg-order-proof PR extraction");
+
+test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
+  ok(hasAdminMergeFlag("gh pr merge --admin 123"), "flag before the number");
+  ok(hasAdminMergeFlag("gh pr merge 123 --admin"), "flag after the number");
+  ok(hasAdminMergeFlag("gh pr merge --admin=true 123"), "--admin=true");
+  ok(hasAdminMergeFlag("gh pr merge --admin= 123"), "--admin= (gh's own empty = true)");
+  ok(hasAdminMergeFlag("gh pr merge --squash --admin 123"), "after another flag");
+  ok(hasAdminMergeFlag("cd /x && gh pr merge --admin 123"), "behind a cd chain");
+  ok(!hasAdminMergeFlag("gh pr merge 123 --admin=false"), "--admin=false is NOT a bypass (must not refuse)");
+  ok(!hasAdminMergeFlag("gh pr merge 123 --squash"), "plain merge untouched");
+  ok(!hasAdminMergeFlag("gh pr merge 123 --adminx"), "a `--adminx` typo is NOT a bypass (no false block)");
+  ok(!hasAdminMergeFlag("gh pr merge 123 --no-admin"), "`--no-admin` is not the flag");
+});
+
+test("extractMergePrNumber: flag order never hides the PR number", () => {
+  equal(extractMergePrNumber("gh pr merge 123"), 123);
+  equal(extractMergePrNumber("gh pr merge --admin 123"), 123, "flag before the number (the evasion)");
+  equal(extractMergePrNumber("gh pr merge --squash --admin 123"), 123);
+  equal(extractMergePrNumber("gh pr merge 123 --admin"), 123);
+  equal(extractMergePrNumber("gh pr merge --repo owner/name --admin 123"), 123, "--repo's value is not the PR");
+  equal(extractMergePrNumber("gh pr merge -R owner/name 123"), 123);
+  equal(extractMergePrNumber("gh pr merge --admin --repo=owner/name 123"), 123, "--flag=value form");
+  equal(extractMergePrNumber("gh pr merge --admin"), null, "no number → cannot bind evidence");
+  equal(extractMergePrNumber("gh pr merge --admin; sleep 123"), null, "a later command's number is NOT this merge's PR");
+  equal(extractMergePrNumber("gh pr create --title 123"), null);
+});
+
+test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
+  const good = "<!-- admin-merge-safety: " + "a".repeat(40) + " -->\nPR head: " + "a".repeat(40) +
+    "\nmain compared (union of 10 runs): s1:1,s2:2\nPR failing: 0 | main failing: 3 | unique to this PR: 0\n";
+  ok(evidenceBodyIsCertifying(good), "full evidence certifies");
+  ok(!evidenceBodyIsCertifying("<!-- admin-merge-safety: " + "a".repeat(40) + " -->"),
+    "marker only (empty/unparsed set) does NOT certify");
+  ok(!evidenceBodyIsCertifying(good.replace("unique to this PR: 0", "unique to this PR: 1")),
+    "a non-zero unique count never certifies");
+  ok(!evidenceBodyIsCertifying(good.replace("main compared (union of 10 runs): s1:1,s2:2\n", "")),
+    "missing main provenance does NOT certify");
+  ok(!evidenceBodyIsCertifying(good.replace("PR failing: 0 | main failing: 3", "PR failing: | main failing: ")),
+    "missing counts do NOT certify");
+});
+
+test("evaluateAdminMergeGate: pure decisions", () => {
+  const head = "b".repeat(40);
+  const commented = (sha: string, body: string) => [body.split("<SHA>").join(sha)];
+  const ev = "<!-- admin-merge-safety: <SHA> -->\nPR head: <SHA>\nmain compared (union of 10 runs): s1:1\nPR failing: 1 | main failing: 1 | unique to this PR: 0";
+  equal(evaluateAdminMergeGate(null, head, [], false).status, "block", "no PR number → block (fail closed)");
+  equal(evaluateAdminMergeGate(1, null, [], false).status, "block", "no head → block");
+  equal(evaluateAdminMergeGate(1, head, null, false).status, "block", "unreadable comments → block (fail closed)");
+  equal(evaluateAdminMergeGate(1, head, commented("c".repeat(40), ev), false).status, "block", "stale evidence (head X, now Y) → block");
+  equal(evaluateAdminMergeGate(1, head, ["<!-- admin-merge-safety: " + head + " -->"], false).status, "block", "vacuous marker → block");
+  equal(evaluateAdminMergeGate(1, head, commented(head, ev), false).status, "allow", "head-bound non-vacuous evidence → allow");
+  equal(evaluateAdminMergeGate(null, null, null, true).status, "allow", "override hatch allows (audited)");
+});
+
+// ── #930 factory-level: the actual tool_call refusal ───────────────────────
+
+const PR_ADMIN = 99900010;
+function adminGh(head: string, comments: string[] | null, failComments = false) {
+  return (cmd: string) => {
+    if (cmd.includes("--json comments")) {
+      if (failComments) throw ghError("simulated gh failure");
+      return JSON.stringify(comments ?? []);
+    }
+    if (cmd.includes("headRefOid")) return head;
+    throw ghError(`unexpected gh call: ${cmd}`);
+  };
+}
+function evidenceBody(sha: string, counts = "PR failing: 1 | main failing: 1 | unique to this PR: 0"): string {
+  return `<!-- admin-merge-safety: ${sha} -->\nPR head: ${sha}\nmain compared (union of 10 runs): s1:1,s2:2\n${counts}\n<details>raw comm -23 output</details>\nFlake classification: none needed`;
+}
+
+for (const [label, command] of [
+  ["--admin before the PR number", `gh pr merge --admin ${PR_ADMIN}`],
+  ["--admin after the PR number", `gh pr merge ${PR_ADMIN} --admin`],
+  ["--admin=true before the PR number", `gh pr merge --admin=true ${PR_ADMIN}`],
+  ["--admin with no PR number at all", "gh pr merge --admin"],
+] as const) {
+  testAsync(`#930 refusal: ${label} without evidence is BLOCKED`, async () => {
+    await withTempHome(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      _setRunGhOverride(adminGh("d".repeat(40), []));
+      try {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        const res = await fire("tool_call", { toolName: "bash", input: { command } });
+        ok(res && res.block === true, `expected a block for: ${command}`);
+        ok(/admin-merge/.test(String(res.reason)), `block reason must name the admin-merge gate: ${String(res.reason).slice(0, 120)}`);
+        const blocked = tempAuditLines().filter((l) => l.event === "merge_gate_block");
+        equal(blocked.length, 1, "exactly one audit entry");
+        equal(blocked[0].reason, "admin_merge_no_evidence");
+      } finally {
+        _setRunGhOverride(null);
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+}
+
+testAsync("#930 stale evidence: a marker minted at an OLD head does not unlock the new head", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "e".repeat(40);
+    _setRunGhOverride(adminGh(head, [evidenceBody("f".repeat(40))]));
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${PR_ADMIN} --admin` } });
+      ok(res && res.block === true, "stale evidence must block");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#930 vacuity: a marker at the current head with no counts is BLOCKED", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "1".repeat(40);
+    _setRunGhOverride(adminGh(head, [`<!-- admin-merge-safety: ${head} -->`]));
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${PR_ADMIN} --admin` } });
+      ok(res && res.block === true, "vacuous evidence must block");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#930 valid head-bound evidence + clean review → allowed; the registry gate still runs", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "2".repeat(40);
+    // The registry gate must ALSO pass — admin evidence does not replace the
+    // review record. A repo-less legacy record cannot be foreign.
+    writeReviewFile(resolvePath(os.homedir(), ".pi", "agent", "reviews", `${PR_ADMIN}.json`),
+      { pr: PR_ADMIN, head_sha: head, verdict: "clean" });
+    _setRunGhOverride(adminGh(head, [evidenceBody(head)]));
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" });
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${PR_ADMIN} --admin --squash` } });
+      equal(res, undefined, "evidence + clean review at the head → merge allowed");
+      const passes = tempAuditLines().filter((l) => l.event === "merge_gate_pass");
+      ok(passes.some((l) => l.reason === "admin_merge_evidence_ok"), "the admin evidence verification is audited");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#930 override hatch: AGENT_ADMIN_MERGE_OVERRIDE=1 allows a raw --admin (audited)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "3".repeat(40);
+    writeReviewFile(resolvePath(os.homedir(), ".pi", "agent", "reviews", `${PR_ADMIN}.json`),
+      { pr: PR_ADMIN, head_sha: head, verdict: "clean" });
+    _setRunGhOverride(adminGh(head, []));
+    process.env.AGENT_ADMIN_MERGE_OVERRIDE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" });
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${PR_ADMIN} --admin` } });
+      equal(res, undefined, "override allows the merge");
+      const passes = tempAuditLines().filter((l) => l.event === "merge_gate_pass");
+      ok(passes.some((l) => l.reason === "admin_merge_override"), "the override is audited");
+    } finally {
+      delete process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#930 --admin=false is not a bypass — the admin gate does not fire (registry gate decides)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(adminGh("4".repeat(40), []));
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        input: { command: `gh pr merge ${PR_ADMIN} --admin=false` },
+      });
+      ok(res && res.block === true, "no review record → the registry gate blocks");
+      const blocked = tempAuditLines().filter((l) => l.event === "merge_gate_block");
+      equal(blocked[0].reason, "no_review_record", "the ADMIN gate must not fire for --admin=false");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
 });
 
 // ── Summary ───────────────────────────────────────────

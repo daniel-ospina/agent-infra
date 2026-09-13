@@ -17,6 +17,12 @@ Templates:
 - `docs-ci.yml` — markdownlint, lychee link check, doc frontmatter
 - `node-ci.yml` — Node script validation, skill lint, typecheck, lint
 - `python-ci.yml` — Python CI
+- `admin-merge-detector.yml` — post-merge detector for the #930 safe-admin-merge
+  rail (**detection only, never blocks**). It is NOT a `workflow_call` reusable —
+  it triggers itself via `workflow_run` on the `CI on main` workflow, so
+  materializing it into a consumer repo wires it up with no caller edit. It files
+  an issue when a merge to main carried tests that were not in main's prior
+  failing set (the path a human clicking "admin merge" leaves open).
 - `pipeline-compliance.yml` — pipeline compliance gate (below)
 
 ---

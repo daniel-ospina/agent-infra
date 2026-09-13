@@ -165,6 +165,47 @@ rm -f "${TMPDIR:-/tmp}/pi-pr-body-$(git rev-parse --absolute-git-dir | cksum | c
 
 The PostToolUse hook fires on `gh pr merge` as a safety net for manual merges outside commit-workflow. Step 2 is the primary code-review gate.
 
+### `--admin` merges: `scripts/admin-merge.sh` is the REQUIRED path (#930)
+
+`gh pr merge --admin` bypasses required checks by design, so nothing makes it
+*safe*: it cannot tell a check already red on `main` from a NEW failure the PR
+introduces. tortoise #3420 merged at 08:15 carrying
+`tests/test_markers.py::test_no_redirect_stems_registry_exact` — a test that was
+**not** in main's failing set — and main ratcheted redder. A convention is what
+produced that; this is a rail.
+
+**Never run `gh pr merge --admin` directly.** The `review-enforcer` merge gate
+REFUSES a raw `--admin` merge that carries no head-bound evidence comment, and
+the evidence is bound to the head SHA — so **every push invalidates it**.
+
+```bash
+# The MANDATED path. Computes the failing set, refuses a genuinely new failure,
+# posts the head-bound evidence, and only then runs `gh pr merge --admin`.
+# Extra flags (--squash, --rebase, --delete-branch, …) pass through.
+scripts/admin-merge.sh <PR> --squash
+
+# Inside, it is:
+#   pr-fails.txt   ← scripts/ci-failure-set.sh --pr <PR>
+#   main-fails.txt ← scripts/ci-failure-set.sh --main-union 10   # the UNION
+#   comm -23 pr-fails.txt main-fails.txt   ⇒ must be EMPTY
+#   non-empty → re-run the PR's failed jobs once (pass-on-retry = flaky, not new)
+#   residual non-empty → BLOCK: prints the list, exits non-zero, does NOT merge
+```
+
+⚠️ The baseline is the **union of main's last N runs** (default 10), never a
+single run. tortoise #3469: raw `comm -23` reported 1 unique failure while the
+true value was 0 — `test_import_wrong_key_422` and
+`test_import_count_mismatch_422` share one assertion and *which sibling trips
+depends on execution order*, so main fails each in different runs. A single-run
+baseline hard-blocks a SAFE merge, and a gate that false-blocks once gets
+disabled — which is how a convention comes back.
+
+Deliberate operator use only: set `AGENT_ADMIN_MERGE_OVERRIDE=1` (or the
+`ELDATO_ADMIN_MERGE_OVERRIDE` alias) — the same escape-hatch convention as
+`AGENT_SKIP_REVIEW_GATE`, and audited as `admin_merge_override`. The post-merge
+detector (`.github/workflows/admin-merge-detector.yml`) still runs and files an
+issue whenever a merge to main carried unique failures.
+
 ## Step 1.5 — Fallback Tier Classification (only if TIER = unknown)
 
 Skip if TIER was resolved in pre-flight. Proceed directly to the auto-reclassification check below.

@@ -1,0 +1,114 @@
+name: Admin-merge detector
+# Post-merge DETECTOR for the #930 safe-admin-merge rail.
+#
+# DETECTION ONLY — this workflow NEVER blocks anything. It is the closed loop
+# for the path the pre-merge chokepoint cannot cover: a human clicking
+# "admin merge" in the GitHub UI. `--admin` bypasses required checks by design,
+# so this cannot be a server-side required check; the only honest answer is to
+# notice afterwards and file.
+#
+# Sequencing is deliberate: prevention (scripts/admin-merge.sh + the
+# review-enforcer merge gate) is the chokepoint and runs FIRST; this detector
+# runs after the merge and never gates the chokepoint. A detector that can block
+# is a detector that will be disabled the first time it false-blocks.
+#
+# What it does, after "CI on main" completes for a push to main:
+#   1. the merged commit's failing set      → scripts/ci-failure-set.sh --commit <sha>
+#   2. main's PRIOR failing set (union)     → scripts/ci-failure-set.sh --main-union N --exclude <sha>
+#   3. the shared comparison                → scripts/ci-failure-set.sh --diff
+#   4. unique non-empty → file an issue; always exit 0.
+#
+# `templates/.github/workflows/admin-merge-detector.yml` is the source of truth
+# and `scripts/sync-ci-workflows.sh` materializes `.github/workflows/` — so
+# consumer repos get this detector by running that script (GitHub Actions cannot
+# parse a symlinked workflow, #555).
+
+on:
+  workflow_run:
+    workflows: ["CI on main"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit to inspect (default: the triggering run's head)"
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Compare the merged commit's failing set against main's prior set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_RUNS: "10"
+          MERGE_SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha }}
+        run: |
+          set -uo pipefail
+          # Detection only: every failure path below logs and exits 0. This job
+          # must never be able to block — its whole reason to exist is the loop
+          # the chokepoint cannot close.
+          if [ -z "${MERGE_SHA:-}" ]; then
+            echo "no merge sha in the event context — nothing to inspect"
+            exit 0
+          fi
+          echo "inspecting merge commit $MERGE_SHA (main baseline: union of last $MAIN_RUNS runs)"
+
+          # An EXTRACTION FAILURE (parser exit 1) means "cannot certify", never
+          # "nothing is unique". For a detector the honest response is a loud log
+          # line, not a silent pass — but still exit 0 (never block).
+          if ! bash scripts/ci-failure-set.sh --commit "$MERGE_SHA" > merged-fails.txt 2>extract-err.txt; then
+            echo "::warning::admin-merge detector: could not extract the merged commit's failing set"
+            sed 's/^/  /' extract-err.txt
+            exit 0
+          fi
+          if ! bash scripts/ci-failure-set.sh --main-union "$MAIN_RUNS" --exclude "$MERGE_SHA" \
+                --provenance main-runs.txt > main-fails.txt 2>>extract-err.txt; then
+            echo "::warning::admin-merge detector: could not extract main's prior failing set"
+            sed 's/^/  /' extract-err.txt
+            exit 0
+          fi
+
+          bash scripts/ci-failure-set.sh --diff merged-fails.txt main-fails.txt > unique.txt
+          unique_count="$(wc -l < unique.txt | tr -d ' ')"
+          echo "merged commit failing: $(wc -l < merged-fails.txt | tr -d ' ') | main prior failing: $(wc -l < main-fails.txt | tr -d ' ') | unique to this merge: $unique_count"
+
+          if [ "$unique_count" -eq 0 ]; then
+            echo "✅ no unique failures carried by this merge"
+            exit 0
+          fi
+
+          {
+            echo "The merge at \`$MERGE_SHA\` landed tests that were **not** in main's prior failing set."
+            echo ""
+            echo "This is the rail's post-merge detector (#930) — detection only, it does not block."
+            echo "It exists because an \`--admin\` merge bypasses required checks, so the only"
+            echo "honest answer for that path is to notice afterwards."
+            echo ""
+            echo "Unique failures ($unique_count):"
+            echo ""
+            echo '```'
+            cat unique.txt
+            echo '```'
+            echo ""
+            echo "Main baseline (union of the last $MAIN_RUNS main runs, excluding this commit):"
+            echo ""
+            echo '```'
+            cat main-runs.txt
+            echo '```'
+            echo ""
+            echo "Next time use \`scripts/admin-merge.sh <PR>\` — it refuses this merge before it lands."
+          } > issue-body.md
+
+          gh issue create \
+            --title "admin-merge carried unique failures (${MERGE_SHA:0:7})" \
+            --label bug \
+            --body-file issue-body.md || echo "::warning::could not file the detector issue"
+          exit 0

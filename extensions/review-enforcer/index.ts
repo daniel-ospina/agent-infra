@@ -635,6 +635,213 @@ export function logMergeGateDecision(
   }
 }
 
+// ── #930: safe-admin-merge evidence gate ──────────────
+// `--admin` bypasses required checks, so nothing makes it *safe*: it cannot tell
+// a check already red on main from a NEW failure the PR introduces (tortoise
+// #3420 merged carrying a test that was not in main's failing set, and main
+// ratcheted redder). The chokepoint is scripts/admin-merge.sh; this gate closes
+// the other half — a RAW `gh pr merge … --admin` is refused unless the PR
+// carries an `<!-- admin-merge-safety: <head-sha> -->` evidence comment bound
+// to the CURRENT head SHA, so every push invalidates prior evidence.
+//
+// Flag shapes the gate must catch (a single regex on `--admin` is not enough —
+// `extractPrNumber` requires the number to follow `gh pr merge` immediately, so
+// every one of these previously slipped past the merge-registry gate entirely):
+//   gh pr merge --admin 123          (flag BEFORE the number)
+//   gh pr merge 123 --admin
+//   gh pr merge --admin=true 123
+//   gh pr merge --squash --admin 123
+//   gh pr merge --admin              (no number → cannot bind evidence)
+const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40})\s*-->/g;
+
+/**
+ * Is an `--admin` flag present in a `gh pr merge` command? `--admin=false` is
+ * NOT a bypass (gh explicitly disables it), so it must not be refused.
+ * `--admin=true`, bare `--admin` and `--admin=` (gh's own "true") are.
+ */
+export function hasAdminMergeFlag(command: string): boolean {
+  // Token-anchored: `--admin` must be a WHOLE flag. A `--adminx` typo is not a
+  // bypass (gh rejects it as an unknown flag), and refusing it would be exactly
+  // the false block this rail must not produce.
+  const re = /(?:^|[\s"'])--admin(?:=(\S*))?(?=$|[\s"'])/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(command)) !== null) {
+    const val = m[1];
+    if (val === undefined || val === "" || val === "true") return true;
+  }
+  return false;
+}
+
+/**
+ * Extract the PR number from a `gh pr merge` command REGARDLESS of flag order
+ * (#930 adversarial class 4 — arg-order evasion). The segment runs from `gh pr
+ * merge` to the first shell terminator (`;`, `&&`, `||`, `|`, newline), so a
+ * number belonging to a LATER command can never be attributed to this merge.
+ * Flags that take a value are skipped together with their value; every
+ * value-less merge flag is listed so a later number is still found. Returns
+ * null when no PR number is present (e.g. `gh pr merge --admin` on the current
+ * branch) — a null answer must FAIL CLOSED for an admin merge, never fall
+ * through to the dispatch-count path.
+ */
+export function extractMergePrNumber(command: string): number | null {
+  const idx = command.search(/gh\s+pr\s+merge\b/);
+  if (idx === -1) return null;
+  const rest = command.slice(idx).replace(/^gh\s+pr\s+merge\b/, "");
+  const segment = rest.split(/;|&&|\|\||\||\n/)[0] ?? "";
+  const tokens = segment.split(/\s+/).filter(Boolean);
+  const valueFlags = new Set([
+    "--repo", "-R", "--body", "-b", "--body-file", "-F", "--subject",
+    "-t", "--author-email", "--match-head-commit",
+  ]);
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (valueFlags.has(tok)) {
+      i++; // skip the flag's value
+      continue;
+    }
+    if (/^--[A-Za-z-]+=/.test(tok)) continue; // --flag=value
+    if (/^\d+$/.test(tok)) return Number(tok);
+  }
+  return null;
+}
+
+/**
+ * Evidence must be **non-vacuous**, not merely present (#930 adversarial class
+ * 2 — forgery/vacuity). A marker line alone proves nothing: the evidence body
+ * must carry the comparison's own counts, with `unique to this PR: 0`. A body
+ * computed over an empty or unparsed failing set cannot produce this line, and a
+ * forged marker would have to reconstruct it.
+ */
+export function evidenceBodyIsCertifying(body: string): boolean {
+  return (
+    /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0\b/.test(body) &&
+    /PR head:\s*[0-9a-fA-F]{7,40}/.test(body) &&
+    /main compared \(union of \d+ runs?\):/.test(body)
+  );
+}
+
+export type AdminMergeGateResult =
+  | { status: "block"; reason: string }
+  | { status: "allow"; message: string };
+
+/**
+ * Pure decision for the admin-merge evidence gate.
+ *
+ * `comments` is the PR's comment bodies, or null when the fetch FAILED — a
+ * failed fetch is `block` (fail-closed): an admin merge is a bypass, and a
+ * bypass must not be granted because gh was unreachable.
+ */
+export function evaluateAdminMergeGate(
+  pr: number | null,
+  currentHead: string | null,
+  comments: string[] | null,
+  override: boolean,
+): AdminMergeGateResult {
+  if (override) {
+    return {
+      status: "allow",
+      message:
+        "[review-enforcer] ⚠️  ADMIN-MERGE OVERRIDE — the head-bound evidence gate was " +
+        "bypassed by AGENT_ADMIN_MERGE_OVERRIDE=1 (audited). Ensure the operator has " +
+        "approved this admin merge; the post-merge detector still runs.",
+    };
+  }
+  const remediation = [
+    "   → Run the mandated rail instead: scripts/admin-merge.sh <PR>",
+    "     It computes the failing set (union over main's last N runs), refuses a genuinely",
+    "     new failure, and posts the head-bound evidence this gate requires.",
+    "   → Deliberate operator override: set AGENT_ADMIN_MERGE_OVERRIDE=1 (or the ELDATO_",
+    "     alias) and restart (audited as admin_merge_override).",
+  ];
+  if (pr === null) {
+    return {
+      status: "block",
+      reason: [
+        "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
+        "❌ `gh pr merge --admin` carries no resolvable PR number, so no head-bound evidence can be checked.",
+        ...remediation,
+      ].join("\n"),
+    };
+  }
+  if (currentHead === null) {
+    return {
+      status: "block",
+      reason: [
+        "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
+        `❌ Could not verify the current head of PR #${pr} — an admin merge cannot be bound to evidence without it.`,
+        ...remediation,
+      ].join("\n"),
+    };
+  }
+  if (comments === null) {
+    return {
+      status: "block",
+      reason: [
+        "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
+        `❌ Could not read PR #${pr}'s comments to look for head-bound admin-merge evidence — failing CLOSED for a bypass.`,
+        ...remediation,
+      ].join("\n"),
+    };
+  }
+  for (const body of comments) {
+    ADMIN_MERGE_EVIDENCE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ADMIN_MERGE_EVIDENCE_RE.exec(body)) !== null) {
+      const sha = m[1].toLowerCase();
+      // Head-SHA BINDING (#930 adversarial class 1 — stale evidence): a marker
+      // minted at head X must not unlock head Y. Accept a prefix match so a
+      // short SHA in the marker still binds, but only when it is a prefix of the
+      // CURRENT head — never a prefix of some earlier one.
+      const bound = sha.length >= 40
+        ? currentHead.toLowerCase() === sha
+        : currentHead.toLowerCase().startsWith(sha);
+      if (bound && evidenceBodyIsCertifying(body)) {
+        return {
+          status: "allow",
+          message:
+            `[review-enforcer] ✅ Admin-merge evidence verified for PR #${pr} ` +
+            `(marker bound to head ${currentHead.slice(0, 12)}, evidence non-vacuous) — allowing --admin merge`,
+        };
+      }
+    }
+  }
+  return {
+    status: "block",
+    reason: [
+      "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
+      `❌ PR #${pr} has no \`admin-merge-safety\` evidence bound to its CURRENT head (${currentHead.slice(0, 12)}).`,
+      "   Evidence is head-bound: every push to the PR invalidates it, so a stale marker is refused.",
+      "   A marker alone is also refused — the evidence body must carry the comparison counts.",
+      ...remediation,
+    ].join("\n"),
+  };
+}
+
+/** The PR's comment bodies, or null when the fetch failed (fail-closed). */
+export function getPrComments(pr: number, ctx: RepoContext): string[] | null {
+  const repoArg = ctx.repo ? ` --repo ${ctx.repo}` : "";
+  try {
+    // `--jq '[.comments[].body]'` → ONE JSON array of bodies. The plain
+    // `.comments[].body` form prints one body per line, which silently SPLITS a
+    // multi-line evidence comment (the marker line would arrive as its own
+    // "comment" with no counts) — a real vacuity hole, not a formatting nit.
+    const out = runGh(`gh pr view ${pr} --json comments --jq '[.comments[].body]'${repoArg}`, {
+      cwd: ctx.cwd,
+      timeout: 15000,
+    });
+    const parsed = JSON.parse(out);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((b): b is string => typeof b === "string");
+  } catch {
+    return null;
+  }
+}
+
+/** The admin-merge override hatch, mirroring the repo's AGENT_/ELDATO_ env convention. */
+function _adminMergeOverride(): boolean {
+  return _getEnv("ADMIN_MERGE_OVERRIDE") === "1";
+}
+
 // ── Block message ─────────────────────────────────────
 
 // #517: the code-review-skill path is repo-layout-dependent — agent-infra
@@ -769,11 +976,42 @@ export default function (pi: ExtensionAPI) {
       const command = String(event.input.command ?? "");
       if (!isGitOp(command)) return undefined;
 
+      // #930: the admin-merge evidence gate runs FIRST (before the merge
+      // registry). `--admin` bypasses required checks, so it is refused unless
+      // the PR carries evidence bound to the CURRENT head SHA. On a pass it
+      // FALLS THROUGH to the merge-registry gate — the two gates are
+      // independent and both must pass.
+      if (/gh\s+pr\s+merge\b/.test(command) && hasAdminMergeFlag(command)) {
+        const adminPr = extractMergePrNumber(command);
+        // #426 context resolution, reuse: --repo / GH_REPO / cd / fallback.
+        const adminCtx = resolveRepoContext(command, null);
+        const adminHead = adminPr !== null ? await getPrHeadSha(adminPr, adminCtx) : null;
+        const adminComments =
+          adminPr !== null && adminHead !== null ? getPrComments(adminPr, adminCtx) : null;
+        const adminOverride = _adminMergeOverride();
+        const adminResult = evaluateAdminMergeGate(
+          adminPr, adminHead, adminComments, adminOverride
+        );
+        if (adminResult.status === "block") {
+          console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked");
+          logGateEvent("merge_gate_block", {
+            pr: adminPr,
+            reason: "admin_merge_no_evidence",
+          });
+          return { block: true, reason: adminResult.reason };
+        }
+        console.log(adminResult.message);
+        logGateEvent("merge_gate_pass", {
+          pr: adminPr,
+          reason: adminOverride ? "admin_merge_override" : "admin_merge_evidence_ok",
+        });
+      }
+
       // #138: merge registry gate runs FIRST for `gh pr merge` commands.
       // A recorded clean review (registry record) IS the evidence — merges do
       // NOT also require dispatchCount > 0. That gate stays for git
       // commit/push and gh pr create, below.
-      const prNumber = extractPrNumber(command);
+      const prNumber = extractPrNumber(command) ?? extractMergePrNumber(command);
       if (prNumber !== null) {
         // #426: repo resolution is command-first (--repo / GH_REPO / cd), then
         // the merge ENVIRONMENT — git remote of the cd target, else of the pi
