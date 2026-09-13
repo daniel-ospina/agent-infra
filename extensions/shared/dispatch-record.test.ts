@@ -244,6 +244,16 @@ interface DispatchOptions {
 	extraParentEnv?: Record<string, string>;
 	/** Omit `--session-id`/`--session-dir` (the `--no-session` degrade shape). */
 	noSession?: boolean;
+	/**
+	 * Override the child session id. Needed to express the MULTI-LEG shape: the
+	 * real dispatcher mints a fresh session id per spawn attempt, and retry()
+	 * restarts `attempt` at 1 on every leg (primary / each failover hop /
+	 * fallback) — so two DIFFERENT attempts can share one `(dispatchId, attempt)`
+	 * pair and are told apart ONLY by `childSessionId`. The default derivation
+	 * below keys on nonce+attempt, which cannot express that collision (it is a
+	 * faithful stand-in for the single-leg case and stays the default).
+	 */
+	sessionId?: string;
 }
 
 /** One dispatch through the REAL spawnSubAgent with the fake pi child. */
@@ -251,8 +261,9 @@ async function dispatch(scenario: string, opts: DispatchOptions = {}): Promise<D
 	const nonce = opts.nonce ?? mkNonce();
 	// Task 1 mints a FRESH session id per ATTEMPT; mirror that here so attempt
 	// rows carry distinct childSessionId values (a shared id would make the
-	// per-attempt rows indistinguishable).
-	const sessionId = `s-${nonce}-a${opts.attempt ?? 1}`;
+	// per-attempt rows indistinguishable). A caller simulating two LEGS at the
+	// same attempt must pass `sessionId` explicitly — see DispatchOptions.
+	const sessionId = opts.sessionId ?? `s-${nonce}-a${opts.attempt ?? 1}`;
 	const sessionDir = path.join(tmpDir, "child-sessions", sessionId);
 	const closedFile = path.join(tmpDir, `closed-${nonce}`);
 	const subAgentEnv: Record<string, string | undefined> = {
@@ -479,6 +490,62 @@ test("2-attempt run writes TWO rows sharing one dispatchId, distinguished by att
 	equal(new Set(rows.map((r) => r.dispatchId)).size, 1, "one dispatchId");
 	equal(new Set(rows.map((r) => r.childSessionId)).size, 2, "fresh child session per attempt (Task 1)");
 	equal(attemptIds.length, 2, "two spawn attempts actually ran");
+});
+
+test("#783 review: the identity is dispatchId+childSessionId+attempt — a multi-leg attempt=1 collision IS distinguished", async () => {
+	// The gap this closes: the 2-attempt test above varies BOTH `attempt` (1,2)
+	// AND `childSessionId`, so it would still pass if the identity regressed to
+	// `dispatchId` + `attempt`. Yet the documentation justifies including
+	// `childSessionId` with precisely the MULTI-LEG case — `retry()` restarts
+	// `attempt` at 1 on every call and is invoked separately per leg (primary /
+	// each failover hop / fallback), so two genuinely different spawn attempts
+	// can share one `(dispatchId, attempt)` pair. With no test for it, that
+	// justification was unpinned and the documented identity could silently
+	// regress while every existing assertion still passed.
+	//
+	// Shape: one dispatch, two legs, both failing at attempt 1 — same nonce,
+	// SAME attempt, two real children. Sequential (not Promise.all): two
+	// concurrent appends would race `recordDispatchOutcome`'s before/after
+	// read-back window and make the assertion flaky for the wrong reason.
+	const nonce = mkNonce();
+	const attempt = 1;
+	// Distinct ids because the real dispatcher mints a fresh session id per
+	// spawn attempt — two legs are two different children even at attempt 1.
+	const leg = (legName: string) =>
+		dispatch("silent", {
+			nonce,
+			attempt,
+			sessionId: `s-${legName}-${nonce}`,
+			extraParentEnv: { TASK_BACKSTOP_MS: "3000", TASK_HARD_CAP_MS: "3600000" },
+		});
+	const leg1 = await leg("primary");
+	const leg2 = await leg("failover");
+	equal(leg1.value, undefined, "leg 1 really spawned and settled silent");
+	equal(leg2.value, undefined, "leg 2 really spawned and settled silent");
+	const rows = outcomeRows(nonce);
+	equal(rows.length, 2, `two rows — one per spawn attempt (got ${rows.length})`);
+	equal(new Set(rows.map((r) => r.dispatchId)).size, 1, "one dispatchId (same dispatch, two legs)");
+	equal(rows.map((r) => r.attempt).join(","), "1,1", "BOTH rows carry attempt=1 — the per-leg restart");
+	equal(
+		new Set(rows.map((r) => r.childSessionId)).size,
+		2,
+		"distinct childSessionId per leg — the only field telling these two apart",
+	);
+	ok(
+		rows.every((r) => r.childSessionId !== null),
+		"both legs minted a session id (not the --no-session degrade)",
+	);
+	// The assertion that makes the doc's justification non-vacuous. The
+	// documented key is 3-part; collapsing it to the `dispatchId` + `attempt`
+	// form the doc explicitly REJECTS would merge these two rows into one.
+	const documented = new Set(rows.map((r) => `${r.dispatchId}|${r.childSessionId}|${r.attempt}`));
+	const collapsed = new Set(rows.map((r) => `${r.dispatchId}|${r.attempt}`));
+	equal(documented.size, 2, "dispatchId+childSessionId+attempt yields 2 distinct rows");
+	equal(
+		collapsed.size,
+		1,
+		"dispatchId+attempt collapses them to ONE — which is exactly why childSessionId is in the identity",
+	);
 });
 
 test("unwritable ledger root: payload carries `record: \"failed: …\"`, never a dangling path", async () => {
