@@ -113,9 +113,12 @@ probe exits non-zero (the probe prints plain `DEGRADED` and exits 1; only
 `--print` emits the `**DEGRADED` token, so the trigger is either) — the gate
 does NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in
 task-subagent default) or any build-equivalent model would be a same-build
-"independent" review, the #716 defect. The gate records `[SECOND-MODEL-GATE]
-model=**DEGRADED independent=DEGRADED @ <head-sha>` (via `record-review.sh`)
-and escalates to a human.
+"independent" review, the #716 defect. Do NOT record a degraded marker — check (f) hard-fails **both**
+forms: `model=**DEGRADED` is rejected as a reserved value (before the
+independence field is read), and `independent=DEGRADED` is rejected by design
+(see the check (f) list below). STOP and escalate to a human: a guarded-surface
+change cannot merge until an independent model is funded or the operator
+authorizes a bypass (#860).
 
 **Success path — record the marker.** When the probe resolves
 (`RESOLVED=<provider/id>`), record the success form on the same idempotent
