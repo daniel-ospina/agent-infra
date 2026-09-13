@@ -80,6 +80,20 @@ export const REVIEW_CYCLE_CAPS = {
  * does, with `"micro"`), so this is latent — but reusing that derivation to
  * drive `tier` needs the V3/V4 case resolved first.
  */
+/**
+ * L3 fingerprint-stall threshold — the fraction of consecutive cycle pairs whose
+ * fingerprint is UNCHANGED that constitutes a stall.
+ *
+ * Mirrors `stall_threshold` in `skills/code-review/SKILL.md` (§Fingerprint-stall,
+ * default `0.8`) and `skills/plan-review/SKILL.md` (same value). Read as a ratio
+ * of *recurrence*, not of novelty: 0.8 means "80% of the window repeated the
+ * previous fingerprint". The canonical per-issue form is
+ * `|current ∩ prev| / |prev|`; with one whole-set digest per cycle the only
+ * computable quantity is whether a cycle is an exact repeat, so the ratio is
+ * taken over window transitions.
+ */
+export const STALL_THRESHOLD = 0.8;
+
 export const TIER_CONFIG = {
   micro: { vLevel: null, maxCycles: REVIEW_CYCLE_CAPS.skip, reviewers: 0 },
   standard: { vLevel: "V1", maxCycles: REVIEW_CYCLE_CAPS.lowMedium, reviewers: 2 },
@@ -119,23 +133,44 @@ export function evaluateTermination(
   // wants loops to run until a fresh review finds zero issues.
   // (L2 return removed — always continue past this layer.)
 
-  // L3: Deadlock — identical-issue-fingerprint-stall OR plateau (same count 3 cycles).
-  // Fingerprint comparison is skipped when fingerprints are not populated (the common case).
+  // L3: Deadlock — fingerprint-stall (the same issue set recurring) OR plateau
+  // (the issue count is not shrinking). Plateau IS the skills' `honest-stuck`
+  // layer: an independent signal, NOT gated on the fingerprint test.
+  //
+  // ⛔ Direction. `fingerprints` carries ONE whole-set digest per cycle, so the
+  // computable recurrence is the fraction of window TRANSITIONS that repeat the
+  // previous fingerprint: 1.0 for a full stall, 0.0 when every cycle differs.
+  // The form this replaced divided the count of DISTINCT prints by the window
+  // size and fired at `>= 0.8` — i.e. it escalated on exactly the cycles that
+  // were making progress (novelty, not recurrence) — and its `size >= 2` guard
+  // made the canonical stall (all prints equal ⇒ size === 1) unreachable. Both
+  // halves were the inversion of the canonical predicate in
+  // `skills/code-review/SKILL.md` §Fingerprint-stall: recurrence =
+  // `|current ∩ prev| / |prev|`, fire at `>= stall_threshold`.
+  //
+  // Unpopulated fingerprints carry NO signal ⇒ never fire on them. Fail open
+  // for the LOOP: terminating a live loop on absent data is worse than missing
+  // a stall, which L10 still bounds. (This is also why the branch is currently
+  // unreachable in production — no caller populates `fingerprint` yet.)
   if (n >= 3) {
     const last3 = cycles.slice(-3);
     const fingerprints = last3.map(c => c.fingerprint || "");
-    const uniquePrints = new Set(fingerprints.filter(f => f));
     const allSameCount = last3.every(c => c.issuesFound === lastCycle?.issuesFound);
 
-    // Only fire fingerprint-stall when fingerprints ARE populated (≥2 distinct populated)
-    if (uniquePrints.size >= 2 && fingerprints.every(f => f)) {
-      const uniqueness = uniquePrints.size / fingerprints.length;
-      if (uniqueness >= 0.8) {
-        return { shouldExit: true, reason: "L3-deadlock", escalate: true, message: `Fingerprint-stall: ${(uniqueness * 100).toFixed(0)}% unique fingerprints (≤20% expected).` };
+    if (fingerprints.every(f => f !== "")) {
+      let recurring = 0;
+      for (let i = 1; i < fingerprints.length; i++) {
+        if (fingerprints[i] === fingerprints[i - 1]) recurring++;
+      }
+      const transitions = fingerprints.length - 1;
+      const recurrence = transitions === 0 ? 0 : recurring / transitions;
+      if (recurrence >= STALL_THRESHOLD) {
+        return { shouldExit: true, reason: "L3-deadlock", escalate: true, message: `Fingerprint-stall: ${(recurrence * 100).toFixed(0)}% of cycles repeated the previous fingerprint (threshold ${(STALL_THRESHOLD * 100).toFixed(0)}%).` };
       }
     }
 
-    // Plateau: same issue count for 3 consecutive cycles (not at zero, not at cap)
+    // Plateau (≡ `honest-stuck`): same issue count for 3 consecutive cycles
+    // (not at zero, not at cap).
     if (allSameCount && lastCycle && lastCycle.issuesFound > 0 && n < effectiveMax) {
       return { shouldExit: true, reason: "L3-deadlock", escalate: true, message: `Plateau: ${lastCycle.issuesFound} issues for 3 cycles.` };
     }

@@ -3,7 +3,7 @@
  * Run: npx tsx extensions/loop-enforcer/termination.test.ts
  */
 
-import { evaluateTermination, type CycleData } from "./termination.ts";
+import { evaluateTermination, STALL_THRESHOLD, type CycleData } from "./termination.ts";
 
 let passed = 0;
 let failed = 0;
@@ -44,13 +44,16 @@ function cycle(n: number, issues: number, verdict = "NEEDS_FIX", fingerprint?: s
 
 // ── L3: plateau ───────────────────────────────────────
 {
-  // Same count 3 cycles → escalate
+  // Same count 3 cycles → escalate. Assert the MESSAGE too: `reason` alone is
+  // produced by both L3 branches, so it cannot distinguish plateau from
+  // fingerprint-stall.
   const r = evaluateTermination([
     cycle(1, 4, "NEEDS_FIX", undefined, 2),
     cycle(2, 4, "NEEDS_FIX", undefined, 1),
     cycle(3, 4, "NEEDS_FIX", undefined, 1),
   ], 10);
   assert(r.shouldExit && r.reason === "L3-deadlock" && r.escalate, "L3: plateau 3 cycles → escalate");
+  assert(r.message.startsWith("Plateau"), "L3: plateau message names the plateau branch");
 }
 {
   // Same count but only 2 cycles → no trigger
@@ -70,13 +73,50 @@ function cycle(n: number, issues: number, verdict = "NEEDS_FIX", fingerprint?: s
   assert(r.shouldExit && r.reason === "L5-diminishing-returns", "L5: 0-issue cycles → diminishing returns");
 }
 {
-  // Fingerprint-stall: 3 identical fingerprints → escalate
+  // Fingerprint-stall — the canonical case: the SAME fingerprint across the
+  // window. `issuesFound` is deliberately NON-constant so `allSameCount` is
+  // false and the plateau branch CANNOT fire; the only path to L3-deadlock is
+  // the fingerprint branch. The message assertion pins that, and is what makes
+  // this test able to fail: delete the fingerprint block and it goes red.
   const r = evaluateTermination([
     cycle(1, 3, "NEEDS_FIX", "bugA", 1),
-    cycle(2, 3, "NEEDS_FIX", "bugA", 1),
-    cycle(3, 3, "NEEDS_FIX", "bugA", 1),
+    cycle(2, 5, "NEEDS_FIX", "bugA", 1),
+    cycle(3, 4, "NEEDS_FIX", "bugA", 1),
   ], 10);
-  assert(r.shouldExit && r.reason === "L3-deadlock", "L3: fingerprint-stall → escalate");
+  assert(r.shouldExit && r.reason === "L3-deadlock" && r.escalate, "L3: recurring fingerprint → escalate");
+  assert(r.message.startsWith("Fingerprint-stall"), "L3: fingerprint-stall message names the fingerprint branch");
+}
+{
+  // ⛔ Direction pin (the defect this replaced): mostly-DIFFERENT fingerprints
+  // are progress, not a stall. `allSameCount` is false here too, so nothing
+  // else can fire L3 — this cell is exactly what the inverted `uniqueness >=
+  // 0.8` predicate terminated a live loop on.
+  const r = evaluateTermination([
+    cycle(1, 3, "NEEDS_FIX", "bugA", 1),
+    cycle(2, 5, "NEEDS_FIX", "bugB", 1),
+    cycle(3, 4, "NEEDS_FIX", "bugC", 1),
+  ], 10);
+  assert(!r.shouldExit, "L3: novel fingerprints each cycle → continue (not a stall)");
+}
+{
+  // Boundary: one repeated transition out of two (1/2 = 0.5) is BELOW the
+  // threshold — the window must be substantially recurrent to fire.
+  const r = evaluateTermination([
+    cycle(1, 3, "NEEDS_FIX", "bugA", 1),
+    cycle(2, 5, "NEEDS_FIX", "bugA", 1),
+    cycle(3, 4, "NEEDS_FIX", "bugB", 1),
+  ], 10);
+  assert(!r.shouldExit, `L3: 1/2 recurrence (< ${STALL_THRESHOLD}) → continue`);
+}
+{
+  // Unpopulated fingerprints carry no signal → never fire the fingerprint branch.
+  // (Non-constant counts so plateau cannot stand in for it.)
+  const r = evaluateTermination([
+    cycle(1, 3, "NEEDS_FIX", undefined, 1),
+    cycle(2, 5, "NEEDS_FIX", undefined, 1),
+    cycle(3, 4, "NEEDS_FIX", undefined, 1),
+  ], 10);
+  assert(!r.shouldExit, "L3: absent fingerprints → no fingerprint-stall");
 }
 {
   // Fingerprints not populated → skip fingerprint check, plateau may catch it
