@@ -44,8 +44,8 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi }
-assert_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi }
-assert_not_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
+assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi }
+assert_not_contains() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
 exists() { if [ -e "$1" ]; then ok "$2"; else bad "$2 (missing: $1)"; fi }
 absent() { if [ -e "$1" ]; then bad "$2 (still present: $1)"; else ok "$2"; fi }
 is_link() { if [ -L "$1" ]; then ok "$2"; else bad "$2 (not a symlink: $1)"; fi }

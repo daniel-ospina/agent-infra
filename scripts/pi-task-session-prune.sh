@@ -135,7 +135,7 @@ is_session_dir_name() {
     case "$1" in
         *[!0-9a-fA-F-]*) return 1 ;;
     esac
-    printf '%s' "$1" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' <<<"$1"
 }
 
 # safe_child_dir <dir> — a legitimate per-child session dir: NOT a symlink,
@@ -270,8 +270,8 @@ run() {
         if [ "${TASK_SESSION_PRUNE_DRY_RUN:-1}" = "0" ]; then MODE=apply; else MODE=dry-run; fi
     fi
     case "$MODE" in dry-run|apply) ;; *) usage >&2; exit 2 ;; esac
-    printf '%s' "$MAX_AGE_DAYS" | grep -qE '^[0-9]+$' || { echo "bad TASK_SESSION_MAX_AGE_DAYS: $MAX_AGE_DAYS" >&2; exit 2; }
-    printf '%s' "$MAX_BYTES" | grep -qE '^[0-9]+$' || { echo "bad TASK_SESSION_MAX_BYTES: $MAX_BYTES" >&2; exit 2; }
+    grep -qE '^[0-9]+$' <<<"$MAX_AGE_DAYS" || { echo "bad TASK_SESSION_MAX_AGE_DAYS: $MAX_AGE_DAYS" >&2; exit 2; }
+    grep -qE '^[0-9]+$' <<<"$MAX_BYTES" || { echo "bad TASK_SESSION_MAX_BYTES: $MAX_BYTES" >&2; exit 2; }
 
     resolve_root
 
