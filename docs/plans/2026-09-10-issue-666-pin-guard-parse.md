@@ -643,16 +643,188 @@ for files it had never touched, and was told to "restore the line" it had never 
 merging would in fact have left the **base** branch's valid copies in place. Measured on its first
 real PR run (#785, two markdown lines, 11 commits behind): both the `ci.yml` accumulator and the
 `ci-main.yml` invocation line reported missing, neither of which that PR touched, and the check went
-green the moment the branch was updated. The leg now passes `pull_request.merge_commit_sha` — the ref
-whose tree would actually **land** — which is also the only ref where "the PR changed this file AND
-the base branch changed it since" exists at all. `merge_commit_sha` is null while a PR conflicts with
-its base, so the step fails closed with its **own** message ("this is NOT a finding about your
-workflow files") instead of reporting a spurious workflow finding. Pinned by the wiring test, which
-now reads `env.MERGE_SHA` and the `run` block as **parsed nodes** and asserts both the value and the
-presence of the null guard; both were verified non-vacuous by mutating the live workflow (env
-reverted to `head.sha` → RED; null guard removed → RED). The flag keeps its historical name
-`--head-ref`; its contract is now documented as "the ref whose tree would land", because renaming it
-touches ~70 references for no behavioural gain.
+green the moment the branch was updated. The leg now passes the **merge result** — the ref whose tree
+would actually **land** — which is also the only ref where "the PR changed this file AND the base
+branch changed it since" exists at all. When there is no merge commit the step fails closed with its
+**own** message ("this is NOT a finding about your workflow files") instead of reporting a spurious
+workflow finding. Pinned by the wiring test, which reads the step's `env` and `run` block as **parsed
+nodes** and asserts the resolution, the fail-closed guard, and that `--head-ref` receives the resolved
+value — verified non-vacuous by mutating the live workflow, one mutation per assertion, each RED.
+That list is ENUMERATED, not a guarantee: the #843 follow-ups below added four more revisions
+precisely because successive reviews kept constructing mutations the then-current revision did not
+catch. The flag keeps
+its historical name `--head-ref`; its contract is now documented as "the ref whose tree would land",
+because renaming it touches ~70 references for no behavioural gain.
+
+### #843 (follow-up, 2026-09-13) — the merge commit comes from the REST API, not the event payload
+
+#821 named the right subject but read it from the wrong place. `github.event.pull_request.merge_commit_sha`
+is **null in the event payload** until GitHub computes mergeability, and that computation is
+**asynchronous**. On the first RED run of the new code the field was empty (`merge_commit_sha` was
+present via the REST API, `mergeable` was `true`, and `refs/pull/<n>/merge` existed):
+
+```
+env:
+  MERGE_SHA:                       ← EMPTY
+  HEAD_SHA: d072f292581589d322729b5005bf16bee1d41689
+❌ pull_request.merge_commit_sha is EMPTY, so there is no merge result to validate.
+```
+
+So the fix for one false RED (stale branches) introduced a **more common** one — a race-dependent
+subset of *every* PR. Two corrections to this account, both found in review and both worth recording
+because the first draft got them wrong:
+
+- **It was a race, not a constant.** The first runs on #834's code were **green** with the field
+  populated (16:41Z, 16:43Z); the first RED was at 16:52Z, on a different PR's branch. That is what
+  makes it a race rather than a defect in one PR.
+- **#834's own PR says nothing about the field.** `pull_request_target` checks out the **default
+  branch**, so #834's PR was validated by main's *pre-#834* leg (which passed `--head-ref "$HEAD_SHA"`).
+  It never exercised the payload read at all. Claiming it "passed because the field was populated" was
+  wrong, and it is the same bootstrap effect now documented in the workflow header.
+
+The step now resolves the merge commit from `GET /repos/{owner}/{repo}/pulls/{number}`, re-adds the
+`pull-requests: read` scope that #675's review had removed as unused (correctly at the time — this
+change is what needs it), and keeps the fail-closed branch for a genuinely conflicted PR, where the
+API also returns nothing because no merge commit exists. The lesson, recorded because it is easy to
+repeat: the payload field and the REST API field of the same name are **not** interchangeable.
+
+### #843, second revision — the assertions were vacuous (cycle 1)
+
+The review of the first cut found that the wiring test could not distinguish the behaviour it claimed
+to protect. The step was selected with `s.run.includes("check-pi-pin-lockstep.mjs --head-ref")`
+against `step.run` — and a YAML **block scalar keeps its `#` lines**, so prose matched, and so did a
+**commented-out invocation**. Measured, before the fix: `# node scripts/check-pi-pin-lockstep.mjs
+--head-ref "$MERGE_SHA"` left the suite at `120 passed, 0 failed` while the trusted leg ran no checker
+at all. Likewise `--jq '.head.sha'` and the very plausible fallback `--jq '.merge_commit_sha //
+.head.sha'` were **green** while validating the PR head — silently reinstating the #821 false RED.
+Nine mutations were green in total (`|| true` making the API-failure branch dead code, an emptied
+branch body, an unreachable `-z` guard, and permission/`env` keys pinned by presence rather than
+value).
+
+### #843, third revision — the text checks were STILL vacuous (cycle 2)
+
+The second cut stripped comments and pinned exact lines, and closed all nine. The cycle-2 review then
+showed the class was not closed, only narrowed: **every assertion still reasoned about TEXT, and a
+`run:` body is data.** Eleven further mutations were GREEN, each one defeating the gate while the suite
+reported success:
+
+| mutation | effect with the suite GREEN |
+|---|---|
+| step `continue-on-error: true` | checker runs, checker fails, **job still succeeds** |
+| step `if: false` | step never runs |
+| job-level `if:` | job never runs |
+| `on.pull_request_target.paths-ignore: ['**']` | leg never triggers |
+| `runs-on:` an unroutable label | job never runs |
+| job-level `permissions: contents: write` | over-grant that the workflow-level assertion cannot see |
+| extra workflow scope (`id-token: write`) | over-grant invisible to two named-key checks |
+| invocation inside `: <<'NEVERRUN' …` | checker never runs, step exits 0 |
+| resolution+guards in an uncalled function | checker runs with an empty ref |
+| `set +e` + trailing `exit 0` | a failing checker becomes a passing step |
+| `trap 'exit 0' EXIT` | **every** `exit 1` in the step becomes success |
+
+The same review also caught **two false claims written by the author**, both now corrected in place:
+this document's own "every mutation that breaks the behaviour is RED" (a universal property a
+text-level test cannot have — replaced by the enumerated result below), and the workflow header's
+"this very fix's PR is RED here" (it was GREEN: `pull_request_target` runs main's *previous* copy, so
+the run says nothing about the new code either way — measured RED at 17:44Z and GREEN at 19:33Z on the
+same branch and the same old code, which is itself the best illustration of the race).
+
+The third revision adds (a) the structural properties text cannot express — the step must not set
+`continue-on-error` or `if:`, the job must not set `if:` or a job-level `permissions:`, `runs-on` must
+be pinned, the trigger must have no path filter, and the workflow-level permission KEY SET must be
+exactly `{contents, pull-requests}`; and (b) a **behavioural** test that EXECUTES the committed `run:`
+body with a stubbed `gh` (no network) and a stubbed `node` (so the invocation is observable), then
+asserts four scenarios: the resolved merge commit reaches `--head-ref`; a **failing checker fails the
+step**; an empty value fires the guard and does **not** invoke the checker; an API failure fails with
+its own message and does not borrow the conflict wording. Executing is the same approach used for
+`ci-main.yml`'s item 6b (#807/#828) and for the same reason: shell semantics cannot be modelled
+lexically.
+
+MEASURED RESULT (not a universal claim). Mutations verified RED, each with the suite failing:
+the 11 above plus re-adding the payload `MERGE_SHA`, `--head-ref "$HEAD_SHA"`, dropping the jq
+`// ""`, `// " "`, the `/pulls` list endpoint, either guard emptied or losing its `exit 1`, the `-z`
+guard inverted or moved above the assignment, the invocation moved above the guard, dropping
+`contents: read` or `pull-requests: read`, `contents: write`, `pull-requests: write`, dropping
+`GH_TOKEN` or `REPO`, and `PR_NUMBER -> github.run_id`. This is an enumerated list, not a proof: a
+text-and-execution test can still be defeated by something neither list anticipated, and the residual
+bounds are recorded rather than denied.
+
+### #843, fourth revision — the text pins and the execution were not tied together (cycle 3)
+
+The cycle-3 review found the sharpest defeat yet, and it reinstated the **exact** #821 regression:
+
+> a DECOY copy of the correct resolution block inside a heredoc (satisfying every text pin, never
+> executed) followed by a REAL call resolving `.head["sha"]` — **121 passed, 0 failed**, while the
+> leg validated the PR head.
+
+Two structural facts made that possible. The text pins were satisfied by *any* non-comment line, and
+the behavioural stub `gh` **ignored its argv**, so the only endpoint check was `ghArgv` matching
+`/\/pulls\//` — which any `/pulls/` URL satisfies. The two layers therefore proved different things
+about different lines. Bracketed `.head["sha"]` also evaded the `--jq[^\n]*head\.sha` regex.
+
+The same review found the STEP-level neutralizers that executing a *body* cannot see, all green:
+`shell: 'true {0}'` (GitHub runs `true <script>` — the step exits 0 and never runs the checker),
+`defaults.run.shell`, job-level `continue-on-error: true` (a failing job, a green run), a narrowed
+`types:` or a `branches:` filter (the leg never fires), `needs:` on a job that is skipped, and
+`container:`.
+
+These are fixed by (a) asserting the **actual** `gh` argv VERBATIM — exactly one call, resolving
+`merge_commit_sha` — which ties the text pins to what really executes and makes a decoy irrelevant
+because it never runs; and (b) asserting the structural neutralizers absent (no `shell:` on the step,
+no `defaults.run.shell` at job or workflow level, no job `continue-on-error`, no `needs`, no
+`container`, `types` pinned to the full four, no `paths`/`paths-ignore`/`branches`/`branches-ignore`).
+
+Two over-strictness fixes came from the same review, because a test that reds honest edits is also a
+defect: step selection is now tolerant of extra flags (the strict value assertion still fires, but
+with a message about the *value* rather than a confusing "no step found"), and the S3/S4 message
+greps were replaced by a **difference** assertion — an API failure and an empty merge commit must not
+produce interchangeable messages, which is the property that matters, without pinning prose that a
+copy-edit would red.
+
+MEASURED RESULT for this revision: the decoy+`.head["sha"]` bypass, `shell:`, `defaults.run.shell`, job
+`continue-on-error`, `types: [closed]`, `types: [labeled]`, `branches:`, `branches-ignore:`, `needs:`,
+`container:`, a commented-out invocation, a heredoc-wrapped invocation, `trap 'exit 0' EXIT`,
+`.head.sha`, and a job-level `permissions:` override are all RED. Three successive reviews each found
+defeatable assertions in the previous revision, which is the honest reason this document records what
+was TESTED rather than claiming the test cannot be defeated.
+
+### #843, fifth revision — the neutralizers moved OUTSIDE the step (cycle 4)
+
+The cycle-4 review found that all four prior revisions, and both layers of the test, had reasoned
+exclusively about the ONE selected step. Everything that could disable the leg from elsewhere was
+unguarded, and each of these left the suite at `121 passed, 0 failed`:
+
+- a **third step** — `run: printf 'process.exit(0)\n' > scripts/check-pi-pin-lockstep.mjs` in a
+  "Warm the checkout" step: the checker is a no-op forever after that lands;
+- a third step appending a shim dir to `$GITHUB_PATH`, or exporting `BASH_ENV` via `$GITHUB_ENV`
+  (bash SOURCES `$BASH_ENV` before the script, so `exit 0` in it ends the step);
+- **`actions/checkout`'s `uses:`/`with:`** — nothing constrained them, so
+  `ref: ${{ github.event.pull_request.head.sha }}` was GREEN here **and under actionlint**. That is the
+  pwn-request RCE vector this file's own header forbids, on the one file whose only guard is this test
+  (`workflow-lock.yml` is not content-locked);
+- `env:` at step, job, or workflow level — an extra key the three-value check cannot see;
+- a second, un-stubbed resolution channel *inside* the body: `git ls-remote origin
+  refs/pull/$PR_NUMBER/head` overriding `MERGE_SHA` after the pinned `gh` call. The rev-4 claim that the
+  argv assertion "ties the text pins to what really executes" was **false** — it bound one `gh` call,
+  not the value that reaches `--head-ref`.
+
+This revision adds the job's **step shape** (exactly `[checkout, validate]`), the checkout pin
+(`uses: actions/checkout@v4`, no `with:`), `env:` key sets at all three levels, and a shape **whitelist**
+on the executed body. That whitelist was itself defeated in cycle 5 (`echo ".*"` admits `$( )`), which
+is the same category error the file's header says was abandoned for the lock: a regex over a shell
+language. It is replaced by a **VALUE pin** — see the sixth revision.
+
+Two over-strictness cases found in the same review were relaxed, because a test that reds honest edits
+is also a defect: `types` is now compared as a SET (reordering is not a behaviour change), and
+`runs-on` accepts any pinned `ubuntu-*` label rather than exactly `ubuntu-latest`. The remaining
+strictness (the body whitelist, the exact invocation line, the exact guard spellings) is deliberate:
+this is a 26-line security-critical body, and an addition to it must be a conscious edit to the test.
+
+MEASURED RESULT for this revision: a third step overwriting the checker, a third step shimming
+`$GITHUB_PATH`, a third step exporting `BASH_ENV`, checkout `ref:` to the PR head, an unpinned checkout
+`uses:`, checkout `ref: github.head_ref`, `git ls-remote` overriding the resolved ref, rewriting the
+harness argv log, a second `gh` call, a step `env:` extra key, a job `env:`, and a workflow `env:` are
+all RED; reordered `types` and `runs-on: ubuntu-24.04` are GREEN (the relaxations work).
 
 ## Out of Scope
 
@@ -667,3 +839,47 @@ touches ~70 references for no behavioural gain.
 | Refreshing the now-stale "~4s of work" comment in `ci.yml` | blocked by design — `ci.yml` is a locked file; a comment edit would require an `--update-lock` commit of its own. Not part of the guard's contract |
 | Executing the committed command under `pull_request_target` | rejected on security grounds (RCE vector) and recorded as the reason item 6b is local-leg-only |
 | Walking symlinks **above** the repo root | deliberate; `/tmp` is a symlink on macOS, so walking to `/` would make every fixture RED |
+
+### #843, sixth revision — the body is pinned by VALUE, and the job set is pinned (cycle 5)
+
+The cycle-5 review found two more P0s and confirmed the pattern. The shape whitelist added in rev 5
+was defeated by one line that matched its own `^  echo ".*"$` rule:
+
+```
+echo "$(printf 'process.exit(0)\n' > scripts/check-pi-pin-lockstep.mjs)"
+```
+
+Measured end-to-end: the checker is overwritten, the pinned invocation then runs the no-op, and the
+step exits 0 with the suite at `121 passed, 0 failed`. Second, the pwn-request guard was a raw-text
+regex requiring an UNQUOTED `ref:` at line start and inspecting only `jobs.workflow-lock`, so a quoted
+`"ref":` on a checkout in a **second job** — arbitrary `run:` on the privileged `pull_request_target`
+trigger — was GREEN, and under actionlint too. Also found: `strategy.matrix` with an `exclude` covering
+every combination SKIPS the job (a skipped job cannot fail), and the step-level `continue-on-error`
+check used `=== false` against a YAML subset that does **not** type-resolve scalars, so an honest
+explicit `continue-on-error: false` parsed as the string `"false"` and false-RED (inconsistent with the
+job-level check, which already used `truthyFlag`).
+
+The sixth revision therefore stops describing the body by shape at all: the comment-stripped body is
+compared **by value** to `EXPECTED_LOCK_BODY`, the same technique as `EXPECTED_CI_MAIN_INVOCATION` and
+for the same reason. Any edit to what runs is RED and must be a deliberate edit to that constant.
+Alongside it: the job set is pinned to exactly `["workflow-lock"]`; every job's every step is walked
+structurally for `with.ref` and for any `uses` other than the pinned checkout; and `strategy` is
+asserted absent.
+
+MEASURED RESULT for this revision: a second job with a quoted `"ref":` to the PR head, a second job with
+a bare `run:`, a quoted `"ref":` on the single job's checkout, the `echo "$( )"` checker-overwrite, a
+`strategy.matrix` that excludes every combination, a third step overwriting the checker, `git ls-remote`
+overriding the resolved ref, and a second `gh` call are all RED. Step- and job-level
+`continue-on-error: false` are GREEN (the over-strictness fix), while `continue-on-error: true` stays
+RED.
+
+NOTE ON THE REVIEW BUDGET. The `code-review` skill has **no hard cycle cap** —
+`max_fix_cycles` was removed in favour of convergence gating, with a 10-cycle safety cap that escalates
+to a human rather than ending the loop (agent-infra#700 removed an earlier hard-coded 4 because it
+contradicted the convergence-gated skills). This PR used **five** cycles, which is inside that bound,
+with the fifth run as an explicitly-labelled closing review. It was not stopped early because cycles 3,
+4 and 5 each found the then-current validation defeatable — one of them a pwn-request vector — so
+treating any of those revisions as converged would have shipped a gate that reports green while doing
+nothing. A sixth, confirmation pass on the final revision then found a step-level `if:` had been dropped
+in the rev-6 rewrite; that is fixed here, and it is the concrete argument for re-reviewing a revision
+rather than trusting the fixes.

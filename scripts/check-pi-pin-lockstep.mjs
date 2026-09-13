@@ -198,8 +198,13 @@
  *
  * WHAT REF THE CALLER SHOULD PASS, AND WHY IT IS NOT THE HEAD (#821). The flag
  * name is historical; the contract is "the ref whose tree would LAND".
- * `workflow-lock.yml` passes `pull_request.merge_commit_sha` — the merge result —
- * and asserts that it does (see the wiring test). Validating `head.sha` instead
+ * `workflow-lock.yml` passes the PR's merge commit — resolved from the REST API,
+ * NOT from the event payload, whose `merge_commit_sha` is null until GitHub
+ * computes mergeability asynchronously (#843) — and asserts that it does (see the
+ * wiring test). Note the bound: the merge commit is a function of (head, base), so
+ * it is "what would land as of the event that triggered this run", not a standing
+ * guarantee — a base-branch move afterwards invalidates it until the next event.
+ * Validating `head.sha` instead
  * was a FALSE RED generator: the head is the pre-merge state, so any branch cut
  * before a guarded workflow changed carried the OLD files, failed assertions for
  * files it never touched, and was told to "restore the line" it had never
@@ -431,6 +436,50 @@ const STICKY_CHILD = process.env[STICKY_FIXTURE_ENV] !== undefined;
 
 // ── Constants used by the narrow guard ─────────────────────────────────────
 const isMap = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/**
+ * A block scalar KEEPS its `#` comment lines, so any assertion that greps a `run:`
+ * body for a substring is satisfiable by PROSE — including by a commented-out
+ * command. Measured in review: `# node scripts/check-pi-pin-lockstep.mjs --head-ref
+ * "$MERGE_SHA"` left this whole suite green while the trusted leg ran no checker at
+ * all. Assertions about what a step DOES must read a comment-stripped body.
+ */
+// BOUND: this is a heuristic, not shell modelling. It drops any line whose first
+// non-space character is `#`, which is correct for the current body but would diverge
+// from what the shell does if the body ever gained a MULTI-LINE quoted string whose
+// continuation line began with `#` (the shell would treat it as string content; this
+// would drop it). The body has no such string today. Note the split: the VALUE PIN and
+// the step SELECTION both use this function, so those two cannot disagree with each
+// other — but the behavioural test executes the RAW body, which follows the shell. In
+// that hypothetical the pin could therefore pin a body that differs from the one that
+// executes; today they are identical.
+const stripComments = (s) =>
+  String(s)
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .join("\n");
+
+/**
+ * The `workflow-lock` step that EXECUTES the checker, or `null`. Shared by the
+ * wiring test and the behavioural test so the two cannot drift apart.
+ */
+function workflowLockStep(doc) {
+  const steps = doc?.jobs?.["workflow-lock"]?.steps;
+  if (!Array.isArray(steps)) return null;
+  return (
+    steps.find(
+      (s) =>
+        typeof s.run === "string" &&
+        // Tolerant on purpose: extra flags must still SELECT the step, so the strict
+        // value assertion below can fail with a message about the VALUE rather than a
+        // confusing "no step found". What it does require is a NON-COMMENT line — a
+        // commented-out invocation must not select anything.
+        /^\s*node\s+scripts\/check-pi-pin-lockstep\.mjs\b[^\n]*--head-ref/m.test(
+          stripComments(s.run)
+        )
+    ) ?? null
+  );
+}
 const EXPECTED_USES = "daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main";
 // #675 P2-2 — a FAILURE ACCUMULATOR, not `&&` (see the header for why).
 const EXPECTED_TEST_COMMAND =
@@ -780,7 +829,11 @@ const REQUIRED_TESTS = Object.freeze([
   "the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)",
   "workflow coverage: an unclassified new workflow is RED (#675 P2-d)",
   "workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)",
-  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)",
+  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821, #843)",
+  // #843 cycle 2 — the wiring test above reasons about TEXT, and a `run:` body is
+  // data: it cannot tell an executing line from one in a heredoc, a never-called
+  // function, or a comment. This is the executing counterpart (#807 class).
+  "workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — the checker executes and its failure fails the step (#843 cycle 3, #807 class)",
   "a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)",
   "a symlinked locked workflow is RED from lockFindings (#675 P1-2)",
   "the lock CLI is RED for a symlinked locked workflow (#675 P1-2)",
@@ -841,8 +894,9 @@ const REQUIRED_TESTS = Object.freeze([
 // the pin-suite-only stub makes observable (a deleted failure guard, an `exit 0`
 // before the guard, and a guard inside a never-taken `case` arm), plus the pinned
 // stub-keyed bound. All four are in the roster above as well, so deleting one by
-// name is RED independently of this floor.)
-const MIN_EXPECTED_PASSING = 120;
+// name is RED independently of this floor. #843 cycle 3: 120 → 121 — the
+// behavioural workflow-lock test, also in the roster.)
+const MIN_EXPECTED_PASSING = 121;
 
 let finalized = false;
 function finalize() {
@@ -2132,7 +2186,35 @@ test("--update-lock on a symlinked locked file fails instead of printing an upda
 // #675 P2-g — the trusted leg is bootstrapped by the NEXT PR after it lands
 // (pull_request_target resolves from the default branch). Nothing writes
 // post-merge evidence, so this is the assertion that deleting/unwiring it is RED.
-test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)", () => {
+// The COMMITTED executed body, by VALUE — the same technique as
+// EXPECTED_CI_MAIN_INVOCATION, and for the same reason: every attempt to describe
+// this body by SHAPE failed. Five reviews produced a decoy block in a heredoc, a
+// git-based second resolution channel, a rewritten argv log, and finally a
+// shape-whitelist whose `echo ".*"` admitted
+//     echo "$(printf 'process.exit(0)\n' > scripts/check-pi-pin-lockstep.mjs)"
+// — measured: the checker overwritten, the step exiting 0, suite green. A frozen
+// value cannot be talked around: ANY change to what runs is RED, so an edit here
+// must be a deliberate edit to this constant.
+const EXPECTED_LOCK_BODY = [
+  "if ! MERGE_SHA=$(gh api \"repos/$REPO/pulls/$PR_NUMBER\" --jq '.merge_commit_sha // \"\"'); then",
+  "  echo \"❌ could not read PR #$PR_NUMBER from $REPO via the REST API.\"",
+  "  echo \"   That is an auth, scope or network failure — NOT a finding about your workflow\"",
+  "  echo \"   files. The step needs \\`pull-requests: read\\`. Re-run once the API is reachable.\"",
+  "  exit 1",
+  "fi",
+  "if [ -z \"$MERGE_SHA\" ]; then",
+  "  echo \"❌ no merge commit exists for this PR, so there is no merge result to validate.\"",
+  "  echo \"   The REST API returned an empty merge_commit_sha, which normally means the\"",
+  "  echo \"   PR conflicts with its base branch — GitHub computes no merge commit until\"",
+  "  echo \"   the conflicts are resolved. This is NOT a finding about your workflow files:\"",
+  "  echo \"   the job simply cannot see what would land. Resolve the conflicts or update\"",
+  "  echo \"   your branch and it re-runs. PR head, for reference only: $HEAD_SHA\"",
+  "  exit 1",
+  "fi",
+  "node scripts/check-pi-pin-lockstep.mjs --head-ref \"$MERGE_SHA\"",
+].join("\n");
+
+test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821, #843)", () => {
   const rel = ".github/workflows/workflow-lock.yml";
   const abs = path.join(REPO_ROOT, rel);
   assert.ok(fs.existsSync(abs), `${rel} must exist — it is the trusted structural leg`);
@@ -2143,35 +2225,362 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
     isMap(doc.on) && Object.hasOwn(doc.on, "pull_request_target"),
     `${rel} must still trigger on \`pull_request_target\` — that is the base-branch trigger`
   );
-  // #821 — THE VALIDATED REF MUST BE THE MERGE RESULT, NOT THE HEAD.
-  // The head is the pre-merge state. Validating it made every branch cut before a
-  // guarded workflow changed fail against files it never touched — and never will
-  // change, because merging leaves the BASE branch's copies in place. The merge
-  // result is also the only ref where "PR change + a base branch that changed the
-  // same file since" exists at all, which is the case that actually matters.
-  const steps = doc.jobs["workflow-lock"].steps;
-  const step = steps.find(
-    (s) => typeof s.run === "string" && s.run.includes("check-pi-pin-lockstep.mjs --head-ref")
+  const step = workflowLockStep(doc);
+  assert.ok(
+    step,
+    `${rel} must invoke the checker on a NON-COMMENT line. Whether that line EXECUTES is ` +
+      "answered behaviourally by the test below."
   );
-  assert.ok(step, `${rel} must still invoke the checker with --head-ref`);
+  const job = doc.jobs["workflow-lock"];
+
+  // ---- THE EXECUTED BODY, BY VALUE -------------------------------------------
   assert.equal(
-    step.env?.MERGE_SHA,
-    "${{ github.event.pull_request.merge_commit_sha }}",
-    `${rel} must validate \`pull_request.merge_commit_sha\` — the merge result is what lands (#821)`
+    stripComments(step.run).trimEnd(),
+    EXPECTED_LOCK_BODY,
+    `${rel}: the executed body must be EXACTLY EXPECTED_LOCK_BODY. This is a value pin, not a ` +
+      "shape check: shape checks over a shell language have been defeated in every review."
   );
-  assert.match(
-    String(step.run),
-    /-z "\$MERGE_SHA"/,
-    `${rel} must fail closed with its own message when \`merge_commit_sha\` is empty (a conflicted ` +
-      "PR has no merge result to validate — that must not be reported as a workflow finding)"
+
+  // ---- THE JOB SET ------------------------------------------------------------
+  // Only `jobs.workflow-lock` was ever inspected. A SECOND job runs arbitrary `run:`
+  // on the privileged `pull_request_target` trigger with nothing guarding it.
+  assert.deepEqual(
+    Object.keys(doc.jobs ?? {}),
+    ["workflow-lock"],
+    `${rel}: \`workflow-lock\` must be the ONLY job`
+  );
+
+  // ---- THE STEP SHAPE, AND THE PWN-REQUEST VECTOR ------------------------------
+  const steps = job.steps;
+  assert.equal(steps.length, 2, `${rel}: the job must be exactly [checkout, validate]`);
+  assert.equal(
+    steps[0].uses,
+    "actions/checkout@v4",
+    `${rel}: the checkout step must be pinned to \`actions/checkout@v4\``
+  );
+  assert.equal(
+    steps[0].with,
+    undefined,
+    `${rel}: the checkout must pass NO \`with:\` — a \`ref:\` here checks out PR content`
+  );
+  assert.equal(steps[1], step, `${rel}: the validating step must be the LAST step`);
+  // A STRUCTURAL walk, deliberately, not a text regex: the previous regex required an
+  // unquoted `ref:` at line start, so a quoted `"ref":` evaded it — and it never
+  // inspected any job but this one.
+  for (const [jobId, j] of Object.entries(doc.jobs ?? {})) {
+    for (const [idx, s] of (Array.isArray(j.steps) ? j.steps : []).entries()) {
+      assert.ok(
+        !Object.keys(s.with ?? {}).some((k) => k.toLowerCase() === "ref"),
+        `${rel}: ${jobId}.steps[${idx}] must not pass a \`ref\` to an action — on ` +
+          "`pull_request_target` that is the pwn-request vector this file's header forbids"
+      );
+      for (const [k, v] of Object.entries(s.with ?? {})) {
+        assert.ok(
+          !/github(\.event)?\.(head_ref|pull_request\.head)/.test(String(v)),
+          `${rel}: ${jobId}.steps[${idx}].with.${k} references the PR head`
+        );
+      }
+      assert.ok(
+        s.uses === undefined || s.uses === "actions/checkout@v4",
+        `${rel}: ${jobId}.steps[${idx}] must not use an unpinned action (${s.uses})`
+      );
+      // A step-level `if:` SKIPS the step, and a skipped step cannot fail. Do not
+      // lean on actionlint here: it rejects only CONSTANT conditions, so
+      // `if: github.event_name == 'push'` (always false on this trigger — it IS
+      // `pull_request_target`) passes actionlint and silently disables the gate.
+      assert.equal(
+        s.if,
+        undefined,
+        `${rel}: ${jobId}.steps[${idx}] must not be conditional (\`if:\`)`
+      );
+    }
+  }
+
+  // ---- EVERYTHING THAT CAN STOP THE JOB RUNNING, OR STOP IT FAILING -------------
+  assert.equal(job.if, undefined, `${rel}: the workflow-lock JOB must not be conditional (\`if:\`)`);
+  assert.equal(
+    truthyFlag(job, "continue-on-error"),
+    false,
+    `${rel}: \`jobs.workflow-lock.continue-on-error\` lets a FAILING job leave the run GREEN`
+  );
+  assert.equal(
+    truthyFlag(step, "continue-on-error"),
+    false,
+    `${rel}: the validating step must not set \`continue-on-error\` — that turns a failing ` +
+      "checker into a passing job. (Compared via truthyFlag, because the YAML subset does NOT " +
+      'type-resolve scalars: `false` parses as the STRING "false".)'
+  );
+  assert.equal(
+    job.needs,
+    undefined,
+    `${rel}: the job must have no \`needs\` — a skipped job cannot fail the run`
+  );
+  assert.equal(
+    job.strategy,
+    undefined,
+    `${rel}: a \`strategy.matrix\` whose \`exclude\` covers every combination SKIPS the job, ` +
+      "and a skipped job cannot fail a run"
   );
   assert.ok(
-    isMap(doc.permissions) && Object.hasOwn(doc.permissions, "contents"),
+    typeof job["runs-on"] === "string" && job["runs-on"].startsWith("ubuntu-"),
+    `${rel}: the job must run on a pinned ubuntu runner label`
+  );
+  assert.equal(job.container, undefined, `${rel}: the job must not declare a \`container:\``);
+  assert.equal(
+    step.shell,
+    undefined,
+    `${rel}: the step must not override \`shell:\` — that changes what the body even means`
+  );
+  for (const [label, val] of [
+    ["jobs.workflow-lock.defaults", job.defaults],
+    ["`defaults`", doc.defaults],
+  ]) {
+    assert.ok(
+      val === undefined || (isMap(val) && Object.keys(val).length === 0),
+      `${rel}: ${label} must not set \`run.shell\``
+    );
+  }
+
+  // ---- PERMISSIONS -------------------------------------------------------------
+  assert.equal(
+    isMap(doc.permissions) ? doc.permissions.contents : undefined,
+    "read",
     `${rel} must grant \`contents: read\``
   );
+  assert.equal(
+    isMap(doc.permissions) ? doc.permissions["pull-requests"] : undefined,
+    "read",
+    `${rel} must grant \`pull-requests: read\` — the merge commit is resolved from the ` +
+      "pulls API (#843); without it that call 403s and the leg reds"
+  );
+  assert.deepEqual(
+    Object.keys(doc.permissions ?? {}).sort(),
+    ["contents", "pull-requests"],
+    `${rel} must grant EXACTLY these two scopes at workflow level — an extra one is an ` +
+      "over-grant that checking two named keys cannot see"
+  );
+  assert.equal(
+    job.permissions,
+    undefined,
+    `${rel}: \`jobs.workflow-lock.permissions\` overrides the workflow-level block`
+  );
+
+  // ---- ENV AT EVERY LEVEL -------------------------------------------------------
+  assert.equal(
+    step.env?.PR_NUMBER,
+    "${{ github.event.pull_request.number }}",
+    `${rel} must pass the PR number so the merge commit can be resolved from the API (#843)`
+  );
+  assert.equal(step.env?.REPO, "${{ github.repository }}", `${rel} must pass the repo slug (#843)`);
+  assert.equal(step.env?.GH_TOKEN, "${{ github.token }}", `${rel} must pass GH_TOKEN (#843)`);
+  assert.deepEqual(
+    Object.keys(step.env ?? {}).sort(),
+    ["GH_TOKEN", "HEAD_SHA", "PR_NUMBER", "REPO"],
+    `${rel}: the step's \`env\` must contain EXACTLY these keys`
+  );
   assert.ok(
-    !Object.hasOwn(doc.permissions, "pull-requests"),
-    `${rel} must not grant the unused \`pull-requests: read\` scope (#675 P2-h)`
+    !Object.hasOwn(step.env ?? {}, "MERGE_SHA"),
+    `${rel} must NOT read \`merge_commit_sha\` from the event payload — it is null until ` +
+      "mergeability is computed, so every PR races it (#843)"
+  );
+  assert.equal(job.env, undefined, `${rel}: the job must not set \`env:\``);
+  assert.equal(doc.env, undefined, `${rel}: the workflow must not set \`env:\``);
+
+  // ---- THE TRIGGER -------------------------------------------------------------
+  const onTarget = isMap(doc.on?.pull_request_target) ? doc.on.pull_request_target : {};
+  assert.deepEqual(
+    Array.isArray(onTarget.types) ? [...onTarget.types].sort() : onTarget.types,
+    ["edited", "opened", "reopened", "synchronize"],
+    `${rel}: the trigger's event \`types\` must be pinned to the full set`
+  );
+  for (const k of ["paths", "paths-ignore", "branches", "branches-ignore"]) {
+    assert.ok(
+      !Object.hasOwn(onTarget, k),
+      `${rel}: an \`on.pull_request_target\` \`${k}\` filter can stop this leg from triggering`
+    );
+  }
+});
+
+/** Timeout for each behavioural spawn of the workflow-lock step. */
+const LOCKPOINT_TIMEOUT_MS = 30_000;
+/** The merge commit the stubbed `gh` reports. Distinctive, so a match means a match. */
+const LOCKPOINT_SHA = "0123456789abcdef0123456789abcdef01234567";
+
+/**
+ * The behavioural counterpart of the wiring test: run the COMMITTED `run:` body
+ * with a stubbed `gh` (so nothing touches the network) and a stubbed `node` (so the
+ * checker invocation is observable), and report what actually executed.
+ */
+function runWorkflowLockStep(body, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? LOCKPOINT_TIMEOUT_MS;
+  const ghMode = opts.ghMode ?? "ok";
+  const nodeStatus = opts.nodeStatus ?? 0;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pin-wlock-"));
+  try {
+    const stubDir = path.join(dir, "stub");
+    fs.mkdirSync(stubDir);
+    const gh = path.join(stubDir, "gh");
+    fs.writeFileSync(
+      gh,
+      [
+        "#!/bin/bash",
+        `printf '%s\\n' "$*" >> "${dir}/gh-argv.txt"`,
+        `case "${ghMode}" in`,
+        "  fail) exit 1 ;;",
+        "  empty) exit 0 ;;",
+        `  *) printf '%s\\n' "${opts.sha ?? LOCKPOINT_SHA}"; exit 0 ;;`,
+        "esac",
+        "",
+      ].join("\n")
+    );
+    fs.chmodSync(gh, 0o755);
+    const node = path.join(stubDir, "node");
+    fs.writeFileSync(
+      node,
+      [
+        "#!/bin/bash",
+        `printf '%s\\n' "$*" >> "${dir}/node-argv.txt"`,
+        `exit ${nodeStatus}`,
+        "",
+      ].join("\n")
+    );
+    fs.chmodSync(node, 0o755);
+    const script = path.join(dir, "step.sh");
+    fs.writeFileSync(script, body.endsWith("\n") ? body : `${body}\n`);
+    const res = spawnSync(BASH_ABS, ["-e", script], {
+      cwd: dir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${stubDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        GH_TOKEN: "stub",
+        REPO: "stub/stub",
+        PR_NUMBER: "1",
+        HEAD_SHA: "stub-head",
+      },
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: timeoutMs,
+    });
+    const read = (f) => (fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim() : "");
+    return {
+      status: res.status,
+      signal: res.signal ?? null,
+      error: res.error ?? null,
+      output: `${res.stdout ?? ""}${res.stderr ?? ""}`,
+      ghArgv: read(path.join(dir, "gh-argv.txt")),
+      nodeArgv: read(path.join(dir, "node-argv.txt")),
+    };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * THE ASSERTION THE TEXT CHECKS CANNOT MAKE. Every assertion in the wiring test
+ * reasons about what the step SAYS; a `run:` body is data, so text cannot tell an
+ * executing line from one inside a heredoc, a never-called function, or a comment.
+ * Measured in review, all GREEN before this test existed: the invocation inside
+ * `: <<'NEVERRUN' … NEVERRUN`; inside a function never called; `set +e` plus a
+ * trailing `exit 0`; and `trap 'exit 0' EXIT` (which converts EVERY `exit 1` in the
+ * step into success). This test EXECUTES the committed body with stubs and asserts
+ * what ran and what the composite exit status was — the same proven approach as
+ * item 6b for `ci-main.yml` (#807/#828), chosen there for the same reason: shell
+ * semantics cannot be modelled lexically.
+ */
+test("workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — the checker executes and its failure fails the step (#843 cycle 3, #807 class)", () => {
+  const rel = ".github/workflows/workflow-lock.yml";
+  const doc = parseWorkflowYaml(fs.readFileSync(path.join(REPO_ROOT, rel), "utf8"));
+  const step = workflowLockStep(doc);
+  assert.ok(step, `${rel} must execute the checker on a non-comment line`);
+  const body = String(step.run);
+  // The exact argv the stubbed `gh` must receive. `$*` re-joins with spaces, so the
+  // shell's quoting is gone: this is the RESOLVED argv, which is what makes the
+  // behavioural scenarios and the text pins agree on the same single call.
+  const EXPECTED_GH_ARGV = `api repos/stub/stub/pulls/1 --jq .merge_commit_sha // ""`;
+  const spawn = (opts) => {
+    const r = runWorkflowLockStep(body, opts);
+    assert.equal(
+      r.error,
+      null,
+      `${rel}: the committed run block could not be spawned: ${r.error?.message}`
+    );
+    return r;
+  };
+
+  // S1 — the RESOLVED merge commit reaches the checker. A BODY that runs no checker
+  // (commented out, inside a heredoc, inside a function never called) cannot satisfy
+  // this: `node` never runs. The neutralizers that are NOT in the body — `shell:`,
+  // step or job `continue-on-error`, `if:`, `needs:`, the trigger filters, a THIRD
+  // step, the checkout's `uses`/`with:`, `env:` at any level — are asserted
+  // structurally in the wiring test, because executing a body cannot see them. The
+  // split is stated explicitly so neither layer is assumed to cover the other's
+  // classes; the FROZEN-BODY value pin in the wiring test is what bounds THIS layer.
+  const ok = spawn({ nodeStatus: 0 });
+  assert.equal(ok.status, 0, `${rel}: must exit 0 when the checker passes.\n${tail(ok.output)}`);
+  // EXACTLY ONE call, with EXACTLY this argv. This is the assertion that ties the
+  // text pins to reality: a decoy copy of the correct block inside a heredoc
+  // satisfies every text pin and never executes, so it cannot appear here — and a
+  // real call resolving `.head["sha"]` (note: brackets, which the text-level
+  // `head\.sha` regex does not match) resolves to a DIFFERENT argv and is RED here.
+  assert.equal(
+    ok.ghArgv,
+    EXPECTED_GH_ARGV,
+    `${rel}: must make exactly one pull-requests call, resolving merge_commit_sha — nothing ` +
+      "about the text of the step proves the call that actually runs is the pinned one"
+  );
+  assert.equal(
+    ok.nodeArgv,
+    `scripts/check-pi-pin-lockstep.mjs --head-ref ${LOCKPOINT_SHA}`,
+    `${rel}: must invoke the checker with the RESOLVED merge commit, exactly — nothing about ` +
+      "the TEXT of the step proves it runs"
+  );
+
+  // S2 — a failing checker must fail the step. `set +e`, a trailing `exit 0`,
+  // `trap 'exit 0' EXIT`, or `|| true` around the invocation all leave the text
+  // looking perfect while the gate stops being one.
+  const failed = spawn({ nodeStatus: 1 });
+  assert.notEqual(
+    failed.status,
+    0,
+    `${rel}: a FAILING checker must fail the step — that is the entire gate.\n${tail(failed.output)}`
+  );
+
+  // S3 — no merge commit: the guard fires with its own message and the checker is
+  // NOT invoked. This is also what pins the invocation AFTER the guard.
+  const empty = spawn({ ghMode: "empty" });
+  assert.notEqual(empty.status, 0, `${rel}: an empty merge_commit_sha must fail closed`);
+  assert.equal(
+    empty.nodeArgv,
+    "",
+    `${rel}: the checker must not run when there is no merge commit to validate`
+  );
+  assert.equal(
+    empty.ghArgv,
+    EXPECTED_GH_ARGV,
+    `${rel}: the empty case must still make the resolution call, and only that call`
+  );
+  assert.ok(
+    empty.output.trim() !== "",
+    `${rel}: the empty case must say WHY it failed — a silent non-zero exit is not a diagnosis`
+  );
+
+  // S4 — an API failure MUST be distinguishable from an empty merge commit. Asserted
+  // as DIFFERENCE rather than by grepping the wording: the property that matters is
+  // that the two causes are not interchangeable (if they were, a 403 is being
+  // reported as a PR conflict), and pinning prose would red an honest copy-edit.
+  const apiFail = spawn({ ghMode: "fail" });
+  assert.notEqual(apiFail.status, 0, `${rel}: a failed API call must fail closed`);
+  assert.equal(apiFail.nodeArgv, "", `${rel}: the checker must not run when the API call failed`);
+  assert.equal(
+    apiFail.ghArgv,
+    EXPECTED_GH_ARGV,
+    `${rel}: a failed API call must still be the pinned resolution call`
+  );
+  assert.notEqual(
+    apiFail.output,
+    empty.output,
+    `${rel}: an API failure and an empty merge_commit_sha must produce DIFFERENT messages — if ` +
+      "they are interchangeable, a 403/network failure is being reported as a PR conflict"
   );
 });
 
