@@ -69,7 +69,7 @@ Six parallel read-only verification passes were run **before** decomposition. Th
 
 | # | Original claim | Verified reality | Disposition |
 |---|---|---|---|
-| **C1** | "`tools/collision_preflight.py` does not exist; a whole session was wasted because the check was imaginary" | **FALSE.** `scripts/parallel_work_check.sh` (10.9 KB, `+x`) and `parallel_work_check.py` (53.5 KB) exist and are exactly what `issue-scoping:106,118` and `issue-workflow:107` invoke. The *filename* in #878 is wrong. | **Close #878 as invalid.** Do not "delete a missing gate." |
+| **C1** | "`tools/collision_preflight.py` does not exist; a whole session was wasted because the check was imaginary" | **FALSE PREMISE.** A repo-wide search returns **zero** references to `collision_preflight` in agent-infra (the file exists in **tortoise**, 42 KB). The current skills mandate `scripts/parallel_work_check.sh start` (`issue-scoping:106`, `executing-plans:19`). **But the gap the issue points at is real** — see below. | **Retain #878, narrowed.** Do not close it. |
 | **C2** | "Gate scripts were never ported — pipeline gates silently no-op" (#100) | **STALE.** `scripts/_research_path.sh` (107 L, `+x`), `scripts/validate-script.cjs` (351 L), `scripts/cron-quality-gates.sh` (367 L, `+x`) all exist and are wired. | **Close #100.** Already fixed. |
 | **C3** | "The VGATE docs exemption requires a bare `git commit`, but AGENTS.md mandates `git commit -F <file>`, so following the rule disables the exemption" (#908) | **MISDIAGNOSED.** Measured against the real `isBareCommitShape` on HEAD: `git commit -F /tmp/m.md` → **bare (exempt)**. AGENTS.md's full literal `${TMPDIR…}` command → **bare (exempt)**. The **actual** blocked command (session archive `2026-09-10T18-48-17-978Z`, line 2699) was `… && git commit -F /tmp/commit-msg-…md 2>&1 \| tail -20`. Cause: `isRedirectToken` is applied at `verification-gate/index.ts:1205` and `:2148` but **not** in `isBareCommitShape` (`:1326-1368`), so `2>&1` is parsed as a **pathspec**. | **Fix is a one-line `continue` on redirect tokens.** `-F` was never the problem. |
 | **C4** | "There is no measurement of whether any gate catches anything useful" | **PARTLY WRONG.** Run-rate and block-rate are measured (§2.1). Missing: **correctness** (Q3) and **time** (Q4). No correlation id joins `gate-events.jsonl` to `audit.jsonl`, so latency cannot even be inferred. | **Narrow the item** to correctness + duration + a reader. |
@@ -106,9 +106,18 @@ These were surfaced only by the verification passes.
 
 Ranked by **time freed per unit of quality risk**. W1–W3 are near-free.
 
-### W1 — Close the false and stale gate claims
-Close **#878** (premise false — tool exists), **#100** (stale — scripts exist and are wired), **#894** (already fixed in `c88d0d7`). No code change.
-**Risk: none.** **Effort: trivial.** Reduces the issue backlog without touching behaviour.
+### W1 — Close the stale gate claims (and fix the one real gap)
+Close **#100** (stale — scripts exist and are wired) and **#894** (already fixed in `c88d0d7`). No code change.
+
+**Retain #878.** Its premise is wrong (`collision_preflight` does not exist in agent-infra) but its instinct is right, and the pre-flight does have a genuine hole — verified in `scripts/parallel_work_check.py`:
+
+1. The duplicate search is **closed-issues only** — `repo:<slug> is:issue state:closed in:title,body <symbol>` (`:318-320`). It answers *"was this already fixed and closed?"*, never *"is this already open?"*
+2. It is **gated on `--symbol` / `PARALLEL_CHECK_SYMBOL`** (`:1034`); with no symbol, the block does not execute at all.
+3. The no-board skip is **not** a factor — `:739-742` retains the search: *"fetch/guard/dup-search above are retained and still fail closed."* Only the board scan is skipped.
+
+**Minimal fix, no new gate:** add an open-issue search to the existing C1 path and run it even without a symbol. The three duplicates filed in this epic's own decomposition were all **open** issues, so they were outside C1's question by design.
+
+**Risk: none.** **Effort: trivial.**
 
 ### W2 — Fix the confirmed fail-open paths
 `verification-gate`: make registration failure **abort** rather than register nothing (N1); un-swallow the bridge write (N3); add an outer cap to the auto-bypass (N4). `main-worktree-guard`: make the import failure fail **closed**, and make `isWorktreeCwd` (bash) match `isWorktreeCwdWrite` (write) (N2).
@@ -205,7 +214,7 @@ Every incident currently adds a rule; nothing removes one — that is the mechan
 
 | Workstream | Issue | Depends on | Risk | Effort |
 |---|---|---|---|---|
-| W1 close false/stale claims + W6 delete inline-review rule | **#919** (narrowed: W9 + W12 dropped) | — | none | very low |
+| W1 close stale claims (#100, #894) + W6 delete inline-review rule | **#919** (narrowed: W9 + W12 dropped) | — | none | very low |
 | W2 fix fail-open paths | **#920** (narrowed: N1 + N3 only) | — | none | low–medium |
 | W3 delete 2 strict subsets + W4 one design gate (17 conserved checks) | **#921** | #919 | medium | medium |
 | W5 4 reviewers in code-review | **#922** | — | medium | low |
@@ -251,7 +260,9 @@ The quality control that would have been provided by the 7 loops is replaced by 
 **Two findings from this.**
 
 1. **The irony is the lesson.** The epic's first correction is that #878's premise was false — the collision pre-flight *does* exist. The decomposition then skipped it. The mandated check is `scripts/parallel_work_check.sh start` (C1, "closed-issue DUP_FIX search"), required by `issue-scoping` before any scoping. It was not run, and no manual search replaced it.
-2. **A new verified defect.** When the sanctioned check *was* finally run it returned `C1: CLEAR  no-board-skip: no board session — board scan skipped`. **The duplicate search short-circuits when there is no board session** — so in a no-board repo (this one) the C1 dedup search does not run at all. The dedup protection is absent in exactly the environment where the epic is executed. Added to #925's scope.
+2. **Two verified defects, one retraction.** (a) The dedup gap is real but not where I first said: C1's duplicate search is **closed-issues only** and **gated on `--symbol`** — it never asks whether an issue is already **open**. (b) **My earlier claim that the search short-circuits without a board was FALSE and is retracted.** Reading `parallel_work_check.py:739-742`: *"fetch/guard/dup-search above are retained and still fail closed"* — only the board scan is skipped. I over-read the `no-board-skip` verdict string instead of reading the code. The finding lands on **#878**, retained and narrowed — **no new gate, no new issue**.
+
+   This was the **third** claim corrected today, all three from the same error: reasoning from an issue title or a status string instead of the source. That is the epic's own methodological finding, demonstrated three times by the agent writing it.
 
 **W12 now has a worked example: this decomposition.** Filing without a dedup pass is precisely the "unbounded issue emission" #903 and #906 describe — and the check that should have caught it is a silent no-op.
 
