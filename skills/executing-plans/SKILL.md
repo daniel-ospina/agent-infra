@@ -647,10 +647,17 @@ The `commit` step (Step 6 handoff) is a `human_approval` gate in this skill's fr
 
 ### Approval Routing
 
-When a gate fires, the agent MUST invoke the approval router to surface the request:
+> **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
+> Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session
+> without loading the framework skill first. Only the operational core is inlined; the status table,
+> store/transport contract, and Slack enablement live canonically (restating them is how the original
+> six copies drifted apart).
+
+When a gate fires — including this skill's `commit` handoff gate and the "When to Stop and Ask"
+checkpoints — the agent MUST invoke the approval router to surface the request:
 
 ```bash
-# Portable invocation (works from ANY repo checkout — #1402 rollout):
+# Portable invocation (works from ANY repo checkout — swarm #1402 rollout):
 python3 -c "
 import os, sys
 sys.path.insert(0, os.environ.get('SWARM_ROOT', os.path.expanduser('~/swarm')))
@@ -660,21 +667,43 @@ print('Approval request created')
 "
 ```
 
-Routine gates do NOT pop a human dialog: with `requires_human=False` (the default) the request routes through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human), so the reviewer is the requester's `reports_to` role (a pi role — e.g. product-strategist for product-implementer). The request is logged to the per-repo store `~/.swarm/approvals/<repo>.json` and that role approves via `review_approval()`. Do NOT set `APPROVAL_NO_NOTIFY=0` — it overrides the daemon kill-switch.
+⚠️ **This excerpt passes `requires_human=False`**, so under the default config
+(`APPROVAL_AUTO_APPROVE` unset, which means `1`) the request **auto-approves to `policy:auto` and
+touches no human** — it does *not* route through the VSM hierarchy. Hierarchy routing happens only
+with `APPROVAL_AUTO_APPROVE=0`; a genuine human checkpoint needs `requires_human=True`.
 
-Use `requires_human=True` for genuine human gates (epics, P0): that routes to 'human'. **Human gates are NEVER rate-limited and NEVER auto-approved** (#1402). With Slack forwarding configured (SLACK_BOT_TOKEN + SLACK_APPROVAL_CHANNEL in `~/.swarm.env`), the request is posted to Slack by the slack-bridge — the human answers there. Without Slack, the request is logged to the per-repo store `~/.swarm/approvals/<repo>.json` and an osascript notification fires (suppressed by `APPROVAL_NO_NOTIFY=1`).
+⛔ **No dialog pops — do not wait for one.** A `pending` request fires a macOS *notification banner*
+(`osascript … display notification`), which has no buttons and no answer path; it is best-effort and
+silently no-ops on non-macOS/CI/SSH. Reaching a human on Slack needs more than `SLACK_BOT_TOKEN` +
+`SLACK_APPROVAL_CHANNEL`: the bridge derives a **different** store slug than the router, so
+`SLACK_APPROVAL_FILE` must be pinned to the router's store (agent-infra #956) or the request just
+waits in `~/.swarm/approvals/<slug>.json`.
 
-**Conversation protocol (#1402) — approvals are a back-and-forth, not a one-shot:**
-1. After `request_approval(...)`, monitor feedback: `python3 -c "from operations.coordination.approval import approval_feedback; print(approval_feedback('<req_id>'))"` — human replies in the Slack thread are mirrored into `approvals.json` (`thread` entries) by the slack-bridge within ~5s.
-2. If the human asks a question or gives feedback, **answer it** — post your response as a follow-up request in the SAME thread:
-   ```python
-   request_approval('product-implementer', artifact='<same-artifact>',
-                    context='RE: <original_req_id> — <your answer to the human>',
-                    requires_human=True, parent='<original_req_id>')
-   ```
-   The slack-bridge posts follow-ups with `parent` into the parent's Slack thread, so the human sees your answer in context.
-3. Continue monitoring until the request resolves: `pending_approvals('human')` shrinks when the human accepts/rejects (Socket Mode buttons or `review_approval()`).
-4. **Approved** → proceed with the gate. **Denied/feedback** → revise per the feedback and re-request (new request, same thread via `parent`). Never silently proceed past a denied gate, and never spam: a NEW request per revision is correct — dedupe only collapses identical pending requests.
+**Detect the answer — read the record, never infer from a shrinking list:**
+```bash
+SWARM="${SWARM_ROOT:-$HOME/swarm}/operations/coordination/approval.py"
+python3 "$SWARM" --pending --role human    # still open
+python3 "$SWARM" --status <req_id>         # this record's status + reviewer
+```
+A Slack thread reply sets `changes_requested`, which leaves `--pending` **without approving**;
+`is_approved(..., requires_human=True)` also returns `False` after a Slack *button* approval (the
+bridge overwrites `reviewer` with the clicking user's id — agent-infra #959). Trust `status == 'approved'`.
+
+**Role-based escalation:** with `APPROVAL_AUTO_APPROVE=0`, omitting `requires_human=True` pends for
+the requester's `reports_to` role — e.g. `product-strategist` for `product-implementer`; only
+`chain[1]` is used, so nothing walks the chain further. Under the default (`APPROVAL_AUTO_APPROVE`
+unset, which means `1`) such a request **auto-approves** and never reaches a human — **unless** an
+escalation keyword (`deploy`/`delete`/`destroy`/`migrate`/`release`) appears in the artifact/context,
+which pends for a human regardless. `requires_human=True`
+is for genuine human gates (epics, P0) — those are never auto-approved. **Never silently proceed
+past a denied gate**, and never spam: a new request per revision is correct. Dedupe collapses
+identical `pending` requests **and** identical `policy:auto` re-fires (so respawns do not grow the
+store); human-reviewed records never dedupe.
+
+⚠️ **The former 4-step Slack conversation protocol was removed from this skill**: it called
+`approval_feedback()` and `request_approval(..., parent=…)`, neither of which exists in the current
+router (`SWARM_ROOT`) — `approval_feedback` is not importable there (an `from … import` raises
+`ImportError`) and `parent=` raises `TypeError`. See the canonical block and agent-infra #958.
 
 ## When to Stop and Ask
 
