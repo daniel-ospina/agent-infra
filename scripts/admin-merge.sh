@@ -13,7 +13,8 @@
 # that carries no head-bound evidence comment — so the bypass is safe or it does
 # not happen.
 #
-#   pr-fails.txt   ← scripts/ci-failure-set.sh --pr <N>
+#   pr-fails.txt   ← scripts/ci-failure-set.sh --commit <head>   # the head SHA,
+#                    the exact revision the evidence marker binds to
 #   main-fails.txt ← scripts/ci-failure-set.sh --main-union N
 #   unique         ← scripts/ci-failure-set.sh --diff pr-fails.txt main-fails.txt
 #   unique EMPTY            → post head-bound evidence, then merge
@@ -23,12 +24,14 @@
 #                             BLOCK, print the list, exit non-zero, NO merge.
 #
 # TWO PRECONDITIONS THE FAILING SETS ALONE CANNOT EXPRESS:
-#   1. THE HEAD MUST HAVE BEEN TESTED. The lane must have at least one COMPLETED
-#      run for this head, and none still running. A queued run yields an EMPTY
-#      failing set — indistinguishable from "green" — so without this gate the
+#   1. THE HEAD MUST HAVE BEEN TESTED. The lane must have at least one TESTED run
+#      for this head (a run that finished `success`, `failure` or `timed_out`) and
+#      none still running. A queued run — or a run that finished `cancelled`,
+#      `skipped` or `startup_failure`, none of which exercises the code — yields an
+#      EMPTY failing set, indistinguishable from "green". Without this gate the
 #      rail certifies nothing and merges before CI finishes, and the fresh
 #      failure lands after the merge. That is the #3420 ratchet this rail exists
-#      to stop (review P0 #3).
+#      to stop (review P0 #3; `tested` rather than `completed`: review P1, cycle 2).
 #   2. THE HEAD MUST NOT MOVE. The marker binds ONE SHA. The head is re-resolved
 #      immediately before the comment and again by GitHub via
 #      `--match-head-commit`, so a rebase inside the window cannot land an
@@ -52,7 +55,11 @@
 #   --any-workflow       drop the lane filter (opt-out; re-opens the bogus zero)
 #   --no-rerun           skip the flake re-run classification (a non-empty
 #                        unique set then blocks immediately)
-#   --dry-run            compute + print the decision, post nothing, merge nothing
+#   --dry-run            compute + print the decision; mutates nothing at all —
+#                        no CI re-run, no comment, no merge. On the flake path it
+#                        reports and exits 0 (it is an inspection, not a verdict;
+#                        a real run would re-run and re-classify). Add --no-rerun
+#                        to get the no-reclassification verdict as the exit code.
 #   --repo owner/repo    repo for the gh calls
 #   Extra flags (`--squash`, `--merge`, `--rebase`, `--delete-branch`, `--auto`,
 #   …) are passed through to `gh pr merge` rather than hardcoded. `--admin` is
@@ -70,7 +77,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 
-usage() { sed -n '1,50p' "$0" | sed -n 's/^# \{0,1\}//p'; }
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
 info() { printf '%s\n' "$*"; }
 
@@ -101,7 +108,8 @@ run_failure_set() {
 wait_for_run() {
   local run_id="$1" waited=0 status
   while [ "$waited" -lt "$RERUN_TIMEOUT" ]; do
-    status="$($GH run view "$run_id" --json status --jq .status 2>/dev/null || echo unknown)"
+    # shellcheck disable=SC2086
+    status="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} --json status --jq .status 2>/dev/null || echo unknown)"
     [ "$status" = "completed" ] && return 0
     sleep "$POLL_INTERVAL"
     waited=$((waited + POLL_INTERVAL))
@@ -193,11 +201,12 @@ main() {
 
   # ── 1b. THE HEAD MUST HAVE BEEN TESTED (review P0 #3) ────────────────────
   # `examined=0` is NOT the signal — a green lane legitimately has no failing
-  # runs. The signal is `completed=0` (nothing ever finished) or `pending>0`
-  # (something has not). Either way an empty failing set proves nothing, so the
-  # rail must not read it as "no unique failures".
-  local pr_completed pr_pending
+  # runs. The signal is `tested=0` (no run actually exercised this revision) or
+  # `pending>0` (something has not finished). Either way an empty failing set
+  # proves nothing, so the rail must not read it as "no unique failures".
+  local pr_completed pr_tested pr_pending
   pr_completed="$(report_value "$TMP/pr-report.txt" completed)"
+  pr_tested="$(report_value "$TMP/pr-report.txt" tested)"
   pr_pending="$(report_value "$TMP/pr-report.txt" pending)"
   if [ "${pr_pending:-0}" -gt 0 ]; then
     say_err "admin-merge: ✗ BLOCK — the test lane has NOT finished for head $head:"
@@ -206,13 +215,18 @@ main() {
     say_err "   Wait for CI to complete, then re-run the rail."
     exit 1
   fi
-  if [ "${pr_completed:-0}" -eq 0 ]; then
-    say_err "admin-merge: ✗ BLOCK — no COMPLETED run of the lane exists for head $head (lane: $lane)."
-    say_err "   Nothing about this revision was tested, so a comparison cannot certify anything."
+  # NOT `completed`: a `cancelled`/`skipped` run is terminal but exercised
+  # nothing, so it cannot certify the revision (review P1, cycle 2). A parser too
+  # old to emit `tested` therefore BLOCKS — fail closed, never vacuous.
+  if [ "${pr_tested:-0}" -eq 0 ]; then
+    say_err "admin-merge: ✗ BLOCK — no run of the lane actually TESTED head $head (lane: $lane)."
+    say_err "   completed=${pr_completed:-0} run(s), of which tested=${pr_tested:-0}."
+    say_err "   A cancelled or skipped run is finished but exercised nothing, so an"
+    say_err "   empty failing set proves nothing about this revision."
     say_err "   Confirm the lane is the right one (--workflow) and that CI ran for this head."
     exit 1
   fi
-  info "admin-merge: lane finished for $head ($pr_completed completed run(s))"
+  info "admin-merge: lane finished for $head (${pr_tested} tested of ${pr_completed} completed run(s))"
 
   # ── 2. main's baseline: the UNION over the last N runs ───────────────────
   local main_status=0
@@ -245,6 +259,15 @@ main() {
       say_err "admin-merge: ✗ BLOCK — unique failures present and --no-rerun given. No merge."
       exit 1
     fi
+    # `--dry-run` MUTATES NOTHING — including CI. Re-running failed jobs before
+    # the DRY_RUN branch would make a documented no-op re-run a caller's CI
+    # (review P2, cycle 2). Report the decision instead of performing it.
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "admin-merge: (dry-run) a real run would re-run the failing job(s) of this head once and re-classify them."
+      info "admin-merge: (dry-run) --dry-run performs no CI re-run, posts no comment and merges nothing."
+      info "admin-merge: (dry-run) decision: BLOCK unless the residual clears on retry. No merge."
+      exit 0
+    fi
     # Re-run every failing run of the PR head ONCE. A test that passes on retry
     # is order/timing flaky, not new — the #3469 shape (a sibling pair that
     # trips alternately on main) must not hard-block a safe merge.
@@ -253,7 +276,8 @@ main() {
       [ -n "$run_line" ] || continue
       run_id="${run_line##*:}"
       info "admin-merge: ↻ re-running failed jobs of run $run_id"
-      if ! $GH run rerun "$run_id" --failed >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      if ! $GH run rerun "$run_id" --failed ${repo_args[@]+"${repo_args[@]}"} >/dev/null 2>&1; then
         say_err "admin-merge: ✗ BLOCK — could not re-run $run_id (gh error). No merge."
         exit 1
       fi
@@ -322,7 +346,7 @@ main() {
   # The lane's COMPLETION state is part of the evidence: it is the fact that
   # makes an empty failing set mean "tested and green" rather than "never ran".
   analyzed="$analyzed
-Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) pending=$(report_value "$TMP/pr-report.txt" pending) | main completed=$(report_value "$TMP/main-report.txt" completed) pending=$(report_value "$TMP/main-report.txt" pending)"
+Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tested=$(report_value "$TMP/pr-report.txt" tested) pending=$(report_value "$TMP/pr-report.txt" pending) | main completed=$(report_value "$TMP/main-report.txt" completed) tested=$(report_value "$TMP/main-report.txt" tested) pending=$(report_value "$TMP/main-report.txt" pending)"
 
   # A vacuous comparison is STATED, never implied. Both sides empty is usually a
   # correct outcome (the lane is green on both sides) — but it is also exactly

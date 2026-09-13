@@ -350,7 +350,7 @@ if [ -f "$SCEN/comment" ]; then
   grep -q "^test lane: python-ci.yml$" "$c" && pass "the lane is stated in the evidence" || fail "test lane line missing"
   grep -q "PR failing: 1 | main failing: 1 | unique to this PR: 0" "$c" && pass "counts line exact" || fail "counts line wrong"
   grep -q "Failing runs examined: PR=1 main=1" "$c" && pass "examined/extracted counts recorded" || fail "examined counts missing"
-  grep -q "^Lane completion: PR completed=1 pending=0" "$c" && pass "lane completion recorded (the fact that makes 'empty' mean green)" || fail "lane completion line missing"
+  grep -q "^Lane completion: PR completed=1 tested=1 pending=0" "$c" && pass "lane completion recorded (the fact that makes 'empty' mean green)" || fail "lane completion line missing"
   grep -q "Flake classification: none needed" "$c" && pass "clean case records no re-run" || fail "clean-case flake line wrong"
   grep -q 'comm -23' "$c" && pass "raw comparison in a <details> block" || fail "raw comparison missing"
 else
@@ -504,7 +504,7 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9102"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "no lane run for the head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "no COMPLETED run of the lane" "$TMP/err" && pass "the block says nothing was tested" || fail "expected the not-tested reason on stderr"
+grep -q "no run of the lane actually TESTED" "$TMP/err" && pass "the block says nothing was tested" || fail "expected the not-tested reason on stderr"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted" || pass "no evidence comment posted"
 
 # ── 13. the head must not MOVE (review P1) ───────────────
@@ -595,6 +595,174 @@ rc=$?
 grep -q "comparison failed after the re-run" "$TMP/err" && pass "the block names the post-re-run comparison failure" || fail "expected the post-re-run comparison-failure reason on stderr"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the comparison failed" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 16. --exclude must ACTUALLY exclude (review P0, cycle 2) ──────────────
+# The lane projection is TAGGED (`status<TAB>conclusion<TAB>sha:id`). `--exclude`
+# used to be `awk -F: '$1 != x'`, which compared the whole first column — so it
+# matched nothing, silently, and main's baseline kept the very run it was told to
+# drop. The consumer that depends on it is the post-merge detector: it excludes
+# the merge commit so the merged run's failures are not in its own baseline. With
+# a dead `--exclude` the two sides are identical, `--diff` is always empty, and
+# the detector can NEVER fire — the closed loop for a human's UI admin-merge is
+# dead while still printing "no unique failures". A silent no-op in a gate is
+# worse than a loud failure, so this drives the flag through its real projection.
+echo "== 16. --exclude really drops the run (a silent no-op kills the detector) =="
+new_scen exclude
+EX_KEEP="aaaa000000000000000000000000000000000000"
+EX_DROP="bbbb000000000000000000000000000000000000"
+lane_fail "$EX_KEEP" 2001 > "$SCEN/runs-main"
+lane_fail "$EX_DROP" 2002 >> "$SCEN/runs-main"
+log_failed 'tests/test_keep.py::test_keep' > "$SCEN/log-2001"
+log_failed 'tests/test_drop.py::test_drop' > "$SCEN/log-2002"
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" --main-union 10 --exclude "$EX_DROP" --provenance "$TMP/ex-prov.txt" > "$TMP/ex-out.txt" 2>"$TMP/ex-err.txt" || fail "--main-union --exclude should succeed"
+grep -q "test_keep" "$TMP/ex-out.txt" && pass "the non-excluded run is still parsed" || fail "the kept run's failure disappeared"
+grep -q "test_drop" "$TMP/ex-out.txt" && fail "--exclude did NOT drop the run — the detector's own merge stays in its baseline (P0)" || pass "the excluded run is dropped from the failing set"
+grep -q "$EX_DROP" "$TMP/ex-prov.txt" && fail "the excluded run is still reported as examined (provenance)" || pass "the excluded run is absent from provenance"
+grep -q "$EX_KEEP" "$TMP/ex-prov.txt" && pass "the kept run is still in provenance" || fail "the kept run vanished from provenance"
+# A run whose headSha is EMPTY must be KEPT: dropping runs we cannot identify
+# shrinks the baseline and MANUFACTURES "unique" failures — the opposite of the
+# vacuity bug, and just as wrong (VGATE cycle 2).
+lane_line completed failure "" 2003 >> "$SCEN/runs-main"
+log_failed 'tests/test_nosha.py::test_nosha' > "$SCEN/log-2003"
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" --main-union 10 --exclude "$EX_DROP" > "$TMP/ex-nosha.txt" 2>/dev/null \
+  || fail "--main-union --exclude should still succeed with an empty-sha run"
+grep -q "test_nosha" "$TMP/ex-nosha.txt" && pass "an unidentifiable (empty-sha) run is kept, not silently dropped" || fail "--exclude dropped a run it could not identify — that manufactures unique failures"
+# A SHORT --exclude must still match the full headSha (callers pass either).
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" --main-union 10 --exclude "${EX_DROP:0:7}" > "$TMP/ex-short.txt" 2>/dev/null \
+  || fail "--main-union --exclude <short> should succeed"
+grep -q "test_drop" "$TMP/ex-short.txt" && fail "a short --exclude did not match the full headSha" || pass "a short --exclude matches the full headSha"
+
+# ── 17. a CANCELLED run is finished but is not EVIDENCE (review P1, cycle 2) ─
+# Gating on `completed` accepted a `cancelled` run as "this revision was tested".
+# `cancel-in-progress` supersede and cancelled CI both produce one, and neither
+# exercised a line of the PR. `tested` counts only runs that actually ran the
+# suite (success/failure/timed_out). `startup_failure` is NOT tested either: the
+# workflow never started, so nothing ran (VGATE cycle 2).
+echo "== 17. a cancelled run never certifies the head (terminal != tested) =="
+new_scen cancelled
+HEAD_CX="8888000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_CX" > "$SCEN/head"
+lane_line completed cancelled "$HEAD_CX" 7701 > "$SCEN/runs-$HEAD_CX"
+lane_fail maincafe 7702 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7702"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a cancelled lane run → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0 — a cancelled run certified the head"
+grep -q "actually TESTED" "$TMP/err" && pass "the block says the run tested nothing" || fail "expected the not-tested reason on stderr"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for a cancelled run" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+# ...but a cancelled run ALONGSIDE a run that did execute must NOT block: the real
+# run is the evidence. A fix that over-blocks gets the gate disabled.
+new_scen cancelled-plus
+printf '%s\n' "$HEAD_CX" > "$SCEN/head"
+lane_line completed cancelled "$HEAD_CX" 7703 > "$SCEN/runs-$HEAD_CX"
+lane_pass "$HEAD_CX" 7704 >> "$SCEN/runs-$HEAD_CX"
+run_admin 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a cancelled run beside a tested run → allow (exit 0)" || fail "expected exit 0, got $rc — the tested-count fix over-blocks"
+grep -q "tested=1" "$TMP/out" && pass "the evidence reports tested=1 of completed=2" || fail "expected tested=1 in the printed evidence"
+# `startup_failure` = the workflow never STARTED. It is terminal, so the old
+# `completed` gate accepted it as "tested" although nothing ran (VGATE cycle 2).
+new_scen startupfail
+HEAD_SF="aaaa111100000000000000000000000000000000"
+printf '%s\n' "$HEAD_SF" > "$SCEN/head"
+lane_line completed startup_failure "$HEAD_SF" 7711 > "$SCEN/runs-$HEAD_SF"
+lane_fail maind00d 7712 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7712"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a startup_failure-only head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0 — a workflow that never started certified the head"
+grep -q "actually TESTED" "$TMP/err" && pass "the block says the run tested nothing" || fail "expected the not-tested reason on stderr"
+
+# ── 18. --dry-run mutates NOTHING, CI included (review P2, cycle 2) ──────────
+# `--dry-run` is documented as posting nothing and merging nothing, but the
+# re-run loop ran BEFORE the dry-run branch, so a documented no-op re-ran a
+# caller's CI. A dry run must be safe to point at anything, any time.
+echo "== 18. --dry-run performs no CI re-run (and no merge) =="
+new_scen dryrun-rerun
+HEAD_DR="9999000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DR" > "$SCEN/head"
+lane_fail "$HEAD_DR" 8801 > "$SCEN/runs-$HEAD_DR"
+log_failed 'tests/test_newly.py::test_newly_landed' > "$SCEN/log-8801"
+lane_fail mainbeef 8802 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-8802"
+run_admin 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "--dry-run exits 0 on an unexplained failure" || fail "expected exit 0 (a dry run reports, it does not decide), got $rc"
+grep -q "run rerun" "$SCEN/calls" && fail "--dry-run RE-RAN CI — a documented no-op mutated the caller's CI" || pass "--dry-run issued no CI re-run"
+grep -q "pr merge" "$SCEN/calls" && fail "--dry-run merged" || pass "--dry-run attempted no merge"
+[ -f "$SCEN/comment" ] && fail "--dry-run posted evidence" || pass "--dry-run posted nothing"
+grep -qi "re-run" "$TMP/out" && pass "the dry run says a real run would re-run and re-classify" || fail "expected the dry run to say what a real run would do"
+
+# ── 19. --repo reaches EVERY repo-scoped gh call (residual P0 #2) ───────────
+# `--repo` reached `pr view` / `run list` / `run view --log-failed`, but NOT
+# `run rerun` or `run view --json status`. Both are repo-scoped: on the flake
+# path a cross-repo rail either failed to re-run (BLOCK) or polled the WRONG
+# repo until timeout. The class is "one call site silently drops a flag".
+echo "== 19. --repo reaches run rerun and the status poll =="
+new_scen repoflag2
+HEAD_RR="3333000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_RR" > "$SCEN/head"
+lane_fail "$HEAD_RR" 6601 > "$SCEN/runs-$HEAD_RR"
+log_failed 'tests/test_often.py::test_flaky_sibling' > "$SCEN/log-6601"
+lane_fail main6666 6602 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-6602"
+# after the re-run the flaky sibling passes → the flake path completes
+log_passed 'tests/test_often.py::test_flaky_sibling' > "$SCEN/log-after-6601"
+run_admin 42 --main-runs 1 --repo other-org/other-repo >/dev/null 2>&1
+rerun_line="$(grep -m1 -E '^run rerun' "$SCEN/calls")"
+case "$rerun_line" in
+  *"--repo other-org/other-repo"*) pass "gh run rerun received --repo" ;;
+  *) fail "gh run rerun did NOT receive --repo — a cross-repo re-run hits the wrong repo"; echo "      $rerun_line" ;;
+esac
+poll_line="$(grep -m1 -E '^run view 6601 .*--json status' "$SCEN/calls")"
+case "$poll_line" in
+  *"--repo other-org/other-repo"*) pass "the status poll received --repo" ;;
+  *) fail "the completion poll did NOT receive --repo — it polls the wrong repo"; echo "      $poll_line" ;;
+esac
+
+# ── 20. --help prints the WHOLE header (review P2, cycle 2) ─────────────────
+# `sed -n '1,50p'` truncated a 65-line header, so `--help` ended mid-sentence and
+# never showed --any-workflow / --no-rerun / --dry-run / --repo / the env seams.
+# Exactly the `1,60p` bug already fixed in ci-failure-set.sh, repeated here.
+echo "== 20. --help shows the WHOLE header =="
+bash "$ADM" --help > "$TMP/help.txt" 2>&1 || true
+# The flags appear in the SYNOPSIS (header lines <50), so grepping for them does
+# NOT pin this fix — HEAD's truncated --help already listed all of them. Anchor on
+# content that lives ONLY past the old `sed -n '1,50p'` cut: the DESCRIPTION block
+# and the env seams. (The first cut of this test grepped the flags and passed
+# with the fix reverted — a test that pins nothing; caught by VGATE.)
+head_lines="$(grep -c '^#' "$ADM")"
+grep -q "^# Env seams" "$ADM" && [ "$head_lines" -gt 50 ] \
+  && pass "the file carries $head_lines comment lines, all past the old 50-line cut — the fix is meaningful" \
+  || fail "expected more than 50 comment lines (the old cut was 50)"
+for f in ADMIN_MERGE_GH ADMIN_MERGE_FAILURE_SET_SH ADMIN_MERGE_POLL_INTERVAL; do
+  grep -q "$f" "$TMP/help.txt" && pass "--help prints the $f env seam (past the old cut)" || fail "--help is truncated before $f"
+done
+grep -q "mutates nothing at all" "$TMP/help.txt" && pass "--help prints the full --dry-run description (past the old cut)" || fail "--help truncates the --dry-run description"
+grep -q "re-opens the bogus zero" "$TMP/help.txt" && pass "--help prints the full --any-workflow description" || fail "--help truncates the --any-workflow description"
+
+# ── 21. a detected-but-unreported merge is not a PASSING run (review P2) ────
+# The detector filed with `gh issue create … || echo ::warning::` then `exit 0`, so
+# "I found something and could not report it" was indistinguishable from "nothing
+# found". Assert the shape statically: the workflow must not swallow a filing
+# failure, and must not fall back to exit 0 there. (`workflow_run`-triggered and
+# referenced by nothing, it gates no required check — being red is safe.)
+echo "== 21. the detector does not swallow a filing failure =="
+DET="$ROOT/templates/.github/workflows/admin-merge-detector.yml"
+grep -q 'if ! gh issue create' "$DET" && pass "the detector branches on the issue-creation result" || fail "the detector still swallows a filing failure"
+grep -q 'could not file the detector issue"' "$DET" && fail "the warning-then-exit-0 shape survived" || pass "no warning-then-exit-0 fallback remains"
+grep -q 'UNREPORTED' "$DET" && pass "the failure is announced as UNREPORTED" || fail "expected an ::error:: naming the unreported merge"
+
+# ── 22. PARITY: the materialized detector is its template ───────────────────
+# The template is the source of truth (sync-ci-workflows.sh copies it). A drifted
+# materialization means the workflow GitHub runs is not the one reviewed.
+echo "== 22. materialized detector is byte-identical to its template =="
+if cmp -s "$ROOT/templates/.github/workflows/admin-merge-detector.yml" "$ROOT/.github/workflows/admin-merge-detector.yml"; then
+  pass "the materialized detector is byte-identical to the template"
+else
+  fail "the materialized detector drifted from its template — run sh scripts/sync-ci-workflows.sh"
+fi
 
 echo ""
 if [ "$failures" -gt 0 ]; then

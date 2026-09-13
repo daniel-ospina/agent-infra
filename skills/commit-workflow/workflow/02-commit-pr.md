@@ -185,11 +185,17 @@ the evidence is bound to the head SHA — so **every push invalidates it**.
 scripts/admin-merge.sh <PR> --squash
 
 # Inside, it is:
-#   pr-fails.txt   ← scripts/ci-failure-set.sh --pr <PR>
+#   pr-fails.txt   ← scripts/ci-failure-set.sh --commit <head>   # the head SHA,
+#                    the exact revision the evidence marker binds to
 #   main-fails.txt ← scripts/ci-failure-set.sh --main-union 10   # the UNION
 #   comm -23 pr-fails.txt main-fails.txt   ⇒ must be EMPTY
 #   non-empty → re-run the PR's failed jobs once (pass-on-retry = flaky, not new)
 #   residual non-empty → BLOCK: prints the list, exits non-zero, does NOT merge
+#
+# Both sides are lane-filtered to the same workflow (default `python-ci.yml`,
+# `--workflow` to override), and the rail BLOCKS unless the lane has actually
+# TESTED the head — a run that is queued, or one that finished `cancelled`,
+# exercised nothing, so an empty failing set would prove nothing.
 ```
 
 ⚠️ The baseline is the **union of main's last N runs** (default 10), never a

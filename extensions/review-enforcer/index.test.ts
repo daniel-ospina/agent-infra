@@ -40,6 +40,9 @@ import {
   getPrHeadShaViaRest,
   getPrHeadSha,
   hasAdminMergeFlag,
+  isGhPrMergeCommand,
+  isAdminMergeCommand,
+  isGitOp,
   extractMergePrNumber,
   evidenceBodyIsCertifying,
   evaluateAdminMergeGate,
@@ -2860,6 +2863,166 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   ok(hasAdminMergeFlag("gh pr merge --admin 123"), "flag before the number");
   ok(hasAdminMergeFlag("gh pr merge 123 --admin"), "flag after the number");
   ok(hasAdminMergeFlag("gh pr merge --admin=true 123"), "--admin=true");
+  // gh parses this flag with Go's strconv.ParseBool: EIGHT case-sensitive true
+  // spellings. Matching only the literal `true` let every other spelling through
+  // as "not an admin merge", so the command fell to the merge-registry gate and
+  // merged with NO evidence — a live fail-open (review P1, cycle 2).
+  for (const v of ["1", "t", "T", "TRUE", "True", '\"true\"']) {
+    ok(hasAdminMergeFlag(`gh pr merge 123 --admin=${v}`), `--admin=${v} is a bypass (Go-true spelling)`);
+    ok(hasAdminMergeFlag(`gh pr merge --admin=${v} 123`), `--admin=${v} before the number`);
+  }
+  ok(hasAdminMergeFlag("gh pr merge 123 --admin='True'"), "a single-quoted Go-true value");
+  // ...and the Go-FALSE spellings must still not be refused: `--admin=false` is
+  // an ordinary merge and must take the registry path, not be blocked here.
+  for (const v of ["0", "f", "F", "FALSE", "false", "False"]) {
+    ok(!hasAdminMergeFlag(`gh pr merge 123 --admin=${v}`), `--admin=${v} is NOT a bypass`);
+  }
+  // SHELL SPELLINGS (VGATE cycle 2): bash lowers each of these to a real
+  // `--admin=true` before gh sees it, but we see the raw string. The gate cannot
+  // evaluate a shell, so anything it cannot RESOLVE to a Go-false value is
+  // treated as an admin merge. Enumeration is not possible (`$(…)` is arbitrary);
+  // these are the shapes that broke the previous `=== "true"` rule.
+  const shellSpellings = [
+    "--admin\\=true",
+    "--admin=$'true'",
+    "--admin=`true`",
+    "--admin=$(echo true)",
+    "--admin=${X:-true}",
+    '--admin=tr""ue',
+    "--admin=$ADMIN_VAL",
+    "--admin=true;echo x",
+    "--admin=TRUE&&echo x",
+    "--admin=true|cat",
+  ];
+  for (const s of shellSpellings) {
+    ok(hasAdminMergeFlag(`gh pr merge 123 ${s}`), `${s} is a bypass (bash delivers --admin=true; we fail closed)`);
+  }
+  // The same bash-quoting family on the flag NAME: bash re-joins the token, so
+  // these reach gh as a real `--admin=true` while carrying no literal `--admin`
+  // in the raw string. Quotes are stripped before matching (VGATE round 2, D1).
+  for (const s of ['--ad""min=true', '--"admin"=true', "--ad'min'=true", '--admin"=true']) {
+    ok(hasAdminMergeFlag(`gh pr merge 123 ${s}`), `${s} is a bypass (quote-split flag name)`);
+  }
+  // VGATE round 3 found the SAME family via backslashes, line continuations and
+  // ANSI-C quoting — all reach gh as `--admin` / `--admin=true`. Enumerating
+  // spellings is what produced three rounds of fail-opens, so the scanner now
+  // resolves quotes/escapes/continuations and FAILS CLOSED on the rest.
+  const splicingSpellings = [
+    "--ad\\min=true",
+    "--adm\\in",
+    "--ad\\m\\i\\n=true",
+    "--ad\\\nmin=true",
+    "$'--admin'",
+    "$'--adm\\x69n'",
+    "$'--admin=TRUE'",
+    "--adm$'\\x69'n=true",
+    "--admi${X}n=true",
+    "--admi$X=true",
+    "--admin=$ADMIN_VAL",
+  ];
+  for (const s of splicingSpellings) {
+    ok(hasAdminMergeFlag(`gh pr merge 123 ${s}`), `${JSON.stringify(s)} is a bypass (spliced name or unresolvable value)`);
+  }
+  // `gh pr "merge"` is the same family one level up: bash re-joins it, so the
+  // CALLER's guard must see the normalized form or the whole gate is skipped.
+  ok(isGhPrMergeCommand('gh pr "merge" 123 --admin=true'), 'gh pr "merge" is recognized as a merge command (normalized)');
+  ok(isGhPrMergeCommand("gh pr merge 123"), "a plain `gh pr merge` is recognized");
+  ok(!isGhPrMergeCommand("gh pr view 123 --json headRefOid"), "`gh pr view` is not a merge command");
+  // A VERB we cannot resolve must not be a way PAST the gate (VGATE round 5).
+  for (const c of [
+    "gh pr $'merge' 123 --admin=true",
+    'gh pr $"merge" 123 --admin=true',
+    "gh pr m$'erge' 123 --admin=true",
+    'gh pr m""erge 123 --admin=true',
+    "M=merge; gh pr $M 123 --admin=true",
+    "gh pr `echo merge` 123 --admin=true",
+  ]) {
+    ok(isGhPrMergeCommand(c), `an unresolvable verb is treated as a merge: ${JSON.stringify(c)}`);
+    ok(hasAdminMergeFlag(c), `...and its admin flag is seen: ${JSON.stringify(c)}`);
+  }
+  // VGATE round 6: the SPLICE can sit on the `gh`/`pr` words too, or be glued to
+  // the verb. Rule 2 keys on the unresolvable CONSTRUCT plus the two verb words
+  // anywhere, not on a position — enumerating positions is what produced rounds
+  // 3, 5 and 6.
+  for (const c of [
+    "gh $'pr' merge 123 --admin=true",
+    "$'gh' pr merge 123 --admin=true",
+    "g$'h' pr merge 123 --admin=true",
+    "gh pr merge$(printf '%s' '') 123 --admin=true",
+    "gh pr $(echo merge) 123 --admin=true",
+    "gh pr {merge,view} 123 --admin=true",
+  ]) {
+    ok(isGhPrMergeCommand(c), `a spliced gh/pr/verb is treated as a merge: ${JSON.stringify(c)}`);
+    ok(hasAdminMergeFlag(c), `...and its admin flag is seen: ${JSON.stringify(c)}`);
+  }
+  // Rule 2 must NOT make harmless commands GATE-RELEVANT. This asserts the
+  // SHIPPED predicate (`isGitOp`) directly — not a replica. VGATE round 7 found
+  // that a replica let the conjunction be dropped with the suite still green.
+  for (const c of [
+    'echo "gh pr merge 1 --squash"',
+    "rg 'gh pr merge' scripts/",
+    'echo "git commit -m x"',
+    "gh pr view 123 --json headRefOid",
+    'echo "$(date)"',
+    "rg '{a,b}' -- files",
+  ]) {
+    ok(!isGitOp(c), `not gate-relevant: ${JSON.stringify(c)}`);
+  }
+  // The shipped predicate MUST be gate-relevant for every bypass shape above.
+  for (const c of [
+    "gh pr merge 123 --admin=true",
+    'gh pr "merge" 123 --admin=true',
+    "gh pr $'merge' 123 --admin=true",
+    "gh $'pr' merge 123 --admin=true",
+    'gh pr merge 123 -${V:--}admin=true',
+    "gh pr merge 123 $V-admin=true",
+    'gh pr merge 123 -$(printf %s \'-\')admin=true',
+  ]) {
+    ok(isGitOp(c), `gate-relevant (the rail must see this): ${JSON.stringify(c)}`);
+  }
+  // A construct WITHOUT the word `admin` must not trigger the ADMIN gate. This is
+  // the over-block boundary the docstring promises: the common
+  // `gh pr merge "$PR" --squash` stays an ordinary merge. (It is still
+  // `isGitOp`-relevant — the registry gate governs every merge — so the assertion
+  // belongs on `hasAdminMergeFlag`, not on `isGitOp`.)
+  for (const c of [
+    'gh pr merge "$PR" --squash',
+    "gh pr merge 123 --body \"$(cat msg)\"",
+    "gh pr merge 123 --squash --delete-branch",
+    "gh pr merge 123 --admin=false",
+  ]) {
+    ok(!hasAdminMergeFlag(c), `a construct without \`admin\` does not trigger the admin gate: ${JSON.stringify(c)}`);
+  }
+  // A quoted MENTION carrying an admin flag must stay OUT of the gate: `gh` inside
+  // the quotes is not a bare token, so this is not a command. This was a real
+  // over-block (it fired on heredocs and greps) until the bare-`gh` requirement
+  // was added (VGATE round 8); pin it so it cannot come back.
+  ok(!isGitOp('echo "gh pr merge 1 --admin=true"'), 'a quoted MENTION with an admin flag is NOT gate-relevant');
+  ok(!isGitOp('printf %s "gh pr merge 1 --admin=true"'), 'a quoted MENTION inside printf is NOT gate-relevant');
+  // `hasAdminMergeFlag` is fail-closed and therefore far too broad to be a
+  // RELEVANCE test on its own. Using it as one blocked ordinary shell commands at
+  // zero dispatches (VGATE round 9) because it returns true for ANSI-C quoting and
+  // for any construct beside the word `admin`. The shape conjunction is what
+  // prevents that; pin it.
+  for (const c of ["echo $'hello'", 'sed $\'s/x/y/\' file', "grep -P $'\\t' file", 'echo "admin $USER"', 'cat admin-$USER.txt', "echo $(date)"]) {
+    ok(!isGitOp(c), `an ordinary command is NOT gate-relevant: ${JSON.stringify(c)}`);
+  }
+  // ...and a quoted MENTION stays clean even though its normalized text is a
+  // perfect `gh pr merge` — the distinction is QUOTE STATE, not text, which is
+  // why `hasBareGhWord` exists (VGATE round 10).
+  for (const c of ["rg 'gh pr merge' scripts/", "printf %s 'gh pr merge 1 --admin=true'"]) {
+    ok(!isGitOp(c), `a quoted mention is NOT gate-relevant: ${JSON.stringify(c)}`);
+  }
+  // NOT CLOSED, deliberately, and STATED in the docstring rather than claimed:
+  // a `$VAR` expanded UPSTREAM of the string, `gh api … /merge`, and `gh alias`
+  // shims are invisible here. Those need argv-level enforcement. Do not add an
+  // assertion asserting otherwise.
+  // An UNPARSEABLE value is refused rather than allowed. This is the safe
+  // direction: gh errors on it (`invalid argument … strconv.ParseBool`), so
+  // refusing a command gh would have rejected costs nothing, while allowing it
+  // on the theory that gh would error is a fail-open if that theory is wrong.
+  ok(hasAdminMergeFlag("gh pr merge 123 --admin=zork"), "an unparseable value is refused (fail closed)");
+  ok(hasAdminMergeFlag("gh pr merge 123 --admin=''"), "an empty quoted value is refused (fail closed)");
   ok(hasAdminMergeFlag("gh pr merge --admin= 123"), "--admin= (gh's own empty = true)");
   ok(hasAdminMergeFlag("gh pr merge --squash --admin 123"), "after another flag");
   ok(hasAdminMergeFlag("cd /x && gh pr merge --admin 123"), "behind a cd chain");
@@ -2904,8 +3067,20 @@ test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
     "body `PR head:` disagreeing with the marker does NOT certify");
   ok(!evidenceBodyIsCertifying(good.replace("PR head:", "PR sha:"), MARK),
     "a body with no `PR head:` line at all does NOT certify");
+  // Prefix tolerance must hold in BOTH directions. Until review cycle 2 the code
+  // was `marker.length >= 40 ? bodyHead === marker : …`, so a FULL marker with a
+  // SHORT `PR head:` returned false while the reverse returned true — the comment
+  // claimed a symmetry the code did not have. This test previously exercised only
+  // the marker-shortened direction (a `String.replace` of the first occurrence,
+  // which is the marker comment, not the `PR head:` line).
   ok(evidenceBodyIsCertifying(good.replace(MARK, MARK.slice(0, 12)), MARK),
-    "a short SHA in the body names the same revision (prefix-tolerant)");
+    "a short SHA in the MARKER line names the same revision (prefix-tolerant)");
+  ok(evidenceBodyIsCertifying(good.split("PR head: " + MARK).join("PR head: " + MARK.slice(0, 12)), MARK),
+    "a short SHA in the body's `PR head:` names the same revision (the asymmetric direction)");
+  // A DIFFERENT revision must still fail, in both directions: tolerance is prefix
+  // matching, not "any short sha matches".
+  ok(!evidenceBodyIsCertifying(good.split("PR head: " + MARK).join("PR head: " + "d".repeat(12)), MARK),
+    "a short SHA naming a DIFFERENT revision does NOT certify");
 });
 
 test("evaluateAdminMergeGate: pure decisions", () => {
@@ -2950,6 +3125,32 @@ for (const [label, command] of [
   ["--admin after the PR number", `gh pr merge ${PR_ADMIN} --admin`],
   ["--admin=true before the PR number", `gh pr merge --admin=true ${PR_ADMIN}`],
   ["--admin with no PR number at all", "gh pr merge --admin"],
+  // The bash token-splicing family in the COMMAND SHAPE: bash re-joins these, so
+  // they must reach the admin gate like any other admin merge. A raw-only guard
+  // returned early and skipped the gate entirely (VGATE round 3).
+  ["a quote-split `merge` verb", `gh pr "merge" ${PR_ADMIN} --admin=true`],
+  ["a backslash-split flag name", `gh pr merge ${PR_ADMIN} --ad\\min=true`],
+  ["an ANSI-C quoted flag", `gh pr merge ${PR_ADMIN} $'--admin'`],
+  // VGATE round 6: the splice on the `gh`/`pr` words, which skipped BOTH gates.
+  ["a splice on the `gh` word", `$'gh' pr merge ${PR_ADMIN} --admin=true`],
+  ["a splice on the `pr` word", `gh $'pr' merge ${PR_ADMIN} --admin=true`],
+  ["a substitution glued to the verb", `gh pr merge$(printf '%s' '') ${PR_ADMIN} --admin=true`],
+  // VGATE round 9: `isGitOp` said yes while the CALLER's separate predicate said
+  // no, so this was ALLOWED with no evidence. They now share one function.
+  ["a splice mid-way through the `pr` word", `gh p$'r' merge ${PR_ADMIN} --admin=true`],
+  ["a `$VAR`-supplied `pr` word", `V=pr; gh $V merge ${PR_ADMIN} --admin=true`],
+  // VGATE round 10: a quote/backslash/continuation-spliced COMMAND NAME. bash
+  // re-joins these to `gh`; a raw-string word test missed them entirely.
+  ["a quote-split `gh` command name", `g"h" pr merge ${PR_ADMIN} --admin=true`],
+  ["an empty-quote-prefixed `gh` name", `''gh pr merge ${PR_ADMIN} --admin=true`],
+  ["a backslash-escaped `gh` name", `\\gh pr merge ${PR_ADMIN} --admin=true`],
+  ["a line-continuation inside the `gh` name", "g\\\nh pr merge " + PR_ADMIN + " --admin=true"],
+  // VGATE round 11: a FULLY quoted command name is executable, not a mention. The
+  // previous rule admitted `''gh` and `g"h"` while excluding `"gh"` — the same
+  // family, inconsistently. Command position now decides, not "any unquoted char".
+  ["a fully-quoted `gh` command name", `"gh" pr merge ${PR_ADMIN} --admin=true`],
+  ["a single-quoted `gh` command name", `'gh' pr merge ${PR_ADMIN} --admin=true`],
+  ["a fully-quoted `gh` after a separator", `true && "gh" pr merge ${PR_ADMIN} --admin=true`],
 ] as const) {
   testAsync(`#930 refusal: ${label} without evidence is BLOCKED`, async () => {
     await withTempHome(async () => {

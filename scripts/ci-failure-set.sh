@@ -28,6 +28,7 @@
 #
 # Options:
 #   --exclude <sha>           (--main-union) drop runs whose headSha is <sha>
+#                             (full or short; matched against the run's headSha)
 #   --repo <owner/repo>       repo for the gh calls (default: gh's own resolution)
 #   --workflow <file|name>    restrict the run listing to ONE workflow (default
 #                             `python-ci.yml`, or $CI_FAILURE_SET_WORKFLOW).
@@ -38,7 +39,14 @@
 #                             repo's only failing surface)
 #   --provenance <file>       write the examined failing runs as `<sha>:<run-id>`
 #   --runs-report <file>      write `examined=` / `extracted=` / `completed=` /
-#                             `pending=` counts for the selector's lane runs
+#                             `tested=` / `pending=` counts for the lane runs
+#
+# --exclude MATCHES the run's headSha, whatever the projection looks like. It is
+# compared against the PARSED sha field, never a blind awk `$1` — the listing's
+# own column layout must not be able to silently disable it (review P0, cycle 2).
+# The PARSING is still positional (`$3`, split on `:`), so a future projection
+# change must update this too; that is why it is done in one place, next to the
+# projection it reads.
 #   --help
 #
 # Exit codes:
@@ -74,15 +82,24 @@
 # WHAT `--runs-report` MEANS (the completion doctrine):
 #   examined   failing runs in the lane (the ones whose logs are parsed)
 #   extracted  failing runs that yielded at least one `FAILED <nodeid>` line
-#   completed  lane runs that FINISHED (any conclusion — a `cancelled` run is
-#              finished, it just is not red)
+#   completed  lane runs that FINISHED (any conclusion)
+#   tested     of `completed`, the runs that actually EXERCISED the code:
+#              `success`, `failure`, `timed_out`. NOT `cancelled`/`skipped`
+#              (finished without running the suite) and NOT `startup_failure`
+#              (the workflow never started — nothing ran at all).
 #   pending    lane runs still queued/in-progress
 #   `examined=0` is NOT a failure — a green lane legitimately has none. The
-#   vacuity signal is `completed=0`: it means nothing about this revision was
-#   ever tested, so an empty failing set proves nothing. A failures-only
+#   vacuity signal is `tested=0`: it means nothing about this revision was ever
+#   exercised, so an empty failing set proves nothing. A failures-only
 #   projection cannot express that, which is how a pre-CI merge certified an
-#   empty set (review P0 #3). Consumers gate on `completed`/`pending`; see
+#   empty set (review P0 #3). Consumers gate on `tested`/`pending`; see
 #   scripts/admin-merge.sh.
+#
+#   FINISHED IS NOT TESTED (review P1, cycle 2): gating on `completed` alone let
+#   a `cancelled` run — a `cancel-in-progress` supersede, or a cancelled CI —
+#   satisfy the "this revision was tested" requirement. Both are terminal; only
+#   one is evidence. A superseded run belongs to the OLD commit, so it cannot
+#   satisfy the NEW head's `tested` count either — the fix is safe.
 #
 # Env seams (tests only):
 #   CI_FAILURE_SET_GH         the gh command to run (default: `gh`)
@@ -109,8 +126,9 @@ WORKFLOW_ARGS=()
 # completed (the #3420 ratchet it exists to stop).
 #
 # `cancelled` is deliberately not a FAILURE (ci.yml uses `cancel-in-progress`, so
-# a superseded run is cancelled, not red) — but a cancelled run IS completed, so
-# it still counts toward "the lane finished", never toward "the lane failed".
+# a superseded run is cancelled, not red) — and it is not EVIDENCE either: it
+# counts toward `completed` (the run is over) but never toward `tested` (the run
+# exercised nothing) nor toward `examined` (it has no failing set).
 LANE_RUN_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
@@ -154,7 +172,7 @@ extract_failed_tests() {
 # provenance/counts when requested. Returns 1 on extraction failure.
 collect_union() {
   local lane_file="$1" provenance="$2" report="$3"
-  local tmp_set="" examined=0 extracted=0 completed=0 pending=0 run_id line
+  local tmp_set="" examined=0 extracted=0 completed=0 tested=0 pending=0 run_id line
   tmp_set="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_set"
   # The provenance file must exist even when NOTHING failed — callers build the
@@ -173,6 +191,12 @@ collect_union() {
     # exactly what a failures-only listing cannot see.
     if [ "$status" = "completed" ]; then
       completed=$((completed + 1))
+      # Terminal != exercised. `cancelled`/`skipped`/`neutral` finished without
+      # running the suite, so they must not count toward "this revision was
+      # tested" (review P1, cycle 2).
+      case "$conclusion" in
+        success|failure|timed_out) tested=$((tested + 1)) ;;
+      esac
     else
       pending=$((pending + 1))
     fi
@@ -190,8 +214,8 @@ collect_union() {
     fi
   done < "$lane_file"
   if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\ncompleted=%s\npending=%s\n' \
-      "$examined" "$extracted" "$completed" "$pending" > "$report"
+    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
+      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
   fi
   sort -u "$tmp_set"
   rm -f "$tmp_set"
@@ -275,7 +299,22 @@ main() {
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
       if [ -n "$exclude" ]; then
-        awk -F: -v x="$exclude" '$1 != x' "$runs" > "$filtered"
+        # Parse the TAGGED projection's sha field — never a bare `$1`. `$1` of a
+        # `status<TAB>conclusion<TAB>sha:id` line is `status<TAB>conclusion<TAB>sha`,
+        # so a blind `-F: '$1 != x'` matches nothing and `--exclude` becomes a
+        # silent no-op: the merged commit's own run stays in main's baseline, its
+        # failures equal the PR's, and the post-merge detector can never fire
+        # (review P0, cycle 2). Prefix-tolerant both ways: callers pass a full sha
+        # from an event payload, the API may return either. A line with an EMPTY
+        # sha is KEPT — dropping runs we cannot identify would shrink the baseline
+        # and manufacture "unique" failures (VGATE cycle 2).
+        awk -F'\t' -v x="$exclude" '
+          {
+            n = split($3, a, ":")
+            sha = a[1]
+            if (sha == "") print
+            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
+          }' "$runs" > "$filtered"
       else
         cp "$runs" "$filtered"
       fi

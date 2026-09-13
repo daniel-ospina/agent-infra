@@ -62,10 +62,240 @@ const ISSUE_COMPLEXITY_FILE = "/tmp/agent-issue-complexity";
 // ── Git operation patterns ────────────────────────────
 
 const GIT_COMMIT_PATTERN = /(^|\s)git\s+(commit|push)(?=\s|$)/;
+
+/**
+ * Remove the bash token-splicing the scanner CAN resolve, so a flag spelled
+ * across quotes or escapes is seen the way gh sees it.
+ *
+ * Bash re-joins a single token across these before gh ever sees argv:
+ *   `--ad""min=true`, `--ad\min=true`, `--ad\<newline>min=true`, `--ad'min'=true`
+ * all reach gh as `--admin=true`, while the RAW string contains no `--admin`.
+ * So we drop quote characters, drop backslash-newline continuations, and drop
+ * backslashes (which only ever escape the next character).
+ *
+ * It is NOT a shell. Two families stay unresolved and are handled differently:
+ *   - what `isUnresolvableFlagToken` catches (ANSI-C quoting, a `$`/backtick in a
+ *     dash-token) is REFUSED — fail closed;
+ *   - what NOTHING here catches — brace expansion (`--{admin,squash}`), `xargs`
+ *     `{}`, and `$(…)`/backticks that SUPPLY the `--` or the whole flag — is an
+ *     OPEN GAP. It is stated in `hasAdminMergeFlag`'s docstring and tracked as a
+ *     follow-up; the only real fix is argv-level enforcement (a `gh` shim).
+ */
+function normalizeForFlagScan(command: string): string {
+  return command.replace(/\\\r?\n/g, "").replace(/["'\\]/g, "");
+}
+
+/**
+ * Does the command hide a substitution inside a DASH-TOKEN, in a form this
+ * scanner REFUSES rather than guesses at?
+ *
+ *   - ANSI-C / locale quoting: `$'--admin'`, `$'--adm\x69n'`, `--adm$'\x69'n`.
+ *     Decoding `\xNN` is exactly the guessing this gate must not do.
+ *   - a substitution inside a LITERAL `--` token: `--admi${X}n=true`,
+ *     `--admin=$(echo true)`, `` --admin=`true` ``.
+ *
+ * NARROWER THAN IT SOUNDS, deliberately so: the second rule requires the `--` to
+ * be LITERAL. A construct can supply the dash itself — `-${V:--}admin=true`,
+ * `$V-admin=true`, `-$(printf %s '-')admin=true` all reach gh as `--admin=true` —
+ * and this function does NOT catch those. `hasAdminMergeFlag` catches them
+ * separately, by a construct-plus-`admin` rule; see the STATED LIMITS there, which
+ * names what remains open. Do not read this function as covering "a substitution
+ * inside a dash-token" in general: it covers the case where the `--` is visible.
+ */
+function isUnresolvableFlagToken(command: string, probe: string): boolean {
+  if (/\$['"]/.test(command)) return true;
+  return /--[^\s]*[$`]/.test(probe);
+}
+
+/**
+ * Bash constructs that ASSEMBLE a token from pieces, which this scanner does not
+ * evaluate: any `$` (variable reference, `${…}`, `$'…'`, `$("…")`, `$(…)`),
+ * backticks, and brace expansion (`{a,b}`).
+ *
+ * A bare `$VAR` counts: `M=merge; gh pr $M 123 --admin=true` really does perform
+ * an admin merge, and a construct set without `$` missed it entirely (VGATE round
+ * 6). Being generous here is safe because rule 2 is only consulted after the
+ * literal form fails AND the caller conjuncts with `hasAdminMergeFlag`, so
+ * `gh pr comment --body "$(…)"` stays outside the gate.
+ *
+ * Plain `'`/`"` quoting is deliberately NOT here — it is resolved (quotes are
+ * stripped) and treating it as unresolvable made every quoted MENTION look like an
+ * operation, e.g. `echo "git commit -m x"` (VGATE round 4).
+ */
+function hasUnresolvableConstruct(command: string): boolean {
+  return /\$|`|\{|\}/.test(command);
+}
+
+/**
+ * Is this a `gh pr merge` command?
+ *
+ * Two ways to answer yes, and both are needed:
+ *   1. the literal, NORMALIZED form — quotes and backslashes are how bash
+ *      re-joins one token, so `gh pr "merge" 123` and `gh pr m\\erge 123` are
+ *      merges while their raw text is not;
+ *   2. an UNRESOLVABLE shape — if the text carries a construct this scanner cannot
+ *      evaluate (see `hasUnresolvableConstruct`) and `pr` + `merge` both appear
+ *      once quotes are stripped, we refuse to let the spelling HIDE the operation.
+ *      This is what closes `gh pr $'merge' 123`, `gh $'pr' merge 123`,
+ *      `$'gh' pr merge 123`, `g$'h' pr merge 123` and `gh pr merge$(…) 123`.
+ *
+ * Three VGATE rounds each found one more position where a splice hid the verb
+ * (r3 the verb itself, r5 an ANSI-C verb, r6 the `gh`/`pr` words and a
+ * substitution glued to the verb). Enumerating positions is what made that
+ * possible, so rule 2 keys on the CONSTRUCT, not on a position: any unresolvable
+ * construct plus the two verb words anywhere is treated as a merge. The caller
+ * then applies the admin gate, which is itself fail-closed, so a false hit costs
+ * a retry while a miss is an unevidenced admin merge.
+ */
+export function isGhPrMergeCommand(command: string): boolean {
+  const probe = normalizeForFlagScan(command);
+  if (/(^|\s)gh\s+pr\s+merge(?=\s|$)/.test(probe)) return true;
+  if (!hasUnresolvableConstruct(command)) return false;
+  // `[^\w]` rather than `\s` before each word: after stripping quotes a spliced
+  // word keeps its residue, so the probe holds `$merge` / `$pr` — a
+  // whitespace-anchored match missed exactly the cases this rule exists for
+  // (VGATE round 6).
+  const hasPr = /(^|[^\w])pr\b/.test(probe);
+  const hasMerge = /(^|[^\w])merge\b/.test(probe);
+  const hasGh = /(^|\W)gh\b/.test(command) || /(^|\W)gh\b/.test(probe);
+  // Requiring BOTH verb words misses a splice INSIDE a word: `gh pr m$'erge'`
+  // normalizes to `m$erge`, where `merge` never appears contiguously. So
+  // `gh` + `pr` under a construct is enough to treat the text as a merge too.
+  // That is still narrow: the caller also requires an admin flag, so a
+  // `gh pr comment --body "$(…)"` is not gate-relevant.
+  return (hasPr && hasMerge) || (hasGh && hasPr);
+}
+
 const GH_PR_PATTERN = /(^|\s)gh\s+pr\s+(create|merge)(?=\s|$)/;
 
-function isGitOp(command: string): boolean {
-  return GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command);
+// Exported so the test suite can pin this predicate DIRECTLY. VGATE round 7
+// showed that an unexported `isGitOp` could have its conjunction dropped — the
+// exact round-4 regression — while the shipped suite stayed green, because the
+// test replicated the predicate instead of exercising it.
+/**
+ * The rail's ADMIN-GATE relevance test. `isGitOp` and the `tool_call` gate BOTH
+ * use this one function — they cannot disagree. VGATE round 9 caught exactly that
+ * failure: `isGitOp` said yes (so the handler ran) while the caller's separate
+ * `isGhPrMergeCommand && hasAdminMergeFlag` said no, and `gh p$'r' merge 123
+ * --admin=true` was ALLOWED with no head-bound evidence. One predicate, one answer.
+ *
+ * `hasAdminMergeFlag` is fail-closed, so on its own it is far too broad to be a
+ * relevance test — it returns true for `echo $'hello'` (ANSI-C quoting) and for
+ * `echo "admin $USER"` (a construct plus the word `admin`), and using it as one
+ * blocked ordinary shell commands at zero dispatches (round 9). It must therefore
+ * be conjoined with a shape test.
+ */
+/**
+ * Which characters of `command` sit OUTSIDE a quoted region?
+ *
+ * Needed because a quote-split COMMAND NAME (`g"h" pr merge …`, `''gh pr merge …`,
+ * `\gh pr merge …`) is bash-re-joined to `gh` while the raw text contains no
+ * contiguous `gh`, and a quoted MENTION (`echo "gh pr merge 1 --admin=true"`) is
+ * the opposite: it DOES contain `gh`, but inside the quotes, so it is not a
+ * command at all. The two are indistinguishable from the normalized text — both
+ * normalize to `gh pr merge` — so the distinction has to come from quote state.
+ *
+ * Tracks `'…'` and `"…"` (with `\` escapes outside single quotes).
+ */
+function unquotedMask(command: string): boolean[] {
+  const mask = new Array<boolean>(command.length).fill(true);
+  let quote: string | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote === null) {
+      if (ch === "\\") {
+        if (i + 1 < command.length) i++;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        mask[i] = false;
+        continue;
+      }
+      mask[i] = true;
+    } else {
+      mask[i] = false;
+      if (ch === quote) quote = null;
+      else if (quote === '"' && ch === "\\" && i + 1 < command.length) mask[++i] = false;
+    }
+  }
+  return mask;
+}
+
+/**
+ * Is a `gh` COMMAND NAME present in `command` — i.e. would the shell really run
+ * `gh`, rather than the text merely quoting the string "gh"?
+ *
+ * Two cases are a real command name:
+ *   1. a partially-unquoted token that de-quotes to `gh` — `g"h"`, `''gh`, `\gh`,
+ *      `gh`. The splice is inside the word, so wherever it sits it is the name it
+ *      resolves to.
+ *   2. a FULLY quoted token — `"gh"`, `'gh'` — but ONLY in command position. A
+ *      fully-quoted word is executable; a fully-quoted ARGUMENT is a string. So
+ *      `"gh" pr merge 1 --admin=true` runs, while `echo "gh pr merge 1
+ *      --admin=true"` only prints. Command position = the first word, a word after
+ *      a separator, or a word after a command-introducing keyword.
+ *
+ * Text alone cannot separate those two — `echo "gh …"` and `"gh" …` normalize
+ * identically — so the distinction has to come from quote state (unquotedMask) plus
+ * position. VGATE round 11 found the fully-quoted half missing: the previous rule
+ * ("at least one character outside a quoted region") admitted `''gh` and `g"h"`
+ * while excluding `"gh"`, an inconsistency inside one family.
+ */
+const COMMAND_INTRODUCERS = /^(command|sudo|env|exec|nohup|nice|time|xargs|do|then|else)$/;
+
+function hasBareGhWord(command: string): boolean {
+  // bash removes a backslash-newline outright, so `g\<newline>h` is the command
+  // `gh`. Do the same before tokenizing, or the continuation splits the name.
+  const joined = command.replace(/\\\r?\n/g, "");
+  const mask = unquotedMask(joined);
+  const tokens = joined.split(/\s+/).filter((t) => t.length > 0);
+  let at = 0;
+  let prev: string | null = null;
+  for (const tok of tokens) {
+    const start = joined.indexOf(tok, at);
+    at = start + tok.length;
+    if (tok.replace(/["'\\]/g, "") === "gh") {
+      const partiallyUnquoted = [...tok].some((_, i) => mask[start + i]);
+      const commandPosition =
+        prev === null || /[;&|(){!]$/.test(prev) || COMMAND_INTRODUCERS.test(prev);
+      if (partiallyUnquoted || commandPosition) return true;
+    }
+    prev = tok;
+  }
+  return false;
+}
+
+export function isAdminMergeCommand(command: string): boolean {
+  if (!hasAdminMergeFlag(command)) return false;
+  const probe = normalizeForFlagScan(command);
+  if (hasUnresolvableConstruct(command)) {
+    // Unreadable AND possibly a merge: a `gh` word, or both `pr` and `merge`.
+    // This is what catches `gh p$'r' merge …`, `$'gh' pr merge …`, `g$'h' pr
+    // merge …` WITHOUT the word list that rounds 6-8 kept re-finding a seam in.
+    return (
+      /(^|[^\w])gh\b/.test(probe) ||
+      (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
+    );
+  }
+  // Readable text, so the only way it is still a merge is a quote-split verb
+  // behind a BARE `gh` (quotes are deliberately not a construct). Requiring the
+  // `gh` to be bare is what keeps a quoted MENTION — `echo "gh pr merge 1
+  // --admin=true"`, `rg 'gh pr merge' scripts/` — outside the gate; gating those
+  // was a real over-block that fired on heredocs and greps (VGATE round 8).
+  const bareGh = hasBareGhWord(command);
+  return bareGh && /(^|\s)gh\s+pr\s+merge/.test(probe);
+}
+
+export function isGitOp(command: string): boolean {
+  // RAW, as before. Normalizing here made a quoted MENTION look like an
+  // operation (`echo "git commit -m x"`, `rg 'gh pr merge' scripts/` matched
+  // only after the quotes were stripped), turning harmless commands into gate
+  // hits — a regression introduced by the `gh pr "merge"` fix and caught by
+  // VGATE round 4.
+  if (GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command)) return true;
+  if (isGhPrMergeCommand(command) && hasBareGhWord(command)) return true;
+  return isAdminMergeCommand(command);
 }
 
 // ── Merge registry gate (#138) ────────────────────────
@@ -650,27 +880,118 @@ export function logMergeGateDecision(
 //   gh pr merge --admin 123          (flag BEFORE the number)
 //   gh pr merge 123 --admin
 //   gh pr merge --admin=true 123
+//   gh pr merge 123 --admin=TRUE     (any Go-true spelling: 1, t, T, True …)
 //   gh pr merge --squash --admin 123
 //   gh pr merge --admin              (no number → cannot bind evidence)
 const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40})\s*-->/g;
 
 /**
- * Is an `--admin` flag present in a `gh pr merge` command? `--admin=false` is
- * NOT a bypass (gh explicitly disables it), so it must not be refused.
- * `--admin=true`, bare `--admin` and `--admin=` (gh's own "true") are.
+ * Is an `--admin` flag present in a `gh pr merge` command, with a value that
+ * makes the merge an ADMIN merge? Bare `--admin`, `--admin=`, every Go-true
+ * spelling (`=true`, `=TRUE`, `=True`, `=t`, `=T`, `=1`, `="true"`) and every
+ * value we cannot RESOLVE are. Only a resolvable Go-FALSE value (`0`, `f`, `F`,
+ * `FALSE`, `false`, `False`) is an ordinary merge and must not be refused.
+ *
+ * FAIL-CLOSED ON THE UNRESOLVABLE (why this is not `val === "true"`):
+ * we see a raw command STRING, not argv. Bash lowers `--admin\=true`,
+ * `--admin=$'true'`, ``--admin=`true` ``, `--admin=$(echo true)`,
+ * `--admin=${X:-true}`, `--admin=tr""ue` and `--admin=true; …` all to a real
+ * `--admin=true` before gh sees them. We cannot evaluate a shell, so we do not
+ * pretend to: a value that is not a resolvable false spelling is treated as an
+ * admin merge. The previous rule (`=== "true"` only) returned false for every
+ * one of those spellings, and the command then fell through to the merge-registry
+ * gate and merged WITH NO EVIDENCE — a live fail-open in the declared arg-order
+ * evasion class (#930 review P1, cycle 2; VGATE cycle 2).
+ *
+ * COST OF THE SAFE DIRECTION: `--admin=zork`, `--admin=''` and a quoted
+ * `--title "--admin=TRUE"` are now refused although gh would have rejected the
+ * command (or read the flag as a value). Refusing a command gh would have
+ * refused anyway costs nothing; accepting one it would have merged is the hole.
+ * The value charset excludes shell metacharacters and quotes so a compound
+ * command's tail (`--admin=true && gh pr merge …`) is not swallowed into the value.
+ *
+ * QUOTES, ESCAPES AND LINE CONTINUATIONS ARE RESOLVED BEFORE MATCHING. Bash
+ * re-joins a single token across these, so `--ad""min=true`, `--ad\min=true`,
+ * `--ad\<newline>min=true` and `--ad'min'=true` all reach gh as a real
+ * `--admin=true` while the raw string carries no literal `--admin`. Three VGATE
+ * rounds each found another member of this family being missed, so the scanner
+ * no longer enumerates: see `normalizeForFlagScan` (what is resolved) and
+ * `isUnresolvableFlagToken` (what is refused instead of guessed at).
+ *
+ * STATED LIMITS — WHAT THIS CANNOT SEE (a raw-string scanner, not a shell). These
+ * are OPEN GAPS, not safe assumptions, and are tracked for argv-level enforcement.
+ * Read this as the authoritative list; if a shape is not matched by the code and
+ * not named here, that is a bug in this file, not a safe assumption.
+ *   - `xargs`/`{}` assembling the flag from parts that never co-occur with the
+ *     word `admin`, e.g. `printf '%s' --ad | xargs -I{} gh pr merge 123 {}min`;
+ *   - anything expanded UPSTREAM of the string (a `$VAR` in the caller's argv);
+ *   - an equivalent merge issued as `gh api … /merge`, through a `gh alias`, or
+ *     from a `$VAR`-expanded argv;
+ *   - in `isGitOp`, a `$VAR`-SUPPLIED verb with NO admin flag is not treated as a
+ *     merge, so it bypasses the MERGE-REGISTRY gate (`V=pr; gh $V merge 123
+ *     --squash`). With an admin flag the rule below catches it, and an ANSI-C verb
+ *     (`gh p$'r' …`) is refused by rule 2(a) regardless. The registry gate is
+ *     outside #930's scope, so this is noted, not fixed.
+ * (Brace expansion `--{admin,squash}` and a construct-supplied dash such as
+ * `-${V:--}admin=true` were on this list in an earlier revision and are now
+ * CLOSED by rule 2 below — verified, not assumed.)
+ *
+ * A complete gate cannot be built on this surface: it needs argv-level
+ * enforcement (a `gh` shim/allowlist). This file's claims are bounded to what it
+ * actually implements:
+ *   - resolvable splices (quotes, backslashes, line continuations) are resolved;
+ *   - a construct plus the word `admin` is refused (rule 2) — that is what closes
+ *     the ASSEMBLED-FLAG family `-${V:--}admin=true`, `$V-admin=true`,
+ *     `-$(printf %s '-')admin=true`, which VGATE round 7 showed reaching gh as
+ *     `--admin=true` while the earlier dash-anchored rule missed them;
+ *   - a spliced VERB is refused rather than read (`isGhPrMergeCommand`).
+ * It does NOT claim exhaustive coverage, and it does not:
+ *   - OVER-BLOCKS, acceptably and visibly: any `gh pr merge` carrying a construct
+ *     (a `$`, backtick or brace) AND the word `admin` is refused unless it has
+ *     head-bound evidence — including a harmless `echo "gh pr merge 1
+ *     --admin=true"`, and a `--body "ask the admin"` beside a `$VAR`. The remedy
+ *     is the mandated `scripts/admin-merge.sh`; the alternative was a bypass.
  */
 export function hasAdminMergeFlag(command: string): boolean {
-  // Token-anchored: `--admin` must be a WHOLE flag. A `--adminx` typo is not a
-  // bypass (gh rejects it as an unknown flag), and refusing it would be exactly
-  // the false block this rail must not produce.
-  const re = /(?:^|[\s"'])--admin(?:=(\S*))?(?=$|[\s"'])/g;
+  // 1. Normalize the splicing bash resolves before gh sees argv (quotes,
+  //    backslashes, line continuations), so `--ad""min=true` and `--ad\min=true`
+  //    are seen as `--admin=true` rather than hiding the flag. (VGATE rounds 1-3:
+  //    each of these returned FALSE while gh received a real admin merge.)
+  const probe = normalizeForFlagScan(command);
+  // 2. Fail CLOSED on what we cannot resolve. Guessing here is what produced
+  //    seven rounds of fail-opens, so the rule is "unresolvable ⇒ admin merge".
+  //    (a) ANSI-C quoting, or a `$`/backtick inside a literal `--` token;
+  if (isUnresolvableFlagToken(command, probe)) return true;
+  //    (b) a construct that could ASSEMBLE the flag — the dashes included. VGATE
+  //    round 7: `-${V:--}admin=true`, `$V-admin=true` and
+  //    `-$(printf %s '-')admin=true` all reach gh as `--admin=true`, and a rule
+  //    anchored on a literal `--` misses every one. Keying on the CONSTRUCT plus
+  //    the word `admin` (rather than on a dash position) is what closes the
+  //    family; it is narrow in the direction that matters, because a construct
+  //    WITHOUT the word `admin` — e.g. the common `gh pr merge "$PR" --squash` —
+  //    is untouched.
+  if (hasUnresolvableConstruct(command) && /admin/i.test(command)) return true;
+  // 3. The literal flag. Token-anchored: `--admin` must be a WHOLE flag. A
+  //    `--adminx` typo is not a bypass (gh rejects it as an unknown flag), and
+  //    refusing it would be exactly the false block this rail must not produce.
+  //    `=` may carry a Go-false value; anything else is a bypass (see GO_FALSE).
+  const re = /(?:^|[\s])--admin(?:=([^\s;&|()`$<>]*))?(?=$|[\s;&|()`$<>])/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(command)) !== null) {
+  while ((m = re.exec(probe)) !== null) {
     const val = m[1];
-    if (val === undefined || val === "" || val === "true") return true;
+    // ONLY a resolvable Go-false value makes this an ordinary merge. Bare (`val
+    // === undefined`), empty, Go-true, and unparseable values all count as an
+    // admin merge: we fail CLOSED on anything we cannot resolve.
+    if (val === undefined || !GO_FALSE.has(val)) return true;
   }
   return false;
 }
+
+/**
+ * The Go `strconv.ParseBool` spellings that mean FALSE — the ONLY values under
+ * which `--admin=<v>` is not an admin merge. Case-SENSITIVE, exactly as Go is.
+ */
+const GO_FALSE = new Set(["0", "f", "F", "FALSE", "false", "False"]);
 
 /**
  * Extract the PR number from a `gh pr merge` command REGARDLESS of flag order
@@ -709,8 +1030,10 @@ export function extractMergePrNumber(command: string): number | null {
  * Evidence must be **non-vacuous**, not merely present (#930 adversarial class
  * 2 — forgery/vacuity). A marker line alone proves nothing: the evidence body
  * must carry the comparison's own counts, with `unique to this PR: 0`. A body
- * computed over an empty or unparsed failing set cannot produce this line, and a
- * forged marker would have to reconstruct it.
+ * computed over an empty or unparsed failing set cannot produce this line without
+ * the comparison having produced *some* numeric line — but see the
+ * `evidenceBodyIsCertifying` docstring for what this honestly cannot prove: a
+ * hand-typed line is one `printf` away, so this closes vacuity, not forgery.
  */
 /** The body's `PR head:` value, lowercased, or null when absent. */
 export function evidenceHeadInBody(body: string): string | null {
@@ -738,15 +1061,17 @@ export function evidenceBodyIsCertifying(body: string, markerSha: string): boole
   const marker = markerSha.toLowerCase();
   // Prefix-tolerant in BOTH directions, mirroring the caller's head binding: a
   // short SHA is legitimate in either line, but the two must denote one commit.
-  const headNamesTheMarker = marker.length >= 40
-    ? bodyHead === marker
-    : marker.startsWith(bodyHead) || bodyHead.startsWith(marker);
+  // (This was asymmetric until review cycle 2: a full-length marker with a
+  // short `PR head:` returned false while the reverse returned true, so the
+  // comment described a tolerance the code did not have.)
+  const headNamesTheMarker =
+    marker === bodyHead || marker.startsWith(bodyHead) || bodyHead.startsWith(marker);
   return (
     headNamesTheMarker &&
     /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0\b/.test(body) &&
     // The lane is named in the provenance line (`... union of N runs of
     // <lane>:`) — accept it, but never accept a missing provenance line.
-    /main compared \(union of \d+ runs?(?: of \S+)?\):/.test(body)
+    /main compared \(union of \d+ runs?(?: of [^:()]+)?\):/.test(body)
   );
 }
 
@@ -1011,7 +1336,7 @@ export default function (pi: ExtensionAPI) {
       // the PR carries evidence bound to the CURRENT head SHA. On a pass it
       // FALLS THROUGH to the merge-registry gate — the two gates are
       // independent and both must pass.
-      if (/gh\s+pr\s+merge\b/.test(command) && hasAdminMergeFlag(command)) {
+      if (isAdminMergeCommand(command)) {
         const adminPr = extractMergePrNumber(command);
         // #426 context resolution, reuse: --repo / GH_REPO / cd / fallback.
         const adminCtx = resolveRepoContext(command, null);

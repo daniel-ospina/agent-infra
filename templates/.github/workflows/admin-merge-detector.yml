@@ -32,7 +32,10 @@ name: Admin-merge detector
 # pre-merge rail false-blocks on it, and this detector would file a FALSE issue
 # for it (a detector that cries wolf gets disabled). Set WORKFLOW to the test
 # lane of the repo this file is materialized into.
-#   4. unique non-empty → file an issue; always exit 0.
+#   4. unique non-empty → file an issue. The job's OWN result is honest: exit 1 if the
+#      issue could not be filed (a detected-but-unreported merge must not read as a
+#      passing run). Detection OUTCOMES exit 0 — nothing `needs:` this job and it is
+#      not a required check, so it never gates the merge path.
 #
 # `templates/.github/workflows/admin-merge-detector.yml` is the source of truth
 # and `scripts/sync-ci-workflows.sh` materializes `.github/workflows/` — so
@@ -138,8 +141,17 @@ jobs:
             echo "Next time use \`scripts/admin-merge.sh <PR>\` — it refuses this merge before it lands."
           } > issue-body.md
 
-          gh issue create \
+          # A DETECTED-but-unreported merge must not read as a passing run. The
+          # warning-then-exit-0 shape is the same "cannot report looks like
+          # nothing to report" hole this job exists to close (a repo without the
+          # `bug` label would silently never report). Exit non-zero: this job is
+          # `workflow_run`-triggered and nothing `needs:` it, so it gates nothing —
+          # but its OWN result must be honest.
+          if ! gh issue create \
             --title "admin-merge carried unique failures (${MERGE_SHA:0:7})" \
             --label bug \
-            --body-file issue-body.md || echo "::warning::could not file the detector issue"
+            --body-file issue-body.md; then
+            echo "::error::detected $unique_count unique failure(s) at $MERGE_SHA but could not file the issue — this merge is UNREPORTED"
+            exit 1
+          fi
           exit 0
