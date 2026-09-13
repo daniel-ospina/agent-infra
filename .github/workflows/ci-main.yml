@@ -348,7 +348,9 @@ jobs:
             //
             // The title used to carry the SHA (`main broken by merge (cc288d5)`), which is
             // unique by construction, so it could never match an open issue and every failure
-            // minted a duplicate — 33 since 08-13 (#850, #837 still open).
+            // minted a duplicate — 35 since 08-13 as of 2026-09-13 (#850 and #837 were filed
+            // for this defect and have since been CLOSED as stale duplicates; #975 and #976
+            // were two OPEN duplicates minted 5s apart by the race this change also guards).
             //
             // A bare constant title would dedup but OVER-collapse: the filer never recorded
             // which job failed, so two unrelated breakages would share one issue, and closing
@@ -373,7 +375,12 @@ jobs:
             // enforce-skills.yml:109), so an issue stays open after main recovers and later
             // same-set failures append to it. Both are bounded and disclosed rather than fixed
             // here — close-on-success is a new mechanism, not a dedup fix.
-            const failed = Object.entries(JSON.parse(process.env.NEEDS || '{}'))
+            // `|| {}` after the parse too: NEEDS is `${{ toJSON(needs) }}`, and a literal `null`
+            // (not `{}`) makes Object.entries throw BEFORE the try/catch below, so the run would
+            // error out having filed nothing. Not reachable today (all 7 jobs are wired into
+            // `needs:`, so it is always a populated object) — but it is the only throw-before-filing
+            // path in this step, and the safe direction here is "file", never "crash quietly".
+            const failed = Object.entries(JSON.parse(process.env.NEEDS || '{}') || {})
               .filter(([, v]) => v.result === 'failure')
               .map(([k]) => k)
               .sort();
@@ -416,5 +423,6 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: TITLE,
-              body: `${detail}\n\n_Recurrences with the same failing job set are appended to this issue rather than filed as duplicates (#937)._`,              labels: ['bug'],
+              body: `${detail}\n\n_Recurrences with the same failing job set are appended to this issue rather than filed as duplicates (#937)._`,
+              labels: ['bug'],
             });
