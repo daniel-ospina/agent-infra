@@ -382,33 +382,94 @@ export function nonAdversarialCapViolations(table: RiskRow[]): string[] {
   return violations;
 }
 
-/** The adversarial branch of the executable fixer loop: `then BOUND=<N>; fi`. */
-const EXECUTABLE_BOUND_RE = /then\s+BOUND=(\d+);\s*fi/g;
-
 /**
- * The bound the fixer loop actually EXECUTES — parsed from the `then BOUND=<N>;
- * fi` statement, never from the `adversarial-bound: cap=N` anchor comment. The
- * anchor and the executable are two separate surfaces: a comment is not a
- * guard, so the pin must read the code (the #723 defect shape — a runtime bound
- * diverging from the declared one while nothing fails).
+ * Extract the fenced ```bash blocks from the fixer-loop doc. The loop is
+ * instructions an agent copies and runs, so "what executes" is the code inside
+ * the fences — not the surrounding prose, and not a commented-out line.
  */
-export function executableAdversarialBounds(src: string): number[] {
-  const out: number[] = [];
-  for (const m of src.matchAll(EXECUTABLE_BOUND_RE)) out.push(Number(m[1]));
+export function executableBashBlocks(md: string): string[] {
+  const out: string[] = [];
+  for (const m of md.matchAll(/```bash\n([\s\S]*?)```/g)) out.push(m[1]);
   return out;
 }
 
-/** Violations when the fixer loop's EXECUTED adversarial bound ≠ the declared cap. */
+/**
+ * Strip shell comments from a line so a commented-out statement can never
+ * satisfy a pin. `#` is a comment only at the start of a word (line start or
+ * after whitespace) and only outside single/double quotes — so `"${VAR#pfx}"`
+ * and `${ADVERSARIAL_BOUND:-0}` are left intact.
+ */
+function stripLineComment(line: string): string {
+  let quote = "";
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+
+/** Comment-stripped copy of shell code. */
+export function stripShellComments(code: string): string {
+  return code.split("\n").map(stripLineComment).join("\n");
+}
+
+/**
+ * The `BOUND=<N>` assignments the fixer loop actually EXECUTES, in source
+ * order: the pre-loop general default (10) and the adversarial branch (the
+ * declared cap). Parsed from fenced bash with comments stripped, so a
+ * commented-out `then BOUND=2; fi` yields only the default (a violation), and
+ * `BOUND=10` → `BOUND=100` changes the parsed value. The `\b` before `BOUND`
+ * makes `${ADVERSARIAL_BOUND:-0}` — where `_` is a word character — no match.
+ *
+ * Text, not a runtime value, is the only surface available here: the fixer
+ * loop is a markdown doc an agent copies. LIMIT (stated, not hidden): this
+ * proves the DOCUMENTED code diverges when it does; it cannot prove a human
+ * ran a different snippet. Numeric equality — never `includes("BOUND=10")`,
+ * which `"BOUND=100".includes("BOUND=10")` satisfies (the cycle-2 bypass) —
+ * is what binds the assertion to the value rather than a substring.
+ */
+export function executableBoundAssignments(src: string): number[] {
+  const out: number[] = [];
+  for (const block of executableBashBlocks(src)) {
+    for (const m of stripShellComments(block).matchAll(/\bBOUND=(\d+)\b/g)) out.push(Number(m[1]));
+  }
+  return out;
+}
+
+/** The general (non-adversarial) safety cap the executable loop must default to. */
+export const EXECUTABLE_DEFAULT_BOUND = 10;
+
+/**
+ * Violations when the fixer loop's EXECUTED bounds diverge from the declared
+ * contract. Requires exactly TWO executable assignments — the 10-cycle general
+ * default and the declared adversarial cap — in that order, compared
+ * numerically against comment-stripped code. Both cycle-2 residuals are
+ * therefore violations, not silent passes: commenting the branch out leaves
+ * one assignment, and `BOUND=10` → `BOUND=100` leaves `[100, 2]`.
+ */
 export function executableBoundViolations(src: string): string[] {
-  const bounds = executableAdversarialBounds(src);
-  if (bounds.length !== 1) {
+  const bounds = executableBoundAssignments(src);
+  if (bounds.length !== 2) {
     return [
-      `fixer-loop: expected exactly 1 \`then BOUND=<N>; fi\` adversarial branch, found ${bounds.length}`,
+      `fixer-loop: expected exactly 2 executable \`BOUND=<N>\` assignments (the general default + the adversarial branch), found ${bounds.length}`,
     ];
   }
-  if (bounds[0] !== ADVERSARIAL_CAP) {
+  if (bounds[0] !== EXECUTABLE_DEFAULT_BOUND) {
     return [
-      `fixer-loop: the EXECUTED adversarial bound is ${bounds[0]}, but the declared cap is ${ADVERSARIAL_CAP}`,
+      `fixer-loop: the EXECUTED general default bound is ${bounds[0]}, expected ${EXECUTABLE_DEFAULT_BOUND}`,
+    ];
+  }
+  if (bounds[1] !== ADVERSARIAL_CAP) {
+    return [
+      `fixer-loop: the EXECUTED adversarial bound is ${bounds[1]}, but the declared cap is ${ADVERSARIAL_CAP}`,
     ];
   }
   return [];
@@ -471,7 +532,13 @@ test("#838 does not re-cap non-adversarial work (3 / 5 / 10 intact)", () => {
 
 test("the executable fixer loop keeps the 10-cycle default and adds the adversarial branch", () => {
   const src = ADVERSARIAL_SOURCES["skills/code-review/references/fixer-loop.md"];
-  ok(src.includes("BOUND=10"), "the non-adversarial safety cap must stay 10 in the executable loop");
+  // Exact numeric parity on the parsed executable — never `includes("BOUND=10")`,
+  // which `BOUND=100` satisfies (cycle-2 residual #874).
+  deepEqual(
+    executableBoundAssignments(src),
+    [EXECUTABLE_DEFAULT_BOUND, ADVERSARIAL_CAP],
+    "the executable loop must assign exactly the general default then the adversarial cap",
+  );
   ok(src.includes("ADVERSARIAL_BOUND"), "the executable loop must honour the declared adversarial domain");
   ok(
     src.includes('EXIT_REASON="adversarial-capped"'),
@@ -537,7 +604,43 @@ test("rejects an executable bound that drifted from the declared cap (BOUND=3, a
   ok(v.some((s) => s.includes("EXECUTED adversarial bound is 3")), `expected an executed-bound violation, got: ${v.join(" | ")}`);
 });
 
-test("rejects a missing adversarial branch in the executable loop", () => {
+test("rejects a COMMENTED-OUT adversarial branch (executed default stays 10 — cycle-2 residual #874)", () => {
+  const path = "skills/code-review/references/fixer-loop.md";
+  const src = ADVERSARIAL_SOURCES[path];
+  const commented = src.replace(
+    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+    '# if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+  );
+  ok(commented !== src, "control did not apply — the adversarial BOUND branch was not found");
+  // The anchor is untouched and the old `then BOUND=<N>; fi` regex still
+  // matched the comment, so anchor parity AND the old text match stayed green —
+  // this is the bypass the comment stripper exists to close.
+  deepEqual(
+    adversarialBoundViolations({ ...ADVERSARIAL_SOURCES, [path]: commented }),
+    [],
+    "anchor parity is expected to stay green",
+  );
+  const v = executableBoundViolations(commented);
+  ok(v.some((s) => s.includes("found 1")), `expected found-1 (only the default executes), got: ${v.join(" | ")}`);
+});
+
+test("rejects a mutated general default that `includes('BOUND=10')` would miss (BOUND=100 — cycle-2 residual #875)", () => {
+  const path = "skills/code-review/references/fixer-loop.md";
+  const src = ADVERSARIAL_SOURCES[path];
+  const bumped = src.replace("\nBOUND=10\n", "\nBOUND=100\n");
+  ok(bumped !== src, "control did not apply — the `BOUND=10` default was not found");
+  ok(
+    bumped.includes("BOUND=10"),
+    "`BOUND=100` contains `BOUND=10` — the old substring check stayed green; that is the residual",
+  );
+  const v = executableBoundViolations(bumped);
+  ok(
+    v.some((s) => s.includes("general default bound is 100")),
+    `expected a general-default violation, got: ${v.join(" | ")}`,
+  );
+});
+
+test("rejects a dropped adversarial branch (one assignment, not two)", () => {
   const dropped = ADVERSARIAL_SOURCES["skills/code-review/references/fixer-loop.md"].replace(
     /if \[ "\$\{ADVERSARIAL_BOUND:-0\}" = "1" \]; then BOUND=2; fi\n/,
     "",
@@ -547,7 +650,7 @@ test("rejects a missing adversarial branch in the executable loop", () => {
     "control did not apply — the adversarial BOUND branch was not found",
   );
   const v = executableBoundViolations(dropped);
-  ok(v.some((s) => s.includes("found 0")), `expected found-0, got: ${v.join(" | ")}`);
+  ok(v.some((s) => s.includes("found 1")), `expected found-1, got: ${v.join(" | ")}`);
 });
 
 // ── The runtime mapping ─────────────────────────────────────────────────────

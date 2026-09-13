@@ -78,7 +78,7 @@ At each verifier gate (scope-verify, plan-verify, verify):
 2. Each verifier returns structured output with `NO ISSUES FOUND` or an issue list
 3. The gate stays locked (blocks write/edit/bash/MCP) until ALL dispatched verifiers return clean
 4. If any verifier finds issues → fix them → re-dispatch ALL verifiers
-5. Only `NO ISSUES FOUND` from every verifier advances the gate
+5. Only `NO ISSUES FOUND` from every verifier advances the gate (adversarial domain: `THREAT SURFACE COVERED` substitutes — see below)
 
 **The gate does NOT advance on dispatch count alone.** Verifier content is checked. A verifier that finds issues keeps the gate locked so the agent must fix and re-verify.
 

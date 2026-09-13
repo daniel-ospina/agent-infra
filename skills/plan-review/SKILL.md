@@ -466,7 +466,7 @@ of prior cycles, no investment in defending prior fixes. This prevents confirmat
 
 For each cycle:
 1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions), **plus Reviewer #5** when its trigger fires (new component / new write path / new shared-state owner / new vocabulary definition) or on the final cycle. #5 is dispatched **alongside** the proportional set, never instead of it — N does not drop because #5 fired. If the trigger does not fire, the cycle runs the proportional N only, and the cycle log records `#5: not triggered`.
-2. Parse responses. Reviewers #1–#4: all return `NO ISSUES FOUND` → exit clean; issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
+2. Parse responses. Reviewers #1–#4: all return `NO ISSUES FOUND` → exit clean (adversarial domain: `THREAT SURFACE COVERED` from a fresh reviewer substitutes — see the bounded subsection below); issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
 3. After fixes applied, go to step 1 (repeat cycle)
 
 **Why task sub-agents:** `pi -p` spawns a fresh session. The reviewer has no context
@@ -510,7 +510,7 @@ plan_modified_per_cycle: <json array of booleans>
   This IS skipping the review. Fixing without re-reviewing = no review.
 
 - ❌ Self-declare "I addressed the feedback" as completion
-  Only "NO ISSUES FOUND" from all fresh reviewers is a valid exit signal.
+  Only "NO ISSUES FOUND" from all fresh reviewers is a valid exit signal — except in the adversarial domain, where a fresh reviewer's `THREAT SURFACE COVERED` substitutes (see "Adversarial domain" above).
 
 - ❌ Re-review in the same conversation context
   Confirmation bias makes same-context re-review unreliable.

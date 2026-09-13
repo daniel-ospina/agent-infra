@@ -69,7 +69,7 @@ objective not delivered), #708/PR #823 (2 cycles, converged only under an impose
 
 ## 5. Verification
 
-- `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` — 32 passed, 0 failed (21 baseline + 11 new), including the negative controls (mutated cap / missing anchor / duplicated anchor / re-capped canonical table / **executed** `BOUND=3` with the anchor intact / dropped executable branch) — each must FAIL.
+- `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` — **34 passed, 0 failed** (21 baseline + 13 new), including the negative controls (mutated cap / missing anchor / duplicated anchor / re-capped canonical table / **executed** `BOUND=3` with the anchor intact / dropped executable branch / **commented-out adversarial branch** / **`BOUND=10` → `BOUND=100`**) — each must FAIL. The executable-bound pin parses the fenced bash with shell comments stripped and requires exactly two numeric `BOUND=<N>` assignments (`[10, 2]`), so it binds the effective value rather than source text: a commented-out `then BOUND=2; fi` leaves one assignment, and `BOUND=100` fails the strict default equality that `includes("BOUND=10")` used to wave through.
 - `node scripts/check-skill-lint.test.mjs`, `node scripts/check-skill-lint.mjs --repo .`, `node scripts/check-pi-pin-lockstep.mjs` — green.
 - Bounded code review: **max 2 cycles**, per this change's own rule. A fresh reviewer returning `THREAT SURFACE COVERED` (all 5 declared classes covered, no in-scope bypass reproduced) is a clean exit; residuals are filed, not chased, and the PR body discloses the basis.
 
@@ -94,3 +94,22 @@ Out-of-scope findings — **filed, not chased**: #871 (reported cycle count is o
 **Exit: `adversarial-capped` at 2 cycles — a BOUNDED exit, not a clean one.** Per this change's own rule, the cycle-2 in-scope residuals are **filed, not chased**: #874 (the executable-bound pin's text-vs-effective-value weakness) and #875 (unqualified `NO ISSUES FOUND` sentences left next to the adversarial substitution). No literal `NO ISSUES FOUND` was obtained and no `clean` verdict is claimed.
 
 Disclosure: `[ADVERSARIAL-BOUND] cycles=2 threats=5 covered=3 residuals=#874,#875`
+
+## 7. Resume (2026-09-12, post-merge of main)
+
+`origin/main` was merged into the branch (head `b7a40e2`) before any re-review, so the recorded
+verdict and second-model gate line bind to the final head. Both cycle-2 in-scope residuals were then
+**closed in this PR** rather than carried:
+
+- **#874** — the executable-bound pin now strips shell comments from the fenced bash and parses
+  every `BOUND=<N>` assignment, requiring exactly `[10, 2]` numerically. A commented-out
+  `then BOUND=2; fi` yields `[10]` (violation) and `BOUND=10` → `BOUND=100` yields `[100, 2]`
+  (violation). Negative controls added for both, and the old substring check
+  (`includes("BOUND=10")`, which `BOUND=100` satisfies) was replaced with strict equality.
+- **#875** — `task-workflow-standard` and `plan-review` now qualify their general
+  "only `NO ISSUES FOUND` advances" sentences with the adversarial `THREAT SURFACE COVERED`
+  substitution, so the rule is not read unqualified in multiple places.
+
+Verification: `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` → **34 passed, 0 failed**;
+both bypass mutations were re-applied to the real `fixer-loop.md` and each made the suite red
+(30 passed, 4 failed). The bounded re-review verdict for the merged head is recorded in the PR body.
