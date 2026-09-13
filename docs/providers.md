@@ -91,7 +91,9 @@ that catches what the cheaper reviewers miss. Single-model review means a model'
 own blind spots are structurally invisible to it. The owner traded that quality
 control for cost and simplicity, for four recorded reasons:
 
-1. It required a funded independent model, and none was ever funded (#742, #860).
+1. No usable independent model is available — the one funded window (OpenRouter,
+   2026-09-12) resolved a candidate the owner has ruled out and that stalls with
+   zero tool calls (#742, #860, #978).
 2. It did not enforce what it documented: the `[SECOND-MODEL-GATE]` marker was
    unsigned raw text, so solvency was never verified and any PR-body sentence
    could satisfy it (#977).

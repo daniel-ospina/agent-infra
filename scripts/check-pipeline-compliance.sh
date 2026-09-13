@@ -471,7 +471,7 @@ run_checks() {
   local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no"
   local is_micro=false is_stdcomplex=false
   local tier="unspecified"
-  local files_plain="" files_ends="" runtime_file="" test_evidence="" files_valid="" files_ok="false"
+  local files_plain="" runtime_file="" test_evidence="" files_valid="" files_ok="false"
   # Which issue-side checks actually ran (for the mode-specific PASS line) —
   # reset per call, since run_checks is invoked repeatedly by the SELF_TEST.
   B_CHECKED="no"
@@ -489,11 +489,6 @@ run_checks() {
   if files_valid="$(files_rows "$FILES" 2>/dev/null)"; then
     files_ok="true"
     files_plain="$(printf '%s\n' "$files_valid" | LC_ALL=C awk -F '\t' '{ print $2 }')"
-    # Both ends of every row — the NEW path always, and the previous path
-    # whenever present. Check (f) matches the guarded surface against BOTH
-    # (C2): a content-identical rename moves a guarded file to a new name, and
-    # matching only the new path would let the gate vanish.
-    files_ends="$(printf '%s\n' "$files_valid" | LC_ALL=C awk -F '\t' '{ print $2; if ($3 != "") print $3 }')"
   fi
 
   echo "=== Pipeline Compliance Gate ==="
