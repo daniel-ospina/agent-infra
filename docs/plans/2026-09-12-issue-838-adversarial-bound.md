@@ -32,19 +32,70 @@ objective not delivered), #708/PR #823 (2 cycles, converged only under an impose
 | 3 | Cap **2 cycles** (tighter than the general bound); residuals **filed from cycle 1, not chased** | `proportional-gates` (canonical), `AGENTS.md` §Hard Cap, `code-review`, `plan-review` |
 | 4 | Disclose plainly when a merge rests on threat-list coverage, not a literal `NO ISSUES FOUND` | `AGENTS.md` §Hard Cap + `[ADVERSARIAL-BOUND] cycles=… threats=… covered=… residuals=…` in the PR body |
 
-### 2.1 Own threat surface (this change's declaration — in scope)
+### 2.1 Own threat surface (this change's declaration)
 
-1. **Bound drift** — the adversarial cap reads 2 on one surface and another number elsewhere → the pin requires every surface to carry exactly one anchor and all caps to be equal.
-2. **Silent re-cap of non-adversarial work** — the Low-Medium / Medium-High / High caps (3 / 5 / 10) move → the pin asserts the canonical table is unchanged; `tier-config-parity` already pins runtime ↔ table parity.
-3. **Unbounded-claim laundering** — a bounded exit presented as literal `NO ISSUES FOUND` → a distinct pinned verdict token plus a required PR-body disclosure line.
+This is the acceptance contract for the change. It is deliberately **finite**: a declared list,
+covered by mutation tests, is what makes the exit decidable (and is why a bounded exit needs no
+literal `NO ISSUES FOUND`).
+
+**In scope — accidental drift.** What is under pin is the `### L1 — Exit conditions` fence in
+`skills/code-review/references/fixer-loop.md`, plus the bound values the eight declaring surfaces
+carry. That fence is **agent-facing prose — a prompt a fixer agent reads and follows — not a shell
+program the repo executes.** The pin's contract is therefore *fidelity to the canonical text*; the
+failure mode it exists to catch is drift — an edit that silently stops the document matching the
+intended contract. Each class below has a mutation test that goes red without its guard.
+
+1. **Bound drift** — the adversarial cap reads 2 on one surface and another number elsewhere → every surface carries exactly one anchor and all are equal.
+2. **Silent re-cap of non-adversarial work** — the Low-Medium / Medium-High / High caps (3 / 5 / 10) move → the canonical table is asserted unchanged; `tier-config-parity` already pins runtime ↔ table parity.
+3. **Unbounded-claim laundering** — a bounded, threat-list-covered exit presented as a literal `NO ISSUES FOUND` → the bounded verdict token (`THREAT SURFACE COVERED`) is distinct, and the PR body must carry the `[ADVERSARIAL-BOUND] …` disclosure line.
 4. **Domain-declaration escape** — an adversarial change never classified as one → the declaration is mandatory and binary (`(not adversarial)` required when it does not apply).
-5. **Pin vacuity** — the pin passes on an absent anchor → exactly-one-anchor per surface + negative controls.
+5. **Fence drift** — any edit to the canonical `### L1` block (a commented-out branch, `BOUND=10` → `BOUND=100`, an added forged-marker line) → the exact-text pin requires the block verbatim, exactly once.
+6. **Stray / duplicate block** — a second `### L1`-shaped section or an extra `BOUND=` assignment a fixer could copy instead → exactly-one-heading + no-stray-assignment conditions.
+7. **Renamed / relocated heading** — the fence moved out of its `### L1` section → the heading is part of the pinned block.
+8. **Literal guard-reachability loss** — the `ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}` setup line deleted, or a *literal* duplicate `ADVERSARIAL_BOUND` assignment added (the cycle-1 regression) → the reachability pin requires the setup line exactly once and no other literal reference.
+9. **Pin vacuity by drift** — the pin passes because its anchor vanished → every anchor check fails closed on absence, with negative controls.
 
-### 2.2 Out of scope (filed/left, not chased)
+**Coverage basis (stated so a reviewer can verify it mechanically).** Classes 1, 2, 5, 6, 7, 8 and 9
+are **mutation-tested**: each is a shape applied to the real `fixer-loop.md`/canonical table that
+makes a named assertion in `tier-config-parity.test.ts` go red (the §8.1 mutation table; the
+negative-control tests carry the same names). Classes 3 and 4 are **contract-text invariants** —
+there is no fence mutation for them; they are asserted by the pinned `adversarial-capped` token
+(`canonicalFenceSelfViolations`) / anchor parity (`adversarialBoundViolations`) and enforced by the
+skills the contract lives in (`code-review`, `issue-scoping`). The mutation-test requirement below
+applies to the drift classes; the contract classes are verified against their pinned text.
+
+**Out of scope — adversarial shell-execution semantics against the fence *as code*.** Pre-loop
+variable rebinding that avoids the literal token (guard-name splitting via `v=ADVERSARIAL_` +
+`v+=BOUND` + `printf -v "$v"`), builtin / `[` shadowing, environment injection, and forged
+observation channels are **not** in scope. Rationale:
+
+- The artifact is a **prompt**, read by an agent — the repo never executes it. Its correctness
+  property is that it *says what the contract intends*, not that it is undefeatable by a shell
+  attacker with write access to the session's environment.
+- Forging an observation required an observation channel — *execute the markdown in bash and parse
+  its stdout*. That channel has been **deleted** (§8, approach A); there is nothing left to forge,
+  and **an execution harness must not be re-introduced** to chase these classes.
+- Enumerating spellings of shell-semantic attacks against a document is the exact unbounded loop
+  #838 exists to stop: every fix invites a new spelling (four cycles produced four).
+
+Residuals of this class are **filed, not chased** (#892). Moving the line — declaring any of these
+in scope — is a scoping decision, not a reviewer finding.
+
+**Reviewer challenge rule.** A reviewer's job is (a) to verify each in-scope class above has a
+mutation test that genuinely goes red, and (b) to challenge whether this declaration is **honest** —
+in particular, whether any item placed out of scope is in fact load-bearing for the contract *as
+written* (the document an agent follows). Constructing a new arbitrary-shell-execution attack against
+the fence is **not** a finding under this declaration; a reviewer who believes an out-of-scope vector
+breaks the actual contract must argue it *against this declaration*, with evidence about the
+document, rather than file the vector.
+
+### 2.2 Out of scope (filed/left, not chased — non-adversarial)
 
 - Mechanical test→threat coverage semantics (the pin checks contract text; the reviewer judges coverage).
 - Runtime cycle counting (no counter exists in `review-enforcer`; separate change).
 - Classifying whether a change is adversarial (a scoping judgement; only its explicitness is enforced).
+
+(Adversarial shell-execution semantics are out of scope by §2.1 above, not repeated here.)
 
 ## 3. Design decisions
 
@@ -177,9 +228,10 @@ fourth hardening, the observation channel is removed:
 
 The two in-scope findings are the **same class** (pin vacuity / guard neutering) the simplification
 exists to bound — not a new class — and both are closed by exact text, so no execution was
-reintroduced. Residual, declared as a LIMIT: the pin polices the approved block, its heading, the
-guard's reachability, and stray `BOUND=`; it does not scan arbitrary extra prose for a bound computed
-under another variable/spelling.
+reintroduced. What the pin does *not* scan for — a bound computed under a non-literal
+variable/spelling, or a shadowed builtin — is **out of scope by declaration** (§2.1): the artifact is
+prose an agent reads, not a program the repo executes, so shell-execution semantics against it are
+not part of the contract this pin enforces.
 
 **Mutation evidence** — each mutation applied to the real `fixer-loop.md`, then the real suite run
 (the first failing pin is the substantive one):
@@ -200,3 +252,26 @@ always among them.
 The chosen approach is not clever — it is the absence of cleverness. A pin whose "verification"
 executes the text under test can always be made to observe a forgery; a pin that *is* the text
 cannot.
+
+### 8.2 Re-scope (2026-09-13, cycle-2 review) — the pin vacuity vector is declared, not chased
+
+The cycle-2 fresh reviewers reproduced two further "pin vacuity" vectors (#892): guard-name
+splitting (`v=ADVERSARIAL_` + `v+=BOUND` + `printf -v "$v" 0`) and `[` shadowing, each leaving both
+pin functions green while a *shell executing the markdown* would run the general 10-cycle cap. Those
+reviewers were operating against an **unbounded threat model** — arbitrary shell semantics against
+the fence treated as an executed program. That model is wrong for this artifact, and no pin can
+exhaust it, which is why four cycles produced four new vectors.
+
+This is the re-scope. The declared threat surface is §2.1: **in scope = accidental drift** (any edit
+to the canonical text, any bound change, a stray/duplicate block, a renamed heading, loss of literal
+guard reachability — each has a red-without-guard mutation test above), and **out of scope =
+adversarial shell-execution semantics against the fence as code** (the #892 class, the deleted
+observation channel, environment injection). Rationale: the fence is a prompt consumed by an agent,
+not a program the repo executes; the pin's contract is fidelity-to-canonical-text; and the
+observation channel that made forgery meaningful was deleted (approach A). **The execution harness is
+not re-introduced.** #892 is filed as an out-of-scope residual.
+
+The cycle-3 review was re-briefed accordingly — to test in-scope coverage and to challenge only the
+*honesty* of this declaration (see §2.1's reviewer challenge rule). A reviewer that still disagrees
+must argue the declaration is dishonest (i.e. that an out-of-scope vector breaks the contract *as
+written*), citing §2.1, rather than filing a new vector.
