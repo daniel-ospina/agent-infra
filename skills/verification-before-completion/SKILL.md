@@ -178,9 +178,11 @@ When the verifier sub-agent returns issues: fix flagged issues → re-dispatch �
 
 | Signal | Threshold | Action |
 |--------|-----------|--------|
-| Same issue 3 consecutive cycles | Stalled | Escalate to human with stuck issue + attempted fixes |
-| Non-decreasing issue count 3 cycles + different issues | Honest-stuck | Fixer introducing new bugs — escalate |
+| Recurrence `|current ∩ prev| / |prev|` ≥ `stall_threshold` (default `0.8`) | Fingerprint-stall | Escalate to human with stuck issue + attempted fixes |
+| Recurrence ≥ `stall_threshold` **AND** new issues present **AND** issue count non-decreasing 3 cycles | Honest-stuck | Fixer repeating known issues while adding new ones — escalate |
 | No file changes 2 cycles | Zero-progress | Fixer making no progress — escalate |
+
+> Do not phrase honest-stuck as "non-decreasing count **+ different issues**". That describes the `[0, threshold)` band, which under the old two-sided phrasing satisfied *neither* detector — leaving a non-convergent loop undiagnosed. Recurrence gates *whether* we fire; the new-issue test gates only the *label*.
 
 **Exit outcomes:** CLEAN (zero issues), Convergence (shrinking set → escalate), Stall, Honest-stuck, Capped (10 cycles).
 

@@ -885,11 +885,11 @@ For each cycle:
 
 3. **Stuckness detection (3-layer algorithm)**:
 
-   a. **Fingerprint-stall**: Hash each surviving issue's location+description+suggestion (SHA256). **Recall is `|current ∩ prev| / max(|current|, |prev|)`** — the denominator is the *larger* of the two issue sets, never the previous cycle alone. (With `|prev|` as the denominator, a cycle that repeats all 10 prior issues **and adds 20 new ones** scores 10/10 = 1.0 and is misreported as a stall, suppressing the 20 new issues and — because this branch used to break first — masking honest-stuck entirely.) If recall ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
+   a. **Fingerprint-stall**: Hash each surviving issue's location+description+suggestion (SHA256). **Recurrence is `|current ∩ prev| / |prev|`** — "what fraction of *last cycle's* issues came back?". `|prev|` is the correct denominator and the *only* one: it is the stall signal, so a cycle that repeats all 10 prior issues must score 1.0. (A symmetric denominator — `max(|current|, |prev|)` — inverts this: repeating all 10 prior issues *plus* 5 new ones scores `10/15 = 0.67`, **below** threshold, so the loop reads as ordinary churn on a cycle where nothing was resolved. Do not use it.) If recurrence ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit. **`recurrence ≥ stall_threshold` is sufficient to fire on its own** — it is never combined with a second required condition.
 
-   b. **Honest-stuck**: Track `issues_per_cycle` (the number of issues surviving after each re-review) **and the fingerprint recall of each cycle against the previous one — the same symmetric ratio `fingerprint-stall` uses.** If recall is **below `stall_threshold`** AND issue count is **non-decreasing for 3 consecutive cycles**, the fixer is introducing new issues faster than it resolves existing ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem.
+   b. **Honest-stuck**: Track `issues_per_cycle` (the number of issues surviving after each re-review) **and the same recurrence ratio `fingerprint-stall` uses — `|current ∩ prev| / |prev|`.** Recurrence decides *whether* the loop is stuck; this layer only decides *which label*. If recurrence ≥ `stall_threshold` **and** new issues are arriving (`current \ prev` is non-empty) **and** `issues_per_cycle` is **non-decreasing for 3 consecutive cycles**, the fixer is repeating known issues *while* adding new ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem.
 
-      ⚠️ The predicate is **`recall < stall_threshold`**, *not* "the fingerprints differ". Those are not equivalent: `fingerprint-stall` fires at `recall >= stall_threshold`, so a cycle whose recall falls anywhere in `[0, stall_threshold)` would satisfy **neither** detector if this conjunct were phrased as "fingerprints differ" — leaving a band in which a non-convergent loop goes completely undiagnosed. State both detectors as ratios over the same denominator so they are mutually exhaustive. The executable form of this predicate lives in `references/fixer-loop.md`; **that file and this section must agree.**
+      ⚠️ State this as **recurrence ≥ threshold + new issues present**, *not* as "recurrence < threshold and fingerprints differ". Phrasing the two layers as opposite sides of the threshold hole is what left a band (`[0, threshold)`) in which a non-convergent loop satisfied **neither** detector. The structural fix is that the recurrence test gates *firing* and the new-issue test gates only the *label* — so every heavy-recurrence cycle is diagnosed, and which label it gets is a separate question. The executable form of this predicate lives in `references/fixer-loop.md`; **that file and this section must agree.**
 
    c. **Zero-progress**: Track `files_changed_per_cycle`. If files changed = 0 for 2 consecutive cycles, the fixer is making zero code progress. Exit reason = `zero-progress`. Escalate to human. (Previously mapped onto `fingerprint-stall`, which made three distinct conditions indistinguishable in the persisted record.)
 
@@ -919,11 +919,13 @@ cycles: <N>
 issues_per_cycle: <json array>
 files_changed_per_cycle: <json array>
 detector_fired: <fingerprint-stall|honest-stuck|zero-progress|''>   # which layer fired, or empty
-fingerprint_recall_last_cycle: <0.0-1.0>   # the predicate's actual input
+fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual input; null on a zero-progress exit, which fires before the scan
 skill: code-review
 ```
 
-> **Why `detector_fired` and `fingerprint_recall_last_cycle` are recorded:** without them, "why did this loop exit?" cannot be answered after the fact — the predicate's inputs are gone and only the verdict survives. A run that exited `fingerprint-stall` under the old asymmetric denominator could not be distinguished from a genuine recurring set.
+> **`detector_fired` is never empty when `exit_reason` names a detector** — `zero-progress` sets it too. An empty `detector_fired` alongside a detector exit reads as "no layer fired", which is the opposite of what happened.
+
+> **Why `detector_fired` and `fingerprint_recurrence_last_cycle` are recorded:** without them, "why did this loop exit?" cannot be answered after the fact — the predicate's inputs are gone and only the verdict survives. A run that exited `fingerprint-stall` under the old asymmetric denominator could not be distinguished from a genuine recurring set.
 
 This file enables cross-session staleness detection and loop enforcer integration.
 

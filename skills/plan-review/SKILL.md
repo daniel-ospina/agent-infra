@@ -109,7 +109,7 @@ When review finds issues, the agent attempts to resolve them autonomously before
 | **P0**, needs substantial work | File a GitHub issue via issue-creation, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
 | **P0**, requires human input (data loss, security, ontology choice, cost >$10/mo, legal/compliance) | Pause with structured question + research findings. |
 
-**Stall detection:** If the same issue fingerprint persists across 2+ cycles, file an issue and continue (do NOT stall exit). Only stall exit if the issue is P0 and unfixable.
+**Stall detection:** A fingerprint persisting across 2+ cycles is precisely what the `fingerprint-stall` detector measures — do not hand-diagnose it here. Follow the 3-layer stuckness algorithm in Phase 5: recurrence ≥ `stall_threshold` (default `0.8`) → escalate to a human. Filing a GitHub issue is a **remedy** for a stalled issue, never an alternative to the detector — filing it and continuing is how a stalled loop silently runs to its cycle cap.
 
 
 ### Phase 1 — Review (Parallel Agents)
@@ -484,11 +484,11 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **Stuckness detection (3-layer algorithm)**:
 
-a. **Fingerprint-stall**: Hash each surviving issue's dimension+location+description+suggestion (SHA256). **Recall is `|current ∩ prev| / max(|current|, |prev|)`** — the denominator is the *larger* of the two issue sets, never the previous cycle alone. (With `|prev|` as the denominator, a cycle that repeats all 10 prior issues **and adds 20 new ones** scores 10/10 = 1.0 and is misreported as a stall, suppressing the 20 new issues.) If recall ≥ the stall threshold → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
+a. **Fingerprint-stall**: Hash each surviving issue's dimension+location+description+suggestion (SHA256). **Recurrence is `|current ∩ prev| / |prev|`** — "what fraction of *last cycle's* issues came back?". `|prev|` is the correct denominator and the *only* one: it is the stall signal, so a cycle that repeats all 10 prior issues must score 1.0. (A symmetric denominator — `max(|current|, |prev|)` — inverts this: repeating all 10 prior issues *plus* 5 new ones scores `10/15 = 0.67`, **below** threshold, so the loop reads as ordinary churn on a cycle where nothing was resolved. Do not use it.) **`stall_threshold` defaults to `0.8`** — the same value `code-review/references/fixer-loop.md` reads from `STALL_THRESHOLD`. If recurrence ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit. **`recurrence ≥ stall_threshold` is sufficient to fire on its own** — it is never combined with a second required condition.
 
-b. **Honest-stuck**: Track `issues_per_cycle` (number of issues surviving after each cycle) **and the fingerprint recall of each cycle against the previous one — the same symmetric ratio `fingerprint-stall` uses.** If recall is **below the stall threshold** AND issue count is **non-decreasing for 3 consecutive cycles**, the fixer is introducing new issues faster than it resolves existing ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.**
+b. **Honest-stuck**: Track `issues_per_cycle` (number of issues surviving after each cycle) **and the same recurrence ratio `fingerprint-stall` uses — `|current ∩ prev| / |prev|`.** Recurrence decides *whether* the loop is stuck; this layer only decides *which label*. If recurrence ≥ `stall_threshold` **and** new issues are arriving (`current \ prev` is non-empty) **and** `issues_per_cycle` is **non-decreasing for 3 consecutive cycles**, the fixer is repeating known issues *while* adding new ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.**
 
-   ⚠️ The predicate is **`recall < threshold`**, *not* "the fingerprints differ". Those are not equivalent: `fingerprint-stall` fires at `recall >= threshold`, so a cycle whose recall falls anywhere in `[0, threshold)` would satisfy **neither** detector if this conjunct were phrased as "fingerprints differ" — leaving a band in which a non-convergent loop goes completely undiagnosed. State both detectors as ratios over the same denominator so they are mutually exhaustive.
+   ⚠️ State this as **recurrence ≥ threshold + new issues present**, *not* as "recurrence < threshold and fingerprints differ". Phrasing the two layers as opposite sides of the threshold hole is what left a band (`[0, threshold)`) in which a non-convergent loop satisfied **neither** detector. The structural fix is that the recurrence test gates *firing* and the new-issue test gates only the *label* — so every heavy-recurrence cycle is diagnosed, and which label it gets is a separate question.
 
 c. **Zero-progress**: Track whether the plan doc was modified each cycle. If the plan doc is unchanged for 2 consecutive cycles, the fixer is making zero progress. Exit reason = `zero-progress`. Escalate to human. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.** (Previously mapped onto `fingerprint-stall`, which made three distinct conditions — identical issues recurring, new issues outpacing fixes, and the fixer writing nothing at all — indistinguishable in the persisted record.)
 
@@ -502,10 +502,10 @@ cycles: <N>
 issues_per_cycle: <json array>
 plan_modified_per_cycle: <json array of booleans>
 detector_fired: <fingerprint-stall|honest-stuck|zero-progress|''>   # which layer fired, or empty
-fingerprint_recall_last_cycle: <0.0-1.0>   # the predicate's actual input
+fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual input; null on a zero-progress exit, which fires before the scan
 ```
 
-> **Why `detector_fired` and `fingerprint_recall_last_cycle` are recorded:** without them, "why did this loop exit?" cannot be answered after the fact — the predicate's inputs are gone and only the verdict survives. That is what made a real non-convergent run undiagnosable.
+> **Why `detector_fired` and `fingerprint_recurrence_last_cycle` are recorded:** without them, "why did this loop exit?" cannot be answered after the fact — the predicate's inputs are gone and only the verdict survives. That is what made a real non-convergent run undiagnosable.
 
 **Progress report:** After each cycle, output: "Plan review cycle N: X issues found across N reviewers, Y fixed, Z remaining."
 
