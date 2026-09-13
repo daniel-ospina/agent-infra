@@ -37,7 +37,8 @@
 #                             bogus zero — use only when the test lane is the
 #                             repo's only failing surface)
 #   --provenance <file>       write the examined failing runs as `<sha>:<run-id>`
-#   --runs-report <file>      write `examined=<n>` / `extracted=<n>` counts
+#   --runs-report <file>      write `examined=` / `extracted=` / `completed=` /
+#                             `pending=` counts for the selector's lane runs
 #   --help
 #
 # Exit codes:
@@ -70,6 +71,19 @@
 #   The filter also applies to `--pr`/`--commit`: the PR side and the main side
 #   must come from the SAME lane, or `comm -23` compares two different things.
 #
+# WHAT `--runs-report` MEANS (the completion doctrine):
+#   examined   failing runs in the lane (the ones whose logs are parsed)
+#   extracted  failing runs that yielded at least one `FAILED <nodeid>` line
+#   completed  lane runs that FINISHED (any conclusion — a `cancelled` run is
+#              finished, it just is not red)
+#   pending    lane runs still queued/in-progress
+#   `examined=0` is NOT a failure — a green lane legitimately has none. The
+#   vacuity signal is `completed=0`: it means nothing about this revision was
+#   ever tested, so an empty failing set proves nothing. A failures-only
+#   projection cannot express that, which is how a pre-CI merge certified an
+#   empty set (review P0 #3). Consumers gate on `completed`/`pending`; see
+#   scripts/admin-merge.sh.
+#
 # Env seams (tests only):
 #   CI_FAILURE_SET_GH         the gh command to run (default: `gh`)
 #   CI_FAILURE_SET_WORKFLOW   the workflow filter (default: `python-ci.yml`)
@@ -88,10 +102,16 @@ DEFAULT_WORKFLOW="python-ci.yml"
 REPO_ARGS=()
 WORKFLOW_ARGS=()
 
-# A failing check run. `cancelled` is deliberately EXCLUDED: ci.yml uses
-# `cancel-in-progress`, so a superseded run is cancelled, not failed — counting
-# it as red would pollute every baseline with noise.
-FAILING_RUN_JQ='.[] | select(.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="startup_failure") | "\(.headSha):\(.databaseId)"'
+# A lane run. The projection is TAGGED rather than pre-filtered to failures so
+# ONE listing answers two different questions: which runs failed, AND whether the
+# lane has FINISHED. A failures-only projection cannot see a queued run at all —
+# which is how the chokepoint certified an empty set and merged before CI had
+# completed (the #3420 ratchet it exists to stop).
+#
+# `cancelled` is deliberately not a FAILURE (ci.yml uses `cancel-in-progress`, so
+# a superseded run is cancelled, not red) — but a cancelled run IS completed, so
+# it still counts toward "the lane finished", never toward "the lane failed".
+LANE_RUN_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
@@ -99,15 +119,16 @@ say_err() { printf '%s\n' "$*" >&2; }
 
 # ── selectors ─────────────────────────────────────────────
 
-# list_failing_runs <flag> <value> <limit>  → `<sha>:<run-id>` lines on stdout.
-# <flag> is `--commit` or `--branch`. Exits 1 when gh fails (fail-closed: an
-# unreadable run list must never read as "nothing failed").
-list_failing_runs() {
+# list_lane_runs <flag> <value> <limit> → tagged `<status>\t<conclusion>\t<sha>:<id>`
+# lines for the selector's runs IN THE LANE. <flag> is `--commit` or `--branch`.
+# Exits 1 when gh fails (fail-closed: an unreadable run list must never read as
+# "nothing ran").
+list_lane_runs() {
   local flag="$1" value="$2" limit="$3"
   # shellcheck disable=SC2086
   $GH run list "$flag" "$value" --limit "$limit" \
     ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} \
-    --json databaseId,conclusion,headSha --jq "$FAILING_RUN_JQ"
+    --json databaseId,status,conclusion,headSha --jq "$LANE_RUN_JQ"
 }
 
 # extract_failed_tests <run-id> → sorted-unique nodeids, one per line.
@@ -128,11 +149,12 @@ extract_failed_tests() {
 
 # ── modes ─────────────────────────────────────────────────
 
-# Sets a union of the FAILED nodeids across every failing run in <run-list>.
-# Also writes provenance/counts when requested. Returns 1 on extraction failure.
+# Sets a union of the FAILED nodeids across every FAILING run in <lane-file>,
+# and counts the lane's completion state from the SAME listing. Also writes
+# provenance/counts when requested. Returns 1 on extraction failure.
 collect_union() {
-  local runs_file="$1" provenance="$2" report="$3"
-  local tmp_set="" examined=0 extracted=0 run_id line
+  local lane_file="$1" provenance="$2" report="$3"
+  local tmp_set="" examined=0 extracted=0 completed=0 pending=0 run_id line
   tmp_set="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_set"
   # The provenance file must exist even when NOTHING failed — callers build the
@@ -141,18 +163,35 @@ collect_union() {
   [ -n "$provenance" ] && : > "$provenance"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    run_id="${line##*:}"
+    local status rest conclusion runref
+    status="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    conclusion="${rest%%$'\t'*}"
+    runref="${rest#*$'\t'}"
+    run_id="${runref##*:}"
+    # Completion is counted for EVERY run, failures included: a queued run is
+    # exactly what a failures-only listing cannot see.
+    if [ "$status" = "completed" ]; then
+      completed=$((completed + 1))
+    else
+      pending=$((pending + 1))
+    fi
+    case "$conclusion" in
+      failure|timed_out|startup_failure) ;;
+      *) continue ;;
+    esac
     examined=$((examined + 1))
-    printf '%s\n' "$line" >> "${provenance:-/dev/null}"
+    printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
     local one
     one="$(extract_failed_tests "$run_id")" || { rm -f "$tmp_set"; return 1; }
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_set"
     fi
-  done < "$runs_file"
+  done < "$lane_file"
   if [ -n "$report" ]; then
-    printf 'examined=%s\nextracted=%s\n' "$examined" "$extracted" > "$report"
+    printf 'examined=%s\nextracted=%s\ncompleted=%s\npending=%s\n' \
+      "$examined" "$extracted" "$completed" "$pending" > "$report"
   fi
   sort -u "$tmp_set"
   rm -f "$tmp_set"
@@ -218,7 +257,7 @@ main() {
         say_err "ci-failure-set: ✗ could not resolve head of PR #$pr"; exit 1; }
       [ -n "$head" ] || { say_err "ci-failure-set: ✗ empty head for PR #$pr"; exit 1; }
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-      list_failing_runs --commit "$head" 100 > "$runs" || { rm -f "$runs"; say_err "ci-failure-set: ✗ could not list runs for $head"; exit 1; }
+      list_lane_runs --commit "$head" 100 > "$runs" || { rm -f "$runs"; say_err "ci-failure-set: ✗ could not list runs for $head"; exit 1; }
       collect_union "$runs" "$provenance" "$report" || { rm -f "$runs"; exit 1; }
       rm -f "$runs"
       ;;
@@ -226,7 +265,7 @@ main() {
       [ -n "$commit" ] || { say_err "ci-failure-set: --commit needs a SHA"; exit 2; }
       local runs
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-      list_failing_runs --commit "$commit" 100 > "$runs" || { rm -f "$runs"; say_err "ci-failure-set: ✗ could not list runs for $commit"; exit 1; }
+      list_lane_runs --commit "$commit" 100 > "$runs" || { rm -f "$runs"; say_err "ci-failure-set: ✗ could not list runs for $commit"; exit 1; }
       collect_union "$runs" "$provenance" "$report" || { rm -f "$runs"; exit 1; }
       rm -f "$runs"
       ;;
@@ -234,7 +273,7 @@ main() {
       local runs filtered
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-      list_failing_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
+      list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
       if [ -n "$exclude" ]; then
         awk -F: -v x="$exclude" '$1 != x' "$runs" > "$filtered"
       else

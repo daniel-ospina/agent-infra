@@ -712,11 +712,41 @@ export function extractMergePrNumber(command: string): number | null {
  * computed over an empty or unparsed failing set cannot produce this line, and a
  * forged marker would have to reconstruct it.
  */
-export function evidenceBodyIsCertifying(body: string): boolean {
+/** The body's `PR head:` value, lowercased, or null when absent. */
+export function evidenceHeadInBody(body: string): string | null {
+  const m = /PR head:\s*([0-9a-fA-F]{7,40})\b/.exec(body);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Is `body` a CERTIFYING evidence comment for the marker SHA `markerSha`?
+ *
+ * What this CANNOT do: prove the comparison actually ran. The counts line is
+ * text, and a determined agent can type it. No agent-side check can close that
+ * (it is why the honest limit is stated rather than papered over).
+ *
+ * What it CAN do — and did not, before this fix — is refuse an internally
+ * INCONSISTENT comment. The body's `PR head:` must name the SAME revision as
+ * the marker that unlocked the gate; the caller separately binds the marker to
+ * the CURRENT head. So pasting a valid marker onto an unrelated body (or
+ * hand-typing counts beside a `PR head:` the marker does not name) no longer
+ * certifies.
+ */
+export function evidenceBodyIsCertifying(body: string, markerSha: string): boolean {
+  const bodyHead = evidenceHeadInBody(body);
+  if (bodyHead === null) return false;
+  const marker = markerSha.toLowerCase();
+  // Prefix-tolerant in BOTH directions, mirroring the caller's head binding: a
+  // short SHA is legitimate in either line, but the two must denote one commit.
+  const headNamesTheMarker = marker.length >= 40
+    ? bodyHead === marker
+    : marker.startsWith(bodyHead) || bodyHead.startsWith(marker);
   return (
+    headNamesTheMarker &&
     /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0\b/.test(body) &&
-    /PR head:\s*[0-9a-fA-F]{7,40}/.test(body) &&
-    /main compared \(union of \d+ runs?\):/.test(body)
+    // The lane is named in the provenance line (`... union of N runs of
+    // <lane>:`) — accept it, but never accept a missing provenance line.
+    /main compared \(union of \d+ runs?(?: of \S+)?\):/.test(body)
   );
 }
 
@@ -795,7 +825,7 @@ export function evaluateAdminMergeGate(
       const bound = sha.length >= 40
         ? currentHead.toLowerCase() === sha
         : currentHead.toLowerCase().startsWith(sha);
-      if (bound && evidenceBodyIsCertifying(body)) {
+      if (bound && evidenceBodyIsCertifying(body, sha)) {
         return {
           status: "allow",
           message:

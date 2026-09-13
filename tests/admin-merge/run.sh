@@ -36,6 +36,16 @@
 #  11. `--repo` reaches the RUN calls (`gh run list` / `gh run view`), not just
 #      `pr view` — dropping it compares the WRONG repo and yields a vacuous
 #      "zero unique failures" against an unrelated baseline.
+#  12. THE HEAD MUST HAVE BEEN TESTED (review P0 #3): a queued/in-progress lane
+#      run, or no lane run at all, yields an EMPTY failing set — indistinguishable
+#      from "green". Both must BLOCK, or the rail merges before CI finishes and
+#      the fresh failure lands after the merge (the #3420 ratchet).
+#  13. THE HEAD MUST NOT MOVE (review P1): a rebase between the analysis and the
+#      comment must BLOCK, on the CLEAN path too — not only inside the flake
+#      branch. The merge also carries `--match-head-commit` so GitHub enforces it.
+#  14. A FAILED COMPARISON IS NOT AN EMPTY COMPARISON (review P2): `--diff`
+#      returning non-zero must BLOCK; an unchecked failure leaves an empty file
+#      that reads as "no unique failures" — fail-open.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -90,6 +100,14 @@ has_flag() {
 case "$key" in
   "pr view")
     pr="${3:-}"
+    # head-seq models a PR head that MOVES between resolutions (a rebase landing
+    # mid-run): the Nth `pr view` returns the Nth line.
+    if [ -f "$SCEN/head-seq" ]; then
+      n=$(( $(cat "$SCEN/head-seq-count" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$n" > "$SCEN/head-seq-count"
+      sed -n "${n}p" "$SCEN/head-seq"
+      exit 0
+    fi
     if [ -f "$SCEN/head-$pr" ]; then cat "$SCEN/head-$pr"; exit 0; fi
     [ -f "$SCEN/head" ] && { cat "$SCEN/head"; exit 0; }
     exit 1 ;;
@@ -158,6 +176,14 @@ run_admin() {
 log_failed() { printf 'test (a)\tRun tests\tFAILED %s - AssertionError: boom\n' "$1"; }
 log_passed() { printf 'test (a)\tRun tests\tPASSED %s\n' "$1"; }
 
+# Lane-run fixture lines. The parser reads the lane's COMPLETION state from the
+# SAME `gh run list` projection as its failures (that is the point of P0 #3), so
+# the fixture models the projection: `<status>\t<conclusion>\t<sha>:<run-id>`.
+lane_line() { printf '%s\t%s\t%s:%s\n' "$1" "$2" "$3" "$4"; }
+lane_fail() { lane_line completed failure "$1" "$2"; }
+lane_pass() { lane_line completed success "$1" "$2"; }
+lane_queued() { lane_line in_progress "" "$1" "$2"; }
+
 # Shared comparison helper. The captures below go through this function rather
 # than `"$(bash "$CFS" …)"` because the main-worktree-guard's unverifiable-
 # content gate fails closed on ANY command substitution whose first token is a
@@ -196,11 +222,11 @@ printf '%s\n' "$HEAD_TRAP" > "$SCEN/head"
 X='tests/test_import.py::test_import_count_mismatch_422'
 Y='tests/test_import.py::test_import_wrong_key_422'
 # PR head fails X only.
-printf '%s:101\n' "$HEAD_TRAP" > "$SCEN/runs-$HEAD_TRAP"
+lane_fail "$HEAD_TRAP" 101 > "$SCEN/runs-$HEAD_TRAP"
 log_failed "$X" > "$SCEN/log-101"
 # main: newest run fails Y, older run fails X — so a SINGLE-run baseline (the
 # newest) cannot see X and reads it as new.
-printf 'main1111:201\nmain2222:202\n' > "$SCEN/runs-main"
+{ lane_fail main1111 201; lane_fail main2222 202; } > "$SCEN/runs-main"
 log_failed "$Y" > "$SCEN/log-201"
 log_failed "$X" > "$SCEN/log-202"
 
@@ -240,9 +266,9 @@ new_scen flaky
 HEAD_FLAKE="bbbb000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_FLAKE" > "$SCEN/head"
 FL='tests/test_flaky.py::test_sometimes'
-printf '%s:301\n' "$HEAD_FLAKE" > "$SCEN/runs-$HEAD_FLAKE"
+lane_fail "$HEAD_FLAKE" 301 > "$SCEN/runs-$HEAD_FLAKE"
 log_failed "$FL" > "$SCEN/log-301"
-printf 'main3333:401\n' > "$SCEN/runs-main"
+lane_fail main3333 401 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-401"
 log_passed "$FL" > "$SCEN/log-after-301"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
@@ -271,9 +297,9 @@ new_scen block
 HEAD_GEN="cccc000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_GEN" > "$SCEN/head"
 NEW='tests/test_new.py::test_brand_new_failure'
-printf '%s:501\n' "$HEAD_GEN" > "$SCEN/runs-$HEAD_GEN"
+lane_fail "$HEAD_GEN" 501 > "$SCEN/runs-$HEAD_GEN"
 log_failed "$NEW" > "$SCEN/log-501"
-printf 'main4444:601\n' > "$SCEN/runs-main"
+lane_fail main4444 601 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-601"
 cp "$SCEN/log-501" "$SCEN/log-after-501"   # the retry FAILS again
 run_admin 42 --main-runs 1 >/dev/null 2>&1
@@ -296,9 +322,9 @@ echo "== 5. unreadable log → extraction failure → BLOCK (never a vacuous pas
 new_scen vacuous
 HEAD_VAC="dddd000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_VAC" > "$SCEN/head"
-printf '%s:701\n' "$HEAD_VAC" > "$SCEN/runs-$HEAD_VAC"
+lane_fail "$HEAD_VAC" 701 > "$SCEN/runs-$HEAD_VAC"
 : > "$SCEN/fail-log-701"          # `gh run view --log-failed` fails
-printf 'main5555:801\n' > "$SCEN/runs-main"
+lane_fail main5555 801 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-801"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
@@ -311,9 +337,9 @@ echo "== 6. evidence structure (marker + counts + provenance) =="
 new_scen shape
 HEAD_SHAPE="eeee000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_SHAPE" > "$SCEN/head"
-printf '%s:901\n' "$HEAD_SHAPE" > "$SCEN/runs-$HEAD_SHAPE"
+lane_fail "$HEAD_SHAPE" 901 > "$SCEN/runs-$HEAD_SHAPE"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-901"
-printf 'main6666:1001\n' > "$SCEN/runs-main"
+lane_fail main6666 1001 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-1001"
 run_admin 42 --main-runs 4 >/dev/null 2>&1
 if [ -f "$SCEN/comment" ]; then
@@ -324,6 +350,7 @@ if [ -f "$SCEN/comment" ]; then
   grep -q "^test lane: python-ci.yml$" "$c" && pass "the lane is stated in the evidence" || fail "test lane line missing"
   grep -q "PR failing: 1 | main failing: 1 | unique to this PR: 0" "$c" && pass "counts line exact" || fail "counts line wrong"
   grep -q "Failing runs examined: PR=1 main=1" "$c" && pass "examined/extracted counts recorded" || fail "examined counts missing"
+  grep -q "^Lane completion: PR completed=1 pending=0" "$c" && pass "lane completion recorded (the fact that makes 'empty' mean green)" || fail "lane completion line missing"
   grep -q "Flake classification: none needed" "$c" && pass "clean case records no re-run" || fail "clean-case flake line wrong"
   grep -q 'comm -23' "$c" && pass "raw comparison in a <details> block" || fail "raw comparison missing"
 else
@@ -333,10 +360,10 @@ fi
 # ── 7. merge flags pass through ───────────────────────────────────────────
 echo "== 7. extra merge flags pass through (not hardcoded) =="
 run_admin 42 --main-runs 4 --squash --delete-branch >/dev/null 2>&1
-if grep -q "pr merge 42 --admin --squash --delete-branch" "$SCEN/calls"; then
-  pass "--squash/--delete-branch forwarded to gh pr merge"
+if grep -q "pr merge 42 --admin --match-head-commit $HEAD_SHAPE --squash --delete-branch" "$SCEN/calls"; then
+  pass "--squash/--delete-branch forwarded and the merge is head-pinned (--match-head-commit)"
 else
-  fail "merge flags were not forwarded"
+  fail "merge flags were not forwarded, or the merge is not head-pinned"
   grep "pr merge" "$SCEN/calls" | sed 's/^/      /'
 fi
 
@@ -345,9 +372,9 @@ echo "== 8. --dry-run is inert =="
 new_scen dry
 HEAD_DRY="ffff000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_DRY" > "$SCEN/head"
-printf '%s:1101\n' "$HEAD_DRY" > "$SCEN/runs-$HEAD_DRY"
+lane_fail "$HEAD_DRY" 1101 > "$SCEN/runs-$HEAD_DRY"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-1101"
-printf 'main7777:1201\n' > "$SCEN/runs-main"
+lane_fail main7777 1201 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-1201"
 run_admin 42 --main-runs 1 --dry-run >/dev/null 2>&1
 rc=$?
@@ -363,6 +390,16 @@ grep -qE '^[[:space:]]*comm[[:space:]]+-23' "$ADM" && fail "admin-merge.sh re-im
 if [ -f "$DETECTOR" ]; then
   grep -qE '^[[:space:]]*comm[[:space:]]+-23' "$DETECTOR" && fail "the detector re-implements comm -23" || pass "detector does not re-implement comm -23"
   grep -q -- '--diff' "$DETECTOR" && pass "detector uses the shared --diff mode" || fail "detector does not use --diff"
+  # CANNOT-RUN must not read as NOTHING-FOUND: the dependency is checked, and no
+  # extraction path warns-then-exits-0 (which is the silent no-op a consumer
+  # without scripts/ used to get for every merge, for ever).
+  grep -q 'ci-failure-set.sh is not in this checkout' "$DETECTOR" && pass "detector refuses to run without its dependency (no silent no-op)" || fail "the detector may no-op silently when scripts/ci-failure-set.sh is absent"
+  if grep -qE '::warning::.*could not extract' "$DETECTOR"; then
+    fail "an extraction failure is still downgraded to a warning — that is the silent no-op"
+  else
+    pass "extraction failures are not downgraded to warnings"
+  fi
+  grep -q -- '--workflow "$WORKFLOW"' "$DETECTOR" && pass "detector lane-filters both sides" || fail "the detector does not lane-filter"
 else
   fail "missing $DETECTOR (the post-merge consumer)"
 fi
@@ -380,15 +417,17 @@ HEAD_BZ="1111000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_BZ" > "$SCEN/head"
 SIB='tests/test_import.py::test_import_count_mismatch_422'
 # The PR fails the sibling that main ALSO fails — in a different run (#3469).
-printf '%s:2001\n' "$HEAD_BZ" > "$SCEN/runs-$HEAD_BZ"
+lane_fail "$HEAD_BZ" 2001 > "$SCEN/runs-$HEAD_BZ"
 log_failed "$SIB" > "$SCEN/log-2001"
 # main, UNFILTERED: the last 10 runs are non-test lanes. Their logs carry no
 # `FAILED <nodeid>` line, so the unfiltered baseline is EMPTY.
-: > "$SCEN/runs-main"
+# main, UNFILTERED: the last 10 runs are non-test lanes. A FAILED-looking
+# entry with no pytest log contributes no nodeid, so the unfiltered baseline is
+# EMPTY even though the lane is red elsewhere.
 i=0
-while [ "$i" -lt 10 ]; do printf 'main9999:%s\n' "$((3000 + i))" >> "$SCEN/runs-main"; i=$((i + 1)); done
+while [ "$i" -lt 10 ]; do lane_fail main9999 "$((3000 + i))" >> "$SCEN/runs-main"; i=$((i + 1)); done
 # main, TEST LANE only: it fails the very sibling the PR is charged with.
-printf 'main8888:4001\n' > "$SCEN/runs-main.by-workflow.python-ci.yml"
+lane_fail main8888 4001 > "$SCEN/runs-main.by-workflow.python-ci.yml"
 log_failed "$SIB" > "$SCEN/log-4001"
 
 run_admin 42 --main-runs 10 --any-workflow >/dev/null 2>&1
@@ -415,9 +454,9 @@ echo "== 11. --repo reaches the run listing (a silent wrong-repo comparison is v
 new_scen repoflag
 HEAD_RP="2222000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_RP" > "$SCEN/head"
-printf '%s:5001\n' "$HEAD_RP" > "$SCEN/runs-$HEAD_RP"
+lane_fail "$HEAD_RP" 5001 > "$SCEN/runs-$HEAD_RP"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-5001"
-printf 'main1234:5002\n' > "$SCEN/runs-main"
+lane_fail main1234 5002 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-5002"
 run_admin 42 --main-runs 1 --repo other-org/other-repo --dry-run >/dev/null 2>&1
 list_line="$(grep -m1 -E '^run list' "$SCEN/calls")"
@@ -434,6 +473,128 @@ case "$view_line" in
   *"--repo other-org/other-repo --log-failed"*) pass "gh run view received --repo" ;;
   *) fail "gh run view did NOT receive --repo"; echo "      $view_line" ;;
 esac
+
+# ── 12. the head must have been TESTED (review P0 #3) ────
+# A queued/in-progress run — or no run at all — yields an EMPTY failing set,
+# which is indistinguishable from "green" unless completion is gated. Without
+# this the rail certifies nothing and merges before CI finishes, and the fresh
+# failure lands after the merge: the #3420 ratchet it exists to stop.
+echo "== 12. the head must have been TESTED (P0 #3) =="
+# (a) the lane is still running for this head
+new_scen pending
+HEAD_PD="6666000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PD" > "$SCEN/head"
+lane_queued "$HEAD_PD" 9001 > "$SCEN/runs-$HEAD_PD"
+lane_fail main6666 9002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9002"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "in-progress lane run → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "has NOT finished" "$TMP/err" && pass "the block names the unfinished lane" || fail "expected the not-finished reason on stderr"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (b) the lane produced NO run at all for this head
+new_scen norun
+HEAD_NR="7777000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NR" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_NR"
+lane_fail main5555 9102 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9102"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "no lane run for the head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "no COMPLETED run of the lane" "$TMP/err" && pass "the block says nothing was tested" || fail "expected the not-tested reason on stderr"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted" || pass "no evidence comment posted"
+
+# ── 13. the head must not MOVE (review P1) ───────────────
+# The head-move check used to live ONLY inside the flake branch, so the common
+# clean path posted evidence for one SHA and merged whatever the head was by
+# then. Here the failing sets match (unique = 0, the CLEAN path) and the head
+# moves between the analysis and the evidence: it must still BLOCK.
+echo "== 13. head moving before the evidence BLOCKS (clean path, P1) =="
+new_scen headmove
+HEAD_HM="3333000000000000000000000000000000000000"
+NEW_HM="4444000000000000000000000000000000000000"
+printf '%s\n%s\n' "$HEAD_HM" "$NEW_HM" > "$SCEN/head-seq"
+printf '0' > "$SCEN/head-seq-count"
+lane_fail "$HEAD_HM" 7001 > "$SCEN/runs-$HEAD_HM"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7001"
+lane_fail main5555 7002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head moved" || fail "expected a non-zero exit, got 0 — the clean path merged a moved head"
+grep -q "head moved before the evidence" "$TMP/err" && pass "the block names the head move" || fail "expected the head-move reason on stderr"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for a moved head" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 14. a FAILED comparison is not an EMPTY comparison (review P2) ──
+# The two `--diff` invocations never checked their exit status, so a failure
+# left an empty file, which reads as "no unique failures" and merges. Fail-open.
+echo "== 14. a failed comparison BLOCKS (fail-open, P2) =="
+new_scen diffail
+HEAD_DF="8888000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DF" > "$SCEN/head"
+lane_fail "$HEAD_DF" 8001 > "$SCEN/runs-$HEAD_DF"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-8001"
+lane_fail main7777 8002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-8002"
+# A parser that succeeds everywhere EXCEPT `--diff`.
+DIFF_FAILING="$TMP/cfs-diff-fails.sh"
+cat > "$DIFF_FAILING" <<'DIFFEOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  [ "$a" = "--diff" ] && { echo "simulated comparison failure" >&2; exit 1; }
+done
+exec bash "$CFS_REAL" "$@"
+DIFFEOF
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FAILURE_SET_SH="$DIFF_FAILING" CFS_REAL="$CFS" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the comparison fails" || fail "expected a non-zero exit, got 0 — fail-open"
+grep -q "comparison failed" "$TMP/err" && pass "the block names the failed comparison" || fail "expected the comparison-failure reason on stderr"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the comparison failed" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 15. the SECOND comparison is guarded too (review P2, flake branch) ──
+# §14 only reaches the FIRST `--diff`. The flake branch has a SECOND one, and an
+# unchecked failure there leaves an empty file → residual 0 → merge. Its own
+# scenario is required or the guard is untested (VGATE finding).
+echo "== 15. a failed SECOND comparison BLOCKS (flake branch, P2) =="
+new_scen diffail2
+HEAD_D2="9999000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_D2" > "$SCEN/head"
+FL2='tests/test_flaky.py::test_sometimes'
+lane_fail "$HEAD_D2" 8201 > "$SCEN/runs-$HEAD_D2"
+log_failed "$FL2" > "$SCEN/log-8201"
+log_passed "$FL2" > "$SCEN/log-after-8201"      # passes on retry → the 2nd --diff runs
+lane_fail main6666 8202 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-8202"
+# A parser that succeeds on the FIRST comparison and fails on the SECOND.
+DIFF_FAILING2="$TMP/cfs-diff2-fails.sh"
+cat > "$DIFF_FAILING2" <<'DIFFEOF2'
+#!/usr/bin/env bash
+for a in "$@"; do
+  if [ "$a" = "--diff" ]; then
+    n=$(( $(cat "$DIFF_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$n" > "$DIFF_COUNT_FILE"
+    [ "$n" -ge 2 ] && { echo "simulated second comparison failure" >&2; exit 1; }
+  fi
+done
+exec bash "$CFS_REAL" "$@"
+DIFFEOF2
+printf '0' > "$TMP/diff-count-2"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FAILURE_SET_SH="$DIFF_FAILING2" CFS_REAL="$CFS" \
+  DIFF_COUNT_FILE="$TMP/diff-count-2" ADMIN_MERGE_POLL_INTERVAL=0 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the SECOND comparison fails" || fail "expected a non-zero exit, got 0 — fail-open in the flake branch"
+grep -q "comparison failed after the re-run" "$TMP/err" && pass "the block names the post-re-run comparison failure" || fail "expected the post-re-run comparison-failure reason on stderr"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the comparison failed" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
 echo ""
 if [ "$failures" -gt 0 ]; then

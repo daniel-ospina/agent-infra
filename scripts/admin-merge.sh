@@ -22,6 +22,18 @@
 #                             evidence). Residual unique still non-empty →
 #                             BLOCK, print the list, exit non-zero, NO merge.
 #
+# TWO PRECONDITIONS THE FAILING SETS ALONE CANNOT EXPRESS:
+#   1. THE HEAD MUST HAVE BEEN TESTED. The lane must have at least one COMPLETED
+#      run for this head, and none still running. A queued run yields an EMPTY
+#      failing set — indistinguishable from "green" — so without this gate the
+#      rail certifies nothing and merges before CI finishes, and the fresh
+#      failure lands after the merge. That is the #3420 ratchet this rail exists
+#      to stop (review P0 #3).
+#   2. THE HEAD MUST NOT MOVE. The marker binds ONE SHA. The head is re-resolved
+#      immediately before the comment and again by GitHub via
+#      `--match-head-commit`, so a rebase inside the window cannot land an
+#      unanalyzed head behind SHA-bound evidence (review P1).
+#
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
 #                              [--workflow <file|name>] [--any-workflow]
@@ -167,14 +179,40 @@ main() {
   info "admin-merge: PR #$PR head $head"
 
   # ── 1. the PR's failing set, with provenance for the flake re-run ────────
+  # Selected by COMMIT, not by PR: the analyzed set must be provably the SHA the
+  # evidence marker names. `--pr` would re-resolve the head internally, so a push
+  # between the two resolutions could analyze one SHA and certify another (#P1).
   local pr_status=0
-  run_failure_set --pr "$PR" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+  run_failure_set --commit "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
     --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" > "$TMP/pr-fails.txt" || pr_status=$?
   if [ "$pr_status" -ne 0 ]; then
     say_err "admin-merge: ✗ BLOCK — could not extract the PR's failing set (parser exit $pr_status)."
     say_err "   Refusing to certify a comparison computed over an unreadable set."
     exit 1
   fi
+
+  # ── 1b. THE HEAD MUST HAVE BEEN TESTED (review P0 #3) ────────────────────
+  # `examined=0` is NOT the signal — a green lane legitimately has no failing
+  # runs. The signal is `completed=0` (nothing ever finished) or `pending>0`
+  # (something has not). Either way an empty failing set proves nothing, so the
+  # rail must not read it as "no unique failures".
+  local pr_completed pr_pending
+  pr_completed="$(report_value "$TMP/pr-report.txt" completed)"
+  pr_pending="$(report_value "$TMP/pr-report.txt" pending)"
+  if [ "${pr_pending:-0}" -gt 0 ]; then
+    say_err "admin-merge: ✗ BLOCK — the test lane has NOT finished for head $head:"
+    say_err "   $pr_pending run(s) still queued/in progress (lane: $lane)."
+    say_err "   An unfinished lane yields an empty failing set, which proves nothing."
+    say_err "   Wait for CI to complete, then re-run the rail."
+    exit 1
+  fi
+  if [ "${pr_completed:-0}" -eq 0 ]; then
+    say_err "admin-merge: ✗ BLOCK — no COMPLETED run of the lane exists for head $head (lane: $lane)."
+    say_err "   Nothing about this revision was tested, so a comparison cannot certify anything."
+    say_err "   Confirm the lane is the right one (--workflow) and that CI ran for this head."
+    exit 1
+  fi
+  info "admin-merge: lane finished for $head ($pr_completed completed run(s))"
 
   # ── 2. main's baseline: the UNION over the last N runs ───────────────────
   local main_status=0
@@ -188,7 +226,12 @@ main() {
   fi
 
   # ── 3. the shared comparison (one implementation, two consumers) ─────────
-  run_failure_set --diff "$TMP/pr-fails.txt" "$TMP/main-fails.txt" > "$TMP/unique.txt"
+  # Its OWN exit status is checked: a failed `--diff` leaves an EMPTY file, which
+  # reads as "no unique failures" and merges. That is fail-open (review P2).
+  if ! run_failure_set --diff "$TMP/pr-fails.txt" "$TMP/main-fails.txt" > "$TMP/unique.txt"; then
+    say_err "admin-merge: ✗ BLOCK — the shared comparison failed (parser exit). No merge."
+    exit 1
+  fi
   local unique_before
   unique_before="$(count_lines "$TMP/unique.txt")"
 
@@ -231,10 +274,13 @@ main() {
     fi
 
     local pr_status2=0
-    run_failure_set --pr "$PR" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+    run_failure_set --commit "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
       --runs-report "$TMP/pr-report2.txt" > "$TMP/pr-fails2.txt" || pr_status2=$?
     [ "$pr_status2" -eq 0 ] || { say_err "admin-merge: ✗ BLOCK — PR failing set unreadable after re-run"; exit 1; }
-    run_failure_set --diff "$TMP/pr-fails2.txt" "$TMP/main-fails.txt" > "$TMP/unique2.txt"
+    if ! run_failure_set --diff "$TMP/pr-fails2.txt" "$TMP/main-fails.txt" > "$TMP/unique2.txt"; then
+      say_err "admin-merge: ✗ BLOCK — the shared comparison failed after the re-run (parser exit). No merge."
+      exit 1
+    fi
     rerun_residual="$(count_lines "$TMP/unique2.txt")"
 
     if [ "$rerun_residual" -gt 0 ]; then
@@ -248,6 +294,21 @@ main() {
     info "admin-merge: ✅ all $unique_before residual failure(s) passed on retry — flaky, not new"
   fi
 
+  # ── 4. THE HEAD IS RE-RESOLVED IMMEDIATELY BEFORE THE EVIDENCE (review P1) ─
+  # This check used to live only inside the flake branch, so the common clean
+  # path resolved the head once, posted evidence for that SHA, and then merged
+  # whatever the head was by then. A rebase/update-branch in that window merged
+  # an unanalyzed head behind SHA-bound evidence. Now it runs unconditionally —
+  # and GitHub is asked to enforce it too, via --match-head-commit below.
+  local head_final
+  # shellcheck disable=SC2086
+  head_final="$(resolve_head "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+  if [ "$head_final" != "$head" ]; then
+    say_err "admin-merge: ✗ BLOCK — head moved before the evidence was posted ($head → $head_final)."
+    say_err "   The evidence would be bound to $head; re-run the rail for the new head."
+    exit 1
+  fi
+
   local pr_count main_count
   pr_count="$(count_lines "$TMP/pr-fails.txt")"
   main_count="$(count_lines "$TMP/main-fails.txt")"
@@ -258,6 +319,10 @@ main() {
   [ -s "$TMP/pr-report2.txt" ] && analyzed="$(printf 'Failing runs examined: PR=%s main=%s (with parseable FAILED lines: PR=%s main=%s)' \
     "$(report_value "$TMP/pr-report2.txt" examined)" "$(report_value "$TMP/main-report.txt" examined)" \
     "$(report_value "$TMP/pr-report2.txt" extracted)" "$(report_value "$TMP/main-report.txt" extracted)")"
+  # The lane's COMPLETION state is part of the evidence: it is the fact that
+  # makes an empty failing set mean "tested and green" rather than "never ran".
+  analyzed="$analyzed
+Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) pending=$(report_value "$TMP/pr-report.txt" pending) | main completed=$(report_value "$TMP/main-report.txt" completed) pending=$(report_value "$TMP/main-report.txt" pending)"
 
   # A vacuous comparison is STATED, never implied. Both sides empty is usually a
   # correct outcome (the lane is green on both sides) — but it is also exactly
@@ -289,7 +354,7 @@ main() {
   info "admin-merge: ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
 
   # shellcheck disable=SC2086
-  $GH pr merge "$PR" --admin ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} ${repo_args[@]+"${repo_args[@]}"}
+  $GH pr merge "$PR" --admin --match-head-commit "$head" ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} ${repo_args[@]+"${repo_args[@]}"}
 }
 
 main "$@"

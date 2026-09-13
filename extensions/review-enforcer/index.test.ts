@@ -2883,17 +2883,29 @@ test("extractMergePrNumber: flag order never hides the PR number", () => {
 });
 
 test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
-  const good = "<!-- admin-merge-safety: " + "a".repeat(40) + " -->\nPR head: " + "a".repeat(40) +
-    "\nmain compared (union of 10 runs): s1:1,s2:2\nPR failing: 0 | main failing: 3 | unique to this PR: 0\n";
-  ok(evidenceBodyIsCertifying(good), "full evidence certifies");
-  ok(!evidenceBodyIsCertifying("<!-- admin-merge-safety: " + "a".repeat(40) + " -->"),
+  const MARK = "a".repeat(40);
+  const good = "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
+    "\nmain compared (union of 10 runs of python-ci.yml): s1:1,s2:2\nPR failing: 0 | main failing: 3 | unique to this PR: 0\n";
+  ok(evidenceBodyIsCertifying(good, MARK), "full evidence certifies (lane-qualified provenance accepted)");
+  ok(evidenceBodyIsCertifying(good.replace(" of python-ci.yml", ""), MARK),
+    "lane-less provenance from an older evidence format still certifies");
+  ok(!evidenceBodyIsCertifying("<!-- admin-merge-safety: " + MARK + " -->", MARK),
     "marker only (empty/unparsed set) does NOT certify");
-  ok(!evidenceBodyIsCertifying(good.replace("unique to this PR: 0", "unique to this PR: 1")),
+  ok(!evidenceBodyIsCertifying(good.replace("unique to this PR: 0", "unique to this PR: 1"), MARK),
     "a non-zero unique count never certifies");
-  ok(!evidenceBodyIsCertifying(good.replace("main compared (union of 10 runs): s1:1,s2:2\n", "")),
+  ok(!evidenceBodyIsCertifying(good.replace("main compared (union of 10 runs of python-ci.yml): s1:1,s2:2\n", ""), MARK),
     "missing main provenance does NOT certify");
-  ok(!evidenceBodyIsCertifying(good.replace("PR failing: 0 | main failing: 3", "PR failing: | main failing: ")),
+  ok(!evidenceBodyIsCertifying(good.replace("PR failing: 0 | main failing: 3", "PR failing: | main failing: "), MARK),
     "missing counts do NOT certify");
+  // The forgery class the review said was NOT closed: the body's `PR head:` must
+  // name the revision the marker names, so a valid marker pasted onto an
+  // unrelated (or hand-typed) body cannot certify.
+  ok(!evidenceBodyIsCertifying(good.replace("PR head: " + MARK, "PR head: " + "c".repeat(40)), MARK),
+    "body `PR head:` disagreeing with the marker does NOT certify");
+  ok(!evidenceBodyIsCertifying(good.replace("PR head:", "PR sha:"), MARK),
+    "a body with no `PR head:` line at all does NOT certify");
+  ok(evidenceBodyIsCertifying(good.replace(MARK, MARK.slice(0, 12)), MARK),
+    "a short SHA in the body names the same revision (prefix-tolerant)");
 });
 
 test("evaluateAdminMergeGate: pure decisions", () => {
@@ -2906,6 +2918,13 @@ test("evaluateAdminMergeGate: pure decisions", () => {
   equal(evaluateAdminMergeGate(1, head, commented("c".repeat(40), ev), false).status, "block", "stale evidence (head X, now Y) → block");
   equal(evaluateAdminMergeGate(1, head, ["<!-- admin-merge-safety: " + head + " -->"], false).status, "block", "vacuous marker → block");
   equal(evaluateAdminMergeGate(1, head, commented(head, ev), false).status, "allow", "head-bound non-vacuous evidence → allow");
+  // A marker bound to the current head, pasted onto a body that names a DIFFERENT
+  // revision: refused (the forgery case the review found open).
+  equal(evaluateAdminMergeGate(1, head, [ev.split("<SHA>").join(head)
+    .replace("PR head: " + head, "PR head: " + "d".repeat(40))], false).status, "block",
+    "evidence body naming another revision → block");
+  equal(evaluateAdminMergeGate(1, head, commented(head, ev.replace(" of python-ci.yml", "")), false).status,
+    "allow", "lane-less provenance (older format) still allowed");
   equal(evaluateAdminMergeGate(null, null, null, true).status, "allow", "override hatch allows (audited)");
 });
 
