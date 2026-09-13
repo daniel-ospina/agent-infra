@@ -321,12 +321,32 @@ let branchOwnership: any = null;
 // of this change carried exactly that query and documented it as the fix; it
 // was a no-op in production.
 //
+// What this fix DOES guarantee: a namespace missing any of the members we call
+// degrades to the documented M1/M2/M3-OFF path instead of throwing. What it does
+// NOT guarantee: it cannot stop a throw from a member that EXISTS but fails at
+// call time, nor from a stale module whose shape drifted under an unchanged
+// name. Those still surface as an aborted tool call, because the host rethrows
+// an extension error to BLOCK the call (`emitToolCall` itself has no try/catch;
+// the host wrapper rethrows "Extension failed, blocking execution"). Closing
+// that larger class means wrapping the branch-ownership block in a try/catch
+// that falls back to the legacy classifier — filed as follow-up, deliberately
+// not attempted here because it restructures a 300-line safety block with no
+// test coverage for the fallback path.
+//
+// Also NOT covered by this guard: the same "loaded but stale" exposure exists in
+// `classify-git.mjs` (only 2 of ~35 destructured targets carry a typeof guard)
+// and in `extensions/auto-sync.ts` (a STATIC import of this same helper, no
+// validation). Both are filed as follow-ups.
+//
 // Consequence, stated plainly: on a stale namespace this guard is DOWN for the
 // life of the process. A reload cannot recover it (the registry survives
 // reloads) — only a full pi restart can. That is still strictly better than
-// breaking git, but it is NOT self-healing, and there is no specifier trick
-// that makes it so. This is why the member list below must stay in sync with
-// the call sites; `test-module-load.mjs` pins that both ways.
+// breaking git, but it is NOT self-healing. Specifier tricks do NOT fix it (see
+// above). A `.ts` helper WOULD hot-reload — jiti re-evaluates a `.ts`
+// dependency on reload — so migrating `shared/branch-ownership.mjs` to `.ts`
+// (or having the loader set `tryNative: false` for extension deps) is the real
+// self-healing path, blocked only by the plain-Node test/consumer imports of
+// the `.mjs`. Filed, not done here.
 const _BRANCH_OWNERSHIP_MEMBERS = [
   "acquireRepoLock", "classifyBranchOp", "decideM1", "decideM2", "decideM3",
   "localBranchExists", "ownershipAllowed", "readBranchState", "releaseRepoLock",
@@ -341,10 +361,15 @@ try {
     console.warn(
       "[main-worktree-guard] ⚠️ branch-ownership.mjs namespace is STALE/incomplete — M1/M2/M3 branch-ownership guards DISABLED (falling back to legacy behavior). Missing exports:",
       _missing.join(", "),
+      "— ⚠️ THIS PERSISTS FOR THE LIFE OF THIS PROCESS: a reload cannot recover it, only a full pi restart can. Do that now if you need branch-ownership enforcement.",
     );
     branchOwnership = null;
   }
 } catch (e) {
+  // Clear the binding FIRST: if the import assigned a namespace and a later
+  // property access in the validation threw (e.g. a jiti-interop getter), the
+  // binding would otherwise stay set with no validation and be used unguarded.
+  branchOwnership = null;
   console.warn("[main-worktree-guard] ⚠️ branch-ownership.mjs failed to load — M1/M2/M3 branch-ownership guards DISABLED (falling back to legacy behavior):", String(e));
 }
 
