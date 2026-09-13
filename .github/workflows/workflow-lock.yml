@@ -51,19 +51,47 @@
 # above). Passing a PR ref to `actions/checkout`, or any step that runs PR
 # content, turns this into the well-known `pull_request_target` RCE vector.
 #
-# WHICH REF — THE MERGE RESULT, NOT THE HEAD (#821). The ref validated below is
-# `pull_request.merge_commit_sha` — the commit GitHub would create by merging this
-# PR into its base — because that is the state that would actually land. The
-# HEAD is the WRONG subject, and using it produced a false RED on every branch cut
-# before a guarded workflow changed: the head still carries the OLD files, the
-# assertions fail, and the job tells the author to "restore the line" for a line
-# they never touched and should not touch — even though merging would leave the
-# base branch's (valid) copies in place. Validating the merge result also handles
-# the case that actually matters: a PR that changes a guarded workflow on top of a
-# base branch that has since changed it too (the merge result is the only place
-# that combination exists). `merge_commit_sha` is null while a PR conflicts with
-# its base; the step below fails closed with its own message in that case rather
+# WHICH REF — THE MERGE RESULT, NOT THE HEAD (#821, #843). The ref validated below
+# is the merge result — the commit GitHub would create by merging this PR into its
+# base — because that is the state that would land if the merge happened now. The
+# HEAD is the WRONG
+# subject, and using it produced a false RED on every branch cut before a guarded
+# workflow changed: the head still carries the OLD files, the assertions fail, and
+# the job tells the author to "restore the line" for a line they never touched and
+# should not touch — even though merging would leave the base branch's (valid)
+# copies in place. Validating the merge result also handles the case that actually
+# matters: a PR that changes a guarded workflow on top of a base branch that has
+# since changed it too (the merge result is the only place that combination
+# exists).
+#
+# ...RESOLVED FROM THE REST API, NOT THE EVENT PAYLOAD (#843). The event field
+# `pull_request.merge_commit_sha` is NULL until GitHub computes mergeability, and
+# that computation is ASYNCHRONOUS. On the first RED run of the new code the field
+# was empty while the PR was MERGEABLE and `refs/pull/<n>/merge` already existed —
+# earlier runs of the same code had won the race and were green, which is what made
+# it a race rather than a bug in one PR. Reading the payload therefore reds a
+# race-dependent subset of perfectly mergeable PRs. The step resolves the value from
+# `GET /repos/{owner}/{repo}/pulls/{number}` instead: that is a LATER SNAPSHOT of the
+# same server-side computation, so it is EXPECTED to have the value, not guaranteed
+# to (no retry — #857). No merge commit has two causes — usually a PR that conflicts
+# with its base, occasionally a computation that has not finished — and either way
+# there is nothing to validate, so the step fails closed with its own message rather
 # than reporting a spurious workflow finding.
+#
+# NOT A GUARANTEE ABOUT WHAT EVENTUALLY LANDS. `merge_commit_sha` is a function of
+# (head, base): if the base branch moves after this job runs, the validated commit
+# is no longer the one a merge would produce, and nothing re-runs this leg until the
+# next pull_request_target event. That is inherent (the payload-based version had
+# the same property), but it means a green here is "valid as of this event", not a
+# standing guarantee.
+#
+# BOOTSTRAP. Because `pull_request_target` checks out the DEFAULT branch, this file
+# cannot be validated by itself: a PR that changes it is checked by main's PREVIOUS
+# copy, so the change takes effect on the next PR after it lands, and there is no way
+# to preview it. Whether that run is green or red here says NOTHING about the new
+# code — measured on the branch that made this change, the OLD leg was RED at 17:44Z
+# (empty event field) and GREEN at 19:33Z (populated). Same code, both outcomes: that
+# is precisely the race this change removes.
 #
 # See GitHub Security Lab, "Keeping your GitHub Actions and workflows secure:
 # Preventing pwn requests" (Part 4) and GitHub's "Securely using
@@ -76,11 +104,13 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 # Read-only. `contents: read` covers the checkout and the git tree + blob calls.
-# `pull-requests: read` is deliberately NOT granted — nothing here reads PR
-# metadata (the only API calls are the git tree and git blob endpoints);
-# declaring an unused scope is the P2-h finding from the #675 review.
+# `pull-requests: read` IS required (#843): the merge commit is resolved from
+# `GET /repos/{owner}/{repo}/pulls/{number}` — see the step below for why the
+# event payload's `merge_commit_sha` cannot be used. (#675's review removed this
+# scope as unused, correctly at the time; this change is what needs it.)
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   workflow-lock:
@@ -93,16 +123,37 @@ jobs:
       - name: Validate the MERGE RESULT's workflow files (narrow structural guard, lock skipped)
         env:
           GH_TOKEN: ${{ github.token }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Validate what would LAND, not what the branch currently points at (#821).
+          #
+          # RESOLVED FROM THE REST API, NOT THE EVENT PAYLOAD (#843).
+          # `github.event.pull_request.merge_commit_sha` is NULL until GitHub
+          # computes mergeability, which is ASYNCHRONOUS — it was empty on the first
+          # RED run of this code, while that PR was MERGEABLE and
+          # `refs/pull/<n>/merge` already existed (earlier runs of the same code won
+          # the race and were green). Reading the payload therefore
+          # reds a race-dependent subset of PRs; the REST API read below is a later
+          # snapshot of the same computation, so it is expected to have the value
+          # rather than guaranteed to (no retry — #857).
+          # `gh api` itself failing (403 from a missing scope, network, deleted PR)
+          # is a DIFFERENT condition from "the API says there is no merge commit",
+          # and must not borrow the conflicts message.
+          if ! MERGE_SHA=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.merge_commit_sha // ""'); then
+            echo "❌ could not read PR #$PR_NUMBER from $REPO via the REST API."
+            echo "   That is an auth, scope or network failure — NOT a finding about your workflow"
+            echo "   files. The step needs \`pull-requests: read\`. Re-run once the API is reachable."
+            exit 1
+          fi
           if [ -z "$MERGE_SHA" ]; then
-            echo "❌ pull_request.merge_commit_sha is EMPTY, so there is no merge result to validate."
-            echo "   GitHub does not compute one while this PR conflicts with its base branch."
-            echo "   This is NOT a finding about your workflow files — the job simply cannot see"
-            echo "   what would land. Resolve the conflicts or update your branch and it re-runs."
-            echo "   PR head, for reference only: $HEAD_SHA"
+            echo "❌ no merge commit exists for this PR, so there is no merge result to validate."
+            echo "   The REST API returned an empty merge_commit_sha, which normally means the"
+            echo "   PR conflicts with its base branch — GitHub computes no merge commit until"
+            echo "   the conflicts are resolved. This is NOT a finding about your workflow files:"
+            echo "   the job simply cannot see what would land. Resolve the conflicts or update"
+            echo "   your branch and it re-runs. PR head, for reference only: $HEAD_SHA"
             exit 1
           fi
           node scripts/check-pi-pin-lockstep.mjs --head-ref "$MERGE_SHA"
