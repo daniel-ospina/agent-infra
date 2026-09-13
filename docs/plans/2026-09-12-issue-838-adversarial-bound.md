@@ -121,8 +121,9 @@ document, rather than file the vector.
 
 ## 5. Verification
 
-> **Superseded by §8** — the execution harness described here was deleted; the suite is now **42 passed,
-> 0 failed**. The text below is the historical cycle-0/cycle-1 record.
+> **Superseded by §8 / §8.3** — the execution harness described here was deleted, and #894 later pinned
+> the subject set; the suite is now **46 passed, 0 failed**. The text below is the historical
+> cycle-0/cycle-1 record.
 
 - `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` — **34 passed, 0 failed** (21 baseline + 13 new), including the negative controls (mutated cap / missing anchor / duplicated anchor / re-capped canonical table / **executed** `BOUND=3` with the anchor intact / dropped executable branch / **commented-out adversarial branch** / **`BOUND=10` → `BOUND=100`**) — each must FAIL. The executable-bound pin parses the fenced bash with shell comments stripped and requires exactly two numeric `BOUND=<N>` assignments (`[10, 2]`), so it binds the effective value rather than source text: a commented-out `then BOUND=2; fi` leaves one assignment, and `BOUND=100` fails the strict default equality that `includes("BOUND=10")` used to wave through.
 - `node scripts/check-skill-lint.test.mjs`, `node scripts/check-skill-lint.mjs --repo .`, `node scripts/check-pi-pin-lockstep.mjs` — green.
@@ -275,3 +276,29 @@ The cycle-3 review was re-briefed accordingly — to test in-scope coverage and 
 *honesty* of this declaration (see §2.1's reviewer challenge rule). A reviewer that still disagrees
 must argue the declaration is dishonest (i.e. that an out-of-scope vector breaks the contract *as
 written*), citing §2.1, rather than filing a new vector.
+
+### 8.3 Cycle-4 review of the re-scope (2026-09-13) — #894 closed, class 9 honest
+
+The cycle-3 reviewer accepted the §2.1 declaration as honest, confirmed the execution harness is
+verifiably gone, and produced **no new adversarial-shell vector** — the unbounded loop the re-scope
+exists to stop is closed. It filed one **in-scope class-9 (pin vacuity)** finding, #894:
+`adversarialBoundViolations()` returned `[]` for an empty source map, and `ADVERSARIAL_SURFACES`
+(the map's subject set) had no cardinality or set-equality assertion, so deleting a de-listed
+surface left the positive test green and the surface free to drift.
+
+Fixed as the reviewer prescribed — no redesign, no execution harness:
+
+- `adversarialBoundViolations()` fails closed on an empty source set (absent subject = violation).
+- The checked subject set is pinned to the declared eight (`DECLARED_ADVERSARIAL_SURFACES` +
+  `subjectSetViolations()` set-equality), so de-listing a surface and adding an undeclared one both
+  go red.
+- Negative controls added: a shrunk set, an empty `{}`, and an added undeclared surface each fail.
+
+**Evidence** — `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` → **46 passed, 0 failed**
+(was 42). Mutation evidence, file restored byte-for-byte after each:
+
+| Mutation | Result |
+|---|---|
+| empty-source guard neutered (`length === 0` → `-1`) | 45 passed / **1 failed** (the `{}` control) |
+| `skills/plan-review/SKILL.md` deleted from `ADVERSARIAL_SURFACES` | 44 passed / **2 failed** (the subject-set pin + its dependent control) |
+| baseline (unmutated) | **46 passed, 0 failed** |

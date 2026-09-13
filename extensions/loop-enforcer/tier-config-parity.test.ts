@@ -318,6 +318,47 @@ export const ADVERSARIAL_SURFACES = [
   "skills/task-workflow-standard/SKILL.md",
 ] as const;
 
+/**
+ * The declared subject set — the eight surfaces the plan doc (§2.1) says carry
+ * the adversarial bound. Deliberately duplicated from `ADVERSARIAL_SURFACES`
+ * (same pattern as `CANONICAL_NON_ADVERSARIAL`): the map actually checked is
+ * derived from `ADVERSARIAL_SURFACES`, so if a surface silently drops out of
+ * *that* list the positive test stays green with one fewer subject and the
+ * de-listed surface may drift to any cap (#894, class 9). Set-equality between
+ * the two is the guard.
+ */
+export const DECLARED_ADVERSARIAL_SURFACES: readonly string[] = [
+  "AGENTS.md",
+  "templates/AGENTS.base.md",
+  "skills/proportional-gates/SKILL.md",
+  "skills/code-review/SKILL.md",
+  "skills/code-review/references/fixer-loop.md",
+  "skills/plan-review/SKILL.md",
+  "skills/issue-scoping/SKILL.md",
+  "skills/task-workflow-standard/SKILL.md",
+];
+
+/**
+ * Set-equality violations between the checked surface set and the declared
+ * one; `[]` means they agree exactly. Pure, so the negative controls below can
+ * prove a shrunken set goes red rather than merely never firing.
+ */
+export function subjectSetViolations(
+  checked: readonly string[],
+  declared: readonly string[],
+): string[] {
+  const violations: string[] = [];
+  const checkedSet = new Set(checked);
+  const declaredSet = new Set(declared);
+  for (const p of declaredSet) {
+    if (!checkedSet.has(p)) violations.push(`declared adversarial surface "${p}" is not checked`);
+  }
+  for (const p of checkedSet) {
+    if (!declaredSet.has(p)) violations.push(`checked adversarial surface "${p}" is not declared`);
+  }
+  return violations;
+}
+
 const ADVERSARIAL_ANCHOR_RE = /adversarial-bound: cap=(\d+)/g;
 
 /** Cap values declared by anchors in `src`, in file order. */
@@ -336,6 +377,12 @@ export function declaredAdversarialCaps(src: string): number[] {
  */
 export function adversarialBoundViolations(sources: Record<string, string>): string[] {
   const violations: string[] = [];
+  // Fail closed on an empty subject set: iterating an empty map would return
+  // `[]` — a vacuous pass that reads exactly like "every surface agrees"
+  // (#894, class 9). An absent subject is a violation, never a silent pass.
+  if (Object.keys(sources).length === 0) {
+    return ["no adversarial surfaces checked — an empty source set cannot satisfy the pin"];
+  }
   const declared = new Map<string, number>();
   for (const [path, src] of Object.entries(sources)) {
     const caps = declaredAdversarialCaps(src);
@@ -618,6 +665,50 @@ test("every adversarial surface declares exactly one cap anchor, and all agree a
   );
 });
 
+test("the checked subject set is exactly the declared eight (#894 class 9)", () => {
+  // Pin both forms: the literal set-equality the reviewer prescribed, and the
+  // pure predicate the negative controls exercise.
+  deepEqual(
+    [...ADVERSARIAL_SURFACES].sort(),
+    [...DECLARED_ADVERSARIAL_SURFACES].sort(),
+    "ADVERSARIAL_SURFACES drifted from the declared eight — a surface was silently added or dropped",
+  );
+  deepEqual(
+    subjectSetViolations(ADVERSARIAL_SURFACES, DECLARED_ADVERSARIAL_SURFACES),
+    [],
+    `subject set drifted: ${subjectSetViolations(ADVERSARIAL_SURFACES, DECLARED_ADVERSARIAL_SURFACES).join(" | ")}`,
+  );
+});
+
+test("rejects a shrunk subject set — de-listing a surface no longer passes vacuously (#894)", () => {
+  const dropped = "skills/plan-review/SKILL.md";
+  const shrunken = ADVERSARIAL_SURFACES.filter((p) => p !== dropped);
+  // Document the residual hole this pin exists to close: the shrunk map alone
+  // still satisfies the anchor parity check (all remaining anchors agree at 2).
+  const shrunkenSources = Object.fromEntries(
+    shrunken.map((p) => [p, readFileSync(join(REPO_ROOT, p), "utf-8")]),
+  );
+  deepEqual(
+    adversarialBoundViolations(shrunkenSources),
+    [],
+    "expected the shrunk map alone to look clean — that vacuity is what the subject-set pin must catch",
+  );
+  const v = subjectSetViolations(shrunken, DECLARED_ADVERSARIAL_SURFACES);
+  ok(
+    v.some((s) => s.includes(dropped) && s.includes("is not checked")),
+    `expected a de-listed-surface violation for ${dropped}, got: ${v.join(" | ")}`,
+  );
+});
+
+test("rejects an empty source set — adversarialBoundViolations({}) fails closed (#894)", () => {
+  const v = adversarialBoundViolations({});
+  ok(v.length > 0, "an empty subject set must be a violation, not a vacuous []");
+  ok(
+    v.some((s) => s.includes("empty source set")),
+    `expected an empty-source-set violation, got: ${v.join(" | ")}`,
+  );
+});
+
 test("#838 does not re-cap non-adversarial work (3 / 5 / 10 intact)", () => {
   deepEqual(
     nonAdversarialCapViolations(TABLE),
@@ -682,6 +773,17 @@ test("rejects a re-capped canonical table (the non-adversarial guard is not vacu
 test("rejects a canonical table that lost a risk row", () => {
   const v = nonAdversarialCapViolations(TABLE.filter((r) => r.risk !== "Low-Medium"));
   ok(v.some((s) => s.includes("Low-Medium")), `expected a Low-Medium violation, got: ${v.join(" | ")}`);
+});
+
+test("rejects an ADDED undeclared surface (subject set is capped, not just floored)", () => {
+  const v = subjectSetViolations(
+    [...ADVERSARIAL_SURFACES, "docs/extra.md"],
+    DECLARED_ADVERSARIAL_SURFACES,
+  );
+  ok(
+    v.some((s) => s.includes("docs/extra.md") && s.includes("is not declared")),
+    `expected an undeclared-surface violation, got: ${v.join(" | ")}`,
+  );
 });
 
 // Negative controls — every shape the deleted execution harness was defeated
