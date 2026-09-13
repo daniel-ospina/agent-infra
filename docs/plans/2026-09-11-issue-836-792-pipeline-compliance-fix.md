@@ -22,6 +22,13 @@ One PR, because both issues are the **same mechanism**: `scripts/check-pipeline-
 
 ## Supersession — `820ff66` removed the local static pin (indicator 2)
 
+> **Update (after `3dc3d51`):** #876 (`f9909b2`, issue #861) then wired the repo-wide guard
+> *and* its suite into CI (`ci.yml` job `sigpipe-grep`) and into `.husky/pre-commit`. The
+> "nothing executes it" gap recorded below is therefore closed; #877 now tracks only the
+> coverage misses (post-pipe env prefix, `cat` producer, flag-after-pattern, and the suite's
+> missing separated-`-i -q` fixture). The supersession itself — and everything else in this
+> section — is unchanged.
+
 While this PR was open, **#863** (`91275a9`/`317c4a0`) landed
 `scripts/check-no-sigpipe-grep.sh` — a **repo-wide** guard for the same
 `printf/echo … | quiet-grep` idiom whose `SCAN_DIRS=(scripts .husky pi-bootstrap)` put this
@@ -40,9 +47,10 @@ The handover is **not** total: the repo-wide guard is narrower than the pin remo
 requires `grep` immediately after the pipe (a post-pipe env prefix is a MISS), knows only the
 `printf`/`echo` producers (`cat` is a MISS) and looks for the quiet flag before the pattern
 (`grep x -q` is a MISS); its suite also does not pin the separated `grep -i -q` spelling (the
-guard detects it, but no fixture exercises it); and nothing executes the guard (no workflow or
-hook invokes it, and `tests/sigpipe-grep/run.sh` is not wired into `ci.yml`/`ci-main.yml`). All
-of it is filed as **#877**. Everything else this PR delivers — the hoisted `has_*` matchers, the large-input
+guard detects it, but no fixture exercises it). All four are filed as **#877**. The
+**reproduction** half, by contrast, is closed: #876 (`f9909b2`, issue #861) wired the guard
+*and* its suite into CI (`ci.yml` job `sigpipe-grep`) and into `.husky/pre-commit`, so a
+reintroduced site fails a check rather than merging green. Everything else this PR delivers — the hoisted `has_*` matchers, the large-input
 positive/negative controls, the `run_checks` end-to-end vector, the `pr_is_docs_only` fail-OPEN
 vector and the whole of #792 — is unchanged and still covered by the verification below.
 

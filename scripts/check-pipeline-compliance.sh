@@ -1660,11 +1660,15 @@ $big_filler"
   # scopes non-builtin producers out deliberately), and looks for the quiet flag
   # before the pattern (so `grep x -q` is a MISS). No live occurrence of those
   # three spellings exists on this head, so nothing regresses today — the gap is
-  # tracked in issue #877, together with the fact that neither the guard nor its
-  # suite is invoked by any workflow today (so neither pin was machine-enforced
-  # — same class as #865 for this script's own self-test) and that run.sh has no
-  # separated `grep -i -q` fixture (the guard's has_quiet() does detect that
-  # spelling; the suite simply does not pin it).
+  # tracked in issue #877, together with the fact that run.sh has no separated
+  # `grep -i -q` fixture (the guard's has_quiet() does detect that spelling; the
+  # suite simply does not pin it).
+  #
+  # The reproduction half is now closed: #876 (`f9909b2`, issue #861) wired the
+  # guard AND its suite into CI (`ci.yml` job `sigpipe-grep`) and into
+  # `.husky/pre-commit`, so a reintroduced site can no longer merge green. #877
+  # therefore tracks only the three coverage misses above plus the missing
+  # separated-flag fixture.
   #
   # The behavioural half of #836 (large-input regression vectors below, incl. the
   # fail-OPEN `pr_is_docs_only` site) is unaffected and still lives here, because
