@@ -226,11 +226,18 @@ Every incident currently adds a rule; nothing removes one — that is the mechan
 
 **Post-hoc dedup pass changed this table.** 3 of the 9 filed issues were duplicates and 2 more were partly duplicated — see §7.1. Live issues: **#919, #920, #921, #922, #925, #926**.
 
-**Parallelization map (lean):**
-- **Wave 1 (launch immediately, all independent, near-zero risk):** #919, #908, #891, #820
-- **Wave 2 (independent of each other):** #920, #922, #925 (scripts half)
-- **Wave 3:** #921 (waits on #919), #925's extension half
-- **Wave 4:** #926 — scoping only, do not dispatch as implementation
+**Ordering authority:** the **issue body of #917** is now canonical for the order of work, cost accounting, and design checkpoints. This section is retained as the planning record.
+
+**Ordering principle:** by **cost removed per unit of risk**, with the biggest *runtime* cost first — not by risk-adjusted ease, which is what the first draft did and which mis-weighted the work. See §2.1 (measured cost split) and the corrected note in §7.2.
+
+- **Stage 1 — free wins, no checkpoint, run all in parallel:** #919, #891, #820
+- **Stage 2 — biggest runtime cost, design checkpoint required:** #922 (cuts the 9,711 reviewer dispatches), #921 (7 loops → 1; also absorbs W9 loop-rule de-duplication — its dependency on #919 is **void**)
+- **Stage 3 — correctness, design checkpoint required:** #920, #908 (adversarial — opens a skip path)
+- **Stage 4 — biggest maintenance cost:** #926. Scoping starts **now, in parallel**; implementation last (only item with a data-loss failure mode).
+- **Deprioritised, not scheduled:** #925 (measurement is a real gap but **is not the priority**)
+- **Explicitly out of scope, named:** `sequence-enforcer` (18 commits, 5,614 lines, 1 open issue) — absent by decision, not oversight
+
+**Design checkpoints (required, no exceptions):** #922, #921, #908, #920, #926 get a design reviewed by the human **in plain words** before implementation is dispatched — what changes, what could go wrong, what it costs if wrong, how we undo it, and the recommendation. Stage 1 does not need this. Rationale: this epic removes safety machinery, so a wrongly-removed check does not fail loudly — the checkpoint substitutes for the review rounds being deleted.
 
 ## 7. Process note (deliberate deviation, recorded)
 
