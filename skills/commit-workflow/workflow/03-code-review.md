@@ -24,7 +24,7 @@ fi
 : ${ONTOLOGY_RATING:=""}
 ```
 
-Pass these ratings to code-review Step 4 dispatch logic. When all empty, the 6 always-on agents (Guidance, Bug-Shallow, Bug-Deep, History, PR Comments, Security) still run.
+Pass these ratings to code-review Step 4 dispatch logic. When all empty, the 4 always-on agents (Guidance, Bug — two-pass, History, Security) still run.
 
 ## Step 2 — Code-Review Gate
 
