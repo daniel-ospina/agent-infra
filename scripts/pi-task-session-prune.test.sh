@@ -81,6 +81,7 @@ U_REAL_LIVE="13131313-1313-4313-8313-131313131313"
 U_REAL_DEAD="14141414-1414-4414-8414-141414141414"
 U_SYMLINK="15151515-1515-4515-8515-151515151515"
 U_SWAP="18181818-1818-4818-8818-181818181818"
+U_SWAP_DIR="19191919-1919-4919-8919-191919191919"
 U_NESTED="16161616-1616-4616-8616-161616161616"
 U_TILDE="17171717-1717-4717-8717-171717171717"
 
@@ -297,8 +298,12 @@ mkdir -p "$OUTSIDE_SWAP"
 mksession "$T/P/root/$U_SWAP/1780000000_swapped.jsonl" 700 $((9 * DAY))
 printf 'PRECIOUS' >"$OUTSIDE_SWAP/1780000000_swapped.jsonl"
 mkdir -p "$T/P/hooks"
+# #936: `mv`, not `rm -rf`. An `rm -rf` of the decoy destroys it in the SHIM, so
+# the `pruned=0` assertion cannot distinguish "the script correctly skipped" from
+# "the shim deleted it first". `mv` leaves the decoy intact (under a non-UUID
+# name, so no later phase picks it up) and makes the counter assertion meaningful.
 cat >"$T/P/hooks/2" <<HOOK
-rm -rf "$T/P/root/$U_SWAP"
+mv "$T/P/root/$U_SWAP" "$T/P/root/$U_SWAP.moved"
 ln -s "$OUTSIDE_SWAP" "$T/P/root/$U_SWAP"
 HOOK
 PS_HOOK_DIR="$T/P/hooks"; PS_COUNT="$T/P/ps.count"
@@ -307,6 +312,8 @@ assert_eq "$RC" "0" "P1 symlink-swap pass exits 0 (no escape, no crash)"
 exists "$OUTSIDE_SWAP/1780000000_swapped.jsonl" "P1 file OUTSIDE the root survives the mid-window symlink swap"
 assert_eq "$(cat "$OUTSIDE_SWAP/1780000000_swapped.jsonl")" "PRECIOUS" "P1 the outside file is not merely present but UNMODIFIED"
 assert_contains "$OUT" "pruned=0" "P1 nothing was pruned through the planted symlink"
+PS_HOOK_DIR=""; PS_COUNT=""
+
 PS_HOOK_DIR=""; PS_COUNT=""
 
 # ── 6. mode resolution: dry-run by default ─────────────────────────────
