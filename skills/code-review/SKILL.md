@@ -46,7 +46,7 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 
 
 > **Canonical:** `agent-infra/skills/code-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
@@ -979,35 +979,6 @@ When the fixer loop exits with remaining issues (stall/cap/fail), the **orchestr
 4. **If issues still remain** → THEN post the PR comment with the warning + remaining issues. These are the genuinely hard problems that need human judgment. Add a `### Requires Human Attention` section explaining what was tried and why each issue couldn't be auto-resolved.
 
 **Pause only when:** a taxonomy-matching decision arises (human input taxonomy). Everything else proceeds unattended.
-
-### Step 6.6 — Second-Model Final Gate (Two-Tier Review)
-
-After the fixer loop converges clean (all Flash-based review cycles done), dispatch ONE second-model reviewer as a final quality gate. The second model is a stronger reasoner — it catches what the cheaper review agents miss.
-
-**Model (second-model gate, #716):** resolve the effective model with the guard — `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe` (network): it writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED` (exit 1). **`--probe` is the resolution AND the dispatch authority.** `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --print` is an **offline hint for inspection only** (honours `$SECOND_MODEL`, else the ordered `preference` in `pi-bootstrap/pi-config/second-model.json`) — it opens no socket, so it **cannot verify solvency**: it emits a *candidate* (with a loud stderr notice) and must NEVER be the dispatch source. **Dispatch contract:** dispatch `model=<RESOLVED id>` from `--probe` (the liveness gate is the dispatch authority; `--print` is an offline hint, never the resolution). With `$SECOND_MODEL` set the probe certifies **only** that id — if it is not solvent+reachable (or declares no probe endpoint in `preference`) the probe is `DEGRADED` and never falls through to a config default.
-
-**Fail-closed DEGRADED (no silent fallback):** if `--probe` exits non-zero (it prints plain `DEGRADED`; the trigger is the `--probe` exit code, never `--print`) — `--print`'s `**DEGRADED` fires only for a malformed/unusable authority — do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review, the exact #716 defect. There is NO recordable degraded marker — check (f) hard-fails both forms: `model=**DEGRADED` is rejected as a reserved value (before the independence field is read), and `independent=DEGRADED` is rejected by design. STOP and escalate to a human: a degraded second-model gate is a human decision, not an auto-fallback, and the guarded-surface change cannot merge until an independent model is funded or the operator authorizes a bypass (#860). `[#476 hop-leg]` is orthogonal and stackable — a dispatch that lands on a failover hop is annotated `[SECOND-MODEL-GATE][#476 hop-leg]`, and a hop-leg run is never presented as the configured second model. Pricing/base decision: issue #284, superseded by #716.
-
-**Success path — record the marker (required):** when the probe resolves, record the success form as well: `SECOND_MODEL_GATE_MODEL=<RESOLVED id> SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh` (it appends `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>`). check (f) in `scripts/check-pipeline-compliance.sh` requires that line on ANY diff touching the second-model guarded surface, so a successful gate that is never recorded still fails the merge gate.
-
-**Dispatch:**
-```
-task(model=<RESOLVED provider/id from `$AGENT_INFRA_PATH/scripts/check-second-model.sh --probe`>, prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
-```
-
-**Prompt:** Same review dimensions as Steps 4-5 agents — the second model just applies stronger reasoning. No prompt engineering needed.
-
-**Second-model findings surfaced as `[SECOND-MODEL-GATE]` severity:**
-
-| Second-model Issue | Action |
-|---|---|
-| `[SECOND-MODEL-GATE] P0` | Structural flaw missed by Flash — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P1` | Important gap — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P2` | Real improvement — fix required, re-run the second-model gate once (P2s block the merge gate) |
-
-**Re-dispatch:** Max 2 second-model cycles. On 2nd failure → surface in PR comment as `[SECOND-MODEL-GATE]` with "second-model final gate could not converge."
-
-**Gate passes:** second-model gate returns CLEAN (no P0/P1/P2 findings). Proceed to Step 7.
 
 ### Step 7 — Eligibility Re-check
 
