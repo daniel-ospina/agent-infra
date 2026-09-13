@@ -1,0 +1,247 @@
+---
+title: "Epic 917 — Lean Agent Workflow: Analysis and Verified Plan"
+type: epic-analysis
+domain: capability
+subjects.team: organisation-design-team
+aboutObjects:
+- agent-infra
+- workflow-lean
+status: live
+created: 2026-09-13
+revision: 1
+revision_note: "Initial analysis. Six parallel read-only verification passes completed BEFORE decomposition. Four of the
+  original findings were falsified and are corrected in §3 — notably #878 (tool exists), #100 (stale), #908 (misdiagnosed)
+  and 'no gate measurement exists' (57,630-line gate-events.jsonl exists). Ranked plan corrected accordingly; item
+  'restore the skip-review path' was SPLIT — the docs-shape exemption is safe, the skip-review path is not and must be deleted."
+---
+
+# Epic 917 — Lean Agent Workflow
+
+**Issue:** [#917](https://github.com/daniel-ospina/agent-infra/issues/917)
+
+## 1. What this epic is
+
+The agent workflow has become **self-referential**: the machinery that governs the work is now the main source of the work.
+
+| Signal | Value | Source |
+|---|---|---|
+| Issues touching the framework/gates/skills themselves | **407 / 591 (69%)** | `gh issue list` title classification |
+| September issues that are framework-internal | **240 / 355 (68%)** | same |
+| Merged PRs in agent-infra that are scaffolding maintenance | **212 / 300 (71%)** | `gh pr list` title classification |
+| Merged PRs that are product/content work | **7 / 300 (2%)** | same |
+| Sept issue creation vs closure | **355 created / 183 closed** | backlog growing |
+| The 8 most recent merged PRs | **all 8 are gate/guard fixes** | `gh pr list --state merged` |
+| Reviewer dispatches for one complex issue | **45–70** | skill trace, all 7 loops |
+| Skills defining their own review/gate loop | **43 of 101** | `grep "NO ISSUES FOUND"` |
+| Enforcement code vs process definition | **~122,000 vs 43,400 lines** | `wc -l` over `extensions/` + `scripts/` vs `skills/*.md` |
+
+The question this epic answers is not "are gates good?" — several are load-bearing and incident-driven. It is: **which of these gates are producing signal, and which are producing only cost?**
+
+## 2. Evidence base
+
+### 2.1 Instrumentation that already exists (corrects an early wrong claim)
+
+`~/.pi/agent/audit/gate-events.jsonl` — **57,630 lines**, 2026-08-13 → 2026-09-13, written by `extensions/shared/audit-log.ts:55`. So run-rate **and** block-rate are already measured:
+
+| Event | Count |
+|---|---|
+| `merge_gate_pass` | 1,918 |
+| `merge_gate_block` | **814** (~30% block rate) |
+| ↳ `no_review_record` | 536 |
+| ↳ `head_advanced` | 275 |
+| ↳ `verdict_not_clean` | **3** |
+| `gate_bypass` | **7,769** (7,737 = `escape_hatch`) |
+| `gate_bypass_refused` | 107 |
+| `gate_recovery` | 5,275 (field `recovered` is a *file count*, not a verdict) |
+
+Also present: `~/.pi/agent/audit/enforcement.jsonl` (32,630 entries, 147 blocked), `~/.pi/agent/reviews/*.json` (**1,339 files**), `~/.pi/agent/audit/audit.jsonl` (794,660 lines / 180 MB).
+
+### 2.2 The two statistics that matter most
+
+1. **1,339 of 1,339 review records carry verdict `clean`** (1,249 `clean` + 90 `clean-micro`). The review record has **never once** captured a gate finding something wrong.
+2. **7,769 `gate_bypass` events, 7,737 of them `escape_hatch`** — and **nothing records whether the override was justified.** There is no false-block rate, because the false blocks were never adjudicated.
+
+The merge gate blocks overwhelmingly for **bookkeeping** reasons (`no_review_record` 536, `head_advanced` 275) and almost never for a finding (`verdict_not_clean` **3**). That is the shape of a gate that costs time without producing signal.
+
+## 3. Verification results — four original claims were WRONG
+
+Six parallel read-only verification passes were run **before** decomposition. They falsified four of the findings the initial analysis rested on. Recording these is the point of the exercise: the original analysis was built partly on **issue titles rather than verified repo state**, which is itself the failure mode this epic targets.
+
+| # | Original claim | Verified reality | Disposition |
+|---|---|---|---|
+| **C1** | "`tools/collision_preflight.py` does not exist; a whole session was wasted because the check was imaginary" | **FALSE.** `scripts/parallel_work_check.sh` (10.9 KB, `+x`) and `parallel_work_check.py` (53.5 KB) exist and are exactly what `issue-scoping:106,118` and `issue-workflow:107` invoke. The *filename* in #878 is wrong. | **Close #878 as invalid.** Do not "delete a missing gate." |
+| **C2** | "Gate scripts were never ported — pipeline gates silently no-op" (#100) | **STALE.** `scripts/_research_path.sh` (107 L, `+x`), `scripts/validate-script.cjs` (351 L), `scripts/cron-quality-gates.sh` (367 L, `+x`) all exist and are wired. | **Close #100.** Already fixed. |
+| **C3** | "The VGATE docs exemption requires a bare `git commit`, but AGENTS.md mandates `git commit -F <file>`, so following the rule disables the exemption" (#908) | **MISDIAGNOSED.** Measured against the real `isBareCommitShape` on HEAD: `git commit -F /tmp/m.md` → **bare (exempt)**. AGENTS.md's full literal `${TMPDIR…}` command → **bare (exempt)**. The **actual** blocked command (session archive `2026-09-10T18-48-17-978Z`, line 2699) was `… && git commit -F /tmp/commit-msg-…md 2>&1 \| tail -20`. Cause: `isRedirectToken` is applied at `verification-gate/index.ts:1205` and `:2148` but **not** in `isBareCommitShape` (`:1326-1368`), so `2>&1` is parsed as a **pathspec**. | **Fix is a one-line `continue` on redirect tokens.** `-F` was never the problem. |
+| **C4** | "There is no measurement of whether any gate catches anything useful" | **PARTLY WRONG.** Run-rate and block-rate are measured (§2.1). Missing: **correctness** (Q3) and **time** (Q4). No correlation id joins `gate-events.jsonl` to `audit.jsonl`, so latency cannot even be inferred. | **Narrow the item** to correctness + duration + a reader. |
+
+Additionally: **#894 is already fixed** (hardened in `c88d0d7`; the tests now reject a shrunk and an empty subject set) → close.
+
+**Methodological lesson for this epic:** 3 of 4 corrections were cases where an issue *title or body* asserted a repo state that had drifted. Any child issue in this epic must state its **verification command**, not just its claim.
+
+## 4. New confirmed findings (not in the original list)
+
+These were surfaced only by the verification passes.
+
+**N1 — `verification-gate` fails OPEN on a load error.** `index.ts:3177` wraps the *entire* handler registration in one `try`; the `catch` at `:4070` only logs. A throw registering any single handler leaves **zero** handlers registered → every VGATE check silently no-ops. This is the #708/#826 class, confirmed at line level.
+
+**N2 — `main-worktree-guard` fails OPEN on a load error, asymmetrically.** `index.ts:128-160` seeds `classifyGitCommand = () => "allow"` and `evaluateHubGateWithTargets = () => ({verdict:"non-git"})`. The import `catch` at `:288` prints *"bash git guard DISABLED"* and continues. Comment at `:140` states the intent explicitly: *"NEVER false-blocks."* Note the asymmetry: `:131 isWorktreeCwd = () => true` (bash fails open) vs `:132 isWorktreeCwdWrite = () => false` (write fails closed).
+
+**N3 — VGATE bridge write is swallowed.** `verification-gate/index.ts:381-383`: `writeBridge` catches and returns. A failed PASS write silently breaks cross-process and child recovery.
+
+**N4 — an uncapped fail-open path exists by design.** `verification-gate/index.ts:3625-3648`: after `BLOCK_ATTEMPT_THRESHOLD` blocks on the same files, *interactive* sessions `return undefined` — an **allow-unverified-commit**. Sub-agents are correctly excluded (#825), but there is no outer cap.
+
+**N5 — the review record has never recorded a finding.** §2.2. Either the reviews are flawless, or the record captures the reviewer's own clean claim rather than an adjudicated outcome. Given 7,737 unadjudicated escape hatches, the second explanation is more likely — and it means the 1,339 "clean" verdicts are **not evidence of quality**.
+
+**N6 — the reviewer count is worse than documented.** `code-review` Step 4's header says "6-10 agents" but the dispatch block emits up to **13** (6 always-on + 4 surface + 3 infra). In agent-infra, `scripts/**` and `skills/**` match the INFRA detection on nearly every PR, so the **modal count is 9-13**, not 6-10.
+
+**N7 — `test-review` hash backstop is genuinely non-functional.** `grep -rn "test-review/"` over `scripts/`, `.husky/`, `extensions/*/index.ts` → **0 code hits** (only 3 markdown files reference it). `~/.pi/agent/test-review/` exists and is empty. `.husky/pre-commit` has no backstop. The "gate" is prose only.
+
+**N8 — no gate requires a regression test to have been observed failing.** No `red_phase` / `observed_failing` / `test_failed_first` check exists in `scripts/`, `.husky/`, or `extensions/*/index.ts`. #820 is accurate.
+
+**N9 — the pin in #874 is vacuous for a different reason than reported.** `tier-config-parity.test.ts:246-288` compares `TIER_CONFIG` numbers against a **regex-parsed markdown table** — but `index.ts:1724` calls `evaluateTermination(cycleData)` with **one argument**, defaulting to `REVIEW_CYCLE_CAPS.high`, and `liveCallShapeViolations` **forbids** passing a `tier` argument. `termination.ts:79` admits: "no production caller passes `tier`". The pinned mapping is **unreachable code**.
+
+**N10 — post-hoc state checking is NOT equivalent to the current guard.** See §5 W11. It is complementary and largely superior for branch/ref/discard *detection* and for eliminating false blocks, and **strictly weaker** for irreversible discards and for prevention. Any claim of "same guarantees" is false for the irreversible subset.
+
+## 5. The verified ranked plan
+
+Ranked by **time freed per unit of quality risk**. W1–W3 are near-free.
+
+### W1 — Close the false and stale gate claims
+Close **#878** (premise false — tool exists), **#100** (stale — scripts exist and are wired), **#894** (already fixed in `c88d0d7`). No code change.
+**Risk: none.** **Effort: trivial.** Reduces the issue backlog without touching behaviour.
+
+### W2 — Fix the confirmed fail-open paths
+`verification-gate`: make registration failure **abort** rather than register nothing (N1); un-swallow the bridge write (N3); add an outer cap to the auto-bypass (N4). `main-worktree-guard`: make the import failure fail **closed**, and make `isWorktreeCwd` (bash) match `isWorktreeCwdWrite` (write) (N2).
+**Risk: none to quality** — these only make checks that are *supposed* to run actually run. Expect a short increase in blocks while the reasons for them are cleaned up. **Effort: medium.**
+
+### W3 — Delete the two strict-subset review loops
+`plan-review` Phase 4.5 (second-model) is a **strict subset** of Phase 1 — **identical prompt**, stronger model, no additional check. `task-workflow-standard`'s SCOPE-VERIFY and PLAN-VERIFY are strict subsets of `issue-scoping` L1/L5 and have **no prompt file of their own**.
+**Risk: low.** Nothing unique is lost. **Effort: low.**
+
+### W4 — Collapse the remaining review loops into one design gate
+The 7 loops carry **5 non-subset sources**. A naive collapse loses real checks — each of these is currently **UNIQUE** and must be merged forward:
+
+| Lost if collapsed naively | Source loop |
+|---|---|
+| Disconfirmation-query check; "original framing not challenged"; "prescribed solution adopted unre-derived" | `issue-scoping` problem-verify |
+| Cosmetic-alternative detection; **better-approach-rejected-for-convenience (P0)**; dependency/API external verification | `issue-scoping` solution-verify |
+| Cross-diamond drift; weakest-assumption ranking | `issue-scoping` Phase 5.6 |
+| Codebase-pattern / test-infra reuse; pre-mortem scoring | `issue-scoping` Phase 7 |
+| Spec gaps + scope creep; step dependency/circularity; parallelizability/YAGNI/DRY; GOOD>EASY; interface-impact consumer enumeration; test-layer assignment; 8 failure-mode families; D1–D9/A1–A6 | `plan-review` Phase 1 |
+
+**Verdict: 7→2 is safe ONLY if the 17-item merged checklist is conserved.** The merged checklist is specified in the sibling scoping document.
+**Risk: moderate.** Effort: medium. Do on one path first, measure, then widen.
+
+### W5 — Collapse `code-review`'s 9-13 reviewers to 4
+Verified merged set: **R1 Correctness & Provenance** (was Guidance + Bug-Shallow + Bug-Deep + History + PR Comments), **R2 Conformance** (was Architecture + Data/Schema + Ontology + UX), **R3 Infrastructure & Config** (was Skill Infra + Extension Safety + Config), **R4 Security** (deliberately unmerged — merging loses the HIGH-confidence-only precision discipline, which is its actual value).
+**Seven checks are at risk of being lost** and must be carried explicitly: #9's *downstream impact*; AS3 observability/scalability/deployment; #11's confidence discipline; Step 0.7 *content-generation-gap* (assigned to **no** Step 4 agent); Step 0.6's *sufficiency* judgment; #8's 8 skill-type semantic sub-checks; #12's env-name↔code correspondence; UXC5/UXR6 focus-management/reduced-motion specifics.
+Steps **0, 0.1, 0.2** are deterministic and can become **scripted checks** instead of reviewer dispatches.
+**Risk: medium.** Effort: low. **External corroboration:** review quality plateaus around n=5–10 passes; ensembling multiple reviewers does not improve results; single well-instructed agents match homogeneous multi-agent teams at lower cost.
+
+### W6 — Delete the unimplementable "inline review" rule
+`proportional-gates:183-186` and `plan-review:74` instruct inline (same-context) review for Project/Task. Verified **not implementable and unsound**, for three independent reasons: (i) it violates `AGENTS.md:129-139`; (ii) nothing in the enforcement layer can observe a same-context review, so it can never satisfy the dispatch-count gate; (iii) `code-review` contains **zero** inline-review language — it was never implemented.
+Consequence today: an agent follows the prose → dispatches **0 reviewers** → `plan-review` never runs → hits `review-enforcer` at commit (`index.ts:680-686`, every tier blocks at 0) → stalls, having believed it satisfied the gate.
+**Action:** delete the inline/skip prose; replace with a **count-scaled, always-fresh** table — Low → 1 fresh reviewer; Low-Medium → 2; Medium-High → 3; High → 4. Strike the "even a trivial one-line reviewer" wording (`commit-workflow:95`), which invites the content-free dispatch `AGENTS.md:92` forbids.
+**Risk: none** — this removes an instruction that cannot be followed. **Effort: very low.**
+
+### W7 — One-line fix + restore the docs-shape exemption
+Insert `if (isRedirectToken(tok)) continue;` into `isBareCommitShape`'s token loop (`verification-gate/index.ts:1326-1368`). Fails closed: a real pathspec still returns `false`. Then restore the docs/static-only exemption under a **narrow** definition that cannot be gamed:
+
+1. Extension ∈ {`.md`, `.txt`} only — **drop `.html`** (inline `<script>` is code) and **`.css`/`.scss`** (GH-Pages / MDX serve surfaces)
+2. **No deny-segment anywhere**: `public dist build out .next _site coverage vendor node_modules target .github skills templates prompts`
+3. Excluded by **name**: `AGENTS.md`, `CLAUDE.md`, `MEMORY.md`, `**/SKILL.md` — these encode behaviour for every future session
+4. Index mode must be `100644` — **reject symlinks (`120000`) and gitlinks**
+5. Never a sweep, pathspec, or `--amend` (already enforced)
+6. The exemption is scoped to **VGATE only** — never read as "no reviewer at all"
+
+**Risk: low under (1)-(6).** Effort: low. Corroborated by `verification-gate/index.ts:1322` (`BARE_COMMIT_VALUE_FLAGS` already includes `-F`).
+
+### W8 — Implement or delete the two genuinely dead gates
+**N7** (`test-review` backstop, #891): port to a real script wired into `.husky/pre-commit`, **or** delete the gate claim. **N8** (#820): add an observed-failing-test requirement, **or** delete the claim from `test-writing`. Also correct `commit-workflow/workflow/01-preflight.md:605-660`, whose "Mechanism" bash is never executed by any hook — agents must transcribe it, which is the same prose-only class.
+**Risk: none** — either action removes a false guarantee. **Effort: low–medium.**
+
+### W9 — Keep one copy of the review-loop rules, not five
+The 3-layer stuckness specification is duplicated verbatim in **5 files** (`code-review/SKILL.md`, `code-review/references/fixer-loop.md`, `plan-review`, `test-review`, `verification-before-completion`), and the adversarial-bound fence in **6**. `code-review` itself contains the instruction *"that file and this section must agree."* Drift has already occurred: #822, #833, #871, #874, #875, #892, #894.
+**Action:** one canonical definition; all other files link to it.
+**Risk: none.** Effort: low.
+
+### W10 — Measure correctness, not just activity
+Extend `extensions/shared/audit-log.ts` with `decision` (`pass|block|bypass|refused`) and `duration_ms`. Add a `block_id` (ULID) to every block/bypass, and a new append-only `~/.pi/agent/audit/block-outcomes.jsonl` recording `{block_id, outcome: correct|false_block|unknown, evidence, reviewed_at}` — the `escape_hatch` emit site (`review-enforcer/index.ts:730`) is the natural hook. Add a `scripts/gate-metrics.sh` reader. Add `session_id` correlation to join gate events to `audit.jsonl`.
+This is what makes W1–W9 verifiable instead of arguable. Note: **7,737 unadjudicated escape hatches** is the specific number this closes.
+**Risk: touching enforcement extensions is high; the script + JSONL additions are low/additive.** Split accordingly. Effort: medium.
+
+### W11 — Invert the git guard: state-first, not text-parsing
+`main-worktree-guard` detects dangerous git actions by **parsing command text** — `index.ts` 2,799 lines, `classify-git.mjs` **429 KB**, `test.mjs` **408 KB**, README 70 KB, ~71 issues, and residual rounds #351, #437, #456, #540, #627, #663, #694, #805, #814, #867, #882, #883, #895, #900. External research is unambiguous: a sound and complete static policy over arbitrary shell input is **infeasible**; the recommended posture is state-based allowlisting, not perfect parsing.
+
+**But the verified verdict is "do not replace — invert":**
+
+| Guarantee | State-checkable? |
+|---|---|
+| G1 hub stays `main`+clean | **YES** — post-call branch + porcelain vs baseline; make `hub-state-check.sh` *latching* |
+| G2 no branch mutation in a shared main | YES (decision), partial (prevention) — `for-each-ref` before/after |
+| G3 commit/push only on own branch (local) | **YES** — ref-journal delta; restore ref to pre-call SHA |
+| G3 remote | PARTIAL — needs `ls-remote` before/after; rollback not guaranteed |
+| G5 sibling-branch protection | PARTIAL |
+| G6 shared ref namespace | PARTIAL |
+| **G4 don't destroy uncommitted work** | **NO for prevention** — post-hoc only tells you it already happened |
+| **G7 backdoor closure (scripts/`bash -c`/interpreters)** | **NO as an independent guarantee** — its effects *are* G1–G4 |
+| G8 marker integrity | NO — not a state property (trivial, keep interception) |
+
+**The three steps, in order:**
+1. **Ref journal + hub latch** (per-call snapshots, roll back local ref moves, latch a freeze on violation). This retires the M4 verb allowlist, the push-refspec arms, and most of M2/M3 classification — and eliminates the biggest false-positive source (#772, #883, #895, #897).
+2. **Pre-call shadow snapshot** (`git stash create` — non-mutating — + untracked manifest). **This is the make-or-break prerequisite** — it is what converts G4's irreversible class into *recoverable*.
+3. **Keep a closed interception list** for irreversible prevention only: write/edit overwrite, `reset --hard`, `checkout`/`restore` path, `clean`, `checkout -f`/`switch -f`, `branch -D`, `push --force`/`--delete`. Keep M5's `discardDestroysWip` **effect** test — it is already state-keyed and is the right model.
+4. **Retire the adversarial tier**: quote/ANSI-C/alias/backtick/`eval`/`${}`-expansion closures, heredoc and script-content walking, interpreter-inline payload classification. This is the bulk of the 429 KB and the source of most residual rounds. **Justification: #351 already declares deliberate obfuscation out of threat model.** Say so explicitly in the PR.
+
+**Risk: HIGH and asymmetric.** Removing G4 interception without step 2 re-opens the 2026-08-06 / 2026-09-10 incident class with **detection-only** response — a data-loss risk, not a lint. Post-hoc enforcement is also **strictly weaker** where damage precedes detection: discarded working-tree edits that never became git objects are unrecoverable; untracked overwrites/deletes are unrecoverable; remote force-push rollback is unsafe after a fetch window. **State attribution in parallel tool mode is unsolved** — a sibling's concurrent legitimate recovery can look like this session's violation. Document it; do not paper over it.
+**Effort: high.** This is the largest single maintenance sink and the largest long-term win.
+
+### W12 — Admission control and sunset for new gates
+Every incident currently adds a rule; nothing removes one — that is the mechanism producing the growth curve. The existing auto-file rule has no admission control at all (#906).
+**Action:** a new gate must name the incident it prevents, how its effectiveness will be measured, and a review date. A guard needing a 10th fix for the same underlying problem triggers **approach review, not an 11th fix** — the main-worktree-guard residual chain is the worked example.
+**Risk: none.** Effort: low.
+
+## 6. Decomposition and dependencies
+
+| Workstream | Issue | Depends on | Risk | Effort |
+|---|---|---|---|---|
+| W1 close false/stale claims + W6 delete inline-review rule + W9 one copy of loop rules + W12 admission control | **#919** | — | none | very low–low |
+| W2 fix fail-open paths | **#920** | — | none | medium |
+| W3 delete 2 strict subsets + W4 one design gate (17 conserved checks) | **#921** | #919 (W9) | medium | medium |
+| W5 4 reviewers in code-review | **#922** | — | medium | low |
+| W7 redirect fix + docs exemption | **#923** | — | low | low |
+| W8 implement or delete 2 dead gates | **#924** | — | none | low–med |
+| W10 measure correctness + duration | **#925** | — | high (ext) / low (scripts) | medium |
+| W11 invert the git guard (SCOPING ONLY) | **#926** | #920, #925 | **high** | high |
+| Filed during this analysis — worktree helper false block | **#918** | — | none | low |
+
+**Parallelization map (lean):**
+- **Wave 1 (launch immediately, all independent, near-zero risk):** #919, #923, #924, plus #918. Grouped as one batch where practical.
+- **Wave 2 (independent of each other):** #920, #922, #925 (scripts half only).
+- **Wave 3:** #921 (waits on #919), #925's extension half.
+- **Wave 4:** #926 — scoping only, do not dispatch as implementation.
+
+## 7. Process note (deliberate deviation, recorded)
+
+This epic **does not run the full `epic-workflow`** — no Align stage, no 3 human approval gates, no test-design gate, no capstone verification gate, no `issue-scoping` double diamond with 7 review loops.
+
+This is a **deliberate, recorded deviation**, not a silent bypass. The justification: the epic's subject *is* that pipeline's overhead; applying the full ceremony would be self-refuting. The lean process actually used:
+
+1. One analysis document (this file)
+2. **Six parallel read-only verification passes, completed BEFORE decomposition** — this is the load-bearing quality step, and it caught 4 false claims
+3. Direct decomposition into proportional child issues
+4. Per-child verification proportional to that child's risk (W11 gets full treatment; W1/W6/W12 get a verification command and a test)
+
+The quality control that would have been provided by the 7 loops is replaced by **evidence**: every claim in this document cites a file:line, a command, or a count. Three of the four corrections in §3 were claims inherited from issue titles that had drifted — which is the argument for requiring a **verification command** on every child issue rather than a review round.
+
+## 7.1 Post-decomposition corrections to this document
+
+Three things changed while decomposing, and are recorded here rather than silently folded in:
+
+1. **The count went from 12 workstreams to 8 issues.** W1/W6/W9/W12 were grouped into #919 and W3/W4 into #921. Twelve issues would have been self-refuting for an epic whose thesis is that the framework emits too much issue traffic. This is W12 (admission control) applied to the epic itself.
+2. **A live reproduction of W11 was captured.** While filing these issues, a `bash` call was blocked because an *issue-body heredoc* contained the literal text of a destructive git verb — data that was never executed. Same root cause as #918 (content-based matching on non-executing text). Filed as additional evidence on #918.
+3. **W5's at-risk check count is 8, not 7.** The verification pass listed eight: the seventh (#12 env-name↔code correspondence) was initially omitted from the summary. Issue #922 carries all eight.
+
+## 8. Open risk
+
+The one thing this epic does not resolve: **N5** — 1,339 review verdicts, all `clean`. Until W10 lands, it is not possible to distinguish "the reviews are flawless" from "the record captures the reviewer's own claim rather than an adjudicated outcome." Given 7,737 unadjudicated escape hatches, the second is far more likely, and it means **the quality signal this workflow has been relying on may be largely self-reported.** That is the single strongest argument for W10 going first among the measurement items.
