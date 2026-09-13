@@ -21,11 +21,31 @@
 # Exit-status parity with eldato's original where both run; documented divergences:
 #   - missing AGENTS.md / placeholder table -> skip-with-note (original exits 1)
 #   - Pass 1 (file existence) is a new gate
-#   - missing manifest stays fail-closed (exit 1) — the pre-flight is the only drift
-#     coverage; a silent pass would remove the sole gate (issue #239 D1)
+#   - missing manifest stays fail-closed (exit 1) ONLY when no manifest is resolvable at
+#     ANY of the three locations (repo-local x2, then the agent-infra manifest actually in
+#     force). A consumer repo without a repo-local manifest is NOT "the extension enforces
+#     nothing" — skill-enforcer resolves its gate map from the extension's own install
+#     location, i.e. agent-infra's manifest, for every repo (see below). Fail-closing there
+#     guarded a failure mode that cannot occur, at the cost of failing closed on repos that
+#     have no repo-local manifest. Which repos carry a repo-local manifest is deliberately NOT
+#     asserted here — the set moves as worktrees come and go, and an earlier "27 of 30" figure
+#     was wrong (it counted agent-infra's worktree dirs as org repos).
+#     For a repo with NO repo-local manifest, location 3 now resolves the in-force manifest, so
+#     the fail-closed branch no longer fires for it. Where a repo-local manifest exists, it
+#     wins and location 3 is never consulted.
+#
+#     SCOPE — the fallback removes the FALSE block; it does not make every consumer pass.
+#     Pass 1 still requires the in-force manifest's skills to resolve under the repo's skill
+#     prefix. That is satisfied by the standard consumer layout (`skills/` symlinked to
+#     agent-infra — how tortoise/premise-labs are set up) and deliberately NOT satisfied by a
+#     consumer carrying a partial REAL `skills/` dir: such a repo cannot satisfy the gate at
+#     all, which is precisely the permanent-confusing-block case Pass 1 exists to catch.
+#     A silent pass would still be wrong — the audit keeps running, it just runs against the
+#     manifest that is actually enforcing (#3462).
 #
 # Layout detection (independent, not coupled):
 #   - manifest: `enforcement/dangerous-ops.txt` (agent-infra) -> `operations/enforcement/dangerous-ops.txt` (consumer)
+#     -> `${AGENT_INFRA_PATH}/enforcement/dangerous-ops.txt` (in-force fallback, #3462)
 #   - skill prefix: `skills/` (agent-infra) -> `operations/skills/` (consumer); prefer `skills/` when both exist
 #
 # Consumer-layout caveat: consumer repos may SYMLINK `operations/skills/<name>` to an
@@ -58,17 +78,54 @@ if [[ $# -eq 1 && "$1" == "--help" ]]; then usage; exit 0; fi
 ROOT="${ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$(cd "$(dirname "$0")/../.." && pwd)")}"
 
 # ── Layout detection (independent, decoupled) ─────────────────────────────────
+# Resolution order:
+#   1. $ROOT/enforcement/dangerous-ops.txt           (agent-infra layout)
+#   2. $ROOT/operations/enforcement/dangerous-ops.txt (consumer layout)
+#   3. ${AGENT_INFRA_PATH}/enforcement/dangerous-ops.txt — the manifest actually IN FORCE
+#
+# Why 3 exists (#3462): skill-enforcer resolves its gate map at extensions/
+# skill-enforcer.ts:75 as `resolve(__dirname, "..", "enforcement", "dangerous-ops.txt")`
+# — the *extension's* install location, i.e. agent-infra's manifest — and never reads the
+# per-repo path. So a consumer repo with no repo-local manifest is enforced by the global
+# one, and the audit must validate against it rather than fail-closed on its absence.
+# Repo-local wins when present (a repo declaring its own manifest is audited against that).
+# Fail-closed survives for the one genuinely dangerous case: NO manifest anywhere
+# (e.g. a bare CI checkout with AGENT_INFRA_PATH unset), where the extension really would
+# run with an empty gate map and enforce nothing.
 MANIFEST=""
-if [ -f "$ROOT/enforcement/dangerous-ops.txt" ]; then
-  MANIFEST="$ROOT/enforcement/dangerous-ops.txt"
-elif [ -f "$ROOT/operations/enforcement/dangerous-ops.txt" ]; then
-  MANIFEST="$ROOT/operations/enforcement/dangerous-ops.txt"
+for _candidate in \
+  "$ROOT/enforcement/dangerous-ops.txt" \
+  "$ROOT/operations/enforcement/dangerous-ops.txt"; do
+  if [ -f "$_candidate" ]; then
+    MANIFEST="$_candidate"
+    break
+  fi
+done
+# The fallback probe is GUARDED, not concatenated into the loop above: with AGENT_INFRA_PATH
+# unset/empty, "${AGENT_INFRA_PATH:-}/enforcement/dangerous-ops.txt" expands to the absolute
+# path /enforcement/dangerous-ops.txt — a ROOT-LEVEL probe. On a root-owned CI container that
+# path is plantable, and a planted manifest listing the repo's own skills would make the audit
+# "pass" against a manifest that is not in force — converting the one branch this resolution
+# order exists to keep CLOSED into a fail-open one (#3462 review, P2).
+#
+# Assumes AGENT_INFRA_PATH resolves to the same checkout the skill-enforcer extension is
+# installed from (its realpath target), so that "the manifest in force" is literally true. If
+# AGENT_INFRA_PATH points at a different worktree, this audits that worktree's manifest while
+# the extension enforces the main checkout's — the two coincide in the standard environment.
+if [ -z "$MANIFEST" ] && [ -n "${AGENT_INFRA_PATH:-}" ] \
+   && [ -f "$AGENT_INFRA_PATH/enforcement/dangerous-ops.txt" ]; then
+  MANIFEST="$AGENT_INFRA_PATH/enforcement/dangerous-ops.txt"
 fi
 if [ -z "$MANIFEST" ]; then
-  echo "❌ Manifest not found under $ROOT (tried enforcement/ and operations/enforcement/)"
-  echo "   Fail-closed: a missing manifest means the enforcement audit cannot run (issue #239 D1)."
+  echo "❌ No enforcement manifest resolvable (tried: $ROOT/enforcement/, $ROOT/operations/enforcement/, ${AGENT_INFRA_PATH:-<AGENT_INFRA_PATH unset>}/enforcement/)"
+  echo "   Fail-closed: with no manifest anywhere skill-enforcer loads an empty gate map and"
+  echo "   enforces nothing, and this audit has nothing to check (issue #239 D1)."
   exit 1
 fi
+case "$MANIFEST" in
+  "$ROOT/enforcement/dangerous-ops.txt"|"$ROOT/operations/enforcement/dangerous-ops.txt") ;;
+  *) echo "ℹ️  No repo-local manifest — auditing against the manifest in force: $MANIFEST" ;;
+esac
 
 SKILL_PREFIX="skills"
 if [ ! -d "$ROOT/skills" ] && [ -d "$ROOT/operations/skills" ]; then
