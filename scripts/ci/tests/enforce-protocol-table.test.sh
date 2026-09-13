@@ -162,7 +162,7 @@ run "O-partial-skills-still-fails" 1 "$O" "$LINFRA"
 # Comment lines are stripped first: the script DOCUMENTS the vulnerable form in a comment
 # explaining why it is avoided, and a naive grep matched that documentation.
 _LIVE_CODE=$(grep -v '^[[:space:]]*#' "$SCRIPT" | tr -d '\\' | tr '\n' ' ')
-if printf '%s' "$_LIVE_CODE" | grep -qE 'AGENT_INFRA_PATH[:-]*\}[^[:alnum:]_]*/enforcement'; then
+if grep -qE 'AGENT_INFRA_PATH[:-]*\}[^[:alnum:]_]*/enforcement' <<<"$_LIVE_CODE"; then
   echo "❌ P-no-naive-root-probe: unguarded AGENT_INFRA_PATH-derived root probe present in code"; FAIL=1
 else
   echo "✅ P-no-naive-root-probe (spelling canary — NOT a functional guard; see comment)"
