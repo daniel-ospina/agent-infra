@@ -460,6 +460,19 @@ export function adversarialBoundAssignments(src: string): string[] {
 export const EXECUTABLE_DEFAULT_BOUND = 10;
 
 /**
+ * The private execution marker the harness prints AFTER the fenced body.
+ *
+ * The body is attacker-influenced text; a marker the fence could also produce
+ * (`BOUND=<N>`) is forgeable — a decoy `printf "BOUND=%d\n" 2` was read by the
+ * old FIRST-match parse while the real loop executed 10 (cycle-2 residual
+ * #874). The sentinel is not in the documented fence, so the fence cannot print
+ * it, and the harness reads the LAST occurrence — its own trailing echo, which
+ * runs after the body. Emission uses `command`, so a function the body defines
+ * cannot shadow it.
+ */
+export const BOUND_SENTINEL = "__PIN_BOUND__";
+
+/**
  * The bound the fence ACTUALLY produces, obtained by RUNNING it. The fenced L1
  * block is executed under bash with `ADVERSARIAL_BOUND` set to 1 (adversarial)
  * or 0 (general), `gh` stubbed to report OPEN, and the loop variables seeded —
@@ -467,7 +480,9 @@ export const EXECUTABLE_DEFAULT_BOUND = 10;
  * EXECUTES: a commented-out branch, a reassigned guard variable, an
  * unconditional branch, or a rewritten condition all change the observed value
  * while leaving assignment text untouched. `break` is neutralised (the block is
- * a loop body, not a loop) and cannot affect the bound.
+ * a loop body, not a loop) and cannot affect the bound. The bound is reported by
+ * the harness's OWN trailing `BOUND_SENTINEL` echo and read as the LAST
+ * occurrence, so a forged marker the body prints can never be the value read.
  *
  * LIMIT (stated, not hidden): it executes the DOCUMENTED fence, which is what a
  * fixer agent copies; it cannot prove an agent ran something else.
@@ -485,7 +500,9 @@ export function effectiveAdversarialBound(src: string, adversarial: boolean): nu
     'EXIT_REASON=""',
     `ADVERSARIAL_BOUND=${adversarial ? 1 : 0}`,
     body,
-    'echo "BOUND=${BOUND}"',
+    // `command` skips a function the body may define, so the sentinel cannot be
+    // shadowed; the sentinel itself is private to this harness.
+    `command echo "${BOUND_SENTINEL}=\${BOUND}"`,
     'echo "EXIT_REASON=${EXIT_REASON}"',
   ].join("\n");
   let out: string;
@@ -494,9 +511,15 @@ export function effectiveAdversarialBound(src: string, adversarial: boolean): nu
   } catch (err: any) {
     throw new Error(`executing the fixer-loop fence failed: ${err?.message ?? err}`);
   }
-  const m = /^BOUND=(\d+)\s*$/m.exec(out);
-  if (!m) throw new Error(`the fixer-loop fence did not report BOUND; output: ${out}`);
-  return Number(m[1]);
+  // LAST occurrence: the harness's own trailing echo is the final sentinel line,
+  // so a decoy the body printed earlier can never win (cycle-2 residual #874).
+  const re = new RegExp(`^${BOUND_SENTINEL}=(\\d+)\\s*$`, "gm");
+  let last: string | undefined;
+  for (const m of out.matchAll(re)) last = m[1];
+  if (last === undefined) {
+    throw new Error(`the fixer-loop fence did not report ${BOUND_SENTINEL}; output: ${out}`);
+  }
+  return Number(last);
 }
 
 /**
@@ -781,6 +804,37 @@ test("rejects an unconditional adversarial branch (guard removed, assignment int
   ok(
     v.some((s) => s.includes("ADVERSARIAL_BOUND=0 yields BOUND=2")),
     `expected the general-mode execution violation, got: ${v.join(" | ")}`,
+  );
+});
+
+test("rejects a FORGED stdout marker (decoy `printf \"BOUND=%d\\n\" 2` + real `(( BOUND = 10 ))` — cycle-2 residual #874)", () => {
+  const path = "skills/code-review/references/fixer-loop.md";
+  const src = ADVERSARIAL_SOURCES[path];
+  const forged = src.replace(
+    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi\n' +
+      '[ "${ADVERSARIAL_BOUND:-0}" = "1" ] && { (( BOUND = 10 )); printf "BOUND=%d\\n" 2; }',
+  );
+  ok(forged !== src, "control did not apply — the adversarial BOUND branch was not found");
+  // Shape and guard checks stay green: `(( BOUND = 10 ))` has spaces around
+  // `=`, and `%d` is not a digit, so the source-text pins cannot see the decoy.
+  deepEqual(
+    executableBoundAssignments(forged),
+    [EXECUTABLE_DEFAULT_BOUND, ADVERSARIAL_CAP],
+    "the assignment shape is expected to stay green",
+  );
+  // The OLD harness (append `echo "BOUND=…"`, first-match) read the forged `2`.
+  // The sentinel + last-match harness reads its own trailing echo, so the REAL
+  // executed 10 is observed and the bypass fails.
+  equal(
+    effectiveAdversarialBound(forged, true),
+    EXECUTABLE_DEFAULT_BOUND,
+    "the forged marker must not be read — the real executed bound is 10",
+  );
+  const v = executableBoundViolations(forged);
+  ok(
+    v.some((s) => s.includes("ADVERSARIAL_BOUND=1 yields BOUND=10")),
+    `expected the forged marker to be rejected with the real bound, got: ${v.join(" | ")}`,
   );
 });
 
