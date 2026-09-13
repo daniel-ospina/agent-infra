@@ -79,41 +79,48 @@ model.
 
 The pipeline's "second-model" review gates (issue-scoping §5.6, code-review §6.6,
 plan-review §4.5, subagent-driven-development final reviewer) resolve their
-model with `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --print` (offline; honours
-`$SECOND_MODEL`, else the ordered `preference` list in
-`pi-bootstrap/pi-config/second-model.json`) and `--probe` (network: vendor offer
+model with `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe` (network: vendor offer
 + solvency; writes `RESOLVED=<provider/id>` for the first **solvent+reachable**
-candidate, or `DEGRADED`). There is no hardcoded default literal.
+candidate, or `DEGRADED`). `--print` (offline; honours `$SECOND_MODEL`, else the
+ordered `preference` list in `pi-bootstrap/pi-config/second-model.json`) is an
+**offline hint for inspection only** — never the dispatch source. There is no
+hardcoded default literal.
 
 `second-model.json` is the single source of truth: an ordered `preference`
 list, each candidate's `runtimeVia` dispatch authority, the primary's
 `buildEquivalence` set, the probe endpoints, and an integer-cents
 `costCentsPerPass`. Adding a funded model is a config edit, never a code edit.
 
-**Dispatch contract (ONE rule — G6/G13).** `--print` is the **offline**
-resolver (never opens a socket): it returns the first build-independent
-candidate in `preference` order, or `$SECOND_MODEL` verbatim when the operator
-override is set — but only after the same `load_authority()`/`validate()` the
-other modes run, and only when the override is a **dispatchable model id** (a
-reserved/placeholder/malformed override is exit 2, never a resolved reviewer;
-H2 closed the fail-open where the override returned before validation).
-`--probe` is the **liveness gate and the dispatch authority**:
-dispatch its `RESOLVED`. With no override, `--probe` walks the same ordered
-`preference` `--print` reads and resolves the first **solvent+reachable**
-candidate (so it equals `--print` whenever that candidate is live, and falls
-through in the same order otherwise). With `$SECOND_MODEL` set, `--probe`
+**Dispatch contract (ONE rule — G6/G13).** `--probe` is the **resolution, the
+liveness gate and the dispatch authority**: dispatch its `RESOLVED`. With no
+override, `--probe` walks the ordered `preference` and resolves the first
+**solvent+reachable** candidate. With `$SECOND_MODEL` set, `--probe`
 certifies **only** that id — a matching `preference` entry is probed, and an
 override that declares no probe endpoint or is not solvent+reachable is
 `DEGRADED`; the probe never falls through to a config default the operator
-pinned away from. The guard header and the four gate skills state this same
-rule.
+pinned away from. `--print` is the **offline hint** (never opens a socket): it
+emits the first build-independent candidate in `preference` order, or the
+`$SECOND_MODEL` override — but only after the same
+`load_authority()`/`validate()` the other modes run, and only when the override
+is a **dispatchable model id** (a reserved/placeholder/malformed override is
+exit 2, never a resolved reviewer; H2 closed the fail-open where the override
+returned before validation) that is **not build-equivalent** (#910 defect 2: a
+build-equivalent override is `**DEGRADED`, exit 1 — routed exactly like a
+build-equivalent `preference` entry, never handed out with exit 0). Because
+`--print` cannot verify solvency, every candidate it emits carries a loud
+stderr notice naming it a *candidate, not a resolution* (#910 defect 1); it
+must never be the dispatch source. The guard header and the four gate skills
+state this same rule.
 
-**Fail-closed DEGRADED.** When the resolver returns `**DEGRADED` — or the
-probe exits non-zero (the probe prints plain `DEGRADED` and exits 1; only
-`--print` emits the `**DEGRADED` token, so the trigger is either) — the gate
+**Fail-closed DEGRADED.** When `--probe` exits non-zero (the probe prints
+plain `DEGRADED` and exits 1) — or, for a malformed/unusable authority,
+`--print` emits `**DEGRADED` — the gate
 does NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in
 task-subagent default) or any build-equivalent model would be a same-build
-"independent" review, the #716 defect. Do NOT record a degraded marker — check (f) hard-fails **both**
+"independent" review, the #716 defect. The governing trigger is the **`--probe`
+exit code**; the `--print` token is secondary and fires only where it can
+genuinely fire (a malformed/unusable authority — insolvency is undetectable
+offline). Do NOT record a degraded marker — check (f) hard-fails **both**
 forms: `model=**DEGRADED` is rejected as a reserved value (before the
 independence field is read), and `independent=DEGRADED` is rejected by design
 (see the check (f) list below). STOP and escalate to a human: a guarded-surface
