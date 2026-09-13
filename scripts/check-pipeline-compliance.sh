@@ -1665,10 +1665,10 @@ $big_filler"
   # suite simply does not pin it).
   #
   # The reproduction half is now closed: #876 (`f9909b2`, issue #861) wired the
-  # guard AND its suite into CI (`ci.yml` job `sigpipe-grep`) and into
-  # `.husky/pre-commit`, so a reintroduced site can no longer merge green. #877
-  # therefore tracks only the three coverage misses above plus the missing
-  # separated-flag fixture.
+  # guard into `.husky/pre-commit` and, with its suite, into CI (`ci.yml` job
+  # `sigpipe-grep`, which runs both). A reintroduced `printf`/`echo | grep -q`
+  # site in one of the forms the guard covers therefore fails a check instead of
+  # merging green; the three spellings above stay unenforced until #877.
   #
   # The behavioural half of #836 (large-input regression vectors below, incl. the
   # fail-OPEN `pr_is_docs_only` site) is unaffected and still lives here, because
