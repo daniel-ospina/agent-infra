@@ -16,7 +16,9 @@
  *     (tool start/end, turn start/end, 30s ticks carrying in-flight state +
  *     stream age). The kill fires only on genuine silence — no in-flight tool,
  *     no active turn with fresh stream activity, no output — with bounded
- *     backstops: stream-stall (20 min), tool-stall (6h; min(L,T) preflight),
+ *     backstops: stream-stall (20 min), tool-stall (2h on the task path —
+ *     DEFAULT_TASK_TOOL_STALL_MS, #783; min(L,T) preflight; the exported
+ *     DEFAULT_TOOL_STALL_MS stays 6h for extensions/subagent/),
  *     first-message (300s). Markers never contaminate results (filtered at
  *     ingestion). Absent the emitter → exact legacy byte-silence behavior.
  *   - Tier 3: exit watchdog (120s, TASK_EXIT_GRACE_MS) — both stdio streams EOF
@@ -1523,7 +1525,22 @@ export const DEFAULT_TOOL_STALL_MS = 21_600_000;
  * detector, and markers stay fresh while a tool runs), so the bound MUST exceed
  * any legitimate single-tool duration or it kills healthy children and destroys
  * in-flight work: a bound below ~1h is a behaviour change, not a tuning tweak.
- * Task-local (unexported) — subagent/ keeps the frozen 6h constant above. */
+ * Task-local (unexported) — subagent/ keeps the frozen 6h constant above.
+ *
+ * ⚠️ DELIBERATE OVERRIDE of the #208 align-condition-3 decision ("Keep the
+ * tool-stall bound at 6h", docs/research/2026-08-12-issue-208-research.md:338)
+ * and of commit 0e863ea / #363, which raised the hard cap 2h→6h precisely
+ * because "2h killed mid-pipeline workers" (#489 kill-productive-agents
+ * class: deploys, batch reads). The override is accepted because the two
+ * bounds are now DECOUPLED: this is the task-path tool-stall only, the hard
+ * cap stays 6h, and the exported DEFAULT_TOOL_STALL_MS stays 6h so the
+ * subagent backstop cannot be dragged below the cap. Justification: a tool
+ * wedged >2h is already pathological in this repo, and firing at 2h gives the
+ * parent a recoverable cut 4h before the cap would otherwise fire.
+ * Accepted risk (explicit, not silent): one legitimately long tool >2h WILL be
+ * killed. Because clause 1 resolves a DEFINED payload whenever hasOutput is
+ * true, retry() treats that cut as success — the attempt is NOT retried, so a
+ * killed-but-productive dispatch is surfaced to the parent rather than lost.*/
 const DEFAULT_TASK_TOOL_STALL_MS = 7_200_000;
 export const DEFAULT_FIRST_MESSAGE_MS = 300_000;
 
@@ -1548,7 +1565,11 @@ export function getStreamStallMs(): number {
 export function getToolStallMs(): number {
   // #783 fix 4: the task path resolves the task-local 2h default; the exported
   // DEFAULT_TOOL_STALL_MS stays 6h for extensions/subagent/index.ts.
-  return Math.max(60_000, Number(process.env.TASK_TOOL_STALL_MS) || DEFAULT_TASK_TOOL_STALL_MS);
+  // Fail-CLOSED on a non-finite override: `Number("1e400")`/"Infinity" are
+  // truthy and survive Math.max, which would leave the wedged-tool detector
+  // permanently disarmed. Only a positive finite value overrides the default.
+  const n = Number(process.env.TASK_TOOL_STALL_MS);
+  return Number.isFinite(n) && n > 0 ? Math.max(60_000, n) : DEFAULT_TASK_TOOL_STALL_MS;
 }
 /**
  * #209: system load probe — 1-minute load average. Reads /proc/loadavg
@@ -1885,12 +1906,15 @@ export function parseHeartbeatLine(
       // touchActivity() on tool_execution_end; a wedged child is still caught
       // at S of true quiet via growing markerAge.
       // toolAgeMaxMs is deliberately NOT reset here (asymmetry, review note):
-      // clause 1 (tool-stall) requires toolsInFlight>0, and after tool_end the
-      // only way to regain it is a real tool_start (post turn_start's reset);
-      // a same-turn sequential tool inheriting a frozen tool_age is safe under
-      // the 6h default hard cap (a false tool-stall needs a >6h frozen age —
-      // reachable only at the ~6h hard-cap boundary, so a healthy agent is
-      // never killed early; the tool-stall bound itself is unchanged at 6h).
+      // clause 1 (tool-stall) requires toolsInFlight>0, which after tool_end is
+      // only regained via a real tool_start. The stale value it could then read
+      // is bounded: the child recomputes tool_age_max_ms from its CURRENT
+      // in-flight tools on every tick (task-heartbeat.ts tick), so the next
+      // parent tick overwrites it, and turn_start/turn_end hard-reset it to 0.
+      // Any stale value below the bound comes by construction from a tool that
+      // had not tripped that same bound; it is at most the task path's
+      // DEFAULT_TASK_TOOL_STALL_MS (2h, #783) — NOT the >6h age the pre-split
+      // safety argument assumed.
       state.streamAgeMs = 0;
       break;
     case "turn_start":
@@ -2090,8 +2114,9 @@ export function ingestHeartbeatChunk(
 }
 
 /** Flush the residual line buffer (close / kill-composition / overflow):
- * non-marker residue is appended to the accumulator, marker-prefixed residue
- * discarded. Returns the flushed (non-marker) text, "" if none. */
+ * non-marker residue is appended to the accumulator, EXCEPT known pi-CLI noise
+ * (`isKnownStderrNoise`, #783 Task 1); marker-prefixed residue is discarded.
+ * Returns the flushed text, "" if none (or if the residue was filtered noise). */
 export function flushHeartbeatLineBuf(ctx: HeartbeatIngestContext): string {
   if (!ctx.lineBuf) return "";
   const { flush } = flushHeartbeatResidue(ctx.lineBuf);
@@ -2378,8 +2403,10 @@ function restoreTodos(pi: ExtensionAPI): void {
 export function renderRepoStateLine(repoState: RepoState | null, cwd: string): string {
   const branch = repoState ? (repoState.branch ?? "null") : "unknown";
   const sha = repoState ? (repoState.headSha ?? "unknown") : "unknown";
-  const dirty = repoState ? String(repoState.dirty) : "unknown";
-  const dirtyPaths = repoState ? String(repoState.paths.length) : "unknown";
+  // #783 review fix: a failed status probe yields null (UNKNOWN) for dirty and
+  // paths — render `unknown`, never a confident `dirty=false dirtyPaths=0`.
+  const dirty = repoState ? (repoState.dirty === null ? "unknown" : String(repoState.dirty)) : "unknown";
+  const dirtyPaths = repoState ? (repoState.paths === null ? "unknown" : String(repoState.paths.length)) : "unknown";
   return `branch=${branch} headSha=${sha} worktree=${cwd} dirty=${dirty} dirtyPaths=${dirtyPaths}`;
 }
 
@@ -2498,12 +2525,22 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     //                     must never surface as `attempt: undefined`.
     //   transcriptPath  = the best-known locator at settle (session .jsonl when
     //                     it exists, else the child's session directory).
+    //                     Resolved LAZILY, at settle — see resolveTranscript().
     const childSessionId = sessionArgFromArgs(args, "--session-id");
     const childSessionDir = sessionArgFromArgs(args, "--session-dir");
     const attempt = record?.attempt ?? 1;
     const parentSessionId = record?.parentSessionId ?? null;
     const dispatchClass = record?.dispatchClass ?? resolveDispatchClass(subAgentEnv);
-    const transcriptPath = resolveTranscriptPath(childSessionDir, childSessionId);
+    // #783 Task 4 (review fix): resolve the transcript locator LAZILY, at
+    // settle. Doing it at spawn time is dead code — the child has not started,
+    // so the session dir/jsonl does not exist yet and `readdirSync` always
+    // throws, making the documented "prefer this child's .jsonl" branch
+    // unreachable. The dir remains the fallback ONLY for a genuine zero-output
+    // kill that beats the child's first write. Both the ledger row and the
+    // abnormal-exit payload must carry this same settle-time value, so the
+    // thunk is evaluated ONCE inside doResolve and threaded to both.
+    const resolveTranscript = (): string | null =>
+      resolveTranscriptPath(childSessionDir, childSessionId);
     // #101: spawn via process.execPath + resolved entry script (same as the
     // subagent tool) so a truncated PATH can't cause a non-retryable ENOENT.
     const invocation = getPiInvocation(args);
@@ -2679,7 +2716,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // dispatchId write N rows distinguished by `attempt`. Only values known
     // AT SETTLE are recorded; the ledger is append-only, so nothing re-writes
     // a row later (#840 owns any amendment, via a follow-up row).
-    const writeOutcomeRow = (reason: string, exitCode: number | null): RecordWriteResult => {
+    const writeOutcomeRow = (reason: string, exitCode: number | null, transcriptPath: string | null): RecordWriteResult => {
       if (!dispatchLedgerEnabled(subAgentEnv)) return { ok: false, path: "", skipped: true };
       return recordDispatchOutcome(
         buildDispatchOutcomeRow({
@@ -2724,7 +2761,8 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // and the cut-with-output arm is covered here too (a call-site writer
       // would miss it, leaving that population uncountable).
       if (opts?.reason) {
-        const recordResult = writeOutcomeRow(opts.reason, opts.exitCode ?? null);
+        const transcriptPath = resolveTranscript();
+        const recordResult = writeOutcomeRow(opts.reason, opts.exitCode ?? null, transcriptPath);
         if (value && typeof value === "object") {
           const details: Record<string, unknown> = { ...(value.details ?? {}), transcriptPath };
           // Never name a path when nothing was written: an unwritable/full
@@ -2886,7 +2924,8 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // exit-settle success (live pipe-holder) MUST sweep (round-3 F2).
     const finalize = (code: number | null, settlePath: "close" | "exit") => {
       // #176: flush the line-buffer residue before composing the result —
-      // non-marker tail preserved, truncated-marker tail discarded.
+      // non-marker tail preserved (minus known pi-CLI noise, see
+      // flushHeartbeatLineBuf), truncated-marker tail discarded.
       flushHeartbeatLineBuf(hbCtx);
       // #191: process is gone — disarm the completion watchdog even when a
       // prior abort-resolve settled the promise (killed latches before
@@ -2948,12 +2987,17 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         );
         return;
       }
-      // failed — existing non-clean composition (unchanged, mirrors
-      // composeTaskResult's failure branch: stdout || stderrClean || exit msg).
+      // Non-clean composition (mirrors composeTaskResult's failure branch:
+      // stdout || stderrClean || exit msg). Two classes reach here: a genuine
+      // non-zero exit (cls === "failed"), and a SUCCESS-but-SILENT child that
+      // exited 0 with empty stdout and no sessionEnded. Recording the latter
+      // as `reason: "failed"` with `exitCode: 0` would be self-contradictory,
+      // so the label distinguishes them (`clean-empty`) — the payload itself
+      // is unchanged.
       const output = stdout.trim();
       const text = output || stderrClean || `Sub-agent exited with code ${code}`;
       const extra = output ? (stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "") : "";
-      doResolve({ content: [{ type: "text", text: text + extra }], details: { model, provider, exitCode: code } }, { sweep: true, reason: "failed", exitCode: code });
+      doResolve({ content: [{ type: "text", text: text + extra }], details: { model, provider, exitCode: code } }, { sweep: true, reason: cls === "failed" ? "failed" : "clean-empty", exitCode: code });
     };
 
     // #272: per-dispatch monotonic latch of the effective first-message
@@ -3020,8 +3064,8 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     const heartbeat = setInterval(async () => {
       const now = Date.now();
       // Flush residue BEFORE deciding so a kill result sees everything so
-      // far (non-marker residue preserved — kill-result fidelity; marker
-      // residue discarded).
+      // far (non-marker residue preserved — kill-result fidelity, minus known
+      // pi-CLI noise the flusher filters; marker residue discarded).
       flushHeartbeatLineBuf(hbCtx);
       // Tier 1 + tier 2 (#176): one idle detector — tier-1 first-output
       // (startup hangs, retryable), then tool-stall → stream-stall →
@@ -3915,14 +3959,22 @@ export default function (pi: ExtensionAPI) {
         },
       });
       if (loopOut.halted) {
-        return haltDispatchResult({
-          family: loopOut.halted.family,
-          provider: loopOut.halted.provider,
-          model: loopOut.halted.model,
-          reason: loopOut.halted.reason,
-          state: readLatchState(subAgentEnv),
-          attempted: true,
-        });
+        // #783 Task 1 (review fix): this halt is reached ONLY after a leg
+        // really spawned (attempted: true), so with an unwritable
+        // TASK_SESSION_ROOT the child ran degraded. Wrap it like the other
+        // four post-spawn returns so the caller can see that. (The pre-spawn
+        // halt above is deliberately NOT wrapped — the root is untouched
+        // there.)
+        return withSessionDegraded(
+          haltDispatchResult({
+            family: loopOut.halted.family,
+            provider: loopOut.halted.provider,
+            model: loopOut.halted.model,
+            reason: loopOut.halted.reason,
+            state: readLatchState(subAgentEnv),
+            attempted: true,
+          }),
+        );
       }
       result = loopOut.result;
       dispatchLeg = loopOut.dispatchLeg;

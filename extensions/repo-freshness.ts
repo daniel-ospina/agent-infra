@@ -307,10 +307,14 @@ export interface RepoState {
   branch: string | null;
   /** HEAD sha; null when undetermined. */
   headSha: string | null;
-  /** Any uncommitted change (tracked or untracked). */
-  dirty: boolean;
-  /** Porcelain paths (a rename/copy contributes only its new path). */
-  paths: string[];
+  /** Any uncommitted change (tracked or untracked); **null when the status
+   * probe failed — UNKNOWN, never reported as a confident `clean`**. A handoff
+   * payload that says "clean" when it could not observe the tree is the
+   * dangerous direction, so the probe failure propagates as null. */
+  dirty: boolean | null;
+  /** Porcelain paths (a rename/copy contributes only its new path); null when
+   * the status probe failed (unknown, not "no paths"). */
+  paths: string[] | null;
 }
 
 /** Parse `git status --porcelain -z`: entries are `XY<space>PATH`,
@@ -353,11 +357,16 @@ export async function asyncRepoState(
       run(["status", "--porcelain", "-z"]),
     ]);
     if (branchRes.code !== 0 && shaRes.code !== 0 && statusRes.code !== 0) return null;
-    const paths = statusRes.code === 0 ? parsePorcelainZ(statusRes.stdout) : [];
+    // A failed status probe MUST NOT become a confident `dirty=false` (#783
+    // review): `paths = []` would render `dirty=false dirtyPaths=0` for a tree
+    // nobody actually observed. Report the two status-derived fields as null
+    // (UNKNOWN) so the render shows `dirty=unknown dirtyPaths=unknown`.
+    const statusOk = statusRes.code === 0;
+    const paths = statusOk ? parsePorcelainZ(statusRes.stdout) : null;
     return {
       branch: branchRes.code === 0 ? branchRes.stdout.trim() || null : null,
       headSha: shaRes.code === 0 ? shaRes.stdout.trim() || null : null,
-      dirty: paths.length > 0,
+      dirty: paths === null ? null : paths.length > 0,
       paths,
     };
   } catch {

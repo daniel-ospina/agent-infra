@@ -1078,9 +1078,24 @@ test("stall-bound getters — defaults + ≥60s clamp", () => {
   });
   withEnv({ TASK_STREAM_STALL_MS: "5", TASK_TOOL_STALL_MS: "-1", TASK_FIRST_MESSAGE_MS: "NaN" }, () => {
     equal(getStreamStallMs(), 60_000);
-    equal(getToolStallMs(), 60_000);
+    // #783 fix 4 (review): a non-positive override fails CLOSED to the task
+    // default rather than being clamped up (the finiteness gate's contract).
+    equal(getToolStallMs(), 7_200_000);
     equal(getFirstMessageMs(), DEFAULT_FIRST_MESSAGE_MS); // NaN → default
   });
+  // a POSITIVE finite override still clamps to ≥60s (a sub-60s bound could
+  // kill a productive agent between two ticks).
+  withEnv({ TASK_TOOL_STALL_MS: "1000" }, () =>
+    equal(getToolStallMs(), 60_000, "a positive sub-60s override is clamped to 60s"));
+  // #783 fix 4 (review): a NON-FINITE override must fail CLOSED to the default.
+  // `Number("Infinity")` / `Number("1e400")` are truthy and survive Math.max,
+  // which would leave the wedged-tool detector permanently disarmed.
+  withEnv({ TASK_TOOL_STALL_MS: "Infinity" }, () =>
+    equal(getToolStallMs(), 7_200_000, "non-finite override fails closed to the 2h task default"));
+  withEnv({ TASK_TOOL_STALL_MS: "1e400" }, () =>
+    equal(getToolStallMs(), 7_200_000, "overflowing override fails closed to the 2h task default"));
+  withEnv({ TASK_TOOL_STALL_MS: "10800000" }, () =>
+    equal(getToolStallMs(), 10_800_000, "a finite positive override is honoured"));
   withEnv({ TASK_STREAM_STALL_MS: "120000" }, () => equal(getStreamStallMs(), 120_000));
 });
 
@@ -2505,8 +2520,14 @@ test("E271g: detached spawn + treeKill heartbeat kill + backstop + hard-cap retr
   // verifier P2: hard-cap composition carries the same retryability contract
   ok(source.includes("reason: \"hard-cap\", hardCapMs: getTaskHardCapMs()"), "hard-cap composition preserved (#221)");
   ok(source.includes("exceeded the hard cap with no real output — retryable (#271)"), "hard-cap resolveUndefined = !hasOutput (#271 verifier P2)");
-  // source-drift pin: tool-stall NOT lowered (align condition 3)
-  ok(source.includes("export const DEFAULT_TOOL_STALL_MS = 21_600_000;"), "DEFAULT_TOOL_STALL_MS unchanged (6h)");
+  // #783 fix 4 re-pin (align condition 3, corrected): the property this guards
+  // is the EFFECTIVE task-path bound, not the untouched exported literal.
+  // Pinning ONLY the literal stayed green while getToolStallMs() returned 2h —
+  // so assert BOTH: the frozen export stays 6h for extensions/subagent/, and
+  // the task path resolves the deliberate 2h DEFAULT_TASK_TOOL_STALL_MS.
+  ok(source.includes("export const DEFAULT_TOOL_STALL_MS = 21_600_000;"), "DEFAULT_TOOL_STALL_MS unchanged (6h, subagent path)");
+  withEnv({ TASK_TOOL_STALL_MS: undefined }, () =>
+    equal(getToolStallMs(), 7_200_000, "the task path's EFFECTIVE tool-stall is the 2h task-local default (the deliberate #208 condition-3 override)"));
 });
 
 section("#191 completion watchdog — spawnSubAgent wiring (source assertions)");
@@ -3988,6 +4009,23 @@ testAsync("#783/T2: asyncRepoState reads branch/headSha/dirty/paths from a real 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+testAsync("#783/T2 (review fix): a failed status probe is UNKNOWN, never a confident clean", async () => {
+  const fakeExec = async (_cmd: string, args: string[]) => {
+    if (args.includes("--show-current")) return { code: 0, stdout: "main\n", stderr: "", timedOut: false };
+    if (args.includes("HEAD")) return { code: 0, stdout: `${"a".repeat(40)}\n`, stderr: "", timedOut: false };
+    return { code: 128, stdout: "", stderr: "fatal: status failed", timedOut: false };
+  };
+  const st = await asyncRepoState("/tmp", { exec: fakeExec });
+  ok(st, "branch/sha are still probed when only the status probe fails");
+  equal(st!.dirty, null, "failed status probe → dirty UNKNOWN (null), never a confident false");
+  equal(st!.paths, null, "failed status probe → paths UNKNOWN (null), never []");
+  equal(
+    renderRepoStateLine(st, "/tmp"),
+    `branch=main headSha=${"a".repeat(40)} worktree=/tmp dirty=unknown dirtyPaths=unknown`,
+    "the render shows dirty=unknown dirtyPaths=unknown (name=value format preserved)",
+  );
 });
 
   for (const t of asyncTests) await t();

@@ -179,8 +179,13 @@ jobs:
         npx tsx extensions/subagent/cache-integration.test.ts || failures=$((failures+1))
         # #783 Task 7.3 — subagent parity pin: the ext keeps its OWN timeout /
         # stall semantics and was NOT dragged by the builtin-tools task-constant
-        # split. Zero-dep source pin (node:* + readFileSync only), wired here —
-        # NOT ci.yml's verify job — because that job deliberately runs no npm ci.
+        # split. Zero-dep source pin (node:* + readFileSync only), wired here
+        # alongside the rest of the subagent-extension suites. This is the
+        # post-merge backstop; note its sibling zero-dep pin
+        # (extensions/shared/default-coverage.test.ts) ALSO runs per-PR in
+        # ci.yml's verify job, so the earlier "ci.yml runs no npm ci" rationale
+        # for keeping THIS one post-merge-only was false — it could run there
+        # too, but this job is where the subagent surface is covered.
         echo "== extensions/subagent/subagent-parity.test.ts =="
         npx tsx extensions/subagent/subagent-parity.test.ts || failures=$((failures+1))
         echo "== extensions/builtin-tools/subagent-integration.test.ts =="

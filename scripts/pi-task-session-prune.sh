@@ -23,6 +23,10 @@
 #     sibling incarnation may be starting), so a directory is never removed
 #     with content; a per-child dir is rmdir'd ONLY when it is empty AND its
 #     child is not live.
+#   * SYMLINK-SAFE: only UUID-named child dirs inside the canonical root are
+#     ever considered; symlinked entries are skipped and every unlink/rmdir is
+#     containment-checked against the canonical root (a planted
+#     `$ROOT/<name> -> ~/.ssh` can never make the sweep delete outside it).
 #
 # Bounds (env-tunable, plan/scope contract):
 #   TASK_SESSION_MAX_AGE_DAYS  default 7
@@ -48,7 +52,10 @@ ISSUE_REF="#783"
 TAB="$(printf '\t')"
 
 PS_BIN="${PS_BIN:-/bin/ps}"
-ROOT="${TASK_SESSION_ROOT:-${HOME:-}/.pi/agent/task-sessions}"
+# ROOT is resolved in resolve_root() (after --help parsing) so `--help` works
+# even when HOME is unset; see the normalization note there.
+ROOT=""
+ROOT_REAL=""
 MAX_AGE_DAYS="${TASK_SESSION_MAX_AGE_DAYS:-7}"
 MAX_BYTES="${TASK_SESSION_MAX_BYTES:-2147483648}"
 PRUNE_LOG="${TASK_SESSION_PRUNE_LOG:-${HOME:-}/.pi/agent/state/pi-task-session-prune.log}"
@@ -77,6 +84,90 @@ EOF
 # ── helpers ────────────────────────────────────────────────────────────
 say() { printf '%s\n' "$*"; log "$*"; }
 log() { printf '%s\n' "$*" >>"$PRUNE_LOG" 2>/dev/null || true; }
+
+# Trim leading/trailing whitespace (bash 3.2 — no external tools).
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# resolve_root — normalize TASK_SESSION_ROOT EXACTLY as the JS side does
+# (extensions/shared/session-id.ts resolveTaskSessionRoot: trim, then expand a
+# leading `~` / `~/`). A mismatch makes the pruner point at a DIFFERENT tree
+# than the one task children write to — it would report "absent — nothing to
+# do" and exit 0 even on --apply, so the bound would never bind. FAIL CLOSED
+# (exit 3) when the root cannot be resolved; never operate on a guessed path.
+resolve_root() {
+    local raw
+    raw="$(trim "${TASK_SESSION_ROOT:-}")"
+    if [ -z "$raw" ]; then
+        if [ -z "${HOME:-}" ]; then
+            echo "FAIL-CLOSED abort: TASK_SESSION_ROOT unset and HOME unset — cannot resolve the session root (exit 3)" >&2
+            exit 3
+        fi
+        raw="$HOME/.pi/agent/task-sessions"
+    fi
+    case "$raw" in
+        "~"|"~/"*)
+            if [ -z "${HOME:-}" ]; then
+                echo "FAIL-CLOSED abort: TASK_SESSION_ROOT is under '~' but HOME is unset (exit 3)" >&2
+                exit 3
+            fi
+            ;;
+    esac
+    case "$raw" in
+        "~") ROOT="$HOME" ;;
+        "~/"*) ROOT="$HOME/${raw#\~/}" ;;
+        *) ROOT="$raw" ;;
+    esac
+    if [ -z "$ROOT" ]; then
+        echo "FAIL-CLOSED abort: resolved TASK_SESSION_ROOT is empty (exit 3)" >&2
+        exit 3
+    fi
+}
+
+# is_session_dir_name <name> — the session-id grammar's concrete mint: a UUID.
+# Requiring the name shape stops the sweep from ever considering arbitrary
+# top-level entries (e.g. a planted directory).
+is_session_dir_name() {
+    case "$1" in
+        *[!0-9a-fA-F-]*) return 1 ;;
+    esac
+    printf '%s' "$1" | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+}
+
+# safe_child_dir <dir> — a legitimate per-child session dir: NOT a symlink,
+# named with the session-id grammar, and canonically INSIDE the session root.
+# The symlink guard is load-bearing: `[ -d ]` follows symlinks (and a trailing
+# slash defeats even `test -L`), so without it a planted `$ROOT/x -> ~/.ssh`
+# would make the sweep inventory — and delete — files outside the root.
+safe_child_dir() {
+    local d="$1" cid parent
+    [ -n "$d" ] || return 1
+    [ -L "$d" ] && return 1
+    [ -d "$d" ] || return 1
+    cid="$(basename "$d")"
+    is_session_dir_name "$cid" || return 1
+    parent="$(cd "$d" 2>/dev/null && pwd -P)" || return 1
+    case "$parent" in
+        "$ROOT_REAL"|"$ROOT_REAL"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# path_inside_root <path> — the canonical PARENT of <path> is the session root
+# or a descendant. `pwd -P` so a symlinked parent cannot fake containment.
+path_inside_root() {
+    local parent
+    [ -n "$ROOT_REAL" ] || return 1
+    parent="$(cd "$(dirname -- "$1")" 2>/dev/null && pwd -P)" || return 1
+    case "$parent" in
+        "$ROOT_REAL"|"$ROOT_REAL"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 now_epoch() {
     if [ -n "${TASK_SESSION_PRUNE_NOW_EPOCH:-}" ]; then
@@ -182,6 +273,8 @@ run() {
     printf '%s' "$MAX_AGE_DAYS" | grep -qE '^[0-9]+$' || { echo "bad TASK_SESSION_MAX_AGE_DAYS: $MAX_AGE_DAYS" >&2; exit 2; }
     printf '%s' "$MAX_BYTES" | grep -qE '^[0-9]+$' || { echo "bad TASK_SESSION_MAX_BYTES: $MAX_BYTES" >&2; exit 2; }
 
+    resolve_root
+
     mkdir -p "$(dirname "$PRUNE_LOG")" 2>/dev/null || true
     # Fail-closed (ARMED only): an armed pass must never delete without an
     # audit trail. Dry-run keeps best-effort logging (its verdict is stdout).
@@ -198,6 +291,14 @@ run() {
         say "MODE=$MODE NOW=$now ROOT=$ROOT (absent — nothing to do)"
         echo "[task-session-prune] MODE=$MODE pruned=0 freed=0B remaining=0B dirs=0 (root absent)"
         exit 0
+    fi
+    # Canonicalize the root ONCE. Every unlink/rmdir below is containment-
+    # checked against this real path, so a symlinked parent cannot escape.
+    ROOT_REAL="$(cd "$ROOT" 2>/dev/null && pwd -P)" || ROOT_REAL=""
+    if [ -z "$ROOT_REAL" ]; then
+        echo "FAIL-CLOSED abort: cannot canonicalize TASK_SESSION_ROOT ($ROOT) (exit 3)" >&2
+        log "FAIL-CLOSED abort: cannot canonicalize TASK_SESSION_ROOT ($ROOT)"
+        exit 3
     fi
 
     if ! probe_ps; then
@@ -217,26 +318,29 @@ run() {
     # never enter the evictable inventory.
     total=0
     for d in "$ROOT"/*/; do
-        [ -d "$d" ] || continue
+        d="${d%/}"
+        safe_child_dir "$d" || continue
         cid="$(basename "$d")"
         if child_is_live "$cid"; then
             while IFS= read -r f; do
                 [ -n "$f" ] || continue
+                path_inside_root "$f" || continue
                 sz="$(file_size "$f")"
                 case "$sz" in ''|*[!0-9]*) continue ;; esac
                 total=$(( total + sz ))
-            done < <(find "$d" -mindepth 1 -maxdepth 1 -type f 2>/dev/null)
+            done < <(find -P "$d" -mindepth 1 -maxdepth 1 -type f -not -type l 2>/dev/null)
             continue
         fi
         while IFS= read -r f; do
             [ -n "$f" ] || continue
+            path_inside_root "$f" || { log "SKIP outside session root: $f"; continue; }
             mt="$(file_mtime "$f")"
             sz="$(file_size "$f")"
             case "$mt" in ''|*[!0-9]*) log "SKIP unstatable mtime: $f"; continue ;; esac
             case "$sz" in ''|*[!0-9]*) log "SKIP unstatable size: $f"; continue ;; esac
             printf '%s\t%s\t%s\t%s\n' "$mt" "$sz" "$cid" "$f" >>"$INVENTORY"
             total=$(( total + sz ))
-        done < <(find "$d" -mindepth 1 -maxdepth 1 -type f 2>/dev/null)
+        done < <(find -P "$d" -mindepth 1 -maxdepth 1 -type f -not -type l 2>/dev/null)
     done
 
     # ── selection: oldest non-live first; age OR size, whichever binds first.
@@ -266,6 +370,7 @@ run() {
         freed_bytes=0
         while IFS="$TAB" read -r cid sz f; do
             [ -n "$f" ] || continue
+            path_inside_root "$f" || { log "SKIP outside session root: $f"; continue; }
             if ! probe_ps; then
                 echo "FAIL-CLOSED abort: ps probe failed during unlink phase — remaining deletes suppressed (exit 3)" >&2
                 log "FAIL-CLOSED abort: ps probe failed during unlink phase — remaining deletes suppressed"
@@ -293,13 +398,18 @@ run() {
             log "FAIL-CLOSED: ps probe failed before rmdir phase — directories left in place"
         else
             for d in "$ROOT"/*/; do
-                [ -d "$d" ] || continue
+                d="${d%/}"
+                if [ -L "$d" ]; then
+                    log "SKIP symlink child dir $d — never followed (symlink-escape guard)"
+                    continue
+                fi
+                safe_child_dir "$d" || continue
                 cid="$(basename "$d")"
                 if child_is_live "$cid"; then
                     [ "$MODE" = dry-run ] && log "KEEP dir $d — child $cid is live"
                     continue
                 fi
-                if [ -z "$(find "$d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+                if [ -z "$(find -P "$d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
                     if [ "$MODE" = apply ]; then
                         if rmdir -- "$d" 2>/dev/null; then dirs_pruned=$(( dirs_pruned + 1 )); fi
                     else

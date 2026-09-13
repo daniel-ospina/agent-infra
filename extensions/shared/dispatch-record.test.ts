@@ -101,8 +101,27 @@ case "$SCENARIO" in
     echo "FAKE-PI-PARTIAL-task4"
     sleep 120
     ;;
+  transcript-partial)
+    echo "FAKE-PI-PARTIAL-task4"
+    SDIR=""; SID=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --session-dir) SDIR="$2"; shift 2 ;;
+        --session-id) SID="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ -n "$SDIR" ]; then
+      mkdir -p "$SDIR"
+      echo '{}' > "$SDIR/2026-01-01T00-00-00-000Z_$SID.jsonl"
+    fi
+    sleep 120
+    ;;
   exit0)
     echo "FAKE-PI-OK-task4"
+    exit 0
+    ;;
+  exit0-silent)
     exit 0
     ;;
 esac
@@ -364,7 +383,7 @@ test("row contract end-to-end: shared dispatchId, arg-vector childSessionId, tra
 	equal(row.attempt, 1);
 	equal(row.reason, "backstop");
 	equal(row.dispatchClass, "task");
-	equal(row.transcriptPath, d.sessionDir, "no .jsonl yet → the session dir is the locator");
+	equal(row.transcriptPath, d.sessionDir, "no .jsonl written by the fake child → the session dir is the fallback locator");
 	equal(row.exitCode, null, "killed attempt → no exit code");
 	equal(row.cwd, process.cwd());
 	ok(row.toolAgeMaxMs === null || typeof row.toolAgeMaxMs === "number");
@@ -373,8 +392,35 @@ test("row contract end-to-end: shared dispatchId, arg-vector childSessionId, tra
 	// payload: `record` names the real ledger; `transcriptPath` names the child.
 	equal(d.value!.details.record, ledgerPath());
 	ok(fs.existsSync(d.value!.details.record as string), "the path the payload names really exists");
-	equal(d.value!.details.transcriptPath, d.sessionDir);
+	equal(d.value!.details.transcriptPath, d.sessionDir, "payload falls back to the dir when the child wrote no .jsonl");
 	equal(d.value!.details.reason, "cut", "the payload's reason VALUE is unchanged by the record (backstop pin)");
+});
+
+test("#783 (review fix): the transcript locator is resolved AT SETTLE — a child-written .jsonl wins over the dir", async () => {
+	const d = await dispatch("transcript-partial", { extraParentEnv: { TASK_BACKSTOP_MS: "3000", TASK_HARD_CAP_MS: "3600000" } });
+	ok(d.value !== undefined, "hasOutput → defined backstop payload");
+	const rows = outcomeRows(d.nonce);
+	equal(rows.length, 1, `exactly one outcome row (got ${rows.length})`);
+	const row = rows[0];
+	ok(
+		typeof row.transcriptPath === "string" && row.transcriptPath.endsWith(".jsonl"),
+		`row.transcriptPath names the child's .jsonl, not the dir (got ${row.transcriptPath})`,
+	);
+	ok(row.transcriptPath.includes(d.sessionId), "the id-matching transcript is chosen");
+	equal(
+		d.value!.details.transcriptPath,
+		row.transcriptPath,
+		"the payload's transcriptPath is the SAME settle-time value as the ledger row's",
+	);
+});
+
+test("#783 (review fix): a success-but-SILENT child records 'clean-empty', never a failed/exitCode:0 contradiction", async () => {
+	const d = await dispatch("exit0-silent", {});
+	ok(d.value !== undefined, "the non-clean arm still composes a payload");
+	const rows = outcomeRows(d.nonce);
+	equal(rows.length, 1, `exactly one row (got ${rows.length})`);
+	equal(rows[0].reason, "clean-empty", "exit 0 + empty stdout → clean-empty (not 'failed')");
+	equal(rows[0].exitCode, 0, "the exit code is recorded as 0");
 });
 
 test("silent child at the HARD CAP writes exactly ONE row — even though the close path re-settles as 'cut'", async () => {
@@ -485,7 +531,7 @@ test("every abnormal settle passes a reason; success/clean/spawn-error sites pas
 	ok(source.includes('doResolve(undefined, { sweep: true, reason: "hard-cap" })'), "cap no-output arm");
 	ok(source.includes('), { sweep: true, reason: "hard-cap" })'), "cap composer arm");
 	ok(source.includes('{ sweep: true, reason: "cut", exitCode: code }'), "cut arm (both ternary branches)");
-	ok(source.includes('{ sweep: true, reason: "failed", exitCode: code }'), "non-zero failed arm");
+	ok(source.includes('reason: cls === "failed" ? "failed" : "clean-empty", exitCode: code'), "final arm labels a genuine failure 'failed' and a success-but-silent child 'clean-empty'");
 	ok(source.includes('doResolve(undefined, { sweep: true, reason: decision.reason ?? "silence-threshold" })'), "heartbeat no-output arm");
 	ok(source.includes('), { sweep: true, reason: decision.reason ?? "silence-threshold" })'), "heartbeat composer arm");
 	ok(source.includes('doResolve(undefined, { sweep: true, reason: "backstop" })'), "backstop no-output arm");

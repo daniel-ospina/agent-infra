@@ -15,9 +15,14 @@
  * Method (session-log forensics, verified against real logs):
  *   - The task tool spawns the child as `pi -p ... <prompt>`; since #783
  *     Task 1 the child also persists its own session (`--session-id` +
- *     `--session-dir` under TASK_SESSION_ROOT), but its FIRST user message is
- *     still EXACTLY the parent's arguments.prompt → exact pairing by prompt
- *     hash (sha256).
+ *     `--session-dir` under TASK_SESSION_ROOT). The child's first user
+ *     message is NOT the raw prompt — pi TRANSFORMS it (system preamble
+ *     injected, body abridged), so exact prompt-hash pairing does not work
+ *     (see KNOWN LIMITATION), and this sweep's `listSessionDirs()` also
+ *     filters on an agent-infra cwd slug, so the new
+ *     `~/.pi/agent/task-sessions/<uuid>/` child dirs are never scanned. This
+ *     script predates #783; the pairing channel it was built on is broken and
+ *     the replacement is still unwired.
  *   - T0 = child session spawn ts (session event); time-to-first-message =
  *     first assistant message with content; time-to-first-tool = first
  *     assistant message containing a toolCall.
@@ -29,15 +34,19 @@
  *
  * Read-only — never modifies session logs.
  *
- * KNOWN LIMITATION (review #332 P1): exact-hash pairing is ~impossible in
- * practice — pi TRANSFORMS the child's first user message (system preamble
- * injected, body abridged), so the raw prompt never appears verbatim. Prefix
- * matches are accepted only with verified full-text containment of a prompt
- * fragment + a 10-min time window; anything else is reported UNPAIRED (never
- * nearest-ts guesswork). Reliable pairing needs a verified channel (e.g., the
- * child session id surfaced in the task tool's result) — tracked as a
- * follow-up. Until then the sweep reports honest '0 paired' rather than
- * fabricated slow-thinking-tail numbers.
+ * KNOWN LIMITATION (review #332 P1, STILL OPEN): exact-hash pairing is
+ * ~impossible in practice — pi TRANSFORMS the child's first user message
+ * (system preamble injected, body abridged), so the raw prompt never appears
+ * verbatim. Prefix matches are accepted only with verified full-text
+ * containment of a prompt fragment + a 10-min time window; anything else is
+ * reported UNPAIRED (never nearest-ts guesswork). The verified pairing channel
+ * now EXISTS (#783 Task 4): the task tool publishes the child's
+ * `childSessionId` and the settle-time `transcriptPath` (in the durable
+ * outcome row and the abnormal-exit payload's details). Wiring THIS sweep to
+ * that channel — instead of prompt-hash/containment heuristics and the
+ * cwd-slug session scan — is the intended fix path; until it lands the sweep
+ * still reports honest '0 paired' rather than fabricated slow-thinking-tail
+ * numbers.
  */
 
 import { createHash } from "node:crypto";
