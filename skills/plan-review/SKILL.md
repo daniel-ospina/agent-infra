@@ -109,7 +109,7 @@ When review finds issues, the agent attempts to resolve them autonomously before
 | **P0**, needs substantial work | File a GitHub issue via issue-creation, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
 | **P0**, requires human input (data loss, security, ontology choice, cost >$10/mo, legal/compliance) | Pause with structured question + research findings. |
 
-**Stall detection:** If the same issue fingerprint persists across 2+ cycles, file an issue and continue (do NOT stall exit). Only stall exit if the issue is P0 and unfixable.
+**Stall detection:** A fingerprint persisting across 2+ cycles is precisely what the `fingerprint-stall` detector measures — do not hand-diagnose it here. Follow the 3-layer stuckness algorithm in Phase 5: recurrence ≥ `stall_threshold` (default `0.8`) → escalate to a human. Filing a GitHub issue is a **remedy** for a stalled issue, never an alternative to the detector — filing it and continuing is how a stalled loop silently runs to its cycle cap.
 
 
 ### Phase 1 — Review (Parallel Agents)
@@ -475,6 +475,8 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 - [ ] Last cycle's reviewers #1–#4 all returned "NO ISSUES FOUND" (verbatim, not paraphrased)
 - [ ] Reviewer #5 (if dispatched) was parsed against its **full** token and dispositioned per the table above — `NO ISSUES FOUND — CLEAN`, `— DEGRADED (<source>)` recorded as a caveat, or `ISSUES:` recorded with its verdicts. None of these blocks the cycle; all three satisfy this box. Substring-matching `NO ISSUES FOUND` and reading `— DEGRADED` as clean fails this box.
+
+  ⚠️ **This box gates *proceeding*, not *cleanliness* — the two are different predicates and this is the one place a reader mid-loop consults.** All three dispositions satisfy it, but only `NO ISSUES FOUND — CLEAN` yields a **clean** exit. `ISSUES:` (and a `— DEGRADED` recorded as a caveat) yields an **escalation** exit: proceed to Phase 5 with the surviving issues documented and carried into the escalation payload, and **never report it as clean or complete**. Per `AGENTS.md` §Hard Cap, an exit that leaves issues unresolved is an escalation exit, not a completion.
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
@@ -482,22 +484,28 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **Stuckness detection (3-layer algorithm)**:
 
-a. **Fingerprint-stall**: Hash each surviving issue's dimension+location+description+suggestion (SHA256). If ≥80% of fingerprints match the previous cycle → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
+a. **Fingerprint-stall**: Hash each surviving issue's **location + severity** (SHA256) — the defect's *stable identity*, **never** its `dimension`/`description`/`suggestion`. Wording is the part a fresh, memoryless reviewer varies; hashing it made an identical defect re-described in new words hash differently, so recurrence read ~0 on a cycle where nothing was fixed — the most common real stall, invisible to the primary detector. **Recurrence is `|current ∩ prev| / |prev|`** — "what fraction of *last cycle's* issues came back?". `|prev|` is the correct denominator and the *only* one: it is the stall signal, so a cycle that repeats all 10 prior issues must score 1.0. (A symmetric denominator — `max(|current|, |prev|)` — inverts this: repeating all 10 prior issues *plus* 5 new ones scores `10/15 = 0.67`, **below** threshold, so the loop reads as ordinary churn on a cycle where nothing was resolved. Do not use it.) **`stall_threshold` defaults to `0.8`** — the same value `code-review/references/fixer-loop.md` reads from `STALL_THRESHOLD`. If recurrence ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
 
-b. **Honest-stuck**: Track `issues_per_cycle` (number of issues surviving after each cycle). If issue count is **non-decreasing for 3 consecutive cycles** AND the fingerprints differ from prior cycles (genuinely new issues each time), the fixer is introducing new issues faster than it resolves existing ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem.
+b. **Honest-stuck**: Track `issues_per_cycle`. **This is an INDEPENDENT signal, not a refinement of recurrence** — it fires when the count is **non-decreasing for 3 consecutive cycles**, *regardless of recurrence*. Gating it behind `recurrence ≥ stall_threshold` was itself a regression: a loop that churns one-for-one (every issue fixed, a new one appearing in its place) has **low** recurrence but is not converging, and the gate left it undiagnosed until the cycle cap. Exit reason = `honest-stuck`. Escalate to human. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.**
 
-c. **Zero-progress**: Track whether the plan doc was modified each cycle. If plan doc unchanged for 2 consecutive cycles, the fixer is making zero progress — treat as fingerprint-stall and escalate.
+   ⚠️ **Fire if `recurrence ≥ stall_threshold` OR `issues_per_cycle` is non-decreasing for 3 consecutive cycles.** Either is sufficient on its own. The two tests exist because they catch different pathologies — recurrence catches *the same issues coming back*, the count test catches *the loop not shrinking, however caused*. Recurrence is used only to pick the label (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`); it is never a precondition for the count signal.
+
+c. **Zero-progress**: Track whether the plan doc was modified each cycle. If the plan doc is unchanged for 2 consecutive cycles, the fixer is making zero progress. Exit reason = `zero-progress`. Escalate to human. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.** (Previously mapped onto `fingerprint-stall`, which made three distinct conditions — identical issues recurring, new issues outpacing fixes, and the fixer writing nothing at all — indistinguishable in the persisted record.)
 
 **Convergence rule:** If cycle N issues are a strict subset of cycle N-1 issues (no new dimensions or locations, only previously-flagged items remain), the reviewer is in a refinement loop — fixes are shrinking the problem space but not eliminating it. Log convergence and escalate to human: present remaining issues with attempted fixes. Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.
 
 **Cycle-status YAML**: Write `operations/logs/cycle-status.yaml` on loop exit:
 
 ```yaml
-exit_reason: <clean|fingerprint-stall|honest-stuck|cycle-cap|convergence>
+exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|convergence>
 cycles: <N>
 issues_per_cycle: <json array>
 plan_modified_per_cycle: <json array of booleans>
+detector_fired: <fingerprint-stall|honest-stuck|zero-progress|''>   # which layer fired, or empty
+fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual input; null on a zero-progress exit, which fires before the scan
 ```
+
+> **Why `detector_fired` and `fingerprint_recurrence_last_cycle` are recorded:** without them, "why did this loop exit?" cannot be answered after the fact — the predicate's inputs are gone and only the verdict survives. That is what made a real non-convergent run undiagnosable.
 
 **Progress report:** After each cycle, output: "Plan review cycle N: X issues found across N reviewers, Y fixed, Z remaining."
 
@@ -519,7 +527,7 @@ After Phase 4 converges clean (Flash reviewers are done), dispatch ONE second-mo
 
 **Model (second-model gate, #716):** resolve the effective model with the guard — `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --print` (offline; honours `$SECOND_MODEL`, else the ordered `preference` in `pi-bootstrap/pi-config/second-model.json`). Before dispatch run `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe` (network): it writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED`. **Dispatch contract:** dispatch `model=<RESOLVED id>` from `--probe` (the liveness gate is the dispatch authority; `--print` is the offline resolver). With `$SECOND_MODEL` set the probe certifies **only** that id — if it is not solvent+reachable (or declares no probe endpoint in `preference`) the probe is `DEGRADED` and never falls through to a config default.
 
-**Fail-closed DEGRADED (no silent fallback):** if `--print` returns `**DEGRADED` (or the probe exits non-zero), do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review, the exact #716 defect. Record `[SECOND-MODEL-GATE] model=**DEGRADED independent=DEGRADED` via `record-review.sh` (`SECOND_MODEL_GATE_MODEL` / `SECOND_MODEL_GATE_INDEPENDENT`) and escalate to a human: a degraded second-model gate is a human decision, not an auto-fallback. `[#476 hop-leg]` is orthogonal and stackable — a dispatch that lands on a failover hop is annotated `[SECOND-MODEL-GATE][#476 hop-leg]`, and a hop-leg run is never presented as the configured second model. Pricing/base decision: issue #284, superseded by #716.
+**Fail-closed DEGRADED (no silent fallback):** if `--print` returns `**DEGRADED` (or the probe exits non-zero), do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review, the exact #716 defect. There is NO recordable degraded marker — check (f) hard-fails both forms: `model=**DEGRADED` is rejected as a reserved value (before the independence field is read), and `independent=DEGRADED` is rejected by design. STOP and escalate to a human: a degraded second-model gate is a human decision, not an auto-fallback, and the guarded-surface change cannot merge until an independent model is funded or the operator authorizes a bypass (#860). `[#476 hop-leg]` is orthogonal and stackable — a dispatch that lands on a failover hop is annotated `[SECOND-MODEL-GATE][#476 hop-leg]`, and a hop-leg run is never presented as the configured second model. Pricing/base decision: issue #284, superseded by #716.
 
 **Success path — record the marker (required):** when the probe resolves, record the success form as well: `SECOND_MODEL_GATE_MODEL=<RESOLVED id> SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh` (it appends `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>`). check (f) in `scripts/check-pipeline-compliance.sh` requires that line on ANY diff touching the second-model guarded surface, so a successful gate that is never recorded still fails the merge gate.
 

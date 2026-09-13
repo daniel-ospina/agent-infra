@@ -178,9 +178,12 @@ When the verifier sub-agent returns issues: fix flagged issues → re-dispatch �
 
 | Signal | Threshold | Action |
 |--------|-----------|--------|
-| Same issue 3 consecutive cycles | Stalled | Escalate to human with stuck issue + attempted fixes |
-| Non-decreasing issue count 3 cycles + different issues | Honest-stuck | Fixer introducing new bugs — escalate |
+| Fingerprint `location + severity` — **never** `description`/`suggestion` (a fresh reviewer re-words the same defect; hashing the wording makes recurrence read ~0 on a real stall) | — | — |
+| Recurrence `|current ∩ prev| / |prev|` ≥ `stall_threshold` (default `0.8`) | Fingerprint-stall | Escalate to human with stuck issue + attempted fixes |
+| Issue count non-decreasing 3 consecutive cycles — **fires on its own, regardless of recurrence** | Honest-stuck | The loop is not shrinking (churn, or issues outpace fixes) — escalate |
 | No file changes 2 cycles | Zero-progress | Fixer making no progress — escalate |
+
+> **Fire if `recurrence ≥ stall_threshold` OR the count is non-decreasing for 3 cycles.** Either alone is sufficient; they are independent signals for different pathologies. Recurrence picks the *label* only (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`) — never a precondition for the count signal.
 
 **Exit outcomes:** CLEAN (zero issues), Convergence (shrinking set → escalate), Stall, Honest-stuck, Capped (10 cycles).
 

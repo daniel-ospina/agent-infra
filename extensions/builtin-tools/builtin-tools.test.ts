@@ -811,13 +811,47 @@ testAsync("completion watchdog reaps a genuinely hung node child via treeKill", 
 });
 
 testAsync("disarmed completion watchdog lets a clean-exit child exit naturally", async () => {
+  // #844 — THE WALL-CLOCK WINDOW HERE WAS THE DEFECT, NOT THE WATCHDOG.
+  //
+  // This test armed a real 500 ms grace and asserted the watchdog never fired
+  // for a child running `process.exit(0)`. But 500 ms sits inside the noise band
+  // of process spawn under load: when a parallel `npx tsx` run or CI contention
+  // pushed node's startup past the grace, the watchdog fired CORRECTLY — the
+  // child genuinely had not exited within the grace — and the assertion flipped.
+  // Same tree, same command: 222 passed / 0 failed, then 221 / 1. A regression
+  // gate that reports a false failure is worse than no gate: it trains
+  // operators to ignore a red suite, and a plan that pins its number inherits a
+  // nondeterministic baseline.
+  //
+  // The property — "a child that exits cleanly BEFORE the grace is never
+  // killed" — cannot be expressed against a grace the machine can overshoot. So:
+  //   * the grace is now far outside any plausible clean-exit lifetime. It costs
+  //     no wall-clock time because disarm() below clears it (and the `finally`
+  //     guarantees that even on an assertion failure, so a red run cannot leave
+  //     a live timer holding the event loop open for the full grace).
+  //   * `kill` is INJECTED: the assertion observes the signal instead of relying
+  //     on a real treeKill whose only visible trace is the flaky log line.
+  // The grace's boundary semantics are covered deterministically by the three
+  // injected-spy tests above ("fires after grace once armed", "disarm before
+  // grace cancels the kill", "grace already elapsed when disarmed"), and the
+  // real-treeKill path by the hung-child test, also above. This one asserts only what
+  // it can assert honestly: a clean exit is left alone.
+  const kills: string[] = [];
   const child = spawn(process.execPath, ["-e", "process.exit(0);"], { stdio: ["ignore", "pipe", "pipe"] });
   const pid = child.pid!;
-  const wd = armCompletionWatchdog({ pid, graceMs: 500 });
-  await new Promise<number | null>((res) => child.on("close", (c) => res(c)));
-  wd.disarm(); // exited before grace — disarm after the fact is a no-op
-  await sleep(700);
-  equal(wd.killed, false, "clean exit → watchdog never fired");
+  const wd = armCompletionWatchdog({ pid, graceMs: 30_000, kill: (sig) => kills.push(sig) });
+  try {
+    const code = await new Promise<number | null>((res) => child.on("close", (c) => res(c)));
+    // Precondition, asserted rather than assumed: the child really did exit
+    // cleanly, so "not killed" is a statement about a clean exit.
+    equal(code, 0, "the fixture child exits cleanly");
+    wd.disarm(); // exited before grace — disarm after the fact is a no-op
+    await sleep(50);
+    equal(wd.killed, false, "clean exit → watchdog never fired");
+    equal(kills.length, 0, "clean exit → watchdog sent no signal");
+  } finally {
+    wd.disarm();
+  }
 });
 
 testAsync("E1: fake child completes (payload + session_end) then hangs → edge arms watchdog → composed as success", async () => {
