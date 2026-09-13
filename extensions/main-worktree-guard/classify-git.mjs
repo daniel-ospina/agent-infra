@@ -1256,7 +1256,7 @@ export function codePayloadGitVerdict(content, currentBranch, executionCwd = pro
   const GIT_SEG = "(?:(?:sudo|doas|env|nice|ionice|timeout|nohup|setsid|stdbuf|time|command|builtin|eval|exec|xargs)\\s+(?:-\\S+\\s+|\\d+\\s+)*)*(?:\\S*\\/)?git\\s+(?![=:])\\S";
   if (new RegExp(`(?:^|[\\s;&|(\`$])${GIT_SEG}`).test(shellProbe)) {
     const shellText = _stripShellComments(shellProbe);
-    if (_unverifiableGitContent(shellText)) return "block";
+    if (_unverifiableGitContent(shellText, executionCwd)) return "block";
     for (const inv of allGitInvocations(shellText)) {
       if (inv.verb === "__unverifiable__") return "block";
       invocations.push(inv);
@@ -1264,7 +1264,7 @@ export function codePayloadGitVerdict(content, currentBranch, executionCwd = pro
   }
   const { cmds, unresolved } = extractCodeGitCommandsDetailed(c);
   for (const cmd of cmds) {
-    if (_unverifiableGitContent(cmd)) return "block";
+    if (_unverifiableGitContent(cmd, executionCwd)) return "block";
     for (const inv of allGitInvocations(cmd)) {
       if (inv.verb === "__unverifiable__") return "block";
       invocations.push(inv);
@@ -2335,6 +2335,7 @@ function _wtScanLine(line, carry) {
   let quote = carry?.quote ?? null;
   let arith = carry?.arith ?? 0;
   let delim = null;
+  let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
   let atWordStart = carry?.atWordStart ?? true;
   while (i < line.length) {
     const ch = line[i];
@@ -2368,7 +2369,7 @@ function _wtScanLine(line, carry) {
       // every following line — including a later discard (reviewer round-6 P1).
       while (j < line.length && (q ? line[j] !== q : !/[\s;&|<>(){}'"\\]/.test(line[j]))) { d += line[j]; j++; }
       if (q && line[j] === q) j++;
-      if (d && delim === null) delim = d;
+      if (d && delim === null) { delim = d; delimQuoted = q; }
       // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
       // placeholder, never the next real command token. An opener with no
       // delimiter (`<<` in arithmetic) emits bare `<<`.
@@ -2379,7 +2380,41 @@ function _wtScanLine(line, carry) {
     out += ch; i++; atWordStart = false;
   }
   if (carry) { carry.quote = quote; carry.arith = arith; carry.atWordStart = atWordStart; }
-  return { text: out, delim };
+  return { text: out, delim, delimQuoted };
+}
+
+/**
+ * Blank the BODIES of QUOTED heredocs (`<<'EOF'` / `<<"EOF"`).
+ *
+ * The outer shell performs NO expansion inside a quoted heredoc, so a `$( )`
+ * or backtick appearing there is literal text — e.g. a markdown code span in
+ * an embedded Python/Ruby/SQL heredoc — and can never be an outer-shell command
+ * substitution (#967/#895: a Python docstring `` `/` `` was misread as
+ * `$(/)` and froze every hub-rooted session). Unquoted heredocs (`<<EOF`) ARE
+ * expanded by the outer shell and stay in the scanned text.
+ *
+ * A quoted body that is PIPED or fed to an interpreter is still executable by
+ * THAT interpreter; the explicit heredoc-to-shell closure in
+ * `_unverifiableGitContent` (run on the raw text, not this projection) keeps
+ * that case gated. Non-heredoc lines are returned verbatim — this is a pure
+ * projection for the substitution scan, never a rewrite of live shell text.
+ */
+function _stripQuotedHeredocBodies(text) {
+  const lines = String(text ?? "").split("\n");
+  const out = [];
+  let pending = null; // delimiter while inside a quoted heredoc body
+  const carry = { quote: null, arith: 0, atWordStart: true };
+  for (const line of lines) {
+    if (pending !== null) {
+      if (line.trim() === pending) { out.push(""); pending = null; continue; }
+      out.push(""); // body line — literal to the outer shell
+      continue;
+    }
+    const { delim, delimQuoted } = _wtScanLine(line, carry);
+    out.push(line);
+    if (delim !== null && delimQuoted) pending = delim;
+  }
+  return out.join("\n");
 }
 
 function _wtStripHeredocData(text, codeBodies) {
@@ -5108,7 +5143,7 @@ const COMPOUND_WORDS = new Set(["for", "do", "done", "if", "then", "else", "elif
  * assignments); an interpreter or path as the first command token (script-in-
  * substitution); a SPAWNER at command position (start or after pipe/`;`) with
  * any `$VAR` argument. Recurses into nested substitutions (paren-balanced). */
-function _spanCarriesGit(inner, cmdVars = {}) {
+function _spanCarriesGit(inner, cmdVars = {}, execCwd = process.cwd()) {
   // Literal git in the span: classify each git invocation — READ-ONLY and
   // sanctioned-recovery verbs pass (`git describe`, `git status` in a commit
   // message must NOT re-freeze the worktree commit — second-model P1);
@@ -5124,7 +5159,7 @@ function _spanCarriesGit(inner, cmdVars = {}) {
     if (gi.verb && isHubRecoveryInvocation(gi.verb, gi.args, null) === "block") return true;
   }
   for (const sub of _extractSubstitutionSpans(inner)) {
-    if (_spanCarriesGit(sub, cmdVars)) return true;
+    if (_spanCarriesGit(sub, cmdVars, execCwd)) return true;
   }
   const t = _tokenize(inner);
   let k = 0;
@@ -5139,7 +5174,20 @@ function _spanCarriesGit(inner, cmdVars = {}) {
     if (cmdVars[name] !== undefined && /^(?:.*\/)?git$/.test(String(cmdVars[name]).trim().split(/\s+/)[0])) return true;
     return false;
   }
-  if (SHELL_INTERPRETERS.has(first) || /^\.{0,2}\//.test(first)) return true; // interpreter/path
+  if (SHELL_INTERPRETERS.has(first)) return true; // interpreter runs its operand — fail closed
+  if (/^\.{0,2}\//.test(first)) {
+    // A path-shaped span is a real script execution ONLY when it names an
+    // existing regular file — a real effect. A bare `/`, a directory, or a
+    // nonexistent path (markdown prose, a docstring code span) executes
+    // nothing, so there is no git effect to fail closed on (#895/#967). A
+    // RELATIVE path is NOT resolved (the substitution's cd-chain cwd is not
+    // tracked here) → keep failing closed.
+    if (!first.startsWith("/")) return true;
+    try {
+      if (!existsSync(first) || !statSync(first).isFile()) return false;
+    } catch { return true; }
+    return true; // an existing script we cannot statically prove read-only
+  }
   for (let i = k; i < t.length; i++) {
     if (SPAWNER_WORDS.has(t[i]) && (i === k || t[i - 1] === "|" || t[i - 1] === ";")) {
       if (t.slice(i + 1).some((a) => /\$/.test(a))) return true;
@@ -5154,35 +5202,40 @@ function _spanCarriesGit(inner, cmdVars = {}) {
  * Fail closed while the hub is disordered — but only for the construct's OWN
  * content (a worktree-exempt `git commit` before a `$(date)` must not
  * false-block). */
-function _unverifiableGitContent(command) {
+function _unverifiableGitContent(command, execCwd = process.cwd()) {
   const c = String(command ?? "");
+  // #967/#895: the outer shell does not EXPAND a quoted heredoc body, so a
+  // `$( )`/backtick inside it is literal text. Scan the outer-shell projection
+  // (`ce`) for substitutions; the heredoc rule below still reads the RAW text
+  // (a quoted body piped/fed to an interpreter is executable by THAT shell).
+  const ce = _stripQuotedHeredocBodies(c);
   // Command-level assignments — the $VAR command-word resolution in spans and
   // -c inlines resolves against these (`G=git; $( { $G reset; } )` — the nested
   // walk's fresh frame has no G, but the OUTER command assigned it; R11-4).
   const cmdVars = {};
-  for (const m of c.matchAll(/(?:^|[;&|\s])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=([^\s;&|]+)/g)) {
+  for (const m of ce.matchAll(/(?:^|[;&|\s])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=([^\s;&|]+)/g)) {
     cmdVars[m[1]] = m[2];
   }
   // Round-19 (final gate P1): process substitution `<( echo 'git …' )` feeds
   // a shell interpreter a script with NO file — the content is executable
   // text (probe: `bash <(echo 'git commit')` committed to the hub). Classify
   // the <( )/>( ) spans like $() content.
-  for (const m of c.matchAll(/[<>]\(([^)]*)\)/g)) {
+  for (const m of ce.matchAll(/[<>]\(([^)]*)\)/g)) {
     // The FD's CONTENT is what the shell executes — a git word ANYWHERE in the
     // substitution output is unverifiable (bash <(echo 'git commit') runs git;
     // `bash <(echo 'git status')` is conservatively blocked too — the gate
     // cannot evaluate echo's output).
-    if (/\bgit\b/.test(m[1] ?? "") || _spanCarriesGit(m[1] ?? "")) return true;
+    if (/\bgit\b/.test(m[1] ?? "") || _spanCarriesGit(m[1] ?? "", {}, execCwd)) return true;
   }
   // Round-11 (security P1): span extraction on the RAW command (unquoted
   // `$( … )` splits into `$`/`(` tokens — the token-level scan missed them).
-  for (const inner of _extractSubstitutionSpans(c)) {
-    if (_spanCarriesGit(inner, cmdVars)) return true;
+  for (const inner of _extractSubstitutionSpans(ce)) {
+    if (_spanCarriesGit(inner, cmdVars, execCwd)) return true;
   }
-  const tokens = _tokenize(c);
+  const tokens = _tokenize(ce);
   for (const t of tokens) {
     for (const inner of _extractSubstitutionSpans(t)) {
-      if (_spanCarriesGit(inner, cmdVars)) return true;
+      if (_spanCarriesGit(inner, cmdVars, execCwd)) return true;
     }
   }
   // Round-14 (final gate P1): heredoc bodies fed to a shell interpreter are
@@ -5195,16 +5248,16 @@ function _unverifiableGitContent(command) {
   // `export G=git; sh -c '$G reset'` fails closed; `sh -c '$EDITOR x'` (env
   // var, not command-assigned) passes (the second-model's no-blanket-block
   // warning).
-  const cInlineVar = c.match(/\b(?:sh|bash|zsh|dash|ksh)\s+-c\s+['"]?\$(\{?[A-Za-z_][A-Za-z0-9_]*\}?)/);
+  const cInlineVar = ce.match(/\b(?:sh|bash|zsh|dash|ksh)\s+-c\s+['"]?\$(\{?[A-Za-z_][A-Za-z0-9_]*\}?)/);
   if (cInlineVar) {
     const name = cInlineVar[1].replace(/[{}]/g, "");
-    if (new RegExp(`(?:^|[;&|\\s])(?:export\\s+)?${name}=`).test(c)) return true;
+    if (new RegExp(`(?:^|[;&|\\s])(?:export\\s+)?${name}=`).test(ce)) return true;
   }
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (t === "eval") {
       const rest = tokens.slice(i + 1, i + 4).join(" ");
-      if (/\bgit\b/.test(rest) || _spanCarriesGit(rest, cmdVars)) return true; // round-12: pass cmdVars — `eval $G` resolves
+      if (/\bgit\b/.test(rest) || _spanCarriesGit(rest, cmdVars, execCwd)) return true; // round-12: pass cmdVars — `eval $G` resolves
     }
     if ((t === "alias" || t === "function") && tokens[i + 1]) {
       const def = tokens.slice(i + 1, i + 3).join(" ");
@@ -5299,7 +5352,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
   // the invocation loop (a preceding worktree-exempt `continue` must not skip
   // the check): if any substitution/indirection content carries git, block while
   // the hub is disordered (content-scoped — `git commit -m "$(date)"` passes).
-  if (_unverifiableGitContent(command)) {
+  if (_unverifiableGitContent(command, sessionCwd)) {
     return {
       verdict: "block",
       reason: [
@@ -8008,6 +8061,27 @@ export function extractScriptPath(command) {
 }
 
 /**
+ * The invocation's positional arguments for a resolved script — every token
+ * AFTER the script operand (the `extractScriptPath` scan stops at the script,
+ * so the rest are the script's own `$1…`). Used by the #967/#1484
+ * reachability filter: `bash probe.sh --status` must not be gated by a
+ * `--reset`-only discard branch it never enters.
+ * @param {string} command
+ * @param {string} scriptPath
+ * @returns {string[]}
+ */
+export function extractScriptArgs(command, scriptPath) {
+  try {
+    const tokens = _tokenize(String(command ?? ""));
+    const i = tokens.indexOf(scriptPath);
+    if (i === -1) return [];
+    return tokens.slice(i + 1);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Gate a script FILE's git content against the hub-recovery allowlist.
  * "block" = the script performs a non-sanctioned git mutation (backdoor
  * pattern); "allow" = no git, or all git ops are sanctioned/read-only.
@@ -8017,14 +8091,148 @@ export function extractScriptPath(command) {
  * @param {string|null} currentBranch
  * @returns {"allow"|"block"}
  */
-export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd()) {
+export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null) {
   let content;
   try {
     content = readFileSync(path, "utf-8");
   } catch {
     return "allow";
   }
-  return scriptContentGitVerdict(content, currentBranch, executionCwd, sessionCwd);
+  return scriptContentGitVerdict(content, currentBranch, executionCwd, sessionCwd, scriptArgs);
+}
+
+/** Split a `case` pattern list on UNQUOTED, UNBRACKETED `|`. */
+function _splitCasePatterns(patterns) {
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let bracket = false;
+  for (let i = 0; i < patterns.length; i++) {
+    const ch = patterns[i];
+    if (quote) { cur += ch; if (ch === quote) quote = null; continue; }
+    if (ch === "\\") { cur += ch + (patterns[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === "[") { bracket = true; cur += ch; continue; }
+    if (ch === "]" && bracket) { bracket = false; cur += ch; continue; }
+    if (ch === "|" && !bracket) { out.push(cur); cur = ""; continue; }
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+/** POSIX `case` glob match for ONE branch pattern. An UNRESOLVABLE pattern
+ *  (`$VAR`, backtick) or a malformed character class is treated as MATCHING
+ *  — the branch stays gated (fail closed). */
+function _casePatternMatchesOne(pattern, value) {
+  let p = String(pattern).trim();
+  if (p.length >= 2 && ((p.startsWith("'") && p.endsWith("'")) || (p.startsWith('"') && p.endsWith('"')))) {
+    p = p.slice(1, -1);
+  }
+  if (/[$`]/.test(p)) return true; // unresolvable → assume reachable
+  let re = "^";
+  for (let i = 0; i < p.length; i++) {
+    const ch = p[i];
+    if (ch === "*") { re += "[\\s\\S]*"; continue; }
+    if (ch === "?") { re += "[\\s\\S]"; continue; }
+    if (ch === "\\") {
+      const n = p[i + 1]; i++;
+      if (n !== undefined) re += n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      continue;
+    }
+    if (ch === "[") {
+      const j = p.indexOf("]", i + 1);
+      if (j === -1) { re += "\\["; continue; }
+      let cls = p.slice(i + 1, j);
+      if (cls.startsWith("!")) cls = "^" + cls.slice(1);
+      re += "[" + cls + "]";
+      i = j;
+      continue;
+    }
+    re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  re += "$";
+  try { return new RegExp(re).test(value); } catch { return true; }
+}
+
+/** Any pattern in a `case` branch list matches the value? */
+function _casePatternsMatch(patterns, value) {
+  return _splitCasePatterns(patterns).some((p) => _casePatternMatchesOne(p, value));
+}
+
+/**
+ * Conservative reachability filter for the SCRIPT surface (#967/#1484).
+ *
+ * The classifier gated the whole script text, so a discard-shaped git op that
+ * only one subcommand reaches blocked EVERY invocation — including the
+ * read-only ones (#967: the second-model solvency probe). Given the
+ * invocation's positional args, blank the bodies of branches in a top-level
+ * `case "$1" in … esac` whose patterns cannot match `$1`: an unreachable
+ * subcommand has no effect, so its git content must not gate the invocation.
+ *
+ * Every uncertainty BAILS — returns the input unchanged (fail closed):
+ *   - args not supplied (undefined), so nothing can be proven,
+ *   - any function definition (`case "$1"` inside one is the FUNCTION's $1),
+ *     `shift`, or `set --` (the script's positionals are rewritten),
+ *   - a `case` word other than a bare `$1`, or a nested `case`,
+ *   - `;&`/`;;&` fallthrough, or a branch header the parser cannot locate.
+ */
+function _pruneUnreachableCaseBranches(content, args) {
+  const src = String(content ?? "");
+  if (!src.includes("case")) return src;
+  if (!Array.isArray(args)) return src; // args unknown → fail closed
+  if (/\bfunction\s+[A-Za-z_]/.test(src)) return src;
+  if (/[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{/.test(src)) return src;
+  if (/(^|[\s;&|])shift\b/.test(src)) return src;
+  if (/(^|[\s;&|])set\s+--/.test(src)) return src;
+  const value = args[0] === undefined ? "" : String(args[0]);
+  const lines = src.split("\n");
+  const out = [];
+  let depth = 0;         // open `case` blocks; only the top level is analyzed
+  let expectHeader = false;
+  let prune = false;     // the branch being read is proven unreachable
+  for (const line of lines) {
+    const t = line.trim();
+    if (depth === 0) {
+      const m = t.match(/^case\s+(.+?)\s+in(?:\s|$)/);
+      if (m) {
+        const word = m[1].trim();
+        if (!/^["']?\$\{?1\}?["']?$/.test(word)) return src; // not the script's $1
+        if (t.replace(/^case\s+.+?\s+in/, "").trim() !== "") return src; // trailing → ambiguous
+        depth = 1;
+        expectHeader = true;
+        prune = false;
+        out.push(line);
+        continue;
+      }
+      out.push(line);
+      continue;
+    }
+    if (t === "esac") {
+      depth = 0;
+      expectHeader = false;
+      prune = false;
+      out.push(line);
+      continue;
+    }
+    if (/^case\s+.+?\s+in(?:\s|$)/.test(t)) return src; // nested case → bail
+    if (expectHeader) {
+      const h = t.match(/^([^()\n]*?)\)\s*(.*)$/);
+      if (!h) return src; // cannot locate the branch header → bail
+      prune = !_casePatternsMatch(h[1], value);
+      expectHeader = false;
+      out.push(prune ? "" : line);
+      if (/;;&/.test(h[2])) return src; // fallthrough → bail
+      if (/;;/.test(h[2]) || /;&/.test(t)) expectHeader = true;
+      continue;
+    }
+    if (/;&/.test(t) && !/;;/.test(t)) return src; // `;&` fallthrough → bail
+    out.push(prune ? "" : line);
+    if (/;;&/.test(line)) return src;
+    if (/;;/.test(line)) expectHeader = true;
+  }
+  // Unterminated `case` (no matching `esac`) — malformed; never prune.
+  return depth === 0 ? out.join("\n") : src;
 }
 
 /**
@@ -8034,17 +8242,25 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
  * @param {string|null} currentBranch
  * @param {string} executionCwd
  * @param {string} sessionCwd
+ * @param {string[]|null} scriptArgs — the invocation's positional args; when
+ *   supplied, branches a top-level `case "$1"` proves unreachable are exempt
+ *   (#967/#1484). `null`/omitted → the whole script is gated (previous
+ *   behaviour).
  * @returns {"allow"|"block"}
  */
-export function scriptContentGitVerdict(content, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd()) {
-  const strippedContent = _stripShellComments(content);
+export function scriptContentGitVerdict(content, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null) {
+  const scoped = _pruneUnreachableCaseBranches(_stripShellComments(content), scriptArgs);
   // Round-7: run the scan on COMMENT-STRIPPED content (a comment like
   // `# runs $(git rev-parse)` must not false-block an otherwise-clean script).
   // Round-6 (second-model P2): the script surface needs the same substitution /
   // eval / alias fail-closed — a script containing `echo "$(git -C <hub>
   // reset --hard)"` yields zero invocations and would otherwise be "allow".
-  if (_unverifiableGitContent(strippedContent)) return "block";
-  return _gitInvocationsVerdict(allGitInvocations(strippedContent), currentBranch, executionCwd, sessionCwd);
+  // #967/#895: `_unverifiableGitContent` scans only the outer-shell projection
+  // (quoted-heredoc bodies are literal text, not substitutions) and the
+  // path-branch fires only on an existing file — a git-free script can no
+  // longer be frozen by a docstring backtick.
+  if (_unverifiableGitContent(scoped, executionCwd)) return "block";
+  return _gitInvocationsVerdict(allGitInvocations(scoped), currentBranch, executionCwd, sessionCwd);
 }
 
 /**

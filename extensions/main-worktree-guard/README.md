@@ -901,6 +901,41 @@ blocked with a reason naming the closure; recovery scripts (`hub-worktree.sh`:
 `fetch` + `worktree add`) and read-only git in scripts pass. Inline `bash -c
 '…'` is gated as the caller's own command by the normal classifier.
 
+**#967/#1484 — the classifier gates the EFFECT, not the text.** The original
+closure failed closed on the script's raw text, which froze **git-free** scripts
+fleet-wide: a markdown/docstring code span `` `/` `` inside a quoted Python
+heredoc was read as the command `$(/)`, so `scripts/check-second-model.sh` (the
+second-model gate's resolution authority — zero git operations) was unrunnable
+from every path and every guarded-surface PR was unmergeable. Three refinements,
+all fail-closed on uncertainty:
+- **Quoted heredocs are not outer-shell text.** The outer shell does not expand
+  `$( )`/backticks inside `<<'EOF'`-style bodies, so those spans are literal
+  (a docstring, SQL, or prose). Only the non-body projection is scanned for
+  substitutions; UNQUOTED heredocs still expand and still gate, and a quoted
+  body piped/fed to an interpreter is still caught by the heredoc-to-shell rule.
+- **A path span only fires on a real effect.** An absolute path must name an
+  existing regular file to count as a script execution; a bare `/`, a directory,
+  or a nonexistent path runs nothing. Relative paths stay fail-closed (their
+  cd-chain cwd is not tracked). An existing file (or a shell interpreter) still
+  fails closed — an unreadable script is unverifiable.
+- **Subcommand reachability.** `scriptGitVerdict` now takes the invocation's
+  argv; a top-level `case "$1" in … esac` branch whose pattern cannot match `$1`
+  is blanked, so `bash dispatch.sh --status` is not gated by a `--reset`-only
+  discard — while `bash dispatch.sh --reset` still blocks. The filter BAILS
+  (whole script gated) on any uncertainty: unknown argv, a function definition,
+  `shift`/`set --`, a non-`$1` case word, a nested `case`, or `;&` fallthrough.
+- **The block message** names the script's OWN checkout ("a linked worktree" vs
+  "the shared main checkout", #743) and no longer suggests `hub-worktree.sh`,
+  which cannot lift a hub-rooted session's content gate. `cd`-ing into a
+  worktree does not either — the gate keys on the session cwd.
+
+Deliberately still blocked (documented residuals): a git op inside a quoted
+heredoc PIPED/ fed to a shell (`cat <<'EOF' | sh`), an existing-file or
+interpreter substitution (`$(bash /tmp/x.sh)`, `$(/bin/sh)`), unquoted-heredoc
+expansions, and the coarse round-14 rule (a `<<` + a shell word + any `git` word
+anywhere — over-blocks a read-only `bash <<'EOF' … git --version … EOF`, tracked
+separately).
+
 **#627 extends the closure to non-shell code interpreters (inline payloads).**
 The same payload escaped via `python3 -c "import subprocess; subprocess.run(['git',
 'reset','--hard'])"` (array form — no `git` token at a shell command position).
