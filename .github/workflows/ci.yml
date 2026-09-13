@@ -173,6 +173,16 @@ jobs:
         # The blocking backstop is ci-main.yml's extension-tests job, same
         # split as sequence-enforcer above.
         run: npx tsx extensions/loop-enforcer/tier-config-parity.test.ts
+      - name: Loop-enforcer termination layers (#847 — L3 stall predicates)
+        # Zero-dep: the suite's only import is `./termination.ts`, which has no
+        # imports at all — no `node:` modules, no packages — so it MUST run
+        # here, in the job that performs no `npm ci`. Before #847 this suite
+        # was wired NOWHERE —
+        # the inverted L3 fingerprint predicate was invisible to CI, and its one
+        # vacuous fixture passed through the plateau branch. The anti-vacuity
+        # pins (direction, superset recurrence, threshold boundary, window
+        # position) are worth nothing if nothing runs them.
+        run: npx tsx extensions/loop-enforcer/termination.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the
