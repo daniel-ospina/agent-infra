@@ -1635,68 +1635,25 @@ $big_filler"
   rm -f "$E2E_LOG"
 
   # ── #836 indicator 2: the idiom must not come back ──────────────────────
-  # No LIVE `printf … | grep -q …` pipeline may remain anywhere in this script.
-  # The pattern is assembled from two fragments so this file's own source cannot
-  # match itself; comment lines are excluded (the ban's rationale is written in
-  # prose, and a real pipeline is never a comment-only line).
+  # Deliberately NOT pinned here. #863 landed `scripts/check-no-sigpipe-grep.sh`
+  # — a repo-wide guard for this same `printf/echo | grep -q` SIGPIPE idiom
+  # whose SCAN_DIRS include `scripts/`, so THIS file is in its scan set — plus
+  # `tests/sigpipe-grep/run.sh`, which pins that guard's detection of the joined
+  # (`-q`), separated (`-i -q`) and `--quiet` spellings, its negation controls
+  # (here-string, `case`, a non-quiet `| grep`), the `\`-continued form, comment
+  # exclusion, and the guard's own self-scan. A second, weaker copy of that scan
+  # living in this self-test would be a second source of truth for one idiom,
+  # free to drift from the guard that actually owns it — so the local pin was
+  # removed rather than duplicated (#841, #863). The behavioural half of #836
+  # (large-input regression vectors below, incl. the fail-OPEN `pr_is_docs_only`
+  # site) is unaffected and still lives here, because no repo-wide guard can
+  # express it.
   #
-  # Coverage (review-hardened): producers include the `echo`/`cat` forms and the
-  # env-prefixed (`LC_ALL=C grep -q`) and `--quiet` spellings, all of which race
-  # identically. KNOWN LIMITS, accepted rather than papered over: a multi-stage
-  # pipeline (`printf … | tee x | grep -q`) and a backslash-continued line are
-  # not matched by a line-oriented regex, and a quoted string that merely
-  # CONTAINS the text (e.g. a printf that prints it) is an accepted false
-  # positive — the message below names the line so a legitimate hit is a
-  # one-line clarification, not a mystery block.
-  anti_a='(printf|echo|cat)[^|]*'
-  # The flag run may be JOINED (`grep -iq`) or SEPARATED (`grep -i -q`,
-  # `grep -n -q`): the old single-token form matched only the joined spelling,
-  # so a reverted site written as `grep -i -q` passed the pin (review catch).
-  # The optional middle group never crosses a `|`, so a quiet grep on a LATER
-  # pipeline stage is still not conflated with this producer.
-  anti_b='[|][[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^|[:space:]]*[[:space:]]+)*grep[[:space:]]+([^|]*[[:space:]])?(-[a-zA-Z]*q[a-zA-Z]*|--quiet)'
-  anti="${anti_a}${anti_b}"
   # `${BASH_SOURCE[0]:-$0}` — under `set -u` BASH_SOURCE is unset for a
   # stdin/`eval` invocation, which used to abort the whole self-test before the
-  # #792 vectors ran (review catch). The pin is also UNVERIFIABLE, not green,
-  # when its own source cannot be read — that must fail loudly.
+  # #792 vectors ran (review catch). The #792 CLI vectors below re-enter this
+  # script through it.
   SELF_SRC="${BASH_SOURCE[0]:-$0}"
-  pipe_hits=""
-  if [[ -r "$SELF_SRC" ]]; then
-    pipe_hits="$(grep -nE "$anti" "$SELF_SRC" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
-  fi
-  if [[ ! -r "$SELF_SRC" ]]; then
-    printf '❌ #836 static pin: cannot read its own source (%s) — the pin is unverifiable, not green\n' "$SELF_SRC" >&2
-    selffail=$((selffail + 1))
-  elif [[ -z "$pipe_hits" ]]; then
-    printf '✅ #836 static pin: no live evidence pipeline that pipes printf/echo/cat into a quiet grep in %s\n' "$SELF_SRC"
-  else
-    printf '❌ #836 static pin: a printf-into-grep -q pipeline is back — under pipefail its SIGPIPE false-negates evidence (and can fail-OPEN at pr_is_docs_only / the clean-micro binding). Pass the text with a here-string instead (grep -q … <<<"$text"):\n%s\n' "$pipe_hits" >&2
-    selffail=$((selffail + 1))
-  fi
-
-  # Positive control for the pin: a scan that matches NOTHING is
-  # indistinguishable from a pattern that was silently disarmed, so assert the
-  # ban pattern still recognises the idiom (in every spelling) and still
-  # ignores a here-string. The samples are assembled from parts and the pipe is
-  # a VARIABLE on purpose: this file's own source must never contain a literal
-  # `<producer> | grep -q` line, or the pin above would flag its own control.
-  sp='|'
-  s_joined="printf '%s' \"\$body\" $sp grep -q code-review"
-  s_sep="printf '%s' \"\$body\" $sp grep -i -q code-review"
-  s_quiet="cat \"\$f\" $sp grep --quiet code-review"
-  s_env="printf '%s' \"\$body\" $sp LC_ALL=C grep -q code-review"
-  s_herestr="LC_ALL=C grep -q code-review <<<\"\$body\""
-  pin_hit() { if grep -qE "$anti" <<<"$1"; then printf '1'; else printf '0'; fi; }
-  pin_pos="$(pin_hit "$s_joined")$(pin_hit "$s_sep")$(pin_hit "$s_quiet")$(pin_hit "$s_env")"
-  pin_neg="$(pin_hit "$s_herestr")"
-  if [[ "$pin_pos" == "1111" && "$pin_neg" == "0" ]]; then
-    printf '✅ #836 static pin positive control: matched the env-prefixed, joined (grep -q), separated (grep -i -q) and --quiet spellings; ignored a here-string\n'
-  else
-    printf '❌ #836 static pin positive control FAILED (matches=%s, here-string misread as a hit=%s) — the ban pattern no longer recognises the idiom it exists to ban, so a green scan proves nothing\n' \
-      "${pin_pos:-<none>}" "$pin_neg" >&2
-    selffail=$((selffail + 1))
-  fi
 
   # ── #836 fail-OPEN site: pr_is_docs_only at a racy size ─────────────────
   # pr_is_docs_only's `! printf … | grep -qvE '^docs/'` did not merely
