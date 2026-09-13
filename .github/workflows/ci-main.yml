@@ -72,10 +72,15 @@ jobs:
         # retry, tree-kill) were unwired: the extensions/*/test*.mjs glob above
         # misses .ts files. Loop the rest, skipping the explicitly-listed ones
         # (a future shared suite is picked up automatically). Zero-dep tsx route.
+        # #783 — dispatch-record.test.ts MUST be skipped here: it imports
+        # ../builtin-tools/index.js (#29), which needs typebox from the
+        # builtin-tools npm ci BELOW this loop. Running it here fails
+        # ERR_MODULE_NOT_FOUND on a fresh checkout. Run explicitly after the ci.
         for t in extensions/shared/*.test.ts; do
           [ -f "$t" ] || continue  # no-match guard (glob loops elsewhere in this file)
           case "$t" in
             extensions/shared/print-mode.test.ts|extensions/shared/print-mode-wiring.test.ts) continue ;;
+            extensions/shared/dispatch-record.test.ts) continue ;;
           esac
           echo "== $t =="
           npx tsx "$t" || failures=$((failures+1))
@@ -143,6 +148,12 @@ jobs:
         # payload + the census instrument. Runs after the npm ci above.
         echo "== extensions/builtin-tools/task-cap-handoff.integration.test.ts =="
         npx tsx extensions/builtin-tools/task-cap-handoff.integration.test.ts || failures=$((failures+1))
+        # #783 — dispatch-record.test.ts lives in extensions/shared but is NOT
+        # zero-dep: it imports ../builtin-tools/index.ts (typebox). It is skipped
+        # by the shared glob above (which runs before this npm ci) and run HERE,
+        # after the install — same treatment as the builtin-tools suites.
+        echo "== extensions/shared/dispatch-record.test.ts =="
+        npx tsx extensions/shared/dispatch-record.test.ts || failures=$((failures+1))
         # provider-failover*.test.ts under extensions/shared are auto-picked by
         # the shared glob above (incl. the python3-spawning parity suite).
         # #553/#573/#574 — subagent suites: the two builtin-tools suites spawn a
