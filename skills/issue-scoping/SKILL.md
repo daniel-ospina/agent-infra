@@ -846,8 +846,9 @@ Do NOT evaluate on: diff size, number of files touched, implementation speed.
 
 1. PICK THE BEST APPROACH. Document why. Document rejected alternatives.
 2. DRAFT THE PLAN: problem statement, proposed solution, implementation plan, testing strategy, verification plan, acceptance criteria, runtime prerequisites.
+3. CLASSIFY THE DOMAIN — mandatory, binary. Is this gate/enforcement code whose correctness is "an attacker cannot make it fail open"? If YES, DECLARE THE ADVERSARIAL THREAT SURFACE: the in-scope bypass classes (each with the adversarial input and the required behaviour) and the classes explicitly OUT OF SCOPE. If NO, state `(not adversarial)` explicitly — an undeclared classification is a gap.
 
-Output the complete plan draft.
+Output the complete plan draft, including `### Adversarial Threat Surface` when (and only when) step 3 declared one. The declaration is what bounds the review at 2 cycles and makes threat-list coverage the acceptance criterion — see `AGENTS.md` §Hard Cap.
 ```
 
 #### Agent B (Complex only):
@@ -968,13 +969,14 @@ Each review cycle dispatches FRESH `task` sub-agents.
 - [ ] Last reviewer response: "NO ISSUES FOUND" (verbatim)
 - [ ] If cycle 1 found issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted
+- [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
 **Stuckness detection:**
 - Fingerprint-stall: recurrence `|current ∩ prev| / |prev|` ≥ `stall_threshold` (default `0.8`) → escalate
 - Honest-stuck: issue count non-decreasing for 3 cycles → escalate. **Independent signal — fires regardless of recurrence** (a one-for-one churn has low recurrence but is not converging)
 - Zero-progress: plan unchanged for 2 cycles → escalate
 - Convergence: strict subset of prior cycle → escalate with remaining issues
-**Safety cap:** 10 cycles.
+**Safety cap:** 10 cycles. **Adversarial domain** (a declared `### Adversarial Threat Surface`): **2 cycles** — acceptance is threat-list coverage, residuals are filed from cycle 1 and not chased, and a bounded exit must be disclosed (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). <!-- adversarial-bound: cap=2 -->
 
 ---
 
@@ -996,7 +998,7 @@ gh issue comment $ISSUE_NUMBER --body "$(cat <<'PLANEOF'
 ### full-diamond-verify: N cycles, clean | N issues remain
 
 ## Plan
-<plan draft>
+<plan draft — must include `### Adversarial Threat Surface` (in-scope bypass classes + classes out of scope), or the single line `(not adversarial)`>
 
 ## Clarifications
 <from clarifying-questions Step 6a (Pass A), or "none — no questions qualified">

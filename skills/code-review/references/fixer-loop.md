@@ -35,6 +35,11 @@ import sys, json
 print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))
 ")
 
+# #838 — adversarial domain: set to 1 iff the scoping comment carries the
+# `### Adversarial Threat Surface` declaration. Drives the 2-cycle bound in L1
+# and the `adversarial-capped` exit. Unset/0 → the general 10-cycle cap.
+ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}
+
 # implementation_agent requires positive integer issue_number.
 # Fall back to PR_NUMBER when no linked issue — uses issue_number for logging only.
 ISSUE_NUMBER_SAFE=${ISSUE_NUMBER:-$PR_NUMBER}
@@ -64,7 +69,16 @@ EXIT_REASON=""
 ### L1 — Exit conditions
 ```bash
 CYCLE=$((CYCLE + 1))
-if [ $CYCLE -gt 10 ]; then EXIT_REASON="cycle-cap"; break; fi  # 10 = the convergence-gated safety cap (SKILL.md "Safety cap at 10 cycles")
+# 10 = the convergence-gated safety cap (SKILL.md "Safety cap at 10 cycles");
+# 2 = the adversarial-domain bound (#838, SKILL.md "Adversarial domain — declared
+# threat surface"), set ADVERSARIAL_BOUND=1 from the scoping declaration.
+# adversarial-bound: cap=2
+BOUND=10
+if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi
+if [ $CYCLE -gt $BOUND ]; then
+  if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then EXIT_REASON="adversarial-capped"; else EXIT_REASON="cycle-cap"; fi
+  break
+fi
 PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
 if [ "$PR_STATE" != "OPEN" ]; then EXIT_REASON="pr-closed"; break; fi
 ```
@@ -374,6 +388,7 @@ with open('operations/logs/cycle-status.yaml', 'w') as f:
 - `EXIT_REASON == "convergence"` (**agent-judged** — the loop never sets this; the agent posts it after reading the remaining issue set): `⚠️ Auto-fix converged with issues unresolved — requires human review\n\n`
 - `EXIT_REASON == "honest-stuck"`: `⚠️ Auto-fix stuck (honest-stuck — issue count not shrinking for 3 cycles) — requires human review\n\n`
 - `EXIT_REASON == "cycle-cap"`: `⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain; escalate to a human\n\n`
+- `EXIT_REASON == "adversarial-capped"`: `[ADVERSARIAL-BOUND] cycles=${CYCLE} threats=<K> covered=<K> residuals=<#N,…|none> — bounded by the declared threat surface (#838); residuals filed, not chased\n\n`
 - `EXIT_REASON == "tool-unavailable"` or `"push-failed"` or `"git-error"` or `"pr-closed"`: `⚠️ Auto-fix aborted (${EXIT_REASON}) — issues require human review\n\n`
 - `EXIT_REASON == "clean"`: no prefix
 
