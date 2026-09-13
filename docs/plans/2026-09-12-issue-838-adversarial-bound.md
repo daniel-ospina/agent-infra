@@ -64,10 +64,14 @@ objective not delivered), #708/PR #823 (2 cycles, converged only under an impose
 | `skills/plan-review/SKILL.md` | same at the plan-level gate loop + exit conditions |
 | `skills/issue-scoping/SKILL.md` | mandatory binary threat-surface declaration (plan prompt + scoping-comment template) + bounded gate-loop note |
 | `skills/task-workflow-standard/SKILL.md` | scope/plan verifier gates accept the bounded verdict |
+| `skills/code-review/references/fixer-loop.md` | the pinned `### L1` fence: `ADVERSARIAL_BOUND=1` → 2 cycles, `adversarial-capped`; one of the 8 anchor surfaces |
 | `extensions/loop-enforcer/tier-config-parity.test.ts` | anchor-parity pin + negative controls |
 | `docs/plans/2026-09-12-issue-838-adversarial-bound.md` | this doc |
 
 ## 5. Verification
+
+> **Superseded by §8** — the execution harness described here was deleted; the suite is now **42 passed,
+> 0 failed**. The text below is the historical cycle-0/cycle-1 record.
 
 - `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` — **34 passed, 0 failed** (21 baseline + 13 new), including the negative controls (mutated cap / missing anchor / duplicated anchor / re-capped canonical table / **executed** `BOUND=3` with the anchor intact / dropped executable branch / **commented-out adversarial branch** / **`BOUND=10` → `BOUND=100`**) — each must FAIL. The executable-bound pin parses the fenced bash with shell comments stripped and requires exactly two numeric `BOUND=<N>` assignments (`[10, 2]`), so it binds the effective value rather than source text: a commented-out `then BOUND=2; fi` leaves one assignment, and `BOUND=100` fails the strict default equality that `includes("BOUND=10")` used to wave through.
 - `node scripts/check-skill-lint.test.mjs`, `node scripts/check-skill-lint.mjs --repo .`, `node scripts/check-pi-pin-lockstep.mjs` — green.
@@ -89,7 +93,7 @@ Out-of-scope findings — **filed, not chased**: #871 (reported cycle count is o
 **Cycle 2** — 2 fresh reviewers (the cap). Verdicts split:
 
 - Reviewer A (adversarial): 2 more in-scope bypasses of classes 1/2/5 — the executable-bound pin matches **text**, so a commented-out `then BOUND=2; fi` (executed bound 10) and `BOUND=10 → BOUND=100` (`includes()` substring vacuity) both leave the suite 32/32 green. **Class 1 and 2 are therefore NOT covered.**
-- Reviewer B (contract/consistency): `THREAT SURFACE COVERED` — classes 3 and 4 covered, no permissive reading on any of the seven surfaces.
+- Reviewer B (contract/consistency): `THREAT SURFACE COVERED` — classes 3 and 4 covered, no permissive reading on any of the eight surfaces.
 
 **Exit: `adversarial-capped` at 2 cycles — a BOUNDED exit, not a clean one.** Per this change's own rule, the cycle-2 in-scope residuals are **filed, not chased**: #874 (the executable-bound pin's text-vs-effective-value weakness) and #875 (unqualified `NO ISSUES FOUND` sentences left next to the adversarial substitution). No literal `NO ISSUES FOUND` was obtained and no `clean` verdict is claimed.
 
@@ -121,7 +125,7 @@ all three bypass mutations were re-applied to the real `fixer-loop.md` and each 
 recorded in the PR body.
 
 > **Superseded by §8.** The execution boundary described immediately above was removed one day
-> later — it is the observation channel §8 deletes, and its count is now 38/0.
+> later — it is the observation channel §8 deletes; the suite is now **42 passed, 0 failed**.
 
 ## 8. Decisive simplification (2026-09-13) — exact-text pin, harness deleted
 
@@ -140,28 +144,58 @@ class 5, pin vacuity):
 By #838's own contract this class is declared **out of scope, not chased**. Rather than write a
 fourth hardening, the observation channel is removed:
 
-- **Approach A — exact-text pin, no execution.** `CANONICAL_L1_FENCE` is the one approved L1 fence,
-  byte-for-byte. `l1FenceViolations(md)` requires it to occur **exactly once** *and* requires no
-  `BOUND=` assignment to survive **outside** it — both are properties of the text, so there is no
-  stdout to forge. `canonicalFenceSelfViolations()` ties the constant to `ADVERSARIAL_CAP` and the
-  `adversarial-capped` exit, so moving the cap without moving the fence fails even before the doc is
-  read.
+- **Approach A — exact-text pin, no execution.** `CANONICAL_L1_BLOCK` is the one approved
+  `### L1 — Exit conditions` block, byte-for-byte. `l1FenceViolations(md)` requires (i) the block to
+  occur **exactly once**, (ii) the `### L1` heading to occur **exactly once**, and (iii) no `BOUND=`
+  assignment to survive **outside** the block. `adversarialReachabilityViolations(md)` additionally
+  requires the guard setup line `ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}` to occur exactly once and
+  **no other `ADVERSARIAL_BOUND` reference** anywhere — restoring, as exact text, the layer the
+  deleted `adversarialBoundAssignments()` used to provide. `canonicalFenceSelfViolations()` ties the
+  constant to `ADVERSARIAL_CAP` and the `adversarial-capped` exit. No bash is executed; every check
+  is a property of the text, so there is no stdout to forge.
 - **Deleted, not disabled:** `execFileSync`, `BOUND_SENTINEL`, `effectiveAdversarialBound`,
   `executableBashBlocks`, `stripShellComments`, `executableBoundAssignments`,
   `adversarialBoundAssignments`, `fixerLoopBlock`, `unallowedL1Statements`, the `L1_ALLOWED_STATEMENTS`
   allowlist, and every execution-based test.
 
-**Mutation evidence** — each mutation applied to the real `fixer-loop.md`, then the real suite run:
+### 8.1 Cycle-1 review of the simplification (2 fresh reviewers)
+
+- **In-scope (class 5/1, REGRESSION)** — Reviewer A reproduced a pre-loop `ADVERSARIAL_BOUND=0`
+  injection that left the canonical L1 block byte-identical: the pin stayed green (whole suite 42/0)
+  while the doc executed the general 10-cycle cap. The deleted `adversarialBoundAssignments()` layer
+  used to catch exactly this. Fixed by `adversarialReachabilityViolations()` — exact text, no
+  execution — plus guard-spelling controls (`export` / `unset` / `printf -v`).
+- **In-scope (class 5)** — Reviewer A also placed a second `### L1`-shaped section (`CAP=20`) a fixer
+  could copy instead. Fixed by the exactly-one-heading condition (a renamed-heading decoy containing
+  the same heading substring is caught too).
+- **Control fragility** — the relocated-fence control rewrote the *first* heading occurrence, so a
+  decoy earlier in the doc made it red for the wrong reason. Fixed by anchoring the mutation on
+  `CANONICAL_L1_BLOCK`.
+- **Doc/PR-body staleness** — §4–§7 carried pre-§8 counts (32/34/37/38), “seven surfaces”, and an
+  omitted `fixer-loop.md` row; the PR body still described the deleted harness as the blocker. All
+  corrected here; the PR body is refreshed at merge.
+
+The two in-scope findings are the **same class** (pin vacuity / guard neutering) the simplification
+exists to bound — not a new class — and both are closed by exact text, so no execution was
+reintroduced. Residual, declared as a LIMIT: the pin polices the approved block, its heading, the
+guard's reachability, and stray `BOUND=`; it does not scan arbitrary extra prose for a bound computed
+under another variable/spelling.
+
+**Mutation evidence** — each mutation applied to the real `fixer-loop.md`, then the real suite run
+(the first failing pin is the substantive one):
 
 | Mutation | Result |
 |---|---|
-| commented-out adversarial branch | 37 passed / **1 failed** (red) |
-| `BOUND=10` → `BOUND=100` | 35 passed / **3 failed** (red) |
-| allowlist-clean decoy block prepended | 37 passed / **1 failed** (red) |
-| forged marker `printf "BOUND=%d\n" 2` | 37 passed / **1 failed** (red) |
+| commented-out adversarial branch | 39 passed / **3 failed** (red) |
+| `BOUND=10` → `BOUND=100` | 37 passed / **5 failed** (red) |
+| allowlist-clean decoy block prepended | 40 passed / **2 failed** (red) |
+| forged marker `printf "BOUND=%d\n" 2` | 39 passed / **3 failed** (red) |
+| pre-loop `ADVERSARIAL_BOUND=0` (cycle-1 finding) | 41 passed / **1 failed** (red) |
+| renamed-heading `### L1` decoy with `CAP=20` (cycle-1 finding) | 41 passed / **1 failed** (red) |
 
-File restored byte-for-byte after each. Baseline: **39 passed, 0 failed**. The anchor also rejects a
-fence moved out of the `### L1` section (heading bound by the same exact string).
+File restored byte-for-byte after each. Baseline: **42 passed, 0 failed**. Failure counts include
+control-precondition assertions that also trip when the base doc is mutated; the pin failure is
+always among them.
 
 The chosen approach is not clever — it is the absence of cleverness. A pin whose "verification"
 executes the text under test can always be made to observe a forgery; a pin that *is* the text

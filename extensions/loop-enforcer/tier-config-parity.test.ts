@@ -410,12 +410,13 @@ export function nonAdversarialCapViolations(table: RiskRow[]): string[] {
  * Executing attacker-influenceable text and parsing its output is what made
  * every one of those forgeries possible, so the observation channel is GONE:
  * no bash execution, no stdout parsing, no regex extraction of the bound. The
- * doc must contain this one string, exactly once. Any edit — a commented-out
- * branch, `BOUND=10` → `100`, a decoy block, a forged marker — changes the text
- * and fails the pin structurally, and the forgery class cannot recur because
- * there is nothing left to forge. The harness (`execFileSync`, `BOUND_SENTINEL`,
- * the statement allowlist, the last-match read) is deleted, not kept as dead
- * weight.
+ * doc must contain this one block, exactly once. Any edit to it — a commented-out
+ * branch, `BOUND=10` → `100`, a forged marker — changes the text and fails the
+ * pin, and there is nothing left to forge. The harness (`execFileSync`,
+ * `BOUND_SENTINEL`, the statement allowlist, the last-match read) is deleted, not
+ * kept as dead weight. What this does NOT claim is stated in the LIMIT below:
+ * it polices the approved block and the guard's reachability, not arbitrary
+ * extra prose elsewhere in the document.
  */
 export const CANONICAL_L1_FENCE = [
   "CYCLE=$((CYCLE + 1))",
@@ -433,8 +434,23 @@ export const CANONICAL_L1_FENCE = [
   'if [ "$PR_STATE" != "OPEN" ]; then EXIT_REASON="pr-closed"; break; fi',
 ].join("\n");
 
+/** The `### L1` heading the approved block must be the only instance of. */
+const L1_HEADING = "### L1 — Exit conditions";
+
 /** Identifier characters — a word char before `BOUND=` means the token is part of a longer identifier. */
 const WORD_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+
+/** Count occurrences of `token` not preceded by an identifier character. */
+function countBareToken(text: string, token: string): number {
+  let count = 0;
+  let idx = text.indexOf(token);
+  while (idx !== -1) {
+    const prev = idx > 0 ? text[idx - 1] : "\n";
+    if (!WORD_CHARS.includes(prev)) count++;
+    idx = text.indexOf(token, idx + 1);
+  }
+  return count;
+}
 
 /**
  * The approved L1 block: its heading, its fences, and the fence body verbatim.
@@ -445,38 +461,40 @@ const WORD_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567
 export const CANONICAL_L1_BLOCK =
   "### L1 — Exit conditions\n```bash\n" + CANONICAL_L1_FENCE + "\n```";
 
+/**
+ * The one approved pre-loop guard-variable setup line, byte-for-byte. The
+ * adversarial branch is `[ "${ADVERSARIAL_BOUND:-0}" = "1" ]`, so this line is
+ * what makes it reachable at all.
+ */
+export const ADVERSARIAL_GUARD_SETUP = "ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}";
+
 /** Count bare `BOUND=<...>` assignments in `text` (identifier-prefixed forms like `ADVERSARIAL_BOUND=` do not count). */
 function countBoundAssignments(text: string): number {
-  let count = 0;
-  let idx = text.indexOf("BOUND=");
-  while (idx !== -1) {
-    const prev = idx > 0 ? text[idx - 1] : "\n";
-    if (!WORD_CHARS.includes(prev)) count++;
-    idx = text.indexOf("BOUND=", idx + 1);
-  }
-  return count;
+  return countBareToken(text, "BOUND=");
 }
 
 /**
  * Violations of the exact-text L1 pin; `[]` means the doc carries the approved
- * L1 block verbatim, exactly once, and nothing else in the doc assigns `BOUND`.
+ * L1 block verbatim, exactly once, carries exactly one `### L1` heading, and
+ * nothing else in the doc assigns `BOUND`.
  *
- * Two structural conditions, both properties of the text itself — no execution
+ * Three structural conditions, all properties of the text itself — no execution
  * and no parsed observation to forge:
  *
  *   1. `CANONICAL_L1_BLOCK` occurs exactly once. A commented-out variant, a
- *      `BOUND=10` → `100` substitution, a rewritten branch, or moving the fence
- *      out of the `### L1` section all fail here.
- *   2. No `BOUND=` assignment survives OUTSIDE the approved block. A decoy block
- *      a fixer could copy instead (the cycle-3 hole) fails here — and this check
- *      is symmetric with condition 1, so no selector/aggregator asymmetry
- *      remains to exploit.
+ *      `BOUND=10` → `100` substitution, or a rewritten branch all fail here.
+ *   2. The `### L1` heading occurs exactly once — a second L1-shaped section a
+ *      fixer could copy instead (the cycle-3 decoy, however its body is spelt)
+ *      fails here.
+ *   3. No `BOUND=` assignment survives OUTSIDE the approved block. The two
+ *      checks are symmetric, so no selector/aggregator asymmetry remains.
  *
- * LIMIT (stated, not hidden): this binds the ONE approved block and rejects
- * other `BOUND=` assignments. It does not prove an executing agent ran this
- * text, and it does not scan for arbitrary extra bash that computes a bound by
- * another spelling. Those are documentation-completeness concerns; the class
- * this guard exists to close is pin VACUITY — a pin that observes a forgery.
+ * LIMIT (stated, not hidden): this binds the ONE approved block, its heading,
+ * and other `BOUND=` assignments. It does not prove an executing agent ran this
+ * text, and it does not scan arbitrary extra prose for a bound computed under
+ * some other spelling/variable. Those are documentation-completeness concerns;
+ * the class this guard exists to close is pin VACUITY — a pin that observes a
+ * forgery.
  */
 export function l1FenceViolations(md: string): string[] {
   const violations: string[] = [];
@@ -486,11 +504,46 @@ export function l1FenceViolations(md: string): string[] {
       `fixer-loop: the approved L1 block must appear exactly once, byte-for-byte; found ${occurrences}`,
     );
   }
+  const headings = md.split(L1_HEADING).length - 1;
+  if (headings !== 1) {
+    violations.push(`fixer-loop: expected exactly one \`${L1_HEADING}\` heading, found ${headings}`);
+  }
   const outside = md.split(CANONICAL_L1_BLOCK).join("");
   const stray = countBoundAssignments(outside);
   if (stray > 0) {
     violations.push(
       `fixer-loop: ${stray} \`BOUND=\` assignment(s) outside the approved L1 block — a decoy the fixer could copy instead`,
+    );
+  }
+  return violations;
+}
+
+/**
+ * Reachability of the adversarial branch: the guard variable must be defined by
+ * exactly the approved setup line and never touched anywhere else.
+ *
+ * This restores the layer the deleted execution harness's
+ * `adversarialBoundAssignments()` provided — the cycle-3 guard-neutering finding —
+ * as EXACT TEXT instead of a scan over extracted fenced blocks. A pre-loop
+ * `ADVERSARIAL_BOUND=0` left the canonical L1 fence byte-identical, so the
+ * suite stayed 39/0 green while the doc executed the general 10-cycle cap
+ * (cycle-1 review). `export ADVERSARIAL_BOUND=0`, `unset ADVERSARIAL_BOUND`,
+ * `printf -v ADVERSARIAL_BOUND '%d' 0`, … all leave the branch unreachable and
+ * are caught here.
+ */
+export function adversarialReachabilityViolations(md: string): string[] {
+  const violations: string[] = [];
+  const setup = md.split(ADVERSARIAL_GUARD_SETUP).length - 1;
+  if (setup !== 1) {
+    violations.push(
+      `fixer-loop: the approved guard setup \`${ADVERSARIAL_GUARD_SETUP}\` must appear exactly once; found ${setup}`,
+    );
+  }
+  const remainder = md.split(CANONICAL_L1_BLOCK).join("").split(ADVERSARIAL_GUARD_SETUP).join("");
+  const extra = countBareToken(remainder, "ADVERSARIAL_BOUND");
+  if (extra > 0) {
+    violations.push(
+      `fixer-loop: ${extra} extra \`ADVERSARIAL_BOUND\` reference(s) outside the approved block and setup line — the guard can be neutered`,
     );
   }
   return violations;
@@ -588,10 +641,11 @@ test("the approved L1 fence is self-consistent with the declared cap", () => {
   );
 });
 
-test("the pre-loop setup defines ADVERSARIAL_BOUND (the branch is reachable)", () => {
-  ok(
-    FENCE_SRC.includes("ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}"),
-    "the pre-loop setup must define ADVERSARIAL_BOUND, or the branch is unreachable",
+test("the pre-loop setup defines ADVERSARIAL_BOUND exactly once, never reassigned", () => {
+  deepEqual(
+    adversarialReachabilityViolations(FENCE_SRC),
+    [],
+    `adversarial reachability drifted: ${adversarialReachabilityViolations(FENCE_SRC).join(" | ")}`,
   );
 });
 
@@ -686,6 +740,56 @@ test("rejects a neutered guard variable (`ADVERSARIAL_BOUND=0` injected — cycl
   ok(l1FenceViolations(neutered).length > 0, "an injected guard reassignment must fail the exact-text pin");
 });
 
+test("rejects a PRE-LOOP guard neutering that leaves the L1 block byte-identical (cycle-1 regression)", () => {
+  // The deleted harness's `adversarialBoundAssignments()` caught this. It is
+  // the regression this control pins: the canonical L1 block is untouched, so
+  // only the reachability check can see it.
+  const neutered = FENCE_SRC.replace(
+    ADVERSARIAL_GUARD_SETUP,
+    `${ADVERSARIAL_GUARD_SETUP}\nADVERSARIAL_BOUND=0`,
+  );
+  ok(neutered !== FENCE_SRC, "control did not apply — the guard setup line was not found");
+  deepEqual(
+    l1FenceViolations(neutered),
+    l1FenceViolations(FENCE_SRC),
+    "the pre-loop injection must not change the L1 pin (reachability is the only layer that can see it)",
+  );
+  ok(
+    adversarialReachabilityViolations(neutered).length > 0,
+    "an extra pre-loop ADVERSARIAL_BOUND assignment must be a violation",
+  );
+});
+
+test("rejects other pre-loop guard neutering spellings (`export` / `unset` / `printf -v`)", () => {
+  const spellings = [
+    "export ADVERSARIAL_BOUND=0",
+    "ADVERSARIAL_BOUND=",
+    "unset ADVERSARIAL_BOUND",
+    'printf -v ADVERSARIAL_BOUND "%d" 0',
+  ];
+  for (const line of spellings) {
+    const neutered = FENCE_SRC.replace(ADVERSARIAL_GUARD_SETUP, `${ADVERSARIAL_GUARD_SETUP}\n${line}`);
+    ok(neutered !== FENCE_SRC, `control did not apply for: ${line}`);
+    ok(
+      adversarialReachabilityViolations(neutered).length > 0,
+      `\`${line}\` must fail the reachability check`,
+    );
+  }
+});
+
+test("rejects a second L1-shaped section a fixer could copy (renamed-heading decoy, cycle-1)", () => {
+  // The decoy bound is spelt without a `BOUND=` token, so only the heading
+  // count can see it. `### L1 — Exit conditions (ACTIVE)` still contains the
+  // exact heading substring, so it counts as a second heading.
+  const decoy =
+    "### L1 — Exit conditions (ACTIVE — use this one)\n```bash\nCAP=20\n```\n\n";
+  const v = l1FenceViolations(decoy + FENCE_SRC);
+  ok(
+    v.some((s) => s.includes("heading")),
+    `expected a duplicate-heading violation, got: ${v.join(" | ")}`,
+  );
+});
+
 test("rejects an unconditional adversarial branch (guard removed)", () => {
   const unconditional = FENCE_SRC.replace(
     'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
@@ -696,8 +800,14 @@ test("rejects an unconditional adversarial branch (guard removed)", () => {
 });
 
 test("rejects the approved fence moved out of the `### L1` section (heading anchor)", () => {
-  const moved = FENCE_SRC.replace("### L1 — Exit conditions\n```bash\n", "### L1b — relocated\n```bash\n");
-  ok(moved !== FENCE_SRC, "control did not apply — the L1 heading was not found");
+  // Anchor the mutation on the canonical block itself so the control cannot
+  // rewrite some other occurrence (cycle-1 review: a decoy earlier in the doc
+  // made the old `.replace` hit the wrong heading).
+  const moved = FENCE_SRC.replace(
+    CANONICAL_L1_BLOCK,
+    CANONICAL_L1_BLOCK.replace("### L1 — Exit conditions", "### L1b — relocated"),
+  );
+  ok(moved !== FENCE_SRC, "control did not apply — the canonical L1 block was not found");
   ok(l1FenceViolations(moved).length > 0, "a relocated fence must fail the exact-text pin");
 });
 
