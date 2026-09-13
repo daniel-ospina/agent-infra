@@ -526,7 +526,7 @@ test("writer is INSIDE doResolve immediately after `settled = true` (never at a 
 	ok(source.includes("if (!dispatchLedgerEnabled(subAgentEnv)) return { ok: false, path: \"\", skipped: true };"));
 });
 
-test("every abnormal settle passes a reason; success/clean/spawn-error sites pass none", () => {
+test("every abnormal settle passes a reason; only the success/clean sites pass none", () => {
 	// The two no-payload cap/backstop arms and the cut ternary arm.
 	ok(source.includes('doResolve(undefined, { sweep: true, reason: "hard-cap" })'), "cap no-output arm");
 	ok(source.includes('), { sweep: true, reason: "hard-cap" })'), "cap composer arm");
@@ -537,11 +537,42 @@ test("every abnormal settle passes a reason; success/clean/spawn-error sites pas
 	ok(source.includes('doResolve(undefined, { sweep: true, reason: "backstop" })'), "backstop no-output arm");
 	ok(source.includes('), { sweep: true, reason: "backstop" })'), "backstop composer arm");
 	// NO reason on the success paths: the two composeTaskResult settles
-	// (sessionEnded completion, abort-after-end) and the clean-exit /
-	// spawn-error settles must never write a row.
+	// (sessionEnded completion, abort-after-end) and the clean-exit settle must
+	// never write a row. #783 review: the spawn-error settle USED to be here too;
+	// it now records `spawn-error`, so this pin flipped with it (see the
+	// dedicated spawn-error test below) — leaving the old assertion would have
+	// silently re-legalised the gap.
 	ok(source.includes("doResolve({ content: [{ type: \"text\", text: stdout.trim() }], details }, { sweep: settlePath === \"exit\" });"), "clean-exit settle carries NO reason");
-	ok(source.includes("details: { model, provider, isError: true } });"), "spawn-error settle carries NO reason");
+	ok(source.includes('details: { model, provider, isError: true } }, { reason: "spawn-error" });'), "spawn-error settle carries its OWN reason (row recorded, gap closed)");
+	ok(!source.includes('details: { model, provider, isError: true } });'), "no reason-less spawn-error settle survives (that shape writes no row)");
 	equal((source.match(/reason: "hard-cap"/g) ?? []).length, 3, "hard-cap reason literal: details + 2 opts");
+});
+
+test("#783 review: the spawn-error settle records a row — the abnormal population is complete", () => {
+	// Cycle-2 review (two independent reviewers) flagged this as the ONLY
+	// abnormal settle absent from the ledger, which made the documented "every
+	// abnormal settle writes exactly one row" contract false and left the class
+	// invisible to the #796 population. The fix IS a behavior change, but it can
+	// only be pinned at the SOURCE level: inducing a real spawn error (ENOENT /
+	// EACCES) hermetically is not possible, because `getPiInvocation` derives the
+	// command from `process.execPath` / `process.argv[1]` — properties of the
+	// running process that no test can redirect without a new production seam.
+	// (An earlier revision of this comment claimed a behavioral pin "in the
+	// integration suite"; no such test exists, and the claim was corrected rather
+	// than left standing — a false coverage claim is the same defect class this
+	// cycle fixed elsewhere.) The source pin below is non-vacuous: removing the
+	// reason from the settle fails it.
+	const chokepoint = source.indexOf("if (opts?.reason)");
+	ok(chokepoint > 0, "the row gate still keys on opts.reason");
+	const spawn = source.indexOf('proc.on("error"');
+	ok(spawn > 0, "spawn-error handler present");
+	const spawnSettle = source.indexOf("doResolve(", spawn);
+	ok(spawnSettle > spawn, "spawn-error settle found");
+	const tail = source.slice(spawnSettle, source.indexOf("\n", spawnSettle));
+	ok(tail.includes('reason: "spawn-error"'), `the spawn-error settle passes a reason, so it writes a row: ${tail.trim()}`);
+	// Exactly-once: the `settled` latch is what makes adding a reason safe (a
+	// spawn error can be followed by `close`), so pin that it still guards.
+	ok(source.includes("if (settled) return;"), "the settled latch still guarantees exactly-once");
 });
 
 test("attempt is threaded from retry() into every spawn leg (primary / failover / fallback)", () => {

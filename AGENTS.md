@@ -185,10 +185,16 @@ Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context �
 
 ## Durable Dispatch Record & Task-Session Retention (#783)
 
-**Every builtin `task` dispatch that settles abnormally writes one immutable outcome
-row** — one row per spawn *attempt*, not per dispatch (a retried dispatch writes N rows
-sharing one `dispatchId`, distinguished by `attempt`). Dispatches that settle successfully
-write no row. The row lands in the
+**Every builtin `task` dispatch that settles abnormally writes one immutable outcome row**
+— one row per spawn *attempt*, not per dispatch. The row identity is
+**`dispatchId` + `childSessionId` + `attempt`** — never `dispatchId` + `attempt`, because
+`attempt` is a **per-leg** ordinal: `retry()` restarts it at 1 on every leg (primary, each
+failover hop, and the provider-fallback leg), so a multi-leg walk writes several `attempt=1`
+rows under one `dispatchId`. (On the `--no-session` degrade, `childSessionId` is null for
+every attempt, so the identity degrades to `dispatchId` + `attempt`.) Dispatches that settle
+successfully write no row — **except the success-but-silent settle** (exit 0, empty stdout,
+no `sessionEnded`), which is recorded as `reason: "clean-empty"` because it is
+indistinguishable from a silent loss to a ledger reader. The row lands in the
 **existing** dispatch ledger, `~/.pi/agent/audit/provider-failover.jsonl` (JSONL,
 `event: "dispatch-outcome"`; gate `DISPATCH_LEDGER`, default ON) — never a new file. Its
 `dispatchId` is the dispatch's `TASK_HEARTBEAT_NONCE`, so it joins the #512 usage and #476

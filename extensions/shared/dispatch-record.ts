@@ -70,7 +70,13 @@ export interface DispatchOutcomeRow {
   /** The child's own pi session id, read from the spawned arg vector. */
   childSessionId: string | null;
   /** 1-based spawn-attempt ordinal (retry() respawns). REQUIRED: a dispatch
-   * that retried writes N rows sharing one `dispatchId`. */
+   * that retried writes N rows sharing one `dispatchId`.
+   * ⚠️ `attempt` is PER-LEG, not dispatch-global (#783 review): `retry()`
+   * restarts at 1 for every leg it is called on (each failover hop, and the
+   * provider-fallback leg). So `(dispatchId, attempt)` is NOT a unique row key —
+   * a 3-leg walk with retries writes several `attempt=1` rows. The row identity
+   * is `dispatchId` + `childSessionId` + `attempt`; a reader that counts
+   * attempts against `dispatchId` alone will merge distinct spawn attempts. */
   attempt: number;
   cwd: string;
   branch: string | null;

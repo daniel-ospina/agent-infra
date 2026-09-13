@@ -80,6 +80,7 @@ U_F_AGE="12121212-1212-4212-8212-121212121212"
 U_REAL_LIVE="13131313-1313-4313-8313-131313131313"
 U_REAL_DEAD="14141414-1414-4414-8414-141414141414"
 U_SYMLINK="15151515-1515-4515-8515-151515151515"
+U_SWAP="18181818-1818-4818-8818-181818181818"
 U_NESTED="16161616-1616-4616-8616-161616161616"
 U_TILDE="17171717-1717-4717-8717-171717171717"
 
@@ -99,6 +100,12 @@ fi
 if [ -n "${FAKE_PS_SEQ_DIR:-}" ]; then
     if [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
     exit 1
+fi
+# FAKE_PS_HOOK_DIR → run <dir>/N (if present) before rendering, so a section
+# can mutate the filesystem at an exact probe index — the seam the symlink-swap
+# TOCTOU test needs (it must act AFTER the inventory walk, not before it).
+if [ -n "${FAKE_PS_HOOK_DIR:-}" ] && [ -f "$FAKE_PS_HOOK_DIR/$N" ]; then
+    bash "$FAKE_PS_HOOK_DIR/$N" >/dev/null 2>&1 || true
 fi
 if [ -n "${FAKE_PS_FAIL:-}" ]; then exit "${FAKE_PS_FAIL}"; fi
 if [ -n "${FAKE_PS_EMPTY:-}" ]; then exit 0; fi
@@ -134,6 +141,7 @@ mk_env() { mkdir -p "$T/$1/root"; }
 
 # Per-run ps env (reset explicitly — no cross-section leakage).
 PS_SOURCE=""; PS_FAIL=""; PS_SEQ_DIR=""; PS_COUNT=""; PS_EMPTY=""; OVERRIDE_PS_BIN=""
+PS_HOOK_DIR=""
 MAX_AGE_DAYS="7"; MAX_BYTES="2147483648"; DRY_RUN="1"
 ROOT_OVERRIDE=""; LOG_OVERRIDE=""
 
@@ -151,6 +159,7 @@ run_prune() { # <envname> [args…]
     FAKE_PS_SEQ_DIR="$PS_SEQ_DIR" \
     FAKE_PS_EMPTY="$PS_EMPTY" \
     FAKE_PS_COUNT="$PS_COUNT" \
+    FAKE_PS_HOOK_DIR="$PS_HOOK_DIR" \
     bash "$PRUNER" "$@"
 }
 
@@ -271,6 +280,34 @@ exists "$T/E/root/$U_TOCTOU/1780000000_toctou.jsonl" "E1 transcript survives —
 assert_contains "$(cat "$T/E/prune.log")" "went live before unlink (TOCTOU re-probe)" "E1 TOCTOU skip logged"
 assert_contains "$OUT" "pruned=0" "E1 nothing pruned"
 PS_SEQ_DIR=""; PS_COUNT=""
+
+# ── 5b. TOCTOU: child dir swapped for an OUTSIDE symlink mid-window ────
+# #783 review. The apply loop's top-of-iteration containment check and its
+# `rm` are separated by two forks (probe_ps, child_is_live), so a path-based
+# `rm -f "$ROOT/<uuid>/<file>"` follows an intermediate symlink planted in
+# that window and deletes OUTSIDE the root — making the header's "a planted
+# symlink can never make the sweep delete outside it" false. The unlink now
+# re-asserts containment atomically (cd into the parent, require the resolved
+# cwd to still be inside the canonical root, then unlink by BASENAME). This
+# test plants the swap at probe #2 — the exact window, since probe #1 is the
+# pre-inventory availability check — so it fails if that hardening is reverted.
+mk_env P
+OUTSIDE_SWAP="$T/P/outside"
+mkdir -p "$OUTSIDE_SWAP"
+mksession "$T/P/root/$U_SWAP/1780000000_swapped.jsonl" 700 $((9 * DAY))
+printf 'PRECIOUS' >"$OUTSIDE_SWAP/1780000000_swapped.jsonl"
+mkdir -p "$T/P/hooks"
+cat >"$T/P/hooks/2" <<HOOK
+rm -rf "$T/P/root/$U_SWAP"
+ln -s "$OUTSIDE_SWAP" "$T/P/root/$U_SWAP"
+HOOK
+PS_HOOK_DIR="$T/P/hooks"; PS_COUNT="$T/P/ps.count"
+OUT="$(run_prune P --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P1 symlink-swap pass exits 0 (no escape, no crash)"
+exists "$OUTSIDE_SWAP/1780000000_swapped.jsonl" "P1 file OUTSIDE the root survives the mid-window symlink swap"
+assert_eq "$(cat "$OUTSIDE_SWAP/1780000000_swapped.jsonl")" "PRECIOUS" "P1 the outside file is not merely present but UNMODIFIED"
+assert_contains "$OUT" "pruned=0" "P1 nothing was pruned through the planted symlink"
+PS_HOOK_DIR=""; PS_COUNT=""
 
 # ── 6. mode resolution: dry-run by default ─────────────────────────────
 mk_env F

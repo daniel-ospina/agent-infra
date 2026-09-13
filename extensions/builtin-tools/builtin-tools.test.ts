@@ -2470,6 +2470,47 @@ testAsync("child lifecycle — ready, tool-Set semantics, per-turn flags, tick f
   }
 });
 
+testAsync("child lifecycle (review fix): a lost tool_execution_end must NOT leak liveness into a later turn", async () => {
+  // #783 code review (P1). `turn_end` clears `outstandingTools` to bound a lost
+  // `tool_execution_end` to one turn, but the sibling `updatedToolIds` Set was
+  // only pruned per-id in `tool_execution_end`. So after ANY lost end, a
+  // streamed tool's id survived into later turns — and a subsequent
+  // NON-streaming tool reusing that toolCallId (plausible for providers that
+  // emit positional ids like `call_0`) made `computeToolUpdates` report a tool
+  // that has never emitted as live. The child then ticked `tool_updates=1`, and
+  // the parent's PRIMARY `tool-silence` clause would kill the healthy silent
+  // child at S (20 min): the exact false-liveness direction the gate exists to
+  // close, re-created inside the new Set. Fails if the `turn_end` clear is
+  // reverted, which is the only thing that closes it.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  try {
+    await withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: "leaknonce" }, async () => {
+      childFactory(api);
+      await handlers.session_start({} as any);
+      await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+      // A streaming tool that emits, then its end is LOST (never delivered).
+      await handlers.tool_execution_start({ toolCallId: "call_0", toolName: "bash", args: {} });
+      await handlers.tool_execution_update({ toolCallId: "call_0", toolName: "bash", args: {}, partialResult: "out" });
+      await handlers.turn_end({ turnIndex: 1, message: {}, toolResults: [] });
+      // Next turn: a NON-streaming tool (a nested `task` never emits updates)
+      // happens to reuse the same id.
+      await handlers.turn_start({ turnIndex: 2, timestamp: Date.now() });
+      await handlers.tool_execution_start({ toolCallId: "call_0", toolName: "task", args: {} });
+      await sleep(5_300);
+      const tick = lines.filter((l) => l.startsWith("[task-heartbeat] tick")).pop() ?? "";
+      ok(tick.includes("tools=1"), `one tool in flight: ${tick}`);
+      ok(tick.includes("tool_updates=0"), `a reused id must NOT inherit the previous turn's liveness (tool-silence gate stays off): ${tick}`);
+      await handlers.session_shutdown({} as any);
+    });
+  } finally {
+    console.error = origErr;
+  }
+});
+
 test("E8 (review fix): mid-line marker merge — foreign head preserved, marker part discarded", () => {
   const { ctx, acc, real } = makeIngest();
   ctx.expectedNonce = "n1"; // production context: parent always authenticates

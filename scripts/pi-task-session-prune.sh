@@ -27,6 +27,11 @@
 #     ever considered; symlinked entries are skipped and every unlink/rmdir is
 #     containment-checked against the canonical root (a planted
 #     `$ROOT/<name> -> ~/.ssh` can never make the sweep delete outside it).
+#     #783 review: the containment verdict for an unlink is re-asserted
+#     ATOMICALLY with the unlink — see the apply loop — because the loop's
+#     top-of-iteration check is separated from its `rm` by two forks, and a
+#     path-based `rm` would follow an intermediate symlink planted in that
+#     window. The unlink now runs by BASENAME from inside the verified parent.
 #
 # Bounds (env-tunable, plan/scope contract):
 #   TASK_SESSION_MAX_AGE_DAYS  default 7
@@ -93,11 +98,18 @@ trim() {
     printf '%s' "$s"
 }
 
-# resolve_root — normalize TASK_SESSION_ROOT EXACTLY as the JS side does
-# (extensions/shared/session-id.ts resolveTaskSessionRoot: trim, then expand a
-# leading `~` / `~/`). A mismatch makes the pruner point at a DIFFERENT tree
-# than the one task children write to — it would report "absent — nothing to
-# do" and exit 0 even on --apply, so the bound would never bind. FAIL CLOSED
+# resolve_root — normalize TASK_SESSION_ROOT with the same trim + leading-`~`
+# expansion as the JS side (extensions/shared/session-id.ts
+# resolveTaskSessionRoot), so the pruner points at the SAME tree task children
+# write to. A mismatch would make it report "absent — nothing to do" and exit 0
+# even on --apply, so the bound would never bind.
+# NOTE (#783 review): this is parity on TRIM + TILDE only, NOT byte-exact path
+# normalization. The JS side `path.join()`s the root when minting --session-dir
+# (collapsing repeated/trailing separators); this shell builds "$ROOT/$1"
+# verbatim, so TASK_SESSION_ROOT=/x/y/ compares as /x/y//<uuid>. Liveness still
+# matches because child_is_live also matches the always-emitted --session-id
+# (provider-independent), and the unlink path is containment-checked via
+# `pwd -P`. Do not claim byte-exactness here. FAIL CLOSED
 # (exit 3) when the root cannot be resolved; never operate on a guessed path.
 resolve_root() {
     local raw
@@ -381,12 +393,29 @@ run() {
                 log "SKIP $f — child $cid went live before unlink (TOCTOU re-probe)"
                 continue
             fi
-            if rm -f -- "$f" 2>/dev/null; then
+            # #783 review (TOCTOU): re-assert containment ATOMICALLY with the
+            # unlink. The check at the top of this iteration is separated from
+            # the `rm` below by two forks (probe_ps, child_is_live); swapping
+            # `$ROOT/<uuid>` for an outside-pointing symlink in that window would
+            # make a path-based `rm` follow the new intermediate component out of
+            # the root — the header's "can never delete outside it" would be
+            # false. So: cd into the file's parent, then require the RESOLVED cwd
+            # (`pwd -P`, which follows any planted symlink) to still be inside
+            # the canonical root, then unlink by BASENAME — the shell's cwd is a
+            # real directory, so a later swap of the PATH cannot redirect a
+            # basename unlink. NOTE: the comparison is against `$ROOT_REAL`, not
+            # against the literal `$(dirname "$f")` — `pwd -P` collapses `//`
+            # and other redundant separators, so a literal comparison would
+            # reject every legitimate path under a root whose env value ends in
+            # a slash.
+            if ( cd -- "$(dirname -- "$f")" 2>/dev/null \
+                 && case "$(pwd -P)" in "$ROOT_REAL"/*) true ;; *) false ;; esac \
+                 && rm -f -- "$(basename -- "$f")" ) 2>/dev/null; then
                 printf '%s\n' "$f" >>"$DELETED"
                 pruned_count=$(( pruned_count + 1 ))
                 freed_bytes=$(( freed_bytes + sz ))
             else
-                log "SKIP unlink failed: $f"
+                log "SKIP unlink failed or parent no longer inside the canonical root: $f"
             fi
         done <"$PLAN"
     fi

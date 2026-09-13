@@ -26,10 +26,15 @@
  * ephemeral by design). This pin asserts it is STILL there, at the documented
  * arg vector — removing it would be the regression, not keeping it.
  *
- * WIRING HONESTY: run by ci-main.yml's extension-tests job (post-merge, in the
- * block that runs `npm ci` in extensions/subagent), NOT ci.yml's `verify` job —
- * that job deliberately performs no `npm ci`. Like every suite in that job this
- * is post-merge only; the per-PR gate is ci.yml's `verify`.
+ * WIRING HONESTY: run by ci-main.yml's extension-tests job (post-merge, at the
+ * end of the block that runs `npm ci` in extensions/subagent). It is NOT in
+ * ci.yml's `verify` job — but not because it COULD not be: this pin is zero-dep
+ * (`node:*` + `readFileSync` only), and its sibling zero-dep pin
+ * (extensions/shared/default-coverage.test.ts) already runs per-PR in that job.
+ * It is wired into ci-main.yml because that is where the subagent surface is
+ * covered alongside the rest of the subagent-extension suites. (The earlier
+ * "ci.yml's verify job performs no npm ci, therefore this cannot run there"
+ * rationale was false and was corrected in ci-main.yml; this header now matches.)
  *
  * Run: npx tsx extensions/subagent/subagent-parity.test.ts
  */

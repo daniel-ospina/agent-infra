@@ -1701,11 +1701,15 @@ export function getCutGapMs(): number {
 // TASK_BACKSTOP_MS overrides; 0 = off (deliberate unbounded-wait config).
 //
 // #783 fix 4 — DELIBERATE DECOUPLING: the backstop derives from the FROZEN
-// exported DEFAULT_TOOL_STALL_MS (6h) + margin (6h30m), NOT from the task
-// path's own derived tool-stall bound (2/3 of the cap — 4h at the 6h default). It is no
+// exported DEFAULT_TOOL_STALL_MS (6h) plus the 30-min DEFAULT_BACKSTOP_MARGIN_MS
+// — 6h30m in total — NOT from the task path's own derived tool-stall bound (2/3
+// of the cap — 4h at the 6h default). It is no
 // longer literally "task tool-stall + margin". It must stay ABOVE the 6h hard
-// cap so the cap remains the last resort; deriving it from the 2h task bound
-// would drag it to 2h30m and pre-empt the cap.
+// cap so the cap remains the last resort: deriving it from the TASK bound (4h at
+// the default) would drag it to 4h30m and pre-empt the cap the backstop exists
+// to sit above. (#783 review: this comment previously said "2h task bound …
+// 2h30m", the pre-§6.6 fixed-literal numbers; the derivation moved and the
+// arithmetic with it.)
 
 /** #271 D4: backstop margin over the FROZEN DEFAULT_TOOL_STALL_MS (30 min).
  * #783 fix 4: deliberately NOT the task path's derived tool-stall bound. */
@@ -1724,7 +1728,7 @@ export let sweepRunCount = 0;
 
 /** Backstop = FROZEN DEFAULT_TOOL_STALL_MS (6h) + 30min margin = 6h30m
  * (23_400_000) — deliberately above the 6h hard cap (#783 fix 4: decoupled
- * from the task path's 2h tool-stall bound). 0 = off. */
+ * from the task path's derived tool-stall bound, 2/3 of the cap). 0 = off. */
 export function getTaskBackstopMs(): number {
   const raw = Number(process.env.TASK_BACKSTOP_MS);
   if (Number.isFinite(raw) && raw === 0) return 0; // explicit opt-out
@@ -2803,10 +2807,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     };
 
     // #783 Task 4: the durable OUTCOME row writer. One row per SPAWN ATTEMPT
-    // (not per dispatch) — retry() respawns up to 3x, so N attempts under one
-    // dispatchId write N rows distinguished by `attempt`. Only values known
-    // AT SETTLE are recorded; the ledger is append-only, so nothing re-writes
-    // a row later (#840 owns any amendment, via a follow-up row).
+    // (not per dispatch) — retry() respawns up to 3x, so a retried dispatch
+    // writes N rows under one dispatchId, each carrying its own `attempt`
+    // ordinal. ⚠️ `attempt` is PER-LEG (#783 review): retry() restarts it at 1
+    // on every leg (primary / each failover hop / fallback), so `attempt` ALONE
+    // distinguishes nothing — the row identity is `dispatchId` +
+    // `childSessionId` + `attempt` (on the `--no-session` degrade, where
+    // childSessionId is null for all attempts, it degrades to `dispatchId` +
+    // `attempt`). Only values known AT SETTLE are recorded; the ledger is
+    // append-only, so nothing re-writes a row later (#840 owns any amendment,
+    // via a follow-up row).
     const writeOutcomeRow = (reason: string, exitCode: number | null, transcriptPath: string | null): RecordWriteResult => {
       if (!dispatchLedgerEnabled(subAgentEnv)) return { ok: false, path: "", skipped: true };
       return recordDispatchOutcome(
@@ -2840,9 +2850,21 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
 
     const doResolve = (
       value: { content: any[]; details: Record<string, unknown> } | undefined,
-      // `reason` is the abnormal/success discriminator. REQUIRED on every
-      // abnormal settle; OMITTED by the success/clean/sessionEnded/
-      // abort-after-end/spawn-error settles — those write NO row.
+      // `reason` is the row discriminator. A row is written IFF `reason` is
+      // provided, and the enumeration is exact (#783 review — the previous
+      // "success → NO row" phrasing was false for `clean-empty`):
+      //   ROW   hard-cap | cut | backstop | failed | clean-empty | spawn-error |
+      //         any heartbeat `decision.reason` (tool-silence, tool-stall,
+      //         stream-stall, silence-threshold, first-message-stall,
+      //         max-dispatch, zero-output)
+      //   NO ROW clean success | sessionEnded | abort-after-end
+      // `clean-empty` is a SUCCESS settle (exit 0, empty stdout, no sessionEnded)
+      // that still writes a row, because it is indistinguishable from a silent
+      // loss to a ledger reader. `spawn-error` (pi not found, EACCES, EMFILE)
+      // used to write no row, making it the only abnormal settle missing from
+      // the #796 population; #783 review closed that gap rather than documenting
+      // it — the row needs nothing unavailable at that point, and `settled`
+      // already guarantees exactly-once (no double row when `close` follows).
       opts?: { reason?: string; exitCode?: number | null; keepCompletionWatchdog?: boolean; sweep?: boolean },
     ) => {
       if (settled) return;
@@ -3379,8 +3401,14 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     proc.on("error", (err: Error) => {
       clearInterval(heartbeat);
       exitWatchdog.disarm();
-      // Spawn errors (pi not found, etc.) are NOT retryable — return the error
-      doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${err.message}\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } });
+      // Spawn errors (pi not found, etc.) are NOT retryable — return the error.
+      // #783 review: record a row like every other abnormal settle. This was
+      // the only abnormal settle missing from the ledger, which made the
+      // documented "every abnormal settle writes exactly one row" contract
+      // false and left the class invisible to the #796 population. `reason`
+      // only gates the row write and cannot change the resolution, and
+      // `doResolve`'s `settled` latch keeps it exactly-once if `close` follows.
+      doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${err.message}\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } }, { reason: "spawn-error" });
     });
   });
 }

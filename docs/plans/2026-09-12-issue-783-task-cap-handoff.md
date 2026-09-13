@@ -59,7 +59,7 @@ was verified against the installed build.
 | 9 | tool schema (`task`) | `:3200-3234` (registered), `:3235` (`execute`) | standard | unit |
 | 10 | `repo-freshness` readers | exported: `currentBranch:109`, `repoClean:143`, `mergeOrRebaseInProgress:280`, `indexLocked:287`; `tryGit` **private** `:83` | standard | unit |
 | 11 | dispatch ledger | `shared/provider-failover.ts:1321` `appendLedger`; `~/.pi/agent/audit/provider-failover.jsonl`; key `dispatchId = TASK_HEARTBEAT_NONCE` (minted `index.ts:3438`) | standard | unit |
-| 12 | CI suite enumeration | `.github/workflows/ci-main.yml:123-158` (explicit) **plus a `:69` glob over `extensions/shared/*.test.ts`** — new shared tests are auto-collected; adding them explicitly double-runs them | — | shell |
+| 12 | CI suite enumeration | `.github/workflows/ci-main.yml:123-158` (explicit) **plus a `:69` glob over `extensions/shared/*.test.ts`** — new shared tests are auto-collected; adding them explicitly double-runs them. ⚠️ **SUPERSEDED:** `dispatch-record.test.ts` is the EXCEPTION — it imports `../builtin-tools/index.js`, which needs `typebox` from the builtin-tools `npm ci`, so the glob **skips** it (`ci-main.yml:75-83`) and it runs explicitly after that install (`:151-156`). Auto-collection alone would fail `ERR_MODULE_NOT_FOUND` on a fresh checkout. | — | shell |
 | 13 | launchd farm | `templates/launchd/*.plist` (5), `install-launchd.sh:142` (`verify_targets`)/`:366`, `install-launchd.test.sh:105`,`:207`, `setup.sh:289` | standard | shell test |
 | 14 | reaper | `scripts/pi-reap-idle.sh` — `:165` is the `tty ~ /^ttys/` gate; `:157` is a pid sanity check (cannot see tty-less task children) | — | shell test |
 | 15 | census instrument (live reader) | `docs/scoping/…/census.py:52,114,119,136,133,163` | — | must stay green |
@@ -364,10 +364,24 @@ the reason from its caller. This covers all four no-payload settles (`:2528`, `:
 cut-with-output arm, with exactly-once semantics by construction.
 
 **The choke point needs an explicit abnormal/success discriminator, or it writes the wrong rows.**
+
+> ⚠️ **SUPERSEDED ON ONE POINT (cycle-2 review).** Everywhere below, the **spawn-error** settle is
+> listed among the *success / no-row* paths. That was the design-time classification, and it is
+> **no longer true**: the shipped code passes `reason: "spawn-error"` (`extensions/builtin-tools/index.ts`,
+> the `proc.on("error")` settle) and therefore **writes a row**. Two independent reviewers flagged
+> that spawn error was the ONLY abnormal settle absent from the ledger, which made the documented
+> "every abnormal settle writes exactly one row" contract false and left that population invisible
+> to #796; the behaviour was changed rather than documented. It is safe because `reason` only gates
+> the row write (it does not feed `resolveUndefined`) and `doResolve`'s `settled` latch keeps it
+> exactly-once if `close` follows. The line numbers in this Task 4 section are design-time
+> references to a pre-change file and are left as written for auditability — do not read them as
+> current. The genuine no-row settles are only: clean success / sessionEnded / abort-after-end.
+
 `doResolve`'s signature is `(value, opts?: {keepCompletionWatchdog?, sweep?})` (`:2418`) — **it
 carries no reason**, and the four abnormal sites pass only `{sweep:true}`. A writer keyed naively
 off "reached `doResolve`" would emit `dispatch-outcome` rows for the **success** paths (`:2581`
-sessionEnded completion, `:2604` clean exit, `:2867` abort-after-end, `:2908` spawn error) —
+sessionEnded completion, `:2604` clean exit, `:2867` abort-after-end; *at design time this list also
+included the `:2908` spawn error — see the SUPERSEDED note above*) —
 contradicting the acceptance "a child that exits normally writes none" — while a writer gated on a
 reason it cannot obtain writes **nothing** at its own primary sites.
 
@@ -379,7 +393,8 @@ reason it cannot obtain writes **nothing** at its own primary sites.
 | `:2619` (both arms) | cut | `"cut"` |
 | `:2781`, `:2808` | heartbeat | `decision.reason` |
 | `:2842` | backstop | `"backstop"` |
-| `:2581`, `:2604`, `:2867`, `:2908` | success / clean / spawn-error | **omitted → no row** |
+| `:2581`, `:2604`, `:2867` | success / clean | **omitted → no row** |
+| `:3211` | spawn error | `"spawn-error"` — ⚠️ **SUPERSEDED** (originally listed above as omitted → no row; the behavior was changed in cycle-2 review so the abnormal population is complete) |
 | `:2632` | non-zero `failed` | `"failed"` (its own row) |
 | **`:2848`** | **backstop, hasOutput arm** | `"backstop"` |
 
@@ -601,14 +616,21 @@ never removed; farmed count asserts 6.
    `.ts` suites **explicitly** (`:123-125` builtin-tools, `:126-127` provider-failover,
    `:128-129` cut-resume, `:151-158` subagent), but `:69` **already globs
    `extensions/shared/*.test.ts`**. So add only the two new
-   `extensions/builtin-tools/*.integration.test.ts` entries — adding
-   `dispatch-record.test.ts` explictly would **double-run** it (the hazard the file's own
-   `.mjs` comment at `:44-46` warns about) — and wire the parity pin into **`ci-main.yml`'s
+   `extensions/builtin-tools/*.integration.test.ts` entries. ⚠️ **SUPERSEDED:** the
+   original text here said adding `dispatch-record.test.ts` explicitly would **double-run**
+   it. The shipped wiring does the opposite — the glob **skips** it (`ci-main.yml:83`) and it
+   runs explicitly after the builtin-tools `npm ci` (`:155-156`), because it imports
+   `../builtin-tools/index.js` and would hit `ERR_MODULE_NOT_FOUND` otherwise. Wire the parity pin into **`ci-main.yml`'s
 extension-tests job (which runs `npm ci`)**, not `ci.yml`: `extensions/subagent/index.ts` imports
    **runtime** values from four `@earendil-works/*` packages, and `ci.yml`'s `verify` job
-deliberately runs **without** `npm ci` (`:138`, `:151`) — a parity test that must live there has
-to be a `readFileSync` source pin (zero-dep, like
-   `extensions/shared/default-coverage.test.ts`). Task 7.1 and the residual table are reconciled on
+deliberately runs **without** `npm ci`. ⚠️ **SUPERSEDED rationale:** the original text here concluded
+   that the parity pin therefore *had* to be a zero-dep `readFileSync` pin to live in `ci.yml`. That
+   implication was declared FALSE in `.github/workflows/ci-main.yml:183-188` — the pin IS zero-dep
+   (`node:*` + `readFileSync` only) and its sibling `extensions/shared/default-coverage.test.ts`
+   ALREADY runs per-PR in `ci.yml`'s verify job (`ci.yml:208`), so it *could* run there too; it is
+   wired into `ci-main.yml`'s extension-tests job because that is where the subagent surface is
+   covered. The `subagent-parity.test.ts` header was reconciled to this; the plan's Task 7.1 is now
+   reconciled too. Task 7.1 and the residual table are reconciled on
    **`ci-main.yml`**.
 
    **Shell suites are enumerated explicitly too** (`ci-main.yml:198-206`):
@@ -742,14 +764,14 @@ is delivered by **#840**, not here.
 | Changed | `extensions/builtin-tools/index.ts`, `builtin-tools.test.ts` (one repin), `cut-resume.integration.test.ts`, `task-cap-handoff.integration.test.ts` (ledger isolation) |
 
 - **Writer at the ONE choke point** — inside `doResolve`, immediately after `settled = true`, gated on a caller-supplied `reason`. Not at call sites: `finalize` is invoked unconditionally from both `proc.on("exit")` and `proc.on("close")`, so a cap kill would otherwise settle row A and the close-path `cut` a second row for the same attempt (append-only → unrepairable). The 60 s cap test proves it at runtime: the fake child's SIGTERM trap confirms the close path ran, and the ledger holds **exactly one** row (`reason=hard-cap`).
-- **`doResolve` gained `reason` (required-on-abnormal) + `exitCode`.** The 12 sites: `:2815`/`:2819` cap → `hard-cap`; `:2903` exit-path cut (one `doResolve`, both ternary arms) → `cut`; `:2927` non-zero → `failed`; `:3076`/`:3102` heartbeat → `decision.reason ?? "silence-threshold"`; `:3141`/`:3146` backstop → `backstop`; `:2870` sessionEnded, `:2893` clean exit, `:3170` abort-after-end, `:3211` spawn error → **no reason → NO row**. *(The brief listed three separate "cut" numbers; in the code the cut is ONE settle with two arms, and the other two numbers are the success settles. Followed the code — see the review note.)*
+- **`doResolve` gained `reason` (required-on-abnormal) + `exitCode`.** The 12 sites: `:2815`/`:2819` cap → `hard-cap`; `:2903` exit-path cut (one `doResolve`, both ternary arms) → `cut`; `:2927` non-zero → `failed`; `:3076`/`:3102` heartbeat → `decision.reason ?? "silence-threshold"`; `:3141`/`:3146` backstop → `backstop`; `:2870` sessionEnded, `:2893` clean exit, `:3170` abort-after-end → **no reason → NO row**. `:3211` spawn error → ⚠️ **SUPERSEDED:** this entry originally read "spawn error → **no reason → NO row**". That made spawn error the ONLY abnormal settle absent from the ledger, so the documented "every abnormal settle writes exactly one row" contract was false and the class was invisible to #796. Cycle-2 review (2 independent reviewers) flagged it and the **behavior was changed** rather than documented: the settle now passes `reason: "spawn-error"` and DOES write a row. The gain is safe because `reason` only gates the row write (it does not feed `resolveUndefined`) and `doResolve`'s `settled` latch keeps it exactly-once if `close` follows. *(The brief listed three separate "cut" numbers; in the code the cut is ONE settle with two arms, and the other two numbers are the success settles. Followed the code — see the review note.)*
 - **Same ledger, same key.** Rows go through `appendLedger(row, "dispatch-outcome", subAgentEnv)` → `~/.pi/agent/audit/provider-failover.jsonl`, `dispatchId = TASK_HEARTBEAT_NONCE`, so #796 and the #512/#476 rows join on one key in one file.
 - **`appendLedger` cannot back `{ok,error}`, so the writer wraps it**: write, then stat + read-back the appended byte range for OUR identity (robust to a concurrent sibling append). An unwritable root yields `record: "failed: <err>"` in the payload — never a path to nothing (pinned by a test).
 - **Gate `DISPATCH_LEDGER`, default ON.** Explicitly off → the row is skipped AND the payload carries no `record` field at all (no advertised path, no false failure claim).
 - **`attempt` threaded** from `retry((attempt) => spawnLeg(leg, attempt))` through `recordCtx(attempt)` on the primary, failover and fallback legs; the spawn boundary defaults a missing value to `1` (tsx does not typecheck). `childSessionId` is read from the **arg vector** (`--session-id`), the source of truth for what spawned. A scripted 2-attempt run writes **2 rows, one `dispatchId`, `attempt` 1/2**.
 - **`dispatchClass`**: no existing reviewer/eval discriminator exists anywhere (the review-enforcer counts any `task`/`subagent` tool_result and keeps no class) — so it is caller-declared via `TASK_DISPATCH_CLASS`, default `"task"`. Recorded as the honest form of "distinguishes builtin-task from reviewer/eval".
 - **Ledger isolation:** `cut-resume` and `task-cap-handoff` now point `PI_CODING_AGENT_DIR` at their tmpdir (`provider-failover` already did). After all four real-`spawnSubAgent` suites, the operator's `~/.pi/agent/audit/provider-failover.jsonl` **does not exist** — zero test rows leaked.
-- `dispatch-record.test.ts` is auto-collected by `ci-main.yml`'s existing `extensions/shared/*.test.ts` glob — adding it explicitly would double-run it.
+- `dispatch-record.test.ts` is **NOT** auto-collected by `ci-main.yml`'s `extensions/shared/*.test.ts` glob — it is explicitly skipped there (`:83`) and run after the builtin-tools `npm ci` (`:155-156`), because it imports `../builtin-tools/index.js` and needs `typebox` on a fresh checkout. (Earlier text claimed the opposite: that the glob collects it and adding it explicitly would double-run it.)
 
 ### ✅ Tasks 5, 6, 7 — DONE (verified)
 

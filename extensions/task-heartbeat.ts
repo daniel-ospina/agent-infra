@@ -480,7 +480,18 @@ export default function (pi: ExtensionAPI) {
     turnActive = false;
     // Pi guarantees all tools finalize before turn_end — clearing here bounds
     // any residual start/end desync to one turn (cycle-2 P1 fix).
+    // #783 review: `updatedToolIds` MUST be cleared alongside its sibling Map.
+    // The per-id delete in `tool_execution_end` is not sufficient on its own: if
+    // a `tool_execution_end` is ever lost or skipped (the exact desync this
+    // clear exists to bound), the streamed tool's id would survive into LATER
+    // turns, and a subsequent non-streaming tool (a nested `task`, say) reusing
+    // that same toolCallId — plausible for providers that emit positional ids
+    // like `call_0` — would make `computeToolUpdates` report a tool that has
+    // never emitted as live. The child would then tick `tool_updates=1` and the
+    // parent's PRIMARY `tool-silence` clause would kill the healthy silent child
+    // at S: the precise false-liveness direction this gate exists to close.
     outstandingTools.clear();
+    updatedToolIds.clear();
     touchActivity();
     emit(formatTurnEnd(nonce, event.turnIndex));
   });
