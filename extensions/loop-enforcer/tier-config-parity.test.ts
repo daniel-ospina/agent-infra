@@ -41,6 +41,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ok, equal, deepEqual } from "node:assert/strict";
@@ -422,19 +423,15 @@ export function stripShellComments(code: string): string {
 }
 
 /**
- * The `BOUND=<N>` assignments the fixer loop actually EXECUTES, in source
- * order: the pre-loop general default (10) and the adversarial branch (the
- * declared cap). Parsed from fenced bash with comments stripped, so a
- * commented-out `then BOUND=2; fi` yields only the default (a violation), and
- * `BOUND=10` → `BOUND=100` changes the parsed value. The `\b` before `BOUND`
- * makes `${ADVERSARIAL_BOUND:-0}` — where `_` is a word character — no match.
+ * The `BOUND=<N>` assignments the fixer loop declares, in source order: the
+ * pre-loop general default (10) and the adversarial branch (the declared cap).
+ * Parsed from fenced bash with comments stripped. `${ADVERSARIAL_BOUND:-0}` is
+ * not matched — `\b` before `BOUND` fails after `_`, and there is no `=`.
  *
- * Text, not a runtime value, is the only surface available here: the fixer
- * loop is a markdown doc an agent copies. LIMIT (stated, not hidden): this
- * proves the DOCUMENTED code diverges when it does; it cannot prove a human
- * ran a different snippet. Numeric equality — never `includes("BOUND=10")`,
- * which `"BOUND=100".includes("BOUND=10")` satisfies (the cycle-2 bypass) —
- * is what binds the assertion to the value rather than a substring.
+ * This is a SHAPE check only. `effectiveAdversarialBound()` below is
+ * authoritative: assignment text cannot see a neutered guard variable (the
+ * cycle-3 finding — `ADVERSARIAL_BOUND=0` injected before an intact branch), so
+ * the suite EXECUTES the fence to learn the bound.
  */
 export function executableBoundAssignments(src: string): number[] {
   const out: number[] = [];
@@ -444,35 +441,115 @@ export function executableBoundAssignments(src: string): number[] {
   return out;
 }
 
+/**
+ * Every assignment to `ADVERSARIAL_BOUND` in the fenced, comment-stripped code,
+ * as its raw value. The setup line (`ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}`)
+ * is the ONLY legitimate assignment: a literal reassignment (`ADVERSARIAL_BOUND=0`
+ * placed before the branch) neuters the guard while leaving the branch text
+ * byte-for-byte intact, so it must be a violation on its own.
+ */
+export function adversarialBoundAssignments(src: string): string[] {
+  const out: string[] = [];
+  for (const block of executableBashBlocks(src)) {
+    for (const m of stripShellComments(block).matchAll(/\bADVERSARIAL_BOUND=(\S*)/g)) out.push(m[1]);
+  }
+  return out;
+}
+
 /** The general (non-adversarial) safety cap the executable loop must default to. */
 export const EXECUTABLE_DEFAULT_BOUND = 10;
 
 /**
- * Violations when the fixer loop's EXECUTED bounds diverge from the declared
- * contract. Requires exactly TWO executable assignments — the 10-cycle general
- * default and the declared adversarial cap — in that order, compared
- * numerically against comment-stripped code. Both cycle-2 residuals are
- * therefore violations, not silent passes: commenting the branch out leaves
- * one assignment, and `BOUND=10` → `BOUND=100` leaves `[100, 2]`.
+ * The bound the fence ACTUALLY produces, obtained by RUNNING it. The fenced L1
+ * block is executed under bash with `ADVERSARIAL_BOUND` set to 1 (adversarial)
+ * or 0 (general), `gh` stubbed to report OPEN, and the loop variables seeded —
+ * then `BOUND` is read back. This is the only check that binds to what
+ * EXECUTES: a commented-out branch, a reassigned guard variable, an
+ * unconditional branch, or a rewritten condition all change the observed value
+ * while leaving assignment text untouched. `break` is neutralised (the block is
+ * a loop body, not a loop) and cannot affect the bound.
+ *
+ * LIMIT (stated, not hidden): it executes the DOCUMENTED fence, which is what a
+ * fixer agent copies; it cannot prove an agent ran something else.
+ */
+export function effectiveAdversarialBound(src: string, adversarial: boolean): number {
+  const block = executableBashBlocks(src).find(
+    (b) => /^\s*BOUND=\d+\s*$/m.test(stripShellComments(b)) && b.includes("ADVERSARIAL_BOUND"),
+  );
+  if (!block) throw new Error("no fenced bash block assigns BOUND and references ADVERSARIAL_BOUND");
+  const body = stripShellComments(block).replace(/\bbreak\b/g, "true");
+  const script = [
+    'gh() { echo "OPEN"; }',
+    "CYCLE=0",
+    "PR_NUMBER=1",
+    'EXIT_REASON=""',
+    `ADVERSARIAL_BOUND=${adversarial ? 1 : 0}`,
+    body,
+    'echo "BOUND=${BOUND}"',
+    'echo "EXIT_REASON=${EXIT_REASON}"',
+  ].join("\n");
+  let out: string;
+  try {
+    out = execFileSync("bash", ["-c", script], { encoding: "utf-8", timeout: 10_000 });
+  } catch (err: any) {
+    throw new Error(`executing the fixer-loop fence failed: ${err?.message ?? err}`);
+  }
+  const m = /^BOUND=(\d+)\s*$/m.exec(out);
+  if (!m) throw new Error(`the fixer-loop fence did not report BOUND; output: ${out}`);
+  return Number(m[1]);
+}
+
+/**
+ * Violations when the fixer loop's EFFECTIVE bounds diverge from the declared
+ * contract. Three layers, weakest first: shape (exactly two `BOUND=<N>`
+ * assignments, 10 then the declared cap), guard integrity (no literal
+ * reassignment of `ADVERSARIAL_BOUND`), and EXECUTION (the fence run with the
+ * guard set must produce 2 adversarial / 10 general). The execution layer is
+ * what closes both cycle-2 residuals and the cycle-3 guard-neutering bypass.
  */
 export function executableBoundViolations(src: string): string[] {
+  const violations: string[] = [];
   const bounds = executableBoundAssignments(src);
   if (bounds.length !== 2) {
-    return [
+    violations.push(
       `fixer-loop: expected exactly 2 executable \`BOUND=<N>\` assignments (the general default + the adversarial branch), found ${bounds.length}`,
-    ];
+    );
+  } else {
+    if (bounds[0] !== EXECUTABLE_DEFAULT_BOUND) {
+      violations.push(
+        `fixer-loop: the EXECUTED general default bound is ${bounds[0]}, expected ${EXECUTABLE_DEFAULT_BOUND}`,
+      );
+    }
+    if (bounds[1] !== ADVERSARIAL_CAP) {
+      violations.push(
+        `fixer-loop: the EXECUTED adversarial bound is ${bounds[1]}, but the declared cap is ${ADVERSARIAL_CAP}`,
+      );
+    }
   }
-  if (bounds[0] !== EXECUTABLE_DEFAULT_BOUND) {
-    return [
-      `fixer-loop: the EXECUTED general default bound is ${bounds[0]}, expected ${EXECUTABLE_DEFAULT_BOUND}`,
-    ];
+  for (const value of adversarialBoundAssignments(src)) {
+    if (value !== "${ADVERSARIAL_BOUND:-0}") {
+      violations.push(
+        `fixer-loop: \`ADVERSARIAL_BOUND=${value}\` reassigns the guard variable (only the \`\${ADVERSARIAL_BOUND:-0}\` default setup is allowed) — a literal reassignment neuters the bound`,
+      );
+    }
   }
-  if (bounds[1] !== ADVERSARIAL_CAP) {
-    return [
-      `fixer-loop: the EXECUTED adversarial bound is ${bounds[1]}, but the declared cap is ${ADVERSARIAL_CAP}`,
-    ];
+  try {
+    const adversarial = effectiveAdversarialBound(src, true);
+    if (adversarial !== ADVERSARIAL_CAP) {
+      violations.push(
+        `fixer-loop: EXECUTING the fence with ADVERSARIAL_BOUND=1 yields BOUND=${adversarial}, expected ${ADVERSARIAL_CAP}`,
+      );
+    }
+    const general = effectiveAdversarialBound(src, false);
+    if (general !== EXECUTABLE_DEFAULT_BOUND) {
+      violations.push(
+        `fixer-loop: EXECUTING the fence with ADVERSARIAL_BOUND=0 yields BOUND=${general}, expected ${EXECUTABLE_DEFAULT_BOUND}`,
+      );
+    }
+  } catch (err: any) {
+    violations.push(`fixer-loop: could not execute the fence: ${err?.message ?? err}`);
   }
-  return [];
+  return violations;
 }
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -651,6 +728,60 @@ test("rejects a dropped adversarial branch (one assignment, not two)", () => {
   );
   const v = executableBoundViolations(dropped);
   ok(v.some((s) => s.includes("found 1")), `expected found-1, got: ${v.join(" | ")}`);
+});
+
+test("the fence EXECUTES to the declared bounds (2 adversarial / 10 general)", () => {
+  const src = ADVERSARIAL_SOURCES["skills/code-review/references/fixer-loop.md"];
+  equal(effectiveAdversarialBound(src, true), ADVERSARIAL_CAP, "adversarial mode must execute BOUND=2");
+  equal(
+    effectiveAdversarialBound(src, false),
+    EXECUTABLE_DEFAULT_BOUND,
+    "general mode must execute BOUND=10",
+  );
+});
+
+test("rejects a neutered guard variable (`ADVERSARIAL_BOUND=0` before the intact branch — cycle-3 finding)", () => {
+  const path = "skills/code-review/references/fixer-loop.md";
+  const src = ADVERSARIAL_SOURCES[path];
+  const neutered = src.replace(
+    'BOUND=10\nif [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+    'ADVERSARIAL_BOUND=0\nBOUND=10\nif [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+  );
+  ok(neutered !== src, "control did not apply — the BOUND=10 + branch anchor was not found");
+  // The assignment SHAPE is untouched — a text-only check stayed green.
+  deepEqual(
+    executableBoundAssignments(neutered),
+    [EXECUTABLE_DEFAULT_BOUND, ADVERSARIAL_CAP],
+    "the assignment shape is expected to stay green",
+  );
+  const v = executableBoundViolations(neutered);
+  ok(
+    v.some((s) => s.includes("reassigns the guard variable")),
+    `expected a guard-reassignment violation, got: ${v.join(" | ")}`,
+  );
+  // The execution layer must also observe the neutered bound.
+  equal(
+    effectiveAdversarialBound(neutered, true),
+    EXECUTABLE_DEFAULT_BOUND,
+    "executing the neutered fence must yield the general default",
+  );
+});
+
+test("rejects an unconditional adversarial branch (guard removed, assignment intact — execution layer)", () => {
+  const path = "skills/code-review/references/fixer-loop.md";
+  const src = ADVERSARIAL_SOURCES[path];
+  const unconditional = src.replace(
+    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+    "if true; then BOUND=2; fi",
+  );
+  ok(unconditional !== src, "control did not apply — the adversarial branch was not found");
+  // Shape still parses as two numeric assignments; only EXECUTION sees the drift.
+  deepEqual(executableBoundAssignments(unconditional), [EXECUTABLE_DEFAULT_BOUND, ADVERSARIAL_CAP]);
+  const v = executableBoundViolations(unconditional);
+  ok(
+    v.some((s) => s.includes("ADVERSARIAL_BOUND=0 yields BOUND=2")),
+    `expected the general-mode execution violation, got: ${v.join(" | ")}`,
+  );
 });
 
 // ── The runtime mapping ─────────────────────────────────────────────────────

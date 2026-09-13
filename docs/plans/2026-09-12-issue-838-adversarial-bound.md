@@ -101,15 +101,21 @@ Disclosure: `[ADVERSARIAL-BOUND] cycles=2 threats=5 covered=3 residuals=#874,#87
 verdict and second-model gate line bind to the final head. Both cycle-2 in-scope residuals were then
 **closed in this PR** rather than carried:
 
-- **#874** — the executable-bound pin now strips shell comments from the fenced bash and parses
-  every `BOUND=<N>` assignment, requiring exactly `[10, 2]` numerically. A commented-out
-  `then BOUND=2; fi` yields `[10]` (violation) and `BOUND=10` → `BOUND=100` yields `[100, 2]`
-  (violation). Negative controls added for both, and the old substring check
-  (`includes("BOUND=10")`, which `BOUND=100` satisfies) was replaced with strict equality.
+- **#874** — the executable-bound pin now binds to what EXECUTES, at three layers: (a) shell
+  comments are stripped from the fenced bash and every `BOUND=<N>` assignment parsed, requiring
+  exactly `[10, 2]` numerically; (b) no literal reassignment of `ADVERSARIAL_BOUND` is allowed
+  (only the `${ADVERSARIAL_BOUND:-0}` default setup); (c) the fenced L1 block is **executed** under
+  bash with the guard set to 1 and 0 and the observed `BOUND` must be 2 and 10. A commented-out
+  `then BOUND=2; fi` yields `[10]`; `BOUND=10` → `BOUND=100` yields `[100, 2]`; and the cycle-3
+  guard-neutering bypass (`ADVERSARIAL_BOUND=0` injected before the byte-intact branch) is caught
+  by layers (b) and (c) even though the assignment shape is unchanged. Negative controls cover all
+  three, and the old substring check (`includes("BOUND=10")`, satisfied by `BOUND=100`) is gone.
 - **#875** — `task-workflow-standard` and `plan-review` now qualify their general
   "only `NO ISSUES FOUND` advances" sentences with the adversarial `THREAT SURFACE COVERED`
   substitution, so the rule is not read unqualified in multiple places.
 
-Verification: `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` → **34 passed, 0 failed**;
-both bypass mutations were re-applied to the real `fixer-loop.md` and each made the suite red
-(30 passed, 4 failed). The bounded re-review verdict for the merged head is recorded in the PR body.
+Verification: `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` → **37 passed, 0 failed**;
+all three bypass mutations were re-applied to the real `fixer-loop.md` and each made the suite red
+(commented-out branch: 30 passed / 7 failed; `BOUND=100`: 31 passed / 6 failed; guard-neutering
+`ADVERSARIAL_BOUND=0`: 35 passed / 2 failed). The bounded re-review verdict for the merged head is
+recorded in the PR body.
