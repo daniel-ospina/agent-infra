@@ -885,11 +885,13 @@ For each cycle:
 
 3. **Stuckness detection (3-layer algorithm)**:
 
-   a. **Fingerprint-stall**: Hash each surviving issue's location+description+suggestion (SHA256). If ≥`stall_threshold` of fingerprints match the previous cycle → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
+   a. **Fingerprint-stall**: Hash each surviving issue's **location + severity** (SHA256) — the defect's *stable identity*, **never** its `description`/`suggestion`. Wording is the part a fresh, memoryless reviewer varies; hashing it made an identical defect re-described in new words hash differently, so recurrence read ~0 on a cycle where nothing was fixed — the most common real stall, and invisible to the primary detector. **Recurrence is `|current ∩ prev| / |prev|`** — "what fraction of *last cycle's* issues came back?". `|prev|` is the correct denominator and the *only* one: it is the stall signal, so a cycle that repeats all 10 prior issues must score 1.0. (A symmetric denominator — `max(|current|, |prev|)` — inverts this: repeating all 10 prior issues *plus* 5 new ones scores `10/15 = 0.67`, **below** threshold, so the loop reads as ordinary churn on a cycle where nothing was resolved. Do not use it.) If recurrence ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
 
-   b. **Honest-stuck**: Track `issues_per_cycle` (the number of issues surviving after each re-review). If issue count is **non-decreasing for 3 consecutive cycles** AND the fingerprints differ from prior cycles (genuinely new issues each time), the fixer is introducing new issues faster than it resolves existing ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem.
+   b. **Honest-stuck**: Track `issues_per_cycle`. **This is an INDEPENDENT signal, not a refinement of recurrence** — it fires when the count is **non-decreasing for 3 consecutive cycles**, *regardless of recurrence*. Gating it behind `recurrence ≥ stall_threshold` was itself a regression: a loop that churns one-for-one (every issue fixed, a new one appearing in its place) has **low** recurrence but is not converging, and the gate left it undiagnosed until the cycle cap. Exit reason = `honest-stuck`. Escalate to human.
 
-   c. **Zero-progress**: Track `files_changed_per_cycle`. If files changed = 0 for 2 consecutive cycles, the fixer is making zero code progress — treat as fingerprint-stall and escalate.
+      ⚠️ **Fire if `recurrence ≥ stall_threshold` OR `issues_per_cycle` is non-decreasing for 3 consecutive cycles.** Either is sufficient on its own. The two tests exist because they catch different pathologies — recurrence catches *the same issues coming back*, the count test catches *the loop not shrinking, however caused*. Recurrence is used only to pick the label (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`); it is never a precondition for the count signal. The executable form lives in `references/fixer-loop.md`; **that file and this section must agree.**
+
+   c. **Zero-progress**: Track `files_changed_per_cycle`. If files changed = 0 for 2 consecutive cycles, the fixer is making zero code progress. Exit reason = `zero-progress`. Escalate to human. (Previously mapped onto `fingerprint-stall`, which made three distinct conditions indistinguishable in the persisted record.)
 
 **Exit conditions — ALL must be true before proceeding to Step 8:**
 
@@ -901,7 +903,7 @@ For each cycle:
 
 **Convergence rule:** If re-review issues are a strict subset of the previous cycle's issues (no new dimensions or files flagged), the fixer is in a refinement loop. Log convergence and escalate to human: present remaining issues with attempted fixes. Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.
 
-**Stall guard:** If the same issue survives 3 consecutive fix cycles, the automated fixer cannot resolve it. Log and escalate to human.
+**Stall guard:** there is no separate fixed-cycle stall rule. "The same issue survives N cycles" is exactly what the 3-layer detection above measures — recurrence over a wording-invariant fingerprint, plus the count signal. Do not restate it here as a cycle count; a second, weaker statement of the same rule is how the loop ends up with two different answers to "are we stuck?".
 
 **Exit outcomes:**
 - `STATUS=failed` → fixer couldn't push. Post with `⚠️ Auto-fix failed (push error) — N issues remain`.
@@ -912,12 +914,20 @@ For each cycle:
 **Cycle-status YAML**: Write `operations/logs/cycle-status.yaml` on loop exit:
 
 ```yaml
-exit_reason: <clean|fingerprint-stall|honest-stuck|cycle-cap|convergence|stall-guard>
+exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|tool-unavailable|pr-closed|git-error|push-failed|convergence>
 cycles: <N>
 issues_per_cycle: <json array>
 files_changed_per_cycle: <json array>
+detector_fired: <fingerprint-stall|honest-stuck|zero-progress|''>   # which layer fired, or empty
+fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual input; null on a zero-progress exit, which fires before the scan
 skill: code-review
 ```
+
+> **`detector_fired` is never empty when `exit_reason` names a detector** — `zero-progress` sets it too. An empty `detector_fired` alongside a detector exit reads as "no layer fired", which is the opposite of what happened.
+>
+> **`convergence` is the one agent-judged exit** — "the remaining issues are a strict subset with no new dimensions" is a reading of the issue set, not something the classifier emits. Every other value in this enum is written by the loop itself. Do not add a value here that nothing produces: a never-emitted enum member reads as a live exit path and hides the fact that the loop exits somewhere else.
+
+> **Why `detector_fired` and `fingerprint_recurrence_last_cycle` are recorded:** without them, "why did this loop exit?" cannot be answered after the fact — the predicate's inputs are gone and only the verdict survives. A run that exited `fingerprint-stall` under the old asymmetric denominator could not be distinguished from a genuine recurring set.
 
 This file enables cross-session staleness detection and loop enforcer integration.
 

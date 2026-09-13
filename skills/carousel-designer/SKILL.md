@@ -68,7 +68,7 @@ Writes review-status.yaml (clean + content hash)
 | Context drift after 5-8 turns | Objective refresh every 3 turns. Checkpoint+restart at 5 iterations |
 | Hallucination from iterative self-rewriting | CSS output validated against JSON schema. Cold DeepSeek copy check |
 | Single agent develops blind spots | Cold DeepSeek verifies copy accuracy independently |
-| Persistence deficit (task abandonment) | Hard stall: 3× identical fingerprint → escalate to human |
+| Persistence deficit (task abandonment) | Hard stall: recurrence ≥ `stall_threshold` (0.8) → escalate to human |
 
 ## Process
 
@@ -227,7 +227,7 @@ Exit condition: After 5 carousels, if no structural fix repeats across entries, 
 - **Overlay removal test:** Visualize without the overlay gradient. Does the image work on its own?
 - **Directional gradient test:** Would an angled gradient (105deg, matching CTA slide precedent) improve text-image interplay?
 - **Feed scale:** At 375px wide (Instagram feed), does the composition read as a coherent thumbnail?
-- **Escalation:** If scrim_override changes (YAML) are needed, flag as P1 with note "requires scrim_override" — these can't be resolved by CSS fixes and fingerprint-stall escalates to human after 3 cycles.
+- **Escalation:** If scrim_override changes (YAML) are needed, flag as P1 with note "requires scrim_override" — these can't be resolved by CSS fixes and fingerprint-stall escalates to human once recurrence (`|current ∩ prev| / |prev|`) reaches `stall_threshold` (0.8) — there is no fixed cycle count.
 - **Fallback:** If the angled scrim doesn't resolve within 2 fixer cycles, emit a human-flag note rather than cycling indefinitely.
 - For non-photo-hero slides: check balanced layout, not cluttered. Clear focal point.
 - Adequate negative space
@@ -238,7 +238,7 @@ When clean, writes `review-status.yaml` to the carousel directory. The posting s
 
 ## No Cycle Cap
 
-Loop runs until clean. Natural peak at ~4-5 iterations per Opus session. Checkpoint+restart if more needed. Hard stall only when 3× identical fingerprint → escalate to human. No arbitrary cap.
+Loop runs until clean. Natural peak at ~4-5 iterations per Opus session. Checkpoint+restart if more needed. Hard stall only when recurrence (`|current ∩ prev| / |prev|`) reaches `stall_threshold` (0.8) → escalate to human. No arbitrary cap.
 
 ## Integration
 
