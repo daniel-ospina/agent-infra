@@ -119,3 +119,50 @@ all three bypass mutations were re-applied to the real `fixer-loop.md` and each 
 (commented-out branch: 30 passed / 7 failed; `BOUND=100`: 31 passed / 6 failed; guard-neutering
 `ADVERSARIAL_BOUND=0`: 35 passed / 2 failed). The bounded re-review verdict for the merged head is
 recorded in the PR body.
+
+> **Superseded by §8.** The execution boundary described immediately above was removed one day
+> later — it is the observation channel §8 deletes, and its count is now 38/0.
+
+## 8. Decisive simplification (2026-09-13) — exact-text pin, harness deleted
+
+The #874 closure in §7 hardened an observation channel — *execute the markdown in bash, parse its
+stdout* — that three review cycles each defeated in a new way. Three holes, one family (threat
+class 5, pin vacuity):
+
+1. `printf "BOUND=%d\n" 2` printed a fake marker the first-match regex read → 37/0 green while the
+   real loop executed the 10-cycle cap.
+2. The sentinel + last-match fix fell to a shadowing body (`command`/`[`/`builtin`/`printf`).
+3. The allowlist fix fell to an allowlist-clean **decoy block placed earlier**: `fixerLoopBlock()`
+   bound to the first matching block while `executableBoundAssignments()` summed over all blocks, so
+   the real L1 fence was never checked and never executed — the pin returned `[]` while the fence
+   executed `BOUND=20`.
+
+By #838's own contract this class is declared **out of scope, not chased**. Rather than write a
+fourth hardening, the observation channel is removed:
+
+- **Approach A — exact-text pin, no execution.** `CANONICAL_L1_FENCE` is the one approved L1 fence,
+  byte-for-byte. `l1FenceViolations(md)` requires it to occur **exactly once** *and* requires no
+  `BOUND=` assignment to survive **outside** it — both are properties of the text, so there is no
+  stdout to forge. `canonicalFenceSelfViolations()` ties the constant to `ADVERSARIAL_CAP` and the
+  `adversarial-capped` exit, so moving the cap without moving the fence fails even before the doc is
+  read.
+- **Deleted, not disabled:** `execFileSync`, `BOUND_SENTINEL`, `effectiveAdversarialBound`,
+  `executableBashBlocks`, `stripShellComments`, `executableBoundAssignments`,
+  `adversarialBoundAssignments`, `fixerLoopBlock`, `unallowedL1Statements`, the `L1_ALLOWED_STATEMENTS`
+  allowlist, and every execution-based test.
+
+**Mutation evidence** — each mutation applied to the real `fixer-loop.md`, then the real suite run:
+
+| Mutation | Result |
+|---|---|
+| commented-out adversarial branch | 37 passed / **1 failed** (red) |
+| `BOUND=10` → `BOUND=100` | 35 passed / **3 failed** (red) |
+| allowlist-clean decoy block prepended | 37 passed / **1 failed** (red) |
+| forged marker `printf "BOUND=%d\n" 2` | 37 passed / **1 failed** (red) |
+
+File restored byte-for-byte after each. Baseline: **39 passed, 0 failed**. The anchor also rejects a
+fence moved out of the `### L1` section (heading bound by the same exact string).
+
+The chosen approach is not clever — it is the absence of cleverness. A pin whose "verification"
+executes the text under test can always be made to observe a forgery; a pin that *is* the text
+cannot.
