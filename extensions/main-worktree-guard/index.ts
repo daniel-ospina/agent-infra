@@ -293,8 +293,57 @@ try {
 // Try/catch-guarded: load failure → M1/M2/M3 OFF + one-time warn; write/edit
 // never depends on it.
 let branchOwnership: any = null;
+// The extension host keeps ONE process-wide module registry for its entire
+// life. A `../shared/branch-ownership.mjs` first imported by an EARLIER
+// generation of this file is therefore served from cache on every later
+// reload — present, cached, and missing any export added since it was first
+// evaluated. Because a reload re-evaluates THIS file but NOT its dependencies,
+// a newly-added call site here meets that stale namespace and throws
+// `… is not a function` at RUNTIME, mid-decision, from inside the tool hook.
+// The throw escapes the hook and aborts the entire bash tool call (pi's
+// emitToolCall runs the handler with no try/catch), so the guard ends up
+// blocking EVERY mutating git command (`add`/`commit`/`push`) instead of
+// guarding it — a safety control failing into a total work stoppage, which its
+// own degradation contract (above) is explicitly designed to avoid.
+//
+// The fix is VALIDATION, not cache-busting: verify that every export we call is
+// actually present, and if not, take the documented M1/M2/M3-OFF path instead
+// of throwing. The load-failure catch below never covers this case — the
+// import SUCCEEDS, it just returns an old namespace.
+//
+// Do NOT "fix" this with a specifier query (`…branch-ownership.mjs?gen=N`).
+// pi loads extensions through jiti, whose resolver STRIPS the query before the
+// module registry sees it: `jiti.resolve("./dep.mjs?gen=1")` and
+// `jiti.resolve("./dep.mjs?gen=2")` return the same path, and three different
+// query specifiers in one jiti load yield ONE module instance (a native-ESM
+// host honours the query instead). So the query is inert HERE — and in a
+// native host it would leak one module instance per reload. An earlier version
+// of this change carried exactly that query and documented it as the fix; it
+// was a no-op in production.
+//
+// Consequence, stated plainly: on a stale namespace this guard is DOWN for the
+// life of the process. A reload cannot recover it (the registry survives
+// reloads) — only a full pi restart can. That is still strictly better than
+// breaking git, but it is NOT self-healing, and there is no specifier trick
+// that makes it so. This is why the member list below must stay in sync with
+// the call sites; `test-module-load.mjs` pins that both ways.
+const _BRANCH_OWNERSHIP_MEMBERS = [
+  "acquireRepoLock", "classifyBranchOp", "decideM1", "decideM2", "decideM3",
+  "localBranchExists", "ownershipAllowed", "readBranchState", "releaseRepoLock",
+  "repoKey", "resolveEffectiveRepo", "resolveRepoFromInv",
+] as const;
 try {
   branchOwnership = await import("../shared/branch-ownership.mjs");
+  const _missing = _BRANCH_OWNERSHIP_MEMBERS.filter(
+    (k) => typeof branchOwnership?.[k] !== "function",
+  );
+  if (_missing.length > 0) {
+    console.warn(
+      "[main-worktree-guard] ⚠️ branch-ownership.mjs namespace is STALE/incomplete — M1/M2/M3 branch-ownership guards DISABLED (falling back to legacy behavior). Missing exports:",
+      _missing.join(", "),
+    );
+    branchOwnership = null;
+  }
 } catch (e) {
   console.warn("[main-worktree-guard] ⚠️ branch-ownership.mjs failed to load — M1/M2/M3 branch-ownership guards DISABLED (falling back to legacy behavior):", String(e));
 }

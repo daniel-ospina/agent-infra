@@ -173,6 +173,58 @@ if (targets.length > 0 && targets.every((t) => declared.has(t.name))) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Part A2 — the branch-ownership member-list invariant (#879), BOTH ways.
+//
+// #879: `index.ts` validates a hardcoded `_BRANCH_OWNERSHIP_MEMBERS` list
+// before calling into the cached `shared/branch-ownership.mjs` namespace, so a
+// STALE namespace (one imported by an earlier generation of index.ts, served
+// from cache for the life of the host process) degrades to M1/M2/M3-OFF
+// instead of throwing `… is not a function` from inside the tool hook — a
+// throw that aborts the whole bash tool call and breaks every mutating git
+// command.
+//
+// That protection is only as good as the list. If a call site uses a member
+// the list omits, validation passes on the stale namespace and the crash
+// returns. So pin it in both directions, statically, at zero cost:
+//   A2a — every `branchOwnership.<member>` used in index.ts IS listed.
+//   A2b — every listed member IS an exported function of the module.
+// ─────────────────────────────────────────────────────────────────────────
+const MEMBER_LIST_RE = /_BRANCH_OWNERSHIP_MEMBERS\s*=\s*\[([\s\S]*?)\]\s*as const/;
+const memberListRaw = MEMBER_LIST_RE.exec(src)?.[1] ?? null;
+const listedMembers = memberListRaw
+  ? [...memberListRaw.matchAll(/["']([A-Za-z0-9_]+)["']/g)].map((m) => m[1])
+  : [];
+expectTrue("A2: located _BRANCH_OWNERSHIP_MEMBERS in index.ts", listedMembers.length > 0,
+  "the validated member list could not be parsed — did it get renamed or reshaped?");
+
+// A2a: every member access in index.ts must be validated before use.
+const usedMembers = [...new Set([...src.matchAll(/branchOwnership\s*\.\s*([A-Za-z0-9_]+)/g)].map((m) => m[1]))];
+const unlisted = usedMembers.filter((m) => !listedMembers.includes(m));
+expectTrue(`A2a: every branchOwnership.<member> used is validated (${usedMembers.length} used)`,
+  unlisted.length === 0,
+  `used but NOT in _BRANCH_OWNERSHIP_MEMBERS: ${unlisted.join(", ")} — a stale namespace would `
+  + "pass validation and throw `is not a function` mid-hook, aborting the bash tool call (#879)");
+if (unlisted.length === 0 && usedMembers.length > 0) {
+  console.log(`     (${usedMembers.length} members used, all validated)`);
+}
+
+// A2b: every validated member must actually exist in the module. A wrong name
+// here would silently DISABLE the guard on a healthy namespace — the opposite
+// failure (fail-closed as fail-open).
+const BO_MJS = join(HERE, "..", "shared", "branch-ownership.mjs");
+const boSrc = blankBlockComments(readFileSync(BO_MJS, "utf8"));
+const exportedFns = new Set(
+  [...boSrc.matchAll(/export\s+(?:async\s+)?function\s+([A-Za-z0-9_]+)/g)].map((m) => m[1]));
+const notExported = listedMembers.filter((m) => !exportedFns.has(m));
+expectTrue(`A2b: every validated member is an exported function (${listedMembers.length} listed)`,
+  notExported.length === 0,
+  `listed but NOT an exported function of shared/branch-ownership.mjs: ${notExported.join(", ")} — `
+  + "this would disable M1/M2/M3 on a HEALTHY namespace, failing open");
+if (notExported.length === 0 && listedMembers.length > 0) {
+  console.log(`     (${listedMembers.length} listed members, all exported)`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Part B — real module load + behavioral proof that the classify-git bindings
 // are the real imports, not the fail-safe stubs.
 // ─────────────────────────────────────────────────────────────────────────
