@@ -151,12 +151,12 @@ if [ -n "$SECOND_MODEL_GATE_MODEL" ]; then
   # `unknown` (G5): `model=none independent=yes` used to be recorded and read by
   # check (f) as a resolved independent reviewer.
   _sm_lc="$(printf '%s' "$SECOND_MODEL_GATE_MODEL" | tr 'A-Z' 'a-z')"
-  if printf '%s' "$_sm_lc" | grep -qE '^(\**degraded|none|null|n/?a|unknown)$'; then
+  if grep -qE '^(\**degraded|none|null|n/?a|unknown)$' <<<"$_sm_lc"; then
     if [ "$SECOND_MODEL_GATE_INDEPENDENT" != "DEGRADED" ]; then
       echo "SECOND_MODEL_GATE_MODEL=$SECOND_MODEL_GATE_MODEL is the reserved DEGRADED marker but SECOND_MODEL_GATE_INDEPENDENT=$SECOND_MODEL_GATE_INDEPENDENT — a reserved value is never an independent reviewer; use independent=DEGRADED (refusing to record)" >&2
       exit 2
     fi
-  elif ! printf '%s' "$SECOND_MODEL_GATE_MODEL" | grep -qE '^~?[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*(:[A-Za-z0-9._-]+)?$'; then
+  elif ! grep -qE '^~?[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*(:[A-Za-z0-9._-]+)?$' <<<"$SECOND_MODEL_GATE_MODEL"; then
     echo "SECOND_MODEL_GATE_MODEL='$SECOND_MODEL_GATE_MODEL' is not a provider/id (and not the reserved DEGRADED marker) — refusing to record (fail closed)" >&2
     exit 2
   fi
@@ -252,11 +252,11 @@ if [ "$VERDICT" = "clean-micro" ]; then
             echo "⚠️ clean-micro tier guard: could not fetch labels of $ref — that ref is undeterminable (record proceeds unless another ref is non-micro)" >&2
             continue
           fi
-          if printf '%s\n' "$LABELS" | grep -q '^complexity:micro$'; then
+          if grep -q '^complexity:micro$' <<<"$LABELS"; then
             MICRO_SEEN=1
             continue
           fi
-          if printf '%s\n' "$LABELS" | grep -qE '^complexity:' ; then
+          if grep -qE '^complexity:' <<<"$LABELS"; then
             OFFENDING_LABEL="$(printf '%s\n' "$LABELS" | grep -E '^complexity:' | head -1)"
             REFUSED=1
             echo "❌ clean-micro tier guard: $REPO#$PR closes $ref, whose complexity label is \"$OFFENDING_LABEL\" — clean-micro certifies the MICRO process only and is REFUSED for a non-micro linked issue." >&2

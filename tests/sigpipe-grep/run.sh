@@ -22,8 +22,11 @@
 #      short-payload test cannot catch the class, and why the bug looked flaky.
 #   7. the guard's own CLI contract (missing root / unknown arg → exit 2, --help → 0)
 #   8. exception semantics: a STALE declaration, a count DRIFT, and a declaration with no
-#      tracking issue each FAIL; an exact one passes and is announced. Load-bearing here:
-#      #841's own exception is `scripts/record-review.sh`, blocked by #860.
+#      tracking issue each FAIL; an exact one passes and is announced. The announcement
+#      property is pinned POSITIVELY by the synthetic fixture in 8d. The one real exception
+#      this repo ever carried (`scripts/record-review.sh`, blocked by #860) was deleted when
+#      #860 was resolved by funding — see the exceptions file. Section 0 therefore pins the
+#      shipped state too: zero live exception lines and no phantom exemption.
 #   9. SELF-SCAN — the guard includes ITSELF in the scan set. An earlier revision excluded its
 #      own path, and review round 1 found a genuine occurrence of this class hiding in that
 #      blind spot. This test appends the idiom to a COPY of the guard and requires detection,
@@ -77,12 +80,22 @@ else
   fail "the guard found an undeclared occurrence (exit $rc) — see below"
   sed -n '1,20p' "$OUT"
 fi
-if [ -s "$ROOT/scripts/sigpipe-grep-exceptions.txt" ]; then
+# The shipped repo carries no LIVE exception lines (comments only). A declared
+# exception must always be announced — that property is proven positively on a
+# synthetic fixture in section 8d. Here we pin that the shipped file declares
+# nothing, so the guard must not print a phantom exemption.
+live_exc="$(grep -vcE '^[[:space:]]*(#|$)' "$ROOT/scripts/sigpipe-grep-exceptions.txt" 2>/dev/null || true)"
+live_exc="${live_exc:-0}"
+if [ "$live_exc" -eq 0 ]; then
   if grep -q 'DECLARED BLOCKED' "$OUT"; then
-    pass "the declared blocked exception is ANNOUNCED on every run (never a silent mute)"
+    fail "the guard announced a DECLARED BLOCKED exception but the shipped exceptions file has no live lines"
   else
-    fail "scripts/sigpipe-grep-exceptions.txt exists but the guard did not announce it"
+    pass "no live exception lines shipped — the scan set is clean with no exemption claimed"
   fi
+elif grep -q 'DECLARED BLOCKED' "$OUT"; then
+  pass "$live_exc declared exception(s) ANNOUNCED on every run (never a silent mute)"
+else
+  fail "$live_exc live exception line(s) present but the guard did not announce them"
 fi
 
 # ── 1 ────────────────────────────────────────────────────────────────────────

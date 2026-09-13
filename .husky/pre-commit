@@ -51,6 +51,16 @@ if [ -f scripts/check-cost-config.sh ]; then
   bash scripts/check-cost-config.sh --shipped-only || exit 1
 fi
 
+# #841/#861 — builtin-writer SIGPIPE false-negative guard. `printf`/`echo`
+# piped into a quiet `grep` under `pipefail` can report "not found" for a match
+# that IS present (the writer takes SIGPIPE once grep exits early on a multiline
+# payload), silently turning a guard into a pass — the idiom cost data in
+# stale-worktrees.sh/cleanup-worktree.sh. Offline + fast; the scan set is
+# scripts/, .husky/ and pi-bootstrap/.
+if [ -f scripts/check-no-sigpipe-grep.sh ]; then
+  bash scripts/check-no-sigpipe-grep.sh || exit 1
+fi
+
 # #716 — second-model gate designation (shipped config only; OFFLINE). Blocks
 # commits that make the second-model designation build-equivalent to the
 # primary (the #716 defect, incl. the provider-less `deepseek-flash` alias) or

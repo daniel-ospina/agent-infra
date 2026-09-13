@@ -101,6 +101,23 @@ jobs:
       - name: Second-model fixture suite (hermetic, zero network)
         run: bash tests/second-model/run.sh
 
+  sigpipe-grep:
+    # #841/#861 — the builtin-writer SIGPIPE false-negative guard. `printf`/`echo`
+    # piped into a quiet `grep` under `pipefail` can report "not found" for a
+    # match that IS present (the writer takes SIGPIPE once grep exits early on a
+    # multiline payload), silently turning a guard into a pass. The scan set is
+    # scripts/, .husky/ and pi-bootstrap/. This job is the WIRING — #863 shipped
+    # the guard unwired because adding this job required editing a guarded file
+    # while no independent model was funded (#860), which is exactly the "guard
+    # nobody runs" failure the guard exists to prevent.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SIGPIPE false-negative guard (the scan set must be clean)
+        run: bash scripts/check-no-sigpipe-grep.sh
+      - name: SIGPIPE guard suite (detection, continuations, exceptions, positive controls)
+        run: bash tests/sigpipe-grep/run.sh
+
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
     # every extensions/ top-level entry except *.test.ts must be farm-wired
