@@ -205,21 +205,23 @@ Every incident currently adds a rule; nothing removes one — that is the mechan
 
 | Workstream | Issue | Depends on | Risk | Effort |
 |---|---|---|---|---|
-| W1 close false/stale claims + W6 delete inline-review rule + W9 one copy of loop rules + W12 admission control | **#919** | — | none | very low–low |
-| W2 fix fail-open paths | **#920** | — | none | medium |
-| W3 delete 2 strict subsets + W4 one design gate (17 conserved checks) | **#921** | #919 (W9) | medium | medium |
+| W1 close false/stale claims + W6 delete inline-review rule | **#919** (narrowed: W9 + W12 dropped) | — | none | very low |
+| W2 fix fail-open paths | **#920** (narrowed: N1 + N3 only) | — | none | low–medium |
+| W3 delete 2 strict subsets + W4 one design gate (17 conserved checks) | **#921** | #919 | medium | medium |
 | W5 4 reviewers in code-review | **#922** | — | medium | low |
-| W7 redirect fix + docs exemption | **#923** | — | low | low |
-| W8 implement or delete 2 dead gates | **#924** | — | none | low–med |
+| W7 redirect fix + docs exemption | **#908** (canonical — #923 closed as dup) | — | low | low |
+| W8 implement or delete 2 dead gates | **#891** + **#820** (canonical — #924 closed as dup) | — | none | low–med |
 | W10 measure correctness + duration | **#925** | — | high (ext) / low (scripts) | medium |
 | W11 invert the git guard (SCOPING ONLY) | **#926** | #920, #925 | **high** | high |
-| Filed during this analysis — worktree helper false block | **#918** | — | none | low |
+| worktree helper false block | **#897** (canonical — #918 closed as dup) | — | none | low |
+
+**Post-hoc dedup pass changed this table.** 3 of the 9 filed issues were duplicates and 2 more were partly duplicated — see §7.1. Live issues: **#919, #920, #921, #922, #925, #926**.
 
 **Parallelization map (lean):**
-- **Wave 1 (launch immediately, all independent, near-zero risk):** #919, #923, #924, plus #918. Grouped as one batch where practical.
-- **Wave 2 (independent of each other):** #920, #922, #925 (scripts half only).
-- **Wave 3:** #921 (waits on #919), #925's extension half.
-- **Wave 4:** #926 — scoping only, do not dispatch as implementation.
+- **Wave 1 (launch immediately, all independent, near-zero risk):** #919, #908, #891, #820
+- **Wave 2 (independent of each other):** #920, #922, #925 (scripts half)
+- **Wave 3:** #921 (waits on #919), #925's extension half
+- **Wave 4:** #926 — scoping only, do not dispatch as implementation
 
 ## 7. Process note (deliberate deviation, recorded)
 
@@ -236,11 +238,24 @@ The quality control that would have been provided by the 7 loops is replaced by 
 
 ## 7.1 Post-decomposition corrections to this document
 
-Three things changed while decomposing, and are recorded here rather than silently folded in:
+**The decomposition violated this epic's own W12.** Nine issues were filed **without a duplicate search**. A post-hoc pass found **3 duplicates** and **2 partly-duplicated** issues:
 
-1. **The count went from 12 workstreams to 8 issues.** W1/W6/W9/W12 were grouped into #919 and W3/W4 into #921. Twelve issues would have been self-refuting for an epic whose thesis is that the framework emits too much issue traffic. This is W12 (admission control) applied to the epic itself.
-2. **A live reproduction of W11 was captured.** While filing these issues, a `bash` call was blocked because an *issue-body heredoc* contained the literal text of a destructive git verb — data that was never executed. Same root cause as #918 (content-based matching on non-executing text). Filed as additional evidence on #918.
-3. **W5's at-risk check count is 8, not 7.** The verification pass listed eight: the seventh (#12 env-name↔code correspondence) was initially omitted from the summary. Issue #922 carries all eight.
+| Filed | Verdict | Canonical home |
+|---|---|---|
+| #918 worktree helper false-blocked on a clean hub | **duplicate** | **#897** (identical); also #772 (classifier matches command TEXT — the second reproduction) |
+| #923 redirect fix + docs exemption | **duplicate** | **#908** — same issue; only the corrected diagnosis was new, now posted there |
+| #924 test-review backstop + observed-failing pin | **duplicate** | **#891** and **#820** — both named in #924's own body |
+| #919 cleanup batch | **narrowed** | W12 → #906/#903; W9 → #833/#847/#871/#815/#676. Now W1 + W6 |
+| #920 fail-open paths | **narrowed** | N2 → #853/#761/#789; N4 → #771. Now N1 + N3 |
+
+**Two findings from this.**
+
+1. **The irony is the lesson.** The epic's first correction is that #878's premise was false — the collision pre-flight *does* exist. The decomposition then skipped it. The mandated check is `scripts/parallel_work_check.sh start` (C1, "closed-issue DUP_FIX search"), required by `issue-scoping` before any scoping. It was not run, and no manual search replaced it.
+2. **A new verified defect.** When the sanctioned check *was* finally run it returned `C1: CLEAR  no-board-skip: no board session — board scan skipped`. **The duplicate search short-circuits when there is no board session** — so in a no-board repo (this one) the C1 dedup search does not run at all. The dedup protection is absent in exactly the environment where the epic is executed. Added to #925's scope.
+
+**W12 now has a worked example: this decomposition.** Filing without a dedup pass is precisely the "unbounded issue emission" #903 and #906 describe — and the check that should have caught it is a silent no-op.
+
+**Consequence for later workstreams:** no further issues in this epic are to be filed without first running the dedup pass *and* verifying it did not short-circuit. #921 and #926 are now explicitly **umbrella** issues — their deliverable includes *retiring* existing issues (#829 into #921; ~25 guard issues dispositioned by #926), not adding to them.
 
 ## 8. Open risk
 
