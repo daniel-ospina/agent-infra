@@ -226,11 +226,13 @@ function cycle(n: number, issues: number, verdict = "NEEDS_FIX", fingerprints?: 
   // set. Canonically `|curr ∩ prev| / |prev|`; the natural misreading of the
   // skill's prose ("what fraction of LAST cycle's issues came back") iterates the
   // PREVIOUS set instead. The two are equal whenever prev is a set (an
-  // intersection is symmetric), and differ only when prev has a REPEATED digest
-  // that the current cycle does not re-mention — reachable, because
+  // intersection is symmetric), and differ exactly when prev carries a REPEATED
+  // digest that the current cycle STILL MENTIONS — reachable, because
   // `sha256(location + ":" + severity)` collapses two defects sharing both.
   // prev={a,b} (from the list [a,a,b]), curr={a}: canon 1/2 = 0.5 → CONTINUE;
-  // iterating prevFps counts `a` twice → 2/2 = 1.0 → false escalation.
+  // iterating prevFps counts the duplicated `a` twice → 2/2 = 1.0 → false
+  // escalation. (Build the fixture any other way — e.g. a `curr` that dropped the
+  // duplicate — and both forms agree, so the test cannot fail.)
   const r = evaluateTermination([
     cycle(1, 4, "NEEDS_FIX", ["a", "a", "b"], 1),
     cycle(2, 1, "NEEDS_FIX", ["a"], 1),
@@ -324,6 +326,31 @@ function cycle(n: number, issues: number, verdict = "NEEDS_FIX", fingerprints?: 
     cycle(3, 4, "NEEDS_FIX", ["a", "b"], 1),
   ], 10);
   assert(r.shouldExit && r.detector === "honest-stuck", "L3: both detectors hold → honest-stuck label wins");
+}
+{
+  // ⛔ The PUREST canonical stall, and the only fixture with a 1-issue current
+  // cycle: one issue, still there. `prev={a}`, `curr={a}` ⇒ 1/1 = 1.0 → FIRE.
+  // Every other positive fixture forces `issuesFound >= 3`, which left the
+  // `currCycle.issuesFound > 0` delegation boundary unpinned — relaxing it to
+  // `> 1` (or `>= 3`) kept the whole suite green while silently dropping the
+  // one-issue stall to `Continue`. This cell is what makes that boundary load-
+  // bearing; it also exercises the smallest possible recurrence denominator.
+  const r = evaluateTermination([
+    cycle(1, 1, "NEEDS_FIX", ["a"], 1),
+    cycle(2, 1, "NEEDS_FIX", ["a"], 1),
+  ], 10);
+  assert(r.shouldExit && r.detector === "fingerprint-stall", "L3: a single recurring issue (1/1) → fingerprint-stall (the >0 boundary)");
+}
+{
+  // ⛔ DELEGATION BOUNDARY one cycle before the cap: L3 owns a stall at
+  // `n < effectiveMax`, L10 owns it at `n === effectiveMax` (the next test). Both
+  // escalate, so only the label differs — but a `n < effectiveMax - 1` drift
+  // drops the LAST pre-cap stall here to `Continue`, losing both the detector and
+  // the escalation for that cycle. Every other 9-cycle fixture has strictly
+  // declining counts, so this non-decreasing one is what pins the boundary.
+  const eight = Array.from({ length: 8 }, (_, i) => cycle(i + 1, 4, "NEEDS_FIX", undefined, 1));
+  const r = evaluateTermination([...eight, cycle(9, 4, "NEEDS_FIX", undefined, 1)], 10);
+  assert(r.shouldExit && r.reason === "L3-deadlock" && r.detector === "honest-stuck", "L3: a stall one cycle before the cap → L3 owns it (not L10, not Continue)");
 }
 {
   // At the cap, L10 owns the exit (it escalates too). Reporting L3 here would

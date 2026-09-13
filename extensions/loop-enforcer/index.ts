@@ -1754,7 +1754,9 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
         const chain = escalation ? escalation.path.join(" → ") : "unknown";
         // #847 cycle-3 — this is the ORDINARY path: it runs before the completion
         // branch below, so it is the only human-gate write for a cron/trigger/
-        // continuous loop and the first of two for a soft-paused completion loop.
+        // continuous loop, and the first of two for a completion loop that
+        // HARD-STOPS (for one that soft-pauses it is the only one — that branch
+        // returns before the second push).
         // With the bare layer reason it persisted `cap-escalate:L3-deadlock` for
         // BOTH detectors — the exact ambiguity the detector field exists to remove.
         manifest.human_gate_flags.push(`cap-escalate:${termResult.detector ?? termResult.reason} → ${chain}`);
@@ -1771,6 +1773,11 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
           // Soft pause — allow user to restart session with fresh context
           manifest.context_resets = currentResets + 1;
           manifest.cycles = manifest.cycles.slice(-1); // reset counter, keep only the most recent cycle
+          // Restored (#847 cycle-4 review): this line is present at `5612d07` and
+          // was dropped without explanation while the `exit_reason` line below it
+          // was rewritten. `session_start` recovery requires `status === "running"`,
+          // so this is not a no-op for a paused loop resumed by a new session.
+          manifest.status = "running";
           // #847 — persist the DETECTOR, not just the layer, when L3 fired:
           // `reason` is "L3-deadlock" for both stalls, so storing it alone made
           // the canonical exit vocabulary (`fingerprint-stall` / `honest-stuck`)
