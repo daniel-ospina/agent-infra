@@ -4,7 +4,8 @@
 # Exercises scripts/check-second-model.sh semantics:
 #   0. every fixture JSON parses; every fixture is canonically encoded
 #      (ensure_ascii=False) so the bounded-delta claim is byte-visible
-#   1. clean fixture → PASS (exit 0); `--print` resolves `moonshot/kimi-k3`
+#   1. clean fixture → PASS (exit 0); `--print` emits `moonshot/kimi-k3` as a
+#      CANDIDATE (never a resolution — #910 notice on stderr)
 #   2. backdoor-same-build (`deepseek/deepseek-v4-pro`)     → BLOCK (exit 1)
 #   3. backdoor-false-pass (`deepseek-flash`, provider-less) → BLOCK (exit 1)
 #      — the canonical #716 false pass a naive id/family check misses
@@ -61,7 +62,7 @@ if ! git -C "$ROOT" diff --quiet -- tests/fixtures/second-model; then
   exit 1
 fi
 
-cleanup() { rm -f "$OUT"; }
+cleanup() { rm -f "$OUT" "$OUT.err"; }
 trap cleanup EXIT
 
 pass() { echo "   ✅ $1"; }
@@ -117,13 +118,19 @@ echo "1. clean fixture → PASS (exit 0)"
 run_guard 0 "clean fixture" --check --live-dir "$FIX/clean"
 grep -q "second-model gate: PASS" "$OUT" && pass "summary PASS" || { fail "expected PASS summary"; tail -20 "$OUT"; }
 if grep -q "⚠️  second-model gate: PASS with" "$OUT"; then pass "PASS accepts the external-authority warning"; else fail "expected the external-authority PASS cap"; fi
-bash "$GUARD" --print --live-dir "$FIX/clean" >"$OUT" 2>&1
+bash "$GUARD" --print --live-dir "$FIX/clean" >"$OUT" 2>"$OUT.err"
 code=$?
 if [ "$code" -eq 0 ] && [ "$(cat "$OUT")" = "moonshot/kimi-k3" ]; then
-  pass "--print resolves the first preference candidate (moonshot/kimi-k3)"
+  pass "--print emits the first preference candidate (moonshot/kimi-k3) on stdout"
 else
   fail "--print — expected exit 0 + moonshot/kimi-k3, got exit $code / '$(cat "$OUT")'"
 fi
+# #910 defect 1: the candidate must never be readable as a resolution — a loud
+# stderr notice names the epistemic status AND the --probe dispatch authority.
+grep -q "CANDIDATE, not a resolution" "$OUT.err" && grep -q "UNVERIFIABLE offline" "$OUT.err" \
+  && grep -q -- "--probe is the resolution + dispatch authority" "$OUT.err" \
+  && pass "--print emits the #910 'candidate, not a resolution' notice on stderr" \
+  || { fail "#910: --print candidate notice missing"; cat "$OUT.err"; }
 
 echo ""
 echo "2. backdoor-same-build (deepseek/deepseek-v4-pro) → BLOCK, exit 1"
@@ -165,8 +172,15 @@ code=$?
 if [ "$code" -eq 0 ]; then pass "override → exit 0 (operator-override-open-by-design)"; else fail "expected exit 0, got $code"; tail -20 "$OUT"; fi
 grep -q "operator override active" "$OUT" && pass "override WARNed" || fail "override warning missing"
 grep -q "NOT what a gate would dispatch" "$OUT" && pass "override names the config-vs-dispatch gap" || fail "override message incomplete"
-SECOND_MODEL=deepseek/deepseek-v4-pro bash "$GUARD" --print --live-dir "$FIX/clean" >"$OUT" 2>/dev/null
-if [ "$(cat "$OUT")" = "deepseek/deepseek-v4-pro" ]; then pass "--print honours the override"; else fail "--print did not honour the override ('$(cat "$OUT")')"; fi
+# #910 defect 2: a BUILD-EQUIVALENT override must not be handed out with exit
+# 0 — the old branch ran is_model_id() but not is_equivalent(), so the
+# documented AGENTS.md default printed verbatim (the exact #716 false pass).
+SECOND_MODEL=deepseek/deepseek-v4-pro bash "$GUARD" --print --live-dir "$FIX/clean" >"$OUT" 2>"$OUT.err"; code=$?
+if [ "$code" -eq 1 ] && [ "$(cat "$OUT")" = "**DEGRADED" ] && grep -q "SAME served build as the primary" "$OUT.err"; then
+  pass "#910: a build-equivalent \$SECOND_MODEL override is DEGRADED by --print (exit 1)"
+else
+  fail "#910: build-equivalent override not fail-closed (exit $code, '$(cat "$OUT")')"; cat "$OUT.err"
+fi
 
 echo ""
 echo "8. SECOND_MODEL_GATE_OVERRIDE=1 silences the BLOCK (escape hatch)"
@@ -192,8 +206,8 @@ grep -q "second-model gate: PASS" "$OUT" && pass "shipped-only PASS" || { fail "
 # Hermetic probe path (fixture, not network): the solvent candidate resolves.
 run_guard 0 "probe --probe-fixture" --probe --live-dir "$FIX/probe-kimi-solvent" --probe-fixture "$FIX/probe-kimi-solvent/probe.json"
 grep -q "RESOLVED=moonshot/kimi-k3" "$OUT" && pass "hermetic probe resolves the first solvent candidate" || { fail "expected RESOLVED=moonshot/kimi-k3"; tail -15 "$OUT"; }
-bash "$GUARD" --print --live-dir "$FIX/probe-kimi-solvent" --probe-fixture "$FIX/probe-kimi-solvent/probe.json" >"$OUT" 2>&1
-[ "$(cat "$OUT")" = "moonshot/kimi-k3" ] && pass "--print with probe data resolves kimi" || fail "--print probe resolution got '$(cat "$OUT")'"
+bash "$GUARD" --print --live-dir "$FIX/probe-kimi-solvent" --probe-fixture "$FIX/probe-kimi-solvent/probe.json" >"$OUT" 2>/dev/null
+[ "$(cat "$OUT")" = "moonshot/kimi-k3" ] && pass "--print with probe data emits the kimi candidate" || fail "--print probe emission got '$(cat "$OUT")'"
 
 echo ""
 echo "9b. --shipped-only selects the SHIPPED file, not the live one (D3)"
@@ -794,8 +808,12 @@ run_guard 0 "--probe skips a solvent build-equivalent candidate (A2)" \
 grep -q "build-equivalent (skipped)" "$OUT" && pass "--probe reports the build-equivalent skip" || { fail "no build-equivalent skip note"; tail -10 "$OUT"; }
 grep -q "RESOLVED=openrouter/anthropic/claude-opus-4.8" "$OUT" && pass "--probe resolves the independent candidate, not the same-build one" || { fail "expected RESOLVED=opus-4.8"; tail -10 "$OUT"; }
 # --print on the same fixture also skips the same-build candidate (two-step contract).
-bash "$GUARD" --print --live-dir "$FIX/probe-build-equivalent" --probe-fixture "$FIX/probe-build-equivalent/probe.json" >"$OUT" 2>&1
+bash "$GUARD" --print --live-dir "$FIX/probe-build-equivalent" --probe-fixture "$FIX/probe-build-equivalent/probe.json" >"$OUT" 2>/dev/null
 [ "$(cat "$OUT")" = "openrouter/anthropic/claude-opus-4.8" ] && pass "--print and --probe agree on the same-build skip" || fail "--print disagreed: '$(cat "$OUT")'"
+# #910 defect 1: the fixture path also carries the candidate notice (no --print
+# emission is ever readable as a resolution).
+bash "$GUARD" --print --live-dir "$FIX/probe-build-equivalent" --probe-fixture "$FIX/probe-build-equivalent/probe.json" >/dev/null 2>"$OUT.err"
+grep -q "CANDIDATE, not a resolution" "$OUT.err" && pass "#910: --print (fixture path) carries the candidate notice" || fail "#910: fixture-path candidate notice missing"
 # A5: --probe probes a matching $SECOND_MODEL override FIRST.
 bash "$GUARD" --probe --live-dir "$FIX/probe-order" --probe-fixture "$FIX/probe-order/probe.json" >"$OUT" 2>&1
 grep -q "RESOLVED=moonshot/kimi-k3" "$OUT" && pass "--probe without an override resolves the config order (kimi-k3)" || { fail "expected kimi-k3"; tail -10 "$OUT"; }
@@ -825,7 +843,7 @@ else
   fail "H4: --model fail-open on an independent id — exit $code / '$(head -1 "$OUT")'"
 fi
 
-# G2: --print is the documented offline authority — it must reject what
+# G2: --print is the documented offline HINT — it must reject what
 # --check/--equivalence reject, and never emit a reserved/placeholder id.
 run_guard 2 "--print on empty-equivalence is exit 2 (G2)" --print --live-dir "$FIX/empty-equivalence"
 run_guard 2 "--print on misconfigured-equivalence is exit 2 (G2)" --print --live-dir "$FIX/misconfigured-equivalence"
@@ -847,6 +865,9 @@ if [ "$code" -eq 2 ]; then pass "H2: --print override does not silence the missi
 # Positive control: a dispatchable override still prints verbatim (no over-block).
 SECOND_MODEL=moonshot/kimi-k3 bash "$GUARD" --print --live-dir "$FIX/clean" >"$OUT" 2>/dev/null; code=$?
 if [ "$code" -eq 0 ] && [ "$(cat "$OUT")" = "moonshot/kimi-k3" ]; then pass "H2: a dispatchable override still prints verbatim (exit 0)"; else fail "H2: valid override regressed (exit $code, '$(cat "$OUT")')"; fi
+# #910 defect 1: the dispatchable-override emission carries the candidate notice too.
+SECOND_MODEL=moonshot/kimi-k3 bash "$GUARD" --print --live-dir "$FIX/clean" >/dev/null 2>"$OUT.err"
+grep -q "CANDIDATE, not a resolution" "$OUT.err" && pass "#910: the override candidate carries the notice" || fail "#910: override candidate notice missing"
 PRBAD="$(mktemp -d /tmp/second-model-prbad.XXXXXX)"
 mk_pref_bad() { # <json-model-literal>
   # An EXTERNAL runtimeVia only WARNs, so the model-type/id guard is the only

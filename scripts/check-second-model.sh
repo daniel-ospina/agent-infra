@@ -16,12 +16,22 @@
 # never a code edit.
 #
 # Modes:
-#   --print                resolve the effective designation (offline) — writes
-#                          the provider/id to stdout. Honours `$SECOND_MODEL`.
-#                          Runs the SAME shared validate() as --check/--probe, so
-#                          it cannot hand out an id another mode rejects. Exit
-#                          0 = a usable id; 1 = no valid config candidate
-#                          (prints `**DEGRADED`); 2 = unusable authority
+#   --print                OFFLINE HINT (inspection only; never the dispatch
+#                          source) — writes the first build-independent
+#                          `preference` candidate (or a non-equivalent
+#                          `$SECOND_MODEL` override) to stdout. It opens no
+#                          socket, so it CANNOT verify solvency/reachability:
+#                          the value is a CANDIDATE, not a resolution, and every
+#                          success emission carries a loud stderr notice saying
+#                          so (#910 defect 1). `--probe` is the resolution +
+#                          dispatch authority. Runs the SAME shared validate()
+#                          as --check/--probe, so it cannot hand out an id
+#                          another mode rejects, and applies the SAME
+#                          build-equivalence filter to `$SECOND_MODEL` a
+#                          `preference` entry gets (#910 defect 2). Exit
+#                          0 = a well-formed candidate; 1 = no valid candidate
+#                          or a build-equivalent override (prints
+#                          `**DEGRADED`); 2 = unusable authority
 #                          (missing/unparseable config, non-string or reserved
 #                          model, empty equivalence set — G2), or a
 #                          `$SECOND_MODEL` override that is not a dispatchable
@@ -36,7 +46,9 @@
 #                          independent; otherwise BLOCK DEGRADED.
 #   --probe                network mode: vendor offer + solvency per candidate,
 #                          first solvent+reachable wins → `RESOLVED=<id>`;
-#                          none → `DEGRADED` (exit 1). Applies the SAME
+#                          none → `DEGRADED` (exit 1). THE resolution and the
+#                          dispatch authority (#910): dispatch this `RESOLVED`,
+#                          never `--print`'s candidate. Applies the SAME
 #                          build-equivalence filter as `--print`, and probes a
 #                          `$SECOND_MODEL` override first. NEVER run by
 #                          pre-commit.
@@ -84,20 +96,21 @@
 # Operator override: `$SECOND_MODEL` stays supported (AGENTS.md §284) —
 # config-default fail-closed, operator-override-open-by-design. ONE contract
 # (G6/G13, also stated in docs/providers.md §Second-model gate — keep them in
-# sync): `--print` is the OFFLINE authority and returns the override verbatim
-# (with a WARN) — but ONLY after the same load_authority()+validate() every
-# other mode runs, and ONLY when the override is a dispatchable model id. H2
-# closed the fail-open where the `if operator_override:` branch returned before
-# validation, so `--print` emitted `**DEGRADED` / `none` / `hello world` / a
-# build-equivalent id with exit 0 while `--check` exited 2 on the same config,
-# and the missing-config fatal did not apply at all.
-# dispatch its `RESOLVED`, which for the no-override case is the first
-# solvent+reachable candidate in the same ordered `preference` `--print` reads,
-# and WITH an override is the override itself (a matching preference entry is
-# probed first; an override that declares no probe endpoint, or that is not
-# solvent+reachable, is DEGRADED — the probe NEVER falls through to a config
-# default the operator pinned away from, which is exactly the G6 drop). An
-# override is WARNed and annotated, never blocked.
+# sync): `--probe` is the resolution AND the dispatch authority; dispatch its
+# `RESOLVED`, which for the no-override case is the first solvent+reachable
+# candidate in the ordered `preference`, and WITH an override is the override
+# itself (a matching preference entry is probed first; an override that
+# declares no probe endpoint, or that is not solvent+reachable, is DEGRADED —
+# the probe NEVER falls through to a config default the operator pinned away
+# from, which is exactly the G6 drop). An override is WARNed and annotated,
+# never blocked. `--print` is an OFFLINE HINT only: it cannot verify solvency,
+# it emits a CANDIDATE, not a resolution (#910 defect 1), and it applies the
+# SAME build-equivalence filter to the override a `preference` entry gets
+# (#910 defect 2) — a build-equivalent override is `**DEGRADED` (exit 1), never
+# printed with exit 0. H2 closed the fail-open where the `if operator_override:`
+# branch returned before validation, so `--print` emitted `**DEGRADED` /
+# `none` / `hello world` with exit 0 while `--check` exited 2 on the same
+# config, and the missing-config fatal did not apply at all.
 #
 # Dep-free of npm: bash + python3 stdlib only (urllib is imported lazily inside
 # the network helper so offline modes pay no import cost). python3 is the
@@ -198,6 +211,17 @@ allow_local_probe = allow_local_probe == "1"
 
 OK, WARN, BLOCK = "OK", "WARN", "BLOCK"
 lines = []
+
+# #910 defect 1: `--print` opens no socket, so it can never verify solvency —
+# the offline loop used to return the first non-equivalent `preference` entry
+# (an INSOLVENT `moonshot/kimi-k3` today) with exit 0 and EMPTY stderr,
+# indistinguishable from a resolution. Every `--print` success emission now
+# carries this notice on stderr, so the value can never be read as a resolution.
+PRINT_CANDIDATE_NOTICE = (
+    "⚠️  second-model gate: {model} is a --print CANDIDATE, not a resolution — "
+    "solvency is UNVERIFIABLE offline; --probe is the resolution + dispatch authority "
+    "(run it and dispatch its RESOLVED id)."
+)
 blocks = 0
 warns = 0
 fatals = 0
@@ -480,6 +504,14 @@ def is_equivalent(mid, eq):
         if safe_search(fam, n):
             return True
     return False
+
+
+def override_build_equivalent(ov, eq):
+    """#910 defect 2: the `$SECOND_MODEL` override is subject to the SAME
+    build-equivalence filter a `preference` entry is. True = the pinned id is
+    the primary's served build (or an unparseable/reserved token), so `--print`
+    must NOT hand it out with exit 0 — it is not an independent reviewer."""
+    return is_equivalent(ov, eq)
 
 
 def repo_root():
@@ -838,6 +870,19 @@ if mode == "selftest-policy":
     for tok in ("**DEGRADED", "degraded", "none", "null", "n/a", "unknown", ""):
         chk(is_equivalent(tok, eq), f"reserved/placeholder token {tok!r} reads build-equivalent (never independent)")
     chk(not is_equivalent("moonshot/kimi-k3", eq), "a real independent id still reads independent")
+    rchk_ov = [
+        ("deepseek/deepseek-v4-pro", True),
+        ("deepseek-flash", True),
+        ("moonshot/kimi-k3", False),
+        ("openrouter/anthropic/claude-opus-4.8", False),
+    ]
+    for ov, want in rchk_ov:
+        got = override_build_equivalent(ov, eq)
+        chk(got == want, f"$SECOND_MODEL override {ov!r} build-equivalent={want} (#910 defect 2)")
+    for phrase in ("CANDIDATE", "not a resolution", "UNVERIFIABLE offline",
+                   "--probe is the resolution + dispatch authority"):
+        chk(phrase in PRINT_CANDIDATE_NOTICE,
+            f"--print candidate notice names {phrase!r} (#910 defect 1)")
     for f in fails:
         print(f"❌ {f}", file=sys.stderr)
     print(f"SELFTEST-POLICY {'PASS' if not fails else 'FAIL'} ({len(fails)} failure(s))")
@@ -867,7 +912,7 @@ if mode == "equivalence":
     print(f"INDEPENDENT {norm_model(equiv_model)}")
     sys.exit(1)
 
-# ── print mode (offline resolver for the gate skills) ───────────────────────
+# ── print mode (offline HINT for the gate skills — never the dispatch source) ──
 if mode == "print":
     # H2: load and validate the authority BEFORE honouring an operator
     # override. The old code returned the override from the top of this block,
@@ -897,7 +942,7 @@ if mode == "print":
         print("**DEGRADED")
         sys.exit(1)
     # G2: run the SAME shared validator every other mode runs. Round 1 wired
-    # it into --equivalence but not --print, so the DOCUMENTED offline resolver
+    # it into --equivalence but not --print, so the DOCUMENTED offline hint
     # handed out a build-equivalent id with exit 0 (the exact #716 defect)
     # while --check/--equivalence exited 2 on the same config. Fatal
     # (unusable-authority) violations are exit 2; a build-equivalent BLOCK is
@@ -911,6 +956,9 @@ if mode == "print":
                 print(f"❌ {msg}", file=sys.stderr)
         print("**DEGRADED")
         sys.exit(2)
+    # #910: the override branch below filters on build-equivalence, so the set
+    # must be computed BEFORE it (validate() already fatals on an empty set).
+    eq = equivalence_set(cfg)
     if operator_override:
         # H2: a reserved/placeholder/malformed override is never a resolved
         # reviewer. The old branch printed it verbatim with exit 0.
@@ -918,7 +966,18 @@ if mode == "print":
             print(f"❌ second-model gate: $SECOND_MODEL={operator_override!r} is not a dispatchable model id — DEGRADED (fail closed; a reserved/placeholder/non-id override is never a resolved reviewer)", file=sys.stderr)
             print("**DEGRADED")
             sys.exit(2)
+        if override_build_equivalent(operator_override, eq):
+            # #910 defect 2: this branch ran is_model_id() but NOT
+            # is_equivalent(), so the documented AGENTS.md default
+            # (`deepseek/deepseek-v4-pro`) printed VERBATIM with exit 0 — the
+            # exact #716 false pass the config-default branch had already
+            # closed. Route it like a build-equivalent `preference` entry: never
+            # handed out, fail closed. `--probe` refuses the same id.
+            print(f"❌ second-model gate: $SECOND_MODEL={operator_override} is the SAME served build as the primary — DEGRADED (fail closed; a build-equivalent override is not an independent reviewer, and --print does not hand it out with exit 0 — #910)", file=sys.stderr)
+            print("**DEGRADED")
+            sys.exit(1)
         print(f"⚠️  second-model gate: $SECOND_MODEL={operator_override} operator override active — independence NOT asserted offline (config-default fail-closed, operator-override-open-by-design)", file=sys.stderr)
+        print(PRINT_CANDIDATE_NOTICE.format(model=operator_override), file=sys.stderr)
         print(operator_override)
         sys.exit(0)
     pref = [e for e in pref_raw if isinstance(e, dict)]
@@ -931,7 +990,6 @@ if mode == "print":
             print(f"❌ second-model gate: preference[{i}].model {model!r} is not a dispatchable model id — DEGRADED (fail closed)", file=sys.stderr)
             print("**DEGRADED")
             sys.exit(2)
-    eq = equivalence_set(cfg)
     if probe_fixture:
         fixture, err = load_fixture(probe_fixture)
         if err:
@@ -940,6 +998,7 @@ if mode == "print":
             sys.exit(2)
         model, notes = resolve(cfg, pref, fixture)
         if model:
+            print(PRINT_CANDIDATE_NOTICE.format(model=model), file=sys.stderr)
             print(model)
             sys.exit(0)
         print("⚠️  second-model gate: no solvent+reachable candidate — DEGRADED", file=sys.stderr)
@@ -950,6 +1009,7 @@ if mode == "print":
     for entry in pref:
         model = entry.get("model", "")
         if model and not is_equivalent(model, eq):
+            print(PRINT_CANDIDATE_NOTICE.format(model=model), file=sys.stderr)
             print(model)
             sys.exit(0)
     print("⚠️  second-model gate: no offline-valid candidate — DEGRADED", file=sys.stderr)
