@@ -75,132 +75,34 @@ model.
 - Clean exits whose output merely *mentions* the phrase (e.g. research content
   about connection errors) do **not** trigger a fallback (exit-code guarded)
 
-### Second-model gate (`$SECOND_MODEL` — issues #284, #716)
+### Second-model review — REMOVED (single-model review)
 
-The pipeline's "second-model" review gates (issue-scoping §5.6, code-review §6.6,
-plan-review §4.5, subagent-driven-development final reviewer) resolve their
-model with `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe` (network: vendor offer
-+ solvency; writes `RESOLVED=<provider/id>` for the first **solvent+reachable**
-candidate, or `DEGRADED`). `--print` (offline; honours `$SECOND_MODEL`, else the
-ordered `preference` list in `pi-bootstrap/pi-config/second-model.json`) is an
-**offline hint for inspection only** — never the dispatch source. There is no
-hardcoded default literal.
+The second-model subsystem has been **removed**: the `check-second-model.sh`
+designation guard and its `second-model.json` config, the `$SECOND_MODEL` /
+`SECOND_MODEL_GATE_*` environment surface, the final-gate step in the four gate
+skills (`code-review` §6.6, `plan-review` §4.5, `issue-scoping` §5.6,
+`subagent-driven-development`), and the PR-time check (f) in
+`scripts/check-pipeline-compliance.sh`. There is now **one model**: the session
+model, used at every review stage.
 
-`second-model.json` is the single source of truth: an ordered `preference`
-list, each candidate's `runtimeVia` dispatch authority, the primary's
-`buildEquivalence` set, the probe endpoints, and an integer-cents
-`costCentsPerPass`. Adding a funded model is a config edit, never a code edit.
+**This is a deliberate, recorded decision — not an accident.** The removed final
+gate was the pipeline's only *cross-model* review: a different, stronger reasoner
+that catches what the cheaper reviewers miss. Single-model review means a model's
+own blind spots are structurally invisible to it. The owner traded that quality
+control for cost and simplicity, for four recorded reasons:
 
-**Dispatch contract (ONE rule — G6/G13).** `--probe` is the **resolution, the
-liveness gate and the dispatch authority**: dispatch its `RESOLVED`. With no
-override, `--probe` walks the ordered `preference` and resolves the first
-**solvent+reachable** candidate. With `$SECOND_MODEL` set, `--probe`
-certifies **only** that id — a matching `preference` entry is probed, and an
-override that declares no probe endpoint or is not solvent+reachable is
-`DEGRADED`; the probe never falls through to a config default the operator
-pinned away from. `--print` is the **offline hint** (never opens a socket): it
-emits the first build-independent candidate in `preference` order, or the
-`$SECOND_MODEL` override — but only after the same
-`load_authority()`/`validate()` the other modes run, and only when the override
-is a **dispatchable model id** (a reserved/placeholder/malformed override is
-exit 2, never a resolved reviewer; H2 closed the fail-open where the override
-returned before validation) that is **not build-equivalent** (#910 defect 2: a
-build-equivalent override is `**DEGRADED`, exit 1 — routed exactly like a
-build-equivalent `preference` entry, never handed out with exit 0). Because
-`--print` cannot verify solvency, every candidate it emits carries a loud
-stderr notice naming it a *candidate, not a resolution* (#910 defect 1); it
-must never be the dispatch source. The guard header and the four gate skills
-state this same rule.
+1. It required a funded independent model, and none was ever funded (#742, #860).
+2. It did not enforce what it documented: the `[SECOND-MODEL-GATE]` marker was
+   unsigned raw text, so solvency was never verified and any PR-body sentence
+   could satisfy it (#977).
+3. It was the only thing blocking the **entire guarded surface** — every PR
+   touching `AGENTS.md`, the gate scripts, the workflows or the four skills was
+   unmergeable for reasons unrelated to its content.
+4. It could not repair itself: the fix touched a guarded file, so it failed its
+   own check.
 
-**DEGRADED is RECORDED, not enforced (#977).** When `--probe` exits non-zero
-(the probe prints plain `DEGRADED` and exits 1) — or, for a malformed/unusable
-authority, `--print` emits `**DEGRADED` — the gate does NOT dispatch a
-substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default)
-or any build-equivalent model would be a same-build "independent" review, the
-#716 defect. That prohibition stays, and is enforced **offline** by the
-designation guard
-(`bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --check --shipped-only`),
-which still runs in `.husky/pre-commit`, `ci.yml`, `ci-main.yml` and `sync.sh`.
-The governing trigger is the **`--probe` exit code**; the `--print` token is
-secondary and fires only where it can genuinely fire (a malformed/unusable
-authority — insolvency is undetectable offline). The PR-time DISPATCH check
-(check (f)) is **ARCHIVED** (#977) and no longer blocks a merge: it required a
-funded independent model that is not funded (#860), it was the only thing
-blocking the entire guarded surface, it could not repair itself, and its
-`[SECOND-MODEL-GATE]` marker is unsigned raw text that never verified
-independence. A DEGRADED window is therefore recorded honestly — as
-`independent=DEGRADED`, with `model=**DEGRADED` still reported as a reserved
-value — and surfaced as a non-blocking `⚠️` warning. Escalate to a human for
-the funding or override decision (#860), but the merge is not mechanically
-blocked.
-
-**Success path — record the marker.** When the probe resolves
-(`RESOLVED=<provider/id>`), record the success form on the same idempotent
-channel: `SECOND_MODEL_GATE_MODEL=<RESOLVED id>
-SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh`, which appends
-`[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>` to the PR body.
-`scripts/check-pipeline-compliance.sh` check (f) is now an **informational
-consumer only** (#977, ARCHIVED): on a diff touching the guarded surface it
-still DETECTS and prints `independent=NO` / `independent=DEGRADED` / a
-build-equivalent id / a reserved or non-id model (including the reserved
-placeholders `none`/`null`/`n/a`/`unknown`, not just `**DEGRADED`) /
-conflicting markers / a line not bound to the PR head, and a valid marker still
-prints its `pass f` line — but none of those findings blocks the merge any
-more. `$SECOND_MODEL` remains an
-operator override (config-default fail-closed,
-operator-override-open-by-design) and is annotated, never blocked; the probe
-certifies only the override id (see the dispatch contract above), so the
-operator's pin is never silently replaced by a config default.
-
-**Guard location.** The guard is `scripts/check-second-model.sh` in this repo.
-It is deliberately **not** copied into `~/.pi/agent/scripts/` (G12): the guard
-resolves its shipped config from its own PHYSICAL repo root, so a farm copy
-there would resolve `ROOT=$HOME/.pi` and fail `--check`/`--probe` with exit 2.
-Invoke it as `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh"` — the base
-template and the four gate skills use that one convention, so a consumer tree
-never depends on a bare repo-relative path. The script resolves its own repo
-root PHYSICALLY (`realpath`), so the consumer `scripts/` symlink cannot
-misresolve the shipped config (issue #716's E8).
-
-**Probe security.** The probe never forwards a credential dictated by an
-untrusted config: probe URLs must be `https://` (`file://` only under the
-test-only `--allow-file-probe`; a loopback host is permitted only under the
-test-only `--allow-local-probe`), the destination host must be an **exact**
-member of a fixed per-vendor allowlist (there is no derivable fallback —
-`model=lvh/…` cannot nominate `lvh.me`), the host is parsed with
-`urllib.parse.urlsplit` (the same parser urllib connects with, so a `#`/`?`
-suffix cannot make the policy inspect a different host than the request
-reaches), `authEnv` must name the candidate's **own** vendor's credential env
-var (a vendor cannot forward another vendor's key), and a redirect is followed
-only when it stays on the same `https` host **and port** (an `https`→`http`
-downgrade is refused). The `Authorization` header is therefore never re-sent to
-a host or scheme the config chose. Keys are never printed, logged or written.
-
-**Escape hatch / rollback (`SECOND_MODEL_GATE_OVERRIDE=1`).** Sets a loud
-notice and silences guard **BLOCKs** (exit 1); violations are still DETECTED
-and printed. It does **not** silence an unusable-authority fatal (exit 2) — an
-override cannot authorize a designation that does not exist. Sanctioned only
-for the documented bootstrap/rollback window (#716): the one-time install of
-the designation in a repo whose base lacks it, or rolling the config back after
-a bad candidate. It is not a general merge bypass — outside that window, fund a
-candidate or fix the config instead. It affects the **offline designation
-guard** only: the archived PR-time check (f) has no override and no merge
-effect (#977).
-
-**Bootstrap exemption.** Check (f) is a loud WARN until
-`pi-bootstrap/pi-config/second-model.json` POSITIVELY exists on the PR's base
-ref — a one-time carve-out keyed only on the file's absence on base (never a
-branch name, PR number, or commit range; never obtainable by a diff touching
-the file). An UNRESOLVABLE base ref (a shallow clone, or the CI workflow's
-base-fetch step removed) is reported as a non-blocking warning — a base that
-cannot be read cannot prove the file was ever absent, so the report says so
-rather than silently reading it as absent. (Before #977 this was a FAIL; it is
-now informational only.)
-
-**Why.** From 2026-09-14 12:00 Beijing, `deepseek-v4-pro` is served by the same
-V4.1 Flash build as the primary session, so a provider-qualified id check alone
-does not prove review independence. See #716 (funding state + evidence) and
-#734 (the dispatch-level surface, out of scope here).
+The venice cold-class seam (`COLD_CLASS_PROVIDER`, §8) is unrelated and
+untouched. See PR #980 for the full rationale.
 
 ## 3. Env var reference
 
@@ -505,7 +407,6 @@ window validates the burn economics. Per-dispatch measurement is
 Venice is registered flash-ONLY in `pi-bootstrap/pi-config/models.json`
 (`baseUrl https://api.venice.ai/api/v1`, `$VENICE_API_KEY`,
 cost 0.14/0.28 input/output + 0.03 cacheRead, contextWindow 300000). The
-**#284 carve-out**: `COLD_CLASS_PROVIDER` is an operator override SEPARATE
-from `$SECOND_MODEL` — second-model gates never route venice unless
-`$SECOND_MODEL` itself says so; cold-class applies only to the default-leg
-(flash) reviewer/eval dispatches an operator has explicitly opted in.
+**#284 carve-out**: `COLD_CLASS_PROVIDER` is an operator override that applies
+only to default-leg (flash) cache-cold reviewer/eval dispatches an operator has
+explicitly opted in.

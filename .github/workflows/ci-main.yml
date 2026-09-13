@@ -279,22 +279,6 @@ jobs:
       - name: Cost-config fixture suite (#341 scenarios 0-14; green same-merge)
         run: bash tests/cost-config/run.sh
 
-  second-model-guard:
-    # #716 — post-merge re-check of the second-model designation: the ordered
-    # `preference` in pi-bootstrap/pi-config/second-model.json must not be
-    # build-equivalent to the primary's served build and every candidate must
-    # declare its dispatch authority. Catches a merge that lands a
-    # build-equivalent designation (the #716 drift class) after PR review.
-    # Offline + the hermetic fixture suite; NO network probe here (the probe's
-    # DEGRADED outcome is an operator funding matter, see #716).
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Second-model guard (shipped, offline)
-        run: bash scripts/check-second-model.sh --check --shipped-only
-      - name: Second-model fixture suite (hermetic, zero network)
-        run: bash tests/second-model/run.sh
-
   sigpipe-grep-guard:
     # #841/#861 — post-merge re-check of the builtin-writer SIGPIPE
     # false-negative guard. `printf`/`echo` piped into a quiet `grep` under
@@ -343,7 +327,7 @@ jobs:
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, second-model-guard, pi-config-extensions-guard, sigpipe-grep-guard, python-ci]
+    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, python-ci]
     if: failure()
     steps:
       - uses: actions/github-script@v7

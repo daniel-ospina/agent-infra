@@ -16,10 +16,9 @@
 # It was deleted the moment its stated condition was met:
 #
 #   #860 ("no independent model is funded") was resolved on 2026-09-12 by funding the
-#   OpenRouter account. `check-second-model.sh --probe` now resolves
-#   openrouter/anthropic/claude-opus-4.8 as reachable + solvent, and that id is classified
-#   INDEPENDENT of the primary — so a PR touching the guarded surface (which includes this
-#   script) can record `independent=yes` and merge on its merits.
+#   OpenRouter account: the second-model gate's probe resolved a reachable + solvent
+#   candidate classified INDEPENDENT of the primary, so a PR touching the guarded surface
+#   (which includes this script) could record `independent=yes` and merge on its merits.
 #
 # The 4 sites were fixed with the same here-string transform applied to the other 51 in #841.
 # This deletion is the debt-cannot-outlive-its-cause property working as designed: the moment

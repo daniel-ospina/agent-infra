@@ -62,21 +62,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch PR base ref (#977 archived check (f) reads the base designation file)
-        # The ARCHIVED check (f) still reads
-        # pi-bootstrap/pi-config/second-model.json from the PR's BASE via
-        # `git show <base>:<path>` to report the base state (the bootstrap
-        # exemption). It no longer blocks a merge (#977), so this fetch is for
-        # report accuracy, not enforcement: without the base object the check
-        # reports an unresolvable base as a non-blocking warning. (No-op for
-        # workflow_call, where the base-sha context is empty.)
-        if: ${{ github.event.pull_request.base.sha != '' }}
-        run: git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
       - name: Run pipeline compliance gate
         env:
           GH_REPO: ${{ inputs.repo || github.repository }}
           PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number }}
-          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PIPELINE_COMPLIANCE_SKIP: ${{ inputs.skip && '1' || '0' }}
           GH_TOKEN: ${{ github.token }}
         run: |
