@@ -2339,19 +2339,48 @@ test("--update-lock on a symlinked locked file fails instead of printing an upda
 // value cannot be talked around: ANY change to what runs is RED, so an edit here
 // must be a deliberate edit to this constant.
 const EXPECTED_LOCK_BODY = [
-  "if ! MERGE_SHA=$(gh api \"repos/$REPO/pulls/$PR_NUMBER\" --jq '.merge_commit_sha // \"\"'); then",
-  "  echo \"❌ could not read PR #$PR_NUMBER from $REPO via the REST API.\"",
-  "  echo \"   That is an auth, scope or network failure — NOT a finding about your workflow\"",
-  "  echo \"   files. The step needs \\`pull-requests: read\\`. Re-run once the API is reachable.\"",
-  "  exit 1",
-  "fi",
+  "ATTEMPT=0",
+  "MERGE_SHA=\"\"",
+  "MERGEABLE=\"\"",
+  "STATE=\"\"",
+  "while [ \"$ATTEMPT\" -lt 3 ]; do",
+  "  ATTEMPT=$((ATTEMPT + 1))",
+  "  if ! MERGE_INFO=$(gh api \"repos/$REPO/pulls/$PR_NUMBER\" --jq '[.merge_commit_sha // \"\", (.mergeable | tostring), (.state // \"\")] | join(\" \")'); then",
+  "    echo \"❌ could not read PR #$PR_NUMBER from $REPO via the REST API.\"",
+  "    echo \"   That is an auth, scope or network failure — NOT a finding about your workflow\"",
+  "    echo \"   files. The step needs \\`pull-requests: read\\`. Re-run once the API is reachable.\"",
+  "    exit 1",
+  "  fi",
+  "  MERGE_SHA=${MERGE_INFO%% *}",
+  "  MERGE_REST=${MERGE_INFO#* }",
+  "  MERGEABLE=${MERGE_REST%% *}",
+  "  STATE=${MERGE_REST##* }",
+  "  if [ -n \"$MERGE_SHA\" ]; then break; fi",
+  "  if [ \"$STATE\" != \"open\" ]; then break; fi",
+  "  if [ \"$MERGEABLE\" = \"false\" ]; then break; fi",
+  "  if [ \"$ATTEMPT\" -lt 3 ]; then sleep $((ATTEMPT * 2)); fi",
+  "done",
   "if [ -z \"$MERGE_SHA\" ]; then",
-  "  echo \"❌ no merge commit exists for this PR, so there is no merge result to validate.\"",
-  "  echo \"   The REST API returned an empty merge_commit_sha, which normally means the\"",
-  "  echo \"   PR conflicts with its base branch — GitHub computes no merge commit until\"",
-  "  echo \"   the conflicts are resolved. This is NOT a finding about your workflow files:\"",
-  "  echo \"   the job simply cannot see what would land. Resolve the conflicts or update\"",
-  "  echo \"   your branch and it re-runs. PR head, for reference only: $HEAD_SHA\"",
+  "  if [ \"$STATE\" != \"open\" ]; then",
+  "    echo \"❌ this PR is not open (state: ${STATE:-unknown}), so there is no merge result to\"",
+  "    echo \"   validate. This is NOT a finding about your workflow files — there is simply\"",
+  "    echo \"   nothing here to check. PR head, for reference only: $HEAD_SHA\"",
+  "  elif [ \"$MERGEABLE\" = \"false\" ]; then",
+  "    echo \"❌ this PR CONFLICTS with its base branch, so no merge commit exists to validate.\"",
+  "    echo \"   GitHub finished computing mergeability and reported mergeable=false, so this\"",
+  "    echo \"   is a real conflict rather than a timing window. This is NOT a finding about\"",
+  "    echo \"   your workflow files: the job cannot see what would land until it is resolved.\"",
+  "    echo \"   PR head, for reference only: $HEAD_SHA\"",
+  "  else",
+  "    echo \"❌ no merge commit could be read for this PR after $ATTEMPT attempt(s), so there\"",
+  "    echo \"   is nothing to validate. This is NOT a finding about your workflow files.\"",
+  "    echo \"   merge_commit_sha was empty and mergeable reported '$MERGEABLE' rather than\"",
+  "    echo \"   false. That is USUALLY a timing condition — GitHub computes mergeability\"",
+  "    echo \"   asynchronously and a read can land before it finishes — but it can also be a\"",
+  "    echo \"   conflict GitHub has not resolved yet, so both are worth a look. Re-run this\"",
+  "    echo \"   job first; if it keeps failing this way, check the PR against its base.\"",
+  "    echo \"   PR head, for reference only: $HEAD_SHA\"",
+  "  fi",
   "  exit 1",
   "fi",
   "node scripts/check-pi-pin-lockstep.mjs --head-ref \"$MERGE_SHA\"",
@@ -2554,6 +2583,13 @@ const LOCKPOINT_SHA = "0123456789abcdef0123456789abcdef01234567";
  * with a stubbed `gh` (so nothing touches the network) and a stubbed `node` (so the
  * checker invocation is observable), and report what actually executed.
  */
+// What `gh api ... --jq '[.merge_commit_sha // "", (.mergeable | tostring), (.state // "")] | join(" ")'`
+// prints. Note the LEADING SPACE when there is no merge commit — faithful to the real
+// output, so the step's `${MERGE_INFO%% *}` / `${MERGE_REST%% *}` / `${MERGE_REST##* }`
+// split is exercised against the shape it will actually see rather than a convenient one.
+const ghResponse = (sha, mergeable, state = "open") =>
+  [sha ?? "", String(mergeable), String(state)].join(" ");
+
 function runWorkflowLockStep(body, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? LOCKPOINT_TIMEOUT_MS;
   const ghMode = opts.ghMode ?? "ok";
@@ -2562,17 +2598,28 @@ function runWorkflowLockStep(body, opts = {}) {
   try {
     const stubDir = path.join(dir, "stub");
     fs.mkdirSync(stubDir);
+    // A SEQUENCE, not a fixed mode (#857). A retry cannot be tested with a stub that
+    // answers the same way every time: "the read was empty and then populated" IS the
+    // regression, and it is observable only if the stub can change its answer between
+    // calls. `__FAIL__` is a call that exits non-zero (auth/scope/network).
+    const responses =
+      opts.ghResponses ??
+      Array.from({ length: 5 }, () =>
+        ghMode === "fail" ? "__FAIL__" : ghResponse(opts.sha ?? LOCKPOINT_SHA, "true")
+      );
+    fs.writeFileSync(path.join(dir, "gh-responses.txt"), `${responses.join("\n")}\n`);
     const gh = path.join(stubDir, "gh");
     fs.writeFileSync(
       gh,
       [
         "#!/bin/bash",
         `printf '%s\\n' "$*" >> "${dir}/gh-argv.txt"`,
-        `case "${ghMode}" in`,
-        "  fail) exit 1 ;;",
-        "  empty) exit 0 ;;",
-        `  *) printf '%s\\n' "${opts.sha ?? LOCKPOINT_SHA}"; exit 0 ;;`,
-        "esac",
+        `n=0; [ -f "${dir}/gh-count" ] && n=$(cat "${dir}/gh-count")`,
+        `n=$((n + 1)); printf '%s' "$n" > "${dir}/gh-count"`,
+        `line=$(sed -n "\${n}p" "${dir}/gh-responses.txt")`,
+        'if [ "$line" = "__FAIL__" ]; then exit 1; fi',
+        `printf '%s\\n' "$line"`,
+        "exit 0",
         "",
       ].join("\n")
     );
@@ -2590,6 +2637,17 @@ function runWorkflowLockStep(body, opts = {}) {
     fs.chmodSync(node, 0o755);
     const script = path.join(dir, "step.sh");
     fs.writeFileSync(script, body.endsWith("\n") ? body : `${body}\n`);
+    // `sleep` is STUBBED, so the backoff is asserted on the sleeps actually REQUESTED. A
+    // wall-clock bound cannot do this safely: measured idle/loaded runs of the unresolved case
+    // reached 8.0 s and 8.4 s against an 8 s bound, i.e. it would false-RED a correct suite —
+    // the very class of flake this PR exists to remove. The stub makes it deterministic (and
+    // removes ~6 s from the suite).
+    const sleep = path.join(stubDir, "sleep");
+    fs.writeFileSync(
+      sleep,
+      ["#!/bin/bash", `printf '%s\\n' "$*" >> "${dir}/sleep-args.txt"`, "exit 0", ""].join("\n")
+    );
+    fs.chmodSync(sleep, 0o755);
     const res = spawnSync(BASH_ABS, ["-e", script], {
       cwd: dir,
       encoding: "utf8",
@@ -2609,6 +2667,8 @@ function runWorkflowLockStep(body, opts = {}) {
       status: res.status,
       signal: res.signal ?? null,
       error: res.error ?? null,
+      // #857 — the sleeps the step ASKED FOR, in order. This is what pins the backoff.
+      sleeps: read(path.join(dir, "sleep-args.txt")).split("\n").filter(Boolean),
       output: `${res.stdout ?? ""}${res.stderr ?? ""}`,
       ghArgv: read(path.join(dir, "gh-argv.txt")),
       nodeArgv: read(path.join(dir, "node-argv.txt")),
@@ -2638,8 +2698,12 @@ test("workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — t
   const body = String(step.run);
   // The exact argv the stubbed `gh` must receive. `$*` re-joins with spaces, so the
   // shell's quoting is gone: this is the RESOLVED argv, which is what makes the
-  // behavioural scenarios and the text pins agree on the same single call.
-  const EXPECTED_GH_ARGV = `api repos/stub/stub/pulls/1 --jq .merge_commit_sha // ""`;
+  // behavioural scenarios and the text pins agree on the same call. #857 widened the
+  // jq to emit all THREE of merge_commit_sha, mergeable and state — still ONE request per
+  // attempt. `state` is what makes the closed-PR diagnosis possible without extra calls.
+  const EXPECTED_GH_ARGV =
+    `api repos/stub/stub/pulls/1 --jq [.merge_commit_sha // "", (.mergeable | tostring), (.state // "")] | join(" ")`;
+  const ghCalls = (r) => (r.ghArgv === "" ? [] : r.ghArgv.split("\n"));
   const spawn = (opts) => {
     const r = runWorkflowLockStep(body, opts);
     assert.equal(
@@ -2665,17 +2729,68 @@ test("workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — t
   // satisfies every text pin and never executes, so it cannot appear here — and a
   // real call resolving `.head["sha"]` (note: brackets, which the text-level
   // `head\.sha` regex does not match) resolves to a DIFFERENT argv and is RED here.
-  assert.equal(
-    ok.ghArgv,
-    EXPECTED_GH_ARGV,
-    `${rel}: must make exactly one pull-requests call, resolving merge_commit_sha — nothing ` +
-      "about the text of the step proves the call that actually runs is the pinned one"
+  assert.deepEqual(
+    ghCalls(ok),
+    [EXPECTED_GH_ARGV],
+    `${rel}: must make exactly one pull-requests call when the first read already carries the ` +
+      "merge commit — nothing about the text of the step proves the call that runs is the pinned one"
   );
   assert.equal(
     ok.nodeArgv,
     `scripts/check-pi-pin-lockstep.mjs --head-ref ${LOCKPOINT_SHA}`,
     `${rel}: must invoke the checker with the RESOLVED merge commit, exactly — nothing about ` +
       "the TEXT of the step proves it runs"
+  );
+
+  // S1b — THE #857 REGRESSION, EXECUTED. This is the whole point of the retry: a read
+  // that lands inside the mergeability window (empty, mergeable not yet false) must not
+  // red a mergeable PR. Without the retry the first read is the only read, the step
+  // exits 1, and the author is told their workflow files have a problem they do not.
+  const retried = spawn({
+    nodeStatus: 0,
+    ghResponses: [ghResponse("", "null"), ghResponse(LOCKPOINT_SHA, "true")],
+  });
+  assert.equal(
+    retried.status,
+    0,
+    `${rel}: an empty FIRST read followed by a populated second one must SUCCEED — that is the ` +
+      `#857 flake, which was a false RED on a mergeable PR; got status ${retried.status}.\n` +
+      tail(retried.output)
+  );
+  assert.deepEqual(
+    ghCalls(retried),
+    [EXPECTED_GH_ARGV, EXPECTED_GH_ARGV],
+    `${rel}: the retry must re-read the API, with the pinned argv, exactly once more`
+  );
+  assert.equal(
+    retried.nodeArgv,
+    `scripts/check-pi-pin-lockstep.mjs --head-ref ${LOCKPOINT_SHA}`,
+    `${rel}: the RETRIED read must still reach the checker with the merged commit`
+  );
+  // A populated read is accepted even while `mergeable` is still null. The guard is the
+  // ABSENCE of a merge commit, never the presence of a flag: gating on `mergeable` would
+  // make this advisory leg depend on a field GitHub may not have computed yet.
+  const shaWithNullMergeable = spawn({
+    nodeStatus: 0,
+    ghResponses: [ghResponse("", "null"), ghResponse(LOCKPOINT_SHA, "null")],
+  });
+  assert.equal(
+    shaWithNullMergeable.status,
+    0,
+    `${rel}: mergeable is a DIAGNOSIS, not a gate — a real merge commit must be validated even ` +
+      "when mergeable has not been computed"
+  );
+  // ...and the same for `mergeable: false`. DEFENSIVE, and stated as such: no PR has been
+  // OBSERVED with both a merge commit and mergeable=false (every conflicting PR checked — 852,
+  // 767, 636 — is `mergeable=false, mergeable_state=dirty, merge_commit_sha=null`). But if one
+  // ever does appear, the sha is the thing this leg exists to validate, so a flag must not veto
+  // it. This pins that, and it does not claim the combination is expected.
+  const shaWithFalseMergeable = spawn({ nodeStatus: 0, ghResponses: [ghResponse(LOCKPOINT_SHA, "false")] });
+  assert.equal(
+    shaWithFalseMergeable.status,
+    0,
+    `${rel}: a POPULATED merge commit must be validated even when mergeable=false — the ` +
+      "presence of a merge commit, not a flag, is what this leg needs"
   );
 
   // S2 — a failing checker must fail the step. `set +e`, a trailing `exit 0`,
@@ -2688,23 +2803,124 @@ test("workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — t
     `${rel}: a FAILING checker must fail the step — that is the entire gate.\n${tail(failed.output)}`
   );
 
-  // S3 — no merge commit: the guard fires with its own message and the checker is
-  // NOT invoked. This is also what pins the invocation AFTER the guard.
-  const empty = spawn({ ghMode: "empty" });
-  assert.notEqual(empty.status, 0, `${rel}: an empty merge_commit_sha must fail closed`);
+  // S3 — no merge commit AND mergeability never computed: after exhausting its attempts
+  // the guard reports a TIMING condition and the checker is NOT invoked. This is also
+  // what pins the invocation AFTER the guard.
+  const stuck = spawn({
+    ghResponses: Array.from({ length: 5 }, () => ghResponse("", "null")),
+  });
+  assert.notEqual(stuck.status, 0, `${rel}: an empty merge_commit_sha must fail closed`);
   assert.equal(
-    empty.nodeArgv,
+    stuck.nodeArgv,
     "",
     `${rel}: the checker must not run when there is no merge commit to validate`
   );
   assert.equal(
-    empty.ghArgv,
-    EXPECTED_GH_ARGV,
-    `${rel}: the empty case must still make the resolution call, and only that call`
+    ghCalls(stuck).length,
+    3,
+    `${rel}: the unresolved case must exhaust exactly 3 attempts — not 1 (no retry) and not more`
+  );
+  // THE BACKOFF IS ASSERTED EXACTLY, not bounded. Without it the retry is three back-to-back
+  // reads, which cannot help a computation that needs TIME — and that mutation was GREEN before
+  // this assertion existed. `['2','4']` pins the floor AND the ceiling: no sleep is wrong, and a
+  // sleep after the final attempt (12 s instead of 6 s) is wrong too.
+  assert.deepEqual(
+    stuck.sleeps,
+    ["2", "4"],
+    `${rel}: the retry must wait 2 s then 4 s, and must NOT sleep after the LAST attempt — ` +
+      `got ${JSON.stringify(stuck.sleeps)}`
+  );
+  // THE COUNT IN THE MESSAGE IS ASSERTED TOO. The number is the one fact in the diagnosis a
+  // reader uses to judge how hard the leg tried, and a stray off-by-one there was GREEN before
+  // this assertion existed.
+  assert.match(
+    stuck.output,
+    /after 3 attempt\(s\)/,
+    `${rel}: the diagnosis must report the number of attempts ACTUALLY made (3)`
   );
   assert.ok(
-    empty.output.trim() !== "",
-    `${rel}: the empty case must say WHY it failed — a silent non-zero exit is not a diagnosis`
+    ghCalls(stuck).every((a) => a === EXPECTED_GH_ARGV),
+    `${rel}: every attempt must be the pinned resolution call`
+  );
+  assert.ok(
+    !/CONFLICTS/.test(stuck.output),
+    `${rel}: ... and must NOT assert a conflict GitHub never reported`
+  );
+
+  // S3c — a CLOSED PR. `edited` is in the trigger set, so editing a closed PR's body runs this
+  // leg; mergeability stays null forever for it, so the guard must stop after ONE call and say
+  // there is nothing to validate rather than report a conflict or a timing window.
+  const notOpen = spawn({ ghResponses: [ghResponse("", "null", "closed")] });
+  assert.notEqual(notOpen.status, 0, `${rel}: a non-open PR must fail closed`);
+  assert.equal(notOpen.nodeArgv, "", `${rel}: the checker must not run for a non-open PR`);
+  assert.equal(
+    ghCalls(notOpen).length,
+    1,
+    `${rel}: a non-open PR cannot become mergeable by waiting — one attempt, no retry`
+  );
+  assert.ok(!/CONFLICTS/.test(notOpen.output), `${rel}: a closed PR is not a conflict`);
+  assert.notEqual(
+    notOpen.output,
+    stuck.output,
+    `${rel}: "not open" and "no merge commit yet" must not be interchangeable`
+  );
+
+  // S3d — the OBSERVED closed shape WITH mergeable=false (PR 680). STATE MUST WIN: the state
+  // check precedes the mergeable check, so this must NOT be reported as a conflict. Telling an
+  // author to resolve conflicts on a PR that is already closed is precisely the wrong diagnosis.
+  // Pinned because the message-side precedence was otherwise unasserted: swapping the message
+  // branch condition to the sha check stayed GREEN and produced CONFLICTS for this input.
+  const closedConflicted = spawn({ ghResponses: [ghResponse("", "false", "closed")] });
+  assert.notEqual(closedConflicted.status, 0, `${rel}: a closed PR must fail closed`);
+  assert.equal(
+    ghCalls(closedConflicted).length,
+    1,
+    `${rel}: a closed PR cannot become mergeable by waiting — one attempt`
+  );
+  assert.ok(
+    !/CONFLICTS/.test(closedConflicted.output),
+    `${rel}: a CLOSED PR must not be reported as a conflict even when mergeable=false — the ` +
+      "state check precedes the mergeable check"
+  );
+  assert.match(
+    closedConflicted.output,
+    /not open/,
+    `${rel}: the closed-PR diagnosis must say the PR is not open`
+  );
+  // (`closedConflicted` vs `conflicted` and `notOpen` vs `conflicted` are asserted after S3b,
+  // where `conflicted` exists — they were placed here first and hit a TDZ error.)
+
+  // S3b — mergeable === false: GitHub HAS finished and concluded the trees cannot
+  // merge. Reported on the FIRST call with the conflict message and NOT retried — an
+  // extra attempt cannot change a decided conflict, it only delays the diagnosis.
+  const conflicted = spawn({ ghResponses: [ghResponse("", "false")] });
+  assert.notEqual(conflicted.status, 0, `${rel}: a real conflict must fail closed`);
+  assert.equal(conflicted.nodeArgv, "", `${rel}: the checker must not run on a real conflict`);
+  assert.equal(
+    ghCalls(conflicted).length,
+    1,
+    `${rel}: a DECIDED conflict must be reported on the first call — retrying cannot help`
+  );
+  assert.match(conflicted.output, /CONFLICTS/, `${rel}: a decided conflict must be named as one`);
+  assert.notEqual(
+    conflicted.output,
+    stuck.output,
+    `${rel}: "conflicts" and "still computing" must not be interchangeable — reporting a timing ` +
+      "window as a conflict is the bug this test exists for"
+  );
+  // The TWO remaining pairs of the four canonical outputs, asserted here because `conflicted`
+  // does not exist earlier in the test. A previous revision claimed "all six pairs" while
+  // `notOpen` vs `conflicted` had no assertion at all.
+  assert.notEqual(
+    notOpen.output,
+    conflicted.output,
+    `${rel}: "this PR is not open" and "CONFLICTS with its base" must not be interchangeable — ` +
+      "telling an author to resolve conflicts on a closed PR is the wrong diagnosis"
+  );
+  assert.notEqual(
+    closedConflicted.output,
+    conflicted.output,
+    `${rel}: a CLOSED PR with mergeable=false and an OPEN conflict must not be interchangeable`
   );
 
   // S4 — an API failure MUST be distinguishable from an empty merge commit. Asserted
@@ -2714,16 +2930,46 @@ test("workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — t
   const apiFail = spawn({ ghMode: "fail" });
   assert.notEqual(apiFail.status, 0, `${rel}: a failed API call must fail closed`);
   assert.equal(apiFail.nodeArgv, "", `${rel}: the checker must not run when the API call failed`);
-  assert.equal(
-    apiFail.ghArgv,
-    EXPECTED_GH_ARGV,
-    `${rel}: a failed API call must still be the pinned resolution call`
+  assert.deepEqual(
+    ghCalls(apiFail),
+    [EXPECTED_GH_ARGV],
+    `${rel}: a failed API call must still be the pinned resolution call, and must NOT be retried ` +
+      "as though the PR were the problem"
   );
   assert.notEqual(
     apiFail.output,
-    empty.output,
-    `${rel}: an API failure and an empty merge_commit_sha must produce DIFFERENT messages — if ` +
-      "they are interchangeable, a 403/network failure is being reported as a PR conflict"
+    stuck.output,
+    `${rel}: an API failure and a still-uncomputed mergeability must produce DIFFERENT messages — ` +
+      "if they are interchangeable, a 403/network failure is reported as a timing window"
+  );
+  assert.notEqual(
+    apiFail.output,
+    conflicted.output,
+    `${rel}: an API failure must not be reported as a PR conflict either`
+  );
+
+  // Every failure path must DIAGNOSE, and the four canonical messages must be distinguishable —
+  // FOUR cases is SIX pairs, and an unasserted pair is a swap that stays GREEN. All six are now
+  // asserted explicitly: stuck/notOpen, stuck/conflicted, stuck/apiFail, notOpen/apiFail,
+  // conflicted/apiFail, and notOpen/conflicted. The loop below asserts only that each path SAYS
+  // something — a previous revision described it as covering "the rest of the pairs", which it
+  // never did.
+  for (const [label, r] of [
+    ["the unresolved case", stuck],
+    ["a closed PR", notOpen],
+    ["a decided conflict", conflicted],
+    ["an API failure", apiFail],
+  ]) {
+    assert.ok(
+      r.output.trim() !== "",
+      `${rel}: ${label} must say WHY it failed — a silent non-zero exit is not a diagnosis`
+    );
+  }
+  assert.notEqual(
+    notOpen.output,
+    apiFail.output,
+    `${rel}: "this PR is not open" and "the API call failed" must not be interchangeable — a ` +
+      "403 would otherwise read as a closed PR"
   );
 });
 
