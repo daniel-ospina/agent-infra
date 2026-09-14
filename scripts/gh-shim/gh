@@ -41,8 +41,18 @@
 #     certifying lines by hand satisfies this gate. That is why the post-merge
 #     detector, not this gate, is the authority of record; this gate raises the
 #     cost of an unevidenced merge, it does not prove one was earned.
-#   - `gh api graphql -f query=@file`. The mutation text is read from a FILE, so no
-#     argv token carries `mergePullRequest`.
+#   - `gh api graphql -f query=@file` / `--input <file>` / `-F query=@-`. The mutation
+#     text is read from a FILE or STDIN, so no argv token carries `mergePullRequest`.
+#     A file- or stdin-supplied query is therefore refused outright whenever the call is
+#     `gh api graphql`.
+#   - AGENT_GH_REAL and AGENT_ADMIN_MERGE_OVERRIDE ARE CALLER-CONTROLLED. Both are the
+#     "caller deliberately removes the guard" class — the same class as `env -i`, a
+#     `PATH=` reset, or invoking the real gh by absolute path. They exist because a
+#     nested call (the verifier shelling out to gh) must not re-enter this shim. What
+#     this layer defends against is a caller removing the guard WITHOUT MEANING TO — by
+#     splicing a token, or without knowing the guard is there. It is not, and cannot be,
+#     a defence against the caller deciding to remove it; the post-merge detector is what
+#     makes THAT visible after the fact, and AGENT_ADMIN_MERGE_OVERRIDE announces itself.
 #
 # Env:
 #   AGENT_ADMIN_MERGE_OVERRIDE=1   the existing audited hatch: allow, loudly
@@ -75,7 +85,15 @@ find_real_gh() {
   IFS=:
   for d in $PATH; do
     case "$d" in "$SELF_DIR"|"") continue ;; esac
-    [ -x "$d/gh" ] && { printf '%s' "$d/gh"; IFS="$old_ifs"; return 0; }
+    [ -x "$d/gh" ] || continue
+    # SKIP ANY DIRECTORY WHOSE `gh` IS THIS SCRIPT. Skipping only $SELF_DIR is not
+    # enough: the harness prepends a NEUTRAL directory holding a SYMLINK back to this
+    # script, so `-x "$d/gh"` was true for the shim itself, `REAL` became the shim, and
+    # `exec "$REAL"` re-entered forever — EVERY gh call hung (VGATE cycle 3). `-ef`
+    # compares device+inode THROUGH symlinks, so it catches a link, a link chain and a
+    # hardlink alike.
+    [ "$d/gh" -ef "$SELF_DIR/$(basename "$self")" ] && continue
+    printf '%s' "$d/gh"; IFS="$old_ifs"; return 0
   done
   IFS="$old_ifs"
   return 1
@@ -119,6 +137,9 @@ for tok in "$@"; do
     -b?*|-F?*|-t?*|-A?*) continue ;;
     # A bare `--` is an argument separator, never the positional.
     --) continue ;;
+    # An ATTACHED value of a global flag. `--hostname=github.com` was refused as an
+    # unrecognized flag (over-block, VGATE cycle 3).
+    --hostname=*) continue ;;
   esac
   case "$tok" in
     -R|--repo|--hostname) expect_value=1; prev_flag="$tok"; continue ;;
@@ -151,6 +172,10 @@ done
 # endpoint), so strip those before matching — matching the bare token missed it in
 # BOTH layers (VGATE).
 if [ "$CMD" = "api" ]; then
+  api_graphql=0
+  for tok in "$@"; do
+    [ "$tok" = "graphql" ] && api_graphql=1
+  done
   for tok in "$@"; do
     api_path="${tok%%\?*}"
     api_path="${api_path%%#*}"
@@ -163,8 +188,16 @@ if [ "$CMD" = "api" ]; then
     # GraphQL. `mergePullRequest` IS the mutation `gh pr merge --admin` itself issues
     # (gh sends no admin field in its REST payload; it is the server-side mutation that
     # performs the bypass), so calling it directly is ADMIN-EQUIVALENT and needs no
-    # obfuscation at all (VGATE).
+    # obfuscation at all (VGATE cycle 2).
     case "$tok" in *mergePullRequest*) IS_ADMIN=1 ;; esac
+    # …and when the query itself comes from a FILE or STDIN there is nothing to read, so
+    # refuse rather than assume benign (VGATE cycle 3). Gated on `graphql`, so an
+    # ordinary REST call that happens to carry an `@` is unaffected.
+    if [ "$api_graphql" -eq 1 ]; then
+      case "$tok" in
+        *@*|--input|--input=*) IS_ADMIN=1 ;;
+      esac
+    fi
   done
 fi
 

@@ -288,6 +288,55 @@ for evil in '0,5' '0x' '0/9'; do
     || pass "\`unique to this PR: $evil\` does NOT certify"
 done
 
+# ── 10. the shapes VGATE cycle 3 found open (fail-open / hang, fixed) ──────
+echo "== 10. self-recursion, file-supplied GraphQL, and attached --hostname ="
+
+# (a) THE PRODUCTION PATH. The harness prepends a NEUTRAL directory holding a SYMLINK
+# back to this shim. Skipping only $SELF_DIR meant `-x "$d/gh"` matched the SHIM ITSELF,
+# so `REAL` became the shim and `exec "$REAL"` re-entered forever: EVERY gh call hung.
+# Exit status alone cannot show this — a hang is not a status — so bound it in time.
+mkdir -p "$TMP/neutral" "$TMP/bin"
+ln -sf "$SHIM" "$TMP/neutral/gh"
+printf '#!/usr/bin/env bash\nprintf "REALGH-CALLED %%s\\n" "$*"\n' > "$TMP/bin/gh"
+chmod +x "$TMP/bin/gh"
+out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+  bash "$TMP/neutral/gh" pr view 1 2>&1 & 
+  p=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG'; fi )"
+case "$out" in
+  *HUNG*) fail "through the neutral symlink it re-exec'd ITSELF — every gh call would hang" ;;
+  "")     fail "through the neutral symlink nothing ran" ;;
+  *)      pass "the neutral-symlink path terminates (it does not re-exec itself)" ;;
+esac
+case "$out" in
+  *REALGH-CALLED*) pass "  …and it really reached the real gh, not a fallback" ;;
+  *HUNG*) ;;  # already reported
+  *) fail "  …but the real gh never ran: $out" ;;
+esac
+
+# (b) A query supplied from a FILE or STDIN cannot be inspected at all — no argv token
+# carries `mergePullRequest`. Refuse rather than assume benign.
+for shape in '-F query=@/tmp/q.graphql' '-f query=@/tmp/q.graphql' '--input /tmp/body.json' '-F query=@-'; do
+  new_scen "gqlfile${shape//[^a-z0-9]/}"
+  bash "$SHIM" api graphql $shape >/dev/null 2>"$TMP/err"; rc=$?
+  [ "$rc" -ne 0 ] && pass "\`gh api graphql $shape\` → REFUSED (exit $rc)" \
+    || fail "\`$shape\` was ALLOWED — an uninspectable GraphQL query"
+done
+
+# (c) …while an ordinary REST call that happens to carry an `@` is NOT affected.
+new_scen restat
+bash "$SHIM" api user -f 'note=me@example.com' >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && pass "a non-graphql \`gh api\` with an \`@\` is passed through (no over-block)" \
+  || fail "a non-graphql \`gh api\` was refused"
+
+# (d) The attached form of a global value flag must not read as an unrecognized flag.
+new_scen hostnameeq
+jq -n --rawfile b "$TMP/body-good" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin --hostname=github.com >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && pass "\`--hostname=github.com\` with evidence → allowed (no over-block)" \
+  || fail "\`--hostname=…\` was over-blocked: $(head -1 "$TMP/err")"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"
   exit 1
