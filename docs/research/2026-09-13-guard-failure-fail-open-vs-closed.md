@@ -80,9 +80,9 @@ A commit is **reversible** and is re-checked at push/PR/merge, so the local hook
 
 ### Relevance to #917
 
-This bears directly on decision **D1**, which spans #920 (verification-gate fail-open paths) and #926 (main-worktree-guard inversion). The repo's live evidence: blocking has caused total stoppage twice (#879 closed, #882 open); silent self-disablement has occurred at least five times (#853, #789, #744, #761, #708); and the built-in override has been used **7,737 times** with no correctness record.
+This bears directly on decision **D1**, which spans #920 (verification-gate fail-open paths) and #926 (main-worktree-guard inversion). The repo's live evidence: blocking has caused total stoppage twice (#879 closed, #882 open); silent self-disablement has occurred at least five times (#853, #789, #744, #761, #708); and the built-in override has been used **7,738 times** with no correctness record (`~/.pi/agent/audit/gate-events.jsonl`, `gate_bypass` events, re-measured 2026-09-14 at `01d0684`; 7,737 when this brief was written — the file is append-only, so this figure must be re-measured, not cited).
 
-Per rule 3 above, the 7,737 unrecorded bypasses are the sharpest gap — a bypass that is not recorded as a state distinct from "passed" is indistinguishable from a clean run.
+Per rule 3 above, the 7,738 unrecorded bypasses are the sharpest gap — a bypass that is not recorded as a state distinct from "passed" is indistinguishable from a clean run.
 
 ## Review-loop disclosure (honest status)
 
