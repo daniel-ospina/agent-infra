@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -2543,6 +2543,104 @@ try {
     // check-ignore must classify read-only (hub-worktree.sh's .worktrees warn).
     const ci = isHubRecoveryInvocation("check-ignore", ["-q", ".worktrees"], "main");
     expectBool("#444 check-ignore → readonly (hub-worktree.sh surface)", ci === "readonly", true);
+  }
+}
+
+// ── #967/#1484: gate the EFFECT, not the text ───────────────────────────────
+// The #1484 script surface gated the whole script TEXT, so a git-FREE script
+// could be frozen by a markdown/docstring backtick, and a discard-shaped op
+// reachable from only ONE subcommand blocked EVERY invocation. The second-model
+// resolution authority (`scripts/check-second-model.sh --probe`, git-free) was
+// unrunnable from every path → the second-model gate was permanently DEGRADED
+// → every guarded-surface PR was unmergeable fleet-wide. These cases pin the
+// fix: read-only/text-only content is allowed, real discards stay blocked, and
+// subcommand reachability is argv-driven.
+{
+  const BT = String.fromCharCode(96);
+  let t967 = null;
+  try {
+    t967 = execSync("mktemp -d", { encoding: "utf-8" }).trim();
+    const mk967 = (name, content) => {
+      const p = `${t967}/${name}`;
+      writeFileSync(p, content);
+      return p;
+    };
+    // (a) A QUOTED heredoc is literal text to the outer shell — the exact #967
+    // trigger: a Python docstring code span `` `/` `` misread as `$(/)`.
+    const docstring = mk967("docstring.sh", "python3 - \"$1\" \\\n  <<'PYEOF'\n# docs: a trailing " + BT + "/" + BT + " normalizes to empty\nPYEOF\n");
+    expectBool("#967: quoted python heredoc + docstring backtick → allow (no git effect)", scriptGitVerdict(docstring, "main", MAIN, MAIN, ["--probe"]) === "allow", true);
+    // A path-shaped span that names no real file executes nothing.
+    const prosePath = mk967("prose-path.sh", "echo \"see the " + BT + "/usr/local/bin/nope-" + process.pid + BT + " path\"\n");
+    expectBool("#967: prose path-span (nonexistent file) → allow", scriptGitVerdict(prosePath, "main", MAIN, MAIN) === "allow", true);
+    // (b) Every discard closure this gate exists for stays blocked.
+    const plainDiscard = mk967("plain-discard.sh", "#!/bin/bash\ngit reset --hard\n");
+    expectBool("#967: plain discard → block (unchanged)", scriptGitVerdict(plainDiscard, "main", MAIN, MAIN) === "block", true);
+    const interpSubst = mk967("interp-subst.sh", "echo \"$(bash /tmp/m4-evil.sh)\"\n");
+    expectBool("#967: interpreter-in-substitution → block (T87 intact)", scriptGitVerdict(interpSubst, "main", MAIN, MAIN) === "block", true);
+    const pipedHeredoc = mk967("piped-heredoc.sh", "cat <<'EOF' | sh\ngit reset --hard\nEOF\n");
+    expectBool("#967: piped quoted heredoc + discard → block (T104 intact)", scriptGitVerdict(pipedHeredoc, "main", MAIN, MAIN) === "block", true);
+    const unquotedHeredoc = mk967("unquoted-heredoc.sh", "cat <<EOF\n$(git reset --hard)\nEOF\n");
+    expectBool("#967: unquoted heredoc IS expanded → block", scriptGitVerdict(unquotedHeredoc, "main", MAIN, MAIN) === "block", true);
+    // (c) The documented dodge — write /tmp/x.sh + `bash /tmp/x.sh` — stays
+    // closed: extractScriptPath resolves the file and the content gate blocks,
+    // for an arg-taking invocation too.
+    expectBool("#967: /tmp dodge resolves + blocks (arg-taking)",
+      extractScriptPath(`bash ${plainDiscard} --status`) === plainDiscard &&
+      scriptGitVerdict(plainDiscard, "main", MAIN, MAIN, ["--status"]) === "block", true);
+
+    // Reachability: a top-level `case "$1"` dispatch gates only the branches
+    // THIS invocation can enter.
+    const dispatch = mk967("dispatch.sh", "#!/bin/bash\ncase \"$1\" in\n  --reset) git reset --hard ;;\n  --status) git status ;;\n  *) echo usage ;;\nesac\n");
+    expectBool("#967: dispatch --status → allow (discard branch unreachable)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, ["--status"]) === "allow", true);
+    expectBool("#967: dispatch --reset → block (discard reachable)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, ["--reset"]) === "block", true);
+    expectBool("#967: dispatch no args → allow (only the `*` branch runs)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, []) === "allow", true);
+    expectBool("#967: dispatch args-unknown → block (fail closed)", scriptGitVerdict(dispatch, "main", MAIN, MAIN) === "block", true);
+    const dispatchGlob = mk967("dispatch-glob.sh", "case \"$1\" in\n  --res*|--hard) git reset --hard ;;\n  --st*) git status ;;\nesac\n");
+    expectBool("#967: glob --st* → allow", scriptGitVerdict(dispatchGlob, "main", MAIN, MAIN, ["--status"]) === "allow", true);
+    expectBool("#967: glob --res* → block", scriptGitVerdict(dispatchGlob, "main", MAIN, MAIN, ["--reset"]) === "block", true);
+    // Fail-closed bail-outs: a `case "$1"` that is NOT the script's dispatch
+    // must never be pruned by the invocation's argv.
+    const fnCase = mk967("fn-case.sh", "f() {\n  case \"$1\" in\n    --reset) git reset --hard ;;\n  esac\n}\nf --reset\n");
+    expectBool("#967: function-local case $1 → NOT pruned (block)", scriptGitVerdict(fnCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const shiftCase = mk967("shift-case.sh", "shift\ncase \"$1\" in\n  --reset) git reset --hard ;;\n  --st*) git status ;;\nesac\n");
+    expectBool("#967: `shift` rewrites positionals → NOT pruned (block)", scriptGitVerdict(shiftCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const varCase = mk967("var-case.sh", "MODE=\"$1\"\ncase \"$MODE\" in\n  --reset) git reset --hard ;;\n  --status) git status ;;\nesac\n");
+    expectBool("#967: non-$1 case word → NOT pruned (block)", scriptGitVerdict(varCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    // Structural bail-outs — malformed/ambiguous cases are never pruned.
+    const nestedCase = mk967("nested-case.sh", "case \"$1\" in\n  --reset)\n    case \"$2\" in\n      x) git reset --hard ;;\n    esac\n    ;;\n  --status) git status ;;\nesac\n");
+    expectBool("#967: multi-line nested case → NOT pruned (block)", scriptGitVerdict(nestedCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const fallthrough = mk967("fallthrough.sh", "case \"$1\" in\n  --status) git status ;;&\n  --reset) git reset --hard ;;\nesac\n");
+    expectBool("#967: `;;&` fallthrough → NOT pruned (block)", scriptGitVerdict(fallthrough, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const unterminated = mk967("unterminated.sh", "case \"$1\" in\n  --reset) git reset --hard ;;\n");
+    expectBool("#967: unterminated case → NOT pruned (block)", scriptGitVerdict(unterminated, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    expectBool("#967: extractScriptArgs reads the script argv", JSON.stringify(extractScriptArgs("bash x.sh --status a b", "x.sh")) === JSON.stringify(["--status", "a", "b"]), true);
+
+    // (a) end-to-end: the ACTUAL second-model resolution authority must no
+    // longer be classified git-bearing, and the #1484 gate's decision for the
+    // live command line (extractScriptPath → scriptGitVerdict with argv) must
+    // allow it from the hub.
+    const probeCandidates = [
+      fileURLToPath(new URL("../../scripts/check-second-model.sh", import.meta.url)),
+      resolve(PROJECT_CWD, "scripts/check-second-model.sh"),
+      resolve(MAIN, "scripts/check-second-model.sh"),
+    ];
+    const realProbe = probeCandidates.find((p) => existsSync(p));
+    if (!realProbe) {
+      console.log("⏭️  #967 real-probe case skipped — scripts/check-second-model.sh not found");
+    } else {
+      const liveCmd = `bash ${realProbe} --probe`;
+      const liveSp = extractScriptPath(liveCmd);
+      const liveArgs = extractScriptArgs(liveCmd, liveSp);
+      expectBool("#967: real check-second-model.sh --probe → allow (git-free resolution authority unblocked)",
+        liveSp === realProbe && scriptGitVerdict(realProbe, "main", MAIN, MAIN, liveArgs) === "allow", true);
+      expectBool("#967: live command argv parses as [--probe]", JSON.stringify(liveArgs) === JSON.stringify(["--probe"]), true);
+    }
+  } catch (e) {
+    console.error(`❌ #967 script-classifier cases FAILED to provision: ${String(e.message).slice(0, 160)}`); fail++;
+  } finally {
+    if (t967) {
+      try { execSync(`rm -rf "${t967}"`, { stdio: "ignore" }); } catch {}
+    }
   }
 }
 
