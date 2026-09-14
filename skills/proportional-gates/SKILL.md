@@ -88,7 +88,7 @@ Before deciding what gates to run, classify the change:
 | Medium-High (large plan, some novelty) | 3 reviewers | 5 |
 | High (novel architecture, first-of-kind) | 4 reviewers | 10 |
 
-`—` in Max Cycles = **0 loop cycles** — this column counts TOTAL cycles, so `—` means the loop never runs for that row: one reviewer pass, no re-review. Tier crosswalk: `micro` → Low, `standard` → Low-Medium, `complex` → High. Editing this table requires the matching change in `extensions/loop-enforcer/termination.ts` and `tier-config-parity.test.ts` in the same commit — the parity test parses it.
+`—` is the skip sentinel: one reviewer pass, no re-review (the enforcer reads it as 0 loop cycles). A numeric cell counts cycles, where cycle 1 is the first pass. Tier crosswalk: `micro` → Low, `standard` → Low-Medium, `complex` → High. Editing this table requires the matching change in `extensions/loop-enforcer/termination.ts` and `tier-config-parity.test.ts` in the same commit — the parity test parses it.
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers.
 

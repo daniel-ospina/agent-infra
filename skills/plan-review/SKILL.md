@@ -468,7 +468,7 @@ of prior cycles, no investment in defending prior fixes. This prevents confirmat
 
 For each cycle:
 1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions), **plus Reviewer #5** when its trigger fires (new component / new write path / new shared-state owner / new vocabulary definition) or on the final cycle. #5 is dispatched **alongside** the proportional set, never instead of it — N does not drop because #5 fired. If the trigger does not fire, the cycle runs the proportional N only, and the cycle log records `#5: not triggered`.
-2. Parse responses. Every proportional reviewer returning `NO ISSUES FOUND` → exit clean (adversarial domain: `THREAT SURFACE COVERED` from a fresh reviewer substitutes — see the bounded subsection below); issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
+2. Parse responses. Every proportional reviewer returning `NO ISSUES FOUND` → exit clean (adversarial domain: `THREAT SURFACE COVERED` from a fresh reviewer substitutes — see the Adversarial domain subsection above); issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
 3. After fixes applied, go to step 1 (repeat cycle)
 
 **Why task sub-agents:** `pi -p` spawns a fresh session. The reviewer has no context
@@ -487,7 +487,7 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **No hard cap.** The loop continues until clean exit or convergence. The safety cap is the tier's **Max Cycles** row in `proportional-gates` §Review Cycles — if reached, escalate to human (runaway prevention, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
 
-**Half-budget research rule.** Once half the tier's **Max Cycles** (`proportional-gates` §Review Cycles), rounded up, is spent and P0/P1 issues remain, every surviving issue needs research backing before the next fix — the fixer cites the source, or records `internal-only, no external source` when Phase 3's skip condition applies (purely internal: typo, formatting, in-repo convention). An unresearched re-fix does not count as a fix.
+**Half-budget research rule.** Once half the **governing budget**, rounded up, is spent — the tier's **Max Cycles** (`proportional-gates` §Review Cycles), or the adversarial domain's **2** when that domain applies (above) — every surviving issue needs research backing before the next fix: the fixer cites the source, or records `internal-only, no external source` when Phase 3's skip condition applies (purely internal: typo, formatting, in-repo convention). An unresearched re-fix does not count as a fix.
 
 **Stuckness detection (3-layer algorithm)**:
 

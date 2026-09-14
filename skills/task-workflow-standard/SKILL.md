@@ -74,7 +74,7 @@ VERIFY (gate: verifier — blocks write/edit/bash)
 
 At each verifier gate (scope-verify, plan-verify, verify):
 
-1. **Dispatch the gate's own count** via the `task` tool — scope: `issue-scoping` §Tier Scaling; plan: `proportional-gates` §Review Cycles
+1. **Dispatch the gate's own count** via the `task` tool — scope: `issue-scoping` §Tier Scaling; plan: `proportional-gates` §Review Cycles; verify: `verification-before-completion` (one verifier sub-agent)
 2. Each dispatched agent returns structured output with `NO ISSUES FOUND` or an issue list
 3. The gate stays locked (blocks write/edit/bash/MCP) until ALL dispatched agents return clean
 4. If any agent finds issues → fix them → re-dispatch ALL
