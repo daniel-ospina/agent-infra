@@ -66,8 +66,10 @@
 # Env seams: PS_BIN KILL_BIN DATE_BIN CMUX_STATE_DIR PI_SESSIONS_DIR
 #   REAP_IDLE_HOURS REAP_STUCK_HOURS REAP_REAP_STUCK REAP_DRY_RUN
 #   REAP_GRACE_SECONDS REAP_NOW_EPOCH REAP_LOCK_STALE_SECONDS REAP_LOG
-#   REAP_MAX_HOURS (upper sanity bound for the two hour thresholds; the raw
-#   pre-normalization range check is meaningless without it).
+#   REAP_MAX_HOURS (upper sanity bound for an explicitly supplied hour
+#   threshold; the raw pre-normalization range check is meaningless without it).
+#   The derived stuck bound (3x idle) is positivity-checked after the multiply
+#   instead, so a 64-bit wrap cannot make it negative.
 #   (default $HOME/.pi/agent/state/pi-reap-idle.log).
 # Exit codes: 0 completed passes, 2 usage, 3 fail-closed (store / lock /
 #            log-unwritable / ps-enumeration / descendant-map — see the
@@ -196,13 +198,16 @@ lstart_to_epoch() {
 PS_TABLE=""
 CANDIDATES=""  # newline-separated candidate pids (tty'd + pi-argv)
 PS_RC=0        # exit status of the bulk `ps` call (0 = enumeration ran)
+post_ps_ok=1   # 0 => the post-pass enumeration failed (POST/RESIDUAL degraded)
 
 ps_enumeration() {
     local raw ps_rc=0 awk_rc=0 cand_rc=0
     [ -n "${PS_TABLE:-}" ] && rm -f "$PS_TABLE" "$PS_TABLE.raw" 2>/dev/null
     # A failed mktemp must not fall through to the literal path ".raw" in the
-    # cwd — treat it as an enumeration failure (PS_RC) like any other.
-    PS_TABLE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-ps.XXXXXX")" || { PS_TABLE=""; PS_RC=1; return 1; }
+    # cwd — treat it as an enumeration failure (PS_RC) like any other. Clear
+    # CANDIDATES too: a failed enumeration must never leave the PREVIOUS
+    # enumeration's candidate list in place for a (post-pass) consumer.
+    PS_TABLE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-ps.XXXXXX")" || { PS_TABLE=""; CANDIDATES=""; PS_RC=1; return 1; }
     # Pinned bulk contract carries lstart (documented) but rows are parsed by
     # token scan (4-digit year token => stat/rss/command follow) so spacey
     # command columns never shift the parse.
@@ -1047,10 +1052,16 @@ run() {
     REAP_IDLE_HOURS=$(( 10#${REAP_IDLE_HOURS} ))
     # bounded-veto freshness bound (#947): default 3x the (final) idle
     # threshold, so --idle-hours moves it too; an explicit value always wins.
-    # The derived value needs no cap: idle <= REAP_MAX_HOURS, so 3x it cannot
-    # approach the 64-bit wrap the raw check above bounds.
     if [ -z "$REAP_STUCK_HOURS" ]; then
         REAP_STUCK_HOURS=$(( REAP_IDLE_HOURS * 3 ))
+        # The derived value is ARITHMETIC, so it can WRAP. With a huge
+        # REAP_MAX_HOURS an accepted idle threshold overflows signed 64-bit
+        # (e.g. 4e18 * 3 -> -6.4e18), and a NEGATIVE bound makes every age
+        # comparison true (`a > -6e18`), so an actively working session would
+        # classify STUCK and, under the arm, be TERM'd — reproduced end-to-end.
+        # Validate the RESULT itself, not just its operands. (#947 review P1)
+        grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" && [ "$REAP_STUCK_HOURS" -ge 1 ] \
+            || { echo "bad derived --stuck-hours: $REAP_STUCK_HOURS (--idle-hours too large)" >&2; exit 2; }
     else
         grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" || { echo "bad --stuck-hours: $REAP_STUCK_HOURS" >&2; exit 2; }
         awk -v v="$REAP_STUCK_HOURS" -v m="$REAP_MAX_HOURS" 'BEGIN{exit !(v >= 1 && v <= m)}' \
@@ -1212,17 +1223,32 @@ run() {
     # armed — killed pids are gone => RESIDUAL=0 by construction; dry-run —
     # nothing killed => RESIDUAL = the would-be-reaped count.
     ps_enumeration
+    post_ps_ok=1
+    # The post-pass read feeds the POST/RESIDUAL diagnostics only (no kill
+    # decision remains), so a failure is not fatal — but it must NOT be
+    # reported as a fresh count: a stale candidate list would make a failed
+    # post-pass read look byte-identical to a clean one. (#947 review P2)
+    if [ "$PS_RC" != 0 ]; then
+        post_ps_ok=0
+        log "POST-PASS ps enumeration failed (rc=$PS_RC) — POST/RESIDUAL degraded"
+    fi
     self_ancestors_from_table
     # Post-pass map: only feeds the RESIDUAL diagnostic (no kill decision is
     # left to make), so a build failure here is logged, not fatal — the
     # initial build above is the one that gates signaling.
     descendant_map_build || log "POST-PASS descendant map unavailable — RESIDUAL diagnostic degraded"
-    post_count="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "$post_ps_ok" = 1 ]; then
+        post_count="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')"
+    else
+        post_count="?"
+    fi
     residual_count=0
     if [ "$MODE" = apply ]; then
-        if [ -n "$CANDIDATES" ]; then
+        if [ "$post_ps_ok" = 1 ] && [ -n "$CANDIDATES" ]; then
             classify_candidates "$now" 0
             residual_count="$REAP_COUNT"
+        elif [ "$post_ps_ok" != 1 ]; then
+            residual_count="?"
         fi
     else
         residual_count="$REAP_COUNT"

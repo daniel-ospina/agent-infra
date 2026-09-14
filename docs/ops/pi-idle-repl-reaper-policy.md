@@ -176,10 +176,15 @@ fence + allowlist + marathon/own-session gates → settle-verified kill. Driven
 hourly by launchd; interactive runs default to **dry-run**; the launchd env
 carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
 `REAP_IDLE_HOURS`. Bounded-veto override: `--stuck-hours N` /
-`REAP_STUCK_HOURS` (default 3× the idle threshold). Both thresholds are bounded
+`REAP_STUCK_HOURS` (default 3× the idle threshold). An explicitly supplied
+threshold is bounded
 by `REAP_MAX_HOURS` (default 1000000); the RAW value is range-checked before
 decimal normalization (bash `$(( 10#… ))` wraps mod 2^64) and a bad value —
 including a non-numeric `REAP_MAX_HOURS` itself — is a usage error (exit 2).
+The **derived** stuck bound (3× the idle threshold) is not capped, but it is
+checked after the multiply to be a positive decimal, so an overflowing wrap
+cannot make it negative (a negative bound would make every age comparison
+true and classify active sessions STUCK).
 Stuck arm: `--reap-stuck` /
 `REAP_REAP_STUCK=1` — **not** set by the launchd job, so the hourly pass
 reports the stuck set and never reaps it.
@@ -213,7 +218,9 @@ reports the stuck set and never reaps it.
   the post-pass re-classification of the reap-eligible set (same gates; legit
   skips like marathon/running-twin/own-session never appear), so RESIDUAL=0
   after a clean armed pass, and on dry-run RESIDUAL = the would-be-reaped
-  count with KILLED=0. YIELD = Σ per-target rss at kill (KB). STUCK =
+  count with KILLED=0. If that post-pass `ps` read itself fails, its fields are
+  reported as `?` (with a `POST-PASS ps enumeration failed` reason line) rather
+  than as a stale count — a degraded diagnostic must not read as a fresh one. YIELD = Σ per-target rss at kill (KB). STUCK =
   candidates classified stuck this pass; STUCK_RSS = Σ their rss; STUCK_ARMED
   = whether `REAP_REAP_STUCK` armed the stuck set (a stuck pass with
   `STUCK>0 STUCK_ARMED=0` is the documented, deliberate non-reap state — it is

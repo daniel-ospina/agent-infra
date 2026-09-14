@@ -1595,6 +1595,30 @@ OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run -
 assert_eq "$D22ERC" "0" "D22c a large in-range --idle-hours is accepted"
 assert_contains "$(cat "$T/D/reap.log")" "THRESHOLD=333334 STUCK_HOURS=1000002" "D22c the derived stuck bound is not capped"
 
+# D22d (review P1): the DERIVED stuck bound is arithmetic, so it can wrap. A
+# huge REAP_MAX_HOURS makes an accepted --idle-hours overflow signed 64-bit:
+# 4e18*3 -> -6446744073709551616, and a NEGATIVE bound makes every age test
+# true (`a > -6e18`) — an actively working session classifies STUCK and, under
+# the arm, is TERM+KILLed (reproduced end-to-end by review). Pre-fix this input
+# was accepted; the old code caught it only by accident (the residue check).
+OUT="$(REAP_MAX_HOURS=4000000000000000000 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 4000000000000000000 2>&1)"; D22DRC=$?
+assert_eq "$D22DRC" "2" "D22d a wrapped (negative) derived stuck bound is rejected"
+assert_contains "$OUT" "bad derived --stuck-hours" "D22d the message names the derived bound, not the flag the user passed"
+OUT="$(REAP_MAX_HOURS=5000000000000000000 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 5000000000000000000 2>&1)"; D22ERC=$?
+assert_eq "$D22ERC" "2" "D22d a second wrapping case (5e18*3) is rejected too"
+# positive control: a large derived bound that does NOT wrap stays usable.
+OUT="$(REAP_MAX_HOURS=3000000000000000000 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 3000000000000000000 2>&1)"; D22FRC=$?
+assert_eq "$D22FRC" "0" "D22d a large non-wrapping derived bound is still accepted"
+
+# D23 (review P2): the post-pass read feeds POST/RESIDUAL only, but a failed
+# post-pass must not be reported as a fresh count — a stale candidate list made
+# a failed read byte-identical to a clean one.
+: > "$T/D/ps-source"; : > "$T/D/reap.log"; : > "$T/D/bulk-count"
+OUT="$(FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=2 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"; D23RC=$?
+assert_eq "$D23RC" "0" "D23 a failed POST-pass enumeration does not abort the pass"
+assert_contains "$(cat "$T/D/reap.log")" "POST-PASS ps enumeration failed" "D23 the degradation is logged"
+assert_contains "$(cat "$T/D/reap.log")" "POST=?" "D23 POST is reported as unknown, not as a stale count"
+
 rm -rf "$T/D"
 
 echo "════════════════════════════════════════════════════════════════"
