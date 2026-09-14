@@ -86,7 +86,7 @@ jobs:
         # ci-main.yml is pinned in scripts/workflow-lock.json and a comment
         # tweak would force a lock re-derivation. A fixture nothing runs pins
         # nothing, so every assertion the suite carries — expect_ref,
-        # expect_trace, pr_is_docs_only, resolve_issue_ref, and the
+        # expect_trace, pr_is_artifact_only, resolve_issue_ref, and the
         # has_scoping_marker family added by #991 — was decorative.
         #
         # CI is also the ONLY venue for it: the #1484 main-worktree-guard

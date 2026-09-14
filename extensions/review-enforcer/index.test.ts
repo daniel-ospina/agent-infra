@@ -45,6 +45,7 @@ import {
   countMergeVerbs,
   isGitOp,
   extractMergePrNumber,
+  extractMergeSelector,
   evidenceBodyIsCertifying,
   evaluateAdminMergeGate,
   getPrComments,
@@ -268,7 +269,7 @@ test("null when no cd prefix", () => {
 
 // ── resolveRepoContext priority ───────────────────────
 
-section("resolveRepoContext — resolution priority (--repo > GH_REPO > cd > record > fallback)");
+section("resolveRepoContext — resolution priority (url > --repo > GH_REPO > cd > record > fallback)");
 
 test("priority 1: --repo flag beats GH_REPO env", () => {
   const ctx = resolveRepoContext("GH_REPO=env/repo gh pr merge 138 --repo flag/repo", cleanRecord);
@@ -3083,6 +3084,358 @@ test("extractMergePrNumber: flag order never hides the PR number", () => {
   equal(extractMergePrNumber("gh pr create --title 123"), null);
 });
 
+// ── #1007: the PR POSITIONAL — a URL, not only a number ──────────────────────
+// `gh pr merge <url> --admin` used to be refused by BOTH layers (this scanner and the
+// argv-level shim). That refusal was fail-closed, but it was an over-block — and an
+// over-block is what pushes a caller at AGENT_ADMIN_MERGE_OVERRIDE, the outcome the
+// gate exists to prevent. The URL is now resolved: the number is IN the token, so no
+// second party is asked who the PR is.
+//
+// A BRANCH selector stays REFUSED, deliberately: resolving a branch to a number needs a
+// `gh` call, i.e. the gate asking the gated thing for the identity it is about to check.
+//
+// PARITY: `scripts/gh-shim/gh::parse_pr_url` accepts the SAME one shape, and
+// `tests/gh-shim/run.sh` §11 drives this same table through the argv layer (with a
+// tripwire that fails if the TS shape moves without that file). If this table changes,
+// change that one in the same commit.
+section("#1007 — the PR selector: a strict URL is resolved, a branch is not");
+
+const PR_URL_1006 = "https://github.com/daniel-ospina/agent-infra/pull/1006";
+
+test("extractMergeSelector: a PR URL is resolved to its number AND its repo", () => {
+  // The repo matters as much as the number: gh resolves the merge against the URL's
+  // repo, so reading the evidence from anywhere else verifies a PR gh is not about to
+  // merge (the `--repo` wrong-repo class, in a third spelling).
+  const s = extractMergeSelector(`gh pr merge ${PR_URL_1006} --admin`);
+  equal(s.pr, 1006, "the number is extracted from the URL");
+  equal(s.repo, "daniel-ospina/agent-infra", "…and the URL's repo with it");
+  equal(extractMergePrNumber(`gh pr merge ${PR_URL_1006} --admin`), 1006, "extractMergePrNumber delegates");
+  equal(extractMergeSelector(`gh pr merge --admin ${PR_URL_1006}`).pr, 1006, "flag order does not hide the URL");
+  equal(extractMergeSelector(`gh pr merge ${PR_URL_1006} --admin`).repo,
+    extractMergeSelector(`gh pr merge --admin ${PR_URL_1006}`).repo, "the repo is found in either order");
+  equal(extractMergeSelector("gh pr merge 123 --admin").repo, null, "a bare number carries no repo");
+  equal(extractMergeSelector("gh pr create --title 123").pr, null, "a non-merge is out of scope");
+});
+
+test("extractMergeSelector: a BRANCH selector stays unresolved (fail closed)", () => {
+  equal(extractMergeSelector("gh pr merge my-branch --admin").pr, null, "a branch is not a selector here");
+  equal(extractMergeSelector("gh pr merge release/v2 --admin").pr, null, "…including a slash branch");
+  equal(extractMergeSelector("gh pr merge feature/1007 --admin").pr, null, "…even when it contains digits");
+  equal(evaluateAdminMergeGate(extractMergeSelector("gh pr merge my-branch --admin").pr, "a".repeat(40), [], false).status,
+    "block", "…and the gate then blocks it (an over-block, stated as such)");
+});
+
+test("extractMergeSelector: every near-miss refuses (the number must be IN the token)", () => {
+  const bad = [
+    "https://github.com/o/r/pull/abc",
+    "https://github.com/o/r/pull/",
+    "https://github.com/o/r/pull/123/files",
+    "https://github.com/o/r/pull/123/",
+    "https://github.com/o/r/pull/123?s=1",
+    "https://github.com/o/r/pull/123#x",
+    "http://github.com/o/r/pull/123",
+    "github.com/o/r/pull/123",
+    "https://evil.com/o/r/pull/123",
+    "https://www.github.com/o/r/pull/123",
+    "https://github.com/o/r",
+    "https://github.com//pull/1",
+    "https://github.com/o//pull/1",
+    "https://github.com/o!/r/pull/1",
+    "https://github.com/o/x y/pull/1",
+  ];
+  for (const u of bad) equal(extractMergeSelector(`gh pr merge ${u} --admin`).pr, null, `refused: ${u}`);
+});
+
+test("resolveRepoContext: a URL's repo OUTRANKS --repo and GH_REPO (gh ignores both)", () => {
+  // Probed live 2026-09-14 (recorded in scripts/gh-shim/gh):
+  //   gh pr merge <URL to a repo that does not exist> --repo <one that does>
+  //     → "Could not resolve to a Repository with the name '…definitely-not-a-repo-xyz'"
+  //   gh pr merge <URL to one that exists> --repo <one that does not>
+  //     → failed on the URL's PR, never on the bogus --repo
+  // So `--repo` is dead input when the selector is a URL, and honouring it would read
+  // the evidence from a repo gh is not merging.
+  const ctx = resolveRepoContext(`gh pr merge ${PR_URL_1006} --admin --repo owner/other`, null);
+  equal(ctx.repo, "daniel-ospina/agent-infra", "the URL's repo wins over --repo");
+  equal(ctx.source, "url", "…and the context says where it came from");
+  equal(resolveRepoContext(`GH_REPO=env/repo gh pr merge ${PR_URL_1006} --admin`, null).repo,
+    "daniel-ospina/agent-infra", "…and over GH_REPO");
+  // The URL is NOT a repo source when it is not the selector.
+  equal(resolveRepoContext("gh pr merge 123 --admin", null).source, "fallback",
+    "a bare-number merge is unaffected by this rule");
+});
+
+test("extractMergeSelector: a URL in a flag VALUE is never the selector — either order", () => {
+  // VGATE cycle 1 (#1007) found this as a FAIL-OPEN: the walk was not quote-aware, so
+  // `--body "see <url> here"` left the URL as a FREE token and it became the selector —
+  // the gate then read the head and comments of a different PR in a DIFFERENT repo than
+  // gh merges, and a foreign certificate would satisfy it. The vulnerable ordering is
+  // the value BEFORE the positional; with the positional first the walk returns early,
+  // which is why an earlier version of this test passed while the bug was live.
+  const values = [
+    `--body "see ${PR_URL_1006} for context"`, // quoted, multi-word — the exploit
+    `--body "see ${PR_URL_1006}"`,
+    `--body ${PR_URL_1006}`, // unquoted, single token
+    `-b "see ${PR_URL_1006} here"`, // short form, same skip
+    `--body-file ${PR_URL_1006}`,
+    `--subject "re ${PR_URL_1006} now"`,
+    `-t ${PR_URL_1006}`,
+    `--author-email ${PR_URL_1006}`,
+    `-A "notes ${PR_URL_1006}"`, // -A was MISSING from valueFlags
+    `--match-head-commit ${PR_URL_1006}`,
+    `--hostname ${PR_URL_1006}`, // --hostname was MISSING too
+    `--body="see ${PR_URL_1006} here"`, // attached form
+  ];
+  for (const v of values) {
+    // (a) THE VULNERABLE ORDERING: value first, real positional after it.
+    const before = `gh pr merge ${v} 123 --admin`;
+    equal(extractMergeSelector(before).pr, 123, `value before the positional: ${v}`);
+    equal(extractMergeSelector(before).repo, null, `…and no URL repo leaks: ${v}`);
+    ok(!resolveRepoContext(before, null).repo, `…and the repo context stays empty: ${v}`);
+    // (b) the ordering the earlier test used (it returned early — vacuous for (a)).
+    const after = `gh pr merge 123 --admin ${v}`;
+    equal(extractMergeSelector(after).pr, 123, `positional first: ${v}`);
+    equal(extractMergeSelector(after).repo, null, `…and no URL repo leaks: ${v}`);
+  }
+  // Escaped quotes: the tokenizer only closes a quote on an UNESCAPED one, in EVERY
+  // context (never earlier than bash would). VGATE's second cycle reached the same
+  // fail-open through `\"` inside a double-quoted value and through the `$'…\'…'` form.
+  const escaped = [
+    `--body "a\\" ${PR_URL_1006} b"`, // `\"` inside a double-quoted value
+    `--body $'a\\' ${PR_URL_1006} b'`, // ANSI-C: `\'` is an escape, not a close
+    `--subject "x\\" ${PR_URL_1006}"`,
+  ];
+  for (const v of escaped) {
+    const before = `gh pr merge ${v} 123 --admin`;
+    equal(extractMergeSelector(before).pr, 123, `escaped quote before the positional: ${v}`);
+    equal(extractMergeSelector(before).repo, null, `…and no URL repo leaks: ${v}`);
+  }
+  // …and with NO positional, a value-hosted URL must not stand in for one.
+  equal(extractMergeSelector(`gh pr merge --admin --body "see ${PR_URL_1006} here"`).pr, null,
+    "a body URL is not a selector (no positional)");
+  equal(resolveRepoContext(`gh pr merge --admin --body "see ${PR_URL_1006} here"`, null).source,
+    "fallback", "…and it is not a repo source either");
+});
+
+test("extractMergeSelector: the two layers must agree on the NUMBER, not just the shape", () => {
+  // A leading zero or a value above 2^53 is one the TS side cannot hold in a Number
+  // while the shim passes the literal digits to the verifier. Refused on both sides
+  // rather than silently read as a DIFFERENT PR's evidence.
+  for (const n of ["0", "01006", "0001", "9007199254740993", "99999999999999999999"]) {
+    equal(extractMergeSelector(`gh pr merge https://github.com/o/r/pull/${n} --admin`).pr, null,
+      `refused on the TS side: /pull/${n}`);
+  }
+  equal(extractMergeSelector("gh pr merge https://github.com/o/r/pull/1006 --admin").pr, 1006,
+    "a normal number still resolves (the guard is not an over-block)");
+});
+
+test("extractMergeSelector: nested substitutions — the selector the SHELL would pass", () => {
+  // Every expectation here was taken from real bash argv (a fake `gh` printing "$@"),
+  // not from the tokenizer. A substitution is ONE word to the shell, and `$( … )` /
+  // backticks opened inside a quoted value carry their OWN quote state: a `"` inside
+  // them does not close the outer `"`. Modeled with a level stack (VGATE #1007 c3).
+  const cases: Array<[string, number, string | null]> = [
+    [`--body "$(cat msg)" 123`, 123, null],
+    [`--body "$(${PR_URL_1006})" 123`, 123, null], // the URL is inside the VALUE
+    [`--body "$(echo ${PR_URL_1006})" 123`, 123, null],
+    [`--body "\`echo ${PR_URL_1006} \`" 123`, 123, null],
+    [`--subject "\`id -u\`" 123`, 123, null],
+    [`--body "$(echo 999)" 123`, 123, null],
+    [`--body "$((1+2))" 123`, 123, null],
+    [`--body "$(echo $((1+2)))" 123`, 123, null],
+    [`--body "$( (a) )" 123`, 123, null], // paren depth inside `$( … )`
+    [`--body "$(echo ')')" 123`, 123, null], // a `)` inside a quoted inner region
+    // The inner 77 is a VALUE of the inner `--body`-like construct; the shell hands the
+    // outer positional. A tokenizer that reached into the substitution would name 77.
+    [`--body "$(" 77 ")" 456`, 456, null],
+  ];
+  for (const [v, pr, repo] of cases) {
+    const s = extractMergeSelector(`gh pr merge ${v} --admin`);
+    equal(s.pr, pr, `shell-verified selector for: ${v}`);
+    equal(s.repo, repo, `…and repo for: ${v}`);
+  }
+
+  // VGATE #1007 cycle 3 found a real FAIL-OPEN — and it was BASH-ACCEPTED, not just a
+  // fatal-input artifact. A `$(case …)` region closes at its pattern `)` (bash does the
+  // same), so the region popped early and the text after it became free tokens. But bash
+  // evaluates `$(case x in y)` to an ERROR (empty + word removed), so the number after it
+  // is consumed as `--body`'s VALUE — the positional is ABSENT and gh merges the CURRENT
+  // BRANCH's PR, while the scanner reported that number. `case`/`esac` state keeps the
+  // region open, so no token inside it can stand in for the positional.
+  for (const body of [
+    `--body $(case x in y) 123`, // bash: positional ABSENT (123 is --body's value)
+    `--body $(case x in y) ${PR_URL_1006} 123`, // bash: selector 123 (URL is the value)
+    `--body $(case x in y) ${PR_URL_1006} esac) 123`, // bash: syntax error, rc≠0
+    "--body `case x in y) 123`", // bash: substitution errors, `--admin` is swallowed as the body
+  ]) {
+    const s = extractMergeSelector(`gh pr merge ${body} --admin`);
+    equal(s.pr, null, `no token inside a case region is the selector: ${body}`);
+    equal(s.repo, null, `…and no repo either: ${body}`);
+    // Measured: for the first TWO rows bash ACCEPTS the command and runs gh, so this is a
+    // fail-closed fix, not a cosmetic one — an unevidenced-in-reality PR can no longer be
+    // named for approval. For the others bash fails before gh runs.
+    equal(evaluateAdminMergeGate(s.pr, "a".repeat(40), [], false).status, "block",
+      `…and the gate blocks: ${body}`);
+  }
+
+  // The ROOT still splits: a substitution is ONE word to the shell, so the literal token
+  // after it is a separate word and is still found. NOTE this is a statement about the
+  // TOKENIZER, not bash parity: bash passes the substitution's OUTPUT as the positional
+  // (`$(printf x) 123` reaches gh as `x 123`), which is not statically knowable — and gh
+  // then rejects a second positional. The argv-level shim is what decides that case.
+  equal(extractMergeSelector(`gh pr merge $(printf x) 123 --admin`).pr, 123,
+    "the substitution is one word; the next literal token is the next word");
+  equal(extractMergeSelector(`gh pr merge 123 $(printf x) --admin`).pr, 123,
+    "…in either order");
+});
+
+test("extractMergeSelector: unmodeled shell syntax in a QUOTED value refuses (never a fail-open)", () => {
+  // These are the shapes where the fast string layer cannot reproduce the shell's argv:
+  // a QUOTED value carrying shell separators (`;;`, `{ }`, `( )`, `for … done`, `&&`).
+  // Each MEASURED against real bash argv: for every row below bash ACCEPTS the command
+  // and gh would see the trailing 123 as its positional, while this layer refuses. That
+  // is deliberately the SAFE direction — the over-block the issue is about, in its
+  // narrowest form — and it is why the shim (real argv) is the authority here, not this.
+  // If a future edit makes any of these resolve, prove it against bash argv first.
+  const overBlocks = [
+    `--body "$(case x in y) echo z ;; esac)"`,
+    `--body "$(case x in y) echo z ;; y2) echo w ;; esac)"`,
+    `--body "$(case x in (y) echo z ;; esac)"`,
+    `--body "$(f() { echo x; }; f)"`, // a function definition in a quoted value
+    `--body "$(for i in 1 2; do echo $i; done)"`,
+    `--body "$([ -f x ] && echo y)"`,
+  ];
+  for (const v of overBlocks) {
+    equal(extractMergeSelector(`gh pr merge ${v} 123 --admin`).pr, null,
+      `refused rather than guessed (bash would merge 123): ${v}`);
+    // …and the gate it feeds must therefore refuse too, not fall through to another path.
+    equal(evaluateAdminMergeGate(extractMergeSelector(`gh pr merge ${v} 123 --admin`).pr,
+      "a".repeat(40), [], false).status, "block", `…and the gate blocks: ${v}`);
+  }
+});
+
+test("extractMergeSelector: a repo PAIR cannot leak its value's tail into the selector", () => {
+  // VGATE #1007 cycle 4 (P0): `extractMergeSelector` used to read its token stream from
+  // `stripRepoArgs(command)`, which removes only the FIRST whitespace-delimited word of a
+  // value. A quoted `--repo "see <url> here"` therefore left ` <url> here"` as free text
+  // and the URL branch returned that URL as the selector — naming a DIFFERENT PR and a
+  // different repo than gh merges (the old `^\d+$`-only walk ignored the leaked URL, so
+  // the URL feature introduced it). The selector now comes from the ORIGINAL tail.
+  const pair = `--repo "see ${PR_URL_1006} here"`;
+  const forms = [
+    `gh pr merge ${pair} 123`, // quoted value, post-verb
+    `gh pr merge -R "see ${PR_URL_1006} here" 123`,
+    `gh pr merge --repo="see ${PR_URL_1006} here" 123`, // =-joined quoted value
+    `gh pr merge ${pair} --repo cli/cli 123`, // a second, VALID --repo wins for gh
+    `gh ${pair} pr merge 123`, // the pair between `gh` and `pr`
+    `gh pr ${pair} merge 123`, // …and between `pr` and `merge`
+    `gh -R "see ${PR_URL_1006} here" pr merge 123`,
+  ];
+  for (const cmd of forms) {
+    const full = `${cmd} --admin`;
+    equal(extractMergeSelector(full).pr, 123, `the real positional is the selector: ${full}`);
+    equal(extractMergeSelector(full).repo, null, `…and the leaked URL's repo is not used: ${full}`);
+    // The repo CONTEXT matters as much as the number: a `source:"url"` here read the
+    // evidence/registry record of a repo gh is not merging into.
+    ok(resolveRepoContext(full, null).source !== "url",
+      `…and the URL is not the repo source either: ${full}`);
+  }
+  // The pre-verb spelling must STILL be found (this is what `stripRepoArgs` normalised for;
+  // a leaked tail used to hide the verb and over-block).
+  equal(extractMergeSelector(`gh -R owner/repo pr merge 123 --admin`).pr, 123,
+    "a plain pre-verb repo pair still resolves");
+  equal(extractMergeSelector(`gh --repo=owner/repo pr merge 123 --admin`).pr, 123,
+    "…including the =-joined spelling");
+  equal(extractMergeSelector(`gh -Rowner/repo pr merge 123 --admin`).pr, 123,
+    "…and the attached spelling");
+  equal(extractMergeSelector(`gh pr merge -R owner/repo 123 --admin`).pr, 123,
+    "…and a post-verb one");
+});
+
+test("extractMergeSelector: the verb regex stays LINEAR on a crafted command (ReDoS guard)", () => {
+  // The first cut of MERGE_VERB_RE used an ambiguous REPO_PAIR (`=\S+` and `\S*` both
+  // match `=a`, and `\S*` matches the EMPTY string) under an unbounded repetition, so a failing
+  // tail enumerated 2^k splits. Measured on that form: 80 ms at 20 `--repo=` tokens,
+  // 1.3 s at 26, 5.2 s at 28, 20.8 s at 30, and >400 s (timed out) at 34. This function
+  // runs on EVERY git-shaped bash call, so that is a denial of service in the gate
+  // itself. The alternatives are now disjoint (`=`, whitespace, neither). The bound is
+  // deliberately loose so a loaded machine cannot make it flaky, while still catching a
+  // return of the exponential (which costs seconds at these sizes).
+  for (const k of [40, 120]) {
+    const cmd = `git commit -m x && gh ${"--repo=a ".repeat(k)}z`;
+    const t0 = Date.now();
+    equal(extractMergeSelector(cmd).pr, null, `a ${k}-pair command resolves no PR`);
+    ok(Date.now() - t0 < 2000, `a ${k}-pair command finishes fast (${Date.now() - t0} ms)`);
+  }
+});
+
+test("extractMergeSelector: a QUOTED verb is not this command's verb", () => {
+  // A text search on the raw command matched `gh pr merge` inside a quoted argument and
+  // attributed that URL's repo to a command that is not a merge at all (fresh review,
+  // P2). The verb must start OUTSIDE quotes — the same quote model as everywhere else.
+  const q = `gh pr view "gh pr merge ${PR_URL_1006} --admin"`;
+  equal(extractMergeSelector(q).pr, null, "a verb inside a quoted argument does not resolve");
+  equal(extractMergeSelector(q).repo, null, "…and its URL does not leak a repo");
+  ok(resolveRepoContext(q, null).source !== "url", "…and it is not the repo source");
+});
+
+test("extractMergeSelector: a bare number must round-trip, or the two layers disagree", () => {
+  // The shim forwards a bare positional to gh as the LITERAL digits. `Number()` rounds
+  // above 2^53 and normalises a leading zero, so those make the scanner name a
+  // DIFFERENT PR than the shim — the divergence the URL-digits rule already refuses.
+  for (const bad of ["9007199254740993", "01006", "0001", "99999999999999999", "0"]) {
+    equal(extractMergeSelector(`gh pr merge ${bad} --admin`).pr, null,
+      `refused (cannot round-trip): ${bad}`);
+  }
+  equal(extractMergeSelector("gh pr merge 123 --admin").pr, 123,
+    "an ordinary number still resolves (this guard is not an over-block)");
+});
+
+test("resolveRepoContext: a compound command does not lend the FIRST verb's URL repo to the SECOND", () => {
+  // `extractPrNumber` counts PER VERB (it takes the LAST `gh pr merge`) while
+  // `extractMergeSelector` takes the FIRST. Attributing the first verb's URL repo to the
+  // second verb's number read another repo's evidence for that number (fresh review, P2).
+  const cmd = `gh pr merge ${PR_URL_1006}; gh pr merge 123`;
+  equal(extractMergeSelector(cmd).repo, "daniel-ospina/agent-infra",
+    "the selector still reports the first verb's URL repo (unchanged)");
+  ok(resolveRepoContext(cmd, null).source !== "url",
+    "…but a COMPOUND command may not take the URL repo for its gate lookup");
+  // The single-verb form keeps the URL repo — this guard must not disable the feature.
+  equal(resolveRepoContext(`gh pr merge ${PR_URL_1006} --admin`, null).source, "url",
+    "a single-verb URL merge still takes the URL's repo");
+});
+
+test("resolveRepoContext: a QUOTED verb in an assignment does not hide the real URL repo", () => {
+  // Re-review P2 on the F4 fix: `countMergeVerbs` counts a quoted mention conservatively
+  // (by design, for the admin compound guard), so using it for repo attribution discarded
+  // the URL repo for a LEGITIMATE single merge — and `extractPrNumber` read the quoted
+  // mention as the gated PR (the quoted-verb defect again). Both are now precise: the
+  // count uses the quote-aware verb matcher, and the number regex masks quoted regions.
+  const cmd = `x="say gh pr merge 1"; gh pr merge ${PR_URL_1006} --admin`;
+  equal(extractMergePrNumber(cmd), 1006, "the real merge is the URL's PR");
+  equal(resolveRepoContext(cmd, null).source, "url",
+    "…and the URL's repo is kept (a conservative verb count would drop it)");
+  // The NUMBER must also come from the real verb: this is the wrong-PR evidence read the
+  // reviewer flagged, fixed by making `extractPrNumber` see only UNQUOTED verbs.
+  equal(extractPrNumber(cmd), null, "a quoted mention is not this command's PR number");
+  equal(extractPrNumber(`gh pr merge --body "see gh pr merge 999" 138 --admin`), null,
+    "…nor does a mention in a flag value shadow the positional (gh merges 138)");
+  equal(extractMergePrNumber(`gh pr merge --body "see gh pr merge 999" 138 --admin`), 138,
+    "…the quote-aware extractor still finds the real positional");
+  equal(extractPrNumber('git commit -m "see gh pr merge 138"'), null,
+    "…and a mention in a commit message does not drive the gate");
+  // Unchanged behaviour, so the masking cannot silently disable the extractor.
+  equal(extractPrNumber("gh pr merge 138 --repo owner/repo"), 138, "a plain command still parses");
+  // PRE-EXISTING, NOT caused by masking: a quoted POSITIONAL was already null (the regex
+  // needs bare digits), and both extractors refuse it, so the registry gate is skipped for
+  // that spelling. The dequote fix and this hole are filed as a follow-up (#1021).
+  equal(extractPrNumber('gh pr merge "138"'), null,
+    "a quoted positional yields no number (pre-existing; the registry gate is skipped)");
+  // A quote-SPLICED token is a FRAGMENT: bash turns `"1"38` into `138`, so the digits the
+  // mask leaves visible are not the argument. Refused rather than guessed (round-4 review).
+  equal(extractPrNumber('gh pr merge "1"38'), null, "a quote-spliced token is refused, not guessed");
+  equal(extractPrNumber('gh pr merge 1"38"'), null, "…in either splice direction");
+});
+
 test("withGhShim (#984): the argv-level gh shim is put on PATH for every bash call", () => {
   const ORIG = "gh pr merge 123 --admin";
   const shimmed = withGhShim(ORIG, "/repo/scripts/gh-shim");
@@ -3491,6 +3844,44 @@ testAsync("#930 override hatch: AGENT_ADMIN_MERGE_OVERRIDE=1 allows a raw --admi
       ok(passes.some((l) => l.reason === "admin_merge_override"), "the override is audited");
     } finally {
       delete process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1007 scanner flow: a PR URL resolves through the admin gate — and an UNEVIDENCED one is still blocked", async () => {
+  // The over-block lived in TWO layers. This drives the extension end-to-end, so it
+  // fails if the scanner refuses the URL even though the shim would have resolved it.
+  // Both directions are asserted on the SAME command: the URL form must reach the
+  // evidence decision (a), and must not weaken it (b).
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "7".repeat(40);
+    const url = `https://github.com/daniel-ospina/agent-infra/pull/${PR_ADMIN}`;
+    // A repo-less legacy record: the registry gate finds it even under the URL's repo.
+    writeReviewFile(resolvePath(os.homedir(), ".pi", "agent", "reviews", `${PR_ADMIN}.json`),
+      { pr: PR_ADMIN, head_sha: head, verdict: "clean" });
+    try {
+      const run = async () => {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task" });
+        return fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${url} --admin` } });
+      };
+      // (a) head-bound evidence → ALLOWED. Before #1007 this was blocked with
+      // "carries no resolvable PR number".
+      _setRunGhOverride(adminGh(head, [evidenceBody(head)]));
+      equal(await run(), undefined, "URL + head-bound evidence → allowed (the over-block is gone)");
+      // (b) the SAME URL with NO evidence → still BLOCKED, by the admin-merge gate.
+      _setRunGhOverride(adminGh(head, []));
+      const blocked = await run();
+      ok(blocked && blocked.block === true, "URL without evidence → still BLOCKED");
+      ok(/admin-merge/.test(String(blocked && blocked.reason)),
+        "…and it is the EVIDENCE gate that blocked, not a parse failure");
+    } finally {
       _setRunGhOverride(null);
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
