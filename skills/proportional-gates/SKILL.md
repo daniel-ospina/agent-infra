@@ -20,7 +20,7 @@ Rigid rules ("always run 4 reviewers", "always typecheck", "always use a worktre
 
 **Proportional gates** replace mechanical rules with a single principle: **match verification depth to change risk and novelty.** An agent uses judgment to decide what gates to run. A reviewer validates those decisions.
 
-This skill is the canonical reference. Consuming skills inline the proportionality tables relevant to their domain.
+This skill is the canonical reference. Consuming skills cite the tables below by name; they never copy the numeric cells.
 
 ---
 
@@ -84,9 +84,11 @@ Before deciding what gates to run, classify the change:
 | Risk | Reviewers | Max Cycles |
 |------|-----------|------------|
 | Low | 1 reviewer | — |
-| Low-Medium (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |
-| Medium-High (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
-| High (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 10 |
+| Low-Medium (small plan, existing patterns) | 2 reviewers | 3 |
+| Medium-High (large plan, some novelty) | 3 reviewers | 5 |
+| High (novel architecture, first-of-kind) | 4 reviewers | 10 |
+
+`—` in Max Cycles = **0 re-review cycles** (one pass, no re-review — the Low row). Tier crosswalk: `micro` → Low, `standard` → Low-Medium, `complex` → High. Editing this table requires the matching change in `extensions/loop-enforcer/termination.ts` and `tier-config-parity.test.ts` in the same commit — the parity test parses it.
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers.
 
@@ -136,25 +138,11 @@ This is the same generate-review loop applied to gate selection itself. The agen
 
 ---
 
-## Inlining Instructions
+## Consuming These Tables
 
-Consuming skills inline the proportionality tables relevant to their domain. Do NOT inline the full skill — just the tables that replace rigid rules.
+Consuming skills **cite** the tables above by name — `proportional-gates` §Review Cycles — and never copy the numeric cells. A copied cell is a second source of truth: it is not the table the parity test parses, so it drifts silently.
 
-Format in consuming skills:
-
-```markdown
-## Proportional Gates (inlined from proportional-gates v1.0.0)
-
-> Replace rigid rules with judgment-based gating. See proportional-gates/SKILL.md for the canonical reference.
-
-### [Domain] Proportionality
-
-[Relevant table(s) from above]
-
-### Reviewer-Validates-Judgment
-
-After classifying and selecting gates, dispatch a brief review sub-agent to validate the decisions. On disagreement, re-classify and re-run skipped gates.
-```
+The **judgment principle** may be restated in a consuming skill's own words — "replace rigid rules with judgment-based gating", and the Reviewer-Validates-Judgment pattern above. Numbers and caps may not.
 
 ---
 
@@ -176,7 +164,7 @@ Proportionality applies to **verification depth**, not to **safety invariants**.
 
 ## Review Gate Routing by Level
 
-For review gates that dispatch sub-agent reviewers, route proportionally based on the issue's Level field:
+For review gates that dispatch sub-agent reviewers, route by the issue's Level field:
 
 | Level | Dispatch | Rationale |
 |-------|----------|-----------|

@@ -140,7 +140,7 @@ Phase 5: solution-converge
 Phase 5.5: 🛡️ solution-verify (Standard+Complex — verifiers per Tier Scaling + controller)
            └─ OR full-diamond-verify (Micro: 1 verifier checks all 4 phases)
 Phase 6: Wiring Check
-Phase 7: Parallel Review Gates (4 agents + fix loop)
+Phase 7: Parallel Review Gates (Agents #1–#4 + fix loop)
 Phase 8: Finalize + post plan
 ```
 
@@ -187,9 +187,9 @@ CONFIRMED PROBLEM: <from Phase 2 output>
 PROBLEM-DIVERGE OUTPUT: <diverge sub-agent output(s)>
 PROBLEM-CONVERGE OUTPUT: <converge sub-agent output(s)>
 ORIGINAL ISSUE BODY: <full issue text>
-PHASE 1.5 RESEARCH: <### Axis Research + ### Integration Docs, or "none">
+PHASE 1.5 RESEARCH: <### Axis Research, or "none">
 
-Read PHASE 1.5 RESEARCH before judging dimensions 1, 2 and 5. Treat it as a strong but fallible input — usually right, not always. Where you doubt a finding, say so and check it yourself. Never pass a scope because it cites research, and never fail one for contradicting research you have not verified.
+Read PHASE 1.5 RESEARCH before judging dimensions 1, 2 and 5. Treat it as a strong but fallible input. Where you doubt a finding, say so and check it yourself. Never pass a scope because it cites research, and never fail one for contradicting research you have not verified.
 
 CHECK FIVE DIMENSIONS:
 
@@ -251,8 +251,7 @@ If no issues: NO ISSUES FOUND
 After every verifier returns:
 
 ```
-VERIFIER 1: [P0: ..., P1: ..., P2: ...]
-VERIFIER 2: [P0: ..., P1: ..., P2: ...]
+VERIFIER <n>: [P0: ..., P1: ..., P2: ...]   # one block per verifier dispatched (Tier Scaling)
 ```
 
 **Step 1 — Identify all P0 and P1 issues** across all verifiers.
@@ -266,7 +265,7 @@ VERIFIER 2: [P0: ..., P1: ..., P2: ...]
 - If controller only ignored → still re-dispatch (verifiers must stop flagging it, or escalate)
 - If no P0/P1 found at all → gate passes
 
-**Half-budget research rule.** Once half the tier's cycle budget is spent and P0/P1 issues remain, each surviving issue must be researched — external sources where the issue is not purely internal — before the next fix, and the cycle log records the source used. Re-fixing from memory past the halfway point is how a verifier loop circles without converging.
+**Half-budget research rule.** Once this gate has run 2 re-verify cycles without clearing P0/P1 (half of the 3-cycle stuckness bound below), each surviving issue must be researched before the next fix — external sources where the issue is not purely internal — and the cycle log records the source used.
 
 **Step 4 — Handle P2/P3/P4:**
 - Controller incorporates reasonable P2+ findings
@@ -278,8 +277,7 @@ VERIFIER 2: [P0: ..., P1: ..., P2: ...]
 **Cycle log entry:**
 ```
 ### problem-verify — Cycle N
-- Verifier 1: P0=0, P1=2, P2=1
-- Verifier 2: P0=0, P1=1, P2=2
+- Verifier <n>: P0=..., P1=..., P2=...   # one line per verifier dispatched
 - Controller action: Fixed P1-X (missing falsification check), Ignored P1-Y (verifier missed the diverge report's adversarial queries — rationale documented)
 - Re-dispatching...
 ```
@@ -305,7 +303,7 @@ SOLUTION-CONVERGE OUTPUT: <converge sub-agent output(s)>
 CODEBASE EXPLORER: <from Phase 3, if available>
 PHASE 1.5 RESEARCH: <### Axis Research + ### Integration Docs, or "none">
 
-Read PHASE 1.5 RESEARCH before judging dimensions 1, 2 and 5. Treat it as a strong but fallible input — usually right, not always. Where you doubt a finding, say so and check it yourself.
+Read PHASE 1.5 RESEARCH before judging dimensions 1, 2 and 5. Treat it as a strong but fallible input. Where you doubt a finding, say so and check it yourself.
 
 CHECK FIVE DIMENSIONS:
 
@@ -361,7 +359,7 @@ Same as problem-verify: identify P0/P1 → fix or ignore → re-dispatch if fixe
 
 ### Duplication & Architecture Reviewer (#688) — controller dispatch
 
-**The two verifiers above do NOT run the duplication check and must not be told to dispatch reviewers.** They have no `task` tool and no `verdict:` field in their schema, so a nested dispatch would have no route back into the gate. After the verifier loop settles, the **controller** dispatches one more `task` sub-agent:
+**The verifier(s) above do NOT run the duplication check and must not be told to dispatch reviewers.** They have no `task` tool and no `verdict:` field in their schema, so a nested dispatch would have no route back into the gate. After the verifier loop settles, the **controller** dispatches one more `task` sub-agent:
 
 ```
 Read skills/reviewers/duplication-architecture/SKILL.md IN FULL — the file is the
@@ -853,7 +851,7 @@ Evaluate on: outcome quality, edge case handling, failure mode coverage, future 
 Do NOT evaluate on: diff size, number of files touched, implementation speed.
 ⛔ HYPOTHESIS, NOT PLAN: the issue body's prescribed fix ("the fix is X") is the author's hypothesis — one candidate approach. Re-derive from the CONFIRMED PROBLEM; adopt the body's fix only if it wins on evidence against the alternatives.
 
-1. PICK THE BEST APPROACH. Document why. Document rejected alternatives. When the choice is genuinely contested (2+ viable approaches, no clear winner), deliberate it on the graph instead of arguing in prose: options/criteria/findings → IMPL/NAND → `tortoise_compute_confidence`, and report the ranking (`tortoise-decide`).
+1. PICK THE BEST APPROACH. Document why. Document rejected alternatives. When the choice is genuinely contested (2+ viable approaches, no clear winner), deliberate it on the graph instead of arguing in prose: options/criteria/findings → IMPL/NAND → `tortoise_compute_confidence`, and report the ranking (`tortoise-decide`). If the graph is unreachable, argue it in prose and record the ranking with its reasoning — Tortoise is advisory, never blocking.
 2. DRAFT THE PLAN: problem statement, proposed solution, implementation plan, testing strategy, verification plan, acceptance criteria, runtime prerequisites.
 3. CLASSIFY THE DOMAIN — mandatory, binary. Is this gate/enforcement code whose correctness is "an attacker cannot make it fail open"? If YES, DECLARE THE ADVERSARIAL THREAT SURFACE: the in-scope bypass classes (each with the adversarial input and the required behaviour) and the classes explicitly OUT OF SCOPE. If NO, state `(not adversarial)` explicitly — an undeclared classification is a gap.
 

@@ -56,11 +56,11 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 
 ## Proportional Review Cycles
 
-Reviewer counts and cycle caps: `proportional-gates` §Review Cycles. The table below says *who* runs, not how many or for how long.
+Reviewer counts and cycle caps: `proportional-gates` §Review Cycles — never restated here. Tier crosswalk: `micro` → Low, `standard` → Low-Medium, `complex` → High.
 
 | Risk tier | Reviewers dispatched |
 |------|-----------|
-| **Micro** | none — micro plans are inline issue comments, not docs |
+| **Micro** | not applicable — `plan-review` does not run for Micro (see When to Use) |
 | **Low-Medium** (small plan, existing patterns) | **#1 Structural & Efficiency**, **#2 Integration** |
 | **Medium-High** (large plan, some novelty) | #1–#2 + **#3 UX Coherence** |
 | **High** (novel architecture, first-of-kind) | #1–#3 + **#4 Failure Mode Auditor** |
@@ -117,7 +117,7 @@ When review finds issues, the agent attempts to resolve them autonomously before
 
 Launch the proportional reviewer count (N) for the risk tier (`proportional-gates` §Review Cycles) **in parallel** via Pi `task`. Each receives the full plan doc, issue spec (if available), epic doc (if available), and research context (if resolved). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
-Every reviewer reads `## Verified Research Context` and `## Prior State (Tortoise)` **before** judging — a suggestion made without reading them is rejected. Treat both as strong but fallible: usually right, not always. Where a reviewer doubts a finding, it says so and verifies the claim itself rather than inheriting it.
+Every reviewer reads whichever of `## Verified Research Context` and `## Prior State (Tortoise)` are present **before** judging — an absent section means none was available, not a finding. Treat them as strong but fallible: where a reviewer doubts a finding it verifies the claim itself rather than inheriting it.
 
 ---
 
@@ -485,9 +485,9 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 - [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
-**No hard cap.** The loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (runaway prevention, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
+**No hard cap.** The loop continues until clean exit or convergence. The safety cap is the tier's **Max Cycles** row in `proportional-gates` §Review Cycles — if reached, escalate to human (runaway prevention, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
 
-**Half-budget research rule.** Once half the tier's cycle budget is spent and P0/P1 issues remain, every surviving issue needs research backing before the next fix attempt — the fixer cites the source it used for each, and an unresearched re-fix does not count as a fix. Re-fixing the same issues from memory past the halfway point is the signature of a loop going in circles; the remedy is evidence, not another attempt.
+**Half-budget research rule.** Once half the tier's **Max Cycles** (`proportional-gates` §Review Cycles) is spent and P0/P1 issues remain, every surviving issue needs research backing before the next fix — the fixer cites the source, or records `internal-only, no external source` for a purely internal issue (Phase 3). An unresearched re-fix does not count as a fix.
 
 **Stuckness detection (3-layer algorithm)**:
 

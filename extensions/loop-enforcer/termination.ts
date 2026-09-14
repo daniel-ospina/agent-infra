@@ -84,7 +84,7 @@ export interface CycleData {
  * not a guard (#723).
  */
 export const REVIEW_CYCLE_CAPS = {
-  /** Low — 1 reviewer, no re-review cycles. Never 0 *reviewers*: #485 blocks every tier at 0 dispatches. */
+  /** Low — 1 reviewer dispatch, 0 loop cycles (this cap counts TOTAL cycles, so 0 = no loop ever runs). Never 0 *reviewers*: #485 blocks every tier at 0 dispatches. */
   skip: 0,
   /** Low-Medium — 2 reviewers. */
   lowMedium: 3,

@@ -151,11 +151,11 @@ Produce a `### Testing Knowledge` block with ALL findings (from knowledge base +
 
 **If no surface map:** skip Phase 0 entirely — no domain-specific testing knowledge needed.
 
-### Phase 1 — Review (Parallel Agents)
+### Phase 1 — Review (4 Parallel Agents)
 
 Launch 4 reviewers **in parallel** via Pi `task`. Each receives the full test file(s), surface map (if available), and journey map (if available). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
-**Multi-file support:** TEST FILE may be a single file or a list. For multiple files, review all simultaneously — the reviewers examine all files in one dispatch. Output per-file issues with file path prefix. Limit 5 files per dispatch (context window).
+**Multi-file support:** TEST FILE may be a single file or a list. For multiple files, review all simultaneously — 4 parallel reviewers examine all files in one dispatch. Output per-file issues with file path prefix. Limit 5 files per dispatch (context window).
 
 **CRITICAL:** Every review cycle dispatches FRESH `task` sub-agents. Reviewers have no memory of prior cycles, no investment in defending prior fixes. This prevents confirmation bias.
 
