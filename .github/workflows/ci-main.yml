@@ -251,6 +251,10 @@ jobs:
           # (scripts/admin-merge.sh). Post-merge re-check of the same hermetic
           # suite ci.yml runs per-PR.
           bash tests/admin-merge/run.sh || errors=$((errors+1))
+          # #984 — the ARGV-LEVEL half: scripts/gh-shim/gh decides from its own argv
+          # (where bash has finished), so a splice cannot hide the flag. Same hermetic
+          # suite ci.yml runs per-PR.
+          bash tests/gh-shim/run.sh || errors=$((errors+1))
           # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
           # farm-link preservation, extensions/ content parity = #447 ship-list drift
           # tripwire, #446 launchctl isolation). Real setup.sh, hermetic (~2min).
