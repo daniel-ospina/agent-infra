@@ -95,7 +95,7 @@ export interface RiskRow {
   risk: string;
   /** Reviewer count parsed from the Reviewers cell. */
   reviewers: number;
-  /** Max Cycles cell; the Low row's em-dash means "review skipped" → 0. */
+  /** Max Cycles cell; the Low row's em-dash means "no re-review cycles" → 0. */
   maxCycles: number;
 }
 
@@ -273,7 +273,7 @@ export function mappingViolations(
     }
   };
 
-  check("REVIEW_CYCLE_CAPS.skip", caps.skip, 0);
+  check("REVIEW_CYCLE_CAPS.skip", caps.skip, 1);
   check("REVIEW_CYCLE_CAPS.lowMedium", caps.lowMedium, 2);
   check("REVIEW_CYCLE_CAPS.mediumHigh", caps.mediumHigh, 3);
   check("REVIEW_CYCLE_CAPS.high", caps.high, 4);
@@ -641,7 +641,7 @@ test("Review Cycles table parses to the four proportional rows", () => {
   deepEqual(
     TABLE.map((r) => [r.risk, r.reviewers, r.maxCycles]),
     [
-      ["Low", 0, 0],
+      ["Low", 1, 0],
       ["Low-Medium", 2, 3],
       ["Medium-High", 3, 5],
       ["High", 4, 10],
@@ -1111,7 +1111,7 @@ test("TIER_CONFIG pins the tier → risk-row assignment, not just the pair", () 
   deepEqual(
     Object.entries(TIER_CONFIG).map(([tier, cfg]) => [tier, cfg.reviewers, cfg.maxCycles]),
     [
-      ["micro", 0, 0],
+      ["micro", 1, 0],
       ["standard", 2, 3],
       ["complex", 4, 10],
     ],
@@ -1202,7 +1202,7 @@ test("rejects a non-numeric Reviewers cell (same strictness as Max Cycles)", () 
 });
 
 test("rejects a non-numeric, non-skip Max Cycles cell (no silent 0)", () => {
-  const bogus = MARKDOWN.replace("| Low | 0 (skip review) | — |", "| Low | 0 (skip review) | unlimited |");
+  const bogus = MARKDOWN.replace("| Low | 1 reviewer | — |", "| Low | 1 reviewer | unlimited |");
   ok(bogus !== MARKDOWN, "control did not apply — the Low row text moved; update this control");
   let threw = false;
   try {

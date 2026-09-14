@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# gh-shim/gh — the argv-level admin-merge guard (#984).
+#
+# WHY THIS EXISTS. The review-enforcer answers *"will this command text make gh
+# perform an admin merge?"* from STRING rules, and seven adversarial rounds each
+# closed one splice and found the next (`--ad""min`, `--ad\min`, `$'--admin'`,
+# `$'merge'`, `xargs {}`, `-${V:--}admin=true`, `$V-admin=true`). That class is not
+# closable in a scanner, and the reason is a proof rather than an impression:
+# resolving `$VAR`/`$(…)` requires EVALUATING a shell, which a gate cannot do
+# without running the very command it exists to refuse.
+#
+# This shim answers the same question from its OWN argv — a layer where the shell
+# has already finished. `-${V:--}admin=true` is the literal string `--admin` by the
+# time this process starts, so there is no splice left to hide behind and no string
+# rewriting to anticipate. The scanner stays as the fast first layer (it produces
+# better messages and costs nothing); THIS is the layer that does not share its
+# limit.
+#
+# Installed ahead of the real gh on PATH by the review-enforcer's `tool_call` hook,
+# so enforcement is not something a caller can forget.
+#
+# RULE: an admin merge is allowed only with a head-bound certifying evidence comment
+# for the CURRENT head. Everything else — every ordinary gh command — is passed
+# through untouched.
+#
+# THE PR POSITIONAL (#1007). gh takes a NUMBER, a URL, or a BRANCH in this slot. This
+# layer resolves a bare number and exactly ONE URL spelling —
+# `https://github.com/<owner>/<repo>/pull/<digits>` — and refuses every other value,
+# including a branch. That URL shape is safe to accept because the number is IN the
+# token: no second party is asked who the PR is. A branch selector is
+# refused DELIBERATELY, not for want of effort: resolving a branch to a number means
+# calling `gh`, i.e. a gate asking the thing it is gating for the identity it is about
+# to check — at which point the gate no longer has an independent answer. That refusal
+# is an over-block, and an over-block is a real defect (it is what pushes a caller at
+# AGENT_ADMIN_MERGE_OVERRIDE), so it is stated here and pinned by a test rather than
+# left as a surprise. An accepted URL is not waved through: it is resolved to a number
+# and routed through the FULL gate — head pinning, evidence, zero residual — exactly
+# as a bare number is.
+#
+# PARITY. The scanner (`extensions/review-enforcer/index.ts`, `extractMergeSelector` —
+# which `extractMergePrNumber` now delegates to) runs FIRST and accepts the SAME one URL
+# shape, so a caller sees one answer, not two. The case tables that pin this are
+# `tests/gh-shim/run.sh` §11 and `index.test.ts` ("extractMergeSelector: …"); §11(g) is
+# a tripwire that fails if the TS shape moves without this file being revisited.
+#
+# STATED LIMITS — WHAT THIS LAYER CANNOT SEE (the counterpart to the scanner's own
+# STATED LIMITS, which this layer backs rather than replaces):
+#   - `gh alias`. The argv here is `gh <alias> …`; gh expands the alias AFTER we
+#     have run, so an alias defined as `pr merge --admin` is invisible to BOTH
+#     layers. Named, not silently trusted.
+#   - a command that discards this PATH entry — `env -i … gh …`, or an explicit
+#     `PATH=` reset — and a caller that invokes the real gh by ABSOLUTE path.
+#     Both are deliberate acts to remove the guard rather than subtle ones to hide
+#     a token, which is the improvement this layer buys.
+#   - argv already expanded in a PARENT process the harness never sees.
+#   - it is only active where it is wired: the review-enforcer puts it on PATH for
+#     bash tool calls, so a merge issued from outside the harness is not covered.
+#   - the CERTIFICATE IS NOT AUTHENTICATED. It is checked for shape, bound to the
+#     head, and required to be non-vacuous — but it is comment TEXT, and the same
+#     token that would merge can also write the comment. An agent that types the
+#     certifying lines by hand satisfies this gate. That is why the post-merge
+#     detector, not this gate, is the authority of record; this gate raises the
+#     cost of an unevidenced merge, it does not prove one was earned.
+#   - `gh api graphql -f query=@file` / `--input <file>` / `-F query=@-`. The mutation
+#     text is read from a FILE or STDIN, so no argv token carries `mergePullRequest`.
+#     A file- or stdin-supplied query is therefore refused outright whenever the call is
+#     `gh api graphql`.
+#   - AGENT_GH_REAL and AGENT_ADMIN_MERGE_OVERRIDE ARE CALLER-CONTROLLED. Both are the
+#     "caller deliberately removes the guard" class — the same class as `env -i`, a
+#     `PATH=` reset, or invoking the real gh by absolute path. They exist because a
+#     nested call (the verifier shelling out to gh) must not re-enter this shim. What
+#     this layer defends against is a caller removing the guard WITHOUT MEANING TO — by
+#     splicing a token, or without knowing the guard is there. It is not, and cannot be,
+#     a defence against the caller deciding to remove it; the post-merge detector is what
+#     makes THAT visible after the fact, and AGENT_ADMIN_MERGE_OVERRIDE announces itself.
+#   - a BRANCH selector in the PR position (`gh pr merge my-branch --admin`) is refused
+#     rather than resolved (#1007) — see THE PR POSITIONAL above. This is an over-block
+#     and it is deliberate.
+#   - a non-`github.com` PR URL (GitHub Enterprise, `www.github.com`, an explicit port,
+#     a case-variant host) is refused rather than resolved (#1007). The host cannot be
+#     forwarded to the evidence lookup, so accepting it would read the evidence from a
+#     DIFFERENT host's repo — the `--repo` wrong-repo class in a new spelling.
+#
+# Env:
+#   AGENT_ADMIN_MERGE_OVERRIDE=1   the existing audited hatch: allow, loudly
+set -uo pipefail
+
+# Resolve THIS script's own directory through any symlinks. The harness injects a
+# NEUTRAL symlink (`~/.pi/agent/shims/gh` -> here) so the path it puts on PATH carries
+# no gate-relevant word; `dirname "${BASH_SOURCE[0]}"` would then yield the shim LINK's
+# directory, the verifier would resolve to a path that does not exist, and every admin
+# merge would be refused. Fail-closed, but the layer would be dead in production.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  self_dir="$(cd "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  case "$self" in /*) ;; *) self="$self_dir/$self" ;; esac
+done
+SELF_DIR="$(cd "$(dirname "$self")" && pwd)"
+# NO override: this path is derived from the script's own location, so a caller cannot
+# redirect the check at a file of its choosing. An earlier `AGENT_GH_SHIM_VERIFY` env
+# seam was reachable in PRODUCTION — `AGENT_GH_SHIM_VERIFY=/dev/null` made the check
+# exit 0 and the admin merge proceeded unevidenced, with no announcement (VGATE).
+VERIFY="$SELF_DIR/../verify-admin-merge-evidence.sh"
+
+# The real gh. `AGENT_GH_REAL` is set by an OUTER invocation so that a nested call
+# (the verifier shells out to gh itself) cannot recurse back into this shim.
+find_real_gh() {
+  [ -n "${AGENT_GH_REAL:-}" ] && [ -x "${AGENT_GH_REAL}" ] && { printf '%s' "$AGENT_GH_REAL"; return 0; }
+  local d
+  local old_ifs="$IFS"
+  IFS=:
+  for d in $PATH; do
+    case "$d" in "$SELF_DIR"|"") continue ;; esac
+    [ -x "$d/gh" ] || continue
+    # SKIP ANY DIRECTORY WHOSE `gh` IS THIS SCRIPT. Skipping only $SELF_DIR is not
+    # enough: the harness prepends a NEUTRAL directory holding a SYMLINK back to this
+    # script, so `-x "$d/gh"` was true for the shim itself, `REAL` became the shim, and
+    # `exec "$REAL"` re-entered forever — EVERY gh call hung (VGATE cycle 3). `-ef`
+    # compares device+inode THROUGH symlinks, so it catches a link, a link chain and a
+    # hardlink alike.
+    [ "$d/gh" -ef "$SELF_DIR/$(basename "$self")" ] && continue
+    printf '%s' "$d/gh"; IFS="$old_ifs"; return 0
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+REAL="$(find_real_gh)" || {
+  printf 'gh-shim: cannot find the real gh (searched PATH minus %s)\n' "$SELF_DIR" >&2
+  printf 'gh-shim: refusing to run an unresolvable gh — pass AGENT_GH_REAL if it lives elsewhere\n' >&2
+  exit 127
+}
+export AGENT_GH_REAL="$REAL"
+
+# Resolve a PR URL to `<owner> <repo> <number>`, or return non-zero when the token is
+# not EXACTLY one accepted URL shape (#1007). Strictness is the point: `…/pull/123`
+# is accepted because the number is in the token, and every near-miss is refused
+# because a gate must not guess at a route-equivalent spelling.
+#
+# Refused, each for a stated reason:
+#   - any host but `github.com` — the host cannot be carried into `--repo`, so the
+#     evidence lookup would run against a different host (see STATED LIMITS).
+#   - a query or fragment (`…/pull/123?s=1`, `…/pull/123#x`) — gh routes both to the
+#     same PR, but "route-equivalent" is not "the same string".
+#   - an extra path segment, incl. a trailing `/` (`…/pull/123/files`, `…/pull/123/`) —
+#     same reason, and it is how a `/pull/1/../2`-style confusion would enter.
+#   - a non-numeric number, an empty owner/repo, a bare `github.com/…` without a
+#     scheme. `http://` is NOT upgraded to `https://` here: a gate normalising input
+#     is a second parse that can disagree with gh's.
+#   - an owner/repo containing anything outside `[A-Za-z0-9_.-]` — GitHub's own repo
+#     alphabet, and the EXACT character class the scanner's `PR_URL_RE` uses. The two
+#     layers must accept the same set, or one over-blocks what the other accepts.
+#   - a BRANCH name. See THE PR POSITIONAL: resolving one needs a `gh` call.
+parse_pr_url() {
+  local u="$1" rest owner repo num
+  case "$u" in
+    *\?*|*\#*) return 1 ;;
+    https://github.com/*) ;;
+    *) return 1 ;;
+  esac
+  rest="${u#https://github.com/}"
+  owner="${rest%%/*}"
+  [ -n "$owner" ] || return 1
+  [ "$owner" = "$rest" ] && return 1          # no `/` after the owner
+  case "$owner" in *[!A-Za-z0-9_.-]*) return 1 ;; esac
+  rest="${rest#*/}"
+  repo="${rest%%/*}"
+  [ -n "$repo" ] || return 1
+  [ "$repo" = "$rest" ] && return 1           # no `/` after the repo
+  case "$repo" in *[!A-Za-z0-9_.-]*) return 1 ;; esac
+  rest="${rest#*/}"
+  case "$rest" in
+    pull/*) num="${rest#pull/}" ;;
+    *) return 1 ;;
+  esac
+  case "$num" in
+    ''|*[!0-9]*) return 1 ;;
+    # No leading zero: GitHub never emits one, and `Number()` on the TS side would map
+    # `01006` to `1006` while this side passed `01006` to the verifier — a divergence in
+    # the very value both layers exist to agree on.
+    0*) return 1 ;;
+  esac
+  # At most 15 digits. Every number this short survives a JS `Number` exactly, so the
+  # scanner (`PR_URL_RE` + its safe-integer check) accepts the SAME set; a longer one
+  # would be rounded there and read a DIFFERENT PR's evidence. No real repo is within
+  # 14 orders of magnitude of this bound.
+  [ "${#num}" -le 15 ] || return 1
+  printf '%s %s %s' "$owner" "$repo" "$num"
+}
+
+# Flag values that belong to gh's GLOBAL flags, so the walker does not mistake a
+# repo name for the command word. (`--repo` is also the flag the verifier needs.)
+# Value-taking flags of `gh pr merge` plus gh's globals. A VALUE must never be
+# mistaken for the PR positional: `gh pr merge --admin --body 123` would otherwise
+# verify PR #123 while the real command merges the CURRENT BRANCH's PR (VGATE).
+VALUE_FLAGS=' -R --repo --hostname -b --body -F --body-file -t --subject -A --author-email --match-head-commit '
+# Flags that take NO value. Anything else is UNRECOGNIZED, which makes the parse
+# untrustworthy: we cannot tell a future flag's value from the PR number.
+BOOL_FLAGS=' --merge -m --squash -s --rebase -r --delete-branch -d --auto --disable-auto --admin --help -h '
+
+CMD=""; SUB=""; PR_NUM=""; IS_ADMIN=0; REPO_FLAG=""; PR_URL_REPO=""
+seen_cmd=0; expect_value=0; prev_flag=""; saw_unknown_flag=""
+for tok in "$@"; do
+  if [ "$expect_value" -eq 1 ]; then
+    expect_value=0
+    tok_value="${tok#=}"
+    case "$prev_flag" in -R|--repo) REPO_FLAG="$tok_value" ;; esac
+    continue
+  fi
+  # ATTACHED forms carry the value in the same token, so they must be matched
+  # BEFORE the generic `-*` branch — `--repo=owner/other` and `-Rowner/other` are
+  # both accepted by gh, and dropping the repo reads the evidence from the WRONG
+  # repository (VGATE). `-R=owner/other` is also valid pflag.
+  case "$tok" in
+    --repo=*) REPO_FLAG="${tok#--repo=}"; continue ;;
+    -R?*)     REPO_FLAG="${tok#-R}"; REPO_FLAG="${REPO_FLAG#=}"; continue ;;
+    # Attached SHORT values (`-b123`, `-Ffile`) are the same as `-b 123`; they consume
+    # nothing further, and must not later be read as the positional.
+    -b?*|-F?*|-t?*|-A?*) continue ;;
+    # A bare `--` is an argument separator, never the positional.
+    --) continue ;;
+    # An ATTACHED value of a global flag. `--hostname=github.com` was refused as an
+    # unrecognized flag (over-block, VGATE cycle 3).
+    --hostname=*) continue ;;
+  esac
+  case "$tok" in
+    -R|--repo|--hostname) expect_value=1; prev_flag="$tok"; continue ;;
+  esac
+  case "$tok" in
+    -*)
+      # An admin flag is matched HERE, on resolved argv, where `--admin` is a
+      # literal string — the same value the scanner had to guess about.
+      case "$tok" in
+        --admin) IS_ADMIN=1 ;;
+        --admin=false|--admin=FALSE|--admin=False|--admin=0|--admin=f|--admin=F) ;;
+        --admin=*) IS_ADMIN=1 ;;
+      esac
+      # An ATTACHED value (`--body=123`) consumes nothing further. `--hostname=` was
+      # missing here, so a legitimate global flag was read as an UNKNOWN flag before the
+      # positional and the whole command was refused (#1007 VGATE cycle 2 — an over-block,
+      # exactly the class this issue exists to remove).
+      case "$tok" in
+        --body=*|--body-file=*|--subject=*|--author-email=*|--match-head-commit=*|--repo=*|--hostname=*) continue ;;
+      esac
+      case "$VALUE_FLAGS" in *" $tok "*) expect_value=1; prev_flag="$tok"; continue ;; esac
+      case "$BOOL_FLAGS" in *" $tok "*) continue ;; esac
+      saw_unknown_flag="$tok"
+      continue ;;
+  esac
+  if [ "$seen_cmd" -eq 0 ]; then CMD="$tok"; seen_cmd=1; continue; fi
+  if [ -z "$SUB" ]; then SUB="$tok"; continue; fi
+  [ -z "$PR_NUM" ] && PR_NUM="$tok"
+done
+
+# `gh api …/merge` is the other shape that lands a merge. The endpoint may carry a
+# QUERY or FRAGMENT (`…/merge?s=1`, accepted by gh and still routed to the merge
+# endpoint), so strip those before matching — matching the bare token missed it in
+# BOTH layers (VGATE).
+if [ "$CMD" = "api" ]; then
+  api_graphql=0
+  for tok in "$@"; do
+    [ "$tok" = "graphql" ] && api_graphql=1
+  done
+  for tok in "$@"; do
+    api_path="${tok%%\?*}"
+    api_path="${api_path%%#*}"
+    # CASE-INSENSITIVELY: GitHub's route matching is case-insensitive, so
+    # `PUT …/pulls/1/MERGE` reaches the same endpoint (live probe: 401, where a bogus
+    # path is 404) — the case-sensitive glob let it through in both layers (VGATE).
+    # `tr` rather than `${x,,}`: macOS ships bash 3.2, which lacks it.
+    api_path="$(printf '%s' "$api_path" | tr '[:upper:]' '[:lower:]')"
+    case "$api_path" in */merge|*/merge/*) IS_ADMIN=1 ;; esac
+    # GraphQL. `mergePullRequest` IS the mutation `gh pr merge --admin` itself issues
+    # (gh sends no admin field in its REST payload; it is the server-side mutation that
+    # performs the bypass), so calling it directly is ADMIN-EQUIVALENT and needs no
+    # obfuscation at all (VGATE cycle 2).
+    case "$tok" in *mergePullRequest*) IS_ADMIN=1 ;; esac
+    # …and when the query itself comes from a FILE or STDIN there is nothing to read, so
+    # refuse rather than assume benign (VGATE cycle 3). Gated on `graphql`, so an
+    # ordinary REST call that happens to carry an `@` is unaffected.
+    if [ "$api_graphql" -eq 1 ]; then
+      case "$tok" in
+        *@*|--input|--input=*) IS_ADMIN=1 ;;
+      esac
+    fi
+  done
+fi
+
+# Everything that is not an admin merge is not this shim's business.
+if [ "$IS_ADMIN" -eq 0 ]; then
+  exec "$REAL" "$@"
+fi
+
+# FROM HERE ON: an admin merge. Refusal is the default; the rail's evidence is the
+# only thing that opens it.
+if [ "${AGENT_ADMIN_MERGE_OVERRIDE:-}" = "1" ]; then
+  printf 'gh-shim: ⚠️  ADMIN-MERGE OVERRIDE — AGENT_ADMIN_MERGE_OVERRIDE=1 (audited).\n' >&2
+  printf 'gh-shim:    The post-merge detector still runs. Ensure the operator approved this.\n' >&2
+  exec "$REAL" "$@"
+fi
+
+if [ -z "$PR_NUM" ]; then
+  printf 'gh-shim: ✗ REFUSED — an admin merge with no PR number in argv cannot be justified.\n' >&2
+  printf 'gh-shim:   Name the PR so its head-bound evidence can be checked, or use the rail:\n' >&2
+  printf 'gh-shim:       scripts/admin-merge.sh <PR> [--workflow <lane>]\n' >&2
+  exit 1
+fi
+# An UNRECOGNIZED flag before the positional means we cannot tell a flag's VALUE
+# from the PR number (`--future-flag 123`). Fail closed rather than verify the
+# wrong PR.
+if [ -n "$saw_unknown_flag" ]; then
+  printf 'gh-shim: ✗ REFUSED — unrecognized flag %s before the PR number, so the number\n' "$saw_unknown_flag" >&2
+  printf 'gh-shim:   cannot be told from that flag'"'"'s value. Pass the PR first, or use the rail.\n' >&2
+  exit 1
+fi
+# The positional is either a bare number or the one accepted PR URL (#1007).
+case "$PR_NUM" in *[!0-9]*)
+  if parsed="$(parse_pr_url "$PR_NUM")"; then
+    # `parsed` is `<owner> <repo> <number>` — the repo is TWO fields joined by a
+    # slash, not one (a `%% *` on the whole string returns the repo alone).
+    parsed_rest="${parsed#* }"                      # `<repo> <number>`
+    PR_URL_REPO="${parsed%% *}/${parsed_rest%% *}"   # `owner/repo`
+    PR_NUM="${parsed_rest##* }"
+  else
+    printf 'gh-shim: ✗ REFUSED — %s is not a PR number or a github.com PR URL, so evidence cannot be resolved.\n' "$PR_NUM" >&2
+    printf 'gh-shim:   The positional may be a number or https://github.com/<owner>/<repo>/pull/<n>.\n' >&2
+    printf 'gh-shim:   A BRANCH name is deliberately NOT resolved: a gate does not ask gh who it is gating.\n' >&2
+    exit 1
+  fi ;;
+esac
+# A BARE number must satisfy the SAME rule `parse_pr_url` applies to the URL form: no
+# leading zero, at most 15 digits. The scanner holds a JS `Number`, which normalises
+# `01006` and ROUNDS above 2^53 (`9007199254740993` -> `...992`), while this side passes
+# the literal digits to gh — so without this the two layers can name different PRs and
+# the gate reads the wrong PR's evidence (fresh review, P2).
+case "$PR_NUM" in
+  ''|0*|*[!0-9]*)
+    printf 'gh-shim: ✗ REFUSED — %s is not a PR number both this shim and the scanner can\n' "$PR_NUM" >&2
+    printf 'gh-shim:   name exactly (no leading zero; digits only). Give the number GitHub prints.\n' >&2
+    exit 1 ;;
+esac
+if [ "${#PR_NUM}" -gt 15 ]; then
+  printf 'gh-shim: ✗ REFUSED — a %s-digit PR number cannot be held exactly by the scanner,\n' "${#PR_NUM}" >&2
+  printf 'gh-shim:   so the two layers could name different PRs. Use the URL form or the rail.\n' >&2
+  exit 1
+fi
+
+# A URL carries its OWN repo, and gh resolves the PR against the URL — it IGNORES a
+# contradicting `--repo` (probed live 2026-09-14: `gh pr view <agent-infra URL> --repo
+# <tortoise>` returned the agent-infra URL; `gh pr merge <URL to a repo that does not
+# exist> --repo <one that does>` failed on the URL's repo, and the mirror image failed
+# on the URL's PR and never on the bogus `--repo` — so `pr merge` and `pr view` share
+# one lookup). The URL's repo is therefore what the evidence must be read from:
+# dropping it would read the evidence from the CWD's repo, and honouring a
+# contradicting `--repo` would verify a PR gh is not about to merge. The URL wins here
+# for the same reason it wins in gh. `github.com/owner/repo` is the same repo as
+# `owner/repo` (gh accepts the HOST/-prefixed form), so the host is dropped for the
+# COMPARISON only — the value forwarded is unchanged.
+if [ -n "$PR_URL_REPO" ]; then
+  if [ -n "$REPO_FLAG" ] && [ "${REPO_FLAG#github.com/}" != "$PR_URL_REPO" ]; then
+    printf 'gh-shim: note: --repo %s is ignored — gh resolves a PR URL against the repo named in the URL (%s).\n' \
+      "$REPO_FLAG" "$PR_URL_REPO" >&2
+  fi
+  REPO_FLAG="$PR_URL_REPO"
+fi
+
+if [ ! -x "$VERIFY" ] && [ ! -f "$VERIFY" ]; then
+  printf 'gh-shim: ✗ REFUSED — the evidence verifier is missing (%s).\n' "$VERIFY" >&2
+  printf 'gh-shim:   Failing closed: an unverifiable admin merge does not happen.\n' >&2
+  exit 1
+fi
+
+verify_args=("$PR_NUM")
+[ -n "$REPO_FLAG" ] && verify_args+=(--repo "$REPO_FLAG")
+verify_out="$(bash "$VERIFY" "${verify_args[@]}" 2>&1)"
+verify_rc=$?
+if [ "$verify_rc" -ne 0 ]; then
+  printf '%s\n' "$verify_out" | sed 's/^/gh-shim: /' >&2
+  printf 'gh-shim: ✗ REFUSED — no head-bound evidence justifies this admin merge (PR #%s).\n' "$PR_NUM" >&2
+  printf 'gh-shim:   `--admin` bypasses required checks, so it needs the rail certificate:\n' >&2
+  printf 'gh-shim:       scripts/admin-merge.sh %s [--workflow <lane>]\n' "$PR_NUM" >&2
+  exit 1
+fi
+
+printf 'gh-shim: ✅ head-bound evidence verified for PR #%s — allowing the admin merge.\n' "$PR_NUM" >&2
+exec "$REAL" "$@"

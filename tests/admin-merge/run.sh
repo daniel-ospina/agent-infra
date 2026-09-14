@@ -206,6 +206,15 @@ lane_queued() { lane_line in_progress "" "$1" "$2"; }
 # helper, the guard blocks the whole suite again in an agent session.
 cfs_diff() { bash "$CFS" --diff "$1" "$2"; }
 
+# Same reason as cfs_diff, one indirection further out: the #1484 classifier fails
+# closed on a `$(bash <path> …)` substitution, because that is also the shape of the
+# closed script backdoor. Calling the guard through a function whose body is the plain
+# invocation keeps the suite runnable by an agent — inlining it again re-blocks the
+# WHOLE suite, which is how the cycle-3 review caught this (it was self-inflicted, not
+# a classifier defect: the commit that mentioned "the #1484 classifier" was the one
+# that introduced the pattern).
+lane_tested() { bash "$ROOT/scripts/check-lane-tested.sh" "$@"; }
+
 # ── 1. --diff is set subtraction on unsorted, duplicated input ─────────────
 echo "== 1. --diff (the single shared comparison) =="
 printf 'b\na\na\n' > "$TMP/a.txt"
@@ -357,7 +366,7 @@ if [ -f "$SCEN/comment" ]; then
   c="$SCEN/comment"
   grep -q "<!-- admin-merge-safety: $HEAD_SHAPE -->" "$c" && pass "marker binds the head SHA" || fail "marker missing/not head-bound"
   grep -q "^PR head: $HEAD_SHAPE$" "$c" && pass "PR head recorded" || fail "PR head line missing"
-  grep -q "main compared (union of 4 runs of python-ci.yml): main6666:1001" "$c" && pass "main provenance recorded as sha:run-id, lane named" || fail "main provenance line wrong"
+  grep -q "main compared (union of 1 run of python-ci.yml): main6666:1001" "$c" && pass "main provenance recorded as sha:run-id, lane named" || fail "main provenance line wrong"
   grep -q "^test lane: python-ci.yml$" "$c" && pass "the lane is stated in the evidence" || fail "test lane line missing"
   grep -q "PR failing: 1 | main failing: 1 | unique to this PR: 0" "$c" && pass "counts line exact" || fail "counts line wrong"
   grep -q "Failing runs examined: PR=1 main=1" "$c" && pass "examined/extracted counts recorded" || fail "examined counts missing"
@@ -382,7 +391,7 @@ fi
 # ── 7. merge flags pass through ───────────────────────────────────────────
 echo "== 7. extra merge flags pass through (not hardcoded) =="
 run_admin 42 --main-runs 4 --squash --delete-branch >/dev/null 2>&1
-if grep -q "pr merge 42 --admin --match-head-commit $HEAD_SHAPE --squash --delete-branch" "$SCEN/calls"; then
+if grep -q "pr merge 42 --admin --squash --delete-branch --match-head-commit $HEAD_SHAPE" "$SCEN/calls"; then
   pass "--squash/--delete-branch forwarded and the merge is head-pinned (--match-head-commit)"
 else
   fail "merge flags were not forwarded, or the merge is not head-pinned"
@@ -477,7 +486,7 @@ else
   fail "expected exit 0 with the lane filter, got $rc"
   sed 's/^/      /' "$TMP/err"
 fi
-grep -q "main compared (union of 10 runs of python-ci.yml): main8888:4001" "$SCEN/comment" \
+grep -q "main compared (union of 1 run of python-ci.yml): main8888:4001" "$SCEN/comment" \
   && pass "evidence names the lane and the lane-filtered provenance" \
   || fail "evidence does not record the lane-filtered provenance"
 
@@ -686,12 +695,24 @@ rc=$?
 grep -q "actually TESTED" "$TMP/err" && pass "the block says the run tested nothing" || fail "expected the not-tested reason on stderr"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a cancelled run" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+# …and it must NOT be mislabelled as a lane that does not run on PRs. A cancelled
+# run DID run (terminal, tested=0) — that is the case the lines above describe,
+# and the main-only diagnosis is a different fault with a different fix (VGATE).
+grep -q "MAIN-ONLY lane" "$TMP/err" \
+  && fail "a cancelled run was mislabelled as a MAIN-ONLY lane — it had a run for this head" \
+  || pass "a cancelled-only head is not mislabelled as a main-only lane"
 # ...but a cancelled run ALONGSIDE a run that did execute must NOT block: the real
 # run is the evidence. A fix that over-blocks gets the gate disabled.
 new_scen cancelled-plus
 printf '%s\n' "$HEAD_CX" > "$SCEN/head"
 lane_line completed cancelled "$HEAD_CX" 7703 > "$SCEN/runs-$HEAD_CX"
 lane_pass "$HEAD_CX" 7704 >> "$SCEN/runs-$HEAD_CX"
+# The baseline is a REQUIRED half of this scenario, not scenery: without it the
+# rail has nothing to compare against and now says so (#1003), which would make
+# this test pass for the wrong reason. It was missing here, so the head-side
+# assertion below was riding on a comparison that never happened.
+lane_fail maincafe 7705 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7705"
 run_admin 42 --main-runs 1 --dry-run >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "a cancelled run beside a tested run → allow (exit 0)" || fail "expected exit 0, got $rc — the tested-count fix over-blocks"
@@ -884,7 +905,7 @@ if [ -f "$SCEN/comment" ]; then
   grep -q "PR failing: 250 | main failing: 250 | unique to this PR: 0" "$c" \
     && pass "the counts line keeps the FULL, uncapped count" || fail "the counts line was corrupted"
   grep -q "^PR head: $HEAD_BIG$" "$c" && pass "the head binding survives" || fail "the head line was lost"
-  grep -q "main compared (union of 1 runs of python-ci.yml): mainfeed:9902" "$c" \
+  grep -q "main compared (union of 1 run of python-ci.yml): mainfeed:9902" "$c" \
     && pass "the provenance line is intact" || fail "the provenance line was lost"
 else
   fail "no evidence comment posted for the 250-entry case"
@@ -990,6 +1011,228 @@ if [ -f "$SCEN/comment" ]; then
 else
   fail "no evidence comment posted for the 60-run case"
 fi
+
+# ── 28. SPLIT-TRIGGER LANES: a lane must exist on BOTH sides (#1003) ────────
+# A repo can split its lanes by TRIGGER — a pull_request-only lane and a
+# push-only lane (agent-infra itself: ci.yml is PR-only, ci-main.yml is
+# main-only). Then NO single --workflow spans both sides, and two distinct
+# faults follow. Both are asserted here.
+echo "== 28. a lane with no runs on main is not a baseline (#1003) =="
+
+# (a) THE FALSE CLAIM. `--main-runs` is the REQUESTED window; the certifying
+# line used to print it as though it were the number of runs unioned. With 1
+# main run and --main-runs 10 the comment asserted "union of 10 runs" — in the
+# one line the review-enforcer trusts enough to certify a bypass. The count must
+# be what was ACTUALLY unioned.
+new_scen unioncount
+HEAD_UC="f0f0000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_UC" > "$SCEN/head"
+lane_pass "$HEAD_UC" 8901 > "$SCEN/runs-$HEAD_UC"
+# TWO failing main runs against a requested window of TEN.
+{ lane_fail mainaaaa 8902; lane_fail mainbbbb 8903; } > "$SCEN/runs-main"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-8902"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-8903"
+run_admin 42 --main-runs 10 --dry-run >/dev/null 2>&1
+got="$(grep -o 'main compared (union of [0-9]* runs' "$TMP/out" | head -1)"
+grep -q "main compared (union of 2 runs of python-ci.yml)" "$TMP/out" \
+  && pass "the evidence states the union size ACTUALLY used (2), not the requested window (10)" \
+  || fail "the evidence claims a union size it did not compute (got: '$got')"
+grep -q "union of 10 runs" "$TMP/out" \
+  && fail "the REQUESTED window is still asserted as if it were the union" \
+  || pass "no inflated union claim"
+
+# …but a lane that is GREEN on both sides is not "missing": its runs EXIST and
+# merely passed. Conflating the two would block every clean repo — the vacuous
+# case is an outcome of a comparison that happened, and must stay certifiable.
+new_scen greenboth
+printf '%s\n' "$HEAD_UC" > "$SCEN/head"
+lane_pass "$HEAD_UC" 8911 > "$SCEN/runs-$HEAD_UC"
+{ lane_pass maincccc 8912; lane_pass maindddd 8913; } > "$SCEN/runs-main"
+run_admin 42 --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a lane green on BOTH sides → certify (exit 0), not blocked" \
+  || fail "expected exit 0 for a lane that exists on both sides and is green, got $rc"
+grep -q "vacuous comparison" "$TMP/out" \
+  && pass "…and it reads as VACUOUS (a comparison that happened), not as a missing baseline" \
+  || fail "a green lane on both sides must read as vacuous, not as missing"
+
+# (b) THE SPLIT ITSELF. The lane has runs on the PR side and NONE on main — the
+# empty baseline absorbs nothing, so a PRE-EXISTING failure is attributed to the
+# PR and a safe merge is refused for the wrong reason. The certificate is a
+# comparison; with nothing to compare against there is no certificate, and the
+# block must name the way to a real baseline rather than leaving the caller to
+# guess.
+new_scen splitlane
+HEAD_SPLIT="f1f1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SPLIT" > "$SCEN/head"
+lane_fail "$HEAD_SPLIT" 8801 > "$SCEN/runs-$HEAD_SPLIT"
+log_failed 'tests/test_new.py::test_new' > "$SCEN/log-8801"
+lane_fail mainbusy1 8802 > "$SCEN/runs-main"          # main is busy…
+log_failed 'tests/test_other.py::test_red_main' > "$SCEN/log-8802"
+: > "$SCEN/runs-main.by-workflow.python-ci.yml"          # …but never in THIS lane
+run_admin 42 --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a lane with no runs on main → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — certified against a baseline that does not exist"
+grep -q "never TESTED main" "$TMP/err" \
+  && pass "the block says the lane provides no baseline" \
+  || fail "expected the no-baseline reason on stderr"
+grep -q -- "--any-workflow" "$TMP/err" \
+  && pass "the block names the way to a real baseline (--any-workflow)" \
+  || fail "the block offers no way out of the split"
+grep -q "vacuous comparison" "$TMP/err" \
+  && fail "a MISCONFIGURATION is reported as a vacuous COMPARISON — the two must be distinguishable" \
+  || pass "the no-baseline fault is not mislabelled as a vacuous comparison"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted against a baseline that does not exist" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (c) THE OTHER DIRECTION: a MAIN-ONLY lane, i.e. the lane has runs on main and
+# none for the head. "The lane ran but exercised nothing" and "this lane does not
+# run on pull requests" are different faults with different fixes (wait for CI vs
+# change the lane), so the block must not conflate them.
+new_scen mainonly
+HEAD_MO="f2f2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_MO" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_MO"
+lane_fail mainfeed 9002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9002"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a lane with no runs for the head → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0"
+grep -q "MAIN-ONLY lane" "$TMP/err" \
+  && pass "the block names the split SHAPE (a main-only lane) instead of only 'nothing tested'" \
+  || fail "the block cannot distinguish a main-only lane from one that merely has not started"
+
+# (d) A main lane whose runs are all `cancelled`/`skipped` exercised NOTHING, so
+# it is not a baseline either. `completed` would ACCEPT it; only `tested` refuses.
+# Nothing pinned this: swapping the counter to `completed` left the suite green
+# while a cancelled-only baseline fail-opened.
+new_scen maincancelled
+printf '%s\n' "$HEAD_UC" > "$SCEN/head"
+lane_pass "$HEAD_UC" 8921 > "$SCEN/runs-$HEAD_UC"
+lane_line completed cancelled maincanc 8922 > "$SCEN/runs-main"
+run_admin 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a main lane whose only run was CANCELLED → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — a cancelled baseline run certified the merge"
+grep -q "never TESTED main" "$TMP/err" && pass "…for the no-baseline reason" \
+  || fail "expected the no-baseline reason on stderr"
+
+# (e) A NON-NUMERIC counter is a report-contract violation (version skew).
+# `[ "$x" -eq 0 ]` on such a value returns 2, and under `set -uo pipefail` (no
+# `-e`) that SKIPS the body — so the guard fails OPEN and merges against a
+# baseline that was never computed. The counter must be VALIDATED, not trusted.
+# Driven through the parser seam so this is the real rail, not a grep.
+cat > "$TMP/garbage-parser" <<'STUB'
+#!/usr/bin/env bash
+# A parser whose MAIN-side `tested` is not a number (contract violation).
+rep=""; mode=""; i=0; args=("$@")
+while [ "$i" -lt "${#args[@]}" ]; do
+  case "${args[$i]}" in
+    --runs-report) i=$((i+1)); rep="${args[$i]}" ;;
+    --commit) mode=pr; i=$((i+1)) ;;
+    --main-union) mode=main; i=$((i+1)) ;;
+    --diff) mode=diff ;;
+  esac
+  i=$((i+1))
+done
+case "$mode" in
+  pr)   [ -n "$rep" ] && printf 'examined=0\nextracted=0\ncompleted=1\ntested=%s\npending=%s\n' "${STUB_PR_TESTED:-1}" "${STUB_PR_PENDING:-0}" > "$rep" ;;
+  main) [ -n "$rep" ] && printf 'examined=0\nextracted=0\ncompleted=1\ntested=%s\npending=0\n' "${STUB_MAIN_TESTED:-1}" > "$rep" ;;
+esac
+exit 0
+STUB
+chmod +x "$TMP/garbage-parser"
+new_scen garbagecounter
+printf '%s\n' "$HEAD_UC" > "$SCEN/head"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_FAILURE_SET_SH="$TMP/garbage-parser" \
+  STUB_MAIN_TESTED='n/a' ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --dry-run >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a NON-NUMERIC main 'tested' → BLOCK (exit $rc), not fail-open" \
+  || fail "a non-numeric baseline counter CERTIFIED the merge — [-eq] fails open on garbage"
+grep -q "never TESTED main" "$TMP/err" && pass "…for the no-baseline reason" \
+  || fail "expected the no-baseline reason for a malformed counter"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on a malformed report" \
+  || pass "no merge attempted"
+
+# (f) …and the SAME hole on the head side, which `pending` had while `tested` was
+# already validated: `[ "$x" -gt 0 ]` returns 2 on `n/a`, the body is skipped, the
+# rail reads "nothing pending" and merges with the lane possibly still running.
+# "Not proven finished" is not "finished". check-lane-tested.sh already refuses
+# `pending=garbage`; the rail must not disagree with it.
+new_scen garbagepending
+printf '%s\n' "$HEAD_UC" > "$SCEN/head"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_FAILURE_SET_SH="$TMP/garbage-parser" \
+  STUB_PR_PENDING='n/a' ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --dry-run >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a NON-NUMERIC head 'pending' → BLOCK (exit $rc), not fail-open" \
+  || fail "an unreadable 'pending' CERTIFIED the merge — the rail cannot show the lane finished"
+grep -q "has NOT finished" "$TMP/err" && pass "…for the not-finished reason" \
+  || fail "expected the not-finished reason for an unreadable pending"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on an unreadable report" \
+  || pass "no merge attempted"
+
+# ── 29. cycle-3 review: a false certificate, a rebindable binding, and two
+#        fail-opens in the guard's own counters ──────────────────────────────
+echo "== 29. an unattributed failing run, the head binding, and pending =="
+
+# (a) A FAILING run whose log yields NO `FAILED <nodeid>` line contributes NOTHING to
+# the set, so "unique to this PR: 0" is unsupported — the certificate would be FALSE.
+# Before the fix the rail printed `PR failing: 0` for a RED lane and merged it.
+new_scen unattributed
+HEAD_UA="a1a1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_UA" > "$SCEN/head"
+lane_fail "$HEAD_UA" 9101 > "$SCEN/runs-$HEAD_UA"
+printf 'test (a)\tRun tests\tImportError: no module named y\n' > "$SCEN/log-9101"
+lane_fail mainua 9102 > "$SCEN/runs-main"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9102"
+run_admin 42 --main-runs 3 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "a failing run with NO parseable id BLOCKS (exit $rc)" \
+  || fail "a RED lane was certified as zero-residual — a false certificate"
+[ -f "$SCEN/comment" ] && fail "  …but an evidence comment was posted" || pass "  …no evidence comment"
+grep -q "pr merge" "$SCEN/calls" && fail "  …but a merge was attempted" || pass "  …and no merge was attempted"
+grep -q "parseable" "$TMP/err" && pass "  …and the refusal names the reason" || fail "  …the refusal is unexplained"
+
+# …while a failing run that IS attributable behaves exactly as before (no over-block).
+new_scen attributed
+printf '%s\n' "$HEAD_UA" > "$SCEN/head"
+lane_fail "$HEAD_UA" 9111 > "$SCEN/runs-$HEAD_UA"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9111"
+lane_fail mainua2 9112 > "$SCEN/runs-main"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9112"
+run_admin 42 --main-runs 3 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && pass "an attributable failure present on both sides still certifies (no over-block)" \
+  || fail "a normal zero-residual merge was blocked: $(head -1 "$TMP/err")"
+
+# (b) `--match-head-commit` must come AFTER the caller's passthrough: gh takes the LAST
+# occurrence of a scalar flag, so the old order let `-- --match-head-commit <other>`
+# rebind the merge to a head other than the certified one.
+new_scen rebound
+HEAD_RB="b2b2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_RB" > "$SCEN/head"
+lane_fail "$HEAD_RB" 9201 > "$SCEN/runs-$HEAD_RB"
+log_failed 'tests/test_same.py::test_same' > "$SCEN/log-9201"
+lane_fail mainrb 9202 > "$SCEN/runs-main"
+log_failed 'tests/test_same.py::test_same' > "$SCEN/log-9202"
+run_admin 42 --main-runs 3 -- --match-head-commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef >/dev/null 2>&1
+last_mhc="$(grep -o -- '--match-head-commit [0-9a-fA-F]*' "$SCEN/calls" | tail -1)"
+[ "$last_mhc" = "--match-head-commit $HEAD_RB" ] \
+  && pass "the certified head is the LAST --match-head-commit, so a passthrough cannot rebind it" \
+  || fail "a passthrough rebound the merge (last flag: '$last_mhc')"
+
+# (c) A report with NO `pending` counter is from a parser too old to answer the question.
+# Defaulting it to 0 (as this did) silently asserted "nothing is still running".
+printf 'examined=1\nextracted=1\ncompleted=1\ntested=1\n' > "$TMP/rep-nopending.txt"
+out="$(lane_tested "$TMP/rep-nopending.txt" lane sha 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && pass "a report MISSING 'pending' cannot certify (exit $rc)" \
+  || fail "a missing 'pending' defaulted to 0 and certified the lane"
+case "$out" in *"no 'pending' counter"*) pass "  …and it names the missing counter" ;; *) fail "  …unexplained: $out" ;; esac
+printf 'examined=1\nextracted=1\ncompleted=1\ntested=1\npending=0\n' > "$TMP/rep-pending0.txt"
+lane_tested "$TMP/rep-pending0.txt" lane sha >/dev/null 2>&1 \
+  && pass "  …while an explicit pending=0 certifies (no over-block)" \
+  || fail "an explicit pending=0 was refused"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
