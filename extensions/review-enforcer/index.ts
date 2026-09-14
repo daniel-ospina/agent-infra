@@ -250,40 +250,75 @@ const COMMAND_INTRODUCERS =
 /** A separator GLUED to the following word: `true;gh pr merge 1`, `(gh pr merge 1`. */
 const GLUED_SEPARATOR = /^[;&|(){!]+/;
 
-function hasBareGhWord(command: string): boolean {
+/**
+ * Split `command` into the words a shell would see, recording where each one
+ * starts and which characters sit outside a quoted region.
+ *
+ * Split on SEPARATORS as well as whitespace: `true;gh pr merge 1` is two commands
+ * with no space between them and `(gh pr merge 1` is one — a whitespace-only split
+ * leaves `;gh` / `(gh` as single tokens that never equal `gh`.
+ */
+interface ScanTokens {
+  joined: string;
+  mask: boolean[];
+  tokens: string[];
+  starts: number[];
+  gaps: string[];
+}
+
+function scanTokens(command: string): ScanTokens {
   // bash removes a backslash-newline outright, so `g\<newline>h` is the command
   // `gh`. Do the same before tokenizing, or the continuation splits the name.
   const joined = stripRepoArgs(command).replace(/\\\r?\n/g, "");
   const mask = unquotedMask(joined);
-  // Split on separators as well as whitespace. `true;gh pr merge 1` is two
-  // commands with no space between them and `(gh pr merge 1` is one - a
-  // whitespace-only split leaves `;gh` / `(gh` as single tokens that never equal
-  // `gh`, so the glued-separator spellings skipped both gates.
   const tokens = joined.split(/[\s;&|(){!]+/).filter((t) => t.length > 0);
+  const starts: number[] = [];
+  const gaps: string[] = [];
   let at = 0;
-  let prev: string | null = null;
   let prevEnd = 0;
   for (const tok of tokens) {
     const start = joined.indexOf(tok, at);
+    starts.push(start);
     at = start + tok.length;
-    // The text between the previous token and this one. The separators are NOT
-    // part of a token (and `joined` normalisation is not applied here), so a
-    // separator is only visible in this gap: `true && "gh" ...` has prev=`true`
-    // but `&&` in the gap, and `true;gh ...` is the same command with no space.
-    const gap = joined.slice(prevEnd, start);
-    if (tok.replace(/["'\\]/g, "").replace(GLUED_SEPARATOR, "") === "gh") {
-      const partiallyUnquoted = [...tok].some((_, i) => mask[start + i]);
-      const commandPosition =
-        prev === null ||
-        /[;&|(){!]/.test(gap) ||
-        COMMAND_INTRODUCERS.test(prev) ||
-        /^-[a-z]*c$/.test(prev); // `sh -c '...'`, `bash -lc '...'`
-      if (partiallyUnquoted || commandPosition) return true;
-    }
-    prev = tok;
+    // The text BETWEEN the previous token and this one. Separators are not part
+    // of any token, so a separator is only visible in this gap: `true && "gh" ...`
+    // has prev=`true` but `&&` in the gap, and `true;gh ...` is the same command
+    // written with no space.
+    gaps.push(joined.slice(prevEnd, start));
     prevEnd = start + tok.length;
   }
-  return false;
+  return { joined, mask, tokens, starts, gaps };
+}
+
+/** A shell word with its quoting removed: `"gh"`, `''gh`, `\gh`, `` `gh `` → `gh`. */
+function dequote(tok: string): string {
+  return tok.replace(/["'\\`]/g, "").replace(GLUED_SEPARATOR, "");
+}
+
+/** Would the shell RUN this word as `gh` (rather than merely quoting the string)? */
+function isGhWordAt(scan: ScanTokens, i: number): boolean {
+  const tok = scan.tokens[i];
+  if (tok === undefined || dequote(tok) !== "gh") return false;
+  const start = scan.starts[i];
+  // A splice INSIDE the word (`g"h"`, `''gh`, `\gh`) is the command name wherever
+  // it sits. A FULLY quoted word (`"gh"`) is executable only in command position.
+  const partiallyUnquoted = [...tok].some((_, k) => scan.mask[start + k]);
+  if (partiallyUnquoted) return true;
+  const prev = i === 0 ? null : scan.tokens[i - 1];
+  return (
+    prev === null ||
+    // A newline is a command separator too: `gh pr merge 111 --admin\n"gh" pr
+    // merge 999 --admin` is two commands. Without \n here the second (fully
+    // quoted) verb lost its command position and the compound count stayed 1.
+    /[;&|(){!\n\r]/.test(scan.gaps[i]) ||
+    COMMAND_INTRODUCERS.test(prev) ||
+    /^-[a-z]*c$/.test(prev) // `sh -c '...'`, `bash -lc '...'`
+  );
+}
+
+function hasBareGhWord(command: string): boolean {
+  const scan = scanTokens(command);
+  return scan.tokens.some((_, i) => isGhWordAt(scan, i));
 }
 
 /**
@@ -1052,8 +1087,21 @@ const GO_FALSE = new Set(["0", "f", "F", "FALSE", "false", "False"]);
  * treats >1 as a fail-closed block rather than guessing which PR was meant.
  */
 export function countMergeVerbs(command: string): number {
-  const bare = stripRepoArgs(command).replace(/\\\r?\n/g, " ");
-  return (bare.match(/(^|[\s;&|(){!])gh\s+pr\s+merge(?=\s|$)/g) ?? []).length;
+  // This MUST use the same recognizer the gate uses (`isGhWordAt`), not a second
+  // regex. Cycle-2 review: a regex here counted 1 for
+  // `gh pr merge 111 --admin; sh -c 'gh pr merge 999 --admin'` — the second verb
+  // is wrapped, so it did not match — the `> 1` fail-closed guard was skipped and
+  // 999 merged unevidenced. Two disagreeing predicates is the exact failure this
+  // file keeps re-learning (VGATE round 9), so the count walks the same tokens.
+  const scan = scanTokens(command);
+  let n = 0;
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (!isGhWordAt(scan, i)) continue;
+    if (dequote(scan.tokens[i + 1] ?? "") !== "pr") continue;
+    if (dequote(scan.tokens[i + 2] ?? "") !== "merge") continue;
+    n++;
+  }
+  return n;
 }
 
 export function extractMergePrNumber(command: string): number | null {

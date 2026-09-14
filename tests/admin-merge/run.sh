@@ -777,9 +777,32 @@ echo ""
 # performed. The guard must read `--runs-report` and exit non-zero.
 echo "== 23. the detector refuses to certify a lane that never ran =="
 grep -q -- '--runs-report merged-report.txt' "$DET" && pass "the detector collects the merged commit's run report" || fail "no --runs-report on the merged-commit call — the vacuity guard cannot exist"
-grep -q 'merged_tested=' "$DET" && pass "the detector reads the \`tested\` count" || fail "the detector never inspects \`tested\`"
-grep -q 'merged_tested:-0}" -eq 0' "$DET" && pass "a lane with tested=0 is refused" || fail "tested=0 would read as 'no unique failures' — the vacuity hole"
-grep -q 'merged_pending:-0}" -gt 0' "$DET" && pass "a lane with a pending run is refused" || fail "a pending run would be treated as tested"
+grep -q 'check-lane-tested.sh merged-report.txt' "$DET" && pass "the detector delegates the guard to the shipped script" || fail "the detector does not call scripts/check-lane-tested.sh"
+# Drive the REAL guard with fixtures. A grep-only assertion cannot tell a working
+# guard from one neutralised to `||` (cycle-2 review P2), so exercise the script.
+GUARD="$ROOT/scripts/check-lane-tested.sh"
+if [ -f "$GUARD" ]; then
+  gdir="$SCEN/guard"; mkdir -p "$gdir"
+  printf 'examined=1\nextracted=1\ncompleted=1\ntested=0\npending=0\n' > "$gdir/never-ran.txt"
+  printf 'examined=1\nextracted=1\ncompleted=1\ntested=0\npending=1\n' > "$gdir/pending.txt"
+  printf 'examined=2\nextracted=2\ncompleted=2\ntested=2\npending=0\n' > "$gdir/ran.txt"
+  printf 'examined=1\nextracted=1\ncompleted=1\n' > "$gdir/no-tested-key.txt"
+  printf 'examined=0\nextracted=0\ncompleted=0\ntested=0\npending=0\n' > "$gdir/empty-lane.txt"
+  run_guard() { bash "$GUARD" "$1" python-ci.yml deadbeef >/dev/null 2>&1; }
+  run_guard "$gdir/never-ran.txt" && fail "tested=0 was CERTIFIED — the vacuity hole is open" || pass "a lane with tested=0 is refused"
+  run_guard "$gdir/pending.txt" && fail "a pending run was CERTIFIED" || pass "a lane with a pending run is refused"
+  run_guard "$gdir/empty-lane.txt" && fail "an empty lane was CERTIFIED" || pass "a lane with zero runs is refused"
+  run_guard "$gdir/no-tested-key.txt" && fail "a report with no 'tested' counter was CERTIFIED (must fail closed)" || pass "a report missing the 'tested' counter is refused"
+  run_guard "$gdir/ran.txt" || fail "a lane that DID test the commit was refused — the guard is too strict"
+  run_guard "$gdir/ran.txt" && pass "a lane that genuinely tested the commit is accepted"
+  run_guard "$gdir/does-not-exist.txt" && fail "a missing report was CERTIFIED" || pass "a missing report is refused"
+  # The lane must be repo-configurable WITHOUT editing the workflow: a repo whose
+  # test lane is not python-ci.yml used to have to edit its copy, which breaks the
+  # template/materialized byte-parity pipeline-compliance enforces (cycle-2 P2).
+  grep -q 'ADMIN_MERGE_DETECTOR_WORKFLOW' "$DET" && pass "the lane is configurable from a repo variable, so parity can hold" || fail "the lane is hardcoded — a repo with a different lane must break template parity to fix it"
+else
+  fail "missing scripts/check-lane-tested.sh — the guard cannot be tested as shipped"
+fi
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

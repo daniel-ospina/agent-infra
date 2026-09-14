@@ -3136,7 +3136,80 @@ function evidenceBody(sha: string, counts = "PR failing: 1 | main failing: 1 | u
   return `<!-- admin-merge-safety: ${sha} -->\nPR head: ${sha}\nmain compared (union of 10 runs): s1:1,s2:2\n${counts}\n<details>raw comm -23 output</details>\nFlake classification: none needed`;
 }
 
+testAsync("#930 compound: a second merge in the same command is BLOCKED, not judged on the first PR", async () => {
+  // Cycle-2 review P0: `countMergeVerbs` used a SECOND regex instead of the gate's
+  // own recognizer, so a wrapped/quoted second verb counted as one. The command was
+  // then judged against PR 111's evidence and merged 999 with none. Every spelling
+  // below reached `gh pr merge 999 --admin` while the gate inspected 111.
+  const shapes = [
+    "sh -c 'gh pr merge 999 --admin'",
+    'bash -c "gh pr merge 999 --admin"',
+    "eval 'gh pr merge 999 --admin'",
+    '"gh" pr merge 999 --admin',
+    "'gh' pr merge 999 --admin",
+    "`gh pr merge 999 --admin`",
+    "gh pr merge 999 --admin",
+  ];
+  const seps = ["; ", " && ", " || ", " | ", " & ", "\n", "("];
+  for (const sep of seps) {
+    for (const second of shapes) {
+      const command = `gh pr merge 111 --admin${sep}${second}`;
+      await withTempHome(async () => {
+        const prevMode = process.env.PI_MODE;
+        process.env.PI_MODE = "print";
+        // PR 111 carries VALID head-bound evidence, so the first merge alone would
+        // legitimately pass — the block must come from the compound rule.
+        _setRunGhOverride(adminGh("d".repeat(40), [evidenceBody("d".repeat(40))]));
+        try {
+          const { pi, fire } = mockPi();
+          (reviewEnforcerFactory as any)(pi);
+          await fire("session_start");
+          const res = await fire("tool_call", { toolName: "bash", input: { command } });
+          ok(res && res.block === true, `a compound command must block: ${JSON.stringify(command)}`);
+          const blocked = tempAuditLines().filter((l) => l.event === "merge_gate_block");
+          equal(blocked.length, 1, `exactly one audit entry for ${JSON.stringify(command)}`);
+          equal(blocked[0].reason, "admin_merge_compound_command");
+        } finally {
+          _setRunGhOverride(null);
+          if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+        }
+      });
+    }
+  }
+});
+
+testAsync("#930 refusal: a single evidenced merge is NOT blocked by the compound rule", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "d".repeat(40);
+    _setRunGhOverride(adminGh(head, [evidenceBody(head)]));
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${PR_ADMIN} --admin` } });
+      // It may still block for the UNRELATED reason that no review record exists in
+      // this temp home — what must NOT happen is the compound rule firing on a
+      // single merge. Assert the property, not the absence of any block.
+      ok(
+        String(res?.reason ?? "").indexOf("more than one") === -1,
+        `a single merge must not be blocked by the compound rule: ${String(res?.reason).slice(0, 120)}`
+      );
+      equal(
+        tempAuditLines().filter((l) => l.reason === "admin_merge_compound_command").length,
+        0,
+        "no compound-command audit row for a single merge"
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
 for (const [label, command] of [
+  ["a plain un-evidenced admin merge", `gh pr merge ${PR_ADMIN} --admin`],
   ["--admin before the PR number", `gh pr merge --admin ${PR_ADMIN}`],
   ["--admin after the PR number", `gh pr merge ${PR_ADMIN} --admin`],
   ["--admin=true before the PR number", `gh pr merge --admin=true ${PR_ADMIN}`],

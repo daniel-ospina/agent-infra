@@ -70,7 +70,16 @@ jobs:
           MAIN_RUNS: "10"
           # The TEST workflow both sides are read from — see THE LANE above. A
           # lane with no runs on main makes every comparison vacuous.
-          WORKFLOW: "python-ci.yml"
+          #
+          # Repo-configurable via the `ADMIN_MERGE_DETECTOR_WORKFLOW` repository
+          # VARIABLE, so a repo whose test lane is not `python-ci.yml` can point at
+          # its own lane WITHOUT editing this file — which would break the
+          # template/materialized byte-parity that pipeline-compliance enforces.
+          # (agent-infra sets it to `ci-main.yml`: `python-ci.yml` here is a
+          # `workflow_call`-only reusable whose runs are attributed to the caller,
+          # so the guard would exit 1 on every run — permanently red, detecting
+          # nothing.)
+          WORKFLOW: ${{ vars.ADMIN_MERGE_DETECTOR_WORKFLOW || 'python-ci.yml' }}
           MERGE_SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha }}
         run: |
           set -uo pipefail
@@ -119,10 +128,12 @@ jobs:
           # unique_count=0 and would report "no unique failures" for a comparison
           # that never happened: the "cannot run reads as found nothing" hole this
           # file's own header forbids. `tested` counts success|failure|timed_out.
-          merged_tested="$(awk -F= '$1=="tested"{print $2}' merged-report.txt)"
-          merged_pending="$(awk -F= '$1=="pending"{print $2}' merged-report.txt)"
-          if [ "${merged_tested:-0}" -eq 0 ] || [ "${merged_pending:-0}" -gt 0 ]; then
-            echo "::error::admin-merge detector: lane '$WORKFLOW' has no TESTED run of $MERGE_SHA (tested=${merged_tested:-0}, pending=${merged_pending:-0}) — this comparison cannot certify the merge"
+          #
+          # The condition lives in scripts/check-lane-tested.sh so the test suite
+          # drives the SHIPPED code with fixtures — a guard asserted only by
+          # grepping for its own text can be neutered (`||` → `&&`) with the suite
+          # still green (cycle-2 review P2).
+          if ! bash scripts/check-lane-tested.sh merged-report.txt "$WORKFLOW" "$MERGE_SHA"; then
             exit 1
           fi
           unique_count="$(wc -l < unique.txt | tr -d ' ')"
