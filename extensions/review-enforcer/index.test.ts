@@ -3149,6 +3149,13 @@ testAsync("#930 compound: a second merge in the same command is BLOCKED, not jud
     "'gh' pr merge 999 --admin",
     "`gh pr merge 999 --admin`",
     "gh pr merge 999 --admin",
+    // Cycle-3 review P0: a construct-SPLICED verb word dequotes to a residue, so an
+    // exact `dequote(tok) === "merge"` test missed it and the compound guard was
+    // skipped — the second PR merged unevidenced.
+    "gh pr $'merge' 999 --admin",
+    "gh p$'r' merge 999 --admin",
+    "gh pr ${X}merge 999 --admin",
+    "gh ${X}pr merge 999 --admin",
   ];
   const seps = ["; ", " && ", " || ", " | ", " & ", "\n", "("];
   for (const sep of seps) {
@@ -3254,6 +3261,13 @@ for (const [label, command] of [
   ["a `sh -c` wrapper", `sh -c 'gh pr merge ${PR_ADMIN} --admin'`],
   ["a `bash -lc` wrapper", `bash -lc 'gh pr merge ${PR_ADMIN} --admin'`],
   ["an `eval` wrapper", `eval 'gh pr merge ${PR_ADMIN} --admin'`],
+  // Cycle-3 review P0: gh's short repo flag may take an ATTACHED value
+  // (`-Rowner/repo`), a valid pflag spelling that skipped both gates.
+  ["gh's -R with an attached value", `gh -Rowner/repo pr merge ${PR_ADMIN} --admin`],
+  ["gh's -R attached after another word", `true; gh -Rowner/repo pr merge ${PR_ADMIN} --admin`],
+  // Cycle-3 review: a `$VAR` may SUPPLY the flag, so no text scan can see the
+  // word `admin`. Fails closed (documented over-block for an unquoted `$PR`).
+  ["a `$VAR`-supplied admin flag", `V=--admin; gh pr merge ${PR_ADMIN} $V`],
 ] as const) {
   testAsync(`#930 refusal: ${label} without evidence is BLOCKED`, async () => {
     await withTempHome(async () => {

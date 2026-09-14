@@ -160,7 +160,11 @@ function hasUnresolvableConstruct(command: string): boolean {
  * optional flag in a different position.
  */
 function stripRepoArgs(command: string): string {
-  return command.replace(/(^|\s)(?:-R|--repo)(?:=|\s+)[A-Za-z0-9_.\/-]+/g, "$1");
+  // The value may be ATTACHED (`-Rowner/repo`), `=`-joined, or a separate word.
+  // Requiring `=` or whitespace after the flag missed gh's valid pflag spelling
+  // `gh -Rowner/repo pr merge 999 --admin`, which then skipped BOTH gates entirely
+  // (cycle-3 review P0).
+  return command.replace(/(^|\s)(?:-R|--repo)(?:=\S*|\s+\S+|\S*)/g, "$1");
 }
 
 export function isGhPrMergeCommand(command: string): boolean {
@@ -335,7 +339,24 @@ function hasBareGhWord(command: string): boolean {
  * be conjoined with a shape test.
  */
 export function isAdminMergeCommand(command: string): boolean {
-  if (!hasAdminMergeFlag(command)) return false;
+  if (!hasAdminMergeFlag(command)) {
+    // A `$VAR` can SUPPLY the flag: `V=--admin; gh pr merge 999 $V` reaches gh as
+    // an admin merge while no text scan can see the word `admin`. That is a class
+    // the STATED LIMITS block does not name (it names a `$VAR`-supplied VERB), so
+    // per this file's own contract it is a bug, not a documented limit — and it is
+    // indistinguishable from a benign `gh pr merge $PR --squash`. Fail CLOSED.
+    // The cost is that an UNQUOTED `$PR` needs the evidence comment; the quoted
+    // `"$PR"` form (the common one) is unaffected, since its `$` is not preceded
+    // by whitespace. Documented in STATED LIMITS.
+    // `merge` must be a WORD in the text — `isGhPrMergeCommand` is deliberately
+    // broad (any `gh` + `pr` under a construct), so reusing it here made a benign
+    // `gh pr view $X` admin-gated.
+    return (
+      hasUnresolvableConstruct(command) &&
+      /(^|[^\w])merge\b/.test(normalizeForFlagScan(command)) &&
+      /(^|\s)\$[{(A-Za-z_]/.test(command)
+    );
+  }
   const bare = stripRepoArgs(command);
   const probe = normalizeForFlagScan(bare);
   if (hasUnresolvableConstruct(bare)) {
@@ -456,7 +477,8 @@ export function extractPrNumber(command: string): number | null {
 
 // Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag.
 export function extractRepoFlag(command: string): string | null {
-  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
+  // Value may be attached (`-Rowner/repo`), `=`-joined, or a separate word.
+  const m = command.match(/(?:--repo|-R)(?:=|\s+)?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
   return m ? m[1] : null;
 }
 
@@ -1009,6 +1031,14 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  * `-${V:--}admin=true` were on this list in an earlier revision and are now
  * CLOSED by rule 2 below — verified, not assumed.)
  *
+ * A `$VAR`-SUPPLIED FLAG is CLOSED by failing closed, and the cost is stated: a
+ * merge shape with an unresolvable construct and a BARE `$VAR` argument is treated
+ * as an admin merge (`isAdminMergeCommand`), because `V=--admin; gh pr merge 999
+ * $V` reaches gh as an admin merge while no text scan can see the word `admin`.
+ * This also refuses the benign unquoted `gh pr merge $PR --squash`. The QUOTED form
+ * `gh pr merge "$PR" --squash` (the common one) is unaffected — its `$` is not
+ * preceded by whitespace — and the evidence comment is the documented way through.
+ *
  * A complete gate cannot be built on this surface: it needs argv-level
  * enforcement (a `gh` shim/allowlist). This file's claims are bounded to what it
  * actually implements:
@@ -1094,9 +1124,21 @@ export function countMergeVerbs(command: string): number {
   // 999 merged unevidenced. Two disagreeing predicates is the exact failure this
   // file keeps re-learning (VGATE round 9), so the count walks the same tokens.
   const scan = scanTokens(command);
+  // A construct-SPLICED verb (`gh pr $'merge' 999`, `gh p$'r' merge 999`) dequotes
+  // to a residue, so an exact `dequote(tok) === "merge"` test does not see it and
+  // the compound guard was skipped — the second PR merged unevidenced (cycle-3
+  // review P0). When the text carries any unresolvable construct, every
+  // command-position `gh` is counted CONSERVATIVELY: this count is only ever used
+  // as `> 1` on a command already known to be an admin merge, so an over-count
+  // costs a retry while an under-count is an unevidenced merge.
+  const unresolvable = hasUnresolvableConstruct(command);
   let n = 0;
   for (let i = 0; i < scan.tokens.length; i++) {
     if (!isGhWordAt(scan, i)) continue;
+    if (unresolvable) {
+      n++;
+      continue;
+    }
     if (dequote(scan.tokens[i + 1] ?? "") !== "pr") continue;
     if (dequote(scan.tokens[i + 2] ?? "") !== "merge") continue;
     n++;
