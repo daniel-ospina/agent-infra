@@ -92,7 +92,7 @@ fi
 1. **Align** — Inherited from parent Epic. Only runs if standalone.
 2. **Research** — `shared/research/SKILL.md` — Targeted research (appends to epic brief if exists)
 3. **Scope** — `shared/scope/SKILL.md` — Scope + E2E proportional to project size
-4. **Plan** — `shared/plan/SKILL.md` — Proportional substeps (skip prototype if no GUI; 2-3 reviewers vs 1-3)
+4. **Plan** — `shared/plan/SKILL.md` — Proportional substeps (skip prototype if no GUI; reviewer count per risk tier)
 5. **Decompose** — `shared/decompose/SKILL.md` — MECE-first + wiring + verification (if project has child issues). Uses `issue-creation` skill.
 6. **Verify** — `shared/verify/SKILL.md` — Proportional verification
 
@@ -146,7 +146,7 @@ When the project is standalone (no parent Epic):
 | Full adversarial + Eisenhower | Adversarial lite (2 challenges) |
 | Full research brief (6+ queries) | Targeted research (2-3 queries) |
 | 8 planning substeps | Proportional substeps (skip irrelevant) |
-| 4 parallel reviewers | 2-3 reviewers |
+| Reviewers per the risk tier's count (`proportional-gates`) | Same table, lower tier only |
 | Full E2E test suite | Key-journey E2E only |
 
 ---
