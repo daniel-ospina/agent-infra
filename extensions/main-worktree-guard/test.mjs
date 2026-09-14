@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -576,13 +576,18 @@ try {
 // at the SOURCE level (comment text stripped first — a doc mention must not
 // false-trip). TRIPWIRE, NOT PROOF: naive/spaced/literal reintroductions of
 // the #99 carve-outs are caught (banned strings + whitespace-tolerant
-// call-site count + the surviving call pinned to its M3 decideM3 role), but
+// call-site count + each surviving call pinned to its role), but
 // deliberate rewrites (alias indirection, comment-split spellings, a guard
 // inserted between the isInfra assignment and decideM3, or restoring a
 // skipInfra option in classify-git) can evade source pins — index.ts is not
 // importable, so behavioral pins on it are impossible. A deliberate reverter
 // can delete the pins anyway; these exist to catch accidental/merge-confusion
 // reverts (verified: literal reverts of every removed hunk fail the suite).
+//
+// #805 P1: the count is TWO, both pinned to their role — the M3 ceremony
+// assignment and the M2 no-baseline `effectiveIsAgentInfra` argument. Any
+// THIRD call site (the write-tail exemption these pins exist to forbid) still
+// trips both count assertions below.
 const guardIndexSrc = readFileSync(
   join(PROJECT_CWD, "extensions", "main-worktree-guard", "index.ts"), "utf8");
 const pinSrc = guardIndexSrc.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
@@ -590,8 +595,12 @@ for (const banned of ["Downgraded agent-infra", "isAgentInfraRepo()) return unde
   expectBool(`#615 source pin: index.ts has no ${JSON.stringify(banned)}`, !pinSrc.includes(banned), true);
 }
 const infraCallSites = (pinSrc.match(/isAgentInfraRepo\s*\(/g) ?? []).length;
-expectBool("#615 source pin: only the M3 ceremony isAgentInfraRepo( call remains (index.ts)", infraCallSites === 1, true);
-const m3AssignIdx = pinSrc.indexOf("isInfra = isAgentInfraRepo(muEff.effectiveCwd)");
+const M3_INFRA_CALL = "isInfra = isAgentInfraRepo(muEff.effectiveCwd)";
+const M2_INFRA_CALL = "effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd)";
+expectBool("#615 source pin: only the M3 ceremony + the M2 no-baseline isAgentInfraRepo( calls remain (index.ts)", infraCallSites === 2, true);
+expectBool("#615 source pin: every isAgentInfraRepo( call site is one of the two known roles",
+  pinSrc.includes(M3_INFRA_CALL) && pinSrc.includes(M2_INFRA_CALL), true);
+const m3AssignIdx = pinSrc.indexOf(M3_INFRA_CALL);
 expectBool("#615 source pin: the surviving call is the M3 isInfra assignment", m3AssignIdx !== -1, true);
 const afterM3 = m3AssignIdx !== -1 ? pinSrc.slice(m3AssignIdx, m3AssignIdx + 2500) : "";
 expectBool("#615 source pin: isInfra feeds decideM3 (isAgentInfra: isInfra) — not an exemption guard", afterM3.includes("isAgentInfra: isInfra"), true);
@@ -611,7 +620,7 @@ expectBool("#618 source pin: write gate imports resolveTargetCheckout", pinSrc.i
 expectBool("#618 source pin: write gate classifies the target checkout (_checkoutOf)", pinSrc.includes("_checkoutOf(tgtReal)"), true);
 expectBool("#618 source pin: cross-cwd tracked-hub block wired (_targetTrackedAt)", pinSrc.includes("_targetTrackedAt(tgtCheck.top, tgtReal)"), true);
 expectBool("#618 source pin: cross-cwd block reason helper exists (_hubTargetWriteBlockReason)", pinSrc.includes("_hubTargetWriteBlockReason"), true);
-expectBool("#621 source pin: no isAgentInfraRepo gate in the write tail (stays ONE M3 ceremony call site)", infraCallSites === 1, true);
+expectBool("#621 source pin: no isAgentInfraRepo gate in the write tail (stays the M3 ceremony + M2 ownership call sites)", infraCallSites === 2, true);
 
 // ── 2026-09-09 review fold-in source pins (index.ts + classify-git.mjs) ────
 // Two fresh-context reviewers (correctness + adversarial bypass-surface)
@@ -2534,6 +2543,104 @@ try {
     // check-ignore must classify read-only (hub-worktree.sh's .worktrees warn).
     const ci = isHubRecoveryInvocation("check-ignore", ["-q", ".worktrees"], "main");
     expectBool("#444 check-ignore → readonly (hub-worktree.sh surface)", ci === "readonly", true);
+  }
+}
+
+// ── #967/#1484: gate the EFFECT, not the text ───────────────────────────────
+// The #1484 script surface gated the whole script TEXT, so a git-FREE script
+// could be frozen by a markdown/docstring backtick, and a discard-shaped op
+// reachable from only ONE subcommand blocked EVERY invocation. The second-model
+// resolution authority (`scripts/check-second-model.sh --probe`, git-free) was
+// unrunnable from every path → the second-model gate was permanently DEGRADED
+// → every guarded-surface PR was unmergeable fleet-wide. These cases pin the
+// fix: read-only/text-only content is allowed, real discards stay blocked, and
+// subcommand reachability is argv-driven.
+{
+  const BT = String.fromCharCode(96);
+  let t967 = null;
+  try {
+    t967 = execSync("mktemp -d", { encoding: "utf-8" }).trim();
+    const mk967 = (name, content) => {
+      const p = `${t967}/${name}`;
+      writeFileSync(p, content);
+      return p;
+    };
+    // (a) A QUOTED heredoc is literal text to the outer shell — the exact #967
+    // trigger: a Python docstring code span `` `/` `` misread as `$(/)`.
+    const docstring = mk967("docstring.sh", "python3 - \"$1\" \\\n  <<'PYEOF'\n# docs: a trailing " + BT + "/" + BT + " normalizes to empty\nPYEOF\n");
+    expectBool("#967: quoted python heredoc + docstring backtick → allow (no git effect)", scriptGitVerdict(docstring, "main", MAIN, MAIN, ["--probe"]) === "allow", true);
+    // A path-shaped span that names no real file executes nothing.
+    const prosePath = mk967("prose-path.sh", "echo \"see the " + BT + "/usr/local/bin/nope-" + process.pid + BT + " path\"\n");
+    expectBool("#967: prose path-span (nonexistent file) → allow", scriptGitVerdict(prosePath, "main", MAIN, MAIN) === "allow", true);
+    // (b) Every discard closure this gate exists for stays blocked.
+    const plainDiscard = mk967("plain-discard.sh", "#!/bin/bash\ngit reset --hard\n");
+    expectBool("#967: plain discard → block (unchanged)", scriptGitVerdict(plainDiscard, "main", MAIN, MAIN) === "block", true);
+    const interpSubst = mk967("interp-subst.sh", "echo \"$(bash /tmp/m4-evil.sh)\"\n");
+    expectBool("#967: interpreter-in-substitution → block (T87 intact)", scriptGitVerdict(interpSubst, "main", MAIN, MAIN) === "block", true);
+    const pipedHeredoc = mk967("piped-heredoc.sh", "cat <<'EOF' | sh\ngit reset --hard\nEOF\n");
+    expectBool("#967: piped quoted heredoc + discard → block (T104 intact)", scriptGitVerdict(pipedHeredoc, "main", MAIN, MAIN) === "block", true);
+    const unquotedHeredoc = mk967("unquoted-heredoc.sh", "cat <<EOF\n$(git reset --hard)\nEOF\n");
+    expectBool("#967: unquoted heredoc IS expanded → block", scriptGitVerdict(unquotedHeredoc, "main", MAIN, MAIN) === "block", true);
+    // (c) The documented dodge — write /tmp/x.sh + `bash /tmp/x.sh` — stays
+    // closed: extractScriptPath resolves the file and the content gate blocks,
+    // for an arg-taking invocation too.
+    expectBool("#967: /tmp dodge resolves + blocks (arg-taking)",
+      extractScriptPath(`bash ${plainDiscard} --status`) === plainDiscard &&
+      scriptGitVerdict(plainDiscard, "main", MAIN, MAIN, ["--status"]) === "block", true);
+
+    // Reachability: a top-level `case "$1"` dispatch gates only the branches
+    // THIS invocation can enter.
+    const dispatch = mk967("dispatch.sh", "#!/bin/bash\ncase \"$1\" in\n  --reset) git reset --hard ;;\n  --status) git status ;;\n  *) echo usage ;;\nesac\n");
+    expectBool("#967: dispatch --status → allow (discard branch unreachable)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, ["--status"]) === "allow", true);
+    expectBool("#967: dispatch --reset → block (discard reachable)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, ["--reset"]) === "block", true);
+    expectBool("#967: dispatch no args → allow (only the `*` branch runs)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, []) === "allow", true);
+    expectBool("#967: dispatch args-unknown → block (fail closed)", scriptGitVerdict(dispatch, "main", MAIN, MAIN) === "block", true);
+    const dispatchGlob = mk967("dispatch-glob.sh", "case \"$1\" in\n  --res*|--hard) git reset --hard ;;\n  --st*) git status ;;\nesac\n");
+    expectBool("#967: glob --st* → allow", scriptGitVerdict(dispatchGlob, "main", MAIN, MAIN, ["--status"]) === "allow", true);
+    expectBool("#967: glob --res* → block", scriptGitVerdict(dispatchGlob, "main", MAIN, MAIN, ["--reset"]) === "block", true);
+    // Fail-closed bail-outs: a `case "$1"` that is NOT the script's dispatch
+    // must never be pruned by the invocation's argv.
+    const fnCase = mk967("fn-case.sh", "f() {\n  case \"$1\" in\n    --reset) git reset --hard ;;\n  esac\n}\nf --reset\n");
+    expectBool("#967: function-local case $1 → NOT pruned (block)", scriptGitVerdict(fnCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const shiftCase = mk967("shift-case.sh", "shift\ncase \"$1\" in\n  --reset) git reset --hard ;;\n  --st*) git status ;;\nesac\n");
+    expectBool("#967: `shift` rewrites positionals → NOT pruned (block)", scriptGitVerdict(shiftCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const varCase = mk967("var-case.sh", "MODE=\"$1\"\ncase \"$MODE\" in\n  --reset) git reset --hard ;;\n  --status) git status ;;\nesac\n");
+    expectBool("#967: non-$1 case word → NOT pruned (block)", scriptGitVerdict(varCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    // Structural bail-outs — malformed/ambiguous cases are never pruned.
+    const nestedCase = mk967("nested-case.sh", "case \"$1\" in\n  --reset)\n    case \"$2\" in\n      x) git reset --hard ;;\n    esac\n    ;;\n  --status) git status ;;\nesac\n");
+    expectBool("#967: multi-line nested case → NOT pruned (block)", scriptGitVerdict(nestedCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const fallthrough = mk967("fallthrough.sh", "case \"$1\" in\n  --status) git status ;;&\n  --reset) git reset --hard ;;\nesac\n");
+    expectBool("#967: `;;&` fallthrough → NOT pruned (block)", scriptGitVerdict(fallthrough, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const unterminated = mk967("unterminated.sh", "case \"$1\" in\n  --reset) git reset --hard ;;\n");
+    expectBool("#967: unterminated case → NOT pruned (block)", scriptGitVerdict(unterminated, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    expectBool("#967: extractScriptArgs reads the script argv", JSON.stringify(extractScriptArgs("bash x.sh --status a b", "x.sh")) === JSON.stringify(["--status", "a", "b"]), true);
+
+    // (a) end-to-end: the ACTUAL second-model resolution authority must no
+    // longer be classified git-bearing, and the #1484 gate's decision for the
+    // live command line (extractScriptPath → scriptGitVerdict with argv) must
+    // allow it from the hub.
+    const probeCandidates = [
+      fileURLToPath(new URL("../../scripts/check-second-model.sh", import.meta.url)),
+      resolve(PROJECT_CWD, "scripts/check-second-model.sh"),
+      resolve(MAIN, "scripts/check-second-model.sh"),
+    ];
+    const realProbe = probeCandidates.find((p) => existsSync(p));
+    if (!realProbe) {
+      console.log("⏭️  #967 real-probe case skipped — scripts/check-second-model.sh not found");
+    } else {
+      const liveCmd = `bash ${realProbe} --probe`;
+      const liveSp = extractScriptPath(liveCmd);
+      const liveArgs = extractScriptArgs(liveCmd, liveSp);
+      expectBool("#967: real check-second-model.sh --probe → allow (git-free resolution authority unblocked)",
+        liveSp === realProbe && scriptGitVerdict(realProbe, "main", MAIN, MAIN, liveArgs) === "allow", true);
+      expectBool("#967: live command argv parses as [--probe]", JSON.stringify(liveArgs) === JSON.stringify(["--probe"]), true);
+    }
+  } catch (e) {
+    console.error(`❌ #967 script-classifier cases FAILED to provision: ${String(e.message).slice(0, 160)}`); fail++;
+  } finally {
+    if (t967) {
+      try { execSync(`rm -rf "${t967}"`, { stdio: "ignore" }); } catch {}
+    }
   }
 }
 

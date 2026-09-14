@@ -103,7 +103,7 @@ as the parser — the narrow assertions still read parsed nodes.
 | 4 | the `ci` job's `with:` key set is exactly `["test-command"]` and its value is exactly the expected accumulator command | emptied binding; `\|\| true` suffix; extra `with:` key; losing the second suite; a `test-command:` line inside a block scalar |
 | 5 | `node-ci.yml` still declares the `unit-test` job and the `test-command` workflow_call input | renamed input; removed `unit-test` job |
 | 6 | **6a (values, trusted leg + local)** `.github/workflows/ci-main.yml` still declares the `extension-tests` pin-gate job, the `with:` key set `["node-version", "script-validate", "skill-lint", "test-command"]` (the last non-empty), **and** that `test-command` body still contains the exact pin-suite invocation line `node scripts/check-pi-pin-lockstep.mjs \|\| failures=$((failures+1))` as a whole trimmed line | missing job; extra `with:` key; dropped `test-command`; emptied `test-command`; scalar `with:`; empty document; **deleted invocation line; altered line (`\|\| true`, `\|\| failures=0`); repointed script path** (all three RED on the per-PR suite *and* end-to-end on the trusted `--head-ref` leg) |
-| **6b** | **(behavioural, local leg only)** the committed post-merge `test-command` **exits non-zero** under `bash -e` with a failing `node` stub | negative control (guard inside `if false … fi`); guard in a never-called function; guard in a heredoc; invocation inside a multi-line quoted string (**single-suite `FIXTURE_CI_MAIN` only** — on the committed multi-suite command this shape stays GREEN; see the unowned hole in the Accepted-residual section); positive control (passing stubs → exit 0); **hygiene: an unresolvable `bash` and a command that never finishes are RED, not passes** |
+| **6b** | **(behavioural, local leg only)** the committed post-merge `test-command` **exits non-zero** with the `node` stub failing **only** the pin suite (`npx`/`npm`/`bash` and every other `node` invocation pass) | positive control (the committed command → non-zero); all-pass control (every stub passes → exit 0); negative control (**#807**: the committed invocation wrapped in a multi-line quoted string → exit 0 → RED, on the LIVE file); guard inside `if false … fi`; guard in a never-called function; guard in a heredoc; failure guard deleted; `exit 0` before the guard; guard in a never-taken `case` arm; **pinned bound: a command that keys its exit status off the stub is still GREEN**; **hygiene: an unresolvable `bash` and a command that never finishes are RED, not passes** |
 
 Each item has both a failing fixture and a passing fixture (the fixture trio / spelling reformats).
 
@@ -120,9 +120,9 @@ actually fail the step?* — and answers it by running the committed command:
 
 1. parse `ci-main.yml` with `scripts/workflow-yaml.mjs` (never grep) and take the `extension-tests`
    job's `test-command` body;
-2. write it to a temp dir and run it as `bash -e <script>` with `node` — plus `npx`, `npm` and
-   `bash`, the other interpreters that command shells out to — replaced by stubs that exit 1, first
-   on `PATH`;
+2. write it to a temp dir and run it as `bash -e <script>` with `node`/`npx`/`npm`/`bash` replaced
+   by stubs first on `PATH`. The `node` stub exits 1 **only when its arguments name
+   `scripts/check-pi-pin-lockstep.mjs`**; every other stubbed invocation exits 0 (#807);
 3. assert the step exits **non-zero**.
 
 The stub keeps the run honest: every interpreter reachable **by bare name** on the child's `PATH` is
@@ -130,34 +130,45 @@ replaced, so the real suites never re-enter and every suite's verdict is a knob.
 itself bound the run — a command that ignores `PATH` (an absolute interpreter path, or its own `PATH`
 surgery) can still do real work — so the run is additionally bounded by an explicit spawn **timeout**
 (120 s), and a timeout is RED with its own message. `bash`, not this repo, decides the outcome, but the
-claim must be stated narrowly: what this catches is **any shell construct that makes the step's exit
-status depend on a real suite failing**. A command that merely keys its exit status off the stub is
-**not** caught — reproduced: a `node --version >/dev/null 2>&1 || exit 1` probe followed by the guard
-block and no suites at all is GREEN here while the pin gate is dead (the real CI would exit 0). That
-shape is item **6a**'s job (the invocation line is absent), not 6b's.
+claim must be stated narrowly: with the `node` stub failing **only** the pin suite, what this catches
+is **any shell construct that stops the pin-suite invocation from failing the step** — a deleted line,
+a multi-line quoted string around it, a guard hidden in a never-called function or a never-taken `case`
+arm, an `exit 0` before the guard. **#807 changed this**: the pre-#807 stub failed *every* interpreter,
+and because the committed command is multi-suite the *other* suites drove the guard, so a swallowed
+invocation still left the step non-zero and 6b stayed GREEN. Failing only the pin suite makes 6b
+sensitive to that whole reachability class, behaviourally and with no shell modelling. A command that
+merely keys its exit status off the stub is still **not** caught — reproduced and pinned: a probe that
+names the pin suite, `node scripts/check-pi-pin-lockstep.mjs --version >/dev/null 2>&1 || exit 1`,
+followed by the guard block and no suite invocation at all is GREEN here while the pin gate is dead
+(the real CI would exit 0). That shape is item **6a**'s job (the invocation line is absent), not 6b's.
 
-**Two controls make it falsifiable**, and both are in-suite:
+**Three controls make it falsifiable**, and all are in-suite:
 
-- a **positive** control — the same command with *passing* stubs must exit 0 (otherwise the assertion
-  could pass because of a missing binary, a `cd` into a non-existent directory, or some unrelated
-  early failure);
-- a **negative** control — the same command with its failure guard moved inside `if false; then … fi`
-  must make the assertion go RED (otherwise it is a formality).
+- a **positive** control — the committed command, with only the pin suite's stub failing, must exit
+  non-zero;
+- an **all-pass** control — the same command with every stub passing must exit 0 (otherwise the
+  positive control could pass because of a missing binary, a `cd` into a non-existent directory, or
+  some unrelated early failure);
+- a **negative** control — the committed invocation wrapped in a multi-line quoted string must make
+  the assertion go RED (the #807 shape; the pre-#807 stub stayed GREEN on it, asserted in the same
+  fixture).
 
 **The bound, stated exactly** (the module header is authoritative): the assertion proves that *on this
-machine, with this shell, with `node` replaced by a stub that always exits 1, the committed body makes
-the step exit non-zero*. It does **not** prove that the real suites run, that they pass, that the step
-fails on GitHub's runner, or that the failing status came from a real suite at all (see the
-stub-keyed shape above). It gives **no per-suite attribution**: every suite fails under the stub, so a
-command that dropped only the pin-suite line still exits non-zero while the others fail. Asserting that
-the line is still **present** is item **6a**'s job (a value assertion, run on both legs), and a byte
-change to the locked file additionally trips the content lock.
+machine, with this shell, with the `node` stub failing only the pin suite's invocation and every other
+stub passing, the committed body makes the step exit non-zero*. It does **not** prove that the real
+suites run, that they pass, that the step fails (or passes) on GitHub's runner, or that the failing
+status came from the real pin suite rather than from the stub (see the stub-keyed shape above).
+Per-suite attribution is bounded by the **stub**, not by the suite count: the stub matches `node`'s
+arguments, so an invocation through an interpreter it does not replace (an absolute `node` path) is not
+the stubbed failure. Asserting that the line is still **present** is item **6a**'s job (a value
+assertion, run on both legs), and a byte change to the locked file additionally trips the content lock.
 
-**6a and 6b are not complements, and 6b alone is not enough.** 6a proves the line EXISTS; 6b proves
-the step CAN FAIL — but the two misses do not cover each other. 6b's miss (a dropped or repointed
-invocation line) is covered by 6a. 6a's miss — **unreachability**, a line that is textually present
-but never executed — is **not** covered by 6b on the committed multi-suite `ci-main.yml`; see the
-unowned hole in the Accepted-residual section below.
+**6a and 6b cover different legs, not just different misses.** 6a proves the line EXISTS; 6b proves the
+step CAN FAIL when the pin suite fails. Since #807 a dropped or repointed invocation line leaves
+*nothing* failing and makes 6b RED too — on the per-PR and post-merge legs, where 6b can run. But 6b
+EXECUTES the command, so it can never run on the trusted `pull_request_target` leg (executing PR content
+there is the RCE vector). 6a is the value assertion that leg runs, and it remains the only thing that
+sees a dropped or repointed invocation line in a PR's workflow bytes.
 
 **Item 6b is per-PR / post-merge only, and PR-editable.** It has to EXECUTE the command, so it can
 only live in the suite, which runs from the PR-editable `ci.yml` (and post-merge via `ci-main.yml`).
@@ -287,7 +298,9 @@ therefore no longer holds; it is left untouched in this PR because `ci.yml` is a
 comment is not part of the guard's contract.
 
 **Case census (final cycle, counted from the file and the run):** 116 tests = 83 plain `test()` +
-11 `expectWired` + 18 `expectRed` + 4 `expectLockRedForEdit`. The run also asserts a set of REQUIRED
+11 `expectWired` + 18 `expectRed` + 4 `expectLockRedForEdit`. (#807 moved the total to **120** — +3
+reachability shapes and +1 pinned stub-keyed bound; see the #807 subsection below.) The run also
+asserts a set of REQUIRED
 TEST NAMES (60 entries), so a deleted or renamed assertion is RED regardless of the total; it does NOT
 catch a required test whose BODY is replaced by a same-name no-op — a same-commit residual recorded
 below. Eight of the eleven new tests were added to the roster as well, so the assertions this cycle
@@ -323,7 +336,7 @@ restored or repaired cannot be deleted by name.
 | 13 | item 6, guard inside `if false; then … fi` | ✅ GREEN (scanner returned `[]`) | ❌ **RED** — item 6b: the command exits 0, assertion fails |
 | 14 | item 6, guard inside a never-called shell function | ✅ GREEN (scanner returned `[]`) | ❌ **RED** |
 | 15 | item 6, guard buried in `if false; then cat <<EOF` | ✅ GREEN (scanner returned `[]`) | ❌ **RED** |
-| 16 | item 6, invocation inside a multi-line quoted string | ✅ GREEN (scanner returned `[]`) | ❌ **RED** on the single-suite fixture (the LIVE file stays green because another suite fails first — stated in the fixture's comment) |
+| 16 | item 6, invocation inside a multi-line quoted string | ✅ GREEN (scanner returned `[]`) | ❌ **RED** — **closed by #807**: with the stub failing only the pin suite, the wrapped LIVE invocation leaves the step exiting 0, so item 6b goes RED on the committed file (the pre-#807 all-fail stub stayed GREEN on the same mutation — asserted in the same fixture) |
 | 17 | item 6, `echo "a <<x"` (phantom heredoc) | ❌ **false RED** on `d5e876e` | ✅ **GREEN** — no heredoc modelling remains |
 | 18 | trusted leg, tree mode `100755` | ❌ RED (false) | ✅ **GREEN** — accepted as a regular blob |
 | 19 | trusted leg, tree modes `040000` / `160000` | ❌ RED (true but untested) | ❌ **RED**, both, with the mode named |
@@ -338,8 +351,8 @@ restored or repaired cannot be deleted by name.
 
 | # | Check | Before (this cycle's start) | After (final cycle) |
 |---|---|---|---|
-| 26 | **item 6a**: delete the pin-suite invocation line from the fixture/live `ci-main.yml` | ✅ GREEN — the presence assertion did not exist; the suite reports `0 failed`, exit 0 and the trusted `--head-ref` leg ✅ while the pin gate is dead | ❌ **RED on both legs** — the suite's value assertion names the line; the trusted leg is RED end-to-end through the stubbed `gh` CLI. Item 6b stays GREEN on the live file, which is why 6a has to exist (asserted in the same fixture) |
-| 27 | **item 6a**: alter the line — `\|\| true`, `\|\| failures=0`, a repointed script path | ✅ GREEN | ❌ **RED on both legs**; the repointed path is additionally invisible to 6b, asserted |
+| 26 | **item 6a**: delete the pin-suite invocation line from the fixture/live `ci-main.yml` | ✅ GREEN — the presence assertion did not exist; the suite reports `0 failed`, exit 0 and the trusted `--head-ref` leg ✅ while the pin gate is dead | ❌ **RED on both legs** — the suite's value assertion names the line; the trusted leg is RED end-to-end through the stubbed `gh` CLI. Under the then-current all-fail stub item 6b stayed GREEN on the live file (asserted in the same fixture); **superseded by #807** — with the pin-suite-only stub 6b is RED here too, and 6a remains the only check that can run on the trusted leg |
+| 27 | **item 6a**: alter the line — `\|\| true`, `\|\| failures=0`, a repointed script path | ✅ GREEN | ❌ **RED on both legs**; under the then-current all-fail stub the repointed path was additionally invisible to 6b (asserted) — under the #807 pin-suite-only stub 6b is RED for it too |
 | 28 | **item 6a**: a legitimate unrelated edit elsewhere in the command | — (no assertion) | ✅ **GREEN on both legs** (the check's negative control) |
 | 29 | **item 6b**: a spawn failure (unresolvable `bash`) | ✅ **PASSED** — `spawnSync` returns `status: null` and `assert.notEqual(null, 0)` is true, so "nothing executed" was recorded as "the guarantee holds" | ❌ **RED** with its own `could not be SPAWNED at all` message; `error === null && typeof status === "number"` is now required first |
 | 30 | **item 6b**: a command that never finishes | n/a (no timeout) | ❌ **RED** at the explicit spawn timeout (`120 s`; the fixture drives the same path at `1 s`) |
@@ -443,43 +456,27 @@ different things: the line is *present* (a string property) and the step can *fa
 Only the second needed modelling. Losing both left a hole with no owner — a `ci-main.yml` that drops the
 invocation line and updates the lock was red in **nothing**: measured on the previous revision, the
 suite reports `0 failed`, exit 0, and the trusted `--head-ref` leg reports ✅, while the real post-merge
-pin gate is dead. Item 6b cannot see it, because under the failing stub the *other* suites still drive
-the guard and the step still exits non-zero. Item **6a** restores it as a trimmed-line equality against
+pin gate is dead. Item 6b could not see it at the time, because under the pre-#807 failing stub the
+*other* suites still drove the guard and the step still exited non-zero (#807 later closed that — see
+"The reachability hole is CLOSED" below). Item **6a** restores it as a trimmed-line equality against
 a pinned constant, on the value the YAML reader parsed — never a grep of the raw file — and runs it on
 **both** legs (it executes nothing, so it is safe on the privileged trigger). What 6a proves is bounded:
 the line **exists**; it does **not** prove the line is **reachable** (a line inside a multi-line quoted
 string is textually present but is not a command) and does not prove the step can **fail** (6b's job).
-**6b does not cover that reachability shape on the committed file either**, and that is measured, not
-argued: on the committed **multi-suite** `ci-main.yml` the wrapped invocation leaves 6a at **0
-findings** and `runCiMainTestCommand(mutated, 1)` at **status 1** — 6b's own notion of GREEN — because
-the *other* suites still drive the guard and the step still exits non-zero. 6b's RED fixture for this
-shape uses the **single-suite** `FIXTURE_CI_MAIN`, where the pin suite is the step's only suite and the
-swallowed invocation does move the exit status (`runCiMainTestCommand(fixture, 1)` → **status 0**), so
-that fixture goes RED there and only there. On the committed multi-suite file this shape is seen by
-**neither 6a nor 6b**; only the **content lock** is left, and that is the same-commit residual, recorded
-as an unowned hole below.
+
+**The reachability hole is CLOSED (#807), behaviourally.** The pre-#807 item 6b stub failed *every*
+interpreter, so the *other* suites in the committed multi-suite command drove the failure guard on their
+own: a swallowed invocation left 6a at **0 findings** and `runCiMainTestCommand(wrapped, "all-fail")` at
+**status 1** — 6b's own notion of GREEN (measured on the committed `ci-main.yml`). The stub now fails
+**only** the pin suite (`node` exits 1 only when its arguments name
+`scripts/check-pi-pin-lockstep.mjs`), so a swallowed invocation leaves nothing failing:
+`runCiMainTestCommand(wrapped, "pin-suite-only-fails")` → **status 0**, 6b RED, on the committed file.
+No shell structure is modelled: the stub change *is* the fix. The same change makes 6b RED for a deleted
+or repointed invocation line too. 6a is still required, because 6b can only run where the command may
+be EXECUTED and the trusted `--head-ref` leg must never execute PR content.
 
 ## Accepted residual (recorded, not papered over)
 
-- **Unowned hole: the invocation can be wrapped in a multi-line quoted string, so it is textually
-  present but never executed — on the committed multi-suite file NEITHER 6a NOR 6b sees it (measured).**
-  The reproducer wraps the invocation line in an `echo "…"` whose string spans lines, e.g. the single
-  accumulator line `node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))` becomes the body
-  of `echo "start` / `node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))` / `end"`. Bash then
-  treats the line as string text, so the pin suite never runs. 6a does not catch it because its check is
-  trimmed-LINE equality and the wrapped line is still one trimmed line (measured on the committed
-  `ci-main.yml`: `ciMainInvocationFindings(wrapped).length === 0`). 6b does not catch it either on the
-  committed file because the negative run makes *every* suite fail, the *other* suites still drive the
-  guard, and the step still exits non-zero — which is exactly 6b's assertion (measured:
-  `runCiMainTestCommand(wrapped, 1)` → `{ status: 1, error: null }`, identical to the committed
-  baseline). 6b's RED fixture for the shape uses the **single-suite** `FIXTURE_CI_MAIN`, where the pin
-  suite is the step's only suite, so the swallowed invocation does move the exit status
-  (`runCiMainTestCommand(fixture, 1)` → status 0) and the fixture goes RED there and only there. Only
-  the **content lock** sees the committed shape, and the lock is the same-commit residual below (a PR
-  that edits `ci-main.yml` *and* re-locks passes both legs). Closing the hole needs shell-reachability
-  modelling of the quoted-string class — the modelling this PR deleted after five rounds of bypasses —
-  so it is recorded as an **unowned hole**, not papered over. The three strings that claimed 6b's
-  fixture covered this shape on the committed file were corrected in the same commit.
 - **6a's trimmed-line equality is DELIBERATELY over-strict, and its false REDs are the accepted
   price.** The check compares one whole trimmed line to a pinned constant, so a semantically identical,
   legitimate edit to the invocation false-REDs: a trailing comment (`…failures=$((failures+1)) # keep`),
@@ -489,7 +486,7 @@ as an unowned hole below.
   the over-strictness is chosen because the failure is loud and the message names the constant, so any
   such edit must update `EXPECTED_CI_MAIN_INVOCATION` in the same commit. Tightening it (comment
   stripping, continuation joining) would be shell modelling — deliberately out of scope for this PR —
-  and would widen the reachability hole above.
+  and would re-open the construct-modelling this repo deleted deliberately.
 
 - **A required test whose BODY is replaced by a same-name no-op is not caught (#675 P2-5).** The
   roster records test NAMES, not semantics: `test("<required name>", () => assert.ok(true))` passes and
@@ -542,25 +539,30 @@ as an unowned hole below.
   own copy is not caught by the trusted leg, and a PR that edits a workflow together with the lock
   passes both. The lock's real value is conspicuousness — an edit to a locked file cannot be silent.
 - **Item 6b is a bounded BEHAVIOURAL check — it proves the command can fail, not that it works.** It
-  runs the committed `test-command` under `bash -e` with this repo's interpreters replaced by stubs
-  that exit 1, and asserts the step exits non-zero. It proves, on this machine and this shell, that the
-  committed body fails the step. It does NOT prove that the real suites run or pass, that the step
-  fails on GitHub's runner, that the failing status came from a real suite at all (a command that keys
-  its exit status off the stub is GREEN here and dead in real CI — item 6a catches that shape), or
-  anything about per-suite attribution (under failing stubs every suite fails, so a command that
-  dropped only the pin-suite line still exits non-zero — asserting the line is *present* is item 6a's
-  job, and a byte change to the locked file additionally trips the content lock). The module header is
+  runs the committed `test-command` under `bash -e` with the `node` stub failing ONLY the pin suite
+  (`npx`/`npm`/`bash` and every other `node` invocation pass) and asserts the step exits non-zero. It
+  proves, on this machine and this shell, that the committed body fails the step when the pin suite
+  fails — on the committed multi-suite command, where the other suites pass. It does NOT prove that the
+  real suites run or pass, that the step fails on GitHub's runner, or that the failing status came from
+  the real pin suite rather than the stub (a command that keys its exit status off the stub is GREEN
+  here and dead in real CI — item 6a catches that shape, and the bound is pinned by its own fixture).
+  Per-suite attribution is bounded by the stub's ARGUMENT match, so an invocation through an
+  interpreter it does not replace is not the stubbed failure. Asserting the line is *present* is item
+  6a's job (a byte change to the locked file additionally trips the content lock). The module header is
   the authoritative statement.
 - **Item 6b is per-PR / post-merge only, and PR-editable.** It must execute the command, so it cannot
   run under `pull_request_target` (executing PR content there is the RCE vector). The trusted
   `--head-ref` leg therefore makes no shell claim about `ci-main.yml` at all — what it does assert about
   `ci-main.yml` is item 6a (values only); item 6b's shell guarantee sits at the same trust level as the
   lock.
-- **Item 6b costs wall-clock time.** The suite went from ~11 s at `d5e876e` to ~73 s now: real
-  `bash -e` round-trips, the stubbed-`gh` `--head-ref` end-to-end fixtures, and one fixture that copies
-  and re-runs the whole suite (so every test added is effectively paid twice). Stubbing out the shell
-  instead would restore the old speed and the old guessing; the cost is accepted. The stale "~4s of
-  work" comment in `ci.yml` is out of scope here (locked file, not part of the contract).
+- **Item 6b costs wall-clock time.** The suite went from ~11 s at `d5e876e` to ~73 s at the end of
+  the #666 work: real `bash -e` round-trips, the stubbed-`gh` `--head-ref` end-to-end fixtures, and the
+  sticky fixture, which copies and re-runs the whole suite (so every test added was effectively paid
+  twice). **#808** lets the sticky fixture's authenticated child skip the item-6b real-`bash` runs and
+  the `--head-ref` end-to-end fixtures the parent has already proved (the token handshake authorises the
+  skip; the parent's assertions are unchanged). Stubbing out the shell instead would restore the old
+  speed and the old guessing; the cost is accepted. The stale "~4s of work" comment in `ci.yml` is out
+  of scope here (locked file, not part of the contract).
 - **An ancestor symlink above the repo root is not walked.** `symlinkedAncestor` starts at the repo
   root and deliberately does not `lstat` it or any directory above it, because `/tmp` itself is a
   symlink on macOS and walking to `/` would make every fixture RED. A symlink in the repo's own path
@@ -599,14 +601,15 @@ as an unowned hole below.
 - **positive controls** — `(h)`/`(i)` carry their explicit predicate positive controls (#675 P1-3);
   every one of items 1–6 has a failing fixture and a passing fixture; `lockFindings` now has one
   positive control per schema branch (#675 P2-e); **item 6b has an explicit positive control** (the
-  same command with passing stubs must exit 0) and an explicit negative control (the guard moved into
-  `if false … fi` must go RED); **item 6a has a positive control too** (a legitimate unrelated edit
-  elsewhere in the command stays GREEN, on both legs).
-- **`MIN_EXPECTED_PASSING` floor** — 71 → 91 → 109 → 105 (third revision) → **116** (final cycle: item
-  6a's invocation-presence fixtures, item 6b's spawn hygiene, the sticky handshake and the pinned
-  same-file-listener residual), and it is now a SECONDARY signal: the run also asserts a set of required
-  test NAMES (#675 P2-c, 60 entries), so deleting or renaming a real test is RED even when the count is
-  unchanged.
+  committed command with only the pin suite's stub failing must exit non-zero) and an explicit negative
+  control (the committed invocation wrapped in a multi-line quoted string must go RED — the #807 shape)
+  alongside the all-pass control (every stub passing → exit 0); **item 6a has a positive control too**
+  (a legitimate unrelated edit elsewhere in the command stays GREEN, on both legs).
+- **`MIN_EXPECTED_PASSING` floor** — 71 → 91 → 109 → 105 (third revision) → 116 (final cycle) → **120**
+  (#807: the three reachability shapes the pin-suite-only stub makes observable — deleted guard, `exit 0`
+  before the guard, never-taken `case` arm — plus the pinned stub-keyed bound), and it is now a SECONDARY
+  signal: the run also asserts a set of required test NAMES (#675 P2-c), so deleting or renaming a real
+  test is RED even when the count is unchanged.
   The floor and the roster are evaluated in a `process.on("exit", …)` handler (#675 P2-h), so an early
   `process.exit(0)` cannot skip them — and since the third revision that handler is registered at the
   top of the module, the decision it takes is `process.exit(1)`, which is **sticky against everything
@@ -614,6 +617,214 @@ as an unowned hole below.
   code earlier in the same file. An uncaught throw inside the handler fails closed rather than open.
   The unbounded "terminal" claim stood here until the final cycle, which corrected it and pinned the
   limitation with a fixture (`RESIDUAL (pinned, not a guarantee): …`).
+
+### #807 (follow-up, 2026-09-13) — item 6b's stub fails ONLY the pin suite
+
+The pre-#807 stub failed every stubbed interpreter. On the committed multi-suite `ci-main.yml` the
+*other* suites then drove the failure guard on their own, so an invocation swallowed by a multi-line
+quoted string left the step exiting non-zero and item 6b GREEN: the reachability class that earlier
+revisions of this document recorded as an **unowned hole** is closed **behaviourally**, not by
+modelling. The `node` stub now exits 1 only when
+its arguments name `scripts/check-pi-pin-lockstep.mjs`; `npx`/`npm`/`bash` and every other `node`
+invocation exit 0. Measured on the committed file: the wrapped command → `all-fail` status **1** (the old
+false GREEN), `pin-suite-only-fails` status **0** (the new RED); the committed command →
+`pin-suite-only-fails` status **1**. Fixtures added: the three required controls, a deleted failure
+guard, an `exit 0` before the guard, a never-taken `case` arm, and the pinned stub-keyed bound. The
+`all-fail` mode is retained only to demonstrate the behaviour it replaced, and no shell structure is
+analysed anywhere — the stub change *is* the fix. #808 (same change) lets the sticky fixture's
+authenticated child skip the item-6b real-`bash` runs and the `--head-ref` end-to-end fixtures the
+parent has already proved, without changing what the parent asserts.
+
+### #821 (follow-up, 2026-09-13) — the trusted leg validates the MERGE RESULT, not the head
+
+`workflow-lock.yml` passed `pull_request.head.sha` to the checker. The head is the **pre-merge**
+state, so any branch cut before a guarded workflow changed carried the *old* files, failed assertions
+for files it had never touched, and was told to "restore the line" it had never removed — while
+merging would in fact have left the **base** branch's valid copies in place. Measured on its first
+real PR run (#785, two markdown lines, 11 commits behind): both the `ci.yml` accumulator and the
+`ci-main.yml` invocation line reported missing, neither of which that PR touched, and the check went
+green the moment the branch was updated. The leg now passes the **merge result** — the ref whose tree
+would actually **land** — which is also the only ref where "the PR changed this file AND the base
+branch changed it since" exists at all. When there is no merge commit the step fails closed with its
+**own** message ("this is NOT a finding about your workflow files") instead of reporting a spurious
+workflow finding. Pinned by the wiring test, which reads the step's `env` and `run` block as **parsed
+nodes** and asserts the resolution, the fail-closed guard, and that `--head-ref` receives the resolved
+value — verified non-vacuous by mutating the live workflow, one mutation per assertion, each RED.
+That list is ENUMERATED, not a guarantee: the #843 follow-ups below added four more revisions
+precisely because successive reviews kept constructing mutations the then-current revision did not
+catch. The flag keeps
+its historical name `--head-ref`; its contract is now documented as "the ref whose tree would land",
+because renaming it touches ~70 references for no behavioural gain.
+
+### #843 (follow-up, 2026-09-13) — the merge commit comes from the REST API, not the event payload
+
+#821 named the right subject but read it from the wrong place. `github.event.pull_request.merge_commit_sha`
+is **null in the event payload** until GitHub computes mergeability, and that computation is
+**asynchronous**. On the first RED run of the new code the field was empty (`merge_commit_sha` was
+present via the REST API, `mergeable` was `true`, and `refs/pull/<n>/merge` existed):
+
+```
+env:
+  MERGE_SHA:                       ← EMPTY
+  HEAD_SHA: d072f292581589d322729b5005bf16bee1d41689
+❌ pull_request.merge_commit_sha is EMPTY, so there is no merge result to validate.
+```
+
+So the fix for one false RED (stale branches) introduced a **more common** one — a race-dependent
+subset of *every* PR. Two corrections to this account, both found in review and both worth recording
+because the first draft got them wrong:
+
+- **It was a race, not a constant.** The first runs on #834's code were **green** with the field
+  populated (16:41Z, 16:43Z); the first RED was at 16:52Z, on a different PR's branch. That is what
+  makes it a race rather than a defect in one PR.
+- **#834's own PR says nothing about the field.** `pull_request_target` checks out the **default
+  branch**, so #834's PR was validated by main's *pre-#834* leg (which passed `--head-ref "$HEAD_SHA"`).
+  It never exercised the payload read at all. Claiming it "passed because the field was populated" was
+  wrong, and it is the same bootstrap effect now documented in the workflow header.
+
+The step now resolves the merge commit from `GET /repos/{owner}/{repo}/pulls/{number}`, re-adds the
+`pull-requests: read` scope that #675's review had removed as unused (correctly at the time — this
+change is what needs it), and keeps the fail-closed branch for a genuinely conflicted PR, where the
+API also returns nothing because no merge commit exists. The lesson, recorded because it is easy to
+repeat: the payload field and the REST API field of the same name are **not** interchangeable.
+
+### #843, second revision — the assertions were vacuous (cycle 1)
+
+The review of the first cut found that the wiring test could not distinguish the behaviour it claimed
+to protect. The step was selected with `s.run.includes("check-pi-pin-lockstep.mjs --head-ref")`
+against `step.run` — and a YAML **block scalar keeps its `#` lines**, so prose matched, and so did a
+**commented-out invocation**. Measured, before the fix: `# node scripts/check-pi-pin-lockstep.mjs
+--head-ref "$MERGE_SHA"` left the suite at `120 passed, 0 failed` while the trusted leg ran no checker
+at all. Likewise `--jq '.head.sha'` and the very plausible fallback `--jq '.merge_commit_sha //
+.head.sha'` were **green** while validating the PR head — silently reinstating the #821 false RED.
+Nine mutations were green in total (`|| true` making the API-failure branch dead code, an emptied
+branch body, an unreachable `-z` guard, and permission/`env` keys pinned by presence rather than
+value).
+
+### #843, third revision — the text checks were STILL vacuous (cycle 2)
+
+The second cut stripped comments and pinned exact lines, and closed all nine. The cycle-2 review then
+showed the class was not closed, only narrowed: **every assertion still reasoned about TEXT, and a
+`run:` body is data.** Eleven further mutations were GREEN, each one defeating the gate while the suite
+reported success:
+
+| mutation | effect with the suite GREEN |
+|---|---|
+| step `continue-on-error: true` | checker runs, checker fails, **job still succeeds** |
+| step `if: false` | step never runs |
+| job-level `if:` | job never runs |
+| `on.pull_request_target.paths-ignore: ['**']` | leg never triggers |
+| `runs-on:` an unroutable label | job never runs |
+| job-level `permissions: contents: write` | over-grant that the workflow-level assertion cannot see |
+| extra workflow scope (`id-token: write`) | over-grant invisible to two named-key checks |
+| invocation inside `: <<'NEVERRUN' …` | checker never runs, step exits 0 |
+| resolution+guards in an uncalled function | checker runs with an empty ref |
+| `set +e` + trailing `exit 0` | a failing checker becomes a passing step |
+| `trap 'exit 0' EXIT` | **every** `exit 1` in the step becomes success |
+
+The same review also caught **two false claims written by the author**, both now corrected in place:
+this document's own "every mutation that breaks the behaviour is RED" (a universal property a
+text-level test cannot have — replaced by the enumerated result below), and the workflow header's
+"this very fix's PR is RED here" (it was GREEN: `pull_request_target` runs main's *previous* copy, so
+the run says nothing about the new code either way — measured RED at 17:44Z and GREEN at 19:33Z on the
+same branch and the same old code, which is itself the best illustration of the race).
+
+The third revision adds (a) the structural properties text cannot express — the step must not set
+`continue-on-error` or `if:`, the job must not set `if:` or a job-level `permissions:`, `runs-on` must
+be pinned, the trigger must have no path filter, and the workflow-level permission KEY SET must be
+exactly `{contents, pull-requests}`; and (b) a **behavioural** test that EXECUTES the committed `run:`
+body with a stubbed `gh` (no network) and a stubbed `node` (so the invocation is observable), then
+asserts four scenarios: the resolved merge commit reaches `--head-ref`; a **failing checker fails the
+step**; an empty value fires the guard and does **not** invoke the checker; an API failure fails with
+its own message and does not borrow the conflict wording. Executing is the same approach used for
+`ci-main.yml`'s item 6b (#807/#828) and for the same reason: shell semantics cannot be modelled
+lexically.
+
+MEASURED RESULT (not a universal claim). Mutations verified RED, each with the suite failing:
+the 11 above plus re-adding the payload `MERGE_SHA`, `--head-ref "$HEAD_SHA"`, dropping the jq
+`// ""`, `// " "`, the `/pulls` list endpoint, either guard emptied or losing its `exit 1`, the `-z`
+guard inverted or moved above the assignment, the invocation moved above the guard, dropping
+`contents: read` or `pull-requests: read`, `contents: write`, `pull-requests: write`, dropping
+`GH_TOKEN` or `REPO`, and `PR_NUMBER -> github.run_id`. This is an enumerated list, not a proof: a
+text-and-execution test can still be defeated by something neither list anticipated, and the residual
+bounds are recorded rather than denied.
+
+### #843, fourth revision — the text pins and the execution were not tied together (cycle 3)
+
+The cycle-3 review found the sharpest defeat yet, and it reinstated the **exact** #821 regression:
+
+> a DECOY copy of the correct resolution block inside a heredoc (satisfying every text pin, never
+> executed) followed by a REAL call resolving `.head["sha"]` — **121 passed, 0 failed**, while the
+> leg validated the PR head.
+
+Two structural facts made that possible. The text pins were satisfied by *any* non-comment line, and
+the behavioural stub `gh` **ignored its argv**, so the only endpoint check was `ghArgv` matching
+`/\/pulls\//` — which any `/pulls/` URL satisfies. The two layers therefore proved different things
+about different lines. Bracketed `.head["sha"]` also evaded the `--jq[^\n]*head\.sha` regex.
+
+The same review found the STEP-level neutralizers that executing a *body* cannot see, all green:
+`shell: 'true {0}'` (GitHub runs `true <script>` — the step exits 0 and never runs the checker),
+`defaults.run.shell`, job-level `continue-on-error: true` (a failing job, a green run), a narrowed
+`types:` or a `branches:` filter (the leg never fires), `needs:` on a job that is skipped, and
+`container:`.
+
+These are fixed by (a) asserting the **actual** `gh` argv VERBATIM — exactly one call, resolving
+`merge_commit_sha` — which ties the text pins to what really executes and makes a decoy irrelevant
+because it never runs; and (b) asserting the structural neutralizers absent (no `shell:` on the step,
+no `defaults.run.shell` at job or workflow level, no job `continue-on-error`, no `needs`, no
+`container`, `types` pinned to the full four, no `paths`/`paths-ignore`/`branches`/`branches-ignore`).
+
+Two over-strictness fixes came from the same review, because a test that reds honest edits is also a
+defect: step selection is now tolerant of extra flags (the strict value assertion still fires, but
+with a message about the *value* rather than a confusing "no step found"), and the S3/S4 message
+greps were replaced by a **difference** assertion — an API failure and an empty merge commit must not
+produce interchangeable messages, which is the property that matters, without pinning prose that a
+copy-edit would red.
+
+MEASURED RESULT for this revision: the decoy+`.head["sha"]` bypass, `shell:`, `defaults.run.shell`, job
+`continue-on-error`, `types: [closed]`, `types: [labeled]`, `branches:`, `branches-ignore:`, `needs:`,
+`container:`, a commented-out invocation, a heredoc-wrapped invocation, `trap 'exit 0' EXIT`,
+`.head.sha`, and a job-level `permissions:` override are all RED. Three successive reviews each found
+defeatable assertions in the previous revision, which is the honest reason this document records what
+was TESTED rather than claiming the test cannot be defeated.
+
+### #843, fifth revision — the neutralizers moved OUTSIDE the step (cycle 4)
+
+The cycle-4 review found that all four prior revisions, and both layers of the test, had reasoned
+exclusively about the ONE selected step. Everything that could disable the leg from elsewhere was
+unguarded, and each of these left the suite at `121 passed, 0 failed`:
+
+- a **third step** — `run: printf 'process.exit(0)\n' > scripts/check-pi-pin-lockstep.mjs` in a
+  "Warm the checkout" step: the checker is a no-op forever after that lands;
+- a third step appending a shim dir to `$GITHUB_PATH`, or exporting `BASH_ENV` via `$GITHUB_ENV`
+  (bash SOURCES `$BASH_ENV` before the script, so `exit 0` in it ends the step);
+- **`actions/checkout`'s `uses:`/`with:`** — nothing constrained them, so
+  `ref: ${{ github.event.pull_request.head.sha }}` was GREEN here **and under actionlint**. That is the
+  pwn-request RCE vector this file's own header forbids, on the one file whose only guard is this test
+  (`workflow-lock.yml` is not content-locked);
+- `env:` at step, job, or workflow level — an extra key the three-value check cannot see;
+- a second, un-stubbed resolution channel *inside* the body: `git ls-remote origin
+  refs/pull/$PR_NUMBER/head` overriding `MERGE_SHA` after the pinned `gh` call. The rev-4 claim that the
+  argv assertion "ties the text pins to what really executes" was **false** — it bound one `gh` call,
+  not the value that reaches `--head-ref`.
+
+This revision adds the job's **step shape** (exactly `[checkout, validate]`), the checkout pin
+(`uses: actions/checkout@v4`, no `with:`), `env:` key sets at all three levels, and a shape **whitelist**
+on the executed body. That whitelist was itself defeated in cycle 5 (`echo ".*"` admits `$( )`), which
+is the same category error the file's header says was abandoned for the lock: a regex over a shell
+language. It is replaced by a **VALUE pin** — see the sixth revision.
+
+Two over-strictness cases found in the same review were relaxed, because a test that reds honest edits
+is also a defect: `types` is now compared as a SET (reordering is not a behaviour change), and
+`runs-on` accepts any pinned `ubuntu-*` label rather than exactly `ubuntu-latest`. The remaining
+strictness (the body whitelist, the exact invocation line, the exact guard spellings) is deliberate:
+this is a 26-line security-critical body, and an addition to it must be a conscious edit to the test.
+
+MEASURED RESULT for this revision: a third step overwriting the checker, a third step shimming
+`$GITHUB_PATH`, a third step exporting `BASH_ENV`, checkout `ref:` to the PR head, an unpinned checkout
+`uses:`, checkout `ref: github.head_ref`, `git ls-remote` overriding the resolved ref, rewriting the
+harness argv log, a second `gh` call, a step `env:` extra key, a job `env:`, and a workflow `env:` are
+all RED; reordered `types` and `runs-on: ubuntu-24.04` are GREEN (the relaxations work).
 
 ## Out of Scope
 
@@ -628,3 +839,47 @@ as an unowned hole below.
 | Refreshing the now-stale "~4s of work" comment in `ci.yml` | blocked by design — `ci.yml` is a locked file; a comment edit would require an `--update-lock` commit of its own. Not part of the guard's contract |
 | Executing the committed command under `pull_request_target` | rejected on security grounds (RCE vector) and recorded as the reason item 6b is local-leg-only |
 | Walking symlinks **above** the repo root | deliberate; `/tmp` is a symlink on macOS, so walking to `/` would make every fixture RED |
+
+### #843, sixth revision — the body is pinned by VALUE, and the job set is pinned (cycle 5)
+
+The cycle-5 review found two more P0s and confirmed the pattern. The shape whitelist added in rev 5
+was defeated by one line that matched its own `^  echo ".*"$` rule:
+
+```
+echo "$(printf 'process.exit(0)\n' > scripts/check-pi-pin-lockstep.mjs)"
+```
+
+Measured end-to-end: the checker is overwritten, the pinned invocation then runs the no-op, and the
+step exits 0 with the suite at `121 passed, 0 failed`. Second, the pwn-request guard was a raw-text
+regex requiring an UNQUOTED `ref:` at line start and inspecting only `jobs.workflow-lock`, so a quoted
+`"ref":` on a checkout in a **second job** — arbitrary `run:` on the privileged `pull_request_target`
+trigger — was GREEN, and under actionlint too. Also found: `strategy.matrix` with an `exclude` covering
+every combination SKIPS the job (a skipped job cannot fail), and the step-level `continue-on-error`
+check used `=== false` against a YAML subset that does **not** type-resolve scalars, so an honest
+explicit `continue-on-error: false` parsed as the string `"false"` and false-RED (inconsistent with the
+job-level check, which already used `truthyFlag`).
+
+The sixth revision therefore stops describing the body by shape at all: the comment-stripped body is
+compared **by value** to `EXPECTED_LOCK_BODY`, the same technique as `EXPECTED_CI_MAIN_INVOCATION` and
+for the same reason. Any edit to what runs is RED and must be a deliberate edit to that constant.
+Alongside it: the job set is pinned to exactly `["workflow-lock"]`; every job's every step is walked
+structurally for `with.ref` and for any `uses` other than the pinned checkout; and `strategy` is
+asserted absent.
+
+MEASURED RESULT for this revision: a second job with a quoted `"ref":` to the PR head, a second job with
+a bare `run:`, a quoted `"ref":` on the single job's checkout, the `echo "$( )"` checker-overwrite, a
+`strategy.matrix` that excludes every combination, a third step overwriting the checker, `git ls-remote`
+overriding the resolved ref, and a second `gh` call are all RED. Step- and job-level
+`continue-on-error: false` are GREEN (the over-strictness fix), while `continue-on-error: true` stays
+RED.
+
+NOTE ON THE REVIEW BUDGET. The `code-review` skill has **no hard cycle cap** —
+`max_fix_cycles` was removed in favour of convergence gating, with a 10-cycle safety cap that escalates
+to a human rather than ending the loop (agent-infra#700 removed an earlier hard-coded 4 because it
+contradicted the convergence-gated skills). This PR used **five** cycles, which is inside that bound,
+with the fifth run as an explicitly-labelled closing review. It was not stopped early because cycles 3,
+4 and 5 each found the then-current validation defeatable — one of them a pwn-request vector — so
+treating any of those revisions as converged would have shipped a gate that reports green while doing
+nothing. A sixth, confirmation pass on the final revision then found a step-level `if:` had been dropped
+in the rev-6 rewrite; that is fixed here, and it is the concrete argument for re-reviewing a revision
+rather than trusting the fixes.

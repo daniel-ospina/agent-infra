@@ -1728,28 +1728,39 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
         manifest.ralph_loop_attempted = true;
         manifest.cycles.push({
           number: nextCycle, verdict: "NEEDS_FIX", issues_found: 1,
-          exit_signal: `ralph-loop:${termResult.reason}`, timestamp: new Date().toISOString(),
+          // #847 — the FIRST stall hit returns through here without ever writing
+          // `exit_reason`, so the detector has to ride on the exit_signal; with the
+          // bare layer reason it read "L3-deadlock" for both detectors, which is
+          // exactly the ambiguity the detector field exists to remove.
+          exit_signal: `ralph-loop:${termResult.detector ?? termResult.reason}`, timestamp: new Date().toISOString(),
         });
         writeManifest(slug, manifest);
         
         const lastSignal = manifest.cycles[manifest.cycles.length - 2]?.exit_signal || "unknown";
-        logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "ralph_loop_injected", data: { reason: termResult.reason, last_signal: lastSignal, cycles: manifest.cycles?.length ?? 0 } });
-        notify(manifest, "ralph_loop", `${termResult.reason} | last: ${lastSignal}`);
+        logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "ralph_loop_injected", data: { reason: termResult.reason, detector: termResult.detector, last_signal: lastSignal, cycles: manifest.cycles?.length ?? 0 } });
+        notify(manifest, "ralph_loop", `${termResult.detector ?? termResult.reason} | last: ${lastSignal}`);
         
         injectContinuation(pi, slug, manifest,
-          `You appear stuck. Last cycles had the same issue pattern (${termResult.reason}). Goal: ${manifest.goal}. Try a different approach. What assumption are you making that might be wrong?`
+          `You appear stuck. Last cycles had the same issue pattern (${termResult.detector ?? termResult.reason}). Goal: ${manifest.goal}. Try a different approach. What assumption are you making that might be wrong?`
         );
         console.log(`[loop-enforcer] 🔄 Ralph Loop injected for ${slug} (${termResult.reason})`);
         return;
       }
 
-      notify(manifest, "cap_fired", termResult.reason);
+      notify(manifest, "cap_fired", termResult.detector ?? termResult.reason);
       console.log(`[loop-enforcer] 🛑 Cap fired: ${termResult.reason} — ${termResult.message}`);
       if (termResult.escalate) {
         const escalation = resolveEscalation(manifest);
         const chain = escalation ? escalation.path.join(" → ") : "unknown";
-        manifest.human_gate_flags.push(`cap-escalate:${termResult.reason} → ${chain}`);
-        notify(manifest, "escalation_needed", `${termResult.reason} | chain: ${chain} | target: ${escalation?.target || "unknown"}`);
+        // #847 cycle-3 — this is the ORDINARY path: it runs before the completion
+        // branch below, so it is the only human-gate write for a cron/trigger/
+        // continuous loop, and the first of two for a completion loop that
+        // HARD-STOPS (for one that soft-pauses it is the only one — that branch
+        // returns before the second push).
+        // With the bare layer reason it persisted `cap-escalate:L3-deadlock` for
+        // BOTH detectors — the exact ambiguity the detector field exists to remove.
+        manifest.human_gate_flags.push(`cap-escalate:${termResult.detector ?? termResult.reason} → ${chain}`);
+        notify(manifest, "escalation_needed", `${termResult.detector ?? termResult.reason} | chain: ${chain} | target: ${escalation?.target || "unknown"}`);
         console.log(`[loop-enforcer] 🚨 Escalation: ${termResult.reason} → ${chain}`);
       }
       // Non-completion loops don't terminate on cap — they reset for next trigger
@@ -1761,13 +1772,22 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
         if (currentResets < maxResets) {
           // Soft pause — allow user to restart session with fresh context
           manifest.context_resets = currentResets + 1;
-          manifest.cycles = manifest.cycles.slice(-1); // reset counter, keep last fingerprint
-          manifest.exit_reason = termResult.reason;
+          manifest.cycles = manifest.cycles.slice(-1); // reset counter, keep only the most recent cycle
+          // Restored (#847 cycle-4 review): this line is present at `5612d07` and
+          // was dropped without explanation while the `exit_reason` line below it
+          // was rewritten. `session_start` recovery requires `status === "running"`,
+          // so this is not a no-op for a paused loop resumed by a new session.
           manifest.status = "running";
+          // #847 — persist the DETECTOR, not just the layer, when L3 fired:
+          // `reason` is "L3-deadlock" for both stalls, so storing it alone made
+          // the canonical exit vocabulary (`fingerprint-stall` / `honest-stuck`)
+          // unreachable in the persisted record. `?? reason` keeps every other
+          // layer's value byte-identical (none of them set `detector`).
+          manifest.exit_reason = termResult.detector ?? termResult.reason;
           writeManifest(slug, manifest);
           
           const usage1 = extractLastUsage(process.cwd());
-          logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_paused", data: { exit_reason: termResult.reason, cycles: manifest.cycles?.length ?? 0, context_resets: manifest.context_resets, tokens_in: usage1?.input, tokens_out: usage1?.output, total_tokens: usage1?.totalTokens, cost_usd: usage1?.cost } });
+          logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_paused", data: { exit_reason: manifest.exit_reason, detector: termResult.detector, cycles: manifest.cycles?.length ?? 0, context_resets: manifest.context_resets, tokens_in: usage1?.input, tokens_out: usage1?.output, total_tokens: usage1?.totalTokens, cost_usd: usage1?.cost } });
           
           pi.sendUserMessage(
             `[loop-enforcer] Loop '${slug}' hit cycle cap. Restart your Pi session to resume with fresh context. (Reset ${manifest.context_resets}/${maxResets})`,
@@ -1781,20 +1801,23 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
         
         // Max resets reached — hard stop
         manifest.status = "complete";
-        manifest.exit_reason = termResult.reason;
+        manifest.exit_reason = termResult.detector ?? termResult.reason;
         manifest.resume_from_cycle = null;
         manifest.cycles.push({
           number: nextCycle, verdict: "NEEDS_FIX", issues_found: 1,
-          exit_signal: `cap:${termResult.reason}`, timestamp: new Date().toISOString(),
+          // #847 cycle-3 — `cap:` prefix preserved (scheduler.ts matches
+          // `startsWith("cap:")`), cause disambiguated. Without this the cycle row
+          // read `cap:L3-deadlock` beside an `exit_reason` of `honest-stuck`.
+          exit_signal: `cap:${termResult.detector ?? termResult.reason}`, timestamp: new Date().toISOString(),
         });
         writeManifest(slug, manifest);
         const usage1b = extractLastUsage(process.cwd());
-        logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_fired", data: { exit_reason: termResult.reason, cycles: manifest.cycles?.length ?? 0, context_resets: manifest.context_resets, tokens_in: usage1b?.input, tokens_out: usage1b?.output, total_tokens: usage1b?.totalTokens, cost_usd: usage1b?.cost } });
+        logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_fired", data: { exit_reason: manifest.exit_reason, detector: termResult.detector, cycles: manifest.cycles?.length ?? 0, context_resets: manifest.context_resets, tokens_in: usage1b?.input, tokens_out: usage1b?.output, total_tokens: usage1b?.totalTokens, cost_usd: usage1b?.cost } });
         if (termResult.escalate) {
           const escalation = resolveEscalation(manifest);
           const chain = escalation ? escalation.path.join(" → ") : "unknown";
-          manifest.human_gate_flags.push(`cap-escalate:${termResult.reason} → ${chain}`);
-          notify(manifest, "escalation_needed", `${termResult.reason} | chain: ${chain}`);
+          manifest.human_gate_flags.push(`cap-escalate:${termResult.detector ?? termResult.reason} → ${chain}`);
+          notify(manifest, "escalation_needed", `${termResult.detector ?? termResult.reason} | chain: ${chain}`);
         }
         clearBridgeState();
         activeLoopSlugs.clear();
@@ -1804,13 +1827,13 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
       }
       // Cron/trigger/continuous: cap fires, but loop resets for next trigger rather than exiting
       const capUsage = extractLastUsage(process.cwd());
-      logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_fired", data: { exit_reason: termResult.reason, cycles: manifest.cycles?.length ?? 0, escalate: termResult.escalate, tokens_in: capUsage?.input, tokens_out: capUsage?.output, total_tokens: capUsage?.totalTokens, cost_usd: capUsage?.cost } });
+      logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_fired", data: { exit_reason: termResult.detector ?? termResult.reason, detector: termResult.detector, cycles: manifest.cycles?.length ?? 0, escalate: termResult.escalate, tokens_in: capUsage?.input, tokens_out: capUsage?.output, total_tokens: capUsage?.totalTokens, cost_usd: capUsage?.cost } });
       if (!manifest.trigger_history) manifest.trigger_history = [];
       manifest.trigger_history.push({
         trigger_id: `${slug}-${Date.now()}`,
         started_at: new Date().toISOString(),
         cycles: manifest.cycles?.length || 0,
-        verdict: termResult.reason,
+        verdict: termResult.detector ?? termResult.reason,
         tokens_consumed: capUsage?.totalTokens || 0,
       });
       console.log(`[loop-enforcer] ${manifest.loop_type} loop — cap ${termResult.reason}, resetting for next trigger`);

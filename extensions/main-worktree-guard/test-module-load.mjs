@@ -35,7 +35,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-module-load.mjs
 import { execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -173,6 +173,79 @@ if (targets.length > 0 && targets.every((t) => declared.has(t.name))) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Part A3 — the branch-ownership member-list invariant (#879), BOTH ways.
+//
+// #879: `index.ts` validates a hardcoded `_BRANCH_OWNERSHIP_MEMBERS` list
+// before calling into the cached `shared/branch-ownership.mjs` namespace, so a
+// STALE namespace (one imported by an earlier generation of index.ts, served
+// from cache for the life of the host process) degrades to M1/M2/M3-OFF
+// instead of throwing `… is not a function` from inside the tool hook — a
+// throw that aborts the whole bash tool call and breaks every mutating git
+// command.
+//
+// That protection is only as good as the list. If a call site uses a member
+// the list omits, validation passes on the stale namespace and the crash
+// returns. So pin it in both directions, statically, at zero cost:
+//   A3a — every `branchOwnership.<member>` used in index.ts IS listed.
+//   A3b — every listed member IS an exported function of the module.
+//
+// KNOWN LIMITATIONS (deliberate, documented rather than implied):
+//   * A3a pins ONE SYNTACTIC SHAPE. A member reached as
+//     `branchOwnership["x"]`, via an alias (`const b = branchOwnership; b.x()`),
+//     through optional chaining, or used in ANOTHER FILE would not be caught.
+//     Closing that needs a runtime backstop, not a bigger regex.
+//   * Both directions are regex-based heuristics, so they can be fooled by
+//     unusual comment/string shapes. They are a drift tripwire, not a proof.
+// ─────────────────────────────────────────────────────────────────────────
+function blankCommentsAndStrings(input) {
+  // Strings first (so a `//` or `/*` INSIDE a string cannot corrupt the comment
+  // pass), then block comments, then line comments. Templates/escapes are
+  // handled crudely on purpose — this feeds a drift tripwire, not a parser.
+  let out = input.replace(/(["'`])(?:\\.|(?!\1)[^\\\n])*\1/g, '""');
+  out = blankBlockComments(out);
+  out = out.replace(/\/\/[^\n]*/g, "");
+  return out;
+}
+const srcCode = blankCommentsAndStrings(src);
+
+const MEMBER_LIST_RE = /_BRANCH_OWNERSHIP_MEMBERS\s*=\s*\[([\s\S]*?)\]\s*as const/;
+// NOTE: read the list from `src` (block-comments-blanked only) — the member
+// names ARE string literals, so stripping strings would erase the list itself.
+const memberListRaw = MEMBER_LIST_RE.exec(src)?.[1] ?? null;
+const listedMembers = memberListRaw
+  ? [...memberListRaw.matchAll(/["']([A-Za-z0-9_]+)["']/g)].map((m) => m[1])
+  : [];
+expectTrue("A3: located _BRANCH_OWNERSHIP_MEMBERS in index.ts", listedMembers.length > 0,
+  "the validated member list could not be parsed — did it get renamed or reshaped?");
+
+// A3a: every member access in index.ts must be validated before use.
+const usedMembers = [...new Set([...srcCode.matchAll(/branchOwnership\s*\.\s*([A-Za-z0-9_]+)/g)].map((m) => m[1]))];
+const unlisted = usedMembers.filter((m) => !listedMembers.includes(m));
+expectTrue(`A3a: every branchOwnership.<member> used is validated (${usedMembers.length} used)`,
+  unlisted.length === 0,
+  `used but NOT in _BRANCH_OWNERSHIP_MEMBERS: ${unlisted.join(", ")} — a stale namespace would `
+  + "pass validation and throw `is not a function` mid-hook, aborting the bash tool call (#879)");
+if (unlisted.length === 0 && usedMembers.length > 0) {
+  console.log(`     (${usedMembers.length} members used, all validated)`);
+}
+
+// A3b: every validated member must actually exist in the module. A wrong name
+// here would silently DISABLE the guard on a healthy namespace — the opposite
+// failure (fail-closed as fail-open).
+const BO_MJS = join(HERE, "..", "shared", "branch-ownership.mjs");
+const boSrc = blankCommentsAndStrings(readFileSync(BO_MJS, "utf8"));
+const exportedFns = new Set(
+  [...boSrc.matchAll(/export\s+(?:async\s+)?function\s+([A-Za-z0-9_]+)/g)].map((m) => m[1]));
+const notExported = listedMembers.filter((m) => !exportedFns.has(m));
+expectTrue(`A3b: every validated member is an exported function (${listedMembers.length} listed)`,
+  notExported.length === 0,
+  `listed but NOT an exported function of shared/branch-ownership.mjs: ${notExported.join(", ")} — `
+  + "this would disable M1/M2/M3 on a HEALTHY namespace, failing open");
+if (notExported.length === 0 && listedMembers.length > 0) {
+  console.log(`     (${listedMembers.length} listed members, all exported)`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Part B — real module load + behavioral proof that the classify-git bindings
 // are the real imports, not the fail-safe stubs.
 // ─────────────────────────────────────────────────────────────────────────
@@ -204,6 +277,33 @@ async function partB() {
     register(new URL("./module-load-hooks.mjs", import.meta.url), import.meta.url);
   }
 
+  // Hermetic HOME (#744 review): the guard's #207 escape marker lives at
+  // ~/.pi/agent/.allow-main-edits and is keyed to PI_SESSION_ID. A live marker
+  // in the operator's real HOME (the documented recovery step) exempts main
+  // checkout mutations, which would make B6b's destructive op ALLOWED and turn
+  // this suite falsely red. Point HOME at a throwaway dir before the module
+  // loads, so the suite never reads the operator's marker/audit state.
+  const prevHome = process.env.HOME;
+  const prevCwd = process.cwd();
+  let tmp = null;
+  const fakeHome = realpathSync(mkdtempSync(join(tmpdir(), "guard-module-load-home-")));
+  // Restores the caller's environment and removes the scratch dirs. Defined
+  // before the B2/B3 bail-outs so those paths restore HOME/hatches too, not
+  // just the main path's finally — a leaked fake HOME would otherwise outlive
+  // the harness if this file were ever imported instead of run (#744 review).
+  const cleanup = () => {
+    process.chdir(prevCwd);
+    for (const [v, val] of savedHatch) {
+      if (val === undefined) delete process.env[v]; else process.env[v] = val;
+    }
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    for (const d of [fakeHome, tmp]) {
+      if (!d) continue;
+      try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  };
+  process.env.HOME = fakeHome;
+
   // stripTypeScriptTypes emits an ExperimentalWarning; this suite's own
   // pass/fail output is the signal, so drop Node's default warning printer.
   process.removeAllListeners("warning");
@@ -215,6 +315,10 @@ async function partB() {
   let mod;
   try {
     mod = await import(pathToFileURL(INDEX_TS).href);
+  } catch (e) {
+    // A rejected import must not leak the fake HOME or the env hatches.
+    cleanup();
+    throw e;
   } finally {
     console.warn = realWarn;
   }
@@ -223,23 +327,22 @@ async function partB() {
   for (const w of degradation) console.log(`     captured: ${w}`);
   expect(`B1: index.ts loads with no degradation warning (warnings: ${warnings.length})`, degradation.length, 0);
   expect("B2: index.ts default export is the extension factory", typeof mod.default, "function");
-  if (typeof mod.default !== "function") return;
+  if (typeof mod.default !== "function") return cleanup();
 
   // Drive the factory: it registers exactly session_start + tool_call.
   const handlers = new Map();
   mod.default({ on(name, fn) { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(fn); } });
   const toolCall = handlers.get("tool_call")?.[0];
   expect("B3: factory registered a tool_call handler", typeof toolCall, "function");
-  if (typeof toolCall !== "function") return;
+  if (typeof toolCall !== "function") return cleanup();
 
   // Hermetic MAIN checkout: clean + on main, so nothing blocks for a reason
   // other than the binding under test.
   // realpath: on macOS tmpdir() is /var/... while git reports /private/var/...
   // (the guard realpaths its toplevel, so a non-realpath'd fixture would look
   // outside the hub and misjudge the carve-out).
-  const tmp = realpathSync(mkdtempSync(join(tmpdir(), "guard-module-load-")));
+  tmp = realpathSync(mkdtempSync(join(tmpdir(), "guard-module-load-")));
   const repo = join(tmp, "hub");
-  const prevCwd = process.cwd();
   try {
     execSync(`git init -q -b main "${repo}"`, { stdio: "ignore" });
     execSync("git config user.email t@t && git config user.name t", { cwd: repo, stdio: "ignore" });
@@ -282,6 +385,50 @@ async function partB() {
     expectTrue("B6b: `git reset --hard` is blocked by the loaded extension end-to-end",
       !!reset && reset.block === true, `handler returned ${JSON.stringify(reset)}`);
 
+    // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
+    // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE
+    // script whose only path-shaped content is a markdown code span inside a
+    // quoted heredoc must RUN (this is the #967 fleet-wide freeze), and a
+    // discard reachable only from another subcommand must not gate THIS
+    // invocation — while still blocking its own.
+    const BT = String.fromCharCode(96);
+    writeFileSync(join(repo, "probe.sh"),
+      "python3 - \"$1\" <<'PYEOF'\n# docs: a trailing " + BT + "/" + BT + " normalizes to empty\nPYEOF\n");
+    const probeRun = await callBash("bash probe.sh --probe");
+    expectTrue("B8a: git-free script w/ docstring backtick runs (#967 probe class)",
+      probeRun === undefined, `handler returned ${JSON.stringify(probeRun)}`);
+    writeFileSync(join(repo, "dispatch.sh"),
+      "case \"$1\" in\n  --reset) git reset --hard ;;\n  --status) git status ;;\nesac\n");
+    const dStatus = await callBash("bash dispatch.sh --status");
+    const dReset = await callBash("bash dispatch.sh --reset");
+    expectTrue("B8b: dispatch --status ALLOWED (discard branch unreachable)",
+      dStatus === undefined, `handler returned ${JSON.stringify(dStatus)}`);
+    expectTrue("B8c: dispatch --reset BLOCKED (discard reachable)",
+      !!dReset && dReset.block === true, `handler returned ${JSON.stringify(dReset)}`);
+    expectTrue("B8c-msg: block message drops the dead hub-worktree recovery + old wording",
+      !!dReset && /script content contains a blocked git operation/.test(dReset.reason ?? "") &&
+      !/git-bearing script in the shared main checkout/.test(dReset.reason ?? "") &&
+      !/checkout-hygiene\/hub-worktree\.sh/.test(dReset.reason ?? ""),
+      `reason=${JSON.stringify(dReset?.reason ?? "")}`);
+    // (c) the documented dodge — write /tmp/x.sh + `bash /tmp/x.sh` — stays closed.
+    const dodgePath = join(tmp, "dodge.sh");
+    writeFileSync(dodgePath, "#!/bin/bash\ngit reset --hard\n");
+    const dodge = await callBash(`bash ${dodgePath}`);
+    expectTrue("B8d: /tmp dodge (write + bash <file>) BLOCKED",
+      !!dodge && dodge.block === true, `handler returned ${JSON.stringify(dodge)}`);
+    // #743: a script OWNED by a linked worktree is labeled as such — the old
+    // message called it "the shared main checkout" and offered a recovery
+    // (hub-worktree.sh) that cannot lift a hub-rooted session's content gate.
+    const wt = join(tmp, "wt");
+    execSync(`git worktree add -q "${wt}" -b wt/label HEAD`, { cwd: repo, stdio: "ignore" });
+    writeFileSync(join(wt, "wt-discard.sh"), "#!/bin/bash\ngit reset --hard\n");
+    const wtBlock = await callBash(`bash ${join(wt, "wt-discard.sh")}`);
+    expectTrue("B8e: worktree-owned script labeled a linked worktree (not the main checkout)",
+      !!wtBlock && wtBlock.block === true &&
+      /script location: a linked worktree/.test(wtBlock.reason ?? "") &&
+      !/checkout-hygiene\/hub-worktree\.sh/.test(wtBlock.reason ?? ""),
+      `reason=${JSON.stringify(wtBlock?.reason ?? "")}`);
+
     // ── B7: write/edit gate on a DISORDERED hub (#1484/#436/#628) ──
     // Pre-#744 the import degraded mid-destructuring, so the later bindings
     // (`resolveTargetTopLevel`, `resolveTargetCheckout`, `classifierLoaded`)
@@ -289,13 +436,22 @@ async function partB() {
     execSync("printf 'wip\\n' > stray.txt", { cwd: repo, stdio: "ignore" });
     const realWarn2 = console.warn;
     console.warn = () => {}; // the #628 banner is chatty; decisions are what matter
-    let trackedWrite, firstWrite, capWrite;
+    let trackedWrite, firstWrite, capWrite, carveOutBlocked = [];
     try {
       // B7a: overwriting an EXISTING TRACKED hub file must block.
       trackedWrite = await callWrite(join(repo, "tracked.txt"));
       // B7b/B7c: NEW files take the #436 carve-out (1..25 allowed, 26 blocked).
       firstWrite = await callWrite(join(repo, "docs", "plans", "_new-1.md"));
-      for (let i = 2; i <= 25; i++) await callWrite(join(repo, "docs", "plans", `_new-${i}.md`));
+      if (firstWrite !== undefined) carveOutBlocked.push(`_new-1: ${JSON.stringify(firstWrite).slice(0, 120)}`);
+      for (let i = 2; i <= 25; i++) {
+        const r = await callWrite(join(repo, "docs", "plans", `_new-${i}.md`));
+        // A blocked carve-out write is NOT counted toward the #628 volume, so a
+        // single transient block inside 1..25 shifts B7c's boundary and shows
+        // up as a confusing "write #26 was allowed". Record them so that mode
+        // reports itself as this, not as a cap regression. (Observed twice in
+        // ~250 runs under load — see #768.)
+        if (r !== undefined) carveOutBlocked.push(`_new-${i}: ${JSON.stringify(r).slice(0, 120)}`);
+      }
       capWrite = await callWrite(join(repo, "docs", "plans", "_new-26.md"));
     } finally {
       console.warn = realWarn2;
@@ -306,15 +462,14 @@ async function partB() {
       firstWrite === undefined, `handler returned ${JSON.stringify(firstWrite)}`);
     expectTrue("B7c: write #26 blocks on the #628 volume cap (hubNewFileVolumeVerdict/HUB_NEW_FILE_BLOCK_CAP are real)",
       !!capWrite && capWrite.block === true && /#628/.test(capWrite.reason ?? ""),
-      `handler returned ${JSON.stringify(capWrite)}`);
+      `handler returned ${JSON.stringify(capWrite)}` +
+      (carveOutBlocked.length
+        ? ` — but ${carveOutBlocked.length} of writes 1..25 were BLOCKED (${carveOutBlocked.slice(0, 2).join(" | ")}), so this boundary shifted instead of failing (#768)`
+        : ""));
   } catch (e) {
     expectTrue("B: part B ran without throwing", false, String(e?.message ?? e).slice(0, 200));
   } finally {
-    process.chdir(prevCwd);
-    for (const [v, val] of savedHatch) {
-      if (val === undefined) delete process.env[v]; else process.env[v] = val;
-    }
-    try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+    cleanup();
   }
 }
 

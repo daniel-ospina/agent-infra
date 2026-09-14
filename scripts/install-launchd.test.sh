@@ -44,10 +44,10 @@ assert_eq() { # <actual> <expected> <label>
     if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi
 }
 assert_contains() { # <haystack> <needle> <label>
-    if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi
+    if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
 assert_not_contains() {
-    if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi
+    if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi
 }
 
 # ── scaffold ──────────────────────────────────────────────────────────────
@@ -102,7 +102,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -163,11 +163,13 @@ assert_contains "$OUT" "corruption-canary: installed + loaded" "corruption-canar
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
 assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekly installed on fresh machine (#373)"
 assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reaper installed on fresh machine (#469)"
+assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
 FLEET_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.fleet-cost-weekly.plist"
 REAPER_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-session-reaper.plist"
+PRUNE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-task-session-prune.plist"
 DBW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.deepseek-balance-watch.plist"
 HUB_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 ORACLE_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
@@ -188,6 +190,20 @@ assert_contains "$(cat "$REAPER_INSTALLED")" "<string>0</string>" "reaper plist 
 assert_contains "$(cat "$REAPER_INSTALLED")" "StartInterval" "reaper job is interval-scheduled"
 assert_contains "$(cat "$REAPER_INSTALLED")" "<integer>3600</integer>" "reaper job hourly (StartInterval 3600)"
 assert_contains "$(cat "$REAPER_INSTALLED")" "agent-infra-plist-version: 0.1.0" "reaper template carries version marker"
+# #947 — the DEPLOYED invariant: the hourly job must never arm the stuck set
+# (arming is a manual, per-machine decision). Without this assertion a later
+# template edit adding REAP_REAP_STUCK=1 would satisfy every other plist check
+# and silently broaden the kill set on every host at the next sync.
+assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_REAP_STUCK" "reaper plist does NOT arm the STUCK set (#947)"
+assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_STUCK_HOURS" "reaper plist does not override the stuck bound (#947)"
+# #783 Task 6 — pi-task-session-prune rendered-plist content asserts (farmed
+# path, DISARMED TASK_SESSION_PRUNE_DRY_RUN=1, hourly StartInterval 3600)
+assert_contains "$(cat "$PRUNE_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-task-session-prune.sh" "prune plist rendered with fake HOME (farmed path)"
+assert_contains "$(cat "$PRUNE_INSTALLED")" "TASK_SESSION_PRUNE_DRY_RUN" "prune plist carries TASK_SESSION_PRUNE_DRY_RUN env"
+assert_contains "$(cat "$PRUNE_INSTALLED")" "<string>1</string>" "prune plist SHIPS DRY-RUN (TASK_SESSION_PRUNE_DRY_RUN=1)"
+assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interval-scheduled"
+assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
+assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
 assert_contains "$(cat "$DBW_INSTALLED")" "$HOME1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh" "balance-watch plist rendered with fake HOME (#476)"
 assert_contains "$(cat "$DBW_INSTALLED")" "agent-infra-plist-version: 0.1.0" "balance-watch template carries version marker"
 # #476 — the balance poller is the SINGLE restore authority: must run every
@@ -204,7 +220,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "5" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch)"
+assert_eq "$BOOTSTRAP_COUNT1" "6" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

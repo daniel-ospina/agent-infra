@@ -35,10 +35,10 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 > **Canonical:** `agent-infra/skills/plan-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Low-Medium, 5 for Medium-High, 10 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
+> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers, convergence-gated. Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
 
 # Plan Review
 
@@ -54,22 +54,22 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 
 `plan-review <plan-doc-path> [--issue <number>] [--epic <path>] [--tier standard|complex]`
 
-## Proportional Review Cycles (inlined from proportional-gates v1.0.0)
+## Proportional Review Cycles
 
-> Reviewer count scales with plan risk and novelty. Not every plan needs 4 reviewers.
->
-> **Plus Reviewer #5 (conditional).** The table below is the *proportional* set. Reviewer #5 (Duplication & Architecture, #688) is dispatched **in addition to** it whenever the plan introduces a new component, a new write path, a new shared-state owner, or a new definition of an existing vocabulary — and again on the final cycle. It is **not** triggered by plan length, so a High-risk plan with a new write path dispatches **4 + #5**. Keeping it out of the table is deliberate: it is orthogonal to risk, not a fifth risk tier. See the Reviewer #5 section in Phase 1.
+Reviewer counts and cycle caps: `proportional-gates` §Review Cycles — never restated here. Tier crosswalk: `micro` → Low, `standard` → Low-Medium, `complex` → High.
 
-| Risk | Reviewers | Max Cycles |
-|------|-----------|------------|
-| **Micro** | 0 (skip review) | — |
-| **Low-Medium** (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |
-| **Medium-High** (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
-| **High** (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 10 |
+| Risk tier | Reviewers dispatched |
+|------|-----------|
+| **Micro** | not applicable — `plan-review` does not run for Micro (see When to Use) |
+| **Low-Medium** (small plan, existing patterns) | **#1 Structural & Efficiency**, **#2 Integration** |
+| **Medium-High** (large plan, some novelty) | #1–#2 + **#3 UX Coherence** |
+| **High** (novel architecture, first-of-kind) | #1–#3 + **#4 Failure Mode Auditor** |
 
-**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
+**Reviewer #5 (Duplication & Architecture, #688) is conditional and additive** — dispatched alongside the tier's set whenever the plan introduces a new component, a new write path, a new shared-state owner, or a new definition of an existing vocabulary, and again on the final cycle. It is orthogonal to the risk tiers, not a fifth one; see the Reviewer #5 section in Phase 1. **#5 is never a replacement for another reviewer.**
 
-**Level-based routing:** For Project-level issues (Level: project in issue body), prefer inline review in the current context over sub-agent dispatch. For Epic-level issues (Level: epic), use fresh-context sub-agent reviewers (default). If Level is missing, default to sub-agent review (safe default). See `proportional-gates` skill for the canonical routing table.
+**Proportional dispatch:** the tier sets the count; the agent decides whether the plan's size and novelty justify reporting up a tier, notes the decision, and a reviewer sub-agent validates it.
+
+**Adversarial domain — declared threat surface (bound: 2 cycles, orthogonal to the rows above).** When the scoping comment carries an `### Adversarial Threat Surface` declaration (gate/enforcement code whose correctness is "an attacker cannot make it fail open"), the plan review is bounded by that surface, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) is a **clean exit** for this domain — a literal `NO ISSUES FOUND` is not required, and when the merge rests on threat-list coverage the PR body must disclose it (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
 
 ## Input Resolution
 
@@ -81,11 +81,12 @@ Before starting the first cycle:
 4. **Collect codebase context:** read key files referenced in the plan's `Files:` sections
 5. **Resolve research brief:** derive path from epic or plan doc frontmatter
 6. **Research Resolution Gate (#2092):** if research brief exists, pre-read content once. Inject as `## Verified Research Context (author-provided)` header into every reviewer sub-agent prompt. If no brief exists, omit the section.
+7. **Tortoise — prior state and premises:** query the graph for what is already believed about the plan's subject (`tortoise_search`, `tortoise_recall` mode=state, `tortoise_belief_timeline`) and inject the result as `## Prior State (Tortoise)`. ADVISORY, never blocking: an empty or unreachable graph is not a finding, it means no priors (`how-to-use-tortoise`). When the plan rests on a genuinely contested design choice, deliberate it on the graph — options/criteria/findings → IMPL/NAND → `tortoise_compute_confidence` — and review the ranking (`tortoise-decide`).
 
 ## Review Cycle
 
 ```
-Phase 1: Review (4 parallel agents)
+Phase 1: Review (N parallel agents, per risk tier)
     ↓
 Phase 2: Merge & Dedup
     ↓
@@ -105,16 +106,18 @@ When review finds issues, the agent attempts to resolve them autonomously before
 |---------------|--------|
 | **P2** (improvement) | Fix inline immediately. Note in changelog. Re-review. Do NOT pause. |
 | **P1** (important gap) | Research + fix inline. Note in changelog. Re-review. Do NOT pause. |
-| **P0** (structural flaw), fixable in < 5 lines | Fix inline. Note in changelog. Re-review. Do NOT pause. |
-| **P0**, needs substantial work | File a GitHub issue via issue-creation, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
-| **P0**, requires human input (data loss, security, ontology choice, cost >$10/mo, legal/compliance) | Pause with structured question + research findings. |
+| **P0** (structural flaw), fixable in < 5 lines | Research, then fix inline. Note in changelog. Re-review. Do NOT pause. |
+| **P0**, needs substantial work | Research, then file a GitHub issue via issue-creation, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
+| **P0**, requires human input (data loss, security, ontology choice, cost >$10/mo, legal/compliance) | Research, then pause with a structured question: present context, options, analysis, and a recommendation in plain language. |
 
-**Stall detection:** If the same issue fingerprint persists across 2+ cycles, file an issue and continue (do NOT stall exit). Only stall exit if the issue is P0 and unfixable.
+**Stall detection:** A fingerprint persisting across 2+ cycles is precisely what the `fingerprint-stall` detector measures — do not hand-diagnose it here. Follow the 3-layer stuckness algorithm in Phase 4: recurrence ≥ `stall_threshold` (default `0.8`) → escalate to a human. Filing a GitHub issue is a **remedy** for a stalled issue, never an alternative to the detector — filing it and continuing is how a stalled loop silently runs to its cycle cap.
 
 
 ### Phase 1 — Review (Parallel Agents)
 
-Launch the proportional reviewer count (N) from the Review Cycles table **in parallel** via Pi `task`. Each receives the full plan doc, issue spec (if available), epic doc (if available), and research context (if resolved). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch the proportional reviewer count (N) for the risk tier (`proportional-gates` §Review Cycles) **in parallel** via Pi `task`. Each receives the full plan doc, issue spec (if available), epic doc (if available), and research context (if resolved). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+
+Every reviewer reads whichever of `## Verified Research Context` and `## Prior State (Tortoise)` are present **before** judging — an absent section means none was available, not a finding. Treat them as strong but fallible: where a reviewer doubts a finding it verifies the claim itself rather than inheriting it.
 
 ---
 
@@ -157,11 +160,13 @@ CHECK THESE DIMENSIONS:
    - DRY: does the plan duplicate logic across tasks?
    - Are there redundant verification steps?
    - Is complexity proportional to the tier?
+   - Does the plan cite its research inputs (research brief / Pattern Research) as the basis for its key decisions?
 
 6. GOOD > EASY (design quality — always checked):
    - Does any design decision choose the EASY path over the GOOD one? Easy paths accumulate into brittle systems; good paths cost more upfront but pay back in reliability, extensibility, and user satisfaction.
    - Flag decisions that optimize for implementation convenience over outcome quality: shortcuts on error handling, schema changes that skip migrations, duplicated logic instead of a shared abstraction, hardcoded config instead of proper configuration, quick hacks over maintainable patterns.
    - Each GOOD > EASY flag MUST name the Good alternative AND its cost (effort, time, risk). If you cannot name the Good alternative, it is a preference — omit it.
+   - System design: does the plan account for duplication, scalability, and where shared state lives? Check against Reviewer #5's D1–D9/A1–A6 rather than re-deriving them.
 
 For each issue, return EXACTLY:
 ISSUE:
@@ -261,14 +266,19 @@ CHECK THESE DIMENSIONS:
    - Are UX decisions described without rationale?
    - Are accessibility considerations mentioned where relevant?
 
+5. INFORMATION ARCHITECTURE:
+   - Is information architecture considered across the user journey — is each screen or step showing the right information, in the right order?
+   - Does any single step load more information than the user needs to act on it?
+
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
-  dimension: ux-coherence
+  dimension: ux-coherence|information-architecture
   location: [Task N, Step M] or [Header section name]
   description: <what's wrong>
   suggestion: <what to fix>
 
+P0=structural flaw, P1=important gap, P2=improvement
 If no issues: NO ISSUES FOUND
 ```
 
@@ -382,7 +392,7 @@ If clean: NO ISSUES FOUND — CLEAN
 If a source was unavailable: NO ISSUES FOUND — DEGRADED (<source> unavailable)
 ```
 
-**Disposition — controller-level, and #5 is NOT part of the cycle loop.** Reviewer #5 is advisory; its findings must not be merged into Phase 2, must not affect convergence, and must not trigger a re-dispatch of any reviewer. (One format retry is allowed if its output is unparseable or missing verdicts — that is a retry for *malformed output*, not a re-review on its findings.) Phase 4 step 2's `Issues found → Phase 2-3` applies to reviewers #1–#4 only.
+**Disposition — controller-level, and #5 is NOT part of the cycle loop.** Reviewer #5 is advisory; its findings must not be merged into Phase 2, must not affect convergence, and must not trigger a re-dispatch of any reviewer. (One format retry is allowed if its output is unparseable or missing verdicts — that is a retry for *malformed output*, not a re-review on its findings.) Phase 4 step 2's `Issues found → Phase 2-3` applies to the proportional reviewers only.
 
 | Result | Action |
 |---|---|
@@ -417,12 +427,6 @@ Return ONLY the number.
 ```
 
 **Filter:** Issues scoring < 50 are tagged `[LOW-CONFIDENCE]` P2 — surfaced for human judgment, not sent to fixer. Issues scoring >= 50 proceed to Phase 3 (Fix). Low-confidence issues do NOT count as unresolved for convergence purposes.
-
-
-1. Parse all `ISSUE:` blocks from reviewer outputs
-2. Dedup: same location + similar description → keep higher severity
-3. Sort: P0 > P1 > P2, then structural > integration > UX > failure > good-easy
-4. If zero issues → plan is clean, proceed to Phase 5
 
 ### Phase 3 — Fix (1 Agent with Research)
 
@@ -464,7 +468,7 @@ of prior cycles, no investment in defending prior fixes. This prevents confirmat
 
 For each cycle:
 1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions), **plus Reviewer #5** when its trigger fires (new component / new write path / new shared-state owner / new vocabulary definition) or on the final cycle. #5 is dispatched **alongside** the proportional set, never instead of it — N does not drop because #5 fired. If the trigger does not fire, the cycle runs the proportional N only, and the cycle log records `#5: not triggered`.
-2. Parse responses. Reviewers #1–#4: all return `NO ISSUES FOUND` → exit clean; issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
+2. Parse responses. Every proportional reviewer returning `NO ISSUES FOUND` → exit clean (adversarial domain: `THREAT SURFACE COVERED` from a fresh reviewer substitutes — see the Adversarial domain subsection above); issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
 3. After fixes applied, go to step 1 (repeat cycle)
 
 **Why task sub-agents:** `pi -p` spawns a fresh session. The reviewer has no context
@@ -473,31 +477,42 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **Exit conditions — ALL must be true before proceeding to Phase 5:**
 
-- [ ] Last cycle's reviewers #1–#4 all returned "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Last cycle's proportional reviewers all returned "NO ISSUES FOUND" (verbatim, not paraphrased)
 - [ ] Reviewer #5 (if dispatched) was parsed against its **full** token and dispositioned per the table above — `NO ISSUES FOUND — CLEAN`, `— DEGRADED (<source>)` recorded as a caveat, or `ISSUES:` recorded with its verdicts. None of these blocks the cycle; all three satisfy this box. Substring-matching `NO ISSUES FOUND` and reading `— DEGRADED` as clean fails this box.
+
+  ⚠️ **This box gates *proceeding*, not *cleanliness* — the two are different predicates and this is the one place a reader mid-loop consults.** All three dispositions satisfy it, but only `NO ISSUES FOUND — CLEAN` yields a **clean** exit. `ISSUES:` (and a `— DEGRADED` recorded as a caveat) yields an **escalation** exit: proceed to Phase 5 with the surviving issues documented and carried into the escalation payload, and **never report it as clean or complete**. Per `AGENTS.md` §Hard Cap, an exit that leaves issues unresolved is an escalation exit, not a completion.
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
+- [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
-**No hard cap.** The loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (runaway prevention, not a quality gate).
+**No hard cap.** The loop continues until clean exit or convergence. The safety cap is the tier's **Max Cycles** row in `proportional-gates` §Review Cycles — if reached, escalate to human (runaway prevention, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
+
+**Half-budget research rule.** Once half the **governing budget**, rounded up, is spent — the tier's **Max Cycles** (`proportional-gates` §Review Cycles), or the adversarial domain's **2** when that domain applies (above) — every surviving issue needs research backing before the next fix: the fixer cites the source, or records `internal-only, no external source` when Phase 3's skip condition applies (purely internal: typo, formatting, in-repo convention). An unresearched re-fix does not count as a fix.
 
 **Stuckness detection (3-layer algorithm)**:
 
-a. **Fingerprint-stall**: Hash each surviving issue's dimension+location+description+suggestion (SHA256). If ≥80% of fingerprints match the previous cycle → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
+a. **Fingerprint-stall**: Hash each surviving issue's **location + severity** (SHA256) — the defect's *stable identity*, **never** its `dimension`/`description`/`suggestion`. Wording is the part a fresh, memoryless reviewer varies; hashing it made an identical defect re-described in new words hash differently, so recurrence read ~0 on a cycle where nothing was fixed — the most common real stall, invisible to the primary detector. **Recurrence is `|current ∩ prev| / |prev|`** — "what fraction of *last cycle's* issues came back?". `|prev|` is the correct denominator and the *only* one: it is the stall signal, so a cycle that repeats all 10 prior issues must score 1.0. (A symmetric denominator — `max(|current|, |prev|)` — inverts this: repeating all 10 prior issues *plus* 5 new ones scores `10/15 = 0.67`, **below** threshold, so the loop reads as ordinary churn on a cycle where nothing was resolved. Do not use it.) **`stall_threshold` defaults to `0.8`** — the same value `code-review/references/fixer-loop.md` reads from `STALL_THRESHOLD`. If recurrence ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
 
-b. **Honest-stuck**: Track `issues_per_cycle` (number of issues surviving after each cycle). If issue count is **non-decreasing for 3 consecutive cycles** AND the fingerprints differ from prior cycles (genuinely new issues each time), the fixer is introducing new issues faster than it resolves existing ones. Exit reason = `honest-stuck`. Escalate to human — this indicates a systemic problem.
+b. **Honest-stuck**: Track `issues_per_cycle`. **This is an INDEPENDENT signal, not a refinement of recurrence** — it fires when the count is **non-decreasing for 3 consecutive cycles**, *regardless of recurrence*. Gating it behind `recurrence ≥ stall_threshold` was itself a regression: a loop that churns one-for-one (every issue fixed, a new one appearing in its place) has **low** recurrence but is not converging, and the gate left it undiagnosed until the cycle cap. Exit reason = `honest-stuck`. Escalate to human. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.**
 
-c. **Zero-progress**: Track whether the plan doc was modified each cycle. If plan doc unchanged for 2 consecutive cycles, the fixer is making zero progress — treat as fingerprint-stall and escalate.
+   ⚠️ **Fire if `recurrence ≥ stall_threshold` OR `issues_per_cycle` is non-decreasing for 3 consecutive cycles.** Either is sufficient on its own. The two tests exist because they catch different pathologies — recurrence catches *the same issues coming back*, the count test catches *the loop not shrinking, however caused*. Recurrence is used only to pick the label (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`); it is never a precondition for the count signal.
+
+c. **Zero-progress**: Track whether the plan doc was modified each cycle. If the plan doc is unchanged for 2 consecutive cycles, the fixer is making zero progress. Exit reason = `zero-progress`. Escalate to human. **Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.** (Previously mapped onto `fingerprint-stall`, which made three distinct conditions — identical issues recurring, new issues outpacing fixes, and the fixer writing nothing at all — indistinguishable in the persisted record.)
 
 **Convergence rule:** If cycle N issues are a strict subset of cycle N-1 issues (no new dimensions or locations, only previously-flagged items remain), the reviewer is in a refinement loop — fixes are shrinking the problem space but not eliminating it. Log convergence and escalate to human: present remaining issues with attempted fixes. Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.
 
 **Cycle-status YAML**: Write `operations/logs/cycle-status.yaml` on loop exit:
 
 ```yaml
-exit_reason: <clean|fingerprint-stall|honest-stuck|cycle-cap|convergence>
+exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|adversarial-capped|convergence>
 cycles: <N>
 issues_per_cycle: <json array>
 plan_modified_per_cycle: <json array of booleans>
+detector_fired: <fingerprint-stall|honest-stuck|zero-progress|''>   # which layer fired, or empty
+fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual input; null on a zero-progress exit, which fires before the scan
 ```
+
+> **Why `detector_fired` and `fingerprint_recurrence_last_cycle` are recorded:** without them, "why did this loop exit?" cannot be answered after the fact — the predicate's inputs are gone and only the verdict survives. That is what made a real non-convergent run undiagnosable.
 
 **Progress report:** After each cycle, output: "Plan review cycle N: X issues found across N reviewers, Y fixed, Z remaining."
 
@@ -507,48 +522,17 @@ plan_modified_per_cycle: <json array of booleans>
   This IS skipping the review. Fixing without re-reviewing = no review.
 
 - ❌ Self-declare "I addressed the feedback" as completion
-  Only "NO ISSUES FOUND" from all fresh reviewers is a valid exit signal.
+  Only "NO ISSUES FOUND" from all fresh reviewers is a valid exit signal — except in the adversarial domain, where a fresh reviewer's `THREAT SURFACE COVERED` substitutes (see "Adversarial domain" above).
 
 - ❌ Re-review in the same conversation context
   Confirmation bias makes same-context re-review unreliable.
   Always use `task` for fresh sessions.
 
-### Phase 4.5 — Second-Model Final Gate (Two-Tier Review)
-
-After Phase 4 converges clean (Flash reviewers are done), dispatch ONE second-model reviewer as a final quality gate. The second model is a stronger reasoner — it catches what cheaper reviewers miss. It runs ONCE, only after Flash has converged.
-
-**Model (second-model gate):** dispatch with `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous; resolve via `~/.pi/agent/models.json`). When `$SECOND_MODEL` is set but unresolvable, or unset with the default unresolvable, dispatch the tool default (`deepseek-flash`) and annotate the result `[SECOND-MODEL-GATE] stand-in ($SECOND_MODEL=… set-but-unresolvable | unset+default-unresolvable)`. Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only.
-
-**Dispatch:**
-```
-task(model=<$SECOND_MODEL per the second-model gate convention>, prompt=<same prompt as Phase 1, single reviewer>)
-```
-
-**Prompt:** Same as Phase 1 reviewers — the second model just applies stronger reasoning to the same review dimensions. No prompt engineering needed.
-
-**Second-model findings are surfaced as `[SECOND-MODEL-GATE]` severity tags:**
-
-| Second-model Issue | Action |
-|---|---|
-| `[SECOND-MODEL-GATE] P0` | Structural flaw missed by Flash — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P1` | Important gap — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P2` | Improvement — note in plan, do NOT re-run |
-| `[SECOND-MODEL-GATE] P3/P4` | Nit/suggestion — note, do NOT re-run |
-
-**Re-dispatch rule:** If the second-model gate finds P0 or P1 → fix → re-dispatch it once. Max 2 second-model cycles. On 2nd failure → surface to human as `[SECOND-MODEL-GATE]` with "second-model final gate could not converge."
-
-**Gate passes:** second-model gate returns CLEAN or only P2+ issues.
-
-**Log:**
-```
-🔍 second-model final gate: clean | N issues found (P0: X, P1: Y) — resolved in M cycles
-```
-
 ### Phase 5 — Final Verification
 
-After plan is clean (Phase 4 says clean), dispatch ONE verification sub-agent via Pi `task` that re-reviews the final plan (same N reviewers as the review cycles, proportional to plan risk). Same prompts as Phase 1, concatenated.
+After plan is clean (Phase 4 says clean), dispatch the tier's reviewers (the same N as the review cycles, proportional to plan risk) via Pi `task` — one per Phase 1 prompt, not concatenated — to re-review the final plan.
 
-If the verification sub-agent finds issues:
+If any reviewer finds issues:
 - Fix them (Phase 3)
 - Re-verify (Phase 5 again)
 - Max 2 additional cycles
@@ -592,6 +576,6 @@ This gives one orchestrator-level recovery before waking the human.
 
 ## Announce
 
-At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped at [3|5|10] cycles per plan risk tier — escalates to human at cap. See Proportional Review Cycles table. Does not auto-exit with remaining issues."
+At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped per plan risk tier (`proportional-gates` §Review Cycles) — escalates to human at cap. Does not auto-exit with remaining issues."
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

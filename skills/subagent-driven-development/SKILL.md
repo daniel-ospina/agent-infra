@@ -15,7 +15,7 @@ allowed-tools: read write edit bash web_search web_fetch todo_write task grep fi
 # Subagent-Driven Development
 Execute plan by dispatching fresh subagent per task, with two-stage review after each: spec compliance review first, then code quality review.
 
-> **Cold-class seam (#512):** the two-stage spec/code reviewers are cache-cold one-shot eval dispatches — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id). **Unset (default) = inert.** Implementer dispatches and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+> **Cold-class seam (#512):** the two-stage spec/code reviewers are cache-cold one-shot eval dispatches — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id). **Unset (default) = inert.** Implementer dispatches never route venice (docs/providers.md §8).
 
 **Why subagents:** You delegate tasks to specialized agents with isolated context. By precisely crafting their instructions and context, you ensure they stay focused and succeed at their task. They should never inherit your session's context or history — you construct exactly what they need. This also preserves your own context for coordination work.
 
@@ -166,20 +166,18 @@ digraph process {
 
 ## Model Selection
 
-**Implementer + per-task reviewers (spec + code quality):** Use the same model as the current session. The session model is already configured with valid credentials and is capable of every task in this workflow. Do NOT specify a different model for sub-agents unless the user explicitly instructs you to do so.
-
-**Final code reviewer (after all tasks):** Dispatch with the second-model gate convention — `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro`, provider-qualified; when set-but-unresolvable or unset-with-unresolvable-default, omit `model` and annotate the result `[SECOND-MODEL-GATE] stand-in`). Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only. This is the two-tier review pattern — Flash handles per-task reviews, the second model serves as the senior reviewer for the final pass across the entire implementation. It catches what cheaper per-task reviewers miss.
+**Implementer + per-task reviewers (spec + code quality):** Use the same model as the current session. The session model is already configured with valid credentials and is capable of every task in this workflow. Do NOT specify a different model for sub-agents unless the user explicitly instructs you to do so. This applies to the final code reviewer too — the final review uses the session model (single-model review; the former second-model final gate was removed).
 
 ```
-# Per-task reviews — session model (Flash)
+# Per-task reviews — session model
 task(prompt=spec_reviewer_prompt)
 task(prompt=code_quality_reviewer_prompt)
 
-# Final review — second-model gate
-task(prompt=final_code_reviewer_prompt, model=<$SECOND_MODEL per the second-model gate convention>)
+# Final review — session model
+task(prompt=final_code_reviewer_prompt)
 ```
 
-If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for per-task reviews to use the session default. Pass the `$SECOND_MODEL` value (default `deepseek/deepseek-v4-pro`) only for the final code reviewer.
+If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for every review (per-task and final) to use the session default.
 
 ## Handling Implementer Status
 

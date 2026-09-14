@@ -4,8 +4,132 @@ import { execSync } from "child_process";
 import { isPrintMode } from "../shared/print-mode.js";
 import * as fs from "fs";
 import * as os from "os";
-import { resolve as resolvePath } from "path";
+import { resolve as resolvePath, dirname } from "path";
+import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
+
+/**
+ * #984 — the ARGV-LEVEL layer.
+ *
+ * The string scanner answers "will this command text make gh perform an admin
+ * merge?" and seven adversarial rounds each closed one splice and found the next
+ * (`--ad""min`, `$'--admin'`, `xargs {}`, `-${V:--}admin=true`, `$V-admin=true`).
+ * That class is not closable in a scanner, and the reason is a proof rather than
+ * an impression: resolving `$VAR`/`$(…)` requires EVALUATING a shell, which a gate
+ * cannot do without running the very command it exists to refuse.
+ *
+ * So we put a `gh` shim ahead of the real `gh` on PATH for every bash call. By the
+ * time `gh` runs, bash has finished: `-${V:--}admin=true` IS the literal string
+ * `--admin`, with no splice left to hide behind. `event.input` is mutable and the
+ * mutation affects real execution (docs/extensions.md), which is what makes this
+ * enforcement rather than advice.
+ *
+ * The scanner stays as the fast first layer — it gives better messages and costs
+ * nothing — now backed by a layer that does not share its limit.
+ */
+const EXTENSION_DIR = (() => {
+  try {
+    return dirname(fileURLToPath(import.meta.url));
+  } catch {
+    return null;
+  }
+})();
+
+/** Warn ONCE per session when the argv-level layer is missing — silence would make
+ *  a degraded guard look like a working one. */
+let ghShimAbsenceWarned = false;
+
+/**
+ * Resolve the shim directory, or null when no shim is installed.
+ *
+ * `AGENT_GH_SHIM_DIR` lets an operator (or a consumer install) point at a shim
+ * somewhere else; the default is this checkout's `scripts/gh-shim`.
+ */
+export function resolveGhShimDir(): string | null {
+  const explicit = process.env.AGENT_GH_SHIM_DIR;
+  const candidates: string[] = [];
+  if (explicit) candidates.push(explicit);
+  if (EXTENSION_DIR) candidates.push(resolvePath(EXTENSION_DIR, "..", "..", "scripts", "gh-shim"));
+  for (const dir of candidates) {
+    try {
+      if (fs.existsSync(resolvePath(dir, "gh"))) return dir;
+    } catch {
+      /* an unreadable candidate is not a match */
+    }
+  }
+  return null;
+}
+
+/**
+ * Materialize the shim at a NEUTRAL path and return that directory.
+ *
+ * Injecting the CHECKOUT's path would put the branch name into every bash command:
+ * this very worktree is `…/930-admin-merge-rail/scripts/gh-shim`, and `admin` in the
+ * injected text flips the gates of OTHER extensions, which read the same mutated
+ * `event.input.command` after this handler (VGATE #984: with a path containing
+ * `admin`, `isGitOp(patched)` is TRUE for a command that is not a git op). The
+ * neutral directory keeps the injected text free of gate-relevant words.
+ */
+export const NEUTRAL_GH_SHIM_DIR = resolvePath(os.homedir(), ".pi", "agent", "shims");
+
+export function materializeGhShim(sourceDir: string | null): string | null {
+  if (!sourceDir) return null;
+  try {
+    fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
+    const target = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
+    const src = fs.realpathSync(resolvePath(sourceDir, "gh"));
+    const current = fs.existsSync(target) ? fs.realpathSync(target) : null;
+    if (current !== src) {
+      try {
+        fs.rmSync(target, { force: true });
+      } catch {
+        /* a missing target is the expected case */
+      }
+      try {
+        fs.symlinkSync(src, target);
+      } catch {
+        fs.copyFileSync(src, target);
+        fs.chmodSync(target, 0o755);
+      }
+    }
+    return fs.existsSync(target) ? NEUTRAL_GH_SHIM_DIR : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolved ONCE per session — with a revalidation, because this runs on EVERY bash call. */
+let ghShimDirCache: string | null | undefined;
+function activeGhShimDir(): string | null {
+  if (ghShimDirCache !== undefined) {
+    // REVALIDATE before reuse. A session outlives a worktree: if the link is removed,
+    // or its target is deleted (removing a worktree dangles every link into it), the
+    // cached directory would still be prepended to PATH while containing no `gh` — so
+    // PATH lookup falls through to the REAL gh and the argv layer is silently absent
+    // for the rest of the session (VGATE #984). One existsSync per bash call.
+    if (ghShimDirCache !== null && fs.existsSync(resolvePath(ghShimDirCache, "gh"))) {
+      return ghShimDirCache;
+    }
+  }
+  ghShimDirCache = materializeGhShim(resolveGhShimDir());
+  return ghShimDirCache;
+}
+
+/**
+ * Prefix a bash command with the shim directory on PATH.
+ *
+ * Returns null when there is nothing to do — no shim resolved, or the operator's
+ * kill switch is set. The kill switch exists because this touches EVERY bash call:
+ * `AGENT_GH_SHIM=0` turns the layer off without editing code.
+ *
+ * `export PATH=…` on its OWN LINE, so the command's text is otherwise untouched
+ * and its exit status is still the command's (`&&` would change both).
+ */
+export function withGhShim(command: string, shimDir: string | null): string | null {
+  if (process.env.AGENT_GH_SHIM === "0") return null;
+  if (!shimDir) return null;
+  return `export PATH=${JSON.stringify(shimDir)}:"$PATH"\n${command}`;
+}
 
 // ── gh invocation seam (testable) ─────────────────────
 // ESM named imports of builtin CJS modules (child_process) are not patchable
@@ -62,10 +186,461 @@ const ISSUE_COMPLEXITY_FILE = "/tmp/agent-issue-complexity";
 // ── Git operation patterns ────────────────────────────
 
 const GIT_COMMIT_PATTERN = /(^|\s)git\s+(commit|push)(?=\s|$)/;
-const GH_PR_PATTERN = /(^|\s)gh\s+pr\s+(create|merge)(?=\s|$)/;
 
-function isGitOp(command: string): boolean {
-  return GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command);
+/**
+ * Remove the bash token-splicing the scanner CAN resolve, so a flag spelled
+ * across quotes or escapes is seen the way gh sees it.
+ *
+ * Bash re-joins a single token across these before gh ever sees argv:
+ *   `--ad""min=true`, `--ad\min=true`, `--ad\<newline>min=true`, `--ad'min'=true`
+ * all reach gh as `--admin=true`, while the RAW string contains no `--admin`.
+ * So we drop quote characters, drop backslash-newline continuations, and drop
+ * backslashes (which only ever escape the next character).
+ *
+ * It is NOT a shell. Two families stay unresolved and are handled differently:
+ *   - what `isUnresolvableFlagToken` catches (ANSI-C quoting, a `$`/backtick in a
+ *     dash-token) is REFUSED — fail closed;
+ *   - what NOTHING here catches — brace expansion (`--{admin,squash}`), `xargs`
+ *     `{}`, and `$(…)`/backticks that SUPPLY the `--` or the whole flag — is an
+ *     OPEN GAP. It is stated in `hasAdminMergeFlag`'s docstring and tracked as a
+ *     follow-up; the only real fix is argv-level enforcement (a `gh` shim).
+ */
+function normalizeForFlagScan(command: string): string {
+  return command.replace(/\\\r?\n/g, "").replace(/["'\\]/g, "");
+}
+
+/**
+ * Does the command hide a substitution inside a DASH-TOKEN, in a form this
+ * scanner REFUSES rather than guesses at?
+ *
+ *   - ANSI-C / locale quoting: `$'--admin'`, `$'--adm\x69n'`, `--adm$'\x69'n`.
+ *     Decoding `\xNN` is exactly the guessing this gate must not do.
+ *   - a substitution inside a LITERAL `--` token: `--admi${X}n=true`,
+ *     `--admin=$(echo true)`, `` --admin=`true` ``.
+ *
+ * NARROWER THAN IT SOUNDS, deliberately so: the second rule requires the `--` to
+ * be LITERAL. A construct can supply the dash itself — `-${V:--}admin=true`,
+ * `$V-admin=true`, `-$(printf %s '-')admin=true` all reach gh as `--admin=true` —
+ * and this function does NOT catch those. `hasAdminMergeFlag` catches them
+ * separately, by a construct-plus-`admin` rule; see the STATED LIMITS there, which
+ * names what remains open. Do not read this function as covering "a substitution
+ * inside a dash-token" in general: it covers the case where the `--` is visible.
+ */
+function isUnresolvableFlagToken(command: string, probe: string): boolean {
+  if (/\$['"]/.test(command)) return true;
+  return /--[^\s]*[$`]/.test(probe);
+}
+
+/**
+ * Bash constructs that ASSEMBLE a token from pieces, which this scanner does not
+ * evaluate: any `$` (variable reference, `${…}`, `$'…'`, `$("…")`, `$(…)`),
+ * backticks, and brace expansion (`{a,b}`).
+ *
+ * A bare `$VAR` counts: `M=merge; gh pr $M 123 --admin=true` really does perform
+ * an admin merge, and a construct set without `$` missed it entirely (VGATE round
+ * 6). Being generous here is safe because rule 2 is only consulted after the
+ * literal form fails AND the caller conjuncts with `hasAdminMergeFlag`, so
+ * `gh pr comment --body "$(…)"` stays outside the gate.
+ *
+ * Plain `'`/`"` quoting is deliberately NOT here — it is resolved (quotes are
+ * stripped) and treating it as unresolvable made every quoted MENTION look like an
+ * operation, e.g. `echo "git commit -m x"` (VGATE round 4).
+ */
+function hasUnresolvableConstruct(command: string): boolean {
+  return /\$|`|\{|\}/.test(command);
+}
+
+/**
+ * Is this a `gh pr merge` command?
+ *
+ * Two ways to answer yes, and both are needed:
+ *   1. the literal, NORMALIZED form — quotes and backslashes are how bash
+ *      re-joins one token, so `gh pr "merge" 123` and `gh pr m\\erge 123` are
+ *      merges while their raw text is not;
+ *   2. an UNRESOLVABLE shape — if the text carries a construct this scanner cannot
+ *      evaluate (see `hasUnresolvableConstruct`) and `pr` + `merge` both appear
+ *      once quotes are stripped, we refuse to let the spelling HIDE the operation.
+ *      This is what closes `gh pr $'merge' 123`, `gh $'pr' merge 123`,
+ *      `$'gh' pr merge 123`, `g$'h' pr merge 123` and `gh pr merge$(…) 123`.
+ *
+ * Three VGATE rounds each found one more position where a splice hid the verb
+ * (r3 the verb itself, r5 an ANSI-C verb, r6 the `gh`/`pr` words and a
+ * substitution glued to the verb). Enumerating positions is what made that
+ * possible, so rule 2 keys on the CONSTRUCT, not on a position: any unresolvable
+ * construct plus the two verb words anywhere is treated as a merge. The caller
+ * then applies the admin gate, which is itself fail-closed, so a false hit costs
+ * a retry while a miss is an unevidenced admin merge.
+ */
+/**
+ * gh's GLOBAL `-R/--repo <value>` flag may sit between any two gh words, so
+ * `gh -R owner/repo pr merge 123` is a valid spelling of `gh pr merge 123`.
+ * (The repo already fixed this for the merge-scope recogniser in
+ * `extensions/verification-gate/index.ts` - `GH_PR_MERGE_VERB`, #204 - and #930
+ * did not carry it over, so the most realistic spelling for a multi-repo
+ * operator skipped BOTH gates.)
+ *
+ * Removing the repo pair up front makes every downstream shape compare against
+ * the same canonical text, rather than teaching each of four patterns about an
+ * optional flag in a different position.
+ *
+ * ⚠️ Its value removal is NOT quote-aware: `\s+\S+` takes only the FIRST
+ * whitespace-delimited word, so a quoted value (`--repo "see <url> here"`) keeps its
+ * TAIL in the output. Every caller here only looks for WORDS (`gh`, `pr`, `merge`,
+ * `--admin`), which is unaffected — but never read a positional/selector out of this
+ * output: that tail held a PR URL and `extractMergeSelector` returned it as the
+ * selector (wrong PR + wrong repo, VGATE #1007 cycle 4). It reads the ORIGINAL tail
+ * instead, and re-finds the verb with `MERGE_VERB_RE`.
+ */
+function stripRepoArgs(command: string): string {
+  // The value may be ATTACHED (`-Rowner/repo`), `=`-joined, or a separate word.
+  // Requiring `=` or whitespace after the flag missed gh's valid pflag spelling
+  // `gh -Rowner/repo pr merge 999 --admin`, which then skipped BOTH gates entirely
+  // (cycle-3 review P0).
+  return command.replace(/(^|\s)(?:-R|--repo)(?:=\S*|\s+\S+|\S*)/g, "$1");
+}
+
+export function isGhPrMergeCommand(command: string): boolean {
+  const bare = stripRepoArgs(command);
+  const probe = normalizeForFlagScan(bare);
+  // `[^\w]` rather than `\s` before `gh`: a separator GLUED to the word
+  // (`true;gh pr merge 1`, `(gh pr merge 1`) leaves no whitespace to anchor on.
+  if (/(^|[\s;&|(){!])gh\s+pr\s+merge(?=\s|$)/.test(probe)) return true;
+  if (!hasUnresolvableConstruct(command)) return false;
+  // `[^\w]` rather than `\s` before each word: after stripping quotes a spliced
+  // word keeps its residue, so the probe holds `$merge` / `$pr` — a
+  // whitespace-anchored match missed exactly the cases this rule exists for
+  // (VGATE round 6).
+  const hasPr = /(^|[^\w])pr\b/.test(probe);
+  const hasMerge = /(^|[^\w])merge\b/.test(probe);
+  const hasGh = /(^|\W)gh\b/.test(bare) || /(^|\W)gh\b/.test(probe);
+  // Requiring BOTH verb words misses a splice INSIDE a word: `gh pr m$'erge'`
+  // normalizes to `m$erge`, where `merge` never appears contiguously. So
+  // `gh` + `pr` under a construct is enough to treat the text as a merge too.
+  // That is still narrow: the caller also requires an admin flag, so a
+  // `gh pr comment --body "$(…)"` is not gate-relevant.
+  return (hasPr && hasMerge) || (hasGh && hasPr);
+}
+
+const GH_PR_PATTERN = /(^|[\s;&|(){!])gh\s+pr\s+(create|merge)(?=\s|$)/;
+
+/**
+ * Which characters of `command` sit OUTSIDE a quoted region?
+ *
+ * Needed because a quote-split COMMAND NAME (`g"h" pr merge …`, `''gh pr merge …`,
+ * `\gh pr merge …`) is bash-re-joined to `gh` while the raw text contains no
+ * contiguous `gh`, and a quoted MENTION (`echo "gh pr merge 1 --admin=true"`) is
+ * the opposite: it DOES contain `gh`, but inside the quotes, so it is not a
+ * command at all. The two are indistinguishable from the normalized text — both
+ * normalize to `gh pr merge` — so the distinction has to come from quote state.
+ *
+ * Tracks `'…'` and `"…"` (with `\` escapes outside single quotes).
+ */
+/**
+ * `RegExp.exec` that skips any match starting INSIDE a quoted region (mask[i] false).
+ * `MERGE_VERB_RE` is a text search, so `gh pr view "gh pr merge <url> --admin"` matched
+ * the QUOTED verb and attributed that URL's repo to a non-merge command (fresh review,
+ * P2). The mask is `unquotedMask`'s — the same quote model the rest of this file uses,
+ * so the two cannot drift.
+ */
+function matchUnquoted(re: RegExp, text: string, mask: boolean[]): RegExpExecArray | null {
+  const scan = new RegExp(re.source, `${re.flags.replace("g", "")}g`);
+  let m: RegExpExecArray | null;
+  while ((m = scan.exec(text)) !== null) {
+    if (mask[m.index] === true) return m;
+    scan.lastIndex = m.index + 1;
+  }
+  return null;
+}
+
+/**
+ * PRECISE count of real (unquoted) `gh pr merge` verbs — the counterpart of
+ * `countMergeVerbs`, which over-counts BY DESIGN for the admin-merge compound guard (an
+ * over-count there only costs a retry). Repo attribution needs the precise one: an
+ * over-count discards a legitimate URL repo (re-review P2). Same `MERGE_VERB_RE` and same
+ * `unquotedMask`, so this cannot become a second, disagreeing text model.
+ */
+function countUnquotedMergeVerbs(command: string): number {
+  const mask = unquotedMask(command);
+  const scan = new RegExp(MERGE_VERB_RE.source, "g");
+  let n = 0;
+  let m: RegExpExecArray | null;
+  while ((m = scan.exec(command)) !== null) {
+    if (mask[m.index] === true) n++;
+    else scan.lastIndex = m.index + 1;
+  }
+  return n;
+}
+
+function unquotedMask(command: string): boolean[] {
+  const mask = new Array<boolean>(command.length).fill(true);
+  let quote: string | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote === null) {
+      if (ch === "\\") {
+        if (i + 1 < command.length) i++;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        mask[i] = false;
+        continue;
+      }
+      mask[i] = true;
+    } else {
+      mask[i] = false;
+      if (ch === quote) quote = null;
+      else if (quote === '"' && ch === "\\" && i + 1 < command.length) mask[++i] = false;
+    }
+  }
+  return mask;
+}
+
+/**
+ * Is a `gh` COMMAND NAME present in `command` — i.e. would the shell really run
+ * `gh`, rather than the text merely quoting the string "gh"?
+ *
+ * Two cases are a real command name:
+ *   1. a partially-unquoted token that de-quotes to `gh` — `g"h"`, `''gh`, `\gh`,
+ *      `gh`. The splice is inside the word, so wherever it sits it is the name it
+ *      resolves to.
+ *   2. a FULLY quoted token — `"gh"`, `'gh'` — but ONLY in command position. A
+ *      fully-quoted word is executable; a fully-quoted ARGUMENT is a string. So
+ *      `"gh" pr merge 1 --admin=true` runs, while `echo "gh pr merge 1
+ *      --admin=true"` only prints. Command position = the first word, a word after
+ *      a separator, or a word after a command-introducing keyword.
+ *
+ * Text alone cannot separate those two — `echo "gh …"` and `"gh" …` normalize
+ * identically — so the distinction has to come from quote state (unquotedMask) plus
+ * position. VGATE round 11 found the fully-quoted half missing: the previous rule
+ * ("at least one character outside a quoted region") admitted `''gh` and `g"h"`
+ * while excluding `"gh"`, an inconsistency inside one family.
+ */
+const COMMAND_INTRODUCERS =
+  /^(command|sudo|env|exec|nohup|nice|time|xargs|do|then|else|eval|sh|bash|zsh|dash|ksh)$/;
+
+/** A separator GLUED to the following word: `true;gh pr merge 1`, `(gh pr merge 1`. */
+const GLUED_SEPARATOR = /^[;&|(){!]+/;
+
+/**
+ * Split `command` into the words a shell would see, recording where each one
+ * starts and which characters sit outside a quoted region.
+ *
+ * Split on SEPARATORS as well as whitespace: `true;gh pr merge 1` is two commands
+ * with no space between them and `(gh pr merge 1` is one — a whitespace-only split
+ * leaves `;gh` / `(gh` as single tokens that never equal `gh`.
+ */
+interface ScanTokens {
+  joined: string;
+  mask: boolean[];
+  tokens: string[];
+  starts: number[];
+  gaps: string[];
+}
+
+function scanTokens(command: string): ScanTokens {
+  // bash removes a backslash-newline outright, so `g\<newline>h` is the command
+  // `gh`. Do the same before tokenizing, or the continuation splits the name.
+  const joined = stripRepoArgs(command).replace(/\\\r?\n/g, "");
+  const mask = unquotedMask(joined);
+  const tokens = joined.split(/[\s;&|(){!]+/).filter((t) => t.length > 0);
+  const starts: number[] = [];
+  const gaps: string[] = [];
+  let at = 0;
+  let prevEnd = 0;
+  for (const tok of tokens) {
+    const start = joined.indexOf(tok, at);
+    starts.push(start);
+    at = start + tok.length;
+    // The text BETWEEN the previous token and this one. Separators are not part
+    // of any token, so a separator is only visible in this gap: `true && "gh" ...`
+    // has prev=`true` but `&&` in the gap, and `true;gh ...` is the same command
+    // written with no space.
+    gaps.push(joined.slice(prevEnd, start));
+    prevEnd = start + tok.length;
+  }
+  return { joined, mask, tokens, starts, gaps };
+}
+
+/** A shell word with its quoting removed: `"gh"`, `''gh`, `\gh`, `` `gh `` → `gh`. */
+function dequote(tok: string): string {
+  return tok.replace(/["'\\`]/g, "").replace(GLUED_SEPARATOR, "");
+}
+
+/** Would the shell RUN this word as `gh` (rather than merely quoting the string)? */
+function isGhWordAt(scan: ScanTokens, i: number): boolean {
+  const tok = scan.tokens[i];
+  if (tok === undefined || dequote(tok) !== "gh") return false;
+  const start = scan.starts[i];
+  // A splice INSIDE the word (`g"h"`, `''gh`, `\gh`) is the command name wherever
+  // it sits. A FULLY quoted word (`"gh"`) is executable only in command position.
+  const partiallyUnquoted = [...tok].some((_, k) => scan.mask[start + k]);
+  if (partiallyUnquoted) return true;
+  let prev = i === 0 ? null : scan.tokens[i - 1];
+  // `bash -c -- '...'` is valid: `--` separates the option from the script. Look
+  // THROUGH it, or the introducer stops being recognised (cycle-4 review P0-2).
+  if (prev === "--" && i >= 2) prev = scan.tokens[i - 2];
+  return (
+    prev === null ||
+    // A newline is a command separator too: `gh pr merge 111 --admin\n"gh" pr
+    // merge 999 --admin` is two commands. Without \n here the second (fully
+    // quoted) verb lost its command position and the compound count stayed 1.
+    /[;&|(){!\n\r]/.test(scan.gaps[i]) ||
+    COMMAND_INTRODUCERS.test(prev) ||
+    /^-[a-z]*c$/.test(prev) || // `sh -c '...'`, `bash -lc '...'`
+    // Other real command positions. A redirection (`2>/dev/null`, `>/dev/null`),
+    // an assignment prefix (`FOO=bar`) or a reserved word (`if`, `while`, ...)
+    // all put the next word in command position; enumerating only the introducers
+    // and `-c` let `2>/dev/null "gh" pr merge 1 --admin` skip BOTH gates
+    // (cycle-4 review P0-1).
+    /^(\d*[<>]|&>>?)/.test(prev) || // redirection (`2>/dev/null`)
+    /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev) || // assignment prefix
+    /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prev)
+  );
+}
+
+function hasBareGhWord(command: string): boolean {
+  const scan = scanTokens(command);
+  return scan.tokens.some((_, i) => isGhWordAt(scan, i));
+}
+
+/**
+ * The rail's ADMIN-GATE relevance test. `isGitOp` and the `tool_call` gate BOTH
+ * use this one function — they cannot disagree. VGATE round 9 caught exactly that
+ * failure: `isGitOp` said yes (so the handler ran) while the caller's separate
+ * `isGhPrMergeCommand && hasAdminMergeFlag` said no, and `gh p$'r' merge 123
+ * --admin=true` was ALLOWED with no head-bound evidence. One predicate, one answer.
+ *
+ * `hasAdminMergeFlag` is fail-closed, so on its own it is far too broad to be a
+ * relevance test — it returns true for `echo $'hello'` (ANSI-C quoting) and for
+ * `echo "admin $USER"` (a construct plus the word `admin`), and using it as one
+ * blocked ordinary shell commands at zero dispatches (round 9). It must therefore
+ * be conjoined with a shape test.
+ */
+export function isAdminMergeCommand(command: string): boolean {
+  if (!hasAdminMergeFlag(command)) {
+    // A `$VAR` can SUPPLY the flag: `V=--admin; gh pr merge 999 $V` reaches gh as
+    // an admin merge while no text scan can see the word `admin`. That is a class
+    // the STATED LIMITS block does not name (it names a `$VAR`-supplied VERB), so
+    // per this file's own contract it is a bug, not a documented limit — and it is
+    // indistinguishable from a benign `gh pr merge $PR --squash`. Fail CLOSED.
+    // The cost is that an UNQUOTED `$PR` needs the evidence comment; the quoted
+    // `"$PR"` form (the common one) is unaffected, since its `$` is not preceded
+    // by whitespace. Documented in STATED LIMITS.
+    // `merge` must be a WORD in the text — `isGhPrMergeCommand` is deliberately
+    // broad (any `gh` + `pr` under a construct), so reusing it here made a benign
+    // `gh pr view $X` admin-gated.
+    if (!hasUnresolvableConstruct(command)) return false;
+    // A `$`-bearing ARGUMENT anywhere in the merge command means the flag may be
+    // hidden in it. The whitespace anchor missed the QUOTED form
+    // `gh pr merge 999 "$(printf '\x2d\x2d\x61dmin')"`, whose `$` follows a `"`.
+    // Carve out only the POSITION argument — the first token after `merge` — so the
+    // common `gh pr merge "$PR" --squash` stays outside the gate (cycle-4 P0-3).
+    // Only a `$`-bearing token that is an ARGUMENT OF THE MERGE counts. Scoping it
+    // to anything `$`-bearing in the command made `cd "$HOME/wt" && gh pr merge 7`
+    // an admin merge, which hijacked the cd-attribution gate and reported the
+    // wrong reason (cycle-4 regression caught by the existing cd tests).
+    const scan = scanTokens(command);
+    let mergeIdx = -1;
+    for (let i = 1; i < scan.tokens.length; i++) {
+      if (dequote(scan.tokens[i]) === "merge" && dequote(scan.tokens[i - 1]) === "pr") {
+        mergeIdx = i;
+        break;
+      }
+    }
+    if (mergeIdx === -1) {
+      // The VERB WORD may itself be construct-spliced, so the exact token match
+      // finds no `merge` and everything below is skipped: ``gh pr m`printf erge`
+      // 999 $V`` and ``gh p`printf r` merge 999 $V`` are both real admin merges
+      // (cycle-5 review P0, third seam).
+      //
+      // The signal is a CONSTRUCT IN A VERB POSITION — the token right after `gh`
+      // or right after `pr`. Requiring only "construct + the words gh and pr" was
+      // too broad (it made `gh pr view $X` an admin merge), and requiring `pr` to
+      // be a word missed ``gh p`printf r` …``, where `printf` hides it.
+      const hasConstructTokenAfter = (word: string): boolean => {
+        for (let i = 0; i < scan.tokens.length - 1; i++) {
+          if (dequote(scan.tokens[i]) !== word) continue;
+          if (/[$`]/.test(scan.tokens[i + 1] ?? "")) return true;
+        }
+        return false;
+      };
+      if (!hasUnresolvableConstruct(command)) return false;
+      return hasConstructTokenAfter("gh") || hasConstructTokenAfter("pr");
+    }
+    // The literal word `merge` gates the rest, but it must come AFTER the
+    // spliced-verb fallback above: ``gh pr m`printf erge` …`` has no literal
+    // `merge` at all (cycle-5 review P0, third seam).
+    if (!/(^|[^\w])merge\b/.test(normalizeForFlagScan(command))) return false;
+
+    // Work on the RAW text after the `merge` word, not on tokens: the separator
+    // split breaks `$(printf ...)` into `"$` + `printf` + ..., so a token-local test
+    // missed a QUOTED substitution supplying the flag (cycle-4 P0-3).
+    // NOTE: backticks count. `hasUnresolvableConstruct` counts them, but this loop
+    // tested only `/\$/`, so a backtick-substituted flag was invisible
+    // (cycle-5 review P0, first seam).
+    const afterMerge = command
+      .slice(scan.starts[mergeIdx] + scan.tokens[mergeIdx].length)
+      .replace(/^\s+/, "")
+      .split(/\s+/)
+      .filter(Boolean);
+    // A literal number LATER in the argument list means the POSITION was not the
+    // first argument, so the flag may be sitting in the first slot:
+    // `V=$(printf x --adm); gh pr merge $V 999` is a real admin merge
+    // (cycle-5 review P0, second seam). With no later number, a first-slot variable
+    // is the ordinary `gh pr merge "$PR" --squash` and stays clean.
+    // A value-flag's value is never the flag.
+    const laterBareNumber = afterMerge.slice(1).some((a) => /^\d+$/.test(a));
+    const VALUE_FLAGS = new Set([
+      "--body", "-b", "--body-file", "-F", "--subject", "-t",
+      "--author-email", "--repo", "-R", "--match-head-commit",
+    ]);
+    for (let i = 0; i < afterMerge.length; i++) {
+      const arg = afterMerge[i];
+      if (i > 0 && VALUE_FLAGS.has(afterMerge[i - 1])) continue;
+      if (!/[$`]/.test(arg)) continue;
+      if (i === 0) {
+        if (/\$\(|`/.test(arg)) return true; // a CONSTRUCTED value in the position slot
+        if (laterBareNumber) return true; // the position was actually later
+        continue; // a genuine `$PR` position argument
+      }
+      return true;
+    }
+    return false;
+  }
+  const bare = stripRepoArgs(command);
+  const probe = normalizeForFlagScan(bare);
+  if (hasUnresolvableConstruct(bare)) {
+    // Unreadable AND possibly a merge: a `gh` word, or both `pr` and `merge`.
+    // This is what catches `gh p$'r' merge …`, `$'gh' pr merge …`, `g$'h' pr
+    // merge …` WITHOUT the word list that rounds 6-8 kept re-finding a seam in.
+    return (
+      /(^|[^\w])gh\b/.test(probe) ||
+      (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
+    );
+  }
+  // Readable text, so the only way it is still a merge is a quote-split verb
+  // behind a BARE `gh` (quotes are deliberately not a construct). Requiring the
+  // `gh` to be bare is what keeps a quoted MENTION — `echo "gh pr merge 1
+  // --admin=true"`, `rg 'gh pr merge' scripts/` — outside the gate; gating those
+  // was a real over-block that fired on heredocs and greps (VGATE round 8).
+  const bareGh = hasBareGhWord(command);
+  return bareGh && /(^|[\s;&|(){!])gh\s+pr\s+merge/.test(probe);
+}
+
+// Exported so the test suite can pin this predicate DIRECTLY. VGATE round 7
+// showed that an unexported `isGitOp` could have its conjunction dropped — the
+// exact round-4 regression — while the shipped suite stayed green, because the
+// test replicated the predicate instead of exercising it.
+export function isGitOp(command: string): boolean {
+  // RAW, as before. Normalizing here made a quoted MENTION look like an
+  // operation (`echo "git commit -m x"`, `rg 'gh pr merge' scripts/` matched
+  // only after the quotes were stripped), turning harmless commands into gate
+  // hits — a regression introduced by the `gh pr "merge"` fix and caught by
+  // VGATE round 4.
+  if (GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command)) return true;
+  if (isGhPrMergeCommand(command) && hasBareGhWord(command)) return true;
+  return isAdminMergeCommand(command);
 }
 
 // ── Merge registry gate (#138) ────────────────────────
@@ -142,18 +717,69 @@ export function repoFromGitRemote(dir: string): string | null {
 export interface RepoContext {
   repo?: string; // owner/name → passed as --repo to the gate's own gh calls
   cwd?: string; // resolved cd path → passed as cwd to the gate's own gh calls
-  source: "flag" | "env" | "cd" | "record" | "fallback";
+  source: "url" | "flag" | "env" | "cd" | "record" | "fallback";
 }
 
 // Extract the PR number from `gh pr merge <n>` (matches GH_PR_PATTERN verbs).
+/**
+ * The command with every quoted region replaced by SPACES — same length, same offsets, so a
+ * match index still addresses the original text. A text regex run on this cannot see a
+ * QUOTED mention as one of the command's own tokens. Reuses `unquotedMask`, the file's
+ * single quote model, so the two cannot drift.
+ */
+function maskQuoted(command: string): string {
+  const mask = unquotedMask(command);
+  let out = "";
+  for (let i = 0; i < command.length; i++) out += mask[i] ? command[i] : " ";
+  return out;
+}
+
+/**
+ * The PR number written IMMEDIATELY after the verb (`gh pr merge 138`).
+ *
+ * Measured on main before this change, the raw-text match took the FIRST
+ * `gh pr merge <digits>` ANYWHERE — including inside a quoted argument — and the registry
+ * path consults this function FIRST (`extractPrNumber(command) ?? extractMergePrNumber`),
+ * so a mention shadowed the real positional and the gate checked a DIFFERENT PR than gh
+ * merged (a wrong-PR evidence read):
+ *   `gh pr merge --body "see gh pr merge 999" 138 --admin` -> 999 (gh merges 138)
+ *   `x="say gh pr merge 1"; gh pr merge <url> --admin`      -> 1   (gh merges the URL's PR)
+ *   `git commit -m "see gh pr merge 138"`                    -> 138 (a mention drove the gate)
+ * Masking the verb fixes all three: the match must be one bash would pass as a word.
+ *
+ * It does NOT change a QUOTED POSITIONAL (`gh pr merge "138"`): the regex requires bare
+ * digits after the verb, so that spelling returned null before masking too and still does —
+ * `extractMergePrNumber` refuses the quoted token as well, so the registry gate is SKIPPED
+ * for it. That is a PRE-EXISTING hole (the scanner does not dequote a positional) and the
+ * follow-up issue covers it together with the dequote fix; masking neither causes nor
+ * widens it.
+ */
 export function extractPrNumber(command: string): number | null {
-  const m = command.match(/gh\s+pr\s+merge\s+(\d+)/);
-  return m ? parseInt(m[1], 10) : null;
+  const masked = maskQuoted(command);
+  const m = masked.match(/gh\s+pr\s+merge\s+(\d+)/);
+  if (m === null) return null;
+  // A token ADJACENT to a quoted region is quote-SPLICED: bash concatenates `"1"38` into
+  // `138`, so the digits the mask leaves visible are a FRAGMENT of the real argument and
+  // taking them names a different PR (`"1"38` masked reads `38`; gh merges 138). Refuse
+  // rather than guess — the same fail-closed direction as the rest of this walk (round-4
+  // review, P2: masking alone turned this from null into a wrong-number read).
+  //
+  // STATED LIMIT (pre-existing, filed with the dequote follow-up #1021): this covers `'` and
+  // `"` adjacency only. The ANSI-C family splices with a `$` in front (`1$'38'` is `138` to
+  // bash) and a digit-adjacent `$` is not caught here, so `1$'38'` still reads `1`. That is
+  // NO WORSE than before this function was masked (the raw regex also read `1`), and the
+  // dequote-aware positional in #1021 is what closes it.
+  const dStart = m.index + m[0].length - m[1].length;
+  const before = command[dStart - 1];
+  const after = command[dStart + m[1].length];
+  if (before === '"' || before === "'" || after === '"' || after === "'") return null;
+  return parseInt(m[1], 10);
 }
 
 // Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag.
 export function extractRepoFlag(command: string): string | null {
-  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
+  // Value may be attached (`-Rowner/repo`), `=`-joined, or a separate word.
+  const m = command.match(/(?:--repo|-R)(?:=|\s+)?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
   return m ? m[1] : null;
 }
 
@@ -259,6 +885,39 @@ export function extractCdPath(command: string): string | null {
 }
 
 export function resolveRepoContext(command: string, record: ReviewRecord | null): RepoContext {
+  // #1007: a PR URL in the SELECTOR outranks every other source, because gh resolves
+  // the merge against the URL and IGNORES --repo/GH_REPO. Probed live rather than
+  // assumed (2026-09-14):
+  //   gh pr view <agent-infra URL> --repo <tortoise>  → returned the agent-infra URL
+  //   gh pr merge <URL to a repo that does not exist> --repo <one that does>  →
+  //       "Could not resolve to a Repository with the name '…definitely-not-a-repo-xyz'"
+  //   gh pr merge <URL to one that exists> --repo <one that does not>  →
+  //       failed on the URL's PR, never on the bogus --repo
+  // So reading the evidence from anywhere but the URL's repo verifies a PR gh is not
+  // about to merge. The URL wins here for the same reason it wins in gh.
+  const selector = extractMergeSelector(command);
+  // A COMPOUND command is resolved PER VERB by the caller, and the two extractors need not
+  // agree on WHICH verb: `extractPrNumber` is a text match (first `gh pr merge <digits>`),
+  // while `extractMergeSelector` takes the FIRST verb — so `gh pr merge <url>; gh pr merge
+  // 123` would attribute the url verb's repo to a number taken from a later verb and read
+  // another repo's evidence (fresh review, P2).
+  //
+  // ⚠️ NOT `countMergeVerbs`: that one is deliberately CONSERVATIVE for the admin path (it
+  // counts every command-position `gh` under an unresolvable construct, where an over-count
+  // only costs a retry). Over-counting here DROPS a legitimate URL repo — re-review found
+  // `x="say gh pr merge 1"; gh pr merge <url> --admin`, where it returned 2 and the URL repo
+  // was discarded. This counter is PRECISE instead: the same `MERGE_VERB_RE` + the same
+  // `unquotedMask`, so a quoted mention is not a verb.
+  //
+  // It counts a real second verb spelled with `;`, `&&`, a newline, `|`, a subshell, a
+  // glued `;` or a repo pair in the gaps. It UNDER-counts a verb hidden inside `sh -c '…'`
+  // or a splice (`gh pr $'merge' 123`) — measured (round-4 review). That is benign here and
+  // deliberate: `maskQuoted` hides those same spellings from `extractPrNumber`, so the
+  // number and the repo stay consistent (both resolve the FIRST verb) instead of the repo
+  // being taken from one verb and the number from another.
+  if (selector.repo && countUnquotedMergeVerbs(command) <= 1) {
+    return { repo: selector.repo, source: "url" };
+  }
   const flag = extractRepoFlag(command);
   if (flag) return { repo: flag, source: "flag" };
   const env = extractGhRepoEnv(command);
@@ -635,6 +1294,644 @@ export function logMergeGateDecision(
   }
 }
 
+// ── #930: safe-admin-merge evidence gate ──────────────
+// `--admin` bypasses required checks, so nothing makes it *safe*: it cannot tell
+// a check already red on main from a NEW failure the PR introduces (tortoise
+// #3420 merged carrying a test that was not in main's failing set, and main
+// ratcheted redder). The chokepoint is scripts/admin-merge.sh; this gate closes
+// the other half — a RAW `gh pr merge … --admin` is refused unless the PR
+// carries an `<!-- admin-merge-safety: <head-sha> -->` evidence comment bound
+// to the CURRENT head SHA, so every push invalidates prior evidence.
+//
+// Flag shapes the gate must catch (a single regex on `--admin` is not enough —
+// `extractPrNumber` requires the number to follow `gh pr merge` immediately, so
+// every one of these previously slipped past the merge-registry gate entirely):
+//   gh pr merge --admin 123          (flag BEFORE the number)
+//   gh pr merge 123 --admin
+//   gh pr merge --admin=true 123
+//   gh pr merge 123 --admin=TRUE     (any Go-true spelling: 1, t, T, True …)
+//   gh pr merge --squash --admin 123
+//   gh pr merge --admin              (no number → cannot bind evidence)
+const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40})\s*-->/g;
+
+/**
+ * Is an `--admin` flag present in a `gh pr merge` command, with a value that
+ * makes the merge an ADMIN merge? Bare `--admin`, `--admin=`, every Go-true
+ * spelling (`=true`, `=TRUE`, `=True`, `=t`, `=T`, `=1`, `="true"`) and every
+ * value we cannot RESOLVE are. Only a resolvable Go-FALSE value (`0`, `f`, `F`,
+ * `FALSE`, `false`, `False`) is an ordinary merge and must not be refused.
+ *
+ * FAIL-CLOSED ON THE UNRESOLVABLE (why this is not `val === "true"`):
+ * we see a raw command STRING, not argv. Bash lowers `--admin\=true`,
+ * `--admin=$'true'`, ``--admin=`true` ``, `--admin=$(echo true)`,
+ * `--admin=${X:-true}`, `--admin=tr""ue` and `--admin=true; …` all to a real
+ * `--admin=true` before gh sees them. We cannot evaluate a shell, so we do not
+ * pretend to: a value that is not a resolvable false spelling is treated as an
+ * admin merge. The previous rule (`=== "true"` only) returned false for every
+ * one of those spellings, and the command then fell through to the merge-registry
+ * gate and merged WITH NO EVIDENCE — a live fail-open in the declared arg-order
+ * evasion class (#930 review P1, cycle 2; VGATE cycle 2).
+ *
+ * COST OF THE SAFE DIRECTION: `--admin=zork`, `--admin=''` and a quoted
+ * `--title "--admin=TRUE"` are now refused although gh would have rejected the
+ * command (or read the flag as a value). Refusing a command gh would have
+ * refused anyway costs nothing; accepting one it would have merged is the hole.
+ * The value charset excludes shell metacharacters and quotes so a compound
+ * command's tail (`--admin=true && gh pr merge …`) is not swallowed into the value.
+ *
+ * QUOTES, ESCAPES AND LINE CONTINUATIONS ARE RESOLVED BEFORE MATCHING. Bash
+ * re-joins a single token across these, so `--ad""min=true`, `--ad\min=true`,
+ * `--ad\<newline>min=true` and `--ad'min'=true` all reach gh as a real
+ * `--admin=true` while the raw string carries no literal `--admin`. Three VGATE
+ * rounds each found another member of this family being missed, so the scanner
+ * no longer enumerates: see `normalizeForFlagScan` (what is resolved) and
+ * `isUnresolvableFlagToken` (what is refused instead of guessed at).
+ *
+ * STATED LIMITS — WHAT THIS CANNOT SEE (a raw-string scanner, not a shell). These
+ * are OPEN GAPS, not safe assumptions. Read this as the authoritative list; if a
+ * shape is not matched by the code and not named here, that is a bug in this file,
+ * not a safe assumption.
+ *   - `xargs`/`{}` assembling the flag from parts that never co-occur with the
+ *     word `admin`, e.g. `printf '%s' --ad | xargs -I{} gh pr merge 123 {}min`;
+ *   - anything expanded UPSTREAM of the string (a `$VAR` in the caller's argv);
+ *   - an equivalent merge issued as `gh api … /merge`, through a `gh alias`, or
+ *     from a `$VAR`-expanded argv;
+ *   - in `isGitOp`, a `$VAR`-SUPPLIED verb with NO admin flag is not treated as a
+ *     merge, so it bypasses the MERGE-REGISTRY gate (`V=pr; gh $V merge 123
+ *     --squash`). With an admin flag the rule below catches it, and an ANSI-C verb
+ *     (`gh p$'r' …`) is refused by rule 2(a) regardless. The registry gate is
+ *     outside #930's scope, so this is noted, not fixed.
+ * (A construct-supplied dash such as `-${V:--}admin=true` was on this list in an
+ * earlier revision and is now CLOSED by rule 2 below — verified, not assumed.
+ * BRACE EXPANSION is closed ONLY in the forms where the expanded word still
+ * contains `admin`: `--adm{in,}` is NOT gated, because the expansion also yields
+ * `--adm`/`--ad`, which gh rejects, so it never produced an executed merge. Do not
+ * read an earlier "brace expansion … CLOSED" wording as wider than this.)
+ *
+ * #1007 — THE SELECTOR SHAPE. The selector may be a bare number or ONE PR URL
+ * (`extractMergeSelector`). A BRANCH selector is NOT resolved and stays a
+ * fail-closed block: resolving it needs a `gh` call, i.e. this gate asking the thing
+ * it is gating for the identity it is about to check. A QUOTED URL
+ * (`gh pr merge "https://…/pull/1" --admin`) still blocks here — this layer does not
+ * dequote, exactly as it has never dequoted a `"123"` selector. The argv-level shim
+ * sees the URL already dequoted, so those shapes resolve THERE, not here: an
+ * over-block at the outer layer, never a bypass. Both directions are pinned in
+ * `index.test.ts` ("extractMergeSelector") and `tests/gh-shim/run.sh` §11.
+ *
+ * A `$VAR`- or `$()`-SUPPLIED FLAG is CLOSED by failing closed: any `$`-bearing
+ * ARGUMENT of the merge beyond the position argument makes the command an admin
+ * merge, because `V=--admin; gh pr merge 999 $V` reaches gh as an admin merge while
+ * no text scan can see the word `admin`. The POSITION argument is exempt (in either
+ * quoting form) and a value-flag's value is exempt, so `gh pr merge "$PR" --squash`
+ * and `gh pr merge 999 --body "$(cat msg)"` stay outside the gate — the common
+ * shapes are NOT over-blocked. Not claimed: that every `$`-bearing later argument
+ * really is the flag. A false hit costs a retry; a miss is an unevidenced merge.
+ *
+ * A complete gate cannot be built on this surface: it needs argv-level
+ * enforcement (a `gh` shim/allowlist). This file's claims are bounded to what it
+ * actually implements:
+ *   - resolvable splices (quotes, backslashes, line continuations) are resolved;
+ *   - a construct plus the word `admin` is refused (rule 2) — that is what closes
+ *     the ASSEMBLED-FLAG family `-${V:--}admin=true`, `$V-admin=true`,
+ *     `-$(printf %s '-')admin=true`, which VGATE round 7 showed reaching gh as
+ *     `--admin=true` while the earlier dash-anchored rule missed them;
+ *   - a spliced VERB is refused rather than read (`isGhPrMergeCommand`).
+ * It does NOT claim exhaustive coverage, and it does not:
+ *   - OVER-BLOCKS, acceptably and visibly: any `gh pr merge` carrying a construct
+ *     (a `$`, backtick or brace) AND the word `admin` is refused unless it has
+ *     head-bound evidence — including a harmless `echo "gh pr merge 1
+ *     --admin=true"`, and a `--body "ask the admin"` beside a `$VAR`. The remedy
+ *     is the mandated `scripts/admin-merge.sh`; the alternative was a bypass.
+ *
+ * #984 — WHAT LAYERING THE SHIM ON TOP OF THIS CHANGES. The gaps ABOVE are limits
+ * of THIS layer, and the CONSTRUCT-SPLICE class among them is now covered by
+ * `scripts/gh-shim/gh`, which decides the same question from its own argv, where
+ * bash has already finished (`-${V:--}admin=true` IS the literal `--admin` by
+ * then); the `tool_call` handler below puts that shim on PATH for every bash call.
+ * A scanner cannot resolve `$VAR` without evaluating a shell, which a gate must not
+ * do, so the class is covered by a layer that does not share this one's limit
+ * rather than by more rules here. This scanner stays as the fast first layer
+ * (better messages, no process spawn).
+ *
+ * NOT COVERED BY EITHER LAYER — do not read the paragraph above as wider than this.
+ * These stay open, and are re-stated in the shim's own header: `gh alias` (gh
+ * expands the alias AFTER the shim has run), a command that discards the shim's
+ * PATH entry (`env -i`, an explicit `PATH=` reset) or calls the real gh by
+ * ABSOLUTE path, and argv already expanded in a parent process.
+ */
+export function hasAdminMergeFlag(command: string): boolean {
+  // 1. Normalize the splicing bash resolves before gh sees argv (quotes,
+  //    backslashes, line continuations), so `--ad""min=true` and `--ad\min=true`
+  //    are seen as `--admin=true` rather than hiding the flag. (VGATE rounds 1-3:
+  //    each of these returned FALSE while gh received a real admin merge.)
+  const probe = normalizeForFlagScan(command);
+  // 2. Fail CLOSED on what we cannot resolve. Guessing here is what produced
+  //    seven rounds of fail-opens, so the rule is "unresolvable ⇒ admin merge".
+  //    (a) ANSI-C quoting, or a `$`/backtick inside a literal `--` token;
+  if (isUnresolvableFlagToken(command, probe)) return true;
+  //    (b) a construct that could ASSEMBLE the flag — the dashes included. VGATE
+  //    round 7: `-${V:--}admin=true`, `$V-admin=true` and
+  //    `-$(printf %s '-')admin=true` all reach gh as `--admin=true`, and a rule
+  //    anchored on a literal `--` misses every one. Keying on the CONSTRUCT plus
+  //    the word `admin` (rather than on a dash position) is what closes the
+  //    family; it is narrow in the direction that matters, because a construct
+  //    WITHOUT the word `admin` — e.g. the common `gh pr merge "$PR" --squash` —
+  //    is untouched.
+  if (hasUnresolvableConstruct(command) && /admin/i.test(command)) return true;
+  // 3. The literal flag. Token-anchored: `--admin` must be a WHOLE flag. A
+  //    `--adminx` typo is not a bypass (gh rejects it as an unknown flag), and
+  //    refusing it would be exactly the false block this rail must not produce.
+  //    `=` may carry a Go-false value; anything else is a bypass (see GO_FALSE).
+  const re = /(?:^|[\s])--admin(?:=([^\s;&|()`$<>]*))?(?=$|[\s;&|()`$<>])/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(probe)) !== null) {
+    const val = m[1];
+    // ONLY a resolvable Go-false value makes this an ordinary merge. Bare (`val
+    // === undefined`), empty, Go-true, and unparseable values all count as an
+    // admin merge: we fail CLOSED on anything we cannot resolve.
+    if (val === undefined || !GO_FALSE.has(val)) return true;
+  }
+  return false;
+}
+
+/**
+ * The Go `strconv.ParseBool` spellings that mean FALSE — the ONLY values under
+ * which `--admin=<v>` is not an admin merge. Case-SENSITIVE, exactly as Go is.
+ */
+const GO_FALSE = new Set(["0", "f", "F", "FALSE", "false", "False"]);
+
+/**
+ * Extract the PR number from a `gh pr merge` command REGARDLESS of flag order
+ * (#930 adversarial class 4 — arg-order evasion). The segment runs from `gh pr
+ * merge` to the first shell terminator (`;`, `&&`, `||`, `|`, newline), so a
+ * number belonging to a LATER command can never be attributed to this merge.
+ * Flags that take a value are skipped together with their value; every
+ * value-less merge flag is listed so a later number is still found. Returns
+ * null when no PR number is present (e.g. `gh pr merge --admin` on the current
+ * branch) — a null answer must FAIL CLOSED for an admin merge, never fall
+ * through to the dispatch-count path.
+ */
+/**
+ * How many `gh pr merge` verbs the command carries.
+ *
+ * `extractMergePrNumber` deliberately truncates at the first `;`/`&&`/`||`/`|`,
+ * and the gate evaluates exactly ONE PR - so a compound
+ * `gh pr merge 111 --admin; gh pr merge 999 --admin` is judged against 111's
+ * evidence and then merges 999 with `--admin` and no evidence at all. The caller
+ * treats >1 as a fail-closed block rather than guessing which PR was meant.
+ */
+export function countMergeVerbs(command: string): number {
+  // This MUST use the same recognizer the gate uses (`isGhWordAt`), not a second
+  // regex. Cycle-2 review: a regex here counted 1 for
+  // `gh pr merge 111 --admin; sh -c 'gh pr merge 999 --admin'` — the second verb
+  // is wrapped, so it did not match — the `> 1` fail-closed guard was skipped and
+  // 999 merged unevidenced. Two disagreeing predicates is the exact failure this
+  // file keeps re-learning (VGATE round 9), so the count walks the same tokens.
+  const scan = scanTokens(command);
+  // A construct-SPLICED verb (`gh pr $'merge' 999`, `gh p$'r' merge 999`) dequotes
+  // to a residue, so an exact `dequote(tok) === "merge"` test does not see it and
+  // the compound guard was skipped — the second PR merged unevidenced (cycle-3
+  // review P0). When the text carries any unresolvable construct, every
+  // command-position `gh` is counted CONSERVATIVELY: this count is only ever used
+  // as `> 1` on a command already known to be an admin merge, so an over-count
+  // costs a retry while an under-count is an unevidenced merge.
+  const unresolvable = hasUnresolvableConstruct(command);
+  let n = 0;
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (!isGhWordAt(scan, i)) continue;
+    if (unresolvable) {
+      n++;
+      continue;
+    }
+    if (dequote(scan.tokens[i + 1] ?? "") !== "pr") continue;
+    if (dequote(scan.tokens[i + 2] ?? "") !== "merge") continue;
+    n++;
+  }
+  return n;
+}
+
+export function extractMergePrNumber(command: string): number | null {
+  return extractMergeSelector(command).pr;
+}
+
+/**
+ * The ONE PR-URL shape this gate resolves (#1007):
+ * `https://github.com/<owner>/<repo>/pull/<digits>`.
+ *
+ * The number is IN the token, so accepting a URL does not mean asking `gh` who the
+ * PR is. Everything else is refused, and each refusal is deliberate:
+ *   - any other host — the host cannot be carried into `--repo`, so the evidence
+ *     would be read from a different host's repo;
+ *   - `?`/`#` (gh routes `…/pull/1?s=1` to the same PR, but "route-equivalent" is
+ *     not "the same string", and this layer must not normalise);
+ *   - an extra path segment or trailing `/`;
+ *   - a BRANCH name — resolving one needs a `gh` call, i.e. asking the gated thing
+ *     for the identity it is about to check. It stays a fail-closed block.
+ * This is the SAME shape `scripts/gh-shim/gh::parse_pr_url` accepts, on purpose:
+ * the two layers must not disagree about what is a PR (see the parity note there).
+ */
+const PR_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([0-9]+)$/;
+
+export interface MergeSelector {
+  pr: number | null;
+  /** `owner/repo` when the selector was a PR URL, else null. */
+  repo: string | null;
+}
+
+/**
+ * Split a command segment into the ARGV words gh would see — respecting QUOTES.
+ *
+ * `scanTokens` splits on whitespace regardless of quoting, which is right for the rules
+ * that ask "does the text contain X" and WRONG here: `--body "see <url> here"` is ONE
+ * argv value, so a URL inside it is not the selector. A whitespace split leaves that URL
+ * as a free token, and the gate would then certify a DIFFERENT PR (in a different repo)
+ * than gh merges — a FAIL-OPEN, found by VGATE on #1007's first cycle.
+ *
+ * An unterminated quote is NOT an error here: the caller's `;`/`&&` segment split is not
+ * quote-aware either, so an unterminated region usually means the segment was CUT, and
+ * everything after the flag is then one value. Consuming it as one word is what keeps
+ * `gh pr merge 123 --admin --body "msg with ; in it"` allowed (the positional is found
+ * before the value) while refusing a body-hosted URL standing in for a missing one.
+ * BACKSLASHES ARE ALWAYS ESCAPES, in every context — including inside single quotes,
+ * where bash has none. That is deliberate, and it is the SAFE direction: it can only
+ * keep a quoted region OPEN longer than bash would, never close it EARLIER. Closing
+ * early is the only way this function can turn a value's contents into a free token,
+ * and a free URL token is what makes the gate certify a different PR (in a different
+ * repo) than gh merges. VGATE found that fail-open three times on #1007 — first from a
+ * whitespace split, then through `\"` inside a double-quoted value (and the `$'…\'…'`
+ * form), then through a NESTED substitution whose inner quotes closed the OUTER region.
+ * Over-reading a quote can only REFUSE a command gh would have run, which is the
+ * direction this gate is allowed to be wrong in.
+ *
+ * NESTED REGIONS ARE MODELLED, because a nested region's quotes are INDEPENDENT of the
+ * enclosing one: `"$( … " … " …)"` keeps the OUTER quote open across the inner ones,
+ * so a URL inside the value never becomes a free token. Levels are tracked per region
+ * (`$( … )`, backticks), with backslash escaping inside all of them, and a paren depth
+ * so `$((1+2))` and `$( (a) )` close where bash closes them.
+ *
+ * STILL NOT A SHELL (see the STATED LIMITS above): constructs this cannot model — a
+ * `case`-pattern `)` inside `$( … )`, here-docs — could still end a region early. The
+ * argv-level shim is the AUTHORITY for exactly this reason; this layer is the fast one,
+ * not the correct one.
+ */
+interface SubLevel {
+  kind: "root" | "paren" | "tick";
+  q: "'" | '"' | null;
+  depth: number;
+  /** `case` … `esac` saw no `esac` yet: its pattern `)` must NOT close the region. */
+  caseDepth: number;
+}
+
+function splitArgvWords(segment: string): string[] {
+  const words: string[] = [];
+  let cur = "";
+  let started = false;
+  let word = ""; // the current UNQUOTED word, for `case`/`esac` recognition
+  const lv: SubLevel[] = [{ kind: "root", q: null, depth: 0, caseDepth: 0 }];
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i];
+    const s = lv[lv.length - 1];
+    // A `case` pattern is closed by a BARE `)`, which is not the region's `)`.
+    // Without this, `$(case x in y) <url> esac) 123` popped the substitution at the
+    // pattern and left `<url>` as a free token — the URL then stood in for the
+    // positional (VGATE #1007 cycle 3's sibling).
+    const flushWord = () => {
+      if (word === "case") s.caseDepth++;
+      else if (word === "esac" && s.caseDepth > 0) s.caseDepth--;
+      word = "";
+    };
+    if (s.q === "'") {
+      // No escapes in bash's single quotes — but see the header: escaping here can only
+      // keep the region open longer, which is the safe direction.
+      cur += c;
+      if (c === "\\" && i + 1 < segment.length) { cur += segment[++i]; continue; }
+      if (c === "'") s.q = null;
+      continue;
+    }
+    if (s.q === '"') {
+      cur += c;
+      if (c === "\\" && i + 1 < segment.length) { cur += segment[++i]; continue; }
+      if (c === '"') { s.q = null; continue; }
+      if (c === "$" && segment[i + 1] === "(") {
+        flushWord();
+        cur += segment[++i];
+        lv.push({ kind: "paren", q: null, depth: 1, caseDepth: 0 });
+        continue;
+      }
+      if (c === "`") { flushWord(); lv.push({ kind: "tick", q: null, depth: 0, caseDepth: 0 }); continue; }
+      continue;
+    }
+    // Unquoted AT THIS LEVEL (a `"` opened inside `$( … )` does not quote the outer one).
+    if (c === "\\" && i + 1 < segment.length) { flushWord(); cur += c + segment[++i]; started = true; continue; }
+    if (c === "'" || c === '"') { flushWord(); s.q = c; cur += c; started = true; continue; }
+    if (c === "$" && segment[i + 1] === "(") {
+      flushWord();
+      cur += segment[++i];
+      lv.push({ kind: "paren", q: null, depth: 1, caseDepth: 0 });
+      started = true;
+      continue;
+    }
+    if (c === "`") {
+      flushWord();
+      if (s.kind === "tick") lv.pop();
+      else lv.push({ kind: "tick", q: null, depth: 0, caseDepth: 0 });
+      cur += c;
+      started = true;
+      continue;
+    }
+    if (c === "(" && s.kind === "paren") { flushWord(); s.depth++; cur += c; started = true; continue; }
+    if (c === ")" && s.kind === "paren" && s.caseDepth === 0) {
+      flushWord();
+      s.depth--;
+      if (s.depth === 0) lv.pop();
+      cur += c;
+      started = true;
+      continue;
+    }
+    // Only the ROOT level splits words: a substitution is ONE word to the shell. But
+    // whitespace ends a WORD at every level — without that, `case`/`esac` inside a
+    // substitution was never recognized and a pattern `)` popped the region early.
+    if (/\s/.test(c)) {
+      flushWord();
+      if (lv.length === 1) {
+        if (started) { words.push(cur); cur = ""; started = false; }
+      } else {
+        cur += c;
+      }
+      continue;
+    }
+    word += c;
+    cur += c;
+    started = true;
+  }
+  if (started) words.push(cur);
+  return words;
+}
+
+/**
+ * The PR selector of a `gh pr merge`, resolved to `{ pr, repo }` (#1007).
+ *
+ * ONE token walk serves both the number and the URL's repo, and the walk is
+ * quote-aware. Both properties are load-bearing: a raw regex for the repo would also
+ * match a URL inside a `--body "…"` value and read the evidence from the WRONG repo,
+ * and a whitespace tokenizer would hand that same URL back as if it were the
+ * positional. Either one is a FAIL-OPEN (a foreign repo's certificate certifies a merge
+ * it was never computed for), not an over-block.
+ */
+// `gh pr merge`, tolerating a repo pair in ANY gap between the three words
+// (`gh -R owner/repo pr merge 123`, `gh pr -R owner/repo merge 123`) — the spellings
+// `stripRepoArgs` used to normalise, re-found here in the ORIGINAL text.
+//
+// ⚠️ The three value alternatives MUST stay DISJOINT and each MUST match at least one
+// character. An earlier form (`=\S+|\s+…|\S*`) was ambiguous — `=\S+` and `\S*` both match
+// `=a`, and `\S*` matches the EMPTY string — so under the unbounded `(?:\s+REPO_PAIR)*`
+// a failing tail enumerated 2^k splits: measured 80 ms at 20 `--repo=` tokens, 1.3 s at
+// 26, 5.2 s at 28 and 20.8 s at 30 (~3x per token), on a function that runs on EVERY
+// git-shaped bash call — a command-string denial of service in the gate itself
+// (code-review P1). Disjoint first characters (`=`, whitespace, neither) make it linear;
+// `index.test.ts` pins a time bound so a future edit cannot quietly restore the blowup.
+const REPO_PAIR = String.raw`(?:-R|--repo)(?:=\S+|\s+(?:"[^"]*"|'[^']*'|[^\s=]\S*)|[^\s=]\S+)`;
+const MERGE_VERB_RE = new RegExp(
+  String.raw`\bgh\b(?:\s+${REPO_PAIR})*\s+pr(?:\s+${REPO_PAIR})*\s+merge\b`,
+);
+
+export function extractMergeSelector(command: string): MergeSelector {
+  // The selector is read from the ORIGINAL text, never from `stripRepoArgs`'s output:
+  // that function removes only the first whitespace-delimited word of a value, so a
+  // quoted `--repo "see <url> here"` left its TAIL (URL included) as free text and the URL
+  // branch below returned that URL as the selector — a wrong-PR AND wrong-repo evidence
+  // read (VGATE #1007 cycle 4, P0; a regression the URL feature introduced, since the old
+  // `^\d+$`-only walk ignored the leaked URL and found the real positional). The walk
+  // skips a `--repo`/`-R` VALUE quote-aware (`valueFlags`), and `MERGE_VERB_RE` re-finds
+  // the verb in the original — so `stripRepoArgs` is not needed here at all, and using it
+  // only added a way to over-block (a leaked tail hid the verb from the canonical text).
+  const verb = matchUnquoted(MERGE_VERB_RE, command, unquotedMask(command));
+  if (verb === null) return { pr: null, repo: null };
+  const segment = command.slice(verb.index + verb[0].length).split(/;|&&|\|\||\||\n/)[0] ?? "";
+  const tokens = splitArgvWords(segment);
+  // Every `gh pr merge` flag that takes a VALUE must be here, or its value can be read
+  // as the positional. `-A`/`--hostname` were missing (VGATE, #1007 cycle 1), so
+  // `gh pr merge -A <url> 123 --admin` resolved to the URL's PR. This set mirrors the
+  // shim's `VALUE_FLAGS` (`scripts/gh-shim/gh`) — the two layers must not disagree.
+  const valueFlags = new Set([
+    "--repo", "-R", "--body", "-b", "--body-file", "-F", "--subject",
+    "-t", "--author-email", "-A", "--match-head-commit", "--hostname",
+  ]);
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (valueFlags.has(tok)) {
+      i++; // skip the flag's value
+      continue;
+    }
+    if (/^--[A-Za-z-]+=/.test(tok)) continue; // --flag=value
+    if (/^\d+$/.test(tok)) {
+      // The SHIM forwards a bare positional to gh as the LITERAL digits, so a value that
+      // `Number()` cannot round-trip makes the two layers name different PRs: above 2^53
+      // it rounds (`9007199254740993` -> `…992`) and a leading zero normalises
+      // (`01006` -> `1006`). This is the same rule the URL digits below already apply,
+      // and the same rule the shim applies to both spellings — refuse rather than let the
+      // layers disagree about which PR's evidence to read (fresh review, P2).
+      const n = Number(tok);
+      if (n < 1 || !Number.isSafeInteger(n) || String(n) !== tok || tok.length > 15) {
+        return { pr: null, repo: null };
+      }
+      return { pr: n, repo: null };
+    }
+    const m = PR_URL_RE.exec(tok);
+    if (m) {
+      // `Number()` is lossy above 2^53 and maps `01006` → `1006`, while the shim passes
+      // the literal digits. Refuse rather than let the two layers disagree about the PR
+      // they name (a divergence here is a wrong-PR evidence read, not a cosmetic one).
+      const digits = m[3];
+      const n = Number(digits);
+      // ≤15 digits is the SAME bound the shim applies (`parse_pr_url`): short enough that
+      // a JS `Number` is exact, so the two layers can never disagree about which PR the
+      // digits name. Over it, `Number` is lossy and the gate would read a different PR's
+      // evidence — refuse instead.
+      if (n < 1 || digits.length > 15 || !Number.isSafeInteger(n) || String(n) !== digits) {
+        return { pr: null, repo: null };
+      }
+      return { pr: n, repo: `${m[1]}/${m[2]}` };
+    }
+  }
+  return { pr: null, repo: null };
+}
+
+/**
+ * Evidence must be **non-vacuous**, not merely present (#930 adversarial class
+ * 2 — forgery/vacuity). A marker line alone proves nothing: the evidence body
+ * must carry the comparison's own counts, with `unique to this PR: 0`. A body
+ * computed over an empty or unparsed failing set cannot produce this line without
+ * the comparison having produced *some* numeric line — but see the
+ * `evidenceBodyIsCertifying` docstring for what this honestly cannot prove: a
+ * hand-typed line is one `printf` away, so this closes vacuity, not forgery.
+ */
+/** The body's `PR head:` value, lowercased, or null when absent. */
+export function evidenceHeadInBody(body: string): string | null {
+  const m = /PR head:\s*([0-9a-fA-F]{7,40})\b/.exec(body);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Is `body` a CERTIFYING evidence comment for the marker SHA `markerSha`?
+ *
+ * What this CANNOT do: prove the comparison actually ran. The counts line is
+ * text, and a determined agent can type it. No agent-side check can close that
+ * (it is why the honest limit is stated rather than papered over).
+ *
+ * What it CAN do — and did not, before this fix — is refuse an internally
+ * INCONSISTENT comment. The body's `PR head:` must name the SAME revision as
+ * the marker that unlocked the gate; the caller separately binds the marker to
+ * the CURRENT head. So pasting a valid marker onto an unrelated body (or
+ * hand-typing counts beside a `PR head:` the marker does not name) no longer
+ * certifies.
+ */
+export function evidenceBodyIsCertifying(body: string, markerSha: string): boolean {
+  const bodyHead = evidenceHeadInBody(body);
+  if (bodyHead === null) return false;
+  const marker = markerSha.toLowerCase();
+  // Prefix-tolerant in BOTH directions, mirroring the caller's head binding: a
+  // short SHA is legitimate in either line, but the two must denote one commit.
+  // (This was asymmetric until review cycle 2: a full-length marker with a
+  // short `PR head:` returned false while the reverse returned true, so the
+  // comment described a tolerance the code did not have.)
+  const headNamesTheMarker =
+    marker === bodyHead || marker.startsWith(bodyHead) || bodyHead.startsWith(marker);
+  return (
+    headNamesTheMarker &&
+    /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0\b/.test(body) &&
+    // The lane is named in the provenance line (`... union of N runs of
+    // <lane>:`) — accept it, but never accept a missing provenance line.
+    // `.+` (greedy, to the LAST `):`), not `[^:()]+`: a lane may be named by a workflow
+    // NAME rather than a file, and `gh` accepts names containing `:` and `(`/`)` —
+    // `--workflow 'CI: tests'` and `--workflow 'tests (unit)'` both emitted valid rail
+    // evidence that this contract refused, blocking a legitimate merge (cycle-3 review).
+    /main compared \(union of \d+ runs?(?: of .+)?\):/.test(body)
+  );
+}
+
+export type AdminMergeGateResult =
+  | { status: "block"; reason: string }
+  | { status: "allow"; message: string };
+
+/**
+ * Pure decision for the admin-merge evidence gate.
+ *
+ * `comments` is the PR's comment bodies, or null when the fetch FAILED — a
+ * failed fetch is `block` (fail-closed): an admin merge is a bypass, and a
+ * bypass must not be granted because gh was unreachable.
+ */
+export function evaluateAdminMergeGate(
+  pr: number | null,
+  currentHead: string | null,
+  comments: string[] | null,
+  override: boolean,
+): AdminMergeGateResult {
+  if (override) {
+    return {
+      status: "allow",
+      message:
+        "[review-enforcer] ⚠️  ADMIN-MERGE OVERRIDE — the head-bound evidence gate was " +
+        "bypassed by AGENT_ADMIN_MERGE_OVERRIDE=1 (audited). Ensure the operator has " +
+        "approved this admin merge; the post-merge detector still runs.",
+    };
+  }
+  const remediation = [
+    "   → Run the mandated rail instead: scripts/admin-merge.sh <PR>",
+    "     It computes the failing set (union over main's last N runs), refuses a genuinely",
+    "     new failure, and posts the head-bound evidence this gate requires.",
+    "   → Deliberate operator override: set AGENT_ADMIN_MERGE_OVERRIDE=1 (or the ELDATO_",
+    "     alias) and restart (audited as admin_merge_override).",
+  ];
+  if (pr === null) {
+    return {
+      status: "block",
+      reason: [
+        "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
+        "❌ `gh pr merge --admin` carries no resolvable PR number, so no head-bound evidence can be checked.",
+        ...remediation,
+      ].join("\n"),
+    };
+  }
+  if (currentHead === null) {
+    return {
+      status: "block",
+      reason: [
+        "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
+        `❌ Could not verify the current head of PR #${pr} — an admin merge cannot be bound to evidence without it.`,
+        ...remediation,
+      ].join("\n"),
+    };
+  }
+  if (comments === null) {
+    return {
+      status: "block",
+      reason: [
+        "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
+        `❌ Could not read PR #${pr}'s comments to look for head-bound admin-merge evidence — failing CLOSED for a bypass.`,
+        ...remediation,
+      ].join("\n"),
+    };
+  }
+  for (const body of comments) {
+    ADMIN_MERGE_EVIDENCE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ADMIN_MERGE_EVIDENCE_RE.exec(body)) !== null) {
+      const sha = m[1].toLowerCase();
+      // Head-SHA BINDING (#930 adversarial class 1 — stale evidence): a marker
+      // minted at head X must not unlock head Y. Accept a prefix match so a
+      // short SHA in the marker still binds, but only when it is a prefix of the
+      // CURRENT head — never a prefix of some earlier one.
+      const bound = sha.length >= 40
+        ? currentHead.toLowerCase() === sha
+        : currentHead.toLowerCase().startsWith(sha);
+      if (bound && evidenceBodyIsCertifying(body, sha)) {
+        return {
+          status: "allow",
+          message:
+            `[review-enforcer] ✅ Admin-merge evidence verified for PR #${pr} ` +
+            `(marker bound to head ${currentHead.slice(0, 12)}, evidence non-vacuous) — allowing --admin merge`,
+        };
+      }
+    }
+  }
+  return {
+    status: "block",
+    reason: [
+      "✅ Review enforcement (admin-merge evidence) gate is working correctly.",
+      `❌ PR #${pr} has no \`admin-merge-safety\` evidence bound to its CURRENT head (${currentHead.slice(0, 12)}).`,
+      "   Evidence is head-bound: every push to the PR invalidates it, so a stale marker is refused.",
+      "   A marker alone is also refused — the evidence body must carry the comparison counts.",
+      ...remediation,
+    ].join("\n"),
+  };
+}
+
+/** The PR's comment bodies, or null when the fetch failed (fail-closed). */
+export function getPrComments(pr: number, ctx: RepoContext): string[] | null {
+  const repoArg = ctx.repo ? ` --repo ${ctx.repo}` : "";
+  try {
+    // `--jq '[.comments[].body]'` → ONE JSON array of bodies. The plain
+    // `.comments[].body` form prints one body per line, which silently SPLITS a
+    // multi-line evidence comment (the marker line would arrive as its own
+    // "comment" with no counts) — a real vacuity hole, not a formatting nit.
+    const out = runGh(`gh pr view ${pr} --json comments --jq '[.comments[].body]'${repoArg}`, {
+      cwd: ctx.cwd,
+      timeout: 15000,
+    });
+    const parsed = JSON.parse(out);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((b): b is string => typeof b === "string");
+  } catch {
+    return null;
+  }
+}
+
+/** The admin-merge override hatch, mirroring the repo's AGENT_/ELDATO_ env convention. */
+function _adminMergeOverride(): boolean {
+  return _getEnv("ADMIN_MERGE_OVERRIDE") === "1";
+}
+
 // ── Block message ─────────────────────────────────────
 
 // #517: the code-review-skill path is repo-layout-dependent — agent-infra
@@ -766,14 +2063,81 @@ export default function (pi: ExtensionAPI) {
       if (!isToolCallEventType("bash", event)) return undefined;
       if (!extensionEnabled) return undefined;
 
-      const command = String(event.input.command ?? "");
+      // #984: the ARGV-LEVEL layer runs FIRST and for EVERY bash call, not only
+      // for git ops — the shim has to be on PATH before the command runs, and a
+      // command that does not look like a merge to the scanner is exactly the
+      // case the scanner cannot decide. The string gates below then act as the
+      // fast first layer, unchanged.
+      //
+      // `rawCommand` is what the CALLER wrote: the injected prefix names the shim
+      // path (`…/gh-shim/gh`), so scanning the MUTATED text would feed the gates a
+      // `gh` word that the author never wrote.
+      const rawCommand = String(event.input.command ?? "");
+      const shimDir = activeGhShimDir();
+      if (shimDir === null && !ghShimAbsenceWarned && process.env.AGENT_GH_SHIM !== "0") {
+        ghShimAbsenceWarned = true;
+        console.log(
+          "[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner " +
+            "is active, so bash token splicing can still hide an admin merge. " +
+            "Set AGENT_GH_SHIM_DIR, or install scripts/gh-shim."
+        );
+      }
+      const shimmed = withGhShim(rawCommand, shimDir);
+      if (shimmed !== null) event.input.command = shimmed;
+
+      const command = rawCommand;
       if (!isGitOp(command)) return undefined;
+
+      // #930: the admin-merge evidence gate runs FIRST (before the merge
+      // registry). `--admin` bypasses required checks, so it is refused unless
+      // the PR carries evidence bound to the CURRENT head SHA. On a pass it
+      // FALLS THROUGH to the merge-registry gate — the two gates are
+      // independent and both must pass.
+      if (isAdminMergeCommand(command)) {
+        // P1 (fresh review): a compound command is judged against ONE PR, so
+        // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
+        // and then merge 999 unevidenced. Fail closed.
+        if (countMergeVerbs(command) > 1) {
+          console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge)");
+          logGateEvent("merge_gate_block", { reason: "admin_merge_compound_command" });
+          return {
+            block: true,
+            reason:
+              "This command contains more than one `gh pr merge`. The admin-merge evidence " +
+              "gate can only certify ONE PR per call, so it cannot prove the others are " +
+              "evidenced. Run them as separate commands.",
+          };
+        }
+        const adminPr = extractMergePrNumber(command);
+        // #426 context resolution, reuse: --repo / GH_REPO / cd / fallback.
+        const adminCtx = resolveRepoContext(command, null);
+        const adminHead = adminPr !== null ? await getPrHeadSha(adminPr, adminCtx) : null;
+        const adminComments =
+          adminPr !== null && adminHead !== null ? getPrComments(adminPr, adminCtx) : null;
+        const adminOverride = _adminMergeOverride();
+        const adminResult = evaluateAdminMergeGate(
+          adminPr, adminHead, adminComments, adminOverride
+        );
+        if (adminResult.status === "block") {
+          console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked");
+          logGateEvent("merge_gate_block", {
+            pr: adminPr,
+            reason: "admin_merge_no_evidence",
+          });
+          return { block: true, reason: adminResult.reason };
+        }
+        console.log(adminResult.message);
+        logGateEvent("merge_gate_pass", {
+          pr: adminPr,
+          reason: adminOverride ? "admin_merge_override" : "admin_merge_evidence_ok",
+        });
+      }
 
       // #138: merge registry gate runs FIRST for `gh pr merge` commands.
       // A recorded clean review (registry record) IS the evidence — merges do
       // NOT also require dispatchCount > 0. That gate stays for git
       // commit/push and gh pr create, below.
-      const prNumber = extractPrNumber(command);
+      const prNumber = extractPrNumber(command) ?? extractMergePrNumber(command);
       if (prNumber !== null) {
         // #426: repo resolution is command-first (--repo / GH_REPO / cd), then
         // the merge ENVIRONMENT — git remote of the cd target, else of the pi

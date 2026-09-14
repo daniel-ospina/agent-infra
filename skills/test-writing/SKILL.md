@@ -137,7 +137,7 @@ Before writing implementation code, verify the test against this checklist. **Al
 
 **Dispatch (multi-file, single invocation):**
 ```
-task(prompt='test-review: <file1> <file2> ... --caller test-writing \n\nSURFACE MAP: <surface map from plan doc>\nJOURNEY MAP: <journey map from plan doc>\n\nTEST FILE 1: <full content>\nTEST FILE 2: <full content>\n...')
+task(prompt='test-review: <file1> <file2> ... \n\nSURFACE MAP: <surface map from plan doc>\nJOURNEY MAP: <journey map from plan doc>\n\nTEST FILE 1: <full content>\nTEST FILE 2: <full content>\n...')
 ```
 
 All changed test files from this implementation batch are dispatched in a SINGLE task sub-agent invocation. Limit 5 files per dispatch (context window). test-review runs its full protocol (Phases 0-5) and returns per-file results.
@@ -199,21 +199,6 @@ After green, clean up:
 - Simplify logic
 
 Re-run tests after each refactor. Keep the cycle tight — refactor only what was just implemented.
-
-**Post-refactor re-hash:** After refactoring, re-hash all test files touched in this cycle. Write per-file hash to `~/.pi/agent/test-review/<sha256-of-absolute-test-file-path>.json`:
-
-```json
-{
-  "status": "CLEAN" | "CAPPED",
-  "test_file_path": "/absolute/path/to/test.test.ts",
-  "source_file_paths": ["/absolute/path/to/source.ts"],
-  "composite_hash": "<sha256>",
-  "timestamp": "<ISO8601>",
-  "capped_issues": [{"severity": "P0|P1|P2", "dimension": "...", "description": "..."}]
-}
-```
-
-Hash schema is defined here in test-writing (single source of truth). Include `PASS` on its own line in console output for VGATE compatibility.
 
 ### Step 8 — Report
 

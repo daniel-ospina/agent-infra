@@ -33,7 +33,7 @@
 
 import { readFileSync, readdirSync, existsSync } from 'fs';
 import { join, basename, dirname } from 'path';
-import { pathToFileURL } from 'url';
+import { isMain } from './is-main.mjs';
 import { validateFrontmatter } from './frontmatter-validate.mjs';
 
 // ── CLI ────────────────────────────────────────────────────────────────────
@@ -251,8 +251,11 @@ export function run(argv, deps = {}) {
   return 1;
 }
 
-const isMain =
-  process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
-if (isMain) {
+// #708 — symlink-insensitive. The previous `pathToFileURL(process.argv[1]).href
+// === import.meta.url` comparison was false whenever ANY component of the
+// invocation path was a symlink (macOS `/var` → `/private/var`; a consumer
+// repo's symlinked `scripts/` dir), so this fail-CLOSED #254 gate printed
+// nothing and exited 0 — indistinguishable from a clean run.
+if (isMain(import.meta.url, process.argv[1])) {
   process.exit(run(process.argv.slice(2)));
 }

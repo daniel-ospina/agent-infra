@@ -251,6 +251,84 @@ Store as `TIER` for subsequent steps. Write the marker file — the only channel
 echo "$TIER" > /tmp/agent-issue-complexity
 ```
 
+### Pipeline-Artifact Preflight (#792)
+
+The `pipeline-compliance` required check reads **issue-side artifacts** — a scoping comment
+(check b) and, for `complexity:standard`/`complex`, a plan doc or a `Wiring` table (check d).
+Which of those must exist *before implementation begins* depends on the check: the scoping
+comment and its `Wiring` table do (they are the issue-side evidence), while a
+`docs/plans/*.md` plan doc is normally written **with** the change and is therefore also
+acceptable at merge time. Nothing in the pipeline consults either artifact until the PR
+exists, so an unscoped standard issue otherwise pays the whole gate cost **twice**: tests +
+review loop + PR → blocked merge → retro artifact → the added file invalidates the reviewed
+SHA → re-review (#745 / PR #778).
+
+Run the gate's own issue-side checks **now** — one invocation, seconds, no `gh` surprise
+at merge time. Depending on how the repo was initialised, a checkout may carry the gate via
+`agent-infra init`'s `scripts/` symlink, or may not carry it at all; resolve it from the
+checkout when present, else from `$AGENT_INFRA_PATH`:
+
+```bash
+GATE="${AGENT_INFRA_PATH:-}/scripts/check-pipeline-compliance.sh"
+[ -f scripts/check-pipeline-compliance.sh ] && GATE="scripts/check-pipeline-compliance.sh"
+if [ "$ISSUE_NUMBER" = "none" ]; then
+  # Nothing was evaluated, so this must not exit 0: the table below maps 0 to
+  # "the gate ran and passed". exit 2 = could not run, same as a missing gate.
+  echo "⚠️ pipeline preflight SKIPPED (exit 2) — no linked issue on this branch, so there is no issue-side artifact to evaluate. This is NOT a pass: check (a) still requires a linked issue at merge time." >&2
+  exit 2
+elif [ ! -f "$GATE" ]; then
+  # Never let an unfound gate fall through to 0. Both lookups failed, so nothing was run.
+  echo "❌ pipeline preflight could not RUN — no scripts/check-pipeline-compliance.sh in $(pwd), and none under AGENT_INFRA_PATH=${AGENT_INFRA_PATH:-unset}." >&2
+  exit 2
+else
+  # GH_REPO must be THIS repo. When the gate is resolved through $AGENT_INFRA_PATH its
+  # self-resolved root is agent-infra, so its origin auto-detection would name the wrong
+  # repo — pin it in both branches.
+  GH_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)" \
+    bash "$GATE" --issue-only "$ISSUE_NUMBER"
+fi
+```
+
+Read the **exit code**; do not infer the verdict from the absence of a printed error. Exit 0
+means *the gate ran and passed* — every path that did not run the gate (no linked issue, gate
+not found, malformed invocation) exits 2, so 0 can never mean "skipped":
+
+| Exit | Meaning | Action |
+|------|---------|--------|
+| **0** | the gate **ran** and the issue-side artifacts are present (or exempt at this tier) | proceed |
+| **1** | **BLOCK** — the artifacts are missing; the script prints the remedy and the producing skill | fix before implementing (see below) |
+| **2** | the check could not **RUN** — no linked issue to evaluate, gate not found, malformed target, missing `gh`/`jq`, or a `gh api` failure | fix the cause, then re-run — never read it as a pass |
+
+`--issue-only` evaluates **exactly the checks that need no PR** and skips the rest, reusing
+the same code path and tier rules as the merge-time run (check (d)'s merge-time remedy text
+differs, because the PR diff is invisible here):
+
+| Check | `--issue-only` (pre-PR) | Merge-time run |
+|-------|------------------------|----------------|
+| a. linked issue | skipped — there is no PR body yet | enforced |
+| b. scoping comment (`<!-- issue-scoping:`) | **enforced** | enforced |
+| c. code-review evidence | skipped — no PR body/commits yet | enforced |
+| d. plan doc | **`Wiring` branch only** — the `docs/plans/*.md` branch reads the PR diff | enforced (both branches) |
+| e. test-coverage evidence | skipped — no diff/body yet | enforced |
+
+Tier exemptions are identical to the merge-time run: `complexity:micro` skips the issue-side
+checks (a micro issue exits 0 with no artifacts); an **unlabeled** issue is treated as
+non-micro, so check b still applies — which is why a `bug`/`improvement` issue with no
+`complexity:*` label needs the scoping comment too.
+`PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=<N>` is the env equivalent of
+the flag. **Exactly one target** is accepted: a surplus positional, a `--issue-only` that is
+not the first argument, and an env target combined with either argv form are all usage
+errors (exit 2) — never a silent fall-through to the merge-time (PR) gate, and never a silent
+drop of the target you meant.
+
+**On failure — BLOCK.** The one remedy that clears check (d) **before** the PR exists is a
+`Wiring` table in the scoping comment (issue-scoping — the table is part of its output); a
+`docs/plans/YYYY-MM-DD-issue-NNN-slug.md` plan doc (writing-plans) also satisfies check (d)
+at merge time but `--issue-only` cannot see it, so do not respond to a preflight (d) failure
+with a plan doc alone. Posting the scoping comment is the fix for check (b). Doing it here
+costs seconds; doing it after the review loop costs the review loop. This step does **not**
+change the gate's verdict logic — `ISSUE_ONLY=0` is the only path a PR takes.
+
 ### Micro Tier Auto-Detection & Gate Behavior
 
 When `TIER = Micro` or auto-detected (1 file, <20 added lines, no migrations, or docs/CSS/static-only per 02-commit-pr.md Step 1.5).
@@ -263,11 +341,11 @@ Mechanism separation: the VGATE content-shape skip is extension-side and shape-b
 | Verification-gate (VGATE) | **shape-gated, not tier-gated** — docs/CSS/static-only sets skip regardless of tier; code sets never skip (see Pi Extension Gates → Verification Gate below) |
 | Lint/Typecheck | **KEPT** — runs in pre-commit hooks, zero agent overhead |
 | Code review (Step 3) | **SKIPPED** — per commit-workflow/03-code-review.md |
-| Pipeline-compliance CI gate (check a) | **KEPT — issue link required at EVERY tier, docs-only micro included (#488)** — the script's micro exemption skips checks b–e (scoping/review/plan evidence), and the docs-only shape exemption covers only check e (test evidence); no carve-out exists or is planned for the linked-issue requirement. See the #488 note below. |
+| Pipeline-compliance CI gate (check a) | **KEPT — issue link required at EVERY tier, docs-only micro included (#488)** — the script's micro exemption skips checks b–e (scoping/review/plan evidence), and the docs-only shape exemption covers only check e (test evidence); no carve-out exists or is planned for the linked-issue requirement in a PR run. See the #488 note below. |
 
 **Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code), and VGATE's own [VGATE] verification dispatch satisfies the review-enforcer ≥1-dispatch rule before the commit — micro code sets clear the gate with no extra ceremony. The residual case the uniform block closes is the docs-only micro commit: VGATE shape-exempts it and the multi-agent code-review gate is skipped at micro, so the ≥1 dispatch must come from a lightweight reviewer dispatch (even a trivial one-line review counts).
 
-**#488 decision — the pipeline-compliance issue-link requirement (check a) is KEPT for docs-only shape-exempt commits, as a deliberate audit invariant.** The audit (scripts/check-pipeline-compliance.sh): check a is unconditional — it runs at every tier and every file shape; `complexity:micro` skips checks b–e (scoping comment, code-review evidence, plan doc) and the docs/skills/templates/config-only shape exemption covers only check e (test coverage — it exempts nothing about the linked issue). No docs-only carve-out exists in the script or the workflow. KEEP rationale: (1) a docs-only commit now skips VGATE (#472 shape exemption) and the multi-agent code-review gate (micro), so check a is the only deterministic, CI-enforced content gate left on it — the review-enforcer ≥1-dispatch floor is content-free by design (#485); (2) the #485 audit documented that the "docs are low-consequence" premise fails for the contract-doc subclass (skills/*.md edits encode agent behavior for every future session — #475/#492), so docs-only commits are exactly the class that must keep tracing to a deliberate issue; (3) friction is negligible for pipeline-shaped work — Issue Detection above resolves an issue before every PR-opening commit (the permitted `'none'` answer leaves no PR that check a would pass — a no-issue docs change must go through issue-creation first, which is the intended remedy, not a gate exemption). Relaxing would reopen a no-content-gate path for contract-doc changes and break the gate's "every PR traces to an issue" audit claim. No script or test change — this is a documented-rationale decision (#488).
+**#488 decision — the pipeline-compliance issue-link requirement (check a) is KEPT for docs-only shape-exempt commits, as a deliberate audit invariant.** This holds for **every PR run** — the #792 `--issue-only` preflight evaluates the linked issue's artifacts directly (there is no PR body to parse) and never runs in CI, so the invariant below is unchanged. The audit (scripts/check-pipeline-compliance.sh): in a PR run check a is unconditional — it runs at every tier and every file shape; `complexity:micro` skips checks b–e (scoping comment, code-review evidence, plan doc) and the docs/skills/templates/config-only shape exemption covers only check e (test coverage — it exempts nothing about the linked issue). No docs-only carve-out exists in the script or the workflow. KEEP rationale: (1) a docs-only commit now skips VGATE (#472 shape exemption) and the multi-agent code-review gate (micro), so check a is the only deterministic, CI-enforced content gate left on it — the review-enforcer ≥1-dispatch floor is content-free by design (#485); (2) the #485 audit documented that the "docs are low-consequence" premise fails for the contract-doc subclass (skills/*.md edits encode agent behavior for every future session — #475/#492), so docs-only commits are exactly the class that must keep tracing to a deliberate issue; (3) friction is negligible for pipeline-shaped work — Issue Detection above resolves an issue before every PR-opening commit (the permitted `'none'` answer leaves no PR that check a would pass — a no-issue docs change must go through issue-creation first, which is the intended remedy, not a gate exemption). Relaxing would reopen a no-content-gate path for contract-doc changes and break the gate's "every PR traces to an issue" audit claim. No script or test change — this is a documented-rationale decision (#488).
 
 ## Wiring-Gap Check (canary-fix PRs only)
 
@@ -518,81 +596,3 @@ fallback and rebase/cherry-pick push-leg de-flooding (#737) are deliberate non-g
 **Threshold semantics (#561):** `dispatchStreak` counts only dispatch-FORMAT failures (empty/no-text/unparseable/refused) and escalates MESSAGING at 3 — it never disables or bypasses anything. The gate NEVER auto-disables for task sub-agents (#285). FAIL verdicts and zero-merge PASSes are successful dispatches (#132) — they add a remedy line but do not move the streak. Any successful merge resets the streak. In an interactive session only, 3 consecutive format failures still auto-disable the gate (unchanged), now recorded to the audit log.
 
 **Observing / clearing bridge state (#561):** `$AGENT_INFRA_PATH/scripts/vgate.sh status` prints the bridge file (`~/.pi/agent/verification/latest.json`) with per-entry root/file/stored-hash + disk match-or-drop preview and the audit tail. `vgate.sh clear` drops the CURRENT worktree root's entries; `clear --root <R>` and `clear --all` target other scopes. Fail-closed: clearing only removes verified state — the next git op re-blocks until re-verified; it is never a bypass. A live session's in-session registry is process-local (not affected by the CLI) — a stuck block inside a running session is cured by the gate's own diagnostics + escalation above, not by the CLI.
-
----
-
-### Test-Review Hash Backstop Gate
-
-**Purpose:** Ensure every test file has passed test-review before commit. Complements VGATE (which verifies file content quality) by verifying test correctness. Catches any code path that bypassed the test-writing → test-review mandatory gate.
-
-**When:** Standard+Complex tier commits where staged files include `.ts`, `.tsx`, `.py`, `.sql`, `.js`, or `.jsx`.
-
-**Skip:** Micro tier commits (tier-gated — the Mechanism below reads the issue's `complexity:*` LABEL, the same canonical channel Tier Detection above uses; #515 removed the earlier body-substring grep, which false-skipped Standard issues whose bodies merely mention `complexity:micro` in prose — prose mentions are not a tier signal, and the Standard PR class most likely to name the tier is pipeline-policy edits like this file. VGATE remains shape-gated, never micro-gated), or commits with no matching file extensions.
-
-**Mechanism:**
-
-```bash
-# Skip for micro tier — the complexity LABEL is the canonical tier source (Tier Detection
-# above reads the same label); a body-substring grep would false-positive on Standard issue
-# bodies that mention 'complexity:micro' in prose, silently skipping the gate (#515)
-IS_MICRO=$(gh issue view <N> --json labels --jq '.labels[].name' | grep -q '^complexity:micro$' && echo true || echo false)
-[ "$IS_MICRO" = "true" ] && exit 0
-
-# Check for testable files
-STAGED=$(git diff --cached --name-only)
-HAS_TESTABLE=$(echo "$STAGED" | grep -qE '\.(ts|tsx|py|sql|js|jsx)$' && echo true || echo false)
-[ "$HAS_TESTABLE" != "true" ] && exit 0
-
-# Check each test file for test-review hash
-for FILE in $(echo "$STAGED" | grep -E '\.(test|spec|e2e)\.(ts|tsx)$|\.pg$|\.py$'); do
-  # Skip deleted files
-  git diff --cached --diff-filter=D -- "$FILE" | grep -q . && continue
-  
-  ABS_PATH=$(realpath "$FILE" 2>/dev/null || readlink -f "$FILE" 2>/dev/null || echo "$FILE")
-  if command -v sha256sum >/dev/null 2>&1; then
-    FILE_HASH=$(echo -n "$ABS_PATH" | sha256sum | cut -d' ' -f1)
-  else
-    FILE_HASH=$(echo -n "$ABS_PATH" | shasum -a 256 | cut -d' ' -f1)
-  fi
-  HASH_FILE="$HOME/.pi/agent/test-review/${FILE_HASH}.json"
-  
-  if [ ! -f "$HASH_FILE" ]; then
-    echo "⛔ BLOCKED: test-review never completed for $FILE"
-    echo "   Run test-writing → test-review before committing."
-    exit 1
-  fi
-  
-  STATUS=$(python3 -c "import json; print(json.load(open('$HASH_FILE'))['status'])" 2>/dev/null || echo "ABSENT")
-  
-  case "$STATUS" in
-    CLEAN)
-      echo "✅ $FILE — test-review: CLEAN"
-      ;;
-    CAPPED)
-      ISSUES=$(python3 -c "import json; d=json.load(open('$HASH_FILE')); print('; '.join(i['description'][:80] for i in d.get('capped_issues',[])))" 2>/dev/null || echo "unknown")
-      echo "⚠️ $FILE — test-review: CAPPED ($ISSUES)"
-      ;;
-    *)
-      echo "⛔ BLOCKED: invalid hash status '$STATUS' for $FILE"
-      exit 1
-      ;;
-  esac
-done
-
-# TTL cleanup: remove hashes older than 30 days
-find "$HOME/.pi/agent/test-review/" -name '*.json' -mtime +30 -delete 2>/dev/null || true
-
-# Orphan cleanup: remove hashes where test file no longer exists
-for HF in "$HOME/.pi/agent/test-review/"*.json; do
-  [ ! -f "$HF" ] && continue
-  FP=$(python3 -c "import json; print(json.load(open('$HF')).get('test_file_path',''))" 2>/dev/null || true)
-  [ -n "$FP" ] && [ ! -f "$FP" ] && rm -f "$HF"
-done
-```
-
-**Tri-state verdict:**
-- **ABSENT** (no hash file) → **BLOCK** — test-review was never completed
-- **CAPPED** (hash exists, status=CAPPED) → **WARN** — proceed with documented issues
-- **CLEAN** (hash exists, status=CLEAN) → proceed
-
-**Post-commit cleanup:** After successful commit, delete consumed hash files for CLEAN-status files in this commit.

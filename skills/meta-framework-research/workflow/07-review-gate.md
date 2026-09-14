@@ -63,7 +63,7 @@ task(prompt='<review prompt from 7.2>')
 
 **Stall conditions:**
 - N > 3 (max cycles reached) → document unresolved issues, proceed to 7.6
-- Fingerprint stall (≥80% same issues across 2 cycles) → document, proceed
+- Recurring unresolved issues (≥80% identical across 2 cycles) → document, proceed. **This is this gate's own rule, not the 3-layer stuckness detector** — do not reuse the detector's `fingerprint-stall` name or its escalate-to-human outcome for this continue-and-proceed path.
 
 ### 7.6 Completion
 Review gate complete. Meta-framework document is ready.

@@ -107,7 +107,7 @@ python3 tools/collision_preflight.py <N>   # ONLY exit 0 authorizes dispatch
 | `epic` | any | `epic-workflow` | Full: 6 stages, all review gates, 3 human gates |
 | `project` | any | `project-workflow` | Proportional: shared sub-skills, reduced depth |
 | `task` | `micro` (or all-low) | `task-workflow` | Inline: all 6 stages, no sub-skill dispatch |
-| `task` | `standard` \| `complex` (or missing/unknown) | `task-workflow-standard` | Gated: 2 parallel verifiers at scope AND plan before implementation |
+| `task` | `standard` \| `complex` (or missing/unknown) | `task-workflow-standard` | Gated: scope verifiers per `issue-scoping` §Tier Scaling, plan reviewers per `proportional-gates` §Review Cycles — before implementation |
 
 **Task complexity routing rules:**
 

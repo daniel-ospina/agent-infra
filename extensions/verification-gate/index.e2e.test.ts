@@ -18,13 +18,33 @@
 import { ok, equal } from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 // ── Isolation: bridge lives under a temp HOME (never touch the real one) ──
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "vgate-e2e-"));
 process.env.HOME = TEST_ROOT;
+// #851 — give the hermetic temp HOME a git identity. Without it, every `git commit`
+// in a scenario depends on the AMBIENT identity git auto-detects from the user name and
+// hostname: on a dev machine that resolves to a non-empty name (so the suite passed),
+// while on a GitHub runner it resolves to `runner@<host>` with an EMPTY name and git
+// aborts with `fatal: empty ident name (for <runner@…>) not allowed`. Scenario #3255
+// does not set the identity inline (59 sibling scenarios do, which papered over the
+// instance), so `extension-tests / unit-test` was RED on main for every merge — see
+// #851. A global config inside the temp HOME fixes the CLASS and makes the file's
+// "hermetic" claim true — but ONLY together with the overrides below: an ambient
+// `GIT_CONFIG_GLOBAL` takes precedence over `$HOME/.gitconfig`, and `GIT_AUTHOR_*` /
+// `GIT_COMMITTER_*` override the config outright, so relying on the file alone would
+// leave the runner failure reachable through any of them.
+const TEST_GITCONFIG = join(TEST_ROOT, ".gitconfig");
+writeFileSync(TEST_GITCONFIG, "[user]\n\tname = vgate-e2e\n\temail = e2e@test\n");
+process.env.GIT_CONFIG_GLOBAL = TEST_GITCONFIG;
+process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+for (const k of [
+  "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+  "EMAIL", "GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE",
+]) delete process.env[k];
 // The gate under test must be ACTIVE — clear the escape hatch if the parent
 // environment inherited it (sub-agent sessions pre-disable extension gates).
 delete process.env.ELDATO_SKIP_VGATE;
@@ -116,10 +136,10 @@ const fakePi: any = {
     handlers.get(evt)!.push(h);
   },
 };
-async function fire(evt: string, event: any): Promise<any> {
+async function fire(evt: string, event: any, ctx: any = {}): Promise<any> {
   let result: any = undefined;
   for (const h of handlers.get(evt) ?? []) {
-    const r = await h(event, {});
+    const r = await h(event, ctx);
     if (r !== undefined) result = r;
   }
   return result;
@@ -4057,6 +4077,177 @@ async function main() {
     ok(res.reason.includes("feat80.ts"), "80: the block names the branch-authored file");
     ok(!res.reason.includes("basesub.ts"),
       "80: and does NOT name the base-identical incoming path — the push-leg de-flood");
+  });
+
+  // ── #3255: the git-op root must come from the cwd the runtime actually spawns
+  // the command in (ctx.cwd), NOT process.cwd(). The first attempt at this fix
+  // instead INFERRED the root from the verification bridge, which let a clean
+  // adopted tree produce an empty scope and silently ALLOW an op whose
+  // unverified content lived in the session's real tree. This pins the plumbing
+  // that replaced it: with no `input.cwd`, the root follows `ctx.cwd`. Ignoring
+  // ctx (falling back to process.cwd()) must turn this red.
+  test("scenario #3255: ctx.cwd decides the git-op root when input carries no cwd", async () => {
+    const hub = join(TEST_ROOT, "cwd-hub");
+    const wt = join(TEST_ROOT, "cwd-wt");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -q -b main");
+    writeFileSync(join(hub, "base.txt"), "base\n");
+    git(hub, "add base.txt");
+    git(hub, "commit -m baseline");
+    git(hub, `worktree add -q ${wt} -b wtbranch`);
+
+    // An unverified staged change exists in the WORKTREE ...
+    writeFileSync(join(wt, "wtfile.txt"), "v1\n");
+    git(wt, "add wtfile.txt");
+
+    // ... while the HUB has nothing staged, so the two roots are observably different.
+    const fromWt = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ctx'" }, // no input.cwd — ctx.cwd is the only signal
+    }, { cwd: wt });
+    ok(fromWt && fromWt.block === true,
+      "ctx.cwd=worktree must scope the op to the worktree and BLOCK on its unverified staged file");
+    ok(fromWt.reason.includes("wtfile.txt"),
+      "the block must name the worktree's own file, not another tree's");
+
+    const fromHub = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ctx'" },
+    }, { cwd: hub });
+    equal(fromHub, undefined,
+      "ctx.cwd=hub is clean → allowed; the two fires must DIFFER (identical results would mean ctx is ignored)");
+  });
+
+  // ── #920 (O3): a changed file whose worktree copy is UNREADABLE is not a
+  // deleted one. The verify loop's bare `catch { continue }` treated EVERY
+  // read failure as ENOENT (deletion) and skipped the file → it was never
+  // named `unverified`, so the gate printed `✅ … verified — allowing` for a
+  // file it never read. `chmod 000` is the exploit primitive: the staged
+  // content is still committed by the bare commit. RED pre-fix (allow),
+  // GREEN post-fix (block). No other test in either suite chmods anything.
+  test("scenario 920: unreadable changed file (EACCES, not ENOENT) must BLOCK, never be skipped as deleted", async () => {
+    const repo = join(TEST_ROOT, "repo-920-eacces");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base920.txt"), "b\n");
+    git(repo, "add base920.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "unreadable920.ts"), "staged content\n");
+    git(repo, "add unreadable920.ts"); // staged — a bare commit records the index blob
+    await fire("session_start", {});
+    chmodSync(join(repo, "unreadable920.ts"), 0o000); // worktree copy unreadable (owner denied)
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m unreadable", cwd: repo },
+      });
+      ok(res && res.block === true,
+        "920: an EACCES (mode-000) changed file must BLOCK — RED pre-fix: the bare catch treated it as deleted and ALLOWED an unreadable-but-staged file");
+      ok(res.reason.includes("unreadable920.ts"),
+        "920: the block names the unreadable file — it is unverified, not content-free like a deletion");
+    } finally {
+      // Never leak a 000 fixture: restore the mode so cleanup (rmSync) succeeds.
+      chmodSync(join(repo, "unreadable920.ts"), 0o644);
+    }
+  });
+
+  // ── #920 (O3) cycle-1 review, P1: `ENOTDIR` is NOT "genuinely absent".
+  // A path COMPONENT replaced by a non-directory (a D/F conflict) still leaves
+  // the INDEX holding a staged blob for that path, which a bare `git commit`
+  // records. Putting `ENOTDIR` in the skip set therefore re-opened the very
+  // fail-open the EACCES case above closes, through another errno: the gate
+  // printed `✅ N files verified — allowing` for a file it never read. The
+  // discriminator is the INDEX, not the errno — `git ls-files -z --
+  // :(top,literal)<path>` (non-empty stdout ⇒ an index entry exists ⇒ the
+  // commit records content ⇒ BLOCK; empty stdout at exit 0 ⇒ a deletion ⇒
+  // skip; any probe fault ⇒ fail CLOSED). The three legs below pin every
+  // branch of that discrimination:
+  //   (a) ENOTDIR + index entry present (staged `M` row)  → BLOCK
+  //   (b) ENOTDIR + index entry absent  (staged `D` row)  → skip, never named
+  //   (c) ENOENT  (a genuine deletion)                    → skip (49b/55c policy)
+  // (a) is RED pre-fix (the skip set let the staged blob through unverified);
+  // (b)/(c) are policy pins — green either side of the fix, and (b) is what a
+  // naive "just drop ENOTDIR from the skip set" would break.
+  test("scenario 920 (P1): ENOTDIR from a D/F conflict WITH an index entry must BLOCK, never be skipped as deleted", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enotdir-indexed");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    mkdirSync(join(repo, "dfdir920"), { recursive: true });
+    writeFileSync(join(repo, "dfdir920", "inner920.ts"), "v1\n");
+    git(repo, "add dfdir920/inner920.ts");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "dfdir920", "inner920.ts"), "v2 staged content\n");
+    git(repo, "add dfdir920/inner920.ts"); // staged M row — a bare commit records this blob
+    // D/F conflict: replace the parent DIRECTORY with a regular FILE, so the
+    // child read throws ENOTDIR while the index still holds the staged blob.
+    rmSync(join(repo, "dfdir920"), { recursive: true, force: true });
+    writeFileSync(join(repo, "dfdir920"), "now a file\n");
+    await fire("session_start", {});
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m dfconflict", cwd: repo },
+      });
+      ok(res && res.block === true,
+        "920 (P1): ENOTDIR with an index entry must BLOCK — RED pre-fix: ENOTDIR was skipped as a deletion, so the staged blob was allowed unverified");
+      ok(res.reason.includes("dfdir920/inner920.ts"),
+        "920 (P1): the block names the D/F child — it has staged content, it is not content-free like a deletion");
+    } finally {
+      // Deterministic fixture teardown: restore the directory shape.
+      rmSync(join(repo, "dfdir920"), { recursive: true, force: true });
+    }
+  });
+
+  test("scenario 920 (P1): ENOTDIR on a genuine DELETION row (no index entry) must still be skipped, never name-blocked", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enotdir-deleted");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    mkdirSync(join(repo, "dfdir920b"), { recursive: true });
+    writeFileSync(join(repo, "dfdir920b", "inner920.ts"), "v1\n");
+    git(repo, "add dfdir920b/inner920.ts");
+    git(repo, "commit -m base");
+    git(repo, "rm dfdir920b/inner920.ts"); // staged D row — content-free
+    // Same D/F conflict shape, but the index holds NO entry: the row is a
+    // deletion, so the read failure must stay a skip (the errno alone cannot
+    // tell this from leg (a) — that is exactly why the probe exists).
+    rmSync(join(repo, "dfdir920b"), { recursive: true, force: true });
+    writeFileSync(join(repo, "dfdir920b"), "now a file\n");
+    await fire("session_start", {});
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m dfconflict-del", cwd: repo },
+      });
+      equal(res, undefined,
+        "920 (P1): ENOTDIR with NO index entry is a deletion — it must be skipped, never block (dropping ENOTDIR from the skip set would red here)");
+    } finally {
+      rmSync(join(repo, "dfdir920b"), { recursive: true, force: true });
+    }
+  });
+
+  test("scenario 920 (P1): ENOENT (a genuine deletion) must still be skipped — the pinned deletion policy", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enoent-deleted");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "gone920.ts"), "v1\n");
+    git(repo, "add gone920.ts");
+    git(repo, "commit -m base");
+    git(repo, "rm gone920.ts"); // staged deletion AND worktree copy removed → ENOENT
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m del920", cwd: repo },
+    });
+    equal(res, undefined,
+      "920 (P1): ENOENT = genuinely absent = content-free — a deletion must still be skipped (policy pinned by 49b/55c)");
   });
 
 } // main: plugin loaded; tests run sequentially via runAll()

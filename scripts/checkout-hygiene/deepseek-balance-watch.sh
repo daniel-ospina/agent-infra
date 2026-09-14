@@ -107,7 +107,7 @@ probe_triple() { # <output>
   BODY="$(printf '%s\n' "$1" | sed '$d' | sed '$d')"
   CODE="$(printf '%s\n' "$1" | tail -2 | head -1)"
   TIME_T="$(printf '%s\n' "$1" | tail -1)"
-  if [ -z "$CODE" ] || ! printf '%s' "$CODE" | grep -qE '^[0-9]{3}$'; then
+  if [ -z "$CODE" ] || ! grep -qE '^[0-9]{3}$' <<<"$CODE"; then
     CODE="000"; TIME_T=""; BODY=""
   fi
 }

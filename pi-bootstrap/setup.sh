@@ -278,15 +278,16 @@ if [ -d "$scripts_dir" ]; then
   echo "    scripts/checkout-hygiene farm: $copied copied (real files, #427)"
 fi
 
-# Fleet-scripts farm (#373 + #469): the weekly fleet-cost cadence runs under
-# launchd (com.eldato.fleet-cost-weekly plist) and the pi-session reaper runs
-# hourly (com.eldato.pi-session-reaper plist) — launchd cannot read
-# ~/Documents (same TCC wall as #427). session-postmortem.sh (the shared
-# parser), the report, the watch, the weekly driver, and the reaper must ALL
-# sit in ~/.pi/agent/scripts so the drivers' sibling calls resolve and the
-# plists' ProgramArguments targets exist (broken-target guard). Same
-# idempotent real-copy refresh model.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh)
+# Fleet-scripts farm (#373 + #469 + #783): the weekly fleet-cost cadence runs
+# under launchd (com.eldato.fleet-cost-weekly plist), the pi-session reaper runs
+# hourly (com.eldato.pi-session-reaper plist), and the Task 6 child-session
+# retention sweep runs hourly (com.eldato.pi-task-session-prune plist) —
+# launchd cannot read ~/Documents (same TCC wall as #427).
+# session-postmortem.sh (the shared parser), the report, the watch, the weekly
+# driver, the reaper, and the prune sweep must ALL sit in ~/.pi/agent/scripts so
+# the drivers' sibling calls resolve and the plists' ProgramArguments targets
+# exist (broken-target guard). Same idempotent real-copy refresh model.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -304,14 +305,12 @@ done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 
 # Merge-gate scripts farm (#562): record-review.sh — the review-enforcer's
-# merge-registry writer (issue #138). NOT launchd-invoked (pi-session code
-# resolves it explicitly: code-review SKILL.md Step 10 + commit-workflow
-# 04-merge-deploy), so it never joined the #427/#373 farms and drifted: the
-# repo copy is CI-tested while production mints execute the ~/.pi copy, and
-# nothing refreshed the latter until a manual copy (the #513 clean-micro
-# guard sat on main 09-07 while ~/.pi/agent/scripts/record-review.sh stayed
-# pre-guard 09-04). Same idempotent real-copy refresh model as the farms
-# above — every sync re-applies the repo copy.
+# merge-registry writer (issue #138).
+# NOT launchd-invoked (pi-session code resolves record-review.sh explicitly:
+# code-review SKILL.md Step 10 + commit-workflow 04-merge-deploy), so it never
+# joined the #427/#373 farms and drifted: the repo copy is CI-tested while
+# production mints execute the ~/.pi copy. Same idempotent real-copy refresh
+# model as the farms above.
 merge_gate_srcs=(record-review.sh)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0

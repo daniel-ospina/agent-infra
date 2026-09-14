@@ -76,6 +76,45 @@ jobs:
       - name: Cost-config guard tests (fixtures, detect-not-block semantics)
         run: bash tests/cost-config/run.sh
 
+  sigpipe-grep:
+    # #841/#861 — the builtin-writer SIGPIPE false-negative guard. `printf`/`echo`
+    # piped into a quiet `grep` under `pipefail` can report "not found" for a
+    # match that IS present (the writer takes SIGPIPE once grep exits early on a
+    # multiline payload), silently turning a guard into a pass. The scan set is
+    # scripts/, .husky/ and pi-bootstrap/. This job is the WIRING — #863 shipped
+    # the guard unwired because adding this job required editing a guarded file
+    # while no independent model was funded (#860), which is exactly the "guard
+    # nobody runs" failure the guard exists to prevent.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SIGPIPE false-negative guard (the scan set must be clean)
+        run: bash scripts/check-no-sigpipe-grep.sh
+      - name: SIGPIPE guard suite (detection, continuations, exceptions, positive controls)
+        run: bash tests/sigpipe-grep/run.sh
+
+  admin-merge:
+    # #930 — the safe-admin-merge rail. `--admin` bypasses required checks, so
+    # nothing makes it *safe*: it cannot tell a check already red on main from a
+    # NEW failure the PR introduces (tortoise #3420 merged carrying a test that
+    # was not in main's failing set, and main ratcheted redder). This job is the
+    # per-PR half: scripts/ci-failure-set.sh is the ONE parser, and
+    # scripts/admin-merge.sh is the chokepoint (union baseline + flake re-run +
+    # head-bound evidence). The refusal half (a raw `gh pr merge --admin`
+    # without evidence) is pinned by extensions/review-enforcer/index.test.ts.
+    # Hermetic: a fake `gh` serves every call — no network, no provider keys.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Safe admin-merge rail suite (parser, #3469 trap, flake, parity)
+        run: bash tests/admin-merge/run.sh
+      - name: Argv-level admin-merge guard suite (#984)
+        # The layer that makes obfuscation irrelevant: the shim inspects its OWN argv,
+        # where bash has already resolved `-${V:--}admin=true` into `--admin`. The
+        # suite drives the real shim through a real shell with the splices that
+        # defeated the string scanner, and asserts refusal.
+        run: bash tests/gh-shim/run.sh
+
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
     # every extensions/ top-level entry except *.test.ts must be farm-wired
@@ -165,11 +204,11 @@ jobs:
         # WITHOUT `npm ci`, which this job does not perform.
         run: npx tsx extensions/shared/default-coverage.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
-        # The guard's bash-git classifier degraded SILENTLY in every session
-        # from #697 until #744 (five rename-destructuring targets declared
-        # nowhere → ReferenceError at module load, swallowed by the load
-        # try/catch, leaving the fail-safe defaults for the bindings at or after
-        # the abort point bound). No gate could see it: the
+        # The guard's bash-git classifier lost its LATER bindings SILENTLY in
+        # every session from #697 until #744 (five rename-destructuring targets
+        # declared nowhere → ReferenceError at module load, swallowed by the
+        # load try/catch, leaving the fail-safe defaults for the bindings at or
+        # after the abort point bound). No gate could see it: the
         # sibling extensions/main-worktree-guard/test.mjs imports
         # classify-git.mjs DIRECTLY, and the extensions/*/test*.mjs glob is
         # post-merge only (ci-main.yml). Its own step here, not a second
@@ -178,6 +217,31 @@ jobs:
         # invocation.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~30s.
         run: node extensions/main-worktree-guard/test-module-load.mjs
+      - name: main-worktree-guard working-tree-discard gate (#709)
+        # The discard family used to be gated on git ARGV, so `git checkout --
+        # <path>` (the 2026-09-10 incident verb) classified `allow` and every
+        # other discard verb was exempt in linked worktrees — exactly where the
+        # `pi -p` review fixers run. #709 keys the gate on the EFFECT instead.
+        # Behavioral: loads the REAL index.ts through module-load-hooks.mjs and
+        # drives the tool_call handler against a hermetic hub + linked worktree.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s. Its own
+        # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
+        # not PR-triggered); perf-parity with the #744 step above.
+        run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: entry-point guard symlink regression (#708)
+        # The entry-point idiom `pathToFileURL(process.argv[1]).href ===
+        # import.meta.url` is symlink-SENSITIVE (pathToFileURL does no fs
+        # resolution; the ESM loader realpaths import.meta.url), so ANY
+        # symlinked invocation path made the guard body skip and the #254
+        # fail-closed frontmatter gate exit 0 having printed NOTHING —
+        # indistinguishable from a clean run. macOS `mktemp -d` is under `/var`
+        # and every bootstrapped consumer repo symlinks `scripts/` (#387), so
+        # this is the normal case, not an edge case.
+        # Its own step (like #744/#709 above) because the
+        # `extensions/*/test*.mjs` glob in ci-main.yml is POST-MERGE only.
+        # Positive control: spawns the REAL gates through symlinked paths.
+        # Zero-dep (`node:*` only), no `npm ci`, ~3s.
+        run: node extensions/shared/test-is-main.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).

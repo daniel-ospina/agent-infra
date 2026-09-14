@@ -49,7 +49,7 @@
  */
 
 import os from "node:os";
-import { pathToFileURL } from "node:url";
+import { isMain } from "./is-main.mjs";
 
 export const DEFAULT_SUSPEND_MULT = 2.5;
 export const DEFAULT_RESUME_MULT = 1.5;
@@ -152,8 +152,8 @@ export function run(argv, deps) {
   return go ? 0 : 3;
 }
 
-const isMain =
-  process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
-if (isMain) {
+// #708 — symlink-insensitive: a symlinked invocation path must not make the
+// load gate print nothing and exit 0 (which reads as «load is fine, go»).
+if (isMain(import.meta.url, process.argv[1])) {
   process.exit(run(process.argv, {}));
 }

@@ -39,10 +39,10 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi }
-assert_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi }
-assert_not_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
-assert_reap_eligible() { if printf '%s' "$1" | grep -q "REAP-ELIGIBLE"; then ok "$2"; else bad "$2"; fi }
-assert_skipped_reason() { if printf '%s' "$1" | grep -qF -- "$3"; then ok "$2"; else bad "$2 (missing reason: $3)"; fi }
+assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi }
+assert_not_contains() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
+assert_reap_eligible() { if grep -q "REAP-ELIGIBLE" <<<"$1"; then ok "$2"; else bad "$2"; fi }
+assert_skipped_reason() { if grep -qF -- "$3" <<<"$1"; then ok "$2"; else bad "$2 (missing reason: $3)"; fi }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-test.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
@@ -78,6 +78,18 @@ cat > "$T/bin/ps" <<'SHIM'
 #!/usr/bin/env bash
 SOURCE="${FAKE_PS_SOURCE:?}"
 if [ "${1:-}" = "-axo" ]; then
+    # Deterministic bulk-call failure injection (settle-time probe tests):
+    # FAKE_PS_BULK_LOG counts bulk calls; from FAKE_PS_FAIL_BULK_N onward the
+    # call fails (rc 1). FAKE_PS_FAIL_PARTIAL=1 still prints the rows first
+    # (a partly-failed `ps`). Absent env => unchanged behaviour.
+    if [ -n "${FAKE_PS_BULK_LOG:-}" ]; then
+        _bn=0; [ -s "$FAKE_PS_BULK_LOG" ] && _bn="$(cat "$FAKE_PS_BULK_LOG")"
+        _bn=$(( _bn + 1 )); printf '%s\n' "$_bn" > "$FAKE_PS_BULK_LOG"
+        if [ -n "${FAKE_PS_FAIL_BULK_N:-}" ] && [ "$_bn" -ge "$FAKE_PS_FAIL_BULK_N" ]; then
+            [ "${FAKE_PS_FAIL_PARTIAL:-0}" = "1" ] && sed 's/^ *//' "$SOURCE"
+            exit 1
+        fi
+    fi
     sed 's/^ *//' "$SOURCE"
     # Inject a self row whose pid is the REAPER, not the shim. The reaper
     # exports PI_REAP_SELF_PID=$$ on its bulk ps call (real ps ignores it) —
@@ -120,7 +132,7 @@ fi
 SIG="${1#-}"
 TARGET="${2#-}"
 case "$SIG" in TERM|KILL) ;; *) exit 0 ;; esac
-if [ -n "${FAKE_ESRCH_PIDS:-}" ] && printf '%s\n' "$FAKE_ESRCH_PIDS" | grep -qx "$TARGET"; then
+if [ -n "${FAKE_ESRCH_PIDS:-}" ] && grep -qx "$TARGET" <<<"$FAKE_ESRCH_PIDS"; then
     exit 1
 fi
 exit 0
@@ -927,6 +939,733 @@ assert_contains "$(cat "$T/C29/kill.log")" "kill -TERM -12126" "C29 candidate A 
 assert_not_contains "$(cat "$T/C29/kill.log")" "kill -TERM -12129" "C29 candidate B suppressed (no TERM) when deciding file deleted"
 assert_contains "$(cat "$T/C29/reap.log")" "cannot re-probe deciding file" "C29 re-probe-failure suppress reason logged"
 rm -rf "$T/C29"
+
+echo "fixture pack D: bounded veto — stuck classification + arm (#947)"
+mk_env D
+make_lookup "$T/D/date.lookup"
+FAKE_SELF_TTY=tts900
+# Real epochs for the two-signal staleness fixtures (122h and 40h before NOW).
+E_AUG31_0000="$(python3 -c 'import datetime;print(int(datetime.datetime.fromisoformat("2026-08-31T00:00:00+00:00").timestamp()))')"
+E_SEP03_1000="$(python3 -c 'import datetime;print(int(datetime.datetime.fromisoformat("2026-09-03T10:00:00+00:00").timestamp()))')"
+
+# running_record_fixture <pid> <tty> <sid> <cwd> <jsonl-last-iso> <updatedAt|cold>
+# Emits a ps row (S, no children) + one non-idle cmux record. `cold` omits
+# updatedAt (the fail-closed no-freshness-proof case).
+running_record_fixture() { # <pid> <tty> <sid> <cwd> <last-iso> <updatedAt|cold>
+    local pid="$1" tty="$2" sid="$3" cwd="$4" last="$5" upd="$6"
+    printf '%s\n' "$(psrow "$pid" 400000 "$pid" "$tty" "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd $cwd")" > "$T/D/ps-source"
+    if [ "$upd" = cold ]; then
+        printf '{"%s":{"pid":%s,"pidStartSeconds":%s,"agentLifecycle":"running","runtimeStatus":"idle","cwd":"%s"}}' "$sid" "$pid" "$E_SEP3_2000" "$cwd" | cmux_store D
+    else
+        printf '{"%s":{"pid":%s,"pidStartSeconds":%s,"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":%s,"cwd":"%s"}}' "$sid" "$pid" "$E_SEP3_2000" "$upd" "$cwd" | cmux_store D
+    fi
+    session_jsonl D "$cwd" "$sid" "$E_SEP3_2000" "$last"
+}
+
+# D1: a FRESH non-idle record still vetoes — but the skip line now carries the
+# JSONL idle age. Pre-#947 the veto short-circuited BEFORE the JSONL proof, so
+# a 122h-frozen session reported only "allowlist lifecycle=running" and its age
+# was invisible (the silent-failure class this issue is about).
+running_record_fixture 30001 ttys400 d1 /Users/t/d1 "2026-08-31T00:00:00.000Z" "$E_SEP5_0100"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "D1 fresh non-idle record still vetoes (no reap)"
+assert_contains "$OUT" "jsonl idle 122.0h" "D1 veto line surfaces the JSONL idle age (pre-#947 blindness fixed)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D1 fresh non-idle record is NOT stuck"
+rm -rf "$T/D/sessions"
+
+# D2: both independent signals frozen past the bound => STUCK, report-only.
+# Even --apply sends ZERO signals for the stuck set by default.
+running_record_fixture 30002 ttys401 d2 /Users/t/d2 "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$OUT" "STUCK-ESCALATE" "D2 stuck passed the freshness bound -> escalated"
+assert_contains "$OUT" "⚠️ STUCK: 1" "D2 stuck audit block surfaced on stdout (no more silent exit 0)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "D2 stuck is NOT reap-eligible by default"
+[ ! -s "$T/D/kill.log" ] && ok "D2 zero signals for the report-only stuck set" || bad "D2 zero signals for the report-only stuck set"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK=1 STUCK_RSS=30000 STUCK_ARMED=0" "D2 footer records STUCK/STUCK_RSS/STUCK_ARMED=0"
+rm -rf "$T/D/sessions"
+
+# D3: missing updatedAt => no freshness proof => the veto stands (fail closed).
+running_record_fixture 30003 ttys402 d3 /Users/t/d3 "2026-08-31T00:00:00.000Z" cold
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D3 record with no updatedAt is NOT stuck (fail closed)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "D3 no-updatedAt veto preserved"
+rm -rf "$T/D/sessions"
+
+# D4: a live non-zombie child process (a tool call in flight) blocks STUCK.
+# The pre-existing marathon gate only catches *pi* descendants; this catches a
+# long-running bash/tool child. The child must be non-pi so the run reaches the
+# stuck check rather than the earlier `orchestrating` skip.
+running_record_fixture 30004 ttys403 d4 /Users/t/d4 "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+printf '%s\n' "$(psrow 30004 400000 30004 ttys403 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d4")" \
+               "$(psrow 30044 30004 30004 ttys403 "Sat Sep  5 01:00:00 2026" S 0 "/bin/bash -c long-tool")" > "$T/D/ps-source"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D4 live non-pi child (tool in flight) blocks STUCK"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "D4 no reap while a child process is live"
+rm -rf "$T/D/sessions"
+
+# D5: a CPU-accumulating process (stat R) is not provably stuck.
+running_record_fixture 30005 ttys404 d5 /Users/t/d5 "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+printf '%s\n' "$(psrow 30005 400000 30005 ttys404 "Thu Sep  3 20:00:00 2026" R 30000 "/usr/local/bin/pi --cwd /Users/t/d5")" > "$T/D/ps-source"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D5 stat R (accumulating CPU) is not stuck"
+rm -rf "$T/D/sessions"
+
+# D6: the freshness bound is STRICT (>). JSONL + record both exactly 30h stale:
+# --stuck-hours 30 => NOT stuck; --stuck-hours 29 => stuck. Driven through the
+# CLI FLAG (its happy path — parse_args position/`shift 2` bugs would otherwise
+# hide behind the env var) and the resolved bound is pinned from the footer.
+running_record_fixture 30006 ttys405 d6 /Users/t/d6 "2026-09-03T20:00:00.000Z" "$E_SEP3_2000"
+: > "$T/D/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --stuck-hours 30 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D6 exactly-at-bound 30h vs --stuck-hours 30 survives (strict >)"
+assert_contains "$OUT" "allowlist lifecycle=running" "D6 at-bound candidate keeps the plain allowlist skip"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK_HOURS=30" "D6 --stuck-hours 30 resolves into the footer bound"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --stuck-hours 29 2>&1)"
+assert_contains "$OUT" "STUCK-ESCALATE" "D6 30h vs --stuck-hours 29 escalates (strict >)"
+rm -rf "$T/D/sessions"
+
+# D7: --idle-hours moves the default stuck bound (3x) with it. 40h stale:
+# under --idle-hours 12 the bound is 36h => stuck; at the 24h default it is
+# 72h => not stuck.
+running_record_fixture 30007 ttys406 d7 /Users/t/d7 "2026-09-03T10:00:00.000Z" "$E_SEP03_1000"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=12 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"
+assert_contains "$OUT" "STUCK-ESCALATE" "D7 --idle-hours 12 -> bound 36h -> 40h stale is stuck"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D7 default bound 72h -> 40h stale is not stuck"
+rm -rf "$T/D/sessions"
+
+# D8: union freshness — one matched twin with a FRESH updatedAt keeps the veto
+# for the whole pid (least-stale record governs), even with the JSONL frozen.
+running_record_fixture 30008 ttys407 d8 /Users/t/d8 "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+printf '%s' '{"d8a":{"pid":30008,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d8"},"d8b":{"pid":30008,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_SEP5_0100',"cwd":"/Users/t/d8"}}' | cmux_store D
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D8 one fresh matched twin keeps the veto (least-stale governs)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "D8 no reap with a fresh matched record"
+rm -rf "$T/D/sessions"
+
+# D8b: STUCK needs BOTH independent signals frozen. THE kill-path conjunct: a
+# stale record with a FRESH (actively moving) JSONL must never be STUCK —
+# otherwise the arm TERMs a session that is demonstrably working. Without this
+# fixture the `idle_age_h > REAP_STUCK_HOURS` half is unexercised (every other
+# stuck fixture freezes both signals), so deleting it keeps the suite green.
+running_record_fixture 30081 ttys416 d8b /Users/t/d8b "2026-09-05T01:00:00.000Z" "$E_AUG31_0000"
+: > "$T/D/kill.log"
+OUT="$(REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D8b stale record + FRESH jsonl (1h) is NOT stuck"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "D8b stale record + fresh jsonl never eligible"
+assert_not_contains "$OUT" "record stale past" "D8b no stuck escalation text"
+[ ! -s "$T/D/kill.log" ] && ok "D8b stale record + fresh jsonl sent zero signals" || bad "D8b stale record + fresh jsonl sent zero signals"
+rm -rf "$T/D/sessions"
+
+# D8c: freshness unions over EVERY non-idle record for the pid, fence-matched
+# or not. A fresh non-idle record with NO pidStartSeconds abstains from voting
+# (so it cannot veto the ordinary path — 'abstain != veto' is pinned by B2),
+# but it MUST still withhold a STUCK kill: it is direct evidence the pid is
+# being written to right now. Live shape: the store has 56 no-pss records, 4 of
+# them fresh non-idle.
+running_record_fixture 30082 ttys417 d8c /Users/t/d8c "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+printf '%s' '{"d8c":{"pid":30082,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d8c"},"d8c-nopss":{"pid":30082,"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_SEP5_0100',"cwd":"/Users/t/d8c"}}' | cmux_store D
+: > "$T/D/kill.log"
+OUT="$(REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D8c fresh no-pss non-idle twin withholds the STUCK kill"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "D8c fresh no-pss twin never eligible"
+[ ! -s "$T/D/kill.log" ] && ok "D8c fresh no-pss twin sent zero signals" || bad "D8c fresh no-pss twin sent zero signals"
+rm -rf "$T/D/sessions"
+
+# D9: armed stuck reap (REAP_REAP_STUCK=1) — the ONLY path that signals a stuck
+# candidate. Row carries stuck=1; settle guards are unchanged.
+running_record_fixture 30009 ttys408 d9 /Users/t/d9 "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+cat > "$T/D/stuck-side.sh" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+    -TERM) sed -i.bak '/^30009 /d' "$FAKE_PS_SOURCE"; rm -f "$FAKE_PS_SOURCE.bak" ;;
+esac
+SH
+chmod +x "$T/D/stuck-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/stuck-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$OUT" "REAP-ELIGIBLE(STUCK)" "D9 armed stuck candidate is reap-eligible"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30009" "D9 armed stuck TERM group shape"
+assert_contains "$(cat "$T/D/reap.log")" "stuck=1" "D9 SIGNAL line records stuck=1"
+assert_contains "$(cat "$T/D/reap.log")" "KILLED=1" "D9 armed stuck KILLED=1"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK_ARMED=1" "D9 footer records STUCK_ARMED=1"
+rm -rf "$T/D/sessions" "$T/D/stuck-side.sh"
+
+# D10: --reap-stuck flag is the CLI form of REAP_REAP_STUCK=1 (dry-run: no
+# signals, but the candidate is listed as stuck-reapable).
+running_record_fixture 30010 ttys409 d10 /Users/t/d10 "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+: > "$T/D/kill.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --reap-stuck 2>&1)"
+assert_contains "$OUT" "REAP-ELIGIBLE(STUCK)" "D10 --reap-stuck arms the stuck set (dry-run lists it)"
+[ ! -s "$T/D/kill.log" ] && ok "D10 dry-run --reap-stuck sends no signals" || bad "D10 dry-run --reap-stuck sends no signals"
+rm -rf "$T/D/sessions"
+
+# D11: a non-idle candidate with NO JSONL proof still reports the allowlist
+# reason (veto vocabulary precedence preserved by the reorder).
+printf '%s\n' "$(psrow 30011 400000 30011 ttys410 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d11missing")" > "$T/D/ps-source"
+printf '{"d11":{"pid":30011,"pidStartSeconds":%s,"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":%s,"cwd":"/Users/t/d11missing"}}' "$E_SEP3_2000" "$E_AUG31_0000" | cmux_store D
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$OUT" "SKIP allowlist lifecycle=running runtimeStatus=idle" "D11 veto reason wins when there is no JSONL proof"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D11 no proof => never stuck (fail closed)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "D11 no proof => never eligible"
+rm -rf "$T/D/sessions"
+
+# D12: bad --stuck-hours / REAP_REAP_STUCK values are usage errors (exit 2).
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --stuck-hours abc 2>&1)"; RC=$?
+assert_eq "$RC" "2" "D12 bad --stuck-hours exits 2"
+OUT="$(REAP_REAP_STUCK=yes REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "2" "D12 bad REAP_REAP_STUCK exits 2"
+
+# D13: an updatedAt that is digit/dot soup is NOT a freshness stamp. awk would
+# coerce "1.2.3" to 1.2 and ".." to 0 => a huge apparent age => a false STUCK.
+# These must keep the plain veto (fail closed) — review P1.
+for BADSTAMP in '"1.2.3"' '".."' '"."' '"123abc"' '"0"' '"-5"' 'null'; do
+    running_record_fixture 30031 ttys411 d13 /Users/t/d13 "2026-08-31T00:00:00.000Z" cold
+    printf '{"d13":{"pid":30031,"pidStartSeconds":%s,"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":%s,"cwd":"/Users/t/d13"}}' "$E_SEP3_2000" "$BADSTAMP" | cmux_store D
+    : > "$T/D/kill.log"
+    OUT="$(REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+    assert_not_contains "$OUT" "STUCK-ESCALATE" "D13 updatedAt=$BADSTAMP is not a stamp -> not stuck"
+    assert_not_contains "$OUT" "REAP-ELIGIBLE" "D13 updatedAt=$BADSTAMP never eligible"
+    # discriminating: an accepted stamp would print a NUMBER for the record age;
+    # rejection is only observable through the `?` fallback
+    assert_contains "$OUT" "record age ?h" "D13 updatedAt=$BADSTAMP rejected as unusable (age unknown)"
+    [ ! -s "$T/D/kill.log" ] && ok "D13 updatedAt=$BADSTAMP sent zero signals" || bad "D13 updatedAt=$BADSTAMP sent zero signals"
+    rm -rf "$T/D/sessions"
+    : > "$T/D/reap.log"
+    : > "$T/D/kill.log"
+done
+
+# D14: an implausibly future stamp is not a stamp either (negative age would read
+# as fresh, a huge future stamp is garbage) — both keep the veto. Each leg
+# asserts the OBSERVABLE rejection, not just the shared "not stuck" verdict: a
+# deleted upper bound would accept the stamp and print a negative age, which
+# still yields "not stuck" for the wrong reason (review P2).
+for BADSTAMP in "$((NOW + 86400 * 30))" 0 1; do
+    running_record_fixture 30032 ttys412 d14 /Users/t/d14 "2026-08-31T00:00:00.000Z" "$BADSTAMP"
+    : > "$T/D/kill.log"
+    OUT="$(REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+    assert_not_contains "$OUT" "STUCK-ESCALATE" "D14 implausible updatedAt=$BADSTAMP -> not stuck"
+    [ ! -s "$T/D/kill.log" ] && ok "D14 implausible updatedAt=$BADSTAMP sent zero signals" || bad "D14 implausible updatedAt=$BADSTAMP sent zero signals"
+    rm -rf "$T/D/sessions"
+    : > "$T/D/reap.log"
+    : > "$T/D/kill.log"
+done
+# positive control: a stamp 1h in the FUTURE is inside the +86400 skew window,
+# so it IS accepted (age negative) and the veto must hold on freshness grounds —
+# distinguishing "rejected as unusable" from "accepted but negative".
+running_record_fixture 30033 ttys412 d14f /Users/t/d14f "2026-08-31T00:00:00.000Z" "$((NOW + 3600))"
+OUT="$(REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"
+assert_not_contains "$OUT" "STUCK-ESCALATE" "D14 within-skew future stamp is accepted and keeps the veto"
+assert_not_contains "$OUT" "record age ?h" "D14 within-skew future stamp was USED as a stamp (age known)"
+rm -rf "$T/D/sessions"
+
+# D15: STUCK settle re-verify — A's TERM side effect rewrites B's record to
+# idle/fresh => B's FRESH store re-read sees the premise gone and suppresses.
+# Two stuck candidates so A's signal runs before B's settle (deterministic).
+running_record_fixture 30041 ttys413 d15a /Users/t/d15a "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+running_record_fixture 30042 ttys413 d15b /Users/t/d15b "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+printf '%s\n' "$(psrow 30041 400000 30041 ttys413 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15a")" \
+               "$(psrow 30042 400000 30042 ttys413 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15b")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15a d15a "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15b d15b "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+printf '%s' '{"d15a":{"pid":30041,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15a"},"d15b":{"pid":30042,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15b"}}' | cmux_store D
+cat > "$T/D/settle-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        sed -i.bak '/^30041 /d' "\$FAKE_PS_SOURCE"; rm -f "\$FAKE_PS_SOURCE.bak"
+        printf '%s' '{"d15b":{"pid":30042,"pidStartSeconds":$E_SEP3_2000,"agentLifecycle":"idle","runtimeStatus":"idle","updatedAt":$E_SEP5_0100,"cwd":"/Users/t/d15b"}}' > "$T/D/cmux/pi-hook-sessions.json"
+        ;;
+esac
+SH
+chmod +x "$T/D/settle-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/settle-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30041" "D15 candidate A (stuck) TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30042" "D15 candidate B suppressed (store re-read: record now idle)"
+assert_contains "$(cat "$T/D/reap.log")" "stuck row record no longer frozen" "D15 stuck-settle suppress reason logged"
+rm -rf "$T/D/sessions" "$T/D/settle-side.sh"
+
+# D15b: the STUCK settle also re-checks the PROCESS STATE. A's TERM side effect
+# flips B's ps row to `R` (accumulating CPU) => B's stuck-settle stat branch
+# suppresses. Without this fixture that branch is unreachable (D15 only rewrites
+# the store; D9's side deletes the candidate's row, which fails earlier).
+running_record_fixture 30046 ttys418 d15c /Users/t/d15c "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+printf '%s\n' "$(psrow 30046 400000 30046 ttys418 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15c")" \
+               "$(psrow 30047 400000 30047 ttys418 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15d")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15c d15c "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15d d15d "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+printf '%s' '{"d15c":{"pid":30046,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15c"},"d15d":{"pid":30047,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15d"}}' | cmux_store D
+cat > "$T/D/stat-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '%s\n' "30047 400000 30047 ttys418 Thu Sep  3 20:00:00 2026 R 30000 /usr/local/bin/pi --cwd /Users/t/d15d" > "\$FAKE_PS_SOURCE"
+        ;;
+esac
+SH
+chmod +x "$T/D/stat-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/stat-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30046" "D15b trigger candidate TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30047" "D15b stuck row suppressed when the process leaves S at settle"
+assert_contains "$(cat "$T/D/reap.log")" "no longer sleeping" "D15b stat-branch suppress reason logged"
+rm -rf "$T/D/sessions" "$T/D/stat-side.sh"
+
+# D15c: the store re-read FAILING at settle must suppress (fail-closed). Only
+# this fixture reaches stuck_record_still_frozen's store_extract-failure path.
+running_record_fixture 30048 ttys419 d15e /Users/t/d15e "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+printf '%s\n' "$(psrow 30048 400000 30048 ttys419 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15e")" \
+               "$(psrow 30049 400000 30049 ttys419 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15f")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15e d15e "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15f d15f "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+printf '%s' '{"d15e":{"pid":30048,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15e"},"d15f":{"pid":30049,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15f"}}' | cmux_store D
+cat > "$T/D/store-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '%s\n' "30049 400000 30049 ttys419 Thu Sep  3 20:00:00 2026 S 30000 /usr/local/bin/pi --cwd /Users/t/d15f" > "\$FAKE_PS_SOURCE"
+        printf '%s' 'this-is-not-json' > "$T/D/cmux/pi-hook-sessions.json"
+        ;;
+esac
+SH
+chmod +x "$T/D/store-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/store-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30048" "D15c trigger candidate TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30049" "D15c stuck row suppressed when the store re-read fails (fail-closed)"
+assert_contains "$(cat "$T/D/reap.log")" "stuck row record no longer frozen" "D15c store-failure suppress reason logged"
+rm -rf "$T/D/sessions" "$T/D/store-side.sh"
+
+# D15e (review P1): the settle re-verify must mirror classify's UNION, not just
+# the max-epoch deciding sid. pid has TWO matched records: d15gx (max JSONL
+# epoch => the deciding sid) and d15gy (older). The TERM side effect refreshes
+# d15gy's stamp to 1h while d15gx stays stale — the old sid-filtered re-read saw
+# only d15gx and SIGNALED. Under the union rule d15gy is fresh => suppress.
+printf '%s\n' "$(psrow 30050 400000 30050 ttys420 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15g")" \
+               "$(psrow 30051 400000 30051 ttys420 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15h")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15g d15g "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15h d15gx "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15h d15gy "$E_SEP3_2000" "2026-08-30T00:00:00.000Z"
+printf '%s' '{"d15g":{"pid":30050,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15g"},"d15gx":{"pid":30051,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15h"},"d15gy":{"pid":30051,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15h"}}' | cmux_store D
+cat > "$T/D/twin-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '%s\n' "30051 400000 30051 ttys420 Thu Sep  3 20:00:00 2026 S 30000 /usr/local/bin/pi --cwd /Users/t/d15h" > "\$FAKE_PS_SOURCE"
+        printf '%s' '{"d15gx":{"pid":30051,"pidStartSeconds":$E_SEP3_2000,"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":$E_AUG31_0000,"cwd":"/Users/t/d15h"},"d15gy":{"pid":30051,"pidStartSeconds":$E_SEP3_2000,"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":$E_SEP5_0100,"cwd":"/Users/t/d15h"}}' > "$T/D/cmux/pi-hook-sessions.json"
+        ;;
+esac
+SH
+chmod +x "$T/D/twin-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/twin-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30050" "D15e trigger candidate TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30051" "D15e non-deciding twin going fresh suppresses (union, not sid-filtered)"
+assert_contains "$(cat "$T/D/reap.log")" "stuck row record no longer frozen" "D15e twin-refresh suppress reason logged"
+rm -rf "$T/D/sessions" "$T/D/twin-side.sh"
+
+# D15f: the declared complement of D15e — a twin going IDLE (with a fresh
+# stamp but NO JSONL advance) does NOT suppress: an idle record is the reap
+# target itself, not work in progress. Pins the doc's wording so a future
+# change to this policy is a deliberate, visible one.
+printf '%s\n' "$(psrow 30052 400000 30052 ttys422 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15i")" \
+               "$(psrow 30053 400000 30053 ttys422 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15j")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15i d15i "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15j d15hx "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15j d15hy "$E_SEP3_2000" "2026-08-30T00:00:00.000Z"
+printf '%s' '{"d15i":{"pid":30052,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15i"},"d15hx":{"pid":30053,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15j"},"d15hy":{"pid":30053,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15j"}}' | cmux_store D
+cat > "$T/D/idle-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '%s\n' "30053 400000 30053 ttys422 Thu Sep  3 20:00:00 2026 S 30000 /usr/local/bin/pi --cwd /Users/t/d15j" > "\$FAKE_PS_SOURCE"
+        printf '%s' '{"d15hx":{"pid":30053,"pidStartSeconds":$E_SEP3_2000,"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":$E_AUG31_0000,"cwd":"/Users/t/d15j"},"d15hy":{"pid":30053,"pidStartSeconds":$E_SEP3_2000,"agentLifecycle":"idle","runtimeStatus":"idle","updatedAt":$E_SEP5_0100,"cwd":"/Users/t/d15j"}}' > "$T/D/cmux/pi-hook-sessions.json"
+        ;;
+esac
+SH
+chmod +x "$T/D/idle-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/idle-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30052" "D15f trigger candidate TERM'd normally"
+assert_contains "$(cat "$T/D/kill.log")" "30053" "D15f a twin going IDLE does not suppress (idle is the reap target, not work)"
+assert_not_contains "$(cat "$T/D/reap.log")" "SETTLE-SKIP 30053 stuck row" "D15f no stuck-settle suppress for the idle twin"
+rm -rf "$T/D/sessions" "$T/D/idle-side.sh"
+
+# D15g (review P1): the stuck row's settle-3 probe set is the UNION of every
+# matched record's file, not just the deciding one. The deciding sid (Aug-31)
+# is strictly newer than the twin (Aug-30), and at TERM the twin's JSONL — not
+# the deciding file, and with its store record left untouched — resumes. Only
+# $sfiles_all catches it ("activity advanced"); $sfile would TERM the pid.
+printf '%s\n' "$(psrow 30054 400000 30054 ttys423 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15k")" \
+               "$(psrow 30055 400000 30055 ttys423 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15l")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15k d15k "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15l d15kx "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15l d15ky "$E_SEP3_2000" "2026-08-30T00:00:00.000Z"
+printf '%s' '{"d15k":{"pid":30054,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15k"},"d15kx":{"pid":30055,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15l"},"d15ky":{"pid":30055,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15l"}}' | cmux_store D
+cat > "$T/D/union-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '%s\n' "30055 400000 30055 ttys423 Thu Sep  3 20:00:00 2026 S 30000 /usr/local/bin/pi --cwd /Users/t/d15l" > "\$FAKE_PS_SOURCE"
+        printf '{"type":"message","role":"user","timestamp":"2026-09-05T01:00:00.000Z","content":"hi"}\n' >> "$T/D/sessions/--Users-t-d15l--/${E_SEP3_2000}_d15ky.jsonl"
+        ;;
+esac
+SH
+chmod +x "$T/D/union-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/union-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30054" "D15g trigger candidate TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30055" "D15g non-deciding twin's JSONL advancing suppresses (union probe set)"
+assert_contains "$(cat "$T/D/reap.log")" "activity advanced" "D15g union JSONL re-probe reason logged"
+rm -rf "$T/D/sessions" "$T/D/union-side.sh"
+
+# D15h (review P2): settle 2c takes a FRESH child probe. A tool child spawned
+# after the classify snapshot leaves the parent in S with its record unchanged,
+# so only the fresh enumeration catches it.
+printf '%s\n' "$(psrow 30056 400000 30056 ttys424 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15m")" \
+               "$(psrow 30057 400000 30057 ttys424 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15n")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15m d15m "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15n d15n "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+printf '%s' '{"d15m":{"pid":30056,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15m"},"d15n":{"pid":30057,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15n"}}' | cmux_store D
+cat > "$T/D/child-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '%s\n' "30057 400000 30057 ttys424 Thu Sep  3 20:00:00 2026 S 30000 /usr/local/bin/pi --cwd /Users/t/d15n" \
+                       "30058 30057 30058 ttys424 Thu Sep  3 20:00:00 2026 S 2000 /bin/bash -c 'sleep 300'" > "\$FAKE_PS_SOURCE"
+        ;;
+esac
+SH
+chmod +x "$T/D/child-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/child-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30056" "D15h trigger candidate TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30057" "D15h a tool child spawned after classify suppresses (fresh settle probe)"
+assert_contains "$(cat "$T/D/reap.log")" "live child/descendant at settle" "D15h fresh-child suppress reason logged"
+rm -rf "$T/D/sessions" "$T/D/child-side.sh"
+
+# D15i (review P2): the deciding record vanishing from the store must suppress
+# (the `decided` conjunct) — an older stale twin alone is not enough.
+printf '%s\n' "$(psrow 30059 400000 30059 ttys425 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15o")" \
+               "$(psrow 30060 400000 30060 ttys425 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15p")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15o d15o "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15p d15px "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+session_jsonl D /Users/t/d15p d15py "$E_SEP3_2000" "2026-08-30T00:00:00.000Z"
+printf '%s' '{"d15o":{"pid":30059,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15o"},"d15px":{"pid":30060,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15p"},"d15py":{"pid":30060,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15p"}}' | cmux_store D
+cat > "$T/D/gone-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '%s\n' "30060 400000 30060 ttys425 Thu Sep  3 20:00:00 2026 S 30000 /usr/local/bin/pi --cwd /Users/t/d15p" > "\$FAKE_PS_SOURCE"
+        printf '%s' '{"d15py":{"pid":30060,"pidStartSeconds":$E_SEP3_2000,"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":$E_AUG31_0000,"cwd":"/Users/t/d15p"}}' > "$T/D/cmux/pi-hook-sessions.json"
+        ;;
+esac
+SH
+chmod +x "$T/D/gone-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/gone-side.sh" REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30059" "D15i trigger candidate TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30060" "D15i deciding record vanishing from the store suppresses"
+assert_contains "$(cat "$T/D/reap.log")" "stuck row record no longer frozen" "D15i deciding-record-gone suppress reason logged"
+rm -rf "$T/D/sessions" "$T/D/gone-side.sh"
+
+# D16: a value-less --idle-hours / --stuck-hours must exit 2, not spin forever
+# (pre-existing hang; the new --stuck-hours inherited it — review P2).
+for FLAG in --idle-hours --stuck-hours; do
+    REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run "$FLAG" > "$T/D/d16.out" 2>&1 &
+    D16PID=$!
+    # bounded poll, not a fixed sleep: a loaded box must not report a correct
+    # immediate exit as a HANG (review P2)
+    D16HUNG=1
+    for _ in $(seq 1 200); do
+        kill -0 "$D16PID" 2>/dev/null || { D16HUNG=0; break; }
+        sleep 0.05
+    done
+    if [ "$D16HUNG" = 1 ]; then
+        # kill the CHILD first (a killed parent reparents it to pid 1 and
+        # `pkill -P` then misses it — orphan leak). pkill here is
+        # intentionally unshimmed and only ever targets this subshell's own
+        # children.
+        pkill -9 -P "$D16PID" 2>/dev/null
+        kill -9 "$D16PID" 2>/dev/null
+        wait "$D16PID" 2>/dev/null
+        bad "D16 $FLAG with no value exits 2 (HUNG instead)"
+    else
+        wait "$D16PID" 2>/dev/null; D16RC=$?
+        assert_eq "$D16RC" "2" "D16 $FLAG with no value exits 2 (no hang)"
+    fi
+done
+
+# D17: 0-valued stale stamp is rejected by the plausibility window (the "0" case
+# in D13) — and a REAL epoch just inside the window still works (guards the
+# guard: the plausibility bound must not reject live data).
+running_record_fixture 30051 ttys414 d17 /Users/t/d17 "2026-08-31T00:00:00.000Z" "$E_AUG31_0000"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"
+assert_contains "$OUT" "STUCK-ESCALATE" "D17 a real stale epoch still classifies STUCK (bound did not over-reject)"
+rm -rf "$T/D/sessions"
+
+# D18: fail-closed on an unavailable descendant map (pre-existing fail-open
+# closed here, because the #947 no-live-child guard leans on the same map). A
+# map build failure makes has_live_pi_descendant()/has_live_child() answer "no"
+# for EVERY pid, silently disabling the orchestrating-skip and the stuck arm's
+# no-child guard => a session running tool work could be reaped.
+# Probe: a genuine INTERPRETER failure (a failing python3 shim first on the
+# reaper's PATH), installed last so no earlier fixture sees it. Legs: (A) abort
+# with candidates; (B) clean no-op with 0 candidates (isolates `pre_count`);
+# (C) a malformed ROW is skipped, not fatal.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$T/bin/python3"
+chmod +x "$T/bin/python3"
+running_record_fixture 30061 ttys415 d18 /Users/t/d18 "2026-08-31T00:00:00.000Z" cold
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply > "$T/D/d18.out" 2>&1
+D18RC=$?
+assert_eq "$D18RC" "3" "D18A descendant-map build failure with candidates aborts (exit 3)"
+assert_contains "$(cat "$T/D/d18.out")" "FAIL-CLOSED abort: descendant map unavailable" "D18A abort message names the map"
+assert_contains "$(cat "$T/D/reap.log")" "descendant map unavailable" "D18A abort recorded in the log footer proof"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK_ARMED=" "D18A abort footer keeps the STUCK_ARMED field"
+[ ! -s "$T/D/kill.log" ] && ok "D18A zero signals on descendant-map failure" || bad "D18A zero signals on descendant-map failure"
+# leg B: same broken interpreter, ZERO candidates => must stay a clean no-op
+# (deleting the `pre_count > 0` conjunct would abort the hourly job nightly)
+: > "$T/D/ps-source"; : > "$T/D/reap.log"
+REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply > "$T/D/d18b.out" 2>&1
+assert_eq "$?" "0" "D18B zero candidates with a failed map is a no-op (not an abort)"
+assert_not_contains "$(cat "$T/D/d18b.out")" "FAIL-CLOSED abort" "D18B no-candidate pass never aborts"
+# leg C: a malformed row (non-numeric ppid) is now SKIPPED at the row level —
+# the map still builds, so the pass runs normally. One stray byte in an argv
+# (or one bad row) must never read as "map unavailable" and stop reaping
+# forever (review P2: a UnicodeDecodeError here was a quiet hourly DoS).
+rm -f "$T/bin/python3"
+printf '%s\n' "$(psrow 30061 400000 30061 ttys415 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d18")" \
+               "$(psrow 30062 NOPE 30062 ttys415 "Thu Sep  3 20:00:00 2026" S 2000 "/usr/local/bin/pi --cwd /Users/t/d18b")" > "$T/D/ps-source"
+: > "$T/D/reap.log"
+REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run > "$T/D/d18c.out" 2>&1
+assert_eq "$?" "0" "D18C a malformed ps row is skipped, not fatal (no abort)"
+assert_not_contains "$(cat "$T/D/d18c.out")" "FAIL-CLOSED abort" "D18C malformed row never reads as map-unavailable"
+assert_contains "$(cat "$T/D/d18c.out")" "30061" "D18C the candidate is still classified after the bad row"
+# leg D: the row-level skip must also survive an UNDECODABLE argv byte. BSD ps
+# prints argv raw, so ONE non-UTF-8 byte in any process's argv used to raise
+# UnicodeDecodeError and sink the whole map => the new abort => a permanent
+# hourly no-reap. Only `errors="replace"` protects this (D18C exercises the
+# int() skip, not the decoder).
+{ printf '%s' "30061 400000 30061 ttys415 Thu Sep  3 20:00:00 2026 S 30000 /usr/local/bin/pi --cwd /Users/t/d18"; printf '\xff'; printf 'b\n'; } > "$T/D/ps-source"
+: > "$T/D/reap.log"
+REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run > "$T/D/d18d.out" 2>&1
+assert_eq "$?" "0" "D18D an undecodable argv byte does not sink the map (exit 0)"
+assert_not_contains "$(cat "$T/D/d18d.out")" "FAIL-CLOSED abort" "D18D undecodable byte never reads as map-unavailable"
+assert_contains "$(cat "$T/D/d18d.out")" "30061" "D18D the candidate is still classified with a bad byte present"
+# leg E: `--list` is a read-only diagnostic — it must work when the map CANNOT
+# build (broken interpreter), print the candidates, and leave the log alone.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$T/bin/python3"
+chmod +x "$T/bin/python3"
+: > "$T/D/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --list 2>&1)"; D18ERC=$?
+assert_eq "$D18ERC" "0" "D18E --list works with a broken interpreter (exit 0)"
+assert_contains "$OUT" "30061" "D18E --list prints the candidate list"
+assert_not_contains "$OUT" "FAIL-CLOSED abort" "D18E --list is never blocked by the abort"
+[ ! -s "$T/D/reap.log" ] && ok "D18E --list is read-only (no log write)" || bad "D18E --list is read-only (no log write)"
+rm -f "$T/bin/python3"
+rm -rf "$T/D/sessions"
+
+# D19b (review P2): `$(( 10#... ))` WRAPS past bash's signed 64-bit range, so a
+# huge digit string normalized to 0 — which would make "idle > 0" true for
+# every session. Out-of-range values must be usage errors.
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 18446744073709551616 2>&1)"; D19BRC=$?
+assert_eq "$D19BRC" "2" "D19b --idle-hours 2^64 (wraps to 0) is rejected, not accepted"
+assert_contains "$OUT" "out of range" "D19b out-of-range message names the bound"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --stuck-hours 99999999999999999999 2>&1)"; D19CRC=$?
+assert_eq "$D19CRC" "2" "D19b --stuck-hours beyond the cap is rejected"
+
+# D20 (review P1): store values are UNTRUSTED and bash `$(( ))` re-parses an
+# operand as an ARITHMETIC EXPRESSION — a crafted pidStartSeconds executed code
+# as the user. The record must be treated as unusable (abstain), never
+# evaluated: no "INJECTED" on any stream, and the pass must not abort either
+# (a bare word used to kill the whole pass with no footer).
+printf '%s\n' "$(psrow 30091 400000 30091 ttys426 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d20")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d20 d20 "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+printf '%s' '{"d20":{"pid":30091,"pidStartSeconds":"epoch[$(echo INJECTED >&2)]","agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d20"}}' | cmux_store D
+: > "$T/D/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"; D20RC=$?
+assert_eq "$D20RC" "0" "D20 a crafted pidStartSeconds does not abort the pass"
+assert_not_contains "$OUT" "INJECTED" "D20 a crafted pidStartSeconds is never evaluated as shell"
+assert_contains "$OUT" "no-pidStartSeconds abstain" "D20 the crafted value is treated as an unusable stamp (abstain)"
+assert_contains "$(cat "$T/D/reap.log")" "MODE=dry-run" "D20 the pass still writes its footer proof"
+rm -rf "$T/D/sessions"
+
+# D21 (review P2): a broken `ps` must not masquerade as an idle machine. With
+# `|| true` the empty table was indistinguishable from "no pi sessions" — exit
+# 0 with a healthy footer, every hour, forever.
+cp "$T/bin/ps" "$T/bin/ps.orig"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$T/bin/ps"
+chmod +x "$T/bin/ps"
+: > "$T/D/reap.log"; : > "$T/D/kill.log"
+REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply > "$T/D/d21.out" 2>&1; D21RC=$?
+mv "$T/bin/ps.orig" "$T/bin/ps"
+assert_eq "$D21RC" "3" "D21 a failed ps enumeration aborts (exit 3), not a healthy no-op"
+assert_contains "$(cat "$T/D/d21.out")" "ps enumeration failed" "D21 abort names the ps failure"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK_ARMED=" "D21 abort footer is written"
+[ ! -s "$T/D/kill.log" ] && ok "D21 zero signals when ps is broken" || bad "D21 zero signals when ps is broken"
+rm -rf "$T/D/sessions"
+
+# D19: the derived stuck bound is DECIMAL. bash's $(( )) reads a zero-padded
+# value as octal while awk reads it as decimal, so REAP_IDLE_HOURS=024 gave awk
+# 24h but a bound of $((024*3)) = 60 (documented: 72).
+running_record_fixture 30071 ttys421 d19 /Users/t/d19 "2026-09-03T20:00:00.000Z" "$E_SEP3_2000"
+: > "$T/D/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 024 2>&1)"; D19RC=$?
+assert_eq "$D19RC" "0" "D19 --idle-hours 024 is accepted"
+assert_contains "$(cat "$T/D/reap.log")" "THRESHOLD=24 STUCK_HOURS=72" "D19 zero-padded threshold derives the DECIMAL 3x bound (72, not 60)"
+: > "$T/D/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 08 2>&1)"; D19RC=$?
+assert_eq "$D19RC" "0" "D19 --idle-hours 08 is accepted (no octal abort)"
+assert_contains "$(cat "$T/D/reap.log")" "THRESHOLD=8 STUCK_HOURS=24" "D19 08 normalizes to decimal 8 and derives 24"
+rm -rf "$T/D/sessions"
+
+# D15j (review P1): the settle-time fresh enumeration is only EVIDENCE if it
+# ran. A failed/empty settle `ps` used to make descendant_map_build "succeed"
+# on an empty map, has_live_child answer "no child" for every pid, and the
+# guard silently vanish — reproduced as a real TERM+KILL of a session with a
+# live tool child. The row must SUPPRESS instead.
+printf '%s\n' "$(psrow 30062 400000 30062 ttys427 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15q")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15q d15q "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+printf '%s' '{"d15q":{"pid":30062,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15q"}}' | cmux_store D
+: > "$T/D/bulk-count"; : > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=2 REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"; D15JRC=$?
+assert_eq "$D15JRC" "0" "D15j a failed settle enumeration does not abort the pass"
+[ ! -s "$T/D/kill.log" ] && ok "D15j failed settle enumeration suppresses the kill (0 signals)" || bad "D15j failed settle enumeration suppresses the kill (0 signals)"
+assert_contains "$(cat "$T/D/reap.log")" "fresh ps enumeration unavailable" "D15j the suppress reason is logged"
+rm -rf "$T/D/sessions"
+
+# D21b (review P2): a PARTLY failed `ps` (rc!=0 but rows emitted) is the same
+# hazard in a quieter form — a truncated table silently reads as "no live
+# child", so an armed pass must abort, not proceed on a subset.
+: > "$T/D/kill.log"; : > "$T/D/reap.log"; : > "$T/D/bulk-count"
+REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY \
+    FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=1 FAKE_PS_FAIL_PARTIAL=1 \
+    run_reaper D --apply > "$T/D/d21b.out" 2>&1; D21BRC=$?
+assert_eq "$D21BRC" "3" "D21b a partially-failed ps aborts (exit 3) despite emitting rows"
+assert_contains "$(cat "$T/D/d21b.out")" "candidates=" "D21b the abort reports the candidate count it saw"
+[ ! -s "$T/D/kill.log" ] && ok "D21b zero signals on a truncated ps table" || bad "D21b zero signals on a truncated ps table"
+rm -rf "$T/D/sessions"
+
+# D21c (review P2): `--list` is the diagnostic surface an operator reaches for
+# when the reaper misbehaves — a silent empty list would look like "no
+# sessions". It must report a failed enumeration (stderr, exit 3).
+: > "$T/D/reap.log"; : > "$T/D/bulk-count"
+OUT="$(FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=1 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --list 2>&1)"; D21CRC=$?
+assert_eq "$D21CRC" "3" "D21c --list exits 3 when its ps probe failed"
+assert_contains "$OUT" "--list: ps enumeration failed" "D21c --list names the failure instead of printing nothing"
+[ ! -s "$T/D/reap.log" ] && ok "D21c --list still writes no log on the failure path" || bad "D21c --list still writes no log on the failure path"
+
+# D22 (review P2): REAP_MAX_HOURS is itself an operator env seam gating both
+# thresholds; a non-numeric value used to make the range comparison error and
+# turn EVERY pass into an exit-2 with no documented knob.
+OUT="$(REAP_MAX_HOURS=abc REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"; D22RC=$?
+assert_eq "$D22RC" "2" "D22 a non-numeric REAP_MAX_HOURS is a usage error"
+assert_contains "$OUT" "bad REAP_MAX_HOURS" "D22 the message names the env seam"
+
+# D22b (review P2): the `LOCK raced` branch must write the same reduced footer
+# as the live-owner branch — a monitor keying on STUCK_ARMED must never read
+# the previous pass's values on a lock abort. An unwritable STATE_DIR forces the
+# raced branch (the lock dir cannot be created at all).
+mkdir -p "$T/D/home/.pi/agent/state"
+: > "$T/D/reap.log"
+chmod 500 "$T/D/home/.pi/agent/state" 2>/dev/null
+REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run > "$T/D/d22b.out" 2>&1; D22BRC=$?
+chmod 700 "$T/D/home/.pi/agent/state" 2>/dev/null
+assert_eq "$D22BRC" "3" "D22b a lock that cannot be created aborts (exit 3)"
+assert_contains "$(cat "$T/D/reap.log")" "LOCK raced" "D22b the raced lock branch is the one taken"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK_HOURS=72" "D22b the LOCK raced abort footer carries the stuck bound"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK_ARMED=0" "D22b the LOCK raced abort footer carries STUCK_ARMED"
+
+# D22c (review P2): a 2^64 multiple wraps to a value INSIDE the bound, so
+# bounding the residue accepted it (2^64+1 => THRESHOLD=1 => reap almost
+# everything). The RAW digit string must be bounded before normalization.
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 18446744073709551617 2>&1)"; D22CRC=$?
+assert_eq "$D22CRC" "2" "D22c --idle-hours 2^64+1 (wraps to 1) is rejected"
+assert_contains "$OUT" "out of range" "D22c the wrap-by-multiple case is named"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --stuck-hours 18446744073709551617 2>&1)"; D22DRC=$?
+assert_eq "$D22DRC" "2" "D22c --stuck-hours 2^64+1 (wraps to 1) is rejected"
+# ...and the derived bound is NOT clamped by REAP_MAX_HOURS (a regression the
+# residue check introduced: --idle-hours 333334 => stuck 1000002 > cap =>
+# exit 2 naming a flag the user never passed).
+: > "$T/D/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 333334 2>&1)"; D22ERC=$?
+assert_eq "$D22ERC" "0" "D22c a large in-range --idle-hours is accepted"
+assert_contains "$(cat "$T/D/reap.log")" "THRESHOLD=333334 STUCK_HOURS=1000002" "D22c the derived stuck bound is not capped"
+
+# D22d (review P1): the DERIVED stuck bound is arithmetic, so it can wrap. A
+# huge REAP_MAX_HOURS makes an accepted --idle-hours overflow signed 64-bit:
+# 4e18*3 -> -6446744073709551616, and a NEGATIVE bound makes every age test
+# true (`a > -6e18`) — an actively working session classifies STUCK and, under
+# the arm, is TERM+KILLed (reproduced end-to-end by review). Pre-fix this input
+# was accepted; the old code caught it only by accident (the residue check).
+OUT="$(REAP_MAX_HOURS=4000000000000000000 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 4000000000000000000 2>&1)"; D22DRC=$?
+assert_eq "$D22DRC" "2" "D22d a wrapped (negative) derived stuck bound is rejected"
+assert_contains "$OUT" "bad derived --stuck-hours" "D22d the message names the derived bound, not the flag the user passed"
+OUT="$(REAP_MAX_HOURS=5000000000000000000 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 5000000000000000000 2>&1)"; D22ERC=$?
+assert_eq "$D22ERC" "2" "D22d a second wrapping case (5e18*3) is rejected too"
+# positive control: a large derived bound that does NOT wrap stays usable.
+OUT="$(REAP_MAX_HOURS=3000000000000000000 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 3000000000000000000 2>&1)"; D22FRC=$?
+assert_eq "$D22FRC" "0" "D22d a large non-wrapping derived bound is still accepted"
+# D22e (round-5 review P1): a 64-bit wrap can land POSITIVE, which a positivity
+# check accepts. `$(( 6148914691236517206 * 3 ))` = 2 (3N-2^64), so a "7e14-year"
+# bound silently became 2 HOURS — a 3h-stale non-idle session flips STUCK and is
+# TERM+KILLed under the arm (reproduced end-to-end). Wrap detection must be
+# monotonicity, not sign.
+for D22E in 6148914691236517206 6148914691236517205 6148914691236517207 9223372036854775807; do
+    OUT="$(REAP_MAX_HOURS=$D22E REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours $D22E 2>&1)"; D22ERC=$?
+    assert_eq "$D22ERC" "2" "D22e a positive-wrapping derived bound (idle=$D22E) is rejected"
+done
+assert_contains "$OUT" "bad derived --stuck-hours" "D22e the positive-wrap rejection names the derived bound"
+# D22f (round-6 review P2): the stuck bound ESCALATES the idle bound, so an
+# explicit value below it is a contradiction — the stuck arm compares
+# `idle_age_h > REAP_STUCK_HOURS`, so `--stuck-hours 1` (default idle 24h) TERM'd
+# a session idle only 2h, bypassing the idle proof the header contract requires.
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 24 --stuck-hours 1 2>&1)"; D22FRC=$?
+assert_eq "$D22FRC" "2" "D22f an explicit --stuck-hours below the idle threshold is rejected"
+assert_contains "$OUT" "below the idle threshold" "D22f the message explains the escalation rule"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 24 --stuck-hours 48 2>&1)"; D22GRC=$?
+assert_eq "$D22GRC" "0" "D22f an explicit --stuck-hours ABOVE the idle threshold is still accepted"
+
+# D23 (review P2): the post-pass read feeds POST/RESIDUAL only, but a failed
+# post-pass must not be reported as a fresh count — a stale candidate list made
+# a failed read byte-identical to a clean one.
+: > "$T/D/ps-source"; : > "$T/D/reap.log"; : > "$T/D/bulk-count"
+OUT="$(FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=2 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"; D23RC=$?
+assert_eq "$D23RC" "0" "D23 a failed POST-pass enumeration does not abort the pass"
+assert_contains "$(cat "$T/D/reap.log")" "POST-PASS ps enumeration failed" "D23 the degradation is logged"
+assert_contains "$(cat "$T/D/reap.log")" "POST=?" "D23 POST is reported as unknown, not as a stale count"
+assert_contains "$(cat "$T/D/reap.log")" "RESIDUAL=?" "D23 RESIDUAL is degraded too (dry-run) — the doc's claim is code-true"
+
+# D24 (round-6 review P2): the UNION settle probe set applies to the NORMAL
+# (non-stuck) path too. A strictly-older matched twin that advances in the
+# classify->settle window must suppress — probing only the max-epoch deciding
+# file (the pre-round-6 field) would TERM it.
+printf '%s\n' "$(psrow 30063 400000 30063 ttys428 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d24a")" \
+               "$(psrow 30064 400000 30064 ttys428 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d24b")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d24a d24c "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+session_jsonl D /Users/t/d24b d24new "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+session_jsonl D /Users/t/d24b d24old "$E_SEP3_2000" "2026-09-02T20:00:00.000Z"
+printf '%s' '{"d24c":{"pid":30063,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/d24a"},"d24new":{"pid":30064,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/d24b"},"d24old":{"pid":30064,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/d24b"}}' | cmux_store D
+cat > "$T/D/norm-union-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '{"type":"message","role":"user","timestamp":"2026-09-05T01:00:00.000Z","content":"hi"}\n' >> "$T/D/sessions/--Users-t-d24b--/${E_SEP3_2000}_d24old.jsonl"
+        ;;
+esac
+SH
+chmod +x "$T/D/norm-union-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/norm-union-side.sh" REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30063" "D24 trigger candidate TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30064" "D24 normal row: a strictly-older twin's advance suppresses (union probe set)"
+assert_contains "$(cat "$T/D/reap.log")" "activity advanced" "D24 normal-row union probe reason logged"
+rm -rf "$T/D/sessions" "$T/D/norm-union-side.sh"
+
+rm -rf "$T/D"
 
 echo "════════════════════════════════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"

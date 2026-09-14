@@ -9,7 +9,17 @@
          veto-only gate; every false-positive class is structurally blocked
          (allowlist union veto, ±3s incarnation fence, settle re-verify via
          fresh ps probes, own-session/own-tty/ancestor skips, orchestrating-
-         marathon skip). Canonical script: agent-infra/scripts/pi-reap-idle.sh
+         marathon skip). The veto is BOUNDED by record freshness (#947): a
+         non-idle record whose own updatedAt is older than 3× the idle
+         threshold (72h) is classified STUCK — REPORTED in the pass log, never
+         signaled — and a stuck row is additionally re-verified at settle
+         against a fresh store read. This job deliberately leaves the STUCK
+         arm DISARMED: the hourly pass must never reap the STUCK set, only
+         surface it; arming it is a manual, per-machine operator decision (see
+         docs/ops/pi-idle-repl-reaper-policy.md), and
+         scripts/install-launchd.test.sh asserts this plist carries no STUCK
+         arm or bound override. Canonical script:
+         agent-infra/scripts/pi-reap-idle.sh
          (COPIED to ~/.pi/agent/scripts/ by pi-bootstrap/setup.sh scripts
          farm; #427: launchd cannot read ~/Documents repos under macOS TCC).
          Rendered by scripts/install-launchd.sh (#304) — placeholders only.

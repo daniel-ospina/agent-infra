@@ -76,6 +76,55 @@ jobs:
           fi
           bash scripts/check-pipeline-compliance.sh
 
+      - name: Run the gate's fixture suite
+        # #991 — the parser/fixture suite was executed by NOTHING. The env var is
+        # set nowhere outside the script itself (grep: only the script's own
+        # help text and its own guard), and this job ran the gate only —
+        # `ci-main.yml:55-56` said so outright ("pipeline-compliance.yml is also
+        # PR-triggered, but runs no test suite"). That line is now stale, and
+        # this step is what makes it so; it is not corrected here because
+        # ci-main.yml is pinned in scripts/workflow-lock.json and a comment
+        # tweak would force a lock re-derivation. A fixture nothing runs pins
+        # nothing, so every assertion the suite carries — expect_ref,
+        # expect_trace, pr_is_artifact_only, resolve_issue_ref, and the
+        # has_scoping_marker family added by #991 — was decorative.
+        #
+        # CI is also the ONLY venue for it: the #1484 main-worktree-guard
+        # blocks local execution of this script (it contains a read-only
+        # `git -C "$ROOT" remote get-url origin`), so neither the maintainer nor
+        # an agent can run the suite on their own machine (#883).
+        #
+        # NOT a new gate. This executes a suite the script ALREADY ships and
+        # which already asserts; it adds no requirement a PR must satisfy and
+        # changes no check's verdict. It is pure shell with no gh calls, so it
+        # needs no token and cannot flake on API availability.
+        env:
+          GH_REPO: ${{ inputs.repo || github.repository }}
+        run: |
+          set -euo pipefail
+          # The self-test seam is a hard requirement of this script. If it is
+          # ever renamed or removed, FAIL LOUDLY rather than skipping: a bare
+          # `exit 0` here would be a silent no-op of the exact class #991
+          # removes — the suite would quietly stop running while the job stayed
+          # green, which is how check (b) rotted into a substring match in the
+          # first place.
+          #
+          # This step is therefore fail-closed for EVERY caller, including a
+          # consumer that reuses this file via workflow_call against a script
+          # copy predating the seam. That is deliberate. An earlier version
+          # skipped with a `::notice::` when a hardcoded repo slug did not
+          # match, which review flagged twice: first because `exit 0` anywhere
+          # is a silent no-op, then because `github.repository` is not stable
+          # across a rename or transfer — so renaming this repo would have
+          # silently downgraded this repo's own run to the skip path. A loud,
+          # self-explaining error costs a consumer one build; a silent skip
+          # costs everyone the guarantee.
+          if ! grep -q 'PIPELINE_COMPLIANCE_SELF_TEST' scripts/check-pipeline-compliance.sh; then
+            echo "::error::scripts/check-pipeline-compliance.sh carries no PIPELINE_COMPLIANCE_SELF_TEST seam, so the fixture suite cannot run — and a fixture nothing runs pins nothing (#991). If this is a consumer copy that predates the seam, either update it or stop calling this workflow."
+            exit 1
+          fi
+          PIPELINE_COMPLIANCE_SELF_TEST=1 bash scripts/check-pipeline-compliance.sh
+
   workflow-drift:
     # #303 drift guard — reusable workflows must be REAL COMMITTED FILES in
     # .github/workflows/, materialized from templates/ by
@@ -89,7 +138,9 @@ jobs:
       - name: Reusable workflows match templates
         run: |
           failures=0
-          for f in python-ci.yml node-ci.yml docs-ci.yml; do
+          # #930 — admin-merge-detector.yml is materialized here too so the
+          # post-merge detector reaches consumers via the same sync path.
+          for f in python-ci.yml node-ci.yml docs-ci.yml admin-merge-detector.yml; do
             if ! diff -q "templates/.github/workflows/$f" ".github/workflows/$f" >/dev/null 2>&1; then
               echo "::error::$f differs from templates/.github/workflows/$f — edit the template, then run scripts/sync-ci-workflows.sh and commit the materialized copy"
               failures=$((failures+1))

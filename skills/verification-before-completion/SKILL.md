@@ -3,7 +3,7 @@ name: verification-before-completion
 description: "Proof-of-work gate before claiming any task is done. Runs verification appropriate to the task type (code → typecheck+tests, deploy → browser screenshot, content → schema validate). Use whenever Pi is about to tell the user something is 'done' or 'fixed.' Not tied to commit-workflow — covers non-commit verification (research, content, config, deploy)."
 subjects.team: organisation-design-team
 allowed-tools: read write edit bash
-version: 1.1.0
+version: 1.2.0
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
@@ -178,9 +178,12 @@ When the verifier sub-agent returns issues: fix flagged issues → re-dispatch �
 
 | Signal | Threshold | Action |
 |--------|-----------|--------|
-| Same issue 3 consecutive cycles | Stalled | Escalate to human with stuck issue + attempted fixes |
-| Non-decreasing issue count 3 cycles + different issues | Honest-stuck | Fixer introducing new bugs — escalate |
+| Fingerprint `location + severity` — **never** `description`/`suggestion` (a fresh reviewer re-words the same defect; hashing the wording makes recurrence read ~0 on a real stall) | — | — |
+| Recurrence `|current ∩ prev| / |prev|` ≥ `stall_threshold` (default `0.8`) | Fingerprint-stall | Escalate to human with stuck issue + attempted fixes |
+| Issue count non-decreasing 3 consecutive cycles — **fires on its own, regardless of recurrence** | Honest-stuck | The loop is not shrinking (churn, or issues outpace fixes) — escalate |
 | No file changes 2 cycles | Zero-progress | Fixer making no progress — escalate |
+
+> **Fire if `recurrence ≥ stall_threshold` OR the count is non-decreasing for 3 cycles.** Either alone is sufficient; they are independent signals for different pathologies. Recurrence picks the *label* only (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`) — never a precondition for the count signal.
 
 **Exit outcomes:** CLEAN (zero issues), Convergence (shrinking set → escalate), Stall, Honest-stuck, Capped (10 cycles).
 
@@ -241,24 +244,55 @@ Self-audit: was research invoked? Adversarial queries run? Contradictions resolv
 | **WARNINGS** | "⚠️ Verified with warnings: <list>." Claim "done" but note warnings. |
 | **FAILURES** | "❌ Verification failed: <specific>." Do NOT claim "done." |
 
-### Approval Routing
+### Approval Routing (inlined from human-input-framework v2.1.1)
+
+> **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
+> Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session
+> without loading the framework skill first. Only the operational core is inlined; the status table,
+> store/transport contract, and Slack enablement live canonically (restating them is how the original
+> six copies drifted apart).
 
 When a human gate fires — proof adjudication: FAILURES that block the "done" claim, stuck review loops (stall / honest-stuck / zero-progress escalation), or missing gate evidence ("No Verification Gates section") — the agent MUST invoke the approval router to surface the request:
 
 ```bash
-# Role-based escalation (non-epic gates):
+# Portable invocation (works from ANY repo checkout — swarm #1402 rollout):
 python3 -c "
+import os, sys
+sys.path.insert(0, os.environ.get('SWARM_ROOT', os.path.expanduser('~/swarm')))
 from operations.coordination.approval import request_approval
 request_approval('product-implementer', artifact='<verify-evidence>.md', context='<task> proof gate for issue <N>')
 print('Approval request created')
 "
 ```
 
-This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to the per-repo store `~/.swarm/approvals/<repo>.json` and must be checked manually.
+⛔ **No dialog pops — do not wait for one.** A `pending` request fires a macOS *notification banner*
+(`osascript … display notification`), which has no buttons and no answer path; it is best-effort and
+silently no-ops on non-macOS/CI/SSH. Reaching a human on Slack needs more than `SLACK_BOT_TOKEN` +
+`SLACK_APPROVAL_CHANNEL`: the bridge derives a **different** store slug than the router, so
+`SLACK_APPROVAL_FILE` must be pinned to the router's store (agent-infra #956) or the request just
+waits in `~/.swarm/approvals/<slug>.json`.
 
-**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
+**Detect the answer — read the record, never infer from a shrinking list:**
+```bash
+SWARM="${SWARM_ROOT:-$HOME/swarm}/operations/coordination/approval.py"
+python3 "$SWARM" --pending --role human    # still open
+python3 "$SWARM" --status <req_id>         # this record's status + reviewer
+```
+A Slack thread reply sets `changes_requested`, which leaves `--pending` **without approving**;
+`is_approved(..., requires_human=True)` also returns `False` after a Slack *button* approval (the
+bridge overwrites `reviewer` with the clicking user's id — agent-infra #959). Trust `status == 'approved'`.
 
-**Role-based escalation** (for non-epic gates): use without `requires_human=True` to route through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human).
+**Role-based escalation:** with `APPROVAL_AUTO_APPROVE=0`, omitting `requires_human=True` pends for
+the requester's `reports_to` role — e.g. `product-strategist` for `product-implementer`; only
+`chain[1]` is used, so nothing walks the chain further. Under the default (`APPROVAL_AUTO_APPROVE`
+unset, which means `1`) such a request **auto-approves** and never reaches a human — **unless** an
+escalation keyword (`deploy`/`delete`/`destroy`/`migrate`/`release`) appears in the artifact/context,
+which pends for a human regardless. Pass `requires_human=True` for a real human checkpoint.
+
+⚠️ **This gate currently passes no `requires_human`**, so under the default config it auto-approves —
+a FAILURES verdict does not reach a human unless an escalation keyword happens to appear in the
+artifact/context (agent-infra #964). Raising it to `requires_human=True` is a deliberate behaviour
+change needing its own review; this excerpt documents the current truth.
 
 ## What NOT to Verify
 

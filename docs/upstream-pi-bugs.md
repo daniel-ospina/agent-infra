@@ -240,6 +240,138 @@ lifecycle events.
 
 ---
 
+## Issue E: auto-compaction retry has no attempt cap — a session wedges unreachable by input
+
+**Repo:** pi-core (`@earendil-works/pi-coding-agent`)
+**Severity:** High — the session becomes **input-unreachable**: the operator's
+own input re-arms the retry loop, so the wedge cannot be escaped from the
+keyboard. Observed wedging three sessions in one working session (agent-infra
+#943).
+
+**Verified against:** pi v0.85.1, `dist/core/agent-session.js` (line numbers
+below are that file). Note: this install also carries agent-infra's own
+offline-resume patch (`scripts/patch-pi-retry.sh`), so a pristine upstream
+install may carry these lines shifted by a few — verify by code, not by line
+number.
+
+### Symptom
+
+At high context (observed **98.2%**), compaction fails:
+
+```
+Context overflow recovery failed: Summarization failed: generation hit the token cap
+  and the summary is incomplete
+⠸ Auto-compacting... (escape to cancel)
+```
+
+Escape aborts the attempt (`Auto-compaction failed: Turn prefix summarization
+failed: This operation was aborted`) and it retries again on the next inbound or
+queued message. Context *grew* across attempts (98.2% → 98.9%), so each failure
+makes the next harder.
+Escape, repeated Ctrl+C and `/exit` all failed to break it — `/exit` was even
+swallowed as a **steering message**. No terminal state is ever offered. Only
+killing and respawning the process recovers the session.
+
+Input sent to a wedged turn is delivered only as a *chat/steering* message and
+is never processed as a command. But its delivery is itself a `message_start`
+event for a `user` message — which clears the flag at :364 and re-arms the loop
+(see Evidence). So the escape attempt **sustains** the wedge instead of
+breaking it, and the spinner keeps showing healthy "working" with frozen token
+counters.
+
+### Evidence
+
+The overflow recovery is bounded by a **single boolean**,
+`_overflowRecoveryAttempted` (:99). It is set at **:1690**, immediately before
+the compact-and-retry, and consulted at **:1667** to refuse a second attempt
+(producing the "…after one compact-and-retry attempt" message at :1669).
+
+It is then **reset** in two places:
+
+| line | reset trigger |
+|---|---|
+| **:364** | `message_start` where `message.role === "user"` — **any inbound user message** |
+| **:406** | any assistant message whose `stopReason` is neither `error` nor `length` |
+
+So the bound is neither global nor per-wedge: it is re-armed by ordinary
+session activity. **This is why the documented escape hatches fail** — input
+sent to break out *is a user message*, delivery hits :364, the flag clears, and
+the overflow recovery re-arms against the same un-compactable context. The
+operator's own escape attempt re-triggers the loop that traps them.
+
+No attempt counter bounds this loop, and there is no progress test. (An attempt
+counter does exist in `pi-ai/dist/utils/retry.js`, but it only retries
+`stopReason === "error"` and this failure is a `length` stop, so it never
+engages; and nothing compares the context size before and after an attempt to
+detect a non-converging retry.) The sharpest symptom: the only terminal message
+(**:1669**) is **unreachable in this state**, because the guard that gates it is
+the thing being repeatedly cleared.
+
+The failure path (:1867-1889) emits `compaction_end` with `errorMessage` and
+`willRetry: false`, then `return false` — an error event, but **no terminal
+state**, and the turn is left open (which is what keeps the session
+input-unreachable).
+
+### Repro
+
+1. Drive a session to ~98% context (a long single turn, e.g. a large review).
+2. Force the summarizer to hit its output cap (a context large enough that the
+   summary cannot complete within the token cap).
+3. Observe: the recovery fails, Escape aborts one attempt, and it retries
+   immediately — repeatedly, with context growing.
+4. Attempt to escape with Escape / Ctrl+C / `/exit`: all fail; `/exit` is
+   queued as steering and never runs.
+
+### Suspected cause
+
+`_overflowRecoveryAttempted` is a **boolean** rather than a monotonic counter,
+and its two reset sites (:364, :406) are reached by the normal traffic the loop
+generates. A retry cap alone would not fix this — the reset at :364 has to stop
+clearing the bound (or the bound has to become a counter that ordinary user
+messages cannot reset).
+
+### Expected behavior
+
+1. **Cap the retry count monotonically.** Once overflow recovery has failed, it
+   must not be re-armed by inbound user messages or by unrelated assistant
+   messages. A counter that only a *successful compaction* resets.
+2. **On exhaustion, enter an explicit terminal state** that says so — e.g.
+   *"cannot compact: context too large to summarize — start a new session."*
+   Today the only message that says anything like this is unreachable.
+3. **Do not retry while context is growing.** A recovery attempt that leaves
+   context at or above its previous size is guaranteed not to converge; it
+   should terminate rather than loop.
+4. The wedged turn should be **force-abortable** so queued input can be
+   delivered, rather than requiring the operator to kill the process.
+
+### Suggested fix
+
+```js
+// :99 — a counter, not a boolean
+_overflowRecoveryAttempts = 0;
+
+// :1690 — increment, and never reset on user-message activity
+this._overflowRecoveryAttempts += 1;
+// …and on exhaustion, emit a TERMINAL state rather than :1669's compact-and-retry refusal
+```
+
+and remove the reset at **:364** (or scope it to "a successful compaction
+completed", which is the only event that actually invalidates the bound).
+
+### Mitigation in agent-infra
+
+- **None yet.** No local patch has been written — this path is a
+  session-safety mechanism, and a bad patch to `agent-session.js` would affect
+  every session, so it is deliberately not patched on the
+  `scripts/patch-pi-retry.sh` model without an explicit decision (see
+  `docs/upstream-pi-bugs.md` Issue D for that model). Filing upstream is
+  blocked (403 — no issue-create permission), so this draft awaits manual
+  filing.
+- Detectable-side mitigation is tracked separately in agent-infra #943
+  (outcome 2) and #928 (the `toolUpdates` / no-progress bound).
+
+---
+
 ## Issue #360: skill silently dropped when frontmatter description is missing/empty — warning is emitted but never surfaced
 
 **Repo:** pi-core (`@earendil-works/pi-coding-agent`)

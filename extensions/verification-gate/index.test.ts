@@ -7,8 +7,9 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent } from "./index.js";
 import { createHash } from "node:crypto";
+import { execSync } from "node:child_process";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { join, sep, dirname } from "node:path";
@@ -3268,6 +3269,193 @@ test("#755 E: empty output is clean with an empty map (vacuous, not an anomaly)"
   deepEqual(e.scope, { files: [], renameOldPaths: [], clean: true });
   equal(e.statuses.size, 0);
 });
+// ── #3255: worktree-aware root resolution ─────────────
+// The cwd's git root is the HUB when the change lives in a linked worktree,
+// while the bridge's compound keys are keyed on the WORKTREE (verification is
+// dispatched with the worktree as project root). Adopting the sibling root is
+// what stops the hub-vs-worktree hash comparison that blocks every push.
+const sameRepo3255 = (r: string) => (r.startsWith("/repo") ? "/repo/.git" : "/other/.git");
+
+test("pickVerifiedRoot: adopts a same-repo worktree root when the cwd root has no entries", () => {
+  equal(pickVerifiedRoot("/repo", ["/repo/.worktrees/feat"], sameRepo3255), "/repo/.worktrees/feat");
+});
+
+test("pickVerifiedRoot: status quo when the cwd root has its own entries", () => {
+  equal(
+    pickVerifiedRoot("/repo", ["/repo", "/repo/.worktrees/feat"], sameRepo3255),
+    null,
+    "the hub's own entries mean there is nothing to adopt",
+  );
+});
+
+test("pickVerifiedRoot: never adopts a DIFFERENT repository's root", () => {
+  equal(
+    pickVerifiedRoot("/other", ["/repo/.worktrees/feat"], sameRepo3255),
+    null,
+    "a foreign repo's verified entries must stay inert",
+  );
+});
+
+test("pickVerifiedRoot: ambiguous siblings fall back to the status quo (fail-closed)", () => {
+  equal(pickVerifiedRoot("/repo/hub", ["/repo/w1", "/repo/w2"], () => "/repo/.git"), null);
+});
+
+test("pickVerifiedRoot: no entries, or an unresolvable repo, falls back", () => {
+  equal(pickVerifiedRoot("/repo", [], sameRepo3255), null);
+  equal(pickVerifiedRoot("/repo", ["/repo/w1"], () => null), null);
+});
+
+test("#3255 policy: the git-op root is authoritative — adoption must never gate an op (fail-closed)", () => {
+  const src = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8");
+  // The first attempt resolved the git-op root through the bridge-adopting
+  // helper. A clean adopted tree then produced an EMPTY scope, which takes the
+  // gate's empty-scope path and ALLOWS an op carrying unverified content in the
+  // session's real tree — a fail-open. This pins the direction, because that is
+  // the property a unit test of the helper itself cannot express.
+  ok(
+    !/const cwd = recoveryOnlyRoot\(/.test(src),
+    "the git-op root must not be bridge-adopted (adoption ⇒ empty scope ⇒ ALLOW)",
+  );
+  ok(
+    /const cwd = resolveGitRoot\(cdPath \?\? inputCwd\)/.test(src),
+    "the git-op root must come from the command's own cwd",
+  );
+  ok(
+    /const sessionRoot = normalizeWorktreeRoot\(recoveryOnlyRoot\(/.test(src),
+    "session-start bridge recovery is the one place adoption is permitted",
+  );
+});
+
+// ── #920 (O3) cycle-4 review, P2: ASK THE INDEX, never parse stderr ──
+//
+// The cycle-2 P2-A rule read a `git cat-file -e` 128 as absence when stderr
+// carried `does not exist (neither on disk nor in the index)`. git ECHOES THE
+// PROBED PATH in its fatal messages, so a path literally NAMED after that
+// phrase satisfied the substring test. The conflicted-index form — `fatal:
+// path '<p>' is in the index, but not at stage 0` — is a 128 that echoes the
+// path, so such a path read as ABSENT, the `ENOTDIR` branch `continue`d, and
+// the op was ALLOWED. The fix replaces stderr interpretation with a direct
+// membership question, `git ls-files -z -- :(top,literal)<path>`.
+//
+// The tests below are the four pins the new rule needs — entry present ⇒
+// records content; entry absent ⇒ absent; non-zero exit ⇒ fail CLOSED;
+// ambiguous/spawn failure ⇒ fail CLOSED — plus the cycle-4 counterexample
+// itself (REAL git, conflicted index) and a structural pin that no stderr
+// substring matching survives in the helper.
+section("indexRecordsContent — membership comes from the index, never from stderr (#920 P2)");
+
+// A real file name chosen to collide with the phrase the OLD rule matched on.
+const ABSENCE_PHRASE_PATH = "does not exist (neither on disk nor in the index)";
+
+/** Initialise a scratch repo and return a blob-hash helper bound to it. */
+function scratchRepo(prefix: string) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  execSync("git init -q -b main .", { cwd: dir, stdio: "ignore" });
+  const blob = (content: string) =>
+    execSync("git hash-object -w --stdin", { cwd: dir, input: content, encoding: "utf-8" }).trim();
+  return { dir, blob };
+}
+
+test("REAL git: a staged index entry reads as RECORDS CONTENT", () => {
+  const { dir } = scratchRepo("vgate-indexprobe-staged-");
+  try {
+    writeFileSync(join(dir, "staged.ts"), "staged\n");
+    execSync("git add staged.ts", { cwd: dir, stdio: "ignore" });
+    equal(indexRecordsContent(dir, "staged.ts"), true,
+      "a non-empty `ls-files` listing — the index holds the blob a bare commit records ⇒ must block if unread");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: a path in NEITHER the index nor the worktree is ABSENT — the skip branch stays intact", () => {
+  // The other half of the discrimination: an empty listing with exit 0 must
+  // still read as ABSENT, or every D/F deletion would name-block (e2e 920(P1)
+  // leg (b)). There is no message to parse any more, so this is the only way to
+  // over-block — and it is pinned here.
+  const { dir } = scratchRepo("vgate-indexprobe-empty-");
+  try {
+    equal(indexRecordsContent(dir, "ghost.ts"), false,
+      "genuine absence (empty stdout, exit 0) must stay a skip; it must not name-block every deletion");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: a non-zero exit outside any repo reads as RECORDS CONTENT (fail CLOSED)", () => {
+  // Not a synthetic err: git itself returns 128 with `fatal: not a git
+  // repository` here. A probe that cannot answer must never read as absence.
+  const dir = mkdtempSync(join(tmpdir(), "vgate-indexprobe-norepo-"));
+  try {
+    throws(() => execSync("git rev-parse --show-toplevel", { cwd: dir, stdio: "ignore" }),
+      "precondition: the temp dir must NOT be inside a git repo");
+    equal(indexRecordsContent(dir, "a.ts"), true,
+      "outside a repo the probe cannot answer ⇒ records-content (fail CLOSED), not absence");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous/spawn failure ⇒ fail CLOSED (unanswerable cwd reads as RECORDS CONTENT)", () => {
+  // A cwd that does not exist makes `execSync` fail to spawn git at all — the
+  // pure "probe could not RUN" class, with no exit status and no stderr.
+  const ghostCwd = join(tmpdir(), "vgate-indexprobe-no-such-cwd-", String(Date.now()));
+  equal(existsSync(ghostCwd), false, "precondition: the cwd must not exist");
+  equal(indexRecordsContent(ghostCwd, "a.ts"), true,
+    "a spawn failure is ambiguous ⇒ must read as records-content (fail CLOSED), never as absence");
+});
+
+test("REAL git: a conflicted-index path NAMED like git's absence message is RECORDS CONTENT (#920 P2)", () => {
+  // The cycle-4 counterexample, with real git. An unmerged index (stages 1/2/3,
+  // no stage 0) is exactly the shape that made the OLD `cat-file -e` probe
+  // print `fatal: path '<name>' is in the index, but not at stage 0` — a 128
+  // that echoes the path. When the path is literally named after the phrase the
+  // old rule substring-matched, that echo read as absence ⇒ skip ⇒ ALLOW: the
+  // fail-open this test is RED against pre-fix.
+  const { dir, blob } = scratchRepo("vgate-indexprobe-echo-");
+  try {
+    const info = `100644 ${blob("base\n")} 1\t${ABSENCE_PHRASE_PATH}\n`
+      + `100644 ${blob("ours\n")} 2\t${ABSENCE_PHRASE_PATH}\n`
+      + `100644 ${blob("theirs\n")} 3\t${ABSENCE_PHRASE_PATH}\n`;
+    execSync("git update-index --index-info", {
+      cwd: dir, input: info, stdio: ["pipe", "ignore", "ignore"],
+    });
+    equal(indexRecordsContent(dir, ABSENCE_PHRASE_PATH), true,
+      "the index DOES hold entries at this path ⇒ records content; a path-echoing fatal message must not read as absence");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: glob metacharacters in a real file name are matched LITERALLY", () => {
+  // A plain pathspec would expand `a[1].ts` as a bracket expression and could
+  // list nothing (or the wrong entry) for a path that IS in the index —
+  // `:(top,literal)` is what makes the listing authoritative.
+  const { dir } = scratchRepo("vgate-indexprobe-glob-");
+  try {
+    writeFileSync(join(dir, "a[1].ts"), "brackets\n");
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+    equal(indexRecordsContent(dir, "a[1].ts"), true,
+      "a literal file name with glob metacharacters must resolve to its own index entry");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the index probe never substring-matches stderr (#920 P2 structural pin)", () => {
+  const src = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8");
+  const start = src.indexOf("export function indexRecordsContent");
+  ok(start >= 0, "precondition: the index probe must exist");
+  const end = src.indexOf("\n}\n", start);
+  const body = src.slice(start, end);
+  ok(/git ls-files -z -- /.test(body), "the probe must ask the index via `git ls-files -z --`");
+  ok(!/cat-file/.test(body), "`cat-file -e` must be gone from the probe — its path-echoing stderr was the defect");
+  ok(!/includes\s*\(/.test(body),
+    "no substring `includes(...)` test may remain anywhere in the probe");
+  ok(!/does not exist \(neither on disk nor in the index\)/.test(body),
+    "the absence-message constant must be gone from the probe");
+});
+
 // ── Results ───────────────────────────────────────────
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

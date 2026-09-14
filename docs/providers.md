@@ -75,16 +75,36 @@ model.
 - Clean exits whose output merely *mentions* the phrase (e.g. research content
   about connection errors) do **not** trigger a fallback (exit-code guarded)
 
-### Second-model gate (`$SECOND_MODEL` — issue #284)
+### Second-model review — REMOVED (single-model review)
 
-The pipeline's "second-model" review gates (issue-scoping §5.6, code-review §6.6,
-plan-review §4.5, subagent-driven-development final reviewer) dispatch with
-`model` = `$SECOND_MODEL` (env), **default `deepseek/deepseek-v4-pro`**
-(provider-qualified — the bare id is ambiguous across providers). When the
-configured second model is set-but-unresolvable or unset-with-unresolvable-
-default, dispatch the tool default (`deepseek-flash`, the shipped
-`defaultModel`) and annotate `[SECOND-MODEL-GATE] stand-in`
-(never silently substitute). Pricing decision + rationale: issue #284.
+The second-model subsystem has been **removed**: the `check-second-model.sh`
+designation guard and its `second-model.json` config, the `$SECOND_MODEL` /
+`SECOND_MODEL_GATE_*` environment surface, the final-gate step in the four gate
+skills (`code-review` §6.6, `plan-review` §4.5, `issue-scoping` §5.6,
+`subagent-driven-development`), and the PR-time check (f) in
+`scripts/check-pipeline-compliance.sh`. There is now **one model**: the session
+model, used at every review stage.
+
+**This is a deliberate, recorded decision — not an accident.** The removed final
+gate was the pipeline's only *cross-model* review: a different, stronger reasoner
+that catches what the cheaper reviewers miss. Single-model review means a model's
+own blind spots are structurally invisible to it. The owner traded that quality
+control for cost and simplicity, for four recorded reasons:
+
+1. No usable independent model is available — the one funded window (OpenRouter,
+   2026-09-12) resolved a candidate the owner has ruled out and that stalls with
+   zero tool calls (#742, #860, #978).
+2. It did not enforce what it documented: the `[SECOND-MODEL-GATE]` marker was
+   unsigned raw text, so solvency was never verified and any PR-body sentence
+   could satisfy it (#977).
+3. It was the only thing blocking the **entire guarded surface** — every PR
+   touching `AGENTS.md`, the gate scripts, the workflows or the four skills was
+   unmergeable for reasons unrelated to its content.
+4. It could not repair itself: the fix touched a guarded file, so it failed its
+   own check.
+
+The venice cold-class seam (`COLD_CLASS_PROVIDER`, §8) is unrelated and
+untouched. See PR #980 for the full rationale.
 
 ## 3. Env var reference
 
@@ -389,7 +409,6 @@ window validates the burn economics. Per-dispatch measurement is
 Venice is registered flash-ONLY in `pi-bootstrap/pi-config/models.json`
 (`baseUrl https://api.venice.ai/api/v1`, `$VENICE_API_KEY`,
 cost 0.14/0.28 input/output + 0.03 cacheRead, contextWindow 300000). The
-**#284 carve-out**: `COLD_CLASS_PROVIDER` is an operator override SEPARATE
-from `$SECOND_MODEL` — second-model gates never route venice unless
-`$SECOND_MODEL` itself says so; cold-class applies only to the default-leg
-(flash) reviewer/eval dispatches an operator has explicitly opted in.
+**#284 carve-out**: `COLD_CLASS_PROVIDER` is an operator override that applies
+only to default-leg (flash) cache-cold reviewer/eval dispatches an operator has
+explicitly opted in.

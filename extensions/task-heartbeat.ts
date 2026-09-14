@@ -148,6 +148,27 @@ export interface TickFields {
   toolAgeMaxMs: number;
   sawMsg: boolean;
   sawTool: boolean;
+  /** #783 §6.6: the in-flight tool round has emitted at least one update. */
+  toolUpdates: boolean;
+}
+
+/** #783 §6.6: the output-liveness bit the tick carries — true iff there is at
+ * least one in-flight tool and EVERY one of them has emitted at least one
+ * `tool_execution_update`. UNIVERSAL, not existential: the parent uses this to
+ * decide whether silence means "the silent tool is wedged", which is only sound
+ * if the silence cannot belong to a tool that never emits at all (a nested
+ * `task` — see E279a2). Exported so the direction is pinned by a unit test
+ * rather than only by a handler closure. */
+export function computeToolUpdates(
+  outstanding: Iterable<string>,
+  updated: ReadonlySet<string>,
+): boolean {
+  let any = false;
+  for (const id of outstanding) {
+    any = true;
+    if (!updated.has(id)) return false;
+  }
+  return any;
 }
 
 export function formatTick(nonce: string, f: TickFields): string {
@@ -155,6 +176,7 @@ export function formatTick(nonce: string, f: TickFields): string {
     `${HEARTBEAT_MARKER_PREFIX} tick nonce=${nonce} ` +
     `tools=${f.tools} turn=${f.turn ? 1 : 0} ` +
     `stream_age_ms=${f.streamAgeMs} tool_age_max_ms=${f.toolAgeMaxMs} ` +
+    `tool_updates=${f.toolUpdates ? 1 : 0} ` +
     `saw_msg=${f.sawMsg ? 1 : 0} saw_tool=${f.sawTool ? 1 : 0}`
   );
 }
@@ -367,6 +389,16 @@ export default function (pi: ExtensionAPI) {
   // completion order — a preflight-started tool that is rejected/skipped could
   // desync a counter forever). Values are start timestamps for tool_age_max_ms.
   const outstandingTools = new Map<string, number>();
+  /** #783 §6.6: which in-flight tools have emitted `tool_execution_update`.
+   * Only streaming tools emit updates — `bash` does, while `task`, `read`,
+   * `edit`, `write` pass `_onUpdate` UNUSED. The tick reports whether EVERY
+   * in-flight tool has emitted (see `computeToolUpdates`): the clause concludes
+   * something about the tool that went quiet, so "SOME tool produced output" is
+   * the wrong direction — with a bash that emitted and ended while a nested
+   * task is still in flight, an existential latch stayed true and killed the
+   * healthy nested child (the P1 the §6.6 verifier reproduced). Tracked per
+   * toolCallId and dropped on end so the set cannot grow without bound. */
+  const updatedToolIds = new Set<string>();
   let lastActivityAt = Date.now();
   let turnActive = false;
   let turnSawMessage = false;
@@ -398,6 +430,7 @@ export default function (pi: ExtensionAPI) {
         turn: turnActive,
         streamAgeMs: now - lastActivityAt,
         toolAgeMaxMs,
+        toolUpdates: computeToolUpdates(outstandingTools.keys(), updatedToolIds),
         sawMsg: turnSawMessage,
         sawTool: turnSawTool,
       }),
@@ -447,7 +480,18 @@ export default function (pi: ExtensionAPI) {
     turnActive = false;
     // Pi guarantees all tools finalize before turn_end — clearing here bounds
     // any residual start/end desync to one turn (cycle-2 P1 fix).
+    // #783 review: `updatedToolIds` MUST be cleared alongside its sibling Map.
+    // The per-id delete in `tool_execution_end` is not sufficient on its own: if
+    // a `tool_execution_end` is ever lost or skipped (the exact desync this
+    // clear exists to bound), the streamed tool's id would survive into LATER
+    // turns, and a subsequent non-streaming tool (a nested `task`, say) reusing
+    // that same toolCallId — plausible for providers that emit positional ids
+    // like `call_0` — would make `computeToolUpdates` report a tool that has
+    // never emitted as live. The child would then tick `tool_updates=1` and the
+    // parent's PRIMARY `tool-silence` clause would kill the healthy silent child
+    // at S: the precise false-liveness direction this gate exists to close.
     outstandingTools.clear();
+    updatedToolIds.clear();
     touchActivity();
     emit(formatTurnEnd(nonce, event.turnIndex));
   });
@@ -459,12 +503,14 @@ export default function (pi: ExtensionAPI) {
     emit(formatToolStart(nonce, event.toolCallId, event.toolName));
   });
 
-  pi.on("tool_execution_update", async () => {
+  pi.on("tool_execution_update", async (event) => {
+    updatedToolIds.add(event.toolCallId);
     touchActivity();
   });
 
   pi.on("tool_execution_end", async (event) => {
     outstandingTools.delete(event.toolCallId);
+    updatedToolIds.delete(event.toolCallId);
     touchActivity();
     emit(formatToolEnd(nonce, event.toolCallId));
   });

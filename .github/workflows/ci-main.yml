@@ -72,10 +72,15 @@ jobs:
         # retry, tree-kill) were unwired: the extensions/*/test*.mjs glob above
         # misses .ts files. Loop the rest, skipping the explicitly-listed ones
         # (a future shared suite is picked up automatically). Zero-dep tsx route.
+        # #783 — dispatch-record.test.ts MUST be skipped here: it imports
+        # ../builtin-tools/index.js (#29), which needs typebox from the
+        # builtin-tools npm ci BELOW this loop. Running it here fails
+        # ERR_MODULE_NOT_FOUND on a fresh checkout. Run explicitly after the ci.
         for t in extensions/shared/*.test.ts; do
           [ -f "$t" ] || continue  # no-match guard (glob loops elsewhere in this file)
           case "$t" in
             extensions/shared/print-mode.test.ts|extensions/shared/print-mode-wiring.test.ts) continue ;;
+            extensions/shared/dispatch-record.test.ts) continue ;;
           esac
           echo "== $t =="
           npx tsx "$t" || failures=$((failures+1))
@@ -138,6 +143,17 @@ jobs:
         npx tsx extensions/builtin-tools/provider-failover.integration.test.ts || failures=$((failures+1))
         echo "== extensions/builtin-tools/cut-resume.integration.test.ts =="
         npx tsx extensions/builtin-tools/cut-resume.integration.test.ts || failures=$((failures+1))
+        # #783 — the composer consolidation: cap / cut / heartbeat / backstop
+        # all resolve through composeAbnormalExit, proven against a real cap
+        # payload + the census instrument. Runs after the npm ci above.
+        echo "== extensions/builtin-tools/task-cap-handoff.integration.test.ts =="
+        npx tsx extensions/builtin-tools/task-cap-handoff.integration.test.ts || failures=$((failures+1))
+        # #783 — dispatch-record.test.ts lives in extensions/shared but is NOT
+        # zero-dep: it imports ../builtin-tools/index.ts (typebox). It is skipped
+        # by the shared glob above (which runs before this npm ci) and run HERE,
+        # after the install — same treatment as the builtin-tools suites.
+        echo "== extensions/shared/dispatch-record.test.ts =="
+        npx tsx extensions/shared/dispatch-record.test.ts || failures=$((failures+1))
         # provider-failover*.test.ts under extensions/shared are auto-picked by
         # the shared glob above (incl. the python3-spawning parity suite).
         # #553/#573/#574 — subagent suites: the two builtin-tools suites spawn a
@@ -161,6 +177,17 @@ jobs:
         npx tsx extensions/subagent/timeout-integration.test.ts || failures=$((failures+1))
         echo "== extensions/subagent/cache-integration.test.ts =="
         npx tsx extensions/subagent/cache-integration.test.ts || failures=$((failures+1))
+        # #783 Task 7.3 — subagent parity pin: the ext keeps its OWN timeout /
+        # stall semantics and was NOT dragged by the builtin-tools task-constant
+        # split. Zero-dep source pin (node:* + readFileSync only), wired here
+        # alongside the rest of the subagent-extension suites. This is the
+        # post-merge backstop; note its sibling zero-dep pin
+        # (extensions/shared/default-coverage.test.ts) ALSO runs per-PR in
+        # ci.yml's verify job, so the earlier "ci.yml runs no npm ci" rationale
+        # for keeping THIS one post-merge-only was false — it could run there
+        # too, but this job is where the subagent surface is covered.
+        echo "== extensions/subagent/subagent-parity.test.ts =="
+        npx tsx extensions/subagent/subagent-parity.test.ts || failures=$((failures+1))
         echo "== extensions/builtin-tools/subagent-integration.test.ts =="
         PATH="$PWD/extensions/subagent/node_modules/.bin:$PATH" \
           npx tsx extensions/builtin-tools/subagent-integration.test.ts || failures=$((failures+1))
@@ -214,7 +241,20 @@ jobs:
           # only); real-tty assertions are dev-box verification steps in the
           # #469 plan, not CI.
           bash scripts/pi-reap-idle.test.sh || errors=$((errors+1))
+          # #783 — task-session retention sweep: live child survives every pass,
+          # ps-probe failure deletes nothing (fail-closed), TOCTOU re-probe,
+          # dry-run default. Hermetic (fake PS shim + throwaway root/log).
+          bash scripts/pi-task-session-prune.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
+          # #930 — safe-admin-merge rail: the ONE failing-set parser
+          # (scripts/ci-failure-set.sh) plus the chokepoint that consumes it
+          # (scripts/admin-merge.sh). Post-merge re-check of the same hermetic
+          # suite ci.yml runs per-PR.
+          bash tests/admin-merge/run.sh || errors=$((errors+1))
+          # #984 — the ARGV-LEVEL half: scripts/gh-shim/gh decides from its own argv
+          # (where bash has finished), so a splice cannot hide the flag. Same hermetic
+          # suite ci.yml runs per-PR.
+          bash tests/gh-shim/run.sh || errors=$((errors+1))
           # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
           # farm-link preservation, extensions/ content parity = #447 ship-list drift
           # tripwire, #446 launchctl isolation). Real setup.sh, hermetic (~2min).
@@ -247,6 +287,21 @@ jobs:
         run: bash scripts/check-cost-config.sh --shipped-only
       - name: Cost-config fixture suite (#341 scenarios 0-14; green same-merge)
         run: bash tests/cost-config/run.sh
+
+  sigpipe-grep-guard:
+    # #841/#861 — post-merge re-check of the builtin-writer SIGPIPE
+    # false-negative guard. `printf`/`echo` piped into a quiet `grep` under
+    # `pipefail` can report "not found" for a present match (SIGPIPE once grep
+    # exits early), silently turning a guard into a pass. This is the MAIN-line
+    # red signal: a merge that reintroduces the idiom, or that leaves a stale
+    # exception, fails here even if its PR check was bypassed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SIGPIPE false-negative guard (the scan set must be clean)
+        run: bash scripts/check-no-sigpipe-grep.sh
+      - name: SIGPIPE guard suite (hermetic, zero network)
+        run: bash tests/sigpipe-grep/run.sh
 
   pi-config-extensions-guard:
     # #498/#502 — post-merge re-check of the pi-config extension-farm parity gate
@@ -281,16 +336,102 @@ jobs:
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, python-ci]
+    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, python-ci]
     if: failure()
+    # RESIDUAL (round-2 review): paginate -> find -> create is check-then-act, so two
+    # concurrent post-merge runs can both create (runs 34534428397 / 34534452089 failed 17s
+    # apart on 2026-09-10 and filed #710 / #711). A job-level `concurrency:` group was added
+    # here and then REMOVED: with `cancel-in-progress: false` GitHub keeps at most one running
+    # AND one pending job, so a third queued filer EVICTS the pending one and that filing
+    # silently never happens. Dropping a filing is worse than an extra duplicate — this
+    # change's own rule is "a duplicate beats silence" — so the race is left as a bounded
+    # residual rather than traded for a new fail-open. It is strictly rarer than the pre-fix
+    # behaviour, which created a duplicate on every failure.
     steps:
       - uses: actions/github-script@v7
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         with:
           script: |
-            github.rest.issues.create({
+            // #903 / #937 — ONE issue per FAILING JOB SET, not one per commit.
+            //
+            // The title used to carry the SHA (`main broken by merge (cc288d5)`), which is
+            // unique by construction, so it could never match an open issue and every failure
+            // minted a duplicate — 35 since 08-13 as of 2026-09-13 (#850 and #837 were filed
+            // for this defect and have since been CLOSED as stale duplicates; #975 and #976
+            // were two OPEN duplicates minted 5s apart by the race this change also guards).
+            //
+            // A bare constant title would dedup but OVER-collapse: the filer never recorded
+            // which job failed, so two unrelated breakages would share one issue, and closing
+            // it for one would silently mark the other resolved. Keying on the failing job set
+            // separates them and preserves run -> failing-job traceability.
+            //
+            // Provenance: #339 (08-25) identified this defect and prescribed this remedy —
+            // docs/plans/2026-08-25-339-merge-reliability.md, Option 2: "dedupe: if an OPEN
+            // issue already exists with the same signature (workflow + job + assertion),
+            // comment the new run on it instead of filing a new issue" and "Include the
+            // failing job/assertion in the issue body (today: run URL only)". This is that
+            // option. (An earlier revision of this message denied the credit, because a
+            // review finding was accepted without being checked against the plan doc.)
+            //
+            // Same shape as enforce-skills.yml's dedup (paginate + find by title); this file
+            // was the outlier. Recurrences are APPENDED as comments rather than overwriting the
+            // body, so the occurrence history survives.
+            //
+            // RESIDUAL (round-2 review): the key is the failing JOB SET, not the root cause.
+            // `extension-tests` multiplexes several suites, so two unrelated breakages inside
+            // it still share a title. And there is no close-on-success here (unlike
+            // enforce-skills.yml:109), so an issue stays open after main recovers and later
+            // same-set failures append to it. Both are bounded and disclosed rather than fixed
+            // here — close-on-success is a new mechanism, not a dedup fix.
+            // `|| {}` after the parse too: NEEDS is `${{ toJSON(needs) }}`, and a literal `null`
+            // (not `{}`) makes Object.entries throw BEFORE the try/catch below, so the run would
+            // error out having filed nothing. Not reachable today (all 7 jobs are wired into
+            // `needs:`, so it is always a populated object) — but it is the only throw-before-filing
+            // path in this step, and the safe direction here is "file", never "crash quietly".
+            const failed = Object.entries(JSON.parse(process.env.NEEDS || '{}') || {})
+              .filter(([, v]) => v.result === 'failure')
+              .map(([k]) => k)
+              .sort();
+            const TITLE = failed.length
+              ? `main broken by merge: ${failed.join(' + ')}`
+              : 'main broken by merge';
+            const detail = `Post-merge CI failed on main at ${context.sha}.\n` +
+              `Failing jobs: ${failed.length ? failed.join(', ') : 'unknown'}\n` +
+              `See: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // A duplicate beats silence: the old code always filed. If the lookup fails
+            // (secondary rate limit, 5xx, a later page), fall through and still file.
+            let issues = [];
+            try {
+              issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100,
+              });
+            } catch (e) {
+              core.warning(`issue lookup failed (${e.message}) — filing without dedup`);
+            }
+            const dup = issues.find(i => !i.pull_request && i.title === TITLE);
+            if (dup) {
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: dup.number,
+                  body: `Recurred: ${detail}`,
+                });
+                core.notice(`main broken again — appended to #${dup.number} instead of filing a duplicate`);
+                return;
+              } catch (e) {
+                core.warning(`could not comment on #${dup.number} (${e.message}) — filing a new issue`);
+              }
+            }
+            await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `main broken by merge (${context.sha.slice(0,7)})`,
-              body: `Post-merge CI failed on main at ${context.sha}.\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              title: TITLE,
+              body: `${detail}\n\n_Recurrences with the same failing job set are appended to this issue rather than filed as duplicates (#937)._`,
               labels: ['bug'],
             });
