@@ -1441,7 +1441,11 @@ export function evidenceBodyIsCertifying(body: string, markerSha: string): boole
     /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0\b/.test(body) &&
     // The lane is named in the provenance line (`... union of N runs of
     // <lane>:`) — accept it, but never accept a missing provenance line.
-    /main compared \(union of \d+ runs?(?: of [^:()]+)?\):/.test(body)
+    // `.+` (greedy, to the LAST `):`), not `[^:()]+`: a lane may be named by a workflow
+    // NAME rather than a file, and `gh` accepts names containing `:` and `(`/`)` —
+    // `--workflow 'CI: tests'` and `--workflow 'tests (unit)'` both emitted valid rail
+    // evidence that this contract refused, blocking a legitimate merge (cycle-3 review).
+    /main compared \(union of \d+ runs?(?: of .+)?\):/.test(body)
   );
 }
 

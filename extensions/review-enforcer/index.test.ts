@@ -3160,6 +3160,17 @@ test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
     "a non-zero unique count never certifies");
   ok(!evidenceBodyIsCertifying(good.replace("main compared (union of 10 runs of python-ci.yml): s1:1,s2:2\n", ""), MARK),
     "missing main provenance does NOT certify");
+  // The rail prints the runs that ACTUALLY CONTRIBUTED to the union, so a one-run
+  // baseline reads "1 run" (singular) and a lane whose runs were all green reads
+  // "0 runs". Both must certify: if this regex tightened to plural-only, the
+  // rail's OWN evidence would stop certifying and every merge would be blocked
+  // with no way through — an over-blocking gate is a broken gate too (#1003).
+  ok(evidenceBodyIsCertifying(good.replace("union of 10 runs", "union of 1 run"), MARK),
+    "the singular 'union of 1 run' certifies (the rail emits it for a one-run baseline)");
+  ok(evidenceBodyIsCertifying(good.replace("union of 10 runs", "union of 0 runs"), MARK),
+    "the zero 'union of 0 runs' certifies (a lane whose runs all passed)");
+  ok(!evidenceBodyIsCertifying(good.replace("union of 10 runs", "union of 1 banana"), MARK),
+    "a malformed union count does NOT certify");
   ok(!evidenceBodyIsCertifying(good.replace("PR failing: 0 | main failing: 3", "PR failing: | main failing: "), MARK),
     "missing counts do NOT certify");
   // The forgery class the review said was NOT closed: the body's `PR head:` must
