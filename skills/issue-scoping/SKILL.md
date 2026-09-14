@@ -690,7 +690,7 @@ Independently evaluate the same framings. Same output format.
 
 ### Human Gate (conditional)
 
-Pause for human approval ONLY if: confidence < 50, agents disagree AND controller cannot resolve, or confirmed definition differs significantly from original. Otherwise: proceed directly.
+Pause for human approval ONLY if: confidence < 50, or (Complex) the two converge agents disagree AND the controller cannot resolve, or the confirmed definition differs significantly from the original. Otherwise: proceed directly.
 
 #### Approval Routing
 
@@ -1004,7 +1004,7 @@ Pause for human approval if: confidence < 50, P0 issues remain after review, wir
 
 - **Double diamond is non-negotiable.** Micro tier runs all 4 phases (1 sub-agent each). No issue gets scoped without exploring alternative problems AND solutions.
 - **Verification gates after each diamond.** Standard+Complex gate at the tier's verifier count; Micro gets a single full-diamond verifier. P0/P1 → fix → re-verify. P2+ → incorporate and pass.
-- **Controller is the tiebreaker, not a script.** When verifiers disagree, the main agent decides. Verifiers flag issues; controller fixes or ignores with rationale.
+- **Controller is the tiebreaker, not a script.** When verifiers disagree (Complex), the main agent decides. Verifiers flag issues; controller fixes or ignores with rationale.
 - **Problem phases use research skill.** Discover and Define invoke `research` for adversarial queries — not just web_search.
 - **Quality over convenience in solution selection.** The converge step picks the better outcome, not the easier implementation.
 - **Fix root causes, not symptoms.** When problem-diverge discovers a deeper cause, target that — not the symptom the issue described.
