@@ -60,8 +60,6 @@ Your role is to work within the skills and processes framework we have explicitl
 
 When choosing between two approaches, prefer the one that produces the better outcome over the one that's easier to implement. Quality of result trumps implementation convenience. Easy paths accumulate into brittle systems; good paths cost more upfront but pay back in reliability, extensibility, and user satisfaction.
 
----
-
 ## ⛔ USER QUESTIONS PROTOCOL: research and ask without jargon
 
 When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be canonical, e.g. as per ontology document)
