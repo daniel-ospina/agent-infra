@@ -363,7 +363,6 @@ export function isAdminMergeCommand(command: string): boolean {
     // broad (any `gh` + `pr` under a construct), so reusing it here made a benign
     // `gh pr view $X` admin-gated.
     if (!hasUnresolvableConstruct(command)) return false;
-    if (!/(^|[^\w])merge\b/.test(normalizeForFlagScan(command))) return false;
     // A `$`-bearing ARGUMENT anywhere in the merge command means the flag may be
     // hidden in it. The whitespace anchor missed the QUOTED form
     // `gh pr merge 999 "$(printf '\x2d\x2d\x61dmin')"`, whose `$` follows a `"`.
@@ -381,25 +380,63 @@ export function isAdminMergeCommand(command: string): boolean {
         break;
       }
     }
-    if (mergeIdx === -1) return false;
+    if (mergeIdx === -1) {
+      // The VERB WORD may itself be construct-spliced, so the exact token match
+      // finds no `merge` and everything below is skipped: ``gh pr m`printf erge`
+      // 999 $V`` and ``gh p`printf r` merge 999 $V`` are both real admin merges
+      // (cycle-5 review P0, third seam).
+      //
+      // The signal is a CONSTRUCT IN A VERB POSITION — the token right after `gh`
+      // or right after `pr`. Requiring only "construct + the words gh and pr" was
+      // too broad (it made `gh pr view $X` an admin merge), and requiring `pr` to
+      // be a word missed ``gh p`printf r` …``, where `printf` hides it.
+      const hasConstructTokenAfter = (word: string): boolean => {
+        for (let i = 0; i < scan.tokens.length - 1; i++) {
+          if (dequote(scan.tokens[i]) !== word) continue;
+          if (/[$`]/.test(scan.tokens[i + 1] ?? "")) return true;
+        }
+        return false;
+      };
+      if (!hasUnresolvableConstruct(command)) return false;
+      return hasConstructTokenAfter("gh") || hasConstructTokenAfter("pr");
+    }
+    // The literal word `merge` gates the rest, but it must come AFTER the
+    // spliced-verb fallback above: ``gh pr m`printf erge` …`` has no literal
+    // `merge` at all (cycle-5 review P0, third seam).
+    if (!/(^|[^\w])merge\b/.test(normalizeForFlagScan(command))) return false;
+
     // Work on the RAW text after the `merge` word, not on tokens: the separator
-    // split breaks `$(printf ...)` into `"$` + `printf` + ..., so a token-local
-    // test missed a QUOTED substitution supplying the flag (cycle-4 P0-3).
+    // split breaks `$(printf ...)` into `"$` + `printf` + ..., so a token-local test
+    // missed a QUOTED substitution supplying the flag (cycle-4 P0-3).
+    // NOTE: backticks count. `hasUnresolvableConstruct` counts them, but this loop
+    // tested only `/\$/`, so a backtick-substituted flag was invisible
+    // (cycle-5 review P0, first seam).
     const afterMerge = command
       .slice(scan.starts[mergeIdx] + scan.tokens[mergeIdx].length)
       .replace(/^\s+/, "")
       .split(/\s+/)
       .filter(Boolean);
-    // Drop the POSITION argument (a benign `"$PR"`) and drop a value-flag's value
-    // (`--body "$(cat msg)"` is not a flag). What remains is the only place an
-    // `--admin` could be hiding.
+    // A literal number LATER in the argument list means the POSITION was not the
+    // first argument, so the flag may be sitting in the first slot:
+    // `V=$(printf x --adm); gh pr merge $V 999` is a real admin merge
+    // (cycle-5 review P0, second seam). With no later number, a first-slot variable
+    // is the ordinary `gh pr merge "$PR" --squash` and stays clean.
+    // A value-flag's value is never the flag.
+    const laterBareNumber = afterMerge.slice(1).some((a) => /^\d+$/.test(a));
     const VALUE_FLAGS = new Set([
       "--body", "-b", "--body-file", "-F", "--subject", "-t",
       "--author-email", "--repo", "-R", "--match-head-commit",
     ]);
-    for (let i = 1; i < afterMerge.length; i++) {
-      if (VALUE_FLAGS.has(afterMerge[i - 1])) continue;
-      if (/\$/.test(afterMerge[i])) return true;
+    for (let i = 0; i < afterMerge.length; i++) {
+      const arg = afterMerge[i];
+      if (i > 0 && VALUE_FLAGS.has(afterMerge[i - 1])) continue;
+      if (!/[$`]/.test(arg)) continue;
+      if (i === 0) {
+        if (/\$\(|`/.test(arg)) return true; // a CONSTRUCTED value in the position slot
+        if (laterBareNumber) return true; // the position was actually later
+        continue; // a genuine `$PR` position argument
+      }
+      return true;
     }
     return false;
   }
@@ -1073,9 +1110,12 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  *     --squash`). With an admin flag the rule below catches it, and an ANSI-C verb
  *     (`gh p$'r' …`) is refused by rule 2(a) regardless. The registry gate is
  *     outside #930's scope, so this is noted, not fixed.
- * (Brace expansion `--{admin,squash}` and a construct-supplied dash such as
- * `-${V:--}admin=true` were on this list in an earlier revision and are now
- * CLOSED by rule 2 below — verified, not assumed.)
+ * (A construct-supplied dash such as `-${V:--}admin=true` was on this list in an
+ * earlier revision and is now CLOSED by rule 2 below — verified, not assumed.
+ * BRACE EXPANSION is closed ONLY in the forms where the expanded word still
+ * contains `admin`: `--adm{in,}` is NOT gated, because the expansion also yields
+ * `--adm`/`--ad`, which gh rejects, so it never produced an executed merge. Do not
+ * read an earlier "brace expansion … CLOSED" wording as wider than this.)
  *
  * A `$VAR`- or `$()`-SUPPLIED FLAG is CLOSED by failing closed: any `$`-bearing
  * ARGUMENT of the merge beyond the position argument makes the command an admin

@@ -3296,6 +3296,14 @@ for (const [label, command] of [
   // Cycle-4 review P0-3: the flag may be SUPPLIED by a quoted substitution, whose
   // `$` follows a `"` — a whitespace-anchored test missed it entirely.
   ["a quoted substitution supplying the flag", `gh pr merge ${PR_ADMIN} "$(printf '\\x2d\\x2d\\x61dmin')"`],
+  // Cycle-5 review P0: a construct-ASSEMBLED flag in a BACKTICK substitution, in the
+  // POSITION slot, or with a splice on the VERB itself — hex escapes dodge the
+  // literal word `admin`, so no literal rule can fire.
+  ["a backtick substitution supplying the flag", "gh pr merge " + PR_ADMIN + " `printf '\\x2d\\x2d\\x61dmin'`"],
+  ["a substitution in the POSITION slot", "gh pr merge $(printf '\\x2d\\x2d\\x61dmin') " + PR_ADMIN],
+  ["a variable in the position slot with a later number", "V=$(printf '\\x2d\\x2d\\x61dmin'); gh pr merge $V " + PR_ADMIN],
+  ["a backtick-spliced `pr` word", "V=$(printf x); gh p`printf r` merge " + PR_ADMIN + " $V"],
+  ["a backtick-spliced `merge` verb", "V=$(printf x); gh pr m`printf erge` " + PR_ADMIN + " $V"],
 ] as const) {
   testAsync(`#930 refusal: ${label} without evidence is BLOCKED`, async () => {
     await withTempHome(async () => {

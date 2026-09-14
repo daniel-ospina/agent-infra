@@ -42,10 +42,27 @@ examined="$(read_report examined)"
 
 # Fail closed on a MISSING counter too: a report that does not carry `tested` is
 # from a parser too old to answer the question, which is not the same as a yes.
-if [ -z "$tested" ]; then
-  echo "::error::vacuity guard: the report at '${REPORT}' carries no 'tested' counter (examined=${examined:-?} completed=${completed:-?}) — cannot certify ${SHA}"
-  exit 1
-fi
+# A NON-NUMERIC counter answers nothing either — `[ "$tested" -eq 0 ]` returns 2
+# under `set -uo pipefail` (no `-e`), the `if` is skipped, and the script printed
+# success: a fail-OPEN in the guard itself (cycle-5 review P2).
+case "${tested:-}" in
+  '')
+    echo "::error::vacuity guard: the report at '${REPORT}' carries no 'tested' counter (examined=${examined:-?} completed=${completed:-?}) — cannot certify ${SHA}"
+    exit 1
+    ;;
+esac
+case "${tested}" in
+  *[!0-9]*)
+    echo "::error::vacuity guard: 'tested' is not a number ('${tested}') in '${REPORT}' — cannot certify ${SHA}"
+    exit 1
+    ;;
+esac
+case "${pending:-0}" in
+  *[!0-9]*)
+    echo "::error::vacuity guard: 'pending' is not a number ('${pending}') in '${REPORT}' — cannot certify ${SHA}"
+    exit 1
+    ;;
+esac
 
 if [ "$tested" -eq 0 ]; then
   echo "::error::vacuity guard: ${LANE} produced NO tested run of ${SHA} (examined=${examined:-0} completed=${completed:-0} tested=0) — a comparison with no run cannot certify this merge"
