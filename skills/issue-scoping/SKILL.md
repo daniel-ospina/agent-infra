@@ -13,7 +13,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 **Human approval gate:** presents output for user review. Pipeline advances after approval.
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 
 > **Canonical:** `agent-infra/skills/issue-scoping/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
@@ -856,55 +856,6 @@ Output the complete plan draft, including `### Adversarial Threat Surface` when 
 Same agent, independently dispatched. Controller merges if both choose same approach; decides with rationale if different.
 
 **Merge tiebreaker:** When equal, prefer better outcome. When one is clearly better and the other easier, pick the better one.
-
----
-
-## Phase 5.6 — Second-Model Coherence Check (Two-Tier Review)
-
-After solution-verify converges clean (both diamond verification gates passed with Flash reviewers), dispatch ONE second-model reviewer to check **cross-diamond coherence**. The second model checks that the problem definition and solution approach are consistent, nothing was lost between diamonds, and the scoping output is complete.
-
-**Model (second-model gate, #716):** resolve the effective model with the guard — `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe` (network): it writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED` (exit 1). **`--probe` is the resolution AND the dispatch authority.** `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --print` is an **offline hint for inspection only** (honours `$SECOND_MODEL`, else the ordered `preference` in `pi-bootstrap/pi-config/second-model.json`) — it opens no socket, so it **cannot verify solvency**: it emits a *candidate* (with a loud stderr notice) and must NEVER be the dispatch source. **Dispatch contract:** dispatch `model=<RESOLVED id>` from `--probe` (the liveness gate is the dispatch authority; `--print` is an offline hint, never the resolution). With `$SECOND_MODEL` set the probe certifies **only** that id — if it is not solvent+reachable (or declares no probe endpoint in `preference`) the probe is `DEGRADED` and never falls through to a config default.
-
-**Fail-closed DEGRADED (no silent fallback):** if `--probe` exits non-zero (it prints plain `DEGRADED`; the trigger is the `--probe` exit code, never `--print`) — `--print`'s `**DEGRADED` fires only for a malformed/unusable authority — do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review, the exact #716 defect. There is NO recordable degraded marker — check (f) hard-fails both forms: `model=**DEGRADED` is rejected as a reserved value (before the independence field is read), and `independent=DEGRADED` is rejected by design. STOP and escalate to a human: a degraded second-model gate is a human decision, not an auto-fallback, and the guarded-surface change cannot merge until an independent model is funded or the operator authorizes a bypass (#860). `[#476 hop-leg]` is orthogonal and stackable — a dispatch that lands on a failover hop is annotated `[SECOND-MODEL-GATE][#476 hop-leg]`, and a hop-leg run is never presented as the configured second model. Pricing/base decision: issue #284, superseded by #716.
-
-**Success path — record the marker (required):** when the probe resolves, record the success form as well: `SECOND_MODEL_GATE_MODEL=<RESOLVED id> SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh` (it appends `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>`). check (f) in `scripts/check-pipeline-compliance.sh` requires that line on ANY diff touching the second-model guarded surface, so a successful gate that is never recorded still fails the merge gate.
-
-**Dispatch:**
-```
-task(model=<RESOLVED provider/id from `$AGENT_INFRA_PATH/scripts/check-second-model.sh --probe`>, prompt=<coherence check prompt>)
-```
-
-**Prompt:**
-```
-You are a senior reviewer checking cross-diamond coherence of a scoping session. Both diamonds passed verification individually — your job is to check they HANG TOGETHER.
-
-CONFIRMED PROBLEM: <from Phase 2>
-SOLUTION APPROACH: <from Phase 5>
-ORIGINAL ISSUE: <issue body>
-RESEARCH ARTIFACT: <### Axis Research + ### Integration Docs from Phase 1.5>
-
-CHECK:
-1. Does the solution actually address the confirmed problem? Or did it drift back to the original issue framing?
-2. Were any problem-dimensions discovered in Phase 1 but dropped by Phase 5?
-3. Are edge cases from problem-diverge handled in the solution?
-4. Is there a SIMPLER approach that would achieve the same outcome? (Devil's advocate)
-5. What is the weakest assumption in this scoping?
-6. RESEARCH CROSS-CHECK: do the chosen approach's dependency claims match `### Integration Docs` (any dep in the plan absent from the research artifact, or contradicted by it, is flagged)?
-
-Output ISSUE blocks or NO ISSUES FOUND.
-```
-
-**Second-model findings surfaced as `[SECOND-MODEL-GATE]`:**
-
-| Second-model Issue | Action |
-|---|---|
-| `[SECOND-MODEL-GATE] P0` | Problem-solution mismatch — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P1` | Important gap — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P2` | Improvement — note, do NOT re-run |
-
-**Re-dispatch:** Max 2 cycles. On 2nd failure → surface in scoping comment as `[SECOND-MODEL-GATE]` with "second-model coherence check could not converge."
-
-**Applies to:** Standard + Complex tiers only. Micro tier skips (single full-diamond-verify is sufficient).
 
 ---
 

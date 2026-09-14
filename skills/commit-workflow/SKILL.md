@@ -59,7 +59,7 @@ CONTENT is clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resol
 regression check for code PRs) AND the verification gate verified the staged files. The review
 is surface-dispatched from the PR diff (issue complexity ratings scale review depth, per
 `code-review` Step 0.8 infra detection + Step 3.6 surface matrix, and `test-routing` domain dispatch):
-always-on: bug scan (shallow+deep), guidance compliance, history, prior-PR comments, and SECURITY
+always-on: bug scan (one checker, two ORDERED passes — the blind diff scan first, then the deep caller/callee), guidance compliance, history + prior-PR comments (one checker), and SECURITY
 (security-review skill discipline — HIGH-confidence findings only, research-before-report);
 plus domain reviewers as applicable: skills/extensions/.mcp.json/ontology → Skill Infrastructure /
 Ontology & Templates / Extension Safety; UX → ux-consistency/ux-coverage/ux-realism (code-review) + ux-verification (test-routing); config → Agent #12 config review;

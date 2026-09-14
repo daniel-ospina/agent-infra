@@ -310,7 +310,6 @@ differs, because the PR diff is invisible here):
 | c. code-review evidence | skipped — no PR body/commits yet | enforced |
 | d. plan doc | **`Wiring` branch only** — the `docs/plans/*.md` branch reads the PR diff | enforced (both branches) |
 | e. test-coverage evidence | skipped — no diff/body yet | enforced |
-| f. second-model gate (#716) | skipped — needs the PR diff, body/commits and base ref | enforced |
 
 Tier exemptions are identical to the merge-time run: `complexity:micro` skips the issue-side
 checks (a micro issue exits 0 with no artifacts); an **unlabeled** issue is treated as

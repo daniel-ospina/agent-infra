@@ -46,12 +46,12 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 
 
 > **Canonical:** `agent-infra/skills/code-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **Unified v3.2.0** — agent-neutral. Consolidates Claude (v1.8.0) and Pi (v2.0.0) versions. Test coverage Step 0, 5-agent review (Agent #2 split into shallow + deep), convergence-gated fixer loop, `--standard-tier` flag, Supabase error logging, merge-dedup step. Uses agent-neutral sub-agent dispatch.
+> **Unified v3.2.0** — agent-neutral. Consolidates Claude (v1.8.0) and Pi (v2.0.0) versions. Test coverage Step 0, 4 always-on reviewers (Bug scan runs two ordered passes — blind diff scan then deep; History and PR-comment history merged into one), convergence-gated fixer loop, `--standard-tier` flag, Supabase error logging, merge-dedup step. Uses agent-neutral sub-agent dispatch.
 
 # Code Review
 
@@ -63,7 +63,7 @@ Provide a code review for the given pull request.
 
 - `PR_NUMBER`: the pull request number to review
 - `--re-review`: follow-up review after fix commits; see Smart Re-Review
-- `--standard-tier`: reduced 2-agent review (Guidance Compliance + Bug Scan — shallow only, #2a)
+- `--standard-tier`: reduced 2-agent review (Guidance Compliance + Bug Scan — pass 1 only, the blind diff scan; the deep pass 2 is skipped)
 
 **Routing:**
 - `--standard-tier` present → skip to **Standard-Tier Review**
@@ -443,15 +443,15 @@ Store all variables for Step 4 dispatch.
 
 ---
 
-### Step 4 — Parallel Review (6-10 agents, surface-matched, ratings scale depth)
+### Step 4 — Parallel Review (4-11 agents, surface-matched, ratings scale depth)
 
-Launch **6 always-on agents** (Guidance, Bug-Shallow, Bug-Deep, History, PR Comments, Security) plus **up to 4 surface-matched domain agents** (UX, Architecture, Data, Config) in parallel via Pi `task`. Domain agents trigger on the PR diff surface (Step 3.6); complexity ratings, when present, scale depth inside each reviewer. Each receives the PR diff, CLAUDE.md paths, affected files, and research context (if any). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch **4 always-on agents** (Guidance, Bug (two passes: blind diff scan, then deep caller/callee), History, Security) plus **up to 4 surface-matched domain agents** (UX, Architecture, Data, Config) in parallel via Pi `task`. Domain agents trigger on the PR diff surface (Step 3.6); complexity ratings, when present, scale depth inside each reviewer. Each receives the PR diff, CLAUDE.md paths, affected files, and research context (if any). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
 **Dispatch logic:**
 ```bash
 # Always dispatch
-# Always-on: 6 agents (Agent #2 split into shallow + deep — #2a and #2b; Security is #11)
-AGENTS="Agent #1 (Guidance), Agent #2a (Bug Scan - Shallow), Agent #2b (Bug Scan - Deep), Agent #3 (History), Agent #4 (PR Comments), Agent #11 (Security)"
+# Always-on: 4 agents (Agent #2 runs two passes in order; History + PR Comments merged into Agent #3; Security is #11)
+AGENTS="Agent #1 (Guidance), Agent #2 (Bug Scan - two-pass), Agent #3 (History + PR Comments), Agent #11 (Security)"
 
 # Surface-first dispatch (domain reviewers fire on the DIFF — ratings scale depth inside the agents)
 [ "$UI_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #5 (UX — epic reviewers)"
@@ -487,7 +487,11 @@ ISSUE:
   suggestion: <what to fix>
 ```
 
-**Agent #2a — Bug Scan (Shallow Diff)**:
+**Agent #2 — Bug Scan (Two Passes, In Order)**:
+
+Run BOTH passes in order in this one reviewer. Pass 1 is deliberately blind — do NOT read extra context before it reports; that blindness is load-bearing (it prevents the reviewer talking itself out of a finding). Pass 2 then reads full files plus the call graph. Keep `check_type: bug` on both; prefix pass-2 findings with `[deep]`.
+
+*Pass 1 — Shallow Diff (blind — the diff ONLY):*
 ```
 Shallow scan of the PR diff for obvious bugs. Focus on the changes themselves — avoid reading extra context.
 Look for: null pointer dereferences, wrong variable, inverted condition, missing async/await, incorrect API usage.
@@ -502,7 +506,7 @@ ISSUE:
   suggestion: <what to fix>
 ```
 
-**Agent #2b — Bug Scan (Deep — Caller/Callee)**:
+*Pass 2 — Deep (Caller/Callee) — run only AFTER pass 1 has reported:*
 ```
 Deep bug scan — read full changed files plus their import graph. Trace callers and callees. Check for broken contracts, cascading side effects, missing error propagation.
 
@@ -529,26 +533,15 @@ ISSUE:
   suggestion: <what to fix>
 ```
 
-**Agent #3 — Git History/Blame**:
+**Agent #3 — Git History/Blame + Previous PR Comments** (merged: both halves walk the same file history):
 ```
-Read git blame and history of the code modified. Identify bugs visible only in historical context:
+Part A — Git history/blame. Read git blame and history of the code modified. Identify bugs visible only in historical context:
 - Regressions after a previous fix
 - Removed safety checks or guards
 - Repeated bugfix attempts that indicate a deeper issue
 - Patterns of breakage on these files/lines
 
-For each issue found, return:
-ISSUE:
-  check_type: historical-context
-  severity: P0|P1|P2
-  location: <file path>:<line>
-  description: <what's wrong>
-  suggestion: <what to fix>
-```
-
-**Agent #4 — Previous PR Comments**:
-```
-Find prior PRs that touched the same files. For each prior PR, read its comments.
+Part B — Previous PR comments. Find prior PRs that touched the same files. For each prior PR, read its comments.
 Flag cases where the current PR repeats an issue flagged in a past review on the same files.
 Steps:
 1. For each affected file: gh api '/repos/{owner}/{repo}/commits?path={file}&per_page=20'
@@ -558,10 +551,10 @@ Steps:
 
 For each issue found, return:
 ISSUE:
-  check_type: pr-comment-history
+  check_type: historical-context|pr-comment-history
   severity: P0|P1|P2
   location: <file path>:<line>
-  description: <repeated issue from PR #N>
+  description: <what's wrong; for Part B say "repeated issue from PR #N">
   suggestion: <what to fix>
 ```
 
@@ -803,20 +796,20 @@ If no issues: NO ISSUES FOUND
 
 ### Step 4.5 — Merge-Dedup Bug Scan Results
 
-Agent #2a (shallow) and Agent #2b (deep) may find overlapping or complementary bugs. After all agents return, merge their results:
+Agent #2's pass 1 (blind diff scan) and pass 2 (deep caller/callee) may find overlapping or complementary bugs. After all agents return, merge their results:
 
-1. **Dedup by location:** If both #2a and #2b flag the same `location` (file:line), keep only the more severe issue (prefer P0 > P1 > P2). If severity matches, prefer the deeper analysis (#2b).
+1. **Dedup by location:** If both passes flag the same `location` (file:line), keep only the more severe issue (prefer P0 > P1 > P2). If severity matches, prefer the deeper analysis (pass 2).
 
-2. **Complement check:** For each #2b issue that targets a caller/callee outside the diff, cross-reference with #2a results. If #2a flagged the same root cause at the source location, merge into a single issue with both locations cited.
+2. **Complement check:** For each pass-2 issue that targets a caller/callee outside the diff, cross-reference with pass-1 results. If pass 1 flagged the same root cause at the source location, merge into a single issue with both locations cited.
 
 3. **Output:** Produce a deduplicated, merged list of `check_type: bug` issues for confidence scoring in Step 5. Document merge decisions:
    ```
-   MERGE: #2a location X + #2b location Y → merged (same root cause, source at X, side effect at Y)
-   SKIP: #2a location Z (superseded by #2b deeper finding at same location)
-   KEEP: #2b location W (unique deep finding, no shallow overlap)
+   MERGE: pass 1 location X + pass 2 location Y → merged (same root cause, source at X, side effect at Y)
+   SKIP: pass 1 location Z (superseded by pass 2 deeper finding at same location)
+   KEEP: pass 2 location W (unique deep finding, no shallow overlap)
    ```
 
-Return the merged bug issues alongside Agent #1/#3/#4/#5/#6/#7 issues unchanged.
+Return the merged bug issues alongside Agent #1/#3/#5/#6/#7 issues unchanged.
 
 ### Step 5 — Confidence Scoring
 
@@ -979,35 +972,6 @@ When the fixer loop exits with remaining issues (stall/cap/fail), the **orchestr
 4. **If issues still remain** → THEN post the PR comment with the warning + remaining issues. These are the genuinely hard problems that need human judgment. Add a `### Requires Human Attention` section explaining what was tried and why each issue couldn't be auto-resolved.
 
 **Pause only when:** a taxonomy-matching decision arises (human input taxonomy). Everything else proceeds unattended.
-
-### Step 6.6 — Second-Model Final Gate (Two-Tier Review)
-
-After the fixer loop converges clean (all Flash-based review cycles done), dispatch ONE second-model reviewer as a final quality gate. The second model is a stronger reasoner — it catches what the cheaper review agents miss.
-
-**Model (second-model gate, #716):** resolve the effective model with the guard — `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe` (network): it writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED` (exit 1). **`--probe` is the resolution AND the dispatch authority.** `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --print` is an **offline hint for inspection only** (honours `$SECOND_MODEL`, else the ordered `preference` in `pi-bootstrap/pi-config/second-model.json`) — it opens no socket, so it **cannot verify solvency**: it emits a *candidate* (with a loud stderr notice) and must NEVER be the dispatch source. **Dispatch contract:** dispatch `model=<RESOLVED id>` from `--probe` (the liveness gate is the dispatch authority; `--print` is an offline hint, never the resolution). With `$SECOND_MODEL` set the probe certifies **only** that id — if it is not solvent+reachable (or declares no probe endpoint in `preference`) the probe is `DEGRADED` and never falls through to a config default.
-
-**Fail-closed DEGRADED (no silent fallback):** if `--probe` exits non-zero (it prints plain `DEGRADED`; the trigger is the `--probe` exit code, never `--print`) — `--print`'s `**DEGRADED` fires only for a malformed/unusable authority — do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review, the exact #716 defect. There is NO recordable degraded marker — check (f) hard-fails both forms: `model=**DEGRADED` is rejected as a reserved value (before the independence field is read), and `independent=DEGRADED` is rejected by design. STOP and escalate to a human: a degraded second-model gate is a human decision, not an auto-fallback, and the guarded-surface change cannot merge until an independent model is funded or the operator authorizes a bypass (#860). `[#476 hop-leg]` is orthogonal and stackable — a dispatch that lands on a failover hop is annotated `[SECOND-MODEL-GATE][#476 hop-leg]`, and a hop-leg run is never presented as the configured second model. Pricing/base decision: issue #284, superseded by #716.
-
-**Success path — record the marker (required):** when the probe resolves, record the success form as well: `SECOND_MODEL_GATE_MODEL=<RESOLVED id> SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh` (it appends `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>`). check (f) in `scripts/check-pipeline-compliance.sh` requires that line on ANY diff touching the second-model guarded surface, so a successful gate that is never recorded still fails the merge gate.
-
-**Dispatch:**
-```
-task(model=<RESOLVED provider/id from `$AGENT_INFRA_PATH/scripts/check-second-model.sh --probe`>, prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
-```
-
-**Prompt:** Same review dimensions as Steps 4-5 agents — the second model just applies stronger reasoning. No prompt engineering needed.
-
-**Second-model findings surfaced as `[SECOND-MODEL-GATE]` severity:**
-
-| Second-model Issue | Action |
-|---|---|
-| `[SECOND-MODEL-GATE] P0` | Structural flaw missed by Flash — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P1` | Important gap — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P2` | Real improvement — fix required, re-run the second-model gate once (P2s block the merge gate) |
-
-**Re-dispatch:** Max 2 second-model cycles. On 2nd failure → surface in PR comment as `[SECOND-MODEL-GATE]` with "second-model final gate could not converge."
-
-**Gate passes:** second-model gate returns CLEAN (no P0/P1/P2 findings). Proceed to Step 7.
 
 ### Step 7 — Eligibility Re-check
 
@@ -1187,7 +1151,7 @@ Runs 2 agents. Used when full review is disproportionate.
 
 **Step 1-3:** Same as full review (eligibility, CLAUDE.md paths, summary).
 
-**Step 4:** Launch only 2 parallel agents — Guidance Compliance + Bug Scan (shallow only, Agent #2a). Skip Agent #2b (deep), Agent #3 (History), and Agent #4 (PR Comments).
+**Step 4:** Launch only 2 parallel agents — Guidance Compliance + Bug Scan (pass 1 only, the blind diff scan). Skip Agent #2's deep pass 2 and Agent #3 (History + PR Comments).
 
 **Step 5 onward:** Same as full review (scoring, filter, fixer, re-check, comment, logging), then record the verdict (Step 10). Append `(standard-tier review: guidance compliance + bug scan)` to comment header.
 
@@ -1197,7 +1161,7 @@ If `--re-review` with `--standard-tier`: identify fix commits (delta diff identi
 
 ## Smart Re-Review (`--re-review`)
 
-Targeted review on fix commits only. Skipped agents: Git History, PR Comments (static — won't have changed).
+Targeted review on fix commits only. Skipped agent: #3 Git History + Previous PR Comments (static — won't have changed).
 
 **Step A — Identify fix commits:** Sub-agent finds commits pushed after the most recent "### Code review" bot comment. Returns fix commit SHAs + distinct file count + combined delta diff.
 

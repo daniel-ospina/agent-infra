@@ -15,7 +15,7 @@ allowed-tools: read write edit bash web_search web_fetch todo_write task grep fi
 # Subagent-Driven Development
 Execute plan by dispatching fresh subagent per task, with two-stage review after each: spec compliance review first, then code quality review.
 
-> **Cold-class seam (#512):** the two-stage spec/code reviewers are cache-cold one-shot eval dispatches — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id). **Unset (default) = inert.** Implementer dispatches and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+> **Cold-class seam (#512):** the two-stage spec/code reviewers are cache-cold one-shot eval dispatches — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id). **Unset (default) = inert.** Implementer dispatches never route venice (docs/providers.md §8).
 
 **Why subagents:** You delegate tasks to specialized agents with isolated context. By precisely crafting their instructions and context, you ensure they stay focused and succeed at their task. They should never inherit your session's context or history — you construct exactly what they need. This also preserves your own context for coordination work.
 
@@ -165,22 +165,18 @@ digraph process {
 
 ## Model Selection
 
-**Implementer + per-task reviewers (spec + code quality):** Use the same model as the current session. The session model is already configured with valid credentials and is capable of every task in this workflow. Do NOT specify a different model for sub-agents unless the user explicitly instructs you to do so.
-
-**Final code reviewer (after all tasks):** resolve the model with the second-model gate guard (#716) — `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe` (network; writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED`). **`--probe` is the resolution AND the dispatch authority.** `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --print` is an **offline hint for inspection only** (never the dispatch source): it opens no socket, so it cannot verify solvency and emits a *candidate* (with a loud stderr notice). Dispatch `model=<RESOLVED id>` from `--probe` (the liveness gate is the dispatch authority; `--print` is an offline hint, never the resolution). With `$SECOND_MODEL` set the probe certifies **only** that id — if it is not solvent+reachable (or declares no probe endpoint in `preference`) the probe is `DEGRADED` and never falls through to a config default. Never a hardcoded default. **Fail-closed DEGRADED (no silent fallback):** if `--print` returns `**DEGRADED` for a malformed/unusable authority, or the probe exits non-zero, do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review (the exact #716 defect). The probe never emits the `**DEGRADED` token — it prints plain `DEGRADED` and exits 1 — so the governing trigger is the `--probe` exit code; `--print`'s `**DEGRADED` covers only a malformed/unusable authority and is never the resolution. Literal-matching only `**DEGRADED` never trips fail-closed here. There is NO recordable degraded marker — check (f) hard-fails both forms: `model=**DEGRADED` is rejected as a reserved value (before the independence field is read), and `independent=DEGRADED` is rejected by design. STOP and escalate to a human: the guarded-surface change cannot merge until an independent model is funded or the operator authorizes a bypass (#860). `[#476 hop-leg]` is orthogonal and stackable — a dispatch that lands on a failover hop is annotated `[SECOND-MODEL-GATE][#476 hop-leg]`, and a hop-leg run is never presented as the configured second model. This is the two-tier review pattern — Flash handles per-task reviews, the second model serves as the senior reviewer for the final pass across the entire implementation. It catches what cheaper per-task reviewers miss. Pricing/base decision: issue #284, superseded by #716.
-
-**Success path — record the marker (required):** when the probe resolves, record the success form as well: `SECOND_MODEL_GATE_MODEL=<RESOLVED id> SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh` (it appends `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>`). check (f) in `scripts/check-pipeline-compliance.sh` requires that line on ANY diff touching the second-model guarded surface, so a successful gate that is never recorded still fails the merge gate.
+**Implementer + per-task reviewers (spec + code quality):** Use the same model as the current session. The session model is already configured with valid credentials and is capable of every task in this workflow. Do NOT specify a different model for sub-agents unless the user explicitly instructs you to do so. This applies to the final code reviewer too — the final review uses the session model (single-model review; the former second-model final gate was removed).
 
 ```
-# Per-task reviews — session model (Flash)
+# Per-task reviews — session model
 task(prompt=spec_reviewer_prompt)
 task(prompt=code_quality_reviewer_prompt)
 
-# Final review — second-model gate
-task(prompt=final_code_reviewer_prompt, model=<RESOLVED provider/id from `$AGENT_INFRA_PATH/scripts/check-second-model.sh --probe`>)
+# Final review — session model
+task(prompt=final_code_reviewer_prompt)
 ```
 
-If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for per-task reviews to use the session default. Pass the resolver's `RESOLVED` id (`bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe`) only for the final code reviewer — never a build-equivalent id, and never the session default as the final review.
+If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for every review (per-task and final) to use the session default.
 
 ## Handling Implementer Status
 
