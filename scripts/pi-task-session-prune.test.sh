@@ -304,7 +304,12 @@ HOOK
 PS_HOOK_DIR="$T/P/hooks"; PS_COUNT="$T/P/ps.count"
 OUT="$(run_prune P --apply 2>&1)"; RC=$?
 assert_eq "$RC" "0" "P1 symlink-swap pass exits 0 (crash-free)"
-assert_contains "$(cat "$T/P/prune.log")" "SKIP unlink failed or parent no longer inside the canonical root" "P1 containment re-assert REFUSED the symlinked unlink (no escape)"
+# Mechanism link — the three assertions below are the OUTCOME link (outside
+# file present / unmodified / pruned=0). The guard's refusal line is the only
+# observable that the atomic re-assert fired instead of unlinking; "no escape"
+# is proven by those outcomes, not by this grep. Coupled to that log string in
+# scripts/pi-task-session-prune.sh — reword one, reword both.
+assert_contains "$(cat "$T/P/prune.log")" "SKIP unlink failed or parent no longer inside the canonical root" "P1 containment re-assert fired and REFUSED the symlinked unlink"
 exists "$OUTSIDE_SWAP/1780000000_swapped.jsonl" "P1 file OUTSIDE the root survives the mid-window symlink swap"
 assert_eq "$(cat "$OUTSIDE_SWAP/1780000000_swapped.jsonl")" "PRECIOUS" "P1 the outside file is not merely present but UNMODIFIED"
 assert_contains "$OUT" "pruned=0" "P1 nothing was pruned through the planted symlink"
