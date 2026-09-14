@@ -122,58 +122,65 @@ wait_for_run() {
 
 # build_evidence — the machine-readable comment. The marker binds the evidence
 # to ONE head SHA: every push invalidates it, and the merge gate matches on it.
-# The provenance list: one `sha:id` per failing main run. It grows with
-# --main-runs and is NOT bounded by `cap`/`linemax` — measured at N=1000 (a
-# 40-hex sha + 11-digit run id per entry, as `gh run list` actually emits) it is
-# ~53,000 chars alone, making the whole body ~108,000, well over the 65,536-char
-# cap. Elide it past 50 entries; nothing certifying depends on its length (the
-# regex only needs `union of N runs of <lane>:`). (VGATE rounds 3-4.)
+# ── EVIDENCE TAIL: one bound, one note, no fences ───────────────────────────
+# The shape here is deliberately minimal, and the reasons are load-bearing:
 #
-# KNOWN LIMIT: the elision counts and slices on commas. A `sha:id` entry cannot
-# contain one in practice (sha is hex, the run id is numeric), so this is
-# defensive only — but a comma-bearing entry would mis-count "and K more". #RESIDUAL
-provenance_list() {
+#  * A LIST, not a fenced code block. A fence is a parser with state: a node id
+#    containing a backtick run closes it early and swallows the rest of the
+#    comment. A list has no such surface — so the fence-length computation, the
+#    clip disclosure and the fence-balance test all cease to exist rather than
+#    needing to be right.
+#  * ONE limit for every embedded list, sized from the OBSERVED distribution:
+#    main's union baseline runs ~18-19 entries of ~60 chars, and the default
+#    window is 10 runs. So in practice the limit never fires — it is a safety
+#    branch, not machinery that engages on every merge. 25 x 300 = 7,500 chars
+#    per list; four lists is 30,000, comfortably under GitHub's 65,536-char body
+#    cap, with no per-case arithmetic to re-derive.
+#  * ONE note, on every list that was trimmed. A capped list that LOOKS complete
+#    is worse than no list, so trimming is always stated.
+#  * The display policy is stated ONCE in the body, not recomputed per list —
+#    which is why there is no second note vocabulary.
+#
+# Bounds here are sized to what has actually been observed, not to a hypothetical
+# worst case. Over-sizing them was how this section accumulated four interacting
+# rules and a fence algorithm in the first place.
+EVIDENCE_ENTRIES=25
+EVIDENCE_WIDTH=300
+
+# One <details> block: a list, capped, with a single stated remainder.
+#   $1 summary   $2 newline-separated content   $3 what to say when empty
+evidence_list() {
+  local summary="$1" content="$2" empty="$3"
+  local shown total more=0
+  # `|| true` guards the pipeline against SIGPIPE from `head` on large input.
+  shown="$(printf '%s\n' "$content" | head -n "$EVIDENCE_ENTRIES" | cut -c1-"$EVIDENCE_WIDTH" || true)"
+  total="$(printf '%s\n' "$content" | grep -c . 2>/dev/null || true)"
+  total="${total:-0}"
+  if [ "$total" -gt "$EVIDENCE_ENTRIES" ]; then more=$((total - EVIDENCE_ENTRIES)); fi
+  printf '<details><summary>%s</summary>\n\n' "$summary"
+  if [ -z "$(printf '%s' "$shown" | tr -d '[:space:]')" ]; then
+    printf '%s\n' "$empty"
+  else
+    printf '%s\n' "$shown" | grep . | sed 's/^/- /'
+    if [ "$more" -gt 0 ]; then
+      printf -- '- ...and %s more (list capped; the full set is reproducible from the run ids above)\n' "$more"
+    fi
+  fi
+  printf '\n</details>\n'
+  return 0
+}
+
+# The run ids for the provenance line, comma-separated — same single limit, so
+# there is one number to reason about rather than one per field.
+provenance_ids() {
   local raw n
-  raw="$(tr '\n' ' ' < "$1" | sed 's/ *$//' | tr ' ' ',' | sed 's/,,*/,/g' | sed 's/,$//')"
+  raw="$(tr '\n' ',' < "$1" | sed 's/,,*/,/g; s/,$//')"
   n="$(printf '%s' "$raw" | awk -F, '{print NF+0}')"
-  if [ "${n:-0}" -gt 50 ]; then
-    printf '%s' "$(printf '%s' "$raw" | cut -d, -f1-50), and $((n - 50)) more"
+  if [ "${n:-0}" -gt "$EVIDENCE_ENTRIES" ]; then
+    printf '%s' "$(printf '%s' "$raw" | cut -d, -f1-"$EVIDENCE_ENTRIES"),+$((n - EVIDENCE_ENTRIES)) more"
   else
     printf '%s' "$raw"
   fi
-}
-
-# One <details> block for a failing set, BOUNDED to <=$1 entries and <=$2 chars per
-# entry, with truncation ALWAYS stated. A capped list that looks complete is worse
-# than no list: the reader cannot tell a cap from the whole set.
-#   $1 cap (entries)  $2 linemax (chars/entry)  $3 summary  $4 content  $5 hint
-bounded_details() {
-  local cap="$1" linemax="$2" summary="$3" content="$4" hint="$5"
-  local shown n_total n_shown note="" fence='```'
-  # `|| true` guards the pipeline against SIGPIPE from `head` on large input.
-  shown="$(printf '%s\n' "$content" | head -n "$cap" | cut -c1-"$linemax" || true)"
-  # A node id containing a backtick RUN would close the fence early and swallow
-  # the rest of the comment — a PR author controls test names, and a test that
-  # prints `FAILED ``` ` is enough. Use a fence LONGER than any run in the
-  # content (the standard CommonMark remedy) so the block cannot be broken.
-  local runs
-  runs="$(printf '%s\n' "$shown" | awk '{n=0; for(i=1;i<=length($0);i++){if(substr($0,i,1)=="`"){n++; if(n>m)m=n} else n=0}} END{print m+0}')"
-  if [ "${runs:-0}" -ge 3 ]; then
-    fence="$(printf '`%.0s' $(seq 1 $((runs + 1))))"
-  fi
-  n_total="$(printf '%s\n' "$content" | grep -c . 2>/dev/null || true)"
-  n_shown="$(printf '%s\n' "$shown" | grep -c . 2>/dev/null || true)"
-  n_total="${n_total:-0}"
-  n_shown="${n_shown:-0}"
-  if [ "$n_total" -gt "$n_shown" ]; then
-    note="... and $((n_total - n_shown)) more (capped at $cap entries x $linemax chars so the evidence stays postable; full set: $hint)"
-  elif [ "$(printf '%s' "$content" | wc -m | tr -d ' ')" -gt "$(printf '%s' "$shown" | wc -m | tr -d ' ')" ]; then
-    note="... entries over $linemax chars are CLIPPED (so the evidence stays postable; full set: $hint)"
-  fi
-  printf '<details><summary>%s</summary>\n\n%s\n%s' "$summary" "$fence" "$shown"
-  [ -n "$note" ] && printf '\n%s' "$note"
-  printf '\n%s\n</details>\n' "$fence"
-  return 0
 }
 
 build_evidence() {
@@ -184,46 +191,29 @@ build_evidence() {
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
   printf 'test lane: %s\n' "$lane"
-  printf 'main compared (union of %s runs of %s): %s\n' "$MAIN_RUNS" "$lane" "$(provenance_list "$main_prov")"
+  printf 'main compared (union of %s runs of %s): %s\n' "$MAIN_RUNS" "$lane" "$(provenance_ids "$main_prov")"
   printf 'PR failing: %s | main failing: %s | unique to this PR: 0\n' "$pr_count" "$main_count"
   printf '%s\n' "$analyzed"
-  # THE AUDITABLE DIFF, not just its verdict. `unique: 0` is a CONCLUSION; a
-  # reviewer must be able to reach it from the comment alone. With a zero
-  # residual, the PR's own failing set IS the pre-existing set — so it is listed.
-  # Without it, the only evidence for "all N were already red on main" is an
-  # EMPTY `comm` block, indistinguishable from nothing having been compared at
-  # all, and the reviewer must re-run the tool to audit. (#3467 item 2.)
-  #
-  # BOUNDED THREE WAYS — a line cap alone is NOT a bound: GitHub rejects a body
-  # over 65,536 CHARACTERS, and pytest builds node ids from `parametrize` ids and
-  # reprs, so 400 over-long lines still blow the cap (`head -n 200` alone was
-  # measured at 65,479 B and over it past ~161 chars/line). <=100 entries x <=180
-  # chars = <=18,000 chars per block; three blocks (the flake path is the only
-  # way to get three non-empty) = <=54,000 chars, plus ~1.5 KB of scaffolding and
-  # a bounded provenance list — provably under the cap. The certifying lines are
-  # emitted ABOVE this point, so bounding the tail cannot affect certification.
-  # Units are CHARACTERS throughout (`cut -c` / `wc -m`), matching GitHub's own
-  # limit; bounding BYTES instead would need UTF-8-safe truncation to avoid
-  # splitting a multibyte char. (VGATE rounds 1-3.)
-  local cap=100 linemax=180
-  bounded_details "$cap" "$linemax" \
-    "the $pr_count failure(s) this PR carries — all pre-existing on main (union of $MAIN_RUNS runs)" \
-    "$(cat "$pr_fails")" "ci-failure-set.sh --pr"
-  bounded_details "$cap" "$linemax" \
-    "main baseline: $main_count pre-existing failure(s), for comparison" \
-    "$(cat "$main_fails")" "ci-failure-set.sh --main-union"
+  # THE AUDITABLE DIFF, not just its verdict (#3467 item 2): with a zero
+  # residual the PR's own failing set IS the pre-existing set, so recording it is
+  # what lets a reviewer reach `unique: 0` from the comment instead of taking it
+  # on faith — and what distinguishes a real "all N were already red on main"
+  # from a comparison that never happened.
+  evidence_list "the $pr_count failure(s) this PR carries — all pre-existing on main" \
+    "$(cat "$pr_fails")" "(none — this PR carries no failure of its own)"
+  evidence_list "main baseline: $main_count pre-existing failure(s), for comparison" \
+    "$(cat "$main_fails")" "(none)"
   # The PRE-rerun residual, when the flake path ran. Labelled for what it IS: it
-  # is NOT the diff of the two sets above (those are POST-rerun), so it must never
-  # be presented under a "must be empty" heading — a non-empty list under a
-  # "must be empty" label is an evidence-integrity defect. (VGATE round 2.)
+  # is NOT the diff of the two sets above (those are POST-rerun), so it must not
+  # be presented under a "must be empty" heading.
   if [ -n "$unique_raw" ]; then
-    bounded_details "$cap" "$linemax" \
-      'residual BEFORE the flake re-run — reclassified as flaky, NOT new failures' \
-      "$unique_raw" "re-run the rail"
+    evidence_list 'residual BEFORE the flake re-run — reclassified as flaky, NOT new failures' \
+      "$unique_raw" "(none)"
   fi
-  bounded_details "$cap" "$linemax" \
-    'final residual — raw <code>comm -23 pr-fails main-fails</code>; must be empty' \
-    "$final_unique_raw" "re-run the rail"
+  evidence_list 'final residual (`comm -23` pr-fails main-fails) — must be empty' \
+    "$final_unique_raw" "(empty — nothing unique to this PR)"
+  printf '\nLists show at most %s entries of %s chars; the full sets are reproducible from the run ids above.\n' \
+    "$EVIDENCE_ENTRIES" "$EVIDENCE_WIDTH"
   printf '%s\n' "$flake_line"
 }
 

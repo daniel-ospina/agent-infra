@@ -833,19 +833,13 @@ else
   fail "missing scripts/check-lane-tested.sh — the guard cannot be tested as shipped"
 fi
 
-# ── 24. the evidence body is BOUNDED (a very red main must stay postable) ──
-# GitHub rejects a comment body over 65,536 characters. The auditable-diff blocks
-# embed both failing sets verbatim, and main's set is a UNION over N runs. Unbounded,
-# the evidence stops being postable and a SAFE merge BLOCKS: fail-closed, but an
-# availability regression that bites exactly the situation the rail exists for.
-#
-# The payload below uses LONG node ids, not just many of them. A LINE cap alone is
-# not a byte bound — 250 entries x ~720 chars/side is ~180 KB unbounded, far over
-# the cap — so this scenario fails a line-cap-only fix (100 x 720 x 2 = 144 KB,
-# still over), and it asserts EACH block's note separately so a one-sided
-# reversion cannot pass. Units are CHARACTERS (`wc -m`), matching GitHub's limit
-# and the code's `cut -c`. (VGATE rounds 2-3.)
-echo "== 24. the evidence body is bounded, and stays certifying when truncated =="
+# ── 24. the evidence body is BOUNDED ────────────────────────────────────────
+# GitHub rejects a comment body over 65,536 chars. The embedded sets are LISTS
+# capped at EVIDENCE_ENTRIES (25) — sized from the OBSERVED distribution (main's
+# union runs 18-19 entries), so the cap is a safety branch, not machinery that
+# engages on every merge. Trimming is always STATED: a capped list that looks
+# complete is worse than no list.
+echo "== 24. the evidence body is bounded, and states its own trimming =="
 new_scen bigset
 HEAD_BIG="bbbb111100000000000000000000000000000000"
 printf '%s\n' "$HEAD_BIG" > "$SCEN/head"
@@ -860,67 +854,35 @@ done > "$SCEN/log-9901"
 cp "$SCEN/log-9901" "$SCEN/log-9902"    # identical sides → unique = 0 → the clean path
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && pass "a 250-entry, long-id set still certifies (exit 0)" \
-  || { fail "a 250-entry set blocked the merge (exit $rc) — the bound did not work"; sed 's/^/      /' "$TMP/err"; }
+[ "$rc" -eq 0 ] && pass "a 250-entry set still certifies (exit 0)" \
+  || { fail "a 250-entry set blocked the merge (exit $rc)"; sed 's/^/      /' "$TMP/err"; }
 if [ -f "$SCEN/comment" ]; then
   c="$SCEN/comment"
   chars=$(wc -m < "$c" | tr -d ' ')
-  bytes=$(wc -c < "$c" | tr -d ' ')
-  [ "$chars" -lt 65536 ] && pass "the evidence body is $chars chars ($bytes bytes), under GitHub's 65,536-char cap" \
-    || fail "the evidence body is $chars chars — over GitHub's cap, so a safe merge cannot post its evidence"
-  # BOTH blocks asserted separately: one generic match lets a one-sided reversion
-  # through (bound the PR block, leave main's uncapped → still green).
-  grep -qF -- '... and 150 more (capped at 100 entries x 180 chars so the evidence stays postable; full set: ci-failure-set.sh --pr)' "$c" \
-    && pass "the PR-set truncation is STATED, with its own hint" || fail "the PR-set truncation note is missing or wrong"
-  grep -qF -- '... and 150 more (capped at 100 entries x 180 chars so the evidence stays postable; full set: ci-failure-set.sh --main-union)' "$c" \
-    && pass "the main-set truncation is STATED, with its own hint" || fail "the main-set truncation note is missing/wrong — a one-sided reversion passes here"
-  # The certifying lines must survive: they are emitted ABOVE the bounded tail.
+  [ "$chars" -lt 65536 ] && pass "body is $chars chars, under GitHub's 65,536-char cap" \
+    || fail "body is $chars chars — over the cap, so a safe merge cannot post its evidence"
+  items=$(grep -c '^- tests/' "$c")
+  [ "$items" -eq 50 ] && pass "each set shows exactly the 25-entry cap (50 entries, 25 per set)" \
+    || fail "expected 50 listed entries, got $items — the cap is not applied per list"
+  grep -qF -- '- ...and 225 more' "$c" && pass "trimming is STATED (250 → 25 + 225 more), never silent" \
+    || fail "trimming is silent — a reader cannot tell a capped list from a complete one"
+  grep -qF -- 'Lists show at most 25 entries of 300 chars' "$c" && pass "the display policy is stated once, not per list" \
+    || fail "the display policy is missing"
   grep -q "PR failing: 250 | main failing: 250 | unique to this PR: 0" "$c" \
-    && pass "the counts line keeps the FULL, uncapped count" || fail "the counts line was corrupted by the bound"
-  grep -q "^PR head: $HEAD_BIG$" "$c" && pass "the head binding survives truncation" || fail "the head line was lost"
+    && pass "the counts line keeps the FULL, uncapped count" || fail "the counts line was corrupted"
+  grep -q "^PR head: $HEAD_BIG$" "$c" && pass "the head binding survives" || fail "the head line was lost"
   grep -q "main compared (union of 1 runs of python-ci.yml): mainfeed:9902" "$c" \
-    && pass "the provenance line survives truncation" || fail "the provenance line was lost"
-  # An unbalanced ``` swallows the rest of the comment and hides the audit trail.
-  fences=$(grep -c '^```$' "$c")
-  [ $((fences % 2)) -eq 0 ] && [ "$fences" -ge 6 ] \
-    && pass "code fences are balanced ($fences openings/closings)" \
-    || fail "unbalanced code fences in the evidence body ($fences) — the comment renders broken"
+    && pass "the provenance line is intact" || fail "the provenance line was lost"
 else
   fail "no evidence comment posted for the 250-entry case"
 fi
 
-# CLIP-ONLY path: FEWER entries than the cap, but entries longer than linemax. The
-# count note cannot fire here, so this is the only way to pin the clip disclosure —
-# silently clipping a node id makes the evidence wrong while looking complete.
-new_scen clipset
-HEAD_CLIP="cccc222200000000000000000000000000000000"
-printf '%s\n' "$HEAD_CLIP" > "$SCEN/head"
-lane_fail "$HEAD_CLIP" 9911 > "$SCEN/runs-$HEAD_CLIP"
-lane_fail mainfeed2 9912 > "$SCEN/runs-main"
-i=0
-while [ "$i" -lt 40 ]; do
-  log_failed "tests/test_clip.py::test_case_${i}_${LONG}"
-  i=$((i + 1))
-done > "$SCEN/log-9911"
-cp "$SCEN/log-9911" "$SCEN/log-9912"
-run_admin 42 --main-runs 1 >/dev/null 2>&1
-if [ -f "$SCEN/comment" ]; then
-  grep -qF -- '... entries over 180 chars are CLIPPED' "$SCEN/comment" \
-    && pass "over-long entries are DISCLOSED, not silently clipped" || fail "long entries are clipped SILENTLY — the evidence looks complete but is wrong"
-  grep -qF -- '... and 150 more' "$SCEN/comment" \
-    && fail "a count-truncation note fired when no entry was dropped" || pass "no spurious count note when only clipping occurred"
-else
-  fail "no evidence comment posted for the clip-only case"
-fi
-
-# ── 25. the FLAKE path's evidence is honest AND pinned ──────────────────────
-# The flake path is the ONLY way to get three non-empty blocks, and it is the
-# path where the pre-rerun residual is non-empty while the displayed PR set is
-# POST-rerun. Showing the pre-rerun residual under a "must be empty" heading
-# contradicts the sets around it (round-2 defect), and leaving that unpinned let
-# a reversion of the label AND of the 11th-argument selection pass 118/118.
-echo "== 25. the flake path labels its residual honestly and pins it ==
-"
+# ── 25. the flake path's evidence is honest ─────────────────────────────────
+# The flake path is the only route to three non-empty lists, and the only one
+# where the displayed PR set is POST-rerun while the pre-rerun residual is
+# non-empty. Showing that residual under a "must be empty" heading contradicts
+# the sets around it.
+echo "== 25. the flake path labels its residual honestly =="
 new_scen flakebig
 HEAD_FB="eeee444400000000000000000000000000000000"
 printf '%s\n' "$HEAD_FB" > "$SCEN/head"
@@ -936,7 +898,7 @@ i=0
 while [ "$i" -lt 120 ]; do
   log_passed "tests/test_flaky_big.py::test_case_$i"
   i=$((i + 1))
-done > "$SCEN/log-after-9931"          # every residual passes on retry → flaky
+done > "$SCEN/log-after-9931"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "a 120-entry flake residual certifies after the re-run (exit 0)" \
@@ -944,29 +906,24 @@ rc=$?
 if [ -f "$SCEN/comment" ]; then
   c="$SCEN/comment"
   grep -qF -- 'residual BEFORE the flake re-run — reclassified as flaky, NOT new failures' "$c" \
-    && pass "the pre-rerun residual is labelled for what it is (not 'must be empty')" \
-    || fail "the pre-rerun residual is missing or mislabelled — the round-2 defect is back"
-  grep -qF -- '... and 20 more' "$c" \
-    && pass "the pre-rerun residual is bounded too (120 → 100 shown)" \
-    || fail "the pre-rerun residual is unbounded — the third block escaped the cap"
-  # The "must be empty" block must show the POST-rerun residual: empty.
-  block="$(awk '/final residual/{f=1} f{print} f&&/<\/details>/{exit}' "$c")"
-  body_lines=$(printf '%s\n' "$block" | sed '1d' | grep -v '^```*$' | grep -v '^</details>$' | grep -c . || true)
-  [ "${body_lines:-0}" -eq 0 ] \
-    && pass "the 'must be empty' block is EMPTY (post-rerun residual), consistent with the displayed sets" \
-    || fail "the 'must be empty' block shows ${body_lines} line(s) — the PRE-rerun residual leaked into it"
+    && pass "the pre-rerun residual is labelled for what it is" || fail "the pre-rerun residual is missing/mislabelled"
+  grep -qF -- '- ...and 95 more' "$c" && pass "the pre-rerun residual uses the same cap (120 → 25 + 95)" \
+    || fail "the pre-rerun residual escaped the cap"
+  grep -qF -- '(empty — nothing unique to this PR)' "$c" \
+    && pass "the 'must be empty' block shows the EMPTY post-rerun residual" \
+    || fail "the pre-rerun residual leaked into the 'must be empty' block"
   grep -q "PR failing: 0 | main failing: 1 | unique to this PR: 0" "$c" \
     && pass "the counts line reflects the POST-rerun PR set" || fail "the counts line does not match the post-rerun set"
 else
   fail "no evidence comment posted on the flake path"
 fi
 
-# ── 26. a backtick-bearing node id cannot break the fence ──────────────────
-# A PR author controls test names, so a test that prints `FAILED ``` ` puts a
-# bare ``` in the embedded set — which CLOSES the block early and swallows the
-# rest of the comment (including the audit trail) as raw HTML. The fence must be
-# longer than any backtick run inside it. (VGATE round 3.)
-echo "== 26. a backtick-bearing id does not break the evidence fence =="
+# ── 26. a backtick-bearing node id cannot break the evidence ────────────────
+# A PR author controls test names, so a test that prints a bare fence marker puts
+# one in the set. The evidence is LISTS, not fenced blocks, so there is no fence
+# to close early and nothing to swallow — and therefore no fence-length algorithm
+# to get right.
+echo "== 26. a backtick-bearing id cannot break the evidence =="
 new_scen btick
 HEAD_BT="dddd333300000000000000000000000000000000"
 printf '%s\n' "$HEAD_BT" > "$SCEN/head"
@@ -976,31 +933,22 @@ lane_fail mainbt 9922 > "$SCEN/runs-main"
 cp "$SCEN/log-9921" "$SCEN/log-9922"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 if [ -f "$SCEN/comment" ]; then
-  n3=$(grep -c '^```$' "$SCEN/comment")
-  n4=$(grep -c '^````$' "$SCEN/comment")
-  n_open=$(grep -c '^<details>' "$SCEN/comment")
-  n_close=$(grep -c '^</details>$' "$SCEN/comment")
-  # The poisoned id IS a bare ``` line — but it must be CONTENT, i.e. enclosed by a
-  # LONGER fence. The signature of the fix is therefore a 4-backtick fence; before
-  # it, no such fence exists and the bare ``` closes the block.
-  [ "$n4" -ge 4 ] && pass "the fence was LENGTHENED past the backtick run ($n4 four-backtick lines)" \
-    || fail "no lengthened fence — a backtick id closes the block early and breaks the comment"
-  [ "$n_open" -eq 3 ] && [ "$n_close" -eq 3 ] \
-    && pass "all three evidence blocks stay structurally intact ($n_open opened, $n_close closed)" \
-    || fail "the block structure was damaged by a backtick id ($n_open opened, $n_close closed)"
-  [ "$n3" -eq 4 ] && pass "the 4 bare fences elsewhere are the empty final-residual block ($n3)" \
-    || fail "unexpected bare-fence count ($n3)"
+  c="$SCEN/comment"
+  grep -qx -- '- ```' "$c" && pass "the backtick id renders as an inert list item" \
+    || fail "the backtick id is not rendered as a list item"
+  d_open=$(grep -c '^<details>' "$c"); d_close=$(grep -c '^</details>$' "$c")
+  [ "$d_open" -eq 3 ] && [ "$d_close" -eq 3 ] \
+    && pass "all three evidence blocks stay structurally intact ($d_open/$d_close)" \
+    || fail "block structure damaged ($d_open opened, $d_close closed)"
+  fenced=$(grep -c '^```*$' "$c")
+  [ "${fenced:-0}" -eq 0 ] && pass "no fenced block exists, so there is no fence to break" \
+    || fail "a fenced block is present — the injection surface is back ($fenced)"
 else
   fail "no evidence comment posted for the backtick case"
 fi
 
-# ── 27. the PROVENANCE list is bounded too ─────────────────────────────────
-# The provenance line is one `sha:id` per failing main run and grows with
-# --main-runs; it is NOT covered by the cap/linemax that bound the set blocks.
-# Unbounded it is ~53,000 chars at N=1000 — over half the body cap by itself.
-# Without this scenario the elision branch never executes and the fix is
-# unpinned (reverting it left the suite fully green). (VGATE round 4.)
-echo "== 27. the provenance list is elided past 50 runs =="
+# ── 27. the provenance list uses the SAME single limit ──────────────────────
+echo "== 27. the provenance list shares the one limit =="
 new_scen provcap
 HEAD_PC="ffff555500000000000000000000000000000000"
 printf '%s\n' "$HEAD_PC" > "$SCEN/head"
@@ -1020,13 +968,12 @@ rc=$?
 if [ -f "$SCEN/comment" ]; then
   c="$SCEN/comment"
   grep -qE 'main compared \(union of 60 runs of python-ci\.yml\): ' "$c" \
-    && pass "the provenance line keeps its lane + run-count prefix (certifying)" || fail "the provenance line lost its certifying prefix"
-  grep -qF -- ', and 10 more' "$c" \
-    && pass "the provenance list is elided past 50 entries (60 → 50 + 'and 10 more')" \
-    || fail "the provenance list is UNBOUNDED — the elision fix is reverted or not reached"
+    && pass "the provenance line keeps its certifying prefix" || fail "the provenance line lost its certifying prefix"
+  grep -qF -- '+35 more' "$c" && pass "the provenance list is capped by the same 25 (60 → 25 + 35)" \
+    || fail "the provenance list is unbounded or uses a different limit"
   chars=$(wc -m < "$c" | tr -d ' ')
-  [ "$chars" -lt 65536 ] && pass "the body stays under the cap with 60 runs ($chars chars)" \
-    || fail "the body is $chars chars — unbounded provenance pushed it over"
+  [ "$chars" -lt 65536 ] && pass "body stays under the cap with 60 runs ($chars chars)" \
+    || fail "body is $chars chars — unbounded provenance pushed it over"
 else
   fail "no evidence comment posted for the 60-run case"
 fi
