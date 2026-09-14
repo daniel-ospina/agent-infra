@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # tests/gh-shim/run.sh — the ARGV-LEVEL admin-merge guard (#984).
 #
+# §11 (#1007) pins the PR POSITIONAL: a URL is resolved through the full gate, a branch
+# stays refused. The scanner in `extensions/review-enforcer/index.ts` accepts the same
+# one URL shape (`extractMergeSelector`) and runs FIRST, so both layers must agree — the
+# §11(g) tripwire fails if the TS shape moves without this file being revisited.
+#
 # The point of this layer is that bash has already finished when it runs. So these
 # tests drive the shim through a real SHELL with the obfuscations that defeated the
 # string scanner in seven review rounds — `-${V:--}admin=true`, an `xargs`-assembled
@@ -336,6 +341,189 @@ jq -n --rawfile b "$TMP/body-good" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b
 bash "$SHIM" pr merge 123 --admin --hostname=github.com >/dev/null 2>"$TMP/err"; rc=$?
 [ "$rc" -eq 0 ] && pass "\`--hostname=github.com\` with evidence → allowed (no over-block)" \
   || fail "\`--hostname=…\` was over-blocked: $(head -1 "$TMP/err")"
+# ── 11. the PR POSITIONAL: a URL is resolved, a branch is refused (#1007) ────
+echo "== 11. a PR URL is a second selector — resolved by the SAME gate (#1007) =="
+# gh takes a NUMBER, a URL, or a BRANCH in this slot. The gate used to resolve only a
+# number, so a URL was refused — fail-closed, but an over-block, and an over-block is
+# what pushes a caller at the override hatch. The URL is now resolved; the branch stays
+# refused on purpose (resolving one needs a `gh` call, i.e. the gate asking the gated
+# thing who it is gating). PARITY: the outer scanner accepts the SAME one URL shape —
+# see `test("extractMergeSelector")` in `extensions/review-enforcer/index.test.ts`.
+URL="https://github.com/daniel-ospina/agent-infra/pull/1006"
+cert_body "$HEAD_A" > "$TMP/body-url"
+
+# (a) The URL resolves to its number, and the URL'S REPO reaches the evidence lookup.
+# The number assertion IS the issue's acceptance: what reaches the verifier must be the
+# number parsed out of the URL, not a number that merely happened to be nearby.
+new_scen urlgood
+jq -n --rawfile b "$TMP/body-url" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge "$URL" --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && pass "a PR URL with head-bound evidence → allowed (exit 0)" \
+  || { fail "the URL form was refused"; sed 's/^/      /' "$TMP/err"; }
+grep -q "pr view 1006 --repo daniel-ospina/agent-infra --json headRefOid" "$SCEN/calls" \
+  && pass "the number extracted from the URL (1006), with the URL's repo, reached the verifier" \
+  || fail "the extracted number/repo did not reach the verifier: $(cat "$SCEN/calls")"
+grep -q "^pr merge $URL --admin$" "$SCEN/calls" && pass "the real gh received the ORIGINAL argv unchanged" \
+  || fail "argv was not passed through intact: $(cat "$SCEN/calls")"
+
+# ...and the flag BEFORE the positional must not hide the URL either (`--admin` is
+# value-less, so it consumes nothing — a regression here would refuse a valid call).
+new_scen urladminfirst
+jq -n --rawfile b "$TMP/body-url" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge --admin "$URL" >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && pass "\`--admin\` before the URL → still resolved (exit 0)" \
+  || { fail "flag order hid the URL"; sed 's/^/      /' "$TMP/err"; }
+
+# (b) TWO-DIRECTION PROOF, direction 1: the URL form routes through the FULL gate, so an
+# UNEVIDENCED URL admin merge is refused exactly as a bare number is.
+new_scen urlnovidence
+bash "$SHIM" pr merge "$URL" --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "an UNEVIDENCED URL admin merge → REFUSED (exit $rc)" \
+  || fail "a URL bypassed the evidence gate"
+grep -q "pr merge" "$SCEN/calls" && fail "the real gh was invoked — the merge happened" \
+  || pass "the real gh was never invoked"
+
+# ...direction 1b: head pinning still BINDS through the URL — a stale marker does not open it.
+new_scen urlstale
+jq -n --rawfile b "$TMP/body-url" '{headRefOid:"'"$HEAD_B"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge "$URL" --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "evidence for a STALE head via URL → REFUSED (exit $rc)" \
+  || fail "a stale marker opened the URL form"
+
+# (c) gh resolves a PR URL against the URL's OWN repo and IGNORES a contradicting
+# --repo (probed live 2026-09-14 — see the shim header). So the evidence must be read
+# from the URL's repo, and the ignored flag is announced rather than dropped silently.
+new_scen urlrepowins
+jq -n --rawfile b "$TMP/body-url" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge "$URL" --admin --repo owner/other >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && pass "a contradicting --repo does not over-block (gh ignores it; the URL wins)" \
+  || { fail "the contradiction was refused instead of resolved to the URL's repo"; sed 's/^/      /' "$TMP/err"; }
+grep -q "pr view 1006 --repo daniel-ospina/agent-infra" "$SCEN/calls" \
+  && pass "  …and the evidence was read from the URL's repo" \
+  || fail "  …but the evidence was read from the wrong repo: $(cat "$SCEN/calls")"
+# The real-gh line legitimately carries the original argv (incl. the ignored flag);
+# what must not carry it is the EVIDENCE LOOKUP.
+if grep "^pr view" "$SCEN/calls" | grep -q -- "--repo owner/other"; then
+  fail "  …the contradicting --repo reached the lookup"
+else
+  pass "  …the contradicting --repo did NOT reach the lookup"
+fi
+grep -q "ignored" "$TMP/err" && pass "  …and the caller is TOLD the flag was ignored" \
+  || fail "  …the ignored flag was silent"
+
+# (d) Every near-miss stays REFUSED — a branch, and the malformed-URL family. Strictness
+# is the point: the number is accepted only when it is IN the token.
+badsel_n=0
+for bad in "my-branch" "release/v2" "feature/1007" \
+  "https://github.com/o/r/pull/abc" "https://github.com/o/r/pull/" \
+  "https://github.com/o/r/pull/123/files" "https://github.com/o/r/pull/123/" \
+  "https://github.com/o/r/pull/123?s=1" "https://github.com/o/r/pull/123#x" \
+  "http://github.com/o/r/pull/123" "github.com/o/r/pull/123" \
+  "https://evil.com/o/r/pull/123" "https://www.github.com/o/r/pull/123" \
+  "https://github.com/o/r" "https://github.com//pull/1" "https://github.com/o//pull/1" \
+  "https://github.com/o!/r/pull/1" "https://github.com/o/x y/pull/1" \
+  "https://github.com/o/r/pull/0" "https://github.com/o/r/pull/01006" \
+  "https://github.com/o/r/pull/9007199254740993"; do
+  badsel_n=$((badsel_n + 1))
+  new_scen "badsel$badsel_n"
+  jq -n --rawfile b "$TMP/body-url" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+  bash "$SHIM" pr merge "$bad" --admin >/dev/null 2>"$TMP/err"; rc=$?
+  if [ "$rc" -ne 0 ] && ! grep -q "pr merge" "$SCEN/calls"; then
+    pass "\`$bad\` → REFUSED (exit $rc)"
+  else
+    fail "\`$bad\` was ACCEPTED as a PR selector (rc=$rc)"
+  fi
+done
+
+# ...and the branch refusal says WHY, so a reader sees a decision rather than a bug.
+new_scen urlbranch
+bash "$SHIM" pr merge my-branch --admin >/dev/null 2>"$TMP/err"; rc=$?
+grep -q "BRANCH name is deliberately NOT resolved" "$TMP/err" \
+  && pass "a branch refusal explains that it is deliberate (not a bare 'not a number')" \
+  || fail "the branch refusal does not say it is deliberate: $(head -1 "$TMP/err")"
+
+# (e) No over-block on ordinary use: a URL in a NON-admin merge passes through untouched.
+new_scen urlsquash
+bash "$SHIM" pr merge "$URL" --squash >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && pass "a NON-admin URL merge passes through (no over-block)" \
+  || fail "a plain URL merge was blocked"
+grep -q "^pr merge $URL --squash$" "$SCEN/calls" && pass "  …with argv untouched" \
+  || fail "  …but argv changed: $(cat "$SCEN/calls")"
+
+# (f) A URL inside a flag VALUE is not the selector — and the VULNERABLE ordering is the
+# value BEFORE the positional. gh accepts interspersed flags, so
+# `gh pr merge --body "see <url>" 123 --admin` really merges 123; the gate must verify
+# 123, not the URL's PR in the URL's repo. (The shim was never exposed here — argv is
+# already dequoted, so the whole quoted body is ONE value — but the scanner IS a string
+# layer, and a whitespace split there made this a fail-open. Pinned on both sides: this
+# suite drives the argv layer, `index.test.ts` drives the scanner.)
+#
+# The fixture serves the SAME head and comments whatever number is asked for, so the
+# `pr view` ARGV is the discriminator — an exit code alone would pass either way.
+new_scen urlbodyvalue
+jq -n --rawfile b "$TMP/body-url" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge --body "see $URL here" 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && pass "a value-hosted URL before the positional → resolved, not confused (exit 0)" \
+  || { fail "the value-before-positional form was refused"; sed 's/^/      /' "$TMP/err"; }
+grep -q "pr view 123 " "$SCEN/calls" && pass "  …the verifier resolved the POSITIONAL (123)" \
+  || fail "  …the verifier did not resolve 123: $(head -1 "$SCEN/calls")"
+grep -q "pr view 1006 " "$SCEN/calls" && fail "  …the body URL was read as the PR (fail-open)" \
+  || pass "  …the body URL was NOT read as the PR"
+
+# The same ordering with an ESCAPED quote inside the value: bash keeps the value open
+# (the `\"` does not close it) and the whole thing is ONE argv value, so the positional
+# still wins. The scanner needed a fix for this shape; the argv layer never did.
+new_scen urlbodyescaped
+jq -n --rawfile b "$TMP/body-url" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+SCEN="$SCEN" bash "$SHIM" pr merge --body "a\" $URL b" 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+grep -q "pr view 123 " "$SCEN/calls" && pass "  …an escaped quote inside the value still resolves 123" \
+  || fail "  …an escaped quote broke the value: $(head -1 "$SCEN/calls")"
+grep -q "pr view 1006 " "$SCEN/calls" && fail "  …the escaped-quote body URL became the PR (fail-open)" \
+  || pass "  …the escaped-quote body URL was NOT read as the PR"
+
+# NOTE: an ATTACHED `--hostname=` (`gh pr merge 123 --admin --hostname=github.com`) is
+# covered by §10(d) above — the over-block that motivated adding it to the shared
+# attached-value case (#1007 VGATE cycle 2) is pinned there with a full evidence fixture.
+
+# (g) PARITY TRIPWIRE with the outer scanner. This is not a proof of equivalence — it
+# fails when the TS shape is edited without the bash one being revisited, which is the
+# drift that produces an over-block in one layer and an accept in the other.
+grep -Fq 'PR_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([0-9]+)$/' \
+  "$ROOT/extensions/review-enforcer/index.ts" \
+  && pass "the scanner carries the same URL shape (parity tripwire)" \
+  || fail "the scanner's PR_URL_RE changed shape — revisit the shim's parse_pr_url"
+
+# …and the SAME tripwire in the other direction (VGATE #1007 cycle 4): the loop in (d)
+# pins 21 refusals BEHAVIOURALLY, but a NEW permissive shape added here while the scanner
+# is edited to match would otherwise drift unpinned. These two literals are what "the same
+# shape" means — the host and the allowed owner/repo charset.
+grep -Fq 'https://github.com/' "$ROOT/scripts/gh-shim/gh" \
+  && grep -Fq '*[!A-Za-z0-9_.-]*' "$ROOT/scripts/gh-shim/gh" \
+  && pass "the shim carries the same host + charset (parity tripwire, other direction)" \
+  || fail "the shim's parse_pr_url changed shape — revisit the scanner's PR_URL_RE"
+
+# (h) A BARE number obeys the SAME rule as the URL form — no leading zero, at most 15
+# digits. The scanner holds a JS `Number` (which normalises `01006` and ROUNDS above
+# 2^53) while this argv layer passes the literal digits to gh, so without this rule the
+# two layers can name different PRs and the gate reads the wrong PR's evidence (fresh
+# review, P2). The scanner refuses the same set — see index.test.ts.
+#
+# The fixture must be CERTIFYING: the number guard exits before the verifier, so without
+# evidence the verifier would refuse anyway and this case passed even with the guard
+# removed (round-4 review P3 — a test that cannot tell). With evidence served for whatever
+# number is asked, the ONLY thing that can refuse is the number rule, and removing it lets
+# `pr merge` reach the fake gh (rc=0) — the mutation the assertion exists to catch.
+for badnum in 0 01006 0001 9007199254740993 9999999999999999; do
+  new_scen "badnum$badnum"
+  jq -n --rawfile b "$TMP/body-url" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+  bash "$SHIM" pr merge "$badnum" --admin >/dev/null 2>"$TMP/err"; rc=$?
+  if [ "$rc" -ne 0 ] && ! grep -q "pr merge" "$SCEN/calls" \
+     && grep -qE "both this shim and the scanner|cannot be held exactly by the scanner" "$TMP/err"; then
+    pass "a bare \`$badnum\` → REFUSED by the number rule (exit $rc)"
+  else
+    fail "a bare \`$badnum\` was not refused by the number rule (rc=$rc): $(head -1 "$TMP/err")"
+  fi
+done
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"
