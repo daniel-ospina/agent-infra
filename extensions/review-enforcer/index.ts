@@ -4,8 +4,132 @@ import { execSync } from "child_process";
 import { isPrintMode } from "../shared/print-mode.js";
 import * as fs from "fs";
 import * as os from "os";
-import { resolve as resolvePath } from "path";
+import { resolve as resolvePath, dirname } from "path";
+import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
+
+/**
+ * #984 — the ARGV-LEVEL layer.
+ *
+ * The string scanner answers "will this command text make gh perform an admin
+ * merge?" and seven adversarial rounds each closed one splice and found the next
+ * (`--ad""min`, `$'--admin'`, `xargs {}`, `-${V:--}admin=true`, `$V-admin=true`).
+ * That class is not closable in a scanner, and the reason is a proof rather than
+ * an impression: resolving `$VAR`/`$(…)` requires EVALUATING a shell, which a gate
+ * cannot do without running the very command it exists to refuse.
+ *
+ * So we put a `gh` shim ahead of the real `gh` on PATH for every bash call. By the
+ * time `gh` runs, bash has finished: `-${V:--}admin=true` IS the literal string
+ * `--admin`, with no splice left to hide behind. `event.input` is mutable and the
+ * mutation affects real execution (docs/extensions.md), which is what makes this
+ * enforcement rather than advice.
+ *
+ * The scanner stays as the fast first layer — it gives better messages and costs
+ * nothing — now backed by a layer that does not share its limit.
+ */
+const EXTENSION_DIR = (() => {
+  try {
+    return dirname(fileURLToPath(import.meta.url));
+  } catch {
+    return null;
+  }
+})();
+
+/** Warn ONCE per session when the argv-level layer is missing — silence would make
+ *  a degraded guard look like a working one. */
+let ghShimAbsenceWarned = false;
+
+/**
+ * Resolve the shim directory, or null when no shim is installed.
+ *
+ * `AGENT_GH_SHIM_DIR` lets an operator (or a consumer install) point at a shim
+ * somewhere else; the default is this checkout's `scripts/gh-shim`.
+ */
+export function resolveGhShimDir(): string | null {
+  const explicit = process.env.AGENT_GH_SHIM_DIR;
+  const candidates: string[] = [];
+  if (explicit) candidates.push(explicit);
+  if (EXTENSION_DIR) candidates.push(resolvePath(EXTENSION_DIR, "..", "..", "scripts", "gh-shim"));
+  for (const dir of candidates) {
+    try {
+      if (fs.existsSync(resolvePath(dir, "gh"))) return dir;
+    } catch {
+      /* an unreadable candidate is not a match */
+    }
+  }
+  return null;
+}
+
+/**
+ * Materialize the shim at a NEUTRAL path and return that directory.
+ *
+ * Injecting the CHECKOUT's path would put the branch name into every bash command:
+ * this very worktree is `…/930-admin-merge-rail/scripts/gh-shim`, and `admin` in the
+ * injected text flips the gates of OTHER extensions, which read the same mutated
+ * `event.input.command` after this handler (VGATE #984: with a path containing
+ * `admin`, `isGitOp(patched)` is TRUE for a command that is not a git op). The
+ * neutral directory keeps the injected text free of gate-relevant words.
+ */
+export const NEUTRAL_GH_SHIM_DIR = resolvePath(os.homedir(), ".pi", "agent", "shims");
+
+export function materializeGhShim(sourceDir: string | null): string | null {
+  if (!sourceDir) return null;
+  try {
+    fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
+    const target = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
+    const src = fs.realpathSync(resolvePath(sourceDir, "gh"));
+    const current = fs.existsSync(target) ? fs.realpathSync(target) : null;
+    if (current !== src) {
+      try {
+        fs.rmSync(target, { force: true });
+      } catch {
+        /* a missing target is the expected case */
+      }
+      try {
+        fs.symlinkSync(src, target);
+      } catch {
+        fs.copyFileSync(src, target);
+        fs.chmodSync(target, 0o755);
+      }
+    }
+    return fs.existsSync(target) ? NEUTRAL_GH_SHIM_DIR : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolved ONCE per session — with a revalidation, because this runs on EVERY bash call. */
+let ghShimDirCache: string | null | undefined;
+function activeGhShimDir(): string | null {
+  if (ghShimDirCache !== undefined) {
+    // REVALIDATE before reuse. A session outlives a worktree: if the link is removed,
+    // or its target is deleted (removing a worktree dangles every link into it), the
+    // cached directory would still be prepended to PATH while containing no `gh` — so
+    // PATH lookup falls through to the REAL gh and the argv layer is silently absent
+    // for the rest of the session (VGATE #984). One existsSync per bash call.
+    if (ghShimDirCache !== null && fs.existsSync(resolvePath(ghShimDirCache, "gh"))) {
+      return ghShimDirCache;
+    }
+  }
+  ghShimDirCache = materializeGhShim(resolveGhShimDir());
+  return ghShimDirCache;
+}
+
+/**
+ * Prefix a bash command with the shim directory on PATH.
+ *
+ * Returns null when there is nothing to do — no shim resolved, or the operator's
+ * kill switch is set. The kill switch exists because this touches EVERY bash call:
+ * `AGENT_GH_SHIM=0` turns the layer off without editing code.
+ *
+ * `export PATH=…` on its OWN LINE, so the command's text is otherwise untouched
+ * and its exit status is still the command's (`&&` would change both).
+ */
+export function withGhShim(command: string, shimDir: string | null): string | null {
+  if (process.env.AGENT_GH_SHIM === "0") return null;
+  if (!shimDir) return null;
+  return `export PATH=${JSON.stringify(shimDir)}:"$PATH"\n${command}`;
+}
 
 // ── gh invocation seam (testable) ─────────────────────
 // ESM named imports of builtin CJS modules (child_process) are not patchable
@@ -1097,9 +1221,9 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  * `isUnresolvableFlagToken` (what is refused instead of guessed at).
  *
  * STATED LIMITS — WHAT THIS CANNOT SEE (a raw-string scanner, not a shell). These
- * are OPEN GAPS, not safe assumptions, and are tracked for argv-level enforcement.
- * Read this as the authoritative list; if a shape is not matched by the code and
- * not named here, that is a bug in this file, not a safe assumption.
+ * are OPEN GAPS, not safe assumptions. Read this as the authoritative list; if a
+ * shape is not matched by the code and not named here, that is a bug in this file,
+ * not a safe assumption.
  *   - `xargs`/`{}` assembling the flag from parts that never co-occur with the
  *     word `admin`, e.g. `printf '%s' --ad | xargs -I{} gh pr merge 123 {}min`;
  *   - anything expanded UPSTREAM of the string (a `$VAR` in the caller's argv);
@@ -1141,6 +1265,22 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  *     head-bound evidence — including a harmless `echo "gh pr merge 1
  *     --admin=true"`, and a `--body "ask the admin"` beside a `$VAR`. The remedy
  *     is the mandated `scripts/admin-merge.sh`; the alternative was a bypass.
+ *
+ * #984 — WHAT LAYERING THE SHIM ON TOP OF THIS CHANGES. The gaps ABOVE are limits
+ * of THIS layer, and the CONSTRUCT-SPLICE class among them is now covered by
+ * `scripts/gh-shim/gh`, which decides the same question from its own argv, where
+ * bash has already finished (`-${V:--}admin=true` IS the literal `--admin` by
+ * then); the `tool_call` handler below puts that shim on PATH for every bash call.
+ * A scanner cannot resolve `$VAR` without evaluating a shell, which a gate must not
+ * do, so the class is covered by a layer that does not share this one's limit
+ * rather than by more rules here. This scanner stays as the fast first layer
+ * (better messages, no process spawn).
+ *
+ * NOT COVERED BY EITHER LAYER — do not read the paragraph above as wider than this.
+ * These stay open, and are re-stated in the shim's own header: `gh alias` (gh
+ * expands the alias AFTER the shim has run), a command that discards the shim's
+ * PATH entry (`env -i`, an explicit `PATH=` reset) or calls the real gh by
+ * ABSOLUTE path, and argv already expanded in a parent process.
  */
 export function hasAdminMergeFlag(command: string): boolean {
   // 1. Normalize the splicing bash resolves before gh sees argv (quotes,
@@ -1558,7 +1698,29 @@ export default function (pi: ExtensionAPI) {
       if (!isToolCallEventType("bash", event)) return undefined;
       if (!extensionEnabled) return undefined;
 
-      const command = String(event.input.command ?? "");
+      // #984: the ARGV-LEVEL layer runs FIRST and for EVERY bash call, not only
+      // for git ops — the shim has to be on PATH before the command runs, and a
+      // command that does not look like a merge to the scanner is exactly the
+      // case the scanner cannot decide. The string gates below then act as the
+      // fast first layer, unchanged.
+      //
+      // `rawCommand` is what the CALLER wrote: the injected prefix names the shim
+      // path (`…/gh-shim/gh`), so scanning the MUTATED text would feed the gates a
+      // `gh` word that the author never wrote.
+      const rawCommand = String(event.input.command ?? "");
+      const shimDir = activeGhShimDir();
+      if (shimDir === null && !ghShimAbsenceWarned && process.env.AGENT_GH_SHIM !== "0") {
+        ghShimAbsenceWarned = true;
+        console.log(
+          "[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner " +
+            "is active, so bash token splicing can still hide an admin merge. " +
+            "Set AGENT_GH_SHIM_DIR, or install scripts/gh-shim."
+        );
+      }
+      const shimmed = withGhShim(rawCommand, shimDir);
+      if (shimmed !== null) event.input.command = shimmed;
+
+      const command = rawCommand;
       if (!isGitOp(command)) return undefined;
 
       // #930: the admin-merge evidence gate runs FIRST (before the merge
