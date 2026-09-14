@@ -20,9 +20,20 @@ name: Admin-merge detector
 # on it) — it just tells the truth.
 #
 # What it does, after "CI on main" completes for a push to main:
-#   1. the merged commit's failing set      → scripts/ci-failure-set.sh --commit <sha> --workflow <lane>
-#   2. main's PRIOR failing set (union)     → scripts/ci-failure-set.sh --main-union N --exclude <sha> --workflow <lane>
-#   3. the shared comparison                → scripts/ci-failure-set.sh --diff
+#   1. the merged commit's failing set      → ci-failure-set.sh --commit <sha> --workflow <lane>
+#   2. main's PRIOR failing set (union)     → ci-failure-set.sh --main-union N --exclude <sha> --workflow <lane>
+#   3. the shared comparison                → ci-failure-set.sh --diff
+#
+# WHERE THE SCRIPTS COME FROM (#972). They are NOT expected in this checkout.
+# `agent-infra init` installs a consumer's `scripts/` as a MACHINE-LOCAL symlink
+# (manifest.json `"kind": "symlink"`, fs.symlinkSync) — it resolves on a laptop
+# and DANGLES on a runner, so a detector that reached for `scripts/` would work
+# exactly where it is developed and never where it is deployed. Same failure
+# class as #555 (symlinked workflows read as their link-target string). The
+# helper is therefore checked out from agent-infra at a PINNED REF into
+# `.agent-infra/`, alongside the consumer's own checkout. One source, one
+# version, nothing local to drift or be missing — and no duplicate parser, which
+# matters because the comparison must stay a single implementation.
 #
 # THE LANE (WORKFLOW below) must name the TEST workflow. `gh run list --branch
 # main` returns whatever ran most, not the test lane — measured on tortoise main
@@ -64,6 +75,20 @@ jobs:
         with:
           ref: main
 
+      # The rail's scripts, from a PINNED agent-infra ref (#972) — never from
+      # this checkout, whose `scripts/` is a machine-local symlink that does not
+      # resolve on a runner. See WHERE THE SCRIPTS COME FROM above.
+      #
+      # Repo-configurable via the `ADMIN_MERGE_DETECTOR_REF` repository VARIABLE
+      # so a repo can pin exactly what its detector runs against; `main` is the
+      # default because a materialized detector is a COPY of the file at `main`,
+      # so its helper should come from the same place.
+      - uses: actions/checkout@v4
+        with:
+          repository: daniel-ospina/agent-infra
+          ref: ${{ vars.ADMIN_MERGE_DETECTOR_REF || 'main' }}
+          path: .agent-infra
+
       - name: Compare the merged commit's failing set against main's prior set
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,10 +111,10 @@ jobs:
           # See "NEVER BLOCKS IS ABOUT DETECTION OUTCOMES" above: every path that
           # means "could not run" exits 1 so it cannot masquerade as "found
           # nothing". No merge waits on this workflow.
-          if [ ! -f scripts/ci-failure-set.sh ]; then
-            echo "::error::admin-merge detector CANNOT RUN — scripts/ci-failure-set.sh is not in this checkout, so this detector can inspect NO merge to main."
+          if [ ! -f .agent-infra/scripts/ci-failure-set.sh ]; then
+            echo "::error::admin-merge detector CANNOT RUN — .agent-infra/scripts/ci-failure-set.sh is missing, so this detector can inspect NO merge to main."
             echo "  Failing LOUDLY rather than passing quietly: 'cannot run' must not read as 'found nothing'."
-            echo "  Fix: commit scripts/ci-failure-set.sh as a REAL FILE in this repo's checkout. scripts/sync-ci-workflows.sh copies only .github/workflows/*.yml, and a machine-local scripts/ symlink does not resolve on a runner."
+            echo "  Fix: the pinned agent-infra checkout did not provide the rail's scripts. Check the ADMIN_MERGE_DETECTOR_REF repository variable (#972)."
             exit 1
           fi
           if [ -z "${MERGE_SHA:-}" ]; then
@@ -101,13 +126,13 @@ jobs:
           # An EXTRACTION FAILURE (parser exit 1) means "cannot certify", never
           # "nothing is unique". Loud, and non-zero: a silent pass here would
           # report a clean loop for a comparison that never happened.
-          if ! bash scripts/ci-failure-set.sh --commit "$MERGE_SHA" --workflow "$WORKFLOW" \
+          if ! bash .agent-infra/scripts/ci-failure-set.sh --commit "$MERGE_SHA" --workflow "$WORKFLOW" \
                 --runs-report merged-report.txt > merged-fails.txt 2>extract-err.txt; then
             echo "::error::admin-merge detector: could not extract the merged commit's failing set — cannot certify this merge"
             sed 's/^/  /' extract-err.txt
             exit 1
           fi
-          if ! bash scripts/ci-failure-set.sh --main-union "$MAIN_RUNS" --exclude "$MERGE_SHA" --workflow "$WORKFLOW" \
+          if ! bash .agent-infra/scripts/ci-failure-set.sh --main-union "$MAIN_RUNS" --exclude "$MERGE_SHA" --workflow "$WORKFLOW" \
                 --provenance main-runs.txt --runs-report main-report.txt > main-fails.txt 2>>extract-err.txt; then
             echo "::error::admin-merge detector: could not extract main's prior failing set — cannot certify this merge"
             sed 's/^/  /' extract-err.txt
@@ -116,7 +141,7 @@ jobs:
 
           # `--diff` can also fail; an unchecked failure leaves an EMPTY file,
           # which reads as "no unique failures" and reports a clean loop.
-          if ! bash scripts/ci-failure-set.sh --diff merged-fails.txt main-fails.txt > unique.txt 2>>extract-err.txt; then
+          if ! bash .agent-infra/scripts/ci-failure-set.sh --diff merged-fails.txt main-fails.txt > unique.txt 2>>extract-err.txt; then
             echo "::error::admin-merge detector: the shared comparison failed — cannot certify this merge"
             sed 's/^/  /' extract-err.txt
             exit 1
@@ -129,11 +154,11 @@ jobs:
           # that never happened: the "cannot run reads as found nothing" hole this
           # file's own header forbids. `tested` counts success|failure|timed_out.
           #
-          # The condition lives in scripts/check-lane-tested.sh so the test suite
-          # drives the SHIPPED code with fixtures — a guard asserted only by
-          # grepping for its own text can be neutered (`||` → `&&`) with the suite
-          # still green (cycle-2 review P2).
-          if ! bash scripts/check-lane-tested.sh merged-report.txt "$WORKFLOW" "$MERGE_SHA"; then
+          # The condition lives in .agent-infra/scripts/check-lane-tested.sh so the
+          # test suite drives the SHIPPED code with fixtures — a guard asserted
+          # only by grepping for its own text can be neutered (`||` → `&&`) with
+          # the suite still green (cycle-2 review P2).
+          if ! bash .agent-infra/scripts/check-lane-tested.sh merged-report.txt "$WORKFLOW" "$MERGE_SHA"; then
             exit 1
           fi
           unique_count="$(wc -l < unique.txt | tr -d ' ')"

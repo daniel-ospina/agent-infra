@@ -415,7 +415,20 @@ if [ -f "$DETECTOR" ]; then
   # CANNOT-RUN must not read as NOTHING-FOUND: the dependency is checked, and no
   # extraction path warns-then-exits-0 (which is the silent no-op a consumer
   # without scripts/ used to get for every merge, for ever).
-  grep -q 'ci-failure-set.sh is not in this checkout' "$DETECTOR" && pass "detector refuses to run without its dependency (no silent no-op)" || fail "the detector may no-op silently when scripts/ci-failure-set.sh is absent"
+  grep -q 'CANNOT RUN' "$DETECTOR" && pass "detector refuses to run without its dependency (no silent no-op)" || fail "the detector may no-op silently when its dependency is absent"
+  # #972: the dependency must NOT be a repo-local path. `agent-infra init`
+  # installs a consumer's `scripts/` as a MACHINE-LOCAL symlink, so a detector
+  # reaching for `scripts/` works where it is developed and never on a runner.
+  # Assert the resolution source, not just the guard's wording — this is the
+  # regression that made the detector inert in every consumer repo.
+  local_dep=$(grep -c 'bash scripts/ci-failure-set.sh\|bash scripts/check-lane-tested.sh' "$DETECTOR" || true)
+  pinned_dep=$(grep -c 'bash \.agent-infra/scripts/' "$DETECTOR" || true)
+  [ "${local_dep:-0}" -eq 0 ] && pass "the detector never invokes a repo-local scripts/ helper" \
+    || fail "the detector still invokes a repo-local helper ($local_dep) — a dangling symlink on a runner (#972)"
+  [ "${pinned_dep:-0}" -eq 4 ] && pass "all 4 helper invocations resolve from the pinned agent-infra checkout" \
+    || fail "expected 4 pinned-helper invocations (3 x ci-failure-set.sh + 1 x check-lane-tested.sh), got $pinned_dep"
+  grep -q 'ADMIN_MERGE_DETECTOR_REF' "$DETECTOR" && pass "the helper ref is repo-configurable, so a repo can pin it" \
+    || fail "the pinned ref is not configurable"
   if grep -qE '::warning::.*could not extract' "$DETECTOR"; then
     fail "an extraction failure is still downgraded to a warning — that is the silent no-op"
   else
