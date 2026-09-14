@@ -53,30 +53,30 @@ The Double Diamond generates multiple alternatives — but the converge step can
 
 ## Design Principle: Fix Root Causes, Not Symptoms
 
-When problem-diverge discovers that the issue describes a symptom rather than the root cause, scoping MUST target the root cause — not the symptom the issue author happened to notice.
+When problem-diverge discovers that the issue describes a symptom rather than the root cause, scoping MUST target the root cause — not the symptom the issue author happened to notice. The objective is to ensure good system design (even if that means expanding scope) instead of patches. To ensure good system design, you MUST use the research skill to check and confirm your designs match the state of the art in comparable cases (if research was already produced, check it and confirm).
 
 **Examples:**
-- Issue: "Add retry button to failed uploads" → Root cause: uploads fail silently with no error surfaced → Scope: surface errors + add retry
-- Issue: "Increase timeout on X endpoint" → Root cause: N+1 query under load → Scope: fix the query + keep timeout as safety net
-- Issue: "Add validation to form Y" → Root cause: API accepts invalid data without rejecting → Scope: add API validation + add client validation
+- Issue: "Add retry button to failed uploads" → Root cause: uploads fail silently with no error surfaced → Scope: surface errors + add retry + investigate what caused errors to eliminate problem + check user-facing copy for human approaval.
+- Issue: "Increase timeout on X endpoint" → Root cause: N+1 query under load → Scope: fix the query + keep timeout as safety net + invesitgate system design improvements to improve resilience.
+- Issue: "Add validation to form Y" → Root cause: API accepts invalid data without rejecting → Scope: add API validation + add client validation + ensure user-facing copy is good (human approval needed if changing)
 
-**Gate:** When problem-converge picks a confirmed problem definition, compare it to the original issue. If the original described a symptom and scoping settled on a fix for that symptom without addressing the root cause, the scoping is incomplete. The verification gates (2.5) check for this.
+**Gate:** When problem-converge picks a confirmed problem definition, compare it to the original issue. If the original described a symptom and scoping settled on a fix for that symptom without addressing the root cause, the scoping is incomplete - we want good system design instead of patches. The verification gates (2.5) check for this.
 
 ## Design Principle: Issue-Body Solutions Are Hypotheses, Not the Plan
 
-An issue body may assert a solution direction — "the fix is X", "implement exemption in Y". That assertion is the **author's hypothesis, not the plan.** Authoring bias is real: the author can be wrong, can write mid-frustration, and `issue-creation` deliberately separates what-and-why (creation) from how (scoping). The red flag that guards an *agent* thinking "I already know what to do…" must apply equally when the *issue body itself* prescribes the fix (exhibit: #472 — body said "None — scope is clear" while listing an open direction fork; the worker misread the prescribed direction as settled).
+An issue body may assert a solution direction — "the fix is X", "implement exemption in Y". That assertion is the **author's hypothesis, not the plan.** Authoring bias is real: the author can be wrong, can write mid-frustration, and `issue-creation` deliberately separates what-and-why (creation) from how (scoping). The red flag that guards an *agent* thinking "I already know what to do…" must apply equally when the *issue body itself* prescribes the fix (exhibit: #472 — body said "None — scope is clear" while listing an open direction fork; the worker misread the prescribed direction as settled). Research root causes and proper system design.
 
 **What this means in the double diamond:**
-- **problem-diverge:** challenge the framing a prescribed fix embeds — a body that states a solution has already skipped part of the problem diamond; scoping must not inherit the skip.
-- **problem-converge:** confirming the problem does NOT confirm the body's proposed solution — they are independent claims.
-- **solution-diverge:** the body's stated fix is ONE candidate approach (often the author's first idea). Generate 2-3 distinct approaches that include it as a candidate.
-- **solution-converge:** choose on evidence and outcome quality. The body's fix wins only if it survives comparison against the alternatives.
+- **problem-diverge:** challenge the framing a prescribed fix embeds — a body that states a solution has already skipped part of the problem diamond; scoping must not inherit the skip. Brainstorm multiple possible root causes and problems and research (or check existing research) to ensure you understand the system and principles.
+- **problem-converge:**  confirm which problem definition addresses the issue and is rooted in the best understanding of the system.
+- **solution-diverge:** the issue body's stated fix is ONE candidate approach (often the author's first idea). Research best practices and generate 2-3 distinct candidate solution approaches (the issue body solution, if any, is one candidate).
+- **solution-converge:** choose on outcome quality (good system design, good>easy).
 
 **Gate:** If the final plan matches the solution the issue body prescribed, the scope must show the re-derivation that earned it (alternatives considered, evidence, rejected-with-rationale). A plan that adopts the body's fix without re-derivation is a bypass. The verification gates (2.5 / 5.5) check for this.
 
 ## Design Principle: File Extra Issues, Don't Silently Absorb
 
-Scoping often discovers things that are genuinely separate from the issue at hand — adjacent bugs, unrelated improvements, documentation gaps, tech debt. These are NOT hard dependencies and should NOT be silently absorbed into the scope. They should be filed as separate GitHub issues so they're tracked, prioritized, and owned independently.
+Scoping often discovers things that are genuinely separate from the issue at hand — adjacent bugs, unrelated improvements, documentation gaps, tech debt. These are NOT hard dependencies and should NOT be silently absorbed into the scope. File them as separate GitHub issues (unless a separate open issue already covers them) so they're tracked, prioritized, and owned independently.
 
 **What to file vs what to absorb:**
 
@@ -85,7 +85,7 @@ Scoping often discovers things that are genuinely separate from the issue at han
 | Hard dependency (can't ship without it) | Absorb into scope |
 | Soft dependency (should ship together, could ship separately) | File issue, link as related, flag in plan |
 | Adjacent bug discovered during scouting | File issue, notify user, do NOT absorb |
-| Tech debt in touched area (not caused by this issue) | File issue, note in plan, do NOT absorb |
+| Tech debt in touched area (not caused by this issue) | File issue, note in plan, do NOT absorb (unless part of moving towards a better system design, good >easy) |
 | Documentation gap discovered | File issue, do NOT absorb |
 | UX inconsistency noticed in adjacent component | File issue, do NOT absorb |
 
@@ -148,9 +148,9 @@ Phase 8: Finalize + post plan
 
 | Phase | Micro | Standard | Complex |
 |-------|-------|----------|---------|
-| problem-diverge sub-agents | 1 | 2 | 2 |
-| problem-converge sub-agents | 1 | 2 | 2 |
-| **problem-verify** | Skip | ✅ (2 verifiers) | ✅ (2 verifiers) |
+| problem-diverge sub-agents | 1 | 1 | 2 |
+| problem-converge sub-agents | 1 | 1 | 2 |
+| **problem-verify** | Skip | ✅ (1 verifiers) | ✅ (1 verifiers) |
 | solution-diverge sub-agents | 1 | 1 | 2 |
 | solution-converge sub-agents | 1 | 1 | 2 |
 | **Phase 1.5 External Research** | Skip (proportional: codebase-first + fire only on demonstrated gap) | ✅ (axis matrix, 8-cap) | ✅ (axis matrix, 14-cap) |
@@ -191,23 +191,26 @@ ORIGINAL ISSUE BODY: <full issue text>
 CHECK FOUR DIMENSIONS + DIMENSION 5:
 
 1. DIVERGE THOROUGHNESS: Did problem-diverge genuinely explore alternatives?
+   - Was research done to understand the underlying system? (review the research; if incomplete, research and add to document)
    - Are there alternative problem framings that differ meaningfully from the original?
    - Were adversarial queries run seeking DISCONFIRMATION (not just confirmation)?
    - Were assumptions mapped and tagged [validated]/[unverified]?
-   - Were hidden dependencies and affected-but-unmentioned stakeholders identified?
-   - WERE THERE NO ALTERNATIVES, or were they cosmetic variations? Flag as P1.
+   - Were hidden dependencies identified?
+   - Were redundancies with other systems researched and good overall system design considered?
 
 2. CONVERGE RIGOR: Was convergence on the problem evidence-based?
+    - Was research done to understand the system mechanics? (review the research; if incomplete, research and add to document)
    - Is the chosen definition backed by evidence (citations, data, patterns)?
    - Were rejected alternatives documented with rationale?
    - Is there a falsification check? Confidence score?
-   - DID CONVERGENCE PICK THE ORIGINAL ISSUE'S FRAMING WITHOUT CHALLENGING IT? Flag as P1.
    - WAS A SOLUTION THE ISSUE BODY PRESCRIBES ("the fix is X") ADOPTED AS SETTLED WITHOUT RE-DERIVATION IN THE DOUBLE DIAMOND? Flag as P1.
+    - Were redundancies with other systems considered and good overall system design weighted in the decision?
 
 3. QUALITY OVER CONVENIENCE: Did convergence prioritize correctness over ease?
    - Was a framing rejected because it required more research?
    - Was the original issue's framing accepted because it's simpler?
    - FLAG any sign that the easy definition was chosen over the correct one.
+   - Was the principle taken into account of good-system-design>patches 
 
 4. GAPS: What's missing from the problem definition?
    - Edge cases, error states, failure modes not accounted for?
@@ -996,6 +999,7 @@ Pause for human approval if: confidence < 50, P0 issues remain after review, wir
 ## Key Principles
 
 - **Double diamond is non-negotiable.** Micro tier runs all 4 phases (1 sub-agent each). No issue gets scoped without exploring alternative problems AND solutions.
+- **Research is a MUST.** To design good systems, we should research system mechanics, best practices, and the reasons behind them.
 - **Verification gates after each diamond.** Standard+Complex get 2 parallel verifiers per gate; Micro gets a single full-diamond verifier. P0/P1 → fix → re-verify. P2+ → incorporate and pass.
 - **Controller is the tiebreaker, not a script.** When verifiers disagree, the main agent decides. Verifiers flag issues; controller fixes or ignores with rationale.
 - **Problem phases use research skill.** Discover and Define invoke `research` for adversarial queries — not just web_search.
