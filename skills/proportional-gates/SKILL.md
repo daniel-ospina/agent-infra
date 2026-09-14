@@ -182,7 +182,7 @@ For review gates that dispatch sub-agent reviewers, route proportionally based o
 |-------|----------|-----------|
 | **Epic** | Sub-agent reviewer (fresh context) | Full adversarial check needed; scope justifies dispatch cost |
 
-**Fallback:** If Level is missing or unrecognized, default to sub-agent review (safe default = full review, never skip).
+**Fallback:** If Level has no row above (missing or unrecognized), default to sub-agent review (safe default = full review, never skip).
 
 **Skills affected:** `plan-review`, `code-review`, `test-review`, and any skill that dispatches reviewer sub-agents.
 
