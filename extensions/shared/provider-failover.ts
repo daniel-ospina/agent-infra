@@ -263,10 +263,11 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
       // position: a leg absent from the table yields startIdx -1 and the walk
       // then re-returns legs[0] — the DRAINING root. So this entry exists so
       // stale pre-#727 state (latch file / in-flight marker / session pinned to
-      // the slug) still matches its own leg, while RESOLUTION_ONLY_LEGS keeps a
-      // FRESH continuation from being served it: pre-#727 the chain HALTED
-      // after the hop leg, and quietly re-introducing the 0423 generation as a
-      // live hop would be exactly the silent generation change #727 removes.
+      // the slug) still matches its own leg, while RESOLUTION_ONLY_LEGS keeps it
+      // from ever being SERVED — neither as an advance target nor through
+      // resolution's latched-active fast path: pre-#727 the chain HALTED after
+      // the hop leg, and quietly re-introducing the 0423 generation as a live
+      // hop would be exactly the silent generation change #727 removes.
       { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
     ],
   },
@@ -366,7 +367,14 @@ export function familyLegs(family: string): LegRef[] | undefined {
  * downgrade. #727: the flash family's hop target is the V4.1 openrouter leg; the
  * older "DeepSeek V4 Flash 0423" slug stays resolvable for stale pre-#727 state,
  * but the chain reaches a structured HALT after the V4.1 leg — the same place it
- * halted before that leg existed. */
+ * halted before that leg existed.
+ *
+ * It is also never SERVED (not just never advanced onto): resolution's
+ * latched-active fast path serves `fam.activeLeg` directly without consulting
+ * the walk, and a PRE-#727 latch recorded this very leg as its activeLeg. The
+ * guard there is what stops a stale record from dispatching the downgraded
+ * build for up to the latch TTL — see the `isResolutionOnlyLeg` clause in
+ * resolveWithChain. */
 const RESOLUTION_ONLY_LEGS: ReadonlySet<string> = new Set(["openrouter/deepseek/deepseek-v4-flash"]);
 
 function isResolutionOnlyLeg(leg: LegRef): boolean {
@@ -1110,7 +1118,19 @@ export function resolveWithChain(
   if (fam?.terminal) {
     return { leg: null, halted: true, reason: "halt", hop: null };
   }
-  if (fam?.activeLeg && !unavailable.has(fam.activeLeg.provider)) {
+  // #727 serve-path guard: a latched activeLeg is served DIRECTLY (below),
+  // without the advance walk — and a PRE-#727 latch recorded the legacy-
+  // generation openrouter leg (deepseek/deepseek-v4-flash = upstream "V4 Flash
+  // 0423") as its activeLeg, exactly the silent downgrade #727 removes. Such a
+  // record has no migration path (only TTL self-heal), so treating it as
+  // unusable makes resolution fall through to the standard advance walk below,
+  // which yields the family's CURRENT hop target (the V4.1 leg) or a structured
+  // halt — never the legacy generation. Same input, current answer.
+  if (
+    fam?.activeLeg &&
+    !unavailable.has(fam.activeLeg.provider) &&
+    !isResolutionOnlyLeg(fam.activeLeg)
+  ) {
     // #512 second-model P2: an OFF-TABLE record (venice) froze its family
     // activeLeg at drain time. Under a double-exhaustion (the deepseek root
     // was ALSO freshly latched when venice drained), that frozen leg is a

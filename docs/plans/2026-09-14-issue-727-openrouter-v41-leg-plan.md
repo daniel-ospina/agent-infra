@@ -51,8 +51,12 @@ levels later is a one-line change.
 - (c) Keep it in the table but **resolution-only**.
 **Decision: (c)** — the entry exists so stale state matches its own position (no `startIdx -1`
 re-return of the draining root), while `RESOLUTION_ONLY_LEGS` stops a fresh advance from being
-served it. The chain **halts** after the V4.1 leg — exactly where it halted before the V4.1 leg
-existed. No generation downgrade is reachable by an automatic hop.
+served it. The guard is applied on **both** serve paths: the advance walk skips it, and resolution's
+latched-active fast path refuses a `fam.activeLeg` that IS this leg — a pre-#727 latch record froze
+exactly that slug, and serving it directly would re-dispatch the 0423 build for up to the latch TTL
+(the walk then re-resolves the family's *current* hop target, the V4.1 leg). The chain **halts**
+after the V4.1 leg — exactly where it halted before the V4.1 leg existed. No generation downgrade is
+reachable by an automatic hop.
 
 ## Wiring
 
@@ -60,10 +64,10 @@ existed. No generation downgrade is reachable by an automatic hop.
 |---|---|---|---|
 | Provider registration | `extensions/custom-provider-openrouter/index.ts` | register `deepseek/deepseek-v4.1-flash` (reasoning true, `off`/`high`/`max`, text+image, 300K) | `pi --list-models` shows it, reasoning = yes |
 | Clamp authority | `pi-bootstrap/pi-config/models.json` | `providers.openrouter.modelOverrides["deepseek/deepseek-v4.1-flash"].contextWindow = 300000` | `scripts/check-cost-config.sh` PASS |
-| Chain table | `extensions/shared/provider-failover.ts` | openrouter leg → V4.1 slug; 0423 kept last as resolution-only | `provider-failover.test.ts` 80/0 |
+| Chain table | `extensions/shared/provider-failover.ts` | openrouter leg → V4.1 slug; 0423 kept last as resolution-only, guarded on BOTH serve paths (advance walk + latched-active) | `provider-failover.test.ts` 81/0 |
 | Family identity | `extensions/shared/provider-failover.ts` `familyOf` | `deepseek/deepseek-v4.1-flash` (slash form) → flash family | new pin + `default-coverage.test.ts` 5/0 |
 | Latch/session behavior | `extensions/provider-exhaustion.ts`, `extensions/provider-exhaustion.test.ts` | hop target = V4.1 slug; comment sync | `provider-exhaustion.test.ts` 36/0 |
-| Consumer suite | `extensions/builtin-tools/builtin-tools.test.ts` | `OPENROUTER_FLASH` = V4.1 slug | 228→ all green |
+| Consumer suite | `extensions/builtin-tools/builtin-tools.test.ts` | `OPENROUTER_FLASH` = V4.1 slug | 237/0 all green |
 | Fixture mirror | `tests/fixtures/cost-config/*/models.json` (8 trees) | mirror the new clamp key | `tests/cost-config/run.sh` exit 0 (scratch-verified + negative control) |
 | Docs | `docs/providers.md` | chain + cost delta + resolution-only rationale | review |
 
@@ -78,7 +82,8 @@ existed. No generation downgrade is reachable by an automatic hop.
 ## Rollback
 
 Revert the PR. No durable state migration: the legacy slug stays registered and in-table, so
-pre-#727 latch files / markers / sessions keep resolving throughout. The clamp key is additive.
+pre-#727 latch files / markers / sessions keep resolving throughout — a record whose `activeLeg` is
+the 0423 slug resolves to the current hop target rather than dispatching it. The clamp key is additive.
 
 ## Learnings
 

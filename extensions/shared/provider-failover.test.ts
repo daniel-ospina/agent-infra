@@ -886,6 +886,69 @@ test("RESOLUTION-ONLY legacy leg (#727): matches its own position, never an adva
   equal(fromLegacy.leg, null);
 });
 
+test("RESOLUTION-ONLY legacy leg (#727) is never SERVED: a stale pre-#727 latch re-resolves to the V4.1 leg", () => {
+  // A PRE-#727 latch record, byte-for-byte what the old code wrote when the root
+  // drained with qwen-tp out: activeLeg = the legacy-generation openrouter leg
+  // (readLatchState has no migration and the TTL is 24h, so for a day after the
+  // upgrade this is what resolution sees). Serving it would re-introduce the
+  // very silent generation downgrade #727 removes.
+  const { env } = makeEnv("v727-serve"); // env blocks qwen-tp by default
+  const now = Date.now();
+  fs.writeFileSync(
+    latchStateFile(env),
+    JSON.stringify({
+      version: 1,
+      epoch: 1,
+      updatedAt: new Date(now).toISOString(),
+      primaries: {
+        deepseek: {
+          status: "exhausted",
+          reason: "402",
+          source: "marker",
+          latchedAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
+          families: {
+            "deepseek-v4-flash": {
+              activeLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+              hopCount: 1,
+              lastReason: "402",
+            },
+          },
+          notice: null,
+        },
+      },
+      blockedLegs: {},
+    }),
+  );
+  const state = readLatchState(env);
+  // (a) root ask: the frozen legacy activeLeg is replaced by the CURRENT hop
+  // target — the same answer the family gives with no activeLeg recorded.
+  const rootAsk = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
+  equal(rootAsk.halted, false);
+  equal(
+    rootAsk.leg?.model,
+    "deepseek/deepseek-v4.1-flash",
+    "a stale legacy activeLeg must resolve to the current hop target, not itself",
+  );
+  ok(rootAsk.leg?.model !== "deepseek/deepseek-v4-flash", "never served the 0423 build (the #727 defect)");
+  equal(rootAsk.reason, "latched-advance", "served via the walk, not the latched-active fast path");
+  // (b) hop ask from a deeper family leg: same — never the frozen legacy leg
+  const hopAsk = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "qwen-tp", model: "deepseek-v4-flash-0731" },
+    state,
+    { env },
+  );
+  equal(hopAsk.leg?.model, "deepseek/deepseek-v4.1-flash");
+  // (c) when the current hop leg's provider is itself out, resolution HALTS —
+  // it does not fall back to the legacy generation to keep a leg alive.
+  markLegBlocked("openrouter", "401", { env });
+  const tail = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, readLatchState(env), { env });
+  equal(tail.halted, true, "no usable hop left → structured halt, never the 0423 build");
+  equal(tail.leg, null);
+  equal(tail.reason, "halt");
+});
+
 test("hopCount contract: first active-leg set = 1; re-advance from active leg = 2", () => {
   // qwen-tp UNBLOCKED so the flash chain has three usable legs:
   // deepseek → qwen-tp/deepseek-v4-flash-0731 → openrouter

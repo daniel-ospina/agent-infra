@@ -301,9 +301,11 @@ with automatic return after balance restore.
   (`RESOLUTION_ONLY_LEGS`): it is there so stale pre-#727 state (latch file /
   in-flight marker / session pinned to the slug) still matches its own leg — an
   absent table entry would make `nextLegAfter`'s startIdx -1 and re-return the
-  DRAINING root — while a fresh chain continuation is never served the older
-  build. The chain therefore HALTS after the V4.1 leg, exactly where it halted
-  before the V4.1 leg existed.
+  DRAINING root — while it is never SERVED, neither as an advance target nor
+  through resolution's latched-active fast path (a pre-#727 latch record froze
+  this very slug as its `activeLeg`; that record now re-resolves to the V4.1
+  leg instead of dispatching the older build). The advance walk therefore
+  HALTS after the V4.1 leg, exactly where it halted before the V4.1 leg existed.
   Thinking is CONFIGURABLE on the V4.1 leg (off/high/max — the levels the
   deepseek primary can express); `minimal`/`low`/`medium` stay unmapped for hop
   parity — the upstream slug accepts them, the primary cannot express them, and
