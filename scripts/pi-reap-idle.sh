@@ -45,8 +45,10 @@
 #   * UNTRUSTED store values never reach arithmetic: `store_number_ok` gates
 #     every store-derived number, because bash `$(( ))` re-parses an operand
 #     as an ARITHMETIC EXPRESSION (a crafted `pidStartSeconds` is a
-#     code-execution vector, not merely a parse risk). A `ps` that FAILED is a
-#     fail-closed abort, never a healthy "no candidates" pass.
+#     code-execution vector, not merely a parse risk). A `ps`/parser that
+#     FAILED is a fail-closed abort (exit 3), never a healthy "no candidates"
+#     pass — and `--list` reports the failure instead of printing an empty
+#     list.
 #   * Never touch another session's checkout: own tty / own ancestor pids /
 #     own PI_SESSION_ID are hard skips. Orchestrating marathons (a live
 #     non-zombie pi descendant) are skipped.
@@ -64,6 +66,8 @@
 # Env seams: PS_BIN KILL_BIN DATE_BIN CMUX_STATE_DIR PI_SESSIONS_DIR
 #   REAP_IDLE_HOURS REAP_STUCK_HOURS REAP_REAP_STUCK REAP_DRY_RUN
 #   REAP_GRACE_SECONDS REAP_NOW_EPOCH REAP_LOCK_STALE_SECONDS REAP_LOG
+#   REAP_MAX_HOURS (upper sanity bound for the two hour thresholds; the raw
+#   pre-normalization range check is meaningless without it).
 #   (default $HOME/.pi/agent/state/pi-reap-idle.log).
 # Exit codes: 0 completed passes, 2 usage, 3 fail-closed (store / lock /
 #            log-unwritable / ps-enumeration / descendant-map — see the
@@ -90,6 +94,12 @@ REAP_GRACE_SECONDS="${REAP_GRACE_SECONDS:-5}"
 # Upper sanity bound for both hour thresholds. Also keeps `$(( 10#... ))`
 # normalization from WRAPPING on a huge digit string (see run()).
 REAP_MAX_HOURS="${REAP_MAX_HOURS:-1000000}"
+# ...and it is itself an operator-settable env seam, so validate it before it
+# guards anything: a non-numeric value would make the `-le` comparisons error
+# and turn EVERY pass into an exit-2 (#947 review P2).
+grep -qE '^[0-9]+$' <<<"$REAP_MAX_HOURS" && [ "$REAP_MAX_HOURS" -ge 1 ] \
+    || { echo "bad REAP_MAX_HOURS: $REAP_MAX_HOURS (want a positive integer)" >&2; exit 2; }
+REAP_MAX_HOURS=$(( 10#${REAP_MAX_HOURS} ))
 REAP_LOCK_STALE_SECONDS="${REAP_LOCK_STALE_SECONDS:-1800}"
 STATE_DIR="${HOME:-}/.pi/agent/state"
 LOCK_DIR="$STATE_DIR/pi-reap-idle.lock"
@@ -188,9 +198,11 @@ CANDIDATES=""  # newline-separated candidate pids (tty'd + pi-argv)
 PS_RC=0        # exit status of the bulk `ps` call (0 = enumeration ran)
 
 ps_enumeration() {
-    local raw ps_rc=0
+    local raw ps_rc=0 awk_rc=0 cand_rc=0
     [ -n "${PS_TABLE:-}" ] && rm -f "$PS_TABLE" "$PS_TABLE.raw" 2>/dev/null
-    PS_TABLE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-ps.XXXXXX")"
+    # A failed mktemp must not fall through to the literal path ".raw" in the
+    # cwd — treat it as an enumeration failure (PS_RC) like any other.
+    PS_TABLE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-ps.XXXXXX")" || { PS_TABLE=""; PS_RC=1; return 1; }
     # Pinned bulk contract carries lstart (documented) but rows are parsed by
     # token scan (4-digit year token => stat/rss/command follow) so spacey
     # command columns never shift the parse.
@@ -207,7 +219,6 @@ ps_enumeration() {
     # former `sed 's/^ *//'` pipe is not needed.
     { PI_REAP_SELF_PID="$$" "$PS_BIN" -axo pid=,ppid=,pgid=,tty=,lstart=,stat=,rss=,command= 2>/dev/null; ps_rc=$?; } \
         >"$PS_TABLE.raw"
-    PS_RC="$ps_rc"
     awk '{
         pid=$1; ppid=$2; pgid=$3; tty=$4
         if (pid !~ /^[0-9]+$/ || pid+0 <= 0) next
@@ -230,9 +241,18 @@ ps_enumeration() {
         printf "%s %s %s %s %s %s %s", pid, ppid, pgid, tty, stat, rss, cmd
         if (cand) printf " CAND"
         printf "\n"
-    }' "$PS_TABLE.raw" >"$PS_TABLE"
+    }' "$PS_TABLE.raw" >"$PS_TABLE" || awk_rc=$?
     rm -f "$PS_TABLE.raw"
-    CANDIDATES="$(awk '$NF=="CAND" {print $1}' "$PS_TABLE")"
+    CANDIDATES="$(awk '$NF=="CAND" {print $1}' "$PS_TABLE")" || cand_rc=$?
+    # Any leg of the enumeration failing (ps, the parser, the candidate scan)
+    # makes the table untrustworthy in the SAME direction — an empty/truncated
+    # table reads as "no live child", so the guard disappears. A nonzero rc in
+    # a sibling command is not "ps succeeded" (#947 review P2).
+    PS_RC=0
+    if [ "$ps_rc" != 0 ]; then PS_RC="$ps_rc"
+    elif [ "$awk_rc" != 0 ]; then PS_RC="$awk_rc"
+    elif [ "$cand_rc" != 0 ]; then PS_RC="$cand_rc"
+    fi
 }
 
 self_pid="$$"
@@ -867,7 +887,17 @@ reap_one() { # <cand-line> <now>
         # kills (tens of seconds later at REAP_GRACE_SECONDS each) could
         # group-kill a session that resumed and started working.
         ps_enumeration
-        self_ancestors_from_table
+        # The fresh probe is only evidence if it RAN and produced a table. A
+        # failed/empty enumeration makes descendant_map_build "succeed" on an
+        # empty map, has_live_child/has_live_pi_descendant then answer "no
+        # child" for every pid, and the guard below silently disappears —
+        # reproduced as a real TERM+KILL of a session with a live tool child
+        # (#947 review P1). Fail closed instead.
+        if [ "$PS_RC" != 0 ] || [ ! -s "$PS_TABLE" ]; then
+            log "SETTLE-SKIP $pid stuck row fresh ps enumeration unavailable (rc=$PS_RC) — suppress"
+            return 0
+        fi
+        [ -n "$SELF_TTY" ] || self_ancestors_from_table
         if ! descendant_map_build; then
             log "SETTLE-SKIP $pid stuck row fresh descendant map unavailable — suppress"
             return 0
@@ -958,6 +988,7 @@ lock_acquire() {
     fi
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         log "LOCK raced — abort"
+        log "MODE=$MODE NOW=$(now_epoch) THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS CANDIDATES=0 STUCK=0 STUCK_RSS=0 STUCK_ARMED=$REAP_REAP_STUCK KILLED=0 YIELD=0"
         return 1
     fi
     printf '%s\n' "$$" >"$LOCK_DIR/owner"
@@ -1003,24 +1034,29 @@ run() {
     fi
     case "$MODE" in dry-run|apply) ;; *) usage >&2; exit 2 ;; esac
     grep -qE '^[0-9]+$' <<<"$REAP_IDLE_HOURS" || { echo "bad --idle-hours: $REAP_IDLE_HOURS" >&2; exit 2; }
-    # normalize to decimal: bash's $(( )) reads a zero-padded value as OCTAL
-    # while awk reads the same string as decimal, so REAP_IDLE_HOURS=024 gave
-    # awk 24h but a derived bound of $((024*3)) = 60 (= 3x20), silently 12h
-    # earlier than the documented 3x. (#947 review P2)
-    REAP_IDLE_HOURS=$(( 10#${REAP_IDLE_HOURS} ))
-    # ...but `$(( 10#... ))` WRAPS for a digit string beyond the shell's signed
-    # 64-bit range, so `--idle-hours 18446744073709551616` normalized to 0 =>
-    # "reap every session with any JSONL". A value accepted by the regex must
-    # round-trip into a sane range. (#947 review P2)
-    [ "$REAP_IDLE_HOURS" -ge 1 ] && [ "$REAP_IDLE_HOURS" -le "$REAP_MAX_HOURS" ] \
+    # Bound the RAW string BEFORE normalizing. `$(( 10#... ))` wraps mod 2^64,
+    # so 2^64+1 normalized to 1 — a "1 hour" threshold that would reap almost
+    # everything — and 2^64 normalized to 0. Checking the residue cannot catch
+    # that; checking the raw value can (and the regex above already proved it is
+    # all digits, so awk cannot be confused by it). (#947 review P2)
+    awk -v v="$REAP_IDLE_HOURS" -v m="$REAP_MAX_HOURS" 'BEGIN{exit !(v >= 1 && v <= m)}' \
         || { echo "bad --idle-hours: out of range (1..$REAP_MAX_HOURS)" >&2; exit 2; }
+    # Only NOW is it safe to normalize (bash reads a zero-padded value as OCTAL
+    # while awk reads the same string as decimal, so REAP_IDLE_HOURS=024 gave
+    # awk 24h but a derived bound of $((024*3)) = 60, silently 12h early).
+    REAP_IDLE_HOURS=$(( 10#${REAP_IDLE_HOURS} ))
     # bounded-veto freshness bound (#947): default 3x the (final) idle
     # threshold, so --idle-hours moves it too; an explicit value always wins.
-    if [ -z "$REAP_STUCK_HOURS" ]; then REAP_STUCK_HOURS=$(( REAP_IDLE_HOURS * 3 )); fi
-    grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" || { echo "bad --stuck-hours: $REAP_STUCK_HOURS" >&2; exit 2; }
-    REAP_STUCK_HOURS=$(( 10#${REAP_STUCK_HOURS} ))
-    [ "$REAP_STUCK_HOURS" -ge 1 ] && [ "$REAP_STUCK_HOURS" -le "$REAP_MAX_HOURS" ] \
-        || { echo "bad --stuck-hours: out of range (1..$REAP_MAX_HOURS)" >&2; exit 2; }
+    # The derived value needs no cap: idle <= REAP_MAX_HOURS, so 3x it cannot
+    # approach the 64-bit wrap the raw check above bounds.
+    if [ -z "$REAP_STUCK_HOURS" ]; then
+        REAP_STUCK_HOURS=$(( REAP_IDLE_HOURS * 3 ))
+    else
+        grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" || { echo "bad --stuck-hours: $REAP_STUCK_HOURS" >&2; exit 2; }
+        awk -v v="$REAP_STUCK_HOURS" -v m="$REAP_MAX_HOURS" 'BEGIN{exit !(v >= 1 && v <= m)}' \
+            || { echo "bad --stuck-hours: out of range (1..$REAP_MAX_HOURS)" >&2; exit 2; }
+        REAP_STUCK_HOURS=$(( 10#${REAP_STUCK_HOURS} ))
+    fi
     case "$REAP_REAP_STUCK" in
         0|1) ;;
         *) echo "bad REAP_REAP_STUCK: $REAP_REAP_STUCK (want 0 or 1)" >&2; exit 2 ;;
@@ -1036,6 +1072,13 @@ run() {
     if [ "$LIST_ONLY" = 1 ]; then
         ps_enumeration
         trap 'rm -f "$PS_TABLE"' EXIT
+        # A diagnostic that prints nothing because its probe FAILED must not
+        # look like "no sessions" — the operator's only signal would be an
+        # empty list. Report and exit 3. (#947 review P2)
+        if [ "$PS_RC" != 0 ]; then
+            echo "--list: ps enumeration failed (rc=$PS_RC, exit 3)" >&2
+            exit 3
+        fi
         printf '%s\n' "$CANDIDATES" | sed '/^$/d'
         exit 0
     fi
@@ -1082,14 +1125,17 @@ run() {
     ps_enumeration
     self_ancestors_from_table
     pre_count="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')"
-    # FAIL-CLOSED (#947 review P2): a `ps` that FAILED is not an idle machine.
-    # Without this, a broken ps/PS_BIN yields an empty table => 0 candidates =>
-    # the store read is skipped and the job exits 0 with a healthy-looking
-    # footer, every hour, forever.
-    if [ "$PS_RC" != 0 ] && [ "$pre_count" -eq 0 ]; then
-        echo "FAIL-CLOSED abort: ps enumeration failed (rc=$PS_RC, exit 3)" >&2
-        log "FAIL-CLOSED abort: ps enumeration failed (rc=$PS_RC, exit 3)"
-        log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS CANDIDATES=0 STUCK=0 STUCK_RSS=0 STUCK_ARMED=$REAP_REAP_STUCK KILLED=0 YIELD=0"
+    # FAIL-CLOSED (#947 review P2/P1): a `ps` that FAILED is not an idle
+    # machine. Without this, a broken ps/PS_BIN yields an empty table => 0
+    # candidates => the store read is skipped and the job exits 0 with a
+    # healthy-looking footer, every hour, forever. Abort whenever the
+    # enumeration did not fully succeed — with OR without rows: a partly-failed
+    # ps yields a TRUNCATED table, and a truncated table silently defeats the
+    # no-live-child guard (the same reasoning the settle probe suppresses on).
+    if [ "$PS_RC" != 0 ]; then
+        echo "FAIL-CLOSED abort: ps enumeration failed (rc=$PS_RC, candidates=$pre_count, exit 3)" >&2
+        log "FAIL-CLOSED abort: ps enumeration failed (rc=$PS_RC, candidates=$pre_count, exit 3)"
+        log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS CANDIDATES=$pre_count STUCK=0 STUCK_RSS=0 STUCK_ARMED=$REAP_REAP_STUCK KILLED=0 YIELD=0"
         exit 3
     fi
     descendant_map_ok=1

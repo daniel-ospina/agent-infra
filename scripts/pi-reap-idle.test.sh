@@ -78,6 +78,18 @@ cat > "$T/bin/ps" <<'SHIM'
 #!/usr/bin/env bash
 SOURCE="${FAKE_PS_SOURCE:?}"
 if [ "${1:-}" = "-axo" ]; then
+    # Deterministic bulk-call failure injection (settle-time probe tests):
+    # FAKE_PS_BULK_LOG counts bulk calls; from FAKE_PS_FAIL_BULK_N onward the
+    # call fails (rc 1). FAKE_PS_FAIL_PARTIAL=1 still prints the rows first
+    # (a partly-failed `ps`). Absent env => unchanged behaviour.
+    if [ -n "${FAKE_PS_BULK_LOG:-}" ]; then
+        _bn=0; [ -s "$FAKE_PS_BULK_LOG" ] && _bn="$(cat "$FAKE_PS_BULK_LOG")"
+        _bn=$(( _bn + 1 )); printf '%s\n' "$_bn" > "$FAKE_PS_BULK_LOG"
+        if [ -n "${FAKE_PS_FAIL_BULK_N:-}" ] && [ "$_bn" -ge "$FAKE_PS_FAIL_BULK_N" ]; then
+            [ "${FAKE_PS_FAIL_PARTIAL:-0}" = "1" ] && sed 's/^ *//' "$SOURCE"
+            exit 1
+        fi
+    fi
     sed 's/^ *//' "$SOURCE"
     # Inject a self row whose pid is the REAPER, not the shim. The reaper
     # exports PI_REAP_SELF_PID=$$ on its bulk ps call (real ps ignores it) —
@@ -1509,6 +1521,79 @@ OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run -
 assert_eq "$D19RC" "0" "D19 --idle-hours 08 is accepted (no octal abort)"
 assert_contains "$(cat "$T/D/reap.log")" "THRESHOLD=8 STUCK_HOURS=24" "D19 08 normalizes to decimal 8 and derives 24"
 rm -rf "$T/D/sessions"
+
+# D15j (review P1): the settle-time fresh enumeration is only EVIDENCE if it
+# ran. A failed/empty settle `ps` used to make descendant_map_build "succeed"
+# on an empty map, has_live_child answer "no child" for every pid, and the
+# guard silently vanish — reproduced as a real TERM+KILL of a session with a
+# live tool child. The row must SUPPRESS instead.
+printf '%s\n' "$(psrow 30062 400000 30062 ttys427 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d15q")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d15q d15q "$E_SEP3_2000" "2026-08-31T00:00:00.000Z"
+printf '%s' '{"d15q":{"pid":30062,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"running","runtimeStatus":"idle","updatedAt":'$E_AUG31_0000',"cwd":"/Users/t/d15q"}}' | cmux_store D
+: > "$T/D/bulk-count"; : > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=2 REAP_REAP_STUCK=1 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"; D15JRC=$?
+assert_eq "$D15JRC" "0" "D15j a failed settle enumeration does not abort the pass"
+[ ! -s "$T/D/kill.log" ] && ok "D15j failed settle enumeration suppresses the kill (0 signals)" || bad "D15j failed settle enumeration suppresses the kill (0 signals)"
+assert_contains "$(cat "$T/D/reap.log")" "fresh ps enumeration unavailable" "D15j the suppress reason is logged"
+rm -rf "$T/D/sessions"
+
+# D21b (review P2): a PARTLY failed `ps` (rc!=0 but rows emitted) is the same
+# hazard in a quieter form — a truncated table silently reads as "no live
+# child", so an armed pass must abort, not proceed on a subset.
+: > "$T/D/kill.log"; : > "$T/D/reap.log"; : > "$T/D/bulk-count"
+REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY \
+    FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=1 FAKE_PS_FAIL_PARTIAL=1 \
+    run_reaper D --apply > "$T/D/d21b.out" 2>&1; D21BRC=$?
+assert_eq "$D21BRC" "3" "D21b a partially-failed ps aborts (exit 3) despite emitting rows"
+assert_contains "$(cat "$T/D/d21b.out")" "candidates=" "D21b the abort reports the candidate count it saw"
+[ ! -s "$T/D/kill.log" ] && ok "D21b zero signals on a truncated ps table" || bad "D21b zero signals on a truncated ps table"
+rm -rf "$T/D/sessions"
+
+# D21c (review P2): `--list` is the diagnostic surface an operator reaches for
+# when the reaper misbehaves — a silent empty list would look like "no
+# sessions". It must report a failed enumeration (stderr, exit 3).
+: > "$T/D/reap.log"; : > "$T/D/bulk-count"
+OUT="$(FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=1 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --list 2>&1)"; D21CRC=$?
+assert_eq "$D21CRC" "3" "D21c --list exits 3 when its ps probe failed"
+assert_contains "$OUT" "--list: ps enumeration failed" "D21c --list names the failure instead of printing nothing"
+[ ! -s "$T/D/reap.log" ] && ok "D21c --list still writes no log on the failure path" || bad "D21c --list still writes no log on the failure path"
+
+# D22 (review P2): REAP_MAX_HOURS is itself an operator env seam gating both
+# thresholds; a non-numeric value used to make the range comparison error and
+# turn EVERY pass into an exit-2 with no documented knob.
+OUT="$(REAP_MAX_HOURS=abc REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run 2>&1)"; D22RC=$?
+assert_eq "$D22RC" "2" "D22 a non-numeric REAP_MAX_HOURS is a usage error"
+assert_contains "$OUT" "bad REAP_MAX_HOURS" "D22 the message names the env seam"
+
+# D22b (review P2): the `LOCK raced` branch must write the same reduced footer
+# as the live-owner branch — a monitor keying on STUCK_ARMED must never read
+# the previous pass's values on a lock abort. An unwritable STATE_DIR forces the
+# raced branch (the lock dir cannot be created at all).
+mkdir -p "$T/D/home/.pi/agent/state"
+: > "$T/D/reap.log"
+chmod 500 "$T/D/home/.pi/agent/state" 2>/dev/null
+REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run > "$T/D/d22b.out" 2>&1; D22BRC=$?
+chmod 700 "$T/D/home/.pi/agent/state" 2>/dev/null
+assert_eq "$D22BRC" "3" "D22b a lock that cannot be created aborts (exit 3)"
+assert_contains "$(cat "$T/D/reap.log")" "LOCK raced" "D22b the raced lock branch is the one taken"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK_HOURS=72" "D22b the LOCK raced abort footer carries the stuck bound"
+assert_contains "$(cat "$T/D/reap.log")" "STUCK_ARMED=0" "D22b the LOCK raced abort footer carries STUCK_ARMED"
+
+# D22c (review P2): a 2^64 multiple wraps to a value INSIDE the bound, so
+# bounding the residue accepted it (2^64+1 => THRESHOLD=1 => reap almost
+# everything). The RAW digit string must be bounded before normalization.
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 18446744073709551617 2>&1)"; D22CRC=$?
+assert_eq "$D22CRC" "2" "D22c --idle-hours 2^64+1 (wraps to 1) is rejected"
+assert_contains "$OUT" "out of range" "D22c the wrap-by-multiple case is named"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --stuck-hours 18446744073709551617 2>&1)"; D22DRC=$?
+assert_eq "$D22DRC" "2" "D22c --stuck-hours 2^64+1 (wraps to 1) is rejected"
+# ...and the derived bound is NOT clamped by REAP_MAX_HOURS (a regression the
+# residue check introduced: --idle-hours 333334 => stuck 1000002 > cap =>
+# exit 2 naming a flag the user never passed).
+: > "$T/D/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 333334 2>&1)"; D22ERC=$?
+assert_eq "$D22ERC" "0" "D22c a large in-range --idle-hours is accepted"
+assert_contains "$(cat "$T/D/reap.log")" "THRESHOLD=333334 STUCK_HOURS=1000002" "D22c the derived stuck bound is not capped"
 
 rm -rf "$T/D"
 

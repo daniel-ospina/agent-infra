@@ -65,9 +65,11 @@ RSS/process measurement.
   — it still cannot veto the ordinary path — but it CAN withhold a STUCK kill.
   The JSONL proof is computed **before** the veto so
   the stuck population is never invisible: every vetoed row **that has a JSONL
-  proof** carries its `jsonl idle Xh, record age Yh` (a vetoed row with no
-  proof keeps the fail-closed `SKIP <veto>` line and reports no ages, since
-  none exist), plus a `⚠️ STUCK` audit block and
+  proof** surfaces its `jsonl idle` age, and its record age too whenever a
+  usable `updatedAt` exists (a vetoed row with no proof keeps the fail-closed
+  `SKIP <veto>` line and reports no ages, since none exist; a proof-bearing row
+  whose sibling non-idle record carries a missing/unparseable `updatedAt`
+  reports `record age ?h`), plus a `⚠️ STUCK` audit block and
   `STUCK_HOURS=/STUCK=/STUCK_RSS=/STUCK_ARMED=` footer fields.
 - **Falsification note:** the 24h threshold is diurnal-safe (a session that
   was used yesterday morning and again this morning is never falsely flagged);
@@ -103,7 +105,12 @@ RSS/process measurement.
    of every matched record's file** — so a twin that advances is not invisible.
    A STUCK row additionally re-reads the cmux store: its deciding record must
    still exist, still be non-idle, and **every** non-idle record for that pid
-   must still carry a valid stale stamp (the same union rule as classify). So a
+   must still carry a valid stale stamp (the same union rule as classify). A
+   STUCK row also takes a **fresh `ps` enumeration** and re-runs the
+   no-live-child / no-live-pi-descendant probe against it, so a tool child
+   spawned *after* classify suppresses the kill; if that fresh enumeration
+   fails or comes back empty, the row is suppressed (an untrustworthy probe
+   is never read as "no child"). So a
    twin that **refreshes** — i.e. starts a turn — suppresses, while a twin that
    merely goes *idle* deliberately does not: an idle record is the reap target
    itself, not work in progress, and any real activity on that twin is still
@@ -121,6 +128,14 @@ leaders); per-pid fallback otherwise — documented limitation below.
 
 ## Safety gates + never-touch list
 
+- Fail-closed ps enumeration (added with #947): if the pass-start `ps` (or its
+  row parser, or the candidate scan) fails, the pass aborts (exit 3) and
+  signals nothing — **whether or not rows came out**, because a partly-failed
+  `ps` yields a *truncated* table and a truncated table silently reads as "no
+  live child". A broken `ps` must never be mistaken for an idle machine. The
+  same rule guards the settle-time re-enumeration for STUCK rows (see gate 7).
+  `--list` reports the failure on stderr and exits 3 rather than printing an
+  empty list.
 - Fail-closed store: a missing/corrupt cmux store **with candidates** aborts
   (exit 3) after one retry — the pass never reaps from an unreadable
   registry. Zero tty'd pi candidates skip the store read entirely (exit 0,
@@ -161,7 +176,11 @@ fence + allowlist + marathon/own-session gates → settle-verified kill. Driven
 hourly by launchd; interactive runs default to **dry-run**; the launchd env
 carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
 `REAP_IDLE_HOURS`. Bounded-veto override: `--stuck-hours N` /
-`REAP_STUCK_HOURS` (default 3× the idle threshold). Stuck arm: `--reap-stuck` /
+`REAP_STUCK_HOURS` (default 3× the idle threshold). Both thresholds are bounded
+by `REAP_MAX_HOURS` (default 1000000); the RAW value is range-checked before
+decimal normalization (bash `$(( 10#… ))` wraps mod 2^64) and a bad value —
+including a non-numeric `REAP_MAX_HOURS` itself — is a usage error (exit 2).
+Stuck arm: `--reap-stuck` /
 `REAP_REAP_STUCK=1` — **not** set by the launchd job, so the hourly pass
 reports the stuck set and never reaps it.
 
@@ -174,9 +193,10 @@ reports the stuck set and never reaps it.
   Truncation uses a `mktemp`-ed sibling in the log's own directory — never a
   predictable `/tmp` name (a local symlink-truncation surface). Every pass writes a footer
   `MODE=<dry-run|apply> NOW=… THRESHOLD=… STUCK_HOURS=… STUCK=… STUCK_RSS=… STUCK_ARMED=… CANDIDATES=… PRE=… POST=… RESIDUAL=… KILLED=… YIELD=…`
-  (the exact field set, in order, of a normal pass). Every exit path that
-  reaches classification writes a reduced footer carrying `STUCK_HOURS=` and
-  `STUCK_ARMED=` — `MODE=disabled … sentinel=`, the **lock** abort, the **ps
+  (the exact field set, in order, of a normal pass). Every abort that runs
+  before classification writes a reduced footer carrying `STUCK_HOURS=` and
+  `STUCK_ARMED=` — `MODE=disabled … sentinel=`, the **lock** abort (both the
+  live-owner and the `LOCK raced` branch), the **ps
   enumeration** abort, the **descendant-map** abort and the **store** abort —
   so a monitor keying on `STUCK_ARMED` never silently reads the previous
   pass's values as current. On those paths `STUCK=0` is a literal "no
@@ -184,7 +204,9 @@ reports the stuck set and never reaps it.
   reason line immediately before the footer; the disabled path's reason is on
   **stdout** (`echo`), so its log holds the footer alone (the footer is
   self-describing: `MODE=disabled … sentinel=<path>`). The one footer-less
-  exit is the **log-unwritable** abort, which by definition cannot log. MODE distinguishes armed vs dry passes (an armed pass with zero kills must
+  exit is the **log-unwritable** abort, which by definition cannot log; the
+  non-classifying modes (`--list`, `--probe-jsonl`, `--help`, usage errors)
+  write no footer and never reach classification. MODE distinguishes armed vs dry passes (an armed pass with zero kills must
   not read as a disarmed job); zero-candidate runs still write the footer
   (an absent log must never mean "not running"); PRE = tty'd-pi before the
   kill pass; POST + RESIDUAL come from a **fresh post-pass read** — RESIDUAL is
@@ -281,7 +303,9 @@ reports the stuck set and never reaps it.
   `running`. The guards are the dual-signal freshness bound (a `updatedAt`
   that is not a real epoch — digit/dot soup, out of plausible range — is
   never treated as stale; fail closed), the S/I process state at classify
-  **and again at settle**, the absence of a live child at classify, and the
+  **and again at settle**, the settle-time fresh `ps` re-enumeration and
+  child/descendant re-check (suppressed if that probe fails or is empty), the
+  absence of a live child at classify, and the
   settle re-verify: fresh lstart + fresh JSONL (unchanged) **plus, for stuck
   rows only, a fresh store re-read** requiring the deciding record to still
   exist and still be non-idle, every non-idle record for that pid to still be
