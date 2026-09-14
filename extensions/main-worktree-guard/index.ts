@@ -164,7 +164,8 @@ let resolveTargetCheckout: (targetPath: string, cwd?: string) => { top: string; 
 let trackedRelsIn: (repoTop: string, rels: string[]) => string[] = () => [];
 let hasDotGitAncestor: (p: string) => boolean = () => false;
 let extractScriptPath: (command: string) => string | null = () => null;
-let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
+let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
+let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null) => "allow" | "block" = () => "allow";
 // #627: non-shell code-interpreter payload surface (python -c / node -e / …).
 // Fail-safe defaults inert so a failed import NEVER false-blocks.
 let extractCodePayload: (command: string) => { kind: "inline" | "file" | "stdin-file" | "module" | "stdin"; value: string | null } | null = () => null;
@@ -287,6 +288,10 @@ try {
   // _backdoorBlock, whose catch turns the whole #627 gate fail-OPEN).
   if (typeof _extractCodePayload === "function") extractCodePayload = _extractCodePayload;
   if (typeof _codePayloadGitVerdict === "function") codePayloadGitVerdict = _codePayloadGitVerdict;
+  // #967/#1484: the invocation's positional args feed the subcommand
+  // reachability filter. Stale-module skew guard: a missing export leaves the
+  // fail-safe default ([] → no reachability proof → the whole script gates).
+  if (typeof _m5.extractScriptArgs === "function") extractScriptArgs = _m5.extractScriptArgs;
   // Stale-classify-git skew guard: a missing export must leave the fail-safe
   // defaults (never overwrite a function with undefined → TypeError on the
   // write branch).
@@ -1748,14 +1753,29 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     const resolved = resolve(base, scriptPath);
     if (!existsSync(resolved) || !statSync(resolved).isFile()) return null;
     const branch = getMainCheckoutBranch();
-    if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd())) === "block") {
+    // #967/#1484: pass the invocation's positional args so a branch only a
+    // DIFFERENT subcommand reaches cannot gate this one (e.g. `--probe` must
+    // not be blocked by a `--reset`-only discard). [] is a real argv (no args)
+    // — `$1` is then provably empty; undefined would be "unknown".
+    const scriptArgs = extractScriptArgs(command, scriptPath);
+    if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs) === "block") {
+      // #743: label the SCRIPT's own checkout, not the session's. A linked
+      // worktree's copy is not "the shared main checkout", and the old message
+      // offered hub-worktree.sh — which creates a worktree but cannot make a
+      // hub-rooted session run a content-gated script.
+      let scriptInWorktree = false;
+      try { scriptInWorktree = isWorktreeCwdWrite(resolve(dirname(resolved))); } catch { /* main (safe default) */ }
       return [
-        `⛔ Script execution blocked — git-bearing script in the shared main checkout (#1484).`,
+        `⛔ Script execution blocked — script content contains a blocked git operation (#1484).`,
         `   The script backdoor (write /tmp/x.sh + bash /tmp/x.sh) is closed:`,
-        `   ${resolved} contains a non-sanctioned git operation.`,
-        `   → Run the git commands directly (recovery: git checkout main && git pull --ff-only),`,
-        `     or work in an isolated worktree:`,
-        `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+        `   ${resolved}`,
+        `   (script location: ${scriptInWorktree ? "a linked worktree" : "the shared main checkout"})`,
+        `   performs a git operation that is not sanctioned against the shared main checkout.`,
+        `   → Run the underlying git commands directly (each is gated on its own), or do`,
+        `     this work in an isolated worktree (invoke the using-git-worktrees skill).`,
+        `   → cd-ing into a worktree from a HUB-ROOTED session does not lift this — the`,
+        `     gate keys on the session cwd. Start the session in the worktree, or set`,
+        `     the documented AGENT_ALLOW_MAIN_EDITS escape hatch for a solo session.`,
       ].join("\n");
     }
     return null;

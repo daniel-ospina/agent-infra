@@ -62,6 +62,7 @@ export const LOCKED_FILES = Object.freeze([
  */
 export const UNLOCKED_WORKFLOWS = Object.freeze([
   ".github/workflows/docs-ci.yml",
+  ".github/workflows/admin-merge-detector.yml",
   ".github/workflows/drift-check.yml",
   ".github/workflows/enforce-skills.yml",
   ".github/workflows/pipeline-compliance.yml",

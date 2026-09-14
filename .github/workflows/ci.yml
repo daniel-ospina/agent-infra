@@ -93,6 +93,22 @@ jobs:
       - name: SIGPIPE guard suite (detection, continuations, exceptions, positive controls)
         run: bash tests/sigpipe-grep/run.sh
 
+  admin-merge:
+    # #930 — the safe-admin-merge rail. `--admin` bypasses required checks, so
+    # nothing makes it *safe*: it cannot tell a check already red on main from a
+    # NEW failure the PR introduces (tortoise #3420 merged carrying a test that
+    # was not in main's failing set, and main ratcheted redder). This job is the
+    # per-PR half: scripts/ci-failure-set.sh is the ONE parser, and
+    # scripts/admin-merge.sh is the chokepoint (union baseline + flake re-run +
+    # head-bound evidence). The refusal half (a raw `gh pr merge --admin`
+    # without evidence) is pinned by extensions/review-enforcer/index.test.ts.
+    # Hermetic: a fake `gh` serves every call — no network, no provider keys.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Safe admin-merge rail suite (parser, #3469 trap, flake, parity)
+        run: bash tests/admin-merge/run.sh
+
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
     # every extensions/ top-level entry except *.test.ts must be farm-wired
