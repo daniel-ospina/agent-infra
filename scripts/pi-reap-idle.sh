@@ -635,6 +635,7 @@ classify_candidates() {
     local now="$1" emit="$2" pid detail epoch pgid stat rss tty rec al rs sid cwd sfile
     local last_epoch youngest vote abstain matched_cnt veto diff sid_marker rec_pss
     local rec_age_min ruid rage stuck_ok sfiles_all US_ALL ral rrs
+    local rsid rcwd rf le US
     REAP_CANDIDATES=""; REAP_COUNT=0
     if [ "$emit" = 1 ]; then STUCK_CANDIDATES=""; STUCK_COUNT=0; STUCK_RSS=0; fi
     if [ -z "$CANDIDATES" ]; then
@@ -807,7 +808,12 @@ classify_candidates() {
         fi
         idle_age_h="$(awk -v n="$now" -v y="$youngest" 'BEGIN{printf "%.1f", (n-y)/3600}')"
         if awk -v n="$now" -v y="$youngest" -v t="$REAP_IDLE_HOURS" 'BEGIN{exit !((n-y)/3600 > t)}'; then
-            REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfile|$idle_age_h|$youngest|$epoch|0" | sed '/^$/d')"
+            # Field 5 (the settle probe set) carries the UNION of every matched
+            # proof file, not just the max-epoch deciding one: a strictly-older
+            # matched twin that advances in the classify->settle window must
+            # suppress, exactly as for a stuck row. Probing the union only ever
+            # narrows the kill set. (#947 review P2)
+            REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfiles_all|$idle_age_h|$youngest|$epoch|0" | sed '/^$/d')"
             [ "$emit" = 1 ] && say "$pid tty=$tty REAP-ELIGIBLE rss=${rss:-0} idle_h=${idle_age_h}h session=$sid jsonl=$sfile"
         else
             [ "$emit" = 1 ] && say "$pid tty=$tty SKIP active (idle_h=${idle_age_h}h ≤ threshold ${REAP_IDLE_HOURS}h)"
@@ -833,7 +839,7 @@ signal_target() { # <pid> <pgid> <TERM|KILL> — group signal when pgid==pid els
 reap_one() { # <cand-line> <now>
     local cand="$1" now="$2"
     local pid pgid rss sid sfile idle_h class_epoch class_lstart
-    local detail epoch2 pgid2 stat2 sfile2 fresh_epoch stuck_flag
+    local detail epoch2 pgid2 stat2 sfile2 fresh_epoch stuck_flag epoch3 pgid3 stat3
     pid="$(printf '%s' "$cand" | cut -d'|' -f1)"
     pgid="$(printf '%s' "$cand" | cut -d'|' -f2)"
     rss="$(printf '%s' "$cand" | cut -d'|' -f3)"
@@ -1071,6 +1077,14 @@ run() {
         awk -v v="$REAP_STUCK_HOURS" -v m="$REAP_MAX_HOURS" 'BEGIN{exit !(v >= 1 && v <= m)}' \
             || { echo "bad --stuck-hours: out of range (1..$REAP_MAX_HOURS)" >&2; exit 2; }
         REAP_STUCK_HOURS=$(( 10#${REAP_STUCK_HOURS} ))
+        # The stuck bound is an ESCALATION of the idle bound, so an explicit
+        # value below it is a contradiction: the stuck arm compares
+        # `idle_age_h > REAP_STUCK_HOURS`, so `--stuck-hours 1` with the default
+        # 24h idle would TERM a session idle only 2h — a live session reaped
+        # without ever passing the idle proof the header contract requires.
+        # Same monotonicity rule as the derived branch. (#947 review P2)
+        [ "$REAP_STUCK_HOURS" -ge "$REAP_IDLE_HOURS" ] \
+            || { echo "bad --stuck-hours: $REAP_STUCK_HOURS is below the idle threshold ${REAP_IDLE_HOURS}h (the stuck bound escalates it)" >&2; exit 2; }
     fi
     case "$REAP_REAP_STUCK" in
         0|1) ;;

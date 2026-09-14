@@ -182,9 +182,13 @@ by `REAP_MAX_HOURS` (default 1000000); the RAW value is range-checked before
 decimal normalization (bash `$(( 10#… ))` wraps mod 2^64) and a bad value —
 including a non-numeric `REAP_MAX_HOURS` itself — is a usage error (exit 2).
 The **derived** stuck bound (3× the idle threshold) is not capped, but it is
-checked after the multiply to be a positive decimal, so an overflowing wrap
-cannot make it negative (a negative bound would make every age comparison
-true and classify active sessions STUCK).
+checked after the multiply to be a positive decimal **and** `>= REAP_IDLE_HOURS`,
+so an overflowing wrap cannot make it negative (a negative bound would make every
+age comparison true and classify active sessions STUCK) **and a wrap that lands
+positive** (e.g. `6148914691236517206 * 3 == 2`, a ~7e14-year bound silently
+becoming 2h) is rejected too — every 64-bit wrap yields a value below the
+multiplicand, so monotonicity catches the positive-wrap class the positivity
+check alone accepted.
 Stuck arm: `--reap-stuck` /
 `REAP_REAP_STUCK=1` — **not** set by the launchd job, so the hourly pass
 reports the stuck set and never reaps it.
@@ -294,6 +298,18 @@ reports the stuck set and never reaps it.
 
 ## Limitations + residuals
 
+- **The normal (non-stuck) path's settle re-verify is narrower than the arm's.**
+  Both paths re-probe the **union of every matched proof file** (a strictly
+  older matched twin that advances suppresses), but only a STUCK row re-reads
+  the cmux store at settle: for a normal row the store is read once, at
+  classify, so a cmux record that goes fresh/non-idle in the classify→settle
+  window is not seen (the JSONL union probe is what catches resumed work there).
+  Tracked in #1009 with the marathon-skip gap below.
+- **The orchestrating skip is tty-gated.** `has_live_pi_descendant` marks a
+  descendant only when it is a tty'd `pi` (the same classifier the candidate
+  set uses), so a **headless** `pi -p` descendant does not protect its parent —
+  the parent's JSONL is what catches resumed orchestration in practice. Tracked
+  in #1009.
 - **pgid ≠ pid fallback:** when a candidate is not its own process-group
   leader, the reaper signals the pid alone (documented per-pid TERM). Live
   fleet data shows all tty'd REPLs are pgid leaders, so group semantics hold;
@@ -313,8 +329,9 @@ reports the stuck set and never reaps it.
   **and again at settle**, the settle-time fresh `ps` re-enumeration and
   child/descendant re-check (suppressed if that probe fails or is empty), the
   absence of a live child at classify, and the
-  settle re-verify: fresh lstart + fresh JSONL (unchanged) **plus, for stuck
-  rows only, a fresh store re-read** requiring the deciding record to still
+  settle re-verify: fresh lstart + fresh JSONL over the **union of every matched
+  proof file** **plus, for stuck rows only, a fresh store re-read** requiring the
+  deciding record to still
   exist and still be non-idle, every non-idle record for that pid to still be
   stale (union), and the process still sleeping — so a turn starting on any
   of the pid's records rewrites that record and suppresses, and the deciding

@@ -1619,6 +1619,15 @@ for D22E in 6148914691236517206 6148914691236517205 6148914691236517207 92233720
     assert_eq "$D22ERC" "2" "D22e a positive-wrapping derived bound (idle=$D22E) is rejected"
 done
 assert_contains "$OUT" "bad derived --stuck-hours" "D22e the positive-wrap rejection names the derived bound"
+# D22f (round-6 review P2): the stuck bound ESCALATES the idle bound, so an
+# explicit value below it is a contradiction — the stuck arm compares
+# `idle_age_h > REAP_STUCK_HOURS`, so `--stuck-hours 1` (default idle 24h) TERM'd
+# a session idle only 2h, bypassing the idle proof the header contract requires.
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 24 --stuck-hours 1 2>&1)"; D22FRC=$?
+assert_eq "$D22FRC" "2" "D22f an explicit --stuck-hours below the idle threshold is rejected"
+assert_contains "$OUT" "below the idle threshold" "D22f the message explains the escalation rule"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 24 --stuck-hours 48 2>&1)"; D22GRC=$?
+assert_eq "$D22GRC" "0" "D22f an explicit --stuck-hours ABOVE the idle threshold is still accepted"
 
 # D23 (review P2): the post-pass read feeds POST/RESIDUAL only, but a failed
 # post-pass must not be reported as a fresh count — a stale candidate list made
@@ -1629,6 +1638,32 @@ assert_eq "$D23RC" "0" "D23 a failed POST-pass enumeration does not abort the pa
 assert_contains "$(cat "$T/D/reap.log")" "POST-PASS ps enumeration failed" "D23 the degradation is logged"
 assert_contains "$(cat "$T/D/reap.log")" "POST=?" "D23 POST is reported as unknown, not as a stale count"
 assert_contains "$(cat "$T/D/reap.log")" "RESIDUAL=?" "D23 RESIDUAL is degraded too (dry-run) — the doc's claim is code-true"
+
+# D24 (round-6 review P2): the UNION settle probe set applies to the NORMAL
+# (non-stuck) path too. A strictly-older matched twin that advances in the
+# classify->settle window must suppress — probing only the max-epoch deciding
+# file (the pre-round-6 field) would TERM it.
+printf '%s\n' "$(psrow 30063 400000 30063 ttys428 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d24a")" \
+               "$(psrow 30064 400000 30064 ttys428 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/d24b")" > "$T/D/ps-source"
+session_jsonl D /Users/t/d24a d24c "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+session_jsonl D /Users/t/d24b d24new "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+session_jsonl D /Users/t/d24b d24old "$E_SEP3_2000" "2026-09-02T20:00:00.000Z"
+printf '%s' '{"d24c":{"pid":30063,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/d24a"},"d24new":{"pid":30064,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/d24b"},"d24old":{"pid":30064,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/d24b"}}' | cmux_store D
+cat > "$T/D/norm-union-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM)
+        printf '{"type":"message","role":"user","timestamp":"2026-09-05T01:00:00.000Z","content":"hi"}\n' >> "$T/D/sessions/--Users-t-d24b--/${E_SEP3_2000}_d24old.jsonl"
+        ;;
+esac
+SH
+chmod +x "$T/D/norm-union-side.sh"
+: > "$T/D/kill.log"; : > "$T/D/reap.log"
+OUT="$(FAKE_KILL_SIDE="$T/D/norm-union-side.sh" REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --apply 2>&1)"
+assert_contains "$(cat "$T/D/kill.log")" "kill -TERM -30063" "D24 trigger candidate TERM'd normally"
+assert_not_contains "$(cat "$T/D/kill.log")" "30064" "D24 normal row: a strictly-older twin's advance suppresses (union probe set)"
+assert_contains "$(cat "$T/D/reap.log")" "activity advanced" "D24 normal-row union probe reason logged"
+rm -rf "$T/D/sessions" "$T/D/norm-union-side.sh"
 
 rm -rf "$T/D"
 
