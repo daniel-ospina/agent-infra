@@ -57,7 +57,14 @@ case "${tested}" in
     exit 1
     ;;
 esac
-case "${pending:-0}" in
+case "${pending:-}" in
+  '')
+    # A report with NO `pending` counter is from a parser too OLD to answer the
+    # question. Defaulting it to 0 (as this did) silently asserted "nothing is still
+    # running" — the same fail-open class as the `tested` check above (cycle-3 review).
+    echo "::error::vacuity guard: the report at '${REPORT}' carries no 'pending' counter (examined=${examined:-?} completed=${completed:-?}) — cannot certify ${SHA}"
+    exit 1
+    ;;
   *[!0-9]*)
     echo "::error::vacuity guard: 'pending' is not a number ('${pending}') in '${REPORT}' — cannot certify ${SHA}"
     exit 1
@@ -69,10 +76,10 @@ if [ "$tested" -eq 0 ]; then
   exit 1
 fi
 
-if [ "${pending:-0}" -gt 0 ]; then
+if [ "$pending" -gt 0 ]; then
   echo "::error::vacuity guard: ${LANE} still has ${pending} pending run(s) for ${SHA} — the comparison is not settled yet"
   exit 1
 fi
 
-echo "vacuity guard: ${LANE} tested ${SHA} (examined=${examined:-0} completed=${completed:-0} tested=${tested} pending=${pending:-0})"
+echo "vacuity guard: ${LANE} tested ${SHA} (examined=${examined:-0} completed=${completed:-0} tested=${tested} pending=${pending})"
 exit 0
