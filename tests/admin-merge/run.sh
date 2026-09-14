@@ -382,7 +382,7 @@ fi
 # ── 7. merge flags pass through ───────────────────────────────────────────
 echo "== 7. extra merge flags pass through (not hardcoded) =="
 run_admin 42 --main-runs 4 --squash --delete-branch >/dev/null 2>&1
-if grep -q "pr merge 42 --admin --match-head-commit $HEAD_SHAPE --squash --delete-branch" "$SCEN/calls"; then
+if grep -q "pr merge 42 --admin --squash --delete-branch --match-head-commit $HEAD_SHAPE" "$SCEN/calls"; then
   pass "--squash/--delete-branch forwarded and the merge is head-pinned (--match-head-commit)"
 else
   fail "merge flags were not forwarded, or the merge is not head-pinned"
@@ -1164,6 +1164,66 @@ grep -q "has NOT finished" "$TMP/err" && pass "…for the not-finished reason" \
   || fail "expected the not-finished reason for an unreadable pending"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on an unreadable report" \
   || pass "no merge attempted"
+
+# ── 29. cycle-3 review: a false certificate, a rebindable binding, and two
+#        fail-opens in the guard's own counters ──────────────────────────────
+echo "== 29. an unattributed failing run, the head binding, and pending =="
+
+# (a) A FAILING run whose log yields NO `FAILED <nodeid>` line contributes NOTHING to
+# the set, so "unique to this PR: 0" is unsupported — the certificate would be FALSE.
+# Before the fix the rail printed `PR failing: 0` for a RED lane and merged it.
+new_scen unattributed
+HEAD_UA="a1a1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_UA" > "$SCEN/head"
+lane_fail "$HEAD_UA" 9101 > "$SCEN/runs-$HEAD_UA"
+printf 'test (a)\tRun tests\tImportError: no module named y\n' > "$SCEN/log-9101"
+lane_fail mainua 9102 > "$SCEN/runs-main"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9102"
+run_admin 42 --main-runs 3 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "a failing run with NO parseable id BLOCKS (exit $rc)" \
+  || fail "a RED lane was certified as zero-residual — a false certificate"
+[ -f "$SCEN/comment" ] && fail "  …but an evidence comment was posted" || pass "  …no evidence comment"
+grep -q "pr merge" "$SCEN/calls" && fail "  …but a merge was attempted" || pass "  …and no merge was attempted"
+grep -q "parseable" "$TMP/err" && pass "  …and the refusal names the reason" || fail "  …the refusal is unexplained"
+
+# …while a failing run that IS attributable behaves exactly as before (no over-block).
+new_scen attributed
+printf '%s\n' "$HEAD_UA" > "$SCEN/head"
+lane_fail "$HEAD_UA" 9111 > "$SCEN/runs-$HEAD_UA"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9111"
+lane_fail mainua2 9112 > "$SCEN/runs-main"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9112"
+run_admin 42 --main-runs 3 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && pass "an attributable failure present on both sides still certifies (no over-block)" \
+  || fail "a normal zero-residual merge was blocked: $(head -1 "$TMP/err")"
+
+# (b) `--match-head-commit` must come AFTER the caller's passthrough: gh takes the LAST
+# occurrence of a scalar flag, so the old order let `-- --match-head-commit <other>`
+# rebind the merge to a head other than the certified one.
+new_scen rebound
+HEAD_RB="b2b2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_RB" > "$SCEN/head"
+lane_fail "$HEAD_RB" 9201 > "$SCEN/runs-$HEAD_RB"
+log_failed 'tests/test_same.py::test_same' > "$SCEN/log-9201"
+lane_fail mainrb 9202 > "$SCEN/runs-main"
+log_failed 'tests/test_same.py::test_same' > "$SCEN/log-9202"
+run_admin 42 --main-runs 3 -- --match-head-commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef >/dev/null 2>&1
+last_mhc="$(grep -o -- '--match-head-commit [0-9a-fA-F]*' "$SCEN/calls" | tail -1)"
+[ "$last_mhc" = "--match-head-commit $HEAD_RB" ] \
+  && pass "the certified head is the LAST --match-head-commit, so a passthrough cannot rebind it" \
+  || fail "a passthrough rebound the merge (last flag: '$last_mhc')"
+
+# (c) A report with NO `pending` counter is from a parser too old to answer the question.
+# Defaulting it to 0 (as this did) silently asserted "nothing is still running".
+printf 'examined=1\nextracted=1\ncompleted=1\ntested=1\n' > "$TMP/rep-nopending.txt"
+out="$(bash "$ROOT/scripts/check-lane-tested.sh" "$TMP/rep-nopending.txt" lane sha 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && pass "a report MISSING 'pending' cannot certify (exit $rc)" \
+  || fail "a missing 'pending' defaulted to 0 and certified the lane"
+case "$out" in *"no 'pending' counter"*) pass "  …and it names the missing counter" ;; *) fail "  …unexplained: $out" ;; esac
+printf 'examined=1\nextracted=1\ncompleted=1\ntested=1\npending=0\n' > "$TMP/rep-pending0.txt"
+bash "$ROOT/scripts/check-lane-tested.sh" "$TMP/rep-pending0.txt" lane sha >/dev/null 2>&1 \
+  && pass "  …while an explicit pending=0 certifies (no over-block)" \
+  || fail "an explicit pending=0 was refused"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

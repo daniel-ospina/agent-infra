@@ -120,6 +120,13 @@ counter_is_positive() {
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
   [ "$1" -gt 0 ]
 }
+# TRUE only for a counter that is a readable non-negative integer. A caller that must
+# COMPARE two counters uses this instead of a bare `-lt`, which returns 2 on garbage —
+# and under `set -uo pipefail` (no `-e`) that SKIPS the guard rather than failing it.
+counter_is_number() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
 
 resolve_head() {
   local pr="$1"; shift
@@ -336,6 +343,34 @@ main() {
   pr_completed="$(report_value "$TMP/pr-report.txt" completed)"
   pr_tested="$(report_value "$TMP/pr-report.txt" tested)"
   pr_pending="$(report_value "$TMP/pr-report.txt" pending)"
+
+  # AN UNATTRIBUTED FAILING RUN. `examined` counts the lane's failing runs; `extracted`
+  # counts those whose log yielded at least one `FAILED <nodeid>` line. When a failing
+  # run contributes NOTHING to the set, the residual is not KNOWN to be zero — while the
+  # certificate would print `PR failing: 0` for a lane that is RED. That is a false
+  # certificate, which is the one severity this rail exists to prevent (cycle-3 review:
+  # a head run failing with `ImportError: no module named y` certified as zero-residual
+  # and the rail merged it). A gate whose output authorises a bypass fails CLOSED here.
+  #
+  # Deliberately NOT applied to the MAIN side: an unattributed run there under-reports
+  # the BASELINE, which can only make the residual look larger — a false block, for which
+  # the retry path is the designed remedy. The false-certificate direction is the PR side.
+  pr_examined="$(report_value "$TMP/pr-report.txt" examined)"
+  pr_extracted="$(report_value "$TMP/pr-report.txt" extracted)"
+  if ! counter_is_number "$pr_examined" || ! counter_is_number "$pr_extracted"; then
+    say_err "⛔ admin-merge: BLOCKED — the lane run report carries unreadable"
+    say_err "   examined/extracted counters (examined='${pr_examined:-}', extracted='${pr_extracted:-}'),"
+    say_err "   so the failing set cannot be shown to be complete."
+    exit 1
+  fi
+  if [ "$pr_extracted" -lt "$pr_examined" ]; then
+    say_err "⛔ admin-merge: BLOCKED — $((pr_examined - pr_extracted)) of $pr_examined failing PR run(s)"
+    say_err "   yielded NO parseable 'FAILED <nodeid>' line, so their failures are NOT in the"
+    say_err "   set and 'unique to this PR: 0' would be a false certificate (lane: $lane)."
+    say_err "   Either the run failed outside the test step (fix it), or the log format moved"
+    say_err "   and the parser needs updating. This is a refusal, not a comparison."
+    exit 1
+  fi
   # "Not proven finished" is not "finished": `! counter_is_zero` blocks on an
   # UNREADABLE `pending` too, not only on a positive one. A bare `-gt 0` skipped
   # the body on a non-numeric value (`[ n/a: integer expression expected`, exit
@@ -575,7 +610,12 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
   info "admin-merge: ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
 
   # shellcheck disable=SC2086
-  $GH pr merge "$PR" --admin --match-head-commit "$head" ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} ${repo_args[@]+"${repo_args[@]}"}
+  # ORDER MATTERS. `--match-head-commit "$head"` is deliberately passed AFTER the caller's
+  # passthrough args (MERGE_ARGS): gh takes the LAST occurrence of a scalar flag, so with
+  # the old order a `-- --match-head-commit <other>` passthrough silently REBOUND the merge
+  # to a head other than the one just certified, defeating the binding this comment claims
+  # (cycle-3 review). Ours goes last so ours wins.
+  $GH pr merge "$PR" --admin ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} --match-head-commit "$head" ${repo_args[@]+"${repo_args[@]}"}
 }
 
 main "$@"
