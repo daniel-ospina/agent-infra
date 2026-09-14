@@ -5,7 +5,7 @@
  *
  * Review-cycle caps ARE authorised — proportionally. AGENTS.md (Hard Cap)
  * holds the fallback (10) and names the canonical proportional table in
- * `skills/proportional-gates/SKILL.md`: Low → skip, Low-Medium → 3,
+ * `skills/proportional-gates/SKILL.md`: Low → no re-review (—), Low-Medium → 3,
  * Medium-High → 5, High → 10.
  * (Pre-#723 wording here claimed "no numeric caps without explicit user
  * authorization", which stopped being true when the proportional table landed.)
@@ -84,7 +84,7 @@ export interface CycleData {
  * not a guard (#723).
  */
 export const REVIEW_CYCLE_CAPS = {
-  /** Low — 0 reviewers, review skipped. */
+  /** Low — 1 reviewer, no re-review cycles. Never 0 *reviewers*: #485 blocks every tier at 0 dispatches. */
   skip: 0,
   /** Low-Medium — 2 reviewers. */
   lowMedium: 3,
@@ -114,7 +114,7 @@ export const STALL_THRESHOLD = 0.8;
 /**
  * Proportional-gates tier mapping → loop V-levels, reviewer count and cap.
  *
- * The risk row is selected by `reviewers` (Low 0 / Low-Medium 2 /
+ * The risk row is selected by `reviewers` (Low 1 / Low-Medium 2 /
  * Medium-High 3 / High 4) and `maxCycles` MUST equal that row's Max Cycles.
  * The complexity tiers map onto rows 1, 2 and 4: `standard` declares 2
  * reviewers (Low-Medium, 3 cycles) and `complex` declares 4 (High, 10).
@@ -131,7 +131,7 @@ export const STALL_THRESHOLD = 0.8;
  * drive `tier` needs the V3/V4 case resolved first.
  */
 export const TIER_CONFIG = {
-  micro: { vLevel: null, maxCycles: REVIEW_CYCLE_CAPS.skip, reviewers: 0 },
+  micro: { vLevel: null, maxCycles: REVIEW_CYCLE_CAPS.skip, reviewers: 1 },
   standard: { vLevel: "V1", maxCycles: REVIEW_CYCLE_CAPS.lowMedium, reviewers: 2 },
   complex: { vLevel: "V2", maxCycles: REVIEW_CYCLE_CAPS.high, reviewers: 4 },
 } as const;

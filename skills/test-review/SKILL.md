@@ -453,8 +453,6 @@ Journey map coverage: ✓ | skipped (no journey map)
 7-point quality checklist: ✓
 ```
 
-**Hash output (test-writing caller only):** If invoked with `--caller test-writing` context, write per-file hash to `~/.pi/agent/test-review/<sha256-of-absolute-test-file-path>.json`. Schema defined in test-writing/SKILL.md Step 7. Include `PASS` on its own line in console output for VGATE compatibility. If invoked standalone or from code-review: skip hash write.
-
 ## Integration
 
 **Invoked by:**

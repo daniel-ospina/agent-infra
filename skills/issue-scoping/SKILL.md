@@ -56,9 +56,9 @@ The Double Diamond generates multiple alternatives — but the converge step can
 When problem-diverge discovers that the issue describes a symptom rather than the root cause, scoping MUST target the root cause — not the symptom the issue author happened to notice.
 
 **Examples:**
-- Issue: "Add retry button to failed uploads" → Root cause: uploads fail silently with no error surfaced → Scope: surface errors + add retry
-- Issue: "Increase timeout on X endpoint" → Root cause: N+1 query under load → Scope: fix the query + keep timeout as safety net
-- Issue: "Add validation to form Y" → Root cause: API accepts invalid data without rejecting → Scope: add API validation + add client validation
+- Issue: "Add retry button to failed uploads" → Root cause: uploads fail silently with no error surfaced → Scope: surface errors + add retry + confirm UX copy with human + analyse root causes of errors
+- Issue: "Increase timeout on X endpoint" → Root cause: N+1 query under load → Scope: fix the query + keep timeout as safety net + analyse system design
+- Issue: "Add validation to form Y" → Root cause: API accepts invalid data without rejecting → Scope: add API validation + add client validation + analyse UX  and ifnromation architecture and get approval by human if changes are needed
 
 **Gate:** When problem-converge picks a confirmed problem definition, compare it to the original issue. If the original described a symptom and scoping settled on a fix for that symptom without addressing the root cause, the scoping is incomplete. The verification gates (2.5) check for this.
 
@@ -76,7 +76,7 @@ An issue body may assert a solution direction — "the fix is X", "implement exe
 
 ## Design Principle: File Extra Issues, Don't Silently Absorb
 
-Scoping often discovers things that are genuinely separate from the issue at hand — adjacent bugs, unrelated improvements, documentation gaps, tech debt. These are NOT hard dependencies and should NOT be silently absorbed into the scope. They should be filed as separate GitHub issues so they're tracked, prioritized, and owned independently.
+Scoping often discovers things that are genuinely separate from the issue at hand — adjacent bugs, unrelated improvements, documentation gaps, tech debt. These are NOT hard dependencies and should NOT be silently absorbed into the scope. They should be filed as separate GitHub issues (unless an issue already covers them in which case add evidence as comment) so they're tracked, prioritized, and owned independently.
 
 **What to file vs what to absorb:**
 
@@ -85,7 +85,7 @@ Scoping often discovers things that are genuinely separate from the issue at han
 | Hard dependency (can't ship without it) | Absorb into scope |
 | Soft dependency (should ship together, could ship separately) | File issue, link as related, flag in plan |
 | Adjacent bug discovered during scouting | File issue, notify user, do NOT absorb |
-| Tech debt in touched area (not caused by this issue) | File issue, note in plan, do NOT absorb |
+| Tech debt in touched area (not caused by this issue) | Consider if connected problem and system design can solve both, if not then File issue, note in plan, do NOT absorb |
 | Documentation gap discovered | File issue, do NOT absorb |
 | UX inconsistency noticed in adjacent component | File issue, do NOT absorb |
 
@@ -148,13 +148,13 @@ Phase 8: Finalize + post plan
 
 | Phase | Micro | Standard | Complex |
 |-------|-------|----------|---------|
-| problem-diverge sub-agents | 1 | 2 | 2 |
-| problem-converge sub-agents | 1 | 2 | 2 |
-| **problem-verify** | Skip | ✅ (2 verifiers) | ✅ (2 verifiers) |
+| problem-diverge sub-agents | 1 | 1 | 2 |
+| problem-converge sub-agents | 1 | 1 | 2 |
+| **problem-verify** | Skip | ✅ (1 verifiers) | ✅ (2 verifiers) |
 | solution-diverge sub-agents | 1 | 1 | 2 |
 | solution-converge sub-agents | 1 | 1 | 2 |
 | **Phase 1.5 External Research** | Skip (proportional: codebase-first + fire only on demonstrated gap) | ✅ (axis matrix, 8-cap) | ✅ (axis matrix, 14-cap) |
-| **solution-verify** / **full-diamond-verify** | ✅ (1 verifier, all phases) | ✅ (2 verifiers) | ✅ (2 verifiers) |
+| **solution-verify** / **full-diamond-verify** | ✅ (1 verifier, all phases) | ✅ (1 verifiers) | ✅ (2 verifiers) |
 | Codebase Explorer | Skip | ✅ | ✅ |
 | UX Prototype Gate | Skip | If UX_RATING ≥ medium | If UX_RATING ≥ medium |
 | Wiring Check | ✅ | ✅ | ✅ |
@@ -172,7 +172,7 @@ Phase 8: Finalize + post plan
 
 ### Gate Mechanics
 
-1. **Dispatch 2 parallel verifier sub-agents** via `task` — both receive the same inputs, reach independent conclusions
+1. **Dispatch parallel verifier sub-agents** via `task` — both receive the same inputs, reach independent conclusions
 2. **Controller (main agent) acts as tiebreaker** — not a script, not mechanical voting
 3. **Re-dispatch rule:** If either verifier finds P0 or P1 → controller decides fix-or-ignore → re-dispatch both → repeat
 4. **Pass-through rule:** If verifiers find only P2/P3/P4 → controller incorporates them → gate passes. No re-launch needed.
@@ -191,18 +191,21 @@ ORIGINAL ISSUE BODY: <full issue text>
 CHECK FOUR DIMENSIONS + DIMENSION 5:
 
 1. DIVERGE THOROUGHNESS: Did problem-diverge genuinely explore alternatives?
+   - Was research done (inetrnal and external) to understand the problem?
    - Are there alternative problem framings that differ meaningfully from the original?
    - Were adversarial queries run seeking DISCONFIRMATION (not just confirmation)?
    - Were assumptions mapped and tagged [validated]/[unverified]?
    - Were hidden dependencies and affected-but-unmentioned stakeholders identified?
-   - WERE THERE NO ALTERNATIVES, or were they cosmetic variations? Flag as P1.
+   - Was redudndancy/overlap with other systems researched and overall good system design considered? 
 
 2. CONVERGE RIGOR: Was convergence on the problem evidence-based?
+ - Was research done (inetrnal and external) considered?
    - Is the chosen definition backed by evidence (citations, data, patterns)?
    - Were rejected alternatives documented with rationale?
    - Is there a falsification check? Confidence score?
    - DID CONVERGENCE PICK THE ORIGINAL ISSUE'S FRAMING WITHOUT CHALLENGING IT? Flag as P1.
    - WAS A SOLUTION THE ISSUE BODY PRESCRIBES ("the fix is X") ADOPTED AS SETTLED WITHOUT RE-DERIVATION IN THE DOUBLE DIAMOND? Flag as P1.
+   - Was redudndancy/overlap with other systems considered and overall good system design part of the decision?
 
 3. QUALITY OVER CONVENIENCE: Did convergence prioritize correctness over ease?
    - Was a framing rejected because it required more research?
@@ -215,7 +218,7 @@ CHECK FOUR DIMENSIONS + DIMENSION 5:
    - Dependencies assumed but not verified?
    - **Deferred/gated scope:** if the scope defers any work pending data, prove-out, approval, or a future event, a REAL re-check mechanism must exist — a scheduled job, a dated gate, an automated trip, or a named owner + concrete trigger. "Defer until X" with no mechanism = silent rot; flag as P1.
 
-5. RESEARCH ARTIFACT (Phase 1.5 — external best-practice research):
+5. RESEARCH ARTIFACT (Phase 1.5 — external best-practice and system design research):
    - Is the `### Axis Research` block present in the scoping output, OR a justified-skip trigger assessment (axes all low + no deps + no novel pattern)?
    - Presence of a populated block with bare section titles but no findings = P2 (ritualization check: findings must be content, not section headers).
    - Do findings carry per-framing provenance (canonical / competitor-precedent / pitfalls + source name or URL)?
@@ -299,25 +302,22 @@ CODEBASE EXPLORER: <from Phase 3, if available>
 CHECK FIVE DIMENSIONS:
 
 1. DIVERGE GENUINENESS: Are the approaches truly distinct?
+    - Was research done (inetrnal and external) to understand the problem (if not, do it)?
    - Do they differ in architecture or technique (not just file names or variable names)?
    - Does each have named tradeoffs, risks, and "best fit if" conditions?
    - Are there 2+ approaches? If only 1: is it because genuinely no alternatives exist, or because diverge was shallow?
-   - ARE THEY COSMETIC VARIATIONS OF THE SAME IDEA? Flag as P1.
-
+   
 2. CONVERGE QUALITY OVER CONVENIENCE: Was the best approach chosen?
-   - Does the rationale evaluate outcome quality, edge case handling, failure mode coverage?
+   - Does the rationale evaluate outcome quality, edge case handling, failure mode coverage, and overall system design?
    - Or does it evaluate diff size, number of files, implementation speed?
-   - Were rejected alternatives documented with "when this WOULD have been better"?
    - DID CONVERGENCE PICK THE APPROACH WITH FEWER FILES TO TOUCH? Flag as P1.
    - IS THERE A BETTER APPROACH THAT WAS REJECTED FOR CONVENIENCE? Flag as P0.
    - WAS THE ISSUE BODY'S PRESCRIBED SOLUTION TREATED AS THE PLAN (ADOPTED UNCHANGED) RATHER THAN RE-DERIVED AND VERIFIED AGAINST ALTERNATIVES? Flag as P1.
 
-3. PLAN COMPLETENESS: Does the plan surface everything?
-   - All states: loading, empty, error, edge cases?
-   - For UI: mobile considered?
-   - Error handling and failure modes addressed?
-   - Runtime prerequisites documented?
-   - Concrete, verifiable Acceptance Criteria?
+3. SCOPE COMPLETENESS: Is the scope thorough?
+   - UX: mobile considered? UX and information architecture are needed?
+   - Good overall system design included?
+   - Does the scope include all the needed info to be a good scope?
 
 4. WIRING PRE-CHECK: Are integration surfaces accounted for?
    - DB, API, auth, external services, UI components, cross-cutting concerns?
