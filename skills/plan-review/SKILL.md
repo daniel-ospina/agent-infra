@@ -63,11 +63,11 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 | Risk | Reviewers | Max Cycles |
 |------|-----------|------------|
 | **Micro** | 0 (skip review) | — |
-| **Low-Medium** (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |
-| **Medium-High** (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
-| **High** (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 10 |
+| **Low-Medium** (small plan, existing patterns) | 1 reviewers (Structural + Integration) | 5 |
+| **Medium-High** (large plan, some novelty) | 2 reviewers (+ Efficiency) | 5 |
+| **High** (novel architecture, first-of-kind) | 2 reviewers (all parallel) | 10 |
 
-**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
+**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
 
 **Adversarial domain — declared threat surface (bound: 2 cycles, orthogonal to the rows above).** When the scoping comment carries an `### Adversarial Threat Surface` declaration (gate/enforcement code whose correctness is "an attacker cannot make it fail open"), the plan review is bounded by that surface, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) is a **clean exit** for this domain — a literal `NO ISSUES FOUND` is not required, and when the merge rests on threat-list coverage the PR body must disclose it (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
 
@@ -107,9 +107,9 @@ When review finds issues, the agent attempts to resolve them autonomously before
 |---------------|--------|
 | **P2** (improvement) | Fix inline immediately. Note in changelog. Re-review. Do NOT pause. |
 | **P1** (important gap) | Research + fix inline. Note in changelog. Re-review. Do NOT pause. |
-| **P0** (structural flaw), fixable in < 5 lines | Fix inline. Note in changelog. Re-review. Do NOT pause. |
-| **P0**, needs substantial work | File a GitHub issue via issue-creation, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
-| **P0**, requires human input (data loss, security, ontology choice, cost >$10/mo, legal/compliance) | Pause with structured question + research findings. |
+| **P0** (structural flaw), fixable in < 5 lines | Research and Fix inline. Note in changelog. Re-review. Do NOT pause. |
+| **P0**, needs substantial work | Research and File a GitHub issue via issue-creation, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
+| **P0**, requires human input (data loss, security, ontology choice, cost >$10/mo, legal/compliance) | Pause with structured question + research findings (research and present to user with context, options, analysis, and recommendation. No jargon). |
 
 **Stall detection:** A fingerprint persisting across 2+ cycles is precisely what the `fingerprint-stall` detector measures — do not hand-diagnose it here. Follow the 3-layer stuckness algorithm in Phase 5: recurrence ≥ `stall_threshold` (default `0.8`) → escalate to a human. Filing a GitHub issue is a **remedy** for a stalled issue, never an alternative to the detector — filing it and continuing is how a stalled loop silently runs to its cycle cap.
 
@@ -159,11 +159,13 @@ CHECK THESE DIMENSIONS:
    - DRY: does the plan duplicate logic across tasks?
    - Are there redundant verification steps?
    - Is complexity proportional to the tier?
+   - Was research used to inform the plan?
 
 6. GOOD > EASY (design quality — always checked):
    - Does any design decision choose the EASY path over the GOOD one? Easy paths accumulate into brittle systems; good paths cost more upfront but pay back in reliability, extensibility, and user satisfaction.
    - Flag decisions that optimize for implementation convenience over outcome quality: shortcuts on error handling, schema changes that skip migrations, duplicated logic instead of a shared abstraction, hardcoded config instead of proper configuration, quick hacks over maintainable patterns.
    - Each GOOD > EASY flag MUST name the Good alternative AND its cost (effort, time, risk). If you cannot name the Good alternative, it is a preference — omit it.
+   - Overall good system design (no unnecessary duplication, scalability, variety handling, neat ontology, good architecture, etc.) needs to be accounted for.
 
 For each issue, return EXACTLY:
 ISSUE:
@@ -262,6 +264,12 @@ CHECK THESE DIMENSIONS:
    - Does the plan make unvalidated assumptions about user behavior?
    - Are UX decisions described without rationale?
    - Are accessibility considerations mentioned where relevant?
+
+5. INFORMATION ARCHITECTURE:
+   - Is information architecture considered across the user journey?
+   - Is each line of the copy useful (is it focused on the important messages, informing the user of what's needed without loading them with unnecessary information)?
+   - Is the copy concise?
+   - Does the copy read like high-quality copy and avoid obvious AI-copy patterns?
 
 For each issue, return EXACTLY:
 ISSUE:

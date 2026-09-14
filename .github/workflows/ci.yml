@@ -108,6 +108,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Safe admin-merge rail suite (parser, #3469 trap, flake, parity)
         run: bash tests/admin-merge/run.sh
+      - name: Argv-level admin-merge guard suite (#984)
+        # The layer that makes obfuscation irrelevant: the shim inspects its OWN argv,
+        # where bash has already resolved `-${V:--}admin=true` into `--admin`. The
+        # suite drives the real shim through a real shell with the splices that
+        # defeated the string scanner, and asserts refusal.
+        run: bash tests/gh-shim/run.sh
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):

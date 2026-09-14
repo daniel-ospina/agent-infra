@@ -329,6 +329,88 @@ parse_issue_ref() {
 # for a docs-only PR — see resolve_issue_ref.
 parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 
+# has_scoping_marker <scoping-comment-text> — true when the text carries the
+# `<!-- issue-scoping:` marker as a REAL scoping artifact rather than as a
+# substring of prose.
+#
+# WHY THIS IS NOT A BARE SUBSTRING MATCH (#991). Check (b) is the ONLY
+# enforcement that the scoping artifact exists for a non-micro issue, and the
+# old form — `grep -qF '<!-- issue-scoping:'` — was satisfied by any comment
+# that merely MENTIONED the marker, including one written to assert that no
+# scoping comment exists. That is not an adversarial edge case: it happened by
+# accident on #786, in a bug report explaining that a DIFFERENT issue lacked
+# the artifact. Check (c) received exactly this precision fix under #513
+# ("never bare prose mentioning the marker text"); (b) did not, so the two
+# siblings drifted — the class tracked by the duplication audit on #917.
+#
+# EACH COMMENT IS EXAMINED SEPARATELY. The caller's jq appends a record
+# separator (0x1e) per comment, so this scans EVERY comment and requires the
+# marker to be the first line of ONE of them — which is what the check's own
+# message has always claimed ("one of its comments"). (The message used to say
+# "must START with the marker"; that phrasing predates the footer tolerance and
+# is no longer accurate, so the code and the message now read the same way:
+# first content line, or last one set off by a blank line.)
+# Testing only the concatenation's first line silently checked the THREAD's
+# oldest comment instead, and that was a regression: issue #883's genuine
+# artifact is comment 3, posted after two discussion comments, so it failed
+# under this revision where all five previous generations had passed it. The
+# retrospective case — artifact posted after discussion — is exactly when that
+# happens, so it had to be fixed here rather than filed.
+#
+# The marker must be at COLUMN 0 of that comment's first CONTENT line — where
+# "content" means the first line that is neither blank nor an ATX heading. Two
+# reasons, both measured rather than assumed:
+#
+#   * Leading whitespace is NOT stripped. GFM renders a first line indented >= 4
+#     columns (4 spaces, or a tab) as an INDENTED CODE BLOCK, which DISPLAYS the
+#     marker text — a mention, not a hidden artifact. An earlier revision of this
+#     comment stripped it, re-admitting exactly the false-pass class this check
+#     exists to remove (all four parser generations had rejected it).
+#   * Leading ATX HEADINGS are skipped, because the producer emits BOTH shapes:
+#     `<!-- issue-scoping: … -->` on line 1 (#949, #991, #883's comment 3), and
+#     `## Scope — …` / `## Scoping — …` on line 1 with the marker on line 3
+#     (#729, #843, #857, #858 — all genuine, all rejected by a strict first-line
+#     rule). A prose PREFACE is still rejected: prose is neither blank nor a
+#     heading, so it must itself be the marker, and it is not. This keeps the
+#     false-pass class closed — a fenced or blockquoted example opens with ```
+#     or `>`, neither of which is a heading — while accepting both documented
+#     artifact shapes.
+#
+# Cost, stated plainly: a marker indented on its first line still FAILS, and a
+# prose preface still FAILS. Both are deliberate and loud — the failure message
+# names the required position.
+has_scoping_marker() {
+  # RS = 0x1e, injected by the caller's jq. See the sanitization note at each
+  # fetch site: the separator is in-band, so the data is stripped of it first.
+  #
+  # POSITION IS THE CONTRACT. An artifact carries the marker either as the
+  # comment's FIRST line with content, or as its LAST one when set off by a
+  # blank line. Both branches ask WHERE the marker sits — never what Markdown
+  # makes of it — so there is no fence, indentation or container grammar left to
+  # get wrong. Measured over this repo's 235 marker-bearing comments: 223 first,
+  # 2 last (the two #783 artifacts), 10 neither — and all 10 are prose, tables
+  # or fenced examples, i.e. mentions.
+  awk -v RS='\036' '
+    {
+      n = split($0, lines, "\n")
+      # Branch 1 — the first line with content, skipping blanks and any leading
+      # ATX headings (the producer emits both a bare-marker and a heading-first
+      # shape: four real artifacts open with an ATX heading — #729 uses
+      # "## Scoping — #729", the other three "## Scope —").
+      j = 0
+      while (j < n && (lines[j+1] ~ /^[[:space:]]*$/ || lines[j+1] ~ /^#{1,6}[[:space:]]/)) j++
+      if (j < n && lines[j+1] ~ /^<!-- issue-scoping:/) found = 1
+      # Branch 2 — the last line with content, and only when a blank line sets
+      # it off as a footer block. Drop the blank-line condition and a crowded
+      # "preamble\n<marker>" passes, which is the mention shape.
+      k = n
+      while (k >= 1 && lines[k] ~ /^[[:space:]]*$/) k--
+      if (k >= 2 && lines[k] ~ /^<!-- issue-scoping:/ && lines[k-1] ~ /^[[:space:]]*$/) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' <<<"$1"
+}
+
 # files_rows <files> — validate the UNTRUSTED diff list from pulls/files and
 # print its well-formed rows. Returns 1 without output if ANY row is
 # malformed, because a single bad row makes the whole list untrustworthy.
@@ -558,13 +640,13 @@ run_checks() {
     echo "ℹ️  [b–e] Skipped: issue $issue_display is complexity:micro (micro-tier exemption)."
     echo ""
   else
-    if grep -qF '<!-- issue-scoping:' <<<"$SCOPING_COMMENT"; then
+    if has_scoping_marker "$SCOPING_COMMENT"; then
       pass b "scoping comment present on issue $issue_display (<!-- issue-scoping: marker)"
       B_CHECKED="yes"
     else
-      fail b "no scoping comment on issue $issue_display — a comment with the marker \"<!-- issue-scoping:\" is required."
+      fail b "no scoping comment on issue $issue_display — one of its comments must carry the marker \"<!-- issue-scoping:\" as its FIRST line with content, or as its LAST one set off by a blank line (it is not enough to mention it, or to show it in a quoted example, a table or a code fence — move the marker to the top of the comment or onto its own blank-line-separated footer)."
       echo "      Missing: scoping comment on the linked issue."
-      echo "      Invoke:  issue-scoping — it posts the scoping comment to the issue."
+      echo "      Invoke:  issue-scoping — it posts the scoping comment, whose first line carries the marker."
     fi
 
     # c. CODE-REVIEW EVIDENCE — PR body or any PR commit message.
@@ -713,7 +795,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
     echo "Issue: $ISSUE_TARGET"
     echo ""
     echo "Would check, in order (issue-side only — no PR exists at preflight):"
-    echo "  b. SCOPING COMMENT  gh api repos/<repo>/issues/<n>/comments → search for '<!-- issue-scoping:' marker"
+    echo "  b. SCOPING COMMENT  gh api repos/<repo>/issues/<n>/comments → one comment must carry the '<!-- issue-scoping:' marker as its first content line, or as its last one set off by a blank line (a mention anywhere else does not count)"
     echo "  d. WIRING           the scoping comment's 'Wiring' section, for complexity:standard/complex only (the docs/plans/*.md branch needs the PR diff and is checked at merge time)"
     echo ""
     echo "Skipped as PR-dependent: a (PR body), c (PR body/commits), e (PR diff + body) — all enforced at the required status check."
@@ -727,7 +809,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "Would check, in order:"
   echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL); a PR whose diff is ENTIRELY under docs/ may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
-  echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → search for '<!-- issue-scoping:' marker"
+  echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
   echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
   echo "  d. PLAN DOC          gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → docs/plans/*.md change, or 'Wiring' in scoping comment (complexity:standard/complex only)"
   echo "  e. TEST-COVERAGE EVID gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → runtime code changes (extensions/**/*.ts excl. *.test.ts, extensions/**/*.js, bin/*.js) need test files in the diff or test-run markers in PR body/commits"
@@ -1019,6 +1101,236 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # The TRACE pattern IS anchored, so these must not resolve.
   expect_trace 'prefs #42' ''
   expect_trace 'preferences #42' ''
+
+  # ── #991: the scoping marker must be an ARTIFACT, not a mention ──────────
+  # Check (b) is the only enforcement that issue-scoping ran for a non-micro
+  # issue, and it used to be `grep -qF '<!-- issue-scoping:'` — satisfied by any
+  # comment that merely MENTIONED the marker. The `prose` vectors below are the
+  # point of this block: without them the fix pins nothing, and they are the
+  # live defect, not a hypothetical. The first one is the literal sentence from
+  # #786 that falsely satisfied (b) on #786 itself while stating that a
+  # DIFFERENT issue had no scoping comment.
+  expect_scoping() {
+    local desc="$1" text="$2" want="$3" got
+    if has_scoping_marker "$text"; then got=true; else got=false; fi
+    if [[ "$got" == "$want" ]]; then
+      printf '✅ has_scoping_marker(%s) → %s\n' "$desc" "$got"
+    else
+      printf '❌ has_scoping_marker(%s) → %s (expected %s)\n' "$desc" "$got" "$want" >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+  # Real artifact: the marker is at column 0 of the comment's first line (this
+  # is the head of the #949 scoping comment, quoted verbatim).
+  expect_scoping 'genuine artifact (marker on line 1)' \
+    '<!-- issue-scoping: 2026-09-13 · #949 · consolidated duplication remediation -->
+
+# Scoping — #949' true
+  # POSITION IS THE CONTRACT, so a marker that is neither the comment's first
+  # line with content nor a blank-line-separated footer is NOT an artifact —
+  # however well-formed it looks. This read `true` under the fence parser, which
+  # only asked whether the marker began a line; under a positional rule it is
+  # false because the preamble crowds it. Measured, not assumed: across the
+  # repo's 235 marker-bearing comments the marker is first in 223 and a
+  # blank-line-separated last line in 2 (both #783); the other 10 are prose,
+  # tables or fenced examples.
+  expect_scoping 'marker after a crowded prose preamble (not the first line)' \
+    'Some preamble about the issue.
+<!-- issue-scoping: 2026-09-14 · #991 · x -->' false
+  # The FOOTER shape is real work, not a hypothetical: #783's two artifacts
+  # ("Scope confirmed" and "Plan complete") carry the marker on their last line,
+  # set off by a blank line, and #783 carries two of them. #783's PR (#873)
+  # merged 2026-09-13, before this fix, so no live PR was at stake — but a
+  # first-line-only rule silently invalidates real artifacts, and would fail
+  # closed on any future PR whose issue carries one. The blank line above the
+  # marker is what keeps this from also accepting the crowded mention shapes.
+  expect_scoping 'genuine artifact (marker as the LAST line, after a blank line) — the #783 shape' \
+    '*Artifact:* docs/scoping/2026-09-12-issue-783-census/SCOPE-ARTIFACT.md
+
+<!-- issue-scoping: v5.1 double diamond + verify -->' true
+  # ...but the blank line is load-bearing. Crowded against the line above, the
+  # same text is indistinguishable from a mention and must stay false.
+  expect_scoping 'marker as the last line, crowded (no blank line above)' \
+    'See the census artifact for the full picture.
+<!-- issue-scoping: v5.1 double diamond + verify -->' false
+  # Leading BLANK lines are tolerated: the rule is the first line WITH CONTENT,
+  # so a comment that opens with a newline still carries the artifact.
+  expect_scoping 'genuine artifact (marker after leading blank lines)' \
+    '
+
+<!-- issue-scoping: 2026-09-14 · #991 · x -->
+## Confirmed Problem' true
+  # LEADING ATX HEADINGS are tolerated, because the producer emits BOTH shapes.
+  # A STRICT first-line rule rejected the second shape outright and FOUR genuine
+  # artifacts already in this repo have it (#729, #843, #857, #858) — the check
+  # would have invalidated real work while claiming to sharpen a rule. Verified
+  # against the live comments, not constructed.
+  expect_scoping 'genuine artifact (heading, then the marker) — the #843 shape' \
+    '## Scope — resolve the merge result from the REST API
+
+<!-- issue-scoping: 2026-09-14 (standard) -->
+
+**Tier:** complexity:standard
+
+### Problem (confirmed, re-derived)' true
+  # A heading followed by PROSE is a discussion comment, not an artifact — the
+  # heading is skipped, and the first real content line is prose, so it must be
+  # the marker and is not. This is the #674/#680/#793 shape.
+  # The REAL #674 shape, reduced: an artifact-status comment that OPENS with a
+  # heading and then MENTIONS the marker inside a sentence. It contains the
+  # marker, so the pre-fix substring matcher accepted it — this vector is
+  # therefore non-vacuous in the direction that matters. (An earlier version of
+  # this vector omitted the marker entirely, which made it indistinguishable
+  # from the `no marker at all` guard and pinned nothing — caught in review.)
+  expect_scoping 'heading, then prose CALLING the marker (not an artifact) — the #674 shape' \
+    $'## ⛔ Premise verification: PARTLY TRUE — the artifact enforces nothing\n\nThe defect is that the PR does not disclose it: | b. SCOPING COMMENT (`<!-- issue-scoping:` marker) | — |' false
+  # A FENCED example that opens with a heading: line 1 is ```markdown, which is
+  # neither blank nor a heading, so it must itself be the marker. Closing the
+  # heading allowance one level down.
+  expect_scoping 'fenced example opening with a heading' \
+    '```markdown
+## Scope
+<!-- issue-scoping: 2026-01-01 · #1 · x -->
+```' false
+  # ❌ THE LIVE REPRODUCTION — the opening of #786's first comment, which is
+  # what actually satisfied check (b) on #786. Quoted from the sentence as far
+  # as "have one"; the comment continues ", an epic-recorded deviation". The
+  # vector is truncated for readability, not altered — the live comment was
+  # re-checked and behaves identically (pre-fix true, post-fix false).
+  expect_scoping 'prose mentioning the marker (#786, the live defect)' \
+    "Once (a) is satisfiable, this PR also trips (b) (no \`<!-- issue-scoping:\` comment on #922 — 0 comments; 0/7 open #917 children have one)." false
+  # Prose that asserts the artifact is MISSING must never satisfy the check.
+  expect_scoping 'prose asserting absence' \
+    'There is no <!-- issue-scoping: marker on this issue.' false
+  expect_scoping 'prose quoting the marker inline' \
+    'The gate greps for <!-- issue-scoping: and nothing else.' false
+  # A fenced code block that quotes the marker mid-line is still a mention.
+  expect_scoping 'marker quoted inside code span' \
+    'Run: grep -qF "<!-- issue-scoping:" <<<"$SCOPING_COMMENT"' false
+  # Blockquote: the line starts with `>`, not with the marker.
+  expect_scoping 'marker inside a blockquote' \
+    '> <!-- issue-scoping: quoted, not posted -->' false
+  # INDENTED ON THE FIRST LINE: must FAIL. An earlier revision tolerated this,
+  # on the reasoning that nothing precedes the first line so indentation cannot
+  # mean "inside a code block". That was WRONG: GFM renders a first line
+  # indented >=4 columns as an INDENTED CODE BLOCK, which displays the marker
+  # text — a mention, not a hidden artifact. The 2-space form below is harmless
+  # in rendering terms but is not the producer's form either, and every real
+  # artifact in this repo is at column 0, so the rule is column 0 for all of
+  # them. All four parser generations rejected the >=4 forms; the deletion had
+  # re-admitted them.
+  expect_scoping 'marker indented 2 spaces on the first line' \
+    '  <!-- issue-scoping: indented -->' false
+  expect_scoping 'marker indented 4 spaces on the first line (indented code block)' \
+    '    <!-- issue-scoping: 2026-01-01 · #1 · x -->' false
+  expect_scoping 'marker tab-indented on the first line (indented code block)' \
+    '	<!-- issue-scoping: 2026-01-01 · #1 · x -->' false
+  # A marker at column 0 INSIDE a fence is still a mention — and this is the
+  # realistic one: issue-scoping/SKILL.md documents the posting form as a
+  # ```bash fence with the marker at column 0, so quoting the skill's own
+  # instructions false-passed under the anchored-only version.
+  expect_scoping 'marker at column 0 inside a fence' \
+    'Comment explaining the gate:
+
+```bash
+<!-- issue-scoping: 2026-01-01 · #1 · example -->
+```' false
+  expect_scoping 'marker inside a tilde fence' \
+    '~~~
+<!-- issue-scoping: 2026-01-01 · #1 · x -->
+~~~' false
+  # NESTED / MIXED fences — a boolean toggle false-passed all three of these.
+  # The first is the canonical way to quote a fenced block inside a fenced
+  # block, so it is a realistic quoting form, not a contrived one.
+  expect_scoping '4-backtick outer, 3-backtick inner (nested)' \
+    '````markdown
+```bash
+<!-- issue-scoping: 2026-01-01 · #1 · x -->
+```
+````' false
+  expect_scoping 'tilde outer, backtick inner' \
+    '~~~
+```
+<!-- issue-scoping: 2026-01-01 · #1 · x -->
+```
+~~~' false
+  expect_scoping 'backtick outer, tilde inner' \
+    '```
+~~~
+<!-- issue-scoping: 2026-01-01 · #1 · x -->
+~~~
+```' false
+  # A closer may be followed only by whitespace; this one does not close, so
+  # the marker stays inside the fence.
+  expect_scoping 'invalid closer (trailing text)' \
+    '```
+<!-- issue-scoping: 2026-01-01 · #1 · x -->
+``` closing' false
+  # INDENTATION. CommonMark allows a fence at most 3 columns of indentation
+  # (tab = next multiple of 4). The character/length rule alone false-PASSED
+  # the first vector below — a fail-OPEN — because the 4-space-indented ``` was
+  # read as a closer, exposing a marker GitHub renders inside <pre>.
+  expect_scoping '4-space-indented closer inside a fence (fail-open guard)' \
+    '```markdown
+Example:
+    ```bash
+    echo hi
+    ```
+<!-- issue-scoping: 2026-01-01 · #1 · x -->' false
+  expect_scoping 'tab-indented closer inside a fence (fail-open guard)' \
+    '```
+<!-- issue-scoping: 2026-01-01 · #1 · x -->
+	```
+<!-- issue-scoping: 2026-01-01 · #1 · still in fence -->' false
+  # An over-indented opener is paragraph text, not a fence — but that no longer
+  # matters: the marker below it is not the comment's FIRST line, so it is not
+  # an artifact either way. The parser needed a rule for this case; the
+  # positional check does not, which is the point of the revision.
+  expect_scoping 'over-indented opener, marker below it (not first line)' \
+    'Preamble:
+    ```
+<!-- issue-scoping: 2026-01-01 · #1 · x -->' false
+  expect_scoping 'tab-indented opener, marker below it (not first line)' \
+    'Preamble:
+	```
+<!-- issue-scoping: 2026-01-01 · #1 · x -->' false
+  # Boundary: 3 columns is still a fence; 4 is not.
+  expect_scoping 'fence indented 3 spaces containing the marker' \
+    '   ```
+<!-- issue-scoping: 2026-01-01 · #1 · x -->' false
+  expect_scoping 'over-indented fence, marker below it (not first line)' \
+    '    ```
+<!-- issue-scoping: 2026-01-01 · #1 · x -->' false
+  # ...but a genuine artifact FOLLOWED by a fence must still PASS. The producer
+  # posts the marker first, so fence state can never hide a real one — this is
+  # the no-regression guard for the fence rule.
+  expect_scoping 'genuine marker, fence later in the comment' \
+    '<!-- issue-scoping: 2026-09-14 · #991 · x -->
+
+```bash
+echo hi
+```' true
+  expect_scoping 'empty comment text' '' false
+  expect_scoping 'no marker at all' 'Just a normal comment.' false
+  # The real #991 scoping comment head (posted) must PASS.
+  expect_scoping 'real #991 scoping comment' \
+    '<!-- issue-scoping: 2026-09-14 · #991 · check (b) is a bare-substring fail-open -->
+
+# Scoping — #991' true
+  # MULTI-COMMENT: each comment is its own record (0x1e), and the marker must be
+  # the first line of ONE of them — not of the thread. Testing only the
+  # concatenation's first line was a regression: #883's genuine artifact is
+  # comment 3, after two discussion comments, and it failed. The retrospective
+  # path is exactly when an artifact lands late, so this is the load-bearing
+  # case rather than an edge.
+  expect_scoping 'genuine artifact in the SECOND comment' \
+    $'first comment: no artifact, just discussion.\n\x1e<!-- issue-scoping: 2026-09-14 · #991 · x -->\n\n## Plan' true
+  expect_scoping 'real #883 shape — artifact is comment 3 of 3' \
+    $'This is fixed by #973, filed independently.\n\x1eanother discussion comment.\n\x1e<!-- issue-scoping: 2026-09-14 (standard, retrospective) -->\n\n## Plan' true
+  expect_scoping 'marker crowded in the SECOND comment (not its first line)' \
+    $'plain first comment.\n\x1eSome preface.\n<!-- issue-scoping: 2026-09-14 · #991 · x -->' false
+  expect_scoping 'mention in a later comment, artifact in none' \
+    $'first comment discussing the `<!-- issue-scoping:` marker form.\n\x1esee above for the marker `<!-- issue-scoping:` — no artifact here.' false
 
   # ── #836: broken-pipe regression (checks c/e must not false-negate) ───────
   # See the `has_review_evidence` rationale block above. The bug was a RACE, so
@@ -1389,7 +1701,13 @@ if [[ "$ISSUE_ONLY" == "1" ]]; then
   IO_REPO="${IO_REPO:-$GH_REPO}"
   echo "Resolving linked issue $ISSUE_REF (labels/comments from repos/$IO_REPO/issues/$IO_ISSUE)..." >&2
   LABELS="$(fetch_json "issues/$IO_ISSUE/labels" '.[].name' 1 "$IO_REPO")"
-  SCOPING_COMMENT="$(fetch_json "issues/$IO_ISSUE/comments" '.[].body' 1 "$IO_REPO")"
+  # The 0x1e record separator is what lets has_scoping_marker examine EACH
+  # comment instead of only the thread's first line. See its rationale block.
+  # The separator is IN-BAND, so the body is stripped of any 0x1e first —
+  # otherwise a comment containing that byte could fabricate a record boundary
+  # and make its own later mention look like an artifact. No comment in this
+  # repo contains one, but the delimiter must not be forgeable from the data.
+  SCOPING_COMMENT="$(fetch_json "issues/$IO_ISSUE/comments" '.[].body | gsub("\u001e"; "") + "\u001e"' 1 "$IO_REPO")"
   PR_BODY=""; COMMIT_MSGS=""; FILES=""; FILES_EXPECTED=""
   run_checks || true
   summarize
@@ -1425,7 +1743,10 @@ SCOPING_COMMENT=""
 if [[ -n "$LIVE_ISSUE_REF" ]]; then
   echo "Resolving linked issue $LIVE_ISSUE_REF (labels/comments from repos/$LIVE_ISSUE_REPO/issues/$LIVE_ISSUE)..." >&2
   LABELS="$(fetch_json "issues/$LIVE_ISSUE/labels" '.[].name' 1 "$LIVE_ISSUE_REPO")"
-  SCOPING_COMMENT="$(fetch_json "issues/$LIVE_ISSUE/comments" '.[].body' 1 "$LIVE_ISSUE_REPO")"
+  # 0x1e separator per comment — has_scoping_marker scans every record. The
+  # body is stripped of any 0x1e first, so the delimiter is not forgeable from
+  # comment text (see the rationale at the issue-only site above).
+  SCOPING_COMMENT="$(fetch_json "issues/$LIVE_ISSUE/comments" '.[].body | gsub("\u001e"; "") + "\u001e"' 1 "$LIVE_ISSUE_REPO")"
 fi
 COMMIT_MSGS="$(fetch_json "pulls/$PR_NUMBER/commits" '.[].commit.message' 1)"
 
