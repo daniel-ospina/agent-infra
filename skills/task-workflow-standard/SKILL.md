@@ -29,6 +29,7 @@ SCOPE (gate: auto)
   ├─ Read issue-scoping/SKILL.md
   ├─ Run double diamond: problem → solution
   ├─ Write scope output (issue comment or plan doc)
+  ├─ Declare the domain: `### Adversarial Threat Surface`, or an explicit `(not adversarial)`
   │
   ▼
 SCOPE-VERIFY (gate: verifier — blocks write/edit/bash)
@@ -37,6 +38,7 @@ SCOPE-VERIFY (gate: verifier — blocks write/edit/bash)
   ├─ Each reviews: problem definition, alternatives, complexity
   ├─ If issues found → fix → re-dispatch
   ├─ Loop until ALL verifiers return NO ISSUES FOUND
+  │     (adversarial domain: `THREAT SURFACE COVERED`, bounded at 2 cycles — see below)
   │
   ▼
 PLAN (gate: auto)
@@ -52,6 +54,7 @@ PLAN-VERIFY (gate: verifier — blocks write/edit/bash)
   ├─ Each reviews: approach soundness, step clarity, integration surfaces
   ├─ If issues found → fix → re-dispatch
   ├─ Loop until ALL verifiers return NO ISSUES FOUND
+  │     (adversarial domain: `THREAT SURFACE COVERED`, bounded at 2 cycles — see below)
   │
   ▼
 IMPLEMENT (gate: auto)
@@ -75,9 +78,13 @@ At each verifier gate (scope-verify, plan-verify, verify):
 2. Each verifier returns structured output with `NO ISSUES FOUND` or an issue list
 3. The gate stays locked (blocks write/edit/bash/MCP) until ALL dispatched verifiers return clean
 4. If any verifier finds issues → fix them → re-dispatch ALL verifiers
-5. Only `NO ISSUES FOUND` from every verifier advances the gate
+5. Only `NO ISSUES FOUND` from every verifier advances the gate (adversarial domain: `THREAT SURFACE COVERED` substitutes — see below)
 
 **The gate does NOT advance on dispatch count alone.** Verifier content is checked. A verifier that finds issues keeps the gate locked so the agent must fix and re-verify.
+
+### Adversarial domain — bounded verifier gates
+
+When the scope output declares an `### Adversarial Threat Surface` (gate/enforcement code whose correctness is "an attacker cannot make it fail open"), the verifier gates are bounded by that declared surface, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A verifier that reproduces no in-scope bypass and confirms each declared class is covered returns **`THREAT SURFACE COVERED`** — a clean exit for this domain, substituting for `NO ISSUES FOUND`. When the merge rests on threat-list coverage rather than a literal `NO ISSUES FOUND`, the PR body must disclose it (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
 
 ## Nudge Protocol
 

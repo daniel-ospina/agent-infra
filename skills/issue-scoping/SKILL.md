@@ -13,7 +13,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 **Human approval gate:** presents output for user review. Pipeline advances after approval.
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 
 > **Canonical:** `agent-infra/skills/issue-scoping/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
@@ -846,8 +846,9 @@ Do NOT evaluate on: diff size, number of files touched, implementation speed.
 
 1. PICK THE BEST APPROACH. Document why. Document rejected alternatives.
 2. DRAFT THE PLAN: problem statement, proposed solution, implementation plan, testing strategy, verification plan, acceptance criteria, runtime prerequisites.
+3. CLASSIFY THE DOMAIN — mandatory, binary. Is this gate/enforcement code whose correctness is "an attacker cannot make it fail open"? If YES, DECLARE THE ADVERSARIAL THREAT SURFACE: the in-scope bypass classes (each with the adversarial input and the required behaviour) and the classes explicitly OUT OF SCOPE. If NO, state `(not adversarial)` explicitly — an undeclared classification is a gap.
 
-Output the complete plan draft.
+Output the complete plan draft, including `### Adversarial Threat Surface` when (and only when) step 3 declared one. The declaration is what bounds the review at 2 cycles and makes threat-list coverage the acceptance criterion — see `AGENTS.md` §Hard Cap.
 ```
 
 #### Agent B (Complex only):
@@ -855,51 +856,6 @@ Output the complete plan draft.
 Same agent, independently dispatched. Controller merges if both choose same approach; decides with rationale if different.
 
 **Merge tiebreaker:** When equal, prefer better outcome. When one is clearly better and the other easier, pick the better one.
-
----
-
-## Phase 5.6 — Second-Model Coherence Check (Two-Tier Review)
-
-After solution-verify converges clean (both diamond verification gates passed with Flash reviewers), dispatch ONE second-model reviewer to check **cross-diamond coherence**. The second model checks that the problem definition and solution approach are consistent, nothing was lost between diamonds, and the scoping output is complete.
-
-**Model (second-model gate):** dispatch with `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous; resolve via `~/.pi/agent/models.json`). When `$SECOND_MODEL` is set but unresolvable, or unset with the default unresolvable, dispatch the tool default (`deepseek-flash`) and annotate the result `[SECOND-MODEL-GATE] stand-in ($SECOND_MODEL=… set-but-unresolvable | unset+default-unresolvable)`. Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only.
-
-**Dispatch:**
-```
-task(model=<$SECOND_MODEL per the second-model gate convention>, prompt=<coherence check prompt>)
-```
-
-**Prompt:**
-```
-You are a senior reviewer checking cross-diamond coherence of a scoping session. Both diamonds passed verification individually — your job is to check they HANG TOGETHER.
-
-CONFIRMED PROBLEM: <from Phase 2>
-SOLUTION APPROACH: <from Phase 5>
-ORIGINAL ISSUE: <issue body>
-RESEARCH ARTIFACT: <### Axis Research + ### Integration Docs from Phase 1.5>
-
-CHECK:
-1. Does the solution actually address the confirmed problem? Or did it drift back to the original issue framing?
-2. Were any problem-dimensions discovered in Phase 1 but dropped by Phase 5?
-3. Are edge cases from problem-diverge handled in the solution?
-4. Is there a SIMPLER approach that would achieve the same outcome? (Devil's advocate)
-5. What is the weakest assumption in this scoping?
-6. RESEARCH CROSS-CHECK: do the chosen approach's dependency claims match `### Integration Docs` (any dep in the plan absent from the research artifact, or contradicted by it, is flagged)?
-
-Output ISSUE blocks or NO ISSUES FOUND.
-```
-
-**Second-model findings surfaced as `[SECOND-MODEL-GATE]`:**
-
-| Second-model Issue | Action |
-|---|---|
-| `[SECOND-MODEL-GATE] P0` | Problem-solution mismatch — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P1` | Important gap — fix required, re-run the second-model gate once |
-| `[SECOND-MODEL-GATE] P2` | Improvement — note, do NOT re-run |
-
-**Re-dispatch:** Max 2 cycles. On 2nd failure → surface in scoping comment as `[SECOND-MODEL-GATE]` with "second-model coherence check could not converge."
-
-**Applies to:** Standard + Complex tiers only. Micro tier skips (single full-diamond-verify is sufficient).
 
 ---
 
@@ -964,13 +920,14 @@ Each review cycle dispatches FRESH `task` sub-agents.
 - [ ] Last reviewer response: "NO ISSUES FOUND" (verbatim)
 - [ ] If cycle 1 found issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted
+- [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
 **Stuckness detection:**
-- Fingerprint-stall: ≥80% same issues across cycles → escalate
-- Honest-stuck: non-decreasing issue count for 3 cycles → escalate
+- Fingerprint-stall: recurrence `|current ∩ prev| / |prev|` ≥ `stall_threshold` (default `0.8`) → escalate
+- Honest-stuck: issue count non-decreasing for 3 cycles → escalate. **Independent signal — fires regardless of recurrence** (a one-for-one churn has low recurrence but is not converging)
 - Zero-progress: plan unchanged for 2 cycles → escalate
 - Convergence: strict subset of prior cycle → escalate with remaining issues
-**Safety cap:** 10 cycles.
+**Safety cap:** 10 cycles. **Adversarial domain** (a declared `### Adversarial Threat Surface`): **2 cycles** — acceptance is threat-list coverage, residuals are filed from cycle 1 and not chased, and a bounded exit must be disclosed (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). <!-- adversarial-bound: cap=2 -->
 
 ---
 
@@ -992,7 +949,7 @@ gh issue comment $ISSUE_NUMBER --body "$(cat <<'PLANEOF'
 ### full-diamond-verify: N cycles, clean | N issues remain
 
 ## Plan
-<plan draft>
+<plan draft — must include `### Adversarial Threat Surface` (in-scope bypass classes + classes out of scope), or the single line `(not adversarial)`>
 
 ## Clarifications
 <from clarifying-questions Step 6a (Pass A), or "none — no questions qualified">

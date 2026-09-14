@@ -203,7 +203,7 @@ is_self_like() {
         t="$(awk -v p="$pid" '$1==p {print $4}' "$PS_TABLE" | head -1)"
         [ "$t" = "$SELF_TTY" ] && return 0
     fi
-    printf '%s\n' "$SELF_ANCESTORS" | grep -qx "$pid" && return 0
+    grep -qx "$pid" <<<"$SELF_ANCESTORS" && return 0
     return 1
 }
 
@@ -466,7 +466,7 @@ classify_candidates() {
         case "$stat" in Z*) continue ;; esac
         # own-session veto (PI_SESSION_ID hard gate)
         if [ -n "${PI_SESSION_ID:-}" ]; then
-            if printf '%s\n' "$(store_records_for_pid "$pid")" | grep -qE "	${PI_SESSION_ID}(	|$)"; then
+            if grep -qE "	${PI_SESSION_ID}(	|$)" <<<"$(store_records_for_pid "$pid")"; then
                 [ "$emit" = 1 ] && say "$pid tty=$tty SKIP own-session (PI_SESSION_ID match)"
                 continue
             fi
@@ -695,7 +695,7 @@ run() {
         if [ "${REAP_DRY_RUN:-1}" = "0" ]; then MODE=apply; else MODE=dry-run; fi
     fi
     case "$MODE" in dry-run|apply) ;; *) usage >&2; exit 2 ;; esac
-    printf '%s' "$REAP_IDLE_HOURS" | grep -qE '^[0-9]+$' || { echo "bad --idle-hours: $REAP_IDLE_HOURS" >&2; exit 2; }
+    grep -qE '^[0-9]+$' <<<"$REAP_IDLE_HOURS" || { echo "bad --idle-hours: $REAP_IDLE_HOURS" >&2; exit 2; }
     mkdir -p "$(dirname "$REAP_LOG")" 2>/dev/null || true
     now="$(now_epoch)"
 

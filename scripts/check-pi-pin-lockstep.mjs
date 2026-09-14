@@ -198,8 +198,13 @@
  *
  * WHAT REF THE CALLER SHOULD PASS, AND WHY IT IS NOT THE HEAD (#821). The flag
  * name is historical; the contract is "the ref whose tree would LAND".
- * `workflow-lock.yml` passes `pull_request.merge_commit_sha` — the merge result —
- * and asserts that it does (see the wiring test). Validating `head.sha` instead
+ * `workflow-lock.yml` passes the PR's merge commit — resolved from the REST API,
+ * NOT from the event payload, whose `merge_commit_sha` is null until GitHub
+ * computes mergeability asynchronously (#843) — and asserts that it does (see the
+ * wiring test). Note the bound: the merge commit is a function of (head, base), so
+ * it is "what would land as of the event that triggered this run", not a standing
+ * guarantee — a base-branch move afterwards invalidates it until the next event.
+ * Validating `head.sha` instead
  * was a FALSE RED generator: the head is the pre-merge state, so any branch cut
  * before a guarded workflow changed carried the OLD files, failed assertions for
  * files it never touched, and was told to "restore the line" it had never
@@ -277,11 +282,149 @@ import {
 // is the path the handler exists for. (`--head-ref` mode is excluded: it decides
 // its own findings and exit status, and its success path must still exit 0.)
 const ARGS = process.argv.slice(2);
-function argValue(flag) {
-  const i = ARGS.indexOf(flag);
-  return i >= 0 ? (ARGS[i + 1] ?? null) : null;
+
+// ── #858 — AN UNUSABLE INVOCATION MUST FAIL CLOSED, NOT RUN THE LOCAL SUITE ──
+// `HEAD_REF === null` means "not in --head-ref mode", which runs the LOCAL suite and
+// exits 0. The original `argValue("--head-ref")` returned `null` for BOTH "flag absent"
+// and "flag present with no value", so each of these VALIDATED THE LOCAL CHECKOUT AND
+// REPORTED SUCCESS on `origin/main`'s script — measured, exit 0:
+//
+//     node scripts/check-pi-pin-lockstep.mjs --head-ref
+//     VAR=""; node scripts/check-pi-pin-lockstep.mjs --head-ref $VAR   # shell drops it
+//     node scripts/check-pi-pin-lockstep.mjs --head-ref=$VAR
+//     node scripts/check-pi-pin-lockstep.mjs --headRef x          # any near-miss spelling
+//
+// NOT every unusable invocation was a fail-open. `--head-ref --repo x/y` set `HEAD_REF`
+// to the string `--repo` and exited 2 from the SHA validator, as did an explicitly empty
+// value and a duplicated `--head-ref`. Eight of the eleven argv forms in the test table
+// below were fail-opens; those three were already refused and are listed there so the fix
+// does not regress them. (An earlier revision of this comment said all of them exited 0.)
+//
+// The second is the one that matters: `--head-ref $VAR` is the natural way to write a
+// shell wrapper, and an empty `$VAR` makes the argument vanish entirely — the trusted leg
+// then reports success having validated nothing but main's own tree.
+//
+// Patching only the exact token `--head-ref` would leave the same hole in the `=` spelling,
+// which is the conventional form and the natural output of `--head-ref=$SHA`. So the parser
+// is strict over the WHOLE argument vector: `--head-ref` and `--repo` are the only arguments
+// this tool has ever accepted (checked across every caller, workflow, fixture and doc in the
+// repo — plus the `=` spelling), and nothing else is treated as "no --head-ref".
+//
+// NOTE ON ORDERING: this refusal sits BEFORE the `exit` handler is registered, so
+// `process.exit(2)` terminates without that handler ever existing. A flag threaded into the
+// handler to guard it would therefore be dead code (measured — removing one changed
+// nothing). The consequence is that the `headRef: null` invariant below cannot be observed by
+// calling the CLI and reading a parsed field: the process exits before it can. What CAN be
+// observed is a VIOLATION of it, because the refusal block asserts the shape at runtime and
+// exits 3 on a violation while a correct refusal exits 2 — so the invariant is pinned
+// behaviourally through that difference, not by inspecting the parsed object.
+const KNOWN_FLAGS = ["--head-ref", "--repo"];
+// The initialized shape. Every error path gets a COPY of it rather than a bare `{ error }`:
+// the guards below test `HEAD_REF !== null`, and an OMITTED key is `undefined`, which is
+// `!== null`. A bare `{ error }` would therefore make "we refused this invocation"
+// indistinguishable from "this is a --head-ref run" to anything reading a parsed field.
+// Not hypothetical: an earlier revision of this block returned a bare `{ error }`.
+const EMPTY_ARGS = Object.freeze({ headRef: null, repo: null });
+function usageError(message) {
+  return { ...EMPTY_ARGS, ok: false, error: message };
 }
-const HEAD_REF = argValue("--head-ref");
+function parseArgs(argv) {
+  const parsed = { ...EMPTY_ARGS };
+  for (let i = 0; i < argv.length; i += 1) {
+    const raw = argv[i];
+    let name = raw;
+    let inline = null;
+    const eq = raw.indexOf("=");
+    if (raw.startsWith("--") && eq > 2) {
+      name = raw.slice(0, eq);
+      inline = raw.slice(eq + 1);
+    }
+    if (!KNOWN_FLAGS.includes(name)) {
+      return usageError(
+        `unrecognised argument ${JSON.stringify(raw)} — this tool accepts only ` +
+          `${KNOWN_FLAGS.join(" and ")}, written \`--head-ref <sha>\` or \`--head-ref=<sha>\`.`
+      );
+    }
+    const value = inline !== null ? inline : (argv[i + 1] ?? null);
+    if (inline === null) i += 1;
+    if (value === null || value === "" || value.startsWith("-")) {
+      return usageError(
+        `${name} was passed with no usable value (got ` +
+          `${value === null ? "nothing" : JSON.stringify(value)}).`
+      );
+    }
+    if (name === "--head-ref") {
+      // Duplicates are REFUSED rather than resolved. The previous `argValue` used
+      // `ARGS.indexOf(flag)` and therefore silently took the FIRST value, which is one
+      // more way to validate a tree the caller did not mean to validate; "last wins"
+      // (the usual CLI convention) is no better. Neither is right, so neither is offered.
+      if (parsed.headRef !== null) {
+        return usageError(
+          "--head-ref was passed more than once — refusing to guess which value to validate."
+        );
+      }
+      parsed.headRef = value;
+    } else {
+      if (parsed.repo !== null) {
+        return usageError(
+          "--repo was passed more than once — refusing to guess which repository to read."
+        );
+      }
+      parsed.repo = value;
+    }
+  }
+  // `--repo` only selects WHICH repository a --head-ref tree is read from. On its own
+  // there is no tree to read, so it would fall through to local-suite mode and validate
+  // THIS checkout and exit 0 — the same shape as every other case in this block.
+  if (parsed.repo !== null && parsed.headRef === null) {
+    return usageError(
+      "--repo was passed without --head-ref — it only selects which repository to read a " +
+        "--head-ref tree from, so alone it would silently validate THIS checkout."
+    );
+  }
+  return { ...parsed, ok: true };
+}
+// EVERY error path above returns through `usageError`, which copies `EMPTY_ARGS` (so an error
+// result always carries `headRef: null` / `repo: null`) and sets `ok: false` (so the refusal
+// gate does not depend on the truthiness of a message string). That is load-bearing rather
+// than tidy: the guards below test `HEAD_REF !== null`, and an OMITTED key is `undefined`,
+// which is `!== null`. A bare `{ error }` therefore made "we refused this invocation"
+// indistinguishable from "this is a --head-ref run", which silently broke the
+// moved-refusal control on an earlier revision of this block. It is asserted AT RUNTIME in the
+// refusal block below, and that assertion is pinned BEHAVIOURALLY: it exits 3, not the refusal's
+// 2, so a wrongly-built result fails the CLI test instead of passing as a refusal.
+//
+// The gate is `PARSED.ok`, an explicit sentinel, NOT the truthiness of `PARSED.error`. Keying it
+// on the message would mean a falsy message (`""`) skipped both the refusal and the shape
+// assertion and fell through to local-suite mode — not reachable today, since every message is a
+// non-empty literal, but the sentinel makes the gate independent of message content.
+const PARSED = parseArgs(ARGS);
+if (!PARSED.ok) {
+  // The invariant, asserted at the only place it is observable — the refusal exits before any
+  // other read of a parsed field. An error result with a non-null headRef/repo means something
+  // bypassed `usageError`, and the `HEAD_REF !== null` guards below would then read "we refused
+  // this" as "this is a --head-ref run".
+  if (PARSED.headRef !== null || PARSED.repo !== null) {
+    console.error(
+      "❌ internal: a refused parse must carry headRef: null and repo: null — an omitted " +
+        "key is `undefined`, which passes the `!== null` guards and would make this refusal " +
+        "indistinguishable from a --head-ref run (#858)."
+    );
+    process.exit(3);
+  }
+  // RESIDUAL BOUND (stated, not defended): deleting the check above is not detected by any
+  // test. It is source code, and like every guard in this file its PRESENCE is a property of
+  // the source — a commit that removed it while building a bare `{ error }` elsewhere would be
+  // GREEN. The deliberate class for that is branch protection (#646), not a longer test.
+  console.error(
+    `❌ ${PARSED.error}\n` +
+      "   Refusing to continue: falling back to local-suite mode here would validate THIS\n" +
+      "   checkout and exit 0, which is a fail-open in the trusted leg. Pass an explicit\n" +
+      '   commit SHA — `--head-ref "$MERGE_SHA"` — and check the variable is non-empty.'
+  );
+  process.exit(2);
+}
+const HEAD_REF = PARSED.headRef;
 
 process.on("exit", () => {
   if (HEAD_REF !== null) return;
@@ -431,6 +574,50 @@ const STICKY_CHILD = process.env[STICKY_FIXTURE_ENV] !== undefined;
 
 // ── Constants used by the narrow guard ─────────────────────────────────────
 const isMap = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/**
+ * A block scalar KEEPS its `#` comment lines, so any assertion that greps a `run:`
+ * body for a substring is satisfiable by PROSE — including by a commented-out
+ * command. Measured in review: `# node scripts/check-pi-pin-lockstep.mjs --head-ref
+ * "$MERGE_SHA"` left this whole suite green while the trusted leg ran no checker at
+ * all. Assertions about what a step DOES must read a comment-stripped body.
+ */
+// BOUND: this is a heuristic, not shell modelling. It drops any line whose first
+// non-space character is `#`, which is correct for the current body but would diverge
+// from what the shell does if the body ever gained a MULTI-LINE quoted string whose
+// continuation line began with `#` (the shell would treat it as string content; this
+// would drop it). The body has no such string today. Note the split: the VALUE PIN and
+// the step SELECTION both use this function, so those two cannot disagree with each
+// other — but the behavioural test executes the RAW body, which follows the shell. In
+// that hypothetical the pin could therefore pin a body that differs from the one that
+// executes; today they are identical.
+const stripComments = (s) =>
+  String(s)
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .join("\n");
+
+/**
+ * The `workflow-lock` step that EXECUTES the checker, or `null`. Shared by the
+ * wiring test and the behavioural test so the two cannot drift apart.
+ */
+function workflowLockStep(doc) {
+  const steps = doc?.jobs?.["workflow-lock"]?.steps;
+  if (!Array.isArray(steps)) return null;
+  return (
+    steps.find(
+      (s) =>
+        typeof s.run === "string" &&
+        // Tolerant on purpose: extra flags must still SELECT the step, so the strict
+        // value assertion below can fail with a message about the VALUE rather than a
+        // confusing "no step found". What it does require is a NON-COMMENT line — a
+        // commented-out invocation must not select anything.
+        /^\s*node\s+scripts\/check-pi-pin-lockstep\.mjs\b[^\n]*--head-ref/m.test(
+          stripComments(s.run)
+        )
+    ) ?? null
+  );
+}
 const EXPECTED_USES = "daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main";
 // #675 P2-2 — a FAILURE ACCUMULATOR, not `&&` (see the header for why).
 const EXPECTED_TEST_COMMAND =
@@ -702,7 +889,7 @@ function runHeadRefMode(ref, repo) {
   process.exit(0);
 }
 
-if (HEAD_REF !== null) runHeadRefMode(HEAD_REF, argValue("--repo") ?? resolveRepo());
+if (HEAD_REF !== null) runHeadRefMode(HEAD_REF, PARSED.repo ?? resolveRepo());
 
 let passed = 0;
 let failed = 0;
@@ -780,7 +967,11 @@ const REQUIRED_TESTS = Object.freeze([
   "the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)",
   "workflow coverage: an unclassified new workflow is RED (#675 P2-d)",
   "workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)",
-  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)",
+  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821, #843)",
+  // #843 cycle 2 — the wiring test above reasons about TEXT, and a `run:` body is
+  // data: it cannot tell an executing line from one in a heredoc, a never-called
+  // function, or a comment. This is the executing counterpart (#807 class).
+  "workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — the checker executes and its failure fails the step (#843 cycle 3, #807 class)",
   "a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)",
   "a symlinked locked workflow is RED from lockFindings (#675 P1-2)",
   "the lock CLI is RED for a symlinked locked workflow (#675 P1-2)",
@@ -792,6 +983,10 @@ const REQUIRED_TESTS = Object.freeze([
   "--head-ref is RED end-to-end when a workflow is committed as a symlink (mode 120000) (#675 P1-2)",
   "--head-ref is GREEN end-to-end for a regular-file tree (mode 100644) (#675 P1-2)",
   "an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)",
+  // #858 — the arg parser must not turn a usage error into local-suite mode, and the
+  // `=` spelling must be honoured rather than ignored.
+  "--head-ref with a missing or empty value fails CLOSED instead of running the local suite (#858)",
+  "the `=` spelling of --head-ref is HONOURED end-to-end, not ignored (#858 P1)",
   // #666 third revision — the ci-main.yml STRUCTURAL shape (value assertions)
   "ci-main structural: losing the `extension-tests` job is RED (#666 third revision)",
   "ci-main structural: an extra `with:` key is RED (#666 third revision)",
@@ -841,8 +1036,10 @@ const REQUIRED_TESTS = Object.freeze([
 // the pin-suite-only stub makes observable (a deleted failure guard, an `exit 0`
 // before the guard, and a guard inside a never-taken `case` arm), plus the pinned
 // stub-keyed bound. All four are in the roster above as well, so deleting one by
-// name is RED independently of this floor.)
-const MIN_EXPECTED_PASSING = 120;
+// name is RED independently of this floor. #843 cycle 3: 120 → 121 — the
+// behavioural workflow-lock test, also in the roster. #858: 121 → 123 — the
+// `--head-ref` usage-error test and the `=` spelling test, both in the roster.)
+const MIN_EXPECTED_PASSING = 123;
 
 let finalized = false;
 function finalize() {
@@ -2132,7 +2329,64 @@ test("--update-lock on a symlinked locked file fails instead of printing an upda
 // #675 P2-g — the trusted leg is bootstrapped by the NEXT PR after it lands
 // (pull_request_target resolves from the default branch). Nothing writes
 // post-merge evidence, so this is the assertion that deleting/unwiring it is RED.
-test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)", () => {
+// The COMMITTED executed body, by VALUE — the same technique as
+// EXPECTED_CI_MAIN_INVOCATION, and for the same reason: every attempt to describe
+// this body by SHAPE failed. Five reviews produced a decoy block in a heredoc, a
+// git-based second resolution channel, a rewritten argv log, and finally a
+// shape-whitelist whose `echo ".*"` admitted
+//     echo "$(printf 'process.exit(0)\n' > scripts/check-pi-pin-lockstep.mjs)"
+// — measured: the checker overwritten, the step exiting 0, suite green. A frozen
+// value cannot be talked around: ANY change to what runs is RED, so an edit here
+// must be a deliberate edit to this constant.
+const EXPECTED_LOCK_BODY = [
+  "ATTEMPT=0",
+  "MERGE_SHA=\"\"",
+  "MERGEABLE=\"\"",
+  "STATE=\"\"",
+  "while [ \"$ATTEMPT\" -lt 3 ]; do",
+  "  ATTEMPT=$((ATTEMPT + 1))",
+  "  if ! MERGE_INFO=$(gh api \"repos/$REPO/pulls/$PR_NUMBER\" --jq '[.merge_commit_sha // \"\", (.mergeable | tostring), (.state // \"\")] | join(\" \")'); then",
+  "    echo \"❌ could not read PR #$PR_NUMBER from $REPO via the REST API.\"",
+  "    echo \"   That is an auth, scope or network failure — NOT a finding about your workflow\"",
+  "    echo \"   files. The step needs \\`pull-requests: read\\`. Re-run once the API is reachable.\"",
+  "    exit 1",
+  "  fi",
+  "  MERGE_SHA=${MERGE_INFO%% *}",
+  "  MERGE_REST=${MERGE_INFO#* }",
+  "  MERGEABLE=${MERGE_REST%% *}",
+  "  STATE=${MERGE_REST##* }",
+  "  if [ -n \"$MERGE_SHA\" ]; then break; fi",
+  "  if [ \"$STATE\" != \"open\" ]; then break; fi",
+  "  if [ \"$MERGEABLE\" = \"false\" ]; then break; fi",
+  "  if [ \"$ATTEMPT\" -lt 3 ]; then sleep $((ATTEMPT * 2)); fi",
+  "done",
+  "if [ -z \"$MERGE_SHA\" ]; then",
+  "  if [ \"$STATE\" != \"open\" ]; then",
+  "    echo \"❌ this PR is not open (state: ${STATE:-unknown}), so there is no merge result to\"",
+  "    echo \"   validate. This is NOT a finding about your workflow files — there is simply\"",
+  "    echo \"   nothing here to check. PR head, for reference only: $HEAD_SHA\"",
+  "  elif [ \"$MERGEABLE\" = \"false\" ]; then",
+  "    echo \"❌ this PR CONFLICTS with its base branch, so no merge commit exists to validate.\"",
+  "    echo \"   GitHub finished computing mergeability and reported mergeable=false, so this\"",
+  "    echo \"   is a real conflict rather than a timing window. This is NOT a finding about\"",
+  "    echo \"   your workflow files: the job cannot see what would land until it is resolved.\"",
+  "    echo \"   PR head, for reference only: $HEAD_SHA\"",
+  "  else",
+  "    echo \"❌ no merge commit could be read for this PR after $ATTEMPT attempt(s), so there\"",
+  "    echo \"   is nothing to validate. This is NOT a finding about your workflow files.\"",
+  "    echo \"   merge_commit_sha was empty and mergeable reported '$MERGEABLE' rather than\"",
+  "    echo \"   false. That is USUALLY a timing condition — GitHub computes mergeability\"",
+  "    echo \"   asynchronously and a read can land before it finishes — but it can also be a\"",
+  "    echo \"   conflict GitHub has not resolved yet, so both are worth a look. Re-run this\"",
+  "    echo \"   job first; if it keeps failing this way, check the PR against its base.\"",
+  "    echo \"   PR head, for reference only: $HEAD_SHA\"",
+  "  fi",
+  "  exit 1",
+  "fi",
+  "node scripts/check-pi-pin-lockstep.mjs --head-ref \"$MERGE_SHA\"",
+].join("\n");
+
+test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821, #843)", () => {
   const rel = ".github/workflows/workflow-lock.yml";
   const abs = path.join(REPO_ROOT, rel);
   assert.ok(fs.existsSync(abs), `${rel} must exist — it is the trusted structural leg`);
@@ -2143,35 +2397,579 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
     isMap(doc.on) && Object.hasOwn(doc.on, "pull_request_target"),
     `${rel} must still trigger on \`pull_request_target\` — that is the base-branch trigger`
   );
-  // #821 — THE VALIDATED REF MUST BE THE MERGE RESULT, NOT THE HEAD.
-  // The head is the pre-merge state. Validating it made every branch cut before a
-  // guarded workflow changed fail against files it never touched — and never will
-  // change, because merging leaves the BASE branch's copies in place. The merge
-  // result is also the only ref where "PR change + a base branch that changed the
-  // same file since" exists at all, which is the case that actually matters.
-  const steps = doc.jobs["workflow-lock"].steps;
-  const step = steps.find(
-    (s) => typeof s.run === "string" && s.run.includes("check-pi-pin-lockstep.mjs --head-ref")
+  const step = workflowLockStep(doc);
+  assert.ok(
+    step,
+    `${rel} must invoke the checker on a NON-COMMENT line. Whether that line EXECUTES is ` +
+      "answered behaviourally by the test below."
   );
-  assert.ok(step, `${rel} must still invoke the checker with --head-ref`);
+  const job = doc.jobs["workflow-lock"];
+
+  // ---- THE EXECUTED BODY, BY VALUE -------------------------------------------
   assert.equal(
-    step.env?.MERGE_SHA,
-    "${{ github.event.pull_request.merge_commit_sha }}",
-    `${rel} must validate \`pull_request.merge_commit_sha\` — the merge result is what lands (#821)`
+    stripComments(step.run).trimEnd(),
+    EXPECTED_LOCK_BODY,
+    `${rel}: the executed body must be EXACTLY EXPECTED_LOCK_BODY. This is a value pin, not a ` +
+      "shape check: shape checks over a shell language have been defeated in every review."
   );
-  assert.match(
-    String(step.run),
-    /-z "\$MERGE_SHA"/,
-    `${rel} must fail closed with its own message when \`merge_commit_sha\` is empty (a conflicted ` +
-      "PR has no merge result to validate — that must not be reported as a workflow finding)"
+
+  // ---- THE JOB SET ------------------------------------------------------------
+  // Only `jobs.workflow-lock` was ever inspected. A SECOND job runs arbitrary `run:`
+  // on the privileged `pull_request_target` trigger with nothing guarding it.
+  assert.deepEqual(
+    Object.keys(doc.jobs ?? {}),
+    ["workflow-lock"],
+    `${rel}: \`workflow-lock\` must be the ONLY job`
+  );
+
+  // ---- THE STEP SHAPE, AND THE PWN-REQUEST VECTOR ------------------------------
+  const steps = job.steps;
+  assert.equal(steps.length, 2, `${rel}: the job must be exactly [checkout, validate]`);
+  assert.equal(
+    steps[0].uses,
+    "actions/checkout@v4",
+    `${rel}: the checkout step must be pinned to \`actions/checkout@v4\``
+  );
+  assert.equal(
+    steps[0].with,
+    undefined,
+    `${rel}: the checkout must pass NO \`with:\` — a \`ref:\` here checks out PR content`
+  );
+  assert.equal(steps[1], step, `${rel}: the validating step must be the LAST step`);
+  // A STRUCTURAL walk, deliberately, not a text regex: the previous regex required an
+  // unquoted `ref:` at line start, so a quoted `"ref":` evaded it — and it never
+  // inspected any job but this one.
+  for (const [jobId, j] of Object.entries(doc.jobs ?? {})) {
+    for (const [idx, s] of (Array.isArray(j.steps) ? j.steps : []).entries()) {
+      assert.ok(
+        !Object.keys(s.with ?? {}).some((k) => k.toLowerCase() === "ref"),
+        `${rel}: ${jobId}.steps[${idx}] must not pass a \`ref\` to an action — on ` +
+          "`pull_request_target` that is the pwn-request vector this file's header forbids"
+      );
+      for (const [k, v] of Object.entries(s.with ?? {})) {
+        assert.ok(
+          !/github(\.event)?\.(head_ref|pull_request\.head)/.test(String(v)),
+          `${rel}: ${jobId}.steps[${idx}].with.${k} references the PR head`
+        );
+      }
+      assert.ok(
+        s.uses === undefined || s.uses === "actions/checkout@v4",
+        `${rel}: ${jobId}.steps[${idx}] must not use an unpinned action (${s.uses})`
+      );
+      // A step-level `if:` SKIPS the step, and a skipped step cannot fail. Do not
+      // lean on actionlint here: it rejects only CONSTANT conditions, so
+      // `if: github.event_name == 'push'` (always false on this trigger — it IS
+      // `pull_request_target`) passes actionlint and silently disables the gate.
+      assert.equal(
+        s.if,
+        undefined,
+        `${rel}: ${jobId}.steps[${idx}] must not be conditional (\`if:\`)`
+      );
+    }
+  }
+
+  // ---- EVERYTHING THAT CAN STOP THE JOB RUNNING, OR STOP IT FAILING -------------
+  assert.equal(job.if, undefined, `${rel}: the workflow-lock JOB must not be conditional (\`if:\`)`);
+  assert.equal(
+    truthyFlag(job, "continue-on-error"),
+    false,
+    `${rel}: \`jobs.workflow-lock.continue-on-error\` lets a FAILING job leave the run GREEN`
+  );
+  assert.equal(
+    truthyFlag(step, "continue-on-error"),
+    false,
+    `${rel}: the validating step must not set \`continue-on-error\` — that turns a failing ` +
+      "checker into a passing job. (Compared via truthyFlag, because the YAML subset does NOT " +
+      'type-resolve scalars: `false` parses as the STRING "false".)'
+  );
+  assert.equal(
+    job.needs,
+    undefined,
+    `${rel}: the job must have no \`needs\` — a skipped job cannot fail the run`
+  );
+  assert.equal(
+    job.strategy,
+    undefined,
+    `${rel}: a \`strategy.matrix\` whose \`exclude\` covers every combination SKIPS the job, ` +
+      "and a skipped job cannot fail a run"
   );
   assert.ok(
-    isMap(doc.permissions) && Object.hasOwn(doc.permissions, "contents"),
+    typeof job["runs-on"] === "string" && job["runs-on"].startsWith("ubuntu-"),
+    `${rel}: the job must run on a pinned ubuntu runner label`
+  );
+  assert.equal(job.container, undefined, `${rel}: the job must not declare a \`container:\``);
+  assert.equal(
+    step.shell,
+    undefined,
+    `${rel}: the step must not override \`shell:\` — that changes what the body even means`
+  );
+  for (const [label, val] of [
+    ["jobs.workflow-lock.defaults", job.defaults],
+    ["`defaults`", doc.defaults],
+  ]) {
+    assert.ok(
+      val === undefined || (isMap(val) && Object.keys(val).length === 0),
+      `${rel}: ${label} must not set \`run.shell\``
+    );
+  }
+
+  // ---- PERMISSIONS -------------------------------------------------------------
+  assert.equal(
+    isMap(doc.permissions) ? doc.permissions.contents : undefined,
+    "read",
     `${rel} must grant \`contents: read\``
   );
+  assert.equal(
+    isMap(doc.permissions) ? doc.permissions["pull-requests"] : undefined,
+    "read",
+    `${rel} must grant \`pull-requests: read\` — the merge commit is resolved from the ` +
+      "pulls API (#843); without it that call 403s and the leg reds"
+  );
+  assert.deepEqual(
+    Object.keys(doc.permissions ?? {}).sort(),
+    ["contents", "pull-requests"],
+    `${rel} must grant EXACTLY these two scopes at workflow level — an extra one is an ` +
+      "over-grant that checking two named keys cannot see"
+  );
+  assert.equal(
+    job.permissions,
+    undefined,
+    `${rel}: \`jobs.workflow-lock.permissions\` overrides the workflow-level block`
+  );
+
+  // ---- ENV AT EVERY LEVEL -------------------------------------------------------
+  assert.equal(
+    step.env?.PR_NUMBER,
+    "${{ github.event.pull_request.number }}",
+    `${rel} must pass the PR number so the merge commit can be resolved from the API (#843)`
+  );
+  assert.equal(step.env?.REPO, "${{ github.repository }}", `${rel} must pass the repo slug (#843)`);
+  assert.equal(step.env?.GH_TOKEN, "${{ github.token }}", `${rel} must pass GH_TOKEN (#843)`);
+  assert.deepEqual(
+    Object.keys(step.env ?? {}).sort(),
+    ["GH_TOKEN", "HEAD_SHA", "PR_NUMBER", "REPO"],
+    `${rel}: the step's \`env\` must contain EXACTLY these keys`
+  );
   assert.ok(
-    !Object.hasOwn(doc.permissions, "pull-requests"),
-    `${rel} must not grant the unused \`pull-requests: read\` scope (#675 P2-h)`
+    !Object.hasOwn(step.env ?? {}, "MERGE_SHA"),
+    `${rel} must NOT read \`merge_commit_sha\` from the event payload — it is null until ` +
+      "mergeability is computed, so every PR races it (#843)"
+  );
+  assert.equal(job.env, undefined, `${rel}: the job must not set \`env:\``);
+  assert.equal(doc.env, undefined, `${rel}: the workflow must not set \`env:\``);
+
+  // ---- THE TRIGGER -------------------------------------------------------------
+  const onTarget = isMap(doc.on?.pull_request_target) ? doc.on.pull_request_target : {};
+  assert.deepEqual(
+    Array.isArray(onTarget.types) ? [...onTarget.types].sort() : onTarget.types,
+    ["edited", "opened", "reopened", "synchronize"],
+    `${rel}: the trigger's event \`types\` must be pinned to the full set`
+  );
+  for (const k of ["paths", "paths-ignore", "branches", "branches-ignore"]) {
+    assert.ok(
+      !Object.hasOwn(onTarget, k),
+      `${rel}: an \`on.pull_request_target\` \`${k}\` filter can stop this leg from triggering`
+    );
+  }
+});
+
+/** Timeout for each behavioural spawn of the workflow-lock step. */
+const LOCKPOINT_TIMEOUT_MS = 30_000;
+/** The merge commit the stubbed `gh` reports. Distinctive, so a match means a match. */
+const LOCKPOINT_SHA = "0123456789abcdef0123456789abcdef01234567";
+
+/**
+ * The behavioural counterpart of the wiring test: run the COMMITTED `run:` body
+ * with a stubbed `gh` (so nothing touches the network) and a stubbed `node` (so the
+ * checker invocation is observable), and report what actually executed.
+ */
+// What `gh api ... --jq '[.merge_commit_sha // "", (.mergeable | tostring), (.state // "")] | join(" ")'`
+// prints. Note the LEADING SPACE when there is no merge commit — faithful to the real
+// output, so the step's `${MERGE_INFO%% *}` / `${MERGE_REST%% *}` / `${MERGE_REST##* }`
+// split is exercised against the shape it will actually see rather than a convenient one.
+const ghResponse = (sha, mergeable, state = "open") =>
+  [sha ?? "", String(mergeable), String(state)].join(" ");
+
+function runWorkflowLockStep(body, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? LOCKPOINT_TIMEOUT_MS;
+  const ghMode = opts.ghMode ?? "ok";
+  const nodeStatus = opts.nodeStatus ?? 0;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pin-wlock-"));
+  try {
+    const stubDir = path.join(dir, "stub");
+    fs.mkdirSync(stubDir);
+    // A SEQUENCE, not a fixed mode (#857). A retry cannot be tested with a stub that
+    // answers the same way every time: "the read was empty and then populated" IS the
+    // regression, and it is observable only if the stub can change its answer between
+    // calls. `__FAIL__` is a call that exits non-zero (auth/scope/network).
+    const responses =
+      opts.ghResponses ??
+      Array.from({ length: 5 }, () =>
+        ghMode === "fail" ? "__FAIL__" : ghResponse(opts.sha ?? LOCKPOINT_SHA, "true")
+      );
+    fs.writeFileSync(path.join(dir, "gh-responses.txt"), `${responses.join("\n")}\n`);
+    const gh = path.join(stubDir, "gh");
+    fs.writeFileSync(
+      gh,
+      [
+        "#!/bin/bash",
+        `printf '%s\\n' "$*" >> "${dir}/gh-argv.txt"`,
+        `n=0; [ -f "${dir}/gh-count" ] && n=$(cat "${dir}/gh-count")`,
+        `n=$((n + 1)); printf '%s' "$n" > "${dir}/gh-count"`,
+        `line=$(sed -n "\${n}p" "${dir}/gh-responses.txt")`,
+        'if [ "$line" = "__FAIL__" ]; then exit 1; fi',
+        `printf '%s\\n' "$line"`,
+        "exit 0",
+        "",
+      ].join("\n")
+    );
+    fs.chmodSync(gh, 0o755);
+    const node = path.join(stubDir, "node");
+    fs.writeFileSync(
+      node,
+      [
+        "#!/bin/bash",
+        `printf '%s\\n' "$*" >> "${dir}/node-argv.txt"`,
+        `exit ${nodeStatus}`,
+        "",
+      ].join("\n")
+    );
+    fs.chmodSync(node, 0o755);
+    const script = path.join(dir, "step.sh");
+    fs.writeFileSync(script, body.endsWith("\n") ? body : `${body}\n`);
+    // `sleep` is STUBBED, so the backoff is asserted on the sleeps actually REQUESTED. A
+    // wall-clock bound cannot do this safely: measured idle/loaded runs of the unresolved case
+    // reached 8.0 s and 8.4 s against an 8 s bound, i.e. it would false-RED a correct suite —
+    // the very class of flake this PR exists to remove. The stub makes it deterministic (and
+    // removes ~6 s from the suite).
+    const sleep = path.join(stubDir, "sleep");
+    fs.writeFileSync(
+      sleep,
+      ["#!/bin/bash", `printf '%s\\n' "$*" >> "${dir}/sleep-args.txt"`, "exit 0", ""].join("\n")
+    );
+    fs.chmodSync(sleep, 0o755);
+    const res = spawnSync(BASH_ABS, ["-e", script], {
+      cwd: dir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${stubDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        GH_TOKEN: "stub",
+        REPO: "stub/stub",
+        PR_NUMBER: "1",
+        HEAD_SHA: "stub-head",
+      },
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: timeoutMs,
+    });
+    const read = (f) => (fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim() : "");
+    return {
+      status: res.status,
+      signal: res.signal ?? null,
+      error: res.error ?? null,
+      // #857 — the sleeps the step ASKED FOR, in order. This is what pins the backoff.
+      sleeps: read(path.join(dir, "sleep-args.txt")).split("\n").filter(Boolean),
+      output: `${res.stdout ?? ""}${res.stderr ?? ""}`,
+      ghArgv: read(path.join(dir, "gh-argv.txt")),
+      nodeArgv: read(path.join(dir, "node-argv.txt")),
+    };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * THE ASSERTION THE TEXT CHECKS CANNOT MAKE. Every assertion in the wiring test
+ * reasons about what the step SAYS; a `run:` body is data, so text cannot tell an
+ * executing line from one inside a heredoc, a never-called function, or a comment.
+ * Measured in review, all GREEN before this test existed: the invocation inside
+ * `: <<'NEVERRUN' … NEVERRUN`; inside a function never called; `set +e` plus a
+ * trailing `exit 0`; and `trap 'exit 0' EXIT` (which converts EVERY `exit 1` in the
+ * step into success). This test EXECUTES the committed body with stubs and asserts
+ * what ran and what the composite exit status was — the same proven approach as
+ * item 6b for `ci-main.yml` (#807/#828), chosen there for the same reason: shell
+ * semantics cannot be modelled lexically.
+ */
+test("workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — the checker executes and its failure fails the step (#843 cycle 3, #807 class)", () => {
+  const rel = ".github/workflows/workflow-lock.yml";
+  const doc = parseWorkflowYaml(fs.readFileSync(path.join(REPO_ROOT, rel), "utf8"));
+  const step = workflowLockStep(doc);
+  assert.ok(step, `${rel} must execute the checker on a non-comment line`);
+  const body = String(step.run);
+  // The exact argv the stubbed `gh` must receive. `$*` re-joins with spaces, so the
+  // shell's quoting is gone: this is the RESOLVED argv, which is what makes the
+  // behavioural scenarios and the text pins agree on the same call. #857 widened the
+  // jq to emit all THREE of merge_commit_sha, mergeable and state — still ONE request per
+  // attempt. `state` is what makes the closed-PR diagnosis possible without extra calls.
+  const EXPECTED_GH_ARGV =
+    `api repos/stub/stub/pulls/1 --jq [.merge_commit_sha // "", (.mergeable | tostring), (.state // "")] | join(" ")`;
+  const ghCalls = (r) => (r.ghArgv === "" ? [] : r.ghArgv.split("\n"));
+  const spawn = (opts) => {
+    const r = runWorkflowLockStep(body, opts);
+    assert.equal(
+      r.error,
+      null,
+      `${rel}: the committed run block could not be spawned: ${r.error?.message}`
+    );
+    return r;
+  };
+
+  // S1 — the RESOLVED merge commit reaches the checker. A BODY that runs no checker
+  // (commented out, inside a heredoc, inside a function never called) cannot satisfy
+  // this: `node` never runs. The neutralizers that are NOT in the body — `shell:`,
+  // step or job `continue-on-error`, `if:`, `needs:`, the trigger filters, a THIRD
+  // step, the checkout's `uses`/`with:`, `env:` at any level — are asserted
+  // structurally in the wiring test, because executing a body cannot see them. The
+  // split is stated explicitly so neither layer is assumed to cover the other's
+  // classes; the FROZEN-BODY value pin in the wiring test is what bounds THIS layer.
+  const ok = spawn({ nodeStatus: 0 });
+  assert.equal(ok.status, 0, `${rel}: must exit 0 when the checker passes.\n${tail(ok.output)}`);
+  // EXACTLY ONE call, with EXACTLY this argv. This is the assertion that ties the
+  // text pins to reality: a decoy copy of the correct block inside a heredoc
+  // satisfies every text pin and never executes, so it cannot appear here — and a
+  // real call resolving `.head["sha"]` (note: brackets, which the text-level
+  // `head\.sha` regex does not match) resolves to a DIFFERENT argv and is RED here.
+  assert.deepEqual(
+    ghCalls(ok),
+    [EXPECTED_GH_ARGV],
+    `${rel}: must make exactly one pull-requests call when the first read already carries the ` +
+      "merge commit — nothing about the text of the step proves the call that runs is the pinned one"
+  );
+  assert.equal(
+    ok.nodeArgv,
+    `scripts/check-pi-pin-lockstep.mjs --head-ref ${LOCKPOINT_SHA}`,
+    `${rel}: must invoke the checker with the RESOLVED merge commit, exactly — nothing about ` +
+      "the TEXT of the step proves it runs"
+  );
+
+  // S1b — THE #857 REGRESSION, EXECUTED. This is the whole point of the retry: a read
+  // that lands inside the mergeability window (empty, mergeable not yet false) must not
+  // red a mergeable PR. Without the retry the first read is the only read, the step
+  // exits 1, and the author is told their workflow files have a problem they do not.
+  const retried = spawn({
+    nodeStatus: 0,
+    ghResponses: [ghResponse("", "null"), ghResponse(LOCKPOINT_SHA, "true")],
+  });
+  assert.equal(
+    retried.status,
+    0,
+    `${rel}: an empty FIRST read followed by a populated second one must SUCCEED — that is the ` +
+      `#857 flake, which was a false RED on a mergeable PR; got status ${retried.status}.\n` +
+      tail(retried.output)
+  );
+  assert.deepEqual(
+    ghCalls(retried),
+    [EXPECTED_GH_ARGV, EXPECTED_GH_ARGV],
+    `${rel}: the retry must re-read the API, with the pinned argv, exactly once more`
+  );
+  assert.equal(
+    retried.nodeArgv,
+    `scripts/check-pi-pin-lockstep.mjs --head-ref ${LOCKPOINT_SHA}`,
+    `${rel}: the RETRIED read must still reach the checker with the merged commit`
+  );
+  // A populated read is accepted even while `mergeable` is still null. The guard is the
+  // ABSENCE of a merge commit, never the presence of a flag: gating on `mergeable` would
+  // make this advisory leg depend on a field GitHub may not have computed yet.
+  const shaWithNullMergeable = spawn({
+    nodeStatus: 0,
+    ghResponses: [ghResponse("", "null"), ghResponse(LOCKPOINT_SHA, "null")],
+  });
+  assert.equal(
+    shaWithNullMergeable.status,
+    0,
+    `${rel}: mergeable is a DIAGNOSIS, not a gate — a real merge commit must be validated even ` +
+      "when mergeable has not been computed"
+  );
+  // ...and the same for `mergeable: false`. DEFENSIVE, and stated as such: no PR has been
+  // OBSERVED with both a merge commit and mergeable=false (every conflicting PR checked — 852,
+  // 767, 636 — is `mergeable=false, mergeable_state=dirty, merge_commit_sha=null`). But if one
+  // ever does appear, the sha is the thing this leg exists to validate, so a flag must not veto
+  // it. This pins that, and it does not claim the combination is expected.
+  const shaWithFalseMergeable = spawn({ nodeStatus: 0, ghResponses: [ghResponse(LOCKPOINT_SHA, "false")] });
+  assert.equal(
+    shaWithFalseMergeable.status,
+    0,
+    `${rel}: a POPULATED merge commit must be validated even when mergeable=false — the ` +
+      "presence of a merge commit, not a flag, is what this leg needs"
+  );
+
+  // S2 — a failing checker must fail the step. `set +e`, a trailing `exit 0`,
+  // `trap 'exit 0' EXIT`, or `|| true` around the invocation all leave the text
+  // looking perfect while the gate stops being one.
+  const failed = spawn({ nodeStatus: 1 });
+  assert.notEqual(
+    failed.status,
+    0,
+    `${rel}: a FAILING checker must fail the step — that is the entire gate.\n${tail(failed.output)}`
+  );
+
+  // S3 — no merge commit AND mergeability never computed: after exhausting its attempts
+  // the guard reports a TIMING condition and the checker is NOT invoked. This is also
+  // what pins the invocation AFTER the guard.
+  const stuck = spawn({
+    ghResponses: Array.from({ length: 5 }, () => ghResponse("", "null")),
+  });
+  assert.notEqual(stuck.status, 0, `${rel}: an empty merge_commit_sha must fail closed`);
+  assert.equal(
+    stuck.nodeArgv,
+    "",
+    `${rel}: the checker must not run when there is no merge commit to validate`
+  );
+  assert.equal(
+    ghCalls(stuck).length,
+    3,
+    `${rel}: the unresolved case must exhaust exactly 3 attempts — not 1 (no retry) and not more`
+  );
+  // THE BACKOFF IS ASSERTED EXACTLY, not bounded. Without it the retry is three back-to-back
+  // reads, which cannot help a computation that needs TIME — and that mutation was GREEN before
+  // this assertion existed. `['2','4']` pins the floor AND the ceiling: no sleep is wrong, and a
+  // sleep after the final attempt (12 s instead of 6 s) is wrong too.
+  assert.deepEqual(
+    stuck.sleeps,
+    ["2", "4"],
+    `${rel}: the retry must wait 2 s then 4 s, and must NOT sleep after the LAST attempt — ` +
+      `got ${JSON.stringify(stuck.sleeps)}`
+  );
+  // THE COUNT IN THE MESSAGE IS ASSERTED TOO. The number is the one fact in the diagnosis a
+  // reader uses to judge how hard the leg tried, and a stray off-by-one there was GREEN before
+  // this assertion existed.
+  assert.match(
+    stuck.output,
+    /after 3 attempt\(s\)/,
+    `${rel}: the diagnosis must report the number of attempts ACTUALLY made (3)`
+  );
+  assert.ok(
+    ghCalls(stuck).every((a) => a === EXPECTED_GH_ARGV),
+    `${rel}: every attempt must be the pinned resolution call`
+  );
+  assert.ok(
+    !/CONFLICTS/.test(stuck.output),
+    `${rel}: ... and must NOT assert a conflict GitHub never reported`
+  );
+
+  // S3c — a CLOSED PR. `edited` is in the trigger set, so editing a closed PR's body runs this
+  // leg; mergeability stays null forever for it, so the guard must stop after ONE call and say
+  // there is nothing to validate rather than report a conflict or a timing window.
+  const notOpen = spawn({ ghResponses: [ghResponse("", "null", "closed")] });
+  assert.notEqual(notOpen.status, 0, `${rel}: a non-open PR must fail closed`);
+  assert.equal(notOpen.nodeArgv, "", `${rel}: the checker must not run for a non-open PR`);
+  assert.equal(
+    ghCalls(notOpen).length,
+    1,
+    `${rel}: a non-open PR cannot become mergeable by waiting — one attempt, no retry`
+  );
+  assert.ok(!/CONFLICTS/.test(notOpen.output), `${rel}: a closed PR is not a conflict`);
+  assert.notEqual(
+    notOpen.output,
+    stuck.output,
+    `${rel}: "not open" and "no merge commit yet" must not be interchangeable`
+  );
+
+  // S3d — the OBSERVED closed shape WITH mergeable=false (PR 680). STATE MUST WIN: the state
+  // check precedes the mergeable check, so this must NOT be reported as a conflict. Telling an
+  // author to resolve conflicts on a PR that is already closed is precisely the wrong diagnosis.
+  // Pinned because the message-side precedence was otherwise unasserted: swapping the message
+  // branch condition to the sha check stayed GREEN and produced CONFLICTS for this input.
+  const closedConflicted = spawn({ ghResponses: [ghResponse("", "false", "closed")] });
+  assert.notEqual(closedConflicted.status, 0, `${rel}: a closed PR must fail closed`);
+  assert.equal(
+    ghCalls(closedConflicted).length,
+    1,
+    `${rel}: a closed PR cannot become mergeable by waiting — one attempt`
+  );
+  assert.ok(
+    !/CONFLICTS/.test(closedConflicted.output),
+    `${rel}: a CLOSED PR must not be reported as a conflict even when mergeable=false — the ` +
+      "state check precedes the mergeable check"
+  );
+  assert.match(
+    closedConflicted.output,
+    /not open/,
+    `${rel}: the closed-PR diagnosis must say the PR is not open`
+  );
+  // (`closedConflicted` vs `conflicted` and `notOpen` vs `conflicted` are asserted after S3b,
+  // where `conflicted` exists — they were placed here first and hit a TDZ error.)
+
+  // S3b — mergeable === false: GitHub HAS finished and concluded the trees cannot
+  // merge. Reported on the FIRST call with the conflict message and NOT retried — an
+  // extra attempt cannot change a decided conflict, it only delays the diagnosis.
+  const conflicted = spawn({ ghResponses: [ghResponse("", "false")] });
+  assert.notEqual(conflicted.status, 0, `${rel}: a real conflict must fail closed`);
+  assert.equal(conflicted.nodeArgv, "", `${rel}: the checker must not run on a real conflict`);
+  assert.equal(
+    ghCalls(conflicted).length,
+    1,
+    `${rel}: a DECIDED conflict must be reported on the first call — retrying cannot help`
+  );
+  assert.match(conflicted.output, /CONFLICTS/, `${rel}: a decided conflict must be named as one`);
+  assert.notEqual(
+    conflicted.output,
+    stuck.output,
+    `${rel}: "conflicts" and "still computing" must not be interchangeable — reporting a timing ` +
+      "window as a conflict is the bug this test exists for"
+  );
+  // The TWO remaining pairs of the four canonical outputs, asserted here because `conflicted`
+  // does not exist earlier in the test. A previous revision claimed "all six pairs" while
+  // `notOpen` vs `conflicted` had no assertion at all.
+  assert.notEqual(
+    notOpen.output,
+    conflicted.output,
+    `${rel}: "this PR is not open" and "CONFLICTS with its base" must not be interchangeable — ` +
+      "telling an author to resolve conflicts on a closed PR is the wrong diagnosis"
+  );
+  assert.notEqual(
+    closedConflicted.output,
+    conflicted.output,
+    `${rel}: a CLOSED PR with mergeable=false and an OPEN conflict must not be interchangeable`
+  );
+
+  // S4 — an API failure MUST be distinguishable from an empty merge commit. Asserted
+  // as DIFFERENCE rather than by grepping the wording: the property that matters is
+  // that the two causes are not interchangeable (if they were, a 403 is being
+  // reported as a PR conflict), and pinning prose would red an honest copy-edit.
+  const apiFail = spawn({ ghMode: "fail" });
+  assert.notEqual(apiFail.status, 0, `${rel}: a failed API call must fail closed`);
+  assert.equal(apiFail.nodeArgv, "", `${rel}: the checker must not run when the API call failed`);
+  assert.deepEqual(
+    ghCalls(apiFail),
+    [EXPECTED_GH_ARGV],
+    `${rel}: a failed API call must still be the pinned resolution call, and must NOT be retried ` +
+      "as though the PR were the problem"
+  );
+  assert.notEqual(
+    apiFail.output,
+    stuck.output,
+    `${rel}: an API failure and a still-uncomputed mergeability must produce DIFFERENT messages — ` +
+      "if they are interchangeable, a 403/network failure is reported as a timing window"
+  );
+  assert.notEqual(
+    apiFail.output,
+    conflicted.output,
+    `${rel}: an API failure must not be reported as a PR conflict either`
+  );
+
+  // Every failure path must DIAGNOSE, and the four canonical messages must be distinguishable —
+  // FOUR cases is SIX pairs, and an unasserted pair is a swap that stays GREEN. All six are now
+  // asserted explicitly: stuck/notOpen, stuck/conflicted, stuck/apiFail, notOpen/apiFail,
+  // conflicted/apiFail, and notOpen/conflicted. The loop below asserts only that each path SAYS
+  // something — a previous revision described it as covering "the rest of the pairs", which it
+  // never did.
+  for (const [label, r] of [
+    ["the unresolved case", stuck],
+    ["a closed PR", notOpen],
+    ["a decided conflict", conflicted],
+    ["an API failure", apiFail],
+  ]) {
+    assert.ok(
+      r.output.trim() !== "",
+      `${rel}: ${label} must say WHY it failed — a silent non-zero exit is not a diagnosis`
+    );
+  }
+  assert.notEqual(
+    notOpen.output,
+    apiFail.output,
+    `${rel}: "this PR is not open" and "the API call failed" must not be interchangeable — a ` +
+      "403 would otherwise read as a closed PR"
   );
 });
 
@@ -2550,7 +3348,7 @@ test("head-ref tree: a truncated tree payload throws (fail-closed) (#675 P1-2)",
 });
 
 /** Build a stubbed `gh` (git tree + git blobs) and run the REAL --head-ref CLI against it. */
-function runHeadRefWithStub(treeObj, blobMap) {
+function runHeadRefWithStub(treeObj, blobMap, flagStyle = "space") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pin-headref-stub-"));
   const bin = path.join(dir, "bin");
   const blobDir = path.join(dir, "blobs");
@@ -2584,15 +3382,17 @@ function runHeadRefWithStub(treeObj, blobMap) {
   fs.chmodSync(stub, 0o755);
   const treePath = path.join(dir, "tree.json");
   fs.writeFileSync(treePath, JSON.stringify(treeObj));
+  const headSha = "a".repeat(40);
+  // #858 P1 — the `=` spelling is the conventional form (`--head-ref=$SHA`). Running it
+  // through the same stub proves it is HONOURED, not merely refused: if it were still
+  // ignored, this spawn would run the local suite and exit 0.
+  const argv =
+    flagStyle === "equals"
+      ? [`--head-ref=${headSha}`, "--repo=owner/repo"]
+      : ["--head-ref", headSha, "--repo", "owner/repo"];
   return spawnSync(
     process.execPath,
-    [
-      path.join(REPO_ROOT, "scripts", "check-pi-pin-lockstep.mjs"),
-      "--head-ref",
-      "a".repeat(40),
-      "--repo",
-      "owner/repo",
-    ],
+    [path.join(REPO_ROOT, "scripts", "check-pi-pin-lockstep.mjs"), ...argv],
     {
       encoding: "utf8",
       env: {
@@ -3596,6 +4396,125 @@ test("the live workflow corpus parses (the subset is adequate for this repo)", (
 // inside a try/catch that sets `process.exitCode = 1`. Both injection points are
 // exercised — mid-suite (the old fixture) and the TOP of the module body, which is
 // the earliest point the handler can catch.
+// #858 — A USAGE ERROR MUST NOT BECOME LOCAL-SUITE MODE.
+// Any invocation that is not a well-formed one used to fall through to "not in --head-ref
+// mode", which runs THIS suite and exits 0. Measured against `origin/main`'s script: EIGHT of
+// the eleven forms below ran the local suite and exited 0 — not all eleven. The other three
+// (an explicitly empty value, another flag where the value belongs, a duplicated `--head-ref`)
+// reached `runHeadRefMode` with a bad value and exited 2 from the SHA validator, so they were
+// already refused; they are in the table because the fix must not regress them. The
+// unquoted-empty-variable form is the one a real caller hits (the shell drops the argument
+// entirely, so the flag looks absent); the `=` and near-miss spellings are what the first fix
+// attempt still missed, because it matched the exact token `--head-ref`.
+test("--head-ref with a missing or empty value fails CLOSED instead of running the local suite (#858)", () => {
+  const suite = path.join(REPO_ROOT, "scripts", "check-pi-pin-lockstep.mjs");
+  const NO_VALUE = /was passed with no usable value/;
+  const UNKNOWN = /unrecognised argument/;
+  // [label, argv, expected-message regex]
+  const cases = [
+    ["no value at all", ["--head-ref"], NO_VALUE],
+    ["an explicitly empty value", ["--head-ref", ""], NO_VALUE],
+    ["another flag where the value belongs", ["--head-ref", "--repo", "o/r"], NO_VALUE],
+    ["the `=` form with an empty value", ["--head-ref="], NO_VALUE],
+    ["a near-miss spelling (--headRef)", ["--headRef", "abc"], UNKNOWN],
+    ["a single-dash spelling (-head-ref)", ["-head-ref", "abc"], UNKNOWN],
+    ["a prefixed spelling (--head-refx)", ["--head-refx", "abc"], UNKNOWN],
+    ["a bare positional argument", ["abc"], UNKNOWN],
+    ["a flag this tool has never accepted", ["--version"], UNKNOWN],
+    ["a duplicated --head-ref", ["--head-ref", "a", "--head-ref", "b"], /more than once/],
+    ["--repo with no --head-ref", ["--repo", "o/r"], /without --head-ref/],
+  ];
+  for (const [label, args, expected] of cases) {
+    // The timeout is a DETECTOR, not just a guard: without the fix the child runs the
+    // local suite, so the one thing we must never do is read a timed-out child as
+    // "not zero, therefore fixed". A regression must surface as an explicit message.
+    const res = spawnSync(process.execPath, [suite, ...args], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      maxBuffer: 8 * 1024 * 1024,
+      timeout: 30_000,
+    });
+    const out = `${res.stdout ?? ""}${res.stderr ?? ""}`;
+    assert.notEqual(
+      res.error?.code,
+      "ETIMEDOUT",
+      `${label}: RAN THE LOCAL SUITE instead of refusing — it never finished, which is the ` +
+        "fail-open this test exists for (#858)"
+    );
+    assert.equal(res.error ?? null, null, `${label}: could not spawn the suite (${res.error?.message})`);
+    // The EXACT code is asserted, not "non-zero". `assert.notEqual(status, 0)` is TRUE for
+    // `status === null`, which is what a spawn failure or a signal-killed child produces — the
+    // same anti-pattern this file documents and fixes for `assertStepCanFail`. Pinning 2 also
+    // makes the runtime shape assertion observable: a wrongly-built parse result exits 3.
+    assert.equal(res.signal ?? null, null, `${label}: the child must not be killed by a signal`);
+    assert.equal(
+      res.status,
+      2,
+      `${label}: must FAIL CLOSED with the documented usage-error code 2 (3 means the parse ` +
+        `result was built without the null headRef/repo shape, and 0 is the fail-open this ` +
+        `test exists for). status=${res.status}`
+    );
+    assert.match(
+      out,
+      expected,
+      `${label}: the refusal must say what was wrong (expected ${expected}), not just exit non-zero`
+    );
+    assert.ok(
+      !/ALL TESTS PASSED/.test(out),
+      `${label}: must NOT run the local suite — running it is the fail-open`
+    );
+    // Pin that the refusal is not followed by a report about a suite that never ran. The
+    // refusal exits before the `exit` handler is registered, so this output must be ONLY
+    // the refusal. It cannot be pinned through the handler in either direction: with the
+    // error path's `headRef: null` the handler would reach `finalize()` and throw on the TDZ
+    // binding, and with a bare `{ error }` it would early-return instead — and neither is
+    // reachable from here, because `process.exit(2)` precedes both. The runtime assertion in
+    // the refusal block is what makes the shape observable, via its exit code of 3.
+    assert.ok(
+      !/passed, \d+ failed/.test(out) && !/floor and roster were initialized/.test(out),
+      `${label}: the refusal must not be followed by a summary of a suite that never ran. ` +
+        `Got: ${JSON.stringify(out.slice(0, 200))}`
+    );
+  }
+});
+
+// #858 P1 — the first fix matched the exact token `--head-ref`, so `--head-ref=<sha>` was
+// still invisible and still fell through to local-suite mode. This is the counter-test:
+// the `=` spelling must be HONOURED end-to-end (stubbed, so it runs no PR content and
+// touches no network), not merely refused.
+test("the `=` spelling of --head-ref is HONOURED end-to-end, not ignored (#858 P1)", () => {
+  const res = runHeadRefWithStub(
+    {
+      truncated: false,
+      tree: [
+        { path: ".github/workflows/ci.yml", mode: "100644", type: "blob", sha: "c" },
+        { path: ".github/workflows/node-ci.yml", mode: "100644", type: "blob", sha: "n" },
+        { path: ".github/workflows/ci-main.yml", mode: "100644", type: "blob", sha: "m" },
+      ],
+    },
+    { c: FIXTURE_CALLER, n: FIXTURE_CALLEE, m: FIXTURE_CI_MAIN },
+    "equals"
+  );
+  assert.equal(
+    res.status,
+    0,
+    `\`--head-ref=<sha>\` must be honoured and GREEN on a valid tree; got status ${res.status}, ` +
+      `stdout=${JSON.stringify(res.stdout)}, stderr=${JSON.stringify(res.stderr)}`
+  );
+  assert.match(
+    res.stdout,
+    /still satisfy the narrow structural guard/,
+    "the `=` form must reach --head-ref mode (if it were ignored, this would be a local-suite run)"
+  );
+});
+
+// #858 — NOTE ON THE REMOVED STRUCTURAL TEST. An earlier revision pinned the parse-error shape
+// by reading this file's own source and asserting there is no literal `return {` in `parseArgs`.
+// Review cycle 3 falsified it: the same defect written as `const bare = { error }; return bare;`
+// evaded the regex and left the suite GREEN. A regex over source is not enforcement. It is
+// replaced by the runtime assertion in the refusal block (exit 3) plus the `status === 2`
+// assertion in the test above — both behavioural, and neither claims more than it checks.
+
 test("an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)", () => {
   const injections = [
     [

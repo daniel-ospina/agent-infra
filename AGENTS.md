@@ -113,16 +113,18 @@ These conditions define a **clean completion** only. A convergence, stall, abort
 
 #### Hard Cap
 
-**The skill's own bound always governs — this file only supplies a fallback.** The `proportional-gates` skill holds the **canonical** proportional table (Low → skip; Low-Medium → **3**; Medium-High → **5**; High → **10**), and most convergence-gated skills use a **10-cycle safety cap** (`code-review`, `test-review`, `epic-plan`, `verification-before-completion` are examples — **not an exhaustive list**). Other skills carry their own bounds, all of them governing over the fallback (`prototype-review` 5, 3 in React-diff mode; the `research` Step-5.5 verifier 2; the second-model gates in `code-review`, `plan-review` and `issue-scoping` 2; `codebase-audit` 3). The `subagent-driven-development` final reviewer is also a second-model gate but states no cycle bound of its own, so the fallback **10** governs it. A skill that says "no hard cap" but states a safety cap is **still governed by that cap** — "no hard cap" means no quality-gate ceiling, not no runaway guard. Only when a skill states no bound of any kind does the fallback **10** apply, and a skill that **explicitly declares itself uncapped** (`carousel-designer` — "No Cycle Cap … No arbitrary cap") is never capped by this file, and its own stop rules govern.
+**The skill's own bound always governs — this file only supplies a fallback.** The `proportional-gates` skill holds the **canonical** proportional table (Low → skip; Low-Medium → **3**; Medium-High → **5**; High → **10**), and most convergence-gated skills use a **10-cycle safety cap** (`code-review`, `test-review`, `epic-plan`, `verification-before-completion` are examples — **not an exhaustive list**). Other skills carry their own bounds, all of them governing over the fallback (`prototype-review` 5, 3 in React-diff mode; the `research` Step-5.5 verifier 2; `codebase-audit` 3). The `subagent-driven-development` final reviewer states no cycle bound of its own, so the fallback **10** governs it. A skill that says "no hard cap" but states a safety cap is **still governed by that cap** — "no hard cap" means no quality-gate ceiling, not no runaway guard. Only when a skill states no bound of any kind does the fallback **10** apply, and a skill that **explicitly declares itself uncapped** (`carousel-designer` — "No Cycle Cap … No arbitrary cap") is never capped by this file, and its own stop rules govern.
 
-This is a **runaway guard, not a quality gate** — review cycles are how quality gets produced, so do not treat the cap as a target, and do not stop early because the count "feels high". Stop on (a) a clean exit (the skill's clean verdict — `NO ISSUES FOUND`, or its defined equivalent), (b) **convergence as the running skill defines it** (issues are a strict subset of the previous cycle's — no new dimensions or files; some skills define this only at their safety cap, e.g. `epic-plan`), (c) a stall signal the skill defines (`fingerprint-stall`, `honest-stuck`, `zero-progress`, stall-guard), (d) an abort the skill defines (`tool-unavailable`, `git-error`, `pr-closed`, fixer push failure), or (e) the bound. Never apply a bound tighter than the skill's own.
+**One domain bounds by surface, not by count: the adversarial domain** (gate/enforcement code whose correctness is "an attacker cannot make it fail open" — argv/path/symlink resolution, working-tree discard, merge and verification gates). Its bound is **the declared threat surface, not reviewer exhaustion: 2 cycles** — the skill's own bound for that domain, canonical in `proportional-gates`, so the paragraph above still governs (this file imposes nothing tighter). Scoping declares the in-scope bypass classes and the classes explicitly out of scope; acceptance is **every declared class covered by a test + green CI**, not "the reviewer ran out of ideas". Residuals are **filed from cycle 1, not chased** — findings outside the declared surface are follow-up issues by default. A fresh reviewer that reproduces no in-scope bypass and confirms the declaration is covered exits `THREAT SURFACE COVERED` — this domain's defined clean equivalent. **When a merge rests on threat-list coverage rather than a literal `NO ISSUES FOUND`, say so plainly** in the PR body and the report (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`); never present a bounded exit as an unbounded clean one. <!-- adversarial-bound: cap=2 -->
+
+This is a **runaway guard, not a quality gate** — review cycles are how quality gets produced, so do not treat the cap as a target, and do not stop early because the count "feels high". Stop on (a) a clean exit (the skill's clean verdict — `NO ISSUES FOUND`, or its defined equivalent), (b) **convergence as the running skill defines it** (issues are a strict subset of the previous cycle's — no new dimensions or files; some skills define this only at their safety cap, e.g. `epic-plan`), (c) a stall signal the skill defines (`fingerprint-stall`, `honest-stuck`, `zero-progress`), (d) an abort the skill defines (`tool-unavailable`, `git-error`, `pr-closed`, fixer push failure), or (e) the bound. Never apply a bound tighter than the skill's own.
 
 The bound applies to the **gate** — the loop, or the area under review — not to an individual reviewer process. Count every cycle (review round) for that gate — not every reviewer process: **dispatching a fresh reviewer does not reset, extend, or replenish the budget.** The fresh-context rule exists to defeat confirmation bias, not to hand the loop a new counter — a gate that has spent its bound has spent it no matter how many distinct reviewer processes were involved. A fresh reviewer is a new *reviewer*, never a new *loop*.
 
 **(b)–(e) are escalation exits, not completions.** They do not satisfy the Exit Conditions above, and the loop must never be reported or handed off as clean or complete **while issues remain** (if the skill's own recovery path resolves them all and a fresh reviewer returns the clean verdict, that is a clean completion under (a)). (Where a skill labels its *zero-issue* exit "convergence" — e.g. `prototype-review` — that is a clean exit under (a), not this rule.) On a non-clean exit → **escalate** — to the orchestrator agent, or to a human wherever a skill requires one (the Auto-Continue pause conditions apply in addition). Document the remaining issues, then follow the skill's own path for that exit **first** — including any mandatory orchestrator recovery (`code-review` Step 6.5, `plan-review`'s deep-fix attempt) — and post **the exact marker the skill's own exit table defines at the point that path specifies**, where it defines one (`code-review` cap → `⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain; escalate to a human`; `test-review` cap → `⚠️ Test review capped at 10 cycles — N issues remain:`). Where the skill defines no marker for that exit, post `⚠️ <the skill's own name for the exit> after N cycles — M issues remain` and record the exit under the skill's own name. Use the skill's own label verbatim — do not invent a cap label for a convergence or stall exit, and do not relabel an exit the skill itself names otherwise:
 
 - **Paths that require a human** (non-exhaustive: `plan-review` → Requires Human Input; `carousel-b2b-copy` → BLOCKED; `code-review` → its convergence exit needs human acknowledgement and its cap/stall exit surfaces to a human via its Step 6.5 recovery; `test-writing` → halts while a P0 remains): **do not proceed past that skill's own halt point.**
-- **Paths that log-and-proceed** (`epic-plan`, `test-review`, `meta-framework-research`'s 3-cycle stall rule, `test-writing` when only P1/P2 remain — **non-exhaustive**): continue **only** with the skill's own marker posted where it defines one, and the remaining issues — including any P0 — recorded in the artifact, exactly as the skill directs. A capped exit is never described as clean or complete.
+- **Paths that log-and-proceed** (`epic-plan`, `test-review`, `meta-framework-research`'s 3-cycle stall rule, `code-review`'s `adversarial-capped` exit — bounded by the declared threat surface, its `[ADVERSARIAL-BOUND]` disclosure being the marker — `test-writing` when only P1/P2 remain — **non-exhaustive**): continue **only** with the skill's own marker posted where it defines one, and the remaining issues — including any P0 — recorded in the artifact, exactly as the skill directs. A capped exit is never described as clean or complete.
 
 #### FORBIDDEN — These Bypass the Quality Gate Entirely
 
@@ -175,11 +177,43 @@ This applies even for "obvious" fixes — the cost of a wrong diagnosis is highe
 
 Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context → construct their prompts with exactly what they need.
 
-**⛔ Model override prohibition:** Do NOT pass `model: "claude-sonnet"` or any non-DeepSeek model to the `task` tool. Only DeepSeek is configured for general use; see the second-model-gate exception below. Overriding will cause the sub-agent to fail with "No API key found for anthropic."
-
-**Second-model gate exception (#284):** the second-model review gates (issue-scoping §5.6 coherence check, code-review §6.6 + plan-review §4.5 final gates, subagent-driven-development final code reviewer) may dispatch `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous). Non-DeepSeek second models (e.g., kimi-k3, qwen3.8-max after re-enable) are permitted ONLY via an explicit `$SECOND_MODEL` override; when the configured second model is unavailable, dispatch the tool default and annotate `[SECOND-MODEL-GATE] stand-in` — never silently substitute, and never use a non-DeepSeek second model without the env override. **#512 cold-class carve-out:** the venice cold-class seam (`COLD_CLASS_PROVIDER`, docs/providers.md §8) is an operator override SEPARATE from `$SECOND_MODEL` — it applies ONLY to default-leg (flash) cache-cold reviewer/eval dispatches an operator has explicitly opted in; it never authorizes a non-DeepSeek or venice-served second-model gate run. Second-model gates route venice only when `$SECOND_MODEL` itself resolves there. **#476 provider-failover interplay:** the failover's exhaustion hops (deepseek → openrouter/qwen-tp serving name-compatible deepseek ids) are the framework's own dispatch change and leave `$SECOND_MODEL` untouched — the gate's role fidelity is preserved. Annotation rule when the failover is active: same provider id on a different leg is NOT the same pinned version — a `[SECOND-MODEL-GATE]` dispatch that lands on a hop leg (deepseek→openrouter re-serve of the same id, or the qwen-tp `deepseek-v4-flash-0731` rename once qwen-tp is unblocked) MUST be annotated `[#476 hop-leg]`; never present a hop-leg run as the configured second model.
+**⛔ Model override prohibition:** Do NOT pass `model: "claude-sonnet"` or any non-DeepSeek model to the `task` tool. Only DeepSeek is configured for general use. Overriding will cause the sub-agent to fail with "No API key found for anthropic."
 
 <!-- REPO-SPECIFIC: Add tool-specific exceptions here (e.g., design_reviewer for Claude Opus) -->
+
+## Durable Dispatch Record & Task-Session Retention (#783)
+
+**Every builtin `task` dispatch that settles abnormally writes one immutable outcome row**
+— one row per spawn *attempt*, not per dispatch. The row identity is
+**`dispatchId` + `childSessionId` + `attempt`** — never `dispatchId` + `attempt`, because
+`attempt` is a **per-leg** ordinal: `retry()` restarts it at 1 on every leg (primary, each
+failover hop, and the provider-fallback leg), so a multi-leg walk writes several `attempt=1`
+rows under one `dispatchId`. (On the `--no-session` degrade, `childSessionId` is null for
+every attempt, so the identity degrades to `dispatchId` + `attempt`.) Dispatches that settle
+successfully write no row — **except the success-but-silent settle** (exit 0, empty stdout,
+no `sessionEnded`), which is recorded as `reason: "clean-empty"` because it is
+indistinguishable from a silent loss to a ledger reader. The row lands in the
+**existing** dispatch ledger, `~/.pi/agent/audit/provider-failover.jsonl` (JSONL,
+`event: "dispatch-outcome"`; gate `DISPATCH_LEDGER`, default ON) — never a new file. Its
+`dispatchId` is the dispatch's `TASK_HEARTBEAT_NONCE`, so it joins the #512 usage and #476
+failover rows on one key in one file (#796 consumes it). The ledger is **append-only**: a written
+row can never be edited, so a reader that needs to **amend** an outcome must append a
+**follow-up row keyed by `dispatchId` + `childSessionId` + `attempt`** — never rewrite history.
+
+**Each dispatch also keeps its child's transcript** under `$TASK_SESSION_ROOT` (default
+`~/.pi/agent/task-sessions/`), a **mode 0700** root with one `<uuid>/` directory per spawn
+attempt.
+
+**Retention is owned, bounded, and dry-run by default.** Owner: **the organisation-design-team
+operator on call for agent-infra**. Bounds: `TASK_SESSION_MAX_AGE_DAYS` (7) **or**
+`TASK_SESSION_MAX_BYTES` (2 GiB), whichever binds first, evicting oldest-non-live first. The
+shipped job (`com.eldato.pi-task-session-prune`) is **DRY-RUN**;
+**arming it is a separate manual step owned by that operator** (with a dated trigger). Until it is
+armed the bounds do not bind — a known, accepted state, not a silent one.
+
+**Tolerance rule:** rows written by other framework versions may **lack identity fields**
+(`dispatchId`, `childSessionId`, `attempt`, `dispatchClass`). Readers must **tolerate absent
+fields** and must not throw on a missing one.
 
 ## Batch Implementation & Parallel Dispatch
 

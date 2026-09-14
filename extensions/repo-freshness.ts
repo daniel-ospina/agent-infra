@@ -25,12 +25,15 @@
 //
 // Self-contained by default: only the ExtensionAPI type is imported — except
 // shared helpers (./shared/print-mode.js; the #5611 sibling-import constraint
-// is stale for the current jiti/static loader, verified 2026-08-13).
+// is stale for the current jiti/static loader, verified 2026-08-13) and the
+// session-checks exec seam used by asyncRepoState (#783 Task 2 — reusing the
+// existing promisified execFile rather than adding a second wrapper).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { isPrintMode } from "./shared/print-mode.js";
+import { execFileAsync, type ExecFn } from "./session-checks.js";
 
 // ── Knobs ───────────────────────────────────────────────────────────────
 
@@ -109,6 +112,11 @@ export function defaultBranch(cwd: string): string {
 export function currentBranch(cwd: string): string | null {
   const b = tryGit(cwd, "branch --show-current");
   return b === null || b === "" ? null : b;
+}
+
+/** HEAD sha; null when undetermined (git missing / not a repo). */
+export function headSha(cwd: string): string | null {
+  return tryGit(cwd, "rev-parse HEAD");
 }
 
 /**
@@ -289,6 +297,81 @@ export function indexLocked(cwd: string): boolean {
   if (!gitDir) return false;
   const abs = gitDir.startsWith("/") ? gitDir : `${cwd}/${gitDir}`;
   return existsSync(`${abs}/index.lock`);
+}
+
+// ── Async repo state (#783 Task 2 — off the heartbeat path) ─────────────
+
+/** Repo-state snapshot for the task handoff payload (#783 Task 2). */
+export interface RepoState {
+  /** Current branch; null on detached HEAD (or when undetermined). */
+  branch: string | null;
+  /** HEAD sha; null when undetermined. */
+  headSha: string | null;
+  /** Any uncommitted change (tracked or untracked); **null when the status
+   * probe failed — UNKNOWN, never reported as a confident `clean`**. A handoff
+   * payload that says "clean" when it could not observe the tree is the
+   * dangerous direction, so the probe failure propagates as null. */
+  dirty: boolean | null;
+  /** Porcelain paths (a rename/copy contributes only its new path); null when
+   * the status probe failed (unknown, not "no paths"). */
+  paths: string[] | null;
+}
+
+/** Parse `git status --porcelain -z`: entries are `XY<space>PATH`,
+ * NUL-terminated; rename/copy entries are followed by a second NUL-terminated
+ * ORIG_PATH which must not be counted as a changed path. */
+export function parsePorcelainZ(out: string): string[] {
+  const parts = out.split("\0");
+  const paths: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i];
+    if (entry.length < 4) continue; // "XY p" minimum
+    paths.push(entry.slice(3));
+    const status = entry.slice(0, 2);
+    if (status[0] === "R" || status[0] === "C") i++; // skip ORIG_PATH
+  }
+  return paths;
+}
+
+/**
+ * Async { branch, headSha, dirty, paths } probe — called ONCE per dispatch at
+ * spawn and cached on the dispatch; NEVER from the 10s heartbeat. The
+ * synchronous readers above use `execSync` (tryGit); running them per tick
+ * would block the parent's event loop every 10s mid-dispatch.
+ *
+ * Returns null when nothing could be determined (git missing, not a repo,
+ * aborted) — callers render `unknown`, never throw. `exec` is a test seam
+ * (defaults to session-checks' `execFileAsync`, which takes an AbortSignal).
+ */
+export async function asyncRepoState(
+  cwd: string,
+  opts: { signal?: AbortSignal; exec?: ExecFn } = {},
+): Promise<RepoState | null> {
+  const exec = opts.exec ?? execFileAsync;
+  const run = (args: string[]) =>
+    exec("git", ["-C", cwd, ...args], { timeoutMs: 10_000, signal: opts.signal });
+  try {
+    const [branchRes, shaRes, statusRes] = await Promise.all([
+      run(["branch", "--show-current"]),
+      run(["rev-parse", "HEAD"]),
+      run(["status", "--porcelain", "-z"]),
+    ]);
+    if (branchRes.code !== 0 && shaRes.code !== 0 && statusRes.code !== 0) return null;
+    // A failed status probe MUST NOT become a confident `dirty=false` (#783
+    // review): `paths = []` would render `dirty=false dirtyPaths=0` for a tree
+    // nobody actually observed. Report the two status-derived fields as null
+    // (UNKNOWN) so the render shows `dirty=unknown dirtyPaths=unknown`.
+    const statusOk = statusRes.code === 0;
+    const paths = statusOk ? parsePorcelainZ(statusRes.stdout) : null;
+    return {
+      branch: branchRes.code === 0 ? branchRes.stdout.trim() || null : null,
+      headSha: shaRes.code === 0 ? shaRes.stdout.trim() || null : null,
+      dirty: paths === null ? null : paths.length > 0,
+      paths,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** Default branch checked out in any worktree ≠ current checkout → true.

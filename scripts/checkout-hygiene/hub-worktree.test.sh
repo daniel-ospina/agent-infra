@@ -23,7 +23,7 @@ ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
 assert_contains() { # <haystack> <needle> <label>
-  if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi
+  if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
 assert_eq() { # <actual> <expected> <label>
   if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', want '$2')"; fi

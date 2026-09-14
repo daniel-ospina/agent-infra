@@ -86,17 +86,42 @@ closing_issue_refs() {
 
 # ── main (guarded — executable when run, inert when sourced for tests) ────
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-# Scan args for --force-stale (any position); everything else stays
-# positional.
-FORCE_STALE=0
-POSITIONAL=()
-for _arg in "$@"; do
-  if [ "$_arg" = "--force-stale" ]; then
-    FORCE_STALE=1
-  else
-    POSITIONAL+=("$_arg")
+# ── #980: the second-model subsystem was removed ────────────────────────
+# These env vars used to feed the [SECOND-MODEL-GATE] marker. Ignoring them
+# SILENTLY would write a plain `clean` record while the caller believes
+# second-model evidence was captured — a false green. Refuse instead.
+for _v in SECOND_MODEL_GATE_MODEL SECOND_MODEL_GATE_INDEPENDENT; do
+  if [ -n "${!_v:-}" ]; then
+    echo "record-review.sh: \$${_v} is set, but the second-model gate was removed (#980/#979) — it would be silently ignored, so this record would not carry the evidence you expect. Unset it and re-run." >&2
+    exit 2
   fi
 done
+
+# Scan args for --force-stale (any position); everything else stays
+# positional — but an UNKNOWN option is REFUSED, never silently dropped.
+# Only $1..$4 are read, so a dropped trailing flag used to shift the repo
+# position and still write a record with rc=0.
+FORCE_STALE=0
+POSITIONAL=()
+_argv=("$@")
+_i=0
+while [ "$_i" -lt "${#_argv[@]}" ]; do
+  _arg="${_argv[$_i]}"
+  case "$_arg" in
+    --force-stale) FORCE_STALE=1 ;;
+    --second-model|--second-model-independent)
+      echo "record-review.sh: '$_arg' was removed with the second-model subsystem (#980/#979) — this repo is single-model; refusing to record. Drop it from the invocation." >&2
+      exit 2 ;;
+    -*) echo "record-review.sh: unknown option '$_arg' — the second-model gate was removed (#980/#979). usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]" >&2
+        exit 2 ;;
+    *) POSITIONAL+=("$_arg") ;;
+  esac
+  _i=$((_i + 1))
+done
+if [ "${#POSITIONAL[@]}" -gt 4 ]; then
+  echo "record-review.sh: too many arguments (${#POSITIONAL[@]}) — usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]" >&2
+  exit 2
+fi
 if [ "${#POSITIONAL[@]}" -gt 0 ]; then
   set -- "${POSITIONAL[@]}"
 else
@@ -199,11 +224,11 @@ if [ "$VERDICT" = "clean-micro" ]; then
             echo "⚠️ clean-micro tier guard: could not fetch labels of $ref — that ref is undeterminable (record proceeds unless another ref is non-micro)" >&2
             continue
           fi
-          if printf '%s\n' "$LABELS" | grep -q '^complexity:micro$'; then
+          if grep -q '^complexity:micro$' <<<"$LABELS"; then
             MICRO_SEEN=1
             continue
           fi
-          if printf '%s\n' "$LABELS" | grep -qE '^complexity:' ; then
+          if grep -qE '^complexity:' <<<"$LABELS"; then
             OFFENDING_LABEL="$(printf '%s\n' "$LABELS" | grep -E '^complexity:' | head -1)"
             REFUSED=1
             echo "❌ clean-micro tier guard: $REPO#$PR closes $ref, whose complexity label is \"$OFFENDING_LABEL\" — clean-micro certifies the MICRO process only and is REFUSED for a non-micro linked issue." >&2
@@ -308,13 +333,17 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
   # not silently skip the evidence post; the gate would fail with no trace).
-  if ! printf '%s' "$BODY" | grep -qF "$MARKER"; then
+  MISSING=""
+  if ! grep -qF "$MARKER" <<<"$BODY"; then
+    MISSING="$MARKER"
+  fi
+  if [ -n "$MISSING" ]; then
     if [ -n "$BODY" ]; then
       NEWBODY="${BODY}
 
-${MARKER}"
+${MISSING}"
     else
-      NEWBODY="$MARKER"
+      NEWBODY="$MISSING"
     fi
     jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
       | gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \

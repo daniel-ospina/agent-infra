@@ -24,7 +24,7 @@ assert_eq() {
     if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi
 }
 assert_contains() {
-    if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi
+    if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
 
 T="$(mktemp -d /tmp/record-review-test.XXXXXX)"
@@ -44,20 +44,24 @@ cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
 if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
-    # PATCH body — read stdin, swallow
-    cat >/dev/null
+    # PATCH body — capture stdin when GH_STUB_PATCH_BODY is set (#716), else swallow
+    if [ -n "${GH_STUB_PATCH_BODY:-}" ]; then
+        cat > "$GH_STUB_PATCH_BODY"
+    else
+        cat >/dev/null
+    fi
     exit 0
 fi
 if [ "$1" = "api" ]; then
-    if printf '%s' "$*" | grep -qF -- "--jq .head.sha"; then
+    if grep -qF -- "--jq .head.sha" <<<"$*"; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
     fi
-    if printf '%s' "$*" | grep -qF -- "--jq .body"; then
+    if grep -qF -- "--jq .body" <<<"$*"; then
         printf '{"body": "%s"}' "${STUB_BODY:-PR body}"
         exit 0
     fi
-    if printf '%s' "$*" | grep -qF -- "--jq .[].name"; then
+    if grep -qF -- "--jq .[].name" <<<"$*"; then
         [ "${STUB_LABELS_FAIL:-0}" = "1" ] && exit 1
         num="$(printf '%s' "$*" | sed -n 's/.*issues\/\([0-9]*\)\/labels.*/\1/p')"
         if [ -n "$num" ] && [ -n "${STUB_LABELS_DIR:-}" ] && [ -f "${STUB_LABELS_DIR}/$num" ]; then
@@ -301,6 +305,95 @@ assert_contains "$OUT" "#42" "parser: narrative prose-verb class matches (parse_
 run_record_verdict clean-micro "" 424316
 [ "$RECORD_RC" = "0" ] && ok "repo-less clean-micro fails open (rc 0)" || bad "repo-less clean-micro (rc=$RECORD_RC)"
 assert_contains "$RECORD_ERR" "UNVERIFIED" "repo-less clean-micro warns the tier is unverified"
+
+# 9. #980 argv/env fail-closed guard ─────────────────────────────
+# The second-model flag/env surface was REMOVED. Its removal must fail CLOSED:
+# exit 2, a named message, and NO record written. The defect class it guards:
+# only $1..$4 are read, so a stale trailing flag was silently dropped and the
+# record was still written with rc=0 (a false green: the caller believes
+# evidence was captured; none was).
+# Adversarial-domain rule: every declared refusal class is covered by a test —
+# and the test must be REGRESSION-SENSITIVE, i.e. it must fail if the guard is
+# reverted. Two classes (9.2, 9.3) are ALSO caught downstream by the pre-existing
+# "repo must be owner/name" validator, so rc=2 alone would pass either way;
+# those groups therefore assert the NAMED message, which only the guard emits.
+# (Verified against the pre-change script: classes 1/4/5/6 fail without the
+# guard; 2/3 pass on rc alone and are only caught by the message assertion.)
+run_record_raw() { # <pr> <sha> [args...] verbatim; env via SM_ENV_MODEL / SM_ENV_IND
+    local pr="$1" sha="$2"; shift 2
+    local rcfile="$T/grc" errfile="$T/gerr"
+    : > "$errfile"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        [ -n "${SM_ENV_MODEL:-}" ] && export SECOND_MODEL_GATE_MODEL="$SM_ENV_MODEL"
+        [ -n "${SM_ENV_IND:-}" ]   && export SECOND_MODEL_GATE_INDEPENDENT="$SM_ENV_IND"
+        rc=0
+        bash "$RECORD" "$pr" "$sha" "$@" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    )
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+rec_path() { printf '%s/.pi/agent/reviews/daniel-ospina-agent-infra-%s.json' "$F_HOME" "$1"; }
+assert_refused() { # <pr> <label>
+    [ "$RECORD_RC" = "2" ] && ok "guard: $2 refuses (rc 2)" || bad "guard: $2 (rc=$RECORD_RC, want 2)"
+    if [ -f "$(rec_path "$1")" ]; then bad "guard: $2 wrote a record"; else ok "guard: $2 writes no record"; fi
+}
+
+# 9.1 full stale flag pair, trailing (the documented stale invocation).
+run_record_raw 424501 "$SHA" clean "daniel-ospina/agent-infra" \
+    --second-model openrouter/anthropic/claude-opus-4.8 --second-model-independent yes
+assert_refused 424501 "trailing --second-model pair"
+assert_contains "$RECORD_ERR" "second-model subsystem" "guard: refusal names the removed subsystem"
+
+# 9.2 the flag in the REPO slot. rc=2 alone does NOT prove the guard ran —
+# the pre-existing repo-format validator also refuses it — so this asserts the
+# guard's NAMED message, which is what a revert would remove.
+run_record_raw 424502 "$SHA" clean --second-model somewhere
+assert_refused 424502 "--second-model in the REPO slot"
+assert_contains "$RECORD_ERR" "second-model subsystem" \
+    "guard: REPO-slot refusal names the removed subsystem (not the repo-format error)"
+
+# 9.3 --second-model-independent alone (same downstream-fallback caveat as 9.2).
+run_record_raw 424503 "$SHA" clean --second-model-independent yes
+assert_refused 424503 "--second-model-independent alone"
+assert_contains "$RECORD_ERR" "second-model subsystem" \
+    "guard: --second-model-independent refusal names the removed subsystem"
+
+# 9.4 any other unknown dashed option.
+run_record_raw 424504 "$SHA" clean "daniel-ospina/agent-infra" --bogus-flag
+assert_refused 424504 "unknown option"
+assert_contains "$RECORD_ERR" "unknown option" "guard: unknown option is named"
+
+# 9.5 over-arity — the old parser truncated silently.
+run_record_raw 424505 "$SHA" clean "daniel-ospina/agent-infra" extra-positional
+assert_refused 424505 "five positionals"
+assert_contains "$RECORD_ERR" "too many arguments" "guard: over-arity is named"
+
+# 9.6 removed env var: SECOND_MODEL_GATE_MODEL (was silently ignored).
+SM_ENV_MODEL=openrouter/some-model run_record_raw 424506 "$SHA" clean "daniel-ospina/agent-infra"
+assert_refused 424506 "SECOND_MODEL_GATE_MODEL set"
+assert_contains "$RECORD_ERR" "SECOND_MODEL_GATE_MODEL" "guard: the offending env var is named"
+
+# 9.7 removed env var: SECOND_MODEL_GATE_INDEPENDENT.
+SM_ENV_IND=yes run_record_raw 424507 "$SHA" clean "daniel-ospina/agent-infra"
+assert_refused 424507 "SECOND_MODEL_GATE_INDEPENDENT set"
+assert_contains "$RECORD_ERR" "SECOND_MODEL_GATE_INDEPENDENT" "guard: the offending env var is named"
+
+# 9.8-9.10 positive controls — the guard must not break legitimate invocations.
+run_record_raw 424508 "$SHA" --force-stale clean "daniel-ospina/agent-infra"
+[ "$RECORD_RC" = "0" ] && ok "guard: --force-stale leading still records (rc 0)" || bad "guard: --force-stale leading (rc=$RECORD_RC)"
+[ -f "$(rec_path 424508)" ] && ok "guard: --force-stale leading wrote a record" || bad "guard: --force-stale leading wrote no record"
+
+run_record_raw 424509 "$SHA" clean "daniel-ospina/agent-infra" --force-stale
+[ "$RECORD_RC" = "0" ] && ok "guard: --force-stale trailing still records (rc 0)" || bad "guard: --force-stale trailing (rc=$RECORD_RC)"
+[ -f "$(rec_path 424509)" ] && ok "guard: --force-stale trailing wrote a record" || bad "guard: --force-stale trailing wrote no record"
+
+run_record_raw 424510 "$SHA" clean "daniel-ospina/agent-infra"
+[ "$RECORD_RC" = "0" ] && ok "guard: plain 4-positional form still records (rc 0)" || bad "guard: plain form (rc=$RECORD_RC)"
+[ -f "$(rec_path 424510)" ] && ok "guard: plain form wrote a record" || bad "guard: plain form wrote no record"
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"

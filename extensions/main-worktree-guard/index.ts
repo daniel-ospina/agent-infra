@@ -100,16 +100,29 @@
 // cannot retry its way past it.
 //
 // Degradation contract:
-//  - classify-git.mjs load failure → bash git guard degrades to warn-only
-//    (fail-safe, never false-blocks) while the write/edit guard stays fully
-//    enforced.
+//  - classify-git.mjs TOTAL load failure → the bash git guard degrades to
+//    non-blocking — one load-time warning, then every command passes silently
+//    (fail-safe, never false-blocks) — AND the write/edit gate fails OPEN. (A
+//    PARTIAL abort — the #744 shape — is different: it keeps whatever was bound
+//    before the abort point, so the gates bound earlier keep working.)
+//    The write/edit gate's target classification comes from the same import:
+//    `resolveTargetCheckout` stays `() => null` and `hasDotGitAncestor` stays
+//    `() => false`, so `_checkoutOf` returns null and the gate takes its
+//    "!tgtCheck → isolated by construction" branch and ALLOWS the write. The
+//    inert defaults are deliberate (a failed import must never false-block),
+//    but the consequence is that a load failure is a SILENT LOSS OF
+//    ENFORCEMENT, not a safe mode. Tracked as #761.
 //  - branch-ownership.mjs load failure → M1/M2/M3 are OFF (one-time warn) and
 //    the guard falls back to the frozen-legacy classifier for EVERY repo — no
-//    agent-infra exemption (#615); write/edit never depends on either module.
+//    agent-infra exemption (#615); write/edit never depends on THIS module (its
+//    classify-git dependency is the bullet above, #761).
 //  - isWorktreeCwd defaults are SPLIT: the bash path fails OPEN (() => true —
 //    a worktree lookalike is treated as isolated), the write/edit path fails
-//    CLOSED (() => false — an unverifiable target is treated as main and
+//    CLOSED (() => false — an unverifiable SESSION cwd is treated as main and
 //    blocked). This fixes the latent fail-open at the old shared default.
+//    Note this covers the SESSION-cwd checks only — the TARGET-classification
+//    path (`_checkoutOf`) is a separate input, and it is the one that fails
+//    open when the import degrades (first bullet, #761).
 // The TTL'd file-based escape marker (~/.pi/agent/.allow-main-edits, #207)
 // allows a deliberate mid-session escalation — see README.md.
 
@@ -122,9 +135,11 @@ import { homedir } from "node:os";
 import { isPrintMode } from "../shared/print-mode.js";
 import { appendJsonl } from "../shared/audit-log.js";
 
-// Shared destructive-git rules (also used by test.mjs). If the import ever
-// fails (jiti resolution edge case), the bash guard degrades to warn-only
-// while write/edit protection stays fully enforced.
+// Shared destructive-git rules (also used by test.mjs). If the import fails
+// TOTALLY (jiti resolution edge case), the bash guard degrades to non-blocking
+// and the write/edit gate fails OPEN — see the degradation contract above,
+// #761. (A partial abort can leave the write/edit classification bound: its
+// targets are #32/#34/#35-37 of 37, so an abort at the tail keeps it live.)
 let classifyGitCommand: (cmd: string) => string = () => "allow";
 let classifyGitCommandDetailed: (cmd: string) => any = () => ({ verdict: "allow" });
 let isWorktreeCwd: (cwd: string) => boolean = () => true;      // bash path: fail-open
@@ -293,9 +308,83 @@ try {
 // Try/catch-guarded: load failure → M1/M2/M3 OFF + one-time warn; write/edit
 // never depends on it.
 let branchOwnership: any = null;
+// The extension host keeps ONE process-wide module registry for its entire
+// life. A `../shared/branch-ownership.mjs` first imported by an EARLIER
+// generation of this file is therefore served from cache on every later
+// reload — present, cached, and missing any export added since it was first
+// evaluated. Because a reload re-evaluates THIS file but NOT its dependencies,
+// a newly-added call site here meets that stale namespace and throws
+// `… is not a function` at RUNTIME, mid-decision, from inside the tool hook.
+// The throw escapes the hook and aborts the entire bash tool call (pi's
+// emitToolCall runs the handler with no try/catch), so the guard ends up
+// blocking EVERY mutating git command (`add`/`commit`/`push`) instead of
+// guarding it — a safety control failing into a total work stoppage, which its
+// own degradation contract (above) is explicitly designed to avoid.
+//
+// The fix is VALIDATION, not cache-busting: verify that every export we call is
+// actually present, and if not, take the documented M1/M2/M3-OFF path instead
+// of throwing. The load-failure catch below never covers this case — the
+// import SUCCEEDS, it just returns an old namespace.
+//
+// Do NOT "fix" this with a specifier query (`…branch-ownership.mjs?gen=N`).
+// pi loads extensions through jiti, whose resolver STRIPS the query before the
+// module registry sees it: `jiti.resolve("./dep.mjs?gen=1")` and
+// `jiti.resolve("./dep.mjs?gen=2")` return the same path, and three different
+// query specifiers in one jiti load yield ONE module instance (a native-ESM
+// host honours the query instead). So the query is inert HERE — and in a
+// native host it would leak one module instance per reload. An earlier version
+// of this change carried exactly that query and documented it as the fix; it
+// was a no-op in production.
+//
+// What this fix DOES guarantee: a namespace missing any of the members we call
+// degrades to the documented M1/M2/M3-OFF path instead of throwing. What it does
+// NOT guarantee: it cannot stop a throw from a member that EXISTS but fails at
+// call time, nor from a stale module whose shape drifted under an unchanged
+// name. Those still surface as an aborted tool call, because the host rethrows
+// an extension error to BLOCK the call (`emitToolCall` itself has no try/catch;
+// the host wrapper rethrows "Extension failed, blocking execution"). Closing
+// that larger class means wrapping the branch-ownership block in a try/catch
+// that falls back to the legacy classifier — filed as follow-up, deliberately
+// not attempted here because it restructures a 300-line safety block with no
+// test coverage for the fallback path.
+//
+// Also NOT covered by this guard: the same "loaded but stale" exposure exists in
+// `classify-git.mjs` (only 2 of ~35 destructured targets carry a typeof guard)
+// and in `extensions/auto-sync.ts` (a STATIC import of this same helper, no
+// validation). Both are filed as follow-ups.
+//
+// Consequence, stated plainly: on a stale namespace this guard is DOWN for the
+// life of the process. A reload cannot recover it (the registry survives
+// reloads) — only a full pi restart can. That is still strictly better than
+// breaking git, but it is NOT self-healing. Specifier tricks do NOT fix it (see
+// above). A `.ts` helper WOULD hot-reload — jiti re-evaluates a `.ts`
+// dependency on reload — so migrating `shared/branch-ownership.mjs` to `.ts`
+// (or having the loader set `tryNative: false` for extension deps) is the real
+// self-healing path, blocked only by the plain-Node test/consumer imports of
+// the `.mjs`. Filed, not done here.
+const _BRANCH_OWNERSHIP_MEMBERS = [
+  "acquireRepoLock", "classifyBranchOp", "decideM1", "decideM2", "decideM3",
+  "localBranchExists", "ownershipAllowed", "readBranchState", "releaseRepoLock",
+  "repoKey", "resolveEffectiveRepo", "resolveRepoFromInv",
+] as const;
 try {
   branchOwnership = await import("../shared/branch-ownership.mjs");
+  const _missing = _BRANCH_OWNERSHIP_MEMBERS.filter(
+    (k) => typeof branchOwnership?.[k] !== "function",
+  );
+  if (_missing.length > 0) {
+    console.warn(
+      "[main-worktree-guard] ⚠️ branch-ownership.mjs namespace is STALE/incomplete — M1/M2/M3 branch-ownership guards DISABLED (falling back to legacy behavior). Missing exports:",
+      _missing.join(", "),
+      "— ⚠️ THIS PERSISTS FOR THE LIFE OF THIS PROCESS: a reload cannot recover it, only a full pi restart can. Do that now if you need branch-ownership enforcement.",
+    );
+    branchOwnership = null;
+  }
 } catch (e) {
+  // Clear the binding FIRST: if the import assigned a namespace and a later
+  // property access in the validation threw (e.g. a jiti-interop getter), the
+  // binding would otherwise stay set with no validation and be used unguarded.
+  branchOwnership = null;
   console.warn("[main-worktree-guard] ⚠️ branch-ownership.mjs failed to load — M1/M2/M3 branch-ownership guards DISABLED (falling back to legacy behavior):", String(e));
 }
 
@@ -1977,7 +2066,21 @@ export default function (pi: ExtensionAPI) {
             return { block: true, reason: gate.reason ?? "" };
           }
           if (gate.verdict === "recovery" || gate.verdict === "allowed") {
-            return undefined; // sanctioned recovery / read-only / worktree-isolated — done
+            // #805: M4's recovery allowlist sanctions `git push
+            // <checked-out-branch>` for WIP preservation. M4 cannot see the
+            // SESSION's baseline — pushing whatever branch the SHARED hub
+            // happens to be on is exactly the cross-session contamination
+            // (#265) the branch-ownership gate exists to refuse. Never let
+            // this early-return swallow a push: fall through to the
+            // ownership/M2 path below (which allows the session's OWN branch
+            // and blocks foreign ones, incl. bare/`HEAD`/remote-only pushes).
+            const pushDet = classifyGitCommandDetailed(command);
+            const gateablePush = pushDet?.verdict === "block:push" ||
+              pushDet?.verdict === "block:force-push" ||
+              pushDet?.verdict === "block:push-delete";
+            if (!gateablePush) {
+              return undefined; // sanctioned recovery / read-only / non-push — done
+            }
           }
         }
       } else if (isWrite || isEdit) {
@@ -2238,6 +2341,15 @@ export default function (pi: ExtensionAPI) {
               reason: "⛔ Branch-state command blocked — could not resolve the effective repo (fail-closed; #265).",
             };
           }
+          // #805: an UNRESOLVED target (bare cd / unexpandable $VAR / `-C`
+          // sentinel) must never be worktree-exempted — the command may run in
+          // the shared hub. Same fail-closed rule as M2.
+          if (muEff.unresolvedTarget) {
+            return {
+              block: true,
+              reason: "⛔ Branch-state command blocked — the command's target repository is unresolved (fail-closed; #805).",
+            };
+          }
           if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
           const baseline = baselines.get(pid);
           const isInfra = isAgentInfraRepo(muEff.effectiveCwd);
@@ -2458,10 +2570,20 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const baseline = baselines.get(pid);
+        // #805 P1: with NO baseline, decideM2 must know whether the resolved
+        // MAIN checkout is THIS session's own (a worktree shares its common
+        // dir, so `repoKey` equality identifies it) or the agent-infra hub —
+        // only those two are refused; a different repo's MAIN checkout is
+        // ordinary cross-repo work and stays allowed. Both probes spawn git, so
+        // they run only in the (rare, anomalous) no-baseline case.
         const m2 = branchOwnership.decideM2({
           effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
           pushDst: det.pushDst, pushTargets: det.pushTargets,
           verdict: det.verdict, allowActive: false,
+          ...(baseline ? {} : {
+            sessionRepoKey: branchOwnership.repoKey(process.cwd()) ?? null,
+            effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd),
+          }),
         });
         if (m2?.block) return { block: true, reason: m2.reason };
         return undefined; // on-baseline or unverifiable-but-exempt

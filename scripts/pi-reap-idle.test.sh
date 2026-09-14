@@ -39,10 +39,10 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi }
-assert_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi }
-assert_not_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
-assert_reap_eligible() { if printf '%s' "$1" | grep -q "REAP-ELIGIBLE"; then ok "$2"; else bad "$2"; fi }
-assert_skipped_reason() { if printf '%s' "$1" | grep -qF -- "$3"; then ok "$2"; else bad "$2 (missing reason: $3)"; fi }
+assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi }
+assert_not_contains() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
+assert_reap_eligible() { if grep -q "REAP-ELIGIBLE" <<<"$1"; then ok "$2"; else bad "$2"; fi }
+assert_skipped_reason() { if grep -qF -- "$3" <<<"$1"; then ok "$2"; else bad "$2 (missing reason: $3)"; fi }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-test.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
@@ -120,7 +120,7 @@ fi
 SIG="${1#-}"
 TARGET="${2#-}"
 case "$SIG" in TERM|KILL) ;; *) exit 0 ;; esac
-if [ -n "${FAKE_ESRCH_PIDS:-}" ] && printf '%s\n' "$FAKE_ESRCH_PIDS" | grep -qx "$TARGET"; then
+if [ -n "${FAKE_ESRCH_PIDS:-}" ] && grep -qx "$TARGET" <<<"$FAKE_ESRCH_PIDS"; then
     exit 1
 fi
 exit 0

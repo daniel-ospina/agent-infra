@@ -147,7 +147,10 @@ unconditionally.
   peaked cannot trigger an immediate re-cut.
 - **`toolsInFlight > 0` exemption (the #198 structural fix):** the first-message
   clause never fires while a tool is in flight — a live tool is bounded by the
-  6h tool-stall clause, never cut at M. Pinned by test E13. Note (#279): with
+  task-path in-flight clauses (#783): output-silence first (S = 20 min), then
+  the age backstop at 2/3 of the effective hard cap (4h at the 6h default),
+  never cut at M. (The exported `DEFAULT_TOOL_STALL_MS` stays 6h for
+  `extensions/subagent/`.) Pinned by test E13. Note (#279): with
   the `everSawRealActivity` latch below, the per-turn exemption is subsumed
   (every parse source of `toolsInFlight`/`turnSawTool` also latches); the
   live #198 protection is the session-level latch — E279g pins hung-tool
@@ -183,8 +186,8 @@ unconditionally.
   message that normally takes >90s is still cut after 900s under a persistent
   storm (10× slowdown ⇒ 900s < 1500s needed). Guarantee: *no cut for
   first-message latency up to 15 min of storm time; beyond that, capped by
-  design* (uncapped scale would let hung providers linger indefinitely; the 6h
-  tool-stall clause remains the backstop for in-flight tools).
+  design* (uncapped scale would let hung providers linger indefinitely; the
+  in-flight tool-silence clause + age backstop remain the bounds for tools).
 - **RPO ≤ 48h (not 24h) for daily-backup:** a deferral near one daily
   invocation can slip to the next under sustained load — accepted trade for
   load safety.
