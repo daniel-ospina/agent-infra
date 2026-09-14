@@ -45,6 +45,25 @@ RSS/process measurement.
   JSONL, a lone ghost cmux record with no session file, or an incarnation
   mismatch all abstain. cmux lifecycle fields are a **veto-only** signal,
   never proof.
+- **Bounded veto (#947).** `agentLifecycle` is an **event-driven belief**, not
+  a measurement: cmux sets it from hooks (a prompt turn started; a
+  turn-complete has not arrived), so a lost/never-sent turn-complete leaves
+  `lifecycle=running` **forever**. An unbounded veto therefore immunises that
+  pid permanently, however long its JSONL sits untouched — measured
+  2026-09-13: 45/47 candidates vetoed, 38 by `lifecycle=running`, and two of
+  them provably frozen at 98h/128h. A non-idle record is consequently only
+  evidence while it is **fresh**: a non-idle record whose OWN `updatedAt` is
+  older than `REAP_STUCK_HOURS` (default **3× `REAP_IDLE_HOURS`** = 72h) is no
+  longer current, and the pid is classified **STUCK**. STUCK is **reported,
+  never signaled by default**; `REAP_REAP_STUCK=1` (`--reap-stuck`) arms it,
+  and even then all of these must hold: JSONL ground truth past the same
+  bound, **every** incarnation-matched record stale past it (any fresh *or*
+  `updatedAt`-less record keeps the veto — fail closed), the process not
+  accumulating CPU (`stat` S/I), and **no live non-zombie child process**
+  (a tool call in flight). The JSONL proof is computed **before** the veto so
+  the stuck population is never invisible: every vetoed row now carries its
+  `jsonl idle Xh, record age Yh`, plus a `⚠️ STUCK` audit block and
+  `STUCK=/STUCK_RSS=/STUCK_ARMED=` footer fields.
 - **Falsification note:** the 24h threshold is diurnal-safe (a session that
   was used yesterday morning and again this morning is never falsely flagged);
   the boundary and the ±3s incarnation fence are hermetic-tested via
@@ -58,12 +77,17 @@ RSS/process measurement.
 4. ≥1 incarnation-matched cmux record: `pidStartSeconds` within ±3s of the ps
    lstart (second-granularity rounding differs up to ~1s live). Stale siblings
    beyond the fence neither prove nor veto.
-5. **ALLOWLIST union veto:** EVERY incarnation-matched record must be
-   `agentLifecycle==idle` AND `runtimeStatus==idle`. Any value on either key —
-   running / needsInput / unknown / error / None / absent — vetoes the pid.
-   Records with no `pidStartSeconds` abstain.
+5. **ALLOWLIST union veto (bounded, #947):** EVERY incarnation-matched record
+   must be `agentLifecycle==idle` AND `runtimeStatus==idle`. Any value on
+   either key — running / needsInput / unknown / error / None / absent —
+   vetoes the pid. Records with no `pidStartSeconds` abstain. The veto is
+   **bounded by record freshness** (see *Bounded veto* above): a veto whose
+   matched records are ALL stale past `REAP_STUCK_HOURS` is re-classified
+   STUCK (reported; not signaled unless `REAP_REAP_STUCK=1`). A fresh
+   record — or one with no parseable `updatedAt` — keeps the plain veto.
 6. JSONL proves idle > threshold (youngest voting record wins; a no-JSONL
-   twin abstains but does NOT veto).
+   twin abstains but does NOT veto). The proof is evaluated **before** the
+   veto so a vetoed row still reports its idle age.
 7. **Settle re-verify immediately before each signal:** a FRESH per-pid ps
    probe (lstart changed ⇒ pid died+reused ⇒ suppress) and a fresh JSONL
    re-probe (activity advanced ⇒ suppress). The re-probed file is the
@@ -83,6 +107,13 @@ leaders); per-pid fallback otherwise — documented limitation below.
   (exit 3) after one retry — the pass never reaps from an unreadable
   registry. Zero tty'd pi candidates skip the store read entirely (exit 0,
   footer written) so cmux-less machines never emit hourly ⚠️ noise.
+- Fail-closed descendant map (added with #947): the map backing the
+  orchestrating-skip and the stuck arm's no-live-child guard is rebuilt by
+  `python3`; if that build fails **with candidates present**, the pass aborts
+  (exit 3) and signals nothing. Without it an unbuildable map made every pid
+  answer "no live pi descendant / no live child" — silently disabling the
+  skip, i.e. a session running tool or sub-agent work could be reaped. An
+  empty ps table (0 candidates) is not a failure and stays a clean no-op.
 - Single-instance mkdir-lock (`~/.pi/agent/state/pi-reap-idle.lock`; macOS
   has no flock). Stale rules: a live owner whose lock is younger than
   `REAP_LOCK_STALE_SECONDS` (=1800) blocks the pass (exit 3); a dead owner
@@ -101,12 +132,16 @@ leaders); per-pid fallback otherwise — documented limitation below.
 
 `scripts/pi-reap-idle.sh` 4 passes: ps tty'd-pi enumeration (pinned contract
 `ps -axo pid=,ppid=,pgid=,tty=,lstart=,stat=,rss=,command=`; argv-based pi
-classifier) → cmux store index (canonical `~/.cmuxterm/pi-hook-sessions.json`
+classifier) → descendant-map build (**fail-closed**, see above) → cmux store
+index (canonical `~/.cmuxterm/pi-hook-sessions.json`
 only; stale `.tmp` crash-leftovers ignored) → session_id→JSONL-first join with
 fence + allowlist + marathon/own-session gates → settle-verified kill. Driven
 hourly by launchd; interactive runs default to **dry-run**; the launchd env
 carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
-`REAP_IDLE_HOURS`.
+`REAP_IDLE_HOURS`. Bounded-veto override: `--stuck-hours N` /
+`REAP_STUCK_HOURS` (default 3× the idle threshold). Stuck arm: `--reap-stuck` /
+`REAP_REAP_STUCK=1` — **not** set by the launchd job, so the hourly pass
+reports the stuck set and never reaps it.
 
 ## Ops contract
 
@@ -124,8 +159,11 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   the post-pass re-classification of the reap-eligible set (same gates; legit
   skips like marathon/running-twin/own-session never appear), so RESIDUAL=0
   after a clean armed pass, and on dry-run RESIDUAL = the would-be-reaped
-  count with KILLED=0. YIELD = Σ per-target rss at kill (KB). Log
-  size-guarded (~200 lines).
+  count with KILLED=0. YIELD = Σ per-target rss at kill (KB). STUCK =
+  candidates classified stuck this pass; STUCK_RSS = Σ their rss; STUCK_ARMED
+  = whether `REAP_REAP_STUCK` armed the stuck set (a stuck pass with
+  `STUCK>0 STUCK_ARMED=0` is the documented, deliberate non-reap state — it is
+  NOT health). Log size-guarded (~200 lines).
 - **Dry-run → apply procedure:** `bash ~/.pi/agent/scripts/pi-reap-idle.sh`
   (dry-run; inspect verdict rows + MODE=dry-run footer) → one-shot
   `--apply` → confirm footer KILLED/RESIDUAL/YIELD → the hourly launchd pass
@@ -138,10 +176,12 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   the recovery path.
 - **Version sensitivity:** the reaper pins live schema (pi JSONL timestamps,
   cmux hook-store keys incl. `pidStartSeconds`/`agentLifecycle`/
-  `runtimeStatus`, session-dir `--<cwd>--` encoding). If pi or cmux changes
-  any of these shapes the reaper fails closed (skips), not open — dry-run and
-  the hermetic suite (`bash scripts/pi-reap-idle.test.sh`) before trusting a
-  new version.
+  `runtimeStatus`/`updatedAt`, session-dir `--<cwd>--` encoding). If pi or
+  cmux changes any of these shapes the reaper fails closed (skips), not open
+  — a dropped/renamed `updatedAt` makes every non-idle record un-ageable, so
+  the stuck set stays empty (the pre-#947 behaviour) rather than reaping.
+  Dry-run and the hermetic suite (`bash scripts/pi-reap-idle.test.sh`) before
+  trusting a new version.
 - **Retirement rule:** renaming/removing the farmed script requires retiring
   the plist too (broken-target guard cannot catch a stale extra job).
 - **Lifecycle-observation results (recorded pre-merge, Verification step 2 of
@@ -204,6 +244,20 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
 - **Store rules recap:** zero candidates ⇒ store skipped ⇒ exit 0; candidates
   + store missing/persistently corrupt ⇒ ⚠️ retry-once ⇒ exit 3 (never
   mistaken for a disarmed job — the footer documents the abort).
+- **Stuck arm is off by default and is a deliberate broadening (#947):** with
+  `REAP_REAP_STUCK=1` the reaper will TERM a pid whose cmux record says
+  `running`. The guards are the dual-signal freshness bound (a `updatedAt`
+  that is not a real epoch — digit/dot soup, out of plausible range — is
+  never treated as stale; fail closed), the S/I process state at classify
+  **and again at settle**, the absence of a live child at classify, and the
+  settle re-verify: fresh lstart + fresh JSONL (unchanged) **plus, for stuck
+  rows only, a fresh store re-read** requiring the deciding record to still
+  be non-idle with a still-stale stamp and the process still sleeping — a
+  turn that ends (or any hook activity) rewrites the record and suppresses.
+  The residual risk is a single tool call that legitimately writes nothing
+  for ≥72h, holds no child process, and leaves the cmux record untouched —
+  indistinguishable from wedged by any signal the reaper can read. Leave the
+  arm off where that class matters; the hourly launchd job does not set it.
 
 ## Out of scope / follow-ups
 

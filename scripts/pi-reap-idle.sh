@@ -12,12 +12,31 @@
 #     must carry agentLifecycle==idle AND runtimeStatus==idle. Any other
 #     value on either key (running/needsInput/unknown/error/None/absent)
 #     vetoes the pid. Stale (>±3s) sibling records neither prove nor veto.
+#   * BOUNDED VETO (#947): a non-idle cmux record only vetoes while it is
+#     FRESH. cmux derives agentLifecycle from hook events (a prompt turn
+#     started; a turn-complete has not arrived), so a lost/never-sent
+#     turn-complete leaves lifecycle=running FOREVER — an unbounded veto
+#     would immunise that pid permanently, however long its JSONL sits
+#     untouched (live: 45/47 candidates vetoed, 38 of them
+#     lifecycle=running). A non-idle record whose OWN updatedAt is older
+#     than REAP_STUCK_HOURS (default 3x REAP_IDLE_HOURS) is therefore no
+#     longer current evidence: the pid is classified STUCK. STUCK is
+#     REPORTED loudly and is NEVER signaled unless REAP_REAP_STUCK=1 arms
+#     it — and even then it must satisfy: JSONL ground truth past
+#     REAP_STUCK_HOURS, EVERY matched record stale past the bound (any
+#     fresh OR updatedAt-less record keeps the veto — fail closed), a
+#     sleeping process (stat S/I — never R/T/D), and NO live non-zombie
+#     child process (a tool call in flight). The JSONL proof is computed
+#     BEFORE the veto so the stuck population is never invisible.
 #   * Incarnation fence: record pidStartSeconds within ±3s of the ps lstart
 #     (second-granularity rounding differs up to ~1s in live data).
 #   * Never kill active work: settle re-verify BEFORE each signal uses a
 #     FRESH per-pid ps probe (lstart changed => pid died+reused => suppress)
-#     and a FRESH JSONL re-probe (activity advanced => suppress). Post-TERM
-#     survivor re-check = the same fresh probe (kill -0 is never the oracle).
+#     and a FRESH JSONL re-probe (activity advanced => suppress). STUCK rows
+#     add a FRESH store re-read: the deciding record must STILL be non-idle
+#     with a still-stale updatedAt and the process still sleeping (S/I).
+#     Post-TERM survivor re-check = the same fresh probe (kill -0 is never
+#     the oracle).
 #   * Never touch another session's checkout: own tty / own ancestor pids /
 #     own PI_SESSION_ID are hard skips. Orchestrating marathons (a live
 #     non-zombie pi descendant) are skipped.
@@ -29,14 +48,15 @@
 #     makes armed vs dry passes legible in the log.
 #
 # Usage:
-#   pi-reap-idle.sh [--dry-run] [--apply] [--idle-hours N] [--list]
+#   pi-reap-idle.sh [--dry-run] [--apply] [--idle-hours N]
+#                   [--stuck-hours N] [--reap-stuck] [--list]
 #                   [--probe-jsonl FILE...] [--help]
 # Env seams: PS_BIN KILL_BIN DATE_BIN CMUX_STATE_DIR PI_SESSIONS_DIR
-#   REAP_IDLE_HOURS REAP_DRY_RUN REAP_GRACE_SECONDS REAP_NOW_EPOCH
-#   REAP_LOCK_STALE_SECONDS REAP_LOG (default $HOME/.pi/agent/state/
-#   pi-reap-idle.log).
+#   REAP_IDLE_HOURS REAP_STUCK_HOURS REAP_REAP_STUCK REAP_DRY_RUN
+#   REAP_GRACE_SECONDS REAP_NOW_EPOCH REAP_LOCK_STALE_SECONDS REAP_LOG
+#   (default $HOME/.pi/agent/state/pi-reap-idle.log).
 # Exit codes: 0 completed passes, 2 usage, 3 fail-closed (store / lock /
-#   log-unwritable abort).
+#            log-unwritable / descendant-map — see the FAIL-CLOSED aborts in run()).
 
 set -uo pipefail
 
@@ -50,6 +70,11 @@ CMUX_STATE_DIR="${CMUX_STATE_DIR:-${HOME:-}/.cmuxterm}"
 CMUX_STORE="$CMUX_STATE_DIR/pi-hook-sessions.json"
 PI_SESSIONS_DIR="${PI_SESSIONS_DIR:-${HOME:-}/.pi/agent/sessions}"
 REAP_IDLE_HOURS="${REAP_IDLE_HOURS:-24}"
+# Bounded-veto freshness bound (#947). Empty => 3x REAP_IDLE_HOURS, resolved
+# in run() AFTER the threshold is final (so --idle-hours moves it too).
+REAP_STUCK_HOURS="${REAP_STUCK_HOURS:-}"
+# 1 arms the stuck set for signaling; 0 (default) reports it only.
+REAP_REAP_STUCK="${REAP_REAP_STUCK:-0}"
 REAP_GRACE_SECONDS="${REAP_GRACE_SECONDS:-5}"
 REAP_LOCK_STALE_SECONDS="${REAP_LOCK_STALE_SECONDS:-1800}"
 STATE_DIR="${HOME:-}/.pi/agent/state"
@@ -69,22 +94,29 @@ usage() {
 $SCRIPT_NAME — reap provably-idle interactive pi REPL sessions ($ISSUE_REF)
 
 Usage:
-  $SCRIPT_NAME [--dry-run] [--apply] [--idle-hours N] [--list]
-               [--probe-jsonl FILE...] [--help]
+  $SCRIPT_NAME [--dry-run] [--apply] [--idle-hours N] [--stuck-hours N]
+               [--reap-stuck] [--list] [--probe-jsonl FILE...] [--help]
 
   (no mode flag)   dry-run: classify + report, send NO signals (default)
   --dry-run        explicit dry-run
   --apply          armed one-shot pass (or env REAP_DRY_RUN=0)
   --idle-hours N   threshold override (env REAP_IDLE_HOURS)
+  --stuck-hours N  bounded-veto freshness bound for a non-idle cmux record
+                   beyond which the pid is classified STUCK (env
+                   REAP_STUCK_HOURS; default 3x the idle threshold)
+  --reap-stuck     ARM the STUCK set for signaling (env REAP_REAP_STUCK=1).
+                   Off by default: STUCK is reported, never killed.
   --list           list tty'd pi candidate pids and exit (no store read)
   --probe-jsonl F  probe pi session JSONL file(s) (ground-truth parser check;
                    prints {"path","last_timestamp","idle_proven","reason"}
                    per file) and exit
   --help           this text
 
-Fail-closed: absent/unparseable JSONL never proves idle; a missing/corrupt
-cmux store WITH candidates aborts (exit 3) after one retry. Zero tty'd pi
-candidates skip the store read entirely and still write a MODE= footer.
+Fail-closed: absent/unparseable JSONL never proves idle; a non-idle cmux
+record only vetoes while fresh (updatedAt within REAP_STUCK_HOURS); a
+missing/corrupt cmux store WITH candidates aborts (exit 3) after one retry.
+Zero tty'd pi candidates skip the store read entirely and still write a
+MODE= footer.
 EOF
 }
 
@@ -209,10 +241,12 @@ is_self_like() {
 
 # has_live_pi_descendant <pid>: precomputed-map lookup (marathon skip).
 # One python pass over PS_TABLE computes, for every pid, whether a live
-# (non-zombie) pi process is reachable as a descendant; classify then greps
-# instead of walking the process tree per candidate (O(candidates x tree)
-# awk spawns took minutes on the real 814-row table). Zombie descendants
-# (STAT Z*) neither propagate nor count as the pi descendant.
+# (non-zombie) pi process is reachable as a descendant AND whether the pid
+# has a live (non-zombie) DIRECT child; classify then greps instead of
+# walking the process tree per candidate (O(candidates x tree) awk spawns
+# took minutes on the real 814-row table). Zombie descendants (STAT Z*)
+# neither propagate nor count as the pi descendant, and a zombie child does
+# not count as work in flight. Column shape: "pid pi_descendant live_child".
 DESC_MAP=""
 
 descendant_map_build() {
@@ -224,6 +258,7 @@ import sys
 ps_table, out_path = sys.argv[1], sys.argv[2]
 parent = {}
 has = {}
+live = {}
 for ln in open(ps_table, encoding="utf-8"):
     f = ln.split()
     if len(f) < 6:
@@ -233,6 +268,7 @@ for ln in open(ps_table, encoding="utf-8"):
     cand = (len(f) > 7 and f[-1] == "CAND" and not stat.startswith("Z"))
     parent[pid] = ppid
     has[pid] = False
+    live[pid] = not stat.startswith("Z")
     if cand:
         cur = parent.get(pid)
         hops = 0
@@ -243,9 +279,18 @@ for ln in open(ps_table, encoding="utf-8"):
             cur = parent.get(cur)
             hops += 1
 
+# direct live child: a candidate whose turn is really executing a tool has a
+# live non-zombie child process (bash / node / MCP helper). Load-bearing for
+# the #947 stuck arm: no live child => no tool call in flight.
+live_child = {p: False for p in has}
+for p, par in parent.items():
+    if live.get(p) and par in live_child:
+        live_child[par] = True
+
 with open(out_path, "w", encoding="utf-8") as out:
     for pid in sorted(has):
-        out.write("%s %s\n" % (pid, "1" if has[pid] else "0"))
+        out.write("%s %s %s\n" % (pid, "1" if has[pid] else "0",
+                                  "1" if live_child[pid] else "0"))
 PYEOF
 }
 
@@ -255,15 +300,33 @@ has_live_pi_descendant() {
     return $?
 }
 
+# has_live_child <pid>: snapshot lookup — any live (non-zombie) direct child.
+# An unknown pid (absent from the snapshot) matches no row, so awk exits 0 and
+# this reports "HAS a live child" — the fail-closed direction (it blocks the
+# #947 stuck arm), and deliberately the same shape as has_live_pi_descendant
+# above: a missing row is never read as "safe to kill". Do not "fix" the
+# no-match exit code — that would invert this into a fail-open.
+# NOTE: an unbuildable/empty map is a DIFFERENT case (it returns 1 = "no
+# child"); run() aborts fail-closed before any kill decision when the build
+# fails and candidates exist.
+has_live_child() {
+    [ -s "$DESC_MAP" ] || return 1
+    awk -v p="$1" '$1==p { if ($3=="1") exit 0; exit 1 }' "$DESC_MAP"
+    return $?
+}
+
 
 # ── pass 2: cmux store read (fail-closed; retry-once handled by caller) ─
 # TSV rows: pid<TAB>pidStartSeconds<TAB>pidStartMicroseconds<TAB>
-# agentLifecycle<TAB>runtimeStatus<TAB>sessionId<TAB>cwd
+# agentLifecycle<TAB>runtimeStatus<TAB>sessionId<TAB>cwd<TAB>updatedAt
+# updatedAt (float epoch) is the record's own last-write time — the lossy
+# agentLifecycle belief is bounded by it (#947).
 STORE_TSV=""
-store_read() { # 0 on success; 3 on missing/corrupt (python exit)
-    [ -n "${STORE_TSV:-}" ] && rm -f "$STORE_TSV" 2>/dev/null
-    STORE_TSV="$(mktemp "${TMPDIR:-/tmp}/pi-reap-store.XXXXXX")"
-    python3 - "$CMUX_STORE" "$STORE_TSV" <<'PYEOF'
+# store_extract <store-file> <out-tsv> — 0 on success; 3 on missing/corrupt.
+# Split out of store_read so the stuck-settle re-verify can re-read the store
+# into a private temp file without disturbing STORE_TSV (#947).
+store_extract() {
+    python3 - "$1" "$2" <<'PYEOF'
 import json, sys
 
 store_path, out_path = sys.argv[1], sys.argv[2]
@@ -298,14 +361,57 @@ for sid, rec in data.items():
         esc(rec.get("runtimeStatus", "")),
         esc(sid),
         esc(rec.get("cwd", "")),
+        esc(rec.get("updatedAt", "")),
     ]))
 with open(out_path, "w", encoding="utf-8") as out:
     out.write("\n".join(rows) + ("\n" if rows else ""))
 PYEOF
 }
 
+store_read() { # 0 on success; 3 on missing/corrupt (python exit)
+    [ -n "${STORE_TSV:-}" ] && rm -f "$STORE_TSV" 2>/dev/null
+    STORE_TSV="$(mktemp "${TMPDIR:-/tmp}/pi-reap-store.XXXXXX")"
+    store_extract "$CMUX_STORE" "$STORE_TSV"
+}
+
 store_records_for_pid() { # <pid> -> matching TSV lines ("" when none)
     grep -E "^${1}	" "$STORE_TSV" 2>/dev/null || true
+}
+
+# updated_stamp_ok <value> <now> — a store `updatedAt` is only usable as a
+# freshness stamp when it is a REAL epoch: a strict decimal (NOT a digit/dot
+# soup awk would coerce to 0 — "1.2.3" is not a timestamp) inside a plausible
+# window (>= 2001-09-09, not materially in the future). Anything else abstains
+# so the veto stands (fail closed; #947 review P1).
+updated_stamp_ok() {
+    local v="$1" now="$2"
+    grep -qE '^[0-9]+(\.[0-9]+)?$' <<<"$v" || return 1
+    awk -v u="$v" -v n="$now" 'BEGIN{exit !(u >= 1000000000 && u <= n + 86400)}'
+}
+
+# stuck_record_still_frozen <sid> <pid> <now> — STUCK-settle re-verify: a FRESH
+# store read must show the deciding record STILL non-idle with a still-stale
+# stamp. A turn that ended (or any hook activity) rewrites the record, so this
+# suppresses exactly the case the classification-time check cannot see. Every
+# failure mode returns 1 (suppress) — never 0.
+stuck_record_still_frozen() {
+    local sid="$1" pid="$2" now="$3" tsv rec n=0 al rs ua age
+    tsv="$(mktemp "${TMPDIR:-/tmp}/pi-reap-stuck.XXXXXX")" || return 1
+    if ! store_extract "$CMUX_STORE" "$tsv"; then rm -f "$tsv"; return 1; fi
+    while IFS= read -r rec; do
+        [ -n "$rec" ] || continue
+        [ "$(printf '%s' "$rec" | awk -F'\t' '{print $6}')" = "$sid" ] || continue
+        n=$((n+1))
+        al="$(printf '%s' "$rec" | awk -F'\t' '{print $4}')"
+        rs="$(printf '%s' "$rec" | awk -F'\t' '{print $5}')"
+        ua="$(printf '%s' "$rec" | awk -F'\t' '{print $8}')"
+        if [ "$al" = "idle" ] && [ "$rs" = "idle" ]; then rm -f "$tsv"; return 1; fi
+        updated_stamp_ok "$ua" "$now" || { rm -f "$tsv"; return 1; }
+        age="$(awk -v n="$now" -v u="$ua" 'BEGIN{printf "%.1f", (n-u)/3600}')"
+        awk -v a="$age" -v t="$REAP_STUCK_HOURS" 'BEGIN{exit !(a > t)}' || { rm -f "$tsv"; return 1; }
+    done <<<"$(grep -E "^${pid}	" "$tsv" 2>/dev/null || true)"
+    rm -f "$tsv"
+    [ "$n" -gt 0 ]
 }
 
 # ── pass 3: JSONL ground truth (inline python, reverse tail scan) ──────
@@ -400,9 +506,15 @@ except Exception: pass
 
 # ── pass 4: classification ─────────────────────────────────────────────
 # reap-eligible rows -> REAP_CANDIDATES:
-#   pid|pgid|rss|sessionId|jsonl|idle_h|class_last_epoch|class_lstart
+#   pid|pgid|rss|sessionId|jsonl|idle_h|class_last_epoch|class_lstart|stuck
+# (stuck=1 only ever appears under REAP_REAP_STUCK=1; reap_one re-checks it.)
+# stuck-classified rows -> STUCK_CANDIDATES (report-only audit list):
+#   pid|tty|rss|jsonl_idle_h|record_age_h|sessionId|veto
 REAP_CANDIDATES=""
 REAP_COUNT=0
+STUCK_CANDIDATES=""
+STUCK_COUNT=0
+STUCK_RSS=0
 
 candidate_detail() { # <pid> -> "lstart_epoch pgid stat rss" via FRESH probe
     local pid="$1" line lstart epoch pgid stat rss
@@ -438,11 +550,14 @@ session_file_for() { # <sessionId> <cwd> -> first matching JSONL ("" if none)
 
 # classify_candidates <now> <emit:1|0> — fills REAP_CANDIDATES/REAP_COUNT.
 # emit=1 prints + logs per-candidate verdict rows; emit=0 is the RESIDUAL
-# re-classification sweep (silent).
+# re-classification sweep (silent). STUCK_* are rebuilt on emit=1 only, so
+# the silent residual sweep cannot double-count the audit list.
 classify_candidates() {
     local now="$1" emit="$2" pid detail epoch pgid stat rss tty rec al rs sid cwd sfile
     local last_epoch youngest vote abstain matched_cnt veto diff sid_marker rec_pss
+    local rec_age_min ruid rage stuck_ok
     REAP_CANDIDATES=""; REAP_COUNT=0
+    if [ "$emit" = 1 ]; then STUCK_CANDIDATES=""; STUCK_COUNT=0; STUCK_RSS=0; fi
     if [ -z "$CANDIDATES" ]; then
         [ "$emit" = 1 ] && say "(no tty'd pi candidates)"
         return 0
@@ -491,12 +606,11 @@ classify_candidates() {
             [ "$emit" = 1 ] && say "$pid tty=$tty SKIP incarnation-unmatched (fence ±${FENCE_TOLERANCE_SECONDS}s; ${abstain} no-pidStartSeconds abstain(s))"
             continue
         fi
-        if [ -n "$veto" ]; then
-            [ "$emit" = 1 ] && say "$pid tty=$tty SKIP $veto (any non-idle twin vetoes)"
-            continue
-        fi
-        # JSONL idle proof: youngest voting matched record wins; no-JSONL
-        # records abstain (prove nothing AND veto nothing).
+        # JSONL idle proof FIRST (#947): the ground-truth age must be measured
+        # even for a candidate the cmux veto is about to block — otherwise the
+        # stuck population is invisible and a permanently immunised pid reads
+        # as a healthy "allowlist" skip. Youngest voting matched record wins;
+        # no-JSONL records abstain (prove nothing AND veto nothing).
         youngest=""; vote=0; sid=""; sfile=""
         while IFS= read -r rec; do
             [ -n "$rec" ] || continue
@@ -532,13 +646,65 @@ classify_candidates() {
                 case "$sfile$US" in *"$rf$US"*) ;; *) sfile="$sfile$US$rf" ;; esac
             fi
         done <<<"$matched"
+        # ── bounded veto (#947): a non-idle cmux record is now the ONLY
+        # blocker left, but it is a hook-derived belief that can be stuck
+        # forever. Measure the least-stale matched record's own updatedAt;
+        # any record with a fresh stamp — or no stamp at all — keeps the veto
+        # (fail closed).
+        rec_age_min=""
+        if [ -n "$veto" ]; then
+            while IFS= read -r rec; do
+                [ -n "$rec" ] || continue
+                ruid="$(printf '%s' "$rec" | awk -F'\t' '{print $8}')"
+                updated_stamp_ok "$ruid" "$now" || { rec_age_min=""; break; }
+                rage="$(awk -v n="$now" -v u="$ruid" 'BEGIN{printf "%.1f", (n-u)/3600}')"
+                if [ -z "$rec_age_min" ] || awk -v a="$rage" -v b="$rec_age_min" 'BEGIN{exit !(a < b)}'; then
+                    rec_age_min="$rage"
+                fi
+            done <<<"$matched"
+        fi
+        if [ -n "$veto" ]; then
+            # no JSONL proof => the veto still reports first (the reason
+            # vocabulary the suite pins) and nothing is ever signaled.
+            if [ "$vote" -eq 0 ]; then
+                [ "$emit" = 1 ] && say "$pid tty=$tty SKIP $veto (any non-idle twin vetoes)"
+                continue
+            fi
+            idle_age_h="$(awk -v n="$now" -v y="$youngest" 'BEGIN{printf "%.1f", (n-y)/3600}')"
+            # STUCK requires BOTH independent signals frozen past the same long
+            # bound, a process not accumulating CPU (S/I), and no live child
+            # (no tool call in flight).
+            stuck_ok=0
+            if [ -n "$rec_age_min" ] \
+               && awk -v a="$rec_age_min" -v t="$REAP_STUCK_HOURS" 'BEGIN{exit !(a > t)}' \
+               && awk -v a="$idle_age_h" -v t="$REAP_STUCK_HOURS" 'BEGIN{exit !(a > t)}' \
+               && ! has_live_child "$pid"; then
+                case "$stat" in S*|I*) stuck_ok=1 ;; esac
+            fi
+            if [ "$stuck_ok" = 1 ]; then
+                if [ "$emit" = 1 ]; then
+                    STUCK_CANDIDATES="$(printf '%s\n%s' "$STUCK_CANDIDATES" "$pid|$tty|${rss:-0}|$idle_age_h|$rec_age_min|$sid|$veto" | sed '/^$/d')"
+                    STUCK_COUNT=$((STUCK_COUNT+1))
+                    STUCK_RSS=$((STUCK_RSS + ${rss:-0}))
+                fi
+                if [ "$REAP_REAP_STUCK" = 1 ]; then
+                    REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfile|$idle_age_h|$youngest|$epoch|1" | sed '/^$/d')"
+                    [ "$emit" = 1 ] && say "$pid tty=$tty REAP-ELIGIBLE(STUCK) rss=${rss:-0} idle_h=${idle_age_h}h record_age_h=${rec_age_min}h session=$sid jsonl=$sfile"
+                else
+                    [ "$emit" = 1 ] && say "$pid tty=$tty STUCK-ESCALATE rss=${rss:-0} idle_h=${idle_age_h}h record_age_h=${rec_age_min}h session=$sid ($veto, record stale past ${REAP_STUCK_HOURS}h) — report-only"
+                fi
+                continue
+            fi
+            [ "$emit" = 1 ] && say "$pid tty=$tty SKIP $veto (any non-idle twin vetoes; jsonl idle ${idle_age_h}h, record age ${rec_age_min:-?}h)"
+            continue
+        fi
         if [ "$vote" -eq 0 ]; then
             [ "$emit" = 1 ] && say "$pid tty=$tty SKIP no-jsonl-proof (${abstain} abstain(s) — fail-closed)"
             continue
         fi
         idle_age_h="$(awk -v n="$now" -v y="$youngest" 'BEGIN{printf "%.1f", (n-y)/3600}')"
         if awk -v n="$now" -v y="$youngest" -v t="$REAP_IDLE_HOURS" 'BEGIN{exit !((n-y)/3600 > t)}'; then
-            REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfile|$idle_age_h|$youngest|$epoch" | sed '/^$/d')"
+            REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfile|$idle_age_h|$youngest|$epoch|0" | sed '/^$/d')"
             [ "$emit" = 1 ] && say "$pid tty=$tty REAP-ELIGIBLE rss=${rss:-0} idle_h=${idle_age_h}h session=$sid jsonl=$sfile"
         else
             [ "$emit" = 1 ] && say "$pid tty=$tty SKIP active (idle_h=${idle_age_h}h ≤ threshold ${REAP_IDLE_HOURS}h)"
@@ -564,7 +730,7 @@ signal_target() { # <pid> <pgid> <TERM|KILL> — group signal when pgid==pid els
 reap_one() { # <cand-line> <now>
     local cand="$1" now="$2"
     local pid pgid rss sid sfile idle_h class_epoch class_lstart
-    local detail epoch2 pgid2 sfile2 fresh_epoch
+    local detail epoch2 pgid2 stat2 sfile2 fresh_epoch stuck_flag
     pid="$(printf '%s' "$cand" | cut -d'|' -f1)"
     pgid="$(printf '%s' "$cand" | cut -d'|' -f2)"
     rss="$(printf '%s' "$cand" | cut -d'|' -f3)"
@@ -573,6 +739,7 @@ reap_one() { # <cand-line> <now>
     idle_h="$(printf '%s' "$cand" | cut -d'|' -f6)"
     class_epoch="$(printf '%s' "$cand" | cut -d'|' -f7)"
     class_lstart="$(printf '%s' "$cand" | cut -d'|' -f8)"
+    stuck_flag="$(printf '%s' "$cand" | cut -d'|' -f9)"
     # fail-closed: a corrupted candidate row (store value containing the
     # unescaped field separator, etc.) must SUPPRESS, never proceed.
     case "$class_epoch" in
@@ -581,15 +748,44 @@ reap_one() { # <cand-line> <now>
     case "$class_lstart" in
         ''|*[!0-9]*) log "SETTLE-SKIP $pid corrupt cand class_lstart — suppress"; return 0 ;;
     esac
+    # defense in depth (#947): a stuck-armed row is only ever signaled while
+    # REAP_REAP_STUCK is still set for THIS pass. A row whose flag is neither
+    # 0/1/empty is corrupt => suppress.
+    case "$stuck_flag" in
+        ''|0) stuck_flag=0 ;;
+        1)
+            stuck_flag=1
+            if [ "$REAP_REAP_STUCK" != 1 ]; then
+                log "SETTLE-SKIP $pid stuck cand but REAP_REAP_STUCK unset — suppress"
+                return 0
+            fi
+            ;;
+        *) log "SETTLE-SKIP $pid corrupt cand stuck flag — suppress"; return 0 ;;
+    esac
     # settle 1: still self/ancestor?
     is_self_like "$pid" && { log "SETTLE-SKIP $pid now-self — suppress"; return 0; }
     # settle 2: FRESH probe — lstart changed (pid died + reused)?
     detail="$(candidate_detail "$pid")" || { log "SETTLE-SKIP $pid gone (ESRCH at settle) — suppress"; return 0; }
     epoch2="$(printf '%s' "$detail" | awk '{print $1}')"
     pgid2="$(printf '%s' "$detail" | awk '{print $2}')"
+    stat2="$(printf '%s' "$detail" | awk '{print $3}')"
     if [ -n "$class_lstart" ] && [ -n "$epoch2" ] && [ "$epoch2" != "$class_lstart" ]; then
         log "SETTLE-SKIP $pid incarnation changed (pid reused) — suppress"
         return 0
+    fi
+    # settle 2b (STUCK rows only, #947): re-verify the override's premise from a
+    # FRESH store read AND require the process to still be sleeping. The stuck
+    # warrant is "the cmux record has not advanced past the bound"; if the turn
+    # ended (or a tool child appeared) between classify and settle, suppress.
+    if [ "$stuck_flag" = 1 ]; then
+        case "$stat2" in
+            S*|I*) ;;
+            *) log "SETTLE-SKIP $pid stuck row process no longer sleeping (stat=$stat2) — suppress"; return 0 ;;
+        esac
+        if ! stuck_record_still_frozen "$sid" "$pid" "$now"; then
+            log "SETTLE-SKIP $pid stuck row record no longer frozen/idle — suppress"
+            return 0
+        fi
     fi
     # settle 3: JSONL activity advanced since classification? Every deciding
     # (max-epoch) file is re-probed — an advance on ANY tied twin suppresses.
@@ -609,7 +805,7 @@ reap_one() { # <cand-line> <now>
     done <<<"$(printf '%s' "$sfile" | tr "$(printf '\037')" '\n')"
     # (single-file case: one iteration, identical semantics to round 1)
     signal_target "$pid" "$pgid2" TERM
-    log "SIGNAL pid=$pid pgid=$pgid2 SIGTERM rss=${rss:-0} idle_h=${idle_h}h session=$sid jsonl=$sfile"
+    log "SIGNAL pid=$pid pgid=$pgid2 SIGTERM rss=${rss:-0} idle_h=${idle_h}h stuck=$stuck_flag session=$sid jsonl=$sfile"
     sleep "$REAP_GRACE_SECONDS"
     # survivor re-check = fresh probe (kill -0 would ESRCH on fake pids).
     # The same incarnation fence applies BEFORE SIGKILL: if the pid was
@@ -677,7 +873,13 @@ parse_args() {
             --dry-run) MODE=dry-run; shift ;;
             --apply) MODE=apply; shift ;;
             --list) LIST_ONLY=1; shift ;;
-            --idle-hours) REAP_IDLE_HOURS="${2:-}"; shift 2 ;;
+            --idle-hours)
+                [ $# -ge 2 ] || { echo "bad --idle-hours: missing value" >&2; exit 2; }
+                REAP_IDLE_HOURS="$2"; shift 2 ;;
+            --stuck-hours)
+                [ $# -ge 2 ] || { echo "bad --stuck-hours: missing value" >&2; exit 2; }
+                REAP_STUCK_HOURS="$2"; shift 2 ;;
+            --reap-stuck) REAP_REAP_STUCK=1; shift ;;
             --probe-jsonl) shift; while [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; do PROBE_FILES+=("$1"); shift; done ;;
             --help|-h) usage; exit 0 ;;
             *) usage >&2; exit 2 ;;
@@ -696,6 +898,14 @@ run() {
     fi
     case "$MODE" in dry-run|apply) ;; *) usage >&2; exit 2 ;; esac
     grep -qE '^[0-9]+$' <<<"$REAP_IDLE_HOURS" || { echo "bad --idle-hours: $REAP_IDLE_HOURS" >&2; exit 2; }
+    # bounded-veto freshness bound (#947): default 3x the (final) idle
+    # threshold, so --idle-hours moves it too; an explicit value always wins.
+    if [ -z "$REAP_STUCK_HOURS" ]; then REAP_STUCK_HOURS=$(( REAP_IDLE_HOURS * 3 )); fi
+    grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" || { echo "bad --stuck-hours: $REAP_STUCK_HOURS" >&2; exit 2; }
+    case "$REAP_REAP_STUCK" in
+        0|1) ;;
+        *) echo "bad REAP_REAP_STUCK: $REAP_REAP_STUCK (want 0 or 1)" >&2; exit 2 ;;
+    esac
     mkdir -p "$(dirname "$REAP_LOG")" 2>/dev/null || true
     now="$(now_epoch)"
 
@@ -733,15 +943,29 @@ run() {
     fi
 
     if [ -f "$DISABLED_SENTINEL" ]; then
-        log "MODE=disabled NOW=$now THRESHOLD=$REAP_IDLE_HOURS sentinel=$DISABLED_SENTINEL KILLED=0 YIELD=0"
+        log "MODE=disabled NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK=0 STUCK_RSS=0 KILLED=0 YIELD=0 sentinel=$DISABLED_SENTINEL"
         echo "disabled by sentinel ($DISABLED_SENTINEL) — exiting without signal"
         exit 0
     fi
-    log "==== pi-reap-idle pass: MODE=$MODE THRESHOLD=$REAP_IDLE_HOURS now=$now ===="
+    log "==== pi-reap-idle pass: MODE=$MODE THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS REAP_STUCK=$REAP_REAP_STUCK now=$now ===="
     ps_enumeration
     self_ancestors_from_table
-    descendant_map_build
+    descendant_map_ok=1
+    descendant_map_build || descendant_map_ok=0
     pre_count="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')"
+    # FAIL-CLOSED (#947): if the map failed to build, has_live_pi_descendant()
+    # and has_live_child() both answer "no" for EVERY pid (an absent row is
+    # never read as safe-to-kill by accident — but an absent MAP is). That
+    # silently disables the orchestrating-skip above AND the #947
+    # no-live-child guard, i.e. a session running tool/sub-agent work could be
+    # reaped. An empty ps table (no candidates) is not an error — only a
+    # failed build with work to decide on.
+    if [ "$pre_count" -gt 0 ] && [ "$descendant_map_ok" = 0 ]; then
+        echo "FAIL-CLOSED abort: descendant map unavailable (exit 3)" >&2
+        log "FAIL-CLOSED abort: descendant map unavailable (exit 3)"
+        log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS CANDIDATES=$pre_count STUCK=0 STUCK_RSS=0 KILLED=0 YIELD=0"
+        exit 3
+    fi
 
     if [ "$LIST_ONLY" = 1 ]; then
         printf '%s\n' "$CANDIDATES" | sed '/^$/d'
@@ -757,13 +981,40 @@ run() {
             if ! store_read; then
                 echo "FAIL-CLOSED abort: cmux store missing/corrupt (attempt 2, exit 3)" >&2
                 log "FAIL-CLOSED abort: cmux store missing/corrupt (attempt 2, exit 3)"
-                log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS CANDIDATES=$pre_count KILLED=0 YIELD=0"
+                log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS CANDIDATES=$pre_count STUCK=0 STUCK_RSS=0 KILLED=0 YIELD=0"
                 exit 3
             fi
         fi
         classify_candidates "$now" 1
     else
         say "(no tty'd pi candidates — store read skipped)"
+    fi
+
+    # ── STUCK audit block (#947): the population the cmux veto holds forever.
+    # Fail-closed default = reported, never signaled; REAP_REAP_STUCK=1 arms
+    # it. Surfacing this is the point: exit 0 with a ~2%-of-target reap must
+    # not read as health while a large provably-frozen set sits vetoed.
+    if [ "$STUCK_COUNT" -gt 0 ]; then
+        say ""
+        say "⚠️ STUCK: ${STUCK_COUNT} provably-frozen session(s), ~$((STUCK_RSS / 1024))MB — non-idle cmux record with its OWN updatedAt older than ${REAP_STUCK_HOURS}h:"
+        local srow spid stty srss sidle srec ssid sveto
+        while IFS= read -r srow; do
+            [ -n "$srow" ] || continue
+            spid="$(printf '%s' "$srow" | cut -d'|' -f1)"
+            stty="$(printf '%s' "$srow" | cut -d'|' -f2)"
+            srss="$(printf '%s' "$srow" | cut -d'|' -f3)"
+            sidle="$(printf '%s' "$srow" | cut -d'|' -f4)"
+            srec="$(printf '%s' "$srow" | cut -d'|' -f5)"
+            ssid="$(printf '%s' "$srow" | cut -d'|' -f6)"
+            sveto="$(printf '%s' "$srow" | cut -d'|' -f7)"
+            say "   pid=$spid tty=$stty rss=${srss}KB jsonl_idle=${sidle}h record_age=${srec}h session=$ssid ($sveto)"
+        done <<<"$STUCK_CANDIDATES"
+        if [ "$REAP_REAP_STUCK" = 1 ]; then
+            say "   → ARMED (REAP_REAP_STUCK=1): this set IS reaped by --apply."
+        else
+            say "   → NOT reaped (fail-closed). Re-run with --reap-stuck / REAP_REAP_STUCK=1 to reap this set."
+        fi
+        log "STUCK count=$STUCK_COUNT rss=$STUCK_RSS hours=$REAP_STUCK_HOURS armed=$REAP_REAP_STUCK"
     fi
 
     if [ "$MODE" = apply ] && [ -n "$REAP_CANDIDATES" ]; then
@@ -779,6 +1030,9 @@ run() {
     # nothing killed => RESIDUAL = the would-be-reaped count.
     ps_enumeration
     self_ancestors_from_table
+    # Post-pass map: only feeds the RESIDUAL diagnostic (no kill decision is
+    # left to make), so a build failure here is logged, not fatal — the
+    # initial build above is the one that gates signaling.
     descendant_map_build
     post_count="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')"
     residual_count=0
@@ -794,9 +1048,9 @@ run() {
     if [ "$MODE" = dry-run ]; then
         say "DRY-RUN — no signals sent"
     fi
-    log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS CANDIDATES=$pre_count PRE=$pre_count POST=$post_count RESIDUAL=$residual_count KILLED=$KILLED YIELD=$YIELD_RSS"
+    log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS STUCK=$STUCK_COUNT STUCK_RSS=$STUCK_RSS STUCK_ARMED=$REAP_REAP_STUCK CANDIDATES=$pre_count PRE=$pre_count POST=$post_count RESIDUAL=$residual_count KILLED=$KILLED YIELD=$YIELD_RSS"
     if [ "$MODE" = apply ]; then
-        echo "armed pass complete: KILLED=$KILLED YIELD_RSS=${YIELD_RSS}KB RESIDUAL=$residual_count"
+        echo "armed pass complete: KILLED=$KILLED YIELD_RSS=${YIELD_RSS}KB RESIDUAL=$residual_count STUCK=$STUCK_COUNT"
     fi
     exit 0
 }
