@@ -704,7 +704,13 @@ test("ALL-LEGS-HALT: openrouter also blocked → structured halt class (leg null
   // nextLegAfter agrees
   const step = nextLegAfter("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
   equal(step.halted, true);
-  equal(step.skipped.length, 3, "qwen-tp + BOTH openrouter table entries reported as skipped (excluded-with-alert)");
+  equal(step.skipped.length, 2, "qwen-tp + the V4.1 openrouter entry are unavailable (excluded-with-alert)");
+  equal(step.resolutionOnly.length, 1, "the legacy 0423 leg is reported as resolution-only, NOT as blocked");
+  equal(step.resolutionOnly[0]?.model, "deepseek/deepseek-v4-flash");
+  ok(
+    !step.skipped.some((l) => l.model === "deepseek/deepseek-v4-flash"),
+    "an intentionally retired leg must never be reported as blocked/exhausted",
+  );
 });
 
 test("no latch / stale / disabled / no-hop → requested leg (must-stay semantics)", () => {

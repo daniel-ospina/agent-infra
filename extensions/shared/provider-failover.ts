@@ -48,11 +48,13 @@
  * Chain model: alias families. A "family" is one logical model served by
  * multiple (provider, model) legs with identical behavior on different
  * balances. deepseek-v4-flash → qwen-tp/deepseek-v4-flash-0731 (flash RENAMED
- * on the token plan — same id family, distinct model id) → openrouter slug
- * openrouter/deepseek/deepseek-v4-flash. deepseek-v4-pro → qwen-tp identity
- * deepseek-v4-pro → openrouter/deepseek/deepseek-v4-pro. All legs of a family
- * latched/blocked → the structured HALT class (never a silent fallthrough to
- * a latched default).
+ * on the token plan — same id family, distinct model id) → the openrouter V4.1
+ * slug openrouter/deepseek/deepseek-v4.1-flash (#727: the same generation as
+ * the primary; the older "V4 Flash 0423" slug deepseek/deepseek-v4-flash is
+ * appended LAST as RESOLUTION-ONLY — matched for stale state, never served).
+ * deepseek-v4-pro → qwen-tp identity deepseek-v4-pro →
+ * openrouter/deepseek/deepseek-v4-pro. All legs of a family latched/blocked →
+ * the structured HALT class (never a silent fallthrough to a latched default).
  *
  * Exhaustion signature (text classifier — s2: message_end errorMessage is text
  * only; after_provider_response never fires on 402 for the SDK transport):
@@ -316,8 +318,10 @@ export function familyOf(modelId: string | null | undefined, provider?: string |
     if (id === fam.legs[0]?.model) return famKey;
   }
   if (id === "deepseek-v4-flash-0731") return "deepseek-v4-flash";
-  // openrouter slugs arrive as "deepseek/deepseek-v4-flash" (slash id). Only
-  // the BASE slug names hop (never -vision-exp / -0813 variants — see above).
+  // openrouter slugs arrive as "deepseek/<slug>" (slash id): the flash hop leg
+  // is the #727 V4.1 slug, and the legacy 0423 slug still resolves here for
+  // stale state. Only the BASE slug names hop (never -vision-exp / -0813
+  // variants — see above).
   if (provider === "openrouter" || id.includes("/")) {
     const slug = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
     // Both flash-family generations normalize onto the family: the #727 V4.1
@@ -1001,7 +1005,13 @@ export function rootPrimaryOfFamily(family: string | undefined): string | undefi
 export interface ChainStep {
   leg: LegRef | null;
   halted: boolean;
-  skipped: LegRef[]; // blocked legs skipped on the way (excluded-with-alert)
+  skipped: LegRef[]; // legs skipped on the way because they are UNAVAILABLE
+  // (env-blocked, durable auth block, or a provider holding a FRESH own
+  // exhaustion record) - excluded-with-alert.
+  resolutionOnly: LegRef[]; // legs skipped because they are RESOLUTION-ONLY
+  // (#727): table entries matched by position for stale state but never a serve
+  // target. Reported SEPARATELY so no diagnostic can mislabel an intentionally
+  // retired leg as blocked/exhausted.
 }
 
 export function nextLegAfter(
@@ -1014,7 +1024,7 @@ export function nextLegAfter(
   const now = opts.now ?? Date.now();
   const ttl = opts.ttlMs ?? latchTtlMs(env);
   const legs = familyLegs(family);
-  if (!legs) return { leg: null, halted: true, skipped: [] };
+  if (!legs) return { leg: null, halted: true, skipped: [], resolutionOnly: [] };
   // Hop candidates = legs after `after`, minus: env-blocked ∪ durable auth
   // blocks ∪ providers holding a FRESH own exhaustion record (review R2 —
   // never advance INTO a freshly-exhausted provider).
@@ -1025,15 +1035,23 @@ export function nextLegAfter(
   // and the walk re-returns the DRAINING root as the "next" leg.
   const startIdx = legs.findIndex((l) => l.provider === after.provider && l.model === legIdentity(family, after));
   const skipped: LegRef[] = [];
+  const resolutionOnly: LegRef[] = [];
   for (let i = startIdx + 1; i < legs.length; i++) {
     const leg = legs[i];
-    if (unavailable.has(leg.provider) || isResolutionOnlyLeg(leg)) {
+    // Resolution-only first: it is a STATIC property of the leg (never a serve
+    // target by design), so a simultaneous provider block must not reclassify
+    // it as a transient outage in diagnostics.
+    if (isResolutionOnlyLeg(leg)) {
+      resolutionOnly.push(leg);
+      continue;
+    }
+    if (unavailable.has(leg.provider)) {
       skipped.push(leg);
       continue;
     }
-    return { leg, halted: false, skipped };
+    return { leg, halted: false, skipped, resolutionOnly };
   }
-  return { leg: null, halted: true, skipped };
+  return { leg: null, halted: true, skipped, resolutionOnly };
 }
 
 /**
