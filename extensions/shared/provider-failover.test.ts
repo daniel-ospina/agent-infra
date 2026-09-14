@@ -946,7 +946,41 @@ test("RESOLUTION-ONLY legacy leg (#727) is never SERVED: a stale pre-#727 latch 
     { env },
   );
   equal(hopAsk.leg?.model, "deepseek/deepseek-v4.1-flash");
-  // (c) when the current hop leg's provider is itself out, resolution HALTS —
+  // (c) a request for the CURRENT hop leg (the frozen record is stale, the ask
+  // is right): the walk from that leg halts ("nothing after it"), so resolution
+  // re-asks from the root — the answer is the hop leg itself, never a halt with
+  // an available target sitting at it and never the retired slug.
+  const askHop = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
+    state,
+    { env },
+  );
+  equal(askHop.halted, false, "a request for the current hop leg must not halt");
+  equal(askHop.leg?.model, "deepseek/deepseek-v4.1-flash");
+  // (d) a request for the RETIRED slug under the stale latch is moved onto the
+  // current hop target (it is a failover event, not a must-stay: the family's
+  // chosen leg is being re-derived).
+  const askRetired = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    state,
+    { env },
+  );
+  equal(askRetired.halted, false);
+  equal(askRetired.leg?.model, "deepseek/deepseek-v4.1-flash");
+  // (e) ...but with NO latch it is honest must-stay: ask for an exact leg and
+  // you get it (no failover is in progress, so nothing is rewritten).
+  const emptyEnv = { ...env, PI_CODING_AGENT_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "pf-727-muststay-")) };
+  const mustStay = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    readLatchState(emptyEnv),
+    { env: emptyEnv },
+  );
+  equal(mustStay.reason, "clear");
+  equal(mustStay.leg?.model, "deepseek/deepseek-v4-flash", "must-stay: the requested leg verbatim when no latch is fresh");
+  // (f) when the current hop leg's provider is itself out, resolution HALTS —
   // it does not fall back to the legacy generation to keep a leg alive.
   markLegBlocked("openrouter", "401", { env });
   const tail = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, readLatchState(env), { env });
@@ -1108,7 +1142,7 @@ test("WRITE parity: hop-leg (openrouter) drain under fresh root still records un
     reason: "402",
     source: "marker",
     family: "deepseek-v4-flash",
-    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
     env,
   });
   ok(isLatched("deepseek", state, { env }), "record continues under the root (in-flight continuation)");
@@ -1289,7 +1323,7 @@ test("root-primary mapping: hop-leg drain with NO root latch records under the D
     reason: "402",
     source: "marker",
     family: "deepseek-v4-flash",
-    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
     env,
   });
   const state = readLatchState(env);
@@ -1317,7 +1351,7 @@ test("root-primary mapping: hop-leg drain UNDER a fresh root latch records under
     reason: "402",
     source: "marker",
     family: "deepseek-v4-flash",
-    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
     env,
   });
   const state = readLatchState(env);

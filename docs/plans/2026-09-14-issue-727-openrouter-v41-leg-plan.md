@@ -54,9 +54,11 @@ re-return of the draining root), while `RESOLUTION_ONLY_LEGS` stops a fresh adva
 served it. The guard is applied on **both** serve paths: the advance walk skips it, and resolution's
 latched-active fast path refuses a `fam.activeLeg` that IS this leg — a pre-#727 latch record froze
 exactly that slug, and serving it directly would re-dispatch the 0423 build for up to the latch TTL
-(the walk then re-resolves the family's *current* hop target, the V4.1 leg). The chain **halts**
-after the V4.1 leg — exactly where it halted before the V4.1 leg existed. No generation downgrade is
-reachable by an automatic hop.
+(the walk then re-resolves the family's *current* hop target, the V4.1 leg — retrying from the family
+root when the first walk halts, so a dispatch of the *hop leg itself* is served rather than halted).
+The chain **halts** after the V4.1 leg — exactly where it halted before the V4.1 leg existed. No
+generation downgrade is reachable by an automatic hop; the 0423 build survives only for an explicit
+must-stay dispatch of that exact leg with no fresh latch.
 
 ## Wiring
 

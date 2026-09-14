@@ -1141,9 +1141,13 @@ export function resolveWithChain(
   // generation openrouter leg (deepseek/deepseek-v4-flash = upstream "V4 Flash
   // 0423") as its activeLeg, exactly the silent downgrade #727 removes. Such a
   // record has no migration path (only TTL self-heal), so treating it as
-  // unusable makes resolution fall through to the standard advance walk below,
-  // which yields the family's CURRENT hop target (the V4.1 leg) or a structured
-  // halt — never the legacy generation. Same input, current answer.
+  // unusable skips the fast path: resolution advances along the chain instead
+  // (retrying from the family ROOT if that walk halts — see below), which
+  // yields the family's CURRENT hop target (the V4.1 leg) whether the ask was
+  // the root, the current hop leg, or the retired slug itself — or a structured
+  // halt when nothing is left. Never the legacy build. The one surviving
+  // must-stay case is a dispatch of an exact leg with NO fresh latch at all
+  // (the early `clear` return above).
   if (
     fam?.activeLeg &&
     !unavailable.has(fam.activeLeg.provider) &&
@@ -1176,8 +1180,17 @@ export function resolveWithChain(
     const hop = activeHop(requested, fam.activeLeg);
     return { leg: fam.activeLeg, halted: false, reason: "latched-active", hop };
   }
-  // advance from the requested leg along the chain
-  const step = nextLegAfter(family, requested, state, { env, now, ttlMs: ttl });
+  // advance along the chain. #727: with a RESOLUTION-ONLY frozen activeLeg a
+  // halt means "nothing usable AFTER the requested leg" — the wrong question
+  // when the requested leg IS the current hop target (or the retired slug
+  // itself). Re-ask from the family ROOT, the same computation the family makes
+  // with no activeLeg at all, so the answer is the current hop target instead of
+  // a halt with an available target sitting at it.
+  let step = nextLegAfter(family, requested, state, { env, now, ttlMs: ttl });
+  if (step.halted && fam?.activeLeg !== undefined && isResolutionOnlyLeg(fam.activeLeg)) {
+    const rootLeg = familyLegs(family)?.[0];
+    if (rootLeg) step = nextLegAfter(family, rootLeg, state, { env, now, ttlMs: ttl });
+  }
   if (step.halted) return { leg: null, halted: true, reason: "halt", hop: null };
   const hop = activeHop(requested, step.leg!);
   return { leg: step.leg, halted: false, reason: "latched-advance", hop };

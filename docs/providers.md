@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-14
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, custom-provider-openrouter, provider-failover, issue-284, issue-476, issue-637
+aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, custom-provider-openrouter, provider-failover, issue-284, issue-476, issue-637, issue-727
 ---
 
 # Provider reliability guide — qwen + the task tool
@@ -301,11 +301,15 @@ with automatic return after balance restore.
   (`RESOLUTION_ONLY_LEGS`): it is there so stale pre-#727 state (latch file /
   in-flight marker / session pinned to the slug) still matches its own leg — an
   absent table entry would make `nextLegAfter`'s startIdx -1 and re-return the
-  DRAINING root — while it is never SERVED, neither as an advance target nor
-  through resolution's latched-active fast path (a pre-#727 latch record froze
-  this very slug as its `activeLeg`; that record now re-resolves to the V4.1
-  leg instead of dispatching the older build). The advance walk therefore
-  HALTS after the V4.1 leg, exactly where it halted before the V4.1 leg existed.
+  DRAINING root — while no FAILOVER path can serve it: the advance walk skips
+  it, resolution's latched-active fast path refuses a frozen `activeLeg` that is
+  this slug (a pre-#727 latch recorded exactly that — such a record re-resolves
+  its family's current hop target, the V4.1 leg, instead of dispatching the
+  older build), and a dispatch of the retired slug under a fresh latch is moved
+  onto the current hop target as well. The only way to run the 0423 build is an
+  explicit must-stay dispatch of that exact leg with no fresh latch. The advance
+  walk therefore HALTS after the V4.1 leg, exactly where it halted before the
+  V4.1 leg existed.
   Thinking is CONFIGURABLE on the V4.1 leg (off/high/max — the levels the
   deepseek primary can express); `minimal`/`low`/`medium` stay unmapped for hop
   parity — the upstream slug accepts them, the primary cannot express them, and

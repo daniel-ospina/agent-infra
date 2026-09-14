@@ -568,8 +568,9 @@ test("HOP-OWN drain under a healthy root: own record + DIRECT return to the prim
   const { env, cleanup } = hermetic();
   applyEnv(env);
   try {
-    // Session explicitly on the openrouter hop leg; deepseek root NEVER
-    // latched (healthy). openrouter's OWN credits drain (independent account).
+    // Session pinned to the LEGACY 0423 slug (a pre-#727 stale session: it was
+    // the hop leg then, and is RESOLUTION-ONLY now); deepseek root NEVER latched
+    // (healthy). openrouter's OWN credits drain (independent account).
     const pi = makeFakePi();
     extension(pi as any);
     await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
@@ -597,7 +598,8 @@ test("banner accuracy (round-4 P2-1): hop-own drain says 'drained its own credit
   try {
     const pi = makeFakePi();
     extension(pi as any);
-    // hop-own drain on openrouter under a healthy (absent) root
+    // hop-own drain on openrouter under a healthy (absent) root — the session is
+    // pinned to the retired 0423 slug, which must behave as the same provider leg
     await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
     const drainBanner = banners.find((b) => b.title.startsWith("Hop provider drained"));
     ok(drainBanner, "hop-own drain banner fired");
