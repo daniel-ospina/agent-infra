@@ -53,6 +53,10 @@ import {
   MICRO_BLOCK_MESSAGE,
   TIER_RULE,
   default as reviewEnforcerFactory,
+  resolveGhShimDir,
+  materializeGhShim,
+  NEUTRAL_GH_SHIM_DIR,
+  withGhShim,
   type ReviewRecord,
 } from "./index.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
@@ -3077,6 +3081,70 @@ test("extractMergePrNumber: flag order never hides the PR number", () => {
   equal(extractMergePrNumber("gh pr merge --admin"), null, "no number → cannot bind evidence");
   equal(extractMergePrNumber("gh pr merge --admin; sleep 123"), null, "a later command's number is NOT this merge's PR");
   equal(extractMergePrNumber("gh pr create --title 123"), null);
+});
+
+test("withGhShim (#984): the argv-level gh shim is put on PATH for every bash call", () => {
+  const ORIG = "gh pr merge 123 --admin";
+  const shimmed = withGhShim(ORIG, "/repo/scripts/gh-shim");
+  ok(shimmed !== null, "a resolved shim dir yields a patched command");
+  // Its OWN LINE: a `&&` prefix would change the command's exit status, which the
+  // harness reports back to the agent.
+  equal((shimmed as string).split("\n").length, 2, "the prefix is one line plus the command");
+  ok((shimmed as string).endsWith(ORIG), "the caller's command is preserved verbatim");
+  ok((shimmed as string).startsWith('export PATH="/repo/scripts/gh-shim":"$PATH"'), "PATH is prepended, quoted");
+  equal(withGhShim(ORIG, null), null, "no shim installed → nothing injected (never a broken PATH)");
+  // The kill switch: this touches EVERY bash call, so it must be switchable.
+  const prev = process.env.AGENT_GH_SHIM;
+  process.env.AGENT_GH_SHIM = "0";
+  equal(withGhShim(ORIG, "/repo/scripts/gh-shim"), null, "AGENT_GH_SHIM=0 disables the layer");
+  if (prev === undefined) delete process.env.AGENT_GH_SHIM;
+  else process.env.AGENT_GH_SHIM = prev;
+  equal(withGhShim("true", "/a b/gh-shim"), 'export PATH="/a b/gh-shim":"$PATH"\ntrue',
+    "a shim path containing a space survives quoting");
+});
+
+test("withGhShim: the injected prefix must NOT make a benign command look like a git op", () => {
+  // The prefix names the shim, so scanning the MUTATED text would hand the gates a
+  // `gh` word the caller never wrote. The handler keeps the gates on the caller's
+  // text for exactly this reason; this asserts the hazard is real, so a refactor
+  // that starts scanning the patched string has a failing test to hit.
+  const benign = "echo hello";
+  equal(isAdminMergeCommand(benign), false, "the benign command is not an admin merge");
+  const patched = withGhShim(benign, "/repo/scripts/gh-shim") as string;
+  equal(isAdminMergeCommand(patched), false, "the prefix alone is not an admin merge");
+  equal(isGitOp(patched), isGitOp(benign), "and the prefix does not fabricate a git op");
+  // WHAT IS ACTUALLY INJECTED must be free of gate-relevant words. Other extensions
+  // read the same mutated `event.input.command` AFTER this handler, so injecting the
+  // CHECKOUT's path leaks the branch name (`…/930-admin-merge-rail/scripts/gh-shim`)
+  // into every bash command — and `admin` there flips THEIR gates: with such a path
+  // `isGitOp(patched)` is TRUE for a command that is not a git op (VGATE #984). The
+  // synthetic path above cannot catch that, so assert against the real one.
+  ok(!/admin/i.test(NEUTRAL_GH_SHIM_DIR),
+    `the neutral shim dir carries no gate word (got ${NEUTRAL_GH_SHIM_DIR})`);
+  const realPatch = withGhShim(benign, NEUTRAL_GH_SHIM_DIR) as string;
+  equal(isGitOp(realPatch), isGitOp(benign), "the REAL injected prefix does not fabricate a git op");
+  equal(isAdminMergeCommand(realPatch), isAdminMergeCommand(benign), "…nor an admin merge");
+});
+
+test("materializeGhShim: the shim is linked at a neutral path, not the checkout's", () => {
+  const resolved = resolveGhShimDir();
+  ok(resolved !== null, "a source shim resolves in this repo");
+  equal(materializeGhShim(null), null, "no source → nothing materialized (never an empty PATH entry)");
+  const neutral = materializeGhShim(resolved);
+  equal(neutral, NEUTRAL_GH_SHIM_DIR, "materializes into the neutral directory");
+  ok(neutral !== null && !/admin/i.test(neutral), "…whose path has no gate word");
+  equal(materializeGhShim(resolved), neutral, "idempotent — a second call is a no-op");
+});
+
+test("resolveGhShimDir: resolves this checkout's shim, and an unusable override falls back", () => {
+  const dir = resolveGhShimDir();
+  ok(dir !== null, "the repo's scripts/gh-shim is found from the extension's own location");
+  ok((dir as string).endsWith("gh-shim"), `resolved to a gh-shim dir (got ${dir})`);
+  process.env.AGENT_GH_SHIM_DIR = "/nonexistent/shim";
+  const fallback = resolveGhShimDir();
+  ok(fallback !== null && fallback !== "/nonexistent/shim",
+    "an unusable override FALLS BACK rather than silently disabling the layer");
+  delete process.env.AGENT_GH_SHIM_DIR;
 });
 
 test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {

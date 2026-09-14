@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# gh-shim/gh — the argv-level admin-merge guard (#984).
+#
+# WHY THIS EXISTS. The review-enforcer answers *"will this command text make gh
+# perform an admin merge?"* from STRING rules, and seven adversarial rounds each
+# closed one splice and found the next (`--ad""min`, `--ad\min`, `$'--admin'`,
+# `$'merge'`, `xargs {}`, `-${V:--}admin=true`, `$V-admin=true`). That class is not
+# closable in a scanner, and the reason is a proof rather than an impression:
+# resolving `$VAR`/`$(…)` requires EVALUATING a shell, which a gate cannot do
+# without running the very command it exists to refuse.
+#
+# This shim answers the same question from its OWN argv — a layer where the shell
+# has already finished. `-${V:--}admin=true` is the literal string `--admin` by the
+# time this process starts, so there is no splice left to hide behind and no string
+# rewriting to anticipate. The scanner stays as the fast first layer (it produces
+# better messages and costs nothing); THIS is the layer that does not share its
+# limit.
+#
+# Installed ahead of the real gh on PATH by the review-enforcer's `tool_call` hook,
+# so enforcement is not something a caller can forget.
+#
+# RULE: an admin merge is allowed only with a head-bound certifying evidence comment
+# for the CURRENT head. Everything else — every ordinary gh command — is passed
+# through untouched.
+#
+# STATED LIMITS — WHAT THIS LAYER CANNOT SEE (the counterpart to the scanner's own
+# STATED LIMITS, which this layer backs rather than replaces):
+#   - `gh alias`. The argv here is `gh <alias> …`; gh expands the alias AFTER we
+#     have run, so an alias defined as `pr merge --admin` is invisible to BOTH
+#     layers. Named, not silently trusted.
+#   - a command that discards this PATH entry — `env -i … gh …`, or an explicit
+#     `PATH=` reset — and a caller that invokes the real gh by ABSOLUTE path.
+#     Both are deliberate acts to remove the guard rather than subtle ones to hide
+#     a token, which is the improvement this layer buys.
+#   - argv already expanded in a PARENT process the harness never sees.
+#   - it is only active where it is wired: the review-enforcer puts it on PATH for
+#     bash tool calls, so a merge issued from outside the harness is not covered.
+#   - the CERTIFICATE IS NOT AUTHENTICATED. It is checked for shape, bound to the
+#     head, and required to be non-vacuous — but it is comment TEXT, and the same
+#     token that would merge can also write the comment. An agent that types the
+#     certifying lines by hand satisfies this gate. That is why the post-merge
+#     detector, not this gate, is the authority of record; this gate raises the
+#     cost of an unevidenced merge, it does not prove one was earned.
+#   - `gh api graphql -f query=@file`. The mutation text is read from a FILE, so no
+#     argv token carries `mergePullRequest`.
+#
+# Env:
+#   AGENT_ADMIN_MERGE_OVERRIDE=1   the existing audited hatch: allow, loudly
+set -uo pipefail
+
+# Resolve THIS script's own directory through any symlinks. The harness injects a
+# NEUTRAL symlink (`~/.pi/agent/shims/gh` -> here) so the path it puts on PATH carries
+# no gate-relevant word; `dirname "${BASH_SOURCE[0]}"` would then yield the shim LINK's
+# directory, the verifier would resolve to a path that does not exist, and every admin
+# merge would be refused. Fail-closed, but the layer would be dead in production.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  self_dir="$(cd "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  case "$self" in /*) ;; *) self="$self_dir/$self" ;; esac
+done
+SELF_DIR="$(cd "$(dirname "$self")" && pwd)"
+# NO override: this path is derived from the script's own location, so a caller cannot
+# redirect the check at a file of its choosing. An earlier `AGENT_GH_SHIM_VERIFY` env
+# seam was reachable in PRODUCTION — `AGENT_GH_SHIM_VERIFY=/dev/null` made the check
+# exit 0 and the admin merge proceeded unevidenced, with no announcement (VGATE).
+VERIFY="$SELF_DIR/../verify-admin-merge-evidence.sh"
+
+# The real gh. `AGENT_GH_REAL` is set by an OUTER invocation so that a nested call
+# (the verifier shells out to gh itself) cannot recurse back into this shim.
+find_real_gh() {
+  [ -n "${AGENT_GH_REAL:-}" ] && [ -x "${AGENT_GH_REAL}" ] && { printf '%s' "$AGENT_GH_REAL"; return 0; }
+  local d
+  local old_ifs="$IFS"
+  IFS=:
+  for d in $PATH; do
+    case "$d" in "$SELF_DIR"|"") continue ;; esac
+    [ -x "$d/gh" ] && { printf '%s' "$d/gh"; IFS="$old_ifs"; return 0; }
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+REAL="$(find_real_gh)" || {
+  printf 'gh-shim: cannot find the real gh (searched PATH minus %s)\n' "$SELF_DIR" >&2
+  printf 'gh-shim: refusing to run an unresolvable gh — pass AGENT_GH_REAL if it lives elsewhere\n' >&2
+  exit 127
+}
+export AGENT_GH_REAL="$REAL"
+
+# Flag values that belong to gh's GLOBAL flags, so the walker does not mistake a
+# repo name for the command word. (`--repo` is also the flag the verifier needs.)
+# Value-taking flags of `gh pr merge` plus gh's globals. A VALUE must never be
+# mistaken for the PR positional: `gh pr merge --admin --body 123` would otherwise
+# verify PR #123 while the real command merges the CURRENT BRANCH's PR (VGATE).
+VALUE_FLAGS=' -R --repo --hostname -b --body -F --body-file -t --subject -A --author-email --match-head-commit '
+# Flags that take NO value. Anything else is UNRECOGNIZED, which makes the parse
+# untrustworthy: we cannot tell a future flag's value from the PR number.
+BOOL_FLAGS=' --merge -m --squash -s --rebase -r --delete-branch -d --auto --disable-auto --admin --help -h '
+
+CMD=""; SUB=""; PR_NUM=""; IS_ADMIN=0; REPO_FLAG=""
+seen_cmd=0; expect_value=0; prev_flag=""; saw_unknown_flag=""
+for tok in "$@"; do
+  if [ "$expect_value" -eq 1 ]; then
+    expect_value=0
+    tok_value="${tok#=}"
+    case "$prev_flag" in -R|--repo) REPO_FLAG="$tok_value" ;; esac
+    continue
+  fi
+  # ATTACHED forms carry the value in the same token, so they must be matched
+  # BEFORE the generic `-*` branch — `--repo=owner/other` and `-Rowner/other` are
+  # both accepted by gh, and dropping the repo reads the evidence from the WRONG
+  # repository (VGATE). `-R=owner/other` is also valid pflag.
+  case "$tok" in
+    --repo=*) REPO_FLAG="${tok#--repo=}"; continue ;;
+    -R?*)     REPO_FLAG="${tok#-R}"; REPO_FLAG="${REPO_FLAG#=}"; continue ;;
+    # Attached SHORT values (`-b123`, `-Ffile`) are the same as `-b 123`; they consume
+    # nothing further, and must not later be read as the positional.
+    -b?*|-F?*|-t?*|-A?*) continue ;;
+    # A bare `--` is an argument separator, never the positional.
+    --) continue ;;
+  esac
+  case "$tok" in
+    -R|--repo|--hostname) expect_value=1; prev_flag="$tok"; continue ;;
+  esac
+  case "$tok" in
+    -*)
+      # An admin flag is matched HERE, on resolved argv, where `--admin` is a
+      # literal string — the same value the scanner had to guess about.
+      case "$tok" in
+        --admin) IS_ADMIN=1 ;;
+        --admin=false|--admin=FALSE|--admin=False|--admin=0|--admin=f|--admin=F) ;;
+        --admin=*) IS_ADMIN=1 ;;
+      esac
+      # An ATTACHED value (`--body=123`) consumes nothing further.
+      case "$tok" in
+        --body=*|--body-file=*|--subject=*|--author-email=*|--match-head-commit=*|--repo=*) continue ;;
+      esac
+      case "$VALUE_FLAGS" in *" $tok "*) expect_value=1; prev_flag="$tok"; continue ;; esac
+      case "$BOOL_FLAGS" in *" $tok "*) continue ;; esac
+      saw_unknown_flag="$tok"
+      continue ;;
+  esac
+  if [ "$seen_cmd" -eq 0 ]; then CMD="$tok"; seen_cmd=1; continue; fi
+  if [ -z "$SUB" ]; then SUB="$tok"; continue; fi
+  [ -z "$PR_NUM" ] && PR_NUM="$tok"
+done
+
+# `gh api …/merge` is the other shape that lands a merge. The endpoint may carry a
+# QUERY or FRAGMENT (`…/merge?s=1`, accepted by gh and still routed to the merge
+# endpoint), so strip those before matching — matching the bare token missed it in
+# BOTH layers (VGATE).
+if [ "$CMD" = "api" ]; then
+  for tok in "$@"; do
+    api_path="${tok%%\?*}"
+    api_path="${api_path%%#*}"
+    # CASE-INSENSITIVELY: GitHub's route matching is case-insensitive, so
+    # `PUT …/pulls/1/MERGE` reaches the same endpoint (live probe: 401, where a bogus
+    # path is 404) — the case-sensitive glob let it through in both layers (VGATE).
+    # `tr` rather than `${x,,}`: macOS ships bash 3.2, which lacks it.
+    api_path="$(printf '%s' "$api_path" | tr '[:upper:]' '[:lower:]')"
+    case "$api_path" in */merge|*/merge/*) IS_ADMIN=1 ;; esac
+    # GraphQL. `mergePullRequest` IS the mutation `gh pr merge --admin` itself issues
+    # (gh sends no admin field in its REST payload; it is the server-side mutation that
+    # performs the bypass), so calling it directly is ADMIN-EQUIVALENT and needs no
+    # obfuscation at all (VGATE).
+    case "$tok" in *mergePullRequest*) IS_ADMIN=1 ;; esac
+  done
+fi
+
+# Everything that is not an admin merge is not this shim's business.
+if [ "$IS_ADMIN" -eq 0 ]; then
+  exec "$REAL" "$@"
+fi
+
+# FROM HERE ON: an admin merge. Refusal is the default; the rail's evidence is the
+# only thing that opens it.
+if [ "${AGENT_ADMIN_MERGE_OVERRIDE:-}" = "1" ]; then
+  printf 'gh-shim: ⚠️  ADMIN-MERGE OVERRIDE — AGENT_ADMIN_MERGE_OVERRIDE=1 (audited).\n' >&2
+  printf 'gh-shim:    The post-merge detector still runs. Ensure the operator approved this.\n' >&2
+  exec "$REAL" "$@"
+fi
+
+if [ -z "$PR_NUM" ]; then
+  printf 'gh-shim: ✗ REFUSED — an admin merge with no PR number in argv cannot be justified.\n' >&2
+  printf 'gh-shim:   Name the PR so its head-bound evidence can be checked, or use the rail:\n' >&2
+  printf 'gh-shim:       scripts/admin-merge.sh <PR> [--workflow <lane>]\n' >&2
+  exit 1
+fi
+# An UNRECOGNIZED flag before the positional means we cannot tell a flag's VALUE
+# from the PR number (`--future-flag 123`). Fail closed rather than verify the
+# wrong PR.
+if [ -n "$saw_unknown_flag" ]; then
+  printf 'gh-shim: ✗ REFUSED — unrecognized flag %s before the PR number, so the number\n' "$saw_unknown_flag" >&2
+  printf 'gh-shim:   cannot be told from that flag'"'"'s value. Pass the PR first, or use the rail.\n' >&2
+  exit 1
+fi
+case "$PR_NUM" in *[!0-9]*)
+  printf 'gh-shim: ✗ REFUSED — %s is not a PR number, so evidence cannot be resolved.\n' "$PR_NUM" >&2
+  exit 1 ;;
+esac
+
+if [ ! -x "$VERIFY" ] && [ ! -f "$VERIFY" ]; then
+  printf 'gh-shim: ✗ REFUSED — the evidence verifier is missing (%s).\n' "$VERIFY" >&2
+  printf 'gh-shim:   Failing closed: an unverifiable admin merge does not happen.\n' >&2
+  exit 1
+fi
+
+verify_args=("$PR_NUM")
+[ -n "$REPO_FLAG" ] && verify_args+=(--repo "$REPO_FLAG")
+verify_out="$(bash "$VERIFY" "${verify_args[@]}" 2>&1)"
+verify_rc=$?
+if [ "$verify_rc" -ne 0 ]; then
+  printf '%s\n' "$verify_out" | sed 's/^/gh-shim: /' >&2
+  printf 'gh-shim: ✗ REFUSED — no head-bound evidence justifies this admin merge (PR #%s).\n' "$PR_NUM" >&2
+  printf 'gh-shim:   `--admin` bypasses required checks, so it needs the rail certificate:\n' >&2
+  printf 'gh-shim:       scripts/admin-merge.sh %s [--workflow <lane>]\n' "$PR_NUM" >&2
+  exit 1
+fi
+
+printf 'gh-shim: ✅ head-bound evidence verified for PR #%s — allowing the admin merge.\n' "$PR_NUM" >&2
+exec "$REAL" "$@"
