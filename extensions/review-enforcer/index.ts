@@ -308,7 +308,10 @@ function isGhWordAt(scan: ScanTokens, i: number): boolean {
   // it sits. A FULLY quoted word (`"gh"`) is executable only in command position.
   const partiallyUnquoted = [...tok].some((_, k) => scan.mask[start + k]);
   if (partiallyUnquoted) return true;
-  const prev = i === 0 ? null : scan.tokens[i - 1];
+  let prev = i === 0 ? null : scan.tokens[i - 1];
+  // `bash -c -- '...'` is valid: `--` separates the option from the script. Look
+  // THROUGH it, or the introducer stops being recognised (cycle-4 review P0-2).
+  if (prev === "--" && i >= 2) prev = scan.tokens[i - 2];
   return (
     prev === null ||
     // A newline is a command separator too: `gh pr merge 111 --admin\n"gh" pr
@@ -316,7 +319,15 @@ function isGhWordAt(scan: ScanTokens, i: number): boolean {
     // quoted) verb lost its command position and the compound count stayed 1.
     /[;&|(){!\n\r]/.test(scan.gaps[i]) ||
     COMMAND_INTRODUCERS.test(prev) ||
-    /^-[a-z]*c$/.test(prev) // `sh -c '...'`, `bash -lc '...'`
+    /^-[a-z]*c$/.test(prev) || // `sh -c '...'`, `bash -lc '...'`
+    // Other real command positions. A redirection (`2>/dev/null`, `>/dev/null`),
+    // an assignment prefix (`FOO=bar`) or a reserved word (`if`, `while`, ...)
+    // all put the next word in command position; enumerating only the introducers
+    // and `-c` let `2>/dev/null "gh" pr merge 1 --admin` skip BOTH gates
+    // (cycle-4 review P0-1).
+    /^(\d*[<>]|&>>?)/.test(prev) || // redirection (`2>/dev/null`)
+    /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev) || // assignment prefix
+    /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prev)
   );
 }
 
@@ -351,11 +362,46 @@ export function isAdminMergeCommand(command: string): boolean {
     // `merge` must be a WORD in the text — `isGhPrMergeCommand` is deliberately
     // broad (any `gh` + `pr` under a construct), so reusing it here made a benign
     // `gh pr view $X` admin-gated.
-    return (
-      hasUnresolvableConstruct(command) &&
-      /(^|[^\w])merge\b/.test(normalizeForFlagScan(command)) &&
-      /(^|\s)\$[{(A-Za-z_]/.test(command)
-    );
+    if (!hasUnresolvableConstruct(command)) return false;
+    if (!/(^|[^\w])merge\b/.test(normalizeForFlagScan(command))) return false;
+    // A `$`-bearing ARGUMENT anywhere in the merge command means the flag may be
+    // hidden in it. The whitespace anchor missed the QUOTED form
+    // `gh pr merge 999 "$(printf '\x2d\x2d\x61dmin')"`, whose `$` follows a `"`.
+    // Carve out only the POSITION argument — the first token after `merge` — so the
+    // common `gh pr merge "$PR" --squash` stays outside the gate (cycle-4 P0-3).
+    // Only a `$`-bearing token that is an ARGUMENT OF THE MERGE counts. Scoping it
+    // to anything `$`-bearing in the command made `cd "$HOME/wt" && gh pr merge 7`
+    // an admin merge, which hijacked the cd-attribution gate and reported the
+    // wrong reason (cycle-4 regression caught by the existing cd tests).
+    const scan = scanTokens(command);
+    let mergeIdx = -1;
+    for (let i = 1; i < scan.tokens.length; i++) {
+      if (dequote(scan.tokens[i]) === "merge" && dequote(scan.tokens[i - 1]) === "pr") {
+        mergeIdx = i;
+        break;
+      }
+    }
+    if (mergeIdx === -1) return false;
+    // Work on the RAW text after the `merge` word, not on tokens: the separator
+    // split breaks `$(printf ...)` into `"$` + `printf` + ..., so a token-local
+    // test missed a QUOTED substitution supplying the flag (cycle-4 P0-3).
+    const afterMerge = command
+      .slice(scan.starts[mergeIdx] + scan.tokens[mergeIdx].length)
+      .replace(/^\s+/, "")
+      .split(/\s+/)
+      .filter(Boolean);
+    // Drop the POSITION argument (a benign `"$PR"`) and drop a value-flag's value
+    // (`--body "$(cat msg)"` is not a flag). What remains is the only place an
+    // `--admin` could be hiding.
+    const VALUE_FLAGS = new Set([
+      "--body", "-b", "--body-file", "-F", "--subject", "-t",
+      "--author-email", "--repo", "-R", "--match-head-commit",
+    ]);
+    for (let i = 1; i < afterMerge.length; i++) {
+      if (VALUE_FLAGS.has(afterMerge[i - 1])) continue;
+      if (/\$/.test(afterMerge[i])) return true;
+    }
+    return false;
   }
   const bare = stripRepoArgs(command);
   const probe = normalizeForFlagScan(bare);
@@ -1031,13 +1077,14 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  * `-${V:--}admin=true` were on this list in an earlier revision and are now
  * CLOSED by rule 2 below — verified, not assumed.)
  *
- * A `$VAR`-SUPPLIED FLAG is CLOSED by failing closed, and the cost is stated: a
- * merge shape with an unresolvable construct and a BARE `$VAR` argument is treated
- * as an admin merge (`isAdminMergeCommand`), because `V=--admin; gh pr merge 999
- * $V` reaches gh as an admin merge while no text scan can see the word `admin`.
- * This also refuses the benign unquoted `gh pr merge $PR --squash`. The QUOTED form
- * `gh pr merge "$PR" --squash` (the common one) is unaffected — its `$` is not
- * preceded by whitespace — and the evidence comment is the documented way through.
+ * A `$VAR`- or `$()`-SUPPLIED FLAG is CLOSED by failing closed: any `$`-bearing
+ * ARGUMENT of the merge beyond the position argument makes the command an admin
+ * merge, because `V=--admin; gh pr merge 999 $V` reaches gh as an admin merge while
+ * no text scan can see the word `admin`. The POSITION argument is exempt (in either
+ * quoting form) and a value-flag's value is exempt, so `gh pr merge "$PR" --squash`
+ * and `gh pr merge 999 --body "$(cat msg)"` stay outside the gate — the common
+ * shapes are NOT over-blocked. Not claimed: that every `$`-bearing later argument
+ * really is the flag. A false hit costs a retry; a miss is an unevidenced merge.
  *
  * A complete gate cannot be built on this surface: it needs argv-level
  * enforcement (a `gh` shim/allowlist). This file's claims are bounded to what it

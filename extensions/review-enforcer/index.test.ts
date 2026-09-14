@@ -3033,6 +3033,24 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   ok(!hasAdminMergeFlag("gh pr merge 123 --no-admin"), "`--no-admin` is not the flag");
 });
 
+test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs", () => {
+  // Cycle-4 review P2: the `$VAR`-supplied-flag BRANCH could be deleted with the
+  // suite still green, because the only class-6 case in the table (`V=--admin; gh
+  // pr merge … $V`) is caught earlier by the literal-`admin` rule. These assert what
+  // ONLY that branch provides, so deleting it goes red.
+  ok(!isAdminMergeCommand("gh pr merge $PR --squash"), "the position argument is exempt in EITHER quoting form");
+  ok(isAdminMergeCommand("gh pr merge $PR $FLAG"), "a SECOND `$`-bearing argument can hide the flag, so it fails closed");
+  ok(isAdminMergeCommand("gh pr merge 999 $FLAG"), "a bare `$VAR` argument after the position fails closed");
+  ok(isAdminMergeCommand("V=--admin; gh pr merge 999 $V"), "a `$VAR`-supplied flag fails closed");
+  ok(isAdminMergeCommand('gh pr merge 999 "$(printf x)"'), "a QUOTED substitution argument fails closed");
+  // The carve-outs that keep legitimate merges usable.
+  ok(!isAdminMergeCommand('gh pr merge "$PR" --squash'), "the QUOTED position argument is NOT gated");
+  ok(!isAdminMergeCommand('gh pr merge 999 --body "$(cat msg)"'), "a dynamic --body is NOT the flag");
+  ok(!isAdminMergeCommand('gh pr merge 999 -F "$tmpfile"'), "a dynamic --body-file is NOT the flag");
+  ok(!isAdminMergeCommand('cd "$HOME/wt" && gh pr merge 7'), "a `$` BEFORE the merge word is not the flag");
+  ok(!isAdminMergeCommand("gh pr view $X"), "a non-merge gh call with a `$VAR` is NOT gated");
+});
+
 test("countMergeVerbs: a compound command must fail closed", () => {
   // Fresh review P1-1: `extractMergePrNumber` deliberately truncates at the first
   // separator and the gate evaluates ONE PR, so `gh pr merge 111 --admin; gh pr
@@ -3268,6 +3286,16 @@ for (const [label, command] of [
   // Cycle-3 review: a `$VAR` may SUPPLY the flag, so no text scan can see the
   // word `admin`. Fails closed (documented over-block for an unquoted `$PR`).
   ["a `$VAR`-supplied admin flag", `V=--admin; gh pr merge ${PR_ADMIN} $V`],
+  // Cycle-4 review P0-1: a redirection / assignment / reserved-word PREFIX is a
+  // command position; enumerating only introducers and `-c` let these skip both
+  // gates when the command name was also quoted.
+  ["a redirection before a quoted `gh`", `2>/dev/null "gh" pr merge ${PR_ADMIN} --admin`],
+  ["an assignment prefix before a quoted `gh`", `FOO=bar "gh" pr merge ${PR_ADMIN} --admin`],
+  // Cycle-4 review P0-2: `--` may separate an introducer's option from its script.
+  ["`sh -c --` with the command quoted", `sh -c -- 'gh pr merge ${PR_ADMIN} --admin'`],
+  // Cycle-4 review P0-3: the flag may be SUPPLIED by a quoted substitution, whose
+  // `$` follows a `"` — a whitespace-anchored test missed it entirely.
+  ["a quoted substitution supplying the flag", `gh pr merge ${PR_ADMIN} "$(printf '\\x2d\\x2d\\x61dmin')"`],
 ] as const) {
   testAsync(`#930 refusal: ${label} without evidence is BLOCKED`, async () => {
     await withTempHome(async () => {
