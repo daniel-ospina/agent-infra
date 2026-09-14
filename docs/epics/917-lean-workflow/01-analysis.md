@@ -9,8 +9,10 @@ aboutObjects:
 status: live
 created: 2026-09-13
 revision: 2
-revision_note: "Revision 2 (2026-09-14, anchored at 01d0684) re-anchors this document to repo state after five merges it
-  predates (#922/#946, #980, #973, #992, #1020). W5/#922 is DONE (83ab24f); N6 is retired as consumed by it; W3 shrinks
+revision_note: "Revision 2 (2026-09-14, anchored at 01d0684 = 14:21:12Z) re-anchors this document to repo state after four merges it
+  predates (#922/#946, #980, #973, #992). #1020 is NOT among them — it merged at 14:31:14Z, ten minutes AFTER the anchor,
+  so it post-dates this revision rather than being absorbed by it; it is named below only where it is a measured fact.
+  W5/#922 is DONE (83ab24f); N6 is retired as consumed by it; W3 shrinks
   to its task-workflow-standard half because #980 removed the second-model subsystem entirely — which is also D2's answer
   to 'does the different-model check survive?'. Every figure now carries a stated pipeline and a measured-at anchor, or is
   explicitly labelled un-re-verified; N9's verbatim quote is replaced with the real code anchors. Revision 1 follows.
@@ -28,7 +30,7 @@ revision_note: "Revision 2 (2026-09-14, anchored at 01d0684) re-anchors this doc
 
 The agent workflow has become **self-referential**: the machinery that governs the work is now the main source of the work.
 
-**Measurement anchor.** Every row was **re-measured on 2026-09-14 at `01d0684`** using the pipeline in the last column;
+**Measurement anchor.** Every row **except the 8-most-recent-merged-PRs row** was **re-measured on 2026-09-14 at `01d0684`** using the pipeline in the last column — that one row was measured **after** the anchor and says so in-cell; every other row the last column names.
 revision 1 read them on 2026-09-13 with no per-row anchor. Where a figure **could not** be reproduced — the
 framework-internal *numerator* rows, which were never backed by a recorded command — it is kept but marked **†un-re-verified**
 rather than silently retained. Every denominator moved, so the revision-1 percentages are no longer reproducible either.
@@ -40,10 +42,10 @@ rather than silently retained. Every denominator moved, so the revision-1 percen
 | Merged PRs in agent-infra that are scaffolding maintenance | **212† / 319 (66%)** | 212 / 300 (71%) | denominator: `… is:pr is:merged`; numerator †un-re-verified |
 | Merged PRs that are product/content work | **7† / 319 (2%)** | 7 / 300 (2%) | same denominator; numerator †un-re-verified |
 | Sept issue creation vs closure | **434 created / 209 closed** | 355 / 183 | `… is:issue created:2026-09-01..2026-09-30` / `closed:2026-09-01..2026-09-30` |
-| The 8 most recent merged PRs | **6 of 8** gate/guard/pipeline fixes (#1006, #1005, #992, #982, #980, #973); 2 docs (#1020 AGENTS.md edit, #950 upstream-issue record) | all 8 | `gh pr list --state merged --limit 8 --json number,title` |
+| The 8 most recent merged PRs | **6 of 8** gate/guard/pipeline fixes (#1006, #1005, #992, #982, #980, #973); 2 docs (#1020 AGENTS.md edit, #950 upstream-issue record) — **#1020 post-dates the anchor** (merged 14:31:14Z vs anchor 14:21:12Z), so this row was measured AFTER the anchor, not at it | all 8 | `gh pr list --state merged --limit 8 --json number,title` |
 | Reviewer dispatches for one complex issue | **45–70† — not re-measured** (manual session trace; no reproducible pipeline) | 45–70 | skill trace, all 7 loops |
-| Skills defining their own review/gate loop | **39 of 98** | 43 of 101 | `grep -rl --include=SKILL.md "NO ISSUES FOUND" skills/ \| wc -l` = 39; `ls skills/*/SKILL.md \| wc -l` = 98 (nested `SKILL.md` under `skills/**` adds 25 → 123) |
-| Enforcement code vs process definition | **133,114 vs 43,329 lines** (87,932 excluding `*.test.*` and `test(s)/`) | ~122,000 vs 43,400 (not reproducible from the stated source) | `find extensions scripts -type f \( -name '*.ts' -o -name '*.mjs' -o -name '*.js' -o -name '*.sh' -o -name '*.cjs' -o -name '*.py' \) \| xargs cat \| wc -l` vs `find skills -name '*.md' \| xargs cat \| wc -l` |
+| Skills defining their own review/gate loop | **39 of 98** | 43 of 101 | `grep -rl --include=SKILL.md "NO ISSUES FOUND" skills/ \| wc -l` = 39; `ls skills/*/SKILL.md \| wc -l` = 98 (nested `SKILL.md` under `skills/**` adds 25 → 123, counted by basename; the tracked editor temp `skills/prototype-review/.!56666!SKILL.md` matches a suffix grep but is not a skill — see #740, #463) |
+| Enforcement code vs process definition | **133,114 vs 43,329 lines** (87,932 excluding `*.test.*` and `test(s)/`) | ~122,000 vs 43,400 (not reproducible from the stated source) | `find extensions scripts -type f ! -path '*/node_modules/*' \( -name '*.ts' -o -name '*.mjs' -o -name '*.js' -o -name '*.sh' -o -name '*.cjs' -o -name '*.py' \) \| xargs cat \| wc -l` vs `find skills -name '*.md' \| xargs cat \| wc -l` — the `node_modules` exclusion is required: without it the pipeline is not reproducible in a tree with dependencies installed (it returns ~559,689). Figures verified against `git archive 01d0684`, which has no `node_modules` |
 
 The question this epic answers is not "are gates good?" — several are load-bearing and incident-driven. It is: **which of these gates are producing signal, and which are producing only cost?**
 
@@ -87,13 +89,13 @@ Six parallel read-only verification passes were run **before** decomposition. Th
 | # | Original claim | Verified reality | Disposition |
 |---|---|---|---|
 | **C1** | "`tools/collision_preflight.py` does not exist; a whole session was wasted because the check was imaginary" | **FALSE PREMISE.** A repo-wide search returns **zero** references to `collision_preflight` in agent-infra (the file exists in **tortoise**, 42 KB). The current skills mandate `scripts/parallel_work_check.sh start` (`issue-scoping:106`, `executing-plans:19`). **But the gap the issue points at is real** — see below. | **Retain #878, narrowed.** Do not close it. |
-| **C2** | "Gate scripts were never ported — pipeline gates silently no-op" (#100) | **STALE.** `scripts/_research_path.sh` (107 L, `+x`), `scripts/validate-script.cjs` (351 L), `scripts/cron-quality-gates.sh` (367 L, `+x`) all exist and are wired. | **Close #100.** Already fixed. |
+| **C2** | "Gate scripts were never ported — pipeline gates silently no-op" (#100) | **STALE.** `scripts/_research_path.sh` (107 L, `+x`), `scripts/validate-script.cjs` (351 L), `scripts/cron-quality-gates.sh` (367 L, `+x`) all exist and are wired. | **#100 needs no action — it is already CLOSED** (2026-08-07, five weeks before this epic). The finding stands; the *action* is void. |
 | **C3** | "The VGATE docs exemption requires a bare `git commit`, but AGENTS.md mandates `git commit -F <file>`, so following the rule disables the exemption" (#908) | **MISDIAGNOSED.** Measured against the real `isBareCommitShape` on HEAD: `git commit -F /tmp/m.md` → **bare (exempt)**. AGENTS.md's full literal `${TMPDIR…}` command → **bare (exempt)**. The **actual** blocked command (session archive `2026-09-10T18-48-17-978Z`, line 2699) was `… && git commit -F /tmp/commit-msg-…md 2>&1 \| tail -20`. Cause: `isRedirectToken` is applied at `verification-gate/index.ts:1205` and `:2148` but **not** in `isBareCommitShape` (`:1326-1368`), so `2>&1` is parsed as a **pathspec**. | **Fix is NOT one line — my second error on this row.** Tested against the real predicate: a bare `continue` on redirect tokens fixes the glued forms (`2>&1`, `>/dev/null`) but **not** the space-separated form (`> /dev/null`), which tokenises as `>` + `/dev/null` and leaves the *target* as the bare positional. Correct fix is two-part (~4 lines) at `index.ts:1346` — skip the redirect token, and when it is an operator, consume its target too. **Also, the non-bare surface is three classes, not one:** unknown long flags (`--trailer`, `--author`, `--date`, `--allow-empty`, `--cleanup`) and inline trailing comments (`index.ts:1361-1367`) defeat the exemption identically. #908's stated mechanism (`-F`) is refuted; its *conclusion* — "the exemption is largely unreachable in practice" — survives through all three. |
 | **C5** | "The test-review hash backstop store has never held an entry, so the gate is prose-only" (my own N7 finding, from `~/.pi/agent/test-review/` being empty) | **PREMISE FALSE, conclusion survives.** The store **has** held entries — the hash `fbb28d…803` in `docs/plans/2026-09-05-issue-485-micro-dispatch-policy.md:127` reproduces exactly as the SHA-256 of a **worktree path** (`.worktrees/485/extensions/review-enforcer/index.test.ts`), and `audit.jsonl` shows it being read and written on 2026-09-06. The entries vanished because the key is `sha256(realpath(file))` — when the worktree was cleaned up, the entry was orphaned and pruned. **The empty directory is explained by a fragile key, not by the writer never running.** The gate *is* unenforced (no hook, script, CI job, or extension reads it) — that part is real. | **Delete the gate** (redundant with the mandatory synchronous test-review), but fix the stated reason: the defect is the key, not a dead writer. |
 | **C6** | "Nothing requires a regression test to have been observed failing" (#820) | **REAL.** Verified: no mechanism matches (`grep` for red-phase/observed-failing/sabotage markers across `scripts/`, `.husky/`, `extensions/`, `.github/` → no matches). The nearest thing, `scripts/cron-quality-gates.sh:219-270`, is a **static grep for assertion markers** — it rejects tests with zero assertions, and would pass a vacuous pin that has an assertion but is invariant. It is also **not scheduled** (no crontab, no launchd, not in CI). | **Implement, scoped — do not delete.** The requirement is honestly scoped to TDD-authored tests; deleting it would remove a legitimate instruction. Add a bounded sabotage pass instead. |
 | **C4** | "There is no measurement of whether any gate catches anything useful" | **PARTLY WRONG.** Run-rate and block-rate are measured (§2.1). Missing: **correctness** (Q3) and **time** (Q4). No correlation id joins `gate-events.jsonl` to `audit.jsonl`, so latency cannot even be inferred. | **Narrow the item** to correctness + duration + a reader. |
 
-Additionally: **#894 is already fixed** (hardened in `c88d0d7`; the tests now reject a shrunk and an empty subject set) → close.
+Additionally: **#894 is already fixed** (hardened in `c88d0d7`; the tests now reject a shrunk and an empty subject set) **and is already CLOSED** (2026-09-13, before this document's own `01d0684` anchor) → no action.
 
 **Methodological lesson for this epic:** 3 of 4 corrections were cases where an issue *title or body* asserted a repo state that had drifted. Any child issue in this epic must state its **verification command**, not just its claim.
 
@@ -117,7 +119,7 @@ These were surfaced only by the verification passes.
 
 **N8 — no gate requires a regression test to have been observed failing.** No `red_phase` / `observed_failing` / `test_failed_first` check exists in `scripts/`, `.husky/`, or `extensions/*/index.ts`. #820 is accurate.
 
-**N9 — the pin in #874 is vacuous for a different reason than reported.** `tier-config-parity.test.ts:246-288` compares `TIER_CONFIG` numbers against a **regex-parsed markdown table** — but `extensions/loop-enforcer/index.ts:1724` calls `evaluateTermination(cycleData)` with **one argument**, defaulting to `REVIEW_CYCLE_CAPS.high`, and `liveCallShapeViolations` **forbids** passing a `tier` argument. That property is asserted directly by the suite: `liveCallShapeViolations` is defined at `extensions/loop-enforcer/tier-config-parity.test.ts:221` and asserted at `:1155` (`deepEqual(liveCallShapeViolations(INDEX_SRC), [], "live call shape drifted")`). The pinned mapping is **unreachable code**.
+**N9 — the pin in #874 is vacuous for a different reason than reported.** (`#874` itself is **CLOSED**, 2026-09-13T07:11:55Z — pre-anchor, and its fix is what the revision-1 quote got wrong. This section records the mechanism, not a pending action, and it is **retired as a live finding**: no work is owed on #874.) `tier-config-parity.test.ts:246-288` compares `TIER_CONFIG` numbers against a **regex-parsed markdown table** — but `extensions/loop-enforcer/index.ts:1724` calls `evaluateTermination(cycleData)` with **one argument**, defaulting to `REVIEW_CYCLE_CAPS.high`, and `liveCallShapeViolations` **forbids** passing a `tier` argument. That property is asserted directly by the suite: `liveCallShapeViolations` is defined at `extensions/loop-enforcer/tier-config-parity.test.ts:221` and asserted at `:1155` (`deepEqual(liveCallShapeViolations(INDEX_SRC), [], "live call shape drifted")`). The pinned mapping is **unreachable code**.
 
 > **Correction (revision 2).** Revision 1 attributed a verbatim quote to `termination.ts:79` — *"no production caller passes `tier`"*. **No such text exists in the repo.** `grep -rn "production caller" extensions/ scripts/ skills/` returns only two unrelated hits in `scripts/check-pi-pin-lockstep.mjs`, and `extensions/loop-enforcer/termination.ts:79` is instead the comment *"which AGENTS.md §Hard Cap names canonical"* about the parity test parsing the skill table. The quote was **fabricated**. The mechanism above is real and is carried by the two code anchors named in its place — but a quotation is only admissible if it is reproducible, and this one was not.
 
@@ -128,7 +130,7 @@ These were surfaced only by the verification passes.
 Ranked by **time freed per unit of quality risk**. W1–W3 are near-free.
 
 ### W1 — Close the stale gate claims (and fix the one real gap)
-Close **#100** (stale — scripts exist and are wired) and **#894** (already fixed in `c88d0d7`). No code change.
+**#100** (stale — scripts exist and are wired) and **#894** (fixed in `c88d0d7`) are **both already CLOSED** — recorded here as findings, nothing to close. No code change.
 
 **Retain #878.** Its premise is wrong (`collision_preflight` does not exist in agent-infra) but its instinct is right, and the pre-flight does have a genuine hole — verified in `scripts/parallel_work_check.py`:
 
@@ -142,6 +144,8 @@ Close **#100** (stale — scripts exist and are wired) and **#894** (already fix
 
 ### W2 — Fix the confirmed fail-open paths
 `verification-gate`: make registration failure **abort** rather than register nothing (N1); un-swallow the bridge write (N3); add an outer cap to the auto-bypass (N4). `main-worktree-guard`: make the import failure fail **closed**, and make `isWorktreeCwd` (bash) match `isWorktreeCwdWrite` (write) (N2).
+
+**What actually shipped (PR #1019, merged 2026-09-14T21:35:37Z):** the **O3** verify-loop read-failure discrimination — a non-`ENOENT` read failure now blocks instead of being silently skipped. That was the reachable fail-open; it was found during scoping and is the one this row delivered. **N1 and N3 were assessed and left unchanged**: N1 is a D1-policy question (guard-machinery failure ⇒ fail **open** with a loud alarm, while detected violations fail closed) and today's behaviour already complies; N3 already fails CLOSED. N2/N4 remain open under their own issues.
 **Risk: none to quality** — these only make checks that are *supposed* to run actually run. Expect a short increase in blocks while the reasons for them are cleaned up. **Effort: medium.**
 
 ### W3 — Delete the two strict-subset review loops — **HALF DONE (#980)**
@@ -193,11 +197,11 @@ Then restore the docs/static-only exemption under a **narrow** definition that c
 **Risk: low under (1)-(6).** Effort: low. Corroborated by `verification-gate/index.ts:1322` (`BARE_COMMIT_VALUE_FLAGS` already includes `-F`).
 
 ### W8 — Implement or delete the two genuinely dead gates
-**N7** (`test-review` backstop, #891): port to a real script wired into `.husky/pre-commit`, **or** delete the gate claim. **N8** (#820): add an observed-failing-test requirement, **or** delete the claim from `test-writing`. Also correct `commit-workflow/workflow/01-preflight.md:605-660`, whose "Mechanism" bash is never executed by any hook — agents must transcribe it, which is the same prose-only class.
+**N7** (`test-review` backstop, #891): ~~port to a real script wired into `.husky/pre-commit`, **or** delete the gate claim~~ → **DONE — the gate claim was deleted** (PR #944, merged 2026-09-14T21:47:27Z; #891 CLOSED). **N8** (#820): add an observed-failing-test requirement, **or** delete the claim from `test-writing`. Also correct `commit-workflow/workflow/01-preflight.md:605-660`, whose "Mechanism" bash is never executed by any hook — agents must transcribe it, which is the same prose-only class.
 **Risk: none** — either action removes a false guarantee. **Effort: low–medium.**
 
 ### W9 — Keep one copy of the review-loop rules, not five
-The 3-layer stuckness specification is duplicated verbatim in **5 files** (`code-review/SKILL.md`, `code-review/references/fixer-loop.md`, `plan-review`, `test-review`, `verification-before-completion`), and the adversarial-bound fence in **6**. `code-review` itself contains the instruction *"that file and this section must agree."* Drift has already occurred: #822, #833, #871, #874, #875, #892, #894.
+The 3-layer stuckness specification is duplicated verbatim in **7 files** (`code-review/SKILL.md`, `code-review/references/fixer-loop.md`, `plan-review`, `test-review`, `verification-before-completion`, `meta-framework-research/workflow/07-review-gate.md`, `carousel-designer/SKILL.md` — re-measured 2026-09-14 by `grep -rl "fingerprint-stall\|honest-stuck\|zero-progress" skills/`), and the adversarial-bound fence in **6**. `code-review` itself contains the instruction *"that file and this section must agree."* Drift has already occurred: #822, #833, #871, #874, #875, #892, #894.
 **Action:** one canonical definition; all other files link to it.
 **Risk: none.** Effort: low.
 
@@ -241,17 +245,17 @@ Every incident currently adds a rule; nothing removes one — that is the mechan
 
 | Workstream | Issue | Depends on | Risk | Effort |
 |---|---|---|---|---|
-| W1 close stale claims (#100, #894) + W6 delete inline-review rule | **#919** (narrowed: W9 + W12 dropped) | — | none | very low |
-| W2 fix fail-open paths | **#920** (narrowed: N1 + N3 only) | — | none | low–medium |
+| W1 record stale claims (#100, #894) + W6 delete inline-review rule | **#919** (narrowed: W9 + W12 dropped) — **merged 2026-09-14T18:26:54Z** | — | none | very low |
+| W2 fix fail-open paths | **#920 — merged 2026-09-14T21:35:37Z** (PR #1019, `dc0270f463`). **Shipped: the O3 verify-loop read-failure discrimination.** N1 (registration-`try` catch) and N3 (`writeBridge`) were assessed and **deliberately left unchanged** — N1 is a D1-policy question (guard-machinery error ⇒ fail open with alarm), N3 already fails CLOSED | — | none | low–medium |
 | W3 delete 2 strict subsets + W4 one design gate (17 conserved checks) | **#921** | #919 | medium | medium |
 | W5 4 reviewers in code-review | **#922 — DONE** (`83ab24f`, PR #946, merged 2026-09-13T23:22:21Z) | — | medium | low |
 | W7 redirect fix + docs exemption | **#908** (canonical — #923 closed as dup) | — | low | low |
-| W8 implement or delete 2 dead gates | **#891** + **#820** (canonical — #924 closed as dup) | — | none | low–med |
+| W8 implement or delete 2 dead gates | **#820** remains — **#891 is DONE** (PR #944, merged 2026-09-14T21:47:27Z; the N7 half shipped, so this row is half-closed) | — | none | low–med |
 | W10 measure correctness + duration | **#925** | — | high (ext) / low (scripts) | medium |
 | W11 invert the git guard (SCOPING ONLY) | **#926** | #920, #925 | **high** | high |
 | worktree helper false block | **#897** (canonical — #918 closed as dup) | — | none | low |
 
-**Post-hoc dedup pass changed this table.** 3 of the 9 filed issues were duplicates and 2 more were partly duplicated — see §7.1. **As of revision 2 (2026-09-14 at `01d0684`) the live issues are #919, #920, #921, #925, #926** — **#922 is CLOSED** (2026-09-13T23:22:22Z) and its work shipped in `83ab24f`. (#919, #920, #921, #925, #926 and #908 were each re-checked as still OPEN at that anchor.)
+**Post-hoc dedup pass changed this table.** 3 of the 9 filed issues were duplicates and 2 more were partly duplicated — see §7.1. **As of revision 2 (2026-09-14 at `01d0684`) the live issues are #919, #920, #921, #925, #926** — **#922 is CLOSED** (2026-09-13T23:22:22Z) and its work shipped in `83ab24f`. (#919, #920, #921, #925, #926 and #908 were each re-checked as still OPEN at that anchor.) **Since that anchor #919 has merged** (2026-09-14T18:26:54Z, `38137fc373`) **and #920 has merged** (2026-09-14T21:35:37Z, PR #1019 at `dc0270f463`), so a reader today finds both CLOSED; the anchor claim is left as measured. Both closures post-date this revision.
 
 **D2 is answered.** The open decision recorded in the PR body — *"how much review, and does the different-model check survive?"* — is settled on **both** halves: the *different-model* half by **#980** (merged 2026-09-13T23:10:52Z), which removed the second-model subsystem entirely (one model — the session model — at every review stage, recorded as a deliberate trade in `docs/providers.md`); the *how much* half by **#922** (9-13 → 4). Neither remains an open design question.
 
@@ -259,14 +263,15 @@ Every incident currently adds a rule; nothing removes one — that is the mechan
 
 **Ordering principle:** by **cost removed per unit of risk**, with the biggest *runtime* cost first — not by risk-adjusted ease, which is what the first draft did and which mis-weighted the work. See the cost accounting in the **#917 issue body** (canonical for cost accounting) — §2.1 covers *instrumentation*, not the spend split. *(Revision 1 pointed at a "corrected note in §7.2"; **there is no §7.2** — the reference is repaired here.)*
 
-- **Stage 1 — free wins, no checkpoint, run all in parallel:** #919, #891, #820
+- **Stage 1 — free wins, no checkpoint, run all in parallel:** ~~#919~~ **DONE** (PR #939, merged 2026-09-14T18:26:54Z), ~~#891~~ **DONE** (PR #944, merged 2026-09-14T21:47:27Z), **#820**
+  *(Three of the DONE marks in this section post-date the `01d0684` anchor — #919, #891, and #920 — because each merged during this epic's own drain. The stage lists are a plan measured at the anchor, not live dispatch instructions; the live-set paragraph above names what is still open.)*
 - **Stage 2 — biggest runtime cost, design checkpoint required:** ~~#922~~ **DONE** (`83ab24f`, PR #946) — the 9-13 → 4 collapse is shipped, so its checkpoint is discharged. The "9,711 reviewer dispatches" that motivated it was the cumulative `review_dispatch` event count at the time of writing and is **not re-verified** (the current cumulative count is 10,031 — cumulative, not a rate, so the two are not comparable). **#921** (7 loops → 1; also absorbs W9 loop-rule de-duplication — its dependency on #919 is **void**) remains.
-- **Stage 3 — correctness, design checkpoint required:** #920, #908 (adversarial — opens a skip path)
+- **Stage 3 — correctness, design checkpoint required:** #908 (adversarial — opens a skip path); ~~#920~~ **delivered** 2026-09-14T21:35:37Z (PR #1019)
 - **Stage 4 — biggest maintenance cost:** #926. Scoping starts **now, in parallel**; implementation last (only item with a data-loss failure mode).
 - **Deprioritised, not scheduled:** #925 (measurement is a real gap but **is not the priority**)
-- **Explicitly out of scope, named:** `sequence-enforcer` — re-measured 2026-09-14 at `01d0684`: **5,614 lines** = `extensions/sequence-enforcer/index.ts` (2,208) + `sequence-enforcer.test.ts` (3,406); **27 commits** touching that directory (revision 1 said "18"); **4 open issues** matching `sequence-enforcer` in title/body (revision 1 said "1"). Absent by decision, not oversight
+- **Explicitly out of scope, named:** `sequence-enforcer` — re-measured 2026-09-14 at `01d0684`: **5,614 lines** = `extensions/sequence-enforcer/index.ts` (2,208) + `sequence-enforcer.test.ts` (3,406); **27 commits** touching that directory (revision 1 said "18"); **3 open issues** matching `sequence-enforcer` in title/body (#681, #464, #917 — re-measured 2026-09-14 via `gh issue list --state open --search sequence-enforcer`; revision 1 said "1", revision 2 said "4"). Absent by decision, not oversight
 
-**Design checkpoints (required, no exceptions):** **#921, #908, #920, #926** get a design reviewed by the human **in plain words** before implementation is dispatched (#922's checkpoint is discharged — that work shipped in `83ab24f`) — what changes, what could go wrong, what it costs if wrong, how we undo it, and the recommendation. Stage 1 does not need this. Rationale: this epic removes safety machinery, so a wrongly-removed check does not fail loudly — the checkpoint substitutes for the review rounds being deleted.
+**Design checkpoints (required, no exceptions):** **#921, #908, #926** get a design reviewed by the human **in plain words** before implementation is dispatched (#922's checkpoint is discharged — that work shipped in `83ab24f`; **#920's is discharged too** — the O3 verify-loop read-failure fix shipped in PR #1019, merged 2026-09-14T21:35:37Z, and its N1/N3 half was assessed and deliberately left unchanged as a D1-policy matter, so there is no design left to review) — what changes, what could go wrong, what it costs if wrong, how we undo it, and the recommendation. Stage 1 does not need this. Rationale: this epic removes safety machinery, so a wrongly-removed check does not fail loudly — the checkpoint substitutes for the review rounds being deleted.
 
 ## 7. Process note (deliberate deviation, recorded)
 
@@ -291,7 +296,7 @@ The quality control that would have been provided by the 7 loops is replaced by 
 | #923 redirect fix + docs exemption | **duplicate** | **#908** — same issue; only the corrected diagnosis was new, now posted there |
 | #924 test-review backstop + observed-failing pin | **duplicate** | **#891** and **#820** — both named in #924's own body |
 | #919 cleanup batch | **narrowed** | W12 → #906/#903; W9 → #833/#847/#871/#815/#676. Now W1 + W6 |
-| #920 fail-open paths | **narrowed** | N2 → #853/#761/#789; N4 → #771. Now N1 + N3 |
+| #920 fail-open paths | **half-delivered** | N2 → #853/#761/#789; N4 → #771; N1 (D1 question) + N3 (already CLOSED) left unchanged; **O3 shipped** in PR #1019 (`dc0270f463`) |
 
 **Two findings from this.**
 

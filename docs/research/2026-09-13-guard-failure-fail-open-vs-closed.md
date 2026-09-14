@@ -72,7 +72,7 @@ Answers the question behind epic #917 decision **D1**: when a guard's own machin
 A commit is **reversible** and is re-checked at push/PR/merge, so the local hook is a convenience gate, not the enforcement plane:
 
 1. **Local pre-commit hook:** fail-closed on a detected *violation*, **fail-open-with-loud-alarm on the guard's own internal error** — never a silent `0`.
-2. **The authoritative gate must be fail-closed and outside the actor's reach** — server-side `pre-receive`/`update` or a required CI check; `--no-verify` cannot touch those. This matches this repo's own `docs/ops/guarded-paths.md`, which explicitly calls `.husky/pre-commit` "a local hook, not the judge".
+2. **The authoritative gate must be fail-closed and outside the actor's reach** — server-side `pre-receive`/`update` or a required CI check; `--no-verify` cannot touch those. This matches this repo's own `docs/ops/guarded-paths.md:63`, which describes `.husky/pre-commit` as "Local hook, not the judge; it cannot weaken the required check."
 3. **Never emit a pass-shaped value for "could not run"** — use a distinct verdict (`UNKNOWN`/`UNGATED`/`FAILED-TO-RUN`) or pre-commit's `1` vs `3` split. GitHub's skipped-job-reports-Success is the anti-pattern this repo already tracks as a "live, exploited conflation class" (`docs/research/2026-09-11-issue-755-vgate-merge-scope.md`).
 4. **Choose the error direction deliberately** along OPA's two axes — don't inherit it accidentally from `set -e`.
 5. **Verify the escape hatch is actually outside the guard's scope** rather than assuming it.
@@ -80,7 +80,7 @@ A commit is **reversible** and is re-checked at push/PR/merge, so the local hook
 
 ### Relevance to #917
 
-This bears directly on decision **D1**, which spans #920 (verification-gate fail-open paths) and #926 (main-worktree-guard inversion). The repo's live evidence: blocking has caused total stoppage twice (#879 closed, #882 open); silent self-disablement has occurred at least five times (#853, #789, #744, #761, #708); and the built-in override has been used **7,738 times** with no correctness record (`~/.pi/agent/audit/gate-events.jsonl`, `gate_bypass` events, re-measured 2026-09-14 at `01d0684`; 7,737 when this brief was written — the file is append-only, so this figure must be re-measured, not cited).
+This bears directly on decision **D1**, which now spans **#926** (main-worktree-guard inversion) alone — its companion **#920** (verification-gate fail-open paths) is **closed**: PR #1019, merged 2026-09-14T21:35:37Z, shipped the O3 verify-loop read-failure discrimination (`dc0270f463`, which post-dates this brief). #920's other two findings — N1 (registration-`try` catch) and N3 (`writeBridge`) — were assessed and deliberately left unchanged: N1 is a D1-policy question and N3 already fails CLOSED. The repo's live evidence: blocking has caused total stoppage twice (#879 closed, #882 open); silent self-disablement has occurred at least five times (#853, #789, #744, #761, #708); and the built-in override has been used **7,738 times** with no correctness record (`~/.pi/agent/audit/gate-events.jsonl`, `gate_bypass` events, re-measured 2026-09-14 at `01d0684`; 7,737 when this brief was written — the file is append-only, so this figure must be re-measured, not cited).
 
 Per rule 3 above, the 7,738 unrecorded bypasses are the sharpest gap — a bypass that is not recorded as a state distinct from "passed" is indistinguishable from a clean run.
 
