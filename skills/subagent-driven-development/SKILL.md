@@ -26,6 +26,7 @@ Execute plan by dispatching fresh subagent per task, with two-stage review after
 **The controller — not the subagent — owns worktree creation.** Subagents must never invoke `using-git-worktrees` or call `git worktree add` on their own. When a subagent dispatched from inside a worktree tries to create its own worktree, the new worktree nests inside the current one (`.worktrees/agent-A/.worktrees/agent-B`), which breaks teardown, leaks commits, and can cascade to 3+ levels.
 
 **Controller responsibilities (this skill, running in the main conversation):**
+0. Run the collision pre-flight FIRST, from the target repo root: `python3 tools/collision_preflight.py <N>`. Only exit 0 authorizes dispatch — exit 1 (COLLISION) means the issue is already in flight and exit 2 (INCOMPLETE) means a surface could not be queried (not clean). Both are hard stops (#3061).
 1. Invoke `using-git-worktrees` ONCE, before dispatching any implementer subagent.
 2. After the worktree is created, capture its absolute path.
 3. Include the worktree path in every implementer subagent's prompt: `Your working directory is <absolute-path>. cd there first. Do NOT create a worktree — one already exists.`
