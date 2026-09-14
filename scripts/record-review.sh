@@ -41,11 +41,43 @@ set -euo pipefail
 # first-ref-only, while the tier guard needs ANY-ref semantics (a PR closing
 # two same-repo issues of different tiers has no single tier identity).
 # Keyword class: fix(es|ed)?|close(s|d)?|resolve(s|d)? directly followed by
-# the reference (so "resolves SLACK_APPROVAL_FILE" is not an issue ref).
+# the reference (so "resolves SLACK_APPROVAL_FILE" is not an issue ref), and
+# sitting in a REFERENCE CONTEXT (REFCTX): the keyword begins a line, optionally
+# after ONE OR MORE Markdown prefixes GitHub renders as line-leading reference
+# markers (bullet / ordered marker / blockquote / ATX heading / task-list
+# checkbox) or emphasis/bold/backtick marks. The prefix and checkbox groups are
+# REPEATABLE, so a COMPOUND prefix is a reference context too — `> - Closes #42`
+# and `> > Closes #42` auto-close on GitHub just like `- Closes #42`. A
+# mid-sentence mention is NOT a reference (#1012) — position is the contract,
+# matching check-pipeline-compliance.sh::parse_issue_ref, which composes the
+# SAME two constants.
+#
+# The CROSS-SCRIPT INVARIANT is scoped to the keyword CLASS, not the position
+# rule: REFCTX and CLOSING_KW are byte-identical across the two scripts, pinned
+# mechanically by record-review.test.sh §8.13. The #513 tier guard below does
+# NOT rely on the positional rule for GitHub parity — GitHub auto-closes a
+# mid-sentence ref, so the guard ALSO scans with a WORD-BOUNDARY-ANCHORED
+# CLOSING_KW (passing `\b${CLOSING_KW}` as closing_issue_refs' optional
+# <kw-pattern>) and refuses when a non-micro ref appears in either scan. The
+# `\b` is load-bearing in the FALSE-REFUSAL direction: the keyword class is a
+# SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), so an
+# unanchored scan reads `The prefix #42 is unrelated.` as `fix #42`, fetches
+# #42's labels, and refuses a record GitHub would never auto-close — a false
+# refusal, and strictly BROADER than GitHub, which requires a word boundary.
+# Scoping the invariant to the class is what keeps the positional rule
+# (check (a), anti-#968) from becoming a tier-guard fail-open.
 # Top-level + guarded main below: this function is source-reachable by tests.
+REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:space:]]*)*(\[[ xX]\][[:space:]]+)*[*_`]{0,3}[[:space:]]*'
+CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
 closing_issue_refs() {
-  local text="$1" kw
-  kw='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
+  # <kw-pattern> (optional) selects the keyword class WITHOUT the positional
+  # REFCTX prefix — the GitHub-parity scan the tier guard unions in. Callers
+  # pass a BOUNDARY-ANCHORED pattern (`\b${CLOSING_KW}`): without `\b` the class
+  # matches inside English words and the scan is BROADER than GitHub (false
+  # refusals). Default is the positional form "${REFCTX}${CLOSING_KW}",
+  # mirroring check-pipeline-compliance.sh::parse_issue_ref.
+  local text="$1" kwpat="${2:-}" kw
+  if [ -n "$kwpat" ]; then kw="$kwpat"; else kw="${REFCTX}${CLOSING_KW}"; fi
   # a. full URLs.
   while IFS= read -r m; do
     [ -z "$m" ] && continue
@@ -197,6 +229,15 @@ fi
 #       labels carry no complexity:* → loud warning + record proceeds
 #       (fail-open: a transient gh/API failure must not block a legitimate
 #       record; the warning names the unverified tier).
+# Ref collection keeps GITHUB PARITY (#1012 r2): the guard unions the
+# positional scan with a WORD-BOUNDARY-ANCHORED CLOSING_KW scan, because GitHub
+# auto-closes a mid-sentence ref — a body like "Closes #100" + "This also
+# closes #42" closes complex #42 on merge and must never record clean-micro off
+# micro #100 alone. Refusal is the fail-closed direction, so the union widens
+# the bind without widening the fail-open arms. The `\b` on the parity class is
+# the OTHER direction: an unanchored class matches inside English words, turning
+# `The prefix #42 is unrelated.` into a refusal GitHub itself would never make
+# (#1012 r3).
 if [ "$VERDICT" = "clean-micro" ]; then
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     echo "⚠️ clean-micro tier guard: repo undetectable or gh missing — tier attestation UNVERIFIED (record proceeds; a non-micro linked issue should never be recorded clean-micro)" >&2
@@ -207,7 +248,15 @@ if [ "$VERDICT" = "clean-micro" ]; then
       echo "⚠️ clean-micro tier guard: could not read the PR body of $REPO#$PR (gh/API failure or empty body?) — tier attestation UNVERIFIED (record proceeds)" >&2
     else
       # Collect same-repo closing refs (dedupe via awk; preserve order).
-      REFS="$(closing_issue_refs "$BODY" | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
+      # GITHUB PARITY (#1012 r2): the POSITIONAL scan alone misses a
+      # mid-sentence "This also closes #42" that GitHub WILL auto-close on
+      # merge, so the guard unions it with a keyword-class scan. Refusing on a
+      # ref either scan finds is fail-CLOSED. The parity scan is
+      # WORD-BOUNDARY-ANCHORED (#1012 r3): `\b` before the class keeps ordinary
+      # prose ("prefix", "discloses", "unresolved") from being read as a
+      # keyword and refused, which would be a FALSE refusal — GitHub requires a
+      # word boundary the unanchored scan did not.
+      REFS="$({ closing_issue_refs "$BODY"; closing_issue_refs "$BODY" "\b${CLOSING_KW}"; } | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
       if [ -z "$REFS" ]; then
         echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | head -c 200 || true))" >&2
       else

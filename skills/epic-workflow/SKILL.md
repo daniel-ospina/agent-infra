@@ -65,24 +65,50 @@ Routes an epic through the full 6-stage fractal planning pipeline. Each stage in
 
 ## Human Gates
 
-### Approval Routing
+### Approval Routing (inlined from human-input-framework v2.1.1)
+
+> **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
+> Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session
+> without loading the framework skill first. Only the operational core is inlined; the status table,
+> store/transport contract, and Slack enablement live canonically (restating them is how the original
+> six copies drifted apart).
 
 When a human gate fires, the agent MUST invoke the approval router to surface the request:
 
 ```bash
-# For human bypass (default for epic gates):
+# Portable invocation (works from ANY repo checkout — swarm #1402 rollout):
 python3 -c "
+import os, sys
+sys.path.insert(0, os.environ.get('SWARM_ROOT', os.path.expanduser('~/swarm')))
 from operations.coordination.approval import request_approval
 request_approval('product-strategist', artifact='<doc-name>.md', context='<stage> approval for epic <name>', requires_human=True)
 print('Approval request created')
 "
 ```
 
-This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to the per-repo store `~/.swarm/approvals/<repo>.json` and must be checked manually.
+⛔ **No dialog pops — do not wait for one.** A `pending` request fires a macOS *notification banner*
+(`osascript … display notification`), which has no buttons and no answer path; it is best-effort and
+silently no-ops on non-macOS/CI/SSH. Reaching a human on Slack needs more than `SLACK_BOT_TOKEN` +
+`SLACK_APPROVAL_CHANNEL`: the bridge derives a **different** store slug than the router, so
+`SLACK_APPROVAL_FILE` must be pinned to the router's store (agent-infra #956) or the request just
+waits in `~/.swarm/approvals/<slug>.json`.
 
-**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
+**Detect the answer — read the record, never infer from a shrinking list:**
+```bash
+SWARM="${SWARM_ROOT:-$HOME/swarm}/operations/coordination/approval.py"
+python3 "$SWARM" --pending --role human    # still open
+python3 "$SWARM" --status <req_id>         # this record's status + reviewer
+```
+A Slack thread reply sets `changes_requested`, which leaves `--pending` **without approving**;
+`is_approved(..., requires_human=True)` also returns `False` after a Slack *button* approval (the
+bridge overwrites `reviewer` with the clicking user's id — agent-infra #959). Trust `status == 'approved'`.
 
-**Role-based escalation** (for non-epic gates): use without `requires_human=True` to route through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human).
+**Role-based escalation:** with `APPROVAL_AUTO_APPROVE=0`, omitting `requires_human=True` pends for
+the requester's `reports_to` role — e.g. `product-strategist` for `product-implementer`; only
+`chain[1]` is used, so nothing walks the chain further. Under the default (`APPROVAL_AUTO_APPROVE`
+unset, which means `1`) such a request **auto-approves** and never reaches a human — **unless** an
+escalation keyword (`deploy`/`delete`/`destroy`/`migrate`/`release`) appears in the artifact/context,
+which pends for a human regardless. Pass `requires_human=True` for a real human checkpoint.
 
 1. After Scope — docs committed, GitHub URL presented
 2. After Planning coherence — docs committed, GitHub URL presented
