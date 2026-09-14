@@ -62,16 +62,14 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 
 | Risk | Reviewers | Max Cycles |
 |------|-----------|------------|
-| **Micro** | 0 (skip review) | — |
+| **Micro** | no plan doc — nothing to review | — |
 | **Low-Medium** (small plan, existing patterns) | 1 reviewer (Structural + Integration) | 5 |
 | **Medium-High** (large plan, some novelty) | 2 reviewers (+ Efficiency) | 5 |
 | **High** (novel architecture, first-of-kind) | 2 reviewers | 10 |
 
-**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
+**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 1 reviewer. A 200-line plan with new architecture = 2 reviewers. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
 
 **Adversarial domain — declared threat surface (bound: 2 cycles, orthogonal to the rows above).** When the scoping comment carries an `### Adversarial Threat Surface` declaration (gate/enforcement code whose correctness is "an attacker cannot make it fail open"), the plan review is bounded by that surface, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) is a **clean exit** for this domain — a literal `NO ISSUES FOUND` is not required, and when the merge rests on threat-list coverage the PR body must disclose it (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
-
-**Level-based routing:** For Project-level issues (Level: project in issue body), prefer inline review in the current context over sub-agent dispatch. For Epic-level issues (Level: epic), use fresh-context sub-agent reviewers (default). If Level is missing, default to sub-agent review (safe default). See `proportional-gates` skill for the canonical routing table.
 
 ## Input Resolution
 
