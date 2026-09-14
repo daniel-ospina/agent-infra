@@ -17,7 +17,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 > **Canonical:** `agent-infra/skills/issue-scoping/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **v5.1.0 — Double Diamond with Integrated Verification Gates.** Each diamond now has a verification gate (2 parallel verifiers + controller tiebreaker) before proceeding. Micro tier gets a single gate after both diamonds. See #7498.
+> **v5.1.0 — Double Diamond with Integrated Verification Gates.** Each diamond now has a verification gate before proceeding, at the tier's verifier count (see Tier Scaling). Micro tier gets a single gate after both diamonds. See #7498.
 
 # Issue Scoping
 
@@ -26,10 +26,10 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 Multi-phase planning for **existing** GitHub issues. Uses the **double diamond** design framework with integrated verification:
 1. **problem-diverge** — explore alternative problem definitions, root causes, dependencies
 2. **problem-converge** — evaluate framings, pick best, confirm with evidence
-3. **🛡️ problem-verify** — 2 parallel verifiers check diamond quality (Standard+Complex)
+3. **🛡️ problem-verify** — verifiers check diamond quality (Standard+Complex; count per Tier Scaling)
 4. **solution-diverge** — generate 2-3 distinct solution approaches with tradeoffs
 5. **solution-converge** — pick best approach, draft plan, document rejected alternatives
-6. **🛡️ solution-verify** — 2 parallel verifiers check diamond quality (Standard+Complex)
+6. **🛡️ solution-verify** — verifiers check diamond quality (Standard+Complex; count per Tier Scaling)
 
 This covers **"what & why"**: requirements, scope, constraints, and validated approach. Detailed implementation design ("how") — bite-sized TDD tasks, design decisions — is handled by `writing-plans` after human approval.
 
@@ -56,9 +56,9 @@ The Double Diamond generates multiple alternatives — but the converge step can
 When problem-diverge discovers that the issue describes a symptom rather than the root cause, scoping MUST target the root cause — not the symptom the issue author happened to notice.
 
 **Examples:**
-- Issue: "Add retry button to failed uploads" → Root cause: uploads fail silently with no error surfaced → Scope: surface errors + add retry + confirm UX copy with human + analyse root causes of errors
-- Issue: "Increase timeout on X endpoint" → Root cause: N+1 query under load → Scope: fix the query + keep timeout as safety net + analyse system design
-- Issue: "Add validation to form Y" → Root cause: API accepts invalid data without rejecting → Scope: add API validation + add client validation + analyse UX  and ifnromation architecture and get approval by human if changes are needed
+- Issue: "Add retry button to failed uploads" → Root cause: uploads fail silently with no error surfaced → Scope: surface errors, add retry, confirm the UX copy with the human, and diagnose why the uploads fail
+- Issue: "Increase timeout on X endpoint" → Root cause: N+1 query under load → Scope: fix the query, keep the timeout as a safety net
+- Issue: "Add validation to form Y" → Root cause: API accepts invalid data without rejecting → Scope: add API validation and client validation; if the UX or information architecture must change, get human approval first
 
 **Gate:** When problem-converge picks a confirmed problem definition, compare it to the original issue. If the original described a symptom and scoping settled on a fix for that symptom without addressing the root cause, the scoping is incomplete. The verification gates (2.5) check for this.
 
@@ -133,11 +133,11 @@ Phase 0: Tier classification + Skill-domain detection + Epic/component detection
 Phase 1: problem-diverge
 Phase 2: problem-converge
 Phase 1.5: External Research (Standard+Complex — axis matrix + question-driven + persist; see §Phase 1.5)
-Phase 2.5: 🛡️ problem-verify (Standard+Complex: 2 parallel verifiers + controller tiebreaker)
+Phase 2.5: 🛡️ problem-verify (Standard+Complex — verifiers per Tier Scaling + controller)
 Phase 3: Codebase Explorer + UX Prototype Gate (fed with verified problem)
 Phase 4: solution-diverge
 Phase 5: solution-converge
-Phase 5.5: 🛡️ solution-verify (Standard+Complex: 2 parallel verifiers + controller tiebreaker)
+Phase 5.5: 🛡️ solution-verify (Standard+Complex — verifiers per Tier Scaling + controller)
            └─ OR full-diamond-verify (Micro: 1 verifier checks all 4 phases)
 Phase 6: Wiring Check
 Phase 7: Parallel Review Gates (4 agents + fix loop)
@@ -150,11 +150,11 @@ Phase 8: Finalize + post plan
 |-------|-------|----------|---------|
 | problem-diverge sub-agents | 1 | 1 | 2 |
 | problem-converge sub-agents | 1 | 1 | 2 |
-| **problem-verify** | Skip | ✅ (1 verifiers) | ✅ (2 verifiers) |
+| **problem-verify** | Skip | ✅ (1 verifier) | ✅ (2 verifiers) |
 | solution-diverge sub-agents | 1 | 1 | 2 |
 | solution-converge sub-agents | 1 | 1 | 2 |
 | **Phase 1.5 External Research** | Skip (proportional: codebase-first + fire only on demonstrated gap) | ✅ (axis matrix, 8-cap) | ✅ (axis matrix, 14-cap) |
-| **solution-verify** / **full-diamond-verify** | ✅ (1 verifier, all phases) | ✅ (1 verifiers) | ✅ (2 verifiers) |
+| **solution-verify** / **full-diamond-verify** | ✅ (1 verifier, all phases) | ✅ (1 verifier) | ✅ (2 verifiers) |
 | Codebase Explorer | Skip | ✅ | ✅ |
 | UX Prototype Gate | Skip | If UX_RATING ≥ medium | If UX_RATING ≥ medium |
 | Wiring Check | ✅ | ✅ | ✅ |
@@ -172,11 +172,11 @@ Phase 8: Finalize + post plan
 
 ### Gate Mechanics
 
-1. **Dispatch parallel verifier sub-agents** via `task` — both receive the same inputs, reach independent conclusions
-2. **Controller (main agent) acts as tiebreaker** — not a script, not mechanical voting
-3. **Re-dispatch rule:** If either verifier finds P0 or P1 → controller decides fix-or-ignore → re-dispatch both → repeat
+1. **Dispatch the tier's verifier count** (Tier Scaling, above) in parallel via `task` — all receive the same inputs and reach independent conclusions
+2. **Controller (main agent) adjudicates** — not a script, not mechanical voting
+3. **Re-dispatch rule:** If any verifier finds P0 or P1 → controller decides fix-or-ignore → re-dispatch all verifiers → repeat
 4. **Pass-through rule:** If verifiers find only P2/P3/P4 → controller incorporates them → gate passes. No re-launch needed.
-5. **Exit:** Both verifiers return no P0s and no P1s
+5. **Exit:** No verifier returns a P0 or P1
 
 ### Verifier Prompt
 
@@ -184,28 +184,31 @@ Phase 8: Finalize + post plan
 You are verifying the problem diamond of a scoping session. Check whether problem-diverge and problem-converge were done with genuine rigor — not mechanically, not superficially.
 
 CONFIRMED PROBLEM: <from Phase 2 output>
-PROBLEM-DIVERGE OUTPUT: <Agent A + Agent B outputs>
-PROBLEM-CONVERGE OUTPUT: <Agent A + Agent B outputs>
+PROBLEM-DIVERGE OUTPUT: <diverge sub-agent output(s)>
+PROBLEM-CONVERGE OUTPUT: <converge sub-agent output(s)>
 ORIGINAL ISSUE BODY: <full issue text>
+PHASE 1.5 RESEARCH: <### Axis Research + ### Integration Docs, or "none">
 
-CHECK FOUR DIMENSIONS + DIMENSION 5:
+Read PHASE 1.5 RESEARCH before judging dimensions 1, 2 and 5. Treat it as a strong but fallible input — usually right, not always. Where you doubt a finding, say so and check it yourself. Never pass a scope because it cites research, and never fail one for contradicting research you have not verified.
+
+CHECK FIVE DIMENSIONS:
 
 1. DIVERGE THOROUGHNESS: Did problem-diverge genuinely explore alternatives?
-   - Was research done (inetrnal and external) to understand the problem?
    - Are there alternative problem framings that differ meaningfully from the original?
    - Were adversarial queries run seeking DISCONFIRMATION (not just confirmation)?
    - Were assumptions mapped and tagged [validated]/[unverified]?
    - Were hidden dependencies and affected-but-unmentioned stakeholders identified?
-   - Was redudndancy/overlap with other systems researched and overall good system design considered? 
+   - Were redundancy and overlap with existing systems checked against the codebase?
+   - WERE THERE NO ALTERNATIVES, or were they cosmetic variations? Flag as P1.
 
 2. CONVERGE RIGOR: Was convergence on the problem evidence-based?
- - Was research done (inetrnal and external) considered?
+   - Did convergence use the research, or leave it as decoration?
    - Is the chosen definition backed by evidence (citations, data, patterns)?
    - Were rejected alternatives documented with rationale?
    - Is there a falsification check? Confidence score?
    - DID CONVERGENCE PICK THE ORIGINAL ISSUE'S FRAMING WITHOUT CHALLENGING IT? Flag as P1.
    - WAS A SOLUTION THE ISSUE BODY PRESCRIBES ("the fix is X") ADOPTED AS SETTLED WITHOUT RE-DERIVATION IN THE DOUBLE DIAMOND? Flag as P1.
-   - Was redudndancy/overlap with other systems considered and overall good system design part of the decision?
+   - Was system design (duplication, scalability, where shared state lives) part of the decision? Flag as P2 if unconsidered.
 
 3. QUALITY OVER CONVENIENCE: Did convergence prioritize correctness over ease?
    - Was a framing rejected because it required more research?
@@ -245,21 +248,21 @@ If no issues: NO ISSUES FOUND
 
 ### Controller Logic
 
-After both verifiers return:
+After every verifier returns:
 
 ```
-VERIFIER A: [P0: ..., P1: ..., P2: ...]
-VERIFIER B: [P0: ..., P1: ..., P2: ...]
+VERIFIER 1: [P0: ..., P1: ..., P2: ...]
+VERIFIER 2: [P0: ..., P1: ..., P2: ...]
 ```
 
-**Step 1 — Identify all P0 and P1 issues** across both verifiers.
+**Step 1 — Identify all P0 and P1 issues** across all verifiers.
 
 **Step 2 — For each P0/P1, controller decides:**
 - **Fix:** The issue is real → apply the fix to the problem definition/converge output
-- **Ignore:** The issue is a false positive → note rationale in cycle log. Example: "Verifier B flagged 'no adversarial queries' but Agent B's challenge report explicitly ran 4 disconfirmation queries"
+- **Ignore:** The issue is a false positive → note rationale in cycle log. Example: "Verifier 2 flagged 'no adversarial queries' but the diverge report explicitly ran 4 disconfirmation queries"
 
 **Step 3 — Re-dispatch if any P0/P1 was fixed:**
-- If controller fixed anything → re-dispatch BOTH verifiers (fresh `task` sessions)
+- If controller fixed anything → re-dispatch every verifier (fresh `task` sessions)
 - If controller only ignored → still re-dispatch (verifiers must stop flagging it, or escalate)
 - If no P0/P1 found at all → gate passes
 
@@ -273,9 +276,9 @@ VERIFIER B: [P0: ..., P1: ..., P2: ...]
 **Cycle log entry:**
 ```
 ### problem-verify — Cycle N
-- Verifier A: P0=0, P1=2, P2=1
-- Verifier B: P0=0, P1=1, P2=2
-- Controller action: Fixed P1-X (missing falsification check), Ignored P1-Y (verifier missed Agent B's adversarial queries — rationale documented)
+- Verifier 1: P0=0, P1=2, P2=1
+- Verifier 2: P0=0, P1=1, P2=2
+- Controller action: Fixed P1-X (missing falsification check), Ignored P1-Y (verifier missed the diverge report's adversarial queries — rationale documented)
 - Re-dispatching...
 ```
 
@@ -287,7 +290,7 @@ VERIFIER B: [P0: ..., P1: ..., P2: ...]
 
 ### Gate Mechanics
 
-Same as problem-verify: 2 parallel verifiers → controller tiebreaker → re-dispatch for P0/P1 → pass for P2+ only.
+Same as problem-verify, at the tier's verifier count.
 
 ### Verifier Prompt
 
@@ -295,29 +298,33 @@ Same as problem-verify: 2 parallel verifiers → controller tiebreaker → re-di
 You are verifying the solution diamond of a scoping session. Check whether solution-diverge and solution-converge produced genuinely distinct approaches and converged on quality over convenience.
 
 CONFIRMED PROBLEM: <from Phase 2>
-SOLUTION-DIVERGE OUTPUT: <Agent A + Agent B outputs>
-SOLUTION-CONVERGE OUTPUT: <Agent A (+ Agent B) plan drafts>
+SOLUTION-DIVERGE OUTPUT: <diverge sub-agent output(s)>
+SOLUTION-CONVERGE OUTPUT: <converge sub-agent output(s)>
 CODEBASE EXPLORER: <from Phase 3, if available>
+PHASE 1.5 RESEARCH: <### Axis Research + ### Integration Docs, or "none">
+
+Read PHASE 1.5 RESEARCH before judging dimensions 1, 2 and 5. Treat it as a strong but fallible input — usually right, not always. Where you doubt a finding, say so and check it yourself.
 
 CHECK FIVE DIMENSIONS:
 
 1. DIVERGE GENUINENESS: Are the approaches truly distinct?
-    - Was research done (inetrnal and external) to understand the problem (if not, do it)?
    - Do they differ in architecture or technique (not just file names or variable names)?
    - Does each have named tradeoffs, risks, and "best fit if" conditions?
    - Are there 2+ approaches? If only 1: is it because genuinely no alternatives exist, or because diverge was shallow?
-   
+   - ARE THEY COSMETIC VARIATIONS OF THE SAME IDEA? Flag as P1.
+
 2. CONVERGE QUALITY OVER CONVENIENCE: Was the best approach chosen?
-   - Does the rationale evaluate outcome quality, edge case handling, failure mode coverage, and overall system design?
+   - Does the rationale evaluate outcome quality, edge case handling, failure mode coverage, and system design?
    - Or does it evaluate diff size, number of files, implementation speed?
+   - Were rejected alternatives documented with "when this WOULD have been better"?
    - DID CONVERGENCE PICK THE APPROACH WITH FEWER FILES TO TOUCH? Flag as P1.
    - IS THERE A BETTER APPROACH THAT WAS REJECTED FOR CONVENIENCE? Flag as P0.
    - WAS THE ISSUE BODY'S PRESCRIBED SOLUTION TREATED AS THE PLAN (ADOPTED UNCHANGED) RATHER THAN RE-DERIVED AND VERIFIED AGAINST ALTERNATIVES? Flag as P1.
 
 3. SCOPE COMPLETENESS: Is the scope thorough?
-   - UX: mobile considered? UX and information architecture are needed?
-   - Good overall system design included?
-   - Does the scope include all the needed info to be a good scope?
+   - UX: are mobile and information architecture accounted for?
+   - Is system design accounted for (dimension 2)?
+   - Are the Acceptance Criteria concrete and verifiable?
 
 4. WIRING PRE-CHECK: Are integration surfaces accounted for?
    - DB, API, auth, external services, UI components, cross-cutting concerns?
@@ -577,7 +584,7 @@ gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^scop
 
 Dispatch in parallel via `task`. All agents MUST invoke the `research` skill internally.
 
-**Micro:** 1 sub-agent. **Standard:** 2 sub-agents. **Complex:** 2 sub-agents.
+**Micro:** 1 sub-agent. **Standard:** 1 sub-agent. **Complex:** 2 sub-agents.
 
 #### Agent A (all tiers):
 
@@ -644,7 +651,7 @@ Gather all agent outputs. Proceed directly to Phase 2.
 
 ### Sub-Agent Dispatch
 
-**Micro:** 1 sub-agent. **Standard:** 2 sub-agents. **Complex:** 2 sub-agents.
+**Micro:** 1 sub-agent. **Standard:** 1 sub-agent. **Complex:** 2 sub-agents.
 
 #### Agent A (all tiers):
 
@@ -718,7 +725,7 @@ This triggers an osascript dialog on the human's machine. The pipeline advances 
 
 For each axis rated `medium+` (UX / Ontology / Architecture from Phase 0 ratings; **Library-deps axis triggered by third-party-dep detection** in the issue body / affected files — there is no Phase 0 Library rating field in v5):
 
-1. **Codebase-first precedent scan** — grep/read for existing patterns (3+ examples → query can be lighter or skipped with justification).
+1. **Prior-state scan** — (a) codebase-first: grep/read for existing patterns (3+ examples → query can be lighter or skipped with justification); (b) Tortoise: `tortoise_search` / `tortoise_recall` (mode=state) on the axis topic, plus `tortoise_belief_timeline` for decisions already made — record prior decisions and their premises as `PRIOR_RESEARCH` with their ids. ADVISORY, never blocking: an empty or unreachable graph is not a finding, it just means no priors (`how-to-use-tortoise`).
 2. **Dedup against PRIOR_RESEARCH** — if the epic brief / existing brief already covers this axis at sufficient granularity, skip with a `> Deduplicated: covered by <brief section>` note (deduplicated questions never count toward the cap).
 3. **Per-bucket protocol queries** — 1–3 external queries per axis (canonical / competitor-precedent / pitfalls), per research-protocol §1.1. **Cap reconciliation:** the D3 cap is a **post-dedup total**; when the cap binds, lower-priority axes drop to 1 framing each (a capped `medium+`/high axis that keeps only one framing MUST keep the pitfalls/adversarial one — canonical-only for a capped high axis is P1 under Phase 2.5 dimension 5).
 
@@ -844,7 +851,7 @@ Evaluate on: outcome quality, edge case handling, failure mode coverage, future 
 Do NOT evaluate on: diff size, number of files touched, implementation speed.
 ⛔ HYPOTHESIS, NOT PLAN: the issue body's prescribed fix ("the fix is X") is the author's hypothesis — one candidate approach. Re-derive from the CONFIRMED PROBLEM; adopt the body's fix only if it wins on evidence against the alternatives.
 
-1. PICK THE BEST APPROACH. Document why. Document rejected alternatives.
+1. PICK THE BEST APPROACH. Document why. Document rejected alternatives. When the choice is genuinely contested (2+ viable approaches, no clear winner), deliberate it on the graph instead of arguing in prose: options/criteria/findings → IMPL/NAND → `tortoise_compute_confidence`, and report the ranking (`tortoise-decide`).
 2. DRAFT THE PLAN: problem statement, proposed solution, implementation plan, testing strategy, verification plan, acceptance criteria, runtime prerequisites.
 3. CLASSIFY THE DOMAIN — mandatory, binary. Is this gate/enforcement code whose correctness is "an attacker cannot make it fail open"? If YES, DECLARE THE ADVERSARIAL THREAT SURFACE: the in-scope bypass classes (each with the adversarial input and the required behaviour) and the classes explicitly OUT OF SCOPE. If NO, state `(not adversarial)` explicitly — an undeclared classification is a gap.
 
@@ -996,7 +1003,7 @@ Pause for human approval if: confidence < 50, P0 issues remain after review, wir
 ## Key Principles
 
 - **Double diamond is non-negotiable.** Micro tier runs all 4 phases (1 sub-agent each). No issue gets scoped without exploring alternative problems AND solutions.
-- **Verification gates after each diamond.** Standard+Complex get 2 parallel verifiers per gate; Micro gets a single full-diamond verifier. P0/P1 → fix → re-verify. P2+ → incorporate and pass.
+- **Verification gates after each diamond.** Standard+Complex gate at the tier's verifier count; Micro gets a single full-diamond verifier. P0/P1 → fix → re-verify. P2+ → incorporate and pass.
 - **Controller is the tiebreaker, not a script.** When verifiers disagree, the main agent decides. Verifiers flag issues; controller fixes or ignores with rationale.
 - **Problem phases use research skill.** Discover and Define invoke `research` for adversarial queries — not just web_search.
 - **Quality over convenience in solution selection.** The converge step picks the better outcome, not the easier implementation.
