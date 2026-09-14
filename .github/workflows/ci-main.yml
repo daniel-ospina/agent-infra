@@ -329,14 +329,100 @@ jobs:
     runs-on: ubuntu-latest
     needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, python-ci]
     if: failure()
+    # RESIDUAL (round-2 review): paginate -> find -> create is check-then-act, so two
+    # concurrent post-merge runs can both create (runs 34534428397 / 34534452089 failed 17s
+    # apart on 2026-09-10 and filed #710 / #711). A job-level `concurrency:` group was added
+    # here and then REMOVED: with `cancel-in-progress: false` GitHub keeps at most one running
+    # AND one pending job, so a third queued filer EVICTS the pending one and that filing
+    # silently never happens. Dropping a filing is worse than an extra duplicate — this
+    # change's own rule is "a duplicate beats silence" — so the race is left as a bounded
+    # residual rather than traded for a new fail-open. It is strictly rarer than the pre-fix
+    # behaviour, which created a duplicate on every failure.
     steps:
       - uses: actions/github-script@v7
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         with:
           script: |
-            github.rest.issues.create({
+            // #903 / #937 — ONE issue per FAILING JOB SET, not one per commit.
+            //
+            // The title used to carry the SHA (`main broken by merge (cc288d5)`), which is
+            // unique by construction, so it could never match an open issue and every failure
+            // minted a duplicate — 35 since 08-13 as of 2026-09-13 (#850 and #837 were filed
+            // for this defect and have since been CLOSED as stale duplicates; #975 and #976
+            // were two OPEN duplicates minted 5s apart by the race this change also guards).
+            //
+            // A bare constant title would dedup but OVER-collapse: the filer never recorded
+            // which job failed, so two unrelated breakages would share one issue, and closing
+            // it for one would silently mark the other resolved. Keying on the failing job set
+            // separates them and preserves run -> failing-job traceability.
+            //
+            // Provenance: #339 (08-25) identified this defect and prescribed this remedy —
+            // docs/plans/2026-08-25-339-merge-reliability.md, Option 2: "dedupe: if an OPEN
+            // issue already exists with the same signature (workflow + job + assertion),
+            // comment the new run on it instead of filing a new issue" and "Include the
+            // failing job/assertion in the issue body (today: run URL only)". This is that
+            // option. (An earlier revision of this message denied the credit, because a
+            // review finding was accepted without being checked against the plan doc.)
+            //
+            // Same shape as enforce-skills.yml's dedup (paginate + find by title); this file
+            // was the outlier. Recurrences are APPENDED as comments rather than overwriting the
+            // body, so the occurrence history survives.
+            //
+            // RESIDUAL (round-2 review): the key is the failing JOB SET, not the root cause.
+            // `extension-tests` multiplexes several suites, so two unrelated breakages inside
+            // it still share a title. And there is no close-on-success here (unlike
+            // enforce-skills.yml:109), so an issue stays open after main recovers and later
+            // same-set failures append to it. Both are bounded and disclosed rather than fixed
+            // here — close-on-success is a new mechanism, not a dedup fix.
+            // `|| {}` after the parse too: NEEDS is `${{ toJSON(needs) }}`, and a literal `null`
+            // (not `{}`) makes Object.entries throw BEFORE the try/catch below, so the run would
+            // error out having filed nothing. Not reachable today (all 7 jobs are wired into
+            // `needs:`, so it is always a populated object) — but it is the only throw-before-filing
+            // path in this step, and the safe direction here is "file", never "crash quietly".
+            const failed = Object.entries(JSON.parse(process.env.NEEDS || '{}') || {})
+              .filter(([, v]) => v.result === 'failure')
+              .map(([k]) => k)
+              .sort();
+            const TITLE = failed.length
+              ? `main broken by merge: ${failed.join(' + ')}`
+              : 'main broken by merge';
+            const detail = `Post-merge CI failed on main at ${context.sha}.\n` +
+              `Failing jobs: ${failed.length ? failed.join(', ') : 'unknown'}\n` +
+              `See: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // A duplicate beats silence: the old code always filed. If the lookup fails
+            // (secondary rate limit, 5xx, a later page), fall through and still file.
+            let issues = [];
+            try {
+              issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100,
+              });
+            } catch (e) {
+              core.warning(`issue lookup failed (${e.message}) — filing without dedup`);
+            }
+            const dup = issues.find(i => !i.pull_request && i.title === TITLE);
+            if (dup) {
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: dup.number,
+                  body: `Recurred: ${detail}`,
+                });
+                core.notice(`main broken again — appended to #${dup.number} instead of filing a duplicate`);
+                return;
+              } catch (e) {
+                core.warning(`could not comment on #${dup.number} (${e.message}) — filing a new issue`);
+              }
+            }
+            await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `main broken by merge (${context.sha.slice(0,7)})`,
-              body: `Post-merge CI failed on main at ${context.sha}.\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              title: TITLE,
+              body: `${detail}\n\n_Recurrences with the same failing job set are appended to this issue rather than filed as duplicates (#937)._`,
               labels: ['bug'],
             });
