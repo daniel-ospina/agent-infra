@@ -92,7 +92,7 @@ Blocks `git commit/push` and `gh pr create/merge` unless ≥1 sub-agent was disp
 
 - **Scope:** **uniform ≥1-dispatch block — every tier (micro, standard, complex, unknown/unlabeled) blocks at 0 dispatches (#485)** — see the REVIEW-ENFORCER-TIER-RULE fence in `workflow/01-preflight.md` (machine-read; drift-pinned to `TIER_RULE` in `extensions/review-enforcer/index.ts`)
 - **What it wants:** ≥1 sub-agent dispatch before any git op
-- **What to do:** Dispatch a reviewer sub-agent (even a trivial one-line reviewer). It doesn't need to find issues — it just needs to have run. Code-bearing sets satisfy the floor via VGATE's own [VGATE] verification dispatch; docs-only sets dispatch a lightweight reviewer naming the diff.
+- **What to do:** Dispatch a reviewer sub-agent that returns a verdict on the diff — even a one-line reviewer must state whether the diff is sound ("NO ISSUES FOUND" or a list of issues), however small the diff. The ≥1-dispatch floor counts the dispatch, but the dispatch must be a review, not a token sign-off. Code-bearing sets satisfy the floor via VGATE's own [VGATE] verification dispatch (whose verdict is the [VGATE] PASS); docs-only sets dispatch a lightweight reviewer naming the diff and returning its verdict.
 - **Bypass:** `AGENT_SKIP_REVIEW_GATE=1` (emergency only)
 
 ### Verification Gate (`verification-gate`)
