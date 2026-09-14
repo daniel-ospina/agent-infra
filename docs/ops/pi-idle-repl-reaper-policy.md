@@ -45,6 +45,32 @@ RSS/process measurement.
   JSONL, a lone ghost cmux record with no session file, or an incarnation
   mismatch all abstain. cmux lifecycle fields are a **veto-only** signal,
   never proof.
+- **Bounded veto (#947).** `agentLifecycle` is an **event-driven belief**, not
+  a measurement: cmux sets it from hooks (a prompt turn started; a
+  turn-complete has not arrived), so a lost/never-sent turn-complete leaves
+  `lifecycle=running` **forever**. An unbounded veto therefore immunises that
+  pid permanently, however long its JSONL sits untouched — measured
+  2026-09-13: 45/47 candidates vetoed, 38 by `lifecycle=running`, and two of
+  them provably frozen at 98h/128h. A non-idle record is consequently only
+  evidence while it is **fresh**: a non-idle record whose OWN `updatedAt` is
+  older than `REAP_STUCK_HOURS` (default **3× `REAP_IDLE_HOURS`** = 72h) is no
+  longer current, and the pid is classified **STUCK**. STUCK is **reported,
+  never signaled by default**; `REAP_REAP_STUCK=1` (`--reap-stuck`) arms it,
+  and even then all of these must hold: JSONL ground truth past the same
+  bound, **every** non-idle record for that pid stale past it (fence-matched
+  or not; any fresh *or* `updatedAt`-less record keeps the veto — fail
+  closed), the process not accumulating CPU (`stat` S/I), and **no live
+  non-zombie child process** (a tool call in flight). A record that cannot be
+  identity-verified (no/off-fence `pidStartSeconds`) abstains from **voting**
+  — it still cannot veto the ordinary path — but it CAN withhold a STUCK kill.
+  The JSONL proof is computed **before** the veto so
+  the stuck population is never invisible: every vetoed row **that has a JSONL
+  proof** surfaces its `jsonl idle` age, and its record age too whenever a
+  usable `updatedAt` exists (a vetoed row with no proof keeps the fail-closed
+  `SKIP <veto>` line and reports no ages, since none exist; a proof-bearing row
+  whose sibling non-idle record carries a missing/unparseable `updatedAt`
+  reports `record age ?h`), plus a `⚠️ STUCK` audit block and
+  `STUCK_HOURS=/STUCK=/STUCK_RSS=/STUCK_ARMED=` footer fields.
 - **Falsification note:** the 24h threshold is diurnal-safe (a session that
   was used yesterday morning and again this morning is never falsely flagged);
   the boundary and the ±3s incarnation fence are hermetic-tested via
@@ -58,16 +84,39 @@ RSS/process measurement.
 4. ≥1 incarnation-matched cmux record: `pidStartSeconds` within ±3s of the ps
    lstart (second-granularity rounding differs up to ~1s live). Stale siblings
    beyond the fence neither prove nor veto.
-5. **ALLOWLIST union veto:** EVERY incarnation-matched record must be
-   `agentLifecycle==idle` AND `runtimeStatus==idle`. Any value on either key —
-   running / needsInput / unknown / error / None / absent — vetoes the pid.
-   Records with no `pidStartSeconds` abstain.
+5. **ALLOWLIST union veto (bounded, #947):** EVERY incarnation-matched record
+   must be `agentLifecycle==idle` AND `runtimeStatus==idle`. Any value on
+   either key — running / needsInput / unknown / error / None / absent —
+   vetoes the pid. Records with no `pidStartSeconds` abstain from voting. The
+   veto is **bounded by record freshness** (see *Bounded veto* above): a veto
+   whose non-idle records are ALL stale past `REAP_STUCK_HOURS` is
+   re-classified STUCK (reported; not signaled unless `REAP_REAP_STUCK=1`). A
+   fresh record — or one with no parseable `updatedAt` — keeps the plain
+   veto, **including a non-idle record that abstained from voting** (freshness
+   is unioned over every non-idle record this pid has, so an unverifiable
+   record can still only *withhold* a kill, never cause one).
 6. JSONL proves idle > threshold (youngest voting record wins; a no-JSONL
-   twin abstains but does NOT veto).
+   twin abstains but does NOT veto). The proof is evaluated **before** the
+   veto so a vetoed row still reports its idle age.
 7. **Settle re-verify immediately before each signal:** a FRESH per-pid ps
    probe (lstart changed ⇒ pid died+reused ⇒ suppress) and a fresh JSONL
    re-probe (activity advanced ⇒ suppress). The re-probed file is the
-   age-setting (max-epoch) record's file. Post-TERM survivor re-check is the
+   age-setting (max-epoch) record's file — **plus, for a STUCK row, the union
+   of every matched record's file** — so a twin that advances is not invisible.
+   A STUCK row additionally re-reads the cmux store: its deciding record must
+   still exist, still be non-idle, and **every** non-idle record for that pid
+   must still carry a valid stale stamp (the same union rule as classify). A
+   STUCK row also takes a **fresh `ps` enumeration** and re-runs the
+   no-live-child / no-live-pi-descendant probe against it, so a tool child
+   spawned *after* classify suppresses the kill; if that fresh enumeration
+   fails or comes back empty, the row is suppressed (an untrustworthy probe
+   is never read as "no child"). So a
+   twin that **refreshes** — i.e. starts a turn — suppresses, while a twin that
+   merely goes *idle* deliberately does not: an idle record is the reap target
+   itself, not work in progress, and any real activity on that twin is still
+   caught by the union JSONL re-probe above. Only the DECIDING record **ending**
+   suppresses outright (a turn that ended there disproves the premise).
+   Post-TERM survivor re-check is the
    same fresh probe (`kill -0` is never the oracle) WITH the incarnation fence
    re-applied: a pid recycled in the grace window suppresses the SIGKILL;
    zombies skip it. Survivors (same lstart) get SIGKILL
@@ -79,10 +128,29 @@ leaders); per-pid fallback otherwise — documented limitation below.
 
 ## Safety gates + never-touch list
 
+- Fail-closed ps enumeration (added with #947): if the pass-start `ps` (or its
+  row parser, or the candidate scan) fails, the pass aborts (exit 3) and
+  signals nothing — **whether or not rows came out**, because a partly-failed
+  `ps` yields a *truncated* table and a truncated table silently reads as "no
+  live child". A broken `ps` must never be mistaken for an idle machine. The
+  same rule guards the settle-time re-enumeration for STUCK rows (see gate 7).
+  `--list` reports the failure on stderr and exits 3 rather than printing an
+  empty list.
 - Fail-closed store: a missing/corrupt cmux store **with candidates** aborts
   (exit 3) after one retry — the pass never reaps from an unreadable
   registry. Zero tty'd pi candidates skip the store read entirely (exit 0,
   footer written) so cmux-less machines never emit hourly ⚠️ noise.
+- Fail-closed descendant map (added with #947): the map backing the
+  orchestrating-skip and the stuck arm's no-live-child guard is rebuilt by
+  `python3`; if that build fails **with candidates present**, the pass aborts
+  (exit 3) and signals nothing. Without it an unbuildable map made every pid
+  answer "no live pi descendant / no live child" — silently disabling the
+  skip, i.e. a session running tool or sub-agent work could be reaped. An
+  empty ps table (0 candidates) is not a failure and stays a clean no-op, and
+  `--list` exits before the build so the diagnostic surface is never blocked.
+  Only **interpreter/IO** failure counts as "unavailable": a malformed ps row
+  or an undecodable argv byte is skipped row-by-row (`errors="replace"`), so
+  one stray byte cannot turn the hourly job into a permanent no-reap.
 - Single-instance mkdir-lock (`~/.pi/agent/state/pi-reap-idle.lock`; macOS
   has no flock). Stale rules: a live owner whose lock is younger than
   `REAP_LOCK_STALE_SECONDS` (=1800) blocks the pass (exit 3); a dead owner
@@ -101,12 +169,29 @@ leaders); per-pid fallback otherwise — documented limitation below.
 
 `scripts/pi-reap-idle.sh` 4 passes: ps tty'd-pi enumeration (pinned contract
 `ps -axo pid=,ppid=,pgid=,tty=,lstart=,stat=,rss=,command=`; argv-based pi
-classifier) → cmux store index (canonical `~/.cmuxterm/pi-hook-sessions.json`
+classifier) → descendant-map build (**fail-closed**, see above) → cmux store
+index (canonical `~/.cmuxterm/pi-hook-sessions.json`
 only; stale `.tmp` crash-leftovers ignored) → session_id→JSONL-first join with
 fence + allowlist + marathon/own-session gates → settle-verified kill. Driven
 hourly by launchd; interactive runs default to **dry-run**; the launchd env
 carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
-`REAP_IDLE_HOURS`.
+`REAP_IDLE_HOURS`. Bounded-veto override: `--stuck-hours N` /
+`REAP_STUCK_HOURS` (default 3× the idle threshold). An explicitly supplied
+threshold is bounded
+by `REAP_MAX_HOURS` (default 1000000); the RAW value is range-checked before
+decimal normalization (bash `$(( 10#… ))` wraps mod 2^64) and a bad value —
+including a non-numeric `REAP_MAX_HOURS` itself — is a usage error (exit 2).
+The **derived** stuck bound (3× the idle threshold) is not capped, but it is
+checked after the multiply to be a positive decimal **and** `>= REAP_IDLE_HOURS`,
+so an overflowing wrap cannot make it negative (a negative bound would make every
+age comparison true and classify active sessions STUCK) **and a wrap that lands
+positive** (e.g. `6148914691236517206 * 3 == 2`, a ~7e14-year bound silently
+becoming 2h) is rejected too — every 64-bit wrap yields a value below the
+multiplicand, so monotonicity catches the positive-wrap class the positivity
+check alone accepted.
+Stuck arm: `--reap-stuck` /
+`REAP_REAP_STUCK=1` — **not** set by the launchd job, so the hourly pass
+reports the stuck set and never reaps it.
 
 ## Ops contract
 
@@ -116,16 +201,34 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   world-readable /tmp file; the capped footer is authoritative).
   Truncation uses a `mktemp`-ed sibling in the log's own directory — never a
   predictable `/tmp` name (a local symlink-truncation surface). Every pass writes a footer
-  `MODE=<dry-run|apply> NOW=… THRESHOLD=… CANDIDATES=… PRE=… POST=… RESIDUAL=… KILLED=… YIELD=…`:
-  MODE distinguishes armed vs dry passes (an armed pass with zero kills must
+  `MODE=<dry-run|apply> NOW=… THRESHOLD=… STUCK_HOURS=… STUCK=… STUCK_RSS=… STUCK_ARMED=… CANDIDATES=… PRE=… POST=… RESIDUAL=… KILLED=… YIELD=…`
+  (the exact field set, in order, of a normal pass). Every abort that runs
+  before classification writes a reduced footer carrying `STUCK_HOURS=` and
+  `STUCK_ARMED=` — `MODE=disabled … sentinel=`, the **lock** abort (both the
+  live-owner and the `LOCK raced` branch), the **ps
+  enumeration** abort, the **descendant-map** abort and the **store** abort —
+  so a monitor keying on `STUCK_ARMED` never silently reads the previous
+  pass's values as current. On those paths `STUCK=0` is a literal "no
+  classification ran", never a measured zero. The abort paths `log` their own
+  reason line immediately before the footer; the disabled path's reason is on
+  **stdout** (`echo`), so its log holds the footer alone (the footer is
+  self-describing: `MODE=disabled … sentinel=<path>`). The one footer-less
+  exit is the **log-unwritable** abort, which by definition cannot log; the
+  non-classifying modes (`--list`, `--probe-jsonl`, `--help`, usage errors)
+  write no footer and never reach classification. MODE distinguishes armed vs dry passes (an armed pass with zero kills must
   not read as a disarmed job); zero-candidate runs still write the footer
   (an absent log must never mean "not running"); PRE = tty'd-pi before the
   kill pass; POST + RESIDUAL come from a **fresh post-pass read** — RESIDUAL is
   the post-pass re-classification of the reap-eligible set (same gates; legit
   skips like marathon/running-twin/own-session never appear), so RESIDUAL=0
   after a clean armed pass, and on dry-run RESIDUAL = the would-be-reaped
-  count with KILLED=0. YIELD = Σ per-target rss at kill (KB). Log
-  size-guarded (~200 lines).
+  count with KILLED=0. If that post-pass `ps` read itself fails, its fields are
+  reported as `?` (with a `POST-PASS ps enumeration failed` reason line) rather
+  than as a stale count — a degraded diagnostic must not read as a fresh one. YIELD = Σ per-target rss at kill (KB). STUCK =
+  candidates classified stuck this pass; STUCK_RSS = Σ their rss; STUCK_ARMED
+  = whether `REAP_REAP_STUCK` armed the stuck set (a stuck pass with
+  `STUCK>0 STUCK_ARMED=0` is the documented, deliberate non-reap state — it is
+  NOT health). Log size-guarded (~200 lines).
 - **Dry-run → apply procedure:** `bash ~/.pi/agent/scripts/pi-reap-idle.sh`
   (dry-run; inspect verdict rows + MODE=dry-run footer) → one-shot
   `--apply` → confirm footer KILLED/RESIDUAL/YIELD → the hourly launchd pass
@@ -138,10 +241,12 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   the recovery path.
 - **Version sensitivity:** the reaper pins live schema (pi JSONL timestamps,
   cmux hook-store keys incl. `pidStartSeconds`/`agentLifecycle`/
-  `runtimeStatus`, session-dir `--<cwd>--` encoding). If pi or cmux changes
-  any of these shapes the reaper fails closed (skips), not open — dry-run and
-  the hermetic suite (`bash scripts/pi-reap-idle.test.sh`) before trusting a
-  new version.
+  `runtimeStatus`/`updatedAt`, session-dir `--<cwd>--` encoding). If pi or
+  cmux changes any of these shapes the reaper fails closed (skips), not open
+  — a dropped/renamed `updatedAt` makes every non-idle record un-ageable, so
+  the stuck set stays empty (the pre-#947 behaviour) rather than reaping.
+  Dry-run and the hermetic suite (`bash scripts/pi-reap-idle.test.sh`) before
+  trusting a new version.
 - **Retirement rule:** renaming/removing the farmed script requires retiring
   the plist too (broken-target guard cannot catch a stale extra job).
 - **Lifecycle-observation results (recorded pre-merge, Verification step 2 of
@@ -175,9 +280,9 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   signaling — survives the re-syncs that re-install the launchd job after an
   operator deliberately disarms it. Precedence: the ARMED log-writable probe
   runs before the sentinel check — an unwritable log aborts exit 3 even when
-  disarmed (the documented no-trail failure class; dry-run — and `--list`
-  when mode resolves to dry-run — keep best-effort logging since their
-  verdict surfaces are stdout).
+  disarmed (the documented no-trail failure class; the read-only `--list`
+  path never takes the lock and never writes the log at all — its verdict
+  surface is stdout).
 
 - **Framing-byte fail-closed (round 4):** the `|` cand-row delimiter and
   the 0x1f settle tie-separator are APFS-legal in names. `esc()` strips
@@ -193,6 +298,18 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
 
 ## Limitations + residuals
 
+- **The normal (non-stuck) path's settle re-verify is narrower than the arm's.**
+  Both paths re-probe the **union of every matched proof file** (a strictly
+  older matched twin that advances suppresses), but only a STUCK row re-reads
+  the cmux store at settle: for a normal row the store is read once, at
+  classify, so a cmux record that goes fresh/non-idle in the classify→settle
+  window is not seen (the JSONL union probe is what catches resumed work there).
+  Tracked in #1009 with the marathon-skip gap below.
+- **The orchestrating skip is tty-gated.** `has_live_pi_descendant` marks a
+  descendant only when it is a tty'd `pi` (the same classifier the candidate
+  set uses), so a **headless** `pi -p` descendant does not protect its parent —
+  the parent's JSONL is what catches resumed orchestration in practice. Tracked
+  in #1009.
 - **pgid ≠ pid fallback:** when a candidate is not its own process-group
   leader, the reaper signals the pid alone (documented per-pid TERM). Live
   fleet data shows all tty'd REPLs are pgid leaders, so group semantics hold;
@@ -204,6 +321,25 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
 - **Store rules recap:** zero candidates ⇒ store skipped ⇒ exit 0; candidates
   + store missing/persistently corrupt ⇒ ⚠️ retry-once ⇒ exit 3 (never
   mistaken for a disarmed job — the footer documents the abort).
+- **Stuck arm is off by default and is a deliberate broadening (#947):** with
+  `REAP_REAP_STUCK=1` the reaper will TERM a pid whose cmux record says
+  `running`. The guards are the dual-signal freshness bound (a `updatedAt`
+  that is not a real epoch — digit/dot soup, out of plausible range — is
+  never treated as stale; fail closed), the S/I process state at classify
+  **and again at settle**, the settle-time fresh `ps` re-enumeration and
+  child/descendant re-check (suppressed if that probe fails or is empty), the
+  absence of a live child at classify, and the
+  settle re-verify: fresh lstart + fresh JSONL over the **union of every matched
+  proof file** **plus, for stuck rows only, a fresh store re-read** requiring the
+  deciding record to still
+  exist and still be non-idle, every non-idle record for that pid to still be
+  stale (union), and the process still sleeping — so a turn starting on any
+  of the pid's records rewrites that record and suppresses, and the deciding
+  record ending suppresses outright.
+  The residual risk is a single tool call that legitimately writes nothing
+  for ≥72h, holds no child process, and leaves the cmux record untouched —
+  indistinguishable from wedged by any signal the reaper can read. Leave the
+  arm off where that class matters; the hourly launchd job does not set it.
 
 ## Out of scope / follow-ups
 

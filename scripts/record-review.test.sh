@@ -34,7 +34,10 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 # Stubbed gh: answers the stale-sha head query + PR-body read/PATCH + the
 # #513 clean-micro tier guard's body/labels queries.
 #   head    (--jq .head.sha)      → ${STUB_HEAD_SHA:-40×a}
-#   body    (--jq .body)          → {"body": "${STUB_BODY:-PR body}"}  (PR body text)
+#   body    (--jq .body)          → raw ${STUB_BODY:-PR body}. `gh --jq .body`
+#                                   prints the body TEXT, not the JSON envelope;
+#                                   the old envelope form only "worked" while the
+#                                   closing parser was unanchored (#1012).
 #   labels  (--jq '.[].name')     → ${STUB_LABELS:-} lines, or the per-issue
 #                                   file ${STUB_LABELS_DIR}/<issue-num> when it
 #                                   exists; exit 1 when STUB_LABELS_FAIL=1
@@ -58,7 +61,7 @@ if [ "$1" = "api" ]; then
         echo; exit 0
     fi
     if grep -qF -- "--jq .body" <<<"$*"; then
-        printf '{"body": "%s"}' "${STUB_BODY:-PR body}"
+        printf '%s' "${STUB_BODY:-PR body}"
         exit 0
     fi
     if grep -qF -- "--jq .[].name" <<<"$*"; then
@@ -135,6 +138,19 @@ refs_for() { # <repo> <text> — prints one "repo#num" per line
         # arg0 = _ (NOT the script path) — the main guard compares $0 with
         # BASH_SOURCE[0]; an arg0 equal to the script path would RUN main.
         bash -c 'source "$1" >/dev/null 2>&1 || exit 1; closing_issue_refs "$2"' _ "$RECORD" "$text"
+    ) 2>/dev/null || true
+}
+
+# #1012 r2/r3 GitHub-parity seam: closing_issue_refs with the WORD-BOUNDARY-
+# ANCHORED CLOSING_KW (no positional REFCTX prefix, but `\b`-anchored exactly
+# as the tier guard passes it). The #513 tier guard unions this scan with the
+# positional one, so a mid-sentence ref GitHub will auto-close still binds —
+# while prose that merely CONTAINS the class ("prefix", "discloses") does not.
+refs_for_any() { # <repo> <text> — boundary-anchored keyword-class scan
+    local repo="$1" text="$2"
+    (
+        export REPO="$repo"
+        bash -c 'source "$1" >/dev/null 2>&1 || exit 1; closing_issue_refs "$2" "\b$CLOSING_KW"' _ "$RECORD" "$text"
     ) 2>/dev/null || true
 }
 
@@ -255,10 +271,33 @@ printf 'complexity:micro\n' > "$T/labels/424313"
 # even when these pins fail (the only failure gate is top-level FAIL=0).
 export STUB_LABELS_DIR="$T/labels"
 export STUB_LABELS=""   # per-issue map takes precedence in the stub
-STUB_BODY="Fixes #424310 and also closes #424311" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424309 "$SHA"
+STUB_BODY=$'Fixes #424310\nCloses #424311' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424309 "$SHA"
 [ "$RECORD_RC" = "4" ] && ok "multi-ref: any same-repo non-micro ref refuses (rc 4)" || bad "multi-ref: any non-micro refuses (rc=$RECORD_RC, err=$RECORD_ERR)"
-STUB_BODY="Fixes #424312 and Closes #424313" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424314 "$SHA"
+STUB_BODY=$'Fixes #424312\nCloses #424313' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424314 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "multi-ref: all-micro refs allow (rc 0)" || bad "multi-ref: all-micro allows (rc=$RECORD_RC, err=$RECORD_ERR)"
+unset STUB_LABELS_DIR STUB_LABELS
+rm -rf "$T/labels"
+
+# 8.9a #1012 × #513 — GITHUB-PARITY tier bind. The positional closing scan
+# alone MISSES "This also closes #424331" (mid-sentence), so pre-fix the guard
+# resolved only the micro ref #424330, reached no refusal, and recorded
+# clean-micro on a PR that ALSO auto-closes complexity:complex #424331 on merge
+# — a SILENT FAIL-OPEN. The guard now unions the positional scan with a
+# WORD-BOUNDARY-ANCHORED CLOSING_KW scan. RED before the record-review.sh
+# parity fix.
+mkdir -p "$T/labels"
+printf 'complexity:micro\n'   > "$T/labels/424330"
+printf 'complexity:complex\n' > "$T/labels/424331"
+export STUB_LABELS_DIR="$T/labels"
+export STUB_LABELS=""   # per-issue map takes precedence in the stub
+STUB_BODY=$'Closes #424330\nThis also closes #424331' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424332 "$SHA"
+[ "$RECORD_RC" = "4" ] && ok "github-parity bind: mid-sentence complex ref refuses (rc 4)" || bad "github-parity bind: mid-sentence complex ref must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424332.json" ] && ok "github-parity bind: no record written on refusal" || bad "github-parity bind: record written on refusal"
+# Positive control: when the mid-sentence ref is ALSO micro, the union must not
+# manufacture a refusal.
+printf 'complexity:micro\n' > "$T/labels/424333"
+STUB_BODY=$'Closes #424330\nThis also closes #424333' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424334 "$SHA"
+[ "$RECORD_RC" = "0" ] && ok "github-parity bind: mid-sentence micro ref still allows (rc 0)" || bad "github-parity bind: all-micro union must allow (rc=$RECORD_RC, err=$RECORD_ERR)"
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
 
@@ -291,20 +330,109 @@ fi
 # 8.11 parser-parity corpus (check-pipeline-compliance parse_issue_ref semantics).
 OUT="$(refs_for "daniel-ospina/agent-infra" "Fixes #42")"
 assert_contains "$OUT" "daniel-ospina/agent-infra#42" "parser: bare #N resolves against REPO"
-OUT="$(refs_for "daniel-ospina/agent-infra" "Closes daniel-ospina/tortoise#7 and Resolves #9")"
+OUT="$(refs_for "daniel-ospina/agent-infra" $'Closes daniel-ospina/tortoise#7\nResolves #9')"
 assert_contains "$OUT" "daniel-ospina/tortoise#7" "parser: owner/repo#N carries its own repo"
-assert_contains "$OUT" "daniel-ospina/agent-infra#9" "parser: bare #N next to owner/repo#N still resolves"
+assert_contains "$OUT" "daniel-ospina/agent-infra#9" "parser: bare #N on its own line still resolves"
 OUT="$(refs_for "daniel-ospina/agent-infra" "Fixes https://github.com/other/orgrepo/issues/12")"
 assert_contains "$OUT" "other/orgrepo#12" "parser: full URL form"
 OUT="$(refs_for "daniel-ospina/agent-infra" "Fixes https://github.com/other/orgrepo/pull/12")"
 [ -z "$OUT" ] && ok "parser: pull-URL excluded" || bad "parser: pull-URL excluded (got: $OUT)"
+# #1012 — the closing match is POSITIONAL, so a mid-sentence mention must NOT
+# resolve (this vector used to assert the opposite; it is what let PR #968
+# satisfy the compliance gate). A bullet reference context still resolves.
 OUT="$(refs_for "daniel-ospina/agent-infra" "This fixes #42 in passing")"
-assert_contains "$OUT" "#42" "parser: narrative prose-verb class matches (parse_issue_ref parity)"
+[ -z "$OUT" ] && ok "parser: mid-sentence mention does not resolve (positional, #1012)" || bad "parser: mid-sentence mention must not resolve (got: $OUT)"
+OUT="$(refs_for "daniel-ospina/agent-infra" "- Fixes #42")"
+assert_contains "$OUT" "#42" "parser: bullet reference context resolves (parse_issue_ref parity)"
+# #1012 r2 — the reference context was too narrow: heading / ordered-list /
+# task-list / blockquote / "+" bullet are all accepted Markdown reference
+# shapes (they resolved before the positional rule) and were left UNPINNED.
+OUT="$(refs_for "daniel-ospina/agent-infra" "## Closes #42")"
+assert_contains "$OUT" "#42" "parser: heading reference context resolves"
+OUT="$(refs_for "daniel-ospina/agent-infra" "1. Closes #42")"
+assert_contains "$OUT" "#42" "parser: ordered-list reference context resolves"
+OUT="$(refs_for "daniel-ospina/agent-infra" "- [ ] Closes #42")"
+assert_contains "$OUT" "#42" "parser: task-list reference context resolves"
+OUT="$(refs_for "daniel-ospina/agent-infra" "> Closes #42")"
+assert_contains "$OUT" "#42" "parser: blockquote reference context resolves"
+OUT="$(refs_for "daniel-ospina/agent-infra" "+ Closes #42")"
+assert_contains "$OUT" "#42" "parser: plus-bullet reference context resolves"
+# #1012 r3 — the prefix + checkbox groups are REPEATABLE, so COMPOUND prefixes
+# (nested blockquote, list-inside-quote) are reference contexts. A
+# single-consumption group false-BLOCKED check (a) on these while GitHub still
+# auto-closes on merge.
+OUT="$(refs_for "daniel-ospina/agent-infra" "> > Closes #42")"
+assert_contains "$OUT" "#42" "parser: nested-blockquote reference context resolves"
+OUT="$(refs_for "daniel-ospina/agent-infra" "> - Closes #42")"
+assert_contains "$OUT" "#42" "parser: list-inside-quote reference context resolves"
+OUT="$(refs_for "daniel-ospina/agent-infra" ">> Closes #42")"
+assert_contains "$OUT" "#42" "parser: tight-nested blockquote reference context resolves"
+# Anti-vacuous control: consuming more prefixes must NOT reopen the
+# mid-sentence vacuity — the keyword must follow the marks immediately.
+OUT="$(refs_for "daniel-ospina/agent-infra" "> - This also closes #42")"
+[ -z "$OUT" ] && ok "parser: compound prefix does not reopen mid-sentence vacuity" || bad "parser: compound prefix must not resolve a mid-sentence keyword (got: $OUT)"
+# Anti-vacuous control: an ATX heading is at most 6 hashes.
+OUT="$(refs_for "daniel-ospina/agent-infra" "####### Closes #42")"
+[ -z "$OUT" ] && ok "parser: 7-hash run is not a heading context" || bad "parser: 7-hash run must not resolve (got: $OUT)"
+# #1012 r2/r3 — the GitHub-parity scan (boundary-anchored CLOSING_KW) DOES
+# resolve the mid-sentence ref the positional scan ignores; this is the
+# mechanism the #513 tier guard unions in (§8.9a).
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "This also closes #42")"
+assert_contains "$OUT" "#42" "parser: parity scan resolves a mid-sentence closing ref (GitHub parity)"
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "a sentence about refs #42")"
+[ -z "$OUT" ] && ok "parser: parity scan still ignores the trace class" || bad "parser: parity scan must not match trace keywords (got: $OUT)"
+# #1012 r3 — the parity scan is WORD-BOUNDARY-anchored because the keyword class
+# is a SUFFIX of ordinary English words. Unanchored, these three bodies were
+# read as `fix #42` / `closes #42` / `resolved #42`, triggering a label fetch
+# and a false `exit 4` refusal on a non-micro issue. RED pre-fix.
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "The prefix #42 is unrelated.")"
+[ -z "$OUT" ] && ok "parser: parity scan ignores 'prefix #42' (word boundary)" || bad "parser: parity scan must ignore 'prefix #42' (got: $OUT)"
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "This discloses #42 but does not close it.")"
+[ -z "$OUT" ] && ok "parser: parity scan ignores 'discloses #42' (word boundary)" || bad "parser: parity scan must ignore 'discloses #42' (got: $OUT)"
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "Unresolved #42 remains open.")"
+[ -z "$OUT" ] && ok "parser: parity scan ignores 'unresolved #42' (word boundary)" || bad "parser: parity scan must ignore 'unresolved #42' (got: $OUT)"
 
 # 8.12 repo-less clean-micro → arm (c) fail-open (no repo to tier-bind).
 run_record_verdict clean-micro "" 424316
 [ "$RECORD_RC" = "0" ] && ok "repo-less clean-micro fails open (rc 0)" || bad "repo-less clean-micro (rc=$RECORD_RC)"
 assert_contains "$RECORD_ERR" "UNVERIFIED" "repo-less clean-micro warns the tier is unverified"
+
+# 8.13 cross-script byte-identity pin (#1012 r2) — the REFCTX positional prefix
+# and the CLOSING_KW keyword class MUST be byte-identical between
+# check-pipeline-compliance.sh and record-review.sh: that equality is the
+# stated justification for anchoring both parsers with the same rule, yet
+# nothing asserted it, so a one-sided edit could silently desynchronize the two
+# gates. Extract the constant lines (in file order) and compare them.
+A_CONST="$(grep -E '^(REFCTX|CLOSING_KW)=' "$SCRIPT_DIR/check-pipeline-compliance.sh" || true)"
+B_CONST="$(grep -E '^(REFCTX|CLOSING_KW)=' "$RECORD" || true)"
+[ -n "$A_CONST" ] && [ -n "$B_CONST" ] || bad "cross-script pin: REFCTX/CLOSING_KW lines missing from a script (extraction is vacuous)"
+assert_eq "$A_CONST" "$B_CONST" "cross-script byte-identity: REFCTX + CLOSING_KW lines identical"
+
+# 8.14 FALSE-REFUSAL guard on the parity scan (#1012 r3). The parity scan is
+# WORD-BOUNDARY-anchored. Unanchored, the keyword class matches INSIDE English
+# words that GitHub's own closing parser — which requires a word boundary —
+# never treats as keywords, so the guard REFUSED a legitimate clean-micro over
+# prose. RED pre-fix: `The prefix #424340 is unrelated.` yielded `fix #424340`
+# from the bare scan, fetched #424340's labels, and exited 4 because they were
+# non-micro. The guard must PROCEED (record) — and arm (c) must still warn that
+# no real ref was found, which is what makes this vector non-vacuous (a
+# "proceeds" result could otherwise be a micro ref that slipped through).
+mkdir -p "$T/labels"
+printf 'complexity:standard\n' > "$T/labels/424340"
+printf 'complexity:standard\n' > "$T/labels/424341"
+printf 'complexity:standard\n' > "$T/labels/424342"
+export STUB_LABELS_DIR="$T/labels"
+export STUB_LABELS=""   # per-issue map takes precedence in the stub
+STUB_BODY='The prefix #424340 is unrelated.' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424340 "$SHA"
+[ "$RECORD_RC" = "0" ] && ok "false-refusal: 'prefix #N' is not a closing ref (rc 0)" || bad "false-refusal: 'prefix #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424340.json" ] && ok "false-refusal: 'prefix #N' record written" || bad "false-refusal: 'prefix #N' record must be written"
+assert_contains "$RECORD_ERR" "no same-repo closing-issue ref" "false-refusal: 'prefix #N' reached arm (c), not a tier bind"
+STUB_BODY='This discloses #424341 but does not close it.' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424341 "$SHA"
+[ "$RECORD_RC" = "0" ] && ok "false-refusal: 'discloses #N' is not a closing ref (rc 0)" || bad "false-refusal: 'discloses #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+STUB_BODY='Unresolved #424342 remains open.' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424342 "$SHA"
+[ "$RECORD_RC" = "0" ] && ok "false-refusal: 'unresolved #N' is not a closing ref (rc 0)" || bad "false-refusal: 'unresolved #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+unset STUB_LABELS_DIR STUB_LABELS
+rm -rf "$T/labels"
 
 # 9. #980 argv/env fail-closed guard ─────────────────────────────
 # The second-model flag/env surface was REMOVED. Its removal must fail CLOSED:

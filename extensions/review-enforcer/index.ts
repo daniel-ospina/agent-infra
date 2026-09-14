@@ -282,6 +282,14 @@ function hasUnresolvableConstruct(command: string): boolean {
  * Removing the repo pair up front makes every downstream shape compare against
  * the same canonical text, rather than teaching each of four patterns about an
  * optional flag in a different position.
+ *
+ * ⚠️ Its value removal is NOT quote-aware: `\s+\S+` takes only the FIRST
+ * whitespace-delimited word, so a quoted value (`--repo "see <url> here"`) keeps its
+ * TAIL in the output. Every caller here only looks for WORDS (`gh`, `pr`, `merge`,
+ * `--admin`), which is unaffected — but never read a positional/selector out of this
+ * output: that tail held a PR URL and `extractMergeSelector` returned it as the
+ * selector (wrong PR + wrong repo, VGATE #1007 cycle 4). It reads the ORIGINAL tail
+ * instead, and re-finds the verb with `MERGE_VERB_RE`.
  */
 function stripRepoArgs(command: string): string {
   // The value may be ATTACHED (`-Rowner/repo`), `=`-joined, or a separate word.
@@ -327,6 +335,42 @@ const GH_PR_PATTERN = /(^|[\s;&|(){!])gh\s+pr\s+(create|merge)(?=\s|$)/;
  *
  * Tracks `'…'` and `"…"` (with `\` escapes outside single quotes).
  */
+/**
+ * `RegExp.exec` that skips any match starting INSIDE a quoted region (mask[i] false).
+ * `MERGE_VERB_RE` is a text search, so `gh pr view "gh pr merge <url> --admin"` matched
+ * the QUOTED verb and attributed that URL's repo to a non-merge command (fresh review,
+ * P2). The mask is `unquotedMask`'s — the same quote model the rest of this file uses,
+ * so the two cannot drift.
+ */
+function matchUnquoted(re: RegExp, text: string, mask: boolean[]): RegExpExecArray | null {
+  const scan = new RegExp(re.source, `${re.flags.replace("g", "")}g`);
+  let m: RegExpExecArray | null;
+  while ((m = scan.exec(text)) !== null) {
+    if (mask[m.index] === true) return m;
+    scan.lastIndex = m.index + 1;
+  }
+  return null;
+}
+
+/**
+ * PRECISE count of real (unquoted) `gh pr merge` verbs — the counterpart of
+ * `countMergeVerbs`, which over-counts BY DESIGN for the admin-merge compound guard (an
+ * over-count there only costs a retry). Repo attribution needs the precise one: an
+ * over-count discards a legitimate URL repo (re-review P2). Same `MERGE_VERB_RE` and same
+ * `unquotedMask`, so this cannot become a second, disagreeing text model.
+ */
+function countUnquotedMergeVerbs(command: string): number {
+  const mask = unquotedMask(command);
+  const scan = new RegExp(MERGE_VERB_RE.source, "g");
+  let n = 0;
+  let m: RegExpExecArray | null;
+  while ((m = scan.exec(command)) !== null) {
+    if (mask[m.index] === true) n++;
+    else scan.lastIndex = m.index + 1;
+  }
+  return n;
+}
+
 function unquotedMask(command: string): boolean[] {
   const mask = new Array<boolean>(command.length).fill(true);
   let quote: string | null = null;
@@ -673,13 +717,63 @@ export function repoFromGitRemote(dir: string): string | null {
 export interface RepoContext {
   repo?: string; // owner/name → passed as --repo to the gate's own gh calls
   cwd?: string; // resolved cd path → passed as cwd to the gate's own gh calls
-  source: "flag" | "env" | "cd" | "record" | "fallback";
+  source: "url" | "flag" | "env" | "cd" | "record" | "fallback";
 }
 
 // Extract the PR number from `gh pr merge <n>` (matches GH_PR_PATTERN verbs).
+/**
+ * The command with every quoted region replaced by SPACES — same length, same offsets, so a
+ * match index still addresses the original text. A text regex run on this cannot see a
+ * QUOTED mention as one of the command's own tokens. Reuses `unquotedMask`, the file's
+ * single quote model, so the two cannot drift.
+ */
+function maskQuoted(command: string): string {
+  const mask = unquotedMask(command);
+  let out = "";
+  for (let i = 0; i < command.length; i++) out += mask[i] ? command[i] : " ";
+  return out;
+}
+
+/**
+ * The PR number written IMMEDIATELY after the verb (`gh pr merge 138`).
+ *
+ * Measured on main before this change, the raw-text match took the FIRST
+ * `gh pr merge <digits>` ANYWHERE — including inside a quoted argument — and the registry
+ * path consults this function FIRST (`extractPrNumber(command) ?? extractMergePrNumber`),
+ * so a mention shadowed the real positional and the gate checked a DIFFERENT PR than gh
+ * merged (a wrong-PR evidence read):
+ *   `gh pr merge --body "see gh pr merge 999" 138 --admin` -> 999 (gh merges 138)
+ *   `x="say gh pr merge 1"; gh pr merge <url> --admin`      -> 1   (gh merges the URL's PR)
+ *   `git commit -m "see gh pr merge 138"`                    -> 138 (a mention drove the gate)
+ * Masking the verb fixes all three: the match must be one bash would pass as a word.
+ *
+ * It does NOT change a QUOTED POSITIONAL (`gh pr merge "138"`): the regex requires bare
+ * digits after the verb, so that spelling returned null before masking too and still does —
+ * `extractMergePrNumber` refuses the quoted token as well, so the registry gate is SKIPPED
+ * for it. That is a PRE-EXISTING hole (the scanner does not dequote a positional) and the
+ * follow-up issue covers it together with the dequote fix; masking neither causes nor
+ * widens it.
+ */
 export function extractPrNumber(command: string): number | null {
-  const m = command.match(/gh\s+pr\s+merge\s+(\d+)/);
-  return m ? parseInt(m[1], 10) : null;
+  const masked = maskQuoted(command);
+  const m = masked.match(/gh\s+pr\s+merge\s+(\d+)/);
+  if (m === null) return null;
+  // A token ADJACENT to a quoted region is quote-SPLICED: bash concatenates `"1"38` into
+  // `138`, so the digits the mask leaves visible are a FRAGMENT of the real argument and
+  // taking them names a different PR (`"1"38` masked reads `38`; gh merges 138). Refuse
+  // rather than guess — the same fail-closed direction as the rest of this walk (round-4
+  // review, P2: masking alone turned this from null into a wrong-number read).
+  //
+  // STATED LIMIT (pre-existing, filed with the dequote follow-up #1021): this covers `'` and
+  // `"` adjacency only. The ANSI-C family splices with a `$` in front (`1$'38'` is `138` to
+  // bash) and a digit-adjacent `$` is not caught here, so `1$'38'` still reads `1`. That is
+  // NO WORSE than before this function was masked (the raw regex also read `1`), and the
+  // dequote-aware positional in #1021 is what closes it.
+  const dStart = m.index + m[0].length - m[1].length;
+  const before = command[dStart - 1];
+  const after = command[dStart + m[1].length];
+  if (before === '"' || before === "'" || after === '"' || after === "'") return null;
+  return parseInt(m[1], 10);
 }
 
 // Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag.
@@ -791,6 +885,39 @@ export function extractCdPath(command: string): string | null {
 }
 
 export function resolveRepoContext(command: string, record: ReviewRecord | null): RepoContext {
+  // #1007: a PR URL in the SELECTOR outranks every other source, because gh resolves
+  // the merge against the URL and IGNORES --repo/GH_REPO. Probed live rather than
+  // assumed (2026-09-14):
+  //   gh pr view <agent-infra URL> --repo <tortoise>  → returned the agent-infra URL
+  //   gh pr merge <URL to a repo that does not exist> --repo <one that does>  →
+  //       "Could not resolve to a Repository with the name '…definitely-not-a-repo-xyz'"
+  //   gh pr merge <URL to one that exists> --repo <one that does not>  →
+  //       failed on the URL's PR, never on the bogus --repo
+  // So reading the evidence from anywhere but the URL's repo verifies a PR gh is not
+  // about to merge. The URL wins here for the same reason it wins in gh.
+  const selector = extractMergeSelector(command);
+  // A COMPOUND command is resolved PER VERB by the caller, and the two extractors need not
+  // agree on WHICH verb: `extractPrNumber` is a text match (first `gh pr merge <digits>`),
+  // while `extractMergeSelector` takes the FIRST verb — so `gh pr merge <url>; gh pr merge
+  // 123` would attribute the url verb's repo to a number taken from a later verb and read
+  // another repo's evidence (fresh review, P2).
+  //
+  // ⚠️ NOT `countMergeVerbs`: that one is deliberately CONSERVATIVE for the admin path (it
+  // counts every command-position `gh` under an unresolvable construct, where an over-count
+  // only costs a retry). Over-counting here DROPS a legitimate URL repo — re-review found
+  // `x="say gh pr merge 1"; gh pr merge <url> --admin`, where it returned 2 and the URL repo
+  // was discarded. This counter is PRECISE instead: the same `MERGE_VERB_RE` + the same
+  // `unquotedMask`, so a quoted mention is not a verb.
+  //
+  // It counts a real second verb spelled with `;`, `&&`, a newline, `|`, a subshell, a
+  // glued `;` or a repo pair in the gaps. It UNDER-counts a verb hidden inside `sh -c '…'`
+  // or a splice (`gh pr $'merge' 123`) — measured (round-4 review). That is benign here and
+  // deliberate: `maskQuoted` hides those same spellings from `extractPrNumber`, so the
+  // number and the repo stay consistent (both resolve the FIRST verb) instead of the repo
+  // being taken from one verb and the number from another.
+  if (selector.repo && countUnquotedMergeVerbs(command) <= 1) {
+    return { repo: selector.repo, source: "url" };
+  }
   const flag = extractRepoFlag(command);
   if (flag) return { repo: flag, source: "flag" };
   const env = extractGhRepoEnv(command);
@@ -1241,6 +1368,16 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  * `--adm`/`--ad`, which gh rejects, so it never produced an executed merge. Do not
  * read an earlier "brace expansion … CLOSED" wording as wider than this.)
  *
+ * #1007 — THE SELECTOR SHAPE. The selector may be a bare number or ONE PR URL
+ * (`extractMergeSelector`). A BRANCH selector is NOT resolved and stays a
+ * fail-closed block: resolving it needs a `gh` call, i.e. this gate asking the thing
+ * it is gating for the identity it is about to check. A QUOTED URL
+ * (`gh pr merge "https://…/pull/1" --admin`) still blocks here — this layer does not
+ * dequote, exactly as it has never dequoted a `"123"` selector. The argv-level shim
+ * sees the URL already dequoted, so those shapes resolve THERE, not here: an
+ * over-block at the outer layer, never a bypass. Both directions are pinned in
+ * `index.test.ts` ("extractMergeSelector") and `tests/gh-shim/run.sh` §11.
+ *
  * A `$VAR`- or `$()`-SUPPLIED FLAG is CLOSED by failing closed: any `$`-bearing
  * ARGUMENT of the merge beyond the position argument makes the command an admin
  * merge, because `V=--admin; gh pr merge 999 $V` reaches gh as an admin merge while
@@ -1374,15 +1511,211 @@ export function countMergeVerbs(command: string): number {
 }
 
 export function extractMergePrNumber(command: string): number | null {
-  const canonical = stripRepoArgs(command);
-  const idx = canonical.search(/gh\s+pr\s+merge\b/);
-  if (idx === -1) return null;
-  const rest = canonical.slice(idx).replace(/^gh\s+pr\s+merge\b/, "");
-  const segment = rest.split(/;|&&|\|\||\||\n/)[0] ?? "";
-  const tokens = segment.split(/\s+/).filter(Boolean);
+  return extractMergeSelector(command).pr;
+}
+
+/**
+ * The ONE PR-URL shape this gate resolves (#1007):
+ * `https://github.com/<owner>/<repo>/pull/<digits>`.
+ *
+ * The number is IN the token, so accepting a URL does not mean asking `gh` who the
+ * PR is. Everything else is refused, and each refusal is deliberate:
+ *   - any other host — the host cannot be carried into `--repo`, so the evidence
+ *     would be read from a different host's repo;
+ *   - `?`/`#` (gh routes `…/pull/1?s=1` to the same PR, but "route-equivalent" is
+ *     not "the same string", and this layer must not normalise);
+ *   - an extra path segment or trailing `/`;
+ *   - a BRANCH name — resolving one needs a `gh` call, i.e. asking the gated thing
+ *     for the identity it is about to check. It stays a fail-closed block.
+ * This is the SAME shape `scripts/gh-shim/gh::parse_pr_url` accepts, on purpose:
+ * the two layers must not disagree about what is a PR (see the parity note there).
+ */
+const PR_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([0-9]+)$/;
+
+export interface MergeSelector {
+  pr: number | null;
+  /** `owner/repo` when the selector was a PR URL, else null. */
+  repo: string | null;
+}
+
+/**
+ * Split a command segment into the ARGV words gh would see — respecting QUOTES.
+ *
+ * `scanTokens` splits on whitespace regardless of quoting, which is right for the rules
+ * that ask "does the text contain X" and WRONG here: `--body "see <url> here"` is ONE
+ * argv value, so a URL inside it is not the selector. A whitespace split leaves that URL
+ * as a free token, and the gate would then certify a DIFFERENT PR (in a different repo)
+ * than gh merges — a FAIL-OPEN, found by VGATE on #1007's first cycle.
+ *
+ * An unterminated quote is NOT an error here: the caller's `;`/`&&` segment split is not
+ * quote-aware either, so an unterminated region usually means the segment was CUT, and
+ * everything after the flag is then one value. Consuming it as one word is what keeps
+ * `gh pr merge 123 --admin --body "msg with ; in it"` allowed (the positional is found
+ * before the value) while refusing a body-hosted URL standing in for a missing one.
+ * BACKSLASHES ARE ALWAYS ESCAPES, in every context — including inside single quotes,
+ * where bash has none. That is deliberate, and it is the SAFE direction: it can only
+ * keep a quoted region OPEN longer than bash would, never close it EARLIER. Closing
+ * early is the only way this function can turn a value's contents into a free token,
+ * and a free URL token is what makes the gate certify a different PR (in a different
+ * repo) than gh merges. VGATE found that fail-open three times on #1007 — first from a
+ * whitespace split, then through `\"` inside a double-quoted value (and the `$'…\'…'`
+ * form), then through a NESTED substitution whose inner quotes closed the OUTER region.
+ * Over-reading a quote can only REFUSE a command gh would have run, which is the
+ * direction this gate is allowed to be wrong in.
+ *
+ * NESTED REGIONS ARE MODELLED, because a nested region's quotes are INDEPENDENT of the
+ * enclosing one: `"$( … " … " …)"` keeps the OUTER quote open across the inner ones,
+ * so a URL inside the value never becomes a free token. Levels are tracked per region
+ * (`$( … )`, backticks), with backslash escaping inside all of them, and a paren depth
+ * so `$((1+2))` and `$( (a) )` close where bash closes them.
+ *
+ * STILL NOT A SHELL (see the STATED LIMITS above): constructs this cannot model — a
+ * `case`-pattern `)` inside `$( … )`, here-docs — could still end a region early. The
+ * argv-level shim is the AUTHORITY for exactly this reason; this layer is the fast one,
+ * not the correct one.
+ */
+interface SubLevel {
+  kind: "root" | "paren" | "tick";
+  q: "'" | '"' | null;
+  depth: number;
+  /** `case` … `esac` saw no `esac` yet: its pattern `)` must NOT close the region. */
+  caseDepth: number;
+}
+
+function splitArgvWords(segment: string): string[] {
+  const words: string[] = [];
+  let cur = "";
+  let started = false;
+  let word = ""; // the current UNQUOTED word, for `case`/`esac` recognition
+  const lv: SubLevel[] = [{ kind: "root", q: null, depth: 0, caseDepth: 0 }];
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i];
+    const s = lv[lv.length - 1];
+    // A `case` pattern is closed by a BARE `)`, which is not the region's `)`.
+    // Without this, `$(case x in y) <url> esac) 123` popped the substitution at the
+    // pattern and left `<url>` as a free token — the URL then stood in for the
+    // positional (VGATE #1007 cycle 3's sibling).
+    const flushWord = () => {
+      if (word === "case") s.caseDepth++;
+      else if (word === "esac" && s.caseDepth > 0) s.caseDepth--;
+      word = "";
+    };
+    if (s.q === "'") {
+      // No escapes in bash's single quotes — but see the header: escaping here can only
+      // keep the region open longer, which is the safe direction.
+      cur += c;
+      if (c === "\\" && i + 1 < segment.length) { cur += segment[++i]; continue; }
+      if (c === "'") s.q = null;
+      continue;
+    }
+    if (s.q === '"') {
+      cur += c;
+      if (c === "\\" && i + 1 < segment.length) { cur += segment[++i]; continue; }
+      if (c === '"') { s.q = null; continue; }
+      if (c === "$" && segment[i + 1] === "(") {
+        flushWord();
+        cur += segment[++i];
+        lv.push({ kind: "paren", q: null, depth: 1, caseDepth: 0 });
+        continue;
+      }
+      if (c === "`") { flushWord(); lv.push({ kind: "tick", q: null, depth: 0, caseDepth: 0 }); continue; }
+      continue;
+    }
+    // Unquoted AT THIS LEVEL (a `"` opened inside `$( … )` does not quote the outer one).
+    if (c === "\\" && i + 1 < segment.length) { flushWord(); cur += c + segment[++i]; started = true; continue; }
+    if (c === "'" || c === '"') { flushWord(); s.q = c; cur += c; started = true; continue; }
+    if (c === "$" && segment[i + 1] === "(") {
+      flushWord();
+      cur += segment[++i];
+      lv.push({ kind: "paren", q: null, depth: 1, caseDepth: 0 });
+      started = true;
+      continue;
+    }
+    if (c === "`") {
+      flushWord();
+      if (s.kind === "tick") lv.pop();
+      else lv.push({ kind: "tick", q: null, depth: 0, caseDepth: 0 });
+      cur += c;
+      started = true;
+      continue;
+    }
+    if (c === "(" && s.kind === "paren") { flushWord(); s.depth++; cur += c; started = true; continue; }
+    if (c === ")" && s.kind === "paren" && s.caseDepth === 0) {
+      flushWord();
+      s.depth--;
+      if (s.depth === 0) lv.pop();
+      cur += c;
+      started = true;
+      continue;
+    }
+    // Only the ROOT level splits words: a substitution is ONE word to the shell. But
+    // whitespace ends a WORD at every level — without that, `case`/`esac` inside a
+    // substitution was never recognized and a pattern `)` popped the region early.
+    if (/\s/.test(c)) {
+      flushWord();
+      if (lv.length === 1) {
+        if (started) { words.push(cur); cur = ""; started = false; }
+      } else {
+        cur += c;
+      }
+      continue;
+    }
+    word += c;
+    cur += c;
+    started = true;
+  }
+  if (started) words.push(cur);
+  return words;
+}
+
+/**
+ * The PR selector of a `gh pr merge`, resolved to `{ pr, repo }` (#1007).
+ *
+ * ONE token walk serves both the number and the URL's repo, and the walk is
+ * quote-aware. Both properties are load-bearing: a raw regex for the repo would also
+ * match a URL inside a `--body "…"` value and read the evidence from the WRONG repo,
+ * and a whitespace tokenizer would hand that same URL back as if it were the
+ * positional. Either one is a FAIL-OPEN (a foreign repo's certificate certifies a merge
+ * it was never computed for), not an over-block.
+ */
+// `gh pr merge`, tolerating a repo pair in ANY gap between the three words
+// (`gh -R owner/repo pr merge 123`, `gh pr -R owner/repo merge 123`) — the spellings
+// `stripRepoArgs` used to normalise, re-found here in the ORIGINAL text.
+//
+// ⚠️ The three value alternatives MUST stay DISJOINT and each MUST match at least one
+// character. An earlier form (`=\S+|\s+…|\S*`) was ambiguous — `=\S+` and `\S*` both match
+// `=a`, and `\S*` matches the EMPTY string — so under the unbounded `(?:\s+REPO_PAIR)*`
+// a failing tail enumerated 2^k splits: measured 80 ms at 20 `--repo=` tokens, 1.3 s at
+// 26, 5.2 s at 28 and 20.8 s at 30 (~3x per token), on a function that runs on EVERY
+// git-shaped bash call — a command-string denial of service in the gate itself
+// (code-review P1). Disjoint first characters (`=`, whitespace, neither) make it linear;
+// `index.test.ts` pins a time bound so a future edit cannot quietly restore the blowup.
+const REPO_PAIR = String.raw`(?:-R|--repo)(?:=\S+|\s+(?:"[^"]*"|'[^']*'|[^\s=]\S*)|[^\s=]\S+)`;
+const MERGE_VERB_RE = new RegExp(
+  String.raw`\bgh\b(?:\s+${REPO_PAIR})*\s+pr(?:\s+${REPO_PAIR})*\s+merge\b`,
+);
+
+export function extractMergeSelector(command: string): MergeSelector {
+  // The selector is read from the ORIGINAL text, never from `stripRepoArgs`'s output:
+  // that function removes only the first whitespace-delimited word of a value, so a
+  // quoted `--repo "see <url> here"` left its TAIL (URL included) as free text and the URL
+  // branch below returned that URL as the selector — a wrong-PR AND wrong-repo evidence
+  // read (VGATE #1007 cycle 4, P0; a regression the URL feature introduced, since the old
+  // `^\d+$`-only walk ignored the leaked URL and found the real positional). The walk
+  // skips a `--repo`/`-R` VALUE quote-aware (`valueFlags`), and `MERGE_VERB_RE` re-finds
+  // the verb in the original — so `stripRepoArgs` is not needed here at all, and using it
+  // only added a way to over-block (a leaked tail hid the verb from the canonical text).
+  const verb = matchUnquoted(MERGE_VERB_RE, command, unquotedMask(command));
+  if (verb === null) return { pr: null, repo: null };
+  const segment = command.slice(verb.index + verb[0].length).split(/;|&&|\|\||\||\n/)[0] ?? "";
+  const tokens = splitArgvWords(segment);
+  // Every `gh pr merge` flag that takes a VALUE must be here, or its value can be read
+  // as the positional. `-A`/`--hostname` were missing (VGATE, #1007 cycle 1), so
+  // `gh pr merge -A <url> 123 --admin` resolved to the URL's PR. This set mirrors the
+  // shim's `VALUE_FLAGS` (`scripts/gh-shim/gh`) — the two layers must not disagree.
   const valueFlags = new Set([
     "--repo", "-R", "--body", "-b", "--body-file", "-F", "--subject",
-    "-t", "--author-email", "--match-head-commit",
+    "-t", "--author-email", "-A", "--match-head-commit", "--hostname",
   ]);
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
@@ -1391,9 +1724,37 @@ export function extractMergePrNumber(command: string): number | null {
       continue;
     }
     if (/^--[A-Za-z-]+=/.test(tok)) continue; // --flag=value
-    if (/^\d+$/.test(tok)) return Number(tok);
+    if (/^\d+$/.test(tok)) {
+      // The SHIM forwards a bare positional to gh as the LITERAL digits, so a value that
+      // `Number()` cannot round-trip makes the two layers name different PRs: above 2^53
+      // it rounds (`9007199254740993` -> `…992`) and a leading zero normalises
+      // (`01006` -> `1006`). This is the same rule the URL digits below already apply,
+      // and the same rule the shim applies to both spellings — refuse rather than let the
+      // layers disagree about which PR's evidence to read (fresh review, P2).
+      const n = Number(tok);
+      if (n < 1 || !Number.isSafeInteger(n) || String(n) !== tok || tok.length > 15) {
+        return { pr: null, repo: null };
+      }
+      return { pr: n, repo: null };
+    }
+    const m = PR_URL_RE.exec(tok);
+    if (m) {
+      // `Number()` is lossy above 2^53 and maps `01006` → `1006`, while the shim passes
+      // the literal digits. Refuse rather than let the two layers disagree about the PR
+      // they name (a divergence here is a wrong-PR evidence read, not a cosmetic one).
+      const digits = m[3];
+      const n = Number(digits);
+      // ≤15 digits is the SAME bound the shim applies (`parse_pr_url`): short enough that
+      // a JS `Number` is exact, so the two layers can never disagree about which PR the
+      // digits name. Over it, `Number` is lossy and the gate would read a different PR's
+      // evidence — refuse instead.
+      if (n < 1 || digits.length > 15 || !Number.isSafeInteger(n) || String(n) !== digits) {
+        return { pr: null, repo: null };
+      }
+      return { pr: n, repo: `${m[1]}/${m[2]}` };
+    }
   }
-  return null;
+  return { pr: null, repo: null };
 }
 
 /**
