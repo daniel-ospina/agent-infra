@@ -89,7 +89,9 @@ jobs:
       - name: Reusable workflows match templates
         run: |
           failures=0
-          for f in python-ci.yml node-ci.yml docs-ci.yml; do
+          # #930 — admin-merge-detector.yml is materialized here too so the
+          # post-merge detector reaches consumers via the same sync path.
+          for f in python-ci.yml node-ci.yml docs-ci.yml admin-merge-detector.yml; do
             if ! diff -q "templates/.github/workflows/$f" ".github/workflows/$f" >/dev/null 2>&1; then
               echo "::error::$f differs from templates/.github/workflows/$f — edit the template, then run scripts/sync-ci-workflows.sh and commit the materialized copy"
               failures=$((failures+1))
