@@ -2830,6 +2830,73 @@ export function hashMatchesDisk(projectRoot: string, filePath: string, storedHas
   return createHash(algo).update(content).digest("hex") === storedHash.toLowerCase();
 }
 
+/**
+ * #920 (O3, cycle-1 review P1): does the INDEX still record content at
+ * `repoPath`?
+ *
+ * The discriminator for a worktree read failure that is NOT a proven absence.
+ * `ENOENT` proves the path is gone; **`ENOTDIR` proves only that a path
+ * COMPONENT is not a directory**. After a D/F conflict
+ * (`git add a/b.ts && rm -rf a && echo x > a`) the parent `a` is a regular file
+ * while the index still holds the staged blob at `a/b.ts` — and a bare
+ * `git commit` records exactly that blob. The errno alone therefore cannot
+ * separate "deleted" (content-free ⇒ safe to skip) from "content staged but
+ * unreadable" (must block); skipping `ENOTDIR` re-opened the very fail-open
+ * #920 closes, through another errno.
+ *
+ * ASK THE INDEX — never interpret a probe's stderr (cycle-4 review P2).
+ * `git ls-files -z -- :(top,literal)<path>` lists the index entry at
+ * `<path>`: non-empty stdout ⇔ an index entry exists (a stage-0 entry, or an
+ * unmerged stage 1/2/3 entry) ⇔ a bare `git commit` records content. Empty
+ * stdout with exit 0 ⇔ no entry ⇔ genuinely absent.
+ *
+ * `:(top,literal)` is load-bearing. The path is repo-root-relative — git emits
+ * diff paths that way at ANY cwd — so a PLAIN pathspec would be resolved
+ * relative to the (possibly sub-directory) `cwd`, and it would expand glob
+ * metacharacters in a real file name (`a[1].ts`): either can list nothing for a
+ * path that IS in the index, i.e. read an entry as absence (fail OPEN).
+ * `:(top)` pins the resolution to the repo root; `literal` disables globbing.
+ *
+ * (cycle-4 review P2) The previous probe was `git cat-file -e -- :<path>`,
+ * reading a 128 as absence only when
+ * `stderr.includes("does not exist (neither on disk nor in the index)")` — the
+ * cycle-2 P2-A "capture stderr and match the genuine message" rule. That rule
+ * is UNSOUND because **git echoes the probed path** in its fatal messages: for
+ * a path literally NAMED `does not exist (neither on disk nor in the index)`,
+ * git's own echo satisfied the substring test. The conflicted-index form —
+ * `fatal: path '<p>' is in the index, but not at stage 0` — is a 128 that
+ * echoes the path and matched, so such a path read as *absent*, the `ENOTDIR`
+ * branch `continue`d, and the op was ALLOWED: a fail-open counterexample to
+ * "every other outcome fails CLOSED", on this declared adversarial surface.
+ * The lesson generalizes: exit code + stderr are attacker-influenced *output*,
+ * not a decision surface. The membership question has a direct answer — the
+ * index — so ask it and stop parsing text.
+ *
+ * FAIL CLOSED. Only "non-empty stdout" and "empty stdout with exit 0" are
+ * answers. A non-zero exit, a signal/timeout, a spawn failure, or anything else
+ * ambiguous ⇒ `true` ⇒ the caller names the file `unverified` and the op
+ * blocks.
+ */
+export function indexRecordsContent(cwd: string, repoPath: string): boolean {
+  try {
+    const out = execSync(
+      `git ls-files -z -- ${shellQuoteSingle(":(top,literal)" + repoPath)}`,
+      { cwd, timeout: 3000, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+    );
+    return out.length > 0; // non-empty ⇒ an index entry exists; the commit records content
+  } catch (err: any) {
+    // No exit code or stderr is an answer here: an absent entry exits 0 with
+    // EMPTY stdout, so every throwing outcome (126/127 = git not runnable, a
+    // null status + a signal = timeout, a spawn failure, a non-repo cwd, …) is
+    // a probe fault, fails CLOSED, and the log names which case it was. stderr
+    // is captured for that log ONLY — never matched against.
+    const stderr = typeof err?.stderr === "string" ? err.stderr : "";
+    const gitSaid = stderr.trim() === "" ? "<no stderr>" : stderr.trim().split("\n")[0];
+    console.error(`[verification-gate] ⚠️ index probe failed for ${repoPath} (exit ${err?.status ?? "none"}${err?.signal ? `, signal ${err.signal}` : ""}) — failing CLOSED (unverified); git said: ${gitSaid}`);
+    return true;
+  }
+}
+
 // #7595: verifier sub-agents may return absolute paths (e.g.
 // "/Users/x/repo/src/a.ts") or root-relative forms ("./src/a.ts") while
 // git diff yields repo-relative paths ("src/a.ts"). Registry keys must be
@@ -3612,8 +3679,45 @@ export default function (pi: ExtensionAPI) {
       let currentHash: string;
       try {
         currentHash = hashFile(cwd, file);
-      } catch {
-        // File doesn't exist (deleted) — skip verification
+      } catch (err: any) {
+        // #920 (O3): the worktree copy could not be hashed. Discriminate on the
+        // INDEX — the errno ALONE cannot separate "deleted" (content-free) from
+        // "content staged but unreadable" (must block), and conflating them is
+        // fail OPEN:
+        //
+        //   • ENOENT — the worktree path is ABSENT. For a `D` row that is a
+        //     content-free deletion (nothing of it is committed), so keep
+        //     skipping: a deletion must never name-block or forever-block. For an
+        //     `A`/`AD` row — the index holds staged content, the worktree copy is
+        //     gone — this skip IS the deferred fail-open residual tracked by
+        //     #1018 (the check hashes the WORKTREE copy, not the staged blob a
+        //     bare commit records; the per-path status map that tells the two
+        //     rows apart is computed upstream and discarded, so closing it means
+        //     hashing `git show :<rel>` — plan §5/§7). `ENOENT` therefore does
+        //     NOT stand in for the row type: it covers a safe skip and a known
+        //     fail-open together. Pinned by e2e scenario 49 sub-case (b) and
+        //     scenario 55 leg (c), and by scenario 920 (P1) leg (c).
+        //
+        //   • ENOTDIR — a path COMPONENT is not a directory (a D/F conflict),
+        //     which is NOT proof of absence. The index may still hold the staged
+        //     blob a bare `git commit` records, so ask the index instead of the
+        //     errno: an entry ⇒ unverified (block); no entry ⇒ a deletion ⇒
+        //     skip. (Cycle-1 review P1: putting ENOTDIR in the skip set re-opened
+        //     the EACCES fail-open below through another errno; just dropping it
+        //     would instead name-block genuine D/F deletions — scenario 920 (P1)
+        //     legs (a)/(b) pin both halves.)
+        //
+        //   • ANY OTHER errno (EACCES on a mode-000 file or a restricted parent
+        //     dir, EISDIR, EIO, …) — the worktree path EXISTS but the gate could
+        //     not READ it, and its STAGED content may still be committed (the
+        //     index blob is what a bare `git commit` records). Fail CLOSED by
+        //     naming it unverified so the op blocks. A bare `catch { continue }`
+        //     here let `chmod 000` (or any read fault) silently authorize the
+        //     commit — the exact defect this fix closes.
+        const code = err?.code;
+        if (code === "ENOENT") continue;
+        if (code === "ENOTDIR" && !indexRecordsContent(cwd, file)) continue;
+        unverified.push(file);
         continue;
       }
       const key = compoundKey(worktreeRoot, file);
