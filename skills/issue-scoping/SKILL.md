@@ -266,6 +266,8 @@ VERIFIER 2: [P0: ..., P1: ..., P2: ...]
 - If controller only ignored → still re-dispatch (verifiers must stop flagging it, or escalate)
 - If no P0/P1 found at all → gate passes
 
+**Half-budget research rule.** Once half the tier's cycle budget is spent and P0/P1 issues remain, each surviving issue must be researched — external sources where the issue is not purely internal — before the next fix, and the cycle log records the source used. Re-fixing from memory past the halfway point is how a verifier loop circles without converging.
+
 **Step 4 — Handle P2/P3/P4:**
 - Controller incorporates reasonable P2+ findings
 - Does NOT trigger re-dispatch
@@ -355,7 +357,7 @@ If no issues: NO ISSUES FOUND
 
 ### Controller Logic
 
-Same as problem-verify: identify P0/P1 → fix or ignore → re-dispatch if fixed → pass if only P2+.
+Same as problem-verify: identify P0/P1 → fix or ignore → re-dispatch if fixed → pass if only P2+. The half-budget research rule applies here too.
 
 ### Duplication & Architecture Reviewer (#688) — controller dispatch
 

@@ -38,7 +38,7 @@ steps:
 > **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 > **Canonical:** `agent-infra/skills/plan-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (1-2), convergence-gated (cap proportional to risk: 5 for Low-Medium, 5 for Medium-High, 10 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
+> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers, convergence-gated. Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
 
 # Plan Review
 
@@ -54,20 +54,20 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 
 `plan-review <plan-doc-path> [--issue <number>] [--epic <path>] [--tier standard|complex]`
 
-## Proportional Review Cycles (inlined from proportional-gates v1.0.0)
+## Proportional Review Cycles
 
-> Reviewer count scales with plan risk and novelty. Not every plan needs 2 reviewers.
->
-> **Plus Reviewer #5 (conditional).** The table below is the *proportional* set. Reviewer #5 (Duplication & Architecture, #688) is dispatched **in addition to** it whenever the plan introduces a new component, a new write path, a new shared-state owner, or a new definition of an existing vocabulary — and again on the final cycle. It is **not** triggered by plan length, so a High-risk plan with a new write path dispatches **2 + #5**. Keeping it out of the table is deliberate: it is orthogonal to risk, not a fifth risk tier. See the Reviewer #5 section in Phase 1.
+Reviewer counts and cycle caps: `proportional-gates` §Review Cycles. The table below says *who* runs, not how many or for how long.
 
-| Risk | Reviewers | Max Cycles |
-|------|-----------|------------|
-| **Micro** | no plan doc — nothing to review | — |
-| **Low-Medium** (small plan, existing patterns) | 1 reviewer (Structural + Integration) | 5 |
-| **Medium-High** (large plan, some novelty) | 2 reviewers (+ Efficiency) | 5 |
-| **High** (novel architecture, first-of-kind) | 2 reviewers | 10 |
+| Risk tier | Reviewers dispatched |
+|------|-----------|
+| **Micro** | none — micro plans are inline issue comments, not docs |
+| **Low-Medium** (small plan, existing patterns) | **#1 Structural & Efficiency**, **#2 Integration** |
+| **Medium-High** (large plan, some novelty) | #1–#2 + **#3 UX Coherence** |
+| **High** (novel architecture, first-of-kind) | #1–#3 + **#4 Failure Mode Auditor** |
 
-**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 1 reviewer. A 200-line plan with new architecture = 2 reviewers. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
+**Reviewer #5 (Duplication & Architecture, #688) is conditional and additive** — dispatched alongside the tier's set whenever the plan introduces a new component, a new write path, a new shared-state owner, or a new definition of an existing vocabulary, and again on the final cycle. It is orthogonal to the risk tiers, not a fifth one; see the Reviewer #5 section in Phase 1. **#5 is never a replacement for another reviewer.**
+
+**Proportional dispatch:** the tier sets the count; the agent decides whether the plan's size and novelty justify reporting up a tier, notes the decision, and a reviewer sub-agent validates it.
 
 **Adversarial domain — declared threat surface (bound: 2 cycles, orthogonal to the rows above).** When the scoping comment carries an `### Adversarial Threat Surface` declaration (gate/enforcement code whose correctness is "an attacker cannot make it fail open"), the plan review is bounded by that surface, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) is a **clean exit** for this domain — a literal `NO ISSUES FOUND` is not required, and when the merge rests on threat-list coverage the PR body must disclose it (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
 
@@ -86,7 +86,7 @@ Before starting the first cycle:
 ## Review Cycle
 
 ```
-Phase 1: Review (1-2 parallel agents)
+Phase 1: Review (N parallel agents, per risk tier)
     ↓
 Phase 2: Merge & Dedup
     ↓
@@ -115,7 +115,7 @@ When review finds issues, the agent attempts to resolve them autonomously before
 
 ### Phase 1 — Review (Parallel Agents)
 
-Launch the proportional reviewer count (N) from the Review Cycles table **in parallel** via Pi `task`. Each receives the full plan doc, issue spec (if available), epic doc (if available), and research context (if resolved). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch the proportional reviewer count (N) for the risk tier (`proportional-gates` §Review Cycles) **in parallel** via Pi `task`. Each receives the full plan doc, issue spec (if available), epic doc (if available), and research context (if resolved). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
 Every reviewer reads `## Verified Research Context` and `## Prior State (Tortoise)` **before** judging — a suggestion made without reading them is rejected. Treat both as strong but fallible: usually right, not always. Where a reviewer doubts a finding, it says so and verifies the claim itself rather than inheriting it.
 
@@ -487,6 +487,8 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **No hard cap.** The loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (runaway prevention, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
 
+**Half-budget research rule.** Once half the tier's cycle budget is spent and P0/P1 issues remain, every surviving issue needs research backing before the next fix attempt — the fixer cites the source it used for each, and an unresearched re-fix does not count as a fix. Re-fixing the same issues from memory past the halfway point is the signature of a loop going in circles; the remedy is evidence, not another attempt.
+
 **Stuckness detection (3-layer algorithm)**:
 
 a. **Fingerprint-stall**: Hash each surviving issue's **location + severity** (SHA256) — the defect's *stable identity*, **never** its `dimension`/`description`/`suggestion`. Wording is the part a fresh, memoryless reviewer varies; hashing it made an identical defect re-described in new words hash differently, so recurrence read ~0 on a cycle where nothing was fixed — the most common real stall, invisible to the primary detector. **Recurrence is `|current ∩ prev| / |prev|`** — "what fraction of *last cycle's* issues came back?". `|prev|` is the correct denominator and the *only* one: it is the stall signal, so a cycle that repeats all 10 prior issues must score 1.0. (A symmetric denominator — `max(|current|, |prev|)` — inverts this: repeating all 10 prior issues *plus* 5 new ones scores `10/15 = 0.67`, **below** threshold, so the loop reads as ordinary churn on a cycle where nothing was resolved. Do not use it.) **`stall_threshold` defaults to `0.8`** — the same value `code-review/references/fixer-loop.md` reads from `STALL_THRESHOLD`. If recurrence ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
@@ -574,6 +576,6 @@ This gives one orchestrator-level recovery before waking the human.
 
 ## Announce
 
-At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped at [5|5|10] cycles per plan risk tier — escalates to human at cap. See Proportional Review Cycles table. Does not auto-exit with remaining issues."
+At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped per plan risk tier (`proportional-gates` §Review Cycles) — escalates to human at cap. Does not auto-exit with remaining issues."
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.
