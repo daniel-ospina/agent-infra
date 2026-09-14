@@ -190,6 +190,12 @@ assert_contains "$(cat "$REAPER_INSTALLED")" "<string>0</string>" "reaper plist 
 assert_contains "$(cat "$REAPER_INSTALLED")" "StartInterval" "reaper job is interval-scheduled"
 assert_contains "$(cat "$REAPER_INSTALLED")" "<integer>3600</integer>" "reaper job hourly (StartInterval 3600)"
 assert_contains "$(cat "$REAPER_INSTALLED")" "agent-infra-plist-version: 0.1.0" "reaper template carries version marker"
+# #947 — the DEPLOYED invariant: the hourly job must never arm the stuck set
+# (arming is a manual, per-machine decision). Without this assertion a later
+# template edit adding REAP_REAP_STUCK=1 would satisfy every other plist check
+# and silently broaden the kill set on every host at the next sync.
+assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_REAP_STUCK" "reaper plist does NOT arm the STUCK set (#947)"
+assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_STUCK_HOURS" "reaper plist does not override the stuck bound (#947)"
 # #783 Task 6 — pi-task-session-prune rendered-plist content asserts (farmed
 # path, DISARMED TASK_SESSION_PRUNE_DRY_RUN=1, hourly StartInterval 3600)
 assert_contains "$(cat "$PRUNE_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-task-session-prune.sh" "prune plist rendered with fake HOME (farmed path)"

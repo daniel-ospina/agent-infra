@@ -33,8 +33,11 @@
 #   * Never kill active work: settle re-verify BEFORE each signal uses a
 #     FRESH per-pid ps probe (lstart changed => pid died+reused => suppress)
 #     and a FRESH JSONL re-probe (activity advanced => suppress). STUCK rows
-#     add a FRESH store re-read: the deciding record must STILL be non-idle
-#     with a still-stale updatedAt and the process still sleeping (S/I).
+#     add a FRESH store re-read: their deciding record must still exist and
+#     still be non-idle, and EVERY non-idle record for the pid must still
+#     carry a valid stale stamp (classify's union, mirrored) — plus the union
+#     of every matched record's JSONL file, and the process still sleeping
+#     (S/I).
 #     Post-TERM survivor re-check = the same fresh probe (kill -0 is never
 #     the oracle).
 #   * Never touch another session's checkout: own tty / own ancestor pids /
@@ -259,11 +262,20 @@ ps_table, out_path = sys.argv[1], sys.argv[2]
 parent = {}
 has = {}
 live = {}
-for ln in open(ps_table, encoding="utf-8"):
+# errors="replace": BSD ps prints argv bytes raw, so ONE undecodable byte in
+# any process's argv (a Latin-1 filename, say) would otherwise raise
+# UnicodeDecodeError and sink the WHOLE map — and a failed map aborts the pass
+# fail-closed, turning a stray byte into a permanent hourly no-reap. A
+# malformed ROW is skipped for the same reason: row-level parse hiccups must
+# never read as "map unavailable". (#947 review P2)
+for ln in open(ps_table, encoding="utf-8", errors="replace"):
     f = ln.split()
     if len(f) < 6:
         continue
-    pid, ppid = int(f[0]), int(f[1])
+    try:
+        pid, ppid = int(f[0]), int(f[1])
+    except ValueError:
+        continue
     stat = f[4]
     cand = (len(f) > 7 and f[-1] == "CAND" and not stat.startswith("Z"))
     parent[pid] = ppid
@@ -322,6 +334,7 @@ has_live_child() {
 # updatedAt (float epoch) is the record's own last-write time — the lossy
 # agentLifecycle belief is bounded by it (#947).
 STORE_TSV=""
+STUCK_TSV=""
 # store_extract <store-file> <out-tsv> — 0 on success; 3 on missing/corrupt.
 # Split out of store_read so the stuck-settle re-verify can re-read the store
 # into a private temp file without disturbing STORE_TSV (#947).
@@ -389,29 +402,44 @@ updated_stamp_ok() {
     awk -v u="$v" -v n="$now" 'BEGIN{exit !(u >= 1000000000 && u <= n + 86400)}'
 }
 
-# stuck_record_still_frozen <sid> <pid> <now> — STUCK-settle re-verify: a FRESH
-# store read must show the deciding record STILL non-idle with a still-stale
-# stamp. A turn that ended (or any hook activity) rewrites the record, so this
-# suppresses exactly the case the classification-time check cannot see. Every
-# failure mode returns 1 (suppress) — never 0.
+# stuck_record_still_frozen <sid> <pid> <now> — STUCK-settle re-verify. The
+# population inspected is deliberately the SAME one classify unions over:
+# EVERY record for this pid, fence-matched or not. Three things must hold from
+# a FRESH store read —
+#   (1) the DECIDING record ($sid) is present and still non-idle; and
+#   (2) every non-idle record for this pid still carries a valid, still-stale
+#       stamp (a twin that starts a turn rewrites its own stamp => suppress);
+#   (3) at least one row must exist at all.
+# Every failure mode returns 1 (suppress) — never 0. Re-reading ONLY $sid was a
+# fail-open: a twin whose sid is not the max-epoch one could go fresh in the
+# classify->settle window and stay invisible (#947 review P1 — reported
+# independently by three reviewers).
 stuck_record_still_frozen() {
-    local sid="$1" pid="$2" now="$3" tsv rec n=0 al rs ua age
+    local sid="$1" pid="$2" now="$3" tsv rec n=0 decided=0 rsid2 al rs ua age
     tsv="$(mktemp "${TMPDIR:-/tmp}/pi-reap-stuck.XXXXXX")" || return 1
-    if ! store_extract "$CMUX_STORE" "$tsv"; then rm -f "$tsv"; return 1; fi
+    STUCK_TSV="$tsv"
+    if ! store_extract "$CMUX_STORE" "$tsv"; then STUCK_TSV=""; rm -f "$tsv"; return 1; fi
     while IFS= read -r rec; do
         [ -n "$rec" ] || continue
-        [ "$(printf '%s' "$rec" | awk -F'\t' '{print $6}')" = "$sid" ] || continue
         n=$((n+1))
+        rsid2="$(printf '%s' "$rec" | awk -F'\t' '{print $6}')"
         al="$(printf '%s' "$rec" | awk -F'\t' '{print $4}')"
         rs="$(printf '%s' "$rec" | awk -F'\t' '{print $5}')"
+        [ "$rsid2" = "$sid" ] && decided=1
+        if [ "$al" = "idle" ] && [ "$rs" = "idle" ]; then
+            # a record going idle means a turn ENDED; only the deciding record
+            # ending proves the whole premise is gone (a sibling going idle
+            # just leaves the union — it does not weaken it)
+            if [ "$rsid2" = "$sid" ]; then STUCK_TSV=""; rm -f "$tsv"; return 1; fi
+            continue
+        fi
         ua="$(printf '%s' "$rec" | awk -F'\t' '{print $8}')"
-        if [ "$al" = "idle" ] && [ "$rs" = "idle" ]; then rm -f "$tsv"; return 1; fi
-        updated_stamp_ok "$ua" "$now" || { rm -f "$tsv"; return 1; }
+        updated_stamp_ok "$ua" "$now" || { STUCK_TSV=""; rm -f "$tsv"; return 1; }
         age="$(awk -v n="$now" -v u="$ua" 'BEGIN{printf "%.1f", (n-u)/3600}')"
-        awk -v a="$age" -v t="$REAP_STUCK_HOURS" 'BEGIN{exit !(a > t)}' || { rm -f "$tsv"; return 1; }
+        awk -v a="$age" -v t="$REAP_STUCK_HOURS" 'BEGIN{exit !(a > t)}' || { STUCK_TSV=""; rm -f "$tsv"; return 1; }
     done <<<"$(grep -E "^${pid}	" "$tsv" 2>/dev/null || true)"
-    rm -f "$tsv"
-    [ "$n" -gt 0 ]
+    STUCK_TSV=""; rm -f "$tsv"
+    [ "$n" -gt 0 ] && [ "$decided" = 1 ]
 }
 
 # ── pass 3: JSONL ground truth (inline python, reverse tail scan) ──────
@@ -555,7 +583,7 @@ session_file_for() { # <sessionId> <cwd> -> first matching JSONL ("" if none)
 classify_candidates() {
     local now="$1" emit="$2" pid detail epoch pgid stat rss tty rec al rs sid cwd sfile
     local last_epoch youngest vote abstain matched_cnt veto diff sid_marker rec_pss
-    local rec_age_min ruid rage stuck_ok
+    local rec_age_min ruid rage stuck_ok sfiles_all US_ALL ral rrs
     REAP_CANDIDATES=""; REAP_COUNT=0
     if [ "$emit" = 1 ]; then STUCK_CANDIDATES=""; STUCK_COUNT=0; STUCK_RSS=0; fi
     if [ -z "$CANDIDATES" ]; then
@@ -611,7 +639,7 @@ classify_candidates() {
         # stuck population is invisible and a permanently immunised pid reads
         # as a healthy "allowlist" skip. Youngest voting matched record wins;
         # no-JSONL records abstain (prove nothing AND veto nothing).
-        youngest=""; vote=0; sid=""; sfile=""
+        youngest=""; vote=0; sid=""; sfile=""; sfiles_all=""
         while IFS= read -r rec; do
             [ -n "$rec" ] || continue
             rsid="$(printf '%s' "$rec" | awk -F'\t' '{print $6}')"
@@ -633,6 +661,10 @@ classify_candidates() {
             le="$(jsonl_epoch_for "$rf")"
             if [ -z "$le" ]; then abstain=$((abstain+1)); continue; fi
             vote=$((vote+1))
+            # every proof-bearing matched file, in match order — the settle-3
+            # probe set for a stuck row (see the REAP-eligible emit below)
+            US_ALL="$(printf '\037')"
+            case "$sfiles_all$US_ALL" in *"$rf$US_ALL"*) ;; *) sfiles_all="$sfiles_all$US_ALL$rf" ;; esac
             # sid/sfile track the MAX-epoch (age-setting) record — settle-3
             # re-probes exactly the file(s) that decided eligibility. TIED
             # equal-max twins are unioned (\x1f unit-separator joined — only
@@ -653,15 +685,26 @@ classify_candidates() {
         # (fail closed).
         rec_age_min=""
         if [ -n "$veto" ]; then
+            # Freshness is a UNION over EVERY non-idle record for this pid —
+            # not just the fence-matched ones. A record with a missing or
+            # off-fence pidStartSeconds abstains from VOTING (the veto itself
+            # still comes from $matched only, so the normal path and its pinned
+            # 'abstain != veto' contract are unchanged), but it must still be
+            # able to WITHHOLD a kill: a fresh or unparseable stamp on it is
+            # direct evidence this pid is being written to right now. It can
+            # never CAUSE one. (#947 review P2)
             while IFS= read -r rec; do
                 [ -n "$rec" ] || continue
+                ral="$(printf '%s' "$rec" | awk -F'\t' '{print $4}')"
+                rrs="$(printf '%s' "$rec" | awk -F'\t' '{print $5}')"
+                [ "$ral" = "idle" ] && [ "$rrs" = "idle" ] && continue
                 ruid="$(printf '%s' "$rec" | awk -F'\t' '{print $8}')"
                 updated_stamp_ok "$ruid" "$now" || { rec_age_min=""; break; }
                 rage="$(awk -v n="$now" -v u="$ruid" 'BEGIN{printf "%.1f", (n-u)/3600}')"
                 if [ -z "$rec_age_min" ] || awk -v a="$rage" -v b="$rec_age_min" 'BEGIN{exit !(a < b)}'; then
                     rec_age_min="$rage"
                 fi
-            done <<<"$matched"
+            done <<<"$(store_records_for_pid "$pid")"
         fi
         if [ -n "$veto" ]; then
             # no JSONL proof => the veto still reports first (the reason
@@ -688,7 +731,12 @@ classify_candidates() {
                     STUCK_RSS=$((STUCK_RSS + ${rss:-0}))
                 fi
                 if [ "$REAP_REAP_STUCK" = 1 ]; then
-                    REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfile|$idle_age_h|$youngest|$epoch|1" | sed '/^$/d')"
+                    # a stuck row re-probes the UNION of every matched
+                    # proof-bearing file at settle, not just the max-epoch one:
+                    # a twin whose JSONL advances then suppresses, and
+                    # $youngest is >= the stuck bound old, so a genuine advance
+                    # (~now) always exceeds it. (#947 review P1)
+                    REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfiles_all|$idle_age_h|$youngest|$epoch|1" | sed '/^$/d')"
                     [ "$emit" = 1 ] && say "$pid tty=$tty REAP-ELIGIBLE(STUCK) rss=${rss:-0} idle_h=${idle_age_h}h record_age_h=${rec_age_min}h session=$sid jsonl=$sfile"
                 else
                     [ "$emit" = 1 ] && say "$pid tty=$tty STUCK-ESCALATE rss=${rss:-0} idle_h=${idle_age_h}h record_age_h=${rec_age_min}h session=$sid ($veto, record stale past ${REAP_STUCK_HOURS}h) — report-only"
@@ -783,7 +831,7 @@ reap_one() { # <cand-line> <now>
             *) log "SETTLE-SKIP $pid stuck row process no longer sleeping (stat=$stat2) — suppress"; return 0 ;;
         esac
         if ! stuck_record_still_frozen "$sid" "$pid" "$now"; then
-            log "SETTLE-SKIP $pid stuck row record no longer frozen/idle — suppress"
+            log "SETTLE-SKIP $pid stuck row record no longer frozen/idle (union over all its records) — suppress"
             return 0
         fi
     fi
@@ -898,10 +946,16 @@ run() {
     fi
     case "$MODE" in dry-run|apply) ;; *) usage >&2; exit 2 ;; esac
     grep -qE '^[0-9]+$' <<<"$REAP_IDLE_HOURS" || { echo "bad --idle-hours: $REAP_IDLE_HOURS" >&2; exit 2; }
+    # normalize to decimal: bash's $(( )) reads a zero-padded value as OCTAL
+    # while awk reads the same string as decimal, so REAP_IDLE_HOURS=024 gave
+    # awk 24h but a derived bound of $((024*3)) = 60 (= 3x20), silently 12h
+    # earlier than the documented 3x. (#947 review P2)
+    REAP_IDLE_HOURS=$(( 10#${REAP_IDLE_HOURS} ))
     # bounded-veto freshness bound (#947): default 3x the (final) idle
     # threshold, so --idle-hours moves it too; an explicit value always wins.
     if [ -z "$REAP_STUCK_HOURS" ]; then REAP_STUCK_HOURS=$(( REAP_IDLE_HOURS * 3 )); fi
     grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" || { echo "bad --stuck-hours: $REAP_STUCK_HOURS" >&2; exit 2; }
+    REAP_STUCK_HOURS=$(( 10#${REAP_STUCK_HOURS} ))
     case "$REAP_REAP_STUCK" in
         0|1) ;;
         *) echo "bad REAP_REAP_STUCK: $REAP_REAP_STUCK (want 0 or 1)" >&2; exit 2 ;;
@@ -919,7 +973,7 @@ run() {
         log "FAIL-CLOSED abort: lock (exit 3)"
         exit 3
     fi
-    trap 'rm -f "$PS_TABLE" "$STORE_TSV" "$DESC_MAP"; lock_release' EXIT
+    trap 'rm -f "$PS_TABLE" "$STORE_TSV" "$STUCK_TSV" "$DESC_MAP"; lock_release' EXIT
     # log size guard: keep last ~200 lines. Truncation temp is mktemp'd in
     # the log's own directory (never a predictable sibling name — a local
     # attacker could pre-seed a symlink at a fixed path).
@@ -943,13 +997,21 @@ run() {
     fi
 
     if [ -f "$DISABLED_SENTINEL" ]; then
-        log "MODE=disabled NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK=0 STUCK_RSS=0 KILLED=0 YIELD=0 sentinel=$DISABLED_SENTINEL"
+        log "MODE=disabled NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS STUCK=0 STUCK_RSS=0 STUCK_ARMED=$REAP_REAP_STUCK CANDIDATES=0 KILLED=0 YIELD=0 sentinel=$DISABLED_SENTINEL"
         echo "disabled by sentinel ($DISABLED_SENTINEL) — exiting without signal"
         exit 0
     fi
-    log "==== pi-reap-idle pass: MODE=$MODE THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS REAP_STUCK=$REAP_REAP_STUCK now=$now ===="
+    log "==== pi-reap-idle pass: MODE=$MODE THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS STUCK_ARMED=$REAP_REAP_STUCK now=$now ===="
     ps_enumeration
     self_ancestors_from_table
+    # `--list` is a pure read-only diagnostic (no store read, no kill
+    # decision) and is the surface an operator uses to debug exactly this
+    # failure — so it exits BEFORE the descendant-map build and its abort
+    # below, which exists only to gate SIGNALING. (#947 review P2)
+    if [ "$LIST_ONLY" = 1 ]; then
+        printf '%s\n' "$CANDIDATES" | sed '/^$/d'
+        exit 0
+    fi
     descendant_map_ok=1
     descendant_map_build || descendant_map_ok=0
     pre_count="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -963,13 +1025,8 @@ run() {
     if [ "$pre_count" -gt 0 ] && [ "$descendant_map_ok" = 0 ]; then
         echo "FAIL-CLOSED abort: descendant map unavailable (exit 3)" >&2
         log "FAIL-CLOSED abort: descendant map unavailable (exit 3)"
-        log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS CANDIDATES=$pre_count STUCK=0 STUCK_RSS=0 KILLED=0 YIELD=0"
+        log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS CANDIDATES=$pre_count STUCK=0 STUCK_RSS=0 STUCK_ARMED=$REAP_REAP_STUCK KILLED=0 YIELD=0"
         exit 3
-    fi
-
-    if [ "$LIST_ONLY" = 1 ]; then
-        printf '%s\n' "$CANDIDATES" | sed '/^$/d'
-        exit 0
     fi
 
     # candidates==0 => skip the store read entirely (fail-closed abort only
@@ -981,7 +1038,7 @@ run() {
             if ! store_read; then
                 echo "FAIL-CLOSED abort: cmux store missing/corrupt (attempt 2, exit 3)" >&2
                 log "FAIL-CLOSED abort: cmux store missing/corrupt (attempt 2, exit 3)"
-                log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS CANDIDATES=$pre_count STUCK=0 STUCK_RSS=0 KILLED=0 YIELD=0"
+                log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS CANDIDATES=$pre_count STUCK=0 STUCK_RSS=0 STUCK_ARMED=$REAP_REAP_STUCK KILLED=0 YIELD=0"
                 exit 3
             fi
         fi
@@ -1033,7 +1090,7 @@ run() {
     # Post-pass map: only feeds the RESIDUAL diagnostic (no kill decision is
     # left to make), so a build failure here is logged, not fatal — the
     # initial build above is the one that gates signaling.
-    descendant_map_build
+    descendant_map_build || log "POST-PASS descendant map unavailable — RESIDUAL diagnostic degraded"
     post_count="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')"
     residual_count=0
     if [ "$MODE" = apply ]; then
