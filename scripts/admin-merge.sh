@@ -122,17 +122,108 @@ wait_for_run() {
 
 # build_evidence — the machine-readable comment. The marker binds the evidence
 # to ONE head SHA: every push invalidates it, and the merge gate matches on it.
+# The provenance list: one `sha:id` per failing main run. It grows with
+# --main-runs and is NOT bounded by `cap`/`linemax` — measured at N=1000 (a
+# 40-hex sha + 11-digit run id per entry, as `gh run list` actually emits) it is
+# ~53,000 chars alone, making the whole body ~108,000, well over the 65,536-char
+# cap. Elide it past 50 entries; nothing certifying depends on its length (the
+# regex only needs `union of N runs of <lane>:`). (VGATE rounds 3-4.)
+#
+# KNOWN LIMIT: the elision counts and slices on commas. A `sha:id` entry cannot
+# contain one in practice (sha is hex, the run id is numeric), so this is
+# defensive only — but a comma-bearing entry would mis-count "and K more". #RESIDUAL
+provenance_list() {
+  local raw n
+  raw="$(tr '\n' ' ' < "$1" | sed 's/ *$//' | tr ' ' ',' | sed 's/,,*/,/g' | sed 's/,$//')"
+  n="$(printf '%s' "$raw" | awk -F, '{print NF+0}')"
+  if [ "${n:-0}" -gt 50 ]; then
+    printf '%s' "$(printf '%s' "$raw" | cut -d, -f1-50), and $((n - 50)) more"
+  else
+    printf '%s' "$raw"
+  fi
+}
+
+# One <details> block for a failing set, BOUNDED to <=$1 entries and <=$2 chars per
+# entry, with truncation ALWAYS stated. A capped list that looks complete is worse
+# than no list: the reader cannot tell a cap from the whole set.
+#   $1 cap (entries)  $2 linemax (chars/entry)  $3 summary  $4 content  $5 hint
+bounded_details() {
+  local cap="$1" linemax="$2" summary="$3" content="$4" hint="$5"
+  local shown n_total n_shown note="" fence='```'
+  # `|| true` guards the pipeline against SIGPIPE from `head` on large input.
+  shown="$(printf '%s\n' "$content" | head -n "$cap" | cut -c1-"$linemax" || true)"
+  # A node id containing a backtick RUN would close the fence early and swallow
+  # the rest of the comment — a PR author controls test names, and a test that
+  # prints `FAILED ``` ` is enough. Use a fence LONGER than any run in the
+  # content (the standard CommonMark remedy) so the block cannot be broken.
+  local runs
+  runs="$(printf '%s\n' "$shown" | awk '{n=0; for(i=1;i<=length($0);i++){if(substr($0,i,1)=="`"){n++; if(n>m)m=n} else n=0}} END{print m+0}')"
+  if [ "${runs:-0}" -ge 3 ]; then
+    fence="$(printf '`%.0s' $(seq 1 $((runs + 1))))"
+  fi
+  n_total="$(printf '%s\n' "$content" | grep -c . 2>/dev/null || true)"
+  n_shown="$(printf '%s\n' "$shown" | grep -c . 2>/dev/null || true)"
+  n_total="${n_total:-0}"
+  n_shown="${n_shown:-0}"
+  if [ "$n_total" -gt "$n_shown" ]; then
+    note="... and $((n_total - n_shown)) more (capped at $cap entries x $linemax chars so the evidence stays postable; full set: $hint)"
+  elif [ "$(printf '%s' "$content" | wc -m | tr -d ' ')" -gt "$(printf '%s' "$shown" | wc -m | tr -d ' ')" ]; then
+    note="... entries over $linemax chars are CLIPPED (so the evidence stays postable; full set: $hint)"
+  fi
+  printf '<details><summary>%s</summary>\n\n%s\n%s' "$summary" "$fence" "$shown"
+  [ -n "$note" ] && printf '\n%s' "$note"
+  printf '\n%s\n</details>\n' "$fence"
+  return 0
+}
+
 build_evidence() {
   local head="$1" main_prov="$2" pr_count="$3" main_count="$4"
   local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
+  local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
   printf 'test lane: %s\n' "$lane"
-  printf 'main compared (union of %s runs of %s): %s\n' "$MAIN_RUNS" "$lane" "$(tr '\n' ' ' < "$main_prov" | sed 's/ *$//' | tr ' ' ',' | sed 's/,,*/,/g' | sed 's/,$//')"
+  printf 'main compared (union of %s runs of %s): %s\n' "$MAIN_RUNS" "$lane" "$(provenance_list "$main_prov")"
   printf 'PR failing: %s | main failing: %s | unique to this PR: 0\n' "$pr_count" "$main_count"
   printf '%s\n' "$analyzed"
-  printf '<details><summary>raw `comm -23` output</summary>\n\n```\n%s\n```\n</details>\n' "${unique_raw:-}"
+  # THE AUDITABLE DIFF, not just its verdict. `unique: 0` is a CONCLUSION; a
+  # reviewer must be able to reach it from the comment alone. With a zero
+  # residual, the PR's own failing set IS the pre-existing set — so it is listed.
+  # Without it, the only evidence for "all N were already red on main" is an
+  # EMPTY `comm` block, indistinguishable from nothing having been compared at
+  # all, and the reviewer must re-run the tool to audit. (#3467 item 2.)
+  #
+  # BOUNDED THREE WAYS — a line cap alone is NOT a bound: GitHub rejects a body
+  # over 65,536 CHARACTERS, and pytest builds node ids from `parametrize` ids and
+  # reprs, so 400 over-long lines still blow the cap (`head -n 200` alone was
+  # measured at 65,479 B and over it past ~161 chars/line). <=100 entries x <=180
+  # chars = <=18,000 chars per block; three blocks (the flake path is the only
+  # way to get three non-empty) = <=54,000 chars, plus ~1.5 KB of scaffolding and
+  # a bounded provenance list — provably under the cap. The certifying lines are
+  # emitted ABOVE this point, so bounding the tail cannot affect certification.
+  # Units are CHARACTERS throughout (`cut -c` / `wc -m`), matching GitHub's own
+  # limit; bounding BYTES instead would need UTF-8-safe truncation to avoid
+  # splitting a multibyte char. (VGATE rounds 1-3.)
+  local cap=100 linemax=180
+  bounded_details "$cap" "$linemax" \
+    "the $pr_count failure(s) this PR carries — all pre-existing on main (union of $MAIN_RUNS runs)" \
+    "$(cat "$pr_fails")" "ci-failure-set.sh --pr"
+  bounded_details "$cap" "$linemax" \
+    "main baseline: $main_count pre-existing failure(s), for comparison" \
+    "$(cat "$main_fails")" "ci-failure-set.sh --main-union"
+  # The PRE-rerun residual, when the flake path ran. Labelled for what it IS: it
+  # is NOT the diff of the two sets above (those are POST-rerun), so it must never
+  # be presented under a "must be empty" heading — a non-empty list under a
+  # "must be empty" label is an evidence-integrity defect. (VGATE round 2.)
+  if [ -n "$unique_raw" ]; then
+    bounded_details "$cap" "$linemax" \
+      'residual BEFORE the flake re-run — reclassified as flaky, NOT new failures' \
+      "$unique_raw" "re-run the rail"
+  fi
+  bounded_details "$cap" "$linemax" \
+    'final residual — raw <code>comm -23 pr-fails main-fails</code>; must be empty' \
+    "$final_unique_raw" "re-run the rail"
   printf '%s\n' "$flake_line"
 }
 
@@ -367,8 +458,15 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
 
   info "admin-merge: PR failing: $pr_count | main failing: $main_count | unique to this PR: 0"
 
+  # The set the "must be empty" claim is actually ABOUT: after a flake re-run,
+  # unique2.txt is the post-rerun residual (pr-fails2 vs main-fails), while
+  # unique.txt is the PRE-rerun one. Showing the pre-rerun set under a "must be
+  # empty" heading contradicts the displayed (post-rerun) sets. (VGATE round 2.)
+  local final_unique="$TMP/unique.txt"
+  if [ -f "$TMP/unique2.txt" ]; then final_unique="$TMP/unique2.txt"; fi
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
-    "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" > "$TMP/evidence.md"
+    "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
+    "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"
