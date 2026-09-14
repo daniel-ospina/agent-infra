@@ -685,8 +685,8 @@ Independently evaluate the same framings. Same output format.
 
 ### Merge & Decide
 
-- Both agree → confirmed. Disagree → controller decides with rationale.
-- **Micro:** Single agent output is the confirmed definition.
+- **Complex:** both converge agents agree → confirmed; disagree → controller decides with rationale.
+- **Micro + Standard:** the single agent's output is the confirmed definition.
 
 ### Human Gate (conditional)
 
