@@ -110,7 +110,7 @@ When review finds issues, the agent attempts to resolve them autonomously before
 | **P0**, needs substantial work | Research, then file a GitHub issue via issue-creation, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
 | **P0**, requires human input (data loss, security, ontology choice, cost >$10/mo, legal/compliance) | Research, then pause with a structured question: present context, options, analysis, and a recommendation in plain language. |
 
-**Stall detection:** A fingerprint persisting across 2+ cycles is precisely what the `fingerprint-stall` detector measures — do not hand-diagnose it here. Follow the 3-layer stuckness algorithm in Phase 5: recurrence ≥ `stall_threshold` (default `0.8`) → escalate to a human. Filing a GitHub issue is a **remedy** for a stalled issue, never an alternative to the detector — filing it and continuing is how a stalled loop silently runs to its cycle cap.
+**Stall detection:** A fingerprint persisting across 2+ cycles is precisely what the `fingerprint-stall` detector measures — do not hand-diagnose it here. Follow the 3-layer stuckness algorithm in Phase 4: recurrence ≥ `stall_threshold` (default `0.8`) → escalate to a human. Filing a GitHub issue is a **remedy** for a stalled issue, never an alternative to the detector — filing it and continuing is how a stalled loop silently runs to its cycle cap.
 
 
 ### Phase 1 — Review (Parallel Agents)
@@ -487,7 +487,7 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **No hard cap.** The loop continues until clean exit or convergence. The safety cap is the tier's **Max Cycles** row in `proportional-gates` §Review Cycles — if reached, escalate to human (runaway prevention, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
 
-**Half-budget research rule.** Once half the tier's **Max Cycles** (`proportional-gates` §Review Cycles) is spent and P0/P1 issues remain, every surviving issue needs research backing before the next fix — the fixer cites the source, or records `internal-only, no external source` for a purely internal issue (Phase 3). An unresearched re-fix does not count as a fix.
+**Half-budget research rule.** Once half the tier's **Max Cycles** (`proportional-gates` §Review Cycles), rounded up, is spent and P0/P1 issues remain, every surviving issue needs research backing before the next fix — the fixer cites the source, or records `internal-only, no external source` when Phase 3's skip condition applies (purely internal: typo, formatting, in-repo convention). An unresearched re-fix does not count as a fix.
 
 **Stuckness detection (3-layer algorithm)**:
 
@@ -530,7 +530,7 @@ fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual inp
 
 ### Phase 5 — Final Verification
 
-After plan is clean (Phase 4 says clean), dispatch ONE verification sub-agent via Pi `task` that re-reviews the final plan (same N reviewers as the review cycles, proportional to plan risk). Same prompts as Phase 1, concatenated.
+After plan is clean (Phase 4 says clean), dispatch the tier's reviewers (the same N as the review cycles, proportional to plan risk) via Pi `task` to re-review the final plan. Same prompts as Phase 1, concatenated.
 
 If the verification sub-agent finds issues:
 - Fix them (Phase 3)

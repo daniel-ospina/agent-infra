@@ -5,7 +5,7 @@
  *
  * Review-cycle caps ARE authorised — proportionally. AGENTS.md (Hard Cap)
  * holds the fallback (10) and names the canonical proportional table in
- * `skills/proportional-gates/SKILL.md`: Low → no re-review (—), Low-Medium → 3,
+ * `skills/proportional-gates/SKILL.md`: Low → 0 loop cycles (`—`), Low-Medium → 3,
  * Medium-High → 5, High → 10.
  * (Pre-#723 wording here claimed "no numeric caps without explicit user
  * authorization", which stopped being true when the proportional table landed.)
