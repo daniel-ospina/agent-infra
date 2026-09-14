@@ -64,9 +64,11 @@ RSS/process measurement.
   identity-verified (no/off-fence `pidStartSeconds`) abstains from **voting**
   — it still cannot veto the ordinary path — but it CAN withhold a STUCK kill.
   The JSONL proof is computed **before** the veto so
-  the stuck population is never invisible: every vetoed row now carries its
-  `jsonl idle Xh, record age Yh`, plus a `⚠️ STUCK` audit block and
-  `STUCK=/STUCK_RSS=/STUCK_ARMED=` footer fields.
+  the stuck population is never invisible: every vetoed row **that has a JSONL
+  proof** carries its `jsonl idle Xh, record age Yh` (a vetoed row with no
+  proof keeps the fail-closed `SKIP <veto>` line and reports no ages, since
+  none exist), plus a `⚠️ STUCK` audit block and
+  `STUCK_HOURS=/STUCK=/STUCK_RSS=/STUCK_ARMED=` footer fields.
 - **Falsification note:** the 24h threshold is diurnal-safe (a session that
   was used yesterday morning and again this morning is never falsely flagged);
   the boundary and the ±3s incarnation fence are hermetic-tested via
@@ -172,13 +174,17 @@ reports the stuck set and never reaps it.
   Truncation uses a `mktemp`-ed sibling in the log's own directory — never a
   predictable `/tmp` name (a local symlink-truncation surface). Every pass writes a footer
   `MODE=<dry-run|apply> NOW=… THRESHOLD=… STUCK_HOURS=… STUCK=… STUCK_RSS=… STUCK_ARMED=… CANDIDATES=… PRE=… POST=… RESIDUAL=… KILLED=… YIELD=…`
-  (the exact field set, in order, of a normal pass). The early-exit footers
-  — `MODE=disabled … sentinel=` and both FAIL-CLOSED exit-3 aborts — are a
-  REDUCED shape, but they still carry `STUCK_HOURS=`/`STUCK_ARMED=` so a
-  monitor keying on `STUCK_ARMED` parses every footer; on those paths
-  `STUCK=0` is a literal "no classification ran", never a measured zero
-  (abort and disabled runs also log their own explicit reason line
-  immediately before the footer). MODE distinguishes armed vs dry passes (an armed pass with zero kills must
+  (the exact field set, in order, of a normal pass). Every exit path that
+  reaches classification writes a reduced footer carrying `STUCK_HOURS=` and
+  `STUCK_ARMED=` — `MODE=disabled … sentinel=`, the **lock** abort, the **ps
+  enumeration** abort, the **descendant-map** abort and the **store** abort —
+  so a monitor keying on `STUCK_ARMED` never silently reads the previous
+  pass's values as current. On those paths `STUCK=0` is a literal "no
+  classification ran", never a measured zero. The abort paths `log` their own
+  reason line immediately before the footer; the disabled path's reason is on
+  **stdout** (`echo`), so its log holds the footer alone (the footer is
+  self-describing: `MODE=disabled … sentinel=<path>`). The one footer-less
+  exit is the **log-unwritable** abort, which by definition cannot log. MODE distinguishes armed vs dry passes (an armed pass with zero kills must
   not read as a disarmed job); zero-candidate runs still write the footer
   (an absent log must never mean "not running"); PRE = tty'd-pi before the
   kill pass; POST + RESIDUAL come from a **fresh post-pass read** — RESIDUAL is
@@ -241,9 +247,9 @@ reports the stuck set and never reaps it.
   signaling — survives the re-syncs that re-install the launchd job after an
   operator deliberately disarms it. Precedence: the ARMED log-writable probe
   runs before the sentinel check — an unwritable log aborts exit 3 even when
-  disarmed (the documented no-trail failure class; dry-run — and `--list`
-  when mode resolves to dry-run — keep best-effort logging since their
-  verdict surfaces are stdout).
+  disarmed (the documented no-trail failure class; the read-only `--list`
+  path never takes the lock and never writes the log at all — its verdict
+  surface is stdout).
 
 - **Framing-byte fail-closed (round 4):** the `|` cand-row delimiter and
   the 0x1f settle tie-separator are APFS-legal in names. `esc()` strips

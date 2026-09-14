@@ -31,15 +31,22 @@
 #   * Incarnation fence: record pidStartSeconds within ±3s of the ps lstart
 #     (second-granularity rounding differs up to ~1s in live data).
 #   * Never kill active work: settle re-verify BEFORE each signal uses a
-#     FRESH per-pid ps probe (lstart changed => pid died+reused => suppress)
-#     and a FRESH JSONL re-probe (activity advanced => suppress). STUCK rows
-#     add a FRESH store re-read: their deciding record must still exist and
-#     still be non-idle, and EVERY non-idle record for the pid must still
-#     carry a valid stale stamp (classify's union, mirrored) — plus the union
-#     of every matched record's JSONL file, and the process still sleeping
-#     (S/I).
+#     FRESH per-pid ps probe (lstart changed => pid died+reused => suppress),
+#     a FRESH JSONL re-probe (activity advanced => suppress), and — for STUCK
+#     rows — a FRESH ps enumeration (a tool child spawned since classify
+#     suppresses, since the pass-start map cannot see it) plus a FRESH store
+#     re-read: their deciding record must still exist and still be non-idle,
+#     and EVERY non-idle record for the pid must still carry a valid stale
+#     stamp (classify's union, mirrored), with the union of every matched
+#     record's JSONL file re-probed. Stuck rows also require stat S/I at
+#     settle.
 #     Post-TERM survivor re-check = the same fresh probe (kill -0 is never
 #     the oracle).
+#   * UNTRUSTED store values never reach arithmetic: `store_number_ok` gates
+#     every store-derived number, because bash `$(( ))` re-parses an operand
+#     as an ARITHMETIC EXPRESSION (a crafted `pidStartSeconds` is a
+#     code-execution vector, not merely a parse risk). A `ps` that FAILED is a
+#     fail-closed abort, never a healthy "no candidates" pass.
 #   * Never touch another session's checkout: own tty / own ancestor pids /
 #     own PI_SESSION_ID are hard skips. Orchestrating marathons (a live
 #     non-zombie pi descendant) are skipped.
@@ -59,7 +66,8 @@
 #   REAP_GRACE_SECONDS REAP_NOW_EPOCH REAP_LOCK_STALE_SECONDS REAP_LOG
 #   (default $HOME/.pi/agent/state/pi-reap-idle.log).
 # Exit codes: 0 completed passes, 2 usage, 3 fail-closed (store / lock /
-#            log-unwritable / descendant-map — see the FAIL-CLOSED aborts in run()).
+#            log-unwritable / ps-enumeration / descendant-map — see the
+#            FAIL-CLOSED aborts in run()).
 
 set -uo pipefail
 
@@ -79,6 +87,9 @@ REAP_STUCK_HOURS="${REAP_STUCK_HOURS:-}"
 # 1 arms the stuck set for signaling; 0 (default) reports it only.
 REAP_REAP_STUCK="${REAP_REAP_STUCK:-0}"
 REAP_GRACE_SECONDS="${REAP_GRACE_SECONDS:-5}"
+# Upper sanity bound for both hour thresholds. Also keeps `$(( 10#... ))`
+# normalization from WRAPPING on a huge digit string (see run()).
+REAP_MAX_HOURS="${REAP_MAX_HOURS:-1000000}"
 REAP_LOCK_STALE_SECONDS="${REAP_LOCK_STALE_SECONDS:-1800}"
 STATE_DIR="${HOME:-}/.pi/agent/state"
 LOCK_DIR="$STATE_DIR/pi-reap-idle.lock"
@@ -174,9 +185,10 @@ lstart_to_epoch() {
 # raw dump makes enumeration ~2 subprocesses total.
 PS_TABLE=""
 CANDIDATES=""  # newline-separated candidate pids (tty'd + pi-argv)
+PS_RC=0        # exit status of the bulk `ps` call (0 = enumeration ran)
 
 ps_enumeration() {
-    local raw
+    local raw ps_rc=0
     [ -n "${PS_TABLE:-}" ] && rm -f "$PS_TABLE" "$PS_TABLE.raw" 2>/dev/null
     PS_TABLE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-ps.XXXXXX")"
     # Pinned bulk contract carries lstart (documented) but rows are parsed by
@@ -185,8 +197,17 @@ ps_enumeration() {
     # PI_REAP_SELF_PID is exported to the ps child so a shimmed PS_BIN can
     # stamp the reaper's own row deterministically (test harness; real ps
     # ignores it). In a pipeline subshell $$ is still the shell's own pid.
-    { PI_REAP_SELF_PID="$$" "$PS_BIN" -axo pid=,ppid=,pgid=,tty=,lstart=,stat=,rss=,command= 2>/dev/null || true; } \
-        | sed 's/^ *//' >"$PS_TABLE.raw"
+    # The rc is captured OUT of the pipeline (not `|| true`), and the braces
+    # are redirected to the file rather than piped — `{ ...; rc=$?; } | cmd`
+    # runs in a SUBSHELL and the assignment is lost (which is how the first
+    # version of this guard silently read rc=0). A broken `ps` yields an empty
+    # table that is otherwise indistinguishable from a genuinely idle machine:
+    # exit 0, CANDIDATES=0, healthy-looking footer, forever. run() aborts on
+    # that (#947 review P2). The awk below is whitespace-insensitive, so the
+    # former `sed 's/^ *//'` pipe is not needed.
+    { PI_REAP_SELF_PID="$$" "$PS_BIN" -axo pid=,ppid=,pgid=,tty=,lstart=,stat=,rss=,command= 2>/dev/null; ps_rc=$?; } \
+        >"$PS_TABLE.raw"
+    PS_RC="$ps_rc"
     awk '{
         pid=$1; ppid=$2; pgid=$3; tty=$4
         if (pid !~ /^[0-9]+$/ || pid+0 <= 0) next
@@ -391,16 +412,21 @@ store_records_for_pid() { # <pid> -> matching TSV lines ("" when none)
     grep -E "^${1}	" "$STORE_TSV" 2>/dev/null || true
 }
 
-# updated_stamp_ok <value> <now> — a store `updatedAt` is only usable as a
-# freshness stamp when it is a REAL epoch: a strict decimal (NOT a digit/dot
-# soup awk would coerce to 0 — "1.2.3" is not a timestamp) inside a plausible
-# window (>= 2001-09-09, not materially in the future). Anything else abstains
-# so the veto stands (fail closed; #947 review P1).
-updated_stamp_ok() {
+# store_number_ok <value> <now> — the shared strictness gate for EVERY
+# store-derived number this script does arithmetic on. Store values are
+# UNTRUSTED: bash `$(( ))` re-parses an operand as an ARITHMETIC EXPRESSION,
+# so a crafted `pidStartSeconds` of the form `epoch[$(cmd)]` EXECUTES code as
+# the user (verified end-to-end, #947 review P1) while a bare word aborts the
+# whole pass. Only a strict decimal inside a plausible epoch window passes;
+# callers ignore anything else (fail closed — an unusable stamp can only
+# withhold a kill, never cause one). Arithmetic on an accepted value is still
+# done through `awk -v`, which never evaluates its argument as an expression.
+store_number_ok() {
     local v="$1" now="$2"
     grep -qE '^[0-9]+(\.[0-9]+)?$' <<<"$v" || return 1
     awk -v u="$v" -v n="$now" 'BEGIN{exit !(u >= 1000000000 && u <= n + 86400)}'
 }
+updated_stamp_ok() { store_number_ok "$1" "$2"; }
 
 # stuck_record_still_frozen <sid> <pid> <now> — STUCK-settle re-verify. The
 # population inspected is deliberately the SAME one classify unions over:
@@ -620,7 +646,11 @@ classify_candidates() {
             [ -n "$rec" ] || continue
             rec_pss="$(printf '%s' "$rec" | awk -F'\t' '{print $2}')"
             if [ -z "$rec_pss" ]; then abstain=$((abstain+1)); continue; fi
-            diff=$(( epoch - rec_pss )); [ "$diff" -lt 0 ] && diff=$(( -diff ))
+            # UNTRUSTED value, and the next line is arithmetic: gate it first
+            # (see store_number_ok). An unusable pss abstains — it can neither
+            # prove nor veto.
+            store_number_ok "$rec_pss" "$now" || { abstain=$((abstain+1)); continue; }
+            diff="$(awk -v a="$epoch" -v b="$rec_pss" 'BEGIN{d=a-b; if (d<0) d=-d; printf "%d", d}')"
             [ "$diff" -gt "$FENCE_TOLERANCE_SECONDS" ] && continue  # stale sibling: no vote
             matched_cnt=$((matched_cnt+1))
             matched="$(printf '%s\n%s' "$matched" "$rec" | sed '/^$/d')"
@@ -655,7 +685,7 @@ classify_candidates() {
             # shift the cand row, a 0x1f would shred the settle split — such
             # a file can never round-trip the pipeline, so abstain.
             case "$rf" in
-                *'|'*|*"$(printf '\037')"*)
+                *'|'*|*"$(printf '\037')"*|*$'\n'*)
                     abstain=$((abstain+1)); continue ;;
             esac
             le="$(jsonl_epoch_for "$rf")"
@@ -830,6 +860,22 @@ reap_one() { # <cand-line> <now>
             S*|I*) ;;
             *) log "SETTLE-SKIP $pid stuck row process no longer sleeping (stat=$stat2) — suppress"; return 0 ;;
         esac
+        # settle 2c (STUCK rows, #947 review P2): a FRESH child probe. The
+        # classify-time DESC_MAP is a pass-start snapshot and cannot see a tool
+        # child spawned since; a parent `wait`ing on a child stays in S with
+        # its cmux record unchanged, so without this a stuck row behind other
+        # kills (tens of seconds later at REAP_GRACE_SECONDS each) could
+        # group-kill a session that resumed and started working.
+        ps_enumeration
+        self_ancestors_from_table
+        if ! descendant_map_build; then
+            log "SETTLE-SKIP $pid stuck row fresh descendant map unavailable — suppress"
+            return 0
+        fi
+        if has_live_child "$pid" || has_live_pi_descendant "$pid"; then
+            log "SETTLE-SKIP $pid stuck row live child/descendant at settle (work in flight) — suppress"
+            return 0
+        fi
         if ! stuck_record_still_frozen "$sid" "$pid" "$now"; then
             log "SETTLE-SKIP $pid stuck row record no longer frozen/idle (union over all its records) — suppress"
             return 0
@@ -891,9 +937,20 @@ lock_acquire() {
         owner="$(cat "$LOCK_DIR/owner" 2>/dev/null)"
         started="$(cat "$LOCK_DIR/started" 2>/dev/null)"
         now="$(now_epoch)"
-        if [ -n "$started" ] && [ -n "$now" ]; then age=$(( now - started )); fi
+        # `started` comes from the lock file, which is on disk: never feed it
+        # to `$(( ))` unvalidated (same arithmetic-injection class as
+        # pidStartSeconds). An unusable value leaves age unknown => the lock is
+        # treated as NOT stale (block), the fail-closed direction.
+        if [ -n "$started" ] && [ -n "$now" ] && store_number_ok "$started" "$now"; then
+            age="$(awk -v a="$now" -v b="$started" 'BEGIN{printf "%d", a-b}')"
+        else
+            age=0   # unknown age => not-stale => a live owner's lock is honoured
+        fi
         if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && [ "$age" -lt "$REAP_LOCK_STALE_SECONDS" ]; then
             log "LOCK held by live pid $owner (age ${age}s) — abort"
+            # footer on this path too (#947 review P2): a footer-keyed monitor
+            # must not read the PREVIOUS pass's STUCK_ARMED/KILLED as current.
+            log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS CANDIDATES=0 STUCK=0 STUCK_RSS=0 STUCK_ARMED=$REAP_REAP_STUCK KILLED=0 YIELD=0"
             return 1
         fi
         log "LOCK stale (owner=${owner:-?} age=${age}s) — breaking"
@@ -951,17 +1008,37 @@ run() {
     # awk 24h but a derived bound of $((024*3)) = 60 (= 3x20), silently 12h
     # earlier than the documented 3x. (#947 review P2)
     REAP_IDLE_HOURS=$(( 10#${REAP_IDLE_HOURS} ))
+    # ...but `$(( 10#... ))` WRAPS for a digit string beyond the shell's signed
+    # 64-bit range, so `--idle-hours 18446744073709551616` normalized to 0 =>
+    # "reap every session with any JSONL". A value accepted by the regex must
+    # round-trip into a sane range. (#947 review P2)
+    [ "$REAP_IDLE_HOURS" -ge 1 ] && [ "$REAP_IDLE_HOURS" -le "$REAP_MAX_HOURS" ] \
+        || { echo "bad --idle-hours: out of range (1..$REAP_MAX_HOURS)" >&2; exit 2; }
     # bounded-veto freshness bound (#947): default 3x the (final) idle
     # threshold, so --idle-hours moves it too; an explicit value always wins.
     if [ -z "$REAP_STUCK_HOURS" ]; then REAP_STUCK_HOURS=$(( REAP_IDLE_HOURS * 3 )); fi
     grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" || { echo "bad --stuck-hours: $REAP_STUCK_HOURS" >&2; exit 2; }
     REAP_STUCK_HOURS=$(( 10#${REAP_STUCK_HOURS} ))
+    [ "$REAP_STUCK_HOURS" -ge 1 ] && [ "$REAP_STUCK_HOURS" -le "$REAP_MAX_HOURS" ] \
+        || { echo "bad --stuck-hours: out of range (1..$REAP_MAX_HOURS)" >&2; exit 2; }
     case "$REAP_REAP_STUCK" in
         0|1) ;;
         *) echo "bad REAP_REAP_STUCK: $REAP_REAP_STUCK (want 0 or 1)" >&2; exit 2 ;;
     esac
     mkdir -p "$(dirname "$REAP_LOG")" 2>/dev/null || true
     now="$(now_epoch)"
+
+    # `--list` is a pure read-only diagnostic (no store read, no kill decision,
+    # no lock, no log write) and is the surface an operator reaches for when
+    # the reaper misbehaves — so it is handled HERE, before the lock, before
+    # any log mutation, and before the descendant-map build/abort (which exists
+    # only to gate SIGNALING). (#947 review P2)
+    if [ "$LIST_ONLY" = 1 ]; then
+        ps_enumeration
+        trap 'rm -f "$PS_TABLE"' EXIT
+        printf '%s\n' "$CANDIDATES" | sed '/^$/d'
+        exit 0
+    fi
 
     if [ ${#PROBE_FILES[@]} -gt 0 ]; then
         probe_jsonl "${PROBE_FILES[@]}"
@@ -1004,13 +1081,16 @@ run() {
     log "==== pi-reap-idle pass: MODE=$MODE THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS STUCK_ARMED=$REAP_REAP_STUCK now=$now ===="
     ps_enumeration
     self_ancestors_from_table
-    # `--list` is a pure read-only diagnostic (no store read, no kill
-    # decision) and is the surface an operator uses to debug exactly this
-    # failure — so it exits BEFORE the descendant-map build and its abort
-    # below, which exists only to gate SIGNALING. (#947 review P2)
-    if [ "$LIST_ONLY" = 1 ]; then
-        printf '%s\n' "$CANDIDATES" | sed '/^$/d'
-        exit 0
+    pre_count="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | wc -l | tr -d ' ')"
+    # FAIL-CLOSED (#947 review P2): a `ps` that FAILED is not an idle machine.
+    # Without this, a broken ps/PS_BIN yields an empty table => 0 candidates =>
+    # the store read is skipped and the job exits 0 with a healthy-looking
+    # footer, every hour, forever.
+    if [ "$PS_RC" != 0 ] && [ "$pre_count" -eq 0 ]; then
+        echo "FAIL-CLOSED abort: ps enumeration failed (rc=$PS_RC, exit 3)" >&2
+        log "FAIL-CLOSED abort: ps enumeration failed (rc=$PS_RC, exit 3)"
+        log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS CANDIDATES=0 STUCK=0 STUCK_RSS=0 STUCK_ARMED=$REAP_REAP_STUCK KILLED=0 YIELD=0"
+        exit 3
     fi
     descendant_map_ok=1
     descendant_map_build || descendant_map_ok=0
