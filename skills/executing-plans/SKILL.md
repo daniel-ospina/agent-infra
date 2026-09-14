@@ -249,10 +249,14 @@ ISSUE_NUMBER=<from plan doc or branch name>
 SCOPING_PLAN=$(gh issue view $ISSUE_NUMBER --json comments --jq '.comments[] | select(.body | contains("<!-- issue-scoping:")) | .body' | tail -1)
 
 if [ -n "$SCOPING_PLAN" ]; then
-  UX_RATING=$(echo "$SCOPING_PLAN" | awk '/^\| UX \|/ {print $3}')
-  ARCH_RATING=$(echo "$SCOPING_PLAN" | awk '/^\| Architecture \|/ {print $3}')
-  ONTOLOGY_RATING=$(echo "$SCOPING_PLAN" | awk '/^\| Ontology \|/ {print $3}')
-  ACCESSIBILITY_RATING=$(echo "$SCOPING_PLAN" | awk '/^\| Accessibility \|/ {print $3}')
+  # Table rows are parsed with -F'|' + whitespace strip, matching
+  # commit-workflow/workflow/03-code-review.md — the default FS makes $3
+  # the literal '|' for a '| Domain | Rating |' row, so the rating is
+  # unreachable and the complexity-axis checks silently never fire.
+  UX_RATING=$(echo "$SCOPING_PLAN" | awk -F'|' '/^\| UX \|/ {gsub(/ /,""); print $3}')
+  ARCH_RATING=$(echo "$SCOPING_PLAN" | awk -F'|' '/^\| Architecture \|/ {gsub(/ /,""); print $3}')
+  ONTOLOGY_RATING=$(echo "$SCOPING_PLAN" | awk -F'|' '/^\| Ontology \|/ {gsub(/ /,""); print $3}')
+  ACCESSIBILITY_RATING=$(echo "$SCOPING_PLAN" | awk -F'|' '/^\| Accessibility \|/ {gsub(/ /,""); print $3}')
 else
   echo "No scoping plan found — skipping complexity-axis checks"
   UX_RATING=""
