@@ -18,7 +18,7 @@
 import { ok, equal } from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -4116,6 +4116,138 @@ async function main() {
     }, { cwd: hub });
     equal(fromHub, undefined,
       "ctx.cwd=hub is clean → allowed; the two fires must DIFFER (identical results would mean ctx is ignored)");
+  });
+
+  // ── #920 (O3): a changed file whose worktree copy is UNREADABLE is not a
+  // deleted one. The verify loop's bare `catch { continue }` treated EVERY
+  // read failure as ENOENT (deletion) and skipped the file → it was never
+  // named `unverified`, so the gate printed `✅ … verified — allowing` for a
+  // file it never read. `chmod 000` is the exploit primitive: the staged
+  // content is still committed by the bare commit. RED pre-fix (allow),
+  // GREEN post-fix (block). No other test in either suite chmods anything.
+  test("scenario 920: unreadable changed file (EACCES, not ENOENT) must BLOCK, never be skipped as deleted", async () => {
+    const repo = join(TEST_ROOT, "repo-920-eacces");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base920.txt"), "b\n");
+    git(repo, "add base920.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "unreadable920.ts"), "staged content\n");
+    git(repo, "add unreadable920.ts"); // staged — a bare commit records the index blob
+    await fire("session_start", {});
+    chmodSync(join(repo, "unreadable920.ts"), 0o000); // worktree copy unreadable (owner denied)
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m unreadable", cwd: repo },
+      });
+      ok(res && res.block === true,
+        "920: an EACCES (mode-000) changed file must BLOCK — RED pre-fix: the bare catch treated it as deleted and ALLOWED an unreadable-but-staged file");
+      ok(res.reason.includes("unreadable920.ts"),
+        "920: the block names the unreadable file — it is unverified, not content-free like a deletion");
+    } finally {
+      // Never leak a 000 fixture: restore the mode so cleanup (rmSync) succeeds.
+      chmodSync(join(repo, "unreadable920.ts"), 0o644);
+    }
+  });
+
+  // ── #920 (O3) cycle-1 review, P1: `ENOTDIR` is NOT "genuinely absent".
+  // A path COMPONENT replaced by a non-directory (a D/F conflict) still leaves
+  // the INDEX holding a staged blob for that path, which a bare `git commit`
+  // records. Putting `ENOTDIR` in the skip set therefore re-opened the very
+  // fail-open the EACCES case above closes, through another errno: the gate
+  // printed `✅ N files verified — allowing` for a file it never read. The
+  // discriminator is the INDEX, not the errno — `git ls-files -z --
+  // :(top,literal)<path>` (non-empty stdout ⇒ an index entry exists ⇒ the
+  // commit records content ⇒ BLOCK; empty stdout at exit 0 ⇒ a deletion ⇒
+  // skip; any probe fault ⇒ fail CLOSED). The three legs below pin every
+  // branch of that discrimination:
+  //   (a) ENOTDIR + index entry present (staged `M` row)  → BLOCK
+  //   (b) ENOTDIR + index entry absent  (staged `D` row)  → skip, never named
+  //   (c) ENOENT  (a genuine deletion)                    → skip (49b/55c policy)
+  // (a) is RED pre-fix (the skip set let the staged blob through unverified);
+  // (b)/(c) are policy pins — green either side of the fix, and (b) is what a
+  // naive "just drop ENOTDIR from the skip set" would break.
+  test("scenario 920 (P1): ENOTDIR from a D/F conflict WITH an index entry must BLOCK, never be skipped as deleted", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enotdir-indexed");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    mkdirSync(join(repo, "dfdir920"), { recursive: true });
+    writeFileSync(join(repo, "dfdir920", "inner920.ts"), "v1\n");
+    git(repo, "add dfdir920/inner920.ts");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "dfdir920", "inner920.ts"), "v2 staged content\n");
+    git(repo, "add dfdir920/inner920.ts"); // staged M row — a bare commit records this blob
+    // D/F conflict: replace the parent DIRECTORY with a regular FILE, so the
+    // child read throws ENOTDIR while the index still holds the staged blob.
+    rmSync(join(repo, "dfdir920"), { recursive: true, force: true });
+    writeFileSync(join(repo, "dfdir920"), "now a file\n");
+    await fire("session_start", {});
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m dfconflict", cwd: repo },
+      });
+      ok(res && res.block === true,
+        "920 (P1): ENOTDIR with an index entry must BLOCK — RED pre-fix: ENOTDIR was skipped as a deletion, so the staged blob was allowed unverified");
+      ok(res.reason.includes("dfdir920/inner920.ts"),
+        "920 (P1): the block names the D/F child — it has staged content, it is not content-free like a deletion");
+    } finally {
+      // Deterministic fixture teardown: restore the directory shape.
+      rmSync(join(repo, "dfdir920"), { recursive: true, force: true });
+    }
+  });
+
+  test("scenario 920 (P1): ENOTDIR on a genuine DELETION row (no index entry) must still be skipped, never name-blocked", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enotdir-deleted");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    mkdirSync(join(repo, "dfdir920b"), { recursive: true });
+    writeFileSync(join(repo, "dfdir920b", "inner920.ts"), "v1\n");
+    git(repo, "add dfdir920b/inner920.ts");
+    git(repo, "commit -m base");
+    git(repo, "rm dfdir920b/inner920.ts"); // staged D row — content-free
+    // Same D/F conflict shape, but the index holds NO entry: the row is a
+    // deletion, so the read failure must stay a skip (the errno alone cannot
+    // tell this from leg (a) — that is exactly why the probe exists).
+    rmSync(join(repo, "dfdir920b"), { recursive: true, force: true });
+    writeFileSync(join(repo, "dfdir920b"), "now a file\n");
+    await fire("session_start", {});
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m dfconflict-del", cwd: repo },
+      });
+      equal(res, undefined,
+        "920 (P1): ENOTDIR with NO index entry is a deletion — it must be skipped, never block (dropping ENOTDIR from the skip set would red here)");
+    } finally {
+      rmSync(join(repo, "dfdir920b"), { recursive: true, force: true });
+    }
+  });
+
+  test("scenario 920 (P1): ENOENT (a genuine deletion) must still be skipped — the pinned deletion policy", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enoent-deleted");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "gone920.ts"), "v1\n");
+    git(repo, "add gone920.ts");
+    git(repo, "commit -m base");
+    git(repo, "rm gone920.ts"); // staged deletion AND worktree copy removed → ENOENT
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m del920", cwd: repo },
+    });
+    equal(res, undefined,
+      "920 (P1): ENOENT = genuinely absent = content-free — a deletion must still be skipped (policy pinned by 49b/55c)");
   });
 
 } // main: plugin loaded; tests run sequentially via runAll()
