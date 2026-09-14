@@ -23,7 +23,7 @@
 #                             evidence). Residual unique still non-empty →
 #                             BLOCK, print the list, exit non-zero, NO merge.
 #
-# TWO PRECONDITIONS THE FAILING SETS ALONE CANNOT EXPRESS:
+# THREE PRECONDITIONS THE FAILING SETS ALONE CANNOT EXPRESS:
 #   1. THE HEAD MUST HAVE BEEN TESTED. The lane must have at least one TESTED run
 #      for this head (a run that finished `success`, `failure` or `timed_out`) and
 #      none still running. A queued run — or a run that finished `cancelled`,
@@ -36,6 +36,14 @@
 #      immediately before the comment and again by GitHub via
 #      `--match-head-commit`, so a rebase inside the window cannot land an
 #      unanalyzed head behind SHA-bound evidence (review P1).
+#   3. THE LANE MUST BASELINE BOTH SIDES. `main-fails.txt` is `comm -23`'s right
+#      operand, so if it is EMPTY every failure the PR carries reads as new —
+#      including ones already red on main, which turns a safe merge into a false
+#      block. A lane is therefore usable only if it has TESTED runs on main too
+#      (the same `tested` counter as precondition 1). Repos that split their
+#      lanes by TRIGGER (a `pull_request`-only lane and a `push`-only lane) have
+#      no single --workflow spanning both sides; `--any-workflow` compares
+#      against every lane on main (#1003).
 #
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
@@ -90,6 +98,34 @@ count_lines() { wc -l < "$1" | tr -d ' '; }
 report_value() {
   [ -n "$1" ] && [ -r "$1" ] || { printf ''; return 0; }
   awk -F= -v k="$2" '$1 == k { print $2 }' "$1"
+}
+
+# Counter predicates — and why they are written this way.
+#
+# A counter that is NOT A NUMBER answers nothing: `[ "$x" -eq 0 ]` (and `-gt 0`)
+# returns 2 on such a value, and under `set -uo pipefail` (no `-e`) the `if` body
+# is SKIPPED — so a guard written as `[ "$x" -eq 0 ]` fails OPEN on a malformed
+# report. Both predicates therefore return FALSE for an unreadable counter, and
+# every caller must BLOCK unless its condition is AFFIRMATIVELY true (`!`) — never
+# "unless it evaluated false".
+#
+# check-lane-tested.sh refuses the same values for the detector (a fail-open in
+# the guard itself, cycle-5 review P2); the two consumers must agree on the
+# report contract.
+counter_is_zero() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -eq 0 ]
+}
+counter_is_positive() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -gt 0 ]
+}
+# TRUE only for a counter that is a readable non-negative integer. A caller that must
+# COMPARE two counters uses this instead of a bare `-lt`, which returns 2 on garbage —
+# and under `set -uo pipefail` (no `-e`) that SKIPS the guard rather than failing it.
+counter_is_number() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
 }
 
 resolve_head() {
@@ -191,7 +227,18 @@ build_evidence() {
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
   printf 'test lane: %s\n' "$lane"
-  printf 'main compared (union of %s runs of %s): %s\n' "$MAIN_RUNS" "$lane" "$(provenance_ids "$main_prov")"
+  # The count is the runs that ACTUALLY CONTRIBUTED to the union, not the
+  # REQUESTED window ($MAIN_RUNS). A run that contributed nothing — it was green —
+  # adds nothing to the union and is not counted, so N always equals the number of
+  # ids printed here, and the total window is still stated on the `Lane completion:`
+  # line. Printing the requested window instead asserted a comparison that did not
+  # happen, in the one line the review-enforcer trusts enough to certify a bypass
+  # (#1003).
+  local main_union_n=0
+  if [ -f "$main_prov" ]; then main_union_n="$(count_lines "$main_prov")"; fi
+  local run_word="runs"
+  if [ "$main_union_n" = "1" ]; then run_word="run"; fi
+  printf 'main compared (union of %s %s of %s): %s\n' "$main_union_n" "$run_word" "$lane" "$(provenance_ids "$main_prov")"
   printf 'PR failing: %s | main failing: %s | unique to this PR: 0\n' "$pr_count" "$main_count"
   printf '%s\n' "$analyzed"
   # THE AUDITABLE DIFF, not just its verdict (#3467 item 2): with a zero
@@ -296,24 +343,85 @@ main() {
   pr_completed="$(report_value "$TMP/pr-report.txt" completed)"
   pr_tested="$(report_value "$TMP/pr-report.txt" tested)"
   pr_pending="$(report_value "$TMP/pr-report.txt" pending)"
-  if [ "${pr_pending:-0}" -gt 0 ]; then
+
+  # "Not proven finished" is not "finished": `! counter_is_zero` blocks on an
+  # UNREADABLE `pending` too, not only on a positive one. A bare `-gt 0` skipped
+  # the body on a non-numeric value (`[ n/a: integer expression expected`, exit
+  # 2) and the rail merged while the lane might still be running — the #3420
+  # ratchet that precondition 1 exists to stop (VGATE cycle 2, #1003).
+  if ! counter_is_zero "$pr_pending"; then
     say_err "admin-merge: ✗ BLOCK — the test lane has NOT finished for head $head:"
-    say_err "   $pr_pending run(s) still queued/in progress (lane: $lane)."
+    if counter_is_positive "$pr_pending"; then
+      say_err "   $pr_pending run(s) still queued/in progress (lane: $lane)."
+    else
+      say_err "   the run report's 'pending' counter is unreadable ('${pr_pending:-}'), so the rail"
+      say_err "   cannot show the lane finished (lane: $lane)."
+    fi
     say_err "   An unfinished lane yields an empty failing set, which proves nothing."
     say_err "   Wait for CI to complete, then re-run the rail."
     exit 1
   fi
   # NOT `completed`: a `cancelled`/`skipped` run is terminal but exercised
   # nothing, so it cannot certify the revision (review P1, cycle 2). A parser too
-  # old to emit `tested` therefore BLOCKS — fail closed, never vacuous.
-  if [ "${pr_tested:-0}" -eq 0 ]; then
+  # old to emit `tested` therefore BLOCKS — fail closed, never vacuous. The
+  # counter is VALIDATED, not trusted: a non-numeric `tested` made `[ -eq ]`
+  # error and skip this body, which is a fail-open (VGATE, #1003).
+  if ! counter_is_positive "$pr_tested"; then
     say_err "admin-merge: ✗ BLOCK — no run of the lane actually TESTED head $head (lane: $lane)."
     say_err "   completed=${pr_completed:-0} run(s), of which tested=${pr_tested:-0}."
     say_err "   A cancelled or skipped run is finished but exercised nothing, so an"
     say_err "   empty failing set proves nothing about this revision."
+    # "The lane ran but exercised nothing" and "this lane does not run on pull
+    # requests at all" are different faults with different fixes. On a repo that
+    # splits its lanes by trigger the second is the common one, and waiting for
+    # CI cannot help — the lane must be changed (#1003).
+    # "No runs at all" is completed AND pending BOTH zero — NOT `examined=0`,
+    # which is equally true of a run that finished `cancelled`/`skipped`. Those
+    # are the "ran but proved nothing" case the lines above already describe, and
+    # calling them a main-only lane is simply false (VGATE, #1003).
+    if counter_is_zero "$pr_completed" && counter_is_zero "$pr_pending"; then
+      say_err "   The lane '$lane' has NO runs for this head at all — which is what a"
+      say_err "   MAIN-ONLY lane looks like. If this repo splits its lanes by trigger,"
+      say_err "   pick a lane that runs on pull requests."
+    fi
     say_err "   Confirm the lane is the right one (--workflow) and that CI ran for this head."
     exit 1
   fi
+  # ── 1c. EVERY FAILING RUN MUST BE ATTRIBUTED (cycle-3 review) ────────────
+  # `examined` counts the lane's failing runs; `extracted` counts those whose log
+  # yielded at least one `FAILED <nodeid>` line. A failing run that contributes
+  # NOTHING leaves the residual UNKNOWN while the certificate would print
+  # `PR failing: 0` for a lane that is RED — a FALSE certificate, the one severity
+  # this rail exists to prevent (the cycle-3 repro: a head run failing with
+  # `ImportError: no module named y` certified as zero-residual, and the rail
+  # merged). A gate whose output authorises a bypass fails CLOSED here.
+  #
+  # ORDER MATTERS: this sits AFTER the not-finished / not-tested diagnostics. Run
+  # first, an absent or unreadable report made THIS the reported reason, masking the
+  # real one — and the suite pins those messages (cycle-3, caught by CI).
+  #
+  # Deliberately NOT applied to the MAIN side: an unattributed run there
+  # under-reports the BASELINE, which can only make the residual look larger — a
+  # false block, whose designed remedy is the retry path. The false-certificate
+  # direction is the PR side.
+  local pr_examined pr_extracted
+  pr_examined="$(report_value "$TMP/pr-report.txt" examined)"
+  pr_extracted="$(report_value "$TMP/pr-report.txt" extracted)"
+  if ! counter_is_number "$pr_examined" || ! counter_is_number "$pr_extracted"; then
+    say_err "⛔ admin-merge: BLOCKED — the lane run report carries unreadable"
+    say_err "   examined/extracted counters (examined='${pr_examined:-}', extracted='${pr_extracted:-}'),"
+    say_err "   so the failing set cannot be shown to be complete."
+    exit 1
+  fi
+  if [ "$pr_extracted" -lt "$pr_examined" ]; then
+    say_err "⛔ admin-merge: BLOCKED — $((pr_examined - pr_extracted)) of $pr_examined failing PR run(s)"
+    say_err "   yielded NO parseable 'FAILED <nodeid>' line, so their failures are NOT in the"
+    say_err "   set and 'unique to this PR: 0' would be a false certificate (lane: $lane)."
+    say_err "   Either the run failed outside the test step (fix it), or the log format moved"
+    say_err "   and the parser needs updating. This is a refusal, not a comparison."
+    exit 1
+  fi
+
   info "admin-merge: lane finished for $head (${pr_tested} tested of ${pr_completed} completed run(s))"
 
   # ── 2. main's baseline: the UNION over the last N runs ───────────────────
@@ -324,6 +432,43 @@ main() {
   if [ "$main_status" -ne 0 ]; then
     say_err "admin-merge: ✗ BLOCK — could not extract main's failing set (parser exit $main_status)."
     say_err "   Refusing to certify a comparison computed over an unreadable baseline."
+    exit 1
+  fi
+
+  # ── 2b. is the selected lane a BASELINE at all? ───────────────────────────
+  # A rail certificate claims "this PR carries no failure that is not already red
+  # on main". That claim IS a comparison, so it needs a baseline. A lane that
+  # never ran on main gives an empty baseline, and an empty baseline absorbs
+  # nothing: every failure the PR carries reads as new, PRE-EXISTING ones
+  # included, and a safe merge is refused for the wrong reason. An over-blocking
+  # gate is a broken gate too — but the remedy is a REAL baseline, not a
+  # certificate backed by nothing, so this BLOCKS and names the way to one.
+  #
+  # The signal is `tested`, NOT `examined`, and deliberately the SAME one the
+  # head-side check uses: `examined` counts only FAILING runs (a green lane
+  # legitimately has examined=0), so it cannot tell a green baseline from a
+  # missing one. `tested` counts every run that actually exercised the revision,
+  # passing or failing — exactly the question here.
+  #
+  # This does not ride on the vacuous case below: "green on both sides" is an
+  # OUTCOME of a comparison that happened, "never tested main" is a
+  # MISCONFIGURATION in which none did, and a reader must tell them apart. Repos
+  # that split their lanes by trigger (a pull_request-only lane and a push-only
+  # lane — this one does) have no single --workflow spanning both sides, which is
+  # what --any-workflow is for (#1003).
+  local main_tested main_completed
+  main_tested="$(report_value "$TMP/main-report.txt" tested)"
+  main_completed="$(report_value "$TMP/main-report.txt" completed)"
+  if ! counter_is_positive "$main_tested"; then
+    say_err "admin-merge: ✗ BLOCK — the lane '$lane' never TESTED main, so there is no baseline."
+    say_err "   main: completed=${main_completed:-0} run(s), of which tested=${main_tested:-0}."
+    say_err "   A rail certificate claims \"this PR carries no failure that is not already red"
+    say_err "   on main\". That claim IS a comparison. With nothing on main to compare against,"
+    say_err "   every failure this PR carries reads as new — PRE-EXISTING ones included — and a"
+    say_err "   safe merge is refused for the wrong reason."
+    say_err "   A repo can split its lanes by TRIGGER (a PR-only lane and a main-only lane), and"
+    say_err "   then no single --workflow spans both sides. Compare against every lane on main"
+    say_err "   instead: add --any-workflow."
     exit 1
   fi
 
@@ -473,7 +618,12 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
   info "admin-merge: ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
 
   # shellcheck disable=SC2086
-  $GH pr merge "$PR" --admin --match-head-commit "$head" ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} ${repo_args[@]+"${repo_args[@]}"}
+  # ORDER MATTERS. `--match-head-commit "$head"` is deliberately passed AFTER the caller's
+  # passthrough args (MERGE_ARGS): gh takes the LAST occurrence of a scalar flag, so with
+  # the old order a `-- --match-head-commit <other>` passthrough silently REBOUND the merge
+  # to a head other than the one just certified, defeating the binding this comment claims
+  # (cycle-3 review). Ours goes last so ours wins.
+  $GH pr merge "$PR" --admin ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} --match-head-commit "$head" ${repo_args[@]+"${repo_args[@]}"}
 }
 
 main "$@"

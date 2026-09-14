@@ -196,6 +196,14 @@ scripts/admin-merge.sh <PR> --squash
 # `--workflow` to override), and the rail BLOCKS unless the lane has actually
 # TESTED the head — a run that is queued, or one that finished `cancelled`,
 # exercised nothing, so an empty failing set would prove nothing.
+#
+# A lane is only usable if it runs on BOTH sides. The rail also BLOCKS when the
+# lane never tested `main`, because the certificate claims "every failure here is
+# already red on main" — that claim IS a comparison, and an empty baseline
+# absorbs nothing, so a pre-existing failure would be charged to the PR. This
+# matters for repos that split their lanes by TRIGGER: agent-infra's `ci.yml` is
+# `pull_request`-only and `ci-main.yml` is `push`-only, so neither spans both
+# sides. Pass `--any-workflow` there to compare against every lane on main.
 ```
 
 ⚠️ The baseline is the **union of main's last N runs** (default 10), never a

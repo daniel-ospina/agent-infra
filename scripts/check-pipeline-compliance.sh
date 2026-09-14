@@ -9,9 +9,12 @@
 #   a. LINKED ISSUE      — PR body references an issue via a closing keyword
 #                          (Fixes #N / Closes #N / Resolves #N, plus
 #                          owner/repo#N or https://github.com/owner/repo/issues/N
-#                          for cross-repo issues) that BEGINS A LINE (a bullet
-#                          or emphasis/backtick marker may precede it). A
-#                          mid-sentence mention is not a reference (#1012).
+#                          for cross-repo issues) that BEGINS A LINE, optionally
+#                          after a Markdown line-leading prefix — bullet,
+#                          ordered-list marker, blockquote, ATX heading or
+#                          task-list checkbox (compound included) — and/or an
+#                          emphasis/bold/backtick marker. A mid-sentence
+#                          mention is not a reference (#1012).
 #                          For cross-repo refs the
 #                          labels (tier) and scoping comments (checks b–e) are
 #                          fetched from the issue's OWN repo, not the PR's.
@@ -157,8 +160,10 @@ Env:
 
 Check (a) scope:
   A closing keyword ("Fixes #N" / "Closes #N" / "Resolves #N", or owner/repo#N
-  / a full issue URL) must BEGIN A LINE — a Markdown bullet or
-  emphasis/bold/backtick marker may precede it. A mid-sentence mention does NOT
+  / a full issue URL) must BEGIN A LINE, optionally preceded by a Markdown
+  line-leading prefix — a bullet, ordered-list marker, blockquote, ATX heading
+  or task-list checkbox (compound/nested prefixes included) — and/or an
+  emphasis/bold/backtick marker. A mid-sentence mention does NOT
   count, because it can auto-close an issue on merge (#1012).
   A diff that is ENTIRELY an artifact — under docs/, instruction-layer Markdown
   (skills/**/*.md, AGENTS.md), or .github/CODEOWNERS — may instead use a
@@ -243,22 +248,40 @@ pass() { printf '✅ [%s] %s\n' "$1" "$2"; }
 fail() { printf '❌ [%s] %s\n' "$1" "$2"; FAILURES=$((FAILURES + 1)); }
 # Reference CONTEXT (#1012) — where a closing OR traceability keyword must sit
 # to count as a reference rather than a mention. The keyword begins a line,
-# optionally after a Markdown bullet ("- " / "* ") and/or emphasis / bold /
-# backtick markers. An UNANCHORED match read a sentence that merely DISCUSSED a
-# closing keyword as a reference: PR #968's status note "…a closing keyword
-# would falsely close #949…" satisfied check (a) AND would have auto-closed
-# #949 on merge. Position is the contract, exactly as #991 made check (b)
-# positional. REFCTX is byte-identical to record-review.sh's copy — the same
-# documented cross-script contract the keyword class carries.
-REFCTX='^[[:space:]]*([-*][[:space:]]+)?[*_`]{0,3}[[:space:]]*'
+# optionally after ONE OR MORE Markdown prefixes GitHub renders as a
+# line-leading reference marker — a bullet ("- " / "* " / "+ "), an
+# ordered-list marker ("1. " / "1) "), a blockquote ("> " / ">> "), an ATX
+# heading ("# " … "###### "), a task-list checkbox ("[ ] " / "[x ]") — and/or
+# emphasis / bold / backtick marks. The prefix and checkbox groups are
+# REPEATABLE, so COMPOUND prefixes count too (`> - Closes #42`,
+# `> > Closes #42`, `>> Closes #42`): nesting is still a reference context that
+# auto-closes on GitHub, while a single-consumption group false-BLOCKED check
+# (a) on exactly those shapes (#1012 r3). An UNANCHORED match read a sentence
+# that merely DISCUSSED a closing keyword as a reference: PR #968's status note
+# "…a closing keyword would falsely close #949…" satisfied check (a) AND would
+# have auto-closed #949 on merge. Position is the contract, exactly as #991
+# made check (b) positional.
+# The CROSS-SCRIPT CONTRACT is the keyword CLASS, not the position rule: REFCTX
+# and CLOSING_KW are byte-identical to record-review.sh's copies (pinned
+# mechanically by record-review.test.sh §8.13), while record-review's #513 tier
+# guard ALSO scans with a WORD-BOUNDARY-ANCHORED CLOSING_KW (`\b` + the class,
+# NO REFCTX) — GitHub auto-closes a mid-sentence ref, so the tier guard must
+# bind it even though check (a) ignores it, and `\b` keeps the class from
+# matching INSIDE ordinary English words ("prefix", "discloses", "unresolved").
+REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:space:]]*)*(\[[ xX]\][[:space:]]+)*[*_`]{0,3}[[:space:]]*'
 
 # Closing-keyword class (check a's default) and the NON-closing traceability
 # class (the artifact-only fallback). \b anchors the TRACE keywords so a
 # substring cannot masquerade as one ("prefs #42" must not read as
-# "refs #42"). CLOSING_KW itself stays byte-identical to
+# "refs #42"). CLOSING_KW stays byte-identical to
 # record-review.sh::closing_issue_refs (a documented cross-script contract);
-# the positional REFCTX prefix is applied by BOTH scripts, so the composed
-# pattern is identical too. Both suites pin the COMPOSED form now.
+# the positional REFCTX prefix is applied by BOTH scripts by default, so the
+# POSITIONAL composed pattern is identical. The tier guard's GitHub-parity scan
+# is the one place the composition differs: it composes `\b` + CLOSING_KW with
+# NO REFCTX (see the REFCTX comment above) — the CLASS stays byte-identical, the
+# position/boundary wrapper is chosen per scan. Both suites pin the COMPOSED
+# form, and record-review.test.sh §8.13 pins the two constant lines
+# byte-for-byte across the scripts (nothing asserted that equality before).
 CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
 TRACE_KW='\b(ref(s|erences?)?|part[[:space:]]+of|advance(s|d)?|track(s|ed)?|relates?[[:space:]]+to)'
 
@@ -323,9 +346,10 @@ resolve_issue_only_ref() {
 # Each form greps the keyword directly followed by the reference (so e.g.
 # "resolves SLACK_APPROVAL_FILE" is not mistaken for an issue ref), and the
 # keyword must occupy a REFERENCE CONTEXT (REFCTX): it begins a line, optionally
-# after a bullet or emphasis marker. A mid-sentence mention is NOT a reference
-# (#1012) — that distinction is what keeps a sentence about a closing keyword
-# from satisfying check (a) and auto-closing an issue on merge.
+# after a Markdown line-leading prefix (bullet / ordered marker / blockquote /
+# ATX heading / task-list checkbox) or emphasis marker. A mid-sentence mention
+# is NOT a reference (#1012) — that distinction is what keeps a sentence about a
+# closing keyword from satisfying check (a) and auto-closing an issue on merge.
 parse_issue_ref() {
   local text="$1" kwpat="${2:-$CLOSING_KW}" m repo num kw
   # Positional for BOTH classes: parse_trace_ref delegates here, so a
@@ -669,7 +693,7 @@ run_checks() {
       pass a "linked issue $issue_display (traceability keyword in PR body — artifact-only PR, closure not implied)"
     fi
   else
-    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown bullet or emphasis/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
+    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
     echo "      Missing: issue reference in PR body."
     echo "      Invoke:  issue-scoping — run it, then reference the issue when opening the PR."
     echo ""
@@ -856,7 +880,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "PR:   $GH_REPO#$PR_NUMBER"
   echo ""
   echo "Would check, in order:"
-  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a bullet/emphasis marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
+  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
   echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
@@ -1033,13 +1057,43 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # class, now judged per reference context by REFCTX).
   expect_ref $'resolves SLACK_APPROVAL_FILE first\nCloses #2492' "$GH_REPO#2492"
   expect_ref 'Closes #173.' "$GH_REPO#173"
-  # #1012 — a REFERENCE CONTEXT may open with a Markdown bullet or an
-  # emphasis / bold / backtick marker, and only there.
+  # #1012 — a REFERENCE CONTEXT may open with a Markdown line-leading prefix
+  # (bullet, ordered marker, blockquote, ATX heading, task-list checkbox) or an
+  # emphasis / bold / backtick marker, and only there. The heading /
+  # ordered-list / task-list / blockquote vectors below are the regression this
+  # round repairs: they resolved before the positional rule and were left
+  # UNPINNED, so the narrowing went unnoticed.
   expect_ref '- Closes #173' "$GH_REPO#173"
   expect_ref '* Closes #173' "$GH_REPO#173"
+  expect_ref '+ Closes #173' "$GH_REPO#173"
+  expect_ref '1. Closes #173' "$GH_REPO#173"
+  expect_ref '1) Closes #173' "$GH_REPO#173"
+  expect_ref '> Closes #173' "$GH_REPO#173"
+  expect_ref '## Closes #173' "$GH_REPO#173"
+  expect_ref '###### Closes #173' "$GH_REPO#173"
+  expect_ref '- [ ] Closes #173' "$GH_REPO#173"
+  expect_ref '- [x] Closes #173' "$GH_REPO#173"
   expect_ref '**Closes #173**' "$GH_REPO#173"
   expect_ref '`Closes #173`' "$GH_REPO#173"
+  # #1012 r3 — the prefix + checkbox groups are REPEATABLE, so a COMPOUND
+  # line-leading prefix (nested blockquote; list inside a quote) is a reference
+  # context too. A single-consumption group false-BLOCKED check (a) on these
+  # shapes while GitHub still auto-closes on merge; they were unpinned, which
+  # is why the over-refusal was invisible.
+  expect_ref '> > Closes #173' "$GH_REPO#173"
+  expect_ref '> - Closes #173' "$GH_REPO#173"
+  expect_ref '>> Closes #173' "$GH_REPO#173"
+  expect_ref '- > Closes #173' "$GH_REPO#173"
+  expect_ref '> - [ ] Closes #173' "$GH_REPO#173"
+  # Anti-vacuous control for the repeatable group: consuming MORE prefixes must
+  # not drag a MID-SENTENCE keyword into a reference context — the keyword must
+  # still follow the marks immediately.
+  expect_ref '> - This also closes #173' ''
+  expect_ref '> > the prefix #173 is unrelated' ''
   expect_ref 'No issue referenced here' ''
+  # Anti-vacuous control: a line-leading prefix must NOT be manufacturable out
+  # of prose — a 7-hash run is not an ATX heading (the `#{1,6}` bound).
+  expect_ref '####### Closes #173' ''
 
   # ── #720: closing parser must NOT accept traceability keywords ────────────
   # These are the RED-if-broken assertions for the artifact-only fallback. If
@@ -1200,8 +1254,11 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # ── #1012: the closing match is POSITIONAL, and the pattern is shared with
   # record-review.sh::closing_issue_refs (its §8.11 pins the same class). A
   # keyword buried inside a word or a sentence is a mention, not a reference.
+  # The parity scan that misreads prose lives in record-review.sh and is pinned
+  # by its §8.11/§8.14; here the boundaries that matter are the positional ones.
   expect_ref 'prefixes #42' ''
   expect_ref 'bugfixes #42' ''
+  expect_ref 'The prefix #42 is unrelated.' ''
   # The TRACE class is positional too, so a mid-word / mid-sentence substring
   # must not resolve — while a real reference context does (pinned above).
   expect_trace 'prefs #42' ''
@@ -1832,7 +1889,7 @@ FILES="$(fetch_json "pulls/$PR_NUMBER/files" '.[] | "\(.status)\t\(.filename)\t\
 # Authoritative file count for this PR. files_rows demands the validated
 # DISTINCT-new-path count EQUAL this, which is what makes a forged or
 # truncated list unable to read as complete (and so unable to look
-# docs-only). Distinct paths, not rows: .changed_files counts paths while
+# artifact-only). Distinct paths, not rows: .changed_files counts paths while
 # pulls/files returns one entry per diff entry.
 FILES_EXPECTED="$(fetch_json "pulls/$PR_NUMBER" '.changed_files // ""')"
 
