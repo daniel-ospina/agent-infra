@@ -88,7 +88,7 @@ Before deciding what gates to run, classify the change:
 | Medium-High (large plan, some novelty) | 3 reviewers | 5 |
 | High (novel architecture, first-of-kind) | 4 reviewers | 10 |
 
-`—` in Max Cycles = **0 loop cycles** — this column counts TOTAL cycles, so `—` means the loop never runs for that row (no pass and no re-review). Tier crosswalk: `micro` → Low, `standard` → Low-Medium, `complex` → High. Editing this table requires the matching change in `extensions/loop-enforcer/termination.ts` and `tier-config-parity.test.ts` in the same commit — the parity test parses it.
+`—` in Max Cycles = **0 loop cycles** — this column counts TOTAL cycles, so `—` means the loop never runs for that row: one reviewer pass, no re-review. Tier crosswalk: `micro` → Low, `standard` → Low-Medium, `complex` → High. Editing this table requires the matching change in `extensions/loop-enforcer/termination.ts` and `tier-config-parity.test.ts` in the same commit — the parity test parses it.
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers.
 
@@ -142,7 +142,7 @@ This is the same generate-review loop applied to gate selection itself. The agen
 
 Consuming skills **cite** `proportional-gates` §Review Cycles by name and never copy its cells — a copy is a second source of truth, and it is not the table the parity test parses, so it drifts silently.
 
-The **judgment principle** and the domain tables (workspace isolation, dependency verification) may be restated or inlined in a consuming skill's own words — "replace rigid rules with judgment-based gating", and the Reviewer-Validates-Judgment pattern above. Reviewer counts and cycle caps may not.
+The **judgment principle** and the domain tables (e.g. workspace isolation, pre-flight verification, dependency verification, research depth) may be restated or inlined in a consuming skill's own words — "replace rigid rules with judgment-based gating", and the Reviewer-Validates-Judgment pattern above. Reviewer counts and cycle caps may not.
 
 ---
 

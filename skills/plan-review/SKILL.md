@@ -530,9 +530,9 @@ fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual inp
 
 ### Phase 5 — Final Verification
 
-After plan is clean (Phase 4 says clean), dispatch the tier's reviewers (the same N as the review cycles, proportional to plan risk) via Pi `task` to re-review the final plan. Same prompts as Phase 1, concatenated.
+After plan is clean (Phase 4 says clean), dispatch the tier's reviewers (the same N as the review cycles, proportional to plan risk) via Pi `task` — one per Phase 1 prompt, not concatenated — to re-review the final plan.
 
-If the verification sub-agent finds issues:
+If any reviewer finds issues:
 - Fix them (Phase 3)
 - Re-verify (Phase 5 again)
 - Max 2 additional cycles
