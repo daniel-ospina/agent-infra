@@ -1054,13 +1054,17 @@ run() {
     # threshold, so --idle-hours moves it too; an explicit value always wins.
     if [ -z "$REAP_STUCK_HOURS" ]; then
         REAP_STUCK_HOURS=$(( REAP_IDLE_HOURS * 3 ))
-        # The derived value is ARITHMETIC, so it can WRAP. With a huge
-        # REAP_MAX_HOURS an accepted idle threshold overflows signed 64-bit
-        # (e.g. 4e18 * 3 -> -6.4e18), and a NEGATIVE bound makes every age
-        # comparison true (`a > -6e18`), so an actively working session would
-        # classify STUCK and, under the arm, be TERM'd — reproduced end-to-end.
-        # Validate the RESULT itself, not just its operands. (#947 review P1)
-        grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" && [ "$REAP_STUCK_HOURS" -ge 1 ] \
+        # The derived value is ARITHMETIC, so it can WRAP — and a wrap can land
+        # POSITIVE (6148914691236517206 * 3 -> 3N-2^64 = 2), which a
+        # positivity check alone accepts: the intended ~7e14-year bound becomes
+        # 2 hours, so a 3h-stale non-idle session flips STUCK and is reaped
+        # under the arm (reproduced end-to-end by review). Require monotonicity:
+        # for any wrap, derived = 3N - 2^64 < N (since N <= 2^63-1, which the
+        # REAP_MAX_HOURS validation enforces via `[ -ge 1 ]` erroring above
+        # INT64_MAX), so `derived >= idle` rejects EVERY wrap while preserving
+        # the "derived bound is not capped by REAP_MAX_HOURS" intent.
+        # (#947 review P1)
+        grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" && [ "$REAP_STUCK_HOURS" -ge "$REAP_IDLE_HOURS" ] \
             || { echo "bad derived --stuck-hours: $REAP_STUCK_HOURS (--idle-hours too large)" >&2; exit 2; }
     else
         grep -qE '^[0-9]+$' <<<"$REAP_STUCK_HOURS" || { echo "bad --stuck-hours: $REAP_STUCK_HOURS" >&2; exit 2; }
@@ -1251,7 +1255,11 @@ run() {
             residual_count="?"
         fi
     else
-        residual_count="$REAP_COUNT"
+        if [ "$post_ps_ok" = 1 ]; then
+            residual_count="$REAP_COUNT"
+        else
+            residual_count="?"
+        fi
     fi
 
     if [ "$MODE" = dry-run ]; then

@@ -1609,6 +1609,16 @@ assert_eq "$D22ERC" "2" "D22d a second wrapping case (5e18*3) is rejected too"
 # positive control: a large derived bound that does NOT wrap stays usable.
 OUT="$(REAP_MAX_HOURS=3000000000000000000 REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours 3000000000000000000 2>&1)"; D22FRC=$?
 assert_eq "$D22FRC" "0" "D22d a large non-wrapping derived bound is still accepted"
+# D22e (round-5 review P1): a 64-bit wrap can land POSITIVE, which a positivity
+# check accepts. `$(( 6148914691236517206 * 3 ))` = 2 (3N-2^64), so a "7e14-year"
+# bound silently became 2 HOURS — a 3h-stale non-idle session flips STUCK and is
+# TERM+KILLed under the arm (reproduced end-to-end). Wrap detection must be
+# monotonicity, not sign.
+for D22E in 6148914691236517206 6148914691236517205 6148914691236517207 9223372036854775807; do
+    OUT="$(REAP_MAX_HOURS=$D22E REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper D --dry-run --idle-hours $D22E 2>&1)"; D22ERC=$?
+    assert_eq "$D22ERC" "2" "D22e a positive-wrapping derived bound (idle=$D22E) is rejected"
+done
+assert_contains "$OUT" "bad derived --stuck-hours" "D22e the positive-wrap rejection names the derived bound"
 
 # D23 (review P2): the post-pass read feeds POST/RESIDUAL only, but a failed
 # post-pass must not be reported as a fresh count — a stale candidate list made
@@ -1618,6 +1628,7 @@ OUT="$(FAKE_PS_BULK_LOG="$T/D/bulk-count" FAKE_PS_FAIL_BULK_N=2 REAP_NOW_EPOCH=$
 assert_eq "$D23RC" "0" "D23 a failed POST-pass enumeration does not abort the pass"
 assert_contains "$(cat "$T/D/reap.log")" "POST-PASS ps enumeration failed" "D23 the degradation is logged"
 assert_contains "$(cat "$T/D/reap.log")" "POST=?" "D23 POST is reported as unknown, not as a stale count"
+assert_contains "$(cat "$T/D/reap.log")" "RESIDUAL=?" "D23 RESIDUAL is degraded too (dry-run) — the doc's claim is code-true"
 
 rm -rf "$T/D"
 
