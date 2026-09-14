@@ -30,10 +30,47 @@ export default function (pi: ExtensionAPI) {
       // at runtime (s7) — without them a hop-leg dispatch would fail to
       // resolve the model. Cost/maxTokens sourced from the equivalent
       // openrouter.models[] rows in models-store.json (catalog authority, s7);
-      // contextWindow honors the global clamp (300K).
+      // contextWindow honors the global clamp (300K). (Exception: the V4.1 row
+      // below has NO entry in the shipped store — see its own comment for the
+      // provenance of its rates.)
+      //
+      // #727: the flash hop leg is `deepseek/deepseek-v4.1-flash` — the SAME
+      // generation the deepseek-official primary serves (the slug maps onto the
+      // flash family in familyOf), so a failover no longer silently changes the
+      // model generation. `reasoning` is CONFIGURABLE here, carrying the levels
+      // the deepseek primary can express (off/high/max — `off` is implicit
+      // there and explicit here because OpenRouter needs a concrete effort
+      // value); minimal/low/medium stay unmapped for hop parity: the upstream
+      // slug accepts them, the primary cannot express them, and a hop must not
+      // change the session's thinking level. `input` includes image because the
+      // slug accepts images (probed live 2026-09-14: an 8x8 red PNG → "Red") —
+      // the same declaration the venice `deepseek-v4-1-flash` entry carries for
+      // this model generation; the deepseek-official text-only row is the
+      // outlier. COST PROVENANCE: this slug has NO row in the shipped
+      // pi-bootstrap/pi-config/models-store.json, so the rates below come from
+      // the live OpenRouter catalog for the slug ($0.15/$0.60 per M, cache-read
+      // $0.003 per M, verified 2026-09-14) — the delta vs the legacy 0423 slug
+      // is recorded in docs/providers.md (#727 indicator c).
+      {
+        id: "deepseek/deepseek-v4.1-flash",
+        name: "DeepSeek V4.1 Flash (via OpenRouter)",
+        reasoning: true,
+        thinkingLevelMap: { off: "none", minimal: null, low: null, medium: null, high: "high", max: "max" },
+        input: ["text", "image"],
+        cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
+        contextWindow: 300000,
+        maxTokens: 384000
+      },
+      // Legacy-generation leg (upstream "DeepSeek V4 Flash 0423"), kept in the
+      // table as RESOLUTION-ONLY (`RESOLUTION_ONLY_LEGS` in provider-failover.ts
+      // — no longer a chain hop target and never served to a fresh advance). It
+      // stays REGISTERED and IN-TABLE because stale state is real: a pre-#727
+      // latch file / in-flight marker / session pinned to this slug must still
+      // resolve (a table miss would make nextLegAfter's startIdx -1 and
+      // re-return the DRAINING root leg).
       {
         id: "deepseek/deepseek-v4-flash",
-        name: "DeepSeek V4 Flash (via OpenRouter)",
+        name: "DeepSeek V4 Flash 0423 (via OpenRouter, legacy)",
         reasoning: false,
         input: ["text"],
         cost: { input: 0.0882, output: 0.1764, cacheRead: 0.01764, cacheWrite: 0 },

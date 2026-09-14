@@ -286,11 +286,28 @@ with automatic return after balance restore.
 - Marker-only latch trigger (fail-closed nonce auth on the child marker).
 - Alias-family hop chains: `deepseek-flash (canonical; legacy alias
   deepseek-v4-flash) → qwen-tp/deepseek-v4-flash-0731
-  → openrouter/deepseek/deepseek-v4-flash` (qwen-tp is env-blocked until its
+  → openrouter/deepseek/deepseek-v4.1-flash` (qwen-tp is env-blocked until its
   401 remediation; default chain while blocked: deepseek → openrouter). The
   family KEY stays the legacy `deepseek-v4-flash` (it is the durable latch-state
   key); `familyOf`/`legIdentity` normalize BOTH root spellings onto the chain,
   so an un-migrated legacy frontmatter/session keeps its hop protection.
+  #727: the openrouter hop leg is the **V4.1** slug, so a failover serves the
+  same generation as the primary instead of the April 0423 build. Cost delta on
+  the emergency leg: `deepseek/deepseek-v4.1-flash` $0.15/$0.60 per M
+  (cache-read $0.003) vs the 0423 slug's $0.0882/$0.1764 — 1.70x input, 3.40x
+  output, and cache-read is CHEAPER ($0.003 vs $0.01764) — accepted 2026-09-14
+  and recorded here per #727 indicator (c). The legacy
+  `deepseek/deepseek-v4-flash` entry stays in the table but is RESOLUTION-ONLY
+  (`RESOLUTION_ONLY_LEGS`): it is there so stale pre-#727 state (latch file /
+  in-flight marker / session pinned to the slug) still matches its own leg — an
+  absent table entry would make `nextLegAfter`'s startIdx -1 and re-return the
+  DRAINING root — while a fresh chain continuation is never served the older
+  build. The chain therefore HALTS after the V4.1 leg, exactly where it halted
+  before the V4.1 leg existed.
+  Thinking is CONFIGURABLE on the V4.1 leg (off/high/max — the levels the
+  deepseek primary can express); `minimal`/`low`/`medium` stay unmapped for hop
+  parity — the upstream slug accepts them, the primary cannot express them, and
+  a hop must not change the session's thinking level.
 - Env knobs: `PROVIDER_FAILOVER_DISABLE=1` (kill switch), `PI_FAILOVER_NO_HOP=1`
   (must-stay), `PROVIDER_EXHAUSTION_TTL_MS` (latch TTL, default 24h — the poller
   is the real clear authority; a stale latch self-heals in one TTL at the

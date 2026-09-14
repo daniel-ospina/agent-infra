@@ -252,9 +252,21 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
       // `deepseek-v4-flash` alias, both registered in models.json.
       { provider: "deepseek", model: "deepseek-flash" },
       { provider: "qwen-tp", model: "deepseek-v4-flash-0731" },
-      // #727: this openrouter slug (upstream "DeepSeek V4 Flash 0423") is
-      // older-generation vs the primary's V4.1 Flash — re-point/validate the
-      // leg generation there; the chain shape is deliberately unchanged here.
+      // #727: the openrouter hop leg serves the SAME generation as the primary
+      // (V4.1 Flash) — `deepseek/deepseek-v4.1-flash` is upstream
+      // "DeepSeek V4.1 Flash" ($0.15/$0.60 per M), where the previous slug
+      // `deepseek/deepseek-v4-flash` is upstream "DeepSeek V4 Flash 0423"
+      // ($0.0882/$0.1764 per M), i.e. a silent generation downgrade on failover.
+      { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
+      // Legacy-generation leg, kept LAST and RESOLUTION-ONLY (#727). It must
+      // stay in the table because nextLegAfter matches the CURRENT leg by table
+      // position: a leg absent from the table yields startIdx -1 and the walk
+      // then re-returns legs[0] — the DRAINING root. So this entry exists so
+      // stale pre-#727 state (latch file / in-flight marker / session pinned to
+      // the slug) still matches its own leg, while RESOLUTION_ONLY_LEGS keeps a
+      // FRESH continuation from being served it: pre-#727 the chain HALTED
+      // after the hop leg, and quietly re-introducing the 0423 generation as a
+      // live hop would be exactly the silent generation change #727 removes.
       { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
     ],
   },
@@ -277,7 +289,9 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
  *   2. per family (deterministic iteration order): the family's ROOT leg model
  *      (`fam.legs[0].model`, i.e. the canonical spelling) → that family key;
  *   3. the qwen-tp rename `deepseek-v4-flash-0731` → the flash family;
- *   4. openrouter/slash ids: last-slash slug match against the BASE slugs;
+ *   4. openrouter/slash ids: last-slash slug match against the BASE slugs
+ *      (deepseek-v4-flash, deepseek/deepseek-v4.1-flash — the #727 hop leg, and
+ *      deepseek-v4-pro);
  *   5. otherwise undefined.
  *
  * The dotted canonical `deepseek/deepseek-flash` is deliberately NOT matched:
@@ -305,6 +319,14 @@ export function familyOf(modelId: string | null | undefined, provider?: string |
   // the BASE slug names hop (never -vision-exp / -0813 variants — see above).
   if (provider === "openrouter" || id.includes("/")) {
     const slug = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+    // Both flash-family generations normalize onto the family: the #727 V4.1
+    // hop-leg slug and the legacy 0423 slug (stale state must still resolve).
+    // The V4.1 match requires the SLASH form: only `deepseek/deepseek-v4.1-flash`
+    // is an upstream OpenRouter id (the table leg), so the bare spelling stays
+    // family-less (pinned as a silent-substitution negative, review R4 P2). The
+    // legacy slug's bare form keeps its pre-existing leniency — grandfathering,
+    // NOT a pattern to extend.
+    if (slug === "deepseek-v4.1-flash" && id.includes("/")) return "deepseek-v4-flash";
     if (slug === "deepseek-v4-flash") return "deepseek-v4-flash";
     if (slug === "deepseek-v4-pro") return "deepseek-v4-pro";
   }
@@ -330,6 +352,25 @@ export function legIdentity(famKey: string, leg: LegRef): string {
 
 export function familyLegs(family: string): LegRef[] | undefined {
   return ALIAS_FAMILIES[family]?.legs;
+}
+
+/** Table legs kept for RESOLUTION ONLY — matchable by position (so stale state
+ * still finds its own leg) but NEVER the target of a fresh advance.
+ *
+ * Why the entry must exist anyway: `nextLegAfter` locates the current leg by
+ * table position, so a leg missing from the table gives startIdx -1 and the walk
+ * re-returns legs[0] — the DRAINING root leg (#715's regression).
+ *
+ * Why it must not be advanceable: that walk is how a chain continuation picks
+ * its next leg, and serving a resolution-only leg is an automatic generation
+ * downgrade. #727: the flash family's hop target is the V4.1 openrouter leg; the
+ * older "DeepSeek V4 Flash 0423" slug stays resolvable for stale pre-#727 state,
+ * but the chain reaches a structured HALT after the V4.1 leg — the same place it
+ * halted before that leg existed. */
+const RESOLUTION_ONLY_LEGS: ReadonlySet<string> = new Set(["openrouter/deepseek/deepseek-v4-flash"]);
+
+function isResolutionOnlyLeg(leg: LegRef): boolean {
+  return RESOLUTION_ONLY_LEGS.has(`${leg.provider}/${leg.model}`);
 }
 
 /** Is `provider` a member of the family's chain table (root + hop legs)?
@@ -978,7 +1019,7 @@ export function nextLegAfter(
   const skipped: LegRef[] = [];
   for (let i = startIdx + 1; i < legs.length; i++) {
     const leg = legs[i];
-    if (unavailable.has(leg.provider)) {
+    if (unavailable.has(leg.provider) || isResolutionOnlyLeg(leg)) {
       skipped.push(leg);
       continue;
     }

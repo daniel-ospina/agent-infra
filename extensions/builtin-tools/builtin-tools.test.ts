@@ -2829,7 +2829,7 @@ const FLASH_ROOT: LegRef = { provider: "deepseek", model: "deepseek-flash" };
 // unchanged) and the migration-window input spelling. legIdentity() normalizes
 // it onto FLASH_ROOT, so both spellings must resolve identically.
 const FLASH_ROOT_LEGACY: LegRef = { provider: "deepseek", model: "deepseek-v4-flash" };
-const OPENROUTER_FLASH: LegRef = { provider: "openrouter", model: "deepseek/deepseek-v4-flash" };
+const OPENROUTER_FLASH: LegRef = { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" }; // #727
 const QWENTP_FLASH: LegRef = { provider: "qwen-tp", model: "deepseek-v4-flash-0731" };
 
 section("#715 default surfaces — the task-tool in-code default is pinned");
