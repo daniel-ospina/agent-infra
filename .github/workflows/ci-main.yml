@@ -246,6 +246,11 @@ jobs:
           # dry-run default. Hermetic (fake PS shim + throwaway root/log).
           bash scripts/pi-task-session-prune.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
+          # #930 — safe-admin-merge rail: the ONE failing-set parser
+          # (scripts/ci-failure-set.sh) plus the chokepoint that consumes it
+          # (scripts/admin-merge.sh). Post-merge re-check of the same hermetic
+          # suite ci.yml runs per-PR.
+          bash tests/admin-merge/run.sh || errors=$((errors+1))
           # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
           # farm-link preservation, extensions/ content parity = #447 ship-list drift
           # tripwire, #446 launchctl isolation). Real setup.sh, hermetic (~2min).

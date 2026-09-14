@@ -1,0 +1,207 @@
+name: Admin-merge detector
+# Post-merge DETECTOR for the #930 safe-admin-merge rail.
+#
+# DETECTION ONLY — this workflow NEVER gates prevention. Its whole reason to
+# exist is the loop the pre-merge chokepoint cannot close: a human clicking
+# "admin merge" in the GitHub UI. `--admin` bypasses required checks by design,
+# so this cannot be a server-side required check; the only honest answer is to
+# notice afterwards and file.
+#
+# "NEVER BLOCKS" IS ABOUT DETECTION OUTCOMES, NOT ABOUT RUNNABILITY.
+#   - ran, found nothing            → exit 0
+#   - ran, filed an issue           → exit 0
+#   - CANNOT RUN (dependency absent, or the failing set could not be read)
+#                                   → exit 1, loudly
+# A detector that exits 0 when it could not run is a SILENT NO-OP — the one
+# outcome worse than a red X, because it reads as "nothing found". That is a
+# review finding on this file (#930): a consumer without scripts/ got a step
+# that warned and exited 0 for every merge, for ever. A red run on a post-merge
+# workflow gates nothing (this file is not a required check and no merge waits
+# on it) — it just tells the truth.
+#
+# What it does, after "CI on main" completes for a push to main:
+#   1. the merged commit's failing set      → ci-failure-set.sh --commit <sha> --workflow <lane>
+#   2. main's PRIOR failing set (union)     → ci-failure-set.sh --main-union N --exclude <sha> --workflow <lane>
+#   3. the shared comparison                → ci-failure-set.sh --diff
+#
+# WHERE THE SCRIPTS COME FROM (#972). They are NOT expected in this checkout.
+# `agent-infra init` installs a consumer's `scripts/` as a MACHINE-LOCAL symlink
+# (manifest.json `"kind": "symlink"`, fs.symlinkSync) — it resolves on a laptop
+# and DANGLES on a runner, so a detector that reached for `scripts/` would work
+# exactly where it is developed and never where it is deployed. Same failure
+# class as #555 (symlinked workflows read as their link-target string). The
+# helper is therefore checked out from agent-infra at a PINNED REF into
+# `.agent-infra/`, alongside the consumer's own checkout. One source, one
+# version, nothing local to drift or be missing — and no duplicate parser, which
+# matters because the comparison must stay a single implementation.
+#
+# THE LANE (WORKFLOW below) must name the TEST workflow. `gh run list --branch
+# main` returns whatever ran most, not the test lane — measured on tortoise main
+# 2026-09-13, of the last 30 runs 11 were `availability-watchdog` and only 2
+# were the test lane. An unfiltered window of 10 can contain ZERO test runs, so
+# the baseline extracts EMPTY while main is red. That is the bogus zero: the
+# pre-merge rail false-blocks on it, and this detector would file a FALSE issue
+# for it (a detector that cries wolf gets disabled). Set WORKFLOW to the test
+# lane of the repo this file is materialized into.
+#   4. unique non-empty → file an issue. The job's OWN result is honest: exit 1 if the
+#      issue could not be filed (a detected-but-unreported merge must not read as a
+#      passing run). Detection OUTCOMES exit 0 — nothing `needs:` this job and it is
+#      not a required check, so it never gates the merge path.
+#
+# `templates/.github/workflows/admin-merge-detector.yml` is the source of truth
+# and `scripts/sync-ci-workflows.sh` materializes `.github/workflows/` — so
+# consumer repos get this detector by running that script (GitHub Actions cannot
+# parse a symlinked workflow, #555).
+
+on:
+  workflow_run:
+    workflows: ["CI on main"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit to inspect (default: the triggering run's head)"
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # The rail's scripts, from a PINNED agent-infra ref (#972) — never from
+      # this checkout, whose `scripts/` is a machine-local symlink that does not
+      # resolve on a runner. See WHERE THE SCRIPTS COME FROM above.
+      #
+      # Repo-configurable via the `ADMIN_MERGE_DETECTOR_REF` repository VARIABLE
+      # so a repo can pin exactly what its detector runs against; `main` is the
+      # default because a materialized detector is a COPY of the file at `main`,
+      # so its helper should come from the same place.
+      - uses: actions/checkout@v4
+        with:
+          repository: daniel-ospina/agent-infra
+          ref: ${{ vars.ADMIN_MERGE_DETECTOR_REF || 'main' }}
+          path: .agent-infra
+
+      - name: Compare the merged commit's failing set against main's prior set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_RUNS: "10"
+          # The TEST workflow both sides are read from — see THE LANE above. A
+          # lane with no runs on main makes every comparison vacuous.
+          #
+          # Repo-configurable via the `ADMIN_MERGE_DETECTOR_WORKFLOW` repository
+          # VARIABLE, so a repo whose test lane is not `python-ci.yml` can point at
+          # its own lane WITHOUT editing this file — which would break the
+          # template/materialized byte-parity that pipeline-compliance enforces.
+          # (agent-infra sets it to `ci-main.yml`: `python-ci.yml` here is a
+          # `workflow_call`-only reusable whose runs are attributed to the caller,
+          # so the guard would exit 1 on every run — permanently red, detecting
+          # nothing.)
+          WORKFLOW: ${{ vars.ADMIN_MERGE_DETECTOR_WORKFLOW || 'python-ci.yml' }}
+          MERGE_SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha }}
+        run: |
+          set -uo pipefail
+          # See "NEVER BLOCKS IS ABOUT DETECTION OUTCOMES" above: every path that
+          # means "could not run" exits 1 so it cannot masquerade as "found
+          # nothing". No merge waits on this workflow.
+          if [ ! -f .agent-infra/scripts/ci-failure-set.sh ]; then
+            echo "::error::admin-merge detector CANNOT RUN — .agent-infra/scripts/ci-failure-set.sh is missing, so this detector can inspect NO merge to main."
+            echo "  Failing LOUDLY rather than passing quietly: 'cannot run' must not read as 'found nothing'."
+            echo "  Fix: the pinned agent-infra checkout did not provide the rail's scripts. Check the ADMIN_MERGE_DETECTOR_REF repository variable (#972)."
+            exit 1
+          fi
+          if [ -z "${MERGE_SHA:-}" ]; then
+            echo "no merge sha in the event context — nothing to inspect"
+            exit 0
+          fi
+          echo "inspecting merge commit $MERGE_SHA (lane: $WORKFLOW; main baseline: union of last $MAIN_RUNS runs)"
+
+          # An EXTRACTION FAILURE (parser exit 1) means "cannot certify", never
+          # "nothing is unique". Loud, and non-zero: a silent pass here would
+          # report a clean loop for a comparison that never happened.
+          if ! bash .agent-infra/scripts/ci-failure-set.sh --commit "$MERGE_SHA" --workflow "$WORKFLOW" \
+                --runs-report merged-report.txt > merged-fails.txt 2>extract-err.txt; then
+            echo "::error::admin-merge detector: could not extract the merged commit's failing set — cannot certify this merge"
+            sed 's/^/  /' extract-err.txt
+            exit 1
+          fi
+          if ! bash .agent-infra/scripts/ci-failure-set.sh --main-union "$MAIN_RUNS" --exclude "$MERGE_SHA" --workflow "$WORKFLOW" \
+                --provenance main-runs.txt --runs-report main-report.txt > main-fails.txt 2>>extract-err.txt; then
+            echo "::error::admin-merge detector: could not extract main's prior failing set — cannot certify this merge"
+            sed 's/^/  /' extract-err.txt
+            exit 1
+          fi
+
+          # `--diff` can also fail; an unchecked failure leaves an EMPTY file,
+          # which reads as "no unique failures" and reports a clean loop.
+          if ! bash .agent-infra/scripts/ci-failure-set.sh --diff merged-fails.txt main-fails.txt > unique.txt 2>>extract-err.txt; then
+            echo "::error::admin-merge detector: the shared comparison failed — cannot certify this merge"
+            sed 's/^/  /' extract-err.txt
+            exit 1
+          fi
+          # VACUITY GUARD (fresh review P1-3). An EMPTY failing set is only
+          # meaningful if the lane actually RAN. A lane that produced no run at all
+          # — a wrong workflow name, a `workflow_call`-only reusable whose runs are
+          # attributed to its caller, a pipeline that never triggered — yields
+          # unique_count=0 and would report "no unique failures" for a comparison
+          # that never happened: the "cannot run reads as found nothing" hole this
+          # file's own header forbids. `tested` counts success|failure|timed_out.
+          #
+          # The condition lives in .agent-infra/scripts/check-lane-tested.sh so the
+          # test suite drives the SHIPPED code with fixtures — a guard asserted
+          # only by grepping for its own text can be neutered (`||` → `&&`) with
+          # the suite still green (cycle-2 review P2).
+          if ! bash .agent-infra/scripts/check-lane-tested.sh merged-report.txt "$WORKFLOW" "$MERGE_SHA"; then
+            exit 1
+          fi
+          unique_count="$(wc -l < unique.txt | tr -d ' ')"
+          echo "merged commit failing: $(wc -l < merged-fails.txt | tr -d ' ') | main prior failing: $(wc -l < main-fails.txt | tr -d ' ') | unique to this merge: $unique_count"
+
+          if [ "$unique_count" -eq 0 ]; then
+            echo "✅ no unique failures carried by this merge"
+            exit 0
+          fi
+
+          {
+            echo "The merge at \`$MERGE_SHA\` landed tests that were **not** in main's prior failing set."
+            echo ""
+            echo "This is the rail's post-merge detector (#930) — detection only, it does not block."
+            echo "It exists because an \`--admin\` merge bypasses required checks, so the only"
+            echo "honest answer for that path is to notice afterwards."
+            echo ""
+            echo "Unique failures ($unique_count):"
+            echo ""
+            echo '```'
+            cat unique.txt
+            echo '```'
+            echo ""
+            echo "Main baseline (union of the last $MAIN_RUNS main runs, excluding this commit):"
+            echo ""
+            echo '```'
+            cat main-runs.txt
+            echo '```'
+            echo ""
+            echo "Next time use \`scripts/admin-merge.sh <PR>\` — it refuses this merge before it lands."
+          } > issue-body.md
+
+          # A DETECTED-but-unreported merge must not read as a passing run. The
+          # warning-then-exit-0 shape is the same "cannot report looks like
+          # nothing to report" hole this job exists to close (a repo without the
+          # `bug` label would silently never report). Exit non-zero: this job is
+          # `workflow_run`-triggered and nothing `needs:` it, so it gates nothing —
+          # but its OWN result must be honest.
+          if ! gh issue create \
+            --title "admin-merge carried unique failures (${MERGE_SHA:0:7})" \
+            --label bug \
+            --body-file issue-body.md; then
+            echo "::error::detected $unique_count unique failure(s) at $MERGE_SHA but could not file the issue — this merge is UNREPORTED"
+            exit 1
+          fi
+          exit 0
