@@ -265,7 +265,7 @@ VERIFIER <n>: [P0: ..., P1: ..., P2: ...]   # one block per verifier dispatched 
 - If controller only ignored → still re-dispatch (verifiers must stop flagging it, or escalate)
 - If no P0/P1 found at all → gate passes
 
-**Half-budget research rule.** Once this gate has run 2 re-verify cycles without clearing P0/P1, each surviving issue must be researched before the next fix — external sources where the issue is not purely internal — and the cycle log records the source used. These gates carry no cycle cap of their own; 2 is the operational trigger here.
+**Half-budget research rule.** Once this gate has run 2 re-verify cycles without clearing P0/P1, each surviving issue must be researched before the next fix — external sources where the issue is not purely internal — and the cycle log records the source used. These gates carry no cycle cap of their own: the 2 is half the 3-cycle stuckness escalation below, rounded up, used here as the research trigger.
 
 **Step 4 — Handle P2/P3/P4:**
 - Controller incorporates reasonable P2+ findings
@@ -616,7 +616,7 @@ Output:
 - Affected but unmentioned: ...
 ```
 
-#### Agent B (Standard + Complex only):
+#### Agent B (Complex only):
 
 ```
 You are the Devil's Advocate for problem definition. Challenge the issue's problem statement.
@@ -679,7 +679,7 @@ Output:
 ### Confidence (0-100)
 ```
 
-#### Agent B (Standard + Complex only):
+#### Agent B (Complex only):
 
 Independently evaluate the same framings. Same output format.
 

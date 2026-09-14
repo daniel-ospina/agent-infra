@@ -20,7 +20,7 @@ Rigid rules ("always run 4 reviewers", "always typecheck", "always use a worktre
 
 **Proportional gates** replace mechanical rules with a single principle: **match verification depth to change risk and novelty.** An agent uses judgment to decide what gates to run. A reviewer validates those decisions.
 
-This skill is the canonical reference. Consuming skills cite the tables below by name; they never copy the numeric cells.
+This skill is the canonical reference. Consuming skills cite `proportional-gates` §Review Cycles by name and never copy its cells; the domain tables (workspace isolation, pre-flight verification, dependency verification, research depth) may be inlined — see §Consuming These Tables.
 
 ---
 
