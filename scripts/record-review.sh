@@ -41,11 +41,18 @@ set -euo pipefail
 # first-ref-only, while the tier guard needs ANY-ref semantics (a PR closing
 # two same-repo issues of different tiers has no single tier identity).
 # Keyword class: fix(es|ed)?|close(s|d)?|resolve(s|d)? directly followed by
-# the reference (so "resolves SLACK_APPROVAL_FILE" is not an issue ref).
+# the reference (so "resolves SLACK_APPROVAL_FILE" is not an issue ref), and
+# sitting in a REFERENCE CONTEXT (REFCTX): the keyword begins a line, optionally
+# after a Markdown bullet or emphasis/bold/backtick marker. A mid-sentence
+# mention is NOT a reference (#1012) — position is the contract, matching
+# check-pipeline-compliance.sh::parse_issue_ref, which composes the SAME two
+# constants. Both are byte-identical across the two scripts.
 # Top-level + guarded main below: this function is source-reachable by tests.
+REFCTX='^[[:space:]]*([-*][[:space:]]+)?[*_`]{0,3}[[:space:]]*'
+CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
 closing_issue_refs() {
   local text="$1" kw
-  kw='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
+  kw="${REFCTX}${CLOSING_KW}"
   # a. full URLs.
   while IFS= read -r m; do
     [ -z "$m" ] && continue

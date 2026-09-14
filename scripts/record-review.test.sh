@@ -34,7 +34,10 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 # Stubbed gh: answers the stale-sha head query + PR-body read/PATCH + the
 # #513 clean-micro tier guard's body/labels queries.
 #   head    (--jq .head.sha)      → ${STUB_HEAD_SHA:-40×a}
-#   body    (--jq .body)          → {"body": "${STUB_BODY:-PR body}"}  (PR body text)
+#   body    (--jq .body)          → raw ${STUB_BODY:-PR body}. `gh --jq .body`
+#                                   prints the body TEXT, not the JSON envelope;
+#                                   the old envelope form only "worked" while the
+#                                   closing parser was unanchored (#1012).
 #   labels  (--jq '.[].name')     → ${STUB_LABELS:-} lines, or the per-issue
 #                                   file ${STUB_LABELS_DIR}/<issue-num> when it
 #                                   exists; exit 1 when STUB_LABELS_FAIL=1
@@ -58,7 +61,7 @@ if [ "$1" = "api" ]; then
         echo; exit 0
     fi
     if grep -qF -- "--jq .body" <<<"$*"; then
-        printf '{"body": "%s"}' "${STUB_BODY:-PR body}"
+        printf '%s' "${STUB_BODY:-PR body}"
         exit 0
     fi
     if grep -qF -- "--jq .[].name" <<<"$*"; then
@@ -255,9 +258,9 @@ printf 'complexity:micro\n' > "$T/labels/424313"
 # even when these pins fail (the only failure gate is top-level FAIL=0).
 export STUB_LABELS_DIR="$T/labels"
 export STUB_LABELS=""   # per-issue map takes precedence in the stub
-STUB_BODY="Fixes #424310 and also closes #424311" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424309 "$SHA"
+STUB_BODY=$'Fixes #424310\nCloses #424311' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424309 "$SHA"
 [ "$RECORD_RC" = "4" ] && ok "multi-ref: any same-repo non-micro ref refuses (rc 4)" || bad "multi-ref: any non-micro refuses (rc=$RECORD_RC, err=$RECORD_ERR)"
-STUB_BODY="Fixes #424312 and Closes #424313" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424314 "$SHA"
+STUB_BODY=$'Fixes #424312\nCloses #424313' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424314 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "multi-ref: all-micro refs allow (rc 0)" || bad "multi-ref: all-micro allows (rc=$RECORD_RC, err=$RECORD_ERR)"
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
@@ -291,15 +294,20 @@ fi
 # 8.11 parser-parity corpus (check-pipeline-compliance parse_issue_ref semantics).
 OUT="$(refs_for "daniel-ospina/agent-infra" "Fixes #42")"
 assert_contains "$OUT" "daniel-ospina/agent-infra#42" "parser: bare #N resolves against REPO"
-OUT="$(refs_for "daniel-ospina/agent-infra" "Closes daniel-ospina/tortoise#7 and Resolves #9")"
+OUT="$(refs_for "daniel-ospina/agent-infra" $'Closes daniel-ospina/tortoise#7\nResolves #9')"
 assert_contains "$OUT" "daniel-ospina/tortoise#7" "parser: owner/repo#N carries its own repo"
-assert_contains "$OUT" "daniel-ospina/agent-infra#9" "parser: bare #N next to owner/repo#N still resolves"
+assert_contains "$OUT" "daniel-ospina/agent-infra#9" "parser: bare #N on its own line still resolves"
 OUT="$(refs_for "daniel-ospina/agent-infra" "Fixes https://github.com/other/orgrepo/issues/12")"
 assert_contains "$OUT" "other/orgrepo#12" "parser: full URL form"
 OUT="$(refs_for "daniel-ospina/agent-infra" "Fixes https://github.com/other/orgrepo/pull/12")"
 [ -z "$OUT" ] && ok "parser: pull-URL excluded" || bad "parser: pull-URL excluded (got: $OUT)"
+# #1012 — the closing match is POSITIONAL, so a mid-sentence mention must NOT
+# resolve (this vector used to assert the opposite; it is what let PR #968
+# satisfy the compliance gate). A bullet reference context still resolves.
 OUT="$(refs_for "daniel-ospina/agent-infra" "This fixes #42 in passing")"
-assert_contains "$OUT" "#42" "parser: narrative prose-verb class matches (parse_issue_ref parity)"
+[ -z "$OUT" ] && ok "parser: mid-sentence mention does not resolve (positional, #1012)" || bad "parser: mid-sentence mention must not resolve (got: $OUT)"
+OUT="$(refs_for "daniel-ospina/agent-infra" "- Fixes #42")"
+assert_contains "$OUT" "#42" "parser: bullet reference context resolves (parse_issue_ref parity)"
 
 # 8.12 repo-less clean-micro → arm (c) fail-open (no repo to tier-bind).
 run_record_verdict clean-micro "" 424316
