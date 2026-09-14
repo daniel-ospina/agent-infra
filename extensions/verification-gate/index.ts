@@ -8,6 +8,20 @@ import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
 import { isPrintMode, argvAllowsTask } from "../shared/print-mode.js";
+// #966: the command parsers are ONE copy shared with review-enforcer, in
+// extensions/shared/ — the two extensions carried private copies that silently
+// drifted (and asserted opposite answers for the same input). Kept in shared/
+// rather than inline because pi's loader treats every .ts in an extension DIR
+// as an extension and fails on a pure-helper module (#5611). The module header
+// records the last-wins resolution and the per-helper provenance; the drift-pin
+// in index.test.ts keeps the copies from ever coming back.
+import {
+  GH_PR_MERGE_VERB,
+  extractCdPath,
+  extractGhRepoEnv,
+  extractPrNumber,
+  extractRepoFlag,
+} from "../shared/git-command-parse.js";
 // #755 merge-scope subtraction. VALUE import of a nested sibling module — safe:
 // pi's extension loader only auto-loads a directory's index.ts/index.js or its
 // package.json#pi.extensions, so subtract-scope.ts is never registered as an
@@ -21,6 +35,9 @@ import {
   type SubBundle,
   type SubAudit,
 } from "./subtract-scope.js";
+// Re-exported for the module's public surface (tests and any external consumer
+// import them from ./index.js) — the DEFINITION lives only in shared/.
+export { extractCdPath, extractGhRepoEnv, extractPrNumber, extractRepoFlag };
 // ponytail: inlined from verification-gate-utils.ts — pi's extension loader treats every .ts in
 // ~/.pi/agent/extensions/ as an extension and fails on a pure-helper module (no factory export).
 // Do NOT re-extract to a sibling .ts; the directory+entry pattern (see main-worktree-guard) is the
@@ -526,10 +543,9 @@ function recoverBridgeForRoot(normRoot: string): number {
 // push recognizers treat a FOREIGN head push as scaffolding (a different
 // checkout's push is not this scope's op — today's adjacency regexes
 // classified it the same way).
-// #204 review P2-1: gh's merge verb with the optional global -R/--repo flag
-// between `gh` and `pr` — `gh -R owner/name pr merge 123` is a valid spelling
-// and must route into the merge-scope path like the post-verb flag form.
-const GH_PR_MERGE_VERB = /(?:^|\s)gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+merge(?=\s|$)/;
+// #204 review P2-1: gh's merge verb grammar now lives in shared/
+// (GH_PR_MERGE_VERB, imported above) because extractPrNumber depends on it and
+// both #966 consumers need the same spelling set.
 
 export interface GitVerbInvocation {
   /** byte offset of the candidate `git` word in the scanned text */
@@ -752,31 +768,6 @@ export function isShapeExemptFile(repoRelativePath: string): boolean {
   return true;
 }
 
-// ponytail: parse cd prefixes in bash commands so git ops in worktrees
-// resolve to the correct repo root. pi's bash tool keeps process.cwd()
-// unchanged even when the shell script starts with "cd /worktree &&".
-// #204 review P2-2: the cd must sit at a REAL command boundary (start, or
-// after &&/;/||/| — and a bare newline, which bash treats as a separator)
-// — a `cd /tmp &&` sequence inside quoted prose (e.g. `--comment "see cd
-// /tmp && x"`) must not poison the resolved cwd (a poisoned cwd fed the
-// merge-scope repo/head comparison → false skip).
-export function extractCdPath(command: string): string | null {
-  // Quote-aware: mask quoted regions so a `cd /tmp &&` inside --comment/
-  // --body prose can never anchor the separator scan (review #230 P2-3:
-  // `gh pr merge 1 --comment "see; cd /tmp && x"` poisoned the cwd). A quoted
-  // region that directly follows `cd ` is the cd ARGUMENT — preserved so
-  // `cd "/path with spaces" && git …` still extracts.
-  const masked = command.replace(
-    /(["'])(?:\\.|(?!\1)[\s\S])*\1/g,
-    (q: string, _quote: string, offset: number) => {
-      const before = command.slice(Math.max(0, offset - 4), offset);
-      return /cd\s+$/.test(before) ? q : " ".repeat(q.length);
-    },
-  );
-  const m = masked.match(/(?:^|&&\s*|;\s*|\|\|\s*|\|\s*|\n\s*)\s*cd\s+(['"]?)([^;&|]+?)\1\s*(?:&&|;)/);
-  return m ? resolve(m[2]) : null;
-}
-
 // ── Merge scope resolution (#204) ─────────────────────
 // `gh pr merge` merges REMOTELY — the local checkout's `git diff
 // origin/main...HEAD` is only meaningful when (a) the cwd repo IS the PR's
@@ -796,12 +787,9 @@ export function extractCdPath(command: string): string | null {
 // same-repo path. The head check (`gh pr view <n> --json headRefOid`) is the
 // only network call and only fires on the same-repo path.
 //
-// ponytail: extractRepoFlag/extractGhRepoEnv/extractPrNumber are local copies
-// of review-enforcer's helpers (extensions/review-enforcer/index.ts). A
-// cross-extension import would couple the two extensions' independent load
-// graphs — pi's loader compiles each extension as its own module (#5611) — and
-// the regexes are tiny (rule of two: promote to extensions/shared/ when a
-// third consumer appears). Keep them in sync with the review-enforcer source.
+// #966: extractRepoFlag/extractGhRepoEnv/extractPrNumber used to be local copies
+// of review-enforcer's helpers, kept in sync by comment only — and they drifted.
+// They now live in extensions/shared/git-command-parse.ts and are imported above.
 
 // #204 review P2-2: verb-anchored merge detection. GH_PR_PATTERN is a
 // substring scan, so `gh pr create --body "run gh pr merge 42"` would match
@@ -843,49 +831,6 @@ export function mergeCommandWindow(command: string): string {
   const tailSep = tail.search(sepRe);
   const tailEnd = tailSep === -1 ? tail.length : tailSep;
   return command.slice(segStart, verbEnd + tailEnd).replace(/"[^"]*"/g, " ").replace(/'[^']*'/g, " ");
-}
-
-// Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag.
-/** Normalize a raw repo capture to exactly OWNER/REPO: strip a leading
- * [HOST/] segment (gh accepts GH_REPO=[HOST/]OWNER/REPO; --repo is
- * OWNER/REPO only). A value with >2 segments after host-stripping, or an
- * empty/garbage identity, yields null — fail-closed (review #230 P2-2: the
- * unanchored capture turned "github.com/owner/repo" into the garbage
- * identity "github.com/owner" and flipped same-repo merges into wrong
- * cross-repo skips). */
-function normalizeRepoCapture(raw: string): string | null {
-  const parts = raw.split("/").filter(Boolean);
-  if (parts.length === 2) return parts.join("/");
-  if (parts.length === 3) return `${parts[1]}/${parts[2]}`; // host/owner/repo
-  return null; // 4+ segments — garbage identity, fail-closed
-}
-
-export function extractRepoFlag(command: string): string | null {
-  // 2-3 segments: a HOST/ prefix must reach normalizeRepoCapture (the old
-  // two-segment capture turned "github.com/owner/repo" into "github.com/owner").
-  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
-  return m ? normalizeRepoCapture(m[1]) : null;
-}
-
-// Priority 2: GH_REPO=owner/name env assignment prefix in the command.
-export function extractGhRepoEnv(command: string): string | null {
-  const m = command.match(/(?:^|\s)GH_REPO=([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
-  return m ? normalizeRepoCapture(m[1]) : null;
-}
-
-// Extract the PR number from `gh pr merge <n>` (merge branch only). The number
-// may sit before or after flags (`gh pr merge 123 --squash` and
-// `gh pr merge --squash 123` are both valid gh spellings), so scan the token
-// stream after the merge verb for the first pure-integer token — flag values
-// (owner/name repos, quoted bodies) never tokenize as a bare integer.
-export function extractPrNumber(command: string): number | null {
-  const m = command.match(GH_PR_MERGE_VERB);
-  if (!m) return null;
-  const rest = command.slice((m.index ?? 0) + m[0].length);
-  for (const token of rest.split(/\s+/)) {
-    if (/^\d+$/.test(token)) return parseInt(token, 10);
-  }
-  return null;
 }
 
 // Parse owner/name from a git remote URL: GitHub SSH (git@github.com:o/n.git),
@@ -1056,6 +1001,14 @@ export function resolveMergeScope(command: string, cwd: string): MergeScopeDecis
   if (isCrossRepo(cwdRepo, explicitRepo)) {
     return { verify: false, reason: "cross_repo" };
   }
+  // `pr === null` is the CONSERVATIVE arm, and since the #966 merge it covers
+  // the flags-before-positional spellings too (`gh pr merge --squash 123`): the
+  // shared extractPrNumber reads the digits AT the unquoted verb, because a
+  // token scan could take a flag VALUE for the positional (`gh pr merge --body
+  // 999 42` → 999 while gh merges 42) and resolve the WRONG PR's head. With no
+  // number the head is unknown, and `evaluateMergeScope` maps that to
+  // `same_repo_head_unknown` → verify: true — a skip (`head_mismatch`) is only
+  // ever taken on a head this actually resolved, so the decline is fail-closed.
   const pr = extractPrNumber(window);
   const localHead = localHeadSha(cwd);
   const prHead = pr !== null ? getPrHeadSha(pr, cwd, explicitRepo) : null;
