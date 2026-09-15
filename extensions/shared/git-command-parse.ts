@@ -37,7 +37,11 @@
  *    subshell cds instead of fabricating a path. On promotion, THREE further
  *    #960 fixes were folded in: bash line continuations (`\` + newline) are
  *    stripped before the segment scan (`cd /wt \` ⏎ `&& op` → /wt, not the
- *    fabricated `/wt \`); `cd -- <path>` resolves its operand; and a target
+ *    fabricated `/wt \`) — a `\` + CRLF is stripped as well, which is MODULE
+ *    LENIENCY, not bash semantics (bash escapes the CR and leaves the LF a
+ *    real newline, so an op after it is a syntax error and nothing runs; the
+ *    divergence only ever attests a root for a command that failed, and is
+ *    pinned as leniency in the suite); `cd -- <path>` resolves its operand; and a target
  *    the parser cannot model (`&`, `-`, `(`/`)`, `<`/`>`, a backslash escape)
  *    is reported unattributable rather than fabricated — the last closes a
  *    fail-open for `cd X & op`, where bash runs the op in the ORIGINAL cwd.
@@ -389,6 +393,22 @@ function parseCdOperand(raw: string):
  * inside a double-quoted argument (`-m "don't"`), which is why both quote kinds
  * are tracked here.
  */
+/**
+ * True when the character at `idx` is escaped by an ODD number of preceding
+ * backslashes (`\#` is literal, `\\#` starts a comment).
+ *
+ * A quote state is not enough to find word boundaries: bash counts a
+ * backslash-escaped character as part of the WORD, so `echo x\ #y` is one word
+ * and the `#` inside it starts no comment. An escape-unaware predicate read it
+ * as a comment start and reported a WRONG, fully-attested root (code-review P1
+ * on #987) — the exact fail-open class #960 exists to refuse.
+ */
+function isEscapedAt(s: string, idx: number): boolean {
+  let n = 0;
+  for (let k = idx - 1; k >= 0 && s[k] === "\\"; k--) n++;
+  return n % 2 === 1;
+}
+
 function stripLineContinuations(command: string): string {
   let out = "";
   let quote: "'" | '"' | null = null;
@@ -408,11 +428,11 @@ function stripLineContinuations(command: string): string {
     if (c === "\\") {
       const j = command[i + 1] === "\r" && command[i + 2] === "\n" ? i + 2 : i + 1;
       if (command[j] === "\n") { i = j; continue; } // `\` ⏎ → both removed
-      // An escape inside double quotes stays in the text (it may protect a
-      // `"` we would otherwise read as the closing quote); outside quotes the
-      // next character is examined normally, so `\#` never opens a comment.
+      // The escape and the character it protects are emitted together and the
+      // protected character is stepped over, so it can never open a quote or a
+      // comment — `\"` inside double quotes, `\#` outside them.
       out += c;
-      if (quote === '"' && i + 1 < command.length) { out += command[i + 1]; i++; }
+      if (i + 1 < command.length) { out += command[i + 1]; i++; }
       continue;
     }
     if (quote === '"') {
@@ -421,7 +441,11 @@ function stripLineContinuations(command: string): string {
       continue;
     }
     if (c === "'" || c === '"') { quote = c; out += c; continue; }
-    if (c === "#" && (i === 0 || /[\s;&|(\n]/.test(command[i - 1]))) {
+    // A `#` opens an inline comment only at an UNESCAPED word boundary: `\#`
+    // is a literal `#`, and an escaped separator (`echo x\ #y`) does not end
+    // the word, so that `#` is inside a word rather than starting a comment.
+    if (c === "#" && !isEscapedAt(command, i) &&
+        (i === 0 || (!isEscapedAt(command, i - 1) && /[\s;&|(\n]/.test(command[i - 1])))) {
       inComment = true;
       out += c;
       continue;
@@ -455,8 +479,20 @@ export function parseCdChains(command: string): CdChainInfo {
       else if (c === q) q = null;
       continue;
     }
+    if (c === "\\") {
+      // Outside quotes a backslash protects the NEXT character: `\'` must not
+      // open a single-quoted span, which silently swallowed the rest of the
+      // command (`echo it\'s && cd /b && op` → "no cd at all", the state both
+      // callers read as "use the session root"). `unquotedMask` in this file
+      // already consumes it — two disagreeing escape models was the defect.
+      cur += c;
+      if (i + 1 < command.length) { cur += command[i + 1]; i++; }
+      continue;
+    }
     if (c === '"' || c === "'") { q = c; cur += c; continue; }
-    if (c === "#" && (i === 0 || /[\s;&|(\n]/.test(command[i - 1]))) {
+    // Comment start needs an unescaped word boundary — see isEscapedAt.
+    if (c === "#" && !isEscapedAt(command, i) &&
+        (i === 0 || (!isEscapedAt(command, i - 1) && /[\s;&|(\n]/.test(command[i - 1])))) {
       // bash inline comment: the rest of the LINE is not command text, so a
       // `# note` after a path is not part of the target (`cd /a # c` cds /a).
       while (i < command.length && command[i] !== "\n") i++;

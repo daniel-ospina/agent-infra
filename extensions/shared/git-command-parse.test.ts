@@ -1033,6 +1033,40 @@ test("a cd opened by a backtick is unattributable, not 'no cd at all'", () => {
   const info = parseCdChains("`cd /a && git commit`");
   equal(info.last, null);
   equal(info.unattributable, true);
+  // The cost of counting the opener, measured and accepted: a CLOSED
+  // substitution followed by a resolvable cd is declined too, though bash runs
+  // the op in /b — the segment scan never learns where the op sits. This is the
+  // SAME conservative class the `$(…)` spelling has always had (last line), and
+  // it is FAIL-CLOSED: no root is attested, review-enforcer asks for an absolute
+  // cd, verification-gate substitutes its session root exactly as it did before.
+  // `{"/b", false}` would instead attest a root for an op that may be inside
+  // the substitution — the fail-open this pin exists to prevent.
+  equal(parseCdChains("`cd /a` && cd /b && git commit").unattributable, true);
+  equal(parseCdChains("$(cd /a) && cd /b && git commit").unattributable, true);
+});
+
+test("an ESCAPED separator does not start an inline comment (fail-open fix)", () => {
+  // bash: `echo x\ #y` is ONE word — the `#` is inside it, not a comment start.
+  // An escape-unaware predicate read the `#` as a comment, dropped the rest of
+  // the line, and reported a WRONG root ATTRIBUTABLY (the #960 class).
+  equal(parseCdChains("cd /a && echo x\\ #y && cd /b && git commit").last, resolvePath("/b"));
+  // With a line continuation the joined `cd /b` is an ARGUMENT to echo, so bash
+  // runs the op in /a: the module must NOT attest /b — it declines instead.
+  const cont = parseCdChains("cd /a && echo x\\ #y \\\ncd /b; git commit");
+  equal(cont.last, null);
+  equal(cont.unattributable, true);
+  // Controls: `\#` is a literal `#`, and a real comment still ends its line.
+  equal(parseCdChains("cd /a && echo \\#note && cd /b && git commit").last, resolvePath("/b"));
+  equal(parseCdChains("cd /a && true # note \\\ncd /b && git commit").last, resolvePath("/b"));
+});
+
+test("an escaped quote cannot desync the scanner (outside-quote escapes)", () => {
+  // bash: `echo it\'s` is one word; the `\'` used to latch the SINGLE-quote
+  // state, swallow the rest of the command, and leave the cd unseen — so both
+  // consumers fell back to the session root for an op that ran in /b.
+  const info = parseCdChains("echo it\\'s && cd /b && git commit");
+  equal(info.last, resolvePath("/b"));
+  equal(info.unattributable, false);
 });
 
 test("extractRepoFlag: the ATTACHED short form is a real gh spelling (#931/#993)", () => {
