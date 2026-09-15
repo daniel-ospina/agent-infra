@@ -263,6 +263,19 @@ jobs:
         # Positive control: spawns the REAL gates through symlinked paths.
         # Zero-dep (`node:*` only), no `npm ci`, ~3s.
         run: node extensions/shared/test-is-main.mjs
+      - name: infra-verify bounded-scan regression (#1051)
+        # `find <dir>/` dereferences a symlinked START POINT and `-P` cannot undo
+        # it, so a repo committing `templates -> /` turned infra-verify's bounded
+        # in-checkout enumeration into a filesystem-wide walk that could report
+        # green over a tree that is not the checkout's. Its own step (like
+        # #708/#744/#709 above) because the `extensions/*/test*.mjs` glob in
+        # ci-main.yml is POST-MERGE only, and a fail-open regression in a
+        # verifier should not reach main before anything reads it.
+        # Hermetic (temp fixtures, a tiny sentinel tree — never `/`), zero-dep
+        # (`node:*` + bash), no `npm ci`, ~2s. The suite is bidirectional: the
+        # vulnerable form (`find <dir>/`, `find -H`, `find -L`) is executed and
+        # asserted to LEAK, then the fixed form is asserted not to.
+        run: node extensions/shared/test-infra-verify-scan.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
