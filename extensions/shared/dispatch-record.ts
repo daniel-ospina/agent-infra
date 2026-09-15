@@ -78,6 +78,13 @@ export interface DispatchOutcomeRow {
    * is `dispatchId` + `childSessionId` + `attempt`; a reader that counts
    * attempts against `dispatchId` alone will merge distinct spawn attempts. */
   attempt: number;
+  /** The directory the child was SPAWNED in — the dispatching parent's target
+   * worktree/repo, NOT necessarily the parent's own checkout (#1071). Before
+   * #1071 this was always `process.cwd()`, because the child always ran there;
+   * now it is the resolved target, so a reader must not infer "the repo the
+   * parent worked in" from it. PHYSICAL path (canonicalized where the target
+   * exists) — it matches the child's own `getcwd()`. `branch`/`headSha`/
+   * `dirty`/`dirtyPaths` describe THIS directory, never the parent's. */
   cwd: string;
   branch: string | null;
   headSha: string | null;
@@ -113,6 +120,9 @@ export interface DispatchOutcomeInput {
   parentSessionId: string | null;
   childSessionId: string | null;
   attempt: number;
+  /** The child's target spawn directory (#1071) — see `DispatchOutcomeRow.cwd`
+   * for the semantics (physical path; the target repo, never the parent's
+   * checkout). */
   cwd: string;
   branch: string | null;
   headSha: string | null;
