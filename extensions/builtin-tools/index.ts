@@ -2591,7 +2591,28 @@ export const ABNORMAL_EXIT_DETAIL_KEYS = [
   "heartbeatTimeout",
 ] as const;
 
-export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal, record?: DispatchRecordContext): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
+/**
+ * #1071: the task tool's TARGET working directory for one dispatch.
+ *
+ * The child used to be spawned with `cwd: process.cwd()` — the PARENT's
+ * working directory — so a child dispatched to work in another repo/worktree
+ * loaded the parent's extension stack (observed: a child told to work in
+ * `agent-infra` loaded **tortoise**'s stack, with `verification-gate` adopting
+ * a foreign worktree as its git-op root) and the parent's `Alive state` /
+ * wedge report named the parent's checkout (`branch`/`headSha`/`worktree`/
+ * `dirty`), the one field an operator trusts when triaging a wedge.
+ *
+ * An explicit target is resolved to an ABSOLUTE path (so a relative value is
+ * unambiguous in the report and spawn-equivalent for the child), trimmed.
+ * Omitted / null / blank → `process.cwd()`, byte-identical to the pre-#1071
+ * behavior. Pinned by the negative-twin tests in builtin-tools.test.ts.
+ */
+export function resolveTaskCwd(cwd?: string | null): string {
+  const trimmed = typeof cwd === "string" ? cwd.trim() : "";
+  return trimmed ? resolve(trimmed) : process.cwd();
+}
+
+export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal, record?: DispatchRecordContext, cwd?: string): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
   return new Promise((resolve) => {
     // #176 code-review: per-dispatch marker nonce — the child echoes it in
     // every [task-heartbeat] marker; markers without it are foreign (MCP
@@ -2639,13 +2660,20 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // #101: spawn via process.execPath + resolved entry script (same as the
     // subagent tool) so a truncated PATH can't cause a non-retryable ENOENT.
     const invocation = getPiInvocation(args);
+    // #1071: the child runs in the TARGET working directory, never the parent's
+    // by default-of-omission. BOTH consumers below read this same value — the
+    // spawn (so the child loads the target repo's extension stack / AGENTS.md /
+    // project-local extensions) and the repo-state probe + render (so the
+    // wedge report names the TARGET's branch/headSha/worktree/dirty). A parent
+    // that omits it gets process.cwd() exactly as before.
+    const targetCwd = resolveTaskCwd(cwd);
     // #271 (#208 D2): detached spawn → the child gets its own pgid (setsid),
     // so a settle-path sweep can anchor on it without ever signalling the
     // orchestrator. Opt out via TASK_DETACHED=0 (parity with
     // SUBAGENT_DETACHED, #137 F8).
     const detached = process.env.TASK_DETACHED !== "0";
     const proc = spawn(invocation.command, invocation.args, {
-      cwd: process.cwd(),
+      cwd: targetCwd,
       shell: false,
       detached,
       stdio: ["ignore", "pipe", "pipe"],
@@ -2699,10 +2727,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // the cached value and never invoke git themselves; null until/unless the
     // probe resolves → fields render `unknown`.
     let repoState: RepoState | null = null;
-    void asyncRepoState(process.cwd(), { signal })
+    void asyncRepoState(targetCwd, { signal })
       .then((s) => { repoState = s; })
       .catch(() => { repoState = null; });
-    const repoStateText = (): string => renderRepoStateLine(repoState, process.cwd());
+    const repoStateText = (): string => renderRepoStateLine(repoState, targetCwd);
 
     const appendCap = (s: string, add: string, cap: number) => {
       const merged = s + add;
@@ -2825,7 +2853,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           parentSessionId,
           childSessionId,
           attempt,
-          cwd: process.cwd(),
+          cwd: targetCwd,
           branch: repoState?.branch ?? null,
           headSha: repoState?.headSha ?? null,
           dirty: repoState?.dirty ?? null,
@@ -3711,6 +3739,7 @@ export default function (pi: ExtensionAPI) {
       "The sub-agent runs pi in print mode (-p) with access to read, bash, edit, and write tools.",
       "For complex multi-turn tasks, break them into multiple task calls or handle them yourself.",
       "Sub-agents have NO access to the current session context — provide all necessary information in the prompt.",
+      "Pass `cwd` with the worktree or repo the child should work in. The child is SPAWNED there, so it loads THAT repo's extension stack, AGENTS.md and project skills, and the parent's `Alive state` / wedge report names the target's branch / headSha / worktree / dirty. Omit it only when the child is meant to work where the parent is — the child then inherits the parent's cwd and an unrelated repo's gates (#1071).",
     ],
     parameters: Type.Object({
       prompt: Type.String({
@@ -3732,6 +3761,12 @@ export default function (pi: ExtensionAPI) {
         Type.Boolean({
           description:
             "Per-dispatch opt-in to propagate the controller's OWN main-edits hatch (AGENT_ALLOW_MAIN_EDITS=1 / ELDATO_ALLOW_MAIN_EDITS=1) to this one child. Default false (#623): task children are UNHATCHED BY DEFAULT — even a hatched controller's env is stripped of the hatch before the child is spawned, so an ambient launcher hatch can never silently hatch a whole fleet (M2/M3/M4 hub-discipline off). Pass true ONLY to deliberately dispatch an in-main child under the controller's own escape authorization; a controller whose env is NOT hatched cannot opt a child in (the child must never be hatched by a parent that does not itself hold the authorization).",
+        })
+      ),
+      cwd: Type.Optional(
+        Type.String({
+          description:
+            "Target working directory for this sub-agent — the repo/worktree it should work in (absolute, or relative to the parent's cwd). The child is SPAWNED here, so it loads THAT repo's extension stack, AGENTS.md and project skills, and the parent's `Alive state` / wedge report names the target's branch / headSha / worktree / dirty. Default: the parent's cwd (process.cwd()) — omit only when the child should work where the parent is (#1071).",
         })
       ),
     }),
@@ -4024,7 +4059,7 @@ export default function (pi: ExtensionAPI) {
         dispatchClass,
       });
       const spawnLeg = (leg: LegRef, attempt = 1) =>
-        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt));
+        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd);
 
       let result = await retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions);
       // A malformed per-attempt id throws inside childSessionArgs(); retry()
@@ -4135,7 +4170,7 @@ export default function (pi: ExtensionAPI) {
         const buildFbArgs = (): string[] =>
           ["-p", "--provider", fallbackProvider, "--model", fallbackModel, ...childSessionArgs(), params.prompt];
         const fbResult = await retry(
-          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt)),
+          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd),
           retryOptions,
         );
         if (fbResult.status === "success" && fbResult.value) {

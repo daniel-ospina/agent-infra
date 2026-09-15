@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, spawnSubAgent } from "./index.js";
 import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
@@ -27,7 +27,7 @@ import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -4172,7 +4172,7 @@ test("#783/T2: every Alive state template appends the cached repo state (source 
     ok(site.includes("${repoStateText()}"), "every Alive state line appends branch/headSha/worktree/dirty");
   }
   ok(source.includes("let repoState: RepoState | null = null;"), "per-dispatch cached repoState");
-  ok(source.includes("void asyncRepoState(process.cwd(), { signal })"), "probed ONCE at spawn");
+  ok(source.includes("void asyncRepoState(targetCwd, { signal })"), "probed ONCE at spawn, in the child's TARGET cwd (#1071)");
 });
 
 testAsync("#783/T2: asyncRepoState reads branch/headSha/dirty/paths from a real repo", async () => {
@@ -4216,6 +4216,121 @@ testAsync("#783/T2 (review fix): a failed status probe is UNKNOWN, never a confi
     `branch=main headSha=${"a".repeat(40)} worktree=/tmp dirty=unknown dirtyPaths=unknown`,
     "the render shows dirty=unknown dirtyPaths=unknown (name=value format preserved)",
   );
+});
+
+// ── #1071: the task child's TARGET working directory ─────────────────
+//
+section("#1071 — task child cwd (target working directory)");
+
+// NEGATIVE TWIN: omitting the parameter must reproduce the pre-#1071 behavior
+// byte-for-byte. Without this the suite cannot tell the fix from a regression
+// (a future "improvement" that defaults elsewhere would silently move every
+// unparameterised child), so it asserts the fallback EXACTLY.
+test("#1071: resolveTaskCwd — omitted / null / blank → process.cwd() (negative twin)", () => {
+  equal(resolveTaskCwd(), process.cwd(), "omitted → the PARENT's cwd (pre-#1071 behavior)");
+  equal(resolveTaskCwd(undefined), process.cwd(), "undefined → the PARENT's cwd");
+  equal(resolveTaskCwd(null), process.cwd(), "null → the PARENT's cwd");
+  equal(resolveTaskCwd(""), process.cwd(), "empty string → the PARENT's cwd");
+  equal(resolveTaskCwd("   "), process.cwd(), "whitespace-only → the PARENT's cwd");
+});
+
+// POSITIVE TWIN: an explicit target is used, resolved to an absolute path so
+// the wedge report's `worktree=` is unambiguous.
+test("#1071: resolveTaskCwd — an explicit target is used as-is (positive twin)", () => {
+  equal(resolveTaskCwd("/tmp/wt-1071"), "/tmp/wt-1071", "absolute target passes through");
+  equal(resolveTaskCwd("  /tmp/wt-1071  "), "/tmp/wt-1071", "surrounding whitespace is trimmed");
+  equal(resolveTaskCwd("rel/wt-1071"), resolve(process.cwd(), "rel/wt-1071"), "relative target resolves against the parent cwd");
+  ok(resolveTaskCwd("./x").startsWith("/"), "always absolute in the report");
+});
+
+// SOURCE PINS: the ONE resolved value feeds BOTH consumers (spawn + repo probe)
+// and the ledger row, and the schema exposes it to parents.
+test("#1071: the target cwd is wired through spawn + repo probe + ledger row (source pin)", () => {
+  ok(source.includes("const targetCwd = resolveTaskCwd(cwd);"), "resolved ONCE per spawn attempt");
+  // Pin the SPAWN OPTIONS BLOCK specifically. A bare `cwd: targetCwd,` also matches
+  // the ledger row alone, so that form would stay green if the spawn mutated back
+  // to process.cwd() (raised in VGATE review of this change).
+  ok(/\{\s*\n\s*cwd: targetCwd,\s*\n\s*shell: false,/.test(source), "the child is SPAWNED in the target cwd (not process.cwd())");
+  ok(source.includes("cwd: targetCwd,"), "the repo-state/ledger consumers read the same target cwd");
+  ok(source.includes("void asyncRepoState(targetCwd, { signal })"), "the repo probe reads the TARGET repo");
+  ok(source.includes("renderRepoStateLine(repoState, targetCwd)"), "the wedge report names the TARGET worktree");
+  ok(!source.includes("void asyncRepoState(process.cwd(), { signal })"), "no stale parent-cwd probe remains");
+  ok(!source.includes("renderRepoStateLine(repoState, process.cwd())"), "no stale parent-cwd render remains");
+});
+
+test("#1071: the task tool schema exposes `cwd` and threads it to every leg (source pin)", () => {
+  ok(/cwd: Type\.Optional\(\s*Type\.String\(/.test(source), "schema exposes an optional cwd");
+  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd)"), "primary + failover-hop legs pass params.cwd");
+  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd)"), "the provider-fallback leg passes params.cwd");
+  ok(!source.includes("cwd: process.cwd(),"), "no spawn site pins the parent cwd any more");
+});
+
+// BEHAVIORAL E2E: a PATH-shadow fake `pi` that prints its own cwd. This is the
+// real proof — the child PROCESS is in the target directory, not merely a
+// function returning it. `process.argv[1] = undefined` makes getPiInvocation
+// fall back to bare `pi` (cut-resume.integration.test.ts precedent).
+const FAKE_PI_CWD_SHIM = "#!/bin/sh\npwd -P\nexit 0\n";
+
+testAsync("#1071 (E2E): a child with a target cwd RUNS there; omitted → the parent's cwd", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1071-cwd-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(join(shimDir, "pi"), FAKE_PI_CWD_SHIM, { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.argv[1] = undefined as unknown as string;
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: process.env.PATH,
+      // No row in the operator's ledger for a test dispatch (#783 gate).
+      DISPATCH_LEDGER: "0",
+    };
+    const args = ["-p", "--no-session", "print your cwd"];
+
+    const target = resolveTaskCwd(dir);
+    const positive = await spawnSubAgent("deepseek-v4-flash", "deepseek", env, args, undefined, undefined, dir);
+    equal(
+      positive?.content?.[0]?.text?.trim(),
+      realpathSync(target),
+      "positive twin — the CHILD PROCESS ran in the target cwd",
+    );
+
+    const negative = await spawnSubAgent("deepseek-v4-flash", "deepseek", env, args);
+    equal(
+      negative?.content?.[0]?.text?.trim(),
+      realpathSync(process.cwd()),
+      "negative twin — omitting cwd still spawns in the PARENT's cwd (pre-#1071 behavior)",
+    );
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+testAsync("#1071: the report names the TARGET repo's worktree/branch/dirty (never the parent's)", async () => {
+  // The reporting half of the acceptance criteria, deterministic: the probe is
+  // run against a temp repo on a unique branch with an uncommitted file, then
+  // rendered with the SAME resolved cwd spawnSubAgent would use. This is the
+  // #1030 defect — the wedge report said `branch=main … dirty=false` while the
+  // real work target held uncommitted changes.
+  const dir = mkdtempSync(join(tmpdir(), "t1071-report-"));
+  try {
+    execSync("git init -q", { cwd: dir });
+    execSync("git symbolic-ref HEAD refs/heads/fix/target-1071", { cwd: dir });
+    execSync("git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: dir });
+    writeFileSync(join(dir, "uncommitted.txt"), "x");
+    const st = await asyncRepoState(dir);
+    const line = renderRepoStateLine(st, resolveTaskCwd(dir));
+    ok(line.includes(`worktree=${resolve(dir)}`), `worktree is the TARGET repo: ${line}`);
+    ok(line.includes("branch=fix/target-1071"), `branch is the TARGET's, not the parent's: ${line}`);
+    ok(line.includes("dirty=true"), `the TARGET's uncommitted change is visible: ${line}`);
+    ok(!line.includes(`worktree=${process.cwd()}`), "never the parent's checkout");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
   for (const t of asyncTests) await t();
