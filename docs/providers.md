@@ -293,10 +293,12 @@ with automatic return after balance restore.
   so an un-migrated legacy frontmatter/session keeps its hop protection.
   #727: the openrouter hop leg is the **V4.1** slug, so a failover serves the
   same generation as the primary instead of the April 0423 build. Cost delta on
-  the emergency leg: `deepseek/deepseek-v4.1-flash` $0.15/$0.60 per M
-  (cache-read $0.003) vs the 0423 slug's $0.0882/$0.1764 — 1.70x input, 3.40x
-  output, and cache-read is CHEAPER ($0.003 vs $0.01764) — accepted 2026-09-14
-  and recorded here per #727 indicator (c). The legacy
+  the emergency leg: `deepseek/deepseek-v4-flash`'s $0.0882/$0.1764 (cache-read
+  $0.01764) vs `deepseek/deepseek-v4.1-flash` — 1.70x input / 3.40x output in the
+  DeepSeek first-party OFF-PEAK window ($0.15/$0.60, cache-read $0.003) and
+  3.40x / 6.80x at the catalog reference + peak windows ($0.30/$1.20, cache-read
+  $0.006); cache-read is cheaper than the 0423 slug's in both. Accepted
+  2026-09-14 and recorded here per #727 indicator (c). The legacy
   `deepseek/deepseek-v4-flash` entry stays in the table but is RESOLUTION-ONLY
   (`RESOLUTION_ONLY_LEGS`): it is there so stale pre-#727 state (latch file /
   in-flight marker / session pinned to the slug) still matches its own leg — an

@@ -48,9 +48,16 @@ export default function (pi: ExtensionAPI) {
       // this model generation; the deepseek-official text-only row is the
       // outlier. COST PROVENANCE: this slug has NO row in the shipped
       // pi-bootstrap/pi-config/models-store.json, so the rates below come from
-      // the live OpenRouter catalog for the slug ($0.15/$0.60 per M, cache-read
-      // $0.003 per M, verified 2026-09-14) — the delta vs the legacy 0423 slug
-      // is recorded in docs/providers.md (#727 indicator c).
+      // the live OpenRouter catalog (`GET /api/v1/models` + the slug's endpoints).
+      // They are the **DeepSeek first-party OFF-PEAK window** (weekends, plus
+      // weekdays outside 01:00-04:00 and 06:00-10:00 UTC): $0.15/$0.60 per M,
+      // cache-read $0.003 (verified 2026-09-15). The catalog's reference rate —
+      // and the peak windows — is 2x that ($0.30/$1.20, cache-read $0.006), so
+      // hourly cost accounting sees the best case here; the delta vs the legacy
+      // 0423 slug is recorded in docs/providers.md for BOTH windows (#727
+      // indicator c). The flat cheap endpoint (Relace: same $0.15/$0.60) prices
+      // cache-read at $0.015, 5x the windowed value — the declared cache-read
+      // belongs to the DeepSeek endpoint, not to a generic "the slug" rate.
       {
         id: "deepseek/deepseek-v4.1-flash",
         name: "DeepSeek V4.1 Flash (via OpenRouter)",

@@ -262,8 +262,11 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
       { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
       // Legacy-generation leg, kept LAST and RESOLUTION-ONLY (#727). It must
       // stay in the table because nextLegAfter matches the CURRENT leg by table
-      // position: a leg absent from the table yields startIdx -1 and the walk
-      // then re-returns legs[0] — the DRAINING root. So this entry exists so
+      // position: a leg absent from the table yields startIdx -1, and the walk
+      // then RESTARTS at legs[0] — so it can hand back a leg at or BEHIND the
+      // requested one (the #715 regression: the walk re-returned the root)
+      // instead of halting or stepping forward; which leg it lands on depends
+      // on what is unavailable at that moment. This entry exists so
       // stale pre-#727 state (latch file / in-flight marker / session pinned to
       // the slug) still matches its own leg, while RESOLUTION_ONLY_LEGS keeps it
       // from ever being SERVED — neither as an advance target nor through
@@ -364,7 +367,8 @@ export function familyLegs(family: string): LegRef[] | undefined {
  *
  * Why the entry must exist anyway: `nextLegAfter` locates the current leg by
  * table position, so a leg missing from the table gives startIdx -1 and the walk
- * re-returns legs[0] — the DRAINING root leg (#715's regression).
+ * restarts at legs[0], able to re-serve a leg at or behind the requested one
+ * (#715's regression — the walk re-returned the root).
  *
  * Why it must not be advanceable: that walk is how a chain continuation picks
  * its next leg, and serving a resolution-only leg is an automatic generation
@@ -1156,8 +1160,10 @@ export function resolveWithChain(
   // yields the family's first AVAILABLE leg (the V4.1 openrouter leg while
   // `qwen-tp` stays config-blocked) whether the ask was the root, the current
   // hop leg, or the retired slug itself — or a structured halt when nothing is
-  // left. Never the legacy build. The one surviving must-stay case is a dispatch
-  // of an exact leg with NO fresh latch at all (the early `clear` return above).
+  // left. Never the legacy build. The surviving must-stay shapes are the early
+  // returns that hand back `requested` verbatim: `clear` (no fresh latch at all),
+  // `no-hop` (PI_FAILOVER_NO_HOP=1) and `disabled` (PROVIDER_FAILOVER_DISABLE=1) —
+  // an explicit ask for this exact leg, never a failover decision.
   if (
     fam?.activeLeg &&
     !unavailable.has(fam.activeLeg.provider) &&

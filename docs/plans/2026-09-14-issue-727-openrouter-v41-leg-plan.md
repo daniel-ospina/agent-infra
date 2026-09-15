@@ -29,8 +29,8 @@ all (an extension `models[]` array REPLACES the provider catalog — s7), and it
 
 **1. Which slug should the hop leg serve?**
 - (a) Keep 0423 — leaves the family contract violated (rejected).
-- (b) Re-point to `deepseek/deepseek-v4.1-flash` — same generation as the primary; ~1.70x input /
-  3.40x output on the *emergency* leg only.
+- (b) Re-point to `deepseek/deepseek-v4.1-flash` — same generation as the primary; costlier on the
+  *emergency* leg only (1.70x input / 3.40x output off-peak, 3.40x / 6.80x at peak vs the 0423 slug).
 - (c) Keep both as ordered legs — the pre-#727 *halt-after-hop* behaviour is lost and a second-leg
   exhaustion silently serves the older build (the same class of defect this issue removes).
 **Decision: (b)** — user decision 2026-09-14 ("I want 4.1, with reasoning configurable"). Cost delta
@@ -43,8 +43,9 @@ must not change the session's thinking level. The probed capability is recorded 
 levels later is a one-line change.
 
 **3. What happens to stale pre-#727 state referring to the 0423 slug?**
-- (a) Drop it from the table → `nextLegAfter` computes `startIdx -1` and the walk re-returns
-  `legs[0]`, the **draining root** (#715's regression).
+- (a) Drop it from the table → `nextLegAfter` computes `startIdx -1`, so the walk RESTARTS at
+  `legs[0]` and can hand back a leg at or behind the requested one — the **draining root** being the
+  observed #715 case — instead of halting or stepping forward.
 - (b) Keep it as an ordinary leg → a *fresh* continuation after the V4.1 leg drains is served the
   0423 build: the pre-#727 chain (which halted there) would be extended, re-introducing a silent
   generation downgrade one hop later.
