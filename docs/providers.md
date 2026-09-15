@@ -308,11 +308,11 @@ with automatic return after balance restore.
   leg while `qwen-tp` stays config-blocked, instead of dispatching the older
   build), and a dispatch of the retired slug under a fresh latch is re-resolved
   the same way. The only way to run the 0423 build is to ask for that exact leg
-  and have the failure path stand down — an explicit must-stay dispatch
-  (`PI_FAILOVER_NO_HOP=1`) or the kill switch (`PROVIDER_FAILOVER_DISABLE=1`),
-  both of which return the requested leg verbatim, latch or not. The advance walk
-  therefore HALTS after the V4.1 leg, exactly where it halted before the V4.1 leg
-  existed.
+  with nothing for resolution to re-derive: no fresh latch at all (`clear`), an
+  explicit must-stay dispatch (`PI_FAILOVER_NO_HOP=1`), or the kill switch
+  (`PROVIDER_FAILOVER_DISABLE=1`) — all three return the requested leg verbatim.
+  The advance walk therefore HALTS after the V4.1 leg, exactly where it halted
+  before the V4.1 leg existed.
   Thinking is CONFIGURABLE on the V4.1 leg (off/high/max — the levels the
   deepseek primary can express); `minimal`/`low`/`medium` stay unmapped for hop
   parity — the upstream slug accepts them, the primary cannot express them, and

@@ -58,9 +58,10 @@ exactly that slug, and serving it directly would re-dispatch the 0423 build for 
 `qwen-tp` stays config-blocked — retrying from the family root when the first walk halts, so a dispatch
 of the *hop leg itself* is served rather than halted).
 The chain **halts** after the V4.1 leg — exactly where it halted before the V4.1 leg existed. No
-generation downgrade is reachable by an automatic hop; the 0423 build survives only for an explicit
-must-stay dispatch of that exact leg (`PI_FAILOVER_NO_HOP=1`) or the kill switch
-(`PROVIDER_FAILOVER_DISABLE=1`), both of which return the requested leg verbatim, latch or not.
+generation downgrade is reachable by an automatic hop; the 0423 build survives only when a dispatch
+asks for that exact leg with nothing for resolution to re-derive: no fresh latch at all (`clear`), an
+explicit must-stay dispatch (`PI_FAILOVER_NO_HOP=1`), or the kill switch
+(`PROVIDER_FAILOVER_DISABLE=1`) — all three return the requested leg verbatim.
 
 ## Wiring
 
