@@ -59,7 +59,8 @@ exactly that slug, and serving it directly would re-dispatch the 0423 build for 
 of the *hop leg itself* is served rather than halted).
 The chain **halts** after the V4.1 leg — exactly where it halted before the V4.1 leg existed. No
 generation downgrade is reachable by an automatic hop; the 0423 build survives only for an explicit
-must-stay dispatch of that exact leg with no fresh latch.
+must-stay dispatch of that exact leg (`PI_FAILOVER_NO_HOP=1`) or the kill switch
+(`PROVIDER_FAILOVER_DISABLE=1`), both of which return the requested leg verbatim, latch or not.
 
 ## Wiring
 

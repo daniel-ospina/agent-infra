@@ -293,7 +293,7 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
  *      (`fam.legs[0].model`, i.e. the canonical spelling) → that family key;
  *   3. the qwen-tp rename `deepseek-v4-flash-0731` → the flash family;
  *   4. openrouter/slash ids: last-slash slug match against the BASE slugs
- *      (deepseek-v4-flash, deepseek/deepseek-v4.1-flash — the #727 hop leg, and
+ *      (deepseek-v4-flash, deepseek-v4.1-flash — the #727 hop leg, and
  *      deepseek-v4-pro);
  *   5. otherwise undefined.
  *
