@@ -431,8 +431,9 @@ partial signal was defined but never rendered and `N/M` was undefined; the surfa
 emitted by `infra-verify` but absent from the router schema; `infra-verify`'s Failure Handling said
 "not offered → `skip`" while Step 3 said omitted-from-`checks[]`; and all four Python invocations ran
 with the repo as CWD, so a repo-local `yaml.py` was imported and executed by the verifier (fixed by
-running Python from `/` with an absolute path — `-I`/`-s` would also close it but drop user
-site-packages and turn a user-local PyYAML install into a permanent red).
+running Python from `/` with an absolute path — `-I` would also close it but drops user
+site-packages, turning a user-local PyYAML install into a permanent red (`-s` leaves the CWD on
+`sys.path` and would not close it).
 
 ## Learnings
 

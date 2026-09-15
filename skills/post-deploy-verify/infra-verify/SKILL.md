@@ -39,8 +39,8 @@ workflow YAML only. They are **repo-scoped, not diff-scoped** — Step 1 offers 
 of its target tree *in the repo*, so a PR touching only classes no check covers (`terraform/*`,
 `docker/*`, `k8s/*`, `supabase/*`, `enforcement/*`, `Dockerfile`, `docker-compose*`, `*.tf`, …) still
 offers all four and reports `pass` against the repo's own trees while that changed surface goes
-unvalidated. **That is a known fail-open, tracked by #1052** — stated here as a gap, not as a pass.
-The surface status is `skip` (with a `reason`) only when no target set exists in the repo at all.
+unvalidated — a known fail-open (tracked by #1052), **not a clean run**. The surface status is `skip`
+(with a `reason`) only when no target set exists in the repo at all.
 
 ## Workflow
 
@@ -217,7 +217,8 @@ site-packages directory and leaves the CWD on `sys.path`. And `-I` carries a sid
 drops user site-packages too, turning a user-local PyYAML install into a permanent fail-closed red.
 The CWD change closes the same hole without either consequence.
 >
-> Paths are always passed as **argv**, so a filename can never reach the interpreter source.
+> Paths are always passed as **argv**, so a filename can never reach the interpreter source —
+> the pre-#1035 form interpolated `$f` into the `python3 -c` source, which was itself an injection.
 
 **ci-config:**
 ```bash

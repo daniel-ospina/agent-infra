@@ -158,7 +158,7 @@ A `skip` row renders its surface-level `reason` as a note under the table (the `
 reserved for issue numbers), so a skipped surface is never reported without saying why.
 
 **All pass:** "✅ Post-deploy verification: all surfaces passed."
-**All pass, but partial coverage:** "⚠️ Post-deploy verification: all offered surfaces passed." followed by the applicable clauses — when `K > 0`, "K check(s) not offered — <names>; surface(s) with unverified targets: <list>"; and when any check reported `validated` < `total`, "N check(s) only partially validated — <names>". A partial run never uses the plain all-pass line.
+**All pass, but partial coverage:** "⚠️ Post-deploy verification: all offered surfaces passed." followed by the applicable clauses — when `K > 0`, "K check(s) not offered — <names>; surface(s) with unverified targets: <list>"; and when any check reported `validated` < `total`, "J check(s) only partially validated — <names>", where `J` is the count of such checks (a distinct symbol from the cell's `N`). A partial run never uses the plain all-pass line.
 **Some fail:** "⚠️ Post-deploy verification: N/M surfaces passed. Failures: <list>"
 **All fail/skip:** "⏭️ Post-deploy verification: no verification run"
 
