@@ -9,7 +9,7 @@ tags: [pipeline, issue, routing, fractal, orchestrator, entry-point]
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 summary: "Fractal entry-point router — detects Level + complexity and dispatches to epic-workflow, project-workflow, task-workflow (micro), or task-workflow-standard (gated)."
 created: 2026-07-07
-updated: 2026-08-08
+updated: 2026-09-15
 steps:
   - name: classify_ask
     type: skill
@@ -48,7 +48,28 @@ Entry-point router for the fractal planning pipeline. Detects the issue's Level 
 
 > **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
+## ⛔ Gate 0 — Classify A or B before routing
+
+**No infrastructure/machinery issue is routed before it is classified.** Run this before `## Routing`; a category-B issue does not enter a planning pipeline at all. This test classifies *machinery* only — a product, capability, or user-facing issue is out of scope and routes normally. Canonical definition: `AGENTS.md` → **Product Over Process**.
+
+This adds no new plan, report, or gate script, and no new planning stage: it is a routing decision that *removes* work — a B item is closed, or left open as a note, instead of planned.
+
+| | Failure mode | What happens |
+|---|---|---|
+| **A** | silent destruction of work · a **false PASS** (a gate reports OK over a wrong/unverified artifact) · a **bypass** (a PR or agent can *defeat* a gate) · a **no-op gate** (exits 0 when it cannot run) · an **inert enforcer** (its condition can never fire) | **Route normally** — full pipeline, proportional depth |
+| **B** | friction (**including false blocks**) · ceremony · doc drift · consistency between process docs · observability *of the machinery* · gate marker/format negotiation · meta-process (how issues are filed, how plans are reviewed, cycle counts) · machinery test flakiness | **Do not route.** A B item never enters a planning pipeline. If its honest answer to *what does the user lose?* is "nothing but time" — or no consequence is named — close it `not planned` with one sentence naming the failure mode and an invitation to reopen (if it was already filed, close it now). A B item whose admission sentence names a real consequence is still not routed and not planned: leave it open as a note |
+| **not machinery** | — a product, capability, or user-facing issue | **Out of scope** — the A/B test classifies machinery only; route normally |
+
+The three questions that decide a borderline case:
+1. Can a PR or an agent **defeat** it? → **A**. Does its **wording or marker parsing** merely mis-grade? → **B**.
+2. **Fail-open** (something wrong slips through) → **A**. **Fail-closed / over-block** (something right is refused) → **B**.
+3. If this is never fixed, what does the user lose? **"Nothing but time" is a valid answer — B, and for an item not yet filed it means do not file it.**
+
+**Why this gate exists:** the backlog reached ~260 open issues, ~172 of them category B. A planning pipeline run over a B issue produces process artifacts that satisfy process checks and change nothing about the product. See the drift note in `AGENTS.md`.
+
 ## Routing
+
+**Gate 0 (above) is resolved first.** A category-B *machinery* issue exits there, before this diagram; product/capability issues and category-A issues route below.
 
 ```
 ISSUE IN (#N)

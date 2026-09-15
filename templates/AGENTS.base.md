@@ -21,16 +21,49 @@
 1. A skill explicitly mandates a human gate (sign-off, approval, decision point)
 2. P0 consequence risk (data loss, security, unrecoverable cost >$10/mo)
 3. Genuinely ambiguous — research was inconclusive (<50% confidence) and you need a decision
+4. No category-A work is left and nothing already designated is still in flight — the only thing in front of you is new category-B process machinery (see **Product Over Process** below). Say so plainly.
 
 If none of those apply: **keep going.** The user can interrupt if they disagree.
 
-**Auto-file rule:** When you encounter a bug, workflow gap, missed edge case, or improvement opportunity → file a GitHub issue immediately. Never ask "should I file an issue?" — just file it.
+**Auto-file rule:** When you encounter a bug, workflow gap, missed edge case, or improvement opportunity → file a GitHub issue immediately. Never ask "should I file an issue?" — just file it — **subject to the admission control in Product Over Process below** (category A always; category B only with a stated consequence; a product bug is filed as before).
+
+**Moving is not a license to build machinery.** "Keep going" means keep making progress on the **product** — not keep adding, fixing, auditing, or documenting *process*. If the only work in front of you is category B, that is a real reason to stop and say so — say it plainly rather than manufacturing more process to look busy.
 
 ---
 
 ## ⛔ HARD RULE: Process Discipline
 
 Your role is to work within the skills and processes framework we have explicitly designed. The skills, workflows, and tools embed the accumulated learnings from all previous work and should not be bypassed nor hacked. If there are difficulties or inefficiencies, the right process is to do the work as designated regardless and provide feedback in the reflection phase (after the work), for systematic improvement of all future runs. Following this process allows us to treat our system as a product we can evolve and eventually sell, but only if properly used instead of bypassed. If in absolute need, ask for permission to bypass before doing so.
+
+---
+
+## ⛔ HARD RULE: Product Over Process — the A/B test for infrastructure work
+
+Every infra issue, gate, guard, workflow step, or refactor is classified **A** or **B** *before* it is filed, planned, or worked. This is a **falsifier**, not a label — the classification must name the failure mode, not the annoyance.
+
+**A — keep.** The failure mode is one of:
+- **silent destruction of work** — uncommitted work destroyed, a database with no volume or no working backup, a workspace/pane deleted, a killed child's work discarded;
+- **a false PASS** — a gate or verifier reports OK while the artifact is wrong, unverified, or unbuilt, so a broken thing merges or ships;
+- **a bypass** — a PR or an agent can *defeat* a gate: rewrite the grader, disable it by ambient env, defuse its head pin, record a hash that does not match what was committed, or reach a "human gate" that never reaches a human;
+- **a no-op gate** — exits 0, or silently does nothing, when it cannot run;
+- **an inert enforcer** — a runner whose termination or enforcement condition can never fire while it appears to protect something.
+
+**B — needs strong justification to exist.** The failure mode is only: friction (**including false blocks**), ceremony, documentation drift, consistency between process docs, observability *of the machinery*, gate-about-gate parsing or marker format, meta-process (how issues are filed, how plans are reviewed, how many review cycles run), or test flakiness of the machinery itself.
+
+**A B item that clears admission is still only a note** — never routed, never planned. It stays open as a note unless it becomes category A; closing it remains permitted and needs no ceremony.
+
+**The decision line when something is ambiguous:**
+- Can a PR or an agent **defeat** it? → **A**.
+- Does the gate's **wording or marker parsing** merely mis-grade? → **B**.
+- **Fail-open** (something wrong slips through) → **A**. **Fail-closed / over-block** (something right is refused) → **B**.
+
+**B never gets a default yes.** Filing a category-B item requires one sentence of the form *"If this is never fixed, the user loses ___."* — and **"nothing but time" is an acceptable, honest answer, in which case do not file it.** Noticed-but-not-consequential is a note, not a work item.
+
+**Closing a B item is always permitted and needs no ceremony** — `not planned`, one sentence naming the failure mode, and the invitation to reopen. A false close is cheaper than an unfixed data-loss defect.
+
+**Precedence.** This rule decides what gets filed, planned, and newly started; it dissolves neither adjacent hard rule. A false or over-blocking gate that is *blocking work in front of you* is still repaired under **Fix Broken Infrastructure** (its B classification governs only whether it becomes a tracked, planned work item), and work **already designated and in flight** is completed under **Process Discipline** — with feedback in the reflection phase, not abandoned mid-execution.
+
+**This rule exists because of a real drift (2026-09).** The backlog reached ~260 open issues, ~172 of them category B: false blocks, doc drift, gate-format negotiation, and observability of the gates themselves. An epic created to make the workflow *lean* produced six parallel verification passes, two revisions of its own analysis doc, and nine child issues — and its final artifact was a comment formatted to satisfy a check about comment formatting. Roughly two-thirds of measured agent effort went to process machinery. **The tell: you cannot name the product capability that improved.**
 
 ---
 
@@ -236,6 +269,8 @@ Does **not** apply to: routine project file reads, git operations, local shell c
 ## File Pre-Existing Bugs
 
 When you encounter a **pre-existing bug** (not introduced by your current work), **file a GitHub issue for it.** Do not treat "out of scope" as a reason to skip. Known bugs carried silently forward accumulate into build rot.
+
+**Admission control applies to machinery findings — see Product Over Process.** Classify the *machinery* finding A or B *before* filing. **A** — file it, always. **B** — file it only with a stated consequence; if the honest answer is "nothing but time", do not file it. A pre-existing **product** bug is filed as before — the A/B test governs machinery, not the product.
 
 ---
 
