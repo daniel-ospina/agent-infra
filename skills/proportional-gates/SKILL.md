@@ -149,8 +149,9 @@ word, or a bare "it breaks" is **not** a consequence.
 not filed as a GitHub issue.** This governs findings raised inside a review gate. `AGENTS.md`'s
 auto-file rule is written unconditionally, is **not** amended by this skill, and nothing in the harness
 makes a skill outrank the always-loaded root instructions — the two texts are **not mechanically
-reconciled**. This rule states the *intended* behaviour for a finding raised inside a review gate; a
-consequence-less in-gate finding may still be filed under `AGENTS.md:27`. The residual — `AGENTS.md` still files a
+reconciled**. This rule states the *intended* behaviour for a finding raised inside a review gate: such a
+finding is **not** to be filed. Nothing in the harness *forces* that — an agent that ignores this rule
+may still file one under `AGENTS.md:27`, which is the residual below. The residual — `AGENTS.md` still files a
 consequence-less finding on *incidental discovery while working*, i.e. outside any gate — is **known and
 unfixed**: #906, which would have scoped it, was closed **NOT_PLANNED** on 2026-09-15 (as was #903), so
 nothing tracks it. Closing it needs a clause in `AGENTS.md` and `templates/AGENTS.base.md`; that is a

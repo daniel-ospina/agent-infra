@@ -144,6 +144,8 @@ Only `[ERROR]` items trigger the fix-loop. `[WARNING]` items are logged but do n
 with **no adequate consequence** is advisory — logged, never blocking, never filed — and a review that
 returns ≥1 item with none carrying an adequate consequence is malformed, not clean: record the marker,
 re-dispatch once, exit non-clean (canonical: `proportional-gates` §Findings Must Declare Consequence).
+Where this gate's retry bound (5 iterations) is already spent, record the marker and exit non-clean
+without the extra dispatch.
 
 ### Fix-Loop
 

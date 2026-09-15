@@ -140,7 +140,7 @@ Verified on `main` @ 6b25167:
   (L398–L400) — keyed on the **failing job set**, and the dedup matches on that title (the canonical
   paginate-then-find shape of `.github/workflows/enforce-skills.yml:89`).
 - The fix landed in `77a3e8d` (2026-09-13, #937/#938), with a sibling worktree
-  `.worktrees/fix/903-autofiler-dedup`.
+  `.worktrees/fix-903-autofiler-dedup` (branch `fix/903-autofiler-dedup`).
 - **Stale duplicates remaining OPEN: 2** — #975 (`main broken by merge (6f1f3d7)`) and #976
   (`main broken by merge (6c59118)`). Both titles carry a SHA, so both were minted by the **pre-fix**
   filer whose SHA-bearing title guaranteed uniqueness; both predate `77a3e8d`. The filer minted **35**
@@ -149,7 +149,8 @@ Verified on `main` @ 6b25167:
   titles prove the pre-fix filer, and two distinct SHAs are two distinct commits, not the same-title race.)*
 - **Re-check mechanism (not a bare "ask"):** owner = this task's controller; trigger = the question
   is posed in the #903 PR body, and if neither of #975/#976 is closed by the time this PR merges, the
-  operator on call for agent-infra closes the two within 24h and records it on #903.
+  operator on call for agent-infra closes the two within 24h. (The record of that closure is the issue
+  itself — **not** a comment on #903, which §1.3 establishes is closed and not a re-raise target.)
 
 ---
 
@@ -230,9 +231,11 @@ reviewer erase a whole cycle by omitting the field. Therefore:
   the reviewer verdict, never a count.
 
 **Precedence (two clauses).**
-1. Against `AGENTS.md:27`'s auto-file rule: it does not re-mandate a consequence-less reviewer finding
-   into an issue. The bar governs findings *inside a review gate*; the auto-file rule still governs an
-   agent discovering a defect while working (§1.3).
+1. Against `AGENTS.md:27`'s auto-file rule: the bar states that a consequence-less finding raised *inside a
+   review gate* is not filed. `AGENTS.md` is **not** amended and the two texts are **not mechanically
+   reconciled** — nothing forces compliance, so an agent may still file one under `AGENTS.md:27`. The bar
+   governs findings *inside a review gate*; the auto-file rule governs an agent discovering a defect while
+   working (§1.3), and that residual is untracked.
 2. Against `AGENTS.md`'s Review Loop Protocol / Hard Cap: for exit conditions, the `clean` predicate is
    the reviewer's verbatim clean verdict and the conformance floor above is what stops a
    consequence-less cycle from being declared clean. A cycle with findings but no consequences is not a
@@ -313,7 +316,7 @@ issue, or (ii) an emitter file defining an `ISSUE` schema dispatched by such a g
 this repo's own tooling". This plan uses the source's own formulation — `[inherited — #903 §3;
 classification not reproducible to a split]` — rather than re-deriving a percentage.
 
-**Role B — 25 consumer gate/reference files:**
+**Role B — 26 consumer gate/reference files:**
 
 | File | Role |
 |---|---|
@@ -329,53 +332,56 @@ classification not reproducible to a split]` — rather than re-deriving a perce
 | `skills/meta-framework-research/workflow/07-review-gate.md` | Research gate (fresh-context review gate) |
 | `skills/planning/shared/research/SKILL.md` | Project/standalone research gate — dispatches a fresh-context reviewer returning `ISSUES: <list>` with a 10-cycle fix-loop (the plan's own inclusion criterion (i)) |
 | `skills/executing-plans/SKILL.md` | Batch-verification gate — its dispatched verification sub-agent returns `ISSUE` blocks with a retry-then-takeover loop. Included after cycle 3; only that one dispatch site (L564) is edited, the file's deterministic check echoes are not |
-
 | `skills/commit-workflow/workflow/03-code-review.md` | **In-pipeline migration-review gate** (Step 2.5) — dispatches a fresh-context `task` reviewer returning `STATUS: CLEAN \| HAS_ISSUES` with an `[ERROR]`/`[WARNING]` blocking class and its own fix-loop. Added after cycle 4: the earlier "deterministic scanner class" exclusion was **false** — this is an LLM reviewer applying a judgement checklist, not the pattern-scan |
 | `skills/plan-review/references/reviewers/{architectural-soundness,efficiency,integration,structural-pattern}.md` (4) | Reviewer **dimension specs** — `architectural-soundness.md` and `integration.md` are cited by `skills/reviewers/architectural-soundness/SKILL.md:17` and `skills/reviewers/integration/SKILL.md:17`; `efficiency.md` and `structural-pattern.md` have no inbound reference but each carries the same `ISSUE:` schema, which is the actual ground for including all four. Added after cycle 4: they carry `severity:` with no field, and "undispatched" was too weak a reason to leave a schema uncovered |
 | `skills/subagent-driven-development/{SKILL.md,spec-reviewer-prompt.md,code-quality-reviewer-prompt.md}` | **In-session plan-execution gate** — dispatches a spec-compliance reviewer and a code-quality reviewer, each returning `ISSUES_FOUND` with a priority class, in a fix-and-re-review loop. Added after cycle 5: it is the sibling mode of `executing-plans` in the same plan-execution stage, and it met the same inclusion criterion |
+| `skills/task-workflow-standard/SKILL.md` | **Standard+complex pipeline verifier gate** — its `## Verifier Gate Protocol` parses findings and keeps the gate locked until every dispatched verifier returns clean. Added after cycle 6: it is in the engineering delivery pipeline and blocks on findings, so it is an in-scope consumer |
 
 **Role A — 15 emitter files:** the 15 `skills/reviewers/*/SKILL.md` **plus the inline `ISSUE:` schemas inside the gate files above** (see below).
 
-**Role B count breakdown:** 25 files = **15 `SKILL.md` gates** + `code-review/references/fixer-loop.md`
+**Role B count breakdown:** 26 files = **16 `SKILL.md` gates** + `code-review/references/fixer-loop.md`
 + `meta-framework-research/workflow/07-review-gate.md` + `commit-workflow/workflow/03-code-review.md`
-+ 3 `subagent-driven-development/*.md` + 4 `plan-review/references/reviewers/*.md`. Of the 15 gates,
-`plan-review` and `executing-plans`
++ 3 `subagent-driven-development/*.md` + 4 `plan-review/references/reviewers/*.md`. Of the 16 gates,
+`plan-review`, `executing-plans` and `task-workflow-standard`
 already cite `proportional-gates`, so **13** gain the citation.
 
-**Per-file finding-emitter site counts (the §6 threshold).** The threshold is **`consequence:` occurrences
-minus the 2 contributed by the file's own header blockquote**, so it is a per-file site count, not a
-file-wide floor (a whole-file count passes vacuously on the blockquote alone):
+**Per-file finding-emitter site counts (the §6 threshold).** The count is a **curated** per-file figure:
+`consequence:` occurrences minus the 2 the file's own header blockquote contributes, plus any dispatched
+return token in the same file. It is recorded per file **because** a whole-file count passes vacuously on
+the blockquote alone, which is why §4.4a's commands — not this table — are the binding check.
 
-| File | site count |
+| File | site count (curated) |
 |---|---|
 | `code-review` | 16 |
 | `plan-review` | 5 |
 | `test-review` | 4 |
-| `issue-scoping` | 3 |
+| `issue-scoping` | 5 |
 | `prototype-review` | 1 |
 | `verification-before-completion` | 1 |
 | `research` | 3 (schema + 2 dispatch tokens) |
-| the five other epic gates (`align`,`research`,`verify`,`plan`,`scope`) | 1 each, plus 1 return token each |
+| the five other epic gates (`align`,`research`,`verify`,`plan`,`scope`) | 2 each (schema + return token) |
+| `epic-plan` | 3 |
+| `epic-scope` | 3 |
 | `epic-decompose` | 3 (per-issue schema, MECE schema, return token) |
 | `planning/shared/research` | 2 (blockquote + return token) |
-| `executing-plans` | 2 (schema + return token) |
+| `executing-plans` | 3 (schema + return token + floor) |
+| `task-workflow-standard` | 1 (gate protocol + floor) |
 | `commit-workflow/workflow/03-code-review.md` | 1 schema block (2 items) |
 | `subagent-driven-development/{SKILL,spec-reviewer-prompt,code-quality-reviewer-prompt}.md` | 1–2 each |
 | 4 `plan-review/references/reviewers/*.md` | 1 each |
-| `code-review/references/fixer-loop.md` | 1 (blockquote only; the reviewer path is prose) |
-| `meta-framework-research/workflow/07-review-gate.md` | 1 (return instruction) |
+| `code-review/references/fixer-loop.md` | 2 (blockquote + floor) |
+| `meta-framework-research/workflow/07-review-gate.md` | 1 (return instruction + floor) |
 | each of the 15 `skills/reviewers/*/SKILL.md` | 1 |
 
-The 15 emitter files are listed explicitly because an earlier revision of this section omitted them, which
-left 15 of the edited files outside every recorded check. Numbers are re-measured at implementation time
-with the §4.4a commands; what matters is that the threshold is *recorded per file*, not self-graded.
+The 15 emitter files are listed explicitly because an earlier revision omitted them, which left 15 of the
+edited files outside every recorded check.
 
 **Canonical rule — 1 file:** `skills/proportional-gates/SKILL.md`.
 
 Role A and Role B are **disjoint** except for the inline schemas, which live *inside* Role B's gate
-files (so they add no file to the count). Intervention 2 edits **1 canonical + 25 gate/reference + 15
-reviewer-emitter = 41 distinct files**; intervention 1 adds 1. **Grand total edited: 42 files** (plus
-this plan doc = 43 changed paths).
+files (so they add no file to the count). Intervention 2 edits **1 canonical + 26 gate/reference + 15
+reviewer-emitter = 42 distinct files**; intervention 1 adds 1. **Grand total edited: 43 files** (plus
+this plan doc = 44 changed paths).
 
 The inline `ISSUE:` schemas were **not** left to the per-gate blockquote: every `severity:` schema line
 in the gate files was given the field — **30 sites** across `code-review` (16), `plan-review` (5),
@@ -397,6 +403,8 @@ the criterion above, not by omission**:
 | `skills/code-review/ARCHIVE-pi-v2.0.0.md` | Superseded archive; excluded from drift scans by the `ARCHIVE*` filter in `tier-config-parity.test.ts` |
 | `skills/commit-workflow/workflow/04-merge-deploy.md`, `skills/test-writing/SKILL.md` | **Consumer exit steps, not emitters.** They key a merge/loop decision on findings the gate has *already* voided or counted; they declare no finding schema and no severity-blocking rule of their own |
 | `skills/post-deploy-verify/SKILL.md` | WARN-ONLY post-merge clickthrough gate (**never blocks the pipeline**). Agent-executed, and it does file issues (Step 4, `clickthrough-failure:` prefix) — but those are failures observed **post-merge while working**: discovery-while-working under `AGENTS.md:27`, not in-gate reviewer findings. Excluded by that distinction, and the residual path is untracked (#906 closed `NOT_PLANNED`) |
+| `skills/strategy-builder/SKILL.md` (+ `references/protocols.md`), `skills/strategy-to-pitch-components/**` | Go-to-market strategy / outreach-content pipeline — outside the engineering delivery pipeline, so out by the criterion (their adversarial-review protocols flag `severity: critical/major/minor` inside a strategy loop, not a delivery gate) |
+| `skills/commit-workflow/SKILL.md` | The commit-workflow **index**, not a gate: it names the ≥1-dispatch floor enforced by the `review-enforcer` extension and declares no finding schema of its own (it counts dispatches, not verdicts) |
 | `skills/test-debt-gate/SKILL.md` | Deterministic gate classifications (baseline-diff, `test-baseline.json`-keyed) with an auto-file protocol. Deliberately files a scoped issue per accepted debt — a filing **policy**, not a reviewer finding |
 | `skills/qa-mission/SKILL.md`, `skills/ux-qa/SKILL.md`, `skills/friction-triage/SKILL.md` | Agent-invoked issue emitters outside the engineering delivery pipeline (QA missions and friction triage file scoped issues by design; not in-gate reviewer findings) |
 
@@ -424,14 +432,14 @@ schema occurrence in each gate file, not one per file.
   `### P2 — Should Fix (blocks merge)` heading reworded — otherwise the file would simultaneously say
   "P2 blocks merge" and "P2 is advisory", the *silent, self-contradictory* disablement §4.5 exists to
   avoid.
-- **Gate files (25):** the rule is added to (a) every inline `ISSUE:` schema and every `ISSUES:` return token, (b) the reviewer-dispatch instruction, and (c) the merge/parse/fix/exit step, where a finding lacking an adequate `consequence:` is voided for blocking **and** for filing — plus the conformance floor (§4.1) and, in each of the **15** gate `SKILL.md` files, the `proportional-gates` citation (**13** of them lack it today).
+- **Gate files (26):** the rule is added to (a) every inline `ISSUE:` schema and every `ISSUES:` return token, (b) the reviewer-dispatch instruction, and (c) the merge/parse/fix/exit step, where a finding lacking an adequate `consequence:` is voided for blocking **and** for filing — plus the conformance floor (§4.1) and, in each of the **16** gate `SKILL.md` files, the `proportional-gates` citation (**13** of them lack it today).
 - **Canonical rule (1):** a short new section in `skills/proportional-gates/SKILL.md`. **It is not
   true that every gate already cites it** — today `grep -rln proportional-gates skills/` returns:
   `plan-review`, `issue-workflow`, `project-workflow`, `task-workflow-standard`, `executing-plans`,
   `execution-intent`, `commit-workflow/workflow/01-preflight.md`,
-  `writing-plans/workflow/02-research-intake.md`, and `proportional-gates` itself. Of the 14 consumer
-  gates, only `plan-review` and `executing-plans` cite it, so **Task 4 adds the citation to the other
-  thirteen.** The new
+  `writing-plans/workflow/02-research-intake.md`, and `proportional-gates` itself. Of the **16** consumer
+  gate `SKILL.md` files, three already cite it (`plan-review`, `executing-plans`, `task-workflow-standard`),
+  so **Task 4 adds the citation to the other thirteen.** The new
   section is placed so it cannot disturb the machine-parsed `### Review Cycles` table or the single
   `<!-- adversarial-bound: cap=2 -->` anchor pinned by
   `extensions/loop-enforcer/tier-config-parity.test.ts`.
@@ -480,9 +488,9 @@ awk '/^Severity: P0 \| P1 \| P2$/{s=$0; getline; if ($0 !~ /consequence:/) print
   skills/reviewers/*/SKILL.md | tee /dev/stderr | wc -l
 # (2) the one finding schema with NO `severity:` line — `epic-decompose`'s MECE block — expect 1
 grep -A1 'type: overlap | gap' skills/epic-decompose/SKILL.md | grep -c 'consequence:'
-# (3) every dispatched return token must name the field — expect no output
+# (3) every dispatched return token must name the field — expect 0 lines
 grep -rn 'ISSUES:' skills/ --include=*.md | grep -v 'consequence:' \
-  | grep -v 'record each verdict\|no\*\* verdict\|disposition\|satisf' # disposition tables are not tokens
+  | grep -vi 'record each verdict\|with \*\*no\*\* verdict\|gates \*proceeding\*\|satisf' | wc -l
 ```
 
 **Two case variants exist and both must be checked.** Gate schemas use lowercase indented `severity:`;
@@ -571,7 +579,7 @@ are reworded per §4.5; `check-skill-lint` exits 0.
 
 **Intent:** A consequence-less finding is advisory — not blocking, not counted, not filed — without
 opening a vacuous-pass channel.
-**Acceptance:** **every finding-emitting site** in each of the 25 gate/reference files carries the field — both the
+**Acceptance:** **every finding-emitting site** in each of the 26 gate/reference files carries the field — both the
 `ISSUE:` schemas *and* the `ISSUES: <list>` return tokens of the six epic gates and `planning/shared/research` (which have **zero**
 `ISSUE:` occurrences, so a bare `ISSUE:` count would pass vacuously), plus the one `ISSUE:` schema with
 **no `severity:` line** (`epic-decompose`'s MECE block) and the third dispatch site in `issue-scoping`
@@ -625,7 +633,7 @@ No `.ts`/`.py` changes → typecheck/build skipped per `proportional-gates` §Pr
 | Touch point | Type | Covered by | Status |
 |---|---|---|---|
 | Reviewer output schema (dispatched files) | skill prose | Task 3 (15 files) | ✅ |
-| Reviewer output schema (inline in gates) | skill prose | Task 4 (25 gate/reference files, every occurrence) | ✅ |
+| Reviewer output schema (inline in gates) | skill prose | Task 4 (26 gate/reference files, every occurrence) | ✅ |
 | Gate conformance floor (incl. the gates added in review) | skill prose | Task 4 — every gate states the floor and the spent-bound carve-out | ✅ |
 | Gate blocking decision + conformance floor | skill prose | Task 4 | ✅ |
 | Issue-filing path from findings | skill prose | Task 4 — advisory findings are not filed | ✅ |

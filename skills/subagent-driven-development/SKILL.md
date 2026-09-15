@@ -208,7 +208,8 @@ the spec reviewer or the code-quality reviewer returns must declare
 not block the re-review loop and is never filed as an issue. A review round that returns ≥1 issue and
 **none** carrying an adequate consequence is malformed reviewer output, not a clean round: record
 `⚠️ reviewer returned N consequence-less findings`, re-dispatch that reviewer once, and exit the loop
-**non-clean**. A round with zero issues is clean.
+**non-clean**. A round with zero issues is clean. Where the loop's retry budget is already spent, record
+the marker and exit non-clean without the extra dispatch.
 
 ## Example Workflow
 

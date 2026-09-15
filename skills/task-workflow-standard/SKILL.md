@@ -75,10 +75,12 @@ VERIFY (gate: verifier — blocks write/edit/bash)
 At each verifier gate (scope-verify, plan-verify, verify):
 
 1. **Dispatch the gate's own count** via the `task` tool — scope: `issue-scoping` §Tier Scaling; plan: `proportional-gates` §Review Cycles; verify: `verification-before-completion` (one verifier sub-agent)
-2. Each dispatched agent returns structured output with `NO ISSUES FOUND` or an issue list
-3. The gate stays locked (blocks write/edit/bash/MCP) until ALL dispatched agents return clean
-4. If any agent finds issues → fix them → re-dispatch ALL
+2. Each dispatched agent returns structured output with `NO ISSUES FOUND` or an issue list — **every issue must declare `consequence: <what breaks, who observes it>`** (canonical: `proportional-gates` §Findings Must Declare Consequence). An issue without an adequate consequence is **advisory**: it does not block this gate, is not counted, and is not filed as an issue.
+3. The gate stays locked (blocks write/edit/bash/MCP) until ALL dispatched agents return clean — where "clean" means each gate's own clean token, never a count, and never a substring of a qualified token
+4. If any agent finds a **blocking** issue → fix it → re-dispatch ALL
 5. Only `NO ISSUES FOUND` from every dispatched agent advances the gate (adversarial domain: `THREAT SURFACE COVERED` substitutes — see below)
+
+**Conformance floor.** A round that returns ≥1 issue and **none** carrying an adequate `consequence:` is malformed reviewer output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit the gate **non-clean**. Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch — the floor never widens a bound (`AGENTS.md` §Hard Cap counts every dispatch as a round).
 
 **The gate does NOT advance on dispatch count alone.** Verifier content is checked. A verifier that finds issues keeps the gate locked so the agent must fix and re-verify.
 
