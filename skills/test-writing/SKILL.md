@@ -135,9 +135,13 @@ Before writing implementation code, verify the test against this checklist. **Al
 
 **⛔ MANDATORY GATE — blocks Green phase until clean.** After the 7-point self-check passes, dispatch `test-review` as a `task` sub-agent for independent review. The self-check is the writer reviewing their own work; `test-review` brings an external perspective with 4 parallel reviewers checking correctness, coverage+surface, journey-alignment, and test-quality.
 
-**Dispatch (multi-file, single invocation):**
+**Dispatch (multi-file, single invocation).** `TEST DIFF` and `SABOTAGE EVIDENCE` are REQUIRED fields — reviewer 1's discriminating-power check is decidable only from them, and omitting them makes that check fire blind. **What goes in `SABOTAGE EVIDENCE` depends on which path you are on, and on the TDD path below it is expected to be empty:**
+
+- **(a) TDD path** — the test was written before the implementation, so this gate runs *before* Step 4 (run the test) and Step 5 (implement the fix). There is no fix to revert yet, so `"none supplied"` is the correct and expected value here; reviewer 1's fallback branch governs, and that is not a gap.
+- **(b) Pin added to an existing suite** (the fix already exists — the regression case, and the one #820 is about) — perform the Step 4 sabotage procedure **now**, before dispatching, and paste the observed failure. Do not leave this empty: on this path an empty field is exactly the vacuous-pin condition the check exists to catch.
+- If a batch mixes both, fill in (b)'s evidence and say so; do not leave the field blank because part of the batch is TDD-authored.
 ```
-task(prompt='test-review: <file1> <file2> ... --caller test-writing \n\nSURFACE MAP: <surface map from plan doc>\nJOURNEY MAP: <journey map from plan doc>\n\nTEST FILE 1: <full content>\nTEST FILE 2: <full content>\n...')
+task(prompt='test-review: <file1> <file2> ... \n\nTEST DIFF: <diff of the test files in this batch, or "none supplied">\nSABOTAGE EVIDENCE: <per the must-fail requirement in Step 4 below — see the two cases above; write "none supplied" if there is none>\nSURFACE MAP: <surface map from plan doc>\nJOURNEY MAP: <journey map from plan doc>\n\nTEST FILE 1: <full content>\nTEST FILE 2: <full content>\n...')
 ```
 
 All changed test files from this implementation batch are dispatched in a SINGLE task sub-agent invocation. Limit 5 files per dispatch (context window). test-review runs its full protocol (Phases 0-5) and returns per-file results.
@@ -169,6 +173,22 @@ npx vitest run <test-file> --reporter=verbose 2>&1 | tail -10
 - Verify the test setup isn't accidentally providing the correct answer
 - Rewrite the test
 
+*Exception — a **pin added to an existing suite** (see the must-fail requirement below): the implementation already exists, so a green run here is the **expected** result. For that case the must-fail run is the sabotage run described below, not this one.*
+
+**Gate — this must-fail requirement covers every new or changed assertion, not only the pre-implementation case above.** The test you just ran was written *before* the implementation. The far more common case — and the one with no pre-implementation run at all — is a **pin added to an existing suite** after the fact: the regression test for a bug you have just fixed. That assertion is never run against broken code, so it never passes the must-fail requirement, and the pipeline counts it as evidence anyway.
+
+For that case, prove the pin by **sabotage**:
+
+1. Revert the fix (or re-introduce the defect) in place.
+2. Run the assertion. **It must fail, for the reason you expect** — not a load error, not a different assertion.
+3. Restore the fix and confirm it passes.
+
+**If Step 3.5(b) already ran this sabotage before dispatching the review, do not repeat it here** — carry the same output forward.
+
+An assertion you cannot make fail pins nothing. It is a **vacuous pin** — worse than no test, because the pipeline counts it. Three were caught in one change in this repo; none would have been without that pass, and each looked correct on inspection.
+
+**An equality on a value that is identical under *every* schedule cannot pin a race.** The observable must *differ* between the buggy and the fixed schedule. For a double-resolve or a torn read the settled value is the same either way, so the discriminating observable is an **operation history**: count the invocations (a `PATH` shim is enough) and assert the exact count — 2 against the bug, 1 against the fix. (The count assertion is itself a value equality; that is fine. The point is the *counted quantity* separates the schedules, while the settled value does not.)
+
 ### Step 5 — Implement (Minimal Code to Pass)
 
 Write the minimum code that makes the test pass. No more.
@@ -199,21 +219,6 @@ After green, clean up:
 - Simplify logic
 
 Re-run tests after each refactor. Keep the cycle tight — refactor only what was just implemented.
-
-**Post-refactor re-hash:** After refactoring, re-hash all test files touched in this cycle. Write per-file hash to `~/.pi/agent/test-review/<sha256-of-absolute-test-file-path>.json`:
-
-```json
-{
-  "status": "CLEAN" | "CAPPED",
-  "test_file_path": "/absolute/path/to/test.test.ts",
-  "source_file_paths": ["/absolute/path/to/source.ts"],
-  "composite_hash": "<sha256>",
-  "timestamp": "<ISO8601>",
-  "capped_issues": [{"severity": "P0|P1|P2", "dimension": "...", "description": "..."}]
-}
-```
-
-Hash schema is defined here in test-writing (single source of truth). Include `PASS` on its own line in console output for VGATE compatibility.
 
 ### Step 8 — Report
 

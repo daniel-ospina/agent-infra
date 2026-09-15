@@ -95,7 +95,7 @@ export interface RiskRow {
   risk: string;
   /** Reviewer count parsed from the Reviewers cell. */
   reviewers: number;
-  /** Max Cycles cell; the Low row's em-dash means "no re-review cycles" → 0. */
+  /** Max Cycles cell; the Low row's em-dash means "0 loop cycles" (the loop never runs) → 0. */
   maxCycles: number;
 }
 
@@ -1188,7 +1188,7 @@ test("tripwire control: legitimate refactors still pass", () => {
 
 test("rejects a non-numeric Reviewers cell (same strictness as Max Cycles)", () => {
   const bogus = MARKDOWN.replace(
-    "| Low-Medium (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |",
+    "| Low-Medium (small plan, existing patterns) | 2 reviewers | 3 |",
     "| Low-Medium (small plan, existing patterns) | many reviewers | 3 |",
   );
   ok(bogus !== MARKDOWN, "control did not apply — the Low-Medium row text moved; update this control");

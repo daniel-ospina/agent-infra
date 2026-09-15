@@ -5,7 +5,7 @@
  *
  * Review-cycle caps ARE authorised — proportionally. AGENTS.md (Hard Cap)
  * holds the fallback (10) and names the canonical proportional table in
- * `skills/proportional-gates/SKILL.md`: Low → no re-review (—), Low-Medium → 3,
+ * `skills/proportional-gates/SKILL.md`: Low → 0 loop cycles (`—`), Low-Medium → 3,
  * Medium-High → 5, High → 10.
  * (Pre-#723 wording here claimed "no numeric caps without explicit user
  * authorization", which stopped being true when the proportional table landed.)
@@ -84,7 +84,7 @@ export interface CycleData {
  * not a guard (#723).
  */
 export const REVIEW_CYCLE_CAPS = {
-  /** Low — 1 reviewer, no re-review cycles. Never 0 *reviewers*: #485 blocks every tier at 0 dispatches. */
+  /** Low — 1 reviewer dispatch, 0 loop cycles (this cap counts TOTAL cycles, so 0 = no loop ever runs). Never 0 *reviewers*: #485 blocks every tier at 0 dispatches. */
   skip: 0,
   /** Low-Medium — 2 reviewers. */
   lowMedium: 3,
