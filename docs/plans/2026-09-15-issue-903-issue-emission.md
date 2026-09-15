@@ -342,9 +342,10 @@ classification not reproducible to a split]` — rather than re-deriving a perce
 
 **Role B count breakdown:** 27 files = **17 `SKILL.md` gates** + `code-review/references/fixer-loop.md`
 + `meta-framework-research/workflow/07-review-gate.md` + `commit-workflow/workflow/03-code-review.md`
-+ 3 `subagent-driven-development/*.md` + 4 `plan-review/references/reviewers/*.md`. Of the 16 gates,
-`plan-review`, `executing-plans` and `task-workflow-standard`
-already cite `proportional-gates`, so **13** gain the citation.
++ 3 `subagent-driven-development/*.md` + 4 `plan-review/references/reviewers/*.md`. Of the **17** gates,
+three already cite `proportional-gates` (`plan-review`, `executing-plans`, `task-workflow-standard`),
+so **14** gain the citation. All 17 cite it after this change (verified: `git grep -l proportional-gates
+origin/main -- 'skills/**/SKILL.md'` = 3 of them; HEAD = 17).
 
 **Per-file finding-emitter site counts (the §6 threshold).** The count is a **curated** per-file figure:
 the number of *finding-emitting sites* in the file — `severity:` schema lines, dispatched return tokens,
@@ -453,7 +454,7 @@ schema occurrence in each gate file, not one per file.
 | Pinned by | What it pins | Constraint on the edit |
 |---|---|---|
 | `extensions/loop-enforcer/tier-config-parity.test.ts` | `skills/proportional-gates/SKILL.md` `### Review Cycles` table | Add nothing inside the table region; the new section goes after it |
-| same suite | exactly one `adversarial-bound: cap=2` anchor in **each of the 8 `ADVERSARIAL_SURFACES`** — **five of them are edited here**: `skills/proportional-gates/SKILL.md` (anchor L96, Task 2), `skills/code-review/SKILL.md:894`, `skills/code-review/references/fixer-loop.md` (anchor L75, immediately above the `BOUND=10` line), `skills/plan-review/SKILL.md:72`, `skills/issue-scoping/SKILL.md:937` | Add **no** second anchor at any of the five; keep each existing one in place |
+| same suite | exactly one `adversarial-bound: cap=2` anchor in **each of the 8 `ADVERSARIAL_SURFACES`** — **six of them are edited here**: `skills/proportional-gates/SKILL.md` (anchor L96, Task 2), `skills/code-review/SKILL.md:894`, `skills/code-review/references/fixer-loop.md` (anchor L75, immediately above the `BOUND=10` line), `skills/plan-review/SKILL.md:72`, `skills/issue-scoping/SKILL.md:937`, `skills/task-workflow-standard/SKILL.md` | Add **no** second anchor at any of the six; keep each existing one in place |
 | same suite | `STALL_THRESHOLD_SURFACES` — every live `skills/**/*.md` is scanned both ways: each listed surface keeps a numeric `stall_threshold` default, and no other file declares one. **Six** edited files are surfaces: `code-review/SKILL.md:839`, `code-review/references/fixer-loop.md`, `issue-scoping/SKILL.md:933`, `plan-review/SKILL.md:113/:494`, `test-review/SKILL.md:425`, `verification-before-completion/SKILL.md:182/:186` | No new `stall_threshold` mention anywhere, and **no decimal number within the 120-char window** of the existing ones (the scan takes the first `\d+\.\d+` in that window); do not remove an existing declaration |
 | same suite | `skills/code-review/references/fixer-loop.md`: `CANONICAL_L1_BLOCK` exactly once, exactly one `### L1 — Exit conditions` heading, no `BOUND=` outside it, no extra `ADVERSARIAL_BOUND` reference | The fixer-loop edit is **prose on the reviewer-finding path only** — the embedded parser, its field list, its `EXIT_REASON="clean"` branches and `ISSUES_PER_CYCLE_JSON` are **not** touched (§4.4); introduce no `BOUND=`/`ADVERSARIAL_BOUND` token |
 | `extensions/review-enforcer/index.test.ts` (`CONTRACT_DOC_PINS`) | `skills/code-review/SKILL.md` region `### Step 10a` → `## Standard-Tier Review`, tokens `clean-micro`/`complexity:micro`/`exit 4`/`not multi-agent` | The code-review edit stays **outside** that window |
