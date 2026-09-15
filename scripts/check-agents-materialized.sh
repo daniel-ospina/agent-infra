@@ -35,12 +35,13 @@ fi
 
 # ── Resolve the materializer. Physical pwd: scripts/ may be a symlink to
 # agent-infra (consumer repos). Physical pwd keeps the default AGENT_INFRA_PATH
-# (= HERE/..) pointing at the real agent-infra install so (a) the drift
-# warning resolves the canonical base template and (b) the materializer is the
+# (= HERE/..) pointing at the real agent-infra install so (a) the drift check
+# resolves the canonical base template (--check prefers the script's own
+# physical parent and falls back to this var) and (b) the materializer is the
 # agent-infra copy even when invoked via symlink. A logical pwd would default
-# AGENT_INFRA_PATH to the consumer root — harmless for the marker gate (--check
-# never reads the template; lazy resolution), but it would silently disable the
-# best-effort drift warning when the env var is unset.
+# AGENT_INFRA_PATH to the consumer root — which matters now that the content
+# compare exists: the fallback would not resolve, and the compare would be
+# skipped (reported, never silently green) instead of running.
 HERE="$(cd -P "$(dirname "$0")" && pwd -P)"
 MATERIALIZER="$HERE/materialize-agents.sh"
 
@@ -70,22 +71,37 @@ if ! OUTPUT="$(bash "$MATERIALIZER" --check "$STAGE_DIR" 2>&1)"; then
   echo ""
   echo "⛔ [agent-infra] AGENTS.md is a STUB — universal rules never reach the model."
   echo "   The file references AGENTS.base.md by URL, but pi only reads LOCAL files."
+  # Surface the materializer's own output: it carries the `MISSING:` heading list
+  # and a MARKER-AWARE remediation. Discarding it (as an earlier revision did)
+  # left a marker-less file being told to run `--new`, which the materializer's
+  # own clobber guard refuses.
+  printf '%s\n' "$OUTPUT"
   echo "   Materialize it (base text inline + repo-specific tail below):"
   echo "     bash $MATERIALIZER --new $(pwd -P) <repo-tail-file>"
   echo "   Or refresh an existing materialized file:"
   echo "     bash $MATERIALIZER --merge $(pwd -P)"
+  echo "   (If the message above says this file predates the BASE-END marker, follow"
+  echo "    ITS guidance instead — both --new and --merge refuse in that case.)"
   echo ""
   exit 1
 fi
 
-# Passed (exit 0). Distinguish CLEAN from BASE-OWNED CONTENT DRIFT: drift is
-# non-blocking (the rules still reach the model), but reporting it as a green
-# "passed" would be a lie (#1027) — the same lie `--check` used to tell. The
-# machine key is emitted by the materializer and is stable.
+# Passed (exit 0). The materializer distinguishes three non-failing outcomes,
+# and they must NOT be collapsed into one green line (#1027):
+#   clean  → base-owned region compared and matches
+#   drift  → BASE-OWNED CONTENT DRIFTED (non-blocking; rules still reach pi)
+#   skip   → no template resolvable, so the content compare never ran
+#            ("content compare skipped") — a green "passed" here would be a
+#            comparison-free pass, exactly what this gate must not print.
 if grep -q 'BASE-OWNED CONTENT DRIFTED' <<<"$OUTPUT" \
    || grep -q 'base-owned content compare could not run' <<<"$OUTPUT"; then
-  echo "$OUTPUT" | grep -E 'base head differs|compare could not run' || true
+  printf '%s\n' "$OUTPUT" | grep -E 'base head differs|compare could not run' || true
   echo "[agent-infra] ⚠️ AGENTS.md materialization gate: markers present, but base-owned content DRIFTED (non-blocking — run --merge to refresh; the required CI check pins content)"
+  exit 0
+fi
+if grep -q 'content compare skipped' <<<"$OUTPUT"; then
+  printf '%s\n' "$OUTPUT" | grep 'content compare skipped' || true
+  echo "[agent-infra] ⚠️ AGENTS.md materialization gate: passed HEADINGS ONLY — base-owned content was not compared (base template not resolvable)"
   exit 0
 fi
 echo "[agent-infra] ✅ AGENTS.md materialization gate: passed"

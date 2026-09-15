@@ -10,9 +10,11 @@
 #                    rule heading is present, then (b) the BASE-OWNED REGION matches
 #                    the canonical template (line-subsequence when the file has no
 #                    BASE-END marker; exact head compare when it does).
-#                    Exit 0 = materialized (content drift is reported as a ⚠️ but
-#                    is NON-blocking — rules still reach the model), 1 = stub/missing
-#                    heading (authoring-time gate). Never exits 2.
+#                    Exit 0 = materialized (content drift is reported with the
+#                    machine key BASE-OWNED CONTENT DRIFTED, but is NON-blocking —
+#                    the rules still reach the model), 1 = stub/missing required
+#                    heading (authoring-time gate), 2 = usage error (wrong argv,
+#                    via usage()). A well-formed `--check` never returns 2.
 #   --merge <repo>   Rewrite AGENTS.md = current base + existing tail after the
 #                    marker (idempotent; safe to re-run after base changes).
 #                    FIRST-TIME migration is NOT automatic — the human curates the
@@ -46,7 +48,17 @@ MODE="$1"; REPO="$2"
 # AGENT_INFRA_PATH) — otherwise a false "STUB" block masks a materialized
 # file (#600 review P2).
 resolve_base_template() {
-  BASE_TEMPLATE="${AGENT_INFRA_PATH:-$(cd -P "$(dirname "$0")/.." && pwd -P)}/templates/AGENTS.base.md"
+  # Resolution ORDER must match `--check`'s (script's own physical parent first,
+  # then AGENT_INFRA_PATH). If it did not, a stale AGENT_INFRA_PATH could make
+  # --check report drift against base A while the --merge it recommends rewrites
+  # against base B — a loop with no way to converge.
+  local self_dir
+  self_dir="$(cd -P "$(dirname "$0")/.." 2>/dev/null && pwd -P)" || true
+  if [ -n "$self_dir" ] && [ -f "$self_dir/templates/AGENTS.base.md" ]; then
+    BASE_TEMPLATE="$self_dir/templates/AGENTS.base.md"
+  else
+    BASE_TEMPLATE="${AGENT_INFRA_PATH:-$self_dir}/templates/AGENTS.base.md"
+  fi
   [ -f "$BASE_TEMPLATE" ] || { echo "❌ base template missing: $BASE_TEMPLATE"; exit 1; }
 }
 
@@ -115,13 +127,38 @@ if [ "$MODE" = "--check" ]; then
       # SUBSEQUENCE. Repo-specific additions are allowed (that is the repo-owned
       # tail). Operand order pins direction: template FIRST, so `^<` = "a base
       # line missing from the file".
-      if DIFF_OUT=$(diff <(tr -d '\r' < "$BASE_T") <(tr -d '\r' < "$f")); then
+      #
+      # `--text` is LOAD-BEARING, not cosmetic: without it, GNU diff switches to
+      # BINARY mode when either side contains a NUL byte and prints only
+      # "Binary files ... differ" — zero `^<` lines — so BASE_ONLY would read 0
+      # and a file with every base-owned rule deleted would print the CLEAN line
+      # (a fail-open, found by the #1027 adversarial review). `--text` forces a
+      # line-wise comparison regardless of content. A suite case pins it.
+      #
+      # The marker-less path deliberately re-emits BOTH the `base head differs`
+      # first line and the BASE-OWNED CONTENT DRIFTED key; only the key is new.
+      # `base head differs` is retained for legacy/unmigrated hook copies that
+      # still grep that exact string (see scripts/check-agents-materialized.sh's
+      # history) — removing it would silently blind those copies. The updated
+      # hook keys on the machine key and the skip/drift wording, not this line.
+      if DIFF_OUT=$(diff --text <(tr -d '\r' < "$BASE_T") <(tr -d '\r' < "$f")); then
         drc=0
       else
         drc=$?
       fi
       if [ "$drc" -eq 2 ]; then
+        # Defensive: both operands are asserted to be readable regular files, so
+        # this fires only on an unexpected diff failure. Kept so a degraded
+        # compare can never be mistaken for a clean one.
         echo "   ⚠️  base-owned content compare could not run (diff exit 2)"
+        echo "⚠️ $REPO: materialized (9 base rule headings present) but base-owned content compare could not run (internal error)"
+        exit 0
+      fi
+      # Belt-and-braces for the binary-mode class `--text` closes: if diff exited
+      # non-zero yet emitted no `<`/`>` line at all, the comparison is degraded —
+      # never report that as clean.
+      if [ "$drc" -eq 1 ] && ! grep -qE '^[<>]' <<<"$DIFF_OUT"; then
+        echo "   ⚠️  base-owned content compare produced no line-level output (degraded)"
         echo "⚠️ $REPO: materialized (9 base rule headings present) but base-owned content compare could not run (internal error)"
         exit 0
       fi

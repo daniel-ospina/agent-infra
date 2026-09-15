@@ -113,7 +113,8 @@ and whenever the template does not resolve, and prints `✅ … materialized (al
 4. `templates/AGENTS.base.md` — Fix-Broken enrichment (anchor untouched).
 5. `AGENTS.md` — conform + restore `## Memory Hygiene` + `$10` + typos + declared blocks; `^<`==0.
 6. CI: a new **step in the existing `pipeline-compliance` job** (`.github/workflows/pipeline-compliance.yml`),
-   shape: `if [ -f tests/materialize-agents/run.sh ]; then grep -q '^<' tests/materialize-agents/run.sh || { echo "::error::suite carries no real-repo pin"; exit 1; }; bash tests/materialize-agents/run.sh; elif [ -f manifest.json ] && [ -f bin/agent-infra.js ]; then echo "::error::…"; exit 1; else echo "::notice::consumer checkout — skipped"; fi`
+   shape: `if [ -f tests/materialize-agents/run.sh ]; then grep -qF 'diff --text "$BASE" "$ROOT/AGENTS.md"' tests/materialize-agents/run.sh || { echo "::error::suite carries no real-repo pin"; exit 1; }; bash tests/materialize-agents/run.sh; elif [ -f pi-bootstrap/setup.sh ] || [ -f manifest.json ]; then echo "::error::…"; exit 1; else echo "::notice::consumer checkout — skipped"; fi`
+   (⚠️ review cycle 1: the first revision used `grep -q '^<'` — in BRE `^` is an ANCHOR, so it can never match the suite's `cnt=…grep -c '^<'` line. It exited 1 on every PR and made the required check RED. The guard now pins the counting construct with `-F`, and the agent-infra sentinel is two independent paths so a benign rename cannot open a silent skip.)
    (the self-integrity grep sits INSIDE the suite-exists branch so it cannot run — or red — on a consumer
    checkout). `.github/workflows/ci.yml` `drift-check` job runs `bash tests/materialize-agents/run.sh`
    (visible). Re-record `scripts/workflow-lock.json`. Acceptance: the required context name stays

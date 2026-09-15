@@ -149,20 +149,27 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f tests/materialize-agents/run.sh ]; then
-            # The real-repo pin (`diff templates/AGENTS.base.md AGENTS.md`,
-            # counting `^<`) is what makes the suite non-vacuous. A suite that
-            # lost it would still pass every fixture case and pin nothing, so
-            # assert its presence before trusting its verdict.
-            if ! grep -q '^<' tests/materialize-agents/run.sh; then
-              echo "::error::tests/materialize-agents/run.sh carries no real-repo pin (^<) — the #1027 base-owned-region assertion cannot be trusted."
+            # Assert the PIN CONSTRUCT, not a bare two-character substring. The
+            # first revision used `grep -q '^<'`, which in BRE is an ANCHOR — it
+            # can only match a line that begins with `<`, which no line of the
+            # suite does. It therefore exited 1 on every PR, turning the repo's
+            # ONLY required check red (caught by the #1027 adversarial review).
+            # `-F` + the full `diff --text <base> <AGENTS.md>` invocation pins the
+            # real-repo comparison itself, not a diagnostic that shares its text.
+            if ! grep -qF 'diff --text "$BASE" "$ROOT/AGENTS.md"' tests/materialize-agents/run.sh; then
+              echo "::error::tests/materialize-agents/run.sh carries no real-repo pin — the #1027 base-owned-region assertion cannot be trusted."
               exit 1
             fi
             bash tests/materialize-agents/run.sh
-          elif [ -f manifest.json ] && [ -f bin/agent-infra.js ]; then
+          elif [ -f pi-bootstrap/setup.sh ] || [ -f manifest.json ]; then
+            # Two independent agent-infra-only sentinels, so a benign rename of
+            # either one cannot open a silent skip. `pi-bootstrap/` is never
+            # shipped to consumers (the bootstrap copies only AGENTS.md,
+            # .mcp.json and .husky); manifest.json is the consumer ship-list.
             echo "::error::agent-infra checkout detected but tests/materialize-agents/run.sh is missing — the #1027 base-owned-region pin would silently stop running."
             exit 1
           else
-            echo "::notice::consumer checkout (no agent-infra manifest) — materialize-agents suite skipped"
+            echo "::notice::consumer checkout — materialize-agents suite skipped"
           fi
 
   workflow-drift:

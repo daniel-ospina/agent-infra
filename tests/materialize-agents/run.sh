@@ -192,7 +192,7 @@ if [ "$GITOK" -eq 1 ]; then
   cp "$HOOK" "$h/scripts/check-agents-materialized.sh"
   cp "$MAT" "$h/scripts/materialize-agents.sh"
   grep -v '^#### Hard Cap$' "$BASE" > "$h/AGENTS.md"
-  hout="$( cd "$h" && git add -A >/dev/null 2>&1; env AGENT_INFRA_PATH="$h" bash scripts/check-agents-materialized.sh 2>&1 )"; hrc=$?
+  hout="$( cd "$h" && git add AGENTS.md >/dev/null 2>&1; env AGENT_INFRA_PATH="$h" bash scripts/check-agents-materialized.sh 2>&1 )"; hrc=$?
   if [ "$hrc" -eq 1 ] && grep -q 'STUB' <<<"$hout"; then
     pass "hook: missing required heading → STUB block (exit 1)"
   else
@@ -201,7 +201,7 @@ if [ "$GITOK" -eq 1 ]; then
   # drift (not a missing heading) → hook must not print a green 'passed'
   cp "$BASE" "$h/AGENTS.md"
   sed -i.bak 's/^## ⛔ DESIGN PRINCIPLE: Good > Easy$/## ⛔ DESIGN PRINCIPLE: Good > Cheap/' "$h/AGENTS.md"; rm -f "$h/AGENTS.md.bak"
-  hout="$( cd "$h" && git add -A >/dev/null 2>&1; env AGENT_INFRA_PATH="$h" bash scripts/check-agents-materialized.sh 2>&1 )"; hrc=$?
+  hout="$( cd "$h" && git add AGENTS.md >/dev/null 2>&1; env AGENT_INFRA_PATH="$h" bash scripts/check-agents-materialized.sh 2>&1 )"; hrc=$?
   if [ "$hrc" -eq 0 ] && grep -q 'DRIFTED' <<<"$hout" && ! grep -q '✅ AGENTS.md materialization gate: passed' <<<"$hout"; then
     pass "hook: content drift → ⚠️ DRIFTED, no green 'passed' (exit 0)"
   else
@@ -211,13 +211,79 @@ else
   echo "   ⏭️  SKIP hook-level case: \`git init\` blocked locally (hub-state gate); runs in CI"
 fi
 
-# ── Real-repo regression pin: base is a line-subsequence of AGENTS.md ───────
-cnt="$(diff "$BASE" "$ROOT/AGENTS.md" | grep -c '^<' || true)"
-if [ "${cnt:-0}" -eq 0 ]; then
-  pass "real-repo pin: every base line present in AGENTS.md, in order"
+# ── NUL/binary-mode control (#1027 adversarial review): a NUL byte made GNU
+# diff switch to binary mode and emit zero `^<` lines, so a file with base-owned
+# content deleted printed the CLEAN line. The compare now passes `--text`; this
+# case fails without that flag.
+d="$(new_fixture nulbyte)"
+python3 -c "
+import sys
+ls = open(sys.argv[1], 'rb').read().split(b'\n')
+del ls[20:30]
+open(sys.argv[2], 'wb').write(b'\x00' + b'\n'.join(ls))
+" "$BASE" "$d/AGENTS.md"
+out="$(run_check "$d")"; rc=$?
+case "$out" in
+  *'BASE-OWNED CONTENT DRIFTED'*)
+    if [ "$rc" -eq 0 ] && ! grep -q '^✅ ' <<<"$out"; then
+      pass "NUL/binary-mode file with base lines deleted → drift (not a clean ✅)"
+    else
+      fail "NUL case: drift reported but rc=$rc or a plain ✅ was printed"
+    fi ;;
+  *)
+    fail "NUL case: binary-mode comparison degraded to a non-drift result (rc=$rc)"; sed -n '1,4p' <<<"$out" ;;
+esac
+
+# ── Required-heading list ↔ base agreement. The materializer's list carries the
+# claim "keep this list in sync with tests/materialize-agents/run.sh"; this is
+# the assertion that makes it true. Without it a legitimate base REWORD passes
+# agent-infra's own CI while every consumer's --check starts exiting 1 (STUB).
+markers="$(sed -n '/for marker in/,/; do$/p' "$MAT" \
+  | grep -v 'for marker in' \
+  | sed -e 's/^[[:space:]]*//' -e 's/^"//' \
+        -e 's/"[[:space:]]*\\\{0,1\}[[:space:]]*; do[[:space:]]*$//' \
+        -e 's/"[[:space:]]*\\\{0,1\}[[:space:]]*$//')"
+nmarkers="$(printf '%s\n' "$markers" | grep -c . || true)"
+if [ "${nmarkers:-0}" -eq 9 ]; then
+  pass "materializer declares exactly 9 required headings"
 else
-  fail "real-repo pin: ${cnt} base line(s) missing/modified in AGENTS.md"
-  diff "$BASE" "$ROOT/AGENTS.md" | grep '^<' | sed -n '1,10p'
+  fail "materializer declares ${nmarkers:-0} required headings (expected 9)"
+fi
+bad=0
+while IFS= read -r m; do
+  [ -n "$m" ] || continue
+  grep -qF -- "$m" "$BASE" || { fail "required heading not present in the base: '$m'"; bad=1; }
+done <<<"$markers"
+[ "$bad" -eq 0 ] && pass "all 9 required headings exist verbatim in templates/AGENTS.base.md"
+
+# ── Hook skip path must state that the comparison did not run (#1027 review).
+d="$(new_fixture hookskip --no-base)"
+cp "$BASE" "$d/AGENTS.md"
+out="$(run_check "$d" AGENT_INFRA_PATH=)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'content compare skipped' <<<"$out"; then
+  pass "skip path states the comparison did not run (no bare green)"
+else
+  fail "skip path: expected the explicit 'content compare skipped' wording (rc=$rc)"
+fi
+
+# ── Real-repo regression pin: base is a line-subsequence of AGENTS.md.
+# diff's own status is captured, so a `diff` internal failure (rc 2, e.g. an
+# unreadable file) FAILS here instead of being swallowed into "no drift".
+if DIFF_OUT=$(diff --text "$BASE" "$ROOT/AGENTS.md"); then
+  drc=0
+else
+  drc=$?
+fi
+if [ "$drc" -eq 2 ]; then
+  fail "real-repo pin: diff exited 2 (internal error) — cannot verify the pin"
+else
+  cnt="$(grep -c '^<' <<<"$DIFF_OUT" || true)"
+  if [ "${cnt:-0}" -eq 0 ]; then
+    pass "real-repo pin: every base line present in AGENTS.md, in order"
+  else
+    fail "real-repo pin: ${cnt} base line(s) missing/modified in AGENTS.md"
+    grep '^<' <<<"$DIFF_OUT" | sed -n '1,10p'
+  fi
 fi
 
 # ── Adversarial-anchor pin: exactly one anchor per AGENTS surface ───────────
