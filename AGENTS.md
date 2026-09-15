@@ -10,7 +10,7 @@
 
 ## ⛔ HARD RULE: Auto-Continue — NEVER PAUSE WITHOUT A REASON
 
-**Default: GO.** Do not stop to ask if you should continue. Do not wait unless there's a hard dependency. The session is the user's authorization — they already said "do the thing" by starting it. Your job is to keep moving until you hit a real gate.
+**Default: GO.** Do not stop. Do not ask. Do not wait. The session is the user's authorization — they already said "do the thing" by starting it. Your job is to keep moving until you hit a real gate.
 
 **Forbidden:** Any question whose answer is trivially "yes" — this means:
 - "Ready?" "Proceed?" "Continue?" "Shall I…?" "Want me to…?" "Should I…?"
@@ -19,12 +19,12 @@
 
 **Only pause if at least one is true:**
 1. A skill explicitly mandates a human gate (sign-off, approval, decision point)
-2. P0 consequence risk (data loss, security, unrecoverable cost >$15/mo)
+2. P0 consequence risk (data loss, security, unrecoverable cost >$10/mo)
 3. Genuinely ambiguous — research was inconclusive (<50% confidence) and you need a decision
 
 If none of those apply: **keep going.** The user can interrupt if they disagree.
 
-**Auto-file rule:** When you encounter a bug, workflow gap, missed edge case, or improvement opportunity → check if there's alreayd an open GitHub issue for it and if not, file immediately. Never ask "should I file an issue?" — just file it.
+**Auto-file rule:** When you encounter a bug, workflow gap, missed edge case, or improvement opportunity → file a GitHub issue immediately. Never ask "should I file an issue?" — just file it.
 
 ---
 
@@ -38,18 +38,19 @@ Your role is to work within the skills and processes framework we have explicitl
 
 **When a dependency is broken (MCP server down, database unreachable, API returning errors, connection failing, auth broken), you MUST fix the root cause OR get explicit human authorization to change the plan/workflow.** Do NOT silently change approach, point at a different backend, enable a fallback, or "make it work" with a workaround without either (a) fixing the actual breakage, or (b) human sign-off on the change.
 
-**If you need auth or credentials, ask for them.** Do not create complciaitons when simply requesting the user to do auth would solve the problem.
+**If you need auth or credentials, ask for them.** Do not create complications when simply requesting the user to do auth would solve the problem.
 
 **This rule exists because of a real incident (2026-08-05):** the planned FalkorDB Cloud connection was failing (#7795). Instead of debugging the connection, an agent silently shipped a self-hosted FalkorDB container on Fly.io with AOF disabled and no off-box backup. That fallback had no durability — a later test run wiped the production graph (5,748 points) and it was only partially recoverable. A single unresolved failure compounded into permanent data loss because the workaround was never flagged for human review.
 
 **The pattern to follow when something is broken:**
 1. **Diagnose first** — read the error, trace the root cause, confirm what's actually failing (skills: `debug-workflow`, `find-bugs`)
-2. **Use research skill to confirm what's the cannonical architecture and SOTA solution** - we want to be a fats follwoer on bets practices everywhere that is not unique to us.
-3.. **Fix the root cause with durable solutions** — reconnect, repair config, fix the bug. This is the default. Avoid patchy solutions that compound debt, we want clean archietcure that is simple yet complete. If you need to change the current architecture, escalate.
+2. **Research the canonical architecture and SOTA solution** — use the research skill to confirm what the canonical architecture and state-of-the-art solution are; we want to be a fast follower on best practices everywhere that is not unique to us.
+3. **Fix the root cause with durable solutions** — reconnect, repair config, fix the bug. This is the default. Avoid patchy solutions that compound debt; we want clean architecture that is simple yet complete. If you need to change the current architecture, escalate.
 4. **If you cannot fix it** (needs credentials, external service access, decision) — **STOP and escalate**: report the diagnosis + proposed fallback to the human, get explicit approval BEFORE changing the architecture, backend, or workflow
 5. **Never ship a fallback as if it were the plan** — a workaround (embedded DB instead of managed, self-host instead of cloud, local instead of remote) is a red flag that must be surfaced, not absorbed
 
 **Signs you are working around instead of fixing:**
+- Changing which backend/service a system points at (cloud → self-hosted, remote → local, prod → test) to make a test pass or a deploy succeed
 - Enabling a "fallback mode" that wasn't in the approved plan
 - "It works now" after switching to a different service, with no explanation of why the original failed
 - Disabling a failing check instead of repairing the cause
@@ -60,20 +61,21 @@ Your role is to work within the skills and processes framework we have explicitl
 
 ## ⛔ DESIGN PRINCIPLE: Good > Easy
 
-When choosing between two approaches, prefer the one that produces the better outcome over the one that's easier to implement. Quality of result trumps implementation convenience. Easy paths accumulate into brittle systems; good paths cost more upfront but pay back in reliability, extensibility, and user satisfaction. When in doubt, use the research skill to find the SOTA solution based on high-quality system design.
+When choosing between two approaches, prefer the one that produces the better outcome over the one that's easier to implement. Quality of result trumps implementation convenience. Easy paths accumulate into brittle systems; good paths cost more upfront but pay back in reliability, extensibility, and user satisfaction.
 
 ## ⛔ USER QUESTIONS PROTOCOL: research and ask without jargon
 
-When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be cannonical, e.g. as per ontology document)
+When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be canonical, e.g. as per ontology document)
 
 ## ⛔ SESSION RECAP PROTOCOL: don't recount trivia about what happened, present state and decisions.
 
-If you're going to present a recap at the end of a turn or session, don't say things like "Cycle 3 found the worst bug of the whole lane" or "Two corrections I had to make about my own work" unless they're changing the scope, architecture or UX that was agreed. Insted present the state, key design principles/decisions made, and cleanly present any user decisions needed (see USER QUESTIONS PROTOCOL) or next steps. If the next steps are just to continue, do not step and just continue (see NEVER PAUSE WITHOUT A REASON)
+If you're going to present a recap at the end of a turn or session, don't say things like "Cycle 3 found the worst bug of the whole lane" or "Two corrections I had to make about my own work" unless they're changing the scope, architecture or UX that was agreed. Instead present the state, key design principles/decisions made, and cleanly present any user decisions needed (see USER QUESTIONS PROTOCOL) or next steps. If the next steps are just to continue, do not stop and just continue (see NEVER PAUSE WITHOUT A REASON)
 
 ---
 
 <!-- REPO-SPECIFIC: Add your skill compliance table here. Map trigger → skill → consequence of skipping. -->
 
+<!-- REPO-SPECIFIC (agent-infra): vendored swarm artifacts — see VENDOR.md -->
 **Vendored swarm artifacts** (scripts/parallel_work_check.*, scripts/checkout_guard.sh, connectors/): see `VENDOR.md` — base rev + patch ledger + drift gate (`scripts/check-vendor-drift.sh --manifest`).
 
 ## ⛔ HARD RULE: Skill Compliance
@@ -191,6 +193,7 @@ Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context �
 
 <!-- REPO-SPECIFIC: Add tool-specific exceptions here (e.g., design_reviewer for Claude Opus) -->
 
+<!-- REPO-SPECIFIC (agent-infra): builtin task-dispatch ledger + task-session retention (#783) -->
 ## Durable Dispatch Record & Task-Session Retention (#783)
 
 **Every builtin `task` dispatch that settles abnormally writes one immutable outcome row**
@@ -270,7 +273,7 @@ Does **not** apply to: routine project file reads, git operations, local shell c
 
 ## File Pre-Existing Bugs
 
-When you encounter a **pre-existing bug** (not introduced by your current work), check if it's already filed as a Github issue and if not **file an issue for it.** Do not treat "out of scope" as a reason to skip. Known bugs carried silently forward accumulate into build rot. Add to the issue a requirement to investigate whether any SOTA architecture would resolve the bug.
+When you encounter a **pre-existing bug** (not introduced by your current work), **file a GitHub issue for it.** Do not treat "out of scope" as a reason to skip. Known bugs carried silently forward accumulate into build rot.
 
 ---
 
@@ -339,6 +342,12 @@ When writing or updating any doc in `docs/`, auto-populate entity metadata from 
 
 <!-- REPO-SPECIFIC: Reference your ontology doc for entity types and predicates. Canonical ontology: tortoise repo `docs/ONTOLOGY.md` (v3.1) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§1.1 types, §2.2 predicates). In repos that keep a docs/teams tree (eldato layout), reference `docs/teams/<team>/domains (S1)/<domain>/ONTOLOGY.md` if present. -->
 
+
+## Memory Hygiene
+
+- `MEMORY.md` must stay under 150 lines.
+- `MEMORY.md` = raw coding gotchas only (things that bite mid-code). Not an implementation log, not a docs index.
+- Format: `[category]: [what broke] → [root cause] → [the fix]`
 
 ## Memory Contracts
 

@@ -2829,7 +2829,7 @@ const FLASH_ROOT: LegRef = { provider: "deepseek", model: "deepseek-flash" };
 // unchanged) and the migration-window input spelling. legIdentity() normalizes
 // it onto FLASH_ROOT, so both spellings must resolve identically.
 const FLASH_ROOT_LEGACY: LegRef = { provider: "deepseek", model: "deepseek-v4-flash" };
-const OPENROUTER_FLASH: LegRef = { provider: "openrouter", model: "deepseek/deepseek-v4-flash" };
+const OPENROUTER_FLASH: LegRef = { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" }; // #727
 const QWENTP_FLASH: LegRef = { provider: "qwen-tp", model: "deepseek-v4-flash-0731" };
 
 section("#715 default surfaces — the task-tool in-code default is pinned");
@@ -3289,7 +3289,8 @@ test("decidePostDispatch: terminal hop leg connection-error → return (never re
       fromLeg: FLASH_ROOT,
       env,
     });
-    // active leg is openrouter (terminal — last in chain when qwen-tp blocked)
+    // active leg is openrouter (terminal — the last SERVABLE leg: the retired
+    // 0423 entry that follows it is resolution-only since #727)
     equal(readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"].activeLeg.provider, "openrouter");
     const decision = decidePostDispatch({
       result: connErrResult(),

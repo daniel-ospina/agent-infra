@@ -506,10 +506,10 @@ test("interactive 402: durable latch + notice + setModel hop onto the chain leg"
     equal(rec.source, "interactive");
     equal(rec.notice?.title, "Provider credit exhausted", "notice stored on the latch record");
     // qwen-tp blocked by default → hop = openrouter slug
-    deepEqual(rec.families["deepseek-v4-flash"].activeLeg, { provider: "openrouter", model: "deepseek/deepseek-v4-flash" });
+    deepEqual(rec.families["deepseek-v4-flash"].activeLeg, { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" });
     equal(pi.setModelCalls.length, 1, "setModel called once");
     equal(pi.setModelCalls[0].provider, "openrouter");
-    equal(pi.setModelCalls[0].id, "deepseek/deepseek-v4-flash", "next turn hops onto the openrouter leg (Model object)");
+    equal(pi.setModelCalls[0].id, "deepseek/deepseek-v4.1-flash", "next turn hops onto the openrouter leg (Model object)");
   } finally {
     restoreEnv();
     cleanup();
@@ -568,8 +568,9 @@ test("HOP-OWN drain under a healthy root: own record + DIRECT return to the prim
   const { env, cleanup } = hermetic();
   applyEnv(env);
   try {
-    // Session explicitly on the openrouter hop leg; deepseek root NEVER
-    // latched (healthy). openrouter's OWN credits drain (independent account).
+    // Session pinned to the LEGACY 0423 slug (a pre-#727 stale session: it was
+    // the hop leg then, and is RESOLUTION-ONLY now); deepseek root NEVER latched
+    // (healthy). openrouter's OWN credits drain (independent account).
     const pi = makeFakePi();
     extension(pi as any);
     await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
@@ -597,7 +598,8 @@ test("banner accuracy (round-4 P2-1): hop-own drain says 'drained its own credit
   try {
     const pi = makeFakePi();
     extension(pi as any);
-    // hop-own drain on openrouter under a healthy (absent) root
+    // hop-own drain on openrouter under a healthy (absent) root — the session is
+    // pinned to the retired 0423 slug, which must behave as the same provider leg
     await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
     const drainBanner = banners.find((b) => b.title.startsWith("Hop provider drained"));
     ok(drainBanner, "hop-own drain banner fired");
@@ -694,7 +696,7 @@ test("session_start on a latched family hops BEFORE the first prompt (tui); prin
     await pi.emit("session_start", { reason: "startup" }, ctx("tui", modelObj("deepseek", "deepseek-v4-flash")));
     equal(pi.setModelCalls.length, 1, "tui hops at session start");
     equal(pi.setModelCalls[0].provider, "openrouter");
-    equal(pi.setModelCalls[0].id, "deepseek/deepseek-v4-flash");
+    equal(pi.setModelCalls[0].id, "deepseek/deepseek-v4.1-flash");
     const pi2 = makeFakePi();
     await pi2.emit("session_start", { reason: "startup" }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
     equal(pi2.setModelCalls.length, 0, "print children never hop (CLI authoritative — sC3)");
@@ -799,21 +801,22 @@ test("interactiveHopTarget: latched root → first available leg; clear/terminal
     });
     deepEqual(interactiveHopTarget({ provider: "deepseek", model: "deepseek-v4-flash" }, readLatchState(env), env), {
       provider: "openrouter",
-      model: "deepseek/deepseek-v4-flash",
+      model: "deepseek/deepseek-v4.1-flash",
     });
     // #715 migration window: the CANONICAL-spelling session leg hops identically
     // (an un-migrated legacy session and a canonical one share the chain).
     deepEqual(interactiveHopTarget({ provider: "deepseek", model: "deepseek-flash" }, readLatchState(env), env), {
       provider: "openrouter",
-      model: "deepseek/deepseek-v4-flash",
+      model: "deepseek/deepseek-v4.1-flash",
     });
     // same-leg: the session is ALREADY on the active (hop) leg → null
     equal(
-      interactiveHopTarget({ provider: "openrouter", model: "deepseek/deepseek-v4-flash" }, readLatchState(env), env),
+      interactiveHopTarget({ provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" }, readLatchState(env), env),
       null,
       "already on the active leg → no re-hop",
     );
-    // TERMINAL state: latch from the terminal openrouter leg → halted → null
+    // TERMINAL state: latch from the FINAL table leg (#727: the legacy-generation
+    // slug is last) → halted → null
     setExhausted({
       primaryProvider: "deepseek",
       reason: "402",

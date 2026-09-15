@@ -125,6 +125,66 @@ jobs:
           fi
           PIPELINE_COMPLIANCE_SELF_TEST=1 bash scripts/check-pipeline-compliance.sh
 
+      - name: AGENTS.md materialize gate suite (#1027 — base-owned region pin)
+        # #1027 — `scripts/materialize-agents.sh --check` validated the base rule
+        # headings by PRESENCE only: a base-owned paragraph could be deleted, or a
+        # universal rule silently reworded, while `--check` still printed a green
+        # ✅. That is exactly the class the gate exists to prevent (a stub ships
+        # ZERO universal rules — #600), one level down. The suite pins it: a
+        # missing required heading exits 1; base-owned content drift is reported
+        # and never rendered as a plain ✅.
+        #
+        # Why this job: `pipeline-compliance` is the repo's ONLY required status
+        # check (#646), so this is the one place the suite blocks a merge. It also
+        # runs in ci.yml's `drift-check` job, where it is visible but not
+        # merge-blocking. HONEST SCOPE: every CI gate in this repo is PR-editable
+        # (#713 class) — a PR that removes this step or no-ops the suite can still
+        # merge green. The step is fail-closed for *suite-file-missing*, not for
+        # deliberate removal.
+        #
+        # The self-integrity grep sits INSIDE the suite-exists branch on purpose:
+        # on a consumer checkout reusing this file via workflow_call the suite is
+        # absent by design, and running the grep there would red a legitimate
+        # consumer build.
+        run: |
+          set -euo pipefail
+          if [ -f tests/materialize-agents/run.sh ]; then
+            # Assert the PIN CONSTRUCT, not a bare two-character substring. The
+            # first revision used `grep -q '^<'`, which in BRE is an ANCHOR — it
+            # can only match a line that begins with `<`, which no line of the
+            # suite does. It therefore exited 1 on every PR, turning the repo's
+            # ONLY required check red (caught by the #1027 adversarial review).
+            #
+            # A plain `grep -qF <literal>` is not enough either: it matches a
+            # COMMENTED-OUT invocation, so a one-character `#` would silently stop
+            # the pin while this guard stayed green (reproduced in review). The
+            # awk below skips comment lines and matches the literal with index(),
+            # so only a live invocation satisfies it. Single-quoted: `$BASE` and
+            # `$ROOT` are awk's, not the shell's. No pipe, so no SIGPIPE risk.
+            #
+            # Residual, stated plainly: this is a source-text tripwire, not a
+            # proof the pin RAN. A PR that edits the suite to make the pin a no-op
+            # is the repo's disclosed #713 class (every CI gate here is
+            # PR-editable); the suite's own positive control is what pins the
+            # pin's behaviour.
+            if ! awk 'BEGIN{s="diff --text \"$BASE\" \"$ROOT/AGENTS.md\""} /^[[:space:]]*#/{next} index($0,s){f=1} END{exit(f?0:1)}' tests/materialize-agents/run.sh; then
+              echo "::error::tests/materialize-agents/run.sh carries no live real-repo pin — the #1027 base-owned-region assertion cannot be trusted."
+              exit 1
+            fi
+            bash tests/materialize-agents/run.sh
+          elif [ -f pi-bootstrap/setup.sh ] || { [ -f manifest.json ] && [ -f bin/agent-infra.js ]; }; then
+            # Two signals, each agent-infra-ONLY. `pi-bootstrap/` is never shipped
+            # to consumers; `bin/agent-infra.js` likewise. A bare `manifest.json`
+            # is NOT one of these — it is a generic filename (PWA/extension
+            # manifests), and this workflow is reusable by consumers via
+            # `workflow_call`, so testing it alone would red a legitimate consumer
+            # build (found in the #1027 review).
+            echo "::error::agent-infra checkout detected but tests/materialize-agents/run.sh is missing — the #1027 base-owned-region pin would silently stop running."
+            exit 1
+          else
+            echo "::notice::consumer checkout — materialize-agents suite skipped"
+          fi
+
   workflow-drift:
     # #303 drift guard — reusable workflows must be REAL COMMITTED FILES in
     # .github/workflows/, materialized from templates/ by

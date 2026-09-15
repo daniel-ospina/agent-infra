@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-14
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, custom-provider-openrouter, provider-failover, issue-284, issue-476, issue-637
+aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, custom-provider-openrouter, provider-failover, issue-284, issue-476, issue-637, issue-727
 ---
 
 # Provider reliability guide — qwen + the task tool
@@ -286,11 +286,41 @@ with automatic return after balance restore.
 - Marker-only latch trigger (fail-closed nonce auth on the child marker).
 - Alias-family hop chains: `deepseek-flash (canonical; legacy alias
   deepseek-v4-flash) → qwen-tp/deepseek-v4-flash-0731
-  → openrouter/deepseek/deepseek-v4-flash` (qwen-tp is env-blocked until its
+  → openrouter/deepseek/deepseek-v4.1-flash` (qwen-tp is env-blocked until its
   401 remediation; default chain while blocked: deepseek → openrouter). The
   family KEY stays the legacy `deepseek-v4-flash` (it is the durable latch-state
   key); `familyOf`/`legIdentity` normalize BOTH root spellings onto the chain,
   so an un-migrated legacy frontmatter/session keeps its hop protection.
+  #727: the openrouter hop leg is the **V4.1** slug, so a failover serves the
+  same generation as the primary instead of the April 0423 build. Cost delta on
+  the emergency leg: `deepseek/deepseek-v4-flash`'s $0.0882/$0.1764 (cache-read
+  $0.01764) vs `deepseek/deepseek-v4.1-flash` — 1.70x input / 3.40x output in the
+  DeepSeek first-party OFF-PEAK window ($0.15/$0.60, cache-read $0.003) and
+  3.40x / 6.80x at the catalog reference + peak windows ($0.30/$1.20, cache-read
+  $0.006); cache-read is cheaper than the 0423 slug's in both. Accepted
+  2026-09-14 and recorded here per #727 indicator (c). The legacy
+  `deepseek/deepseek-v4-flash` entry stays in the table but is RESOLUTION-ONLY
+  (`RESOLUTION_ONLY_LEGS`): it is there so stale pre-#727 state (latch file /
+  in-flight marker / session pinned to the slug) still matches its own leg — an
+  absent entry would make `nextLegAfter`'s startIdx -1 and restart the walk at
+  `legs[0]` (the DRAINING root for an in-flight marker, where the write path
+  walks pre-write state, #715; the first AVAILABLE leg for a read-side latch) —
+  while no automatic path can serve it or advance onto it: the
+  advance walk skips it, resolution's latched-active fast path refuses a frozen
+  `activeLeg` that is this slug (a pre-#727 latch recorded exactly that — such a
+  record re-resolves the family's first available leg, i.e. the V4.1 openrouter
+  leg while `qwen-tp` stays config-blocked, instead of dispatching the older
+  build), and a dispatch of the retired slug under a fresh latch is re-resolved
+  the same way. The only way to run the 0423 build is to ask for that exact leg
+  with nothing for resolution to re-derive: no fresh latch at all (`clear`), an
+  explicit must-stay dispatch (`PI_FAILOVER_NO_HOP=1`), or the kill switch
+  (`PROVIDER_FAILOVER_DISABLE=1`) — all three return the requested leg verbatim.
+  The advance walk therefore HALTS after the V4.1 leg, exactly where it halted
+  before the V4.1 leg existed.
+  Thinking is CONFIGURABLE on the V4.1 leg (off/high/max — the levels the
+  deepseek primary can express); `minimal`/`low`/`medium` stay unmapped for hop
+  parity — the upstream slug accepts them, the primary cannot express them, and
+  a hop must not change the session's thinking level.
 - Env knobs: `PROVIDER_FAILOVER_DISABLE=1` (kill switch), `PI_FAILOVER_NO_HOP=1`
   (must-stay), `PROVIDER_EXHAUSTION_TTL_MS` (latch TTL, default 24h — the poller
   is the real clear authority; a stale latch self-heals in one TTL at the

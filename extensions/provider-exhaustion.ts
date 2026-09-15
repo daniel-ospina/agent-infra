@@ -90,8 +90,8 @@ export function sessionFamily(model: string | undefined): string | undefined {
  * ({id, provider, api, baseUrl, ...} — empirically verified, round-2 P0); an
  * id string is accepted defensively (legacy/harness). Returns the parts the
  * pure helpers consume. NEVER feed the raw ctx.model into string parsing: an
- * openrouter leg id is "deepseek/deepseek-v4-flash" (slash INSIDE the id) and
- * must not be split as provider/model. */
+ * openrouter leg id is "deepseek/deepseek-v4.1-flash" (#727; slash INSIDE the
+ * id) and must not be split as provider/model. */
 export function modelParts(ctxModel: unknown): { provider: string; model: string } {
   if (ctxModel && typeof ctxModel === "object") {
     const m = ctxModel as { id?: unknown; provider?: unknown };

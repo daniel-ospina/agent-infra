@@ -402,6 +402,9 @@
         "deepseek/deepseek-v4-flash": {
           "contextWindow": 300000
         },
+        "deepseek/deepseek-v4.1-flash": {
+          "contextWindow": 300000
+        },
         "deepseek/deepseek-v4-flash-0731": {
           "contextWindow": 300000
         },
