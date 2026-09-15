@@ -512,8 +512,8 @@ Deep bug scan — read full changed files plus their import graph. Trace callers
 
 1. Read each changed file in full (not just the diff).
 2. Trace imports to identify callers and callees across the codebase:
-   grep -r "from '.*<module-path>'" --include='*.ts' --include='*.tsx'
-   grep -r "<symbol>(" --include='*.ts' --include='*.tsx'
+   git grep -n -e "from '.*<module-path>'" -- '*.ts' '*.tsx'
+   git grep -n -e "<symbol>(" -- '*.ts' '*.tsx'
 3. Map the call graph around each change. Check for:
    - Broken interface contracts: function signature changes that callers don't handle (changed return type, added/removed parameter, different error shape)
    - Cascading side effects: mutations, events, or DB writes that downstream code assumes won't change

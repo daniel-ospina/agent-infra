@@ -311,19 +311,19 @@ if not policy.can_view():
 
 ```bash
 # Missing authorization checks
-grep -rn "def get_\|def post_\|def put_\|def delete_" --include="*.py" | grep -v "@require\|@login\|permission"
+git grep -n -e "def get_\|def post_\|def put_\|def delete_" -- '*.py' | grep -v "@require\|@login\|permission"
 
 # Direct object access without ownership check
-grep -rn "\.get(.*id)\|\.filter(id=" --include="*.py" | grep -v "user_id\|owner"
+git grep -n -e "\.get(.*id)\|\.filter(id=" -- '*.py' | grep -v "user_id\|owner"
 
 # Mass assignment
-grep -rn "\*\*request\.\|update(\*\*\|create(\*\*" --include="*.py"
+git grep -n -e "\*\*request\.\|update(\*\*\|create(\*\*" -- '*.py'
 
 # Path traversal risk
-grep -rn "os\.path\.join.*request\|open(.*request" --include="*.py"
+git grep -n -e "os\.path\.join.*request\|open(.*request" -- '*.py'
 
 # Admin endpoints
-grep -rn "admin\|superuser" --include="*.py" | grep "route\|endpoint"
+git grep -n -e "admin\|superuser" -- '*.py' | grep "route\|endpoint"
 ```
 
 ---

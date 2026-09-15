@@ -361,16 +361,16 @@ def add_cors(response):
 
 ```bash
 # Missing CSRF protection
-grep -rn "@app\.route.*POST\|@router\.post" --include="*.py" | grep -v "csrf"
+git grep -n -e "@app\.route.*POST\|@router\.post" -- '*.py' | grep -v "csrf"
 
 # State-changing GET requests
-grep -rn "\.delete\|\.update\|\.create" --include="*.py" | grep "GET"
+git grep -n -e "\.delete\|\.update\|\.create" -- '*.py' | grep "GET"
 
 # CORS wildcards
-grep -rn "Access-Control-Allow-Origin.*\*" --include="*.py"
+git grep -n -e "Access-Control-Allow-Origin.*\*" -- '*.py'
 
 # Framework CSRF disabled
-grep -rn "csrf_exempt\|WTF_CSRF_ENABLED.*False\|csrf.*disable" --include="*.py"
+git grep -n -e "csrf_exempt\|WTF_CSRF_ENABLED.*False\|csrf.*disable" -- '*.py'
 ```
 
 ---
