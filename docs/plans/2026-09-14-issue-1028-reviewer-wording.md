@@ -1,4 +1,25 @@
+---
+title: "#1028 — reframe the review-dispatch floor as a review, not a run — Scope & Plan"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-09-14
+aboutSubjects: organisation-design-team, review-enforcer, commit-workflow
+aboutObjects: agent-infra, issue-1028, issue-919, issue-939, issue-485
+---
+
+<!-- research-path: docs/plans/2026-09-14-issue-1028-reviewer-wording.md -->
+
 # Plan — #1028: strike the "even a trivial one-line reviewer" clause
+
+> **For Pi:** Use `executing-plans` to implement this plan task-by-task.
+
+**Goal:** Reframe the review-enforcer ≥1-dispatch floor's rationale so the dispatched reviewer must return a verdict on the diff, while keeping the floor itself unchanged.
+
+**Team:** organisation-design-team
+
+**Architecture:** Wording-only change across five live sites (`skills/commit-workflow/SKILL.md`, `skills/commit-workflow/workflow/01-preflight.md`, `extensions/review-enforcer/index.ts`), with the floor proven code-enforced and token-pinned. No logic, test, or gate-behavior change.
 
 **Issue:** #1028 (complexity:standard, Level: task)
 **Branch:** `fix/1028-reviewer-wording` (worktree `.worktrees/fix-1028-reviewer-wording`, from `origin/main` @ 02b50eb)
@@ -163,23 +184,23 @@ dispatch.
 Exact rewrites:
 
 1. `skills/commit-workflow/SKILL.md:95` —
-   `- **What to do:** Dispatch a reviewer sub-agent that returns a verdict on the diff — even a one-line reviewer must state whether the diff is sound ("NO ISSUES FOUND" or a list of issues), however small the diff. The ≥1-dispatch floor counts the dispatch, but the dispatch must be a review, not a token sign-off. Code-bearing sets satisfy the floor via VGATE's own [VGATE] verification dispatch (whose verdict is the [VGATE] PASS); docs-only sets dispatch a lightweight reviewer naming the diff and returning its verdict.`
+   `- **What to do:** Dispatch a reviewer sub-agent that returns a verdict on the diff — even a one-line reviewer must state whether the diff is sound ("NO ISSUES FOUND" or a list of issues), however small the diff. The ≥1-dispatch floor is content-free by design (#485 F2) — it counts the dispatch, not the verdict — but the reviewer you dispatch is expected to review, not to rubber-stamp. Code-bearing sets satisfy the floor via VGATE's own [VGATE] verification dispatch, whose PASS is the code-set equivalent of a returned verdict; docs-only sets dispatch a lightweight reviewer naming the diff and returning its verdict.`
 2. `01-preflight.md:340` (table cell) — replace
    `docs-only sets dispatch a lightweight reviewer (even a trivial one-line review counts).`
    → `docs-only sets dispatch a lightweight reviewer that returns a verdict on the diff (a one-line verdict is enough — the diff is small, not the review absent).`
 3. `01-preflight.md:346` (rationale) — replace
    `so the ≥1 dispatch must come from a lightweight reviewer dispatch (even a trivial one-line review counts).`
-   → `so the ≥1 dispatch must come from a lightweight reviewer dispatch that returns a verdict on the diff (a one-line verdict is enough — the dispatch satisfies the floor, but it must review, not merely run).`
+   → `so the ≥1 dispatch must come from a lightweight reviewer dispatch that returns a verdict on the diff (a one-line verdict is enough — the floor is content-free (#485 F2) and counts the dispatch, but the dispatch is expected to be a real review, not merely a run).`
 4. `01-preflight.md:390` (shell comment) — replace
    `# Even a trivial one-line review counts.`
    → `# The reviewer must return a verdict on the diff — a one-line verdict is enough.`
 5. `extensions/review-enforcer/index.ts:1964` (`MICRO_BLOCK_MESSAGE`) — replace
    `"   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch naming the diff — even a trivial one-line review counts:",`
-   → `"   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch that names the diff and returns a verdict on it — a one-line verdict is enough. The floor counts the dispatch; the dispatch is expected to be a real review that returns a verdict, not a sign-off:",``
+   → `"   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch that names the diff and returns a verdict on it — a one-line verdict is enough. The floor counts the dispatch; the dispatch is expected to be a real review that returns a verdict, not a sign-off:",`
 6. `01-preflight.md:397` (item 4 of the same "How to satisfy" block as `:390`; kept
    coherent with it) — replace
    `docs-only micro sets (VGATE content-shape exempt) dispatch a lightweight reviewer naming the diff — the multi-agent code-review gate stays skipped per 03-code-review.md`
-   → `docs-only micro sets (VGATE content-shape exempt) dispatch a lightweight reviewer naming the diff and returning a verdict on it — the multi-agent code-review gate stays skipped per 03-code-review.md`
+   → `docs-only micro sets (VGATE content-shape exempt) dispatch a lightweight reviewer naming the diff and returning a verdict on it (the floor counts the dispatch — content-free, #485 F2) — the multi-agent code-review gate stays skipped per 03-code-review.md`
 
 ### Task 2: Pin verdict — no co-change (falsifies #939's premise)
 
@@ -302,5 +323,23 @@ pinned; no co-change required); clean code-review verdict recorded via
   `npx tsx extensions/review-enforcer/index.test.ts` = 186 passed, 0 failed;
   verification-gate 314/0; test-git-freshness 40/0; loop-enforcer 52/0 and 46/0;
   inventory confirmed complete. **plan-review: CLEAN.**
+- **code-review — cycle 1** (PR #1044; 7 reviewers: 4 always-on + Skill
+  Infrastructure + Ontology & Templates + Extension Safety). Clean: Guidance,
+  Bug Scan, Security, Skill Infrastructure, Extension Safety.
+  - Agent #3 (History/PR comments): 1×P2 — the new obligation wording
+    ("must be a review") could read as contradicting the content-free floor
+    stated in `code-review/SKILL.md:1124` ("the floor is deliberately
+    content-free"), and the VGATE carve-out. Incorporated: the obligation sites
+    (`SKILL.md:95`, `01-preflight.md:346`/`:397`) now state the floor is
+    content-free (#485 F2) and that the verdict is *expected quality*, and
+    `SKILL.md:95` names the VGATE PASS as the code-set equivalent of a verdict.
+  - Agent #1 + #9: 2×P2 — the plan doc lacked the mandated `writing-plans`
+    header (research-path comment + Goal/Team/Architecture) and the repo's
+    doc front matter (`check-doc-affiliation.cjs` → "Missing front matter
+    block"). Incorporated: front matter + header added.
+  - Agent #2: 1×P2 — a doubled backtick in the plan doc's quoted rewrite.
+    Fixed.
+  - Controller: no P0/P1 → all P2s fixed → re-review (cycle 2).
+- **code-review — cycle 2** — (pending)
 
 <!-- plan-review: cycles=4, status=clean, version=2.3.0 -->
