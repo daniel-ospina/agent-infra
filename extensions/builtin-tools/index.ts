@@ -2627,7 +2627,48 @@ export function resolveTaskCwd(cwd?: string | null): string {
   }
 }
 
+/**
+ * #1071: reject a target that CANNOT be a child's working directory, before any
+ * spawn. `child_process.spawn` throws SYNCHRONOUSLY — it never returns a
+ * ChildProcess and never emits an `error` event — when `cwd` exists as a
+ * non-directory (`ENOTDIR`) or contains a NUL byte (`ERR_INVALID_ARG_VALUE`).
+ * Inside `spawnSubAgent`'s Promise executor that throw rejects the promise
+ * before the child's async `error` handler is attached, so the `spawn-error`
+ * settle (with its ledger row and its cwd-naming message) never runs and
+ * `retry()` re-attempts 3x before reporting a HUNG MODEL — the exact
+ * misdiagnosis this parameter was added to remove.
+ *
+ * A target that does NOT exist, or an unreadable directory, is deliberately NOT
+ * rejected here: those surface asynchronously (`ENOENT` / `EACCES`), which the
+ * child's async `error` handler reports as `spawn-error` and which now name the
+ * cwd. Returns an error message, or null when the target is spawnable.
+ */
+export function taskCwdRefusal(cwd?: string | null): string | null {
+  if (typeof cwd !== "string") return null; // omitted / null → process.cwd(), always spawnable
+  const trimmed = cwd.trim();
+  if (!trimmed) return null;
+  if (trimmed.includes("\0")) return `cwd must not contain a NUL byte`;
+  const target = resolveTaskCwd(trimmed);
+  try {
+    return fs.statSync(target).isDirectory() ? null : `cwd ${target} exists but is not a directory`;
+  } catch {
+    return null; // not there (or unreadable parent) → spawn reports it asynchronously, naming the cwd
+  }
+}
+
 export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal, record?: DispatchRecordContext, cwd?: string): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
+  // #1071: refuse an unspawnable target BEFORE the promise below — a
+  // synchronous `spawn` throw would reject it with no `spawn-error` row and no
+  // self-identifying message (see `taskCwdRefusal`). Pre-spawn by construction,
+  // so no spawn ATTEMPT ran and no outcome row is owed (#783's contract is one
+  // row per attempt) — same shape as the `invalid-session-id` refusal.
+  const cwdError = taskCwdRefusal(cwd);
+  if (cwdError) {
+    return Promise.resolve({
+      content: [{ type: "text", text: `❌ Sub-agent dispatch refused: ${cwdError}` }],
+      details: { model, provider, status: "invalid-cwd", retryable: false, error: cwdError, cwd: resolveTaskCwd(cwd) },
+    });
+  }
   return new Promise((resolve) => {
     // #176 code-review: per-dispatch marker nonce — the child echoes it in
     // every [task-heartbeat] marker; markers without it are foreign (MCP
@@ -2679,9 +2720,11 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // by default-of-omission. ONE resolved value feeds every consumer below —
     // the spawn (so the child works in the target repo, whose AGENTS.md and git
     // state it loads), the repo-state probe + render (so the wedge report names
-    // the TARGET's branch/headSha/worktree/dirty), and the outcome ledger row's
+    // the TARGET's branch/headSha/worktree/dirty), the outcome ledger row's
     // `cwd` (so the row can never carry the parent's cwd beside the target's
-    // branch). A parent that omits it gets process.cwd() exactly as before.
+    // branch), and the spawn-error message (so a bad target is self-identifying
+    // rather than reading as a missing pi binary). A parent that omits it gets
+    // process.cwd() exactly as before.
     const targetCwd = resolveTaskCwd(cwd);
     // #271 (#208 D2): detached spawn → the child gets its own pgid (setsid),
     // so a settle-path sweep can anchor on it without ever signalling the

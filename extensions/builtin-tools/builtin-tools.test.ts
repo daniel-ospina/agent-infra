@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, spawnSubAgent } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent } from "./index.js";
 import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
@@ -4234,9 +4234,11 @@ test("#1071: resolveTaskCwd — omitted / null / blank → process.cwd() (negati
   equal(resolveTaskCwd("   "), process.cwd(), "whitespace-only → the PARENT's cwd");
 });
 
-// POSITIVE TWIN: an explicit target is used, resolved to an absolute path so
-// the wedge report's `worktree=` is unambiguous.
-test("#1071: resolveTaskCwd — an explicit target is used as-is (positive twin)", () => {
+// POSITIVE TWIN: an explicit target is resolved to an ABSOLUTE path (and, when
+// it exists, canonicalized to its physical path — see the sibling test). This
+// test covers the lexical FALLBACK branch, so every case here is deliberately a
+// path that does not exist.
+test("#1071: resolveTaskCwd — an explicit target: trimmed, absolutized, realpath-canonicalized (positive twin)", () => {
   // A path that cannot exist: realpath throws → the lexical absolute path is
   // used (the total-function fallback). Constructed, never a fixed literal, so
   // the assertion cannot flake on a machine where that literal happens to exist.
@@ -4245,6 +4247,28 @@ test("#1071: resolveTaskCwd — an explicit target is used as-is (positive twin)
   equal(resolveTaskCwd(`  ${ghost}  `), resolve(ghost), "surrounding whitespace is trimmed");
   equal(resolveTaskCwd("rel/wt-1071"), resolve(process.cwd(), "rel/wt-1071"), "relative target resolves against the parent cwd");
   ok(resolveTaskCwd("./x").startsWith("/"), "always absolute in the report");
+});
+
+// #1071 review fix (round 2): `child_process.spawn` THROWS SYNCHRONOUSLY for a
+// cwd that exists as a non-directory (ENOTDIR) or holds a NUL byte — it never
+// returns a ChildProcess, so the promise executor rejects before `proc.on("error")`
+// is attached: no `spawn-error` row, no cwd-naming message, and retry() reports a
+// hung model. Those two shapes must be refused pre-spawn; a MISSING target must
+// NOT be (it is an ordinary async ENOENT that the handler now names).
+test("#1071 (review fix): taskCwdRefusal — file/NUL targets refused, missing targets left to spawn", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1071-refuse-"));
+  try {
+    const file = join(dir, "not-a-dir.txt");
+    writeFileSync(file, "x");
+    equal(taskCwdRefusal(), null, "omitted → spawnable (process.cwd())");
+    equal(taskCwdRefusal(""), null, "blank → spawnable");
+    equal(taskCwdRefusal(dir), null, "an existing directory is spawnable");
+    ok(taskCwdRefusal(file)?.includes(file), `an existing FILE is refused, naming it: ${taskCwdRefusal(file)}`);
+    equal(taskCwdRefusal(join(dir, "ghost")), null, "a MISSING target is not refused here (spawn reports it async, naming the cwd)");
+    ok(taskCwdRefusal(`a\0b`)?.includes("NUL"), "a NUL byte is refused");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // #1071 review fix: the reported `worktree=` (and the ledger row's `cwd`) must be
@@ -4331,6 +4355,17 @@ testAsync("#1071 (E2E): a child with a target cwd RUNS there; omitted → the pa
       realpathSync(process.cwd()),
       "negative twin — omitting cwd still spawns in the PARENT's cwd (pre-#1071 behavior)",
     );
+
+    // #1071 review fix: an unspawnable target must RESOLVE as a refusal, not
+    // REJECT the promise (a synchronous spawn throw would reject before the
+    // error handler is attached — no row, no message, and a misleading
+    // "model may be hung" report after 3 retries).
+    const fileTarget = join(dir, "not-a-dir.txt");
+    writeFileSync(fileTarget, "x");
+    const refused = await spawnSubAgent("deepseek-v4-flash", "deepseek", env, args, undefined, undefined, fileTarget);
+    equal(refused?.details?.status, "invalid-cwd", "a non-directory target is REFUSED, not a rejected promise");
+    equal(refused?.details?.retryable, false, "the refusal is non-retryable");
+    ok(String(refused?.content?.[0]?.text).includes(fileTarget), "the refusal names the offending target");
   } finally {
     process.env.PATH = savedPath;
     process.argv[1] = savedArgv1;
