@@ -34,12 +34,16 @@ physical path and admitted only when that path is inside the checkout or the mat
 **fails** with an explicit refusal instead of being scanned — `find <dir>/` dereferences a
 symlinked start point and walks the whole target (#1051). The single-level **glob** enumerations
 (`scripts/*.mjs`, `.github/workflows/*.yml`) still follow a symlinked path component with no
-boundary check — bounded, not unbounded, and tracked separately in #1083; they are deliberately
+boundary check — single-level (non-recursive), not boundary-checked, and tracked separately in #1083; they are deliberately
 not claimed as covered here.
 
 ## Contract
 
-**Input:** PR number, repo root (and `${AGENT_INFRA_PATH}` when a skills/templates tree is a symlink)
+**Input:** PR number, repo root. `${AGENT_INFRA_PATH}` is **read from the environment** — it is not passed
+by the caller — and is what admits a symlinked skills/templates tree whose target lives outside the
+checkout. With it unset (or unresolvable) such a tree is refused, never silently skipped; see
+`scripts/link-skills.sh`, whose `$HOME/agent-infra` fallback this check deliberately does not adopt
+(residual 1 in the #1051 plan doc).
 **Output:** JSON `VerificationResult`
 **Gate:** WARN-ONLY
 
@@ -67,11 +71,15 @@ unvalidated — a known fail-open (tracked by #1052), **not a clean run**. The s
 > physical path is outside the checkout *and* outside the matching subtree of `${AGENT_INFRA_PATH}`
 > (`${AGENT_INFRA_PATH}/skills`, `${AGENT_INFRA_PATH}/templates`) — the shared agent-infra tree
 > consumer repos symlink their skills directory to — **fails closed**; it is never silently
-> un-offered, because a check that vanishes is a false green. The subtree bound (not the whole
+> not offered, because a check that vanishes is a false green. The subtree bound (not the whole
 > shared checkout) keeps a `templates -> $AGENT_INFRA_PATH` redirect from scanning the shared
 > repo's unrelated trees. Paths are passed as **argv**, never
 > interpolated into an interpreter string. **BSD userland:** no GNU-only `sed`/`grep` constructs
 > (e.g. `\+` in a BRE silently yields an empty match and can turn a clean tree into a false fail).
+> **`<REPO_ROOT>` must be substituted** with the absolute repo root (the `task` cwd) before the block
+> runs — every block opens `cd "<REPO_ROOT>" || exit 1`, so an unsubstituted placeholder exits 1 on its
+> first line with no check output. That hard exit is the fix for #1051, not a check failure: a literal
+> paste would otherwise `cd` to the ambient directory and silently re-base the whole boundary.
 
 ### Step 1 — Detect Available Checks
 
@@ -93,8 +101,9 @@ shopt -s nullglob
 # (path printed on stdout) / rc 1 = no entry at all (absent) / rc 2 = present
 # but outside the permitted boundary, or the checkout root itself could not be
 # resolved / rc 3 = present but unverifiable (a plain file, a dangling symlink,
-# a symlink loop, or otherwise unresolvable). rc 2 and rc 3 FAIL CLOSED, are
-# offered (never silently un-offered), and are never scanned. With AGENT_INFRA_PATH unset a symlinked tree is refused, not
+# a symlink loop, an unlistable tree, or otherwise unresolvable). rc 2 and rc 3
+# FAIL CLOSED, are
+# offered (never silently not offered), and are never scanned. With AGENT_INFRA_PATH unset a symlinked tree is refused, not
 # silently dropped. Identical in every block that enumerates a tree.
 repo_real=$(pwd -P)
 agent_real=""
@@ -106,6 +115,7 @@ bounded_root() {   # $1 candidate start point (may be a symlink) - $2 its subtre
   [ -n "$repo_real" ] || return 2   # no boundary basis: refuse, never a '/*' wildcard admission
   [ -e "$1" ] || [ -L "$1" ] || return 1   # no entry at all: empty target set
   [ -d "$1" ] || return 3           # present, but not a directory (file, dangling link, loop)
+  [ -r "$1" ] || return 3           # present, but not listable: the probe would read empty and vanish
   physical=$(cd "$1" 2>/dev/null && pwd -P) || return 3   # present, but unresolvable
   case "$physical" in
     "$repo_real"|"$repo_real"/*) printf '%s\n' "$physical"; return 0 ;;
@@ -223,8 +233,9 @@ cd "<REPO_ROOT>" || exit 1
 # (path printed on stdout) / rc 1 = no entry at all (absent) / rc 2 = present
 # but outside the permitted boundary, or the checkout root itself could not be
 # resolved / rc 3 = present but unverifiable (a plain file, a dangling symlink,
-# a symlink loop, or otherwise unresolvable). rc 2 and rc 3 FAIL CLOSED, are
-# offered (never silently un-offered), and are never scanned. With AGENT_INFRA_PATH unset a symlinked tree is refused, not
+# a symlink loop, an unlistable tree, or otherwise unresolvable). rc 2 and rc 3
+# FAIL CLOSED, are
+# offered (never silently not offered), and are never scanned. With AGENT_INFRA_PATH unset a symlinked tree is refused, not
 # silently dropped. Identical in every block that enumerates a tree.
 repo_real=$(pwd -P)
 agent_real=""
@@ -236,6 +247,7 @@ bounded_root() {   # $1 candidate start point (may be a symlink) - $2 its subtre
   [ -n "$repo_real" ] || return 2   # no boundary basis: refuse, never a '/*' wildcard admission
   [ -e "$1" ] || [ -L "$1" ] || return 1   # no entry at all: empty target set
   [ -d "$1" ] || return 3           # present, but not a directory (file, dangling link, loop)
+  [ -r "$1" ] || return 3           # present, but not listable: the probe would read empty and vanish
   physical=$(cd "$1" 2>/dev/null && pwd -P) || return 3   # present, but unresolvable
   case "$physical" in
     "$repo_real"|"$repo_real"/*) printf '%s\n' "$physical"; return 0 ;;
@@ -266,7 +278,7 @@ skills_rc=0
 skills_phys=$(bounded_root "$SKILLS_DIR" skills) || skills_rc=$?
 case "$skills_rc" in
   0) ;;
-  2) echo "❌ skill-lint: $SKILLS_DIR resolves outside the checkout and \${AGENT_INFRA_PATH}/skills — refusing to scan (bounded-scan guard, #1051; set AGENT_INFRA_PATH to the shared agent-infra checkout)"; exit 1 ;;
+  2) echo "❌ skill-lint: $SKILLS_DIR is neither inside the checkout nor under \${AGENT_INFRA_PATH}/skills, or the checkout root itself could not be resolved (repo_real='$repo_real') — refusing to scan (bounded-scan guard, #1051; set AGENT_INFRA_PATH to the shared agent-infra checkout)"; exit 1 ;;
   *) echo "❌ skill-lint: no verifiable skills dir at $SKILLS_DIR (rc=$skills_rc) — failure to verify (fail-closed)"; exit 1 ;;
 esac
 # The linter's own discovery FOLLOWS a symlinked `SKILL.md` FILE — readdirSync
@@ -312,8 +324,9 @@ cd "<REPO_ROOT>" || exit 1
 # (path printed on stdout) / rc 1 = no entry at all (absent) / rc 2 = present
 # but outside the permitted boundary, or the checkout root itself could not be
 # resolved / rc 3 = present but unverifiable (a plain file, a dangling symlink,
-# a symlink loop, or otherwise unresolvable). rc 2 and rc 3 FAIL CLOSED, are
-# offered (never silently un-offered), and are never scanned. With AGENT_INFRA_PATH unset a symlinked tree is refused, not
+# a symlink loop, an unlistable tree, or otherwise unresolvable). rc 2 and rc 3
+# FAIL CLOSED, are
+# offered (never silently not offered), and are never scanned. With AGENT_INFRA_PATH unset a symlinked tree is refused, not
 # silently dropped. Identical in every block that enumerates a tree.
 repo_real=$(pwd -P)
 agent_real=""
@@ -325,6 +338,7 @@ bounded_root() {   # $1 candidate start point (may be a symlink) - $2 its subtre
   [ -n "$repo_real" ] || return 2   # no boundary basis: refuse, never a '/*' wildcard admission
   [ -e "$1" ] || [ -L "$1" ] || return 1   # no entry at all: empty target set
   [ -d "$1" ] || return 3           # present, but not a directory (file, dangling link, loop)
+  [ -r "$1" ] || return 3           # present, but not listable: the probe would read empty and vanish
   physical=$(cd "$1" 2>/dev/null && pwd -P) || return 3   # present, but unresolvable
   case "$physical" in
     "$repo_real"|"$repo_real"/*) printf '%s\n' "$physical"; return 0 ;;
@@ -342,7 +356,7 @@ tv_rc=0
 tv_phys=$(bounded_root templates templates) || tv_rc=$?
 case "$tv_rc" in
   0) ;;
-  2) echo "❌ template-validity: templates resolves outside the checkout and \${AGENT_INFRA_PATH}/templates — refusing to scan (bounded-scan guard, #1051; set AGENT_INFRA_PATH to the shared agent-infra checkout)"; exit 1 ;;
+  2) echo "❌ template-validity: templates is neither inside the checkout nor under \${AGENT_INFRA_PATH}/templates, or the checkout root itself could not be resolved (repo_real='$repo_real') — refusing to scan (bounded-scan guard, #1051; set AGENT_INFRA_PATH to the shared agent-infra checkout)"; exit 1 ;;
   *) echo "❌ template-validity: no verifiable templates dir (rc=$tv_rc) — failure to verify (fail-closed)"; exit 1 ;;
 esac
 all_templates=()
@@ -482,7 +496,8 @@ deterministic validation tools and reports results.
   start point physically (`bounded_root`) and admits it only inside the checkout or the matching
   subtree of `${AGENT_INFRA_PATH}`. An out-of-boundary start point is an _offered_ check that **fails**
   (`refusing to scan`), never a silent `not_offered` and never an unbounded walk (#1051). A start
-  point that is **present but unverifiable** — not a directory, or `cd`/`pwd -P` fails on it — is
+  point that is **present but unverifiable** — not a directory, not listable (mode 111), or `cd`/`pwd -P`
+  fails on it — is
   treated the same way: offered, then failed (`no verifiable …`), never silently dropped. Only a
   genuinely **absent** start point (no entry at all) has an empty target set
   and is therefore not offered. This is the deliberate exception to *"an absent surface is not

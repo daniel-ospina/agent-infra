@@ -37,8 +37,12 @@
 // (that glob alone is post-merge only — the same #708/#744/#709 pattern).
 // Plain node, zero deps.
 //
+// Scope: a ONE-OFF regression pin for #1051's start-point guard. It is not the
+// general "execute a skill's inline blocks in CI" mechanism tracked (and closed
+// NOT_PLANNED as category B) by #1050 — do not read it as that mechanism.
+//
 // Run: node extensions/shared/test-infra-verify-scan.mjs
-import { readFileSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, copyFileSync, rmSync, existsSync, renameSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, copyFileSync, rmSync, existsSync, renameSync, realpathSync, lstatSync, chmodSync } from "node:fs";
 import { join, resolve, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -72,9 +76,18 @@ if (!step1 || !tvBlock || !slBlock) {
 }
 
 // ── Harness ─────────────────────────────────────────────────────────────────
-const root = mkdtempSync(join(tmpdir(), "infra-verify-scan.")); // physical (macOS /var -> /private/var)
+// `realpathSync` immediately: macOS `mkdtempSync(tmpdir())` yields a
+// `/var/folders/…` path while every block emits the physical `/private/var/…`,
+// so without this the `out.includes(OUTSIDE)` comparison is dead and only the
+// filename fallbacks in `leaksOutside` fire (test-review P2).
+const root = realpathSync(mkdtempSync(join(tmpdir(), "infra-verify-scan.")));
 const OUTSIDE = join(root, "outside");     // the sentinel tree the scanner must never reach
 const ALLOWED = join(root, "agent-infra"); // stands in for the shared agent-infra checkout
+// A killed/timed-out run must not leak the fixture tree (test-review P2): the
+// trailing `rmSync` only runs on a normal exit.
+const cleanup = () => { try { rmSync(root, { recursive: true, force: true }); } catch {} };
+process.on("exit", cleanup);
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { cleanup(); process.exit(130); });
 
 mkdirSync(join(OUTSIDE, "secret"), { recursive: true });
 mkdirSync(join(OUTSIDE, "skills", "leaked", "nested"), { recursive: true });
@@ -119,7 +132,6 @@ function fixture(setup) {
 const isTemplateValidityOffered = (out) => /\btemplate-validity\b/.test(out);
 const isSkillLintOffered = (out) => /\bskill-lint\b/.test(out);
 const leaksOutside = (out) => out.includes(OUTSIDE) || /\bsecret\.json\b/.test(out) || /\bleaked\b/.test(out);
-
 // ── Negative twin 1: the platform exhibits the trap ─────────────────────────
 {
   const dir = fixture((d) => {
@@ -238,7 +250,7 @@ const leaksOutside = (out) => out.includes(OUTSIDE) || /\bsecret\.json\b/.test(o
   check("#1051 E: skill-lint FAILS CLOSED on an out-of-boundary skills dir",
     sl.rc !== 0 && !sl.out.includes("validated"), `rc=${sl.rc} out=${JSON.stringify(sl.out.trim())}`);
   check("#1051 E: the refusal is the boundary refusal, not an incidental linter failure",
-    /refusing to scan/i.test(sl.out) && /outside the checkout/i.test(sl.out),
+    /refusing to scan/i.test(sl.out) && /neither inside the checkout nor under/.test(sl.out),
     JSON.stringify(sl.out.trim()));
   check("#1051 E: no green is reported over the out-of-boundary tree",
     !/✅/.test(sl.out), JSON.stringify(sl.out.trim()));
@@ -483,9 +495,48 @@ const leaksOutside = (out) => out.includes(OUTSIDE) || /\bsecret\.json\b/.test(o
     !allBash.includes('find "$SKILLS_DIR/"'), "found a trailing-slash skills start point");
   check("#1051 I: no `find -H` / `find -L` start-point-following form survives in any bash block",
     !/find\s+-(H|L)\b/.test(allBash), "found a start-point-following find mode");
-  check("#1051 I: no variable start point carries a trailing slash",
-    !/find\s+(-[A-Za-z]+\s+)*"\$[A-Za-z_][A-Za-z0-9_]*"\s*\//.test(allBash),
-    "found a trailing slash on a variable start point");
+  // The trailing slash is the defect, whether it sits inside or outside the
+  // quotes and whether the operand is a literal dir or a variable: `find "$x/"`
+  // and `find skills/` are both vulnerable forms. The pre-fix regex only caught
+  // the unquoted-variable shape (`"$x" /`), so `find "$tv_phys/"` and
+  // `find skills/` appended to a fence left the suite GREEN (test-review P1).
+  // The trailing slash is the defect, wherever it sits: `find templates/`,
+  // `find "$SKILLS_DIR/"`, `find "$tv_phys/"` and `find skills/` are all
+  // vulnerable. The pre-fix regex only caught the unquoted-variable shape, so
+  // the last three appended to a fence left the suite GREEN (test-review P1).
+  // Scan the actual OPERAND of every non-comment `find`, then prove the
+  // predicate fires on each vulnerable shape (anti-vacuity twin).
+  const trailingSlashStart = (src) => {
+    const code = src.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+    return [...code.matchAll(/\bfind\s+(?:-[A-Za-z]+\s+)*(\S+)/g)]
+      .map((m) => m[1].replace(/^["']|["']$/g, ""))
+      .some((operand) => operand.endsWith("/"));
+  };
+  check("#1051 I: no `find` start point carries a trailing slash (any quoting/literal form)",
+    !trailingSlashStart(allBash), "found a trailing-slash start point");
+  check("#1051 I twin: a vulnerable form APPENDED to a shipped fence is caught",
+    trailingSlashStart(allBash + "\nfind skills/ -name SKILL.md\n"),
+    "appending a trailing-slash start point to a fence left the tripwire green");
+  for (const form of ["find templates/", 'find "$SKILLS_DIR/"', 'find "$tv_phys/"', "find skills/", 'find -P "$x/" -type f', "find .agents/skills/ -name SKILL.md"]) {
+    check(`#1051 I twin: the tripwire flags the vulnerable form \`${form}\``,
+      trailingSlashStart(form), "the tripwire does not fire");
+  }
+  const uncheckedCd = (src) => {
+    const code = src.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+    const cds = [...code.matchAll(/^cd .*$/gm)].map((m) => m[0]);
+    return cds.length !== 5 || cds.some((l) => !/^cd "[^"]*" \|\| exit 1$/.test(l));
+  };
+  check("#1051 I: every block's `cd` hard-fails rather than continuing in the ambient cwd",
+    !uncheckedCd(allBash), "an unchecked/unguarded `cd` silently re-bases the boundary");
+  check("#1051 I: the predicate is FALSE on the pristine source (it is not a constant)",
+    !uncheckedCd(allBash), "the predicate fires on the unmutated source");
+  for (const form of ["cd $x", 'cd "$x"', 'cd "$x" || true', 'cd "$x" || exit 0']) {
+    // Substitute into the real source so the 5-line count still holds and the
+    // regex — not the length guard — is the only thing under test.
+    const mutated = allBash.replaceAll('cd "<REPO_ROOT>" || exit 1', form);
+    check(`#1051 I twin: the predicate flags the non-failing form \`${form}\` (in situ)`,
+      uncheckedCd(mutated), "the tripwire does not fire");
+  }
   check("#1051 I: Step 1 resolves its start point through bounded_root + find -P",
     step1.includes("bounded_root") && /find -P "\$/.test(step1), "missing bounded_root / find -P");
   check("#1051 I: template-validity resolves its start point through bounded_root + find -P",
@@ -516,10 +567,92 @@ const leaksOutside = (out) => out.includes(OUTSIDE) || /\bsecret\.json\b/.test(o
   check("#1051 I: the three bounded_root preambles are byte-identical",
     defs.length === 3 && new Set(defs).size === 1,
     `found ${defs.length} preamble(s), ${new Set(defs).size} distinct`);
-  check("#1051 I: no block resolves its boundary basis from an unchecked `cd`",
-    !/^cd (?!")/m.test(allBash) && !/^cd "[^"]*"\s*$/m.test(allBash),
-    "found an unquoted or unchecked `cd <REPO_ROOT>`");
 }
+
+// ── Case Q: an unlistable start point is PRESENT → offered, then fail closed ─
+// `[ -d ]` needs only +x, so a mode-111 tree passed it while the offer probe's
+// `find … 2>/dev/null` reported empty — the check silently vanished (the exact
+// false-green class this issue removes). Unlistability is now an rc-3 verdict.
+// Skipped as root, which can list anything (a root CI runner would make the
+// assertion vacuous, not false). The original modes are restored in a `finally`
+// so an interrupted case cannot leave a mode-111 tree that `rmSync` cannot empty.
+if (process.getuid?.() === 0) {
+  console.log("△ #1051 Q: skipped (running as root — a mode-111 tree is still listable)");
+} else {
+  const dir = fixture((d) => {
+    mkdirSync(join(d, "templates"), { recursive: true });
+    writeFileSync(join(d, "templates", "ok.json"), "{}\n");
+    mkdirSync(join(d, "skills", "infra-verify"), { recursive: true });
+    copyFileSync(SKILL_PATH, join(d, "skills", "infra-verify", "SKILL.md"));
+    symlinkSync(join(PROJECT_ROOT, "scripts"), join(d, "scripts"));
+  });
+  const targets = ["templates", "skills"];
+  const prev = targets.map((p) => lstatSync(join(dir, p)).mode);
+  try {
+    for (const p of targets) chmodSync(join(dir, p), 0o111); // execute-only
+    const s1 = runBlock(step1, dir);
+    check("#1051 Q: an unlistable templates/skills is OFFERED (present, not empty)",
+      s1.rc === 0 && isTemplateValidityOffered(s1.out) && isSkillLintOffered(s1.out),
+      `rc=${s1.rc} out=${JSON.stringify(s1.out.trim())}`);
+    for (const [label, block, expect] of [["template-validity", tvBlock, /template-validity/], ["skill-lint", slBlock, /skill-lint/]]) {
+      const r = runBlock(block, dir);
+      check(`#1051 Q: ...then ${label} fails closed on an unlistable start point`,
+        r.rc !== 0 && expect.test(r.out) && /no verifiable|refusing to scan/.test(r.out) && !/✅/.test(r.out),
+        `rc=${r.rc} out=${JSON.stringify(r.out.trim())}`);
+    }
+  } finally {
+    targets.forEach((p, i) => chmodSync(join(dir, p), prev[i]));
+  }
+}
+
+// ── Case R1: C9 behaviourally — a failed `cd` must not be continued past ────
+// No block was ever run with `<REPO_ROOT>` UNSET, so a guard that fails open
+// (`|| true`) would rebase the boundary to the ambient cwd. The fixture cwd
+// holds IN-BOUNDARY start points, so a rebased block SUCCEEDS (rc 0) and the
+// assertion below catches it; a sentinel-only fixture would let the block refuse
+// for an unrelated reason and pass anyway (this was the cycle-1 gap). The
+// diagnostic assertion excludes a crashed block (a syntax error also exits 1).
+{
+  const dir = fixture((d) => {
+    mkdirSync(join(d, "templates"), { recursive: true });
+    writeFileSync(join(d, "templates", "ok.json"), "{}\n");
+    mkdirSync(join(d, "skills", "infra-verify"), { recursive: true });
+    copyFileSync(SKILL_PATH, join(d, "skills", "infra-verify", "SKILL.md"));
+    symlinkSync(join(PROJECT_ROOT, "scripts"), join(d, "scripts"));
+  });
+  const nope = join(root, "no-such-checkout");
+  for (const [label, block] of [["Step 1", step1], ["template-validity", tvBlock], ["skill-lint", slBlock]]) {
+    const r = bash(block.replace(/<REPO_ROOT>/g, nope), dir);
+    check(`#1051 R1: ${label} exits non-zero with an unsubstituted <REPO_ROOT>`,
+      r.rc !== 0, `rc=${r.rc} out=${JSON.stringify(r.out.trim())}`);
+    check(`#1051 R1: ${label} fails on the failed cd, not on a crash`,
+      /No such file or directory|<REPO_ROOT>/.test(r.out) && !/syntax error/i.test(r.out),
+      `rc=${r.rc} out=${JSON.stringify(r.out.trim())}`);
+    check(`#1051 R1: ${label} enumerates nothing in the ambient cwd when the cd fails`,
+      !leaksOutside(r.out), JSON.stringify(r.out.trim()));
+  }
+}
+
+// ── Case R2: #1035 case (i) under the `${AGENT_INFRA_PATH}` precondition ────
+// #1035 pinned "a symlinked resolved skills dir -> skill-lint still offered"
+// WITHOUT an env precondition, but the boundary basis IS that variable. With it
+// unset the check must still be OFFERED (never silently skipped) and must fail
+// CLOSED naming the variable.
+{
+  const dir = fixture((d) => {
+    symlinkSync(join(ALLOWED, "skills"), join(d, "skills"));
+    symlinkSync(join(PROJECT_ROOT, "scripts"), join(d, "scripts"));
+  });
+  const s1 = runBlock(step1, dir); // AGENT_INFRA_PATH unset (fixture default)
+  check("#1051 R2: #1035 case (i) — a symlinked skills tree with ${AGENT_INFRA_PATH} unset is OFFERED (not skipped)",
+    isSkillLintOffered(s1.out), `rc=${s1.rc} out=${JSON.stringify(s1.out.trim())}`);
+  const sl = runBlock(slBlock, dir);
+  check("#1051 R2: ...and fails CLOSED naming the env var (never a silent skip)",
+    sl.rc !== 0 && /refusing to scan/.test(sl.out) && /AGENT_INFRA_PATH/.test(sl.out) && !/✅/.test(sl.out),
+    `rc=${sl.rc} out=${JSON.stringify(sl.out.trim())}`);
+  check("#1051 R2: ...and nothing outside the boundary is read", !leaksOutside(sl.out), JSON.stringify(sl.out.trim()));
+}
+
 
 rmSync(root, { recursive: true, force: true });
 
