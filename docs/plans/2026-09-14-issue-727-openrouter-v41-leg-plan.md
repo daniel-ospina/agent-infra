@@ -51,7 +51,8 @@ levels later is a one-line change.
   generation downgrade one hop later.
 - (c) Keep it in the table but **resolution-only**.
 **Decision: (c)** — the entry exists so stale state matches its own position (no `startIdx -1`
-re-return of the draining root), while `RESOLUTION_ONLY_LEGS` stops a fresh advance from being
+restart at `legs[0]`, which hands back the draining root for an in-flight marker and the first
+available leg for a read-side latch), while `RESOLUTION_ONLY_LEGS` stops a fresh advance from being
 served it. The guard is applied on **both** serve paths: the advance walk skips it, and resolution's
 latched-active fast path refuses a `fam.activeLeg` that IS this leg — a pre-#727 latch record froze
 exactly that slug, and serving it directly would re-dispatch the 0423 build for up to the latch TTL
@@ -106,7 +107,9 @@ additive.
 - An extension `models[]` array REPLACES a provider's catalog, so a hop leg that is not registered
   fails to *resolve* — not just to price correctly (s7).
 - `nextLegAfter` matches the current leg by **table position**: removing a leg that stale state may
-  still name is not a harmless deletion (startIdx −1 → re-returns `legs[0]`, the draining root).
+  still name is not a harmless deletion (startIdx −1 → the walk restarts at `legs[0]`, handing back a
+  leg at or behind the requested one — the draining root for an in-flight marker, the first available
+  leg read-side).
 - Adding a `modelOverrides` key to the shipped `models.json` requires mirroring it into **all eight**
   `tests/fixtures/cost-config/*/models.json` trees (clean + minified + six backdoor trees); the
   parity pin is a canonical-JSON deep equality and the bounded-delta invariant catches a partial edit.

@@ -302,8 +302,10 @@ with automatic return after balance restore.
   `deepseek/deepseek-v4-flash` entry stays in the table but is RESOLUTION-ONLY
   (`RESOLUTION_ONLY_LEGS`): it is there so stale pre-#727 state (latch file /
   in-flight marker / session pinned to the slug) still matches its own leg — an
-  absent table entry would make `nextLegAfter`'s startIdx -1 and re-return the
-  DRAINING root — while no automatic path can serve it or advance onto it: the
+  absent entry would make `nextLegAfter`'s startIdx -1 and restart the walk at
+  `legs[0]` (the DRAINING root for an in-flight marker, where the write path
+  walks pre-write state, #715; the first AVAILABLE leg for a read-side latch) —
+  while no automatic path can serve it or advance onto it: the
   advance walk skips it, resolution's latched-active fast path refuses a frozen
   `activeLeg` that is this slug (a pre-#727 latch recorded exactly that — such a
   record re-resolves the family's first available leg, i.e. the V4.1 openrouter

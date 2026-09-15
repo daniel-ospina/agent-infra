@@ -73,8 +73,10 @@ export default function (pi: ExtensionAPI) {
       // — no longer a chain hop target and never served to a fresh advance). It
       // stays REGISTERED and IN-TABLE because stale state is real: a pre-#727
       // latch file / in-flight marker / session pinned to this slug must still
-      // resolve (a table miss would make nextLegAfter's startIdx -1 and
-      // re-return the DRAINING root leg).
+      // resolve. A table miss would make nextLegAfter's startIdx -1, restarting
+      // the walk at legs[0]: for an in-flight marker that is the DRAINING root
+      // (#715 — the write path walks the pre-write state, where the root is not
+      // yet unavailable), for a read-side latch/session the first AVAILABLE leg.
       {
         id: "deepseek/deepseek-v4-flash",
         name: "DeepSeek V4 Flash 0423 (via OpenRouter, legacy)",
