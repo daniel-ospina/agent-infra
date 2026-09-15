@@ -54,8 +54,9 @@ re-return of the draining root), while `RESOLUTION_ONLY_LEGS` stops a fresh adva
 served it. The guard is applied on **both** serve paths: the advance walk skips it, and resolution's
 latched-active fast path refuses a `fam.activeLeg` that IS this leg — a pre-#727 latch record froze
 exactly that slug, and serving it directly would re-dispatch the 0423 build for up to the latch TTL
-(the walk then re-resolves the family's *current* hop target, the V4.1 leg — retrying from the family
-root when the first walk halts, so a dispatch of the *hop leg itself* is served rather than halted).
+(the walk then re-resolves the family's *first available* leg — the V4.1 openrouter leg while
+`qwen-tp` stays config-blocked — retrying from the family root when the first walk halts, so a dispatch
+of the *hop leg itself* is served rather than halted).
 The chain **halts** after the V4.1 leg — exactly where it halted before the V4.1 leg existed. No
 generation downgrade is reachable by an automatic hop; the 0423 build survives only for an explicit
 must-stay dispatch of that exact leg with no fresh latch.
@@ -85,7 +86,8 @@ must-stay dispatch of that exact leg with no fresh latch.
 
 Revert the PR. No durable state migration: the legacy slug stays registered and in-table, so
 pre-#727 latch files / markers / sessions keep resolving throughout — a record whose `activeLeg` is
-the 0423 slug resolves to the current hop target rather than dispatching it. The clamp key is additive.
+the 0423 slug resolves to the family's first available leg rather than dispatching it. The clamp key is
+additive.
 
 ## Learnings
 

@@ -30,6 +30,7 @@ import {
   manualClear,
   readLatchState,
   isLatched,
+  isResolutionOnlyLeg,
   blockedProviders,
   latchTtlMs,
   renderExhaustionMarker,
@@ -987,6 +988,53 @@ test("RESOLUTION-ONLY legacy leg (#727) is never SERVED: a stale pre-#727 latch 
   equal(tail.halted, true, "no usable hop left → structured halt, never the 0423 build");
   equal(tail.leg, null);
   equal(tail.reason, "halt");
+});
+
+test("null activeLeg + a halting walk is a HALT, never a throw (the retry must not deref null)", () => {
+  // A fresh family record may legitimately carry `activeLeg: null` ("the primary
+  // is serving") — the shape the module's own fromLeg-less write branch produces.
+  // A request for the terminal usable leg then halts the walk (only the
+  // resolution-only leg follows it), and the #727 root-retry must not dereference
+  // the null sentinel: a designed HALT, not a TypeError on the dispatch path.
+  const { env } = makeEnv("v727-nullactive");
+  const now = Date.now();
+  fs.writeFileSync(
+    latchStateFile(env),
+    JSON.stringify({
+      version: 1,
+      epoch: 1,
+      updatedAt: new Date(now).toISOString(),
+      primaries: {
+        deepseek: {
+          status: "exhausted",
+          reason: "402",
+          source: "marker",
+          latchedAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
+          families: { "deepseek-v4-flash": { activeLeg: null, hopCount: 0, lastReason: "402" } },
+          notice: null,
+        },
+      },
+      blockedLegs: {},
+    }),
+  );
+  const state = readLatchState(env);
+  equal(state.primaries.deepseek.families["deepseek-v4-flash"].activeLeg, null, "seed: activeLeg null");
+  // ask for the terminal usable leg under a blocked openrouter provider so the
+  // walk genuinely halts (retired leg only after it)
+  markLegBlocked("openrouter", "401", { env });
+  const tail = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
+    readLatchState(env),
+    { env },
+  );
+  equal(tail.halted, true, "no throw, no served leg");
+  equal(tail.leg, null);
+  equal(tail.reason, "halt");
+  // and the predicate itself is null-tolerant (defence in depth)
+  equal(isResolutionOnlyLeg(null), false);
+  equal(isResolutionOnlyLeg(undefined), false);
 });
 
 test("hopCount contract: first active-leg set = 1; re-advance from active leg = 2", () => {

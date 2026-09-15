@@ -304,9 +304,9 @@ with automatic return after balance restore.
   DRAINING root — while no FAILOVER path can serve it: the advance walk skips
   it, resolution's latched-active fast path refuses a frozen `activeLeg` that is
   this slug (a pre-#727 latch recorded exactly that — such a record re-resolves
-  its family's current hop target, the V4.1 leg, instead of dispatching the
-  older build), and a dispatch of the retired slug under a fresh latch is moved
-  onto the current hop target as well. The only way to run the 0423 build is an
+  the family's first available leg, i.e. the V4.1 openrouter leg while `qwen-tp`
+  stays config-blocked, instead of dispatching the older build), and a dispatch
+  of the retired slug under a fresh latch is re-resolved the same way. The only way to run the 0423 build is an
   explicit must-stay dispatch of that exact leg with no fresh latch. The advance
   walk therefore HALTS after the V4.1 leg, exactly where it halted before the
   V4.1 leg existed.

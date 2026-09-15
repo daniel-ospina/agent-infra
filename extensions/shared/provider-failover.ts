@@ -381,8 +381,11 @@ export function familyLegs(family: string): LegRef[] | undefined {
  * resolveWithChain. */
 const RESOLUTION_ONLY_LEGS: ReadonlySet<string> = new Set(["openrouter/deepseek/deepseek-v4-flash"]);
 
-function isResolutionOnlyLeg(leg: LegRef): boolean {
-  return RESOLUTION_ONLY_LEGS.has(`${leg.provider}/${leg.model}`);
+export function isResolutionOnlyLeg(leg: LegRef | null | undefined): boolean {
+  // Null-tolerant on purpose: callers hold `activeLeg` fields typed
+  // `LegRef | null` ("null = the primary is serving"), and a null deref here
+  // would surface as a throw on the dispatch path instead of a plain false.
+  return leg != null && RESOLUTION_ONLY_LEGS.has(`${leg.provider}/${leg.model}`);
 }
 
 /** Is `provider` a member of the family's chain table (root + hop legs)?
@@ -1187,7 +1190,11 @@ export function resolveWithChain(
   // with no activeLeg at all, so the answer is the current hop target instead of
   // a halt with an available target sitting at it.
   let step = nextLegAfter(family, requested, state, { env, now, ttlMs: ttl });
-  if (step.halted && fam?.activeLeg !== undefined && isResolutionOnlyLeg(fam.activeLeg)) {
+  // `!= null`, NOT `!== undefined`: a family record legitimately carries
+  // `activeLeg: null` ("the primary is serving"), and isResolutionOnlyLeg(null)
+  // would dereference null — turning a designed HALT into a TypeError on the
+  // dispatch path.
+  if (step.halted && fam?.activeLeg != null && isResolutionOnlyLeg(fam.activeLeg)) {
     const rootLeg = familyLegs(family)?.[0];
     if (rootLeg) step = nextLegAfter(family, rootLeg, state, { env, now, ttlMs: ttl });
   }
