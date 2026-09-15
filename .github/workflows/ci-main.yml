@@ -52,8 +52,10 @@ jobs:
         # regression pin) — no explicit line for it, that would double-run it.
         # ⚠️ This leg is POST-MERGE only (on: push → main); the per-PR run of
         # the #744 suite is wired in ci.yml — the per-PR workflow that runs the
-        # test suites (pipeline-compliance.yml is also PR-triggered, but runs
-        # no test suite).
+        # test suites. (This comment used to add "pipeline-compliance.yml is also
+        # PR-triggered, but runs no test suite" — stale since #991, which wired
+        # the pipeline-compliance fixture suite in, and since #1027, which added
+        # tests/materialize-agents/run.sh to the same required job.)
         for t in extensions/*/test*.mjs; do
           [ -f "$t" ] || continue
           echo "== $t =="

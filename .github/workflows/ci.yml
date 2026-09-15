@@ -62,6 +62,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Drift-check tests (tiered exits, fixtures, workflow YAML)
         run: bash tests/drift/run.sh
+      - name: AGENTS.md materialize gate suite (#1027 — base-owned region pin)
+        # #1027 — the materialize gate's `--check` used to validate base rule
+        # headings by PRESENCE only, so a base-owned paragraph could be deleted
+        # (or a rule silently reworded) while `--check` still printed a green ✅.
+        # This suite pins the real defect surface: a missing required heading
+        # exits 1, and base-owned content drift is reported (never a plain ✅).
+        # VISIBLE here, not merge-blocking — the required check is
+        # `pipeline-compliance`, which runs the same suite.
+        run: bash tests/materialize-agents/run.sh
 
   cost-config:
     # #341 — cost-config drift guard (config clamp @400K): asserts the shipped
