@@ -39,7 +39,7 @@
  */
 
 import { spawnSubAgent, sweepRunCount } from "./index.js";
-import { getPgid, listPgid } from "../shared/process-sweep.js";
+import { groupExists, listPgid } from "../shared/process-sweep.js";
 import { spawn, execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -175,7 +175,6 @@ let savedDetached: string | undefined;
 // operator's REAL ledger.
 let savedAgentDir: string | undefined;
 let sentinel: import("node:child_process").ChildProcess;
-const parentPgid = getPgid(process.pid);
 /** Holder pids recorded across all dispatches — killed in teardown so the
  * suite never leaves orphans (incl. the intentional opt-out survivors). */
 const holderPids: number[] = [];
@@ -249,12 +248,19 @@ function markerPattern(marker: string): string {
 	return `[${marker[0]}]${marker.slice(1)}`;
 }
 
-function findPid(marker: string): number {
+/** #1074: `pgrep` exits 1 with no output when there is NO match — that is the
+ * "gone" answer. Every other failure (timeout, usage error, missing binary) is
+ * an UNMEASURED probe. Pre-#1074 both collapsed to 0, which callers read as
+ * "gone": a timed-out probe then satisfied `waitMarkerGone` vacuously and
+ * reported a captured child pid of 0. Returns 0 = measured-no-match, null =
+ * unmeasured. */
+function findPid(marker: string): number | null {
 	try {
 		const out = execSync(`pgrep -f "${markerPattern(marker)}"`, { timeout: 2000, encoding: "utf-8" }).trim();
-		return Number(out.split(/\s+/)[0]);
-	} catch {
-		return 0;
+		const n = Number(out.split(/\s+/)[0]);
+		return Number.isInteger(n) && n > 0 ? n : 0;
+	} catch (e) {
+		return (e as { status?: number }).status === 1 ? 0 : null;
 	}
 }
 
@@ -267,6 +273,10 @@ function readHolderPid(marker: string): number {
 }
 
 function isAlive(pid: number): boolean {
+	// #1074: fail CLOSED on a value that cannot be a pid. `process.kill(0, 0)`
+	// probes the CALLER's own group and succeeds, so a `?? 0`/`undefined` anchor
+	// used to assert "alive" with no witness at all (a fail-open assertion).
+	if (!Number.isInteger(pid) || pid <= 1) return false;
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -276,24 +286,43 @@ function isAlive(pid: number): boolean {
 }
 
 /** Poll until pgid has no members (post-settle sweep verification). Returns
- * the surviving member pids on timeout. */
+ * the surviving member pids on timeout.
+ *
+ * #1074: the VERDICT is the spawn-free `groupExists(pgid)` probe — it runs no
+ * subprocess, so it cannot time out. The old form read `listPgid(pgid)`,
+ * which collapses a FAILED `pgrep` into `[]`; a timed-out probe therefore made
+ * this poll return `[]` immediately and satisfied the `survivors.length === 0`
+ * assertions vacuously (a false PASS on the sweep's own exclusion envelope).
+ * `listPgid` is now only asked to NAME the survivors for the failure message. */
 async function waitGroupEmpty(pgid: number, timeoutMs = 15_000): Promise<number[]> {
+	// #1074: an UNUSABLE anchor is NOT "verified empty". `groupExists(pgid)`
+	// refuses `pgid <= 1` by design (kill(-1, ·) / kill(0, ·)), so without this
+	// guard a missed child-pid capture (`childPid = 0`) returned `[]` on the
+	// first iteration and every `survivors.length === 0` assertion below passed
+	// VACUOUSLY — the unmeasured probe read as a clean sweep. Fail closed.
+	if (!Number.isInteger(pgid) || pgid <= 1) return [pgid];
 	const deadline = Date.now() + timeoutMs;
-	let survivors: number[] = [pgid];
 	while (Date.now() < deadline) {
-		survivors = listPgid(pgid);
-		if (survivors.length === 0) return [];
+		if (!groupExists(pgid)) return [];
 		await sleep(200);
 	}
-	return survivors;
+	const names = listPgid(pgid);
+	return names.length > 0 ? names : [pgid];
 }
 
-/** Poll until no process argv matches the marker. */
+/** Poll until no process argv matches the marker. #1074: an UNMEASURED probe
+ * (`null`) is not "gone" — only a measured no-match (0) is. */
 async function waitMarkerGone(marker: string, timeoutMs = 15_000): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
+	let unmeasured = 0;
 	while (Date.now() < deadline) {
-		if (findPid(marker) === 0) return true;
+		const pid = findPid(marker);
+		if (pid === 0) return true;
+		if (pid === null) unmeasured++;
 		await sleep(200);
+	}
+	if (unmeasured > 0) {
+		console.log(`  ⚠️  waitMarkerGone(${marker}): probe unmeasured on ${unmeasured} attempt(s) — reporting NOT gone`);
 	}
 	return false;
 }
@@ -323,7 +352,7 @@ async function dispatch(scenario: string, marker: string, env: Record<string, st
 	const pidPoller = (async () => {
 		while (Date.now() - started < 20_000) {
 			const pid = findPid(marker);
-			if (pid > 0) return pid;
+			if (pid !== null && pid > 0) return pid;
 			await sleep(100);
 		}
 		return 0;
@@ -375,6 +404,7 @@ test("AC2: signal-death mid-tool → cut (code null) with partials; sweep reaps"
 	const before = sweepRunCount;
 	const { result, childPid, elapsedMs } = await dispatch("ac2", marker);
 	ok(elapsedMs < 60_000, `resolve ${elapsedMs}ms < 60s`);
+	ok(childPid > 0, "child pid captured (pgid anchor — an unmeasured anchor cannot verify a sweep)");
 	ok(result !== undefined, "partials present → defined cut result");
 	equal(result!.details?.killed, true);
 	equal(result!.details?.reason, "cut");
@@ -389,6 +419,7 @@ test("AC2 zero-partial: markers-only SIGKILL cut → undefined result (retryable
 	const marker = mkMarker("ac2zero");
 	const { result, childPid, elapsedMs } = await dispatch("ac2-zero", marker);
 	ok(elapsedMs < 60_000, `resolve ${elapsedMs}ms < 60s`);
+	ok(childPid > 0, "child pid captured (pgid anchor — markers-only cut still has a live process to anchor)");
 	equal(result, undefined, "no real output → retryable undefined");
 	const survivors = await waitGroupEmpty(childPid);
 	equal(survivors.length, 0, `pgid ${childPid} empty post-settle`);
@@ -404,8 +435,8 @@ test("AC10: cut clause resolves < 60s after the 15s cut gap; SIGCONT'd worker re
 	const started = Date.now();
 	const pidPoller = (async () => {
 		while (Date.now() - started < 20_000) {
-			childPid = findPid(marker);
-			if (childPid > 0) return;
+			const pid = findPid(marker);
+			if (pid !== null && pid > 0) { childPid = pid; return; }
 			await sleep(100);
 		}
 	})();
@@ -432,6 +463,7 @@ test("AC11: pipe-holder dies < 2s → CLOSE resolves and must ALSO yield reason 
 	const before = sweepRunCount;
 	const { result, childPid, elapsedMs } = await dispatch("ac11", marker);
 	ok(elapsedMs < 60_000, `resolve ${elapsedMs}ms < 60s`);
+	ok(childPid > 0, "child pid captured (pgid anchor)");
 	ok(result !== undefined, "defined cut result");
 	equal(result!.details?.killed, true);
 	equal(result!.details?.reason, "cut", "close path taxonomy — clean mid-tool exit is a cut (frozen rule)");
@@ -449,6 +481,7 @@ test("AC12: exit-settle SUCCESS < 60s; the settle-path sweep still reaps the pip
 	const before = sweepRunCount;
 	const { result, childPid, elapsedMs } = await dispatch("ac12", marker);
 	ok(elapsedMs < 60_000, `resolve ${elapsedMs}ms < 60s (exit-settle)`);
+	ok(childPid > 0, "child pid captured (pgid anchor)");
 	ok(result !== undefined, "defined success result");
 	ok(result!.content[0].text.includes("FAKE-PI-PARTIAL-ac12"), "stdout intact");
 	equal(result!.details?.reason, undefined, "no cut reason — clean success (toolsInFlight=0)");
@@ -513,8 +546,19 @@ test("TASK_DETACHED=0: sweep skips + warns; the parent's own group is never sign
 	// guard refused to signal it (TASK_DETACHED=0 implies TASK_SWEEP=0)
 	const holderPid = readHolderPid(marker);
 	ok(holderPid > 0 && isAlive(holderPid), "pipe-holder survives (parent's group never signaled)");
-	ok(isAlive(process.pid), "orchestrator alive");
-	equal(getPgid(process.pid), parentPgid, "orchestrator's pgid unchanged");
+	// #1074 — the former `equal(getPgid(process.pid), parentPgid, ...)` was a
+	// differential measurement of an IMMUTABLE own pgid through a lossy,
+	// load-sensitive probe: under load one sample timed out and it failed
+	// spuriously (`null !== 2473`), and if BOTH samples timed out it passed
+	// vacuously (`null === null`). It was also insensitive to signalling — a
+	// pgid never changes, so a signalled-but-surviving process still compares
+	// equal — i.e. it tested the probe, not the invariant. The invariant it
+	// stood for (the orchestrator's own process group was never signalled) is
+	// asserted DIRECTLY and non-vacuously by the witnesses around this line:
+	// the sentinel child in the orchestrator's group and the pipe-holder both
+	// survive, and this very suite completing is the orchestrator's own witness.
+	// (No `ok(isAlive(process.pid))` here: a process cannot observe its own
+	// death, so that assertion can never fail — non-falsifiable is not a witness.)
 	ok(isAlive(sentinel.pid ?? 0), "sentinel in the parent's group still alive");
 	// cleanup the intentional survivor (recorded for teardown)
 	try { process.kill(holderPid, "SIGKILL"); } catch { /* gone */ }
@@ -549,6 +593,7 @@ test("sweep fires EXACTLY ONCE per dispatch; stale grace-timer re-fire must NOT 
 	const before = sweepRunCount;
 	const { result, childPid, elapsedMs } = await dispatch("ac1", marker);
 	ok(result !== undefined);
+	ok(childPid > 0, "child pid captured (pgid anchor)");
 	equal(result!.details?.reason, "cut");
 	equal(sweepRunCount, before + 1, "sweep fired exactly once");
 	// wait past the 2s grace window — a stale grace-timer re-fire must not
@@ -576,9 +621,12 @@ test("AC3: 3× cut dispatch — zero orphans after each; orchestrator untouched"
 		ok(await waitMarkerGone(marker), `wave ${i}: pgrep -f marker empty`);
 	}
 	equal(sweepRunCount, before + 3, "one sweep per dispatch in the wave");
-	// exclusion envelope: the orchestrator's own process + pgid untouched
-	ok(isAlive(process.pid), "orchestrator alive");
-	equal(getPgid(process.pid), parentPgid, "orchestrator pgid unchanged");
+	// exclusion envelope: the orchestrator's own process group is untouched.
+	// #1074: asserted by the direct witnesses (the sentinel child in that group,
+	// plus this suite reaching its own final section), NOT by re-measuring an
+	// immutable pgid through a lossy probe — see the AC1 comment above for the
+	// full rationale. `isAlive(process.pid)` is deliberately absent: a process
+	// cannot observe its own death, so it is not a falsifiable assertion.
 	ok(isAlive(sentinel.pid ?? 0), "sentinel in the parent's group still alive");
 });
 

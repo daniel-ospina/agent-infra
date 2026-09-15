@@ -3096,10 +3096,15 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // TASK_SWEEP=0 disables it ENTIRELY; a non-detached spawn
       // (TASK_DETACHED=0) is skipped + warned by the shared guard — the
       // orchestrator's own group is never signaled (implies TASK_SWEEP=0).
+      // #1074: `spawnedPid` is the AUTHORISATION — the pid of the child this
+      // call just spawned (for a detached spawn that child is a setsid session
+      // + group leader, so its pgid IS its pid). The shared guard signals a
+      // group ONLY when pgid === spawnedPid; it never authorises from a `ps`
+      // measurement, which under load can time out on a live pid.
       if (opts?.sweep && process.env.TASK_SWEEP !== "0" && childPgid !== null && !swept) {
         swept = true;
         sweepRunCount += 1;
-        void sweepProcessGroup(childPgid, { detached });
+        void sweepProcessGroup(childPgid, { detached, spawnedPid: proc.pid });
       }
       resolve(value);
     };
