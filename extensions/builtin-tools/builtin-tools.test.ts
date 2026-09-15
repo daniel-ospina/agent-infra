@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent } from "./index.js";
 import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
@@ -2798,6 +2798,90 @@ testAsync("E16: loop-level wiring — per-tick getLoad1() read + latched bound t
   const builtinSource = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
   ok(builtinSource.includes("latchedFirstMessageMs: latchedEffM"), "#272 loop threads the per-dispatch latch");
   ok(builtinSource.includes("const load1 = getLoad1()"), "#272 loop reads load1 fresh per tick");
+});
+
+
+// ── #1070: the cut gap is load-scaled + latched, and the ages are reported effective ──
+section("#1070 cut-gap load scaling + effective-age reporting");
+
+/** Minimal state that reaches the cut clause: a marker stream inside the
+ * stateFresh window, a tool in flight, and no other clause in play (tool age 0,
+ * toolUpdates false, hasOutput true). */
+function mkCutState(markerAgeMs: number, now: number): HeartbeatState {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.streamAgeMs = 0;
+  st.toolAgeMaxMs = 0;
+  st.lastMarkerAt = now - markerAgeMs;
+  return st;
+}
+
+test("#1070 getEffectiveCutGapMs — load-scaled in the loadScaledBound bands, monotonic per dispatch", () => {
+  const base = getCutGapMs();
+  equal(getEffectiveCutGapMs(undefined, 0), base, "load 0 → the static bound (legacy-identical)");
+  equal(getEffectiveCutGapMs(undefined, 7.9), base, "load 7.9 → 1x");
+  equal(getEffectiveCutGapMs(undefined, 8), base * 2, "load 8 → 2x");
+  equal(getEffectiveCutGapMs(undefined, 15), base * 2, "load 15 → 2x");
+  equal(getEffectiveCutGapMs(undefined, 16), base * 3, "load 16 → 3x");
+  equal(getEffectiveCutGapMs(undefined, 60), base * 3, "3x is bounded");
+  const latched = getEffectiveCutGapMs(undefined, 60);
+  equal(getEffectiveCutGapMs(latched, 0), latched, "a post-storm load drop does NOT re-cut");
+  equal(getEffectiveCutGapMs(base, 60), base * 3, "the latch grows when the load rises");
+  withEnv({ TASK_LOAD_SCALE_OFF: "1" }, () => {
+    equal(getEffectiveCutGapMs(undefined, 60), base, "TASK_LOAD_SCALE_OFF=1 keeps the static bound");
+  });
+});
+
+test("#1070: an explicit TASK_HEARTBEAT_CUT_GAP_MS is honoured verbatim — never rescaled", () => {
+  withEnv({ TASK_HEARTBEAT_CUT_GAP_MS: "45000" }, () => {
+    equal(getCutGapMs(), 45_000, "the override is the base");
+    equal(getEffectiveCutGapMs(undefined, 0), 45_000, "load 0 → the operator's number");
+    equal(getEffectiveCutGapMs(undefined, 60), 45_000, "load 60 → STILL the operator's number (no silent rescale)");
+    equal(getEffectiveCutGapMs(90_000, 60), 90_000, "a larger latch still wins over the override");
+  });
+});
+
+test("#1070: the cut clause fires on the SCALED gap — a marker age between 1x and 3x is spared under load", () => {
+  const now = 1_000_000;
+  const gap = getCutGapMs(); // 1x — 37.5s at the shipped defaults
+  const st = mkCutState(gap + 20_000, now);
+  const legacy = heartbeatKillDecision(
+    dinput({ now, lastLifeSignAt: now, hasOutput: true, state: st, cutGapMs: gap, load1: 0 }),
+  );
+  equal(legacy.kill, true, "1x gap → the same marker age DOES cut (legacy behavior preserved)");
+  equal(legacy.reason, "cut", "reason is the cut clause");
+  const scaled = heartbeatKillDecision(
+    dinput({ now, lastLifeSignAt: now, hasOutput: true, state: st, cutGapMs: getEffectiveCutGapMs(undefined, 60), load1: 60 }),
+  );
+  equal(scaled.kill, false, "the 3x scaled gap spares that same marker age under load");
+  equal(scaled.reason, undefined, "no kill reason");
+});
+
+test("#1070: loop wiring — the effective gap is latched + threaded, and all four kill paths report effective ages", () => {
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  ok(src.includes("cutGapMs: effCutGapMs"), "the loop passes the effective cut gap, overriding the hbThresholds spread");
+  ok(src.includes("let latchedCutGapM: number | undefined"), "the per-dispatch cut-gap latch is declared");
+  ok(src.includes("getEffectiveCutGapMs(latchedCutGapM, load1)"), "the loop scales + latches per tick");
+  ok(src.includes("cutGapMs: getCutGapMs(),"), "hbThresholds still carries the UNSCALED base (the helper owns scaling)");
+  ok(src.includes("(marker gap exceeded ${Math.round(effCutGapMs / 1000)}s)"), "the cut headline reports the EFFECTIVE scaled gap the clause actually used");
+  equal(src.split("hbThresholds.cutGapMs").length - 1, 0, "no diagnostic reads the unscaled cut base — clause and headline agree");
+  equal(src.split("effStreamAgeMs=").length - 1, 4, "all four kill paths report the effective stream age");
+  equal(src.split("effToolAgeMs=").length - 1, 4, "all four kill paths report the effective tool age");
+  // #1070 (review cycle 1): the headline must report the EFFECTIVE age too —
+  // the clauses fire on effStreamAge/effToolAge, so a headline printing the raw
+  // frozen sample contradicted the payload printed beside it.
+  equal(src.split("Math.round(effStreamAgeMs / 1000)").length - 1, 4, "headlines + the triage line print the EFFECTIVE stream age (3 headlines + the diagnostic)");
+  equal(src.split("Math.round(effToolAgeMs / 1000)").length - 1, 1, "the tool-stall headline prints the EFFECTIVE tool age");
+  equal(src.split("hbCtx.state.streamAgeMs / 1000").length - 1, 0, "no headline prints the raw frozen stream age");
+  equal(src.split("hbCtx.state.toolAgeMaxMs / 1000").length - 1, 0, "no headline prints the raw frozen tool age");
+  // #1070 (review cycle 1): the cut-gap reachability invariant — one shared
+  // fresh window, and a one-shot warning when the scaled gap makes the clause
+  // structurally unreachable.
+  equal(src.split("const freshWindowMs = Math.max(2 * HEARTBEAT_TIMEOUT_MS, 2 * getHeartbeatIntervalMs());").length - 1, 1, "freshWindowMs is defined ONCE and shared by the cut-gap warning and the backstop");
+  ok(src.includes("the cut clause cannot fire for this dispatch"), "the loop warns when the scaled cut gap >= the stateFresh window");
+  ok(src.includes("let cutInertWarned = false"), "the unreachability warning is one-shot per dispatch, not per tick");
 });
 
 
