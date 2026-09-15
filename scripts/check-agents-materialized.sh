@@ -62,10 +62,10 @@ if ! git show :AGENTS.md > "$STAGE_DIR/AGENTS.md" 2>/dev/null; then
   exit 1
 fi
 
-# Run the materializer gate. The exit code is authoritative (0 = materialized,
-# 1 = stub/missing, 2 = usage); assignment-inside-if is safe under set -e and
-# preserves the real status (no `|| true` — it would mask the code and make
-# this a dead branch).
+# Run the materializer gate. The exit code is authoritative (0 = materialized
+# — clean OR content-drift, 1 = stub/missing required heading); assignment-inside-if
+# is safe under set -e and preserves the real status (no `|| true` — it would mask
+# the code and make this a dead branch).
 if ! OUTPUT="$(bash "$MATERIALIZER" --check "$STAGE_DIR" 2>&1)"; then
   echo ""
   echo "⛔ [agent-infra] AGENTS.md is a STUB — universal rules never reach the model."
@@ -78,8 +78,15 @@ if ! OUTPUT="$(bash "$MATERIALIZER" --check "$STAGE_DIR" 2>&1)"; then
   exit 1
 fi
 
-# Passed — surface a non-blocking drift warning if the materializer flagged one
-# (consumer predates a base change; --merge refreshes).
-grep -q 'base head differs' <<<"$OUTPUT" && echo "$OUTPUT" | grep 'base head differs'
+# Passed (exit 0). Distinguish CLEAN from BASE-OWNED CONTENT DRIFT: drift is
+# non-blocking (the rules still reach the model), but reporting it as a green
+# "passed" would be a lie (#1027) — the same lie `--check` used to tell. The
+# machine key is emitted by the materializer and is stable.
+if grep -q 'BASE-OWNED CONTENT DRIFTED' <<<"$OUTPUT" \
+   || grep -q 'base-owned content compare could not run' <<<"$OUTPUT"; then
+  echo "$OUTPUT" | grep -E 'base head differs|compare could not run' || true
+  echo "[agent-infra] ⚠️ AGENTS.md materialization gate: markers present, but base-owned content DRIFTED (non-blocking — run --merge to refresh; the required CI check pins content)"
+  exit 0
+fi
 echo "[agent-infra] ✅ AGENTS.md materialization gate: passed"
 exit 0

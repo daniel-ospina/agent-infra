@@ -125,6 +125,46 @@ jobs:
           fi
           PIPELINE_COMPLIANCE_SELF_TEST=1 bash scripts/check-pipeline-compliance.sh
 
+      - name: AGENTS.md materialize gate suite (#1027 — base-owned region pin)
+        # #1027 — `scripts/materialize-agents.sh --check` validated the base rule
+        # headings by PRESENCE only: a base-owned paragraph could be deleted, or a
+        # universal rule silently reworded, while `--check` still printed a green
+        # ✅. That is exactly the class the gate exists to prevent (a stub ships
+        # ZERO universal rules — #600), one level down. The suite pins it: a
+        # missing required heading exits 1; base-owned content drift is reported
+        # and never rendered as a plain ✅.
+        #
+        # Why this job: `pipeline-compliance` is the repo's ONLY required status
+        # check (#646), so this is the one place the suite blocks a merge. It also
+        # runs in ci.yml's `drift-check` job, where it is visible but not
+        # merge-blocking. HONEST SCOPE: every CI gate in this repo is PR-editable
+        # (#713 class) — a PR that removes this step or no-ops the suite can still
+        # merge green. The step is fail-closed for *suite-file-missing*, not for
+        # deliberate removal.
+        #
+        # The self-integrity grep sits INSIDE the suite-exists branch on purpose:
+        # on a consumer checkout reusing this file via workflow_call the suite is
+        # absent by design, and running the grep there would red a legitimate
+        # consumer build.
+        run: |
+          set -euo pipefail
+          if [ -f tests/materialize-agents/run.sh ]; then
+            # The real-repo pin (`diff templates/AGENTS.base.md AGENTS.md`,
+            # counting `^<`) is what makes the suite non-vacuous. A suite that
+            # lost it would still pass every fixture case and pin nothing, so
+            # assert its presence before trusting its verdict.
+            if ! grep -q '^<' tests/materialize-agents/run.sh; then
+              echo "::error::tests/materialize-agents/run.sh carries no real-repo pin (^<) — the #1027 base-owned-region assertion cannot be trusted."
+              exit 1
+            fi
+            bash tests/materialize-agents/run.sh
+          elif [ -f manifest.json ] && [ -f bin/agent-infra.js ]; then
+            echo "::error::agent-infra checkout detected but tests/materialize-agents/run.sh is missing — the #1027 base-owned-region pin would silently stop running."
+            exit 1
+          else
+            echo "::notice::consumer checkout (no agent-infra manifest) — materialize-agents suite skipped"
+          fi
+
   workflow-drift:
     # #303 drift guard — reusable workflows must be REAL COMMITTED FILES in
     # .github/workflows/, materialized from templates/ by

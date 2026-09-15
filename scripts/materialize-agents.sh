@@ -6,8 +6,13 @@
 # after the BASE-END marker (`<!-- AGENTS-BASE-END -->`). The script has
 # three modes:
 #
-#   --check <repo>   Verify base markers present (all universal rules reach pi).
-#                    Exit 0 = materialized, 1 = stub/missing (authoring-time gate).
+#   --check <repo>   Verify all universal rules reach pi: (a) every required base
+#                    rule heading is present, then (b) the BASE-OWNED REGION matches
+#                    the canonical template (line-subsequence when the file has no
+#                    BASE-END marker; exact head compare when it does).
+#                    Exit 0 = materialized (content drift is reported as a ⚠️ but
+#                    is NON-blocking — rules still reach the model), 1 = stub/missing
+#                    heading (authoring-time gate). Never exits 2.
 #   --merge <repo>   Rewrite AGENTS.md = current base + existing tail after the
 #                    marker (idempotent; safe to re-run after base changes).
 #                    FIRST-TIME migration is NOT automatic — the human curates the
@@ -51,10 +56,14 @@ if [ "$MODE" != "--new" ] && [ ! -f "$REPO/AGENTS.md" ]; then
   exit 1
 fi
 
-# ── --check: structural marker gate ────────────────────────────────────
+# ── --check: structural marker gate + base-owned content drift check ────
 if [ "$MODE" = "--check" ]; then
   f="$REPO/AGENTS.md"
   missing=0
+  # Required base rule headings. `#### Hard Cap` is included because it is the
+  # rule that BOUNDS every review loop in the base — a file missing it can pass
+  # a bare "is it a stub?" check while silently losing a load-bearing rule
+  # (#1027). Keep this list in sync with tests/materialize-agents/run.sh.
   for marker in \
     "HARD RULE: Auto-Continue" \
     "NEVER PAUSE WITHOUT A REASON" \
@@ -63,37 +72,85 @@ if [ "$MODE" = "--check" ]; then
     "HARD RULE: Skill Compliance" \
     "Research Discipline" \
     "Debugging Discipline" \
-    "Review Loop Protocol"; do
+    "Review Loop Protocol" \
+    "#### Hard Cap"; do
     grep -qF "$marker" "$f" || { echo "   MISSING: $marker"; missing=1; }
   done
   if [ $missing -eq 0 ]; then
-    # Materialized. Optionally surface base-head drift vs the canonical
-    # template (non-blocking warning — rules still reach the model; drift
-    # means the file predates newer base sections and --merge would refresh).
-    # Requires BOTH a resolvable template AND a canonical BASE-END marker
-    # (anchored, same rule as extraction — a lenient substring guard here
-    # would open the same guard/extract mismatch bug class fixed in --merge,
-    # producing a false drift warning on a byte-current file). Without the
-    # marker the head region is undefined (pre-marker repos like DMeer/
-    # eldato/agent-infra are exempt — their whole file incl. tail would
-    # otherwise be compared). EOLs are normalized (tr -d '\r') so a CRLF
-    # checkout doesn't trip a spurious drift warning.
-    if [ -n "${AGENT_INFRA_PATH:-}" ] \
-       && [ -f "$AGENT_INFRA_PATH/templates/AGENTS.base.md" ] \
-       && grep -qE "^${MARKER}[[:space:]]*$" "$f"; then
+    # Materialized. Now check the BASE-OWNED REGION for drift vs the canonical
+    # template. Drift is NON-blocking (exit 0) — the rules still reach the model
+    # — but a plain ✅ would be a lie, so drift gets its own machine-readable
+    # key (BASE-OWNED CONTENT DRIFTED) that callers can distinguish from clean.
+    #
+    # Read-only template resolution prefers the script's OWN physical parent,
+    # then AGENT_INFRA_PATH. Script-first avoids a false drift warning when a
+    # stale AGENT_INFRA_PATH shadows the checkout the script actually ships with;
+    # the env fallback covers the real-dir `scripts/` consumer layout. If neither
+    # resolves, the content compare is SKIPPED — and the skip is stated.
+    BASE_T=""
+    _self_dir="$(cd -P "$(dirname "$0")/.." 2>/dev/null && pwd -P)" || true
+    if [ -n "$_self_dir" ] && [ -f "$_self_dir/templates/AGENTS.base.md" ]; then
+      BASE_T="$_self_dir/templates/AGENTS.base.md"
+    elif [ -n "${AGENT_INFRA_PATH:-}" ] && [ -f "$AGENT_INFRA_PATH/templates/AGENTS.base.md" ]; then
+      BASE_T="$AGENT_INFRA_PATH/templates/AGENTS.base.md"
+    fi
+    if [ -z "$BASE_T" ]; then
+      echo "✅ $REPO: materialized (9 base rule headings present; content compare skipped — base template not resolvable)"
+      exit 0
+    fi
+    drift=0
+    if grep -qE "^${MARKER}[[:space:]]*$" "$f"; then
+      # Canonical marker present: the base-owned head region is well defined —
+      # compare it exactly (repo edits in the head region are drift).
       HEAD=$(sed -n "1,/^${MARKER}[[:space:]]*$/p" "$f" | sed '$d' | tr -d '\r')
-      TEMPLATE="$(cat "$AGENT_INFRA_PATH/templates/AGENTS.base.md" | tr -d '\r')"
-      # Compare only the pre-marker head (base-owned region) — repo edits in
-      # the head region count as drift (base is mechanical, base-owned).
+      TEMPLATE=$(tr -d '\r' < "$BASE_T")
       if [ "$HEAD" != "$TEMPLATE" ]; then
         echo "   ⚠️  base head differs from current AGENTS.base.md — refresh with --merge"
+        drift=1
       fi
+      CLEAN_MSG="base head matches AGENTS.base.md"
+    else
+      # No marker (legacy hand-written layout): the head region is UNDEFINED, so
+      # require every base line to appear, in order, unmodified — a line
+      # SUBSEQUENCE. Repo-specific additions are allowed (that is the repo-owned
+      # tail). Operand order pins direction: template FIRST, so `^<` = "a base
+      # line missing from the file".
+      if DIFF_OUT=$(diff <(tr -d '\r' < "$BASE_T") <(tr -d '\r' < "$f")); then
+        drc=0
+      else
+        drc=$?
+      fi
+      if [ "$drc" -eq 2 ]; then
+        echo "   ⚠️  base-owned content compare could not run (diff exit 2)"
+        echo "⚠️ $REPO: materialized (9 base rule headings present) but base-owned content compare could not run (internal error)"
+        exit 0
+      fi
+      # `|| true` is REQUIRED: under `set -e` a `grep -c` that matches 0 lines
+      # returns 1 and would abort — silently converting a CLEAN result into a
+      # crash. This is the pipefail/exit-code control pinned by the suite.
+      BASE_ONLY="$(grep -c '^<' <<<"$DIFF_OUT" || true)"
+      if [ "${BASE_ONLY:-0}" -gt 0 ]; then
+        echo "   ⚠️  base head differs from current AGENTS.base.md — ${BASE_ONLY} base line(s) missing/modified; refresh with --merge"
+        drift=1
+      fi
+      CLEAN_MSG="all base lines present in order (repo additions allowed)"
     fi
-    echo "✅ $REPO: materialized (all base markers present)"
+    if [ "$drift" -eq 1 ]; then
+      echo "⚠️ $REPO: materialized (9 base rule headings present) but BASE-OWNED CONTENT DRIFTED"
+      exit 0
+    fi
+    echo "✅ $REPO: materialized (9 base rule headings present; ${CLEAN_MSG})"
     exit 0
   fi
   echo "⛔ $REPO: AGENTS.md is a STUB — universal rules never reach the model."
-  echo "   Fix: run  scripts/materialize-agents.sh --new $REPO <tail-file>"
+  if grep -qF "$MARKER" "$f"; then
+    echo "   Fix: run  scripts/materialize-agents.sh --merge $REPO"
+  else
+    echo "   This AGENTS.md has no ${MARKER} marker (it predates the"
+    echo "   materialization contract). --merge would refuse and --new would overwrite"
+    echo "   it, so restore the MISSING heading(s) above from templates/AGENTS.base.md"
+    echo "   by hand, then re-run --check."
+  fi
   exit 1
 fi
 
