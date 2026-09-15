@@ -80,7 +80,7 @@ At each verifier gate (scope-verify, plan-verify, verify):
 4. If any agent finds a **blocking** issue → fix it → re-dispatch ALL
 5. Only `NO ISSUES FOUND` from every dispatched agent advances the gate (adversarial domain: `THREAT SURFACE COVERED` substitutes — see below)
 
-**Conformance floor.** A round that returns ≥1 issue and **none** carrying an adequate `consequence:` is malformed reviewer output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit the gate **non-clean**. Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch — the floor never widens a bound (`AGENTS.md` §Hard Cap counts every dispatch as a round).
+**Conformance floor.** A round that returns ≥1 issue and **none** carrying an adequate `consequence:` is malformed reviewer output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit the gate **non-clean**. Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch — the floor never widens a bound. (`AGENTS.md` §Hard Cap counts **cycles per gate**, not reviewer dispatches: "dispatching a fresh reviewer does not reset, extend, or replenish the budget.")
 
 **The gate does NOT advance on dispatch count alone.** Verifier content is checked. A verifier that finds issues keeps the gate locked so the agent must fix and re-verify.
 

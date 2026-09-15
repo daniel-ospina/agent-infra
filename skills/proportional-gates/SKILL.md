@@ -162,8 +162,9 @@ substring (e.g. `NO ISSUES FOUND — DEGRADED` is not clean).
 **Conformance floor.** If a cycle yields ≥1 finding and **none** carries an adequate `consequence:`, that
 is malformed reviewer output, not a clean cycle: record `⚠️ reviewer returned N consequence-less
 findings`, re-dispatch once, and then exit **non-clean**. **Where the gate's own bound is already spent,
-record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound, and
-`AGENTS.md` §Hard Cap counts every dispatch as a round. Voided findings are still written to the cycle
+record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound: `AGENTS.md`
+§Hard Cap counts **cycles per gate**, not reviewer dispatches — "dispatching a fresh reviewer does not reset,
+extend, or replenish the budget". Voided findings are still written to the cycle
 log, so convergence and stall detection read them and cannot read a shrunken set as convergence. Findings
 from reviewers that are *advisory by construction* (`duplication-architecture`; `improvement-opportunities`
 P1/P2) are recorded, never counted, and **do not trigger the floor**.
