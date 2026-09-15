@@ -4237,10 +4237,38 @@ test("#1071: resolveTaskCwd — omitted / null / blank → process.cwd() (negati
 // POSITIVE TWIN: an explicit target is used, resolved to an absolute path so
 // the wedge report's `worktree=` is unambiguous.
 test("#1071: resolveTaskCwd — an explicit target is used as-is (positive twin)", () => {
-  equal(resolveTaskCwd("/tmp/wt-1071"), "/tmp/wt-1071", "absolute target passes through");
-  equal(resolveTaskCwd("  /tmp/wt-1071  "), "/tmp/wt-1071", "surrounding whitespace is trimmed");
+  // A path that cannot exist: realpath throws → the lexical absolute path is
+  // used (the total-function fallback). Constructed, never a fixed literal, so
+  // the assertion cannot flake on a machine where that literal happens to exist.
+  const ghost = join(tmpdir(), `t1071-ghost-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  equal(resolveTaskCwd(ghost), resolve(ghost), "a non-existent target falls back to its lexical absolute path");
+  equal(resolveTaskCwd(`  ${ghost}  `), resolve(ghost), "surrounding whitespace is trimmed");
   equal(resolveTaskCwd("rel/wt-1071"), resolve(process.cwd(), "rel/wt-1071"), "relative target resolves against the parent cwd");
   ok(resolveTaskCwd("./x").startsWith("/"), "always absolute in the report");
+});
+
+// #1071 review fix: the reported `worktree=` (and the ledger row's `cwd`) must be
+// the PHYSICAL directory the child is in — the child's `getcwd()` resolves
+// symlinks, so a logical spelling would name a different string than the tree the
+// child actually works in (macOS: `/var/...` vs `/private/var/...`). Pinned for
+// the default path by task-cap-handoff.integration.test.ts:439; pinned here for
+// the parameterized path.
+test("#1071 (review fix): an existing target is canonicalized to its PHYSICAL path", () => {
+  const real = mkdtempSync(join(tmpdir(), "t1071-real-"));
+  const link = join(tmpdir(), `t1071-link-${process.pid}`);
+  try {
+    equal(resolveTaskCwd(real), realpathSync(real), "an existing target reports its realpath");
+    rmSync(link, { recursive: true, force: true });
+    try {
+      execSync(`ln -s ${JSON.stringify(real)} ${JSON.stringify(link)}`);
+    } catch {
+      return; // symlink creation unavailable (unprivileged / no ln) — the realpath pin above already covers the macOS /var case
+    }
+    equal(resolveTaskCwd(link), realpathSync(real), "a symlinked target reports the tree the child's getcwd() would");
+  } finally {
+    rmSync(link, { recursive: true, force: true });
+    rmSync(real, { recursive: true, force: true });
+  }
 });
 
 // SOURCE PINS: the ONE resolved value feeds BOTH consumers (spawn + repo probe)
@@ -4262,7 +4290,7 @@ test("#1071: the task tool schema exposes `cwd` and threads it to every leg (sou
   ok(/cwd: Type\.Optional\(\s*Type\.String\(/.test(source), "schema exposes an optional cwd");
   ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd)"), "primary + failover-hop legs pass params.cwd");
   ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd)"), "the provider-fallback leg passes params.cwd");
-  ok(!source.includes("cwd: process.cwd(),"), "no spawn site pins the parent cwd any more");
+  ok(!/\{\s*\n\s*cwd: process\.cwd\(\),/.test(source), "no spawn options block pins the parent cwd (scoped to the block — a whole-file negative match is over-broad and its failure message cannot name a real spawn site)");
 });
 
 // BEHAVIORAL E2E: a PATH-shadow fake `pi` that prints its own cwd. This is the
@@ -4324,7 +4352,7 @@ testAsync("#1071: the report names the TARGET repo's worktree/branch/dirty (neve
     writeFileSync(join(dir, "uncommitted.txt"), "x");
     const st = await asyncRepoState(dir);
     const line = renderRepoStateLine(st, resolveTaskCwd(dir));
-    ok(line.includes(`worktree=${resolve(dir)}`), `worktree is the TARGET repo: ${line}`);
+    ok(line.includes(`worktree=${realpathSync(dir)}`), `worktree is the TARGET repo, PHYSICAL path: ${line}`);
     ok(line.includes("branch=fix/target-1071"), `branch is the TARGET's, not the parent's: ${line}`);
     ok(line.includes("dirty=true"), `the TARGET's uncommitted change is visible: ${line}`);
     ok(!line.includes(`worktree=${process.cwd()}`), "never the parent's checkout");

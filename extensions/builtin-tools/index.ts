@@ -2595,21 +2595,36 @@ export const ABNORMAL_EXIT_DETAIL_KEYS = [
  * #1071: the task tool's TARGET working directory for one dispatch.
  *
  * The child used to be spawned with `cwd: process.cwd()` — the PARENT's
- * working directory — so a child dispatched to work in another repo/worktree
- * loaded the parent's extension stack (observed: a child told to work in
- * `agent-infra` loaded **tortoise**'s stack, with `verification-gate` adopting
- * a foreign worktree as its git-op root) and the parent's `Alive state` /
- * wedge report named the parent's checkout (`branch`/`headSha`/`worktree`/
- * `dirty`), the one field an operator trusts when triaging a wedge.
+ * working directory — so a child dispatched to work in another repo ran its
+ * extension stack against the WRONG repo (observed: a child told to work in
+ * `agent-infra` emitted tortoise's `[verification-gate]` line, which adopted a
+ * foreign tortoise worktree as its git-op root, and `[tortoise-capture]`
+ * captured the session) and the parent's `Alive state` / wedge report named
+ * the parent's checkout (`branch`/`headSha`/`worktree`/`dirty`), the one field
+ * an operator trusts when triaging a wedge.
  *
- * An explicit target is resolved to an ABSOLUTE path (so a relative value is
- * unambiguous in the report and spawn-equivalent for the child), trimmed.
+ * An explicit target is trimmed, resolved to an ABSOLUTE path, and then
+ * CANONICALIZED (`realpath`): the child's cwd comes from the kernel
+ * (`getcwd()` resolves symlinks), and the report's `worktree=` is the
+ * operator's recovery key — a logical spelling would name a different string
+ * than the directory the child is actually in (on macOS the everyday case is
+ * `/var/...` vs `/private/var/...`, which `task-cap-handoff.integration.
+ * test.ts` already pins for the default path). A target that does not exist
+ * yet cannot be canonicalized — `realpath` throws and the lexical absolute
+ * path is used, keeping this function total (it must never throw at spawn).
+ *
  * Omitted / null / blank → `process.cwd()`, byte-identical to the pre-#1071
  * behavior. Pinned by the negative-twin tests in builtin-tools.test.ts.
  */
 export function resolveTaskCwd(cwd?: string | null): string {
   const trimmed = typeof cwd === "string" ? cwd.trim() : "";
-  return trimmed ? resolve(trimmed) : process.cwd();
+  if (!trimmed) return process.cwd();
+  const absolute = resolve(trimmed);
+  try {
+    return fs.realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
 }
 
 export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal, record?: DispatchRecordContext, cwd?: string): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
@@ -2661,11 +2676,12 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // subagent tool) so a truncated PATH can't cause a non-retryable ENOENT.
     const invocation = getPiInvocation(args);
     // #1071: the child runs in the TARGET working directory, never the parent's
-    // by default-of-omission. BOTH consumers below read this same value — the
-    // spawn (so the child loads the target repo's extension stack / AGENTS.md /
-    // project-local extensions) and the repo-state probe + render (so the
-    // wedge report names the TARGET's branch/headSha/worktree/dirty). A parent
-    // that omits it gets process.cwd() exactly as before.
+    // by default-of-omission. ONE resolved value feeds every consumer below —
+    // the spawn (so the child works in the target repo, whose AGENTS.md and git
+    // state it loads), the repo-state probe + render (so the wedge report names
+    // the TARGET's branch/headSha/worktree/dirty), and the outcome ledger row's
+    // `cwd` (so the row can never carry the parent's cwd beside the target's
+    // branch). A parent that omits it gets process.cwd() exactly as before.
     const targetCwd = resolveTaskCwd(cwd);
     // #271 (#208 D2): detached spawn → the child gets its own pgid (setsid),
     // so a settle-path sweep can anchor on it without ever signalling the
@@ -3436,7 +3452,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // false and left the class invisible to the #796 population. `reason`
       // only gates the row write and cannot change the resolution, and
       // `doResolve`'s `settled` latch keeps it exactly-once if `close` follows.
-      doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${err.message}\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } }, { reason: "spawn-error" });
+      doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } }, { reason: "spawn-error" });
     });
   });
 }
@@ -3739,7 +3755,7 @@ export default function (pi: ExtensionAPI) {
       "The sub-agent runs pi in print mode (-p) with access to read, bash, edit, and write tools.",
       "For complex multi-turn tasks, break them into multiple task calls or handle them yourself.",
       "Sub-agents have NO access to the current session context — provide all necessary information in the prompt.",
-      "Pass `cwd` with the worktree or repo the child should work in. The child is SPAWNED there, so it loads THAT repo's extension stack, AGENTS.md and project skills, and the parent's `Alive state` / wedge report names the target's branch / headSha / worktree / dirty. Omit it only when the child is meant to work where the parent is — the child then inherits the parent's cwd and an unrelated repo's gates (#1071).",
+      "Pass `cwd` with the worktree or repo the child should work in. The child is SPAWNED there, so its git operations, its `AGENTS.md`, and the parent's `Alive state` / wedge report (`branch` / `headSha` / `worktree` / `dirty`) all describe THAT repo instead of the parent's checkout. (Project-local extensions/skills load only for a TRUSTED target — `-p` cannot prompt, so at the default `defaultProjectTrust` they are ignored.) Omit it only when the child is meant to work where the parent is — the child then inherits the parent's cwd (#1071).",
     ],
     parameters: Type.Object({
       prompt: Type.String({
@@ -3766,7 +3782,7 @@ export default function (pi: ExtensionAPI) {
       cwd: Type.Optional(
         Type.String({
           description:
-            "Target working directory for this sub-agent — the repo/worktree it should work in (absolute, or relative to the parent's cwd). The child is SPAWNED here, so it loads THAT repo's extension stack, AGENTS.md and project skills, and the parent's `Alive state` / wedge report names the target's branch / headSha / worktree / dirty. Default: the parent's cwd (process.cwd()) — omit only when the child should work where the parent is (#1071).",
+            "Target working directory for this sub-agent — the repo/worktree it should work in (absolute, or relative to the parent's cwd). The child is SPAWNED here, so its git operations, its `AGENTS.md`, and the parent's `Alive state` / wedge report (`branch` / `headSha` / `worktree` / `dirty`) all describe THAT repo instead of the parent's checkout. Default: the parent's cwd (process.cwd()) — omit only when the child should work where the parent is (#1071).",
         })
       ),
     }),
