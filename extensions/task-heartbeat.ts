@@ -242,6 +242,9 @@ export function isOrphaned(ppid: number, originalPpid: number): boolean {
 export interface OrphanWatchdogHooks {
   ppidGetter: () => number;
   nowGetter: () => number;
+  /** #1074: the orchestrator's own pgid, used by the catch-net below. A seam so
+   * the "unmeasured" path is testable without forcing a real `ps` timeout. */
+  ownPgidGetter: () => number | null;
   killDescendants: (graceMs: number) => Promise<void>;
   exitProcess: (code: number) => void;
   appendLog: (line: string) => void;
@@ -261,12 +264,39 @@ const defaultAppendLog = (line: string): void => {
  * child is its own pgid leader (detached spawn) — closes the mid-fork escape
  * (a descendant forked between the re-walk and exit). Never signals self. */
 const defaultKillDescendants = async (graceMs: number): Promise<void> => {
+  // #1074: capture the getter FUNCTIONS once, BEFORE the grace await — the same
+  // capture-once rule `fireSequence` applies to killDescendants/exitProcess. A
+  // late-bound read would let a hooks mutation/restore land mid-sequence (and a
+  // test's restore is exactly such a mutation) and swap the probe out from
+  // under a kill that is already in flight.
+  const ownPgidGetter = orphanWatchdogHooks.ownPgidGetter;
   for (const childPid of getChildPids(process.pid)) treeKill(childPid, "SIGTERM");
   await new Promise((resolve) => setTimeout(resolve, graceMs));
   for (const childPid of getChildPids(process.pid)) treeKill(childPid, "SIGKILL");
-  const ownPgid = getPgid(process.pid);
-  if (ownPgid !== null && ownPgid === process.pid) {
-    for (const member of listPgid(ownPgid)) {
+  // #1074: `getPgid` returns null on BOTH "no such pid" and "ps failed/timed
+  // out". Here null is safe either way (the catch-net is simply skipped, the
+  // fail-closed direction) — but it used to be SILENT, so the missed cleanup
+  // was indistinguishable from "nothing to clean". Make it diagnosed.
+  const ownPgid = ownPgidGetter();
+  if (ownPgid === null) {
+    console.warn(
+      "[task-heartbeat] own pgid unmeasured (ps failed or timed out) — pgid catch-net skipped; a mid-fork escaped descendant may survive",
+    );
+    return;
+  }
+  if (ownPgid === process.pid) {
+    // #1074: `listPgid` collapses a failed `pgrep` into [], which here can
+    // never be the truth — this branch only runs when THIS process is the
+    // group leader, so it is provably a live member of the group it is asking
+    // about. An empty list is therefore an unmeasured probe, not an empty
+    // group; surface it rather than silently killing nobody.
+    const members = listPgid(ownPgid);
+    if (members.length === 0) {
+      console.warn(
+        `[task-heartbeat] pgid catch-net unmeasured — pgrep returned no members for pgid ${ownPgid} though this process is a member of it; nothing signalled`,
+      );
+    }
+    for (const member of members) {
       if (member !== process.pid) {
         try {
           process.kill(member, "SIGKILL");
@@ -283,6 +313,7 @@ const defaultKillDescendants = async (graceMs: number): Promise<void> => {
 export const orphanWatchdogHooks: OrphanWatchdogHooks = {
   ppidGetter: () => process.ppid,
   nowGetter: () => Date.now(),
+  ownPgidGetter: () => getPgid(process.pid),
   killDescendants: defaultKillDescendants,
   exitProcess: ((code: number) => {
     process.exit(code);

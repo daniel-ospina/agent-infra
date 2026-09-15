@@ -2666,14 +2666,33 @@ test("E271g: sessionEnded-aware finalize — #250 path preserved, exit taxonomy 
 test("E271g: sweep wired on the SETTLE-PATH basis + safety valves", () => {
   // settle-path sweep hook: no-sweep ONLY for close-within-grace normal success
   ok(source.includes("{ sweep: settlePath === \"exit\" }"), "exit-settle success MUST sweep; close-within-grace success does not");
-  ok(source.includes("sweepProcessGroup(childPgid, { detached })"), "sweep anchored on the captured pgid");
+  // #1074: the sweep call must carry BOTH the target pgid AND the
+  // authorisation (`spawnedPid` = the pid this call spawned). The shared guard
+  // signals a group only when pgid === spawnedPid; a `ps` measurement can only
+  // refuse, never authorise. The negative pin below rejects the tautology the
+  // source-text pin would otherwise permit.
+  ok(source.includes("sweepProcessGroup(childPgid, { detached, spawnedPid: proc.pid })"), "sweep anchored on the captured pgid + the spawned-pid authorisation (#1074)");
   // TASK_SWEEP=0 safety valve disables the settle-path sweep ENTIRELY
   ok(source.includes('process.env.TASK_SWEEP !== "0"'), "TASK_SWEEP=0 disables the settle-path sweep");
   // TASK_DETACHED=0 implies TASK_SWEEP=0: the sweep is still CALLED but the
   // shared guard skips + warns on a non-detached spawn (parent's pgid never signaled)
   ok(source.includes("const childPgid: number | null = getPgid(proc.pid ?? 0) ?? proc.pid ?? null;"), "childPgid captured at spawn (both detached and non-detached)");
   ok(source.includes("childPgid !== null"), "sweep gated on a non-null childPgid");
-  ok(source.includes("sweepProcessGroup(childPgid, { detached })"), "sweep passes the detached flag to the runtime guard");
+  ok(source.includes("sweepProcessGroup(childPgid, { detached, spawnedPid: proc.pid })"), "sweep passes the detached flag + the spawned-pid authorisation to the runtime guard");
+  // #1074 negative pin, alias-proof: copying `childPgid` (the pgid) into the
+  // `spawnedPid` slot makes the construction proof a tautology (pgid ===
+  // spawnedPid by definition) and silently degrades the guard to trusting the
+  // caller. A literal pin only catches the exact spelling — `const pg =
+  // childPgid; … spawnedPid: pg` evades it — so assert on EVERY `spawnedPid:`
+  // ARGUMENT instead: that catches the literal, the alias, and any second call
+  // site in one assertion.
+  const spawnedPidArgs = (source.match(/spawnedPid\s*:\s*([A-Za-z0-9_$.()!]+)/g) ?? []).map((m) =>
+    m.replace(/^spawnedPid\s*:\s*/, ""),
+  );
+  ok(
+    spawnedPidArgs.length > 0 && spawnedPidArgs.every((arg) => arg === "proc.pid"),
+    `every spawnedPid must be proc.pid (never a pgid-shaped variable or alias); got [${spawnedPidArgs.join(", ")}]`,
+  );
   ok(source.includes("sweepRunCount += 1"), "sweep hook counter exported for the integration harness");
 });
 
