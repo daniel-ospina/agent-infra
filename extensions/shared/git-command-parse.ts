@@ -49,7 +49,12 @@
  *    `normalizeRepoCapture` strips a `[HOST/]OWNER/REPO` prefix (gh accepts
  *    `GH_REPO=github.com/owner/repo`) and fails closed on a 4+-segment garbage
  *    identity. review-enforcer's copy returned `github.com/owner` for that
- *    input and `a/b` for `GH_REPO=a/b/c/d` — both wrong identities.
+ *    input and `a/b` for `GH_REPO=a/b/c/d` — both wrong identities. Adopting it
+ *    verbatim was NOT a pure win: it required a separator after the short flag,
+ *    so review-enforcer's supported ATTACHED spelling (`-Rowner/repo`, #931,
+ *    pinned by #993 P2) was silently dropped and `resolveRepoContext` fell back
+ *    to the session-cwd repo while gh merged the `-R` target (#426 class). The
+ *    attached form is restored here in both the helper and GH_PR_MERGE_VERB.
  *  • extractPrNumber — review-enforcer's STRICT masked read (#1007/#1021),
  *    adopted over verification-gate's flags-tolerant token scan on evidence:
  *    a token scan takes the first pure-integer token after the verb, so
@@ -86,14 +91,15 @@ import { resolve as resolvePath } from "node:path";
  *
  * The left boundary admits a shell opener (`(`, backtick) as well as whitespace
  * and start-of-string: `(cd X && gh pr merge 7)` and `$(gh pr merge 7)` are
- * real merge invocations, and review-enforcer gates on `extractPrNumber`
- * ALONE — a miss there skips the merge-registry gate (fail-open), so the
- * matcher errs WIDE. It deliberately does NOT admit a QUOTE, so a `gh pr merge
+ * real merge invocations, and a miss there falls back to review-enforcer's
+ * positional selector rather than skipping the gate, but a WRONG number is
+ * worse than a miss (the `--body 999 42` class), so the matcher errs WIDE. It
+ * deliberately does NOT admit a QUOTE, so a `gh pr merge
  * N` inside quoted prose stays unmatched for the shapes the suite pins.
  * (The general quoted-prose false positive remains #960's separate issue.)
  */
 export const GH_PR_MERGE_VERB =
-  /(?:^|[\s(`])gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+merge(?=\s|$)/;
+  /(?:^|[\s(`])gh(?:\s+(?:--repo(?:=|\s+)|-R(?:=|\s*))[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+merge(?=\s|$)/;
 
 // ── repo identity (--repo / GH_REPO=) ────────────────────────────────────
 
@@ -111,11 +117,22 @@ function normalizeRepoCapture(raw: string): string | null {
   return null; // 4+ segments — garbage identity, fail-closed
 }
 
-/** Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag. */
+/**
+ * Priority 1: explicit `--repo owner/name` / `--repo=owner/name` / `-R` flag.
+ *
+ * The whole flag must be a TOKEN (`(?:^|\s)` — `--body=see--repo x/y` cannot
+ * masquerade as one), and the short form's value may be ATTACHED: gh's pflag
+ * parsing accepts `-Rowner/repo`, review-enforcer's deleted copy supported it
+ * explicitly (#931, pinned by #993 P2 as an accepted spelling that otherwise
+ * "skipped both gates"), and `scripts/gh-shim/gh` parses it. Adopting
+ * verification-gate's separator-required copy silently dropped it, which sent
+ * review-enforcer's `resolveRepoContext` to the session-cwd repo while gh merged
+ * the `-R` target — the #426 wrong-repo evidence read. Do not tighten this back.
+ */
 export function extractRepoFlag(command: string): string | null {
   // 2-3 segments: a HOST/ prefix must reach normalizeRepoCapture (a two-segment
   // capture would turn "github.com/owner/repo" into "github.com/owner").
-  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
+  const m = command.match(/(?:^|\s)(?:--repo(?:=|\s+)|-R(?:=|\s*))([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
   return m ? normalizeRepoCapture(m[1]) : null;
 }
 
@@ -271,9 +288,14 @@ function logicalCwd(): string {
  * against — the INVOCATION cwd for a leading cd, the previous cd's directory
  * for the next one, so a relative operand composes with the chain. */
 export function expandCdTarget(path: string, base: string = logicalCwd()): string | null {
+  // The `$`/backtick guard MUST precede the `~/` expansion. `cd ~/$X` used to
+  // return the literal `<home>/$X` with `unattributable: false` — a fabricated
+  // root carrying an unexpanded variable, i.e. a path no op ever ran in,
+  // hashed and registered as verified (bash expands the variable and cds
+  // somewhere else entirely). Same class as the #960 garbage-path forms.
+  if (/[$`]/.test(path)) return null;
   if (path === "~") return os.homedir();
   if (path.startsWith("~/")) return resolvePath(os.homedir(), path.slice(2));
-  if (/[$`]/.test(path)) return null;
   return resolvePath(base, path);
 }
 
@@ -356,24 +378,53 @@ function parseCdOperand(raw: string):
  * BEFORE tokenization: `cd /wt \` ⏎ `&& git push` runs the push in /wt.
  * Without this the cd target captured the trailing `\` and callers resolved a
  * FABRICATED path (`/wt \`) — one of the garbage-path forms in #960's scope.
- * Quote-aware: unquoted and double-quoted backslash-newline is a continuation,
- * but inside SINGLE quotes bash keeps the backslash literal, so a naive global
- * strip could invent a `cd` out of quoted prose.
+ * Quote-and-comment aware: unquoted and double-quoted backslash-newline is a
+ * continuation, but bash keeps the backslash LITERAL inside single quotes, and
+ * inside an inline `#` comment it is literal comment text too — the comment ends
+ * at the newline regardless. Both carve-outs matter:
+ *   `cd /a && true # note \` ⏎ `cd /b && op`
+ * runs the op in /b (the second cd is real), so joining the comment line onto
+ * the next one hid the real cd and reported the WRONG root attributably. A
+ * model that tracks only single quotes also desynchronises on an apostrophe
+ * inside a double-quoted argument (`-m "don't"`), which is why both quote kinds
+ * are tracked here.
  */
 function stripLineContinuations(command: string): string {
   let out = "";
-  let inSingle = false;
+  let quote: "'" | '"' | null = null;
+  let inComment = false;
   for (let i = 0; i < command.length; i++) {
     const c = command[i];
-    if (inSingle) {
+    if (inComment) {
       out += c;
-      if (c === "'") inSingle = false;
+      if (c === "\n") inComment = false; // comment ends at the newline; `\` ⏎ inside it is literal
       continue;
     }
-    if (c === "'") { inSingle = true; out += c; continue; }
+    if (quote === "'") {
+      out += c;
+      if (c === "'") quote = null;
+      continue;
+    }
     if (c === "\\") {
       const j = command[i + 1] === "\r" && command[i + 2] === "\n" ? i + 2 : i + 1;
       if (command[j] === "\n") { i = j; continue; } // `\` ⏎ → both removed
+      // An escape inside double quotes stays in the text (it may protect a
+      // `"` we would otherwise read as the closing quote); outside quotes the
+      // next character is examined normally, so `\#` never opens a comment.
+      out += c;
+      if (quote === '"' && i + 1 < command.length) { out += command[i + 1]; i++; }
+      continue;
+    }
+    if (quote === '"') {
+      out += c;
+      if (c === '"') quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') { quote = c; out += c; continue; }
+    if (c === "#" && (i === 0 || /[\s;&|(\n]/.test(command[i - 1]))) {
+      inComment = true;
+      out += c;
+      continue;
     }
     out += c;
   }
@@ -435,7 +486,12 @@ export function parseCdChains(command: string): CdChainInfo {
       const before = command[i - 1];
       if (
         (after === undefined || /[\s;&|()]/.test(after)) &&
-        (before === undefined || /[\s;&|(\n]/.test(before))
+        // A BACKTICK opener counts: the cd in `` `cd /a && op` `` runs in a
+        // command SUBSTITUTION (its own subshell), so it is a cd we cannot
+        // attribute — without it the segment scan finds no parseable cd and
+        // reports "no cd at all", letting the consumers fall back to the
+        // session root for an op that really ran in /a.
+        (before === undefined || /[\s;&|(\n`]/.test(before))
       ) {
         cdWords++;
       }

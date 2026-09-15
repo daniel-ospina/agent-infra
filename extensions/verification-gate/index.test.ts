@@ -475,6 +475,50 @@ test("the four helpers ARE the shared module's functions (no per-extension copy)
   equal(extractPrNumber, sharedParse.extractPrNumber, "extractPrNumber");
 });
 
+/** Does `src` DECLARE a local copy of `helper`? Declaration-form-agnostic: a
+ * `function` / `async function` / `export default function`, or a `const`/`let`/
+ * `var` with an optional TYPE ANNOTATION between the name and `=`. Scanning only
+ * `function` let the idiomatic TS forms through. The scan is over RAW text, so a
+ * COMMENT that quotes a declaration also trips it — deliberate: the guard fails
+ * CLOSED (a false positive costs a look; a miss re-opens #966). The one shape it
+ * cannot see is a copy relocated to a sibling module and imported under the same
+ * name, for the helpers neither extension re-exports (recorded residual). */
+function declaresHelper(src: string, helper: string): boolean {
+  return new RegExp(
+    `(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${helper}\\b` +
+      `|(?:const|let|var)\\s+${helper}\\s*(?::[^=;]*)?=`,
+  ).test(src);
+}
+
+test("the declaration scan detects every form it claims — and only those", () => {
+  // A guard only ever run against today's CLEAN sources cannot fail when the
+  // regex is weakened: it would drift OPEN silently. Pin the detector itself.
+  for (const positive of [
+    "function extractCdPath(cmd: string) { return null; }",
+    "export function extractCdPath(cmd: string) { return null; }",
+    "async function extractCdPath(cmd: string) { return null; }",
+    "export default function extractCdPath(cmd: string) { return null; }",
+    "const extractCdPath = (cmd: string) => null;",
+    "const extractCdPath: CdParser = (cmd) => null;",
+    "const extractCdPath: (c: string) => string | null = (c) => null;",
+    "let extractCdPath = function (cmd: string) { return null; };",
+    "var extractCdPath = (cmd) => null;",
+    // RAW-text scan ⇒ a comment quoting a declaration also trips it (fail-closed).
+    "// const extractCdPath = old copy;",
+  ]) {
+    ok(declaresHelper(positive, "extractCdPath"), `must detect: ${positive}`);
+  }
+  for (const decoy of [
+    "const extractCdPathRegex = /x/;",
+    "const myExtractCdPath = 1;",
+    "const x = extractCdPath(cmd);",
+    'import { extractCdPath } from "../shared/git-command-parse.js";',
+    "export { extractCdPath, extractPrNumber };",
+  ]) {
+    ok(!declaresHelper(decoy, "extractCdPath"), `must ignore: ${decoy}`);
+  }
+});
+
 test("neither extension declares a local copy of the command parsers (#966)", () => {
   const sources: Array<[string, string]> = [
     ["verification-gate", readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8")],
@@ -493,11 +537,12 @@ test("neither extension declares a local copy of the command parsers (#966)", ()
       // `matchUnquoted` / `countUnquotedMergeVerbs` and the shared masked PR scan are
       // consumers of ONE model, so a local re-declaration here is the drift again.
       "unquotedMask",
+      // The verb grammar is a shared export too (this extension's merge window
+      // matches on it). It is a `const` regex, so only the declaration scan above
+      // can see a re-declaration.
+      "GH_PR_MERGE_VERB",
     ]) {
-      ok(
-        !new RegExp(`(?:export\\s+)?function\\s+${helper}\\s*\\(`).test(src),
-        `${name} must not declare a local ${helper} (#966: one copy only)`,
-      );
+      ok(!declaresHelper(src, helper), `${name} must not declare a local ${helper} (#966: one copy only)`);
     }
   }
 });

@@ -29,6 +29,7 @@ import {
   resolveRepoContext,
   repoFromGitRemote,
   parseCdChains,
+  expandCdTarget,
   evaluateMergeGate,
   readReviewRecord,
   reviewRecordFile,
@@ -143,6 +144,9 @@ test("the exported helpers ARE the shared module's functions (no per-extension c
   equal(extractGhRepoEnv, sharedParse.extractGhRepoEnv, "extractGhRepoEnv");
   equal(extractPrNumber, sharedParse.extractPrNumber, "extractPrNumber");
   equal(parseCdChains, sharedParse.parseCdChains, "parseCdChains");
+  // expandCdTarget is re-exported by this extension too — pin it before the
+  // source-shape half has to be the only guard against a private copy.
+  equal(expandCdTarget, sharedParse.expandCdTarget, "expandCdTarget");
 });
 
 // ── resolveRepoContext priority ───────────────────────
@@ -152,6 +156,15 @@ section("resolveRepoContext — resolution priority (url > --repo > GH_REPO > cd
 test("priority 1: --repo flag beats GH_REPO env", () => {
   const ctx = resolveRepoContext("GH_REPO=env/repo gh pr merge 138 --repo flag/repo", cleanRecord);
   equal(ctx.repo, "flag/repo");
+  equal(ctx.source, "flag");
+});
+
+test("priority 1: a real --repo beats a repo MENTION in quoted prose", () => {
+  // The safe half of the quote-unaware-flag gap (shared suite): the scan takes
+  // its FIRST match, so a real flag before the prose still wins. Held even
+  // though a mention with NO real flag is captured today (reported residual).
+  const ctx = resolveRepoContext('gh pr merge 138 --repo acme/widget --body "see --repo evil/repo"', cleanRecord);
+  equal(ctx.repo, "acme/widget");
   equal(ctx.source, "flag");
 });
 
@@ -1035,7 +1048,7 @@ testAsync("cd ~/… merge into ANOTHER repo is NOT authorized by the session-cwd
   });
 });
 
-testAsync("unattributable cd ($VAR/$(…)/subshell) is NEVER attributed to the session repo (cycle 4 P1 regression)", async () => {
+testAsync("unattributable cd ($VAR form) is NEVER attributed to the session repo (cycle 4 P1 regression)", async () => {
   await withTempHome(async () => {
     const prevMode = process.env.PI_MODE;
     const prevHeartbeat = process.env.TASK_HEARTBEAT;
@@ -3269,8 +3282,11 @@ test("extractMergeSelector: a bare number must round-trip, or the two layers dis
 });
 
 test("resolveRepoContext: a compound command does not lend the FIRST verb's URL repo to the SECOND", () => {
-  // `extractPrNumber` counts PER VERB (it takes the LAST `gh pr merge`) while
-  // `extractMergeSelector` takes the FIRST. Attributing the first verb's URL repo to the
+  // `extractPrNumber` takes the FIRST unquoted `gh pr merge` (a non-global
+  // `.match`), matching `extractMergeSelector`'s first verb — no longer the
+  // "counts PER VERB / takes the LAST" behaviour this comment used to describe.
+  // (Spelling corrected in test-review cycle 2: the module resolves the FIRST
+  // verb, and the number/repo must come from the SAME verb.) Attributing the first verb's URL repo to the
   // second verb's number read another repo's evidence for that number (fresh review, P2).
   const cmd = `gh pr merge ${PR_URL_1006}; gh pr merge 123`;
   equal(extractMergeSelector(cmd).repo, "daniel-ospina/agent-infra",

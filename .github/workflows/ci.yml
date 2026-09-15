@@ -203,6 +203,17 @@ jobs:
         # ./provider-failover.js only, which imports `node:` only) — it must run
         # WITHOUT `npm ci`, which this job does not perform.
         run: npx tsx extensions/shared/default-coverage.test.ts
+      - name: Shared bash/git command-parser suite (#966, zero-dep)
+        # #966 — extensions/shared/git-command-parse.ts imports `node:*` ONLY, so
+        # its suite runs in THIS job (the job that performs no `npm ci`). This is
+        # the PR-gating half of the promotion: the drift-pins that stop the two
+        # extensions re-declaring local copies live in their own index.test.ts
+        # (SDK-bearing → post-merge ci-main.yml glob), but the parser's own truth
+        # table — the artifact #966 exists to create — is zero-dependency by
+        # construction and must gate the PR that changes it. Without this step
+        # the suite ran only AFTER merge (ci-main.yml:79), i.e. the pin could not
+        # stop the regression it exists to prevent.
+        run: npx tsx extensions/shared/git-command-parse.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
