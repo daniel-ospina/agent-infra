@@ -102,17 +102,29 @@ Each sub-skill returns JSON:
     {
       "name": "Journey: Primera Visita — Step 1",
       "status": "pass|fail",
+      "validated": 25,
+      "total": 25,
+      "skipped": [{"reason": "no schema", "count": 3}],
       "error": "only if fail",
       "screenshot": "path (optional)",
       "duration_ms": 0
     }
   ],
+  "not_offered": [
+    {"name": "ci-config", "reason": "no workflow YAML present"}
+  ],
   "evidence": [
-    {"type": "screenshot|log", "path": "...", "description": "..."}
+    {"type": "screenshot|log", "path": "...(optional)", "description": "..."}
   ],
   "issues_filed": [123]
 }
 ```
+
+`not_offered` records checks whose target surface is absent — the `reason` is only ever an
+absent-target reason, never a tooling reason. `validated`/`total` and `skipped` are additive
+(optional) and describe how much of a check's matched set was actually validated. A `pass` is only
+meaningful alongside those counts: `"pass"` with `validated` < `total` (or with `not_offered`
+entries) means **partial coverage**, not a clean surface.
 
 **Report format:**
 
@@ -125,6 +137,10 @@ Each sub-skill returns JSON:
 | web     | ✅ pass | 4/4    | —      |
 | infra   | ✅ pass | 3/3    | —      |
 ```
+
+A surface row whose sub-skill reported `not_offered` entries is rendered with the partial-coverage
+marker: `✅ pass (partial)` and a `Checks` cell of `N/M (+K not offered)`. The `Issues` column holds
+GitHub issue numbers only — never a note or a reason.
 
 **All pass:** "✅ Post-deploy verification: all surfaces passed."
 **Some fail:** "⚠️ Post-deploy verification: N/M surfaces passed. Failures: <list>"
