@@ -38,7 +38,6 @@ steps:
 > **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 > **Canonical:** `agent-infra/skills/plan-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers, convergence-gated. Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
 
 # Plan Review
 
@@ -104,11 +103,11 @@ When review finds issues, the agent attempts to resolve them autonomously before
 
 | Issue severity | Action |
 |---------------|--------|
-| **P2** (improvement) | Fix inline immediately. Note in changelog. Re-review. Do NOT pause. |
+| **P2** (improvement) | Fix inline immediately (surgical fix). Note in changelog. Re-review. Do NOT pause. |
 | **P1** (important gap) | Research + fix inline. Note in changelog. Re-review. Do NOT pause. |
 | **P0** (structural flaw), fixable in < 5 lines | Research, then fix inline. Note in changelog. Re-review. Do NOT pause. |
-| **P0**, needs substantial work | Research, then file a GitHub issue via issue-creation, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
-| **P0**, requires human input (data loss, security, ontology choice, cost >$10/mo, legal/compliance) | Research, then pause with a structured question: present context, options, analysis, and a recommendation in plain language. |
+| **P0**, needs substantial work | Research, review carefully, run through issue-workflow, return to plan-review cycle. Do NOT pause unless the fix fails. |
+| **P0**, requires human input (data loss, security, ontology choice, significant architectural change, cost >$10/mo, legal/compliance) | Research, then pause with a structured question: present context, options, analysis, and a recommendation in plain language. |
 
 **Stall detection:** A fingerprint persisting across 2+ cycles is precisely what the `fingerprint-stall` detector measures — do not hand-diagnose it here. Follow the 3-layer stuckness algorithm in Phase 4: recurrence ≥ `stall_threshold` (default `0.8`) → escalate to a human. Filing a GitHub issue is a **remedy** for a stalled issue, never an alternative to the detector — filing it and continuing is how a stalled loop silently runs to its cycle cap.
 
@@ -137,6 +136,7 @@ CHECK THESE DIMENSIONS:
    - Are there gaps — requirements in the issue but absent from the plan?
    - Are there extras — plan tasks that go beyond what the issue requested?
    - **Deferred/gated work:** if the plan (or its scope record) defers any task pending data, prove-out, approval, or a future event, a REAL re-check mechanism must exist — a scheduled job, a dated gate, an automated trip, or a named owner + concrete trigger. "Defer until X" with no mechanism = the work silently rots; flag it (P1).
+ - Is the plan ultimately going to deliver the outcomes the issue/epic expects?
 
 2. STEP COHERENCE:
    - Do any steps contradict each other?
@@ -257,12 +257,12 @@ CHECK THESE DIMENSIONS:
    - Are there states mentioned in one task but forgotten in another?
 
 3. USER FLOW GAPS:
-   - Are there missing steps in user journeys described by the plan?
+   - Are there missing steps in user journeys described by the plan? Is the whole user journey considered?
    - Does the user have a clear path through every described flow?
+   - Has information architecture been considered to provide what's needed without bloat/distractions?
    - Are there dead ends or unreachable states?
 
-4. UX ASSUMPTIONS:
-   - Does the plan make unvalidated assumptions about user behavior?
+4. UX ASSUMPTIONS
    - Are UX decisions described without rationale?
    - Are accessibility considerations mentioned where relevant?
 
