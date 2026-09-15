@@ -31,7 +31,7 @@ Multi-phase planning for **existing** GitHub issues. Uses the **double diamond**
 5. **solution-converge** — pick best approach, draft plan, document rejected alternatives
 6. **🛡️ solution-verify** — verifiers check diamond quality (Standard+Complex; count per Tier Scaling)
 
-This covers **"what & why"**: requirements, scope, constraints, and validated approach. Detailed implementation design ("how") — bite-sized TDD tasks, design decisions — is handled by `writing-plans` after human approval.
+This covers **"what & why"**: requirements, scope, constraints, and validated approach. Detailed implementation design ("how") — bite-sized TDD tasks, design decisions — is handled by `writing-plans` after human approval. Do not spend significant time on plan-level details during the scope step unless said details can affect the viability of the scope.
 
 **Prerequisite:** Issues should be created via `issue-creation` first (provides complexity ratings and strategy clarity).
 
@@ -45,9 +45,8 @@ The Double Diamond generates multiple alternatives — but the converge step can
 
 | Diamond Phase | Easy Path (rejected) | Right Path (enforced) |
 |---|---|---|
-| problem-converge | Accept the issue's framing because researching alternatives costs queries | Challenge the framing; the cost of solving the wrong problem dwarfs the cost of research |
+| problem-converge | Accept the issue's framing because researching alternatives costs queries | Investigate the framing; the cost of solving the wrong problem dwarfs the cost of research |
 | solution-converge | Pick the approach with fewer files to touch | Pick the approach that handles edge cases, failure modes, and future needs |
-| plan drafting | Scope narrowly to keep the implementation plan short | Surface hard dependencies, migrations, and error handling — even if it makes the plan longer |
 
 **Gate:** At each convergence point (Phases 2 and 5), ask: "Which approach produces the better outcome?" The verification gates (2.5 and 5.5) enforce this — verifiers explicitly check for convenience-over-quality shortcuts.
 
@@ -64,30 +63,19 @@ When problem-diverge discovers that the issue describes a symptom rather than th
 
 ## Design Principle: Issue-Body Solutions Are Hypotheses, Not the Plan
 
-An issue body may assert a solution direction — "the fix is X", "implement exemption in Y". That assertion is the **author's hypothesis, not the plan.** Authoring bias is real: the author can be wrong, can write mid-frustration, and `issue-creation` deliberately separates what-and-why (creation) from how (scoping). The red flag that guards an *agent* thinking "I already know what to do…" must apply equally when the *issue body itself* prescribes the fix (exhibit: #472 — body said "None — scope is clear" while listing an open direction fork; the worker misread the prescribed direction as settled).
+An issue body may assert a solution direction — "the fix is X", "implement exemption in Y". That assertion is the **a hypothesis, not the plan.** Authoring bias is real: the author can be wrong, and `issue-creation` deliberately separates what-and-why (creation) from how (scoping). The red flag that guards an *agent* thinking "I already know what to do…" must apply equally when the *issue body itself* prescribes the fix (exhibit: #472 — body said "None — scope is clear" while listing an open direction fork; the worker misread the prescribed direction as settled).
 
 **What this means in the double diamond:**
-- **problem-diverge:** challenge the framing a prescribed fix embeds — a body that states a solution has already skipped part of the problem diamond; scoping must not inherit the skip.
-- **problem-converge:** confirming the problem does NOT confirm the body's proposed solution — they are independent claims.
-- **solution-diverge:** the body's stated fix is ONE candidate approach (often the author's first idea). Generate 2-3 distinct approaches that include it as a candidate.
+- **problem-diverge:** investigate the framing a prescribed fix embeds — a body that states a solution has already skipped part of the problem diamond; scoping must not inherit the skip. Research the topic to understand possible framings, methods, and approaches; and seek to understand root causes and the system design around the problem.
+- **problem-converge:** confirm the root cause that led to the problem is well understood.
+- **solution-diverge:** the body's stated fix is ONE candidate approach (often the author's first idea). Generate 2-3 distinct approaches that include it as a candidate. Inform yourself with research to know what SOTA and other solutions (archietctures and system designs include).
 - **solution-converge:** choose on evidence and outcome quality. The body's fix wins only if it survives comparison against the alternatives.
 
 **Gate:** If the final plan matches the solution the issue body prescribed, the scope must show the re-derivation that earned it (alternatives considered, evidence, rejected-with-rationale). A plan that adopts the body's fix without re-derivation is a bypass. The verification gates (2.5 / 5.5) check for this.
 
 ## Design Principle: File Extra Issues, Don't Silently Absorb
 
-Scoping often discovers things that are genuinely separate from the issue at hand — adjacent bugs, unrelated improvements, documentation gaps, tech debt. These are NOT hard dependencies and should NOT be silently absorbed into the scope. They should be filed as separate GitHub issues (unless an issue already covers them in which case add evidence as comment) so they're tracked, prioritized, and owned independently.
-
-**What to file vs what to absorb:**
-
-| Finding | Action |
-|---|---|
-| Hard dependency (can't ship without it) | Absorb into scope |
-| Soft dependency (should ship together, could ship separately) | File issue, link as related, flag in plan |
-| Adjacent bug discovered during scouting | File issue, notify user, do NOT absorb |
-| Tech debt in touched area (not caused by this issue) | Consider if connected problem and system design can solve both, if not then File issue, note in plan, do NOT absorb |
-| Documentation gap discovered | File issue, do NOT absorb |
-| UX inconsistency noticed in adjacent component | File issue, do NOT absorb |
+Scoping often discovers things that are genuinely separate from the issue at hand — adjacent bugs, unrelated improvements, documentation gaps, tech debt. If these are NOT dependencies, then they should NOT be silently absorbed into the scope. If genuinely separate, file as GitHub issues (unless an issue already covers them, in which case add evidence as a comment) so they're tracked, prioritized, and owned independently.
 
 **Notification:** When filing extra issues, notify the user with a summary:
 ```
@@ -181,7 +169,7 @@ Phase 8: Finalize + post plan
 ### Verifier Prompt
 
 ```
-You are verifying the problem diamond of a scoping session. Check whether problem-diverge and problem-converge were done with genuine rigor — not mechanically, not superficially.
+You are verifying the problem diamond of a scoping session. Check whether problem-diverge and problem-converge were done with genuine rigor — not mechanically, not superficially. Do not worry about plan-level details unless they genuinely affect the viability of the scope.
 
 CONFIRMED PROBLEM: <from Phase 2 output>
 PROBLEM-DIVERGE OUTPUT: <diverge sub-agent output(s)>
@@ -195,28 +183,26 @@ CHECK FIVE DIMENSIONS:
 
 1. DIVERGE THOROUGHNESS: Did problem-diverge genuinely explore alternatives?
    - Are there alternative problem framings that differ meaningfully from the original?
-   - Were adversarial queries run seeking DISCONFIRMATION (not just confirmation)?
+   - Were adversarial research queries run seeking alternatives (not just confirmation)?
    - Were assumptions mapped and tagged [validated]/[unverified]?
-   - Were hidden dependencies and affected-but-unmentioned stakeholders identified?
+   - Were hidden dependencies identified?
    - Were redundancy and overlap with existing systems checked against the codebase?
-   - WERE THERE NO ALTERNATIVES, or were they cosmetic variations? Flag as P1.
 
 2. CONVERGE RIGOR: Was convergence on the problem evidence-based?
    - Did convergence use the research, or leave it as decoration?
-   - Is the chosen definition backed by evidence (citations, data, patterns)?
    - Were rejected alternatives documented with rationale?
-   - Is there a falsification check? Confidence score?
+   - Is there a falsification check?
    - DID CONVERGENCE PICK THE ORIGINAL ISSUE'S FRAMING WITHOUT CHALLENGING IT? Flag as P1.
    - WAS A SOLUTION THE ISSUE BODY PRESCRIBES ("the fix is X") ADOPTED AS SETTLED WITHOUT RE-DERIVATION IN THE DOUBLE DIAMOND? Flag as P1.
    - Was system design (duplication, scalability, where shared state lives) part of the decision? Flag as P2 if unconsidered.
 
 3. QUALITY OVER CONVENIENCE: Did convergence prioritize correctness over ease?
    - Was a framing rejected because it required more research?
-   - Was the original issue's framing accepted because it's simpler?
-   - FLAG any sign that the easy definition was chosen over the correct one.
+   - Was the original issue's framing accepted because it's the easy path and not because it provides the best outcomes? FLAG any sign that the easy definition was chosen over the correct one.
 
 4. GAPS: What's missing from the problem definition?
-   - Edge cases, error states, failure modes not accounted for?
+   - Edge cases and requirements not accounted for?
+   - Are broad workflows and user journeys mapped and taken into account?
    - Stakeholders or downstream systems not mentioned?
    - Dependencies assumed but not verified?
    - **Deferred/gated scope:** if the scope defers any work pending data, prove-out, approval, or a future event, a REAL re-check mechanism must exist — a scheduled job, a dated gate, an automated trip, or a named owner + concrete trigger. "Defer until X" with no mechanism = silent rot; flag as P1.
@@ -225,7 +211,7 @@ CHECK FIVE DIMENSIONS:
    - Is the `### Axis Research` block present in the scoping output, OR a justified-skip trigger assessment (axes all low + no deps + no novel pattern)?
    - Presence of a populated block with bare section titles but no findings = P2 (ritualization check: findings must be content, not section headers).
    - Do findings carry per-framing provenance (canonical / competitor-precedent / pitfalls + source name or URL)?
-   - For each axis rated high: at least one framing seeks failure modes / counter-evidence (the pitfalls framing satisfies this; canonical-only for a high axis = P1).
+   - For each axis rated high: at least one framing seeks failure modes / counter-evidence /alternatives (the pitfalls framing satisfies this; canonical-only for a high axis = P1).
    - Justified-skip validity: an axis rated `medium+` skipped WITHOUT a brief-coverage citation = P1. A capped high axis reduced to one framing must keep the pitfalls framing (canonical-only = P1).
    - P1 if artifact absent without justification; P1 if a high-rating axis has zero external findings; P2 if citations are weak.
 
@@ -238,7 +224,7 @@ ISSUE:
   suggestion: <what to fix>
 
 P0 = structural flaw in problem definition (wrong root cause, impossible to solve as stated)
-P1 = important gap (shallow divergence, evidence-free convergence, convenience over quality)
+P1 = important gap (shallow divergence, evidence-free convergence, convenience over quality outcomes)
 P2 = improvement (could be more thorough)
 P3 = nitpick (minor)
 P4 = suggestion (nice to have)
@@ -257,12 +243,13 @@ VERIFIER <n>: [P0: ..., P1: ..., P2: ...]   # one block per verifier dispatched 
 **Step 1 — Identify all P0 and P1 issues** across all verifiers.
 
 **Step 2 — For each P0/P1, controller decides:**
-- **Fix:** The issue is real → apply the fix to the problem definition/converge output
+Evaluate the rationale; if in doubt, research, and then decide between:
+- **Fix:** The issue is real → apply the fix to the problem definition/converge output surgically (avoid changing that which doesn't need changing)
 - **Ignore:** The issue is a false positive → note rationale in cycle log. Example: "Verifier 2 flagged 'no adversarial queries' but the diverge report explicitly ran 4 disconfirmation queries"
 
 **Step 3 — Re-dispatch if any P0/P1 was fixed:**
-- If controller fixed anything → re-dispatch every verifier (fresh `task` sessions)
-- If controller only ignored → still re-dispatch (verifiers must stop flagging it, or escalate)
+- If controller fixed anything → re-dispatch every verifier that's affected (fresh `task` sessions)
+- If controller only ignored → research to confirm, and if research backs controller then next step
 - If no P0/P1 found at all → gate passes
 
 **Half-budget research rule.** Once this gate has run 2 re-verify cycles without clearing P0/P1, each surviving issue must be researched before the next fix — external sources where the issue is not purely internal — and the cycle log records the source used. These gates carry no cycle cap of their own: the 2 is half the 3-cycle stuckness escalation below, rounded up, used here as the research trigger.
@@ -272,7 +259,7 @@ VERIFIER <n>: [P0: ..., P1: ..., P2: ...]   # one block per verifier dispatched 
 - Does NOT trigger re-dispatch
 - Gate passes if only P2+ remain
 
-**Stuckness escalation:** If the SAME P0/P1 is flagged by verifiers for 3 consecutive cycles and controller has ignored it each time → escalate to human. The verifiers see something the controller doesn't.
+**Stuckness escalation:** If the SAME P0/P1 is flagged by verifiers for 3 consecutive cycles and the controller has ignored it each time → escalate to a human with a clear decision explained, options, analysis, and no jargon.
 
 **Cycle log entry:**
 ```
@@ -308,18 +295,14 @@ Read PHASE 1.5 RESEARCH before judging dimensions 1, 2 and 5. Treat it as a stro
 CHECK FIVE DIMENSIONS:
 
 1. DIVERGE GENUINENESS: Are the approaches truly distinct?
-   - Do they differ in architecture or technique (not just file names or variable names)?
-   - Does each have named tradeoffs, risks, and "best fit if" conditions?
    - Are there 2+ approaches? If only 1: is it because genuinely no alternatives exist, or because diverge was shallow?
-   - ARE THEY COSMETIC VARIATIONS OF THE SAME IDEA? Flag as P1.
+   - Do they differ in architecture or technique (not just file names or variable names)?
+   - Does each have named tradeoffs and risks?
 
 2. CONVERGE QUALITY OVER CONVENIENCE: Was the best approach chosen?
-   - Does the rationale evaluate outcome quality, edge case handling, failure mode coverage, and system design?
-   - Or does it evaluate diff size, number of files, implementation speed?
-   - Were rejected alternatives documented with "when this WOULD have been better"?
-   - DID CONVERGENCE PICK THE APPROACH WITH FEWER FILES TO TOUCH? Flag as P1.
-   - IS THERE A BETTER APPROACH THAT WAS REJECTED FOR CONVENIENCE? Flag as P0.
-   - WAS THE ISSUE BODY'S PRESCRIBED SOLUTION TREATED AS THE PLAN (ADOPTED UNCHANGED) RATHER THAN RE-DERIVED AND VERIFIED AGAINST ALTERNATIVES? Flag as P1.
+   - Does the rationale evaluate outcome quality, edge case handling, failure mode coverage, and system design? Or does it evaluate diff size, number of files, implementation speed?
+   - Were rejected alternatives documented with rationale?
+   - IS THERE A BETTER APPROACH THAT WAS REJECTED FOR LAZINESS? Flag as P0.
 
 3. SCOPE COMPLETENESS: Is the scope thorough?
    - UX: are mobile and information architecture accounted for?
@@ -333,7 +316,7 @@ CHECK FIVE DIMENSIONS:
 
 5. SOLUTION RESEARCH EVIDENCE (Phase 1.5 artifact → solution):
    - Are new third-party deps / patterns introduced by the chosen approach verified externally (the `### Integration Docs` block lists dep + version + API-surface findings) OR justified-skipped (dep already used elsewhere in the codebase, or in-repo wrapper)?
-   - P1 if the chosen approach introduces a dep with zero external verification and no in-repo precedent.
+   - P1 if the chosen approach introduces a dependency with zero external verification and no in-repo precedent.
    - Do the solution approaches engage the Phase 1.5 findings (validate, refine, or explicitly reject them)? A plan that ignores its own research artifact is P2 (ritualization check — findings must feed the plan).
 
 For each issue:
