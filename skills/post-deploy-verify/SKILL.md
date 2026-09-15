@@ -149,12 +149,16 @@ evidence note, never folded into `N/M`. **A row whose `status` is `fail` always 
 the not-offered count may be appended to its `Checks` cell, but never to its status. The `Issues`
 column holds GitHub issue numbers only — never a note or a reason.
 
-A detected surface with **no covering check** is not the same state as a check whose target is
-absent: the former is `skip` **with a `reason`**, and the router reports it as unverified rather than
-silently clean.
+A surface with **no covering check** is not the same state as a check whose target set is absent, and
+the router must not imply one from the other. A detected-but-uncovered surface still reports `pass`
+against the repo's other trees — the checks are **repo-scoped, not diff-scoped** — which is a known
+fail-open (tracked by #1052), not a clean run.
+
+A `skip` row renders its surface-level `reason` as a note under the table (the `Issues` column stays
+reserved for issue numbers), so a skipped surface is never reported without saying why.
 
 **All pass:** "✅ Post-deploy verification: all surfaces passed."
-**All pass, but partial coverage:** "⚠️ Post-deploy verification: all offered surfaces passed; K check(s) not offered — <names>. Surface(s) with unverified targets: <list>."
+**All pass, but partial coverage:** "⚠️ Post-deploy verification: all offered surfaces passed." followed by the applicable clauses — when `K > 0`, "K check(s) not offered — <names>; surface(s) with unverified targets: <list>"; and when any check reported `validated` < `total`, "N check(s) only partially validated — <names>". A partial run never uses the plain all-pass line.
 **Some fail:** "⚠️ Post-deploy verification: N/M surfaces passed. Failures: <list>"
 **All fail/skip:** "⏭️ Post-deploy verification: no verification run"
 

@@ -24,7 +24,8 @@ intentional: infra changes (skills, scripts, templates, CI config) are validated
 and syntax-checking.
 
 Every check in this skill is **fail-closed**: a check never reports `pass` while validating nothing
-or less than its whole matched set. A check with no target is not offered (`skip`); a check whose
+or less than its whole matched set. A check whose target set is empty is not offered — it is omitted
+from `checks[]` (the surface is `skip` only when **no** check at all was offered); a check whose
 tooling is missing, whose matched set is empty at run time, or whose input fails to parse **fails**.
 
 ## Contract
@@ -34,10 +35,12 @@ tooling is missing, whose matched set is empty at run time, or whose input fails
 **Gate:** WARN-ONLY
 
 **Declared coverage scope:** the four checks cover JS/TS scripts, skills, schema templates, and
-workflow YAML only. `scripts/detect-deploy-surface.sh` also classifies `.github/*`, `supabase/*`,
-`k8s/*`, `terraform/*`, `docker/*`, and `Dockerfile`/`docker-compose*`/`*.tf` as the infra surface —
-those classes are **not** covered here, so a diff touching only them resolves to `skip` with a
-`reason` naming the uncovered surface. That is a declared gap, not a silent pass.
+workflow YAML only. They are **repo-scoped, not diff-scoped** — Step 1 offers a check on the existence
+of its target tree *in the repo*, so a PR touching only classes no check covers (`terraform/*`,
+`docker/*`, `k8s/*`, `supabase/*`, `enforcement/*`, `Dockerfile`, `docker-compose*`, `*.tf`, …) still
+offers all four and reports `pass` against the repo's own trees while that changed surface goes
+unvalidated. **That is a known fail-open, tracked by #1052** — stated here as a gap, not as a pass.
+The surface status is `skip` (with a `reason`) only when no target set exists in the repo at all.
 
 ## Workflow
 
@@ -201,16 +204,20 @@ fi
 echo "✅ template-validity: validated ${#schema[@]}/${#schema[@]} schema template(s); skipped $skipped_noschema markdown (no schema), $skipped_nonschema non-schema"
 ```
 → exit 0 = pass. Validates **every** schema template (dotfiles included) and states the denominator;
-markdown is skipped explicitly, never failed.
+markdown is skipped explicitly, never failed. `.plist` files are XML — out of scope here, validated by
+`scripts/install-launchd.test.sh`; template workflow YAML is also covered by the actionlint gate.
 
 > **Python must run with CWD outside the checkout.** For `python3 -c`, `sys.path[0]` is the current
 directory, searched **before** site-packages — so a repo containing a `yaml.py` would have its own
 code imported and executed by the verifying agent. Python is therefore invoked from `/` with the
-file passed as an absolute path (`cd / && python3 -c '…' "$repo_root/$f"`). `-I`/`-s` would also
-close the hole but also drop the **user** site-packages directory, turning a user-local PyYAML install
-into a permanent fail-closed red — the CWD change closes the same hole without that side effect.
-Paths are always passed as **argv**, so a filename can never reach the interpreter source. `.plist` files are XML — out of scope here, validated by
-`scripts/install-launchd.test.sh`; template workflow YAML is also covered by the actionlint gate.
+file passed as an absolute path (`cd / && python3 -c '…' "$repo_root/$f"`).
+>
+> **`-I` alone would also close this hole, but `-s` would not** — `-s` only drops the **user**
+site-packages directory and leaves the CWD on `sys.path`. And `-I` carries a side effect here: it
+drops user site-packages too, turning a user-local PyYAML install into a permanent fail-closed red.
+The CWD change closes the same hole without either consequence.
+>
+> Paths are always passed as **argv**, so a filename can never reach the interpreter source.
 
 **ci-config:**
 ```bash

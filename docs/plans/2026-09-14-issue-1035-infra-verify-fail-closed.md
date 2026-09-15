@@ -1,7 +1,7 @@
 # Plan — #1035: infra-verify fail-closed checks
 
 <!-- research-path: docs/plans/2026-09-14-issue-1035-infra-verify-fail-closed.md -->
-<!-- plan-review: cycles=8, exit_reason=clean (both reviewers NO ISSUES FOUND at cycle 8), cap=3 (Low-Medium) EXCEEDED without escalation — see § Plan Review Cycle Log, version=2.3.0 -->
+<!-- plan-review: cycles=8, status=clean, exit_reason=clean, cap=3 (Low-Medium) EXCEEDED without escalation — recorded, NOT filed, see § Plan Review Cycle Log, version=2.3.0 -->
 
 **Issue:** #1035 (`complexity:standard`, `Level: task` → `task-workflow-standard`)
 **Branch:** `fix/1035-infra-verify-fail-closed`
@@ -400,7 +400,7 @@ time.** That is a process defect, recorded here rather than laundered: the cap i
 crossing it requires an escalation exit, yet the loop continued because each cycle returned genuine
 new P1s. The exit itself is clean under the skill's own definition (a fresh reviewer pair returning
 `NO ISSUES FOUND`), so the final verdict stands — but the record must show that the bound was crossed
-without a human in the loop. Filed as a follow-up (see § Follow-ups).
+without a human in the loop. **This breach is recorded here only; it was not filed as a follow-up.**
 
 ## Follow-ups filed
 
@@ -415,9 +415,12 @@ All five were found by the code-review gate on PR #1046 and filed rather than si
 - **#1051** — a symlinked `templates/` or skills dir is dereferenced by `find <dir>/`, so a committed
   symlink to `/` yields an unbounded scan; the dereference is deliberate (consumer symlinked skills
   trees), so a containment guard cannot simply be added.
-- **#1052** — `detect-deploy-surface.sh` classifies surfaces (`.github/*`, `terraform/*`, `docker/*`,
-  `k8s/*`, `supabase/*`) that none of the four infra checks cover — now declared in the skill's
-  Contract, machine-visibility tracked there.
+- **#1052** — `detect-deploy-surface.sh` classifies surfaces (`.github/*` outside workflows,
+  `terraform/*`, `docker/*`, `k8s/*`, `supabase/*`, `enforcement/*`, `*.tf`) that none of the four
+  infra checks cover. The checks are **repo-scoped, not diff-scoped**, so such a diff still reports
+  `pass` against the repo's own trees while the changed surface goes unvalidated — a **known
+  fail-open**, now stated as such in the skill's Contract rather than described as a `skip` the
+  mechanism cannot produce.
 - **#1053** — `infra-verify`'s continuity directive uses the Workflow form while a Bounded skill should
   defer to the orchestrator (#5900) — pre-existing and shared with the other two
   post-deploy-verify sub-skills.
