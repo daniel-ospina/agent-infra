@@ -41,7 +41,7 @@ You are a meta-framework reviewer. Review this output for:
 META-FRAMEWORK OUTPUT:
 [full content of meta-framework.md]
 
-Return ISSUE blocks with specific fixes, or "NO ISSUES FOUND".
+Return ISSUE blocks — each carrying `consequence: <what breaks, who observes it>` — with specific fixes, or "NO ISSUES FOUND".
 ```
 
 ### 7.3 Dispatch Reviewer

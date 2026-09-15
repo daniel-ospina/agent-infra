@@ -160,6 +160,13 @@ P1/P2) are recorded, never counted, and **do not trigger the floor**.
 
 The token is exactly `consequence:` — lowercase, one spelling.
 
+**This floor is not the "unverdict findings" disposition.** Several gates carry an advisory row reading
+"`ISSUES` with **no** verdict → record `⚠️ reviewer returned unverdict findings` and proceed". That row
+governs reviewers that are advisory *by construction* and is unaffected. The two triggers are distinct:
+an **unverdict** result (the reviewer returned no parseable verdict) proceeds; a **consequence-less
+blocking finding** (a parsed finding with no adequate consequence) is voided and cannot exit clean. A
+gate carrying both rows must state which one applies.
+
 ---
 
 ## Consuming These Tables

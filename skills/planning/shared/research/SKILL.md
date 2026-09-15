@@ -35,6 +35,14 @@ Routes the workflow's research stage at the correct granularity rung of the ladd
 
 ## Gate Mechanics
 
+> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
+> Consequence). Every finding from the reviewer this gate dispatches must declare
+> `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
+> non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
+> cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> this gate's own full clean token, never a count.
+
 After the research stage completes (epics + standalone projects — any stage the workflow frontmatter declares `gate: verifier`), dispatch a fresh-context reviewer via `task`. **Precedence:** epic-research's own 4-item Review Gate remains the epic-tier gate; this 5-item checklist SUPPLEMENTS it (single dispatch, merged prompt) — it does not replace it:
 
 ```

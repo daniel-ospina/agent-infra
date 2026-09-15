@@ -242,7 +242,7 @@ A **`keep separate`** verdict is a valid, useful outcome — it is the "explicit
 ISSUE #N
 Dimension: Duplication | Architecture
 Severity: P0 | P1 | P2
-Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
+consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [plan/scope section, or component path]
 Problem: [what is duplicated or unsound]
 Evidence: [source — file path, component name, or `tortoise_search` query. Required.]

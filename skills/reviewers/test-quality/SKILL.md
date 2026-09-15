@@ -86,7 +86,7 @@ Dispatched by:
 ISSUE #N
 Dimension: Test Quality
 Severity: P0 | P1 | P2
-Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
+consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [test name or line number]
 Problem: [what makes this a weak test]
 Fix: [what to change — assert user-visible outcome, add failure case, use real dependency, etc.]

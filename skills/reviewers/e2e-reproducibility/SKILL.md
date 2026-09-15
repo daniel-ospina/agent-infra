@@ -67,7 +67,7 @@ Dispatched by the fractal planning pipeline during the **Detailed E2E** substep 
 ISSUE #N
 Dimension: E2E Reproducibility
 Severity: P0 | P1 | P2
-Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
+consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [E2E scenario name, step N]
 Problem: [what makes this test non-reproducible]
 Fix: [what to specify or mock]

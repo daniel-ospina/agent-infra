@@ -242,6 +242,7 @@ CHECK FIVE DIMENSIONS:
 For each issue:
 ISSUE:
   severity: P0|P1|P2|P3|P4
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: diverge-thoroughness|converge-rigor|quality-vs-convenience|gaps|research-artifact
   location: [specific diamond phase or output section]
   description: <what's wrong>
@@ -349,6 +350,7 @@ CHECK FIVE DIMENSIONS:
 For each issue:
 ISSUE:
   severity: P0|P1|P2|P3|P4
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: diverge-genuineness|converge-quality|completeness|wiring|solution-research-evidence
   location: [specific diamond phase or plan section]
   description: <what's wrong>

@@ -64,7 +64,7 @@ Dispatched by the fractal planning pipeline during the **Data Model** substep wh
 ISSUE #N
 Dimension: Ontology Alignment
 Severity: P0 | P1 | P2
-Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
+consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [section name, paragraph reference]
 Problem: [what term drifts from what canonical form]
 Fix: [what term to use instead]

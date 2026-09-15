@@ -26,6 +26,14 @@ Agents are comfortable saying "Fixed" or "Done" without evidence. This skill mak
 
 ## Scoping Verification
 
+> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
+> Consequence). Every finding from every verifier this skill dispatches must declare
+> `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
+> non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
+> cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> this gate's own full clean token, never a count.
+
 **⛔ MANDATORY before claiming scoping is complete.**
 
 The `issue-scoping` skill (v5.1.0) has integrated verification gates — `problem-verify` and `solution-verify` (or `full-diamond-verify` for Micro). Each gate dispatches verifier sub-agents that check diamond quality (diverge thoroughness, converge rigor, quality over convenience).
@@ -44,13 +52,6 @@ Expected output (varies by tier):
 ```
 ## Verification Gates
 
-> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
-> Consequence). Every finding from every verifier this skill dispatches must declare
-> `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
-> non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
-> cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
-> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
-> this gate's own full clean token, never a count.
 <!-- Standard/Complex: -->
 ### problem-verify: N cycles, clean
 ### solution-verify: N cycles, clean
@@ -96,6 +97,7 @@ Verifier result format:
 ISSUE:
   check_type: <type>
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file>:<line> or [section name]
   description: <what's wrong>
   suggestion: <how to fix>

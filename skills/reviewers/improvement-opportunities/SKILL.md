@@ -79,7 +79,7 @@ Dispatched by the fractal planning pipeline during the **Coherence Review** phas
 ISSUE #N
 Dimension: Improvement Opportunity
 Severity: P0 | P1 | P2
-Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
+consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [substep or section reference]
 Problem: [what could be better]
 Fix: [suggested improvement]

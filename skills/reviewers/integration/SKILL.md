@@ -79,7 +79,7 @@ Dispatched by the fractal planning pipeline during the **Architecture** substep 
 ISSUE #N
 Dimension: Integration
 Severity: P0 | P1 | P2
-Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
+consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [architecture diagram reference or section name]
 Problem: [what integration surface is missing or unclear]
 Fix: [what to add or clarify]

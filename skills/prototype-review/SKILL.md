@@ -126,6 +126,7 @@ Then evaluate against these dimensions:
 For each issue, return:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: component-reuse|pattern-compliance|diff-minimality|mock-data|anti-pattern
   location: [file:line]
   description: <what's wrong>

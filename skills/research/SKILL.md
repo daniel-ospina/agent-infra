@@ -393,6 +393,7 @@ RESEARCH OUTPUT: <full text>
 ISSUE:
   check_type: missing-confidence|unflagged-contradiction|untagged-single-source|missing-kg-fact|missing-log-entry
   severity: P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: [claim section name]
   description: <what is missing>
   suggestion: <what to add>

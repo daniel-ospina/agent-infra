@@ -75,7 +75,7 @@ Dispatched by the fractal planning pipeline during the **Data Model** substep wh
 ISSUE #N
 Dimension: Schema Correctness
 Severity: P0 | P1 | P2
-Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
+consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [table.column or relationship reference]
 Problem: [what doesn't match]
 Fix: [what to change]

@@ -107,6 +107,7 @@ For each source file, check if its test file was also changed:
 ISSUE:
   check_type: test-coverage-gap
   severity: P1
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <changed source file>
   description: Source file changed without corresponding test file update.
     <test file> was not modified. Tests may be stale.
@@ -137,6 +138,7 @@ For each DB-touching file, check if its integration test file exists:
 ISSUE:
   check_type: test-coverage-gap
   severity: P1
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   layer: integration
   location: <changed DB file>
   description: DB surface changed without integration test.
@@ -162,6 +164,7 @@ For each critical path change, check for e2e test files:
 ISSUE:
   check_type: test-coverage-gap
   severity: P1
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   layer: e2e
   location: <changed page>
   description: Critical path changed without e2e coverage.
@@ -185,6 +188,7 @@ Flag if UX verification returns violations without fixes:
 ISSUE:
   check_type: ux-violation
   severity: P1
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <component file>
   description: UX verification found unresolved violations.
     <summary from ux-verification report>
@@ -228,6 +232,7 @@ Flag absence of SQL-level testing as a blocking P0 issue with `check_type: sql-t
 ISSUE:
   check_type: sql-test-gap
   severity: P0
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <SQL function file>
   description: Postgres business logic function added/modified without SQL-level test.
     Mocked TypeScript tests cannot verify SQL logic (transaction isolation, RLS guards,
@@ -258,6 +263,7 @@ Flag skipped-generation paths as a blocking P0 issue with `check_type: content-g
 ISSUE:
   check_type: content-generation-gap
   severity: P0
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: Content generation/send function has a code path that silently
     skips real generation and returns a hardcoded fallback, early return, or
@@ -344,6 +350,7 @@ fi
 ISSUE:
   check_type: cross-pr-overlap
   severity: P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   advisory: true
   description: File(s) also modified in N other open PR(s).
     Overlapping files: <comma-separated list>
@@ -490,6 +497,7 @@ For each issue found, return:
 ISSUE:
   check_type: CLAUDE.md-adherence|comment-compliance
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>
@@ -509,6 +517,7 @@ For each issue found, return:
 ISSUE:
   check_type: bug
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>
@@ -536,6 +545,7 @@ For each issue found, return:
 ISSUE:
   check_type: bug
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <what's wrong, prefix with [deep]>
   suggestion: <what to fix>
@@ -561,6 +571,7 @@ For each issue found, return:
 ISSUE:
   check_type: historical-context|pr-comment-history
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <what's wrong; for Part B say "repeated issue from PR #N">
   suggestion: <what to fix>
@@ -583,6 +594,7 @@ For each issue return:
 ISSUE:
   check_type: security
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <vulnerability, why exploitable, attacker-controlled input path>
   suggestion: <fix>
@@ -663,6 +675,7 @@ For each issue return:
 ISSUE:
   check_type: config-validity|config-consistency|secret-leak|insecure-default
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>
@@ -710,6 +723,7 @@ For each issue found, return:
 ISSUE:
   check_type: gate-warning|continuity-directive|frontmatter|broken-reference|sequence-correctness|handover-contract|gate-placement|orchestrator-dependency|io-contract|review-gate-integration|standalone-invocability|cross-skill-assumption
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>
@@ -754,6 +768,7 @@ For each issue found, return:
 ISSUE:
   check_type: vocabulary-conflict|ontology-drift|downstream-impact|template-validity|subject-registry
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>
@@ -794,6 +809,7 @@ For each issue found, return:
 ISSUE:
   check_type: runtime-safety|error-handling|silent-failure|config-validity
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>

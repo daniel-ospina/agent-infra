@@ -214,6 +214,7 @@ CHECK THESE DIMENSIONS:
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: assertion-correctness|test-quality|aaa-pattern|false-positive
   location: <test name or line number>
   description: <what's wrong>
@@ -270,6 +271,7 @@ CHECK THESE DIMENSIONS:
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: happy-path|failure-mode|boundary-value|surface-alignment|missing-test
   location: <test file, test name, or "missing">
   description: <what's missing or wrong>
@@ -316,6 +318,7 @@ CHECK THESE DIMENSIONS:
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: journey-coverage|outcome-verification|failure-journey|sequencing
   location: <test name or journey step>
   description: <what's missing or misaligned>
@@ -374,6 +377,7 @@ CHECK THESE DIMENSIONS:
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: test-quality
   check: TQ1-implementation-detail|TQ2-negative-case|TQ3-mock-overreach|TQ4-outcome-misalignment|TQ5-implementation-coupling|TQ6-test-data|TQ7-excessive-mocking
   location: <test name or line number>

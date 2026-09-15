@@ -144,6 +144,13 @@ The reviewer list above is authoritative for the 3-reviewer dispatch.
 ### 8. Coherence Review + Risk Analysis
 Cross-substep drift detection. Risk identification with mitigation strategies. Improvement opportunities.
 
+**Improvement-opportunities reviewer (explicit dispatch, #903):** dispatch a fresh-context `task`
+sub-agent that reads `skills/reviewers/improvement-opportunities/SKILL.md` in full and applies it to the
+finished plan. It is **advisory by construction** — record its output, but it never blocks this gate,
+never enters the fix-loop below, and its findings are never filed as issues (only a finding declaring an
+adequate `consequence:` may block). Its dispatch is named here because no gate previously dispatched it
+by name; it was reachable only as a coherence dimension.
+
 **Review gate (FINAL):** Is the plan internally consistent? Are risks identified and mitigated? Is the plan ready for decomposition? **Final duplication re-check (#688):** re-run the `duplication-architecture` reviewer across the *finished* plan. Substep 5 saw the architecture in isolation; by step 8 the data model, interfaces, and E2E steps have each added surfaces that can duplicate — and a second writer of state already written elsewhere is the failure this catches. Any duplication found here carries a three-valued verdict: `unify` | `keep separate` | `unify-contract-keep-drivers`. Same contract as substep 5: skill's output block verbatim, advisory, outside the Review Gate Pattern below.
 
 ## Review Gate Pattern

@@ -179,6 +179,7 @@ CHECK THESE DIMENSIONS:
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: spec-coverage|step-coherence|epic-alignment|parallelizability|plan-quality|good-easy
   location: [Task N, Step M] or [Header section name]
   description: <what's wrong>
@@ -232,6 +233,7 @@ CHECK THESE DIMENSIONS:
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: interface-impact|edge-cases|test-coverage|surface-map-quality
   location: [Task N, Step M] or [Header section name]
   description: <what's wrong>
@@ -281,6 +283,7 @@ CHECK THESE DIMENSIONS:
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: ux-coherence|information-architecture
   location: [Task N, Step M] or [Header section name]
   description: <what's wrong>
@@ -319,6 +322,7 @@ Consider these failure families:
 For each gap found, return:
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: failure-mode-gap
   location: Testing Strategy
   description: <failure mode + why existing tests miss it>
@@ -384,6 +388,7 @@ the skill's own definition is an open issue, not a pass.
 
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue]
   dimension: duplication-architecture
   location: <plan section>
   verdict: unify | keep separate | unify-contract-keep-drivers

@@ -202,8 +202,9 @@ reviewer erase a whole cycle by omitting the field. Therefore:
   mirror it.** That precedent belongs to reviewers that are advisory *by construction* (the
   `duplication-architecture` disposition tables in `epic-scope:173`, `issue-scoping:408`, `epic-plan:162`,
   and `plan-review:402`), where "proceed" is harmless. The floor governs **blocking** reviewers, where
-  "proceed" closes the gate. The edit cross-references those four adjacent rows so one cycle cannot have
-  two opposite outcomes.
+  "proceed" closes the gate. The canonical section carries the distinguishing clause (unverdict →
+  proceeds; consequence-less blocking finding → voided, cannot exit clean) so a gate carrying both rows
+  has one stated outcome.
 - **The floor fires only on a BLOCKING reviewer's consequence-less cycle.** Findings from reviewers that
   are *advisory by construction* — `duplication-architecture`, and `improvement-opportunities`' P1/P2 —
   are recorded, never counted toward the gate, and **do not trigger the floor** (§4.5).
@@ -300,8 +301,9 @@ classification not reproducible to a split]` — rather than re-deriving a perce
 | `skills/verification-before-completion/SKILL.md` | Verification gate — dispatches a verifier whose `ISSUE:` block blocks "done" via `<HARD-GATE>`; invoked by `task-workflow-standard` |
 | `skills/research/SKILL.md` | Research gate — Step 5.5 `[VGATE]` verifier emits a full `ISSUE:` schema with a blocking fix gate; the mandated engineering research path (`AGENTS.md`) |
 | `skills/meta-framework-research/workflow/07-review-gate.md` | Research gate (fresh-context review gate) |
+| `skills/planning/shared/research/SKILL.md` | Project/standalone research gate — dispatches a fresh-context reviewer returning `ISSUES: <list>` with a 10-cycle fix-loop (the plan's own inclusion criterion (i)) |
 
-**Role A — 15 emitter files:** `skills/reviewers/*/SKILL.md`.
+**Role A — 16 emitter files:** the 15 `skills/reviewers/*/SKILL.md` **plus the inline `ISSUE:` schemas inside the gate files above** (see below).
 
 **Role B count breakdown:** 15 files = **13 `SKILL.md` gates** + `code-review/references/fixer-loop.md`
 + `meta-framework-research/workflow/07-review-gate.md`. Of the 13 gates, only `plan-review` already cites
@@ -318,8 +320,16 @@ what matters is that the threshold is *recorded per file*, not self-graded.
 
 **Canonical rule — 1 file:** `skills/proportional-gates/SKILL.md`.
 
-Role A and Role B are disjoint. Intervention 2 edits **1 + 15 + 15 = 31 distinct files**; intervention
-1 adds 1. **Grand total edited: 32 files** (plus this plan doc).
+Role A and Role B are **disjoint** except for the inline schemas, which live *inside* Role B's gate
+files (so they add no file to the count). Intervention 2 edits **1 canonical + 16 gate/reference + 15
+reviewer-emitter = 32 distinct files**; intervention 1 adds 1. **Grand total edited: 33 files** (plus
+this plan doc).
+
+The inline `ISSUE:` schemas were **not** left to the per-gate blockquote: every `severity:` schema line
+in the gate files was given the field — **30 sites** across `code-review` (16), `plan-review` (5),
+`test-review` (4), `issue-scoping` (2), `prototype-review` (1), `verification-before-completion` (1),
+`research` (1). This is the point a reviewer caught: a blockquote at the top of the file does not put a
+field into the prompt template an inlined reviewer copies.
 
 **Named exclusions (reported, not silently dropped).** These files also emit findings under a review
 loop, but sit outside the engineering delivery pipeline #903 measured, so they are **out of scope by
@@ -328,7 +338,7 @@ the criterion above, not by omission**:
 | Excluded | Why |
 |---|---|
 | `skills/define-vision/SKILL.md`, `skills/define-subject-identity/SKILL.md`, `skills/define-team-vision/SKILL.md`, `skills/define-strategy/SKILL.md`, `skills/define-product-*/`, `skills/define-team-strategy/SKILL.md` | Strategy/identity pipelines; they iterate reviewers to clean and do not feed the measured issue stream |
-| `skills/planning/shared/{align,research,verify}/SKILL.md` | Epic-workflow *routers* to the `epic-*` gates already in the set (they declare no finding schema of their own) |
+| `skills/planning/shared/{align,verify}/SKILL.md` | 26-line routing stubs — they declare no finding schema of their own (`research` is a real gate and IS in the set, above) |
 | `skills/experiment-analysis/SKILL.md` | Product-experiment pipeline |
 | `skills/executing-plans/SKILL.md` | Its `ISSUE:`-shaped blocks are **deterministic check outputs** (`check_type`/`severity`/… emitted by pre-commit echoes), not reviewer-finding schemas |
 | `skills/content-verification/SKILL.md`, `skills/content-reviewer-breadth|depth/SKILL.md`, `skills/content-fact-checker-writing/SKILL.md` | Content (El Dato) pipeline, a separate domain with its own gate loop |
@@ -508,7 +518,7 @@ the #975/#976 status (so the reconciliation is verified, not remembered).
 | `node --test extensions/shared/test-never-unbounded.mjs` (or its runner) | pass — `using-git-worktrees` pin intact |
 | `npx tsx extensions/review-enforcer/index.test.ts` | pass — `code-review` Step 10a pin intact |
 | `bash scripts/materialize-agents.sh --check .` | clean (AGENTS.md NOT edited) |
-| `grep -c "consequence:" skills/<file>` | per file, ≥ the **recorded per-file site count** (§4.3) — recomputed with the §4.3 commands, and a self-graded count is not accepted |
+| `grep -c "consequence:" skills/<file>` | per file, ≥ the **recorded per-file site count** (§4.3) — run at implementation time; result: every gate file ≥ its site count, 30/30 inline sites covered |
 | `grep -c 'EXIT_REASON="clean"' skills/code-review/references/fixer-loop.md` | unchanged count (the parser is not re-engineered) |
 | `git status --short` after the commit | every edited skill is committed (agent-infra `skills/` installs globally; `commit-workflow`/skill-sync carries it) |
 
