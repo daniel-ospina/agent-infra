@@ -2,11 +2,39 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "child_process";
 import { isPrintMode } from "../shared/print-mode.js";
+// #966: the command parsers are ONE copy shared with verification-gate, in
+// extensions/shared/. This file used to define its own extractPrNumber /
+// extractRepoFlag / extractGhRepoEnv / parseCdChains / expandCdTarget /
+// extractCdPath; the copies drifted for a month and the two suites pinned
+// opposite answers for the same input. The definitions now live only in
+// shared/git-command-parse.ts; the drift-pin in index.test.ts keeps a local
+// copy from ever coming back.
+import {
+  expandCdTarget,
+  extractCdPath,
+  extractGhRepoEnv,
+  extractPrNumber,
+  extractRepoFlag,
+  parseCdChains,
+  unquotedMask,
+  type CdChainInfo,
+} from "../shared/git-command-parse.js";
 import * as fs from "fs";
 import * as os from "os";
 import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
+// Re-exported public surface (tests and external consumers import from
+// ./index.js) — the DEFINITION lives only in shared/.
+export {
+  expandCdTarget,
+  extractCdPath,
+  extractGhRepoEnv,
+  extractPrNumber,
+  extractRepoFlag,
+  parseCdChains,
+  type CdChainInfo,
+};
 
 /**
  * #984 — the ARGV-LEVEL layer.
@@ -324,16 +352,12 @@ export function isGhPrMergeCommand(command: string): boolean {
 const GH_PR_PATTERN = /(^|[\s;&|(){!])gh\s+pr\s+(create|merge)(?=\s|$)/;
 
 /**
- * Which characters of `command` sit OUTSIDE a quoted region?
- *
- * Needed because a quote-split COMMAND NAME (`g"h" pr merge …`, `''gh pr merge …`,
- * `\gh pr merge …`) is bash-re-joined to `gh` while the raw text contains no
- * contiguous `gh`, and a quoted MENTION (`echo "gh pr merge 1 --admin=true"`) is
- * the opposite: it DOES contain `gh`, but inside the quotes, so it is not a
- * command at all. The two are indistinguishable from the normalized text — both
- * normalize to `gh pr merge` — so the distinction has to come from quote state.
- *
- * Tracks `'…'` and `"…"` (with `\` escapes outside single quotes).
+ * `unquotedMask` — the module-wide quote model — now lives in
+ * extensions/shared/git-command-parse.ts (#966) and is imported above. The
+ * helper doc (`Which characters of \`command\` sit OUTSIDE a quoted region?`)
+ * moved with it; `matchUnquoted` / `countUnquotedMergeVerbs` / `scanTokens`
+ * below are its consumers here, and the shared masked PR scan is the other —
+ * one model, so they cannot drift.
  */
 /**
  * `RegExp.exec` that skips any match starting INSIDE a quoted region (mask[i] false).
@@ -369,31 +393,6 @@ function countUnquotedMergeVerbs(command: string): number {
     else scan.lastIndex = m.index + 1;
   }
   return n;
-}
-
-function unquotedMask(command: string): boolean[] {
-  const mask = new Array<boolean>(command.length).fill(true);
-  let quote: string | null = null;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    if (quote === null) {
-      if (ch === "\\") {
-        if (i + 1 < command.length) i++;
-        continue;
-      }
-      if (ch === "'" || ch === '"') {
-        quote = ch;
-        mask[i] = false;
-        continue;
-      }
-      mask[i] = true;
-    } else {
-      mask[i] = false;
-      if (ch === quote) quote = null;
-      else if (quote === '"' && ch === "\\" && i + 1 < command.length) mask[++i] = false;
-    }
-  }
-  return mask;
 }
 
 /**
@@ -720,75 +719,6 @@ export interface RepoContext {
   source: "url" | "flag" | "env" | "cd" | "record" | "fallback";
 }
 
-// Extract the PR number from `gh pr merge <n>` (matches GH_PR_PATTERN verbs).
-/**
- * The command with every quoted region replaced by SPACES — same length, same offsets, so a
- * match index still addresses the original text. A text regex run on this cannot see a
- * QUOTED mention as one of the command's own tokens. Reuses `unquotedMask`, the file's
- * single quote model, so the two cannot drift.
- */
-function maskQuoted(command: string): string {
-  const mask = unquotedMask(command);
-  let out = "";
-  for (let i = 0; i < command.length; i++) out += mask[i] ? command[i] : " ";
-  return out;
-}
-
-/**
- * The PR number written IMMEDIATELY after the verb (`gh pr merge 138`).
- *
- * Measured on main before this change, the raw-text match took the FIRST
- * `gh pr merge <digits>` ANYWHERE — including inside a quoted argument — and the registry
- * path consults this function FIRST (`extractPrNumber(command) ?? extractMergePrNumber`),
- * so a mention shadowed the real positional and the gate checked a DIFFERENT PR than gh
- * merged (a wrong-PR evidence read):
- *   `gh pr merge --body "see gh pr merge 999" 138 --admin` -> 999 (gh merges 138)
- *   `x="say gh pr merge 1"; gh pr merge <url> --admin`      -> 1   (gh merges the URL's PR)
- *   `git commit -m "see gh pr merge 138"`                    -> 138 (a mention drove the gate)
- * Masking the verb fixes all three: the match must be one bash would pass as a word.
- *
- * It does NOT change a QUOTED POSITIONAL (`gh pr merge "138"`): the regex requires bare
- * digits after the verb, so that spelling returned null before masking too and still does —
- * `extractMergePrNumber` refuses the quoted token as well, so the registry gate is SKIPPED
- * for it. That is a PRE-EXISTING hole (the scanner does not dequote a positional) and the
- * follow-up issue covers it together with the dequote fix; masking neither causes nor
- * widens it.
- */
-export function extractPrNumber(command: string): number | null {
-  const masked = maskQuoted(command);
-  const m = masked.match(/gh\s+pr\s+merge\s+(\d+)/);
-  if (m === null) return null;
-  // A token ADJACENT to a quoted region is quote-SPLICED: bash concatenates `"1"38` into
-  // `138`, so the digits the mask leaves visible are a FRAGMENT of the real argument and
-  // taking them names a different PR (`"1"38` masked reads `38`; gh merges 138). Refuse
-  // rather than guess — the same fail-closed direction as the rest of this walk (round-4
-  // review, P2: masking alone turned this from null into a wrong-number read).
-  //
-  // STATED LIMIT (pre-existing, filed with the dequote follow-up #1021): this covers `'` and
-  // `"` adjacency only. The ANSI-C family splices with a `$` in front (`1$'38'` is `138` to
-  // bash) and a digit-adjacent `$` is not caught here, so `1$'38'` still reads `1`. That is
-  // NO WORSE than before this function was masked (the raw regex also read `1`), and the
-  // dequote-aware positional in #1021 is what closes it.
-  const dStart = m.index + m[0].length - m[1].length;
-  const before = command[dStart - 1];
-  const after = command[dStart + m[1].length];
-  if (before === '"' || before === "'" || after === '"' || after === "'") return null;
-  return parseInt(m[1], 10);
-}
-
-// Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag.
-export function extractRepoFlag(command: string): string | null {
-  // Value may be attached (`-Rowner/repo`), `=`-joined, or a separate word.
-  const m = command.match(/(?:--repo|-R)(?:=|\s+)?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
-  return m ? m[1] : null;
-}
-
-// Priority 2: GH_REPO=owner/name env assignment prefix in the command.
-export function extractGhRepoEnv(command: string): string | null {
-  const m = command.match(/(?:^|\s)GH_REPO=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
-  return m ? m[1] : null;
-}
-
 /**
  * Repo context is resolved in priority order from the merge command itself
  * (extractRepoFlag, then GH_REPO=, then cd — LAST cd in the chain wins, since
@@ -806,84 +736,9 @@ export function extractGhRepoEnv(command: string): string | null {
  * must not fall back to the session cwd's repo (that fallback is how a
  * `cd ~/…/DMeer && merge` would get authorized by an agent-infra record —
  * the reverse #426).
+ *
+ * All helpers below live in extensions/shared/git-command-parse.ts (#966).
  */
-
-/** Expand a cd target the way bash would when statically resolvable.
- * `~`/`~/…` → home; a path still containing $/backtick is unresolvable
- * statically → null (bash WOULD expand it, so callers treat the cwd as
- * unattributable rather than guessing). */
-export function expandCdTarget(path: string): string | null {
-  if (path === "~") return os.homedir();
-  if (path.startsWith("~/")) return resolvePath(os.homedir(), path.slice(2));
-  if (/[$`]/.test(path)) return null;
-  return resolvePath(path);
-}
-
-export interface CdChainInfo {
-  last: string | null; // resolved path of the last parseable `cd <path>`
-  unattributable: boolean; // a cd bash WILL run but we can't resolve its target
-}
-
-export function parseCdChains(command: string): CdChainInfo {
-  // Quote-aware scan splitting on &&/;\n OUTSIDE quotes — prose like
-  // `--comment "see; cd /tmp && …"` must never parse as a cd chain (#230
-  // class). Counts standalone `cd` words outside quotes so unparseable forms
-  // (subshell `(cd …`, `cd $VAR`, `cd "$(…)"`) are detected, not silently
-  // mis-attributed to the session cwd (cycle 3 P2-1).
-  const segments: string[] = [];
-  let cur = "", q: string | null = null, esc = false;
-  let cdWords = 0;
-  for (let i = 0; i < command.length; i++) {
-    const c = command[i];
-    if (esc) { cur += c; esc = false; continue; }
-    if (q) {
-      cur += c;
-      if (c === "\\") esc = true;
-      else if (c === q) q = null;
-      continue;
-    }
-    if (c === '"' || c === "'") { q = c; cur += c; continue; }
-    if (c === "&" && command[i + 1] === "&") { segments.push(cur); cur = ""; i++; continue; }
-    if (c === ";" || c === "\n" || c === "|") {
-      // `|` (incl. `||`) splits too — the real `cd /x || exit 1` idiom must
-      // not capture `|| exit 1` into the cd target (cycle 4 P3).
-      if (c === "|" && command[i + 1] === "|") i++;
-      segments.push(cur); cur = ""; continue;
-    }
-    if (c === "c" && command.startsWith("cd", i)) {
-      const after = command[i + 2];
-      const before = command[i - 1];
-      if (
-        (after === undefined || /[\s;&|()]/.test(after)) &&
-        (before === undefined || /[\s;&|(\n]/.test(before))
-      ) {
-        cdWords++;
-      }
-    }
-    cur += c;
-  }
-  segments.push(cur);
-  let last: string | null = null;
-  for (const seg of segments) {
-    const m = seg.match(/^\s*cd\s+(['"]?)(.+?)\1\s*$/);
-    if (m) last = m[2];
-  }
-  if (last !== null) {
-    const resolved = expandCdTarget(last.trim());
-    return { last: resolved, unattributable: resolved === null };
-  }
-  // Bare `cd` (no target) → HOME in bash.
-  const bare = segments.some((s) => /^\s*cd\s*$/.test(s));
-  if (bare) return { last: os.homedir(), unattributable: false };
-  // Any OTHER unparsed cd word (subshell `(cd …`, `cd $VAR`, `cd "$(…)"`, …)
-  // means the effective cwd is unattributable — say so.
-  return { last: null, unattributable: cdWords > 0 };
-}
-
-export function extractCdPath(command: string): string | null {
-  return parseCdChains(command).last;
-}
-
 export function resolveRepoContext(command: string, record: ReviewRecord | null): RepoContext {
   // #1007: a PR URL in the SELECTOR outranks every other source, because gh resolves
   // the merge against the URL and IGNORES --repo/GH_REPO. Probed live rather than
@@ -912,7 +767,7 @@ export function resolveRepoContext(command: string, record: ReviewRecord | null)
   // It counts a real second verb spelled with `;`, `&&`, a newline, `|`, a subshell, a
   // glued `;` or a repo pair in the gaps. It UNDER-counts a verb hidden inside `sh -c '…'`
   // or a splice (`gh pr $'merge' 123`) — measured (round-4 review). That is benign here and
-  // deliberate: `maskQuoted` hides those same spellings from `extractPrNumber`, so the
+  // deliberate: the shared `maskQuoted` hides those same spellings from `extractPrNumber`, so the
   // number and the repo stay consistent (both resolve the FIRST verb) instead of the repo
   // being taken from one verb and the number from another.
   if (selector.repo && countUnquotedMergeVerbs(command) <= 1) {
