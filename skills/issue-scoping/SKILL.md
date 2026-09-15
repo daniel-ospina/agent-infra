@@ -13,6 +13,16 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 **Human approval gate:** presents output for user review. Pipeline advances after approval.
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
+> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
+> Consequence). Every finding from every reviewer this skill dispatches (Phase 2.5 / 5.5 verifiers and
+> Phase 7 agents) must declare `consequence: <what breaks, who observes it>`. Without an adequate one the
+> finding is **advisory: non-blocking, not counted toward this gate, and not filed as an issue** (it is
+> still recorded in the cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer
+> output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit
+> non-clean. "Clean" is this gate's own full clean token, never a count. The adjacent-discovery filing
+> path (§Design Principle: File Extra Issues) is a discovery-while-working path governed by `AGENTS.md`,
+> not by this contract.
+
 > **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 
 > **Canonical:** `agent-infra/skills/issue-scoping/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.

@@ -15,6 +15,14 @@ allowed-tools: read bash grep find web_search web_fetch todo_write task
 
 The final coherence pass that looks beyond correctness to find opportunities for improvement: simplifications, better patterns, missed optimizations, and alignment with the principle of "good > easy." This reviewer is constructive, not adversarial — it flags things that could be better, not things that are broken.
 
+> **Advisory by construction — never blocking, never filed.** This reviewer's findings are the canonical
+> consequence-less class: a missed simplification or a nice-to-have does not, by existing, break anything
+> for anyone. Its **P1 and P2** findings are therefore **recorded in the artifact and are never blocking,
+> never counted toward the gate, and never filed as GitHub issues** (`proportional-gates` §Findings Must
+> Declare Consequence). They do not trigger that section's conformance floor. Only a finding that declares
+> an adequate `consequence:` — a concrete failure plus the party who observes it — can block, which is
+> normally the P0 case below.
+
 ## When Used
 
 Dispatched by the fractal planning pipeline during the **Coherence Review** phase, after all substeps are complete. Applies regardless of complexity axis ratings.
@@ -32,10 +40,12 @@ Dispatched by the fractal planning pipeline during the **Coherence Review** phas
 > P0 is rare for improvement opportunities — this reviewer is primarily P1/P2. But flag as P0 if:
 
 **IO1 — Active harm:**
-- The current approach will cause measurable harm (performance degradation, user confusion, maintenance burden) that a known better approach would avoid
-- Flag with the harm and the alternative
+- The current approach will cause concrete harm that a known better approach would avoid — and the harm
+  must be stated as a *consequence*: what breaks, and who observes it (e.g. "every epic over 20 substeps
+  times out for the operator", not "maintenance burden")
+- Flag with the consequence and the alternative. Without a stated consequence this is P1/P2 advisory, not P0
 
-### P1 — Should Fix
+### P1 — Should Fix (advisory — never blocks, never filed)
 
 **IO2 — Missed simplification:**
 - A section of the epic is more complex than it needs to be — a simpler approach exists that achieves the same goal
@@ -49,7 +59,7 @@ Dispatched by the fractal planning pipeline during the **Coherence Review** phas
 - Epic chooses a technology when a better alternative exists (stdlib, existing dependency, native platform feature)
 - Flag with "why X when Y already does this?"
 
-### P2 — Should Fix (blocks merge)
+### P2 — Should Fix (advisory — never blocks, never filed)
 
 **IO5 — Sequencing optimization:**
 - Substeps or implementation phases could be reordered for faster value delivery or risk reduction
@@ -69,6 +79,7 @@ Dispatched by the fractal planning pipeline during the **Coherence Review** phas
 ISSUE #N
 Dimension: Improvement Opportunity
 Severity: P0 | P1 | P2
+Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [substep or section reference]
 Problem: [what could be better]
 Fix: [suggested improvement]

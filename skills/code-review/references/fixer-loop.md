@@ -14,6 +14,15 @@ A cycle clears the gate **only** when a fresh reviewer pass on the latest commit
 
 > **Notation note:** MCP tool calls (`mcp__ai-workflow-tools__implementation_agent`, `mcp__ai-workflow-tools__code_review_pattern_scan`) are invoked by Claude as orchestrator — results are in Claude's working context, not bash variables. Bash commands run via the Bash tool. UPPERCASE variable names span both; the distinction is enforced at implementation time.
 
+> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
+> Consequence). Every finding from every reviewer this skill dispatches must declare
+> `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
+> non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
+> cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> this gate's own full clean token, never a count. Note the embedded parser below reads the deterministic
+> pattern-scan, not reviewer prose — the pattern-scan's machine findings are explicitly out of this bar.
+
 ## Step 6.5 — Serialize surviving issues
 
 The confidence filter in Step 6 holds surviving issues as structured objects in Claude's context. Before entering the loop, serialize them to `SURVIVING_ISSUES_JSON` — a JSON array of `{severity, location, description, suggestion}` objects:

@@ -76,6 +76,7 @@ Dispatched by the fractal planning pipeline during the **Interfaces** substep wh
 ISSUE #N
 Dimension: Contract Completeness
 Severity: P0 | P1 | P2
+Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [interface name, parameter/field name]
 Problem: [what's missing from the contract]
 Fix: [what to specify]

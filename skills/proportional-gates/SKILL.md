@@ -138,6 +138,30 @@ This is the same generate-review loop applied to gate selection itself. The agen
 
 ---
 
+## Findings Must Declare Consequence
+
+Every finding a review gate produces must declare **`consequence: <what breaks, who observes it>`** —
+a concrete failure (a broken behaviour, a lost invariant, a wrong result) **and** the party who
+observes it (a user, an operator, a downstream component, CI). A restatement of the finding, a severity
+word, or a bare "it breaks" is **not** a consequence.
+
+**A finding without an adequate consequence is advisory: non-blocking, not counted toward the gate, and
+not filed as a GitHub issue.** This governs findings raised inside a review gate — `AGENTS.md`'s
+auto-file rule does not re-mandate a consequence-less reviewer finding into an issue, and for a gate's
+exit conditions the clean predicate is that gate's own **full** clean token, never a count and never a
+substring (e.g. `NO ISSUES FOUND — DEGRADED` is not clean).
+
+**Conformance floor.** If a cycle yields ≥1 finding and **none** carries an adequate `consequence:`, that
+is malformed reviewer output, not a clean cycle: record `⚠️ reviewer returned N consequence-less
+findings`, re-dispatch once, and then exit **non-clean**. Voided findings are still written to the cycle
+log, so convergence and stall detection read them and cannot read a shrunken set as convergence. Findings
+from reviewers that are *advisory by construction* (`duplication-architecture`; `improvement-opportunities`
+P1/P2) are recorded, never counted, and **do not trigger the floor**.
+
+The token is exactly `consequence:` — lowercase, one spelling.
+
+---
+
 ## Consuming These Tables
 
 Consuming skills **cite** `proportional-gates` §Review Cycles by name and never copy its cells — a copy is a second source of truth, and it is not the table the parity test parses, so it drifts silently.

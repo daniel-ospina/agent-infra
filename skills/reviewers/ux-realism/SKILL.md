@@ -68,6 +68,7 @@ Dispatched by the fractal planning pipeline during the **Workflows** substep whe
 ISSUE #N
 Dimension: UX Realism
 Severity: P0 | P1 | P2
+Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [workflow name, step N]
 Problem: [what breaks under real-world conditions]
 Fix: [what to change or add]

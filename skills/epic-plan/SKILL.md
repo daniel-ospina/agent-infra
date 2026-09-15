@@ -50,6 +50,17 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
+> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
+> Consequence). Every finding from every reviewer this skill dispatches must declare
+> `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
+> non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
+> cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> this gate's own full clean token (`NO ISSUES FOUND — CLEAN`; never a substring match, and `…— DEGRADED`
+> is not clean), never a count. `improvement-opportunities` is dispatched from this gate's coherence
+> review and is **advisory by construction** — its P1/P2 findings are recorded, never blocking, never
+> filed, and do not trigger the floor.
+
 > **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 > ⚠️ **This file is authoritative.** All 8 sub-steps and their review gates are defined inline below — there are no separate `workflow/` files.

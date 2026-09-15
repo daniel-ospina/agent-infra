@@ -36,6 +36,16 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
+> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
+> Consequence). Every finding from every reviewer this skill dispatches must declare
+> `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
+> non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
+> cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> this gate's own full clean token (`MECE CLEAN`), never a count. MECE findings **are** in the contract —
+> the `fix: <create new issue | …>` action runs only for a finding that carries an adequate
+> `consequence:`.
+
 > **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 # Work Decomposition into Issues

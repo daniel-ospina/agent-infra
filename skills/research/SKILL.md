@@ -10,6 +10,14 @@ version: 1.0.0
 
 ## Research Discipline
 
+> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
+> Consequence). Every finding from the Step 5.5 `[VGATE]` verifier (and any other reviewer this skill
+> dispatches) must declare `consequence: <what breaks, who observes it>`. Without an adequate one the
+> finding is **advisory: non-blocking, not counted toward this gate, and not filed as an issue** (it is
+> still recorded in the cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer
+> output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit
+> non-clean. "Clean" is this gate's own full clean token, never a count.
+
 This skill follows the [research-protocol](../reference/research-protocol/SKILL.md). Tier 3 integration (full protocol). All five dimensions apply: best practices, challenge definition, internal+external, adversarial, don't reinvent.
 
 **Protocol compliance self-audit:**

@@ -247,6 +247,11 @@ agents in the hub) is prevented by discipline, not just guards:
    process env — launched before `~/.zshenv` had the exports commented out and
    propagated via `login -p` — not any shell rc. Remediation: relaunch cmux so
    new surfaces inherit the clean launchd env.)
+5. **A measurement claim names its revision.** Any test, guard, benchmark, or sweep reported as
+   evidence must state the revision it measured (`git -C <checkout> rev-parse --short HEAD`), and it
+   must be measured against `origin/main` — never the contended hub. The hub is routinely behind, so
+   a guard run there asserts a smaller floor and returns an unqualified pass that describes a
+   revision nobody asked about; that is #900, not a pass. A stale measurement is not a measurement.
 
 ## Quick Reference
 

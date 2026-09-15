@@ -63,6 +63,7 @@ Dispatched by the fractal planning pipeline during the **User Journeys** substep
 ISSUE #N
 Dimension: UX Coverage
 Severity: P0 | P1 | P2
+Consequence: [what breaks, and who observes it — required; a finding with no consequence is advisory only: never blocking, never counted toward the gate, never filed as an issue]
 Location: [journey name or section reference]
 Problem: [what's missing or unclear]
 Fix: [what to add or clarify]

@@ -15,6 +15,14 @@ Automated review-fix cycle for El Dato HTML prototypes. Ensures prototype qualit
 
 ## When to Use
 
+> **Finding contract — `consequence:` required** (canonical: `proportional-gates` §Findings Must Declare
+> Consequence). Every finding from every reviewer this skill dispatches must declare
+> `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
+> non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
+> cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> this gate's own full clean token, never a count.
+
 - After `ui_prototype` generates an HTML prototype file (automatic invocation)
 - After `issue-scoping` implements a React fork prototype (automatic, `--mode=react-diff`)
 - Manually on any prototype: `prototype-review docs/prototypes/YYYY-MM-DD-<feature>.html [--spec "what this demonstrates"]`
