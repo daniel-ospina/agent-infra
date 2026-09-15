@@ -48,11 +48,13 @@
  * Chain model: alias families. A "family" is one logical model served by
  * multiple (provider, model) legs with identical behavior on different
  * balances. deepseek-v4-flash → qwen-tp/deepseek-v4-flash-0731 (flash RENAMED
- * on the token plan — same id family, distinct model id) → openrouter slug
- * openrouter/deepseek/deepseek-v4-flash. deepseek-v4-pro → qwen-tp identity
- * deepseek-v4-pro → openrouter/deepseek/deepseek-v4-pro. All legs of a family
- * latched/blocked → the structured HALT class (never a silent fallthrough to
- * a latched default).
+ * on the token plan — same id family, distinct model id) → the openrouter V4.1
+ * slug openrouter/deepseek/deepseek-v4.1-flash (#727: the same generation as
+ * the primary; the older "V4 Flash 0423" slug deepseek/deepseek-v4-flash is
+ * appended LAST as RESOLUTION-ONLY — matched for stale state, never served).
+ * deepseek-v4-pro → qwen-tp identity deepseek-v4-pro →
+ * openrouter/deepseek/deepseek-v4-pro. All legs of a family latched/blocked →
+ * the structured HALT class (never a silent fallthrough to a latched default).
  *
  * Exhaustion signature (text classifier — s2: message_end errorMessage is text
  * only; after_provider_response never fires on 402 for the SDK transport):
@@ -252,9 +254,25 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
       // `deepseek-v4-flash` alias, both registered in models.json.
       { provider: "deepseek", model: "deepseek-flash" },
       { provider: "qwen-tp", model: "deepseek-v4-flash-0731" },
-      // #727: this openrouter slug (upstream "DeepSeek V4 Flash 0423") is
-      // older-generation vs the primary's V4.1 Flash — re-point/validate the
-      // leg generation there; the chain shape is deliberately unchanged here.
+      // #727: the openrouter hop leg serves the SAME generation as the primary
+      // (V4.1 Flash) — `deepseek/deepseek-v4.1-flash` is upstream
+      // "DeepSeek V4.1 Flash" ($0.15/$0.60 per M), where the previous slug
+      // `deepseek/deepseek-v4-flash` is upstream "DeepSeek V4 Flash 0423"
+      // ($0.0882/$0.1764 per M), i.e. a silent generation downgrade on failover.
+      { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
+      // Legacy-generation leg, kept LAST and RESOLUTION-ONLY (#727). It must
+      // stay in the table because nextLegAfter matches the CURRENT leg by table
+      // position: a leg absent from the table yields startIdx -1, and the walk
+      // then RESTARTS at legs[0] — so it can hand back a leg at or BEHIND the
+      // requested one (the #715 regression: the walk re-returned the root)
+      // instead of halting or stepping forward; which leg it lands on depends
+      // on what is unavailable at that moment. This entry exists so
+      // stale pre-#727 state (latch file / in-flight marker / session pinned to
+      // the slug) still matches its own leg, while RESOLUTION_ONLY_LEGS keeps it
+      // from ever being SERVED — neither as an advance target nor through
+      // resolution's latched-active fast path: pre-#727 the chain HALTED after
+      // the hop leg, and quietly re-introducing the 0423 generation as a live
+      // hop would be exactly the silent generation change #727 removes.
       { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
     ],
   },
@@ -277,7 +295,9 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
  *   2. per family (deterministic iteration order): the family's ROOT leg model
  *      (`fam.legs[0].model`, i.e. the canonical spelling) → that family key;
  *   3. the qwen-tp rename `deepseek-v4-flash-0731` → the flash family;
- *   4. openrouter/slash ids: last-slash slug match against the BASE slugs;
+ *   4. openrouter/slash ids: last-slash slug match against the BASE slugs
+ *      (deepseek-v4-flash, deepseek-v4.1-flash — the #727 hop leg, and
+ *      deepseek-v4-pro);
  *   5. otherwise undefined.
  *
  * The dotted canonical `deepseek/deepseek-flash` is deliberately NOT matched:
@@ -301,10 +321,20 @@ export function familyOf(modelId: string | null | undefined, provider?: string |
     if (id === fam.legs[0]?.model) return famKey;
   }
   if (id === "deepseek-v4-flash-0731") return "deepseek-v4-flash";
-  // openrouter slugs arrive as "deepseek/deepseek-v4-flash" (slash id). Only
-  // the BASE slug names hop (never -vision-exp / -0813 variants — see above).
+  // openrouter slugs arrive as "deepseek/<slug>" (slash id): the flash hop leg
+  // is the #727 V4.1 slug, and the legacy 0423 slug still resolves here for
+  // stale state. Only the BASE slug names hop (never -vision-exp / -0813
+  // variants — see above).
   if (provider === "openrouter" || id.includes("/")) {
     const slug = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+    // Both flash-family generations normalize onto the family: the #727 V4.1
+    // hop-leg slug and the legacy 0423 slug (stale state must still resolve).
+    // The V4.1 match requires the SLASH form: only `deepseek/deepseek-v4.1-flash`
+    // is an upstream OpenRouter id (the table leg), so the bare spelling stays
+    // family-less (pinned as a silent-substitution negative, review R4 P2). The
+    // legacy slug's bare form keeps its pre-existing leniency — grandfathering,
+    // NOT a pattern to extend.
+    if (slug === "deepseek-v4.1-flash" && id.includes("/")) return "deepseek-v4-flash";
     if (slug === "deepseek-v4-flash") return "deepseek-v4-flash";
     if (slug === "deepseek-v4-pro") return "deepseek-v4-pro";
   }
@@ -330,6 +360,36 @@ export function legIdentity(famKey: string, leg: LegRef): string {
 
 export function familyLegs(family: string): LegRef[] | undefined {
   return ALIAS_FAMILIES[family]?.legs;
+}
+
+/** Table legs kept for RESOLUTION ONLY — matchable by position (so stale state
+ * still finds its own leg) but NEVER the target of a fresh advance.
+ *
+ * Why the entry must exist anyway: `nextLegAfter` locates the current leg by
+ * table position, so a leg missing from the table gives startIdx -1 and the walk
+ * restarts at legs[0], able to re-serve a leg at or behind the requested one
+ * (#715's regression — the walk re-returned the root).
+ *
+ * Why it must not be advanceable: that walk is how a chain continuation picks
+ * its next leg, and serving a resolution-only leg is an automatic generation
+ * downgrade. #727: the flash family's hop target is the V4.1 openrouter leg; the
+ * older "DeepSeek V4 Flash 0423" slug stays resolvable for stale pre-#727 state,
+ * but the chain reaches a structured HALT after the V4.1 leg — the same place it
+ * halted before that leg existed.
+ *
+ * It is also never SERVED (not just never advanced onto): resolution's
+ * latched-active fast path serves `fam.activeLeg` directly without consulting
+ * the walk, and a PRE-#727 latch recorded this very leg as its activeLeg. The
+ * guard there is what stops a stale record from dispatching the downgraded
+ * build for up to the latch TTL — see the `isResolutionOnlyLeg` clause in
+ * resolveWithChain. */
+const RESOLUTION_ONLY_LEGS: ReadonlySet<string> = new Set(["openrouter/deepseek/deepseek-v4-flash"]);
+
+export function isResolutionOnlyLeg(leg: LegRef | null | undefined): boolean {
+  // Null-tolerant on purpose: callers hold `activeLeg` fields typed
+  // `LegRef | null` ("null = the primary is serving"), and a null deref here
+  // would surface as a throw on the dispatch path instead of a plain false.
+  return leg != null && RESOLUTION_ONLY_LEGS.has(`${leg.provider}/${leg.model}`);
 }
 
 /** Is `provider` a member of the family's chain table (root + hop legs)?
@@ -952,7 +1012,13 @@ export function rootPrimaryOfFamily(family: string | undefined): string | undefi
 export interface ChainStep {
   leg: LegRef | null;
   halted: boolean;
-  skipped: LegRef[]; // blocked legs skipped on the way (excluded-with-alert)
+  skipped: LegRef[]; // legs skipped on the way because they are UNAVAILABLE
+  // (env-blocked, durable auth block, or a provider holding a FRESH own
+  // exhaustion record) - excluded-with-alert.
+  resolutionOnly: LegRef[]; // legs skipped because they are RESOLUTION-ONLY
+  // (#727): table entries matched by position for stale state but never a serve
+  // target. Reported SEPARATELY so no diagnostic can mislabel an intentionally
+  // retired leg as blocked/exhausted.
 }
 
 export function nextLegAfter(
@@ -965,7 +1031,7 @@ export function nextLegAfter(
   const now = opts.now ?? Date.now();
   const ttl = opts.ttlMs ?? latchTtlMs(env);
   const legs = familyLegs(family);
-  if (!legs) return { leg: null, halted: true, skipped: [] };
+  if (!legs) return { leg: null, halted: true, skipped: [], resolutionOnly: [] };
   // Hop candidates = legs after `after`, minus: env-blocked ∪ durable auth
   // blocks ∪ providers holding a FRESH own exhaustion record (review R2 —
   // never advance INTO a freshly-exhausted provider).
@@ -976,15 +1042,23 @@ export function nextLegAfter(
   // and the walk re-returns the DRAINING root as the "next" leg.
   const startIdx = legs.findIndex((l) => l.provider === after.provider && l.model === legIdentity(family, after));
   const skipped: LegRef[] = [];
+  const resolutionOnly: LegRef[] = [];
   for (let i = startIdx + 1; i < legs.length; i++) {
     const leg = legs[i];
+    // Resolution-only first: it is a STATIC property of the leg (never a serve
+    // target by design), so a simultaneous provider block must not reclassify
+    // it as a transient outage in diagnostics.
+    if (isResolutionOnlyLeg(leg)) {
+      resolutionOnly.push(leg);
+      continue;
+    }
     if (unavailable.has(leg.provider)) {
       skipped.push(leg);
       continue;
     }
-    return { leg, halted: false, skipped };
+    return { leg, halted: false, skipped, resolutionOnly };
   }
-  return { leg: null, halted: true, skipped };
+  return { leg: null, halted: true, skipped, resolutionOnly };
 }
 
 /**
@@ -1003,6 +1077,13 @@ export function nextLegAfter(
  * same state from a root-ask resolves the final leg — conservative direction
  * (halt, never a wrong dispatch); the primary dispatch path always requests
  * the primary or the leg just used, so the disagreement is unreachable there.
+ * The SAME shape applies to a fresh family record whose `activeLeg` is null
+ * ("the primary is serving") and non-terminal: it takes neither the
+ * latched-active fast path nor the #727 root-retry (which is scoped to a
+ * RESOLUTION-ONLY frozen leg), so an explicit ask for the terminal usable leg
+ * halts while a root ask on the identical state resolves that leg. Unchanged
+ * from pre-#727 (the then-final leg behaved the same) and left conservative on
+ * purpose: halting never dispatches a wrong model, and the ask is explicit.
  */
 export interface ResolveOutcome {
   leg: LegRef | null;
@@ -1069,7 +1150,25 @@ export function resolveWithChain(
   if (fam?.terminal) {
     return { leg: null, halted: true, reason: "halt", hop: null };
   }
-  if (fam?.activeLeg && !unavailable.has(fam.activeLeg.provider)) {
+  // #727 serve-path guard: a latched activeLeg is served DIRECTLY (below),
+  // without the advance walk — and a PRE-#727 latch recorded the legacy-
+  // generation openrouter leg (deepseek/deepseek-v4-flash = upstream "V4 Flash
+  // 0423") as its activeLeg, exactly the silent downgrade #727 removes. Such a
+  // record has no migration path (only TTL self-heal), so treating it as
+  // unusable skips the fast path: resolution advances along the chain instead
+  // (retrying from the family ROOT if that walk halts — see below), which
+  // yields the family's first AVAILABLE leg (the V4.1 openrouter leg while
+  // `qwen-tp` stays config-blocked) whether the ask was the root, the current
+  // hop leg, or the retired slug itself — or a structured halt when nothing is
+  // left. Never the legacy build. The surviving must-stay shapes are the early
+  // returns that hand back `requested` verbatim: `clear` (no fresh latch at all),
+  // `no-hop` (PI_FAILOVER_NO_HOP=1) and `disabled` (PROVIDER_FAILOVER_DISABLE=1) —
+  // an explicit ask for this exact leg, never a failover decision.
+  if (
+    fam?.activeLeg &&
+    !unavailable.has(fam.activeLeg.provider) &&
+    !isResolutionOnlyLeg(fam.activeLeg)
+  ) {
     // #512 second-model P2: an OFF-TABLE record (venice) froze its family
     // activeLeg at drain time. Under a double-exhaustion (the deepseek root
     // was ALSO freshly latched when venice drained), that frozen leg is a
@@ -1097,8 +1196,22 @@ export function resolveWithChain(
     const hop = activeHop(requested, fam.activeLeg);
     return { leg: fam.activeLeg, halted: false, reason: "latched-active", hop };
   }
-  // advance from the requested leg along the chain
-  const step = nextLegAfter(family, requested, state, { env, now, ttlMs: ttl });
+  // advance along the chain. #727: with a RESOLUTION-ONLY frozen activeLeg a
+  // halt means "nothing usable AFTER the requested leg" — the wrong question
+  // when the requested leg IS the current hop target (or the retired slug
+  // itself). Re-ask from the family ROOT, the same computation the family makes
+  // with no activeLeg at all, so the answer is the current hop target instead of
+  // a halt with an available target sitting at it.
+  let step = nextLegAfter(family, requested, state, { env, now, ttlMs: ttl });
+  // `!= null`, NOT `!== undefined`: a family record legitimately carries
+  // `activeLeg: null` ("the primary is serving"), which is not a retired leg and
+  // must not take the retry. Belt-and-braces with the predicate's own
+  // null-tolerance (see isResolutionOnlyLeg) so that adding an untolerant call
+  // site later cannot reintroduce a null deref on the dispatch path.
+  if (step.halted && fam?.activeLeg != null && isResolutionOnlyLeg(fam.activeLeg)) {
+    const rootLeg = familyLegs(family)?.[0];
+    if (rootLeg) step = nextLegAfter(family, rootLeg, state, { env, now, ttlMs: ttl });
+  }
   if (step.halted) return { leg: null, halted: true, reason: "halt", hop: null };
   const hop = activeHop(requested, step.leg!);
   return { leg: step.leg, halted: false, reason: "latched-advance", hop };
