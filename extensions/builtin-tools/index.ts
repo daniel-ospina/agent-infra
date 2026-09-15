@@ -1682,11 +1682,52 @@ export function getTaskMaxDispatchMs(): number {
  * tick interval (37.5s at the 30s default) — worst case 37.5s + one 10s
  * decision tick + ≤5s kill escalation + 2s grace ≈ 54.5s ≤ 60s. Floor 15s
  * (fast test bounds: interval floor is 5s). TASK_HEARTBEAT_CUT_GAP_MS
- * overrides; 0/NaN → default (never disable the detector via a bad env value). */
+ * overrides; 0/NaN → default (never disable the detector via a bad env value).
+ *
+ * #1070: this is the STATIC base. The loop reads `getEffectiveCutGapMs`, which
+ * load-scales it (1x/2x/3x, `TASK_LOAD_SCALE_OFF=1` → 1x) unless
+ * TASK_HEARTBEAT_CUT_GAP_MS is explicit — so the ≤60s figure above holds at 1x
+ * only. At 2x/3x the bound is 75s/112.5s, i.e. a worst-case resolve of ~129.5s
+ * (112.5s + tick + kill escalation + grace) BY DESIGN. An explicit override is
+ * honoured verbatim and never rescaled; pinning it is how a test gets a
+ * host-independent bound.
+ *
+ * Reachability invariant: the clause is gated by `stateFresh`
+ * (markerAge <= max(2*T, 2*interval)), so a scaled gap >= that window makes it
+ * structurally unreachable. Safe at the shipped defaults (T = 30min → window
+ * 60min, ~30x the 3x gap); the loop warns when an override crosses it. */
 export function getCutGapMs(): number {
   const raw = Number(process.env.TASK_HEARTBEAT_CUT_GAP_MS);
   const fallback = Math.round(1.25 * getHeartbeatIntervalMs());
   return Math.max(15_000, Number.isFinite(raw) && raw > 0 ? raw : fallback);
+}
+
+/** #1070: the *effective* cut gap — load-scaled and per-dispatch monotonic,
+ * following the #272 firstMessageMs treatment — same bands, same per-dispatch
+ * monotonic latch. firstMessageMs is scaled INSIDE heartbeatKillDecision (the
+ * caller passes the base + the latch); this bound is scaled by the CALLER, and an
+ * explicit TASK_HEARTBEAT_CUT_GAP_MS is not rescaled (see below).
+ *
+ * `loadScaledBound` (#209) was consumed by `firstMessageMs` alone, so the cut
+ * gap — unlike the first-message bound — stayed flat while firstMessageMs
+ * self-escalated 300s -> 900s in the same dispatch.
+ *
+ * An explicit TASK_HEARTBEAT_CUT_GAP_MS override is honoured verbatim: an
+ * operator who names a number means it, and silently rescaling it would make
+ * the override lie. Only the *derived* default is scaled.
+ *
+ * The latch never shrinks within a dispatch (a storm starting mid-dispatch
+ * extends the window; a post-storm load drop never re-cuts).
+ *
+ * Scope note: this scales WHEN the cut fires. Whether the clause should read
+ * the marker clock at all (rather than a life-sign clock) is tracked on #1070
+ * and is deliberately NOT changed here. */
+export function getEffectiveCutGapMs(latched?: number, load = getLoad1()): number {
+  const raw = Number(process.env.TASK_HEARTBEAT_CUT_GAP_MS);
+  const explicit = Number.isFinite(raw) && raw > 0;
+  const base = getCutGapMs();
+  const scaled = explicit ? base : loadScaledBound(base, load);
+  return latched === undefined ? scaled : Math.max(latched, scaled);
 }
 
 // ── #271: backstop + exit taxonomy ──────────────────────────────────
@@ -2238,7 +2279,12 @@ export interface HeartbeatDecisionInput {
   latchedFirstMessageMs?: number;
 
   /** #271: marker-gap cut deadline — liveness-loss detector for the wedged-
-   * alive class (markers stopped while a tool is in flight). See D1. */
+   * alive class (markers stopped while a tool is in flight). See D1.
+   * #1070: callers MUST pass the EFFECTIVE (load-scaled + latched) gap —
+   * `getEffectiveCutGapMs(latched, load1)` — never the bare `getCutGapMs()`,
+   * which is only the static base. Unlike `firstMessageMs` (scaled inside this
+   * function, next to `latchedFirstMessageMs`), the scaling for this bound is
+   * owned by the CALLER, so passing the base silently drops load scaling. */
   cutGapMs: number;
 
   /** #318: network is unreachable (probe failed). When true AND heartbeat
@@ -2692,6 +2738,11 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // Clamped ≥ 60s: negative/zero/NaN/Infinity env values can't disable
     // the kill path or kill productive agents instantly (#489).
     const HEARTBEAT_TIMEOUT_MS = Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000);
+    // #1070: the fresh-marker window that `stateFresh` compares markerAge
+    // against — heartbeatKillDecision computes that window inline from these
+    // same two values. Hoisted so the cut-gap reachability warning and the
+    // backstop timer read the identical number.
+    const freshWindowMs = Math.max(2 * HEARTBEAT_TIMEOUT_MS, 2 * getHeartbeatIntervalMs());
     const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
     let hasOutput = false;
     // #783 Task 2: repo state is probed ONCE per dispatch (async, off the 10s
@@ -3006,7 +3057,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
         {
           headline: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`,
+          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`,
           stderrSection: { delimiter: "--- last stderr ---", slice: 2000, trimFirst: false, omitWhenEmpty: false },
           stdoutSection: { delimiter: "--- last stdout ---", slice: 500, trimFirst: false, omitWhenEmpty: false },
         },
@@ -3028,6 +3079,9 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       maxDispatchMs: getTaskMaxDispatchMs(),
       // #271: marker-gap cut deadline — liveness-loss detector for the
       // wedged-alive class (markers stopped while a tool is in flight). See D1.
+      // #1070: base only — both heartbeatKillDecision call sites override this
+      // with the per-tick load-scaled + latched `effCutGapMs` (the caller owns
+      // scaling, mirroring firstMessageMs above: getFirstMessageMs()).
       cutGapMs: getCutGapMs(),
     };
 
@@ -3085,7 +3139,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // zero-partial cut stays retryable by the retry wrapper, mirroring
         // the kill-clause contract.
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
         doResolve(
           !hasOutput
@@ -3124,6 +3178,14 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // only ever grows (a storm starting mid-dispatch extends the bound; a
     // post-storm load drop never re-cuts); [task] log on real increase.
     let latchedEffM: number | undefined;
+    // #1070: per-dispatch monotonic latch of the effective cut gap, mirroring
+    // latchedEffM above. Threaded in via the caller-passed `cutGapMs` so the
+    // cut clause and its headline report the SAME scaled value.
+    let latchedCutGapM: number | undefined;
+    // #1070: one-shot latch for the cut-gap reachability warning below (the
+    // condition is per-dispatch, not per-tick — an unlatched warn would spam
+    // every 10s decision tick).
+    let cutInertWarned = false;
     // #318: network-aware kill suppression — before honoring a stall-kill,
     // probe connectivity to the sub-agent's provider. When the network is
     // unreachable and the child is alive (fresh heartbeat markers), the
@@ -3192,6 +3254,30 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // parsed alive state. sessionEnded short-circuits at the top of the
       // decision.
       const load1 = getLoad1();
+      // #1070: the cut gap is load-scaled + latched like firstMessageMs. The
+      // effective value is passed as `cutGapMs`, overriding the hbThresholds
+      // spread, so the clause and its headline agree on the scaled bound.
+      const effCutGapMs = getEffectiveCutGapMs(latchedCutGapM, load1);
+      if (latchedCutGapM !== undefined && effCutGapMs > latchedCutGapM) {
+        console.error(
+          `[task] cut-gap bound ${Math.round(latchedCutGapM / 1000)}s -> ${Math.round(effCutGapMs / 1000)}s (load1=${load1})`,
+        );
+      }
+      latchedCutGapM = effCutGapMs;
+      // #1070 reachability invariant: the cut clause is gated by `stateFresh`
+      // (markerAge <= freshWindowMs) and fires only when markerAge > cutGapMs.
+      // A scaled gap >= the window therefore makes the clause structurally
+      // unreachable for the whole dispatch — a detector that is silently dead.
+      // Unreachable at the shipped defaults (T = 30min); it takes a
+      // `TASK_HEARTBEAT_TIMEOUT_MS` override (e.g. interval 60s + T 60s → 2x
+      // gap 150s already > window 120s). Warn rather than clamp: clamping the bound
+      // changes kill timing, which is a deliberate-behaviour decision.
+      if (!cutInertWarned && effCutGapMs >= freshWindowMs) {
+        cutInertWarned = true;
+        console.error(
+          `[task] cut-gap bound ${Math.round(effCutGapMs / 1000)}s >= the stateFresh window ${Math.round(freshWindowMs / 1000)}s — the cut clause cannot fire for this dispatch; raise TASK_HEARTBEAT_TIMEOUT_MS, lower TASK_HEARTBEAT_CUT_GAP_MS, or rely on the tool-stall/backstop bounds`,
+        );
+      }
       const decision = heartbeatKillDecision({
         now,
         startedAt,
@@ -3200,6 +3286,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         state: hbCtx.state,
         ...hbThresholds,
         load1,
+        cutGapMs: effCutGapMs,
         latchedFirstMessageMs: latchedEffM,
         networkDown: networkWaitEnabled ? networkDown : undefined,
       });
@@ -3228,6 +3315,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
               state: hbCtx.state,
               ...hbThresholds,
               load1,
+              cutGapMs: effCutGapMs,
               latchedFirstMessageMs: latchedEffM,
               networkDown: true,
             });
@@ -3271,15 +3359,24 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       }
 
       const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+      // #1070 item 1, applied to the HEADLINE as well as the payload. The
+      // clauses below fire on the EFFECTIVE ages (`effStreamAge`/`effToolAge`
+      // in heartbeatKillDecision = the frozen sample + markerAge), and §6 of
+      // docs/ops/load-policy.md already pins that rule for the bound ("the kill
+      // headline shows the EFFECTIVE bound"). Printing the raw sample in the
+      // headline made a 16-minute-old `streamAgeMs=1` read as live, and now
+      // contradicts the `effStreamAgeMs` in the payload beside it.
+      const effStreamAgeMs = hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0);
+      const effToolAgeMs = hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0);
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s) — treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(hbCtx.state.toolAgeMaxMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s) — treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(effToolAgeMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "max-dispatch": `⚠️ Sub-agent exceeded the total dispatch cap (${Math.round(hbThresholds.maxDispatchMs / 1000)}s, TASK_MAX_DISPATCH_MS). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(markerAgeMs / 1000)}s (marker gap exceeded ${Math.round(hbThresholds.cutGapMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(markerAgeMs / 1000)}s (marker gap exceeded ${Math.round(effCutGapMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
       };
       // #282: first-message-stall triage line — every clause-4 kill is a
       // never-worked session by construction (#279 gate); record the run's
@@ -3290,7 +3387,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // aliveSummary above.
       if (decision.reason === "first-message-stall") {
         console.error(
-          `[task] first-message-stall diagnostic: elapsedMs=${Math.round(hbCtx.state.streamAgeMs / 1000)}s tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] bound=${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s`,
+          `[task] first-message-stall diagnostic: elapsedMs=${Math.round(effStreamAgeMs / 1000)}s tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] bound=${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s`,
         );
       }
       doResolve(composeAbnormalExit(
@@ -3314,7 +3411,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // stateFresh-gated) fires first — the backstop engages only when
     // env-overridden below the hard cap.
     const backstopMs = getTaskBackstopMs();
-    const freshWindowMs = Math.max(2 * HEARTBEAT_TIMEOUT_MS, 2 * getHeartbeatIntervalMs());
+    // (#1070: `freshWindowMs` is hoisted next to HEARTBEAT_TIMEOUT_MS.)
     if (backstopMs > 0) {
       const backstopFire = () => {
         if (settled) return;
@@ -3336,7 +3433,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           return;
         }
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
         doResolve(composeAbnormalExit(
           { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
           {

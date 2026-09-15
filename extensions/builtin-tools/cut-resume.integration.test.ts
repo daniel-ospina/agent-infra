@@ -31,7 +31,9 @@
  * (timeout-integration precedent). subAgentEnv carries TASK_HEARTBEAT=1 (the
  * parent generates + injects TASK_HEARTBEAT_NONCE); the fake pi reads the
  * nonce and emits authentic markers. Short bounds:
- * TASK_HEARTBEAT_INTERVAL_MS=5000 (floor) → cutGap floor 15s.
+ * TASK_HEARTBEAT_INTERVAL_MS=5000 (floor) → cutGap floor 15s, and
+ * TASK_HEARTBEAT_CUT_GAP_MS=15000 pinned explicitly so the load-scaled bound
+ * (#1070) cannot stretch the gap on a loaded host and blow AC10's <60s assert.
  *
  * Run: npx tsx extensions/builtin-tools/cut-resume.integration.test.ts
  */
@@ -159,6 +161,12 @@ let tmpDir: string;
 let savedPath: string;
 let savedArgv1: string;
 let savedInterval: string | undefined;
+// #1070: the cut gap is load-scaled, so a host at loadavg >= 8 would push this
+// suite's 15s base to 30s/45s and blow AC10's `elapsedMs < 60_000` assert on a
+// loaded host (the case #1070 addresses). Pin it explicitly — an explicit
+// TASK_HEARTBEAT_CUT_GAP_MS is honoured verbatim and never rescaled, which is
+// the same pin the sibling suites use (task-cap-handoff / dispatch-record).
+let savedCutGap: string | undefined;
 let savedSweep: string | undefined;
 let savedDetached: string | undefined;
 // #783 Task 4: spawnSubAgent now writes a durable `dispatch-outcome` row to
@@ -182,6 +190,8 @@ function setup() {
 	process.argv[1] = undefined as unknown as string;
 	savedInterval = process.env.TASK_HEARTBEAT_INTERVAL_MS;
 	process.env.TASK_HEARTBEAT_INTERVAL_MS = "5000";
+	savedCutGap = process.env.TASK_HEARTBEAT_CUT_GAP_MS;
+	process.env.TASK_HEARTBEAT_CUT_GAP_MS = "15000";
 	// #783 Task 4: hermetic dispatch-outcome ledger — never the operator's.
 	savedAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = path.join(tmpDir, "agent-dir");
@@ -204,6 +214,8 @@ function teardown() {
 	process.argv[1] = savedArgv1;
 	if (savedInterval === undefined) delete process.env.TASK_HEARTBEAT_INTERVAL_MS;
 	else process.env.TASK_HEARTBEAT_INTERVAL_MS = savedInterval;
+	if (savedCutGap === undefined) delete process.env.TASK_HEARTBEAT_CUT_GAP_MS;
+	else process.env.TASK_HEARTBEAT_CUT_GAP_MS = savedCutGap;
 	if (savedSweep === undefined) delete process.env.TASK_SWEEP;
 	else process.env.TASK_SWEEP = savedSweep;
 	if (savedDetached === undefined) delete process.env.TASK_DETACHED;
