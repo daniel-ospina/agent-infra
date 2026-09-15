@@ -102,17 +102,32 @@ Each sub-skill returns JSON:
     {
       "name": "Journey: Primera Visita — Step 1",
       "status": "pass|fail",
+      "validated": 25,
+      "total": 25,
+      "skipped": [{"reason": "no schema", "count": 3}],
       "error": "only if fail",
       "screenshot": "path (optional)",
       "duration_ms": 0
     }
   ],
+  "not_offered": [
+    {"name": "ci-config", "reason": "no workflow YAML present"}
+  ],
+  "reason": "only if status=skip",
   "evidence": [
-    {"type": "screenshot|log", "path": "...", "description": "..."}
+    {"type": "screenshot|log", "path": "...(optional)", "description": "..."}
   ],
   "issues_filed": [123]
 }
 ```
+
+`not_offered` records checks whose target surface is absent — the `reason` is only ever an
+absent-target reason, never a tooling reason; the surface-level `reason` is set **only** when
+`status` is `skip` (no check was offered at all). `validated`/`total` and `skipped` are additive
+(optional) and describe how much of a check's matched set was actually validated. A `pass` is only
+meaningful alongside those counts: `"pass"` with `validated` < `total` (or with `not_offered`
+entries) means **partial coverage**, not a clean surface. `evidence` carries the not-offered log
+entries, which is where a reason is rendered.
 
 **Report format:**
 
@@ -126,8 +141,26 @@ Each sub-skill returns JSON:
 | infra   | ✅ pass | 3/3    | —      |
 ```
 
+A row is **partial** when the sub-skill's `status` is `pass` **and** it reported `not_offered`
+entries **or** any check whose `validated` < `total`. Render that as `✅ pass (partial)` with a
+`Checks` cell of `N/M (+K not offered)`, where `N` = offered checks that passed, `M` = offered
+checks, and `K` = the `not_offered` count; a short per-check count is shown in the row's evidence
+note as `validated X/T` (`T` = that check's own matched-set total), never folded into `N/M`.
+**A row whose `status` is `fail` always renders `⚠️ fail`** —
+the not-offered count may be appended to its `Checks` cell, but never to its status. The `Issues`
+column holds GitHub issue numbers only — never a note or a reason.
+
+A surface with **no covering check** is not the same state as a check whose target set is absent, and
+the router must not imply one from the other. A detected-but-uncovered surface still reports `pass`
+against the repo's other trees — the checks are **repo-scoped, not diff-scoped** — which is a known
+fail-open (tracked by #1052), not a clean run.
+
+A `skip` row renders its surface-level `reason` as a note under the table (the `Issues` column stays
+reserved for issue numbers), so a skipped surface is never reported without saying why.
+
 **All pass:** "✅ Post-deploy verification: all surfaces passed."
-**Some fail:** "⚠️ Post-deploy verification: N/M surfaces passed. Failures: <list>"
+**All pass, but partial coverage:** "⚠️ Post-deploy verification: all offered surfaces passed." followed by the applicable clauses — when `K > 0`, "K check(s) not offered — <names>; surface(s) with unverified targets: <list>"; and when any check reported `validated` < `total`, "J check(s) only partially validated — <names>", where `J` is the count of such checks. Symbols, each scoped on use: `N`/`M` = offered checks passed / offered checks in the report's `Checks` cell, and surfaces passed / surfaces in the `Some fail` line (**the one pair reused across two scopes**); `K` = the `not_offered` count; `J` = checks partially validated; `X`/`T` = a single check's validated / matched-set total. A partial run never uses the plain all-pass line.
+**Some fail:** "⚠️ Post-deploy verification: N/M surfaces passed. Failures: <list>" (here `N`/`M` count **surfaces**, not checks)
 **All fail/skip:** "⏭️ Post-deploy verification: no verification run"
 
 ### Step 4 — File Issues for Failures
