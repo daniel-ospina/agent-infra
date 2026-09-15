@@ -393,9 +393,11 @@ in the gate files was given the field. Any **total** here is a moving target —
 a site changes it — so the figure is revision-anchored rather than quoted as a present state. **At
 `f8100f9`**, the commit that completed the inline-schema pass, it was **30 sites**: `code-review` (16),
 `plan-review` (5), `test-review` (4), `issue-scoping` (2), `prototype-review` (1),
-`verification-before-completion` (1), `research` (1). The set then grew — `executing-plans` (cycle 4) and
-the four `plan-review/references/reviewers/*.md` (cycle 7) — so **at this head the changed files carry
-35 such lines, 31 of them in the 17 gate `SKILL.md` files**. The binding evidence is §4.4a check (1a):
+`verification-before-completion` (1), `research` (1). Later cycles added the sites the first pass missed — `executing-plans`'
+verification sub-agent schema in cycle 3 (`b349210`) and the four `plan-review/references/reviewers/*.md`
+in cycle 4 (`0a3d7ad`) — so **at HEAD the changed files carry 35 such lines, 31 of them in the 17 gate
+`SKILL.md` files**; that figure moves as cycles add sites, which is why the binding evidence is the check
+below rather than this total. The binding evidence is §4.4a check (1a):
 every `severity:` schema line is followed by a `consequence:` line, which returns **0** violations; no
 total recorded in prose is load-bearing. This is the point a reviewer caught: a blockquote at the top of the file does not put a
 field into the prompt template an inlined reviewer copies.
