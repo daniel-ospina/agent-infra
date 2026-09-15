@@ -547,6 +547,8 @@ fi
 
 **Gate:** If verifier returns issues, fix and re-dispatch (max 2 retries). Do NOT proceed to the next batch until zero issues remain. On 3rd failure: surface to user.
 
+**Conformance floor (canonical: `proportional-gates` §Findings Must Declare Consequence).** A consequence-less ISSUE block is **advisory**: it never blocks, never counts toward this gate, and is never filed as an issue. A cycle that returns ≥1 ISSUE block and **none** carrying an adequate `consequence:` is malformed reviewer output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. Where this gate's retry budget is already spent, record the marker and exit non-clean without the extra dispatch.
+
 
 </HARD-GATE>
 
@@ -565,7 +567,6 @@ Use the same model as the current session — omit the `model` parameter or pass
 4. Return ISSUE blocks (zero issues = CLEAN) with unmet criteria + failing tests, plus optional JSON sidecar with file hashes — each ISSUE block must carry `consequence: <what breaks, who observes it>` (REQUIRED; without it the finding is advisory only: never blocking, never counted toward this gate, never filed as an issue)
 
 **On issues found:** Fix them, then re-dispatch verification (max 2 retries). On 3rd failure → the orchestrator (you, the main session) takes over:
-
 1. Read the unmet criteria and failing tests
 2. Fix the issues directly (you have full context the verification sub-agent lacked)
 3. Re-run verification

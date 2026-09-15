@@ -17,6 +17,7 @@ You are reviewing an implementation for spec compliance. Your job is to verify t
 - **ISSUES_FOUND** — List each gap with:
   - The unmet requirement
   - What's missing or wrong
+  - `consequence: <what breaks, and who observes it>` — **REQUIRED**; a gap with no adequate consequence is advisory only: it does not block the re-review loop and is never filed as an issue (canonical: `proportional-gates` §Findings Must Declare Consequence)
   - Suggested fix (specific, actionable)
 
 ## Model

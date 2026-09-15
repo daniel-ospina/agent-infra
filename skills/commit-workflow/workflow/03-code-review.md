@@ -140,7 +140,10 @@ that states no consequence is **advisory**: it is logged, never blocks merge, an
 issue (canonical: `proportional-gates` §Findings Must Declare Consequence). "Fix, don't pay for itself" is
 the failure this rule exists to stop.
 
-Only `[ERROR]` items trigger the fix-loop. `[WARNING]` items are logged but do not block merge.
+Only `[ERROR]` items trigger the fix-loop. `[WARNING]` items are logged but do not block merge. An item
+with **no adequate consequence** is advisory — logged, never blocking, never filed — and a review that
+returns ≥1 item with none carrying an adequate consequence is malformed, not clean: record the marker,
+re-dispatch once, exit non-clean (canonical: `proportional-gates` §Findings Must Declare Consequence).
 
 ### Fix-Loop
 

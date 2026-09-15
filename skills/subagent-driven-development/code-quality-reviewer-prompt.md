@@ -14,6 +14,7 @@ You are reviewing implemented code for quality, correctness, and maintainability
 - **APPROVED** — Code quality is good. Include any optional improvement suggestions.
 - **ISSUES_FOUND** — List each issue with:
   - Priority (P0 = must-fix, P1 = should-fix, P2 = nice-to-have)
+  - `consequence: <what breaks, and who observes it>` — **REQUIRED**; an issue with no adequate consequence is advisory only: it does not block the approve/re-review loop and is never filed as an issue (canonical: `proportional-gates` §Findings Must Declare Consequence)
   - File and location
   - What's wrong
   - Suggested fix

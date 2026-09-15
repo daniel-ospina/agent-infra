@@ -202,6 +202,14 @@ Implementer subagents report one of four statuses. Handle each appropriately:
 - `./spec-reviewer-prompt.md` - Dispatch spec compliance reviewer subagent
 - `./code-quality-reviewer-prompt.md` - Dispatch code quality reviewer subagent
 
+**Review-loop contract (canonical: `proportional-gates` §Findings Must Declare Consequence).** Every issue
+the spec reviewer or the code-quality reviewer returns must declare
+`consequence: <what breaks, who observes it>`. Without an adequate one the issue is **advisory**: it does
+not block the re-review loop and is never filed as an issue. A review round that returns ≥1 issue and
+**none** carrying an adequate consequence is malformed reviewer output, not a clean round: record
+`⚠️ reviewer returned N consequence-less findings`, re-dispatch that reviewer once, and exit the loop
+**non-clean**. A round with zero issues is clean.
+
 ## Example Workflow
 
 ```

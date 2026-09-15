@@ -169,7 +169,7 @@ which source was unavailable. A DEGRADED result is not a clean pass.
 Return the skill's summary block, then:
   NO ISSUES FOUND — CLEAN
   or  NO ISSUES FOUND — DEGRADED (<source> unavailable)
-  or  ISSUES: <list using the skill's output block>
+  or  ISSUES: <list using the skill's output block — every item carries `consequence: <what breaks, who observes it>`; without it the item is advisory only: never blocking, never counted, never filed>
 ```
 
 **Disposition (this is what keeps it advisory without creating a spin loop):**
