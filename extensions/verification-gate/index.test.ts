@@ -15,6 +15,9 @@ import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFile
 import { join, sep, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+// #966: the shared parser module — the drift-pin below asserts this extension's
+// exported helpers ARE these functions (one copy, not a lookalike).
+import * as sharedParse from "../shared/git-command-parse.js";
 
 let passed = 0;
 let failed = 0;
@@ -454,58 +457,94 @@ test("rejects substring match in longer word", () => {
 
 // ── Module load regression ───────────────────────────
 
-section("extractCdPath — worktree cwd detection");
+// ── Drift-pin: ONE copy of the command parsers (#966) ─
+//
+// The behavioural truth table for the four helpers (and the delete-the-wrong-
+// pin fix for `cd /a && cd /b`, plus the #960 newline-terminated cd) now lives
+// in the shared suite: extensions/shared/git-command-parse.test.ts. What must
+// be pinned HERE is that this extension has no private copy to drift again —
+// the copies drifted silently for a month and the two suites ended up
+// asserting OPPOSITE answers for the same input.
 
-test("extracts path from cd && pattern", () => {
-  const result = extractCdPath("cd /some/worktree && git commit -m test");
-  ok(result !== null);
-  ok(result!.endsWith("/some/worktree"));
+section("drift-pin — shared command parsers (#966)");
+
+test("the four helpers ARE the shared module's functions (no per-extension copy)", () => {
+  equal(extractCdPath, sharedParse.extractCdPath, "extractCdPath");
+  equal(extractRepoFlag, sharedParse.extractRepoFlag, "extractRepoFlag");
+  equal(extractGhRepoEnv, sharedParse.extractGhRepoEnv, "extractGhRepoEnv");
+  equal(extractPrNumber, sharedParse.extractPrNumber, "extractPrNumber");
 });
 
-test("extracts path from cd ; pattern", () => {
-  const result = extractCdPath("cd /tmp ; git push");
-  ok(result !== null);
-  ok(result!.endsWith("/tmp"));
+/** Does `src` DECLARE a local copy of `helper`? Declaration-form-agnostic: a
+ * `function` / `async function` / `export default function`, or a `const`/`let`/
+ * `var` with an optional TYPE ANNOTATION between the name and `=`. Scanning only
+ * `function` let the idiomatic TS forms through. The scan is over RAW text, so a
+ * COMMENT that quotes a declaration also trips it — deliberate: the guard fails
+ * CLOSED (a false positive costs a look; a miss re-opens #966). The one shape it
+ * cannot see is a copy relocated to a sibling module and imported under the same
+ * name, for the helpers neither extension re-exports (recorded residual). */
+function declaresHelper(src: string, helper: string): boolean {
+  return new RegExp(
+    `(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${helper}\\b` +
+      `|(?:const|let|var)\\s+${helper}\\s*(?::[^=;]*)?=`,
+  ).test(src);
+}
+
+test("the declaration scan detects every form it claims — and only those", () => {
+  // A guard only ever run against today's CLEAN sources cannot fail when the
+  // regex is weakened: it would drift OPEN silently. Pin the detector itself.
+  for (const positive of [
+    "function extractCdPath(cmd: string) { return null; }",
+    "export function extractCdPath(cmd: string) { return null; }",
+    "async function extractCdPath(cmd: string) { return null; }",
+    "export default function extractCdPath(cmd: string) { return null; }",
+    "const extractCdPath = (cmd: string) => null;",
+    "const extractCdPath: CdParser = (cmd) => null;",
+    "const extractCdPath: (c: string) => string | null = (c) => null;",
+    "let extractCdPath = function (cmd: string) { return null; };",
+    "var extractCdPath = (cmd) => null;",
+    // RAW-text scan ⇒ a comment quoting a declaration also trips it (fail-closed).
+    "// const extractCdPath = old copy;",
+  ]) {
+    ok(declaresHelper(positive, "extractCdPath"), `must detect: ${positive}`);
+  }
+  for (const decoy of [
+    "const extractCdPathRegex = /x/;",
+    "const myExtractCdPath = 1;",
+    "const x = extractCdPath(cmd);",
+    'import { extractCdPath } from "../shared/git-command-parse.js";',
+    "export { extractCdPath, extractPrNumber };",
+  ]) {
+    ok(!declaresHelper(decoy, "extractCdPath"), `must ignore: ${decoy}`);
+  }
 });
 
-test("extracts quoted path", () => {
-  const result = extractCdPath("cd '/path with spaces' && git commit");
-  ok(result !== null);
-  ok(result!.endsWith("/path with spaces"));
-});
-
-test("returns null for non-cd command", () => {
-  equal(extractCdPath("git commit -m test"), null);
-});
-
-test("returns null for cd without git op suffix", () => {
-  // The regex requires && or ; after the cd path to avoid false positives
-  equal(extractCdPath("cd /tmp"), null);
-});
-
-test("cd inside quoted prose does not poison cwd (P2-2 fix)", () => {
-  equal(extractCdPath('gh pr merge 1 --comment "see cd /tmp && x"'), null);
-  equal(extractCdPath("git commit -m 'run cd /tmp && fix'"), null);
-});
-
-test("cd after a command separator is still detected (P2-2 fix)", () => {
-  ok(extractCdPath("echo x && cd /tmp && git commit")!.endsWith("/tmp"));
-  ok(extractCdPath("cd /a && cd /b && git commit")!.endsWith("/a")); // first boundary-anchored cd wins
-});
-
-test("cd after a bare newline separator is detected (cycle-4 P2-1 fix)", () => {
-  ok(extractCdPath("echo hello\ncd /tmp && git commit")!.endsWith("/tmp"));
-});
-test("review 230 P2-3: quoted prose cd shapes never poison cwd", () => {
-  equal(extractCdPath('gh pr merge 1 --comment "see; cd /tmp && x"'), null);
-  equal(extractCdPath('gh pr merge 1 --body "first\ncd /tmp && second"'), null);
-  ok(extractCdPath('cd "/path with spaces" && git commit')!.endsWith("/path with spaces"));
-});
-
-test("review 230 P2-2: HOST/OWNER/REPO forms normalize to OWNER/REPO", () => {
-  equal(extractGhRepoEnv("GH_REPO=github.com/owner/repo gh pr merge 123"), "owner/repo");
-  equal(extractGhRepoEnv("GH_REPO=a/b/c/d gh pr merge 123"), null);
-  equal(extractRepoFlag("gh pr merge 123 --repo github.com/owner/repo"), "owner/repo");
+test("neither extension declares a local copy of the command parsers (#966)", () => {
+  const sources: Array<[string, string]> = [
+    ["verification-gate", readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8")],
+    ["review-enforcer", readFileSync(fileURLToPath(new URL("../review-enforcer/index.ts", import.meta.url)), "utf-8")],
+  ];
+  for (const [name, src] of sources) {
+    ok(src.includes("shared/git-command-parse.js"), `${name} must import the shared parser`);
+    for (const helper of [
+      "extractCdPath",
+      "extractRepoFlag",
+      "extractGhRepoEnv",
+      "extractPrNumber",
+      "parseCdChains",
+      "expandCdTarget",
+      // The quote model was promoted to shared on the #966 merge — review-enforcer's
+      // `matchUnquoted` / `countUnquotedMergeVerbs` and the shared masked PR scan are
+      // consumers of ONE model, so a local re-declaration here is the drift again.
+      "unquotedMask",
+      // The verb grammar is a shared export too (this extension's merge window
+      // matches on it). It is a `const` regex, so only the declaration scan above
+      // can see a re-declaration.
+      "GH_PR_MERGE_VERB",
+    ]) {
+      ok(!declaresHelper(src, helper), `${name} must not declare a local ${helper} (#966: one copy only)`);
+    }
+  }
 });
 
 // ── Module load regression ───────────────────────────
@@ -848,35 +887,11 @@ test("VGATE PASS overwrites even when path not in lastBlockedFiles", () => {
 
 // ── #204: gh pr merge scope — PR repo resolution ─────
 
-section("extractRepoFlag / extractGhRepoEnv — PR repo resolution (#204)");
-
-test("extractRepoFlag: --repo owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 123 --repo acme/widget"), "acme/widget");
-});
-
-test("extractRepoFlag: -R owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 123 -R acme/widget --squash"), "acme/widget");
-});
-
-test("extractRepoFlag: --repo=owner/name (equals form)", () => {
-  equal(extractRepoFlag("gh pr merge 123 --repo=acme/widget"), "acme/widget");
-});
-
-test("extractRepoFlag: absent → null", () => {
-  equal(extractRepoFlag("gh pr merge 123"), null);
-});
-
-test("extractRepoFlag: does not match git remote args", () => {
-  equal(extractRepoFlag("git remote add origin git@github.com:a/b.git"), null);
-});
-
-test("extractGhRepoEnv: GH_REPO=owner/name prefix", () => {
-  equal(extractGhRepoEnv("GH_REPO=acme/widget gh pr merge 123"), "acme/widget");
-});
-
-test("extractGhRepoEnv: absent → null", () => {
-  equal(extractGhRepoEnv("gh pr merge 123"), null);
-});
+section("repo context priority — PR repo resolution (#204)");
+// The helper-level cases for extractRepoFlag/extractGhRepoEnv (the
+// [HOST/]OWNER/REPO normalization and the garbage-identity fail-closed rule)
+// live in the shared suite. This pins the resolution ORDER the merge-scope
+// path depends on.
 
 test("repo priority: flag beats env when both present", () => {
   const command = "GH_REPO=env/repo gh pr merge 123 --repo flag/repo";
@@ -936,37 +951,6 @@ test("trailing slash / .git forms never yield a garbage identity (P2 fix)", () =
 test("local path remote → null (fail-closed, no accidental skip)", () => {
   equal(repoNameFromRemote("/tmp/some/repo.git"), null);
   equal(repoNameFromRemote("relative/path"), null);
-});
-
-// ── #204: extractPrNumber ─────────────────────────────
-
-section("extractPrNumber — PR number from merge command (#204)");
-
-test("extracts PR number from gh pr merge", () => {
-  equal(extractPrNumber("gh pr merge 123 --squash"), 123);
-});
-
-test("extracts PR number after cd prefix", () => {
-  equal(extractPrNumber("cd /wt && gh pr merge 42"), 42);
-});
-
-test("extracts PR number when flags precede the number (P2 fix: gh pr merge --squash 123)", () => {
-  equal(extractPrNumber("gh pr merge --squash 123"), 123);
-});
-
-test("extracts PR number with flags + cd prefix in either order", () => {
-  equal(extractPrNumber("cd /wt && gh pr merge --repo x/y 42"), 42);
-  equal(extractPrNumber("gh pr merge -R x/y --squash 7"), 7);
-});
-
-test("extracts PR number with global -R flag before the verb (P2-1 fix)", () => {
-  equal(extractPrNumber("gh -R owner/name pr merge 123"), 123);
-  equal(extractPrNumber("GH_REPO=a/b gh --repo=owner/name pr merge 456"), 456);
-});
-
-test("does not mistake flag values for the PR number", () => {
-  // --repo owner/name never tokenizes as a bare integer.
-  equal(extractPrNumber("gh pr merge --repo 123/owner"), null);
 });
 
 // ── #204: verb-anchored merge detection + command window ─

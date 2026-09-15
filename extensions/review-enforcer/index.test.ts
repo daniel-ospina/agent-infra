@@ -29,6 +29,7 @@ import {
   resolveRepoContext,
   repoFromGitRemote,
   parseCdChains,
+  expandCdTarget,
   evaluateMergeGate,
   readReviewRecord,
   reviewRecordFile,
@@ -60,6 +61,9 @@ import {
   withGhShim,
   type ReviewRecord,
 } from "./index.js";
+// #966: the shared parser module — the drift-pin below asserts this extension's
+// exported helpers ARE these functions (one copy, not a lookalike).
+import * as sharedParse from "../shared/git-command-parse.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
@@ -121,150 +125,28 @@ const cleanRecord: ReviewRecord = {
   repo: "owner/repo",
 };
 
-// ── extractPrNumber ───────────────────────────────────
+// ── Drift-pin: ONE copy of the command parsers (#966) ─
+//
+// The behavioural truth table for the four helpers (incl. the corrected
+// last-`cd`-wins rule and the #960 newline-terminated cd) now lives in
+// extensions/shared/git-command-parse.test.ts. What is pinned HERE is that
+// this extension has no private copy to drift again: its exported helpers ARE
+// the shared module's functions. The source-shape half of the pin (neither
+// index.ts declares the helpers locally) lives in verification-gate's suite.
+// A reference identity in BOTH suites means the two extensions cannot
+// disagree on any input — the state that produced the #966 contradiction.
 
-section("extractPrNumber — gh pr merge PR extraction");
+section("drift-pin — shared command parsers (#966)");
 
-test("extracts PR number from plain merge command", () => {
-  equal(extractPrNumber("gh pr merge 138"), 138);
-});
-
-test("extracts PR number when flags follow", () => {
-  equal(extractPrNumber("gh pr merge 138 --repo owner/repo"), 138);
-});
-
-test("extracts PR number after cd prefix", () => {
-  equal(extractPrNumber("cd /tmp && gh pr merge 138"), 138);
-});
-
-test("null for gh pr create (not merge)", () => {
-  equal(extractPrNumber("gh pr create 138"), null);
-});
-
-test("null for git ops", () => {
-  equal(extractPrNumber("git commit -m x"), null);
-  equal(extractPrNumber("git push"), null);
-});
-
-test("null for non-numeric PR", () => {
-  equal(extractPrNumber("gh pr merge abc"), null);
-});
-
-// ── extractRepoFlag ───────────────────────────────────
-
-section("extractRepoFlag — --repo / -R / --repo=");
-
-test("--repo owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 138 --repo owner/repo"), "owner/repo");
-});
-
-test("-R owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 138 -R owner/repo"), "owner/repo");
-});
-
-test("--repo=owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 138 --repo=owner/repo"), "owner/repo");
-});
-
-test("flag before PR number", () => {
-  equal(extractRepoFlag("gh pr merge --repo owner/repo 138"), "owner/repo");
-});
-
-test("null when no flag", () => {
-  equal(extractRepoFlag("gh pr merge 138"), null);
-  equal(extractRepoFlag("GH_REPO=owner/repo gh pr merge 138"), null);
-});
-
-// ── extractGhRepoEnv ──────────────────────────────────
-
-section("extractGhRepoEnv — GH_REPO= prefix");
-
-test("GH_REPO assignment prefix", () => {
-  equal(extractGhRepoEnv("GH_REPO=owner/repo gh pr merge 138"), "owner/repo");
-});
-
-test("null when absent", () => {
-  equal(extractGhRepoEnv("gh pr merge 138"), null);
-});
-
-// ── extractCdPath ─────────────────────────────────────
-
-section("extractCdPath — cd prefix detection");
-
-test("unquoted cd && chain", () => {
-  equal(extractCdPath("cd /tmp/foo && gh pr merge 138"), resolvePath("/tmp/foo"));
-});
-
-test("double-quoted path with spaces", () => {
-  equal(extractCdPath('cd "/tmp/foo bar" && gh pr merge 138'), resolvePath("/tmp/foo bar"));
-});
-
-test("single-quoted path", () => {
-  equal(extractCdPath("cd '/tmp/foo bar' && gh pr merge 138"), resolvePath("/tmp/foo bar"));
-});
-
-test("semicolon chain", () => {
-  equal(extractCdPath("cd /tmp/foo ; gh pr merge 138"), resolvePath("/tmp/foo"));
-});
-
-test("takes the LAST cd in a chain (effective cwd)", () => {
-  equal(extractCdPath("cd /a && cd /b && gh pr merge 138"), resolvePath("/b"));
-  equal(extractCdPath("cd /a ; cd /b ; gh pr merge 138"), resolvePath("/b"));
-});
-
-test("newline-separated cd IS a cd chain (bash semantics; cycle 2 P2-2)", () => {
-  equal(extractCdPath("cd /tmp/foo\ngh pr merge 138"), resolvePath("/tmp/foo"));
-  equal(extractCdPath("cd /tmp/foo\ncd /tmp/bar\ngh pr merge 138"), resolvePath("/tmp/bar"), "last cd wins");
-});
-
-test("prose cd inside quoted args is NEVER a cd chain (quote-aware; #230 class)", () => {
-  equal(extractCdPath('gh pr merge 138 --comment "see; cd /tmp/foo && run it"'), null, "quoted prose ignored");
-  equal(extractCdPath('gh pr merge 138 --comment "cd /tmp/foo"'), null, "leading quoted prose ignored");
-});
-
-test("quoted cd target still parsed (target quotes ≠ prose)", () => {
-  equal(extractCdPath('cd "/tmp/foo bar" && gh pr merge 138'), resolvePath("/tmp/foo bar"));
-});
-
-test("~ and ~/ cd targets expand to the home dir (cycle 3 P2-1)", () => {
-  equal(extractCdPath("cd ~ && gh pr merge 138"), os.homedir());
-  equal(extractCdPath("cd ~/sub && gh pr merge 138"), resolvePath(os.homedir(), "sub"));
-});
-
-test("parseCdChains: $VAR / quoted-$( ) cd target → unattributable, never session-cwd", () => {
-  const r1 = parseCdChains('cd "$HOME/x" && gh pr merge 138');
-  equal(r1.last, null, "$ target not guessed");
-  equal(r1.unattributable, true, "reported so the gate skips the cwd fallback");
-  const r2 = parseCdChains("cd $WORKTREE && gh pr merge 138");
-  equal(r2.last, null);
-  equal(r2.unattributable, true);
-});
-
-test("parseCdChains: subshell (cd …) is unattributable", () => {
-  const r = parseCdChains("(cd /tmp/foo && gh pr merge 138)");
-  equal(r.last, null);
-  equal(r.unattributable, true, "bash runs the cd; the gate must not trust the session cwd");
-});
-
-test("parseCdChains: bare cd → home, NOT unattributable", () => {
-  const r = parseCdChains("cd && gh pr merge 138");
-  equal(r.last, os.homedir());
-  equal(r.unattributable, false);
-});
-
-test("parseCdChains: prose cd inside quoted args counted nowhere (quote-aware)", () => {
-  const r = parseCdChains('gh pr merge 138 --comment "cd /tmp/foo"');
-  equal(r.last, null);
-  equal(r.unattributable, false, "quoted prose is not a cd bash will run");
-});
-
-test("cd /x || exit idiom splits at the pipe (cycle 4 P3)", () => {
-  equal(parseCdChains("cd /tmp/x || exit 1\ngh pr merge 138").last, resolvePath("/tmp/x"));
-  equal(extractCdPath("cd /tmp/x || exit 1\ngh pr merge 138"), resolvePath("/tmp/x"));
-});
-
-test("null when no cd prefix", () => {
-  equal(extractCdPath("gh pr merge 138"), null);
+test("the exported helpers ARE the shared module's functions (no per-extension copy)", () => {
+  equal(extractCdPath, sharedParse.extractCdPath, "extractCdPath");
+  equal(extractRepoFlag, sharedParse.extractRepoFlag, "extractRepoFlag");
+  equal(extractGhRepoEnv, sharedParse.extractGhRepoEnv, "extractGhRepoEnv");
+  equal(extractPrNumber, sharedParse.extractPrNumber, "extractPrNumber");
+  equal(parseCdChains, sharedParse.parseCdChains, "parseCdChains");
+  // expandCdTarget is re-exported by this extension too — pin it before the
+  // source-shape half has to be the only guard against a private copy.
+  equal(expandCdTarget, sharedParse.expandCdTarget, "expandCdTarget");
 });
 
 // ── resolveRepoContext priority ───────────────────────
@@ -274,6 +156,15 @@ section("resolveRepoContext — resolution priority (url > --repo > GH_REPO > cd
 test("priority 1: --repo flag beats GH_REPO env", () => {
   const ctx = resolveRepoContext("GH_REPO=env/repo gh pr merge 138 --repo flag/repo", cleanRecord);
   equal(ctx.repo, "flag/repo");
+  equal(ctx.source, "flag");
+});
+
+test("priority 1: a real --repo beats a repo MENTION in quoted prose", () => {
+  // The safe half of the quote-unaware-flag gap (shared suite): the scan takes
+  // its FIRST match, so a real flag before the prose still wins. Held even
+  // though a mention with NO real flag is captured today (reported residual).
+  const ctx = resolveRepoContext('gh pr merge 138 --repo acme/widget --body "see --repo evil/repo"', cleanRecord);
+  equal(ctx.repo, "acme/widget");
   equal(ctx.source, "flag");
 });
 
@@ -1157,7 +1048,7 @@ testAsync("cd ~/… merge into ANOTHER repo is NOT authorized by the session-cwd
   });
 });
 
-testAsync("unattributable cd ($VAR/$(…)/subshell) is NEVER attributed to the session repo (cycle 4 P1 regression)", async () => {
+testAsync("unattributable cd ($VAR form) is NEVER attributed to the session repo (cycle 4 P1 regression)", async () => {
   await withTempHome(async () => {
     const prevMode = process.env.PI_MODE;
     const prevHeartbeat = process.env.TASK_HEARTBEAT;
@@ -3391,8 +3282,11 @@ test("extractMergeSelector: a bare number must round-trip, or the two layers dis
 });
 
 test("resolveRepoContext: a compound command does not lend the FIRST verb's URL repo to the SECOND", () => {
-  // `extractPrNumber` counts PER VERB (it takes the LAST `gh pr merge`) while
-  // `extractMergeSelector` takes the FIRST. Attributing the first verb's URL repo to the
+  // `extractPrNumber` takes the FIRST unquoted `gh pr merge` (a non-global
+  // `.match`), matching `extractMergeSelector`'s first verb — no longer the
+  // "counts PER VERB / takes the LAST" behaviour this comment used to describe.
+  // (Spelling corrected in test-review cycle 2: the module resolves the FIRST
+  // verb, and the number/repo must come from the SAME verb.) Attributing the first verb's URL repo to the
   // second verb's number read another repo's evidence for that number (fresh review, P2).
   const cmd = `gh pr merge ${PR_URL_1006}; gh pr merge 123`;
   equal(extractMergeSelector(cmd).repo, "daniel-ospina/agent-infra",
