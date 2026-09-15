@@ -162,8 +162,8 @@ let savedPath: string;
 let savedArgv1: string;
 let savedInterval: string | undefined;
 // #1070: the cut gap is load-scaled, so a host at loadavg >= 8 would push this
-// suite's 15s base to 30s/45s and blow AC10's `elapsedMs < 60_000` assert on
-// exactly the loaded hub the change targets. Pin it explicitly — an explicit
+// suite's 15s base to 30s/45s and blow AC10's `elapsedMs < 60_000` assert on a
+// loaded host (the case #1070 addresses). Pin it explicitly — an explicit
 // TASK_HEARTBEAT_CUT_GAP_MS is honoured verbatim and never rescaled, which is
 // the same pin the sibling suites use (task-cap-handoff / dispatch-record).
 let savedCutGap: string | undefined;

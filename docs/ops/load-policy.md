@@ -55,7 +55,7 @@ cores ≈ 2.5×/core):
 
 | Threshold | Default | Rule |
 |---|---|---|
-| `LOAD_SUSPEND_THRESHOLD` | `2.5 × cores` (10-core: 25) | suspend batches / saturate watchdog scale at **≥** this |
+| `LOAD_SUSPEND_THRESHOLD` | `2.5 × cores` (10-core: 25) | suspend batches at **≥** this. Does **not** drive the watchdog — its bands are fixed literals 8/16 (#1073, see §6) |
 | `LOAD_RESUME_THRESHOLD` | `1.5 × cores` (10-core: 15) | resume only **below** this (40% hysteresis band) |
 | `TASK_LOAD_SCALE_START` | `1.5 × cores` (10-core: 15) | **inert for the watchdog — read by nothing (#1073)**; the watchdog's scale bands are fixed at 8/16 (see §6) |
 | `TASK_LOAD_SCALE_MAX` | `3` | **inert for the watchdog — read by nothing (#1073)**; the watchdog's multiplier is fixed at 3 (see §6) |
@@ -69,7 +69,7 @@ threshold — a single-sample dip between suspend and resume never thrash-resume
 
 | Env | Default | Consumer | Meaning |
 |---|---|---|---|
-| `LOAD_SUSPEND_THRESHOLD` | `2.5 × os.cpus().length` (10-core: 25) | load-gate.mjs + builtin-tools scale anchor | suspend batches / saturate watchdog scale at ≥ this |
+| `LOAD_SUSPEND_THRESHOLD` | `2.5 × os.cpus().length` (10-core: 25) | load-gate.mjs (the watchdog reads none of it — #1073) | suspend batches at ≥ this; not a watchdog scale input |
 | `LOAD_RESUME_THRESHOLD` | `1.5 × os.cpus().length` (10-core: 15) | load-gate.mjs | resume only below this (hysteresis band) |
 | `TASK_LOAD_SCALE_START` | `1.5 × os.cpus().length` (10-core: 15) | — read by nothing (#1073) | documented as the watchdog scale point; `loadScaledBound` does not read it (bands are fixed at 8/16) |
 | `TASK_LOAD_SCALE_MAX` | `3` | — read by nothing (#1073) | documented as the watchdog multiplier cap; `loadScaledBound` hardcodes 3 |
@@ -80,11 +80,11 @@ threshold — a single-sample dip between suspend and resume never thrash-resume
 | `GIT_REMOTE_TIMEOUT_MS` | load-scaled base `5_000` (x1/2/3 by loadavg tier; `TASK_LOAD_SCALE_OFF=1` → `5_000`) | slack-bridge `gitRemoteTimeoutMs()` | git config lookup cap (#196 fold, #232) |
 | `TREE_KILL_EXEC_TIMEOUT_MS` | `5_000` | tree-kill `execTimeoutMs()` | pgrep/ps cap on the kill path (#196 fold) |
 
-**One-line ordering-clamp note:** watchdog scale config requires
-`suspend > start` and `resume ≤ suspend` — under misconfiguration both fall
-back to defaults (a NaN/Infinity effective bound is never produced); load-gate
-clamps `resume > suspend` down to `suspend` (safe direction; preserves the
-`LOAD_SUSPEND_THRESHOLD=0` always-defer hook). Validity: absent/empty/
+**One-line ordering-clamp note:** the watchdog has no scale config to order —
+its bands are fixed literals and it reads **none** of `TASK_LOAD_SCALE_START`,
+`TASK_LOAD_SCALE_MAX` or `LOAD_SUSPEND_THRESHOLD` (#1073); `TASK_LOAD_SCALE_OFF=1`
+is its only scale input. `load-gate` clamps `resume > suspend` down to `suspend`
+(safe direction; preserves the `LOAD_SUSPEND_THRESHOLD=0` always-defer hook). Validity: absent/empty/
 non-finite/negative → default; `0` is **valid** for suspend/resume/maxWaitMin
 (the deterministic-defer test hook).
 
@@ -143,8 +143,9 @@ unconditionally.
   at `load1 ≥ 16`; `TASK_LOAD_SCALE_OFF=1` → `1x`. (The `TASK_LOAD_SCALE_START`
   / `TASK_LOAD_SCALE_MAX` rows in §2/§3 name a scale point and cap this function
   does **not** read — its thresholds are fixed literals. See #1073.)
-- **First-message bound:** `effM = max(M, round(M × scale(load1)))`.
-  **Load only EXTENDS the bound**
+- **First-message bound:** `effM = max(M, M × scale(load1))` where
+  `scale ∈ {1,2,3}`. The scaling path does not round — `loadScaledBound`
+  multiplies by 1/2/3 exactly. **Load only EXTENDS the bound**
   (never shrinks below the env-overridable static `TASK_FIRST_MESSAGE_MS`).
 - **Per-dispatch monotonic high-water-mark latch:** an agent's effM is
   `max(previous tick's effM, recomputed effM)` — once a storm raises the bound
@@ -181,13 +182,14 @@ unconditionally.
   `[task] first-message bound 300s → 900s (load1=60)` (rate-limited to bound
   increases); the kill headline shows the EFFECTIVE bound (the 905s cut once
   printed "bound 300s" under a latched 900s bound — fixed). **The same rule now
-  holds for the ages (#1070):** the waiting clauses fire on the EFFECTIVE ages
-  (`streamAgeMs + markerAge`), so every kill headline and the
-  `[task] first-message-stall diagnostic:` line report the effective age too — the
-  raw `streamAgeMs`/`toolAgeMaxMs` in the payload is the child's frozen last
-  self-reported sample and must never be read as live. All four `Alive
-  state:` diagnostics expose both the raw pair and `effStreamAgeMs=` /
-  `effToolAgeMs=`, plus `everSawRealActivity=` for triage.
+  holds for the ages (#1070)** on the four age-reporting clauses — tool-silence,
+  stream-stall, tool-stall and first-message-stall: they fire on the EFFECTIVE
+  ages (`raw + markerAge`), so their headlines and the
+  `[task] first-message-stall diagnostic:` line report the effective age. The raw
+  `streamAgeMs`/`toolAgeMaxMs` in the payload is the child's frozen last
+  self-reported sample, not a live reading. All four `Alive state:` diagnostics
+  expose the raw pair, `effStreamAgeMs=` / `effToolAgeMs=`, and
+  `everSawRealActivity=` for triage.
 - **Cut-gap bound (#1070):** the marker-gap cut deadline is a SECOND consumer of
   the same scale function. `effCutGap = getEffectiveCutGapMs(latched, load1)` —
   the derived base (`1.25 ×` tick interval, floor `15_000`) scaled 1x/2x/3x, with

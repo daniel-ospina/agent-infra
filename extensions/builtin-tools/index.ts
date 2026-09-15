@@ -1704,14 +1704,13 @@ export function getCutGapMs(): number {
 
 /** #1070: the *effective* cut gap — load-scaled and per-dispatch monotonic,
  * following the #272 firstMessageMs treatment — same bands, same per-dispatch
- * monotonic latch — with one deliberate asymmetry: firstMessageMs is scaled
- * INSIDE heartbeatKillDecision (the caller passes the base + the latch), while
- * this bound is scaled by the CALLER and passed in as the effective value, so
- * the clause and its headline read one number. The cut clause was the
- * one waiting bound NOT load-scaled: `loadScaledBound` (#209) was consumed by
- * `firstMessageMs` alone, so on a machine at load 13-18 (10 CPUs) a flat ~38s
- * marker window was the most misfire-prone bound in the file — while
- * firstMessageMs self-escalated 300s -> 900s in the very same dispatch.
+ * monotonic latch. firstMessageMs is scaled INSIDE heartbeatKillDecision (the
+ * caller passes the base + the latch); this bound is scaled by the CALLER, and an
+ * explicit TASK_HEARTBEAT_CUT_GAP_MS is not rescaled (see below).
+ *
+ * `loadScaledBound` (#209) was consumed by `firstMessageMs` alone, so the cut
+ * gap — unlike the first-message bound — stayed flat while firstMessageMs
+ * self-escalated 300s -> 900s in the same dispatch.
  *
  * An explicit TASK_HEARTBEAT_CUT_GAP_MS override is honoured verbatim: an
  * operator who names a number means it, and silently rescaling it would make
@@ -2739,9 +2738,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // Clamped ≥ 60s: negative/zero/NaN/Infinity env values can't disable
     // the kill path or kill productive agents instantly (#489).
     const HEARTBEAT_TIMEOUT_MS = Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000);
-    // #271/#1070: the fresh-marker window that gates EVERY waiting clause
-    // (`stateFresh`). Hoisted here so the cut-gap reachability warning and the
-    // backstop timer read the SAME window (they did drift apart before).
+    // #1070: the fresh-marker window that `stateFresh` compares markerAge
+    // against — heartbeatKillDecision computes that window inline from these
+    // same two values. Hoisted so the cut-gap reachability warning and the
+    // backstop timer read the identical number.
     const freshWindowMs = Math.max(2 * HEARTBEAT_TIMEOUT_MS, 2 * getHeartbeatIntervalMs());
     const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
     let hasOutput = false;
