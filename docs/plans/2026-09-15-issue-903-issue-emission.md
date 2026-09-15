@@ -274,7 +274,7 @@ and 2, so it did, and reports the closure rather than re-litigating it.
 
 Consequences, stated so nothing is silently implied:
 
-1. `Closes #903` is **inert** — the issue is already closed. Note precisely: **two commits on this branch do carry the `Closes #903` keyword**, so GitHub registers the PR as referencing #903, and merging would re-close it if it were ever re-opened. The inertness is a consequence of the issue already being closed, not of the PR abstaining. The PR body states the situation rather than claiming abstention.
+1. `Closes #903` is **inert** — the issue is already closed. Note precisely: **three commits on this branch carry a live `Closes #903` reference**, so GitHub registers the PR as referencing #903, and merging would re-close it if it were ever re-opened. Two carry it as a trailer (`d691294`, `f8100f9`); the third (`1fa56b1`) carries it mid-sentence in its body, which GitHub's parser counts — this repo's own keyword scan (`scripts/record-review.sh`) counts a mid-sentence ref as live for exactly that reason (`git log origin/main..HEAD --grep="Closes #903"` returns three, not two). The inertness is a consequence of the issue already being closed, not of the PR abstaining. The PR body states the situation rather than claiming abstention.
 2. **Nothing tracks the residual.** Earlier revisions of this plan pointed at #906 as the tracker; #906 is
    closed and will not be re-opened by this work. The residual (AGENTS.md still files a consequence-less
    finding on *incidental discovery while working*) is **known, unfixed, and untracked**, and the skill
