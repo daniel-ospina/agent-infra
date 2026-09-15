@@ -34,14 +34,13 @@ if git diff --cached --name-only --diff-filter=D -- AGENTS.md 2>/dev/null | grep
 fi
 
 # ── Resolve the materializer. Physical pwd: scripts/ may be a symlink to
-# agent-infra (consumer repos). Physical pwd keeps the default AGENT_INFRA_PATH
-# (= HERE/..) pointing at the real agent-infra install so (a) the drift check
-# resolves the canonical base template (--check prefers the script's own
-# physical parent and falls back to this var) and (b) the materializer is the
-# agent-infra copy even when invoked via symlink. A logical pwd would default
-# AGENT_INFRA_PATH to the consumer root — which matters now that the content
-# compare exists: the fallback would not resolve, and the compare would be
-# skipped (reported, never silently green) instead of running.
+# agent-infra (consumer repos). The physical pwd keeps the DEFAULT
+# AGENT_INFRA_PATH (= HERE/..) pointing at the real agent-infra install rather
+# than the consumer root. It is not what resolves the template for `--check`
+# (that resolves script-first from the materializer's own physical parent, and
+# `cd -P` already follows a symlinked `scripts/`); it matters for the default
+# AGENT_INFRA_PATH handed to the materializer, and for resolving the
+# materializer itself when invoked through a symlink.
 HERE="$(cd -P "$(dirname "$0")" && pwd -P)"
 MATERIALIZER="$HERE/materialize-agents.sh"
 
@@ -74,8 +73,10 @@ if ! OUTPUT="$(bash "$MATERIALIZER" --check "$STAGE_DIR" 2>&1)"; then
   # Surface the materializer's own output: it carries the `MISSING:` heading list
   # and a MARKER-AWARE remediation. Discarding it (as an earlier revision did)
   # left a marker-less file being told to run `--new`, which the materializer's
-  # own clobber guard refuses.
-  printf '%s\n' "$OUTPUT"
+  # own clobber guard refuses. Its own `Fix: run …` line is STRIPPED, because
+  # that command names the scratch dir this hook is about to delete — printing it
+  # would hand the developer a command that cannot work.
+  printf '%s\n' "$OUTPUT" | grep -v '^   Fix: run' || true
   echo "   Materialize it (base text inline + repo-specific tail below):"
   echo "     bash $MATERIALIZER --new $(pwd -P) <repo-tail-file>"
   echo "   Or refresh an existing materialized file:"
@@ -93,9 +94,16 @@ fi
 #   skip   → no template resolvable, so the content compare never ran
 #            ("content compare skipped") — a green "passed" here would be a
 #            comparison-free pass, exactly what this gate must not print.
-if grep -q 'BASE-OWNED CONTENT DRIFTED' <<<"$OUTPUT" \
-   || grep -q 'base-owned content compare could not run' <<<"$OUTPUT"; then
-  printf '%s\n' "$OUTPUT" | grep -E 'base head differs|compare could not run' || true
+if grep -q 'base-owned content compare could not run' <<<"$OUTPUT"; then
+  # A DEGRADED compare must not be reported as drift: the gate did not
+  # establish drift, and "run --merge to refresh" is the wrong remedy for a
+  # compare that never ran. Its own status, mirroring the skip branch.
+  printf '%s\n' "$OUTPUT" | grep -E 'compare could not run' || true
+  echo "[agent-infra] ⚠️ AGENTS.md materialization gate: passed HEADINGS ONLY — base-owned content compare could not run (not a verified pass)"
+  exit 0
+fi
+if grep -q 'BASE-OWNED CONTENT DRIFTED' <<<"$OUTPUT"; then
+  printf '%s\n' "$OUTPUT" | grep 'base head differs' || true
   echo "[agent-infra] ⚠️ AGENTS.md materialization gate: markers present, but base-owned content DRIFTED (non-blocking — run --merge to refresh; the required CI check pins content)"
   exit 0
 fi

@@ -141,15 +141,38 @@ if [ "$MODE" = "--check" ]; then
       # still grep that exact string (see scripts/check-agents-materialized.sh's
       # history) — removing it would silently blind those copies. The updated
       # hook keys on the machine key and the skip/drift wording, not this line.
-      if DIFF_OUT=$(diff --text <(tr -d '\r' < "$BASE_T") <(tr -d '\r' < "$f")); then
+      # Read both sides BEFORE diffing. This is not cosmetic: if the template
+      # exists but cannot be read (permission denied, I/O error) or is EMPTY, a
+      # process substitution hands `diff` an empty left operand — diff then exits
+      # 1 emitting only `>` lines, so neither the rc-2 arm nor the no-`<>`-line
+      # arm fires and BASE_ONLY reads 0. The gate would print the CLEAN line for
+      # a file whose base-owned rules were deleted. Guarding on OPERAND
+      # READABILITY (not on diff's exit code) is the only way to see it, because
+      # "clean subsequence" and "empty left operand" have identical diff output.
+      # Both were reproduced end-to-end by the #1027 adversarial review.
+      if ! BASE_TEXT="$(tr -d '\r' < "$BASE_T")"; then
+        echo "   ⚠️  base template unreadable: $BASE_T"
+        echo "⚠️ $REPO: materialized (9 base rule headings present) but base-owned content compare could not run (unreadable base template)"
+        exit 0
+      fi
+      if [ -z "$BASE_TEXT" ]; then
+        echo "   ⚠️  base template is EMPTY: $BASE_T"
+        echo "⚠️ $REPO: materialized (9 base rule headings present) but base-owned content compare could not run (empty base template)"
+        exit 0
+      fi
+      if ! FILE_TEXT="$(tr -d '\r' < "$f")"; then
+        echo "   ⚠️  $f unreadable"
+        echo "⚠️ $REPO: materialized (9 base rule headings present) but base-owned content compare could not run (unreadable repo file)"
+        exit 0
+      fi
+      # Trailing-newline differences are normalised away by the command
+      # substitution on both sides, so a missing final newline is not drift.
+      if DIFF_OUT=$(diff --text <(printf '%s\n' "$BASE_TEXT") <(printf '%s\n' "$FILE_TEXT")); then
         drc=0
       else
         drc=$?
       fi
       if [ "$drc" -eq 2 ]; then
-        # Defensive: both operands are asserted to be readable regular files, so
-        # this fires only on an unexpected diff failure. Kept so a degraded
-        # compare can never be mistaken for a clean one.
         echo "   ⚠️  base-owned content compare could not run (diff exit 2)"
         echo "⚠️ $REPO: materialized (9 base rule headings present) but base-owned content compare could not run (internal error)"
         exit 0

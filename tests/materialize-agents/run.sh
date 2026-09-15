@@ -207,6 +207,17 @@ if [ "$GITOK" -eq 1 ]; then
   else
     fail "hook drift expected (rc=$hrc)"; sed -n '1,8p' <<<"$hout"
   fi
+  # the hook's SKIP branch (no resolvable template) must not print a bare green
+  h2="$TMP/hookskip"; mkdir -p "$h2/scripts"
+  cp "$HOOK" "$h2/scripts/check-agents-materialized.sh"
+  cp "$MAT" "$h2/scripts/materialize-agents.sh"
+  cp "$BASE" "$h2/AGENTS.md"
+  hout="$( cd "$h2" && git init -q . >/dev/null 2>&1; git add AGENTS.md >/dev/null 2>&1; env AGENT_INFRA_PATH= bash scripts/check-agents-materialized.sh 2>&1 )"; hrc=$?
+  if [ "$hrc" -eq 0 ] && grep -q 'HEADINGS ONLY' <<<"$hout" && ! grep -q '✅ AGENTS.md materialization gate: passed' <<<"$hout"; then
+    pass "hook: comparison skipped → 'HEADINGS ONLY', no green 'passed' (exit 0)"
+  else
+    fail "hook skip expected (rc=$hrc)"; sed -n '1,8p' <<<"$hout"
+  fi
 else
   echo "   ⏭️  SKIP hook-level case: \`git init\` blocked locally (hub-state gate); runs in CI"
 fi
@@ -254,17 +265,49 @@ while IFS= read -r m; do
   [ -n "$m" ] || continue
   grep -qF -- "$m" "$BASE" || { fail "required heading not present in the base: '$m'"; bad=1; }
 done <<<"$markers"
-[ "$bad" -eq 0 ] && pass "all 9 required headings exist verbatim in templates/AGENTS.base.md"
+# Gate the agreement line on the COUNT as well: if the extraction above yields
+# nothing, `bad` stays 0 and this line would print a green "all 9 headings exist"
+# for a check that examined no headings (found in review).
+if [ "$bad" -eq 0 ] && [ "${nmarkers:-0}" -eq 9 ]; then
+  pass "all 9 required headings exist verbatim in templates/AGENTS.base.md"
+else
+  fail "heading-vs-base agreement not established (${nmarkers:-0} markers extracted, bad=$bad)"
+fi
 
 # ── Hook skip path must state that the comparison did not run (#1027 review).
-d="$(new_fixture hookskip --no-base)"
+# NOTE: this asserts the MATERIALIZER's skip wording; the hook's own skip branch is
+# asserted in the git-fixture block below (a case named for a branch it does not
+# execute pins nothing — #991).
+d="$(new_fixture mat-skip --no-base)"
 cp "$BASE" "$d/AGENTS.md"
 out="$(run_check "$d" AGENT_INFRA_PATH=)"; rc=$?
 if [ "$rc" -eq 0 ] && grep -q 'content compare skipped' <<<"$out"; then
-  pass "skip path states the comparison did not run (no bare green)"
+  pass "materializer skip path states the comparison did not run (no bare green)"
 else
-  fail "skip path: expected the explicit 'content compare skipped' wording (rc=$rc)"
+  fail "materializer skip path: expected the explicit 'content compare skipped' wording (rc=$rc)"
 fi
+
+# ── Unreadable / empty base template must NOT read as clean (#1027 cycle 2).
+# Both hand `diff` an empty left operand: it exits 1 with only `>` lines, so
+# neither the rc-2 arm nor the no-`<>`-line arm fires and BASE_ONLY reads 0.
+# Reproduced before the fix: a file with a base-owned line deleted printed the
+# CLEAN line when the template was unreadable or empty.
+for mode in unreadable empty; do
+  d="$(new_fixture "tmpl-$mode")"
+  grep -v '^When choosing between two approaches, prefer the one that produces' "$BASE" > "$d/AGENTS.md"
+  if [ "$mode" = "unreadable" ]; then
+    chmod 000 "$d/templates/AGENTS.base.md"
+  else
+    : > "$d/templates/AGENTS.base.md"
+  fi
+  out="$(run_check "$d")"; rc=$?
+  chmod 644 "$d/templates/AGENTS.base.md" 2>/dev/null || true
+  if [ "$rc" -eq 0 ] && grep -q 'compare could not run' <<<"$out" && ! grep -q 'all base lines present in order' <<<"$out"; then
+    pass "$mode base template → compare could not run (not a clean ✅)"
+  else
+    fail "$mode base template: expected a degraded ⚠️, not the clean line (rc=$rc)"; sed -n '1,4p' <<<"$out"
+  fi
+done
 
 # ── Real-repo regression pin: base is a line-subsequence of AGENTS.md.
 # diff's own status is captured, so a `diff` internal failure (rc 2, e.g. an

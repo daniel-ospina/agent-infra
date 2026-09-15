@@ -154,18 +154,31 @@ jobs:
             # can only match a line that begins with `<`, which no line of the
             # suite does. It therefore exited 1 on every PR, turning the repo's
             # ONLY required check red (caught by the #1027 adversarial review).
-            # `-F` + the full `diff --text <base> <AGENTS.md>` invocation pins the
-            # real-repo comparison itself, not a diagnostic that shares its text.
-            if ! grep -qF 'diff --text "$BASE" "$ROOT/AGENTS.md"' tests/materialize-agents/run.sh; then
-              echo "::error::tests/materialize-agents/run.sh carries no real-repo pin — the #1027 base-owned-region assertion cannot be trusted."
+            #
+            # A plain `grep -qF <literal>` is not enough either: it matches a
+            # COMMENTED-OUT invocation, so a one-character `#` would silently stop
+            # the pin while this guard stayed green (reproduced in review). The
+            # awk below skips comment lines and matches the literal with index(),
+            # so only a live invocation satisfies it. Single-quoted: `$BASE` and
+            # `$ROOT` are awk's, not the shell's. No pipe, so no SIGPIPE risk.
+            #
+            # Residual, stated plainly: this is a source-text tripwire, not a
+            # proof the pin RAN. A PR that edits the suite to make the pin a no-op
+            # is the repo's disclosed #713 class (every CI gate here is
+            # PR-editable); the suite's own positive control is what pins the
+            # pin's behaviour.
+            if ! awk 'BEGIN{s="diff --text \"$BASE\" \"$ROOT/AGENTS.md\""} /^[[:space:]]*#/{next} index($0,s){f=1} END{exit(f?0:1)}' tests/materialize-agents/run.sh; then
+              echo "::error::tests/materialize-agents/run.sh carries no live real-repo pin — the #1027 base-owned-region assertion cannot be trusted."
               exit 1
             fi
             bash tests/materialize-agents/run.sh
-          elif [ -f pi-bootstrap/setup.sh ] || [ -f manifest.json ]; then
-            # Two independent agent-infra-only sentinels, so a benign rename of
-            # either one cannot open a silent skip. `pi-bootstrap/` is never
-            # shipped to consumers (the bootstrap copies only AGENTS.md,
-            # .mcp.json and .husky); manifest.json is the consumer ship-list.
+          elif [ -f pi-bootstrap/setup.sh ] || { [ -f manifest.json ] && [ -f bin/agent-infra.js ]; }; then
+            # Two signals, each agent-infra-ONLY. `pi-bootstrap/` is never shipped
+            # to consumers; `bin/agent-infra.js` likewise. A bare `manifest.json`
+            # is NOT one of these — it is a generic filename (PWA/extension
+            # manifests), and this workflow is reusable by consumers via
+            # `workflow_call`, so testing it alone would red a legitimate consumer
+            # build (found in the #1027 review).
             echo "::error::agent-infra checkout detected but tests/materialize-agents/run.sh is missing — the #1027 base-owned-region pin would silently stop running."
             exit 1
           else
