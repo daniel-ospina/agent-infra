@@ -55,7 +55,7 @@ steps:
 > `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
 > non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
 > cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
-> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. **Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound. "Clean" is
 > this gate's own token for the reviewer class in question, never a count and never a substring of a
 > qualified token: the **step reviewers** clear on bare `NO ISSUES FOUND` (step 2's pattern test); the
 > **out-of-pattern `duplication-architecture` reviewer** clears only on `NO ISSUES FOUND — CLEAN` —
@@ -148,9 +148,9 @@ Cross-substep drift detection. Risk identification with mitigation strategies. I
 
 **Improvement-opportunities reviewer (explicit dispatch, #903):** dispatch a fresh-context `task`
 sub-agent that reads `skills/reviewers/improvement-opportunities/SKILL.md` in full and applies it to the
-finished plan. It is **advisory by construction** — record its output, but it never blocks this gate,
-never enters the fix-loop below, and its findings are never filed as issues (only a finding declaring an
-adequate `consequence:` may block). Its dispatch is named here because no gate previously dispatched it
+finished plan. Its **P1/P2** findings are advisory — recorded, never blocking, never filed, and they do
+not trigger the floor; a **P0** that declares an adequate `consequence:` blocks like any other finding.
+It never enters the fix-loop below. Its dispatch is named here because no gate previously dispatched it
 by name; it was reachable only as a coherence dimension.
 
 **Review gate (FINAL):** Is the plan internally consistent? Are risks identified and mitigated? Is the plan ready for decomposition? **Final duplication re-check (#688):** re-run the `duplication-architecture` reviewer across the *finished* plan. Substep 5 saw the architecture in isolation; by step 8 the data model, interfaces, and E2E steps have each added surfaces that can duplicate — and a second writer of state already written elsewhere is the failure this catches. Any duplication found here carries a three-valued verdict: `unify` | `keep separate` | `unify-contract-keep-drivers`. Same contract as substep 5: skill's output block verbatim, advisory, outside the Review Gate Pattern below.
@@ -180,7 +180,7 @@ The `duplication-architecture` reviewer is **advisory** and must never be fed in
 | `NO ISSUES FOUND — DEGRADED (<source>)` | Record + name the unavailable source in the plan doc. **Not clean, not blocking.** Proceed with the caveat. |
 | `ISSUES:` with a verdict | Record each verdict. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
 | `ISSUES:` with **no** verdict | Invalid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
-| `ISSUES:` with a verdict but **no adequate `consequence:`** | **The floor fires — this overrides the row above.** The finding is voided, re-dispatch once, exit **non-clean**. |
+| `ISSUES:` with a verdict but **no adequate `consequence:`** | Record it in the artifact; it is **advisory** — voided for blocking and for filing, never counted, and it does **not** fire the floor (`proportional-gates` §Findings Must Declare Consequence). The row above is unaffected: this reviewer is advisory *by construction*. |
 | bare `NO ISSUES FOUND` (no qualifier) | **Not accepted as clean.** The skill's clean token is `NO ISSUES FOUND — CLEAN`. Re-dispatch once requiring the qualified token; if the bare form repeats, read the summary block's `Result:` line — treat as `DEGRADED (unqualified)` unless it names a full-clean result, and proceed. |
 
 **Never re-dispatch a step reviewer because the duplication reviewer found something**, and never hold a subs-step gate open on its findings. Its `P0` is advisory severity, not blocking severity. Record it and proceed; the finding survives into the plan doc as a decision the owner can act on.

@@ -148,8 +148,11 @@ word, or a bare "it breaks" is **not** a consequence.
 **A finding without an adequate consequence is advisory: non-blocking, not counted toward the gate, and
 not filed as a GitHub issue.** This governs findings raised inside a review gate. `AGENTS.md`'s
 auto-file rule is written unconditionally and is **not** amended by this skill: this rule **takes
-precedence for a finding raised inside a review gate**, and closing the remaining gap — auto-filing on
-incidental discovery while working — is tracked by **#906**. For a gate's
+precedence for a finding raised inside a review gate**. The residual — `AGENTS.md` still files a
+consequence-less finding on *incidental discovery while working*, i.e. outside any gate — is **known and
+unfixed**: #906, which would have scoped it, was closed **NOT_PLANNED** on 2026-09-15 (as was #903), so
+nothing tracks it. Closing it needs a clause in `AGENTS.md` and `templates/AGENTS.base.md`; that is a
+deliberate scope decision, not an oversight. For a gate's
 exit conditions the clean predicate is that gate's own **full** clean token, never a count and never a
 substring (e.g. `NO ISSUES FOUND — DEGRADED` is not clean).
 

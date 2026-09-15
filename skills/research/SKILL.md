@@ -16,7 +16,7 @@ version: 1.0.0
 > finding is **advisory: non-blocking, not counted toward this gate, and not filed as an issue** (it is
 > still recorded in the cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer
 > output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit
-> non-clean. "Clean" is this gate's own full clean token, never a count.
+> non-clean. **Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound. "Clean" is this gate's own full clean token, never a count.
 
 This skill follows the [research-protocol](../reference/research-protocol/SKILL.md). Tier 3 integration (full protocol). All five dimensions apply: best practices, challenge definition, internal+external, adversarial, don't reinvent.
 
@@ -383,7 +383,7 @@ task(prompt='[VGATE] Review this research output for completeness and accuracy. 
 4. KG facts filed for key claims (skip if Tortoise unavailable)
 5. Log entry appended to wiki/log.md per WIKI_SCHEMA.md INGEST format
 
-Return ISSUE blocks for any gaps found (zero issues = CLEAN).
+Return ISSUE blocks for any gaps found (zero issues = CLEAN). Each ISSUE block must carry `consequence: <what breaks, who observes it>` — REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue.
 RESEARCH OUTPUT: <full text>
 ')
 ```
@@ -449,7 +449,7 @@ RESEARCH OUTPUT: <the full research summary>
 4. Does the recommendation follow from the evidence presented?
 5. Were adversarial queries included and addressed?
 
-Return: PASS or ISSUES with specific gaps and suggested fixes.
+Return: PASS or ISSUES: <list — each finding carries `consequence: <what breaks, who observes it>` (REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue)>.
 ```
 
 If issues found → fix → re-dispatch with a fresh-session sub-agent. Continue until clean or convergence (NO ISSUES FOUND or same issues re-flagged 3 consecutive cycles). On stall → document remaining issues with "⚠️ stalled after N cycles — M issues remain" and proceed. Per the research protocol: "Research review is a distinct phase before planning begins."

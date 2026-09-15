@@ -116,7 +116,7 @@ Do NOT proceed until user confirms.
 > `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
 > non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
 > cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
-> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. **Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound. "Clean" is
 > this gate's own full clean token, never a count. `improvement-opportunities` is referenced here only as
 > a boundary comparator and is advisory by construction.
 
@@ -180,7 +180,7 @@ Return the skill's summary block, then:
 | `DEGRADED` | Record + name the unavailable source. **Do not** treat as clean, **do not** block. Proceed with the caveat carried into the scope doc. |
 | `ISSUES` with a verdict | Record each verdict in the scope doc. `unify` → fold into the boundary decision. `keep separate` / `unify-contract-keep-drivers` → record the reason; an unjustified `keep separate` is a scope item, not a pass. |
 | `ISSUES` with **no** verdict | Not a valid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
-| `ISSUES` with a verdict but **no adequate `consequence:`** | **The floor fires — this overrides the row above.** The finding is voided, re-dispatch once, exit **non-clean**. |
+| `ISSUES` with a verdict but **no adequate `consequence:`** | Record it in the artifact; it is **advisory** — voided for blocking and for filing, never counted, and it does **not** fire the floor (`proportional-gates` §Findings Must Declare Consequence). The row above is unaffected: this reviewer is advisory *by construction*. |
 
 **This reviewer never fails the gate and never enters the 10-cycle fix-loop above.** P0 here is advisory severity, not blocking severity — record it and proceed. Concretely: do not re-dispatch the *scope* reviewer because the duplication reviewer found something, and do not hold the gate open on it.
 

@@ -35,7 +35,7 @@ steps:
 > `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
 > non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
 > cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
-> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. **Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound. "Clean" is
 > this gate's own full clean token, never a count.
 
 > **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).

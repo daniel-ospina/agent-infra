@@ -41,11 +41,11 @@ steps:
 > `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
 > non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
 > cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
-> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. **Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound. "Clean" is
 > the token of the reviewer class in question — never a count, never a substring of a qualified token:
 > the **per-issue review gate** clears on bare `NO ISSUES FOUND`; the **MECE gate** clears on
-> `MECE CLEAN`; the **out-of-pattern `duplication-architecture` reviewer** clears only on
-> `NO ISSUES FOUND — CLEAN` and `…— DEGRADED (<source>)` is not clean. MECE findings **are** in the
+> `MECE CLEAN`. (This gate dispatches only those two reviewer classes — unlike `epic-plan`, it has no
+> `duplication-architecture` dispatch, so no third token is named here.) MECE findings **are** in the
 > contract — the `fix: <create new issue | …>` action runs only for a finding that carries an adequate
 > `consequence:`.
 

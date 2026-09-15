@@ -19,7 +19,7 @@ A cycle clears the gate **only** when a fresh reviewer pass on the latest commit
 > `consequence: <what breaks, who observes it>`. Without an adequate one the finding is **advisory:
 > non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
 > cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
-> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
+> `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. **Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound. "Clean" is
 > this gate's own full clean token, never a count. Note the embedded parser below reads the deterministic
 > pattern-scan, not reviewer prose — the pattern-scan's machine findings are explicitly out of this bar.
 

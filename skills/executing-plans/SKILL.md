@@ -561,7 +561,7 @@ Use the same model as the current session — omit the `model` parameter or pass
 1. Read the implemented files
 2. Verify each acceptance criterion is met
 3. Run any specified tests
-4. Return ISSUE blocks (zero issues = CLEAN) with unmet criteria + failing tests, plus optional JSON sidecar with file hashes
+4. Return ISSUE blocks (zero issues = CLEAN) with unmet criteria + failing tests, plus optional JSON sidecar with file hashes — each ISSUE block must carry `consequence: <what breaks, who observes it>` (REQUIRED; without it the finding is advisory only: never blocking, never counted toward this gate, never filed as an issue)
 
 **On issues found:** Fix them, then re-dispatch verification (max 2 retries). On 3rd failure → the orchestrator (you, the main session) takes over:
 

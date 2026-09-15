@@ -19,7 +19,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 > finding is **advisory: non-blocking, not counted toward this gate, and not filed as an issue** (it is
 > still recorded in the cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer
 > output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit
-> non-clean. "Clean" is this gate's own full clean token, never a count. The adjacent-discovery filing
+> non-clean. **Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound. "Clean" is this gate's own full clean token, never a count. The adjacent-discovery filing
 > path (§Design Principle: File Extra Issues) is a discovery-while-working path governed by `AGENTS.md`,
 > not by this contract.
 
@@ -418,7 +418,7 @@ Return:
 | `DEGRADED` | Record + name the unavailable source. Not clean, not blocking. Proceed with the caveat in the Plan doc. |
 | `ISSUES` with a verdict | Record. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
 | `ISSUES` with **no** verdict | Invalid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
-| `ISSUES` with a verdict but **no adequate `consequence:`** | **The floor fires — this overrides the row above.** The finding is voided, re-dispatch once, exit **non-clean**. |
+| `ISSUES` with a verdict but **no adequate `consequence:`** | Record it in the artifact; it is **advisory** — voided for blocking and for filing, never counted, and it does **not** fire the floor (`proportional-gates` §Findings Must Declare Consequence). The row above is unaffected: this reviewer is advisory *by construction*. |
 
 **This reviewer never enters the P0/P1 re-dispatch loop above and never fails the gate.** Its P0 is advisory severity, not blocking severity. Do not re-dispatch the solution verifiers because this reviewer found something.
 
