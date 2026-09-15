@@ -118,7 +118,9 @@ Do NOT proceed until user confirms.
 > cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
 > `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. **Where this gate's bound is already spent, record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound. "Clean" is
 > this gate's own full clean token, never a count. `improvement-opportunities` is referenced here only as
-> a boundary comparator and is advisory by construction.
+> a boundary comparator, and its **P1/P2** classes are advisory by construction (a P0 that declares an
+> adequate `consequence:` blocks like any other finding — `proportional-gates` §Findings Must Declare
+> Consequence).
 
 After human approval, dispatch a fresh-context reviewer via `task` sub-agent:
 

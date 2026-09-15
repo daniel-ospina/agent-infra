@@ -529,9 +529,11 @@ So this is **not** merely a disposition change — the dispatch site is made exp
 `duplication-architecture` already has a named dispatch + disposition table in `epic-plan` under
 `## Review Gate Pattern`.
 
-**Decision: it stays dispatched, and becomes advisory-only, explicitly and visibly — not by a special
-exemption.** Its value (capturing improvement ideas) is real; its findings are legitimately
-non-blocking; the bar already produces that outcome, so no exemption is needed — what is needed is
+**Decision: it stays dispatched, and its P1/P2 findings become advisory-only, explicitly and
+visibly — not by a special exemption.** (The scope is exactly §4.1's: the advisory-by-construction
+class covers `duplication-architecture` and `improvement-opportunities`' **P1/P2** — an unqualified
+"advisory-only" would void the P0 path the last bullet below deliberately keeps.) Its value
+(capturing improvement ideas) is real; those findings are legitimately non-blocking; the bar already produces that outcome, so no exemption is needed — what is needed is
 that the disablement be **visible, not silent**. Therefore:
 - `skills/reviewers/improvement-opportunities/SKILL.md` states its P1/P2 classes are advisory by
   construction (recorded, never blocking, never filed) **and** both the `### P1 — Should Fix` and
