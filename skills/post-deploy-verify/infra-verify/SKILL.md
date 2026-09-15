@@ -33,6 +33,12 @@ tooling is missing, whose matched set is empty at run time, or whose input fails
 **Output:** JSON `VerificationResult`
 **Gate:** WARN-ONLY
 
+**Declared coverage scope:** the four checks cover JS/TS scripts, skills, schema templates, and
+workflow YAML only. `scripts/detect-deploy-surface.sh` also classifies `.github/*`, `supabase/*`,
+`k8s/*`, `terraform/*`, `docker/*`, and `Dockerfile`/`docker-compose*`/`*.tf` as the infra surface —
+those classes are **not** covered here, so a diff touching only them resolves to `skip` with a
+`reason` naming the uncovered surface. That is a declared gap, not a silent pass.
+
 ## Workflow
 
 > **Shell contract (applies to every block):** blocks are **bash** and must run on **bash 3.2**
@@ -66,10 +72,10 @@ js_scripts=(scripts/*.mjs scripts/*.cjs scripts/*.js bin/*.js)
 
 # skill-lint — offered iff a skills tree with ≥1 SKILL.md resolves. Resolution
 # order and discovery semantics mirror scripts/check-skill-lint.mjs
-# (findSkillFiles skips `_`/`.`-prefixed entries recursively). The empty-$s
-# guard is load-bearing: unguarded, an unresolved $s makes `find "$s/"`
-# expand to `find "/"` — an unbounded scan that can match an unrelated
-# SKILL.md and spuriously offer the check.
+# (findSkillFiles skips `_`/`.`-prefixed entries recursively). The empty-
+# SKILLS_DIR guard is load-bearing: unguarded, an unresolved $SKILLS_DIR makes
+# `find "$SKILLS_DIR/"` expand to `find "/"` — an unbounded scan that can match
+# an unrelated SKILL.md and spuriously offer the check.
 SKILLS_DIR=""
 for c in operations/skills .agents/skills skills; do
   [ -d "$c" ] && { SKILLS_DIR="$c"; break; }
@@ -102,6 +108,7 @@ Run each **offered** check. Every block is self-contained and fail-closed.
 
 **script-validate:**
 ```bash
+cd <REPO_ROOT>
 shopt -s nullglob
 files=(scripts/*.mjs scripts/*.cjs scripts/*.js bin/*.js)
 if [ ${#files[@]} -eq 0 ]; then
@@ -124,6 +131,7 @@ defect this replaced validated only the first).
 
 **skill-lint:**
 ```bash
+cd <REPO_ROOT>
 SKILLS_DIR=""
 for c in operations/skills .agents/skills skills; do
   [ -d "$c" ] && { SKILLS_DIR="$c"; break; }
@@ -147,6 +155,8 @@ the vacuity where the linter prints `0 SKILL.md files checked. Clean.` and exits
 
 **template-validity:**
 ```bash
+cd <REPO_ROOT>
+repo_root=$PWD
 # Two passes: a schema-only enumeration cannot report what it skipped.
 all_templates=()
 while IFS= read -r -d '' f; do all_templates+=("$f"); done < <(find templates/ -type f -print0 2>/dev/null)
@@ -166,7 +176,7 @@ fi
 
 needs_yaml=0
 for f in "${schema[@]}"; do case "$f" in *.yaml|*.yml) needs_yaml=1 ;; esac; done
-if [ $needs_yaml -eq 1 ] && ! python3 -c 'import yaml' 2>/dev/null; then
+if [ $needs_yaml -eq 1 ] && ! (cd / && python3 -c 'import yaml') 2>/dev/null; then
   echo "❌ template-validity: YAML templates present but PyYAML is unavailable — cannot verify (fail-closed; install PyYAML)"
   exit 1
 fi
@@ -179,7 +189,7 @@ for f in "${schema[@]}"; do
         echo "❌ template-validity: $f did not parse as JSON"; echo "$err"; failed=$((failed+1))
       fi ;;
     *)
-      if ! err=$(python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$f" 2>&1); then
+      if ! err=$(cd / && python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$repo_root/$f" 2>&1); then
         echo "❌ template-validity: $f did not parse as YAML"; echo "$err"; failed=$((failed+1))
       fi ;;
   esac
@@ -191,20 +201,30 @@ fi
 echo "✅ template-validity: validated ${#schema[@]}/${#schema[@]} schema template(s); skipped $skipped_noschema markdown (no schema), $skipped_nonschema non-schema"
 ```
 → exit 0 = pass. Validates **every** schema template (dotfiles included) and states the denominator;
-markdown is skipped explicitly, never failed. `.plist` files are XML — out of scope here, validated by
+markdown is skipped explicitly, never failed.
+
+> **Python must run with CWD outside the checkout.** For `python3 -c`, `sys.path[0]` is the current
+directory, searched **before** site-packages — so a repo containing a `yaml.py` would have its own
+code imported and executed by the verifying agent. Python is therefore invoked from `/` with the
+file passed as an absolute path (`cd / && python3 -c '…' "$repo_root/$f"`). `-I`/`-s` would also
+close the hole but also drop the **user** site-packages directory, turning a user-local PyYAML install
+into a permanent fail-closed red — the CWD change closes the same hole without that side effect.
+Paths are always passed as **argv**, so a filename can never reach the interpreter source. `.plist` files are XML — out of scope here, validated by
 `scripts/install-launchd.test.sh`; template workflow YAML is also covered by the actionlint gate.
 
 **ci-config:**
 ```bash
+cd <REPO_ROOT>
+repo_root=$PWD
 shopt -s nullglob
 wf=(.github/workflows/*.yml .github/workflows/*.yaml)
 if [ ${#wf[@]} -eq 0 ]; then
   echo "❌ ci-config: 0 workflow YAML matched — failure to verify (fail-closed)"; exit 1
 fi
-python3 -c 'import yaml' 2>/dev/null || { echo "❌ ci-config: PyYAML unavailable — cannot verify (fail-closed; install PyYAML)"; exit 1; }
+(cd / && python3 -c 'import yaml') 2>/dev/null || { echo "❌ ci-config: PyYAML unavailable — cannot verify (fail-closed; install PyYAML)"; exit 1; }
 failed=0
 for f in "${wf[@]}"; do
-  if ! err=$(python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$f" 2>&1); then
+  if ! err=$(cd / && python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$repo_root/$f" 2>&1); then
     echo "❌ ci-config: $f did not parse as YAML"; echo "$err"; failed=$((failed+1))
   fi
 done
@@ -244,7 +264,8 @@ absent-target-surface reason, never a tooling reason (a missing tool is an offer
 - No check offered → `"status": "skip"` with a `reason` naming the absent surfaces, `"checks": []`.
 - Partial coverage (a check not offered) → `"status": "pass"` **plus** `not_offered` entries and a
   matching `evidence` entry (`{"type":"log","description":"<name> not offered: <reason>"}`), so a
-  green can never silently mean "a surface went unverified". The router's Step 3 report renders this.
+  green can never silently mean "a surface went unverified". The router renders the partial marker
+  from `not_offered` (and from any `validated` < `total`); the `evidence` entry preserves the reason.
 
 ## Why Script-Based (Not Agent-Executed)
 
@@ -256,10 +277,11 @@ deterministic validation tools and reports results.
 
 - **Never exit non-zero** — always return JSON. A check block's non-zero exit is mapped into the JSON
   `status`; it is never surfaced as a non-zero skill exit.
-- **A check that is _not offered_ → `skip`** (its target surface does not exist in this repo, or no
-  check at all is offered). **An _offered_ check that matched nothing, whose tooling is missing, or
-  whose input failed to parse → `fail`.** "Missing" therefore means *not offered* — never a silent
-  pass over a surface that is present.
+- **A check whose target surface is absent is _not offered_** — omitted from `checks[]` and recorded
+  in `not_offered`; the surface status is `skip` **only when no check was offered at all** (and then
+  it carries a surface-level `reason`). **An _offered_ check that matched nothing, whose tooling is
+  missing, or whose input failed to parse → `fail`.** "Missing" therefore means *not offered* — never
+  a silent pass over a surface that is present.
 - **Log check output as evidence** for failures.
 - **Available checks vary by repo** — a repo with none of the four surfaces legitimately reports
   `skip`; that is distinct from a present-but-unverifiable surface, which fails.

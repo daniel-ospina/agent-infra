@@ -113,6 +113,7 @@ Each sub-skill returns JSON:
   "not_offered": [
     {"name": "ci-config", "reason": "no workflow YAML present"}
   ],
+  "reason": "only if status=skip",
   "evidence": [
     {"type": "screenshot|log", "path": "...(optional)", "description": "..."}
   ],
@@ -121,10 +122,12 @@ Each sub-skill returns JSON:
 ```
 
 `not_offered` records checks whose target surface is absent — the `reason` is only ever an
-absent-target reason, never a tooling reason. `validated`/`total` and `skipped` are additive
+absent-target reason, never a tooling reason; the surface-level `reason` is set **only** when
+`status` is `skip` (no check was offered at all). `validated`/`total` and `skipped` are additive
 (optional) and describe how much of a check's matched set was actually validated. A `pass` is only
 meaningful alongside those counts: `"pass"` with `validated` < `total` (or with `not_offered`
-entries) means **partial coverage**, not a clean surface.
+entries) means **partial coverage**, not a clean surface. `evidence` carries the not-offered log
+entries, which is where a reason is rendered.
 
 **Report format:**
 
@@ -138,11 +141,20 @@ entries) means **partial coverage**, not a clean surface.
 | infra   | ✅ pass | 3/3    | —      |
 ```
 
-A surface row whose sub-skill reported `not_offered` entries is rendered with the partial-coverage
-marker: `✅ pass (partial)` and a `Checks` cell of `N/M (+K not offered)`. The `Issues` column holds
-GitHub issue numbers only — never a note or a reason.
+A row is **partial** when the sub-skill's `status` is `pass` **and** it reported `not_offered`
+entries **or** any check whose `validated` < `total`. Render that as `✅ pass (partial)` with a
+`Checks` cell of `N/M (+K not offered)`, where `N` = offered checks that passed, `M` = offered
+checks, and `K` = the `not_offered` count; a short per-check `validated X/N` is shown in the row's
+evidence note, never folded into `N/M`. **A row whose `status` is `fail` always renders `⚠️ fail`** —
+the not-offered count may be appended to its `Checks` cell, but never to its status. The `Issues`
+column holds GitHub issue numbers only — never a note or a reason.
+
+A detected surface with **no covering check** is not the same state as a check whose target is
+absent: the former is `skip` **with a `reason`**, and the router reports it as unverified rather than
+silently clean.
 
 **All pass:** "✅ Post-deploy verification: all surfaces passed."
+**All pass, but partial coverage:** "⚠️ Post-deploy verification: all offered surfaces passed; K check(s) not offered — <names>. Surface(s) with unverified targets: <list>."
 **Some fail:** "⚠️ Post-deploy verification: N/M surfaces passed. Failures: <list>"
 **All fail/skip:** "⏭️ Post-deploy verification: no verification run"
 
