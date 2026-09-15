@@ -98,6 +98,13 @@ mkdirSync(join(ALLOWED, "templates"), { recursive: true });
 writeFileSync(join(ALLOWED, "templates", "allowed.json"), '{"ok": true}\n');
 mkdirSync(join(ALLOWED, "skills", "infra-verify"), { recursive: true });
 copyFileSync(SKILL_PATH, join(ALLOWED, "skills", "infra-verify", "SKILL.md"));
+// Sibling dirs sharing a NAME PREFIX with the matching subtree: the shared-tree
+// arm's trailing `/` in `"$agent_real/$2"/*` is what keeps these out, and a case
+// on the repo arm alone does not pin it (test-review P1-1).
+mkdirSync(join(ALLOWED, "templates-evil"), { recursive: true });
+writeFileSync(join(ALLOWED, "templates-evil", "evil.json"), '{"evil": 1}\n');
+mkdirSync(join(ALLOWED, "skills-evil", "infra-verify"), { recursive: true });
+copyFileSync(SKILL_PATH, join(ALLOWED, "skills-evil", "infra-verify", "SKILL.md"));
 
 // A deterministic env: AGENT_INFRA_PATH is removed unless a case sets it, so a
 // developer's ambient value cannot turn an out-of-boundary case into a pass.
@@ -132,6 +139,12 @@ function fixture(setup) {
 const isTemplateValidityOffered = (out) => /\btemplate-validity\b/.test(out);
 const isSkillLintOffered = (out) => /\bskill-lint\b/.test(out);
 const leaksOutside = (out) => out.includes(OUTSIDE) || /\bsecret\.json\b/.test(out) || /\bleaked\b/.test(out);
+// Positive control: EVERY other use of this predicate is negated, so a constant
+// `false` would leave the whole suite green while the leak assertions went inert
+// (test-review P2-1, mutation-verified: `() => false` was undetected).
+check("#1051 twin: `leaksOutside` FIRES on a leaking output (the predicate is not a constant)",
+  leaksOutside(OUTSIDE + "/secret.json") && leaksOutside("leaked SKILL.md"),
+  "the predicate did not fire on a known-leaking output");
 // ── Negative twin 1: the platform exhibits the trap ─────────────────────────
 {
   const dir = fixture((d) => {
@@ -276,13 +289,16 @@ const leaksOutside = (out) => out.includes(OUTSIDE) || /\bsecret\.json\b/.test(o
 // checks that only look at the last component miss this; the full physical
 // resolution does not.
 {
-  const dir = fixture((d) => symlinkSync(OUTSIDE, join(d, "operations")));
+  const dir = fixture((d) => {
+    symlinkSync(OUTSIDE, join(d, "operations"));
+    symlinkSync(join(PROJECT_ROOT, "scripts"), join(d, "scripts"));
+  });
   const s1 = runBlock(step1, dir);
   check("#1051 F: a symlink in an intermediate component is detected (offered, not silently skipped)",
     s1.rc === 0 && isSkillLintOffered(s1.out), `rc=${s1.rc} out=${JSON.stringify(s1.out.trim())}`);
   const sl = runBlock(slBlock, dir);
   check("#1051 F: skill-lint refuses through an intermediate symlinked component",
-    sl.rc !== 0 && /refusing to scan|outside the checkout/i.test(sl.out),
+    sl.rc !== 0 && /refusing to scan|outside the checkout/i.test(sl.out) && !leaksOutside(sl.out),
     `rc=${sl.rc} out=${JSON.stringify(sl.out.trim())}`);
 }
 
@@ -351,6 +367,33 @@ const leaksOutside = (out) => out.includes(OUTSIDE) || /\bsecret\.json\b/.test(o
   check("#1051 K: a sibling directory sharing a name prefix is refused (separator is load-bearing)",
     tv.rc !== 0 && !/✅/.test(tv.out) && /refusing to scan/i.test(tv.out),
     `rc=${tv.rc} out=${JSON.stringify(tv.out.trim())}`);
+}
+
+// ── Case K2/E2b: the SEPARATOR on the shared-tree arm ─────────────────────
+// K pins the repo arm's `"$repo_real"/*`; the agent arm is a second copy of the
+// same pattern and its `/` was unpinned — `"$agent_real/$2"*` (no slash) let
+// `templates -> ${AGENT_INFRA_PATH}/templates-evil` be scanned and reported
+// green, the same false-PASS class, on the delegated-tool path
+// (test-review P1-1, mutation-verified).
+{
+  const dir = fixture((d) => symlinkSync(join(ALLOWED, "templates-evil"), join(d, "templates")));
+  const s1 = runBlock(step1, dir, { AGENT_INFRA_PATH: ALLOWED });
+  check("#1051 K2: a shared-tree prefix sibling is OFFERED (present, so it must fail closed)",
+    s1.rc === 0 && isTemplateValidityOffered(s1.out), `rc=${s1.rc} out=${JSON.stringify(s1.out.trim())}`);
+  const tv = runBlock(tvBlock, dir, { AGENT_INFRA_PATH: ALLOWED });
+  check("#1051 K2: a shared-tree prefix sibling is refused (the agent arm's separator is load-bearing)",
+    tv.rc !== 0 && /refusing to scan/i.test(tv.out) && !/✅/.test(tv.out) && !/templates-evil/.test(tv.out),
+    `rc=${tv.rc} out=${JSON.stringify(tv.out.trim())}`);
+}
+{
+  const dir = fixture((d) => {
+    symlinkSync(join(ALLOWED, "skills-evil"), join(d, "skills"));
+    symlinkSync(join(PROJECT_ROOT, "scripts"), join(d, "scripts"));
+  });
+  const sl = runBlock(slBlock, dir, { AGENT_INFRA_PATH: ALLOWED });
+  check("#1051 E2b: a shared-tree skills prefix sibling is refused (not linted as the skills subtree)",
+    sl.rc !== 0 && /refusing to scan/i.test(sl.out) && !/✅/.test(sl.out) && !leaksOutside(sl.out),
+    `rc=${sl.rc} out=${JSON.stringify(sl.out.trim())}`);
 }
 
 // ── Case L: a checkout path containing spaces round-trips ───────────────────
@@ -594,15 +637,40 @@ if (process.getuid?.() === 0) {
     check("#1051 Q: an unlistable templates/skills is OFFERED (present, not empty)",
       s1.rc === 0 && isTemplateValidityOffered(s1.out) && isSkillLintOffered(s1.out),
       `rc=${s1.rc} out=${JSON.stringify(s1.out.trim())}`);
-    for (const [label, block, expect] of [["template-validity", tvBlock, /template-validity/], ["skill-lint", slBlock, /skill-lint/]]) {
+    // The verdict must be the rc-3 wording for THIS label: `/no verifiable|refusing to scan/`
+    // accepted the rc-2 (boundary) refusal too, so `[ -r ] || return 2` passed while the
+    // block told the operator the tree was outside a boundary it is inside, and produced
+    // NO `refusing to scan` line (test-review P2-2, mutation-verified).
+    for (const [label, block, expect, wording] of [
+      ["template-validity", tvBlock, /template-validity/, /no verifiable templates dir/],
+      ["skill-lint", slBlock, /skill-lint/, /no verifiable skills dir/],
+    ]) {
       const r = runBlock(block, dir);
-      check(`#1051 Q: ...then ${label} fails closed on an unlistable start point`,
-        r.rc !== 0 && expect.test(r.out) && /no verifiable|refusing to scan/.test(r.out) && !/✅/.test(r.out),
+      check(`#1051 Q: ...then ${label} fails closed with its OWN rc-3 verdict`,
+        r.rc !== 0 && expect.test(r.out) && wording.test(r.out) &&
+          !/refusing to scan/.test(r.out) && !/✅/.test(r.out),
         `rc=${r.rc} out=${JSON.stringify(r.out.trim())}`);
     }
   } finally {
     targets.forEach((p, i) => chmodSync(join(dir, p), prev[i]));
   }
+}
+
+// ── Case S / S2: the delegated linter's checked-count backstops ─────────────
+// A resolved skills dir whose every candidate is pruned by the linter's own
+// `_*`/`.*` rules lints 0 files: without the `-gt 0` backstop the block exits 0
+// having verified nothing, and the `cannot parse checked-count` branch was never
+// exercised at all (test-review P2-2, mutation-verified both ways).
+{
+  const dir = fixture((d) => {
+    mkdirSync(join(d, "skills", "_archive"), { recursive: true });
+    copyFileSync(SKILL_PATH, join(d, "skills", "_archive", "SKILL.md"));
+    symlinkSync(join(PROJECT_ROOT, "scripts"), join(d, "scripts"));
+  });
+  const sl = runBlock(slBlock, dir);
+  check("#1051 S: skill-lint fails closed when the delegated linter checks 0 skills",
+    sl.rc !== 0 && /linted 0 skills/.test(sl.out) && !/✅/.test(sl.out),
+    `rc=${sl.rc} out=${JSON.stringify(sl.out.trim())}`);
 }
 
 // ── Case R1: C9 behaviourally — a failed `cd` must not be continued past ────

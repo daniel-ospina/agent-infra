@@ -46,16 +46,16 @@ In scope — each class has a runnable test in `extensions/shared/test-infra-ver
 | # | Adversarial input | Required behaviour | Test |
 |---|---|---|---|
 | C1 | start-point symlink → out-of-checkout dir (`templates -> /`, `skills -> <outside>`) | Step 1 **offers**; Step 2 exits non-zero, explicit refusal; no outside path enumerated | A, E |
-| C2 | start-point symlink → shared tree, **non-matching** subtree (`templates -> $AGENT_INFRA_PATH/skills`) | refused (subtree bound) | B2 |
+| C2 | start-point symlink → shared tree, **non-matching** subtree (`templates -> $AGENT_INFRA_PATH/skills`, or a name-**prefix** sibling of the matching subtree) | refused (subtree bound **and** the trailing-`/` separator on the shared-tree arm) | B2, E2, K2, E2b |
 | C3 | symlink in an **intermediate** path component (`operations -> <outside>`, real `skills` beneath) | whole-chain physical resolution refuses it | F |
 | C4 | **unresolvable** start point — dangling symlink **or symlink loop** (`ELOOP`), on either start point (`templates` **or** `skills`) | present, so **offered**; Step 2 fails closed; no walk, never silently un-offered | H (templates) + P (skills: dangling, loop, plain file) + absent twins |
 | C5 | symlinked **descendant** (`templates/nested -> <outside>`; `skills/x/SKILL.md -> <outside>`) | `find` engine: not traversed (`-P`); delegated linter: **refused** (it *does* follow a symlinked `SKILL.md` file) | G (+ `-L` twin), M (+ linter twin) |
 | C6 | vulnerable start-point forms in shipped source (`find <dir>/`, `find -H`, `find -L`, and **any** quoting form of a trailing slash: `find "$var/"`, `find skills/`) | absent from every shipped bash fence — asserted on the actual operand of every non-comment `find`, with anti-vacuity twins per form | I |
 | C7 | boundary basis unavailable (`repo_real=""` from a failed `pwd -P`) | refused — no `"/*"` wildcard admission | J |
 | C8 | `AGENT_INFRA_PATH` misconfigured (regular file, `/`, dangling, symlink, relative) | file//`/`/dangling → refuse; symlink/relative → resolve and admit only the matching subtree | N |
-| C9 | **unchecked or non-failing `cd <REPO_ROOT>`** (`cd $x`, `cd "$x"`, `cd "$x" \|\| true`, `cd "$x" \|\| exit 0`) silently rebasing `repo_real` to the ambient cwd | every block is `cd "<REPO_ROOT>" \|\| exit 1` (predicate self-tested per form) **and** behaviourally: each block run with `<REPO_ROOT>` unsubstituted exits non-zero and enumerates nothing in the ambient cwd | L, I, R |
+| C9 | **unchecked or non-failing `cd <REPO_ROOT>`** (`cd $x`, `cd "$x"`, `cd "$x" \|\| true`, `cd "$x" \|\| exit 0`) silently rebasing `repo_real` to the ambient cwd | every block is `cd "<REPO_ROOT>" \|\| exit 1` (predicate self-tested per form) **and** behaviourally: each block run with `<REPO_ROOT>` unsubstituted exits non-zero and enumerates nothing in the ambient cwd | L, I, R1, R2 |
 | C10 | the symlinked-`SKILL.md` refusal being **wider than the linter's own prune set** (a `_*`/`.*` entry the linter never reads) | no false red — the refusal mirrors `check-skill-lint.mjs`'s prune exactly | M2 |
-| C11 | a start point that is **present but unlistable** (mode 111: `[ -d ]` passes because it needs only `+x`, `find` cannot read it) | rc 3 → offered → failed closed, so the check cannot vanish silently | Q |
+| C11 | a start point that is **present but unlistable** (mode 111: `[ -d ]` passes because it needs only `+x`, `find` cannot read it) | rc 3 → offered → failed closed with its own verdict, so the check cannot vanish silently | Q |
 
 Out of scope (stated, not chased):
 
@@ -103,7 +103,7 @@ three preambles are byte-identical.
 
 | Touch point | Type | Covered by | Status |
 |---|---|---|---|
-| `skills/post-deploy-verify/infra-verify/SKILL.md` — **3 `bounded_root` preambles across 5 executable fences** (all five `cd`-guarded) covering 4 `find` start points | skill bash | `bounded_root` + `find -P`; tests A/B/B2/D/E/E2/F/H/P/Q/R | ✅ |
+| `skills/post-deploy-verify/infra-verify/SKILL.md` — **3 `bounded_root` preambles across 5 executable fences** (all five `cd`-guarded) covering 4 `find` start points | skill bash | `bounded_root` + `find -P`; tests A/B/B2/D/E/E2/F/H/P/Q/R1/R2/K2/E2b/S | ✅ |
 | `templates/` enumeration, symlinked skills dir, **`ci-config` enumeration** (the three surfaces #1051 names) | skill bash | the first two are covered above; `ci-config` uses single-level globs (`.github/workflows/*.yml`) that follow a symlinked path component — **deferred → #1083** (bounded, so fail-open is not reachable; the prose says so and does not claim otherwise) | ⚠️ deferred |
 | `${AGENT_INFRA_PATH}` boundary contract | skill contract / env | Contract "Input" line + C8 tests | ✅ |
 | `${AGENT_INFRA_PATH}` unset vs `scripts/link-skills.sh` (`$HOME/agent-infra` fallback) | env contract | **deliberate divergence**, documented in the skill's Contract and pinned by test R (a symlinked tree with the var unset is offered, then refused naming the var — never a silent skip). The ≥5 in-repo fallback definitions are folded into **#1096** | ⚠️ residual |
@@ -117,7 +117,7 @@ three preambles are byte-identical.
 
 ## Verification
 
-`node extensions/shared/test-infra-verify-scan.mjs` → **93 passed, 0 failed**. Negative twins executed
+`node extensions/shared/test-infra-verify-scan.mjs` → **98 passed, 0 failed**. Negative twins executed
 in the same suite: `find <dir>/`, `find -H`, `find -L` each LEAK the sentinel while the fixed form
 refuses; the delegated linter's follow of a symlinked `SKILL.md` is exercised both ways (refused by the
 skill, reproduced by the linter). Mutation-verified RED (each mutation applied to a scratch copy, never
@@ -265,6 +265,25 @@ fence, and `bash -n` on every fence.
   - **P2 (conf 60, bug scan)** — case Q captured the original mode but never restored it (`void prev`);
     an abnormal exit could leave a mode-111 tree that `rmSync` cannot empty. Fixed with `try`/`finally`
     restoring the captured modes.
+  - **Fresh post-fix verification round** (two independent fresh reviewers, after the fixes above):
+    - **P1 (conf 95, test quality)** — the shared-tree arm's separator, `"$agent_real/$2"/*`, was
+      **unpinned**: `"$agent_real/$2"*` left the suite green, and `templates ->
+      ${AGENT_INFRA_PATH}/templates-evil` was then scanned and reported green — the same false-PASS
+      class on the delegated-tool path. Fixed: cases **K2** (templates arm) and **E2b** (skills arm)
+      with prefix-sibling dirs under the allowed tree; mutation M39 → RED on both.
+    - **P2 (conf 95, test quality)** — `leaksOutside` had **no positive control**: all nine uses are
+      negated, so `() => false` was undetected, and a refusal that echoed the out-of-boundary physical
+      path could leak with the suite green. Fixed: a positive-control twin (T1 → RED).
+    - **P2 (conf 90, test quality)** — case Q accepted either refusal wording, so
+      `[ -r "$1" ] || return 2` passed while the block claimed a present in-checkout tree was *outside*
+      the boundary; and the linter's `checked 0` backstop was unpinned. Fixed: Q asserts each label's
+      own rc-3 verdict (M32 → RED) and case **S** pins the 0-lint backstop (M29 → RED).
+    - **P2 (conf 85, test quality)** — case F's fixture lacked the `scripts` symlink its own comment
+      claimed, so its refusal rested on wording alone. Fixed: fixture aligned and a leak assertion added.
+    - **P2 ×5 (conf 85–100, consistency)** — the issue comment still carried `66 passed` and the
+      pre-C11 rc-2 definition, called #1049 a *live* issue (it is closed `NOT_PLANNED`), and the plan
+      doc said C1–C10 / "two residuals" / a 495-line skill / `tests …/Q/R`. All corrected.
+
   - **P2 (conf 90/68, plan-review)** — the `plan-review` marker and two "not run" statements were stale
     once the gate ran, and the **scoping comment** still carried the old counts and the rc-2 definition
     without "no boundary basis". Fixed: the marker now carries the gate's real signature, and the issue
@@ -273,10 +292,10 @@ fence, and `bash -n` on every fence.
 ### Adversarial-bound disclosure
 
 `[ADVERSARIAL-BOUND] cycles=2 threats=11 covered=11 residuals=#1083,#1084,#1096` — acceptance here is
-**declared-threat-surface coverage** (every class C1–C10 test-covered + green CI), not a literal
-`NO ISSUES FOUND`; the two residuals are filed and deliberately not chased. Class C10 and the cycle-2
-P1 were found by these gates and fixed in-cycle; the bound was not consumed to hide an unresolved
-issue.
+**declared-threat-surface coverage** (every class C1–C11 test-covered + green CI), not a literal
+`NO ISSUES FOUND`; the three residuals are filed and deliberately not chased. Class C10, the cycle-2
+P1 and C11 were found by these gates and fixed in-cycle; the bound was not consumed to hide an
+unresolved issue.
 - **duplication & architecture reviewer** (advisory): `unify-contract-keep-drivers` on the containment
   predicate duplicated across scripts — recorded, not actioned here (the skill cannot `source` a helper;
   a shared contract doc is the follow-up home). `keep separate` on the 3 in-file copies (byte-identity
@@ -310,7 +329,7 @@ issue.
    *current* follow set (tests M/M2), but a future `check-skill-lint.mjs` that *widens* what it reads
    (e.g. starts recursing into symlinked dirs) would turn nothing red. Any change to that script must
    re-derive the refusal; the coupling is a comment-level contract today, not a test.
-3b. `type: Bounded` on a now-495-line skill is **pre-existing** (~297 at HEAD) and deliberately **not**
+3b. `type: Bounded` on a now-510-line skill is **pre-existing** (~297 at HEAD) and deliberately **not**
    restructured here: the three byte-identical preamble copies are forced by the copy-paste-executable
    block contract (a fresh shell cannot `source` a helper), and splitting into `workflow/*.md` would
    put the executable blocks behind a second read at dispatch time. Trigger to revisit: any future
