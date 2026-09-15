@@ -50,6 +50,7 @@ For each issue found, return EXACTLY this format (one per issue):
 
 ISSUE:
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward this gate, never filed as an issue]
   dimension: interface-impact|edge-cases|test-coverage|surface-map-quality
   location: [Task N, Step M] or [Header section name]
   description: [what's wrong]

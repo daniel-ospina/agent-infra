@@ -131,9 +131,14 @@ The subagent must return a structured result:
 ```
 STATUS: CLEAN | HAS_ISSUES
 ISSUES (if any):
-  - [ERROR] <file>: <description>
-  - [WARNING] <file>: <description>
+  - [ERROR] <file>: <description> — consequence: <what breaks, who observes it> (REQUIRED; without it the item is advisory: logged, never blocking, never filed as an issue)
+  - [WARNING] <file>: <description> — consequence: <what breaks, who observes it> (REQUIRED; as above)
 ```
+
+Every item must also carry an explicit consequence — the failure it causes and who observes it. An item
+that states no consequence is **advisory**: it is logged, never blocks merge, and is never filed as an
+issue (canonical: `proportional-gates` §Findings Must Declare Consequence). "Fix, don't pay for itself" is
+the failure this rule exists to stop.
 
 Only `[ERROR]` items trigger the fix-loop. `[WARNING]` items are logged but do not block merge.
 

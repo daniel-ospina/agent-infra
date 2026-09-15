@@ -482,6 +482,7 @@ The verifier reads the `### Verification Plan` from the plan doc (if present) an
 ISSUE:
   check_type: <type>
   severity: P0|P1|P2
+  consequence: [what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward this gate, never filed as an issue]
   location: <file>:<line> or [section name]
   description: <what's wrong>
   suggestion: <how to fix>
