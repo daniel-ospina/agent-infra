@@ -144,8 +144,9 @@ entries, which is where a reason is rendered.
 A row is **partial** when the sub-skill's `status` is `pass` **and** it reported `not_offered`
 entries **or** any check whose `validated` < `total`. Render that as `✅ pass (partial)` with a
 `Checks` cell of `N/M (+K not offered)`, where `N` = offered checks that passed, `M` = offered
-checks, and `K` = the `not_offered` count; a short per-check `validated X/N` is shown in the row's
-evidence note, never folded into `N/M`. **A row whose `status` is `fail` always renders `⚠️ fail`** —
+checks, and `K` = the `not_offered` count; a short per-check count is shown in the row's evidence
+note as `validated X/T` (`T` = that check's own matched-set total), never folded into `N/M`.
+**A row whose `status` is `fail` always renders `⚠️ fail`** —
 the not-offered count may be appended to its `Checks` cell, but never to its status. The `Issues`
 column holds GitHub issue numbers only — never a note or a reason.
 
@@ -158,8 +159,8 @@ A `skip` row renders its surface-level `reason` as a note under the table (the `
 reserved for issue numbers), so a skipped surface is never reported without saying why.
 
 **All pass:** "✅ Post-deploy verification: all surfaces passed."
-**All pass, but partial coverage:** "⚠️ Post-deploy verification: all offered surfaces passed." followed by the applicable clauses — when `K > 0`, "K check(s) not offered — <names>; surface(s) with unverified targets: <list>"; and when any check reported `validated` < `total`, "J check(s) only partially validated — <names>", where `J` is the count of such checks (a distinct symbol from the cell's `N`). A partial run never uses the plain all-pass line.
-**Some fail:** "⚠️ Post-deploy verification: N/M surfaces passed. Failures: <list>"
+**All pass, but partial coverage:** "⚠️ Post-deploy verification: all offered surfaces passed." followed by the applicable clauses — when `K > 0`, "K check(s) not offered — <names>; surface(s) with unverified targets: <list>"; and when any check reported `validated` < `total`, "J check(s) only partially validated — <names>", where `J` is the count of such checks. Across the partial-coverage contract each symbol carries one meaning: `N`/`M` = offered checks passed / offered checks (or surfaces, in the `Some fail` line), `K` = the `not_offered` count, `J` = checks partially validated, `X`/`T` = a single check's validated / matched-set total. A partial run never uses the plain all-pass line.
+**Some fail:** "⚠️ Post-deploy verification: N/M surfaces passed. Failures: <list>" (here `N`/`M` count **surfaces**, not checks)
 **All fail/skip:** "⏭️ Post-deploy verification: no verification run"
 
 ### Step 4 — File Issues for Failures
