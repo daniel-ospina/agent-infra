@@ -1073,6 +1073,13 @@ export function nextLegAfter(
  * same state from a root-ask resolves the final leg — conservative direction
  * (halt, never a wrong dispatch); the primary dispatch path always requests
  * the primary or the leg just used, so the disagreement is unreachable there.
+ * The SAME shape applies to a fresh family record whose `activeLeg` is null
+ * ("the primary is serving") and non-terminal: it takes neither the
+ * latched-active fast path nor the #727 root-retry (which is scoped to a
+ * RESOLUTION-ONLY frozen leg), so an explicit ask for the terminal usable leg
+ * halts while a root ask on the identical state resolves that leg. Unchanged
+ * from pre-#727 (the then-final leg behaved the same) and left conservative on
+ * purpose: halting never dispatches a wrong model, and the ask is explicit.
  */
 export interface ResolveOutcome {
   leg: LegRef | null;

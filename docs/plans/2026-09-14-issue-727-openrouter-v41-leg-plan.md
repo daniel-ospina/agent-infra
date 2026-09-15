@@ -67,7 +67,7 @@ must-stay dispatch of that exact leg with no fresh latch.
 |---|---|---|---|
 | Provider registration | `extensions/custom-provider-openrouter/index.ts` | register `deepseek/deepseek-v4.1-flash` (reasoning true, `off`/`high`/`max`, text+image, 300K) | `pi --list-models` shows it, reasoning = yes |
 | Clamp authority | `pi-bootstrap/pi-config/models.json` | `providers.openrouter.modelOverrides["deepseek/deepseek-v4.1-flash"].contextWindow = 300000` | `scripts/check-cost-config.sh` PASS |
-| Chain table | `extensions/shared/provider-failover.ts` | openrouter leg → V4.1 slug; 0423 kept last as resolution-only, guarded on BOTH serve paths (advance walk + latched-active) | `provider-failover.test.ts` 81/0 |
+| Chain table | `extensions/shared/provider-failover.ts` | openrouter leg → V4.1 slug; 0423 kept last as resolution-only, guarded on BOTH serve paths (advance walk + latched-active) + a root-retry when the frozen leg is retired | `provider-failover.test.ts` 82/0 |
 | Family identity | `extensions/shared/provider-failover.ts` `familyOf` | `deepseek/deepseek-v4.1-flash` (slash form) → flash family | new pin + `default-coverage.test.ts` 5/0 |
 | Latch/session behavior | `extensions/provider-exhaustion.ts`, `extensions/provider-exhaustion.test.ts` | hop target = V4.1 slug; comment sync | `provider-exhaustion.test.ts` 36/0 |
 | Consumer suite | `extensions/builtin-tools/builtin-tools.test.ts` | `OPENROUTER_FLASH` = V4.1 slug | 237/0 all green |
@@ -88,6 +88,15 @@ Revert the PR. No durable state migration: the legacy slug stays registered and 
 pre-#727 latch files / markers / sessions keep resolving throughout — a record whose `activeLeg` is
 the 0423 slug resolves to the family's first available leg rather than dispatching it. The clamp key is
 additive.
+
+### Accepted residuals
+
+- A fresh family record whose `activeLeg` is **null** ("the primary is serving") takes neither the
+  latched-active fast path nor the root-retry (scoped to a RESOLUTION-ONLY frozen leg), so an explicit
+  ask for the terminal usable leg halts where a root ask on the same state resolves that leg. Same
+  shape as the long-standing hop-ask residual on a latch with no per-family state, unchanged from
+  pre-#727; halting never dispatches a wrong model and the ask is explicit. Documented in the
+  `resolveWithChain` docstring.
 
 ## Learnings
 
