@@ -1153,11 +1153,11 @@ export function resolveWithChain(
   // record has no migration path (only TTL self-heal), so treating it as
   // unusable skips the fast path: resolution advances along the chain instead
   // (retrying from the family ROOT if that walk halts — see below), which
-  // yields the family's CURRENT hop target (the V4.1 leg) whether the ask was
-  // the root, the current hop leg, or the retired slug itself — or a structured
-  // halt when nothing is left. Never the legacy build. The one surviving
-  // must-stay case is a dispatch of an exact leg with NO fresh latch at all
-  // (the early `clear` return above).
+  // yields the family's first AVAILABLE leg (the V4.1 openrouter leg while
+  // `qwen-tp` stays config-blocked) whether the ask was the root, the current
+  // hop leg, or the retired slug itself — or a structured halt when nothing is
+  // left. Never the legacy build. The one surviving must-stay case is a dispatch
+  // of an exact leg with NO fresh latch at all (the early `clear` return above).
   if (
     fam?.activeLeg &&
     !unavailable.has(fam.activeLeg.provider) &&
@@ -1198,9 +1198,10 @@ export function resolveWithChain(
   // a halt with an available target sitting at it.
   let step = nextLegAfter(family, requested, state, { env, now, ttlMs: ttl });
   // `!= null`, NOT `!== undefined`: a family record legitimately carries
-  // `activeLeg: null` ("the primary is serving"), and isResolutionOnlyLeg(null)
-  // would dereference null — turning a designed HALT into a TypeError on the
-  // dispatch path.
+  // `activeLeg: null` ("the primary is serving"), which is not a retired leg and
+  // must not take the retry. Belt-and-braces with the predicate's own
+  // null-tolerance (see isResolutionOnlyLeg) so that adding an untolerant call
+  // site later cannot reintroduce a null deref on the dispatch path.
   if (step.halted && fam?.activeLeg != null && isResolutionOnlyLeg(fam.activeLeg)) {
     const rootLeg = familyLegs(family)?.[0];
     if (rootLeg) step = nextLegAfter(family, rootLeg, state, { env, now, ttlMs: ttl });

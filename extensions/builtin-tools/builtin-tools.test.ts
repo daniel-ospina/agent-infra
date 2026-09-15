@@ -3289,7 +3289,8 @@ test("decidePostDispatch: terminal hop leg connection-error → return (never re
       fromLeg: FLASH_ROOT,
       env,
     });
-    // active leg is openrouter (terminal — last in chain when qwen-tp blocked)
+    // active leg is openrouter (terminal — the last SERVABLE leg: the retired
+    // 0423 entry that follows it is resolution-only since #727)
     equal(readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"].activeLeg.provider, "openrouter");
     const decision = decidePostDispatch({
       result: connErrResult(),
