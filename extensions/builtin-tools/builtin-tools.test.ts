@@ -2869,6 +2869,19 @@ test("#1070: loop wiring — the effective gap is latched + threaded, and all fo
   equal(src.split("hbThresholds.cutGapMs").length - 1, 0, "no diagnostic reads the unscaled cut base — clause and headline agree");
   equal(src.split("effStreamAgeMs=").length - 1, 4, "all four kill paths report the effective stream age");
   equal(src.split("effToolAgeMs=").length - 1, 4, "all four kill paths report the effective tool age");
+  // #1070 (review cycle 1): the headline must report the EFFECTIVE age too —
+  // the clauses fire on effStreamAge/effToolAge, so a headline printing the raw
+  // frozen sample contradicted the payload printed beside it.
+  equal(src.split("Math.round(effStreamAgeMs / 1000)").length - 1, 4, "headlines + the triage line print the EFFECTIVE stream age (3 headlines + the diagnostic)");
+  equal(src.split("Math.round(effToolAgeMs / 1000)").length - 1, 1, "the tool-stall headline prints the EFFECTIVE tool age");
+  equal(src.split("hbCtx.state.streamAgeMs / 1000").length - 1, 0, "no headline prints the raw frozen stream age");
+  equal(src.split("hbCtx.state.toolAgeMaxMs / 1000").length - 1, 0, "no headline prints the raw frozen tool age");
+  // #1070 (review cycle 1): the cut-gap reachability invariant — one shared
+  // fresh window, and a one-shot warning when the scaled gap makes the clause
+  // structurally unreachable.
+  equal(src.split("const freshWindowMs = Math.max(2 * HEARTBEAT_TIMEOUT_MS, 2 * getHeartbeatIntervalMs());").length - 1, 1, "freshWindowMs is defined ONCE and shared by the cut-gap warning and the backstop");
+  ok(src.includes("the cut clause cannot fire for this dispatch"), "the loop warns when the scaled cut gap >= the stateFresh window");
+  ok(src.includes("let cutInertWarned = false"), "the unreachability warning is one-shot per dispatch, not per tick");
 });
 
 
