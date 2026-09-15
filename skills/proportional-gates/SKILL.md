@@ -146,14 +146,18 @@ observes it (a user, an operator, a downstream component, CI). A restatement of 
 word, or a bare "it breaks" is **not** a consequence.
 
 **A finding without an adequate consequence is advisory: non-blocking, not counted toward the gate, and
-not filed as a GitHub issue.** This governs findings raised inside a review gate — `AGENTS.md`'s
-auto-file rule does not re-mandate a consequence-less reviewer finding into an issue, and for a gate's
+not filed as a GitHub issue.** This governs findings raised inside a review gate. `AGENTS.md`'s
+auto-file rule is written unconditionally and is **not** amended by this skill: this rule **takes
+precedence for a finding raised inside a review gate**, and closing the remaining gap — auto-filing on
+incidental discovery while working — is tracked by **#906**. For a gate's
 exit conditions the clean predicate is that gate's own **full** clean token, never a count and never a
 substring (e.g. `NO ISSUES FOUND — DEGRADED` is not clean).
 
 **Conformance floor.** If a cycle yields ≥1 finding and **none** carries an adequate `consequence:`, that
 is malformed reviewer output, not a clean cycle: record `⚠️ reviewer returned N consequence-less
-findings`, re-dispatch once, and then exit **non-clean**. Voided findings are still written to the cycle
+findings`, re-dispatch once, and then exit **non-clean**. **Where the gate's own bound is already spent,
+record the marker and exit non-clean without the extra dispatch** — the floor never widens a bound, and
+`AGENTS.md` §Hard Cap counts every dispatch as a round. Voided findings are still written to the cycle
 log, so convergence and stall detection read them and cannot read a shrunken set as convergence. Findings
 from reviewers that are *advisory by construction* (`duplication-architecture`; `improvement-opportunities`
 P1/P2) are recorded, never counted, and **do not trigger the floor**.

@@ -109,7 +109,7 @@ Review this epic research brief for:
 3. ADVERSARIAL BALANCE: Does research include disconfirming evidence, not just confirmation?
 4. SOURCE QUALITY: Are claims sourced (internal codebase, external docs, web research)?
 
-Return: NO ISSUES FOUND | ISSUES: <list>
+Return: NO ISSUES FOUND | ISSUES: <list — each finding carries `consequence: <what breaks, who observes it>` (REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue)>
 ```
 
 Fix-loop until "NO ISSUES FOUND" or convergence; safety cap: 10 cycles.

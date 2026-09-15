@@ -418,6 +418,7 @@ Return:
 | `DEGRADED` | Record + name the unavailable source. Not clean, not blocking. Proceed with the caveat in the Plan doc. |
 | `ISSUES` with a verdict | Record. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
 | `ISSUES` with **no** verdict | Invalid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
+| `ISSUES` with a verdict but **no adequate `consequence:`** | **The floor fires — this overrides the row above.** The finding is voided, re-dispatch once, exit **non-clean**. |
 
 **This reviewer never enters the P0/P1 re-dispatch loop above and never fails the gate.** Its P0 is advisory severity, not blocking severity. Do not re-dispatch the solution verifiers because this reviewer found something.
 
@@ -459,6 +460,7 @@ CHECK ACROSS ALL PHASES:
 7. HYPOTHESIS RULE: If the issue body prescribes a solution ("the fix is X"), was it treated as a hypothesis to verify — not the settled plan?
 
 Severity: P0=structural, P1=important gap, P2=improvement, P3=nitpick, P4=suggestion.
+Each finding must also declare `consequence: <what breaks, who observes it>` — REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue.
 If no issues: NO ISSUES FOUND
 ```
 

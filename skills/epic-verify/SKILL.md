@@ -107,7 +107,7 @@ Review this epic verification for:
 2. MISSING CHECKS: Are there pipeline integrity checks not covered by the 5 steps?
 3. CROSS-PHASE DRIFT: Read the actual artifacts and verify they're coherent — don't trust the checkboxes.
 
-Return: NO ISSUES FOUND | ISSUES: <list>
+Return: NO ISSUES FOUND | ISSUES: <list — each finding carries `consequence: <what breaks, who observes it>` (REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue)>
 ```
 
 Fix-loop until "NO ISSUES FOUND" or convergence; safety cap: 10 cycles (verification is auditing, not creating).

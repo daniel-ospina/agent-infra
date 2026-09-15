@@ -53,7 +53,7 @@ Review this research output for:
 4. FINDINGS-DATE: Does the output carry a `> **Findings date:**` stamp or documented skip?
 5. RAW NOTES: Are findings persisted to `## Raw Notes` (append-only, timestamped, source-tagged) per research-protocol §13?
 
-Return: NO ISSUES FOUND | ISSUES: <list>
+Return: NO ISSUES FOUND | ISSUES: <list — each finding carries `consequence: <what breaks, who observes it>` (REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue)>
 ```
 
 Fix-loop until clean or convergence (10-cycle cap).

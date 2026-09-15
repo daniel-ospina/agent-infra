@@ -42,8 +42,11 @@ steps:
 > non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
 > cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
 > `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
-> this gate's own full clean token (`MECE CLEAN`), never a count. MECE findings **are** in the contract —
-> the `fix: <create new issue | …>` action runs only for a finding that carries an adequate
+> the token of the reviewer class in question — never a count, never a substring of a qualified token:
+> the **per-issue review gate** clears on bare `NO ISSUES FOUND`; the **MECE gate** clears on
+> `MECE CLEAN`; the **out-of-pattern `duplication-architecture` reviewer** clears only on
+> `NO ISSUES FOUND — CLEAN` and `…— DEGRADED (<source>)` is not clean. MECE findings **are** in the
+> contract — the `fix: <create new issue | …>` action runs only for a finding that carries an adequate
 > `consequence:`.
 
 > **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
@@ -107,7 +110,7 @@ Review this issue for:
 4. DEPENDENCY CORRECTNESS: Are dependencies accurate and complete?
 5. VERIFICATION CHECKLIST: Does the issue body reference the epic's test-design surface map and include a verification checklist derived from it (surface → test layer → expected verification)? Are any surfaces this issue touches missing from the checklist?
 
-Return: NO ISSUES FOUND | ISSUES: <list>
+Return: NO ISSUES FOUND | ISSUES: <list — each finding carries `consequence: <what breaks, who observes it>` (REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue)>
 ```
 
 **Resilience:** Per-issue review sub-agents may time out. Inherits retry/timeout from builtin-tools (epic #6038 Phase 4). On zero-output timeout: retry with backoff (max 3). On exhaustion: flag gap and continue ("⚠️ review for issue #N timed out — manual review needed"). Use partial-failure pattern from `parallel-orchestrator`. Never block decomposition on a single reviewer failure.
@@ -137,11 +140,12 @@ CHECK:
 For each gap found:
 ISSUE:
   type: overlap | gap | cycle | serialization
+  consequence: <what breaks, and who observes it - REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue>
   description: <what's wrong>
   affected_issues: <issue numbers>
   fix: <create new issue | merge issues | reorder dependencies>
 
-Return: MECE CLEAN | ISSUES: <list>
+Return: MECE CLEAN | ISSUES: <list — each finding carries `consequence:`>
 ```
 
 **Fix-loop:** If issues found, fix (create/merge/reorder issues) and re-run MECE verification. Safety cap: 10 cycles (convergence-gated). On safety cap: log remaining gaps, proceed.

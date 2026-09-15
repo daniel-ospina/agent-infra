@@ -376,8 +376,8 @@ schema occurrence in each gate file, not one per file.
   true that every gate already cites it** — today `grep -rln proportional-gates skills/` returns:
   `plan-review`, `issue-workflow`, `project-workflow`, `task-workflow-standard`, `executing-plans`,
   `execution-intent`, `commit-workflow/workflow/01-preflight.md`,
-  `writing-plans/workflow/02-research-intake.md`, and `proportional-gates` itself. Of the 13 consumer
-  gates, only `plan-review` cites it, so **Task 4 adds the citation to the other twelve.** The new
+  `writing-plans/workflow/02-research-intake.md`, and `proportional-gates` itself. Of the 14 consumer
+  gates, only `plan-review` cites it, so **Task 4 adds the citation to the other thirteen.** The new
   section is placed so it cannot disturb the machine-parsed `### Review Cycles` table or the single
   `<!-- adversarial-bound: cap=2 -->` anchor pinned by
   `extensions/loop-enforcer/tier-config-parity.test.ts`.
@@ -413,6 +413,29 @@ not reviewer prose. Therefore:
 - **`extensions/loop-enforcer/termination.ts` (`verdict === "CLEAN" && issuesFound === 0`) is out of the
   bar**: it reads the loop manifest, which the agent writes. The floor prose governs the agent that writes
   it; no code change is made. Named here so the exclusion is visible, not silent.
+
+### 4.4a The schema-region conformance check (§6)
+
+A whole-file `grep -c "consequence:"` is **not** a conformance test: the header blockquote this change
+adds to every gate contributes 2–3 occurrences on its own, so a file whose schemas carry nothing still
+passes. The check must be bounded to finding-emitting regions:
+
+```bash
+# (1) every finding-schema `severity:` line must be followed by the field — expect 0
+awk '/^[[:space:]]*severity:/{s=$0; getline; if ($0 !~ /consequence:/) print FILENAME": "s}' \
+  $(git diff --name-only main...HEAD -- 'skills/**/*.md') | tee /dev/stderr | wc -l
+# (2) the one finding schema with NO `severity:` line — `epic-decompose`'s MECE block — expect 1
+grep -A1 'type: overlap | gap' skills/epic-decompose/SKILL.md | grep -c 'consequence:'
+# (3) every dispatched return token must name the field — expect no output
+grep -rn 'Return:.*ISSUES: <list' skills/ | grep -v 'consequence:'
+```
+
+`severity:` alone is the (1) key **only because** the MECE schema is keyed `type:` — and (2) covers it
+explicitly, because a `severity:`-keyed pass is precisely what missed it. Do **not** widen (1) to
+`type:`, which also matches frontmatter and `task`-tool dispatch specs (`type: skill` / `type: parallel`)
+and would report ~31 false positives. The third command is the one that catches the epic gates: their
+prompt lines carry no `severity:` at all, so a `severity:`-keyed pass alone reports clean while zero
+prompt tokens ask for the field.
 
 ### 4.5 `improvement-opportunities` — the judgment call
 
@@ -483,12 +506,14 @@ are reworded per §4.5; `check-skill-lint` exits 0.
 
 **Intent:** A consequence-less finding is advisory — not blocking, not counted, not filed — without
 opening a vacuous-pass channel.
-**Acceptance:** **every finding-emitting site** in each of the 15 gate files carries the field — both the
-`ISSUE:` schemas *and* the `ISSUES: <list>` return tokens of the five epic gates (which have **zero**
-`ISSUE:` occurrences, so a bare `ISSUE:` count would pass vacuously); `07-review-gate.md` has no schema
+**Acceptance:** **every finding-emitting site** in each of the 16 gate files carries the field — both the
+`ISSUE:` schemas *and* the `ISSUES: <list>` return tokens of the six epic gates and `planning/shared/research` (which have **zero**
+`ISSUE:` occurrences, so a bare `ISSUE:` count would pass vacuously), plus the one `ISSUE:` schema with
+**no `severity:` line** (`epic-decompose`'s MECE block) and the third dispatch site in `issue-scoping`
+(its micro verifier prompt); `07-review-gate.md` has no schema
 and needs one added, not amended; each dispatch instruction requires the field; each merge/fix/exit step
-carries the void rule and the conformance floor; each of the **13** gate `SKILL.md` files gains the
-`proportional-gates` citation (**12** currently lack it); `improvement-opportunities` gets an explicit dispatch site +
+carries the void rule and the conformance floor; each of the **14** gate `SKILL.md` files gains the
+`proportional-gates` citation (**13** currently lack it); `improvement-opportunities` gets an explicit dispatch site +
 advisory disposition; the pinned regions/contracts in §4.4 are untouched (`tier-config-parity.test.ts`,
 `review-enforcer/index.test.ts`, `test-never-unbounded.mjs` green).
 **Files:** Modify `skills/code-review/SKILL.md`, `skills/code-review/references/fixer-loop.md`,

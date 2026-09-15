@@ -413,6 +413,7 @@ If a source was unavailable: NO ISSUES FOUND — DEGRADED (<source> unavailable)
 | `NO ISSUES FOUND — DEGRADED (<source>)` | Record + name the unavailable source. **Not clean, not blocking.** |
 | `ISSUES:` with a verdict | Record each verdict. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
 | `ISSUES:` with **no** verdict | Invalid. Re-dispatch once; if it repeats, record `⚠️ unverdict findings` and proceed. |
+| `ISSUES:` with a verdict but **no adequate `consequence:`** | **The floor fires — this overrides the row above.** The finding is voided, re-dispatch once, exit **non-clean**. |
 
 ⚠️ **Both tokens contain the substring `NO ISSUES FOUND`.** Never test #5's result with a substring match — `…— DEGRADED` is not a pass. Match the full token.
 

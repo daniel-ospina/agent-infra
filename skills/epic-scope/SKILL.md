@@ -132,7 +132,7 @@ Review this epic scope for:
 5. COMPLEXITY HONESTY: Are complexity ratings justified by the scope and research?
 6. RESEARCH CHECK (issue #231 D11): For each complexity axis rated `medium+`, is `### Axis Research Notes` present in the scope doc, OR a justified skip (cited brief section covering the boundary question at sufficient granularity)?
 
-Return: NO ISSUES FOUND | ISSUES: <list>
+Return: NO ISSUES FOUND | ISSUES: <list — each finding carries `consequence: <what breaks, who observes it>` (REQUIRED; without it the finding is advisory only: never blocking, never counted toward the gate, never filed as an issue)>
 ```
 
 Fix-loop until "NO ISSUES FOUND" or convergence; safety cap: 10 cycles.
@@ -180,6 +180,7 @@ Return the skill's summary block, then:
 | `DEGRADED` | Record + name the unavailable source. **Do not** treat as clean, **do not** block. Proceed with the caveat carried into the scope doc. |
 | `ISSUES` with a verdict | Record each verdict in the scope doc. `unify` → fold into the boundary decision. `keep separate` / `unify-contract-keep-drivers` → record the reason; an unjustified `keep separate` is a scope item, not a pass. |
 | `ISSUES` with **no** verdict | Not a valid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
+| `ISSUES` with a verdict but **no adequate `consequence:`** | **The floor fires — this overrides the row above.** The finding is voided, re-dispatch once, exit **non-clean**. |
 
 **This reviewer never fails the gate and never enters the 10-cycle fix-loop above.** P0 here is advisory severity, not blocking severity — record it and proceed. Concretely: do not re-dispatch the *scope* reviewer because the duplication reviewer found something, and do not hold the gate open on it.
 

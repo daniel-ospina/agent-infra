@@ -56,8 +56,10 @@ steps:
 > non-blocking, not counted toward this gate, and not filed as an issue** (it is still recorded in the
 > cycle log). A cycle with ≥1 finding and none adequate is malformed reviewer output, not clean: record
 > `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. "Clean" is
-> this gate's own full clean token (`NO ISSUES FOUND — CLEAN`; never a substring match, and `…— DEGRADED`
-> is not clean), never a count. `improvement-opportunities` is dispatched from this gate's coherence
+> this gate's own token for the reviewer class in question, never a count and never a substring of a
+> qualified token: the **step reviewers** clear on bare `NO ISSUES FOUND` (step 2's pattern test); the
+> **out-of-pattern `duplication-architecture` reviewer** clears only on `NO ISSUES FOUND — CLEAN` —
+> `…— DEGRADED (<source>)` is not clean. `improvement-opportunities` is dispatched from this gate's coherence
 > review and is **advisory by construction** — its P1/P2 findings are recorded, never blocking, never
 > filed, and do not trigger the floor.
 
@@ -158,7 +160,7 @@ by name; it was reachable only as a coherence dimension.
 Every sub-step review follows the same pattern:
 
 1. Dispatch fresh-context reviewer via `task` sub-agent
-2. Reviewer returns: "NO ISSUES FOUND" or ISSUES: <list>
+2. Reviewer returns: "NO ISSUES FOUND" or ISSUES: <list — each finding carries `consequence: <what breaks, who observes it>`; without it the finding is advisory only: non-blocking, not counted, not filed>
 3. If issues: fix, re-dispatch (convergence-gated; safety cap: 10 cycles per sub-step)
 4. If clean: proceed to next sub-step
 5. If convergence at safety cap (10 cycles): log remaining issues, proceed with warning
@@ -178,6 +180,7 @@ The `duplication-architecture` reviewer is **advisory** and must never be fed in
 | `NO ISSUES FOUND — DEGRADED (<source>)` | Record + name the unavailable source in the plan doc. **Not clean, not blocking.** Proceed with the caveat. |
 | `ISSUES:` with a verdict | Record each verdict. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
 | `ISSUES:` with **no** verdict | Invalid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
+| `ISSUES:` with a verdict but **no adequate `consequence:`** | **The floor fires — this overrides the row above.** The finding is voided, re-dispatch once, exit **non-clean**. |
 | bare `NO ISSUES FOUND` (no qualifier) | **Not accepted as clean.** The skill's clean token is `NO ISSUES FOUND — CLEAN`. Re-dispatch once requiring the qualified token; if the bare form repeats, read the summary block's `Result:` line — treat as `DEGRADED (unqualified)` unless it names a full-clean result, and proceed. |
 
 **Never re-dispatch a step reviewer because the duplication reviewer found something**, and never hold a subs-step gate open on its findings. Its `P0` is advisory severity, not blocking severity. Record it and proceed; the finding survives into the plan doc as a decision the owner can act on.
