@@ -389,9 +389,15 @@ reviewer-emitter = 43 distinct files**; intervention 1 adds 1. **Grand total edi
 this plan doc = 45 changed paths).
 
 The inline `ISSUE:` schemas were **not** left to the per-gate blockquote: every `severity:` schema line
-in the gate files was given the field — **30 sites** across `code-review` (16), `plan-review` (5),
-`test-review` (4), `issue-scoping` (2), `prototype-review` (1), `verification-before-completion` (1),
-`research` (1). This is the point a reviewer caught: a blockquote at the top of the file does not put a
+in the gate files was given the field. Any **total** here is a moving target — each review cycle that adds
+a site changes it — so the figure is revision-anchored rather than quoted as a present state. **At
+`f8100f9`**, the commit that completed the inline-schema pass, it was **30 sites**: `code-review` (16),
+`plan-review` (5), `test-review` (4), `issue-scoping` (2), `prototype-review` (1),
+`verification-before-completion` (1), `research` (1). The set then grew — `executing-plans` (cycle 4) and
+the four `plan-review/references/reviewers/*.md` (cycle 7) — so **at this head the changed files carry
+35 such lines, 31 of them in the 17 gate `SKILL.md` files**. The binding evidence is §4.4a check (1a):
+every `severity:` schema line is followed by a `consequence:` line, which returns **0** violations; no
+total recorded in prose is load-bearing. This is the point a reviewer caught: a blockquote at the top of the file does not put a
 field into the prompt template an inlined reviewer copies.
 
 **Named exclusions (reported, not silently dropped).** These files also emit findings under a review
@@ -628,7 +634,7 @@ the #975/#976 status (so the reconciliation is verified, not remembered).
 | `node --test extensions/shared/test-never-unbounded.mjs` (or its runner) | pass — `using-git-worktrees` pin intact |
 | `npx tsx extensions/review-enforcer/index.test.ts` | pass — `code-review` Step 10a pin intact |
 | `bash scripts/materialize-agents.sh --check .` | clean (AGENTS.md NOT edited) |
-| `grep -c "consequence:" skills/<file>` | per file, ≥ the **recorded per-file site count** (§4.3) — run at implementation time; result: every gate file ≥ its site count, 30/30 inline sites covered |
+| `grep -c "consequence:" skills/<file>` | per file, ≥ the **recorded per-file site count** (§4.3) — run at implementation time; every gate file ≥ its site count. A whole-file token count passes vacuously on the header blockquote, so the binding check is §4.4a (1a): every `severity:` schema line followed by a `consequence:` line — 0 violations |
 | `grep -c 'EXIT_REASON="clean"' skills/code-review/references/fixer-loop.md` | unchanged count (the parser is not re-engineered) |
 | `git status --short` after the commit | every edited skill is committed (agent-infra `skills/` installs globally; `commit-workflow`/skill-sync carries it) |
 
