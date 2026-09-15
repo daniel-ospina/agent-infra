@@ -62,6 +62,7 @@ ALL parallel sub-agents MUST return results in a parseable, deduplicatable forma
 FINDING: [P0|P1|P2|P3] Brief title
 - File: path/to/file.ts:line
 - Category: [Security|Bug|Config|SupplyChain|Database|UX|Accessibility|SEO|Content|...]
+- Consequence: what breaks, and who observes it (REQUIRED; without it the finding is advisory — recorded, never blocking, never counted, never filed as an issue: `proportional-gates` §Findings Must Declare Consequence)
 - Description: 1-2 sentences
 - Fix: Specific suggested approach
 ```

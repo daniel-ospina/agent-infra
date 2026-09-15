@@ -547,7 +547,20 @@ fi
 
 **Gate:** If verifier returns issues, fix and re-dispatch (max 2 retries). Do NOT proceed to the next batch until zero issues remain. On 3rd failure: surface to user.
 
-**Conformance floor (canonical: `proportional-gates` §Findings Must Declare Consequence).** A consequence-less ISSUE block is **advisory**: it never blocks, never counts toward this gate, and is never filed as an issue. A cycle that returns ≥1 ISSUE block and **none** carrying an adequate `consequence:` is malformed reviewer output, not clean: record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. Where this gate's retry budget is already spent, record the marker and exit non-clean without the extra dispatch.
+**Conformance floor (canonical: `proportional-gates` §Findings Must Declare Consequence).** This governs
+**reviewer-returned** ISSUE blocks. A consequence-less reviewer ISSUE block is **advisory**: it never
+blocks, never counts toward this gate, and is never filed as an issue. A cycle that returns ≥1 reviewer
+ISSUE block and **none** carrying an adequate `consequence:` is malformed reviewer output, not clean:
+record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, and exit non-clean. Where
+this gate's retry budget is already spent, record the marker and exit non-clean without the extra
+dispatch.
+
+**⛔ The deterministic complexity-axis checks below are NOT in the adequacy test and keep their
+severity.** The `echo "ISSUE: check_type: … | severity: P0|P1|P2"` lines are machine output from shell
+checks (`design-token`, `wrapper-compliance`, `migration-safety`, `type-alignment`) — a deterministic
+check has no prose to supply a consequence, so applying the bar to them would void 100% of them and the
+gate would fix nothing forever. This is the same carve-out the pattern-scan has in
+`code-review/references/fixer-loop.md`. Their `severity:` **is** their blocking-ness.
 
 
 </HARD-GATE>

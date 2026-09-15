@@ -261,8 +261,9 @@ Otherwise, parse:
 
 | Condition | Action |
 |-----------|--------|
-| `ISSUES_FOUND: 0` | **Convergence** — prototype is clean |
+| `ISSUES_FOUND: 0` | **Convergence** — prototype is clean. In this mode the clean signal is the tool's verdict line `ISSUES_FOUND: 0`; **never** treat a shrinking `N` as clean, and do not look for a `NO ISSUES FOUND` token — the HTML wrapper never emits one |
 | `ISSUES_FOUND: N > 0` AND `cycle < MAX_CYCLES` | **Next cycle** — tool already fixed HTML; next call reviews the fixed version |
+| `ISSUES_FOUND: N > 0` AND all its findings lack an adequate `consequence:` | **Floor fires** — record `⚠️ reviewer returned N consequence-less findings`, re-dispatch once, exit **non-clean** (where the bound is already spent, record the marker and exit non-clean without the extra dispatch) |
 | `ISSUES_FOUND: N > 0` AND `cycle == MAX_CYCLES` | **Capped exit** — return remaining issues to user |
 | `STATUS: unavailable` or `STATUS: capped` | **Graceful exit** — return partial results + warning |
 
