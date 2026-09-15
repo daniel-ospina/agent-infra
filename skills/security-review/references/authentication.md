@@ -326,20 +326,20 @@ def change_password(old_password, new_password):
 
 ```bash
 # Weak hashing
-grep -rn "md5\|sha1\|sha256" --include="*.py" --include="*.js" | grep -i password
-grep -rn "hashlib\\.md5\|hashlib\\.sha" --include="*.py"
+git grep -n -e "md5\|sha1\|sha256" -- '*.py' '*.js' | grep -i password
+git grep -n -e "hashlib\\.md5\|hashlib\\.sha" -- '*.py'
 
 # Predictable session IDs
-grep -rn "uuid1\|time\\(\\).*session\|user.*id.*session" --include="*.py"
+git grep -n -e "uuid1\|time\\(\\).*session\|user.*id.*session" -- '*.py'
 
 # Missing cookie security
-grep -rn "Set-Cookie" --include="*.py" --include="*.js" | grep -v -i "secure\|httponly"
+git grep -n -e "Set-Cookie" -- '*.py' '*.js' | grep -v -i "secure\|httponly"
 
 # Error message leakage
-grep -rn "not found\|invalid password\|does not exist" --include="*.py" --include="*.js"
+git grep -n -e "not found\|invalid password\|does not exist" -- '*.py' '*.js'
 
 # Session handling
-grep -rn "session\\.regenerate\|regenerate_id\|new_session" --include="*.py" --include="*.php"
+git grep -n -e "session\\.regenerate\|regenerate_id\|new_session" -- '*.py' '*.php'
 ```
 
 ---

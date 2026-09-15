@@ -257,6 +257,10 @@ jobs:
           # (where bash has finished), so a splice cannot hide the flag. Same hermetic
           # suite ci.yml runs per-PR.
           bash tests/gh-shim/run.sh || errors=$((errors+1))
+          # #1069 — fleet search cost: the corpus must not teach an ignore-blind
+          # recursive search, and the guard must not refuse a taught one. Post-merge
+          # re-run of the same hermetic harness ci.yml runs per-PR.
+          bash tests/search-cost/run.sh || errors=$((errors+1))
           # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
           # farm-link preservation, extensions/ content parity = #447 ship-list drift
           # tripwire, #446 launchctl isolation). Real setup.sh, hermetic (~2min).

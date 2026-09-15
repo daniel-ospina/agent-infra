@@ -102,6 +102,25 @@ jobs:
       - name: SIGPIPE guard suite (detection, continuations, exceptions, positive controls)
         run: bash tests/sigpipe-grep/run.sh
 
+  search-cost:
+    # #1069 — the ignore-blind recursive search that walks .worktrees/*/node_modules
+    # (169 GB per checkout; three sessions at load ~18 on 10 CPUs for 80 minutes).
+    # Two halves, one invariant: the corpus teaches only primitives the guard allows,
+    # and the guard refuses only the shape the corpus no longer teaches. This job is
+    # the WIRING for both halves — the corpus contract and the extension's own suite.
+    # setup-node is explicit: the harness type-strips index.ts and needs Node >= 22.13
+    # (sigpipe-grep inherits the runner's Node instead, which is not a contract).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: search-guard suite (threat table, handler-driven, non-vacuity)
+        run: node extensions/search-guard/test.mjs
+      - name: search-cost harness (corpus contract, both directions)
+        run: bash tests/search-cost/run.sh
+
   admin-merge:
     # #930 — the safe-admin-merge rail. `--admin` bypasses required checks, so
     # nothing makes it *safe*: it cannot tell a check already red on main from a
