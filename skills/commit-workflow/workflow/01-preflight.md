@@ -546,8 +546,15 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 ### Scope subtraction (#755)
 
 VGATE **subtracts** a path from the scope it asks you to verify when that path's
-recorded entry is byte-identical to the same path's blob in the named trusted base
-(`refs/remotes/<remote>/<branch>`, falling back to `refs/remotes/origin/main`).
+recorded entry is byte-identical to the same path's blob in the named trusted base:
+a `branch.<cur>.merge` naming a branch **different from the current one** (or naming
+`main`/`master` even when it equals the current branch), resolved on
+`branch.<cur>.remote` else `origin`; otherwise `refs/remotes/origin/main`.
+⛔ A branch's own upstream ref is **not** a base: `git push -u` writes the branch's
+own name there, and using it made the push arm's guard (4) unsatisfiable (T equals
+HEAD^1, a *first* parent), silently disabling the subtraction and re-demanding every
+merged-in file (#3398). The push remote is never consulted as a *fallback* base, and
+`refs/remotes/<remote>/HEAD` is not used (user-settable local state).
 The **recorded entry** is per arm — there is no single answer, because the arms
 differ structurally rather than by a runtime flag:
 

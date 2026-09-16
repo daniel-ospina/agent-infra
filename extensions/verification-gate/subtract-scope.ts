@@ -346,22 +346,40 @@ export function isShallowRepository(cwd: string): boolean {
 }
 
 /** The trusted base, used by BOTH legs so they cannot disagree.
- *  `refs/remotes/<remote>/<branch.<cur>.merge short name, else main>`, remote
- *  from branch.<current>.remote else origin; fallback refs/remotes/origin/main.
+ *  ⛔ The base is the branch the repo INTEGRATES INTO — never a branch's own
+ *  upstream tracking ref. `git push -u` records the branch's OWN name in
+ *  `branch.<cur>.merge`, so resolving the base from it returned the branch's own
+ *  remote ref (origin/feature). That made the push arm's guard (4) unsatisfiable
+ *  — the base then EQUALS HEAD^1 (the branch's own side, i.e. a FIRST parent) and
+ *  is never an ancestor of a NON-FIRST parent — so merge-inheritance subtraction
+ *  silently no-opped and every file a `git merge origin/main` carried in was
+ *  demanded for verification (#3398).
+ *  An upstream is a base only when it is NOT merely the branch's own name, or
+ *  when that name is a conventional integration branch (`main`/`master` — the
+ *  `main` tracking `upstream/main` shape). Everything else resolves to the
+ *  INTEGRATION remote's `origin/main`: the push remote says where content GOES,
+ *  not what was already integrated, and trusting its base let a fork's `main`
+ *  subtract un-integrated unverified content and silently ALLOW the push
+ *  (review F1, fail-open). The base surface is NOT widened RELATIVE TO #755:
+ *  the push command's remote is never consulted as a FALLBACK base, and a
+ *  remote's `HEAD` symref is not used at all (user-settable local state). A
+ *  *declared* upstream naming another branch is still a base, exactly as before.
  *  null when nothing resolves ⇒ no subtraction. */
 export function resolveTrustedBase(cwd: string): { ref: string; oid: string } | null {
   const current = symbolicRefShort(cwd);
   let remote = current === null ? null : configGet(cwd, `branch.${current}.remote`);
   if (remote === null || remote === ".") remote = "origin";
-  let branch = "main";
+  const candidates: string[] = [];
   if (current !== null) {
     const merge = configGet(cwd, `branch.${current}.merge`);
-    if (merge !== null) {
-      const m = /^refs\/heads\/(.+)$/.exec(merge);
-      if (m !== null) branch = m[1];
+    const m = merge !== null ? /^refs\/heads\/(.+)$/.exec(merge) : null;
+    const upstream = m !== null ? m[1] : null;
+    if (upstream !== null && (upstream !== current || upstream === "main" || upstream === "master")) {
+      candidates.push(`refs/remotes/${remote}/${upstream}`);
     }
   }
-  for (const ref of [`refs/remotes/${remote}/${branch}`, `refs/remotes/origin/main`]) {
+  candidates.push("refs/remotes/origin/main");
+  for (const ref of candidates) {
     const oid = gitOut(cwd, ["rev-parse", "--verify", "--quiet", ref]);
     if (oid !== null) {
       const v = oid.replace(/\n$/, "");
