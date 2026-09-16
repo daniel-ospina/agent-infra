@@ -93,19 +93,22 @@
  *    credited) except the misses, which are false-BLOCK. If a new doc'd knob
  *    uses one of the missed forms, fix the scanner (or the wiring) rather than
  *    adding an exemption — the failure message names the token.
- *    RECOGNISED helper idioms: `numEnv("NAME", …)` / `getEnv("NAME")` /
- *    `env("NAME")` — the callee must CONTAIN `env` (any position, dots allowed)
- *    and the literal must be the WHOLE argument (a concatenation like
- *    `numEnv("NAME" + suffix, …)` is NOT credited, deliberately: that shape can
- *    name a different env var at runtime), plus `process.env[\`NAME\`]`. A
+ *    RECOGNISED helper idioms: the callee must contain `env` anywhere
+ *    (`numEnv`, `get2env`, `env`, `env.foo`, `cfg.env`) and the literal must be
+ *    the WHOLE argument — optionally followed by `as const`/`satisfies`, i.e. the
+ *    next non-space char after the literal is `,` or `)`. A concatenation
+ *    (`numEnv("NAME" + suffix, …)`) is deliberately NOT credited: that shape can
+ *    name a different env var at runtime. Also `process.env[\`NAME\`]`. A
  *    differently named helper (`readCfg("NAME")`, `cfg("NAME")`) is therefore
  *    still a false BLOCK.
  *  - PIN 4 COVERS THE BAND VOCABULARY, NOT EVERY PROSE RESTATEMENT. The
  *    restatement scan runs over `skills/**` only, and the band parser reads
  *    §6's sentence in `docs/ops/load-policy.md` only. Prose restatements
  *    elsewhere — §7's ratio form, `docs/research/*` (e.g. the #279 note), the
- *    #209 plan banners — are NOT pinned, so when #1116 recalibrates they can go
- *    stale with the suite green. §7 was reworded in #1073 to avoid adding a
+ *    #209 plan/scope doc BODIES (their banners were reworded to point at §6 in
+ *    #1073, but the tables and bullets below them still describe the old model) —
+ *    are NOT pinned, so when #1116 recalibrates they can go stale with the suite
+ *    green. §7 was reworded in #1073 to avoid adding a
  *    third restatement; the other docs are out of this PR's scope and left as a
  *    known gap. Pin 4 itself is a heuristic: a line that co-locates a band word,
  *    a `Nx` multiplier and 8/16 without being a restatement ("concurrency 3x,
@@ -309,7 +312,9 @@ function matchReadAt(
     // The literal must be the WHOLE argument and the callee must look like an
     // env reader, so `console.log("TASK_X")` stays a mention, not a read.
     const h =
-      /^([A-Za-z_$.]*?[Ee][Nn][Vv][A-Za-z0-9_$]*)\s*\(\s*(["'])([A-Z][A-Z0-9_]+)\2(?=\s*[,)])/.exec(rest);
+      /^([A-Za-z_$.0-9]*?[Ee][Nn][Vv][A-Za-z0-9_$.]*)\s*\(\s*(["'])([A-Z][A-Z0-9_]+)\2(?=\s*(?:as\s+(?:const|string)|satisfies\b)?\s*[,)])/.exec(
+        rest
+      );
     if (h) return { name: h[3], len: h[0].length };
   }
   // Shell expansions.
@@ -455,6 +460,14 @@ export function docEnvTokens(markdown: string): string[] {
     out.add(m[0]);
   }
   return [...out].sort();
+}
+
+/** The §3-default pin's predicate: every number the doc's default cell names
+ * must be a literal of the getter. Named so the mutation control exercises THIS
+ * function rather than re-deriving its complement (a control that cannot fail is
+ * not a control). */
+export function docDefaultPinned(docDefaults: Set<string>, codeLiterals: Set<string>): boolean {
+  return [...docDefaults].every((n) => codeLiterals.has(n));
 }
 
 /** The cells of the §3 table row whose first cell is `` `NAME` ``. */
@@ -740,6 +753,15 @@ test("mutation control: every real read form IS recognised", () => {
   deepEqual([...collectReads('const v = cfg.env("TASK_FAKE_KNOB_XYZ");\n', "js")], [
     "TASK_FAKE_KNOB_XYZ",
   ]);
+  deepEqual([...collectReads('const v = env.foo("TASK_FAKE_KNOB_XYZ");\n', "js")], [
+    "TASK_FAKE_KNOB_XYZ",
+  ]);
+  deepEqual([...collectReads('const v = get2env("TASK_FAKE_KNOB_XYZ");\n', "js")], [
+    "TASK_FAKE_KNOB_XYZ",
+  ]);
+  deepEqual([...collectReads('const v = numEnv("TASK_FAKE_KNOB_XYZ" as const, 1);\n', "js")], [
+    "TASK_FAKE_KNOB_XYZ",
+  ]);
   deepEqual([...collectReads("const v = process.env[`TASK_FAKE_KNOB_XYZ`];\n", "js")], [
     "TASK_FAKE_KNOB_XYZ",
   ]);
@@ -901,20 +923,19 @@ test("the §3 default for TASK_FIRST_OUTPUT_TIMEOUT_MS is the code's own default
     "getFirstOutputTimeoutMs"
   );
   const codeNums = new Set(body.match(/\d[\d_]*/g) ?? []);
-  for (const n of docNums) {
-    ok(
-      codeNums.has(n),
-      `the doc's default ${n} is not a literal of getFirstOutputTimeoutMs() — one side was changed alone ` +
-        `(§3 default cell: "${row![1]}"; code literals: ${[...codeNums].join(", ")})`
-    );
-  }
-  // mutation control: run the SAME predicate over a synthetic bumped doc cell
+  ok(
+    docDefaultPinned(docNums, codeNums),
+    `the doc's default (${[...docNums].join(", ")}) is not a literal of getFirstOutputTimeoutMs() — one side ` +
+      `was changed alone (§3 default cell: "${row![1]}"; code literals: ${[...codeNums].join(", ")})`
+  );
+  // mutation control: the SAME predicate must reject a bumped cell. This proves
+  // the predicate CAN fail; it does not detect the pin line being deleted.
   const bumped = new Set(
     (row![1].replace(/\d[\d_]*/g, "120_000").match(/\d[\d_]*/g) ?? [])
   );
   ok(
-    [...bumped].some((n) => !codeNums.has(n)),
-    "mutation control: the doc-default predicate must reject a value the getter does not have"
+    !docDefaultPinned(bumped, codeNums),
+    "mutation control: docDefaultPinned must reject a default the getter does not have"
   );
 });
 
