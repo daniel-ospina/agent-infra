@@ -247,6 +247,13 @@ jobs:
           # ps-probe failure deletes nothing (fail-closed), TOCTOU re-probe,
           # dry-run default. Hermetic (fake PS shim + throwaway root/log).
           bash scripts/pi-task-session-prune.test.sh || errors=$((errors+1))
+          # #1095 — worktree reaper: real temp git repos for every git gate
+          # (clean / reachable / unreferenced) + shimmed ps/lsof/gh, so each
+          # gate's fail path is driven to PRESERVE (or a loud fail-closed
+          # abort) and `--apply` is proven to remove only what it classified
+          # as reclaimable while the branch ref survives. Hermetic: temp HOME,
+          # temp state dir, no real worktree touched, no network.
+          bash scripts/pi-reap-worktrees.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
           # #930 — safe-admin-merge rail: the ONE failing-set parser
           # (scripts/ci-failure-set.sh) plus the chokepoint that consumes it
