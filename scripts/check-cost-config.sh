@@ -112,6 +112,9 @@ while [ $# -gt 0 ]; do
 done
 
 ok()  { echo "  ✅ $1"; }
+# detail() — an indented diagnostic line attached to the preceding block/warn.
+# Never counts as a block: it only explains one that was already counted.
+detail() { echo "      ↳ $1"; }
 warn() { echo "  ⚠️  $1"; WARNS=$((WARNS + 1)); }
 block() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); }
 # Two block classes the clamp escape must NOT silence, because neither has a
@@ -281,15 +284,32 @@ elif patch_cap != CAP_EXPECTED:
 # Ceiling ordering: a hung attempt must be cut by the IDLE ceiling, not by the
 # full per-call budget — otherwise the idle ceiling is inert and the hang
 # window silently becomes maxRetries x providerTimeout.
-if isinstance(idle, int) and isinstance(ptimeout, int) and ptimeout <= idle:
+if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (idle, ptimeout)) \
+   and ptimeout <= idle:
     retry_issues.append(f"retry.provider.timeoutMs ({ptimeout}) must exceed httpIdleTimeoutMs ({idle}) — "
                         f"otherwise the silent-hang ceiling can never fire first")
 
 # Derived window. The no-progress (hung) window uses the idle ceiling; the
 # worst-case window assumes every attempt burns its full SDK request ceiling.
-nums = (mr, base, patch_cap, idle, ptimeout)
-if all(isinstance(v, int) and v > 0 for v in nums):
-    n = mr
+def _as_int(v):
+    """Positive whole number as int (JSON `8.0` IS 8 — pi reads it as a number),
+    else None. A None anywhere means the window cannot be derived."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if v <= 0 or v != int(v):
+        return None
+    return int(v)
+
+_fields = (("retry.maxRetries", mr), ("retry.baseDelayMs", base),
+           ("patch-pi-retry.sh cap", patch_cap),
+           ("httpIdleTimeoutMs", idle), ("retry.provider.timeoutMs", ptimeout))
+_ints = {k: _as_int(v) for k, v in _fields}
+if all(v is not None for v in _ints.values()):
+    n = _ints["retry.maxRetries"]
+    base = _ints["retry.baseDelayMs"]
+    patch_cap = _ints["patch-pi-retry.sh cap"]
+    idle = _ints["httpIdleTimeoutMs"]
+    ptimeout = _ints["retry.provider.timeoutMs"]
     backoff, v, i = 0, base, 0
     while i < n:
         if v >= patch_cap:
@@ -309,7 +329,16 @@ if all(isinstance(v, int) and v > 0 for v in nums):
         retry_issues.append(f"worst-case window {worst}ms ({worst / 60000:.1f} min) exceeds the "
                             f"declared ceiling {WORST_CEILING}ms")
 else:
-    print("WINDOW hung=0 worst=0 backoff=0")
+    # NO WINDOW line here. `check_settings_file` treats a MISSING derived window
+    # as the fail-closed retry-class block; a zeroed sentinel is a *present*
+    # window, so any non-integer input used to skip the ceiling check entirely
+    # while the exact-value compares still passed (JSON `"maxRetries": 8.0` == 8).
+    # That was a reproduced bypass of the hang ceiling (#1088 review cycle 6, P1):
+    # the guard exited 0 reporting `hung 0ms / worst 0ms`.
+    _bad = ", ".join(f"{k}={v!r}" for k, v in _fields
+                     if _ints[k] is None or _ints[k] <= 0)
+    retry_issues.append("the retry/hang window cannot be derived (not a positive whole "
+                        f"number: {_bad}) — fail-closed")
 
 for i in issues:
     print(i)
@@ -380,7 +409,7 @@ check_settings_file() {
   window_hung="$(printf '%s\n' "$raw" | sed -n 's/^WINDOW hung=\([0-9]*\) .*/\1/p')"
   window_worst="$(printf '%s\n' "$raw" | sed -n 's/^WINDOW hung=[0-9]* worst=\([0-9]*\) .*/\1/p')"
   issues="$(printf '%s\n' "$raw" | sed '/^WINDOW /d')"
-  if [ -z "$window_hung" ]; then
+  if [ -z "$window_hung" ] || [ "$window_hung" = "0" ]; then
     # settings_violations ALWAYS emits the derived WINDOW line when it completes.
     # No WINDOW ⇒ it died before deriving the window (unparseable file, non-object
     # JSON, an internal error) ⇒ the contract cannot be asserted at all. Fail
@@ -388,7 +417,13 @@ check_settings_file() {
     # COST_CLAMP_OVERRIDE=1 exit 0 with the retry/hang contract unasserted
     # (#1088 review cycles 2 and 3, P1). Placed BEFORE the issues loop so every
     # such failure — known shape or not — takes this arm.
-    block_retry "$label — the settings file could not be analysed, so the retry/hang contract cannot be asserted (fail-closed; not covered by COST_CLAMP_OVERRIDE=1). First diagnostic line: $(printf '%s' "$issues" | head -1)"
+    block_retry "$label — the settings file could not be analysed, so the retry/hang contract cannot be asserted (fail-closed; not covered by COST_CLAMP_OVERRIDE=1)"
+    # Every diagnostic, not just the first: the analyser emits one line per
+    # problem (e.g. an exact-value drift AND the reason the window is
+    # underivable), and head -1 hid the cause that matters (#1088 cycle 6).
+    while IFS= read -r i; do
+      [ -n "$i" ] && detail "$i"
+    done <<< "$issues"
   elif [ -n "$issues" ]; then
     while IFS= read -r i; do
       case "$i" in
@@ -410,7 +445,7 @@ check_settings_file() {
 # live files read clean. NOTE the path is resolved from the SESSION CWD, not
 # from the repo root — a session started in a subdirectory (e.g. `$ROOT/extensions`)
 # merges `$ROOT/extensions/.pi/settings.json`. So this walks the checkout for
-# any `.pi/settings.json` (following symlinked `.pi` dirs, depth-bounded) and
+# any `.pi/settings.json` (following symlinked `.pi` dirs, at ANY depth) and
 # fails CLOSED on each one that touches the contract keys. `.worktrees/` is NOT
 # pruned: a linked worktree is physically inside this checkout, is a real session
 # cwd, and is gitignored — so an untracked project file there would otherwise be
@@ -427,35 +462,53 @@ root = sys.argv[1]
 # worktree lives under $ROOT, is a real session cwd, and `.worktrees/` is
 # gitignored — so a `.pi/settings.json` written there is invisible to git AND was
 # invisible to this walk, while still reverting the contract for any session
-# rooted in that worktree (#1088 review cycle 3). MAXDEPTH bounds the descent.
+# rooted in that worktree (#1088 review cycle 3).
 PRUNE = {".git", "node_modules", ".venv", "venv", "__pycache__"}
-MAXDEPTH = 4
-out = []
-for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-    rel = os.path.relpath(dirpath, root)
-    depth = 0 if rel == "." else rel.count(os.sep) + 1
-    dirnames[:] = [d for d in dirnames if d not in PRUNE]
-    if depth >= MAXDEPTH:
-        dirnames[:] = []          # bounds the walk (and any symlink cycle)
-    if os.path.basename(dirpath) != ".pi":
+# Explicit traversal instead of os.walk+MAXDEPTH: a session cwd can be ANY
+# directory in the checkout (so `.pi` can sit at any depth), and a depth cap
+# silently missed `.pi` deeper than the cap — a reproduced B4 bypass (#1088
+# review cycle 6). Cycle safety comes from the visited-set of real paths, which
+# also de-duplicates symlinked directories; there is no depth limit to outrun.
+seen, stack, out = set(), [root], []
+while stack:
+    d = stack.pop()
+    real = os.path.realpath(d)
+    if real in seen:
         continue
-    p = os.path.join(dirpath, "settings.json")
-    if not os.path.lexists(p):
-        continue
-    if not os.path.isfile(p):
-        out.append(f"{p}\tNOT_A_FILE")
-        continue
+    seen.add(real)
     try:
-        with open(p) as f:
-            d = json.load(f)
-    except Exception as e:
-        out.append(f"{p}\tPARSE_ERROR: {e}")
+        entries = list(os.scandir(d))
+    except OSError:
         continue
-    if not isinstance(d, dict):
-        out.append(f"{p}\tNOT_AN_OBJECT")
-        continue
-    keys = [k for k in ("retry", "httpIdleTimeoutMs", "compaction") if k in d]
-    out.append(f"{p}\t{', '.join(keys)}")
+    for e in entries:
+        try:
+            if not e.is_dir(follow_symlinks=True):
+                continue
+        except OSError:
+            continue
+        if e.name in PRUNE:
+            continue
+        if e.name != ".pi":
+            stack.append(e.path)
+            continue
+        # a `.pi` directory: inspect its settings.json, never descend into it
+        p = os.path.join(e.path, "settings.json")
+        if not os.path.lexists(p):
+            continue
+        if not os.path.isfile(p):
+            out.append(f"{p}\tNOT_A_FILE")
+            continue
+        try:
+            with open(p) as f:
+                d = json.load(f)
+        except Exception as ex:
+            out.append(f"{p}\tPARSE_ERROR: {ex}")
+            continue
+        if not isinstance(d, dict):
+            out.append(f"{p}\tNOT_AN_OBJECT")
+            continue
+        keys = [k for k in ("retry", "httpIdleTimeoutMs", "compaction") if k in d]
+        out.append(f"{p}\t{', '.join(keys)}")
 print("\n".join(out))
 PYEOF
 )"

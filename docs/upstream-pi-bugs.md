@@ -329,7 +329,9 @@ attempt count: an attempt count cannot express "give up after N minutes" when
 each attempt may itself burn the full provider timeout (#1088).
 
 ### Mitigation in agent-infra (already shipped)
-- `scripts/patch-pi-retry.sh` caps the backoff at 1 min in both files (wired
+- `scripts/patch-pi-retry.sh` caps the backoff in both files (the cap value is
+  in `docs/ops/cost-config-policy.md` §2 and read out of that script by the
+  guard) (wired
   into `pi-bootstrap/setup.sh`, re-applied on every sync; see
   `docs/providers.md §6`).
 - `retry.maxRetries: 7` + `httpIdleTimeoutMs: 300000` in the shipped

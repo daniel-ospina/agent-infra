@@ -162,7 +162,9 @@ scoped explicitly:
   session started in a subdirectory merges *that* directory's project file over
   the global settings, and a project file could revert the contract while the
   shipped and live files read clean. The guard walks the checkout for **any**
-  `.pi/settings.json` (following symlinked `.pi` directories, depth-bounded) —
+  `.pi/settings.json` (following symlinked `.pi` directories, **at any depth** —
+  an explicit traversal with a realpath visited-set, not a depth cap, because a
+  session cwd can be any directory and a cap silently missed deeper files) —
   including under `.worktrees/`, which is gitignored but *is* a live session cwd —
   and fails closed on each one that carries `retry`, `httpIdleTimeoutMs` or
   `compaction`, or that is unparseable, not a file, or not a JSON object.

@@ -38,6 +38,9 @@
 #      copies of the idle value drifted exactly this way twice in review)
 #  26. COST_CLAMP_OVERRIDE=1 does NOT silence the compaction/settings class
 #      either (the escape is for the models.json clamp rollback window only)
+#  27. a non-integer settings value must not skip the derived-window check
+#      (a zeroed WINDOW sentinel used to read as "window present" → PASS)
+#  28. a project settings file at ANY depth is caught (no depth cap)
 #   6. COST_CLAMP_OVERRIDE=1                       → exit 0 + loud notice
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
@@ -851,6 +854,15 @@ BANNED_RE = (
     (re.compile(rf"(?<![\d.]){WORST_MS}(?![\d])"), "worst case (ms)"),
     (re.compile(r"no-progress window is ~"), "no-progress window (restated)"),
     (re.compile(r"retry ladder is ~"), "retry ladder (restated)"),
+    # The CAP and the per-step LADDER are derived quantities too — a summary doc
+    # restating them drifts exactly like the windows did (#1088 review cycle 6).
+    (re.compile(rf"(?:capped at|cap of)[^\n]{{0,10}}?{CAP // 60000}[\s-]*min"),
+     f"backoff cap ({CAP // 60000} min)"),
+    (re.compile(rf"(?<![\d.]){CAP // 60000}[\s-]*min(?:ute)?s?\s+(?:retry\s+)?cadence"),
+     f"backoff cap ({CAP // 60000} min cadence)"),
+    (re.compile(rf"(?<![\d.]){BASE // 1000}s[/,\s]+{2 * BASE // 1000}s(?![\d])"),
+     "ladder steps (s)"),
+    (re.compile(rf"(?<![\d.]){8 * BASE // 1000}s(?![\d])"), "ladder step (s)"),
 )
 SUMMARY_DOCS = ("docs/providers.md", "docs/upstream-pi-bugs.md")
 # Dated snapshots (plans / research notes committed at a point in time) record
@@ -931,6 +943,78 @@ if [ "$code" -eq 0 ]; then
 else
   fail "the clamp escape stopped working (exit $code)"; sed -n '1,30p' "$OUT"
 fi
+
+echo ""
+echo "27. a non-integer settings value must NOT skip the derived-window check"
+# The window block used to print a zeroed sentinel (`WINDOW hung=0 worst=0`) when
+# any input failed a Python `isinstance(int)` test. `0` is a PRESENT window, so
+# `check_settings_file` took the PASS arm and the ceilings were never asserted —
+# while the exact-value compares still passed, because JSON `8.0 == 8`. That was a
+# reproduced bypass of the hang ceiling (#1088 review cycle 6, P1).
+TMP27="$(mktemp -d /tmp/cost-config-float.XXXXXX)"
+mkroot "$TMP27"
+mutate27() { # $1 = raw JSON literal for the maxRetries value
+  mkroot "$TMP27"   # clean root each time, so each case is independent
+  python3 - "$TMP27/scripts/check-cost-config.sh" "$TMP27/pi-bootstrap/pi-config/settings.json" "$1" <<'PY'
+import json, re, sys
+g, s, expr = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(g).read()
+assert "RETRY_MAX_RETRIES=7" in src, "guard constant shape changed — update this test"
+open(g, "w").write(src.replace("RETRY_MAX_RETRIES=7", "RETRY_MAX_RETRIES=8"))
+# hand-edit the JSON so a float literal survives (json.dump would normalise 8.0)
+text = open(s).read()
+text = re.sub(r'("maxRetries"\s*:\s*)\d+', lambda m: m.group(1) + expr, text, count=1)
+assert expr in text, "maxRetries not rewritten"
+open(s, "w").write(text)
+PY
+}
+mutate27 '8.0'
+bash "$TMP27/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "float 8.0 (== 8) still BLOCKs on the window ceiling"; else fail "FLOAT BYPASS: expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -qE 'hang window [0-9]+ms.*exceeds the declared ceiling' "$OUT"; then pass "the window was actually derived from the float"; else fail "expected the ceiling message (window not derived?)"; sed -n '1,30p' "$OUT"; fi
+# a value that is not a positive whole number at all must fail CLOSED, not pass
+mutate27 '"8"'
+bash "$TMP27/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "string maxRetries → exit 1 (window underivable, fail-closed)"; else fail "expected exit 1 for a string maxRetries, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q 'cannot be derived' "$OUT"; then pass "the underivable-window diagnostic names the cause"; else fail "expected the 'cannot be derived' message"; sed -n '1,30p' "$OUT"; fi
+if grep -q 'WINDOW hung=0' "$OUT"; then fail "a zeroed WINDOW sentinel is still emitted (the bypass shape)"; else pass "no zeroed WINDOW sentinel"; fi
+# ...and a legitimate float equal to the pinned value must NOT false-block
+rm -rf "$TMP27"; TMP27="$(mktemp -d /tmp/cost-config-float.XXXXXX)"; mkroot "$TMP27"
+python3 - "$TMP27/pi-bootstrap/pi-config/settings.json" <<'PY'
+import re, sys
+s = sys.argv[1]
+text = open(s).read()
+text = re.sub(r'("maxRetries"\s*:\s*)\d+', lambda m: m.group(1) + "7.0", text, count=1)
+open(s, "w").write(text)
+PY
+bash "$TMP27/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "float 7.0 == the pinned 7 → exit 0 (no false block)"; else fail "expected exit 0 for 7.0, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP27"
+
+echo ""
+echo "28. a project settings file at ANY depth is caught (no depth cap)"
+# The walk was bounded by MAXDEPTH, so `.pi` deeper than the cap was invisible —
+# a reproduced B4 bypass (#1088 review cycle 6).
+TMP28="$(mktemp -d /tmp/cost-config-deep.XXXXXX)"
+mkroot "$TMP28"
+mkdir -p "$TMP28/a/b/c/d/.pi"
+echo '{"theme":"dark"}' >"$TMP28/a/b/c/d/.pi/settings.json"
+bash "$TMP28/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ] && grep -q "a/b/c/d/.pi/settings.json" "$OUT"; then
+  pass "a 5-deep project file is walked (non-contract → exit 0)"
+else
+  fail "deep project file NOT walked (expected exit 0 + the path in the output, got $code)"; sed -n '1,30p' "$OUT"
+fi
+echo '{"retry":{"maxRetries":10000}}' >"$TMP28/a/b/c/d/.pi/settings.json"
+bash "$TMP28/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "a 5-deep project file reverting the contract → exit 1"; else fail "expected exit 1 for a 5-deep project file, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "a/b/c/d/.pi/settings.json" "$OUT"; then pass "the deep path is named in the block"; else fail "expected the deep path in the message"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP28"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"
