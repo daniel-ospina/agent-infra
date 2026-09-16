@@ -601,8 +601,8 @@ the `spawnSync` finding in the profile.)
 
 `ΔCPU` comes from `ps -o time`; the `%` column is `ΔCPU / 30 s`. The table
 reconciles: the 11 rows sum to +48.01 s and the residual 28 procs to +5.25 s,
-for +53.26 s total. Silences marked with 176 m+ are the ~0.1%-CPU idle TUIs —
-the clean control against which the 6–26% rows are abnormal.
+for +53.26 s total. Silences in the residual bucket are not shown; the ~0.1%-CPU rows are the clean
+control against which the 6–26% rows are abnormal.
 
 ### Confound ruled out
 
@@ -629,11 +629,20 @@ subtree**, so nested frames make them non-additive — read them as a
 | `StringIndexOf` | 2348 | 1488 |
 | `Runtime_StringEqual` | 1289 | 477 |
 | `String::SlowEquals` | 1264 | 465 |
-| `Heap::CollectGarbage` (all paths) | 1659 | 12 |
+| `Heap::CollectGarbage` | *not quotable — see note* | *not quotable* |
 | `RegExpPrototypeTestFast` | 387 | 151 |
 | `FindOrderedHashMapEntry` | 269 | 109 |
 | **`node::SyncProcessRunner::Spawn` / `Run` / `TryInitializeAndRunLoop`** | **262** | **198** |
 | `uv__try_write` (writes to the terminal) | **13** | — |
+
+One deliberately unquoted row: `Heap::CollectGarbage` appears in **three nested
+frames per collection** (`SetMarkerAndCallbackImpl<…Heap::CollectGarbage…>` plus
+two nested `Heap::CollectGarbage` frames), so every occurrence of the symbol is
+the *same* samples seen again — any sum double- or triple-counts. It is plainly
+present in both profiles (allocation pressure is real), but no honest number can
+be attached to it without first defining which of the three frames counts, so it
+is not quoted. It was 1659/12 in an earlier revision of this report; that figure
+was an artifact of substring-matching all three frames.
 
 Two conclusions that survive scrutiny:
 
