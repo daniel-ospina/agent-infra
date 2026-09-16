@@ -119,7 +119,13 @@ export const AGENT_OPTIONS = {
   connections: 4, // max concurrent sockets per origin (parallel pi sessions)
   pipelining: 0, // undici: no pipelining AND close-after-response (socket[kReset])
   headersTimeout: 300_000, // network-layer backstop only; pi's timeoutMs owns the request budget
-  bodyTimeout: 600_000, // matches pi's default httpIdleTimeoutMs request budget
+  // Silent-hang ceiling, aligned with the shipped `httpIdleTimeoutMs: 300000`
+  // (#1088). This Agent bypasses pi's global dispatcher, so the fleet contract
+  // has no other way to reach qwen-ha — and `retry.provider.timeoutMs` is also
+  // 600000, so the previous 600000 here would make a silent hang
+  // indistinguishable from a slow call on the HA path until the per-call
+  // ceiling fired (the inversion `check-cost-config.sh` blocks for settings).
+  bodyTimeout: 300_000,
   allowH2: false, // aliyuncs compatible-mode is HTTP/1.1; matches pi's dispatcher
 } as const;
 

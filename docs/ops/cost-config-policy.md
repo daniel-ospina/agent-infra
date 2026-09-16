@@ -145,15 +145,29 @@ scoped explicitly:
 
 - `COST_CLAMP_OVERRIDE=1` silences the **clamp** block only. Retry-contract
   violations are counted separately (`RETRY_BLOCKS`) and the guard still exits
-  1 — an ambient env var must not be able to defeat the retry bound (§6 below
-  documents the override, and this carve-out is pinned by a test).
-- **Project settings.** pi merges `<cwd>/.pi/settings.json` *over* the global
-  settings, so a project file could revert the contract while the shipped and
-  live files read clean. The guard fails closed on any `$ROOT/.pi/settings.json`
-  that carries `retry` or `httpIdleTimeoutMs` (and on an unparseable one).
-  Scope boundary, stated plainly: a *different* repo's project settings file is
-  outside any guard run inside this repo — the check protects the checkout the
-  guard is given, which is the only one it can see.
+  1 — an ambient env var must not be able to defeat the retry bound. That
+  includes the two *absence* cases, which are retry-class precisely because
+  they are not a clamp rollback: a **deleted** settings file (the contract
+  itself is gone) and an **unparseable** one (the contract cannot be asserted).
+  §6 below documents the override, and both carve-outs are pinned by tests.
+- **Project settings.** pi resolves the project file from the **session cwd**
+  (`join(resolvedCwd, ".pi", "settings.json")`), not from the repo root — so a
+  session started in a subdirectory merges *that* directory's project file over
+  the global settings, and a project file could revert the contract while the
+  shipped and live files read clean. The guard walks the checkout for **any**
+  `.pi/settings.json` (following symlinked `.pi` directories, depth-bounded) and
+  fails closed on each one that carries `retry` or `httpIdleTimeoutMs` — or that
+  is unparseable, not a file, or not a JSON object. Scope boundary, stated
+  plainly: the walk covers **one checkout** — a *different* repo's project
+  settings, and sibling worktrees under `.worktrees/`, are separate checkouts
+  and outside the reach of a guard run inside this one.
+- **Extension-registered providers.** An extension that builds its own undici
+  `Agent` (e.g. `extensions/custom-provider-qwen/`, the HA fallback) bypasses
+  pi's global dispatcher, so `httpIdleTimeoutMs` never reaches it. The guard
+  cannot see TypeScript constants and does not assert them; this PR aligned that
+  Agent's `bodyTimeout` with the same 5-minute silent-hang ceiling and pins the
+  reasoning in the comment there. Any future provider extension must do the same
+  — that file is the worked example.
 - **Provider-level retries.** `retry.provider.maxRetries > 0` multiplies the
   provider calls inside one attempt, so it is part of the window; it is pinned
   to absent/`0` (pi's own settings doc says the same).
@@ -169,7 +183,7 @@ and BLOCKs when any of: a pinned value drifts, the cap and the guard disagree,
 the two ceilings invert, or either window exceeds its declared ceiling. A
 missing/unreadable patch script is a **fail-closed BLOCK** — a window that
 cannot be computed must never read green. `tests/cost-config/run.sh` tests
-15–21 pin guard↔settings↔patch↔doc, including the case where the guard
+15–24 pin guard↔settings↔patch↔doc, including the case where the guard
 constants and the settings are moved **together** to 8 retries: the
 exact-value checks stay green and the **derived** window check is what fires.
 There is no `COST_CLAMP_OVERRIDE` for this contract: unlike the context clamp,
@@ -271,7 +285,11 @@ property; this guard is the pattern to copy, not a substitute for it.
   prints a loud warning, still detects** (exit 0).
 - **It does not cover the retry/hang contract (#1088).** Retry-contract
   violations are counted separately (`RETRY_BLOCKS`); even with the override
-  set, the guard exits 1 when any is present, and the banner says so. The
+  set, the guard exits 1 when any is present, and the banner says so. That
+  class includes the *absence* cases, because neither is a clamp rollback: a
+  **deleted** settings file (the contract is gone) and an **unparseable** one
+  (the contract cannot be asserted — fail closed). Tests 20 and 22 pin all
+  three. The
   override exists for the clamp's rollback window; the retry contract has no
   rollback window, so extending the escape to it would be a pure bypass.
 - **Sanctioned use: the clamp rollback window only.** It never enables a live

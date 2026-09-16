@@ -27,6 +27,13 @@
 #  19. policy doc §2 carries the same numbers as the guard (doc↔guard pin)
 #  20. COST_CLAMP_OVERRIDE=1 does NOT silence a retry-contract block
 #  21. project settings (.pi/settings.json) touching retry/httpIdleTimeoutMs → BLOCK
+#  22. COST_CLAMP_OVERRIDE=1 does NOT silence a MISSING or UNPARSEABLE settings
+#      file either (a deleted/corrupt file is not a clamp rollback)
+#  23. project settings are resolved from the SESSION cwd, so a NESTED
+#      `<subdir>/.pi/settings.json` is caught too (sibling worktrees are not)
+#  24. patch-pi-retry.sh idempotency/normalization over a fake pi tree:
+#      pristine → patched, re-run → byte-identical, stale-comment + wrong cap →
+#      rewritten, changed upstream shape → loud failure (never a silent no-op)
 #   6. COST_CLAMP_OVERRIDE=1                       → exit 0 + loud notice
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
@@ -78,6 +85,9 @@ for _c in RETRY_MAX_RETRIES HTTP_IDLE_TIMEOUT_MS RETRY_BASE_DELAY_MS \
     exit 1
   fi
 done
+
+# Test 24 needs the backoff cap as a VALUE (the loop above only presence-checks).
+CAP_GUARD="$(sed -n 's/^RETRY_MAX_BACKOFF_MS=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
 
 # mkroot <dir> — a self-contained guard root (guard + patch script + configs)
 # so mutation tests can perturb one input without touching the repo.
@@ -620,6 +630,118 @@ bash "$TMP21/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "unparseable project settings → exit 1 (fail-closed)"; else fail "expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP21"
+
+echo ""
+echo "22. COST_CLAMP_OVERRIDE=1 must NOT silence a MISSING/unparseable settings file"
+TMP22="$(mktemp -d /tmp/cost-config-override-absence.XXXXXX)"
+mkroot "$TMP22"
+rm -f "$TMP22/pi-bootstrap/pi-config/settings.json"
+COST_CLAMP_OVERRIDE=1 bash "$TMP22/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then
+  pass "deleted settings file + override → still exit 1 (deleted != clamp rollback)"
+else
+  fail "expected exit 1 for a deleted settings file under the override, got $code"; sed -n '1,30p' "$OUT"
+fi
+if grep -q "does NOT cover" "$OUT"; then pass "carve-out notice present (deleted file)"; else fail "expected the override carve-out notice"; sed -n '1,30p' "$OUT"; fi
+printf '{ not json' >"$TMP22/pi-bootstrap/pi-config/settings.json"
+COST_CLAMP_OVERRIDE=1 bash "$TMP22/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then
+  pass "unparseable settings file + override → still exit 1 (fail-closed, not a clamp rollback)"
+else
+  fail "expected exit 1 for an unparseable settings file under the override, got $code"; sed -n '1,30p' "$OUT"
+fi
+if grep -q "cannot be asserted on an unparseable settings file" "$OUT"; then pass "unparseable-settings fail-closed message present"; else fail "expected the unparseable-settings message"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP22"
+
+echo ""
+echo "23. NESTED project settings (pi resolves <session-cwd>/.pi/settings.json) → BLOCK"
+TMP23="$(mktemp -d /tmp/cost-config-projsettings-nested.XXXXXX)"
+mkroot "$TMP23"
+mkdir -p "$TMP23/extensions/.pi" "$TMP23/.worktrees/other/.pi"
+echo '{"theme":"dark"}' >"$TMP23/extensions/.pi/settings.json"
+echo '{"retry":{"maxRetries":3}}' >"$TMP23/.worktrees/other/.pi/settings.json"
+bash "$TMP23/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then
+  pass "nested non-contract project file scanned; sibling worktree pruned → exit 0"
+else
+  fail "expected exit 0, got $code"; sed -n '1,30p' "$OUT"
+fi
+if grep -q "does not touch the retry contract" "$OUT"; then pass "nested project file was actually walked (not silently skipped)"; else fail "nested project file was NOT scanned — the walk missed it"; sed -n '1,30p' "$OUT"; fi
+echo '{"retry":{"maxRetries":3}}' >"$TMP23/extensions/.pi/settings.json"
+bash "$TMP23/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then
+  pass "nested project settings reverting the contract → exit 1"
+else
+  fail "expected exit 1 for a nested project settings file, got $code"; sed -n '1,30p' "$OUT"
+fi
+if grep -q "extensions/.pi/settings.json" "$OUT"; then pass "the offending path is named in the block"; else fail "expected the nested path in the message"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP23"
+
+echo ""
+echo "24. patch-pi-retry.sh shapes over a fake pi tree (idempotency + normalization)"
+TMP24="$(mktemp -d /tmp/patch-pi-retry.XXXXXX)"
+PKG="$TMP24/node-v99/lib/node_modules/@earendil-works/pi-coding-agent"
+PI_AI_DIR="$PKG/node_modules/@earendil-works/pi-ai/dist/utils"
+mkdir -p "$PKG/dist/core" "$PI_AI_DIR" "$TMP24/bin"
+# A `pi` on PATH that resolves to no package forces find_pi_pkg's $PI_NODE_ROOT
+# fallback onto the fake tree. The pristine targets must EXIST before that call —
+# the node-root glob requires `dist/core/agent-session.js`, and without it the
+# search falls through to `npm root -g` (the real install).
+printf '#!/bin/sh\nexit 0\n' >"$TMP24/bin/pi"; chmod +x "$TMP24/bin/pi"
+CAP="$CAP_GUARD"
+pristine() {
+  printf 'function f() {\n        const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);\n}\n' >"$PKG/dist/core/agent-session.js"
+  printf 'function g() {\n        const delayMs = policy.baseDelayMs * 2 ** (attempt - 1);\n}\n' >"$PI_AI_DIR/retry.js"
+}
+pristine
+PATHS="$(PATH="$TMP24/bin:$PATH" PI_NODE_ROOT="$TMP24" bash "$ROOT/scripts/patch-pi-retry.sh" --paths 2>/dev/null)"
+if [ "$(printf '%s\n' "$PATHS" | head -1)" = "$PKG" ]; then
+  pass "--paths resolves the fake tree (never the real installed pi)"
+else
+  fail "fake-tree resolution failed — refusing to run the patch (would touch the real pi): $PATHS"
+fi
+
+run_patch() { PATH="$TMP24/bin:$PATH" PI_NODE_ROOT="$TMP24" bash "$ROOT/scripts/patch-pi-retry.sh" >"$OUT" 2>&1; }
+if [ "$(printf '%s\n' "$PATHS" | head -1)" = "$PKG" ]; then
+  # (a) pristine → both files patched at the guard's cap
+  pristine; run_patch; code=$?
+  if [ "$code" -eq 0 ]; then pass "pristine shape → exit 0"; else fail "pristine patch run failed (exit $code)"; sed -n '1,20p' "$OUT"; fi
+  if grep -qF "const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), ${CAP});" "$PKG/dist/core/agent-session.js" \
+     && grep -qF "const delayMs = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), ${CAP});" "$PI_AI_DIR/retry.js"; then
+    pass "both targets capped at the guard's ${CAP}ms (guard↔patch coupling)"
+  else fail "applied cap does not match the guard's ${CAP}ms"; sed -n '1,20p' "$OUT"; fi
+  if grep -q 'bounded retry (#318/#1088)' "$PKG/dist/core/agent-session.js"; then pass "the new comment token is in the dist"; else fail "COMMENT_TOKEN missing after patch"; fi
+  # (b) re-run → byte-identical (the fast path still fires after the rewrite)
+  cp "$PKG/dist/core/agent-session.js" "$TMP24/snap.js"
+  run_patch; code=$?
+  if [ "$code" -eq 0 ] && cmp -s "$TMP24/snap.js" "$PKG/dist/core/agent-session.js"; then
+    pass "re-run is byte-identical (idempotent fast path intact)"
+  else fail "re-run was not idempotent (exit $code)"; sed -n '1,20p' "$OUT"; fi
+  if grep -q 'already patched' "$OUT"; then pass "fast path reported (no redundant re-patch)"; else fail "expected the already-patched fast path"; sed -n '1,20p' "$OUT"; fi
+  # (c) an earlier version's install: marker present, stale comment, wrong cap
+  pristine
+  printf 'function f() {\n        // agent-infra offline-resume patch: cap the exponential backoff.\n        // bounded by settings.retry.maxRetries.\n        const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), 300000);\n}\n' >"$PKG/dist/core/agent-session.js"
+  run_patch; code=$?
+  if [ "$code" -eq 0 ]; then pass "stale-comment + wrong-cap shape → exit 0"; else fail "normalization run failed (exit $code)"; sed -n '1,20p' "$OUT"; fi
+  if grep -qF ", ${CAP});" "$PKG/dist/core/agent-session.js" && ! grep -q '300000' "$PKG/dist/core/agent-session.js"; then
+    pass "stale cap 300000 rewritten to the guard's ${CAP}ms"
+  else fail "stale cap was not normalized"; sed -n '1,20p' "$PKG/dist/core/agent-session.js"; fi
+  if grep -qF 'patch: cap the exponential backoff.' "$PKG/dist/core/agent-session.js"; then fail "stale comment text survived the normalization"; else pass "stale comment replaced with the current token"; fi
+  # (d) a genuinely changed upstream shape → loud failure, never a silent no-op
+  pristine
+  sed 's/this\._retryAttempt/this.retryAttempt/' "$PKG/dist/core/agent-session.js" >"$TMP24/changed.js" \
+    && mv "$TMP24/changed.js" "$PKG/dist/core/agent-session.js"
+  sed 's/(attempt - 1)/(attemptNumber - 1)/' "$PI_AI_DIR/retry.js" >"$TMP24/changed2.js" \
+    && mv "$TMP24/changed2.js" "$PI_AI_DIR/retry.js"
+  run_patch; code=$?
+  if [ "$code" -ne 0 ]; then pass "changed upstream shape → non-zero exit ($code)"; else fail "a changed upstream shape exited 0 — silent no-op"; sed -n '1,20p' "$OUT"; fi
+  if grep -q 'patch target not found' "$OUT"; then pass "changed shape fails loudly with the upgrade diagnostic"; else fail "expected the 'patch target not found' diagnostic"; sed -n '1,20p' "$OUT"; fi
+fi
+rm -rf "$TMP24"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

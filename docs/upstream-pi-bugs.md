@@ -332,10 +332,12 @@ each attempt may itself burn the full provider timeout (#1088).
 - `scripts/patch-pi-retry.sh` caps the backoff at 1 min in both files (wired
   into `pi-bootstrap/setup.sh`, re-applied on every sync; see
   `docs/providers.md §6`).
-- `retry.maxRetries: 7` + `httpIdleTimeoutMs: 180000` in the shipped
-  `pi-bootstrap/pi-config/settings.json` → bounded ~27 min no-progress window,
-  asserted (not just documented) by `scripts/check-cost-config.sh`; see
-  `docs/ops/cost-config-policy.md` §2. The budget is finite because #1110
+- `retry.maxRetries: 7` + `httpIdleTimeoutMs: 300000` in the shipped
+  `pi-bootstrap/pi-config/settings.json` → bounded ~43 min no-progress window
+  (and ~83 min worst case), asserted (not just documented) by
+  `scripts/check-cost-config.sh`; see
+  `docs/ops/cost-config-policy.md` §2 — which is the single place those numbers
+  are stated, so they cannot drift apart. The budget is finite because #1110
   (below) makes retries able to *succeed* again.
 - `extensions/builtin-tools/index.ts` suppresses task-tool sub-agent kills
   while the network is unreachable (fresh heartbeat markers prove the child is

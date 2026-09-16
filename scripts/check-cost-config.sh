@@ -348,7 +348,11 @@ check_settings_file() {
   local file="$1" label="$2" missing="$3" raw window_hung window_worst issues i
   if [ ! -f "$file" ]; then
     if [ "$missing" = "block" ]; then
-      block "$label: file missing ($file) — the compaction/retry contract is gone (deleted = contract reverted while CI stays green)"
+      # block_retry, not block: this file carries the bounded retry/hang contract
+      # as well as the compaction block, and a DELETED settings file is not a
+      # clamp rollback. A plain block here let COST_CLAMP_OVERRIDE=1 exit 0 with
+      # the whole contract reverted (#1088 review cycle 2, P1).
+      block_retry "$label: file missing ($file) — the compaction + retry/hang contract is gone (deleted = contract reverted while CI stays green; not a clamp rollback, so the override does NOT cover it)"
     else
       warn "$label: file missing ($file)"
     fi
@@ -365,6 +369,10 @@ check_settings_file() {
     while IFS= read -r i; do
       case "$i" in
         RETRY_CONTRACT:*) block_retry "$label — ${i#RETRY_CONTRACT: }" ;;
+        # An unparseable settings file means the retry/hang contract cannot be
+        # asserted at all → fail closed, and do NOT let COST_CLAMP_OVERRIDE=1
+        # silence it (a corrupt file is not a clamp rollback). Cycle-2 P1.
+        PARSE_ERROR:*) block_retry "$label — $i — the retry/hang contract cannot be asserted on an unparseable settings file (fail-closed; not covered by COST_CLAMP_OVERRIDE=1)" ;;
         *) block "$label — $i" ;;
       esac
     done <<< "$issues"
@@ -375,34 +383,70 @@ check_settings_file() {
 
 # check_project_settings — pi merges a PROJECT settings file OVER the global one
 # (`SettingsManager`: settings = deepMergeSettings(globalSettings, projectSettings),
-# path `<cwd>/.pi/settings.json` when the project is trusted), so a project file
-# can revert the whole retry contract while the shipped and live files read
-# clean. The guard only sees the checkout it is given, so it fails CLOSED on any
-# project settings file that touches the contract keys. (Other repos' project
-# settings are outside this guard's reach — a documented scope boundary, see
-# docs/ops/cost-config-policy.md §2.)
+# path `join(resolvedCwd, ".pi", "settings.json")` when the project is trusted),
+# so a project file can revert the whole retry contract while the shipped and
+# live files read clean. NOTE the path is resolved from the SESSION CWD, not
+# from the repo root — a session started in a subdirectory (e.g. `$ROOT/extensions`)
+# merges `$ROOT/extensions/.pi/settings.json`. So this walks the checkout for
+# any `.pi/settings.json` (following symlinked `.pi` dirs, depth-bounded) and
+# fails CLOSED on each one that touches the contract keys. Scanned within the
+# checkout only: other repos' project settings, and sibling worktrees under
+# `.worktrees/`, are separate checkouts and outside this guard's reach — a
+# documented scope boundary, see docs/ops/cost-config-policy.md §2.
 check_project_settings() {
-  local file="$ROOT/.pi/settings.json" hit
-  [ -f "$file" ] || { ok "no project settings file ($ROOT/.pi/settings.json)"; return 0; }
-  hit="$(python3 - "$file" <<'PYEOF'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception as e:
-    print(f"PARSE_ERROR: {e}")
-    sys.exit(0)
-keys = [k for k in ("retry", "httpIdleTimeoutMs") if k in d]
-print(", ".join(keys))
+  local listing path hit
+  listing="$(python3 - "$ROOT" <<'PYEOF'
+import json, os, sys
+
+root = sys.argv[1]
+# Separate checkouts (worktrees) are not this checkout's config surface; the
+# rest are pure-noise directories that can never hold a session's project file.
+PRUNE = {".git", "node_modules", ".venv", "venv", ".worktrees", "__pycache__"}
+MAXDEPTH = 4
+out = []
+for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+    rel = os.path.relpath(dirpath, root)
+    depth = 0 if rel == "." else rel.count(os.sep) + 1
+    dirnames[:] = [d for d in dirnames if d not in PRUNE]
+    if depth >= MAXDEPTH:
+        dirnames[:] = []          # bounds the walk (and any symlink cycle)
+    if os.path.basename(dirpath) != ".pi":
+        continue
+    p = os.path.join(dirpath, "settings.json")
+    if not os.path.lexists(p):
+        continue
+    if not os.path.isfile(p):
+        out.append(f"{p}\tNOT_A_FILE")
+        continue
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception as e:
+        out.append(f"{p}\tPARSE_ERROR: {e}")
+        continue
+    if not isinstance(d, dict):
+        out.append(f"{p}\tNOT_AN_OBJECT")
+        continue
+    keys = [k for k in ("retry", "httpIdleTimeoutMs") if k in d]
+    out.append(f"{p}\t{', '.join(keys)}")
+print("\n".join(out))
 PYEOF
 )"
-  case "$hit" in
-    PARSE_ERROR:*)
-      block_retry "project settings ($file) is unparseable — cannot assert the retry contract against a file pi merges over the global settings ($hit)" ;;
-    "")
-      ok "project settings ($file) does not touch the retry contract" ;;
-    *)
-      block_retry "project settings ($file) overrides the retry contract ($hit) — pi merges project settings OVER the global ones, so this silently reverts the shipped contract; remove the key here" ;;
-  esac
+  if [ -z "$listing" ]; then
+    ok "no project settings file under $ROOT (pi merges <session-cwd>/.pi/settings.json over the global settings)"
+    return 0
+  fi
+  while IFS=$'\t' read -r path hit; do
+    [ -n "$path" ] || continue
+    case "$hit" in
+      "")
+        ok "project settings ($path) does not touch the retry contract" ;;
+      PARSE_ERROR:*|NOT_A_FILE|NOT_AN_OBJECT)
+        block_retry "project settings ($path) is $hit — cannot assert the retry contract against a file pi merges over the global settings" ;;
+      *)
+        block_retry "project settings ($path) overrides the retry contract ($hit) — pi merges project settings OVER the global ones, so this silently reverts the shipped contract; remove the key here" ;;
+    esac
+  done <<< "$listing"
 }
 
 echo "== cost-config guard (#341) — deepseek context clamp @${CLAMP} =="

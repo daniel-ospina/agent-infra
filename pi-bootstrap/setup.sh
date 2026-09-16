@@ -195,7 +195,7 @@ fi
 
 # Bounded retry patch (idempotent, #318/#1088): cap pi's agent-level retry
 # backoff at 1 min so the retry ladder is uniform, and keep the budget finite
-# (settings.json `retry.maxRetries: 7` + `httpIdleTimeoutMs: 180000`) so a
+# (settings.json `retry.maxRetries: 7` + `httpIdleTimeoutMs: 300000`) so a
 # persistent failure ends the turn visibly instead of spinning for days.
 # Re-applied on every sync so a `pi update` that
 # rewrites the dist can't silently lose the patch. Non-zero (pi missing /

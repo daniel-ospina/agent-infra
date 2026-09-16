@@ -13,7 +13,7 @@
 # agent-level wall-clock retry deadline, so a session's exposure is
 #         (maxRetries + 1) x per-attempt ceiling + sum(backoff)
 # and `maxRetries` alone says nothing about it. `pi-bootstrap/pi-config/
-# settings.json` carries the bounds (maxRetries 7, httpIdleTimeoutMs 180000 =
+# settings.json` carries the bounds (maxRetries 7, httpIdleTimeoutMs 300000 =
 # the silent-hang ceiling, retry.provider.timeoutMs 600000 = the per-call
 # ceiling) and `scripts/check-cost-config.sh` asserts BOTH the exact values
 # AND the window derived from them + this file's default cap. Changing the cap
