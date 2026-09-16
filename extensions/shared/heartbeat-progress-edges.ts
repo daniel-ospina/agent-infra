@@ -27,13 +27,14 @@
  *
  * WHAT IS CONSUMED WHERE
  * ----------------------
- *   · `extensions/task-heartbeat.ts` imports `ACTIVITY_EDGE_EVENTS` / `isActivityEdge`
- *     and routes every clock advance through the declared edge name.
+ *   · `extensions/task-heartbeat.ts` imports `ACTIVITY_EDGE_EVENTS`,
+ *     `LIFECYCLE_EVENTS`, `CLOCK_RESET_EVENT` and the `ActivityEdge` type, and
+ *     routes every clock advance through the declared edge name.
  *   · `extensions/builtin-tools/index.ts` derives `KNOWN_MARKER_KINDS` from
  *     `MARKER_KINDS` and `HeartbeatKillReason` from `HEARTBEAT_KILL_REASONS`.
- *   · `extensions/shared/heartbeat-progress-edges.test.ts` asserts table ↔ source
- *     parity in both directions and asserts the stall-term registry agrees with
- *     its owner files.
+ *   · `extensions/shared/heartbeat-progress-edges.test.ts` consumes `isActivityEdge`
+ *     and `childRegisteredEvents` and asserts table ↔ source parity in BOTH
+ *     directions, including the stall-term registry against its owner files.
  *
  * WHAT THIS FILE DOES NOT DO
  * --------------------------
@@ -63,7 +64,7 @@ export const ACTIVITY_EDGE_EVENTS = [
   "message_update",
 ] as const;
 
-/** pi lifecycle events the child registers — they do NOT advance the clock. */
+/** pi lifecycle events the child registers — NOT activity/progress edges. */
 export const LIFECYCLE_EVENTS = ["session_start", "session_shutdown"] as const;
 
 export type ActivityEdge = (typeof ACTIVITY_EDGE_EVENTS)[number];
@@ -73,8 +74,26 @@ export type LifecycleEvent = (typeof LIFECYCLE_EVENTS)[number];
  * The lifecycle event that RESETS the child clock (sets it to now without being
  * an activity edge — a session that merely started has not worked, which is why
  * its wire kind `ready` does not latch the parent's real-activity flag).
+ *
+ * NOTE: a reset is a CLOCK effect, distinct from "is a progress edge" —
+ * `session_start` advances the clock (the child calls
+ * `touchActivity(CLOCK_RESET_EVENT)`) while not being one of
+ * `ACTIVITY_EDGE_EVENTS`. The two terms are not synonyms.
  */
 export const CLOCK_RESET_EVENT = "session_start" as const;
+
+/** The axes a registered term answers to. Declared so a typo cannot hide one. */
+export const STALL_AXES = [
+  "kill",
+  "loop-exit",
+  "gate",
+  "reap",
+  "retention",
+  "hygiene",
+  "heartbeat",
+] as const;
+
+export type StallAxis = (typeof STALL_AXES)[number];
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
 export const MARKER_KINDS = [
@@ -99,15 +118,20 @@ export function childRegisteredEvents(): string[] {
 }
 
 /**
- * One row: one progress edge, and EACH SIDE's declared effect on it.
+ * One row: one classified edge (activity, lifecycle, or synthetic), and EACH
+ * SIDE's declared effect on it.
  *
  * Field meanings (one falsifiable meaning each — no field is a label):
  *   advancesClock ........ child: `lastActivityAt = Date.now()`
  *   feedsToolUpdates ..... child: adds `toolCallId` to `updatedToolIds`, which
  *                          `computeToolUpdates` folds into the tick's
  *                          `tool_updates` field
- *   workOnly ............. parent: sets `everSawWork = true` and does NOT set
- *                          `everSawRealActivity`
+ *   setsEverSawWork ...... parent: sets `everSawWork = true`. NOT a claim about
+ *                          `everSawRealActivity` — the `tool-start` row sets
+ *                          both, and the #279 guard is expressed by
+ *                          `realActivity: false` on the `turn-start` row
+ *                          (asserted as the ABSENCE of
+ *                          `everSawRealActivity = true` in that arm)
  *   realActivity ......... parent: sets `everSawRealActivity = true` directly
  *   resetsStreamAge ...... parent: `state.streamAgeMs = 0`
  *   resetsToolAge ........ parent: `state.toolAgeMaxMs = 0`
@@ -126,7 +150,7 @@ export interface ProgressEdge {
   /** Pre-condition on the child clock advance. */
   advancesClockCondition?: string;
   feedsToolUpdates: boolean;
-  workOnly: boolean;
+  setsEverSawWork: boolean;
   realActivity: boolean;
   resetsStreamAge: boolean;
   resetsToolAge: boolean;
@@ -144,7 +168,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     wireKind: "ready",
     advancesClock: true,
     feedsToolUpdates: false,
-    workOnly: false,
+    setsEverSawWork: false,
     realActivity: false,
     resetsStreamAge: false,
     resetsToolAge: false,
@@ -159,7 +183,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     advancesClock: true,
     feedsToolUpdates: false,
     // #279: the declared, asserted exception — everSawWork yes, everSawRealActivity no.
-    workOnly: true,
+    setsEverSawWork: true,
     realActivity: false,
     resetsStreamAge: true,
     resetsToolAge: true,
@@ -173,7 +197,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     wireKind: "turn_end",
     advancesClock: true,
     feedsToolUpdates: false,
-    workOnly: false,
+    setsEverSawWork: false,
     realActivity: false,
     resetsStreamAge: true,
     resetsToolAge: true,
@@ -187,7 +211,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     wireKind: "tool_start",
     advancesClock: true,
     feedsToolUpdates: false,
-    workOnly: true,
+    setsEverSawWork: true,
     realActivity: true,
     resetsStreamAge: false,
     resetsToolAge: false,
@@ -202,7 +226,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     wireKind: null,
     advancesClock: true,
     feedsToolUpdates: true,
-    workOnly: false,
+    setsEverSawWork: false,
     realActivity: false,
     resetsStreamAge: false,
     resetsToolAge: false,
@@ -217,7 +241,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     advancesClock: true,
     feedsToolUpdates: false,
     // everSawRealActivity yes; everSawWork NO (it is latched only by tool_start / turn_start).
-    workOnly: false,
+    setsEverSawWork: false,
     realActivity: true,
     resetsStreamAge: true,
     resetsToolAge: false,
@@ -232,7 +256,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     advancesClock: true,
     advancesClockCondition: 'message.role === "assistant"',
     feedsToolUpdates: false,
-    workOnly: false,
+    setsEverSawWork: false,
     realActivity: false,
     resetsStreamAge: false,
     resetsToolAge: false,
@@ -246,7 +270,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     wireKind: null,
     advancesClock: true,
     feedsToolUpdates: false,
-    workOnly: false,
+    setsEverSawWork: false,
     realActivity: false,
     resetsStreamAge: false,
     resetsToolAge: false,
@@ -260,7 +284,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     wireKind: "session_end",
     advancesClock: false,
     feedsToolUpdates: false,
-    workOnly: false,
+    setsEverSawWork: false,
     realActivity: false,
     resetsStreamAge: false,
     resetsToolAge: false,
@@ -274,7 +298,7 @@ export const PROGRESS_EDGE_TABLE: readonly ProgressEdge[] = [
     wireKind: "tick",
     advancesClock: false,
     feedsToolUpdates: false,
-    workOnly: false,
+    setsEverSawWork: false,
     realActivity: false,
     resetsStreamAge: false,
     resetsToolAge: false,
@@ -312,7 +336,11 @@ export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string
   // Shares S with stream-stall: one constant, two conditions. Naming them as one
   // term would be wrong; naming them as two unrelated bounds would be wrong too.
   "tool-silence": "DEFAULT_STREAM_STALL_MS (S) — same bound as stream-stall, different condition",
-  "tool-stall": "TASK_TOOL_STALL_FRACTION × effective hard cap (L)",
+  // The EFFECTIVE bound is TASK_TOOL_STALL_MS when the env override is a
+  // positive finite number; the fraction × cap derivation is the fallback.
+  // Recording only the fraction would let the bound move through a path the
+  // registry cannot see (#1068 review; the same shape PR #873 / #991 caught).
+  "tool-stall": "TASK_TOOL_STALL_MS override (env), else TASK_TOOL_STALL_FRACTION × effective hard cap (L)",
   "first-message-stall": "DEFAULT_FIRST_MESSAGE_MS (M)",
   "max-dispatch": "TASK_MAX_DISPATCH_MS",
   cut: "getCutGapMs() / TASK_HEARTBEAT_CUT_GAP_MS",
@@ -378,12 +406,15 @@ const SCAN_OWNER = "extensions/shared/heartbeat-progress-edges.test.ts (forward 
 const E14_PIN = "extensions/builtin-tools/builtin-tools.test.ts literal pin";
 const SUBAGENT_PARITY = "extensions/subagent/subagent-parity.test.ts literal pin";
 const SUBAGENT_TEST = "extensions/subagent/index.test.ts value+behaviour pin";
+const BT_TEST = "extensions/builtin-tools/builtin-tools.test.ts value+behaviour pin";
 const NONE = "declared and asserted by this registry (was unguarded before #1068)";
 
 /**
  * Every stall / liveness / staleness bound in the repo, with its owner file(s),
  * the fragment of its declaration line that carries the value, and who guards
- * it TODAY. `value: null` means pointer-or-derived (see the note).
+ * it TODAY. `value: null` means the value is not a local literal: a POINTER to
+ * another guard, DERIVED from other bounds, or resolved by a FUNCTION (an env
+ * override). Its presence is still asserted, in declaration shape.
  */
 export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   // — kill axis: child heartbeat protocol —
@@ -440,7 +471,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "= 2 / 3;",
     axis: "kill",
     guardedBy: SUBAGENT_PARITY,
-    note: "L is DERIVED: fraction × effective hard cap",
+    note: "L is DERIVED: fraction × effective hard cap — and is SUPERSEDED by the TASK_TOOL_STALL_MS env override when that is positive finite (see getToolStallMs)",
   },
   {
     name: "DEFAULT_FIRST_MESSAGE_MS",
@@ -471,7 +502,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "= 30_000;",
     axis: "heartbeat",
     guardedBy: NONE,
-    note: "two independent heartbeat intervals that happen to share a value",
+    note: "liveness CADENCE, not a stall bound: the subagent keep-alive emission interval and the slack-bridge socket keepalive. Two INDEPENDENT intervals that happen to share a name and a value. The shared forward assertion is deliberate — if either moves, this registry must be updated together (if they should diverge, split this into two terms with separate notes).",
   },
   // — loop-exit axis (pointer: #847 owns the value) —
   {
@@ -611,6 +642,23 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "hygiene",
     guardedBy: NONE,
   },
+  // — repo-freshness staleness bounds (extensions/repo-freshness.ts) —
+  {
+    name: "DEFAULT_FRESHNESS_INTERVAL_MS",
+    owners: ["extensions/repo-freshness.ts"],
+    value: "= 1_200_000;",
+    axis: "hygiene",
+    guardedBy: NONE,
+    note: "staleness bound on the SOURCE TREE, not on agent liveness: the default interval between repo-freshness checks (20 min). Found by the fixed comment stripper — before it, a `/*` inside a line comment in this file hid it from the scan.",
+  },
+  {
+    name: "MIN_FRESHNESS_INTERVAL_MS",
+    owners: ["extensions/repo-freshness.ts"],
+    value: "= 300_000;",
+    axis: "hygiene",
+    guardedBy: NONE,
+    note: "floor the configured freshness interval is clamped up to (5 min)",
+  },
   // — subagent byte-freshness backstop (class 2: value+behaviour pinned) —
   {
     name: "getSubagentBackstopFreshMs",
@@ -619,6 +667,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: SUBAGENT_TEST,
     note: "FUNCTION, not a const: default 60 min, floor 60 s — declared here so the axis is not invisible to the registry",
+  },
+  {
+    name: "getToolStallMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE tool-stall bound (L) — returns the TASK_TOOL_STALL_MS env override verbatim when it is positive finite, else TASK_TOOL_STALL_FRACTION × effective hard cap. Declared so the env path is visible to the registry rather than only the fraction literal.",
   },
 ];
 
@@ -675,21 +731,23 @@ export const SCAN_BOUND_SUFFIXES = [
 export const SCAN_AGE_SUFFIXES = ["_AGE", "_AGE_MS", "_AGE_S", "_AGE_HOURS", "_AGE_DAYS"] as const;
 
 /** Files the registry is asserted over. Excludes tests — they are not producers. */
-export function stallScanFiles(root: string): string[] {
+export function stallScanFiles(root: string, errors?: string[]): string[] {
   const isTest = (n: string) => /\.test\./i.test(n) || /^test-/i.test(n);
   return [
-    ...collectFiles(root, "extensions", (n) => /\.(ts|mjs)$/.test(n) && !isTest(n)),
-    ...collectFiles(root, "scripts", (n) => /\.(sh|ts|mjs)$/.test(n) && !isTest(n)),
+    ...collectFiles(root, "extensions", (n) => /\.(ts|mjs)$/.test(n) && !isTest(n), 6, errors),
+    ...collectFiles(root, "scripts", (n) => /\.(sh|ts|mjs)$/.test(n) && !isTest(n), 6, errors),
   ];
 }
 
 /** The scan spec consumed by the registry test. */
 export function stallScanSpec(root: string): ScanSpec {
+  const walkErrors: string[] = [];
   return {
-    files: stallScanFiles(root),
+    files: stallScanFiles(root, walkErrors),
     families: SCAN_NAME_FAMILIES,
     boundSuffixes: SCAN_BOUND_SUFFIXES,
     ageSuffixes: SCAN_AGE_SUFFIXES,
+    walkErrors,
   };
 }
 

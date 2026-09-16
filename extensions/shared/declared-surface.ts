@@ -27,7 +27,10 @@
  * An empty or truncated scan is a VIOLATION, never a pass (`vacuityFindings`).
  * A silently-empty parse that reports "0 unregistered declarations" is the
  * no-op-gate failure this module exists to make impossible. The same floor
- * applies to the scan reading fewer files than the corpus declares.
+ * applies to the scan reading fewer files than the corpus declares, and a
+ * corpus WALK failure (an unreadable directory, which would silently drop a
+ * subtree) is reported through the same channel as an unreadable file — never
+ * swallowed.
  *
  * COMMENT HANDLING IS LANGUAGE-AWARE ON PURPOSE
  * ---------------------------------------------
@@ -79,6 +82,11 @@ export interface ScanSpec {
    * whose names carry no stall/silence/reap token at all.
    */
   ageSuffixes: readonly string[];
+  /**
+   * Failures the corpus WALK hit (unreadable directory). Carried through so the
+   * scan can report them: a dropped subtree is a violation, never a silent skip.
+   */
+  walkErrors?: readonly string[];
 }
 
 /**
@@ -100,7 +108,7 @@ export interface StallTerm {
    * bounds.
    */
   value: string | null;
-  /** Which axis the term answers to. */
+  /** Which axis the term answers to. Asserted against the owning module's declared axis set. */
   axis: string;
   /** Who actually pins this term's value today. */
   guardedBy: string;
@@ -169,13 +177,56 @@ export function langOf(file: string): SourceLang {
  * comments is a scan that lies).
  *
  * Shell: `#` line comments only — NO block-comment pass (see the header).
- * TS/JS: block + `//` line comments. String/regex literals are not parsed; a
- * `//` inside a literal can only ever HIDE a declaration, which the non-vacuity
- * floor catches, never fabricate one.
+ * TS/JS: `//` line comments and block comments, removed by ONE left-to-right
+ * pass. That single pass is a CORRECTNESS property, not a style choice: two
+ * ordered regex passes let a `/*` inside a `//` comment open a block that
+ * swallowed real declarations (`extensions/repo-freshness.ts:5` carries the
+ * glob `"./shared/*"` in a line comment, and stripping block comments first
+ * deleted its two FRESH bounds) — a false PASS in the one direction this module
+ * exists to close. It also cannot be fooled by a `//` inside a block comment or
+ * a comment delimiter inside a string literal.
  */
 export function stripComments(src: string, lang: SourceLang = "ts"): string {
   if (lang === "sh") return src.replace(/(^|[ \t])#[^\n]*/g, "$1");
-  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "/" && src[i + 1] === "/") {
+      const nl = src.indexOf("\n", i);
+      i = nl === -1 ? src.length : nl;
+      continue;
+    }
+    if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? src.length : end + 2;
+      // Preserve the removed span's newlines so a declaration that FOLLOWS a
+      // multi-line comment is still at the start of a line (the declaration
+      // regexes are line-anchored).
+      const span = src.slice(i, stop);
+      out += "\n".repeat((span.match(/\n/g) ?? []).length);
+      i = stop;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      // Copy the literal verbatim (honouring escapes) so a comment delimiter
+      // inside it is never mistaken for a comment.
+      let j = i + 1;
+      while (j < src.length) {
+        if (src[j] === "\\") j += 2;
+        else if (src[j] === c) {
+          j++;
+          break;
+        } else j++;
+      }
+      out += src.slice(i, j);
+      i = j;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 /** TS/JS `const|let|var NAME =` (also `export const`). */
@@ -232,6 +283,31 @@ export function declarationLine(src: string, symbol: string, lang: SourceLang = 
   return declarationLines(src, symbol, lang)[0] ?? null;
 }
 
+/**
+ * True when `symbol` appears as a DECLARATION in `src` — on the comment-stripped
+ * source, in a declaration SHAPE (`const`/`let`/`var`, `function`, or a shell
+ * assignment).
+ *
+ * This is the assertion for `value: null` terms (pointers and derived
+ * expressions, which have no literal to compare). A bare word-boundary test over
+ * the RAW source is satisfied by a comment that merely NAMES the term, so
+ * deleting such a declaration while leaving a comment mentioning it kept BOTH
+ * scan directions green (#1068 review).
+ */
+export function declaresSymbol(src: string, symbol: string, lang: SourceLang = "ts"): boolean {
+  const stripped = stripComments(src, lang);
+  if (declarationLines(stripped, symbol, lang).length > 0) return true;
+  const esc = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const shapes = [
+    new RegExp(`(?:^|\\n)[ \\t]*(?:export[ \\t]+)?(?:async[ \\t]+)?function[ \\t*]+${esc}\\b`),
+    new RegExp(`(?:^|\\n)[ \\t]*(?:const|let|var)[ \\t]+${esc}\\b`),
+  ];
+  if (lang === "sh") {
+    shapes.push(new RegExp(`(?:^|\\n)[ \\t]*(?:export[ \\t]+|readonly[ \\t]+|declare[ \\t]+|function[ \\t]+)?${esc}\\b`));
+  }
+  return shapes.some((re) => re.test(stripped));
+}
+
 /** Scan `spec.files` for in-family declarations. */
 export function scanDeclarations(
   spec: ScanSpec,
@@ -239,6 +315,10 @@ export function scanDeclarations(
 ): ScanResult {
   const declarations: Declaration[] = [];
   let filesScanned = 0;
+  // A walk failure is reported through the same channel as an unreadable file.
+  for (const w of spec.walkErrors ?? []) {
+    declarations.push({ file: "", symbol: "", raw: `CORPUS WALK ERROR: ${w}` });
+  }
   for (const file of spec.files) {
     let src: string;
     try {
@@ -296,9 +376,11 @@ export function forwardViolations(
       const lines = declarationLines(src, term.name, langOf(owner));
       if (lines.length === 0) {
         // `value: null` terms may be FUNCTION-shaped (`getSubagentBackstopFreshMs`)
-        // or derived expressions, not a `const NAME = …` — a plain presence check
-        // is the honest assertion for them.
-        if (term.value === null && new RegExp(`\\b${term.name}\\b`).test(src)) continue;
+        // or derived expressions, not a `const NAME = …` — so the presence check
+        // is declaration-SHAPED, on the comment-stripped source. A bare
+        // word-boundary test over raw text is satisfied by a comment that names
+        // the term, which made a deleted declaration invisible.
+        if (term.value === null && declaresSymbol(src, term.name, langOf(owner))) continue;
         out.push(`${term.name}: ${owner} no longer declares it (de-listed or renamed) — the registry says it does`);
         continue;
       }
@@ -318,7 +400,7 @@ export function reverseViolations(
   terms: readonly StallTerm[],
   exemptions: readonly Exemption[],
 ): string[] {
-  const registered = new Set(terms.map((t) => t.name));
+  const registered = new Map(terms.map((t) => [t.name, t]));
   const exempt = new Map(exemptions.map((e) => [e.symbol, e]));
   const out: string[] = [];
   for (const d of scan.declarations) {
@@ -326,7 +408,19 @@ export function reverseViolations(
       out.push(d.raw);
       continue;
     }
-    if (registered.has(d.symbol)) continue;
+    const term = registered.get(d.symbol);
+    if (term) {
+      // A registered term re-declared in a file the registry does not list as an
+      // owner is exactly the silent drift this registry exists to catch: a
+      // second, conflicting copy of a bound. Keying on the NAME alone let it
+      // pass both directions (#1068 review).
+      if (!term.owners.includes(d.file)) {
+        out.push(
+          `${d.file}: ${d.symbol} — declares a REGISTERED term in a file the registry does not list as an owner (owners: ${term.owners.join(", ")}). Either add this file to the term's owners or delete the duplicate declaration.`,
+        );
+      }
+      continue;
+    }
     const ex = exempt.get(d.symbol);
     if (!ex) {
       out.push(
@@ -356,9 +450,14 @@ export function vacuityFindings(scan: ScanResult, floors: VacuityFloors): string
       `VACUOUS SCAN: ${scan.filesScanned} of ${scan.files.length} corpus files were readable (floor ${floors.minFiles}) — the corpus moved, was renamed, or was emptied`,
     );
   }
-  if (scan.declarations.length < floors.minDeclarations) {
+  // Only REAL declarations count toward the floor. An unreadable file (or a
+  // failed directory walk) contributes a sentinel with an empty symbol, and
+  // counting those would let a largely-unreadable corpus clear the floor that
+  // exists to prove the scan saw a real corpus (#1068 review).
+  const found = scan.declarations.filter((d) => d.symbol !== "").length;
+  if (found < floors.minDeclarations) {
     out.push(
-      `VACUOUS SCAN: ${scan.declarations.length} in-family declarations found (floor ${floors.minDeclarations}) — the scanner or its name families stopped matching, so "no unregistered declarations" proves nothing`,
+      `VACUOUS SCAN: ${found} in-family declarations found (floor ${floors.minDeclarations}) — the scanner or its name families stopped matching, so "no unregistered declarations" proves nothing`,
     );
   }
   return out;
@@ -389,6 +488,7 @@ export function collectFiles(
   dirRel: string,
   keep: (name: string) => boolean,
   depth = 6,
+  errors?: string[],
 ): string[] {
   const out: string[] = [];
   const walk = (rel: string, d: number) => {
@@ -397,7 +497,11 @@ export function collectFiles(
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(abs, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      // Report, never swallow: a dropped subtree can hide a new bound, and the
+      // non-vacuity floor is too coarse to cover it (the real corpus is ~126
+      // files against a floor of 100).
+      errors?.push(`${rel}: unreadable directory during the corpus walk (${(err as Error).message})`);
       return;
     }
     for (const e of entries) {

@@ -2478,6 +2478,34 @@ testAsync("#1068 — the child's clock advances on exactly the declared edges (b
   }
 });
 
+testAsync("#1068 — a throwing activity sink must not break the child's heartbeat", async () => {
+  // The sink is a test seam, but it sits on the child's LIVENESS path:
+  // `session_start` calls `touchActivity` BEFORE installing the tick timer, so
+  // an unguarded throwing sink would skip `setInterval` and leave a healthy
+  // child with no heartbeat — which the parent's silence detector would then
+  // kill. An observer must never alter the child's liveness (same contract as
+  // `emit`). This test fails if the guard is removed.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  childHb._setActivitySinkForTest(() => {
+    throw new Error("SINK BOOM");
+  });
+  try {
+    await withEnv(
+      { TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_NONCE: "sinknonce" },
+      async () => {
+        childFactory(api);
+        await handlers.session_start({} as any);
+        await handlers.turn_start({ turnIndex: 1 } as any);
+        await handlers.tool_execution_start({ toolCallId: "s1", toolName: "bash", args: {} } as any);
+        await handlers.session_shutdown({} as any);
+      },
+    );
+  } finally {
+    childHb._setActivitySinkForTest(null);
+  }
+});
+
 testAsync("child lifecycle — ready, tool-Set semantics, per-turn flags, tick fields, shutdown cleanup", async () => {
   const handlers: Record<string, (ev: any) => Promise<void>> = {};
   const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };

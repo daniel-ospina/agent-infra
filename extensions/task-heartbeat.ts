@@ -469,7 +469,17 @@ export default function (pi: ExtensionAPI) {
 
   const touchActivity = (edge: ActivityEdge | typeof CLOCK_RESET_EVENT) => {
     lastActivityAt = Date.now();
-    if (activitySink) activitySink(edge);
+    // #1068: an OBSERVER must never alter the child's liveness — same contract as
+    // `emit()` below. Guarded because `session_start` calls this BEFORE installing
+    // the tick timer, so a throwing sink would skip `setInterval` and leave a
+    // healthy child with no heartbeat at all (the parent would then kill it).
+    if (activitySink) {
+      try {
+        activitySink(edge);
+      } catch {
+        /* an observation failure is never the child's problem */
+      }
+    }
   };
 
   const tick = () => {

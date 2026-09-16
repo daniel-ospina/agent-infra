@@ -34,6 +34,7 @@ import {
   langOf,
   reverseViolations,
   scanDeclarations,
+  declaresSymbol,
   stripComments,
   vacuityFindings,
   type ScanResult,
@@ -100,6 +101,53 @@ test("comments are stripped so prose cannot fabricate a declaration", () => {
   const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => ts);
   equal(scan.declarations.length, 1, "only the real declaration survives");
   equal(scan.declarations[0].symbol, "REAL_STALL_MS");
+});
+
+test("a `/*` inside a `//` comment does NOT open a block comment (the repo-freshness shape)", () => {
+  // The ordering of the two comment passes is a correctness property. Stripping
+  // block comments first let a glob in a line comment (`"./shared/*"`) open a
+  // block whose first closing `*/` was a doc comment far below — deleting every
+  // real declaration in between. That silently hid two live bounds.
+  const src = [
+    '// consumers: "./shared/*" and friends',
+    "// more prose",
+    "export const DEFAULT_FRESHNESS_INTERVAL_MS = 1_200_000;",
+    "/** documentation for the floor */",
+    "export const MIN_FRESHNESS_INTERVAL_MS = 300_000;",
+  ].join("\n");
+  const stripped = stripComments(src, "ts");
+  ok(stripped.includes("DEFAULT_FRESHNESS_INTERVAL_MS"), "a /* inside a // comment must not open a block");
+  ok(stripped.includes("MIN_FRESHNESS_INTERVAL_MS"), "declarations after the comment survive");
+  const scan = scanDeclarations(
+    { ...SPEC, families: [...FAMILIES, "FRESH"], files: ["extensions/repo-freshness.ts"] },
+    () => src,
+  );
+  equal(
+    scan.declarations.map((d) => d.symbol).sort().join(","),
+    "DEFAULT_FRESHNESS_INTERVAL_MS,MIN_FRESHNESS_INTERVAL_MS",
+    "both FRESH bounds must be visible to the scan",
+  );
+});
+
+test("a removed block comment keeps its newlines, so a following declaration stays line-anchored", () => {
+  const src = ["const A_STALL_MS = 1;", "/*", " span", "*/ const B_STALL_MS = 2;"].join("\n");
+  const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => src);
+  equal(
+    scan.declarations.map((d) => d.symbol).sort().join(","),
+    "A_STALL_MS,B_STALL_MS",
+    "removing a multi-line comment must not merge two lines into one",
+  );
+});
+
+section("declaresSymbol — a mention is not a declaration");
+
+test("a comment that merely names the term does not satisfy the presence check", () => {
+  ok(!declaresSymbol("// REAP_STUCK_HOURS is derived at runtime\n", "REAP_STUCK_HOURS"), "a comment mention is not a declaration");
+  ok(!declaresSymbol('const msg = "getSubagentBackstopFreshMs is documented elsewhere";\n', "getSubagentBackstopFreshMs"), "a string-literal mention is not a declaration");
+  ok(declaresSymbol("export function getSubagentBackstopFreshMs(): number {}\n", "getSubagentBackstopFreshMs"));
+  ok(declaresSymbol("export const STALL_THRESHOLD = 0.8;\n", "STALL_THRESHOLD"));
+  ok(declaresSymbol('REAP_STUCK_HOURS="$(expr $REAP_IDLE_HOURS \\* 3)"\n', "REAP_STUCK_HOURS", "sh"), "a shell assignment counts");
+  ok(!declaresSymbol("# REAP_STUCK_HOURS is derived\n", "REAP_STUCK_HOURS", "sh"), "a shell comment mention does not");
 });
 
 section("inFamily — the two-part rule");
@@ -194,6 +242,17 @@ test("an exemption with no rationale is itself a violation", () => {
   ok(!isSubstantive("short"));
 });
 
+test("a registered term declared in an unowned file is a violation", () => {
+  const scan = scanDeclarations({ ...SPEC, files: ["elsewhere.ts"] }, () => "const HEARTBEAT_MS = 30_000;");
+  const term: StallTerm = { name: "HEARTBEAT_MS", owners: ["owner.ts"], value: null, axis: "kill", guardedBy: "t" };
+  const v = reverseViolations(scan, [term], []);
+  equal(v.length, 1, "a second copy of a registered bound must be caught");
+  ok(v[0].includes("does not list as an owner"), v[0]);
+  // …and the same declaration in a LISTED owner is fine.
+  const okScan = scanDeclarations({ ...SPEC, files: ["owner.ts"] }, () => "const HEARTBEAT_MS = 30_000;");
+  equal(reverseViolations(okScan, [term], []).length, 0);
+});
+
 test("an unreadable corpus file is a violation, never a silent skip", () => {
   const scan = scanDeclarations({ ...SPEC, files: ["gone.ts"] }, () => {
     throw new Error("ENOENT");
@@ -202,6 +261,28 @@ test("an unreadable corpus file is a violation, never a silent skip", () => {
   const v = reverseViolations(scan, [], []);
   equal(v.length, 1);
   ok(v[0].includes("UNREADABLE CORPUS FILE"), v[0]);
+});
+
+test("a failed directory walk is reported, surfaced, and never counted toward the floor", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "declared-surface-walk-"));
+  const locked = path.join(tmp, "locked");
+  let errors: string[] = [];
+  try {
+    fs.mkdirSync(locked, { recursive: true });
+    fs.writeFileSync(path.join(locked, "hidden.ts"), "const X_STALL_MS = 1;\n");
+    fs.writeFileSync(path.join(tmp, "readable.ts"), "// nothing in-family\n");
+    fs.chmodSync(locked, 0o000);
+    errors = [];
+    collectFiles(tmp, ".", (n) => n.endsWith(".ts"), 6, errors);
+  } finally {
+    fs.chmodSync(locked, 0o700);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  equal(errors.length, 1, `an unreadable directory must be reported, got ${JSON.stringify(errors)}`);
+  const scan = scanDeclarations({ ...SPEC, files: [], walkErrors: errors }, () => "");
+  ok(reverseViolations(scan, [], []).length === 1, "the walk failure is surfaced through the violation channel");
+  const v = vacuityFindings(scan, { minFiles: 1, minDeclarations: 1 });
+  ok(v.length > 0, "a walk failure must not be able to satisfy the vacuity floor");
 });
 
 section("vacuity — a green run over nothing is a failure");
@@ -219,6 +300,17 @@ test("an empty or truncated scan fails the floors", () => {
   equal(v.length, 1);
   ok(v[0].includes("in-family declarations found"), v[0]);
   ok(v[0].includes("proves nothing"), v[0]);
+
+  // Sentinels for unreadable files/walk failures must NOT inflate the floor.
+  const sentinels: ScanResult = {
+    files: ["a", "b", "c", "d"],
+    filesScanned: 4,
+    declarations: Array.from({ length: 10 }, () => ({ file: "a", symbol: "", raw: "UNREADABLE CORPUS FILE: a" })),
+  };
+  ok(
+    vacuityFindings(sentinels, { minFiles: 4, minDeclarations: 10 }).length > 0,
+    "error sentinels must not satisfy the declaration floor",
+  );
 
   const healthy: ScanResult = {
     files: ["a", "b", "c", "d"],
@@ -286,9 +378,11 @@ test("excludes node_modules/_deprecated/hidden and honours the keep predicate", 
     fs.mkdirSync(path.join(tmp, "sub"), { recursive: true });
     fs.writeFileSync(path.join(tmp, "sub", "keep.ts"), "");
     fs.writeFileSync(path.join(tmp, "skip.test.ts"), "");
-    const got = collectFiles(tmp, ".", (n) => n.endsWith(".ts") && !n.includes(".test."));
+    const errors: string[] = [];
+    const got = collectFiles(tmp, ".", (n) => n.endsWith(".ts") && !n.includes(".test."), 6, errors);
     equal(got.length, 1, `expected only sub/keep.ts, got ${JSON.stringify(got)}`);
     ok(got[0].endsWith("sub/keep.ts"), got[0]);
+    equal(errors.length, 0, `a readable tree must report no walk errors, got ${JSON.stringify(errors)}`);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
