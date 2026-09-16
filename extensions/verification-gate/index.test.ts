@@ -11,7 +11,7 @@ import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, r
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
-import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, symlinkSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { join, sep, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1184,6 +1184,114 @@ test("missing file throws (consistent with hashFile; callers fail closed)", () =
   try {
     const sha1 = createHash("sha1").update("x").digest("hex");
     throws(() => hashMatchesDisk(root, "missing.ts", sha1));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── symlink hashing (#1092) ──────────────────────────
+
+section("symlink hashing — the link TARGET is the committed blob (#1092)");
+
+test("symlink to a DIRECTORY hashes its link target — no EISDIR (#1092)", () => {
+  // The #1092 reproduction: `readFileSync` throws EISDIR on a directory
+  // symlink, and the commit loop routes every errno but ENOENT/ENOTDIR to
+  // `unverified` — so a path like pi-config/extensions/<new-dir> was
+  // PERMANENTLY un-committable. It must hash the link target instead.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "ext-real"));
+    writeFileSync(join(root, "ext-real", "index.ts"), "export const a = 1;\n");
+    symlinkSync("ext-real", join(root, "farm-entry"));
+    const stored = createHash("sha256").update("ext-real").digest("hex");
+    equal(hashMatchesDisk(root, "farm-entry", stored), true, "a dir symlink must verify by its link target");
+    // NOT the content reachable through it (which is a directory, unreadable)
+    const throughContent = createHash("sha256").update("export const a = 1;\n").digest("hex");
+    equal(hashMatchesDisk(root, "farm-entry", throughContent), false, "must not hash a file inside the linked dir");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a symlink to a FILE also hashes the link target (git 120000 blob), not the target's content", () => {
+  // Deliberate semantics (the #305 completion): git commits the TARGET STRING.
+  // Hashing followed content would miss a retarget to an equal-content file.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    writeFileSync(join(root, "target.ts"), "same bytes\n");
+    symlinkSync("target.ts", join(root, "link.ts"));
+    equal(hashMatchesDisk(root, "link.ts", createHash("sha256").update("target.ts").digest("hex")), true);
+    equal(hashMatchesDisk(root, "link.ts", createHash("sha256").update("same bytes\n").digest("hex")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a retargeted symlink is drift (anti-drift preserved) — same link, different bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "a"));
+    mkdirSync(join(root, "b"));
+    symlinkSync("a", join(root, "entry"));
+    const stored = createHash("sha256").update("a").digest("hex");
+    equal(hashMatchesDisk(root, "entry", stored), true);
+    rmSync(join(root, "entry"));
+    symlinkSync("b", join(root, "entry"));
+    equal(hashMatchesDisk(root, "entry", stored), false, "a post-verification retarget must fail closed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a broken symlink hashes its target string (lstat, never follow-through)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    symlinkSync("nowhere-at-all", join(root, "dangling"));
+    equal(hashMatchesDisk(root, "dangling", createHash("sha256").update("nowhere-at-all").digest("hex")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("non-UTF-8 link targets are hashed byte-exact ({ encoding: 'buffer' })", () => {
+  // A string readlink would decode-lossy the target and hash bytes git never
+  // stored; the digest must be over the raw link bytes.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    const rawTarget = Buffer.from([0x61, 0xff, 0xfe, 0x62]);
+    symlinkSync(rawTarget, join(root, "weird"));
+    equal(hashMatchesDisk(root, "weird", createHash("sha256").update(rawTarget).digest("hex")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("errno semantics preserved: a D/F conflict still throws ENOTDIR (not EISDIR-swallowed)", () => {
+  // The #920 branch discriminates on these errnos — lstatSync must throw the
+  // same ones readFileSync did, or a genuine D/F deletion would start blocking.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    writeFileSync(join(root, "parent"), "a regular file\n");
+    let code: string | undefined;
+    try { hashMatchesDisk(root, "parent/child.ts", "0".repeat(64)); } catch (err: any) { code = err?.code; }
+    equal(code, "ENOTDIR");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the hashed bytes are git's own blob for the link (index agreement)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "ext-real"));
+    symlinkSync("ext-real", join(root, "farm-entry"));
+    execSync("git init -q -b main && git add farm-entry", { cwd: root, stdio: "ignore" });
+    // git records the entry as a mode-120000 blob whose contents ARE the target
+    const entry = execSync("git ls-files -s -- farm-entry", { cwd: root, encoding: "utf-8" }).trim();
+    equal(entry.split(/\s+/)[0], "120000", "staging a symlink yields a mode-120000 entry");
+    const targetBytes = execSync("git cat-file -p :farm-entry", { cwd: root, encoding: "buffer" });
+    equal(hashMatchesDisk(root, "farm-entry", createHash("sha256").update(targetBytes).digest("hex")), true,
+      "the gate hashes exactly the bytes git stored for that path");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

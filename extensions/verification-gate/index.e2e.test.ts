@@ -18,7 +18,7 @@
 import { ok, equal } from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -992,6 +992,14 @@ async function main() {
           ok(/Hash mismatch/.test(res.reason), "block reason must carry the hash-mismatch diagnostic");
           ok(res.reason.includes("remedy: file edited after verification OR verifier hash typo"), "mismatch reason must name BOTH causes (#561 dual-cause remedy)");
           ok(res.reason.includes("sha256sum"), "mismatch reason must name the never-hand-type-sha256 fix (#561)");
+          // #1092: the remedy must be BYTE-EXACT for a symlink. `sha256sum <link>`
+          // follows the link (and EISDIRs on a directory link), and a
+          // `printf '%s' "$(readlink …)"` form is not byte-exact either — command
+          // substitution strips a trailing newline from the target and an
+          // unquoted path word-splits. Pin the raw-link-bytes form so the recipe
+          // cannot silently regress to a digest the gate will never accept.
+          ok(res.reason.includes("readlinkSync"), "mismatch remedy must carry the byte-exact symlink form (#1092)");
+          ok(!res.reason.includes("printf '%s'"), "mismatch remedy must NOT carry the non-byte-exact printf/readlink recipe (#1092)");
           ok(res.reason.includes("This session is a task sub-agent"), "mismatch block must still carry the sub-agent marker");
           ok(/Dispatch your own VGATE verification/.test(res.reason), "mismatch block must instruct the child to self-satisfy the gate in-band");
           ok(res.reason.includes("task(prompt="), "mismatch block must show the self-dispatch task(...) template");
@@ -4364,6 +4372,90 @@ async function main() {
       "82: the SIBLING checkout's staged file is never named — the root is not the session's repo");
     ok(res.reason.includes(wt),
       `82: the reported Project root is the operated-on repo (${wt})`);
+  });
+
+  test("scenario 1092: a DIRECTORY symlink commits its LINK TARGET — never a permanent EISDIR block (#1092)", async () => {
+    // The #1092 reproduction, driven through the REAL handler. A symlink to a
+    // directory is the only shape a multi-file extension's pi-config farm entry
+    // can take (`check-pi-config-extensions.sh` requires both the exact
+    // basename and a resolvable symlink into extensions/). Pre-fix,
+    // `hashFile`'s readFileSync threw EISDIR, the commit loop routed every errno
+    // but ENOENT/ENOTDIR to `unverified`, and NO verifier PASS could ever clear
+    // it — the path was un-committable from any non-interactive session.
+    const repo = join(TEST_ROOT, "repo-1092-symlink");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    mkdirSync(join(repo, "ext-real"), { recursive: true });
+    writeFileSync(join(repo, "ext-real", "index.ts"), "export const a = 1;\n");
+    git(repo, "add ext-real/index.ts");
+    git(repo, "commit -m base");
+    symlinkSync("ext-real", join(repo, "farm-entry")); // the pi-config farm entry
+    git(repo, "add farm-entry");
+    await fire("session_start", {});
+
+    // 1. unverified → blocked (and the reason must name the symlink)
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m sym1", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "an unverified directory symlink must block");
+    ok(blocked.reason.includes("farm-entry"), "the block reason must name the symlink path");
+
+    // 2. verify the symlink by its LINK TARGET (git's mode-120000 blob) ...
+    const passJson = JSON.stringify({
+      status: "PASS", failures: [],
+      verified_files: [{ path: join(repo, "farm-entry"), hash: sha("ext-real") }],
+    });
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: farm-entry. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: passJson }],
+    });
+
+    // 3. ... and a RETARGET after that PASS is drift, not a free pass. (Ordered
+    //    before any ALLOWED commit on purpose: an allowed commit arms #7574
+    //    pendingRehash, which re-hashes the committed paths on the next git op
+    //    and would re-bless the retargeted link — that window is a documented,
+    //    file-type-agnostic #7574 property, not something #1092 introduces.)
+    //    Pre-fix this leg was ALLOWED, in the opposite direction from leg 1:
+    //    the retarget points at a path that does not exist, so `readFileSync`
+    //    followed the link and threw ENOENT — which the commit loop reads as
+    //    "deleted, content-free" and SKIPS (#1018's residual class). A symlink
+    //    retarget therefore rode through unverified. `lstatSync` never follows,
+    //    so the link target is hashed and the change is a MISMATCH.
+    rmSync(join(repo, "farm-entry"));
+    symlinkSync("ext-real-2", join(repo, "farm-entry"));
+    git(repo, "add farm-entry");
+    const drifted = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m sym1", cwd: repo },
+    });
+    ok(drifted && drifted.block === true,
+      "#1092: a retargeted symlink is drift — the link-target hash changed, so the commit must block (pre-fix: ENOENT-on-follow-through SKIPPED the path ⇒ allowed)");
+    ok(/Hash mismatch/.test(drifted.reason), "the drift block must be a hash mismatch, not a fresh 'unverified'");
+    ok(drifted.reason.includes("farm-entry"), "the drift block must name the retargeted symlink");
+
+    // 4. re-verify the NEW target → allowed → the committed content is the target
+    const passJson2 = JSON.stringify({
+      status: "PASS", failures: [],
+      verified_files: [{ path: join(repo, "farm-entry"), hash: sha("ext-real-2") }],
+    });
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: farm-entry. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: passJson2 }],
+    });
+    const allowed = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m sym1", cwd: repo },
+    });
+    equal(allowed, undefined,
+      "#1092: a dir symlink must verify by its link target — pre-fix this was EISDIR ⇒ unverified forever (NO verifier PASS could clear it)");
+    git(repo, "commit -m sym1");
+    equal(git(repo, "cat-file -p HEAD:farm-entry"), "ext-real-2",
+      "git records the link TARGET as the committed content (mode-120000 semantics)");
   });
 
 } // main: plugin loaded; tests run sequentially via runAll()

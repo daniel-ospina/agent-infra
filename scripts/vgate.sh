@@ -90,13 +90,20 @@ for vf in files:
     disk = "n/a"
     if "::" in path:
         r, rel = path.split("::", 1)
-        if os.path.isfile(os.path.join(r, rel)):
+        full = os.path.join(r, rel)
+        # #1092: a symlink's committed content is its LINK TARGET (git stores a
+        # mode-120000 blob), and `os.path.isfile` FOLLOWS the link — so a valid
+        # directory symlink previewed as "missing" and its entry read as a stale
+        # no-match, exactly backwards. islink-then-readlink mirrors the gate's
+        # lstat/readlink rule; os.fsencode keeps the target bytes exact.
+        if os.path.islink(full) or os.path.isfile(full):
             try:
                 # Length-branch sha1/sha256 like the extension's hashMatchesDisk
                 # (#320: verifier-submitted hashes stored verbatim — 40-hex sha1
                 # entries legitimately reach the bridge; #561 review r5 P2).
                 algo = hashlib.sha1 if len(h) == 40 else hashlib.sha256
-                disk = algo(open(os.path.join(r, rel), "rb").read()).hexdigest()
+                blob = os.readlink(os.fsencode(full)) if os.path.islink(full) else open(full, "rb").read()
+                disk = algo(blob).hexdigest()
             except Exception:
                 disk = "unreadable"
         else:
