@@ -928,19 +928,32 @@ BANNED_RE = (
      f"backoff cap ({CAP // 1000} s)"),
     (re.compile(rf"(?:capped\s+at|cap\s+of|(?:backoff|retry)\s+(?:capped|cap|cadence)\b)\D{{0,10}}?(?<![\d.]){_num(CAP // 1000)}(?:\.\d+)?[\s-]*s(?![\w])"),
      f"backoff cap ({CAP // 1000} s)"),
-    # ...and the reverse/copula order the MINUTE twin below already covers
-    # ("the cap is 1 min" is caught, so "the cap is 60 s" must be too — leaving
-    # the seconds unit out of that family was a reproduced asymmetry, #1088
-    # review cycle 7). The optional `(?:backoff|retry)` prefix accepts a hyphen
-    # as well as a space, for "the backoff-cap is 60 s".
-    (re.compile(rf"(?:(?:backoff|retry)[\s-]+)?(?:cap|cadence)\s*(?:is|of|=|:)\s*(?<![\d.]){_num(CAP // 1000)}(?:\.\d+)?[\s-]*s(?![\w])"),
+    # ...and the reverse/copula/assignment order ("the cap is 60 s"), which
+    # review cycle 7 found the seconds family missing entirely. Unlike the
+    # MINUTE twin below, the contract noun is REQUIRED here — option (a) of the
+    # cycle-8 review. `60 s` / `60s` is also unrelated current-state prose in
+    # this repo (a 60-second poll, an LB idle timeout), so requiring a prefix
+    # only when the number carries a *bare seconds* unit is what keeps the
+    # innocent prose "the market cadence is 60 s" / "the LB idle timeout cap is
+    # 60 s" out of the ban (both reproduced as false blocks with the prefix
+    # optional). The reverse-order CLASS stays covered by two arms, both
+    # asserted in test 34: the prefixed seconds form here ("the backoff cap is
+    # 60 s", "the backoff-cap is 60 s" — the hyphen is accepted, not just the
+    # space) and the unprefixed MINUTE form in the twin below ("the cap is
+    # 1 min"). What this leaves uncaught — unprefixed `cap`/`cadence` in bare
+    # seconds — is a documented false-pass, never a false block.
+    (re.compile(rf"(?:backoff|retry)[\s-]+(?:cap|cadence)\s*(?:is|of|=|:)\s*(?<![\d.]){_num(CAP // 1000)}(?:\.\d+)?[\s-]*s(?![\w])"),
      f"backoff cap ({CAP // 1000} s)"),
     (re.compile(rf"(?<![\d.]){BACKOFF:,}(?![\d])"), f"retry ladder ({BACKOFF:,} ms)"),
     (re.compile(rf"(?<![\d.]){BACKOFF}(?![\d])"), f"retry ladder ({BACKOFF} ms)"),
     # Noun-FIRST and copula phrasings ("the backoff cap is 1 min", "retry
     # cadence is 1 minute", "cap = 1 min") — the ordered forms above miss the
     # reverse order, which is how a summary doc would naturally state it
-    # (#1088 review).
+    # (#1088 review). The prefix stays OPTIONAL here on purpose: the minute unit
+    # has no innocent-prose collision (nothing else in this repo is "1 min"), so
+    # this arm is the fail-CLOSED side and is what still covers the
+    # unprefixed reverse-order class the seconds arm above now declines — the
+    # deliberate asymmetry, asserted in test 34 (#1088 cycle 8, option (a)).
     (re.compile(rf"(?:(?:backoff|retry)\s+)?(?:cap|cadence)\s*(?:is|of|=|:)\s*{CAP // 60000}[\s-]*min(?:ute)?s?"),
      f"backoff cap ({CAP // 60000} min)"),
     # ...and the bare abbreviation forms ("43m window").
@@ -1495,24 +1508,37 @@ must_catch = ["182 s", "2582 s", "4982 s", "182s", "182 sec", "182 seconds",
               "2,582 s", "2,582 sec", "4,982 s", "2,582 seconds",
               "182.0 s", "2,582.0 s", "4,982.0 s",
               "60 s backoff cap", "the backoff cap is 60 s", "capped at 60 s",
-              "the cap is 60 s", "cap = 60 s", "cadence is 60 s",
-              "the backoff-cap is 60 s"]
+              "the backoff-cap is 60 s", "backoff cap = 60 s",
+              "retry cadence is 60 s"]
+# The reverse-order CLASS that cycle 7 found missing, in the ONE spelling the
+# seconds arm deliberately declines: the cap named WITHOUT the contract noun.
+# The minute twin is the arm that still covers it, so it is asserted here —
+# otherwise `the cap is 60 s` (option (a)) would be a class silently dropped
+# rather than a spelling shifted to its fail-closed twin.
+must_catch_minute = ["the cap is 1 min", "cap = 1 min", "cadence is 1 min"]
 # Innocent current-state prose. `60 s` / `60s` is ALSO a 60-second poll and an
 # LB idle timeout in this repo's own docs, so the cap's bare form is anchored;
 # a blanket bare-letter ban false-blocks all three (verified against the real
 # docs/ tree). These must stay clean or the pin trades a false-pass for blocks.
+# The last two are the option-(a) controls: an unprefixed `cap` / `cadence` with
+# bare seconds is innocent here, and was a reproduced false block while the
+# seconds copula pattern accepted the contract noun as optional.
 # NB: the MINUTE word forms ("43 minutes") are deliberately the fail-CLOSED
 # side — see the note at the ban loop — so they are not controls here.
 must_not = ["common 60 s LB idle timeout", "re-checks every 60s up to",
             "the <=60s figure holds at 1x only", "a 30 s connect timeout",
-            "a 60 s capacity limit", "the export has 60 s capable throughput"]
+            "a 60 s capacity limit", "the export has 60 s capable throughput",
+            "the market cadence is 60 s", "the LB idle timeout cap is 60 s"]
 bad = ["NOT CAUGHT: %r" % s for s in must_catch if not caught(s)]
+bad += ["MINUTE TWIN MISSED: %r" % s for s in must_catch_minute if not caught(s)]
 bad += ["FALSE BLOCK: %r -> %s" % (s, caught(s)) for s in must_not if caught(s)]
-print("\n".join(bad) if bad else "OK")
+print("\n".join(bad) if bad else
+      "OK catch=%d minute=%d not=%d" % (len(must_catch), len(must_catch_minute),
+                                        len(must_not)))
 sys.exit(1 if bad else 0)
 PY
-if [ $? -eq 0 ] && grep -q '^OK$' "$OUT"; then
-  pass "the duration pin catches the bare-unit seconds spellings (copula, comma-grouped, decimal) and blocks no innocent prose"
+if [ $? -eq 0 ] && grep -q '^OK catch=' "$OUT"; then
+  pass "the duration pin catches all $(sed -n 's/^OK catch=\([0-9]*\).*/\1/p' "$OUT") enumerated restatements (incl. the prefixed copula seconds form) and all $(sed -n 's/^OK catch=[0-9]* minute=\([0-9]*\).*/\1/p' "$OUT") unprefixed reverse-order samples via the minute twin, and false-blocks none of the $(sed -n 's/^OK catch=[0-9]* minute=[0-9]* not=\([0-9]*\).*/\1/p' "$OUT") innocent-prose controls enumerated here"
 else
   fail "the duration pin is not doing its job"; sed -n '1,30p' "$OUT"
 fi
