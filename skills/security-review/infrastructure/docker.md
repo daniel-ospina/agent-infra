@@ -386,23 +386,24 @@ docker login -u user -p password registry.example.com
 ## Grep Patterns for Dockerfiles
 
 ```bash
-# Running as root
-grep -rn "^USER" Dockerfile || echo "No USER directive - runs as root"
+# Running as root — exit 1 means "no match"; anything else (e.g. 128, not a work tree)
+# means the search did not run, so `|| echo` would report a root Dockerfile that was never checked
+git grep -n -e "^USER" -- Dockerfile
 
 # Secrets in environment
-grep -rn "^ENV.*PASSWORD\|^ENV.*SECRET\|^ENV.*KEY\|^ENV.*TOKEN" Dockerfile
+git grep -n -e "^ENV.*PASSWORD\|^ENV.*SECRET\|^ENV.*KEY\|^ENV.*TOKEN" -- Dockerfile
 
 # Secrets in build args
-grep -rn "^ARG.*PASSWORD\|^ARG.*SECRET\|^ARG.*KEY" Dockerfile
+git grep -n -e "^ARG.*PASSWORD\|^ARG.*SECRET\|^ARG.*KEY" -- Dockerfile
 
 # Latest tags
-grep -rn "FROM.*:latest\|FROM.*@" Dockerfile | grep -v "@sha256"
+git grep -n -e "FROM.*:latest\|FROM.*@" -- Dockerfile | grep -v "@sha256"
 
 # Privileged instructions
-grep -rn "^ADD\|EXPOSE 22\|apt-get install.*ssh" Dockerfile
+git grep -n -e "^ADD\|EXPOSE 22\|apt-get install.*ssh" -- Dockerfile
 
 # Missing cleanup
-grep -rn "apt-get install" Dockerfile | grep -v "rm -rf"
+git grep -n -e "apt-get install" -- Dockerfile | grep -v "rm -rf"
 ```
 
 ---

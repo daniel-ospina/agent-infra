@@ -14,6 +14,7 @@
         "loop-enforcer/",
         "sequence-enforcer/",
         "main-worktree-guard/",
+        "search-guard/",
         "audit-logger.ts",
         "reflect-hook.ts",
         "shared/",

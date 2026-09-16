@@ -359,25 +359,25 @@ npm sbom --sbom-format cyclonedx
 
 ```bash
 # Unpinned dependencies
-grep -rn "\*\|latest\|>=\|~\|^" package.json requirements.txt
+git grep -n -e "\*\|latest\|>=\|~" -- package.json requirements.txt  # `^` dropped: it matched every line, so the pattern never discriminated
 
 # Missing lock files
 ls package-lock.json yarn.lock Pipfile.lock Cargo.lock go.sum 2>/dev/null
 
 # Credentials in config
-grep -rn "_authToken\|registry.*token\|password" .npmrc .pypirc pip.conf
+grep -n -e "_authToken\|registry.*token\|password" .npmrc .pypirc pip.conf  # file operands: bounded by construction
 
 # Suspicious install scripts
-grep -rn "preinstall\|postinstall\|prepare" package.json
+git grep -n -e "preinstall\|postinstall\|prepare" -- package.json '*/package.json'
 
 # Obfuscated code in dependencies
-grep -rn "eval(.*base64\|exec(.*decode\|compile(.*decode" node_modules/ site-packages/
+find node_modules/ site-packages/ -maxdepth 3 \( -name '*.js' -o -name '*.py' \) -print0 | xargs -0 grep -n -e "eval(.*base64\|exec(.*decode\|compile(.*decode"
 
 # Network calls in setup.py
-grep -rn "requests\|urllib\|socket" setup.py
+git grep -n -e "requests\|urllib\|socket" -- setup.py
 
 # Unpinned GitHub Actions
-grep -rn "uses:.*@main\|uses:.*@master\|uses:.*@latest" .github/workflows/
+git grep -n -e "uses:.*@main\|uses:.*@master\|uses:.*@latest" -- '.github/workflows/*'
 ```
 
 ---

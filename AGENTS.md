@@ -349,6 +349,53 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
   amend **before** pushing; if it is already pushed, post a correction note instead of silently
   force-pushing. Worked example: `skills/commit-workflow/workflow/02-commit-pr.md`.
 
+## Search
+
+A recursive search is the fleet's most expensive habit. An ignore-blind walk started at a repo root
+descends into `.worktrees/*/node_modules` — 169 GB in one checkout — and the #1069 live evidence shows
+three concurrent sessions holding load ~18 on 10 CPUs for 80 minutes. See `docs/ops/load-policy.md`.
+
+**Rule: never start a recursive search at a root you have not bounded.** Prefer an index-bounded
+primitive; if you must walk, bound the walk explicitly.
+
+### Use
+
+Every command here is bounded — by the index, by an explicit non-root start point, or by an explicit
+exclusion.
+
+```bash
+rg -n 'pattern' -g '*.py'                 # honours .gitignore; .worktrees/ is skipped as a hidden path
+git grep -n -e 'pattern' -- '*.py'        # reads the repo index; the fallback when `rg` is absent
+git ls-files --others --exclude-standard  # the untracked files `git grep` cannot see
+rg --files -g '*.ts'                      # enumerate files instead of searching them
+
+# Explicitly bounded walking, for the questions the primitives above cannot answer
+grep -rn 'pattern' --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.worktrees
+find src/ -name '*.ts'                    # an explicit, non-root start point
+find . -maxdepth 3 -name '*.ts'           # a depth bound
+find . \( -name node_modules -o -name .worktrees \) -prune -o -name '*.ts' -print
+```
+
+`git grep` and `git ls-files` see **tracked** files only — pair them with
+`git ls-files --others --exclude-standard` when untracked files matter, and note that `git grep`
+requires a git work tree. `rg`'s dialect is Rust, not BRE: alternation is `|`, not `\|`, and
+`--include` is spelled `-g`. Re-check a translated pattern against that switch.
+
+### Avoid
+
+These shapes walk the whole tree. A runtime guard (`extensions/search-guard`) refuses them and names a
+replacement.
+
+```bash
+grep -r 'pattern'
+grep -rn 'pattern' .
+find . -name '*.ts'
+find / -name '*.ts'
+```
+
+If the guard blocks a search you believe was legitimate, the block reason names the bounded form to use
+instead. `SEARCH_GUARD_DISABLED=1` is the documented escape hatch and should stay rare.
+
 ## Tool Quality & Retirement
 
 - **Two-strikes rule:** If any pipeline tool or script requires >1 manual-fix cycle per use, file a retirement issue. Don't accumulate patches.

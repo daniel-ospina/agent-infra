@@ -347,17 +347,17 @@ User.query.filter(User.id == user_id, User.balance >= amount).update(
 
 ```bash
 # Django unsafe patterns
-grep -rn "mark_safe\||safe\|autoescape off\|\.raw(\|\.extra(" --include="*.py"
+git grep -n -e "mark_safe\||safe\|autoescape off\|\.raw(\|\.extra(" -- '*.py'
 
 # Flask SSTI
-grep -rn "render_template_string\|Template(" --include="*.py"
+git grep -n -e "render_template_string\|Template(" -- '*.py'
 
 # Deserialization
-grep -rn "pickle\.load\|yaml\.load\|marshal\.load" --include="*.py"
+git grep -n -e "pickle\.load\|yaml\.load\|marshal\.load" -- '*.py'
 
 # Command injection
-grep -rn "os\.system\|subprocess.*shell=True\|os\.popen" --include="*.py"
+git grep -n -e "os\.system\|subprocess.*shell=True\|os\.popen" -- '*.py'
 
 # SQL injection
-grep -rn "execute.*f\"\|execute.*%\|\.raw.*f\"" --include="*.py"
+git grep -n -e "execute.*f\"\|execute.*%\|\.raw.*f\"" -- '*.py'
 ```
