@@ -649,7 +649,9 @@ Less severely, three other rows contain mild re-entrant nesting (the same symbol
 appearing again on a nested frame within one stack). Counting only the topmost
 occurrence per path gives `StringIndexOf` 2342 / 1474,
 `RegExpPrototypeTestFast` 374 / 145 and `FindOrderedHashMapEntry` 243 / 95 —
-so those three rows are inflated by under 10% against their topmost-only values.
+so those three rows exceed their topmost-only values by roughly 10% or less
+(up to ~15% for `FindOrderedHashMapEntry`, 269 vs 243 = +10.7%, 109 vs 95 =
++14.7%; the rest are under 5%).
 The difference is immaterial to the profile's conclusion, but the rows are
 sums-over-occurrences, not topmost-only counts.
 
@@ -721,15 +723,19 @@ read from `ps -o time`. Windows differ per control and are stated with each:
   **0.24 s / 30 s = 0.8%** of a core, one 30 s window after a 25 s settle. So
   the burn is *not* intrinsic to an idle `pi` TUI.
 - **Visible spinner + ticking bash call**: prompt `sleep 900` accepted, the bash
-  row rendering `Elapsed Ns` while the `Working` spinner animates —
-  **0.14–0.18 s / 15 s ≈ 1%**, five consecutive 15 s windows after a 30 s
-  settle (windows 1–5: 3.2%, 1.1%, 0.9%, 0.9%, 1.2%). So the 1 Hz
+  row rendering `Elapsed Ns` while the `Working` spinner animates — five
+  consecutive 15 s windows after a 30 s settle: **0.48, 0.17, 0.14, 0.14,
+  0.18 s (3.2%, 1.1%, 0.9%, 0.9%, 1.2%)**. Window 1 is the outlier because the
+  turn was still streaming into the transcript; from window 2 on, the settled
+  cost is **0.14–0.18 s / 15 s ≈ 0.9–1.2%**. So the 1 Hz
   `context.invalidate()` interval *and* the 80 ms spinner, together, cost ~1%
-  when there is no large tool output to re-measure.
+  at steady state when there is no large tool output to re-measure.
 
 Together these bounds rule out two easy explanations — "an idle `pi` TUI just
-costs this" and "the spinner/countdown cadence costs this". Neither reaches
-~0.8–1%, so the burn must come from something that scales with rendered or
+costs this" and "the spinner/countdown cadence costs this". Neither exceeds
+**3.2% even in its worst window**, and the spinner control's steady state is
+~1% — both far below the observed 6–26%. So the burn must come from something
+that scales with rendered or
 session state (how much output a row holds, how many rows/timers are retained)
 or from a cadence not yet identified — not from the configurations measured
 here. The next section shows the one cost path that *is* identified is also too
