@@ -914,18 +914,26 @@ BANNED_RE = (
     # docs/upstream-pi-bugs.md), and banning it bare false-blocks three innocent
     # paragraphs. So the cap's bare form is matched only where the paragraph
     # attaches it to the contract ("60 s backoff cap", "capped at 60 s").
-    # The number itself goes through `_num`, so the comma-grouped spelling
-    # ("2,582 s") is banned too, and the cap's context word ends on a word
-    # boundary so `capacity` / `capable` are not read as `cap`.
-    (re.compile(rf"(?<![\d.]){_num(BACKOFF // 1000)}[\s-]*s(?![\w])"),
+    # The number goes through `_num`, so the comma-grouped spelling ("2,582 s")
+    # is banned too; `(?:\.\d+)?` keeps the decimal spelling the unit-word
+    # `_dur` already tolerates ("182.0 s"); and the cap's context word ends on a
+    # word boundary so `capacity` / `capable` are not read as `cap`.
+    (re.compile(rf"(?<![\d.]){_num(BACKOFF // 1000)}(?:\.\d+)?[\s-]*s(?![\w])"),
      f"retry ladder ({BACKOFF // 1000} s)"),
-    (re.compile(rf"(?<![\d.]){_num(HANG_MS // 1000)}[\s-]*s(?![\w])"),
+    (re.compile(rf"(?<![\d.]){_num(HANG_MS // 1000)}(?:\.\d+)?[\s-]*s(?![\w])"),
      f"no-progress window ({HANG_MS // 1000} s)"),
-    (re.compile(rf"(?<![\d.]){_num(WORST_MS // 1000)}[\s-]*s(?![\w])"),
+    (re.compile(rf"(?<![\d.]){_num(WORST_MS // 1000)}(?:\.\d+)?[\s-]*s(?![\w])"),
      f"worst case ({WORST_MS // 1000} s)"),
-    (re.compile(rf"(?<![\d.]){_num(CAP // 1000)}[\s-]*s(?![\w])[^\n]{{0,24}}?(?:backoff[\s-]+)?(?:capped|cap|cadence)\b"),
+    (re.compile(rf"(?<![\d.]){_num(CAP // 1000)}(?:\.\d+)?[\s-]*s(?![\w])[^\n]{{0,24}}?(?:backoff[\s-]+)?(?:capped|cap|cadence)\b"),
      f"backoff cap ({CAP // 1000} s)"),
-    (re.compile(rf"(?:capped\s+at|cap\s+of|(?:backoff|retry)\s+(?:capped|cap|cadence)\b)\D{{0,10}}?(?<![\d.]){_num(CAP // 1000)}[\s-]*s(?![\w])"),
+    (re.compile(rf"(?:capped\s+at|cap\s+of|(?:backoff|retry)\s+(?:capped|cap|cadence)\b)\D{{0,10}}?(?<![\d.]){_num(CAP // 1000)}(?:\.\d+)?[\s-]*s(?![\w])"),
+     f"backoff cap ({CAP // 1000} s)"),
+    # ...and the reverse/copula order the MINUTE twin below already covers
+    # ("the cap is 1 min" is caught, so "the cap is 60 s" must be too — leaving
+    # the seconds unit out of that family was a reproduced asymmetry, #1088
+    # review cycle 7). The optional `(?:backoff|retry)` prefix accepts a hyphen
+    # as well as a space, for "the backoff-cap is 60 s".
+    (re.compile(rf"(?:(?:backoff|retry)[\s-]+)?(?:cap|cadence)\s*(?:is|of|=|:)\s*(?<![\d.]){_num(CAP // 1000)}(?:\.\d+)?[\s-]*s(?![\w])"),
      f"backoff cap ({CAP // 1000} s)"),
     (re.compile(rf"(?<![\d.]){BACKOFF:,}(?![\d])"), f"retry ladder ({BACKOFF:,} ms)"),
     (re.compile(rf"(?<![\d.]){BACKOFF}(?![\d])"), f"retry ladder ({BACKOFF} ms)"),
@@ -1485,7 +1493,10 @@ def caught(text):
 # letter the docstring claimed to match.
 must_catch = ["182 s", "2582 s", "4982 s", "182s", "182 sec", "182 seconds",
               "2,582 s", "2,582 sec", "4,982 s", "2,582 seconds",
-              "60 s backoff cap", "the backoff cap is 60 s", "capped at 60 s"]
+              "182.0 s", "2,582.0 s", "4,982.0 s",
+              "60 s backoff cap", "the backoff cap is 60 s", "capped at 60 s",
+              "the cap is 60 s", "cap = 60 s", "cadence is 60 s",
+              "the backoff-cap is 60 s"]
 # Innocent current-state prose. `60 s` / `60s` is ALSO a 60-second poll and an
 # LB idle timeout in this repo's own docs, so the cap's bare form is anchored;
 # a blanket bare-letter ban false-blocks all three (verified against the real
@@ -1501,7 +1512,7 @@ print("\n".join(bad) if bad else "OK")
 sys.exit(1 if bad else 0)
 PY
 if [ $? -eq 0 ] && grep -q '^OK$' "$OUT"; then
-  pass "the duration pin catches every bare-letter seconds spelling and blocks no innocent prose"
+  pass "the duration pin catches the bare-unit seconds spellings (copula, comma-grouped, decimal) and blocks no innocent prose"
 else
   fail "the duration pin is not doing its job"; sed -n '1,30p' "$OUT"
 fi
