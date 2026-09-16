@@ -547,7 +547,7 @@ unquoted ` #` in plain values (P1: pi loads but silently corrupts the value).
 
 ---
 
-## Issue #1115: idle `pi` TUI burns 6–26% of a core per session — a timer-callback loop doing ICU string measurement and synchronous subprocess spawning
+## Issue #1115: idle `pi` TUI burns 6–26% of a core per session — the render frame loop re-wrapping large content, not a mystery timer
 
 **Repo:** pi-core (`@earendil-works/pi-coding-agent`)
 **Version probed:** pi 0.85.1 — pi-node v22.23.2, macOS 27.0 (26A428), arm64 (Apple M5, 10-core)
@@ -563,10 +563,12 @@ the 11 are in it (pid 64580, silence 1.0 m, is not), and the other 10 are
 near-idle ~0.1% processes inside the table's residual bucket. The two figures
 are stated separately and must not be added.
 
-**Status of this report:** the measurement and the profile below are
-*measured*; the identity of the pumping timer is **not** established, and the
-section *What this does not yet explain* says so explicitly. Do not read the
-mechanism as settled.
+**Status of this report:** the measurement, the profile and the per-frame cost
+law below are *measured*; the pump is **identified** as the render frame loop,
+and the per-frame cost law **brackets** the observation. What remains open is
+**which size-dependent component** pays that cost each frame — see *What is
+still open*. An earlier draft called the pump unidentified and the magnitude
+unexplained; that was an over-read of the controls and is corrected below.
 
 ### Symptom
 
@@ -682,9 +684,66 @@ as well as the string work, which is a lead worth instrumenting before anything
 else. (The profile gives no *rate* for it — 262/198 are accumulated samples, not
 call counts, so the cadence is not derivable and is not claimed.)
 
-### Cost facts, and what they do NOT add up to
+### Correction: the pump IS identified — it is the render frame loop
 
-Measured on the host (node v22.23.2, arm64), using pi-tui's own primitives:
+An earlier draft of this report concluded "the pumping timer was not
+identified". That conclusion was wrong, and the evidence to refute it was
+already in this document. `sample` showed 61% of main-thread samples inside
+`uv__run_timers` → `RunTimers` → `Function::Call`, and the draft read that as
+"one special timer is pumping". It is not a special timer: **the render frame
+itself is a `setTimeout` callback.**
+
+`TuiBase.scheduleRender()` (`pi-tui/dist/tui.js:636-651`) arms
+`this.renderTimer = setTimeout(…, Math.max(0, MIN_RENDER_INTERVAL_MS - elapsed))`
+with `MIN_RENDER_INTERVAL_MS = 16` (`tui.js:169`); the callback runs
+`doRender()` and **re-arms itself** while `renderRequested` is set. Anything
+that calls `requestRender()` — the 80 ms `Working` loader
+(`pi-tui/dist/components/loader.js`), a 1 Hz `countdown-timer`, and the 1 Hz
+`context.invalidate()` armed by `bash.js` — therefore drives a *frame*, and
+every frame executes inside `uv__run_timers`. So "61% of the main thread is in
+a timer callback" is **exactly what a continuously-repainting TUI looks like**;
+it was never evidence of an unknown timer. Inferring a mystery timer from it
+was a non sequitur, and it sent the investigation looking for a cadence when
+the live variable was **content size**.
+
+`doRender()` then renders the **whole tree**: `TuiMainScreen.render()` walks
+every component (`Container.render`, `tui.js:114-118`, maps all children
+through `child.render(width)`), and diffs the new lines against the entire
+`previousLines` scrollback. Two of those per-frame costs are un-memoised or
+size-dependent:
+
+- **The footer is un-memoised.** `FooterComponent.invalidate()` is a literal
+  no-op and `render()` has no cache check
+  (`dist/modes/interactive/components/footer.js:65,75`), so it recomputes on
+  every frame: `getEntries()` (a fresh filtered array), a scan of all entries,
+  and `getContextUsage()` → `estimateTokens`, which does
+  **`JSON.stringify(block.arguments)` for every assistant `toolCall`**
+  (`dist/core/compaction/compaction.js:188-215`).
+- **Text re-wrapping is O(size).** pi-tui's `Text` memoises on `(text, width)`,
+  so an *unchanged* component is genuinely free (0.00 ms measured) — but any
+  large component whose text is re-set pays in full, on every such frame.
+
+### Per-frame cost law — and it brackets the observation
+
+Measured on the host (node v22.23.2, arm64), using pi-tui's own primitives.
+The load-bearing number is the **re-set** column: a large component whose text
+changes re-wraps in full, and at the frame cadence that is
+**0.6 / 2.5 / 6.9 / 20.8% of a core for 5 / 50 / 200 / 612 KB** — which
+**brackets the observed 6–26%**:
+
+```
+Text.render(width=200), component re-set then rendered   # per frame
+    5 KB -> 0.44 ms      50 KB -> 2.04 ms
+  200 KB -> 5.51 ms     612 KB -> 16.64 ms
+  => @12.5 fps (80 ms cadence):  0.6% / 2.5% / 6.9% / 20.8% of one core
+  unchanged text (memoised):     0.00 ms  -- a *cached* render is free
+
+doRender() whole-scrollback diff, unchanged frame          # per frame
+   1000 lines  0.05 ms     10000 lines 0.46 ms
+  50000 lines  2.55 ms  (@12.5 fps = 3.2%)   200000 lines 0.63 ms
+```
+
+Separately, the real `bash.js` call:
 
 ```
 truncateToVisualLines(ANSI-styled output, 5, width=200)   # the real bash.js call
@@ -731,17 +790,37 @@ read from `ps -o time`. Windows differ per control and are stated with each:
   `context.invalidate()` interval *and* the 80 ms spinner, together, cost ~1%
   at steady state when there is no large tool output to re-measure.
 
-Together these bounds rule out two easy explanations — "an idle `pi` TUI just
-costs this" and "the spinner/countdown cadence costs this". Neither exceeds
+Together these bounds rule out two explanations — "an idle `pi` TUI just costs
+this" and "the spinner/countdown cadence *alone* costs this". Neither exceeds
 **3.2% even in its worst window**, and the spinner control's steady state is
-~1% — both far below the observed 6–26%. So the burn must come from something
-that scales with rendered or
-session state (how much output a row holds, how many rows/timers are retained)
-or from a cadence not yet identified — not from the configurations measured
-here. The next section shows the one cost path that *is* identified is also too
-small at its known cadence, which leaves the gap open rather than closed.
+~1% — both far below the observed 6–26%.
 
-### What this does not yet explain
+**But these controls do not test the variable that matters, and this report
+initially over-read them.** Both controls held **content size at ~zero** — a
+near-empty scrollback, a handful of session entries, a small heap, and no large
+tool output — while the two burning processes profiled had physical footprints
+of **612.0 MB** and **255.5 MB**. The spinner control's own caveat says it:
+the ~1% figure is the cost "when there is no large tool output to re-measure".
+That caveat is the disproof of the conclusion drawn from it. These controls vary
+the *cadence* and hold *size* constant, so they are blind along exactly the axis
+the cost law above says is live. They establish that the burn is not intrinsic
+to an idle `pi` and that cadence alone does not produce it — they do **not**
+establish that the frame loop is cheap, because they were never given anything
+large to render.
+
+A second over-read: the null result was measured on a **later, calmer window**
+(`automountd` 7.3%, `opendirectoryd` ≈0) than the window in which the machine
+died. In the reported fatal window the same table shows `opendirectoryd` **91%**
++ `automountd` **36%** + a `find` at **54%** ≈ **181% of a core — statistically
+equal to pi's entire 177.5%.** Excluding the confound for the calmer window does
+not exclude it for the fatal one; those are separate claims on separate windows.
+And because Unix load average counts **blocked** as well as runnable processes,
+the chain "pi CPU → load 15.94 → swap → reboot" is under-supported: with 39
+`pi` processes at 255–670 MB each against 32 GB, **memory pressure** is at least
+as plausible a cause of the swap thrash. That is a separate issue from the CPU
+burn, but it belongs in the ceiling arithmetic.
+
+### The `bash.js` interval (measured, and bounded)
 
 `bash.js` arms
 
@@ -756,21 +835,40 @@ for an in-flight bash call (cleared on a later `renderResult` with
 `ToolExecutionComponent.updateDisplay()` — **not** from `render()` — so a plain
 render pass does *not* re-invoke it.
 
-**At that 1 Hz cadence the re-wrap above is only 0.4–4.1% of a core, which does
-not account for the observed 6–26%.** The pumping timer was therefore **not**
-identified. Two earlier draft claims were withdrawn in review and are recorded
-here so they are not re-derived:
+### What is still open
+
+At that 1 Hz cadence the `bash.js` re-wrap alone is only 0.4–4.1% of a core, so
+it is not by itself the whole 6–26%. What is established is the *shape*: a
+continuously-repainting frame loop whose per-frame cost is O(content size), with
+one demonstrably un-memoised component (the footer) that recomputes every frame.
+What is **not** yet pinned down is **which size-dependent component's text is
+re-set on which frames** — i.e. which of these dominates:
+
+1. the un-memoised footer (`getEntries` + `estimateTokens`'s `JSON.stringify`
+   per assistant `toolCall`) — measured ~0.24–0.82 ms/frame for 200–20 000
+   entries, real and per-frame but not sufficient alone;
+2. the 1 Hz `bash.js` re-wrap of a large output (0.4–4.1%);
+3. the whole-scrollback `previousLines` diff (3.2% at 50 000 lines);
+4. some other component re-setting its text each frame.
+
+Two earlier draft claims were withdrawn in review and are recorded here so they
+are not re-derived:
 
 - that `renderResult` runs on *every* render pass — false; it is
   `updateDisplay()`, not `render()`;
-- that the 80 ms `Loader` spinner cadence explains the magnitude — the spinner
-  calls `requestRender()`, a render pass, which does not re-invoke
-  `renderResult`, so the `@80 ms Loader`-spinner hypothesis had no basis.
+- that the 80 ms `Loader` spinner explains the magnitude — withdrawn on the
+  grounds that the spinner calls `requestRender()`, a render pass, which does
+  not re-invoke `renderResult`. **That reasoning refuted the wrong proposition.**
+  It correctly shows the spinner does not re-run *bash's* renderer; it does not
+  show the spinner's render pass is cheap — and the render pass is exactly what
+  `doRender()` runs over the whole tree. The `@80 ms` row was reinstated as the
+  frame cadence in the cost law above.
 
-The honest statement is: **the per-session magnitude is unexplained by the
-sites found so far.** The next step is to instrument / breakpoint which timer
-fires at the observed rate and what it `spawnSync`s, then re-derive the cost —
-not to assume the `bash.js` interval is the whole story.
+So the honest statement is narrower than "the magnitude is unexplained":
+**the pump is the render frame loop, the per-frame cost is O(size) and brackets
+the observation, and the remaining unknown is which large component is paying
+it per frame.** Instrumenting that is step 1 below — but it is now a question
+about a *component*, not about a mystery timer.
 
 ### Why this was not patched downstream
 
@@ -790,26 +888,58 @@ technically unreachable. Patching `dist/` directly remains wiped by `pi update`.
 
 ### Suggested next steps (upstream, in order)
 
-1. **Instrument the timer.** Log `Error().stack` from the `uv__run_timers`
-   callback (or attach `--cpu-prof` to an idle spinning session) to name the
-   actual timer, and log what `spawnSync` is executing. This
-   is the missing fact.
-2. Then, if `bash.js` is implicated: stop destroying the preview cache when the
-   result has not changed, and make `truncateToVisualLines` O(tail) rather than
-   O(whole output) — wrap from the end, or memoise on
-   `(text, width, maxVisualLines)`.
-3. Clear any per-row interval on *every* terminal state (including abort and
+1. **Find which component re-renders every frame.** Attach `--cpu-prof` to a
+   long-lived, large session and read the JS frame names (`sample` cannot —
+   every JS frame in it is `???`). The suspects are the four in the previous
+   section. The single highest-value datum the original measurement never
+   collected is a **size column**: heapUsed, footprint, entry count and
+   scrollback line count for each session, cross-plotted against its CPU. That
+   one column separates "large sessions burn" from "a cadence burns".
+2. **Memoise the footer.** `FooterComponent.invalidate()` is a no-op and
+   `render()` has no cache, so it recomputes per frame; `estimateTokens`'s
+   `JSON.stringify(block.arguments)` per assistant `toolCall` is the expensive
+   branch. Cache on the branch/last-entry identity, and stop stringifying tool
+   arguments to estimate tokens.
+3. **Make the idle path genuinely event-driven** (the issue's ask 2). The frame
+   loop re-arms itself from `scheduleRender()`; when nothing has changed, a
+   frame should not be scheduled at all. A content-hash short-circuit before
+   the tree walk would make an unchanged frame free instead of O(size).
+4. **Make `truncateToVisualLines` O(tail) rather than O(whole output)** — wrap
+   from the end, or memoise on `(text, width, maxVisualLines)`.
+5. **Clear any per-row interval on *every* terminal state** (including abort and
    row disposal), not only on a later `updateDisplay()`.
 
 ### Honest status of this report
 
 Measured: the fleet burn, the confound isolation, the `sample` attribution
-(61% of the main thread in one timer callback, with negligible terminal writes
-— 13/8573 = 0.15% for pid 3312, 10/4217 for pid 70130), the
-`spawnSync` presence, the `truncateToVisualLines` cost, and the calibration
-that a fresh idle TUI costs 0.8% of a core while a visible spinner plus a
-ticking bash call costs ~1%. **Not established: which timer drives the burn,
-and therefore its magnitude.** An attempt to reproduce end-to-end (a `seq 1
-200000` bash call driven through a pty) did not reliably produce a large tool
-output, so no end-to-end replay exists. A filer should treat step 1 above as
-the first action, not the `bash.js` hypothesis.
+(61% of the main thread in the frame callback, with negligible terminal writes
+— 13/8573 = 0.15% for pid 3312, 10/4217 for pid 70130), the `spawnSync`
+presence, the per-frame cost law above (including the **re-set** column that
+brackets the observation), the un-memoised footer, the frame loop's
+`setTimeout` re-arm, and the calibration that a fresh idle TUI costs 0.8% of a
+core while a visible spinner plus a ticking bash call costs ~1%.
+
+**Identified:** the pump is the render frame loop (`scheduleRender()` →
+`setTimeout` → `doRender()`), and per-frame cost is O(content size) with one
+un-memoised component. **Not established:** which of the four size-dependent
+sites dominates per frame — and therefore the exact magnitude attributable to
+each. An earlier draft of this report said the pump was unidentified and the
+magnitude unexplained; that was an over-read of its own calibration controls,
+which held content size at zero, and it is corrected above.
+
+Two measurement caveats a filer should carry:
+
+- `ps -o time` on macOS measures the process's **own** CPU and does **not** fold
+  in reaped children (verified by direct experiment: a parent that burned
+  1.03 s while waiting on a 3 s child reported `0:01.03`). So the 177.5% is
+  pi's own CPU, not accumulated subprocess time — the `spawnSync` is not the
+  explanation.
+- It *does* count all threads, and the same sample files show V8 collection
+  running **off the main thread** (`DefaultJobWorker::Run` 166 samples,
+  `ScavengerCollector::JobTask::Run` 100, `ConcurrentMarking` 61, and a
+  scavenger evacuating `ConsString`s). So "61% of the *main thread*" is not the
+  whole process burn, and the extra CPU is allocation-driven — consistent with
+  a render path that allocates and flattens strings, and additive to it.
+
+A filer should treat step 1 above as the first action, and should collect the
+missing **size column** for every process at the same time.
