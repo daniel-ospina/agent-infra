@@ -832,6 +832,19 @@ assert_eq "$("$REAL_GIT" -C "$REPO" worktree list --porcelain | grep -c '^worktr
     "A15 NO record was pruned — both gone-dir records are still registered"
 assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A15 the global prune did not run"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A15 a skipped prune is never counted as removed"
+# Mutation-blindness of the leg above (cycle-9 finding): an apply pass has TWO
+# PRUNE_BLOCKED sites — the classify-deferral and the remove-deferral — and this
+# fixture fires BOTH, so deleting either one alone still leaves the apply footer
+# at PRUNE_BLOCKED=1 and the assertion above notices nothing. A DRY-RUN pass
+# reaches only the classify-deferral site (the remove-deferral sits inside
+# `if [ "$MODE" = apply ]`), isolating that line: remove it and THIS assertion —
+# and only this one — goes red.
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-very-slow-mergebase" REAP_WT_NOW_EPOCH_OVERRIDE="" \
+    REAP_WT_STATUS_TIMEOUT=30 REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_eq "$(grep -cF 'reason=deferred' <<<"$OUT")" "1" \
+    "A15 dry-run: the budget-deferred record is UNCLASSIFIED"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" \
+    "A15 dry-run isolates the classify-deferral prune-block site (no remove-deferral can fire here)"
 
 # ── A16: the ephemeral pre-delete runs under the removal watchdog ──────
 # The allowlisted-ephemeral `rm` was the last unbounded fork on the removal
@@ -1222,6 +1235,13 @@ assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A24A"
 "$REAL_GIT" -C "$REPO" fetch -q --prune upstream
 assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A24_SHA" --format='%(refname)' | wc -l | tr -d ' ')" "0" \
     "A24 the revocable ref is gone (nothing else but the admin record holds it)"
+# The main repo's OWN reflogs are a competing handle: `git gc` keeps
+# reflog-reachable objects, so without expiring them this leg SURVIVES gc even
+# when the admin record was pruned (pre-fix) — an inert assertion that proves
+# nothing (cycle-9 finding, P2). Expire the reflogs FIRST so the admin HEAD is
+# the only handle left; then the leg discriminates: survives on bfc57f8,
+# collected on the pre-fix script.
+"$REAL_GIT" -C "$REPO" reflog expire --expire=now --expire-unreachable=now --all
 "$REAL_GIT" -C "$REPO" gc -q --prune=now 2>/dev/null
 "$REAL_GIT" -C "$REPO" cat-file -e "$A24_SHA" 2>/dev/null \
     && ok "A24 falsifier: the commit SURVIVES gc — the preserved admin HEAD is its durable handle" \
