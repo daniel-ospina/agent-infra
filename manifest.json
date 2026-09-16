@@ -32,7 +32,8 @@
         "subagent/",
         "tortoise-capture/",
         "vision-interceptor/",
-        "vision-interceptor.json"
+        "vision-interceptor.json",
+        "http-pool-hygiene/"
       ]
     },
     "skills/": {

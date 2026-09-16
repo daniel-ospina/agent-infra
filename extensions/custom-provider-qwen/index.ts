@@ -29,9 +29,15 @@
  *
  * ── Connection hygiene mechanism ────────────────────────────────────────────
  * The tuned fetch hands every request an undici `Agent` built from this
- * package's OWN undici copy (pi's global dispatcher — keepAliveTimeout driven
- * by `httpIdleTimeoutMs`, currently 10 min — is too permissive for this
- * endpoint, which kills idle connections at ~8 min). The Agent:
+ * package's OWN undici copy. pi's global dispatcher (`configureHttpDispatcher`)
+ * sets `bodyTimeout`/`headersTimeout` from `httpIdleTimeoutMs` but NO keep-alive
+ * bound, so undici's defaults apply: `keepAliveTimeout` 4s and
+ * `keepAliveMaxTimeout` **600s** — the latter is the ceiling on the server's own
+ * `Keep-Alive: timeout=N` hint, which is why this endpoint (kills idle
+ * connections at ~8 min) could poison the pool for up to 10 minutes (#1110;
+ * corrected 2026-09-15 — `httpIdleTimeoutMs` never bounded keep-alive). The
+ * general fix now lives in `extensions/http-pool-hygiene/`; this Agent remains
+ * the deliberately more aggressive per-provider variant. The Agent:
  *
  *   pipelining: 0        — undici closes the socket after EVERY response
  *                          (client-h1.js: `socket[kReset] = true` when
