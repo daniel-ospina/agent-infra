@@ -226,7 +226,7 @@ Real git (not a shim) is used for every git probe: the gates *are* git semantics
 ## 6. Wiring check
 
 - `scripts/pi-reap-worktrees.sh` (new) — the reaper.
-- `scripts/pi-reap-worktrees.test.sh` (new) — hermetic suite (**151 assertions, all green**; see §9 for the count's history); registered in `.github/workflows/ci-main.yml` alongside `pi-reap-idle.test.sh` (post-merge main-push family — `ci.yml` has no per-PR shell-script block).
+- `scripts/pi-reap-worktrees.test.sh` (new) — hermetic suite (**151 assertions, all green**; see §9 for the count's history); registered in `.github/workflows/ci-main.yml` alongside `pi-reap-idle.test.sh` (post-merge main-push family — `ci.yml` has no per-PR shell-script block). `ci-main.yml` is a **content-locked** workflow, so `scripts/workflow-lock.json` is re-hashed in the same change (`node scripts/check-workflow-lock.mjs --update-lock`); the lock gate fails closed otherwise, which is exactly how this omission was caught by `ci / unit-test` on the PR rather than merged.
 - **Repo-selection contract:** `--repo PATH` (default `$PWD`), mirroring `stale-worktrees.sh`. `git worktree list` is per-repo, so the reaper **never** walks outside the named repo, and the main-checkout exclusion resolves from that repo's `--git-common-dir`.
 - No existing caller changes. `stale-worktrees.sh` / `cleanup-worktree.sh` / `hub-worktree.sh` / `checkout_guard.sh` are untouched.
 - **Adjacent finding (not absorbed):** `scripts/rg` search tooling still walks `.worktrees/*/node_modules` (#1069, already open).
