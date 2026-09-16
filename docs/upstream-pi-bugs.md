@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-11
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-637
+aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-637, issue-1114, issue-1115
 ---
 
 # Upstream pi bug reports — drafts awaiting filing
@@ -544,3 +544,626 @@ unquoted ` #` in plain values (P1: pi loads but silently corrupts the value).
   lint) — the author is told to quote the value.
 - Documented in docs/plans/2026-08-28-issue-254-skill-lint-yaml.md §2
   (truncate-classes) and §5.4 R3 (acknowledged-drift register).
+
+---
+
+## Issue #1115: idle `pi` TUI burns 6–26% of a core per session — the render frame loop is the mechanism; the driver on a silent session is unidentified
+
+**Repo:** pi-core (`@earendil-works/pi-coding-agent`)
+**Version probed:** pi 0.85.1 — pi-node v22.23.2, macOS 27.0 (26A428), arm64 (Apple M5, 10-core)
+**Severity:** High for a multi-session host — this is a load ceiling, not a
+cosmetic bug. Aggregate **177.5% of one core** across 39 `pi` processes. A
+sub-population of **20 processes whose session transcripts had been silent for
+more than 120 s** (in fact 132 s to ~5.8 days) alone accounted for
+**43.82 s / 30 s = 146.1%** of a core. It drove this host to swap-thrash and
+forced a fleet-wide reboot that lost 3 live session threads (#1114).
+
+That 20-process subset is **not** the same set as the table's 11 rows: 10 of
+the 11 are in it (pid 64580, silence 1.0 m, is not), and the other 10 are
+near-idle ~0.1% processes inside the table's residual bucket. The two figures
+are stated separately and must not be added.
+
+**Status of this report:** the measurement, the profile and the per-frame cost
+law below are *measured*. The pump's **mechanism** is identified — the render
+frame loop is a `setTimeout` callback (`scheduleRender()` → `doRender()`), which
+is why the samples land in `uv__run_timers`. Its **driver on a silent session is
+not identified**, and the cost law is a *conditional upper bound*, **not** a
+bracket on the observed burn. What remains open: which size-dependent component
+re-sets its text on which frames, and what requests those frames while the
+transcript is silent — see *What is still open*. Two earlier drafts were each an
+over-read in opposite directions and are corrected below.
+
+### Symptom
+
+A `pi` TUI consumes multi-percent CPU **indefinitely while its own session is
+idle** — no turn in flight, no transcript write, no socket flow, no
+asynchronously-spawned tool child — and its rendered screen is **byte-identical
+between samples 12 s apart**. (A *synchronous* child is a separate matter: see
+the `spawnSync` finding in the profile.)
+
+### Measurement (2026-09-16, ~16:55 EST)
+
+`ps -o pid,time` sampled 30 s apart, all 39 `pi` processes on the host.
+"silence" = age of the process's own session `.jsonl` at sample time.
+
+| pid | ΔCPU / 30 s | % of one core | transcript silence |
+|---|---|---|---|
+| 3312 | +7.88 s | **26.3%** | 8.6 m |
+| 2848 | +6.71 s | **22.4%** | 52.9 m |
+| 2684 | +5.93 s | 19.8% | 174.0 m |
+| 3399 | +5.51 s | 18.4% | 209.5 m |
+| 70130 | +5.44 s | 18.1% | 203.1 m |
+| 64580 | +4.48 s | 14.9% | 1.0 m |
+| 2743 | +3.29 s | 11.0% | 12.1 m |
+| 3462 | +2.41 s | 8.0% | 7.5 m |
+| 3357 | +2.31 s | 7.7% | 8.6 m |
+| 70144 | +2.12 s | 7.1% | 2.2 m |
+| 3244 | +1.93 s | 6.4% | 158.3 m |
+| **subtotal (these 11)** | **+48.01 s** | **160.0%** | |
+| residual 28 procs — 10 more with silence > 120 s at ~0.1% each, plus 18 child/ephemeral `pi` procs whose silence could not be mapped | +5.25 s | 17.5% | |
+| **TOTAL (39 procs)** | **+53.26 s** | **177.5%** | |
+
+`load average` 24.06 → 26.42 over the window (10 cores).
+
+`ΔCPU` comes from `ps -o time`; the `%` column is `ΔCPU / 30 s`. The table
+reconciles: the 11 rows sum to +48.01 s and the residual 28 procs to +5.25 s,
+for +53.26 s total. Silences in the residual bucket are not shown; the ~0.1%-CPU rows are the clean
+control against which the 6–26% rows are abnormal.
+
+### Confound ruled out
+
+One further null result, and its scope limitation. The fleet's own extensions
+were checked as a possible pump: a scoped search of `~/.pi/agent/extensions/`
+(the installed extension set) found **no `setInterval`, no recurring
+`spawnSync`/`execSync`, and no `fs.watch`/`watchFile`** — the only `spawnSync`
+hits were `search-guard` test fixtures. Caveat, on the record: that scan covered
+those three shapes, **not** recursive `setTimeout` self-re-arm or
+`process.nextTick` chains — which is precisely the shape pi's render loop
+turned out to have. So the null result does **not** exclude an extension driving
+frames via a recursive `setTimeout`; it excludes the flat-interval and
+subprocess-loop shapes only.
+
+The pre-reboot handoff also blamed `opendirectoryd` / `automountd` FS churn.
+Re-sampled over the **identical** 30 s window on the same interval:
+`automountd` +2.18 s (7.3% of a core), `opendirectoryd` ≈ 0. So non-`pi`
+FS/mount/UI churn is **7.3% against pi's 177.5% — pi is 24× the confound.**
+The burn is pi's own.
+
+### Profile — `sample <pid> 20` (`/usr/bin/sample`)
+
+Two independent burners were profiled: **pid 3312** (26.3% of a core, silence
+8.6 m) and **pid 70130** (18.1%, silence 203.1 m — the fleet's `stale-stuck`
+process). Counts below are **samples accumulated per symbol inside the timer
+subtree**, so nested frames make them non-additive — read them as a
+*signature*, not a budget.
+
+| | pid 3312 | pid 70130 |
+|---|---|---|
+| samples in the whole report (main thread) | 14080 | — |
+| samples under `uv__run_timers` → `node::Environment::RunTimers` → `v8::Function::Call` → JS | **8573 (61% of the main thread)** | 4217 |
+| `Builtin_SegmentIteratorPrototypeNext` (ICU grapheme) | 911 | 234 |
+| `JSSegmentIterator::Next` (ICU grapheme) | 798 | 225 |
+| `StringIndexOf` | 2348 | 1488 |
+| `Runtime_StringEqual` | 1289 | 477 |
+| `String::SlowEquals` | 1264 | 465 |
+| `Heap::CollectGarbage` | *not quotable — see note* | *not quotable* |
+| `RegExpPrototypeTestFast` | 387 | 151 |
+| `FindOrderedHashMapEntry` | 269 | 109 |
+| **`node::SyncProcessRunner::Spawn`** (see note) | **262** | **198** |
+| `uv__try_write` (writes to the terminal) | **13** | **10** |
+
+One deliberately unquoted row: `Heap::CollectGarbage` appears in **three nested
+frames per collection** (`SetMarkerAndCallbackImpl<…Heap::CollectGarbage…>` plus
+two nested `Heap::CollectGarbage` frames), so every occurrence of the symbol is
+the *same* samples seen again — any sum double- or triple-counts. It is plainly
+present in both profiles (allocation pressure is real), but no honest number can
+be attached to it without first defining which of the three frames counts, so it
+is not quoted. It was 1659/12 in an earlier revision of this report; that figure
+was an artifact of substring-matching all three frames.
+
+Less severely, three other rows contain mild re-entrant nesting (the same symbol
+appearing again on a nested frame within one stack). Counting only the topmost
+occurrence per path gives `StringIndexOf` 2342 / 1474,
+`RegExpPrototypeTestFast` 374 / 145 and `FindOrderedHashMapEntry` 243 / 95 —
+so `StringIndexOf` and `RegExpPrototypeTestFast` exceed their topmost-only
+values by under 5%, and `FindOrderedHashMapEntry` by ~11–15% (269 vs 243 =
++10.7%, 109 vs 95 = +14.7%).
+The difference is immaterial to the profile's conclusion, but the rows are
+sums-over-occurrences, not topmost-only counts.
+
+Two conclusions that survive scrutiny:
+
+1. **The loop writes essentially nothing to the terminal.** 13 `uv__try_write`
+   samples for pid 3312 (three frames, 4+4+5) against 8573 in the callback —
+   0.15% — and 10 for pid 70130 against 4217. pi-tui renders *differentially*
+   (`dist/tui.js` — "Minimal TUI implementation with differential rendering"),
+   so an unchanged frame emits zero bytes. That is why the screen is static and
+   why the burn is invisible to `cmux read-screen` and `ps`-style inspection.
+2. **Syntax dominates: ICU grapheme segmentation plus string compare/search
+   plus Map/object allocation churn.** Plus (see below) a *synchronous*
+   subprocess spawn.
+
+**Not mentioned in the original filing — `spawnSync` runs on this timer.**
+`SyncProcessRunner` is `child_process`'s **synchronous** API
+(`spawnSync`/`execSync`). Its `Spawn` symbol appears on **two distinct stacks**
+(191 + 71 samples for pid 3312; 143 + 55 for 70130), accumulating 262 / 198
+samples in the timer subtree — i.e. **at least two synchronous spawns happened
+during the 20 s sample**; the profile establishes no cadence either way. (The wider
+`Spawn`/`Run`/`TryInitializeAndRunLoop` family sums to 783 / 594 because those
+frames nest inside each spawn; the row quotes the `Spawn` symbol's own frames.)
+Its nested `uv_run` → `uv__io_poll` → `kevent` frames
+sit *inside* the `uv__run_timers` branch, confirming the spawn happens from a
+timer callback. A **synchronous `exec` therefore runs inside the timer loop**
+as well as the string work, which is a lead worth instrumenting before anything
+else. (The profile gives no *rate* for it — 262/198 are accumulated samples, not
+call counts, so the cadence is not derivable and is not claimed.)
+
+### Correction: the pump's *mechanism* is the render frame loop — its *driver* on a silent session is not identified
+
+An earlier draft of this report concluded "the pumping timer was not
+identified". That was **half** wrong, and the half that was wrong matters.
+`sample` showed 61% of main-thread samples inside
+`uv__run_timers` → `RunTimers` → `Function::Call`, and the draft read that as
+"one special timer is pumping". Inferring a *mystery* timer from it was a non
+sequitur: **the render frame itself is a `setTimeout` callback.**
+
+`TuiBase.scheduleRender()` (`pi-tui/dist/tui.js:636-651`) arms
+`this.renderTimer = setTimeout(…, Math.max(0, MIN_RENDER_INTERVAL_MS - elapsed))`
+with `MIN_RENDER_INTERVAL_MS = 16` (`tui.js:169`); the callback runs
+`doRender()` and **re-arms itself** while `renderRequested` is set. Anything
+that calls `requestRender()` — the 80 ms `Working` loader
+(`pi-tui/dist/components/loader.js`), a 1 Hz `countdown-timer`, and the 1 Hz
+`context.invalidate()` armed by `bash.js` — therefore drives a *frame*, and
+every **throttled** frame executes inside `uv__run_timers` (the forced path
+`requestImmediateRender()` runs `doRender()` in a `process.nextTick`, and
+`renderNow(force)` runs it synchronously — `tui.js:592-628` — so the "every
+frame" form would be false). So "61% of the main thread is in a timer
+callback" is **consistent with a continuously-repainting TUI** and needed no
+unknown timer; reading it as proof of one was a non sequitur.
+
+**But the correction must not be over-read in the other direction.**
+`scheduleRender()` only re-arms while `renderRequested` is set, and **nothing
+inside `doRender()` sets it** — a frame exists only because something external
+keeps calling `requestRender()`. On a genuinely silent session no such caller
+has been identified: pi-tui's `IdleStatus` renders two static lines with no
+interval (`status-indicator.js`), and every recurring driver found is
+**turn-scoped** (the `Loader`'s 80 ms tick, the 1 Hz countdown/retry, the 1 Hz
+`bash.js` partial-call interval). The issue's own clean cases — pids 3462/3046
+with cmux `runtimeStatus: idle` burning ~22% — are therefore **not yet
+reconciled** with a turn-scoped driver. So:
+
+- **Identified:** the *mechanism* — frames are timer callbacks, and a frame
+  renders the whole tree.
+- **Not identified:** the *driver* that requests frames while the transcript is
+  silent. This is the same open question as the "it is not idle at all — queued
+  auto-continuation work" framing, which is **not falsified**. The
+  high-frequency-timer framing is therefore **re-expressed, not falsified** —
+  its driver question is still open.
+
+`doRender()` renders the **whole tree**: `TuiMainScreen.render()` walks
+every component (`Container.render`, `tui.js:114-118`, maps all children
+through `child.render(width)`). Per-frame costs found:
+
+- **The footer is un-memoised.** `FooterComponent.invalidate()` is a literal
+  no-op and `render()` has no cache check
+  (`dist/modes/interactive/components/footer.js:65,75`), so it recomputes on
+  every frame, and its demonstrated per-frame cost is `getEntries()` — a fresh
+  filtered array plus a scan of every session entry
+  (`session-manager.js:995`). Its `getContextUsage()` path reaches
+  `estimateTokens`'s `JSON.stringify(block.arguments)` per assistant `toolCall`
+  **only for messages after the last assistant message carrying usage**
+  (`dist/core/compaction/compaction.js:132-149,188-215`) — normally *none* in a
+  finished idle session, so that branch is not the steady per-frame cost.
+- **Text re-wrapping is O(size).** pi-tui's `Text` memoises on `(text, width)`,
+  so an *unchanged* component is genuinely free (0.00 ms measured) — but any
+  large component whose text is re-set pays in full on that frame.
+- **The scrollback diff is O(#lines).** Measured with distinct-but-equal line
+  strings: 0.07 / 0.65 / 0.92 / 2.77 ms per frame at 1 000 / 10 000 / 50 000 /
+  200 000 lines (0.08% / 0.81% / 1.15% / **3.47%** at 12.5 fps).
+
+### Per-frame cost law — an upper bound, *not* a bracket
+
+Measured on the host (node v22.23.2, arm64), using pi-tui's own primitives. The
+**re-set** column is the load-bearing one — a large component whose text
+changes re-wraps in full:
+
+```
+Text.render(width=200), component re-set then rendered   # per frame
+    5 KB -> 0.44 ms      50 KB -> 2.04 ms
+  200 KB -> 5.51 ms     600 KB -> 16.64 ms
+  unchanged text (memoised):     0.00 ms  -- a *cached* render is free
+```
+
+**This does not bracket the observation, and an earlier draft of this
+correction wrongly said it did.** With two free parameters — the content size
+and how often a large component actually re-sets — the curve can be tuned to
+hit almost any target, so "it brackets" is not a claim that can fail:
+
+| cadence | 5 KB | 50 KB | 200 KB | 600 KB |
+|---|---|---|---|---|
+| 80 ms (12.5 fps; the `Loader` tick) | 0.6% | 2.5% | 6.9% | **20.8%** |
+| 16 ms (`MIN_RENDER_INTERVAL_MS`, 62.5 fps) | 2.8% | 12.8% | **34.4%** | **104%** |
+
+At the report's own re-sampled maximum (**26.3%**, pid 3312) the 12.5 fps column
+tops out *below* it (20.8%); at 62.5 fps the same law contains it only
+vacuously. And the issue's filed range is wider still (**10–38%**, peak
+**37.7%**), which this report's 16:55 re-sample narrowed to 6–26% — that
+narrowing must not be used to make the law look like a fit.
+
+The honest reading of the table: **if a session holds a few-hundred-KB
+component that re-sets its text on most frames, the per-frame cost is of the
+order observed — and no such component has been demonstrated to exist.**
+Which component does, and how often, is the missing measurement (see *What is
+still open*). The sizes 5/50/200/600 KB are **illustrative**, chosen to span the
+plausible range of a large tool output; **no session's actual content size,
+heap, entry count or scrollback length was ever measured** — that absence is
+precisely the gap.
+
+The whole-scrollback diff, with distinct-but-equal line strings:
+
+```
+doRender() scrollback diff, distinct refs                      # per frame
+   1000 lines  0.07 ms     10000 lines 0.65 ms
+  50000 lines  0.92 ms (@12.5 fps = 1.2%)  200000 lines 2.77 ms (@12.5 fps = 3.5%)
+```
+
+*(An earlier draft printed `50000 lines 2.55 ms` and `200000 lines 0.63 ms` —
+non-monotonic and wrong: that harness compared a line against itself, i.e. an
+identical string *reference*, which short-circuits to a pointer compare. The
+distinct-ref measurement above is the real one and is monotonic in #lines.)*
+
+Separately, the real `bash.js` call:
+
+```
+truncateToVisualLines(ANSI-styled output, 5, width=200)   # the real bash.js call
+  100 KB -> 4.4 ms      250 KB -> 9.7 ms
+  500 KB -> 19.1 ms    1000 KB -> 40.7 ms
+```
+
+`truncateToVisualLines` (`dist/modes/interactive/components/visual-truncate.js`)
+constructs `new Text(text, …)` and calls `Text.render(width)` — it renders and
+wraps the **entire** string, keeping the last `n` lines. These figures are
+*repeatable on the same string*, so pi-tui's 512-entry `widthCache` does not
+rescue a re-wrap of a large output.
+
+`visibleWidth` (`pi-tui/dist/utils.js`) is **input-class sensitive** and must
+not be quoted as a flat rate: it returns `str.length` on a pure-printable-ASCII
+fast path (`isPrintableAscii`, i.e. 0x20–0x7E — **note `\n` fails it**), and
+otherwise memoises into `widthCache`. Two distinct costs, easy to conflate:
+
+- **Fast path:** ~0.7 ms for 200 KB of pure ASCII — but this is a full
+  character scan of the string, paid on **every** call, and never memoised. So
+  it is not free at this size.
+- **Cold slow path** (any `\n`, ANSI escape, or non-ASCII — i.e. `\x1b`-styled
+  terminal text, which is all real tool output): **≈ 0.6–0.8 µs/char**, i.e.
+  ~120–160 ms for 200 KB. A **warm repeat** of the identical string measured
+  ~0 ms via `widthCache` — which is why a single warm measurement must not be
+  quoted as the cost; wrapping produces many distinct substrings and thrashes
+  the 512-entry cache.
+
+### Calibration (what was ruled out)
+
+Two controls were run to bound the cause before profiling. Method: an
+interactive `pi` spawned under a pty (`pty.fork`, 200×50, output drained), CPU
+read from `ps -o time`. Windows differ per control and are stated with each:
+
+- **Fresh idle TUI**: `pi --offline` in a scratch directory, no prompt sent —
+  **0.24 s / 30 s = 0.8%** of a core, one 30 s window after a 25 s settle. So
+  the burn is *not* intrinsic to an idle `pi` TUI.
+- **Visible spinner + ticking bash call**: prompt `sleep 900` accepted, the bash
+  row rendering `Elapsed Ns` while the `Working` spinner animates — five
+  consecutive 15 s windows after a 30 s settle: **0.48, 0.17, 0.14, 0.14,
+  0.18 s (3.2%, 1.1%, 0.9%, 0.9%, 1.2%)**. Window 1 is the outlier because the
+  turn was still streaming into the transcript; from window 2 on, the settled
+  cost is **0.14–0.18 s / 15 s ≈ 0.9–1.2%**. So the 1 Hz
+  `context.invalidate()` interval *and* the 80 ms spinner, together, cost ~1%
+  at steady state when there is no large tool output to re-measure.
+
+Together these bounds rule out two explanations — "an idle `pi` TUI just costs
+this" and "the spinner/countdown cadence *alone* costs this". Neither exceeds
+**3.2% even in its worst window**, and the spinner control's steady state is
+~1% — both far below the observed 6–26%.
+
+**But these controls do not test the variable that matters, and this report
+initially over-read them.** Both controls held **content size at ~zero** — a
+near-empty scrollback, a handful of session entries, a small heap, and no large
+tool output — while the two burning processes profiled had physical footprints
+of **612.0 MB** and **255.5 MB**. The spinner control's own caveat says it:
+the ~1% figure is the cost "when there is no large tool output to re-measure".
+That caveat is the disproof of the conclusion drawn from it. These controls vary
+the *cadence* and hold *size* constant, so they are blind along exactly the axis
+the cost law above says is live. They establish that the burn is not intrinsic
+to an idle `pi` and that cadence alone does not produce it — they do **not**
+establish that the frame loop is cheap, because they were never given anything
+large to render.
+
+A second over-read, this time in the other direction — and an earlier draft of
+this correction got the sourcing wrong, so the corrected version is given here.
+The 16:55 null result (`automountd` 7.3%, `opendirectoryd` ≈0) is the **only**
+window it is evidence for. Three different epochs are involved and **must not be
+compared as if contemporaneous**:
+
+| window | source | pi measured as | non-pi churn |
+|---|---|---|---|
+| pre-reboot (fatal) | `~/.pi/agent/state/RESTART-HANDOFF-2026-09-16.md` | seven pids, **lifetime** CPU-time/elapsed — e.g. `77540` 197 h/23.8 h ≈ **8.3 cores**, `37315` 172 h ≈ **7.2 cores**; the handoff calls this "the real ceiling" | `opendirectoryd` **18%** + `automountd` **7%** |
+| 13:35–13:36 EST (~33 min after boot) | #1115's own body | 8 rows, summed **≈ 164.1%** (issue says ~12 procs at 10–38%) | `opendirectoryd` **91%** + `automountd` **36%** + a `find` at **54%** ≈ **181%** |
+| 16:55 EST | this report | 39 pids = **177.5%** (20-proc silent subset 146.1%) | `automountd` **7.3%**, `opendirectoryd` ≈0 |
+
+An earlier draft attributed the 91/36/54 row to the *pre-reboot* window and cited
+the handoff for it; the handoff actually records 18%/7%, and 91/36/54 are from
+#1115's own post-boot window. A second draft of the *conclusion* then said "no
+measurement exists for the fatal window's pi share" — also wrong: the handoff
+does measure pi pre-reboot, though as **lifetime CPU-time/elapsed**, not as a
+window sample, so it is not comparable with the other two rows. Both are
+corrected above.
+
+What the three windows actually support, with the methods kept distinct:
+
+- **16:55** — the only window with pi and the confound measured **the same way
+  and at the same time**: pi 177.5% vs 7.3%, i.e. pi ~**24×** the confound. The
+  confound is decisively excluded *here*.
+- **13:35** — pi ≈164.1% against non-pi ≈181%: **the confound was at least
+  comparable, and possibly larger.** The draft's "pi dominates in the windows
+  where pi was measured" is **not** true for this window and has been dropped.
+- **pre-reboot** — the handoff attributes the ceiling to pi (lifetime rates of
+  7–8 cores on individual pids) with confound at 18%/7%, i.e. pi-shaped. But it
+  is a **lifetime** rate, not a 30 s window sample, and one `pi` pid at "~8.3
+  cores" averaged over 23.8 h is itself anomalous next to the 16:55 snapshot
+  (26.3% peak) — see *the burn is episodic* below.
+
+**The burn is episodic, not steady-state — and this report cannot characterise
+it from snapshots.** The pre-reboot handoff and the 16:55 sample cannot both
+describe a constant per-session cost: a lifetime average of ~8.3 cores on one
+pid versus a 26.3%-of-a-core instantaneous reading is a ~31× gap. So either the
+burn is **bursty** (triggered — e.g. by compaction, a multi-MB tool output, or a
+large render) and both measurements are correct episodes of the same process, or
+one of the two is wrong. A 30 s snapshot cannot distinguish those, and neither
+can the two calibration controls, which are single long windows. Two consequences
+the rest of this report should be read against:
+
+- any *steady-state* per-frame cost (the cost law above) can at most explain the
+  snapshot; it cannot explain a lifetime average, so "the cost law brackets the
+  observation" was doubly wrong — it bracketed a *peak*, not the profile;
+- the guard proposed for agent-infra (#1127) must therefore key on a **rate over
+time**, not on a single sample, or it will miss a bursty offender entirely.
+
+So the honest verdict is not "the confound is negligible": it is
+**window-dependent** — decisively excluded at 16:55, comparable at 13:35, and
+pi-shaped but method-incomparable pre-reboot. The report's 177.5% figure stands
+on its own window; it should not be used to dismiss the confound elsewhere.
+And because Unix load average counts **blocked** as well as runnable processes,
+the chain "pi CPU → load 15.94 → swap → reboot" is under-supported: with 39
+`pi` processes at 255–670 MB each against 32 GB, **memory pressure** is at least
+as plausible a cause of the swap thrash. That is a separate issue from the CPU
+burn, but it belongs in the ceiling arithmetic.
+
+### The `bash.js` interval (measured, and bounded)
+
+`bash.js` arms
+
+```js
+if (state.startedAt !== undefined && options.isPartial && !state.interval) {
+    state.interval = setInterval(() => context.invalidate(), 1000);
+}
+```
+
+for an in-flight bash call (cleared on a later `renderResult` with
+`!options.isPartial || context.isError`), and `renderResult` is driven from
+`ToolExecutionComponent.updateDisplay()` — **not** from `render()` — so a plain
+render pass does *not* re-invoke it.
+
+### What is still open
+
+At that 1 Hz cadence the `bash.js` re-wrap alone is only 0.4–4.1% of a core, so
+it is not by itself the whole 6–26%. What is established is the *shape*: frames
+are `setTimeout` callbacks, a frame renders the whole component tree, and at
+least one component (the footer) is recomputed every frame. What is **not** yet
+pinned down is **which size-dependent component's text is re-set on which
+frames, and what requests frames at all while the transcript is silent** — i.e.
+which of these dominates:
+
+0. **the unnamed driver** — `doRender()` does not call `requestRender()`, so a
+   frame requires an external caller; on a silent session none has been
+   identified. Until this is resolved the observed burn is not fully explained;
+   this is the open "not idle at all" framing, and the issue's own clean cases
+   (cmux `runtimeStatus: idle`, ~22% CPU) are not reconciled with a turn-scoped
+   driver;
+1. the un-memoised footer — its demonstrated per-frame cost is `getEntries()`
+   (fresh filtered array + scan of every entry), measured ~0.24–0.82 ms/frame
+   for 200–20 000 entries: real and per-frame but not sufficient alone;
+2. the 1 Hz `bash.js` re-wrap of a large output (0.4–4.1%);
+3. the scrollback line diff (1.2% at 50 000 lines, 3.5% at 200 000);
+4. some other component re-setting its text each frame.
+
+Two earlier draft claims were withdrawn in review and are recorded here so they
+are not re-derived:
+
+- that `renderResult` runs on *every* render pass — false; it is
+  `updateDisplay()`, not `render()`;
+- that the 80 ms `Loader` spinner explains the magnitude — withdrawn on the
+  grounds that the spinner calls `requestRender()`, a render pass, which does
+  not re-invoke `renderResult`. **That reasoning refuted the wrong proposition.**
+  It correctly shows the spinner does not re-run *bash's* renderer; it does not
+  show the spinner's render pass is cheap — and the render pass is what
+  `doRender()` runs over the whole tree. The loader tick was therefore reinstated
+  as *a* frame cadence in the cost law above (as a cadence, not as the driver).
+
+One measurement-definition caveat: "idle" is used here in the **transcript
+sense** (no JSONL write for N minutes), which is what the sampling table
+records. The issue's clean cases used the **session-state sense** (cmux
+`runtimeStatus: idle`). The two are not the same predicate, and the canonical
+operational definition is #469's — idle as of the last complete JSONL entry.
+
+So the honest statement is: **the pump's mechanism is the render frame loop; its
+driver on a silent session is unidentified; and the cost law is a conditional
+upper bound, not a fit.** The remaining unknown is the driver first, the paying
+component second — and both are addressed by the same missing measurement (the
+per-process size column in step 1 below).
+
+### Why this was not patched downstream
+
+There is **no renderer-only seam**: `dist/core/extensions/types.d.ts` exposes
+`registerMessageRenderer` (CustomMessageEntry) and `registerEntryRenderer`
+(CustomEntry) only — nothing that overrides a builtin tool's `renderResult`.
+An extension *can* shadow a builtin by registering a full same-named tool
+definition (`_refreshToolRegistry` in `dist/core/agent-session.js` does
+`definitionRegistry.set(tool.definition.name, …)`, and
+`withBuiltInRenderers` resolves `definition.renderResult ?? builtIn.renderResult`),
+but that means reimplementing `bash` end-to-end — execute, parameters, all
+renderers — and it would rot on every `pi update`.
+
+That is a **judgement**, not an impossibility: a local same-named-tool patch
+was rejected as a fragile, unfalsifiable shadow of a builtin, not as
+technically unreachable. Patching `dist/` directly remains wiped by `pi update`.
+
+### Prior art — and why it matters for the fix
+
+This shape is **not a pi-specific slip**; it is the standard architecture of a
+React-style terminal renderer. Ink — the renderer behind most agent CLIs —
+exposes `maxFps` with a **default of 30** (a throttle interval derived from it)
+and `incrementalRendering`, **default `false`**, which updates only changed
+lines instead of redrawing everything
+([Ink README](https://github.com/vadimdemedes/ink),
+[npm](https://www.npmjs.com/package/ink),
+[Render Options](https://deepwiki.com/vadimdemedes/ink/3.2-render-options),
+[Rendering Lifecycle](https://deepwiki.com/vadimdemedes/ink/8.1-rendering-lifecycle)).
+pi's `MIN_RENDER_INTERVAL_MS = 16` plus a `previousLines` diff is the same
+pattern — pi's throttle is even tighter than Ink's default.
+
+That matters for the recommendation: if the throttled whole-tree frame is a
+**class** characteristic, then finding and re-stating it is not the fix. The
+candidate root causes are pi's **deviations from the class**:
+
+- the footer is recomputed every frame, and its per-frame work is an un-memoised
+  full entry scan — Ink components re-render too, but Ink's per-frame work per
+  component is what its `maxFps` throttle bounds, whereas pi's footer does an
+  O(entries) walk that no cache skips;
+- `truncateToVisualLines` is O(whole output) rather than O(tail) — Ink has no
+  equivalent whole-string re-wrap in its render path.
+
+*(Note on the diff itself: pi's `previousLines` compare is a whole-scrollback
+line-by-line diff, and that is **not** a deviation — Ink's `incrementalRendering`
+does the same whole-output line compare, and Ink's **default** is a full redraw,
+which is at least as expensive. The two bullets above are the pi-specific ones;
+the diff is a hypothesis, not a deviation, and is covered by the falsifier
+below.)*
+
+So the upstream ask should be framed as "make each frame cheap and bounded",
+not "remove the throttle". The falsifier a maintainer should run first: does an
+Ink-based TUI with a large mounted output also burn under the same profile?
+
+### Suggested next steps (upstream, in order)
+
+1. **Name the driver, then the component — and collect the missing size column.**
+   `doRender()` does not call `requestRender()`, so something external is
+   requesting frames on a session whose transcript has not moved. Attach
+   `--cpu-prof` to a long-lived, large session and read the JS frame names
+   (`sample` cannot — every JS frame in it is `???`). At the same time record a
+   **size column** — heapUsed, footprint, entry count and scrollback line count
+   for each session — cross-plotted against its CPU. No session's content size
+   was ever measured, so today the cost law has a free parameter and cannot be
+   falsified; this column is what makes it a claim. That single column separates
+   "large sessions burn" from "a cadence burns", and it is cheap.
+2. **Memoise the footer.** `FooterComponent.invalidate()` is a no-op and
+   `render()` has no cache, so it recomputes per frame; the demonstrated
+   per-frame cost is `getEntries()` (a fresh filtered array plus a scan of every
+   session entry). Cache on the branch/last-entry identity, and stop walking
+   every entry to build a fresh array per frame.
+3. **Make frames cheap and windowed** (the issue's ask 2). Note the ask as
+   filed — "make the idle path event-driven" — is **insufficient as stated and
+   is not adopted here without re-derivation**: an animated indicator (`Working`
+   / `Retry` / `Compaction`) is periodic *by nature*, so event-driven
+   *scheduling* does not stop frames while one is mounted. The evidence points
+   instead at making each frame cheap and bounded: a content-hash short-circuit
+   before the tree walk, so an unchanged frame costs nothing instead of
+   O(lines), plus windowed/incremental rendering rather than a full-tree walk.
+4. **Make `truncateToVisualLines` O(tail) rather than O(whole output)** — wrap
+   from the end, or memoise on `(text, width, maxVisualLines)`.
+5. **Clear any per-row interval on *every* terminal state** (including abort and
+   row disposal), not only on a later `updateDisplay()`.
+
+**Re-check mechanism (so step 1 does not rot):** this report defers its decisive
+measurement, and a deferral with no trip is silent rot. Be precise about what
+exists: this report contains a **dated measurement** (the 16:55 table above), but
+**no mechanical re-measure** — nothing in the fleet currently samples `ΔCPU`
+against transcript silence. The proposed trip is the guard in the next section,
+now filed as agent-infra **#1127** (warn-only, `ΔCPU` joined to #469's existing
+silence predicate); until that issue lands, step 1 has **no** automatic trip, and
+this paragraph is the only re-check. Trigger for a manual re-measure: the next
+time any `pi` process exceeds ~5% of a core with a transcript silent > 120 s. If
+the fleet's next restart shows the spin gone, that is evidence for the "not idle
+at all — queued auto-continuation" framing rather than against it.
+
+### Mitigation available in agent-infra (the issue's ask 3)
+
+The issue's ask 3 — warn/throttle when a session's CPU advances while its
+transcript has not changed — is **not addressed by this report** and is the one
+part agent-infra controls. It is also **not** currently covered by the existing
+substrate, and that was verified rather than assumed:
+
+- `~/.pi/agent/state/stale-stuck.py` correlates **apparent activity** — frozen
+  session/task `.jsonl` size deltas, live non-pi tool children, socket byte flow
+  and a `Working`-style screen state — against transcript idleness. It reads only
+  `ps -o command=`, `ps -o etime=` and `ps -o ppid=` and **never measures CPU
+  at all**, so it cannot see this failure mode; it has no burn signal to
+  correlate.
+- The idle reaper (`scripts/pi-reap-idle.sh`, policy in
+  `docs/ops/pi-idle-repl-reaper-policy.md`, #469) classifies **purely** by
+  transcript idleness (`REAP_IDLE_HOURS`, `REAP_STUCK_HOURS`) and likewise
+  contains no CPU measurement. Every process in the table above is 1–210 min
+  silent, so all of them are *retained indefinitely* by that policy while
+  burning 6–26% of a core.
+
+The natural fix is one comparison added to an existing mechanism, not a new
+subsystem: a ΔCPU-per-window column joined to #469's existing transcript-silence
+predicate (WARN by default; never kill — a false positive destroys an in-memory
+session thread, which is the #1114 failure mode). That is deliberately filed as
+**agent-infra #1127**, not folded into this upstream report.
+
+### Honest status of this report
+
+Measured: the fleet burn, the confound isolation, the `sample` attribution
+(61% of the main thread in the frame callback, with negligible terminal writes
+— 13/8573 = 0.15% for pid 3312, 10/4217 for pid 70130), the `spawnSync`
+presence, the per-frame cost law above (the **re-set** column, with its cadence
+dependence stated), the un-memoised footer, the frame loop's `setTimeout`
+re-arm, and the calibration that a fresh idle TUI costs 0.8% of a core while a
+visible spinner plus a ticking bash call costs ~1%.
+
+**Identified:** the *mechanism* — frames are timer callbacks and a frame renders
+the whole tree, with one demonstrably un-memoised component. **Not established:**
+(a) the *driver* that requests frames while the transcript is silent, and (b)
+which component re-sets its text on which frames — and therefore the magnitude
+attributable to any site. The cost law is a **conditional upper bound**, not a
+fit: at 12.5 fps its 600 KB entry (20.8%) falls *below* the observed maximum
+(26.3%), and at 62.5 fps the same law contains the observed range only
+vacuously.
+
+Two earlier drafts of this section were each an over-read in opposite
+directions, and both are recorded so they are not re-derived: the first called
+the pump unidentified and the magnitude unexplained (an over-read of calibration
+controls that held content size at zero); the second called the pump identified
+and claimed the cost law *brackets* the observation (an over-read of a curve
+with two free parameters). The state above is the defensible one.
+
+Two measurement caveats a filer should carry:
+
+- `ps -o time` on macOS measures the process's **own** CPU and does **not** fold
+  in reaped children (verified by direct experiment: a parent that burned
+  1.03 s while waiting on a 3 s child reported `0:01.03`). So the 177.5% is
+  pi's own CPU, not accumulated subprocess time — the `spawnSync` is not the
+  explanation.
+- It *does* count all threads, and the same sample files show V8 collection
+  running **off the main thread** — nine `PlatformWorkerThread` branches carry
+  `DefaultJobWorker::Run`, `ScavengerCollector::JobTask::Run` (110+ in one
+  subtree) and `ConcurrentMarking::RunMajor`, with
+  `Scavenger::EvacuateShortcutCandidate<…, ConsString, …>` present throughout.
+  So "61% of the *main thread*" is not the whole process burn, and the extra is
+  allocation-driven — consistent with a render path that allocates and flattens
+  strings, and additive to it. (These are subtree sums from a
+  `recursive counted multiple` section, so they are order-of-magnitude evidence,
+  not quotable call counts — the same reason the `Heap::CollectGarbage` row was
+  withheld.)
+
+A filer should treat step 1 above as the first action, and should collect the
+missing **size column** for every process at the same time.
