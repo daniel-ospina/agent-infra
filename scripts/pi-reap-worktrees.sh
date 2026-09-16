@@ -1330,12 +1330,8 @@ run() {
             PRUNE_START_TMP="$(mktemp "${TMPDIR:-/tmp}/pi-reap-prune-start.XXXXXX")" || PRUNE_RECHECK_FAILED=1
             PRUNE_NOW_TMP="$(mktemp "${TMPDIR:-/tmp}/pi-reap-prune-now.XXXXXX")" || PRUNE_RECHECK_FAILED=1
         fi
-        if [ "$PRUNE_RECHECK_FAILED" = 1 ]; then
-            # Never "could not check, so reclaim anyway": an unevaluable re-read
-            # is exactly the unverifiable-probe case (threat class 3).
-            PRUNE_BLOCKED=1
-            log "PRUNE-RECHECK-FAILED (re-read or scratch file unavailable — fail-closed, global prune skipped)"
-        else
+        PRUNE_NEWLY=""
+        if [ "$PRUNE_RECHECK_FAILED" = 0 ]; then
             : >"$PRUNE_START_TMP"; : >"$PRUNE_NOW_TMP"
             # only the path is needed, and only from records git ALREADY flags
             while IFS=$'\t' read -r _p _h _b _f; do
@@ -1346,19 +1342,35 @@ run() {
                 [ -n "$_p" ] || continue
                 case ",$_f," in *,prunable,*) printf '%s\n' "$_p" >>"$PRUNE_NOW_TMP" ;; esac
             done <<<"$WT_LIST"
-            sort -o "$PRUNE_START_TMP" "$PRUNE_START_TMP"
-            sort -o "$PRUNE_NOW_TMP" "$PRUNE_NOW_TMP"
-            PRUNE_NEWLY="$(comm -23 "$PRUNE_NOW_TMP" "$PRUNE_START_TMP")"
-            rm -f "$PRUNE_START_TMP" "$PRUNE_NOW_TMP"
-            if [ -n "$PRUNE_NEWLY" ]; then
-                PRUNE_BLOCKED=1
-                say ""
-                say "⚠️  $(printf '%s\n' "$PRUNE_NEWLY" | wc -l | tr -d ' ') record(s) became prunable DURING this pass, after they were classified — the global prune is skipped."
-                while IFS= read -r _nl; do
-                    [ -n "$_nl" ] || continue
-                    log "PRUNE-RECHECK-BLOCK $_nl (became prunable after classification — not an intended reclaim target)"
-                done <<<"$PRUNE_NEWLY"
-            fi
+            # F18 (cycle-11, P1) — the comparison toolchain's OWN exit status is
+            # part of the probe, not an implementation detail. With `sort` or
+            # `comm` unavailable the process writes to stderr and leaves stdout
+            # EMPTY, which is byte-for-byte what "no new prunable record" looks
+            # like. Reading that empty result without the rc let the
+            # path-filterless prune run on an UNVERIFIABLE comparison — the same
+            # unverifiable-probe bypass (threat class 3) the re-read rc already
+            # closes. Three rc checks, no extra fork; the removal `rm` below is
+            # still unconditional so a failed run leaves no scratch behind.
+            sort -o "$PRUNE_START_TMP" "$PRUNE_START_TMP" || PRUNE_RECHECK_FAILED=1
+            sort -o "$PRUNE_NOW_TMP" "$PRUNE_NOW_TMP" || PRUNE_RECHECK_FAILED=1
+            PRUNE_NEWLY="$(comm -23 "$PRUNE_NOW_TMP" "$PRUNE_START_TMP")" || PRUNE_RECHECK_FAILED=1
+        fi
+        [ -n "$PRUNE_START_TMP" ] && rm -f "$PRUNE_START_TMP"
+        [ -n "$PRUNE_NOW_TMP" ] && rm -f "$PRUNE_NOW_TMP"
+        if [ "$PRUNE_RECHECK_FAILED" = 1 ]; then
+            # Never "could not check, so reclaim anyway": an unevaluable re-read,
+            # scratch file, or comparison is exactly the unverifiable-probe case
+            # (threat class 3).
+            PRUNE_BLOCKED=1
+            log "PRUNE-RECHECK-FAILED (re-read, scratch file, or comparison unavailable — fail-closed, global prune skipped)"
+        elif [ -n "$PRUNE_NEWLY" ]; then
+            PRUNE_BLOCKED=1
+            say ""
+            say "⚠️  $(printf '%s\n' "$PRUNE_NEWLY" | wc -l | tr -d ' ') record(s) became prunable DURING this pass, after they were classified — the global prune is skipped."
+            while IFS= read -r _nl; do
+                [ -n "$_nl" ] || continue
+                log "PRUNE-RECHECK-BLOCK $_nl (became prunable after classification — not an intended reclaim target)"
+            done <<<"$PRUNE_NEWLY"
         fi
         # the pass's snapshot is authoritative again for anything that follows
         WT_LIST="$PRUNE_START_LIST"

@@ -253,6 +253,20 @@ for a in "$@"; do
 done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
+REAL_COMM="$(command -v comm)"
+[ -n "$REAL_COMM" ] || { echo "comm is required" >&2; exit 1; }
+cat >"$T/bin/comm" <<SHIM
+#!/usr/bin/env bash
+# PATH shim for A25's comparison-failure leg (F18). \`comm\` is used by the
+# reaper at EXACTLY ONE place — the pre-prune set comparison — so shadowing it
+# is scoped. With A25_COMM_FAIL set it behaves like the binary being off PATH,
+# which is the reviewer's repro: stderr, EMPTY stdout, rc 127. That empty
+# stdout is byte-for-byte "no new prunable record", so the rc MUST carry the
+# verdict — reading the empty result as "nothing changed" is how the
+# path-filterless prune ran on an unverifiable comparison.
+[ -n "\${A25_COMM_FAIL:-}" ] && exit 127
+exec "$REAL_COMM" "\$@"
+SHIM
 cat >"$T/bin/git-fail-list" <<'SHIM'
 #!/usr/bin/env bash
 for a in "$@"; do [ "$a" = "list" ] && exit 128; done
@@ -325,7 +339,7 @@ chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
          "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status" "$T/bin/git-race-delete-a25" \
-         "$T/bin/git-list-fail-after-probes"
+         "$T/bin/git-list-fail-after-probes" "$T/bin/comm"
 
 # ── fixture builders ───────────────────────────────────────────────────
 mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
@@ -392,6 +406,7 @@ run_reaper() {
     GIT_BIN="${GIT_BIN_OVERRIDE:-$REAL_GIT}" \
     A25_RACE_TARGET="${A25_RACE_TARGET:-}" \
     A25_LIST_SHIM_STATE="${A25_LIST_SHIM_STATE:-}" \
+    A25_COMM_FAIL="${A25_COMM_FAIL:-}" \
     FAKE_PS_LIVE_PATH="${FAKE_PS_LIVE_PATH:-}" \
     FAKE_LSOF_CWD="${FAKE_LSOF_CWD:-}" \
     FAKE_GH_REFS="${FAKE_GH_REFS:-}" \
@@ -1333,18 +1348,58 @@ assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A25_SHA" --format=
 "$REAL_GIT" -C "$REPO" cat-file -e "$A25_SHA" 2>/dev/null \
     && ok "A25 falsifier: the commit SURVIVES gc — the pruned-during-pass record was NOT swept" \
     || bad "A25 the commit was collected: the global prune orphaned it"
-# the fail-closed branch: if the re-read itself cannot be evaluated, the prune
-# is skipped — the alternative ("could not check, so reclaim anyway") is the
-# unverifiable-probe bypass. The reaper state is unchanged: both records are
-# still registered and one of them still arms the prune.
-rm -f "$T/$ENV/seen"
+# ── A25 fail-closed legs, on their OWN single-record fixture ──────────
+# (cycle-11, F19) These legs must NOT reuse the A25 state above. Leg 1 leaves
+# WT_A25X as a gone-dir record that the classify loop blocks on INDEPENDENTLY
+# of the recheck, so `PRUNE_BLOCKED=1` held whatever the fail-closed branch did
+# — deleting that branch's `PRUNE_BLOCKED=1` still passed the whole suite
+# (mutation-verified), i.e. the pin could not catch the defect it exists to
+# catch. Here the ONLY gone-dir record is a `remove/prunable` one: it ARMS the
+# global prune (PRUNE_WANTED=1) and does NOT block the classify loop, so the
+# fail-closed recheck is the single thing that can keep the prune from running.
+# The record is DETACHED and its commit sits on its OWN local branch, NOT on
+# main, so `commits_survive` misses the `merged` fast path and reaches the
+# `for-each-ref --contains` fallback (the probe the re-read shim keys on) while
+# the commit stays durably reachable via refs/heads/* — making the row a
+# `remove/prunable` rather than an orphaning preserve.
+ENV=A25B; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a25b
+commit_in_wt "$REPO" "$OLD_DATE" a25b
+A25B_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" checkout -q main
+WT_A25B="$T/$ENV-gone"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A25B" "$A25B_SHA"
+rm -rf "$WT_A25B"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A25B")" "reason=prunable" \
+    "A25 fail-closed precondition: the single gone-dir record is the prune target"
+assert_absent "$(row_for "$OUT" "$WT_A25B")" "reason=remote-only-ref" \
+    "A25 fail-closed precondition: it is a remove, not a preserve (nothing else blocks the loop)"
+# leg 1 — an UNEVALUABLE RE-READ: the pre-prune `worktree list` fails. The log
+# is scoped per leg (the file is APPENDED across runs) so leg 1's line can never
+# satisfy leg 2's assertion.
+rm -f "$T/$ENV/seen" "$T/$ENV/reap.log"
 OUT="$(A25_LIST_SHIM_STATE="$T/$ENV/seen" GIT_BIN_OVERRIDE="$T/bin/git-list-fail-after-probes" \
     run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A25 fail-closed: exit 0 (a skipped prune is not a failed removal)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNE-PENDING $WT_A25B" \
+    "A25 fail-closed precondition: the record armed the global prune"
 assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNE-RECHECK-FAILED" \
     "A25 fail-closed: an unevaluable re-read skips the prune instead of reclaiming blind"
 assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" "A25 fail-closed: footer PRUNE_BLOCKED=1"
 assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A25 fail-closed: the prune did not run"
+# Leg 1 removed nothing (a skipped prune), so the SAME single-record state still
+# holds for leg 2 — and it still has no preserve record to block the loop.
+# leg 2 — an UNUSABLE COMPARISON (F18): `comm` is off PATH. Its stdout is EMPTY,
+# which is exactly what "no new prunable record" looks like; only the rc can
+# tell the two apart.
+rm -f "$T/$ENV/reap.log"
+OUT="$(A25_COMM_FAIL=1 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A25 fail-closed/comm: exit 0 (a skipped prune is not a failed removal)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNE-RECHECK-FAILED" \
+    "A25 fail-closed/comm: an unusable comparison skips the prune instead of reclaiming blind"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" "A25 fail-closed/comm: footer PRUNE_BLOCKED=1"
+assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A25 fail-closed/comm: the prune did not run"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
