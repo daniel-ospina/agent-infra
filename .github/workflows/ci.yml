@@ -281,6 +281,32 @@ jobs:
         # (provenance).
         run: '! grep -rE ''/Users/danielospina/swarm/operations/coordination'' skills/ extensions/ scripts/'
 
+  http-pool-hygiene:
+    # #1110 — the real-transport arms of this suite (the dead-socket RED
+    # baseline and the keepAliveMaxTimeout falsifier) need a real undici copy.
+    # The zero-dep `verify` job has none, so the glob in ci-main.yml SKIPPED
+    # them and exited 0 — a green run that tested nothing (inert gate).
+    # Install pi's pinned undici (8.9.0, the version the vendored pin carries)
+    # into a TEMP COPY of the extension and run from there — no NODE_PATH, which
+    # would leak into `require.resolve` and turn Part 5's "unresolvable" negative
+    # case into a false failure. PI_HTTP_POOL_REQUIRE_UNDICI=1 makes a missing
+    # undici a FAILURE instead of a green skip. Test-only: no repo manifest is
+    # touched and nothing is written under the checkout.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install undici for the real-transport arms (test-only)
+        run: |
+          tmp="$RUNNER_TEMP/pool-hygiene-ext"
+          mkdir -p "$tmp"
+          cp -R extensions/http-pool-hygiene/. "$tmp/"
+          npm install --no-save --no-audit --no-fund --prefix "$tmp" undici@8.9.0
+      - name: http-pool-hygiene suite (real transport REQUIRED)
+        run: PI_HTTP_POOL_REQUIRE_UNDICI=1 node "$RUNNER_TEMP/pool-hygiene-ext/test-pool-hygiene.mjs"
+
   setup-suite:
     # #449 — pi-bootstrap setup regression suite, per-PR gate: the ONLY run-site
     # that catches the #447 ship-list drift class at PR time (previously the

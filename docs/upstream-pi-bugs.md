@@ -147,11 +147,96 @@ accept a `fetch`/`httpAgent` override (or default to an undici `Agent` with
 `keepAliveTimeout` tuned for providers with aggressive connection TTLs); add a
 connection-pool flush on `"terminated"` before the next retry.
 
-### Mitigation in agent-infra (already shipped)
-Provider auto-fallback in `extensions/builtin-tools/index.ts`: when a qwen
-sub-agent dies with connection-error signatures, the task tool retries the
-dispatch ONCE on `TASK_FALLBACK_MODEL` (default `deepseek-v4-pro`), which uses
-the stable DeepSeek endpoint. Env: `TASK_FALLBACK_MODEL`, `TASK_FALLBACK_DISABLE=1`.
+### Root cause — confirmed and narrowed (#1110, 2026-09-15)
+
+The suspected cause above is right in spirit but wrong in the detail that
+matters, and the wrong detail is why the fix was not obvious. pi *does*
+configure an HTTP dispatcher — `configureHttpDispatcher()` installs an
+`undici.EnvHttpProxyAgent` with `allowH2: false`, `proxyTunnel: true`,
+`bodyTimeout`/`headersTimeout = httpIdleTimeoutMs` and
+`connect.autoSelectFamilyAttemptTimeout`. What it does **not** set is any
+keep-alive bound, so undici's defaults are in force:
+
+| option | default | source |
+|---|---|---|
+| `keepAliveTimeout` | 4 s | `undici/lib/dispatcher/client.js:266` |
+| `keepAliveMaxTimeout` | **600 s** | `undici/lib/dispatcher/client.js:267` |
+| `keepAliveTimeoutThreshold` | 2 s | `undici/lib/dispatcher/client.js:268` |
+
+`keepAliveMaxTimeout` is the **ceiling applied to the server's own
+`Keep-Alive: timeout=N` hint** (`client-h1.js:682-689`:
+`Math.min(hint - threshold, keepAliveMaxTimeout)`). An edge that advertises a
+long idle TTL — Aliyun MaaS, and several managed proxies — therefore keeps the
+pooled socket alive for **up to ten minutes**, far beyond its real connection
+TTL. The edge reaps first, the pool still offers the corpse to the next
+request, the write dies with `ECONNRESET`, and the OpenAI SDK reports it as
+`APIConnectionError` → `"Connection error."`.
+
+Two corrections to the original write-up, both load-bearing:
+
+- `httpIdleTimeoutMs` does **not** bound keep-alive. It maps to
+  `headersTimeout`/`bodyTimeout` only. Raising it (the fleet runs 600000) does
+  not touch pooled-socket lifetime.
+- `keepAliveTimeout` alone is not the fix: a server hint overrides it. Only
+  `keepAliveMaxTimeout` caps the hint — verified by measurement, not by
+  reading: with a 1.8 s idle gap against an edge advertising
+  `Keep-Alive: timeout=3600` and reaping at 1.5 s,
+  `keepAliveTimeout: 1000` still produced `ECONNRESET`, while
+  `keepAliveMaxTimeout: 1000` did not. The negative arm is committed as
+  `test-pool-hygiene.mjs` P3.15 ("FALSIFIER"), and OUR OWN knobs are guarded by
+  P3.4/P3.5 (the fixed arm uses the extension's dispatcher, so a refactor back
+  to `keepAliveTimeout` turns that arm red); P3.15 pins undici's underlying
+  behaviour so the reasoning behind the clamp cannot quietly become folklore.
+
+**Reproduced deterministically** (`extensions/http-pool-hygiene/lb-harness.mjs`
+— a TCP middlebox that silently forgets a connection after `idleReapMs` and
+RSTs the next byte), and end-to-end with three concurrent `pi -p` sessions
+against a reaping edge with a mid-stream kill. The E2E's acceptance checks count
+`[http-pool-hygiene] rotated connection pool (message_end…` lines directly
+(checks A9/A10) rather than inferring the flush from a log regex that pi's own
+retry lines also satisfy:
+
+```
+CONTROL (hygiene OFF)  reaps=12  requests written onto a reaped socket=9   sessions exited 0
+FIXED   (hygiene ON)   reaps=3   requests written onto a reaped socket=0   sessions exited 0, mid-stream kill recovered 3/3
+```
+
+The control's sessions survived only because undici drops a socket once a
+request on it has failed — i.e. the retry is what absorbs the defect, one
+provider call at a time. When the edge also throttles reconnects (the
+condition the issue attributes to the 2s→4s→8s window), the retry budget is
+spent on corpses.
+
+### What the durable fix should be (upstream ask)
+
+1. In `configureHttpDispatcher()`, clamp the server hint:
+   `keepAliveMaxTimeout` (≈30 s is well under the common 60 s LB idle timeout
+   and under Aliyun's ~8 min), leaving `keepAliveTimeout` at its 4 s default so
+   hint-less endpoints do not lose reuse.
+2. Expose a pool flush for the retry path, or flush on a transport-class
+   `stopReason: "error"` before the next attempt — the 5-minute capped retry
+   contract (#1088) only pays off if the retry can land on a fresh connection.
+
+### Mitigation in agent-infra (shipped)
+
+`extensions/http-pool-hygiene/` (#1110) is the agent-infra-owned half — it
+survives `pi update`:
+
+- every request goes through a dispatcher with `keepAliveMaxTimeout` clamped
+  (default 30 s, `PI_HTTP_POOL_KEEPALIVE_MAX_MS`), `keepAliveTimeout` untouched;
+- a transport failure rotates the pool and retries once on a fresh connection
+  (replayable bodies only), and a transport-class `message_end` (e.g.
+  `terminated`) flushes the pool **before** pi's own retry;
+- non-transport failures (429, `overloaded`, quota text) never rotate the pool;
+- `PI_HTTP_POOL_HYGIENE=0` disables it; an unresolvable undici degrades to a
+  loud warning with pi's transport untouched.
+
+The earlier workaround remains in place and is no longer the only recovery
+path: provider auto-fallback in `extensions/builtin-tools/index.ts`
+(`TASK_FALLBACK_MODEL`, `TASK_FALLBACK_DISABLE=1`) and the `qwen-ha` provider
+(`extensions/custom-provider-qwen/`) both predate this fix. `qwen-ha`'s
+`pipelining: 0` (close-after-every-response) remains a deliberate per-provider
+trade-off, not the general fix.
 
 ---
 
