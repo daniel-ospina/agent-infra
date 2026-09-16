@@ -274,10 +274,38 @@ function yieldOneLine(line: string, lang: SourceLang): string {
   return rest === "" ? "" : line.slice(0, line.length - t.length) + rest;
 }
 
-/** TS/JS `const|let|var NAME =` (also `export const`). */
-const TS_DECL_RE = /(?:^|\n)[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*=/g;
-/** Shell `NAME=`, `readonly NAME=`, `export NAME=`, `declare NAME=` at line start. */
-const SH_DECL_RE = /(?:^|\n)[ \t]*(?:export[ \t]+|readonly[ \t]+|declare[ \t]+)?([A-Z_][A-Z0-9_]*)=/g;
+/** TS/JS `const|let|var NAME[: Type] =` (also `export const`). */
+const TS_DECL_RE =
+  /(?:^|\n)[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*(?::[^\n]*?)?[ \t]*=/g;
+/**
+ * Shell `NAME=`, `readonly NAME=`, `export NAME=`, `declare NAME=` — AT LINE START
+ * or after any non-identifier character, because a shell script legitimately
+ * assigns a bound inside a `case` arm (`--idle-days) IDLE_DAYS="$2"; shift 2 ;;`,
+ * which is how two of the reaper scripts take their CLI override). A line-start
+ * anchor missed those sites entirely, which made the exact-declaration-count rule
+ * blind to them.
+ */
+const SH_DECL_RE = /(?:^|[^A-Za-z0-9_])(?:export[ \t]+|readonly[ \t]+|declare[ \t]+)?([A-Z_][A-Z0-9_]*)=/g;
+
+/**
+ * True when `line` carries `fragment` as a WHOLE token.
+ *
+ * A raw `includes()` lets a numeric fragment be extended into a different bound:
+ * a registered `|| 1_800_000` matched `|| 1_800_000 * 2`, and `=14` matched
+ * `=140` — a false PASS in the one direction this module exists to close. So the
+ * digit boundaries are anchored when the fragment itself starts or ends with a
+ * digit (`_` counts, so `1_800_000` cannot be extended to `1_800_0000`), and an
+ * ARITHMETIC continuation after a numeric tail is refused (`* 2`, `/ 2`) —
+ * recording a scaled bound as if it were the bound is exactly the drift the
+ * registry is for. A fragment that needs to describe an expression records the
+ * WHOLE expression (as `WALL_CLOCK_STALL_MS` does).
+ */
+export function carriesValue(line: string, fragment: string): boolean {
+  let re = fragment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (/[0-9]$/.test(fragment)) re += "(?![0-9_])(?!\\s*[*/+-]\\s*[0-9])";
+  if (/^[0-9]/.test(fragment)) re = `(?<![0-9_])${re}`;
+  return new RegExp(re).test(line);
+}
 
 /**
  * True when `symbol` belongs to a declared liveness/stall name family AND has
@@ -301,6 +329,35 @@ export function inFamily(
 }
 
 /**
+ * True when position `at` in `src` sits inside a quoted string ON ITS OWN LINE.
+ *
+ * The shell extraction accepts a name= assignment after any non-identifier char
+ * (so a `case` arm counts), which also matched the `NAME=` inside a log STRING
+ * (`log "... MAX_AGE_DAYS=$MAX_AGE_DAYS ..."`) — a fabricated declaration. The
+ * quote state is recomputed from the LINE START every time, so this stays
+ * line-local and stateless (nothing carries across lines); a string that spans
+ * lines would desynchronize it, which is the same disclosed class as the
+ * flush-left block comment.
+ */
+function insideQuote(src: string, at: number): boolean {
+  const lineStart = src.lastIndexOf("\n", at) + 1;
+  let quote: string | null = null;
+  for (let i = lineStart; i < at; i++) {
+    const c = src[i];
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (quote === null) {
+      if (c === '"' || c === "'") quote = c;
+    } else if (c === quote) {
+      quote = null;
+    }
+  }
+  return quote !== null;
+}
+
+/**
  * Every declaration line for `symbol` in `src` (comment LINES blanked), in source
  * order. Plural because a shell script legitimately declares the same symbol
  * more than once (a default near the top, a CLI override, a `10#` coercion) —
@@ -310,15 +367,20 @@ export function inFamily(
 export function declarationLines(src: string, symbol: string, lang: SourceLang = "ts"): string[] {
   const stripped = yieldCommentLines(src, lang);
   const re = new RegExp(
-    `(?:^|\\n)[ \\t]*(?:export[ \\t]+|readonly[ \\t]+|declare[ \\t]+)?(?:const|let|var)?[ \\t]*${symbol}[ \\t]*=`,
+    `(?:^|[^A-Za-z0-9_])(?:export[ \\t]+|readonly[ \\t]+|declare[ \\t]+)?(?:const|let|var)?[ \\t]*${symbol}[ \\t]*(?::[^\\n]*?)?[ \\t]*=`,
     "g",
   );
   const out: string[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(stripped)) !== null) {
-    const start = m.index + (m[0].startsWith("\n") ? 1 : 0);
-    const nl = stripped.indexOf("\n", start);
-    out.push((nl === -1 ? stripped.slice(start) : stripped.slice(start, nl)).trim());
+    // The match may include the character BEFORE the keyword/name (the shell
+    // boundary rule accepts any non-identifier char), so the line is derived
+    // from the SYMBOL's own position, never from m.index.
+    const at = stripped.indexOf(symbol, m.index);
+    if (at === -1 || insideQuote(stripped, at)) continue;
+    const lineStart = stripped.lastIndexOf("\n", at) + 1;
+    const lineEnd = stripped.indexOf("\n", at);
+    out.push(stripped.slice(lineStart, lineEnd === -1 ? stripped.length : lineEnd).trim());
     if (m.index === re.lastIndex) re.lastIndex++;
   }
   return out;
@@ -385,6 +447,10 @@ export function scanDeclarations(
       while ((m = re.exec(stripped)) !== null) {
         const symbol = m[1];
         if (!inFamily(symbol, spec.families, spec.ageSuffixes, spec.boundSuffixes)) continue;
+        // A name= inside a quoted string is not a declaration (a log line, or the
+        // registry's own `overrides` string literals). Applied to BOTH extractors:
+        // the shell shape also runs over TS/JS sources.
+        if (insideQuote(stripped, m.index + m[0].lastIndexOf(symbol))) continue;
         if (seen.has(symbol)) continue;
         seen.add(symbol);
         declarations.push({ file, symbol, raw: declarationLine(src, symbol, lang) ?? symbol });
@@ -441,13 +507,13 @@ export function forwardViolations(
         );
         continue;
       }
-      if (term.value !== null && !lines[0].includes(term.value)) {
+      if (term.value !== null && !carriesValue(lines[0], term.value)) {
         out.push(
           `${term.name}: ${owner} declares ${JSON.stringify(lines[0])}, which does not carry the registered value ${JSON.stringify(term.value)} — the value changed without updating the registry (or vice versa)`,
         );
       }
       for (let i = 0; i < overrides.length; i++) {
-        if (!lines[i + 1].includes(overrides[i])) {
+        if (!carriesValue(lines[i + 1], overrides[i])) {
           out.push(
             `${term.name}: ${owner} declaration #${i + 2} is ${JSON.stringify(lines[i + 1])}, which does not carry its registered override fragment ${JSON.stringify(overrides[i])} — record the override instead of letting it drift`,
           );

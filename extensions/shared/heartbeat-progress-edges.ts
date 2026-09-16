@@ -107,8 +107,10 @@ export type StallAxis = (typeof STALL_AXES)[number];
  * names must also resolve to a registry entry (the clause→bound closure test),
  * which is what keeps `FIRST_OUTPUT_TIMEOUT_MS` and `DEFAULT_HARD_CAP_MS` — both
  * named only in clause prose — from drifting silently. What remains uncovered is
- * a brand-new out-of-family bound that NO clause names, which is the disclosed
- * limit of a name-shaped scan.
+ * DISCLOSED, not detected: a brand-new out-of-family bound that NO clause names
+ * and that nobody lists here is invisible to both scan directions. The tests can
+ * only enforce `registered ⇒ in-family or listed here`; they cannot see a term
+ * that was never registered at all.
  */
 export const OUT_OF_FAMILY_TERMS = [
   "getSubagentBackstopFreshMs",
@@ -118,6 +120,7 @@ export const OUT_OF_FAMILY_TERMS = [
   "getTaskMaxDispatchMs",
   "getCutGapMs",
   "getEffectiveCutGapMs",
+  "getTaskBackstopMs",
   "FIRST_OUTPUT_TIMEOUT_MS",
   "DEFAULT_HARD_CAP_MS",
   "DEFAULT_MAX_DISPATCH_MS",
@@ -439,11 +442,21 @@ const BT_TEST = "extensions/builtin-tools/builtin-tools.test.ts value+behaviour 
 const NONE = "declared and asserted by this registry (was unguarded before #1068)";
 
 /**
- * Every stall / liveness / staleness bound in the repo, with its owner file(s),
- * the fragment of its declaration line that carries the value, and who guards
- * it TODAY. `value: null` means the value is not a local literal: a POINTER to
- * another guard, DERIVED from other bounds, or resolved by a FUNCTION (an env
- * override). Its presence is still asserted, in declaration shape.
+ * The stall / liveness / staleness bound vocabulary, with each term's owner
+ * file(s), the fragment of its declaration line that carries the value, and who
+ * guards it TODAY. `value: null` means the value is not a local literal: a
+ * POINTER to another guard, DERIVED from other bounds, or resolved by a FUNCTION
+ * (an env override). Its presence is still asserted, in declaration shape.
+ *
+ * SCOPE — what the two scan directions can and cannot see. The reverse scan
+ * matches NAMES (`inFamily`), so a bound whose name carries no family token is
+ * invisible to it unless it is registered in `OUT_OF_FAMILY_TERMS`. Two guards
+ * keep that from being silent: (a) every bound a DECLARED kill clause names must
+ * resolve to a registry entry (the clause→registry closure test), and (b) every
+ * name listed in `OUT_OF_FAMILY_TERMS` must be registered in both directions.
+ * What remains uncovered is DISCLOSED: a brand-new out-of-family bound that no
+ * clause names and nobody registers is not detected. This registry is a
+ * maintained vocabulary with a drift gate, not a proof of completeness.
  */
 export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   // — kill axis: child heartbeat protocol —
@@ -615,6 +628,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "=14",
     axis: "retention",
     guardedBy: NONE,
+    overrides: ['IDLE_DAYS="$2"'],
+    note: "the owner takes a CLI override in a `case` arm (`--idle-days)`), which is why the shell extraction accepts a name= after any non-identifier character",
   },
   {
     name: "REAP_WT_AGED_DAYS",
@@ -771,6 +786,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the EFFECTIVE cut deadline the parser actually uses — getCutGapMs() scaled by system load (1×/2×/3× bands via loadScaledBound) and latched per dispatch. Registered separately from getCutGapMs because the runtime reads this one; recording only the base would record a bound up to 3× smaller than the effective one.",
+  },
+  {
+    name: "getTaskBackstopMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the parent's detector-dead backstop (23.4 h default = DEFAULT_TOOL_STALL_MS + DEFAULT_BACKSTOP_MARGIN_MS), TASK_BACKSTOP_MS override, 0 = OFF explicitly. Out-of-family name, so only this entry keeps it visible.",
   },
   {
     name: "getCutGapMs",

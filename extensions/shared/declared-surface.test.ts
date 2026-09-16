@@ -25,6 +25,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ok, equal } from "node:assert/strict";
 import {
+  carriesValue,
   collectFiles,
   declarationLines,
   driverViolations,
@@ -334,6 +335,52 @@ test("an extra declaration of a registered term is a violation, not a passing `s
   equal(forwardViolations([bare], () => 'Y_IDLE_HOURS="${Y_IDLE_HOURS:-3}"\n').length, 0);
   const v4 = forwardViolations([bare], () => 'Y_IDLE_HOURS="${Y_IDLE_HOURS:-3}"\nY_IDLE_HOURS=9\n');
   ok(v4.length > 0 && v4[0].includes("2 time(s)"), `a second declaration must fail for a 1-declaration term, got ${JSON.stringify(v4)}`);
+});
+
+test("a declaration is found through a TYPE ANNOTATION and inside a `case` arm", () => {
+  // Two shapes the extractors used to miss entirely, each of which made the
+  // reverse scan blind to a real new bound (threat T4 silently unfired):
+  //   - an annotated TS const (`export const X: number = 5;`)
+  //   - a shell assignment on a `case` arm line (`--idle-days) IDLE_DAYS="$2"; ;;;`)
+  const annotated = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => "export const NEW_STALL_MS: number = 5_000;\n");
+  equal(annotated.declarations.map((d) => d.symbol).join(","), "NEW_STALL_MS");
+  const caseArm = scanDeclarations({ ...SPEC, files: ["x.sh"] }, () => 'case "$1" in\n  --stall-ms) NEW_STALL_HOURS="$2"; shift 2 ;;\nesac\n');
+  equal(caseArm.declarations.map((d) => d.symbol).join(","), "NEW_STALL_HOURS");
+});
+
+test("a `NAME=` inside a quoted string is not a declaration (a log line, a registry string)", () => {
+  // The case-arm rule accepts a name= after any non-identifier char, which also
+  // matched `log "... MAX_AGE_DAYS=$MAX_AGE_DAYS ..."` and the registry's own
+  // `overrides` string literals — fabricated declarations. The quote state is
+  // recomputed from the line start, so it stays line-local.
+  const log = 'log "MODE=$MODE MAX_AGE_DAYS=$MAX_AGE_DAYS STUCK_HOURS=$REAP_STUCK_HOURS"\nMAX_AGE_DAYS="${TASK_SESSION_MAX_AGE_DAYS:-7}"\n';
+  const scan = scanDeclarations({ ...SPEC, families: [...FAMILIES, "AGE"], files: ["x.sh"] }, () => log);
+  equal(
+    scan.declarations.map((d) => d.symbol).join(","),
+    "MAX_AGE_DAYS",
+    "only the real assignment may be seen — the quoted mentions must not be",
+  );
+  const reg = "overrides: ['REAP_IDLE_HOURS=\"$2\"', \"10#${REAP_IDLE_HOURS}\"],\n";
+  equal(
+    scanDeclarations({ ...SPEC, files: ["y.ts"] }, () => reg).declarations.length,
+    0,
+    "a registry `overrides` string literal must not register as a declaration",
+  );
+});
+
+test("a numeric fragment cannot be extended into a different bound (whole-token match)", () => {
+  // A raw `includes()` let the registered `=14` match `=140` and `|| 1_800_000`
+  // match `|| 1_800_000 * 2` — a false PASS on the value direction.
+  ok(carriesValue('IDLE_DAYS=14', "=14"));
+  ok(!carriesValue('IDLE_DAYS=140', "=14"), "=14 must not match =140");
+  ok(!carriesValue('IDLE_DAYS=1400', "=14"));
+  ok(carriesValue('|| 1_800_000)', "|| 1_800_000"));
+  ok(!carriesValue('|| 1_800_000 * 2', "|| 1_800_000"), "a scaled value must not match the unscaled fragment");
+  ok(!carriesValue('|| 1_800_0000', "|| 1_800_000"));
+  // A non-numeric fragment keeps plain-substring semantics.
+  ok(carriesValue('export const X = 21_600_000; // 6h', "= 21_600_000;"));
+  const term: StallTerm = { name: "IDLE_DAYS", owners: ["x.sh"], value: "=14", axis: "retention", guardedBy: "none (test)" };
+  ok(forwardViolations([term], () => "IDLE_DAYS=140\n").length > 0, "the forward check must FIRE on an extended run of digits");
 });
 
 section("reverse violations");
