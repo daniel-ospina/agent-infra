@@ -274,9 +274,9 @@ function write(cwd: string, rel: string, body: string): void {
   mkdirSync(join(abs, ".."), { recursive: true });
   writeFileSync(abs, body);
 }
-function mkRepo(): string {
+function mkRepo(branch = "main"): string {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "vg756-")));
-  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["init", "-q", "-b", branch]);
   git(dir, ["config", "user.email", "t@example.com"]);
   git(dir, ["config", "user.name", "t"]);
   return dir;
@@ -453,8 +453,10 @@ test("#3398 REAL GIT — the base is the INTEGRATION remote; a branch's own upst
   //  (a) `git push -u` records the branch's OWN name in branch.<cur>.merge AND
   //      creates refs/remotes/<remote>/<cur>. Here BOTH exist, so the choice is
   //      observable: OLD code picked refs/remotes/fork/feature (the branch's own
-  //      ref) — the #3398/F1 fail-open, since T then equals HEAD^1 and guard (4)
-  //      can never pass. NEW must pick origin/main.
+  //      ref) — the #3398 defect: T then equals HEAD^1, so guard (4) can never
+  //      pass and subtraction is silently disabled (an OVER-gate: more files
+  //      demanded). The F1 fail-open was the separate push-remote-`main`
+  //      fallback, closed by the same rule but a different direction.
   //  (b) an upstream naming a DIFFERENT branch is a DECLARED base and keeps
   //      winning over the origin/main fallback (pre-existing pin).
   for (const [label, explicitOtherBranch, expected] of [
@@ -493,6 +495,53 @@ test("#3398 REAL GIT — the base is the INTEGRATION remote; a branch's own upst
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+});
+
+test("#3398 REAL GIT — a `master`-default repo keeps its base (the carve-out's master half)", () => {
+  // The carve-out accepts an upstream that names the CURRENT branch only when
+  // that name is `main`/`master`. The `master` half had no fixture at all, so
+  // deleting just `|| upstream === "master"` silently disabled subtraction for
+  // every master-based clone with all suites still green (code-review P2).
+  const dir = mkRepo("master");
+  try {
+    write(dir, "a.ts", "a\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "base"]);
+    const branch = git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+    assert.equal(branch, "master");
+    git(dir, ["update-ref", "refs/remotes/upstream/master", "HEAD"]);
+    git(dir, ["config", `branch.${branch}.remote`, "upstream"]);
+    git(dir, ["config", `branch.${branch}.merge`, "refs/heads/master"]);
+    const base = resolveTrustedBase(dir);
+    assert.notEqual(base, null, "a master-default repo must still resolve its own integration branch");
+    assert.equal(base!.ref, "refs/remotes/upstream/master");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#3398 REAL GIT — with NO origin/main the branch's own upstream is NOT a last-resort base (fail-closed)", () => {
+  // The fix's central claim is that the branch's own upstream is never the base.
+  // The case above only shows "not preferred while origin/main resolves"; a
+  // refactor that appended `refs/remotes/<remote>/<cur>` AFTER origin/main would
+  // silently reintroduce #3398 in any repo whose origin/main is absent and no
+  // existing test would fail (code-review P2). Fail CLOSED: no base ⇒ null ⇒
+  // no subtraction ⇒ the verifier is asked about everything.
+  const dir = mkRepo();
+  try {
+    write(dir, "a.ts", "a\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "base"]);
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    git(dir, ["update-ref", "refs/remotes/fork/feature", "HEAD"]);
+    git(dir, ["config", "branch.feature.remote", "fork"]);
+    git(dir, ["config", "branch.feature.merge", "refs/heads/feature"]);
+    // (no refs/remotes/origin/main at all)
+    assert.equal(resolveTrustedBase(dir), null,
+      "must fail closed — never fall back to refs/remotes/fork/feature");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
