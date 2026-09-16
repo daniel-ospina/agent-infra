@@ -360,8 +360,10 @@ export function isShallowRepository(cwd: string): boolean {
  *  INTEGRATION remote's `origin/main`: the push remote says where content GOES,
  *  not what was already integrated, and trusting its base let a fork's `main`
  *  subtract un-integrated unverified content and silently ALLOW the push
- *  (review F1, fail-open). The base surface is deliberately NOT widened beyond
- *  `origin/main` — a remote's `HEAD` symref is user-settable local state.
+ *  (review F1, fail-open). The base surface is NOT widened RELATIVE TO #755:
+ *  the push command's remote is never consulted as a FALLBACK base, and a
+ *  remote's `HEAD` symref is not used at all (user-settable local state). A
+ *  *declared* upstream naming another branch is still a base, exactly as before.
  *  null when nothing resolves ⇒ no subtraction. */
 export function resolveTrustedBase(cwd: string): { ref: string; oid: string } | null {
   const current = symbolicRefShort(cwd);
