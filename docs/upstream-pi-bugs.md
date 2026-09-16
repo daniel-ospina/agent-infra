@@ -877,15 +877,26 @@ to an idle `pi` and that cadence alone does not produce it — they do **not**
 establish that the frame loop is cheap, because they were never given anything
 large to render.
 
-A second over-read: the null result was measured on a **later, calmer window**
-(`automountd` 7.3%, `opendirectoryd` ≈0) than the window in which the machine
-died. The pre-reboot handoff for the fatal window reports `opendirectoryd`
-**91%** + `automountd` **36%** + a `find` at **54%** ≈ **181% of a core —
-statistically equal to pi's entire 177.5%** (see
-`~/.pi/agent/state/RESTART-HANDOFF-2026-09-16.md` and #1115's own body; those
-figures are **not** from the table above). Excluding the confound for the calmer
-window does not exclude it for the fatal one; those are separate claims on
-separate windows.
+A second over-read, this time in the other direction — and an earlier draft of
+this correction got the sourcing wrong, so the corrected version is given here.
+The 16:55 null result (`automountd` 7.3%, `opendirectoryd` ≈0) is the **only**
+window it is evidence for. Three different epochs are involved and **must not be
+compared as if contemporaneous**:
+
+| window | source | non-pi churn |
+|---|---|---|
+| pre-reboot (fatal) | `~/.pi/agent/state/RESTART-HANDOFF-2026-09-16.md` | `opendirectoryd` **18%** + `automountd` **7%** |
+| 13:35–13:36 EST (~33 min after boot) | #1115's own body | `opendirectoryd` **91%** + `automountd` **36%** + a `find` at **54%** ≈ **181%** |
+| 16:55 EST | this report | `automountd` **7.3%**, `opendirectoryd` ≈0 |
+
+An earlier draft attributed the 91/36/54 row to the *pre-reboot* window and cited
+the handoff for it; the handoff actually records 18%/7%, and 91/36/54 are from
+#1115's own post-boot window. Corrected above. What the three windows support is
+narrower than the draft implied: pi dominates the confound **in the two windows
+where pi was measured**, but non-pi churn was demonstrably large in a third, and
+**no measurement exists for the fatal window's pi share** — so the confound is
+*not uniformly* negligible, and "pi was the ceiling" rests on the two windows
+where pi was sampled, not on the window that killed the machine.
 And because Unix load average counts **blocked** as well as runnable processes,
 the chain "pi CPU → load 15.94 → swap → reboot" is under-supported: with 39
 `pi` processes at 255–670 MB each against 32 GB, **memory pressure** is at least
@@ -989,11 +1000,19 @@ That matters for the recommendation: if the throttled whole-tree frame is a
 **class** characteristic, then finding and re-stating it is not the fix. The
 candidate root causes are pi's **deviations from the class**:
 
-- pi's line diff is computed over the **entire** scrollback every frame, rather
-  than only the changed region;
-- the footer is recomputed every frame (Ink components re-render too, but pi's
-  per-frame footer work is an un-memoised full entry scan);
-- `truncateToVisualLines` is O(whole output) rather than O(tail).
+- the footer is recomputed every frame, and its per-frame work is an un-memoised
+  full entry scan — Ink components re-render too, but Ink's per-frame work per
+  component is what its `maxFps` throttle bounds, whereas pi's footer does an
+  O(entries) walk that no cache skips;
+- `truncateToVisualLines` is O(whole output) rather than O(tail) — Ink has no
+  equivalent whole-string re-wrap in its render path.
+
+*(Note on the diff itself: pi's `previousLines` compare is a whole-scrollback
+line-by-line diff, and that is **not** a deviation — Ink's `incrementalRendering`
+does the same whole-output line compare, and Ink's **default** is a full redraw,
+which is at least as expensive. The two bullets above are the pi-specific ones;
+the diff is a hypothesis, not a deviation, and is covered by the falsifier
+below.)*
 
 So the upstream ask should be framed as "make each frame cheap and bounded",
 not "remove the throttle". The falsifier a maintainer should run first: does an
@@ -1045,9 +1064,12 @@ transcript has not changed — is **not addressed by this report** and is the on
 part agent-infra controls. It is also **not** currently covered by the existing
 substrate, and that was verified rather than assumed:
 
-- `~/.pi/agent/state/stale-stuck.py` correlates burn against transcript
-  idleness but reads only `ps -o command=`, `ps -o etime=` and `ps -o ppid=` —
-  it **never measures CPU**, so it cannot see this failure mode.
+- `~/.pi/agent/state/stale-stuck.py` correlates **apparent activity** — frozen
+  session/task `.jsonl` size deltas, live non-pi tool children, socket byte flow
+  and a `Working`-style screen state — against transcript idleness. It reads only
+  `ps -o command=`, `ps -o etime=` and `ps -o ppid=` and **never measures CPU
+  at all**, so it cannot see this failure mode; it has no burn signal to
+  correlate.
 - The idle reaper (`scripts/pi-reap-idle.sh`, policy in
   `docs/ops/pi-idle-repl-reaper-policy.md`, #469) classifies **purely** by
   transcript idleness (`REAP_IDLE_HOURS`, `REAP_STUCK_HOURS`) and likewise
