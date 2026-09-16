@@ -685,6 +685,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "mirrors pi's own DEFAULT_HTTP_IDLE_TIMEOUT_MS",
   },
   {
+    name: "HTTP_IDLE_TIMEOUT_MS",
+    owners: ["scripts/check-cost-config.sh"],
+    value: "=300000",
+    axis: "hygiene",
+    guardedBy: "tests/cost-config/run.sh exact-value + derived-window pin",
+    note: "the SILENT-HANG ceiling (#1088) — undici's idle timeout, pinned to pi's own 300000 by the #1088 contract; the reverse scan caught this one the moment the branch rebased onto the commit that introduced it",
+  },
+  {
     name: "DEFAULT_LOCK_AGE_MS",
     owners: ["extensions/shared/branch-ownership.mjs"],
     value: "= 10 * 60_000;",

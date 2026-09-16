@@ -479,7 +479,7 @@ test("a term whose guardedBy cites a test file is actually referenced by that te
   const offenders: string[] = [];
   const cache = new Map<string, string>();
   for (const t of STALL_TERM_REGISTRY) {
-    const m = /([A-Za-z0-9_./-]+\.(?:test|spec)\.[a-z]+)/.exec(t.guardedBy);
+    const m = /([A-Za-z0-9_./-]+\.(?:test|spec)\.[a-z]+|[A-Za-z0-9_./-]*tests?\/[A-Za-z0-9_./-]+)/.exec(t.guardedBy);
     if (!m) continue; // NONE, or a free-form attribution with no file to check
     const file = m[1];
     let src = cache.get(file);
