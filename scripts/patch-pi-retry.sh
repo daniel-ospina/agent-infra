@@ -96,6 +96,19 @@ case "$CAP_MS" in
     exit 1 ;;
 esac
 
+# An override is a contract violation AT APPLY TIME (the header says the knob
+# MUST equal RETRY_MAX_BACKOFF_MS in check-cost-config.sh, which pins the
+# DEFAULT). Say so loudly: the guard reads the default, so without this an
+# install patched under an ambient override would carry a different cap while
+# the guard stayed green (#1088 review). The guard now also BLOCKS a differing
+# value in its own environment; this covers the install path, which need not
+# run the guard. No second copy of the default is introduced — this keys off
+# the variable being set at all, which is why it warns even on an equal value.
+if [ -n "${PI_MAX_RETRY_DELAY_MS:-}" ]; then
+  echo "⚠️  PI_MAX_RETRY_DELAY_MS=${CAP_MS} is set — this install will carry an override, not the pinned default." >&2
+  echo "    scripts/check-cost-config.sh pins the DEFAULT and BLOCKS a differing value, so the guard will not certify this install." >&2
+fi
+
 # The cap is frozen here, ONCE, before anything reads it. `--cap` reports this
 # value and the patch interpolates this value; freezing it is what makes those
 # two the SAME by construction. Without this, an assignment placed anywhere

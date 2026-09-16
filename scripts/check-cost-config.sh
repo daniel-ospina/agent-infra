@@ -570,9 +570,23 @@ PYEOF
   done <<< "$listing"
 }
 
+# ── an ambient override must not be able to disagree with the contract ────
+# The cap resolver UNSETS PI_MAX_RETRY_DELAY_MS (it wants the script's
+# DEFAULT), but the patch honours the ambient value at APPLY time and setup.sh
+# passes the operator's environment through. So an exported
+# PI_MAX_RETRY_DELAY_MS=300000 let this guard report a 60000ms window and exit 0
+# while an install made from the same environment carried 300000 — the guard
+# would certify a bound it does not enforce (#1088 review). The knob is
+# documented as "MUST equal RETRY_MAX_BACKOFF_MS", so a differing value is a
+# contract violation wherever it is set: fail closed, override-immune.
+
 echo "== cost-config guard (#341) — deepseek context clamp @${CLAMP} =="
 [ "$OVERRIDE" = "1" ] && echo "   ⛔ COST_CLAMP_OVERRIDE=1 is SET — CLAMP blocks will be SILENCED. Retry/hang-contract (#1088) and settings/compaction blocks are NOT covered by this escape and still exit 1."
 echo ""
+
+if [ -n "${PI_MAX_RETRY_DELAY_MS:-}" ] && [ "${PI_MAX_RETRY_DELAY_MS}" != "$RETRY_MAX_BACKOFF_MS" ]; then
+  block_retry "PI_MAX_RETRY_DELAY_MS=${PI_MAX_RETRY_DELAY_MS} is exported in this environment but the contract cap is ${RETRY_MAX_BACKOFF_MS} — the guard reads the DEFAULT cap, so an install patched from this environment would carry a different cap while this guard reported the pinned one (the knob must equal RETRY_MAX_BACKOFF_MS)"
+fi
 
 check_model_file "$SHIPPED_DIR/models.json" "shipped models.json" models block
 check_model_file "$SHIPPED_DIR/models-store.json" "shipped models-store.json" store warn

@@ -261,17 +261,22 @@ property; this guard is the pattern to copy, not a substitute for it.
 - **Guard classes** (`scripts/check-cost-config.sh`):
   - `models.json` drift (any deepseek-served id > 300K) → **BLOCK (exit 1)**.
   - `settings.json` drift (compaction block: enabled + `reserveTokens` 16384 +
-    `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract:
-    `retry.maxRetries` 7, `httpIdleTimeoutMs` 300000, `retry.baseDelayMs`
-    2000, `retry.provider.timeoutMs` 600000, `retry.provider.maxRetries`
-    absent/0; or a missed `retry.provider.timeoutMs` > `httpIdleTimeoutMs`
+    `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract —
+    the keys are `retry.maxRetries`, `httpIdleTimeoutMs`, `retry.baseDelayMs`,
+    `retry.provider.timeoutMs`, `retry.provider.maxRetries`; **the table in §2
+    is the single source for their values, which are deliberately NOT restated
+    here** — or a missed `retry.provider.timeoutMs` > `httpIdleTimeoutMs`
     ordering; or a DERIVED retry/hang window over its declared ceiling) →
     **BLOCK (exit 1)**. Drift in `scripts/patch-pi-retry.sh`'s backoff cap
-    (`RETRY_MAX_BACKOFF_MS` 60000) — or an unreadable/missing patch script —
-    is **BLOCK (exit 1)** too: the window cannot be computed without it, and a
-    bound that cannot be computed must never read green. A project settings
-    file (`<repo>/.pi/settings.json`) carrying `retry` or `httpIdleTimeoutMs`
-    is **BLOCK (exit 1)** as well (pi merges it OVER the global settings).
+    (`RETRY_MAX_BACKOFF_MS`, pinned in §2) — or an unreadable/missing patch
+    script — is **BLOCK (exit 1)** too: the window cannot be computed without
+    it, and a bound that cannot be computed must never read green. A project
+    settings file (`<repo>/.pi/settings.json`) carrying `retry` or
+    `httpIdleTimeoutMs` is **BLOCK (exit 1)** as well (pi merges it OVER the
+    global settings). An ambient `PI_MAX_RETRY_DELAY_MS` differing from the
+    contract cap is **BLOCK (exit 1)**: the guard reads the DEFAULT cap, so
+    without this the environment could install a different cap while the guard
+    stayed green.
   - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
     deletion of the clamp authority is itself terminal drift (clamp gone while
     CI stays green). Store-class and live-dir-missing (first-install) stay

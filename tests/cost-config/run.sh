@@ -903,6 +903,15 @@ SOURCE_DOC = "docs/ops/cost-config-policy.md"   # §2 is the single source
 # anchor.
 SNAPSHOT_DIRS = ("docs/plans/", "docs/research/", "docs/scoping/")
 
+def _sec2_range(text):
+    """1-based [lo, hi] line range of the `## 2.` section; (0, 0) if absent."""
+    m = re.search(r'^## 2\..*?^(?=## )', text, re.M | re.S)
+    if not m:
+        return (0, 0)
+    lo = text[:m.start()].count("\n") + 1
+    return (lo, lo + m.group(0).count("\n"))
+
+
 bad = []
 for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
     dirnames[:] = [d for d in dirnames if d not in {"node_modules", ".git"}]
@@ -951,8 +960,14 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
         # the first attempt: it still missed a 3-line wrap, and it kept the
         # newline in the join, so `[^\n]`-based patterns could not bridge while
         # `[\s-]`-based ones over-matched across unrelated breaks (#1088 review).
-        if snap or rel == SOURCE_DOC:
+        if snap:
             continue
+        # §2 — and ONLY §2 — is the single-source exemption. A whole-FILE
+        # exemption made the policy doc's own later sections invisible, and §5
+        # ("Guard classes") did restate the contract values there, so they could
+        # drift while both this pin and test 19 (which reads §2 only) stayed
+        # green (#1088 review).
+        s2_lo, s2_hi = _sec2_range("".join(_lines)) if rel == SOURCE_DOC else (0, 0)
         para, para_ln = [], 0
         for _i, _l in enumerate(_lines + [""], 1):
             if _l.strip():
@@ -961,6 +976,9 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
                 para.append(_l.rstrip("\n"))
                 continue
             if not para:
+                continue
+            if s2_lo <= para_ln <= s2_hi:
+                para = []
                 continue
             text = " ".join(para)
             para = []
@@ -978,7 +996,7 @@ if bad:
     print("❌ " + "\n❌ ".join(bad))
     sys.exit(1)
 print(f"OK no stale retry/hang numbers (idle={IDLE}, per-call={PROV}, cap={CAP}); derived durations "
-      f"single-sourced in §2, absent from every other current-state doc "
+      f"single-sourced in the policy doc's §2, absent from every other current-state doc "
       f"(banned {len(BANNED_RE)} derived figures/forms)")
 PY
 if [ $? -eq 0 ]; then pass "$(cat "$OUT")"; else fail "stale retry/hang number in a doc: $(cat "$OUT")"; fi
@@ -1132,6 +1150,37 @@ if [ "$(env -u PI_MAX_RETRY_DELAY_MS bash "$ROOT/scripts/patch-pi-retry.sh" --ca
   pass "--cap ignores an ambient PI_MAX_RETRY_DELAY_MS (the guard unsets it)"
 else
   fail "--cap picked up an ambient PI_MAX_RETRY_DELAY_MS (the guard unsets it for the call)"
+fi
+# ...and the guard must not CERTIFY an environment that would install a
+# different cap: it reads the DEFAULT, so an exported override that disagrees
+# with the contract cap is a block (override-immune).
+PI_MAX_RETRY_DELAY_MS=300000 bash "$ROOT/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ] && grep -q 'PI_MAX_RETRY_DELAY_MS=300000 is exported' "$OUT"; then
+  pass "an exported override differing from the contract cap → exit 1 (cannot certify it)"
+else
+  fail "expected exit 1 + the ambient-override block, got $code"; sed -n '1,30p' "$OUT"
+fi
+PI_MAX_RETRY_DELAY_MS=300000 COST_CLAMP_OVERRIDE=1 bash "$ROOT/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ] && grep -q 'does NOT cover' "$OUT"; then
+  pass "...and COST_CLAMP_OVERRIDE=1 does not silence it"
+else
+  fail "expected exit 1 under the clamp override, got $code"; sed -n '1,30p' "$OUT"
+fi
+PI_MAX_RETRY_DELAY_MS="$CAP_GUARD" bash "$ROOT/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then
+  pass "an override EQUAL to the contract cap → exit 0 (no false block)"
+else
+  fail "expected exit 0 when the override equals the cap, got $code"; sed -n '1,30p' "$OUT"
+fi
+# ...and the patcher says so loudly at APPLY time too.
+PI_MAX_RETRY_DELAY_MS=300000 bash "$ROOT/scripts/patch-pi-retry.sh" --cap >"$OUT" 2>&1
+if grep -q 'is set — this install will carry an override' "$OUT"; then
+  pass "the patcher warns when an override would decide the applied cap"
+else
+  fail "expected the override warning from the patcher"; sed -n '1,20p' "$OUT"
 fi
 # The guard EXECUTES this script, so `--cap` must sit before pi discovery and
 # before every write. Nothing else pins that order: a later move of the branch
