@@ -56,6 +56,16 @@
 #   ephemeral pre-delete     A16  (the allowlisted-ephemeral `rm` runs under
 #                                REAP_WT_REMOVE_TIMEOUT => a hang is
 #                                REMOVE-FAILED + exit 4, never a silent pass)
+#   prune watchdog           A17  (`git worktree prune` — the ACTUAL removal for
+#                                a `prunable` row — runs under
+#                                REAP_WT_REMOVE_TIMEOUT => a hang is PRUNE-FAIL
+#                                + exit 4 and the record is left registered)
+#   dangling branch ref      A18  (a force-deleted branch ref is still printed by
+#                                `worktree list`; the ref is VERIFIED before it
+#                                is reported as a survival mechanism)
+#   origin-slug probe failed A19  (a failing `remote get-url` must NOT read as
+#                                "no GitHub remote" — that silently disabled
+#                                the open-PR veto; unverifiable => exit 3)
 
 set -uo pipefail
 
@@ -141,6 +151,30 @@ cat >"$T/bin/rm-slow" <<'SHIM'
 sleep "${FAKE_RM_SLEEP:-3}"
 exec "${REAL_RM_BIN:-rm}" "$@"
 SHIM
+cat >"$T/bin/git-fail-remote" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A19: makes the `remote get-url` probe UNVERIFIABLE when it
+# would have succeeded, while passing git's OWN rc through when origin genuinely
+# does not exist (rc=2) — so one shim drives both arms of the decidable/undecidable
+# branch. Pre-fix, the undecidable arm read as "no GitHub remote" and silently
+# disabled the open-PR veto for the whole pass.
+case " $* " in
+    *" remote get-url "*)
+        "${REAL_GIT_BIN:-git}" "$@" >/dev/null 2>&1
+        rc=$?
+        [ "$rc" = 0 ] && exit 1   # origin exists => simulate a broken probe
+        exit "$rc"                # absent origin => the decidable rc=2
+        ;;
+esac
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+cat >"$T/bin/git-slow-prune" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A17: slows ONLY `worktree prune`, which is the actual
+# removal for a `prunable` row and runs after the classification loop.
+for a in "$@"; do [ "$a" = "prune" ] && { sleep "${FAKE_PRUNE_SLEEP:-3}"; break; }; done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
 cat >"$T/bin/git-slow-status" <<'SHIM'
 #!/usr/bin/env bash
 # GIT_BIN shim: slows ONLY `status`, so the per-probe watchdog is testable.
@@ -186,8 +220,8 @@ esac
 exec "$REAL_GIT_BIN" "$@"
 SHIM
 chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh" \
-         "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-status" \
-         "$T/bin/git-veryslow-status" \
+         "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-prune" "$T/bin/git-slow-status" \
+         "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove"
 
 # ── fixture builders ───────────────────────────────────────────────────
@@ -245,6 +279,7 @@ run_reaper() {
     REAP_WT_CWD_TIMEOUT="${REAP_WT_CWD_TIMEOUT:-5}" \
     REAP_WT_GH_TIMEOUT="${REAP_WT_GH_TIMEOUT:-20}" \
     REAP_WT_REMOVE_TIMEOUT="${REAP_WT_REMOVE_TIMEOUT:-120}" \
+    REAP_WT_GIT_TIMEOUT="${REAP_WT_GIT_TIMEOUT:-20}" \
     REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}" \
     PS_BIN="${PS_BIN_OVERRIDE:-$T/bin/ps}" \
     LSOF_BIN="${LSOF_BIN_OVERRIDE:-$T/bin/lsof}" \
@@ -715,6 +750,99 @@ assert_eq "$RC" "0" "A16b with a normal rm the same worktree is reclaimed"
 assert_nodir "$WT_SLOWRM" "A16b the ephemeral-only worktree is gone"
 assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/a16-slowrm | wc -l | tr -d ' ')" "1" \
     "A16b the branch ref survives"
+
+# ── A17: `git worktree prune` runs under the removal watchdog ─────────
+# For a `prunable` row the prune IS the removal, and it runs AFTER the loop —
+# i.e. beyond the pass budget's reach. It must therefore carry its own watchdog:
+# a hang there would wedge a pass that had already finished classifying, holding
+# the lock until it goes stale 30 min later.
+ENV=A17; REPO="$(mk_repo $ENV)"
+WT_PGONE="$(add_named_wt "$REPO" "$ENV-pgone" feat/a17-pgone)"
+rm -rf "$WT_PGONE"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-slow-prune" FAKE_PRUNE_SLEEP=3 REAP_WT_REMOVE_TIMEOUT=1 \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT_PGONE")" "reason=prunable" \
+    "A17 the gone-dir record is classified prunable before the prune"
+assert_eq "$RC" "4" "A17 a prune timeout => exit 4, never a bare success"
+assert_contains "$(footer $ENV)" "FAILED=1" "A17 footer FAILED=1 (the prune is counted as failed)"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A17 a timed-out prune is never counted as removed"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNE-FAIL" "A17 the prune failure is logged"
+assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_PGONE" \
+    "A17 the admin record is still registered (nothing was pruned)"
+
+# ── A18: a force-deleted branch ref is not a survival mechanism ────────
+# `git worktree list --porcelain` KEEPS emitting `branch refs/heads/X` after X is
+# force-deleted (with HEAD 0000…0), so the label alone is not proof the commits
+# survive. Trusting it reported `refs=branch-retained:X` for a ref that does not
+# exist — a false survival mechanism on the one gate whose failure is
+# unrecoverable. The ref is now resolved before it is reported.
+ENV=A18; REPO="$(mk_repo $ENV)"
+WT_DANGLE="$(add_named_wt "$REPO" "$ENV-dangle" feat/a18-dangle)"
+"$REAL_GIT" -C "$REPO" update-ref -d refs/heads/feat/a18-dangle
+assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "branch refs/heads/feat/a18-dangle" \
+    "A18 precondition: git still LABELS the worktree with the deleted branch"
+# Directory present: whichever gate fires first (dirty on this git version — an
+# unborn HEAD makes the index look fully staged), the outcome must be PRESERVE
+# and the dead ref must never be named as what keeps the commits alive.
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_absent "$(row_for "$OUT" "$WT_DANGLE")" "branch-retained" \
+    "A18a a ref that does not resolve is NOT reported as a survival mechanism"
+assert_contains "$(row_for "$OUT" "$WT_DANGLE")" "preserve" \
+    "A18a the worktree is preserved"
+# Gone directory: this is where the false survival mechanism actually bit. The
+# clean and aged gates are skipped by design on this path, so `branch-retained`
+# on a dead ref reached `remove/reason=prunable` and the end-of-pass prune
+# deregistered the admin record — the LAST handle on that HEAD commit.
+ENV=A18g; REPO="$(mk_repo $ENV)"
+WT_DGONE="$(add_named_wt "$REPO" "$ENV-dgone" feat/a18-dgone)"
+"$REAL_GIT" -C "$REPO" update-ref -d refs/heads/feat/a18-dgone
+rm -rf "$WT_DGONE"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_absent "$(row_for "$OUT" "$WT_DGONE")" "branch-retained" \
+    "A18b a gone checkout whose branch ref does not resolve is NOT branch-retained"
+assert_contains "$(row_for "$OUT" "$WT_DGONE")" "reason=detached-unreachable" \
+    "A18b it is preserved as detached-unreachable (nothing holds that HEAD)"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A18b --apply exits 0 (a preserve, not a failure)"
+assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_DGONE" \
+    "A18b --apply did NOT prune the record — it is the last handle on that HEAD"
+
+# ── A19: an unverifiable origin-slug probe must not read as "no remote" ──
+# `pr_head_refs_load` used to discard the exit status of `git remote get-url
+# origin` and treat an empty URL as "no GitHub remote", which sets
+# PR_APPLICABLE=0 and skips the open-PR veto ENTIRELY — a gate defeated by
+# making its probe unverifiable (the same class as an empty `ps` table).
+# `git remote get-url origin` exits 2 when origin genuinely does not exist, and
+# 0 with a URL otherwise; ONLY those two are decidable. This case uses a repo
+# WITH a GitHub origin, so a healthy probe would run `gh` and veto the branch.
+ENV=A19; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+WT_A19="$(add_named_wt "$REPO" "$ENV-p" feat/a19-p)"
+# control: the same fixture with a healthy git probe vetoes the branch
+FAKE_GH_REFS="feat/a19-p" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A19")" "reason=open-pr" \
+    "A19 control: a healthy origin probe reaches the open-PR veto"
+FAKE_GH_REFS="feat/a19-p" OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote" \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "A19 a failing origin probe => exit 3 (never 'the PR gate is N/A')"
+assert_contains "$OUT" "gh unavailable" "A19 the abort names the unverifiable open-PR gate"
+assert_absent "$OUT" "reason=reclaimable" \
+    "A19 the open-PR candidate is NOT classified reclaimable on a broken probe"
+FAKE_GH_REFS="feat/a19-p" OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "A19 armed: still exit 3"
+assert_dir "$WT_A19" "A19 armed abort removed nothing"
+assert_contains "$(cat "$T/$ENV/reap.log")" "GH slug probe failed" \
+    "A19 the failing probe is logged with its rc"
+# and a genuinely absent origin is still N/A (exit 0), never a false abort —
+# the SAME shim passes git's own rc=2 through here, so this pins the other arm
+# of the new branch (rc=2 decidable / everything else fail-closed).
+ENV=A19b; REPO="$(mk_repo $ENV)"
+WT_A19B="$(add_named_wt "$REPO" "$ENV-na" feat/a19b-na)"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote" run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "A19b no origin at all => still N/A (rc=2 path is decidable)"
+assert_contains "$(row_for "$OUT" "$WT_A19B")" "reason=reclaimable" \
+    "A19b a repo with no origin still reclaims"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

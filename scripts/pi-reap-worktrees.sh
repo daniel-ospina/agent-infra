@@ -54,13 +54,20 @@
 #     (`.venv/`, `node_modules/`) collapses to ONE entry — git never recurses
 #     into it (verified: 60 files under an ignored node_modules = one line)
 #   * EVERY subprocess that can block runs under a watchdog (list / status /
-#     ps / lsof / gh / rm / git worktree remove) — no GNU `timeout` needed on
-#     macOS. `rm` is in that list because the allowlisted-ephemeral pre-delete
+#     ps / lsof / gh / rm / git worktree remove / git worktree prune /
+#     merge-base / for-each-ref / log / symbolic-ref / rev-parse / remote
+#     get-url) — no GNU `timeout` needed on macOS.
+#     The three PROPERTY PROBES per record (merge-base, for-each-ref, log) are
+#     in that list deliberately: the global budget is only checked BETWEEN
+#     records, so an unwatched probe that hangs inside one record hung the whole
+#     pass — the exact failure this tool exists to prevent. Each takes the
+#     preserving arm on a timeout, so failure is fail-closed, never a pass.
+#     `prune` is in the list because it is the ACTUAL removal for every
+#     `prunable` row and runs after the loop, i.e. outside the budget's reach.
+#     `rm` is in that list because the allowlisted-ephemeral pre-delete
 #     (remove_one) is a recursive filesystem delete over a checkout the operator
 #     does not control: a huge or NFS-locked `.venv` can block it exactly as it
-#     can block `git worktree remove`. It is the LAST fork on the removal path
-#     and it runs under REAP_WT_REMOVE_TIMEOUT, so the script has no unbounded
-#     subprocess anywhere.
+#     can block `git worktree remove`, and it is the LAST fork on that path.
 #   * a GLOBAL wall-clock budget (REAP_WT_BUDGET_SECONDS, 300) bounds the
 #     per-worktree work (classification AND removal); unprocessed worktrees are
 #     reported `deferred` and preserved. The budget deliberately does NOT start
@@ -124,6 +131,7 @@
 #   REAP_WT_AGED_DAYS REAP_WT_MAX_DAYS REAP_WT_MAIN_REF REAP_WT_NOW_EPOCH
 #   REAP_WT_LIST_TIMEOUT REAP_WT_STATUS_TIMEOUT REAP_WT_PS_TIMEOUT
 #   REAP_WT_CWD_TIMEOUT REAP_WT_GH_TIMEOUT REAP_WT_REMOVE_TIMEOUT
+#   REAP_WT_GIT_TIMEOUT
 #   REAP_WT_BUDGET_SECONDS REAP_WT_STATE_DIR REAP_WT_LOCK_STALE_SECONDS
 #   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT
 # Exit codes: 0 pass completed with nothing failed, 2 usage, 3 fail-closed
@@ -153,6 +161,10 @@ REAP_WT_PS_TIMEOUT="${REAP_WT_PS_TIMEOUT:-20}"
 REAP_WT_CWD_TIMEOUT="${REAP_WT_CWD_TIMEOUT:-5}"
 REAP_WT_GH_TIMEOUT="${REAP_WT_GH_TIMEOUT:-20}"
 REAP_WT_REMOVE_TIMEOUT="${REAP_WT_REMOVE_TIMEOUT:-120}"
+# Every PROPERTY probe (merge-base / for-each-ref / log / symbolic-ref /
+# rev-parse) runs under this: they read the ref store and the commit graph,
+# which on a healthy repo are milliseconds and on a hung mount are forever.
+REAP_WT_GIT_TIMEOUT="${REAP_WT_GIT_TIMEOUT:-20}"
 REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}"
 REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}"
 REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT:-1000}"
@@ -181,6 +193,7 @@ SELF_CWD_CANON=""
 SELF_PIDS=""
 PS_OUT=""
 CWD_OUT=""
+GIT_OUT=""
 CWD_DEGRADED=0
 REMOVED=0
 FAILED=0
@@ -445,14 +458,18 @@ wt_list_load() {
 resolve_main_ref() {
     local r
     if [ -n "$MAIN_REF_OVERRIDE" ]; then printf '%s\n' "$MAIN_REF_OVERRIDE"; return 0; fi
-    r="$("$GIT_BIN" -C "$REPO_CANON" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)"
-    if [ -n "$r" ] && "$GIT_BIN" -C "$REPO_CANON" rev-parse --verify -q "$r" >/dev/null 2>&1; then
-        printf '%s\n' "$r"; return 0
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" symbolic-ref -q refs/remotes/origin/HEAD
+    r="$(head -1 "$GIT_OUT" 2>/dev/null)"
+    if [ -n "$r" ]; then
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" rev-parse --verify -q "$r"
+        [ $? = 0 ] && { printf '%s\n' "$r"; return 0; }
     fi
     for r in refs/remotes/origin/main refs/heads/main refs/remotes/origin/master refs/heads/master; do
-        if "$GIT_BIN" -C "$REPO_CANON" rev-parse --verify -q "$r" >/dev/null 2>&1; then
-            printf '%s\n' "$r"; return 0
-        fi
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" rev-parse --verify -q "$r"
+        [ $? = 0 ] && { printf '%s\n' "$r"; return 0; }
     done
     printf ''
 }
@@ -634,11 +651,28 @@ github_slug() {
     esac
 }
 pr_head_refs_load() {
-    local slug="" out rc
+    local slug="" out rc url_rc
     if [ -n "$REAP_WT_REPO_SLUG" ]; then
         slug="$REAP_WT_REPO_SLUG"
     else
-        slug="$(github_slug "$("$GIT_BIN" -C "$REPO_CANON" remote get-url origin 2>/dev/null)")"
+        # The probe's EXIT STATUS decides — reading an empty URL as "no GitHub
+        # remote" is fail-OPEN: it silently disables the open-PR veto for the
+        # whole pass, which is the same class as reading an empty `ps` table as
+        # "no live processes". `git remote get-url origin` exits 2 when origin
+        # does not exist, and 0 with a URL otherwise; ONLY those two are
+        # decidable. Anything else (probe failure, timeout 124) means the gate
+        # cannot be evaluated => fail closed, exactly like `gh` being
+        # unavailable. A rc=0 URL that is not github.com still, correctly,
+        # yields no slug => the PR gate is genuinely N/A.
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" remote get-url origin
+        url_rc=$?
+        if [ "$url_rc" != 0 ] && [ "$url_rc" != 2 ]; then
+            PR_APPLICABLE=1; GH_OK=0; GH_STATE="unavailable"
+            log "GH slug probe failed (rc=$url_rc) for $REPO_CANON — fail-closed (origin cannot be resolved)"
+            return 1
+        fi
+        slug="$(github_slug "$(head -1 "$GIT_OUT" 2>/dev/null)")"
     fi
     case "$slug" in
         */*) ;;
@@ -667,19 +701,46 @@ pr_head_refs_load() {
 # the admin record's HEAD is itself the last ref holding a detached commit, so
 # pruning it can orphan that commit (verified).
 commits_survive() {
-    local sha="$1" branch="$2" merged=0 containing=""
-    if [ -n "$MAIN_REF" ] && [ -n "$sha" ] && \
-       "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$MAIN_REF" >/dev/null 2>&1; then
-        merged=1
+    local sha="$1" branch="$2" merged=0 containing="" rc=0
+    if [ -n "$MAIN_REF" ] && [ -n "$sha" ]; then
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$MAIN_REF"
+        rc=$?
+        [ "$rc" = 0 ] && merged=1
+        # ANY other outcome (1 = not an ancestor, 124 = timeout, 128 = unknown
+        # object) leaves merged=0 and the arms below decide. Nothing here can
+        # turn an unverifiable merge into a removal on its own.
     fi
-    if [ "$branch" = "-" ]; then
-        if [ "$merged" = 1 ]; then printf 'merged\n'; return 0; fi
-        containing="$("$GIT_BIN" -C "$REPO_CANON" for-each-ref --contains="$sha" --count=1 \
-            --format='%(refname)' 2>/dev/null | head -1)"
-        if [ -z "$containing" ]; then printf ''; return 0; fi
-        printf 'reachable-from:%s\n' "$containing"; return 0
+    if [ "$merged" = 1 ]; then printf 'merged\n'; return 0; fi
+
+    if [ "$branch" != "-" ]; then
+        # A named branch is a survival mechanism ONLY when the ref RESOLVES.
+        # `git worktree list --porcelain` keeps emitting `branch refs/heads/X`
+        # after X is force-deleted (with HEAD 0000…0), so the label is not proof
+        # — trusting it reports a survival mechanism that does not exist.
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" rev-parse --verify -q "$branch"
+        rc=$?
+        if [ "$rc" = 0 ]; then
+            printf 'branch-retained:%s\n' "${branch#refs/heads/}"
+            return 0
+        fi
+        # 124 = could not verify => preserve. Otherwise the ref is GONE, so the
+        # label lied and the commit must be held by some OTHER ref (below) or it
+        # is orphaned.
+        [ "$rc" = 124 ] && { printf ''; return 0; }
     fi
-    if [ "$merged" = 1 ]; then printf 'merged\n'; else printf 'branch-retained:%s\n' "${branch#refs/heads/}"; fi
+
+    # Detached HEAD — or a named branch whose ref no longer resolves.
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
+        for-each-ref --contains="$sha" --count=1 --format='%(refname)'
+    # A failure here (incl. 129 for a zero/unknown sha) is "cannot establish",
+    # which is a PRESERVE, never a pass.
+    [ $? = 0 ] || { printf ''; return 0; }
+    containing="$(head -1 "$GIT_OUT" 2>/dev/null)"
+    if [ -z "$containing" ]; then printf ''; return 0; fi
+    printf 'reachable-from:%s\n' "$containing"
+    return 0
 }
 
 # ── classification ─────────────────────────────────────────────────────
@@ -756,7 +817,15 @@ classify_one() {
     fi
 
     local head_ts
-    head_ts="$("$GIT_BIN" -C "$REPO_CANON" log -1 --format=%ct "$sha" 2>/dev/null)"
+    # A hung commit-graph read must not wedge the pass: the budget is only
+    # checked between records, so this probe is watchdosed and a failure is
+    # `unreadable-head` (PRESERVE).
+    if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" log -1 --format=%ct "$sha"; then
+        printf 'preserve\tunreadable-head\t\tcannot date HEAD %s (probe failed or timed out)\n' "${sha:-?}"
+        return 0
+    fi
+    head_ts="$(head -1 "$GIT_OUT" 2>/dev/null)"
     case "$head_ts" in
         ''|*[!0-9]*) printf 'preserve\tunreadable-head\t\tcannot date HEAD %s\n' "${sha:-?}"; return 0 ;;
     esac
@@ -860,7 +929,7 @@ run() {
     # it owns the probe scratch dir, the watchdog timers, the probe output files
     # and the lock. Installing it later (as it was) leaked the scratch dir on
     # every early fail-closed exit.
-    trap 'watchdogs_reap; bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT"; lock_release' EXIT
+    trap 'watchdogs_reap; bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT"; lock_release' EXIT
     if [ "$MODE" = unknown ]; then
         if [ "$REAP_WT_DRY_RUN" = "0" ]; then MODE=apply; else MODE=dry-run; fi
     fi
@@ -873,6 +942,7 @@ run() {
     for v in REAP_WT_AGED_DAYS:"$REAP_WT_AGED_DAYS" REAP_WT_LIST_TIMEOUT:"$REAP_WT_LIST_TIMEOUT" \
              REAP_WT_STATUS_TIMEOUT:"$REAP_WT_STATUS_TIMEOUT" REAP_WT_PS_TIMEOUT:"$REAP_WT_PS_TIMEOUT" \
              REAP_WT_CWD_TIMEOUT:"$REAP_WT_CWD_TIMEOUT" REAP_WT_GH_TIMEOUT:"$REAP_WT_GH_TIMEOUT" \
+             REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_GIT_TIMEOUT:"$REAP_WT_GIT_TIMEOUT" \
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_BUDGET_SECONDS:"$REAP_WT_BUDGET_SECONDS" \
              REAP_WT_LOCK_STALE_SECONDS:"$REAP_WT_LOCK_STALE_SECONDS" REAP_WT_PR_LIMIT:"$REAP_WT_PR_LIMIT" \
              REAP_WT_MAX_DAYS:"$REAP_WT_MAX_DAYS"; do
@@ -881,11 +951,24 @@ run() {
     awk -v a="$REAP_WT_AGED_DAYS" -v m="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(a >= 0 && a <= m)}' \
         || { echo "bad --aged-days: out of range (0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
 
+    # ONE reusable scratch file for every bounded git probe in the pass. The
+    # property probes run PER WORKTREE, so a per-call mktemp would add forks to
+    # the tool that exists to unload the host; a single file is truncated by
+    # each run_bounded call and is owned by the EXIT trap.
+    GIT_OUT="$(mktemp "${TMPDIR:-/tmp}/pi-reap-git.XXXXXX")" || GIT_OUT=""
+    if [ -z "$GIT_OUT" ]; then
+        echo "FAIL-CLOSED abort: cannot create the probe scratch file (exit 3)" >&2
+        exit 3
+    fi
+
     REPO="${REPO:-$PWD}"
     REPO_CANON="$(canonicalize "$REPO")"
     [ -n "$REPO_CANON" ] || { echo "not a directory: $REPO" >&2; exit 2; }
     local common
-    common="$("$GIT_BIN" -C "$REPO_CANON" rev-parse --git-common-dir 2>/dev/null)"
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" rev-parse --git-common-dir
+    [ $? = 0 ] || { echo "not a git repository: $REPO_CANON" >&2; exit 2; }
+    common="$(head -1 "$GIT_OUT" 2>/dev/null)"
     [ -n "$common" ] || { echo "not a git repository: $REPO_CANON" >&2; exit 2; }
     case "$common" in
         /*) : ;;
@@ -939,7 +1022,7 @@ run() {
     done <<<"$WT_LIST"
     if [ "$need_pr" = 1 ]; then
         if ! pr_head_refs_load; then
-            echo "FAIL-CLOSED abort: gh unavailable — cannot verify the open-PR gate (exit 3)" >&2
+            echo "FAIL-CLOSED abort: gh unavailable or the origin-remote probe failed — cannot verify the open-PR gate (exit 3)" >&2
             echo "   set REAP_WT_REPO_SLUG, install/auth gh, or run against a repo with no GitHub remote" >&2
             log "FAIL-CLOSED abort: gh unavailable with candidates (exit 3)"
             print_footer "$now"
@@ -1043,10 +1126,13 @@ run() {
             say "    preserve — could also be prunable and a global prune has no path filter."
             say "    Nothing was lost: those records are re-classified on the next pass."
             log "PRUNE-SKIPPED wanted=$PRUNE_WANTED (a deferred or preserved record may be prunable)"
-        elif "$GIT_BIN" -C "$REPO_CANON" worktree prune >/dev/null 2>&1; then
+        elif run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" worktree prune; then
             REMOVED=$((REMOVED + PRUNE_WANTED))
             log "PRUNED $PRUNE_WANTED gone-checkout record(s)"
         else
+            # The prune is the ACTUAL removal for a `prunable` row, so it is
+            # watchdosed like every other removal: a hang here must not wedge a
+            # pass that has already finished classifying.
             FAILED=$((FAILED + PRUNE_WANTED))
             log "PRUNE-FAIL (gone-checkout records left registered)"
         fi
