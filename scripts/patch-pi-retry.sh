@@ -41,6 +41,7 @@
 #   patch-pi-retry.sh               patch + verify (idempotent)
 #   patch-pi-retry.sh --check       verify-only; exit 1 if unpatched
 #   patch-pi-retry.sh --paths       print the resolved pi package paths
+#   patch-pi-retry.sh --cap         print the resolved backoff cap in ms (no side effects)
 #
 # Env overrides:
 #   PI_NODE_ROOT    pi-node install root (default: $HOME/.local/share/pi-node)
@@ -94,6 +95,24 @@ case "$CAP_MS" in
     echo "❌ PI_MAX_RETRY_DELAY_MS must be a plain integer (got '$CAP_MS') — refusing to patch." >&2
     exit 1 ;;
 esac
+
+# ── --cap: print the RESOLVED cap and exit ───────────────────────────────
+# The cost-config guard calls this instead of re-parsing the assignment text
+# below. A static parse cannot bound the ways a shell assigns a variable —
+# `declare`/`local`/`eval`/`printf -v`, or a second assignment chained with `;`
+# on the same line, were all invisible to a line-anchored regex, so the guard
+# went green while this script applied a DIFFERENT cap (#1088 review). Asking
+# the shell for the value removes the whole class: this prints the exact
+# variable interpolated into the patched dist lines.
+#
+# Side-effect free and dependency-free by construction: it runs BEFORE pi
+# discovery, before the oracle-reprobe precondition, and before any file write,
+# so it works in CI where no pi install exists. The guard unsets
+# PI_MAX_RETRY_DELAY_MS for this call, so it reads the script's DEFAULT cap.
+if [ "${1:-}" = "--cap" ]; then
+  printf '%s\n' "$CAP_MS"
+  exit 0
+fi
 
 # ── discover the installed pi package (node-versioned global install) ────
 # Prefer the ACTIVE binary: resolve `pi` to its real file (symlink-safe),

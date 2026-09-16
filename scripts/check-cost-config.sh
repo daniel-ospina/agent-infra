@@ -187,6 +187,34 @@ sys.exit(1 if viol else 0)
 PYEOF
 }
 
+# ── resolve the patch's backoff cap by ASKING the patch script ───────────
+# The cap is interpolated into the pi dist patch, so `patch-pi-retry.sh` owns
+# it; the guard reads it back rather than duplicating it. It is read by
+# EXECUTION (`--cap` prints the resolved $CAP_MS), never by parsing the
+# assignment text. A static parse cannot bound the ways a shell assigns a
+# variable: `declare`/`local`/`eval`/`printf -v`, or a second assignment
+# chained with `;` on the same line, were all invisible to a line-anchored
+# regex — the guard then read 60000, exited 0, and reported a 60000ms window
+# while the script applied 300000 (#1088 review). Those shapes are why the
+# value is now obtained from the shell that will use it.
+#
+# PI_MAX_RETRY_DELAY_MS is UNSET for the call so this reads the script's
+# DEFAULT cap (the contract value), not an ambient override. A missing script,
+# a non-zero exit, or a non-integer/hollow answer all leave the window
+# underivable and fail CLOSED below.
+PATCH_CAP_RESOLVED=""
+PATCH_CAP_WHY=""
+_cap_out="$(env -u PI_MAX_RETRY_DELAY_MS bash "$PATCH_SCRIPT" --cap 2>/dev/null)" || \
+  PATCH_CAP_WHY="patch-pi-retry.sh --cap exited non-zero"
+case "$_cap_out" in
+  '')
+    [ -n "$PATCH_CAP_WHY" ] || PATCH_CAP_WHY="patch-pi-retry.sh --cap printed nothing" ;;
+  *[!0-9]*)
+    PATCH_CAP_WHY="patch-pi-retry.sh --cap did not print a plain integer (got '$_cap_out')" ;;
+  *)
+    PATCH_CAP_RESOLVED="$_cap_out" ;;
+esac
+
 # settings_violations <settings-file> <patch-script> — compaction block
 # (enabled must be TRUE, plus reserveTokens/keepRecentTokens) + the bounded
 # retry/hang contract (#1088), over the PARSED JSON tree. Emits one issue line
@@ -197,10 +225,14 @@ PYEOF
 settings_violations() {
   python3 - "$1" "$2" "$HTTP_IDLE_TIMEOUT_MS" "$RETRY_MAX_RETRIES" \
     "$RETRY_BASE_DELAY_MS" "$RETRY_MAX_BACKOFF_MS" "$RETRY_PROVIDER_TIMEOUT_MS" \
-    "$HANG_WINDOW_CEILING_MS" "$WORST_WINDOW_CEILING_MS" <<'PYEOF'
+    "$HANG_WINDOW_CEILING_MS" "$WORST_WINDOW_CEILING_MS" \
+    "$PATCH_CAP_RESOLVED" "$PATCH_CAP_WHY" <<'PYEOF'
 import json, re, sys
 
 path, patch_path = sys.argv[1], sys.argv[2]
+# The cap, RESOLVED by the shell that owns it (the resolver above) — never
+# parsed out of the assignment text. argv[10] = value or "", argv[11] = why.
+CAP_RESOLVED, CAP_WHY = sys.argv[10], sys.argv[11]
 (IDLE_EXPECTED, MR_EXPECTED, BASE_EXPECTED, CAP_EXPECTED,
  PROVIDER_EXPECTED, HANG_CEILING, WORST_CEILING) = map(int, sys.argv[3:10])
 
@@ -265,41 +297,14 @@ if ptimeout != PROVIDER_EXPECTED:
 if pmr not in (None, 0):
     retry_issues.append(f"retry.provider.maxRetries must be absent or 0 (it multiplies calls per attempt), got {q(pmr)}")
 
-# The backoff cap lives in patch-pi-retry.sh (it is interpolated into the pi
-# dist patch). Read it BACK rather than duplicating it; unreadable = fail
-# closed, because the hang window cannot be computed without it.
-#
-# The cap must be a SINGLE pinned top-level assignment, and that is asserted —
-# the value is NOT inferred from textual order. Textual order is not execution
-# order: taking the LAST regex match (the previous shape) let an UNCONDITIONAL
-# second assignment (`CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"` followed by
-# `CAP_MS=300000`), or a match sitting in a never-taken branch, make the guard
-# read 60000 while the script applied 300000 — a reproduced fail-open that
-# defeated the very "cap != guard → BLOCK" pin this contract is built on
-# (#1088 review). A cap the guard cannot SEE as the only one is unassertable,
-# so it fails closed. Anchored to a real assignment at line start: an unanchored
-# search is shadowed by comment prose of the same shape (#1088 coverage review).
-patch_cap = None
-patch_cap_why = ""
-try:
-    with open(patch_path) as f:
-        _src = f.read()
-    _assigned = re.findall(r'(?m)^\s*(?:export\s+)?CAP_MS=', _src)
-    _caps = re.findall(r'(?m)^\s*CAP_MS="\$\{PI_MAX_RETRY_DELAY_MS:-([0-9]+)\}', _src)
-    if len(_assigned) != 1:
-        patch_cap_why = (f"{len(_assigned)} CAP_MS assignments in the file — the effective cap "
-                         "cannot be read from textual order (a later assignment or a "
-                         "never-taken branch can override the pinned one)")
-    elif len(_caps) != 1:
-        patch_cap_why = ('the single CAP_MS assignment is not the pinned '
-                         'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-<ms>}" form')
-    else:
-        patch_cap = int(_caps[0])
-except Exception as e:
-    patch_cap_why = str(e)
+# The cap arrives already resolved (see the resolver above): the shell ran
+# `patch-pi-retry.sh --cap` and passed the answer in. Nothing here re-parses the
+# script — a static parse could not see every assignment form and let the guard
+# report a cap the script did not apply (#1088 review).
+patch_cap = int(CAP_RESOLVED) if CAP_RESOLVED.isdigit() else None
 if patch_cap is None:
     retry_issues.append(f"retry backoff cap unreadable from {patch_path} — cannot bound the hang window (fail-closed)"
-                        + (f": {patch_cap_why}" if patch_cap_why else ""))
+                        + (f": {CAP_WHY}" if CAP_WHY else ""))
 elif patch_cap != CAP_EXPECTED:
     retry_issues.append(f"patch-pi-retry.sh backoff cap expected {CAP_EXPECTED}, got {patch_cap}")
 

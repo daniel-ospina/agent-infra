@@ -867,10 +867,13 @@ BANNED_RE = (
      "ladder steps (s)"),
     (re.compile(rf"(?<![\d.]){8 * BASE // 1000}s(?![\d])"), "ladder step (s)"),
     # The backoff cap restated as a phrase. Value-derived like the rest, so it
-    # stays correct when the cap changes; the 2-line window in the loop below is
-    # what lets it see a restatement that wraps mid-phrase.
+    # stays correct when the cap changes; the paragraph-scoped match in the
+    # loop below is what lets it see a restatement that wraps mid-phrase.
     (re.compile(rf"(?<![\d.]){CAP // 60000}[\s-]*min(?:ute)?s?\s+backoff\s+cap"),
      f"backoff cap ({CAP // 60000} min)"),
+    # ...and the cap in MILLISECONDS, both spellings.
+    (re.compile(rf"(?<![\d.]){CAP:,}(?![\d])"), f"backoff cap ({CAP:,} ms)"),
+    (re.compile(rf"(?<![\d.]){CAP}(?![\d])"), f"backoff cap ({CAP} ms)"),
 )
 # The ban must apply to EVERY current-state doc under docs/ — not a hand-kept
 # allowlist. A 2-doc allowlist (`providers.md`, `upstream-pi-bugs.md`) let this
@@ -897,6 +900,7 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
             continue
         p = os.path.join(dirpath, fn)
         rel = os.path.relpath(p, root)
+        snap = rel.startswith(SNAPSHOT_DIRS)
         _lines = open(p, encoding="utf-8").readlines()
         for ln, line in enumerate(_lines, 1):
             # (1) a value ATTACHED to the idle key (`httpIdleTimeoutMs: 300000`,
@@ -928,22 +932,37 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
             if m and m.group(1) != str(IDLE):
                 bad.append(f"{rel}:{ln} says 'the fleet runs {m.group(1)}' "
                            f"but the contract idle ceiling is {IDLE}")
-            # (4) no current-state doc other than §2 may restate a derived
-            # duration at all.
-            if snap:
+        # (4) no current-state doc other than §2 may restate a derived figure at
+        # all. PARAGRAPH-scoped (blank-line separators), not line- or N-line
+        # scoped: a restatement WRAPS ("…7 / 1-min backoff" / "cap, per …") and
+        # a line-scoped search is blind to it — the continuation-line false pass
+        # the BANNED_RE rewrite was meant to remove. A fixed N-line window was
+        # the first attempt: it still missed a 3-line wrap, and it kept the
+        # newline in the join, so `[^\n]`-based patterns could not bridge while
+        # `[\s-]`-based ones over-matched across unrelated breaks (#1088 review).
+        if snap or rel == SOURCE_DOC:
+            continue
+        para, para_ln = [], 0
+        for _i, _l in enumerate(_lines + [""], 1):
+            if _l.strip():
+                if not para:
+                    para_ln = _i
+                para.append(_l.rstrip("\n"))
                 continue
-            if rel != SOURCE_DOC:
-                # A 2-line window: the restatement this pin must catch can WRAP
-                # ("…7 / 1-min backoff" / "cap, per …") and a line-scoped search
-                # is blind to it — the same continuation-line false pass the
-                # BANNED_RE rewrite was meant to remove.
-                window = line + " " + (_lines[ln] if ln < len(_lines) else "")
-                for rx, what in BANNED_RE:
-                    m = rx.search(line) or rx.search(window)
-                    if m:
-                        bad.append(f"{rel}:{ln} restates the derived {what} as "
-                                   f"'{m.group(0).strip()}' — those live only in "
-                                   f"docs/ops/cost-config-policy.md §2")
+            if not para:
+                continue
+            text = " ".join(para)
+            para = []
+            for rx, what in BANNED_RE:
+                m = rx.search(text)
+                if m:
+                    # A false block is possible in principle (an innocent "43
+                    # minutes" in a current-state doc matches the derived
+                    # no-progress window). That side is fail-CLOSED and names
+                    # the figure, so it is the deliberate side to err on.
+                    bad.append(f"{rel}:{para_ln} restates the derived {what} as "
+                               f"'{m.group(0).strip()}' — those live only in "
+                               f"docs/ops/cost-config-policy.md §2")
 if bad:
     print("❌ " + "\n❌ ".join(bad))
     sys.exit(1)
@@ -1083,43 +1102,81 @@ if grep -q 'backoff cap expected' "$OUT"; then pass "the cap-drift message names
 rm -rf "$TMP29"
 
 echo ""
-echo "30. a SECOND CAP_MS assignment must NOT shadow the pinned one (fail-open pin)"
-# Textual order is not execution order. Taking the LAST regex match let an
-# UNCONDITIONAL `CAP_MS=300000` after the pinned line (or a matching assignment
-# inside a never-taken branch) make the guard read 60000 while the script
-# applied 300000 — a reproduced fail-open that defeated the cap pin the whole
-# retry contract rests on (#1088 review). The cap must be the ONLY assignment.
+echo "30. the guard reads the cap by EXECUTION, not by parsing the assignment text"
+# A static parse cannot bound the ways a shell assigns a variable. `declare`,
+# `eval`, `printf -v`, an `if true; then CAP_MS=…; fi`, and a second assignment
+# chained with `;` on the SAME line were all invisible to the line-anchored
+# regex (and to its first replacement, which only widened the anchor): the guard
+# read 60000, exited 0 and printed a 60000ms window while the script applied
+# 300000 — the fail-open this whole contract exists to close (#1088 review).
+# The cap is now read by ASKING the script (`patch-pi-retry.sh --cap`), so the
+# value compared IS the value interpolated into the patch.
+CAP_NOW="$(bash "$ROOT/scripts/patch-pi-retry.sh" --cap 2>/dev/null)"
+if [ "$CAP_NOW" = "$CAP_GUARD" ]; then
+  pass "patch-pi-retry.sh --cap reports the guard's cap (${CAP_GUARD}ms)"
+else
+  fail "patch-pi-retry.sh --cap reported '$CAP_NOW' but the guard pins ${CAP_GUARD}ms"
+fi
+if [ "$(env -u PI_MAX_RETRY_DELAY_MS bash "$ROOT/scripts/patch-pi-retry.sh" --cap 2>/dev/null)" = "$CAP_GUARD" ]; then
+  pass "--cap is side-effect free and ignores an ambient PI_MAX_RETRY_DELAY_MS"
+else
+  fail "--cap picked up an ambient PI_MAX_RETRY_DELAY_MS (the guard unsets it for the call)"
+fi
 TMP30="$(mktemp -d /tmp/cost-config-capmulti.XXXXXX)"
-mkroot "$TMP30"
-python3 - "$TMP30/scripts/patch-pi-retry.sh" <<'PY'
+cap30_case() { # $1 = label, $2 = shape key (the tail is built in python: a
+              # shell single-quoted '\n' is a literal backslash-n, which splices
+              # a broken script and tests fail-closed instead of drift)
+  mkroot "$TMP30"
+  python3 - "$TMP30/scripts/patch-pi-retry.sh" "$2" <<'PY'
 import sys
-p = sys.argv[1]
+p, shape = sys.argv[1], sys.argv[2]
 s = open(p).read()
-assert 'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"' in s, "patch cap shape changed — update this test"
-s = s.replace('CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"',
-              'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"\nCAP_MS=300000', 1)
-open(p, "w").write(s)
+anchor = 'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"'
+assert anchor in s, "patch cap shape changed — update this test"
+TAILS = {
+    "semi":    "; CAP_MS=300000",
+    "declare": "\ndeclare CAP_MS=300000",
+    "eval":    '\neval "CAP_MS=300000"',
+    "printfv": "\nprintf -v CAP_MS '%s' 300000",
+    "iftrue":  "\nif true; then CAP_MS=300000; fi",
+}
+assert shape in TAILS, f"unknown shape {shape}"
+open(p, "w").write(s.replace(anchor, anchor + TAILS[shape], 1))
 PY
-bash "$TMP30/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
-code=$?
-if [ "$code" -eq 1 ]; then pass "a second unconditional CAP_MS assignment → exit 1 (not read from textual order)"; else fail "CAP-MULTI BYPASS: expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
-if grep -q 'backoff cap unreadable' "$OUT"; then pass "the fail-closed diagnostic names the unreadable cap"; else fail "expected the 'backoff cap unreadable' message"; sed -n '1,30p' "$OUT"; fi
-if grep -q '2 CAP_MS assignments' "$OUT"; then pass "the diagnostic says why (the assignment count)"; else fail "expected the assignment-count reason in the message"; sed -n '1,30p' "$OUT"; fi
-# ...and the same class via a never-taken branch, not just a bare second line.
+  bash "$TMP30/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  local code=$?
+  if [ "$code" -eq 1 ] && grep -qE 'backoff cap expected [0-9]+, got 300000' "$OUT"; then
+    pass "$1 → exit 1, cap drift named"
+  else
+    fail "$1 — expected exit 1 + the cap-drift message, got $code"; sed -n '1,30p' "$OUT"
+  fi
+}
+cap30_case "a second assignment chained with ';' on the same line" semi
+cap30_case "a 'declare CAP_MS=300000' after the pinned line" declare
+cap30_case "an 'eval \"CAP_MS=300000\"' after the pinned line" eval
+cap30_case "a 'printf -v CAP_MS' after the pinned line" printfv
+cap30_case "an 'if true; then CAP_MS=300000; fi'" iftrue
+# The original bypass shape: the live assignment is the WRONG one and a matching
+# assignment sits in a never-taken branch (the old parse read the latter).
 rm -rf "$TMP30"; TMP30="$(mktemp -d /tmp/cost-config-capdead.XXXXXX)"
 mkroot "$TMP30"
 python3 - "$TMP30/scripts/patch-pi-retry.sh" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
-assert 'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"' in s, "patch cap shape changed — update this test"
-s = s.replace('CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"',
-              'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-300000}"\nif false; then\n  CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"\nfi', 1)
+anchor = 'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"'
+assert anchor in s, "patch cap shape changed — update this test"
+s = s.replace(anchor,
+              'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-300000}"\nif false; then\n  ' + anchor + '\nfi', 1)
 open(p, "w").write(s)
 PY
 bash "$TMP30/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
-if [ "$code" -eq 1 ]; then pass "a matching assignment in a never-taken branch → exit 1"; else fail "DEAD-BRANCH BYPASS: expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+if [ "$code" -eq 1 ] && grep -qE 'backoff cap expected [0-9]+, got 300000' "$OUT"; then
+  pass "a matching assignment in a never-taken branch → exit 1 (the original bypass shape)"
+else
+  fail "DEAD-BRANCH BYPASS: expected exit 1 + the cap-drift message, got $code"; sed -n '1,30p' "$OUT"
+fi
 rm -rf "$TMP30"
 
 if [ "$failures" -eq 0 ]; then

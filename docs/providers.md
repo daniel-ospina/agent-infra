@@ -251,8 +251,9 @@ scripts/patch-pi-retry.sh --check
   hard cap is the outage bound). The suppression is ON by default (behavior
   change for task sub-agents); `TASK_NETWORK_WAIT=0` disables it (fail-open
   legacy).
-- Env knobs: `PI_MAX_RETRY_DELAY_MS` (patch cap, default 60000; must equal
-  `RETRY_MAX_BACKOFF_MS` in `scripts/check-cost-config.sh`),
+- Env knobs: `PI_MAX_RETRY_DELAY_MS` (patch cap; it must equal
+  `RETRY_MAX_BACKOFF_MS` in `scripts/check-cost-config.sh` — the value itself
+  lives in `docs/ops/cost-config-policy.md` §2),
   `TASK_NETWORK_PROBE_URL` (probe target, default = provider baseUrl from
   models.json), `TASK_NETWORK_PROBE_TIMEOUT_MS` (default 5000, clamped ≤ 9s
   so ticks never overlap), `TASK_NETWORK_PROBE_CACHE_MS` (default 15000).
