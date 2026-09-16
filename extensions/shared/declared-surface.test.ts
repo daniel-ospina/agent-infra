@@ -37,6 +37,7 @@ import {
   reverseViolations,
   scanDeclarations,
   declaresSymbol,
+  stripTrailingComment,
   vacuityFindings,
   yieldCommentLines,
   type ScanResult,
@@ -408,6 +409,32 @@ test("a numeric fragment cannot be extended into a different bound (whole-token 
   ok(carriesValue("REAP_IDLE_HOURS=$(( 10#${REAP_IDLE_HOURS} ))", "10#${REAP_IDLE_HOURS}"));
   // A non-numeric fragment keeps plain-substring semantics.
   ok(carriesValue('export const X = 21_600_000; // 6h', "= 21_600_000;"));
+  // A TRAILING comment must not be able to carry a value the declaration no
+  // longer has: the line is stripped before the comparison.
+  equal(stripTrailingComment("export const X = 600_000; // legacy: = 1_200_000;"), "export const X = 600_000;");
+  ok(
+    !carriesValue(stripTrailingComment("export const X = 600_000; // legacy: = 1_200_000;"), "= 1_200_000;"),
+    "the old value kept in a trailing comment must NOT satisfy the forward check",
+  );
+  ok(carriesValue(stripTrailingComment("export const X = 600_000; // note"), "= 600_000;"));
+  equal(
+    stripTrailingComment("REAP_WT_MAX_DAYS=999 # legacy default ${REAP_WT_MAX_DAYS:-1000000}", "sh"),
+    "REAP_WT_MAX_DAYS=999",
+  );
+  const realTerm = { name: "DEFAULT_STREAM_STALL_MS", owners: ["x.ts"], value: "= 1_200_000;", axis: "kill", guardedBy: "none (test)" } as StallTerm;
+  ok(
+    forwardViolations([realTerm], () => "export const DEFAULT_STREAM_STALL_MS = 600_000; // was = 1_200_000;\n").length > 0,
+    "halving the bound while keeping the old value in a comment must be a violation",
+  );
+  for (const [frag, line] of [
+    ["|| 1_800_000", "const X = Math.max(60_000, (Number(process.env.Y) || 1_800_000) * 2);"],
+    ["|| 1_800_000", "const X = Math.max(60_000, (Number(process.env.Y) || 1_800_000e2));"],
+    ["=14", "IDLE_DAYS=14.5"],
+    ["=14", "IDLE_DAYS=14e2"],
+  ] as const) {
+    ok(!carriesValue(line, frag), `a scaled/altered bound must not match: ${line}`);
+  }
+  ok(carriesValue("const X = Math.max(60_000, (Number(process.env.Y) || 1_800_000));", "|| 1_800_000"));
   const term: StallTerm = { name: "IDLE_DAYS", owners: ["x.sh"], value: "=14", axis: "retention", guardedBy: "none (test)" };
   ok(forwardViolations([term], () => "IDLE_DAYS=140\n").length > 0, "the forward check must FIRE on an extended run of digits");
 });

@@ -64,6 +64,13 @@
  * shape, so `declared-surface.test.ts` pins it as a known gap rather than
  * claiming coverage, and the corpus is required not to contain one.
  *
+ * The same disclosure covers the whole TEXT-SHAPED class: extraction is a
+ * line-shaped regex, not a parser, so (a) a `const`-shaped line inside a
+ * MULTI-LINE string/template is read as code, and (b) the scan is not
+ * scope-aware — a same-named declaration in a nested function body satisfies the
+ * presence and forward checks even when the module-level one was deleted. Both
+ * are limits of the mechanism, recorded here rather than implied away.
+ *
  * ZERO-DEPENDENCY IMPORT CONTRACT: `node:*` only. The per-PR `ci.yml` `verify`
  * job runs the shared suites with NO `npm ci`, so this file must not import
  * anything outside Node's stdlib.
@@ -293,23 +300,81 @@ const SH_DECL_LINE_START = /(?:^|\n)[ \t]*(?:export[ \t]+|readonly[ \t]+|declare
 const SH_DECL_ANYWHERE = /(?:^|[^A-Za-z0-9_])(?:export[ \t]+|readonly[ \t]+|declare[ \t]+)?([A-Z_][A-Z0-9_]*)=/g;
 
 /**
- * True when `line` carries `fragment` as a WHOLE token.
+ * Remove a TRAILING comment from a declared line: a line-local, stateless
+ * operation (quote-aware via `insideQuote`), so `... = 600_000; // was 1_200_000`
+ * cannot satisfy the forward check for the OLD value while the real one changed.
+ * A whole-line comment never reaches here (those are blanked).
+ */
+export function stripTrailingComment(line: string, lang: SourceLang = "ts"): string {
+  if (lang === "sh") {
+    // `#` opens a comment only at the start of a word (not inside `${…}`, `$#`).
+    for (let i = 1; i < line.length; i++) {
+      if (line[i] === "#" && /[ \t]/.test(line[i - 1]) && !insideQuote(line, i)) return line.slice(0, i).trimEnd();
+    }
+    return line;
+  }
+  // A `//` comment runs to end of line; a closed `/* … */` span is removed
+  // wherever it sits. Both must be OUTSIDE a string literal.
+  const cut = (s: string): number => {
+    for (let i = 0; i < s.length - 1; i++) {
+      if (!insideQuote(s, i) && s[i] === "/" && s[i + 1] === "/") return i;
+    }
+    return -1;
+  };
+  let out = line;
+  for (let pass = 0; pass < 8; pass++) {
+    const lineCut = cut(out);
+    const open = out.indexOf("/*");
+    if (open !== -1 && !insideQuote(out, open) && (lineCut === -1 || open < lineCut)) {
+      const close = out.indexOf("*/", open + 2);
+      if (close === -1) return out.slice(0, open).trimEnd();
+      out = out.slice(0, open) + out.slice(close + 2);
+      continue;
+    }
+    if (lineCut !== -1) return out.slice(0, lineCut).trimEnd();
+    return out;
+  }
+  return out;
+}
+
+/**
+ * True when `line` carries `fragment` as a WHOLE token that is not further
+ * scaled or continued.
  *
- * A raw `includes()` lets a numeric fragment be extended into a different bound:
- * a registered `|| 1_800_000` matched `|| 1_800_000 * 2`, and `=14` matched
- * `=140` — a false PASS in the one direction this module exists to close. So the
- * boundary after the fragment is refused when it would continue the same token or
- * start an ARITHMETIC continuation of it (`*`, `/`, `%`, a bitwise operator, or
- * `+`/`-` with any operand), and an identifier or `_` continuation is refused
- * after an identifier/`}` tail. A fragment that needs to describe an expression
+ * A raw `includes()` let a registered fragment be extended into a DIFFERENT
+ * bound: `|| 1_800_000` matched `|| 1_800_000 * 2` and `(... || 1_800_000) * 2`,
+ * `=14` matched `=140`, `14.5` and `14e2` — a false PASS in the one direction
+ * this module exists to close. The right-hand side is therefore examined: a token
+ * continuation (digit, `.`, `_`, identifier, an `e`/`n` suffix) is refused, and so
+ * is an arithmetic operator applied to the expression the fragment ends (after
+ * any legitimate closers). A fragment that needs to describe an expression
  * records the WHOLE expression, as `WALL_CLOCK_STALL_MS` does.
  */
 export function carriesValue(line: string, fragment: string): boolean {
-  let re = fragment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (/[0-9]$/.test(fragment)) re += "(?![0-9_])(?!\\s*[*/+\\-%&|^<>])";
-  else if (/[A-Za-z0-9_$}]$/.test(fragment)) re += "(?![A-Za-z0-9_$])";
-  if (/^[0-9]/.test(fragment)) re = `(?<![0-9_])${re}`;
-  return new RegExp(re).test(line);
+  const esc = fragment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const left = /^[0-9]/.test(fragment) ? "(?<![0-9_])" : "";
+  const re = new RegExp(left + esc, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(line)) !== null) {
+    if (re.lastIndex === m.index) re.lastIndex++;
+    if (!continuedAfter(fragment, line.slice(m.index + m[0].length))) return true;
+  }
+  return false;
+}
+
+/** True when what FOLLOWS a fragment continues it or scales its expression. */
+function continuedAfter(fragment: string, after: string): boolean {
+  const numeric = /[0-9_]$/.test(fragment);
+  if (numeric && /^[0-9_.]/.test(after)) return true; // 140, 14.5, 1_800_0000
+  if (numeric && /^[eE][0-9]/.test(after)) return true; // 1_800_000e2
+  if (numeric && /^n\b/.test(after)) return true; // BigInt literal
+  if (/[A-Za-z0-9_$}]$/.test(fragment) && /^[A-Za-z0-9_$]/.test(after)) return true; // identifier / }0
+  // A scale applied to the expression the fragment ends: step over legitimate
+  // closers and spacing, then refuse an arithmetic operator. A trailing COMMENT
+  // (`//`, `#`) is a terminator, not a division.
+  const tail = after.replace(/^[)\]}"'`]+/, "").replace(/^[ \t]+/, "");
+  if (/^(\/\/|#)/.test(tail)) return false;
+  return /^[*/+%&|^<>-]/.test(tail);
 }
 
 /**
@@ -392,7 +457,10 @@ export function declarationLines(src: string, symbol: string, lang: SourceLang =
     if (at === -1 || insideQuote(stripped, at)) continue;
     const lineStart = stripped.lastIndexOf("\n", at) + 1;
     const lineEnd = stripped.indexOf("\n", at);
-    out.push(stripped.slice(lineStart, lineEnd === -1 ? stripped.length : lineEnd).trim());
+    // A trailing comment is removed: it must not be able to carry a value the
+    // declaration no longer has.
+    const lineText = stripTrailingComment(stripped.slice(lineStart, lineEnd === -1 ? stripped.length : lineEnd), lang);
+    out.push(lineText.trim());
     if (m.index === re.lastIndex) re.lastIndex++;
   }
   return out;
