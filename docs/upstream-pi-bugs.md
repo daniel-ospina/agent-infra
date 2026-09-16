@@ -883,20 +883,38 @@ The 16:55 null result (`automountd` 7.3%, `opendirectoryd` ≈0) is the **only**
 window it is evidence for. Three different epochs are involved and **must not be
 compared as if contemporaneous**:
 
-| window | source | non-pi churn |
-|---|---|---|
-| pre-reboot (fatal) | `~/.pi/agent/state/RESTART-HANDOFF-2026-09-16.md` | `opendirectoryd` **18%** + `automountd` **7%** |
-| 13:35–13:36 EST (~33 min after boot) | #1115's own body | `opendirectoryd` **91%** + `automountd` **36%** + a `find` at **54%** ≈ **181%** |
-| 16:55 EST | this report | `automountd` **7.3%**, `opendirectoryd` ≈0 |
+| window | source | pi measured as | non-pi churn |
+|---|---|---|---|
+| pre-reboot (fatal) | `~/.pi/agent/state/RESTART-HANDOFF-2026-09-16.md` | seven pids, **lifetime** CPU-time/elapsed — e.g. `77540` 197 h/23.8 h ≈ **8.3 cores**, `37315` 172 h ≈ **7.2 cores**; the handoff calls this "the real ceiling" | `opendirectoryd` **18%** + `automountd` **7%** |
+| 13:35–13:36 EST (~33 min after boot) | #1115's own body | 8 rows, summed **≈ 164.1%** (issue says ~12 procs at 10–38%) | `opendirectoryd` **91%** + `automountd` **36%** + a `find` at **54%** ≈ **181%** |
+| 16:55 EST | this report | 39 pids = **177.5%** (20-proc silent subset 146.1%) | `automountd` **7.3%**, `opendirectoryd` ≈0 |
 
 An earlier draft attributed the 91/36/54 row to the *pre-reboot* window and cited
 the handoff for it; the handoff actually records 18%/7%, and 91/36/54 are from
-#1115's own post-boot window. Corrected above. What the three windows support is
-narrower than the draft implied: pi dominates the confound **in the two windows
-where pi was measured**, but non-pi churn was demonstrably large in a third, and
-**no measurement exists for the fatal window's pi share** — so the confound is
-*not uniformly* negligible, and "pi was the ceiling" rests on the two windows
-where pi was sampled, not on the window that killed the machine.
+#1115's own post-boot window. A second draft of the *conclusion* then said "no
+measurement exists for the fatal window's pi share" — also wrong: the handoff
+does measure pi pre-reboot, though as **lifetime CPU-time/elapsed**, not as a
+window sample, so it is not comparable with the other two rows. Both are
+corrected above.
+
+What the three windows actually support, with the methods kept distinct:
+
+- **16:55** — the only window with pi and the confound measured **the same way
+  and at the same time**: pi 177.5% vs 7.3%, i.e. pi ~**24×** the confound. The
+  confound is decisively excluded *here*.
+- **13:35** — pi ≈164.1% against non-pi ≈181%: **the confound was at least
+  comparable, and possibly larger.** The draft's "pi dominates in the windows
+  where pi was measured" is **not** true for this window and has been dropped.
+- **pre-reboot** — the handoff attributes the ceiling to pi (lifetime rates of
+  7–8 cores on individual pids) with confound at 18%/7%, i.e. pi-shaped. But it
+  is a **lifetime** rate, not a 30 s window sample, and one `pi` pid at "~8.3
+  cores" average over 23.8 h is itself anomalous next to the 16:55 snapshot
+  (26.3% peak) — which is the "episodic, not steady-state" problem below.
+
+So the honest verdict is not "the confound is negligible": it is **window
+-dependent** — decisively excluded at 16:55, comparable at 13:35, and pi-shaped
+but method-incomparable pre-reboot. The report's 177.5% figure stands on its own
+window; it should not be used to dismiss the confound elsewhere.
 And because Unix load average counts **blocked** as well as runnable processes,
 the chain "pi CPU → load 15.94 → swap → reboot" is under-supported: with 39
 `pi` processes at 255–670 MB each against 32 GB, **memory pressure** is at least
@@ -1049,13 +1067,16 @@ Ink-based TUI with a large mounted output also burn under the same profile?
    row disposal), not only on a later `updateDisplay()`.
 
 **Re-check mechanism (so step 1 does not rot):** this report defers its decisive
-measurement, and a deferral with no trip is silent rot. The trip is: the
-agent-infra half (next section) samples per-pid `ΔCPU` against transcript
-silence on its existing cadence, so the burn is re-measured mechanically; the
-re-measure below is dated, and if the fleet's next restart shows the spin gone,
-that is evidence for the "not idle at all — queued auto-continuation" framing
-rather than against it. Trigger: the next time any `pi` process exceeds ~5% of a
-core with a transcript silent > 120 s.
+measurement, and a deferral with no trip is silent rot. Be precise about what
+exists: this report contains a **dated measurement** (the 16:55 table above), but
+**no mechanical re-measure** — nothing in the fleet currently samples `ΔCPU`
+against transcript silence. The proposed trip is the guard in the next section,
+now filed as agent-infra **#1127** (warn-only, `ΔCPU` joined to #469's existing
+silence predicate); until that issue lands, step 1 has **no** automatic trip, and
+this paragraph is the only re-check. Trigger for a manual re-measure: the next
+time any `pi` process exceeds ~5% of a core with a transcript silent > 120 s. If
+the fleet's next restart shows the spin gone, that is evidence for the "not idle
+at all — queued auto-continuation" framing rather than against it.
 
 ### Mitigation available in agent-infra (the issue's ask 3)
 
@@ -1081,7 +1102,7 @@ The natural fix is one comparison added to an existing mechanism, not a new
 subsystem: a ΔCPU-per-window column joined to #469's existing transcript-silence
 predicate (WARN by default; never kill — a false positive destroys an in-memory
 session thread, which is the #1114 failure mode). That is deliberately left as a
-**separate agent-infra issue**, not folded into this upstream report.
+**filed as agent-infra #1127**, not folded into this upstream report.
 
 ### Honest status of this report
 
