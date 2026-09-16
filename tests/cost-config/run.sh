@@ -874,6 +874,17 @@ BANNED_RE = (
     # ...and the cap in MILLISECONDS, both spellings.
     (re.compile(rf"(?<![\d.]){CAP:,}(?![\d])"), f"backoff cap ({CAP:,} ms)"),
     (re.compile(rf"(?<![\d.]){CAP}(?![\d])"), f"backoff cap ({CAP} ms)"),
+    # A restatement is a restatement in ANY unit: the cap and both windows in
+    # seconds, the ladder sum in ms, and the ladder written out step by step
+    # ("2, 4, 8, 16, 32, 60, 60 seconds"). All value-derived, so they cannot go
+    # stale with the contract (#1088 review).
+    (_dur(CAP, "s"), f"backoff cap ({CAP // 1000} s)"),
+    (_dur(HANG_MS, "s"), f"no-progress window ({HANG_MS // 1000} s)"),
+    (_dur(WORST_MS, "s"), f"worst case ({WORST_MS // 1000} s)"),
+    (re.compile(rf"(?<![\d.]){BACKOFF:,}(?![\d])"), f"retry ladder ({BACKOFF:,} ms)"),
+    (re.compile(rf"(?<![\d.]){BACKOFF}(?![\d])"), f"retry ladder ({BACKOFF} ms)"),
+    (re.compile(r"[,\s]+".join(str(min(BASE * 2 ** i, CAP) // 1000) for i in range(N))),
+     "ladder steps (s, listed)"),
 )
 # The ban must apply to EVERY current-state doc under docs/ — not a hand-kept
 # allowlist. A 2-doc allowlist (`providers.md`, `upstream-pi-bugs.md`) let this
@@ -1118,9 +1129,21 @@ else
   fail "patch-pi-retry.sh --cap reported '$CAP_NOW' but the guard pins ${CAP_GUARD}ms"
 fi
 if [ "$(env -u PI_MAX_RETRY_DELAY_MS bash "$ROOT/scripts/patch-pi-retry.sh" --cap 2>/dev/null)" = "$CAP_GUARD" ]; then
-  pass "--cap is side-effect free and ignores an ambient PI_MAX_RETRY_DELAY_MS"
+  pass "--cap ignores an ambient PI_MAX_RETRY_DELAY_MS (the guard unsets it)"
 else
   fail "--cap picked up an ambient PI_MAX_RETRY_DELAY_MS (the guard unsets it for the call)"
+fi
+# The guard EXECUTES this script, so `--cap` must sit before pi discovery and
+# before every write. Nothing else pins that order: a later move of the branch
+# would make the guard run the patcher. Assert the order directly.
+cap_ln="$(grep -nE -- '= "--cap" \]' "$ROOT/scripts/patch-pi-retry.sh" | head -1 | cut -d: -f1)"
+find_ln="$(grep -n -- '^find_pi_pkg()' "$ROOT/scripts/patch-pi-retry.sh" | head -1 | cut -d: -f1)"
+write_ln="$(grep -n -- 'mv "\$tmp"' "$ROOT/scripts/patch-pi-retry.sh" | head -1 | cut -d: -f1)"
+if [ -n "$cap_ln" ] && [ -n "$find_ln" ] && [ -n "$write_ln" ] \
+   && [ "$cap_ln" -lt "$find_ln" ] && [ "$cap_ln" -lt "$write_ln" ]; then
+  pass "--cap (line $cap_ln) precedes pi discovery ($find_ln) and the first write ($write_ln)"
+else
+  fail "--cap order not pinned — cap=$cap_ln find_pi_pkg=$find_ln write=$write_ln (it must precede both)"
 fi
 TMP30="$(mktemp -d /tmp/cost-config-capmulti.XXXXXX)"
 cap30_case() { # $1 = label, $2 = shape key (the tail is built in python: a
@@ -1178,6 +1201,56 @@ else
   fail "DEAD-BRANCH BYPASS: expected exit 1 + the cap-drift message, got $code"; sed -n '1,30p' "$OUT"
 fi
 rm -rf "$TMP30"
+
+echo ""
+echo "31. what --cap REPORTS is what the patch APPLIES (over a fake pi tree)"
+# `readonly CAP_MS` freezes the value the moment it is validated, so no later
+# assignment — wherever it sits — can make the reported cap and the applied cap
+# diverge. This pins that BEHAVIOURALLY rather than by re-reading the source:
+# the reported value and the value written into the patched dist must be the
+# same, in both the clean shape and the post---cap-assignment shape (#1088
+# review). Test 24's fake-tree harness is gone by now (it cleaned up), so this
+# builds its own minimal one.
+TMP31="$(mktemp -d /tmp/patch-cap-apply.XXXXXX)"
+PKG31="$TMP31/node-v99/lib/node_modules/@earendil-works/pi-coding-agent"
+AI31="$PKG31/node_modules/@earendil-works/pi-ai/dist/utils"
+mkdir -p "$PKG31/dist/core" "$AI31" "$TMP31/bin" "$TMP31/scripts"
+printf '#!/bin/sh\nexit 0\n' >"$TMP31/bin/pi"; chmod +x "$TMP31/bin/pi"
+cp "$ROOT/scripts/patch-pi-retry.sh" "$TMP31/scripts/patch-pi-retry.sh"
+pristine31() {
+  printf 'function f() {\n        const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);\n}\n' >"$PKG31/dist/core/agent-session.js"
+  printf 'function g() {\n        const delayMs = policy.baseDelayMs * 2 ** (attempt - 1);\n}\n' >"$AI31/retry.js"
+}
+apply31() { # $1 = label; asserts reported == applied == the guard's constant
+  local reported applied
+  pristine31
+  reported="$(PATH="$TMP31/bin:$PATH" PI_NODE_ROOT="$TMP31" env -u PI_MAX_RETRY_DELAY_MS \
+              bash "$TMP31/scripts/patch-pi-retry.sh" --cap 2>/dev/null)"
+  PATH="$TMP31/bin:$PATH" PI_NODE_ROOT="$TMP31" bash "$TMP31/scripts/patch-pi-retry.sh" >"$OUT" 2>&1
+  applied="$(sed -n 's/.*Math\.min(settings\.baseDelayMs \* 2 \*\* (this\._retryAttempt - 1), \([0-9][0-9]*\));.*/\1/p' \
+             "$PKG31/dist/core/agent-session.js" | head -1)"
+  if [ "$reported" = "$CAP_GUARD" ] && [ "$applied" = "$CAP_GUARD" ]; then
+    pass "$1: --cap reports ${reported}ms and the dist is patched at ${applied}ms"
+  else
+    fail "$1: --cap reported '$reported', dist patched at '$applied' (both must be ${CAP_GUARD})"; sed -n '1,20p' "$OUT"
+  fi
+}
+if grep -qE '^readonly CAP_MS$' "$TMP31/scripts/patch-pi-retry.sh"; then
+  pass "CAP_MS is made readonly before it is read (the immutability the pin rests on)"
+else
+  fail "CAP_MS is not readonly — a later assignment can diverge the reported and applied caps"
+fi
+apply31 "clean shape"
+python3 - "$TMP31/scripts/patch-pi-retry.sh" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = 'if [ "${1:-}" = "--cap" ]; then\n  printf \'%s\\n\' "$CAP_MS"\n  exit 0\nfi\n'
+assert marker in s, "cap branch shape changed — update this test"
+open(p, "w").write(s.replace(marker, marker + '\nCAP_MS=300000\n', 1))
+PY
+apply31 "an assignment AFTER the --cap branch"
+rm -rf "$TMP31"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

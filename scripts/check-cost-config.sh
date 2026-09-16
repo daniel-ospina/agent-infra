@@ -204,15 +204,20 @@ PYEOF
 # underivable and fail CLOSED below.
 PATCH_CAP_RESOLVED=""
 PATCH_CAP_WHY=""
-_cap_out="$(env -u PI_MAX_RETRY_DELAY_MS bash "$PATCH_SCRIPT" --cap 2>/dev/null)" || \
-  PATCH_CAP_WHY="patch-pi-retry.sh --cap exited non-zero"
+_cap_out="$(env -u PI_MAX_RETRY_DELAY_MS bash "$PATCH_SCRIPT" --cap 2>/dev/null)"
+_cap_rc=$?
 case "$_cap_out" in
-  '')
-    [ -n "$PATCH_CAP_WHY" ] || PATCH_CAP_WHY="patch-pi-retry.sh --cap printed nothing" ;;
-  *[!0-9]*)
-    PATCH_CAP_WHY="patch-pi-retry.sh --cap did not print a plain integer (got '$_cap_out')" ;;
+  *[!0-9]*|'')
+    PATCH_CAP_WHY="patch-pi-retry.sh --cap did not print a plain integer (got '$_cap_out', rc=$_cap_rc)" ;;
   *)
-    PATCH_CAP_RESOLVED="$_cap_out" ;;
+    # A non-zero exit is NOT tolerated even when a valid-looking integer came
+    # back: a script that reports one value and then fails is not one whose
+    # answer can be trusted, and the comment above promises this fails closed.
+    if [ "$_cap_rc" -ne 0 ]; then
+      PATCH_CAP_WHY="patch-pi-retry.sh --cap exited non-zero (rc=$_cap_rc, printed '$_cap_out')"
+    else
+      PATCH_CAP_RESOLVED="$_cap_out"
+    fi ;;
 esac
 
 # settings_violations <settings-file> <patch-script> — compaction block

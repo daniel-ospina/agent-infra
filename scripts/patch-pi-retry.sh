@@ -96,6 +96,15 @@ case "$CAP_MS" in
     exit 1 ;;
 esac
 
+# The cap is frozen here, ONCE, before anything reads it. `--cap` reports this
+# value and the patch interpolates this value; freezing it is what makes those
+# two the SAME by construction. Without this, an assignment placed anywhere
+# after the `--cap` branch (but before the patch text is built) made `--cap`
+# answer 60000 while the patch applied 300000 — the same fail-open class,
+# reached by moving the assignment instead of re-spelling it. A later
+# assignment now fails loudly and leaves the value unchanged (#1088 review).
+readonly CAP_MS
+
 # ── --cap: print the RESOLVED cap and exit ───────────────────────────────
 # The cost-config guard calls this instead of re-parsing the assignment text
 # below. A static parse cannot bound the ways a shell assigns a variable —
