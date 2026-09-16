@@ -183,8 +183,16 @@ export function langOf(file: string): SourceLang {
  * swallowed real declarations (`extensions/repo-freshness.ts:5` carries the
  * glob `"./shared/*"` in a line comment, and stripping block comments first
  * deleted its two FRESH bounds) — a false PASS in the one direction this module
- * exists to close. It also cannot be fooled by a `//` inside a block comment or
- * a comment delimiter inside a string literal.
+ * exists to close.
+ *
+ * The pass also tracks string literals AND regex literals. Regex awareness is
+ * not optional: `extensions/builtin-tools/index.ts` holds
+ * `/^Warning: No project session found with id '[^']*'/`, whose apostrophe would
+ * otherwise open a bogus single-quote "string" that copied thousands of lines of
+ * comments through verbatim — so every parent-side assertion would be scanning
+ * prose. Both directions of that failure (a comment SURVIVING stripping, and a
+ * `/[/*]/` char class being read as a block-comment opener and DELETING real
+ * declarations) are pinned by fixtures below.
  */
 export function stripComments(src: string, lang: SourceLang = "ts"): string {
   if (lang === "sh") return src.replace(/(^|[ \t])#[^\n]*/g, "$1");
@@ -223,10 +231,91 @@ export function stripComments(src: string, lang: SourceLang = "ts"): string {
       i = j;
       continue;
     }
+    if (c === "/" && couldStartRegex(src, i)) {
+      // Copy the regex literal verbatim, but SKIP its contents: a quote inside
+      // it must not open a bogus "string", and a `/*` inside a character class
+      // must not open a bogus block comment.
+      const j = endOfRegex(src, i);
+      out += src.slice(i, j);
+      i = j;
+      continue;
+    }
     out += c;
     i++;
   }
   return out;
+}
+
+/** Keywords after which a `/` starts a regex literal (`return /re/`). */
+const REGEX_PRECEDING_KEYWORD =
+  /(?:^|[^A-Za-z0-9_$.])(return|typeof|instanceof|in|of|new|delete|void|do|else|yield|await|case)$/;
+
+/**
+ * True when the `/` at `i` begins a regex literal. The heuristic is the standard
+ * one: a regex cannot follow a VALUE, and `//` / `/*` are always comments (so
+ * those cases are resolved before this runs).
+ *
+ * The previous-character-only version misread `a++ / b`, `x! / b` (postfix
+ * non-null) and `obj.of / b` (property access) as regex starts; with a
+ * `/`-containing string on the same line that desynchronized the scan and let a
+ * comment fabricate a declaration. So the test is now on the previous TOKEN.
+ */
+function couldStartRegex(src: string, i: number): boolean {
+  if (src[i + 1] === "/" || src[i + 1] === "*") return false;
+  if (src[i + 1] === undefined) return false;
+  if (!prevTokenIsValue(src, i)) return true;
+  // A VALUE before the `/` means division — unless the value-token is a KEYWORD
+  // (`return /re/`) or the keyword is a property NAME (`obj.of`), which the
+  // lookbehind rejects by excluding a preceding `.`.
+  return REGEX_PRECEDING_KEYWORD.test(src.slice(0, i).replace(/\s+$/, ""));
+}
+
+/** Chars that can END a value: literals and closing brackets. */
+const VALUE_ENDERS = ")]}`\"'";
+
+/** True when the token before index `i` is a VALUE (so a `/` divides). */
+function prevTokenIsValue(src: string, i: number): boolean {
+  let k = i - 1;
+  while (k >= 0 && /\s/.test(src[k])) k--;
+  if (k < 0) return false; // start of file — not a value
+  const c = src[k];
+  if (VALUE_ENDERS.includes(c)) return true;
+  if (c === "+" || c === "-") {
+    // Postfix `++` / `--` (a value) vs a binary operator (not one).
+    let m = k - 1;
+    while (m >= 0 && /\s/.test(src[m])) m--;
+    return m >= 0 && src[m] === c;
+  }
+  if (c === "!") {
+    // Postfix non-null assertion (`a! / 2`) vs prefix negation (`!/re/.test(x)`).
+    let m = k - 1;
+    while (m >= 0 && /\s/.test(src[m])) m--;
+    return m >= 0 && /[A-Za-z0-9_$)\]}]/.test(src[m]);
+  }
+  return /[A-Za-z0-9_$]/.test(c);
+}
+
+/** Index just past the regex literal starting at `i` (flags included). */
+function endOfRegex(src: string, i: number): number {
+  let j = i + 1;
+  let inClass = false;
+  while (j < src.length) {
+    const d = src[j];
+    if (d === "\\") {
+      j += 2;
+      continue;
+    }
+    if (d === "\n") break; // an unterminated regex does not span lines
+    if (d === "[") inClass = true;
+    else if (d === "]") inClass = false;
+    else if (d === "/" && !inClass) {
+      j++;
+      while (j < src.length && /[a-z]/.test(src[j])) j++;
+      return j;
+    }
+    j++;
+  }
+  return j;
 }
 
 /** TS/JS `const|let|var NAME =` (also `export const`). */
@@ -492,7 +581,11 @@ export function collectFiles(
 ): string[] {
   const out: string[] = [];
   const walk = (rel: string, d: number) => {
-    if (d > depth) return;
+    if (d > depth) {
+      // A truncated subtree is a dropped subtree: report it.
+      errors?.push(`${rel}: corpus walk hit the depth bound (${depth}) — this subtree was NOT scanned`);
+      return;
+    }
     const abs = path.join(root, rel);
     let entries: fs.Dirent[];
     try {
@@ -510,6 +603,11 @@ export function collectFiles(
       if (e.isDirectory()) {
         if (e.name === "node_modules" || e.name === "_deprecated" || e.name.startsWith(".")) continue;
         walk(childRel, d + 1);
+      } else if (e.isSymbolicLink()) {
+        // `isDirectory()` and `isFile()` are BOTH false for a symlink, so a
+        // symlinked source file or subtree would vanish without a word. Report
+        // it rather than silently shrinking the corpus.
+        errors?.push(`${childRel}: symlinked entry during the corpus walk — not followed, so its contents are NOT in the scan`);
       } else if (e.isFile() && keep(e.name)) {
         out.push(childRel);
       }

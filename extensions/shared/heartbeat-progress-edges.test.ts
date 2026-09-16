@@ -5,7 +5,7 @@
  * ----------------------
  * `heartbeat-progress-edges.ts` is the ONE declaration of what counts as
  * progress, and `STALL_TERM_REGISTRY` is the ONE registry of stall/liveness
- * bounds. This suite makes the declaration load-bearing in three directions:
+ * bounds. This suite makes the declaration load-bearing in four directions:
  *
  *   1. TABLE ↔ SOURCE PARITY (both ways). The child's clock-advancing call
  *      sites must equal the table's `advancesClock` rows; the child's marker
@@ -72,6 +72,8 @@ import { ok, equal } from "node:assert/strict";
 import {
   driverViolations,
   forwardViolations,
+  inFamily,
+  langOf,
   reverseViolations,
   scanDeclarations,
   stripComments,
@@ -81,12 +83,16 @@ import {
 import {
   ACTIVITY_EDGE_EVENTS,
   CLOCK_RESET_EVENT,
+  FUNCTION_SHAPED_TERMS,
   HEARTBEAT_KILL_REASONS,
   KILL_REASON_BOUNDS,
   LIFECYCLE_EVENTS,
   MARKER_KINDS,
   PROGRESS_DRIVERS,
   PROGRESS_EDGE_TABLE,
+  SCAN_AGE_SUFFIXES,
+  SCAN_BOUND_SUFFIXES,
+  SCAN_NAME_FAMILIES,
   STALL_AXES,
   STALL_SCAN_EXEMPTIONS,
   STALL_TERM_REGISTRY,
@@ -503,6 +509,47 @@ test("a value:null term satisfied only by a COMMENT fails the forward scan (no c
     () => commentOnly,
   );
   ok(v.length > 0, "a pointer/derived term must not be satisfied by a comment that merely names it");
+});
+
+test("no scanned TS file leaks a comment after stripping (desync canary)", () => {
+  // The strongest guard against the whole `stripComments` failure class: if the
+  // scanner DESYNCHRONIZES on any file (an apostrophe or a `/*` inside a regex
+  // literal used to do exactly that), the remainder of that file is copied
+  // verbatim and every assertion in this suite starts scanning prose. A
+  // line-start comment marker surviving in TS output cannot happen when the
+  // scanner tracks strings, templates AND regex literals correctly.
+  const offenders: string[] = [];
+  let checked = 0;
+  for (const file of spec.files) {
+    if (langOf(file) !== "ts") continue;
+    checked++;
+    const stripped = stripComments(read(file), "ts");
+    if (/^[ \t]*\/\//m.test(stripped) || /^[ \t]*\/\*/m.test(stripped)) offenders.push(file);
+  }
+  ok(checked >= 50, `only ${checked} TS corpus files were checked — the canary is vacuous`);
+  equal(
+    offenders.length,
+    0,
+    `these files still carry a line-start comment marker after stripping, i.e. the stripper DESYNCHRONIZED on them and their comments are being scanned as code: ${offenders.join(", ")}`,
+  );
+});
+
+test("every registered term is in-family, or explicitly recorded as function-shaped", () => {
+  // The reverse scan and the owners check both iterate declarations that
+  // `inFamily` matched, so a registered term whose NAME is not in-family escapes
+  // both. `FUNCTION_SHAPED_TERMS` must therefore be complete: a new camelCase
+  // term fails here instead of silently having no scan coverage at all.
+  const exempt = new Set<string>(FUNCTION_SHAPED_TERMS);
+  for (const t of STALL_TERM_REGISTRY) {
+    const inFam = inFamily(t.name, SCAN_NAME_FAMILIES, SCAN_AGE_SUFFIXES, SCAN_BOUND_SUFFIXES);
+    ok(
+      inFam || exempt.has(t.name),
+      `${t.name} is neither in-family (so the scan covers it) nor listed in FUNCTION_SHAPED_TERMS — add it to that list deliberately, with its own value+behaviour pin`,
+    );
+  }
+  for (const name of FUNCTION_SHAPED_TERMS) {
+    ok(STALL_TERM_REGISTRY.some((t) => t.name === name), `${name} is listed as function-shaped but is not registered`);
+  }
 });
 
 section("independent drivers");

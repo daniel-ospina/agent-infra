@@ -95,6 +95,16 @@ export const STALL_AXES = [
 
 export type StallAxis = (typeof STALL_AXES)[number];
 
+/**
+ * Registered terms whose NAMES are not in-family (camelCase function names, not
+ * `FAMILY_TOKEN_MS`), so `scanDeclarations` never sees them — and therefore
+ * neither the reverse check nor the owners check can cover them. Listed
+ * explicitly so a NEW non-in-family term FAILS the registry test instead of
+ * silently escaping both directions, and so a reader can see which terms rest on
+ * their own value+behaviour pin (`guardedBy`) for the duplicate-declaration case.
+ */
+export const FUNCTION_SHAPED_TERMS = ["getSubagentBackstopFreshMs", "getToolStallMs"] as const;
+
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
 export const MARKER_KINDS = [
   "ready",
@@ -336,11 +346,12 @@ export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string
   // Shares S with stream-stall: one constant, two conditions. Naming them as one
   // term would be wrong; naming them as two unrelated bounds would be wrong too.
   "tool-silence": "DEFAULT_STREAM_STALL_MS (S) — same bound as stream-stall, different condition",
-  // The EFFECTIVE bound is TASK_TOOL_STALL_MS when the env override is a
-  // positive finite number; the fraction × cap derivation is the fallback.
-  // Recording only the fraction would let the bound move through a path the
-  // registry cannot see (#1068 review; the same shape PR #873 / #991 caught).
-  "tool-stall": "TASK_TOOL_STALL_MS override (env), else TASK_TOOL_STALL_FRACTION × effective hard cap (L)",
+  // The EFFECTIVE bound is max(60 s, TASK_TOOL_STALL_MS) when the env override
+  // is a positive finite number; otherwise max(60 s, fraction × cap). Recording
+  // only the fraction would let the bound move through a path the registry
+  // cannot see, and omitting the 60 s floor would record a bound that does not
+  // exist (#1068 review; the same shape PR #873 / #991 caught).
+  "tool-stall": "max(60 s, TASK_TOOL_STALL_MS) override (env), else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap) (L)",
   "first-message-stall": "DEFAULT_FIRST_MESSAGE_MS (M)",
   "max-dispatch": "TASK_MAX_DISPATCH_MS",
   cut: "getCutGapMs() / TASK_HEARTBEAT_CUT_GAP_MS",
@@ -471,7 +482,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "= 2 / 3;",
     axis: "kill",
     guardedBy: SUBAGENT_PARITY,
-    note: "L is DERIVED: fraction × effective hard cap — and is SUPERSEDED by the TASK_TOOL_STALL_MS env override when that is positive finite (see getToolStallMs)",
+    note: "L is DERIVED: max(60 s, fraction × effective hard cap) — SUPERSEDED by the TASK_TOOL_STALL_MS env override when that is positive finite; BOTH paths floor at 60 s (see getToolStallMs)",
   },
   {
     name: "DEFAULT_FIRST_MESSAGE_MS",
@@ -674,7 +685,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: null,
     axis: "kill",
     guardedBy: BT_TEST,
-    note: "FUNCTION, not a const: the EFFECTIVE tool-stall bound (L) — returns the TASK_TOOL_STALL_MS env override verbatim when it is positive finite, else TASK_TOOL_STALL_FRACTION × effective hard cap. Declared so the env path is visible to the registry rather than only the fraction literal.",
+    note: "FUNCTION, not a const: the EFFECTIVE tool-stall bound (L) — max(60 s, TASK_TOOL_STALL_MS) when the env override is positive finite, else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap). Declared so the env path AND its 60 s safety floor are visible to the registry rather than only the fraction literal.",
   },
 ];
 

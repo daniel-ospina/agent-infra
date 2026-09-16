@@ -139,6 +139,70 @@ test("a removed block comment keeps its newlines, so a following declaration sta
   );
 });
 
+test("REGEX literals do not desynchronize the scan (both failure directions)", () => {
+  // A scanner that tracks only quotes desyncs on an apostrophe inside a regex
+  // literal and copies the rest of the file verbatim — so every later assertion
+  // scans PROSE, and a comment can fabricate a declaration. This is not
+  // hypothetical: extensions/builtin-tools/index.ts holds
+  // /^Warning: No project session found with id '[^']*'/. The `/[/*]/` case is
+  // the opposite direction: a `/` inside a regex character class read as a
+  // block-comment opener DELETES the real declarations after it.
+  const cases: [string, string, string[]][] = [
+    ["apostrophe inside a regex", "const re = /id '([^']*)'/;\n", ["BOGUS_STALL_MS", "REAL_ONE_STALL_MS"]],
+    ["`/*` inside a regex character class", "const re = /[/*]/;\n", ["REAL_TWO_STALL_MS"]],
+    ["`//` inside a regex", "const re = /a\\/\\/b/;\n", ["REAL_THREE_STALL_MS"]],
+  ];
+  for (const [name, head, decls] of cases) {
+    const body = decls.map((d, i) => (i === 0 && name.startsWith("apostrophe") ? `// ${d} = 0;` : `export const ${d} = ${i + 1};`)).join("\n");
+    const stripped = stripComments(`${head}${body}\n`, "ts");
+    for (const d of decls) {
+      if (d.startsWith("BOGUS")) {
+        ok(!stripped.includes(d), `${name}: a comment must not survive stripping (would fabricate ${d})`);
+      } else {
+        ok(stripped.includes(d), `${name}: the real declaration ${d} must survive stripping`);
+      }
+    }
+  }
+  // Division must NOT be mistaken for a regex start (it would swallow code).
+  // The postfix/property cases are the ones a next-character-only heuristic gets
+  // wrong: `a++`, `x!` (non-null) and `obj.of` all END a value.
+  for (const expr of [
+    "const r = a / b;",
+    "const r = (x) / 2;",
+    "const r = arr[0] / 3;",
+    "const r = obj.k / 4;",
+    "const r = a++ / 2;",
+    "const r = a-- / 2;",
+    "const r = x! / 2;",
+    "const r = obj.of / 2;",
+    "const r = obj.in / 2;",
+    "const r = obj.delete / 2;",
+    'const r = "s" / 2;',
+  ]) {
+    const s = stripComments(`${expr}\n// const FAKE_STALL_MS = 1;\nexport const OK_STALL_MS = 2;\n`, "ts");
+    ok(
+      s.includes("OK_STALL_MS") && !s.includes("FAKE_STALL_MS"),
+      `a division must not open a regex literal: ${expr}`,
+    );
+  }
+  // …and a keyword before the slash must still be read as a regex (`return /re/`
+  // includes the backtick case that first exposed the whitespace bug).
+  for (const expr of ["function f(){ return /[$`]/.test(s); }", "function f(){ return  /re/.test(s); }", "switch (x) { case /re/: break; }"]) {
+    const s = stripComments(`${expr}\n// const FAKE2_STALL_MS = 1;\nexport const OK2_STALL_MS = 2;\n`, "ts");
+    ok(s.includes("OK2_STALL_MS") && !s.includes("FAKE2_STALL_MS"), `a keyword must open a regex: ${expr}`);
+  }
+  // The escalation: a misread division on a line that also holds a
+  // `/`-containing string desynchronizes the rest of the file, and a leaked
+  // line-start comment then FABRICATES a declaration.
+  const esc = 'const ratio = a++ / 2; const p = "a/b";\n// const BOGUS_STALL_MS = 0;\nexport const REAL_STALL_MS = 1;\n';
+  const escScan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => esc);
+  equal(
+    escScan.declarations.map((d) => d.symbol).join(","),
+    "REAL_STALL_MS",
+    "a leaked comment must not be able to fabricate a declaration",
+  );
+});
+
 section("declaresSymbol — a mention is not a declaration");
 
 test("a comment that merely names the term does not satisfy the presence check", () => {
@@ -383,6 +447,28 @@ test("excludes node_modules/_deprecated/hidden and honours the keep predicate", 
     equal(got.length, 1, `expected only sub/keep.ts, got ${JSON.stringify(got)}`);
     ok(got[0].endsWith("sub/keep.ts"), got[0]);
     equal(errors.length, 0, `a readable tree must report no walk errors, got ${JSON.stringify(errors)}`);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("a symlinked entry and a depth-truncated subtree are reported, never silently dropped", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "declared-surface-link-"));
+  const errors: string[] = [];
+  try {
+    fs.mkdirSync(path.join(tmp, "real"), { recursive: true });
+    fs.writeFileSync(path.join(tmp, "real", "keep.ts"), "");
+    try {
+      fs.symlinkSync(path.join(tmp, "real", "keep.ts"), path.join(tmp, "linked.ts"));
+    } catch {
+      return; // a platform without symlink permission — skip, the depth case still runs below
+    }
+    collectFiles(tmp, ".", (n) => n.endsWith(".ts"), 6, errors);
+    ok(errors.some((e) => e.includes("symlinked entry")), `a symlink must be reported, got ${JSON.stringify(errors)}`);
+    // A depth bound that truncates must report too.
+    const deep: string[] = [];
+    collectFiles(tmp, ".", (n) => n.endsWith(".ts"), 0, deep);
+    ok(deep.some((e) => e.includes("depth bound")), `a truncated subtree must be reported, got ${JSON.stringify(deep)}`);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
