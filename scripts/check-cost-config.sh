@@ -271,9 +271,16 @@ if pmr not in (None, 0):
 patch_cap = None
 try:
     with open(patch_path) as f:
-        m = re.search(r'CAP_MS="\$\{PI_MAX_RETRY_DELAY_MS:-([0-9]+)\}', f.read())
-    if m:
-        patch_cap = int(m.group(1))
+        # Anchored to a real assignment at the start of a line: an unanchored
+        # search is shadowed by any earlier comment/prose with the same shape,
+        # so the guard would read a stale default while the script applies the
+        # live one (#1088 coverage review). Take the LAST such assignment, which
+        # is the one the shell ends up with.
+        _caps = re.findall(r'(?m)^\s*CAP_MS="\$\{PI_MAX_RETRY_DELAY_MS:-([0-9]+)\}',
+                           f.read())
+        m = _caps[-1] if _caps else None
+    if m is not None:
+        patch_cap = int(m)
 except Exception:
     patch_cap = None
 if patch_cap is None:
@@ -491,7 +498,14 @@ while stack:
         if e.name != ".pi":
             stack.append(e.path)
             continue
-        # a `.pi` directory: inspect its settings.json, never descend into it
+        # a `.pi` directory: inspect its settings.json AND keep walking, because
+        # a session cwd can itself be inside `.pi` (the global layout is
+        # `~/.pi/agent`), and then a nested `.pi/settings.json` is a live project
+        # file. Not descending was a reproduced B4 miss (#1088 coverage review);
+        # the realpath visited-set keeps this cycle-safe.
+        # NB: keep apostrophes out of this heredoc body — an unescaped quote here
+        # has broken this file parse before (#1088).
+        stack.append(e.path)
         p = os.path.join(e.path, "settings.json")
         if not os.path.lexists(p):
             continue

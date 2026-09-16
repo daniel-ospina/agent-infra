@@ -40,7 +40,10 @@
 #      either (the escape is for the models.json clamp rollback window only)
 #  27. a non-integer settings value must not skip the derived-window check
 #      (a zeroed WINDOW sentinel used to read as "window present" → PASS)
-#  28. a project settings file at ANY depth is caught (no depth cap)
+#  28. a project settings file at ANY depth is caught (no depth cap), including
+#      a nested `.pi`-in-`.pi` (a session cwd can be inside `.pi`)
+#  29. the backoff cap is read from the REAL assignment in patch-pi-retry.sh,
+#      not from an earlier assignment-shaped comment
 #   6. COST_CLAMP_OVERRIDE=1                       → exit 0 + loud notice
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
@@ -886,11 +889,14 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
             snap = rel.startswith(SNAPSHOT_DIRS)
             for m in (() if snap else re.finditer(r"httpIdleTimeoutMs[^0-9\n]{0,6}(\d{5,7})", line)):
                 v = m.group(1)
-                # No carve-out for the per-call value: a line may name both
-                # knobs, but 600000 attached to the IDLE key is that key's
-                # pre-#1088 value wherever it appears. Dated snapshots are
+                # ONLY the contract's idle value is acceptable attached to the
+                # idle key. No carve-out for the per-call 600000 (that is this
+                # key's pre-#1088 value wherever it appears) and none for the
+                # deepseek contextWindow clamp, which happens to share the
+                # digit string today — allowing it made a stale restatement in a
+                # summary doc pass (#1088 coverage review). Dated snapshots are
                 # skipped wholesale (SNAPSHOT_DIRS below).
-                if v not in (idle, clamp):
+                if v != idle:
                     bad.append(f"{rel}:{ln} states httpIdleTimeoutMs {v} "
                                f"(contract idle={IDLE}, per-call={PROV})")
             # (2) the backoff cap, restated in prose as a duration.
@@ -1014,7 +1020,43 @@ bash "$TMP28/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "a 5-deep project file reverting the contract → exit 1"; else fail "expected exit 1 for a 5-deep project file, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "a/b/c/d/.pi/settings.json" "$OUT"; then pass "the deep path is named in the block"; else fail "expected the deep path in the message"; sed -n '1,30p' "$OUT"; fi
+# ...and a project file inside a `.pi` directory itself (a session cwd can be
+# `~/.pi/agent`, so `.pi`-in-`.pi` is a live project file, not a curiosity).
+rm -f "$TMP28/a/b/c/d/.pi/settings.json"
+mkdir -p "$TMP28/.pi/inner/.pi"
+echo '{"retry":{"maxRetries":10000}}' >"$TMP28/.pi/inner/.pi/settings.json"
+bash "$TMP28/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ] && grep -q ".pi/inner/.pi/settings.json" "$OUT"; then
+  pass "a nested .pi-in-.pi project file → exit 1, path named"
+else
+  fail "expected exit 1 for .pi/inner/.pi/settings.json, got $code"; sed -n '1,30p' "$OUT"
+fi
 rm -rf "$TMP28"
+
+echo ""
+echo "29. the backoff cap is read from the REAL assignment, not a shadowing comment"
+# The parse was an unanchored `re.search`, so a stale assignment-shaped comment
+# earlier in the patch script shadowed the live one: the guard read the old cap
+# and went green while the script applied the new one (#1088 coverage review).
+TMP29="$(mktemp -d /tmp/cost-config-capshadow.XXXXXX)"
+mkroot "$TMP29"
+python3 - "$TMP29/scripts/patch-pi-retry.sh" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+assert 'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"' in s, "patch cap shape changed — update this test"
+s = s.replace('CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"',
+              'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-300000}"', 1)
+s = s.replace('#!/usr/bin/env bash\n',
+              '#!/usr/bin/env bash\n# legacy default kept for reference: CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"\n', 1)
+open(p, "w").write(s)
+PY
+bash "$TMP29/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "live cap 300000 behind a 60000 comment → exit 1 (cap drift)"; else fail "CAP-PARSE BYPASS: expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q 'backoff cap expected' "$OUT"; then pass "the cap-drift message names both values"; else fail "expected the cap-drift message"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP29"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"
