@@ -645,6 +645,14 @@ be attached to it without first defining which of the three frames counts, so it
 is not quoted. It was 1659/12 in an earlier revision of this report; that figure
 was an artifact of substring-matching all three frames.
 
+Less severely, three other rows contain mild re-entrant nesting (the same symbol
+appearing again on a nested frame within one stack). Counting only the topmost
+occurrence per path gives `StringIndexOf` 2342 / 1474,
+`RegExpPrototypeTestFast` 374 / 145 and `FindOrderedHashMapEntry` 243 / 95 —
+so those three rows are inflated by under 10% against their topmost-only values.
+The difference is immaterial to the profile's conclusion, but the rows are
+sums-over-occurrences, not topmost-only counts.
+
 Two conclusions that survive scrutiny:
 
 1. **The loop writes essentially nothing to the terminal.** 13 `uv__try_write`
@@ -659,16 +667,18 @@ Two conclusions that survive scrutiny:
 
 **Not mentioned in the original filing — `spawnSync` runs on this timer.**
 `SyncProcessRunner` is `child_process`'s **synchronous** API
-(`spawnSync`/`execSync`). Its `Spawn` frame accumulates 262 samples in the 3312
-timer subtree and 198 in 70130. (The wider
+(`spawnSync`/`execSync`). Its `Spawn` symbol appears on **two distinct stacks**
+(191 + 71 samples for pid 3312; 143 + 55 for 70130), accumulating 262 / 198
+samples in the timer subtree — i.e. **at least two synchronous spawns happened
+during the 20 s sample**, not a periodic cadence. (The wider
 `Spawn`/`Run`/`TryInitializeAndRunLoop` family sums to 783 / 594 because those
-frames nest inside a single spawn; the `Spawn` figure is the one frame and is
-what the row quotes.) Its nested `uv_run` → `uv__io_poll` → `kevent` frames
+frames nest inside each spawn; the row quotes the `Spawn` symbol's own frames.)
+Its nested `uv_run` → `uv__io_poll` → `kevent` frames
 sit *inside* the `uv__run_timers` branch, confirming the spawn happens from a
-timer callback. A **periodic synchronous `exec`** is therefore in the same loop
-as the string work, which is a lead worth instrumenting before anything else.
-(The profile gives no *rate* for it — 262/198 are accumulated samples, not call
-counts, so the cadence is not derivable and is not claimed.)
+timer callback. A **synchronous `exec` therefore runs inside the timer loop**
+as well as the string work, which is a lead worth instrumenting before anything
+else. (The profile gives no *rate* for it — 262/198 are accumulated samples, not
+call counts, so the cadence is not derivable and is not claimed.)
 
 ### Cost facts, and what they do NOT add up to
 
@@ -705,20 +715,25 @@ otherwise memoises into `widthCache`. Two distinct costs, easy to conflate:
 
 Two controls were run to bound the cause before profiling. Method: an
 interactive `pi` spawned under a pty (`pty.fork`, 200×50, output drained), CPU
-read from `ps -o time` over a 30 s window after a 25–30 s settle.
+read from `ps -o time`. Windows differ per control and are stated with each:
 
-- **Fresh idle TUI**: `pi --offline` in a scratch directory, no prompt sent,
-  idle — **0.24 s / 30 s = 0.8%** of a core. So the burn is *not* intrinsic to
-  an idle `pi` TUI.
-- **Visible spinner + ticking bash call**: prompt `sleep 900` accepted and the
-  bash row rendering `Elapsed Ns` while the `Working` spinner animates —
-  **0.14–0.18 s / 15 s ≈ 1%** per window, sustained across 5 windows. So the
-  1 Hz `context.invalidate()` interval *and* the 80 ms spinner, together, cost
-  ~1% when there is no large tool output to re-measure.
+- **Fresh idle TUI**: `pi --offline` in a scratch directory, no prompt sent —
+  **0.24 s / 30 s = 0.8%** of a core, one 30 s window after a 25 s settle. So
+  the burn is *not* intrinsic to an idle `pi` TUI.
+- **Visible spinner + ticking bash call**: prompt `sleep 900` accepted, the bash
+  row rendering `Elapsed Ns` while the `Working` spinner animates —
+  **0.14–0.18 s / 15 s ≈ 1%**, five consecutive 15 s windows after a 30 s
+  settle (windows 1–5: 3.2%, 1.1%, 0.9%, 0.9%, 1.2%). So the 1 Hz
+  `context.invalidate()` interval *and* the 80 ms spinner, together, cost ~1%
+  when there is no large tool output to re-measure.
 
-Together these say the burn scales with **what is in the transcript**, not with
-render count or spinner cadence — which is why the magnitude section below does
-not get to close the gap.
+Together these bounds rule out two easy explanations — "an idle `pi` TUI just
+costs this" and "the spinner/countdown cadence costs this". Neither reaches
+~0.8–1%, so the burn must come from something that scales with rendered or
+session state (how much output a row holds, how many rows/timers are retained)
+or from a cadence not yet identified — not from the configurations measured
+here. The next section shows the one cost path that *is* identified is also too
+small at its known cadence, which leaves the gap open rather than closed.
 
 ### What this does not yet explain
 
