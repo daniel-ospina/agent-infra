@@ -246,7 +246,13 @@ jobs:
         # ci-main.yml `extensions/shared/*.test.ts` glob. The `builtin-tools`
         # half of the parity assertion (the real child factory + the real
         # parser) needs `npm ci` and therefore runs post-merge only.
-        run: npx tsx extensions/shared/declared-surface.test.ts && npx tsx extensions/shared/heartbeat-progress-edges.test.ts
+        run: npx tsx extensions/shared/declared-surface.test.ts
+      - name: Heartbeat progress-edge declaration drift gate (#1068, zero-dep)
+        # The SECOND suite of the #1068 pair, as its own step on purpose: `&&`
+        # short-circuits, so a `declared-surface` failure would suppress this
+        # suite's verdict for that PR entirely (the same reason the accumulator
+        # at the top of this job avoids `&&`). Each suite reports on its own.
+        run: npx tsx extensions/shared/heartbeat-progress-edges.test.ts
       - name: Shared bash/git command-parser suite (#966, zero-dep)
         # #966 — extensions/shared/git-command-parse.ts imports `node:*` ONLY, so
         # its suite runs in THIS job (the job that performs no `npm ci`), like
