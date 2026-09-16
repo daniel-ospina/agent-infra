@@ -84,7 +84,7 @@ import {
 import {
   ACTIVITY_EDGE_EVENTS,
   CLOCK_RESET_EVENT,
-  FUNCTION_SHAPED_TERMS,
+  OUT_OF_FAMILY_TERMS,
   HEARTBEAT_KILL_REASONS,
   KILL_REASON_BOUNDS,
   LIFECYCLE_EVENTS,
@@ -427,6 +427,38 @@ test("every kill(\"<clause>\") literal in the parent is a declared clause, and v
   ok(called.size >= 8, `only ${called.size} kill() clauses found — the scan is vacuous`);
 });
 
+test("every bound a kill clause NAMES is registered (clause → registry closure)", () => {
+  // The kill-clause map records a bound per clause, but a clause string is
+  // PROSE — nothing stopped it from naming a bound that is not in the registry
+  // (or from a clause naming none at all). Two real instances were invisible to
+  // the reverse scan because their NAMES carry no family token:
+  // FIRST_OUTPUT_TIMEOUT_MS and DEFAULT_HARD_CAP_MS. This closes that hole for
+  // every DECLARED clause: the named bound must resolve to a registry entry.
+  //
+  // Extraction is deliberately conservative: an ALL-CAPS token containing an
+  // underscore (so a tier label like `S` or the word `OFF` cannot match) or a
+  // `getXxx` accessor. `TASK_*` are ENV VARS, not declarations, so they are
+  // excluded — their default is the registered term beside them.
+  const tokenRe = /\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b|\bget[A-Z][A-Za-z0-9]*\b/g;
+  const missing: string[] = [];
+  for (const clause of HEARTBEAT_KILL_REASONS) {
+    const bound = KILL_REASON_BOUNDS[clause] ?? "";
+    const named = [...bound.matchAll(tokenRe)].map((m) => m[0]).filter((t) => !t.startsWith("TASK_"));
+    ok(
+      named.length > 0,
+      `${clause}: the clause names no bound that the registry can resolve — ${JSON.stringify(bound)}`,
+    );
+    for (const t of named) {
+      if (!STALL_TERM_REGISTRY.some((x) => x.name === t)) missing.push(`${clause} → ${t}`);
+    }
+  }
+  equal(
+    missing.length,
+    0,
+    `these clauses name a bound that is NOT in STALL_TERM_REGISTRY (register it, or the declared clause vocabulary is not actually covered): ${missing.join(", ")}`,
+  );
+});
+
 test("every registered axis is a declared axis", () => {
   const declared = new Set<string>(STALL_AXES);
   for (const t of STALL_TERM_REGISTRY) {
@@ -551,21 +583,22 @@ test("no NON-comment line is ever rewritten (the corpus-wide no-deletion invaria
   );
 });
 
-test("every registered term is in-family, or explicitly recorded as function-shaped", () => {
+test("every registered term is in-family, or explicitly recorded as out-of-family", () => {
   // The reverse scan and the owners check both iterate declarations that
   // `inFamily` matched, so a registered term whose NAME is not in-family escapes
-  // both. `FUNCTION_SHAPED_TERMS` must therefore be complete: a new camelCase
-  // term fails here instead of silently having no scan coverage at all.
-  const exempt = new Set<string>(FUNCTION_SHAPED_TERMS);
+  // both. `OUT_OF_FAMILY_TERMS` must therefore be complete: a new camelCase
+  // accessor or a new `*_TIMEOUT_MS`-style constant fails here instead of
+  // silently having no scan coverage at all.
+  const exempt = new Set<string>(OUT_OF_FAMILY_TERMS);
   for (const t of STALL_TERM_REGISTRY) {
     const inFam = inFamily(t.name, SCAN_NAME_FAMILIES, SCAN_AGE_SUFFIXES, SCAN_BOUND_SUFFIXES);
     ok(
       inFam || exempt.has(t.name),
-      `${t.name} is neither in-family (so the scan covers it) nor listed in FUNCTION_SHAPED_TERMS — add it to that list deliberately, with its own value+behaviour pin`,
+      `${t.name} is neither in-family (so the scan covers it) nor listed in OUT_OF_FAMILY_TERMS — add it to that list deliberately, with its own value+behaviour pin`,
     );
   }
-  for (const name of FUNCTION_SHAPED_TERMS) {
-    ok(STALL_TERM_REGISTRY.some((t) => t.name === name), `${name} is listed as function-shaped but is not registered`);
+  for (const name of OUT_OF_FAMILY_TERMS) {
+    ok(STALL_TERM_REGISTRY.some((t) => t.name === name), `${name} is listed as out-of-family but is not registered`);
   }
 });
 

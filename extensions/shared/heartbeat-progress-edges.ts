@@ -96,19 +96,30 @@ export const STALL_AXES = [
 export type StallAxis = (typeof STALL_AXES)[number];
 
 /**
- * Registered terms whose NAMES are not in-family (camelCase function names, not
- * `FAMILY_TOKEN_MS`), so `scanDeclarations` never sees them — and therefore
- * neither the reverse check nor the owners check can cover them. Listed
- * explicitly so a NEW non-in-family term FAILS the registry test instead of
- * silently escaping both directions, and so a reader can see which terms rest on
- * their own value+behaviour pin (`guardedBy`) for the duplicate-declaration case.
+ * Registered terms whose NAMES are not in-family — camelCase accessors and
+ * constants like `FIRST_OUTPUT_TIMEOUT_MS` whose name carries no stall/silence
+ * family token (see `inFamily`). `scanDeclarations` never sees them, so neither
+ * the reverse check nor the owners check can cover them. Listed explicitly so a
+ * NEW out-of-family term FAILS the registry test instead of silently escaping
+ * both directions.
+ *
+ * This list is NOT the only guard for these: every bound a DECLARED kill clause
+ * names must also resolve to a registry entry (the clause→bound closure test),
+ * which is what keeps `FIRST_OUTPUT_TIMEOUT_MS` and `DEFAULT_HARD_CAP_MS` — both
+ * named only in clause prose — from drifting silently. What remains uncovered is
+ * a brand-new out-of-family bound that NO clause names, which is the disclosed
+ * limit of a name-shaped scan.
  */
-export const FUNCTION_SHAPED_TERMS = [
+export const OUT_OF_FAMILY_TERMS = [
   "getSubagentBackstopFreshMs",
   "getToolStallMs",
   "getStreamStallMs",
   "getFirstMessageMs",
   "getTaskMaxDispatchMs",
+  "getCutGapMs",
+  "FIRST_OUTPUT_TIMEOUT_MS",
+  "DEFAULT_HARD_CAP_MS",
+  "DEFAULT_MAX_DISPATCH_MS",
 ] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
@@ -346,7 +357,7 @@ export type HeartbeatKillReasonName = (typeof HEARTBEAT_KILL_REASONS)[number];
 
 /** clause → the bound constant that gates it. */
 export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string>> = {
-  "zero-output": "first-output timeout (`firstOutputTimeoutMs`, tier-1)",
+  "zero-output": "FIRST_OUTPUT_TIMEOUT_MS — the tier-1 deadline that populates the entry's `firstOutputTimeoutMs`",
   "silence-threshold": "HEARTBEAT_TIMEOUT_MS (T)",
   "stream-stall": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S)",
   // Shares S with stream-stall: one constant, two conditions. Naming them as one
@@ -357,7 +368,7 @@ export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string
   // only the fraction would let the bound move through a path the registry
   // cannot see, and omitting the 60 s floor would record a bound that does not
   // exist (#1068 review; the same shape PR #873 / #991 caught).
-  "tool-stall": "max(60 s, TASK_TOOL_STALL_MS) override (env), else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap) (L)",
+  "tool-stall": "max(60 s, TASK_TOOL_STALL_MS) override (env), else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap from DEFAULT_HARD_CAP_MS) (L)",
   "first-message-stall": "max(60 s, TASK_FIRST_MESSAGE_MS) override (env), else max(60 s, DEFAULT_FIRST_MESSAGE_MS) (M)",
   "max-dispatch": "max(60 s, TASK_MAX_DISPATCH_MS) override (env), else OFF — DEFAULT_MAX_DISPATCH_MS = 0 disables the cap (D)",
   cut: "getCutGapMs() / TASK_HEARTBEAT_CUT_GAP_MS",
@@ -716,6 +727,44 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the EFFECTIVE total-dispatch cap (D) — max(60 s, TASK_MAX_DISPATCH_MS) when the override is positive finite, else DEFAULT_MAX_DISPATCH_MS = 0, which DISABLES the cap (NOT floored: 0 means off, and the floor only applies to an env-supplied cap).",
+  },
+  // — kill axis: bounds a DECLARED clause names, whose NAME is out of the
+  // reverse scan's family vocabulary (`inFamily` needs a family token or an age
+  // suffix). They are registered explicitly so the clause→bound closure test can
+  // hold: every bound a clause NAMES must be in this registry. A brand-new
+  // out-of-family bound that no clause names is still invisible to the reverse
+  // scan — that is the disclosed limit of a name-shaped scan.
+  {
+    name: "FIRST_OUTPUT_TIMEOUT_MS",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: "= 60_000;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test keeps it visible.",
+  },
+  {
+    name: "DEFAULT_HARD_CAP_MS",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: "= 21_600_000;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "6h base of the EFFECTIVE hard cap (TASK_HARD_CAP_MS overrides it, 60 s floor) — the cap the tool-stall (L) derivation multiplies by 2/3.",
+  },
+  {
+    name: "DEFAULT_MAX_DISPATCH_MS",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: "= 0;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "0 = the max-dispatch cap is OFF unless TASK_MAX_DISPATCH_MS supplies a positive finite value.",
+  },
+  {
+    name: "getCutGapMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the cut clause's marker-gap deadline — 1.25× the tick interval from getHeartbeatIntervalMs, 15 s floor, TASK_HEARTBEAT_CUT_GAP_MS override.",
   },
 ];
 
