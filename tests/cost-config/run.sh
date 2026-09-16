@@ -883,6 +883,15 @@ BANNED_RE = (
     (_dur(WORST_MS, "s"), f"worst case ({WORST_MS // 1000} s)"),
     (re.compile(rf"(?<![\d.]){BACKOFF:,}(?![\d])"), f"retry ladder ({BACKOFF:,} ms)"),
     (re.compile(rf"(?<![\d.]){BACKOFF}(?![\d])"), f"retry ladder ({BACKOFF} ms)"),
+    # Noun-FIRST and copula phrasings ("the backoff cap is 1 min", "retry
+    # cadence is 1 minute", "cap = 1 min") — the ordered forms above miss the
+    # reverse order, which is how a summary doc would naturally state it
+    # (#1088 review).
+    (re.compile(rf"(?:(?:backoff|retry)\s+)?(?:cap|cadence)\s*(?:is|of|=|:)\s*{CAP // 60000}[\s-]*min(?:ute)?s?"),
+     f"backoff cap ({CAP // 60000} min)"),
+    # ...and the bare abbreviation forms ("43m window").
+    (re.compile(rf"(?<![\d.]){HANG_MS // 60000}m(?![\d])"), f"no-progress window ({HANG_MS // 60000}m)"),
+    (re.compile(rf"(?<![\d.]){WORST_MS // 60000}m(?![\d])"), f"worst case ({WORST_MS // 60000}m)"),
     (re.compile(r"[,\s]+".join(str(min(BASE * 2 ** i, CAP) // 1000) for i in range(N))),
      "ladder steps (s, listed)"),
 )
@@ -1300,6 +1309,59 @@ open(p, "w").write(s.replace(marker, marker + '\nCAP_MS=300000\n', 1))
 PY
 apply31 "an assignment AFTER the --cap branch"
 rm -rf "$TMP31"
+
+echo ""
+echo "32. a project-settings walk that cannot run must NOT read green"
+# The walker's STDOUT was the only thing the guard read. A crash left `listing`
+# empty, so the guard printed "no project settings file" and exited 0 —
+# certifying a checkout it never walked. The sibling settings path is
+# deliberately fail-closed (no WINDOW line ⇒ block_retry); this walk now is too
+# (#1088 review).
+TMP32="$(mktemp -d /tmp/cost-config-walk.XXXXXX)"
+mkroot "$TMP32"
+python3 - "$TMP32/scripts/check-cost-config.sh" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+anchor = "import json, os, sys\n\nroot = sys.argv[1]"
+assert anchor in s, "walker shape changed — update this test"
+open(p, "w").write(s.replace(anchor, "import json, os, sys\nraise RuntimeError('simulated walker crash')\n\nroot = sys.argv[1]", 1))
+PY
+bash "$TMP32/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ] && grep -q 'the project-settings walk failed' "$OUT"; then
+  pass "a crashing project-settings walk → exit 1 (fail-closed)"
+else
+  fail "WALK FAIL-OPEN: expected exit 1 + the walk-failure block, got $code"; sed -n '1,30p' "$OUT"
+fi
+if grep -q 'simulated walker crash' "$OUT"; then
+  pass "the walk-failure block carries the underlying error text"
+else
+  fail "expected the walker's own error text in the diagnostic"; sed -n '1,30p' "$OUT"
+fi
+# ...and an UNREADABLE directory is a hole in the walk, not a silent skip.
+# A SEPARATE, CLEAN root: the root above carries the injected crash, which would
+# mask the WALK_ERROR path (the first version of this test reused it and
+# asserted the wrong cause — #1088 test bug).
+if [ "$(id -u)" -eq 0 ]; then
+  pass "running as root — the unreadable-directory case is untestable here"
+else
+  rm -rf "$TMP32"; TMP32="$(mktemp -d /tmp/cost-config-walkperm.XXXXXX)"
+  mkroot "$TMP32"
+  mkdir -p "$TMP32/locked/.pi"
+  # a NON-contract file: without the WALK_ERROR block this root would exit 0
+  echo '{"theme":"dark"}' >"$TMP32/locked/.pi/settings.json"
+  chmod 000 "$TMP32/locked"
+  bash "$TMP32/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  chmod 755 "$TMP32/locked"
+  if [ "$code" -eq 1 ] && grep -q 'WALK_ERROR' "$OUT"; then
+    pass "an unreadable directory → exit 1 (a hole in the walk is not green)"
+  else
+    fail "expected exit 1 + WALK_ERROR for an unreadable directory, got $code"; sed -n '1,30p' "$OUT"
+  fi
+fi
+rm -rf "$TMP32"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

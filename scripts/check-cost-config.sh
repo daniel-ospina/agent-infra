@@ -487,8 +487,9 @@ check_settings_file() {
 # repos) is genuinely beyond its reach — a documented scope boundary, see
 # docs/ops/cost-config-policy.md §2.
 check_project_settings() {
-  local listing path hit
-  listing="$(python3 - "$ROOT" <<'PYEOF'
+  local listing path hit walk_rc walk_err
+  walk_err="$(mktemp "${TMPDIR:-/tmp}/cost-config-walk.XXXXXX")"
+  listing="$(python3 - "$ROOT" 2>"$walk_err" <<'PYEOF'
 import json, os, sys
 
 root = sys.argv[1]
@@ -512,7 +513,12 @@ while stack:
     seen.add(real)
     try:
         entries = list(os.scandir(d))
-    except OSError:
+    except OSError as ex:
+        # NOT a silent `continue`: an unreadable directory is a hole in the
+        # walk, and a hole that reports green is how a project settings file
+        # reverting the contract would be missed (#1088 review). Surfaced to
+        # the shell as a block, like every other unassertable input.
+        out.append(f"{d}\tWALK_ERROR: {ex}")
         continue
     for e in entries:
         try:
@@ -553,6 +559,18 @@ while stack:
 print("\n".join(out))
 PYEOF
 )"
+  walk_rc=$?
+  if [ "$walk_rc" -ne 0 ]; then
+    # The walk is the ONLY thing that can assert the project-settings half of
+    # the contract. A crash left `listing` empty, and the empty arm below then
+    # printed "no project settings file" and exited 0 — a false PASS for a
+    # checkout the guard never walked (#1088 review). Fail closed, and name the
+    # walker's own error text.
+    block_settings "the project-settings walk failed (rc=$walk_rc) — the retry/compaction contract cannot be asserted against project settings (fail-closed): $(tr '\n' ' ' <"$walk_err" | cut -c1-200)"
+    rm -f "$walk_err"
+    return 0
+  fi
+  rm -f "$walk_err"
   if [ -z "$listing" ]; then
     ok "no project settings file under $ROOT (pi merges <session-cwd>/.pi/settings.json over the global settings)"
     return 0
@@ -562,7 +580,7 @@ PYEOF
     case "$hit" in
       "")
         ok "project settings ($path) does not touch the retry/compaction contract" ;;
-      PARSE_ERROR:*|NOT_A_FILE|NOT_AN_OBJECT)
+      PARSE_ERROR:*|NOT_A_FILE|NOT_AN_OBJECT|WALK_ERROR:*)
         block_settings "project settings ($path) is $hit — cannot assert the retry/compaction contract against a file pi merges over the global settings" ;;
       *)
         block_settings "project settings ($path) overrides the settings contract ($hit) — pi merges project settings OVER the global ones, so this silently reverts the shipped contract; remove the key here" ;;

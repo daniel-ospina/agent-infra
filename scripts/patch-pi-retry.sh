@@ -106,7 +106,7 @@ esac
 # the variable being set at all, which is why it warns even on an equal value.
 if [ -n "${PI_MAX_RETRY_DELAY_MS:-}" ]; then
   echo "⚠️  PI_MAX_RETRY_DELAY_MS=${CAP_MS} is set — this install will carry an override, not the pinned default." >&2
-  echo "    scripts/check-cost-config.sh pins the DEFAULT and BLOCKS a differing value, so the guard will not certify this install." >&2
+  echo "    scripts/check-cost-config.sh pins the DEFAULT; it BLOCKS a value different from the contract cap, so a differing override will not be certified." >&2
 fi
 
 # The cap is frozen here, ONCE, before anything reads it. `--cap` reports this
