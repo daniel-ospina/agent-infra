@@ -4250,6 +4250,122 @@ async function main() {
       "920 (P1): ENOENT = genuinely absent = content-free — a deletion must still be skipped (policy pinned by 49b/55c)");
   });
 
+  // ── #3398: the merge-inherited face of the trusted-base defect ────────
+  // A `git push -u` records the branch's OWN name in `branch.<cur>.merge`, so
+  // `resolveTrustedBase` used to return the branch's own remote ref as the
+  // trusted base T. That made the push arm's guard (4) unsatisfiable — T then
+  // EQUALS HEAD^1 (the branch's own side, a FIRST parent) and is never an
+  // ancestor of a NON-FIRST parent — so merge-inheritance subtraction silently
+  // no-opped and every file `git merge origin/main` carried in was demanded for
+  // verification. The base is the INTEGRATION branch (origin/main). The fixture
+  // carries a NEW branch-authored file into the push range ON TOP of the
+  // inherited ones, so a bare "allow" cannot pass vacuously: the authored file
+  // must still block while the inherited files must not be named.
+  test("scenario 81 (#3398): a merge of origin/main does not demand its inherited files — the base is the integration branch, not the branch's own tracking ref", async () => {
+    const remote = join(TEST_ROOT, "repo-3398-origin.git");
+    mkdirSync(remote, { recursive: true });
+    git(remote, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3398");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + remote);
+    writeFileSync(join(repo, "base.txt"), "base\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    // The feature branch is pushed NORMALLY — the trigger for #3398.
+    git(repo, "checkout -q -b feature");
+    writeFileSync(join(repo, "authored.txt"), "a1\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feature-work");
+    git(repo, "push -q -u origin feature");
+    equal(git(repo, "config branch.feature.merge"), "refs/heads/feature",
+      "81: (fixture) a normal `push -u` records the branch's OWN name as its upstream — that is the defect's trigger");
+    // main advances with brand-new files — exactly what the merge inherits.
+    git(repo, "checkout -q main");
+    writeFileSync(join(repo, "inherited-a.ts"), "upstream a\n");
+    writeFileSync(join(repo, "inherited-b.yml"), "upstream b\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m upstream-advance");
+    git(repo, "push -q origin main");
+    // Back on feature: a NEW branch-authored file, then the merge.
+    git(repo, "checkout -q feature");
+    git(repo, "fetch -q origin");
+    writeFileSync(join(repo, "authored2.txt"), "a2\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m branch-authored-2");
+    git(repo, "merge --no-ff -q -m merge-origin-main origin/main");
+    equal(git(repo, "rev-parse HEAD:inherited-a.ts"), git(repo, "rev-parse origin/main:inherited-a.ts"),
+      "81: (fixture) the merge result's inherited-a.ts is byte-identical to the base's — it is inherited, not authored");
+    await fire("session_start", {});
+    const before81 = skipCount("base_identical_satisfied");
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true, "81: the push still blocks on the branch's own new file (not a vacuous empty-range allow)");
+    ok(res.reason.includes("authored2.txt"), "81: the block names the branch-authored file");
+    ok(!res.reason.includes("inherited-a.ts") && !res.reason.includes("inherited-b.yml"),
+      "81: files inherited from the merge of origin/main are NOT demanded — a merge commit is not a scope expansion");
+    const after81 = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "base_identical_satisfied");
+    ok(after81.length > before81, "81: the push leg emits base_identical_satisfied (subtraction actually ran)");
+    const last81 = after81[after81.length - 1] as any;
+    ok(last81.arms?.[0]?.t?.ref === "refs/remotes/origin/main",
+      `81: the trusted base is origin/main, not the branch's own tracking ref (got ${last81.arms?.[0]?.t?.ref})`);
+    ok(Array.isArray(last81.subtractedPaths) && last81.subtractedPaths.includes("inherited-a.ts"),
+      "81: the inherited paths are recorded as subtracted");
+    ok(!last81.subtractedPaths.includes("authored2.txt"),
+      "81: the branch-authored path is NOT subtracted (the fix must not over-subtract)");
+  });
+
+  // ── #3398/#960: the git-op ROOT is the pushed repo, not a sibling checkout ──
+  // The measured incident: a session running in one repo ran `cd <other repo>\n
+  // <git op>` and the gate resolved the project root to the SESSION's repo,
+  // then demanded that repo's files (which are in no diff of the pushed tree).
+  // The root must follow the command's actual cwd. A second repo with its own
+  // unverified staged file is the discriminator: if the gate resolved the
+  // sibling, the block would name the SIBLING's file.
+  test("scenario 82 (#3398): a cd-prefixed git op resolves to the repo being operated on, not the session's sibling checkout", async () => {
+    const sibling = join(TEST_ROOT, "repo-3398-sibling");
+    mkdirSync(sibling, { recursive: true });
+    git(sibling, "init -q -b main");
+    git(sibling, "config user.email e2e@test");
+    git(sibling, "config user.name e2e");
+    writeFileSync(join(sibling, "sibling.ts"), "s1\n");
+    git(sibling, "add .");
+    git(sibling, "commit -q -m sibling-base");
+    writeFileSync(join(sibling, "sibling.ts"), "s2 (staged, unverified)\n");
+    git(sibling, "add sibling.ts");
+
+    const hub = join(TEST_ROOT, "repo-3398-hub");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -q -b main");
+    git(hub, "config user.email e2e@test");
+    git(hub, "config user.name e2e");
+    writeFileSync(join(hub, "hub-base.txt"), "h\n");
+    git(hub, "add .");
+    git(hub, "commit -q -m hub-base");
+    const wt = join(TEST_ROOT, "repo-3398-wt");
+    git(hub, `worktree add -q ${wt} -b wtbranch`);
+    writeFileSync(join(wt, "wt-file.ts"), "w1 (staged, unverified)\n");
+    git(wt, "add wt-file.ts");
+
+    await fire("session_start", {});
+    // Newline-separated cd — bash's separator, and the form the incident used.
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: `cd ${wt}\ngit commit -m probe-3398` },
+    }, { cwd: sibling });
+    ok(res && res.block === true, "82: the op in the worktree blocks on its own unverified file");
+    ok(res.reason.includes("wt-file.ts"), "82: the block names the OPERATED-ON repo's file");
+    ok(!res.reason.includes("sibling.ts"),
+      "82: the SIBLING checkout's staged file is never named — the root is not the session's repo");
+    ok(res.reason.includes(wt),
+      `82: the reported Project root is the operated-on repo (${wt})`);
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

@@ -416,12 +416,19 @@ test("#755 REAL GIT — resolveTrustedBase prefers the tracking remote, else ori
 test("#755 REAL GIT — the tracking remote WINS over the origin/main fallback", () => {
   // The half that was untested: a regression that ignored branch.<cur>.remote /
   // branch.<cur>.merge would still pass the origin/main-fallback test above.
+  // ⛔ This fixture is ALSO the pin for resolveTrustedBase's `main`/`master`
+  // carve-out (#3398): the branch is `main` and its upstream names `main`, i.e.
+  // upstream === current — the ONE case where the branch's own name is still a
+  // base (a `main` tracking `upstream/main`). The assertion below keeps the
+  // fixture on `main` so the carve-out cannot silently stop being covered.
   const dir = mkRepo();
   try {
     write(dir, "a.ts", "a\n");
     git(dir, ["add", "."]);
     git(dir, ["commit", "-qm", "base"]);
     const branch = git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+    assert.equal(branch, "main",
+      "this fixture must stay on `main` to keep pinning the #3398 main/master carve-out");
     // Both candidate refs exist and point at DIFFERENT commits, so which one is
     // chosen is observable.
     write(dir, "b.ts", "b\n");
@@ -438,6 +445,54 @@ test("#755 REAL GIT — the tracking remote WINS over the origin/main fallback",
     assert.equal(base!.oid, git(dir, ["rev-parse", "refs/remotes/upstream/main"]).trim());
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#3398 REAL GIT — the base is the INTEGRATION remote; a branch's own upstream is never the base", () => {
+  // Two halves of #3398:
+  //  (a) `git push -u` records the branch's OWN name in branch.<cur>.merge AND
+  //      creates refs/remotes/<remote>/<cur>. Here BOTH exist, so the choice is
+  //      observable: OLD code picked refs/remotes/fork/feature (the branch's own
+  //      ref) — the #3398/F1 fail-open, since T then equals HEAD^1 and guard (4)
+  //      can never pass. NEW must pick origin/main.
+  //  (b) an upstream naming a DIFFERENT branch is a DECLARED base and keeps
+  //      winning over the origin/main fallback (pre-existing pin).
+  for (const [label, explicitOtherBranch, expected] of [
+    ["(a) push -u: upstream is the branch itself", false, "refs/remotes/origin/main"],
+    ["(b) declared base names another branch", true, "refs/remotes/fork/main"],
+  ] as const) {
+    const dir = mkRepo();
+    try {
+      write(dir, "a.ts", "a\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "base"]);
+      // The branch under test is a FEATURE branch: that is the shape `git push -u`
+      // creates, and the shape #3398 was measured on.
+      git(dir, ["checkout", "-q", "-b", "feature"]);
+      const branch = git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+      assert.equal(branch, "feature");
+      // origin/main and fork/main point at DIFFERENT commits, so which is chosen
+      // is observable. fork/main is AHEAD of origin/main (fork-only content).
+      write(dir, "fork-only.ts", "f\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "fork-only"]);
+      git(dir, ["update-ref", "refs/remotes/fork/main", "HEAD"]);
+      git(dir, ["update-ref", "refs/remotes/fork/HEAD", "HEAD"]);
+      // `git push -u fork feature` creates the branch's OWN remote ref too — the
+      // discriminating ref, without which case (a) is not a discriminator.
+      git(dir, ["update-ref", "refs/remotes/fork/feature", "HEAD"]);
+      git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD~"]);
+      git(dir, ["config", `branch.${branch}.remote`, "fork"]);
+      // (a) the branch's own name (what push -u writes); (b) an explicit other branch.
+      git(dir, ["config", `branch.${branch}.merge`, explicitOtherBranch ? "refs/heads/main" : `refs/heads/${branch}`]);
+      const base = resolveTrustedBase(dir);
+      assert.notEqual(base, null, label);
+      assert.equal(base!.ref, expected,
+        `${label}: expected ${expected}`);
+      assert.equal(base!.oid, git(dir, ["rev-parse", expected]).trim(), label);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 

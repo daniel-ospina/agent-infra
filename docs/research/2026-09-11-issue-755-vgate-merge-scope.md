@@ -59,7 +59,14 @@ aboutObjects: agent-infra, issue-755, issue-737, issue-770, issue-775, issue-790
 its **recorded entry** (index blob for the commit leg, `HEAD` blob for the push
 leg) is byte-identical to the same path's blob in the **named trusted base**
 (`refs/remotes/<remote>/<branch.<cur>.merge short name, else main>`, falling back
-to `refs/remotes/origin/main`). This closes the merge-in-progress flood: a merge
+to `refs/remotes/origin/main` — **as shipped through #755**; ⛔ superseded by
+#3398: `git push -u` records the branch's own name in `branch.<cur>.merge`, and
+for a non-integration branch name that ref made the push arm's guard (4)
+unsatisfiable and silently disabled the subtraction. The base is now a
+`branch.<cur>.merge` naming a DIFFERENT branch (or naming `main`/`master`, the
+integration branch even when it equals the current branch), else
+`refs/remotes/origin/main`. The push remote's base is not consulted as a
+fallback, and `origin/HEAD` is not used (user-settable local state). This closes the merge-in-progress flood: a merge
 that pulls 39 upstream files into a 5-file change previously demanded
 verification coverage for all 39.
 
