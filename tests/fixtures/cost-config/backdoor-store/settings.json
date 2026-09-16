@@ -3,7 +3,7 @@
   "defaultModel": "deepseek-flash",
   "defaultThinkingLevel": "high",
   "theme": "dark",
-  "httpIdleTimeoutMs": 180000,
+  "httpIdleTimeoutMs": 300000,
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,

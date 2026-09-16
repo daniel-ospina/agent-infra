@@ -25,6 +25,8 @@
 #  17. patch-pi-retry.sh cap drift (60000 → 300000) → BLOCK
 #  18. patch-pi-retry.sh absent → fail-closed BLOCK (window uncomputable)
 #  19. policy doc §2 carries the same numbers as the guard (doc↔guard pin)
+#  20. COST_CLAMP_OVERRIDE=1 does NOT silence a retry-contract block
+#  21. project settings (.pi/settings.json) touching retry/httpIdleTimeoutMs → BLOCK
 #   6. COST_CLAMP_OVERRIDE=1                       → exit 0 + loud notice
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
@@ -468,11 +470,9 @@ assert settings["retry"]["provider"]["timeoutMs"] == ptimeout, \
     "shipped provider.timeoutMs != guard RETRY_PROVIDER_TIMEOUT_MS"
 
 # Coupling 2: independent recomputation of the window the guard claims to enforce.
-backoff, v, i = 0, base, 0
-while i < n:
-    if v >= cap:
-        backoff += cap * (n - i); break
-    backoff += v; v *= 2; i += 1
+# Closed form (NOT the guard's loop) so a bug in the guard's `while`/`break`
+# arithmetic cannot be reproduced identically on both sides (#1088 review P2).
+backoff = sum(min(base * 2 ** i, cap) for i in range(n))
 hang = (n + 1) * idle + backoff
 worst = (n + 1) * ptimeout + backoff
 m = re.search(r'hung (\d+)ms / worst (\d+)ms', out)
@@ -561,15 +561,17 @@ pairs = [("retry.maxRetries", const("RETRY_MAX_RETRIES")),
          ("httpIdleTimeoutMs", const("HTTP_IDLE_TIMEOUT_MS")),
          ("retry.baseDelayMs", const("RETRY_BASE_DELAY_MS")),
          ("retry.provider.timeoutMs", const("RETRY_PROVIDER_TIMEOUT_MS"))]
-# Require at least one §2 line that carries BOTH the knob and the guard's
-# current value, so moving either one alone turns this red (sabotage-proved by
-# test 19's table-row mutation in review).
+# Require the exact table CELL, not the value anywhere on the line: a substring
+# match false-passes on `| retry.maxRetries | 7 | 8 attempts ... |` when the
+# guard moves to 8 (the 8 in the description cell satisfies it). #1088 review P2.
+table_rows = [ln for ln in sec2.splitlines() if ln.strip().startswith("|")]
 for key, val in pairs:
-    assert any(key in ln and val in ln for ln in sec2.splitlines()), \
-        f"§2 has no line carrying {key} with the guard's value {val}"
+    assert any(re.search(rf"\|\s*`{re.escape(key)}`\s*\|\s*`{val}`\s*\|", ln)
+               for ln in table_rows), \
+        f"§2 has no table row `{key}` | `{val}`"
 cap = const("RETRY_MAX_BACKOFF_MS")
-assert any("patch-pi-retry.sh" in ln and cap in ln for ln in sec2.splitlines()), \
-    f"§2 must tie the {cap}ms backoff cap to patch-pi-retry.sh"
+assert any(re.search(rf"\|[^\n]*patch-pi-retry\.sh[^\n]*\|\s*`{cap}`\s*\|", ln) for ln in table_rows), \
+    f"§2 must tie the {cap}ms backoff cap to patch-pi-retry.sh in a table row"
 ceiling_min = str(int(const("HANG_WINDOW_CEILING_MS")) // 60000)
 assert f"{ceiling_min}-minute" in sec2, f"§2 must state the {ceiling_min}-minute hang-window ceiling"
 assert "#1088" in sec2, "§2 must cite issue #1088"
@@ -577,6 +579,47 @@ print(f"OK §2 pins maxRetries={const('RETRY_MAX_RETRIES')}, idle={const('HTTP_I
       f"cap={cap} (patch-pi-retry.sh), ceiling={ceiling_min} min, cites #1088")
 PY
 if [ $? -eq 0 ]; then pass "$(cat "$OUT")"; else fail "doc↔guard coupling broken: $(cat "$OUT")"; fi
+
+echo ""
+echo "20. COST_CLAMP_OVERRIDE=1 must NOT silence a retry-contract block (bypass pin)"
+TMP20="$(mktemp -d /tmp/cost-config-override.XXXXXX)"
+mkroot "$TMP20"
+python3 - "$TMP20/pi-bootstrap/pi-config/settings.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p)); d["retry"]["maxRetries"] = 9
+open(p, "w").write(json.dumps(d, indent=2) + "\n")
+PY
+COST_CLAMP_OVERRIDE=1 bash "$TMP20/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "override set + retry drift → still exit 1"; else fail "expected exit 1 under the override, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "does NOT cover" "$OUT"; then pass "carve-out notice present"; else fail "expected the override carve-out notice"; sed -n '1,30p' "$OUT"; fi
+# and the clamp class is STILL silenced by the override (the escape keeps working)
+COST_CLAMP_OVERRIDE=1 bash "$GUARD" --live-dir "$FIX/backdoor-models" >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "clamp-class block still silenced by the override"; else fail "clamp override regressed — expected exit 0, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP20"
+
+echo ""
+echo "21. project settings (.pi/settings.json) touching the contract → BLOCK"
+TMP21="$(mktemp -d /tmp/cost-config-projsettings.XXXXXX)"
+mkroot "$TMP21"
+mkdir -p "$TMP21/.pi"
+echo '{"theme":"dark"}' >"$TMP21/.pi/settings.json"
+bash "$TMP21/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "project settings without contract keys → exit 0"; else fail "expected exit 0, got $code"; sed -n '1,30p' "$OUT"; fi
+echo '{"retry":{"maxRetries":3}}' >"$TMP21/.pi/settings.json"
+bash "$TMP21/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "project settings reverting the contract → exit 1"; else fail "expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "project settings" "$OUT" && grep -q "overrides the retry contract" "$OUT"; then pass "project-settings block message present"; else fail "expected the project-settings message"; sed -n '1,30p' "$OUT"; fi
+# an unparseable project settings file must fail closed too
+printf '{ not json' >"$TMP21/.pi/settings.json"
+bash "$TMP21/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "unparseable project settings → exit 1 (fail-closed)"; else fail "expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP21"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

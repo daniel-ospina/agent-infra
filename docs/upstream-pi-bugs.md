@@ -301,7 +301,7 @@ quick-retry window; there is no "pause and wait for connectivity" mode.
 On a network drop, the agent-level retry (the "Retry N/3" path) runs 3 quick
 attempts (2s → 4s → 8s with the defaults) and then the session **ends with an
 error**. When the network returns minutes later, nothing resumes. There is no
-supported way to say "after the quick retries, keep trying every 5 minutes
+supported way to say "after the quick retries, keep trying at a fixed cadence
 until connectivity returns" — `retry.maxRetries` can be raised, but the
 backoff `baseDelayMs * 2^(attempt-1)` then grows unboundedly (17 min, 34 min,
 68 min, … gaps), so a laptop left on through an overnight outage waits hours
@@ -353,7 +353,7 @@ keyboard. Observed wedging three sessions in one working session (agent-infra
 
 **Verified against:** pi v0.85.1, `dist/core/agent-session.js` (line numbers
 below are that file). Note: this install also carries agent-infra's own
-offline-resume patch (`scripts/patch-pi-retry.sh`), so a pristine upstream
+bounded-retry patch (`scripts/patch-pi-retry.sh`), so a pristine upstream
 install may carry these lines shifted by a few — verify by code, not by line
 number.
 

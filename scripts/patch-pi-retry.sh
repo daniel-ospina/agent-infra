@@ -53,6 +53,12 @@ set -uo pipefail
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"
 MARKER="agent-infra offline-resume patch"
+# Present ONLY in the current injected comment. The already-patched fast path
+# requires it too, so an install patched by an earlier version of this script
+# (right cap, stale comment) is normalized rather than left claiming the old
+# contract in the dist (#1088 review P1: changing the comment text without this
+# silently broke the idempotent fast path on every sync).
+COMMENT_TOKEN="bounded retry (#318/#1088)"
 
 # #254 drift-watch precondition (Task 10): pi version change without a
 # successful oracle re-probe is a LOUD FAILURE. The frontmatter validator's
@@ -139,16 +145,18 @@ PATCHED_LINE2="        const delayMs = Math.min(policy.baseDelayMs * 2 ** (attem
 # THIS cap (verification + already-patched check)
 #
 # Replacement is done with python3 (already a dependency of find_pi_pkg):
-# first-time apply = exact-line swap; already-patched-with-different-cap =
-# swap the cap digits in place (regex). The regex-based approach sidesteps
+# first-time apply = exact-line swap; already-patched = rewrite the WHOLE
+# injected block (comment lines + capped delay line), so the cap digits and the
+# comment can never disagree in the dist. The regex-based approach sidesteps
 # awk's BSD-vs-mawk newline/ERE divergence a shell-only version would hit.
 patch_file() {
   local file="$1" old="$2" new="$3" patched_line="$4"
-  if grep -qF "$MARKER" "$file" && grep -qF "$patched_line" "$file"; then
+  if grep -qF "$MARKER" "$file" && grep -qF "$patched_line" "$file" \
+     && grep -qF "$COMMENT_TOKEN" "$file"; then
     echo "    already patched (cap ${CAP_MS}ms): $file"
     return 0
   fi
-  grep -qF "$MARKER" "$file" && echo "    re-patching (cap changed to ${CAP_MS}ms): $file"
+  grep -qF "$MARKER" "$file" && echo "    re-patching (cap ${CAP_MS}ms / comment): $file"
   local tmp
   tmp="$(mktemp "$(dirname "$file")/.retry-patch.XXXXXX")"
   python3 - "$file" "$old" "$new" "$CAP_MS" "$tmp" << 'PY'
@@ -159,16 +167,22 @@ if old in src:
     # first-time (or a pi upgrade restored the uncapped shape)
     src = src.replace(old, new, 1)
 else:
-    # already patched with a DIFFERENT cap — swap the cap digits in place.
-    # group 1 = the prefix through ", ", group 2 = the old digits, group 3 =
-    # ");" — only the digits change; marker comment lines never match.
+    # Already patched — by this script (any cap) or by an earlier version whose
+    # comment still described the old contract. Rewrite the whole injected
+    # block: the marker comment line, any comment lines under it, and the capped
+    # delay line. Anchored on the marker, so it cannot swallow unrelated
+    # preceding comments.
     pat = re.compile(
-        r"(const delayMs = Math\.min\((?:settings\.baseDelayMs \* 2 \*\* \(this\._retryAttempt - 1\), "
-        r"|policy\.baseDelayMs \* 2 \*\* \(attempt - 1\), ))(\d+)(\);)"
+        r"[ \t]*// agent-infra offline-resume patch[^\n]*\n"
+        r"(?:[ \t]*//[^\n]*\n)*"
+        r"[ \t]*const delayMs = Math\.min\("
+        r"(?:settings\.baseDelayMs \* 2 \*\* \(this\._retryAttempt - 1\)"
+        r"|policy\.baseDelayMs \* 2 \*\* \(attempt - 1\))"
+        r", \d+\);"
     )
     if not pat.search(src):
         sys.exit(2)
-    src = pat.sub(lambda m: m.group(1) + newcap + m.group(3), src)
+    src = pat.sub(lambda m: new, src, count=1)
 open(out, "w", encoding="utf-8").write(src)
 PY
   local rc=$?
@@ -206,9 +220,9 @@ fi
 # Replacement text built with REAL newlines (ANSI-C quoting) — never rely on
 # awk's own \n processing, which differs between BSD awk and mawk.
 OLD1="        const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);"
-NEW1="$(printf '        // agent-infra bounded-retry patch (#318/#1088): cap the exponential backoff at %sms so\n        // the retry ladder stays uniform. The ATTEMPT budget is finite (settings.retry.maxRetries);\n        // this cap bounds each gap, not the budget.\n        const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
+NEW1="$(printf '        // agent-infra offline-resume patch — bounded retry (#318/#1088): cap the exponential\n        // backoff at %sms. The ATTEMPT budget is finite (settings.retry.maxRetries) — this caps each gap.\n        const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
 OLD2="        const delayMs = policy.baseDelayMs * 2 ** (attempt - 1);"
-NEW2="$(printf '        // agent-infra bounded-retry patch (#318/#1088): cap the exponential backoff at %sms for\n        // summarization/compaction so the retry ladder stays uniform. The attempt budget is finite;\n        // this cap bounds each gap, not the budget.\n        const delayMs = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
+NEW2="$(printf '        // agent-infra offline-resume patch — bounded retry (#318/#1088): cap the exponential\n        // backoff at %sms here too, so summarization/compaction keep the same uniform ladder.\n        const delayMs = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
 
 if [ "${1:-}" = "--check" ]; then
   local_ok=1

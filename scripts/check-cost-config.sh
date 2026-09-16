@@ -22,9 +22,12 @@
 #     refresh / first-install path)
 # The weekly report (fleet-cost-report.sh) + tripwire are the store alert path.
 #
-# Escape hatch: COST_CLAMP_OVERRIDE=1 silences the BLOCK (prints a loud
-# warning, still detects) — documented in docs/ops/cost-config-policy.md;
-# sanctioned only for the rollback window.
+# Escape hatch: COST_CLAMP_OVERRIDE=1 silences the CLAMP BLOCK (models.json /
+# models-store/catalog class) — prints a loud warning, still detects
+# (exit 0) — documented in docs/ops/cost-config-policy.md; sanctioned only for
+# the clamp's rollback window. It does NOT cover the retry/hang contract
+# (#1088): those violations count in RETRY_BLOCKS and still exit 1. An ambient
+# env var must not be able to defeat the retry bound.
 #
 # Usage:
 #   check-cost-config.sh                  shipped + live (live = $HOME/.pi/agent)
@@ -54,11 +57,16 @@ CLAMP=300000
 # the derived window: change one without the others and this guard fires.
 #
 #   HTTP_IDLE_TIMEOUT_MS       the SILENT-HANG ceiling — undici's
-#                              headers/body idle timeout (a hung attempt
-#                              emits no bytes; this fires long before the
-#                              SDK's total request timeout). #1088's measured
-#                              signature is exactly this mode: 0 B of socket
-#                              traffic on a session that never terminates.
+#                              headers/body idle timeout, i.e. time-to-first-
+#                              byte PLUS inter-chunk idle (a hung attempt emits
+#                              no bytes; this fires long before the SDK's total
+#                              request timeout). #1088's measured signature is
+#                              exactly this mode: 0 B of socket traffic on a
+#                              session that never terminates. Pinned to pi's own
+#                              DEFAULT_HTTP_IDLE_TIMEOUT_MS (300000,
+#                              dist/core/http-dispatcher.js) — do NOT go below
+#                              it without a measurement: it is also the ceiling
+#                              on a 300K-context prefill's time-to-first-byte.
 #   RETRY_PROVIDER_TIMEOUT_MS  the legitimate-call ceiling (SDK total request
 #                              timeout). Must EXCEED the idle ceiling so a hung
 #                              attempt is cut by idle, not by the full budget;
@@ -71,12 +79,12 @@ CLAMP=300000
 #                              (every attempt burns its full SDK ceiling).
 # Recompute after ANY change with:
 #   bash scripts/check-cost-config.sh --live-dir pi-bootstrap/pi-config
-HTTP_IDLE_TIMEOUT_MS=180000
+HTTP_IDLE_TIMEOUT_MS=300000
 RETRY_MAX_RETRIES=7
 RETRY_BASE_DELAY_MS=2000
 RETRY_MAX_BACKOFF_MS=60000
 RETRY_PROVIDER_TIMEOUT_MS=600000
-HANG_WINDOW_CEILING_MS=1800000
+HANG_WINDOW_CEILING_MS=2700000
 WORST_WINDOW_CEILING_MS=5400000
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PATCH_SCRIPT="$ROOT/scripts/patch-pi-retry.sh"
@@ -85,10 +93,11 @@ LIVE_DIR="${HOME}/.pi/agent"
 SHIPPED_ONLY=0
 OVERRIDE="${COST_CLAMP_OVERRIDE:-0}"
 BLOCKS=0
+RETRY_BLOCKS=0
 WARNS=0
 
 usage() {
-  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -104,6 +113,10 @@ done
 ok()  { echo "  ✅ $1"; }
 warn() { echo "  ⚠️  $1"; WARNS=$((WARNS + 1)); }
 block() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); }
+# Retry/hang-contract blocks are counted separately so COST_CLAMP_OVERRIDE=1
+# (the clamp's rollback escape) cannot silence them — an ambient env var must
+# not be able to defeat the retry bound (#1088 review P1).
+block_retry() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); RETRY_BLOCKS=$((RETRY_BLOCKS + 1)); }
 
 # deepseek_violations <file> — canonical matcher over the PARSED JSON tree.
 # Format-independent: walks every dict/list node (pretty, minified, reordered
@@ -184,6 +197,7 @@ path, patch_path = sys.argv[1], sys.argv[2]
  PROVIDER_EXPECTED, HANG_CEILING, WORST_CEILING) = map(int, sys.argv[3:10])
 
 issues = []
+retry_issues = []        # emitted with the RETRY_CONTRACT: tag (override-immune)
 
 def q(v):
     if v is None:
@@ -218,15 +232,20 @@ mr = retry.get("maxRetries")
 base = retry.get("baseDelayMs")
 idle = d.get("httpIdleTimeoutMs")
 ptimeout = provider.get("timeoutMs")
+pmr = provider.get("maxRetries")
 
 if mr != MR_EXPECTED:
-    issues.append(f"retry.maxRetries expected {MR_EXPECTED} (bounded-hang contract), got {q(mr)}")
+    retry_issues.append(f"retry.maxRetries expected {MR_EXPECTED} (bounded-hang contract), got {q(mr)}")
 if base != BASE_EXPECTED:
-    issues.append(f"retry.baseDelayMs expected {BASE_EXPECTED} (the hang-window arithmetic), got {q(base)}")
+    retry_issues.append(f"retry.baseDelayMs expected {BASE_EXPECTED} (the hang-window arithmetic), got {q(base)}")
 if idle != IDLE_EXPECTED:
-    issues.append(f"httpIdleTimeoutMs expected {IDLE_EXPECTED} (the silent-hang ceiling), got {q(idle)}")
+    retry_issues.append(f"httpIdleTimeoutMs expected {IDLE_EXPECTED} (the silent-hang ceiling), got {q(idle)}")
 if ptimeout != PROVIDER_EXPECTED:
-    issues.append(f"retry.provider.timeoutMs expected {PROVIDER_EXPECTED} (the per-call ceiling), got {q(ptimeout)}")
+    retry_issues.append(f"retry.provider.timeoutMs expected {PROVIDER_EXPECTED} (the per-call ceiling), got {q(ptimeout)}")
+# Provider-level retries multiply the provider calls inside ONE attempt, so they
+# are part of the window. pi's own settings doc says keep this at 0.
+if pmr not in (None, 0):
+    retry_issues.append(f"retry.provider.maxRetries must be absent or 0 (it multiplies calls per attempt), got {q(pmr)}")
 
 # The backoff cap lives in patch-pi-retry.sh (it is interpolated into the pi
 # dist patch). Read it back rather than duplicating it; unreadable = fail
@@ -240,25 +259,23 @@ try:
 except Exception:
     patch_cap = None
 if patch_cap is None:
-    issues.append(f"retry backoff cap unreadable from {patch_path} — cannot bound the hang window (fail-closed)")
+    retry_issues.append(f"retry backoff cap unreadable from {patch_path} — cannot bound the hang window (fail-closed)")
 elif patch_cap != CAP_EXPECTED:
-    issues.append(f"patch-pi-retry.sh backoff cap expected {CAP_EXPECTED}, got {patch_cap}")
+    retry_issues.append(f"patch-pi-retry.sh backoff cap expected {CAP_EXPECTED}, got {patch_cap}")
 
 # Ceiling ordering: a hung attempt must be cut by the IDLE ceiling, not by the
 # full per-call budget — otherwise the idle ceiling is inert and the hang
 # window silently becomes maxRetries x providerTimeout.
 if isinstance(idle, int) and isinstance(ptimeout, int) and ptimeout <= idle:
-    issues.append(f"retry.provider.timeoutMs ({ptimeout}) must exceed httpIdleTimeoutMs ({idle}) — "
-                  f"otherwise the silent-hang ceiling can never fire first")
+    retry_issues.append(f"retry.provider.timeoutMs ({ptimeout}) must exceed httpIdleTimeoutMs ({idle}) — "
+                        f"otherwise the silent-hang ceiling can never fire first")
 
 # Derived window. The no-progress (hung) window uses the idle ceiling; the
 # worst-case window assumes every attempt burns its full SDK request ceiling.
 nums = (mr, base, patch_cap, idle, ptimeout)
 if all(isinstance(v, int) and v > 0 for v in nums):
     n = mr
-    backoff = 0
-    v = base
-    i = 0
+    backoff, v, i = 0, base, 0
     while i < n:
         if v >= patch_cap:
             backoff += patch_cap * (n - i)
@@ -270,18 +287,20 @@ if all(isinstance(v, int) and v > 0 for v in nums):
     worst = (n + 1) * ptimeout + backoff
     print(f"WINDOW hung={hang} worst={worst} backoff={backoff}")
     if hang > HANG_CEILING:
-        issues.append(f"hang window {hang}ms ({hang / 60000:.1f} min) exceeds the declared "
-                      f"ceiling {HANG_CEILING}ms — the retry budget and the per-attempt "
-                      f"ceiling drifted apart")
+        retry_issues.append(f"hang window {hang}ms ({hang / 60000:.1f} min) exceeds the declared "
+                            f"ceiling {HANG_CEILING}ms — the retry budget and the per-attempt "
+                            f"ceiling drifted apart")
     if worst > WORST_CEILING:
-        issues.append(f"worst-case window {worst}ms ({worst / 60000:.1f} min) exceeds the "
-                      f"declared ceiling {WORST_CEILING}ms")
+        retry_issues.append(f"worst-case window {worst}ms ({worst / 60000:.1f} min) exceeds the "
+                            f"declared ceiling {WORST_CEILING}ms")
 else:
     print("WINDOW hung=0 worst=0 backoff=0")
 
 for i in issues:
     print(i)
-sys.exit(1 if issues else 0)
+for i in retry_issues:
+    print(f"RETRY_CONTRACT: {i}")
+sys.exit(1 if (issues or retry_issues) else 0)
 PYEOF
 }
 
@@ -344,20 +363,56 @@ check_settings_file() {
   issues="$(printf '%s\n' "$raw" | sed '/^WINDOW /d')"
   if [ -n "$issues" ]; then
     while IFS= read -r i; do
-      block "$label — $i"
+      case "$i" in
+        RETRY_CONTRACT:*) block_retry "$label — ${i#RETRY_CONTRACT: }" ;;
+        *) block "$label — $i" ;;
+      esac
     done <<< "$issues"
   else
     ok "$label — compaction (enabled + 16384/12000) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
   fi
 }
 
+# check_project_settings — pi merges a PROJECT settings file OVER the global one
+# (`SettingsManager`: settings = deepMergeSettings(globalSettings, projectSettings),
+# path `<cwd>/.pi/settings.json` when the project is trusted), so a project file
+# can revert the whole retry contract while the shipped and live files read
+# clean. The guard only sees the checkout it is given, so it fails CLOSED on any
+# project settings file that touches the contract keys. (Other repos' project
+# settings are outside this guard's reach — a documented scope boundary, see
+# docs/ops/cost-config-policy.md §2.)
+check_project_settings() {
+  local file="$ROOT/.pi/settings.json" hit
+  [ -f "$file" ] || { ok "no project settings file ($ROOT/.pi/settings.json)"; return 0; }
+  hit="$(python3 - "$file" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"PARSE_ERROR: {e}")
+    sys.exit(0)
+keys = [k for k in ("retry", "httpIdleTimeoutMs") if k in d]
+print(", ".join(keys))
+PYEOF
+)"
+  case "$hit" in
+    PARSE_ERROR:*)
+      block_retry "project settings ($file) is unparseable — cannot assert the retry contract against a file pi merges over the global settings ($hit)" ;;
+    "")
+      ok "project settings ($file) does not touch the retry contract" ;;
+    *)
+      block_retry "project settings ($file) overrides the retry contract ($hit) — pi merges project settings OVER the global ones, so this silently reverts the shipped contract; remove the key here" ;;
+  esac
+}
+
 echo "== cost-config guard (#341) — deepseek context clamp @${CLAMP} =="
-[ "$OVERRIDE" = "1" ] && echo "   ⛔ COST_CLAMP_OVERRIDE=1 is SET — guard blocks will be SILENCED (escape hatch, see docs/ops/cost-config-policy.md)"
+[ "$OVERRIDE" = "1" ] && echo "   ⛔ COST_CLAMP_OVERRIDE=1 is SET — CLAMP blocks will be SILENCED. Retry/hang-contract blocks (#1088) are NOT covered by this escape and still exit 1."
 echo ""
 
 check_model_file "$SHIPPED_DIR/models.json" "shipped models.json" models block
 check_model_file "$SHIPPED_DIR/models-store.json" "shipped models-store.json" store warn
 check_settings_file "$SHIPPED_DIR/settings.json" "shipped settings.json" block
+check_project_settings
 
 if [ "$SHIPPED_ONLY" = 1 ]; then
   echo ""
@@ -375,8 +430,13 @@ fi
 
 echo ""
 if [ "$OVERRIDE" = "1" ]; then
-  echo "⛔ COST_CLAMP_OVERRIDE=1 — BLOCK silenced by documented escape. Violations above are still DETECTED;"
-  echo "   this is sanctioned only for the rollback window (revert commit + threshold update in the same commit)."
+  if [ "$RETRY_BLOCKS" -gt 0 ]; then
+    echo "❌ cost-config guard: $RETRY_BLOCKS retry/hang-contract BLOCK(s) — COST_CLAMP_OVERRIDE=1 does NOT cover"
+    echo "   the retry contract (the clamp rollback window does not extend to it, #1088). Guard: exit 1."
+    exit 1
+  fi
+  echo "⛔ COST_CLAMP_OVERRIDE=1 — clamp BLOCK silenced by documented escape. Violations above are still DETECTED;"
+  echo "   this is sanctioned only for the clamp rollback window (revert commit + threshold update in the same commit)."
   echo "⛔ Guard: OVERRIDDEN → exit 0"
   exit 0
 fi

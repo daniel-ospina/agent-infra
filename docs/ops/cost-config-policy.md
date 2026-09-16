@@ -93,13 +93,14 @@ exact values and the **derived window**:
 | `retry.maxRetries` | `7` | 8 attempts total — the attempt budget |
 | `retry.baseDelayMs` | `2000` | backoff base: 2s, 4s, 8s, 16s, 32s, 60s, 60s |
 | backoff cap (`patch-pi-retry.sh`, `PI_MAX_RETRY_DELAY_MS`) | `60000` | 1-minute retry cadence — uniform, never 17m/34m/68m gaps |
-| `httpIdleTimeoutMs` | `180000` | **silent-hang ceiling** (undici headers/body idle) |
+| `httpIdleTimeoutMs` | `300000` | **silent-hang ceiling** (undici headers/body idle; pi's own default) |
 | `retry.provider.timeoutMs` | `600000` | **per-call ceiling** (SDK total request) — unchanged |
+| `retry.provider.maxRetries` | absent / `0` | provider-level retries multiply the calls inside one attempt — pinned off |
 
 Derived, and enforced by the guard:
 
-- **no-progress window** `(7+1) x 180000 + 182000` = `1,622,000 ms` ≈ **27.0 min**
-  ≤ the declared **30-minute** ceiling (`HANG_WINDOW_CEILING_MS` = `1800000`).
+- **no-progress window** `(7+1) x 300000 + 182000` = `2,582,000 ms` ≈ **43.0 min**
+  ≤ the declared **45-minute** ceiling (`HANG_WINDOW_CEILING_MS` = `2700000`).
 - **worst-case window** (every attempt burns its full SDK ceiling)
   `(7+1) x 600000 + 182000` = `4,982,000 ms` ≈ **83 min**
   ≤ the declared **90-minute** ceiling (`WORST_WINDOW_CEILING_MS` = `5400000`).
@@ -111,10 +112,11 @@ Derived, and enforced by the guard:
 - *Poisoned pool / persistent outage* — the observed #1088 mode: the attempt
   either fails fast or stalls **silently**, and the session is invisible. The
   silent hang is bounded by the **idle** ceiling, because a hung attempt emits
-  no bytes — exactly the measured 0 B signature. 3 minutes of zero-byte
-  silence is ~2 orders of magnitude above a normal time-to-first-token on a
-  300K-context request; 8 attempts x (<=3 min idle + <=1 min backoff) bounds
-  the whole hang to ~27 min — a coffee break, not a season.
+  no bytes — exactly the measured 0 B signature. 5 minutes of zero-byte silence
+  is ~1.5 orders of magnitude above a normal time-to-first-token on a
+  300K-context request; 8 attempts x (<=5 min idle + <=1 min backoff) bounds the
+  whole hang to ~43 min — a coffee break, not a season. (On this host the
+  observed cost was 34-104 days.)
 - *Transient outage* — wifi handoff, load-balancer restart, short provider
   blip. The ladder still rides ~3 minutes of retrying, and #1110 is what makes
   a tighter budget safe: the retry that lands after connectivity returns now
@@ -123,12 +125,38 @@ Derived, and enforced by the guard:
   than absorbing an arbitrary deadline; the user re-issues one message. That is
   the deliberate trade: the old contract promised unattended survival of *any*
   outage and in practice delivered a silent multi-day hang.
-- *Legitimate slow call* — `retry.provider.timeoutMs` is deliberately
-  **unchanged** at 10 min, so a 300K-context compaction/summarization is never
-  false-killed; tightening it is a cost conversation, not a hang fix. What
-  matters is the **ordering invariant**: the idle ceiling must be *strictly
-  below* the per-call ceiling, or the silent-hang ceiling can never fire first
-  and the no-progress window silently becomes `maxRetries x providerTimeout`.
+- *Legitimate slow call* — the two ceilings bound **different things**, and the
+  ordering between them is what keeps that true. `httpIdleTimeoutMs` =
+  `300000` is pi's own `DEFAULT_HTTP_IDLE_TIMEOUT_MS`; it maps to undici
+  `headersTimeout`/`bodyTimeout`, so it bounds a call that **never emits a
+  byte** (a 300K-context prefill's time-to-first-byte, or a mid-stream stall).
+  `retry.provider.timeoutMs` = `600000` (unchanged) bounds a call that *is*
+  streaming. The enforced invariant is `httpIdleTimeoutMs < provider.timeoutMs`:
+  if the total ceiling were at or below the idle ceiling, the idle ceiling could
+  never fire first and the no-progress window would silently become
+  `maxRetries x providerTimeout`. Going *below* pi's default idle ceiling is
+  deliberately **not** done — that would need a measured time-to-first-byte
+  distribution for 300K-context requests, which we do not have; 5 minutes is the
+  upstream-considered value, so the fleet's previous 10 minutes was the
+  unmeasured outlier.
+
+**What can defeat it (checked, not assumed).** Three escapes were closed or
+scoped explicitly:
+
+- `COST_CLAMP_OVERRIDE=1` silences the **clamp** block only. Retry-contract
+  violations are counted separately (`RETRY_BLOCKS`) and the guard still exits
+  1 — an ambient env var must not be able to defeat the retry bound (§6 below
+  documents the override, and this carve-out is pinned by a test).
+- **Project settings.** pi merges `<cwd>/.pi/settings.json` *over* the global
+  settings, so a project file could revert the contract while the shipped and
+  live files read clean. The guard fails closed on any `$ROOT/.pi/settings.json`
+  that carries `retry` or `httpIdleTimeoutMs` (and on an unparseable one).
+  Scope boundary, stated plainly: a *different* repo's project settings file is
+  outside any guard run inside this repo — the check protects the checkout the
+  guard is given, which is the only one it can see.
+- **Provider-level retries.** `retry.provider.maxRetries > 0` multiplies the
+  provider calls inside one attempt, so it is part of the window; it is pinned
+  to absent/`0` (pi's own settings doc says the same).
 
 **Coupling — the actual bug class.** The pre-#1088 guard pinned the attempt
 count alone (`retry.maxRetries != 10000` → BLOCK) while this doc declared it
@@ -141,7 +169,7 @@ and BLOCKs when any of: a pinned value drifts, the cap and the guard disagree,
 the two ceilings invert, or either window exceeds its declared ceiling. A
 missing/unreadable patch script is a **fail-closed BLOCK** — a window that
 cannot be computed must never read green. `tests/cost-config/run.sh` tests
-15–19 pin guard↔settings↔patch↔doc, including the case where the guard
+15–21 pin guard↔settings↔patch↔doc, including the case where the guard
 constants and the settings are moved **together** to 8 retries: the
 exact-value checks stay green and the **derived** window check is what fires.
 There is no `COST_CLAMP_OVERRIDE` for this contract: unlike the context clamp,
@@ -208,14 +236,16 @@ property; this guard is the pattern to copy, not a substitute for it.
   - `models.json` drift (any deepseek-served id > 300K) → **BLOCK (exit 1)**.
   - `settings.json` drift (compaction block: enabled + `reserveTokens` 16384 +
     `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract:
-    `retry.maxRetries` 7, `httpIdleTimeoutMs` 180000, `retry.baseDelayMs`
-    2000, `retry.provider.timeoutMs` 600000; or a missed
-    `retry.provider.timeoutMs` > `httpIdleTimeoutMs` ordering; or a DERIVED
-    retry/hang window over its declared ceiling) →
+    `retry.maxRetries` 7, `httpIdleTimeoutMs` 300000, `retry.baseDelayMs`
+    2000, `retry.provider.timeoutMs` 600000, `retry.provider.maxRetries`
+    absent/0; or a missed `retry.provider.timeoutMs` > `httpIdleTimeoutMs`
+    ordering; or a DERIVED retry/hang window over its declared ceiling) →
     **BLOCK (exit 1)**. Drift in `scripts/patch-pi-retry.sh`'s backoff cap
     (`RETRY_MAX_BACKOFF_MS` 60000) — or an unreadable/missing patch script —
     is **BLOCK (exit 1)** too: the window cannot be computed without it, and a
-    bound that cannot be computed must never read green.
+    bound that cannot be computed must never read green. A project settings
+    file (`<repo>/.pi/settings.json`) carrying `retry` or `httpIdleTimeoutMs`
+    is **BLOCK (exit 1)** as well (pi merges it OVER the global settings).
   - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
     deletion of the clamp authority is itself terminal drift (clamp gone while
     CI stays green). Store-class and live-dir-missing (first-install) stay
@@ -237,10 +267,15 @@ property; this guard is the pattern to copy, not a substitute for it.
 
 ## 6. `COST_CLAMP_OVERRIDE=1` — the documented escape
 
-- The guard honors `COST_CLAMP_OVERRIDE=1`: it **silences the BLOCK, prints a
-  loud warning, still detects** (exit 0).
-- **Sanctioned use: the rollback window only.** It never enables a live 1M
-  session silently — it is the in-window escape while the revert commit is
+- The guard honors `COST_CLAMP_OVERRIDE=1`: it **silences the CLAMP BLOCK,
+  prints a loud warning, still detects** (exit 0).
+- **It does not cover the retry/hang contract (#1088).** Retry-contract
+  violations are counted separately (`RETRY_BLOCKS`); even with the override
+  set, the guard exits 1 when any is present, and the banner says so. The
+  override exists for the clamp's rollback window; the retry contract has no
+  rollback window, so extending the escape to it would be a pure bypass.
+- **Sanctioned use: the clamp rollback window only.** It never enables a live
+  1M session silently — it is the in-window escape while the revert commit is
   prepared. A per-session override was explicitly dropped: startup auto-sync
   clobbers live edits (verified), so the committed revert is the only durable
   escape.

@@ -2354,12 +2354,16 @@ export function heartbeatKillDecision(
   const effStreamAge = st.streamAgeMs + markerAge;
   const effToolAge = st.toolAgeMaxMs + markerAge;
 
-  // #318: network-aware survival — a sub-agent whose LLM call is failing
-  // because the network is down (pi retry: quick attempts then every 5 min)
-  // looks exactly like a stall to every waiting clause below. When the
-  // network is unreachable AND the child is demonstrably alive (fresh
-  // heartbeat markers), suppress the stall clauses so it survives the outage
-  // in place and resumes when connectivity returns. Stale markers (dead
+  // #318/#1088: network-aware survival — a sub-agent whose LLM call is failing
+  // because the network is down (pi retry: quick attempts, then a uniform 1-min
+  // cadence, then a VISIBLE stop once the finite budget is spent) looks exactly
+  // like a stall to every waiting clause below. When the network is unreachable
+  // AND the child is demonstrably alive (fresh heartbeat markers), suppress the
+  // stall clauses so it survives the outage in place and resumes when
+  // connectivity returns. The suppression is bounded by the retry contract's
+  // budget (and, as the last resort, TASK_HARD_CAP_MS): it delays the stall kill
+  // by the retry window, it does not make the child survive an arbitrary outage.
+  // Stale markers (dead
   // child) or a reachable network fail open to the exact legacy decision.
   // tier-1 zero-output is untouched (it requires !sawReady — a child that
   // never initialized is a startup hang, outage or not).

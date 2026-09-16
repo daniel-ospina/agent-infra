@@ -198,9 +198,9 @@ means a session stops dead. The agent-infra bounded-retry patch changes the
 policy to: quick retries first, then a uniform 1-minute retry cadence —
 **bounded to a finite budget**, so a transient outage recovers on its own and a
 persistent failure terminates the turn **visibly** instead of spinning. See
-`docs/ops/cost-config-policy.md` §2 for the contract and the arithmetic; the
-numbers below are that contract's, and `scripts/check-cost-config.sh` fails
-CI if this table, the settings, and the patch drift apart.
+`docs/ops/cost-config-policy.md` §2 for the contract, the arithmetic, and the
+guard coupling; that section — not this summary — is the authority pinned to
+`scripts/check-cost-config.sh` by `tests/cost-config/run.sh` test 19.
 
 ### What changed
 
@@ -208,8 +208,8 @@ CI if this table, the settings, and the patch drift apart.
 |---|---|---|
 | Agent-turn retry (the visible "Retry N/M" path) | Backoff capped at 1 min | patched `dist/core/agent-session.js` in the installed pi |
 | Compaction / branch-summary retry | Same 1-min cap (same no-cap backoff) | patched `pi-ai/dist/utils/retry.js` |
-| Retry budget | `retry.maxRetries: 7` (8 attempts; ~27 min no-progress window, ~3 min retry ladder) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
-| Silent-hang ceiling | `httpIdleTimeoutMs: 180000` (undici headers/body idle) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
+| Retry budget | `retry.maxRetries: 7` (8 attempts; ~43 min no-progress window, ~3 min retry ladder) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
+| Silent-hang ceiling | `httpIdleTimeoutMs: 300000` (undici headers/body idle — pi's own default) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
 | Task sub-agents | Network-aware kill suppression — while the network is unreachable AND the child is alive (fresh heartbeat markers), the stall clauses (stream-stall / silence / first-message) don't kill it; it survives in retry | `extensions/builtin-tools/index.ts` (`heartbeatKillDecision` + probe in the heartbeat loop) |
 
 ### The patch lifecycle
@@ -227,10 +227,10 @@ scripts/patch-pi-retry.sh --check
 
 ### Behavior
 
-- Network dies mid-turn: 3 quick retries (2s/4s/8s), then retries at
-  16s → 32s → 60s → 60s → 60s → 60s → **stop, and surface the failure**
-  (8 attempts total). The retry ladder is ~3 min; the no-progress window is
-  ~27 min worst case (see `docs/ops/cost-config-policy.md` §2).
+- Network dies mid-turn: 3 quick retries (2s/4s/8s), then retries after
+  16s → 32s → 60s → 60s → **stop, and surface the failure** (8 attempts total;
+  7 backoff gaps). The retry ladder is ~3 min; the no-progress window is
+  ~43 min worst case (see `docs/ops/cost-config-policy.md` §2).
 - Abort anytime with Esc (RPC `abort_retry`); `retry.enabled: false` in
   settings disables retrying entirely (setup.sh deep-merges the `retry` block
   per-key, so a local `enabled: false` survives every sync). A persistent
