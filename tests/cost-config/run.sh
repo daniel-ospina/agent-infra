@@ -34,6 +34,8 @@
 #  24. patch-pi-retry.sh idempotency/normalization over a fake pi tree:
 #      pristine → patched, re-run → byte-identical, stale-comment + wrong cap →
 #      rewritten, changed upstream shape → loud failure (never a silent no-op)
+#  25. no doc states a stale retry/hang number (the duplicate-drift pin — three
+#      copies of the idle value drifted exactly this way twice in review)
 #   6. COST_CLAMP_OVERRIDE=1                       → exit 0 + loud notice
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
@@ -86,8 +88,11 @@ for _c in RETRY_MAX_RETRIES HTTP_IDLE_TIMEOUT_MS RETRY_BASE_DELAY_MS \
   fi
 done
 
-# Test 24 needs the backoff cap as a VALUE (the loop above only presence-checks).
+# Test 24-25 need the contract constants as VALUES (the loop above only
+# presence-checks them).
 CAP_GUARD="$(sed -n 's/^RETRY_MAX_BACKOFF_MS=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
+HTTP_IDLE_TIMEOUT_MS_G="$(sed -n 's/^HTTP_IDLE_TIMEOUT_MS=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
+RETRY_PROVIDER_TIMEOUT_MS_G="$(sed -n 's/^RETRY_PROVIDER_TIMEOUT_MS=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
 
 # mkroot <dir> — a self-contained guard root (guard + patch script + configs)
 # so mutation tests can perturb one input without touching the repo.
@@ -652,7 +657,20 @@ if [ "$code" -eq 1 ]; then
 else
   fail "expected exit 1 for an unparseable settings file under the override, got $code"; sed -n '1,30p' "$OUT"
 fi
-if grep -q "cannot be asserted on an unparseable settings file" "$OUT"; then pass "unparseable-settings fail-closed message present"; else fail "expected the unparseable-settings message"; sed -n '1,30p' "$OUT"; fi
+if grep -q "the retry/hang contract cannot be asserted" "$OUT"; then pass "unparseable-settings fail-closed message present"; else fail "expected the unparseable-settings message"; sed -n '1,30p' "$OUT"; fi
+# Valid JSON that is NOT an object: `d.get(...)` used to raise AttributeError, whose
+# traceback reached the issue loop as an untagged line → plain block() → the override
+# silenced it (cycle-3 P1).
+printf '[1,2,3]' >"$TMP22/pi-bootstrap/pi-config/settings.json"
+COST_CLAMP_OVERRIDE=1 bash "$TMP22/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then
+  pass "non-object settings JSON + override → still exit 1 (fail-closed)"
+else
+  fail "expected exit 1 for non-object settings JSON under the override, got $code"; sed -n '1,30p' "$OUT"
+fi
+if grep -q "is not a JSON object" "$OUT"; then pass "non-object diagnostic names the shape (no raw traceback)"; else fail "expected the 'is not a JSON object' diagnostic"; sed -n '1,30p' "$OUT"; fi
+if grep -q 'Traceback' "$OUT"; then fail "a raw Python traceback reached the user"; else pass "no raw traceback in the output"; fi
 rm -rf "$TMP22"
 
 echo ""
@@ -661,15 +679,16 @@ TMP23="$(mktemp -d /tmp/cost-config-projsettings-nested.XXXXXX)"
 mkroot "$TMP23"
 mkdir -p "$TMP23/extensions/.pi" "$TMP23/.worktrees/other/.pi"
 echo '{"theme":"dark"}' >"$TMP23/extensions/.pi/settings.json"
-echo '{"retry":{"maxRetries":3}}' >"$TMP23/.worktrees/other/.pi/settings.json"
+echo '{"theme":"light"}' >"$TMP23/.worktrees/other/.pi/settings.json"
 bash "$TMP23/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 0 ]; then
-  pass "nested non-contract project file scanned; sibling worktree pruned → exit 0"
+  pass "nested non-contract project files scanned → exit 0"
 else
   fail "expected exit 0, got $code"; sed -n '1,30p' "$OUT"
 fi
-if grep -q "does not touch the retry contract" "$OUT"; then pass "nested project file was actually walked (not silently skipped)"; else fail "nested project file was NOT scanned — the walk missed it"; sed -n '1,30p' "$OUT"; fi
+scanned="$(grep -c "does not touch the retry contract" "$OUT")"
+if [ "$scanned" -eq 2 ]; then pass "both nested project files were walked (subdir + .worktrees)"; else fail "expected 2 walked project files, saw $scanned — the walk missed one"; sed -n '1,30p' "$OUT"; fi
 echo '{"retry":{"maxRetries":3}}' >"$TMP23/extensions/.pi/settings.json"
 bash "$TMP23/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
@@ -679,6 +698,18 @@ else
   fail "expected exit 1 for a nested project settings file, got $code"; sed -n '1,30p' "$OUT"
 fi
 if grep -q "extensions/.pi/settings.json" "$OUT"; then pass "the offending path is named in the block"; else fail "expected the nested path in the message"; sed -n '1,30p' "$OUT"; fi
+# `.worktrees/` is gitignored but IS a live session cwd — an untracked project file
+# there must not be invisible to the guard (cycle-3 review).
+echo '{"theme":"dark"}' >"$TMP23/extensions/.pi/settings.json"
+echo '{"retry":{"maxRetries":10000}}' >"$TMP23/.worktrees/other/.pi/settings.json"
+bash "$TMP23/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then
+  pass "contract-reverting project file under .worktrees/ → exit 1 (not pruned)"
+else
+  fail "expected exit 1 for a .worktrees project settings file, got $code"; sed -n '1,30p' "$OUT"
+fi
+if grep -q "worktrees/other/.pi/settings.json" "$OUT"; then pass "the .worktrees path is named in the block"; else fail "expected the .worktrees path in the message"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP23"
 
 echo ""
@@ -742,6 +773,49 @@ if [ "$(printf '%s\n' "$PATHS" | head -1)" = "$PKG" ]; then
   if grep -q 'patch target not found' "$OUT"; then pass "changed shape fails loudly with the upgrade diagnostic"; else fail "expected the 'patch target not found' diagnostic"; sed -n '1,20p' "$OUT"; fi
 fi
 rm -rf "$TMP24"
+
+echo ""
+echo "25. no doc states a stale retry/hang number (duplicate-drift pin)"
+python3 - "$ROOT" "$CLAMP_EXPECTED" "$HTTP_IDLE_TIMEOUT_MS_G" "$RETRY_PROVIDER_TIMEOUT_MS_G" "$CAP_GUARD" <<'PY' >"$OUT" 2>&1
+import os, re, sys
+root, clamp, idle, prov, cap = sys.argv[1:6]
+IDLE, PROV, CAP = int(idle), int(prov), int(cap)
+# Values that may legitimately appear on a line naming `httpIdleTimeoutMs`:
+# the contract's idle ceiling and the per-call ceiling it sits under (a line
+# documenting BOTH knobs names both). Anything else is a stale duplicate.
+ALLOWED = {str(IDLE), str(PROV), str(clamp)}
+bad = []
+for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
+    dirnames[:] = [d for d in dirnames if d not in {"node_modules", ".git"}]
+    for fn in filenames:
+        if not fn.endswith(".md"):
+            continue
+        p = os.path.join(dirpath, fn)
+        rel = os.path.relpath(p, root)
+        for n, line in enumerate(open(p, encoding="utf-8"), 1):
+            # (1) a value ATTACHED to the key (`httpIdleTimeoutMs: 300000`,
+            # `| httpIdleTimeoutMs | 300000 |`) must be the contract value.
+            for m in re.finditer(r"httpIdleTimeoutMs[^0-9\n]{0,6}(\d{5,7})", line):
+                if m.group(1) not in ALLOWED:
+                    bad.append(f"{rel}:{n} states httpIdleTimeoutMs {m.group(1)} "
+                               f"(contract idle={IDLE}, per-call={PROV})")
+            # (2) the backoff cap, restated in prose as a duration.
+            m = re.search(r"(\d+)-minute capped retry", line)
+            if m and int(m.group(1)) * 60000 != CAP:
+                bad.append(f"{rel}:{n} says '{m.group(1)}-minute capped retry' "
+                           f"but the cap is {CAP}ms")
+            # (3) the fleet's live idle value, named in passing (the exact drift
+            # this pin exists for — it was 600000 in three places after #1088).
+            m = re.search(r"the fleet runs (\d+)", line)
+            if m and m.group(1) != str(IDLE):
+                bad.append(f"{rel}:{n} says 'the fleet runs {m.group(1)}' "
+                           f"but the contract idle ceiling is {IDLE}")
+if bad:
+    print("❌ " + "\n❌ ".join(bad))
+    sys.exit(1)
+print(f"OK no stale retry/hang numbers in docs/**/*.md (idle={IDLE}, per-call={PROV}, cap={CAP})")
+PY
+if [ $? -eq 0 ]; then pass "$(cat "$OUT")"; else fail "stale retry/hang number in a doc: $(cat "$OUT")"; fi
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

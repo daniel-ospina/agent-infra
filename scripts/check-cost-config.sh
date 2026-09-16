@@ -213,6 +213,16 @@ except Exception as e:
     print(f"PARSE_ERROR: {path}: {e}")
     sys.exit(1)
 
+# Valid JSON that is not an object (`[1,2,3]`, `"x"`, `42`, `null`) carries no
+# `compaction`/`retry` keys at all — the contract is unassertable, and the bare
+# `d.get(...)` below used to raise AttributeError, whose traceback reached the
+# guard's issue loop as an UNTAGGED line and was therefore emitted with plain
+# block(), silencing it under COST_CLAMP_OVERRIDE=1 (#1088 review cycle 3, P1).
+if not isinstance(d, dict):
+    print(f"RETRY_CONTRACT: {path} is not a JSON object (got {type(d).__name__}) — the compaction + "
+          "retry/hang contract cannot be asserted (fail-closed)")
+    sys.exit(1)
+
 comp = d.get("compaction")
 if not isinstance(comp, dict):
     issues.append("compaction.reserveTokens expected 16384, got 'missing'")
@@ -365,14 +375,19 @@ check_settings_file() {
   window_hung="$(printf '%s\n' "$raw" | sed -n 's/^WINDOW hung=\([0-9]*\) .*/\1/p')"
   window_worst="$(printf '%s\n' "$raw" | sed -n 's/^WINDOW hung=[0-9]* worst=\([0-9]*\) .*/\1/p')"
   issues="$(printf '%s\n' "$raw" | sed '/^WINDOW /d')"
-  if [ -n "$issues" ]; then
+  if [ -z "$window_hung" ]; then
+    # settings_violations ALWAYS emits the derived WINDOW line when it completes.
+    # No WINDOW ⇒ it died before deriving the window (unparseable file, non-object
+    # JSON, an internal error) ⇒ the contract cannot be asserted at all. Fail
+    # CLOSED **and override-immune**: emitting this as a plain block() is what let
+    # COST_CLAMP_OVERRIDE=1 exit 0 with the retry/hang contract unasserted
+    # (#1088 review cycles 2 and 3, P1). Placed BEFORE the issues loop so every
+    # such failure — known shape or not — takes this arm.
+    block_retry "$label — the settings file could not be analysed, so the retry/hang contract cannot be asserted (fail-closed; not covered by COST_CLAMP_OVERRIDE=1). First diagnostic line: $(printf '%s' "$issues" | head -1)"
+  elif [ -n "$issues" ]; then
     while IFS= read -r i; do
       case "$i" in
         RETRY_CONTRACT:*) block_retry "$label — ${i#RETRY_CONTRACT: }" ;;
-        # An unparseable settings file means the retry/hang contract cannot be
-        # asserted at all → fail closed, and do NOT let COST_CLAMP_OVERRIDE=1
-        # silence it (a corrupt file is not a clamp rollback). Cycle-2 P1.
-        PARSE_ERROR:*) block_retry "$label — $i — the retry/hang contract cannot be asserted on an unparseable settings file (fail-closed; not covered by COST_CLAMP_OVERRIDE=1)" ;;
         *) block "$label — $i" ;;
       esac
     done <<< "$issues"
@@ -389,19 +404,24 @@ check_settings_file() {
 # from the repo root — a session started in a subdirectory (e.g. `$ROOT/extensions`)
 # merges `$ROOT/extensions/.pi/settings.json`. So this walks the checkout for
 # any `.pi/settings.json` (following symlinked `.pi` dirs, depth-bounded) and
-# fails CLOSED on each one that touches the contract keys. Scanned within the
-# checkout only: other repos' project settings, and sibling worktrees under
-# `.worktrees/`, are separate checkouts and outside this guard's reach — a
-# documented scope boundary, see docs/ops/cost-config-policy.md §2.
+# fails CLOSED on each one that touches the contract keys. `.worktrees/` is NOT
+# pruned: a linked worktree is physically inside this checkout, is a real session
+# cwd, and is gitignored — so an untracked project file there would otherwise be
+# invisible to both git and this guard. Everything outside the checkout (other
+# repos) is genuinely beyond its reach — a documented scope boundary, see
+# docs/ops/cost-config-policy.md §2.
 check_project_settings() {
   local listing path hit
   listing="$(python3 - "$ROOT" <<'PYEOF'
 import json, os, sys
 
 root = sys.argv[1]
-# Separate checkouts (worktrees) are not this checkout's config surface; the
-# rest are pure-noise directories that can never hold a session's project file.
-PRUNE = {".git", "node_modules", ".venv", "venv", ".worktrees", "__pycache__"}
+# Noise directories only. NOTE `.worktrees` is deliberately NOT pruned: a linked
+# worktree lives under $ROOT, is a real session cwd, and `.worktrees/` is
+# gitignored — so a `.pi/settings.json` written there is invisible to git AND was
+# invisible to this walk, while still reverting the contract for any session
+# rooted in that worktree (#1088 review cycle 3). MAXDEPTH bounds the descent.
+PRUNE = {".git", "node_modules", ".venv", "venv", "__pycache__"}
 MAXDEPTH = 4
 out = []
 for dirpath, dirnames, filenames in os.walk(root, followlinks=True):

@@ -175,7 +175,7 @@ request, the write dies with `ECONNRESET`, and the OpenAI SDK reports it as
 Two corrections to the original write-up, both load-bearing:
 
 - `httpIdleTimeoutMs` does **not** bound keep-alive. It maps to
-  `headersTimeout`/`bodyTimeout` only. Raising it (the fleet runs 600000) does
+  `headersTimeout`/`bodyTimeout` only. Raising it (the fleet runs 300000) does
   not touch pooled-socket lifetime.
 - `keepAliveTimeout` alone is not the fix: a server hint overrides it. Only
   `keepAliveMaxTimeout` caps the hint — verified by measurement, not by
@@ -225,7 +225,7 @@ spent on corpses.
    and under Aliyun's ~8 min), leaving `keepAliveTimeout` at its 4 s default so
    hint-less endpoints do not lose reuse.
 2. Expose a pool flush for the retry path, or flush on a transport-class
-   `stopReason: "error"` before the next attempt — the 5-minute capped retry
+   `stopReason: "error"` before the next attempt — the bounded retry
    contract (#1088) only pays off if the retry can land on a fresh connection.
 
 ### Mitigation in agent-infra (shipped)

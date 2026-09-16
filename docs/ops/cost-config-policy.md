@@ -148,19 +148,22 @@ scoped explicitly:
   1 — an ambient env var must not be able to defeat the retry bound. That
   includes the two *absence* cases, which are retry-class precisely because
   they are not a clamp rollback: a **deleted** settings file (the contract
-  itself is gone) and an **unparseable** one (the contract cannot be asserted).
-  §6 below documents the override, and both carve-outs are pinned by tests.
+  itself is gone) and one that **cannot be analysed** — unparseable, valid JSON
+  that is not an object, or any failure that leaves the derived window
+  underivable (fail closed; a bound that cannot be computed must never read
+  green). §6 below documents the override, and those carve-outs are pinned by
+  tests 20 and 22.
 - **Project settings.** pi resolves the project file from the **session cwd**
   (`join(resolvedCwd, ".pi", "settings.json")`), not from the repo root — so a
   session started in a subdirectory merges *that* directory's project file over
   the global settings, and a project file could revert the contract while the
   shipped and live files read clean. The guard walks the checkout for **any**
-  `.pi/settings.json` (following symlinked `.pi` directories, depth-bounded) and
-  fails closed on each one that carries `retry` or `httpIdleTimeoutMs` — or that
-  is unparseable, not a file, or not a JSON object. Scope boundary, stated
-  plainly: the walk covers **one checkout** — a *different* repo's project
-  settings, and sibling worktrees under `.worktrees/`, are separate checkouts
-  and outside the reach of a guard run inside this one.
+  `.pi/settings.json` (following symlinked `.pi` directories, depth-bounded) —
+  including under `.worktrees/`, which is gitignored but *is* a live session cwd —
+  and fails closed on each one that carries `retry` or `httpIdleTimeoutMs`, or
+  that is unparseable, not a file, or not a JSON object. Scope boundary, stated
+  plainly: the walk covers **one checkout**; a *different* repo's project
+  settings are outside the reach of a guard run inside this one.
 - **Extension-registered providers.** An extension that builds its own undici
   `Agent` (e.g. `extensions/custom-provider-qwen/`, the HA fallback) bypasses
   pi's global dispatcher, so `httpIdleTimeoutMs` never reaches it. The guard
@@ -183,7 +186,7 @@ and BLOCKs when any of: a pinned value drifts, the cap and the guard disagree,
 the two ceilings invert, or either window exceeds its declared ceiling. A
 missing/unreadable patch script is a **fail-closed BLOCK** — a window that
 cannot be computed must never read green. `tests/cost-config/run.sh` tests
-15–24 pin guard↔settings↔patch↔doc, including the case where the guard
+15–25 pin guard↔settings↔patch↔doc, including the case where the guard
 constants and the settings are moved **together** to 8 retries: the
 exact-value checks stay green and the **derived** window check is what fires.
 There is no `COST_CLAMP_OVERRIDE` for this contract: unlike the context clamp,
