@@ -74,7 +74,16 @@
 #   removal-time TOCTOU      A21  (a gitignored file created AFTER classification
 #                                is a PRESERVE, not a silent delete — re-checked
 #                                before the pre-delete and again before the
-#                                removal fork)
+#                                removal fork; A21d proves the banner names the
+#                                actual verdict, incl. status-timeout)
+#   revocable non-head ref   A22  (a detached HEAD held ONLY by refs/tags/* is
+#                                no longer a survival mechanism — `fetch --prune
+#                                --prune-tags` revokes a local-only tag, so
+#                                PRESERVE / reason=revocable-ref with the ref
+#                                named; the allowlist is refs/heads/* only)
+#   prune-block scope        A23  (a present-dir revocable-ref row must NOT set
+#                                PRUNE_BLOCKED — the commit is held by a ref, so
+#                                deregistering the admin record cannot orphan it)
 
 set -uo pipefail
 
@@ -256,11 +265,29 @@ for a in "$@"; do
 done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
+cat >"$T/bin/git-slow-nth-status" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A21d: sleeps on the Nth `status` probe ONLY, so a
+# removal-time re-check can time out while classification did not. Proves the
+# PRESERVED banner names the actual verdict (`status-timeout`) instead of
+# claiming the checkout changed when the probe merely could not be evaluated.
+for a in "$@"; do
+    if [ "$a" = "status" ]; then
+        c=0
+        [ -n "${FAKE_STATUS_COUNTER:-}" ] && [ -f "$FAKE_STATUS_COUNTER" ] && c="$(cat "$FAKE_STATUS_COUNTER")"
+        c=$((c + 1))
+        [ -n "${FAKE_STATUS_COUNTER:-}" ] && printf '%s\n' "$c" >"$FAKE_STATUS_COUNTER"
+        [ "$c" = "${FAKE_SLOW_STATUS_ON:-2}" ] && sleep "${FAKE_STATUS_SLEEP:-3}"
+        exec "${REAL_GIT_BIN:-git}" "$@"
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
 chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh" \
          "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-prune" "$T/bin/git-slow-status" \
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
-         "$T/bin/git-late-ignored"
+         "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status"
 
 # ── fixture builders ───────────────────────────────────────────────────
 mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
@@ -333,6 +360,9 @@ run_reaper() {
     FAKE_LATE_FILE="${FAKE_LATE_FILE:-}" \
     FAKE_LATE_COUNTER="${FAKE_LATE_COUNTER:-}" \
     FAKE_LATE_ON="${FAKE_LATE_ON:-1}" \
+    FAKE_STATUS_COUNTER="${FAKE_STATUS_COUNTER:-}" \
+    FAKE_SLOW_STATUS_ON="${FAKE_SLOW_STATUS_ON:-2}" \
+    FAKE_STATUS_SLEEP="${FAKE_STATUS_SLEEP:-3}" \
     DU_CANARY="${DU_CANARY:-}" \
     REAL_GIT_BIN="$REAL_GIT" \
     bash "$REAPER" "$@"
@@ -976,7 +1006,8 @@ rm -f "$T/$ENV/cnt-a"
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATE/.env" \
     FAKE_LATE_COUNTER="$T/$ENV/cnt-a" FAKE_LATE_ON=1 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A21a a late ignored file is a PRESERVE (exit 0, never exit 4)"
-assert_contains "$OUT" "PRESERVED — the checkout changed" "A21a the late change is surfaced on stdout"
+assert_contains "$OUT" "PRESERVED — removal-time clean re-check not clean (ignored-artifact)" \
+    "A21a the late change is surfaced on stdout with the re-check's actual verdict"
 assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21a the footer counts the late preserve"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A21a nothing was removed"
 assert_contains "$(footer $ENV)" "FAILED=0" "A21a nothing failed"
@@ -1011,6 +1042,103 @@ assert_contains "$(footer $ENV)" "LATE_PRESERVE=0" "A21c the guard does not fire
 assert_nodir "$WT_LATEC" "A21c the reclaimable worktree is gone"
 assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/a21c-late | wc -l | tr -d ' ')" "1" \
     "A21c the branch ref survives"
+
+# A21d — a re-check that could not be EVALUATED must not be reported as "the
+# checkout changed". `status-timeout` and `dirty` need different operator
+# actions, so the banner names the verdict; the counters and exit code are the
+# same PRESERVE either way.
+ENV=A21d; REPO="$(mk_late_repo $ENV)"
+WT_LATED="$(add_named_wt "$REPO" "$ENV-late" feat/a21d-late)"
+mkdir -p "$WT_LATED/.venv/bin"; printf 'py\n' >"$WT_LATED/.venv/bin/python"
+rm -f "$T/$ENV/cnt-d"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-slow-nth-status" FAKE_STATUS_COUNTER="$T/$ENV/cnt-d" \
+    FAKE_SLOW_STATUS_ON=2 FAKE_STATUS_SLEEP=3 REAP_WT_STATUS_TIMEOUT=1 \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21d a timing-out removal-time re-check is a PRESERVE, not a failure"
+assert_contains "$OUT" "removal-time clean re-check not clean (status-timeout)" \
+    "A21d the banner names status-timeout"
+assert_absent "$OUT" "the checkout changed" \
+    "A21d an unevaluable probe is NOT reported as a checkout change"
+assert_contains "$(footer $ENV)" "FAILED=0" "A21d the probe failure is not reported as a removal failure"
+assert_dir "$WT_LATED" "A21d the worktree is preserved"
+
+# ── A22: a LOCAL TAG is not a survival mechanism either (re-review) ────
+# The first F3 fix blacklisted only refs/remotes/*. A blacklist cannot be
+# completed: `git fetch --prune --prune-tags` (or fetch.pruneTags=true) removes
+# local-only tags too, `git stash drop` revokes refs/stash, `git bisect reset`
+# revokes refs/bisect/*. So the survival test is an ALLOWLIST (refs/heads/*).
+# A tag-only holder is now PRESERVE / reason=revocable-ref, ref named.
+ENV=A22; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a22
+commit_in_wt "$REPO" "$OLD_DATE" a22
+A22_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a22 >/dev/null
+"$REAL_GIT" -C "$REPO" tag -a ops/scratch -m snap "$A22_SHA"
+"$REAL_GIT" -C "$REPO" push -q upstream main:refs/heads/main
+WT_A22="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A22" "$A22_SHA"
+assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A22_SHA" --format='%(refname)')" \
+    "refs/tags/ops/scratch" "A22 precondition: only a LOCAL TAG holds that commit"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A22")" "reason=revocable-ref" \
+    "A22 a tag-only holder => PRESERVE (a local-only tag is revocable)"
+assert_contains "$(row_for "$OUT" "$WT_A22")" "refs/tags/ops/scratch" \
+    "A22 the revocable tag is NAMED"
+assert_absent "$(row_for "$OUT" "$WT_A22")" "reason=reclaimable" \
+    "A22 it is NOT classified reclaimable on a tag"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A22 --apply exits 0 (a preserve is not a failure)"
+assert_dir "$WT_A22" "A22 --apply left the checkout on disk"
+# the falsifier, run for real: `fetch --prune --prune-tags` DOES remove a
+# local-only tag, taking the commit to no ref
+"$REAL_GIT" -C "$REPO" config fetch.pruneTags true
+"$REAL_GIT" -C "$REPO" fetch -q --prune upstream
+assert_eq "$("$REAL_GIT" -C "$REPO" tag -l ops/scratch | wc -l | tr -d ' ')" "0" \
+    "A22 falsifier: fetch.pruneTags=true DELETED the local-only tag"
+assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A22_SHA" --format='%(refname)' | wc -l | tr -d ' ')" "0" \
+    "A22 falsifier: the commit is now on NO ref — the old 'survival' was revocable"
+
+# ── A23: a revocable-ref row must NOT block the end-of-pass prune ──────
+# `PRUNE_BLOCKED` exists so a global, path-filterless `git worktree prune`
+# cannot sweep a record that might be prunable. A record held by a revocable
+# REF is not in that class: deregistering its admin record cannot orphan the
+# commit (the ref holds it) — unlike detached-unreachable, where the record's
+# HEAD is the last handle. Blocking on it made one long-lived remote-only row
+# disable the whole `prunable` reclaim path on every later pass.
+ENV=A23; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a23
+commit_in_wt "$REPO" "$OLD_DATE" a23
+A23_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a23:refs/heads/feat/a23
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a23 >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A23A="$T/$ENV-present"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A23A" "$A23_SHA"
+WT_A23B="$(add_named_wt "$REPO" "$ENV-gone" feat/a23-gone)"
+rm -rf "$WT_A23B"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A23A")" "reason=remote-only-ref" \
+    "A23 precondition: the present-dir row is a revocable-ref preserve"
+assert_contains "$(row_for "$OUT" "$WT_A23B")" "reason=prunable" \
+    "A23 precondition: the gone-dir row is prunable"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A23 --apply exits 0"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=0" \
+    "A23 a present-dir revocable-ref row did NOT set PRUNE_BLOCKED"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNED 1" "A23 the end-of-pass prune ran"
+assert_contains "$(footer $ENV)" "REMOVED=1" "A23 the prunable record is counted as removed"
+assert_absent "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A23B" \
+    "A23 the gone-checkout admin record was pruned"
+assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A23A" \
+    "A23 the revocable-ref worktree is still registered (preserved, not pruned)"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

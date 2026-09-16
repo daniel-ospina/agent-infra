@@ -15,13 +15,17 @@
 #   * reachable    — the commits survive the checkout's deletion: merged to
 #                    main, OR on a NAMED BRANCH (`git worktree remove` deletes
 #                    the checkout, NEVER the branch), OR a detached HEAD whose
-#                    SHA is held by a ref `git fetch --prune` cannot revoke.
-#                    A detached SHA on no such ref would be ORPHANED =>
-#                    preserve — including when the checkout's directory is
-#                    already gone, because the admin record's HEAD is the last
-#                    thing holding that commit. Remote-tracking-only survival
-#                    is PRESERVE / `remote-only-ref`: `fetch --prune` drops
-#                    that ref, so the claim is revocable (F3 / #1104).
+#                    SHA is held by a `refs/heads/*` ref. A detached SHA on no
+#                    such ref would be ORPHANED => preserve — including when the
+#                    checkout's directory is already gone, because the admin
+#                    record's HEAD is the last thing holding that commit.
+#                    A holder OUTSIDE refs/heads/* is PRESERVE: the claim would
+#                    be revocable (F3 / #1104) — `fetch --prune` drops
+#                    refs/remotes/*, `fetch --prune --prune-tags` drops a
+#                    local-only tag, `stash drop` refs/stash, `bisect reset`
+#                    refs/bisect/*. Reason is `remote-only-ref` for
+#                    refs/remotes/* and `revocable-ref` otherwise, and the ref
+#                    is NAMED in both.
 #   * aged         — HEAD commit strictly older than REAP_WT_AGED_DAYS (7)
 # Anything failing clean / reachable / unreferenced is SURFACED with its
 # deciding reason and NEVER auto-removed.
@@ -116,9 +120,18 @@
 #   detached-unreachable   deleting the checkout (or pruning the record) would
 #                          leave the HEAD commit on no ref at all
 #   remote-only-ref        the only ref holding the HEAD is refs/remotes/*,
-#                          which a later `git fetch --prune` can revoke — i.e.
-#                          the survival claim would not be permanent. The
-#                          revocable ref is NAMED so the operator can decide
+#                          which `git fetch --prune` can revoke — i.e. the
+#                          survival claim would not be permanent. The revocable
+#                          ref is NAMED so the operator can decide
+#   revocable-ref          the only ref holding the HEAD is outside
+#                          refs/heads/* and is revocable (`fetch --prune
+#                          --prune-tags` for a local-only tag, `stash drop`,
+#                          `bisect reset`). Same argument as remote-only-ref,
+#                          and the ref is NAMED. Neither reason blocks the
+#                          end-of-pass prune: the commit is held by a REF, so
+#                          deregistering the admin record cannot orphan it
+#                          (unlike detached-unreachable, where the record's
+#                          HEAD is the last handle)
 #   unparseable-path       the record could not be framed safely (tab/newline)
 #   live-process/live-cwd  a process holds the path
 #   dirty                  tracked/unparseable changes
@@ -211,6 +224,9 @@ CWD_DEGRADED=0
 REMOVED=0
 FAILED=0
 LATE_PRESERVE=0
+# Verdict of the removal-time re-check that caused a late PRESERVE (set by
+# remove_one; read by run() so the operator sees WHY, not just "changed").
+REMOVE_SKIP_VERDICT=""
 DEFERRED=0
 WT_TOTAL=0
 REMOVE_C=0
@@ -715,7 +731,7 @@ pr_head_refs_load() {
 # the admin record's HEAD is itself the last ref holding a detached commit, so
 # pruning it can orphan that commit (verified).
 commits_survive() {
-    local sha="$1" branch="$2" merged=0 containing="" remote_only="" rc=0
+    local sha="$1" branch="$2" merged=0 containing="" revocable="" rc=0
     if [ -n "$MAIN_REF" ] && [ -n "$sha" ]; then
         run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
             "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$MAIN_REF"
@@ -747,28 +763,34 @@ commits_survive() {
 
     # Detached HEAD — or a named branch whose ref no longer resolves.
     #
-    # SURVIVAL MUST NOT BE REVOCABLE (F3 / #1104). `--contains` counts
-    # refs/remotes/*, and `git fetch --prune` (or `git remote prune`) drops a
-    # remote-tracking ref once the remote branch is gone — routinely, e.g. after
-    # a squash-merge with branch auto-delete. Removing a checkout because a
-    # REVOCABLE ref holds the commit is not "the commits survive": it makes the
-    # commit gc-eligible later, with no record left that it ever existed. So
-    # only a ref `fetch --prune` cannot touch counts as a survival mechanism.
+    # SURVIVAL MUST NOT BE REVOCABLE (F3 / #1104, re-opened for tags by review).
+    # The first fix blacklisted refs/remotes/*, because `git fetch --prune`
+    # drops a remote-tracking ref once the remote branch is gone — routinely,
+    # e.g. after a squash-merge with branch auto-delete. A blacklist cannot be
+    # completed: `git fetch --prune --prune-tags` (or fetch.pruneTags=true)
+    # deletes a LOCAL-ONLY tag too, `git stash drop`/`clear` revokes
+    # refs/stash, and `git bisect reset` revokes refs/bisect/*. Any of those
+    # leaves the commit on no ref, i.e. gc-eligible, with no record left.
+    # So the test is an ALLOWLIST, not a blacklist: only refs/heads/* — which
+    # `fetch` never writes and only an explicit `git branch -D` removes, a
+    # command this script never calls — counts as a survival mechanism.
     #
     # The merged arm ABOVE is deliberately untouched, and that is why this is
     # not a rejection of remote refs: it is ancestor-based and MAIN_REF is
     # normally refs/remotes/origin/main, so `main` still fast-paths to
-    # `refs=merged` (pinned by A20c). The rejection applies only to the
+    # `refs=merged` (pinned by A20c). The allowlist applies only to the
     # containment fallback for a detached HEAD that is NOT on main.
     #
-    # One bounded probe, then partition by prefix; a commit held ONLY by
-    # remote-tracking refs prints the `remote-only-ref:` marker, which
+    # A holder outside refs/heads/* prints a `<reason>:<refname>` marker, which
     # classify_one turns into PRESERVE with the revocable ref NAMED so the
-    # operator can judge it. The 64-ref output bound cannot cause a removal a
-    # smaller bound would not: if the sample is all remote-tracking and a local
-    # holder sat beyond it, the outcome is PRESERVE. The bound errs toward
-    # preservation. (Walk cost is unchanged — git does not short-circuit the
-    # containment walk for --count=1 either.)
+    # operator can judge it (`remote-only-ref` for refs/remotes/*, the common
+    # case; `revocable-ref` otherwise).
+    #
+    # One bounded probe, then partition by prefix; the 64-ref output bound
+    # cannot cause a removal a larger bound would not: if the sample is all
+    # revocable refs and a refs/heads/* holder sat beyond it, the outcome is
+    # PRESERVE. The bound errs toward preservation. (Walk cost is unchanged —
+    # git does not short-circuit the containment walk for --count=1 either.)
     run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
         for-each-ref --contains="$sha" --count=64 --format='%(refname)'
     # A failure here (incl. 129 for a zero/unknown sha) is "cannot establish",
@@ -777,12 +799,15 @@ commits_survive() {
     while IFS= read -r containing; do
         [ -n "$containing" ] || continue
         case "$containing" in
-            refs/remotes/*) [ -n "$remote_only" ] || remote_only="$containing" ;;
-            *) printf 'reachable-from:%s\n' "$containing"; return 0 ;;
+            refs/heads/*) printf 'reachable-from:%s\n' "$containing"; return 0 ;;
+            *) [ -n "$revocable" ] || revocable="$containing" ;;
         esac
     done <"$GIT_OUT"
-    if [ -n "$remote_only" ]; then
-        printf 'remote-only-ref:%s\n' "$remote_only"
+    if [ -n "$revocable" ]; then
+        case "$revocable" in
+            refs/remotes/*) printf 'remote-only-ref:%s\n' "$revocable" ;;
+            *)              printf 'revocable-ref:%s\n' "$revocable" ;;
+        esac
         return 0
     fi
     printf ''
@@ -824,8 +849,8 @@ classify_one() {
         fi
         refs="$(commits_survive "$sha" "$branch")"
         case "$refs" in
-            remote-only-ref:*)
-                printf 'preserve\tremote-only-ref\t\tsha %s is held only by %s (checkout already gone); `git fetch --prune` can revoke that ref, so pruning the record would ORPHAN it\n' "${sha:-?}" "${refs#remote-only-ref:}"
+            remote-only-ref:*|revocable-ref:*)
+                printf 'preserve\t%s\t\tsha %s is held only by %s (checkout already gone); that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`), so pruning the record would ORPHAN it\n' "${refs%%:*}" "${sha:-?}" "${refs#*:}"
                 return 0 ;;
             '')
                 printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref (checkout already gone) — pruning the record would ORPHAN it\n' "${sha:-?}"
@@ -855,8 +880,8 @@ classify_one() {
 
     refs="$(commits_survive "$sha" "$branch")"
     case "$refs" in
-        remote-only-ref:*)
-            printf 'preserve\tremote-only-ref\t\tsha %s is held only by %s — a later `git fetch --prune` can revoke that ref; removing the checkout would then ORPHAN it\n' "${sha:-?}" "${refs#remote-only-ref:}"
+        remote-only-ref:*|revocable-ref:*)
+            printf 'preserve\t%s\t\tsha %s is held only by %s — that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`); removing the checkout would then ORPHAN it\n' "${refs%%:*}" "${sha:-?}" "${refs#*:}"
             return 0 ;;
         '')
             printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref — removing would orphan it\n' "${sha:-?}"
@@ -922,7 +947,8 @@ classify_one() {
 # rather than trusted.
 #
 # Returns 0 removed · 1 REMOVE-FAILED (a real failure ⇒ exit 4) ·
-#         2 the checkout changed since classification ⇒ PRESERVE.
+#         2 the removal-time clean re-check was not clean ⇒ PRESERVE
+#           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
     local path="$1" eph entry target out rc crumb cverdict cpay
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
@@ -934,6 +960,7 @@ remove_one() {
     cverdict="${crumb%%$'\t'*}"
     cpay="${crumb#*$'\t'}"
     if [ "$cverdict" != clean ]; then
+        REMOVE_SKIP_VERDICT="$cverdict"
         log "REMOVE-SKIP $path checkout changed since classification ($cverdict: $cpay) — nothing removed, preserved"
         rm -f "$out"; return 2
     fi
@@ -970,7 +997,8 @@ remove_one() {
     cverdict="${crumb%%$'\t'*}"
     cpay="${crumb#*$'\t'}"
     if [ "$cverdict" != clean ]; then
-        log "REMOVE-SKIP $path checkout changed between the pre-delete and the removal ($cverdict: $cpay) — nothing removed, preserved"
+        REMOVE_SKIP_VERDICT="$cverdict"
+        log "REMOVE-SKIP $path removal-time re-check not clean ($cverdict: $cpay) — nothing removed, preserved"
         rm -f "$out"; return 2
     fi
 
@@ -1202,12 +1230,15 @@ run() {
                             REMOVED=$((REMOVED + 1))
                             log "REMOVED $p" ;;
                         2)
-                            # The checkout changed between classification and
-                            # removal (F4): it is PRESERVED. Nothing failed and
-                            # nothing was removed, so this must NOT be exit 4 —
-                            # that code is the machine-readable "a removal
-                            # failed". The next pass re-classifies the record.
-                            say "         PRESERVED — the checkout changed between classification and removal (see the log)"
+                            # The removal-time re-check was not clean (F4): the
+                            # checkout is PRESERVED. Nothing failed and nothing
+                            # was removed, so this must NOT be exit 4 — that
+                            # code is the machine-readable "a removal failed".
+                            # The verdict is printed, not assumed: `dirty` and
+                            # `ignored-artifact` mean the checkout changed,
+                            # while `status-*` means the probe could not be
+                            # evaluated — different operator actions.
+                            say "         PRESERVED — removal-time clean re-check not clean (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
                             LATE_PRESERVE=$((LATE_PRESERVE + 1))
                             log "PRESERVED-LATE $p" ;;
                         *)
@@ -1223,7 +1254,15 @@ run() {
             # path, broken admin link) must not be swept up by a global prune.
             case "$reason" in
                 unreadable-path|status-error|status-timeout|unparseable-path|worktree-locked) PRUNE_BLOCKED=1 ;;
-                detached-unreachable|remote-only-ref) PRUNE_BLOCKED=1 ;;
+                detached-unreachable) PRUNE_BLOCKED=1 ;;
+                # `remote-only-ref` / `revocable-ref` deliberately do NOT block:
+                # the commit is held by a REF, so deregistering the admin record
+                # does not orphan it (that is exactly the `detached-unreachable`
+                # case, where the record's HEAD is the last handle). Blocking on
+                # them made a single long-lived remote-only row disable the
+                # whole `prunable` reclaim path on every later pass — the
+                # "reaper that silently never reaps" failure this tool exists to
+                # prevent. Pinned by A23.
             esac
         fi
     done <<<"$WT_LIST"
