@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-11
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-637
+aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-637, issue-1115
 ---
 
 # Upstream pi bug reports — drafts awaiting filing
@@ -544,3 +544,173 @@ unquoted ` #` in plain values (P1: pi loads but silently corrupts the value).
   lint) — the author is told to quote the value.
 - Documented in docs/plans/2026-08-28-issue-254-skill-lint-yaml.md §2
   (truncate-classes) and §5.4 R3 (acknowledged-drift register).
+
+---
+
+## Issue #1115: idle `pi` TUI burns 6–38% of a core per session — an invisible re-render loop that re-measures a tool's entire output
+
+**Repo:** pi-core (`@earendil-works/pi-coding-agent`)
+**Version probed:** pi 0.85.1 — pi-node v22.23.2, macOS 27.0 (26A428), arm64 (Apple M5, 10-core)
+**Severity:** High for a multi-session host — this is a load ceiling, not a
+cosmetic bug. 11 of 39 `pi` processes at 6.4–26.3% of a core each, while their
+session transcripts had not been written for 8 min – 3.5 h. Aggregate 178% of
+one core. It drove this host to swap-thrash and forced a fleet-wide reboot that
+lost 3 live session threads (#1114).
+
+### Symptom
+A `pi` TUI process consumes multi-percent CPU **indefinitely while its own
+session is idle**: no turn in flight, no transcript write, no tool child, no
+socket flow — and a rendered screen that is byte-identical between samples.
+
+### Measurement (2026-09-16 16:5x EST, `ps -o time` sampled 30 s apart, 39 pi procs)
+
+| pid | ΔCPU / 30 s | % of one core | transcript silence |
+|---|---|---|---|
+| 3312 | +7.88 s | **26.3%** | 8.6 m |
+| 2848 | +6.71 s | **22.4%** | 52.9 m |
+| 2684 | +5.93 s | 19.8% | 174 m |
+| 3399 | +5.51 s | 18.4% | 209 m |
+| 70130 | +5.44 s | 18.1% | 203 m |
+| 64580 | +4.48 s | 14.9% | 1.0 m |
+| 2743 | +3.29 s | 11.0% | 12.1 m |
+| … 13 procs at ~0.1% (a clean idle TUI) | | | 176–8300 m |
+| **TOTAL** | **+53.26 s** | **177.5%** | — |
+| **of which, procs silent > 120 min** | **+43.82 s** | **146.1%** | 20 procs |
+
+`load average` 24.06 → 26.42 during the window (10 cores).
+
+**Confound ruled out.** The same window was sampled for ambient FS/mount/UI
+churn: `automountd` +2.18 s (7.3% of a core), `opendirectoryd` ≈ 0. So the
+non-`pi` churn is **7.3% against pi's 177.5% — pi is 24× the confound.** The
+burn is pi's own.
+
+### Profile (`sample <pid> 20`, two independent burners 3312 and 70130)
+
+- **8573 of 14080 main-thread samples (61%) sit inside one JS timer callback:**
+  `uv__run_timers` → `node::Environment::RunTimers` → `v8::Function::Call` →
+  `Builtins_JSEntryTrampoline` → JIT'd JS body.
+- Hot leaves inside that callback:
+  - **ICU grapheme segmentation** — `Builtin_SegmentIteratorPrototypeNext` 518,
+    `JSSegmentIterator::Next` 406, `JSSegments::CreateSegmentDataObject` 207,
+    `Intl::ToString` 103, `icu_78::BreakIterator`;
+  - **string compare / search** — `Runtime_StringEqual` 458, `String::SlowEquals`
+    370, `StringIndexOf` 182, `SearchStringRaw` 181, `_platform_memchr` 162,
+    `CompareCharsEqual` 142, `RegExpPrototypeTestFast` 174;
+  - **object/Map churn** — `Map::TransitionToDataProperty` 126,
+    `FindOrderedHashMapEntry` 111, plus 197 samples of GC.
+- **`uv__try_write`: 5 samples out of 8545** in the timer subtree.
+
+So this is a CPU-bound **string-measurement loop on a timer that writes
+essentially nothing to the terminal**. pi-tui renders differentially
+(`dist/tui.js` — "Minimal TUI implementation with differential rendering"): an
+unchanged frame emits **zero bytes**. That is why the screen is static and why
+the burn is invisible to `cmux read-screen` — the loop is rendering an
+identical frame, forever.
+
+### Cost law (measured, node v22.23.2 arm64)
+
+`visibleWidth()` — pi-tui `dist/utils.js`, grapheme width via `Intl.Segmenter`
+— costs **~1 µs per character**:
+
+```
+visibleWidth(1,925 chars)    =   3.2 ms
+visibleWidth(189,210 chars)  = 185.4 ms      <- one long line
+wrapTextWithAnsi(189,210)    =   9.0 ms
+```
+
+`truncateToVisualLines(text, n, width)`
+(`dist/modes/interactive/components/visual-truncate.js`) constructs
+`new Text(text, …)` and calls `Text.render(width)` — **it renders and wraps the
+entire string**, discarding all but the last `n` lines.
+
+### Suspected code path — two multiplicative defects
+
+**1. `dist/core/tools/renderers/bash.js` re-wraps the tool's entire accumulated
+output on *every* render.**
+
+`renderResult` is invoked from inside `ToolExecutionComponent.render()`
+(`dist/modes/interactive/components/tool-execution.js:259`) — i.e. on every
+render pass. It calls `rebuildBashResultRenderComponent(...)`, which does
+`component.clear()` and adds a **fresh** anonymous child whose cache state
+starts `undefined`, and then calls `component.invalidate()`. The preview cache
+is therefore destroyed every render, so
+`truncateToVisualLines(styledOutput, BASH_PREVIEW_LINES, width)` re-wraps the
+**whole** bash output (measured above at ~1 µs/char) on every pass.
+
+**2. A forced 1 Hz re-render for as long as a bash call is in flight.**
+
+```js
+if (state.startedAt !== undefined && options.isPartial && !state.interval) {
+    state.interval = setInterval(() => context.invalidate(), 1000);
+}
+```
+
+It is cleared only from a later `renderResult` with `!options.isPartial`. Any
+bash call that never reaches a terminal state (a stuck or abandoned turn —
+this host's `stale-stuck` sessions) keeps that timer **forever**.
+
+Multiplied, these are: *a timer that forces a full transcript render* × *a
+render that re-measures the entire tool output with ICU grapheme
+segmentation*.
+
+### Measured magnitude of the mechanism
+
+Harness driving pi's real `truncateToVisualLines` + pi-tui `Text.render`
+(200-col width, 5-line preview) at both timer cadences:
+
+| output | per-tick | @1 Hz (`bash.js` interval) | @80 ms (`Loader` spinner) |
+|---|---|---|---|
+| 10 KB | 0.8 ms | 0.1% | 1.0% |
+| 100 KB | 3.7 ms | 0.4% | 4.6% |
+| 250 KB | 9.3 ms | 0.9% | **11.7%** |
+| 500 KB | 18.1 ms | 1.8% | **22.6%** |
+| 1000 KB | 43.0 ms | 4.3% | **53.7%** |
+
+The fleet's observed **6.4–26.3% per process sits in the 250 KB–1 MB @ 80 ms
+band**.
+
+### Calibration (what was ruled out)
+
+- Fresh interactive `pi --offline`, idle, under a pty: **0.8%** of a core — the
+  burn is *not* intrinsic to an idle TUI, and not caused by the extension set
+  (the same extensions load in both burning and clean sessions).
+- A **visible** `Working` spinner plus a ticking `Elapsed Ns` bash call
+  (`sleep 900`) — i.e. the 1 Hz interval *and* an animating spinner — with an
+  **empty** output: **~1%**. So a render is ~0.8 ms when there is no large tool
+  output to re-measure. The burn scales with **transcript content**, not with
+  render count, which is consistent with the cost law above.
+- The pre-reboot suspicion of FS/mount churn is separately measurable and is
+  ~24× too small (see *Confound ruled out*).
+
+### Why this cannot be fixed downstream
+
+`dist/core/extensions/types.d.ts` exposes `registerMessageRenderer`
+(CustomMessageEntry) and `registerEntryRenderer` (CustomEntry) only. The sole
+`renderResult` in the extension types belongs to a tool **definition** — an
+extension may supply renderers for its **own** tool, never override a builtin's.
+There is no supported seam to replace `bash.js`'s `renderResult`, and patching
+`dist/` is wiped by `pi update`. **The fix must be upstream.**
+
+### Suggested upstream fix
+
+1. In `bash.js` `renderResult`, stop destroying the preview cache on every
+   render — either drop the trailing `component.invalidate()`, or preserve the
+   anonymous child (and its `cachedWidth`/`cachedLines` state) across
+   `rebuildBashResultRenderComponent`. One render should not re-wrap the whole
+   output unless the output or width actually changed.
+2. Make `truncateToVisualLines` O(tail) rather than O(whole output) — wrap from
+   the end, or memoize on `(text, width, maxVisualLines)` — and clear the 1 Hz
+   interval on *any* terminal state for that tool row (including abort / row
+   disposal), not only on a later `renderResult` with `!isPartial`.
+
+### Honest status of this report
+
+The fleet measurement, the confound isolation, the `sample` stack, the cost law
+(~1 µs/char), and the source path are all directly measured. The magnitude
+figures in the table above come from a harness driving pi's real
+`truncateToVisualLines`/`Text.render` — **not** from a clean end-to-end
+reproduction on a fresh session; the attempt to drive one (`seq 1 200000` via
+the model) did not reliably produce a large tool output, so the causal chain is
+*inferred* from the cost law plus the source path rather than *replayed*. A
+filer should treat the two `setInterval`/`invalidate` sites as the first thing
+to instrument.
