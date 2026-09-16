@@ -971,6 +971,34 @@ That is a **judgement**, not an impossibility: a local same-named-tool patch
 was rejected as a fragile, unfalsifiable shadow of a builtin, not as
 technically unreachable. Patching `dist/` directly remains wiped by `pi update`.
 
+### Prior art — and why it matters for the fix
+
+This shape is **not a pi-specific slip**; it is the standard architecture of a
+React-style terminal renderer. Ink — the renderer behind most agent CLIs —
+exposes `maxFps` with a **default of 30** (a throttle interval derived from it)
+and `incrementalRendering`, **default `false`**, which updates only changed
+lines instead of redrawing everything
+([Ink README](https://github.com/vadimdemedes/ink),
+[npm](https://www.npmjs.com/package/ink),
+[Render Options](https://deepwiki.com/vadimdemedes/ink/3.2-render-options),
+[Rendering Lifecycle](https://deepwiki.com/vadimdemedes/ink/8.1-rendering-lifecycle)).
+pi's `MIN_RENDER_INTERVAL_MS = 16` plus a `previousLines` diff is the same
+pattern — pi's throttle is even tighter than Ink's default.
+
+That matters for the recommendation: if the throttled whole-tree frame is a
+**class** characteristic, then finding and re-stating it is not the fix. The
+candidate root causes are pi's **deviations from the class**:
+
+- pi's line diff is computed over the **entire** scrollback every frame, rather
+  than only the changed region;
+- the footer is recomputed every frame (Ink components re-render too, but pi's
+  per-frame footer work is an un-memoised full entry scan);
+- `truncateToVisualLines` is O(whole output) rather than O(tail).
+
+So the upstream ask should be framed as "make each frame cheap and bounded",
+not "remove the throttle". The falsifier a maintainer should run first: does an
+Ink-based TUI with a large mounted output also burn under the same profile?
+
 ### Suggested next steps (upstream, in order)
 
 1. **Name the driver, then the component — and collect the missing size column.**
