@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-11
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-637, issue-1115
+aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-637, issue-1114, issue-1115
 ---
 
 # Upstream pi bug reports — drafts awaiting filing
@@ -552,10 +552,16 @@ unquoted ` #` in plain values (P1: pi loads but silently corrupts the value).
 **Repo:** pi-core (`@earendil-works/pi-coding-agent`)
 **Version probed:** pi 0.85.1 — pi-node v22.23.2, macOS 27.0 (26A428), arm64 (Apple M5, 10-core)
 **Severity:** High for a multi-session host — this is a load ceiling, not a
-cosmetic bug. Aggregate **177.5% of one core** across 39 `pi` processes, of
-which **146.1%** came from 20 processes whose session transcripts had been
-silent for more than 120 s. It drove this host to swap-thrash and forced a
-fleet-wide reboot that lost 3 live session threads (#1114).
+cosmetic bug. Aggregate **177.5% of one core** across 39 `pi` processes. A
+sub-population of **20 processes whose session transcripts had been silent for
+more than 120 s** (in fact 132 s to ~5.8 days) alone accounted for
+**43.82 s / 30 s = 146.1%** of a core. It drove this host to swap-thrash and
+forced a fleet-wide reboot that lost 3 live session threads (#1114).
+
+That 20-process subset is **not** the same set as the table's 11 rows: 10 of
+the 11 are in it (pid 64580, silence 1.0 m, is not), and the other 10 are
+near-idle ~0.1% processes inside the table's residual bucket. The two figures
+are stated separately and must not be added.
 **Status of this report:** the measurement and the profile below are
 *measured*; the identity of the pumping timer is **not** established, and the
 section *What this does not yet explain* says so explicitly. Do not read the
@@ -588,13 +594,15 @@ the `spawnSync` finding in the profile.)
 | 70144 | +2.12 s | 7.1% | 2.2 m |
 | 3244 | +1.93 s | 6.4% | 158.3 m |
 | **subtotal (these 11)** | **+48.01 s** | **160.0%** | |
-| remaining 28 procs (13 at ~0.1%, i.e. a clean idle TUI) | +5.25 s | 17.5% | 176–8300 m |
+| residual 28 procs — 10 more with silence > 120 s at ~0.1% each, plus 18 child/ephemeral `pi` procs whose silence could not be mapped | +5.25 s | 17.5% | |
 | **TOTAL (39 procs)** | **+53.26 s** | **177.5%** | |
 
 `load average` 24.06 → 26.42 over the window (10 cores).
 
-`ΔCPU` comes from `ps -o time`; the `%` column is `ΔCPU / 30 s`. The table is
-reconcilable: 11 rows sum to +48.01 s and the residual 28 procs to +5.25 s.
+`ΔCPU` comes from `ps -o time`; the `%` column is `ΔCPU / 30 s`. The table
+reconciles: the 11 rows sum to +48.01 s and the residual 28 procs to +5.25 s,
+for +53.26 s total. Silences marked with 176 m+ are the ~0.1%-CPU idle TUIs —
+the clean control against which the 6–26% rows are abnormal.
 
 ### Confound ruled out
 
@@ -625,12 +633,12 @@ subtree**, so nested frames make them non-additive — read them as a
 | `RegExpPrototypeTestFast` | 387 | 151 |
 | `FindOrderedHashMapEntry` | 269 | 109 |
 | **`node::SyncProcessRunner::Spawn` / `Run` / `TryInitializeAndRunLoop`** | **262** | **198** |
-| `uv__try_write` (writes to the terminal) | **5** | — |
+| `uv__try_write` (writes to the terminal) | **13** | — |
 
 Two conclusions that survive scrutiny:
 
-1. **The loop writes essentially nothing to the terminal.** 5 `uv__try_write`
-   samples against 8573 in the callback. pi-tui renders *differentially*
+1. **The loop writes essentially nothing to the terminal.** 13 `uv__try_write`
+   samples (three frames, 4+4+5) against 8573 in the callback — 0.15%. pi-tui renders *differentially*
    (`dist/tui.js` — "Minimal TUI implementation with differential rendering"),
    so an unchanged frame emits zero bytes. That is why the screen is static and
    why the burn is invisible to `cmux read-screen` and `ps`-style inspection.
@@ -666,8 +674,17 @@ rescue a re-wrap of a large output.
 `visibleWidth` (`pi-tui/dist/utils.js`) is **input-class sensitive** and must
 not be quoted as a flat rate: it returns `str.length` on a pure-printable-ASCII
 fast path (`isPrintableAscii`, i.e. 0x20–0x7E — **note `\n` fails it**), and
-otherwise memoises into `widthCache`. A cold 200 KB non-fast-path call measured
-0.7 ms; a warm repeat measured ~0 ms.
+otherwise memoises into `widthCache`. Two distinct costs, easy to conflate:
+
+- **Fast path:** ~0.7 ms for 200 KB of pure ASCII — but this is a full
+  character scan of the string, paid on **every** call, and never memoised. So
+  it is not free at this size.
+- **Cold slow path** (any `\n`, ANSI escape, or non-ASCII — i.e. `\x1b`-styled
+  terminal text, which is all real tool output): **≈ 0.6–0.8 µs/char**, i.e.
+  ~120–160 ms for 200 KB. A **warm repeat** of the identical string measured
+  ~0 ms via `widthCache` — which is why a single warm measurement must not be
+  quoted as the cost; wrapping produces many distinct substrings and thrashes
+  the 512-entry cache.
 
 ### What this does not yet explain
 
