@@ -908,13 +908,29 @@ What the three windows actually support, with the methods kept distinct:
 - **pre-reboot** — the handoff attributes the ceiling to pi (lifetime rates of
   7–8 cores on individual pids) with confound at 18%/7%, i.e. pi-shaped. But it
   is a **lifetime** rate, not a 30 s window sample, and one `pi` pid at "~8.3
-  cores" average over 23.8 h is itself anomalous next to the 16:55 snapshot
-  (26.3% peak) — which is the "episodic, not steady-state" problem below.
+  cores" averaged over 23.8 h is itself anomalous next to the 16:55 snapshot
+  (26.3% peak) — see *the burn is episodic* below.
 
-So the honest verdict is not "the confound is negligible": it is **window
--dependent** — decisively excluded at 16:55, comparable at 13:35, and pi-shaped
-but method-incomparable pre-reboot. The report's 177.5% figure stands on its own
-window; it should not be used to dismiss the confound elsewhere.
+**The burn is episodic, not steady-state — and this report cannot characterise
+it from snapshots.** The pre-reboot handoff and the 16:55 sample cannot both
+describe a constant per-session cost: a lifetime average of ~8.3 cores on one
+pid versus a 26.3%-of-a-core instantaneous reading is a ~31× gap. So either the
+burn is **bursty** (triggered — e.g. by compaction, a multi-MB tool output, or a
+large render) and both measurements are correct episodes of the same process, or
+one of the two is wrong. A 30 s snapshot cannot distinguish those, and neither
+can the two calibration controls, which are single long windows. Two consequences
+the rest of this report should be read against:
+
+- any *steady-state* per-frame cost (the cost law above) can at most explain the
+  snapshot; it cannot explain a lifetime average, so "the cost law brackets the
+  observation" was doubly wrong — it bracketed a *peak*, not the profile;
+- the guard proposed for agent-infra (#1127) must therefore key on a **rate over
+time**, not on a single sample, or it will miss a bursty offender entirely.
+
+So the honest verdict is not "the confound is negligible": it is
+**window-dependent** — decisively excluded at 16:55, comparable at 13:35, and
+pi-shaped but method-incomparable pre-reboot. The report's 177.5% figure stands
+on its own window; it should not be used to dismiss the confound elsewhere.
 And because Unix load average counts **blocked** as well as runnable processes,
 the chain "pi CPU → load 15.94 → swap → reboot" is under-supported: with 39
 `pi` processes at 255–670 MB each against 32 GB, **memory pressure** is at least
@@ -1101,8 +1117,8 @@ substrate, and that was verified rather than assumed:
 The natural fix is one comparison added to an existing mechanism, not a new
 subsystem: a ΔCPU-per-window column joined to #469's existing transcript-silence
 predicate (WARN by default; never kill — a false positive destroys an in-memory
-session thread, which is the #1114 failure mode). That is deliberately left as a
-**filed as agent-infra #1127**, not folded into this upstream report.
+session thread, which is the #1114 failure mode). That is deliberately filed as
+**agent-infra #1127**, not folded into this upstream report.
 
 ### Honest status of this report
 
