@@ -34,9 +34,9 @@
  * root mis-resolution (#960).
  */
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { expandCdTarget, parseCdChains, unquotedMask } from "../shared/git-command-parse.js";
@@ -215,7 +215,16 @@ function hasMetacharacter(s: string): boolean {
 
 /** R1's depth-2 boundary: `/`, a home dir, a top-level prefix, or its direct child. */
 export function isSystemOrHomeRoot(dir: string): boolean {
-  const norm = resolve(dir);
+  // realpath FIRST: a lexical resolve() let a symlinked root defeat R1 entirely —
+  // `link-root -> /` normalised to a path under the fixture, so
+  // `find link-root -name x` walked the whole filesystem and ALLOWed. A path that
+  // does not exist yet keeps the lexical form (realpathSync throws on ENOENT).
+  let norm = resolve(dir);
+  try {
+    norm = realpathSync(norm);
+  } catch {
+    /* nonexistent path — the lexical form is the only answer available */
+  }
   if (norm === sep) return true;
   if (norm === resolve(homedir())) return true;
   for (const p of SYSTEM_PREFIXES) {
@@ -324,9 +333,30 @@ function scanArgs(
       i++;
       continue;
     }
+    // Shell redirections are NOT operands. The shell strips `2>/dev/null` before
+    // grep ever sees argv, so `grep -rn p 2>/dev/null` passes no file operand and
+    // searches `.` — but the token was collected as one, which made
+    // `scan.operands` non-empty and skipped the implicit-root classification
+    // entirely (`grep -rn p` BLOCKed while `grep -rn p 2>/dev/null` ALLOWed).
+    // A redirect with no attached target (`> out.txt`) also consumes its word.
+    const redirect = /^(?:\d*)?(?:&>>|&>|>>|<<<|<<|<>|>\||>|<)(.*)$/.exec(v);
+    if (redirect) {
+      if (redirect[1] === "") i++; // `> file` — the target is a separate word
+      i++;
+      continue;
+    }
     if (!endOfOptions && v.startsWith("--")) {
       flags.push(v);
       const eq = v.indexOf("=");
+      // `--directories recurse` ≡ `--directories=recurse` ≡ `-r`: normalise the
+      // joined value into ONE flag shape (so isRecursiveGrep cannot miss it) and
+      // consume the value word, which would otherwise be read as the pattern.
+      if (v === "--directories") {
+        const val = i + 1 < toks.length ? toks[i + 1].value : "";
+        flags.push(`--directories=${val}`);
+        i += 2;
+        continue;
+      }
       if (eq > 0) {
         if (v.slice(0, eq) === "--exclude-dir") excludeDirs.push(v.slice(eq + 1));
         if (["--regexp", "--file"].includes(v.slice(0, eq))) patternFromFlag = true;
@@ -352,6 +382,16 @@ function scanArgs(
       }
       if (/^-[efm]$/.test(v)) {
         if (v === "-e" || v === "-f") patternFromFlag = true;
+        i += 2;
+        continue;
+      }
+      // `-d ACTION` (directories: read|skip|recurse). The value must travel WITH
+      // the flag: read as a separate word it becomes the pattern, and `-d` alone
+      // would otherwise be read as "recursive" unconditionally (`-d skip` is the
+      // very opposite). Normalised to the same shape as `--directories=…`.
+      if (v === "-d") {
+        const val = i + 1 < toks.length ? toks[i + 1].value : "";
+        flags.push(`--directories=${val}`);
         i += 2;
         continue;
       }
@@ -383,24 +423,68 @@ const GREP_SHORT_VALUE = new Set(["-e", "-f", "-m", "-A", "-B", "-C"]);
 
 function isRecursiveGrep(flags: string[]): boolean {
   for (const f of flags) {
-    if (f === "--recursive" || f === "-d") return true;
+    // Every spelling of grep's recursion is the same walk: `-r`/`-R`, the long
+    // forms, and `--directories=ACTION` with a recursing ACTION. Recognizing only
+    // `-r`-shaped and `--recursive` left `--dereference-recursive` and
+    // `--directories=recurse` ALLOWing an unbounded walk.
+    if (f === "--recursive" || f === "--dereference-recursive") return true;
+    if (/^--directories=(recurse|r)$/.test(f)) return true;
+    if (/^-d(recurse|r)$/.test(f)) return true;
     if (/^-[A-Za-z]*[rR]/.test(f)) return true;
   }
   return false;
 }
 
+/**
+ * R3p's guard test: the predicate IMMEDIATELY before `-prune` must name a
+ * directory-blocking target — `-name X -prune` / `-path X -prune`, or a
+ * `\( … \)` group ending right before it. A LOOKBACK WINDOW is unsound: in
+ * `find . -name node_modules -o -name '*.ts' -prune` the vendored name belongs to
+ * a different `-o` branch, so the expression is
+ * `( -name node_modules -o ( -name '*.ts' -a -prune ) )` — nothing is pruned for
+ * the node_modules directory and the walk descends, yet the window read that as a
+ * bound and ALLOWed it. Symmetrically the reversed order
+ * (`-name node_modules -print -o -name '*.ts' -prune`) is not a bound either.
+ */
+function pruneGuardIsVendored(words: string[], i: number): boolean {
+  const VENDORED_NAME = /(node_modules|\.worktrees|\.git|\.\*|_\*)/;
+  const isNameOp = (w: string) => /^-(i?name|i?path)$/.test(w);
+  if (words[i - 1] === ")") {
+    // The group is the immediately-preceding atom: walking back to its matching
+    // `(` is exact, and every `-name` inside that group genuinely gates the prune
+    // (`\( -name node_modules -o -name .git \) -prune` is the standard idiom).
+    let depth = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      if (words[j] === ")") depth++;
+      else if (words[j] === "(") {
+        depth--;
+        if (depth === 0) {
+          for (let k = j; k + 1 < i; k++) {
+            if (isNameOp(words[k]) && VENDORED_NAME.test(words[k + 1])) return true;
+          }
+          return false;
+        }
+      }
+    }
+    return false;
+  }
+  const op = words[i - 2];
+  const val = words[i - 1];
+  return Boolean(op !== undefined && val !== undefined && isNameOp(op) && VENDORED_NAME.test(val));
+}
+
 /** R3p: does this `find` carry a genuine bound? */
 function findBound(args: Token[]): { bounded: boolean; maxdepth: boolean } {
   const words = args.map((t) => t.value);
-  const maxdepth = words.some((w) => w.startsWith("-maxdepth") || w.startsWith("-depth"));
-  // `-prune` only bounds traversal when the predicate guarding it names a
-  // DIRECTORY-blocking target; the guard is the expression immediately before
-  // it (a `\( … \)` group, or a `-name`/`-path` pair), never any `-name` at all.
+  // `-maxdepth N` bounds the walk. `-depth` does NOT: it is the depth-first
+  // traversal ORDER (GNU/POSIX) or a result-depth PREDICATE (BSD) and the walk
+  // still descends — `find . -depth -name '*.ts'` walked the whole tree. Nothing
+  // in the corpus uses `-depth`, so nothing depended on the old arm.
+  const maxdepth = words.some((w) => w.startsWith("-maxdepth"));
   let pruneBlocking = false;
   for (let i = 0; i < words.length; i++) {
     if (words[i] !== "-prune") continue;
-    const window = words.slice(Math.max(0, i - 8), i).join(" ");
-    if (/(node_modules|\.worktrees|\.git|\.\*|_\*)/.test(window)) pruneBlocking = true;
+    if (pruneGuardIsVendored(words, i)) pruneBlocking = true;
   }
   return { bounded: maxdepth || pruneBlocking, maxdepth };
 }
@@ -485,19 +569,39 @@ export function classifySearchCommand(
     const head = skipPrefixes(seg, 0);
     if (head >= seg.length) continue;
     const binary = seg[head].value;
+    // R4b: `git grep` is the corpus's recommended primitive BECAUSE it reads the
+    // index — that IS its bound. `--no-index`/`--untracked` gives the bound up
+    // and re-walks ignore-blind (`.gitignore` is not consulted), which is the
+    // same class as `rg --no-ignore`. `--exclude-standard` restores the excludes,
+    // so it is accepted. Only the `grep` subcommand is inspected; every other
+    // `git` invocation is untouched. This branch sits BEFORE the WATCHED gate:
+    // `git` is not a walker binary, so after it the branch was dead code and
+    // `git grep --no-index` strolled past (caught by the cycle-2 probe).
+    if (binary === "git") {
+      if (seg[head + 1]?.value === "grep") {
+        const gwords = seg.slice(head + 2).map((t) => t.value);
+        const defeat = gwords.find((w) => w === "--no-index" || w === "--untracked");
+        if (defeat && !gwords.includes("--exclude-standard")) {
+          return { block: true, reason: ignoreDefeatReason("git grep", defeat) };
+        }
+      }
+      continue;
+    }
     if (!WATCHED.has(binary)) continue;
 
     const args = seg.slice(head + 1);
     if (binary === "grep") {
       const scan = scanArgs(args, GREP_SHORT_VALUE, GREP_LONG_VALUE, true);
       if (!isRecursiveGrep(scan.flags)) continue; // non-recursive grep never walks
-      if (!scan.operands.length && cwdUnattributable) {
-        // `cd $X && grep -rn p`: bash cds somewhere we cannot read, so the
-        // implicit root is unattestable — fail closed on THAT case only.
+      // `cd $X && grep -rn p [root]`: bash cds somewhere we cannot read, so every
+      // cwd-DEPENDENT operand is unattestable — the implicit `.` root is the
+      // operand list being empty, a relative operand is the same failure one step
+      // later. Absolute operands are attestable and proceed.
+      const operands = scan.operands.length ? scan.operands : ["."];
+      if (cwdUnattributable && operands.some(isCwdDependentOperand)) {
         return { block: true, reason: unattributableReason() };
       }
       // R1 first — it is never softened by R5's exclusion carve-out.
-      const operands = scan.operands.length ? scan.operands : ["."];
       const roots = operands.map((op) => resolveOperand(op, cwd));
       for (const r of roots) {
         if (r.kind === "unresolvable") return { block: true, reason: unresolvableReason(scan.operands, "R2") };
@@ -524,28 +628,34 @@ export function classifySearchCommand(
 
     if (binary === "find") {
       const start = findStartPoints(args);
-      if (!start.length && cwdUnattributable) {
+      const { bounded } = findBound(args);
+      // R3 classifies EVERY start point. `find a b -name x` searches BOTH a and
+      // b; resolving only start[0] made the verdict depend on argument order
+      // (`find src/ <hub> -name x` BLOCKed while `find <hub> src/ -name x`
+      // ALLOWed). The implicit root is `.` when no start point is given.
+      const starts = start.length ? start : ["."];
+      if (cwdUnattributable && starts.some(isCwdDependentOperand)) {
         return { block: true, reason: unattributableReason() };
       }
-      const { bounded } = findBound(args);
-      const root = start.length ? resolveOperand(start[0], cwd)
-        : { kind: "path" as const, raw: ".", path: resolve(cwd), file: false };
-      if (root.kind === "unresolvable") {
-        if (bounded) continue; // R3p exempts operand resolution when the shape is bounded
-        return { block: true, reason: unresolvableReason(start, "R3") };
-      }
-      if (root.kind === "glob") {
-        if (root.prefix === null || isSystemOrHomeRoot(root.prefix) || carriesVendoredTrees(root.prefix, warn)) {
-          return { block: true, reason: blockReason(root.prefix ?? start[0] ?? ".", "R3", "find") };
+      for (const s of starts) {
+        const root = resolveOperand(s, cwd);
+        if (root.kind === "unresolvable") {
+          if (bounded) continue; // R3p exempts operand resolution when the shape is bounded
+          return { block: true, reason: unresolvableReason(start, "R3") };
         }
-        continue;
-      }
-      if (!root.file && isSystemOrHomeRoot(root.path)) {
-        return { block: true, reason: blockReason(root.path, "R1", "find") };
-      }
-      if (bounded) continue; // R3p: `-maxdepth` / a directory-blocking `-prune`
-      if (!root.file && carriesVendoredTrees(root.path, warn)) {
-        return { block: true, reason: blockReason(root.path, "R3", "find") };
+        if (root.kind === "glob") {
+          if (root.prefix === null || isSystemOrHomeRoot(root.prefix) || carriesVendoredTrees(root.prefix, warn)) {
+            return { block: true, reason: blockReason(root.prefix ?? s, "R3", "find") };
+          }
+          continue;
+        }
+        if (!root.file && isSystemOrHomeRoot(root.path)) {
+          return { block: true, reason: blockReason(root.path, "R1", "find") };
+        }
+        if (bounded) continue; // R3p: `-maxdepth` / a directory-blocking `-prune`
+        if (!root.file && carriesVendoredTrees(root.path, warn)) {
+          return { block: true, reason: blockReason(root.path, "R3", "find") };
+        }
       }
       continue;
     }
@@ -572,6 +682,17 @@ function unattributableReason(): string {
 
 /** GNU `find` start points: an option prefix (`-L`/`-H`/`-P`, `-O…`, `-D …`)
  *  precedes them; the first expression token (a `-xxx`, `!`, `(`, `)`) ends them. */
+/**
+ * R2/R3: does this operand's meaning depend on the (possibly unattributable)
+ * cwd? `cd $X && grep -rn p src/` resolves `src/` against a directory bash will
+ * never enter, so the operand cannot be attested — the R2/R3 predicate would be
+ * evaluated against the wrong root and ALLOW a walk the command never performs.
+ * Absolute paths (and `~…`, expanded before resolution) carry their own root.
+ */
+function isCwdDependentOperand(op: string): boolean {
+  return !isAbsolute(op) && !op.startsWith("~");
+}
+
 function findStartPoints(args: Token[]): string[] {
   let i = 0;
   while (i < args.length) {

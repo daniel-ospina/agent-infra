@@ -337,7 +337,8 @@ git grep -n -e "logger.*password\|log.*password\|print.*password" -- '*.py' '*.j
 git grep -n -e "logger.*token\|log.*api_key\|print.*secret" -- '*.py' '*.js'
 
 # Debug mode
-git grep -n -e "debug.*[Tt]rue\|DEBUG.*=.*1" -- '*.py' '*.js' '*.env'
+git grep -n -e "debug.*[Tt]rue\|DEBUG.*=.*1" -- '*.py' '*.js'
+grep -n -e "DEBUG.*=.*1" .env .env.* 2>/dev/null   # `.env` is normally gitignored — `git grep` (index) cannot see it
 
 # Stack traces in responses
 git grep -n -e "traceback\|stack_trace\|exc_info" -- '*.py' | grep -i "return\|response\|json"

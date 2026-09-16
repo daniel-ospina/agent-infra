@@ -587,10 +587,153 @@ a silent one.
    - `security-review/references/logging.md` — the `grep -rn … | xargs -I {} grep -L … {}` pipeline was
      **already broken** at HEAD (it fed `file:line:match` strings to `grep -L` as filenames). Repaired to
      `git grep -l … | xargs -r grep -L …`.
-   - **12 file-operand sites** (both `Dockerfile` blocks, the `.npmrc`/`package.json`/`setup.py` targets)
-     dropped the no-op `-r` and keep `grep -n`: a file operand cannot traverse, and `git grep` would go
-     blind to a gitignored `.npmrc`, which is exactly the file a credential audit must read.
+   - **One file-operand site** (`.npmrc`/`.pypirc`/`pip.conf` in `supply-chain.md`) dropped the no-op
+     `-r` and kept `grep -n`: a file operand cannot traverse, and `git grep` would go blind to a
+     gitignored `.npmrc`, which is exactly the file a credential audit must read. (Rev-11 correction: an
+     earlier revision of this bullet said **12** sites and named the `Dockerfile`/`package.json`/`setup.py`
+     targets — those 9 are `git grep -n -e … -- <target>` sites, and the two remaining removed lines
+     targeted *directories* (`node_modules/ site-packages/`, `.github/workflows/`), which the `find`-based
+     and glob forms above already cover. 10 file-operand sites total, 9 of them `git grep`.)
 7. **Pre-existing, unrelated:** `node extensions/main-worktree-guard/test.mjs` fails 2 cases
    (`bd runtime with set (unchecked-out) → recovery: block`,
    `bd runtime branch -D unchecked-out → recovery: block`) **identically at clean `HEAD`** (verified in a
    detached `/tmp/mwg-probe` worktree of `HEAD`: 1807 passed / 2 failed). Not touched by this change.
+
+---
+
+## Implementation notes — Rev 10 (the finish: #1092 fixed in-band, the re-lock, the rebase)
+
+Added in the session that rebased onto `origin/main` (`e9ee87d`) and drove the branch to mergeable. Five
+things worth recording, all of them *disclosed* rather than silent:
+
+1. **`verification-gate` is fixed in this PR for the directory-symlink class (#1092), not bypassed.**
+   Rev 9 left `pi-bootstrap/pi-config/extensions/search-guard` untracked because `hashFile()` did
+   `readFileSync()` on it → `EISDIR` → the commit loop routes every errno but `ENOENT`/`ENOTDIR` to
+   `unverified` → the path is *permanently* un-committable, and a task sub-agent gets no #7591 auto-bypass.
+   The fix hashes a symlink by its **link target** — git's own `120000` blob semantics, byte-exact via
+   `readlinkSync(..., { encoding: "buffer" })` — in both `hashFile` and `hashMatchesDisk`, with `lstatSync`
+   (never `statSync`) preserving the caller's errno discrimination for the #920 D/F branch. Tests:
+   **7 unit cases** (dir symlink verifies; a file symlink hashes its target, not its content; a retarget is
+   drift; a broken link hashes its target; non-UTF-8 targets are byte-exact; `ENOTDIR` still throws; the
+   hashed bytes equal git's own staged blob) plus a **4-leg e2e scenario** through the real handler (blocked
+   → verified-by-target → retarget is a `Hash mismatch` → re-verified target commits, and
+   `git cat-file -p HEAD:farm-entry` returns the target string).
+   - **The fix closes a fail-OPEN as well as the over-block.** Measured pre-fix with the same harness: a
+     link retargeted to a *nonexistent* path made `readFileSync` follow the link, throw `ENOENT`, and the
+     commit loop read that as "deleted, content-free" and **skipped it — the retarget committed
+     unverified**. `lstatSync` never follows, so it is now a hash mismatch. Both directions are pinned.
+   - **Scope note:** the rule applies to *every* symlink, not just directory ones (git stores the target
+     for both), so a symlinked-**file** path is now hashed by its target string too. That is the #305
+     completion; its blast radius is only the diff that stages a symlink entry itself, and a stale
+     registry entry fails *closed* (re-verify).
+   - `pi-bootstrap/pi-config/agents/verifier.md`'s hash one-liner is made symlink-aware for the same reason
+     (`sha256sum <link>` follows, `readFileSync` throws), and the gate's hash-mismatch remedy line now
+     names the symlink command — otherwise the party the gate asks to re-hash cannot produce a matching
+     digest. `scripts/vgate.sh status` (the bridge inspection surface) had the same follow-through bug:
+     it previewed a valid directory-symlink entry as `missing` / `NO MATCH`, i.e. exactly backwards.
+2. **`scripts/workflow-lock.json` re-locked (a real red check the Rev-9 PR body missed).**
+   `ci / unit-test` runs `check-pi-pin-lockstep.mjs`, whose #666 content-lock assertion is *local* mode —
+   the new `search-cost` jobs in `ci.yml` / `ci-main.yml` changed those bytes while the lock still held the
+   pre-#1090 hashes. Re-locked with `node scripts/check-workflow-lock.mjs --update-lock` (the guard's own
+   remedy), which is the intended loud path for a deliberate locked-workflow edit.
+3. **Rebased onto `e9ee87d`; no conflict materialised.** The expected conflicts in
+   `.github/workflows/ci.yml` and `skills/post-deploy-verify/infra-verify/SKILL.md` auto-merged — the
+   branch never touched the latter (its `grep -r` sites were not among the 133), and `ci.yml` kept both
+   change sets (the `search-cost` job plus #1090's additions; verified by diffing the rebased tree against
+   the pre-rebase commit, which shows exactly main's delta and nothing lost).
+4. **The farm symlink still cannot land from a task sub-agent session — decided by measurement, not by
+   assumption.** The running gate is the code loaded from the **main checkout** at session start
+   (`~/.pi/agent/extensions/verification-gate` → `agent-infra/extensions/verification-gate`, byte-identical
+   to this branch's pre-fix copy), so this PR's fix cannot take effect in the process issuing the commit.
+   Confirmed end-to-end: with the symlink staged and a `[VGATE]` PASS merged into the verified registry
+   (`scripts/vgate.sh status` shows the entry with the correct link-target hash
+   `5062a2db…`), `git commit` **still** reports it as unverified — the `EISDIR` throw runs before the
+   registry is ever consulted. Landing it therefore needs one of the gate's *own* paths: an interactive
+   session's #7591 auto-bypass, or a follow-up commit in a fresh session once this PR (and with it the
+   fix) is on `main`. No bypass (`--no-verify`, `ELDATO_SKIP_VGATE`, env tampering) was used.
+5. **Both e2e suites are heavy under load.** `index.e2e.test.ts` is a ~60-scenario real-git suite; on a
+   host at loadavg ≈32 it runs well past 15 minutes. The #1092 scenario was validated in isolation first
+   (a 4-leg ad-hoc harness identical in shape to the suite) and then in the full suite.
+
+---
+
+## Implementation notes — Rev 11 (cycle-2 review: 10 reproduced bypasses closed, one false PASS in the harness)
+
+The `code-review` gate dispatched 4 reviewers (guidance, bug-scan, security, extension-safety/adversarial) in
+fresh contexts; the adversarial half was scoped to the **bypass classes** the guard claims to own (a walk over
+a vendored tree, an ignore-defeat primitive, and an R1 root), with acceptance = **every declared class covered
+by a test**, not reviewer exhaustion. 21 findings, 16 after dedupe. Each was reproduced before it was fixed —
+`git show HEAD:extensions/search-guard/index.ts` was loaded beside the working copy through the same module
+hooks and the same command list classified through both (the probe table below is that run's output). Every
+fix carries a table row (`T24`–`T29`) or a harness pin, so no class is closed by prose.
+
+### The bypasses (pre-fix → post-fix, measured)
+
+| # | Class | Command | pre | post |
+|---|---|---|---|---|
+| D1 | recursion spelling | `grep -n p --directories=recurse` | ALLOW | **BLOCK** |
+| D1 | recursion spelling | `grep -n p --directories recurse` | ALLOW | **BLOCK** |
+| D1 | recursion spelling | `grep -n p --dereference-recursive` | ALLOW | **BLOCK** |
+| D1 | recursion spelling | `grep -n -d recurse p` | ALLOW | **BLOCK** |
+| D2 | `-prune` lookback window | `find . -name node_modules -o -name '*.ts' -prune -o -name y -print` | ALLOW | **BLOCK** |
+| D3 | only `start[0]` resolved | `find src/ <hub> -name '*.ts'` | ALLOW | **BLOCK** |
+| D6 | redirection read as an operand | `grep -rn p 2>/dev/null` | ALLOW | **BLOCK** |
+| D7 | `-depth` read as a bound | `find . -depth -name '*.ts'` | ALLOW | **BLOCK** |
+| D8 | dead `git grep` branch | `git grep --no-index -n -e p` | ALLOW | **BLOCK** |
+| D9 | unattributable `cd` + relative operand | `cd $X && grep -rn p src/` | ALLOW | **BLOCK** |
+| D10 | symlinked root defeats R1 | `find <link-root → /> -name x` | ALLOW | **BLOCK** |
+
+Controls held in both directions, so no fix is a blunt `BLOCK`-more rule: `--directories=skip`, `-d skip`,
+`find . \( -name node_modules -o -name .worktrees \) -prune …`, `find <clean> src/`, `grep -rn p src/ 2>/dev/null`,
+`git grep --no-index --exclude-standard`, `cd $X && grep -rn p <absolute>`, and a real directory root are all
+still ALLOW. D8's root cause was placement, not logic: the `git grep` branch was written **after** the
+`WATCHED` gate, and `git` is not a walker binary, so it was dead code — the adversarial reviewer's
+"look at what runs before the check" pass found it; the probe would not have (it only tests the shapes shipped).
+
+### The finding that mattered most: the harness's own false PASS
+
+`tests/search-cost/run.sh` had **two exit-code checks that could not fail for the right reason** — the
+"positive control" and the "fails-if-removed" pin. `scan.mjs` enforces the (iii)/(iv) non-vacuity rules on
+*any* invocation, and a single-file fixture carries no `## Search` anchors by construction, so a scan of an
+**innocuous** file also exited `1`. Both checks read that exit code as "caught". Confirmed by running the
+scan on `echo hello`: `rc=1`, only the non-vacuity rules fired. This is the exit-code form of the vacuous-pin
+class the harness exists to prevent, and it is the reason the reverse-direction half of the invariant is now
+enforced by *text*, not by status: `scan_has_violation()` requires `(ii) taught command is REFUSED` naming the
+command, a negative control asserts that an innocuous fixture scans clean, and `--require-anchors` scopes
+(iii)/(iv) to the corpus invocation where the anchors actually exist. The fails-if-removed mutant is a
+**mechanical inversion of the live rewrite** (`git grep -n -e P -- 'g'` → `grep -rn P --include='g'`), asserted
+non-empty (exit 3 → red) — the pre-fix version copied `HEAD:`, which *after* the rewrite is the clean file, so
+its "mutant" was never a mutant.
+
+### Also fixed
+
+- **D4**: `scan.mjs`'s `--cwd` parsing had an off-by-one in both directions — `cwdAt > 0` ignored a leading
+  `--cwd`, and with no `--cwd` at all the target filter dropped `argv[0]` (`i !== cwdAt + 1` ⇒ `i !== 0`), so
+  `scan.mjs <dir>` scanned nothing. `test.mjs --classify` carried the same `cwdAt > 0`. Both fixed; two
+  harness pins added.
+- **D5**: corpus guidance that contradicted the guard's own advice. `data-protection.md` taught
+  `git grep … -- '*.py' '*.js' '*.env'` — `.env` is normally gitignored, so the index primitive is *blind* to
+  exactly the file the audit is about; it now names the untracked-file form. `docker.md`'s
+  `git grep … || echo "No USER directive"` conflated "no match" (exit 1) with "the search never ran"
+  (128, not a work tree) and would report a root `Dockerfile` that was never checked; the `||` is gone.
+- **D9 (second half)**: `resolveOperand` is trusted for the *first* operand of a `find` only after **every**
+  start point is classified — `find src/ .. -name x` no longer depends on argument order.
+- **D11 (declared, not changed)**: R1 fires before R3p/R5, so the `### Use` primitives are refused when the
+  cwd is `$HOME` or `/`. That is the intended semantics — a home-wide recursive walk is the very habit this
+  guards, and the block reason names a bounded replacement — and the corpus contract is asserted from a repo
+  cwd (the fixture hub). The harness comment now states the scoping explicitly instead of leaving it implied.
+- **D13** `manifest.json`'s `search-guard/` row was mis-indented; **D14** the new symlink remedy and the
+  verifier hash one-liner left `readlink <path>` unquoted (a path with a space would split); **D15** the
+  Rev-9 bullet above claimed "12 file-operand sites" (corrected in place to 1 site kept as `grep -n`, 9 as
+  `git grep`, 2 directory targets).
+- **D16** (unchanged, disclosed): the farm symlink still cannot land from a task sub-agent session — see
+  Rev 10 §4. The fix that unblocks it is in this PR; the follow-up commit is one line.
+
+### Measured state after Rev 11
+
+- `node extensions/search-guard/test.mjs` → **128 passed, 0 failed** (the threat table grew 97 → 118 rows: `T24`–`T29`
+  add 21, each pinning which rule fires; the other 10 checks are the handler / non-vacuity / mutation guards).
+- `bash tests/search-cost/run.sh` → **all checks passed**, including the new discriminating controls, the two
+  scanner-argv pins, and the differential fails-if-removed pin (10 960 commands / 277 files, Use=16, Avoid=8).
+- `npx tsx extensions/verification-gate/subtract-scope.test.ts` + `node …/test-subtract-scope.mjs` → green
+  (the gate's only other edit is the quoted remedy string, whose e2e assertion is `includes("sha256sum")`).

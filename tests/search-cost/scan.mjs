@@ -16,7 +16,10 @@
 //   (iii) every `### Use` command must classify null; every `### Avoid` command
 //         must classify non-null. A subsection with zero commands fails
 //         non-vacuity, so rewriting either into prose cannot disarm the pin.
-//   (iv)  the classifier must not be a constant (`null` for everything).
+//         Asserted only under `--require-anchors` (the corpus invocation).
+//   (iv)  the classifier must not be a constant (`null` for everything) — same
+//         scoping: a scoped fixture has no anchors, so the rule is meaningless
+//         there and enforcing it makes every exit code 1 regardless of content.
 //   (v)   `## Search` must be present in both AGENTS files.
 //
 // Fence shapes handled: tagged and untagged openers, indented fences (up to 4
@@ -24,7 +27,14 @@
 // openers preceded by any number of `> ` blockquote markers
 // (`skills/carousel-b2b-design/SKILL.md`, `skills/reviewers/duplication-architecture/SKILL.md`).
 //
-// Usage: node tests/search-cost/scan.mjs <path…> --cwd <fixture>
+// Usage: node tests/search-cost/scan.mjs <path…> --cwd <fixture> [--require-anchors]
+//   --require-anchors  assert the (iii)/(iv) non-vacuity rules — the CORPUS
+//                      invocation's contract (AGENTS.md carries `## Search` →
+//                      `### Use`/`### Avoid`). A scoped fixture has no anchors by
+//                      construction, and enforcing (iii)/(iv) there made the exit
+//                      code say nothing about the file under test: an INNOCUOUS
+//                      fixture also exited 1 (only the non-vacuity rules fired),
+//                      so run.sh's exit-code checks passed for the wrong reason.
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { register, registerHooks } from "node:module";
@@ -32,9 +42,17 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "../..");
 const argv = process.argv.slice(2);
+const FLAGS = new Set(["--require-anchors"]);
 const cwdAt = argv.indexOf("--cwd");
-const CWD = cwdAt > 0 ? argv[cwdAt + 1] : ROOT;
-const TARGETS = argv.filter((a, i) => i !== cwdAt && i !== cwdAt + 1);
+// `--cwd` may appear anywhere — including FIRST — and may be absent entirely. The
+// pre-fix `cwdAt > 0` silently fell back to ROOT when `--cwd` headed the argv, and
+// with no `--cwd` at all (`cwdAt === -1`) the target filter `i !== cwdAt + 1`
+// dropped argv[0], so `scan.mjs skills` scanned nothing.
+const CWD = cwdAt === -1 ? ROOT : argv[cwdAt + 1] ?? ROOT;
+const REQUIRED_ANCHORS = argv.includes("--require-anchors");
+const TARGETS = argv.filter(
+  (a, i) => !FLAGS.has(a) && (cwdAt === -1 || (i !== cwdAt && i !== cwdAt + 1)),
+);
 
 const hooks = await import(
   new URL("../../extensions/main-worktree-guard/module-load-hooks.mjs", import.meta.url).href
@@ -131,11 +149,14 @@ for (const c of ALL) {
   }
 }
 
-// (iii)/(iv) non-vacuity
-if (inUse.length === 0) violations.push("(iii) ### Use yielded zero commands — the pin would be vacuous");
-if (inAvoid.length === 0) violations.push("(iii) ### Avoid yielded zero commands — the pin would be vacuous");
-const blocks = [...inUse, ...inAvoid].filter((c) => classify(c.cmd, CWD, () => {}) !== null);
-if (blocks.length === 0) violations.push("(iv) the classifier returns null for every declared-shape command — vacuous");
+// (iii)/(iv) non-vacuity — the corpus contract, asserted only for the invocation
+// that actually carries the anchors (see --require-anchors in the usage note).
+if (REQUIRED_ANCHORS) {
+  if (inUse.length === 0) violations.push("(iii) ### Use yielded zero commands — the pin would be vacuous");
+  if (inAvoid.length === 0) violations.push("(iii) ### Avoid yielded zero commands — the pin would be vacuous");
+  const blocks = [...inUse, ...inAvoid].filter((c) => classify(c.cmd, CWD, () => {}) !== null);
+  if (blocks.length === 0) violations.push("(iv) the classifier returns null for every declared-shape command — vacuous");
+}
 
 console.log(`   scanned ${ALL.length} commands in ${FILES.length} files (Use=${inUse.length}, Avoid=${inAvoid.length})`);
 if (violations.length) {

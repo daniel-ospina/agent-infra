@@ -13,7 +13,7 @@
 //   node extensions/search-guard/test.mjs                                  # the suite
 //   node extensions/search-guard/test.mjs --classify <command> [--cwd D]   # one classification
 import { execSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { register, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,7 +36,9 @@ const classify = mod.classifySearchCommand;
 if (process.argv[2] === "--classify") {
   const command = process.argv[3] ?? "";
   const cwdAt = process.argv.indexOf("--cwd");
-  const cwd = cwdAt > 0 ? process.argv[cwdAt + 1] : process.cwd();
+  // `cwdAt > 0` silently ignored a `--cwd` that headed the argv (it is the same
+  // off-by-one scan.mjs carried — fixed there too).
+  const cwd = cwdAt === -1 ? process.cwd() : process.argv[cwdAt + 1] ?? process.cwd();
   const verdict = classify(command, cwd, () => {});
   if (verdict) {
     console.log("BLOCK " + verdict.reason.replace(/\s+/g, " ").trim());
@@ -83,6 +85,16 @@ mkdirSync(join(HUB, "functions"), { recursive: true });
 const UNREADABLE = join(FIX, "unreadable");
 mkdirSync(UNREADABLE, { recursive: true });
 chmodSync(UNREADABLE, 0o000);
+// T28: a root that is a SYMLINK to `/`. Lexically it sits under the fixture (not
+// an R1 path), so before #1092 the guard resolved it to a harmless-looking dir
+// and allowed the walk — `find link-root -name x` would have walked the whole
+// filesystem. The symlink target is never traversed by the guard.
+const LINK_ROOT = join(FIX, "link-root");
+try {
+  symlinkSync("/", LINK_ROOT);
+} catch {
+  /* a platform that refuses symlinks to `/` — the T28 row then pins the R1 refusal */
+}
 
 // ── the threat table ───────────────────────────────────────────────────────
 // [name, command, expected, rule-or-null, cwd]
@@ -202,6 +214,44 @@ const ROWS = [
   ["T22 env kill switch", "grep -rn p", "ALLOW", null, HUB, { SEARCH_GUARD_DISABLED: "1" }],
   // T23 — the guidance pin: the untracked-file remedy must not be refused
   ["T23 untracked remedy", "git ls-files --others --exclude-standard", "ALLOW", null, HUB],
+  // T24 — every spelling of grep recursion: `-r`/`-R`, `--recursive`,
+  // `--dereference-recursive`, `--directories=ACTION`. Recognizing only `-r`-shaped
+  // and `--recursive` left three ALLOWing an unbounded walk (cycle-2 D1).
+  ["T24 --directories=recurse", "grep -n p --directories=recurse", "BLOCK", "R2", HUB],
+  ["T24 --directories recurse", "grep -n p --directories recurse", "BLOCK", "R2", HUB],
+  ["T24 --dereference-recursive", "grep -n p --dereference-recursive", "BLOCK", "R2", HUB],
+  ["T24 control --directories=skip", "grep -n p --directories=skip", "ALLOW", null, HUB],
+  ["T24 control -d skip", "grep -n -d skip p", "ALLOW", null, HUB],
+  ["T24 -d recurse", "grep -n -d recurse p", "BLOCK", "R2", HUB],
+  // T25 — a shell redirection is not an operand (cycle-2 D6). The shell strips
+  // `2>/dev/null` before grep sees argv, so the implicit `.` root must still be
+  // classified; treating it as an operand skipped the root check entirely.
+  ["T25 redirection 2>/dev/null", "grep -rn p 2>/dev/null", "BLOCK", "R2", HUB],
+  ["T25 redirection > file", "grep -rn p > /dev/null", "BLOCK", "R2", HUB],
+  ["T25 redirection 2>&1", "grep -rn p 2>&1", "BLOCK", "R2", HUB],
+  ["T25 control scoped + redirect", "grep -rn p src/ 2>/dev/null", "ALLOW", null, HUB],
+  // T26 — find: EVERY start point (not just the first), `-depth` is not a bound
+  // (it is traversal order / a result predicate), and `-prune` is bounded only by
+  // the predicate IMMEDIATELY before it — a lookback window read the vendored name
+  // out of a different `-o` branch (cycle-2 D2/D3/D7).
+  ["T26 find two start points", `find src/ ${HUB} -name '*.ts'`, "BLOCK", "R3", HUB],
+  ["T26 control two clean start points", `find ${SAFE} src/ -name '*.ts'`, "ALLOW", null, HUB],
+  ["T26 -depth is not a bound", "find . -depth -name '*.ts'", "BLOCK", "R3", HUB],
+  ["T26 prune window not a bound", "find . -name node_modules -o -name '*.ts' -prune -o -name y -print", "BLOCK", "R3", HUB],
+  ["T26 control prune group", `find . \\( -name node_modules -o -name .worktrees \\) -prune -o -name '*.ts' -print`, "ALLOW", null, HUB],
+  // T27 — `git grep --no-index`/`--untracked` gives up the index bound, the very
+  // property the corpus recommends `git grep` for (cycle-2 D8).
+  ["T27 git grep --no-index", "git grep --no-index -n -e p", "BLOCK", "R4", HUB],
+  ["T27 git grep --untracked", "git grep --untracked -n -e p", "BLOCK", "R4", HUB],
+  ["T27 control --exclude-standard", "git grep --no-index --exclude-standard -n -e p", "ALLOW", null, HUB],
+  // T28 — R1 is not defeated by a symlinked root: realpath before the depth-2 test
+  // (cycle-2 D10; pre-fix this ALLOWed a walk of `/`).
+  ["T28 symlinked root -> /", `find ${LINK_ROOT} -name x`, "BLOCK", "R1", HUB],
+  // T29 — an unattributable `cd` + a RELATIVE operand: the operand cannot be
+  // attested, so it is unattestable one step later than the implicit `.` root
+  // (cycle-2 D9). An absolute operand carries its own root and proceeds.
+  ["T29 unattributable cd + relative operand", "cd $X && grep -rn p src/", "BLOCK", "cwd", SAFE],
+  ["T29 control unattributable cd + absolute operand", `cd $X && grep -rn p ${HUB}/nonexistent`, "ALLOW", null, SAFE],
   // Scope controls
   ["scope non-recursive grep", `grep -n MARKER ${HUB}/tracked.txt`, "ALLOW", null, HUB],
   ["scope non-recursive file operand", "grep -i x ~/Library/Logs/nonexistent-1069.log", "ALLOW", null, HUB],

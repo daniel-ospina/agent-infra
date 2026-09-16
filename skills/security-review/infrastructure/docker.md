@@ -386,8 +386,9 @@ docker login -u user -p password registry.example.com
 ## Grep Patterns for Dockerfiles
 
 ```bash
-# Running as root
-git grep -n -e "^USER" -- Dockerfile || echo "No USER directive - runs as root"
+# Running as root — exit 1 means "no match"; anything else (e.g. 128, not a work tree)
+# means the search did not run, so `|| echo` would report a root Dockerfile that was never checked
+git grep -n -e "^USER" -- Dockerfile
 
 # Secrets in environment
 git grep -n -e "^ENV.*PASSWORD\|^ENV.*SECRET\|^ENV.*KEY\|^ENV.*TOKEN" -- Dockerfile
