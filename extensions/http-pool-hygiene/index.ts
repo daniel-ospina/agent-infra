@@ -17,7 +17,7 @@
  * wiring. It never throws: a resolution failure degrades to a loud warning and
  * leaves pi's transport untouched (documented in README.md).
  *
- * Kill switch: PI_HTTP_POOL_HYGIENE=0
+ * Kill switch: PI_HTTP_POOL_HYGIENE=0 (also `false`/`disabled`)
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -78,9 +78,15 @@ export function __resetHygieneForTests(): void {
   handle = { wrapper: null, status: "disabled", undiciPath: null, undiciSource: null, retryHosts: [] };
 }
 
+/**
+ * Kill-switch values. `0`/`false` mirror pi's boolean-style settings; `disabled`
+ * mirrors pi's own `httpIdleTimeoutMs: "disabled"` spelling (and the extension's
+ * own announcement). A kill switch that silently ignores a documented spelling is
+ * worse than no kill switch — it reads as armed while the extension stays on.
+ */
 function isDisabled(env: NodeJS.ProcessEnv): boolean {
-  const value = env[DISABLE_ENV];
-  return value === "0" || value?.toLowerCase() === "false";
+  const value = env[DISABLE_ENV]?.trim().toLowerCase();
+  return value === "0" || value === "false" || value === "disabled";
 }
 
 /**
@@ -170,27 +176,37 @@ function agentDirFile(env: NodeJS.ProcessEnv, name: string): string | null {
 /**
  * Re-assert the wrapper if something replaced `globalThis.fetch`.
  *
+ * ALSO the runtime-reconfiguration hook. pi rebuilds its OWN dispatcher when
+ * `httpIdleTimeoutMs` changes at runtime (the settings UI's
+ * `onHttpIdleTimeoutMsChange` → `configureHttpDispatcher(timeoutMs)`), but it
+ * does NOT replace `globalThis.fetch` once ours is installed — pi only
+ * re-installs its own fetch when it still sees the fetch *it* installed
+ * (`shouldInstallGlobals`). So `isWrapperInstalled()` staying true is NOT
+ * evidence that nothing changed: this call is the only place that can notice a
+ * settings change, and it must therefore re-resolve the configuration every
+ * time. `wrapper.reconfigure` is idempotent — an unchanged configuration does
+ * not rotate the pool, so steady-state reuse is untouched.
+ *
  * The NEW fetch is adopted as the wrapper's base (`rebase`) rather than
  * discarded: another extension may have deliberately instrumented fetch after
  * we loaded, and clobbering it would silently drop its work. Returns true when
- * a re-assert happened.
+ * a re-assert (re-install) happened.
  */
 export function reassertFetchWrapper(
   wrapper: ReturnType<typeof createResilientFetch> | null,
   log: (...args: unknown[]) => void = () => {},
   refresh?: () => { options?: unknown; retryHosts?: Set<string> } | undefined,
 ): boolean {
-  if (!wrapper || isWrapperInstalled(wrapper)) return false;
-  // pi calls `configureHttpDispatcher(timeoutMs)` when `httpIdleTimeoutMs`
-  // changes at runtime; adopting the replacement fetch but keeping our OLD
-  // options would silently pin the user's previous timeout. Rebuild instead —
-  // including the retry allowlist, which would otherwise be frozen at install
-  // (a provider added to models.json later would never get the transparent
-  // retry, with nothing in the log to say so).
+  if (!wrapper) return false;
+  // Re-resolve the transport configuration FIRST, whether or not the wrapper was
+  // displaced — this is what makes a runtime `httpIdleTimeoutMs` change (and a
+  // provider added to `models.json` after install) take effect instead of being
+  // pinned to whatever was current at install.
   if (typeof refresh === "function") {
     const next = refresh();
     wrapper.reconfigure(next?.options, next?.retryHosts);
   }
+  if (isWrapperInstalled(wrapper)) return false;
   const foreign = globalThis.fetch;
   if (typeof foreign === "function") wrapper.rebase(foreign);
   installResilientFetch(wrapper);

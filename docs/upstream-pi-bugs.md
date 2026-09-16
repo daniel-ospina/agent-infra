@@ -201,6 +201,17 @@ CONTROL (hygiene OFF)  reaps=12  requests written onto a reaped socket=9   sessi
 FIXED   (hygiene ON)   reaps=3   requests written onto a reaped socket=0   sessions exited 0, mid-stream kill recovered 3/3
 ```
 
+Read those as **one observed run of a timing-dependent harness** (a 150 ms
+reap and 0.4 s between turns), not as deterministic constants — the committed
+checks assert `rstOnReuse > 0` / `=== 0`, not the counts. Note also what the
+FIXED arm does and does not establish: with the clamp (100 ms) below the reap
+(150 ms), the client drops the idle socket *before* the edge can, so
+`rstOnReuse === 0` holds by construction and cannot on its own distinguish the
+clamp from keep-alive-disabled. The complementary property — that steady-state
+reuse on a **healthy** endpoint survives the clamp — is asserted separately and
+against real undici in `test-pool-hygiene.mjs` P3.8 (6 back-to-back requests,
+far fewer than 6 connections, no reaps, no rotations).
+
 The control's sessions survived only because undici drops a socket once a
 request on it has failed — i.e. the retry is what absorbs the defect, one
 provider call at a time. When the edge also throttles reconnects (the

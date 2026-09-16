@@ -51,7 +51,7 @@ import { homedir } from "node:os";
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Kill switch: `PI_HTTP_POOL_HYGIENE=0` (or `false`) disables everything. */
+/** Kill switch: `PI_HTTP_POOL_HYGIENE=0` (or `false`/`disabled`) disables everything. */
 export const DISABLE_ENV = "PI_HTTP_POOL_HYGIENE";
 
 /** Ceiling applied to a server-advertised keep-alive TTL. */
@@ -134,14 +134,33 @@ const TRANSPORT_ERROR_PATTERN = new RegExp(
   "i",
 );
 
-/** True when a thrown error looks like a dead/severed connection. */
+/**
+ * True when a thrown error looks like a dead/severed connection.
+ *
+ * Classification is CODE-FIRST, deliberately. The bare `"fetch failed"`
+ * alternative is the generic wrapper message Node/undici attach to EVERY fetch
+ * network failure — a self-signed TLS failure and a DNS failure both read
+ * `TypeError: fetch failed` (with `cause.code` `DEPTH_ZERO_SELF_SIGNED_CERT` /
+ * `ENOTFOUND`). Matching that message when a cause code is available would
+ * classify TLS/DNS failures as transport kills, rotate the pool, and re-send —
+ * widening the retry scope the allowlist exists to narrow. So the message is
+ * consulted ONLY when there is no cause code to classify on.
+ */
 export function isConnectionClassError(err) {
   if (!err) return false;
   const codes = [err.code, err.errno, err.cause?.code, err.cause?.errno];
   for (const code of codes) {
     if (typeof code === "string" && TRANSPORT_ERROR_PATTERN.test(code)) return true;
   }
+  if (hasCauseCode(err)) return false;
   return isConnectionClassMessage(String(err.message ?? err));
+}
+
+/** True when the error carries a `cause` code we could have classified on. */
+function hasCauseCode(err) {
+  const cause = err?.cause;
+  if (!cause || typeof cause !== "object") return false;
+  return typeof cause.code === "string" || typeof cause.errno === "string";
 }
 
 /** True when an error STRING (e.g. pi's `errorMessage`) is transport-class. */
@@ -153,7 +172,6 @@ export function isConnectionClassMessage(message) {
 // Request replayability
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
 /**
  * A transparent retry re-sends the request; that is only safe when the body can
  * be produced twice. The OpenAI SDK sends a JSON string (replayable) — but a
@@ -371,6 +389,28 @@ export function resolveDispatcherOptions(env = process.env, { settingsJson = nul
   };
 }
 
+/**
+ * Stable signature of the dispatcher options this module owns — the idempotence
+ * key for `reconfigure`, so a re-resolved-but-identical configuration is a no-op.
+ */
+function dispatcherOptionsSignature(o) {
+  return [
+    o?.allowH2,
+    o?.proxyTunnel,
+    o?.keepAliveMaxTimeout,
+    o?.headersTimeout,
+    o?.bodyTimeout,
+    o?.connect?.autoSelectFamilyAttemptTimeout,
+  ].join("|");
+}
+
+/** Set equality for the retry-host allowlist. */
+function sameHostSet(a, b) {
+  if (!a || !b || a.size !== b.size) return false;
+  for (const host of a) if (!b.has(host)) return false;
+  return true;
+}
+
 // Undici can emit an internal Client/Pool "error" while terminating a socket
 // (notably a mid-stream fetch body — the exact kill this module targets).
 // EventEmitter's unhandled-'error' special case would crash the pi process, so
@@ -434,9 +474,10 @@ export function createResilientFetch({
   let rotations = 0;
   let activeRequests = 0;
   let retryHostSet = retryHosts;
-  // The wrapper sits on top of whatever fetch was current when it was built.
-  // If something replaces `globalThis.fetch` later, `rebase` re-points the
-  // wrapper at the NEW fetch instead of discarding it (see index.ts).
+  // The wrapper is built on the fetch it was HANDED (in production, pi's own
+  // `undici.fetch`), not on the ambient `globalThis.fetch`. If something replaces
+  // `globalThis.fetch` later, `rebase` re-points the wrapper at the NEW fetch
+  // instead of discarding it (see index.ts).
   let baseFetch = fetchImpl;
   // The fetch BELOW every wrapper layer that has ever adopted us. Used to break
   // re-entrancy: if an adopted fetch delegates back into `globalThis.fetch`
@@ -543,8 +584,18 @@ export function createResilientFetch({
    * get the transparent retry, with nothing in the log to say so).
    */
   const reconfigure = (nextOptions, nextRetryHosts) => {
-    options = nextOptions ?? options;
+    const next = nextOptions ?? options;
+    const optionsChanged = dispatcherOptionsSignature(next) !== dispatcherOptionsSignature(options);
+    const hostsChanged = nextRetryHosts ? !sameHostSet(nextRetryHosts, retryHostSet) : false;
+    options = next;
     if (nextRetryHosts) retryHostSet = nextRetryHosts;
+    // IDEMPOTENT: this runs on every `session_start`/`turn_start` (pi rebuilds
+    // its OWN dispatcher on a runtime `httpIdleTimeoutMs` change but never
+    // replaces `globalThis.fetch`, so the re-assert is the only place that can
+    // notice). An unchanged configuration must NOT rotate the pool — rotating
+    // per turn would churn connections and undo the steady-state reuse the
+    // clamp deliberately preserves.
+    if (!optionsChanged && !hostsChanged) return dispatcher;
     return rotate("reconfigure");
   };
 

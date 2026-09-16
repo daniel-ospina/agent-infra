@@ -17,6 +17,13 @@
  *   - CONTROL: the edge's reaped sockets DO get reused (the defect) and pi is
  *     forced into connection-error retries that the fix does not need.
  *
+ * Scope note on A2: the fixed clamp (100 ms) is SHORTER than the edge's reap
+ * (150 ms), so the client drops the idle socket before the edge can reap it and
+ * `rstOnReuse === 0` holds by construction. This workload therefore establishes
+ * "the clamp prevents dead-socket reuse" but NOT "reuse is preserved on a
+ * healthy endpoint" — the two cannot be shown in one workload. The steady-state
+ * half is asserted against real undici by `test-pool-hygiene.mjs` P3.8.
+ *
  * Run (needs a pi install):  node extensions/http-pool-hygiene/e2e-live-sessions.mjs
  * NOT part of the zero-dep CI glob (deliberately — it spawns pi).
  */
@@ -218,7 +225,7 @@ console.log("\n──────── acceptance ────────");
 expect("A1 control: the edge's reaped sockets ARE reused (defect reproduced)",
   control.summary.lb.rstOnReuse > 0,
   `rstOnReuse=${control.summary.lb.rstOnReuse} reaps=${control.summary.lb.reaps}`);
-expect("A2 fixed: no request is ever written onto a reaped socket",
+expect("A2 fixed: no request is ever written onto a reaped socket (by construction: clamp < reap; steady-state reuse is P3.8)",
   fixed.summary.lb.rstOnReuse === 0,
   `rstOnReuse=${fixed.summary.lb.rstOnReuse} reaps=${fixed.summary.lb.reaps}`);
 expect("A3 fixed: all sessions complete",

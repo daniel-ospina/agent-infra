@@ -110,6 +110,19 @@ eq("P1.29 negative idle timeout falls back", resolveDispatcherOptions({}, { sett
 eq("P1.30 undici available → run", undiciGateOutcome({ undiciAvailable: true }), "run");
 eq("P1.31 undici missing → skip by default", undiciGateOutcome({ undiciAvailable: false }), "skip");
 eq("P1.32 undici REQUIRED but missing → fail, not a green skip", undiciGateOutcome({ undiciAvailable: false, requireUndici: true }), "fail");
+// P1.33-36 — the classifier must not treat EVERY `fetch failed` as a dead
+// socket: that generic message is what Node/undici attach to a TLS or DNS
+// failure too, and matching it would rotate the pool and re-send for a failure
+// the pool has nothing to do with. Classification is code-first; the generic
+// message is only consulted when there is no cause code to classify on.
+eq("P1.33 self-signed TLS failure is NOT transport-class",
+  isConnectionClassError(Object.assign(new TypeError("fetch failed"), { cause: { code: "DEPTH_ZERO_SELF_SIGNED_CERT" } })), false);
+eq("P1.34 DNS failure is NOT transport-class",
+  isConnectionClassError(Object.assign(new TypeError("fetch failed"), { cause: { code: "ENOTFOUND" } })), false);
+eq("P1.35 a 'fetch failed' with no cause CODE still is (nothing better to classify on)",
+  isConnectionClassError(Object.assign(new TypeError("fetch failed"), { cause: {} })), true);
+eq("P1.36 a transport cause code still wins over the generic message",
+  isConnectionClassError(Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } })), true);
 
 // ─────────────────────────────────────────────────────────────────────────
 console.log("\n── Part 2: resilient-fetch mechanics (scripted transport) ──");
@@ -694,6 +707,49 @@ console.log("\n── Part 4: the extension module itself ──");
         `bodyTimeout=${refreshed.snapshot().bodyTimeout} ceiling=${refreshed.snapshot().keepAliveMaxTimeout}`);
       eq("P4.20 re-assert also refreshes the retry allowlist", refreshed.snapshot().retryHosts.join(","), "provider.example");
 
+      // P4.25 — THE REAL pi PATH (the cycle-1 P1). pi's settings UI calls
+      // `configureHttpDispatcher(timeoutMs)` at runtime, but it does NOT replace
+      // `globalThis.fetch` once ours is installed (`shouldInstallGlobals` is
+      // false), so the old `if (!wrapper || isWrapperInstalled(wrapper)) return`
+      // early-return made the reconfigure path UNREACHABLE and silently pinned
+      // whatever was resolved at install. This arm drives that exact shape —
+      // wrapper still installed, NO fetch replacement — and pins both halves:
+      // the change is picked up, and an unchanged config does not churn the pool.
+      mod.__resetHygieneForTests();
+      globalThis.fetch = prevFetch;
+      const reHandles = new Map();
+      const rePi = { on(name, fn) { if (!reHandles.has(name)) reHandles.set(name, []); reHandles.get(name).push(fn); } };
+      let liveIdle = 1111;
+      await mod.runExtension(rePi, {
+        resolveUndici: () => resolved,
+        readSettings: () => ({ httpIdleTimeoutMs: liveIdle }),
+        readModels: () => ({ providers: { mock: { baseUrl: "http://127.0.0.1:8081/v1" } } }),
+        env: { PI_HTTP_POOL_HYGIENE: "1" },
+        log: () => {},
+        warn: () => {},
+      });
+      const reHandle = mod.getHygieneHandle();
+      eq("P4.25a install mirrors the settings timeout", reHandle.wrapper.snapshot().bodyTimeout, 1111);
+      const rotationsAtInstall = reHandle.wrapper.snapshot().rotations;
+      // The user changes the timeout. pi reconfigures its OWN dispatcher; it does
+      // NOT touch globalThis.fetch (that is the whole point of this arm).
+      liveIdle = 2222;
+      check("P4.25b the wrapper is STILL installed (pi did not replace fetch)", isWrapperInstalled(reHandle.wrapper), true);
+      await reHandles.get("turn_start")[0]();
+      eq("P4.25c a runtime settings change IS picked up without a fetch replacement",
+        reHandle.wrapper.snapshot().bodyTimeout, 2222);
+      eq("P4.25d it rotated exactly once", reHandle.wrapper.snapshot().rotations, rotationsAtInstall + 1);
+      // Idempotence: an unchanged configuration must not rotate (a per-turn
+      // rotation would churn connections and undo steady-state reuse).
+      await reHandles.get("turn_start")[0]();
+      eq("P4.25e an unchanged configuration does NOT rotate the pool",
+        reHandle.wrapper.snapshot().rotations, rotationsAtInstall + 1);
+      // Disabled must remain a no-op in the enabled path.
+      liveIdle = 0;
+      await reHandles.get("turn_start")[0]();
+      eq("P4.25f httpIdleTimeoutMs 0 (disabled) is honoured on reconfigure",
+        reHandle.wrapper.snapshot().bodyTimeout, 0);
+
       // Disabled path must be inert and loud, not silently half-installed.
       globalThis.fetch = prevFetch;
       mod.__resetHygieneForTests();
@@ -701,6 +757,19 @@ console.log("\n── Part 4: the extension module itself ──");
       const disabledHandle = mod.installHygiene({ resolveUndici: () => resolved, env: { PI_HTTP_POOL_HYGIENE: "0" }, log: () => {}, warn: () => {} });
       eq("P4.12 kill switch leaves the transport untouched", disabledHandle.status, "disabled");
       eq("P4.13 kill switch does not install a wrapper", globalThis.fetch === prevFetch, true);
+      // P4.26 — the spelling the extension's own announcement uses. A kill switch
+      // that silently ignores a documented value reads as armed while the
+      // extension stays on.
+      for (const spelling of ["disabled", "DISABLED", "false", "FALSE", "0"]) {
+        mod.__resetHygieneForTests();
+        const h = mod.installHygiene({ resolveUndici: () => resolved, env: { PI_HTTP_POOL_HYGIENE: spelling }, log: () => {}, warn: () => {} });
+        eq(`P4.26 kill switch spelling ${JSON.stringify(spelling)} disables`, h.status, "disabled");
+      }
+      for (const spelling of ["1", "true", "yes", ""]) {
+        mod.__resetHygieneForTests();
+        const h = mod.installHygiene({ resolveUndici: () => resolved, env: { PI_HTTP_POOL_HYGIENE: spelling }, log: () => {}, warn: () => {} });
+        check(`P4.27 spelling ${JSON.stringify(spelling)} does NOT disable`, h.status !== "disabled", `status=${h.status}`);
+      }
 
       // Unresolved undici must WARN (fail loud, never silent).
       const warnings = [];
