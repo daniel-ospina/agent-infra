@@ -842,11 +842,34 @@ WORST_MS = (N + 1) * PROV + BACKOFF
 # that only knows "43 min". Millisecond forms are matched in both plain and
 # comma-grouped spellings. The two phrase forms catch a restatement carrying a
 # WRONG number, which no value-derived pattern can.
+def _num(v):
+    """`v` as a regex, in BOTH spellings: plain ("2582") and thousands-grouped
+    ("2,582").
+
+    The millisecond patterns below already accept both, and a duration restated
+    with a separator is the same restatement — `"2,582 s"` / `"4,982 s"`
+    false-passed while only the plain integer was matched, the same class of
+    gap as the bare-letter one (#1088 review cycle 7).
+    """
+    return rf"(?:{v:,}|{v})" if v >= 1000 else str(v)
+
 def _dur(ms, unit="min"):
-    """Match a prose duration: "43 min" / "43.0 min" / "43-minute" / "182 s"."""
+    """Match a prose duration whose unit is SPELLED OUT, in either number
+    spelling: "43 min" / "43.0 min" / "43-minute" / "182 sec" / "2,582 seconds".
+
+    This helper deliberately does NOT match the bare unit letter. It used to
+    look as if it did: this docstring advertised `"182 s"` while the seconds
+    tail was `sec(?:ond)?s?`, which REQUIRES the word `sec` — so every "N s"
+    restatement false-passed the pin the helper exists to enforce
+    (#1088 review cycle 7). The bare letter is now matched by explicit
+    patterns in BANNED_RE below, which is where the value-by-value collision
+    rules live: `60 s` cannot be banned bare without false-blocking unrelated
+    prose, so its bare form is context-anchored there, while 182 / 2582 / 4982
+    collide with nothing and are banned bare. Docstring and matcher agree.
+    """
     v = int(ms / 60000) if unit == "min" else int(ms / 1000)
     tail = r"min(?:ute)?s?" if unit == "min" else r"sec(?:ond)?s?"
-    return re.compile(rf"(?<![\d.]){v}(?:\.\d+)?[\s-]*{tail}\b")
+    return re.compile(rf"(?<![\d.]){_num(v)}(?:\.\d+)?[\s-]*{tail}\b")
 BANNED_RE = (
     (_dur(HANG_MS), f"no-progress window ({HANG_MS // 60000} min)"),
     (_dur(WORST_MS), f"worst case ({WORST_MS // 60000} min)"),
@@ -881,6 +904,29 @@ BANNED_RE = (
     (_dur(CAP, "s"), f"backoff cap ({CAP // 1000} s)"),
     (_dur(HANG_MS, "s"), f"no-progress window ({HANG_MS // 1000} s)"),
     (_dur(WORST_MS, "s"), f"worst case ({WORST_MS // 1000} s)"),
+    # ...and the same seconds values with the BARE unit letter, mirroring the
+    # `43m` forms below. These are the very spellings `_dur`'s docstring used to
+    # promise and the matcher did not deliver: "182 s" / "2582 s" / "4982 s"
+    # false-passed because the seconds tail demanded the word `sec`.
+    # `60 s` — the cap — is the ONE value that cannot be banned bare: `60 s` /
+    # `60s` is also how unrelated current-state prose reads (a 60-second poll in
+    # docs/ops/load-policy.md, a 60 s LB idle timeout in
+    # docs/upstream-pi-bugs.md), and banning it bare false-blocks three innocent
+    # paragraphs. So the cap's bare form is matched only where the paragraph
+    # attaches it to the contract ("60 s backoff cap", "capped at 60 s").
+    # The number itself goes through `_num`, so the comma-grouped spelling
+    # ("2,582 s") is banned too, and the cap's context word ends on a word
+    # boundary so `capacity` / `capable` are not read as `cap`.
+    (re.compile(rf"(?<![\d.]){_num(BACKOFF // 1000)}[\s-]*s(?![\w])"),
+     f"retry ladder ({BACKOFF // 1000} s)"),
+    (re.compile(rf"(?<![\d.]){_num(HANG_MS // 1000)}[\s-]*s(?![\w])"),
+     f"no-progress window ({HANG_MS // 1000} s)"),
+    (re.compile(rf"(?<![\d.]){_num(WORST_MS // 1000)}[\s-]*s(?![\w])"),
+     f"worst case ({WORST_MS // 1000} s)"),
+    (re.compile(rf"(?<![\d.]){_num(CAP // 1000)}[\s-]*s(?![\w])[^\n]{{0,24}}?(?:backoff[\s-]+)?(?:capped|cap|cadence)\b"),
+     f"backoff cap ({CAP // 1000} s)"),
+    (re.compile(rf"(?:capped\s+at|cap\s+of|(?:backoff|retry)\s+(?:capped|cap|cadence)\b)\D{{0,10}}?(?<![\d.]){_num(CAP // 1000)}[\s-]*s(?![\w])"),
+     f"backoff cap ({CAP // 1000} s)"),
     (re.compile(rf"(?<![\d.]){BACKOFF:,}(?![\d])"), f"retry ladder ({BACKOFF:,} ms)"),
     (re.compile(rf"(?<![\d.]){BACKOFF}(?![\d])"), f"retry ladder ({BACKOFF} ms)"),
     # Noun-FIRST and copula phrasings ("the backoff cap is 1 min", "retry
@@ -1362,6 +1408,103 @@ else
   fi
 fi
 rm -rf "$TMP32"
+
+echo ""
+echo "33. an entry the walk cannot STAT must not read green either"
+# The arm above is an unreadable DIRECTORY (os.scandir raises). This is the
+# sibling arm: the ENTRY stat. `os.DirEntry.is_dir(follow_symlinks=True)` cannot
+# be answered from d_type for a SYMLINK, so the entry gets stat'ed — and under a
+# `chmod 400` directory that stat raises EACCES. The old `except OSError:
+# continue` skipped the entry, so a `.pi/settings.json` behind that symlink was
+# never inspected: the listing came back empty, the guard printed "no project
+# settings file" and exited 0 (#1088 review cycle 7).
+if [ "$(id -u)" -eq 0 ]; then
+  pass "running as root — the unstat-able-entry case is untestable here"
+else
+  TMP33="$(mktemp -d /tmp/cost-config-walkstat.XXXXXX)"
+  OUTSIDE33="$(mktemp -d /tmp/cost-config-walkoutside.XXXXXX)"
+  mkroot "$TMP33"
+  # The settings file lives OUTSIDE the root so the symlink is the ONLY path the
+  # walk can reach it by. Inside the root the walk would also find it directly
+  # and this test would pass for the wrong reason — the first version of this
+  # repro did exactly that.
+  mkdir -p "$OUTSIDE33/.pi" "$TMP33/locked"
+  echo '{"retry":{"maxRetries":99}}' >"$OUTSIDE33/.pi/settings.json"
+  ln -s "$OUTSIDE33/.pi" "$TMP33/locked/.pi"
+  chmod 400 "$TMP33/locked"
+  bash "$TMP33/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  chmod 700 "$TMP33/locked"
+  if [ "$code" -eq 1 ] && grep -q 'WALK_ERROR' "$OUT"; then
+    pass "a symlink under chmod 400 the walk cannot stat → exit 1 (fail-closed)"
+  else
+    fail "WALK FAIL-OPEN: expected exit 1 + WALK_ERROR for an unstat-able entry, got $code"; sed -n '1,30p' "$OUT"
+  fi
+  # ...and with the directory readable again the walk completes, so what blocks
+  # is the REAL violation and not the walk error: the two arms must not be
+  # mistaken for each other.
+  bash "$TMP33/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ] && ! grep -q 'WALK_ERROR' "$OUT" && \
+     grep -q 'overrides the settings contract' "$OUT"; then
+    pass "the same root with the directory readable → the real violation is named"
+  else
+    fail "expected exit 1 naming the settings violation and no WALK_ERROR, got $code"; sed -n '1,30p' "$OUT"
+  fi
+  rm -rf "$TMP33" "$OUTSIDE33"
+fi
+
+echo ""
+echo "34. the derived-duration pin must be able to FAIL (a pin, not a no-op)"
+# Test 25 asserts only "no hit over the real docs/". That passes even if every
+# pattern in BANNED_RE is deleted — which is exactly how the `182 s` false-pass
+# survived: _dur's docstring advertised the bare-letter seconds form while the
+# pattern it built required the word `sec`. So drive the matcher OUT OF THIS
+# FILE, over the spellings that must be caught and the innocent prose that must
+# not be: this is the assertion whose absence let the two disagree (#1088).
+python3 - "$ROOT/tests/cost-config/run.sh" "$HTTP_IDLE_TIMEOUT_MS_G" \
+         "$RETRY_PROVIDER_TIMEOUT_MS_G" "$CAP_GUARD" "$RETRY_MAX_RETRIES_G" \
+         "$RETRY_BASE_DELAY_MS_G" <<'PY' >"$OUT" 2>&1
+import re, sys
+path = sys.argv[1]
+IDLE, PROV, CAP, N, BASE = (int(x) for x in sys.argv[2:7])
+BACKOFF = sum(min(BASE * 2 ** i, CAP) for i in range(N))
+HANG_MS = (N + 1) * IDLE + BACKOFF
+WORST_MS = (N + 1) * PROV + BACKOFF
+src = open(path, encoding="utf-8").read()
+start = src.index("def _num(")   # the numeric-spelling helper is used by both
+end = src.index(")\n# The ban must apply to EVERY")
+ns = dict(globals())          # so the extracted block sees the constants above
+exec(src[start:end + 1], ns)  # defines _dur and BANNED_RE
+BANNED_RE = ns["BANNED_RE"]
+
+def caught(text):
+    return [what for rx, what in BANNED_RE if rx.search(text)]
+
+# Every seconds spelling the old pattern MISSED: the word form, and the bare
+# letter the docstring claimed to match.
+must_catch = ["182 s", "2582 s", "4982 s", "182s", "182 sec", "182 seconds",
+              "2,582 s", "2,582 sec", "4,982 s", "2,582 seconds",
+              "60 s backoff cap", "the backoff cap is 60 s", "capped at 60 s"]
+# Innocent current-state prose. `60 s` / `60s` is ALSO a 60-second poll and an
+# LB idle timeout in this repo's own docs, so the cap's bare form is anchored;
+# a blanket bare-letter ban false-blocks all three (verified against the real
+# docs/ tree). These must stay clean or the pin trades a false-pass for blocks.
+# NB: the MINUTE word forms ("43 minutes") are deliberately the fail-CLOSED
+# side — see the note at the ban loop — so they are not controls here.
+must_not = ["common 60 s LB idle timeout", "re-checks every 60s up to",
+            "the <=60s figure holds at 1x only", "a 30 s connect timeout",
+            "a 60 s capacity limit", "the export has 60 s capable throughput"]
+bad = ["NOT CAUGHT: %r" % s for s in must_catch if not caught(s)]
+bad += ["FALSE BLOCK: %r -> %s" % (s, caught(s)) for s in must_not if caught(s)]
+print("\n".join(bad) if bad else "OK")
+sys.exit(1 if bad else 0)
+PY
+if [ $? -eq 0 ] && grep -q '^OK$' "$OUT"; then
+  pass "the duration pin catches every bare-letter seconds spelling and blocks no innocent prose"
+else
+  fail "the duration pin is not doing its job"; sed -n '1,30p' "$OUT"
+fi
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

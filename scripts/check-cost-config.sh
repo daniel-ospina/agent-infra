@@ -521,12 +521,26 @@ while stack:
         out.append(f"{d}\tWALK_ERROR: {ex}")
         continue
     for e in entries:
-        try:
-            if not e.is_dir(follow_symlinks=True):
-                continue
-        except OSError:
-            continue
+        # PRUNE is a NAME-only decision, so it is taken before any stat: a
+        # pruned entry can never be the source of a hole in the walk.
         if e.name in PRUNE:
+            continue
+        try:
+            is_dir = e.is_dir(follow_symlinks=True)
+        except OSError as ex:
+            # NOT a silent `continue`: an entry we cannot stat is a hole in the
+            # walk, exactly like the unreadable directory above — the same
+            # fail-open shape fixed there (#1088 review). A SYMLINK is what
+            # reaches this arm: d_type cannot answer `is_dir` for one, so it
+            # must be resolved with a stat, and a symlink under a directory
+            # without search
+            # permission raises EACCES. Skipping it let a contract-reverting
+            # `.pi/settings.json` behind that symlink read green —
+            # `✅ no project settings file` at `chmod 400`, a block at `chmod
+            # 700` (#1088 review cycle 7).
+            out.append(f"{e.path}\tWALK_ERROR: {ex}")
+            continue
+        if not is_dir:
             continue
         if e.name != ".pi":
             stack.append(e.path)
