@@ -866,11 +866,28 @@ BANNED_RE = (
     (re.compile(rf"(?<![\d.]){BASE // 1000}s[/,\s]+{2 * BASE // 1000}s(?![\d])"),
      "ladder steps (s)"),
     (re.compile(rf"(?<![\d.]){8 * BASE // 1000}s(?![\d])"), "ladder step (s)"),
+    # The backoff cap restated as a phrase. Value-derived like the rest, so it
+    # stays correct when the cap changes; the 2-line window in the loop below is
+    # what lets it see a restatement that wraps mid-phrase.
+    (re.compile(rf"(?<![\d.]){CAP // 60000}[\s-]*min(?:ute)?s?\s+backoff\s+cap"),
+     f"backoff cap ({CAP // 60000} min)"),
 )
-SUMMARY_DOCS = ("docs/providers.md", "docs/upstream-pi-bugs.md")
-# Dated snapshots (plans / research notes committed at a point in time) record
-# what the fleet ran THEN; they are not current-state docs and are not edited.
-SNAPSHOT_DIRS = ("docs/plans/", "docs/research/")
+# The ban must apply to EVERY current-state doc under docs/ — not a hand-kept
+# allowlist. A 2-doc allowlist (`providers.md`, `upstream-pi-bugs.md`) let this
+# very PR introduce a derived-cap restatement in a THIRD doc
+# (`docs/ops/session-lifecycle-contract.md`: "`retry.maxRetries` 7 / 1-min
+# backoff cap") that the pin could not see, so the new text could drift
+# silently — the exact defect this test exists to prevent (#1088 review). Only
+# two things are exempt and both are declared here.
+SOURCE_DOC = "docs/ops/cost-config-policy.md"   # §2 is the single source
+# Dated snapshots (plans / research / scoping notes committed at a point in
+# time) record what the fleet ran THEN; they are not current-state docs and are
+# not edited. `docs/scoping/` is all-dated files; it also carries a coincidental
+# numeric collision (a websocket reconnect ladder "8s→16s→…→60s" in
+# 2026-08-31-issue-386-lease-fencing.md reaches the same "16s" the LLM retry
+# ladder does), which is why the doc CLASS is the exemption rather than a prose
+# anchor.
+SNAPSHOT_DIRS = ("docs/plans/", "docs/research/", "docs/scoping/")
 
 bad = []
 for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
@@ -880,7 +897,8 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
             continue
         p = os.path.join(dirpath, fn)
         rel = os.path.relpath(p, root)
-        for ln, line in enumerate(open(p, encoding="utf-8"), 1):
+        _lines = open(p, encoding="utf-8").readlines()
+        for ln, line in enumerate(_lines, 1):
             # (1) a value ATTACHED to the idle key (`httpIdleTimeoutMs: 300000`,
             # `| httpIdleTimeoutMs | 300000 |`) must be the contract value. The
             # per-call ceiling is only legitimate on such a line when the SAME
@@ -910,12 +928,18 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
             if m and m.group(1) != str(IDLE):
                 bad.append(f"{rel}:{ln} says 'the fleet runs {m.group(1)}' "
                            f"but the contract idle ceiling is {IDLE}")
-            # (4) the summary docs must not restate a derived duration at all.
+            # (4) no current-state doc other than §2 may restate a derived
+            # duration at all.
             if snap:
                 continue
-            if rel in SUMMARY_DOCS:
+            if rel != SOURCE_DOC:
+                # A 2-line window: the restatement this pin must catch can WRAP
+                # ("…7 / 1-min backoff" / "cap, per …") and a line-scoped search
+                # is blind to it — the same continuation-line false pass the
+                # BANNED_RE rewrite was meant to remove.
+                window = line + " " + (_lines[ln] if ln < len(_lines) else "")
                 for rx, what in BANNED_RE:
-                    m = rx.search(line)
+                    m = rx.search(line) or rx.search(window)
                     if m:
                         bad.append(f"{rel}:{ln} restates the derived {what} as "
                                    f"'{m.group(0).strip()}' — those live only in "
@@ -924,7 +948,7 @@ if bad:
     print("❌ " + "\n❌ ".join(bad))
     sys.exit(1)
 print(f"OK no stale retry/hang numbers (idle={IDLE}, per-call={PROV}, cap={CAP}); derived durations "
-      f"single-sourced in §2, absent from {len(SUMMARY_DOCS)} summary docs "
+      f"single-sourced in §2, absent from every other current-state doc "
       f"(banned {len(BANNED_RE)} derived figures/forms)")
 PY
 if [ $? -eq 0 ]; then pass "$(cat "$OUT")"; else fail "stale retry/hang number in a doc: $(cat "$OUT")"; fi
@@ -1057,6 +1081,46 @@ code=$?
 if [ "$code" -eq 1 ]; then pass "live cap 300000 behind a 60000 comment → exit 1 (cap drift)"; else fail "CAP-PARSE BYPASS: expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q 'backoff cap expected' "$OUT"; then pass "the cap-drift message names both values"; else fail "expected the cap-drift message"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP29"
+
+echo ""
+echo "30. a SECOND CAP_MS assignment must NOT shadow the pinned one (fail-open pin)"
+# Textual order is not execution order. Taking the LAST regex match let an
+# UNCONDITIONAL `CAP_MS=300000` after the pinned line (or a matching assignment
+# inside a never-taken branch) make the guard read 60000 while the script
+# applied 300000 — a reproduced fail-open that defeated the cap pin the whole
+# retry contract rests on (#1088 review). The cap must be the ONLY assignment.
+TMP30="$(mktemp -d /tmp/cost-config-capmulti.XXXXXX)"
+mkroot "$TMP30"
+python3 - "$TMP30/scripts/patch-pi-retry.sh" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+assert 'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"' in s, "patch cap shape changed — update this test"
+s = s.replace('CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"',
+              'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"\nCAP_MS=300000', 1)
+open(p, "w").write(s)
+PY
+bash "$TMP30/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "a second unconditional CAP_MS assignment → exit 1 (not read from textual order)"; else fail "CAP-MULTI BYPASS: expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q 'backoff cap unreadable' "$OUT"; then pass "the fail-closed diagnostic names the unreadable cap"; else fail "expected the 'backoff cap unreadable' message"; sed -n '1,30p' "$OUT"; fi
+if grep -q '2 CAP_MS assignments' "$OUT"; then pass "the diagnostic says why (the assignment count)"; else fail "expected the assignment-count reason in the message"; sed -n '1,30p' "$OUT"; fi
+# ...and the same class via a never-taken branch, not just a bare second line.
+rm -rf "$TMP30"; TMP30="$(mktemp -d /tmp/cost-config-capdead.XXXXXX)"
+mkroot "$TMP30"
+python3 - "$TMP30/scripts/patch-pi-retry.sh" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+assert 'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"' in s, "patch cap shape changed — update this test"
+s = s.replace('CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"',
+              'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-300000}"\nif false; then\n  CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"\nfi', 1)
+open(p, "w").write(s)
+PY
+bash "$TMP30/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "a matching assignment in a never-taken branch → exit 1"; else fail "DEAD-BRANCH BYPASS: expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP30"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

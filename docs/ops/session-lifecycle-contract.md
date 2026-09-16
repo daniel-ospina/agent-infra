@@ -68,8 +68,8 @@ Mechanics:
   (and, for writes, a fresh worktree). Session resumption after an
   outage/reap is NOT a new issue — it is finishing the same one (the bounded
   retry contract: retry is finite, so a long outage ends the turn visibly and
-  the session is resumed by one message; `retry.maxRetries` 7 / 1-min backoff
-  cap, per cost-config-policy §2).
+  the session is resumed by one message; the values and the arithmetic live in
+  cost-config-policy §2).
 - **Why not a hard cap?** Marathon sessions within ONE issue are legitimate
   work (full-pipeline standard runs up to the #363 6h cap; measured $2–6
   pre-clamp). The discipline is *scoping*, enforced by review of session

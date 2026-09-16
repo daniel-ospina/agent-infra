@@ -266,25 +266,40 @@ if pmr not in (None, 0):
     retry_issues.append(f"retry.provider.maxRetries must be absent or 0 (it multiplies calls per attempt), got {q(pmr)}")
 
 # The backoff cap lives in patch-pi-retry.sh (it is interpolated into the pi
-# dist patch). Read it back rather than duplicating it; unreadable = fail
+# dist patch). Read it BACK rather than duplicating it; unreadable = fail
 # closed, because the hang window cannot be computed without it.
+#
+# The cap must be a SINGLE pinned top-level assignment, and that is asserted —
+# the value is NOT inferred from textual order. Textual order is not execution
+# order: taking the LAST regex match (the previous shape) let an UNCONDITIONAL
+# second assignment (`CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"` followed by
+# `CAP_MS=300000`), or a match sitting in a never-taken branch, make the guard
+# read 60000 while the script applied 300000 — a reproduced fail-open that
+# defeated the very "cap != guard → BLOCK" pin this contract is built on
+# (#1088 review). A cap the guard cannot SEE as the only one is unassertable,
+# so it fails closed. Anchored to a real assignment at line start: an unanchored
+# search is shadowed by comment prose of the same shape (#1088 coverage review).
 patch_cap = None
+patch_cap_why = ""
 try:
     with open(patch_path) as f:
-        # Anchored to a real assignment at the start of a line: an unanchored
-        # search is shadowed by any earlier comment/prose with the same shape,
-        # so the guard would read a stale default while the script applies the
-        # live one (#1088 coverage review). Take the LAST such assignment, which
-        # is the one the shell ends up with.
-        _caps = re.findall(r'(?m)^\s*CAP_MS="\$\{PI_MAX_RETRY_DELAY_MS:-([0-9]+)\}',
-                           f.read())
-        m = _caps[-1] if _caps else None
-    if m is not None:
-        patch_cap = int(m)
-except Exception:
-    patch_cap = None
+        _src = f.read()
+    _assigned = re.findall(r'(?m)^\s*(?:export\s+)?CAP_MS=', _src)
+    _caps = re.findall(r'(?m)^\s*CAP_MS="\$\{PI_MAX_RETRY_DELAY_MS:-([0-9]+)\}', _src)
+    if len(_assigned) != 1:
+        patch_cap_why = (f"{len(_assigned)} CAP_MS assignments in the file — the effective cap "
+                         "cannot be read from textual order (a later assignment or a "
+                         "never-taken branch can override the pinned one)")
+    elif len(_caps) != 1:
+        patch_cap_why = ('the single CAP_MS assignment is not the pinned '
+                         'CAP_MS="${PI_MAX_RETRY_DELAY_MS:-<ms>}" form')
+    else:
+        patch_cap = int(_caps[0])
+except Exception as e:
+    patch_cap_why = str(e)
 if patch_cap is None:
-    retry_issues.append(f"retry backoff cap unreadable from {patch_path} — cannot bound the hang window (fail-closed)")
+    retry_issues.append(f"retry backoff cap unreadable from {patch_path} — cannot bound the hang window (fail-closed)"
+                        + (f": {patch_cap_why}" if patch_cap_why else ""))
 elif patch_cap != CAP_EXPECTED:
     retry_issues.append(f"patch-pi-retry.sh backoff cap expected {CAP_EXPECTED}, got {patch_cap}")
 
@@ -417,10 +432,12 @@ check_settings_file() {
   window_worst="$(printf '%s\n' "$raw" | sed -n 's/^WINDOW hung=[0-9]* worst=\([0-9]*\) .*/\1/p')"
   issues="$(printf '%s\n' "$raw" | sed '/^WINDOW /d')"
   if [ -z "$window_hung" ] || [ "$window_hung" = "0" ]; then
-    # settings_violations ALWAYS emits the derived WINDOW line when it completes.
-    # No WINDOW ⇒ it died before deriving the window (unparseable file, non-object
-    # JSON, an internal error) ⇒ the contract cannot be asserted at all. Fail
-    # CLOSED **and override-immune**: emitting this as a plain block() is what let
+    # settings_violations emits the derived WINDOW line on every run that CAN
+    # derive the window. It emits NONE when it dies before deriving (unparseable
+    # file, non-object JSON, an internal error) and ALSO none on the underivable
+    # arm (a non-positive/non-integer input reports "cannot be derived"). Both
+    # are contract-unassertable, so BOTH take this fail-CLOSED **and
+    # override-immune** arm: emitting this as a plain block() is what let
     # COST_CLAMP_OVERRIDE=1 exit 0 with the retry/hang contract unasserted
     # (#1088 review cycles 2 and 3, P1). Placed BEFORE the issues loop so every
     # such failure — known shape or not — takes this arm.
