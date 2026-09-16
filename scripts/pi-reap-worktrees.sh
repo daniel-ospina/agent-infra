@@ -15,10 +15,13 @@
 #   * reachable    — the commits survive the checkout's deletion: merged to
 #                    main, OR on a NAMED BRANCH (`git worktree remove` deletes
 #                    the checkout, NEVER the branch), OR a detached HEAD whose
-#                    SHA is reachable from some ref. A detached SHA on no ref
-#                    would be ORPHANED => preserve — including when the
-#                    checkout's directory is already gone, because the admin
-#                    record's HEAD is the last thing holding that commit.
+#                    SHA is held by a ref `git fetch --prune` cannot revoke.
+#                    A detached SHA on no such ref would be ORPHANED =>
+#                    preserve — including when the checkout's directory is
+#                    already gone, because the admin record's HEAD is the last
+#                    thing holding that commit. Remote-tracking-only survival
+#                    is PRESERVE / `remote-only-ref`: `fetch --prune` drops
+#                    that ref, so the claim is revocable (F3 / #1104).
 #   * aged         — HEAD commit strictly older than REAP_WT_AGED_DAYS (7)
 # Anything failing clean / reachable / unreferenced is SURFACED with its
 # deciding reason and NEVER auto-removed.
@@ -75,6 +78,10 @@
 #     own watchdogs, and charging their latency to the budget made a slow host
 #     defer EVERY worktree on every pass — a reaper that silently never reaps.
 #   * no `find`, `rg -r`, `du`, `lsof +D`, or recursive glob is executed
+#   * the removal path re-runs the clean gate TWICE (remove_one): both runs are
+#     `status` probes bounded by REAP_WT_STATUS_TIMEOUT, so the TOCTOU re-check
+#     cannot itself become the unbounded fork it exists to prevent — and a
+#     re-check that cannot be evaluated takes the PRESERVE arm, never a pass.
 #
 # FAIL-CLOSED: a probe that cannot be evaluated never counts as a pass. Lock
 # held / git enumeration failed / ps failed or empty / gh unavailable with
@@ -108,6 +115,10 @@
 #   worktree-locked        `git worktree lock` is set
 #   detached-unreachable   deleting the checkout (or pruning the record) would
 #                          leave the HEAD commit on no ref at all
+#   remote-only-ref        the only ref holding the HEAD is refs/remotes/*,
+#                          which a later `git fetch --prune` can revoke — i.e.
+#                          the survival claim would not be permanent. The
+#                          revocable ref is NAMED so the operator can decide
 #   unparseable-path       the record could not be framed safely (tab/newline)
 #   live-process/live-cwd  a process holds the path
 #   dirty                  tracked/unparseable changes
@@ -136,6 +147,8 @@
 #   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT
 # Exit codes: 0 pass completed with nothing failed, 2 usage, 3 fail-closed
 # abort (nothing trusted), 4 pass completed but >=1 removal FAILED.
+# (`remove_one`'s internal 2 — "the checkout changed since classification, it
+# is PRESERVED" — is never a process exit code; it maps to exit 0.)
 
 set -uo pipefail
 
@@ -197,6 +210,7 @@ GIT_OUT=""
 CWD_DEGRADED=0
 REMOVED=0
 FAILED=0
+LATE_PRESERVE=0
 DEFERRED=0
 WT_TOTAL=0
 REMOVE_C=0
@@ -701,7 +715,7 @@ pr_head_refs_load() {
 # the admin record's HEAD is itself the last ref holding a detached commit, so
 # pruning it can orphan that commit (verified).
 commits_survive() {
-    local sha="$1" branch="$2" merged=0 containing="" rc=0
+    local sha="$1" branch="$2" merged=0 containing="" remote_only="" rc=0
     if [ -n "$MAIN_REF" ] && [ -n "$sha" ]; then
         run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
             "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$MAIN_REF"
@@ -732,14 +746,46 @@ commits_survive() {
     fi
 
     # Detached HEAD — or a named branch whose ref no longer resolves.
+    #
+    # SURVIVAL MUST NOT BE REVOCABLE (F3 / #1104). `--contains` counts
+    # refs/remotes/*, and `git fetch --prune` (or `git remote prune`) drops a
+    # remote-tracking ref once the remote branch is gone — routinely, e.g. after
+    # a squash-merge with branch auto-delete. Removing a checkout because a
+    # REVOCABLE ref holds the commit is not "the commits survive": it makes the
+    # commit gc-eligible later, with no record left that it ever existed. So
+    # only a ref `fetch --prune` cannot touch counts as a survival mechanism.
+    #
+    # The merged arm ABOVE is deliberately untouched, and that is why this is
+    # not a rejection of remote refs: it is ancestor-based and MAIN_REF is
+    # normally refs/remotes/origin/main, so `main` still fast-paths to
+    # `refs=merged` (pinned by A20c). The rejection applies only to the
+    # containment fallback for a detached HEAD that is NOT on main.
+    #
+    # One bounded probe, then partition by prefix; a commit held ONLY by
+    # remote-tracking refs prints the `remote-only-ref:` marker, which
+    # classify_one turns into PRESERVE with the revocable ref NAMED so the
+    # operator can judge it. The 64-ref output bound cannot cause a removal a
+    # smaller bound would not: if the sample is all remote-tracking and a local
+    # holder sat beyond it, the outcome is PRESERVE. The bound errs toward
+    # preservation. (Walk cost is unchanged — git does not short-circuit the
+    # containment walk for --count=1 either.)
     run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
-        for-each-ref --contains="$sha" --count=1 --format='%(refname)'
+        for-each-ref --contains="$sha" --count=64 --format='%(refname)'
     # A failure here (incl. 129 for a zero/unknown sha) is "cannot establish",
     # which is a PRESERVE, never a pass.
     [ $? = 0 ] || { printf ''; return 0; }
-    containing="$(head -1 "$GIT_OUT" 2>/dev/null)"
-    if [ -z "$containing" ]; then printf ''; return 0; fi
-    printf 'reachable-from:%s\n' "$containing"
+    while IFS= read -r containing; do
+        [ -n "$containing" ] || continue
+        case "$containing" in
+            refs/remotes/*) [ -n "$remote_only" ] || remote_only="$containing" ;;
+            *) printf 'reachable-from:%s\n' "$containing"; return 0 ;;
+        esac
+    done <"$GIT_OUT"
+    if [ -n "$remote_only" ]; then
+        printf 'remote-only-ref:%s\n' "$remote_only"
+        return 0
+    fi
+    printf ''
     return 0
 }
 
@@ -777,10 +823,14 @@ classify_one() {
             printf 'preserve\tunreadable-path\t\texists but cannot be resolved (permissions?)\n'; return 0
         fi
         refs="$(commits_survive "$sha" "$branch")"
-        if [ -z "$refs" ]; then
-            printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref (checkout already gone) — pruning the record would ORPHAN it\n' "${sha:-?}"
-            return 0
-        fi
+        case "$refs" in
+            remote-only-ref:*)
+                printf 'preserve\tremote-only-ref\t\tsha %s is held only by %s (checkout already gone); `git fetch --prune` can revoke that ref, so pruning the record would ORPHAN it\n' "${sha:-?}" "${refs#remote-only-ref:}"
+                return 0 ;;
+            '')
+                printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref (checkout already gone) — pruning the record would ORPHAN it\n' "${sha:-?}"
+                return 0 ;;
+        esac
         printf 'remove\tprunable\t\tcheckout already absent; commits survive via %s\n' "$refs"
         return 0
     fi
@@ -804,10 +854,14 @@ classify_one() {
     esac
 
     refs="$(commits_survive "$sha" "$branch")"
-    if [ -z "$refs" ]; then
-        printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref — removing would orphan it\n' "${sha:-?}"
-        return 0
-    fi
+    case "$refs" in
+        remote-only-ref:*)
+            printf 'preserve\tremote-only-ref\t\tsha %s is held only by %s — a later `git fetch --prune` can revoke that ref; removing the checkout would then ORPHAN it\n' "${sha:-?}" "${refs#remote-only-ref:}"
+            return 0 ;;
+        '')
+            printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref — removing would orphan it\n' "${sha:-?}"
+            return 0 ;;
+    esac
 
     if [ "$PR_APPLICABLE" = 1 ] && [ "$branch" != "-" ]; then
         local bn="${branch#refs/heads/}"
@@ -840,7 +894,7 @@ classify_one() {
 }
 
 # ── removal ────────────────────────────────────────────────────────────
-# remove_one <path> <ephemeral-list>
+# remove_one <path>
 # Never --force. Deletes ONLY declared-ephemeral UNTRACKED (??) entries first
 # (git refuses a worktree containing untracked files); ignored (`!!`)
 # ephemerals are handled by git itself. A refusal/timeout is REPORTED as
@@ -853,9 +907,41 @@ classify_one() {
 # its deletion is a directory `git worktree remove` will refuse on anyway
 # (untracked), so the honest report is available without a second unbounded
 # attempt against the same block. The admin record is left intact either way.
+#
+# TOCTOU (F4 / #1105). The clean gate ran at CLASSIFICATION, and
+# `git worktree remove` does NOT refuse IGNORED files, so a gitignored
+# non-ephemeral file created in the window would be deleted with the checkout —
+# silently, and the row already read `remove`. The window is re-checked HERE,
+# twice: before the pre-delete (so a checkout that changed since classification
+# is preserved with nothing deleted, not even its own ephemerals) and
+# immediately before the destructive `git worktree remove`. A late appearance
+# is a PRESERVE (return 2), not a removal and not a failure: nothing was
+# removed, nothing failed, and the next pass re-classifies the record. The
+# window is narrowed to the fork itself, not closed — closing it would need a
+# lock on the checkout — which is exactly why the classification is re-checked
+# rather than trusted.
+#
+# Returns 0 removed · 1 REMOVE-FAILED (a real failure ⇒ exit 4) ·
+#         2 the checkout changed since classification ⇒ PRESERVE.
 remove_one() {
-    local path="$1" eph="$2" entry target out rc
+    local path="$1" eph entry target out rc crumb cverdict cpay
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
+
+    # Re-check #1 — before ANY deletion. Without this, a checkout that grew an
+    # ignored artifact since classification would lose its ephemerals to the
+    # pre-delete and then be preserved anyway.
+    crumb="$(clean_gate "$path")"
+    cverdict="${crumb%%$'\t'*}"
+    cpay="${crumb#*$'\t'}"
+    if [ "$cverdict" != clean ]; then
+        log "REMOVE-SKIP $path checkout changed since classification ($cverdict: $cpay) — nothing removed, preserved"
+        rm -f "$out"; return 2
+    fi
+    # The FRESH allowlist, not the classification-time one: an ephemeral that
+    # appeared is still declared disposable, so it is deleted here rather than
+    # left to make `git worktree remove` refuse.
+    eph="$cpay"
+
     for entry in $eph; do
         target="$path/${entry%/}"
         [ -e "$target" ] || [ -L "$target" ] || continue
@@ -876,6 +962,18 @@ remove_one() {
         fi
         log "EPHEMERAL removed ${entry%/} under $path"
     done
+
+    # Re-check #2 — immediately before the fork that destroys. This is the one
+    # that matters: the pre-delete above can run for up to
+    # REAP_WT_REMOVE_TIMEOUT, which is the LARGEST part of the old window.
+    crumb="$(clean_gate "$path")"
+    cverdict="${crumb%%$'\t'*}"
+    cpay="${crumb#*$'\t'}"
+    if [ "$cverdict" != clean ]; then
+        log "REMOVE-SKIP $path checkout changed between the pre-delete and the removal ($cverdict: $cpay) — nothing removed, preserved"
+        rm -f "$out"; return 2
+    fi
+
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" worktree remove "$path"
     rc=$?
     if [ "$rc" = 0 ]; then rm -f "$out"; return 0; fi
@@ -898,7 +996,7 @@ report_row() { # <verdict> <path> <reason> <detail>
 }
 
 print_footer() {
-    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED DEFERRED=$DEFERRED GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED"
+    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED"
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -1046,7 +1144,7 @@ run() {
     say "      (measured 84 GB du delta vs 22 GB actual). The deliverable win is FILE COUNT."
     say ""
 
-    local elapsed=0 crumb verdict reason detail ephemeral
+    local elapsed=0 crumb verdict reason detail rc
     # The budget clock starts HERE, not at `now`: see the BOUNDEDNESS note in
     # the header. `now` stays the single ageing reference for the whole pass.
     START_EPOCH="$(now_epoch)"
@@ -1069,7 +1167,6 @@ run() {
         crumb="$(classify_one "$p" "$h" "$b" "$f" "$now")"
         verdict="$(printf '%s' "$crumb" | cut -f1)"
         reason="$(printf '%s' "$crumb" | cut -f2)"
-        ephemeral="$(printf '%s' "$crumb" | cut -f3)"
         detail="$(printf '%s' "$crumb" | cut -f4- | tr '\n' ' ')"
         report_row "$verdict" "$p" "$reason" "$detail"
         if [ "$verdict" = "remove" ]; then
@@ -1097,13 +1194,26 @@ run() {
                     # removal that never happened.
                     say "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
                     log "PRUNE-PENDING $p"
-                elif remove_one "$p" "$ephemeral"; then
-                    say "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
-                    REMOVED=$((REMOVED + 1))
-                    log "REMOVED $p"
                 else
-                    say "         REMOVE-FAILED — see the log ($REAP_WT_LOG)"
-                    FAILED=$((FAILED + 1))
+                    remove_one "$p"; rc=$?
+                    case "$rc" in
+                        0)
+                            say "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
+                            REMOVED=$((REMOVED + 1))
+                            log "REMOVED $p" ;;
+                        2)
+                            # The checkout changed between classification and
+                            # removal (F4): it is PRESERVED. Nothing failed and
+                            # nothing was removed, so this must NOT be exit 4 —
+                            # that code is the machine-readable "a removal
+                            # failed". The next pass re-classifies the record.
+                            say "         PRESERVED — the checkout changed between classification and removal (see the log)"
+                            LATE_PRESERVE=$((LATE_PRESERVE + 1))
+                            log "PRESERVED-LATE $p" ;;
+                        *)
+                            say "         REMOVE-FAILED — see the log ($REAP_WT_LOG)"
+                            FAILED=$((FAILED + 1)) ;;
+                    esac
                 fi
             fi
         else
@@ -1113,7 +1223,7 @@ run() {
             # path, broken admin link) must not be swept up by a global prune.
             case "$reason" in
                 unreadable-path|status-error|status-timeout|unparseable-path|worktree-locked) PRUNE_BLOCKED=1 ;;
-                detached-unreachable) PRUNE_BLOCKED=1 ;;
+                detached-unreachable|remote-only-ref) PRUNE_BLOCKED=1 ;;
             esac
         fi
     done <<<"$WT_LIST"

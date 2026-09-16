@@ -66,6 +66,15 @@
 #   origin-slug probe failed A19  (a failing `remote get-url` must NOT read as
 #                                "no GitHub remote" — that silently disabled
 #                                the open-PR veto; unverifiable => exit 3)
+#   remote-only survival     A20  (a detached HEAD held ONLY by refs/remotes/*
+#                                is no longer a survival mechanism — a later
+#                                `git fetch --prune` revokes it; PRESERVE with
+#                                the revocable ref named, and the merged fast
+#                                path through a remote MAIN_REF is untouched)
+#   removal-time TOCTOU      A21  (a gitignored file created AFTER classification
+#                                is a PRESERVE, not a silent delete — re-checked
+#                                before the pre-delete and again before the
+#                                removal fork)
 
 set -uo pipefail
 
@@ -219,10 +228,39 @@ case " $* " in
 esac
 exec "$REAL_GIT_BIN" "$@"
 SHIM
+cat >"$T/bin/git-late-ignored" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A21 (F4). The reaper calls `status` once at classification and
+# then twice inside remove_one (before the ephemeral pre-delete, and immediately
+# before `git worktree remove`). This shim runs the REAL status first — so the
+# probe's output is exactly what git said — and only THEN creates a GITIGNORED
+# non-ephemeral file in the checkout. FAKE_LATE_ON=N therefore places the write
+# immediately after the Nth status probe, i.e. the file is first SEEN by probe
+# N+1:
+#   N=1 => seen by remove_one's re-check #1 (before the ephemeral pre-delete)
+#   N=2 => seen by remove_one's re-check #2 (after the pre-delete, before the
+#          removal fork — the window the pre-delete itself widens)
+# Pre-fix, remove_one had no re-check at all, so the file was destroyed with the
+# checkout while the pass still reported a clean REMOVED.
+for a in "$@"; do
+    if [ "$a" = "status" ]; then
+        "${REAL_GIT_BIN:-git}" "$@"
+        rc=$?
+        if [ -n "${FAKE_LATE_COUNTER:-}" ] && [ -n "${FAKE_LATE_FILE:-}" ]; then
+            c=0; [ -f "$FAKE_LATE_COUNTER" ] && c="$(cat "$FAKE_LATE_COUNTER")"
+            c=$((c + 1)); printf '%s\n' "$c" >"$FAKE_LATE_COUNTER"
+            [ "$c" -ge "${FAKE_LATE_ON:-1}" ] && printf 'late\n' >"$FAKE_LATE_FILE"
+        fi
+        exit "$rc"
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
 chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh" \
          "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-prune" "$T/bin/git-slow-status" \
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
-         "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove"
+         "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
+         "$T/bin/git-late-ignored"
 
 # ── fixture builders ───────────────────────────────────────────────────
 mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
@@ -292,6 +330,9 @@ run_reaper() {
     FAKE_GH_REFS="${FAKE_GH_REFS:-}" \
     FAKE_GH_FAIL="${FAKE_GH_FAIL:-}" \
     FAKE_GH_ARGS_LOG="${FAKE_GH_ARGS_LOG:-}" \
+    FAKE_LATE_FILE="${FAKE_LATE_FILE:-}" \
+    FAKE_LATE_COUNTER="${FAKE_LATE_COUNTER:-}" \
+    FAKE_LATE_ON="${FAKE_LATE_ON:-1}" \
     DU_CANARY="${DU_CANARY:-}" \
     REAL_GIT_BIN="$REAL_GIT" \
     bash "$REAPER" "$@"
@@ -843,6 +884,133 @@ OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote" run_reaper $ENV --dry-run --rep
 assert_eq "$RC" "0" "A19b no origin at all => still N/A (rc=2 path is decidable)"
 assert_contains "$(row_for "$OUT" "$WT_A19B")" "reason=reclaimable" \
     "A19b a repo with no origin still reclaims"
+
+# ── A20: remote-tracking-only survival is REVOCABLE (F3 / #1104) ────────
+# `commits_survive()` treated "contained in SOME ref" as proof the commits
+# survive, and `for-each-ref --contains` counts refs/remotes/*. A later
+# `git fetch --prune` drops that ref once the remote branch is gone (routine
+# after a squash-merge with branch auto-delete), so the reported survival
+# mechanism could be REVOKED without the reaper's knowing: the commit becomes
+# gc-eligible and no record of it is left. The reaper must therefore only accept
+# a ref `fetch --prune` cannot touch; a remote-tracking-only holder is PRESERVE
+# with the revocable ref NAMED, so the operator can judge it.
+ENV=A20; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a20
+commit_in_wt "$REPO" "$OLD_DATE" a20
+A20_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a20:refs/heads/feat/a20
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a20 >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A20="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A20" "$A20_SHA"
+# precondition: the ONLY holder of that commit is the remote-tracking ref
+assert_contains "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A20_SHA" --format='%(refname)')" \
+    "refs/remotes/upstream/feat/a20" "A20 precondition: the commit is held by a remote-tracking ref"
+assert_absent "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A20_SHA" --format='%(refname)')" \
+    "refs/heads/" "A20 precondition: no LOCAL ref holds it (that is the point)"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A20")" "reason=remote-only-ref" \
+    "A20 a remote-tracking-only holder => PRESERVE (never a removal on a revocable ref)"
+assert_contains "$(row_for "$OUT" "$WT_A20")" "refs/remotes/upstream/feat/a20" \
+    "A20 the revocable ref is NAMED so the operator can judge it"
+assert_absent "$(row_for "$OUT" "$WT_A20")" "reason=reclaimable" \
+    "A20 it is NOT classified reclaimable on a remote-tracking ref"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A20 --apply exits 0 (a preserve is not a failure)"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A20 --apply removed nothing"
+assert_dir "$WT_A20" "A20 --apply left the checkout on disk"
+# the falsifier, run for real: the ref this fixture would have relied on IS
+# revocable — deleting the remote branch and pruning takes the commit to NO ref
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a20
+"$REAL_GIT" -C "$REPO" fetch -q --prune upstream
+assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A20_SHA" --format='%(refname)' | wc -l | tr -d ' ')" "0" \
+    "A20 falsifier: after \`fetch --prune\` the commit is on NO ref — the old 'survival' was revocable"
+
+# ── A20c: the MERGED fast path is untouched by the remote-ref rejection ─
+# main is normally refs/remotes/origin/main, so "only a non-remote ref counts"
+# would disqualify the merged path if it were applied to it. It is not: the
+# merged arm is ancestor-based and runs FIRST. The commit below is held ONLY by
+# refs/remotes/origin/main (local main is a different commit), so `refs=merged`
+# here proves the remote MAIN_REF still fast-paths.
+ENV=A20c; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a20c
+commit_in_wt "$REPO" "$OLD_DATE" a20c
+REMOTE_MAIN_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a20c >/dev/null
+"$REAL_GIT" -C "$REPO" update-ref refs/remotes/origin/main "$REMOTE_MAIN_SHA"
+WT_A20C="$T/$ENV-det"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A20C" "$REMOTE_MAIN_SHA"
+assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$REMOTE_MAIN_SHA" --format='%(refname)')" \
+    "refs/remotes/origin/main" "A20c precondition: only the remote-tracking MAIN_REF holds that commit"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A20C")" "refs=merged" \
+    "A20c a remote-tracking MAIN_REF still fast-paths to refs=merged (the rejection does not disqualify main)"
+
+# ── A21: removal-time TOCTOU for a late gitignored file (F4 / #1105) ────
+# The clean gate runs at CLASSIFICATION and `git worktree remove` does not
+# refuse IGNORED files, so a gitignored non-ephemeral file created in the window
+# was deleted with the checkout — silently, with the row already reading
+# `remove`. remove_one() now re-runs the clean gate before any deletion and
+# again immediately before the removal fork; a late appearance is a PRESERVE.
+# `git-late-ignored` varies WHICH re-check sees the file (FAKE_LATE_ON).
+mk_late_repo() { # <env-name> -> repo with a committed .gitignore for `.env`
+    local envname="$1" d
+    d="$(mk_repo "$envname")"
+    printf '.env\n' >"$d/.gitignore"
+    "$REAL_GIT" -C "$d" add .gitignore
+    GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" \
+        "$REAL_GIT" -C "$d" commit -qm 'ignore .env'
+    printf '%s\n' "$d"
+}
+
+# A21a — the file is first seen by remove_one's re-check #1 (before any delete).
+ENV=A21; REPO="$(mk_late_repo $ENV)"
+WT_LATE="$(add_named_wt "$REPO" "$ENV-late" feat/a21-late)"
+mkdir -p "$WT_LATE/.venv/bin"; printf 'py\n' >"$WT_LATE/.venv/bin/python"
+rm -f "$T/$ENV/cnt-a"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATE/.env" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-a" FAKE_LATE_ON=1 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21a a late ignored file is a PRESERVE (exit 0, never exit 4)"
+assert_contains "$OUT" "PRESERVED — the checkout changed" "A21a the late change is surfaced on stdout"
+assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21a the footer counts the late preserve"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21a nothing was removed"
+assert_contains "$(footer $ENV)" "FAILED=0" "A21a nothing failed"
+assert_dir "$WT_LATE" "A21a the worktree is still on disk"
+assert_file "$WT_LATE/.env" "A21a the late ignored file SURVIVED (the F4 exposure)"
+assert_dir "$WT_LATE/.venv" "A21a the ephemeral pre-delete had NOT run — nothing was deleted"
+assert_contains "$(cat "$T/$ENV/reap.log")" "REMOVE-SKIP" "A21a the skip is logged"
+
+# A21b — the file is first seen by remove_one's re-check #2, i.e. after the
+# pre-delete has run. This is the window the pre-delete itself widens (up to
+# REAP_WT_REMOVE_TIMEOUT), so it is the one the second re-check exists for: the
+# `.venv` assertion below proves the pre-delete had already run when it fired.
+ENV=A21b; REPO="$(mk_late_repo $ENV)"
+WT_LATEB="$(add_named_wt "$REPO" "$ENV-late" feat/a21b-late)"
+mkdir -p "$WT_LATEB/.venv/bin"; printf 'py\n' >"$WT_LATEB/.venv/bin/python"
+rm -f "$T/$ENV/cnt-b"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEB/.env" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-b" FAKE_LATE_ON=2 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21b a file that appears after the pre-delete is still a PRESERVE"
+assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21b the second re-check caught it"
+assert_contains "$(footer $ENV)" "FAILED=0" "A21b it is not reported as a failed removal"
+assert_file "$WT_LATEB/.env" "A21b the late ignored file SURVIVED"
+assert_nodir "$WT_LATEB/.venv" "A21b proof the pre-delete had ALREADY run when the second re-check fired"
+
+# A21c — control: the guard must not become a veto. Same shim, no late write.
+ENV=A21c; REPO="$(mk_late_repo $ENV)"
+WT_LATEC="$(add_named_wt "$REPO" "$ENV-late" feat/a21c-late)"
+mkdir -p "$WT_LATEC/.venv/bin"; printf 'py\n' >"$WT_LATEC/.venv/bin/python"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21c control: with no late write the same fixture is reclaimed"
+assert_contains "$(footer $ENV)" "LATE_PRESERVE=0" "A21c the guard does not fire spuriously"
+assert_nodir "$WT_LATEC" "A21c the reclaimable worktree is gone"
+assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/a21c-late | wc -l | tr -d ' ')" "1" \
+    "A21c the branch ref survives"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
