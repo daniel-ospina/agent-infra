@@ -737,3 +737,50 @@ its "mutant" was never a mutant.
   scanner-argv pins, and the differential fails-if-removed pin (10 960 commands / 277 files, Use=16, Avoid=8).
 - `npx tsx extensions/verification-gate/subtract-scope.test.ts` + `node …/test-subtract-scope.mjs` → green
   (the gate's only other edit is the quoted remedy string, whose e2e assertion is `includes("sha256sum")`).
+
+---
+
+## Implementation notes — Rev 12 (cycle-2 adversarial review: NOT COVERED — 5 reproductions filed, exit `adversarial-capped`)
+
+The `code-review` gate's cycle 2 was dispatched as the **adversarial lens** — the domain that bounds this gate
+(gate/enforcement code whose correctness is "an attacker cannot make it fail open"), scoped to the rule set in
+§Adversarial Threat Surface. The reviewer had no memory of cycle 1, loaded the real classifier via
+`node extensions/search-guard/test.mjs --classify …`, and ran both suites (green). **Verbatim verdict:
+`NOT COVERED — 5 reproduced bypasses + 3 coverage gaps`.** Every reproduction below was then re-verified
+independently against HEAD `8382947` before it was filed (the exact commands and observed verdicts are in the
+issues), and no third cycle was dispatched — the adversarial bound is 2, and in-scope findings surviving
+cycle 2 are filed and recorded, not iterated.
+
+**Coverage (A), per the reviewer:** every declared class has a row that pins WHICH rule fires — R0
+(T4/T4b/T4c), R1 (T1/T2/T2b/T3/T9b/T11d/T28), R2/R3 (T5–T17g/T26), R3p (T11/T11b/T11c/T11e/T26), R4
+(T17/T18/T27), R5 (T9/T9b), R6 (T22), cwd (T20/T21/T29) — with three named gaps: the **R3p `-path` sub-arm has
+zero rows**, the **R4 `git grep` arm is pinned only in its bare form**, and the **cwd class is pinned only for
+`cd`**. The reviewer also confirmed `run.sh`/`scan.mjs` are non-vacuous (positive, negative, and
+fails-if-removed controls all pass), so no class is made vacuous by the harness.
+
+### Filed (all verified after the review, at `8382947`)
+
+| Issue | Sev | Shape | Verdict |
+|---|---|---|---|
+| #1097 | P1 | `git -C . grep --no-index -n -e p` (also `-c`, `--no-pager`, `--git-dir=…`) | ALLOW — git global options hide the subcommand from the R4b arm added in this PR |
+| #1098 | P1 | `find . -path '*/node_modules/*' -prune -o …` and `-path node_modules -prune …` | ALLOW — R3p's `-path` arm substring-matches the vendored name without matching the directory, so nothing is pruned; the arm is also row-less |
+| #1099 | P1 | `pushd <hub> >/dev/null && grep -rn p` from a clean cwd | ALLOW — `parseCdChains` recognizes `cd` only, so the implicit-root check uses the wrong directory (`cd` twin BLOCKs) |
+| #1100 | P2 | `grep -rn p .` in a root with 601 children whose carrier sorts past entry 200 | ALLOW — `MAX_CHILDREN` truncates the probe, converting a bounded probe into a false "no vendored trees" |
+| #1101 | P2 | `find -L . -name x` where the only carrier is a symlinked child directory | ALLOW — the probe skips non-directory dirents while `find -L` descends through them |
+
+Not filed, recorded here: the plan's T4/T4d table rows still read ALLOW for shell grouping while the
+implementation (and the suite) BLOCK — already disclosed in Rev 9 §1 ("T4d is stronger than planned"); the
+table row was not updated. Category B (doc drift), no product consequence.
+
+### Why this is a bounded exit, not a clean one
+
+The gate's own acceptance for this domain is *every in-scope class covered by a test that fails without the
+fix, plus green CI* — and that is **not** satisfied: #1098 is a fooled arm of a declared rule with no rows at
+all, and #1097 is a variant of a rule added in this same PR. The two suites are green (128 rows; harness all
+checks passed), so the pins are honest about what they assert — they simply do not yet assert these shapes.
+Per the skill, the remaining work is a follow-up, not a third cycle of this loop: each issue carries the exact
+command, the observed verdict, the cause with file:line, the suggested fix, and the acceptance rows to add.
+
+`[ADVERSARIAL-BOUND] cycles=2 threats=8 covered=6 residuals=#1097,#1098,#1099,#1100,#1101` — 8 declared rule
+classes (R0, R1, R2, R3, R3p, R4, R5, R6): 6 fully covered, R3p and R4 partially covered (the two sub-arm gaps
+above). Exit reason: `adversarial-capped`.
