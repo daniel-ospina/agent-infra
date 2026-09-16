@@ -222,6 +222,37 @@ cat >"$T/bin/git-very-slow-mergebase" <<'SHIM'
 for a in "$@"; do [ "$a" = "merge-base" ] && { sleep 12; break; }; done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
+cat >"$T/bin/git-race-delete-a25" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A25. Deletes the target checkout at the record's own property
+# probe — i.e. AFTER the pass-start list snapshot that decided it was a
+# present-dir preserve, and BEFORE the end-of-pass `git worktree prune`, which
+# re-evaluates prunability at prune time. Simulates ANY external removal of a
+# checkout mid-pass (an operator, a cleanup job, an editor); no hostility is
+# needed for the window to open.
+for a in "$@"; do
+    if [ "$a" = "for-each-ref" ] && [ -n "${A25_RACE_TARGET:-}" ]; then
+        rm -rf "$A25_RACE_TARGET"
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+cat >"$T/bin/git-list-fail-after-probes" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A25's fail-closed leg. It fails `worktree list` ONLY once a
+# `for-each-ref` has been seen — i.e. only the PRE-PRUNE RE-READ. The startup
+# list and the `-z` probe (both before classification) still succeed, so the
+# pass reaches the recheck and the recheck cannot be evaluated. Pins "an
+# unevaluable probe is fail-closed", never "reclaim anyway".
+STATE="${A25_LIST_SHIM_STATE:-}"
+for a in "$@"; do
+    case "$a" in
+        for-each-ref) [ -n "$STATE" ] && : >"$STATE" ;;
+        list) [ -n "$STATE" ] && [ -e "$STATE" ] && exit 128 ;;
+    esac
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
 cat >"$T/bin/git-fail-list" <<'SHIM'
 #!/usr/bin/env bash
 for a in "$@"; do [ "$a" = "list" ] && exit 128; done
@@ -293,7 +324,8 @@ chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh
          "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-prune" "$T/bin/git-slow-status" \
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
-         "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status"
+         "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status" "$T/bin/git-race-delete-a25" \
+         "$T/bin/git-list-fail-after-probes"
 
 # ── fixture builders ───────────────────────────────────────────────────
 mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
@@ -358,6 +390,8 @@ run_reaper() {
     REAL_RM_BIN="$REAL_RM" \
     GH_BIN="${GH_BIN_OVERRIDE:-$T/bin/gh}" \
     GIT_BIN="${GIT_BIN_OVERRIDE:-$REAL_GIT}" \
+    A25_RACE_TARGET="${A25_RACE_TARGET:-}" \
+    A25_LIST_SHIM_STATE="${A25_LIST_SHIM_STATE:-}" \
     FAKE_PS_LIVE_PATH="${FAKE_PS_LIVE_PATH:-}" \
     FAKE_LSOF_CWD="${FAKE_LSOF_CWD:-}" \
     FAKE_GH_REFS="${FAKE_GH_REFS:-}" \
@@ -1246,6 +1280,71 @@ assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A24_SHA" --format=
 "$REAL_GIT" -C "$REPO" cat-file -e "$A24_SHA" 2>/dev/null \
     && ok "A24 falsifier: the commit SURVIVES gc — the preserved admin HEAD is its durable handle" \
     || bad "A24 the commit was collected: the gone-dir record's HEAD was not a durable handle"
+
+# ── A25: a record that becomes prunable MID-PASS must block the prune ───
+# (cycle-10 P1) The per-record `prunable` test reads the list snapshot taken at
+# PASS START, but `git worktree prune` RE-EVALUATES prunability at prune time. A
+# record present then and gone now never carried the flag, so it never set
+# PRUNE_BLOCKED — and the path-filterless prune sweeps it. Where that record was
+# preserved as `remote-only-ref`, its admin HEAD is the commit's last DURABLE
+# handle, so the prune ORPHANS the commit: the F9 class through a window the
+# snapshot cannot see. The shim removes the live checkout at its own refs probe.
+ENV=A25; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a25
+commit_in_wt "$REPO" "$OLD_DATE" a25
+A25_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a25:refs/heads/feat/a25
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a25 >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A25X="$T/$ENV-live"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A25X" "$A25_SHA"
+WT_A25Y="$(add_named_wt "$REPO" "$ENV-gone" feat/a25-gone)"
+rm -rf "$WT_A25Y"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A25X")" "reason=remote-only-ref" \
+    "A25 precondition: the present-dir record is a revocable-ref preserve"
+assert_absent "$(row_for "$OUT" "$WT_A25X")" "reason=prunable" \
+    "A25 precondition: it carries NO prunable flag at pass start"
+assert_contains "$(row_for "$OUT" "$WT_A25Y")" "reason=prunable" \
+    "A25 precondition: the second record arms the prune"
+OUT="$(A25_RACE_TARGET="$WT_A25X" GIT_BIN_OVERRIDE="$T/bin/git-race-delete-a25" \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A25 --apply exits 0 (a vanished checkout is not a failed removal)"
+if [ ! -d "$WT_A25X" ]; then ok "A25 precondition: the checkout really was removed mid-pass"
+else bad "A25 precondition: the shim did not remove $WT_A25X"; fi
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNE-RECHECK-BLOCK $WT_A25X" \
+    "A25 the mid-pass-prunable record blocks the global prune"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" "A25 footer PRUNE_BLOCKED=1"
+assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A25 the prune did not run"
+assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A25X" \
+    "A25 the preserved record is still registered — its admin HEAD is the durable handle"
+# the orphan claim itself: drop the revocable ref, expire every other handle,
+# then gc — the commit survives only because the admin record is still there
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a25
+"$REAL_GIT" -C "$REPO" fetch -q --prune upstream
+assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A25_SHA" --format='%(refname)' | wc -l | tr -d ' ')" "0" \
+    "A25 the revocable ref is gone (nothing else but the admin record holds it)"
+"$REAL_GIT" -C "$REPO" reflog expire --expire=now --expire-unreachable=now --all
+"$REAL_GIT" -C "$REPO" gc -q --prune=now 2>/dev/null
+"$REAL_GIT" -C "$REPO" cat-file -e "$A25_SHA" 2>/dev/null \
+    && ok "A25 falsifier: the commit SURVIVES gc — the pruned-during-pass record was NOT swept" \
+    || bad "A25 the commit was collected: the global prune orphaned it"
+# the fail-closed branch: if the re-read itself cannot be evaluated, the prune
+# is skipped — the alternative ("could not check, so reclaim anyway") is the
+# unverifiable-probe bypass. The reaper state is unchanged: both records are
+# still registered and one of them still arms the prune.
+rm -f "$T/$ENV/seen"
+OUT="$(A25_LIST_SHIM_STATE="$T/$ENV/seen" GIT_BIN_OVERRIDE="$T/bin/git-list-fail-after-probes" \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A25 fail-closed: exit 0 (a skipped prune is not a failed removal)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNE-RECHECK-FAILED" \
+    "A25 fail-closed: an unevaluable re-read skips the prune instead of reclaiming blind"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" "A25 fail-closed: footer PRUNE_BLOCKED=1"
+assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A25 fail-closed: the prune did not run"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

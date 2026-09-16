@@ -1271,8 +1271,9 @@ run() {
             log "CLASSIFY preserve $p reason=$reason $detail"
             # A preserved record that git may ALSO deem prunable must not be
             # swept up by the global, path-filterless prune. The AUTHORITATIVE
-            # predicate is git's OWN `prunable` flag: it is exactly the set the
-            # prune would remove, so it is what makes a gone-directory row's
+            # predicate is git's OWN `prunable` flag: as of the pass-start
+            # snapshot it is exactly the set the prune would then remove, so it
+            # is what makes a gone-directory row's
             # admin HEAD load-bearing. A detached worktree's admin HEAD is a
             # reachability root for `git gc` (and its reflog a second handle),
             # so deregistering a preserved GONE record discards the last DURABLE
@@ -1281,7 +1282,11 @@ run() {
             # (A24). Present-directory records are never flagged prunable, so a
             # live `remote-only-ref` row no longer disables reclaiming the
             # prunable class (F7/A23) — which is why this is a flag test, not a
-            # reason test.
+            # reason test. The snapshot cannot see a record that becomes
+            # prunable DURING the pass, and `git worktree prune` re-evaluates
+            # prunability at prune time; F17 closes that window with a bounded
+            # pre-prune re-read, because for a preserved gone-dir row the admin
+            # HEAD is the commit's last durable handle.
             case ",$f," in *,prunable,*) PRUNE_BLOCKED=1 ;; esac
             # Belt and braces for a record preserved because a PROBE could not
             # be evaluated: git may not have flagged it prunable, and
@@ -1298,13 +1303,73 @@ run() {
     done <<<"$WT_LIST"
 
     if [ "$MODE" = apply ] && [ "$PRUNE_WANTED" -gt 0 ]; then
+        # F17 (cycle-10, P1) — the per-record `prunable` test above read the flag
+        # from the list snapshot taken at PASS START, but `git worktree prune`
+        # RE-EVALUATES prunability at prune time. A record that was PRESENT then
+        # and is GONE now carries no flag in that snapshot, so nothing set
+        # PRUNE_BLOCKED — yet the path-filterless prune sweeps it. Where such a
+        # record was PRESERVED as `remote-only-ref`/`revocable-ref`, its admin
+        # HEAD is the commit's last DURABLE handle, so the prune ORPHANS the
+        # commit: the F9 class, reached through a window the snapshot cannot
+        # see (threat classes 2 and 4). Re-list immediately before the prune —
+        # bounded, one probe — and block unless every now-prunable path ALREADY
+        # carried the flag when it was classified (those are the intended
+        # reclaim targets). An unreadable re-read, or an unusable scratch file,
+        # is fail-closed: block.
+        PRUNE_START_LIST="$WT_LIST"
+        PRUNE_RECHECK_FAILED=0
+        # `wt_list_load` APPENDS to WT_LIST (it does not reset it), so the
+        # re-read needs the accumulator cleared first — otherwise the re-read
+        # list contains every path TWICE and the set comparison below reports a
+        # spurious difference, blocking the prune on every pass.
+        WT_LIST=""
+        wt_list_load || PRUNE_RECHECK_FAILED=1
+        PRUNE_START_TMP=""
+        PRUNE_NOW_TMP=""
+        if [ "$PRUNE_RECHECK_FAILED" = 0 ]; then
+            PRUNE_START_TMP="$(mktemp "${TMPDIR:-/tmp}/pi-reap-prune-start.XXXXXX")" || PRUNE_RECHECK_FAILED=1
+            PRUNE_NOW_TMP="$(mktemp "${TMPDIR:-/tmp}/pi-reap-prune-now.XXXXXX")" || PRUNE_RECHECK_FAILED=1
+        fi
+        if [ "$PRUNE_RECHECK_FAILED" = 1 ]; then
+            # Never "could not check, so reclaim anyway": an unevaluable re-read
+            # is exactly the unverifiable-probe case (threat class 3).
+            PRUNE_BLOCKED=1
+            log "PRUNE-RECHECK-FAILED (re-read or scratch file unavailable — fail-closed, global prune skipped)"
+        else
+            : >"$PRUNE_START_TMP"; : >"$PRUNE_NOW_TMP"
+            # only the path is needed, and only from records git ALREADY flags
+            while IFS=$'\t' read -r _p _h _b _f; do
+                [ -n "$_p" ] || continue
+                case ",$_f," in *,prunable,*) printf '%s\n' "$_p" >>"$PRUNE_START_TMP" ;; esac
+            done <<<"$PRUNE_START_LIST"
+            while IFS=$'\t' read -r _p _h _b _f; do
+                [ -n "$_p" ] || continue
+                case ",$_f," in *,prunable,*) printf '%s\n' "$_p" >>"$PRUNE_NOW_TMP" ;; esac
+            done <<<"$WT_LIST"
+            sort -o "$PRUNE_START_TMP" "$PRUNE_START_TMP"
+            sort -o "$PRUNE_NOW_TMP" "$PRUNE_NOW_TMP"
+            PRUNE_NEWLY="$(comm -23 "$PRUNE_NOW_TMP" "$PRUNE_START_TMP")"
+            rm -f "$PRUNE_START_TMP" "$PRUNE_NOW_TMP"
+            if [ -n "$PRUNE_NEWLY" ]; then
+                PRUNE_BLOCKED=1
+                say ""
+                say "⚠️  $(printf '%s\n' "$PRUNE_NEWLY" | wc -l | tr -d ' ') record(s) became prunable DURING this pass, after they were classified — the global prune is skipped."
+                while IFS= read -r _nl; do
+                    [ -n "$_nl" ] || continue
+                    log "PRUNE-RECHECK-BLOCK $_nl (became prunable after classification — not an intended reclaim target)"
+                done <<<"$PRUNE_NEWLY"
+            fi
+        fi
+        # the pass's snapshot is authoritative again for anything that follows
+        WT_LIST="$PRUNE_START_LIST"
         if [ "$PRUNE_BLOCKED" = 1 ]; then
             say ""
             say "⚠️  skipped \`git worktree prune\`: ${PRUNE_WANTED} reclaimable gone-checkout record(s) were"
-            say "    left registered, because a record this pass did not classify (deferred) — or did"
-            say "    preserve — could also be prunable and a global prune has no path filter."
+            say "    left registered, because a record this pass did not classify (deferred), did"
+            say "    preserve, or became prunable only after classification — and a global prune"
+            say "    has no path filter."
             say "    Nothing was lost: those records are re-classified on the next pass."
-            log "PRUNE-SKIPPED wanted=$PRUNE_WANTED (a deferred or preserved record may be prunable)"
+            log "PRUNE-SKIPPED wanted=$PRUNE_WANTED (a deferred, preserved, or mid-pass-prunable record may be prunable)"
         elif run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" worktree prune; then
             REMOVED=$((REMOVED + PRUNE_WANTED))
             log "PRUNED $PRUNE_WANTED gone-checkout record(s)"
