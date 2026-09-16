@@ -632,8 +632,8 @@ subtree**, so nested frames make them non-additive — read them as a
 | `Heap::CollectGarbage` | *not quotable — see note* | *not quotable* |
 | `RegExpPrototypeTestFast` | 387 | 151 |
 | `FindOrderedHashMapEntry` | 269 | 109 |
-| **`node::SyncProcessRunner::Spawn` / `Run` / `TryInitializeAndRunLoop`** | **262** | **198** |
-| `uv__try_write` (writes to the terminal) | **13** | — |
+| **`node::SyncProcessRunner::Spawn`** (see note) | **262** | **198** |
+| `uv__try_write` (writes to the terminal) | **13** | **10** |
 
 One deliberately unquoted row: `Heap::CollectGarbage` appears in **three nested
 frames per collection** (`SetMarkerAndCallbackImpl<…Heap::CollectGarbage…>` plus
@@ -647,7 +647,8 @@ was an artifact of substring-matching all three frames.
 Two conclusions that survive scrutiny:
 
 1. **The loop writes essentially nothing to the terminal.** 13 `uv__try_write`
-   samples (three frames, 4+4+5) against 8573 in the callback — 0.15%. pi-tui renders *differentially*
+   samples for pid 3312 (three frames, 4+4+5) against 8573 in the callback —
+   0.15% — and 10 for pid 70130 against 4217. pi-tui renders *differentially*
    (`dist/tui.js` — "Minimal TUI implementation with differential rendering"),
    so an unchanged frame emits zero bytes. That is why the screen is static and
    why the burn is invisible to `cmux read-screen` and `ps`-style inspection.
@@ -657,8 +658,11 @@ Two conclusions that survive scrutiny:
 
 **Not mentioned in the original filing — `spawnSync` runs on this timer.**
 `SyncProcessRunner` is `child_process`'s **synchronous** API
-(`spawnSync`/`execSync`). It appears 262 times in the 3312 timer subtree and
-198 times in 70130, and its nested `uv_run` → `uv__io_poll` → `kevent` frames
+(`spawnSync`/`execSync`). Its `Spawn` frame accumulates 262 samples in the 3312
+timer subtree and 198 in 70130. (The wider
+`Spawn`/`Run`/`TryInitializeAndRunLoop` family sums to 783 / 594 because those
+frames nest inside a single spawn; the `Spawn` figure is the one frame and is
+what the row quotes.) Its nested `uv_run` → `uv__io_poll` → `kevent` frames
 sit *inside* the `uv__run_timers` branch, confirming the spawn happens from a
 timer callback. At ~1 spawn/s this is a plausible partner to the string work,
 and it means a **periodic synchronous `exec`** is in the same loop — a lead
@@ -719,7 +723,7 @@ here so they are not re-derived:
   `updateDisplay()`, not `render()`;
 - that the 80 ms `Loader` spinner cadence explains the magnitude — the spinner
   calls `requestRender()`, a render pass, which does not re-invoke
-  `renderResult`, so that column had no basis.
+  `renderResult`, so the `@80 ms Loader`-spinner hypothesis had no basis.
 
 The honest statement is: **the per-session magnitude is unexplained by the
 sites found so far.** The next step is to instrument / breakpoint which timer
@@ -758,7 +762,8 @@ technically unreachable. Patching `dist/` directly remains wiped by `pi update`.
 ### Honest status of this report
 
 Measured: the fleet burn, the confound isolation, the `sample` attribution
-(61% of the main thread in one timer callback, no terminal writes), the
+(61% of the main thread in one timer callback, with negligible terminal writes
+— 13/8573 = 0.15% for pid 3312, 10/4217 for pid 70130), the
 `spawnSync` presence, the `truncateToVisualLines` cost, and the calibration
 that a fresh idle TUI costs 0.8% of a core while a visible spinner plus a
 ticking bash call costs ~1%. **Not established: which timer drives the burn,
