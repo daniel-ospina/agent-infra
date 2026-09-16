@@ -94,6 +94,7 @@ SHIPPED_ONLY=0
 OVERRIDE="${COST_CLAMP_OVERRIDE:-0}"
 BLOCKS=0
 RETRY_BLOCKS=0
+SETTINGS_BLOCKS=0
 WARNS=0
 
 usage() {
@@ -113,10 +114,14 @@ done
 ok()  { echo "  ✅ $1"; }
 warn() { echo "  ⚠️  $1"; WARNS=$((WARNS + 1)); }
 block() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); }
-# Retry/hang-contract blocks are counted separately so COST_CLAMP_OVERRIDE=1
-# (the clamp's rollback escape) cannot silence them — an ambient env var must
-# not be able to defeat the retry bound (#1088 review P1).
+# Two block classes the clamp escape must NOT silence, because neither has a
+# rollback window (the override exists for exactly one: reverting the models.json
+# contextWindow threshold). Both are counted separately and force exit 1 even
+# with COST_CLAMP_OVERRIDE=1 set — an ambient env var must not be able to defeat
+# the retry bound (#1088 review P1) or to hide a reverted/disabled settings
+# contract. `block()` stays for the clamp class (models.json/modelOverrides).
 block_retry() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); RETRY_BLOCKS=$((RETRY_BLOCKS + 1)); }
+block_settings() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); SETTINGS_BLOCKS=$((SETTINGS_BLOCKS + 1)); }
 
 # deepseek_violations <file> — canonical matcher over the PARSED JSON tree.
 # Format-independent: walks every dict/list node (pretty, minified, reordered
@@ -388,7 +393,9 @@ check_settings_file() {
     while IFS= read -r i; do
       case "$i" in
         RETRY_CONTRACT:*) block_retry "$label — ${i#RETRY_CONTRACT: }" ;;
-        *) block "$label — $i" ;;
+        # Compaction/settings drift (enabled=false, reserve/keep reverted) has no
+        # rollback window either, so the clamp escape must not silence it.
+        *) block_settings "$label — $i" ;;
       esac
     done <<< "$issues"
   else
@@ -470,7 +477,7 @@ PYEOF
 }
 
 echo "== cost-config guard (#341) — deepseek context clamp @${CLAMP} =="
-[ "$OVERRIDE" = "1" ] && echo "   ⛔ COST_CLAMP_OVERRIDE=1 is SET — CLAMP blocks will be SILENCED. Retry/hang-contract blocks (#1088) are NOT covered by this escape and still exit 1."
+[ "$OVERRIDE" = "1" ] && echo "   ⛔ COST_CLAMP_OVERRIDE=1 is SET — CLAMP blocks will be SILENCED. Retry/hang-contract (#1088) and settings/compaction blocks are NOT covered by this escape and still exit 1."
 echo ""
 
 check_model_file "$SHIPPED_DIR/models.json" "shipped models.json" models block
@@ -494,9 +501,10 @@ fi
 
 echo ""
 if [ "$OVERRIDE" = "1" ]; then
-  if [ "$RETRY_BLOCKS" -gt 0 ]; then
-    echo "❌ cost-config guard: $RETRY_BLOCKS retry/hang-contract BLOCK(s) — COST_CLAMP_OVERRIDE=1 does NOT cover"
-    echo "   the retry contract (the clamp rollback window does not extend to it, #1088). Guard: exit 1."
+  if [ "$RETRY_BLOCKS" -gt 0 ] || [ "$SETTINGS_BLOCKS" -gt 0 ]; then
+    echo "❌ cost-config guard: $RETRY_BLOCKS retry/hang-contract BLOCK(s) + $SETTINGS_BLOCKS settings-contract"
+    echo "   BLOCK(s) — COST_CLAMP_OVERRIDE=1 does NOT cover either class: the clamp rollback window does not"
+    echo "   extend to the retry bound (#1088) or to a reverted/disabled compaction contract. Guard: exit 1."
     exit 1
   fi
   echo "⛔ COST_CLAMP_OVERRIDE=1 — clamp BLOCK silenced by documented escape. Violations above are still DETECTED;"

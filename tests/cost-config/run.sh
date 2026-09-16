@@ -36,6 +36,8 @@
 #      rewritten, changed upstream shape → loud failure (never a silent no-op)
 #  25. no doc states a stale retry/hang number (the duplicate-drift pin — three
 #      copies of the idle value drifted exactly this way twice in review)
+#  26. COST_CLAMP_OVERRIDE=1 does NOT silence the compaction/settings class
+#      either (the escape is for the models.json clamp rollback window only)
 #   6. COST_CLAMP_OVERRIDE=1                       → exit 0 + loud notice
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
@@ -816,6 +818,27 @@ if bad:
 print(f"OK no stale retry/hang numbers in docs/**/*.md (idle={IDLE}, per-call={PROV}, cap={CAP})")
 PY
 if [ $? -eq 0 ]; then pass "$(cat "$OUT")"; else fail "stale retry/hang number in a doc: $(cat "$OUT")"; fi
+
+echo ""
+echo "26. COST_CLAMP_OVERRIDE=1 must NOT silence the compaction/settings class either"
+# The escape exists for ONE rollback window (a models.json contextWindow revert).
+# A reverted compaction block has no such window, so it must exit 1 too.
+COST_CLAMP_OVERRIDE=1 bash "$GUARD" --live-dir "$FIX/backdoor-settings" >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then
+  pass "compaction drift + override → still exit 1"
+else
+  fail "expected exit 1 for compaction drift under the override, got $code"; sed -n '1,30p' "$OUT"
+fi
+if grep -q 'settings-contract' "$OUT" && grep -q 'does NOT cover' "$OUT"; then pass "the carve-out notice names the settings class"; else fail "expected the settings-class carve-out notice"; sed -n '1,30p' "$OUT"; fi
+# ...while the clamp class stays silenced (the escape must keep working).
+COST_CLAMP_OVERRIDE=1 bash "$GUARD" --live-dir "$FIX/backdoor-models" >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then
+  pass "clamp-class block still silenced (escape intact)"
+else
+  fail "the clamp escape stopped working (exit $code)"; sed -n '1,30p' "$OUT"
+fi
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

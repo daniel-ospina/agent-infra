@@ -143,16 +143,20 @@ Derived, and enforced by the guard:
 **What can defeat it (checked, not assumed).** Three escapes were closed or
 scoped explicitly:
 
-- `COST_CLAMP_OVERRIDE=1` silences the **clamp** block only. Retry-contract
-  violations are counted separately (`RETRY_BLOCKS`) and the guard still exits
-  1 — an ambient env var must not be able to defeat the retry bound. That
+- `COST_CLAMP_OVERRIDE=1` silences the **clamp** block only (models.json
+  `contextWindow` / `modelOverrides`). Retry-contract violations are counted
+  separately (`RETRY_BLOCKS`) and settings/compaction violations in a third
+  counter (`SETTINGS_BLOCKS`); the guard exits 1 when **either** is non-zero,
+  and the banner says so. An ambient env var must not be able to defeat the
+  retry bound, nor to hide a reverted/disabled compaction contract — neither
+  has a rollback window. That
   includes the two *absence* cases, which are retry-class precisely because
   they are not a clamp rollback: a **deleted** settings file (the contract
   itself is gone) and one that **cannot be analysed** — unparseable, valid JSON
   that is not an object, or any failure that leaves the derived window
   underivable (fail closed; a bound that cannot be computed must never read
   green). §6 below documents the override, and those carve-outs are pinned by
-  tests 20 and 22.
+  tests 20, 22 and 26.
 - **Project settings.** pi resolves the project file from the **session cwd**
   (`join(resolvedCwd, ".pi", "settings.json")`), not from the repo root — so a
   session started in a subdirectory merges *that* directory's project file over
@@ -286,15 +290,16 @@ property; this guard is the pattern to copy, not a substitute for it.
 
 - The guard honors `COST_CLAMP_OVERRIDE=1`: it **silences the CLAMP BLOCK,
   prints a loud warning, still detects** (exit 0).
-- **It does not cover the retry/hang contract (#1088).** Retry-contract
-  violations are counted separately (`RETRY_BLOCKS`); even with the override
-  set, the guard exits 1 when any is present, and the banner says so. That
-  class includes the *absence* cases, because neither is a clamp rollback: a
-  **deleted** settings file (the contract is gone) and an **unparseable** one
-  (the contract cannot be asserted — fail closed). Tests 20 and 22 pin all
-  three. The
-  override exists for the clamp's rollback window; the retry contract has no
-  rollback window, so extending the escape to it would be a pure bypass.
+- **It does not cover the retry/hang contract (#1088) or the settings/
+  compaction contract.** Three counters now separate the block classes: the
+  clamp (`block()`), the retry contract (`block_retry()` → `RETRY_BLOCKS`) and
+  the settings/compaction contract (`block_settings()` → `SETTINGS_BLOCKS`).
+  Even with the override set, the guard exits 1 when either of the latter two
+  is non-zero, and the banner says so. The retry class includes the *absence*
+  cases, because neither is a clamp rollback: a **deleted** settings file (the
+  contract is gone) and one that **cannot be analysed** (unparseable,
+  non-object JSON, or any failure that leaves the derived window underivable —
+  fail closed). Tests 20, 22 and 26 pin all of it.
 - **Sanctioned use: the clamp rollback window only.** It never enables a live
   1M session silently — it is the in-window escape while the revert commit is
   prepared. A per-session override was explicitly dropped: startup auto-sync
