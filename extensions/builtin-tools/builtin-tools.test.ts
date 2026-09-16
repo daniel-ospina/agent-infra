@@ -17,6 +17,9 @@ import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
+// #1068 — the single declaration of the progress-edge classification; read (never
+// restated) by the child↔parent parity assertions below.
+import * as progressEdges from "../shared/heartbeat-progress-edges.js";
 
 /** tsx/CJS interop: the repo root is "type": "commonjs", so the child module's
  * default factory arrives nested (module.exports.default). Unwrap defensively. */
@@ -2414,10 +2417,65 @@ test("child gating matrix — inactive without TASK_HEARTBEAT=1 ∧ PI_MODE=prin
   withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined }, () => {
     const { api, handlers } = stub();
     childFactory(api);
-    for (const ev of ["session_start", "session_shutdown", "turn_start", "turn_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "message_start", "message_update"]) {
-      ok(handlers[ev], `handler registered for ${ev}`);
-    }
+    // #1068 — DERIVED, not a hard-coded list. The previous literal 9-event array
+    // passed for any set that contained it, so a NEWLY-ADDED `pi.on` edge was
+    // invisible here (a set-equality assertion over a hand-maintained list is
+    // structurally blind in exactly the direction that matters). The child now
+    // registers precisely the declared activity edges plus the two lifecycle
+    // events, and this equality fails on a registration on EITHER side.
+    const expected = [...progressEdges.ACTIVITY_EDGE_EVENTS, ...progressEdges.LIFECYCLE_EVENTS].sort();
+    const actual = Object.keys(handlers).sort();
+    deepEqual(
+      actual,
+      expected,
+      `registered handlers must equal ACTIVITY_EDGE_EVENTS ∪ LIFECYCLE_EVENTS (declared in extensions/shared/heartbeat-progress-edges.ts) — actual ${JSON.stringify(actual)}`,
+    );
+    for (const ev of expected) ok(handlers[ev], `handler registered for ${ev}`);
   });
+});
+
+testAsync("#1068 — the child's clock advances on exactly the declared edges (behavioural parity)", async () => {
+  // Fails-if-removed: this drives the REAL child factory and observes the
+  // activity sink, so deleting a `touchActivity(...)` call drops that edge and
+  // shrinks the child's clock edge set silently — no longer possible to do with
+  // a green suite. Cost is ~0 s: the sink is read synchronously, so there is no
+  // wait for the (5 s-clamped) tick interval.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const seen: string[] = [];
+  childHb._setActivitySinkForTest((edge: string) => seen.push(edge));
+  try {
+    await withEnv(
+      { TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_NONCE: "paritynonce" },
+      async () => {
+        childFactory(api);
+        // Fire the declared clock-advancing rows IN TABLE ORDER.
+        const declaredClockEdges = progressEdges.PROGRESS_EDGE_TABLE.filter((r) => r.advancesClock).map((r) => r.event);
+        await handlers.session_start({} as any);
+        await handlers.turn_start({ turnIndex: 1 } as any);
+        await handlers.turn_end({ turnIndex: 1 } as any);
+        await handlers.tool_execution_start({ toolCallId: "p1", toolName: "bash", args: {} } as any);
+        await handlers.tool_execution_update({ toolCallId: "p1", toolName: "bash", args: {} } as any);
+        await handlers.tool_execution_end({ toolCallId: "p1", toolName: "bash", result: {}, isError: false } as any);
+        await handlers.message_start({ message: { role: "assistant" } } as any);
+        await handlers.message_update({ message: { role: "assistant" }, assistantMessageEvent: {} } as any);
+        deepEqual(
+          seen,
+          declaredClockEdges,
+          `the child clock must advance on exactly the declared rows, in table order (declared ${JSON.stringify(declaredClockEdges)}, observed ${JSON.stringify(seen)})`,
+        );
+
+        // Non-advancing edges must NOT touch the clock.
+        const before = seen.length;
+        await handlers.message_start({ message: { role: "user" } } as any);
+        equal(seen.length, before, "a non-assistant message_start must not advance the clock");
+        await handlers.session_shutdown({} as any);
+        equal(seen.length, before, "session_shutdown is a lifecycle edge — it must not advance the clock");
+      },
+    );
+  } finally {
+    childHb._setActivitySinkForTest(null);
+  }
 });
 
 testAsync("child lifecycle — ready, tool-Set semantics, per-turn flags, tick fields, shutdown cleanup", async () => {

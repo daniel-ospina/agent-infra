@@ -81,6 +81,29 @@ import * as path from "node:path";
 // getPgid/listPgid for the pgid catch-net.
 import { getChildPids, treeKill } from "./shared/tree-kill.js";
 import { getPgid, listPgid } from "./shared/process-sweep.js";
+// #1068: the progress-edge classification is DECLARED once, in shared/, and
+// consumed here — so the child's clock edges and the parent's parsed-marker
+// classification cannot drift apart silently. Re-exported so the parity test
+// can prove this module consumes the declaration rather than restating it.
+import {
+  ACTIVITY_EDGE_EVENTS,
+  LIFECYCLE_EVENTS,
+  CLOCK_RESET_EVENT,
+  type ActivityEdge,
+} from "./shared/heartbeat-progress-edges.js";
+export { ACTIVITY_EDGE_EVENTS, LIFECYCLE_EVENTS };
+
+/**
+ * #1068 test seam: observe WHICH declared edge advanced the clock. `null` (the
+ * production default) is inert — a no-op, in the same seam class as the
+ * parent's `setLoad1Override`. The behavioural parity test sets this and asserts
+ * each declared edge fires exactly once, so deleting a `touchActivity(...)` call
+ * turns the suite red instead of silently shrinking the clock's edge set.
+ */
+let activitySink: ((edge: string) => void) | null = null;
+export function _setActivitySinkForTest(fn: ((edge: string) => void) | null): void {
+  activitySink = fn;
+}
 
 // ── Marker contract (drift-guarded vs builtin-tools/index.ts — E14) ────
 
@@ -444,8 +467,9 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const touchActivity = () => {
+  const touchActivity = (edge: ActivityEdge | typeof CLOCK_RESET_EVENT) => {
     lastActivityAt = Date.now();
+    if (activitySink) activitySink(edge);
   };
 
   const tick = () => {
@@ -470,7 +494,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async () => {
     emit(formatReady(nonce));
-    lastActivityAt = Date.now();
+    touchActivity(CLOCK_RESET_EVENT);
     if (tickTimer) clearInterval(tickTimer);
     tickTimer = setInterval(tick, getHeartbeatIntervalMs());
     // Must NEVER hold the event loop open — the #153 hang-on-exit class.
@@ -503,7 +527,7 @@ export default function (pi: ExtensionAPI) {
     // Per-turn flags reset — feeds the parent's first-message backstop.
     turnSawMessage = false;
     turnSawTool = false;
-    touchActivity();
+    touchActivity("turn_start");
     emit(formatTurnStart(nonce, event.turnIndex));
   });
 
@@ -523,26 +547,26 @@ export default function (pi: ExtensionAPI) {
     // at S: the precise false-liveness direction this gate exists to close.
     outstandingTools.clear();
     updatedToolIds.clear();
-    touchActivity();
+    touchActivity("turn_end");
     emit(formatTurnEnd(nonce, event.turnIndex));
   });
 
   pi.on("tool_execution_start", async (event) => {
     outstandingTools.set(event.toolCallId, Date.now());
     turnSawTool = true;
-    touchActivity();
+    touchActivity("tool_execution_start");
     emit(formatToolStart(nonce, event.toolCallId, event.toolName));
   });
 
   pi.on("tool_execution_update", async (event) => {
     updatedToolIds.add(event.toolCallId);
-    touchActivity();
+    touchActivity("tool_execution_update");
   });
 
   pi.on("tool_execution_end", async (event) => {
     outstandingTools.delete(event.toolCallId);
     updatedToolIds.delete(event.toolCallId);
-    touchActivity();
+    touchActivity("tool_execution_end");
     emit(formatToolEnd(nonce, event.toolCallId));
   });
 
@@ -551,13 +575,13 @@ export default function (pi: ExtensionAPI) {
     // responses count as stream activity.
     if ((event.message as { role?: string })?.role === "assistant") {
       turnSawMessage = true;
-      touchActivity();
+      touchActivity("message_start");
     }
   });
 
   pi.on("message_update", async () => {
     // Streaming token deltas — the primary stream-activity signal.
     turnSawMessage = true;
-    touchActivity();
+    touchActivity("message_update");
   });
 }

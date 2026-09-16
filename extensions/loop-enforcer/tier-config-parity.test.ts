@@ -934,6 +934,30 @@ test("the exact-text pin is not vacuous: an empty / unrelated doc is rejected", 
 section("Stall-threshold parity (#847)");
 
 /**
+ * SIBLING INSTRUMENT — ownership split recorded on BOTH sides (#1068).
+ *
+ * `extensions/shared/heartbeat-progress-edges.test.ts` (added by #1068) is a
+ * second declared-surface gate, over a DIFFERENT vocabulary: the progress-edge
+ * classification and the runtime stall/liveness bound registry. It does not
+ * restate, replace, or de-list anything below. The split, so a reader of either
+ * file can see it:
+ *
+ *   · THIS gate owns the `stall_threshold` VALUE, across skill surfaces. It
+ *     is the only authority for that number.
+ *   · The #1068 gate owns the runtime stall-term/edge VOCABULARY and holds NO
+ *     `stall_threshold` value — its registry carries `STALL_THRESHOLD` as a
+ *     pointer with `value: null`, asserts no registered name matching
+ *     `/stall_?threshold/i` carries a value, and excludes `skills/**` from its
+ *     scan corpus by construction.
+ *
+ * The instrument (declare-surface → reverse source scan → non-vacuity floor) is
+ * shared in SPIRIT but deliberately not extracted into a common helper in that
+ * change: doing so would refactor this passing safety gate under a
+ * no-behaviour-change constraint. Extracting it is a follow-up if a third
+ * vocabulary needs it.
+ */
+
+/**
  * The stall-detector surfaces that declare a numeric `stall_threshold`
  * default. `STALL_THRESHOLD` in `termination.ts` is a MIRROR of these, not the
  * source, so drift BETWEEN them is the failure pinned here — the same class
