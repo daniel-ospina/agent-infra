@@ -117,6 +117,7 @@ export const OUT_OF_FAMILY_TERMS = [
   "getFirstMessageMs",
   "getTaskMaxDispatchMs",
   "getCutGapMs",
+  "getEffectiveCutGapMs",
   "FIRST_OUTPUT_TIMEOUT_MS",
   "DEFAULT_HARD_CAP_MS",
   "DEFAULT_MAX_DISPATCH_MS",
@@ -368,10 +369,10 @@ export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string
   // only the fraction would let the bound move through a path the registry
   // cannot see, and omitting the 60 s floor would record a bound that does not
   // exist (#1068 review; the same shape PR #873 / #991 caught).
-  "tool-stall": "max(60 s, TASK_TOOL_STALL_MS) override (env), else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap from DEFAULT_HARD_CAP_MS) (L)",
-  "first-message-stall": "max(60 s, TASK_FIRST_MESSAGE_MS) override (env), else max(60 s, DEFAULT_FIRST_MESSAGE_MS) (M)",
+  "tool-stall": "max(60 s, TASK_TOOL_STALL_MS) override (env), else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap from DEFAULT_HARD_CAP_MS) (L) — floored further by HEARTBEAT_TIMEOUT_MS while no turn is active",
+  "first-message-stall": "max(60 s, TASK_FIRST_MESSAGE_MS) override (env), else max(60 s, DEFAULT_FIRST_MESSAGE_MS) (M) — then load-scaled and latched at the dispatch site",
   "max-dispatch": "max(60 s, TASK_MAX_DISPATCH_MS) override (env), else OFF — DEFAULT_MAX_DISPATCH_MS = 0 disables the cap (D)",
-  cut: "getCutGapMs() / TASK_HEARTBEAT_CUT_GAP_MS",
+  "cut": "getEffectiveCutGapMs() / getCutGapMs() / TASK_HEARTBEAT_CUT_GAP_MS",
 };
 
 // ── independent drivers of "what counts as progress" ───────────────────────
@@ -557,6 +558,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_IDLE_HOURS:-24}",
     axis: "reap",
     guardedBy: NONE,
+    overrides: ['REAP_IDLE_HOURS="$2"', "10#${REAP_IDLE_HOURS}"],
+    note: "the owner re-assigns it twice more (a `--hours` CLI override, then a base-10 coercion) — both lines are recorded so a third assignment cannot shadow the default unnoticed",
   },
   {
     name: "REAP_STUCK_HOURS",
@@ -564,7 +567,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: null,
     axis: "reap",
     guardedBy: NONE,
-    note: "DERIVED: defaults to 3× REAP_IDLE_HOURS, resolved at runtime",
+    overrides: ['REAP_STUCK_HOURS="$2"', "REAP_IDLE_HOURS * 3", "10#${REAP_STUCK_HOURS}"],
+    note: "DERIVED: defaults to 3× REAP_IDLE_HOURS, resolved at runtime; the three further assignments are the CLI override, the derivation and the coercion",
   },
   {
     name: "REAP_GRACE_SECONDS",
@@ -580,6 +584,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_MAX_HOURS:-1000000}",
     axis: "reap",
     guardedBy: NONE,
+    overrides: ["10#${REAP_MAX_HOURS}"],
   },
   {
     name: "REAP_LOCK_STALE_SECONDS",
@@ -617,6 +622,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_WT_AGED_DAYS:-7}",
     axis: "retention",
     guardedBy: NONE,
+    overrides: ['REAP_WT_AGED_DAYS="$2"'],
   },
   {
     name: "REAP_WT_MAX_DAYS",
@@ -739,8 +745,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     owners: ["extensions/builtin-tools/index.ts"],
     value: "= 60_000;",
     axis: "kill",
-    guardedBy: BT_TEST,
-    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test keeps it visible.",
+    guardedBy: NONE,
+    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test keeps it visible. It is also not referenced by name in any test — the registry's forward assertion is what pins the literal, hence NONE rather than BT_TEST.",
   },
   {
     name: "DEFAULT_HARD_CAP_MS",
@@ -755,8 +761,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     owners: ["extensions/builtin-tools/index.ts"],
     value: "= 0;",
     axis: "kill",
+    guardedBy: NONE,
+    note: "0 = the max-dispatch cap is OFF unless TASK_MAX_DISPATCH_MS supplies a positive finite value. Pinned by the registry's forward assertion (BT_TEST pins the getter's behaviour with a literal, not this constant).",
+  },
+  {
+    name: "getEffectiveCutGapMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
     guardedBy: BT_TEST,
-    note: "0 = the max-dispatch cap is OFF unless TASK_MAX_DISPATCH_MS supplies a positive finite value.",
+    note: "FUNCTION, not a const: the EFFECTIVE cut deadline the parser actually uses — getCutGapMs() scaled by system load (1×/2×/3× bands via loadScaledBound) and latched per dispatch. Registered separately from getCutGapMs because the runtime reads this one; recording only the base would record a bound up to 3× smaller than the effective one.",
   },
   {
     name: "getCutGapMs",

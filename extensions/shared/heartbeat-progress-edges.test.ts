@@ -437,13 +437,25 @@ test("every bound a kill clause NAMES is registered (clause → registry closure
   //
   // Extraction is deliberately conservative: an ALL-CAPS token containing an
   // underscore (so a tier label like `S` or the word `OFF` cannot match) or a
-  // `getXxx` accessor. `TASK_*` are ENV VARS, not declarations, so they are
-  // excluded — their default is the registered term beside them.
+  // `getXxx` accessor. Env var NAMES are allowed without registration via an
+  // explicit allowlist — NOT a `TASK_` prefix rule, which would have silently
+  // skipped `TASK_TOOL_STALL_FRACTION`, a real registered CONSTANT that happens
+  // to be named like an env var.
+  const ENV_ONLY = new Set([
+    "TASK_STREAM_STALL_MS",
+    "TASK_TOOL_STALL_MS",
+    "TASK_FIRST_MESSAGE_MS",
+    "TASK_MAX_DISPATCH_MS",
+    "TASK_HEARTBEAT_TIMEOUT_MS",
+    "TASK_HEARTBEAT_CUT_GAP_MS",
+    "TASK_HARD_CAP_MS",
+    "TASK_HEARTBEAT_INTERVAL_MS",
+  ]);
   const tokenRe = /\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b|\bget[A-Z][A-Za-z0-9]*\b/g;
   const missing: string[] = [];
   for (const clause of HEARTBEAT_KILL_REASONS) {
     const bound = KILL_REASON_BOUNDS[clause] ?? "";
-    const named = [...bound.matchAll(tokenRe)].map((m) => m[0]).filter((t) => !t.startsWith("TASK_"));
+    const named = [...bound.matchAll(tokenRe)].map((m) => m[0]).filter((t) => !ENV_ONLY.has(t));
     ok(
       named.length > 0,
       `${clause}: the clause names no bound that the registry can resolve — ${JSON.stringify(bound)}`,
@@ -457,6 +469,67 @@ test("every bound a kill clause NAMES is registered (clause → registry closure
     0,
     `these clauses name a bound that is NOT in STALL_TERM_REGISTRY (register it, or the declared clause vocabulary is not actually covered): ${missing.join(", ")}`,
   );
+});
+
+test("a term whose guardedBy cites a test file is actually referenced by that test", () => {
+  // `guardedBy` is metadata that a reader TRUSTS: it says which other pin holds
+  // this bound. It is prose, so it can lie (FIRST_OUTPUT_TIMEOUT_MS cited
+  // builtin-tools.test.ts, which never mentions it). When the string names a
+  // test file, that file must at least reference the term.
+  const offenders: string[] = [];
+  const cache = new Map<string, string>();
+  for (const t of STALL_TERM_REGISTRY) {
+    const m = /([A-Za-z0-9_./-]+\.(?:test|spec)\.[a-z]+)/.exec(t.guardedBy);
+    if (!m) continue; // NONE, or a free-form attribution with no file to check
+    const file = m[1];
+    let src = cache.get(file);
+    if (src === undefined) {
+      try {
+        src = yieldCommentLines(read(file), langOf(file));
+      } catch {
+        src = "";
+      }
+      cache.set(file, src);
+    }
+    if (src === "") {
+      offenders.push(`${t.name}: cites ${file} as its pin, but that file does not exist`);
+      continue;
+    }
+    const esc = t.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (!new RegExp(`\\b${esc}\\b`).test(src)) {
+      offenders.push(`${t.name}: cites ${file} as its pin, but that test never mentions ${t.name}`);
+    }
+  }
+  equal(offenders.length, 0, `guardedBy misattribution:\n  - ${offenders.join("\n  - ")}`);
+});
+
+test("every declaration a term models is checked, not just one (the shadowing hole)", () => {
+  // Reproduces the #1120 review finding: the forward check used `some()` over the
+  // declaration lines, so a SECOND, shadowing declaration of a registered bound
+  // left the gate green. It now requires the exact line count AND each override
+  // fragment.
+  const term = STALL_TERM_REGISTRY.find((t) => t.name === "REAP_IDLE_HOURS");
+  ok(term !== undefined, "REAP_IDLE_HOURS must be registered (it is a multi-declaration term)");
+  ok((term!.overrides ?? []).length >= 1, "REAP_IDLE_HOURS must record its extra declarations");
+  const owner = term!.owners[0];
+  const realSrc = read(owner);
+  equal(
+    forwardViolations([term!], () => realSrc).length,
+    0,
+    "the real owner file must satisfy the exact declaration-count + override rules",
+  );
+  // An UNRECORDED extra declaration is a violation...
+  const shadowed = `${realSrc}\nREAP_IDLE_HOURS=48\n`;
+  const v1 = forwardViolations([term!], () => shadowed);
+  ok(v1.length > 0 && v1[0].includes("declares it"), `an extra declaration must be a violation, got ${JSON.stringify(v1)}`);
+  // ...and so is a changed registered fragment on an override line.
+  const drifted = realSrc.replace('REAP_IDLE_HOURS="$2"', 'REAP_IDLE_HOURS="$9"');
+  const v2 = forwardViolations([term!], () => drifted);
+  ok(v2.length > 0 && v2[0].includes("override fragment"), `a changed override must be a violation, got ${JSON.stringify(v2)}`);
+  // And the default itself is still checked.
+  const changedDefault = realSrc.replace("${REAP_IDLE_HOURS:-24}", "${REAP_IDLE_HOURS:-48}");
+  const v3 = forwardViolations([term!], () => changedDefault);
+  ok(v3.length > 0 && v3[0].includes("registered value"), `a changed default must be a violation, got ${JSON.stringify(v3)}`);
 });
 
 test("every registered axis is a declared axis", () => {

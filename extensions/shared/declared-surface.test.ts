@@ -306,6 +306,36 @@ test("every owner of a multi-owner term is checked", () => {
   ok(v[0].startsWith("HEARTBEAT_MS: b.ts"), v[0]);
 });
 
+test("an extra declaration of a registered term is a violation, not a passing `some()` match", () => {
+  // The value check used to be satisfied by ANY one declaration line, so a
+  // second, shadowing declaration left the gate green. The count and the
+  // per-override fragments are now both asserted.
+  const term: StallTerm = {
+    name: "X_IDLE_HOURS",
+    owners: ["a.sh"],
+    value: "${X_IDLE_HOURS:-24}",
+    axis: "reap",
+    guardedBy: "none (test)",
+    overrides: ['X_IDLE_HOURS="$2"'],
+  };
+  const good = 'X_IDLE_HOURS="${X_IDLE_HOURS:-24}"\nX_IDLE_HOURS="$2"; shift 2 ;;\n';
+  equal(forwardViolations([term], () => good).length, 0, "the modelled pair must pass");
+  const extra = `${good}X_IDLE_HOURS=48\n`;
+  const v1 = forwardViolations([term], () => extra);
+  ok(v1.length > 0 && v1[0].includes("3 time(s)"), `an unrecorded third declaration must fail, got ${JSON.stringify(v1)}`);
+  const drift = good.replace('X_IDLE_HOURS="$2"', 'X_IDLE_HOURS="$9"');
+  const v2 = forwardViolations([term], () => drift);
+  ok(v2.length > 0 && v2[0].includes("override fragment"), `a changed override must fail, got ${JSON.stringify(v2)}`);
+  const defaultChange = good.replace("${X_IDLE_HOURS:-24}", "${X_IDLE_HOURS:-48}");
+  const v3 = forwardViolations([term], () => defaultChange);
+  ok(v3.length > 0 && v3[0].includes("registered value"), `a changed default must fail, got ${JSON.stringify(v3)}`);
+  // A term with NO overrides still requires exactly one declaration.
+  const bare: StallTerm = { ...term, name: "Y_IDLE_HOURS", value: "${Y_IDLE_HOURS:-3}", overrides: undefined };
+  equal(forwardViolations([bare], () => 'Y_IDLE_HOURS="${Y_IDLE_HOURS:-3}"\n').length, 0);
+  const v4 = forwardViolations([bare], () => 'Y_IDLE_HOURS="${Y_IDLE_HOURS:-3}"\nY_IDLE_HOURS=9\n');
+  ok(v4.length > 0 && v4[0].includes("2 time(s)"), `a second declaration must fail for a 1-declaration term, got ${JSON.stringify(v4)}`);
+});
+
 section("reverse violations");
 
 test("an unregistered in-family declaration is a violation", () => {

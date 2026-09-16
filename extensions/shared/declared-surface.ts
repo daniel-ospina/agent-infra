@@ -131,6 +131,18 @@ export interface StallTerm {
    * bounds.
    */
   value: string | null;
+  /**
+   * The fragments of the term's NON-default declaration lines, in source order
+   * (a CLI override, a `10#` coercion — shell scripts legitimately re-assign a
+   * bound more than once). When present, `forwardViolations` requires the owner
+   * file to declare the term EXACTLY `1 + overrides.length` times, with each
+   * line carrying its recorded fragment.
+   *
+   * This closes a false PASS the `some()` value check allowed: a second,
+   * shadowing declaration (or a changed default further down) left the registry
+   * green because only ONE of the declaration lines had to carry the value.
+   */
+  overrides?: readonly string[];
   /** Which axis the term answers to. Asserted against the owning module's declared axis set. */
   axis: string;
   /** Who actually pins this term's value today. */
@@ -291,8 +303,9 @@ export function inFamily(
 /**
  * Every declaration line for `symbol` in `src` (comment LINES blanked), in source
  * order. Plural because a shell script legitimately declares the same symbol
- * twice (a default near the top, a CLI override later) — the forward check
- * needs to see all of them, not whichever the regex happens to hit first.
+ * more than once (a default near the top, a CLI override, a `10#` coercion) —
+ * and `forwardViolations` checks EVERY one of them against the registry's
+ * `value` + `overrides` fragments, not whichever the regex hits first.
  */
 export function declarationLines(src: string, symbol: string, lang: SourceLang = "ts"): string[] {
   const stripped = yieldCommentLines(src, lang);
@@ -417,10 +430,28 @@ export function forwardViolations(
         out.push(`${term.name}: ${owner} no longer declares it (de-listed or renamed) — the registry says it does`);
         continue;
       }
-      if (term.value !== null && !lines.some((l) => l.includes(term.value as string))) {
+      // EVERY declaration line is checked, not just one: a second, shadowing
+      // declaration of the same bound used to leave this green as long as ANY
+      // line carried the registered fragment (a green gate over a wrong
+      // effective value).
+      const overrides = term.overrides ?? [];
+      if (lines.length !== 1 + overrides.length) {
+        out.push(
+          `${term.name}: ${owner} declares it ${lines.length} time(s) but the registry models ${1 + overrides.length} (1 default${overrides.length ? ` + ${overrides.length} override(s)` : ""}) — a declaration was added or removed without recording it (lines: ${JSON.stringify(lines)})`,
+        );
+        continue;
+      }
+      if (term.value !== null && !lines[0].includes(term.value)) {
         out.push(
           `${term.name}: ${owner} declares ${JSON.stringify(lines[0])}, which does not carry the registered value ${JSON.stringify(term.value)} — the value changed without updating the registry (or vice versa)`,
         );
+      }
+      for (let i = 0; i < overrides.length; i++) {
+        if (!lines[i + 1].includes(overrides[i])) {
+          out.push(
+            `${term.name}: ${owner} declaration #${i + 2} is ${JSON.stringify(lines[i + 1])}, which does not carry its registered override fragment ${JSON.stringify(overrides[i])} — record the override instead of letting it drift`,
+          );
+        }
       }
     }
   }
