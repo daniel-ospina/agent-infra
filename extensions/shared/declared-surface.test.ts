@@ -505,6 +505,36 @@ test("a symlinked entry and a depth-truncated subtree are reported, never silent
   }
 });
 
+test("a symlinked node_modules is NOT reported (the exclusion is by name, before the type check)", () => {
+  // Regression: `isDirectory()` is false for a symlink, so excluding
+  // `node_modules` only inside the directory branch reported a symlinked
+  // node_modules — routine under pnpm / npm workspaces / a developer's `ln -s`
+  // — as a DROPPED SUBTREE and failed the vacuity check on a healthy checkout.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "declared-surface-nm-"));
+  const errors: string[] = [];
+  try {
+    fs.mkdirSync(path.join(tmp, "real-nm"), { recursive: true });
+    fs.writeFileSync(path.join(tmp, "real-nm", "dep.ts"), "");
+    let linked = true;
+    try {
+      fs.symlinkSync(path.join(tmp, "real-nm"), path.join(tmp, "node_modules"));
+    } catch {
+      linked = false; // a platform without symlink permission — the name rule below still holds
+    }
+    const got = collectFiles(tmp, ".", (n) => n.endsWith(".ts"), 6, errors);
+    equal(
+      got.join(","),
+      "./real-nm/dep.ts",
+      `only the real directory may be walked (node_modules must not be), got ${JSON.stringify(got)}`,
+    );
+    if (linked) {
+      equal(errors.length, 0, `a symlinked node_modules must NOT be a walk error, got ${JSON.stringify(errors)}`);
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 section("Results");
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

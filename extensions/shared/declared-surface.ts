@@ -544,8 +544,13 @@ export function collectFiles(
     for (const e of entries) {
       const childRel = `${rel}/${e.name}`;
       // Explicit, bounded exclusions — never walk vendored or deprecated trees.
+      // The exclusion is by NAME and is applied BEFORE the type checks, because
+      // `isDirectory()` is false for a symlink: excluding `node_modules` only in
+      // the directory branch reported a symlinked `node_modules` (routine under
+      // pnpm, npm workspaces, or a developer's `ln -s`) as a DROPPED SUBTREE and
+      // failed the vacuity check on a perfectly healthy checkout.
+      if (e.name === "node_modules" || e.name === "_deprecated" || e.name.startsWith(".")) continue;
       if (e.isDirectory()) {
-        if (e.name === "node_modules" || e.name === "_deprecated" || e.name.startsWith(".")) continue;
         walk(childRel, d + 1);
       } else if (e.isSymbolicLink()) {
         // `isDirectory()` and `isFile()` are BOTH false for a symlink, so a
