@@ -368,15 +368,44 @@ test("a `NAME=` inside a quoted string is not a declaration (a log line, a regis
   );
 });
 
+test("a TS TEMPLATE or parameter mention is not a declaration (a deleted bound stays deleted)", () => {
+  // The loose name= boundary used to run over TS/JS too, so a template literal
+  // carried a fabricated declaration — and because it carried the registered
+  // value, deleting the REAL declaration still passed the forward check.
+  const t = { name: "DEFAULT_STREAM_STALL_MS", owners: ["x.ts"], value: "= 1_200_000;", axis: "kill", guardedBy: "none (test)" } as StallTerm;
+  for (const src of [
+    "const note = `DEFAULT_STREAM_STALL_MS = 1_200_000;`;\n",
+    'const note = "DEFAULT_STREAM_STALL_MS = 1_200_000;";\n',
+    "const f = (DEFAULT_STREAM_STALL_MS: number) => 1;\n",
+    "const x = { DEFAULT_STREAM_STALL_MS: 1 };\n",
+  ]) {
+    ok(
+      forwardViolations([t], () => src).length > 0,
+      `a mention must NOT satisfy the forward check: ${JSON.stringify(src)}`,
+    );
+    equal(scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => src).declarations.length, 0, src);
+  }
+  ok(
+    forwardViolations([t], () => "export const DEFAULT_STREAM_STALL_MS = 1_200_000;\n").length === 0,
+    "the real declaration must still satisfy it",
+  );
+});
+
 test("a numeric fragment cannot be extended into a different bound (whole-token match)", () => {
   // A raw `includes()` let the registered `=14` match `=140` and `|| 1_800_000`
-  // match `|| 1_800_000 * 2` — a false PASS on the value direction.
+  // match `|| 1_800_000 * 2` — a false PASS on the value direction. The guard
+  // refuses a token continuation AND any arithmetic continuation, symbolic
+  // operands included (`+ BUMP`, `% 7`, `| 0`).
   ok(carriesValue('IDLE_DAYS=14', "=14"));
   ok(!carriesValue('IDLE_DAYS=140', "=14"), "=14 must not match =140");
   ok(!carriesValue('IDLE_DAYS=1400', "=14"));
   ok(carriesValue('|| 1_800_000)', "|| 1_800_000"));
-  ok(!carriesValue('|| 1_800_000 * 2', "|| 1_800_000"), "a scaled value must not match the unscaled fragment");
-  ok(!carriesValue('|| 1_800_0000', "|| 1_800_000"));
+  for (const line of ["|| 1_800_000 * 2", "|| 1_800_000 + BUMP", "|| 1_800_000 % 7", "|| 1_800_000 | 0", "|| 1_800_0000", "|| 1_800_000 / 2", "|| 1_800_000 - 1"]) {
+    ok(!carriesValue(`${line})`, "|| 1_800_000"), `a scaled bound must not match the unscaled fragment: ${line}`);
+  }
+  // An identifier/`}` tail cannot be extended either.
+  ok(!carriesValue("REAP_IDLE_HOURS=$(( 10#${REAP_IDLE_HOURS}0 ))", "10#${REAP_IDLE_HOURS}"));
+  ok(carriesValue("REAP_IDLE_HOURS=$(( 10#${REAP_IDLE_HOURS} ))", "10#${REAP_IDLE_HOURS}"));
   // A non-numeric fragment keeps plain-substring semantics.
   ok(carriesValue('export const X = 21_600_000; // 6h', "= 21_600_000;"));
   const term: StallTerm = { name: "IDLE_DAYS", owners: ["x.sh"], value: "=14", axis: "retention", guardedBy: "none (test)" };

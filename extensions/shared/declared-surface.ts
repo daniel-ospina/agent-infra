@@ -278,14 +278,19 @@ function yieldOneLine(line: string, lang: SourceLang): string {
 const TS_DECL_RE =
   /(?:^|\n)[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*(?::[^\n]*?)?[ \t]*=/g;
 /**
- * Shell `NAME=`, `readonly NAME=`, `export NAME=`, `declare NAME=` — AT LINE START
- * or after any non-identifier character, because a shell script legitimately
- * assigns a bound inside a `case` arm (`--idle-days) IDLE_DAYS="$2"; shift 2 ;;`,
- * which is how two of the reaper scripts take their CLI override). A line-start
- * anchor missed those sites entirely, which made the exact-declaration-count rule
- * blind to them.
+ * Shell `NAME=` AT LINE START — the variant used for TS/JS sources, where a
+ * `NAME=` in the middle of a line is a mention (a template literal, a string, an
+ * object property), never a declaration.
  */
-const SH_DECL_RE = /(?:^|[^A-Za-z0-9_])(?:export[ \t]+|readonly[ \t]+|declare[ \t]+)?([A-Z_][A-Z0-9_]*)=/g;
+const SH_DECL_LINE_START = /(?:^|\n)[ \t]*(?:export[ \t]+|readonly[ \t]+|declare[ \t]+)?([A-Z_][A-Z0-9_]*)=/g;
+/**
+ * Shell `NAME=` after any NON-IDENTIFIER character — the variant used for `.sh`
+ * sources, where a script legitimately assigns a bound inside a `case` arm
+ * (`--idle-days) IDLE_DAYS="$2"; shift 2 ;;`, which is how two of the reaper
+ * scripts take their CLI override). A line-start anchor missed those sites, which
+ * made the exact-declaration-count rule blind to them.
+ */
+const SH_DECL_ANYWHERE = /(?:^|[^A-Za-z0-9_])(?:export[ \t]+|readonly[ \t]+|declare[ \t]+)?([A-Z_][A-Z0-9_]*)=/g;
 
 /**
  * True when `line` carries `fragment` as a WHOLE token.
@@ -293,16 +298,16 @@ const SH_DECL_RE = /(?:^|[^A-Za-z0-9_])(?:export[ \t]+|readonly[ \t]+|declare[ \
  * A raw `includes()` lets a numeric fragment be extended into a different bound:
  * a registered `|| 1_800_000` matched `|| 1_800_000 * 2`, and `=14` matched
  * `=140` — a false PASS in the one direction this module exists to close. So the
- * digit boundaries are anchored when the fragment itself starts or ends with a
- * digit (`_` counts, so `1_800_000` cannot be extended to `1_800_0000`), and an
- * ARITHMETIC continuation after a numeric tail is refused (`* 2`, `/ 2`) —
- * recording a scaled bound as if it were the bound is exactly the drift the
- * registry is for. A fragment that needs to describe an expression records the
- * WHOLE expression (as `WALL_CLOCK_STALL_MS` does).
+ * boundary after the fragment is refused when it would continue the same token or
+ * start an ARITHMETIC continuation of it (`*`, `/`, `%`, a bitwise operator, or
+ * `+`/`-` with any operand), and an identifier or `_` continuation is refused
+ * after an identifier/`}` tail. A fragment that needs to describe an expression
+ * records the WHOLE expression, as `WALL_CLOCK_STALL_MS` does.
  */
 export function carriesValue(line: string, fragment: string): boolean {
   let re = fragment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (/[0-9]$/.test(fragment)) re += "(?![0-9_])(?!\\s*[*/+-]\\s*[0-9])";
+  if (/[0-9]$/.test(fragment)) re += "(?![0-9_])(?!\\s*[*/+\\-%&|^<>])";
+  else if (/[A-Za-z0-9_$}]$/.test(fragment)) re += "(?![A-Za-z0-9_$])";
   if (/^[0-9]/.test(fragment)) re = `(?<![0-9_])${re}`;
   return new RegExp(re).test(line);
 }
@@ -367,7 +372,14 @@ function insideQuote(src: string, at: number): boolean {
 export function declarationLines(src: string, symbol: string, lang: SourceLang = "ts"): string[] {
   const stripped = yieldCommentLines(src, lang);
   const re = new RegExp(
-    `(?:^|[^A-Za-z0-9_])(?:export[ \\t]+|readonly[ \\t]+|declare[ \\t]+)?(?:const|let|var)?[ \\t]*${symbol}[ \\t]*(?::[^\\n]*?)?[ \\t]*=`,
+    lang === "sh"
+      ? `(?:^|[^A-Za-z0-9_])(?:export[ \\t]+|readonly[ \\t]+|declare[ \\t]+)?(?:const|let|var)?[ \\t]*${symbol}[ \\t]*=`
+      : // TS/JS: the `const|let|var` keyword is REQUIRED, and the name must start
+        // the line. Without the keyword, an annotated PARAMETER or an object
+        // PROPERTY matched (`(SYMBOL: number) =>`, `{ SYMBOL: 1 }`) and a
+        // `value: null` term passed the forward check with its real declaration
+        // deleted.
+        `(?:^|\\n)[ \\t]*(?:export[ \\t]+)?(?:const|let|var)[ \\t]+${symbol}[ \\t]*(?::[^\\n=;{}]*?)?[ \\t]*=(?!=)`,
     "g",
   );
   const out: string[] = [];
@@ -439,7 +451,7 @@ export function scanDeclarations(
     filesScanned++;
     const lang = langOf(file);
     const stripped = yieldCommentLines(src, lang);
-    const regexes = lang === "sh" ? [SH_DECL_RE] : [TS_DECL_RE, SH_DECL_RE];
+    const regexes = lang === "sh" ? [SH_DECL_ANYWHERE] : [TS_DECL_RE, SH_DECL_LINE_START];
     const seen = new Set<string>();
     for (const re of regexes) {
       re.lastIndex = 0;
