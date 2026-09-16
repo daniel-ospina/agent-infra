@@ -164,8 +164,11 @@ scoped explicitly:
   shipped and live files read clean. The guard walks the checkout for **any**
   `.pi/settings.json` (following symlinked `.pi` directories, depth-bounded) —
   including under `.worktrees/`, which is gitignored but *is* a live session cwd —
-  and fails closed on each one that carries `retry` or `httpIdleTimeoutMs`, or
-  that is unparseable, not a file, or not a JSON object. Scope boundary, stated
+  and fails closed on each one that carries `retry`, `httpIdleTimeoutMs` or
+  `compaction`, or that is unparseable, not a file, or not a JSON object.
+  (`compaction` counts because a project file can disable compaction or shrink
+  it exactly as it can revert `retry` — both are override-immune settings
+  classes, and leaving `compaction` out was a false PASS.) Scope boundary, stated
   plainly: the walk covers **one checkout**; a *different* repo's project
   settings are outside the reach of a guard run inside this one.
 - **Extension-registered providers.** An extension that builds its own undici

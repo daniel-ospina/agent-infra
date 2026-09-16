@@ -2289,9 +2289,10 @@ export interface HeartbeatDecisionInput {
 
   /** #318: network is unreachable (probe failed). When true AND heartbeat
    * markers are fresh, the waiting/stall clauses below are outage artifacts
-   * (the child's pi retries every ~5 min), not wedges — they are suppressed
-   * so the sub-agent survives the outage in place. Stale markers (dead
-   * child) or a reachable network fail open to the legacy decision. */
+   * (the child's pi retries on a uniform 1-min cadence after the quick
+   * attempts — `scripts/patch-pi-retry.sh`, #1088), not wedges — they are
+   * suppressed so the sub-agent survives the outage in place. Stale markers
+   * (dead child) or a reachable network fail open to the legacy decision. */
   networkDown?: boolean;
 
 }
@@ -3286,8 +3287,9 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // probe connectivity to the sub-agent's provider. When the network is
     // unreachable and the child is alive (fresh heartbeat markers), the
     // stall is the outage, not a wedge: skip the kill, keep the interval
-    // running, and let the child's own pi retry (quick attempts then every
-    // 5 min) resume when connectivity returns. Probe result cached per
+    // running, and let the child's own pi retry (quick attempts, then a
+    // uniform 1-min cadence, then the finite budget ends the turn visibly)
+    // resume when connectivity returns. Probe result cached per
     // dispatch (TASK_NETWORK_PROBE_CACHE_MS, default 15s) and only refreshed
     // on demand (kill imminent or recovery check while suppressed).
     // TASK_NETWORK_WAIT=0 disables (fail-open legacy behavior).

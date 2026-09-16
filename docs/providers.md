@@ -130,9 +130,12 @@ untouched. See PR #980 for the full rationale.
   drain (Issue A), dead-socket pool reuse (Issue B), `"terminated"` classification
   (Issue C). Filed by the orchestrator; the agent-infra mitigations make these
   non-blocking.
-- **Settings tuning (plan T3) — APPLIED (global only).** The orchestrator
-  applied `retry.provider.maxRetries` globally in `~/.pi/agent/settings.json`
-  alongside the pre-existing `retry.provider.timeoutMs: 600000`. Per-provider
+- **Settings tuning (plan T3) — SUPERSEDED by #1088.** The orchestrator applied
+  `retry.provider.maxRetries` globally in `~/.pi/agent/settings.json` alongside
+  the pre-existing `retry.provider.timeoutMs: 600000`; **#1088 pins it back to
+  absent/`0`** (provider-level retries multiply the calls inside one attempt, so
+  they are part of the hang window) and `scripts/check-cost-config.sh` blocks a
+  non-zero value — see `docs/ops/cost-config-policy.md` §2. Per-provider
   retry blocks (`providers.qwen.retry.*`) are **not supported**: pi's
   settings-manager `getProviderRetrySettings()` reads global `retry.provider.*`
   only (Q2 answered — verified in `dist/core/settings-manager.js`), so retry

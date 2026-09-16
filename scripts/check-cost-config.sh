@@ -454,7 +454,7 @@ for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
     if not isinstance(d, dict):
         out.append(f"{p}\tNOT_AN_OBJECT")
         continue
-    keys = [k for k in ("retry", "httpIdleTimeoutMs") if k in d]
+    keys = [k for k in ("retry", "httpIdleTimeoutMs", "compaction") if k in d]
     out.append(f"{p}\t{', '.join(keys)}")
 print("\n".join(out))
 PYEOF
@@ -467,11 +467,11 @@ PYEOF
     [ -n "$path" ] || continue
     case "$hit" in
       "")
-        ok "project settings ($path) does not touch the retry contract" ;;
+        ok "project settings ($path) does not touch the retry/compaction contract" ;;
       PARSE_ERROR:*|NOT_A_FILE|NOT_AN_OBJECT)
-        block_retry "project settings ($path) is $hit — cannot assert the retry contract against a file pi merges over the global settings" ;;
+        block_settings "project settings ($path) is $hit — cannot assert the retry/compaction contract against a file pi merges over the global settings" ;;
       *)
-        block_retry "project settings ($path) overrides the retry contract ($hit) — pi merges project settings OVER the global ones, so this silently reverts the shipped contract; remove the key here" ;;
+        block_settings "project settings ($path) overrides the settings contract ($hit) — pi merges project settings OVER the global ones, so this silently reverts the shipped contract; remove the key here" ;;
     esac
   done <<< "$listing"
 }

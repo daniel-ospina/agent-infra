@@ -594,6 +594,23 @@ assert any(re.search(rf"\|[^\n]*patch-pi-retry\.sh[^\n]*\|\s*`{cap}`\s*\|", ln) 
 ceiling_min = str(int(const("HANG_WINDOW_CEILING_MS")) // 60000)
 assert f"{ceiling_min}-minute" in sec2, f"§2 must state the {ceiling_min}-minute hang-window ceiling"
 assert "#1088" in sec2, "§2 must cite issue #1088"
+# §2 is the SINGLE SOURCE for the derived durations — test 25 bans them from the
+# summary docs, so nothing else would notice if §2's own numbers went stale.
+_n = int(const("RETRY_MAX_RETRIES")); _idle = int(const("HTTP_IDLE_TIMEOUT_MS"))
+_base = int(const("RETRY_BASE_DELAY_MS")); _cap = int(cap)
+_ptimeout = int(const("RETRY_PROVIDER_TIMEOUT_MS"))
+backoff = sum(min(_base * 2 ** i, _cap) for i in range(_n))
+hang = (_n + 1) * _idle + backoff
+worst = (_n + 1) * _ptimeout + backoff
+for form, label in ((f"{hang:,} ms", "no-progress window (ms)"),
+                    (f"{hang / 60000:.1f} min", "no-progress window (min)"),
+                    (f"{worst:,} ms", "worst-case window (ms)"),
+                    (f"{worst / 60000:.0f} min", "worst-case window (min)"),
+                    (f"{backoff // 1000} s", "transient ladder (s)")):
+    assert form in sec2, f"§2 must state the derived {label} ({form!r})"
+worst_ceiling_min = str(int(const("WORST_WINDOW_CEILING_MS")) // 60000)
+assert f"{worst_ceiling_min}-minute" in sec2, \
+    f"§2 must state the {worst_ceiling_min}-minute worst-case ceiling"
 print(f"OK §2 pins maxRetries={const('RETRY_MAX_RETRIES')}, idle={const('HTTP_IDLE_TIMEOUT_MS')}, "
       f"cap={cap} (patch-pi-retry.sh), ceiling={ceiling_min} min, cites #1088")
 PY
@@ -632,12 +649,24 @@ echo '{"retry":{"maxRetries":3}}' >"$TMP21/.pi/settings.json"
 bash "$TMP21/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "project settings reverting the contract → exit 1"; else fail "expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
-if grep -q "project settings" "$OUT" && grep -q "overrides the retry contract" "$OUT"; then pass "project-settings block message present"; else fail "expected the project-settings message"; sed -n '1,30p' "$OUT"; fi
+if grep -q "project settings" "$OUT" && grep -q "overrides the settings contract" "$OUT"; then pass "project-settings block message present"; else fail "expected the project-settings message"; sed -n '1,30p' "$OUT"; fi
 # an unparseable project settings file must fail closed too
 printf '{ not json' >"$TMP21/.pi/settings.json"
 bash "$TMP21/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "unparseable project settings → exit 1 (fail-closed)"; else fail "expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+# ...and so must a compaction-only project file: `compaction` is settings-class,
+# which this PR made override-immune, so a project file reverting it is the SAME
+# defect class as reverting `retry` (cycle-5 review P1: `compaction` was not in
+# the key tuple, so the guard reported "does not touch the retry contract").
+echo '{"compaction":{"enabled":false,"reserveTokens":4096}}' >"$TMP21/.pi/settings.json"
+bash "$TMP21/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "compaction-only project settings → exit 1"; else fail "expected exit 1 for a compaction-only project settings file, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q 'compaction' "$OUT"; then pass "the block names the offending key"; else fail "expected 'compaction' named in the block"; sed -n '1,30p' "$OUT"; fi
+COST_CLAMP_OVERRIDE=1 bash "$TMP21/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "compaction-only project settings + override → still exit 1"; else fail "expected exit 1 under the override, got $code"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP21"
 
 echo ""
@@ -691,7 +720,7 @@ if [ "$code" -eq 0 ]; then
 else
   fail "expected exit 0, got $code"; sed -n '1,30p' "$OUT"
 fi
-scanned="$(grep -c "does not touch the retry contract" "$OUT")"
+scanned="$(grep -c "does not touch the retry/compaction contract" "$OUT")"
 if [ "$scanned" -eq 2 ]; then pass "both nested project files were walked (subdir + .worktrees)"; else fail "expected 2 walked project files, saw $scanned — the walk missed one"; sed -n '1,30p' "$OUT"; fi
 echo '{"retry":{"maxRetries":3}}' >"$TMP23/extensions/.pi/settings.json"
 bash "$TMP23/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
@@ -802,11 +831,31 @@ WORST_MS = (N + 1) * PROV + BACKOFF
 # contract changes: restating a duration in a summary doc is the defect, whatever
 # the duration currently is. The two trailing phrase forms catch a restatement
 # carrying a WRONG number ("...window is ~40 min"), which the literals cannot.
-BANNED = (f"{HANG_MS // 60000} min", f"{WORST_MS // 60000} min",
-          f"{BACKOFF // 60000} min retry ladder",
-          f"{HANG_MS:,}", f"{HANG_MS}", f"{WORST_MS:,}", f"{WORST_MS}", f"{BACKOFF // 1000} s",
-          "no-progress window is ~", "retry ladder is ~")
+# Durations are matched as PATTERNS, not literals: a copy-paste of §2's own
+# rendering ("43.0 min", "43 minutes", "~43-minute") must not slip past a ban
+# that only knows "43 min". Millisecond forms are matched in both plain and
+# comma-grouped spellings. The two phrase forms catch a restatement carrying a
+# WRONG number, which no value-derived pattern can.
+def _dur(ms, unit="min"):
+    """Match a prose duration: "43 min" / "43.0 min" / "43-minute" / "182 s"."""
+    v = int(ms / 60000) if unit == "min" else int(ms / 1000)
+    tail = r"min(?:ute)?s?" if unit == "min" else r"sec(?:ond)?s?"
+    return re.compile(rf"(?<![\d.]){v}(?:\.\d+)?[\s-]*{tail}\b")
+BANNED_RE = (
+    (_dur(HANG_MS), f"no-progress window ({HANG_MS // 60000} min)"),
+    (_dur(WORST_MS), f"worst case ({WORST_MS // 60000} min)"),
+    (_dur(BACKOFF, "s"), f"retry ladder ({BACKOFF // 1000} s)"),
+    (re.compile(rf"(?<![\d.]){HANG_MS:,}(?![\d])"), "no-progress window (ms)"),
+    (re.compile(rf"(?<![\d.]){HANG_MS}(?![\d])"), "no-progress window (ms)"),
+    (re.compile(rf"(?<![\d.]){WORST_MS:,}(?![\d])"), "worst case (ms)"),
+    (re.compile(rf"(?<![\d.]){WORST_MS}(?![\d])"), "worst case (ms)"),
+    (re.compile(r"no-progress window is ~"), "no-progress window (restated)"),
+    (re.compile(r"retry ladder is ~"), "retry ladder (restated)"),
+)
 SUMMARY_DOCS = ("docs/providers.md", "docs/upstream-pi-bugs.md")
+# Dated snapshots (plans / research notes committed at a point in time) record
+# what the fleet ran THEN; they are not current-state docs and are not edited.
+SNAPSHOT_DIRS = ("docs/plans/", "docs/research/")
 
 bad = []
 for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
@@ -822,36 +871,43 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
             # per-call ceiling is only legitimate on such a line when the SAME
             # line names the per-call key it belongs to — otherwise it is this
             # key's pre-#1088 value (600000) and it is stale.
-            for m in re.finditer(r"httpIdleTimeoutMs[^0-9\n]{0,6}(\d{5,7})", line):
+            snap = rel.startswith(SNAPSHOT_DIRS)
+            for m in (() if snap else re.finditer(r"httpIdleTimeoutMs[^0-9\n]{0,6}(\d{5,7})", line)):
                 v = m.group(1)
-                ok = (v == idle) or (v == clamp) or \
-                     (v == prov and "provider.timeoutMs" in line)
-                if not ok:
+                # No carve-out for the per-call value: a line may name both
+                # knobs, but 600000 attached to the IDLE key is that key's
+                # pre-#1088 value wherever it appears. Dated snapshots are
+                # skipped wholesale (SNAPSHOT_DIRS below).
+                if v not in (idle, clamp):
                     bad.append(f"{rel}:{ln} states httpIdleTimeoutMs {v} "
                                f"(contract idle={IDLE}, per-call={PROV})")
             # (2) the backoff cap, restated in prose as a duration.
-            m = re.search(r"(\d+)-minute capped retry", line)
+            m = None if snap else re.search(r"(\d+)-minute capped retry", line)
             if m and int(m.group(1)) * 60000 != CAP:
                 bad.append(f"{rel}:{ln} says '{m.group(1)}-minute capped retry' "
                            f"but the cap is {CAP}ms")
             # (3) the fleet's live idle value, named in passing (the exact drift
             # this pin exists for — it was 600000 in three places after #1088).
-            m = re.search(r"the fleet runs (\d+)", line)
+            m = None if snap else re.search(r"the fleet runs (\d+)", line)
             if m and m.group(1) != str(IDLE):
                 bad.append(f"{rel}:{ln} says 'the fleet runs {m.group(1)}' "
                            f"but the contract idle ceiling is {IDLE}")
             # (4) the summary docs must not restate a derived duration at all.
+            if snap:
+                continue
             if rel in SUMMARY_DOCS:
-                for tok in BANNED:
-                    if tok in line:
-                        bad.append(f"{rel}:{ln} restates the derived figure '{tok}' — "
-                                   f"those live only in docs/ops/cost-config-policy.md §2")
+                for rx, what in BANNED_RE:
+                    m = rx.search(line)
+                    if m:
+                        bad.append(f"{rel}:{ln} restates the derived {what} as "
+                                   f"'{m.group(0).strip()}' — those live only in "
+                                   f"docs/ops/cost-config-policy.md §2")
 if bad:
     print("❌ " + "\n❌ ".join(bad))
     sys.exit(1)
 print(f"OK no stale retry/hang numbers (idle={IDLE}, per-call={PROV}, cap={CAP}); derived durations "
       f"single-sourced in §2, absent from {len(SUMMARY_DOCS)} summary docs "
-      f"(banned {len(BANNED)} figures/forms derived from the guard)")
+      f"(banned {len(BANNED_RE)} derived figures/forms)")
 PY
 if [ $? -eq 0 ]; then pass "$(cat "$OUT")"; else fail "stale retry/hang number in a doc: $(cat "$OUT")"; fi
 
