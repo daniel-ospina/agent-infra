@@ -318,18 +318,25 @@ retry.
 ### Expected behavior
 Add a configurable agent-level max retry delay, e.g. `retry.maxDelayMs`
 (default: none → current exponential behavior), so
-`delayMs = min(baseDelayMs * 2^(attempt-1), maxDelayMs)`. With
-`retry.maxRetries` raised this yields "quick retries, then every N seconds
-indefinitely" — a session pauses through an outage and resumes automatically
-when connectivity returns. The retry should stay abortable (Esc /
-`abort_retry`), and long retry sleeps should not block compaction/summarization
-lifecycle events.
+`delayMs = min(baseDelayMs * 2^(attempt-1), maxDelayMs)`. This yields "quick
+retries, then every N seconds" for a **finite, operator-chosen** budget — a
+session pauses through a short outage and resumes automatically when
+connectivity returns, and terminates visibly (rather than spinning) once the
+budget is spent. The retry should stay abortable (Esc / `abort_retry`), and
+long retry sleeps should not block compaction/summarization lifecycle events.
+A wall-clock deadline (`retry.deadlineMs`) would be better still than an
+attempt count: an attempt count cannot express "give up after N minutes" when
+each attempt may itself burn the full provider timeout (#1088).
 
 ### Mitigation in agent-infra (already shipped)
-- `scripts/patch-pi-retry.sh` caps the backoff at 5 min in both files (wired
+- `scripts/patch-pi-retry.sh` caps the backoff at 1 min in both files (wired
   into `pi-bootstrap/setup.sh`, re-applied on every sync; see
   `docs/providers.md §6`).
-- `retry.maxRetries: 10000` in `~/.pi/agent/settings.json`.
+- `retry.maxRetries: 7` + `httpIdleTimeoutMs: 180000` in the shipped
+  `pi-bootstrap/pi-config/settings.json` → bounded ~27 min no-progress window,
+  asserted (not just documented) by `scripts/check-cost-config.sh`; see
+  `docs/ops/cost-config-policy.md` §2. The budget is finite because #1110
+  (below) makes retries able to *succeed* again.
 - `extensions/builtin-tools/index.ts` suppresses task-tool sub-agent kills
   while the network is unreachable (fresh heartbeat markers prove the child is
   alive and retrying, not wedged).

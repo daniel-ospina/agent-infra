@@ -15,7 +15,16 @@
 #      (also: matcher negatives kimi-k3 + deepseek-chat-v3.2 never flagged;
 #      `~deepseek` alias + vision-exp covered)
 #   4. settings.json missing compaction block      → BLOCK (exit 1)
-#   5. settings.json retry.maxRetries != 10000     → BLOCK (exit 1)
+#   5. settings.json retry.maxRetries != 7         → BLOCK (exit 1)
+#      + the derived retry/hang window (#1088): the guard asserts the exact
+#      contract values AND the window computed from them + patch-pi-retry.sh's
+#      backoff cap, so guard / settings / patch / doc cannot disagree.
+#  15. derived window: guard constants vs independent recomputation (ship-tree)
+#  16. DERIVED check in isolation: constants and settings both moved to 8
+#      retries (exact-value checks green) → window ceiling still BLOCKs
+#  17. patch-pi-retry.sh cap drift (60000 → 300000) → BLOCK
+#  18. patch-pi-retry.sh absent → fail-closed BLOCK (window uncomputable)
+#  19. policy doc §2 carries the same numbers as the guard (doc↔guard pin)
 #   6. COST_CLAMP_OVERRIDE=1                       → exit 0 + loud notice
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
@@ -56,6 +65,28 @@ if [ -z "$CLAMP_EXPECTED" ]; then
   echo "❌ could not read CLAMP= from $GUARD — the fixture controls assert against it."
   exit 1
 fi
+
+# Same discipline for the #1088 retry/hang contract: every one of these is read
+# back out of the guard so tests 15-19 cannot be satisfied by a stale copy.
+for _c in RETRY_MAX_RETRIES HTTP_IDLE_TIMEOUT_MS RETRY_BASE_DELAY_MS \
+          RETRY_MAX_BACKOFF_MS RETRY_PROVIDER_TIMEOUT_MS \
+          HANG_WINDOW_CEILING_MS WORST_WINDOW_CEILING_MS; do
+  if ! sed -n "s/^${_c}=\([0-9][0-9]*\)$/\1/p" "$GUARD" | head -1 | grep -q .; then
+    echo "❌ could not read ${_c}= from $GUARD — the retry-contract assertions need it."
+    exit 1
+  fi
+done
+
+# mkroot <dir> — a self-contained guard root (guard + patch script + configs)
+# so mutation tests can perturb one input without touching the repo.
+mkroot() {
+  local root="$1"
+  mkdir -p "$root/scripts" "$root/pi-bootstrap/pi-config"
+  cp "$GUARD" "$root/scripts/check-cost-config.sh"
+  cp "$ROOT/scripts/patch-pi-retry.sh" "$root/scripts/patch-pi-retry.sh"
+  cp "$FIX/clean/models.json" "$FIX/clean/models-store.json" "$FIX/clean/settings.json" \
+     "$root/pi-bootstrap/pi-config/"
+}
 
 # Guard: never modify fixtures. Fail early if the fixture tree is dirty
 # (same clobber-protection as tests/drift/run.sh).
@@ -130,9 +161,9 @@ run_guard 1 "backdoor-settings" --live-dir "$FIX/backdoor-settings"
 if grep -q "compaction.reserveTokens" "$OUT"; then pass "compaction drift flagged"; else fail "expected compaction message"; tail -20 "$OUT"; fi
 
 echo ""
-echo "5. settings.json retry.maxRetries != 10000 → BLOCK, exit 1"
+echo "5. settings.json retry.maxRetries != 7 → BLOCK, exit 1"
 run_guard 1 "backdoor-retry" --live-dir "$FIX/backdoor-retry"
-if grep -q "retry.maxRetries expected 10000" "$OUT"; then pass "retry drift flagged"; else fail "expected retry message"; tail -20 "$OUT"; fi
+if grep -q "retry.maxRetries expected 7" "$OUT"; then pass "retry drift flagged"; else fail "expected retry message"; tail -20 "$OUT"; fi
 
 echo ""
 echo "6. COST_CLAMP_OVERRIDE=1 silences the block (escape hatch)"
@@ -408,6 +439,145 @@ while IFS= read -r line; do
 done <"$OUT"
 
 echo ""
+echo "15. derived retry/hang window — guard constants vs independent arithmetic"
+bash "$GUARD" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "ship-tree guard run exits 0"; else fail "ship-tree guard run expected exit 0, got $code"; sed -n '1,40p' "$OUT"; fi
+python3 - "$GUARD" "$OUT" "$ROOT/pi-bootstrap/pi-config/settings.json" >"$OUT.window" 2>&1 <<'PY'
+import json, re, sys
+guard_src = open(sys.argv[1]).read()
+out = open(sys.argv[2]).read()
+settings = json.load(open(sys.argv[3]))
+
+def const(name):
+    m = re.search(rf'^{name}=(\d+)$', guard_src, re.M)
+    return int(m.group(1)) if m else None
+
+n = const("RETRY_MAX_RETRIES"); idle = const("HTTP_IDLE_TIMEOUT_MS")
+base = const("RETRY_BASE_DELAY_MS"); cap = const("RETRY_MAX_BACKOFF_MS")
+ptimeout = const("RETRY_PROVIDER_TIMEOUT_MS")
+hangceil = const("HANG_WINDOW_CEILING_MS"); worstceil = const("WORST_WINDOW_CEILING_MS")
+assert all(v is not None for v in (n, idle, base, cap, ptimeout, hangceil, worstceil)), \
+    "guard retry-contract constants are missing"
+
+# Coupling 1: the SHIPPED settings values must equal the guard's pinned values.
+assert settings["retry"]["maxRetries"] == n, "shipped maxRetries != guard RETRY_MAX_RETRIES"
+assert settings["httpIdleTimeoutMs"] == idle, "shipped httpIdleTimeoutMs != guard HTTP_IDLE_TIMEOUT_MS"
+assert settings["retry"]["baseDelayMs"] == base, "shipped baseDelayMs != guard RETRY_BASE_DELAY_MS"
+assert settings["retry"]["provider"]["timeoutMs"] == ptimeout, \
+    "shipped provider.timeoutMs != guard RETRY_PROVIDER_TIMEOUT_MS"
+
+# Coupling 2: independent recomputation of the window the guard claims to enforce.
+backoff, v, i = 0, base, 0
+while i < n:
+    if v >= cap:
+        backoff += cap * (n - i); break
+    backoff += v; v *= 2; i += 1
+hang = (n + 1) * idle + backoff
+worst = (n + 1) * ptimeout + backoff
+m = re.search(r'hung (\d+)ms / worst (\d+)ms', out)
+assert m, "the guard's PASS line did not report the derived window"
+gh, gw = map(int, m.groups())
+assert (gh, gw) == (hang, worst), \
+    f"guard window {gh}/{gw} != independently computed {hang}/{worst}"
+
+# Coupling 3: the declared ceilings actually bind the recomputed window.
+assert hang <= hangceil, f"hang window {hang}ms exceeds declared ceiling {hangceil}ms"
+assert worst <= worstceil, f"worst window {worst}ms exceeds declared ceiling {worstceil}ms"
+# Coupling 4: the silent-hang ceiling must fire before the per-call ceiling.
+assert ptimeout > idle, "per-call ceiling must exceed the idle (silent-hang) ceiling"
+print(f"OK {n} retries, idle {idle}ms, cap {cap}ms -> hung {hang}ms ({hang/60000:.1f} min) "
+      f"<= {hangceil}ms; worst {worst}ms ({worst/60000:.1f} min) <= {worstceil}ms")
+PY
+if [ $? -eq 0 ]; then pass "$(cat "$OUT.window")"; else fail "window derivation mismatch: $(cat "$OUT.window")"; fi
+rm -f "$OUT.window"
+
+echo ""
+echo "16. DERIVED check in isolation — constants and settings both at 8 retries"
+# The exact-value checks must stay green here: what fires is the window ceiling.
+# This is the check the pre-#1088 guard lacked (it pinned the count alone).
+TMP16="$(mktemp -d /tmp/cost-config-window.XXXXXX)"
+mkroot "$TMP16"
+python3 - "$TMP16/scripts/check-cost-config.sh" "$TMP16/pi-bootstrap/pi-config/settings.json" <<'PY'
+import json, sys
+g, s = sys.argv[1], sys.argv[2]
+src = open(g).read()
+assert "RETRY_MAX_RETRIES=7" in src, "guard constant shape changed — update this test"
+open(g, "w").write(src.replace("RETRY_MAX_RETRIES=7", "RETRY_MAX_RETRIES=8"))
+d = json.load(open(s)); d["retry"]["maxRetries"] = 8
+open(s, "w").write(json.dumps(d, indent=2) + "\n")
+PY
+bash "$TMP16/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "aligned 8-retry constant still BLOCKs (window over ceiling)"; else fail "expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -qE 'hang window [0-9]+ms.*exceeds the declared ceiling' "$OUT"; then pass "hang-window ceiling message present"; else fail "expected the hang-window ceiling message (not the worst-case one)"; sed -n '1,30p' "$OUT"; fi
+if grep -q "maxRetries expected" "$OUT"; then fail "the exact-value check fired — test 16 must isolate the DERIVED check"; else pass "exact-value checks stayed green (derived check is what fired)"; fi
+rm -rf "$TMP16"
+
+echo ""
+echo "17. patch-pi-retry.sh backoff cap drift → BLOCK (guard↔patch coupling)"
+TMP17="$(mktemp -d /tmp/cost-config-patchcap.XXXXXX)"
+mkroot "$TMP17"
+python3 - "$TMP17/scripts/patch-pi-retry.sh" <<'PY'
+import sys
+p = sys.argv[1]; src = open(p).read()
+needle = "PI_MAX_RETRY_DELAY_MS:-60000"
+assert needle in src, "patch cap default shape changed — update this test"
+open(p, "w").write(src.replace(needle, "PI_MAX_RETRY_DELAY_MS:-300000"))
+PY
+bash "$TMP17/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "cap drift → exit 1"; else fail "expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "backoff cap expected 60000, got 300000" "$OUT"; then pass "cap-drift message present"; else fail "expected the cap-drift message"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP17"
+
+echo ""
+echo "18. patch-pi-retry.sh absent → fail-closed BLOCK (window uncomputable)"
+TMP18="$(mktemp -d /tmp/cost-config-nopatch.XXXXXX)"
+mkroot "$TMP18"
+rm -f "$TMP18/scripts/patch-pi-retry.sh"
+bash "$TMP18/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "missing patch script → exit 1"; else fail "expected exit 1, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "backoff cap unreadable" "$OUT"; then pass "fail-closed message present"; else fail "expected the fail-closed message"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP18"
+
+echo ""
+echo "19. policy doc §2 carries the guard's contract numbers (doc↔guard pin)"
+python3 - "$GUARD" "$ROOT/docs/ops/cost-config-policy.md" >"$OUT" 2>&1 <<'PY'
+import re, sys
+guard_src = open(sys.argv[1]).read()
+doc = open(sys.argv[2]).read()
+
+def const(name):
+    m = re.search(rf'^{name}=(\d+)$', guard_src, re.M)
+    return m.group(1) if m else None
+
+m = re.search(r'^## 2\..*?^(?=## )', doc, re.M | re.S)
+assert m, "§2 not found in docs/ops/cost-config-policy.md"
+sec2 = m.group(0)
+
+pairs = [("retry.maxRetries", const("RETRY_MAX_RETRIES")),
+         ("httpIdleTimeoutMs", const("HTTP_IDLE_TIMEOUT_MS")),
+         ("retry.baseDelayMs", const("RETRY_BASE_DELAY_MS")),
+         ("retry.provider.timeoutMs", const("RETRY_PROVIDER_TIMEOUT_MS"))]
+# Require at least one §2 line that carries BOTH the knob and the guard's
+# current value, so moving either one alone turns this red (sabotage-proved by
+# test 19's table-row mutation in review).
+for key, val in pairs:
+    assert any(key in ln and val in ln for ln in sec2.splitlines()), \
+        f"§2 has no line carrying {key} with the guard's value {val}"
+cap = const("RETRY_MAX_BACKOFF_MS")
+assert any("patch-pi-retry.sh" in ln and cap in ln for ln in sec2.splitlines()), \
+    f"§2 must tie the {cap}ms backoff cap to patch-pi-retry.sh"
+ceiling_min = str(int(const("HANG_WINDOW_CEILING_MS")) // 60000)
+assert f"{ceiling_min}-minute" in sec2, f"§2 must state the {ceiling_min}-minute hang-window ceiling"
+assert "#1088" in sec2, "§2 must cite issue #1088"
+print(f"OK §2 pins maxRetries={const('RETRY_MAX_RETRIES')}, idle={const('HTTP_IDLE_TIMEOUT_MS')}, "
+      f"cap={cap} (patch-pi-retry.sh), ceiling={ceiling_min} min, cites #1088")
+PY
+if [ $? -eq 0 ]; then pass "$(cat "$OUT")"; else fail "doc↔guard coupling broken: $(cat "$OUT")"; fi
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"
   exit 0

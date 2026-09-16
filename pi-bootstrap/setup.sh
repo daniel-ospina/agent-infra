@@ -193,13 +193,15 @@ else
   echo "    warning: npm not found - extension deps skipped (mcp-client/builtin-tools/loop-enforcer may not load)"
 fi
 
-# Offline-resume retry patch (idempotent, #318): cap pi's agent-level retry
-# backoff at 5 min so sessions survive network outages instead of stopping
-# after 3 quick retries. Re-applied on every sync so a `pi update` that
+# Bounded retry patch (idempotent, #318/#1088): cap pi's agent-level retry
+# backoff at 1 min so the retry ladder is uniform, and keep the budget finite
+# (settings.json `retry.maxRetries: 7` + `httpIdleTimeoutMs: 180000`) so a
+# persistent failure ends the turn visibly instead of spinning for days.
+# Re-applied on every sync so a `pi update` that
 # rewrites the dist can't silently lose the patch. Non-zero (pi missing /
 # patch target changed by an upgrade) is a warning, not an abort — the
 # message is the diagnostic; re-run after a pi update if it failed.
-echo "==> Offline-resume retry patch"
+echo "==> Bounded retry patch"
 if [ -x "$INFRA_ROOT/scripts/patch-pi-retry.sh" ]; then
   if bash "$INFRA_ROOT/scripts/patch-pi-retry.sh"; then
     echo "    retry patch: ok"
@@ -208,7 +210,7 @@ if [ -x "$INFRA_ROOT/scripts/patch-pi-retry.sh" ]; then
     echo "      $INFRA_ROOT/scripts/patch-pi-retry.sh"
   fi
 else
-  echo "    WARNING: scripts/patch-pi-retry.sh missing — offline-resume retry patch NOT applied (sessions still stop after 3 quick retries on network loss)."
+  echo "    WARNING: scripts/patch-pi-retry.sh missing — bounded retry patch NOT applied (sessions stop after 3 quick retries on network loss)."
 fi
 
 # Small config / rules files

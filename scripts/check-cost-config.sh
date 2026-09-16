@@ -9,7 +9,12 @@
 # Semantics (detect-not-block for the catalog class — a hard red on the store
 # would break auto-sync when pi's refresh legitimately reverts it):
 #   models.json    drift (any deepseek-served id > 300000)  → BLOCK (exit 1)
-#   settings.json  drift (compaction block / retry contract) → BLOCK (exit 1)
+#   settings.json  drift (compaction block / settings-vs-guard
+#                  mismatch, or a DERIVED retry/hang window over
+#                  ceiling)                                  → BLOCK (exit 1)
+#   patch-pi-retry.sh backoff cap != the guard's cap           → BLOCK (exit 1)
+#     (unreadable/missing patch script = fail-closed BLOCK — the
+#      window arithmetic cannot be asserted without it)
 #   models-store.json drift                                   → WARN (detected)
 #   MISSING shipped models.json / settings.json              → BLOCK (the
 #     clamp authority deleted = clamp gone while CI stays green)
@@ -39,7 +44,42 @@ set -uo pipefail
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 required (stdlib only) — present on ubuntu-latest + macOS" >&2; exit 2; }
 
 CLAMP=300000
+
+# ── retry/hang contract (#1088) — the bounded-retry window ────────────────
+# `retry.maxRetries` is an ATTEMPT budget with no wall-clock deadline in pi,
+# so the session's real exposure is (maxRetries+1) x per-attempt ceiling
+# + sum(backoff). Pinning the count alone (the pre-#1088 guard) let a
+# 10000-attempt x 10-min x 5-min-backoff product (34-104 days) stay green.
+# Every number below is therefore asserted BOTH by exact value AND through
+# the derived window: change one without the others and this guard fires.
+#
+#   HTTP_IDLE_TIMEOUT_MS       the SILENT-HANG ceiling — undici's
+#                              headers/body idle timeout (a hung attempt
+#                              emits no bytes; this fires long before the
+#                              SDK's total request timeout). #1088's measured
+#                              signature is exactly this mode: 0 B of socket
+#                              traffic on a session that never terminates.
+#   RETRY_PROVIDER_TIMEOUT_MS  the legitimate-call ceiling (SDK total request
+#                              timeout). Must EXCEED the idle ceiling so a hung
+#                              attempt is cut by idle, not by the full budget;
+#                              must stay high enough that a 300K-context
+#                              compaction/summarization is not false-killed.
+#   RETRY_MAX_BACKOFF_MS       the patch's backoff cap (read back out of
+#                              scripts/patch-pi-retry.sh — one source of truth).
+#   HANG_WINDOW_CEILING_MS     declared bound on the no-progress window.
+#   WORST_WINDOW_CEILING_MS    declared bound on the total-timeout window
+#                              (every attempt burns its full SDK ceiling).
+# Recompute after ANY change with:
+#   bash scripts/check-cost-config.sh --live-dir pi-bootstrap/pi-config
+HTTP_IDLE_TIMEOUT_MS=180000
+RETRY_MAX_RETRIES=7
+RETRY_BASE_DELAY_MS=2000
+RETRY_MAX_BACKOFF_MS=60000
+RETRY_PROVIDER_TIMEOUT_MS=600000
+HANG_WINDOW_CEILING_MS=1800000
+WORST_WINDOW_CEILING_MS=5400000
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PATCH_SCRIPT="$ROOT/scripts/patch-pi-retry.sh"
 SHIPPED_DIR="$ROOT/pi-bootstrap/pi-config"
 LIVE_DIR="${HOME}/.pi/agent"
 SHIPPED_ONLY=0
@@ -48,7 +88,7 @@ BLOCKS=0
 WARNS=0
 
 usage() {
-  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -126,15 +166,23 @@ sys.exit(1 if viol else 0)
 PYEOF
 }
 
-# settings_violations <file> — compaction block (enabled must be TRUE, plus
-# reserveTokens/keepRecentTokens) + retry.maxRetries contract, over the PARSED
-# JSON tree. Emits one issue line per drift; PARSE_ERROR line + exit 1 on
-# unparseable input.
+# settings_violations <settings-file> <patch-script> — compaction block
+# (enabled must be TRUE, plus reserveTokens/keepRecentTokens) + the bounded
+# retry/hang contract (#1088), over the PARSED JSON tree. Emits one issue line
+# per drift; PARSE_ERROR line + exit 1 on unparseable input. Always emits a
+# `WINDOW hung=<ms> worst=<ms> backoff=<ms>` line on stdout (the derived
+# window) so check_settings_file can report the number it actually enforced
+# rather than a hardcoded one.
 settings_violations() {
-  python3 - "$1" <<'PYEOF'
-import json, sys
+  python3 - "$1" "$2" "$HTTP_IDLE_TIMEOUT_MS" "$RETRY_MAX_RETRIES" \
+    "$RETRY_BASE_DELAY_MS" "$RETRY_MAX_BACKOFF_MS" "$RETRY_PROVIDER_TIMEOUT_MS" \
+    "$HANG_WINDOW_CEILING_MS" "$WORST_WINDOW_CEILING_MS" <<'PYEOF'
+import json, re, sys
 
-path = sys.argv[1]
+path, patch_path = sys.argv[1], sys.argv[2]
+(IDLE_EXPECTED, MR_EXPECTED, BASE_EXPECTED, CAP_EXPECTED,
+ PROVIDER_EXPECTED, HANG_CEILING, WORST_CEILING) = map(int, sys.argv[3:10])
+
 issues = []
 
 def q(v):
@@ -164,10 +212,72 @@ else:
     if comp.get("keepRecentTokens") != 12000:
         issues.append(f"compaction.keepRecentTokens expected 12000, got {q(comp.get('keepRecentTokens'))}")
 
-retry = d.get("retry")
-mr = retry.get("maxRetries") if isinstance(retry, dict) else None
-if mr != 10000:
-    issues.append(f"retry.maxRetries expected 10000 (offline-resume contract), got {q(mr)}")
+retry = d.get("retry") if isinstance(d.get("retry"), dict) else {}
+provider = retry.get("provider") if isinstance(retry.get("provider"), dict) else {}
+mr = retry.get("maxRetries")
+base = retry.get("baseDelayMs")
+idle = d.get("httpIdleTimeoutMs")
+ptimeout = provider.get("timeoutMs")
+
+if mr != MR_EXPECTED:
+    issues.append(f"retry.maxRetries expected {MR_EXPECTED} (bounded-hang contract), got {q(mr)}")
+if base != BASE_EXPECTED:
+    issues.append(f"retry.baseDelayMs expected {BASE_EXPECTED} (the hang-window arithmetic), got {q(base)}")
+if idle != IDLE_EXPECTED:
+    issues.append(f"httpIdleTimeoutMs expected {IDLE_EXPECTED} (the silent-hang ceiling), got {q(idle)}")
+if ptimeout != PROVIDER_EXPECTED:
+    issues.append(f"retry.provider.timeoutMs expected {PROVIDER_EXPECTED} (the per-call ceiling), got {q(ptimeout)}")
+
+# The backoff cap lives in patch-pi-retry.sh (it is interpolated into the pi
+# dist patch). Read it back rather than duplicating it; unreadable = fail
+# closed, because the hang window cannot be computed without it.
+patch_cap = None
+try:
+    with open(patch_path) as f:
+        m = re.search(r'CAP_MS="\$\{PI_MAX_RETRY_DELAY_MS:-([0-9]+)\}', f.read())
+    if m:
+        patch_cap = int(m.group(1))
+except Exception:
+    patch_cap = None
+if patch_cap is None:
+    issues.append(f"retry backoff cap unreadable from {patch_path} — cannot bound the hang window (fail-closed)")
+elif patch_cap != CAP_EXPECTED:
+    issues.append(f"patch-pi-retry.sh backoff cap expected {CAP_EXPECTED}, got {patch_cap}")
+
+# Ceiling ordering: a hung attempt must be cut by the IDLE ceiling, not by the
+# full per-call budget — otherwise the idle ceiling is inert and the hang
+# window silently becomes maxRetries x providerTimeout.
+if isinstance(idle, int) and isinstance(ptimeout, int) and ptimeout <= idle:
+    issues.append(f"retry.provider.timeoutMs ({ptimeout}) must exceed httpIdleTimeoutMs ({idle}) — "
+                  f"otherwise the silent-hang ceiling can never fire first")
+
+# Derived window. The no-progress (hung) window uses the idle ceiling; the
+# worst-case window assumes every attempt burns its full SDK request ceiling.
+nums = (mr, base, patch_cap, idle, ptimeout)
+if all(isinstance(v, int) and v > 0 for v in nums):
+    n = mr
+    backoff = 0
+    v = base
+    i = 0
+    while i < n:
+        if v >= patch_cap:
+            backoff += patch_cap * (n - i)
+            break
+        backoff += v
+        v *= 2
+        i += 1
+    hang = (n + 1) * idle + backoff
+    worst = (n + 1) * ptimeout + backoff
+    print(f"WINDOW hung={hang} worst={worst} backoff={backoff}")
+    if hang > HANG_CEILING:
+        issues.append(f"hang window {hang}ms ({hang / 60000:.1f} min) exceeds the declared "
+                      f"ceiling {HANG_CEILING}ms — the retry budget and the per-attempt "
+                      f"ceiling drifted apart")
+    if worst > WORST_CEILING:
+        issues.append(f"worst-case window {worst}ms ({worst / 60000:.1f} min) exceeds the "
+                      f"declared ceiling {WORST_CEILING}ms")
+else:
+    print("WINDOW hung=0 worst=0 backoff=0")
 
 for i in issues:
     print(i)
@@ -214,9 +324,9 @@ check_model_file() {
 }
 
 # check_settings_file <file> <label> <missing> — compaction block (enabled +
-# reserve/keep) + retry contract, BLOCK on drift.
+# reserve/keep) + the bounded retry/hang contract, BLOCK on drift.
 check_settings_file() {
-  local file="$1" label="$2" missing="$3" issues i
+  local file="$1" label="$2" missing="$3" raw window_hung window_worst issues i
   if [ ! -f "$file" ]; then
     if [ "$missing" = "block" ]; then
       block "$label: file missing ($file) — the compaction/retry contract is gone (deleted = contract reverted while CI stays green)"
@@ -225,13 +335,19 @@ check_settings_file() {
     fi
     return
   fi
-  issues="$(settings_violations "$file")"
+  raw="$(settings_violations "$file" "$PATCH_SCRIPT" 2>&1)"
+  # The WINDOW line reports the derived window the guard actually enforced;
+  # it is emitted on every run (also when clean) so the PASS line names a
+  # measured number instead of a hardcoded one.
+  window_hung="$(printf '%s\n' "$raw" | sed -n 's/^WINDOW hung=\([0-9]*\) .*/\1/p')"
+  window_worst="$(printf '%s\n' "$raw" | sed -n 's/^WINDOW hung=[0-9]* worst=\([0-9]*\) .*/\1/p')"
+  issues="$(printf '%s\n' "$raw" | sed '/^WINDOW /d')"
   if [ -n "$issues" ]; then
     while IFS= read -r i; do
       block "$label — $i"
     done <<< "$issues"
   else
-    ok "$label — compaction block (enabled + 16384/12000) + retry.maxRetries 10000"
+    ok "$label — compaction (enabled + 16384/12000) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
   fi
 }
 

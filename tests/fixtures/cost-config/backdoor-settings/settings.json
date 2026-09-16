@@ -3,9 +3,9 @@
   "defaultModel": "deepseek-flash",
   "defaultThinkingLevel": "high",
   "theme": "dark",
-  "httpIdleTimeoutMs": 600000,
+  "httpIdleTimeoutMs": 180000,
   "retry": {
-    "maxRetries": 10000,
+    "maxRetries": 7,
     "baseDelayMs": 2000,
     "provider": {
       "timeoutMs": 600000

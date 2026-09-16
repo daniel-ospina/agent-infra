@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# patch-pi-retry.sh — apply the agent-infra offline-resume retry patch to the
+# patch-pi-retry.sh — apply the agent-infra bounded-retry patch to the
 # installed pi package (idempotent; safe to run on every sync).
 #
 # Upstream pi's agent-level retry policy (settings.json `retry.*`) uses pure
 # exponential backoff with NO delay cap (`baseDelayMs * 2^(attempt-1)`). With
 # the default `maxRetries: 3` that means 3 quick retries (2s/4s/8s) and then
-# the session dies on a network outage. We want: quick retries first, then
-# keep retrying every 5 minutes indefinitely so a wifi drop (5 min commute,
-# laptop sleeping through a dead connection) pauses the session instead of
-# killing it.
+# the session dies on a network outage. This patch caps the backoff so the
+# retry ladder stays uniform and predictable rather than stretching to
+# 17m/34m/68m gaps.
 #
-# This patch caps the backoff at 5 minutes (300_000 ms). Combined with
-# `retry.maxRetries: 10000` in pi-bootstrap/pi-config/settings.json (≈34 days
-# of 5-min intervals = effectively infinite), a session survives any network
-# outage and resumes automatically when connectivity returns. The user can
-# still abort a retry at any time (Esc / abort_retry).
+# The cap is HALF of the retry contract, not the whole of it (#1088). pi has no
+# agent-level wall-clock retry deadline, so a session's exposure is
+#         (maxRetries + 1) x per-attempt ceiling + sum(backoff)
+# and `maxRetries` alone says nothing about it. `pi-bootstrap/pi-config/
+# settings.json` carries the bounds (maxRetries 7, httpIdleTimeoutMs 180000 =
+# the silent-hang ceiling, retry.provider.timeoutMs 600000 = the per-call
+# ceiling) and `scripts/check-cost-config.sh` asserts BOTH the exact values
+# AND the window derived from them + this file's default cap. Changing the cap
+# here without changing the guard turns CI red — that coupling is deliberate:
+# the pre-#1088 guard pinned only the attempt count, so 10000 attempts x 10-min
+# ceiling x 5-min backoff (34-104 days of silent spinning) stayed green.
 #
 # Two files are patched:
 #   1. dist/core/agent-session.js  — agent-turn retry (the visible
-#      "Retry N/M" path that stops the session after 3 attempts).
+#      "Retry N/M" path).
 #   2. node_modules/@earendil-works/pi-ai/dist/utils/retry.js — the
 #      compaction / branch-summary retry path (same no-cap backoff).
 #
@@ -39,13 +44,14 @@
 #
 # Env overrides:
 #   PI_NODE_ROOT    pi-node install root (default: $HOME/.local/share/pi-node)
-#   PI_MAX_RETRY_DELAY_MS   cap in ms (default 300000 = 5 min)
+#   PI_MAX_RETRY_DELAY_MS   cap in ms (default 60000 = 1 min; MUST equal
+#                           RETRY_MAX_BACKOFF_MS in scripts/check-cost-config.sh)
 #
 # Exit codes: 0 = patched/verified, 1 = failure (loud), 2 = usage error.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CAP_MS="${PI_MAX_RETRY_DELAY_MS:-300000}"
+CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"
 MARKER="agent-infra offline-resume patch"
 
 # #254 drift-watch precondition (Task 10): pi version change without a
@@ -183,7 +189,7 @@ PY
   return 0
 }
 
-usage() { sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 if [ "${1:-}" = "--paths" ]; then
   [ -n "$PI_PKG" ] || { echo "pi package not found" >&2; exit 1; }
@@ -200,9 +206,9 @@ fi
 # Replacement text built with REAL newlines (ANSI-C quoting) — never rely on
 # awk's own \n processing, which differs between BSD awk and mawk.
 OLD1="        const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);"
-NEW1="$(printf '        // agent-infra offline-resume patch: cap the exponential backoff so retries continue every %sms\n        // indefinitely instead of growing unboundedly.\n        const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
+NEW1="$(printf '        // agent-infra bounded-retry patch (#318/#1088): cap the exponential backoff at %sms so\n        // the retry ladder stays uniform. The ATTEMPT budget is finite (settings.retry.maxRetries);\n        // this cap bounds each gap, not the budget.\n        const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
 OLD2="        const delayMs = policy.baseDelayMs * 2 ** (attempt - 1);"
-NEW2="$(printf '        // agent-infra offline-resume patch: cap the exponential backoff so summarization/compaction\n        // retries continue every %sms instead of growing unboundedly.\n        const delayMs = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
+NEW2="$(printf '        // agent-infra bounded-retry patch (#318/#1088): cap the exponential backoff at %sms for\n        // summarization/compaction so the retry ladder stays uniform. The attempt budget is finite;\n        // this cap bounds each gap, not the budget.\n        const delayMs = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
 
 if [ "${1:-}" = "--check" ]; then
   local_ok=1
@@ -213,7 +219,7 @@ if [ "${1:-}" = "--check" ]; then
   exit 1
 fi
 
-echo "==> applying offline-resume retry patch to pi ($PI_PKG)"
+echo "==> applying bounded-retry patch to pi ($PI_PKG)"
 fail=0
 patch_file "$PI_PKG/dist/core/agent-session.js" "$OLD1" "$NEW1" "$PATCHED_LINE1" || fail=1
 [ -f "$PI_AI/dist/utils/retry.js" ] || { echo "❌ pi-ai not found at $PI_AI" >&2; fail=1; }
@@ -223,4 +229,4 @@ if [ "$fail" = "1" ]; then
   echo "❌ retry patch FAILED — sessions will still stop after 3 quick retries on network loss." >&2
   exit 1
 fi
-echo "✅ retry patch applied — sessions now retry every ${CAP_MS}ms after the initial quick retries."
+echo "✅ retry patch applied — backoff capped at ${CAP_MS}ms (the attempt budget is separate, in settings.retry.maxRetries)."

@@ -3,14 +3,14 @@
   "defaultModel": "deepseek-flash",
   "defaultThinkingLevel": "high",
   "theme": "dark",
-  "httpIdleTimeoutMs": 600000,
+  "httpIdleTimeoutMs": 180000,
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
     "keepRecentTokens": 12000
   },
   "retry": {
-    "maxRetries": 10000,
+    "maxRetries": 7,
     "baseDelayMs": 2000,
     "provider": {
       "timeoutMs": 600000
