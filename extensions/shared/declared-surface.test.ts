@@ -29,14 +29,15 @@ import {
   declarationLines,
   driverViolations,
   forwardViolations,
+  isCommentLine,
   isSubstantive,
   inFamily,
   langOf,
   reverseViolations,
   scanDeclarations,
   declaresSymbol,
-  stripComments,
   vacuityFindings,
+  yieldCommentLines,
   type ScanResult,
   type ScanSpec,
   type StallTerm,
@@ -69,12 +70,12 @@ const AGES = ["_AGE", "_AGE_DAYS"];
 
 const SPEC: ScanSpec = { files: [], families: FAMILIES, boundSuffixes: BOUNDS, ageSuffixes: AGES };
 
-section("comment handling is language-aware");
+section("comment handling is line-local and stateless");
 
-test("shell sources are NOT block-comment stripped (glob delimiters must not eat the file)", () => {
-  // A `case` pattern matching absolute paths opens a `/*`; a later glob closes
-  // it with `*/`. A naive block-comment pass therefore deletes everything in
-  // between — including the declaration below.
+test("shell comment lines are blanked and shell glob delimiters are inert", () => {
+  // A shell file legitimately contains `/*` and `*/` as GLOB/case-pattern
+  // characters. Because the transform only blanks `#` comment LINES and carries
+  // no state, those characters cannot open anything.
   const sh = [
     'case "$p" in',
     '  /*) echo abs ;;',
@@ -83,31 +84,57 @@ test("shell sources are NOT block-comment stripped (glob delimiters must not eat
     "echo */bin",
   ].join("\n");
   ok(
-    stripComments(sh, "sh").includes("REAP_IDLE_HOURS"),
-    "a shell file containing /* and */ must keep its later declarations",
+    yieldCommentLines(sh, "sh").includes("REAP_IDLE_HOURS"),
+    "a shell file containing /* and */ must keep its declarations",
   );
-  // …while the naive TS pass would have lost it — pin the divergence so a future
-  // "simplification" to one code path fails here.
-  ok(
-    !stripComments(sh, "ts").includes("REAP_IDLE_HOURS"),
-    "the ts pass (block comments) IS expected to lose that shell text — that is why langOf exists",
+  equal(
+    yieldCommentLines("# REAP_IDLE_HOURS is derived\nREAP_IDLE_HOURS=1\n", "sh").split("\n")[0],
+    "",
+    "a shell comment line is blanked so its prose cannot satisfy a needle",
   );
   equal(langOf("scripts/pi-reap-idle.sh"), "sh");
   equal(langOf("extensions/task-heartbeat.ts"), "ts");
 });
 
-test("comments are stripped so prose cannot fabricate a declaration", () => {
-  const ts = ['// const FAKE_STALL_MS = 1;', "/* HEARTBEAT_HOURS = 2; */", "const REAL_STALL_MS = 3;"].join("\n");
-  const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => ts);
-  equal(scan.declarations.length, 1, "only the real declaration survives");
-  equal(scan.declarations[0].symbol, "REAL_STALL_MS");
+test("a comment prefix is stripped repeatedly, so `/* a */ /* b */ code` keeps its code", () => {
+  // A single pass left `/* b */ const X = 1;`, whose line-anchored declaration
+  // regex no longer matched — an exotic but real miss. The strip now repeats.
+  const src = "/* a */ /* b */ const A_STALL_MS = 1;\n*/ */ const B_STALL_MS = 2;\n";
+  const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => src);
+  equal(scan.declarations.map((d) => d.symbol).sort().join(","), "A_STALL_MS,B_STALL_MS");
 });
 
-test("a `/*` inside a `//` comment does NOT open a block comment (the repo-freshness shape)", () => {
-  // The ordering of the two comment passes is a correctness property. Stripping
-  // block comments first let a glob in a line comment (`"./shared/*"`) open a
+test("prose cannot fabricate a declaration (line comments and block-comment body lines)", () => {
+  const ts = [
+    "// const FAKE_STALL_MS = 1;",
+    "/*  HEARTBEAT_HOURS = 2; */",
+    " * const FAKE2_STALL_MS = 3;",
+    "const REAL_STALL_MS = 3;",
+  ].join("\n");
+  const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => ts);
+  equal(
+    scan.declarations.map((d) => d.symbol).join(","),
+    "REAL_STALL_MS",
+    "only the real declaration survives — a `//`, a one-line block comment and a `*`-body prose line are all blanked",
+  );
+});
+
+test("isCommentLine does not mistake a generator method for a block-comment body line", () => {
+  ok(!isCommentLine("  *gen() { yield 1; }", "ts"), "`*` followed by an identifier is code");
+  ok(isCommentLine(" * prose in a jsdoc block", "ts"), "`* ` is a block-comment body line");
+  ok(isCommentLine("  */", "ts"));
+  ok(isCommentLine("  //x", "ts"));
+  ok(!isCommentLine("  const x = 1;", "ts"));
+  ok(!isCommentLine("# not a ts comment", "ts"), "`#` is not a TS comment marker");
+  ok(isCommentLine("  # a shell comment", "sh"));
+});
+
+test("a `/*` inside a `//` comment is inert (the repo-freshness shape)", () => {
+  // The lexer era had to get two comment passes in the right ORDER: stripping
+  // block comments first let the glob in a line comment (`"./shared/*"`) open a
   // block whose first closing `*/` was a doc comment far below — deleting every
-  // real declaration in between. That silently hid two live bounds.
+  // real declaration in between and silently hiding two live bounds. Line-local
+  // blanking makes that structurally impossible, and this fixture pins it.
   const src = [
     '// consumers: "./shared/*" and friends',
     "// more prose",
@@ -115,9 +142,6 @@ test("a `/*` inside a `//` comment does NOT open a block comment (the repo-fresh
     "/** documentation for the floor */",
     "export const MIN_FRESHNESS_INTERVAL_MS = 300_000;",
   ].join("\n");
-  const stripped = stripComments(src, "ts");
-  ok(stripped.includes("DEFAULT_FRESHNESS_INTERVAL_MS"), "a /* inside a // comment must not open a block");
-  ok(stripped.includes("MIN_FRESHNESS_INTERVAL_MS"), "declarations after the comment survive");
   const scan = scanDeclarations(
     { ...SPEC, families: [...FAMILIES, "FRESH"], files: ["extensions/repo-freshness.ts"] },
     () => src,
@@ -129,77 +153,78 @@ test("a `/*` inside a `//` comment does NOT open a block comment (the repo-fresh
   );
 });
 
-test("a removed block comment keeps its newlines, so a following declaration stays line-anchored", () => {
-  const src = ["const A_STALL_MS = 1;", "/*", " span", "*/ const B_STALL_MS = 2;"].join("\n");
+test("a comment that PREFIXES a code line keeps the code", () => {
+  // Blanking is per LINE, and only the comment span of a prefixed line goes —
+  // otherwise a declaration sharing a line with a comment would be lost.
+  const src = [
+    "/* leading note */ const A_STALL_MS = 1;",
+    "*/",
+    "*/ const B_STALL_MS = 2;",
+    "/** only a comment */",
+    "const C_STALL_MS = 3;",
+  ].join("\n");
   const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => src);
   equal(
     scan.declarations.map((d) => d.symbol).sort().join(","),
-    "A_STALL_MS,B_STALL_MS",
-    "removing a multi-line comment must not merge two lines into one",
+    "A_STALL_MS,B_STALL_MS,C_STALL_MS",
+    "code sharing a line with a comment prefix must survive",
   );
 });
 
-test("REGEX literals do not desynchronize the scan (both failure directions)", () => {
-  // A scanner that tracks only quotes desyncs on an apostrophe inside a regex
-  // literal and copies the rest of the file verbatim — so every later assertion
-  // scans PROSE, and a comment can fabricate a declaration. This is not
-  // hypothetical: extensions/builtin-tools/index.ts holds
-  // /^Warning: No project session found with id '[^']*'/. The `/[/*]/` case is
-  // the opposite direction: a `/` inside a regex character class read as a
-  // block-comment opener DELETES the real declarations after it.
-  const cases: [string, string, string[]][] = [
-    ["apostrophe inside a regex", "const re = /id '([^']*)'/;\n", ["BOGUS_STALL_MS", "REAL_ONE_STALL_MS"]],
-    ["`/*` inside a regex character class", "const re = /[/*]/;\n", ["REAL_TWO_STALL_MS"]],
-    ["`//` inside a regex", "const re = /a\\/\\/b/;\n", ["REAL_THREE_STALL_MS"]],
+test("regression: every cross-line desync trigger that broke the old lexer is now inert", () => {
+  // Each of these made the previous hand-rolled scanner lose track of where it
+  // was — after which it either DELETED real declarations or copied comments
+  // through verbatim so prose was scanned as code. They are kept as fixtures
+  // because they are the exact shapes a future "smarter" rewrite would break on.
+  const bodies: [string, string][] = [
+    // apostrophe inside a regex literal (`extensions/builtin-tools/index.ts`)
+    ["apostrophe in a regex", "const re = /^Warning: No project id '([^']*)'/;"],
+    // a `/*` inside a regex character class
+    ["/* inside a regex class", "const re = /[/*]/;"],
+    // `//` inside a regex
+    ["// inside a regex", "const re = /a\\/\\/b/;"],
+    // regex in statement position after `)` — the case that defeated the
+    // previous-token heuristic
+    ["regex after a statement-position )", "if (ready) /a/.test(s);"],
+    ["regex after a block", "if (ready) {} /a/.test(s);"],
+    // a NESTED template literal, whose inner backtick ended the outer one early
+    ["nested template", "const s = `a${`b${`c`}`}d`;"],
+    // a quote inside a template interpolation
+    ["quote in an interpolation", "const s = `${x}: it's fine`;"],
+    // division that a next-char heuristic reads as a regex start
+    ["division after ++/--", "const r = a++ / 2;"],
+    ["division after postfix !", "const r = x! / 2;"],
+    ["division after a keyword-named property", "const r = obj.of / 2;"],
+    ["division after a double !", "const r = a!! / 2;"],
   ];
-  for (const [name, head, decls] of cases) {
-    const body = decls.map((d, i) => (i === 0 && name.startsWith("apostrophe") ? `// ${d} = 0;` : `export const ${d} = ${i + 1};`)).join("\n");
-    const stripped = stripComments(`${head}${body}\n`, "ts");
-    for (const d of decls) {
-      if (d.startsWith("BOGUS")) {
-        ok(!stripped.includes(d), `${name}: a comment must not survive stripping (would fabricate ${d})`);
-      } else {
-        ok(stripped.includes(d), `${name}: the real declaration ${d} must survive stripping`);
-      }
-    }
-  }
-  // Division must NOT be mistaken for a regex start (it would swallow code).
-  // The postfix/property cases are the ones a next-character-only heuristic gets
-  // wrong: `a++`, `x!` (non-null) and `obj.of` all END a value.
-  for (const expr of [
-    "const r = a / b;",
-    "const r = (x) / 2;",
-    "const r = arr[0] / 3;",
-    "const r = obj.k / 4;",
-    "const r = a++ / 2;",
-    "const r = a-- / 2;",
-    "const r = x! / 2;",
-    "const r = obj.of / 2;",
-    "const r = obj.in / 2;",
-    "const r = obj.delete / 2;",
-    'const r = "s" / 2;',
-  ]) {
-    const s = stripComments(`${expr}\n// const FAKE_STALL_MS = 1;\nexport const OK_STALL_MS = 2;\n`, "ts");
-    ok(
-      s.includes("OK_STALL_MS") && !s.includes("FAKE_STALL_MS"),
-      `a division must not open a regex literal: ${expr}`,
+  for (const [name, head] of bodies) {
+    const src = `${head}\n// const FAKE_STALL_MS = 1;\nexport const REAL_1_STALL_MS = 2;\n`;
+    const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => src);
+    equal(
+      scan.declarations.map((d) => d.symbol).join(","),
+      "REAL_1_STALL_MS",
+      `${name}: the comment must stay blank and the real declaration must survive`,
     );
   }
-  // …and a keyword before the slash must still be read as a regex (`return /re/`
-  // includes the backtick case that first exposed the whitespace bug).
-  for (const expr of ["function f(){ return /[$`]/.test(s); }", "function f(){ return  /re/.test(s); }", "switch (x) { case /re/: break; }"]) {
-    const s = stripComments(`${expr}\n// const FAKE2_STALL_MS = 1;\nexport const OK2_STALL_MS = 2;\n`, "ts");
-    ok(s.includes("OK2_STALL_MS") && !s.includes("FAKE2_STALL_MS"), `a keyword must open a regex: ${expr}`);
-  }
-  // The escalation: a misread division on a line that also holds a
-  // `/`-containing string desynchronizes the rest of the file, and a leaked
-  // line-start comment then FABRICATES a declaration.
-  const esc = 'const ratio = a++ / 2; const p = "a/b";\n// const BOGUS_STALL_MS = 0;\nexport const REAL_STALL_MS = 1;\n';
-  const escScan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => esc);
-  equal(
-    escScan.declarations.map((d) => d.symbol).join(","),
-    "REAL_STALL_MS",
-    "a leaked comment must not be able to fabricate a declaration",
+  // …and the same for a multi-line block comment, whose body is prose: no
+  // fragment of a code line is ever removed, so nothing can be merged or lost.
+  const multi = ["const A_STALL_MS = 1;", "/*", " * prose", " */", "const B_STALL_MS = 2;"].join("\n");
+  const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => multi);
+  equal(scan.declarations.map((d) => d.symbol).join(","), "A_STALL_MS,B_STALL_MS");
+});
+
+test("the DOCUMENTED residual: a flush-left block-comment body line IS read as code", () => {
+  // Without cross-line state this shape is indistinguishable from code, so it is
+  // DISCLOSED rather than covered: no test canary detects it (a flush-left body
+  // line is not a comment line, so the transform leaves it alone and the
+  // no-deletion invariant sees nothing to report). This test pins the residual's
+  // existence so nobody believes the gate covers it, and the corpus is required
+  // not to contain the shape.
+  const src = ["/*", "const FAKE_STALL_MS = 1;", "*/", "const REAL_STALL_MS = 2;"].join("\n");
+  const scan = scanDeclarations({ ...SPEC, files: ["x.ts"] }, () => src);
+  ok(
+    scan.declarations.some((d) => d.symbol === "FAKE_STALL_MS"),
+    "the flush-left form is read as a declaration — this is the disclosed residual, not a covered case",
   );
 });
 
@@ -458,14 +483,20 @@ test("a symlinked entry and a depth-truncated subtree are reported, never silent
   try {
     fs.mkdirSync(path.join(tmp, "real"), { recursive: true });
     fs.writeFileSync(path.join(tmp, "real", "keep.ts"), "");
+    let linked = true;
     try {
       fs.symlinkSync(path.join(tmp, "real", "keep.ts"), path.join(tmp, "linked.ts"));
     } catch {
-      return; // a platform without symlink permission — skip, the depth case still runs below
+      // A platform without symlink permission skips ONLY the symlink assertion —
+      // never the depth case, which needs no symlink (an early `return` here
+      // silently removed that coverage on those platforms).
+      linked = false;
     }
     collectFiles(tmp, ".", (n) => n.endsWith(".ts"), 6, errors);
-    ok(errors.some((e) => e.includes("symlinked entry")), `a symlink must be reported, got ${JSON.stringify(errors)}`);
-    // A depth bound that truncates must report too.
+    if (linked) {
+      ok(errors.some((e) => e.includes("symlinked entry")), `a symlink must be reported, got ${JSON.stringify(errors)}`);
+    }
+    // A depth bound that truncates must report too — asserted on EVERY platform.
     const deep: string[] = [];
     collectFiles(tmp, ".", (n) => n.endsWith(".ts"), 0, deep);
     ok(deep.some((e) => e.includes("depth bound")), `a truncated subtree must be reported, got ${JSON.stringify(deep)}`);

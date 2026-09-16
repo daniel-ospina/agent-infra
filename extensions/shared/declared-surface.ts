@@ -32,14 +32,37 @@
  * subtree) is reported through the same channel as an unreadable file — never
  * swallowed.
  *
- * COMMENT HANDLING IS LANGUAGE-AWARE ON PURPOSE
- * ---------------------------------------------
- * Block comments are stripped for `ts`/`js` sources only. Shell sources are
- * NEVER block-comment stripped: shell globs and `case` patterns contain the
- * literal block-comment delimiters (a `case` branch whose pattern is a trailing
- * slash), so a naive block-comment pass deletes a whole region of a `.sh` file
- * and the scan silently loses every declaration in it. The failure is caught by
- * the non-vacuity floors, but the correct behaviour is not to create it.
+ * NO LEXER — COMMENT HANDLING IS LINE-LOCAL AND STATELESS
+ * ------------------------------------------------------
+ * A declaration scan must never read prose as code (FABRICATION) and must never
+ * lose real code to a parser mistake (DELETION). The first version of this
+ * module tried to get both from a hand-rolled single-pass scanner that tracked
+ * line comments, block comments, string literals, template literals AND regex
+ * literals. It was still wrong in BOTH directions, because the scanner carried
+ * state ACROSS lines and a desynchronized scanner is a lying oracle:
+ *   - DELETION: `/[/*]/` was read as a block opener and removed real
+ *     declarations after it.
+ *   - FABRICATION: `/^Warning: … '[^']*'/`'s apostrophe opened a bogus string
+ *     that copied comments through verbatim, so the assertions scanned prose.
+ *   - and each fix for one direction opened a case in the other (`if (x) /re/`
+ *     in statement position, a property named `of`, a double `!`, a nested
+ *     template) — an unbounded arms race.
+ *
+ * So there is no lexer here. `yieldCommentLines` is LINE-LOCAL and STATELESS: it
+ * can only blank a line that ITSELF begins with a comment marker, so nothing on
+ * a previous line can desynchronize it and no fragment of a code line can be
+ * deleted. Comment-LINE blanking is enough for the two jobs that need it, and it
+ * is the only transform any assertion depends on. Shell sources blank `#` lines
+ * only — never a block-comment pass: shell globs and `case` patterns contain the
+ * literal block-comment delimiters, and dropping a region of a `.sh` file would
+ * silently lose every declaration in it.
+ *
+ * The accepted residual — and it is DISCLOSED, not covered: a block comment whose
+ * body lines are NOT `*`-prefixed (flush-left prose) is indistinguishable from
+ * code without cross-line state, so a declaration-SHAPED flush-left line inside
+ * such a comment WOULD be read as a declaration. Nothing here can detect that
+ * shape, so `declared-surface.test.ts` pins it as a known gap rather than
+ * claiming coverage, and the corpus is required not to contain one.
  *
  * ZERO-DEPENDENCY IMPORT CONTRACT: `node:*` only. The per-PR `ci.yml` `verify`
  * job runs the shared suites with NO `npm ci`, so this file must not import
@@ -172,150 +195,71 @@ export function langOf(file: string): SourceLang {
 }
 
 /**
- * Remove comments so a DECLARATION is never fabricated out of prose (this
- * repo's source comments discuss stall bounds at length, and a scan that reads
- * comments is a scan that lies).
+ * True when `line` (as written in source) is a COMMENT line.
  *
- * Shell: `#` line comments only — NO block-comment pass (see the header).
- * TS/JS: `//` line comments and block comments, removed by ONE left-to-right
- * pass. That single pass is a CORRECTNESS property, not a style choice: two
- * ordered regex passes let a `/*` inside a `//` comment open a block that
- * swallowed real declarations (`extensions/repo-freshness.ts:5` carries the
- * glob `"./shared/*"` in a line comment, and stripping block comments first
- * deleted its two FRESH bounds) — a false PASS in the one direction this module
- * exists to close.
- *
- * The pass also tracks string literals AND regex literals. Regex awareness is
- * not optional: `extensions/builtin-tools/index.ts` holds
- * `/^Warning: No project session found with id '[^']*'/`, whose apostrophe would
- * otherwise open a bogus single-quote "string" that copied thousands of lines of
- * comments through verbatim — so every parent-side assertion would be scanning
- * prose. Both directions of that failure (a comment SURVIVING stripping, and a
- * `/[/*]/` char class being read as a block-comment opener and DELETING real
- * declarations) are pinned by fixtures below.
+ * `*` followed by an IDENTIFIER is deliberately NOT a comment line: a generator
+ * method (`*gen() {`) is real code. A lone `*`, or `*` followed by whitespace,
+ * is a block-comment body line — which is how every JSDoc body in this repo is
+ * written.
  */
-export function stripComments(src: string, lang: SourceLang = "ts"): string {
-  if (lang === "sh") return src.replace(/(^|[ \t])#[^\n]*/g, "$1");
-  let out = "";
-  let i = 0;
-  while (i < src.length) {
-    const c = src[i];
-    if (c === "/" && src[i + 1] === "/") {
-      const nl = src.indexOf("\n", i);
-      i = nl === -1 ? src.length : nl;
-      continue;
-    }
-    if (c === "/" && src[i + 1] === "*") {
-      const end = src.indexOf("*/", i + 2);
-      const stop = end === -1 ? src.length : end + 2;
-      // Preserve the removed span's newlines so a declaration that FOLLOWS a
-      // multi-line comment is still at the start of a line (the declaration
-      // regexes are line-anchored).
-      const span = src.slice(i, stop);
-      out += "\n".repeat((span.match(/\n/g) ?? []).length);
-      i = stop;
-      continue;
-    }
-    if (c === '"' || c === "'" || c === "`") {
-      // Copy the literal verbatim (honouring escapes) so a comment delimiter
-      // inside it is never mistaken for a comment.
-      let j = i + 1;
-      while (j < src.length) {
-        if (src[j] === "\\") j += 2;
-        else if (src[j] === c) {
-          j++;
-          break;
-        } else j++;
-      }
-      out += src.slice(i, j);
-      i = j;
-      continue;
-    }
-    if (c === "/" && couldStartRegex(src, i)) {
-      // Copy the regex literal verbatim, but SKIP its contents: a quote inside
-      // it must not open a bogus "string", and a `/*` inside a character class
-      // must not open a bogus block comment.
-      const j = endOfRegex(src, i);
-      out += src.slice(i, j);
-      i = j;
-      continue;
-    }
-    out += c;
-    i++;
-  }
-  return out;
+export function isCommentLine(line: string, lang: SourceLang = "ts"): boolean {
+  const t = line.replace(/^[ \t]+/, "");
+  if (t === "") return false;
+  if (lang === "sh") return t.startsWith("#");
+  if (t.startsWith("//")) return true;
+  if (t.startsWith("/*")) return true;
+  if (t.startsWith("*/")) return true;
+  return t === "*" || /^\*[ \t]/.test(t);
 }
-
-/** Keywords after which a `/` starts a regex literal (`return /re/`). */
-const REGEX_PRECEDING_KEYWORD =
-  /(?:^|[^A-Za-z0-9_$.])(return|typeof|instanceof|in|of|new|delete|void|do|else|yield|await|case)$/;
 
 /**
- * True when the `/` at `i` begins a regex literal. The heuristic is the standard
- * one: a regex cannot follow a VALUE, and `//` / `/*` are always comments (so
- * those cases are resolved before this runs).
+ * Blank every comment LINE so a DECLARATION is never fabricated out of prose
+ * (this repo's source comments discuss stall bounds at length, and a scan that
+ * reads comments is a scan that lies), while keeping the line count identical so
+ * every declaration stays line-anchored.
  *
- * The previous-character-only version misread `a++ / b`, `x! / b` (postfix
- * non-null) and `obj.of / b` (property access) as regex starts; with a
- * `/`-containing string on the same line that desynchronized the scan and let a
- * comment fabricate a declaration. So the test is now on the previous TOKEN.
+ * LINE-LOCAL AND STATELESS BY CONSTRUCTION — see the header. Each line is
+ * classified on its own; there is no state to desynchronize. A comment that only
+ * PREFIXES a code line (an inline block comment followed by code, or a closing
+ * delimiter followed by code) keeps its code: only the comment span is dropped,
+ * and the strip REPEATS so a line carrying two prefixes still yields its code.
  */
-function couldStartRegex(src: string, i: number): boolean {
-  if (src[i + 1] === "/" || src[i + 1] === "*") return false;
-  if (src[i + 1] === undefined) return false;
-  if (!prevTokenIsValue(src, i)) return true;
-  // A VALUE before the `/` means division — unless the value-token is a KEYWORD
-  // (`return /re/`) or the keyword is a property NAME (`obj.of`), which the
-  // lookbehind rejects by excluding a preceding `.`.
-  return REGEX_PRECEDING_KEYWORD.test(src.slice(0, i).replace(/\s+$/, ""));
+export function yieldCommentLines(src: string, lang: SourceLang = "ts"): string {
+  return src
+    .split("\n")
+    .map((line) => {
+      let cur = line;
+      // Bound the repeat: each pass removes at least one prefix, and 8 nested
+      // inline comments on one line is already far past anything real.
+      for (let i = 0; i < 8; i++) {
+        const next = yieldOneLine(cur, lang);
+        if (next === cur) return cur;
+        cur = next;
+      }
+      return cur;
+    })
+    .join("\n");
 }
 
-/** Chars that can END a value: literals and closing brackets. */
-const VALUE_ENDERS = ")]}`\"'";
-
-/** True when the token before index `i` is a VALUE (so a `/` divides). */
-function prevTokenIsValue(src: string, i: number): boolean {
-  let k = i - 1;
-  while (k >= 0 && /\s/.test(src[k])) k--;
-  if (k < 0) return false; // start of file — not a value
-  const c = src[k];
-  if (VALUE_ENDERS.includes(c)) return true;
-  if (c === "+" || c === "-") {
-    // Postfix `++` / `--` (a value) vs a binary operator (not one).
-    let m = k - 1;
-    while (m >= 0 && /\s/.test(src[m])) m--;
-    return m >= 0 && src[m] === c;
-  }
-  if (c === "!") {
-    // Postfix non-null assertion (`a! / 2`) vs prefix negation (`!/re/.test(x)`).
-    let m = k - 1;
-    while (m >= 0 && /\s/.test(src[m])) m--;
-    return m >= 0 && /[A-Za-z0-9_$)\]}]/.test(src[m]);
-  }
-  return /[A-Za-z0-9_$]/.test(c);
-}
-
-/** Index just past the regex literal starting at `i` (flags included). */
-function endOfRegex(src: string, i: number): number {
-  let j = i + 1;
-  let inClass = false;
-  while (j < src.length) {
-    const d = src[j];
-    if (d === "\\") {
-      j += 2;
-      continue;
-    }
-    if (d === "\n") break; // an unterminated regex does not span lines
-    if (d === "[") inClass = true;
-    else if (d === "]") inClass = false;
-    else if (d === "/" && !inClass) {
-      j++;
-      while (j < src.length && /[a-z]/.test(src[j])) j++;
-      return j;
-    }
-    j++;
-  }
-  return j;
+/**
+ * One pass of the transform. The rewrite branch is gated by `isCommentLine`,
+ * so the module has exactly ONE definition of "this line is a comment" — the
+ * no-deletion invariant asserted in the suite is this line, not a restatement
+ * of it.
+ */
+function yieldOneLine(line: string, lang: SourceLang): string {
+  const t = line.replace(/^[ \t]+/, "");
+  if (t === "" || !isCommentLine(line, lang)) return line;
+  // A `//` (or shell `#`) comment runs to end of line; a block-comment body
+  // line holds no code at all.
+  if (lang === "sh" || t.startsWith("//")) return "";
+  if (t === "*" || /^\*[ \t]/.test(t)) return "";
+  // `*/` closes at index 0; `/*` cannot close before index 2.
+  const close = t.indexOf("*/", t.startsWith("*/") ? 0 : 2);
+  // No closing `*/` on this line: the comment continues below.
+  if (close === -1) return "";
+  const rest = t.slice(close + 2).replace(/^[ \t]+/, "");
+  return rest === "" ? "" : line.slice(0, line.length - t.length) + rest;
 }
 
 /** TS/JS `const|let|var NAME =` (also `export const`). */
@@ -345,13 +289,13 @@ export function inFamily(
 }
 
 /**
- * Every declaration line for `symbol` in `src` (comment-stripped), in source
+ * Every declaration line for `symbol` in `src` (comment LINES blanked), in source
  * order. Plural because a shell script legitimately declares the same symbol
  * twice (a default near the top, a CLI override later) — the forward check
  * needs to see all of them, not whichever the regex happens to hit first.
  */
 export function declarationLines(src: string, symbol: string, lang: SourceLang = "ts"): string[] {
-  const stripped = stripComments(src, lang);
+  const stripped = yieldCommentLines(src, lang);
   const re = new RegExp(
     `(?:^|\\n)[ \\t]*(?:export[ \\t]+|readonly[ \\t]+|declare[ \\t]+)?(?:const|let|var)?[ \\t]*${symbol}[ \\t]*=`,
     "g",
@@ -373,9 +317,9 @@ export function declarationLine(src: string, symbol: string, lang: SourceLang = 
 }
 
 /**
- * True when `symbol` appears as a DECLARATION in `src` — on the comment-stripped
- * source, in a declaration SHAPE (`const`/`let`/`var`, `function`, or a shell
- * assignment).
+ * True when `symbol` appears as a DECLARATION in `src` — on the source with
+ * comment LINES blanked, in a declaration SHAPE (`const`/`let`/`var`,
+ * `function`, or a shell assignment).
  *
  * This is the assertion for `value: null` terms (pointers and derived
  * expressions, which have no literal to compare). A bare word-boundary test over
@@ -384,7 +328,7 @@ export function declarationLine(src: string, symbol: string, lang: SourceLang = 
  * scan directions green (#1068 review).
  */
 export function declaresSymbol(src: string, symbol: string, lang: SourceLang = "ts"): boolean {
-  const stripped = stripComments(src, lang);
+  const stripped = yieldCommentLines(src, lang);
   if (declarationLines(stripped, symbol, lang).length > 0) return true;
   const esc = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const shapes = [
@@ -419,7 +363,7 @@ export function scanDeclarations(
     }
     filesScanned++;
     const lang = langOf(file);
-    const stripped = stripComments(src, lang);
+    const stripped = yieldCommentLines(src, lang);
     const regexes = lang === "sh" ? [SH_DECL_RE] : [TS_DECL_RE, SH_DECL_RE];
     const seen = new Set<string>();
     for (const re of regexes) {
@@ -466,7 +410,7 @@ export function forwardViolations(
       if (lines.length === 0) {
         // `value: null` terms may be FUNCTION-shaped (`getSubagentBackstopFreshMs`)
         // or derived expressions, not a `const NAME = …` — so the presence check
-        // is declaration-SHAPED, on the comment-stripped source. A bare
+        // is declaration-SHAPED, on source with comment LINES blanked. A bare
         // word-boundary test over raw text is satisfied by a comment that names
         // the term, which made a deleted declaration invisible.
         if (term.value === null && declaresSymbol(src, term.name, langOf(owner))) continue;

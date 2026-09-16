@@ -1109,6 +1109,13 @@ test("stall-bound getters — defaults + ≥60s clamp", () => {
   withEnv({ TASK_TOOL_STALL_MS: "10800000" }, () =>
     equal(getToolStallMs(), 10_800_000, "a finite positive override is honoured"));
   withEnv({ TASK_STREAM_STALL_MS: "120000" }, () => equal(getStreamStallMs(), 120_000));
+  // #1068 review: the clause map now RECORDS `max(60 s, …)` for the
+  // first-message clause as well, so the floor it advertises needs the same
+  // behaviour pin the tool-stall clause has — otherwise the registry records a
+  // floor that no test holds.
+  withEnv({ TASK_FIRST_MESSAGE_MS: "1000" }, () =>
+    equal(getFirstMessageMs(), 60_000, "a positive sub-60s first-message override is clamped to 60s"));
+  withEnv({ TASK_FIRST_MESSAGE_MS: "900000" }, () => equal(getFirstMessageMs(), 900_000));
 });
 
 section("#176 heartbeat — parseHeartbeatLine");

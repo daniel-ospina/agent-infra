@@ -103,7 +103,13 @@ export type StallAxis = (typeof STALL_AXES)[number];
  * silently escaping both directions, and so a reader can see which terms rest on
  * their own value+behaviour pin (`guardedBy`) for the duplicate-declaration case.
  */
-export const FUNCTION_SHAPED_TERMS = ["getSubagentBackstopFreshMs", "getToolStallMs"] as const;
+export const FUNCTION_SHAPED_TERMS = [
+  "getSubagentBackstopFreshMs",
+  "getToolStallMs",
+  "getStreamStallMs",
+  "getFirstMessageMs",
+  "getTaskMaxDispatchMs",
+] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
 export const MARKER_KINDS = [
@@ -342,18 +348,18 @@ export type HeartbeatKillReasonName = (typeof HEARTBEAT_KILL_REASONS)[number];
 export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string>> = {
   "zero-output": "first-output timeout (`firstOutputTimeoutMs`, tier-1)",
   "silence-threshold": "HEARTBEAT_TIMEOUT_MS (T)",
-  "stream-stall": "DEFAULT_STREAM_STALL_MS (S)",
+  "stream-stall": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S)",
   // Shares S with stream-stall: one constant, two conditions. Naming them as one
   // term would be wrong; naming them as two unrelated bounds would be wrong too.
-  "tool-silence": "DEFAULT_STREAM_STALL_MS (S) — same bound as stream-stall, different condition",
+  "tool-silence": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — same bound as stream-stall, different condition",
   // The EFFECTIVE bound is max(60 s, TASK_TOOL_STALL_MS) when the env override
   // is a positive finite number; otherwise max(60 s, fraction × cap). Recording
   // only the fraction would let the bound move through a path the registry
   // cannot see, and omitting the 60 s floor would record a bound that does not
   // exist (#1068 review; the same shape PR #873 / #991 caught).
   "tool-stall": "max(60 s, TASK_TOOL_STALL_MS) override (env), else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap) (L)",
-  "first-message-stall": "DEFAULT_FIRST_MESSAGE_MS (M)",
-  "max-dispatch": "TASK_MAX_DISPATCH_MS",
+  "first-message-stall": "max(60 s, TASK_FIRST_MESSAGE_MS) override (env), else max(60 s, DEFAULT_FIRST_MESSAGE_MS) (M)",
+  "max-dispatch": "max(60 s, TASK_MAX_DISPATCH_MS) override (env), else OFF — DEFAULT_MAX_DISPATCH_MS = 0 disables the cap (D)",
   cut: "getCutGapMs() / TASK_HEARTBEAT_CUT_GAP_MS",
 };
 
@@ -466,7 +472,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "= 1_200_000;",
     axis: "kill",
     guardedBy: NONE,
-    note: "S — gates BOTH stream-stall and tool-silence",
+    note: "S — gates BOTH stream-stall and tool-silence; the EFFECTIVE bound is resolved by getStreamStallMs (env override, 60 s floor)",
   },
   {
     name: "DEFAULT_TOOL_STALL_MS",
@@ -490,7 +496,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "= 300_000;",
     axis: "kill",
     guardedBy: NONE,
-    note: "M — before #1068 only self-compared, so any value passed",
+    note: "M — before #1068 only self-compared, so any value passed; the EFFECTIVE bound is resolved by getFirstMessageMs (env override, 60 s floor)",
   },
   {
     name: "DEFAULT_BACKSTOP_MARGIN_MS",
@@ -686,6 +692,30 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the EFFECTIVE tool-stall bound (L) — max(60 s, TASK_TOOL_STALL_MS) when the env override is positive finite, else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap). Declared so the env path AND its 60 s safety floor are visible to the registry rather than only the fraction literal.",
+  },
+  {
+    name: "getStreamStallMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE stream-stall/tool-silence bound (S) — max(60 s, TASK_STREAM_STALL_MS) when the override is set, else max(60 s, DEFAULT_STREAM_STALL_MS). Registered for the same reason as getToolStallMs: without it the env path and the 60 s floor are invisible and only the literal is recorded.",
+  },
+  {
+    name: "getFirstMessageMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE first-message bound (M) — max(60 s, TASK_FIRST_MESSAGE_MS) when set, else max(60 s, DEFAULT_FIRST_MESSAGE_MS).",
+  },
+  {
+    name: "getTaskMaxDispatchMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE total-dispatch cap (D) — max(60 s, TASK_MAX_DISPATCH_MS) when the override is positive finite, else DEFAULT_MAX_DISPATCH_MS = 0, which DISABLES the cap (NOT floored: 0 means off, and the floor only applies to an env-supplied cap).",
   },
 ];
 
