@@ -649,9 +649,9 @@ Less severely, three other rows contain mild re-entrant nesting (the same symbol
 appearing again on a nested frame within one stack). Counting only the topmost
 occurrence per path gives `StringIndexOf` 2342 / 1474,
 `RegExpPrototypeTestFast` 374 / 145 and `FindOrderedHashMapEntry` 243 / 95 —
-so those three rows exceed their topmost-only values by roughly 10% or less
-(up to ~15% for `FindOrderedHashMapEntry`, 269 vs 243 = +10.7%, 109 vs 95 =
-+14.7%; the rest are under 5%).
+so `StringIndexOf` and `RegExpPrototypeTestFast` exceed their topmost-only
+values by under 5%, and `FindOrderedHashMapEntry` by ~11–15% (269 vs 243 =
++10.7%, 109 vs 95 = +14.7%).
 The difference is immaterial to the profile's conclusion, but the rows are
 sums-over-occurrences, not topmost-only counts.
 
@@ -672,7 +672,7 @@ Two conclusions that survive scrutiny:
 (`spawnSync`/`execSync`). Its `Spawn` symbol appears on **two distinct stacks**
 (191 + 71 samples for pid 3312; 143 + 55 for 70130), accumulating 262 / 198
 samples in the timer subtree — i.e. **at least two synchronous spawns happened
-during the 20 s sample**, not a periodic cadence. (The wider
+during the 20 s sample**; the profile establishes no cadence either way. (The wider
 `Spawn`/`Run`/`TryInitializeAndRunLoop` family sums to 783 / 594 because those
 frames nest inside each spawn; the row quotes the `Spawn` symbol's own frames.)
 Its nested `uv_run` → `uv__io_poll` → `kevent` frames
