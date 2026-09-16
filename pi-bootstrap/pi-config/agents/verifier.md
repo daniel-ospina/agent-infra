@@ -46,8 +46,15 @@ curl -s -o /dev/null -w "%{http_code}" https://eldato.com.mx/api/health 2>&1
 
 After verification, compute sha256 hashes for each verified file:
 ```bash
-node -e "const crypto=require('crypto');const fs=require('fs');const files=process.argv.slice(1);files.forEach(f=>{try{const h=crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');console.log(f+':'+h)}catch(e){console.error(f+':ERROR:'+e.message)}})" -- <file1> <file2> ...
+node -e "const crypto=require('crypto');const fs=require('fs');const files=process.argv.slice(1);files.forEach(f=>{try{const s=fs.lstatSync(f);const h=crypto.createHash('sha256').update(s.isSymbolicLink()?fs.readlinkSync(f,{encoding:'buffer'}):fs.readFileSync(f)).digest('hex');console.log(f+':'+h)}catch(e){console.error(f+':ERROR:'+e.message)}})" -- <file1> <file2> ...
 ```
+
+**Symlinks are hashed by their LINK TARGET** (#1092) — git stores a symlink as a mode-120000 blob whose contents
+ARE the target string, so that is what the commit records and what the gate compares. `fs.readFileSync` cannot
+express that (it throws `EISDIR` on a symlink to a directory) and `sha256sum <link>` silently hashes whatever it
+points at, which is not the committed bytes. If you hash a symlink by hand, use the **buffer** form above — never
+`printf '%s' "$(readlink <path>)" | sha256sum`, which is not byte-exact: command substitution strips a trailing
+newline from the target and an unquoted path word-splits, so it disagrees with the gate for those targets.
 
 ## Output Contract
 

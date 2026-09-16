@@ -3,7 +3,7 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { relative, resolve, isAbsolute, join, dirname, basename, extname } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync, lstatSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
@@ -2761,10 +2761,38 @@ export function routeScopeGate(gate: ScopeGateDecision, files: string[]): ScopeG
   }
 }
 
+/**
+ * #1092: the bytes a symlink contributes to a commit are its LINK TARGET, not
+ * the content reachable through it — git stores a symlink as a mode-120000 blob
+ * whose contents are the target string. `readFileSync` cannot express that: on
+ * a symlink to a DIRECTORY it throws `EISDIR`, and the commit loop routes every
+ * errno but `ENOENT`/`ENOTDIR` to `unverified`, so such a path was
+ * **permanently** un-committable (residual of #305, which repaired the path
+ * class for symlinked *files* by realpathing the parent but left the hash
+ * itself following the link). Any multi-file extension — whose pi-config farm
+ * entry is necessarily a directory symlink — could not be landed from a
+ * non-interactive session at all.
+ *
+ * So: hash the link target itself, byte-exact (`{ encoding: "buffer" }` — a
+ * string readlink would decode-lossy a non-UTF-8 target, and git hashes the raw
+ * bytes). That keeps the anti-drift property the gate exists for: retargeting
+ * the link after verification flips the digest, so the commit still blocks.
+ *
+ * `lstatSync` — not `statSync` — is what makes this correct, and it preserves
+ * the caller's errno discrimination exactly: `lstatSync` throws `ENOENT` for an
+ * absent path and `ENOTDIR` for a D/F conflict, like the `readFileSync` it
+ * replaces, so the #920 branch still separates "deleted" from "content staged
+ * but unreadable" for symlinks too.
+ */
+function hashContent(absPath: string): Buffer {
+  return lstatSync(absPath).isSymbolicLink()
+    ? readlinkSync(absPath, { encoding: "buffer" })
+    : readFileSync(absPath);
+}
+
 function hashFile(projectRoot: string, filePath: string): string {
   const absPath = resolve(projectRoot, filePath);
-  const content = readFileSync(absPath);
-  return createHash("sha256").update(content).digest("hex");
+  return createHash("sha256").update(hashContent(absPath)).digest("hex");
 }
 
 /**
@@ -2778,7 +2806,7 @@ function hashFile(projectRoot: string, filePath: string): string {
  */
 export function hashMatchesDisk(projectRoot: string, filePath: string, storedHash: string): boolean {
   const absPath = resolve(projectRoot, filePath);
-  const content = readFileSync(absPath);
+  const content = hashContent(absPath); // #1092: symlink ⇒ link target, same rule as hashFile
   const algo = storedHash.length === 40 ? "sha1" : "sha256";
   return createHash(algo).update(content).digest("hex") === storedHash.toLowerCase();
 }
@@ -3743,7 +3771,14 @@ export default function (pi: ExtensionAPI) {
         // #561: dual-cause remedy — a mismatch is EITHER a genuine post-PASS
         // edit OR a verifier hash-transcription error; name both + the fix so
         // the agent re-verifies current bytes instead of re-dispatching blindly.
-        reasons.push(`      remedy: file edited after verification OR verifier hash typo — never hand-type sha256: run sha256sum ${m.file} and re-dispatch the exact hash`);
+        // #1092: a symlink commits its LINK TARGET (git's mode-120000 blob), and
+        // `sha256sum <link>` FOLLOWS the link — so for a symlink that recipe can
+        // never produce the digest this gate compares. The printed remedy must
+        // therefore be a byte-exact one: a `printf '%s' "$(readlink …)"` recipe
+        // is NOT (command substitution strips a trailing newline from the target,
+        // and an unquoted path word-splits) — both measured against a
+        // newline-terminated target, which it hashes to a different digest.
+        reasons.push(`      remedy: file edited after verification OR verifier hash typo — never hand-type sha256: run sha256sum ${m.file} and re-dispatch the exact hash. If ${m.file} is a SYMLINK it commits its LINK TARGET, not whatever it points at: hash the RAW LINK BYTES with node -e 'const f=require("fs"),c=require("crypto");console.log(c.createHash("sha256").update(f.readlinkSync(process.argv[1],{encoding:"buffer"})).digest("hex"))' -- "${m.file}" (plain sha256sum follows the link — always wrong for a symlink) — #1092`);
       });
     }
 
