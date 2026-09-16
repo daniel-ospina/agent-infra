@@ -1,12 +1,12 @@
 ---
-title: "Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)"
+title: "Cost-Config Policy — deepseek context clamp @300K, drift guard (#341) & bounded retry/hang contract (#1088)"
 type: engineering
 domain: operations
 doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-28
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-341, pi-config, cost-config-policy
+aboutObjects: agent-infra, issue-341, issue-1088, issue-1078, issue-1110, pi-config, cost-config-policy
 ---
 
 # Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)
@@ -59,14 +59,157 @@ history; the pin below is the shipped 300K regime.
   keeps compactions inside the cache-read area so marathon sessions stay at
   the cheap end.
 
-## 2. Why `retry.maxRetries` stays at 10000 (offline-resume contract)
+## 2. The bounded retry/hang contract (#1088) — two ceilings, one finite budget
 
-`retry.maxRetries = 10000` is **load-bearing**, not a dial. With a 5-min
-capped backoff (patch-pi-retry.sh, #318), 10000 retries ≈ **34 days** of
-retrying through an outage — sessions survive any plausible network/provider
-outage and resume without user action. This plan **does not touch retry**; the
-guard asserts it stays at 10000. (Retry-storm *measurement* is a #365
-data-source-discovery task — no persisted retry records exist to analyze yet.)
+The shipped retry contract is **bounded**: a session that cannot make progress
+reaches a visible terminal/needs-input state inside a declared wall-clock
+window, while a transient outage still recovers without user action.
+
+**What changed, and why it was safe to change.** The previous contract was
+10,000 retry attempts plus a 5-minute backoff cap (`patch-pi-retry.sh`,
+#318) and 10-minute per-attempt timeouts — declared *load-bearing, not a dial*.
+It was defensible only because retries could not succeed: `createClient()`
+pooled sockets the server had already killed, so every retry met a corpse
+(#1110, upstream "Issue B" in `docs/upstream-pi-bugs.md`). A budget that can
+never buy recovery is not load-bearing — it is pure exposure:
+`10000 x (10 min attempt + 5 min backoff)` = **34–104 days** of a session
+spinning with no state that distinguishes "retrying" from "working" (measured
+on 2026-09-15: three sessions wedged 24–83 min, 0 B of socket traffic, the
+signature in #1088). #1110 is fixed and merged (`extensions/http-pool-hygiene/`)
+— a retry now lands on a fresh connection — so the unbounded budget no longer
+protects anything. It is now only an unbounded hang.
+
+**The contract.** pi has no agent-level wall-clock retry deadline
+(`_prepareRetry()` in `dist/core/agent-session.js` is an attempt count only),
+so a session's exposure is the **product**, not the count:
+
+    window = (maxRetries + 1) x per-attempt ceiling + sum(backoff)
+
+Every term is pinned below, and `scripts/check-cost-config.sh` asserts both the
+exact values and the **derived window**:
+
+| Knob | Value | Role |
+|---|---|---|
+| `retry.maxRetries` | `7` | 8 attempts total — the attempt budget |
+| `retry.baseDelayMs` | `2000` | backoff base: 2s, 4s, 8s, 16s, 32s, 60s, 60s |
+| backoff cap (`patch-pi-retry.sh`, `PI_MAX_RETRY_DELAY_MS`) | `60000` | 1-minute retry cadence — uniform, never 17m/34m/68m gaps |
+| `httpIdleTimeoutMs` | `300000` | **silent-hang ceiling** (undici headers/body idle; pi's own default) |
+| `retry.provider.timeoutMs` | `600000` | **per-call ceiling** (SDK total request) — unchanged |
+| `retry.provider.maxRetries` | absent / `0` | provider-level retries multiply the calls inside one attempt — pinned off |
+
+Derived, and enforced by the guard:
+
+- **no-progress window** `(7+1) x 300000 + 182000` = `2,582,000 ms` ≈ **43.0 min**
+  ≤ the declared **45-minute** ceiling (`HANG_WINDOW_CEILING_MS` = `2700000`).
+- **worst-case window** (every attempt burns its full SDK ceiling)
+  `(7+1) x 600000 + 182000` = `4,982,000 ms` ≈ **83 min**
+  ≤ the declared **90-minute** ceiling (`WORST_WINDOW_CEILING_MS` = `5400000`).
+- **transient recovery ladder** = `2+4+8+16+32+60+60` = **182 s** ≈ 3 min of
+  retrying after a fast-failing (refused/reset) attempt.
+
+**Why these numbers — against the failure modes, not against roundness.**
+
+- *Poisoned pool / persistent outage* — the observed #1088 mode: the attempt
+  either fails fast or stalls **silently**, and the session is invisible. The
+  silent hang is bounded by the **idle** ceiling, because a hung attempt emits
+  no bytes — exactly the measured 0 B signature. 5 minutes of zero-byte silence
+  is ~1.5 orders of magnitude above a normal time-to-first-token on a
+  300K-context request; 8 attempts x (<=5 min idle + <=1 min backoff) bounds the
+  whole hang to ~43 min — a coffee break, not a season. (On this host the
+  observed cost was 34-104 days.)
+- *Transient outage* — wifi handoff, load-balancer restart, short provider
+  blip. The ladder still rides ~3 minutes of retrying, and #1110 is what makes
+  a tighter budget safe: the retry that lands after connectivity returns now
+  *succeeds*. A longer outage terminates the turn **visibly** — pi emits
+  `auto_retry_end` with the final error and the session accepts input — rather
+  than absorbing an arbitrary deadline; the user re-issues one message. That is
+  the deliberate trade: the old contract promised unattended survival of *any*
+  outage and in practice delivered a silent multi-day hang.
+- *Legitimate slow call* — the two ceilings bound **different things**, and the
+  ordering between them is what keeps that true. `httpIdleTimeoutMs` =
+  `300000` is pi's own `DEFAULT_HTTP_IDLE_TIMEOUT_MS`; it maps to undici
+  `headersTimeout`/`bodyTimeout`, so it bounds a call that **never emits a
+  byte** (a 300K-context prefill's time-to-first-byte, or a mid-stream stall).
+  `retry.provider.timeoutMs` = `600000` (unchanged) bounds a call that *is*
+  streaming. The enforced invariant is `httpIdleTimeoutMs < provider.timeoutMs`:
+  if the total ceiling were at or below the idle ceiling, the idle ceiling could
+  never fire first and the no-progress window would silently become
+  `maxRetries x providerTimeout`. Going *below* pi's default idle ceiling is
+  deliberately **not** done — that would need a measured time-to-first-byte
+  distribution for 300K-context requests, which we do not have; 5 minutes is the
+  upstream-considered value, so the fleet's previous 10 minutes was the
+  unmeasured outlier.
+
+**What can defeat it (checked, not assumed).** Four escapes were closed or
+scoped explicitly:
+
+- `COST_CLAMP_OVERRIDE=1` silences the **clamp** block only (models.json
+  `contextWindow` / `modelOverrides`). Retry-contract violations are counted
+  separately (`RETRY_BLOCKS`) and settings/compaction violations in a third
+  counter (`SETTINGS_BLOCKS`); the guard exits 1 when **either** is non-zero,
+  and the banner says so. An ambient env var must not be able to defeat the
+  retry bound, nor to hide a reverted/disabled compaction contract — neither
+  has a rollback window. That
+  includes the two *absence* cases, which are retry-class precisely because
+  they are not a clamp rollback: a **deleted** settings file (the contract
+  itself is gone) and one that **cannot be analysed** — unparseable, valid JSON
+  that is not an object, or any failure that leaves the derived window
+  underivable (fail closed; a bound that cannot be computed must never read
+  green). §6 below documents the override, and those carve-outs are pinned by
+  tests 20, 22 and 26.
+- **Project settings.** pi resolves the project file from the **session cwd**
+  (`join(resolvedCwd, ".pi", "settings.json")`), not from the repo root — so a
+  session started in a subdirectory merges *that* directory's project file over
+  the global settings, and a project file could revert the contract while the
+  shipped and live files read clean. The guard walks the checkout for **any**
+  `.pi/settings.json` (following symlinked `.pi` directories, **at any depth** —
+  an explicit traversal with a realpath visited-set, not a depth cap, because a
+  session cwd can be any directory and a cap silently missed deeper files) —
+  including under `.worktrees/`, which is gitignored but *is* a live session cwd —
+  and fails closed on each one that carries `retry`, `httpIdleTimeoutMs` or
+  `compaction`, or that is unparseable, not a file, or not a JSON object.
+  (`compaction` counts because a project file can disable compaction or shrink
+  it exactly as it can revert `retry` — both are override-immune settings
+  classes, and leaving `compaction` out was a false PASS.) Scope boundary, stated
+  plainly: the walk covers **one checkout**; a *different* repo's project
+  settings are outside the reach of a guard run inside this one.
+- **Extension-registered providers.** An extension that builds its own undici
+  `Agent` (e.g. `extensions/custom-provider-qwen/`, the HA fallback) bypasses
+  pi's global dispatcher, so `httpIdleTimeoutMs` never reaches it. The guard
+  cannot see TypeScript constants and does not assert them; this PR aligned that
+  Agent's `bodyTimeout` with the same 5-minute silent-hang ceiling and pins the
+  reasoning in the comment there. Any future provider extension must do the same
+  — that file is the worked example.
+- **Provider-level retries.** `retry.provider.maxRetries > 0` multiplies the
+  provider calls inside one attempt, so it is part of the window; it is pinned
+  to absent/`0` (pi's own settings doc says the same).
+
+**Coupling — the actual bug class.** The pre-#1088 guard pinned the attempt
+count alone (`retry.maxRetries != 10000` → BLOCK) while this doc declared it
+load-bearing, so the *window* could drift green in either direction: raising
+the count was blocked, but raising the backoff cap or the idle ceiling (or
+inflating `retry.provider.timeoutMs`) was not — and the count alone says
+nothing without them. The guard now reads the backoff cap **out of**
+`scripts/patch-pi-retry.sh`, computes the window from the **actual** settings,
+and BLOCKs when any of: a pinned value drifts, the cap and the guard disagree,
+the two ceilings invert, or either window exceeds its declared ceiling. A
+missing/unreadable patch script is a **fail-closed BLOCK** — a window that
+cannot be computed must never read green. `tests/cost-config/run.sh` tests
+15–26 pin guard↔settings↔patch↔doc, including the case where the guard
+constants and the settings are moved **together** to 8 retries: the
+exact-value checks stay green and the **derived** window check is what fires.
+There is no `COST_CLAMP_OVERRIDE` for this contract: unlike the context clamp,
+nothing here needs a rollback window.
+
+**Per-call ceiling consistency (#1078).** #1078 asks for a per-call resource
+ceiling on a *tool* invocation (CPU/IO — the prevention leg of the #943
+family); this section pins the per-call ceilings on the *provider-call*
+surface. They share one invariant, enforced here for the surface that has it
+and required of #1078's: **a per-call ceiling must sit strictly below the
+enclosing retry/deadline window, and that window must be finite** — otherwise
+the ceiling can never fire and the "bound" is inert. #1078's tool-call ceiling
+(which depends on #1066 for an enforceable kill) must satisfy the same
+property; this guard is the pattern to copy, not a substitute for it.
 
 ## 3. Existence-proof assumptions (the Aug 25 transient-200K proof)
 
@@ -118,8 +261,22 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
 - **Guard classes** (`scripts/check-cost-config.sh`):
   - `models.json` drift (any deepseek-served id > 300K) → **BLOCK (exit 1)**.
   - `settings.json` drift (compaction block: enabled + `reserveTokens` 16384 +
-    `keepRecentTokens` 12000; or `retry.maxRetries != 10000`) →
-    **BLOCK (exit 1)**.
+    `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract —
+    the keys are `retry.maxRetries`, `httpIdleTimeoutMs`, `retry.baseDelayMs`,
+    `retry.provider.timeoutMs`, `retry.provider.maxRetries`; **the table in §2
+    is the single source for their values, which are deliberately NOT restated
+    here** — or a missed `retry.provider.timeoutMs` > `httpIdleTimeoutMs`
+    ordering; or a DERIVED retry/hang window over its declared ceiling) →
+    **BLOCK (exit 1)**. Drift in `scripts/patch-pi-retry.sh`'s backoff cap
+    (`RETRY_MAX_BACKOFF_MS`, pinned in §2) — or an unreadable/missing patch
+    script — is **BLOCK (exit 1)** too: the window cannot be computed without
+    it, and a bound that cannot be computed must never read green. A project
+    settings file (`<repo>/.pi/settings.json`) carrying `retry` or
+    `httpIdleTimeoutMs` is **BLOCK (exit 1)** as well (pi merges it OVER the
+    global settings). An ambient `PI_MAX_RETRY_DELAY_MS` differing from the
+    contract cap is **BLOCK (exit 1)**: the guard reads the DEFAULT cap, so
+    without this the environment could install a different cap while the guard
+    stayed green.
   - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
     deletion of the clamp authority is itself terminal drift (clamp gone while
     CI stays green). Store-class and live-dir-missing (first-install) stay
@@ -141,10 +298,20 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
 
 ## 6. `COST_CLAMP_OVERRIDE=1` — the documented escape
 
-- The guard honors `COST_CLAMP_OVERRIDE=1`: it **silences the BLOCK, prints a
-  loud warning, still detects** (exit 0).
-- **Sanctioned use: the rollback window only.** It never enables a live 1M
-  session silently — it is the in-window escape while the revert commit is
+- The guard honors `COST_CLAMP_OVERRIDE=1`: it **silences the CLAMP BLOCK,
+  prints a loud warning, still detects** (exit 0).
+- **It does not cover the retry/hang contract (#1088) or the settings/
+  compaction contract.** Three counters now separate the block classes: the
+  clamp (`block()`), the retry contract (`block_retry()` → `RETRY_BLOCKS`) and
+  the settings/compaction contract (`block_settings()` → `SETTINGS_BLOCKS`).
+  Even with the override set, the guard exits 1 when either of the latter two
+  is non-zero, and the banner says so. The retry class includes the *absence*
+  cases, because neither is a clamp rollback: a **deleted** settings file (the
+  contract is gone) and one that **cannot be analysed** (unparseable,
+  non-object JSON, or any failure that leaves the derived window underivable —
+  fail closed). Tests 20, 22 and 26 pin all of it.
+- **Sanctioned use: the clamp rollback window only.** It never enables a live
+  1M session silently — it is the in-window escape while the revert commit is
   prepared. A per-session override was explicitly dropped: startup auto-sync
   clobbers live edits (verified), so the committed revert is the only durable
   escape.

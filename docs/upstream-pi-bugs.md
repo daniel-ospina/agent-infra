@@ -175,7 +175,7 @@ request, the write dies with `ECONNRESET`, and the OpenAI SDK reports it as
 Two corrections to the original write-up, both load-bearing:
 
 - `httpIdleTimeoutMs` does **not** bound keep-alive. It maps to
-  `headersTimeout`/`bodyTimeout` only. Raising it (the fleet runs 600000) does
+  `headersTimeout`/`bodyTimeout` only. Raising it (the fleet runs 300000) does
   not touch pooled-socket lifetime.
 - `keepAliveTimeout` alone is not the fix: a server hint overrides it. Only
   `keepAliveMaxTimeout` caps the hint — verified by measurement, not by
@@ -225,7 +225,7 @@ spent on corpses.
    and under Aliyun's ~8 min), leaving `keepAliveTimeout` at its 4 s default so
    hint-less endpoints do not lose reuse.
 2. Expose a pool flush for the retry path, or flush on a transport-class
-   `stopReason: "error"` before the next attempt — the 5-minute capped retry
+   `stopReason: "error"` before the next attempt — the bounded retry
    contract (#1088) only pays off if the retry can land on a fresh connection.
 
 ### Mitigation in agent-infra (shipped)
@@ -301,7 +301,7 @@ quick-retry window; there is no "pause and wait for connectivity" mode.
 On a network drop, the agent-level retry (the "Retry N/3" path) runs 3 quick
 attempts (2s → 4s → 8s with the defaults) and then the session **ends with an
 error**. When the network returns minutes later, nothing resumes. There is no
-supported way to say "after the quick retries, keep trying every 5 minutes
+supported way to say "after the quick retries, keep trying at a fixed cadence
 until connectivity returns" — `retry.maxRetries` can be raised, but the
 backoff `baseDelayMs * 2^(attempt-1)` then grows unboundedly (17 min, 34 min,
 68 min, … gaps), so a laptop left on through an overnight outage waits hours
@@ -318,18 +318,30 @@ retry.
 ### Expected behavior
 Add a configurable agent-level max retry delay, e.g. `retry.maxDelayMs`
 (default: none → current exponential behavior), so
-`delayMs = min(baseDelayMs * 2^(attempt-1), maxDelayMs)`. With
-`retry.maxRetries` raised this yields "quick retries, then every N seconds
-indefinitely" — a session pauses through an outage and resumes automatically
-when connectivity returns. The retry should stay abortable (Esc /
-`abort_retry`), and long retry sleeps should not block compaction/summarization
-lifecycle events.
+`delayMs = min(baseDelayMs * 2^(attempt-1), maxDelayMs)`. This yields "quick
+retries, then every N seconds" for a **finite, operator-chosen** budget — a
+session pauses through a short outage and resumes automatically when
+connectivity returns, and terminates visibly (rather than spinning) once the
+budget is spent. The retry should stay abortable (Esc / `abort_retry`), and
+long retry sleeps should not block compaction/summarization lifecycle events.
+A wall-clock deadline (`retry.deadlineMs`) would be better still than an
+attempt count: an attempt count cannot express "give up after N minutes" when
+each attempt may itself burn the full provider timeout (#1088).
 
 ### Mitigation in agent-infra (already shipped)
-- `scripts/patch-pi-retry.sh` caps the backoff at 5 min in both files (wired
+- `scripts/patch-pi-retry.sh` caps the backoff in both files (the cap value is
+  in `docs/ops/cost-config-policy.md` §2 and read out of that script by the
+  guard) (wired
   into `pi-bootstrap/setup.sh`, re-applied on every sync; see
   `docs/providers.md §6`).
-- `retry.maxRetries: 10000` in `~/.pi/agent/settings.json`.
+- `retry.maxRetries: 7` + `httpIdleTimeoutMs: 300000` in the shipped
+  `pi-bootstrap/pi-config/settings.json` → a bounded no-progress window (the
+  derived durations are stated, computed and asserted in
+  `docs/ops/cost-config-policy.md` §2, which is the single source for them —
+  they are deliberately not restated here). Asserted (not just documented) by
+  `scripts/check-cost-config.sh`, and `tests/cost-config/run.sh` test 25 fails
+  if a summary doc restates one of the derived figures. The budget is finite because #1110
+  (below) makes retries able to *succeed* again.
 - `extensions/builtin-tools/index.ts` suppresses task-tool sub-agent kills
   while the network is unreachable (fresh heartbeat markers prove the child is
   alive and retrying, not wedged).
@@ -346,7 +358,7 @@ keyboard. Observed wedging three sessions in one working session (agent-infra
 
 **Verified against:** pi v0.85.1, `dist/core/agent-session.js` (line numbers
 below are that file). Note: this install also carries agent-infra's own
-offline-resume patch (`scripts/patch-pi-retry.sh`), so a pristine upstream
+bounded-retry patch (`scripts/patch-pi-retry.sh`), so a pristine upstream
 install may carry these lines shifted by a few — verify by code, not by line
 number.
 
