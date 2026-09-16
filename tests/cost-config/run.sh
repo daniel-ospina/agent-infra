@@ -95,6 +95,8 @@ done
 CAP_GUARD="$(sed -n 's/^RETRY_MAX_BACKOFF_MS=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
 HTTP_IDLE_TIMEOUT_MS_G="$(sed -n 's/^HTTP_IDLE_TIMEOUT_MS=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
 RETRY_PROVIDER_TIMEOUT_MS_G="$(sed -n 's/^RETRY_PROVIDER_TIMEOUT_MS=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
+RETRY_MAX_RETRIES_G="$(sed -n 's/^RETRY_MAX_RETRIES=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
+RETRY_BASE_DELAY_MS_G="$(sed -n 's/^RETRY_BASE_DELAY_MS=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
 
 # mkroot <dir> — a self-contained guard root (guard + patch script + configs)
 # so mutation tests can perturb one input without touching the repo.
@@ -778,14 +780,34 @@ rm -rf "$TMP24"
 
 echo ""
 echo "25. no doc states a stale retry/hang number (duplicate-drift pin)"
-python3 - "$ROOT" "$CLAMP_EXPECTED" "$HTTP_IDLE_TIMEOUT_MS_G" "$RETRY_PROVIDER_TIMEOUT_MS_G" "$CAP_GUARD" <<'PY' >"$OUT" 2>&1
+python3 - "$ROOT" "$CLAMP_EXPECTED" "$HTTP_IDLE_TIMEOUT_MS_G" "$RETRY_PROVIDER_TIMEOUT_MS_G" "$CAP_GUARD" \
+         "$RETRY_MAX_RETRIES_G" "$RETRY_BASE_DELAY_MS_G" <<'PY' >"$OUT" 2>&1
 import os, re, sys
-root, clamp, idle, prov, cap = sys.argv[1:6]
-IDLE, PROV, CAP = int(idle), int(prov), int(cap)
-# Values that may legitimately appear on a line naming `httpIdleTimeoutMs`:
-# the contract's idle ceiling and the per-call ceiling it sits under (a line
-# documenting BOTH knobs names both). Anything else is a stale duplicate.
-ALLOWED = {str(IDLE), str(PROV), str(clamp)}
+root, clamp, idle, prov, cap, n, base = sys.argv[1:8]
+IDLE, PROV, CAP, N, BASE = int(idle), int(prov), int(cap), int(n), int(base)
+# The derived windows, recomputed in closed form from the guard's constants (the
+# same independent arithmetic test 15 uses) so a doc that restates one of them
+# wrongly fails here instead of drifting green.
+BACKOFF = sum(min(BASE * 2 ** i, CAP) for i in range(N))
+HANG_MS = (N + 1) * IDLE + BACKOFF
+WORST_MS = (N + 1) * PROV + BACKOFF
+
+# Rule 4: the derived durations are SINGLE-SOURCED in the policy doc, and the
+# docs that summarise the contract must not restate them. This replaced a
+# regex prose-parser that produced both false blocks (a reverse pattern bridged
+# a comma into the next phrase's number) and false passes (a continuation-line
+# restatement was unreachable) — #1088 review. A figure the summary docs never
+# state cannot drift; §2's own table is pinned by test 19.
+# Built FROM the guard's constants, so the ban cannot itself go stale when the
+# contract changes: restating a duration in a summary doc is the defect, whatever
+# the duration currently is. The two trailing phrase forms catch a restatement
+# carrying a WRONG number ("...window is ~40 min"), which the literals cannot.
+BANNED = (f"{HANG_MS // 60000} min", f"{WORST_MS // 60000} min",
+          f"{BACKOFF // 60000} min retry ladder",
+          f"{HANG_MS:,}", f"{HANG_MS}", f"{WORST_MS:,}", f"{WORST_MS}", f"{BACKOFF // 1000} s",
+          "no-progress window is ~", "retry ladder is ~")
+SUMMARY_DOCS = ("docs/providers.md", "docs/upstream-pi-bugs.md")
+
 bad = []
 for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
     dirnames[:] = [d for d in dirnames if d not in {"node_modules", ".git"}]
@@ -794,28 +816,42 @@ for dirpath, dirnames, filenames in os.walk(os.path.join(root, "docs")):
             continue
         p = os.path.join(dirpath, fn)
         rel = os.path.relpath(p, root)
-        for n, line in enumerate(open(p, encoding="utf-8"), 1):
-            # (1) a value ATTACHED to the key (`httpIdleTimeoutMs: 300000`,
-            # `| httpIdleTimeoutMs | 300000 |`) must be the contract value.
+        for ln, line in enumerate(open(p, encoding="utf-8"), 1):
+            # (1) a value ATTACHED to the idle key (`httpIdleTimeoutMs: 300000`,
+            # `| httpIdleTimeoutMs | 300000 |`) must be the contract value. The
+            # per-call ceiling is only legitimate on such a line when the SAME
+            # line names the per-call key it belongs to — otherwise it is this
+            # key's pre-#1088 value (600000) and it is stale.
             for m in re.finditer(r"httpIdleTimeoutMs[^0-9\n]{0,6}(\d{5,7})", line):
-                if m.group(1) not in ALLOWED:
-                    bad.append(f"{rel}:{n} states httpIdleTimeoutMs {m.group(1)} "
+                v = m.group(1)
+                ok = (v == idle) or (v == clamp) or \
+                     (v == prov and "provider.timeoutMs" in line)
+                if not ok:
+                    bad.append(f"{rel}:{ln} states httpIdleTimeoutMs {v} "
                                f"(contract idle={IDLE}, per-call={PROV})")
             # (2) the backoff cap, restated in prose as a duration.
             m = re.search(r"(\d+)-minute capped retry", line)
             if m and int(m.group(1)) * 60000 != CAP:
-                bad.append(f"{rel}:{n} says '{m.group(1)}-minute capped retry' "
+                bad.append(f"{rel}:{ln} says '{m.group(1)}-minute capped retry' "
                            f"but the cap is {CAP}ms")
             # (3) the fleet's live idle value, named in passing (the exact drift
             # this pin exists for — it was 600000 in three places after #1088).
             m = re.search(r"the fleet runs (\d+)", line)
             if m and m.group(1) != str(IDLE):
-                bad.append(f"{rel}:{n} says 'the fleet runs {m.group(1)}' "
+                bad.append(f"{rel}:{ln} says 'the fleet runs {m.group(1)}' "
                            f"but the contract idle ceiling is {IDLE}")
+            # (4) the summary docs must not restate a derived duration at all.
+            if rel in SUMMARY_DOCS:
+                for tok in BANNED:
+                    if tok in line:
+                        bad.append(f"{rel}:{ln} restates the derived figure '{tok}' — "
+                                   f"those live only in docs/ops/cost-config-policy.md §2")
 if bad:
     print("❌ " + "\n❌ ".join(bad))
     sys.exit(1)
-print(f"OK no stale retry/hang numbers in docs/**/*.md (idle={IDLE}, per-call={PROV}, cap={CAP})")
+print(f"OK no stale retry/hang numbers (idle={IDLE}, per-call={PROV}, cap={CAP}); derived durations "
+      f"single-sourced in §2, absent from {len(SUMMARY_DOCS)} summary docs "
+      f"(banned {len(BANNED)} figures/forms derived from the guard)")
 PY
 if [ $? -eq 0 ]; then pass "$(cat "$OUT")"; else fail "stale retry/hang number in a doc: $(cat "$OUT")"; fi
 

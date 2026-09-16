@@ -513,7 +513,16 @@ if [ "$OVERRIDE" = "1" ]; then
   exit 0
 fi
 if [ "$BLOCKS" -gt 0 ]; then
-  echo "❌ cost-config guard: $BLOCKS BLOCK-level violation(s) — fix the config, or use COST_CLAMP_OVERRIDE=1 (documented escape)."
+  # Class-aware: pointing a retry/settings violation at COST_CLAMP_OVERRIDE=1
+  # sends the operator to a remedy that cannot work (it exits 1 for both), so
+  # the escape is only offered for the clamp class it actually covers.
+  if [ "$RETRY_BLOCKS" -gt 0 ] || [ "$SETTINGS_BLOCKS" -gt 0 ]; then
+    echo "❌ cost-config guard: $BLOCKS BLOCK-level violation(s) — $RETRY_BLOCKS retry/hang-contract +"
+    echo "   $SETTINGS_BLOCKS settings-contract. COST_CLAMP_OVERRIDE=1 does NOT cover either class — fix the"
+    echo "   config (only the models.json clamp class has the documented escape)."
+  else
+    echo "❌ cost-config guard: $BLOCKS BLOCK-level violation(s) — fix the config, or use COST_CLAMP_OVERRIDE=1 (documented escape)."
+  fi
   exit 1
 fi
 if [ "$WARNS" -gt 0 ]; then

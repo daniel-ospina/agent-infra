@@ -208,7 +208,7 @@ guard coupling; that section — not this summary — is the authority pinned to
 |---|---|---|
 | Agent-turn retry (the visible "Retry N/M" path) | Backoff capped at 1 min | patched `dist/core/agent-session.js` in the installed pi |
 | Compaction / branch-summary retry | Same 1-min cap (same no-cap backoff) | patched `pi-ai/dist/utils/retry.js` |
-| Retry budget | `retry.maxRetries: 7` (8 attempts; ~43 min no-progress window, ~3 min retry ladder) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
+| Retry budget | `retry.maxRetries: 7` (8 attempts; ladder + no-progress window derived and asserted in `docs/ops/cost-config-policy.md` §2) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
 | Silent-hang ceiling | `httpIdleTimeoutMs: 300000` (undici headers/body idle — pi's own default) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
 | Task sub-agents | Network-aware kill suppression — while the network is unreachable AND the child is alive (fresh heartbeat markers), the stall clauses (stream-stall / silence / first-message) don't kill it; it survives in retry | `extensions/builtin-tools/index.ts` (`heartbeatKillDecision` + probe in the heartbeat loop) |
 
@@ -229,8 +229,9 @@ scripts/patch-pi-retry.sh --check
 
 - Network dies mid-turn: 3 quick retries (2s/4s/8s), then retries after
   16s → 32s → 60s → 60s → **stop, and surface the failure** (8 attempts total;
-  7 backoff gaps). The retry ladder is ~3 min; the no-progress window is
-  ~43 min worst case (see `docs/ops/cost-config-policy.md` §2).
+  7 backoff gaps). The retry ladder and the no-progress window — both durations,
+  computed from the shipped values — are stated and enforced in
+  `docs/ops/cost-config-policy.md` §2 and deliberately not restated here.
 - Abort anytime with Esc (RPC `abort_retry`); `retry.enabled: false` in
   settings disables retrying entirely (setup.sh deep-merges the `retry` block
   per-key, so a local `enabled: false` survives every sync). A persistent

@@ -140,7 +140,7 @@ Derived, and enforced by the guard:
   upstream-considered value, so the fleet's previous 10 minutes was the
   unmeasured outlier.
 
-**What can defeat it (checked, not assumed).** Three escapes were closed or
+**What can defeat it (checked, not assumed).** Four escapes were closed or
 scoped explicitly:
 
 - `COST_CLAMP_OVERRIDE=1` silences the **clamp** block only (models.json
@@ -190,7 +190,7 @@ and BLOCKs when any of: a pinned value drifts, the cap and the guard disagree,
 the two ceilings invert, or either window exceeds its declared ceiling. A
 missing/unreadable patch script is a **fail-closed BLOCK** — a window that
 cannot be computed must never read green. `tests/cost-config/run.sh` tests
-15–25 pin guard↔settings↔patch↔doc, including the case where the guard
+15–26 pin guard↔settings↔patch↔doc, including the case where the guard
 constants and the settings are moved **together** to 8 retries: the
 exact-value checks stay green and the **derived** window check is what fires.
 There is no `COST_CLAMP_OVERRIDE` for this contract: unlike the context clamp,
