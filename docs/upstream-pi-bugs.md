@@ -562,6 +562,7 @@ That 20-process subset is **not** the same set as the table's 11 rows: 10 of
 the 11 are in it (pid 64580, silence 1.0 m, is not), and the other 10 are
 near-idle ~0.1% processes inside the table's residual bucket. The two figures
 are stated separately and must not be added.
+
 **Status of this report:** the measurement and the profile below are
 *measured*; the identity of the pumping timer is **not** established, and the
 section *What this does not yet explain* says so explicitly. Do not read the
@@ -664,9 +665,10 @@ timer subtree and 198 in 70130. (The wider
 frames nest inside a single spawn; the `Spawn` figure is the one frame and is
 what the row quotes.) Its nested `uv_run` → `uv__io_poll` → `kevent` frames
 sit *inside* the `uv__run_timers` branch, confirming the spawn happens from a
-timer callback. At ~1 spawn/s this is a plausible partner to the string work,
-and it means a **periodic synchronous `exec`** is in the same loop — a lead
-worth instrumenting before anything else.
+timer callback. A **periodic synchronous `exec`** is therefore in the same loop
+as the string work, which is a lead worth instrumenting before anything else.
+(The profile gives no *rate* for it — 262/198 are accumulated samples, not call
+counts, so the cadence is not derivable and is not claimed.)
 
 ### Cost facts, and what they do NOT add up to
 
@@ -698,6 +700,25 @@ otherwise memoises into `widthCache`. Two distinct costs, easy to conflate:
   ~0 ms via `widthCache` — which is why a single warm measurement must not be
   quoted as the cost; wrapping produces many distinct substrings and thrashes
   the 512-entry cache.
+
+### Calibration (what was ruled out)
+
+Two controls were run to bound the cause before profiling. Method: an
+interactive `pi` spawned under a pty (`pty.fork`, 200×50, output drained), CPU
+read from `ps -o time` over a 30 s window after a 25–30 s settle.
+
+- **Fresh idle TUI**: `pi --offline` in a scratch directory, no prompt sent,
+  idle — **0.24 s / 30 s = 0.8%** of a core. So the burn is *not* intrinsic to
+  an idle `pi` TUI.
+- **Visible spinner + ticking bash call**: prompt `sleep 900` accepted and the
+  bash row rendering `Elapsed Ns` while the `Working` spinner animates —
+  **0.14–0.18 s / 15 s ≈ 1%** per window, sustained across 5 windows. So the
+  1 Hz `context.invalidate()` interval *and* the 80 ms spinner, together, cost
+  ~1% when there is no large tool output to re-measure.
+
+Together these say the burn scales with **what is in the transcript**, not with
+render count or spinner cadence — which is why the magnitude section below does
+not get to close the gap.
 
 ### What this does not yet explain
 
@@ -750,7 +771,7 @@ technically unreachable. Patching `dist/` directly remains wiped by `pi update`.
 
 1. **Instrument the timer.** Log `Error().stack` from the `uv__run_timers`
    callback (or attach `--cpu-prof` to an idle spinning session) to name the
-   actual 1 Hz-class timer, and log what `spawnSync` is executing ~1×/s. This
+   actual timer, and log what `spawnSync` is executing. This
    is the missing fact.
 2. Then, if `bash.js` is implicated: stop destroying the preview cache when the
    result has not changed, and make `truncateToVisualLines` O(tail) rather than
