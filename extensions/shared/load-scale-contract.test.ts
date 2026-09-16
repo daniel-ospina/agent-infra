@@ -95,8 +95,9 @@
  *    adding an exemption — the failure message names the token.
  *    RECOGNISED helper idioms: the callee must contain `env` anywhere
  *    (`numEnv`, `get2env`, `env`, `env.foo`, `cfg.env`) and the literal must be
- *    the WHOLE argument — optionally followed by `as const`/`satisfies`, i.e. the
- *    next non-space char after the literal is `,` or `)`. A concatenation
+ *    the WHOLE argument — optionally followed by a type assertion (`as const`,
+ *    `as string`, `satisfies T`); what follows the literal (past any assertion)
+ *    must be a comma or a closing paren. A concatenation
  *    (`numEnv("NAME" + suffix, …)`) is deliberately NOT credited: that shape can
  *    name a different env var at runtime. Also `process.env[\`NAME\`]`. A
  *    differently named helper (`readCfg("NAME")`, `cfg("NAME")`) is therefore
@@ -312,7 +313,7 @@ function matchReadAt(
     // The literal must be the WHOLE argument and the callee must look like an
     // env reader, so `console.log("TASK_X")` stays a mention, not a read.
     const h =
-      /^([A-Za-z_$.0-9]*?[Ee][Nn][Vv][A-Za-z0-9_$.]*)\s*\(\s*(["'])([A-Z][A-Z0-9_]+)\2(?=\s*(?:as\s+(?:const|string)|satisfies\b)?\s*[,)])/.exec(
+      /^([A-Za-z_$.0-9]*?[Ee][Nn][Vv][A-Za-z0-9_$.]*)\s*\(\s*(["'])([A-Z][A-Z0-9_]+)\2(?=\s*(?:as\s+[^,()]+|satisfies\s+[^,()]+)?\s*[,)])/.exec(
         rest
       );
     if (h) return { name: h[3], len: h[0].length };
@@ -760,6 +761,9 @@ test("mutation control: every real read form IS recognised", () => {
     "TASK_FAKE_KNOB_XYZ",
   ]);
   deepEqual([...collectReads('const v = numEnv("TASK_FAKE_KNOB_XYZ" as const, 1);\n', "js")], [
+    "TASK_FAKE_KNOB_XYZ",
+  ]);
+  deepEqual([...collectReads('const v = numEnv("TASK_FAKE_KNOB_XYZ" satisfies string, 1);\n', "js")], [
     "TASK_FAKE_KNOB_XYZ",
   ]);
   deepEqual([...collectReads("const v = process.env[`TASK_FAKE_KNOB_XYZ`];\n", "js")], [
