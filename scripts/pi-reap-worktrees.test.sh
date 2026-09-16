@@ -32,6 +32,12 @@
 #   symlinked path forms    G7   (canonicalization of the live-process match)
 #   self-checkout           G8   (never removes its own checkout)
 #   unreadable-path         G9   (exists but unresolvable => PRESERVE, P0 pin)
+#   unreadable ancestor     G9b  (an untraversable PARENT makes the leaf stat
+#                                fail for a LIVE worktree => still PRESERVE /
+#                                unreadable-path, never prunable)
+#   gone-dir revocable ref  A24  (a gone-dir record held only by a revocable ref
+#                                must block the path-filterless prune — its admin
+#                                HEAD is the commit's last DURABLE handle)
 #   prunable-detached       G10  (gone dir + unreachable sha => PRESERVE, P0 pin)
 #   worktree-locked         G11  (=> PRESERVE)
 #   ps probe failed/empty   G12  (=> exit 3, fail-closed)
@@ -560,6 +566,37 @@ if chmod 000 "$WT_UNREAD" 2>/dev/null && [ -z "$(cd "$WT_UNREAD" 2>/dev/null && 
 else
     echo "  → G9 unreadable-path leg skipped (chmod 000 did not block traversal here)"
     chmod 755 "$WT_UNREAD" 2>/dev/null || true
+fi
+
+# G9b (cycle-8 finding) — the LEAF test above is not sufficient. With an
+# untraversable ANCESTOR, `[ -e ]` and `[ -L ]` are BOTH false for a checkout
+# that is still on disk, so the leaf-only discriminator reached the gone-dir
+# branch and classified a LIVE worktree `remove / reason=prunable`, then
+# deregistered its admin record while reporting `REMOVED=1`. Absence is only
+# proven by a REACHABLE parent that genuinely lacks the leaf.
+ENV=G9b; REPO="$(mk_repo $ENV)"
+PARENT="$T/$ENV-parent"
+mkdir -p "$PARENT"
+"$REAL_GIT" -C "$REPO" worktree add -q "$PARENT/wt" -b feat/g9b
+WT_G9B="$PARENT/wt"
+chmod 000 "$PARENT"
+if [ ! -e "$PARENT/wt" ] && [ -z "$(cd "$PARENT/wt" 2>/dev/null && pwd -P)" ]; then
+    OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+    assert_contains "$(row_for "$OUT" "$WT_G9B")" "reason=unreadable-path" \
+        "G9b an untraversable PARENT => preserve unreadable-path, never prunable"
+    assert_absent "$(row_for "$OUT" "$WT_G9B")" "reason=prunable" \
+        "G9b a live worktree is NOT classified prunable"
+    assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" \
+        "G9b the record is protected from the global prune"
+    OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+    assert_eq "$RC" "0" "G9b --apply exits 0 (a preserve, not a removal)"
+    assert_contains "$(footer $ENV)" "REMOVED=0" "G9b nothing was removed"
+    assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_G9B" \
+        "G9b --apply did NOT deregister the live worktree"
+    chmod 755 "$PARENT"
+else
+    echo "  → G9b ancestor leg skipped (chmod 000 did not block traversal here)"
+    chmod 755 "$PARENT" 2>/dev/null || true
 fi
 
 # ── G10: gone directory + unreachable detached sha (P0 pin) ────────────
@@ -1139,6 +1176,56 @@ assert_absent "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A23B" \
     "A23 the gone-checkout admin record was pruned"
 assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A23A" \
     "A23 the revocable-ref worktree is still registered (preserved, not pruned)"
+
+# ── A24: a GONE-dir revocable-ref record must block the prune (cycle-8 P0) ──
+# F7 stopped `remote-only-ref`/`revocable-ref` from setting PRUNE_BLOCKED, which
+# is right for a PRESENT-dir record (git cannot prune it) but WRONG for a GONE
+# one: a detached worktree's admin HEAD is a `git gc` reachability root, so it is
+# the last DURABLE handle of a commit whose only other holder is a revocable ref.
+# The global, path-filterless prune then deregisters the preserved record — the
+# preserve message itself says "pruning the record would ORPHAN it" — and a later
+# `fetch --prune` leaves the commit on no ref. The authoritative predicate is
+# git's OWN `prunable` flag, which is exactly the set the prune would remove.
+ENV=A24; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a24
+commit_in_wt "$REPO" "$OLD_DATE" a24
+A24_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream tmp-a24:refs/heads/feat/a24
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a24 >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+WT_A24A="$T/$ENV-gone"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A24A" "$A24_SHA"
+rm -rf "$WT_A24A"
+# a second gone-dir record with a NAMED branch: it is a `remove/prunable` row, so
+# it is what arms the end-of-pass prune the first record must block.
+WT_A24B="$(add_named_wt "$REPO" "$ENV-gone2" feat/a24-gone2)"
+rm -rf "$WT_A24B"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_A24A")" "reason=remote-only-ref" \
+    "A24 precondition: a gone-dir record held only by a revocable ref"
+assert_contains "$(row_for "$OUT" "$WT_A24B")" "reason=prunable" \
+    "A24 precondition: a second gone-dir record arms the prune"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A24 --apply exits 0"
+assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" \
+    "A24 the gone-dir revocable-ref record blocks the global prune"
+assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A24 the prune did not run"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A24 nothing was removed"
+assert_contains "$("$REAL_GIT" -C "$REPO" worktree list --porcelain)" "$WT_A24A" \
+    "A24 the revocable-ref record is still registered — the durable handle survives"
+# and the durable-handle claim itself, tested: drop the revocable ref and gc
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a24
+"$REAL_GIT" -C "$REPO" fetch -q --prune upstream
+assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A24_SHA" --format='%(refname)' | wc -l | tr -d ' ')" "0" \
+    "A24 the revocable ref is gone (nothing else but the admin record holds it)"
+"$REAL_GIT" -C "$REPO" gc -q --prune=now 2>/dev/null
+"$REAL_GIT" -C "$REPO" cat-file -e "$A24_SHA" 2>/dev/null \
+    && ok "A24 falsifier: the commit SURVIVES gc — the preserved admin HEAD is its durable handle" \
+    || bad "A24 the commit was collected: the gone-dir record's HEAD was not a durable handle"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

@@ -113,8 +113,12 @@
 # PRESERVE reasons and why each one is not a bug:
 #   main-checkout          the shared checkout
 #   self-checkout          contains the reaper's own cwd
-#   unreadable-path        exists but cannot be resolved (perm/unmount) — NOT
-#                          prunable; deregistering it would drop a live record
+#   unreadable-path        cannot be resolved (perm/unmount) — NOT prunable;
+#                          deregistering it would drop a LIVE record. A failed
+#                          LEAF stat is not proof of absence: an unresolvable
+#                          PARENT preserves too, because with an untraversable
+#                          ancestor `[ -e ]`/`[ -L ]` are false for a checkout
+#                          that is still on disk
 #   prunable               checkout directory already gone, commits survive
 #   worktree-locked        `git worktree lock` is set
 #   detached-unreachable   deleting the checkout (or pruning the record) would
@@ -128,10 +132,13 @@
 #                          --prune-tags` for a local-only tag, `stash drop`,
 #                          `bisect reset`). Same argument as remote-only-ref,
 #                          and the ref is NAMED. Neither reason blocks the
-#                          end-of-pass prune: the commit is held by a REF, so
-#                          deregistering the admin record cannot orphan it
-#                          (unlike detached-unreachable, where the record's
-#                          HEAD is the last handle)
+#                          end-of-pass prune by REASON: the commit is held by a
+#                          REF, so for a present-directory record deregistering
+#                          the admin record cannot orphan it. A GONE-directory
+#                          record is different and still blocks — the admin
+#                          HEAD is a gc reachability root, i.e. its last DURABLE
+#                          handle — and that is caught by the `prunable` flag
+#                          test in the classify loop, not by the reason
 #   unparseable-path       the record could not be framed safely (tab/newline)
 #   live-process/live-cwd  a process holds the path
 #   dirty                  tracked/unparseable changes
@@ -821,7 +828,7 @@ commits_survive() {
 # absorbed by cut -f4-).
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
-    local canon detail crumb cverdict cpay eph="" exists=0 refs=""
+    local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trecord had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
     if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\tbare repository\n'; return 0; fi
     { [ -e "$path" ] || [ -L "$path" ]; } && exists=1
@@ -842,10 +849,22 @@ classify_one() {
         # `canonicalize` failing means "cannot resolve", NOT "directory gone":
         # an existing-but-inaccessible checkout must never be treated as prunable
         # (that would deregister a live worktree and could orphan a detached
-        # commit). Only a truly absent path is prunable — and even then the
-        # commits must survive.
+        # commit). A leaf stat is NOT sufficient to tell the two apart: with an
+        # untraversable ANCESTOR (permissions) or an absent mount, `[ -e ]` and
+        # `[ -L ]` are both false for a checkout that is still on disk, so the
+        # leaf test alone reproduced `remove / reason=prunable` +
+        # `REMOVED=1` on a LIVE worktree (cycle-8 review; A9b). Absence is only
+        # proven by a REACHABLE parent that genuinely lacks the leaf — anything
+        # else (unresolvable parent, or a leaf that is still there) is
+        # `unreadable-path`: preserve, and prune-blocked.
         if [ "$exists" = 1 ]; then
             printf 'preserve\tunreadable-path\t\texists but cannot be resolved (permissions?)\n'; return 0
+        fi
+        parent="$(canonicalize "$(dirname "$path")")"
+        leaf="${path##*/}"
+        if [ -z "$parent" ] || [ -e "$parent/$leaf" ] || [ -L "$parent/$leaf" ]; then
+            printf 'preserve\tunreadable-path\t\tcannot prove the checkout is absent (unresolvable parent: %s)\n' "${parent:-<none>}"
+            return 0
         fi
         refs="$(commits_survive "$sha" "$branch")"
         case "$refs" in
@@ -1250,19 +1269,30 @@ run() {
         else
             PRESERVE_C=$((PRESERVE_C + 1))
             log "CLASSIFY preserve $p reason=$reason $detail"
-            # A preserved record that git may ALSO deem prunable (unresolvable
-            # path, broken admin link) must not be swept up by a global prune.
+            # A preserved record that git may ALSO deem prunable must not be
+            # swept up by the global, path-filterless prune. The AUTHORITATIVE
+            # predicate is git's OWN `prunable` flag: it is exactly the set the
+            # prune would remove, so it is what makes a gone-directory row's
+            # admin HEAD load-bearing. A detached worktree's admin HEAD is a
+            # reachability root for `git gc` (and its reflog a second handle),
+            # so deregistering a preserved GONE record discards the last DURABLE
+            # handle of a commit whose only other holder is a REVOCABLE ref —
+            # the F3 exposure reached through the prune. Reproduced in cycle 8
+            # (A24). Present-directory records are never flagged prunable, so a
+            # live `remote-only-ref` row no longer disables reclaiming the
+            # prunable class (F7/A23) — which is why this is a flag test, not a
+            # reason test.
+            case ",$f," in *,prunable,*) PRUNE_BLOCKED=1 ;; esac
+            # Belt and braces for a record preserved because a PROBE could not
+            # be evaluated: git may not have flagged it prunable, and
+            # `detached-unreachable` (commit on NO ref) is the one reason where
+            # losing the record's HEAD is unrecoverable, so it blocks on the
+            # reason regardless.
             case "$reason" in
                 unreadable-path|status-error|status-timeout|unparseable-path|worktree-locked) PRUNE_BLOCKED=1 ;;
                 detached-unreachable) PRUNE_BLOCKED=1 ;;
-                # `remote-only-ref` / `revocable-ref` deliberately do NOT block:
-                # the commit is held by a REF, so deregistering the admin record
-                # does not orphan it (that is exactly the `detached-unreachable`
-                # case, where the record's HEAD is the last handle). Blocking on
-                # them made a single long-lived remote-only row disable the
-                # whole `prunable` reclaim path on every later pass — the
-                # "reaper that silently never reaps" failure this tool exists to
-                # prevent. Pinned by A23.
+                # `remote-only-ref` / `revocable-ref` block ONLY via the flag
+                # test above — a present-dir row of either must not block.
             esac
         fi
     done <<<"$WT_LIST"
