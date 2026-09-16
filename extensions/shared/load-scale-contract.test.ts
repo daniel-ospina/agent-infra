@@ -93,17 +93,24 @@
  *    credited) except the misses, which are false-BLOCK. If a new doc'd knob
  *    uses one of the missed forms, fix the scanner (or the wiring) rather than
  *    adding an exemption — the failure message names the token.
- *    RECOGNISED helper idioms: `numEnv("NAME", …)` / `getEnv("NAME")` — the
- *    callee must contain `env` and the literal must be the whole argument —
- *    and `process.env[\`NAME\`]`. So any differently named helper
- *    (`readCfg("NAME")`, `cfg("NAME")`) is still a false BLOCK.
+ *    RECOGNISED helper idioms: `numEnv("NAME", …)` / `getEnv("NAME")` /
+ *    `env("NAME")` — the callee must CONTAIN `env` (any position, dots allowed)
+ *    and the literal must be the WHOLE argument (a concatenation like
+ *    `numEnv("NAME" + suffix, …)` is NOT credited, deliberately: that shape can
+ *    name a different env var at runtime), plus `process.env[\`NAME\`]`. A
+ *    differently named helper (`readCfg("NAME")`, `cfg("NAME")`) is therefore
+ *    still a false BLOCK.
  *  - PIN 4 COVERS THE BAND VOCABULARY, NOT EVERY PROSE RESTATEMENT. The
  *    restatement scan runs over `skills/**` only, and the band parser reads
  *    §6's sentence in `docs/ops/load-policy.md` only. Prose restatements
- *    elsewhere — §7's ratio form, `docs/research/*` (e.g. the #279 note) — are
- *    NOT pinned, so when #1116 recalibrates they can go stale with the suite
- *    green. §7 was reworded in #1073 to avoid adding a third restatement; the
- *    other docs are out of this PR's scope and left as a known gap.
+ *    elsewhere — §7's ratio form, `docs/research/*` (e.g. the #279 note), the
+ *    #209 plan banners — are NOT pinned, so when #1116 recalibrates they can go
+ *    stale with the suite green. §7 was reworded in #1073 to avoid adding a
+ *    third restatement; the other docs are out of this PR's scope and left as a
+ *    known gap. Pin 4 itself is a heuristic: a line that co-locates a band word,
+ *    a `Nx` multiplier and 8/16 without being a restatement ("concurrency 3x,
+ *    load 8") still false-blocks — the failure message names the file, and the
+ *    fix is a reword.
  *  - UNCLOSED QUOTES ARE NOT STRINGS: a quote that does not close on its own
  *    line is treated as ordinary code, so an apostrophe or a quote inside a
  *    regex literal (`/don't/`, `/^https?:\/\//`) cannot swallow the rest of the
@@ -301,7 +308,8 @@ function matchReadAt(
     // (extensions/session-checks.ts, extensions/slack-bridge/socket-mode.ts).
     // The literal must be the WHOLE argument and the callee must look like an
     // env reader, so `console.log("TASK_X")` stays a mention, not a read.
-    const h = /^([A-Za-z_$][\w$]*[Ee][Nn][Vv][A-Za-z0-9_$]*)\s*\(\s*(["'])([A-Z][A-Z0-9_]+)\2/.exec(rest);
+    const h =
+      /^([A-Za-z_$.]*?[Ee][Nn][Vv][A-Za-z0-9_$]*)\s*\(\s*(["'])([A-Z][A-Z0-9_]+)\2(?=\s*[,)])/.exec(rest);
     if (h) return { name: h[3], len: h[0].length };
   }
   // Shell expansions.
@@ -609,7 +617,7 @@ function skillMarkdownFiles(): string[] {
 
 /** A restatement of the numeric load bands (what the skill must not carry). */
 const BAND_RESTATEMENT =
-  /(?:\d+x\s*[<≥]|≤\s*load1|load1?\s*[<≥]\s*\d|[123]x[^\n]*\b(?:8|16)\b|\b(?:8|16)\b[^\n]*[123]x)/;
+  /(?:\d+x\s*[<≥]|≤\s*load1|load1?\s*[<≥]\s*\d)|(?=.*\b(?:band|bands|load|scale)\b)(?=.*\b[123]x\b)(?=.*\b(?:8|16)\b)/;
 
 // ── harness ────────────────────────────────────────────────────────────────
 
@@ -722,9 +730,23 @@ test("mutation control: every real read form IS recognised", () => {
   deepEqual([...collectReads('const v = getEnv("TASK_FAKE_KNOB_XYZ");\n', "js")], [
     "TASK_FAKE_KNOB_XYZ",
   ]);
+  // a callee that STARTS with `env`, and the method form
+  deepEqual([...collectReads('const v = env("TASK_FAKE_KNOB_XYZ");\n', "js")], [
+    "TASK_FAKE_KNOB_XYZ",
+  ]);
+  deepEqual([...collectReads('const v = envReader("TASK_FAKE_KNOB_XYZ");\n', "js")], [
+    "TASK_FAKE_KNOB_XYZ",
+  ]);
+  deepEqual([...collectReads('const v = cfg.env("TASK_FAKE_KNOB_XYZ");\n', "js")], [
+    "TASK_FAKE_KNOB_XYZ",
+  ]);
   deepEqual([...collectReads("const v = process.env[`TASK_FAKE_KNOB_XYZ`];\n", "js")], [
     "TASK_FAKE_KNOB_XYZ",
   ]);
+  // …but a concatenated / computed argument is NOT the whole argument — the
+  // exact "a doc-named token looks read while a different var is read" shape
+  deepEqual([...collectReads('const v = numEnv("TASK_FAKE_KNOB_XYZ" + suffix, 1);\n', "js")], []);
+  deepEqual([...collectReads('const s = "set TASK_FAKE_KNOB_XYZ to 1";\n', "js")], []);
   deepEqual([...collectReads("function f(env = process.env) { return env.TASK_FAKE_KNOB_XYZ; }\n", "js")], [
     "TASK_FAKE_KNOB_XYZ",
   ]);
@@ -786,10 +808,10 @@ test("mutation control: the band-restatement predicate fires on the old wording"
   ok(BAND_RESTATEMENT.test("the load bands are 1x/2x/3x at 8/16"));
   ok(BAND_RESTATEMENT.test("scale at load 8 and again at 16, 2x then 3x"));
   ok(!BAND_RESTATEMENT.test("through the fixed bands declared in `docs/ops/load-policy.md` §6"));
-  ok(
-    !BAND_RESTATEMENT.test("retry 2x after 8s, and keep concurrency at 3"),
-    "a legitimate 2x/8s coincidence must not false-block"
-  );
+  // counter-controls: ordinary prose that merely co-locates a multiplier and a
+  // number must NOT false-block (see LIMITS for the residual case)
+  ok(!BAND_RESTATEMENT.test("retry 2x after 8 seconds, and keep concurrency at 3"));
+  ok(!BAND_RESTATEMENT.test("V2 ships 8 files with 3x latency"));
 });
 
 // ── 2. doc bands ⇔ code bands ──────────────────────────────────────────────
@@ -886,11 +908,13 @@ test("the §3 default for TASK_FIRST_OUTPUT_TIMEOUT_MS is the code's own default
         `(§3 default cell: "${row![1]}"; code literals: ${[...codeNums].join(", ")})`
     );
   }
-  // mutation control: the predicate above fires on a bumped doc default
-  ok(!codeNums.has("120_000"), "mutation control: the getter must not carry a 120_000 default");
+  // mutation control: run the SAME predicate over a synthetic bumped doc cell
+  const bumped = new Set(
+    (row![1].replace(/\d[\d_]*/g, "120_000").match(/\d[\d_]*/g) ?? [])
+  );
   ok(
-    ![...new Set(["120_000"])].every((n) => codeNums.has(n)),
-    "mutation control: the default predicate accepted a value the getter does not have"
+    [...bumped].some((n) => !codeNums.has(n)),
+    "mutation control: the doc-default predicate must reject a value the getter does not have"
   );
 });
 

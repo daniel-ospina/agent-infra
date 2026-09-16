@@ -247,14 +247,15 @@ unconditionally.
   suspension is the safe direction.
 - **cgroup/VM-steal blindness:** accepted for a same-host fleet (see §1).
 - **The watchdog's load bands are INERT below the first band on the fleet's
-  10-core hosts:** the bands §6 declares are absolute magnitudes, which on a
-  10-core host sit at well under one× the core count — so every load under the
-  first band's threshold, including the 6.6–7.3 range observed in #1074, leaves
-  the load-aware machinery doing nothing at all (the bound is 1x, i.e. the
-  static env-overridable value). #1073 documents the bands rather than
-  recalibrating them; a per-core rule is tracked in #1116, which is a live-bound
-  change and therefore its own decision. Read the thresholds themselves from §6,
-  which is the single declaration.
+  10-core hosts:** the bands §6 declares are absolute magnitudes anchored to that
+  operating point, and the first band's threshold sits below one× the core count
+  there (the second is above it) — so every load under the first band's
+  threshold, including the 6.6–7.3 range observed in #1074, leaves the load-aware
+  machinery doing nothing at all (the bound is 1x, i.e. the static
+  env-overridable value). #1073 documents the bands rather than recalibrating
+  them; a per-core rule is tracked in #1116, which is a live-bound change and
+  therefore its own decision. Read the thresholds themselves from §6, which is
+  the single declaration.
 
 ## 8. Swarm CLI contract (documented handoff — out of scope here)
 
