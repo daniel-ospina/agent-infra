@@ -2574,7 +2574,9 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
     ok(close > -1 && raw.slice(close, close + 3) === "});", `decision call site ${i + 1} must be closed by its own }); (first depth-0 closer, then the shape is checked — on a parsable source that closer IS this call's)`);
     const args = raw.slice(0, close);
     ok(args.includes("...hbThresholds,"), `decision call site ${i + 1} must spread the loop's own hbThresholds`);
-    ok(!/heartbeatTimeoutMs:/.test(args) && !/intervalMs:/.test(args), `decision call site ${i + 1} must not name heartbeatTimeoutMs:/intervalMs: in its arguments at all — before or after the spread`);
+    const namedKeys = (args.match(/(?:^|[\s,{])\s*["']?([A-Za-z_$][\w$]*)["']?\s*:/g) ?? []).map((k) => k.replace(/["':\s,{]/g, ""));
+    ok(!namedKeys.includes("heartbeatTimeoutMs") && !namedKeys.includes("intervalMs"), `decision call site ${i + 1} must not override the window inputs — a bare, quoted or computed-LITERAL key all reintroduce them (a literal-text key test sees only the first form)`);
+    ok(!/\[\s*["'](heartbeatTimeoutMs|intervalMs)["']\s*\]/.test(args), `decision call site ${i + 1} must not override the window inputs by computed key either`);
     ok(args.indexOf("...") === args.lastIndexOf("..."), `decision call site ${i + 1} must spread hbThresholds and nothing else — a SECOND spread after it re-introduces the window inputs without naming either one`);
   });
   equal((code.match(/heartbeatKillDecision\s*\(/g) ?? []).length, 3, "one declaration + exactly two DIRECT-callee calls; an alias, a parenthesized callee (f)(…), f?.(…) and f.call/apply are NOT claimed — this pins the direct-call count, not every possible invocation");
@@ -2627,7 +2629,12 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   // `markerAgeMs` local six times in the same report. Positive pins instead:
   equal(hcBody.split("hbCtx.state.lastMarkerAt").length - 1, 2, "the callback reads the marker clock exactly twice — both on the single report declaration. A THIRD read is a freshness gate on the far tail (this is the read a `markerAgeMs`/`lastMarkerAt`-based gate needs)");
   ok(/const markerAgeMs = [^;]+;\s*doResolve\(composeAbnormalExit\(/.test(hcBody), "the marker-age local flows STRAIGHT into the resolve — nothing (not even a ternary) may sit between them, which is how the far tail would become freshness-gated without adding an `if` header");
-  ok(hcBody.indexOf("if (settled) return;") < hcBody.indexOf("killTreeAndEscalate()"), "the `settled` short-circuit precedes the tree kill — a settled dispatch's tree must not be killed; the guards' conditions alone do not pin their order");
+  // The order pin reads the guard with the SAME whitespace-tolerant regex as the
+  // presence check: an exact-literal `indexOf` returned -1 on a reformatted guard
+  // (`if (settled)` newline `return;`) and `-1 < killIdx` then PASSED vacuously,
+  // so one whitespace-only edit silently disarmed the pin.
+  const settledGuardIdx = hcBody.search(/if\s*\(\s*settled\s*\)\s*return;/);
+  ok(settledGuardIdx > -1 && settledGuardIdx < hcBody.indexOf("killTreeAndEscalate()"), "the `settled` short-circuit precedes the tree kill — a settled dispatch's tree must not be killed; the guards' conditions alone do not pin their order");
 
   // (d) Behavioural side of the same coupling: with the interval term dominating
   // the max, the decision's window must follow `i.intervalMs` — a T-only window
