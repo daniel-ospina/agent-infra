@@ -942,9 +942,10 @@ all fail-closed on uncertainty:
   the two inputs the verdict actually depends on: the **realpath of the file
   that was read** (printed when it differs from the typed spelling — the hub's
   `scripts/` is a symlink into agent-infra, so the typed path names one
-  checkout while the gated content lives in another) and the session cwd, plus
-  a line stating that the verdict came from the script's **content**, not from
-  session state. #1129 also fixed the label itself: `gitCheckoutIsLinkedWorktree`
+  checkout while the gated content lives in another) and the **execution cwd
+  plus the session cwd** (the verdict is computed from the script's content
+  *resolved against those cwds and the hub's current branch*, so the message
+  states all three inputs rather than claiming the file alone reproduces it). #1129 also fixed the label itself: `gitCheckoutIsLinkedWorktree`
   resolved git's RELATIVE `--git-common-dir` against the unrealpathed cwd
   spelling while `--git-dir` came back ABSOLUTE, so a path traversing a symlink
   (`<hub>/scripts` → another repo's subdirectory) resolved the two halves into
@@ -958,13 +959,27 @@ all fail-closed on uncertainty:
 fenced code block (info string `bash`) inside a single-quoted test fixture, and
 the round-14 `<<` + shell word + `git` co-occurrence in its usage heredoc. Both
 arms are disabled
-for an explicit, **named** list (`SANCTIONED_SCRIPT_RELPATHS`), keyed on the
+for an explicit, **named** list (`SANCTIONED_SCRIPT_RELPATHS`: the mandated
+preflight and `checkout-hygiene/hub-worktree.sh`, the recovery helper the guard
+messages recommend), keyed on the
 **realpath of the guard's own checkout** (derived from the module's own URL) so
-an agent-editable copy of the framework in a worktree is *not* exempt. A
+an agent-editable copy of the framework in a worktree is *not* exempt. The
+anchor is **realpath-before-walk**, and that is load-bearing, not cosmetic: pi
+deploys the guard through the symlink farm
+`~/.pi/agent/extensions/<name>` → the checkout, and a lexical `../..` on that
+spelling yields `~/.pi/agent` — a directory that is neither the checkout (so
+the exemption would silently never fire and the mandated preflight would stay
+blocked) nor a git checkout (so the write gate would not cover it, and an
+agent could mint `<~/.pi/agent>/scripts/<listed relpath>` and take the
+exemption with content of its choosing). The listed relpath is realpath'd on
+the comparison side too. A
 **directory-wide** exemption was rejected: `scripts/` also carries git-
 DESTRUCTIVE helpers (`cleanup-worktree.sh` runs `git worktree remove --force`
 + `git branch -D`) that need no write at all. Every exemption writes an
-`m4_script_exemption` audit row — a silent relaxation is the 2026-08-18 shape.
+`m4_script_exemption` audit row carrying the matched **realpath**, the resolved
+framework root and the session cwd — a silent relaxation is the 2026-08-18
+shape, and a row naming only the listed relpath cannot distinguish a legitimate
+exemption from one taken through a file at the same relpath under another root.
 Pinned by three behavioural tests (sanctioned script runs; the SAME content at
 another path still blocks; a destructive framework helper still blocks).
 

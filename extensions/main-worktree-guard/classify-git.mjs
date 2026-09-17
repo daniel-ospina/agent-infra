@@ -11,6 +11,7 @@ import { execSync, execFileSync } from "node:child_process";
 import { resolve, join, dirname, relative, basename } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 //
 // Purpose: in the SHARED main checkout, branch-state-changing git operations
@@ -3422,8 +3423,12 @@ export function classifyGitCommandDetailed(command) {
 // (isMain:false → the #618/#621 hub-write gate silently lifted for every
 // target under that repo's subdirectories — probe-verified 2026-09-09).
 // git prints repo-relative paths when cwd is under the gitdir's parent and
-// absolute otherwise; resolve() against cwd normalizes BOTH spellings, and
-// realpathSync canonicalizes a symlinked `.git`.
+// absolute otherwise. #1129: realpath the cwd FIRST and resolve BOTH spellings
+// against that base — resolving the relative half against the unrealpathed
+// spelling lands it in a different repo when the supplied path traverses a
+// symlink (probe: a checkout whose `scripts/` is a symlink into another repo).
+// `resolve()` alone normalizes neither half against the other; `realpathSync`
+// canonicalizes a symlinked `.git`.
 // Not a git repo → throws (callers catch — isWorktreeCwd degrades to false =
 // treat as main, the safe/block default).
 export function gitCheckoutIsLinkedWorktree(cwd) {
@@ -3452,6 +3457,23 @@ export function gitCheckoutIsLinkedWorktree(cwd) {
   const c = resolve(base, commonDir);
   if (g === c) return false; // same spelling (main at its toplevel: both ".git")
   return realpathSync(g) !== realpathSync(c);
+}
+
+/** #1129 (code-review P0) — the framework root a sanctioned script exemption
+ *  must be keyed on, derived from the GUARD MODULE's own URL.
+ *
+ *  A pure function so it can be tested against the geometry pi actually
+ *  deploys: pi loads this extension from the symlink farm
+ *  `~/.pi/agent/extensions/<name>/index.ts` → the framework checkout, and its
+ *  jiti loader preserves the SYMLINK SPELLING in `import.meta.url`. Walking
+ *  `..`/`..` LEXICALLY on that spelling yields `~/.pi/agent` — which is neither
+ *  the checkout (the exemption silently never fires, so the mandated preflight
+ *  stays blocked) nor a git checkout (so the write gate does not cover it, and
+ *  an agent could mint `<that root>/scripts/<listed relpath>` and take the
+ *  exemption with content of its choosing). Realpath the MODULE FIRST, then
+ *  walk up. Same inversion class as #708/#823. */
+export function frameworkRootFromModuleUrl(moduleUrl) {
+  return resolve(dirname(realpathSync(fileURLToPath(moduleUrl))), "..", "..");
 }
 
 export function isWorktreeCwd(cwd) {

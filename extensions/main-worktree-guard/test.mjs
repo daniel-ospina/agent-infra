@@ -4,10 +4,10 @@
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname, relative, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4920,6 +4920,35 @@ try {
       pinSrc.indexOf("scriptGitVerdict(resolved, branch, base"), true);
   expectBool("#1129: the exemption is audit-logged (deliberate relaxation is observable)",
     pinSrc.includes("m4_script_exemption"), true);
+  // #1129 (code-review P0) — the ANCHOR. The exemption is only as narrow as the
+  // root it is keyed on. pi deploys the guard through a symlink farm
+  // (`~/.pi/agent/extensions/<name>` → the checkout) and its loader preserves
+  // the symlink spelling in `import.meta.url`, so a LEXICAL `../..` on that
+  // spelling yields `~/.pi/agent`: not the checkout (exemption inert → the
+  // mandated preflight stays blocked) and not a git checkout (agent-WRITABLE,
+  // so an agent could mint `<that root>/scripts/<listed relpath>` and take the
+  // exemption with content of its choosing). BEHAVIOURAL, on the real
+  // geometry — the farm below is a symlink to this extension's own directory,
+  // so this fails on any regression to realpath-after-walk.
+  expectBool("#1129 P0: index.ts derives the anchor from its own module URL",
+    pinSrc.includes("_frameworkRootFromModuleUrl(import.meta.url)"), true);
+  expectBool("#1129 P0: the exemption realpaths BOTH sides of the comparison",
+    pinSrc.includes("realpathSync(resolve(_frameworkRoot, rel))"), true);
+  {
+    const farmTmp = mkdtempSync(join(tmpdir(), "guard-anchor-1129-"));
+    const realExtDir = fileURLToPath(new URL(".", import.meta.url));
+    const realRoot = realpathSync(resolve(realExtDir, "..", ".."));
+    const fakeAgentRoot = join(farmTmp, "pi-agent");
+    mkdirSync(join(fakeAgentRoot, "extensions"), { recursive: true });
+    const farmLink = join(fakeAgentRoot, "extensions", "main-worktree-guard");
+    symlinkSync(realExtDir, farmLink);
+    const farmedModule = join(farmLink, "index.ts");
+    expectBool("#1129 P0: the symlink-farm spelling is what the loader sees (lexical ../.. lands OUTSIDE the checkout)",
+      resolve(dirname(farmedModule), "..", "..") === fakeAgentRoot, true);
+    expectBool("#1129 P0: frameworkRootFromModuleUrl(farmed) is the CHECKOUT, not the farm parent",
+      frameworkRootFromModuleUrl(pathToFileURL(farmedModule).href) === realRoot, true);
+    try { execSync(`rm -rf "${farmTmp}"`, { stdio: "ignore" }); } catch {}
+  }
   expectBool("#1129: the block message names the realpath actually read + the verdict source",
     pinSrc.includes("resolves to:") && pinSrc.includes("verdict source:"), true);
 

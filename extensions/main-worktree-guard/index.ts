@@ -151,6 +151,10 @@ let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
 let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) => boolean = () => false;
+// #1129: the exemption's root anchor (pure fn in classify-git). Fail-safe
+// default null → the inline realpath-first fallback runs; never null-holes the
+// exemption (a stale module must not silently disable it) and never throws.
+let _frameworkRootFromModuleUrl: ((moduleUrl: string) => string) | null = null;
 // #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
@@ -289,6 +293,10 @@ try {
   // _backdoorBlock, whose catch turns the whole #627 gate fail-OPEN).
   if (typeof _extractCodePayload === "function") extractCodePayload = _extractCodePayload;
   if (typeof _codePayloadGitVerdict === "function") codePayloadGitVerdict = _codePayloadGitVerdict;
+  // #1129: the sanctioned-script exemption's anchor (see
+  // frameworkRootFromModuleUrl). Namespace read + typeof guard, same skew
+  // contract as #709/#627 above — a stale module leaves the inline fallback.
+  if (typeof _m5.frameworkRootFromModuleUrl === "function") _frameworkRootFromModuleUrl = _m5.frameworkRootFromModuleUrl;
   // #967/#1484: the invocation's positional args feed the subcommand
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
@@ -1718,21 +1726,35 @@ function _worktreeDiscardBlock(command: string): string | null {
 const SANCTIONED_SCRIPT_RELPATHS = [
   // commit-workflow Step 1 (01-preflight.md) — the mandated pre-push gate.
   "scripts/check-pipeline-compliance.sh",
-  // The sanctioned worktree/recovery helper every guard message recommends.
+  // The recovery helper most guard messages recommend.
   "scripts/checkout-hygiene/hub-worktree.sh",
 ];
 const _frameworkRoot: string | null = (() => {
   try {
-    return realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), "..", ".."));
+    // #1129 (code-review P0): realpath the MODULE, THEN walk up — the
+    // computation lives in classify-git (pure, so it is tested against a real
+    // symlinked extension dir); the inline form below is the SAME expression
+    // and exists so a stale classify-git cannot silently disable the
+    // exemption. pi deploys this extension from the symlink farm
+    // `~/.pi/agent/extensions/<name>` → this checkout and its loader preserves
+    // the symlink spelling, so a lexical `../..` yields `~/.pi/agent`: not the
+    // checkout (exemption inert → the mandated preflight stays blocked) and not
+    // a git checkout (agent-WRITABLE, so a minted
+    // `<~/.pi/agent>/scripts/<listed relpath>` would take the exemption).
+    if (_frameworkRootFromModuleUrl) return _frameworkRootFromModuleUrl(import.meta.url);
+    const self = realpathSync(fileURLToPath(import.meta.url));
+    return realpathSync(resolve(dirname(self), "..", ".."));
   } catch {
     return null; // unknown location → no exemption (fail-closed)
   }
 })();
 
 /** Sanctioned-framework-script exemption (#1129) — returns the matched
- *  relative path (for the audit row), or null. Realpath-keyed on both sides:
- *  a symlinked spelling (the hub's `scripts/`) resolves to the same file, and
- *  a copy in another checkout does not. */
+ *  relative path (for the audit row), or null. Realpath-keyed on BOTH sides:
+ *  a symlinked spelling (the hub's `scripts/`) resolves to the same file, and a
+ *  copy in another checkout does not. The listed relpath is realpath'd too, so
+ *  a symlinked component inside the framework's own tree cannot silently
+ *  disable the exemption. */
 function _sanctionedScriptExemption(resolvedScript: string): string | null {
   if (!_frameworkRoot) return null;
   let real: string;
@@ -1742,7 +1764,9 @@ function _sanctionedScriptExemption(resolvedScript: string): string | null {
     return null;
   }
   for (const rel of SANCTIONED_SCRIPT_RELPATHS) {
-    if (real === resolve(_frameworkRoot, rel)) return rel;
+    let sanctioned: string;
+    try { sanctioned = realpathSync(resolve(_frameworkRoot, rel)); } catch { continue; }
+    if (real === sanctioned) return rel;
   }
   return null;
 }
@@ -1824,10 +1848,19 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     const sanctionedRel = _sanctionedScriptExemption(resolved);
     if (sanctionedRel) {
       try {
+        // #1129 (code-review P2): record the REALPATH that matched, not just
+        // the listed relpath — with only the relpath, an exemption taken
+        // through a file at the same relpath under a different root (the
+        // pre-fix anchor pointed at `~/.pi/agent`) logs an identical row. The
+        // session cwd is recorded too, since that is what an operator needs to
+        // reconstruct where the command came from.
         appendJsonl({
           event: "m4_script_exemption",
           extension: "main-worktree-guard",
           script: sanctionedRel,
+          script_realpath: realpathSync(resolved),
+          framework_root: _frameworkRoot,
+          session_cwd: resolve(process.cwd()),
           command: command.slice(0, 300),
           session_id: _currentSessionId(),
         });
@@ -1855,8 +1888,9 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
         `   ${resolved}`,
         ...(realResolved !== resolved ? [`   (resolves to: ${realResolved})`] : []),
         `   (script location: ${scriptInWorktree ? "a linked worktree" : "the shared main checkout"})`,
-        `   (verdict source: the script's CONTENT — re-read the file at the path above to reproduce;`,
-        `    session cwd: ${resolve(process.cwd())})`,
+        `   (verdict source: the script's CONTENT as read at that path, resolved against the`,
+        `    execution/session cwd below and the hub's current branch — not session state alone;`,
+        `    execution cwd: ${base ?? resolve(process.cwd())}; session cwd: ${resolve(process.cwd())})`,
         `   performs a git operation that is not sanctioned against the shared main checkout.`,
         `   → Run the underlying git commands directly (each is gated on its own), or do`,
         `     this work in an isolated worktree (invoke the using-git-worktrees skill).`,
