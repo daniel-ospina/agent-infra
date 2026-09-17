@@ -98,8 +98,13 @@
  *    the WHOLE argument — optionally followed by a type assertion (`as const`,
  *    `as string`, `satisfies T`); what follows the literal (past any assertion)
  *    must be a comma or a closing paren. A concatenation
- *    (`numEnv("NAME" + suffix, …)`) is deliberately NOT credited: that shape can
- *    name a different env var at runtime. Also `process.env[\`NAME\`]`. A
+ *    (`numEnv("NAME" + suffix, …)`) is deliberately NOT credited, **including one
+ *    written after an assertion** (`"NAME" as any + suffix`): the assertion tail
+ *    is matched as a run of characters that excludes `+`, so a concatenation is
+ *    never swallowed as part of the type. The tail is still a character class,
+ *    not a type parser — a value continuation built from type-position
+ *    characters (`"NAME" as any || other`, `… instanceof X`) is a narrow
+ *    false-OPEN this guard does not close. Also `process.env[\`NAME\`]`. A
  *    differently named helper (`readCfg("NAME")`, `cfg("NAME")`) is therefore
  *    still a false BLOCK.
  *  - PIN 4 COVERS THE BAND VOCABULARY, NOT EVERY PROSE RESTATEMENT. The
@@ -312,8 +317,11 @@ function matchReadAt(
     // (extensions/session-checks.ts, extensions/slack-bridge/socket-mode.ts).
     // The literal must be the WHOLE argument and the callee must look like an
     // env reader, so `console.log("TASK_X")` stays a mention, not a read.
+    // The assertion tail excludes `+` so a trailing CONCATENATION is never
+    // absorbed as if it were part of the type: `"TASK_X" as any + suffix` names
+    // a different var at runtime and must stay a mention (see LIMITS).
     const h =
-      /^([A-Za-z_$.0-9]*?[Ee][Nn][Vv][A-Za-z0-9_$.]*)\s*\(\s*(["'])([A-Z][A-Z0-9_]+)\2(?=\s*(?:as\s+[^,()]+|satisfies\s+[^,()]+)?\s*[,)])/.exec(
+      /^([A-Za-z_$.0-9]*?[Ee][Nn][Vv][A-Za-z0-9_$.]*)\s*\(\s*(["'])([A-Z][A-Z0-9_]+)\2(?=\s*(?:as\s+[^,()+]+|satisfies\s+[^,()+]+)?\s*[,)])/.exec(
         rest
       );
     if (h) return { name: h[3], len: h[0].length };
@@ -772,6 +780,14 @@ test("mutation control: every real read form IS recognised", () => {
   // …but a concatenated / computed argument is NOT the whole argument — the
   // exact "a doc-named token looks read while a different var is read" shape
   deepEqual([...collectReads('const v = numEnv("TASK_FAKE_KNOB_XYZ" + suffix, 1);\n', "js")], []);
+  // …and an assertion does not license a trailing concatenation: at runtime the
+  // name is `"TASK_FAKE_KNOB_XYZ" as any + suffix`, not the literal, so crediting
+  // it would be exactly the false-open the bare-concat control above excludes.
+  deepEqual([...collectReads('const v = numEnv("TASK_FAKE_KNOB_XYZ" as any + suffix, 1);\n', "js")], []);
+  deepEqual(
+    [...collectReads('const v = numEnv("TASK_FAKE_KNOB_XYZ" satisfies string + suffix, 1);\n', "js")],
+    []
+  );
   deepEqual([...collectReads('const s = "set TASK_FAKE_KNOB_XYZ to 1";\n', "js")], []);
   deepEqual([...collectReads("function f(env = process.env) { return env.TASK_FAKE_KNOB_XYZ; }\n", "js")], [
     "TASK_FAKE_KNOB_XYZ",
