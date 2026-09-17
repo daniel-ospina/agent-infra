@@ -34,7 +34,7 @@
 #   scratch-worktree.sh run   [opts] -- <cmd...>   create, run <cmd> inside it,
 #                                                  ALWAYS clean up (trap)
 #   scratch-worktree.sh create [opts]              print path; caller MUST clean
-#   scratch-worktree.sh clean <path> | --all       remove a scratch worktree
+#   scratch-worktree.sh clean <path> | --all [--force-all]   remove a scratch worktree
 #   scratch-worktree.sh list                       list live scratch worktrees
 #
 # OPTIONS (run / create):
@@ -44,7 +44,9 @@
 #                   < 5 MB mode — prefer it for probes). Literal paths, not
 #                   patterns; absolute paths and '.'/'..' components are
 #                   refused, and every listed path MUST exist in REF's tree or
-#                   the call fails (never a silently empty checkout).
+#                   the call fails (never a silently empty checkout). The comma
+#                   is the ONLY delimiter, so a path containing a comma is not
+#                   expressible — use --full for such a path.
 #   --full          full checkout of the tracked tree (default when neither
 #                   --paths nor --full is given)
 #   --root DIR      scratch root (default: ${SCRATCH_WORKTREE_ROOT:-/tmp})
@@ -71,9 +73,10 @@
 # never `rm -rf`s an arbitrary directory. For an OWNED scratch worktree the dirt
 # inside it is the probe's own disposable output, so removal is forced (the same
 # thing `run`'s trap discards). `clean --all` sweeps this repo's scratch root but
-# SKIPS any candidate a live process still holds (bounded `ps` snapshot; a probe
-# whose argv does not name the path escapes it — the safe direction is PRESERVE).
-# No `find`, no recursive walk of the repo, no glob over the scratch root.
+# SKIPS any candidate a live process still holds (bounded `ps` snapshot, which
+# FAILS OPEN for a cwd-only holder — hence a bare `clean --all` refuses to sweep
+# and `--force-all` is required). No `find`, no recursive walk of the repo, no
+# glob over the scratch root.
 
 set -uo pipefail
 
@@ -84,6 +87,7 @@ REF=""
 PATHS=""
 FULL=0
 KEEP=0
+FORCE_ALL=0
 # Seconds a wrapped command gets to die after SIGTERM before SIGKILL (bounded so
 # a TERM-ignoring child cannot block cleanup and leak the worktree).
 SCRATCH_WORKTREE_KILL_GRACE="${SCRATCH_WORKTREE_KILL_GRACE:-5}"
@@ -112,6 +116,7 @@ while [ "$#" -gt 0 ]; do
     --root)  [ -n "${2:-}" ] || die "--root needs a path";  ROOT="$2"; shift 2 ;;
     --full)  FULL=1; shift ;;
     --keep)  KEEP=1; shift ;;
+    --force-all) FORCE_ALL=1; shift ;;
     --all)   CLEAN_ALL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) die "unknown option '$1'" ;;
@@ -183,17 +188,35 @@ remove_one() { # <repo> <path>
   return 0
 }
 
+# remove_created() — the IN-PROCESS cleanup path (cycle-4 P1). `run` created $D
+# with mktemp under the canonical ROOT, so it knows the path by identity; it must
+# NOT depend on the in-worktree marker, which the wrapped command can legitimately
+# delete (`git clean -fdx`, `git stash -u`, `rm -rf .`) — with the marker gone,
+# a marker-based removal warns and leaves the worktree AND its admin record
+# behind, defeating the tool's central guarantee. Marker-based ownership stays
+# for CALLER-SUPPLIED paths (`clean <path>`), where identity cannot be proven.
+remove_created() { # <repo> <path>
+  local repo="$1" d="$2"
+  [ -n "$d" ] || return 0
+  git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
+  if [ -e "$d" ]; then rm -rf "$d" 2>/dev/null || warn "could not remove $d"; fi
+  git -C "$repo" worktree prune >/dev/null 2>&1 || true
+  return 0
+}
+
 list_scratch() { # <repo>
   git -C "$1" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' \
     | while IFS= read -r d; do case "$d" in "$ROOT"/scratch-*) printf '%s\n' "$d" ;; esac; done
 }
 
-# Best-effort liveness probe (cycle-3 P1): `clean --all` must not delete the
-# scratch worktree a sibling session is actively using. Bounded — one `ps`
-# snapshot and a shell pattern match, no filesystem walk, no `find`/`lsof +D`.
-# A probe whose argv does not name the path escapes it (accepted residual), but
-# the common shapes (a shell running `cd <dir> && …`, a test runner invoked with
-# the path) are caught, and the safe direction is PRESERVE.
+# Best-effort liveness probe (cycle-3 P1): `clean --all --force-all` should not
+# delete the scratch worktree a sibling session is actively using. Bounded — one
+# `ps` snapshot and a shell pattern match, no filesystem walk, no `find`/`lsof +D`.
+# HONEST LIMIT: this FAILS OPEN for a holder that does not name the path in argv
+# (e.g. a process whose cwd is the worktree, or one holding an open file there) —
+# such a worktree IS deleted. That is why a bare `clean --all` refuses to sweep at
+# all (see the dispatch below) and the SKILLs tell an agent to clean only its own
+# path; the argv probe is a second line of defence, not the guarantee.
 held_by_live_process() { # <path>
   local d="$1" out
   out="$(/bin/ps -axo args= 2>/dev/null)" || return 1
@@ -210,6 +233,13 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
     exit 0
   fi
   if [ "$CLEAN_ALL" = 1 ]; then
+    if [ "$FORCE_ALL" != 1 ]; then
+      n="$(list_scratch "$REPO" | wc -l | tr -d ' ')"
+      [ "$n" = 0 ] && { echo "$PROG: no scratch worktrees for $REPO"; exit 0; }
+      printf '%s\n' "$PROG: refusing to sweep $n scratch worktree(s) — a bare\n  `clean --all` cannot see a holder whose argv does not name the path, so it\n  would delete a sibling session's in-flight probe. Clean only your own path:\n    $PROG clean <path>\n  Or, deliberately, sweep with --force-all:" >&2
+      list_scratch "$REPO" | sed 's/^/    /' >&2
+      exit 0
+    fi
     while IFS= read -r d; do
       [ -n "$d" ] || continue
       if held_by_live_process "$d"; then
@@ -218,6 +248,9 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
       fi
       remove_one "$REPO" "$d" || true
     done < <(list_scratch "$REPO")
+    # Records whose directory is already gone (a wrapped `rm -rf .`) are not
+    # removable by `owns()`; the prune is what reclaims them.
+    git -C "$REPO" worktree prune >/dev/null 2>&1 || true
     exit 0
   fi
   [ -n "$CLEAN_TARGET" ] || die "clean needs a path or --all"
@@ -295,7 +328,7 @@ if [ "$MODE" = create ]; then
   exit 0
 fi
 
-[ "${#CMD[@]}" -gt 0 ] || { remove_one "$REPO" "$D"; die "run needs a command after --"; }
+[ "${#CMD[@]}" -gt 0 ] || { remove_created "$REPO" "$D"; die "run needs a command after --"; }
 
 CMD_PID=""
 cleanup_run() {
@@ -316,7 +349,7 @@ cleanup_run() {
     if kill -0 -- -"$CMD_PID" 2>/dev/null; then kill -9 -- -"$CMD_PID" 2>/dev/null || true; fi
     kill "$watch" 2>/dev/null || true
   fi
-  remove_one "$REPO" "$D"
+  remove_created "$REPO" "$D"
   exit "$rc"
 }
 trap cleanup_run EXIT

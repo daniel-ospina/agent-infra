@@ -26,8 +26,10 @@
 #                         SIGKILLed so the worktree is still removed
 #   T12 --help            exits 0
 #   T13 linked-worktree caller cleans up (owns() via the COMMON git dir)
-#   T14 clean --all preserves a scratch worktree a live process holds
+#   T14 clean --all --force-all preserves a live-held scratch worktree
 #   T15 a straggler DESCENDANT (leader exits first) is SIGKILLed
+#   T16 a BARE clean --all refuses to sweep (fail-closed); --force-all sweeps
+#   T17 cleanup does not depend on the in-worktree marker (identity removal)
 
 set -uo pipefail
 
@@ -139,9 +141,9 @@ D6="$(sx create --ref "$C2" --full 2>/dev/null)"
 [ "$(live_scratch)" = 1 ] && ok 0 "T6b list shows the scratch worktree (positive control)" || ok 1 "T6b list shows the scratch worktree (got $(live_scratch))"
 FOREIGN="$FIX/foreign-wt"
 git -C "$FIX/repo" worktree add --detach "$FOREIGN" "$C2" >/dev/null 2>&1
-sx clean --all >/dev/null 2>&1
-[ ! -e "$D6" ] && ok 0 "T6c clean --all removes the scratch worktree" || ok 1 "T6c clean --all removes the scratch worktree"
-[ -d "$FOREIGN" ] && ok 0 "T6d clean --all spares a non-scratch worktree" || ok 1 "T6d clean --all spares a non-scratch worktree"
+sx clean --all --force-all >/dev/null 2>&1
+[ ! -e "$D6" ] && ok 0 "T6c clean --all --force-all removes the scratch worktree" || ok 1 "T6c clean --all --force-all removes the scratch worktree"
+[ -d "$FOREIGN" ] && ok 0 "T6d clean --all --force-all spares a non-scratch worktree" || ok 1 "T6d clean --all --force-all spares a non-scratch worktree"
 git -C "$FIX/repo" worktree remove --force "$FOREIGN" >/dev/null 2>&1
 git -C "$FIX/repo" worktree prune >/dev/null 2>&1
 
@@ -159,14 +161,14 @@ sx clean "$FORGED" >/dev/null 2>&1
 rm -rf "$FORGED"
 
 # The reviewer's P1: a REGISTERED worktree under ROOT whose name matches the
-# scratch prefix but carries no marker must survive `clean --all`.
+# scratch prefix but carries no marker must survive `clean --all --force-all`.
 UNMARKED="$ROOT_P/scratch-unmarked"
 git -C "$FIX/repo" worktree add --detach "$UNMARKED" "$C2" >/dev/null 2>&1
 printf 'PRECIOUS UNCOMMITTED\n' > "$UNMARKED/UNRESOLVED.txt"
-sx clean --all >/dev/null 2>&1
+sx clean --all --force-all >/dev/null 2>&1
 { [ -d "$UNMARKED" ] && [ -f "$UNMARKED/UNRESOLVED.txt" ]; } \
-  && ok 0 "T7c registered but unowned worktree survives clean --all" \
-  || ok 1 "T7c registered but unowned worktree survives clean --all"
+  && ok 0 "T7c registered but unowned worktree survives clean --all --force-all" \
+  || ok 1 "T7c registered but unowned worktree survives clean --all --force-all"
 git -C "$FIX/repo" worktree remove --force "$UNMARKED" >/dev/null 2>&1
 git -C "$FIX/repo" worktree prune >/dev/null 2>&1
 
@@ -197,11 +199,15 @@ sx run --ref "$C2" --paths /etc -- true >/dev/null 2>&1
 # vacuously (the cycle-1 vacuity class). Comments are stripped before testing, so
 # prose ABOUT the ban cannot satisfy it and a real invocation cannot hide.
 BAN_RE='(git[[:space:]]+clone|git[[:space:]]+archive|cp[[:space:]]+-[a-zA-Z]*[rR]|cp[[:space:]]+-a|rsync|tar[[:space:]]+-[a-zA-Z]*x)'
-stripped() { sed 's/#.*//' "$1"; }
-detects() { printf '%s\n' "$1" | sed 's/#.*//' | grep -qE "$BAN_RE"; }
+stripped() { sed -E 's/(^|[[:space:]])#.*$/\1/' "$1"; }
+# Strip only WORD-BOUNDARY comments: a bare `s/#.*//` also deletes `#` inside a
+# token, so `echo a#b; cp -R /x /y` would strip to `echo a` and the real scan
+# would report clean (cycle-4 P2).
+detects() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$/\1/' | grep -qE "$BAN_RE"; }
 POS_FAIL=0
 for s in 'git clone /x /y' 'cp -R /x /y' 'cp -a /x /y' 'cp -pR /x /y' \
-         'rsync -a /x /y' 'git archive HEAD | tar -xf - -C /tmp/z'; do
+         'rsync -a /x /y' 'git archive HEAD | tar -xf - -C /tmp/z' \
+         'echo a#b; cp -R /x /y'; do
   detects "$s" || { FAIL "T10a positive control not detected: $s"; POS_FAIL=1; }
 done
 [ "$POS_FAIL" = 0 ] && PASS "T10a every banned copy shape is detected (positive control)"
@@ -253,17 +259,42 @@ else
 fi
 [ "$(live_scratch)" = 0 ] && ok 0 "T11c no admin record survives the TERM-ignoring child" || ok 1 "T11c no admin record survives the TERM-ignoring child"
 
-# ── T14: `clean --all` PRESERVES a scratch worktree a live process holds ─────
+# ── T16: a BARE `clean --all` refuses to sweep (fail-closed) ────────────────
+# The argv liveness probe fails OPEN for a cwd-only holder, so the bare sweep
+# must not run at all; `--force-all` is the deliberate opt-in.
+D16="$(sx create --ref "$C2" --full 2>/dev/null)"
+sx clean --all >/dev/null 2>&1
+[ -d "$D16" ] && ok 0 "T16a a bare clean --all removes nothing" || ok 1 "T16a a bare clean --all removed a worktree"
+sx clean --all --force-all >/dev/null 2>&1
+[ ! -e "$D16" ] && ok 0 "T16b clean --all --force-all removes it" || ok 1 "T16b clean --all --force-all removes it"
+
+# ── T17: cleanup does not depend on the in-worktree marker ──────────────────
+# A wrapped command may delete untracked files, which removes `.scratch-worktree`.
+# `run` knows the path by identity, so it must still remove the worktree and its
+# admin record (cycle-4 P1).
+P17="$FIX/t17path"
+bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full \
+  -- bash -c "pwd > '$P17'; rm -f .scratch-worktree; test -e .scratch-worktree && echo MARKER || echo NOMARKER" \
+  >/dev/null 2>&1
+RP="$(cat "$P17" 2>/dev/null)"
+if [ -n "$RP" ] && [ ! -e "$RP" ]; then
+  ok 0 "T17a a marker-destroying command still cleans the checkout"
+else
+  ok 1 "T17a a marker-destroying command still cleans the checkout (path=${RP:-unset})"
+fi
+[ "$(live_scratch)" = 0 ] && ok 0 "T17b the admin record is reclaimed too" || ok 1 "T17b the admin record is reclaimed too"
+
+# ── T14: `clean --all --force-all` PRESERVES a live-held scratch worktree ────
 D14="$(sx create --ref "$C2" --full 2>/dev/null)"
 bash -c "cd '$D14' && sleep 8" >/dev/null 2>&1 &
 HOLD=$!
 sleep 1
-sx clean --all >/dev/null 2>&1
+sx clean --all --force-all >/dev/null 2>&1
 [ -d "$D14" ] && ok 0 "T14a a live-held scratch worktree is PRESERVED" || ok 1 "T14a a live-held scratch worktree is PRESERVED"
 kill "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
 pkill -P "$HOLD" 2>/dev/null
 sleep 1
-sx clean --all >/dev/null 2>&1
+sx clean --all --force-all >/dev/null 2>&1
 [ ! -e "$D14" ] && ok 0 "T14b the released scratch worktree is removed" || ok 1 "T14b the released scratch worktree is removed"
 
 # ── T15: a straggler DESCENDANT (leader exits first) is still SIGKILLed ──────
