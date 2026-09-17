@@ -416,7 +416,9 @@ fi
 # None of the five is in any farm list, and `test-setup-no-nesting.sh` names each with its owning
 # issue so the class cannot grow a silent member.
 # ⛔ Keep this assignment on ONE line: `scripts/ci_runner_gate.test.sh` reads it with
-# `sed -n 's/^fleet_srcs=(\(.*\))$/\1/p'`, so a wrapped array reads as EMPTY and that gate's
+# `sed -n 's/^# #1142/#1143 — the scheduled reapers are launchd-invoked, so their drivers must
+# be farmed here too (launchd cannot read ~/Documents under macOS TCC, #427).
+fleet_srcs=(\(.*\))$/\1/p'`, so a wrapped array reads as EMPTY and that gate's
 # membership assertion goes RED. (Loud, not silent — do not describe it as vacuous.)
 # Tests are not farmed (the farm contract above): scripts/test_objective.py and
 # scripts/test_turn_classify_state.py land in the repo and stay there.
@@ -455,7 +457,7 @@ fi
 # sweep's `--preflight` and refuses a box whose engine prerequisites do not resolve.
 # Farming the sweep is what makes that preflight able to run at all (it is executed
 # from the farmed path), so the arming can never bless a unit pointed at nothing.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh pi-reap-orphans.sh pi-reap-scratch.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
