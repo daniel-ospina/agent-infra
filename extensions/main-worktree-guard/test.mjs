@@ -4973,17 +4973,45 @@ try {
     pinSrc.includes("gatedSets.every((s) => s.discs.length === 0)") &&
     !pinSrc.includes("for (const set of sets) {"), true);
   expectBool("#1139: the M5 exemption is audit-logged (deliberate relaxation is observable)",
-    pinSrc.includes("m5_script_exemption"), true);
+    pinSrc.includes("m5_script_exemption") &&
+    // ... and the row says what the relaxation HID, not just that it fired
+    // (review fold-in: a row written from inside the filter predicate fires
+    // even when the dropped set carried no discards).
+    pinSrc.includes("discards_dropped") && pinSrc.includes("sets_exempted") &&
+    pinSrc.includes("const exempted: { rel: string; realpath: string; discards: number; forms: string[] }[]"), true);
+  expectBool("#1139 T6: a null anchor / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
+    pinSrc.includes("if (!_frameworkRoot) return null;") &&
+    pinSrc.includes("catch { rel = null; }") &&
+    pinSrc.includes("if (rel === null) return true;"), true);
+  expectBool("#1139 (review P1): the pipe-seed walk DEQUOTES before resolving (a quoted piped script was unwalked)",
+    pinSrc.includes("const dequoted = ") && pinSrc.includes("words.slice(i).join(\" \")"), true);
+  expectBool("#1139 (review P1): the status probe CAPTURES stderr (the not-a-checkout allow arm was dead code)",
+    pinSrc.includes('stdio: ["ignore", "pipe", "pipe"]') &&
+    !pinSrc.includes('stdio: ["ignore", "pipe", "ignore"]'), true);
   expectBool("#1139: the fail-closed arm stopped claiming a dirty tree",
-    pinSrc.includes("target not statically resolvable, failing closed (#709)") &&
+    pinSrc.includes("the discard's effect could not be verified, failing closed (#709)") &&
     pinSrc.includes("NOT a claim that the checkout is dirty") &&
+    // Cause-neutral (review fold-in): the arm serves nine reasons and only two
+    // are target-resolution failures, so no single-cause headline.
+    !pinSrc.includes("target not statically resolvable, failing closed (#709)") &&
     // The misattribution itself: this sentence was printed in BOTH arms,
     // unconditionally, so a clean checkout was told it had uncommitted work.
-    !pinSrc.includes("uncommitted changes to tracked files that this command would revert."), true);
+    !pinSrc.includes("uncommitted changes to tracked files that this command would revert.") &&
+    // The `!== null` contract — `unverifiable ? …` would render the DIRTY arm
+    // (with the hatch) for an empty-string reason.
+    pinSrc.includes("unverifiable !== null") && !pinSrc.includes("unverifiable ?"), true);
   expectBool("#1139: the fail-closed arm stopped offering the bypass hatch as its remedy",
     pinSrc.includes("not its remedy") &&
     // The dirty arm (which really did read a dirty scope) KEEPS the hatch.
     pinSrc.includes("Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1"), true);
+  const reasonFnStart = pinSrc.indexOf("function _worktreeDiscardBlockReason");
+  const reasonFnEnd = reasonFnStart === -1 ? -1 : pinSrc.indexOf("\nfunction ", reasonFnStart + 10);
+  const reasonFn = reasonFnStart === -1 ? "" : pinSrc.slice(reasonFnStart, reasonFnEnd === -1 ? pinSrc.length : reasonFnEnd);
+  expectBool("#1139 (review): the fail-closed remedy prints the framework checkout's OWN absolute path (no advice loop)",
+    reasonFn.includes("resolve(_frameworkRoot, \"scripts/checkout-hygiene/hub-worktree.sh\")") &&
+    !reasonFn.includes("bash scripts/checkout-hygiene/hub-worktree.sh <branch>") &&
+    reasonFn.includes("address the FRAMEWORK CHECKOUT's own copy, because a") &&
+    reasonFn.includes("worktree-local copy of it is gated by design (#1139):"), true);
 
   // (c) RESIDUAL PIN — the text-shape false positives are NOT fixed by the
   // exemption; they are contained. A lone markdown fence is enough to gate a

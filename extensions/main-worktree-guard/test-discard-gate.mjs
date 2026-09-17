@@ -21,7 +21,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-discard-gate.mjs
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -761,12 +761,33 @@ async function partB() {
     expectTrue("B12c: the fail-closed message does NOT claim uncommitted changes exist",
       /NOT a claim that the checkout is dirty/.test(unverifiableMsg) &&
       !/carries\s+uncommitted changes/.test(unverifiableMsg) &&
-      /target not statically resolvable/.test(unverifiableMsg),
+      /not statically resolvable/.test(unverifiableMsg),
       `reason=${JSON.stringify(unverifiableMsg).slice(0, 320)}`);
     expectTrue("B12c2: it names the real reason (target resolution) and does NOT offer the AGENT_ALLOW_MAIN_EDITS hatch as its remedy",
       /not its remedy/.test(unverifiableMsg) &&
       !/Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1/.test(unverifiableMsg),
       `reason=${JSON.stringify(unverifiableMsg).slice(0, 320)}`);
+    // Review fold-in: the fail-closed arm serves NINE reasons, only two of which
+    // are target-resolution failures (the status-read arm resolves the target
+    // and then fails the probe). A headline naming one cause for all nine is the
+    // misattribution class this PR removes, so the arm's own wording must stay
+    // cause-neutral and defer to the `⚠️ <reason>` line.
+    expectTrue("B12c3: the fail-closed headline is CAUSE-NEUTRAL (no single-cause claim for all nine reasons)",
+      /the discard's effect could not be verified, failing closed/.test(unverifiableMsg) &&
+      !/target not statically resolvable, failing closed/.test(unverifiableMsg),
+      `reason=${JSON.stringify(unverifiableMsg).slice(0, 160)}`);
+    // Review fold-in (#1139's own sibling defect class): the message recommended
+    // the RELATIVE `scripts/checkout-hygiene/hub-worktree.sh`, which from a
+    // linked-worktree session resolves to that worktree's own ~gated~ copy — the
+    // gate telling the reader to run a command the gate blocks. The recommended
+    // spelling must be the framework checkout's own (exempt) path, and running
+    // it from the SAME worktree session must be ALLOWED.
+    const recommended = /bash "([^"]*checkout-hygiene\/hub-worktree\.sh)" <branch>/.exec(unverifiableMsg)?.[1] ?? "";
+    expectTrue("B12c4: the remedy names the framework checkout's OWN absolute path (not the relative spelling)",
+      recommended !== "" && recommended === sanctionedRecovery,
+      `recommended=${JSON.stringify(recommended)}`);
+    expectTrue("B12c5: the recommended command is itself ALLOWED from the same worktree session (no advice loop)",
+      allowed(await bash(`bash "${recommended}"`, wt)), "the remedy the gate printed is blocked by the gate");
 
     // Negative control — the correction is not a blanket deletion of the claim:
     // the arm that DID read a dirty scope still says so, and still names the
@@ -824,8 +845,47 @@ async function partB() {
       blocked(wrapped) && /it would destroy uncommitted work/.test(wrapped?.reason ?? ""),
       `reason=${JSON.stringify(wrapped?.reason ?? "").slice(0, 300)}`);
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
-    rmSync(wrapper, { force: true });
+    // (`wrapper` is kept for the pipe-form arms below; `copyPath` is done with.)
     rmSync(copyPath, { force: true });
+
+    // T4 in its PIPE form (review P1 — pre-existing, reproducible before this
+    // change): the pipe-seed walk kept the SHELL QUOTES on the token, so
+    // `cat "<wrapper>" | bash` resolved `'"<wrapper>"'`, realpathSync threw and
+    // the file was never read — a discard inside it ran UNGATED, while the
+    // identical UNQUOTED spelling was walked. The same second-hop wrapper as
+    // B12h, fed through the pipe instead of as an argv script.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const quotedPipe = await bash(`cat "${wrapper}" | bash`, wt);
+    expectTrue("B12i: a QUOTED path piped into a shell is walked like the unquoted spelling (no quote-blind seed)",
+      blocked(quotedPipe) && /it would destroy uncommitted work/.test(quotedPipe?.reason ?? ""),
+      `reason=${JSON.stringify(quotedPipe?.reason ?? "").slice(0, 300)}`);
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    // A quoted path CONTAINING SPACES, behind a flag — the suffix-seed half.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const spaced = join(wt, "spaced wrapper-1139.sh");
+    write(spaced, readFileSync(wrapper, "utf8"));
+    const spacedPipe = await bash(`cat -n "${spaced}" | bash`, wt);
+    expectTrue("B12i2: a quoted path with SPACES behind a flag is walked too",
+      blocked(spacedPipe) && /it would destroy uncommitted work/.test(spacedPipe?.reason ?? ""),
+      `reason=${JSON.stringify(spacedPipe?.reason ?? "").slice(0, 300)}`);
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    rmSync(spaced, { force: true });
+    rmSync(wrapper, { force: true });
+
+    // The ONE allow arm of the status probe: a target with NO working tree has
+    // nothing to discard. The branch was DEAD before this change —
+    // `stdio[2] = "ignore"` left `error.stderr` null, so the not-a-checkout
+    // regex could never match and every such target failed closed (review P1).
+    // A BARE repo is the reachable geometry: a plain non-repo directory never
+    // gets this far (`resolveInvocationTarget` fails first, and that arm fails
+    // closed). Verified by reverting `"pipe"` → `"ignore"` in a copy: this
+    // exact command BLOCKS under the old stdio and ALLOWS under the new one.
+    const bare = join(tmp, "bare-1139.git");
+    execSync(`git init --bare -q "${bare}"`, { cwd: tmp, stdio: "ignore" });
+    const bareTarget = await bash(`git -C "${bare}" checkout -- f.txt`, wt);
+    expectTrue("B12j: a discard aimed at a target with NO working tree (bare repo) is ALLOWED (documented fail-open arm, now reachable)",
+      allowed(bareTarget), `reason=${JSON.stringify(bareTarget?.reason ?? "").slice(0, 240)}`);
+
 
     // ── B11: escape hatches unchanged ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
@@ -858,6 +918,74 @@ async function partB() {
 }
 
 await partB();
+
+// ────────────────────────────────────────────────────────────────────────
+// Part C (#1139, threat class T6) — a guard loaded from a checkout that does
+// NOT carry the listed scripts must FAIL CLOSED, not fail open. `_frameworkRoot`
+// is derived from the guard's own module URL; when no listed relpath exists
+// under it, `realpathSync(resolve(_frameworkRoot, rel))` throws for every entry,
+// `_sanctionedScriptExemption` returns null, and the exemption must be INERT —
+// the harvested set stays gated. The fixture is a COPY of the extension in a
+// layout with no `scripts/`, driven against the SAME command and the SAME cwd
+// as the anchor-correct control, so the only difference is the anchor.
+// ────────────────────────────────────────────────────────────────────────
+async function partC() {
+  const tmpc = realpathSync(mkdtempSync(join(tmpdir(), "guard-noanchor-")));
+  const prevCwd = process.cwd();
+  const savedEnv = HATCH_VARS.map((v) => [v, process.env[v]]);
+  try {
+    const extDir = join(tmpc, "extensions", "main-worktree-guard");
+    mkdirSync(join(tmpc, "extensions", "shared"), { recursive: true });
+    mkdirSync(extDir, { recursive: true });
+    for (const f of ["index.ts", "classify-git.mjs"]) copyFileSync(join(HERE, f), join(extDir, f));
+    for (const f of ["print-mode.ts", "audit-log.ts", "branch-ownership.mjs"]) copyFileSync(join(HERE, "..", "shared", f), join(tmpc, "extensions", "shared", f));
+    for (const v of HATCH_VARS) delete process.env[v];
+    process.env.HOME = tmpc; // no TTL marker under this HOME
+    delete process.env.PI_SESSION_ID;
+    // Capture the guard's one-time load warnings so C0 can prove the fixture
+    // differs from the real guard in EXACTLY one respect — the framework root.
+    // (A load fallback would disable M1/M2/M3 and the C1 block below could then
+    // be attributed to the wrong walk.) The copy's realpath is what makes
+    // `_frameworkRoot` = tmpc, which carries no `scripts/`.
+    const warnings = [];
+    const realWarn = console.warn;
+    console.warn = (...a) => { warnings.push(a.map(String).join(" ")); };
+    let mod;
+    try { mod = await import(pathToFileURL(join(extDir, "index.ts")).href); }
+    finally { console.warn = realWarn; }
+    const handlers = new Map();
+    mod.default({ on(n, fn) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(fn); } });
+    const inertToolCall = handlers.get("tool_call")?.[0];
+    // The framework checkout is the SESSION cwd for both arms; the command is
+    // the sanctioned helper's own path. Only the loaded guard differs.
+    const frameworkCheckout = realpathSync(join(HERE, "..", ".."));
+    const sanctioned = join(frameworkCheckout, "scripts", "checkout-hygiene", "hub-worktree.sh");
+    const cmd = `bash "${sanctioned}"`;
+    process.chdir(frameworkCheckout);
+    expectTrue("C0: the fixture guard loads with its non-M5 machinery intact (the anchor is the only difference)",
+      !warnings.some((w) => /DISABLED/.test(w)), `warnings=${JSON.stringify(warnings).slice(0, 240)}`);
+    const inert = await inertToolCall?.({ toolName: "bash", input: { command: cmd } }, undefined);
+    expectTrue("C1 (#1139 T6): an anchor carrying NO listed script FAILS CLOSED (the exemption is inert, not fail-open)",
+      !!inert && inert.block === true,
+      `handler returned ${JSON.stringify(inert)?.slice(0, 240)}`);
+    // Control: the SAME command, SAME cwd, through the anchor-CORRECT guard.
+    const real = await import(pathToFileURL(INDEX_TS).href);
+    const rh = new Map();
+    real.default({ on(n, fn) { if (!rh.has(n)) rh.set(n, []); rh.get(n).push(fn); } });
+    const anchored = await rh.get("tool_call")[0]({ toolName: "bash", input: { command: cmd } }, undefined);
+    expectTrue("C2 control: the SAME command through the anchor-CORRECT guard is ALLOWED",
+      anchored === undefined || anchored === null,
+      `handler returned ${JSON.stringify(anchored)?.slice(0, 240)}`);
+  } catch (e) {
+    expectTrue("C: part C ran without throwing", false, String(e?.message ?? e).slice(0, 240));
+  } finally {
+    process.chdir(prevCwd);
+    for (const [v, val] of savedEnv) { if (val === undefined) delete process.env[v]; else process.env[v] = val; }
+    try { rmSync(tmpc, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+await partC();
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} test-discard-gate: ${pass} passed, ${fail} failed, ${skip} skipped`);
 process.exit(fail === 0 ? 0 : 1);

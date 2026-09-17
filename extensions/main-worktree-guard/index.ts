@@ -1259,9 +1259,12 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
 // instead: a discard-family command is blocked when the checkout it targets is
 // carrying uncommitted state the discard would destroy — in the hub AND in a
 // linked worktree. Read-only commands, clean targets, untracked-only dirt and
-// index-only restores stay allow. Placed AFTER the env/marker hatch return, so
-// both hatches bypass it unchanged (task children are unhatched by #617/#623,
-// which is why this is the enforcement surface for them).
+// index-only restores stay allow, and so do the framework's OWN sanctioned
+// scripts (#1139 — SANCTIONED_SCRIPT_RELPATHS, the set-scoped exemption in the
+// script walk below; a non-sanctioned script's discards stay gated). Placed
+// AFTER the env/marker hatch return, so both hatches bypass it unchanged (task
+// children are unhatched by #617/#623, which is why this is the enforcement
+// surface for them).
 
 /** Bounded porcelain probe for a discard's target checkout.
  *  @returns true = would destroy uncommitted work; false = nothing to destroy;
@@ -1272,13 +1275,24 @@ function _discardStatusPorcelain(probeCwd: string, d: { scope: string; pathspecs
     if (d.scope === "paths" && d.pathspecs.length > 0) args.push("--", ...d.pathspecs);
     // execFileSync (array args, no shell): pathspecs are DATA — a path
     // containing shell metacharacters can never become a command.
+    //
+    // #1139 (review P1): stderr is PIPED, not ignored. With a terminal `ignore`
+    // Node leaves `error.stderr` null and `error.message` is only
+    // `Command failed: git status …`, so the not-a-checkout test below could
+    // NEVER match and the documented fail-open carve-out was DEAD CODE — a
+    // discard whose resolved target is not a checkout was always blocked with
+    // `null` (and, before #1139, with a message claiming the checkout was
+    // dirty). Capturing stderr is what makes the branch reachable.
     const out = execFileSync("git", args, {
-      cwd: probeCwd, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+      cwd: probeCwd, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"],
     });
     return discardDestroysWip(String(out), d);
   } catch (e) {
     const msg = String((e as { stderr?: unknown })?.stderr ?? "") + String((e as { message?: string })?.message ?? e);
-    // Not a checkout (or a bare repo): there is no working tree to destroy.
+    // Not a checkout (or a bare repo): there is no working tree to destroy, so
+    // this is the probe's one ALLOW arm. Everything else — an unreadable status
+    // on a REAL checkout (index.lock contention, permissions, the 5s timeout) —
+    // is `null` and fails closed at the caller.
     if (/not a git repository|must be run in a work tree|does not have a working tree/i.test(msg)) return false;
     return null; // unverifiable → fail closed
   }
@@ -1291,39 +1305,59 @@ function _worktreeDiscardBlockReason(
   unverifiable: string | null,
 ): string {
   const target = d.pathspecs.length > 0 ? d.pathspecs.slice(0, 5).join(", ") : "(the whole working tree)";
-  // #1139 — the two arms must not read alike. The `unverifiable` arm never
-  // established that ANYTHING is dirty: the target could not be resolved (or
-  // its status could not be read), so the guard failed closed on ignorance.
-  // The old single wording asserted "This checkout carries uncommitted changes
-  // to tracked files that this command would revert" in BOTH arms, which on a
-  // provably clean checkout (`git status --porcelain` empty) sent the reader
-  // hunting a phantom dirty tree — and offered the AGENT_ALLOW_MAIN_EDITS=1
-  // bypass hatch as the remedy for a discard the guard could not even locate.
+  // #1139 — the two arms must not read alike, and the fail-closed arm must not
+  // name a cause it did not establish. The old single wording asserted "This
+  // checkout carries uncommitted changes to tracked files that this command
+  // would revert" in BOTH arms, which on a provably clean checkout
+  // (`git status --porcelain` empty) sent the reader hunting a phantom dirty
+  // tree — and printed the AGENT_ALLOW_MAIN_EDITS=1 bypass hatch as the remedy
+  // for a discard the guard never located.
+  //
+  // The fail-closed arm is reached with NINE different reasons, and only two of
+  // them are target-resolution failures (`the target pathspec …`, `the
+  // invocation's effective repo …`). The rest are payload/script/status
+  // failures (script-indirection, piped-shell-payload, eval-payload, the three
+  // interpreter `-c` arms, and `the target checkout's status could not be read`
+  // — where the target WAS resolved and only the probe failed). So the arm's
+  // headline and remedy stay CAUSE-NEUTRAL and defer the specifics to the
+  // `⚠️ ${unverifiable}` line above them (review fold-in: a header naming
+  // "target not statically resolvable" for every one of the nine is the same
+  // misattribution class this function exists to remove).
+  const sanctionedHelper = _frameworkRoot
+    ? resolve(_frameworkRoot, "scripts/checkout-hygiene/hub-worktree.sh")
+    : null;
   return [
-    unverifiable
-      ? `⛔ Working-tree discard blocked — target not statically resolvable, failing closed (#709).`
+    unverifiable !== null
+      ? `⛔ Working-tree discard blocked — the discard's effect could not be verified, failing closed (#709).`
       : `⛔ Working-tree discard blocked — it would destroy uncommitted work (#709).`,
     `   Form: ${d.form}   Target: ${target}`,
     `   Checkout: ${probeCwd}`,
-    ...(unverifiable ? [`   ⚠️ ${unverifiable} — failing closed.`] : []),
+    ...(unverifiable !== null ? [`   ⚠️ ${unverifiable} — failing closed.`] : []),
     `   The guard gates the EFFECT, not the verb: \`git checkout -- <path>\``,
     `   classifies as a plain path restore, so it used to run ungated in a`,
     `   linked worktree (where pi -p mutation-test fixers run) and in a CLEAN`,
     `   hub — the 2026-09-10 leaked-mutant path.`,
-    ...(unverifiable
+    ...(unverifiable !== null
       ? [
           `   ⚠️ This block is NOT a claim that the checkout is dirty: the guard`,
-          `   could not resolve the target (see the reason above), so it never`,
-          `   compared this discard against real uncommitted work. Check first:`,
+          `   could not verify what this command would discard (see the reason`,
+          `   line above), so it never compared it against real uncommitted work.`,
+          `   Check first:`,
           `       git status --porcelain`,
-          `   → Make the target statically resolvable — a literal path / literal`,
-          `     \`cd\` (no \`$VAR\`, no placeholder), or run the operation from the`,
-          `     checkout it targets.`,
-          `   → The sanctioned recovery surface, if that is what you wanted:`,
-          `       bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
-          `   → This arm is a TARGET-resolution failure, not a dirty-tree one, so`,
-          `     AGENT_ALLOW_MAIN_EDITS=1 is not its remedy: the hatch suppresses`,
-          `     the whole gate rather than resolving the target.`,
+          `   → Resolve what the guard could not — the reason line above names`,
+          `     which of these it is: a literal path / literal \`cd\` (no \`$VAR\` or`,
+          `     placeholder), a target whose status you can read, or a script`,
+          `     whose discards are statically visible.`,
+          `   → The sanctioned recovery surface, if that is what you wanted —`,
+          `     address the FRAMEWORK CHECKOUT's own copy, because a`,
+          `     worktree-local copy of it is gated by design (#1139):`,
+          ...(sanctionedHelper
+            ? [`       bash "${sanctionedHelper}" <branch>`]
+            : [`       bash <framework-checkout>/scripts/checkout-hygiene/hub-worktree.sh <branch>`]),
+          `   → This arm fails closed because the EFFECT was unverifiable, not`,
+          `     because uncommitted work was found, so AGENT_ALLOW_MAIN_EDITS=1 is`,
+          `     not its remedy: the hatch suppresses the whole gate instead of`,
+          `     resolving the reason.`,
         ]
       : [
           `   This checkout carries uncommitted changes to tracked files that`,
@@ -1463,7 +1497,19 @@ function _worktreeDiscardBlock(command: string): string | null {
     const pipeSeg = String(command).split("|");
     const execPlaceholder = /(?:^|\s)(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-[A-Za-z]+\s+)?\{/.test(String(command));
     if (pipeSeg.length > 1 && pipesToShell) {
-      for (const tok of String(pipeSeg.slice(0, -1).join("|")).split(/\s+/)) {
+      // #1139 (review P1, T4-pipe): the whitespace split kept the SHELL QUOTES,
+      // so `cat "undo.sh" | bash` resolved `'"undo.sh"'`, realpathSync threw,
+      // the file was never read — and a discard inside it ran UNGATED, while the
+      // identical unquoted spelling was walked. Dequote the segment first, and
+      // seed every dequoted WORD plus every SUFFIX of the dequoted words, so a
+      // quoted path containing spaces (and one behind a flag: `cat -n "a b.sh"`)
+      // is resolved too. Seeding MORE candidates only ever makes the walk read
+      // more of what the shell would actually run, so this tightens the gate.
+      const dequoted = String(pipeSeg.slice(0, -1).join("|")).replace(/["']/g, "");
+      const words = dequoted.split(/\s+/).filter(Boolean);
+      const candidates = new Set<string>(words);
+      for (let i = 1; i < words.length; i++) candidates.add(words.slice(i).join(" "));
+      for (const tok of candidates) {
         if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
         try {
           const real = realpathSync(resolve(execCwd, tok));
@@ -1655,30 +1701,47 @@ function _worktreeDiscardBlock(command: string): string | null {
   // a session addresses it through a symlink, because both sides are realpath'd.
   // A wrong anchor here is fail-OPEN on other sessions' uncommitted work, which
   // is why this reuses the hardened #1129 helper instead of re-deriving one.
+  //
+  // AUDIT — one row per command, emitted only when a set was ACTUALLY dropped,
+  // and it records HOW MANY discards the relaxation hid. A row that said only
+  // "an exemption fired" cannot answer "did this exemption suppress a block?"
+  // (review fold-in), and a row written from inside the filter predicate fires
+  // even for a sanctioned script whose harvested set carried no discards.
+  const exempted: { rel: string; realpath: string; discards: number; forms: string[] }[] = [];
   const gatedSets = sets.filter((s) => {
     if (s.script === null) return true; // the command's own argv is never exempt
     let rel: string | null = null;
     // Fail closed on a probe failure: keep the set gated.
     try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script)); } catch { rel = null; }
     if (rel === null) return true;
-    // Deliberate gate relaxation → audited (best-effort, never blocks), with
-    // the REALPATH that matched so an exemption taken through a file at the
-    // same relpath under another root is distinguishable in the log
-    // (#1129 code-review P2 — the same row shape as `m4_script_exemption`).
+    try {
+      exempted.push({
+        rel,
+        realpath: realpathSync(resolve(execCwd, s.script)),
+        discards: s.discs.length,
+        forms: [...new Set(s.discs.map((d) => d.form))],
+      });
+    } catch { exempted.push({ rel, realpath: resolve(execCwd, s.script), discards: s.discs.length, forms: [] }); }
+    return false;
+  });
+  if (exempted.length > 0) {
     try {
       appendJsonl({
         event: "m5_script_exemption",
         extension: "main-worktree-guard",
-        script: rel,
-        script_realpath: realpathSync(resolve(execCwd, s.script)),
+        script: exempted[0].rel,
+        script_realpath: exempted[0].realpath,
+        scripts: exempted.map((e) => e.rel),
+        sets_exempted: exempted.length,
+        discards_dropped: exempted.reduce((n, e) => n + e.discards, 0),
+        discard_forms: [...new Set(exempted.flatMap((e) => e.forms))],
         framework_root: _frameworkRoot,
         session_cwd: sessionCwd,
         command: command.slice(0, 300),
         session_id: _currentSessionId(),
       });
     } catch { /* audit is best-effort — never blocks */ }
-    return false;
-  });
+  }
 
   if (gatedSets.every((s) => s.discs.length === 0)) return null;
 
