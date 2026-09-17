@@ -938,14 +938,49 @@ all fail-closed on uncertainty:
 - **The block message** names the script's OWN checkout ("a linked worktree" vs
   "the shared main checkout", #743) and no longer suggests `hub-worktree.sh`,
   which cannot lift a hub-rooted session's content gate. `cd`-ing into a
-  worktree does not either — the gate keys on the session cwd.
+  worktree does not either — the gate keys on the session cwd. **#1129** adds
+  the two inputs the verdict actually depends on: the **realpath of the file
+  that was read** (printed when it differs from the typed spelling — the hub's
+  `scripts/` is a symlink into agent-infra, so the typed path names one
+  checkout while the gated content lives in another) and the session cwd, plus
+  a line stating that the verdict came from the script's **content**, not from
+  session state. #1129 also fixed the label itself: `gitCheckoutIsLinkedWorktree`
+  resolved git's RELATIVE `--git-common-dir` against the unrealpathed cwd
+  spelling while `--git-dir` came back ABSOLUTE, so a path traversing a symlink
+  (`<hub>/scripts` → another repo's subdirectory) resolved the two halves into
+  DIFFERENT repos and was reported as "a linked worktree". The same function
+  feeds `resolveTargetCheckout`/`readHubDisorder`, where the misread was a
+  fail-OPEN "isolated" verdict — the fix is a fail-closed tightening there.
+
+**#1129 — sanctioned framework scripts are exempt from the content walk.**
+`scripts/check-pipeline-compliance.sh` (the script `commit-workflow` Step 1
+*mandates*) was blocked from any hub-rooted session on pure text shapes — a
+fenced code block (info string `bash`) inside a single-quoted test fixture, and
+the round-14 `<<` + shell word + `git` co-occurrence in its usage heredoc. Both
+arms are disabled
+for an explicit, **named** list (`SANCTIONED_SCRIPT_RELPATHS`), keyed on the
+**realpath of the guard's own checkout** (derived from the module's own URL) so
+an agent-editable copy of the framework in a worktree is *not* exempt. A
+**directory-wide** exemption was rejected: `scripts/` also carries git-
+DESTRUCTIVE helpers (`cleanup-worktree.sh` runs `git worktree remove --force`
++ `git branch -D`) that need no write at all. Every exemption writes an
+`m4_script_exemption` audit row — a silent relaxation is the 2026-08-18 shape.
+Pinned by three behavioural tests (sanctioned script runs; the SAME content at
+another path still blocks; a destructive framework helper still blocks).
 
 Deliberately still blocked (documented residuals): a git op inside a quoted
 heredoc PIPED/ fed to a shell (`cat <<'EOF' | sh`), an existing-file or
 interpreter substitution (`$(bash /tmp/x.sh)`, `$(/bin/sh)`), unquoted-heredoc
 expansions, and the coarse round-14 rule (a `<<` + a shell word + any `git` word
 anywhere — over-blocks a read-only `bash <<'EOF' … git --version … EOF`, tracked
-separately).
+separately). **#1129 adds a second, measured residual to this list:** a lone
+markdown fence (a file whose entire content is a fence opener with the info
+string `bash`) gates `block` through the substitution/interpreter arm — no
+`git`, no `<<` — so any script carrying a fenced code sample in a string is
+unrunnable from a hub-rooted session. The
+sanctioned-script exemption above is *containment*; the text arms themselves are
+filed as their own follow-up (agent-infra#1130) because narrowing a fail-closed
+heuristic needs its own adversarial pass.
 
 **#627 extends the closure to non-shell code interpreters (inline payloads).**
 The same payload escaped via `python3 -c "import subprocess; subprocess.run(['git',

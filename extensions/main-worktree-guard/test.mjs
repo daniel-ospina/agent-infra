@@ -4871,6 +4871,74 @@ try {
   expectBool("P627-23: index.ts wires the code-payload backdoor (#627)",
     pinSrc.includes("extractCodePayload") && pinSrc.includes("codePayloadGitVerdict") && pinSrc.includes("#627"), true);
 
+  // ── #1129: hub-symlink checkout mislabel + sanctioned-script exemption ──
+  // (a) BASE-RESOLUTION FALSE POSITIVE. When a checkout's `scripts/` is a
+  // symlink into ANOTHER repo's SUBDIRECTORY, git prints an ABSOLUTE
+  // `--git-dir` beside a RELATIVE `--git-common-dir` (it resolves its own cwd
+  // through the symlink); resolving the relative half against the unrealpathed
+  // cwd lands it in the WRONG repo and the checkout was misread as "a linked
+  // worktree". Deterministic fixture: two one-file repos + the symlink. The
+  // same function feeds `resolveTargetCheckout`, where the misread is a
+  // fail-OPEN "isolated" verdict, so this is a gate-correctness pin too.
+  {
+    const symTmp = mkdtempSync(join(tmpdir(), "guard-symlink-1129-"));
+    const repoA = join(symTmp, "A");
+    const repoB = join(symTmp, "B");
+    mkdirSync(join(repoB, "sub"), { recursive: true });
+    execSync(`git init -q "${repoA}"`, { stdio: "ignore" });
+    execSync(`git init -q "${repoB}"`, { stdio: "ignore" });
+    const symlink = join(repoA, "scripts");
+    symlinkSync(join(repoB, "sub"), symlink);
+    expectBool("#1129: symlinked scripts/ into another repo's subdir is NOT a linked worktree",
+      isWorktreeCwd(symlink) === false, true);
+    expectBool("#1129: the checkout that OWNS the symlink is not a worktree either",
+      isWorktreeCwd(repoA) === false, true);
+    expectBool("#1129: the symlink TARGET repo is not a worktree (control)",
+      isWorktreeCwd(repoB) === false, true);
+    try { execSync(`rm -rf "${symTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+
+  // (b) SANCTIONED-SCRIPT EXEMPTION (#1129). Source pins. The negative half is
+  // the adversarial-review P0: `scripts/` also carries git-DESTRUCTIVE helpers
+  // (`cleanup-worktree.sh` does `git worktree remove --force` + `git branch -D`),
+  // neither of which needs a WRITE — so a directory-wide exemption would let a
+  // hub-rooted session destroy another session's work with the content walker
+  // off. The list must stay named, and destructive helpers must stay out of it.
+  expectBool("#1129: a named sanctioned-script list exists (realpath-keyed)",
+    pinSrc.includes("SANCTIONED_SCRIPT_RELPATHS") && pinSrc.includes("_sanctionedScriptExemption"), true);
+  expectBool("#1129: the mandated preflight + the recovery helper are the listed scripts",
+    pinSrc.includes('"scripts/check-pipeline-compliance.sh"') &&
+    pinSrc.includes('"scripts/checkout-hygiene/hub-worktree.sh"'), true);
+  expectBool("#1129 P0 boundary: no DIRECTORY-wide exemption (destructive helpers stay gated)",
+    !pinSrc.includes("cleanup-worktree.sh") &&
+    !pinSrc.includes("cleanup-stale-branches.sh") &&
+    !pinSrc.includes("startsWith(_frameworkRoot") &&
+    !pinSrc.includes("startsWith(FRAMEWORK_SCRIPTS"), true);
+  expectBool("#1129: the exemption is evaluated BEFORE the content walk",
+    pinSrc.indexOf("_sanctionedScriptExemption(resolved)") !== -1 &&
+    pinSrc.indexOf("_sanctionedScriptExemption(resolved)") <
+      pinSrc.indexOf("scriptGitVerdict(resolved, branch, base"), true);
+  expectBool("#1129: the exemption is audit-logged (deliberate relaxation is observable)",
+    pinSrc.includes("m4_script_exemption"), true);
+  expectBool("#1129: the block message names the realpath actually read + the verdict source",
+    pinSrc.includes("resolves to:") && pinSrc.includes("verdict source:"), true);
+
+  // (c) RESIDUAL PIN — the text-shape false positives are NOT fixed by the
+  // exemption; they are contained. A lone markdown fence is enough to gate a
+  // file `block`, which is the spelling-not-behaviour shape the follow-up must
+  // remove. Pinning it keeps that fix a deliberate, visible change.
+  {
+    const fenceTmp = mkdtempSync(join(tmpdir(), "guard-fence-1129-"));
+    const fenceFile = join(fenceTmp, "fence.sh");
+    writeFileSync(fenceFile, "```bash\n");
+    expectBool("#1129 residual: a markdown ```bash fence alone still gates block (follow-up scope)",
+      scriptGitVerdict(fenceFile, "main", MAIN, MAIN) === "block", true);
+    writeFileSync(fenceFile, "#!/bin/bash\ngit status\n");
+    expectBool("#1129 control: a git-FREE/read-only script still allows",
+      scriptGitVerdict(fenceFile, "main", MAIN, MAIN) === "allow", true);
+    try { execSync(`rm -rf "${fenceTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+
   // ── Degradation (D) ──
   const classifySrc = readFileSync(new URL("./classify-git.mjs", import.meta.url), "utf-8");
   // C2 static assert: no IMPORT of branch-ownership (comments may reference the

@@ -3434,8 +3434,22 @@ export function gitCheckoutIsLinkedWorktree(cwd) {
     encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
   }).trim();
   if (!gitDir || !commonDir) return false;
-  const g = resolve(cwd, gitDir);
-  const c = resolve(cwd, commonDir);
+  // #1129 — resolve BOTH git spellings against the cwd's REALPATH. git emits
+  // a RELATIVE `--git-common-dir` (`../.git`) when its own (realpath-resolved)
+  // cwd sits under the gitdir's parent, but may emit an ABSOLUTE
+  // `--git-dir` when the SUPPLIED cwd spelling traverses a symlink. Resolving
+  // the relative half against the unrealpathed spelling then lands it in a
+  // DIFFERENT repo and the checkout is misread as a linked worktree — probe:
+  // `<hub>/scripts` is a symlink into agent-infra, so gitDir resolved to
+  // `…/agent-infra/.git` while commonDir resolved to `…/<hub>/.git` → "a
+  // linked worktree", wrong (and the same call feeds `resolveTargetCheckout`,
+  // where the misread is a fail-OPEN "isolated" verdict). A base that cannot
+  // be realpath'd keeps the old spelling (fail-closed: no behaviour change on
+  // the error path).
+  let base = cwd;
+  try { base = realpathSync(cwd); } catch { /* keep the given spelling */ }
+  const g = resolve(base, gitDir);
+  const c = resolve(base, commonDir);
   if (g === c) return false; // same spelling (main at its toplevel: both ".git")
   return realpathSync(g) !== realpathSync(c);
 }

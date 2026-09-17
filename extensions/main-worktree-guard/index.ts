@@ -132,6 +132,7 @@ import { execSync, execFileSync } from "node:child_process";
 import { resolve, dirname, join, relative } from "node:path";
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { isPrintMode } from "../shared/print-mode.js";
 import { appendJsonl } from "../shared/audit-log.js";
 
@@ -1688,6 +1689,64 @@ function _worktreeDiscardBlock(command: string): string | null {
   return null;
 }
 
+// #1129 — sanctioned framework scripts, keyed on the running guard's OWN
+// checkout (never on a path the command supplies).
+//
+// WHY THIS EXISTS: `scriptGitVerdict` false-blocks the framework's own
+// mandated preflight from a HUB-rooted session on PURE TEXT shapes —
+// `scripts/check-pipeline-compliance.sh` contains ```bash fences inside a
+// single-quoted TEST FIXTURE and a usage heredoc whose prose says "git
+// remote", and either alone pins the verdict to `block` even though the
+// script's only real git invocation is a read-only `remote get-url`. That
+// block makes commit-workflow Step 1 (the mandated preflight) unrunnable.
+//
+// WHY A NAMED LIST AND NOT THE DIRECTORY (adversarial review P0): `scripts/`
+// also carries git-DESTRUCTIVE helpers — `cleanup-worktree.sh` runs `git
+// worktree remove --force` + `git branch -D` on an agent-supplied branch, and
+// `cleanup-stale-branches.sh --execute` deletes remote branches. Neither needs
+// a write, so "the write gate already covers authoring a malicious script"
+// does NOT cover RUNNING a pre-existing destructive one; a directory-wide
+// exemption would let a hub-rooted session destroy another session's
+// uncommitted work with the content walker switched off. Only scripts whose
+// git content is read-only or the documented recovery surface are listed.
+//
+// WHY THE GUARD'S OWN CHECKOUT: the realpath anchor is derived from this
+// module's location, so an agent-editable COPY of the framework (a linked
+// worktree, where the write gate is lifted) has a different realpath and is
+// NOT exempt. A repo-fingerprint anchor (isAgentInfraRepo) would have been
+// forgeable by exactly that route.
+const SANCTIONED_SCRIPT_RELPATHS = [
+  // commit-workflow Step 1 (01-preflight.md) — the mandated pre-push gate.
+  "scripts/check-pipeline-compliance.sh",
+  // The sanctioned worktree/recovery helper every guard message recommends.
+  "scripts/checkout-hygiene/hub-worktree.sh",
+];
+const _frameworkRoot: string | null = (() => {
+  try {
+    return realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), "..", ".."));
+  } catch {
+    return null; // unknown location → no exemption (fail-closed)
+  }
+})();
+
+/** Sanctioned-framework-script exemption (#1129) — returns the matched
+ *  relative path (for the audit row), or null. Realpath-keyed on both sides:
+ *  a symlinked spelling (the hub's `scripts/`) resolves to the same file, and
+ *  a copy in another checkout does not. */
+function _sanctionedScriptExemption(resolvedScript: string): string | null {
+  if (!_frameworkRoot) return null;
+  let real: string;
+  try {
+    real = realpathSync(resolvedScript);
+  } catch {
+    return null;
+  }
+  for (const rel of SANCTIONED_SCRIPT_RELPATHS) {
+    if (real === resolve(_frameworkRoot, rel)) return rel;
+  }
+  return null;
+}
+
 // Script-backdoor closure (Slice E): the documented escape
 // (`write /tmp/x.sh` + `bash /tmp/x.sh`) is closed by gating the script's git
 // content with the SAME recovery allowlist — a script that performs a
@@ -1758,6 +1817,23 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // not be blocked by a `--reset`-only discard). [] is a real argv (no args)
     // — `$1` is then provably empty; undefined would be "unknown".
     const scriptArgs = extractScriptArgs(command, scriptPath);
+    // #1129 — the framework's OWN sanctioned scripts are exempted before the
+    // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
+    // list keyed on the guard's own checkout). Deliberate gate relaxation →
+    // audited (best-effort, never blocks) so the exemption is observable.
+    const sanctionedRel = _sanctionedScriptExemption(resolved);
+    if (sanctionedRel) {
+      try {
+        appendJsonl({
+          event: "m4_script_exemption",
+          extension: "main-worktree-guard",
+          script: sanctionedRel,
+          command: command.slice(0, 300),
+          session_id: _currentSessionId(),
+        });
+      } catch { /* audit is best-effort — never blocks */ }
+      return null;
+    }
     if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs) === "block") {
       // #743: label the SCRIPT's own checkout, not the session's. A linked
       // worktree's copy is not "the shared main checkout", and the old message
@@ -1765,11 +1841,22 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
       // hub-rooted session run a content-gated script.
       let scriptInWorktree = false;
       try { scriptInWorktree = isWorktreeCwdWrite(resolve(dirname(resolved))); } catch { /* main (safe default) */ }
+      // #1129 — report the file that was actually READ. The hub's `scripts/` is
+      // a symlink into agent-infra, so the typed path names one checkout while
+      // the gated CONTENT belongs to another; and since the verdict comes from
+      // that content (not from session state), a verdict that flipped in the
+      // field without a code change is checkable against the tree only if the
+      // resolved path is printed.
+      let realResolved = resolved;
+      try { realResolved = realpathSync(resolved); } catch { /* keep the spelling */ }
       return [
         `⛔ Script execution blocked — script content contains a blocked git operation (#1484).`,
         `   The script backdoor (write /tmp/x.sh + bash /tmp/x.sh) is closed:`,
         `   ${resolved}`,
+        ...(realResolved !== resolved ? [`   (resolves to: ${realResolved})`] : []),
         `   (script location: ${scriptInWorktree ? "a linked worktree" : "the shared main checkout"})`,
+        `   (verdict source: the script's CONTENT — re-read the file at the path above to reproduce;`,
+        `    session cwd: ${resolve(process.cwd())})`,
         `   performs a git operation that is not sanctioned against the shared main checkout.`,
         `   → Run the underlying git commands directly (each is gated on its own), or do`,
         `     this work in an isolated worktree (invoke the using-git-worktrees skill).`,
