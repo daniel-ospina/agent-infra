@@ -206,6 +206,14 @@ lane_queued() { lane_line in_progress "" "$1" "$2"; }
 # helper, the guard blocks the whole suite again in an agent session.
 cfs_diff() { bash "$CFS" --diff "$1" "$2"; }
 
+# Same guard-safe shape as cfs_diff (no `$(bash <path> …)` substitution): run the
+# parser script itself and capture its streams for assertions. The extraction is
+# its OWN unit — the admin-merge rail is a separate consumer (#3756).
+cfs_run() {
+  SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" "$@" >"$TMP/cfs-out" 2>"$TMP/cfs-err"
+  return $?
+}
+
 # Same reason as cfs_diff, one indirection further out: the #1484 classifier fails
 # closed on a `$(bash <path> …)` substitution, because that is also the shape of the
 # closed script backdoor. Calling the guard through a function whose body is the plain
@@ -952,12 +960,15 @@ else
   fail "no evidence comment posted on the flake path"
 fi
 
-# ── 26. a backtick-bearing node id cannot break the evidence ────────────────
-# A PR author controls test names, so a test that prints a bare fence marker puts
-# one in the set. The evidence is LISTS, not fenced blocks, so there is no fence
-# to close early and nothing to swallow — and therefore no fence-length algorithm
-# to get right.
-echo "== 26. a backtick-bearing id cannot break the evidence =="
+# ── 26. a non-nodeid FAILED payload never reaches the evidence (#3756) ─────
+# A PR author controls test names, so a test can print a bare fence marker in the
+# `FAILED <token>` position. #3756 defect 1: that token is NOT a test id, so the
+# canonical parser DROPS it (counted and reported) before it can ever enter the
+# set — the injection surface is removed at the source, not merely rendered
+# inert. The evidence stays LISTS-of-ids, and the sound id in the SAME capture
+# still certifies. Reverting the extractor to the shell `awk` puts ` ``` ` back
+# into the evidence and turns this RED.
+echo "== 26. a non-nodeid FAILED payload is dropped before the evidence =="
 new_scen btick
 HEAD_BT="dddd333300000000000000000000000000000000"
 printf '%s\n' "$HEAD_BT" > "$SCEN/head"
@@ -968,8 +979,15 @@ cp "$SCEN/log-9921" "$SCEN/log-9922"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 if [ -f "$SCEN/comment" ]; then
   c="$SCEN/comment"
-  grep -qx -- '- ```' "$c" && pass "the backtick id renders as an inert list item" \
-    || fail "the backtick id is not rendered as a list item"
+  grep -qF 'tests/test_ok.py::test_ok' "$c" \
+    && pass "the sound id in the same capture is in the evidence" \
+    || fail "the sound id is missing from the evidence"
+  grep -qF '```' "$c" \
+    && fail "a non-nodeid backtick token reached the evidence" \
+    || pass "the backtick token never reaches the evidence — dropped at the parser (#3756)"
+  grep -q 'UNATTRIBUTABLE' "$TMP/err" \
+    && pass "the dropped backtick token is REPORTED as UNATTRIBUTABLE (not silent)" \
+    || fail "the dropped token is silent on stderr"
   d_open=$(grep -c '^<details>' "$c"); d_close=$(grep -c '^</details>$' "$c")
   [ "$d_open" -eq 3 ] && [ "$d_close" -eq 3 ] \
     && pass "all three evidence blocks stay structurally intact ($d_open/$d_close)" \
@@ -1233,6 +1251,91 @@ printf 'examined=1\nextracted=1\ncompleted=1\ntested=1\npending=0\n' > "$TMP/rep
 lane_tested "$TMP/rep-pending0.txt" lane sha >/dev/null 2>&1 \
   && pass "  …while an explicit pending=0 certifies (no over-block)" \
   || fail "an explicit pending=0 was refused"
+
+# ── 32. THE FAILED-TOKEN POSITION (#3756 defect 1) ─────────────────────────
+# The `may` leak, at the exact position the retired shell `awk` read: the token
+# after `FAILED`. Two payloads, ONE position — the acceptance pair. Reverting the
+# extractor to that `awk` turns `may` into a failure id (M1 RED); making the
+# extractor "extract nothing" loses the real id (M2 RED); dropping a rejected
+# candidate without recording it turns the REPORT assertion RED (M3).
+echo '== 32. the FAILED-token position: `may` is DROPPED + REPORTED, a real id is EXTRACTED =='
+MAYLOG="$TMP/may-position.log"
+printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED may be a known flake\n' > "$MAYLOG"
+out="$(python3 "$ROOT/scripts/ci_exemption.py" ids --log "$MAYLOG" 2>"$TMP/may.err")"
+rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && pass "M1: 'may' in the FAILED-token position yields NO failure id" \
+  || fail "M1: expected no ids, got '$out' (exit $rc)"
+grep -q 'UNATTRIBUTABLE.*may' "$TMP/may.err" && pass "M1: …and the rejected token is REPORTED as UNATTRIBUTABLE" \
+  || fail "M1: the rejected token is not reported: $(cat "$TMP/may.err")"
+grep -q 'unattributable=1' "$TMP/may.err" && pass "M1: …and COUNTED" \
+  || fail "M1: the rejection is not counted"
+REAL_ID='tests/test_real.py::test_real[param-1]'
+REALLOG="$TMP/real-position.log"
+printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED %s - AssertionError: boom\n' "$REAL_ID" > "$REALLOG"
+out="$(python3 "$ROOT/scripts/ci_exemption.py" ids --log "$REALLOG" 2>/dev/null)"
+[ "$out" = "$REAL_ID" ] && pass "M2: a REAL id in the SAME position is still EXTRACTED" \
+  || fail "M2: expected '$REAL_ID', got '$out'"
+
+# The SAME acceptance pair, one door out: the RAIL's own extraction
+# (`ci-failure-set.sh --commit`) must drop+report the garbage and keep the sound
+# id. This is the shell half of the fix — the module alone does not prove the
+# rail routes through it.
+echo '== 32b. the shell rail drops+reports at the FAILED-token position =='
+new_scen cfsmay
+HEAD_CM="aa5511000000000000000000000000000000000"
+lane_fail "$HEAD_CM" 8801 > "$SCEN/runs-$HEAD_CM"
+{ log_failed 'tests/test_ok.py::test_ok'; log_failed 'may'; } > "$SCEN/log-8801"
+cfs_run --commit "$HEAD_CM"; rc=$?
+[ "$rc" -eq 0 ] && pass "the rail reads a capture carrying garbage (exit 0)" \
+  || fail "the rail exited $rc on a capture that also carried a sound id"
+grep -qxF 'tests/test_ok.py::test_ok' "$TMP/cfs-out" && pass "the sound id is EXTRACTED by the rail" \
+  || fail "the rail lost the sound id: $(cat "$TMP/cfs-out")"
+grep -qxF 'may' "$TMP/cfs-out" && fail "'may' was CARRIED as a failure id (permanent false refusal)" \
+  || pass "'may' is NOT in the rail's failure set"
+grep -q 'UNATTRIBUTABLE.*may' "$TMP/cfs-err" && pass "the rail REPORTS the dropped token (not silent)" \
+  || fail "the rail dropped 'may' silently: $(head -2 "$TMP/cfs-err")"
+
+# ── 33. A MOVED IDENTITY: reported across the boundary, never attributed ───
+# B7's dynamic form: within ONE concluded cycle the SAME head's failure id moved
+# (pre-rerun `test_status_surfaces_last_drill`, post-rerun
+# `test_manual_drill_records_measured_time`). A stable regression does not do
+# that, so the re-measure is not comparing like with like. Two required
+# behaviours: (1) the id set ACROSS the boundary is REPORTED — both samples
+# surface, not a single collapsed identity; (2) the moving identity is
+# UNATTRIBUTABLE — flagged by class, never resolved to one PR-unique id.
+# (The decision's UNATTRIBUTABLE VERDICT is the consumer side, #1147.)
+echo "== 33. a moved identity is REPORTED across the boundary and not attributed =="
+new_scen cfsrot
+HEAD_RR="bb6622000000000000000000000000000000000"
+ROT_A1='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_status_surfaces_last_drill'
+ROT_A2='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_manual_drill_records_measured_time'
+{ lane_fail "$HEAD_RR" 8801; lane_fail "$HEAD_RR" 8802; } > "$SCEN/runs-$HEAD_RR"
+log_failed "$ROT_A1" > "$SCEN/log-8801"
+log_failed "$ROT_A2" > "$SCEN/log-8802"
+cfs_run --commit "$HEAD_RR"; rc=$?
+[ "$rc" -eq 0 ] && pass "both samples of the SAME head are read (exit 0)" \
+  || fail "the rail exited $rc over the two samples"
+grep -qxF "$ROT_A1" "$TMP/cfs-out" && grep -qxF "$ROT_A2" "$TMP/cfs-out" \
+  && pass "BOTH identities across the boundary are REPORTED (the move is visible)" \
+  || fail "the boundary collapsed to one identity: $(cat "$TMP/cfs-out")"
+# The rotation rule must FIRE on the move, and must NOT fire on a stable id or a
+# single sample (removing it turns this RED: a moved id would read PR-unique).
+ROT_VERDICT="$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1] + "/scripts")
+import ci_exemption as m
+a, b = sys.argv[2], sys.argv[3]
+moved = m.detect_rotating_identity([frozenset({a}), frozenset({b})])
+stable = m.detect_rotating_identity([frozenset({a}), frozenset({a})])
+single = m.detect_rotating_identity([frozenset({a})])
+covers = {a, b} <= set(moved.get(m.class_key(a), frozenset()))
+print("moved=%s stable=%s single=%s covers_both=%s" % (bool(moved), bool(stable), bool(single), covers))
+' "$ROOT" "$ROT_A1" "$ROT_A2")"
+case "$ROT_VERDICT" in
+  "moved=True stable=False single=False covers_both=True")
+    pass "the moved identity is flagged UNATTRIBUTABLE by class (never one PR-unique id)" ;;
+  *) fail "rotation rule mis-fired: $ROT_VERDICT" ;;
+esac
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
