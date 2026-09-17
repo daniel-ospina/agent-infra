@@ -24,17 +24,40 @@
 #                             as "already red on main". See the #3469 trap below.)
 #   --diff <a> <b>            tests in file a not in file b (the `comm -23`
 #                             comparison, shared by every consumer so the two
-#                             sides cannot drift)
+#                             sides cannot drift). RETAINED for the post-merge
+#                             detector; the pre-merge rail's VERDICT is the
+#                             exemption decision, not this subtraction (#3756).
+#   --commit-rows <sha>       (#3756) the PR-side input for the exemption
+#                             decision: `<nodeid>\t<failures>\t<runs>\t<signature>`
+#                             over the commit's failing runs. `<failures>` is the
+#                             number of the commit's runs in which the id failed,
+#                             `<runs>` the number that actually exercised the suite.
+#                             An id with no stable signature is still EMITTED (blank
+#                             signature) so it cannot vanish from the decision —
+#                             `decide()` fails it CLOSED. Emits NOTHING when no run
+#                             exercised the suite (fail-closed).
 #
 # Options:
-#   --exclude <sha>           (--main-union) drop runs whose headSha is <sha>
-#                             (full or short; matched against the run's headSha)
+#   --exclude <sha>           (--main-union / --main-union-rates /
+#                             --main-union-signatures) drop runs whose headSha is
+#                             <sha> (full or short; matched against the run's headSha)
 #   --main-union-rates [N]    (#3756) per-id failure COUNTS over the last N runs:
 #                             `<nodeid>\t<failures>\t<runs>`. The rate table the
 #                             exemption decision consumes — a union cannot express
 #                             `main 1/8` vs `PR 8/8`, which is why presence-based
 #                             subtraction excused an eight-fold regression. Emits
 #                             NOTHING when no run exercised the suite (fail-closed).
+#   --main-union-signatures [N]
+#                             (#3756) main's per-id stable SIGNATURE over the last
+#                             N runs: `<nodeid>\t<signature>`. The rate table alone
+#                             leaves `main_signatures` empty, so the decision's
+#                             subset rule fails CLOSED and nothing is ever exempt;
+#                             this is the other half of the same measurement.
+#   --per-run <file>          (--commit-rows) write one line per FAILING run with
+#                             that run's failing ids, whitespace-separated — the
+#                             per-run id sets `decide()` consumes for REQUIRED
+#                             class E5 (a class red across runs with a MOVING id is
+#                             UNATTRIBUTABLE, neither PR-unique nor exempt).
 #   --repo <owner/repo>       repo for the gh calls (default: gh's own resolution)
 #   --workflow <file|name>    restrict the run listing to ONE workflow (default
 #                             `python-ci.yml`, or $CI_FAILURE_SET_WORKFLOW).
@@ -107,6 +130,17 @@
 #   one is evidence. A superseded run belongs to the OLD commit, so it cannot
 #   satisfy the NEW head's `tested` count either — the fix is safe.
 #
+# THE DECISION MODULE IS RESOLVED FROM THE RAIL'S OWN DIRECTORY (#3756).
+#   Signature extraction and the exemption decision are ONE implementation,
+#   `ci_exemption.py`, shipped next to this script. It is deliberately NOT read
+#   from the repo being merged: a grader drawn from the graded system is a
+#   bypass — a PR could ship a `tools/ci_exemption.py` that always reports
+#   CLEAN. A missing module is a LOUD REFUSAL (exit 1), never a fallback to the
+#   presence-based subtraction, which is the category-A defect this fixes.
+#   The module is a byte-for-byte copy of the decision authored on the tortoise
+#   side (#3756, tortoise PR #3761 @ 6a4096236); that PR's tests are its
+#   acceptance, and the rail's own suite drives it end to end.
+#
 # Env seams (tests only):
 #   CI_FAILURE_SET_GH         the gh command to run (default: `gh`)
 #   CI_FAILURE_SET_WORKFLOW   the workflow filter (default: `python-ci.yml`)
@@ -116,6 +150,9 @@ set -uo pipefail
 GH="${CI_FAILURE_SET_GH:-gh}"
 DEFAULT_MAIN_RUNS=10
 DEFAULT_WORKFLOW="python-ci.yml"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
+if command -v python3 >/dev/null 2>&1; then PYTHON_BIN=python3; else PYTHON_BIN=python; fi
 
 # Populated by main() before any selector runs. Bash locals are dynamically
 # scoped, but these are deliberately global: every helper below (and every
@@ -169,6 +206,63 @@ extract_failed_tests() {
   printf '%s\n' "$log" \
     | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' \
     | awk '{ for (i = 1; i < NF; i++) if ($i == "FAILED") { print $(i+1); break } }'
+}
+
+# fetch_failed_log <run-id> <out-file> — the RAW `gh run view --log-failed`
+# capture, for the callers that need the failure TEXT and not only the ids.
+# Same fail-closed rule as extract_failed_tests: a gh error is a FAILURE, never
+# an empty capture — an unreadable log must not read as "nothing failed" (#3705).
+fetch_failed_log() {
+  local run_id="$1" out="$2"
+  # shellcheck disable=SC2086
+  if ! $GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed > "$out" 2>/dev/null; then
+    say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set"
+    return 1
+  fi
+}
+
+# failed_ids_from_log <log-file> → the ids, parsed EXACTLY as extract_failed_tests
+# parses the same capture (ANSI stripped, the token after `FAILED`). One parser
+# semantics for ids, whichever door fetched the log.
+failed_ids_from_log() {
+  sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "$1" \
+    | awk '{ for (i = 1; i < NF; i++) if ($i == "FAILED") { print $(i+1); break } }'
+}
+
+# nodeid_is_shaped <id> — the LOOSE nodeid shape the decision's row parser
+# requires (mirrors `_NODEID_LOOSE_RE` in ci_exemption.py: strict file/class
+# part, permissive `::` tail). This is a REFUSAL guard, not a filter: an id the
+# decision's parser would reject must make the producer FAIL LOUDLY rather than
+# quietly drop the row, because an id the decision never sees is an id the gate
+# never blocks (fail-OPEN).
+nodeid_is_shaped() {
+  grep -Eq $'^[A-Za-z0-9_./-]+\\.py::[^\t]+$' <<<"$1"
+}
+
+# require_exemption_module — the one dependency, checked BEFORE any gh call so a
+# broken install refuses immediately instead of after minutes of fetching.
+require_exemption_module() {
+  if [ ! -f "$EXEMPTION_PY" ]; then
+    say_err "ci-failure-set: ✗ the exemption decision module is ABSENT at $EXEMPTION_PY"
+    say_err "   The rail refuses to fall back to presence-based subtraction (the #3756"
+    say_err "   category-A defect). Restore the agent-infra checkout; do not merge."
+    return 1
+  fi
+  return 0
+}
+
+# extract_failed_signatures <log-file> → `<nodeid>\t<signature>` rows.
+# The CANONICAL extractor — the same Python module that runs the decision — so
+# main's signatures and the PR's cannot drift into two parsers. Fail-closed: a
+# nonzero extractor exit is an EXTRACTION FAILURE, never an empty table.
+extract_failed_signatures() {
+  local log_file="$1" out
+  require_exemption_module || return 1
+  if ! out="$("$PYTHON_BIN" "$EXEMPTION_PY" signatures --log "$log_file" 2>/dev/null)"; then
+    say_err "ci-failure-set: ✗ signature extraction FAILED for this run — refusing to read it as unsigned (an empty signature table would fail the decision closed, but the caller must see the refusal)"
+    return 1
+  fi
+  printf '%s\n' "$out"
 }
 
 # ── modes ─────────────────────────────────────────────────
@@ -285,11 +379,150 @@ collect_union_rates() {
   rm -f "$tmp_all"
 }
 
+# #3756 — main's per-id STABLE SIGNATURE over a lane's failing runs.
+# Emits `<nodeid>\t<signature>`, the table `decide(main_signatures=…)` consumes.
+# Mirrors the rates collector's shape: only FAILING runs contribute, extraction
+# failure returns 1, and nothing is emitted when no run exercised the suite.
+collect_union_signatures() {
+  local lane_file="$1" provenance="$2" report="$3"
+  local tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 run_id line
+  tmp_sigs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+  : > "$tmp_sigs"
+  [ -n "$provenance" ] && : > "$provenance"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    local status rest conclusion runref log_file
+    status="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    conclusion="${rest%%$'\t'*}"
+    runref="${rest#*$'\t'}"
+    run_id="${runref##*:}"
+    if [ "$status" = "completed" ]; then
+      completed=$((completed + 1))
+      case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)) ;; esac
+    else
+      pending=$((pending + 1))
+    fi
+    case "$conclusion" in failure|timed_out|startup_failure) ;; *) continue ;; esac
+    examined=$((examined + 1))
+    printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
+    log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+    if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file" "$tmp_sigs"; return 1; fi
+    # A failing run with NO `FAILED <nodeid>` line contributes nothing to either
+    # table. Skip the extractor for it: the `signatures` CLI exits 1 on a capture
+    # that yields no ids, which is correct for a capture that PROVES nothing but
+    # wrong for a run we already know carried no parseable failure (the
+    # `extracted < examined` gate in admin-merge.sh owns that case).
+    local ids="" one=""
+    ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_sigs"; return 1; }
+    if [ -n "$ids" ]; then
+      extracted=$((extracted + 1))
+      one="$(extract_failed_signatures "$log_file")" || { rm -f "$log_file" "$tmp_sigs"; return 1; }
+      [ -n "$one" ] && printf '%s\n' "$one" >> "$tmp_sigs"
+    fi
+    rm -f "$log_file"
+  done < "$lane_file"
+  if [ -n "$report" ]; then
+    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
+      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
+  fi
+  # No tested run -> emit NOTHING. An empty signature table is not evidence; the
+  # caller BLOCKS on it rather than exempting from it.
+  if [ "$tested" -gt 0 ]; then
+    sort -u "$tmp_sigs"
+  fi
+  rm -f "$tmp_sigs"
+}
+
+# #3756 — the PR-side decision input: `<nodeid>\t<failures>\t<runs>\t<signature>`.
+# `<failures>` counts the commit's failing runs in which the id appeared, `<runs>`
+# the runs that exercised the suite (the same K as the rate table). Every id is
+# emitted, with a BLANK signature when the extractor produced none: an id that
+# vanished here would be an id the decision never sees, which is fail-OPEN.
+# `--per-run` writes the per-run id sets detect_rotating_identity() consumes.
+collect_union_rows() {
+  local lane_file="$1" provenance="$2" report="$3" per_run="$4"
+  local tmp_ids="" tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 run_id line
+  tmp_ids="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+  tmp_sigs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+  : > "$tmp_ids"; : > "$tmp_sigs"
+  [ -n "$provenance" ] && : > "$provenance"
+  [ -n "$per_run" ] && : > "$per_run"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    local status rest conclusion runref log_file ids one
+    status="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    conclusion="${rest%%$'\t'*}"
+    runref="${rest#*$'\t'}"
+    run_id="${runref##*:}"
+    if [ "$status" = "completed" ]; then
+      completed=$((completed + 1))
+      case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)) ;; esac
+    else
+      pending=$((pending + 1))
+    fi
+    case "$conclusion" in failure|timed_out|startup_failure) ;; *) continue ;; esac
+    examined=$((examined + 1))
+    printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
+    log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+    if ! fetch_failed_log "$run_id" "$log_file"; then
+      rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1
+    fi
+    ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1; }
+    if [ -n "$ids" ]; then
+      extracted=$((extracted + 1))
+      printf '%s\n' "$ids" >> "$tmp_ids"
+      if [ -n "$per_run" ]; then
+        printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' ' ')" | sed 's/ *$//' >> "$per_run"
+      fi
+      # An id the decision's parser would REJECT must refuse the run, not vanish.
+      local bad=""
+      while IFS= read -r one; do
+        [ -n "$one" ] || continue
+        if ! nodeid_is_shaped "$one"; then bad="$one"; break; fi
+      done <<< "$ids"
+      if [ -n "$bad" ]; then
+        say_err "ci-failure-set: ✗ '$bad' is not a pytest nodeid — the decision's parser would DROP it, so the gate would never see it. Refusing."
+        rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1
+      fi
+      # Only a run that CARRIED ids is fed to the signature extractor: the
+      # `signatures` CLI exits 1 on a capture with no ids (correct for a capture
+      # that proves nothing, wrong for a run already known to carry none).
+      one="$(extract_failed_signatures "$log_file")" || { rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1; }
+      [ -n "$one" ] && printf '%s\n' "$one" >> "$tmp_sigs"
+    fi
+    rm -f "$log_file"
+  done < "$lane_file"
+  if [ -n "$report" ]; then
+    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
+      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
+  fi
+  if [ "$tested" -gt 0 ]; then
+    # Join per-id failure counts (and the id universe, so an UNSIGNED id still
+    # gets a row) with the signature rows. awk only; no second signature parser.
+    awk -F'\t' -v OFS='\t' -v k="$tested" '
+      FNR == NR { fail[$1]++; seen[$1] = 1; next }
+      { if ($1 in seen) sig_by[$1] = sig_by[$1] $2 "\n" }
+      END {
+        for (id in seen) {
+          emitted = 0
+          if (id in sig_by) {
+            n = split(sig_by[id], parts, "\n")
+            for (i = 1; i <= n; i++) if (parts[i] != "") { print id, fail[id] + 0, k, parts[i]; emitted = 1 }
+          }
+          if (!emitted) print id, fail[id] + 0, k, ""
+        }
+      }' "$tmp_ids" "$tmp_sigs" | sort
+  fi
+  rm -f "$tmp_ids" "$tmp_sigs"
+}
+
 # ── main ──────────────────────────────────────────────────
 
 main() {
   local mode="" pr="" commit="" main_runs="$DEFAULT_MAIN_RUNS"
-  local exclude="" repo="" provenance="" report="" diff_a="" diff_b=""
+  local exclude="" repo="" provenance="" report="" diff_a="" diff_b="" per_run=""
   local workflow="${CI_FAILURE_SET_WORKFLOW:-$DEFAULT_WORKFLOW}" any_workflow=0
 
   while [ $# -gt 0 ]; do
@@ -310,6 +543,15 @@ main() {
         else
           shift 1
         fi ;;
+      --main-union-signatures)
+        mode="main-union-signatures"
+        if [ $# -ge 2 ] && [ -n "${2:-}" ] && [ -z "${2##[0-9]*}" ]; then
+          main_runs="$2"; shift 2
+        else
+          shift 1
+        fi ;;
+      --commit-rows) mode="commit-rows"; commit="${2:-}"; shift 2 ;;
+      --per-run) per_run="${2:-}"; shift 2 ;;
       --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 ;;
       --exclude) exclude="${2:-}"; shift 2 ;;
       --repo) repo="${2:-}"; shift 2 ;;
@@ -383,6 +625,35 @@ main() {
       collect_union_rates "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
       rm -f "$runs" "$filtered"
       ;;
+    commit-rows)
+      [ -n "$commit" ] || { say_err "ci-failure-set: --commit-rows needs a SHA"; exit 2; }
+      require_exemption_module || exit 1
+      local runs
+      runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+      list_lane_runs --commit "$commit" 100 > "$runs" || { rm -f "$runs"; say_err "ci-failure-set: ✗ could not list runs for $commit"; exit 1; }
+      collect_union_rows "$runs" "$provenance" "$report" "$per_run" || { rm -f "$runs"; exit 1; }
+      rm -f "$runs"
+      ;;
+    main-union-signatures)
+      require_exemption_module || exit 1
+      local runs filtered
+      runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+      filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+      list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
+      if [ -n "$exclude" ]; then
+        awk -F'\t' -v x="$exclude" '
+          {
+            n = split($3, a, ":")
+            sha = a[1]
+            if (sha == "") print
+            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
+          }' "$runs" > "$filtered"
+      else
+        cp "$runs" "$filtered"
+      fi
+      collect_union_signatures "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
+      rm -f "$runs" "$filtered"
+      ;;
     main-union)
       local runs filtered
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
@@ -412,7 +683,7 @@ main() {
       rm -f "$runs" "$filtered"
       ;;
     *)
-      say_err "ci-failure-set: one of --pr, --commit, --main-union, --diff is required"
+      say_err "ci-failure-set: one of --pr, --commit, --main-union, --main-union-rates, --main-union-signatures, --commit-rows, --diff is required"
       usage >&2
       exit 2
       ;;
