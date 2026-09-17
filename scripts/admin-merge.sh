@@ -185,12 +185,14 @@ RERUN_STALL_SECONDS="${ADMIN_MERGE_STALL_SECONDS:-600}"
 # run a re-run is about to replace is terminal), C is the max over ALL shards.
 #
 # FLOOR is load-bearing: a shard's green ceiling must never be tiny; AND it must
-# exceed RERUN_STALL_SECONDS BY CONSTRUCTION so the stall
-# check can never be transposed with the ceiling. At a flat 900 the ordering
-# held only while the stall window stayed under 900 — an operator raising
-# ADMIN_MERGE_STALL_SECONDS past ~450 would let the CEILING fire first and
-# re-create B7 (a stall reported as a still-running job: opposite remedies)
-# . Hence the default is 2 x the stall window, not a round number. The
+# be at least RERUN_STALL_SECONDS so the stall check can never be transposed with
+# the ceiling. At a flat 900 the ordering held only while the stall window stayed
+# under 900 — an operator raising ADMIN_MERGE_STALL_SECONDS past ~450 would let
+# the CEILING fire first and re-create B7 (a stall reported as a still-running
+# job: opposite remedies). Hence the default is 2 x the stall window, not a round
+# number — AND validate_timing_knobs REFUSES an explicit floor/fail-safe below
+# the stall window, so the invariant does not depend on the default holding; a
+# single knob cannot break it. The
 # fail-safe is larger still and applies to ANY derivation failure — a
 # derivation that failed must never produce a SMALL bound, because a too-tight
 # bound is the original defect this replaces.
@@ -250,12 +252,27 @@ counter_is_number() {
   return 0
 }
 
-# validate_timing_knobs — REFUSE a timing knob that is not a positive integer.
+# validate_timing_knobs — REFUSE a timing knob that is not a positive integer,
+# and REFUSE a ceiling knob below the stall window.
 # A comparison against a non-numeric value returns 2, and under `set -uo pipefail`
 # (no `-e`) the `if` body is SKIPPED: a bad value silently stops the guard from
 # gating. Both the stall window and the per-shard floor feed `-ge`/`-lt`, so a
 # `10m` window made BOTH STALLED and UNOBSERVABLE unreachable and turned every
 # outcome into the ceiling — the transposition this rail exists to prevent.
+# The ORDERING is separate and equally load-bearing: wait_for_run's loop condition
+# is the CEILING (`waited < RERUN_TIMEOUT`) while the STALL check is INSIDE the
+# body. A ceiling SHORTER than the stall window therefore exits via `return 2`
+# before `idle` can reach the stall — a stalled run printed as "still RUNNING at
+# the Ns ceiling" (B7) with the OPPOSITE remedy (wait/retry vs escalate). The
+# DEFAULT floor (2 x stall) satisfies this by construction, but the construction
+# does not cover an explicit knob: `ADMIN_MERGE_RERUN_FLOOR=300` with the default
+# 600s stall — or a fail-safe below the window on a no-green-sample shard —
+# re-creates B7 with one value. So it is REFUSED, by name.
+# POLL_INTERVAL is validated too: a non-numeric value makes `[ "$step" -gt 0 ]`
+# error (step falls back to 1) while `sleep "$POLL_INTERVAL"` then fails EVERY
+# iteration — a 600s stall window becomes a 600-POLL busy spin (~10x the gh
+# calls). 0 stays LEGAL: it is the deterministic TEST SEAM (no real sleeping),
+# so only a NON-NUMERIC value is refused, never zero.
 # Named, at startup, before any CI work.
 validate_timing_knobs() {
   local bad=0
@@ -274,6 +291,33 @@ validate_timing_knobs() {
     bad=1
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — the"
     say_err "   derivation fail-safe must be a POSITIVE integer number of seconds."
+  fi
+  if ! counter_is_number "$POLL_INTERVAL"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_POLL_INTERVAL='${POLL_INTERVAL}' — the poll interval must be"
+    say_err "   a NON-NEGATIVE integer number of seconds (0 is legal: the test seam). A non-numeric"
+    say_err "   value makes the step guard error and every 'sleep' fail, turning the stall window into"
+    say_err "   a tight BUSY SPIN of gh calls instead of a paced poll."
+  fi
+  # Ordering is checked only when the comparison is safe: a non-numeric operand
+  # makes `-lt` return 2 and the guard would silently SKIP. When either side is
+  # malformed the positivity checks above already set `bad`.
+  if counter_is_positive "$RERUN_STALL_SECONDS" && counter_is_positive "$RERUN_FLOOR" \
+     && [ "$RERUN_FLOOR" -lt "$RERUN_STALL_SECONDS" ]; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_FLOOR='${RERUN_FLOOR}' — the per-shard ceiling floor"
+    say_err "   must be at least the stall window ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}'. A"
+    say_err "   SHORTER ceiling reaches the WAIT's ceiling exit before the STALL check can fire, so a"
+    say_err "   stalled run is reported as still RUNNING — not a failure, with the OPPOSITE remedy."
+    say_err "   The default floor is 2 x the stall window."
+  fi
+  if counter_is_positive "$RERUN_STALL_SECONDS" && counter_is_positive "$FAILSAFE_RERUN_TIMEOUT" \
+     && [ "$FAILSAFE_RERUN_TIMEOUT" -lt "$RERUN_STALL_SECONDS" ]; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — the"
+    say_err "   derivation fail-safe must be at least the stall window ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}'."
+    say_err "   A shard with no green sample takes the fail-safe VERBATIM, so a shorter one reports a"
+    say_err "   stalled run as still RUNNING — the same B7 transposition as a short floor."
   fi
   [ "$bad" -eq 0 ] || { say_err "   These are operator knobs; fix the value and re-run the rail."; return 1; }
   return 0

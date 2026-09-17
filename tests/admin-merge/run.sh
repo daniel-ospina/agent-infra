@@ -1761,6 +1761,15 @@ grep -qF 'source=derived per-shard green ceiling 5592s (slowest unfinished shard
 grep -q '3126' "$TMP/bounds-b.txt" \
   && fail "(b) the stale global constant 3126 is still present" \
   || pass "(b) the stale global constant 3126 is gone"
+# …and the GREEN population query must forward the lane filter in DEFAULT mode.
+# The fake's `--status success` branch ignores --workflow, so nothing else pins
+# that green_run_ids routes the SAME lane as the failing-run listing — a dropped
+# filter would derive a shard's ceiling from a DIFFERENT lane's green runs.
+green_call="$(grep -m1 -E '^run list --status success' "$SCEN/calls")"
+case "$green_call" in
+  *"--workflow python-ci.yml"*) pass "(b) green_run_ids forwards --workflow in default mode" ;;
+  *) fail "(b) green_run_ids did NOT forward the lane filter"; echo "      $green_call" ;;
+esac
 # …and the value must TRACK the GREEN fixture — a different population, a
 # different bound. Any constant (including 1563/3126) cannot pass both halves.
 RUN_B2=7702
@@ -1907,9 +1916,16 @@ cat > "$SCEN/jobs-9733.json" <<'JOBS'
 ]}
 JOBS
 printf 'in_progress\n' > "$SCEN/status-9731"
-printf 't1\n' > "$SCEN/updated-9731"
+# The re-run makes PROGRESS on every poll (updatedAt advances), so `idle` never
+# reaches the stall window and the CEILING is what fires. The stall window is now
+# SMALLER than the ceiling (5s < 60s) — the ordering validate_timing_knobs
+# requires. The old fixture forced the ceiling with a stall window ABOVE it
+# (stall=100000, floor=5), which the validator now rightly refuses; the default
+# floor is 2 x 5s = 10s, still below the 60s derived ceiling, so 60s still wins.
+: > "$SCEN/updated-9731"
+_i=0; while [ "$_i" -lt 70 ]; do printf 'T%s\n' "$_i" >> "$SCEN/updated-9731"; _i=$((_i + 1)); done
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
-  ADMIN_MERGE_STALL_SECONDS=100000 ADMIN_MERGE_RERUN_FLOOR=5 \
+  ADMIN_MERGE_STALL_SECONDS=5 \
   bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
 [ "$rc" -ne 0 ] && pass "(e) the DERIVED ceiling blocks when reached (exit $rc)" \
@@ -2145,6 +2161,88 @@ case "$stall_line" in
     fail "(P2-3) the STALL message carries a ceiling source" ;;
   *) pass "(P2-3) …but the STALL message itself carries NO ceiling source (the pin is scoped)" ;;
 esac
+
+# ── 41. THE CEILING ORDERING IS ENFORCED, NOT LEFT TO THE DEFAULT ──────────
+# The #1167 review P2: the header claimed the floor "must exceed the stall window
+# BY CONSTRUCTION", but only the `2 x stall` DEFAULT did. wait_for_run's loop
+# condition is the CEILING while the STALL check is INSIDE the body, so a ceiling
+# below the stall window exits via `return 2` before `idle` can reach the stall:
+# a STALLED run printed as "still RUNNING at the Ns ceiling" (B7) with the
+# OPPOSITE remedy. One knob (`ADMIN_MERGE_RERUN_FLOOR=300` over a 600s stall)
+# broke it. validate_timing_knobs now REFUSES it by name.
+echo "== 41. the ceiling ordering is enforced, not left to the default =="
+
+# (P2-7) the exact repro: floor 300 < the default stall 600.
+new_scen order-floor
+ADMIN_MERGE_RERUN_FLOOR=300 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P2-7) a floor below the stall window is refused (exit 2)" \
+  || fail "(P2-7) a floor below the stall window was NOT refused (exit $rc)"
+grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='300'" "$TMP/err" \
+  && pass "(P2-7) …and the refusal names the knob and its value" \
+  || { fail "(P2-7) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
+grep -q "stall window ADMIN_MERGE_STALL_SECONDS='600'" "$TMP/err" \
+  && pass "(P2-7) …and names the stall window it must clear" \
+  || fail "(P2-7) the refusal does not name the stall window"
+grep -q 'still RUNNING at the' "$TMP/err" \
+  && fail "(P2-7) the refused config still printed a ceiling claim" \
+  || pass "(P2-7) …and no 'still RUNNING at the ceiling' claim was printed"
+
+# (P2-8) the fail-safe on a no-green-sample shard takes the value VERBATIM, so a
+# fail-safe below the stall window has the same B7 transposition.
+new_scen order-failsafe
+ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK=300 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P2-8) a fail-safe below the stall window is refused (exit 2)" \
+  || fail "(P2-8) a fail-safe below the stall window was NOT refused (exit $rc)"
+grep -q "refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='300'" "$TMP/err" \
+  && pass "(P2-8) …and the refusal names the knob and its value" \
+  || { fail "(P2-8) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
+grep -q "stall window ADMIN_MERGE_STALL_SECONDS='600'" "$TMP/err" \
+  && pass "(P2-8) …and names the stall window it must clear" \
+  || fail "(P2-8) the refusal does not name the stall window"
+
+# (P2-9) the DEFAULT path still satisfies the ordering: with a raised stall
+# window and NO floor override, the floor is 2 x stall — the ceiling can never
+# sit below the stall. A regression that refused the default would fail here.
+new_scen order-default
+RUN_O=7831
+cat > "$SCEN/jobs-$RUN_O.json" <<'JOBS'
+{"total_count":2,"jobs":[
+{"name":"test (a)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:50Z"},
+{"name":"test (b)","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:50Z"}
+]}
+JOBS
+printf '7832\n' > "$SCEN/green-runs"
+cat > "$SCEN/jobs-7832.json" <<'JOBS'
+{"total_count":2,"jobs":[
+{"name":"test (a)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:50Z"},
+{"name":"test (b)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:50Z"}
+]}
+JOBS
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_STALL_SECONDS=300 \
+  bash "$ADM" --print-bounds "$RUN_O" --repo x/y >"$TMP/bounds-o.txt" 2>&1
+grep -q '^stall=300$' "$TMP/bounds-o.txt" \
+  && pass "(P2-9) a raised stall window (300s) is accepted with the default floor" \
+  || { fail "(P2-9) the default-order path was refused: $(head -1 "$TMP/bounds-o.txt")"; sed 's/^/      /' "$TMP/bounds-o.txt"; }
+grep -q '^rerun-timeout=600$' "$TMP/bounds-o.txt" \
+  && pass "(P2-9) …and the default floor is 2 x stall (600 = 2 x 300), above the 300s window" \
+  || fail "(P2-9) expected the default floor 600, got: $(head -1 "$TMP/bounds-o.txt")"
+
+# (P2-10) POLL_INTERVAL is a timing knob too: non-numeric is refused (a 600s
+# window would become a 600-poll busy spin of gh calls), while 0 stays LEGAL as
+# the deterministic test seam.
+new_scen order-poll
+ADMIN_MERGE_POLL_INTERVAL=abc bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P2-10) a non-numeric ADMIN_MERGE_POLL_INTERVAL is refused (exit 2)" \
+  || fail "(P2-10) a non-numeric poll interval was not refused (exit $rc)"
+grep -q "refusing ADMIN_MERGE_POLL_INTERVAL='abc'" "$TMP/err" \
+  && pass "(P2-10) …and the refusal names the knob and its value" \
+  || { fail "(P2-10) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
+ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" --print-bounds >/dev/null 2>"$TMP/err"
+[ $? -eq 0 ] && pass "(P2-10) …and 0 stays LEGAL (the deterministic test seam)" \
+  || fail "(P2-10) the 0 test seam was refused: $(head -1 "$TMP/err")"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
