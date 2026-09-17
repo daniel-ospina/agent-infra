@@ -102,6 +102,15 @@ import {
   type DispatchRecordContext,
   type RecordWriteResult,
 } from "../shared/dispatch-record.js";
+// #1068: the progress-edge classification + marker vocabulary + kill-reason
+// clause set are DECLARED once, in shared/. The parent DERIVES from them instead
+// of restating them, so a new edge or clause cannot be added on one side only.
+import {
+  MARKER_KINDS,
+  HEARTBEAT_KILL_REASONS,
+  type HeartbeatKillReasonName,
+} from "../shared/heartbeat-progress-edges.js";
+export { HEARTBEAT_KILL_REASONS };
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1903,10 +1912,12 @@ function markerKindOf(line: string): string {
 
 /** Kinds that make a prefix line a marker. Foreign lines that merely START
  * with the prefix (e.g. a sub-agent grepping this repo's source, a test log)
- * are preserved as ordinary stderr by returning false (code-review fix). */
-export const KNOWN_MARKER_KINDS = new Set([
-  "ready", "tool_start", "tool_end", "turn_start", "turn_end", "tick", "session_end",
-]);
+ * are preserved as ordinary stderr by returning false (code-review fix).
+ *
+ * #1068: DERIVED from `MARKER_KINDS` in shared/heartbeat-progress-edges.ts —
+ * the child's formatters and this parser now read one declaration, and the
+ * parity test asserts this arm set matches the declared wire rows. */
+export const KNOWN_MARKER_KINDS = new Set<string>(MARKER_KINDS);
 
 /**
  * Parse one COMPLETE stderr line into heartbeat state. Returns true only for
@@ -2233,15 +2244,7 @@ export function flushHeartbeatLineBuf(ctx: HeartbeatIngestContext): string {
   return kept;
 }
 
-export type HeartbeatKillReason =
-  | "zero-output"
-  | "silence-threshold"
-  | "stream-stall"
-  | "tool-silence"
-  | "tool-stall"
-  | "first-message-stall"
-  | "max-dispatch"
-  | "cut";
+export type HeartbeatKillReason = HeartbeatKillReasonName;
 
 export interface HeartbeatKillDecision {
   kill: boolean;

@@ -231,6 +231,28 @@ jobs:
         # ./provider-failover.js only, which imports `node:` only) — it must run
         # WITHOUT `npm ci`, which this job does not perform.
         run: npx tsx extensions/shared/default-coverage.test.ts
+      - name: Stall-vocabulary + progress-edge parity (#1068, zero-dep)
+        # #1068 — the declared-surface instrument (`declared-surface.ts`), the
+        # progress-edge declaration (`heartbeat-progress-edges.ts`) and both
+        # suites import `node:*` + each other ONLY, so they run in THIS job (the
+        # job that performs no `npm ci`). The suites assert that the child's
+        # clock-advancing edges, the parent's `parseHeartbeatLine` effects, the
+        # marker vocabulary, the kill-reason clause set and every declared
+        # stall/liveness bound in the repo agree with their declarations — in
+        # both directions, with non-vacuity floors so a renamed corpus FAILS
+        # instead of reporting a clean scan over nothing.
+        # VISIBLE, not merge-blocking: `pipeline-compliance` is the repo's only
+        # required check (#646), so the BLOCKING backstop is the post-merge
+        # ci-main.yml `extensions/shared/*.test.ts` glob. The `builtin-tools`
+        # half of the parity assertion (the real child factory + the real
+        # parser) needs `npm ci` and therefore runs post-merge only.
+        run: npx tsx extensions/shared/declared-surface.test.ts
+      - name: Heartbeat progress-edge declaration drift gate (#1068, zero-dep)
+        # The SECOND suite of the #1068 pair, as its own step on purpose: `&&`
+        # short-circuits, so a `declared-surface` failure would suppress this
+        # suite's verdict for that PR entirely (the same reason the accumulator
+        # at the top of this job avoids `&&`). Each suite reports on its own.
+        run: npx tsx extensions/shared/heartbeat-progress-edges.test.ts
       - name: Shared bash/git command-parser suite (#966, zero-dep)
         # #966 — extensions/shared/git-command-parse.ts imports `node:*` ONLY, so
         # its suite runs in THIS job (the job that performs no `npm ci`), like
