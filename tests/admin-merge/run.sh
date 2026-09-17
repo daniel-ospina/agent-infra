@@ -55,6 +55,11 @@
 #      never left standing over an unmerged PR (B1 lost #3754/#3755 to it).
 #  17. A DRAFT IS REFUSED EARLY: gh refuses to merge a draft and commit-workflow
 #      opens drafts, so the rail refuses before any CI work, by name.
+#  18. THE CEILING IS DERIVED PER SHARD (#1167): no global constant. The bound is
+#      a FUNCTION of the run's own observed job durations, C is the max over the
+#      NOT-completed shards (the ones a wait can land on), the FLOOR protects a
+#      sample-less shard, and ANY derivation failure is the 3900s fail-safe —
+#      never a small bound. The lane-terminal precondition names WAIT vs STALLED.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -164,6 +169,14 @@ case "$key" in
     # `updated-<id>` are consumed one line per poll and REPEAT their last line
     # once exhausted (so an all-in_progress status models a run that never
     # finishes, and a one-line `updated-<id>` models no progress = a stall).
+    # A run whose projection CANNOT be read at all (gh failure/auth/network).
+    # Deliberately distinct from a run that is merely not progressing: the rail
+    # must never call an unreadable run STALLED — "no progress" is a claim about
+    # a field we read, and an outage is the absence of that reading. Field
+    # evidence: frozen metadata produced a FALSE stall while the work was still
+    # running, so a metadata clock alone cannot separate running-but-quiet,
+    # dead, and wedged.
+    [ -f "$SCEN/unreadable-$id" ] && exit 1
     if [ -f "$SCEN/status-$id" ]; then
       n=$(( $(cat "$SCEN/status-count-$id" 2>/dev/null || echo 0) + 1 ))
       printf '%s' "$n" > "$SCEN/status-count-$id"
@@ -209,6 +222,14 @@ case "$key" in
       exit 1
     fi
     exit 0 ;;
+  api*)
+    # The Jobs API seam for the per-shard ceiling derivation (#1167). The run id
+    # is parsed out of the URL so a fixture is per-run; a bare `$SCEN/jobs.json`
+    # serves every run. No fixture is an API error (never a small bound).
+    id="$(printf '%s' "$a2" | sed -n 's#.*/runs/\([0-9][0-9]*\)/jobs.*#\1#p')"
+    if [ -n "$id" ] && [ -f "$SCEN/jobs-$id.json" ]; then cat "$SCEN/jobs-$id.json"; exit 0; fi
+    if [ -f "$SCEN/jobs.json" ]; then cat "$SCEN/jobs.json"; exit 0; fi
+    exit 1 ;;
   *)
     exit 1 ;;
 esac
@@ -1540,6 +1561,9 @@ grep -q "STALLED: no progress for 2s" "$TMP/err" \
   || fail "(b) the stall is not named"
 grep -q "still RUNNING at the" "$TMP/err" && fail "(b) a stall was reported as the ceiling" \
   || pass "(b) the stall is DISTINCT from the ceiling message"
+grep -q "explicit --rerun-timeout\|derived per-shard ceiling\|fail-safe" "$TMP/err" \
+  && fail "(b) a stall carried a ceiling source — the two waits are not distinguishable" \
+  || pass "(b) the stall stderr carries NO ceiling source"
 grep -q "pr merge" "$SCEN/calls" && fail "(b) no merge on a stall" || pass "(b) no merge attempted"
 
 # (c) THE TWO WAITS READ DIFFERENTLY. The lane-terminal precondition fires
@@ -1571,11 +1595,11 @@ grep -q "run rerun" "$SCEN/calls" && fail "(c) no re-run may start from a precon
 
 # (d) THE CEILING IS DERIVED, and its source is stated — not a round number.
 bash "$ADM" --print-bounds > "$TMP/bounds.txt" 2>&1 || true
-grep -q '^rerun-timeout=3126$' "$TMP/bounds.txt" \
-  && pass "(d) the default ceiling is DERIVED: 3126s (2 x the slowest OBSERVED shard)" \
-  || fail "(d) the ceiling is not the derived value: $(head -1 "$TMP/bounds.txt")"
-grep -q 'source=2 x slowest OBSERVED shard 26m03s' "$TMP/bounds.txt" \
-  && pass "(d) …and the derivation's SOURCE (26m03s of 22m10s/25m50s/26m03s) is stated" \
+grep -q '^rerun-timeout=3900$' "$TMP/bounds.txt" \
+  && pass "(d) no run id → the fail-safe 3900s (never a small bound)" \
+  || fail "(d) the default ceiling is not the fail-safe: $(head -1 "$TMP/bounds.txt")"
+grep -q '^source=fail-safe 3900s — no run id supplied' "$TMP/bounds.txt" \
+  && pass "(d) …and the fail-safe states why it applied" \
   || fail "(d) the derivation source is not stated"
 grep -q '^stall=600$' "$TMP/bounds.txt" \
   && pass "(d) …and the stall window is its own, stated value" \
@@ -1593,9 +1617,9 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_I
   ADMIN_MERGE_STALL_SECONDS=100 bash "$ADM" 42 --main-runs 1 --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
 rc=$?
 [ "$rc" -ne 0 ] && pass "(d) the derived ceiling blocks when reached (exit $rc)" || fail "(d) the ceiling did not block"
-grep -q "still RUNNING at the 5s ceiling = 2 x the slowest OBSERVED shard (26m03s)" "$TMP/err" \
-  && pass "(d) the ceiling message states the derivation, not a bare number" \
-  || fail "(d) the ceiling message does not state its derivation"
+grep -q "still RUNNING at the 5s ceiling — explicit --rerun-timeout" "$TMP/err" \
+  && pass "(d) the ceiling message names the bound's source, not a bare number" \
+  || fail "(d) the ceiling message does not state its source"
 
 # (e) ATTRIBUTION: a failure main's lane has NOT measured must not be called
 # "unique to this PR" — but it STILL BLOCKS. main fails a Docker file; the PR
@@ -1641,6 +1665,230 @@ grep -q "measured on this lane, not present on main" "$TMP/err" \
   || fail "(e2) the measured-absent label is missing"
 grep -q "not measurable on this lane" "$TMP/err" && fail "(e2) a measured failure was called unmeasurable" \
   || pass "(e2) the two labels are distinct"
+
+# ── 38. THE PER-SHARD CEILING DERIVATION (#1167) ────────────────────────────
+# The old ceiling was ONE hardcoded shard constant (2 x 1563s). B4's population
+# falsifies that input: `test (b)`'s MEDIAN green run is 2.5x `test (a)`'s, so a
+# single number is too tight for the slow shard and absurdly generous for the
+# fast one. The ceiling is now a FUNCTION of the run's own observed per-shard
+# durations, fetched over the Jobs API through the $GH seam.
+echo "== 38. the per-shard ceiling derivation (#1167) =="
+
+# (a) default: no run id → the fail-safe, and NO network call.
+new_scen bounds-default
+bash "$ADM" --print-bounds > "$TMP/bounds-a.txt" 2>&1 || true
+grep -q '^rerun-timeout=3900$' "$TMP/bounds-a.txt" \
+  && pass "(a) no run id → 3900 (the fail-safe)" \
+  || fail "(a) expected rerun-timeout=3900, got: $(head -1 "$TMP/bounds-a.txt")"
+grep -q '^source=fail-safe 3900s — no run id supplied; the derivation needs a run (pass one: --print-bounds <run-id>)$' "$TMP/bounds-a.txt" \
+  && pass "(a) …and the fail-safe source line" \
+  || fail "(a) the fail-safe source line is missing"
+grep -q '^stall=600$' "$TMP/bounds-a.txt" \
+  && pass "(a) …and the stall window" || fail "(a) the stall line is missing"
+new_scen bounds-offline
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds > "$TMP/out" 2>"$TMP/err"
+[ "$(wc -l < "$SCEN/calls")" -eq 0 ] \
+  && pass "(a) no gh call when there is nothing to derive from" \
+  || { fail "(a) --print-bounds made a network call without a run id"; sed 's/^/      /' "$SCEN/calls"; }
+
+# (b) a synthetic population where two shards differ. `test (a)` is FAST and
+# finished; `test (b)` is SLOW and still running (its completed sample is the
+# same shard's earlier attempt). C must be the UNFINISHED shard's ceiling —
+# NOT a global constant, and NOT the fast shard's — while BOTH rows carry n.
+new_scen bounds-derive
+RUN_B=7701
+cat > "$SCEN/jobs-$RUN_B.json" <<'JOBS'
+{"total_count":4,"jobs":[
+{"name":"test (a)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:18:50Z"},
+{"name":"test (a)","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:18:50Z"},
+{"name":"test (b)","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:46:36Z"},
+{"name":"test (b)","status":"in_progress","conclusion":null,"started_at":"2026-01-01T01:00:00Z","completed_at":null}
+]}
+JOBS
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds "$RUN_B" --repo x/y > "$TMP/bounds-b.txt" 2>&1
+grep -q '^rerun-timeout=5592$' "$TMP/bounds-b.txt" \
+  && pass "(b) C is the UNFINISHED shard's ceiling (5592s), not a global constant" \
+  || { fail "(b) expected rerun-timeout=5592, got: $(head -1 "$TMP/bounds-b.txt")"; sed 's/^/      /' "$TMP/bounds-b.txt"; }
+grep -qE 'shard test \(a\)[[:space:]]+n=2[[:space:]]+max=1130s[[:space:]]+ceiling=2260s[[:space:]]+state=finished' "$TMP/bounds-b.txt" \
+  && pass "(b) the table prints test (a) WITH ITS n (n=2, max=1130s, ceiling=2260s)" \
+  || { fail "(b) the test (a) row is wrong/missing"; sed 's/^/      /' "$TMP/bounds-b.txt"; }
+grep -qE 'shard test \(b\)[[:space:]]+n=1[[:space:]]+max=2796s[[:space:]]+ceiling=5592s[[:space:]]+state=unfinished' "$TMP/bounds-b.txt" \
+  && pass "(b) the table prints test (b) WITH ITS n (n=1, max=2796s, ceiling=5592s)" \
+  || { fail "(b) the test (b) row is wrong/missing"; sed 's/^/      /' "$TMP/bounds-b.txt"; }
+grep -qF 'source=derived per-shard ceiling 5592s (slowest unfinished shard: test (b), n=1, max=2796s)' "$TMP/bounds-b.txt" \
+  && pass "(b) the source names the winning shard and its n/max" \
+  || fail "(b) the derivation source is not per-shard: $(grep '^source=' "$TMP/bounds-b.txt")"
+grep -q '3126' "$TMP/bounds-b.txt" \
+  && fail "(b) the stale global constant 3126 is still present" \
+  || pass "(b) the stale global constant 3126 is gone"
+# …and the value must TRACK the fixture — a different population, a different
+# bound. Any constant (including 1563/3126) cannot pass both halves.
+RUN_B2=7702
+cat > "$SCEN/jobs-$RUN_B2.json" <<'JOBS'
+{"total_count":2,"jobs":[
+{"name":"test (a)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:05:00Z"},
+{"name":"test (b)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:16:40Z"}
+]}
+JOBS
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds "$RUN_B2" --repo x/y > "$TMP/bounds-b2.txt" 2>&1
+grep -q '^rerun-timeout=2000$' "$TMP/bounds-b2.txt" \
+  && pass "(b) a DIFFERENT fixture yields a DIFFERENT value (2000s) — a function, not a constant" \
+  || fail "(b) the value did not track the fixture: $(head -1 "$TMP/bounds-b2.txt")"
+grep -qF 'source=derived per-shard ceiling 2000s (slowest shard (every shard completed): test (b), n=1, max=1000s)' "$TMP/bounds-b2.txt" \
+  && pass "(b) an all-completed run takes the max over EVERY shard and says so" \
+  || fail "(b) the all-completed source is wrong: $(grep '^source=' "$TMP/bounds-b2.txt")"
+# FLOOR is a FLOOR: a fast shard's 2 x max is lifted to it, never below it.
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_RERUN_FLOOR=5000 bash "$ADM" --print-bounds "$RUN_B2" --repo x/y > "$TMP/bounds-floor.txt" 2>&1
+grep -q '^rerun-timeout=5000$' "$TMP/bounds-floor.txt" \
+  && pass "(b) FLOOR lifts a fast shard (ceiling = max(FLOOR, 2 x max))" \
+  || fail "(b) the floor was not applied: $(head -1 "$TMP/bounds-floor.txt")"
+
+# (c) ANY failure of the derivation is the FAIL-SAFE, never a small bound.
+new_scen bounds-bad
+RUN_C1=7711; RUN_C2=7712; RUN_C3=7713
+printf 'this is not JSON at all\n' > "$SCEN/jobs-$RUN_C1.json"
+: > "$SCEN/jobs-$RUN_C2.json"
+printf '{"total_count":1,"jobs":[{"name":"test (a)","status":"in_progress","started_at":"2026-01-01T00:00:00Z","completed_at":null}]}\n' > "$SCEN/jobs-$RUN_C3.json"
+for spec in "$RUN_C1|unparsable jobs response" "$RUN_C2|empty jobs response" "$RUN_C3|no job durations observed" "7799|jobs API error"; do
+  rid="${spec%%|*}"; why="${spec#*|}"
+  SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds "$rid" --repo x/y > "$TMP/out" 2>"$TMP/err" || true
+  if grep -q '^rerun-timeout=3900$' "$TMP/out" \
+     && grep -qF "derivation unavailable (${why}) — using the fail-safe 3900s (never a small bound)" "$TMP/err" \
+     && grep -qF "source=fail-safe 3900s — derivation unavailable (${why})" "$TMP/out"; then
+    pass "(c) $why → 3900, loudly, with the reason"
+  else
+    fail "(c) $why did not fail safe to 3900 ($(head -1 "$TMP/out")); stderr: $(head -1 "$TMP/err")"
+  fi
+done
+ADMIN_MERGE_GH=/nonexistent/gh bash "$ADM" --print-bounds 7799 --repo x/y > "$TMP/out" 2>"$TMP/err" || true
+grep -qF 'derivation unavailable (gh absent) — using the fail-safe 3900s' "$TMP/err" \
+  && pass "(c) gh absent → 3900, loudly" \
+  || fail "(c) gh absent did not fail safe: $(head -1 "$TMP/err")"
+
+# (d) an explicit --rerun-timeout wins, and the derivation is not even consulted.
+new_scen bounds-override
+RUN_D=7721
+printf '{"total_count":1,"jobs":[{"name":"test (b)","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:46:36Z"}]}\n' > "$SCEN/jobs-$RUN_D.json"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds "$RUN_D" --repo x/y --rerun-timeout 1234 > "$TMP/bounds-d.txt" 2>&1
+grep -q '^rerun-timeout=1234$' "$TMP/bounds-d.txt" \
+  && pass "(d) --rerun-timeout overrides the derivation" \
+  || fail "(d) the override was not honoured: $(head -1 "$TMP/bounds-d.txt")"
+grep -q '^source=explicit --rerun-timeout$' "$TMP/bounds-d.txt" \
+  && pass "(d) …and the source says so" || fail "(d) the override source is wrong"
+grep -q 'api ' "$SCEN/calls" \
+  && fail "(d) the derivation was consulted despite an explicit override" \
+  || pass "(d) …and the derivation was not consulted"
+
+# (e) STALLED and CEILING stay distinguishable, and a DERIVED ceiling fires end
+# to end naming its source. The run this re-run replaces is TERMINAL, so every
+# shard has a completed sample — the ordering the rail actually uses.
+new_scen bounds-e2e
+HEAD_E="e0e0000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_E" > "$SCEN/head"
+lane_fail "$HEAD_E" 9731 > "$SCEN/runs-$HEAD_E"
+log_failed 'tests/test_new.py::test_brand_new' > "$SCEN/log-9731"
+lane_fail maine0 9732 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9732"
+cat > "$SCEN/jobs-9731.json" <<'JOBS'
+{"total_count":2,"jobs":[
+{"name":"test (a)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:10Z"},
+{"name":"test (b)","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:30Z"}
+]}
+JOBS
+printf 'in_progress\n' > "$SCEN/status-9731"
+printf 't1\n' > "$SCEN/updated-9731"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_STALL_SECONDS=100000 ADMIN_MERGE_RERUN_FLOOR=5 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e) the DERIVED ceiling blocks when reached (exit $rc)" \
+  || fail "(e) the derived ceiling did not block (exit 0)"
+grep -q 'still RUNNING at the 60s ceiling' "$TMP/err" \
+  && pass "(e) the CEILING message states the derived bound (60s = 2 x 30s)" \
+  || { fail "(e) the ceiling message is wrong"; sed 's/^/      /' "$TMP/err"; }
+grep -qF 'derived per-shard ceiling 60s (slowest shard (every shard completed): test (b), n=1, max=30s)' "$TMP/err" \
+  && pass "(e) …and carries the shard, its n and its max" \
+  || fail "(e) the ceiling message does not carry the derivation"
+grep -q 'STALLED' "$TMP/err" && fail "(e) a ceiling was reported as a stall" || pass "(e) the ceiling is DISTINCT from STALLED"
+grep -q 'explicit --rerun-timeout' "$TMP/err" && fail "(e) an unconfigured bound claimed to be explicit" || pass "(e) the ceiling does not claim an override it did not have"
+grep -q 'pr merge' "$SCEN/calls" && fail "(e) no merge on a ceiling" || pass "(e) no merge attempted"
+
+# ── 39. THE LANE-TERMINAL PRECONDITION COVERS BOTH WAITS (#1167) ───────────
+# The precondition must not merely refuse: it must say WHICH wait it is. A pending
+# run that is moving reads as a WAIT; one whose progress clock has stopped for the
+# stall window reads as STALLED. Neither is the re-run ceiling.
+echo "== 39. the precondition names WAIT vs STALLED =="
+
+# (i) a progressing run → WAIT
+new_scen precond-wait
+HEAD_PW="f9f9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PW" > "$SCEN/head"
+lane_queued "$HEAD_PW" 9801 > "$SCEN/runs-$HEAD_PW"
+lane_fail mainpw 9802 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9802"
+printf 'in_progress\n' > "$SCEN/status-9801"
+printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SCEN/updated-9801"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(i) a pending lane blocks (exit $rc)" || fail "(i) the precondition did not block"
+grep -q 'this is a WAIT, not a stall; the re-run bound is a different wait' "$TMP/err" \
+  && pass "(i) a progressing lane reads as a WAIT, not a stall" \
+  || { fail "(i) the WAIT reading is missing"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'STALLED' "$TMP/err" && fail "(i) a progressing lane was called STALLED" || pass "(i) …and NOT as STALLED"
+grep -q -- '--rerun-timeout never started' "$TMP/err" \
+  && pass "(i) …and the re-run wait is still stated as never started" \
+  || fail "(i) the never-started statement disappeared"
+[ "$(grep -c '^run view 9801' "$SCEN/calls" || true)" -eq 1 ] \
+  && pass "(i) exactly ONE gh run view call for the diagnostic" \
+  || fail "(i) expected one run view call, got $(grep -c '^run view 9801' "$SCEN/calls" || true)"
+
+# (ii) a frozen progress clock → STALLED
+new_scen precond-stall
+printf '%s\n' "$HEAD_PW" > "$SCEN/head"
+lane_queued "$HEAD_PW" 9811 > "$SCEN/runs-$HEAD_PW"
+lane_fail mainpw2 9812 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9812"
+printf 'in_progress\n' > "$SCEN/status-9811"
+printf '2020-01-01T00:00:00Z\n' > "$SCEN/updated-9811"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(ii) a stalled pending lane blocks (exit $rc)" || fail "(ii) the precondition did not block"
+grep -q 'STALLED — no progress for' "$TMP/err" \
+  && pass "(ii) a frozen progress clock reads as STALLED with the idle seconds" \
+  || { fail "(ii) the STALLED reading is missing"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'this is a WAIT, not a stall' "$TMP/err" && fail "(ii) a stalled lane was called a WAIT" || pass "(ii) …and NOT as a WAIT"
+grep -q 'stall window 600s' "$TMP/err" \
+  && pass "(ii) …naming the stall window it exceeded" || fail "(ii) the stall window is not named"
+
+# (iii) AN UNREADABLE RUN IS NOT A STALL. gh failing repeatedly means the run's
+# state was NEVER OBSERVED; STALLED asserts "updatedAt never moved", which the
+# rail cannot claim if it never read the field. The remedies are opposite
+# (repair gh vs escalate a wedged run), so the diagnoses must differ — and the
+# rail must still fail closed.
+new_scen unobservable
+printf '%s\n' "$HEAD_W1" > "$SCEN/head"
+lane_fail "$HEAD_W1" 9641 > "$SCEN/runs-$HEAD_W1"
+log_failed 'tests/test_flaky.py::test_slow' > "$SCEN/log-9641"
+lane_fail mainw4 9642 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9642"
+# NO status-9641 file would mean "completed"; make the projection FAIL instead.
+: > "$SCEN/unreadable-9641"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_STALL_SECONDS=2 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "(iii) an UNREADABLE run still blocks (exit $rc) — fail closed" \
+  || fail "(iii) an unreadable run did not block"
+grep -q 'UNOBSERVABLE' "$TMP/err" \
+  && pass "(iii) …and is reported as UNOBSERVABLE" \
+  || { fail "(iii) the UNOBSERVABLE diagnosis is missing"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'STALLED' "$TMP/err" \
+  && fail "(iii) an unreadable run was called STALLED — that claims progress was observed" \
+  || pass "(iii) …and NOT as STALLED (it never saw the field)"
+grep -q 'gh auth/network' "$TMP/err" \
+  && pass "(iii) …and names the different remedy" \
+  || fail "(iii) the remedy is not named"
+grep -q "pr merge" "$SCEN/calls" && fail "(iii) no merge may be attempted on an unreadable run" \
+  || pass "(iii) no merge attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
