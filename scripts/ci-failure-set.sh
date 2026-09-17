@@ -29,6 +29,12 @@
 # Options:
 #   --exclude <sha>           (--main-union) drop runs whose headSha is <sha>
 #                             (full or short; matched against the run's headSha)
+#   --main-union-rates [N]    (#3756) per-id failure COUNTS over the last N runs:
+#                             `<nodeid>\t<failures>\t<runs>`. The rate table the
+#                             exemption decision consumes — a union cannot express
+#                             `main 1/8` vs `PR 8/8`, which is why presence-based
+#                             subtraction excused an eight-fold regression. Emits
+#                             NOTHING when no run exercised the suite (fail-closed).
 #   --repo <owner/repo>       repo for the gh calls (default: gh's own resolution)
 #   --workflow <file|name>    restrict the run listing to ONE workflow (default
 #                             `python-ci.yml`, or $CI_FAILURE_SET_WORKFLOW).
@@ -221,6 +227,64 @@ collect_union() {
   rm -f "$tmp_set"
 }
 
+# #3756 — per-id failure COUNTS across a lane's runs, not a union.
+#
+# Emits `<nodeid>\t<failures>\t<runs>` where `runs` is the number of runs that
+# actually EXERCISED the suite (the declared K for the rate comparison). This is
+# what makes the exemption decision an EFFECT measurement instead of the presence
+# question — the question that excused `main 1/8` against `PR 8/8`.
+#
+# Fail-closed (#3705): propagation follows `collect_union` exactly — an extraction
+# failure returns 1 rather than emitting an empty set, because an unreadable
+# baseline must never read as "no failures".
+collect_union_rates() {
+  local lane_file="$1" provenance="$2" report="$3"
+  local tmp_all="" examined=0 extracted=0 completed=0 tested=0 pending=0 run_id line
+  tmp_all="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+  : > "$tmp_all"
+  [ -n "$provenance" ] && : > "$provenance"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    local status rest conclusion runref
+    status="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    conclusion="${rest%%$'\t'*}"
+    runref="${rest#*$'\t'}"
+    run_id="${runref##*:}"
+    if [ "$status" = "completed" ]; then
+      completed=$((completed + 1))
+      case "$conclusion" in
+        success|failure|timed_out) tested=$((tested + 1)) ;;
+      esac
+    else
+      pending=$((pending + 1))
+    fi
+    case "$conclusion" in
+      failure|timed_out|startup_failure) ;;
+      *) continue ;;
+    esac
+    examined=$((examined + 1))
+    printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
+    local one
+    one="$(extract_failed_tests "$run_id")" || { rm -f "$tmp_all"; return 1; }
+    if [ -n "$one" ]; then
+      extracted=$((extracted + 1))
+      printf '%s\n' "$one" >> "$tmp_all"
+    fi
+  done < "$lane_file"
+  if [ -n "$report" ]; then
+    printf 'examined=%s\nextracted=%s\ncompleted=%s\ntested=%s\npending=%s\n' \
+      "$examined" "$extracted" "$completed" "$tested" "$pending" > "$report"
+  fi
+  # No tested runs -> emit NOTHING. An empty rate table must never be read as
+  # "main never fails anything", which would exempt every PR failure.
+  if [ "$tested" -gt 0 ]; then
+    sort "$tmp_all" | uniq -c \
+      | awk -v k="$tested" '{ c = $1; $1 = ""; sub(/^ +/, ""); print $0 "\t" c "\t" k }'
+  fi
+  rm -f "$tmp_all"
+}
+
 # ── main ──────────────────────────────────────────────────
 
 main() {
@@ -234,6 +298,13 @@ main() {
       --commit) mode="commit"; commit="${2:-}"; shift 2 ;;
       --main-union)
         mode="main-union"
+        if [ $# -ge 2 ] && [ -n "${2:-}" ] && [ -z "${2##[0-9]*}" ]; then
+          main_runs="$2"; shift 2
+        else
+          shift 1
+        fi ;;
+      --main-union-rates)
+        mode="main-union-rates"
         if [ $# -ge 2 ] && [ -n "${2:-}" ] && [ -z "${2##[0-9]*}" ]; then
           main_runs="$2"; shift 2
         else
@@ -292,6 +363,25 @@ main() {
       list_lane_runs --commit "$commit" 100 > "$runs" || { rm -f "$runs"; say_err "ci-failure-set: ✗ could not list runs for $commit"; exit 1; }
       collect_union "$runs" "$provenance" "$report" || { rm -f "$runs"; exit 1; }
       rm -f "$runs"
+      ;;
+    main-union-rates)
+      local runs filtered
+      runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+      filtered="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+      list_lane_runs --branch main "$main_runs" > "$runs" || { rm -f "$runs" "$filtered"; say_err "ci-failure-set: ✗ could not list main runs"; exit 1; }
+      if [ -n "$exclude" ]; then
+        awk -F'\t' -v x="$exclude" '
+          {
+            n = split($3, a, ":")
+            sha = a[1]
+            if (sha == "") print
+            else if (sha != x && index(sha, x) != 1 && index(x, sha) != 1) print
+          }' "$runs" > "$filtered"
+      else
+        cp "$runs" "$filtered"
+      fi
+      collect_union_rates "$filtered" "$provenance" "$report" || { rm -f "$runs" "$filtered"; exit 1; }
+      rm -f "$runs" "$filtered"
       ;;
     main-union)
       local runs filtered
