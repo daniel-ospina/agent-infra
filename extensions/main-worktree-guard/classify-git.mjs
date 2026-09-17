@@ -391,8 +391,31 @@ const SYNC_VALUE_LONGS = new Set([
 /** Short options that take an argument. Attached vs separate is decided by
  *  git's own rule, scanned left-to-right: an arg-taker followed by MORE
  *  characters has the rest as its value (`-Xours`, `-mX`), while an arg-taker
- *  at the END of the cluster consumes the next argv (`-m`, `-qm`). */
-const SYNC_VALUE_SHORTS = new Set(["m", "F", "s", "X"]);
+ *  at the END of the cluster consumes the next argv (`-m`, `-qm`).
+ *
+ *  #1144 follow-up (P0-2): `o` (`--server-option`, an arg-taker on `pull`) was
+ *  MISSING, so `git pull -o --ff-only origin main` modelled `--ff-only` as a
+ *  live flag while real git consumed it as `-o`'s VALUE — a non-fast-forward
+ *  pull admitted as a provable fast-forward (probe: rc 0, MERGE COMMIT, branch
+ *  moved; the control `git pull --ff-only origin main` correctly aborts
+ *  rc 128). The push path already models this exact option (`VALUE_OPTS`
+ *  includes `-o`/`--push-option`). */
+const SYNC_VALUE_SHORTS = new Set(["m", "F", "s", "X", "o"]);
+/** Short options that are provably BOOLEAN for the sync verbs — they cannot
+ *  consume the next argv token, so they cannot free or swallow an ff flag.
+ *
+ *  Deliberately the SHORT SPELLING OF `SYNC_BOOLEAN_LONGS`, for the same
+ *  reason that set is curated rather than complete: a value table cannot mirror
+ *  git's parser, so the only safe shape is "known-benign or fail closed". Every
+ *  OTHER single-dash cluster letter (`-p`/`--prune`, `-a`, `-f`, `-t`, `-j`,
+ *  `-S`, and anything unenumerated) makes the ff proof UNVERIFIABLE
+ *  (P0-2's stronger fix: a short letter outside this set cannot be proven not
+ *  to be an arg-taker, so the token after it is of unknown kind). This is also
+ *  why the short/long asymmetry self-heals: `-p` is refused exactly as
+ *  `--prune` is, because neither is in its allowlist. `r` is handled separately
+ *  (it forces the rewriting `rebase` effect, which the predicate refuses
+ *  anyway). */
+const SYNC_BOOLEAN_SHORTS = new Set(["q", "v", "e", "n", "r", "k"]);
 
 /** Model one sync invocation's argv: which tokens are option VALUES, and which
  *  option-shaped tokens cannot be proven benign. */
@@ -416,15 +439,25 @@ function _syncArgModel(args) {
       continue;
     }
     if (t.startsWith("-") && t.length > 1) {
+      let clusterUnknown = false;
       for (let k = 1; k < t.length; k++) {
         const c = t[k];
         if (c === "r") rebaseShort = true;
         if (c === "n") noCommitShort = true;
         if (SYNC_VALUE_SHORTS.has(c)) {
+          // An arg-taker: the rest of the token is its value when present
+          // (`-Xours`), otherwise it consumes the NEXT argv token (`-m`,
+          // `-o --ff-only`). Either way it is not an ff flag and nothing
+          // after it in this token is an option.
           if (k === t.length - 1 && i + 1 < args.length) valueSlot[i + 1] = true;
-          break; // attached value, or the value slot already claimed
+          break;
         }
+        // Any letter that is neither an arg-taker nor a known boolean makes
+        // the ff proof unverifiable — it may be an arg-taker this table does
+        // not enumerate, which would swallow or free the ff token.
+        if (!SYNC_BOOLEAN_SHORTS.has(c)) clusterUnknown = true;
       }
+      if (clusterUnknown) unknown.push(t);
     }
   }
   return { valueSlot, unknown, rebaseShort, noCommitShort };
@@ -3134,6 +3167,21 @@ export function classifyGitCommandDetailed(command) {
     deleteTargets: [], pushDst: null, pushTargets: [], isPushDelete: false,
     renameFrom: null, renameTo: null, syncSource: null,
   };
+  // #1144 follow-up (P0-1): a hidden shell substitution (`eval "git rebase …"`,
+  // `$(git reset …)`, backticks, a piped-stdin shell, a heredoc-fed interpreter)
+  // EXECUTES git but contributes NO invocation to the walk — it collapses to an
+  // opaque token. Every downstream consumer that reasons "the invocation list is
+  // the whole command" (the sync arm's `onlyGitInvocation`, the legacy arm's
+  // per-invocation worktree exemption) is therefore UNSOUND unless this is
+  // consulted. Computed up front (and exposed as `out.hiddenStateSubst`) so the
+  // zero-invocation early return carries it too, and ORs the
+  // branch-state-mutating scan with the hub-gate's hardened unverifiable-git
+  // shape set (round-6→19 review-hardened; the two consumers reuse it so the
+  // construct coverage cannot drift).
+  const hiddenStateSubst =
+    _hasHiddenStateSubst(String(command ?? "")) ||
+    _unverifiableGitContent(String(command ?? ""));
+  out.hiddenStateSubst = hiddenStateSubst;
   if (invocations.length === 0) {
     // Round-5 (security F1): the raw destructive-pattern pass must run BEFORE
     // the zero-invocation early return — `eval "git reset --hard"` /
@@ -3324,7 +3372,16 @@ export function classifyGitCommandDetailed(command) {
     // `syncEffect` describes the first sync op, so
     // `git pull --ff-only && git rebase origin/main` classifies block:rebase
     // with a fast-forward-looking record — trusting it would admit the rebase.
-    out.syncOnlyInvocation = invocations.length === 1 && invocations[0] === syncInv;
+    //
+    // #1144 follow-up (P0-1): "only git invocation" is a claim about the WHOLE
+    // command, and a hidden shell substitution makes it UNPROVABLE —
+    // `git pull --ff-only && eval "git rebase origin/main"` walks to exactly
+    // one invocation (the pull) while the eval payload rewrites the branch
+    // after the guard's read. The verb list cannot see it; the effect record
+    // describes the wrong operation. Fail closed: hidden substitution ⇒ the
+    // only-git-invocation claim is false, so the sync arm refuses.
+    out.syncOnlyInvocation =
+      invocations.length === 1 && invocations[0] === syncInv && !hiddenStateSubst;
     // #1144 (reviewer P0): the sync op's OWN repo resolution. `eff` is resolved
     // from the state-mutating / first invocation's hints, so a compound whose
     // FIRST segment is `git -C <worktree> …` made `eff.isWorktree` true and
@@ -3586,18 +3643,10 @@ export function classifyGitCommandDetailed(command) {
   // block restores pre-#591 compound parity.
   out.stateOpCount = invocations.filter((v) =>
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
-  // #591 (round-3→5 fold): a shell construct may hide a branch-state git
-  // invocation from the count above (collapse to opaque tokens → stateOpCount
-  // undercounts). Exposed here so index.ts can refuse the M3 benign-force
-  // carve-out when hidden state mutation is present. The scan ORs the
-  // branch-state-mutating substitution scan (_hasHiddenStateSubst) with the
-  // hub-gate's hardened unverifiable-git shape set (_unverifiableGitContent:
-  // piped-stdin shells, process substitution, heredocs, alias/function
-  // definitions, spawner $VARs — round-6→19 review-hardened; the carve-out
-  // bound reuses it so the construct coverage cannot drift).
-  out.hiddenStateSubst =
-    _hasHiddenStateSubst(String(command ?? "")) ||
-    _unverifiableGitContent(String(command ?? ""));
+  // #591 (round-3→5 fold): `hiddenStateSubst` is computed UP FRONT (see the
+  // zero-invocation guard) and already on `out` — it now feeds not only the M3
+  // benign-force carve-out but the sync arm's `onlyGitInvocation` claim
+  // (P0-1) and the legacy arm's per-invocation worktree exemption (P0-3).
 
   // #596 round-4 (reviewer P1a follow-up): the M2 commit/push repo must come
   // from the classifier's boundary-aware walk of the commit/push invocation,

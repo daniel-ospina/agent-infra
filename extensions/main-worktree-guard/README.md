@@ -312,6 +312,29 @@ one level down:
   "read-only" includes a refspec-less `git fetch`, which cannot write
   `refs/heads/*`.
 
+A second adversarial review cycle then found the same two rules **incompletely
+closed**, and they are enforced here rather than deferred:
+
+- **The option-value model is only as good as its table, so unenumerated shapes
+  fail closed.** `git pull -o --ff-only origin main` read `--ff-only` as a live
+  flag while real git consumed it as `-o`'s (`--server-option`) VALUE and
+  performed a non-fast-forward pull (probe rc 0, merge commit, branch moved).
+  `-o` is now modelled as an arg-taker, and — the general rule — any single-dash
+  short-cluster letter that is neither a known arg-taker nor a known boolean
+  makes the proof **unverifiable**, mirroring the long-option design. The
+  short/long asymmetry self-heals as a consequence: `-p` is refused exactly as
+  `--prune` is, because neither is allowlisted.
+- **A hidden shell payload contributes NO invocation, so every "this is the
+  whole command" claim is unprovable while it runs.** `git pull --ff-only &&
+  eval "git rebase origin/main"` walked to exactly one invocation (the pull), so
+  the sync arm trusted the pull's fast-forward record for a command that rewrites
+  the branch immediately after; and `git -C <worktree> status && eval "git reset
+  --hard origin/main"` looked wholly worktree-scoped, so the legacy arm's
+  per-invocation worktree exemption laundered a reset of the SHARED hub.
+  `hiddenStateSubst` (`eval`, `$(…)`, backticks, piped-stdin shells, heredocs —
+  the hub gate's hardened shape set) now forces `syncOnlyInvocation` false and
+  the worktree exemption false: absent/partial evidence fails closed.
+
 **Why WIP preservation:** the 2026-08-18 incident left 38 commits on `pr1467`
 in the hub. `git push origin <checked-out-branch>` is the ONE allowed push so
 a stranded lane's work never silently dies before recovery.

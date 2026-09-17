@@ -546,6 +546,73 @@ async function partB() {
       !!fetchRefspec && fetchRefspec.block === true,
       `handler returned ${JSON.stringify(fetchRefspec)}`);
 
+    // ── B9p–B9r: #1144 follow-up closures ────────────────────────────────
+    // A second fresh-context adversarial reviewer found three INCOMPLETE
+    // closures of classes already declared above (B6/B8/B9d). Each is driven
+    // end-to-end here; each genuinely REDs at base 8bc92de (where the guard was
+    // verb-shaped and had no hidden-substitution or per-invocation model).
+
+    // B9p — the same class B9d closed, reached through a HIDDEN shell payload.
+    // `eval "git rebase origin/main"` contributes no invocation, so the walk
+    // saw exactly one (the pull) and `syncOnlyInvocation` claimed true: the
+    // sync arm trusted the pull's fast-forward record and returned undefined
+    // for the WHOLE command, letting the rebase move the shared branch. The
+    // `#1144` marker proves the SYNC ARM (not some incidental arm) refused it.
+    const evalRebase = await callBash('git pull --ff-only && eval "git rebase origin/main"');
+    expectTrue("B9p: `pull --ff-only && eval \"rebase\"` is BLOCKED by the sync arm (#1144 B9d-hidden)",
+      !!evalRebase && evalRebase.block === true && /#1144/.test(evalRebase.reason ?? ""),
+      `handler returned ${JSON.stringify(evalRebase)} — the hidden payload rode the visible pull's ff effect`);
+    const evalRebaseLead = await callBash('eval "git pull --rebase origin main" && git pull --ff-only');
+    expectTrue("B9p2: a hidden rewriting pull BEFORE the ff pull is BLOCKED (#1144 B9d-hidden)",
+      !!evalRebaseLead && evalRebaseLead.block === true && /#1144/.test(evalRebaseLead.reason ?? ""),
+      `handler returned ${JSON.stringify(evalRebaseLead)}`);
+    const evalCheckout = await callBash('git pull --ff-only && eval "git checkout main"');
+    expectTrue("B9p3: `pull --ff-only && eval \"checkout main\"` is BLOCKED (#1144 B9d-hidden)",
+      !!evalCheckout && evalCheckout.block === true && /#1144/.test(evalCheckout.reason ?? ""),
+      `handler returned ${JSON.stringify(evalCheckout)}`);
+
+    // B9q — B6's short value slot. `-o` is pull's `--server-option`, an
+    // ARG-TAKER: the old short-option table omitted it, so `--ff-only` was read
+    // as a live flag while real git consumed it as -o's VALUE and performed a
+    // non-fast-forward pull (probe: rc 0, MERGE COMMIT, branch moved). The long
+    // twin already failed closed; only the short letter was open.
+    const shortO = await callBash("git pull -o --ff-only origin main");
+    expectTrue("B9q: `pull -o --ff-only` is BLOCKED (#1144 B6o value slot)",
+      !!shortO && shortO.block === true && /#1144/.test(shortO.reason ?? ""),
+      `handler returned ${JSON.stringify(shortO)} — --ff-only was read as a flag instead of -o's value`);
+    // …and the general rule behind the entry: an unenumerated short letter may
+    // be an arg-taker this table does not know, so the proof fails closed. The
+    // short/long asymmetry also self-heals (`-p` refused as `--prune` is).
+    const shortUnknown = await callBash("git pull -Z --ff-only origin main");
+    expectTrue("B9q2: an unenumerated short letter is BLOCKED (`pull -Z --ff-only`) (#1144 B6o general rule)",
+      !!shortUnknown && shortUnknown.block === true && /#1144/.test(shortUnknown.reason ?? ""),
+      `handler returned ${JSON.stringify(shortUnknown)}`);
+    const shortP = await callBash("git pull --ff-only -p origin main");
+    expectTrue("B9q3: `pull --ff-only -p` is BLOCKED (short twin of the refused `--prune`) (#1144 B6o)",
+      !!shortP && shortP.block === true && /#1144/.test(shortP.reason ?? ""),
+      `handler returned ${JSON.stringify(shortP)}`);
+
+    // B9r — B8's worktree exemption, blinded by a hidden payload. `git -C <wt>
+    // status && eval "git reset --hard origin/main"` walks to ONE invocation
+    // (the worktree-scoped status), so `_allInvocationsWorktreeScoped` saw a
+    // complete worktree-scoped list and the LEGACY arm exempted the whole
+    // command — while the eval payload reset the SHARED hub. No `#1144` marker:
+    // this is the legacy destructive arm, not the allowance.
+    const evalReset = await callBash(`git -C ${leadWt} status && eval "git reset --hard origin/main"`);
+    expectTrue("B9r: `-C <wt> status && eval \"reset --hard\"` is BLOCKED (#1144 B8-hidden)",
+      !!evalReset && evalReset.block === true,
+      `handler returned ${JSON.stringify(evalReset)} — the worktree exemption was blinded by the hidden payload`);
+    const substReset = await callBash(`git -C ${leadWt} status && "$(git reset --hard origin/main)"`);
+    expectTrue("B9r2: the `$(…)` twin is BLOCKED (#1144 B8-hidden)",
+      !!substReset && substReset.block === true,
+      `handler returned ${JSON.stringify(substReset)}`);
+    // Positive control (re-asserted beside the new cases): a wholly
+    // worktree-scoped destructive op still reports no hidden substitution and
+    // stays exempt.
+    const wtOnlyAgain = await callBash(`git -C ${leadWt} reset --hard origin/main`);
+    expectTrue("B9r-cont: a wholly worktree-isolated `reset --hard` stays ALLOWED (#1144 B8-hidden control)",
+      wtOnlyAgain === undefined, `handler returned ${JSON.stringify(wtOnlyAgain)}`);
+
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
     // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE
     // script whose only path-shaped content is a markdown code span inside a

@@ -2054,6 +2054,17 @@ function _syncEffectiveRepo(det: any) {
  *                build): the caller keeps its previous behaviour rather than
  *                hard-blocking every destructive op in a worktree session. */
 function _allInvocationsWorktreeScoped(det: any): boolean | undefined {
+  // #1144 follow-up (P0-3): a hidden shell substitution (`git -C <wt> status
+  // && eval "git reset --hard origin/main"`, `… && "$(git reset --hard
+  // origin/main)"`) EXECUTES a destructive git op that contributes NO
+  // invocation, so `invocationHints` looks complete while the list is not.
+  // "Every git invocation resolves inside a worktree" is then unprovable — and
+  // the exemption exists precisely to skip the destructive block — so fail
+  // closed. (The visible twin and the `sh -c` twin already block because their
+  // second invocation IS in the list.) Checked BEFORE the empty-list degrade:
+  // a zero-visible-invocation compound hiding its git still must not inherit
+  // `eff.isWorktree`.
+  if (det?.hiddenStateSubst === true) return false;
   const invs = det?.invocationHints;
   if (!Array.isArray(invs) || invs.length === 0) return undefined;
   if (!branchOwnership) return undefined;
