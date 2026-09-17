@@ -147,8 +147,20 @@ D5C="$(cat "$P5C" 2>/dev/null)"
 [ "$(live_scratch)" = 0 ] && ok 0 "T5d SIGINT prunes the admin record" || ok 1 "T5d SIGINT prunes the admin record"
 
 # ── T6: create / list / clean lifecycle; --all spares foreign worktrees ─────
-D6="$(sx create --ref "$C2" --full 2>/dev/null)"
+D6="$(sx create --ref "$C2" --full 2>"$FIX/t6err")"
 [ -d "$D6" ] && ok 0 "T6a create prints a live path" || ok 1 "T6a create prints a live path"
+# The remediation create prints must be runnable verbatim: `owns()` needs the path
+# under the CURRENT root and the marker to name the CURRENT repo, so a bare
+# `clean <path>` is unsatisfiable when defaults differ (cycle-12 P2).
+if grep -q -- '--repo' "$FIX/t6err" && grep -q -- '--root' "$FIX/t6err"; then
+  ok 0 "T6e the printed cleanup command carries --repo and --root"
+else
+  ok 1 "T6e the printed cleanup command is not self-contained: $(tr '\n' '|' < "$FIX/t6err")"
+fi
+sx clean "$D6" >/dev/null 2>&1
+[ ! -e "$D6" ] && ok 0 "T6f the created path is cleanable with the matching --repo/--root" \
+  || ok 1 "T6f the created path is cleanable with the matching --repo/--root"
+D6="$(sx create --ref "$C2" --full 2>/dev/null)"
 [ "$(live_scratch)" = 1 ] && ok 0 "T6b list shows the scratch worktree (positive control)" || ok 1 "T6b list shows the scratch worktree (got $(live_scratch))"
 FOREIGN="$FIX/foreign-wt"
 git -C "$FIX/repo" worktree add --detach "$FOREIGN" "$C2" >/dev/null 2>&1

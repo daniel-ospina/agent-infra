@@ -337,8 +337,17 @@ cycle**, and `p1` alone 881 MB.
   `skills/verification-before-completion/SKILL.md`.
 - `git clone`, `cp -R`/`cp -r`, `rsync` of the repo, and `git archive | tar -x`
   into a temp dir are BANNED for scratch checkouts.
-- Leaked worktrees are recoverable by `scripts/pi-reap-worktrees.sh` (#1095);
-  this section exists so they are not created in the first place.
+- Leaked worktrees are recoverable by `scripts/pi-reap-worktrees.sh` (#1095) —
+  **except** ones this helper created, which carry an untracked `.scratch-worktree`
+  marker that the reaper classifies as `dirty` and PRESERVEs. Reclaim those with
+  `bash scripts/scratch-worktree.sh clean --repo <repo> --root <its root> <path>`
+  (or `... --root <its root> --all --force-all`). This section exists so they are
+  not created in the first place.
+- The mandated check is ROOT-SCOPED: `scratch-worktree.sh list --repo <repo>
+  --root <the root you used>` must not show a scratch worktree of YOURS. The
+  default root is `$SCRATCH_WORKTREE_ROOT` (else `/tmp`), so a `list` with default
+  arguments is a false PASS for a scratch worktree created under another root or by
+  the hand-rolled recipe below (`$REPO/.worktrees/scratch-$$`).
 - Cleanup deregisters **only its own record**. A bare `git worktree prune` is
   banned: it deregisters *every* record whose directory is not stat-able at that
   moment (unmounted volume, permission blip, stale network mount), so a routine

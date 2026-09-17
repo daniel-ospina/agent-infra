@@ -467,7 +467,15 @@ GD="$(admin_of "$D")"
 if [ "$MODE" = create ]; then
   printf '%s\n' "$D"
   printf '%s: created %s\n' "$PROG" "$D" >&2
-  printf '%s: you MUST clean it — bash %s clean %s\n' "$PROG" "${BASH_SOURCE[0]}" "$D" >&2
+  # The remediation MUST carry --repo and --root: `owns()` requires the path to be
+  # under the CURRENT root and the marker to name the CURRENT repo, so the bare
+  # `clean <path>` printed here before was unsatisfiable whenever the cleaning
+  # shell's defaults differed from this invocation's (cycle-12 P2) — the printed
+  # command failed, and the worktree leaked.
+  printf '%s: you MUST clean it — bash %s clean --repo %s --root %s %s\n' \
+    "$PROG" "${BASH_SOURCE[0]}" "$(realpath_of "$REPO")" "$ROOT" "$D" >&2
+  printf '%s: check it with — bash %s list --repo %s --root %s\n' \
+    "$PROG" "${BASH_SOURCE[0]}" "$(realpath_of "$REPO")" "$ROOT" >&2
   [ "$KEEP" = 1 ] && printf '%s: --keep set (intentional)\n' "$PROG" >&2
   exit 0
 fi
