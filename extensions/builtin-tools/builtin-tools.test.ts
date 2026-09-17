@@ -2275,8 +2275,11 @@ test("E271c: cut precedence + stateFresh interaction pin", () => {
     return st;
   };
   // (a) cut fires only while stateFresh — markerAge beyond the fresh window
-  // (max(2×T, 2×interval) = 120s here) → NO cut (the backstop owns that
-  // window, D4). Silence (121s > T, not exempt once stale) fires instead.
+  // (max(2×T, 2×interval) = 120s here) → NO cut. The guard is a shared
+  // precondition / regime switch, not a cut-local freshness gate: on shipped
+  // defaults that far tail is the 6h hard cap's, not the backstop's (E271h
+  // pins the shipped-defaults ordering).
+  // Silence (121s > T, not exempt once stale) fires instead.
   const stA = mkSt();
   stA.lastMarkerAt = 1_000_000;
   const dA = heartbeatKillDecision(dinput({ now: 1_000_000 + 121_000, lastLifeSignAt: 1_000_000, state: stA, cutGapMs: 15_000 }));
@@ -2330,6 +2333,113 @@ test("E271e: default-config cut bound ≤ 60s (F3)", () => {
     const worst = cutGap + 10_000 + 5_000 + 2_000;
     ok(worst <= 60_000, `worst-case resolve ${worst}ms must be ≤ 60s`);
   });
+});
+
+test("E271h: shipped-defaults cut reachability — the operative bound is the gap, not the stateFresh guard (#1077)", () => {
+  // E271h OWNS: the shipped `stateFresh` window value, the gap < window
+  // relation (1x and the 3x load ceiling), the guard's far-tail silence, and
+  // the far-tail ownership ordering (hard cap < backstop). The gap's own
+  // default is pinned by E271e; the load bands by load-scale-contract.test.ts.
+  // Placed beside E271e (the other default-config bound) rather than at the
+  // end of the series, so the two shipped-defaults pins read together.
+  //
+  // T is a function-local const in index.ts (its shipped declaration is pinned
+  // by builtin-tools.test.ts:195 and the #1068 drift registry, and the hard
+  // boundary for #1077 forbids editing it), so the shipped default is PARSED
+  // from the source. The parse is the ANCHOR, never the assertion: every check
+  // below is a numeric comparison against the real getters, not a substring
+  // test — which is why this is not the source-text pin it extends.
+  const declRe =
+    /^[ \t]*const HEARTBEAT_TIMEOUT_MS = Math\.max\(([\d_]+), Number\(process\.env\.TASK_HEARTBEAT_TIMEOUT_MS\) \|\| ([\d_]+)\);/gm;
+  const matches = [...source.matchAll(declRe)];
+  equal(matches.length, 1, "VACUITY GUARD: the HEARTBEAT_TIMEOUT_MS declaration must occur exactly once — otherwise the parse could anchor on the wrong constant and stay green");
+  // The EFFECTIVE shipped default is the CLAMPED value, not the raw fallback:
+  // parsing only the `|| N` half would false-RED if the fallback ever dropped
+  // below the 60s floor while the real (clamped) window still satisfied the
+  // invariant.
+  const shippedT = Math.max(
+    Number((matches[0]?.[1] ?? "0").replace(/_/g, "")),
+    Number((matches[0]?.[2] ?? "0").replace(/_/g, "")),
+  );
+  ok(Number.isFinite(shippedT) && shippedT >= 60_000, `the parsed shipped T must clear the 60s clamp floor, got ${shippedT}`);
+
+  withEnv(
+    {
+      TASK_HEARTBEAT_CUT_GAP_MS: undefined,
+      TASK_HEARTBEAT_TIMEOUT_MS: undefined,
+      TASK_HEARTBEAT_INTERVAL_MS: undefined,
+      TASK_LOAD_SCALE_OFF: undefined,
+      TASK_HARD_CAP_MS: undefined,
+      TASK_BACKSTOP_MS: undefined,
+      TASK_TOOL_STALL_MS: undefined,
+    },
+    () => {
+      const gap = getCutGapMs(); // 1x — 37.5s at the shipped 30s interval
+      const storm = getEffectiveCutGapMs(undefined, 1e9); // the 3x band ceiling
+      const windowMs = Math.max(2 * shippedT, 2 * getHeartbeatIntervalMs());
+      // The clause comment above quotes this window ("60 min at defaults") —
+      // pin it, so the prose cannot drift back into the #1077 defect with the
+      // suite green.
+      equal(windowMs, 3_600_000, "the shipped stateFresh window the cut clause comment quotes (60 min)");
+      ok(gap < storm, "the 1e9-load probe must actually engage the load scale, else the storm check below is vacuous");
+      ok(gap < windowMs, `shipped cut gap ${gap}ms must stay inside the window ${windowMs}ms — at or above it the clause is silently dead`);
+      ok(storm < windowMs, `load-storm cut gap ${storm}ms must still stay inside the window ${windowMs}ms`);
+      // The far-tail ownership claim in the comment ("the 6h hard cap, with the
+      // #271 backstop above it") is a RELATION between three exported bounds —
+      // pin it here rather than trusting three separate constant tests that
+      // never compare them.
+      ok(getTaskHardCapMs() > windowMs, "the hard cap (not the guard) bounds the far tail — it must sit above the window");
+      ok(getTaskBackstopMs() > getTaskHardCapMs(), "on shipped defaults the #271 backstop sits ABOVE the hard cap, so the cap owns the far tail first");
+      // tool-stall is evaluated BEFORE cut: the shipped bound must also clear the
+      // window, or it would pre-empt the clause these probes are about.
+      ok(getToolStallMs() > windowMs, "the shipped tool-stall bound must sit above the window — it is checked before cut and must not pre-empt it");
+
+      const now = 10_000_000;
+      const mkState = (markerAgeMs: number) => {
+        const st = createHeartbeatState();
+        st.everSawWork = true;
+        st.turnActive = true;
+        st.toolsInFlight = 1;
+        st.streamAgeMs = 0;
+        st.toolAgeMaxMs = 0;
+        st.lastMarkerAt = now - markerAgeMs;
+        return st;
+      };
+      // The SHIPPED lane: the fixture `dinput` defaults (T=60s, tool-stall=1h,
+      // cutGap=1h) are deliberately NOT the shipped defaults, so every field
+      // these probes depend on is threaded from its real source — including
+      // `toolStallMs`, which is checked BEFORE cut and would pre-empt it if it
+      // fell near the in-band age.
+      const shipped = () => ({
+        heartbeatTimeoutMs: shippedT,
+        intervalMs: getHeartbeatIntervalMs(),
+        cutGapMs: gap,
+        toolStallMs: getToolStallMs(),
+      });
+
+      // IN-BAND: far above the gap, still inside the window — the guard adds no
+      // constraint, so the THRESHOLD alone fires. Tighten the guard and this reds.
+      const inBand = heartbeatKillDecision(
+        dinput({ now, lastLifeSignAt: now, state: mkState(shippedT), ...shipped() }),
+      );
+      equal(inBand.kill, true, "in-band the guard adds no constraint — the clause fires on the gap alone");
+      equal(inBand.reason, "cut");
+
+      // FAR TAIL: past the window. `lastLifeSignAt = now` keeps the silence
+      // clause quiet (silenceMs = 0) and `lastMarkerAt > 0` keeps the staleness
+      // attributable to the WINDOW, not to the never-saw-a-marker sentinel —
+      // so no other clause covers this shape and only the guard stands between
+      // it and a `cut`. Delete `stateFresh &&` and this reds: it is the "the
+      // guard must STAY" evidence.
+      const farState = mkState(windowMs + 1);
+      ok(farState.lastMarkerAt > 0, "the far-tail probe must go stale via the window, not via the never-saw-a-marker sentinel");
+      const farTail = heartbeatKillDecision(
+        dinput({ now, lastLifeSignAt: now, state: farState, ...shipped() }),
+      );
+      equal(farTail.kill, false, "past the window the clause is silent by construction — the guard must stay");
+      equal(farTail.reason, undefined, "no kill reason in the far tail");
+    },
+  );
 });
 
 test("E271f: exit taxonomy — null → cut, 0+tools>0 → cut, 0+tools=0 → success, non-zero → failed", () => {
@@ -3046,6 +3156,39 @@ test("#1070: loop wiring — the effective gap is latched + threaded, and all fo
   equal(src.split("const freshWindowMs = Math.max(2 * HEARTBEAT_TIMEOUT_MS, 2 * getHeartbeatIntervalMs());").length - 1, 1, "freshWindowMs is defined ONCE and shared by the cut-gap warning and the backstop");
   ok(src.includes("the cut clause cannot fire for this dispatch"), "the loop warns when the scaled cut gap >= the stateFresh window");
   ok(src.includes("let cutInertWarned = false"), "the unreachability warning is one-shot per dispatch, not per tick");
+  // #1077 (problem-verify P2): the loop's hoisted `freshWindowMs` and
+  // `heartbeatKillDecision`'s inline stateFresh window are the SAME two inputs
+  // today only by wiring — nothing asserted it before. Pin the coupling so a
+  // change to what `hbThresholds` threads cannot silently decouple the
+  // warning/backstop window from the clause's own window.
+  equal(src.split("markerAge <= Math.max(2 * i.heartbeatTimeoutMs, 2 * i.intervalMs);").length - 1, 1, "the decision computes its window from the same two inputs the loop's freshWindowMs uses");
+  ok(src.includes("heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,"), "hbThresholds threads the loop's own T into the decision");
+  ok(src.includes("intervalMs: getHeartbeatIntervalMs(),"), "hbThresholds threads the loop's own interval getter into the decision");
+  // Behavioural side of the same coupling: with the interval term dominating
+  // the max, the decision's window must follow `i.intervalMs` — a T-only
+  // window would classify `2*interval - 1` as stale and return no kill.
+  const cNow = 20_000_000;
+  const cT = 60_000;
+  const cInt = 600_000;
+  const cState = (age: number) => {
+    const st = createHeartbeatState();
+    st.everSawWork = true;
+    st.turnActive = true;
+    st.toolsInFlight = 1;
+    st.streamAgeMs = 0;
+    st.toolAgeMaxMs = 0;
+    st.lastMarkerAt = cNow - age;
+    return st;
+  };
+  const cNear = heartbeatKillDecision(
+    dinput({ now: cNow, lastLifeSignAt: cNow, state: cState(2 * cInt - 1), heartbeatTimeoutMs: cT, intervalMs: cInt, cutGapMs: 15_000, toolStallMs: 24 * 3_600_000 }),
+  );
+  equal(cNear.kill, true, "fresh on the INTERVAL side of max(2T, 2*interval) — the clause still fires");
+  equal(cNear.reason, "cut");
+  const cPast = heartbeatKillDecision(
+    dinput({ now: cNow, lastLifeSignAt: cNow, state: cState(2 * cInt + 1), heartbeatTimeoutMs: cT, intervalMs: cInt, cutGapMs: 15_000, toolStallMs: 24 * 3_600_000 }),
+  );
+  equal(cPast.kill, false, "beyond the interval side the guard excludes it (the far tail)");
 });
 
 

@@ -2445,17 +2445,29 @@ export function heartbeatKillDecision(
     return kill("silence-threshold");
   }
 
-  // 3.5. cut (#271, D1) — the operational liveness-loss detector for the
-  //    wedged-alive class: markers stopped while a tool is in flight. Placed
-  //    between silence and first-message. `stateFresh` is inherited from
-  //    tool-stall: the clause fires ONLY while the marker stream is fresh
-  //    (markerAge ≤ max(2×T, 2×interval) = 60 min at defaults) — a stream
-  //    stale beyond the fresh window can never trip cut (the backstop owns
-  //    that window, D4; E271c(a) pins this). A busy-but-ticking agent is
-  //    exempt by construction: every marker receipt resets lastMarkerAt, so
-  //    markerAge ≈ ≤1 interval < cutGapMs. Never fires with toolsInFlight == 0
-  //    (that class is silence at T, unchanged). Gated `!sessionEnded` by the
-  //    #191 early return above — the completion watchdog owns post-end exits.
+  // 3.5. cut (#271, D1) — the liveness-loss detector for the wedged-alive
+  //    class: markers stopped while a tool is in flight. Placed between
+  //    silence and first-message. The OPERATIVE bound is the load-scaled
+  //    `cutGapMs` (~38s at defaults; 3x under a load storm) — the threshold is
+  //    the constraint.
+  //    `stateFresh` is a shared precondition / regime switch (it also gates
+  //    the stall clauses above and the silence exemption), NOT a cut-local
+  //    freshness gate: IN-BAND it adds no constraint — in the ordinary cadence
+  //    the clause fires at the gap long before the window (max(2×T,
+  //    2×interval) = 60 min at defaults) can matter.
+  //    It must STAY for the far tail beyond that window, where the clause is
+  //    deliberately OFF. That band is reached only when the in-band clauses
+  //    are suppressed across the whole window — the #318 network-down
+  //    suppression, or a parent-side tick gap (freeze/sleep) — and a child
+  //    still streaming bytes there must not be cut on a stale marker read. On
+  //    shipped defaults the tail is held by the non-stateFresh-gated 6h hard
+  //    cap, with the #271 backstop above it (D4; E271h pins the ordering). An
+  //    operator override that lifts the effective gap to/above the window
+  //    makes cut inert outright — the loop warns once (`cutInertWarned`).
+  //    A busy-but-ticking agent is exempt by construction: every marker
+  //    receipt resets lastMarkerAt, so markerAge ≈ ≤1 interval < cutGapMs.
+  //    Never fires with toolsInFlight == 0 (that class is silence at T,
+  //    unchanged). Gated `!sessionEnded` by the #191 early return above.
   if (
     stateFresh &&
     st.toolsInFlight > 0 &&
