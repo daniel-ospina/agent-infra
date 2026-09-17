@@ -472,6 +472,26 @@ if [ -n "$INFRA_RISK" ]; then
 fi
 ```
 
+**Shared dispatch preamble — inject into EVERY reviewer prompt below** (#1141):
+```
+ISOLATED CHECKOUTS — never copy the repo. If your review needs a checkout other
+than the one you are in (e.g. to run a check or probe the PR branch), get it with
+    bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> [--paths <p1,p2> | --full] -- <cmd...>
+`run` uses a git worktree (object store SHARED — no second .git) and REMOVES it on
+EXIT/INT/TERM/HUP, so a crashed probe leaves nothing behind. `--paths` is a sparse
+checkout (a few KB) — prefer it whenever you only read some paths.
+BANNED for scratch checkouts: `git clone`, `cp -R`, `cp -r`, `rsync` of the repo,
+`git archive | tar -x` into a temp dir. One measured review loop left 13 copies of
+~126 MB each in /private/tmp and drove ~2.4M files of I/O per cycle; the debris
+helped take host load to 42.9. If you create a worktree by hand, the trap is
+mandatory and MUST re-raise the status (a trap that does not `exit` swallows the
+signal and keeps running):
+`trap 'rc=$?; git worktree remove --force "${D:-/nonexistent}" 2>/dev/null; git worktree prune 2>/dev/null; exit $rc' EXIT`,
+with `trap 'exit 130' INT` and `trap 'exit 143' TERM`.
+Before reporting done: `bash scripts/scratch-worktree.sh list` must not show a
+scratch worktree you did not intend to keep.
+```
+
 **Agent #1 — Guidance Compliance** (merged CLAUDE.md + code comments):
 ```
 Audit the PR changes against:

@@ -327,6 +327,7 @@ SURVIVING_ISSUES_JSON="$CURRENT_ISSUES_JSON"
 
 ```bash
 git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
+git worktree prune 2>/dev/null || true
 
 FIXER_ISSUES_AFTER=$(echo "$SURVIVING_ISSUES_JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
 

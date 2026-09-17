@@ -160,6 +160,37 @@ All changed test files from this implementation batch are dispatched in a SINGLE
 
 **Surface map pre-check:** If no surface map exists for these test files AND files touch DB/API/auth boundaries → WARN "no surface map — test-review runs without layer assignment context."
 
+### Step 3.8 — Isolated checkouts — never copy the repo (#1141)
+
+When a test must run against a ref other than your current checkout (verifying a
+branch, reproducing on `main`, mutation-probing a file), get the checkout from a
+worktree — never a copy:
+
+```bash
+bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> \
+  [--paths <dir,file> | --full] -- <test-command...>
+```
+
+`run` shares the object store (no second `.git`) and **removes the worktree on
+EXIT/INT/TERM/HUP**, so a failing or killed test still leaves nothing behind.
+`--paths` is a sparse checkout (a few KB) — use it when the test only reads some
+paths. `--full` is the whole tracked tree.
+
+**BANNED for scratch checkouts:** `git clone`, `cp -R`, `cp -r`, `rsync` of the
+repo, `git archive | tar -x` into a temp dir. If you create a worktree by hand,
+the trap is mandatory and MUST re-raise the status (a trap that does not `exit`
+swallows the signal and the script keeps running):
+
+```bash
+REPO=<repo>; D="$REPO/.worktrees/scratch-$$"
+git -C "$REPO" worktree add --detach "$D" <ref>
+trap 'rc=$?; git -C "$REPO" worktree remove --force "${D:-/nonexistent}" 2>/dev/null; git -C "$REPO" worktree prune 2>/dev/null; exit $rc' EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM
+```
+
+Before reporting done, `bash scripts/scratch-worktree.sh list` must not show a
+scratch worktree you did not intend to keep.
+
 ### Step 4 — Green Phase (Run Test, Verify It Fails)
 
 Run the test and confirm it fails for the expected reason:

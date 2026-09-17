@@ -254,6 +254,14 @@ jobs:
           # as reclaimable while the branch ref survives. Hermetic: temp HOME,
           # temp state dir, no real worktree touched, no network.
           bash scripts/pi-reap-worktrees.test.sh || errors=$((errors+1))
+          # #1141 — scratch-checkout helper: real temp git repos; proves
+          # `run` leaves neither a directory nor an admin record on success,
+          # non-zero exit, SIGTERM or SIGINT, that SIGTERM also kills the
+          # wrapped process group, that `--paths` never yields a silent empty
+          # checkout, and that `clean`/`clean --all` refuse every path this
+          # tool did not create (plain dir, forged marker, registered-but-
+          # unmarked worktree). Hermetic: temp repo + temp scratch root.
+          bash scripts/scratch-worktree.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
           # #930 — safe-admin-merge rail: the ONE failing-set parser
           # (scripts/ci-failure-set.sh) plus the chokepoint that consumes it

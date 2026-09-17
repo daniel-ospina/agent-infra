@@ -170,6 +170,33 @@ grep -E '\.(sql|edge\.ts|functions/)' /tmp/verify-changed.txt  # backend files
 | High | 3+ files, migrations, auth, shared infra, desktop app | Full suite + verifier (convergence-gated) + browser screenshot |
 | Critical | Data migrations, auth changes, payment flows | Full suite + verifier + browser on all routes + schema validate |
 
+## Isolated checkouts — never copy the repo (#1141)
+
+Verification that needs a checkout other than the one you are in (proving a ref,
+reproducing on `main`, mutation-probing a fix) MUST use a worktree, never a copy:
+
+```bash
+bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> \
+  [--paths <dir,file> | --full] -- <verify-command...>
+```
+
+`run` shares the object store (no second `.git`) and **removes the worktree on
+EXIT/INT/TERM/HUP**, so an interrupted verification leaves nothing behind.
+`--paths` is a sparse checkout (a few KB); prefer it for path-scoped checks.
+
+**BANNED for scratch checkouts:** `git clone`, `cp -R`, `cp -r`, `rsync` of the
+repo, `git archive | tar -x` into a temp dir. One measured review loop left 13
+copies of ~126 MB each in `/private/tmp` and drove ~2.4M files of I/O per cycle —
+the cost is I/O and filesystem churn, not disk. If you create a worktree by hand,
+the trap is mandatory and MUST re-raise the status (a trap that does not `exit`
+swallows the signal and keeps running):
+`trap 'rc=$?; git worktree remove --force "${D:-/nonexistent}" 2>/dev/null; git worktree prune 2>/dev/null; exit $rc' EXIT`,
+with `trap 'exit 130' INT` and `trap 'exit 143' TERM`.
+
+Before reporting done: `bash scripts/scratch-worktree.sh list` must not show a
+scratch worktree you did not intend to keep. A verification claim that leaves
+scratch debris falsifies itself.
+
 ## Review Loop (CPI-5 — Convergence-Gated)
 
 When the verifier sub-agent returns issues: fix flagged issues → re-dispatch → repeat until clean. Max 10 cycles.
