@@ -989,13 +989,16 @@ else
   fail "no evidence comment posted on the flake path"
 fi
 
-# ── 26. an unparseable failure id is REFUSED; and the evidence has no fences ──
+# ── 26. an unparseable failure id is DROPPED + REPORTED; no fences ──────────
 # A PR author controls test names. A `FAILED` payload that is NOT a pytest nodeid
-# (` ``` `, `may`) must NOT enter the decision: a rejected row would VANISH from
-# the decision, and an id the decision never sees is one the gate never blocks
-# (fail-OPEN, #3705). The producer REFUSES it loudly instead. Separately, the
+# (` ``` `, `may`) must NOT enter the decision: it matches nothing on main, so it
+# can never be subtracted or verified and reads as "unique to this PR" on every
+# rail run, forever — a PERMANENT FALSE REFUSAL (#3756 defect 1). The canonical
+# parser DROPS it, COUNTS it and REPORTS it as UNATTRIBUTABLE; a run whose ids
+# were all garbage still refuses via the caller's `examined > extracted` gate,
+# and a sound id in the SAME run still certifies. Separately, the
 # evidence is LISTS, so there is no fence algorithm to get right.
-echo "== 26. an unparseable id is REFUSED; the evidence has no fences =="
+echo "== 26. a non-nodeid FAILED payload is DROPPED + REPORTED, never carried =="
 new_scen btick
 HEAD_BT="dddd333300000000000000000000000000000000"
 printf '%s\n' "$HEAD_BT" > "$SCEN/head"
@@ -1004,10 +1007,20 @@ lane_fail "$HEAD_BT" 9921 > "$SCEN/runs-$HEAD_BT"
 main_red_n mainbt 9922 3 'tests/test_ok.py::test_ok' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "a non-nodeid FAILED payload → REFUSE (exit $rc)" || fail "a non-nodeid payload was accepted — it would vanish from the decision"
-grep -q "is not a pytest nodeid" "$TMP/err" && pass "the refusal names the unparseable id" || fail "the refusal is unexplained"
-[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the id set is unsound" || pass "no evidence comment posted"
-grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+# The garbage token must NOT become a failure id. An id that matches nothing on
+# main can never be subtracted or verified, so it reads as "unique to this PR"
+# on every rail run for every such PR, forever — a permanent false refusal
+# (#3756 defect 1). The sound id in the SAME run must still be extracted and
+# must still certify the merge, so the fix is not "extract nothing".
+[ "$rc" -eq 0 ] && pass "a non-nodeid FAILED payload does NOT refuse a sound merge (dropped, not carried)" \
+  || fail "a garbage token still refuses a sound merge (exit $rc): $(head -1 "$TMP/err")"
+grep -q 'UNATTRIBUTABLE' "$TMP/err" && pass "the dropped token is REPORTED as UNATTRIBUTABLE (counted, not swallowed)" \
+  || fail "the rejection is silent — a dropped token with no report"
+[ -f "$SCEN/comment" ] && pass "the sound id in the same run still certified the merge (not 'extract nothing')" \
+  || fail "no evidence comment posted for a sound run"
+grep -q '```' "$SCEN/comment" 2>/dev/null && fail "the garbage token reached the evidence" \
+  || pass "no garbage token in the evidence"
+grep -q "pr merge" "$SCEN/calls" && pass "the merge proceeded (garbage cannot block it forever)" || fail "no merge"
 # The evidence format itself: LISTS, not fenced blocks — so a backtick-bearing
 # node id that DOES parse cannot close a block early.
 new_scen btick2
@@ -1365,6 +1378,57 @@ SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$NOMOD/ci-failure-set.sh" --diff "$
 rc=$?
 [ "$rc" -eq 0 ] && grep -q '^b$' "$TMP/out" && pass "--diff still works (retained for the detector)" \
   || fail "--diff broke — the detector's shared mode must remain"
+
+
+# ── 32. THE FAILED-TOKEN POSITION (#3756 defect 1) ─────────────────────────
+# The `may` leak, at the exact position the retired shell `awk` read: the token
+# after `FAILED`. Two payloads, ONE position — the acceptance pair. Reverting the
+# extractor to that `awk` turns `may` into a failure id (M1 RED); making the
+# extractor "extract nothing" loses the real id (M2 RED).
+echo '== 32. the FAILED-token position: `may` is DROPPED + REPORTED, a real id is EXTRACTED =='
+MAYLOG="$TMP/may-position.log"
+printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED may be a known flake\n' > "$MAYLOG"
+out="$(python3 "$ROOT/scripts/ci_exemption.py" ids --log "$MAYLOG" 2>"$TMP/may.err")"
+rc=$?
+[ "$rc" -eq 0 ] && [ -z "$out" ] && pass "M1: 'may' in the FAILED-token position yields NO failure id" \
+  || fail "M1: expected no ids, got '$out' (exit $rc)"
+grep -q 'UNATTRIBUTABLE.*may' "$TMP/may.err" && pass "M1: …and the rejected token is REPORTED as UNATTRIBUTABLE" \
+  || fail "M1: the rejected token is not reported: $(cat "$TMP/may.err")"
+grep -q 'unattributable=1' "$TMP/may.err" && pass "M1: …and COUNTED" \
+  || fail "M1: the rejection is not counted"
+REAL_ID='tests/test_real.py::test_real[param-1]'
+REALLOG="$TMP/real-position.log"
+printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED %s - AssertionError: boom\n' "$REAL_ID" > "$REALLOG"
+out="$(python3 "$ROOT/scripts/ci_exemption.py" ids --log "$REALLOG" 2>/dev/null)"
+[ "$out" = "$REAL_ID" ] && pass "M2: a REAL id in the SAME position is still EXTRACTED" \
+  || fail "M2: expected '$REAL_ID', got '$out'"
+
+# ── 33. E5 IN THE RAIL: an identity that MOVED is never exempt-and-silent ───
+# B7's dynamic form: cycles 2 and 3 ran the SAME head's SAME run id and produced
+# DIFFERENT ids. The class stayed red; the id moved. Here main has a MEASURED
+# rate (3/3) for the POST-re-run id with a matching signature, so a decision that
+# looked only at the latest sample would EXEMPT it and merge. The rotation
+# observation — the union of every sample of THIS head — makes it UNATTRIBUTABLE
+# instead. Removing that union turns this test RED (the merge proceeds).
+echo "== 33. a rotated identity is UNATTRIBUTABLE, never exempt-and-silent =="
+new_scen rotation
+HEAD_ROT="ee5500000000000000000000000000000000000"
+printf '%s\n' "$HEAD_ROT" > "$SCEN/head"
+ROT_A1='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch'
+ROT_A2='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch_416bf7c5'
+lane_fail "$HEAD_ROT" 7701 > "$SCEN/runs-$HEAD_ROT"
+log_failed "$ROT_A1" > "$SCEN/log-7701"
+# The re-run of the SAME run id reports a DIFFERENT identity (a new attempt).
+log_failed "$ROT_A2" > "$SCEN/log-after-7701"
+main_red_n mainrot 7702 3 "$ROT_A2" > "$SCEN/runs-main"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "the rotated identity BLOCKS the merge (exit $rc)" \
+  || fail "a moving identity was exempted — the exempt-and-silent direction"
+grep -q 'UNATTRIBUTABLE' "$TMP/err" && pass "…and the refusal is attributed UNATTRIBUTABLE, not 'unique to this PR'" \
+  || fail "the refusal does not name UNATTRIBUTABLE: $(grep -m3 'BLOCK\|UNATTRIBUTABLE' "$TMP/err" 2>/dev/null)"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for a moving identity" || pass "no evidence comment"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted" || pass "no merge attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

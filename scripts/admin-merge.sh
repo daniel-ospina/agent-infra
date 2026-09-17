@@ -18,6 +18,11 @@
 #                    and its stable SIGNATURE
 #   main-rates.txt ← scripts/ci-failure-set.sh --main-union-rates N
 #   main-sigs.txt  ← scripts/ci-failure-set.sh --main-union-signatures N
+#   rotation       ← scripts/ci-failure-set.sh --commit-rows <head> --per-run:
+#                    the head's per-run failing-id sets, UNIONED across every
+#                    sample of the SAME head (pre- and post-re-run). An id whose
+#                    CLASS stays red while the ID moves between samples is
+#                    UNATTRIBUTABLE: it is neither PR-unique nor exempt (#3756 E5).
 #   residual       ← the EXEMPTION DECISION (scripts/ci_exemption.py decide):
 #                    an id is EXEMPT only when it was measured on main over
 #                    enough runs WITH a matching signature and the PR's failure
@@ -637,9 +642,23 @@ main() {
     # second subtraction. A swap touching only the first would leave this verdict
     # presence-based, so a failure excused on the first pass would be excused
     # identically here.
+    #
+    # E5, DOOR 3 — the identity that MOVED. B7 measured it on #3749: the SAME
+    # head's SAME run id (35221282837) yielded DIFFERENT failure ids when sampled
+    # before and after the re-run. A single per-collection sample cannot see that,
+    # so the rotation observation is the UNION of every sample of THIS head — the
+    # head is provably unmoved (`head_after == head` above), so the samples are
+    # two observations of one revision, not a baseline drawn from a second tree.
+    # Without this the moved id is read as "unique to this PR" (a wrong reason,
+    # and a permanent one), or — when main also measures the new id — as EXEMPT
+    # AND SILENT, which is the fail-open direction B7's two cycles produced.
+    # With it the class is red across runs with a MOVING id, which
+    # `detect_rotating_identity` classifies UNATTRIBUTABLE: never PR-unique,
+    # never exempt, and therefore never a merge.
+    cat "$TMP/pr-per-run.txt" "$TMP/pr-per-run2.txt" > "$TMP/pr-rotation.txt"
     local dec2_rc=0
     run_exemption_decision "$TMP/pr-rows2.txt" "$TMP/main-rates.txt" "$TMP/main-signatures.txt" \
-      "$TMP/pr-per-run2.txt" "$TMP/unique2" || dec2_rc=$?
+      "$TMP/pr-rotation.txt" "$TMP/unique2" || dec2_rc=$?
     if [ "$dec2_rc" -ne 0 ]; then
       say_err "admin-merge: ✗ BLOCK — the exemption decision could not run after the re-run. No merge."
       exit 1
@@ -649,7 +668,14 @@ main() {
 
     if [ "$rerun_residual" -gt 0 ]; then
       say_err "admin-merge: ✗ BLOCK — $rerun_residual failure(s) SURVIVED the re-run:"
-      sed 's/^/   /' "$TMP/unique2.txt" >&2
+      # The REASON, not just the node id. An UNATTRIBUTABLE id (a rotating identity,
+      # or one with no main-side measurement) is created with `blocked=True`, so its
+      # verdict line is a `BLOCK` line whose reason names the class — and a refusal
+      # that printed ONLY the node id would read as an ordinary "unique to this PR",
+      # leaving the E5 class unreported. Never exempt-and-SILENT applies to the
+      # refusal too.
+      grep -v '^EXEMPT' "$TMP/unique2.lines" 2>/dev/null | sed 's/^/   /' >&2 \
+        || sed 's/^/   /' "$TMP/unique2.txt" >&2
       say_err "   The exemption decision still refuses them — merge refused."
       exit 1
     fi

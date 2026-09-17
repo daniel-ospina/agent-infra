@@ -197,15 +197,13 @@ list_lane_runs() {
 # FAILURE (exit 1), not an empty contribution: silently dropping it is exactly
 # the vacuous pass this rail exists to prevent.
 extract_failed_tests() {
-  local run_id="$1" log
-  # shellcheck disable=SC2086
-  if ! log="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>/dev/null)"; then
-    say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set"
-    return 1
-  fi
-  printf '%s\n' "$log" \
-    | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' \
-    | awk '{ for (i = 1; i < NF; i++) if ($i == "FAILED") { print $(i+1); break } }'
+  local run_id="$1" log_file rc
+  log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+  if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file"; return 1; fi
+  failed_ids_from_log "$log_file"
+  rc=$?
+  rm -f "$log_file"
+  return $rc
 }
 
 # fetch_failed_log <run-id> <out-file> — the RAW `gh run view --log-failed`
@@ -221,23 +219,32 @@ fetch_failed_log() {
   fi
 }
 
-# failed_ids_from_log <log-file> → the ids, parsed EXACTLY as extract_failed_tests
-# parses the same capture (ANSI stripped, the token after `FAILED`). One parser
-# semantics for ids, whichever door fetched the log.
+# failed_ids_from_log <log-file> → the ids, via THE canonical parser.
+#
+# #3756 DEFECT 1: this used to be a second `awk` regex that printed whatever
+# token followed a bare `FAILED` field — including `may` from log prose. `may` is
+# not a test id, so it matched nothing on main, could never be subtracted or
+# verified, and read as "unique to this PR" on every rail run forever. The id
+# extraction now goes through the SAME module that runs the decision
+# (`ci_exemption.py ids`), so there is exactly ONE definition of "is this a test
+# id"; a candidate that fails it is DROPPED, COUNTED and REPORTED as
+# UNATTRIBUTABLE on stderr (fail-closed, #3705) — never carried, never read as
+# "no failures".
 failed_ids_from_log() {
-  sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "$1" \
-    | awk '{ for (i = 1; i < NF; i++) if ($i == "FAILED") { print $(i+1); break } }'
+  local log_file="$1" out
+  require_exemption_module || return 1
+  if ! out="$("$PYTHON_BIN" "$EXEMPTION_PY" ids --log "$log_file")"; then
+    say_err "ci-failure-set: ✗ FAILED-id extraction FAILED for $log_file — refusing to read it as an empty failure set"
+    return 1
+  fi
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return 0
 }
 
-# nodeid_is_shaped <id> — the LOOSE nodeid shape the decision's row parser
-# requires (mirrors `_NODEID_LOOSE_RE` in ci_exemption.py: strict file/class
-# part, permissive `::` tail). This is a REFUSAL guard, not a filter: an id the
-# decision's parser would reject must make the producer FAIL LOUDLY rather than
-# quietly drop the row, because an id the decision never sees is an id the gate
-# never blocks (fail-OPEN).
-nodeid_is_shaped() {
-  grep -Eq $'^[A-Za-z0-9_./-]+\\.py::[^\t]+$' <<<"$1"
-}
+# nodeid_is_shaped was REMOVED with the shell `awk` (#3756 defect 1): it was a
+# SECOND definition of the id shape, and the refusal it powered (abort the whole
+# extraction on one bad token) is precisely the permanent-false-refusal shape the
+# canonical parser replaces with DROP + COUNT + REPORT.
 
 # require_exemption_module — the one dependency, checked BEFORE any gh call so a
 # broken install refuses immediately instead of after minutes of fetching.
@@ -476,16 +483,13 @@ collect_union_rows() {
       if [ -n "$per_run" ]; then
         printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' ' ')" | sed 's/ *$//' >> "$per_run"
       fi
-      # An id the decision's parser would REJECT must refuse the run, not vanish.
-      local bad=""
-      while IFS= read -r one; do
-        [ -n "$one" ] || continue
-        if ! nodeid_is_shaped "$one"; then bad="$one"; break; fi
-      done <<< "$ids"
-      if [ -n "$bad" ]; then
-        say_err "ci-failure-set: ✗ '$bad' is not a pytest nodeid — the decision's parser would DROP it, so the gate would never see it. Refusing."
-        rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1
-      fi
+      # No shape guard here any more (#3756 defect 1): `failed_ids_from_log` has
+      # ALREADY dropped, counted and reported every candidate that is not a test
+      # id, so every id reaching this line is one the decision's parser accepts.
+      # A run whose ids were ALL garbage yields an empty `ids`, so `extracted`
+      # does not advance and the caller's `examined > extracted` gate refuses it
+      # — fail-closed. The old in-shell refusal aborted the WHOLE extraction on
+      # one stray token, which is the permanent-false-refusal shape itself.
       # Only a run that CARRIED ids is fed to the signature extractor: the
       # `signatures` CLI exits 1 on a capture with no ids (correct for a capture
       # that proves nothing, wrong for a run already known to carry none).

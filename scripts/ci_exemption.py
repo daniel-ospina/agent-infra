@@ -60,8 +60,29 @@ _NODEID_RE = re.compile(
     r"::(?P<rest>[A-Za-z0-9_\[\]\-.:]+)$"
 )
 
-#: The only line shape the extractor accepts.
-_FAILED_RE = re.compile(r"^\s*(?:FAILED|ERROR)\s+(?P<nodeid>\S+)\s*$")
+#: The tokens that open a failure record. One list, so the shell can never
+#: disagree with the module about which lines are records at all.
+_FAILED_FIELDS = ("FAILED", "ERROR")
+
+
+def _failed_candidate(line: str) -> str | None:
+    """The token following the FIRST ``FAILED``/``ERROR`` whitespace field.
+
+    This is the exact position the retired shell ``awk`` read
+    (``if ($i == "FAILED") { print $(i+1) }``), so no real id is lost by
+    routing through this module. The return is deliberately three-valued:
+
+    * ``None`` — no such field on the line: it is NOT a failure record (raw logs
+      are mostly prose), and it is NOT a rejection either;
+    * ``''``  — the field was the last token: a truncated record, which IS a
+      rejection;
+    * ``<token>`` — the candidate, which the caller MUST shape-check before use.
+    """
+    fields = line.split()
+    for index, token in enumerate(fields):
+        if token in _FAILED_FIELDS:
+            return fields[index + 1] if index + 1 < len(fields) else ""
+    return None
 
 
 @dataclass
@@ -88,35 +109,62 @@ class ParseResult:
         return bool(self.ids)
 
 
-def parse_failed_ids(lines: str) -> ParseResult:
-    """Extract test ids from ``FAILED <nodeid>`` / ``ERROR <nodeid>`` lines.
+def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
+    """Extract test ids from failure records — THE canonical id parser.
 
-    Strict by construction:
+    Two input shapes, ONE candidate rule (:func:`_failed_candidate`) and ONE
+    definition of "is this a test id" (``_NODEID_LOOSE_RE``), so the shell cannot
+    keep a second, weaker notion of a failure id:
 
-    * a line that is not ``FAILED``/``ERROR`` shaped is **rejected** (it is not a
-      failure record — e.g. a bare ``may`` token, a blank line, prose);
-    * a ``FAILED`` line whose payload is not a nodeid is **rejected** (e.g.
-      ``FAILED may``);
-    * rejected lines are counted in ``rejected`` and never enter ``ids``.
+    * ``raw_log=False`` (default) — a file of ``FAILED <nodeid>`` / ``ERROR
+      <nodeid>`` records. A non-blank line that carries no ``FAILED``/``ERROR``
+      field is **rejected**: in an id file, prose IS a defect (nothing else
+      belongs there).
+    * ``raw_log=True`` — a raw ``gh run view --log-failed`` capture. ANSI SGR
+      escapes and the ``<job>\t<step>\t<ts>Z `` prefix are stripped, then the
+      candidate after the first ``FAILED``/``ERROR`` field is shape-checked. A
+      line with no such field is not a failure record and is skipped — a raw log
+      is mostly prose, and rejecting every prose line would drown the signal.
+
+    In BOTH shapes a candidate that is not a test id is **DROPPED, COUNTED and
+    REPORTED** (``rejected``) and never enters ``ids``. This is the #3756 ``may``
+    leak: an English word in the candidate position used to be emitted verbatim
+    as a failure id, and a garbage id matches nothing on main — it cannot be
+    subtracted or verified, so it reads as "unique to this PR" on EVERY rail run
+    for EVERY PR whose log contains that fragment. A permanent false refusal.
 
     This is the fail-closed rule: unknown resolves to *"not exempt"*, never to
-    *"exempt"*. Silent permissiveness here is a zero-evidence pass.
+    *"exempt"*. Silent permissiveness here is a zero-evidence pass — and a
+    silently-CARRIED token is the permanent false refusal above.
     """
     ids: list[str] = []
     rejected: list[str] = []
     for raw in lines.splitlines():
-        line = raw.strip()
-        if not line:
+        if raw_log:
+            line = _strip_log_prefix(_ANSI_RE.sub("", raw)).strip()
+            if not line:
+                continue
+            candidate = _failed_candidate(line)
+            if candidate is None:
+                # Not a failure record. Skipped, NOT rejected.
+                continue
+            unit = candidate
+        else:
+            line = raw.strip()
+            if not line:
+                continue
+            candidate = _failed_candidate(line)
+            if candidate is None:
+                rejected.append(line)
+                continue
+            unit = line
+        if not _NODEID_LOOSE_RE.match(candidate):
+            # The unit reported is the offending TOKEN in log mode (the line may
+            # be a whole megabyte of prose prefixed by a stray `FAILED`), and the
+            # offending LINE in id-file mode (where the line IS the record).
+            rejected.append(unit)
             continue
-        m = _FAILED_RE.match(line)
-        if not m:
-            rejected.append(line)
-            continue
-        nodeid = m.group("nodeid")
-        if not _NODEID_RE.match(nodeid):
-            rejected.append(line)
-            continue
-        ids.append(nodeid)
+        ids.append(candidate)
     return ParseResult(ids=sorted(set(ids)), rejected=rejected)
 
 
@@ -829,6 +877,34 @@ def _read(path: str) -> str:
     return Path(path).read_text(encoding="utf-8", errors="replace")
 
 
+def _cmd_ids(args: argparse.Namespace) -> int:
+    """`ids --log <capture>` — the canonical FAILED-id extraction (the shell's door).
+
+    stdout: the test ids, sorted and unique, one per line (possibly empty).
+    stderr: every rejected candidate, tagged UNATTRIBUTABLE, plus counts.
+
+    Exits 0 whenever the capture was READ — an empty id set is a legitimate
+    answer (the caller's `examined > extracted` gate owns "a failing run that
+    yielded nothing"). A non-zero exit therefore means exactly one thing: the
+    input could not be read. Reading that as "no failures" is the vacuous pass.
+    """
+    parsed = parse_failed_ids(_read(args.log), raw_log=True)
+    for nodeid in parsed.ids:
+        print(nodeid)
+    for token in parsed.rejected:
+        print(
+            "ci-exemption: UNATTRIBUTABLE: FAILED token is not a test id and was "
+            f"DROPPED (never in the failure set): {token}",
+            file=sys.stderr,
+        )
+    print(
+        f"ci-exemption: ids={len(parsed.ids)} "
+        f"unattributable={len(parsed.rejected)}",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def _cmd_signatures(args: argparse.Namespace) -> int:
     parsed = parse_pr_failure_text(_read(args.log))
     sys.stdout.write(render_signature_table(parsed.signatures))
@@ -931,7 +1007,7 @@ def _cmd_decide(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m tools.ci_exemption <signatures|decide> …`` — the shell's door."""
+    """``python -m tools.ci_exemption <ids|signatures|decide> …`` — the shell's door."""
     parser = argparse.ArgumentParser(
         prog="python -m tools.ci_exemption",
         description="The #3756 pre-merge exemption decision and its signature producer.",
@@ -944,6 +1020,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     sig.add_argument("--log", required=True, help="raw --log-failed file")
     sig.set_defaults(func=_cmd_signatures)
+
+    ids = sub.add_parser(
+        "ids",
+        help="THE canonical FAILED-id extraction from a raw `gh run view --log-failed` capture",
+    )
+    ids.add_argument("--log", required=True, help="raw --log-failed file")
+    ids.set_defaults(func=_cmd_ids)
 
     dec = sub.add_parser("decide", help="run the exemption decision over files")
     dec.add_argument(
