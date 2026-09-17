@@ -2522,20 +2522,22 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
 
   // (a) `hbThresholds` carries the loop's own two window inputs, and BOTH
   // decision call sites spread it — field presence and wiring asserted
-  // together, so an inline literal that stopped spreading would red. Each slice
-  // is validated at its END first: a missing `});` terminator must red, not
-  // silently widen into an arbitrary region whose `includes` checks prove
-  // nothing.
-  // A comment-stripped view: a mention of `heartbeatKillDecision(` or of
-  // `...hbThresholds` inside PROSE must never satisfy a count or a wiring check
-  // (the file's own comments discuss both).
+  // together, so an inline literal that stopped spreading would red.
+  // `code` is a NAIVE comment-strip (line comments to EOL, then block comments),
+  // used so that a mention of `heartbeatKillDecision(` or of `...hbThresholds`
+  // inside PROSE cannot satisfy a count or a wiring check. It is not
+  // tokenizer-aware — a `//` inside a string literal would truncate that line —
+  // which is fail-CLOSED for every use below: a lost anchor lowers a count or
+  // shortens the call-site split, and both red.
   const code = src.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
-  // The literal must be UNIQUE, or `indexOf` could land on a secondary mention
-  // and every pin below would silently read the wrong region. The end is
-  // cross-checked by the literal's own final field (a terminator miss cannot end
-  // with it) — that check fixes both the last field AND the indent, so
-  // reordering or reindenting the literal is a deliberate, visible RED.
-  equal(code.split("const hbThresholds = {").length - 1, 1, "the hbThresholds literal must occur exactly ONCE, else indexOf may anchor on a mention");
+  // The literal must be UNIQUE in the RAW source — the same view `indexOf`
+  // anchors on below. Counted on `code`, a bare mention in a comment would pass
+  // the count while `indexOf` anchored on that mention, silently widening the
+  // region. The region's END is cross-checked by the literal's own final field
+  // (a terminator miss cannot end with it) — that check fixes both the last
+  // field AND the indent, so reordering or reindenting the literal is a
+  // deliberate, visible RED.
+  equal(src.split("const hbThresholds = {").length - 1, 1, "the hbThresholds literal must occur exactly ONCE in the raw source, else indexOf may anchor on a mention");
   const hbStart = src.indexOf("const hbThresholds = {");
   const hbEnd = src.indexOf("\n    };", hbStart);
   ok(hbStart > -1 && hbEnd > hbStart, "the hbThresholds literal must be locatable for the coupling pin");
@@ -2546,22 +2548,35 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   // Wiring is pinned PER CALL SITE, not by a file-wide spread count: a decoy
   // `{ ...hbThresholds }` elsewhere keeps a global count at 2 while a call site
   // silently drops the loop's own thresholds (that call would then run on
-  // undefined bounds — every clause inert). The invocation count is
-  // spelling-agnostic, so a third call site reds however its arguments are
-  // written.
+  // undefined bounds — every clause inert).
   const callSites = code.split("heartbeatKillDecision({").slice(1);
   equal(callSites.length, 2, "there must be exactly two decision call sites taking an inline threshold literal");
+  // Walk a site's OWN argument list by bracket depth instead of taking the first
+  // `});` in the slice. For the LAST site the slice runs to EOF, so
+  // `indexOf("});")` would land on any later terminator in the file and the
+  // `includes` checks below would then read a region that is not this call's.
+  // `depth` starts at 0 because the slice begins immediately after the call's own
+  // `({`, so the first closer at depth 0 is that call's `}`.
+  const ownArgsEnd = (body: string): number => {
+    let depth = 0;
+    for (let k = 0; k < body.length; k++) {
+      const c = body[k];
+      if (c === "{" || c === "(" || c === "[") depth++;
+      else if (c === "}" || c === ")" || c === "]") {
+        if (depth === 0) return k;
+        depth--;
+      }
+    }
+    return -1;
+  };
   callSites.forEach((raw, i) => {
-    const close = raw.indexOf("});");
-    ok(close > 0, `decision call site ${i + 1} must be terminated by its own });`);
-    // Comments are stripped first: an in-slice MENTION of the spread must not
-    // satisfy the check, and the window inputs must not be overridden AFTER the
-    // spread (a later `intervalMs:` would silently win over the loop's own).
-    const args = raw.slice(0, close).replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    const close = ownArgsEnd(raw);
+    ok(close > -1 && raw.slice(close, close + 3) === "});", `decision call site ${i + 1} must be closed by its own }); (first depth-0 closer, then the shape is checked — on a parsable source that closer IS this call's)`);
+    const args = raw.slice(0, close);
     ok(args.includes("...hbThresholds,"), `decision call site ${i + 1} must spread the loop's own hbThresholds`);
-    ok(!/heartbeatTimeoutMs:/.test(args) && !/intervalMs:/.test(args), `decision call site ${i + 1} must not override the window inputs after the spread`);
+    ok(!/heartbeatTimeoutMs:/.test(args) && !/intervalMs:/.test(args), `decision call site ${i + 1} must not name heartbeatTimeoutMs:/intervalMs: in its arguments at all — before or after the spread`);
   });
-  equal((code.match(/heartbeatKillDecision\s*\(/g) ?? []).length, 3, "one declaration + exactly two calls (comments are stripped first; a call through an alias is out of scope)");
+  equal((code.match(/heartbeatKillDecision\s*\(/g) ?? []).length, 3, "one declaration + exactly two DIRECT-callee calls; an alias, a parenthesized callee (f)(…), f?.(…) and f.call/apply are NOT claimed — this pins the direct-call count, not every possible invocation");
 
   // (b) The decision's window expression and the warning. The first is a
   // single-occurrence check stated as such: it pins the expression COUNT, not
@@ -2580,27 +2595,30 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   );
   equal(src.split("cutInertWarned = false").length - 1, 1, "the latch is initialised exactly ONCE — a per-tick re-arm would reproduce the spam it exists to prevent");
 
-  // (c) The far tail's OWNER must not be freshness-gated. The two guard
-  // CONDITIONS are pinned EXACTLY (below), which covers both shapes at once: an
-  // added `else if (…)`/`if(…)` gate changes the guard list, and a freshness
-  // term FOLDED into `if (!hasOutput && <fresh>)` changes the condition string.
-  // A denylist of freshness identifiers was tried in an earlier cycle and is
-  // strictly weaker — it is a closed family and misses the next spelling
-  // (`clampHeartbeatIntervalMs`, `*_INTERVAL_MS`, a local alias, …).
+  // (c) The far tail's OWNER must not be freshness-gated. Two checks with
+  // DIFFERENT blind spots are needed — neither is a superset of the other:
+  //   - the exact-CONDITION pin catches a freshness term folded into one of the
+  //     callback's `if (…)` headers, whatever its spelling (a denylist of
+  //     identifiers is a closed family: `clampHeartbeatIntervalMs`,
+  //     `*_INTERVAL_MS`, a local alias … all walk through it), and it catches an
+  //     added `else if (…)` / `if(…)` guard;
+  //   - the freshness-TOKEN check covers the REST of the body, i.e. a gate
+  //     expressed with no `if` header at all (`switch`, a ternary, a `||`
+  //     short-circuit, a helper) — which the condition pin cannot see.
+  // Only the two together pin "this callback is not freshness-gated".
   const hcStart = src.indexOf("hardCapTimer: NodeJS.Timeout | null = setTimeout(");
   const hcEnd = src.indexOf("}, getTaskHardCapMs());", hcStart);
   ok(hcStart > -1 && hcEnd > hcStart, "the hard-cap timer callback must be locatable");
   const hcBody = src.slice(hcStart, hcEnd);
-  ok(hcBody.includes("if (settled) return;"), "the hard-cap callback still short-circuits on `settled`");
-  ok(hcBody.includes("if (!hasOutput)"), "the hard-cap callback still branches on `hasOutput`");
-  // The guards are pinned by their EXACT CONDITIONS, not by a count plus a
-  // denylist of freshness spellings: a denylist is a closed family and misses
-  // the next spelling, whereas an exact-condition pin catches a folded-in
-  // freshness term however it is written. Any change to these two conditions is
-  // a change to the far tail's owner and must be re-reviewed, not silently
-  // accommodated.
-  const hcGuards = (hcBody.match(/\bif\s*\(([^)]*)\)/g) ?? []).map((g) => g.replace(/\s+/g, " ").trim());
-  equal(hcGuards.slice().sort().join(" | "), "if (!hasOutput) | if (settled)", "the callback's guards are EXACTLY `settled` and `!hasOutput` — a freshness gate is caught however it is spelled, and `else if`/`if(` forms cannot hide");
+  ok(/if\s*\(\s*settled\s*\)\s*return;/.test(hcBody), "the hard-cap callback still short-circuits on `settled`");
+  ok(/if\s*\(\s*!hasOutput\s*\)/.test(hcBody), "the hard-cap callback still branches on `hasOutput`");
+  // Only the parenthesised CONDITION is normalised, so a pure reformat
+  // (if (\n  !hasOutput\n) {) stays green while any change of the condition
+  // itself reds. Any change to these two conditions changes the far tail's
+  // owner and must be re-reviewed, not silently accommodated.
+  const hcGuardConds = (hcBody.match(/\bif\s*\(([^)]*)\)/g) ?? []).map((g) => g.slice(g.indexOf("(") + 1, -1).replace(/\s+/g, " ").trim());
+  equal(hcGuardConds.slice().sort().join(" | "), "!hasOutput | settled", "the callback's guards are EXACTLY `settled` and `!hasOutput` — a freshness term folded into one of them is caught whatever its spelling");
+  ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS|getHeartbeatIntervalMs|intervalMs|cutGapMs/.test(hcBody), "…and no freshness expression may appear in the callback OUTSIDE those `if` headers (a `switch`, ternary or `||`-shaped gate) — the condition pin cannot see those. `lastMarkerAt` is deliberately NOT listed: the callback reads it for the marker-age report");
 
   // (d) Behavioural side of the same coupling: with the interval term dominating
   // the max, the decision's window must follow `i.intervalMs` — a T-only window
