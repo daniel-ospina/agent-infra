@@ -564,6 +564,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "checkpoint park trigger — parks state, kills nothing",
   },
+  {
+    name: "RERUN_STALL_SECONDS",
+    owners: ["scripts/admin-merge.sh"],
+    value: "${ADMIN_MERGE_STALL_SECONDS:-600}",
+    axis: "gate",
+    guardedBy: NONE,
+    note: "the merge gate's re-run progress window (#3756): a main-lane re-run whose status never reaches completed AND whose updatedAt never moves for this long is STALLED and the gate refuses the merge. A still-running job is NOT a failure — only a STALL is. The value is an env seam for tests only (ADMIN_MERGE_STALL_SECONDS); the shipped default is 600 s.",
+  },
   // — reap axis (interactive session reaper) —
   {
     name: "REAP_IDLE_HOURS",

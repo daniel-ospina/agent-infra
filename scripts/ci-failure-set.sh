@@ -101,6 +101,20 @@
 #   one is evidence. A superseded run belongs to the OLD commit, so it cannot
 #   satisfy the NEW head's `tested` count either — the fix is safe.
 #
+# THE ID PARSER IS RESOLVED FROM THE RAIL'S OWN DIRECTORY (#3756 defect 1).
+#   `ci_exemption.py`, shipped next to this script, holds the ONE definition of
+#   "is this a test id". The extraction routes through it (`ci_exemption.py
+#   ids`) instead of a second shell regex, so the rail and the decision can
+#   never disagree about the id universe — and a candidate that is not a test id
+#   is DROPPED, COUNTED and REPORTED as UNATTRIBUTABLE rather than carried as a
+#   failure id (the `may` leak: a garbage id can never match main, so it reads
+#   as "unique to this PR" on every run, forever). It is deliberately NOT read
+#   from the repo being merged: a grader drawn from the graded system is a
+#   bypass — a PR could ship a `tools/ci_exemption.py` that always reports
+#   CLEAN. A missing module is a LOUD REFUSAL (exit 1), never a fallback to a
+#   shell regex. The rate/signature/decision engine that consumes these ids is
+#   #1147 and is built on top of this parser — never beside it.
+#
 # Env seams (tests only):
 #   CI_FAILURE_SET_GH         the gh command to run (default: `gh`)
 #   CI_FAILURE_SET_WORKFLOW   the workflow filter (default: `python-ci.yml`)
@@ -110,6 +124,9 @@ set -uo pipefail
 GH="${CI_FAILURE_SET_GH:-gh}"
 DEFAULT_MAIN_RUNS=10
 DEFAULT_WORKFLOW="python-ci.yml"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
+if command -v python3 >/dev/null 2>&1; then PYTHON_BIN=python3; else PYTHON_BIN=python; fi
 
 # Populated by main() before any selector runs. Bash locals are dynamically
 # scoped, but these are deliberately global: every helper below (and every
@@ -154,15 +171,60 @@ list_lane_runs() {
 # FAILURE (exit 1), not an empty contribution: silently dropping it is exactly
 # the vacuous pass this rail exists to prevent.
 extract_failed_tests() {
-  local run_id="$1" log
+  local run_id="$1" log_file rc
+  log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
+  if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file"; return 1; fi
+  failed_ids_from_log "$log_file"
+  rc=$?
+  rm -f "$log_file"
+  return $rc
+}
+
+# fetch_failed_log <run-id> <out-file> — the RAW `gh run view --log-failed`
+# capture. Same fail-closed rule as extract_failed_tests: a gh error is a
+# FAILURE, never an empty capture — an unreadable log must not read as "nothing
+# failed" (#3705).
+fetch_failed_log() {
+  local run_id="$1" out="$2"
   # shellcheck disable=SC2086
-  if ! log="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>/dev/null)"; then
+  if ! $GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed > "$out" 2>/dev/null; then
     say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set"
     return 1
   fi
-  printf '%s\n' "$log" \
-    | sed $'s/\033\\[[0-9;]*[A-Za-z]//g' \
-    | awk '{ for (i = 1; i < NF; i++) if ($i == "FAILED") { print $(i+1); break } }'
+}
+
+# failed_ids_from_log <log-file> → the ids, via THE canonical parser.
+#
+# #3756 DEFECT 1: this used to be a shell `awk` regex that printed whatever token
+# followed a bare `FAILED` field — including `may` from log prose. `may` is not a
+# test id, so it matched nothing on main, could never be subtracted or verified,
+# and read as "unique to this PR" on every rail run forever. The id extraction
+# now goes through the SAME module that owns the id shape (`ci_exemption.py
+# ids`), so there is exactly ONE definition of "is this a test id"; a candidate
+# that fails it is DROPPED, COUNTED and REPORTED as UNATTRIBUTABLE on stderr
+# (fail-closed, #3705) — never carried, never read as "no failures".
+failed_ids_from_log() {
+  local log_file="$1" out
+  require_exemption_module || return 1
+  if ! out="$("$PYTHON_BIN" "$EXEMPTION_PY" ids --log "$log_file")"; then
+    say_err "ci-failure-set: ✗ FAILED-id extraction FAILED for $log_file — refusing to read it as an empty failure set"
+    return 1
+  fi
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return 0
+}
+
+# require_exemption_module — the one dependency, checked BEFORE any gh call so a
+# broken install refuses immediately instead of after minutes of fetching.
+require_exemption_module() {
+  if [ ! -f "$EXEMPTION_PY" ]; then
+    say_err "ci-failure-set: ✗ the id parser is ABSENT at $EXEMPTION_PY"
+    say_err "   The rail refuses to fall back to a second shell regex (the #3756"
+    say_err "   defect): that is how an unparseable token became a failure id."
+    say_err "   Restore the agent-infra checkout; do not merge."
+    return 1
+  fi
+  return 0
 }
 
 # ── modes ─────────────────────────────────────────────────
