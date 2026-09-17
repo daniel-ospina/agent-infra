@@ -416,10 +416,15 @@ trap 'exit 129' HUP
 if command -v perl >/dev/null 2>&1; then
   ( cd "$D" && exec perl -e 'setpgrp(0,0); exec @ARGV or die "scratch-worktree: exec: $!\n"' -- "${CMD[@]}" ) &
   CMD_PID=$!
+elif command -v python3 >/dev/null 2>&1; then
+  ( cd "$D" && exec python3 -c 'import os,sys; os.setpgrp(); os.execvp(sys.argv[1], sys.argv[1:])' "${CMD[@]}" ) &
+  CMD_PID=$!
 else
-  # Fallback (no perl): the job-control form, with the parent's stderr closed for
-  # the launch window and restored by the child from fd 9 so the wrapped command's
-  # own stderr still reaches the caller.
+  # Last resort (no perl, no python3): the job-control form. DECLARED RESIDUAL —
+  # this branch CAN still print `child setpgid (PID): Operation not permitted`
+  # on a successful run (~5% measured), because the message is emitted after the
+  # launch window closes and the fd dance cannot suppress it. stderr delivery and
+  # the exit code are unaffected; use a host with perl or python3 for silence.
   set -m
   exec 9>&2
   ( cd "$D" && exec 2>&9 9>&- && exec "${CMD[@]}" ) 2>/dev/null &

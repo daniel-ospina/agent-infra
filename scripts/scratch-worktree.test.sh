@@ -83,12 +83,12 @@ sx() { bash "$SW" "$1" --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" "${@:2
 
 # ── T1: run --full, correct ref, nothing survives ───────────────────────────
 OUT="$(sx run --ref "$C1" --full -- bash -c 'echo REF=$(git rev-parse HEAD); echo FILES=$(ls | tr "\n" " ")' 2>/dev/null)"
-echo "$OUT" | grep -q "REF=$C1" && ok 0 "T1a run --full checks out the requested ref" || ok 1 "T1a run --full checks out the requested ref ($OUT)"
+grep -q "REF=$C1" <<<"$OUT" && ok 0 "T1a run --full checks out the requested ref" || ok 1 "T1a run --full checks out the requested ref ($OUT)"
 [ "$(live_scratch)" = 0 ] && ok 0 "T1b run --full leaves no worktree/registration" || ok 1 "T1b run --full leaves no worktree/registration"
 
 # ── T2: run --paths materialises the sparse set ─────────────────────────────
 OUT="$(sx run --ref "$C2" --paths small -- bash -c 'ls small | tr "\n" " "' 2>/dev/null)"
-echo "$OUT" | grep -q 'a.txt' && echo "$OUT" | grep -q 'b.txt' \
+grep -q 'a.txt' <<<"$OUT" && grep -q 'b.txt' <<<"$OUT" \
   && ok 0 "T2a run --paths materialises the requested path" || ok 1 "T2a run --paths materialises the requested path ($OUT)"
 [ "$(live_scratch)" = 0 ] && ok 0 "T2b run --paths leaves no worktree" || ok 1 "T2b run --paths leaves no worktree"
 
@@ -389,9 +389,12 @@ grep -q 'n.txt' "$FIX/t19out" && ok 1 "T19b a same-named NESTED dir was material
 # ── T20: a SUCCESSFUL run is silent on stderr ──────────────────────────────
 # Two distinct bash-3.2 races produce stderr on success: `run_pending_traps: bad
 # value in trap_list` from the watchdog subshell (TERMed while parked in `sleep`)
-# and `child setpgid (PID): Operation not permitted` from the job-control launch
+# and `child setpgid (PID): Operation not permitted` from the `set -m` launch
 # window (~1%). Both read to an agent as tool failure, and the second made a
-# 3-sample T20 flake. 20 samples; the FIRST failing buffer is preserved.
+# 3-sample T20 flake. The group is normally established in the child (perl or
+# python3 setpgrp + exec) so there is no parent-side race; the `set -m` branch is
+# the last resort and CAN still emit that line — a declared residual, not silence.
+# 20 samples; the FIRST failing buffer is preserved.
 ERR20=0; ERRMSG=""
 for _ in $(seq 1 20); do
   bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full -- true \
