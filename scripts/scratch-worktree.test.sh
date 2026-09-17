@@ -35,6 +35,8 @@
 #   T20 run is silent on stderr when it succeeds (20 samples)
 #   T21 a wrapped command that deletes `.git` still deregisters the record
 #   T22 a wrapped command that replaces `$D` with a DANGLING symlink still cleans
+#   T23 a forged marker+gitdir cannot deregister a real sibling (back-link proof)
+#   T24 an undeletable leftover stays VISIBLE to `list` rather than becoming an orphan
 
 set -uo pipefail
 
@@ -156,13 +158,17 @@ git -C "$FIX/repo" worktree prune >/dev/null 2>&1
 DECOY="$ROOT_P/scratch-decoy"
 mkdir -p "$DECOY"; printf 'precious\n' > "$DECOY/data"
 sx clean "$DECOY" >/dev/null 2>&1
-[ -f "$DECOY/data" ] && ok 0 "T7a plain dir is refused" || ok 1 "T7a plain dir is refused"
+RC7A=$?
+{ [ "$RC7A" != 0 ] && [ -f "$DECOY/data" ]; } && ok 0 "T7a plain dir is refused (rc=$RC7A)" \
+  || ok 1 "T7a plain dir is refused (rc=$RC7A)"
 rm -rf "$DECOY"
 
 FORGED="$ROOT_P/scratch-forged"
 mkdir -p "$FORGED"; printf '%s\n' "$FIX/repo" > "$FORGED/.scratch-worktree"; printf 'precious\n' > "$FORGED/data"
 sx clean "$FORGED" >/dev/null 2>&1
-[ -f "$FORGED/data" ] && ok 0 "T7b forged-marker dir is refused (not a registered worktree)" || ok 1 "T7b forged-marker dir is refused"
+RC7B=$?
+{ [ "$RC7B" != 0 ] && [ -f "$FORGED/data" ]; } && ok 0 "T7b forged-marker dir is refused (rc=$RC7B)" \
+  || ok 1 "T7b forged-marker dir is refused (rc=$RC7B)"
 rm -rf "$FORGED"
 
 # The reviewer's P1: a REGISTERED worktree under ROOT whose name matches the
@@ -443,6 +449,55 @@ D22="$(cat "$P22" 2>/dev/null)"
   && ok 0 "T22b a dangling symlink left at the scratch path is removed" \
   || ok 1 "T22b a dangling symlink survived at ${D22:-unset}"
 [ "$(live_scratch)" = 0 ] && ok 0 "T22c no record survives" || ok 1 "T22c a record survived"
+
+# ── T23: ownership cannot be FORGED to deregister a real sibling ────────────
+# The marker is trivially derivable and `gitdir:` is just a path, so a directory
+# under the scratch root carrying both could name an unrelated sibling's admin dir
+# and have `clean <path>` rm -rf it (cycle-9 P1). `owns()` now also requires the
+# admin dir's own `gitdir` BACK-LINK to name this worktree's `.git` — written by
+# git, so a forger cannot produce it for a worktree they do not control.
+SIB="$FIX/sibling-owned"
+git -C "$FIX/repo" worktree add --detach "$SIB" "$C2" >/dev/null 2>&1
+printf 'precious\n' > "$SIB/WIP.txt"
+SIB_ADMIN="$(sed -n 's/^gitdir: //p' "$SIB/.git" 2>/dev/null | head -1)"
+EVIL="$SCRATCH_WORKTREE_ROOT/scratch-evil"
+mkdir -p "$EVIL"
+printf '%s\n' "$(cd "$FIX/repo" && pwd -P)" > "$EVIL/.scratch-worktree"
+printf 'gitdir: %s\n' "$SIB_ADMIN" > "$EVIL/.git"
+sx clean "$EVIL" >/dev/null 2>&1
+RC23=$?
+[ "$RC23" != 0 ] && ok 0 "T23a a forged ownership pair is refused (rc=$RC23)" || ok 1 "T23a a forged ownership pair was accepted (rc=$RC23)"
+if git -C "$SIB" rev-parse --git-dir >/dev/null 2>&1; then
+  ok 0 "T23b the sibling worktree is still a repository"
+else
+  ok 1 "T23b a forged marker DEREGISTERED an unrelated sibling"
+fi
+[ -f "$SIB/WIP.txt" ] && ok 0 "T23c the sibling's files are intact" || ok 1 "T23c the sibling's files are intact"
+rm -rf "$EVIL"
+git -C "$FIX/repo" worktree remove --force "$SIB" >/dev/null 2>&1
+
+# ── T24: an UNREMOVABLE leftover must stay visible, never become an orphan ───
+# If the probe leaves something `rm` cannot delete, pruning the record anyway
+# would hide it from `list` (the documented completion check), from `clean
+# <path>` (no marker to prove ownership) and from the reaper (which enumerates
+# registered worktrees) — a leak that every check reports as clean (cycle-9 P2).
+P24="$FIX/t24path"
+bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full \
+  -- bash -c "pwd > '$P24'; mkdir blocker; : > blocker/f; chmod 000 blocker; exit 0" \
+  >/dev/null 2>&1
+RC24=$?
+D24="$(cat "$P24" 2>/dev/null)"
+[ "$RC24" = 0 ] && ok 0 "T24a the probe's exit code survives" || ok 1 "T24a the probe's exit code survives (rc=$RC24)"
+if [ -e "$D24" ]; then
+  [ "$(live_scratch)" != 0 ] && ok 0 "T24b an unremovable leftover stays visible to list" \
+    || ok 1 "T24b an unremovable leftover became an invisible orphan"
+else
+  ok 0 "T24b the leftover was made removable and removed"
+fi
+chmod -R u+rwX "$D24" 2>/dev/null || true
+rm -rf "$D24" 2>/dev/null || true
+sx clean --all --force-all >/dev/null 2>&1
+[ "$(live_scratch)" = 0 ] && ok 0 "T24c fixture reclaimed" || ok 1 "T24c fixture reclaimed"
 
 echo
 if [ "$FAILS" = 0 ]; then echo "ALL PASS"; exit 0; else echo "$FAILS FAILURE(S)"; exit 1; fi

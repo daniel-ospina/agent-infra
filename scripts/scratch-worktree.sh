@@ -53,7 +53,8 @@
 #   --keep          (create only) intentional keep — `list` will show it
 #   --help          this text
 #
-# Exit codes: 0 ok; 2 usage; otherwise the wrapped command's exit code (`run`).
+# Exit codes: 0 ok; 2 usage; 1 when `clean` refuses a path it cannot prove it owns;
+# otherwise the wrapped command's exit code (`run`).
 # Env: SCRATCH_WORKTREE_ROOT (scratch root) and SCRATCH_WORKTREE_KILL_GRACE
 # (seconds before SIGKILL, default 5).
 #
@@ -142,12 +143,33 @@ canon_root() {
 
 realpath_of() { ( cd "$1" 2>/dev/null && pwd -P ); }
 
-# A scratch checkout this tool owns. BOTH proofs, not just the marker:
+# realpath for a REGULAR FILE. `realpath_of` is `cd`-based and so returns empty
+# (status 1) for a file — using it on `<worktree>/.git` or `<admin>/gitdir` made
+# the ownership back-link check fail for EVERY legitimate worktree, turning
+# `clean <path>` into a permanent no-op (cycle-9 self-review caught this before
+# it shipped; the suite's T6c/T7/T13-T24 caught it immediately).
+realpath_file() { # <path-to-a-regular-file>
+  local d b
+  d="$(dirname "$1")" || return 1
+  b="$(basename "$1")" || return 1
+  [ -d "$d" ] || return 1
+  printf '%s/%s\n' "$( cd "$d" && pwd -P )" "$b"
+}
+
+# A scratch checkout this tool owns. ALL proofs, not just the marker:
 #   1. its physical path is under the canonical ROOT, and
 #   2. `.scratch-worktree` names this repo (realpath), and
-#   3. its admin gitdir really is `<repo>/.git/worktrees/<name>`.
+#   3. its admin gitdir really is under `<common>/worktrees/`, and
+#   4. that admin dir's own `gitdir` BACK-LINK names this worktree's `.git`.
+# (4) is what makes the proof non-forgeable (cycle-9 P1): without it, a directory
+# under the scratch root carrying two hand-written text files could name an
+# ARBITRARY sibling worktree's admin dir and have `remove_one` -> `prune_admin`
+# `rm -rf` it, deregistering that sibling while its files sit on disk. The marker
+# (2) is trivially derivable and `gitdir:` (3) is just a path, so (4) — written by
+# git, not by the caller — is the only step a forger cannot produce for a
+# worktree they do not control.
 owns() { # <repo> <path>
-  local repo="$1" d="$2" rp gd want common
+  local repo="$1" d="$2" rp gd want common back link
   [ -d "$d" ] && [ -f "$d/.scratch-worktree" ] || return 1
   rp="$(realpath_of "$d")" || return 1
   case "$rp/" in "$ROOT"/*) ;; *) return 1 ;; esac
@@ -165,8 +187,14 @@ owns() { # <repo> <path>
   common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
   [ -n "$common" ] || return 1
   common="$(realpath_of "$common")" || return 1
-  case "$gd" in "$common"/worktrees/*) return 0 ;; esac
-  return 1
+  case "$gd" in "$common"/worktrees/*) ;; *) return 1 ;; esac
+  # Back-link: git writes `<admin>/gitdir` = the path of `<worktree>/.git`.
+  [ -f "$gd/gitdir" ] || return 1
+  link="$(head -n 1 "$gd/gitdir" 2>/dev/null)" || return 1
+  [ -n "$link" ] || return 1
+  back="$(realpath_file "$link")" || return 1
+  [ "$back" = "$(realpath_file "$d/.git")" ] || return 1
+  return 0
 }
 
 # Deregistration is ALWAYS targeted (cycle-5 P1): `git worktree remove` already
@@ -230,11 +258,29 @@ remove_one() { # <repo> <path>
 # false PASS (cycle-6 P2). `git clean` protects a worktree's own `.git`; an
 # explicit `rm -rf .git` does not.
 remove_created() { # <repo> <path> [admin-gitdir]
-  local repo="$1" d="$2" gd="${3:-}"
+  local repo="$1" d="$2" gd="${3:-}" left=0
   [ -n "$d" ] || return 0
   [ -n "$gd" ] || gd="$(admin_of "$d")"
   git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
-  if [ -e "$d" ] || [ -L "$d" ]; then rm -rf "$d" 2>/dev/null || warn "could not remove $d"; fi
+  if [ -e "$d" ] || [ -L "$d" ]; then
+    rm -rf "$d" 2>/dev/null || true
+    # A probe can leave something `rm` cannot delete (rewriting its own dir
+    # mode-000). Make it removable and retry before giving up.
+    if [ -e "$d" ] || [ -L "$d" ]; then
+      chmod -R u+rwX "$d" 2>/dev/null || true
+      rm -rf "$d" 2>/dev/null || true
+    fi
+  fi
+  # A leftover that CANNOT be removed must stay VISIBLE (cycle-9 P2). Pruning
+  # the record anyway would turn it into an invisible orphan: `list` — the
+  # documented completion check — would report clean, `clean <path>` would refuse
+  # it (no marker/.git to prove ownership), and the reaper could not see it either
+  # (it enumerates registered worktrees, not directories). Keeping the record
+  # makes `list` surface it.
+  if [ -e "$d" ] || [ -L "$d" ]; then
+    warn "could not remove $d — its registration is KEPT so 'list' shows it"
+    return 1
+  fi
   prune_admin "$repo" "$gd"
   return 0
 }
@@ -294,7 +340,11 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
     exit 0
   fi
   [ -n "$CLEAN_TARGET" ] || die "clean needs a path or --all"
-  remove_one "$REPO" "$CLEAN_TARGET" || true
+  # A refused path is NOT success: the caller asked for removal and did not get
+  # it. `die` would use the usage code (2), so exit 1 explicitly — otherwise a
+  # refusal is indistinguishable from a completed cleanup (cycle-9 P1; a forged or
+  # unowned path must fail loudly).
+  remove_one "$REPO" "$CLEAN_TARGET" || exit 1
   exit 0
 fi
 

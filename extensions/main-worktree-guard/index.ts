@@ -1746,7 +1746,10 @@ const SANCTIONED_SCRIPT_RELPATHS = [
   // create/remove, resolved at runtime), and TIGHTER than it: removal is
   // confined by `owns()` to a path that is under the scratch root AND carries
   // the tool's marker AND whose admin gitdir is under the COMMON
-  // .git/worktrees/, so it cannot be pointed at the hub or another checkout.
+  // .git/worktrees/ AND whose admin dir's own `gitdir` back-link names that
+  // checkout — the last of which is written by git, so it cannot be forged to
+  // deregister a worktree the caller does not control (code-review-cycle-9 P1),
+  // so it cannot be pointed at the hub or another checkout.
   "scripts/scratch-worktree.sh",
 ];
 const _frameworkRoot: string | null = (() => {
