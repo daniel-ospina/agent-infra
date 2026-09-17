@@ -1594,6 +1594,67 @@ export function getHeartbeatIntervalMs(): number {
 export function getStreamStallMs(): number {
   return Math.max(60_000, Number(process.env.TASK_STREAM_STALL_MS) || DEFAULT_STREAM_STALL_MS);
 }
+/**
+ * #1030: resolve a dispatch's inactivity bound (S) from an optional
+ * PER-DISPATCH override, falling back to `getStreamStallMs()` (env → default).
+ *
+ * Why a per-dispatch override exists. S bounds BOTH silence clauses —
+ * `tool-silence` (a tool in flight that produced output and then stopped) and
+ * `stream-stall` (no tools, stream idle). In a test-heavy repo one legitimate
+ * tool call can be silent for longer than S, and the parent — which usually
+ * KNOWS it is dispatching a long implementation task — had no way to say so.
+ * Measured on the #1030 incident's retained child transcripts: five wedges were
+ * exactly this shape (single silent `bash` gaps of 1203 s, 1205 s, 1211 s,
+ * 1211 s, 1285 s, 1341 s on pytest / repo-root `grep -rn`), and one child even
+ * declared `timeout: 2400` on its own bash call while the parent's watchdog
+ * stayed at the 1200 s default. The operator-facing fix was "raise or make
+ * configurable the bound for implementation tasks"; this is the configurable
+ * part, scoped to the one dispatch that needs it so every other dispatch keeps
+ * the safe default.
+ *
+ * FAIL-CLOSED on a bad override — the identical rule `getToolStallMs` already
+ * documents: a non-finite or non-positive value (`Infinity`, `Number("1e400")`,
+ * `NaN`, `0`, negative, a non-numeric string) falls back to the env/default
+ * bound. An override may RAISE the bound; it may never disable it. This is the
+ * adversarial face of a knob on a safety detector: `Math.max(60_000, n)` alone
+ * would let `Infinity` through and leave the wedged-tool detector permanently
+ * disarmed (#1068's inert-enforcer class).
+ *
+ * An accepted override is honoured VERBATIM above the 60 s floor and is never
+ * load-rescaled — the rule docs/ops/load-policy.md §3 already states for
+ * `TASK_HEARTBEAT_CUT_GAP_MS`: an operator who names a number means it, and
+ * silently rescaling it would make the override lie. The 60 s floor is the same
+ * one `getStreamStallMs` applies (a sub-60 s bound would kill a healthy child
+ * between two heartbeat ticks).
+ */
+export function resolveStreamStallMs(overrideMs?: number | null): number {
+  const n = Number(overrideMs);
+  if (Number.isFinite(n) && n > 0) return Math.max(60_000, Math.floor(n));
+  return getStreamStallMs();
+}
+/**
+ * #1030: the INERTNESS warning for the silence bound. The silence clauses fire
+ * only while `effStreamAge > S`; the tool-AGE backstop (`getToolStallMs`, 2/3 of
+ * the effective hard cap — 4 h at the 6 h default) fires on tool age regardless
+ * of output. So an S at or above the age backstop makes the silence clauses
+ * structurally unreachable for that dispatch: the detector an operator raised S
+ * to keep alive can never be the clause that fires. Returns the message, or
+ * `null` when the silence clauses are reachable (the default path: 1200 s <
+ * 4 h, so this is never noise on the shipped defaults).
+ *
+ * WARN, never CLAMP — the same deliberate choice #1070 made for the cut-gap
+ * bound: clamping the bound changes kill timing, and kill timing is an operator
+ * decision, not a silent correction.
+ */
+export function streamStallInertWarning(resolvedMs: number): string | null {
+  const preempts = getToolStallMs();
+  if (resolvedMs < preempts) return null;
+  return (
+    `[task] inactivity bound ${Math.round(resolvedMs / 1000)}s >= the tool-age backstop ` +
+    `${Math.round(preempts / 1000)}s — the silence clauses (tool-silence / stream-stall) cannot fire before the ` +
+    `age backstop for this dispatch; lower stream_stall_ms / TASK_STREAM_STALL_MS, or rely on the age backstop (#1030)`
+  );
+}
 export function getToolStallMs(): number {
   // #783 fix 4: the task path resolves a bound DERIVED from the effective hard
   // cap (2/3 → 4h at the 6h default). It must not read the exported
@@ -2724,7 +2785,7 @@ export function taskCwdRefusal(cwd?: string | null): string | null {
   }
 }
 
-export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal, record?: DispatchRecordContext, cwd?: string): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
+export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal, record?: DispatchRecordContext, cwd?: string, streamStallMs?: number): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
   // #1071: refuse an unspawnable target BEFORE the promise below — a
   // synchronous `spawn` throw would reject it with no `spawn-error` row and no
   // self-identifying message (see `taskCwdRefusal`). Pre-spawn by construction,
@@ -3184,10 +3245,15 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
 
     const startedAt = Date.now();
     // #176: stall bounds resolved once per dispatch (parent-side env).
+    // #1030: `streamStallMs` (S) is the ONE member a dispatch may override —
+    // resolved once in the task tool (so the inertness warning above is emitted
+    // once, not once per attempt/leg) and threaded here, following the #1071
+    // `cwd` pattern: one resolved value feeds every consumer of the dispatch, so
+    // the bound actually applied cannot diverge from the one reported.
     const hbThresholds = {
       heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,
       firstOutputTimeoutMs: FIRST_OUTPUT_TIMEOUT_MS,
-      streamStallMs: getStreamStallMs(),
+      streamStallMs: streamStallMs ?? getStreamStallMs(),
       toolStallMs: getToolStallMs(),
       // #209: load-aware — under a load storm the first message legitimately
       // stalls; scale the bound with loadavg (1x <8, 2x 8–15, 3x ≥16).
@@ -3956,6 +4022,12 @@ export default function (pi: ExtensionAPI) {
             "Target working directory for this sub-agent — the repo/worktree it should work in (absolute, or relative to the parent's cwd). The child is SPAWNED here, so its git operations, its `AGENTS.md`, and the parent's `Alive state` / wedge report (`branch` / `headSha` / `worktree` / `dirty`) all describe THAT repo instead of the parent's checkout. Default: the parent's cwd (process.cwd()) — omit only when the child should work where the parent is (#1071).",
         })
       ),
+      stream_stall_ms: Type.Optional(
+        Type.Number({
+          description:
+            `Per-dispatch inactivity bound (S) in milliseconds — the in-flight-tool silence bound: if the child has a tool in flight (or an idle stream) that has produced NO output for this long, it is treated as wedged and killed. Overrides TASK_STREAM_STALL_MS for THIS dispatch only (floored at ${Math.round(60_000 / 1000)}s; a non-finite/non-positive value falls back to the env/default; honoured verbatim, never rescaled). Default: TASK_STREAM_STALL_MS, else ${DEFAULT_STREAM_STALL_MS} (${Math.round(DEFAULT_STREAM_STALL_MS / 60_000)} min). Raise it for a dispatch you KNOW runs a long, QUIET tool — a full test suite, a repo-wide search — because a tool that goes quiet past the bound is killed even though it is working (#1030). Do NOT raise it to work around a genuinely wedged tool: the age backstop and the hard cap still apply, and a value at or above the age backstop disarms the silence detector (a warning is logged).`,
+        })
+      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       // #783 Task 1: the parent's session identity comes from the extension
@@ -4012,6 +4084,29 @@ export default function (pi: ExtensionAPI) {
   // spread below, so the task-heartbeat EMITTER stays off (that extension
   // gates on DISABLE itself); only the sub-agent-identity marker is forced.
   TASK_HEARTBEAT: "1",
+  // #1030: a task child has NO TTY (`stdio: ["ignore","pipe","pipe"]`) but
+  // inherits the parent's GIT_EDITOR / core.editor / credential-helper env. An
+  // interactive git invoker then opens an editor (or a prompt) that reads a
+  // stdin which never comes, and the child burns its entire budget in silence.
+  // Measured on the #1030 incident: a merge `git commit` with no -m/-F opened
+  // vim, emitted one screen of escape sequences and then 0 bytes for 1211 s,
+  // and was killed by the inactivity bound — the child's stderr tail is the vim
+  // screen, ending `Vim: Caught deadly signal TERM`. Because there is NO TTY,
+  // the interactive branch can never succeed, so the only correct behaviour is
+  // to fail CLOSED and LOUDLY instead of blocking forever:
+  //   GIT_EDITOR / GIT_SEQUENCE_EDITOR = the `true` no-op → `git commit` with no
+  //     message exits at once with "Aborting commit due to empty commit message"
+  //     (the child then retries with -m/-F), and `rebase -i` gets an empty todo
+  //     list instead of hanging.
+  //   GIT_TERMINAL_PROMPT=0 → a credential prompt fails immediately rather than
+  //     waiting for input that cannot arrive.
+  // GIT_EDITOR wins over core.editor, so this also neutralises a repo-local
+  // `core.editor=vim` in a child's target checkout. Deliberately NOT covered
+  // here (same class, no measured instance, kept out to bound this change): the
+  // PAGER class (`GIT_PAGER`/`PAGER`) and SSH_ASKPASS.
+  GIT_EDITOR: "true",
+  GIT_SEQUENCE_EDITOR: "true",
+  GIT_TERMINAL_PROMPT: "0",
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
   // #617/#623: NO AGENT/ELDATO_ALLOW_MAIN_EDITS injection — the sub-agent runs
@@ -4093,6 +4188,17 @@ export default function (pi: ExtensionAPI) {
       // stream (false first-message cuts). Children opt into servers
       // explicitly via the mcp_servers param or mid-run mcp_load.
       subAgentEnv.PI_MCP_SERVERS = params.mcp_servers?.trim() || "none"; // #286 P2: "" (empty string) must not fall through to eager-load-all
+
+      // #1030: resolve this dispatch's inactivity bound (S) ONCE — the value the
+      // watchdog will actually apply — and warn when S has reached the tool-AGE
+      // backstop that pre-empts the silence clauses (from ANY source: this param,
+      // TASK_STREAM_STALL_MS, or a TASK_TOOL_STALL_MS floor below it). Warn,
+      // never clamp: #1070's rule — kill timing is an operator decision.
+      // Resolved here, not inside spawnSubAgent, so the warning is emitted once
+      // per dispatch rather than once per attempt/provider leg.
+      const dispatchStreamStallMs = resolveStreamStallMs(params.stream_stall_ms);
+      const streamStallWarning = streamStallInertWarning(dispatchStreamStallMs);
+      if (streamStallWarning) console.error(streamStallWarning);
 
       // Retry on zero-output failures (model/network hang) with backoff + circuit breaker.
       // Does NOT retry when sub-agent produces partial output — those go to the caller.
@@ -4246,7 +4352,7 @@ export default function (pi: ExtensionAPI) {
         dispatchClass,
       });
       const spawnLeg = (leg: LegRef, attempt = 1) =>
-        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd);
+        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs);
 
       let result = await retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions);
       // A malformed per-attempt id throws inside childSessionArgs(); retry()
@@ -4357,7 +4463,7 @@ export default function (pi: ExtensionAPI) {
         const buildFbArgs = (): string[] =>
           ["-p", "--provider", fallbackProvider, "--model", fallbackModel, ...childSessionArgs(), params.prompt];
         const fbResult = await retry(
-          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd),
+          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs),
           retryOptions,
         );
         if (fbResult.status === "success" && fbResult.value) {

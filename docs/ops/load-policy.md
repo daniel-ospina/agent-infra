@@ -216,6 +216,38 @@ unconditionally.
   `[task] cut-gap bound Xs >= the stateFresh window Ys …` warning when an override
   crosses it. Safe at the shipped defaults (T = 30min ⇒ window 60min, ~30× the 3x
   gap).
+- **Per-dispatch inactivity bound (`stream_stall_ms`, #1030):** S (the
+  in-flight-tool silence bound, and the idle-stream bound — one constant, two
+  clauses) is resolvable **per dispatch** by the task tool's `stream_stall_ms`
+  argument: `resolveStreamStallMs(param)` → the param when it is a positive
+  finite number (floored at 60s), else `max(60 s, TASK_STREAM_STALL_MS)`, else
+  `max(60 s, DEFAULT_STREAM_STALL_MS)`. **An accepted value is honoured VERBATIM
+  and is never load-rescaled** — the same rule §3 already states for
+  `TASK_HEARTBEAT_CUT_GAP_MS`: an operator who names a number means it. A bad
+  shape (`Infinity`, `1e400`, `NaN`, `0`, negative, non-numeric) fails **CLOSED**
+  to the ambient bound — an override may RAISE S, never disable it. Because S is
+  the bound that gates `tool-silence`/`stream-stall` while the tool-AGE backstop
+  (2/3 of the effective hard cap) ignores output, an S **at or above** that
+  backstop makes the silence clauses structurally unreachable: the loop emits the
+  one-shot `[task] inactivity bound Xs >= the tool-age backstop Ys …` warning.
+  **Warn, never clamp** (the #1070 precedent: kill timing is an operator
+  decision). One value is resolved per dispatch and threaded to every leg, so the
+  bound applied cannot diverge from the bound reported. Raised for a dispatch
+  that knowingly runs a long, QUIET tool (a full test suite, a repo-wide search)
+  — the measured #1030 wedges were five single silent calls of 1203–1341s against
+  the 1200s default. It is **not** a workaround for a genuinely wedged tool: the
+  age backstop and the hard cap are untouched by S.
+- A task child's git is **non-interactive by construction** (#1030): the child
+  env forces git's editor, sequence-editor and terminal-prompt variables to a
+  no-op / `0` respectively, and writes them *after* the ambient env spread so a
+  parent's own editor setting cannot leak in. A task child has no TTY
+  (`stdio: ["ignore","pipe","pipe"]`), so an interactive git invoker can never
+  succeed — it can only consume the dispatch's budget in silence (measured:
+  a merge `git commit` with no `-m`/`-F` opened vim, emitted one screen of
+  escapes, then 0 bytes for 1211s until the bound killed it). The pager class
+  and the SSH askpass hook are deliberately **not** covered here. (These are
+  SET, not read, so they are named only in code and in the builtin-tools suite —
+  the §3 doc↔reader gate exempts nothing a doc names that no source reads.)
 - Tier-1 (`TASK_FIRST_OUTPUT_TIMEOUT_MS`) is **NOT** load-scaled — scaling it
   delays hung-spawn detection, and spawn retry is cheap and stateless.
 

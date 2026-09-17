@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning } from "./index.js";
 import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
@@ -1764,6 +1764,182 @@ test("E13: first-message-stall at M — turn active, no message/tool events, ret
   const dHung = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: stHung, streamStallMs: 600_000, toolStallMs: 21_600_000 }));
   equal(dHung.kill, true, "hung in-flight tool still bounded by tool-stall (#198)");
   equal(dHung.reason, "tool-stall", "tool-stall reason (#198)");
+});
+
+// ── #1030 — the per-dispatch inactivity bound (S) ──────────────────────
+// The issue's operator-facing ask: "raise or make configurable the bound for
+// implementation tasks" — because a LONG, QUIET tool (a full test suite, a
+// repo-wide search) looks identical to a wedged one to a silence detector. The
+// measured cost was five dead dispatches in the gated Tortoise repo (silent
+// single-call gaps of 1203–1341 s against a 1200 s default). These tests pin
+// (A) the resolver's contract, (B) that the resolved value is the one the
+// decision actually applies, and (C) that ONE resolved value reaches every leg.
+section("#1030 — per-dispatch task-child inactivity bound (stream_stall_ms)");
+
+test("#1030-A1: no override → the ambient bound (env → default), verbatim", () => {
+  withEnv({ TASK_STREAM_STALL_MS: undefined }, () => {
+    equal(resolveStreamStallMs(), DEFAULT_STREAM_STALL_MS, "no argument → the default bound");
+    equal(resolveStreamStallMs(undefined), DEFAULT_STREAM_STALL_MS, "explicit undefined → the default bound");
+    equal(resolveStreamStallMs(null), DEFAULT_STREAM_STALL_MS, "null (an absent optional param) → the default bound");
+  });
+  withEnv({ TASK_STREAM_STALL_MS: "900000" }, () => {
+    equal(resolveStreamStallMs(), 900_000, "no override → the ENV bound (the pre-#1030 behaviour is unchanged)");
+    equal(resolveStreamStallMs(null), 900_000);
+  });
+});
+
+test("#1030-A2: a positive override WINS over the ambient bound and is honoured verbatim", () => {
+  withEnv({ TASK_STREAM_STALL_MS: "120000" }, () => {
+    equal(resolveStreamStallMs(1_800_000), 1_800_000, "the dispatch override beats TASK_STREAM_STALL_MS (raise)");
+    equal(resolveStreamStallMs(300_000), 300_000, "a LOWERING override is honoured too — the operator means it");
+  });
+  equal(resolveStreamStallMs(60_001.7), 60_001, "the value is floored to whole ms (never a fraction in a comparison)");
+  const aboveBackstop = getToolStallMs() + 1;
+  equal(
+    resolveStreamStallMs(aboveBackstop),
+    aboveBackstop,
+    "even a value past the age backstop is honoured — warned (B2), never clamped (#1070's cut-gap rule)",
+  );
+});
+
+test("#1030-A3: the 60 s floor — a sub-60 s bound would kill a healthy child between two heartbeat ticks", () => {
+  equal(resolveStreamStallMs(1), 60_000, "1 ms → floored to 60 s");
+  equal(resolveStreamStallMs(59_999), 60_000, "59.999 s → floored to 60 s");
+  equal(resolveStreamStallMs(60_000), 60_000, "exactly the floor → unchanged");
+});
+
+test("#1030-A4: FAIL-CLOSED — a non-finite / non-positive / non-numeric override falls back (never disarms the detector)", () => {
+  // The adversarial face of a knob on a safety detector: `Math.max(60_000, n)`
+  // alone lets `Infinity` through (it is truthy and survives Math.max), which
+  // would leave the wedged-child detector permanently disarmed for that
+  // dispatch — the #1068 inert-enforcer class. Every bad shape must fall BACK
+  // to the ambient bound, never to "no bound".
+  withEnv({ TASK_STREAM_STALL_MS: undefined }, () => {
+    for (const bad of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN, 1e400, 0, -1, -60_000]) {
+      equal(resolveStreamStallMs(bad), DEFAULT_STREAM_STALL_MS, `${String(bad)} must fall back to the ambient bound`);
+    }
+    equal(resolveStreamStallMs("Infinity" as any), DEFAULT_STREAM_STALL_MS, "the STRING 'Infinity' (what an env var would give) falls back");
+    equal(resolveStreamStallMs("" as any), DEFAULT_STREAM_STALL_MS, "empty string (Number(\"\") === 0) falls back");
+    equal(resolveStreamStallMs("abc" as any), DEFAULT_STREAM_STALL_MS, "non-numeric string (NaN) falls back");
+    equal(resolveStreamStallMs({} as any), DEFAULT_STREAM_STALL_MS, "a non-number object falls back");
+    equal(resolveStreamStallMs("600000" as any), 600_000, "a numeric string is a number → honoured");
+  });
+  // …and the fallback tracks the ENV, not the hard-coded default
+  withEnv({ TASK_STREAM_STALL_MS: "900000" }, () =>
+    equal(resolveStreamStallMs(Number.NaN), 900_000, "fail-closed falls back to the AMBIENT bound"));
+});
+
+test("#1030-B1: the override CHANGES THE VERDICT — the bound applied is the bound resolved", () => {
+  // Source pins prove the wiring; this proves the SEMANTICS. The state is the
+  // E-silence-1 shape (a tool that produced output, then went quiet) — the
+  // exact shape of all five measured #1030 wedges (pytest / repo-root grep).
+  const silentToolShape = (): HeartbeatState => {
+    const st = createHeartbeatState();
+    st.everSawWork = true;
+    st.turnActive = true;
+    st.toolsInFlight = 1;
+    st.toolAgeMaxMs = S + 60_000; // far BELOW the age backstop…
+    st.streamAgeMs = S + 1;       // …but no output for S: the wedge signal
+    st.toolUpdates = true;        // it HAD emitted, then stopped
+    st.lastMarkerAt = 500_000;
+    return st;
+  };
+  const decide = (st: HeartbeatState, bound: number) =>
+    heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, streamStallMs: bound }));
+
+  equal(decide(silentToolShape(), S).reason, "tool-silence", "fixture sanity: at the default bound this shape is a wedge");
+
+  const raised = resolveStreamStallMs(1_800_000);
+  equal(raised, 1_800_000, "the resolved override is the raised bound");
+  equal(
+    decide(silentToolShape(), raised).kill,
+    false,
+    "THE FIX: the same silent tool, under the raised bound, is NOT killed — a long QUIET test run survives",
+  );
+
+  // …and the raised bound is not INERT: past it the same clause fires again
+  const past = silentToolShape();
+  past.streamAgeMs = raised + 1;
+  const dPast = decide(past, raised);
+  equal(dPast.kill, true, "past the raised bound the child IS killed — the override moved the bound, it did not remove it");
+  equal(dPast.reason, "tool-silence", "the same clause, at the new bound");
+
+  // The age backstop and the hard cap are untouched by S (S only moves the
+  // SILENCE clauses). Raising S must never buy an unbounded child.
+  const aged = silentToolShape();
+  aged.toolAgeMaxMs = L + 1;
+  equal(decide(aged, raised).reason, "tool-stall", "the age backstop still owns a genuinely hung tool under a raised S");
+});
+
+test("#1030-B2: the inertness warning fires exactly AT the age backstop (warn, never clamp)", () => {
+  withEnv({ TASK_STREAM_STALL_MS: undefined, TASK_TOOL_STALL_MS: undefined, TASK_HARD_CAP_MS: undefined }, () => {
+    const backstop = getToolStallMs();
+    equal(
+      streamStallInertWarning(DEFAULT_STREAM_STALL_MS),
+      null,
+      "the shipped default path (1200 s << the 4 h backstop) is never noisy",
+    );
+    equal(streamStallInertWarning(backstop - 1), null, "one ms below the backstop the silence clauses are still reachable");
+    ok(streamStallInertWarning(backstop), "AT the backstop the silence clauses become structurally unreachable → warn");
+    const msg = streamStallInertWarning(backstop + 60_000) as string;
+    ok(msg, "above the backstop a warning is returned");
+    ok(msg.startsWith("[task]"), `carries the [task] prefix (got: ${msg.slice(0, 20)}…)`);
+    ok(msg.includes("#1030"), "names the issue");
+    ok(msg.includes(String(Math.round((backstop + 60_000) / 1000))), "names the RESOLVED bound the operator set");
+    ok(msg.includes(String(Math.round(backstop / 1000))), "names the backstop it collides with");
+  });
+});
+
+test("#1030-C1: the resolved bound is threaded to EVERY leg, and warned ONCE (source pin)", () => {
+  ok(
+    source.includes("export function resolveStreamStallMs(overrideMs?: number | null): number"),
+    "the resolver is exported (so this suite can pin its contract)",
+  );
+  ok(
+    source.includes("export function streamStallInertWarning(resolvedMs: number): string | null"),
+    "the inertness warning is exported",
+  );
+  ok(
+    source.includes("streamStallMs: streamStallMs ?? getStreamStallMs(),"),
+    "the SPAWN-side threshold honours the dispatch override (and falls back when absent)",
+  );
+  ok(
+    source.includes("const dispatchStreamStallMs = resolveStreamStallMs(params.stream_stall_ms);"),
+    "the bound is resolved ONCE per dispatch",
+  );
+  ok(
+    source.includes("if (streamStallWarning) console.error(streamStallWarning);"),
+    "the inertness warning is EMITTED (a returned-but-unprinted warning protects nobody)",
+  );
+  // Every spawn call site carries it — the #1071 cwd pattern: one resolved
+  // value feeds every consumer, so the bound applied cannot diverge from the
+  // bound reported. `params.cwd` appears in exactly the two spawn calls.
+  equal(
+    (source.match(/params\.cwd, dispatchStreamStallMs/g) ?? []).length,
+    2,
+    "BOTH the primary AND the provider-fallback leg pass the resolved bound",
+  );
+  ok(
+    !source.includes("params.cwd)"),
+    "no spawn call site omits the bound (an omitted leg would silently fall back to the env default)",
+  );
+  ok(/stream_stall_ms: Type\.Optional\(\s*Type\.Number\(/.test(source), "the schema exposes stream_stall_ms as a NUMBER");
+  ok(
+    source.includes("Overrides TASK_STREAM_STALL_MS"),
+    "the description names the env var it overrides (discoverability)",
+  );
+});
+
+test("#1030-C2: the task-child env is NON-INTERACTIVE for git (source pin)", () => {
+  // The measured root cause of the ONE genuinely-wedged #1030 child: a merge
+  // `git commit` with no -m/-F opened vim against a child with no TTY, emitted
+  // one screen of escapes, then 0 bytes for 1211 s until the bound killed it.
+  // A no-TTY child can never satisfy an interactive invoker, so the only
+  // correct behaviour is to fail closed. The runtime proof that these reach the
+  // real child process is in provider-failover.integration.test.ts.
+  ok(/^\s*GIT_EDITOR: "true",$/m.test(source), "GIT_EDITOR is the `true` no-op in the task-child env");
+  ok(/^\s*GIT_SEQUENCE_EDITOR: "true",$/m.test(source), "GIT_SEQUENCE_EDITOR is the `true` no-op (rebase -i)");
+  ok(/^\s*GIT_TERMINAL_PROMPT: "0",$/m.test(source), "GIT_TERMINAL_PROMPT=0 — a credential prompt must fail, not wait");
 });
 
 section("#318 network-down survival — heartbeatKillDecision suppression");
@@ -4560,8 +4736,11 @@ test("#1071: the target cwd is wired through spawn + repo probe + ledger row (so
 
 test("#1071: the task tool schema exposes `cwd` and threads it to every leg (source pin)", () => {
   ok(/cwd: Type\.Optional\(\s*Type\.String\(/.test(source), "schema exposes an optional cwd");
-  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd)"), "primary + failover-hop legs pass params.cwd");
-  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd)"), "the provider-fallback leg passes params.cwd");
+  // #1030 appended the dispatch's inactivity bound as the 8th argument, so
+  // these pins name the whole argument list (that is their point: the leg
+  // carries the target cwd — and now the bound resolved for the same dispatch).
+  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "primary + failover-hop legs pass params.cwd");
+  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "the provider-fallback leg passes params.cwd");
   ok(!/\{\s*\n\s*cwd: process\.cwd\(\),/.test(source), "no spawn options block pins the parent cwd (scoped to the block — a whole-file negative match is over-broad and its failure message cannot name a real spawn site)");
 });
 
