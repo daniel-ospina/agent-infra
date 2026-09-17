@@ -21,7 +21,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-discard-gate.mjs
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -718,6 +718,114 @@ async function partB() {
       blocked(await bash("git checkout -- \"$FILE\"", wt)), "was allowed");
     expectTrue("B10b: unresolvable invocation target (`cd $SUBDIR`) fails closed",
       blocked(await bash("cd $SUBDIR && git checkout -- clean.txt", wt)), "was allowed");
+
+    // ── B12 (#1139): M5's sanctioned-framework-script exemption ──
+    // `hub-worktree.sh`'s salvage path reverts the hub's tracked dirt with
+    // `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`. The pure extractor can only
+    // surface that as a `cat-file-revert` HINT whose pathspec is the SHELL LOOP
+    // VARIABLE `$rest`, so the unresolvable-pathspec rule fails CLOSED — on a
+    // provably CLEAN checkout, for the framework's own documented recovery
+    // helper. #1129 exempted this file from M4's content walk; M5 never asked,
+    // so the helper stayed blocked from a hub-rooted session (and its message
+    // claimed uncommitted work that did not exist).
+    const sanctionedRecovery = join(HERE, "..", "..", "scripts", "checkout-hygiene", "hub-worktree.sh");
+    expectTrue("B12-pre: the sanctioned recovery helper is where the anchor expects it",
+      readFileSync(sanctionedRecovery, "utf8").includes("hub-worktree.sh"), sanctionedRecovery);
+    execSync("git checkout -q -- dirty.txt && git clean -qfd", { cwd: hub, stdio: "ignore" });
+    const hubClean = execSync("git status --porcelain", { cwd: hub, encoding: "utf8" }).trim();
+    expect(`B12-pre2: the hub is CLEAN (so any block here cannot be about real WIP): ${JSON.stringify(hubClean)}`, hubClean, "");
+    // No args → usage + exit 2, so the run has no side effects on the fixture.
+    const sanctionedRun = await bash(`bash "${sanctionedRecovery}"`, hub);
+    expectTrue("B12a: #1139 — the sanctioned recovery helper is ALLOWED from a hub-rooted session (M5 exempts it, as M4 does)",
+      allowed(sanctionedRun), `reason=${JSON.stringify(sanctionedRun?.reason ?? "").slice(0, 300)}`);
+
+    // The SAME content at the SAME relpath in a DIFFERENT checkout must still
+    // block: the anchor is the guard's own checkout, never a relpath match and
+    // never the invoking cwd. Driven from the hermetic WORKTREE so M4 (which
+    // early-returns for worktree sessions) cannot be the gate that fires — the
+    // block has to be M5's.
+    mkdirSync(join(hub, "scripts", "checkout-hygiene"), { recursive: true });
+    const copyPath = join(hub, "scripts", "checkout-hygiene", "hub-worktree.sh");
+    write(copyPath, readFileSync(sanctionedRecovery, "utf8"));
+    const copyRun = await bash(`bash "${copyPath}"`, wt);
+    expectTrue("B12b: #1139 — the same content at the same relpath in another checkout is STILL BLOCKED (path-keyed, not content-keyed)",
+      blocked(copyRun) && /Working-tree discard blocked/.test(copyRun?.reason ?? "") &&
+      /not statically resolvable/.test(copyRun?.reason ?? ""),
+      `reason=${JSON.stringify(copyRun?.reason ?? "").slice(0, 300)}`);
+
+    // The second half of #1139: the fail-closed arm above must not tell the
+    // operator the checkout is dirty (it provably is not — B12-pre2) and must
+    // not hand them the bypass hatch as the remedy for a target it could not
+    // even locate.
+    const unverifiableMsg = copyRun?.reason ?? "";
+    expectTrue("B12c: the fail-closed message does NOT claim uncommitted changes exist",
+      /NOT a claim that the checkout is dirty/.test(unverifiableMsg) &&
+      !/carries\s+uncommitted changes/.test(unverifiableMsg) &&
+      /target not statically resolvable/.test(unverifiableMsg),
+      `reason=${JSON.stringify(unverifiableMsg).slice(0, 320)}`);
+    expectTrue("B12c2: it names the real reason (target resolution) and does NOT offer the AGENT_ALLOW_MAIN_EDITS hatch as its remedy",
+      /not its remedy/.test(unverifiableMsg) &&
+      !/Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1/.test(unverifiableMsg),
+      `reason=${JSON.stringify(unverifiableMsg).slice(0, 320)}`);
+
+    // Negative control — the correction is not a blanket deletion of the claim:
+    // the arm that DID read a dirty scope still says so, and still names the
+    // hatch (that arm's legitimate remedy).
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const dirtyMsg = (await bash("git checkout -- dirty.txt", wt))?.reason ?? "";
+    expectTrue("B12d: control — the DIRTY arm still claims uncommitted changes and still names the hatch",
+      /carries uncommitted changes to tracked files/.test(dirtyMsg) &&
+      /Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1/.test(dirtyMsg) &&
+      !/NOT a claim that the checkout is dirty/.test(dirtyMsg),
+      `reason=${JSON.stringify(dirtyMsg).slice(0, 320)}`);
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+
+    // SET-scoped, not command-scoped: the exemption drops the sanctioned
+    // SCRIPT's harvested set; a direct discard sharing the same command is
+    // still gated by the command's own argv set (`script: null`).
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const compound = await bash(`bash "${sanctionedRecovery}" && git checkout -- dirty.txt`, wt);
+    expectTrue("B12e: the exemption is SET-scoped — a direct discard in the same command is still BLOCKED",
+      blocked(compound) && /it would destroy uncommitted work/.test(compound?.reason ?? "") &&
+      /dirty\.txt/.test(compound?.reason ?? ""),
+      `reason=${JSON.stringify(compound?.reason ?? "").slice(0, 300)}`);
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+
+    // Realpath, not cwd: the framework's own copy is exempt however the session
+    // addresses it — and a worktree-local COPY at the same relpath is a
+    // different realpath, so it is still gated (B12b's geometry). This is the
+    // documented residual: a linked-worktree copy is agent-WRITABLE, so it must
+    // not be exempt; sessions that want the helper from a worktree call the
+    // framework checkout's own path.
+    const fromWt = await bash(`bash "${sanctionedRecovery}"`, wt);
+    expectTrue("B12f: the framework's own copy is exempt by REALPATH from any invoking cwd",
+      allowed(fromWt), `reason=${JSON.stringify(fromWt?.reason ?? "").slice(0, 300)}`);
+
+    // The exemption can only ever drop discards harvested FROM the sanctioned
+    // file's own bytes — a set's `script` is always the file its `discs` were
+    // read from. Naming the sanctioned path from elsewhere therefore buys
+    // nothing: a discard riding along in the SAME payload is still gated.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const laundered = await bash(
+      `bash -c 'source "${sanctionedRecovery}"; git checkout -- dirty.txt'`, wt);
+    expectTrue("B12g: naming the sanctioned path inside a `-c` payload does NOT launder a discard riding along in it",
+      blocked(laundered) && /it would destroy uncommitted work/.test(laundered?.reason ?? ""),
+      `reason=${JSON.stringify(laundered?.reason ?? "").slice(0, 300)}`);
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+
+    // Second hop: a WRAPPER that sources the sanctioned helper does not become
+    // sanctioned — sets are per-FILE, so the wrapper's own discards stay in the
+    // wrapper's set (which is not exempt).
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const wrapper = join(wt, "wrapper-1139.sh");
+    write(wrapper, `#!/bin/sh\n. "${sanctionedRecovery}" 2>/dev/null || true\ngit checkout -- dirty.txt\n`);
+    const wrapped = await bash(`bash "${wrapper}"`, wt);
+    expectTrue("B12h: a wrapper that SOURCES the sanctioned helper does NOT inherit the exemption",
+      blocked(wrapped) && /it would destroy uncommitted work/.test(wrapped?.reason ?? ""),
+      `reason=${JSON.stringify(wrapped?.reason ?? "").slice(0, 300)}`);
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    rmSync(wrapper, { force: true });
+    rmSync(copyPath, { force: true });
 
     // ── B11: escape hatches unchanged ──
     write(join(wt, "dirty.txt"), "MUTANT\n");

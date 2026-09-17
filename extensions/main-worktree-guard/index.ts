@@ -1291,23 +1291,52 @@ function _worktreeDiscardBlockReason(
   unverifiable: string | null,
 ): string {
   const target = d.pathspecs.length > 0 ? d.pathspecs.slice(0, 5).join(", ") : "(the whole working tree)";
+  // #1139 — the two arms must not read alike. The `unverifiable` arm never
+  // established that ANYTHING is dirty: the target could not be resolved (or
+  // its status could not be read), so the guard failed closed on ignorance.
+  // The old single wording asserted "This checkout carries uncommitted changes
+  // to tracked files that this command would revert" in BOTH arms, which on a
+  // provably clean checkout (`git status --porcelain` empty) sent the reader
+  // hunting a phantom dirty tree — and offered the AGENT_ALLOW_MAIN_EDITS=1
+  // bypass hatch as the remedy for a discard the guard could not even locate.
   return [
-    `⛔ Working-tree discard blocked — it would destroy uncommitted work (#709).`,
+    unverifiable
+      ? `⛔ Working-tree discard blocked — target not statically resolvable, failing closed (#709).`
+      : `⛔ Working-tree discard blocked — it would destroy uncommitted work (#709).`,
     `   Form: ${d.form}   Target: ${target}`,
     `   Checkout: ${probeCwd}`,
     ...(unverifiable ? [`   ⚠️ ${unverifiable} — failing closed.`] : []),
     `   The guard gates the EFFECT, not the verb: \`git checkout -- <path>\``,
     `   classifies as a plain path restore, so it used to run ungated in a`,
     `   linked worktree (where pi -p mutation-test fixers run) and in a CLEAN`,
-    `   hub — the 2026-09-10 leaked-mutant path. This checkout carries`,
-    `   uncommitted changes to tracked files that this command would revert.`,
-    `   → Probe a mutation on a COPY, never in place (#664):`,
-    `       cp <file> /tmp/probe-<file>   # mutate + test the copy, then rm it`,
-    `       # or: git worktree add /tmp/probe <ref>, test inside it`,
-    `   → Inspect first: git status --porcelain; git diff <path>.`,
-    `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
-    `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
-    `     marker — both bypass this gate unchanged.`,
+    `   hub — the 2026-09-10 leaked-mutant path.`,
+    ...(unverifiable
+      ? [
+          `   ⚠️ This block is NOT a claim that the checkout is dirty: the guard`,
+          `   could not resolve the target (see the reason above), so it never`,
+          `   compared this discard against real uncommitted work. Check first:`,
+          `       git status --porcelain`,
+          `   → Make the target statically resolvable — a literal path / literal`,
+          `     \`cd\` (no \`$VAR\`, no placeholder), or run the operation from the`,
+          `     checkout it targets.`,
+          `   → The sanctioned recovery surface, if that is what you wanted:`,
+          `       bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+          `   → This arm is a TARGET-resolution failure, not a dirty-tree one, so`,
+          `     AGENT_ALLOW_MAIN_EDITS=1 is not its remedy: the hatch suppresses`,
+          `     the whole gate rather than resolving the target.`,
+        ]
+      : [
+          `   This checkout carries uncommitted changes to tracked files that`,
+          `   this command would revert (\`git status --porcelain\` was read for`,
+          `   this scope).`,
+          `   → Probe a mutation on a COPY, never in place (#664):`,
+          `       cp <file> /tmp/probe-<file>   # mutate + test the copy, then rm it`,
+          `       # or: git worktree add /tmp/probe <ref>, test inside it`,
+          `   → Inspect first: git status --porcelain; git diff <path>.`,
+          `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
+          `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
+          `     marker — both bypass this gate unchanged.`,
+        ]),
   ].join("\n");
 }
 
@@ -1593,9 +1622,67 @@ function _worktreeDiscardBlock(command: string): string | null {
     }
   }
 
-  if (sets.every((s) => s.discs.length === 0)) return null;
+  // #1139 — M5's own sanctioned-script exemption, the M5 twin of #1129's M4
+  // exemption (`_backdoorBlock`). SAME list, SAME anchor: `SANCTIONED_SCRIPT_RELPATHS`
+  // resolved under the running guard's OWN checkout, realpath-keyed on both
+  // sides. Without it M4 and M5 disagree about the framework's recovery
+  // helper — M4 exempts `hub-worktree.sh` while M5 blocks it anyway, which is
+  // what made the file's own comment ("Recovery scripts … keep working")
+  // false.
+  //
+  // The reported block: the salvage path reverts the hub's tracked dirt with
+  // `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`. The pure extractor can only
+  // surface that as a `cat-file-revert` HINT whose pathspec is the SHELL LOOP
+  // VARIABLE `$rest`, and the unresolvable-pathspec rule below then fails
+  // closed — on a provably clean checkout, for a script whose every discard is
+  // preceded by its own capture+push (and which refuses to clean the hub when
+  // that push fails).
+  //
+  // SCOPE — the SET is dropped, never the command: `sets[0]` (the command's own
+  // argv) always carries `script: null` and is always gated, and a script
+  // reached through a second hop keeps its OWN set, so `bash /tmp/wrapper.sh`
+  // that sources the sanctioned file is still gated on everything the wrapper
+  // itself says. SAFETY — this is why a path-keyed exemption is safe HERE: a
+  // set's `script` is always the file the set's discards were READ from (the
+  // seed walk stores `realpathSync(resolve(execCwd, p))`'s content with `p`;
+  // every other push site reads the file it stores), so the exemption can only
+  // ever drop discards that came from the sanctioned file's OWN bytes. Naming
+  // the sanctioned path from elsewhere buys nothing — the content is still
+  // that file's, and a wrapper's own discards stay in the wrapper's set.
+  // KEYING — a copy at the same relpath in another checkout is NOT
+  // exempt (the anchor is the guard's own checkout, not a repo fingerprint and
+  // not the invoking cwd); the hub's own `scripts/` spelling still matches when
+  // a session addresses it through a symlink, because both sides are realpath'd.
+  // A wrong anchor here is fail-OPEN on other sessions' uncommitted work, which
+  // is why this reuses the hardened #1129 helper instead of re-deriving one.
+  const gatedSets = sets.filter((s) => {
+    if (s.script === null) return true; // the command's own argv is never exempt
+    let rel: string | null = null;
+    // Fail closed on a probe failure: keep the set gated.
+    try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script)); } catch { rel = null; }
+    if (rel === null) return true;
+    // Deliberate gate relaxation → audited (best-effort, never blocks), with
+    // the REALPATH that matched so an exemption taken through a file at the
+    // same relpath under another root is distinguishable in the log
+    // (#1129 code-review P2 — the same row shape as `m4_script_exemption`).
+    try {
+      appendJsonl({
+        event: "m5_script_exemption",
+        extension: "main-worktree-guard",
+        script: rel,
+        script_realpath: realpathSync(resolve(execCwd, s.script)),
+        framework_root: _frameworkRoot,
+        session_cwd: sessionCwd,
+        command: command.slice(0, 300),
+        session_id: _currentSessionId(),
+      });
+    } catch { /* audit is best-effort — never blocks */ }
+    return false;
+  });
 
-  for (const set of sets) {
+  if (gatedSets.every((s) => s.discs.length === 0)) return null;
+
+  for (const set of gatedSets) {
     // The `cat-file-revert` form (`git show HEAD:x > x`) needs the source's
     // bash WRITE targets (pure string walk) to find where the content lands.
     let writeTargets: string[] = [];

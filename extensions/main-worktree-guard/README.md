@@ -146,6 +146,43 @@ every read-only command. Unresolvable targets (`$VAR` pathspec, unresolvable
 `cd` chain) fail CLOSED; an unreadable `git status` fails open (never
 false-block), matching the repo's write-gate convention.
 
+**#1139 — the framework's own sanctioned scripts are exempt from the M5 walk,
+and the fail-closed message no longer misattributes the cause.** #1129 exempted
+`SANCTIONED_SCRIPT_RELPATHS` from M4's content walk *only*; M5 never consulted
+the list, so `checkout-hygiene/hub-worktree.sh` — the recovery helper every
+guard message recommends — stayed blocked from a hub-rooted session
+(reproduced 3/3 on a provably clean checkout). The cause is structural: the
+script's salvage path reverts the hub's tracked dirt with
+`git show "HEAD:$rest" > "$MAIN_REPO/$rest"`, and the pure extractor can only
+surface that as a `cat-file-revert` **hint** whose pathspec is the shell LOOP
+VARIABLE `$rest` — which the unresolvable-pathspec rule fails closed on, before
+the write-target intersection that is the only thing giving the hint meaning.
+The exemption is applied to the harvested **set**, never to the command:
+`sets[0]` (the command's own argv) always carries `script: null` and is always
+gated, and a script reached through a second hop keeps its own set — so
+`bash …/hub-worktree.sh && git checkout -- <dirty>` is still blocked. It reuses
+`_sanctionedScriptExemption` (`SANCTIONED_SCRIPT_RELPATHS` realpath'd under the
+guard's own checkout — one list, one anchor) and writes an
+`m5_script_exemption` audit row. **A file at the same relpath in another
+checkout — a linked worktree's own `scripts/` copy included — is a different
+realpath and stays gated**: a linked-worktree copy is agent-WRITABLE, so
+exempting it would hand an unhatched `pi -p` fixer a silent way to discard the
+very mutant M5 exists to protect. Sessions that need the helper from a linked
+worktree address the framework checkout's own path (the anchor is the file's
+realpath, not the invoking cwd).
+
+The **message** is split by arm. The `unverifiable` arm (unresolvable
+pathspec / unresolvable target / unreadable status) never established that
+anything is dirty, so it now says so (`⚠️ This block is NOT a claim that the
+checkout is dirty`), points at `git status --porcelain`, and explicitly does
+**not** offer the `AGENT_ALLOW_MAIN_EDITS=1` hatch as the remedy — the hatch
+suppresses the gate rather than resolving the target. The old wording asserted
+"This checkout carries uncommitted changes to tracked files that this command
+would revert" in *both* arms and printed the hatch under it, which on a clean
+checkout sent the reader hunting a phantom dirty tree. The dirty arm
+(`discardDestroysWip` returned true — the status WAS read) keeps both the claim
+and the hatch.
+
 **Escape hatches are unchanged**: M5 sits after the env-hatch / TTL-marker
 return, so `AGENT_ALLOW_MAIN_EDITS=1` and the `~/.pi/agent/.allow-main-edits`
 marker bypass it exactly as they bypass M2/M3. Task children are unhatched by
@@ -982,6 +1019,9 @@ shape, and a row naming only the listed relpath cannot distinguish a legitimate
 exemption from one taken through a file at the same relpath under another root.
 Pinned by three behavioural tests (sanctioned script runs; the SAME content at
 another path still blocks; a destructive framework helper still blocks).
+**#1139 completes the pair:** #1129 exempted this list from M4's content walk
+only, so `hub-worktree.sh` stayed blocked by M5 — the *other* walk — see the
+M5 section below.
 
 Deliberately still blocked (documented residuals): a git op inside a quoted
 heredoc PIPED/ fed to a shell (`cat <<'EOF' | sh`), an existing-file or
@@ -1032,7 +1072,7 @@ marker fixes **guard-blocked** sessions only.
 |---|---|---|
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
-| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), the #1139 sanctioned-script exemption (the recovery helper allowed from a hub-rooted session; the same content at the same relpath in another checkout still blocked; set-scoped so a direct discard in the same command is still blocked; the unclean-vs-unresolvable message split), and both escape hatches |
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)

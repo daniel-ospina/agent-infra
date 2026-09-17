@@ -4952,6 +4952,39 @@ try {
   expectBool("#1129: the block message names the realpath actually read + the verdict source",
     pinSrc.includes("resolves to:") && pinSrc.includes("verdict source:"), true);
 
+  // (b2) THE SAME EXEMPTION, APPLIED TO M5 (#1139). #1129 exempted the
+  // framework's scripts from M4's content walk only; M5's working-tree-discard
+  // walk never asked, so `hub-worktree.sh` stayed blocked from a hub-rooted
+  // session — its salvage path reverts the hub's dirt with
+  // `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`, whose SHELL LOOP VARIABLE
+  // pathspec the extractor can only surface as an unresolvable
+  // `cat-file-revert` hint, which fails closed. Source pins: ONE list and ONE
+  // anchor helper (a second, drift-prone copy is the regression shape), the
+  // exemption scoped to the harvested SET (never to the command), and the
+  // message correction.
+  expectBool("#1139: M5 consults the SAME hardened exempt helper — one definition, one anchor, one list",
+    pinSrc.includes("_sanctionedScriptExemption(resolve(execCwd, s.script))") &&
+    (pinSrc.match(/function _sanctionedScriptExemption\(/g) ?? []).length === 1 &&
+    (pinSrc.match(/const SANCTIONED_SCRIPT_RELPATHS = \[/g) ?? []).length === 1, true);
+  expectBool("#1139: the M5 exemption drops the harvested SET, never the command's argv",
+    pinSrc.includes("const gatedSets = sets.filter((s) => {") &&
+    pinSrc.includes("if (s.script === null) return true;") &&
+    pinSrc.includes("for (const set of gatedSets) {") &&
+    pinSrc.includes("gatedSets.every((s) => s.discs.length === 0)") &&
+    !pinSrc.includes("for (const set of sets) {"), true);
+  expectBool("#1139: the M5 exemption is audit-logged (deliberate relaxation is observable)",
+    pinSrc.includes("m5_script_exemption"), true);
+  expectBool("#1139: the fail-closed arm stopped claiming a dirty tree",
+    pinSrc.includes("target not statically resolvable, failing closed (#709)") &&
+    pinSrc.includes("NOT a claim that the checkout is dirty") &&
+    // The misattribution itself: this sentence was printed in BOTH arms,
+    // unconditionally, so a clean checkout was told it had uncommitted work.
+    !pinSrc.includes("uncommitted changes to tracked files that this command would revert."), true);
+  expectBool("#1139: the fail-closed arm stopped offering the bypass hatch as its remedy",
+    pinSrc.includes("not its remedy") &&
+    // The dirty arm (which really did read a dirty scope) KEEPS the hatch.
+    pinSrc.includes("Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1"), true);
+
   // (c) RESIDUAL PIN — the text-shape false positives are NOT fixed by the
   // exemption; they are contained. A lone markdown fence is enough to gate a
   // file `block`, which is the spelling-not-behaviour shape the follow-up must
