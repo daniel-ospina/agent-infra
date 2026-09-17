@@ -254,6 +254,24 @@ jobs:
           # as reclaimable while the branch ref survives. Hermetic: temp HOME,
           # temp state dir, no real worktree touched, no network.
           bash scripts/pi-reap-worktrees.test.sh || errors=$((errors+1))
+          # #1142 — orphan reaper: a leaked test child re-parented to pid 1 with
+          # a DELETED cwd and still advancing CPU. Hermetic (fake PS/KILL/LSOF
+          # sequence shims + a throwaway state dir), so every gate's fail path
+          # is driven to PRESERVE: a ps/lsof that fails, returns empty, or is
+          # MISSING is a FAILED PROBE, not "nothing to reap"; cwd-unreadable
+          # preserves while cwd-deleted reaps; a signal it cannot re-verify
+          # counts as STILL ALIVE; dry-run sends nothing. Includes the
+          # regression that integer-second ps time truncated a sustained
+          # 10%-of-a-core leak to "idle" (the exact class the tool exists for).
+          bash scripts/pi-reap-orphans.test.sh || errors=$((errors+1))
+          # #1143 — scratch reaper (/private/tmp + $TMPDIR): bounded find, ONE
+          # lsof liveness pass, then system-owned/advisory-lock/self/live-held/
+          # mount-point gates before anything is reclaimable. Hermetic: every
+          # root, shim and state dir is a throwaway, so the suite proves each
+          # guard PRESERVES, that an unevaluable liveness probe aborts without
+          # reclaiming, that an unenumerable root is reported DEGRADED, and that
+          # a dry-run removes nothing and signals nothing.
+          bash scripts/pi-reap-scratch.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
           # #930 — safe-admin-merge rail: the ONE failing-set parser
           # (scripts/ci-failure-set.sh) plus the chokepoint that consumes it

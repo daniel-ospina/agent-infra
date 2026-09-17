@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- pi-reap-orphans (#1142): hourly reap of leaked TEST children that were
+         re-parented to launchd (ppid 1) with a DELETED cwd and are still
+         burning CPU. The incident: one `node *.test.js` child spun at ~100% of
+         a core for 4h32m (135 CPU-min, ~27% of host CPU) with
+         cwd=/private/tmp/execver already removed — invisible, no orchestrator
+         waiting on it, exited cleanly on SIGTERM.
+         The detector requires ALL of: ppid=1 in two independent ps snapshots,
+         a cwd that resolves to a DELETED directory (never "unreadable" — that
+         is a different state and PRESERVES), CPU-time advancing by at least
+         REAP_ORPHAN_MIN_CPU_CENTISECONDS across the sample window, our uid, and
+         an elapsed floor. It signals SIGTERM, waits a grace period, then
+         SIGKILL, and treats an unevaluable post-signal probe as STILL ALIVE
+         (never a false "REAPED").
+         Scoped to SCRATCH cwd roots by default (/tmp, /private/tmp, $TMPDIR,
+         /private/var/folders) because launchd USER AGENTS are ppid=1 by
+         construction — widening the cwd scope to any directory would put
+         every long-running agent in scope, so this job must not pass the
+         widen flag.
+         ⚠️ SHIPS DISARMED (REAP_ORPHAN_DRY_RUN=1) — #1142 acceptance: "a reaper
+         exists, is scheduled, and logs what it kills; dry-run by default".
+         ARMING IS A SEPARATE, MANUAL, OWNED STEP: the owner is the
+         organisation-design-team operator on call for agent-infra, and arming
+         requires a dated trigger. Do NOT flip this to 0 in a routine template
+         bump — an unowned always-on killer is exactly what the reaper policy
+         forbids. Nothing is lost while disarmed: every pass reports the
+         reapable set to ~/.pi/agent/state/pi-reap-orphans.log.
+         Canonical script: agent-infra/scripts/pi-reap-orphans.sh
+         (COPIED to ~/.pi/agent/scripts/ by pi-bootstrap/setup.sh scripts
+         farm; #427: launchd cannot read ~/Documents repos under macOS TCC).
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
+    <key>Label</key>
+    <string>com.eldato.pi-reap-orphans</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/pi-reap-orphans.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>REAP_ORPHAN_DRY_RUN</key>
+        <string>1</string>
+    </dict>
+    <!-- Hourly: the sample window is 3s and the leak class burns a core
+         continuously, so an hour of blindness costs at most ~60 CPU-min. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+</dict>
+</plist>
