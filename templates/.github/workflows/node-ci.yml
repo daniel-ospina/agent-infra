@@ -20,9 +20,28 @@ name: Node.js CI
 #     default:true is load-bearing — boolean workflow_call inputs default
 #     to FALSE when unset, which would silently disable the #254 gate.
 #   * typecheck/lint self-skip on missing config (no force-skip inputs —
-#     test-only consumers with configs use test-command).
+#     test-only consumers with configs use test-command). The no-config
+#     branch is emitted as a ::warning:: annotation so "linted" and
+#     "skipped" are distinguishable in the checks UI (#1128).
 #   * Skip is observable via the callee run log (job-level if: skip lists
 #     the job as skipped).
+#
+# #1128 — lint/typecheck honour the CALLER's package directory:
+#   * both jobs ran at the repo root (no working-directory), so for a caller
+#     whose package lives in a subdirectory the `[ -f eslint.config.js ]`
+#     guard was false, the job printed "No ESLint config found — skipping
+#     lint" and PASSED. A green required check that certifies nothing.
+#   * lint now (a) runs in inputs.working-directory, (b) installs the
+#     package's own deps when it carries a package-lock.json — `npx eslint`
+#     alone resolves neither the config's `globals`/plugin imports nor its
+#     parser, so a nested package failed with ERR_MODULE_NOT_FOUND instead
+#     of linting, and (c) annotates the skip.
+#   * the input defaults to '.' (repo root); a caller that does not set it is
+#     in the same directory as before. The only behavioural gain for such a
+#     caller is the dependency install below, and only when it already has a
+#     lint/tsconfig file plus a package-lock.json in that directory.
+#   * the config-probe list covers every flat-config filename ESLint accepts
+#     (js/mjs/cjs/ts/mts/cts), not just the two original spellings.
 
 on:
   workflow_call:
@@ -33,7 +52,7 @@ on:
       working-directory:
         type: string
         default: '.'
-        description: Directory for the unit-test job's steps.
+        description: Package directory for the typecheck, lint and unit-test jobs (#1128). Default '.' = repo root.
       test-glob:
         type: string
         default: ''
@@ -97,11 +116,23 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
       - name: TypeScript type check
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          # Caller input is passed through the environment, never interpolated
+          # into the shell string (same discipline as the unit-test job).
+          TSC_DIR: ${{ inputs.working-directory }}
         run: |
           if [ -f tsconfig.json ]; then
+            # #1128 — same bare-checkout resolution gap as the lint job: `npx
+            # tsc` alone cannot resolve the package's own `typescript` or
+            # `@types/*` from the package tree, so the run dies with a module
+            # error instead of type-checking.
+            if [ -f package-lock.json ]; then
+              npm ci --no-audit --no-fund
+            fi
             npx tsc --noEmit
           else
-            echo "⚠️  No tsconfig.json — skipping typecheck"
+            echo "::warning::No tsconfig.json in $TSC_DIR — typecheck SKIPPED (#1128)"
           fi
 
   lint:
@@ -112,11 +143,29 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
       - name: ESLint
+        # #1128 — the caller's package dir, not the repo root. Without this a
+        # nested package found no config, printed the skip below and passed.
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          LINT_DIR: ${{ inputs.working-directory }}
         run: |
-          if [ -f eslint.config.mjs ] || [ -f eslint.config.js ] || [ -f .eslintrc.js ] || [ -f .eslintrc.json ]; then
+          if [ -f eslint.config.mjs ] || [ -f eslint.config.js ] || [ -f eslint.config.cjs ] || \
+             [ -f eslint.config.ts ] || [ -f eslint.config.mts ] || [ -f eslint.config.cts ] || \
+             [ -f .eslintrc.js ] || [ -f .eslintrc.json ]; then
+            # #1128 — a flat config imports real packages (`globals`,
+            # `eslint-plugin-*`) and eslint itself is a devDependency. `npx
+            # eslint .` on a bare checkout installs eslint from the registry
+            # but resolves NEITHER of those from the package tree, so the run
+            # died with ERR_MODULE_NOT_FOUND instead of linting. Install the
+            # package's own deps first when it carries a lockfile. This only
+            # runs in the config-found branch: a caller with no config is
+            # untouched.
+            if [ -f package-lock.json ]; then
+              npm ci --no-audit --no-fund
+            fi
             npx eslint .
           else
-            echo "⚠️  No ESLint config found — skipping lint"
+            echo "::warning::No ESLint config in $LINT_DIR — lint SKIPPED, this job certifies nothing (#1128)"
           fi
 
   unit-test:
