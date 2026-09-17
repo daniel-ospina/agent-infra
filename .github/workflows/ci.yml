@@ -265,6 +265,22 @@ jobs:
         # it. The drift-pins that stop the two extensions re-declaring their own
         # copies live in their SDK-bearing index.test.ts (post-merge glob).
         run: npx tsx extensions/shared/git-command-parse.test.ts
+      - name: Load-scale doc↔code contract (#1073, zero-dep)
+        # #1073 — docs/ops/load-policy.md once named two watchdog scale knobs
+        # (`TASK_LOAD_SCALE_START` / `_MAX`) that no code read: an operator set
+        # one and got nothing. The root cause was a rebase that merged one #209
+        # implementation's code with the other's doc, and NOTHING compared a
+        # documented env var against an actual reader. This suite is that gate:
+        # (a) every env var the doc names must have a non-test reader
+        # (or be a declared constant), (b) §6's band sentence is parsed and must
+        # equal the code's literals, (c) the two keep-in-sync copies
+        # (`loadScaledBound` / `loadScaledTimeoutMs`) must stay byte-identical
+        # and must read exactly `TASK_LOAD_SCALE_OFF`. Zero-dep (`node:*` only),
+        # so it MUST run in THIS job — the job that performs no `npm ci`.
+        # VISIBLE, not merge-blocking (`pipeline-compliance` is the only required
+        # check, #646); the BLOCKING backstop is the post-merge ci-main.yml
+        # `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/load-scale-contract.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets

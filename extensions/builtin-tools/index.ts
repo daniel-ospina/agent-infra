@@ -1655,6 +1655,20 @@ export function getFirstMessageMs(): number {
   return Math.max(60_000, Number(process.env.TASK_FIRST_MESSAGE_MS) || DEFAULT_FIRST_MESSAGE_MS);
 }
 
+/** Tier-1 first-output bound (#152) — the retry trigger for a sub-agent that
+ * produced NO output at all. Deliberately NOT load-scaled (#209): scaling it
+ * delays hung-spawn detection, and spawn retry is cheap and stateless.
+ * Env-overridable via TASK_FIRST_OUTPUT_TIMEOUT_MS, floored at 60s, and
+ * fail-closed on a non-finite override (`Number("1e400")` is `Infinity` and
+ * would otherwise disarm the detector — the #783 §6.6 finiteness lesson). A
+ * getter for this was specified by the #209 plan and dropped in the rebase that
+ * merged the implementation, leaving the doc naming an env var nothing read
+ * (#1073); restored here. An unset env is byte-identical to the old constant. */
+export function getFirstOutputTimeoutMs(): number {
+  const n = Number(process.env.TASK_FIRST_OUTPUT_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? Math.max(60_000, n) : 60_000;
+}
+
 /** Opt-in total dispatch cap (#176 code-review): honest markers exempt working
  * agents from every per-clause bound, so an adversarial/pathological loop
  * (drip-streamed tokens, endless cheap tool calls) is otherwise unbounded.
@@ -2838,7 +2852,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // same two values. Hoisted so the cut-gap reachability warning and the
     // backstop timer read the identical number.
     const freshWindowMs = Math.max(2 * HEARTBEAT_TIMEOUT_MS, 2 * getHeartbeatIntervalMs());
-    const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
+    // #1073: env-overridable (TASK_FIRST_OUTPUT_TIMEOUT_MS, floored at 60s,
+    // fail-closed on a non-finite value) — read once per dispatch, like every
+    // other bound here; the getter's default is the 60s this used to hardcode.
+    const FIRST_OUTPUT_TIMEOUT_MS = getFirstOutputTimeoutMs();
     let hasOutput = false;
     // #783 Task 2: repo state is probed ONCE per dispatch (async, off the 10s
     // heartbeat) and cached here. The cap/cut/heartbeat/backstop payloads read
