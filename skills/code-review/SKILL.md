@@ -478,18 +478,23 @@ ISOLATED CHECKOUTS — never copy the repo. If your review needs a checkout othe
 than the one you are in (e.g. to run a check or probe the PR branch), get it with
     bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> [--paths <p1,p2> | --full] -- <cmd...>
 `run` uses a git worktree (object store SHARED — no second .git) and REMOVES it on
-EXIT/INT/TERM/HUP, so a crashed probe leaves nothing behind. `--paths` is a sparse
-checkout (a few KB) — prefer it whenever you only read some paths.
-BANNED for scratch checkouts: `git clone`, `cp -R`, `cp -r`, `rsync` of the repo,
-`git archive | tar -x` into a temp dir. One measured review loop left 13 copies of
-~126 MB each in /private/tmp and drove ~2.4M files of I/O per cycle; the debris
-helped take host load to 42.9. If you create a worktree by hand, the trap is
-mandatory and MUST re-raise the status (a trap that does not `exit` swallows the
-signal and keeps running):
-`trap 'rc=$?; git worktree remove --force "${D:-/nonexistent}" 2>/dev/null; git worktree prune 2>/dev/null; exit $rc' EXIT`,
-with `trap 'exit 130' INT` and `trap 'exit 143' TERM`.
+EXIT/INT/TERM/HUP (SIGKILLing a TERM-ignoring child after a bounded grace), so a
+crashed probe leaves nothing behind. `--paths` is a sparse checkout (a few KB) —
+prefer it whenever you only read some paths. `--paths` is literal: absolute
+paths, `.`/`..`, and globs are refused, and an absent path fails rather than
+yielding an empty checkout.
+BANNED for scratch checkouts: `git clone`, `cp -R`, `cp -r`, `cp -a`, `rsync` of
+the repo, `git archive | tar -x` into a temp dir. One measured review loop left 13
+copies of ~126 MB each in /private/tmp and drove ~2.4M files of I/O per cycle; the
+debris helped take host load to 42.9. If you create a worktree by hand, the trap is
+mandatory and MUST re-raise the status and name the repo (a trap that does not
+`exit` swallows the signal and keeps running; one without `-C` silently fails once
+the probe has changed cwd):
+`REPO=<repo>; D="$REPO/.worktrees/scratch-$$"; git -C "$REPO" worktree add --detach "$D" <ref>; trap 'rc=$?; git -C "$REPO" worktree remove --force "${D:-/nonexistent}" 2>/dev/null; git -C "$REPO" worktree prune 2>/dev/null; exit $rc' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM`.
 Before reporting done: `bash scripts/scratch-worktree.sh list` must not show a
-scratch worktree you did not intend to keep.
+scratch worktree of YOURS. Clean only your own path (`scratch-worktree.sh clean
+<path>`) — NEVER `clean --all` while sibling sessions are running; that sweeps
+their in-flight scratch worktrees.
 ```
 
 **Agent #1 — Guidance Compliance** (merged CLAUDE.md + code comments):

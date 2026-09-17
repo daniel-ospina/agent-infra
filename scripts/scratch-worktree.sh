@@ -42,8 +42,9 @@
 #   --ref REF       ref/sha/branch to check out (default: HEAD)
 #   --paths a,b,c   SPARSE checkout of exactly these repo-relative paths (the
 #                   < 5 MB mode — prefer it for probes). Literal paths, not
-#                   patterns; every listed path MUST exist at REF or the call
-#                   fails (never a silently empty checkout).
+#                   patterns; absolute paths and '.'/'..' components are
+#                   refused, and every listed path MUST exist in REF's tree or
+#                   the call fails (never a silently empty checkout).
 #   --full          full checkout of the tracked tree (default when neither
 #                   --paths nor --full is given)
 #   --root DIR      scratch root (default: ${SCRATCH_WORKTREE_ROOT:-/tmp})
@@ -51,12 +52,16 @@
 #   --help          this text
 #
 # Exit codes: 0 ok; 2 usage; otherwise the wrapped command's exit code (`run`).
+# Env: SCRATCH_WORKTREE_ROOT (scratch root) and SCRATCH_WORKTREE_KILL_GRACE
+# (seconds before SIGKILL, default 5).
 #
 # GUARD NOTE. `extensions/main-worktree-guard` gates a script's git content when
-# the SESSION is rooted in the shared main checkout (#1484). `run` and `list` are
-# permitted there; `create`/`clean` are refused from a hub-rooted session and
-# work from a worktree-rooted session or a terminal. The mandated interface —
-# `run` — therefore works everywhere, and `list` (the completion check) too.
+# the session is rooted in the shared main checkout (#1484). This script is on
+# that guard's SANCTIONED_SCRIPT_RELPATHS (#1129 exemption), realpath-keyed to
+# the guard's OWN checkout, so `run`/`list`/`create`/`clean` all work from a
+# hub-rooted session — which the reviewer rule requires, since it points a
+# hub-rooted reviewer here. A COPY of this file outside the framework checkout is
+# still content-gated (that is the exemption's discriminator).
 #
 # SAFETY. A path is removable ONLY when ALL hold (see `owns()`): it lives under
 # the canonical scratch ROOT; it carries this tool's `.scratch-worktree` marker
@@ -77,6 +82,9 @@ REF=""
 PATHS=""
 FULL=0
 KEEP=0
+# Seconds a wrapped command gets to die after SIGTERM before SIGKILL (bounded so
+# a TERM-ignoring child cannot block cleanup and leak the worktree).
+SCRATCH_WORKTREE_KILL_GRACE="${SCRATCH_WORKTREE_KILL_GRACE:-5}"
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
 warn() { printf '%s: WARN %s\n' "$PROG" "$*" >&2; }
@@ -217,20 +225,28 @@ if [ -n "$PATHS" ] && [ "$FULL" = 0 ]; then
   git -C "$D" sparse-checkout set --no-cone "${PATHS_ARR[@]}" >/dev/null 2>&1 \
     || { rm -rf "$D"; git -C "$REPO" worktree prune >/dev/null 2>&1; die "sparse-checkout set failed"; }
   # With --no-checkout the index is empty, so sparse-checkout set alone
-  # materialises NOTHING. `read-tree -mu HEAD` is the plumbing step that writes
-  # the sparse paths — deliberately NOT `git checkout`, whose presence in this
-  # script's TEXT makes the main-worktree-guard content walker (#1484) refuse to
-  # execute the script at all from a hub-rooted session.
+  # materialises NOTHING; `read-tree -mu HEAD` (plumbing) is the step that
+  # writes the sparse paths.
   git -C "$D" read-tree -mu HEAD >/dev/null 2>&1 \
     || { rm -rf "$D"; git -C "$REPO" worktree prune >/dev/null 2>&1; die "sparse checkout materialisation failed"; }
-  # A typo'd or ref-absent path would otherwise yield a SILENTLY EMPTY checkout
-  # and a false result. Fail loudly instead.
+  # A typo'd, absolute, `.`/`..`, or ref-absent path would otherwise yield a
+  # SILENTLY EMPTY checkout (or an escape out of it) and a false result. Validate
+  # against the REF'S TREE, not the filesystem: `.`, `..` and `.git` all exist on
+  # disk after an empty materialisation.
   for _p in "${PATHS_ARR[@]}"; do
-    if [ ! -e "$D/$_p" ]; then
-      rm -rf "$D"; git -C "$REPO" worktree prune >/dev/null 2>&1
-      die "path '$_p' does not exist at $REF — refusing an empty checkout"
-    fi
+    case "$_p" in
+      /*) die "--paths takes repo-relative paths, not absolute: '$_p'" ;;
+      .|..|./*|../*)
+        die "--paths refuses '.'/'..' operands: '$_p'" ;;
+    esac
+    case "$_p" in
+      */../*|*/..) die "--paths refuses a '..' path component: '$_p'" ;;
+    esac
+    git -C "$REPO" cat-file -e "$REF:$_p" 2>/dev/null \
+      || { rm -rf "$D"; git -C "$REPO" worktree prune >/dev/null 2>&1; \
+           die "path '$_p' does not exist at $REF — refusing an empty checkout"; }
   done
+  unset _p
 else
   if ! git -C "$REPO" worktree add --detach "$D" "$REF" >/dev/null 2>&1; then
     rm -rf "$D"; die "git worktree add failed for $REF"
@@ -251,12 +267,18 @@ fi
 
 CMD_PID=""
 cleanup_run() {
-  local rc=$?
+  local rc=$? watch=""
   if [ -n "$CMD_PID" ]; then
     # Kill the wrapped command's whole process group: a probe that outlives its
-    # worktree would keep burning exactly the I/O this tool exists to stop.
+    # worktree would keep burning exactly the I/O this tool exists to stop. The
+    # wait is BOUNDED — a child that ignores TERM (dev/test servers do) would
+    # otherwise block the trap forever and leak the very worktree we are removing.
     kill -- -"$CMD_PID" 2>/dev/null || true
+    ( sleep "$SCRATCH_WORKTREE_KILL_GRACE" 2>/dev/null; kill -9 -- -"$CMD_PID" 2>/dev/null ) &
+    watch=$!
     wait "$CMD_PID" 2>/dev/null || true
+    kill "$watch" 2>/dev/null || true
+    wait "$watch" 2>/dev/null || true
   fi
   remove_one "$REPO" "$D"
   exit "$rc"

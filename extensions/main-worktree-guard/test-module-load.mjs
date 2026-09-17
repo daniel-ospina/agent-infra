@@ -454,6 +454,23 @@ async function partB() {
       !!destructiveRun && destructiveRun.block === true &&
       /script content contains a blocked git operation/.test(destructiveRun.reason ?? ""),
       `handler returned ${JSON.stringify(destructiveRun)}`);
+    // B8i (#1141): the mandated scratch-checkout helper must be runnable FROM A
+    // HUB-ROOTED session — the rule in code-review / test-writing /
+    // verification-before-completion tells a hub-rooted reviewer to use it, and
+    // its content (worktree add/remove/prune, sparse-checkout, read-tree) would
+    // otherwise be content-gated, pushing the reviewer back to the /tmp copy the
+    // issue bans.
+    const scratch = join(HERE, "..", "..", "scripts", "scratch-worktree.sh");
+    const scratchRun = await callBash(`bash ${scratch} --help`);
+    expectTrue("B8i: the scratch-checkout helper is exempt from the hub content walk (#1141)",
+      scratchRun === undefined, `handler returned ${JSON.stringify(scratchRun)}`);
+    const scratchCopy = join(repo, "scratch-worktree.sh");
+    writeFileSync(scratchCopy, readFileSync(scratch, "utf-8"));
+    const scratchCopyRun = await callBash(`bash ${scratchCopy} --help`);
+    expectTrue("B8j: the SAME helper content outside the framework is still blocked (exemption is path-keyed)",
+      !!scratchCopyRun && scratchCopyRun.block === true &&
+      /script content contains a blocked git operation/.test(scratchCopyRun.reason ?? ""),
+      `handler returned ${JSON.stringify(scratchCopyRun)}`);
 
     // ── B7: write/edit gate on a DISORDERED hub (#1484/#436/#628) ──
     // Pre-#744 the import degraded mid-destructuring, so the later bindings

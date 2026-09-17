@@ -13,15 +13,17 @@
 #   T2  run --paths       sparse checkout is materialised (not empty)
 #   T3  footprint         --paths of a narrow path is < 5 MB; --full << the repo
 #   T4  exit propagation  wrapped command's non-zero code survives cleanup
-#   T5  SIGTERM           killed mid-run => no directory, no admin record
+#   T5  SIGTERM/SIGINT   killed mid-run => no directory, no admin record
 #   T6  create/clean/list lifecycle; --all spares foreign worktrees
 #   T7  refusal           non-owned dirs (plain, forged marker, registered but
 #                         unmarked) are never removed
 #   T8  bad ref           usage error, no worktree registered
-#   T9  missing path      --paths of a path absent at REF fails, never a silent
-#                         empty checkout; a literal pattern is not glob-expanded
-#   T10 source contract   no `git clone` / `cp -R` / `rsync` of the repo
-#   T11 SIGTERM kills the wrapped PROCESS GROUP (no orphan burning I/O)
+#   T9  bad path          --paths of an absent/absolute/'.'/'..' path fails, never
+#                         a silent empty checkout; a literal pattern is not
+#                         glob-expanded
+#   T10 source contract   no clone/copy invocation (with positive controls)
+#   T11 process group     SIGTERM kills the group; a TERM-IGNORING child is
+#                         SIGKILLed so the worktree is still removed
 #   T12 --help            exits 0
 #   T13 linked-worktree caller cleans up (owns() via the COMMON git dir)
 
@@ -99,7 +101,7 @@ sx run --ref "$C2" --full -- bash -c 'exit 7' >/dev/null 2>&1
 [ "$?" = 7 ] && ok 0 "T4a wrapped exit code propagates" || ok 1 "T4a wrapped exit code propagates"
 [ "$(live_scratch)" = 0 ] && ok 0 "T4b failing command still cleans up" || ok 1 "T4b failing command still cleans up"
 
-# ── T5: SIGTERM mid-run => nothing survives ─────────────────────────────────
+# ── T5: SIGTERM / SIGINT mid-run => nothing survives ────────────────────────
 P5="$FIX/t5path"
 # Invoke the script DIRECTLY (not through the `sx` shell function): `$!` must
 # be the script process itself, or the TERM lands on a wrapper subshell and the
@@ -114,6 +116,20 @@ wait "$RUNPID" 2>/dev/null
 D5="$(cat "$P5" 2>/dev/null)"
 { [ -n "$D5" ] && [ ! -e "$D5" ]; } && ok 0 "T5a SIGTERM mid-run cleans the checkout" || ok 1 "T5a SIGTERM mid-run cleans the checkout (D5=${D5:-unset})"
 [ "$(live_scratch)" = 0 ] && ok 0 "T5b SIGTERM prunes the admin record" || ok 1 "T5b SIGTERM prunes the admin record"
+
+# SIGINT: `cmd &` in a non-interactive shell starts with SIGINT IGNORED, so the
+# signal must be un-ignored in a wrapper before it can reach the script's trap.
+P5C="$FIX/t5cpath"
+bash -c "trap - INT; exec bash '$SW' run --repo '$FIX/repo' --root '$SCRATCH_WORKTREE_ROOT' \
+  --ref '$C2' --full -- bash -c \"pwd > '$P5C'; sleep 30\"" >/dev/null 2>&1 &
+RUNPID=$!
+sleep 2
+kill -INT "$RUNPID" 2>/dev/null
+sleep 2
+wait "$RUNPID" 2>/dev/null
+D5C="$(cat "$P5C" 2>/dev/null)"
+{ [ -n "$D5C" ] && [ ! -e "$D5C" ]; } && ok 0 "T5c SIGINT mid-run cleans the checkout" || ok 1 "T5c SIGINT mid-run cleans the checkout (D5C=${D5C:-unset})"
+[ "$(live_scratch)" = 0 ] && ok 0 "T5d SIGINT prunes the admin record" || ok 1 "T5d SIGINT prunes the admin record"
 
 # ── T6: create / list / clean lifecycle; --all spares foreign worktrees ─────
 D6="$(sx create --ref "$C2" --full 2>/dev/null)"
@@ -163,18 +179,43 @@ sx run --ref "$C2" --paths no/such/path -- true >/dev/null 2>&1
 [ "$(live_scratch)" = 0 ] && ok 0 "T9b absent path registers nothing" || ok 1 "T9b absent path registers nothing"
 ( cd "$FIX" && sx run --ref "$C2" --paths '*' -- true ) >/dev/null 2>&1
 [ "$?" = 2 ] && ok 0 "T9c a glob is treated as a literal path, not expanded" || ok 1 "T9c a glob is treated as a literal path"
+# `.`, `..` and `.git` all EXIST ON DISK after an empty materialisation, so a
+# filesystem existence test would pass them — the validation must be against
+# REF's tree (cycle-2 P1).
+for bad in . .. .git; do
+  sx run --ref "$C2" --paths "$bad" -- true >/dev/null 2>&1
+  [ "$?" = 2 ] && ok 0 "T9d '$bad' is refused (not a filesystem existence test)" || ok 1 "T9d '$bad' is refused (got $?)"
+done
+sx run --ref "$C2" --paths /etc -- true >/dev/null 2>&1
+[ "$?" = 2 ] && ok 0 "T9e an absolute path is refused" || ok 1 "T9e an absolute path is refused"
+[ "$(live_scratch)" = 0 ] && ok 0 "T9f no rejected --paths call registered anything" || ok 1 "T9f no rejected --paths call registered anything"
 
 # ── T10: source contract — no clone / copy of the repo ──────────────────────
-# Strip comments FIRST: a comment mentioning `cp -R` must not silence a real
-# invocation on the same line, and a real invocation must not hide in one.
-if grep -nE '(git[[:space:]]+clone|cp[[:space:]]+-[rR]|rsync)' "$SW" | grep -vE '^[0-9]+: *#|^[0-9]+: *$' | grep -vE ':[[:space:]]*#' | grep -q .; then
-  FAIL "T10 source contains a clone/copy invocation:"
-  grep -nE '(git[[:space:]]+clone|cp[[:space:]]+-[rR]|rsync)' "$SW" | grep -vE ':[[:space:]]*#' | sed 's/^/      /'
+# Positive control FIRST: a pattern that silently stopped matching would PASS
+# vacuously (the cycle-1 vacuity class). Comments are stripped before testing, so
+# prose ABOUT the ban cannot satisfy it and a real invocation cannot hide.
+BAN_RE='(git[[:space:]]+clone|git[[:space:]]+archive|cp[[:space:]]+-[a-zA-Z]*[rR]|cp[[:space:]]+-a|rsync|tar[[:space:]]+-[a-zA-Z]*x)'
+stripped() { sed 's/#.*//' "$1"; }
+detects() { printf '%s\n' "$1" | grep -qE "$BAN_RE"; }
+POS_FAIL=0
+for s in 'git clone /x /y' 'cp -R /x /y' 'cp -a /x /y' 'cp -pR /x /y' \
+         'rsync -a /x /y' 'git archive HEAD | tar -xf - -C /tmp/z'; do
+  detects "$s" || { FAIL "T10a positive control not detected: $s"; POS_FAIL=1; }
+done
+[ "$POS_FAIL" = 0 ] && PASS "T10a every banned copy shape is detected (positive control)"
+NEG_FAIL=0
+for s in '# cp -R is banned' 'echo "never rsync the repo"' 'git worktree add /x' 'git read-tree -mu HEAD'; do
+  detects "$s" && { FAIL "T10b false positive: $s"; NEG_FAIL=1; }
+done
+[ "$NEG_FAIL" = 0 ] && PASS "T10b comments/prose and worktree/read-tree do not trip the scan"
+if stripped "$SW" | grep -qE "$BAN_RE"; then
+  FAIL "T10c source contains a clone/copy invocation:"
+  stripped "$SW" | grep -nE "$BAN_RE" | sed 's/^/      /'
 else
-  PASS "T10 source contains no clone/copy invocation"
+  PASS "T10c source contains no clone/copy invocation"
 fi
 
-# ── T11: SIGTERM kills the wrapped PROCESS GROUP (no orphan) ────────────────
+# ── T11: the wrapped process group dies; a TERM-IGNORING child is SIGKILLed ─
 ORPHAN="$FIX/orphan-marker"
 bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full \
   -- bash -c "sleep 3; touch '$ORPHAN'" >/dev/null 2>&1 &
@@ -182,7 +223,29 @@ RUNPID=$!
 sleep 1
 kill -TERM "$RUNPID" 2>/dev/null
 sleep 4   # well past the child's `sleep 3`
-[ ! -e "$ORPHAN" ] && ok 0 "T11 SIGTERM kills the wrapped process group" || ok 1 "T11 orphaned child kept running"
+[ ! -e "$ORPHAN" ] && ok 0 "T11a SIGTERM kills the wrapped process group" || ok 1 "T11a orphaned child kept running"
+
+# A child that IGNORES TERM must not be able to block the trap into an unbounded
+# `wait` — that leaks the worktree, the exact class this tool removes.
+P11="$FIX/t11path"
+SCRATCH_WORKTREE_KILL_GRACE=1 bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" \
+  --ref "$C2" --full -- bash -c "trap '' TERM; pwd > '$P11'; while : ; do sleep 0.5; done" \
+  >/dev/null 2>&1 &
+RUNPID=$!
+sleep 2
+kill -TERM "$RUNPID" 2>/dev/null
+deadline=$((SECONDS + 12))
+while kill -0 "$RUNPID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.5; done
+D11="$(cat "$P11" 2>/dev/null)"
+kill -9 "$RUNPID" 2>/dev/null
+wait "$RUNPID" 2>/dev/null
+if kill -0 "$RUNPID" 2>/dev/null; then
+  ok 1 "T11b a TERM-ignoring child does not block cleanup (script still alive)"
+else
+  { [ -n "$D11" ] && [ ! -e "$D11" ]; } && ok 0 "T11b TERM-ignoring child is SIGKILLed and the worktree removed" \
+    || ok 1 "T11b TERM-ignoring child leaked the worktree (D11=${D11:-unset})"
+fi
+[ "$(live_scratch)" = 0 ] && ok 0 "T11c no admin record survives the TERM-ignoring child" || ok 1 "T11c no admin record survives the TERM-ignoring child"
 
 # ── T12: --help ─────────────────────────────────────────────────────────────
 bash "$SW" --help >/dev/null 2>&1 && ok 0 "T12 --help exits 0" || ok 1 "T12 --help exits 0"

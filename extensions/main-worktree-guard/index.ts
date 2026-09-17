@@ -1733,6 +1733,18 @@ const SANCTIONED_SCRIPT_RELPATHS = [
   "scripts/check-pipeline-compliance.sh",
   // The recovery helper most guard messages recommend.
   "scripts/checkout-hygiene/hub-worktree.sh",
+  // #1141 — the mandated scratch-checkout helper. It is the fix for the
+  // /tmp copy debris, and it is NOT usable from a hub-rooted session without
+  // this exemption: its content carries `git worktree add/remove/prune`,
+  // `sparse-checkout` and `read-tree`, so the content walk blocked exactly the
+  // hub-rooted reviewers the rule is written for — who then fell back to the
+  // improvisation the issue exists to stop (code-review cycle-2 P1, driven
+  // through this module's real handler). Same class as hub-worktree.sh (worktree
+  // create/remove, resolved at runtime), and TIGHTER than it: removal is
+  // confined by `owns()` to a path that is under the scratch root AND carries
+  // the tool's marker AND whose admin gitdir is under the COMMON
+  // .git/worktrees/, so it cannot be pointed at the hub or another checkout.
+  "scripts/scratch-worktree.sh",
 ];
 const _frameworkRoot: string | null = (() => {
   try {

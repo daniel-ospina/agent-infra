@@ -176,10 +176,10 @@ EXIT/INT/TERM/HUP**, so a failing or killed test still leaves nothing behind.
 `--paths` is a sparse checkout (a few KB) — use it when the test only reads some
 paths. `--full` is the whole tracked tree.
 
-**BANNED for scratch checkouts:** `git clone`, `cp -R`, `cp -r`, `rsync` of the
-repo, `git archive | tar -x` into a temp dir. If you create a worktree by hand,
-the trap is mandatory and MUST re-raise the status (a trap that does not `exit`
-swallows the signal and the script keeps running):
+**BANNED for scratch checkouts:** `git clone`, `cp -R`, `cp -r`, `cp -a`, `rsync`
+of the repo, `git archive | tar -x` into a temp dir. If you create a worktree by
+hand, the trap is mandatory and MUST re-raise the status (a trap that does not
+`exit` swallows the signal and the script keeps running):
 
 ```bash
 REPO=<repo>; D="$REPO/.worktrees/scratch-$$"
@@ -189,7 +189,9 @@ trap 'exit 130' INT; trap 'exit 143' TERM
 ```
 
 Before reporting done, `bash scripts/scratch-worktree.sh list` must not show a
-scratch worktree you did not intend to keep.
+scratch worktree of YOURS. Clean only your own path (`scratch-worktree.sh clean
+<path>`) — NEVER `clean --all` while sibling sessions are running; that sweeps
+their in-flight scratch worktrees.
 
 ### Step 4 — Green Phase (Run Test, Verify It Fails)
 

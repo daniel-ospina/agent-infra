@@ -310,6 +310,21 @@ it" against `agent-infra`, measured with `ls -1 /private/tmp | wc -l` and
 | Per cycle, `git clone --depth 1` (derived: `.git` 124,476 KB + tree 22,048 KB) | ~143,000 KB |
 | Leftover scratch worktrees after the run | **0** |
 
+Reproduce it (from a checkout carrying `scripts/scratch-worktree.sh`):
+
+```bash
+SW=scripts/scratch-worktree.sh; R=$(git rev-parse --show-toplevel)
+E0=$(ls -1 /private/tmp | wc -l); S0=$(du -sk /private/tmp | awk '{print $1}')
+for i in 1 2 3 4 5; do bash "$SW" run --repo "$R" --ref origin/main --paths skills/code-review -- du -sk .; done
+for i in 1 2 3;     do bash "$SW" run --repo "$R" --ref origin/main --full -- du -sk .;        done
+bash "$SW" list --repo "$R" | wc -l          # leftovers: expect 0
+E1=$(ls -1 /private/tmp | wc -l); S1=$(du -sk /private/tmp | awk '{print $1}')
+echo "entries $E0 -> $E1 ; KB $S0 -> $S1"
+```
+
+(Read the per-cycle number from the `du` each `run` prints; the `/private/tmp`
+deltas are the entries/size line. Measured 2026-09-17 on Darwin 24.x.)
+
 For comparison, the debris this replaces measured 126 MB + 4,559 files **per
 cycle**, and `p1` alone 881 MB.
 
