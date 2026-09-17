@@ -448,6 +448,7 @@ test("every bound a kill clause NAMES is registered (clause → registry closure
     "TASK_MAX_DISPATCH_MS",
     "TASK_HEARTBEAT_TIMEOUT_MS",
     "TASK_HEARTBEAT_CUT_GAP_MS",
+    "TASK_CPU_STALL_MS",
     "TASK_HARD_CAP_MS",
     "TASK_HEARTBEAT_INTERVAL_MS",
   ]);

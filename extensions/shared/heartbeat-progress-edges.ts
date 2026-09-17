@@ -121,6 +121,7 @@ export const OUT_OF_FAMILY_TERMS = [
   "getTaskMaxDispatchMs",
   "getCutGapMs",
   "getEffectiveCutGapMs",
+  "getCpuStallMs",
   "getTaskBackstopMs",
   "FIRST_OUTPUT_TIMEOUT_MS",
   "DEFAULT_HARD_CAP_MS",
@@ -352,6 +353,7 @@ export const HEARTBEAT_KILL_REASONS = [
   "silence-threshold",
   "stream-stall",
   "tool-silence",
+  "tool-dead",
   "tool-stall",
   "first-message-stall",
   "max-dispatch",
@@ -368,6 +370,10 @@ export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string
   // Shares S with stream-stall: one constant, two conditions. Naming them as one
   // term would be wrong; naming them as two unrelated bounds would be wrong too.
   "tool-silence": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — same bound as stream-stall, different condition",
+  // #928: the CPU-liveness bound (C) for a SILENT in-flight tool. The effective
+  // value is resolved by getCpuStallMs (env override, 60 s floor, blank → the
+  // default — never disabled by a typo), and 0 is the explicit off switch.
+  "tool-dead": "max(60 s, TASK_CPU_STALL_MS) override (env) — 0 = OFF (explicit off switch), else DEFAULT_CPU_STALL_MS = 30 min (C); effective bound resolved by getCpuStallMs. Fires conjunctively with S, so the binding condition is max(S, C) = C",
   // The EFFECTIVE bound is max(60 s, TASK_TOOL_STALL_MS) when the env override
   // is a positive finite number; otherwise max(60 s, fraction × cap). Recording
   // only the fraction would let the bound move through a path the registry
@@ -835,6 +841,22 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the cut clause's marker-gap deadline — 1.25× the tick interval from getHeartbeatIntervalMs, 15 s floor, TASK_HEARTBEAT_CUT_GAP_MS override.",
+  },
+  {
+    name: "DEFAULT_CPU_STALL_MS",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: "= 1_800_000;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "#928 (C) — the shipped CPU-stall bound of the `tool-dead` clause: 30 min of flat CPU, admitted ONLY for a tool that has DEMONSTRATED CPU work this round (`cpu_advanced`) and is silent past S. The EFFECTIVE bound is resolved by getCpuStallMs (env override, 60 s floor, 0 = OFF). Calibrated to cover a tool that burned CPU and is now blocked on I/O, without re-creating the #363/#489 kill-productive-agents class.",
+  },
+  {
+    name: "getCpuStallMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE `tool-dead` CPU-stall bound (C) — max(60 s, TASK_CPU_STALL_MS) when the override is a positive finite number; the VALUE 0 disables the clause outright; blank/whitespace/negative/non-finite fall back to DEFAULT_CPU_STALL_MS so a launcher typo cannot silently disarm a kill path. Registered separately from the literal for the same reason as its siblings: without it the env path, its 60 s floor and its off switch are invisible to the registry.",
   },
 ];
 
