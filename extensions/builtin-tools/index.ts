@@ -2447,12 +2447,11 @@ export function heartbeatKillDecision(
 
   // 3.5. cut (#271, D1) — the liveness-loss detector for the wedged-alive
   //    class: markers stopped while a tool is in flight. Placed between
-  //    silence and first-message. The OPERATIVE bound is the load-scaled
+  //    silence and first-message. The EFFECTIVE bound is the load-scaled
   //    `cutGapMs` (~38s at defaults; 3x under a load storm) — the threshold is
   //    the constraint.
-  //    `stateFresh` is a shared precondition / regime switch (it also gates
-  //    the stall clauses above and the silence exemption), NOT a cut-local
-  //    freshness gate: IN-BAND it adds no constraint — in the ordinary cadence
+  //    `stateFresh` is a shared precondition (it also gates the stall clauses
+  //    above and the silence exemption), NOT a cut-local freshness gate: IN-BAND it adds no constraint — in the ordinary cadence
   //    the clause fires at the gap long before the window (max(2×T,
   //    2×interval) = 60 min at defaults) can matter.
   //    It must STAY for the far tail beyond that window, where the clause is
