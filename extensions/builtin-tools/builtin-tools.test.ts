@@ -2487,15 +2487,16 @@ test("E271h: shipped-defaults cut reachability — the effective bound is the ga
       equal(aliveJustInside.kill, true, "one ms inside the window the clause is alive again — the inert boundary is exact");
       equal(aliveJustInside.reason, "cut");
 
-      // THE CLAUSE READS THE MARKER CLOCK, not a frozen or effective age.
-      // `cutClauseState` zeroes streamAgeMs/toolAgeMaxMs, so EVERY probe above
-      // would stay green if the clause had drifted to `st.streamAgeMs`,
-      // `st.toolAgeMaxMs`, `effStreamAge` or `effToolAge` (with the frozen ages
-      // at 0 all five expressions are equal → they are interchangeable). This
-      // probe separates them: the marker age is one ms SHORT of the gap while
-      // BOTH frozen ages sit one ms ABOVE it (so `effStreamAge`/`effToolAge` are
-      // 2·gap above it). A clause reading the raw frozen age or either effective
-      // age cuts; the marker-clock clause does not.
+      // THE CLAUSE READS THE MARKER CLOCK. `cutClauseState` zeroes the frozen
+      // ages, so the earlier POSITIVE probes (justOverGap / atWindow /
+      // aliveJustInside, which assert kill === true) already separate the RAW
+      // frozen readings — `0 > cutGapMs` is never true — and only the EFFECTIVE
+      // ages stayed interchangeable with the marker clock (with the frozen ages
+      // at 0, `effStreamAge`/`effToolAge` both equal `markerAge`). This probe
+      // closes that AND re-covers the raw readings in one shot: the marker age is
+      // one ms SHORT of the gap while BOTH frozen ages sit one ms ABOVE it (so
+      // the effective ages are 2·gap). Every reading except the marker clock
+      // cuts; the marker-clock clause does not.
       const offClock = cutClauseState(gap - 1, now);
       offClock.streamAgeMs = gap + 1;
       offClock.toolAgeMaxMs = gap + 1;
@@ -2537,11 +2538,18 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   ok(hbBody.trimEnd().endsWith("cutGapMs: getCutGapMs(),"), "the slice must END at the literal's own closing brace");
   ok(hbBody.includes("heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,"), "hbThresholds threads the loop's own T (INSIDE the literal, value terminated so a scaled value cannot satisfy it)");
   ok(hbBody.includes("intervalMs: getHeartbeatIntervalMs(),"), "hbThresholds threads the loop's own interval getter (INSIDE the literal, value terminated so a scaled value cannot satisfy it)");
-  // The two counts TOGETHER say what the comment says: there are exactly two
-  // decision call sites, and `...hbThresholds` appears exactly twice — a THIRD
-  // call site passing its own thresholds reds on the call-site count.
-  equal(src.split("heartbeatKillDecision({").length - 1, 2, "the file has exactly two heartbeatKillDecision call sites");
-  equal(src.split("...hbThresholds").length - 1, 2, "…and exactly two hbThresholds spreads, so both of those call sites receive the loop's own thresholds");
+  // Wiring is pinned PER CALL SITE, not by a file-wide spread count: a decoy
+  // `{ ...hbThresholds }` elsewhere keeps a global count at 2 while a call site
+  // silently drops the loop's own thresholds (that call would then run on
+  // undefined bounds — every clause inert). The invocation count is
+  // spelling-agnostic, so a third call site reds however its arguments are
+  // written.
+  const callSites = src.split("heartbeatKillDecision({").slice(1);
+  equal(callSites.length, 2, "there must be exactly two decision call sites taking an inline threshold literal");
+  callSites.forEach((body, i) => {
+    ok(body.slice(0, body.indexOf("});")).includes("...hbThresholds"), `decision call site ${i + 1} must spread the loop's own hbThresholds`);
+  });
+  equal(src.split("heartbeatKillDecision(").length - 1, 3, "one declaration + exactly two calls — a THIRD call site reds here however its arguments are spelled");
 
   // (b) The decision's window expression and the warning. The first is a
   // single-occurrence check stated as such: it pins the expression COUNT, not
@@ -2551,7 +2559,13 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   // loop warns once" would be asserted by nothing.
   equal(src.split(/markerAge\s*<=\s*Math\.max\(2 \* i\.heartbeatTimeoutMs, 2 \* i\.intervalMs\)/).length - 1, 1, "the decision computes its window from the same two inputs the loop's freshWindowMs uses");
   equal((src.match(/^[ \t]*if \(!cutInertWarned && effCutGapMs >= freshWindowMs\) \{/gm) ?? []).length, 1, "the unreachability warning is a real statement-level guard on `!cutInertWarned && effCutGapMs >= freshWindowMs` (>=, not >)");
-  equal((src.match(/if \(!cutInertWarned && effCutGapMs >= freshWindowMs\) \{\n\s*cutInertWarned = true;\n\s*console\.error\(/) ?? []).length, 1, "the latch is SET before the emission inside that guard — the warning really is one-shot per dispatch");
+  equal((src.match(/if \(!cutInertWarned && effCutGapMs >= freshWindowMs\) \{\n\s*cutInertWarned = true;\n\s*console\.error\(/) ?? []).length, 1, "the latch is SET before the emission inside that guard");
+  equal(src.split("cutInertWarned = true").length - 1, 1, "the latch is written exactly ONCE — a second write before the guard would suppress the warning entirely");
+  ok(
+    src.indexOf("let cutInertWarned = false") > -1 &&
+      src.indexOf("let cutInertWarned = false") < src.indexOf("const heartbeat = setInterval"),
+    "the latch is declared OUTSIDE (before) the per-tick decision callback — declared inside it, the warning would fire every tick",
+  );
 
   // (c) The far tail's OWNER must not be freshness-gated. TWO complementary
   // checks are needed, because neither sees what the other does:
@@ -2568,7 +2582,7 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   ok(hcBody.includes("if (settled) return;"), "the hard-cap callback still short-circuits on `settled`");
   ok(hcBody.includes("if (!hasOutput)"), "the hard-cap callback still branches on `hasOutput`");
   equal((hcBody.match(/\bif\s*\(/g) ?? []).length, 2, "the callback's ONLY two statement guards are `settled` and `!hasOutput` — an added `else if (…)`/`if(…)` gate is a third");
-  ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS/.test(hcBody), "…and no freshness EXPRESSION may be folded into an existing guard (the count above cannot see that)");
+  ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS|getHeartbeatIntervalMs|intervalMs|hbThresholds/.test(hcBody), "…and no freshness EXPRESSION may be folded into an existing guard (the count above cannot see that) — the denial set names BOTH window inputs, not just the timeout");
 
   // (d) Behavioural side of the same coupling: with the interval term dominating
   // the max, the decision's window must follow `i.intervalMs` — a T-only window
