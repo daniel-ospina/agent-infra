@@ -73,6 +73,25 @@
 #   …) are passed through to `gh pr merge` rather than hardcoded. `--admin` is
 #   always added by this script; a caller-supplied `--admin` is dropped.
 #
+#   MERGE METHOD DEFAULT. `gh pr merge` REQUIRES exactly one of
+#   `--merge`/`--rebase`/`--squash` when it is NOT interactive; with none it
+#   errors and NO-OPs. The passthrough above made that an omission the CALLER
+#   could make silently, so the rail posted its head-bound evidence marker and
+#   then merged NOTHING — a FALSE PASS by construction (B1 lost #3754/#3755 to
+#   exactly this). `--squash` is therefore the DEFAULT whenever the caller
+#   supplies no merge method; an explicit `--merge`/`--rebase`/`--squash`
+#   overrides it.
+#
+#   THE MERGE'S EXIT STATUS IS CHECKED. A `gh pr merge` that fails AFTER the
+#   evidence marker was posted exits non-zero, prints gh's stderr, and posts a
+#   head-bound RETRACTION so the marker can never be read as a successful merge.
+#
+#   A DRAFT IS REFUSED EARLY. `commit-workflow` opens drafts deliberately and
+#   `gh` refuses to merge one ("Pull Request is still a draft"), so this is a
+#   systematic collision. The rail reads `isDraft` BEFORE any CI work and
+#   refuses with that specific reason (tell the caller to `gh pr ready`) — never
+#   a generic merge failure after the evidence marker.
+#
 # Env seams (tests only):
 #   ADMIN_MERGE_GH              the gh command (default: `gh`)
 #   ADMIN_MERGE_FAILURE_SET_SH  the parser to use (default: ./ci-failure-set.sh)
@@ -132,6 +151,17 @@ resolve_head() {
   local pr="$1"; shift
   # shellcheck disable=SC2086
   $GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>/dev/null
+}
+
+# resolve_draft <pr> → the PR's `isDraft` flag (`true`/`false`). `commit-workflow`
+# opens drafts on purpose, and `gh pr merge` refuses a draft with "Pull Request is
+# still a draft" — so the rail probes this BEFORE any CI work and refuses early
+# with THAT reason, rather than surfacing it late as a generic merge failure once
+# the head-bound evidence marker has already been posted.
+resolve_draft() {
+  local pr="$1"; shift
+  # shellcheck disable=SC2086
+  $GH pr view "$pr" "$@" --json isDraft --jq .isDraft 2>/dev/null
 }
 
 # run_failure_set <mode...> — invoke the shared parser, splitting its stdout
@@ -268,7 +298,7 @@ main() {
   local PR="" MAIN_RUNS="${MAIN_RUNS:-10}" REPO="" DRY_RUN=0 NO_RERUN=0
   local WORKFLOW="${CI_FAILURE_SET_WORKFLOW:-python-ci.yml}" ANY_WORKFLOW=0
   RERUN_TIMEOUT="${RERUN_TIMEOUT:-1800}"
-  local MERGE_ARGS=()
+  local MERGE_ARGS=() MERGE_METHOD_SET=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -280,14 +310,26 @@ main() {
       --no-rerun) NO_RERUN=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       --help|-h) usage; exit 0 ;;
-      --) shift; while [ $# -gt 0 ]; do MERGE_ARGS+=("$1"); shift; done ;;
+      --) shift; while [ $# -gt 0 ]; do
+            case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
+            MERGE_ARGS+=("$1"); shift
+          done ;;
       --admin|--admin=true) shift ;;  # always added by this script
-      -*) MERGE_ARGS+=("$1"); shift ;;
+      -*) case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
+          MERGE_ARGS+=("$1"); shift ;;
       *)
         if [ -z "$PR" ]; then PR="$1"; else say_err "admin-merge: unexpected argument '$1'"; exit 2; fi
         shift ;;
     esac
   done
+
+  # gh REQUIRES a merge method when it is not interactive. Default it so an
+  # omission cannot leave the evidence marker standing over an unmerged PR. An
+  # explicit --merge/--rebase/--squash wins and is not doubled (the caller's
+  # flags keep their exact order/position).
+  if [ "$MERGE_METHOD_SET" -eq 0 ]; then
+    MERGE_ARGS=(--squash ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"})
+  fi
 
   [ -n "$PR" ] || { say_err "admin-merge: a PR number is required"; usage >&2; exit 2; }
   case "$PR" in *[!0-9]*) say_err "admin-merge: PR must be numeric (got '$PR')"; exit 2 ;; esac
@@ -320,6 +362,25 @@ main() {
   head="$(resolve_head "$PR" ${repo_args[@]+"${repo_args[@]}"})"
   [ -n "$head" ] || { say_err "admin-merge: ✗ could not resolve the head of PR #$PR"; exit 1; }
   info "admin-merge: PR #$PR head $head"
+
+  # ── 0. A DRAFT CANNOT BE MERGED — refuse EARLY, by name ──────────────────
+  # gh refuses a draft with "Pull Request is still a draft", and commit-workflow
+  # opens drafts deliberately, so this is a systematic collision, not an edge
+  # case. Refuse BEFORE any CI work and with the SPECIFIC reason, rather than
+  # letting it surface as a generic merge failure after the evidence marker was
+  # posted. The rail does NOT silently ready the PR: a draft is a deliberate
+  # review checkpoint, and clearing it is the author's act, not the rail's.
+  local is_draft
+  # shellcheck disable=SC2086
+  is_draft="$(resolve_draft "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+  if [ "$is_draft" = "true" ]; then
+    say_err "admin-merge: ✗ BLOCK — PR #$PR is a DRAFT, and gh refuses to merge a draft"
+    say_err "   (\"Pull Request is still a draft\"). This is NOT a CI-failure verdict and NOT"
+    say_err "   a merge failure: no comparison was run and no evidence was posted. A draft is a"
+    say_err "   deliberate review checkpoint, so clearing it is the author's act, not the rail's."
+    say_err "   Mark the PR ready and re-run:  gh pr ready $PR"
+    exit 1
+  fi
 
   # ── 1. the PR's failing set, with provenance for the flake re-run ────────
   # Selected by COMMIT, not by PR: the analyzed set must be provably the SHA the
@@ -623,7 +684,58 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
   # the old order a `-- --match-head-commit <other>` passthrough silently REBOUND the merge
   # to a head other than the one just certified, defeating the binding this comment claims
   # (cycle-3 review). Ours goes last so ours wins.
-  $GH pr merge "$PR" --admin ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} --match-head-commit "$head" ${repo_args[@]+"${repo_args[@]}"}
+  #
+  # THE EXIT STATUS IS CHECKED. `gh pr merge` requires a merge method when it is
+  # not interactive; with none it printed that error and NO-OPed while this
+  # function returned success — leaving "✅ head-bound evidence posted" standing
+  # over an UNMERGED PR (B1 lost #3754/#3755 to exactly that). A merge that fails
+  # must fail LOUD.
+  local merge_status=0
+  # shellcheck disable=SC2086
+  $GH pr merge "$PR" --admin ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} --match-head-commit "$head" ${repo_args[@]+"${repo_args[@]}"} \
+    >"$TMP/merge.out" 2>"$TMP/merge.err" || merge_status=$?
+  if [ "$merge_status" -ne 0 ]; then
+    say_err "⛔ admin-merge: FAILED — the merge of PR #$PR did NOT happen (gh pr merge exit $merge_status)."
+    say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
+    say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+    say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. The merge it was"
+    say_err "   posted to authorize FAILED, so PR #$PR is NOT merged."
+    if [ -s "$TMP/merge.err" ]; then
+      say_err "   gh pr merge said:"
+      sed 's/^/      /' "$TMP/merge.err" >&2
+    fi
+    if [ -s "$TMP/merge.out" ]; then
+      say_err "   gh pr merge stdout:"
+      sed 's/^/      /' "$TMP/merge.out" >&2
+    fi
+    # CORRECT THE MARKER. A posted marker must never be left standing over an
+    # unmerged PR, so a head-bound RETRACTION is posted (best effort) stating that
+    # the merge FAILED and the evidence above is not a successful merge. The
+    # retraction is deliberately NOT a certificate — it carries no
+    # `unique to this PR: 0` line — so the merge gate will not accept it in place
+    # of the evidence.
+    {
+      printf '<!-- admin-merge-retraction: %s -->\n' "$head"
+      printf '⚠️ RETRACTED — the admin merge of head `%s` FAILED and did NOT happen.\n\n' "$head"
+      printf 'The evidence comment above (`admin-merge-safety: %s`) records that the safety\n' "$head"
+      printf 'comparison passed and the evidence was posted. It does NOT mean this PR merged:\n'
+      printf '`gh pr merge` exited %s after that marker was posted.\n\n' "$merge_status"
+      if [ -s "$TMP/merge.err" ]; then
+        printf 'gh pr merge said:\n\n'
+        # Indented, never fenced: this body is machine-read too, and a fence is a
+        # parser with state.
+        sed 's/^/    /' "$TMP/merge.err"
+        printf '\n'
+      fi
+      printf 'Re-run the rail once the cause is fixed; the evidence above is still head-bound to `%s`.\n' "$head"
+    } > "$TMP/retraction.md"
+    # shellcheck disable=SC2086
+    if ! $GH pr comment "$PR" ${repo_args[@]+"${repo_args[@]}"} --body-file "$TMP/retraction.md" >/dev/null 2>&1; then
+      say_err "   (could not post the retraction comment — the FAILED merge above still stands)"
+    fi
+    exit 1
+  fi
+  info "admin-merge: ✅ merged PR #$PR at $head"
 }
 
 main "$@"

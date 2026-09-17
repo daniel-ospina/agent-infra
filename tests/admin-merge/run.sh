@@ -47,6 +47,14 @@
 #  14. A FAILED COMPARISON IS NOT AN EMPTY COMPARISON (review P2): `--diff`
 #      returning non-zero must BLOCK; an unchecked failure leaves an empty file
 #      that reads as "no unique failures" — fail-open.
+#  15. THE MERGE METHOD HAS A DEFAULT: `gh pr merge` requires one and NO-OPs
+#      without it, so the passthrough must not let an omission certify a merge
+#      that never happened. An explicit method overrides it, without doubling.
+#  16. A FAILED MERGE FAILS LOUD: the exit status is checked, gh's stderr is
+#      surfaced, and a head-bound RETRACTION is posted so the success marker is
+#      never left standing over an unmerged PR (B1 lost #3754/#3755 to it).
+#  17. A DRAFT IS REFUSED EARLY: gh refuses to merge a draft and commit-workflow
+#      opens drafts, so the rail refuses before any CI work, by name.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -100,6 +108,20 @@ has_flag() {
 case "$key" in
   "pr view")
     pr="${3:-}"
+    # The draft probe is a DISTINCT question from the head resolutions: answer it
+    # from its own fixture and never let it consume the head-seq sequence.
+    want_draft=0; want_head=0; jprev=""
+    for x in "$@"; do
+      if [ "$jprev" = "--json" ]; then
+        case "$x" in *isDraft*) want_draft=1 ;; esac
+        case "$x" in *headRefOid*) want_head=1 ;; esac
+      fi
+      jprev="$x"
+    done
+    if [ "$want_draft" = 1 ] && [ "$want_head" = 0 ]; then
+      [ -f "$SCEN/draft" ] && { cat "$SCEN/draft"; exit 0; }
+      printf 'false\n'; exit 0
+    fi
     # head-seq models a PR head that MOVES between resolutions (a rebase landing
     # mid-run): the Nth `pr view` returns the Nth line.
     if [ -f "$SCEN/head-seq" ]; then
@@ -159,9 +181,18 @@ case "$key" in
         exit 1
       fi
       cp "$body" "$SCEN/comment"
+      # Keep each body separately too, so a scenario that posts MORE than one
+      # comment (evidence + retraction) can assert on the earlier one as well.
+      cn=$(( $(cat "$SCEN/comment-count" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$cn" > "$SCEN/comment-count"
+      cp "$body" "$SCEN/comment-$cn"
     fi
     exit 0 ;;
   "pr merge")
+    if [ -f "$SCEN/fail-merge" ]; then
+      cat "$SCEN/fail-merge" >&2
+      exit 1
+    fi
     exit 0 ;;
   *)
     exit 1 ;;
@@ -1336,6 +1367,102 @@ case "$ROT_VERDICT" in
     pass "the moved identity is flagged UNATTRIBUTABLE by class (never one PR-unique id)" ;;
   *) fail "rotation rule mis-fired: $ROT_VERDICT" ;;
 esac
+
+# ── 34. the merge method has a DEFAULT, so an omission cannot no-op ─────────
+# `gh pr merge` REQUIRES one of --merge/--rebase/--squash when not interactive;
+# with none it errors and NO-OPs. The passthrough let the CALLER omit it, so the
+# rail posted its head-bound evidence marker and then merged NOTHING — a false
+# PASS by construction (B1 lost #3754/#3755 to it). The default must be present
+# when the caller supplies no method, and an explicit method must win.
+echo "== 34. a default merge method, overridable through the passthrough =="
+new_scen mergemethod
+HEAD_MM="c0c0000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_MM" > "$SCEN/head"
+lane_fail "$HEAD_MM" 9301 > "$SCEN/runs-$HEAD_MM"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9301"
+lane_fail mainmm 9302 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9302"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+if grep -q "pr merge 42 --admin --squash --match-head-commit $HEAD_MM" "$SCEN/calls"; then
+  pass "MERGE_ARGS empty → the merge still carries a method (--squash default)"
+else
+  fail "no default merge method: an omission NO-OPs gh pr merge and leaves the marker standing"
+  grep "pr merge" "$SCEN/calls" | sed 's/^/      /'
+fi
+# An explicit method overrides the default and is not doubled.
+: > "$SCEN/calls"
+run_admin 42 --main-runs 1 -- --rebase >/dev/null 2>&1
+if grep -q "pr merge 42 --admin --rebase --match-head-commit $HEAD_MM" "$SCEN/calls" \
+   && ! grep -q -- "--squash" "$SCEN/calls"; then
+  pass "an explicit --rebase overrides the default (no --squash, no doubling)"
+else
+  fail "the explicit method did not override the default"
+  grep "pr merge" "$SCEN/calls" | sed 's/^/      /'
+fi
+
+# ── 35. a FAILED merge must fail LOUD, and the marker must not stand ────────
+# The rail posted "✅ head-bound evidence posted", then ran `gh pr merge` with NO
+# exit-status check. A failing merge left the marker standing over an UNMERGED
+# PR — a false PASS by construction. Now the failure is loud, gh's stderr is
+# included, and a RETRACTION is posted so the marker cannot be read as success.
+echo "== 35. a failing gh pr merge fails LOUD and the marker is retracted =="
+new_scen mergefails
+HEAD_MF="c1c1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_MF" > "$SCEN/head"
+lane_fail "$HEAD_MF" 9311 > "$SCEN/runs-$HEAD_MF"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9311"
+lane_fail mainmf 9312 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9312"
+printf 'gh: Pull Request is still a draft\n' > "$SCEN/fail-merge"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a failed merge exits non-zero ($rc)" \
+  || fail "a failed gh pr merge returned 0 — the false PASS is unfixed"
+grep -q "the merge of PR #42 did NOT happen" "$TMP/err" && pass "  …and says the merge did NOT happen" \
+  || fail "  …but the failure is not loud/unambiguous"
+grep -q "THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR" "$TMP/err" \
+  && pass "  …and names the standing marker explicitly" \
+  || fail "  …and does not call out the marker"
+grep -qF "gh: Pull Request is still a draft" "$TMP/err" \
+  && pass "  …and includes gh's stderr verbatim" \
+  || fail "  …but gh's stderr is not surfaced"
+[ -f "$SCEN/comment-1" ] && grep -q "<!-- admin-merge-safety: $HEAD_MF -->" "$SCEN/comment-1" \
+  && pass "the evidence marker was posted before the merge was attempted" \
+  || fail "the evidence comment was not posted (the scenario no longer models the defect)"
+[ -f "$SCEN/comment-2" ] && grep -q "RETRACTED — the admin merge of head \`$HEAD_MF\` FAILED" "$SCEN/comment-2" \
+  && pass "a head-bound RETRACTION is posted, so the marker is not left standing" \
+  || fail "the success marker was left standing over an unmerged PR"
+grep -q "unique to this PR: 0" "$SCEN/comment-2" \
+  && fail "the retraction must NOT be a certificate (it carries the unique line)" \
+  || pass "the retraction is not a certificate (no 'unique to this PR: 0')"
+
+# ── 36. a DRAFT is refused EARLY, by name (not a late generic merge failure) ─
+# commit-workflow mandates opening drafts, and gh refuses to merge one. The rail
+# must refuse BEFORE any CI work with that specific reason, distinct from any
+# failure verdict — never let it surface after the evidence marker was posted.
+echo "== 36. a DRAFT PR is refused early, with the specific reason =="
+new_scen draftpr
+HEAD_DP="c2c2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DP" > "$SCEN/head"
+printf 'true\n' > "$SCEN/draft"
+lane_fail "$HEAD_DP" 9321 > "$SCEN/runs-$HEAD_DP"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9321"
+lane_fail maindp 9322 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9322"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a draft PR → non-zero exit ($rc)" || fail "a draft was not refused"
+grep -q "is a DRAFT, and gh refuses to merge a draft" "$TMP/err" \
+  && pass "  …with the DRAFT reason, by name" || fail "  …but the reason is not the draft"
+grep -q "gh pr ready 42" "$TMP/err" \
+  && pass "  …and names the remedy (gh pr ready)" || fail "  …but offers no remedy"
+grep -q "NOT a CI-failure verdict" "$TMP/err" \
+  && pass "  …and distinguishes it from a failure verdict" || fail "  …and conflates it with a failure verdict"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for a draft" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on a draft" || pass "no merge attempted"
+grep -q "run list" "$SCEN/calls" \
+  && fail "the draft check must run BEFORE any CI work" \
+  || pass "the refusal is EARLY (no CI run was even listed)"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
