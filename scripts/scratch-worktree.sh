@@ -230,14 +230,25 @@ remove_one() { # <repo> <path>
     return 1
   fi
   gd="$(admin_of "$d")"
-  # Owned => scratch by construction: the dirt inside it is the probe's own
-  # disposable output (the in-process trap of `run` discards exactly the same
-  # thing). `git worktree remove` refuses on untracked/ignored files, so the
-  # force is what makes the guarantee hold; the unowned case never reaches here.
-  git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
-  if [ -e "$d" ]; then
-    rm -rf "$d" 2>/dev/null || warn "could not remove $d"
+  # The TREE goes first, then the record (cycle-10 P1): `git worktree remove
+  # --force` deregisters the record even when it FAILS to delete the directory
+  # (measured: rc 255, admin dir already gone), so deregistering first made the
+  # "keep the record if the directory survives" invariant unachievable — the
+  # survivor became invisible to `list`, impossible for a second `clean <path>`
+  # (no admin dir, so `owns()` cannot pass) and invisible to the reaper.
+  # Owned => scratch by construction, so the dirt inside is the probe's own
+  # disposable output; `rm -rf` is the whole removal, git is only asked to
+  # deregister afterwards (and `prune_admin` covers a directory already gone).
+  rm -rf "$d" 2>/dev/null || true
+  if [ -e "$d" ] || [ -L "$d" ]; then
+    chmod -R u+rwX "$d" 2>/dev/null || true
+    rm -rf "$d" 2>/dev/null || true
   fi
+  if [ -e "$d" ] || [ -L "$d" ]; then
+    warn "could not remove $d — it stays registered so 'list' shows it"
+    return 1
+  fi
+  git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
   prune_admin "$repo" "$gd"
   return 0
 }
@@ -258,30 +269,58 @@ remove_one() { # <repo> <path>
 # false PASS (cycle-6 P2). `git clean` protects a worktree's own `.git`; an
 # explicit `rm -rf .git` does not.
 remove_created() { # <repo> <path> [admin-gitdir]
-  local repo="$1" d="$2" gd="${3:-}" left=0
+  local repo="$1" d="$2" gd="${3:-}"
   [ -n "$d" ] || return 0
   [ -n "$gd" ] || gd="$(admin_of "$d")"
-  git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
+  # Tree first, then record — see remove_one for why.
+  rm -rf "$d" 2>/dev/null || true
   if [ -e "$d" ] || [ -L "$d" ]; then
+    # A probe can leave something `rm` cannot delete (a mode-000 subtree, or a
+    # file made immutable with chflags/chattr). Make it removable and retry.
+    chmod -R u+rwX "$d" 2>/dev/null || true
     rm -rf "$d" 2>/dev/null || true
-    # A probe can leave something `rm` cannot delete (rewriting its own dir
-    # mode-000). Make it removable and retry before giving up.
-    if [ -e "$d" ] || [ -L "$d" ]; then
-      chmod -R u+rwX "$d" 2>/dev/null || true
-      rm -rf "$d" 2>/dev/null || true
-    fi
   fi
   # A leftover that CANNOT be removed must stay VISIBLE (cycle-9 P2). Pruning
   # the record anyway would turn it into an invisible orphan: `list` — the
   # documented completion check — would report clean, `clean <path>` would refuse
   # it (no marker/.git to prove ownership), and the reaper could not see it either
-  # (it enumerates registered worktrees, not directories). Keeping the record
-  # makes `list` surface it.
+  # (it enumerates registered worktrees, not directories).
   if [ -e "$d" ] || [ -L "$d" ]; then
     warn "could not remove $d — its registration is KEPT so 'list' shows it"
     return 1
   fi
+  git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
   prune_admin "$repo" "$gd"
+  return 0
+}
+
+# Reclaim records whose directory is ALREADY GONE — targeted, never a blanket
+# prune (cycle-10). `owns()` cannot prove ownership of a missing directory, so
+# such a record used to be unreclaimable while `git worktree prune` stayed
+# forbidden. This touches a record only when ALL of these hold: its registered
+# path is under the canonical ROOT with the `scratch-` prefix, the path does not
+# exist, and the admin dir's own `gitdir` back-link names exactly that path.
+# Everything else is left alone, so no unrelated sibling can be deregistered.
+sweep_orphan_records() { # <repo>
+  local repo="$1" common p name gd n=0
+  common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  [ -n "$common" ] || return 0
+  common="$(realpath_of "$common")" || return 0
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$p" in "$ROOT"/scratch-*) ;; *) continue ;; esac
+    [ -e "$p" ] && continue
+    name="$(basename "$p")"
+    gd="$common/worktrees/$name"
+    [ -d "$gd" ] || continue
+    [ -f "$gd/gitdir" ] || continue
+    [ "$(head -n 1 "$gd/gitdir" 2>/dev/null)" = "$p/.git" ] || continue
+    rm -rf "$gd" 2>/dev/null || continue
+    warn "reclaimed the record of the already-gone $p"
+    n=$((n + 1))
+  done < <(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+  # The COUNT goes to stdout (callers branch on it); the warnings are stderr.
+  printf '%s\n' "$n"
   return 0
 }
 
@@ -326,25 +365,34 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
       list_scratch "$REPO" | sed 's/^/    /' >&2
       exit 0
     fi
+    failed=0
     while IFS= read -r d; do
       [ -n "$d" ] || continue
+      # A directory that is already gone is the reaper's job below, not a removal
+      # failure — `owns()` cannot prove a missing path, so calling remove_one on it
+      # would just set `failed` and make a successful sweep exit 1.
+      [ -e "$d" ] || [ -L "$d" ] || continue
       if held_by_live_process "$d"; then
         warn "$d is held by a live process — PRESERVED"
         continue
       fi
-      remove_one "$REPO" "$d" || true
+      remove_one "$REPO" "$d" || failed=1
     done < <(list_scratch "$REPO")
-    # Records whose directory is already gone (a wrapped `rm -rf .`) are no
-    # longer removable by `owns()`, and a blanket prune is FORBIDDEN — it would
-    # deregister unrelated sibling worktrees (see prune_admin).
+    # A directory that is already gone leaves a record `owns()` cannot prove;
+    # reclaim exactly those, by the admin dir's own back-link.
+    sweep_orphan_records "$REPO" >/dev/null || true
+    [ "$failed" = 0 ] || exit 1
     exit 0
   fi
   [ -n "$CLEAN_TARGET" ] || die "clean needs a path or --all"
-  # A refused path is NOT success: the caller asked for removal and did not get
-  # it. `die` would use the usage code (2), so exit 1 explicitly — otherwise a
-  # refusal is indistinguishable from a completed cleanup (cycle-9 P1; a forged or
-  # unowned path must fail loudly).
-  remove_one "$REPO" "$CLEAN_TARGET" || exit 1
+  # A refused path is NOT success (cycle-9 P1): the caller asked for removal and
+  # did not get it. `die` would use the usage code (2), so exit 1 explicitly.
+  # The one exception is an already-gone path whose record the sweep reclaimed —
+  # the request IS satisfied then.
+  if ! remove_one "$REPO" "$CLEAN_TARGET"; then
+    [ "$(sweep_orphan_records "$REPO")" != 0 ] && exit 0
+    exit 1
+  fi
   exit 0
 fi
 

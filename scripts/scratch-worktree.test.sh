@@ -36,7 +36,9 @@
 #   T21 a wrapped command that deletes `.git` still deregisters the record
 #   T22 a wrapped command that replaces `$D` with a DANGLING symlink still cleans
 #   T23 a forged marker+gitdir cannot deregister a real sibling (back-link proof)
-#   T24 an undeletable leftover stays VISIBLE to `list` rather than becoming an orphan
+#   T24 a mode-000 leftover is made removable and removed (retry path)
+#   T25 a truly UNDELETABLE leftover stays registered so `list` shows it
+#   T26 `clean <path>` exits 1 when removal leaves the directory behind
 
 set -uo pipefail
 
@@ -498,6 +500,38 @@ chmod -R u+rwX "$D24" 2>/dev/null || true
 rm -rf "$D24" 2>/dev/null || true
 sx clean --all --force-all >/dev/null 2>&1
 [ "$(live_scratch)" = 0 ] && ok 0 "T24c fixture reclaimed" || ok 1 "T24c fixture reclaimed"
+
+# ── T25: a genuinely UNDELETABLE leftover must stay registered ──────────────
+# The invariant T24 cannot reach: `chmod -R u+rwX` repairs a mode-000 subtree, so
+# that path always removes. An IMMUTABLE file (macOS `chflags uchg`) cannot be
+# removed even then — and the record must NOT be deregistered, or the survivor is
+# invisible to `list`, to a second `clean <path>` and to the reaper (cycle-10 P1).
+if command -v chflags >/dev/null 2>&1 && [ "$(uname -s)" = Darwin ]; then
+  P25="$FIX/t25path"
+  bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full \
+    -- bash -c "pwd > '$P25'; mkdir blocker; : > blocker/f; chflags uchg blocker/f; exit 0" \
+    >/dev/null 2>&1
+  RC25=$?
+  D25="$(cat "$P25" 2>/dev/null)"
+  [ "$RC25" = 0 ] && ok 0 "T25a the probe's exit code survives" || ok 1 "T25a the probe's exit code survives (rc=$RC25)"
+  if [ -e "$D25" ]; then
+    [ "$(live_scratch)" != 0 ] && ok 0 "T25b an undeletable leftover stays registered and visible" \
+      || ok 1 "T25b an undeletable leftover became an invisible orphan"
+    [ "$(sx clean "$D25" >/dev/null 2>&1; echo $?)" != 0 ] \
+      && ok 0 "T25c clean <path> reports the failure (rc != 0)" \
+      || ok 1 "T25c clean <path> reported success for a failed removal"
+  else
+    ok 1 "T25b the immutable fixture was removed — the invariant was not exercised"
+    ok 1 "T25c (not reached)"
+  fi
+  chflags -R nouchg "$D25" 2>/dev/null || true
+  chmod -R u+rwX "$D25" 2>/dev/null || true
+  rm -rf "$D25" 2>/dev/null || true
+  sx clean --all --force-all >/dev/null 2>&1
+  [ "$(live_scratch)" = 0 ] && ok 0 "T25d fixture reclaimed" || ok 1 "T25d fixture reclaimed"
+else
+  ok 0 "T25 skipped (no chflags / not Darwin) — the mode-000 retry path is T24"
+fi
 
 echo
 if [ "$FAILS" = 0 ]; then echo "ALL PASS"; exit 0; else echo "$FAILS FAILURE(S)"; exit 1; fi
