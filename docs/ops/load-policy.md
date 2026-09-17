@@ -339,3 +339,19 @@ cycle**, and `p1` alone 881 MB.
   into a temp dir are BANNED for scratch checkouts.
 - Leaked worktrees are recoverable by `scripts/pi-reap-worktrees.sh` (#1095);
   this section exists so they are not created in the first place.
+- Cleanup deregisters **only its own record**. A bare `git worktree prune` is
+  banned: it deregisters *every* record whose directory is not stat-able at that
+  moment (unmounted volume, permission blip, stale network mount), so a routine
+  probe silently destroys an unrelated sibling worktree's checkout while its
+  files sit on disk. Since `run` is now the mandated path for every review cycle,
+  that fired constantly. The helper reads the worktree's own `gitdir:` line and
+  removes exactly that admin dir; the hand-rolled traps the skills show do the
+  same.
+- A bare `clean --all` is fail-closed (it lists candidates and exits 0): the
+  liveness probe only sees a holder whose **argv names the path**, so a cwd-only
+  holder would be swept. `clean --all --force-all` is the deliberate sibling
+  sweep, for when you have verified no sibling session is mid-probe.
+- `--paths` elements are anchored (`/foo`, not a bare `foo`): under
+  `--no-cone` a bare name is a patternspec matching at any depth, so
+  `--paths small` also pulled in `nested/small/` — inflating the I/O this tool
+  exists to cut and contradicting the "exactly these paths" contract.

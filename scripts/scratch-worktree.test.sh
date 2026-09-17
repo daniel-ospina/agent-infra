@@ -30,6 +30,9 @@
 #   T15 a straggler DESCENDANT (leader exits first) is SIGKILLed
 #   T16 a BARE clean --all refuses to sweep (fail-closed); --force-all sweeps
 #   T17 cleanup does not depend on the in-worktree marker (identity removal)
+#   T18 cleanup deregisters ONLY its own record (never an unrelated sibling)
+#   T19 --paths is anchored (a same-named nested dir is not materialised)
+#   T20 run is silent on stderr when it succeeds
 
 set -uo pipefail
 
@@ -198,7 +201,7 @@ sx run --ref "$C2" --paths /etc -- true >/dev/null 2>&1
 # Positive control FIRST: a pattern that silently stopped matching would PASS
 # vacuously (the cycle-1 vacuity class). Comments are stripped before testing, so
 # prose ABOUT the ban cannot satisfy it and a real invocation cannot hide.
-BAN_RE='(git[[:space:]]+clone|git[[:space:]]+archive|cp[[:space:]]+-[a-zA-Z]*[rR]|cp[[:space:]]+-a|rsync|tar[[:space:]]+-[a-zA-Z]*x)'
+BAN_RE='(git[[:space:]]+clone|git[[:space:]]+archive|cp[[:space:]]+(-[a-zA-Z]*[rR]|-a|--recursive|--archive|-[a-zA-Z]*[aA][a-zA-Z]*)|rsync|tar[[:space:]]+(x|-x|-?[a-zA-Z]*x))'
 stripped() { sed -E 's/(^|[[:space:]])#.*$/\1/' "$1"; }
 # Strip only WORD-BOUNDARY comments: a bare `s/#.*//` also deletes `#` inside a
 # token, so `echo a#b; cp -R /x /y` would strip to `echo a` and the real scan
@@ -207,16 +210,21 @@ detects() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$/\1/' | grep -qE "
 POS_FAIL=0
 for s in 'git clone /x /y' 'cp -R /x /y' 'cp -a /x /y' 'cp -pR /x /y' \
          'rsync -a /x /y' 'git archive HEAD | tar -xf - -C /tmp/z' \
+         'cp --recursive /x /y' 'cp --archive /x /y' 'tar xf a.tar' \
          'echo a#b; cp -R /x /y'; do
   detects "$s" || { FAIL "T10a positive control not detected: $s"; POS_FAIL=1; }
 done
+# The long forms are equivalent spellings, not near-misses: `cp --recursive` is
+# `cp -r` and `tar xf` is `tar -xf`, so missing them was a false PASS in the very
+# check that exists to stop this file reintroducing the copy (cycle-5 P2).
 [ "$POS_FAIL" = 0 ] && PASS "T10a every banned copy shape is detected (positive control)"
 NEG_FAIL=0
 # Controls run through the SAME stripping the real scan uses. (A banned word
 # inside a quoted shell string still matches by design — this is a source lint,
 # not a shell parser; the shipped file has no such string.)
 for s in '# cp -R is banned' '# rsync -a src dst would be banned' \
-         'git worktree add /x /y' 'git read-tree -mu HEAD' 'echo ok'; do
+         'git worktree add /x /y' 'git read-tree -mu HEAD' 'echo ok' \
+         'cp -p /x /y' 'tar -czf out.tgz src' 'git worktree prune'; do
   detects "$s" && { FAIL "T10b false positive: $s"; NEG_FAIL=1; }
 done
 [ "$NEG_FAIL" = 0 ] && PASS "T10b comments/prose and worktree/read-tree do not trip the scan"
@@ -263,8 +271,16 @@ fi
 # The argv liveness probe fails OPEN for a cwd-only holder, so the bare sweep
 # must not run at all; `--force-all` is the deliberate opt-in.
 D16="$(sx create --ref "$C2" --full 2>/dev/null)"
-sx clean --all >/dev/null 2>&1
+sx clean --all 2>"$FIX/t16err" >/dev/null
 [ -d "$D16" ] && ok 0 "T16a a bare clean --all removes nothing" || ok 1 "T16a a bare clean --all removed a worktree"
+# The refusal message is the ONLY explanation of why the gate fired; a backtick
+# inside a double-quoted printf payload ran `clean` as a command substitution and
+# deleted the guidance (cycle-5 P2).
+if grep -q 'refusing to sweep' "$FIX/t16err" && ! grep -q 'command not found' "$FIX/t16err"; then
+  ok 0 "T16c the refusal message renders and runs no external command"
+else
+  ok 1 "T16c the refusal message is corrupt or executed a command: $(tr '\n' '|' < "$FIX/t16err")"
+fi
 sx clean --all --force-all >/dev/null 2>&1
 [ ! -e "$D16" ] && ok 0 "T16b clean --all --force-all removes it" || ok 1 "T16b clean --all --force-all removes it"
 
@@ -328,6 +344,59 @@ D13="$(bash "$SW" run --repo "$LINK" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2"
   && ok 0 "T13b no admin record survives from a linked-worktree caller" || ok 1 "T13b no admin record survives from a linked-worktree caller"
 git -C "$FIX/repo" worktree remove --force "$LINK" >/dev/null 2>&1
 git -C "$FIX/repo" worktree prune >/dev/null 2>&1
+
+# ── T18: deregistration is TARGETED — an unrelated sibling is never pruned ──
+# A blanket `git worktree prune` deregisters any record whose directory is not
+# currently stat-able (unmounted volume, permission blip, stale NFS). Since `run`
+# is the mandated path for every review cycle, that would silently destroy an
+# unrelated sibling's checkout on a routine probe (cycle-5 P1).
+T18PAR="$FIX/hidden"
+mkdir -p "$T18PAR"
+git -C "$FIX/repo" worktree add --detach "$T18PAR/sibling" "$C2" >/dev/null 2>&1
+printf 'wip\n' > "$T18PAR/sibling/UNCOMMITTED.txt"
+chmod 000 "$T18PAR"                      # parent exists but is not stat-able
+sx run --ref "$C2" --full -- true >/dev/null 2>&1
+chmod 755 "$T18PAR"
+if git -C "$T18PAR/sibling" rev-parse --git-dir >/dev/null 2>&1; then
+  ok 0 "T18a an unstat-able sibling worktree survives a run"
+else
+  ok 1 "T18a a routine run PRUNED an unrelated sibling worktree"
+fi
+[ -f "$T18PAR/sibling/UNCOMMITTED.txt" ] && ok 0 "T18b the sibling's files are intact" \
+  || ok 1 "T18b the sibling's files are intact"
+git -C "$FIX/repo" worktree remove --force "$T18PAR/sibling" >/dev/null 2>&1
+rm -rf "$T18PAR"
+
+# ── T19: --paths is ANCHORED, not a gitignore pattern matching at any depth ─
+# `--no-cone` treats each element as a patternspec, so a bare `small` also
+# materialises `nested/small/`. Single-component paths are the common case, so
+# the documented "exactly these paths / literal, not patterns" contract was
+# misleading for most calls (cycle-5 P2).
+git -C "$FIX/repo" checkout -q --detach "$C2"
+mkdir -p "$FIX/repo/nested/small"
+printf 'n\n' > "$FIX/repo/nested/small/n.txt"
+git -C "$FIX/repo" add nested/small/n.txt >/dev/null 2>&1
+git -C "$FIX/repo" commit -qm nest >/dev/null 2>&1
+NEST="$(git -C "$FIX/repo" rev-parse HEAD)"
+sx run --ref "$NEST" --paths small -- bash -c 'ls small 2>/dev/null; echo --; ls nested/small 2>/dev/null' \
+  >"$FIX/t19out" 2>&1
+if grep -q 'a.txt' "$FIX/t19out"; then ok 0 "T19a the requested path is materialised" \
+  ; else ok 1 "T19a the requested path is materialised: $(cat "$FIX/t19out")"; fi
+grep -q 'n.txt' "$FIX/t19out" && ok 1 "T19b a same-named NESTED dir was materialised (unanchored pattern)" \
+  || ok 0 "T19b a same-named nested dir is not materialised (anchored)"
+
+# ── T20: a SUCCESSFUL run is silent on stderr ──────────────────────────────
+# bash 3.2 emits `run_pending_traps: bad value in trap_list` from the watchdog
+# subshell on ~27% of successful runs, which an agent reads as tool failure
+# (cycle-5 P2). Tests elsewhere redirect stderr, so only this assertion sees it.
+ERR20=0
+for _ in 1 2 3; do
+  bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full -- true \
+    >/dev/null 2>"$FIX/t20err" || true
+  [ -s "$FIX/t20err" ] && ERR20=$((ERR20 + 1))
+done
+[ "$ERR20" = 0 ] && ok 0 "T20 a successful run writes nothing to stderr" \
+  || ok 1 "T20 a successful run wrote stderr $ERR20/3 times: $(cat "$FIX/t20err")"
 
 echo
 if [ "$FAILS" = 0 ]; then echo "ALL PASS"; exit 0; else echo "$FAILS FAILURE(S)"; exit 1; fi

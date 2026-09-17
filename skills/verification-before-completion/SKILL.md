@@ -193,12 +193,19 @@ of the repo, `git archive | tar -x` into a temp dir. One measured review loop le
 hand, the trap is mandatory and MUST re-raise the status and name the repo (a trap
 that does not `exit` swallows the signal and keeps running; one without `-C`
 silently fails once the probe has changed cwd):
-`REPO=<repo>; D="$REPO/.worktrees/scratch-$$"; git -C "$REPO" worktree add --detach "$D" <ref>; trap 'rc=$?; git -C "$REPO" worktree remove --force "${D:-/nonexistent}" 2>/dev/null; git -C "$REPO" worktree prune 2>/dev/null; exit $rc' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM`.
+`REPO=<repo>; D="$REPO/.worktrees/scratch-$$"; git -C "$REPO" worktree add --detach "$D" <ref>; GD="$(sed -n 's/^gitdir: //p' "$D/.git" 2>/dev/null)"; trap 'rc=$?; git -C "$REPO" worktree remove --force "${D:-/nonexistent}" 2>/dev/null; case "${GD:-}" in /*/.git/worktrees/*) rm -rf "$GD";; esac; exit $rc' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM`.
+Cleanup is TARGETED for a reason: a bare `git worktree prune` deregisters every
+record whose directory is not currently stat-able — an unmounted volume, a
+permission blip, a stale network mount — so it can silently destroy an unrelated
+sibling worktree's checkout while its files sit on disk. Remove your own record
+(the trap above reads its own `gitdir:` line); never prune the whole repo.
 
 Before reporting done: `bash scripts/scratch-worktree.sh list` must not show a
 scratch worktree of YOURS. Clean only your own path (`scratch-worktree.sh clean
-<path>`) — NEVER `clean --all` while sibling sessions are running; that sweeps
-their in-flight scratch worktrees. A verification claim that leaves scratch debris
+<path>`). A bare `clean --all` refuses to sweep (it cannot see a holder whose argv
+does not name the path, so it would delete a sibling's in-flight probe);
+`clean --all --force-all` is the deliberate sibling sweep — do not run it while
+sibling sessions are running. A verification claim that leaves scratch debris
 falsifies itself.
 
 ## Review Loop (CPI-5 — Convergence-Gated)

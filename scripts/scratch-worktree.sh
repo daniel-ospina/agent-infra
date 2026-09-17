@@ -169,13 +169,39 @@ owns() { # <repo> <path>
   return 1
 }
 
+# Deregistration is ALWAYS targeted (cycle-5 P1): `git worktree remove` already
+# drops this record; the fallback removes only THIS record's admin dir.
+# A blanket `git worktree prune` is forbidden here — it deregisters ANY registered
+# worktree whose directory is not currently stat-able (unmounted volume, permission
+# blip, stale NFS), so a routine `run` would silently destroy an unrelated sibling
+# worktree's checkout while its files sat on disk. Reproduced before this fix:
+# a sibling whose parent dir was unstat-able lost its admin record, and the
+# checkout there stopped working (it could no longer be read as a repo).
+prune_admin() { # <repo> <admin-gitdir>
+  local repo="$1" gd="$2" common
+  [ -n "$gd" ] || return 0
+  common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  common="$(realpath_of "$common")" || return 0
+  gd="$(realpath_of "$gd" 2>/dev/null)" || return 0
+  case "$gd" in
+    "$common"/worktrees/*) rm -rf "$gd" 2>/dev/null || warn "could not deregister $gd" ;;
+  esac
+  return 0
+}
+
+admin_of() { # <path> -> its admin gitdir, or empty
+  [ -f "$1/.git" ] || return 0
+  sed -n 's/^gitdir: //p' "$1/.git" 2>/dev/null | head -1
+}
+
 remove_one() { # <repo> <path>
-  local repo="$1" d="$2"
+  local repo="$1" d="$2" gd=""
   [ -n "$d" ] && [ -n "$repo" ] || return 0
   if ! owns "$repo" "$d"; then
     warn "$d is not a scratch worktree owned by $repo — left in place"
     return 1
   fi
+  gd="$(admin_of "$d")"
   # Owned => scratch by construction: the dirt inside it is the probe's own
   # disposable output (the in-process trap of `run` discards exactly the same
   # thing). `git worktree remove` refuses on untracked/ignored files, so the
@@ -184,23 +210,28 @@ remove_one() { # <repo> <path>
   if [ -e "$d" ]; then
     rm -rf "$d" 2>/dev/null || warn "could not remove $d"
   fi
-  git -C "$repo" worktree prune >/dev/null 2>&1 || true
+  prune_admin "$repo" "$gd"
   return 0
 }
 
 # remove_created() — the IN-PROCESS cleanup path (cycle-4 P1). `run` created $D
 # with mktemp under the canonical ROOT, so it knows the path by identity; it must
 # NOT depend on the in-worktree marker, which the wrapped command can legitimately
-# delete (`git clean -fdx`, `git stash -u`, `rm -rf .`) — with the marker gone,
-# a marker-based removal warns and leaves the worktree AND its admin record
-# behind, defeating the tool's central guarantee. Marker-based ownership stays
-# for CALLER-SUPPLIED paths (`clean <path>`), where identity cannot be proven.
+# delete (`git clean -fdx`, `git stash -u`, `rm -f .scratch-worktree`) — with the
+# marker gone, a marker-based removal warns and leaves the worktree AND its admin
+# record behind, defeating the tool's central guarantee. Marker-based ownership
+# stays for CALLER-SUPPLIED paths (`clean <path>`), where identity cannot be proven.
+#
+# The admin dir is read from $d/.git INSIDE the function, so it is still known
+# after the wrapped command destroyed the marker (and even after a full sweep of
+# untracked files — git never removes a worktree's own `.git` file).
 remove_created() { # <repo> <path>
-  local repo="$1" d="$2"
+  local repo="$1" d="$2" gd=""
   [ -n "$d" ] || return 0
+  gd="$(admin_of "$d")"
   git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
   if [ -e "$d" ]; then rm -rf "$d" 2>/dev/null || warn "could not remove $d"; fi
-  git -C "$repo" worktree prune >/dev/null 2>&1 || true
+  prune_admin "$repo" "$gd"
   return 0
 }
 
@@ -236,7 +267,12 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
     if [ "$FORCE_ALL" != 1 ]; then
       n="$(list_scratch "$REPO" | wc -l | tr -d ' ')"
       [ "$n" = 0 ] && { echo "$PROG: no scratch worktrees for $REPO"; exit 0; }
-      printf '%s\n' "$PROG: refusing to sweep $n scratch worktree(s) — a bare\n  `clean --all` cannot see a holder whose argv does not name the path, so it\n  would delete a sibling session's in-flight probe. Clean only your own path:\n    $PROG clean <path>\n  Or, deliberately, sweep with --force-all:" >&2
+      printf '%s\n' \
+        "$PROG: refusing to sweep $n scratch worktree(s). A bare sweep cannot" \
+        "  see a holder whose argv does not name the path, so it would delete a" \
+        "  sibling session's in-flight probe. Clean only your own path:" \
+        "    $PROG clean <path>" \
+        "  Or, deliberately, sweep with --force-all:" >&2
       list_scratch "$REPO" | sed 's/^/    /' >&2
       exit 0
     fi
@@ -248,9 +284,9 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
       fi
       remove_one "$REPO" "$d" || true
     done < <(list_scratch "$REPO")
-    # Records whose directory is already gone (a wrapped `rm -rf .`) are not
-    # removable by `owns()`; the prune is what reclaims them.
-    git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+    # Records whose directory is already gone (a wrapped `rm -rf .`) are no
+    # longer removable by `owns()`, and a blanket prune is FORBIDDEN — it would
+    # deregister unrelated sibling worktrees (see prune_admin).
     exit 0
   fi
   [ -n "$CLEAN_TARGET" ] || die "clean needs a path or --all"
@@ -305,13 +341,13 @@ if [ "${#PATHS_ARR[@]}" -gt 0 ]; then
   if ! git -C "$REPO" worktree add --detach --no-checkout "$D" "$REF" >/dev/null 2>&1; then
     rm -rf "$D"; die "git worktree add failed for $REF"
   fi
-  git -C "$D" sparse-checkout set --no-cone "${PATHS_ARR[@]}" >/dev/null 2>&1 \
-    || { rm -rf "$D"; git -C "$REPO" worktree prune >/dev/null 2>&1; die "sparse-checkout set failed"; }
+  git -C "$D" sparse-checkout set --no-cone "${PATHS_ARR[@]/#//}" >/dev/null 2>&1 \
+    || { remove_created "$REPO" "$D"; die "sparse-checkout set failed"; }
   # With --no-checkout the index is empty, so sparse-checkout set alone
   # materialises NOTHING; `read-tree -mu HEAD` (plumbing) is the step that
   # writes the sparse paths.
   git -C "$D" read-tree -mu HEAD >/dev/null 2>&1 \
-    || { rm -rf "$D"; git -C "$REPO" worktree prune >/dev/null 2>&1; die "sparse checkout materialisation failed"; }
+    || { remove_created "$REPO" "$D"; die "sparse checkout materialisation failed"; }
 else
   if ! git -C "$REPO" worktree add --detach "$D" "$REF" >/dev/null 2>&1; then
     rm -rf "$D"; die "git worktree add failed for $REF"
@@ -341,13 +377,17 @@ cleanup_run() {
     # bounds it; it is only cancelled once the group is provably empty, so a
     # TERM-ignoring DESCENDANT (leader exits first) is still reaped.
     kill -- -"$CMD_PID" 2>/dev/null || true
-    ( sleep "$SCRATCH_WORKTREE_KILL_GRACE" 2>/dev/null; kill -9 -- -"$CMD_PID" 2>/dev/null ) &
+    # `-9`, and stderr silenced: a TERM to a bash-3.2 subshell parked in `sleep`
+    # makes it emit `run_pending_traps: bad value in trap_list` on ~27% of
+    # SUCCESSFUL runs, which an agent reads as the tool corrupting itself.
+    ( sleep "$SCRATCH_WORKTREE_KILL_GRACE" 2>/dev/null; kill -9 -- -"$CMD_PID" 2>/dev/null ) 2>/dev/null &
     watch=$!
     wait "$CMD_PID" 2>/dev/null || true
     # The leader is reaped. Any process still in the group is a straggler —
     # SIGKILL it now (no need to wait out the grace, the leader is gone).
     if kill -0 -- -"$CMD_PID" 2>/dev/null; then kill -9 -- -"$CMD_PID" 2>/dev/null || true; fi
-    kill "$watch" 2>/dev/null || true
+    kill -9 "$watch" 2>/dev/null || true
+    wait "$watch" 2>/dev/null || true
   fi
   remove_created "$REPO" "$D"
   exit "$rc"
