@@ -203,6 +203,18 @@ jobs:
         run: pip install pytest pytest-timeout pyyaml
       - name: Vendored parallel_work_check suite (pytest, B1–B34)
         run: python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q
+      - name: CI-exemption decision suite (#3761 — pytest, its own step)
+        # #3761 — `scripts/ci_exemption.py` is exec'd by the rail BY PATH
+        # (scripts/admin-merge.sh:159 `EXEMPTION_PY`, :246 the fail-closed
+        # guard, :256 the exec) and had ZERO tests in this repo: the 58
+        # assertions covering it lived only in tortoise, against a vendored
+        # COPY (`tools/ci_exemption.py`). A suite over a copy is a false-PASS
+        # generator — green while the real module drifts — so the suite lives
+        # here, loads the canonical file BY LOCATION and pins `__file__` to it
+        # (test_tests_load_the_file_the_rail_execs). THIS step is what makes it
+        # non-inert: an unwired suite passes in CI by never running.
+        # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
+        run: python3.12 -m pytest tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
       - name: Merge-scope subtraction suite (#755, SDK-free)
