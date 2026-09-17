@@ -260,6 +260,58 @@ not-checked-out-anywhere semantics:
    marker (the documented prompt contract); the CAP stays active under the
    marker (D3 — the marker never re-enables hub writes).
 
+### The clean-hub sync allowance is EFFECT-shaped, not verb-shaped (#1144)
+
+When the hub is **clean and on its baseline branch**, the destructive-git block
+admits one narrow class of ops without a hatch: the session's OWN branch syncs.
+That allowance is decided on the operation's **effect**, never its verb.
+
+Live 2026-09-17: `git rebase origin/main` on the SHARED tortoise hub's `main`
+moved that branch (rewriting the local tip onto `origin/main`) under **11 live
+sessions** with **no hatch** — while the comparable `git reset --hard
+origin/main` was refused and demanded `AGENT_ALLOW_MAIN_EDITS=1`. The allowance
+fired because it matched the VERB (`merge`/`pull`/`rebase`) whenever
+`currentBranch === baselineBranch`. A verb list cannot be repaired by
+lengthening it: the enforcement is a string scan, so both its false-positive
+surface (prose that only DESCRIBES a verb) and its false-negative surface (a
+spelling it does not enumerate) are functions of TEXT, not of EFFECT.
+
+The sync arm now requires ALL of (see `shared/branch-ownership.mjs` →
+`syncEffectAllowed` + `classify-git.mjs` → `syncEffectOf`):
+
+| Condition | Meaning |
+|---|---|
+| `scopeOwnRepo` | the op acts on the repo the session's **baseline was recorded in** — a `-C`/cwd hop into another repo's hub cannot borrow this session's allowance (the comment said "agent-infra main"; the behaviour was any repo's `main`) |
+| `treeClean` | the shared checkout has no uncommitted work at the moment of the decision |
+| `onlyGitInvocation` | the sync op is the command's ONLY git invocation — the classifier assigns one verdict from one verb while the parsed effect describes the FIRST sync op, so `git pull --ff-only && git rebase origin/main` looks fast-forward while carrying a rewrite |
+| `ffOnly` | the op carries `--ff-only` (last-wins across `--ff`/`--no-ff`/`--ff-only`): the only sync effect that cannot move the baseline tip backwards or rewrite a commit |
+| not `rebaseEffect` | `rebase`, `pull --rebase`, `pull -r` REPLACE the tip instead of advancing it |
+| not `leavesDirty` | no `--squash` / `--no-commit` staged state left in the shared tree |
+| not `unverifiable` | every option-shaped token is a KNOWN one — an abbreviated long option (`--mess`) or an optional-argument one (`--gpg-sign`) can silently swallow or free an `--ff-only`, so unlisted shapes fail closed |
+
+Absent or partial evidence fails **closed** — a caller that supplies no effect
+record cannot satisfy the sync arm at all. `git pull --ff-only` and `git merge
+--ff-only` remain permitted without a hatch (the allowance's genuine purpose);
+everything else needs a worktree or the human hatch, and the refusal message
+**names the permitted fast-forward forms** instead of pointing only at the
+hatch.
+
+Two consequences of "effect, not verb" that the first cut missed (found by the
+second review cycle) are worth stating, because they are the same rule applied
+one level down:
+
+- **Worktree exemptions are per-INVOCATION.** `git -C <worktree> status && git
+  reset --hard origin/main` used to inherit the leading segment's worktree
+  exemption while the `reset` ran at the shell cwd — the `-C` binds only the
+  segment it precedes — and so moved the shared hub. The exemption now holds
+  only when EVERY git invocation in the command resolves inside a worktree.
+- **A carve-out may not close a compound command it does not describe.** The M3
+  return-to-original carve-out (#376) returned early for the whole command, so
+  `git checkout main && git reset --hard origin/main` ran with its blessing. It
+  now closes the command only when every OTHER invocation is read-only — where
+  "read-only" includes a refspec-less `git fetch`, which cannot write
+  `refs/heads/*`.
+
 **Why WIP preservation:** the 2026-08-18 incident left 38 commits on `pr1467`
 in the hub. `git push origin <checked-out-branch>` is the ONE allowed push so
 a stranded lane's work never silently dies before recovery.

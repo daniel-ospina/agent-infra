@@ -1976,6 +1976,154 @@ function _rebaseline(pid: number, branch: string) {
   }
 }
 
+// ── #1144: effect-shaped sync allowance ─────────────────────────────────────
+// The allowance's sync arm (pull/merge/rebase) is decided on the operation's
+// EFFECT, never on its verb. Live 2026-09-17: `git rebase origin/main` on the
+// SHARED tortoise hub's `main` moved that branch (rewriting the local tip onto
+// origin/main) under 11 live sessions with NO hatch, while the comparable
+// `git reset --hard origin/main` was refused and demanded
+// AGENT_ALLOW_MAIN_EDITS=1. A verb cannot be enumerated to safety: this
+// enforcement is a string scan, so both its false-positive surface (prose that
+// only DESCRIBES a verb) and its false-negative surface (a spelling it does not
+// enumerate) are functions of TEXT, not of EFFECT. See
+// shared/branch-ownership.mjs → syncEffectAllowed (the predicate) and
+// classify-git.mjs → syncEffectOf (the parsed half).
+const SYNC_ALLOWANCE_KINDS = new Set<string>(["pull", "merge", "rebase"]);
+
+/** Is the checkout at `cwd` free of uncommitted work? Unverifiable (git error,
+ *  no cwd) collapses to false — the sync arm must not fire on a guess. */
+function _checkoutTreeClean(cwd: string | null | undefined): boolean {
+  if (!cwd) return false;
+  try {
+    const porcelain = execSync("git status --porcelain", {
+      encoding: "utf-8", cwd, timeout: 5000,
+    }).trim();
+    return porcelain.length === 0;
+  } catch {
+    return false; // fail closed — never admit a shared-branch move unverified
+  }
+}
+
+/** Assemble the `effect` record the sync arm needs from the LIVE checkout
+ *  preconditions (own repo, clean tree) and the classifier's parsed effect +
+ *  only-git-invocation flag. Returns null when the parsed half is absent so
+ *  the predicate fails closed. */
+function _syncAllowanceEffect(eff: any, baseline: any, det: any) {
+  const parsed = det?.syncEffect ?? null;
+  if (!parsed) return null;
+  const scopeOwnRepo = !!(baseline?.repoKey && eff?.repoKey && baseline.repoKey === eff.repoKey);
+  return {
+    parsedEffect: parsed,
+    onlyGitInvocation: det?.syncOnlyInvocation === true,
+    scopeOwnRepo,
+    treeClean: _checkoutTreeClean(eff?.effectiveCwd ?? eff?.cwd ?? null),
+  };
+}
+
+/** #1144 (reviewer P0): resolve the SYNC invocation's OWN repo. `eff` is
+ *  resolved from the state-mutating / first invocation's hints, so a compound
+ *  whose first segment is `git -C <worktree> …` made `eff.isWorktree` true and
+ *  worktree-exempted a LATER sync op that actually runs at the shell cwd
+ *  (`git -C <wt> status && git rebase origin/main` — the `-C` binds only the
+ *  status; the rebase moves the SHARED hub). Returns null when the sync
+ *  invocation's target cannot be resolved → the predicate fails closed. */
+function _syncEffectiveRepo(det: any) {
+  if (!branchOwnership) return null;
+  try {
+    if (det?.syncInvVisible === false) {
+      // extractor-invisible payload → it runs at the shell cwd (fail closed,
+      // never a worktree exemption the repo layer cannot verify)
+      return branchOwnership.resolveEffectiveRepo("git status", process.cwd());
+    }
+    if (det?.syncHints) return branchOwnership.resolveRepoFromInv(det.syncHints, process.cwd());
+    return null; // no boundary-aware hints for the sync op → unverifiable
+  } catch {
+    return null;
+  }
+}
+
+/** #1144 (cycle-2 reviewer P0) — the LEGACY_BLOCK arm's worktree exemption.
+ *  `eff.isWorktree` is resolved from ONE invocation's hints, so a compound
+ *  command beginning with `git -C <worktree> …` made it true and laundered a
+ *  LATER destructive segment that runs at the shell cwd
+ *  (`git -C <wt> status && git reset --hard origin/main` moved the shared hub).
+ *  Returns:
+ *    true      — EVERY git invocation in the command resolves to a worktree
+ *    false     — at least one does not (or is invisible/unresolvable) → block
+ *    undefined — the classifier emitted no per-invocation data (degraded
+ *                build): the caller keeps its previous behaviour rather than
+ *                hard-blocking every destructive op in a worktree session. */
+function _allInvocationsWorktreeScoped(det: any): boolean | undefined {
+  const invs = det?.invocationHints;
+  if (!Array.isArray(invs) || invs.length === 0) return undefined;
+  if (!branchOwnership) return undefined;
+  for (const inv of invs) {
+    if (inv?.visible === false) return false; // shell cwd, unverifiable → fail closed
+    try {
+      const r = inv?.hints ? branchOwnership.resolveRepoFromInv(inv.hints, process.cwd()) : null;
+      if (!r || r.isWorktree !== true) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** The sync arm's refusal. It states WHY, and — per #1144 — names the
+ *  fast-forward forms whose effect IS safe, instead of pointing only at the
+ *  human hatch: the asymmetry (hatch-required via one verb, hatch-free via
+ *  another) is what made the verb-shaped allowance read as a defect. */
+function _syncAllowanceBlockReason(kind: string, baseline: any, eff: any, det: any, effect: any): string {
+  const parsed = det?.syncEffect ?? null;
+  const branch = baseline?.branch ? `"${baseline.branch}"` : "(no session baseline recorded)";
+  const why: string[] = [];
+  if (!baseline) {
+    why.push("   No baseline was recorded for this checkout, so ownership of the");
+    why.push("   branch cannot be established — the allowance fails closed.");
+  } else if (eff?.currentBranch !== baseline.branch) {
+    why.push(`   This checkout is on "${eff?.currentBranch ?? "HEAD"}", not this session's`);
+    why.push(`   baseline ${branch} — the allowance only ever covers the session's OWN branch.`);
+  } else if (parsed?.rebaseEffect === true) {
+    why.push("   A rebase-integration REPLACES the baseline tip instead of advancing it —");
+    why.push("   that is the same branch move as the `reset`/`clean` this gate refuses.");
+  } else if (parsed?.ffOnly !== true) {
+    why.push("   Only a PROVABLE fast-forward is admitted. This form may resolve to a");
+    why.push("   rebase (git config pull.rebase / branch.<name>.rebase) or mint a merge");
+    why.push("   commit on the shared branch, so it fails closed.");
+  }
+  if (parsed?.unverifiable === true) {
+    why.push("   The flag cannot be PROVEN to be an option here: a `--` terminator makes");
+    why.push("   it a path/ref name, an unresolvable expansion is resolved by the shell");
+    why.push("   AFTER this check, and an option shape outside the known flag sets can");
+    why.push("   silently swallow or free an ff token — either way the effective");
+    why.push("   fast-forward flag is unknown.");
+  }
+  if (parsed?.leavesDirty === true) {
+    why.push("   It also leaves staged/index state in the shared tree (--squash/--no-commit).");
+  }
+  if (effect && effect.onlyGitInvocation !== true) {
+    why.push("   The command contains other git operations, so the fast-forward evidence");
+    why.push("   cannot cover what else it may do to the branch. → Run the sync on its own.");
+  }
+  if (effect && effect.scopeOwnRepo !== true) {
+    why.push("   It targets a DIFFERENT repository than the one this session's baseline was");
+    why.push("   recorded in.");
+  }
+  if (effect && effect.treeClean !== true) {
+    why.push("   This checkout has uncommitted changes — nothing may move the branch now.");
+  }
+  return [
+    `⛔ ${kind} blocked in the shared MAIN checkout — the fast-forward-only allowance does not cover it (#1144).`,
+    `   Branch: ${branch} (this session's baseline, in a checkout SHARED between agents).`,
+    ...why,
+    "   → Permitted without a hatch: `git pull --ff-only` / `git merge --ff-only`",
+    "     (a fast-forward cannot move the tip backwards or rewrite a commit).",
+    "   → Work in an isolated worktree: invoke the using-git-worktrees skill.",
+    "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for",
+    "     deliberate solo sessions.",
+  ].join("\n");
+}
+
 // ── M1: warn on branch deviation (every tool_call, all tool types) ────────
 function _m1(pid: number) {
   if (!branchOwnership) return;
@@ -2559,7 +2707,14 @@ export default function (pi: ExtensionAPI) {
               }
             }
             _rebaseline(pid, m3.reBaseline);
-            return undefined;
+            // #1144 (reviewer P1): the carve-out may only close the WHOLE
+            // command when every other git invocation is read-only. Pre-fix
+            // this `return undefined` laundered a destructive LATER segment in
+            // an agent-infra hub — `git checkout main && git reset --hard
+            // origin/main` (and `… && git rebase origin/main`) ran with the
+            // sanctioned return's blessing. Otherwise fall through to the
+            // remaining gates, which see the command's real verdict.
+            if (det.stateCarveOutClean === true) return undefined;
           }
         }
       }
@@ -2605,12 +2760,22 @@ export default function (pi: ExtensionAPI) {
           : ((det.deleteTargets && det.deleteTargets.length > 0)
             ? det.deleteTargets
             : (det.newBranch ? [det.newBranch] : []));
+        // #1144: sync ops are admitted on their EFFECT, never their verb. The
+        // record is built from the classifier's parsed effect of THIS
+        // invocation plus the LIVE checkout preconditions OF THE SYNC OP'S OWN
+        // REPO (syncEff — never the command-level `eff`, whose hints may come
+        // from a different, worktree-scoped segment). A sync kind with no
+        // record fails closed (see syncEffectAllowed).
+        const isSyncKind = SYNC_ALLOWANCE_KINDS.has(allowanceKind);
+        const syncEff = isSyncKind ? _syncEffectiveRepo(det) : null;
+        const effect = isSyncKind ? _syncAllowanceEffect(syncEff, baseline, det) : undefined;
         if (branchOwnership.ownershipAllowed({
           opKind: allowanceKind,
           currentBranch: eff.currentBranch,
           baselineBranch: baseline?.branch ?? null,
           targets,
           syncSource: det.syncSource,
+          effect,
           // #376 review fold-in: branches this pid renamed its own baseline
           // to (scoped to THIS repo) stay locally deletable after the ceremony
           // return re-bases the baseline (own-branch hygiene). create-new is
@@ -2640,6 +2805,17 @@ export default function (pi: ExtensionAPI) {
           const foreignDelete = baselineBranch !== null && wcDeletes.some((b) => b !== baselineBranch);
           if (!foreignDelete) return undefined;
           // foreign later-segment delete present → fall through to the #73 arms.
+        } else if (isSyncKind && syncEff?.isWorktree !== true) {
+          // #1144: the sync allowance DENIED. Fall to the legacy arm for the
+          // verdict but with the effect-specific refusal. The exemption keys on
+          // the SYNC OP'S OWN resolved repo (reviewer P0): a leading
+          // `git -C <worktree> …` segment must not exempt a later sync op that
+          // runs at the shell cwd (the shared hub). An unresolvable sync target
+          // (`syncEff === null`) is refused — fail closed, never exempt.
+          return {
+            block: true,
+            reason: _syncAllowanceBlockReason(allowanceKind, baseline, syncEff ?? eff, det, effect),
+          };
         }
       }
 
@@ -2738,7 +2914,13 @@ export default function (pi: ExtensionAPI) {
         "block:force-push",
       ];
       if (LEGACY_BLOCK.includes(det.verdict)) {
-        if (eff && eff.isWorktree) return undefined;
+        // #1144 cycle-2 P0: the exemption must hold for EVERY git invocation in
+        // the command, not just the one `eff` was resolved from — otherwise a
+        // leading `git -C <worktree> …` segment launders a destructive segment
+        // that actually runs at the shell cwd (`git -C <wt> status && git reset
+        // --hard origin/main`). `undefined` (no per-invocation data) keeps the
+        // previous single-invocation behaviour.
+        if (eff && eff.isWorktree && _allInvocationsWorktreeScoped(det) !== false) return undefined;
         const kind = det.verdict.slice("block:".length);
         return {
           block: true,
