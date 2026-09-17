@@ -376,7 +376,7 @@ attribute_residual() {
   while IFS= read -r nodeid; do
     [ -n "$nodeid" ] || continue
     file="${nodeid%%::*}"
-    if [ -n "$main_files" ] && printf '%s\n' "$main_files" | grep -qxF "$file"; then
+    if [ -n "$main_files" ] && grep -qxF -- "$file" <<<"$main_files"; then
       printf '   %s\n      -> measured on this lane, not present on main\n' "$nodeid"
     else
       printf '   %s\n      -> not measurable on this lane: main carries no failure in %s, so absence is NOT evidence of novelty\n' "$nodeid" "$file"
