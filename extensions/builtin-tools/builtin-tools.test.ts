@@ -2575,6 +2575,7 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
     const args = raw.slice(0, close);
     ok(args.includes("...hbThresholds,"), `decision call site ${i + 1} must spread the loop's own hbThresholds`);
     ok(!/heartbeatTimeoutMs:/.test(args) && !/intervalMs:/.test(args), `decision call site ${i + 1} must not name heartbeatTimeoutMs:/intervalMs: in its arguments at all — before or after the spread`);
+    ok(args.indexOf("...") === args.lastIndexOf("..."), `decision call site ${i + 1} must spread hbThresholds and nothing else — a SECOND spread after it re-introduces the window inputs without naming either one`);
   });
   equal((code.match(/heartbeatKillDecision\s*\(/g) ?? []).length, 3, "one declaration + exactly two DIRECT-callee calls; an alias, a parenthesized callee (f)(…), f?.(…) and f.call/apply are NOT claimed — this pins the direct-call count, not every possible invocation");
 
@@ -2612,13 +2613,21 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   const hcBody = src.slice(hcStart, hcEnd);
   ok(/if\s*\(\s*settled\s*\)\s*return;/.test(hcBody), "the hard-cap callback still short-circuits on `settled`");
   ok(/if\s*\(\s*!hasOutput\s*\)/.test(hcBody), "the hard-cap callback still branches on `hasOutput`");
-  // Only the parenthesised CONDITION is normalised, so a pure reformat
-  // (if (\n  !hasOutput\n) {) stays green while any change of the condition
-  // itself reds. Any change to these two conditions changes the far tail's
-  // owner and must be re-reviewed, not silently accommodated.
+  // Only the parenthesised CONDITION is normalised, so a WHITESPACE-ONLY
+  // reformat (a wrapped condition) stays green. Redundant parens
+  // (`if ((!hasOutput))`) or an in-condition comment are a deliberate RED — the
+  // extraction cannot balance parens — and either is a change to review. Any
+  // change to these two conditions changes the far tail's owner and must be
+  // re-reviewed, not silently accommodated.
   const hcGuardConds = (hcBody.match(/\bif\s*\(([^)]*)\)/g) ?? []).map((g) => g.slice(g.indexOf("(") + 1, -1).replace(/\s+/g, " ").trim());
   equal(hcGuardConds.slice().sort().join(" | "), "!hasOutput | settled", "the callback's guards are EXACTLY `settled` and `!hasOutput` — a freshness term folded into one of them is caught whatever its spelling");
-  ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS|getHeartbeatIntervalMs|intervalMs|cutGapMs/.test(hcBody), "…and no freshness expression may appear in the callback OUTSIDE those `if` headers (a `switch`, ternary or `||`-shaped gate) — the condition pin cannot see those. `lastMarkerAt` is deliberately NOT listed: the callback reads it for the marker-age report");
+  ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS|heartbeatTimeoutMs|getHeartbeatIntervalMs|clampHeartbeatIntervalMs|HEARTBEAT_INTERVAL_MS|TASK_HEARTBEAT_INTERVAL_MS|DEFAULT_HEARTBEAT|intervalMs|hbThresholds|cutGapMs/.test(hcBody), "…and no freshness expression may appear in the callback OUTSIDE those `if` headers (a `switch`, ternary or `||`-shaped gate) — the condition pin cannot see those. A denylist can never be complete (cycle 6's set was itself narrower than cycle 4's: it had dropped `hbThresholds`, which is what caught a `hbThresholds.heartbeatTimeoutMs` fold); the MARKER-clock family below is pinned POSITIVELY instead, because it cannot be listed here at all");
+  // The marker clock cannot go in the denylist: the callback reads
+  // `hbCtx.state.lastMarkerAt` TWICE on its one report declaration, and the
+  // `markerAgeMs` local six times in the same report. Positive pins instead:
+  equal(hcBody.split("hbCtx.state.lastMarkerAt").length - 1, 2, "the callback reads the marker clock exactly twice — both on the single report declaration. A THIRD read is a freshness gate on the far tail (this is the read a `markerAgeMs`/`lastMarkerAt`-based gate needs)");
+  ok(/const markerAgeMs = [^;]+;\s*doResolve\(composeAbnormalExit\(/.test(hcBody), "the marker-age local flows STRAIGHT into the resolve — nothing (not even a ternary) may sit between them, which is how the far tail would become freshness-gated without adding an `if` header");
+  ok(hcBody.indexOf("if (settled) return;") < hcBody.indexOf("killTreeAndEscalate()"), "the `settled` short-circuit precedes the tree kill — a settled dispatch's tree must not be killed; the guards' conditions alone do not pin their order");
 
   // (d) Behavioural side of the same coupling: with the interval term dominating
   // the max, the decision's window must follow `i.intervalMs` — a T-only window
