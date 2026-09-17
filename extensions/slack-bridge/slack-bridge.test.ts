@@ -1570,6 +1570,7 @@ try {
   }
 }
 
+<<<<<<< Updated upstream
 // ── Dead-session recovery (#158): startup sweep + TTL escalation ──
 // (i) stale surfaced with id/artifact/reviewer; (ii) fresh silent;
 // (iii) repo filtering; (iv) TTL with repo → gh issue + ⏱ banner;
@@ -1833,6 +1834,8 @@ try {
   }
 }
 
+=======
+>>>>>>> Stashed changes
 // ── Factory: explicit enablement logging (#40) ────────
 {
   const handlers = new Map<string, Function[]>();

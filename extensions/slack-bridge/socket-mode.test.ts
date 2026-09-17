@@ -480,9 +480,13 @@ async function startConnected(opts: {
   stateFile?: string | null;
   onVerdict?: (id: string, verdict: string, reviewer: string) => void;
   onFeedback?: (id: string, text: string, reviewer: string) => void;
+<<<<<<< Updated upstream
 } = {}): Promise<{
   state: SocketModeState; api: MockOpenAPI; wsServer: MockWSServer; ownerFile: string;
 }> {
+=======
+} = {}): Promise<{ state: SocketModeState; api: MockOpenAPI; wsServer: MockWSServer }> {
+>>>>>>> Stashed changes
   const api = new MockOpenAPI();
   const wsServer = new MockWSServer();
   api.setUrl(`ws://localhost:${wsServer.port}`);
@@ -1210,6 +1214,7 @@ async function startConnected(opts: {
   rmSync(dir, { recursive: true, force: true });
 }
 
+<<<<<<< Updated upstream
 // ── Test 28: saturation disconnect → yield + 10-min backoff, no 60s loop (#188) ──
 {
   const { state, api, wsServer } = await startConnected();
@@ -1503,6 +1508,8 @@ async function startConnected(opts: {
 // Cleanup: remove per-test owner-lease tmp dirs (suite rmSync convention).
 for (const d of ownerDirs) rmSync(d, { recursive: true, force: true });
 
+=======
+>>>>>>> Stashed changes
 console.log(`\nsocket-mode.test.ts: ${passed} passed, ${failed} failed`);
 if (failed > 0) {
   console.error("❌ SOME TESTS FAILED");

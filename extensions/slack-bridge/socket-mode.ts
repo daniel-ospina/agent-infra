@@ -25,6 +25,7 @@
 //      ⛔ escalation banner when the entry is past the revision cap, #157).
 //      Bot posts and subtype events never self-trigger; replies under
 //      resolved approvals are ignored.
+<<<<<<< Updated upstream
 //   8. (#188) owns the connection SINGLE-OWNER per machine: exactly one pi
 //      process holds the Socket Mode slot at a time. A lock file
 //      (~/.pi/agent/slack-socket-owner.json, {pid, startTime, heartbeat})
@@ -35,6 +36,8 @@
 //      error from apps.connections.open) the receiver YIELDS the lease, logs an
 //      actionable message, and retries on a 10-minute cadence — never the
 //      fixed 60s reconnect loop (observed fail streak 41→100+, #188).
+=======
+>>>>>>> Stashed changes
 //
 // Self-contained on purpose (#146 design decision): the ~15–30 lines of
 // overlap with index.ts (seen-file read/write, findApprovalsFile, HTTPS POST
@@ -111,6 +114,7 @@ export interface SocketModeState {
   apiUrl: string; // API base override for tests ("http://localhost:PORT")
   onVerdict?: (id: string, verdict: string, reviewer: string) => void; // test hook
   onFeedback?: (id: string, text: string, reviewer: string) => void; // #156 test hook
+<<<<<<< Updated upstream
   // ── Single-owner election (#188) ──
   ownerLockFile: string | null; // override (tests); null → ~/.pi/agent/slack-socket-owner.json
   ownsLock: boolean; // this process currently holds the owner lease
@@ -128,6 +132,8 @@ export interface SocketModeState {
   displacedGraceMs?: number;
   leaseHoldMaxFails?: number;
   minStableConnectMs?: number;
+=======
+>>>>>>> Stashed changes
 }
 
 interface SocketEnvelope {
@@ -435,6 +441,7 @@ export function settleEscalatedMessage(opts: {
   });
 }
 
+<<<<<<< Updated upstream
 /** #158: settle a changes_requested message to the ⏱ redraft-escalation
  * banner when the 24h TTL expired without pickup (dead-session recovery).
  * issueUrl present → "Escalated to issue" (with link to the filed GitHub
@@ -477,6 +484,8 @@ export function settleRedraftEscalatedMessage(opts: {
   });
 }
 
+=======
+>>>>>>> Stashed changes
 /** #157: settle the previous revision's message to the ↻ superseded banner
  * when a re-request (v<revision>) is posted. No buttons — the new message
  * carries the live Accept/Reject actions. Same fire-and-forget contract. */
@@ -556,6 +565,7 @@ export function updateResolvedMessage(opts: {
   return postChatUpdate({ channel: opts.channel, ts: opts.ts, text, blocks, token, apiUrl: opts.apiUrl });
 }
 
+<<<<<<< Updated upstream
 // ── Single-owner election (#188) ──────────────────────
 // One pi process per machine holds the Socket Mode connection. The lock file
 // is the shared lease: {pid, startTime, heartbeat}. A lease is stale when the
@@ -985,6 +995,8 @@ function scheduleDisplacedReelect(state: SocketModeState): void {
   state.displacedReelectTimer.unref();
 }
 
+=======
+>>>>>>> Stashed changes
 // ── Verdict write contract (approvals.json) ──────────
 // Same file + format scanApprovals() reads (the swarm review_approval()
 // contract). Duplicated discovery from index.ts (#2492): SLACK_APPROVAL_FILE
@@ -1150,10 +1162,14 @@ function readApprovalsFile(
  * half-written by scanApprovals. Throws on IO failure (callers catch). */
 function writeApprovalsFile(file: string, approvals: ApprovalRequest[]): void {
   const tmp = file + ".tmp";
+<<<<<<< Updated upstream
   // #2492 review: keep the store 0600 — the tmp inode must not downgrade
   // the per-repo store to umask-default (0644) on rename.
   writeFileSync(tmp, JSON.stringify(approvals, null, 2), { mode: 0o600, encoding: "utf-8" });
   chmodSync(tmp, 0o600);
+=======
+  writeFileSync(tmp, JSON.stringify(approvals, null, 2), "utf-8");
+>>>>>>> Stashed changes
   renameSync(tmp, file);
 }
 
@@ -1685,6 +1701,7 @@ export function startSocketModeReceiver(opts?: {
     apiUrl: opts?.apiUrl ?? "",
     onVerdict: opts?.onVerdict,
     onFeedback: opts?.onFeedback,
+<<<<<<< Updated upstream
     ownerLockFile: opts?.ownerLockFile ?? null,
     ownsLock: false,
     heartbeatTimer: null,
@@ -1692,6 +1709,8 @@ export function startSocketModeReceiver(opts?: {
     ownerRecheckTimer: null,
     ownerSkippedLogged: false,
     lockErrorLogged: false,
+=======
+>>>>>>> Stashed changes
   };
   if (!state.appToken) {
     console.log("[slack-bridge] Socket Mode off — missing SLACK_APP_TOKEN (set an xapp-... token to enable button callbacks)");

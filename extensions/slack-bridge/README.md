@@ -237,6 +237,7 @@ open (v1, 🔔 + buttons)
    │
    └─ revision > 15 (REVISION_CAP) or status "escalated" →
         ⛔ *Escalated — revision cap (15) exceeded* (no buttons, settled once)
+<<<<<<< Updated upstream
 
 …and if the requesting session dies (agent-infra #158):
 
@@ -248,6 +249,8 @@ open (v1, 🔔 + buttons)
    │  or, no repo recorded → ⏱ *Expired* — no repo recorded; re-request
    │  (session_start sweep — see Dead-session recovery below)
 ```
+=======
+>>>>>>> Stashed changes
 ```
 
 Specifically:
@@ -268,6 +271,7 @@ Specifically:
   banner exactly once (the seen entry flips to `escalated` as the once-marker)
   and never gets buttons again. A late thread reply under it also settles to
   the ⛔ banner instead of 📝.
+<<<<<<< Updated upstream
 
 ### Dead-session recovery (agent-infra #158)
 
@@ -319,12 +323,19 @@ disable conditions as the approval wiring: `SLACK_BRIDGE_DISABLE=1`,
 `SLACK_APPROVAL_DISABLE=1`, and print mode (task sub-agents). The ⏱ settle
 banners use the same `SLACK_BOT_TOKEN` + seen-file channel/ts as the other
 settles; missing token or channel/ts skips silently (fire-and-forget).
+=======
+>>>>>>> Stashed changes
 
 ## Tests
 
 ```bash
+<<<<<<< Updated upstream
 npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 248 asserts (self-check)
 npx tsx extensions/slack-bridge/socket-mode.test.ts    # 209 asserts (Socket Mode receiver, mock WS server)
+=======
+npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 152 asserts (self-check)
+npx tsx extensions/slack-bridge/socket-mode.test.ts    # 148 asserts (Socket Mode receiver, mock WS server)
+>>>>>>> Stashed changes
 npx tsx extensions/slack-bridge/chunker.test.ts        # 21 asserts
 ```
 

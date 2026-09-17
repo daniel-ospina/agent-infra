@@ -35,9 +35,13 @@ import {
   updateResolvedMessage,
   settleEscalatedMessage, // #157: ⛔ revision-cap banner (forwarder settle)
   settleSupersededMessage, // #157: ↻ banner when a new revision supersedes
+<<<<<<< Updated upstream
   settleRedraftEscalatedMessage, // #158: ⏱ banner when the 24h TTL expires (dead-session recovery)
   REVISION_CAP, // #157: shared cap — matches the epic decision
   loadScaledTimeoutMs, // #209: load-aware shell-out timeout scaling (keep-in-sync with socket-mode.ts)
+=======
+  REVISION_CAP, // #157: shared cap — matches the epic decision
+>>>>>>> Stashed changes
   type SocketModeState,
 } from "./socket-mode.ts";
 
@@ -784,7 +788,11 @@ export async function scanApprovals(opts?: {
         const parentChannel = parentState.channel || reqChannel;
         const res = await postApprovalRequest(req, token, parentChannel, 5000, parentState.ts);
         if (res.ok) {
+<<<<<<< Updated upstream
           state[req.id] = { status, ts: res.ts, channel: parentChannel, parent_ts: parentState.ts, revision };
+=======
+          state[req.id] = { status, ts: res.ts, channel, parent_ts: parentState.ts, revision };
+>>>>>>> Stashed changes
           result.posted++;
         } else {
           result.failed++;
@@ -807,12 +815,20 @@ export async function scanApprovals(opts?: {
       prev &&
       prev.revision !== revision
     ) {
+<<<<<<< Updated upstream
       const res = await postApprovalRequest(req, token, reqChannel);
+=======
+      const res = await postApprovalRequest(req, token, channel);
+>>>>>>> Stashed changes
       if (res.ok) {
         if (prev.ts && prev.channel) {
           void settleSupersededMessage({ channel: prev.channel, ts: prev.ts, revision, apiUrl: getSlackApiUrl() }).catch(() => {});
         }
+<<<<<<< Updated upstream
         state[req.id] = { ...prev, status, ts: res.ts, channel: reqChannel, revision };
+=======
+        state[req.id] = { ...prev, status, ts: res.ts, channel, revision };
+>>>>>>> Stashed changes
         result.posted++;
       } else {
         result.failed++;
@@ -855,7 +871,11 @@ export async function scanApprovals(opts?: {
       if (status === "pending" && (!req.reviewer || req.reviewer === "human")) {
         const res = await postApprovalRequest(req, token, reqChannel);
         if (res.ok) {
+<<<<<<< Updated upstream
           state[req.id] = { status, ts: res.ts, channel: reqChannel, revision };
+=======
+          state[req.id] = { status, ts: res.ts, channel, revision };
+>>>>>>> Stashed changes
           result.posted++;
         } else {
           result.failed++;
