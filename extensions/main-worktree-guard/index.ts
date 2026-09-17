@@ -155,6 +155,13 @@ let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) =
 // default null → the inline realpath-first fallback runs; never null-holes the
 // exemption (a stale module must not silently disable it) and never throws.
 let _frameworkRootFromModuleUrl: ((moduleUrl: string) => string) | null = null;
+// #1139 (review cycle-2 P1): the pipe-seed walk's tokenizer. Fail-safe default
+// is the previous whitespace split (a stale module without `wtShellWords` keeps
+// today's quote-blind behaviour rather than seeding nothing at all — fewer seeds
+// would be the fail-OPEN direction); the same commit ships both halves, and
+// test.mjs pins the export so the skew fails a test instead of silently
+// reverting.
+let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
@@ -297,6 +304,9 @@ try {
   // frameworkRootFromModuleUrl). Namespace read + typeof guard, same skew
   // contract as #709/#627 above — a stale module leaves the inline fallback.
   if (typeof _m5.frameworkRootFromModuleUrl === "function") _frameworkRootFromModuleUrl = _m5.frameworkRootFromModuleUrl;
+  // #1139: the quote-aware shell tokenizer the pipe-seed walk uses (same skew
+  // contract as above).
+  if (typeof _m5.wtShellWords === "function") wtShellWords = _m5.wtShellWords;
   // #967/#1484: the invocation's positional args feed the subcommand
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
@@ -1323,9 +1333,15 @@ function _worktreeDiscardBlockReason(
   // `⚠️ ${unverifiable}` line above them (review fold-in: a header naming
   // "target not statically resolvable" for every one of the nine is the same
   // misattribution class this function exists to remove).
-  const sanctionedHelper = _frameworkRoot
-    ? resolve(_frameworkRoot, "scripts/checkout-hygiene/hub-worktree.sh")
-    : null;
+  // #1139: the remedy must be a REAL file — in the geometry where the guard is
+  // loaded from a checkout with no `scripts/` (the T6 fixture), `_frameworkRoot`
+  // is non-null but the path does not exist, and printing it would hand the
+  // reader a command that cannot run (review cycle-2 P2).
+  let sanctionedHelper: string | null = null;
+  if (_frameworkRoot) {
+    const p = resolve(_frameworkRoot, "scripts/checkout-hygiene/hub-worktree.sh");
+    try { if (existsSync(p)) sanctionedHelper = p; } catch { sanctionedHelper = null; }
+  }
   return [
     unverifiable !== null
       ? `⛔ Working-tree discard blocked — the discard's effect could not be verified, failing closed (#709).`
@@ -1497,19 +1513,23 @@ function _worktreeDiscardBlock(command: string): string | null {
     const pipeSeg = String(command).split("|");
     const execPlaceholder = /(?:^|\s)(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-[A-Za-z]+\s+)?\{/.test(String(command));
     if (pipeSeg.length > 1 && pipesToShell) {
-      // #1139 (review P1, T4-pipe): the whitespace split kept the SHELL QUOTES,
-      // so `cat "undo.sh" | bash` resolved `'"undo.sh"'`, realpathSync threw,
-      // the file was never read — and a discard inside it ran UNGATED, while the
-      // identical unquoted spelling was walked. Dequote the segment first, and
-      // seed every dequoted WORD plus every SUFFIX of the dequoted words, so a
-      // quoted path containing spaces (and one behind a flag: `cat -n "a b.sh"`)
-      // is resolved too. Seeding MORE candidates only ever makes the walk read
-      // more of what the shell would actually run, so this tightens the gate.
-      const dequoted = String(pipeSeg.slice(0, -1).join("|")).replace(/["']/g, "");
-      const words = dequoted.split(/\s+/).filter(Boolean);
-      const candidates = new Set<string>(words);
-      for (let i = 1; i < words.length; i++) candidates.add(words.slice(i).join(" "));
-      for (const tok of candidates) {
+      // #1139 (review cycle-1 P1, T4-pipe): the whitespace split kept the SHELL
+      // QUOTES, so `cat "undo.sh" | bash` resolved `'"undo.sh"'`, realpathSync
+      // threw, the file was never read — and a discard inside it ran UNGATED,
+      // while the identical unquoted spelling was walked.
+      //
+      // FIXED WITH THE SHARED, QUOTE-AWARE TOKENIZER (review cycle-2 P1). The
+      // first attempt dequoted the whole segment then split on whitespace, which
+      // does NOT reconstruct shell words: it INVENTED a seed for unquoted input
+      // (`cat a b | bash` seeded `a`, `b` AND the non-existent `a b`) and
+      // over-split a quoted one (`cat "a b" | bash` seeded `a` and `b`), so a
+      // file that the shell NEVER reads could pin a false block. `wtShellWords`
+      // returns exactly one token per shell word; each token is then dequoted
+      // per-token (quotes + backslash escapes), and NOTHING is re-joined — so
+      // every seed is a string the shell itself would read as one word, and
+      // `cat -n "a b.sh" | bash` still resolves `a b.sh`.
+      for (const raw of wtShellWords(String(pipeSeg.slice(0, -1).join("|")))) {
+        const tok = raw.replace(/\\(.)/g, "$1").replace(/["']/g, "");
         if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
         try {
           const real = realpathSync(resolve(execCwd, tok));
@@ -1703,38 +1723,44 @@ function _worktreeDiscardBlock(command: string): string | null {
   // is why this reuses the hardened #1129 helper instead of re-deriving one.
   //
   // AUDIT — one row per command, emitted only when a set was ACTUALLY dropped,
-  // and it records HOW MANY discards the relaxation hid. A row that said only
-  // "an exemption fired" cannot answer "did this exemption suppress a block?"
-  // (review fold-in), and a row written from inside the filter predicate fires
-  // even for a sanctioned script whose harvested set carried no discards.
-  const exempted: { rel: string; realpath: string; discards: number; forms: string[] }[] = [];
+  // aggregating BY REALPATH and recording HOW MANY discards the relaxation hid.
+  // A row that said only "an exemption fired" cannot answer "did this exemption
+  // suppress a block?" (review fold-in); a row written from inside the filter
+  // predicate fires even when nothing was dropped; and summing raw push-sites
+  // double-counts, because the same sanctioned file can be pushed as TWO sets in
+  // one command (the bounded walk's `seen` set is local to the walk; the inline
+  // `-c` / `$( )` push sites never consult it), which reported 2 / 2 for
+  // `bash <s>; bash -c 'source <s>'` (review cycle-2 P2).
+  const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>();
   const gatedSets = sets.filter((s) => {
     if (s.script === null) return true; // the command's own argv is never exempt
     let rel: string | null = null;
     // Fail closed on a probe failure: keep the set gated.
     try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script)); } catch { rel = null; }
     if (rel === null) return true;
-    try {
-      exempted.push({
-        rel,
-        realpath: realpathSync(resolve(execCwd, s.script)),
-        discards: s.discs.length,
-        forms: [...new Set(s.discs.map((d) => d.form))],
-      });
-    } catch { exempted.push({ rel, realpath: resolve(execCwd, s.script), discards: s.discs.length, forms: [] }); }
+    let real = resolve(execCwd, s.script);
+    try { real = realpathSync(real); } catch { /* keep the lexical path as the key */ }
+    const prev = exempted.get(real);
+    if (prev) {
+      prev.discards += s.discs.length;
+      for (const d of s.discs) prev.forms.add(d.form);
+    } else {
+      exempted.set(real, { rel, discards: s.discs.length, forms: new Set(s.discs.map((d) => d.form)) });
+    }
     return false;
   });
-  if (exempted.length > 0) {
+  if (exempted.size > 0) {
+    const rows = [...exempted.entries()];
     try {
       appendJsonl({
         event: "m5_script_exemption",
         extension: "main-worktree-guard",
-        script: exempted[0].rel,
-        script_realpath: exempted[0].realpath,
-        scripts: exempted.map((e) => e.rel),
-        sets_exempted: exempted.length,
-        discards_dropped: exempted.reduce((n, e) => n + e.discards, 0),
-        discard_forms: [...new Set(exempted.flatMap((e) => e.forms))],
+        script: rows[0][1].rel,
+        script_realpath: rows[0][0],
+        scripts: rows.map(([, v]) => v.rel),
+        sets_exempted: rows.length,
+        discards_dropped: rows.reduce((n, [, v]) => n + v.discards, 0),
+        discard_forms: [...new Set(rows.flatMap(([, v]) => [...v.forms]))],
         framework_root: _frameworkRoot,
         session_cwd: sessionCwd,
         command: command.slice(0, 300),

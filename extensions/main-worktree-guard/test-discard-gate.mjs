@@ -869,7 +869,40 @@ async function partB() {
       blocked(spacedPipe) && /it would destroy uncommitted work/.test(spacedPipe?.reason ?? ""),
       `reason=${JSON.stringify(spacedPipe?.reason ?? "").slice(0, 300)}`);
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
-    rmSync(spaced, { force: true });
+
+    // NEGATIVE direction (review cycle-2 P1): a seed must be a string the shell
+    // itself reads as ONE word. The first attempt at the pipe fix dequoted the
+    // whole segment then split on whitespace, which (a) invented a joined token
+    // for unquoted input and (b) over-split a quoted word — either way seeding a
+    // file the shell NEVER reads, which pins a FALSE BLOCK on it. Both cases
+    // below ALLOWED on the over-seeding version and must stay allowed.
+    //   B12k  : `cat <harmless-a> <harmless-b> | bash` — the joined name
+    //           "<harmless-a> <harmless-b>" exists and CARRIES A DISCARD, but the
+    //           shell reads only the two separate files, so seeding the join is
+    //           grounds for a false block.
+    //   B12k2 : `cat "<split-name>" | bash` — the quoted name is harmless, but
+    //           the first whitespace-separated half (`w`) carries a discard, so
+    //           over-splitting blocks a command that touches nothing dirty.
+    // `dirty.txt` is left DIRTY for these two so a false seed HAS something to
+    // block on — otherwise even the over-seeding version would allow and the
+    // test would pass vacuously.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const harmlessA = "harmless-a-1139.sh";
+    const harmlessB = "harmless-b-1139.sh";
+    write(join(wt, harmlessA), "true\n");
+    write(join(wt, harmlessB), "true\n");
+    write(join(wt, `${harmlessA} ${harmlessB}`), `git checkout -- dirty.txt\n`);
+    const joined = await bash(`cat ${harmlessA} ${harmlessB} | bash`, wt);
+    expectTrue("B12k: an unquoted word PAIR is not joined into an invented seed (no false block)",
+      allowed(joined), `reason=${JSON.stringify(joined?.reason ?? "").slice(0, 240)}`);
+    const splitName = "w-1139 split-1139.sh";
+    write(join(wt, "w-1139"), `git checkout -- dirty.txt\n`);
+    write(join(wt, splitName), "true\n");
+    const overSplit = await bash(`cat "${splitName}" | bash`, wt);
+    expectTrue("B12k2: a QUOTED word containing a space is not over-split into its halves (no false block)",
+      allowed(overSplit), `reason=${JSON.stringify(overSplit?.reason ?? "").slice(0, 240)}`);
+    for (const f of [harmlessA, harmlessB, `${harmlessA} ${harmlessB}`, splitName, "w-1139"]) rmSync(join(wt, f), { force: true });
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
     rmSync(wrapper, { force: true });
 
     // The ONE allow arm of the status probe: a target with NO working tree has
@@ -932,7 +965,7 @@ await partB();
 async function partC() {
   const tmpc = realpathSync(mkdtempSync(join(tmpdir(), "guard-noanchor-")));
   const prevCwd = process.cwd();
-  const savedEnv = HATCH_VARS.map((v) => [v, process.env[v]]);
+  const savedEnv = [...HATCH_VARS, "HOME", "PI_SESSION_ID"].map((v) => [v, process.env[v]]);
   try {
     const extDir = join(tmpc, "extensions", "main-worktree-guard");
     mkdirSync(join(tmpc, "extensions", "shared"), { recursive: true });

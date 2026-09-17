@@ -2648,7 +2648,7 @@ export function wtShellInlinePayloads(command) {
   for (const seg of segs) {
     const head = _wtHeadInterpreter(seg);
     if (head === null || !_WT_SHELL_WORDS.test(basename(String(head)))) continue;
-    const toks = _wtShellWords(seg);
+    const toks = wtShellWords(seg);
     for (let i = 0; i < toks.length; i++) {
       const t = toks[i];
       if (!(t === "-c" || t === "--command" || (/^-[A-Za-z]*c[A-Za-z]*$/.test(t) && !t.startsWith("--")))) continue;
@@ -2671,7 +2671,7 @@ export function wtShellInlinePayloads(command) {
  * which hid the verb and made the fail-closed arm allow a real discard
  * (reviewer round-7 P1).
  */
-function _wtShellWords(s) {
+export function wtShellWords(s) {
   const out = [];
   let cur = "";
   let started = false;
@@ -2728,7 +2728,7 @@ export function wtPipelineFeedsShell(command) {
     const head = _wtHeadInterpreter(seg);
     if (head === null) return false;
     const base = basename(String(head));
-    const toks = _wtShellWords(seg);
+    const toks = wtShellWords(seg);
     const idx = toks.findIndex((t) => basename(String(t)) === base);
     return toks.slice(idx + 1).every((t) => t.startsWith("-") || STDIN_ALIAS.test(t) || REDIRECT.test(t));
   });

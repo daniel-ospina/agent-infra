@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4974,17 +4974,38 @@ try {
     !pinSrc.includes("for (const set of sets) {"), true);
   expectBool("#1139: the M5 exemption is audit-logged (deliberate relaxation is observable)",
     pinSrc.includes("m5_script_exemption") &&
-    // ... and the row says what the relaxation HID, not just that it fired
+    // ... and the row says what the relaxation HID, aggregated BY REALPATH
     // (review fold-in: a row written from inside the filter predicate fires
-    // even when the dropped set carried no discards).
+    // even when the dropped set carried no discards, and summing raw push sites
+    // double-counts one file pushed as two sets — review cycle-2 P2).
     pinSrc.includes("discards_dropped") && pinSrc.includes("sets_exempted") &&
-    pinSrc.includes("const exempted: { rel: string; realpath: string; discards: number; forms: string[] }[]"), true);
+    pinSrc.includes("const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>()"), true);
+  // The remedy must never print a path that cannot run (review cycle-2 P2).
+  expectBool("#1139: the fail-closed remedy is printed only when that file exists",
+    pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
+    !pinSrc.includes("const sanctionedHelper = _frameworkRoot"), true);
   expectBool("#1139 T6: a null anchor / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
     pinSrc.includes("if (!_frameworkRoot) return null;") &&
     pinSrc.includes("catch { rel = null; }") &&
     pinSrc.includes("if (rel === null) return true;"), true);
-  expectBool("#1139 (review P1): the pipe-seed walk DEQUOTES before resolving (a quoted piped script was unwalked)",
-    pinSrc.includes("const dequoted = ") && pinSrc.includes("words.slice(i).join(\" \")"), true);
+  expectBool("#1139 (review cycle-1 P1): the pipe-seed walk TOKENIZES shell words (a quoted piped script was unwalked)",
+    pinSrc.includes("wtShellWords(String(pipeSeg.slice(0, -1).join(\"|\")))") &&
+    // ... and does NOT dequote-then-split, which invents a seed for unquoted
+    // input (`cat a b` → `a b`) and over-splits a quoted one (`cat "a b"` →
+    // `a` + `b`): both pin a FALSE BLOCK on a file the shell never reads
+    // (review cycle-2 P1).
+    !pinSrc.includes("const dequoted = ") &&
+    !pinSrc.includes("words.slice(i).join(\" \")"), true);
+  // The tokenizer is the SHARED one (one shell-word tokenizer in the repo, not a
+  // second drift-prone copy), bound with the stale-module typeof guard. Pinned
+  // BEHAVIOURALLY via the real import (line 10) — if classify-git stops exporting
+  // it, test.mjs fails to load rather than silently regressing the pipe walk.
+  expectBool("#1139: the pipe walk reuses classify-git's exported quote-aware tokenizer",
+    typeof wtShellWords === "function" &&
+    wtShellWords('cat "a b"').length === 2 &&
+    wtShellWords("cat a b").length === 3 &&
+    wtShellWords('"a""b"').length === 1 &&
+    pinSrc.includes("if (typeof _m5.wtShellWords === \"function\") wtShellWords = _m5.wtShellWords;"), true);
   expectBool("#1139 (review P1): the status probe CAPTURES stderr (the not-a-checkout allow arm was dead code)",
     pinSrc.includes('stdio: ["ignore", "pipe", "pipe"]') &&
     !pinSrc.includes('stdio: ["ignore", "pipe", "ignore"]'), true);
