@@ -102,9 +102,12 @@
  *    written after an assertion** (`"NAME" as any + suffix`): the assertion tail
  *    is matched as a run of characters that excludes `+`, so a concatenation is
  *    never swallowed as part of the type. The tail is still a character class,
- *    not a type parser — a value continuation built from type-position
- *    characters (`"NAME" as any || other`, `… instanceof X`) is a narrow
- *    false-OPEN this guard does not close. Also `process.env[\`NAME\`]`. A
+ *    not a type parser: ANY continuation that avoids `,`, `(`, `)` and `+` is
+ *    swallowed, so `"NAME" as any && other` and `"NAME" as any * suffix` are
+ *    narrow false-OPENs this guard does not close. Not every operator is one —
+ *    `"NAME" as any || other` (or `?? other`) is credited and CORRECT: the
+ *    literal is truthy / non-nullish, so it is still the argument at runtime.
+ *    Also `process.env[\`NAME\`]`. A
  *    differently named helper (`readCfg("NAME")`, `cfg("NAME")`) is therefore
  *    still a false BLOCK.
  *  - PIN 4 COVERS THE BAND VOCABULARY, NOT EVERY PROSE RESTATEMENT. The
