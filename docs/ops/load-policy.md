@@ -281,10 +281,11 @@ Across 2,949 recorded pi transcripts (both `sessions/` and `task-sessions/`):
 | `git clone …` → /tmp | 66 | tree + a second `.git` |
 | `rsync -a --exclude .git …` → /tmp | 48 | full tree |
 
-No script in the repo emitted these (`rg '/private/tmp' skills/` → 0 hits; the
-`code-review` fixer loop was the one worktree user, and it removed its worktree).
-The producers were **agent improvisation** — so the durable fix is an explicit,
-checkable rule in the skill text plus a self-cleaning helper, not a reaper.
+No script in the repo emitted these at the time of measurement (`rg
+'/private/tmp' skills/` → 0 hits; this change *adds* mentions of the path to the
+skills, so that command returns 2 hits at the fixing commit). The producers were
+**agent improvisation** — so the durable fix is an explicit, checkable rule in the
+skill text plus a self-cleaning helper, not a reaper.
 
 Surviving artifacts on that host confirmed two copy shapes:
 `/private/tmp/rev13` and `rev14` — 126 MB each, 4,559 files, **no `.git`** (the
@@ -307,7 +308,7 @@ it" against `agent-infra`, measured with `ls -1 /private/tmp | wc -l` and
 | Per cycle, `--paths skills/code-review` | 112 KB |
 | Per cycle, `--paths <one file>` | 8 KB |
 | Per cycle, `--full` | 22,056 KB (tree only — objects shared) |
-| Per cycle, `git clone --depth 1` (derived: `.git` 124,476 KB + tree 22,048 KB) | ~143,000 KB |
+| Per cycle, `git clone --depth 1` (measured, independent reviewer run: tree 22,048 KB + shallow `.git` 8,508 KB) | ~30,600 KB |
 | Leftover scratch worktrees after the run | **0** |
 
 Reproduce it (from a checkout carrying `scripts/scratch-worktree.sh`):

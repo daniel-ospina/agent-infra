@@ -26,6 +26,8 @@
 #                         SIGKILLed so the worktree is still removed
 #   T12 --help            exits 0
 #   T13 linked-worktree caller cleans up (owns() via the COMMON git dir)
+#   T14 clean --all preserves a scratch worktree a live process holds
+#   T15 a straggler DESCENDANT (leader exits first) is SIGKILLed
 
 set -uo pipefail
 
@@ -196,7 +198,7 @@ sx run --ref "$C2" --paths /etc -- true >/dev/null 2>&1
 # prose ABOUT the ban cannot satisfy it and a real invocation cannot hide.
 BAN_RE='(git[[:space:]]+clone|git[[:space:]]+archive|cp[[:space:]]+-[a-zA-Z]*[rR]|cp[[:space:]]+-a|rsync|tar[[:space:]]+-[a-zA-Z]*x)'
 stripped() { sed 's/#.*//' "$1"; }
-detects() { printf '%s\n' "$1" | grep -qE "$BAN_RE"; }
+detects() { printf '%s\n' "$1" | sed 's/#.*//' | grep -qE "$BAN_RE"; }
 POS_FAIL=0
 for s in 'git clone /x /y' 'cp -R /x /y' 'cp -a /x /y' 'cp -pR /x /y' \
          'rsync -a /x /y' 'git archive HEAD | tar -xf - -C /tmp/z'; do
@@ -204,7 +206,11 @@ for s in 'git clone /x /y' 'cp -R /x /y' 'cp -a /x /y' 'cp -pR /x /y' \
 done
 [ "$POS_FAIL" = 0 ] && PASS "T10a every banned copy shape is detected (positive control)"
 NEG_FAIL=0
-for s in '# cp -R is banned' 'echo "never rsync the repo"' 'git worktree add /x' 'git read-tree -mu HEAD'; do
+# Controls run through the SAME stripping the real scan uses. (A banned word
+# inside a quoted shell string still matches by design — this is a source lint,
+# not a shell parser; the shipped file has no such string.)
+for s in '# cp -R is banned' '# rsync -a src dst would be banned' \
+         'git worktree add /x /y' 'git read-tree -mu HEAD' 'echo ok'; do
   detects "$s" && { FAIL "T10b false positive: $s"; NEG_FAIL=1; }
 done
 [ "$NEG_FAIL" = 0 ] && PASS "T10b comments/prose and worktree/read-tree do not trip the scan"
@@ -246,6 +252,35 @@ else
     || ok 1 "T11b TERM-ignoring child leaked the worktree (D11=${D11:-unset})"
 fi
 [ "$(live_scratch)" = 0 ] && ok 0 "T11c no admin record survives the TERM-ignoring child" || ok 1 "T11c no admin record survives the TERM-ignoring child"
+
+# ── T14: `clean --all` PRESERVES a scratch worktree a live process holds ─────
+D14="$(sx create --ref "$C2" --full 2>/dev/null)"
+bash -c "cd '$D14' && sleep 8" >/dev/null 2>&1 &
+HOLD=$!
+sleep 1
+sx clean --all >/dev/null 2>&1
+[ -d "$D14" ] && ok 0 "T14a a live-held scratch worktree is PRESERVED" || ok 1 "T14a a live-held scratch worktree is PRESERVED"
+kill "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
+pkill -P "$HOLD" 2>/dev/null
+sleep 1
+sx clean --all >/dev/null 2>&1
+[ ! -e "$D14" ] && ok 0 "T14b the released scratch worktree is removed" || ok 1 "T14b the released scratch worktree is removed"
+
+# ── T15: a straggler DESCENDANT (leader exits first) is still SIGKILLed ──────
+# The leader exits immediately, so `wait` returns at once; the TERM-ignoring
+# descendant stays in the group. If the watchdog were cancelled at that point
+# the descendant would outlive the worktree (cycle-3 P1).
+P15="$FIX/t15path"; ORPH2="$FIX/orphan2"
+SCRATCH_WORKTREE_KILL_GRACE=1 bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" \
+  --ref "$C2" --full -- bash -c "pwd > '$P15'; ( trap '' TERM; sleep 4; touch '$ORPH2' ) & exit 0" \
+  >/dev/null 2>&1
+RC15=$?
+sleep 5
+D15="$(cat "$P15" 2>/dev/null)"
+[ "$RC15" = 0 ] && ok 0 "T15a leader exit code survives" || ok 1 "T15a leader exit code survives (rc=$RC15)"
+[ ! -e "$ORPH2" ] && ok 0 "T15b a TERM-ignoring descendant is SIGKILLed (no orphan)" || ok 1 "T15b a TERM-ignoring descendant survived"
+{ [ -n "$D15" ] && [ ! -e "$D15" ]; } && ok 0 "T15c the worktree is removed" || ok 1 "T15c the worktree is removed (D15=${D15:-unset})"
+[ "$(live_scratch)" = 0 ] && ok 0 "T15d no admin record survives" || ok 1 "T15d no admin record survives"
 
 # ── T12: --help ─────────────────────────────────────────────────────────────
 bash "$SW" --help >/dev/null 2>&1 && ok 0 "T12 --help exits 0" || ok 1 "T12 --help exits 0"

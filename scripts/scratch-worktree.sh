@@ -66,12 +66,14 @@
 # SAFETY. A path is removable ONLY when ALL hold (see `owns()`): it lives under
 # the canonical scratch ROOT; it carries this tool's `.scratch-worktree` marker
 # naming this repo; and its administrative gitdir really is under
-# `<repo>/.git/worktrees/` (the COMMON git dir, so a linked-worktree caller works). Anything else gets a WARN and is left alone — `clean`
+# `<repo>/.git/worktrees/` (the COMMON git dir, so a linked-worktree caller
+# works). Anything else gets a WARN and is left alone — `clean`
 # never `rm -rf`s an arbitrary directory. For an OWNED scratch worktree the dirt
 # inside it is the probe's own disposable output, so removal is forced (the same
-# thing `run`'s trap discards); `clean --all` therefore sweeps this repo's
-# scratch root, including worktrees a live sibling session is using. No `find`,
-# no recursive walk of the repo, no glob over the scratch root.
+# thing `run`'s trap discards). `clean --all` sweeps this repo's scratch root but
+# SKIPS any candidate a live process still holds (bounded `ps` snapshot; a probe
+# whose argv does not name the path escapes it — the safe direction is PRESERVE).
+# No `find`, no recursive walk of the repo, no glob over the scratch root.
 
 set -uo pipefail
 
@@ -186,6 +188,19 @@ list_scratch() { # <repo>
     | while IFS= read -r d; do case "$d" in "$ROOT"/scratch-*) printf '%s\n' "$d" ;; esac; done
 }
 
+# Best-effort liveness probe (cycle-3 P1): `clean --all` must not delete the
+# scratch worktree a sibling session is actively using. Bounded — one `ps`
+# snapshot and a shell pattern match, no filesystem walk, no `find`/`lsof +D`.
+# A probe whose argv does not name the path escapes it (accepted residual), but
+# the common shapes (a shell running `cd <dir> && …`, a test runner invoked with
+# the path) are caught, and the safe direction is PRESERVE.
+held_by_live_process() { # <path>
+  local d="$1" out
+  out="$(/bin/ps -axo args= 2>/dev/null)" || return 1
+  case "$out" in *"$d"*) return 0 ;; esac
+  return 1
+}
+
 # ── clean / list ────────────────────────────────────────────────────────────
 if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
   resolve_repo
@@ -195,7 +210,14 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
     exit 0
   fi
   if [ "$CLEAN_ALL" = 1 ]; then
-    while IFS= read -r d; do [ -n "$d" ] && remove_one "$REPO" "$d" || true; done < <(list_scratch "$REPO")
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      if held_by_live_process "$d"; then
+        warn "$d is held by a live process — PRESERVED"
+        continue
+      fi
+      remove_one "$REPO" "$d" || true
+    done < <(list_scratch "$REPO")
     exit 0
   fi
   [ -n "$CLEAN_TARGET" ] || die "clean needs a path or --all"
@@ -210,15 +232,43 @@ git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" >/dev/null 2>&1 \
   || die "ref '$REF' does not resolve to a commit in $REPO"
 
 canon_root
-D="$(mktemp -d "$ROOT/scratch-$(basename "$REPO")-XXXXXX")" || die "mktemp failed"
 
+# ── validate --paths BEFORE creating anything ───────────────────────────────
+# Every rejection here must happen before `git worktree add`, or the error path
+# leaks exactly the registered, marker-carrying checkout the tool exists to
+# remove (cycle-3 P0). The ref-tree probe runs against $REPO, so it needs no
+# checkout either.
+PATHS_ARR=()
 if [ -n "$PATHS" ] && [ "$FULL" = 0 ]; then
   # Comma-separated LITERAL repo-relative paths. An array (not an unquoted
   # `${PATHS//,/ }`) so a space in a path is not split and no glob is expanded
   # against the caller's cwd.
-  PATHS_ARR=()
   IFS=',' read -r -a PATHS_ARR <<< "$PATHS"
-  [ "${#PATHS_ARR[@]}" -gt 0 ] || { rm -rf "$D"; die "--paths is empty"; }
+  [ "${#PATHS_ARR[@]}" -gt 0 ] || die "--paths is empty"
+  for _p in "${PATHS_ARR[@]}"; do
+    case "$_p" in
+      /*) die "--paths takes repo-relative paths, not absolute: '$_p'" ;;
+      .|..|./*|../*|*/../*|*/..)
+        die "--paths refuses '.'/'..' operands: '$_p'" ;;
+      '') die "--paths contains an empty path" ;;
+    esac
+  done
+  unset _p
+  # A typo'd or ref-absent path would otherwise yield a SILENTLY EMPTY checkout
+  # and a false result. Probe REF's TREE, not the filesystem: '.', '..' and
+  # '.git' all exist on disk after an empty materialisation. `rev-parse
+  # --verify` (read-only resolution) rather than `cat-file -e`, whose shape the
+  # guard's M5 discard gate models as a revert when the pathspec is a variable.
+  for _p in "${PATHS_ARR[@]}"; do
+    git -C "$REPO" rev-parse --verify --quiet "$REF:$_p" >/dev/null 2>&1 \
+      || die "path '$_p' does not exist at $REF — refusing an empty checkout"
+  done
+  unset _p
+fi
+
+D="$(mktemp -d "$ROOT/scratch-$(basename "$REPO")-XXXXXX")" || die "mktemp failed"
+
+if [ "${#PATHS_ARR[@]}" -gt 0 ]; then
   if ! git -C "$REPO" worktree add --detach --no-checkout "$D" "$REF" >/dev/null 2>&1; then
     rm -rf "$D"; die "git worktree add failed for $REF"
   fi
@@ -229,24 +279,6 @@ if [ -n "$PATHS" ] && [ "$FULL" = 0 ]; then
   # writes the sparse paths.
   git -C "$D" read-tree -mu HEAD >/dev/null 2>&1 \
     || { rm -rf "$D"; git -C "$REPO" worktree prune >/dev/null 2>&1; die "sparse checkout materialisation failed"; }
-  # A typo'd, absolute, `.`/`..`, or ref-absent path would otherwise yield a
-  # SILENTLY EMPTY checkout (or an escape out of it) and a false result. Validate
-  # against the REF'S TREE, not the filesystem: `.`, `..` and `.git` all exist on
-  # disk after an empty materialisation.
-  for _p in "${PATHS_ARR[@]}"; do
-    case "$_p" in
-      /*) die "--paths takes repo-relative paths, not absolute: '$_p'" ;;
-      .|..|./*|../*)
-        die "--paths refuses '.'/'..' operands: '$_p'" ;;
-    esac
-    case "$_p" in
-      */../*|*/..) die "--paths refuses a '..' path component: '$_p'" ;;
-    esac
-    git -C "$REPO" cat-file -e "$REF:$_p" 2>/dev/null \
-      || { rm -rf "$D"; git -C "$REPO" worktree prune >/dev/null 2>&1; \
-           die "path '$_p' does not exist at $REF — refusing an empty checkout"; }
-  done
-  unset _p
 else
   if ! git -C "$REPO" worktree add --detach "$D" "$REF" >/dev/null 2>&1; then
     rm -rf "$D"; die "git worktree add failed for $REF"
@@ -269,16 +301,20 @@ CMD_PID=""
 cleanup_run() {
   local rc=$? watch=""
   if [ -n "$CMD_PID" ]; then
-    # Kill the wrapped command's whole process group: a probe that outlives its
-    # worktree would keep burning exactly the I/O this tool exists to stop. The
-    # wait is BOUNDED — a child that ignores TERM (dev/test servers do) would
-    # otherwise block the trap forever and leak the very worktree we are removing.
+    # Kill the wrapped command's WHOLE PROCESS GROUP: a probe that outlives its
+    # worktree would keep burning exactly the I/O this tool exists to stop.
+    # The wait is BOUNDED — a leader that ignores TERM would otherwise block the
+    # trap forever and leak the worktree we are removing. The watchdog is what
+    # bounds it; it is only cancelled once the group is provably empty, so a
+    # TERM-ignoring DESCENDANT (leader exits first) is still reaped.
     kill -- -"$CMD_PID" 2>/dev/null || true
     ( sleep "$SCRATCH_WORKTREE_KILL_GRACE" 2>/dev/null; kill -9 -- -"$CMD_PID" 2>/dev/null ) &
     watch=$!
     wait "$CMD_PID" 2>/dev/null || true
+    # The leader is reaped. Any process still in the group is a straggler —
+    # SIGKILL it now (no need to wait out the grace, the leader is gone).
+    if kill -0 -- -"$CMD_PID" 2>/dev/null; then kill -9 -- -"$CMD_PID" 2>/dev/null || true; fi
     kill "$watch" 2>/dev/null || true
-    wait "$watch" 2>/dev/null || true
   fi
   remove_one "$REPO" "$D"
   exit "$rc"
