@@ -2354,8 +2354,9 @@ test("E271h: shipped-defaults cut reachability — the effective bound is the ga
   // E271h OWNS: the shipped `stateFresh` window value, the gap < window
   // relation (1x and the 3x load ceiling) probed at the SHIPPED lane's own
   // boundary, the window boundary, the inert-override boundary, the guard's
-  // far-tail silence, the far-tail ownership ordering (hard cap < backstop,
-  // and the hard cap's non-gating), and the loop↔decision window coupling.
+  // far-tail silence, and the far-tail ownership ORDERING (hard cap < backstop).
+  // The hard cap's non-gating attribute and the loop↔decision window coupling
+  // are pinned in E271i, not here.
   // The gap's own default is pinned by E271e; the load bands by
   // load-scale-contract.test.ts. Placed beside E271e (the other
   // default-config bound) rather than at the end of the series, so the two
@@ -2486,20 +2487,22 @@ test("E271h: shipped-defaults cut reachability — the effective bound is the ga
       equal(aliveJustInside.kill, true, "one ms inside the window the clause is alive again — the inert boundary is exact");
       equal(aliveJustInside.reason, "cut");
 
-      // THE CLAUSE READS THE MARKER CLOCK, not an effective age. `cutClauseState`
-      // zeroes streamAgeMs/toolAgeMaxMs, so EVERY probe above would stay green if
-      // the clause had drifted to `effToolAge`/`effStreamAge` (both equal
-      // markerAge when the frozen ages are 0 → the age expression is
-      // interchangeable). This probe separates the clocks: the marker age is one
-      // ms SHORT of the gap while both effective ages sit AT it, so a clause
-      // reading either effective age cuts and the marker-clock clause does not.
+      // THE CLAUSE READS THE MARKER CLOCK, not a frozen or effective age.
+      // `cutClauseState` zeroes streamAgeMs/toolAgeMaxMs, so EVERY probe above
+      // would stay green if the clause had drifted to `st.streamAgeMs`,
+      // `st.toolAgeMaxMs`, `effStreamAge` or `effToolAge` (with the frozen ages
+      // at 0 all five expressions are equal → they are interchangeable). This
+      // probe separates them: the marker age is one ms SHORT of the gap while
+      // BOTH frozen ages sit one ms ABOVE it (so `effStreamAge`/`effToolAge` are
+      // 2·gap above it). A clause reading the raw frozen age or either effective
+      // age cuts; the marker-clock clause does not.
       const offClock = cutClauseState(gap - 1, now);
-      offClock.streamAgeMs = gap;
-      offClock.toolAgeMaxMs = gap;
+      offClock.streamAgeMs = gap + 1;
+      offClock.toolAgeMaxMs = gap + 1;
       const markerClockOnly = heartbeatKillDecision(
         dinput({ now, lastLifeSignAt: now, state: offClock, ...shipped() }),
       );
-      equal(markerClockOnly.kill, false, "the clause reads the MARKER age — effective ages at the gap with the marker one ms short must not cut");
+      equal(markerClockOnly.kill, false, "the clause reads the MARKER age — frozen ages one ms ABOVE the gap (and effective ages 2·gap above) with the marker one ms short must not cut");
       equal(markerClockOnly.reason, undefined);
     },
   );
@@ -2521,35 +2524,51 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   // together, so an inline literal that stopped spreading would red. The slice
   // is validated at BOTH ends: a terminator miss must red, not silently widen
   // into an arbitrary region whose `includes` checks prove nothing.
+  // The literal must be UNIQUE, or `indexOf` could land on a secondary mention
+  // and every pin below would silently read the wrong region. The end is
+  // cross-checked by the literal's own final field (a terminator miss cannot end
+  // with it) — that check fixes both the last field AND the indent, so
+  // reordering or reindenting the literal is a deliberate, visible RED.
+  equal(src.split("const hbThresholds = {").length - 1, 1, "the hbThresholds literal must occur exactly ONCE, else indexOf may anchor on a mention");
   const hbStart = src.indexOf("const hbThresholds = {");
   const hbEnd = src.indexOf("\n    };", hbStart);
   ok(hbStart > -1 && hbEnd > hbStart, "the hbThresholds literal must be locatable for the coupling pin");
   const hbBody = src.slice(hbStart, hbEnd);
-  ok(hbBody.startsWith("const hbThresholds = {"), "the slice must BEGIN at the literal");
   ok(hbBody.trimEnd().endsWith("cutGapMs: getCutGapMs(),"), "the slice must END at the literal's own closing brace");
   ok(hbBody.includes("heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,"), "hbThresholds threads the loop's own T (INSIDE the literal, value terminated so a scaled value cannot satisfy it)");
   ok(hbBody.includes("intervalMs: getHeartbeatIntervalMs(),"), "hbThresholds threads the loop's own interval getter (INSIDE the literal, value terminated so a scaled value cannot satisfy it)");
-  equal(src.split("...hbThresholds").length - 1, 2, "BOTH heartbeatKillDecision call sites spread hbThresholds — the fields only matter if they are wired");
+  // The two counts TOGETHER say what the comment says: there are exactly two
+  // decision call sites, and `...hbThresholds` appears exactly twice — a THIRD
+  // call site passing its own thresholds reds on the call-site count.
+  equal(src.split("heartbeatKillDecision({").length - 1, 2, "the file has exactly two heartbeatKillDecision call sites");
+  equal(src.split("...hbThresholds").length - 1, 2, "…and exactly two hbThresholds spreads, so both of those call sites receive the loop's own thresholds");
 
-  // (b) The decision's window expression and the warning's guard. Both are
-  // single-occurrence checks (the text is unique in index.ts), stated as such:
-  // they pin the expression COUNT, not its call site. The warning is matched on
-  // the whole guard shape — a bare-substring count would be satisfied by the
-  // same text in prose or in a dead local while the real `if` changed.
+  // (b) The decision's window expression and the warning. The first is a
+  // single-occurrence check stated as such: it pins the expression COUNT, not
+  // its call site. The warning is pinned as a STATEMENT-LEVEL guard
+  // (line-anchored, so a mention in prose or a dead local cannot satisfy it)
+  // TOGETHER with the latch write and the emission inside it — otherwise "the
+  // loop warns once" would be asserted by nothing.
   equal(src.split(/markerAge\s*<=\s*Math\.max\(2 \* i\.heartbeatTimeoutMs, 2 \* i\.intervalMs\)/).length - 1, 1, "the decision computes its window from the same two inputs the loop's freshWindowMs uses");
-  equal((src.match(/if \(!cutInertWarned && effCutGapMs >= freshWindowMs\)/g) ?? []).length, 1, "the unreachability warning IS a guard on `!cutInertWarned && effCutGapMs >= freshWindowMs` (>=, not >)");
+  equal((src.match(/^[ \t]*if \(!cutInertWarned && effCutGapMs >= freshWindowMs\) \{/gm) ?? []).length, 1, "the unreachability warning is a real statement-level guard on `!cutInertWarned && effCutGapMs >= freshWindowMs` (>=, not >)");
+  equal((src.match(/if \(!cutInertWarned && effCutGapMs >= freshWindowMs\) \{\n\s*cutInertWarned = true;\n\s*console\.error\(/) ?? []).length, 1, "the latch is SET before the emission inside that guard — the warning really is one-shot per dispatch");
 
-  // (c) The far tail's OWNER must not be freshness-gated. A token check for
-  // `stateFresh` would miss a renamed or inlined freshness gate, so assert the
-  // guard SHAPE: the callback's only early returns are `settled` and
-  // `!hasOutput` — any added gate is a third `if (`.
+  // (c) The far tail's OWNER must not be freshness-gated. TWO complementary
+  // checks are needed, because neither sees what the other does:
+  //   - the statement-guard COUNT catches an added `else if (…)` / `if(…)` gate
+  //     (form-agnostic, but blind to a condition folded into an existing guard);
+  //   - the freshness-EXPRESSION token check catches a gate FOLDED into
+  //     `if (!hasOutput && <fresh>)` (blind to a renamed spelling).
+  // (`lastMarkerAt` is deliberately NOT in the token set: the callback reads it
+  // for the marker-age REPORT, so flagging it would false-RED.)
   const hcStart = src.indexOf("hardCapTimer: NodeJS.Timeout | null = setTimeout(");
   const hcEnd = src.indexOf("}, getTaskHardCapMs());", hcStart);
   ok(hcStart > -1 && hcEnd > hcStart, "the hard-cap timer callback must be locatable");
   const hcBody = src.slice(hcStart, hcEnd);
   ok(hcBody.includes("if (settled) return;"), "the hard-cap callback still short-circuits on `settled`");
   ok(hcBody.includes("if (!hasOutput)"), "the hard-cap callback still branches on `hasOutput`");
-  equal((hcBody.match(/\n\s*if \(/g) ?? []).length, 2, "the hard-cap callback has EXACTLY two guards — a freshness gate on the far tail's owner would be a third");
+  equal((hcBody.match(/\bif\s*\(/g) ?? []).length, 2, "the callback's ONLY two statement guards are `settled` and `!hasOutput` — an added `else if (…)`/`if(…)` gate is a third");
+  ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS/.test(hcBody), "…and no freshness EXPRESSION may be folded into an existing guard (the count above cannot see that)");
 
   // (d) Behavioural side of the same coupling: with the interval term dominating
   // the max, the decision's window must follow `i.intervalMs` — a T-only window
