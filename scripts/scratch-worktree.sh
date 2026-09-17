@@ -222,13 +222,17 @@ remove_one() { # <repo> <path>
 # record behind, defeating the tool's central guarantee. Marker-based ownership
 # stays for CALLER-SUPPLIED paths (`clean <path>`), where identity cannot be proven.
 #
-# The admin dir is read from $d/.git INSIDE the function, so it is still known
-# after the wrapped command destroyed the marker (and even after a full sweep of
-# untracked files — git never removes a worktree's own `.git` file).
-remove_created() { # <repo> <path>
-  local repo="$1" d="$2" gd=""
+# The admin dir is read from $d/.git INSIDE the function (or threaded in as the
+# third argument, captured at CREATION — see refresh_gd below). Reading it late is
+# not enough on its own: if the wrapped command deleted `.git` itself, the
+# fallback `rm -rf` removes the directory while the REGISTRATION survives, and
+# `run` would exit 0 over a phantom record it can no longer prove it owns — a
+# false PASS (cycle-6 P2). `git clean` protects a worktree's own `.git`; an
+# explicit `rm -rf .git` does not.
+remove_created() { # <repo> <path> [admin-gitdir]
+  local repo="$1" d="$2" gd="${3:-}"
   [ -n "$d" ] || return 0
-  gd="$(admin_of "$d")"
+  [ -n "$gd" ] || gd="$(admin_of "$d")"
   git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
   if [ -e "$d" ]; then rm -rf "$d" 2>/dev/null || warn "could not remove $d"; fi
   prune_admin "$repo" "$gd"
@@ -355,6 +359,8 @@ else
 fi
 # Ownership proof for removal — written AFTER a successful add.
 printf '%s\n' "$(realpath_of "$REPO")" > "$D/.scratch-worktree" 2>/dev/null || true
+# The admin dir, captured while the worktree is still intact (cycle-6 P2).
+GD="$(admin_of "$D")"
 
 if [ "$MODE" = create ]; then
   printf '%s\n' "$D"
@@ -364,7 +370,7 @@ if [ "$MODE" = create ]; then
   exit 0
 fi
 
-[ "${#CMD[@]}" -gt 0 ] || { remove_created "$REPO" "$D"; die "run needs a command after --"; }
+[ "${#CMD[@]}" -gt 0 ] || { remove_created "$REPO" "$D" "$GD"; die "run needs a command after --"; }
 
 CMD_PID=""
 cleanup_run() {
@@ -389,7 +395,7 @@ cleanup_run() {
     kill -9 "$watch" 2>/dev/null || true
     wait "$watch" 2>/dev/null || true
   fi
-  remove_created "$REPO" "$D"
+  remove_created "$REPO" "$D" "$GD"
   exit "$rc"
 }
 trap cleanup_run EXIT
@@ -398,9 +404,29 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 # Job control so `( ... ) &` becomes a process-group leader we can signal.
-set -m
-( cd "$D" && exec "${CMD[@]}" ) &
-CMD_PID=$!
-set +m
+#
+# `set -m` is what made bash 3.2 print `child setpgid (PID to PID): Operation not
+# permitted` on ~1% of SUCCESSFUL runs (the child reaches its own setpgid first,
+# so the parent's fails) — an agent reads that as the tool failing, and 120
+# samples reproduced it even after the parent's stderr was closed for the launch
+# window, because the message is emitted after the window. So the group is
+# established in the CHILD instead: `perl` execs the command in place after
+# `setpgrp`, leaving no parent-side setpgid to race. `$!` is that leader's PID, so
+# `kill -- -$CMD_PID` still signals the whole group.
+if command -v perl >/dev/null 2>&1; then
+  ( cd "$D" && exec perl -e 'setpgrp(0,0); exec @ARGV or die "scratch-worktree: exec: $!\n"' -- "${CMD[@]}" ) &
+  CMD_PID=$!
+else
+  # Fallback (no perl): the job-control form, with the parent's stderr closed for
+  # the launch window and restored by the child from fd 9 so the wrapped command's
+  # own stderr still reaches the caller.
+  set -m
+  exec 9>&2
+  ( cd "$D" && exec 2>&9 9>&- && exec "${CMD[@]}" ) 2>/dev/null &
+  CMD_PID=$!
+  exec 2>&9
+  exec 9>&-
+  set +m
+fi
 wait "$CMD_PID"; rc=$?
 exit "$rc"

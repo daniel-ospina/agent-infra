@@ -4986,7 +4986,11 @@ try {
     try { execSync(`git worktree remove --force "${m4Tmp}/wt"`, { stdio: "ignore" }); } catch {}
     try { execSync(`rm -rf "${m4Tmp}"`, { stdio: "ignore" }); } catch {}
   }
-  try { execSync("git worktree prune", { stdio: "ignore" }); } catch {}
+  // No bare `git worktree prune`: with no `cwd` it would prune whatever repo the
+  // suite was invoked from — a real checkout holding unrelated sibling worktree
+  // records, any of which is deregistered if its directory is not stat-able at
+  // that instant (#1141). The `worktree remove` above already dropped its own
+  // record, and the fixture repo itself is deleted by the line above.
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

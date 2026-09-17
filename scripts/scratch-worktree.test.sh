@@ -32,7 +32,8 @@
 #   T17 cleanup does not depend on the in-worktree marker (identity removal)
 #   T18 cleanup deregisters ONLY its own record (never an unrelated sibling)
 #   T19 --paths is anchored (a same-named nested dir is not materialised)
-#   T20 run is silent on stderr when it succeeds
+#   T20 run is silent on stderr when it succeeds (20 samples)
+#   T21 a wrapped command that deletes `.git` still deregisters the record
 
 set -uo pipefail
 
@@ -386,17 +387,42 @@ grep -q 'n.txt' "$FIX/t19out" && ok 1 "T19b a same-named NESTED dir was material
   || ok 0 "T19b a same-named nested dir is not materialised (anchored)"
 
 # ── T20: a SUCCESSFUL run is silent on stderr ──────────────────────────────
-# bash 3.2 emits `run_pending_traps: bad value in trap_list` from the watchdog
-# subshell on ~27% of successful runs, which an agent reads as tool failure
-# (cycle-5 P2). Tests elsewhere redirect stderr, so only this assertion sees it.
-ERR20=0
-for _ in 1 2 3; do
+# Two distinct bash-3.2 races produce stderr on success: `run_pending_traps: bad
+# value in trap_list` from the watchdog subshell (TERMed while parked in `sleep`)
+# and `child setpgid (PID): Operation not permitted` from the job-control launch
+# window (~1%). Both read to an agent as tool failure, and the second made a
+# 3-sample T20 flake. 20 samples; the FIRST failing buffer is preserved.
+ERR20=0; ERRMSG=""
+for _ in $(seq 1 20); do
   bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full -- true \
     >/dev/null 2>"$FIX/t20err" || true
-  [ -s "$FIX/t20err" ] && ERR20=$((ERR20 + 1))
+  if [ -s "$FIX/t20err" ]; then
+    ERR20=$((ERR20 + 1))
+    [ -z "$ERRMSG" ] && ERRMSG="$(head -2 "$FIX/t20err")"
+  fi
 done
-[ "$ERR20" = 0 ] && ok 0 "T20 a successful run writes nothing to stderr" \
-  || ok 1 "T20 a successful run wrote stderr $ERR20/3 times: $(cat "$FIX/t20err")"
+[ "$ERR20" = 0 ] && ok 0 "T20 a successful run writes nothing to stderr (20 samples)" \
+  || ok 1 "T20 a successful run wrote stderr $ERR20/20 times: $ERRMSG"
+[ "$(live_scratch)" = 0 ] && ok 0 "T20b the 20 runs left no record" || ok 1 "T20b the 20 runs left a record"
+
+# ── T21: a wrapped command that deletes `.git` still deregisters the record ──
+# The admin dir cannot be re-derived from `$D/.git` after the probe removed it, so
+# `run` captures it at creation. Without that, the fallback rm's the directory,
+# keeps the registration, and exits 0 over a phantom record it cannot prove it
+# owns (cycle-6 P2).
+P21="$FIX/t21path"
+bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full \
+  -- bash -c "pwd > '$P21'; rm -rf .git" >/dev/null 2>&1
+RC21=$?
+D21="$(cat "$P21" 2>/dev/null)"
+[ "$RC21" = 0 ] && ok 0 "T21a the probe's exit code survives" || ok 1 "T21a the probe's exit code survives (rc=$RC21)"
+{ [ -n "$D21" ] && [ ! -e "$D21" ]; } && ok 0 "T21b the directory is gone" || ok 1 "T21b the directory is gone (D21=${D21:-unset})"
+[ "$(live_scratch)" = 0 ] && ok 0 "T21c no phantom registration survives" || ok 1 "T21c a phantom registration survived"
+if [ -n "$D21" ] && git -C "$FIX/repo" worktree list --porcelain 2>/dev/null | grep -qF "$D21"; then
+  ok 1 "T21d a stale entry remains in git worktree list"
+else
+  ok 0 "T21d no stale entry in git worktree list"
+fi
 
 echo
 if [ "$FAILS" = 0 ]; then echo "ALL PASS"; exit 0; else echo "$FAILS FAILURE(S)"; exit 1; fi
