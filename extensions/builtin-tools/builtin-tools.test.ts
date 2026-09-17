@@ -2620,11 +2620,12 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   ok(/if\s*\(\s*settled\s*\)\s*return;/.test(hcBody), "the hard-cap callback still short-circuits on `settled`");
   ok(/if\s*\(\s*!hasOutput\s*\)/.test(hcBody), "the hard-cap callback still branches on `hasOutput`");
   // Only the parenthesised CONDITION is normalised, so a WHITESPACE-ONLY
-  // reformat (a wrapped condition) stays green. Redundant parens
-  // (`if ((!hasOutput))`) or an in-condition comment are a deliberate RED — the
-  // extraction cannot balance parens — and either is a change to review. Any
-  // change to these two conditions changes the far tail's owner and must be
-  // re-reviewed, not silently accommodated.
+  // reformat (a wrapped condition) stays green, and so does an in-condition
+  // comment — the region is sliced from the comment-stripped view above, so
+  // `if (settled /* c */) return;` reaches here as `if (settled )`. Redundant
+  // parens (`if ((!hasOutput))`) ARE a deliberate RED: the extraction cannot
+  // balance parens. Either way, a change to these two conditions changes the far
+  // tail's owner and must be re-reviewed, not silently accommodated.
   const hcGuardConds = (hcBody.match(/\bif\s*\(([^)]*)\)/g) ?? []).map((g) => g.slice(g.indexOf("(") + 1, -1).replace(/\s+/g, " ").trim());
   equal(hcGuardConds.slice().sort().join(" | "), "!hasOutput | settled", "the callback's guards are EXACTLY `settled` and `!hasOutput` — a freshness term folded into one of them is caught whatever its spelling");
   ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS|heartbeatTimeoutMs|getHeartbeatIntervalMs|clampHeartbeatIntervalMs|HEARTBEAT_INTERVAL_MS|TASK_HEARTBEAT_INTERVAL_MS|DEFAULT_HEARTBEAT|intervalMs|hbThresholds|cutGapMs/.test(hcBody), "…and no freshness expression may appear in the callback OUTSIDE those `if` headers (a `switch`, ternary or `||`-shaped gate) — the condition pin cannot see those. A denylist can never be complete (cycle 6's set was itself narrower than cycle 4's: it had dropped `hbThresholds`, which is what caught a `hbThresholds.heartbeatTimeoutMs` fold); the MARKER-clock family below is pinned POSITIVELY instead, because it cannot be listed here at all");
