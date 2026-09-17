@@ -61,8 +61,20 @@
 #                        and every PR failure reads as new — the bogus zero. See
 #                        THE BOGUS ZERO in ci-failure-set.sh.
 #   --any-workflow       drop the lane filter (opt-out; re-opens the bogus zero)
+#   --rerun-timeout S    bound (seconds) on the RE-RUN wait — the wait for a
+#                        re-run run to finish. Its DEFAULT is DERIVED, never a
+#                        flat round number: 2 x the slowest OBSERVED shard
+#                        `test (a)` (B4: 22m10s / 25m50s / 26m03s) = 2 x 1563s
+#                        = 3126s (~52 min), and the derivation is PRINTED. A
+#                        flat 1800s sat 13–27% above a 26-minute job and host
+#                        I/O load pushed past it (B5 lost both #2958 rails to
+#                        that bound). This wait separates STILL-RUNNING (keep
+#                        waiting) from STALLED (no `updatedAt` progress for
+#                        ADMIN_MERGE_STALL_SECONDS) — only a STALL is a failure.
 #   --no-rerun           skip the flake re-run classification (a non-empty
 #                        unique set then blocks immediately)
+#   --print-bounds       print the DERIVED re-run ceiling + stall window and the
+#                        source of the derivation, then exit. No gh call.
 #   --dry-run            compute + print the decision; mutates nothing at all —
 #                        no CI re-run, no comment, no merge. On the flake path it
 #                        reports and exits 0 (it is an inspection, not a verdict;
@@ -86,6 +98,20 @@
 #   evidence marker was posted exits non-zero, prints gh's stderr, and posts a
 #   head-bound RETRACTION so the marker can never be read as a successful merge.
 #
+#   THE TWO WAITS ARE DIFFERENT, AND THEY READ DIFFERENTLY. Two independent
+#   bounds gate a merge and must never be mistaken for one another (B7: an
+#   operator raised --rerun-timeout and the rail exited INSTANTLY, because the
+#   precondition gated first — an ambiguous message made it read as a fresh
+#   failure):
+#     * the LANE-TERMINAL PRECONDITION — the lane must have finished for the
+#       head BEFORE any comparison happens. It REFUSES, naming itself:
+#       `precondition unmet: run still in_progress — no classification
+#       attempted`. `--rerun-timeout` does NOT apply and never started.
+#     * the RE-RUN WAIT (`--rerun-timeout`) — a real wait, after a re-run, on a
+#       run that is still RUNNING. A still-RUNNING job is NOT a failure; only a
+#       STALL is. It prints STILL-RUNNING progress, and its ceiling is DERIVED
+#       (2 x the slowest OBSERVED shard) with the derivation in the message.
+#
 #   A DRAFT IS REFUSED EARLY. `commit-workflow` opens drafts deliberately and
 #   `gh` refuses to merge one ("Pull Request is still a draft"), so this is a
 #   systematic collision. The rail reads `isDraft` BEFORE any CI work and
@@ -96,6 +122,7 @@
 #   ADMIN_MERGE_GH              the gh command (default: `gh`)
 #   ADMIN_MERGE_FAILURE_SET_SH  the parser to use (default: ./ci-failure-set.sh)
 #   ADMIN_MERGE_POLL_INTERVAL   seconds between re-run status polls (default 10)
+#   ADMIN_MERGE_STALL_SECONDS   no-progress window that means STALLED (default 600)
 
 set -uo pipefail
 
@@ -106,6 +133,12 @@ GH="${ADMIN_MERGE_GH:-gh}"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
+# A run that is still RUNNING is not a failure — only a STALL is. This is the
+# real failure signal: the run is not `completed` and `updatedAt` has not moved
+# for this long. 600s = 10 min: 10x the observed ~2s queue, and far below the
+# fastest OBSERVED shard (22m10s), whose step updates land far more often than
+# once every ten minutes. Env seam: ADMIN_MERGE_STALL_SECONDS (tests only).
+RERUN_STALL_SECONDS="${ADMIN_MERGE_STALL_SECONDS:-600}"
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
@@ -173,17 +206,42 @@ run_failure_set() {
   "$BASH" "$CFS" "$@"
 }
 
-# wait_for_run <run-id> — poll until the run is completed. Returns 1 on timeout.
+# wait_for_run <run-id> — poll until the run is `completed`.
+#   return 0  completed.
+#   return 1  STALLED — not completed and `updatedAt` has not moved for
+#             RERUN_STALL_SECONDS. THIS is the failure signal.
+#   return 2  CEILING — still RUNNING at the derived RERUN_TIMEOUT. NOT a
+#             failure verdict: a still-running job is not a failure; the
+#             derived bound was simply reached.
+# A still-RUNNING run prints progress (status, elapsed/ceiling, and the
+# derivation) instead of a verdict — the old flat message read as a failure
+# when it was only impatience (B5).
 wait_for_run() {
-  local run_id="$1" waited=0 status
+  local run_id="$1" waited=0 idle=0 step status upd line last_upd=""
+  # Wall-clock accounting must advance even when the test seam sets the interval
+  # to 0 — a 0-step loop can never reach its own bound and spins forever.
+  step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
   while [ "$waited" -lt "$RERUN_TIMEOUT" ]; do
+    # ONE gh call for both fields (status + the progress clock), so a poll does
+    # not double its process cost.
     # shellcheck disable=SC2086
-    status="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} --json status --jq .status 2>/dev/null || echo unknown)"
+    line="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} \
+      --json status,updatedAt --jq '.status + " " + .updatedAt' 2>/dev/null || echo 'unknown ')"
+    status="${line%% *}"; upd="${line#* }"
     [ "$status" = "completed" ] && return 0
+    if [ -n "$upd" ] && [ "$upd" != "$last_upd" ]; then
+      idle=0; last_upd="$upd"
+    else
+      idle=$((idle + step))
+    fi
+    if [ "$idle" -ge "$RERUN_STALL_SECONDS" ]; then
+      return 1
+    fi
+    info "admin-merge: … run $run_id STILL RUNNING (status=${status:-unknown}, ${waited}s of the ${RERUN_TIMEOUT}s ceiling = 2 x the slowest OBSERVED shard 26m03s). A running job is not a failure — waiting."
     sleep "$POLL_INTERVAL"
-    waited=$((waited + POLL_INTERVAL))
+    waited=$((waited + step))
   done
-  return 1
+  return 2
 }
 
 # build_evidence — the machine-readable comment. The marker binds the evidence
@@ -294,10 +352,48 @@ build_evidence() {
   printf '%s\n' "$flake_line"
 }
 
+# attribute_residual <residual-file> <main-fails-file> — name WHY each residual
+# failure is not in main's baseline. This IMPROVES the diagnosis of a refusal;
+# it must never NARROW the refusal. Every caller blocks on a non-empty residual
+# regardless of the label here, and there is deliberately NO waiver label
+# (B1 asked for lane-matched attribution sufficient to CERTIFY; the answer is
+# no — a gate cannot adjudicate causation, and accepting it once lets the next
+# genuinely-new failure in that file ride the same argument).
+#
+#   measured on this lane, not present on main
+#       main's baseline carries a failure in the SAME test file, so the lane is
+#       demonstrably measuring that file and does not show this test red.
+#   not measurable on this lane
+#       main's baseline carries NO failure in that file. A FAILURE-ONLY baseline
+#       cannot tell "green on main" from "never run on main", so absence is NOT
+#       evidence of novelty — the rail must not call it "unique to this PR".
+#       (B1: CI's docker lane reproduces ZERO occurrences of the embedded lane's
+#       redislite/GRAPH.COPY race while the embedded lane reproduces it — the old
+#       wording asserted uniqueness with nothing to compare against.)
+attribute_residual() {
+  local residual="$1" mainfails="$2" nodeid file main_files=""
+  [ -s "$mainfails" ] && main_files="$(sed 's/::.*//' "$mainfails" | sort -u)"
+  while IFS= read -r nodeid; do
+    [ -n "$nodeid" ] || continue
+    file="${nodeid%%::*}"
+    if [ -n "$main_files" ] && printf '%s\n' "$main_files" | grep -qxF "$file"; then
+      printf '   %s\n      -> measured on this lane, not present on main\n' "$nodeid"
+    else
+      printf '   %s\n      -> not measurable on this lane: main carries no failure in %s, so absence is NOT evidence of novelty\n' "$nodeid" "$file"
+    fi
+  done < "$residual"
+}
+
 main() {
   local PR="" MAIN_RUNS="${MAIN_RUNS:-10}" REPO="" DRY_RUN=0 NO_RERUN=0
   local WORKFLOW="${CI_FAILURE_SET_WORKFLOW:-python-ci.yml}" ANY_WORKFLOW=0
-  RERUN_TIMEOUT="${RERUN_TIMEOUT:-1800}"
+  # DERIVED, not a round number: 2 x the slowest OBSERVED shard `test (a)`
+  # (B4: 22m10s / 25m50s / 26m03s → slowest 1563s; ceiling 3126s ≈ 52 min).
+  # A flat 1800s left only 13–27% headroom above a 26-minute job, and host I/O
+  # load pushed past it — B5 lost both #2958 rails to that bound. The source of
+  # the number is printed wherever the bound is reported.
+  observed_slowest_shard=1563
+  RERUN_TIMEOUT="${RERUN_TIMEOUT:-$((2 * observed_slowest_shard))}"
   local MERGE_ARGS=() MERGE_METHOD_SET=0
 
   while [ $# -gt 0 ]; do
@@ -309,6 +405,10 @@ main() {
       --rerun-timeout) RERUN_TIMEOUT="${2:-}"; shift 2 ;;
       --no-rerun) NO_RERUN=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
+      # Make the DERIVATION visible on demand: the re-run ceiling is not a round
+      # number, and an operator must be able to see where it came from without
+      # reading the source. No gh call, no side effect.
+      --print-bounds) printf 'rerun-timeout=%s\nsource=2 x slowest OBSERVED shard 26m03s (observed 22m10s / 25m50s / 26m03s)\nstall=%s\n' "$RERUN_TIMEOUT" "$RERUN_STALL_SECONDS"; exit 0 ;;
       --help|-h) usage; exit 0 ;;
       --) shift; while [ $# -gt 0 ]; do
             case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
@@ -411,7 +511,8 @@ main() {
   # 2) and the rail merged while the lane might still be running — the #3420
   # ratchet that precondition 1 exists to stop (VGATE cycle 2, #1003).
   if ! counter_is_zero "$pr_pending"; then
-    say_err "admin-merge: ✗ BLOCK — the test lane has NOT finished for head $head:"
+    say_err "admin-merge: ✗ BLOCK — precondition unmet: run still in_progress — no classification attempted."
+    say_err "   The test lane has NOT finished for head $head:"
     if counter_is_positive "$pr_pending"; then
       say_err "   $pr_pending run(s) still queued/in progress (lane: $lane)."
     else
@@ -420,6 +521,9 @@ main() {
     fi
     say_err "   An unfinished lane yields an empty failing set, which proves nothing."
     say_err "   Wait for CI to complete, then re-run the rail."
+    say_err "   This is the LANE-TERMINAL PRECONDITION, which gates BEFORE any comparison:"
+    say_err "   --rerun-timeout never started and would not change this exit. The re-run"
+    say_err "   wait is a DIFFERENT wait and names itself differently when it fires."
     exit 1
   fi
   # NOT `completed`: a `cancelled`/`skipped` run is terminal but exercised
@@ -551,6 +655,7 @@ main() {
     sed 's/^/   /' "$TMP/unique.txt"
     if [ "$NO_RERUN" -eq 1 ]; then
       say_err "admin-merge: ✗ BLOCK — unique failures present and --no-rerun given. No merge."
+      attribute_residual "$TMP/unique.txt" "$TMP/main-fails.txt" >&2
       exit 1
     fi
     # `--dry-run` MUTATES NOTHING — including CI. Re-running failed jobs before
@@ -565,7 +670,7 @@ main() {
     # Re-run every failing run of the PR head ONCE. A test that passes on retry
     # is order/timing flaky, not new — the #3469 shape (a sibling pair that
     # trips alternately on main) must not hard-block a safe merge.
-    local run_line run_id
+    local run_line run_id wait_rc
     while IFS= read -r run_line; do
       [ -n "$run_line" ] || continue
       run_id="${run_line##*:}"
@@ -575,8 +680,13 @@ main() {
         say_err "admin-merge: ✗ BLOCK — could not re-run $run_id (gh error). No merge."
         exit 1
       fi
-      if ! wait_for_run "$run_id"; then
-        say_err "admin-merge: ✗ BLOCK — run $run_id did not complete within ${RERUN_TIMEOUT}s. No merge."
+      wait_for_run "$run_id"; wait_rc=$?
+      if [ "$wait_rc" -eq 1 ]; then
+        say_err "admin-merge: ✗ BLOCK — run $run_id STALLED: no progress for ${RERUN_STALL_SECONDS}s (status stayed non-completed and updatedAt never moved). A still-running job is not a failure; a STALL is. No merge."
+        exit 1
+      fi
+      if [ "$wait_rc" -ne 0 ]; then
+        say_err "admin-merge: ✗ BLOCK — run $run_id still RUNNING at the ${RERUN_TIMEOUT}s ceiling = 2 x the slowest OBSERVED shard (26m03s). Not a stall — the DERIVED ceiling was reached. No merge."
         exit 1
       fi
     done < "$TMP/pr-runs.txt"
@@ -603,8 +713,11 @@ main() {
 
     if [ "$rerun_residual" -gt 0 ]; then
       say_err "admin-merge: ✗ BLOCK — $rerun_residual unique failure(s) SURVIVED the re-run:"
-      sed 's/^/   /' "$TMP/unique2.txt" >&2
-      say_err "   These are new failures this PR introduces — merge refused."
+      attribute_residual "$TMP/unique2.txt" "$TMP/main-fails.txt" >&2
+      say_err "   The attribution above separates MEASURED-ABSENT (main's lane demonstrably"
+      say_err "   measures this file and does not show this test red) from NOT-MEASURABLE"
+      say_err "   (main's baseline carries no measurement of the file, so absence is NOT"
+      say_err "   evidence of novelty). BOTH block; no label here clears a failure."
       exit 1
     fi
     cp "$TMP/pr-fails2.txt" "$TMP/pr-fails.txt"

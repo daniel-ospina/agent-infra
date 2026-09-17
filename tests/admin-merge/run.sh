@@ -160,7 +160,22 @@ case "$key" in
       [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
       exit 0
     fi
-    printf 'completed\n'
+    # The status/updatedAt projection of the re-run wait. `status-<id>` and
+    # `updated-<id>` are consumed one line per poll and REPEAT their last line
+    # once exhausted (so an all-in_progress status models a run that never
+    # finishes, and a one-line `updated-<id>` models no progress = a stall).
+    if [ -f "$SCEN/status-$id" ]; then
+      n=$(( $(cat "$SCEN/status-count-$id" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$n" > "$SCEN/status-count-$id"
+      s="$(sed -n "${n}p" "$SCEN/status-$id")"
+      [ -n "$s" ] || s="$(tail -n1 "$SCEN/status-$id")"
+      u="$(sed -n "${n}p" "$SCEN/updated-$id" 2>/dev/null)"
+      [ -n "$u" ] || u="$(tail -n1 "$SCEN/updated-$id" 2>/dev/null)"
+      [ -n "$u" ] || u="2026-01-01T00:00:00Z"
+      printf '%s %s\n' "$s" "$u"
+      exit 0
+    fi
+    printf 'completed 2026-01-01T00:00:00Z\n'
     exit 0 ;;
   "run rerun")
     id="${3:-}"
@@ -1463,6 +1478,169 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on a draft" 
 grep -q "run list" "$SCEN/calls" \
   && fail "the draft check must run BEFORE any CI work" \
   || pass "the refusal is EARLY (no CI run was even listed)"
+
+# ── 37. THE TWO WAITS, the DERIVED ceiling, and attribution that does not
+#        narrow the refusal (B4 / B5 / B7 / B1) ───────────────────────────
+# One section, five pinned behaviours:
+#   (a) a run that is still RUNNING is WAITED, not called a failure
+#   (b) a run with no `updatedAt` progress is STALLED, and says so distinctly
+#   (c) the two waits READ DIFFERENTLY (B7: a raised --rerun-timeout exited
+#       INSTANTLY because the lane-terminal precondition gated first)
+#   (d) the re-run ceiling is DERIVED (2 x the slowest OBSERVED shard) and the
+#       derivation is stated
+#   (e) a failure whose file main's lane has NOT measured reads
+#       "not measurable on this lane" — the refusal STAYS, and there is no
+#       waiver label (B1's docker/embedded redislite case)
+echo "== 37. the two waits, the derived ceiling, and non-narrowing attribution =="
+
+# (a) STILL RUNNING is waited, not failed. status goes in_progress -> completed
+# and the re-run's test then PASSES, so the rail must reach the flake path.
+new_scen waitstillrunning
+HEAD_W1="d1d1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_W1" > "$SCEN/head"
+LANE1='tests/test_flaky.py::test_still_running'
+lane_fail "$HEAD_W1" 9601 > "$SCEN/runs-$HEAD_W1"
+log_failed "$LANE1" > "$SCEN/log-9601"
+lane_fail mainw1 9602 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9602"
+log_passed "$LANE1" > "$SCEN/log-after-9601"
+printf 'in_progress\nin_progress\ncompleted\n' > "$SCEN/status-9601"
+printf 't1\nt2\nt3\n' > "$SCEN/updated-9601"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) a run that was STILL RUNNING is waited to completion, not failed (exit 0)" \
+  || fail "(a) a still-running re-run was treated as a failure (exit $rc)"
+grep -q "STILL RUNNING" "$TMP/out" \
+  && pass "(a) it reports STILL RUNNING progress while waiting" \
+  || fail "(a) no STILL RUNNING progress was reported"
+grep -q "STALLED" "$TMP/err" && fail "(a) a still-running job was called STALLED" \
+  || pass "(a) a still-running job was NOT called STALLED"
+grep -q "still RUNNING at the" "$TMP/err" && fail "(a) a still-running job hit the ceiling wrongly" \
+  || pass "(a) the ceiling was not reported for a run that completed"
+grep -q "pr merge 42 --admin" "$SCEN/calls" && pass "(a) the merge proceeded after the wait" \
+  || fail "(a) no merge after a completed re-run"
+
+# (b) STALL: status never leaves in_progress and updatedAt never moves. The
+# stall window is the REAL failure signal, and its message is distinct from the
+# derived-ceiling message.
+new_scen waitstall
+printf '%s\n' "$HEAD_W1" > "$SCEN/head"
+lane_fail "$HEAD_W1" 9611 > "$SCEN/runs-$HEAD_W1"
+log_failed 'tests/test_flaky.py::test_stalls' > "$SCEN/log-9611"
+lane_fail mainw1b 9612 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9612"
+printf 'in_progress\n' > "$SCEN/status-9611"
+printf 't1\n' > "$SCEN/updated-9611"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_STALL_SECONDS=2 bash "$ADM" 42 --main-runs 1 --rerun-timeout 30 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) a STALLED re-run blocks (exit $rc)" || fail "(b) a stalled run did not block"
+grep -q "STALLED: no progress for 2s" "$TMP/err" \
+  && pass "(b) the stall is reported by NAME, with its window" \
+  || fail "(b) the stall is not named"
+grep -q "still RUNNING at the" "$TMP/err" && fail "(b) a stall was reported as the ceiling" \
+  || pass "(b) the stall is DISTINCT from the ceiling message"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) no merge on a stall" || pass "(b) no merge attempted"
+
+# (c) THE TWO WAITS READ DIFFERENTLY. The lane-terminal precondition fires
+# first; raising --rerun-timeout must NOT change that exit (B7's instant exit)
+# and the output must name WHICH wait it was and state the other never started.
+new_scen twowaits
+HEAD_W3="d3d3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_W3" > "$SCEN/head"
+lane_queued "$HEAD_W3" 9621 > "$SCEN/runs-$HEAD_W3"
+lane_fail mainw3 9622 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9622"
+run_admin 42 --main-runs 1 --rerun-timeout 99 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) the lane-terminal precondition blocks (exit $rc), even with --rerun-timeout 99" \
+  || fail "(c) a pending lane certified with a raised re-run bound"
+grep -q "precondition unmet: run still in_progress — no classification attempted" "$TMP/err" \
+  && pass "(c) the refusal NAMES the precondition and that no classification was attempted" \
+  || fail "(c) the precondition refusal is not named"
+grep -q "LANE-TERMINAL PRECONDITION" "$TMP/err" \
+  && pass "(c) …and names it as the lane-terminal precondition" \
+  || fail "(c) …but does not say which wait it is"
+grep -q -- "--rerun-timeout never started" "$TMP/err" \
+  && pass "(c) …and states the re-run wait never started" \
+  || fail "(c) …and leaves the two waits confusable"
+grep -q "still RUNNING at the" "$TMP/err" && fail "(c) the two waits read alike" \
+  || pass "(c) the re-run wait's message is absent (they are distinguishable)"
+grep -q "run rerun" "$SCEN/calls" && fail "(c) no re-run may start from a precondition block" \
+  || pass "(c) no re-run was started"
+
+# (d) THE CEILING IS DERIVED, and its source is stated — not a round number.
+bash "$ADM" --print-bounds > "$TMP/bounds.txt" 2>&1 || true
+grep -q '^rerun-timeout=3126$' "$TMP/bounds.txt" \
+  && pass "(d) the default ceiling is DERIVED: 3126s (2 x the slowest OBSERVED shard)" \
+  || fail "(d) the ceiling is not the derived value: $(head -1 "$TMP/bounds.txt")"
+grep -q 'source=2 x slowest OBSERVED shard 26m03s' "$TMP/bounds.txt" \
+  && pass "(d) …and the derivation's SOURCE (26m03s of 22m10s/25m50s/26m03s) is stated" \
+  || fail "(d) the derivation source is not stated"
+grep -q '^stall=600$' "$TMP/bounds.txt" \
+  && pass "(d) …and the stall window is its own, stated value" \
+  || fail "(d) the stall window is not stated"
+# …and the ceiling message itself carries the derivation.
+new_scen waitceiling
+printf '%s\n' "$HEAD_W1" > "$SCEN/head"
+lane_fail "$HEAD_W1" 9631 > "$SCEN/runs-$HEAD_W1"
+log_failed 'tests/test_flaky.py::test_slow' > "$SCEN/log-9631"
+lane_fail mainw4 9632 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9632"
+printf 'in_progress\n' > "$SCEN/status-9631"
+printf 't1\n' > "$SCEN/updated-9631"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_STALL_SECONDS=100 bash "$ADM" 42 --main-runs 1 --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) the derived ceiling blocks when reached (exit $rc)" || fail "(d) the ceiling did not block"
+grep -q "still RUNNING at the 5s ceiling = 2 x the slowest OBSERVED shard (26m03s)" "$TMP/err" \
+  && pass "(d) the ceiling message states the derivation, not a bare number" \
+  || fail "(d) the ceiling message does not state its derivation"
+
+# (e) ATTRIBUTION: a failure main's lane has NOT measured must not be called
+# "unique to this PR" — but it STILL BLOCKS. main fails a Docker file; the PR
+# fails the embedded file whose race the Docker lane cannot reproduce (B1).
+new_scen notmeasurable
+HEAD_W5="d5d5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_W5" > "$SCEN/head"
+EMBED='tests/test_embedded.py::TestGraph::test_copy_race'
+lane_fail "$HEAD_W5" 9641 > "$SCEN/runs-$HEAD_W5"
+log_failed "$EMBED" > "$SCEN/log-9641"
+lane_fail mainw5 9642 > "$SCEN/runs-main"
+log_failed 'tests/test_docker.py::test_other' > "$SCEN/log-9642"
+cp "$SCEN/log-9641" "$SCEN/log-after-9641"   # the retry FAILS again
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e) an unmeasured-file failure STILL BLOCKS (exit $rc) — the refusal is not narrowed" \
+  || fail "(e) an unmeasured-file failure was allowed through"
+grep -q "not measurable on this lane" "$TMP/err" \
+  && pass "(e) it reports 'not measurable on this lane' instead of 'unique to this PR'" \
+  || fail "(e) the output still asserts uniqueness with no measurement on main"
+grep -q "test_copy_race" "$TMP/err" && pass "(e) …naming the failure" || fail "(e) the failure is not named"
+grep -q "BOTH block" "$TMP/err" \
+  && pass "(e) …and states BOTH labels block (no waiver path)" \
+  || fail "(e) …but does not close the waiver reading"
+[ -f "$SCEN/comment" ] && fail "(e) no evidence may be posted on a block" || pass "(e) no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "(e) no merge on a block" || pass "(e) no merge attempted"
+
+# (e2) the companion: main's lane DOES measure that file, so the label is the
+# stronger measured-absent one — and it also STILL BLOCKS.
+new_scen measuredabsent
+printf '%s\n' "$HEAD_W5" > "$SCEN/head"
+lane_fail "$HEAD_W5" 9651 > "$SCEN/runs-$HEAD_W5"
+log_failed 'tests/test_docker.py::test_copy_race' > "$SCEN/log-9651"
+lane_fail mainw5b 9652 > "$SCEN/runs-main"
+log_failed 'tests/test_docker.py::test_other' > "$SCEN/log-9652"
+cp "$SCEN/log-9651" "$SCEN/log-after-9651"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e2) a measured-absent failure also STILL BLOCKS (exit $rc)" \
+  || fail "(e2) a measured-absent failure was allowed through"
+grep -q "measured on this lane, not present on main" "$TMP/err" \
+  && pass "(e2) it reads 'measured on this lane, not present on main'" \
+  || fail "(e2) the measured-absent label is missing"
+grep -q "not measurable on this lane" "$TMP/err" && fail "(e2) a measured failure was called unmeasurable" \
+  || pass "(e2) the two labels are distinct"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
