@@ -17,8 +17,14 @@
  *   [task-heartbeat] turn_start nonce=<n> <n>           — turn_start
  *   [task-heartbeat] turn_end nonce=<n> <n>             — turn_end
  *   [task-heartbeat] tick nonce=<n> tools=<n> turn=<0|1> stream_age_ms=<n>
- *                       tool_age_max_ms=<n> saw_msg=<0|1> saw_tool=<0|1>
+ *                       tool_age_max_ms=<n> tool_updates=<0|1>
+ *                       cpu_ms=<n> cpu_stall_ms=<n> cpu_advanced=<0|1>
+ *                       saw_msg=<0|1> saw_tool=<0|1>
  *                                               — every clamped interval
+ *                                                     (#928 added cpu_ms /
+ *                                                     cpu_stall_ms; see the
+ *                                                     CPU-liveness block
+ *                                                     below formatTick)
  *   [task-heartbeat] session_end nonce=<n>       — once at session_shutdown
  *                                                  (session completed — #191)
  *
@@ -73,6 +79,7 @@
  *     gated test hooks.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -150,6 +157,21 @@ export interface TickFields {
   sawTool: boolean;
   /** #783 §6.6: the in-flight tool round has emitted at least one update. */
   toolUpdates: boolean;
+  /** #928: cumulative CPU (ms) of the in-flight tool's PROCESS SUBTREE.
+   * 0 = not probed (no eligible tool, probe unavailable, or nothing found). */
+  cpuMs: number;
+  /** #928: wall-clock ms since `cpuMs` last INCREASED while an eligible tool
+   * was in flight. 0 = not probed. See the CPU-liveness block below. */
+  cpuStallMs: number;
+  /** #928: TRUE iff this tool round has DEMONSTRATED CPU work — the probe has
+   * observed at least one strict increase since the round's baseline. This is
+   * what makes flat-CPU evidence admissible: a tool that has never burned any
+   * CPU at all (an `npm ci` downloading, a `git fetch` on a slow link, any
+   * I/O-bound command — all silent AND CPU-idle by nature) is NOT evidence of
+   * a deadlock, and must never be killed on flat CPU alone. Mirrors clause 1's
+   * philosophy exactly: only ever kill a tool that has demonstrated it works,
+   * then stopped. */
+  cpuAdvanced: boolean;
 }
 
 /** #783 §6.6: the output-liveness bit the tick carries — true iff there is at
@@ -177,8 +199,295 @@ export function formatTick(nonce: string, f: TickFields): string {
     `tools=${f.tools} turn=${f.turn ? 1 : 0} ` +
     `stream_age_ms=${f.streamAgeMs} tool_age_max_ms=${f.toolAgeMaxMs} ` +
     `tool_updates=${f.toolUpdates ? 1 : 0} ` +
+    `cpu_ms=${f.cpuMs} cpu_stall_ms=${f.cpuStallMs} cpu_advanced=${f.cpuAdvanced ? 1 : 0} ` +
     `saw_msg=${f.sawMsg ? 1 : 0} saw_tool=${f.sawTool ? 1 : 0}`
   );
+}
+
+// ── #928: non-output liveness for a SILENT in-flight tool ──────────────
+//
+// The gap this closes. `stream_age_ms` is not a progress signal for a silent
+// tool: every `tool_execution_update` feeds `touchActivity()`, so a tool that
+// emits nothing leaves it on the same monotonic curve as a healthy nested
+// `task`. That is why the parent's `toolUpdates` gate refuses to kill either —
+// and why the ONLY bound left for a genuinely wedged silent tool is the
+// multi-hour age backstop (4h by default). The two states the parent must
+// separate are timing-IDENTICAL on every quantity the heartbeat carries today.
+//
+// The signal that does separate them is PROCESS LIVENESS. In the #928 incident
+// the in-flight `grep` had accumulated 69m50s of CPU — genuinely working, just
+// slowly. A deadlocked tool accumulates none. So the emitter reports the CPU
+// time of the in-flight tool's process subtree and how long it has been flat.
+//
+// ── Why `cpu_advanced` exists (i.e. why flat CPU alone is not enough) ──
+// CPU-flat has two causes: a DEADLOCK, and a legitimate I/O block. The second
+// is common and healthy — a download, a slow query, a `git fetch` on a bad
+// link all accrue ~no CPU for minutes while making real progress. Killing on
+// flat CPU alone would therefore trade one false kill (the nested `task`) for
+// another (the silent-but-downloading `bash`).
+//
+// The discriminator that IS available: a tool that has DEMONSTRATED CPU work
+// in this round and THEN gone flat is a deadlock signature; a tool that has
+// never burned CPU at all is just I/O-bound. So the emitter reports
+// `cpu_advanced` alongside the sample, and the parent admits flat-CPU evidence
+// only when it is true. This is the same shape as clause 1's rule — only kill a
+// tool that has demonstrated it works and then stopped — applied to the CPU
+// channel instead of the output channel.
+//
+// ── Why an ALLOWLIST, and why `task` is excluded ──
+// CPU-flat is evidence of death ONLY for a tool whose progress is CPU-bound.
+// A nested `task` legitimately sits at ~0 CPU for minutes while its child
+// awaits a provider response, so probing it would re-create the E279a2 false
+// kill this whole channel exists to avoid. An UNKNOWN tool is never probed
+// either: a new tool kind must not acquire a kill path by accident. The
+// allowlist is a NECESSARY narrowing condition, never the discriminator —
+// `npm ci` and the wedged `grep` are both `bash`, and only the CPU sample
+// separates them.
+//
+// ── Fail-safe direction ──
+// Every failure mode (no eligible tool, `ps` unavailable, unparseable output,
+// no descendants found) reports `cpu_stall_ms=0` — i.e. "not probed".
+// Absence of evidence must never arm a kill; a parent that cannot prove a
+// tool is dead must fall back to its existing bounds.
+
+/** #928: tool names whose progress is CPU-bound and whose process subtree is
+ * therefore meaningful to sample. Allowlist by design (see the block above):
+ * an unlisted tool is never probed and can never acquire a kill path.
+ * `task` is deliberately ABSENT — a nested sub-agent's quiet is legitimate. */
+export const CPU_LIVENESS_TOOL_NAMES: ReadonlySet<string> = new Set(["bash"]);
+
+/** #928: cap on the `ps` probe. The probe runs on the tick path, so it must
+ * never be able to wedge the emitter. */
+export const CPU_PROBE_TIMEOUT_MS = 2_000;
+
+/** #928: parse one `ps -o time=` cell (cumulative CPU) into milliseconds.
+ *
+ * Two dialects, both observed in this repo's existing `ps` usage:
+ *   macOS  `MM:SS.ss` (the minutes field is NOT clamped to 60 — `337:23.88`
+ *                      is 337 minutes) and `HH:MM:SS`;
+ *   Linux  `[[DD-]hh:]mm:ss` per procps.
+ * The RIGHTMOST field is always seconds, so the parse is positional from the
+ * right and both dialects fall out of the same loop.
+ *
+ * Returns null for anything unparseable (`-`, empty, a bare word) so the
+ * caller can treat it as "not probed" rather than as zero CPU. */
+export function parsePsCpuTimeMs(raw: string): number | null {
+  const s = raw.trim();
+  if (s === "" || s === "-") return null;
+  const dash = s.indexOf("-");
+  const days = dash >= 0 ? Number(s.slice(0, dash)) : 0;
+  if (dash >= 0 && !Number.isFinite(days)) return null;
+  const parts = (dash >= 0 ? s.slice(dash + 1) : s).split(":");
+  // `parts.length === 0` cannot happen for a non-empty trimmed string ("".split
+  // yields one element) and the empty case returned above — kept as
+  // defence-in-depth so a refactor cannot turn it into a silent 0.
+  if (parts.length === 0 || parts.length > 3) return null;
+  const nums = parts.map((p) => Number(p));
+  if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null;
+  let seconds = 0;
+  for (const n of nums) seconds = seconds * 60 + n;
+  return Math.round((days * 86_400 + seconds) * 1000);
+}
+
+/** #928: `ps -axo pid=,ppid=,pgid=,time=` output (one process per line).
+ *
+ * Returns `{ cpuMs, pgids }` — the summed CUMULATIVE CPU of the tool's tree and
+ * the distinct detached process groups it spans (sorted) — or null when there
+ * was nothing to measure. `pgids` exists so the CALLER can refuse an
+ * unattributable measurement (see the note below). Never returns `{cpuMs: 0}` in place of null: a measured zero
+ * and "nothing measured" must not be confused.
+ *
+ * Two filters, both load-bearing:
+ *
+ *  · `rootPid` itself is EXCLUDED — the child pi's own CPU advances on every
+ *    tick (it is running this very probe), so including it would mask a dead
+ *    tool permanently. Only the tool's tree is evidence.
+ *
+ *  · a descendant is counted only when its PROCESS GROUP differs from the
+ *    root's. pi spawns the `bash` tool's shell `detached: true` (its own pgid —
+ *    verified in the installed pi's bash tool), while its NON-tool children
+ *    (MCP servers) are spawned non-detached and share pi's pgid. Without this
+ *    filter a background MCP server accruing even a millisecond of CPU would
+ *    advance the sample, and a genuinely deadlocked tool would never be
+ *    detected — the probe would measure "is anything under pi busy" instead of
+ *    "is THIS tool alive".
+ *
+ * ⚠️ The pgid filter alone does NOT attribute the measurement to a TOOL. Other
+ * things pi spawns are detached too: a nested `task`/`subagent` child, and
+ * `tortoise-capture`'s `python3`. Their CPU would otherwise be credited to
+ * whichever eligible tool happens to be in flight, arming the dead-tool clause
+ * against a tool that never burned a cycle of its own. That is why the groups
+ * are reported (`pgids`) rather than folded into the sum — the caller refuses a
+ * multi-group snapshot, and pins the ONE group it will trust.
+ *
+ * Returns null when no descendant row is present — "nothing to measure" must
+ * read as not-probed, never as zero-CPU (which would arm a kill on the tick
+ * after a tool's command exits but before its `tool_execution_end`). Also
+ * returns null when the root is absent from the snapshot, since its pgid is
+ * then unknown.
+ *
+ * Note that the sum can DECREASE between ticks: `ps` lists live processes
+ * only, so a descendant that exits drops out. The caller handles that by
+ * re-basing rather than by treating the drop as progress. */
+export function sumDescendantCpuMs(
+  psOutput: string,
+  rootPid: number,
+): { cpuMs: number; pgids: number[] } | null {
+  const children = new Map<number, number[]>();
+  const selfMs = new Map<number, number>();
+  const pgidOf = new Map<number, number>();
+  for (const line of psOutput.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const ppid = Number(m[2]);
+    const ms = parsePsCpuTimeMs(m[4]);
+    if (ms === null) continue;
+    pgidOf.set(pid, Number(m[3]));
+    const kids = children.get(ppid);
+    if (kids) kids.push(pid);
+    else children.set(ppid, [pid]);
+    selfMs.set(pid, ms);
+  }
+  const rootPgid = pgidOf.get(rootPid);
+  if (rootPgid === undefined) return null;
+  let total = 0;
+  let seen = 0;
+  const detachedGroups = new Set<number>();
+  const queue = [...(children.get(rootPid) ?? [])];
+  const visited = new Set<number>();
+  while (queue.length > 0) {
+    const pid = queue.shift() as number;
+    // Cycle guard: a pid in the list can never be its own ancestor, but the
+    // ps snapshot is not atomic and a recycled pid could theoretically close
+    // a loop. Never let a malformed snapshot spin here.
+    if (visited.has(pid)) continue;
+    visited.add(pid);
+    // Walk THROUGH every descendant, but only COUNT the detached groups.
+    for (const kid of children.get(pid) ?? []) queue.push(kid);
+    const pgid = pgidOf.get(pid);
+    if (pgid === undefined || pgid === rootPgid) continue;
+    detachedGroups.add(pgid);
+    const own = selfMs.get(pid);
+    if (own !== undefined) {
+      total += own;
+      seen += 1;
+    }
+  }
+  // `pgids` carries both facts the caller needs: how many groups there are
+  // (`length`) and WHICH ones (`[0]`). A separate `trees` count was a second
+  // spelling of `pgids.length`, and a redundant guard is a guard that can be
+  // removed without a test noticing — the exact failure this review cycle
+  // exists to avoid.
+  return seen === 0
+    ? null
+    : { cpuMs: total, pgids: [...detachedGroups].sort((a, b) => a - b) };
+}
+
+/** #928: sample the CPU-liveness signal. Returns the tree's cumulative CPU in
+ * ms and which detached groups it spans, or null when the probe could not produce
+ * a measurement. Never throws. */
+export function probeToolTreeCpu(
+  rootPid: number = process.pid,
+): { cpuMs: number; pgids: number[] } | null {
+  try {
+    const out = execSync("ps -axo pid=,ppid=,pgid=,time=", {
+      encoding: "utf-8",
+      timeout: CPU_PROBE_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return sumDescendantCpuMs(out, rootPid);
+  } catch {
+    return null;
+  }
+}
+
+/** #928 test seam: replace the probe (e.g. to pin the clause WITHOUT spawning
+ * `ps`). Mirrors `setLoad1Override` in extensions/builtin-tools/index.ts and
+ * `orphanWatchdogHooks` below. Pass null to restore the real probe. */
+let _cpuProbeOverride: (() => { cpuMs: number; pgids: number[] } | null) | null = null;
+export function setCpuProbeOverride(fn: (() => { cpuMs: number; pgids: number[] } | null) | null): void {
+  _cpuProbeOverride = fn;
+}
+
+/** #928: the CPU-liveness clock's state. Holds the baseline sample, the last
+ * time the sample INCREASED, and whether the current round has demonstrated
+ * CPU work at all. Kept as an exported pure reducer rather than a closure so
+ * the advancement rule — the whole discriminator — is unit-testable without a
+ * timer. (It was a closure first; a mutation of its `>` to `>=` left the entire
+ * suite green while making the fix inert, which is exactly what an untestable
+ * discriminator buys.) */
+export interface CpuLiveness {
+  /** false until a sample has been taken for the current eligible round. */
+  baselineSet: boolean;
+  lastSampleMs: number;
+  lastAdvanceAt: number;
+  /** Demonstrated CPU work this round — see `cpuAdvanced` in TickFields. */
+  advanced: boolean;
+  /** #928: the process group this round is measuring, pinned by the first
+   * admitted sample. Later samples must see this group and only it — see the
+   * identity-pin note in `sampleToolCpu`. null = not yet pinned. */
+  pinnedPgid: number | null;
+}
+
+export function newCpuLiveness(): CpuLiveness {
+  return { baselineSet: false, lastSampleMs: 0, lastAdvanceAt: 0, advanced: false, pinnedPgid: null };
+}
+
+/** #928: clear the EVIDENCE but keep the round's pinned group. Used wherever the
+ * round has not changed but the measurement cannot be trusted this tick — a
+ * failed probe, an unattributable snapshot, a different group appearing. The
+ * pin must survive those, or the very next tick would simply re-pin to whatever
+ * is now visible and adopt the foreign group the pin was there to refuse. */
+export function clearCpuEvidence(s: CpuLiveness): void {
+  s.baselineSet = false;
+  s.advanced = false;
+}
+
+/** Re-arm for a NEW round: clears the evidence AND drops the pinned group, since
+ * the next round is about a different tool. This is the round-boundary call —
+ * tool_start / tool_end / turn_end — not the "unmeasurable this tick" call (see
+ * `clearCpuEvidence`). */
+export function resetCpuLiveness(s: CpuLiveness): void {
+  clearCpuEvidence(s);
+  s.pinnedPgid = null;
+}
+
+/** Advance the clock with one measurement and return the tick's fields. Pure
+ * apart from mutating `s`. `sample === null` means NOT PROBED (probe failed,
+ * `ps` unavailable, no descendant rows, or no eligible tool) and clears the
+ * baseline AND the demonstrated-work latch — a signal that is not continuous
+ * proves nothing.
+ *
+ * Advancing = the sample is STRICTLY GREATER than the previous one. A sample
+ * that DROPS is a descendant exiting (`ps` lists live processes only); we
+ * re-base to it without treating the drop as progress — but the stall clock is
+ * only reset by a real INCREASE, so a drop can never extend the stall either.
+ * The next genuine increase clears it. */
+export function stepCpuLiveness(
+  s: CpuLiveness,
+  sample: number | null,
+  now: number,
+): { cpuMs: number; cpuStallMs: number; cpuAdvanced: boolean } {
+  if (sample === null) {
+    return { cpuMs: 0, cpuStallMs: 0, cpuAdvanced: s.advanced };
+  }
+  if (!s.baselineSet) {
+    s.baselineSet = true;
+    s.lastSampleMs = sample;
+    s.lastAdvanceAt = now;
+  } else if (sample > s.lastSampleMs) {
+    s.lastSampleMs = sample;
+    s.lastAdvanceAt = now;
+    s.advanced = true;
+  } else {
+    s.lastSampleMs = sample;
+  }
+  return {
+    cpuMs: sample,
+    cpuStallMs: Math.max(0, now - s.lastAdvanceAt),
+    cpuAdvanced: s.advanced,
+  };
 }
 
 /** Completion marker (#191): the child declares the session complete. The
@@ -387,8 +696,11 @@ export default function (pi: ExtensionAPI) {
   // In-flight tools tracked as a Map keyed by toolCallId (NOT a bare counter:
   // pi emits tool_execution_start during preflight and tool_execution_end in
   // completion order — a preflight-started tool that is rejected/skipped could
-  // desync a counter forever). Values are start timestamps for tool_age_max_ms.
-  const outstandingTools = new Map<string, number>();
+  // desync a counter forever). Values carry the start timestamp for
+  // tool_age_max_ms and the tool NAME: #928's CPU-liveness probe is per tool
+  // KIND (see CPU_LIVENESS_TOOL_NAMES), so the emitter must know what is in
+  // flight, not just how many.
+  const outstandingTools = new Map<string, { startedAt: number; name: string }>();
   /** #783 §6.6: which in-flight tools have emitted `tool_execution_update`.
    * Only streaming tools emit updates — `bash` does, while `task`, `read`,
    * `edit`, `write` pass `_onUpdate` UNUSED. The tick reports whether EVERY
@@ -405,6 +717,13 @@ export default function (pi: ExtensionAPI) {
   let turnSawTool = false;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
 
+  // #928 CPU-liveness state — the clock's mutable state, advanced by the pure
+  // reducer `stepCpuLiveness` (exported so the advancement rule is pinned by
+  // unit tests rather than only by the tick timer). `cpuMeasurementAttributable`
+  // gates whether it is sampled at all; a reset re-arms the baseline so a new
+  // eligible round earns its own evidence.
+  const cpuLiveness = newCpuLiveness();
+
   const emit = (line: string) => {
     try {
       console.error(line);
@@ -417,13 +736,106 @@ export default function (pi: ExtensionAPI) {
     lastActivityAt = Date.now();
   };
 
+  /** #928: the tool in flight, WHEN the measurement can be ATTRIBUTED to it.
+   *
+   * The probe enumerates pi's detached descendants, and pi spawns other things
+   * detached besides the bash shell — a nested `task`/`subagent` child, and
+   * `tortoise-capture`'s `python3`. Those are ineligible KINDS, so the allowlist
+   * does not exclude them, and their CPU would be credited to whichever
+   * eligible tool happens to be in flight: that would arm `cpu_advanced` for a
+   * `bash` that never burned a cycle of its own and defeat the whole
+   * "never kill an I/O-bound tool" guarantee (the exact bypass two independent
+   * reviewers reproduced).
+   *
+   * So a sample is taken ONLY when it is attributable, and attribution is by
+   * IDENTITY, not by count:
+   *
+   *   1. exactly ONE tool is in flight, and it is eligible;
+   *   2. at the FIRST sample of a round, exactly ONE detached group exists —
+   *      that group is pinned as THE tool's group for the rest of the round;
+   *   3. every later sample of the round must see that same group.
+   *
+   * (2) alone would NOT be enough, and the gap is this round's own lifecycle:
+   * when the `bash` shell EXITS, its group vanishes from `ps` while pi has not
+   * yet emitted `tool_execution_end` (pi waits for the stdout/stderr pipes, and
+   * re-arms a 100 ms idle timer on every chunk of output). If a foreign detached
+   * group — a nested `task`, a `tortoise-capture` helper — is what remains, the
+   * tree count is still 1 and a count-based check admits it: the foreign group's
+   * CPU is credited to a tool whose own process is ALREADY GONE, arming the
+   * evidence latch for it. Requiring the pinned group to still be present
+   * refuses that snapshot, which is the correct answer — this tool can no longer
+   * be measured, so it must not be judged.
+   *
+   * Residual, stated rather than hidden: TWO concurrent eligible `bash` tools go
+   * INERT (the set is never exactly one eligible tool). A busy one therefore
+   * masks a wedged one, because the clause declines to judge rather than judging
+   * on a union it cannot split. That is the fail-open (missed-kill) direction. */
+  const cpuMeasurementAttributable = () => {
+    if (outstandingTools.size !== 1) return false;
+    for (const t of outstandingTools.values()) {
+      return CPU_LIVENESS_TOOL_NAMES.has(t.name);
+    }
+    return false;
+  };
+
+  /** #928: sample the in-flight tool's tree CPU and derive the tick fields.
+   * Thin shell over the pure `stepCpuLiveness` — all the rule logic lives there
+   * so it is unit-testable; this only decides whether to sample at all. */
+  const sampleToolCpu = (now: number): { cpuMs: number; cpuStallMs: number; cpuAdvanced: boolean } => {
+    const notProbed = { cpuMs: 0, cpuStallMs: 0, cpuAdvanced: false };
+    if (!cpuMeasurementAttributable()) {
+      // Same round, unmeasurable this tick (a second tool joined) — clear the
+      // evidence, keep the pin.
+      clearCpuEvidence(cpuLiveness);
+      return notProbed;
+    }
+    const measured = (_cpuProbeOverride ?? probeToolTreeCpu)();
+    // No measurement: delegate to the reducer's null branch so there is exactly
+    // ONE definition of what "not probed" means (it clears the evidence and
+    // leaves the pin — the round has not changed). Inlining a second copy here
+    // is how the branch would drift, or fall out of use entirely.
+    if (measured === null) return stepCpuLiveness(cpuLiveness, null, now);
+    // More than one detached group means the tree we can see is not the
+    // in-flight tool's alone — a concurrent nested `task`, a `tortoise-capture`
+    // helper, or the tool's OWN daemonizing child (a command that calls
+    // `setsid()`: the shell itself cannot, it is already a group leader, but its
+    // children can). Not attributable → not probed this tick, so the clause
+    // stays inert. Note `clearCpuEvidence`, not `reset`: the round has not
+    // changed, so the pin (and the tool it identifies) must survive.
+    //
+    // This is load-bearing at the FIRST sample of a round and nowhere else —
+    // later samples are covered by the pin comparison below, which refuses any
+    // group other than the pinned one. Both are needed: without this, a round
+    // whose very first snapshot spans two groups would PIN one of them, and
+    // every later sample would look consistent with it.
+    if (measured.pgids.length !== 1) {
+      clearCpuEvidence(cpuLiveness);
+      return notProbed;
+    }
+    // Identity pin (see the note above): the first admitted sample of a round
+    // fixes WHICH group this round is about; later samples must see that same
+    // group. A different group means the tool's own group is gone (its shell
+    // exited — the exact window a count-based check gets wrong) or another
+    // appeared mid-round. Both are unattributable, and the refusal must be
+    // STICKY for the round: clearing the pin here would let the next tick simply
+    // re-pin to the foreign group and adopt it.
+    const pgid = measured.pgids[0];
+    if (cpuLiveness.pinnedPgid !== null && cpuLiveness.pinnedPgid !== pgid) {
+      clearCpuEvidence(cpuLiveness);
+      return notProbed;
+    }
+    cpuLiveness.pinnedPgid = pgid;
+    return stepCpuLiveness(cpuLiveness, measured.cpuMs, now);
+  };
+
   const tick = () => {
     const now = Date.now();
     let toolAgeMaxMs = 0;
-    for (const startedAt of outstandingTools.values()) {
-      const age = now - startedAt;
+    for (const t of outstandingTools.values()) {
+      const age = now - t.startedAt;
       if (age > toolAgeMaxMs) toolAgeMaxMs = age;
     }
+    const cpu = sampleToolCpu(now);
     emit(
       formatTick(nonce, {
         tools: outstandingTools.size,
@@ -431,6 +843,9 @@ export default function (pi: ExtensionAPI) {
         streamAgeMs: now - lastActivityAt,
         toolAgeMaxMs,
         toolUpdates: computeToolUpdates(outstandingTools.keys(), updatedToolIds),
+        cpuMs: cpu.cpuMs,
+        cpuStallMs: cpu.cpuStallMs,
+        cpuAdvanced: cpu.cpuAdvanced,
         sawMsg: turnSawMessage,
         sawTool: turnSawTool,
       }),
@@ -497,7 +912,23 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_start", async (event) => {
-    outstandingTools.set(event.toolCallId, Date.now());
+    // #928: EVERY tool start re-arms the CPU-liveness clock. Two reasons, both
+    // load-bearing:
+    //   · a fresh tool must earn its own evidence — a new tool can never
+    //     inherit the previous tool's demonstrated work or flat-CPU age;
+    //   · `cpuMeasurementAttributable` requires the in-flight set to be exactly
+    //     one eligible tool, so ANY second tool (of any kind) makes the next
+    //     measurement unattributable — and a clock that straddled that boundary
+    //     would resume against a different process set.
+    // Unconditional, therefore — including the overlapping swap where the set
+    // never empties (the case a `size === 0` gate misses). This is the fail-safe
+    // direction: a spurious clear costs at most one tick. The parent clears its
+    // own latches on every tool_start too.
+    resetCpuLiveness(cpuLiveness);
+    outstandingTools.set(event.toolCallId, {
+      startedAt: Date.now(),
+      name: event.toolName ?? "",
+    });
     turnSawTool = true;
     touchActivity();
     emit(formatToolStart(nonce, event.toolCallId, event.toolName));

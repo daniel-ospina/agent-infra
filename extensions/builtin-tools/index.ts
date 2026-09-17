@@ -1478,13 +1478,29 @@ export function scanStderrForUsage(
 //     completion watchdog (Tier 4) so a completed child stuck in cleanup is
 //     rescued promptly and its output returned as success.
 //
-// Kill clauses (precedence: tool-silence → tool-stall → stream-stall →
-// silence → cut → first-message → max-dispatch):
+// Kill clauses (precedence: tool-silence → tool-dead → tool-stall →
+// stream-stall → silence → cut → first-message → max-dispatch):
 //   tool-silence ...... in-flight tool with NO OUTPUT for
 //                       TASK_STREAM_STALL_MS (20 min) — the PRIMARY wedged-tool
 //                       detector. A working tool keeps emitting
 //                       `tool_execution_update`, so silence ⇒ wedged, and a
 //                       healthy tool survives however long it runs (#783 §6.6)
+//   tool-dead ......... in-flight tool with NO OUTPUT and NO CPU —
+//                       #928. The complement of tool-silence, and the only
+//                       bound that reaches a tool the silence detector is
+//                       structurally blind to (one that has NEVER emitted an
+//                       update, so `tool_updates` stays 0 and clause 1 cannot
+//                       fire). Evidence is process liveness, not output: the
+//                       child samples the tool's process-subtree CPU and
+//                       reports how long it has been flat — and flat-CPU
+//                       evidence is admitted ONLY for a tool that has
+//                       DEMONSTRATED CPU work in this round (`cpu_advanced`),
+//                       so an I/O-bound tool (silent AND CPU-idle by nature,
+//                       e.g. a download) is never killed on flat CPU. Fires
+//                       only for tool KINDS whose progress is CPU-bound (the
+//                       child's allowlist, `bash`), so a healthy nested `task`
+//                       — quiet by construction and legitimately CPU-flat while
+//                       its child awaits a provider — can never trip it.
 //   tool-stall ........ in-flight tool older than 2/3 of the effective hard cap
 //                       (4h at the 6h default, task path — #783;
 //                       min(L, T) when turnActive=false — preflight-stuck).
@@ -1689,6 +1705,43 @@ export function getCutGapMs(): number {
   return Math.max(15_000, Number.isFinite(raw) && raw > 0 ? raw : fallback);
 }
 
+/** #928: how long an in-flight tool may consume NO CPU — AFTER it has
+ * demonstrated CPU work — before it is treated as deadlocked rather than slow.
+ *
+ * Read it as a floor on the EVIDENCE, not as the bound. The clause requires
+ * `effToolAge > S` AND `toolCpuStallMs > C` conjunctively, and the child's
+ * stall clock starts at the eligible tool's start (it is re-armed with the
+ * CPU baseline), so while a tool is CPU-flat its stall age tracks its own age:
+ * the clause fires at `effToolAge > max(S, C)`. At the shipped defaults
+ * (S = 20 min, C = 30 min) the binding condition is therefore **C — 30 min**,
+ * a 8× improvement on the 4h age backstop it pre-empts and still far inside it.
+ *
+ * Calibration. `cpu_advanced` already excludes the tool that has NEVER burned
+ * CPU (an I/O-bound command — a download, a slow query — is silent AND
+ * CPU-idle from the start), so C does not have to cover the general "blocked on
+ * I/O" class. It has to cover the narrower one that remains: a tool that DID
+ * burn CPU and is now blocked on I/O. That is why it is 30 min rather than
+ * minutes — and why it is not longer: the cost of getting this wrong in the
+ * other direction is the #363/#489 kill-productive-agents class.
+ *
+ * `TASK_CPU_STALL_MS=0` DISABLES the clause — an explicit off switch for a new
+ * kill path. The test is the VALUE being zero, not the exact spelling `"0"`:
+ * `"0"`, `"0.0"`, `"+0"`, `" 0 "` all disable, because an operator who wrote
+ * any of those meant to switch it off and silently arming it anyway is a
+ * surprise with no upside. What is NOT an off switch is a BLANK value: a
+ * launcher doing `TASK_CPU_STALL_MS="${UNSET}"` exports an empty string, and
+ * `0`-means-off conventions must not turn a typo into "disabled".
+ * Non-finite / blank / negative → the default, never "disabled by a typo". */
+export const DEFAULT_CPU_STALL_MS = 1_800_000;
+export function getCpuStallMs(): number {
+  const raw = (process.env.TASK_CPU_STALL_MS ?? "").trim();
+  if (raw === "") return DEFAULT_CPU_STALL_MS;
+  const n = Number(raw);
+  if (n === 0) return 0;
+  if (Number.isFinite(n) && n > 0) return Math.max(60_000, n);
+  return DEFAULT_CPU_STALL_MS;
+}
+
 // ── #271: backstop + exit taxonomy ──────────────────────────────────
 //
 // The parent await is bounded by four layers (D4): exit-settle (≤ ~2s after
@@ -1814,6 +1867,23 @@ export interface HeartbeatState {
    * outer agent awaiting a nested task — silent by construction for the whole
    * child duration, see E279a2 — is misread as wedged and killed at S. */
   toolUpdates: boolean;
+  /** #928: cumulative CPU (ms) of the in-flight tool's process subtree, as
+   * reported by the child's `cpu_ms`. Diagnostic evidence; the DECISION reads
+   * `toolCpuStallMs`. 0 = not probed. */
+  toolCpuMs: number;
+  /** #928: ms since that subtree last consumed CPU (child `cpu_stall_ms`).
+   * 0 = NOT PROBED or advancing this tick — no eligible tool in flight (the
+   * child's allowlist), the probe was unavailable, or the child is older than
+   * this field. Absence of evidence must never arm a kill, so 0 keeps
+   * `tool-dead` off. */
+  toolCpuStallMs: number;
+  /** #928: the in-flight round has DEMONSTRATED CPU work (child
+   * `cpu_advanced`). Flat-CPU evidence is admissible ONLY on top of this: a
+   * tool that has never burned CPU (an I/O-bound download, a slow query) is
+   * silent and CPU-idle by nature and is NOT a deadlock. Mirrors clause 1's
+   * rule — only kill a tool that has demonstrated it works, then stopped.
+   * Fail-safe: absent field (older child) → false → clause inert. */
+  toolCpuAdvanced: boolean;
   /** High-water mark of toolsInFlight ever parsed. */
   toolsMaxInFlight: number;
   /** First-N marker kinds in parse order (bounded, oldest kept) — the run's
@@ -1829,6 +1899,9 @@ export function createHeartbeatState(): HeartbeatState {
     streamAgeMs: 0,
     toolAgeMaxMs: 0,
     toolUpdates: false,
+    toolCpuMs: 0,
+    toolCpuStallMs: 0,
+    toolCpuAdvanced: false,
     turnSawMessage: false,
     turnSawTool: false,
     everSawWork: false,
@@ -1913,6 +1986,19 @@ export function parseHeartbeatLine(
     case "tool_start":
       // #783 §6.6: a round starting from idle resets the output-liveness latch.
       if (state.toolsInFlight === 0) state.toolUpdates = false;
+      // #928: the CPU-liveness triple is reset on EVERY tool_start —
+      // UNCONDITIONALLY, unlike tool_updates above. `tool_updates` is a
+      // universal-over-the-set bit, so clearing it on a new tool would wrongly
+      // DISABLE clause 1; this triple is per-round EVIDENCE, so a new tool must
+      // never inherit its predecessor's. Gating it on `toolsInFlight === 0`
+      // (the shape `tool_updates` needs) left a real hole: a LOST tool_end
+      // keeps `toolsInFlight` stale at 1, so the next tool_start cleared
+      // nothing and a fresh, healthy tool — a nested `task` included — could be
+      // killed on the OLD tool's evidence. A spurious clear costs at most one
+      // tick of delay, which is the fail-safe direction.
+      state.toolCpuMs = 0;
+      state.toolCpuStallMs = 0;
+      state.toolCpuAdvanced = false;
       state.toolsInFlight += 1;
       state.toolsMaxInFlight = Math.max(state.toolsMaxInFlight, state.toolsInFlight);
       state.everSawTool = true;
@@ -1968,6 +2054,12 @@ export function parseHeartbeatLine(
       // default, #783) — NOT the >6h age the pre-split
       // safety argument assumed.
       state.streamAgeMs = 0;
+      // #928: the CPU-liveness pair is meaningless once no tool is in flight,
+      // and a stale non-zero age would otherwise be read by the next tick's
+      // decision in the window before the child reports again.
+      state.toolCpuMs = 0;
+      state.toolCpuStallMs = 0;
+      state.toolCpuAdvanced = false;
       break;
     case "turn_start":
       state.turnActive = true;
@@ -2001,6 +2093,18 @@ export function parseHeartbeatLine(
       // turn_start marker is lost.
       state.streamAgeMs = 0;
       state.toolAgeMaxMs = 0;
+      // #928: see tool_end — no tool survives a turn boundary (pi guarantees
+      // all tools finalize before turn_end), so the CPU triple resets with its
+      // siblings rather than being inherited by the next turn. (turn_start
+      // deliberately does NOT clear it: it is the retry/continuation edge and
+      // any tool starting in the new turn clears it on its own tool_start. The
+      // invariant is therefore "cleared at every boundary that can precede a
+      // fresh tool", and no path can read a stale value: clause 1b requires
+      // toolsInFlight > 0, which is only regained via a tick — which carries
+      // all three fields — or a tool_start, which clears them.)
+      state.toolCpuMs = 0;
+      state.toolCpuStallMs = 0;
+      state.toolCpuAdvanced = false;
       break;
     case "tick": {
       state.tickCount += 1;
@@ -2021,6 +2125,11 @@ export function parseHeartbeatLine(
           // #783 §6.6: absent on an older child → stays false → the silence
           // clause cannot fire (fails SAFE to the age backstop).
           case "tool_updates": state.toolUpdates = v === 1; break;
+          // #928: absent on an older child → both stay 0 → "not probed" →
+          // the dead-tool clause cannot fire (fails SAFE to the age backstop).
+          case "cpu_ms": state.toolCpuMs = v; break;
+          case "cpu_stall_ms": state.toolCpuStallMs = v; break;
+          case "cpu_advanced": state.toolCpuAdvanced = v === 1; break;
           case "saw_msg": state.turnSawMessage = v === 1; break;
           case "saw_tool": state.turnSawTool = v === 1; break;
         }
@@ -2197,6 +2306,7 @@ export type HeartbeatKillReason =
   | "silence-threshold"
   | "stream-stall"
   | "tool-silence"
+  | "tool-dead"
   | "tool-stall"
   | "first-message-stall"
   | "max-dispatch"
@@ -2241,6 +2351,10 @@ export interface HeartbeatDecisionInput {
    * alive class (markers stopped while a tool is in flight). See D1. */
   cutGapMs: number;
 
+  /** #928: how long an in-flight, silent tool may consume no CPU before it is
+   * treated as deadlocked. 0 = the clause is disabled. */
+  cpuStallMs: number;
+
   /** #318: network is unreachable (probe failed). When true AND heartbeat
    * markers are fresh, the waiting/stall clauses below are outage artifacts
    * (the child's pi retries every ~5 min), not wedges — they are suppressed
@@ -2251,9 +2365,9 @@ export interface HeartbeatDecisionInput {
 }
 
 /**
- * The idle detector (#176): tier-1 + the seven kill clauses. Precedence
- * (pinned, E10): tool-silence → tool-stall → stream-stall → silence → cut →
- * first-message → max-dispatch.
+ * The idle detector (#176): tier-1 + the eight kill clauses. Precedence
+ * (pinned, E10): tool-silence → tool-dead → tool-stall → stream-stall →
+ * silence → cut → first-message → max-dispatch.
  * Every clause is bounded; with no markers at all the decision degrades to
  * exact legacy behavior (tier-1 + byte-silence at T).
  */
@@ -2344,8 +2458,97 @@ export function heartbeatKillDecision(
   //    clause once it ends). That is deliberate: the clause only ever kills a
   //    tool that has DEMONSTRATED it streams and then stopped, so silence is
   //    evidence of a wedge rather than of a quiet-but-working tool.
+  //    ⚠️ #928 update: "the age backstop below" is no longer the ONLY bound for
+  //    that population. Clause 1b (`tool-dead`) closes it whenever the buffering
+  //    tool has demonstrated CPU work and then gone FLAT for C — a bound of
+  //    max(S, C) rather than L. Precise scope, because a reader will otherwise
+  //    over-read this: 1b covers the DEADLOCKED-SILENT shape (a tool that burned
+  //    CPU and then stopped), not every silent tool. The #928 incident's `grep`
+  //    was silent but its CPU was ADVANCING (69m50s), so 1b is inert for it BY
+  //    DESIGN — reclassifying a demonstrably working tool as dead is the false
+  //    kill this whole item exists to avoid. The age backstop remains the bound
+  //    for a CPU-advancing silent tool, for one that never burned CPU at all (an
+  //    I/O-bound command), and for any kind outside the child's allowlist.
   if (stateFresh && st.toolsInFlight > 0 && st.toolUpdates && effStreamAge > i.streamStallMs) {
     return kill("tool-silence");
+  }
+
+  // 1b. tool-dead — #928. The COMPLEMENT of clause 1, and the only bound that
+  //     can reach the tool clause 1 is structurally blind to.
+  //
+  //     Why clause 1 cannot cover it: `toolUpdates` is UNIVERSAL over the
+  //     in-flight set (see computeToolUpdates), and a tool that has never
+  //     emitted a single `tool_execution_update` keeps it false. A `bash` that
+  //     buffers all of its output — and any tool that has simply not printed
+  //     yet — therefore cannot trip clause 1 at ANY age. Until this clause
+  //     existed the only bound left for such a tool was the 4h age backstop —
+  //     which is what the #928 incident fell through: an 80-minute silent `grep`
+  //     nobody could classify. (That `grep` was CPU-BUSY, so this clause does
+  //     NOT shorten its bound — see the precise scope note above. What the
+  //     incident establishes is the GAP: silence-only evidence cannot separate
+  //     the two shapes, so a CPU channel had to exist before either could be
+  //     bounded on evidence rather than on a generous age.)
+  //
+  //     Why the evidence is CPU and not time: from the parent's view a wedged
+  //     silent tool and a healthy nested `task` are TIMING-IDENTICAL
+  //     (toolsInFlight=1, never emitted an update, `stream_age_ms` on the same
+  //     monotonic curve). Any age bound that fires on one fires on the other —
+  //     the false kill the `toolUpdates` gate exists to prevent (E279a2). The
+  //     separating signal is process liveness: the incident's `grep` had
+  //     accumulated 69m50s of CPU, i.e. it was genuinely WORKING. The child now
+  //     samples the in-flight tool's process-subtree CPU and reports
+  //     `cpu_stall_ms` (ms since it last advanced).
+  //
+  //     Why this cannot false-kill a nested `task`: `cpu_stall_ms` is 0 —
+  //     "not probed" — for every tool kind outside the child's allowlist, and
+  //     `task` is deliberately outside it (a sub-agent waiting on a provider
+  //     response is legitimately CPU-flat). The allowlist is the necessary
+  //     narrowing condition; the CPU sample is the discriminator.
+  //
+  //     Four independent fail-safes, all of them "do not kill":
+  //       · `cpu_stall_ms` is 0 for an older child (field absent), a probe
+  //         failure, an unparseable `ps`, or no descendant rows found — so this
+  //         clause is inert on any surface that cannot prove death;
+  //       · `cpuStallMs === 0` disables it outright (TASK_CPU_STALL_MS=0);
+  //       · `!st.toolUpdates` keeps it strictly complementary to clause 1 —
+  //         a tool that HAS streamed and then stopped is clause 1's case, and
+  //         the two never disagree about the same tool;
+  //       · `st.toolCpuAdvanced` admits the flat-CPU evidence ONLY for a tool
+  //         that has DEMONSTRATED CPU work in this round, and
+  //         `effToolAge > i.streamStallMs` mirrors clause 1's silence window on
+  //         the tool's own duration, so a freshly-started tool is never judged
+  //         on a CPU baseline that has not had time to establish.
+  //
+  //     `toolCpuAdvanced` is what keeps this from trading one false kill for
+  //     another. Flat CPU has two causes — a deadlock, and a legitimate I/O
+  //     block — and the second is common and healthy: a download, a slow query,
+  //     a `git fetch` on a bad link all accrue ~no CPU for many minutes while
+  //     making real progress, and (crucially) they are ALSO silent, so
+  //     `tool_updates` is 0 for them too. Without this latch such a tool would
+  //     be killed at max(S, C) where the previous bound was the 4h age
+  //     backstop. Requiring demonstrated CPU work is exactly clause 1's shape —
+  //     only ever kill a tool that has demonstrated it works, then stopped —
+  //     applied to the CPU channel instead of the output channel.
+  //
+  //     What flat CPU still does NOT prove (residual, stated not hidden): a tool
+  //     that burned CPU and is NOW blocked on I/O for longer than C is classified
+  //     deadlocked and killed. C (30 min) is sized for that residual, and the
+  //     kill headline says what the evidence was rather than asserting a cause
+  //     the parent cannot prove. The reverse error — never firing on a real
+  //     deadlock — is the bug #928 exists to fix.
+  //     The kill resolves as a partial result and is reported to the model
+  //     with its own headline naming the CPU evidence — a silent bound would
+  //     be only a shorter timeout, not a diagnostic the model can act on.
+  if (
+    stateFresh &&
+    st.toolsInFlight > 0 &&
+    !st.toolUpdates &&
+    i.cpuStallMs > 0 &&
+    st.toolCpuAdvanced &&
+    st.toolCpuStallMs > i.cpuStallMs &&
+    effToolAge > i.streamStallMs
+  ) {
+    return kill("tool-dead");
   }
 
   // 2. tool-stall — AGE BACKSTOP, demoted from primary detector. It now owns
@@ -3006,7 +3209,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
         {
           headline: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`,
+          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`,
           stderrSection: { delimiter: "--- last stderr ---", slice: 2000, trimFirst: false, omitWhenEmpty: false },
           stdoutSection: { delimiter: "--- last stdout ---", slice: 500, trimFirst: false, omitWhenEmpty: false },
         },
@@ -3029,6 +3232,8 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // #271: marker-gap cut deadline — liveness-loss detector for the
       // wedged-alive class (markers stopped while a tool is in flight). See D1.
       cutGapMs: getCutGapMs(),
+      // #928: silent-tool CPU-liveness bound (0 = clause disabled).
+      cpuStallMs: getCpuStallMs(),
     };
 
     // #271 (#208 D6): sessionEnded-aware finalize — ONE composition executed
@@ -3085,7 +3290,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // zero-partial cut stays retryable by the retry wrapper, mirroring
         // the kill-clause contract.
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
         doResolve(
           !hasOutput
@@ -3271,10 +3476,11 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       }
 
       const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s) — treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "tool-dead": `⚠️ Sub-agent's in-flight tool has produced no output for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s AND consumed no CPU for ${Math.round(hbCtx.state.toolCpuStallMs / 1000)}s (bound ${Math.round(hbThresholds.cpuStallMs / 1000)}s) — treated as deadlocked, not slow. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(hbCtx.state.toolAgeMaxMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
@@ -3336,7 +3542,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           return;
         }
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
         doResolve(composeAbnormalExit(
           { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
           {
