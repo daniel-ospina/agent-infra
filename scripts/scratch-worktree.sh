@@ -301,13 +301,17 @@ remove_created() { # <repo> <path> [admin-gitdir]
 # path is under the canonical ROOT with the `scratch-` prefix, the path does not
 # exist, and the admin dir's own `gitdir` back-link names exactly that path.
 # Everything else is left alone, so no unrelated sibling can be deregistered.
-sweep_orphan_records() { # <repo>
-  local repo="$1" common p name gd n=0
+sweep_orphan_records() { # <repo> [target-path]
+  local repo="$1" target="${2:-}" common p name gd n=0
   common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
   [ -n "$common" ] || return 0
   common="$(realpath_of "$common")" || return 0
   while IFS= read -r p; do
     [ -n "$p" ] || continue
+    # With a target, only THAT path's record counts: otherwise `clean <path>`
+    # would exit 0 because some UNRELATED orphan happened to be reclaimed, which
+    # is a false PASS (cycle-11 P1) — the caller asked for one specific removal.
+    [ -z "$target" ] || [ "$p" = "$target" ] || continue
     case "$p" in "$ROOT"/scratch-*) ;; *) continue ;; esac
     [ -e "$p" ] && continue
     name="$(basename "$p")"
@@ -390,7 +394,7 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
   # The one exception is an already-gone path whose record the sweep reclaimed —
   # the request IS satisfied then.
   if ! remove_one "$REPO" "$CLEAN_TARGET"; then
-    [ "$(sweep_orphan_records "$REPO")" != 0 ] && exit 0
+    [ "$(sweep_orphan_records "$REPO" "$CLEAN_TARGET")" != 0 ] && exit 0
     exit 1
   fi
   exit 0

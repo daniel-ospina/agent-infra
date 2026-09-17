@@ -38,7 +38,9 @@
 #   T23 a forged marker+gitdir cannot deregister a real sibling (back-link proof)
 #   T24 a mode-000 leftover is made removable and removed (retry path)
 #   T25 a truly UNDELETABLE leftover stays registered so `list` shows it
-#   T26 `clean <path>` exits 1 when removal leaves the directory behind
+#   T26 the orphan reclaim is TARGET-SPECIFIC (a foreign path stays rc 1 even
+#       when an unrelated orphan record exists, and that orphan is NOT silently
+#       reclaimed as a side effect)
 
 set -uo pipefail
 
@@ -532,6 +534,29 @@ if command -v chflags >/dev/null 2>&1 && [ "$(uname -s)" = Darwin ]; then
 else
   ok 0 "T25 skipped (no chflags / not Darwin) — the mode-000 retry path is T24"
 fi
+
+# ── T26: the orphan reclaim is TARGET-SPECIFIC ─────────────────────────────
+# `clean <path>` must report ITS OWN outcome. Counting any reclaimed record made
+# it exit 0 because an UNRELATED orphan happened to be swept in the same repo —
+# a false PASS, reachable in normal use since the tool itself creates orphans
+# (a probe that deletes its own directory). Cycle-11 P1.
+D26="$(sx create --ref "$C2" --full 2>/dev/null)"
+rm -rf "$D26"
+[ "$(live_scratch)" = 1 ] && ok 0 "T26a an orphan record is set up" || ok 1 "T26a an orphan record is set up ($(live_scratch))"
+FOREIGN26="$FIX/foreign26"
+mkdir -p "$FOREIGN26"
+sx clean "$FOREIGN26" >/dev/null 2>&1
+RC26=$?
+[ "$RC26" != 0 ] && ok 0 "T26b a foreign path is still refused (rc=$RC26)" \
+  || ok 1 "T26b a foreign path reported success (rc=$RC26)"
+[ "$(live_scratch)" = 1 ] && ok 0 "T26c the unrelated orphan is not silently reclaimed" \
+  || ok 1 "T26c the unrelated orphan was swept as a side effect"
+sx clean "$D26" >/dev/null 2>&1
+RC26b=$?
+[ "$RC26b" = 0 ] && ok 0 "T26d cleaning the gone path reclaims ITS record (rc=$RC26b)" \
+  || ok 1 "T26d cleaning the gone path did not reclaim its record (rc=$RC26b)"
+[ "$(live_scratch)" = 0 ] && ok 0 "T26e no record survives" || ok 1 "T26e a record survives"
+rm -rf "$FOREIGN26"
 
 echo
 if [ "$FAILS" = 0 ]; then echo "ALL PASS"; exit 0; else echo "$FAILS FAILURE(S)"; exit 1; fi
