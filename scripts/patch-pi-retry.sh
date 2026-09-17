@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# patch-pi-retry.sh — apply the agent-infra offline-resume retry patch to the
+# patch-pi-retry.sh — apply the agent-infra bounded-retry patch to the
 # installed pi package (idempotent; safe to run on every sync).
 #
 # Upstream pi's agent-level retry policy (settings.json `retry.*`) uses pure
 # exponential backoff with NO delay cap (`baseDelayMs * 2^(attempt-1)`). With
 # the default `maxRetries: 3` that means 3 quick retries (2s/4s/8s) and then
-# the session dies on a network outage. We want: quick retries first, then
-# keep retrying every 5 minutes indefinitely so a wifi drop (5 min commute,
-# laptop sleeping through a dead connection) pauses the session instead of
-# killing it.
+# the session dies on a network outage. This patch caps the backoff so the
+# retry ladder stays uniform and predictable rather than stretching to
+# 17m/34m/68m gaps.
 #
-# This patch caps the backoff at 5 minutes (300_000 ms). Combined with
-# `retry.maxRetries: 10000` in pi-bootstrap/pi-config/settings.json (≈34 days
-# of 5-min intervals = effectively infinite), a session survives any network
-# outage and resumes automatically when connectivity returns. The user can
-# still abort a retry at any time (Esc / abort_retry).
+# The cap is HALF of the retry contract, not the whole of it (#1088). pi has no
+# agent-level wall-clock retry deadline, so a session's exposure is
+#         (maxRetries + 1) x per-attempt ceiling + sum(backoff)
+# and `maxRetries` alone says nothing about it. `pi-bootstrap/pi-config/
+# settings.json` carries the bounds (maxRetries 7, httpIdleTimeoutMs 300000 =
+# the silent-hang ceiling, retry.provider.timeoutMs 600000 = the per-call
+# ceiling) and `scripts/check-cost-config.sh` asserts BOTH the exact values
+# AND the window derived from them + this file's default cap. Changing the cap
+# here without changing the guard turns CI red — that coupling is deliberate:
+# the pre-#1088 guard pinned only the attempt count, so 10000 attempts x 10-min
+# ceiling x 5-min backoff (34-104 days of silent spinning) stayed green.
 #
 # Two files are patched:
 #   1. dist/core/agent-session.js  — agent-turn retry (the visible
-#      "Retry N/M" path that stops the session after 3 attempts).
+#      "Retry N/M" path).
 #   2. node_modules/@earendil-works/pi-ai/dist/utils/retry.js — the
 #      compaction / branch-summary retry path (same no-cap backoff).
 #
@@ -36,17 +41,25 @@
 #   patch-pi-retry.sh               patch + verify (idempotent)
 #   patch-pi-retry.sh --check       verify-only; exit 1 if unpatched
 #   patch-pi-retry.sh --paths       print the resolved pi package paths
+#   patch-pi-retry.sh --cap         print the resolved backoff cap in ms (no side effects)
 #
 # Env overrides:
 #   PI_NODE_ROOT    pi-node install root (default: $HOME/.local/share/pi-node)
-#   PI_MAX_RETRY_DELAY_MS   cap in ms (default 300000 = 5 min)
+#   PI_MAX_RETRY_DELAY_MS   cap in ms (default 60000 = 1 min; MUST equal
+#                           RETRY_MAX_BACKOFF_MS in scripts/check-cost-config.sh)
 #
 # Exit codes: 0 = patched/verified, 1 = failure (loud), 2 = usage error.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CAP_MS="${PI_MAX_RETRY_DELAY_MS:-300000}"
+CAP_MS="${PI_MAX_RETRY_DELAY_MS:-60000}"
 MARKER="agent-infra offline-resume patch"
+# Present ONLY in the current injected comment. The already-patched fast path
+# requires it too, so an install patched by an earlier version of this script
+# (right cap, stale comment) is normalized rather than left claiming the old
+# contract in the dist (#1088 review P1: changing the comment text without this
+# silently broke the idempotent fast path on every sync).
+COMMENT_TOKEN="bounded retry (#318/#1088)"
 
 # #254 drift-watch precondition (Task 10): pi version change without a
 # successful oracle re-probe is a LOUD FAILURE. The frontmatter validator's
@@ -82,6 +95,46 @@ case "$CAP_MS" in
     echo "❌ PI_MAX_RETRY_DELAY_MS must be a plain integer (got '$CAP_MS') — refusing to patch." >&2
     exit 1 ;;
 esac
+
+# An override is a contract violation AT APPLY TIME (the header says the knob
+# MUST equal RETRY_MAX_BACKOFF_MS in check-cost-config.sh, which pins the
+# DEFAULT). Say so loudly: the guard reads the default, so without this an
+# install patched under an ambient override would carry a different cap while
+# the guard stayed green (#1088 review). The guard now also BLOCKS a differing
+# value in its own environment; this covers the install path, which need not
+# run the guard. No second copy of the default is introduced — this keys off
+# the variable being set at all, which is why it warns even on an equal value.
+if [ -n "${PI_MAX_RETRY_DELAY_MS:-}" ]; then
+  echo "⚠️  PI_MAX_RETRY_DELAY_MS=${CAP_MS} is set — this install will carry an override, not the pinned default." >&2
+  echo "    scripts/check-cost-config.sh pins the DEFAULT; it BLOCKS a value different from the contract cap, so a differing override will not be certified." >&2
+fi
+
+# The cap is frozen here, ONCE, before anything reads it. `--cap` reports this
+# value and the patch interpolates this value; freezing it is what makes those
+# two the SAME by construction. Without this, an assignment placed anywhere
+# after the `--cap` branch (but before the patch text is built) made `--cap`
+# answer 60000 while the patch applied 300000 — the same fail-open class,
+# reached by moving the assignment instead of re-spelling it. A later
+# assignment now fails loudly and leaves the value unchanged (#1088 review).
+readonly CAP_MS
+
+# ── --cap: print the RESOLVED cap and exit ───────────────────────────────
+# The cost-config guard calls this instead of re-parsing the assignment text
+# below. A static parse cannot bound the ways a shell assigns a variable —
+# `declare`/`local`/`eval`/`printf -v`, or a second assignment chained with `;`
+# on the same line, were all invisible to a line-anchored regex, so the guard
+# went green while this script applied a DIFFERENT cap (#1088 review). Asking
+# the shell for the value removes the whole class: this prints the exact
+# variable interpolated into the patched dist lines.
+#
+# Side-effect free and dependency-free by construction: it runs BEFORE pi
+# discovery, before the oracle-reprobe precondition, and before any file write,
+# so it works in CI where no pi install exists. The guard unsets
+# PI_MAX_RETRY_DELAY_MS for this call, so it reads the script's DEFAULT cap.
+if [ "${1:-}" = "--cap" ]; then
+  printf '%s\n' "$CAP_MS"
+  exit 0
+fi
 
 # ── discover the installed pi package (node-versioned global install) ────
 # Prefer the ACTIVE binary: resolve `pi` to its real file (symlink-safe),
@@ -133,16 +186,18 @@ PATCHED_LINE2="        const delayMs = Math.min(policy.baseDelayMs * 2 ** (attem
 # THIS cap (verification + already-patched check)
 #
 # Replacement is done with python3 (already a dependency of find_pi_pkg):
-# first-time apply = exact-line swap; already-patched-with-different-cap =
-# swap the cap digits in place (regex). The regex-based approach sidesteps
+# first-time apply = exact-line swap; already-patched = rewrite the WHOLE
+# injected block (comment lines + capped delay line), so the cap digits and the
+# comment can never disagree in the dist. The regex-based approach sidesteps
 # awk's BSD-vs-mawk newline/ERE divergence a shell-only version would hit.
 patch_file() {
   local file="$1" old="$2" new="$3" patched_line="$4"
-  if grep -qF "$MARKER" "$file" && grep -qF "$patched_line" "$file"; then
+  if grep -qF "$MARKER" "$file" && grep -qF "$patched_line" "$file" \
+     && grep -qF "$COMMENT_TOKEN" "$file"; then
     echo "    already patched (cap ${CAP_MS}ms): $file"
     return 0
   fi
-  grep -qF "$MARKER" "$file" && echo "    re-patching (cap changed to ${CAP_MS}ms): $file"
+  grep -qF "$MARKER" "$file" && echo "    re-patching (cap ${CAP_MS}ms / comment): $file"
   local tmp
   tmp="$(mktemp "$(dirname "$file")/.retry-patch.XXXXXX")"
   python3 - "$file" "$old" "$new" "$CAP_MS" "$tmp" << 'PY'
@@ -153,16 +208,22 @@ if old in src:
     # first-time (or a pi upgrade restored the uncapped shape)
     src = src.replace(old, new, 1)
 else:
-    # already patched with a DIFFERENT cap — swap the cap digits in place.
-    # group 1 = the prefix through ", ", group 2 = the old digits, group 3 =
-    # ");" — only the digits change; marker comment lines never match.
+    # Already patched — by this script (any cap) or by an earlier version whose
+    # comment still described the old contract. Rewrite the whole injected
+    # block: the marker comment line, any comment lines under it, and the capped
+    # delay line. Anchored on the marker, so it cannot swallow unrelated
+    # preceding comments.
     pat = re.compile(
-        r"(const delayMs = Math\.min\((?:settings\.baseDelayMs \* 2 \*\* \(this\._retryAttempt - 1\), "
-        r"|policy\.baseDelayMs \* 2 \*\* \(attempt - 1\), ))(\d+)(\);)"
+        r"[ \t]*// agent-infra offline-resume patch[^\n]*\n"
+        r"(?:[ \t]*//[^\n]*\n)*"
+        r"[ \t]*const delayMs = Math\.min\("
+        r"(?:settings\.baseDelayMs \* 2 \*\* \(this\._retryAttempt - 1\)"
+        r"|policy\.baseDelayMs \* 2 \*\* \(attempt - 1\))"
+        r", \d+\);"
     )
     if not pat.search(src):
         sys.exit(2)
-    src = pat.sub(lambda m: m.group(1) + newcap + m.group(3), src)
+    src = pat.sub(lambda m: new, src, count=1)
 open(out, "w", encoding="utf-8").write(src)
 PY
   local rc=$?
@@ -183,7 +244,7 @@ PY
   return 0
 }
 
-usage() { sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 if [ "${1:-}" = "--paths" ]; then
   [ -n "$PI_PKG" ] || { echo "pi package not found" >&2; exit 1; }
@@ -200,9 +261,9 @@ fi
 # Replacement text built with REAL newlines (ANSI-C quoting) — never rely on
 # awk's own \n processing, which differs between BSD awk and mawk.
 OLD1="        const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);"
-NEW1="$(printf '        // agent-infra offline-resume patch: cap the exponential backoff so retries continue every %sms\n        // indefinitely instead of growing unboundedly.\n        const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
+NEW1="$(printf '        // agent-infra offline-resume patch — bounded retry (#318/#1088): cap the exponential\n        // backoff at %sms. The ATTEMPT budget is finite (settings.retry.maxRetries) — this caps each gap.\n        const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
 OLD2="        const delayMs = policy.baseDelayMs * 2 ** (attempt - 1);"
-NEW2="$(printf '        // agent-infra offline-resume patch: cap the exponential backoff so summarization/compaction\n        // retries continue every %sms instead of growing unboundedly.\n        const delayMs = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
+NEW2="$(printf '        // agent-infra offline-resume patch — bounded retry (#318/#1088): cap the exponential\n        // backoff at %sms here too, so summarization/compaction keep the same uniform ladder.\n        const delayMs = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), %s);' "$CAP_MS" "$CAP_MS")"
 
 if [ "${1:-}" = "--check" ]; then
   local_ok=1
@@ -213,7 +274,7 @@ if [ "${1:-}" = "--check" ]; then
   exit 1
 fi
 
-echo "==> applying offline-resume retry patch to pi ($PI_PKG)"
+echo "==> applying bounded-retry patch to pi ($PI_PKG)"
 fail=0
 patch_file "$PI_PKG/dist/core/agent-session.js" "$OLD1" "$NEW1" "$PATCHED_LINE1" || fail=1
 [ -f "$PI_AI/dist/utils/retry.js" ] || { echo "❌ pi-ai not found at $PI_AI" >&2; fail=1; }
@@ -223,4 +284,4 @@ if [ "$fail" = "1" ]; then
   echo "❌ retry patch FAILED — sessions will still stop after 3 quick retries on network loss." >&2
   exit 1
 fi
-echo "✅ retry patch applied — sessions now retry every ${CAP_MS}ms after the initial quick retries."
+echo "✅ retry patch applied — backoff capped at ${CAP_MS}ms (the attempt budget is separate, in settings.retry.maxRetries)."

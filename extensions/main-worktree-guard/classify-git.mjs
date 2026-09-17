@@ -11,6 +11,7 @@ import { execSync, execFileSync } from "node:child_process";
 import { resolve, join, dirname, relative, basename } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 //
 // Purpose: in the SHARED main checkout, branch-state-changing git operations
@@ -2647,7 +2648,7 @@ export function wtShellInlinePayloads(command) {
   for (const seg of segs) {
     const head = _wtHeadInterpreter(seg);
     if (head === null || !_WT_SHELL_WORDS.test(basename(String(head)))) continue;
-    const toks = _wtShellWords(seg);
+    const toks = wtShellWords(seg);
     for (let i = 0; i < toks.length; i++) {
       const t = toks[i];
       if (!(t === "-c" || t === "--command" || (/^-[A-Za-z]*c[A-Za-z]*$/.test(t) && !t.startsWith("--")))) continue;
@@ -2670,14 +2671,25 @@ export function wtShellInlinePayloads(command) {
  * which hid the verb and made the fail-closed arm allow a real discard
  * (reviewer round-7 P1).
  */
-function _wtShellWords(s) {
+export function wtShellWords(s) {
   const out = [];
   let cur = "";
   let started = false;
   let quote = null;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (quote) { cur += ch; if (ch === quote) quote = null; continue; }
+    if (quote) {
+      // #1139 (review cycle-3 P2): a backslash INSIDE double quotes escapes only
+      // `$"` / backtick / backslash / newline — otherwise it is literal, and the
+      // quote after it does NOT close the word. Treating `\"` as a closing quote
+      // split `cat "a\" b" | bash` into two words and swallowed the rest of the
+      // line, so a caller resolving file paths from these tokens seeded the
+      // wrong files. (The unquoted branch below already handles `\`.)
+      if (quote === '"' && ch === "\\" && '"$`\\\n'.includes(s[i + 1] ?? "")) {
+        cur += ch + (s[i + 1] ?? ""); i++; started = true; continue;
+      }
+      cur += ch; if (ch === quote) quote = null; continue;
+    }
     if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; started = true; continue; }
     if (ch === "'" || ch === '"') { quote = ch; cur += ch; started = true; continue; }
     if (ch === " " || ch === "\t" || ch === "\r") {
@@ -2727,7 +2739,7 @@ export function wtPipelineFeedsShell(command) {
     const head = _wtHeadInterpreter(seg);
     if (head === null) return false;
     const base = basename(String(head));
-    const toks = _wtShellWords(seg);
+    const toks = wtShellWords(seg);
     const idx = toks.findIndex((t) => basename(String(t)) === base);
     return toks.slice(idx + 1).every((t) => t.startsWith("-") || STDIN_ALIAS.test(t) || REDIRECT.test(t));
   });
@@ -3422,8 +3434,12 @@ export function classifyGitCommandDetailed(command) {
 // (isMain:false → the #618/#621 hub-write gate silently lifted for every
 // target under that repo's subdirectories — probe-verified 2026-09-09).
 // git prints repo-relative paths when cwd is under the gitdir's parent and
-// absolute otherwise; resolve() against cwd normalizes BOTH spellings, and
-// realpathSync canonicalizes a symlinked `.git`.
+// absolute otherwise. #1129: realpath the cwd FIRST and resolve BOTH spellings
+// against that base — resolving the relative half against the unrealpathed
+// spelling lands it in a different repo when the supplied path traverses a
+// symlink (probe: a checkout whose `scripts/` is a symlink into another repo).
+// `resolve()` alone normalizes neither half against the other; `realpathSync`
+// canonicalizes a symlinked `.git`.
 // Not a git repo → throws (callers catch — isWorktreeCwd degrades to false =
 // treat as main, the safe/block default).
 export function gitCheckoutIsLinkedWorktree(cwd) {
@@ -3434,10 +3450,41 @@ export function gitCheckoutIsLinkedWorktree(cwd) {
     encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
   }).trim();
   if (!gitDir || !commonDir) return false;
-  const g = resolve(cwd, gitDir);
-  const c = resolve(cwd, commonDir);
+  // #1129 — resolve BOTH git spellings against the cwd's REALPATH. git emits
+  // a RELATIVE `--git-common-dir` (`../.git`) when its own (realpath-resolved)
+  // cwd sits under the gitdir's parent, but may emit an ABSOLUTE
+  // `--git-dir` when the SUPPLIED cwd spelling traverses a symlink. Resolving
+  // the relative half against the unrealpathed spelling then lands it in a
+  // DIFFERENT repo and the checkout is misread as a linked worktree — probe:
+  // `<hub>/scripts` is a symlink into agent-infra, so gitDir resolved to
+  // `…/agent-infra/.git` while commonDir resolved to `…/<hub>/.git` → "a
+  // linked worktree", wrong (and the same call feeds `resolveTargetCheckout`,
+  // where the misread is a fail-OPEN "isolated" verdict). A base that cannot
+  // be realpath'd keeps the old spelling (fail-closed: no behaviour change on
+  // the error path).
+  let base = cwd;
+  try { base = realpathSync(cwd); } catch { /* keep the given spelling */ }
+  const g = resolve(base, gitDir);
+  const c = resolve(base, commonDir);
   if (g === c) return false; // same spelling (main at its toplevel: both ".git")
   return realpathSync(g) !== realpathSync(c);
+}
+
+/** #1129 (code-review P0) — the framework root a sanctioned script exemption
+ *  must be keyed on, derived from the GUARD MODULE's own URL.
+ *
+ *  A pure function so it can be tested against the geometry pi actually
+ *  deploys: pi loads this extension from the symlink farm
+ *  `~/.pi/agent/extensions/<name>/index.ts` → the framework checkout, and its
+ *  jiti loader preserves the SYMLINK SPELLING in `import.meta.url`. Walking
+ *  `..`/`..` LEXICALLY on that spelling yields `~/.pi/agent` — which is neither
+ *  the checkout (the exemption silently never fires, so the mandated preflight
+ *  stays blocked) nor a git checkout (so the write gate does not cover it, and
+ *  an agent could mint `<that root>/scripts/<listed relpath>` and take the
+ *  exemption with content of its choosing). Realpath the MODULE FIRST, then
+ *  walk up. Same inversion class as #708/#823. */
+export function frameworkRootFromModuleUrl(moduleUrl) {
+  return resolve(dirname(realpathSync(fileURLToPath(moduleUrl))), "..", "..");
 }
 
 export function isWorktreeCwd(cwd) {

@@ -130,9 +130,12 @@ untouched. See PR #980 for the full rationale.
   drain (Issue A), dead-socket pool reuse (Issue B), `"terminated"` classification
   (Issue C). Filed by the orchestrator; the agent-infra mitigations make these
   non-blocking.
-- **Settings tuning (plan T3) — APPLIED (global only).** The orchestrator
-  applied `retry.provider.maxRetries` globally in `~/.pi/agent/settings.json`
-  alongside the pre-existing `retry.provider.timeoutMs: 600000`. Per-provider
+- **Settings tuning (plan T3) — SUPERSEDED by #1088.** The orchestrator applied
+  `retry.provider.maxRetries` globally in `~/.pi/agent/settings.json` alongside
+  the pre-existing `retry.provider.timeoutMs: 600000`; **#1088 pins it back to
+  absent/`0`** (provider-level retries multiply the calls inside one attempt, so
+  they are part of the hang window) and `scripts/check-cost-config.sh` blocks a
+  non-zero value — see `docs/ops/cost-config-policy.md` §2. Per-provider
   retry blocks (`providers.qwen.retry.*`) are **not supported**: pi's
   settings-manager `getProviderRetrySettings()` reads global `retry.provider.*`
   only (Q2 answered — verified in `dist/core/settings-manager.js`), so retry
@@ -190,24 +193,26 @@ that is needed — no upstream change. The extension factory is
 failure-contained: it never throws (any setup error → warn + no registration),
 so pi startup cannot be blocked.
 
-## 6. Offline-resume retry — survive network outages, don't stop (#318)
+## 6. Bounded retry — survive a transient outage, never hang silently (#318, #1088)
 
 By default pi retries a failed LLM turn 3 times (2s → 4s → 8s exponential
 backoff) and then **ends the session** with the error. On a wifi drop that
-means a session stops dead; when the network returns nothing resumes. The
-agent-infra offline-resume patch changes the policy to: quick retries first,
-then keep retrying **every 5 minutes indefinitely** until connectivity
-returns. The session pauses, the user's laptop can sleep through a dead
-connection, and work resumes automatically — nothing is lost, nothing needs
-re-running.
+means a session stops dead. The agent-infra bounded-retry patch changes the
+policy to: quick retries first, then a uniform (capped) retry cadence —
+**bounded to a finite budget**, so a transient outage recovers on its own and a
+persistent failure terminates the turn **visibly** instead of spinning. See
+`docs/ops/cost-config-policy.md` §2 for the contract, the arithmetic, and the
+guard coupling; that section — not this summary — is the authority pinned to
+`scripts/check-cost-config.sh` by `tests/cost-config/run.sh` test 19.
 
 ### What changed
 
 | Surface | Change | Where |
 |---|---|---|
-| Agent-turn retry (the visible "Retry N/M" path) | Backoff capped at 5 min | patched `dist/core/agent-session.js` in the installed pi |
-| Compaction / branch-summary retry | Same 5-min cap (same no-cap backoff) | patched `pi-ai/dist/utils/retry.js` |
-| Retry budget | `retry.maxRetries: 10000` (≈34 days at 5-min intervals = effectively infinite) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
+| Agent-turn retry (the visible "Retry N/M" path) | Backoff capped (cap value in `docs/ops/cost-config-policy.md` §2) | patched `dist/core/agent-session.js` in the installed pi |
+| Compaction / branch-summary retry | Same cap (same no-cap backoff; §2) | patched `pi-ai/dist/utils/retry.js` |
+| Retry budget | `retry.maxRetries: 7` (8 attempts; ladder + no-progress window derived and asserted in `docs/ops/cost-config-policy.md` §2) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
+| Silent-hang ceiling | `httpIdleTimeoutMs: 300000` (undici headers/body idle — pi's own default) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
 | Task sub-agents | Network-aware kill suppression — while the network is unreachable AND the child is alive (fresh heartbeat markers), the stall clauses (stream-stall / silence / first-message) don't kill it; it survives in retry | `extensions/builtin-tools/index.ts` (`heartbeatKillDecision` + probe in the heartbeat loop) |
 
 ### The patch lifecycle
@@ -225,14 +230,17 @@ scripts/patch-pi-retry.sh --check
 
 ### Behavior
 
-- Network dies mid-turn: 3 quick retries (2s/4s/8s), then retries at
-  16s → 32s → 64s → 128s → 256s → **every 300s (5 min) indefinitely**.
+- Network dies mid-turn: 3 quick retries, then a uniform cadence until the
+  finite budget is spent → **stop, and surface the failure** (8 attempts total).
+  The retry ladder and the no-progress window — both durations, computed from the
+  shipped values — are stated and enforced in `docs/ops/cost-config-policy.md`
+  §2 and deliberately not restated here.
 - Abort anytime with Esc (RPC `abort_retry`); `retry.enabled: false` in
   settings disables retrying entirely (setup.sh deep-merges the `retry` block
-  per-key, so a local `enabled: false` survives every sync). Note: with the
-  huge budget, a persistent retryable failure (sustained 5xx) retries for
-  days instead of ending the session loudly — the abort path and
-  `enabled: false` are the escapes.
+  per-key, so a local `enabled: false` survives every sync). A persistent
+  retryable failure (sustained 5xx, poisoned connection) now ends the turn
+  loudly with the provider error — that visible terminal state, not a
+  multi-day spin, is the #1088 objective.
 - A task sub-agent in retry is not killed by the parent while the network is
   down — but ONLY for kills the pure decision would suppress (network down
   AND fresh heartbeat markers; a never-initialized child or a dead child with
@@ -243,7 +251,9 @@ scripts/patch-pi-retry.sh --check
   hard cap is the outage bound). The suppression is ON by default (behavior
   change for task sub-agents); `TASK_NETWORK_WAIT=0` disables it (fail-open
   legacy).
-- Env knobs: `PI_MAX_RETRY_DELAY_MS` (patch cap, default 300000),
+- Env knobs: `PI_MAX_RETRY_DELAY_MS` (patch cap; it must equal
+  `RETRY_MAX_BACKOFF_MS` in `scripts/check-cost-config.sh` — the value itself
+  lives in `docs/ops/cost-config-policy.md` §2),
   `TASK_NETWORK_PROBE_URL` (probe target, default = provider baseUrl from
   models.json), `TASK_NETWORK_PROBE_TIMEOUT_MS` (default 5000, clamped ≤ 9s
   so ticks never overlap), `TASK_NETWORK_PROBE_CACHE_MS` (default 15000).

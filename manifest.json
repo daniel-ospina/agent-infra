@@ -55,13 +55,13 @@
     }
   },
   "ci": {
-    "ref": "v0.1.2",
-    "sha": "8be44e098fa08ec9f667013f612b64880dbc5b21",
-    "note": "Consumers pin uses: daniel-ospina/agent-infra/.github/workflows/<stack>-ci.yml@vX.Y.Z. Bump = tag + ci.ref edit + agent-infra update (no auto-rewrite; agent-infra check blocks on stale pin). #303"
+    "ref": "v0.1.3",
+    "sha": "a96160fc58dcc4e67ef85187d61e281727c48670",
+    "note": "Consumers pin uses: daniel-ospina/agent-infra/.github/workflows/<stack>-ci.yml@vX.Y.Z. Bump = tag + ci.ref edit + agent-infra update (no auto-rewrite; agent-infra check blocks on stale pin). #303. ci.sha is INFORMATIONAL (no code reads it): the commit that carried the pinned workflow bytes when the release was prepared. It is NOT necessarily the tag's own commit — a release PR that edits a workflow after it leaves the tag carrying different bytes (v0.1.2 recorded the capability MERGE commit; v0.1.3 recorded the workflow-edit commit). Do not build a check on it without first giving it a definition the cut can always satisfy."
   },
   "check": {
     "ci": {
-      "ref": "v0.1.2"
+      "ref": "v0.1.3"
     },
     "exemptions": {
       "dmer": [

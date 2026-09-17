@@ -128,6 +128,7 @@ the retry path; the gap is tracked in `docs/upstream-pi-bugs.md` (Issue B) and
 the host issue #1110.
 
 Related but *not* fixed here: a sustained reconnect throttle on the edge is a
-backoff problem (#1088's 5-minute capped retry contract), not a pool problem.
-This extension makes the retry *able* to succeed; it does not make a hostile
-edge accept connections.
+backoff problem (#1088's bounded retry contract — 1-min capped ladder, 7
+retries), not a pool problem. This extension makes the retry *able* to
+succeed; it does not make a hostile edge accept connections. The finite budget
+is what makes a sustained hostile edge terminate visibly instead of spinning.

@@ -429,6 +429,32 @@ async function partB() {
       !/checkout-hygiene\/hub-worktree\.sh/.test(wtBlock.reason ?? ""),
       `reason=${JSON.stringify(wtBlock?.reason ?? "")}`);
 
+    // ── B8f/B8g/B8h: #1129 sanctioned-framework-script exemption ──
+    // The framework's OWN mandated preflight is exempted from the content walk
+    // (it false-blocks on pure text shapes: ```bash fences inside a single-
+    // quoted test fixture, and a usage heredoc whose prose says "git remote").
+    // The exemption is REALPATH-keyed on the guard's own checkout and NAMED —
+    // so the SAME content at any other path must still block (the
+    // discriminator), and a git-DESTRUCTIVE framework helper must still block
+    // (the adversarial-review P0 boundary).
+    const sanctioned = join(HERE, "..", "..", "scripts", "check-pipeline-compliance.sh");
+    const sanctionedRun = await callBash(`bash ${sanctioned} --help`);
+    expectTrue("B8f: the framework's own mandated preflight is exempt (#1129)",
+      sanctionedRun === undefined, `handler returned ${JSON.stringify(sanctionedRun)}`);
+    const sameContent = join(repo, "check-pipeline-compliance.sh");
+    writeFileSync(sameContent, readFileSync(sanctioned, "utf-8"));
+    const copyRun = await callBash(`bash ${sameContent} --help`);
+    expectTrue("B8h: the SAME content at a non-sanctioned path is still blocked (exemption is path-keyed)",
+      !!copyRun && copyRun.block === true &&
+      /script content contains a blocked git operation/.test(copyRun.reason ?? ""),
+      `handler returned ${JSON.stringify(copyRun)}`);
+    const destructive = join(HERE, "..", "..", "scripts", "cleanup-worktree.sh");
+    const destructiveRun = await callBash(`bash ${destructive} feat/x --force`);
+    expectTrue("B8g: a git-DESTRUCTIVE framework helper is still content-gated (no directory-wide exemption)",
+      !!destructiveRun && destructiveRun.block === true &&
+      /script content contains a blocked git operation/.test(destructiveRun.reason ?? ""),
+      `handler returned ${JSON.stringify(destructiveRun)}`);
+
     // ── B7: write/edit gate on a DISORDERED hub (#1484/#436/#628) ──
     // Pre-#744 the import degraded mid-destructuring, so the later bindings
     // (`resolveTargetTopLevel`, `resolveTargetCheckout`, `classifierLoaded`)
