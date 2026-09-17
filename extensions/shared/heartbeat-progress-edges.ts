@@ -117,6 +117,7 @@ export const OUT_OF_FAMILY_TERMS = [
   "getToolStallMs",
   "getStreamStallMs",
   "getFirstMessageMs",
+  "getFirstOutputTimeoutMs",
   "getTaskMaxDispatchMs",
   "getCutGapMs",
   "getEffectiveCutGapMs",
@@ -564,6 +565,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "checkpoint park trigger — parks state, kills nothing",
   },
+  {
+    name: "RERUN_STALL_SECONDS",
+    owners: ["scripts/admin-merge.sh"],
+    value: "${ADMIN_MERGE_STALL_SECONDS:-600}",
+    axis: "gate",
+    guardedBy: NONE,
+    note: "the merge gate's re-run progress window (#3756): a main-lane re-run whose status never reaches completed AND whose updatedAt never moves for this long is STALLED and the gate refuses the merge. A still-running job is NOT a failure — only a STALL is. The value is an env seam for tests only (ADMIN_MERGE_STALL_SECONDS); the shipped default is 600 s.",
+  },
   // — reap axis (interactive session reaper) —
   {
     name: "REAP_IDLE_HOURS",
@@ -750,6 +759,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "FUNCTION, not a const: the EFFECTIVE first-message bound (M) — max(60 s, TASK_FIRST_MESSAGE_MS) when set, else max(60 s, DEFAULT_FIRST_MESSAGE_MS).",
   },
   {
+    name: "getFirstOutputTimeoutMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE tier-1 FIRST-OUTPUT bound (#1073) — max(60 s, TASK_FIRST_OUTPUT_TIMEOUT_MS) when the override is a positive finite number, else 60 s; a non-finite override fails CLOSED to 60 s so `1e400` cannot disarm the zero-output detector. The 60 s default is the literal the getter body carries (pinned against §3 of docs/ops/load-policy.md by load-scale-contract.test.ts); this entry exists so the effective bound is in the vocabulary, like every other env-overridable getter here.",
+  },
+  {
     name: "getTaskMaxDispatchMs",
     owners: ["extensions/builtin-tools/index.ts"],
     value: null,
@@ -766,10 +783,18 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   {
     name: "FIRST_OUTPUT_TIMEOUT_MS",
     owners: ["extensions/builtin-tools/index.ts"],
-    value: "= 60_000;",
+    // #1073 — this used to be the local literal `= 60_000;`. The bound is now
+    // READ from the env-aware getter, so the registry records the DERIVATION
+    // (that the clause's deadline keeps resolving through the getter, i.e. the
+    // documented TASK_FIRST_OUTPUT_TIMEOUT_MS override stays live) rather than
+    // a literal the declaration no longer carries. The 60 s number itself is
+    // pinned by the getter's own body — builtin-tools.test.ts
+    // value+behaviour pin, plus load-scale-contract.test.ts's §3-doc pin — and
+    // the effective bound is registered separately as `getFirstOutputTimeoutMs`.
+    value: "= getFirstOutputTimeoutMs();",
     axis: "kill",
-    guardedBy: NONE,
-    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test keeps it visible. It is also not referenced by name in any test — the registry's forward assertion is what pins the literal, hence NONE rather than BT_TEST.",
+    guardedBy: BT_TEST,
+    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause), per-dispatch and DERIVED from getFirstOutputTimeoutMs() so TASK_FIRST_OUTPUT_TIMEOUT_MS is live (#1073 — before that wiring the doc named an env var nothing read). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test plus this entry keep it visible.",
   },
   {
     name: "DEFAULT_HARD_CAP_MS",

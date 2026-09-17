@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent } from "./index.js";
 import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
@@ -2693,6 +2693,58 @@ test("loadScaledBound — 1x <8, 2x 8–15, 3x ≥16; TASK_LOAD_SCALE_OFF=1 bypa
   withEnv({ TASK_LOAD_SCALE_OFF: "1" }, () => {
     equal(loadScaledBound(300_000, 60), 300_000, "scale-off keeps the static bound");
   });
+});
+
+// #1073 — the documented contract is "fixed bands + TASK_LOAD_SCALE_OFF ONLY".
+// §2/§3 once advertised TASK_LOAD_SCALE_START / TASK_LOAD_SCALE_MAX as watchdog
+// scale knobs; nothing read them, so setting either did nothing (an inert
+// control). Those rows are gone and §6 declares the bands as fixed literals.
+// This test makes "they are inert" a BEHAVIOURAL statement: wiring either knob
+// back into `loadScaledBound` now fails here and forces the doc (and §6's band
+// sentence, parsed by extensions/shared/load-scale-contract.test.ts) to move
+// with it deliberately.
+test("#1073 — the retired TASK_LOAD_SCALE_START/MAX knobs are inert (fixed bands + OFF only)", () => {
+  const probes = [0, 7.9, 8, 15, 15.9, 16, 60];
+  const baseline = probes.map((l) => loadScaledBound(300_000, l));
+  deepEqual(baseline, [300_000, 300_000, 600_000, 600_000, 600_000, 900_000, 900_000], "bands are 1x/2x/3x at 8/16");
+  withEnv({ TASK_LOAD_SCALE_START: "1000", TASK_LOAD_SCALE_MAX: "9" }, () => {
+    deepEqual(
+      probes.map((l) => loadScaledBound(300_000, l)),
+      baseline,
+      "a retired scale knob changed the bound — §6 declares the bands fixed literals (#1073)"
+    );
+  });
+  withEnv({ TASK_LOAD_SCALE_OFF: "1" }, () => {
+    deepEqual(
+      probes.map((l) => loadScaledBound(300_000, l)),
+      probes.map(() => 300_000),
+      "TASK_LOAD_SCALE_OFF=1 must force 1x at every band"
+    );
+  });
+});
+
+test("getFirstOutputTimeoutMs — default/floor 60s, valid override wins, non-finite fails closed (#1073)", () => {
+  // Absent env must be identical to the constant this replaced (60_000); an
+  // `Infinity` override must NOT disarm the hang/retry detector (#783 lesson).
+  withEnv({ TASK_FIRST_OUTPUT_TIMEOUT_MS: undefined }, () => equal(getFirstOutputTimeoutMs(), 60_000));
+  withEnv({ TASK_FIRST_OUTPUT_TIMEOUT_MS: "" }, () => equal(getFirstOutputTimeoutMs(), 60_000));
+  withEnv({ TASK_FIRST_OUTPUT_TIMEOUT_MS: "abc" }, () => equal(getFirstOutputTimeoutMs(), 60_000));
+  withEnv({ TASK_FIRST_OUTPUT_TIMEOUT_MS: "0" }, () => equal(getFirstOutputTimeoutMs(), 60_000));
+  withEnv({ TASK_FIRST_OUTPUT_TIMEOUT_MS: "-5" }, () => equal(getFirstOutputTimeoutMs(), 60_000));
+  withEnv({ TASK_FIRST_OUTPUT_TIMEOUT_MS: "1e400" }, () => equal(getFirstOutputTimeoutMs(), 60_000));
+  withEnv({ TASK_FIRST_OUTPUT_TIMEOUT_MS: "30000" }, () => equal(getFirstOutputTimeoutMs(), 60_000, "clamped up to the 60s floor"));
+  withEnv({ TASK_FIRST_OUTPUT_TIMEOUT_MS: "120000" }, () => equal(getFirstOutputTimeoutMs(), 120_000, "a valid override is honoured"));
+});
+
+test("#1073 — the tier-1 bound actually READS the getter (wiring, not just a live getter)", () => {
+  ok(
+    source.includes("const FIRST_OUTPUT_TIMEOUT_MS = getFirstOutputTimeoutMs();"),
+    "the per-dispatch tier-1 bound no longer reads TASK_FIRST_OUTPUT_TIMEOUT_MS — the doc row would be inert again"
+  );
+  ok(
+    source.includes("firstOutputTimeoutMs: FIRST_OUTPUT_TIMEOUT_MS"),
+    "the tier-1 bound is not threaded into hbThresholds"
+  );
 });
 
 test("getSystemLoad — live probe returns the real loadavg (regression: unimported existsSync/execSync made it dead code)", () => {

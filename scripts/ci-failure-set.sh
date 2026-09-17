@@ -130,16 +130,29 @@
 #   one is evidence. A superseded run belongs to the OLD commit, so it cannot
 #   satisfy the NEW head's `tested` count either — the fix is safe.
 #
-# THE DECISION MODULE IS RESOLVED FROM THE RAIL'S OWN DIRECTORY (#3756).
-#   Signature extraction and the exemption decision are ONE implementation,
-#   `ci_exemption.py`, shipped next to this script. It is deliberately NOT read
-#   from the repo being merged: a grader drawn from the graded system is a
-#   bypass — a PR could ship a `tools/ci_exemption.py` that always reports
-#   CLEAN. A missing module is a LOUD REFUSAL (exit 1), never a fallback to the
-#   presence-based subtraction, which is the category-A defect this fixes.
-#   The module is a byte-for-byte copy of the decision authored on the tortoise
-#   side (#3756, tortoise PR #3761 @ 6a4096236); that PR's tests are its
-#   acceptance, and the rail's own suite drives it end to end.
+# THE MODULE IS RESOLVED FROM THE RAIL'S OWN DIRECTORY (#3756 defect 1 + the
+# decision).
+#   `ci_exemption.py`, shipped next to this script, holds BOTH halves: the ONE
+#   definition of "is this a test id", and the signature/rate exemption decision
+#   built on top of it. The id extraction routes through it (`ci_exemption.py
+#   ids`) instead of a second shell regex, so the rail and the decision can
+#   never disagree about the id universe — and a candidate that is not a test id
+#   is DROPPED, COUNTED and REPORTED as UNATTRIBUTABLE rather than carried as a
+#   failure id (the `may` leak: a garbage id can never match main, so it reads
+#   as "unique to this PR" on every run, forever).
+#
+#   Signature extraction and the exemption decision are the SAME single
+#   implementation (`ci_exemption.py signatures`, `ci_exemption.py decide`). It is
+#   deliberately NOT read from the repo being merged: a grader drawn from the
+#   graded system is a bypass — a PR could ship a `tools/ci_exemption.py` that
+#   always reports CLEAN. A missing module is a LOUD REFUSAL (exit 1): never a
+#   fallback to the presence-based subtraction (the category-A defect this fixes),
+#   and never a fallback to a shell regex (how an unparseable token became a
+#   failure id).
+#
+#   The parser half is the extractor authored on the rail-extractor side (#3756 /
+#   PR #1165); the decision half is #1147, and it is built ON TOP of that parser —
+#   never beside it. The rail's own suite drives both halves end to end.
 #
 # Env seams (tests only):
 #   CI_FAILURE_SET_GH         the gh command to run (default: `gh`)
@@ -251,8 +264,12 @@ failed_ids_from_log() {
 require_exemption_module() {
   if [ ! -f "$EXEMPTION_PY" ]; then
     say_err "ci-failure-set: ✗ the exemption decision module is ABSENT at $EXEMPTION_PY"
+    say_err "ci-failure-set: ✗ the id parser is ABSENT at $EXEMPTION_PY"
     say_err "   The rail refuses to fall back to presence-based subtraction (the #3756"
-    say_err "   category-A defect). Restore the agent-infra checkout; do not merge."
+    say_err "   category-A defect)."
+    say_err "   The rail refuses to fall back to a second shell regex (the #3756"
+    say_err "   defect): that is how an unparseable token became a failure id."
+    say_err "   Restore the agent-infra checkout; do not merge."
     return 1
   fi
   return 0

@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4951,6 +4951,104 @@ try {
   }
   expectBool("#1129: the block message names the realpath actually read + the verdict source",
     pinSrc.includes("resolves to:") && pinSrc.includes("verdict source:"), true);
+
+  // (b2) THE SAME EXEMPTION, APPLIED TO M5 (#1139). #1129 exempted the
+  // framework's scripts from M4's content walk only; M5's working-tree-discard
+  // walk never asked, so `hub-worktree.sh` stayed blocked from a hub-rooted
+  // session — its salvage path reverts the hub's dirt with
+  // `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`, whose SHELL LOOP VARIABLE
+  // pathspec the extractor can only surface as an unresolvable
+  // `cat-file-revert` hint, which fails closed. Source pins: ONE list and ONE
+  // anchor helper (a second, drift-prone copy is the regression shape), the
+  // exemption scoped to the harvested SET (never to the command), and the
+  // message correction.
+  expectBool("#1139: M5 consults the SAME hardened exempt helper — one definition, one anchor, one list",
+    pinSrc.includes("_sanctionedScriptExemption(resolve(execCwd, s.script))") &&
+    (pinSrc.match(/function _sanctionedScriptExemption\(/g) ?? []).length === 1 &&
+    (pinSrc.match(/const SANCTIONED_SCRIPT_RELPATHS = \[/g) ?? []).length === 1, true);
+  expectBool("#1139: the M5 exemption drops the harvested SET, never the command's argv",
+    pinSrc.includes("const gatedSets = sets.filter((s) => {") &&
+    pinSrc.includes("if (s.script === null) return true;") &&
+    pinSrc.includes("for (const set of gatedSets) {") &&
+    pinSrc.includes("gatedSets.every((s) => s.discs.length === 0)") &&
+    !pinSrc.includes("for (const set of sets) {"), true);
+  expectBool("#1139: the M5 exemption is audit-logged (deliberate relaxation is observable)",
+    pinSrc.includes("m5_script_exemption") &&
+    // ... and the row says what the relaxation HID, aggregated BY REALPATH
+    // (review fold-in: a row written from inside the filter predicate fires
+    // even when the dropped set carried no discards, and summing raw push sites
+    // double-counts one file pushed as two sets — review cycle-2 P2).
+    pinSrc.includes("discards_dropped") && pinSrc.includes("sets_exempted") &&
+    pinSrc.includes("const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>()") &&
+    // …and a repeated push site must not ADD UP (review cycle-3 P2): the same
+    // realpath always yields the same discard list, so `sets_exempted=1` with
+    // `discards_dropped=2` misstated the suppression the row exists to report.
+    pinSrc.includes("prev.discards = Math.max(prev.discards, s.discs.length);"), true);
+  // The remedy must never print a path that cannot run (review cycle-2 P2).
+  expectBool("#1139: the fail-closed remedy is printed only when that file exists",
+    pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
+    !pinSrc.includes("const sanctionedHelper = _frameworkRoot"), true);
+  expectBool("#1139 T6: a null anchor / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
+    pinSrc.includes("if (!_frameworkRoot) return null;") &&
+    pinSrc.includes("catch { rel = null; }") &&
+    pinSrc.includes("if (rel === null) return true;"), true);
+  expectBool("#1139 (review cycle-1 P1): the pipe-seed walk TOKENIZES shell words (a quoted piped script was unwalked)",
+    pinSrc.includes("wtShellWords(String(pipeSeg.slice(0, -1).join(\"|\")))") &&
+    // ... and does NOT dequote-then-split, which invents a seed for unquoted
+    // input (`cat a b` → `a b`) and over-splits a quoted one (`cat "a b"` →
+    // `a` + `b`): both pin a FALSE BLOCK on a file the shell never reads
+    // (review cycle-2 P1).
+    !pinSrc.includes("const dequoted = ") &&
+    !pinSrc.includes("words.slice(i).join(\" \")"), true);
+  // The tokenizer is the SHARED one (one shell-word tokenizer in the repo, not a
+  // second drift-prone copy), bound with the stale-module typeof guard. Pinned
+  // BEHAVIOURALLY via the real import (line 10) — if classify-git stops exporting
+  // it, test.mjs fails to load rather than silently regressing the pipe walk.
+  expectBool("#1139: the pipe walk reuses classify-git's exported quote-aware tokenizer",
+    typeof wtShellWords === "function" &&
+    wtShellWords('cat "a b"').length === 2 &&
+    wtShellWords("cat a b").length === 3 &&
+    wtShellWords('"a""b"').length === 1 &&
+    // review cycle-3 P2: an escaped quote does NOT close the word, and the rest
+    // of the line must not be swallowed into the token
+    wtShellWords('cat "a\\" b" | bash').length === 4 &&
+    wtShellWords('cat "a\\" b" | bash')[1] === '"a\\" b"' &&
+    pinSrc.includes("if (typeof _m5.wtShellWords === \"function\") wtShellWords = _m5.wtShellWords;"), true);
+  // review cycle-3 P1: the per-token dequote must follow the SHELL's rules — the
+  // blanket `[\"']`-and-backslash strip mis-read literal quotes/escapes and
+  // seeded files the shell never reads (one of them a fail-open REGRESSION).
+  expectBool("#1139: the per-token dequote is shell-faithful (single quotes literal, per-context backslash)",
+    pinSrc.includes("function _dequoteShellWord(raw: string): string") &&
+    pinSrc.includes("const _DQ_ESCAPABLE = new Set(") &&
+    pinSrc.includes("const tok = _dequoteShellWord(raw);") &&
+    !pinSrc.includes('raw.replace(/\\\\(.)/g, "$1").replace(/["\']/g, "")'), true);
+  expectBool("#1139 (review P1): the status probe CAPTURES stderr (the not-a-checkout allow arm was dead code)",
+    pinSrc.includes('stdio: ["ignore", "pipe", "pipe"]') &&
+    !pinSrc.includes('stdio: ["ignore", "pipe", "ignore"]'), true);
+  expectBool("#1139: the fail-closed arm stopped claiming a dirty tree",
+    pinSrc.includes("the discard's effect could not be verified, failing closed (#709)") &&
+    pinSrc.includes("NOT a claim that the checkout is dirty") &&
+    // Cause-neutral (review fold-in): the arm serves nine reasons and only two
+    // are target-resolution failures, so no single-cause headline.
+    !pinSrc.includes("target not statically resolvable, failing closed (#709)") &&
+    // The misattribution itself: this sentence was printed in BOTH arms,
+    // unconditionally, so a clean checkout was told it had uncommitted work.
+    !pinSrc.includes("uncommitted changes to tracked files that this command would revert.") &&
+    // The `!== null` contract — `unverifiable ? …` would render the DIRTY arm
+    // (with the hatch) for an empty-string reason.
+    pinSrc.includes("unverifiable !== null") && !pinSrc.includes("unverifiable ?"), true);
+  expectBool("#1139: the fail-closed arm stopped offering the bypass hatch as its remedy",
+    pinSrc.includes("not its remedy") &&
+    // The dirty arm (which really did read a dirty scope) KEEPS the hatch.
+    pinSrc.includes("Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1"), true);
+  const reasonFnStart = pinSrc.indexOf("function _worktreeDiscardBlockReason");
+  const reasonFnEnd = reasonFnStart === -1 ? -1 : pinSrc.indexOf("\nfunction ", reasonFnStart + 10);
+  const reasonFn = reasonFnStart === -1 ? "" : pinSrc.slice(reasonFnStart, reasonFnEnd === -1 ? pinSrc.length : reasonFnEnd);
+  expectBool("#1139 (review): the fail-closed remedy prints the framework checkout's OWN absolute path (no advice loop)",
+    reasonFn.includes("resolve(_frameworkRoot, \"scripts/checkout-hygiene/hub-worktree.sh\")") &&
+    !reasonFn.includes("bash scripts/checkout-hygiene/hub-worktree.sh <branch>") &&
+    reasonFn.includes("address the FRAMEWORK CHECKOUT's own copy, because a") &&
+    reasonFn.includes("worktree-local copy of it is gated by design (#1139):"), true);
 
   // (c) RESIDUAL PIN — the text-shape false positives are NOT fixed by the
   // exemption; they are contained. A lone markdown fence is enough to gate a

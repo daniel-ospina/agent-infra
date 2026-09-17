@@ -1,4 +1,30 @@
-"""tools/ci_exemption.py — the pre-merge EXEMPTION decision (tortoise #3756).
+"""ci_exemption.py — the rail's ONE module for #3756 (tortoise #3756).
+
+THIS FILE IS TWO HALVES, DELIBERATELY, IN ONE MODULE. The FAILED-id parser (the
+rail extractor, PR #1165) is the BASE; the rate/signature/decision engine (PR
+#1147) is built ON TOP of that parser — **never beside it**. Everything that needs
+to know which failures a run reported goes through :func:`parse_failed_ids`, so
+the shell rail and the decision can never disagree about the id universe.
+
+HALF 1 — THE CANONICAL FAILED-ID PARSER (``ids``)
+
+Two defects motivated it:
+
+* **DEFECT 1 — an unparseable token must not become a failure id.** The shell
+  rail used to print whatever token followed a bare ``FAILED`` field, so English
+  prose (``may``) entered the failure set as if it were a nodeid. A garbage id
+  matches nothing on main: it can never be subtracted or verified, so it reads as
+  "unique to this PR" on EVERY rail run for EVERY PR whose log contains that
+  fragment — a permanent false refusal. A candidate that is not a test id is
+  **DROPPED, COUNTED and REPORTED** as UNATTRIBUTABLE, never carried, never read
+  as "no failures".
+* **DEFECT 2 — a MOVING identity is not an attribution.** Within one concluded
+  cycle the same head's failure ids can shift across the re-run boundary (one id
+  replaced by another). :func:`detect_rotating_identity` names the class that was
+  red across runs with a NON-CONSTANT id, so a decision sees UNATTRIBUTABLE
+  rather than a PR-unique failure (or a silent exemption) it cannot justify.
+
+HALF 2 — THE PRE-MERGE EXEMPTION DECISION (``signatures``, ``decide``)
 
 The pre-merge classifier used to decide ownership of a failure by MEMBERSHIP IN A
 SAMPLE OF MAIN::
@@ -37,8 +63,9 @@ the union IS an allowlist, so junk in it is a zero-evidence pass. An unparseable
 non-nodeid line must REFUSE the exemption and be COUNTED AND REPORTED -- never
 silently swallowed, never read as "no failures".
 
-Pure functions only: no I/O, no network, no git. The caller supplies the observed
-numbers; this module decides, and explains.
+Pure functions only: no I/O, no network, no git — except :func:`_read`, the
+``ids`` CLI and the ``signatures`` CLI, which read the caller's own capture file.
+The caller supplies the observed numbers; this module decides, and explains.
 """
 
 from __future__ import annotations
@@ -1007,10 +1034,14 @@ def _cmd_decide(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m tools.ci_exemption <ids|signatures|decide> …`` — the shell's door."""
+    """``python3 ci_exemption.py <ids|signatures|decide> …`` — the shell's door."""
     parser = argparse.ArgumentParser(
-        prog="python -m tools.ci_exemption",
-        description="The #3756 pre-merge exemption decision and its signature producer.",
+        prog="python3 ci_exemption.py",
+        description=(
+            "The #3756 rail module: THE canonical FAILED-id parser (the id universe "
+            "the rail and the exemption decision both read) plus the pre-merge "
+            "exemption decision and its signature producer."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

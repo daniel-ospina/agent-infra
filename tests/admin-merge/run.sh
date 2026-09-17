@@ -47,6 +47,14 @@
 #  14. A FAILED COMPARISON IS NOT AN EMPTY COMPARISON (review P2): `--diff`
 #      returning non-zero must BLOCK; an unchecked failure leaves an empty file
 #      that reads as "no unique failures" — fail-open.
+#  15. THE MERGE METHOD HAS A DEFAULT: `gh pr merge` requires one and NO-OPs
+#      without it, so the passthrough must not let an omission certify a merge
+#      that never happened. An explicit method overrides it, without doubling.
+#  16. A FAILED MERGE FAILS LOUD: the exit status is checked, gh's stderr is
+#      surfaced, and a head-bound RETRACTION is posted so the success marker is
+#      never left standing over an unmerged PR (B1 lost #3754/#3755 to it).
+#  17. A DRAFT IS REFUSED EARLY: gh refuses to merge a draft and commit-workflow
+#      opens drafts, so the rail refuses before any CI work, by name.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -100,6 +108,20 @@ has_flag() {
 case "$key" in
   "pr view")
     pr="${3:-}"
+    # The draft probe is a DISTINCT question from the head resolutions: answer it
+    # from its own fixture and never let it consume the head-seq sequence.
+    want_draft=0; want_head=0; jprev=""
+    for x in "$@"; do
+      if [ "$jprev" = "--json" ]; then
+        case "$x" in *isDraft*) want_draft=1 ;; esac
+        case "$x" in *headRefOid*) want_head=1 ;; esac
+      fi
+      jprev="$x"
+    done
+    if [ "$want_draft" = 1 ] && [ "$want_head" = 0 ]; then
+      [ -f "$SCEN/draft" ] && { cat "$SCEN/draft"; exit 0; }
+      printf 'false\n'; exit 0
+    fi
     # head-seq models a PR head that MOVES between resolutions (a rebase landing
     # mid-run): the Nth `pr view` returns the Nth line.
     if [ -f "$SCEN/head-seq" ]; then
@@ -138,7 +160,22 @@ case "$key" in
       [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
       exit 0
     fi
-    printf 'completed\n'
+    # The status/updatedAt projection of the re-run wait. `status-<id>` and
+    # `updated-<id>` are consumed one line per poll and REPEAT their last line
+    # once exhausted (so an all-in_progress status models a run that never
+    # finishes, and a one-line `updated-<id>` models no progress = a stall).
+    if [ -f "$SCEN/status-$id" ]; then
+      n=$(( $(cat "$SCEN/status-count-$id" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$n" > "$SCEN/status-count-$id"
+      s="$(sed -n "${n}p" "$SCEN/status-$id")"
+      [ -n "$s" ] || s="$(tail -n1 "$SCEN/status-$id")"
+      u="$(sed -n "${n}p" "$SCEN/updated-$id" 2>/dev/null)"
+      [ -n "$u" ] || u="$(tail -n1 "$SCEN/updated-$id" 2>/dev/null)"
+      [ -n "$u" ] || u="2026-01-01T00:00:00Z"
+      printf '%s %s\n' "$s" "$u"
+      exit 0
+    fi
+    printf 'completed 2026-01-01T00:00:00Z\n'
     exit 0 ;;
   "run rerun")
     id="${3:-}"
@@ -159,9 +196,18 @@ case "$key" in
         exit 1
       fi
       cp "$body" "$SCEN/comment"
+      # Keep each body separately too, so a scenario that posts MORE than one
+      # comment (evidence + retraction) can assert on the earlier one as well.
+      cn=$(( $(cat "$SCEN/comment-count" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$cn" > "$SCEN/comment-count"
+      cp "$body" "$SCEN/comment-$cn"
     fi
     exit 0 ;;
   "pr merge")
+    if [ -f "$SCEN/fail-merge" ]; then
+      cat "$SCEN/fail-merge" >&2
+      exit 1
+    fi
     exit 0 ;;
   *)
     exit 1 ;;
@@ -222,6 +268,14 @@ main_red_n() {  # <sha> <base-run-id> <n> <id>  -> lane-run lines on stdout
 # gate defect is tracked separately. NOTE for reviewers: if you re-inline this
 # helper, the guard blocks the whole suite again in an agent session.
 cfs_diff() { bash "$CFS" --diff "$1" "$2"; }
+
+# Same guard-safe shape as cfs_diff (no `$(bash <path> …)` substitution): run the
+# parser script itself and capture its streams for assertions. The extraction is
+# its OWN unit — the admin-merge rail is a separate consumer (#3756).
+cfs_run() {
+  SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" "$@" >"$TMP/cfs-out" 2>"$TMP/cfs-err"
+  return $?
+}
 
 # Same reason as cfs_diff, one indirection further out: the #1484 classifier fails
 # closed on a `$(bash <path> …)` substitution, because that is also the shape of the
@@ -989,16 +1043,25 @@ else
   fail "no evidence comment posted on the flake path"
 fi
 
-# ── 26. an unparseable failure id is DROPPED + REPORTED; no fences ──────────
-# A PR author controls test names. A `FAILED` payload that is NOT a pytest nodeid
-# (` ``` `, `may`) must NOT enter the decision: it matches nothing on main, so it
-# can never be subtracted or verified and reads as "unique to this PR" on every
-# rail run, forever — a PERMANENT FALSE REFUSAL (#3756 defect 1). The canonical
-# parser DROPS it, COUNTS it and REPORTS it as UNATTRIBUTABLE; a run whose ids
-# were all garbage still refuses via the caller's `examined > extracted` gate,
-# and a sound id in the SAME run still certifies. Separately, the
-# evidence is LISTS, so there is no fence algorithm to get right.
-echo "== 26. a non-nodeid FAILED payload is DROPPED + REPORTED, never carried =="
+# ── 26. a non-nodeid FAILED payload never reaches the evidence (#3756) ─────
+# A PR author controls test names, so a test can print a bare fence marker in the
+# `FAILED <token>` position. #3756 defect 1: that token is NOT a test id, so the
+# canonical parser DROPS it (counted and reported) before it can ever enter the
+# set — the injection surface is removed at the source, not merely rendered
+# inert. The evidence stays LISTS-of-ids, and the sound id in the SAME capture
+# still certifies. Reverting the extractor to the shell `awk` puts ` ``` ` back
+# into the evidence and turns this RED.
+#
+# Equivalently: an unparseable failure id is DROPPED + REPORTED, never carried,
+# and because the evidence is LISTS there is no fence algorithm to get right. A
+# `FAILED` payload that is NOT a pytest nodeid (` ``` `, `may`) must NOT enter
+# the decision — it matches nothing on main, so it can never be subtracted or
+# verified and reads as "unique to this PR" on every rail run, forever — a
+# PERMANENT FALSE REFUSAL (#3756 defect 1). The canonical parser DROPS it,
+# COUNTS it and REPORTS it as UNATTRIBUTABLE; a run whose ids were all garbage
+# still refuses via the caller's `examined > extracted` gate, and a sound id in
+# the SAME run still certifies.
+echo "== 26. a non-nodeid FAILED payload is dropped before the evidence =="
 new_scen btick
 HEAD_BT="dddd333300000000000000000000000000000000"
 printf '%s\n' "$HEAD_BT" > "$SCEN/head"
@@ -1026,11 +1089,24 @@ grep -q "pr merge" "$SCEN/calls" && pass "the merge proceeded (garbage cannot bl
 new_scen btick2
 printf '%s\n' "$HEAD_BT" > "$SCEN/head"
 lane_fail "$HEAD_BT" 9931 > "$SCEN/runs-$HEAD_BT"
-log_failed 'tests/test_ok.py::test_ok' > "$SCEN/log-9931"
+# The SAME capture shape as `btick` — a sound id AND a non-nodeid payload in the
+# `FAILED` position — asserted at the EVIDENCE level rather than at the exit
+# level. The assertions below require the dropped token to be REPORTED on stderr
+# and absent from the evidence; a sound-id-only capture can exercise neither.
+{ log_failed 'tests/test_ok.py::test_ok'; log_failed '```'; } > "$SCEN/log-9931"
 main_red_n mainbt2 9932 3 'tests/test_ok.py::test_ok' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1
 if [ -f "$SCEN/comment" ]; then
   c="$SCEN/comment"
+  grep -qF 'tests/test_ok.py::test_ok' "$c" \
+    && pass "the sound id in the same capture is in the evidence" \
+    || fail "the sound id is missing from the evidence"
+  grep -qF '```' "$c" \
+    && fail "a non-nodeid backtick token reached the evidence" \
+    || pass "the backtick token never reaches the evidence — dropped at the parser (#3756)"
+  grep -q 'UNATTRIBUTABLE' "$TMP/err" \
+    && pass "the dropped backtick token is REPORTED as UNATTRIBUTABLE (not silent)" \
+    || fail "the dropped token is silent on stderr"
   d_open=$(grep -c '^<details>' "$c"); d_close=$(grep -c '^</details>$' "$c")
   [ "$d_open" -ge 3 ] && [ "$d_open" -eq "$d_close" ] \
     && pass "all evidence blocks stay structurally intact ($d_open/$d_close)" \
@@ -1384,7 +1460,8 @@ rc=$?
 # The `may` leak, at the exact position the retired shell `awk` read: the token
 # after `FAILED`. Two payloads, ONE position — the acceptance pair. Reverting the
 # extractor to that `awk` turns `may` into a failure id (M1 RED); making the
-# extractor "extract nothing" loses the real id (M2 RED).
+# extractor "extract nothing" loses the real id (M2 RED); dropping a rejected
+# candidate without recording it turns the REPORT assertion RED (M3).
 echo '== 32. the FAILED-token position: `may` is DROPPED + REPORTED, a real id is EXTRACTED =='
 MAYLOG="$TMP/may-position.log"
 printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED may be a known flake\n' > "$MAYLOG"
@@ -1403,14 +1480,344 @@ out="$(python3 "$ROOT/scripts/ci_exemption.py" ids --log "$REALLOG" 2>/dev/null)
 [ "$out" = "$REAL_ID" ] && pass "M2: a REAL id in the SAME position is still EXTRACTED" \
   || fail "M2: expected '$REAL_ID', got '$out'"
 
-# ── 33. E5 IN THE RAIL: an identity that MOVED is never exempt-and-silent ───
+# The SAME acceptance pair, one door out: the RAIL's own extraction
+# (`ci-failure-set.sh --commit`) must drop+report the garbage and keep the sound
+# id. This is the shell half of the fix — the module alone does not prove the
+# rail routes through it.
+echo '== 32b. the shell rail drops+reports at the FAILED-token position =='
+new_scen cfsmay
+HEAD_CM="aa5511000000000000000000000000000000000"
+lane_fail "$HEAD_CM" 8801 > "$SCEN/runs-$HEAD_CM"
+{ log_failed 'tests/test_ok.py::test_ok'; log_failed 'may'; } > "$SCEN/log-8801"
+cfs_run --commit "$HEAD_CM"; rc=$?
+[ "$rc" -eq 0 ] && pass "the rail reads a capture carrying garbage (exit 0)" \
+  || fail "the rail exited $rc on a capture that also carried a sound id"
+grep -qxF 'tests/test_ok.py::test_ok' "$TMP/cfs-out" && pass "the sound id is EXTRACTED by the rail" \
+  || fail "the rail lost the sound id: $(cat "$TMP/cfs-out")"
+grep -qxF 'may' "$TMP/cfs-out" && fail "'may' was CARRIED as a failure id (permanent false refusal)" \
+  || pass "'may' is NOT in the rail's failure set"
+grep -q 'UNATTRIBUTABLE.*may' "$TMP/cfs-err" && pass "the rail REPORTS the dropped token (not silent)" \
+  || fail "the rail dropped 'may' silently: $(head -2 "$TMP/cfs-err")"
+
+# ── 33. A MOVED IDENTITY: reported across the boundary, never attributed ───
+# B7's dynamic form: within ONE concluded cycle the SAME head's failure id moved
+# (pre-rerun `test_status_surfaces_last_drill`, post-rerun
+# `test_manual_drill_records_measured_time`). A stable regression does not do
+# that, so the re-measure is not comparing like with like. Two required
+# behaviours: (1) the id set ACROSS the boundary is REPORTED — both samples
+# surface, not a single collapsed identity; (2) the moving identity is
+# UNATTRIBUTABLE — flagged by class, never resolved to one PR-unique id.
+# (The decision's UNATTRIBUTABLE VERDICT is the consumer side, #1147.)
+echo "== 33. a moved identity is REPORTED across the boundary and not attributed =="
+new_scen cfsrot
+HEAD_RR="bb6622000000000000000000000000000000000"
+ROT_A1='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_status_surfaces_last_drill'
+ROT_A2='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_manual_drill_records_measured_time'
+{ lane_fail "$HEAD_RR" 8801; lane_fail "$HEAD_RR" 8802; } > "$SCEN/runs-$HEAD_RR"
+log_failed "$ROT_A1" > "$SCEN/log-8801"
+log_failed "$ROT_A2" > "$SCEN/log-8802"
+cfs_run --commit "$HEAD_RR"; rc=$?
+[ "$rc" -eq 0 ] && pass "both samples of the SAME head are read (exit 0)" \
+  || fail "the rail exited $rc over the two samples"
+grep -qxF "$ROT_A1" "$TMP/cfs-out" && grep -qxF "$ROT_A2" "$TMP/cfs-out" \
+  && pass "BOTH identities across the boundary are REPORTED (the move is visible)" \
+  || fail "the boundary collapsed to one identity: $(cat "$TMP/cfs-out")"
+# The rotation rule must FIRE on the move, and must NOT fire on a stable id or a
+# single sample (removing it turns this RED: a moved id would read PR-unique).
+ROT_VERDICT="$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1] + "/scripts")
+import ci_exemption as m
+a, b = sys.argv[2], sys.argv[3]
+moved = m.detect_rotating_identity([frozenset({a}), frozenset({b})])
+stable = m.detect_rotating_identity([frozenset({a}), frozenset({a})])
+single = m.detect_rotating_identity([frozenset({a})])
+covers = {a, b} <= set(moved.get(m.class_key(a), frozenset()))
+print("moved=%s stable=%s single=%s covers_both=%s" % (bool(moved), bool(stable), bool(single), covers))
+' "$ROOT" "$ROT_A1" "$ROT_A2")"
+case "$ROT_VERDICT" in
+  "moved=True stable=False single=False covers_both=True")
+    pass "the moved identity is flagged UNATTRIBUTABLE by class (never one PR-unique id)" ;;
+  *) fail "rotation rule mis-fired: $ROT_VERDICT" ;;
+esac
+
+# ── 34. the merge method has a DEFAULT, so an omission cannot no-op ─────────
+# `gh pr merge` REQUIRES one of --merge/--rebase/--squash when not interactive;
+# with none it errors and NO-OPs. The passthrough let the CALLER omit it, so the
+# rail posted its head-bound evidence marker and then merged NOTHING — a false
+# PASS by construction (B1 lost #3754/#3755 to it). The default must be present
+# when the caller supplies no method, and an explicit method must win.
+echo "== 34. a default merge method, overridable through the passthrough =="
+new_scen mergemethod
+HEAD_MM="c0c0000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_MM" > "$SCEN/head"
+lane_fail "$HEAD_MM" 9301 > "$SCEN/runs-$HEAD_MM"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9301"
+# main's rate must be MEASURED (at or above the decision's min_runs floor) for
+# the PR failure to be exempted and the merge to be REACHED at all: the union
+# rail decides on a RATE, and a single main sample can never establish one
+# (fail-closed). Before the swap a mere presence in main's window sufficed.
+main_red_n mainmm 9302 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
+if grep -q "pr merge 42 --admin --squash --match-head-commit $HEAD_MM" "$SCEN/calls"; then
+  pass "MERGE_ARGS empty → the merge still carries a method (--squash default)"
+else
+  fail "no default merge method: an omission NO-OPs gh pr merge and leaves the marker standing"
+  grep "pr merge" "$SCEN/calls" | sed 's/^/      /'
+fi
+# An explicit method overrides the default and is not doubled.
+: > "$SCEN/calls"
+run_admin 42 --main-runs 3 -- --rebase >/dev/null 2>&1
+if grep -q "pr merge 42 --admin --rebase --match-head-commit $HEAD_MM" "$SCEN/calls" \
+   && ! grep -q -- "--squash" "$SCEN/calls"; then
+  pass "an explicit --rebase overrides the default (no --squash, no doubling)"
+else
+  fail "the explicit method did not override the default"
+  grep "pr merge" "$SCEN/calls" | sed 's/^/      /'
+fi
+
+# ── 35. a FAILED merge must fail LOUD, and the marker must not stand ────────
+# The rail posted "✅ head-bound evidence posted", then ran `gh pr merge` with NO
+# exit-status check. A failing merge left the marker standing over an UNMERGED
+# PR — a false PASS by construction. Now the failure is loud, gh's stderr is
+# included, and a RETRACTION is posted so the marker cannot be read as success.
+echo "== 35. a failing gh pr merge fails LOUD and the marker is retracted =="
+new_scen mergefails
+HEAD_MF="c1c1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_MF" > "$SCEN/head"
+lane_fail "$HEAD_MF" 9311 > "$SCEN/runs-$HEAD_MF"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9311"
+main_red_n mainmf 9312 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+printf 'gh: Pull Request is still a draft\n' > "$SCEN/fail-merge"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a failed merge exits non-zero ($rc)" \
+  || fail "a failed gh pr merge returned 0 — the false PASS is unfixed"
+grep -q "the merge of PR #42 did NOT happen" "$TMP/err" && pass "  …and says the merge did NOT happen" \
+  || fail "  …but the failure is not loud/unambiguous"
+grep -q "THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR" "$TMP/err" \
+  && pass "  …and names the standing marker explicitly" \
+  || fail "  …and does not call out the marker"
+grep -qF "gh: Pull Request is still a draft" "$TMP/err" \
+  && pass "  …and includes gh's stderr verbatim" \
+  || fail "  …but gh's stderr is not surfaced"
+[ -f "$SCEN/comment-1" ] && grep -q "<!-- admin-merge-safety: $HEAD_MF -->" "$SCEN/comment-1" \
+  && pass "the evidence marker was posted before the merge was attempted" \
+  || fail "the evidence comment was not posted (the scenario no longer models the defect)"
+[ -f "$SCEN/comment-2" ] && grep -q "RETRACTED — the admin merge of head \`$HEAD_MF\` FAILED" "$SCEN/comment-2" \
+  && pass "a head-bound RETRACTION is posted, so the marker is not left standing" \
+  || fail "the success marker was left standing over an unmerged PR"
+grep -q "unique to this PR: 0" "$SCEN/comment-2" \
+  && fail "the retraction must NOT be a certificate (it carries the unique line)" \
+  || pass "the retraction is not a certificate (no 'unique to this PR: 0')"
+
+# ── 36. a DRAFT is refused EARLY, by name (not a late generic merge failure) ─
+# commit-workflow mandates opening drafts, and gh refuses to merge one. The rail
+# must refuse BEFORE any CI work with that specific reason, distinct from any
+# failure verdict — never let it surface after the evidence marker was posted.
+echo "== 36. a DRAFT PR is refused early, with the specific reason =="
+new_scen draftpr
+HEAD_DP="c2c2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DP" > "$SCEN/head"
+printf 'true\n' > "$SCEN/draft"
+lane_fail "$HEAD_DP" 9321 > "$SCEN/runs-$HEAD_DP"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9321"
+lane_fail maindp 9322 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9322"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a draft PR → non-zero exit ($rc)" || fail "a draft was not refused"
+grep -q "is a DRAFT, and gh refuses to merge a draft" "$TMP/err" \
+  && pass "  …with the DRAFT reason, by name" || fail "  …but the reason is not the draft"
+grep -q "gh pr ready 42" "$TMP/err" \
+  && pass "  …and names the remedy (gh pr ready)" || fail "  …but offers no remedy"
+grep -q "NOT a CI-failure verdict" "$TMP/err" \
+  && pass "  …and distinguishes it from a failure verdict" || fail "  …and conflates it with a failure verdict"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for a draft" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on a draft" || pass "no merge attempted"
+grep -q "run list" "$SCEN/calls" \
+  && fail "the draft check must run BEFORE any CI work" \
+  || pass "the refusal is EARLY (no CI run was even listed)"
+
+# ── 37. THE TWO WAITS, the DERIVED ceiling, and attribution that does not
+#        narrow the refusal (B4 / B5 / B7 / B1) ───────────────────────────
+# One section, five pinned behaviours:
+#   (a) a run that is still RUNNING is WAITED, not called a failure
+#   (b) a run with no `updatedAt` progress is STALLED, and says so distinctly
+#   (c) the two waits READ DIFFERENTLY (B7: a raised --rerun-timeout exited
+#       INSTANTLY because the lane-terminal precondition gated first)
+#   (d) the re-run ceiling is DERIVED (2 x the slowest OBSERVED shard) and the
+#       derivation is stated
+#   (e) a failure whose file main's lane has NOT measured reads
+#       "not measurable on this lane" — the refusal STAYS, and there is no
+#       waiver label (B1's docker/embedded redislite case)
+echo "== 37. the two waits, the derived ceiling, and non-narrowing attribution =="
+
+# (a) STILL RUNNING is waited, not failed. status goes in_progress -> completed
+# and the re-run's test then PASSES, so the rail must reach the flake path.
+new_scen waitstillrunning
+HEAD_W1="d1d1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_W1" > "$SCEN/head"
+LANE1='tests/test_flaky.py::test_still_running'
+lane_fail "$HEAD_W1" 9601 > "$SCEN/runs-$HEAD_W1"
+log_failed "$LANE1" > "$SCEN/log-9601"
+lane_fail mainw1 9602 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9602"
+log_passed "$LANE1" > "$SCEN/log-after-9601"
+printf 'in_progress\nin_progress\ncompleted\n' > "$SCEN/status-9601"
+printf 't1\nt2\nt3\n' > "$SCEN/updated-9601"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) a run that was STILL RUNNING is waited to completion, not failed (exit 0)" \
+  || fail "(a) a still-running re-run was treated as a failure (exit $rc)"
+grep -q "STILL RUNNING" "$TMP/out" \
+  && pass "(a) it reports STILL RUNNING progress while waiting" \
+  || fail "(a) no STILL RUNNING progress was reported"
+grep -q "STALLED" "$TMP/err" && fail "(a) a still-running job was called STALLED" \
+  || pass "(a) a still-running job was NOT called STALLED"
+grep -q "still RUNNING at the" "$TMP/err" && fail "(a) a still-running job hit the ceiling wrongly" \
+  || pass "(a) the ceiling was not reported for a run that completed"
+grep -q "pr merge 42 --admin" "$SCEN/calls" && pass "(a) the merge proceeded after the wait" \
+  || fail "(a) no merge after a completed re-run"
+
+# (b) STALL: status never leaves in_progress and updatedAt never moves. The
+# stall window is the REAL failure signal, and its message is distinct from the
+# derived-ceiling message.
+new_scen waitstall
+printf '%s\n' "$HEAD_W1" > "$SCEN/head"
+lane_fail "$HEAD_W1" 9611 > "$SCEN/runs-$HEAD_W1"
+log_failed 'tests/test_flaky.py::test_stalls' > "$SCEN/log-9611"
+lane_fail mainw1b 9612 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9612"
+printf 'in_progress\n' > "$SCEN/status-9611"
+printf 't1\n' > "$SCEN/updated-9611"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_STALL_SECONDS=2 bash "$ADM" 42 --main-runs 1 --rerun-timeout 30 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) a STALLED re-run blocks (exit $rc)" || fail "(b) a stalled run did not block"
+grep -q "STALLED: no progress for 2s" "$TMP/err" \
+  && pass "(b) the stall is reported by NAME, with its window" \
+  || fail "(b) the stall is not named"
+grep -q "still RUNNING at the" "$TMP/err" && fail "(b) a stall was reported as the ceiling" \
+  || pass "(b) the stall is DISTINCT from the ceiling message"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) no merge on a stall" || pass "(b) no merge attempted"
+
+# (c) THE TWO WAITS READ DIFFERENTLY. The lane-terminal precondition fires
+# first; raising --rerun-timeout must NOT change that exit (B7's instant exit)
+# and the output must name WHICH wait it was and state the other never started.
+new_scen twowaits
+HEAD_W3="d3d3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_W3" > "$SCEN/head"
+lane_queued "$HEAD_W3" 9621 > "$SCEN/runs-$HEAD_W3"
+lane_fail mainw3 9622 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9622"
+run_admin 42 --main-runs 1 --rerun-timeout 99 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) the lane-terminal precondition blocks (exit $rc), even with --rerun-timeout 99" \
+  || fail "(c) a pending lane certified with a raised re-run bound"
+grep -q "precondition unmet: run still in_progress — no classification attempted" "$TMP/err" \
+  && pass "(c) the refusal NAMES the precondition and that no classification was attempted" \
+  || fail "(c) the precondition refusal is not named"
+grep -q "LANE-TERMINAL PRECONDITION" "$TMP/err" \
+  && pass "(c) …and names it as the lane-terminal precondition" \
+  || fail "(c) …but does not say which wait it is"
+grep -q -- "--rerun-timeout never started" "$TMP/err" \
+  && pass "(c) …and states the re-run wait never started" \
+  || fail "(c) …and leaves the two waits confusable"
+grep -q "still RUNNING at the" "$TMP/err" && fail "(c) the two waits read alike" \
+  || pass "(c) the re-run wait's message is absent (they are distinguishable)"
+grep -q "run rerun" "$SCEN/calls" && fail "(c) no re-run may start from a precondition block" \
+  || pass "(c) no re-run was started"
+
+# (d) THE CEILING IS DERIVED, and its source is stated — not a round number.
+bash "$ADM" --print-bounds > "$TMP/bounds.txt" 2>&1 || true
+grep -q '^rerun-timeout=3126$' "$TMP/bounds.txt" \
+  && pass "(d) the default ceiling is DERIVED: 3126s (2 x the slowest OBSERVED shard)" \
+  || fail "(d) the ceiling is not the derived value: $(head -1 "$TMP/bounds.txt")"
+grep -q 'source=2 x slowest OBSERVED shard 26m03s' "$TMP/bounds.txt" \
+  && pass "(d) …and the derivation's SOURCE (26m03s of 22m10s/25m50s/26m03s) is stated" \
+  || fail "(d) the derivation source is not stated"
+grep -q '^stall=600$' "$TMP/bounds.txt" \
+  && pass "(d) …and the stall window is its own, stated value" \
+  || fail "(d) the stall window is not stated"
+# …and the ceiling message itself carries the derivation.
+new_scen waitceiling
+printf '%s\n' "$HEAD_W1" > "$SCEN/head"
+lane_fail "$HEAD_W1" 9631 > "$SCEN/runs-$HEAD_W1"
+log_failed 'tests/test_flaky.py::test_slow' > "$SCEN/log-9631"
+lane_fail mainw4 9632 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9632"
+printf 'in_progress\n' > "$SCEN/status-9631"
+printf 't1\n' > "$SCEN/updated-9631"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_STALL_SECONDS=100 bash "$ADM" 42 --main-runs 1 --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) the derived ceiling blocks when reached (exit $rc)" || fail "(d) the ceiling did not block"
+grep -q "still RUNNING at the 5s ceiling = 2 x the slowest OBSERVED shard (26m03s)" "$TMP/err" \
+  && pass "(d) the ceiling message states the derivation, not a bare number" \
+  || fail "(d) the ceiling message does not state its derivation"
+
+# (e) ATTRIBUTION: a failure main's lane has NOT measured must not be called
+# "unique to this PR" — but it STILL BLOCKS. main fails a Docker file; the PR
+# fails the embedded file whose race the Docker lane cannot reproduce (B1).
+new_scen notmeasurable
+HEAD_W5="d5d5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_W5" > "$SCEN/head"
+EMBED='tests/test_embedded.py::TestGraph::test_copy_race'
+lane_fail "$HEAD_W5" 9641 > "$SCEN/runs-$HEAD_W5"
+log_failed "$EMBED" > "$SCEN/log-9641"
+lane_fail mainw5 9642 > "$SCEN/runs-main"
+log_failed 'tests/test_docker.py::test_other' > "$SCEN/log-9642"
+cp "$SCEN/log-9641" "$SCEN/log-after-9641"   # the retry FAILS again
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e) an unmeasured-file failure STILL BLOCKS (exit $rc) — the refusal is not narrowed" \
+  || fail "(e) an unmeasured-file failure was allowed through"
+grep -q "not measurable on this lane" "$TMP/err" \
+  && pass "(e) it reports 'not measurable on this lane' instead of 'unique to this PR'" \
+  || fail "(e) the output still asserts uniqueness with no measurement on main"
+grep -q "test_copy_race" "$TMP/err" && pass "(e) …naming the failure" || fail "(e) the failure is not named"
+grep -q "BOTH block" "$TMP/err" \
+  && pass "(e) …and states BOTH labels block (no waiver path)" \
+  || fail "(e) …but does not close the waiver reading"
+[ -f "$SCEN/comment" ] && fail "(e) no evidence may be posted on a block" || pass "(e) no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "(e) no merge on a block" || pass "(e) no merge attempted"
+
+# (e2) the companion: main's lane DOES measure that file, so the label is the
+# stronger measured-absent one — and it also STILL BLOCKS.
+new_scen measuredabsent
+printf '%s\n' "$HEAD_W5" > "$SCEN/head"
+lane_fail "$HEAD_W5" 9651 > "$SCEN/runs-$HEAD_W5"
+log_failed 'tests/test_docker.py::test_copy_race' > "$SCEN/log-9651"
+lane_fail mainw5b 9652 > "$SCEN/runs-main"
+log_failed 'tests/test_docker.py::test_other' > "$SCEN/log-9652"
+cp "$SCEN/log-9651" "$SCEN/log-after-9651"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e2) a measured-absent failure also STILL BLOCKS (exit $rc)" \
+  || fail "(e2) a measured-absent failure was allowed through"
+grep -q "measured on this lane, not present on main" "$TMP/err" \
+  && pass "(e2) it reads 'measured on this lane, not present on main'" \
+  || fail "(e2) the measured-absent label is missing"
+grep -q "not measurable on this lane" "$TMP/err" && fail "(e2) a measured failure was called unmeasurable" \
+  || pass "(e2) the two labels are distinct"
+
+# ── 38. E5 IN THE RAIL: an identity that MOVED is never exempt-and-silent ───
+# RENUMBERED (was §33 on this branch). Main's §§33-37 (the rail-extractor side,
+# #1165) landed first and are authoritative, so this section moves to §38 to
+# keep the numbering collision-free; the two are COMPLEMENTARY, not duplicates:
+# §33 above is `attribute_residual`'s FILE-level refusal diagnosis (why the
+# residual could not be attributed to this PR), while this section is #1147's
+# ID-level decision reason — UNATTRIBUTABLE / rotating identity / rate
+# comparison (what the rate comparison decided, and on what evidence). Both
+# print; neither replaces the other.
 # B7's dynamic form: cycles 2 and 3 ran the SAME head's SAME run id and produced
 # DIFFERENT ids. The class stayed red; the id moved. Here main has a MEASURED
 # rate (3/3) for the POST-re-run id with a matching signature, so a decision that
 # looked only at the latest sample would EXEMPT it and merge. The rotation
 # observation — the union of every sample of THIS head — makes it UNATTRIBUTABLE
 # instead. Removing that union turns this test RED (the merge proceeds).
-echo "== 33. a rotated identity is UNATTRIBUTABLE, never exempt-and-silent =="
+echo "== 38. a rotated identity is UNATTRIBUTABLE, never exempt-and-silent =="
 new_scen rotation
 HEAD_ROT="ee5500000000000000000000000000000000000"
 printf '%s\n' "$HEAD_ROT" > "$SCEN/head"
