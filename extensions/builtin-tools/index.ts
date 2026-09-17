@@ -1591,8 +1591,22 @@ export function getHeartbeatIntervalMs(): number {
 
 /** Stall-bound getters: clamp ≥ 60s — a sub-60s bound could kill productive
  * agents between two ticks. */
+/** Stall-bound getters: clamp ≥ 60s — a sub-60s bound could kill productive
+ * agents between two ticks. */
 export function getStreamStallMs(): number {
-  return Math.max(60_000, Number(process.env.TASK_STREAM_STALL_MS) || DEFAULT_STREAM_STALL_MS);
+  // #1030 (review, cycle 1): the SAME non-finite gate `getToolStallMs` and
+  // `getTaskHardCapMs` already carry. `Number("Infinity")` and
+  // `Number("1e400")` are truthy and survive `Math.max`, so the previous
+  // `Number(env) || DEFAULT` form returned `Infinity` — leaving the silence
+  // clauses (`effStreamAge > S`) permanently unable to fire. That is the #1068
+  // inert-enforcer class, and the resolver below DEPENDS on this getter for its
+  // fail-closed fallback: a resolver that correctly rejects a bad OVERRIDE
+  // cannot advertise "an override can never disarm the detector" while its
+  // fallback path re-opens it. A non-positive value fails CLOSED to the default
+  // (never clamped up), mirroring the sibling getters.
+  const n = Number(process.env.TASK_STREAM_STALL_MS);
+  if (Number.isFinite(n) && n > 0) return Math.max(60_000, n);
+  return DEFAULT_STREAM_STALL_MS;
 }
 /**
  * #1030: resolve a dispatch's inactivity bound (S) from an optional
@@ -1615,7 +1629,9 @@ export function getStreamStallMs(): number {
  * FAIL-CLOSED on a bad override — the identical rule `getToolStallMs` already
  * documents: a non-finite or non-positive value (`Infinity`, `Number("1e400")`,
  * `NaN`, `0`, negative, a non-numeric string) falls back to the env/default
- * bound. An override may RAISE the bound; it may never disable it. This is the
+ * bound. An override may RAISE the bound; it may never disable it — and
+ * `getStreamStallMs()` now carries the same gate, so the fallback path cannot
+ * re-open what the override path rejects (#1030 review, cycle 1). This is the
  * adversarial face of a knob on a safety detector: `Math.max(60_000, n)` alone
  * would let `Infinity` through and leave the wedged-tool detector permanently
  * disarmed (#1068's inert-enforcer class).

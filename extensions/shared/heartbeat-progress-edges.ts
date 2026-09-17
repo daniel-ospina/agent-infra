@@ -501,7 +501,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "= 1_200_000;",
     axis: "kill",
     guardedBy: NONE,
-    note: "S — gates BOTH stream-stall and tool-silence; the EFFECTIVE bound is resolved by getStreamStallMs (env override, 60 s floor), or PER DISPATCH by resolveStreamStallMs (#1030)",
+    note: "S — gates BOTH stream-stall and tool-silence; the EFFECTIVE bound is resolved by getStreamStallMs (a positive finite env override, else the default; FAIL-CLOSED, 60 s floor), or PER DISPATCH by resolveStreamStallMs (#1030)",
   },
   {
     name: "DEFAULT_TOOL_STALL_MS",
@@ -751,7 +751,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: null,
     axis: "kill",
     guardedBy: BT_TEST,
-    note: "FUNCTION, not a const: the EFFECTIVE stream-stall/tool-silence bound (S) — max(60 s, TASK_STREAM_STALL_MS) when the override is set, else max(60 s, DEFAULT_STREAM_STALL_MS). Registered for the same reason as getToolStallMs: without it the env path and the 60 s floor are invisible and only the literal is recorded.",
+    note: "FUNCTION, not a const: the EFFECTIVE stream-stall/tool-silence bound (S) — max(60 s, TASK_STREAM_STALL_MS) when the override is a POSITIVE FINITE number, else MAX(60 s, DEFAULT_STREAM_STALL_MS). A non-finite or non-positive override (`Infinity`, `1e400`, `NaN`, `0`, negative) fails CLOSED to the default rather than being clamped up — the same inert-enforcer guard getToolStallMs and getTaskHardCapMs carry, added here in #1030's review cycle 1 (before it, `Number(env) || DEFAULT` let `TASK_STREAM_STALL_MS=Infinity` disarm the silence clauses, and the per-dispatch resolver's own fail-closed fallback inherited that). Registered for the same reason as getToolStallMs: without it the env path and the 60 s floor are invisible and only the literal is recorded.",
   },
   {
     name: "resolveStreamStallMs",

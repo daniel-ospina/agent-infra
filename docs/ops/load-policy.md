@@ -220,12 +220,19 @@ unconditionally.
   in-flight-tool silence bound, and the idle-stream bound — one constant, two
   clauses) is resolvable **per dispatch** by the task tool's `stream_stall_ms`
   argument: `resolveStreamStallMs(param)` → the param when it is a positive
-  finite number (floored at 60s), else `max(60 s, TASK_STREAM_STALL_MS)`, else
-  `max(60 s, DEFAULT_STREAM_STALL_MS)`. **An accepted value is honoured VERBATIM
+  finite number (floored at 60s), else `max(60 s, TASK_STREAM_STALL_MS)` when
+  that env override is a positive finite number, else
+  `DEFAULT_STREAM_STALL_MS`. **Both paths are FAIL-CLOSED:** a non-finite or
+  non-positive value *on either path* (`Infinity`, `1e400`, `NaN`, `0`,
+  negative, non-numeric) resolves to the default — an override may RAISE S,
+  never disable it, and the ambient path carries the same gate so the fallback
+  cannot re-open what the override rejects. **An accepted value is honoured VERBATIM
   and is never load-rescaled** — the same rule §3 already states for
   `TASK_HEARTBEAT_CUT_GAP_MS`: an operator who names a number means it. A bad
   shape (`Infinity`, `1e400`, `NaN`, `0`, negative, non-numeric) fails **CLOSED**
-  to the ambient bound — an override may RAISE S, never disable it. Because S is
+  to the ambient bound — an override may RAISE S, never disable it, and the
+  ambient bound is itself fail-closed (#1030 review cycle 1: the env path used to
+  return `Infinity` for `TASK_STREAM_STALL_MS=Infinity`). Because S is
   the bound that gates `tool-silence`/`stream-stall` while the tool-AGE backstop
   (2/3 of the effective hard cap) ignores output, an S **at or above** that
   backstop makes the silence clauses structurally unreachable: the loop emits the

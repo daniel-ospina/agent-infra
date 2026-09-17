@@ -1829,6 +1829,36 @@ test("#1030-A4: FAIL-CLOSED — a non-finite / non-positive / non-numeric overri
     equal(resolveStreamStallMs(Number.NaN), 900_000, "fail-closed falls back to the AMBIENT bound"));
 });
 
+test("#1030-A5: the AMBIENT env path is fail-closed too (a resolver cannot out-close its own fallback)", () => {
+  // Found in the #1030 review cycle 1. `resolveStreamStallMs` rejects every bad
+  // OVERRIDE shape, but its fallback is `getStreamStallMs()`, which read
+  // `Number(env) || DEFAULT` — and `Number("Infinity")` / `Number("1e400")` are
+  // truthy and survive Math.max. So `TASK_STREAM_STALL_MS=Infinity` left
+  // S = Infinity and the silence clauses (`effStreamAge > S`) unable to fire: a
+  // resolver that correctly rejects `Infinity` still ended up at Infinity. Same
+  // gate as `getToolStallMs` / `getTaskHardCapMs`; non-positive fails CLOSED to
+  // the default rather than being clamped up.
+  for (const bad of ["Infinity", "1e400", "NaN", "0", "-5", "abc"]) {
+    withEnv({ TASK_STREAM_STALL_MS: bad }, () => {
+      equal(getStreamStallMs(), DEFAULT_STREAM_STALL_MS, `TASK_STREAM_STALL_MS=${bad} must fail closed`);
+      equal(
+        resolveStreamStallMs(Number.POSITIVE_INFINITY),
+        DEFAULT_STREAM_STALL_MS,
+        `an Infinity override under TASK_STREAM_STALL_MS=${bad} must not resolve to Infinity`,
+      );
+      ok(
+        Number.isFinite(resolveStreamStallMs(Number.POSITIVE_INFINITY)),
+        "the RESOLVED bound is always finite — the detector can always fire",
+      );
+    });
+  }
+  // a positive finite ambient value is still honoured (no over-correction)
+  withEnv({ TASK_STREAM_STALL_MS: "1800000" }, () => {
+    equal(getStreamStallMs(), 1_800_000, "a finite positive env bound is honoured");
+    equal(resolveStreamStallMs(null), 1_800_000, "…and is the no-override path");
+  });
+});
+
 test("#1030-B1: the override CHANGES THE VERDICT — the bound applied is the bound resolved", () => {
   // Source pins prove the wiring; this proves the SEMANTICS. The state is the
   // E-silence-1 shape (a tool that produced output, then went quiet) — the
