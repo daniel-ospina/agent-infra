@@ -36,12 +36,31 @@ name: Node.js CI
 #     alone resolves neither the config's `globals`/plugin imports nor its
 #     parser, so a nested package failed with ERR_MODULE_NOT_FOUND instead
 #     of linting, and (c) annotates the skip.
-#   * the input defaults to '.' (repo root); a caller that does not set it is
-#     in the same directory as before. The only behavioural gain for such a
-#     caller is the dependency install below, and only when it already has a
-#     lint/tsconfig file plus a package-lock.json in that directory.
+#   * the input defaults to '.' (repo root); a caller that does not set it runs
+#     in the same directory as before. Its behavioural gains are the dependency
+#     install below (only when it already has a lint/tsconfig file plus a
+#     package-lock.json in that directory) and the WIDENED config probe below
+#     (a legacy-eslintrc caller that previously took the annotated skip now
+#     runs eslint — see note (3)).
 #   * the config-probe list covers every flat-config filename ESLint accepts
-#     (js/mjs/cjs/ts/mts/cts), not just the two original spellings.
+#     (js/mjs/cjs/ts/mts/cts) plus the legacy eslintrc spellings.
+#   * THREE behavioural notes for existing callers (all new failure/skip
+#     surfaces, recorded rather than left implicit — code review):
+#     (1) a caller that sets working-directory while keeping its eslint /
+#         tsconfig at the REPO ROOT used to lint/typecheck at the root; it now
+#         runs in the directory it named, finds nothing there and gets an
+#         ANNOTATED skip. Point the input at the directory holding the config.
+#     (2) the lockfile-gated `npm ci` adds a HARD-FAIL mode: a package-lock.json
+#         out of sync with package.json fails the step with npm's own lockfile
+#         error. That is a caller-side config break, not a lint finding.
+#     (3) the widened probe turns a previous annotated SKIP into a real run
+#         for a caller whose only config is a legacy eslintrc spelling
+#         (.eslintrc.cjs/.yml/.yaml/.eslintrc): `npx eslint .` then resolves
+#         whatever eslint is current, which is flat-config-only, so an
+#         eslintrc-only tree fails. The probe already did this for
+#         .eslintrc.js/.eslintrc.json, so this makes the set consistent rather
+#         than adding a new class — and it is the same caller-side config break
+#         as (2): migrate to a flat config.
 
 on:
   workflow_call:
@@ -151,7 +170,8 @@ jobs:
         run: |
           if [ -f eslint.config.mjs ] || [ -f eslint.config.js ] || [ -f eslint.config.cjs ] || \
              [ -f eslint.config.ts ] || [ -f eslint.config.mts ] || [ -f eslint.config.cts ] || \
-             [ -f .eslintrc.js ] || [ -f .eslintrc.json ]; then
+             [ -f .eslintrc.js ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.json ] || [ -f .eslintrc ] || \
+             [ -f .eslintrc.yml ] || [ -f .eslintrc.yaml ]; then
             # #1128 — a flat config imports real packages (`globals`,
             # `eslint-plugin-*`) and eslint itself is a devDependency. `npx
             # eslint .` on a bare checkout installs eslint from the registry
