@@ -229,9 +229,12 @@ run_admin() {
   return $?
 }
 
-# A pytest-shaped failing-run log body.
-log_failed() { printf 'test (a)\tRun tests\tFAILED %s - AssertionError: boom\n' "$1"; }
-log_passed() { printf 'test (a)\tRun tests\tPASSED %s\n' "$1"; }
+# A pytest-shaped failing-run log body in the REAL `gh run view --log-failed`
+# envelope (`<job>\t<step>\t<ISO>Z <line>`), which is what the signature extractor
+# (`scripts/ci_exemption.py signatures`) is grounded on. Without the timestamp
+# prefix the summary line does not parse and every failure would be unsigned.
+log_failed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED %s - AssertionError: boom\n' "$1"; }
+log_passed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z PASSED %s\n' "$1"; }
 
 # Lane-run fixture lines. The parser reads the lane's COMPLETION state from the
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
@@ -240,6 +243,20 @@ lane_line() { printf '%s\t%s\t%s:%s\n' "$1" "$2" "$3" "$4"; }
 lane_fail() { lane_line completed failure "$1" "$2"; }
 lane_pass() { lane_line completed success "$1" "$2"; }
 lane_queued() { lane_line in_progress "" "$1" "$2"; }
+
+# A main baseline that EXEMPTS <id> under the #3756 decision: `n` tested runs (at
+# least the module's min_runs floor) in which <id> fails with the SAME signature,
+# so a PR failure at an equal rate is not "materially higher". Before the swap a
+# merge only needed the id to appear ONCE anywhere in main's window; the decision
+# needs a measured RATE, so scenarios that assert a merge must now measure one.
+main_red_n() {  # <sha> <base-run-id> <n> <id>  -> lane-run lines on stdout
+  local sha="$1" base="$2" n="$3" id="$4" i=0
+  while [ "$i" -lt "$n" ]; do
+    lane_fail "$sha" "$((base + i))"
+    log_failed "$id" > "$SCEN/log-$((base + i))"
+    i=$((i + 1))
+  done
+}
 
 # Shared comparison helper. The captures below go through this function rather
 # than `"$(bash "$CFS" …)"` because the main-worktree-guard's unverifiable-
@@ -299,10 +316,12 @@ Y='tests/test_import.py::test_import_wrong_key_422'
 lane_fail "$HEAD_TRAP" 101 > "$SCEN/runs-$HEAD_TRAP"
 log_failed "$X" > "$SCEN/log-101"
 # main: newest run fails Y, older run fails X — so a SINGLE-run baseline (the
-# newest) cannot see X and reads it as new.
-{ lane_fail main1111 201; lane_fail main2222 202; } > "$SCEN/runs-main"
+# newest) cannot see X and reads it as new. The THIRD run fails X too, so the
+# decision has a measurable main rate for X (2/3) rather than one observation.
+{ lane_fail main1111 201; lane_fail main2222 202; lane_fail main3333 203; } > "$SCEN/runs-main"
 log_failed "$Y" > "$SCEN/log-201"
 log_failed "$X" > "$SCEN/log-202"
+log_failed "$X" > "$SCEN/log-203"
 
 SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" --pr 42 > "$TMP/pr-fails" 2>/dev/null
 SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" --main-union 1 > "$TMP/main-1.txt" 2>/dev/null
@@ -320,16 +339,16 @@ if [ -z "$union" ]; then
 else
   fail "expected the union baseline to find 0 unique failures, got: '$union'"
 fi
-run_admin 42 --main-runs 2 >/dev/null 2>&1
+run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
 if [ "$rc" -eq 0 ]; then
-  pass "admin-merge.sh with --main-runs 2 merges (exit 0) — the safe merge is NOT blocked"
+  pass "admin-merge.sh with --main-runs 3 merges (exit 0) — the safe merge is NOT blocked"
 else
   fail "expected exit 0 for the #3469 shape, got $rc"
   sed 's/^/      /' "$TMP/err"
 fi
-if [ -f "$SCEN/comment" ] && grep -q "unique to this PR: 0" "$SCEN/comment"; then
-  pass "evidence records 'unique to this PR: 0'"
+if [ -f "$SCEN/comment" ] && grep -q "blocked by the decision: 0" "$SCEN/comment"; then
+  pass "evidence records 'blocked by the decision: 0'"
 else
   fail "evidence comment missing or without the counts line"
 fi
@@ -413,29 +432,31 @@ HEAD_SHAPE="eeee000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_SHAPE" > "$SCEN/head"
 lane_fail "$HEAD_SHAPE" 901 > "$SCEN/runs-$HEAD_SHAPE"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-901"
-lane_fail main6666 1001 > "$SCEN/runs-main"
-log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-1001"
-run_admin 42 --main-runs 4 >/dev/null 2>&1
+# 3 main runs failing the SAME id with the SAME signature: enough for the decision
+# to measure a rate and exempt the PR's equal one (see main_red_n).
+main_red_n main6666 1001 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
 if [ -f "$SCEN/comment" ]; then
   c="$SCEN/comment"
   grep -q "<!-- admin-merge-safety: $HEAD_SHAPE -->" "$c" && pass "marker binds the head SHA" || fail "marker missing/not head-bound"
   grep -q "^PR head: $HEAD_SHAPE$" "$c" && pass "PR head recorded" || fail "PR head line missing"
-  grep -q "main compared (union of 1 run of python-ci.yml): main6666:1001" "$c" && pass "main provenance recorded as sha:run-id, lane named" || fail "main provenance line wrong"
+  grep -q "main compared (union of 3 runs of python-ci.yml): " "$c" && pass "main provenance recorded as sha:run-id, lane named" || fail "main provenance line wrong"
   grep -q "^test lane: python-ci.yml$" "$c" && pass "the lane is stated in the evidence" || fail "test lane line missing"
-  grep -q "PR failing: 1 | main failing: 1 | unique to this PR: 0" "$c" && pass "counts line exact" || fail "counts line wrong"
-  grep -q "Failing runs examined: PR=1 main=1" "$c" && pass "examined/extracted counts recorded" || fail "examined counts missing"
+  grep -q "PR failing: 1 | main failing: 1 | blocked by the decision: 0" "$c" && pass "counts line exact" || fail "counts line wrong"
+  grep -q "Failing runs examined: PR=1 main=3" "$c" && pass "examined/extracted counts recorded" || fail "examined counts missing"
   grep -q "^Lane completion: PR completed=1 tested=1 pending=0" "$c" && pass "lane completion recorded (the fact that makes 'empty' mean green)" || fail "lane completion line missing"
   grep -q "Flake classification: none needed" "$c" && pass "clean case records no re-run" || fail "clean-case flake line wrong"
-  grep -q 'comm -23' "$c" && pass "raw comparison in a <details> block" || fail "raw comparison missing"
+  grep -q 'final residual (the exemption decision' "$c" && pass "the residual block names the decision that produced it" || fail "residual block missing"
   # The sets themselves, not just the verdict. Before this, the only diff
   # evidence on the clean path was an EMPTY `comm` block, so the failing test
   # ids appeared NOWHERE in the comment and `unique: 0` was an unfalsifiable
-  # claim to the reader. Each id must now appear exactly TWICE — once per set.
+  # claim to the reader. Each id must now appear in BOTH the PR set and the main
+  # baseline (plus the visible-EXEMPT list).
   n=$(grep -c 'tests/test_other.py::test_red_on_main' "$c" || true)
-  [ "$n" -eq 2 ] && pass "both failing sets are listed verbatim ($n occurrences: PR set + main baseline)" \
-    || fail "expected the failing test id twice (PR set + main set), got $n — the auditable diff is not recorded"
-  grep -q 'the 1 failure(s) this PR carries — all pre-existing on main' "$c" \
-    && pass "the PR-carried set is labelled as the pre-existing set" || fail "PR-set label missing"
+  [ "$n" -ge 2 ] && pass "both failing sets are listed verbatim ($n occurrences: PR set + main baseline)" \
+    || fail "expected the failing test id in both sets, got $n — the auditable diff is not recorded"
+  grep -q 'all EXEMPT (measured on main with a matching signature and no worse rate)' "$c" \
+    && pass "the PR-carried set is labelled as exempt-with-evidence" || fail "PR-set label missing"
   grep -q 'main baseline: 1 pre-existing failure(s), for comparison' "$c" \
     && pass "main's baseline set is listed for comparison" || fail "main baseline set missing"
 else
@@ -444,7 +465,7 @@ fi
 
 # ── 7. merge flags pass through ───────────────────────────────────────────
 echo "== 7. extra merge flags pass through (not hardcoded) =="
-run_admin 42 --main-runs 4 --squash --delete-branch >/dev/null 2>&1
+run_admin 42 --main-runs 3 --squash --delete-branch >/dev/null 2>&1
 if grep -q "pr merge 42 --admin --squash --delete-branch --match-head-commit $HEAD_SHAPE" "$SCEN/calls"; then
   pass "--squash/--delete-branch forwarded and the merge is head-pinned (--match-head-commit)"
 else
@@ -524,9 +545,9 @@ log_failed "$SIB" > "$SCEN/log-2001"
 # EMPTY even though the lane is red elsewhere.
 i=0
 while [ "$i" -lt 10 ]; do lane_fail main9999 "$((3000 + i))" >> "$SCEN/runs-main"; i=$((i + 1)); done
-# main, TEST LANE only: it fails the very sibling the PR is charged with.
-lane_fail main8888 4001 > "$SCEN/runs-main.by-workflow.python-ci.yml"
-log_failed "$SIB" > "$SCEN/log-4001"
+# main, TEST LANE only: it fails the very sibling the PR is charged with, over
+# 3 tested runs so the decision can measure a rate (main_red_n).
+main_red_n main8888 4001 3 "$SIB" > "$SCEN/runs-main.by-workflow.python-ci.yml"
 
 run_admin 42 --main-runs 10 --any-workflow >/dev/null 2>&1
 rc=$?
@@ -540,7 +561,7 @@ else
   fail "expected exit 0 with the lane filter, got $rc"
   sed 's/^/      /' "$TMP/err"
 fi
-grep -q "main compared (union of 1 run of python-ci.yml): main8888:4001" "$SCEN/comment" \
+grep -q "main compared (union of 3 runs of python-ci.yml): " "$SCEN/comment" \
   && pass "evidence names the lane and the lane-filtered provenance" \
   || fail "evidence does not record the lane-filtered provenance"
 
@@ -618,19 +639,22 @@ printf '%s\n%s\n' "$HEAD_HM" "$NEW_HM" > "$SCEN/head-seq"
 printf '0' > "$SCEN/head-seq-count"
 lane_fail "$HEAD_HM" 7001 > "$SCEN/runs-$HEAD_HM"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7001"
-lane_fail main5555 7002 > "$SCEN/runs-main"
-log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
-run_admin 42 --main-runs 1 >/dev/null 2>&1
+# The decision path must be CLEAN for this scenario to reach the head-move check:
+# main fails the SAME id over 3 tested runs, so the PR's equal rate is exempt.
+main_red_n main5555 7002 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head moved" || fail "expected a non-zero exit, got 0 — the clean path merged a moved head"
 grep -q "head moved before the evidence" "$TMP/err" && pass "the block names the head move" || fail "expected the head-move reason on stderr"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a moved head" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
-# ── 14. a FAILED comparison is not an EMPTY comparison (review P2) ──
-# The two `--diff` invocations never checked their exit status, so a failure
-# left an empty file, which reads as "no unique failures" and merges. Fail-open.
-echo "== 14. a failed comparison BLOCKS (fail-open, P2) =="
+# ── 14. a FAILED main-side input is not an EMPTY one (review P2, #3756) ──
+# The decision's baseline is TWO files (rates + signatures). The signature table
+# was added by the swap, and a failure to extract it must BLOCK — reading it as
+# empty would make every signature check fail closed anyway, but the caller must
+# see the refusal, and a silently-empty baseline must never merge. Fail-open.
+echo "== 14. a failed main-signature extraction BLOCKS (fail-open, P2) =="
 new_scen diffail
 HEAD_DF="8888000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_DF" > "$SCEN/head"
@@ -638,12 +662,12 @@ lane_fail "$HEAD_DF" 8001 > "$SCEN/runs-$HEAD_DF"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-8001"
 lane_fail main7777 8002 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-8002"
-# A parser that succeeds everywhere EXCEPT `--diff`.
-DIFF_FAILING="$TMP/cfs-diff-fails.sh"
+# A parser that succeeds everywhere EXCEPT `--main-union-signatures`.
+DIFF_FAILING="$TMP/cfs-sigs-fails.sh"
 cat > "$DIFF_FAILING" <<'DIFFEOF'
 #!/usr/bin/env bash
 for a in "$@"; do
-  [ "$a" = "--diff" ] && { echo "simulated comparison failure" >&2; exit 1; }
+  [ "$a" = "--main-union-signatures" ] && { echo "simulated signature extraction failure" >&2; exit 1; }
 done
 exec bash "$CFS_REAL" "$@"
 DIFFEOF
@@ -651,34 +675,34 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
   ADMIN_MERGE_FAILURE_SET_SH="$DIFF_FAILING" CFS_REAL="$CFS" \
   ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
-[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the comparison fails" || fail "expected a non-zero exit, got 0 — fail-open"
-grep -q "comparison failed" "$TMP/err" && pass "the block names the failed comparison" || fail "expected the comparison-failure reason on stderr"
-[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the comparison failed" || pass "no evidence comment posted"
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the signature extraction fails" || fail "expected a non-zero exit, got 0 — fail-open"
+grep -q "could not extract main's signature table" "$TMP/err" && pass "the block names the failed signature input" || fail "expected the signature-extraction reason on stderr"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the baseline could not be read" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
-# ── 15. the SECOND comparison is guarded too (review P2, flake branch) ──
-# §14 only reaches the FIRST `--diff`. The flake branch has a SECOND one, and an
-# unchecked failure there leaves an empty file → residual 0 → merge. Its own
-# scenario is required or the guard is untested (VGATE finding).
-echo "== 15. a failed SECOND comparison BLOCKS (flake branch, P2) =="
+# ── 15. the SECOND PR read is guarded too (review P2, flake branch) ──
+# §14 only reaches the first read of the PR's rows. The flake branch re-reads
+# them, and an unchecked failure there leaves an empty file → residual 0 → merge.
+# Its own scenario is required or the guard is untested (VGATE finding).
+echo "== 15. a failed SECOND PR read BLOCKS (flake branch, P2) =="
 new_scen diffail2
 HEAD_D2="9999000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_D2" > "$SCEN/head"
 FL2='tests/test_flaky.py::test_sometimes'
 lane_fail "$HEAD_D2" 8201 > "$SCEN/runs-$HEAD_D2"
 log_failed "$FL2" > "$SCEN/log-8201"
-log_passed "$FL2" > "$SCEN/log-after-8201"      # passes on retry → the 2nd --diff runs
+log_passed "$FL2" > "$SCEN/log-after-8201"      # passes on retry → the 2nd read runs
 lane_fail main6666 8202 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-8202"
-# A parser that succeeds on the FIRST comparison and fails on the SECOND.
-DIFF_FAILING2="$TMP/cfs-diff2-fails.sh"
+# A parser that succeeds on the FIRST `--commit-rows` and fails on the SECOND.
+DIFF_FAILING2="$TMP/cfs-rows2-fails.sh"
 cat > "$DIFF_FAILING2" <<'DIFFEOF2'
 #!/usr/bin/env bash
 for a in "$@"; do
-  if [ "$a" = "--diff" ]; then
+  if [ "$a" = "--commit-rows" ]; then
     n=$(( $(cat "$DIFF_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
     printf '%s' "$n" > "$DIFF_COUNT_FILE"
-    [ "$n" -ge 2 ] && { echo "simulated second comparison failure" >&2; exit 1; }
+    [ "$n" -ge 2 ] && { echo "simulated second PR read failure" >&2; exit 1; }
   fi
 done
 exec bash "$CFS_REAL" "$@"
@@ -689,9 +713,9 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
   DIFF_COUNT_FILE="$TMP/diff-count-2" ADMIN_MERGE_POLL_INTERVAL=0 \
   bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
-[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the SECOND comparison fails" || fail "expected a non-zero exit, got 0 — fail-open in the flake branch"
-grep -q "comparison failed after the re-run" "$TMP/err" && pass "the block names the post-re-run comparison failure" || fail "expected the post-re-run comparison-failure reason on stderr"
-[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the comparison failed" || pass "no evidence comment posted"
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the SECOND PR read fails" || fail "expected a non-zero exit, got 0 — fail-open in the flake branch"
+grep -q "PR failing set unreadable after re-run" "$TMP/err" && pass "the block names the post-re-run PR read failure" || fail "expected the post-re-run reason on stderr"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the PR set could not be read" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
 # ── 16. --exclude must ACTUALLY exclude (review P0, cycle 2) ──────────────
@@ -717,6 +741,13 @@ grep -q "test_keep" "$TMP/ex-out.txt" && pass "the non-excluded run is still par
 grep -q "test_drop" "$TMP/ex-out.txt" && fail "--exclude did NOT drop the run — the detector's own merge stays in its baseline (P0)" || pass "the excluded run is dropped from the failing set"
 grep -q "$EX_DROP" "$TMP/ex-prov.txt" && fail "the excluded run is still reported as examined (provenance)" || pass "the excluded run is absent from provenance"
 grep -q "$EX_KEEP" "$TMP/ex-prov.txt" && pass "the kept run is still in provenance" || fail "the kept run vanished from provenance"
+# The SIGNATURE table must honour --exclude identically — it is the other half of
+# the same baseline, and a dead `--exclude` here would let the excluded run's
+# signatures license an exemption the rates table refused.
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$CFS" --main-union-signatures 10 --exclude "$EX_DROP" > "$TMP/ex-sig.txt" 2>/dev/null \
+  || fail "--main-union-signatures --exclude should succeed"
+grep -q "test_keep" "$TMP/ex-sig.txt" && pass "signatures: the non-excluded run is still parsed" || fail "signatures: the kept run's signature disappeared"
+grep -q "test_drop" "$TMP/ex-sig.txt" && fail "signatures: --exclude did NOT drop the run" || pass "signatures: the excluded run is dropped"
 # A run whose headSha is EMPTY must be KEPT: dropping runs we cannot identify
 # shrinks the baseline and MANUFACTURES "unique" failures — the opposite of the
 # vacuity bug, and just as wrong (VGATE cycle 2).
@@ -932,15 +963,21 @@ new_scen bigset
 HEAD_BIG="bbbb111100000000000000000000000000000000"
 printf '%s\n' "$HEAD_BIG" > "$SCEN/head"
 lane_fail "$HEAD_BIG" 9901 > "$SCEN/runs-$HEAD_BIG"
-lane_fail mainfeed 9902 > "$SCEN/runs-main"
 LONG="$(printf 'y%.0s' $(seq 1 700))"
 i=0
 while [ "$i" -lt 250 ]; do
   log_failed "tests/test_big.py::test_case_${i}_${LONG}"
   i=$((i + 1))
 done > "$SCEN/log-9901"
-cp "$SCEN/log-9901" "$SCEN/log-9902"    # identical sides → unique = 0 → the clean path
-run_admin 42 --main-runs 1 >/dev/null 2>&1
+# 3 identical main runs: the decision needs a measurable rate for each of the 250
+# ids, not a single-sample appearance.
+i=9902
+while [ "$i" -lt 9905 ]; do
+  lane_fail mainfeed "$i" >> "$SCEN/runs-main"
+  cp "$SCEN/log-9901" "$SCEN/log-$i"
+  i=$((i + 1))
+done
+run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "a 250-entry set still certifies (exit 0)" \
   || { fail "a 250-entry set blocked the merge (exit $rc)"; sed 's/^/      /' "$TMP/err"; }
@@ -956,10 +993,10 @@ if [ -f "$SCEN/comment" ]; then
     || fail "trimming is silent — a reader cannot tell a capped list from a complete one"
   grep -qF -- 'Lists show at most 25 entries of 300 chars' "$c" && pass "the display policy is stated once, not per list" \
     || fail "the display policy is missing"
-  grep -q "PR failing: 250 | main failing: 250 | unique to this PR: 0" "$c" \
+  grep -q "PR failing: 250 | main failing: 250 | blocked by the decision: 0" "$c" \
     && pass "the counts line keeps the FULL, uncapped count" || fail "the counts line was corrupted"
   grep -q "^PR head: $HEAD_BIG$" "$c" && pass "the head binding survives" || fail "the head line was lost"
-  grep -q "main compared (union of 1 run of python-ci.yml): mainfeed:9902" "$c" \
+  grep -q "main compared (union of 3 runs of python-ci.yml): " "$c" \
     && pass "the provenance line is intact" || fail "the provenance line was lost"
 else
   fail "no evidence comment posted for the 250-entry case"
@@ -997,10 +1034,10 @@ if [ -f "$SCEN/comment" ]; then
     && pass "the pre-rerun residual is labelled for what it is" || fail "the pre-rerun residual is missing/mislabelled"
   grep -qF -- '- ...and 95 more' "$c" && pass "the pre-rerun residual uses the same cap (120 → 25 + 95)" \
     || fail "the pre-rerun residual escaped the cap"
-  grep -qF -- '(empty — nothing unique to this PR)' "$c" \
+  grep -qF -- '(empty — the decision exempts every failure this PR carries)' "$c" \
     && pass "the 'must be empty' block shows the EMPTY post-rerun residual" \
     || fail "the pre-rerun residual leaked into the 'must be empty' block"
-  grep -q "PR failing: 0 | main failing: 1 | unique to this PR: 0" "$c" \
+  grep -q "PR failing: 0 | main failing: 1 | blocked by the decision: 0" "$c" \
     && pass "the counts line reflects the POST-rerun PR set" || fail "the counts line does not match the post-rerun set"
 else
   fail "no evidence comment posted on the flake path"
@@ -1014,15 +1051,51 @@ fi
 # inert. The evidence stays LISTS-of-ids, and the sound id in the SAME capture
 # still certifies. Reverting the extractor to the shell `awk` puts ` ``` ` back
 # into the evidence and turns this RED.
+#
+# Equivalently: an unparseable failure id is DROPPED + REPORTED, never carried,
+# and because the evidence is LISTS there is no fence algorithm to get right. A
+# `FAILED` payload that is NOT a pytest nodeid (` ``` `, `may`) must NOT enter
+# the decision — it matches nothing on main, so it can never be subtracted or
+# verified and reads as "unique to this PR" on every rail run, forever — a
+# PERMANENT FALSE REFUSAL (#3756 defect 1). The canonical parser DROPS it,
+# COUNTS it and REPORTS it as UNATTRIBUTABLE; a run whose ids were all garbage
+# still refuses via the caller's `examined > extracted` gate, and a sound id in
+# the SAME run still certifies.
 echo "== 26. a non-nodeid FAILED payload is dropped before the evidence =="
 new_scen btick
 HEAD_BT="dddd333300000000000000000000000000000000"
 printf '%s\n' "$HEAD_BT" > "$SCEN/head"
 lane_fail "$HEAD_BT" 9921 > "$SCEN/runs-$HEAD_BT"
 { log_failed 'tests/test_ok.py::test_ok'; log_failed '```'; } > "$SCEN/log-9921"
-lane_fail mainbt 9922 > "$SCEN/runs-main"
-cp "$SCEN/log-9921" "$SCEN/log-9922"
-run_admin 42 --main-runs 1 >/dev/null 2>&1
+main_red_n mainbt 9922 3 'tests/test_ok.py::test_ok' > "$SCEN/runs-main"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+# The garbage token must NOT become a failure id. An id that matches nothing on
+# main can never be subtracted or verified, so it reads as "unique to this PR"
+# on every rail run for every such PR, forever — a permanent false refusal
+# (#3756 defect 1). The sound id in the SAME run must still be extracted and
+# must still certify the merge, so the fix is not "extract nothing".
+[ "$rc" -eq 0 ] && pass "a non-nodeid FAILED payload does NOT refuse a sound merge (dropped, not carried)" \
+  || fail "a garbage token still refuses a sound merge (exit $rc): $(head -1 "$TMP/err")"
+grep -q 'UNATTRIBUTABLE' "$TMP/err" && pass "the dropped token is REPORTED as UNATTRIBUTABLE (counted, not swallowed)" \
+  || fail "the rejection is silent — a dropped token with no report"
+[ -f "$SCEN/comment" ] && pass "the sound id in the same run still certified the merge (not 'extract nothing')" \
+  || fail "no evidence comment posted for a sound run"
+grep -q '```' "$SCEN/comment" 2>/dev/null && fail "the garbage token reached the evidence" \
+  || pass "no garbage token in the evidence"
+grep -q "pr merge" "$SCEN/calls" && pass "the merge proceeded (garbage cannot block it forever)" || fail "no merge"
+# The evidence format itself: LISTS, not fenced blocks — so a backtick-bearing
+# node id that DOES parse cannot close a block early.
+new_scen btick2
+printf '%s\n' "$HEAD_BT" > "$SCEN/head"
+lane_fail "$HEAD_BT" 9931 > "$SCEN/runs-$HEAD_BT"
+# The SAME capture shape as `btick` — a sound id AND a non-nodeid payload in the
+# `FAILED` position — asserted at the EVIDENCE level rather than at the exit
+# level. The assertions below require the dropped token to be REPORTED on stderr
+# and absent from the evidence; a sound-id-only capture can exercise neither.
+{ log_failed 'tests/test_ok.py::test_ok'; log_failed '```'; } > "$SCEN/log-9931"
+main_red_n mainbt2 9932 3 'tests/test_ok.py::test_ok' > "$SCEN/runs-main"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
 if [ -f "$SCEN/comment" ]; then
   c="$SCEN/comment"
   grep -qF 'tests/test_ok.py::test_ok' "$c" \
@@ -1035,14 +1108,14 @@ if [ -f "$SCEN/comment" ]; then
     && pass "the dropped backtick token is REPORTED as UNATTRIBUTABLE (not silent)" \
     || fail "the dropped token is silent on stderr"
   d_open=$(grep -c '^<details>' "$c"); d_close=$(grep -c '^</details>$' "$c")
-  [ "$d_open" -eq 3 ] && [ "$d_close" -eq 3 ] \
-    && pass "all three evidence blocks stay structurally intact ($d_open/$d_close)" \
+  [ "$d_open" -ge 3 ] && [ "$d_open" -eq "$d_close" ] \
+    && pass "all evidence blocks stay structurally intact ($d_open/$d_close)" \
     || fail "block structure damaged ($d_open opened, $d_close closed)"
   fenced=$(grep -c '^```*$' "$c")
   [ "${fenced:-0}" -eq 0 ] && pass "no fenced block exists, so there is no fence to break" \
     || fail "a fenced block is present — the injection surface is back ($fenced)"
 else
-  fail "no evidence comment posted for the backtick case"
+  fail "no evidence comment posted for the fence-format case"
 fi
 
 # ── 27. the provenance list uses the SAME single limit ──────────────────────
@@ -1196,8 +1269,8 @@ rep=""; mode=""; i=0; args=("$@")
 while [ "$i" -lt "${#args[@]}" ]; do
   case "${args[$i]}" in
     --runs-report) i=$((i+1)); rep="${args[$i]}" ;;
-    --commit) mode=pr; i=$((i+1)) ;;
-    --main-union) mode=main; i=$((i+1)) ;;
+    --commit|--commit-rows) mode=pr; i=$((i+1)) ;;
+    --main-union|--main-union-rates) mode=main; i=$((i+1)) ;;
     --diff) mode=diff ;;
   esac
   i=$((i+1))
@@ -1264,8 +1337,7 @@ new_scen attributed
 printf '%s\n' "$HEAD_UA" > "$SCEN/head"
 lane_fail "$HEAD_UA" 9111 > "$SCEN/runs-$HEAD_UA"
 log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9111"
-lane_fail mainua2 9112 > "$SCEN/runs-main"
-log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9112"
+main_red_n mainua2 9112 3 'tests/test_pre.py::test_pre' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ] && pass "an attributable failure present on both sides still certifies (no over-block)" \
   || fail "a normal zero-residual merge was blocked: $(head -1 "$TMP/err")"
@@ -1278,8 +1350,7 @@ HEAD_RB="b2b2000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_RB" > "$SCEN/head"
 lane_fail "$HEAD_RB" 9201 > "$SCEN/runs-$HEAD_RB"
 log_failed 'tests/test_same.py::test_same' > "$SCEN/log-9201"
-lane_fail mainrb 9202 > "$SCEN/runs-main"
-log_failed 'tests/test_same.py::test_same' > "$SCEN/log-9202"
+main_red_n mainrb 9202 3 'tests/test_same.py::test_same' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 -- --match-head-commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef >/dev/null 2>&1
 last_mhc="$(grep -o -- '--match-head-commit [0-9a-fA-F]*' "$SCEN/calls" | tail -1)"
 [ "$last_mhc" = "--match-head-commit $HEAD_RB" ] \
@@ -1297,6 +1368,93 @@ printf 'examined=1\nextracted=1\ncompleted=1\ntested=1\npending=0\n' > "$TMP/rep
 lane_tested "$TMP/rep-pending0.txt" lane sha >/dev/null 2>&1 \
   && pass "  …while an explicit pending=0 certifies (no over-block)" \
   || fail "an explicit pending=0 was refused"
+
+# ── 30. THE DEMONSTRATION (#3756): union EXCUSES, the decision BLOCKS ─────
+# The defect in one fixture: a failure main flaked ONCE in 8 runs is in main's
+# union, so `comm -23` subtracts it forever and the gate reports GREEN — even when
+# the PR fails it 8/8. The decision compares RATES and refuses it. This drives the
+# REAL shipped module (`scripts/ci_exemption.py`), not a stub.
+echo "== 30. pre-swap RED / post-swap correct (real decision module) =="
+DEMO="$TMP/demo"; mkdir -p "$DEMO"
+DID='tests/test_oauth_token_fault.py::test_capture_exception_raising_does_not_break_the_typed_error'
+DSIG='AssertionError: assert (200 == 503)'
+printf '%s\t1\t8\n' "$DID" > "$DEMO/main-rates.txt"
+printf '%s\t%s\n' "$DID" "$DSIG" > "$DEMO/main-sigs.txt"
+printf '%s\n' "$DID" > "$DEMO/main-union.txt"
+printf '%s\t8\t8\t%s\n' "$DID" "$DSIG" > "$DEMO/pr-rows.txt"
+printf '%s\n' "$DID" > "$DEMO/pr-fails.txt"
+union_unique="$(comm -23 <(sort -u "$DEMO/pr-fails.txt") <(sort -u "$DEMO/main-union.txt"))"
+[ -z "$union_unique" ] \
+  && pass "PRE-SWAP RED: the union classifier EXCUSES the 8/8 regression (unique set empty → gate green)" \
+  || fail "expected the union path to excuse the regression, got '$union_unique'"
+python3 "$ROOT/scripts/ci_exemption.py" decide \
+  --pr-failures "$DEMO/pr-rows.txt" --main-rates "$DEMO/main-rates.txt" \
+  --main-signatures "$DEMO/main-sigs.txt" \
+  --blocked-out "$DEMO/blocked.txt" --verdict-out "$DEMO/verdict.txt" > "$DEMO/out.txt" 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "POST-SWAP: the decision BLOCKS it (exit $rc)" \
+  || fail "the decision excused an eight-fold regression — the defect is not fixed"
+grep -q '^VERDICT	BLOCK' "$DEMO/verdict.txt" && grep -q 'materially higher' "$DEMO/out.txt" \
+  && pass "the refusal names the rate comparison (main 1/8 vs PR 8/8)" || fail "the decision did not report the rate regression"
+
+# A ROTATING identity (B7 measured it on #3749: two runs of the branch 3h apart,
+# near-zero overlap) must be UNATTRIBUTABLE — neither PR-unique nor exempt.
+A1='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch'
+A2='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch_416bf7c5'
+printf '%s\t1\t1\tRuntimeError: drill failed\n' "$A2" > "$DEMO/rot-pr.txt"
+printf '%s\t4\t4\n' "$A2" > "$DEMO/rot-rates.txt"
+printf '%s\tRuntimeError: drill failed\n' "$A2" > "$DEMO/rot-sigs.txt"
+printf '%s\n%s\n%s\n' "$A1" "$A2" "$A1" > "$DEMO/rotation.txt"
+printf '%s\n' "$A2" > "$DEMO/rot-main-union.txt"
+rot_union_unique="$(comm -23 <(sort -u "$DEMO/rot-pr.txt" | cut -f1) <(sort -u "$DEMO/rot-main-union.txt"))"
+[ -z "$rot_union_unique" ] && pass "PRE-SWAP RED: the union EXCUSES the rotating failure too" \
+  || fail "expected the union to excuse the rotating failure"
+python3 "$ROOT/scripts/ci_exemption.py" decide \
+  --pr-failures "$DEMO/rot-pr.txt" --main-rates "$DEMO/rot-rates.txt" \
+  --main-signatures "$DEMO/rot-sigs.txt" --rotation "$DEMO/rotation.txt" \
+  --unattributable-out "$DEMO/rot-una.txt" --verdict-out "$DEMO/rot-verdict.txt" > "$DEMO/rot-out.txt" 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && grep -q '^VERDICT	BLOCK	blocked=0	unattributable=1' "$DEMO/rot-verdict.txt" \
+  && pass "POST-SWAP: the rotating id is UNATTRIBUTABLE (not PR-unique, not exempt)" \
+  || fail "a rotating identity was not classified UNATTRIBUTABLE (got: $(cat "$DEMO/rot-verdict.txt" 2>/dev/null))"
+
+# ── 31. THE MODULE IS PART OF THE RAIL, NEVER THE GRADED REPO (#3756) ───────
+# The decision is resolved from the RAIL's own directory. A grader drawn from the
+# repo being merged is a bypass (a PR could ship a `tools/ci_exemption.py` that
+# always reports CLEAN), and an ABSENT module must be a LOUD refusal — never a
+# fallback to the presence-based subtraction, which is the defect itself.
+echo "== 31. an absent decision module is a loud refusal, not a union fallback =="
+NOMOD="$TMP/nomodule"; rm -rf "$NOMOD"; mkdir -p "$NOMOD"
+cp "$ADM" "$CFS" "$NOMOD/"
+new_scen nomodule
+HEAD_NM="cccc222200000000000000000000000000000000"
+printf '%s\n' "$HEAD_NM" > "$SCEN/head"
+lane_fail "$HEAD_NM" 6101 > "$SCEN/runs-$HEAD_NM"
+log_failed 'tests/test_x.py::test_x' > "$SCEN/log-6101"
+main_red_n mainnm 6102 3 'tests/test_x.py::test_x' > "$SCEN/runs-main"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  bash "$NOMOD/admin-merge.sh" 42 --main-runs 3 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "an absent module BLOCKS the merge (exit $rc)" \
+  || fail "the rail merged with no decision module — a fail-open fallback"
+grep -q 'the exemption decision module is ABSENT at' "$TMP/err" \
+  && pass "the refusal names the missing module and its path" || fail "the refusal is unexplained"
+grep -q 'fall back to presence-based subtraction' "$TMP/err" \
+  && pass "the refusal rejects the union fallback explicitly" || fail "the refusal does not name the forbidden fallback"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted without a decision" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+# At the parser level too: `--main-union-signatures` refuses, while `--diff` (the
+# mode the DETECTOR still uses) keeps working without the module.
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$NOMOD/ci-failure-set.sh" --main-union-signatures 3 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "--main-union-signatures refuses without the module (exit $rc)" || fail "it produced a table with no extractor"
+grep -q 'ABSENT at' "$TMP/err" && pass "…and says so" || fail "…silently"
+printf 'a\n' > "$TMP/d-a.txt"; printf 'a\nb\n' > "$TMP/d-b.txt"
+SCEN="$SCEN" CI_FAILURE_SET_GH="$FAKE" bash "$NOMOD/ci-failure-set.sh" --diff "$TMP/d-b.txt" "$TMP/d-a.txt" >"$TMP/out" 2>/dev/null
+rc=$?
+[ "$rc" -eq 0 ] && grep -q '^b$' "$TMP/out" && pass "--diff still works (retained for the detector)" \
+  || fail "--diff broke — the detector's shared mode must remain"
+
 
 # ── 32. THE FAILED-TOKEN POSITION (#3756 defect 1) ─────────────────────────
 # The `may` leak, at the exact position the retired shell `awk` read: the token
@@ -1395,9 +1553,12 @@ HEAD_MM="c0c0000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_MM" > "$SCEN/head"
 lane_fail "$HEAD_MM" 9301 > "$SCEN/runs-$HEAD_MM"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9301"
-lane_fail mainmm 9302 > "$SCEN/runs-main"
-log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9302"
-run_admin 42 --main-runs 1 >/dev/null 2>&1
+# main's rate must be MEASURED (at or above the decision's min_runs floor) for
+# the PR failure to be exempted and the merge to be REACHED at all: the union
+# rail decides on a RATE, and a single main sample can never establish one
+# (fail-closed). Before the swap a mere presence in main's window sufficed.
+main_red_n mainmm 9302 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
 if grep -q "pr merge 42 --admin --squash --match-head-commit $HEAD_MM" "$SCEN/calls"; then
   pass "MERGE_ARGS empty → the merge still carries a method (--squash default)"
 else
@@ -1406,7 +1567,7 @@ else
 fi
 # An explicit method overrides the default and is not doubled.
 : > "$SCEN/calls"
-run_admin 42 --main-runs 1 -- --rebase >/dev/null 2>&1
+run_admin 42 --main-runs 3 -- --rebase >/dev/null 2>&1
 if grep -q "pr merge 42 --admin --rebase --match-head-commit $HEAD_MM" "$SCEN/calls" \
    && ! grep -q -- "--squash" "$SCEN/calls"; then
   pass "an explicit --rebase overrides the default (no --squash, no doubling)"
@@ -1426,10 +1587,9 @@ HEAD_MF="c1c1000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_MF" > "$SCEN/head"
 lane_fail "$HEAD_MF" 9311 > "$SCEN/runs-$HEAD_MF"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9311"
-lane_fail mainmf 9312 > "$SCEN/runs-main"
-log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9312"
+main_red_n mainmf 9312 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
 printf 'gh: Pull Request is still a draft\n' > "$SCEN/fail-merge"
-run_admin 42 --main-runs 1 >/dev/null 2>&1
+run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a failed merge exits non-zero ($rc)" \
   || fail "a failed gh pr merge returned 0 — the false PASS is unfixed"
@@ -1641,6 +1801,41 @@ grep -q "measured on this lane, not present on main" "$TMP/err" \
   || fail "(e2) the measured-absent label is missing"
 grep -q "not measurable on this lane" "$TMP/err" && fail "(e2) a measured failure was called unmeasurable" \
   || pass "(e2) the two labels are distinct"
+
+# ── 38. E5 IN THE RAIL: an identity that MOVED is never exempt-and-silent ───
+# RENUMBERED (was §33 on this branch). Main's §§33-37 (the rail-extractor side,
+# #1165) landed first and are authoritative, so this section moves to §38 to
+# keep the numbering collision-free; the two are COMPLEMENTARY, not duplicates:
+# §33 above is `attribute_residual`'s FILE-level refusal diagnosis (why the
+# residual could not be attributed to this PR), while this section is #1147's
+# ID-level decision reason — UNATTRIBUTABLE / rotating identity / rate
+# comparison (what the rate comparison decided, and on what evidence). Both
+# print; neither replaces the other.
+# B7's dynamic form: cycles 2 and 3 ran the SAME head's SAME run id and produced
+# DIFFERENT ids. The class stayed red; the id moved. Here main has a MEASURED
+# rate (3/3) for the POST-re-run id with a matching signature, so a decision that
+# looked only at the latest sample would EXEMPT it and merge. The rotation
+# observation — the union of every sample of THIS head — makes it UNATTRIBUTABLE
+# instead. Removing that union turns this test RED (the merge proceeds).
+echo "== 38. a rotated identity is UNATTRIBUTABLE, never exempt-and-silent =="
+new_scen rotation
+HEAD_ROT="ee5500000000000000000000000000000000000"
+printf '%s\n' "$HEAD_ROT" > "$SCEN/head"
+ROT_A1='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch'
+ROT_A2='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch_416bf7c5'
+lane_fail "$HEAD_ROT" 7701 > "$SCEN/runs-$HEAD_ROT"
+log_failed "$ROT_A1" > "$SCEN/log-7701"
+# The re-run of the SAME run id reports a DIFFERENT identity (a new attempt).
+log_failed "$ROT_A2" > "$SCEN/log-after-7701"
+main_red_n mainrot 7702 3 "$ROT_A2" > "$SCEN/runs-main"
+run_admin 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "the rotated identity BLOCKS the merge (exit $rc)" \
+  || fail "a moving identity was exempted — the exempt-and-silent direction"
+grep -q 'UNATTRIBUTABLE' "$TMP/err" && pass "…and the refusal is attributed UNATTRIBUTABLE, not 'unique to this PR'" \
+  || fail "the refusal does not name UNATTRIBUTABLE: $(grep -m3 'BLOCK\|UNATTRIBUTABLE' "$TMP/err" 2>/dev/null)"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for a moving identity" || pass "no evidence comment"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted" || pass "no merge attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
