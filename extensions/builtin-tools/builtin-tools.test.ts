@@ -2609,10 +2609,14 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   //     expressed with no `if` header at all (`switch`, a ternary, a `||`
   //     short-circuit, a helper) — which the condition pin cannot see.
   // Only the two together pin "this callback is not freshness-gated".
-  const hcStart = src.indexOf("hardCapTimer: NodeJS.Timeout | null = setTimeout(");
-  const hcEnd = src.indexOf("}, getTaskHardCapMs());", hcStart);
+  // The far-tail region is sliced from the COMMENT-STRIPPED view: a commented-out
+  // guard (`// if (settled) return;`) or a comment naming a denied token must not
+  // satisfy — or falsely trip — a check. Both anchors are exact text with no
+  // comments between them, so the indices agree in either view.
+  const hcStart = code.indexOf("hardCapTimer: NodeJS.Timeout | null = setTimeout(");
+  const hcEnd = code.indexOf("}, getTaskHardCapMs());", hcStart);
   ok(hcStart > -1 && hcEnd > hcStart, "the hard-cap timer callback must be locatable");
-  const hcBody = src.slice(hcStart, hcEnd);
+  const hcBody = code.slice(hcStart, hcEnd);
   ok(/if\s*\(\s*settled\s*\)\s*return;/.test(hcBody), "the hard-cap callback still short-circuits on `settled`");
   ok(/if\s*\(\s*!hasOutput\s*\)/.test(hcBody), "the hard-cap callback still branches on `hasOutput`");
   // Only the parenthesised CONDITION is normalised, so a WHITESPACE-ONLY
