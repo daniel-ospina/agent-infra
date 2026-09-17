@@ -234,7 +234,7 @@ remove_created() { # <repo> <path> [admin-gitdir]
   [ -n "$d" ] || return 0
   [ -n "$gd" ] || gd="$(admin_of "$d")"
   git -C "$repo" worktree remove --force "$d" >/dev/null 2>&1 || true
-  if [ -e "$d" ]; then rm -rf "$d" 2>/dev/null || warn "could not remove $d"; fi
+  if [ -e "$d" ] || [ -L "$d" ]; then rm -rf "$d" 2>/dev/null || warn "could not remove $d"; fi
   prune_admin "$repo" "$gd"
   return 0
 }

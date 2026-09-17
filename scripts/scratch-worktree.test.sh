@@ -34,6 +34,7 @@
 #   T19 --paths is anchored (a same-named nested dir is not materialised)
 #   T20 run is silent on stderr when it succeeds (20 samples)
 #   T21 a wrapped command that deletes `.git` still deregisters the record
+#   T22 a wrapped command that replaces `$D` with a DANGLING symlink still cleans
 
 set -uo pipefail
 
@@ -426,6 +427,22 @@ if [ -n "$D21" ] && git -C "$FIX/repo" worktree list --porcelain 2>/dev/null | g
 else
   ok 0 "T21d no stale entry in git worktree list"
 fi
+
+# ── T22: a DANGLING SYMLINK left at $D is still removed ─────────────────────
+# `[ -e ]` follows the link, so a link to a nonexistent path read as "already
+# gone": the record was deregistered, `list` reported clean, and the symlink sat
+# under the scratch root forever (cycle-8 P2). `[ -L ]` closes it.
+P22="$FIX/t22path"
+bash "$SW" run --repo "$FIX/repo" --root "$SCRATCH_WORKTREE_ROOT" --ref "$C2" --full \
+  -- bash -c "pwd > '$P22'; cd /; rm -rf \"\$(cat '$P22')\"; ln -s /nonexistent-target \"\$(cat '$P22')\"" \
+  >/dev/null 2>&1
+RC22=$?
+D22="$(cat "$P22" 2>/dev/null)"
+[ "$RC22" = 0 ] && ok 0 "T22a the probe's exit code survives" || ok 1 "T22a the probe's exit code survives (rc=$RC22)"
+{ [ -n "$D22" ] && [ ! -e "$D22" ] && [ ! -L "$D22" ]; } \
+  && ok 0 "T22b a dangling symlink left at the scratch path is removed" \
+  || ok 1 "T22b a dangling symlink survived at ${D22:-unset}"
+[ "$(live_scratch)" = 0 ] && ok 0 "T22c no record survives" || ok 1 "T22c a record survived"
 
 echo
 if [ "$FAILS" = 0 ]; then echo "ALL PASS"; exit 0; else echo "$FAILS FAILURE(S)"; exit 1; fi
