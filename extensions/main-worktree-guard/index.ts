@@ -132,6 +132,7 @@ import { execSync, execFileSync } from "node:child_process";
 import { resolve, dirname, join, relative } from "node:path";
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { isPrintMode } from "../shared/print-mode.js";
 import { appendJsonl } from "../shared/audit-log.js";
 
@@ -150,6 +151,10 @@ let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
 let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) => boolean = () => false;
+// #1129: the exemption's root anchor (pure fn in classify-git). Fail-safe
+// default null → the inline realpath-first fallback runs; never null-holes the
+// exemption (a stale module must not silently disable it) and never throws.
+let _frameworkRootFromModuleUrl: ((moduleUrl: string) => string) | null = null;
 // #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
@@ -288,6 +293,10 @@ try {
   // _backdoorBlock, whose catch turns the whole #627 gate fail-OPEN).
   if (typeof _extractCodePayload === "function") extractCodePayload = _extractCodePayload;
   if (typeof _codePayloadGitVerdict === "function") codePayloadGitVerdict = _codePayloadGitVerdict;
+  // #1129: the sanctioned-script exemption's anchor (see
+  // frameworkRootFromModuleUrl). Namespace read + typeof guard, same skew
+  // contract as #709/#627 above — a stale module leaves the inline fallback.
+  if (typeof _m5.frameworkRootFromModuleUrl === "function") _frameworkRootFromModuleUrl = _m5.frameworkRootFromModuleUrl;
   // #967/#1484: the invocation's positional args feed the subcommand
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
@@ -1688,6 +1697,80 @@ function _worktreeDiscardBlock(command: string): string | null {
   return null;
 }
 
+// #1129 — sanctioned framework scripts, keyed on the running guard's OWN
+// checkout (never on a path the command supplies).
+//
+// WHY THIS EXISTS: `scriptGitVerdict` false-blocks the framework's own
+// mandated preflight from a HUB-rooted session on PURE TEXT shapes —
+// `scripts/check-pipeline-compliance.sh` contains ```bash fences inside a
+// single-quoted TEST FIXTURE and a usage heredoc whose prose says "git
+// remote", and either alone pins the verdict to `block` even though the
+// script's only real git invocation is a read-only `remote get-url`. That
+// block makes commit-workflow Step 1 (the mandated preflight) unrunnable.
+//
+// WHY A NAMED LIST AND NOT THE DIRECTORY (adversarial review P0): `scripts/`
+// also carries git-DESTRUCTIVE helpers — `cleanup-worktree.sh` runs `git
+// worktree remove --force` + `git branch -D` on an agent-supplied branch, and
+// `cleanup-stale-branches.sh --execute` deletes remote branches. Neither needs
+// a write, so "the write gate already covers authoring a malicious script"
+// does NOT cover RUNNING a pre-existing destructive one; a directory-wide
+// exemption would let a hub-rooted session destroy another session's
+// uncommitted work with the content walker switched off. Only scripts whose
+// git content is read-only or the documented recovery surface are listed.
+//
+// WHY THE GUARD'S OWN CHECKOUT: the realpath anchor is derived from this
+// module's location, so an agent-editable COPY of the framework (a linked
+// worktree, where the write gate is lifted) has a different realpath and is
+// NOT exempt. A repo-fingerprint anchor (isAgentInfraRepo) would have been
+// forgeable by exactly that route.
+const SANCTIONED_SCRIPT_RELPATHS = [
+  // commit-workflow Step 1 (01-preflight.md) — the mandated pre-push gate.
+  "scripts/check-pipeline-compliance.sh",
+  // The recovery helper most guard messages recommend.
+  "scripts/checkout-hygiene/hub-worktree.sh",
+];
+const _frameworkRoot: string | null = (() => {
+  try {
+    // #1129 (code-review P0): realpath the MODULE, THEN walk up — the
+    // computation lives in classify-git (pure, so it is tested against a real
+    // symlinked extension dir); the inline form below is the SAME expression
+    // and exists so a stale classify-git cannot silently disable the
+    // exemption. pi deploys this extension from the symlink farm
+    // `~/.pi/agent/extensions/<name>` → this checkout and its loader preserves
+    // the symlink spelling, so a lexical `../..` yields `~/.pi/agent`: not the
+    // checkout (exemption inert → the mandated preflight stays blocked) and not
+    // a git checkout (agent-WRITABLE, so a minted
+    // `<~/.pi/agent>/scripts/<listed relpath>` would take the exemption).
+    if (_frameworkRootFromModuleUrl) return _frameworkRootFromModuleUrl(import.meta.url);
+    const self = realpathSync(fileURLToPath(import.meta.url));
+    return realpathSync(resolve(dirname(self), "..", ".."));
+  } catch {
+    return null; // unknown location → no exemption (fail-closed)
+  }
+})();
+
+/** Sanctioned-framework-script exemption (#1129) — returns the matched
+ *  relative path (for the audit row), or null. Realpath-keyed on BOTH sides:
+ *  a symlinked spelling (the hub's `scripts/`) resolves to the same file, and a
+ *  copy in another checkout does not. The listed relpath is realpath'd too, so
+ *  a symlinked component inside the framework's own tree cannot silently
+ *  disable the exemption. */
+function _sanctionedScriptExemption(resolvedScript: string): string | null {
+  if (!_frameworkRoot) return null;
+  let real: string;
+  try {
+    real = realpathSync(resolvedScript);
+  } catch {
+    return null;
+  }
+  for (const rel of SANCTIONED_SCRIPT_RELPATHS) {
+    let sanctioned: string;
+    try { sanctioned = realpathSync(resolve(_frameworkRoot, rel)); } catch { continue; }
+    if (real === sanctioned) return rel;
+  }
+  return null;
+}
+
 // Script-backdoor closure (Slice E): the documented escape
 // (`write /tmp/x.sh` + `bash /tmp/x.sh`) is closed by gating the script's git
 // content with the SAME recovery allowlist — a script that performs a
@@ -1758,6 +1841,32 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // not be blocked by a `--reset`-only discard). [] is a real argv (no args)
     // — `$1` is then provably empty; undefined would be "unknown".
     const scriptArgs = extractScriptArgs(command, scriptPath);
+    // #1129 — the framework's OWN sanctioned scripts are exempted before the
+    // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
+    // list keyed on the guard's own checkout). Deliberate gate relaxation →
+    // audited (best-effort, never blocks) so the exemption is observable.
+    const sanctionedRel = _sanctionedScriptExemption(resolved);
+    if (sanctionedRel) {
+      try {
+        // #1129 (code-review P2): record the REALPATH that matched, not just
+        // the listed relpath — with only the relpath, an exemption taken
+        // through a file at the same relpath under a different root (the
+        // pre-fix anchor pointed at `~/.pi/agent`) logs an identical row. The
+        // session cwd is recorded too, since that is what an operator needs to
+        // reconstruct where the command came from.
+        appendJsonl({
+          event: "m4_script_exemption",
+          extension: "main-worktree-guard",
+          script: sanctionedRel,
+          script_realpath: realpathSync(resolved),
+          framework_root: _frameworkRoot,
+          session_cwd: resolve(process.cwd()),
+          command: command.slice(0, 300),
+          session_id: _currentSessionId(),
+        });
+      } catch { /* audit is best-effort — never blocks */ }
+      return null;
+    }
     if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs) === "block") {
       // #743: label the SCRIPT's own checkout, not the session's. A linked
       // worktree's copy is not "the shared main checkout", and the old message
@@ -1765,11 +1874,23 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
       // hub-rooted session run a content-gated script.
       let scriptInWorktree = false;
       try { scriptInWorktree = isWorktreeCwdWrite(resolve(dirname(resolved))); } catch { /* main (safe default) */ }
+      // #1129 — report the file that was actually READ. The hub's `scripts/` is
+      // a symlink into agent-infra, so the typed path names one checkout while
+      // the gated CONTENT belongs to another; and since the verdict comes from
+      // that content (not from session state), a verdict that flipped in the
+      // field without a code change is checkable against the tree only if the
+      // resolved path is printed.
+      let realResolved = resolved;
+      try { realResolved = realpathSync(resolved); } catch { /* keep the spelling */ }
       return [
         `⛔ Script execution blocked — script content contains a blocked git operation (#1484).`,
         `   The script backdoor (write /tmp/x.sh + bash /tmp/x.sh) is closed:`,
         `   ${resolved}`,
+        ...(realResolved !== resolved ? [`   (resolves to: ${realResolved})`] : []),
         `   (script location: ${scriptInWorktree ? "a linked worktree" : "the shared main checkout"})`,
+        `   (verdict source: the script's CONTENT as read at that path, resolved against the`,
+        `    execution/session cwd below and the hub's current branch — not session state alone;`,
+        `    execution cwd: ${base ?? resolve(process.cwd())}; session cwd: ${resolve(process.cwd())})`,
         `   performs a git operation that is not sanctioned against the shared main checkout.`,
         `   → Run the underlying git commands directly (each is gated on its own), or do`,
         `     this work in an isolated worktree (invoke the using-git-worktrees skill).`,

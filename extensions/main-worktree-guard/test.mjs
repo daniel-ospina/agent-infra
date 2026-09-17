@@ -4,10 +4,10 @@
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname, relative, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4870,6 +4870,103 @@ try {
   expectBool("P628-4: the #628 cap BLOCK reason exists (not warn-only)", pinSrc.includes("new-file cap exhausted in a disordered hub") && pinSrc.includes("_warnHubNewFile"), true);
   expectBool("P627-23: index.ts wires the code-payload backdoor (#627)",
     pinSrc.includes("extractCodePayload") && pinSrc.includes("codePayloadGitVerdict") && pinSrc.includes("#627"), true);
+
+  // ── #1129: hub-symlink checkout mislabel + sanctioned-script exemption ──
+  // (a) BASE-RESOLUTION FALSE POSITIVE. When a checkout's `scripts/` is a
+  // symlink into ANOTHER repo's SUBDIRECTORY, git prints an ABSOLUTE
+  // `--git-dir` beside a RELATIVE `--git-common-dir` (it resolves its own cwd
+  // through the symlink); resolving the relative half against the unrealpathed
+  // cwd lands it in the WRONG repo and the checkout was misread as "a linked
+  // worktree". Deterministic fixture: two one-file repos + the symlink. The
+  // same function feeds `resolveTargetCheckout`, where the misread is a
+  // fail-OPEN "isolated" verdict, so this is a gate-correctness pin too.
+  {
+    const symTmp = mkdtempSync(join(tmpdir(), "guard-symlink-1129-"));
+    const repoA = join(symTmp, "A");
+    const repoB = join(symTmp, "B");
+    mkdirSync(join(repoB, "sub"), { recursive: true });
+    execSync(`git init -q "${repoA}"`, { stdio: "ignore" });
+    execSync(`git init -q "${repoB}"`, { stdio: "ignore" });
+    const symlink = join(repoA, "scripts");
+    symlinkSync(join(repoB, "sub"), symlink);
+    expectBool("#1129: symlinked scripts/ into another repo's subdir is NOT a linked worktree",
+      isWorktreeCwd(symlink) === false, true);
+    expectBool("#1129: the checkout that OWNS the symlink is not a worktree either",
+      isWorktreeCwd(repoA) === false, true);
+    expectBool("#1129: the symlink TARGET repo is not a worktree (control)",
+      isWorktreeCwd(repoB) === false, true);
+    try { execSync(`rm -rf "${symTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+
+  // (b) SANCTIONED-SCRIPT EXEMPTION (#1129). Source pins. The negative half is
+  // the adversarial-review P0: `scripts/` also carries git-DESTRUCTIVE helpers
+  // (`cleanup-worktree.sh` does `git worktree remove --force` + `git branch -D`),
+  // neither of which needs a WRITE — so a directory-wide exemption would let a
+  // hub-rooted session destroy another session's work with the content walker
+  // off. The list must stay named, and destructive helpers must stay out of it.
+  expectBool("#1129: a named sanctioned-script list exists (realpath-keyed)",
+    pinSrc.includes("SANCTIONED_SCRIPT_RELPATHS") && pinSrc.includes("_sanctionedScriptExemption"), true);
+  expectBool("#1129: the mandated preflight + the recovery helper are the listed scripts",
+    pinSrc.includes('"scripts/check-pipeline-compliance.sh"') &&
+    pinSrc.includes('"scripts/checkout-hygiene/hub-worktree.sh"'), true);
+  expectBool("#1129 P0 boundary: no DIRECTORY-wide exemption (destructive helpers stay gated)",
+    !pinSrc.includes("cleanup-worktree.sh") &&
+    !pinSrc.includes("cleanup-stale-branches.sh") &&
+    !pinSrc.includes("startsWith(_frameworkRoot") &&
+    !pinSrc.includes("startsWith(FRAMEWORK_SCRIPTS"), true);
+  expectBool("#1129: the exemption is evaluated BEFORE the content walk",
+    pinSrc.indexOf("_sanctionedScriptExemption(resolved)") !== -1 &&
+    pinSrc.indexOf("_sanctionedScriptExemption(resolved)") <
+      pinSrc.indexOf("scriptGitVerdict(resolved, branch, base"), true);
+  expectBool("#1129: the exemption is audit-logged (deliberate relaxation is observable)",
+    pinSrc.includes("m4_script_exemption"), true);
+  // #1129 (code-review P0) — the ANCHOR. The exemption is only as narrow as the
+  // root it is keyed on. pi deploys the guard through a symlink farm
+  // (`~/.pi/agent/extensions/<name>` → the checkout) and its loader preserves
+  // the symlink spelling in `import.meta.url`, so a LEXICAL `../..` on that
+  // spelling yields `~/.pi/agent`: not the checkout (exemption inert → the
+  // mandated preflight stays blocked) and not a git checkout (agent-WRITABLE,
+  // so an agent could mint `<that root>/scripts/<listed relpath>` and take the
+  // exemption with content of its choosing). BEHAVIOURAL, on the real
+  // geometry — the farm below is a symlink to this extension's own directory,
+  // so this fails on any regression to realpath-after-walk.
+  expectBool("#1129 P0: index.ts derives the anchor from its own module URL",
+    pinSrc.includes("_frameworkRootFromModuleUrl(import.meta.url)"), true);
+  expectBool("#1129 P0: the exemption realpaths BOTH sides of the comparison",
+    pinSrc.includes("realpathSync(resolve(_frameworkRoot, rel))"), true);
+  {
+    const farmTmp = mkdtempSync(join(tmpdir(), "guard-anchor-1129-"));
+    const realExtDir = fileURLToPath(new URL(".", import.meta.url));
+    const realRoot = realpathSync(resolve(realExtDir, "..", ".."));
+    const fakeAgentRoot = join(farmTmp, "pi-agent");
+    mkdirSync(join(fakeAgentRoot, "extensions"), { recursive: true });
+    const farmLink = join(fakeAgentRoot, "extensions", "main-worktree-guard");
+    symlinkSync(realExtDir, farmLink);
+    const farmedModule = join(farmLink, "index.ts");
+    expectBool("#1129 P0: the symlink-farm spelling is what the loader sees (lexical ../.. lands OUTSIDE the checkout)",
+      resolve(dirname(farmedModule), "..", "..") === fakeAgentRoot, true);
+    expectBool("#1129 P0: frameworkRootFromModuleUrl(farmed) is the CHECKOUT, not the farm parent",
+      frameworkRootFromModuleUrl(pathToFileURL(farmedModule).href) === realRoot, true);
+    try { execSync(`rm -rf "${farmTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+  expectBool("#1129: the block message names the realpath actually read + the verdict source",
+    pinSrc.includes("resolves to:") && pinSrc.includes("verdict source:"), true);
+
+  // (c) RESIDUAL PIN — the text-shape false positives are NOT fixed by the
+  // exemption; they are contained. A lone markdown fence is enough to gate a
+  // file `block`, which is the spelling-not-behaviour shape the follow-up must
+  // remove. Pinning it keeps that fix a deliberate, visible change.
+  {
+    const fenceTmp = mkdtempSync(join(tmpdir(), "guard-fence-1129-"));
+    const fenceFile = join(fenceTmp, "fence.sh");
+    writeFileSync(fenceFile, "```bash\n");
+    expectBool("#1129 residual: a markdown ```bash fence alone still gates block (follow-up scope)",
+      scriptGitVerdict(fenceFile, "main", MAIN, MAIN) === "block", true);
+    writeFileSync(fenceFile, "#!/bin/bash\ngit status\n");
+    expectBool("#1129 control: a git-FREE/read-only script still allows",
+      scriptGitVerdict(fenceFile, "main", MAIN, MAIN) === "allow", true);
+    try { execSync(`rm -rf "${fenceTmp}"`, { stdio: "ignore" }); } catch {}
+  }
 
   // ── Degradation (D) ──
   const classifySrc = readFileSync(new URL("./classify-git.mjs", import.meta.url), "utf-8");
