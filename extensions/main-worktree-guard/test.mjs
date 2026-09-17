@@ -4979,7 +4979,11 @@ try {
     // even when the dropped set carried no discards, and summing raw push sites
     // double-counts one file pushed as two sets — review cycle-2 P2).
     pinSrc.includes("discards_dropped") && pinSrc.includes("sets_exempted") &&
-    pinSrc.includes("const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>()"), true);
+    pinSrc.includes("const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>()") &&
+    // …and a repeated push site must not ADD UP (review cycle-3 P2): the same
+    // realpath always yields the same discard list, so `sets_exempted=1` with
+    // `discards_dropped=2` misstated the suppression the row exists to report.
+    pinSrc.includes("prev.discards = Math.max(prev.discards, s.discs.length);"), true);
   // The remedy must never print a path that cannot run (review cycle-2 P2).
   expectBool("#1139: the fail-closed remedy is printed only when that file exists",
     pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
@@ -5005,7 +5009,19 @@ try {
     wtShellWords('cat "a b"').length === 2 &&
     wtShellWords("cat a b").length === 3 &&
     wtShellWords('"a""b"').length === 1 &&
+    // review cycle-3 P2: an escaped quote does NOT close the word, and the rest
+    // of the line must not be swallowed into the token
+    wtShellWords('cat "a\\" b" | bash').length === 4 &&
+    wtShellWords('cat "a\\" b" | bash')[1] === '"a\\" b"' &&
     pinSrc.includes("if (typeof _m5.wtShellWords === \"function\") wtShellWords = _m5.wtShellWords;"), true);
+  // review cycle-3 P1: the per-token dequote must follow the SHELL's rules — the
+  // blanket `[\"']`-and-backslash strip mis-read literal quotes/escapes and
+  // seeded files the shell never reads (one of them a fail-open REGRESSION).
+  expectBool("#1139: the per-token dequote is shell-faithful (single quotes literal, per-context backslash)",
+    pinSrc.includes("function _dequoteShellWord(raw: string): string") &&
+    pinSrc.includes("const _DQ_ESCAPABLE = new Set(") &&
+    pinSrc.includes("const tok = _dequoteShellWord(raw);") &&
+    !pinSrc.includes('raw.replace(/\\\\(.)/g, "$1").replace(/["\']/g, "")'), true);
   expectBool("#1139 (review P1): the status probe CAPTURES stderr (the not-a-checkout allow arm was dead code)",
     pinSrc.includes('stdio: ["ignore", "pipe", "pipe"]') &&
     !pinSrc.includes('stdio: ["ignore", "pipe", "ignore"]'), true);

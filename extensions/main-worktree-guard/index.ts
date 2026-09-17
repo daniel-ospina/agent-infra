@@ -1308,6 +1308,47 @@ function _discardStatusPorcelain(probeCwd: string, d: { scope: string; pathspecs
   }
 }
 
+/** Characters a backslash escapes INSIDE double quotes (POSIX: `$`, `` ` ``, `"`, `\`, newline).
+ *  Outside quotes and inside them the rule differs, which is what
+ *  `_dequoteShellWord` and the shared `wtShellWords` tokenizer must agree on. */
+const _DQ_ESCAPABLE = new Set(["\"", "$", "`", "\\", "\n"]);
+
+/**
+ * Strip ONE shell word's quoting/escaping, the way the shell does (#1139,
+ * review cycle-3 P1). `wtShellWords` returns words with their quotes and
+ * escapes still in place; resolving a file path from one therefore needs a
+ * faithful unquote, not a blanket character strip.
+ *
+ * HISTORY — the first two attempts were both wrong, in opposite directions.
+ * A whitespace split with the quotes LEFT ON never resolved `"undo.sh"`
+ * (fail-OPEN: a discard in a quoted piped script ran ungated). Replacing every
+ * `["']` and every backslash anywhere in the token then mis-read the cases
+ * where those characters are LITERAL: `'a\b.sh'` is one file named `a\b.sh`,
+ * but the blanket strip produced `ab.sh` — a seed for a file the shell never
+ * reads, and (worse than the residual it left) a REGRESSION against the
+ * parent commit, where `a\b.sh` had been seeded correctly. The rules below are
+ * the shell's: single quotes are literal until closed, a backslash escapes
+ * anything outside quotes, and inside double quotes only `$`, `` ` ``, `"`,
+ * `\` and newline.
+ */
+function _dequoteShellWord(raw: string): string {
+  let out = "";
+  let quote: string | null = null;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (quote === "'") { if (c === "'") quote = null; else out += c; continue; }
+    if (quote === "\"") {
+      if (c === "\"") { quote = null; continue; }
+      if (c === "\\" && _DQ_ESCAPABLE.has(raw[i + 1] ?? "")) { out += raw[i + 1]; i++; continue; }
+      out += c; continue;
+    }
+    if (c === "'" || c === "\"") { quote = c; continue; }
+    if (c === "\\") { out += raw[i + 1] ?? ""; i++; continue; }
+    out += c;
+  }
+  return out;
+}
+
 /** Shared block reason for M5. */
 function _worktreeDiscardBlockReason(
   d: { form: string; scope: string; pathspecs: string[] },
@@ -1529,7 +1570,7 @@ function _worktreeDiscardBlock(command: string): string | null {
       // every seed is a string the shell itself would read as one word, and
       // `cat -n "a b.sh" | bash` still resolves `a b.sh`.
       for (const raw of wtShellWords(String(pipeSeg.slice(0, -1).join("|")))) {
-        const tok = raw.replace(/\\(.)/g, "$1").replace(/["']/g, "");
+        const tok = _dequoteShellWord(raw);
         if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
         try {
           const real = realpathSync(resolve(execCwd, tok));
@@ -1742,7 +1783,12 @@ function _worktreeDiscardBlock(command: string): string | null {
     try { real = realpathSync(real); } catch { /* keep the lexical path as the key */ }
     const prev = exempted.get(real);
     if (prev) {
-      prev.discards += s.discs.length;
+      // The same realpath always yields the same discard list (the content is
+      // read from that file), so repeated push sites must NOT add up: `max`
+      // keeps `discards_dropped` consistent with `sets_exempted` — a row saying
+      // 1 set hid 2 discards misstates the suppression it exists to report
+      // (review cycle-3 P2).
+      prev.discards = Math.max(prev.discards, s.discs.length);
       for (const d of s.discs) prev.forms.add(d.form);
     } else {
       exempted.set(real, { rel, discards: s.discs.length, forms: new Set(s.discs.map((d) => d.form)) });

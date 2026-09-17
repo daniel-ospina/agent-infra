@@ -903,6 +903,41 @@ async function partB() {
       allowed(overSplit), `reason=${JSON.stringify(overSplit?.reason ?? "").slice(0, 240)}`);
     for (const f of [harmlessA, harmlessB, `${harmlessA} ${harmlessB}`, splitName, "w-1139"]) rmSync(join(wt, f), { force: true });
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+
+    // SHELL FIDELITY (review cycle-3 P1). A seed must equal what the shell reads
+    // as ONE word, in BOTH directions. The cycle-2 fix stripped every quote and
+    // every backslash anywhere in the token, so `'a\b.sh'` (one file, backslash
+    // LITERAL) became `ab.sh` — a seed for a file the shell never reads, i.e. a
+    // fail-open regression against the parent commit AND a latent false block.
+    // The cycle-3 dequote follows the shell's rules (single quotes literal,
+    // backslash escapes outside quotes, and inside double quotes only
+    // `$"`/backtick/backslash/newline). Each row below names which file carries
+    // the discard, so a row whose file is NOT the one the shell reads is a
+    // no-mis-seed assertion.
+    const fidelity = [
+      ["cat 'a\\b.sh' | bash", "a\\b.sh", true, "single-quoted backslash is LITERAL"] ,
+      ["cat 'a\\b.sh' | bash", "ab.sh", false, "…so `ab.sh` must not be seeded"],
+      ["cat \"un'do.sh\" | bash", "un'do.sh", true, "a single quote inside double quotes is literal"],
+      ["cat \"un'do.sh\" | bash", "undo.sh", false, "…so `undo.sh` must not be seeded"],
+      ["cat 'a b.sh' | bash", "a b.sh", true, "single-quoted space is one word"],
+      ["cat a\\ b.sh | bash", "a b.sh", true, "backslash-escaped space is one word"],
+      ['cat \'a" b.sh\' | bash', 'a" b.sh', true, "a double quote inside single quotes is literal"],
+      ['cat "a\\" b.sh" | bash', 'a" b.sh', true, "an escaped quote does not close the word"],
+    ];
+    const fidelityNames = ["ab.sh", "a\\b.sh", "undo.sh", "un'do.sh", "a b.sh", 'a" b.sh'];
+    let fid = 0;
+    for (const [cmd, discardIn, wantBlock, why] of fidelity) {
+      for (const n of fidelityNames) write(join(wt, n), n === discardIn ? "git checkout -- dirty.txt\n" : "true\n");
+      // dirty.txt must be DIRTY in every iteration, or a row expecting a block
+      // would pass vacuously (the same trap as the /tmp probe, found in review).
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const res = await bash(cmd, wt);
+      const gotBlock = blocked(res);
+      expectTrue(`B12l.${++fid}: pipeline-seed fidelity — ${why} (${wantBlock ? "blocks" : "allows"} with the discard in ${JSON.stringify(discardIn)})`,
+        gotBlock === wantBlock, `got ${gotBlock ? "BLOCKED" : "ALLOWED"}: ${JSON.stringify(res?.reason ?? "").slice(0, 200)}`);
+    }
+    for (const n of fidelityNames) rmSync(join(wt, n), { force: true });
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
     rmSync(wrapper, { force: true });
 
     // The ONE allow arm of the status probe: a target with NO working tree has

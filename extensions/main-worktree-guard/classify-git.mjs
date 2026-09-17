@@ -2678,7 +2678,18 @@ export function wtShellWords(s) {
   let quote = null;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (quote) { cur += ch; if (ch === quote) quote = null; continue; }
+    if (quote) {
+      // #1139 (review cycle-3 P2): a backslash INSIDE double quotes escapes only
+      // `$"` / backtick / backslash / newline — otherwise it is literal, and the
+      // quote after it does NOT close the word. Treating `\"` as a closing quote
+      // split `cat "a\" b" | bash` into two words and swallowed the rest of the
+      // line, so a caller resolving file paths from these tokens seeded the
+      // wrong files. (The unquoted branch below already handles `\`.)
+      if (quote === '"' && ch === "\\" && '"$`\\\n'.includes(s[i + 1] ?? "")) {
+        cur += ch + (s[i + 1] ?? ""); i++; started = true; continue;
+      }
+      cur += ch; if (ch === quote) quote = null; continue;
+    }
     if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; started = true; continue; }
     if (ch === "'" || ch === '"') { quote = ch; cur += ch; started = true; continue; }
     if (ch === " " || ch === "\t" || ch === "\r") {
