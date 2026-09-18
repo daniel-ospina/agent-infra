@@ -402,16 +402,21 @@ def decide(
     # absolute terms as main's rate rises. A PR that fails EVERY SINGLE RUN is therefore EXCUSED
     # once main is broken enough — A DETERMINISTIC TOTAL FAILURE TREATED AS A RATE FLUCTUATION.
     #
-    # Concretely, with the default 1.5, the exemption path below exempts when
-    # `pr_rate <= mr.rate * 1.5`. A PR failing every run has `pr_rate == 1.0`, so it is EXCUSED
-    # once `mr.rate >= 1/1.5` — i.e. ONCE MAIN IS ABOUT TWO-THIRDS BROKEN (~0.667). Past that
-    # point the gate reads a total, deterministic failure as "no worse than main" and lets it
-    # through. The more broken main gets, the wider this door opens.
+    # Concretely, with the default 1.5, THE RATE CONDITION for exemption is
+    # `pr_rate <= mr.rate * 1.5` — and note that this is the NECESSARY rate test, not the whole
+    # rule: three earlier conjuncts BLOCK first (the id must be present in `main_rates`, the
+    # signatures must overlap, and `mr.runs >= min_runs`). A PR failing every run has
+    # `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — ONCE MAIN IS ABOUT TWO-THIRDS BROKEN (~0.667)
+    # — the rate test no longer stops it, and it is EXEMPTED provided those other conjuncts hold.
+    # Past that point the gate reads a total, deterministic failure as "no worse than main", and
+    # the more broken main gets, the wider this door opens.
     #
     # Note the asymmetry, which is why this is a fail-open and not a tuning complaint: the input
-    # on the PR side is CERTAIN (every run failed) and the input on the main side is a SAMPLE.
-    # A certain signal is being overridden by an uncertain one, and the override grows with the
-    # uncertainty.
+    # on the PR side is a TOTAL failure (every run failed) while the input on the main side is a
+    # SAMPLE over a finite `k`. The comparison therefore weighs a stronger signal against a weaker
+    # one, and the tolerance grows as the weaker side degrades. (`pr_rate` is still a rate over a
+    # finite sample, so "total" here means "every observed run", not an infinite certainty — the
+    # asymmetry is real but it is one of evidence strength, not of logical certainty.)
     #
     # DEFERRED FIX DIRECTION (owner-authorized as a follow-up, NOT to be applied here): a tolerance
     # that cannot excuse a TOTAL failure — e.g. an absolute floor, or refusing to exempt whenever
