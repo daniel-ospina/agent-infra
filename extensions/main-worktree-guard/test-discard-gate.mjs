@@ -322,6 +322,7 @@ async function partB() {
   const tmp = realpathSync(mkdtempSync(join(tmpdir(), "discard-gate-")));
   const hub = join(tmp, "hub");
   const wt = join(tmp, "wt");
+  const wt2 = join(tmp, "wt2");
   const home = join(tmp, "home");
   const savedEnv = new Map([...HATCH_VARS, "HOME", "PI_SESSION_ID", "SKILL_ENFORCER_DISABLED"]
     .map((v) => [v, process.env[v]]));
@@ -339,6 +340,11 @@ async function partB() {
     write(join(hub, "-dashfile"), "v1\n");
     gg("add -A && git commit -qm init", hub);
     gg(`worktree add -q -b feat "${wt}"`, hub);
+    gg(`worktree add -q -b feat2 "${wt2}"`, hub);
+    // A SECOND linked worktree, deliberately DIRTY from the start. The P0 pin
+    // below needs a real discard aimed at a tree OTHER than the one the
+    // script-indirection arm probes.
+    write(join(wt2, "dirty.txt"), "MUTANT-WT2\n");
     const wtTop = execSync("git rev-parse --show-toplevel", { cwd: wt, encoding: "utf8" }).trim();
     const wtCommon = execSync("git rev-parse --git-common-dir", { cwd: wt, encoding: "utf8" }).trim();
     const wtGit = execSync("git rev-parse --git-dir", { cwd: wt, encoding: "utf8" }).trim();
@@ -400,6 +406,25 @@ async function partB() {
       "was allowed — a state read must never let a real discard through");
     // Restore the committed content so the B6 sequence below starts from clean.
     write(join(wt, "dirty.txt"), "v1\n");
+
+    // ── #1210 P0 (review): the arm's ALLOW must be ARM-LOCAL, not function-local.
+    //
+    // The first cut of this fix did `if (dirty === false) return null`, which did
+    // not end THIS ARM — it exited `_worktreeDiscardBlock` entirely, skipping every
+    // arm AFTER it (the `sets` direct-argv loop, piped-shell-payload, eval, the
+    // three interpreter `-c` arms). A command carrying BOTH an unresolvable script
+    // path AND a real discard against a DIFFERENT dirty checkout was thereby
+    // ALLOWED — `S=…; bash $S; git -C <dirty-elsewhere> checkout -- f` and four
+    // sibling shapes, every one of them BLOCKED before the fix. The guard returning
+    // undefined means the tool executes and the WIP is destroyed.
+    //
+    // This case is the pin: the session tree is CLEAN (so the new state read says
+    // "nothing to destroy" and the arm declines to block) while `wt2` is DIRTY and
+    // the command really does discard it. It REDs if the arm ever short-circuits
+    // the remaining arms again. The suite had no case combining the two.
+    expectTrue("B5f: CLEAN session tree + indirection + discard against a DIFFERENT dirty worktree → BLOCKED (arm-local, not function-local)",
+      blocked(await bash(`S=${cleanUndoEarly}; bash $S; git -C ${wt2} checkout -- dirty.txt`, wt)),
+      "was allowed — the arm exited the whole gate instead of contributing an arm-local verdict");
 
     // ── B6: DIRTY tracked target in a LINKED WORKTREE → BLOCK (the #709 core) ──
     write(join(wt, "dirty.txt"), "MUTANT\n");

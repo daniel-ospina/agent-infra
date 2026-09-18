@@ -1547,22 +1547,44 @@ function _worktreeDiscardBlock(command: string): string | null {
   // and it still fires on every case where a discard would actually lose work.
   //
   // Never assert a state claim that was not observed. Three outcomes:
-  //   false -> target is clean; nothing to destroy; do not fire.
+  //   false -> target is clean; nothing to destroy; do not fire THIS ARM.
   //   true  -> target IS dirty and the script cannot be read, so we cannot
   //            prove it is safe: fail closed, naming the indirection that
   //            blocked us.
-  //   null  -> the target's status could not be read: fail closed naming THAT,
-  //            which is what we actually know.
+  //   null  -> the target's status could not be read, OR the execution cwd
+  //            could not be resolved: fail closed naming THAT, which is what
+  //            we actually know.
+  //
+  // ⛔ P0 (review): `dirty === false` must NOT `return null`. That exits
+  // `_worktreeDiscardBlock` ENTIRELY, skipping every arm AFTER this point (the
+  // `sets` direct-argv probe loop, piped-shell-payload, eval, and the three
+  // interpreter `-c` arms). A command carrying BOTH an unresolvable script path
+  // AND a real discard against a DIFFERENT dirty checkout was thereby ALLOWED:
+  // `S=…; bash $S; git -C <dirty-elsewhere> checkout -- f` and four sibling
+  // shapes, all BLOCKED before this change. The guard returning undefined means
+  // the tool executes and the WIP is destroyed. This arm contributes an
+  // ARM-LOCAL verdict — it forgoes ONLY the script-indirection reason — and
+  // control FALLS THROUGH to the remaining arms.
   if (_scriptPath && /[$`]/.test(_scriptPath)) {
-    const dirty = _discardStatusPorcelain(execCwd, { scope: "all", pathspecs: [] });
-    if (dirty === false) return null;
-    return _worktreeDiscardBlockReason(
-      { form: "script-indirection", scope: "all", pathspecs: [] },
-      execCwd,
-      dirty === null
-        ? "the target checkout's status could not be read"
-        : "the script path is not statically resolvable",
-    );
+    // ⛔ P1 (review): only trust the probe when the execution cwd is RESOLVABLE.
+    // `execCwd` above falls back to `sessionCwd` when the cd chain cannot be
+    // resolved, which would probe the SESSION tree instead of the tree the
+    // command actually runs in — the wrong tree, silently, and the probe's
+    // answer would be about a tree the discard does not touch.
+    const resolvedCwd = commandExecutionCwd(command, sessionCwd);
+    const dirty = resolvedCwd === null
+      ? null
+      : _discardStatusPorcelain(execCwd, { scope: "all", pathspecs: [] });
+    if (dirty !== false) {
+      return _worktreeDiscardBlockReason(
+        { form: "script-indirection", scope: "all", pathspecs: [] },
+        execCwd,
+        dirty === null
+          ? "the target checkout's status could not be read"
+          : "the script path is not statically resolvable",
+      );
+    }
+    // dirty === false: nothing for THIS arm to protect. Fall through.
   }
 
   // Probe sets: the command itself, plus any script FILES it runs/sources
