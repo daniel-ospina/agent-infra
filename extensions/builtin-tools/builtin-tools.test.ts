@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning } from "./index.js";
 import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
@@ -1769,6 +1769,212 @@ test("E13: first-message-stall at M — turn active, no message/tool events, ret
   equal(dHung.reason, "tool-stall", "tool-stall reason (#198)");
 });
 
+// ── #1030 — the per-dispatch inactivity bound (S) ──────────────────────
+// The issue's operator-facing ask: "raise or make configurable the bound for
+// implementation tasks" — because a LONG, QUIET tool (a full test suite, a
+// repo-wide search) looks identical to a wedged one to a silence detector. The
+// measured cost was five dead dispatches in the gated Tortoise repo (silent
+// single-call gaps of 1203–1341 s against a 1200 s default). These tests pin
+// (A) the resolver's contract, (B) that the resolved value is the one the
+// decision actually applies, and (C) that ONE resolved value reaches every leg.
+section("#1030 — per-dispatch task-child inactivity bound (stream_stall_ms)");
+
+test("#1030-A1: no override → the ambient bound (env → default), verbatim", () => {
+  withEnv({ TASK_STREAM_STALL_MS: undefined }, () => {
+    equal(resolveStreamStallMs(), DEFAULT_STREAM_STALL_MS, "no argument → the default bound");
+    equal(resolveStreamStallMs(undefined), DEFAULT_STREAM_STALL_MS, "explicit undefined → the default bound");
+    equal(resolveStreamStallMs(null), DEFAULT_STREAM_STALL_MS, "null (an absent optional param) → the default bound");
+  });
+  withEnv({ TASK_STREAM_STALL_MS: "900000" }, () => {
+    equal(resolveStreamStallMs(), 900_000, "no override → the ENV bound (the pre-#1030 behaviour is unchanged)");
+    equal(resolveStreamStallMs(null), 900_000);
+  });
+});
+
+test("#1030-A2: a positive override WINS over the ambient bound and is honoured verbatim", () => {
+  withEnv({ TASK_STREAM_STALL_MS: "120000" }, () => {
+    equal(resolveStreamStallMs(1_800_000), 1_800_000, "the dispatch override beats TASK_STREAM_STALL_MS (raise)");
+    equal(resolveStreamStallMs(300_000), 300_000, "a LOWERING override is honoured too — the operator means it");
+  });
+  equal(resolveStreamStallMs(60_001.7), 60_001, "the value is floored to whole ms (never a fraction in a comparison)");
+  const aboveBackstop = getToolStallMs() + 1;
+  equal(
+    resolveStreamStallMs(aboveBackstop),
+    aboveBackstop,
+    "even a value past the age backstop is honoured — warned (B2), never clamped (#1070's cut-gap rule)",
+  );
+});
+
+test("#1030-A3: the 60 s floor — a sub-60 s bound would kill a healthy child between two heartbeat ticks", () => {
+  equal(resolveStreamStallMs(1), 60_000, "1 ms → floored to 60 s");
+  equal(resolveStreamStallMs(59_999), 60_000, "59.999 s → floored to 60 s");
+  equal(resolveStreamStallMs(60_000), 60_000, "exactly the floor → unchanged");
+});
+
+test("#1030-A4: FAIL-CLOSED — a non-finite / non-positive / non-numeric override falls back (never disarms the detector)", () => {
+  // The adversarial face of a knob on a safety detector: `Math.max(60_000, n)`
+  // alone lets `Infinity` through (it is truthy and survives Math.max), which
+  // would leave the wedged-child detector permanently disarmed for that
+  // dispatch — the #1068 inert-enforcer class. Every bad shape must fall BACK
+  // to the ambient bound, never to "no bound".
+  withEnv({ TASK_STREAM_STALL_MS: undefined }, () => {
+    for (const bad of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN, 1e400, 0, -1, -60_000]) {
+      equal(resolveStreamStallMs(bad), DEFAULT_STREAM_STALL_MS, `${String(bad)} must fall back to the ambient bound`);
+    }
+    equal(resolveStreamStallMs("Infinity" as any), DEFAULT_STREAM_STALL_MS, "the STRING 'Infinity' (what an env var would give) falls back");
+    equal(resolveStreamStallMs("" as any), DEFAULT_STREAM_STALL_MS, "empty string (Number(\"\") === 0) falls back");
+    equal(resolveStreamStallMs("abc" as any), DEFAULT_STREAM_STALL_MS, "non-numeric string (NaN) falls back");
+    equal(resolveStreamStallMs({} as any), DEFAULT_STREAM_STALL_MS, "a non-number object falls back");
+    equal(resolveStreamStallMs("600000" as any), 600_000, "a numeric string is a number → honoured");
+  });
+  // …and the fallback tracks the ENV, not the hard-coded default
+  withEnv({ TASK_STREAM_STALL_MS: "900000" }, () =>
+    equal(resolveStreamStallMs(Number.NaN), 900_000, "fail-closed falls back to the AMBIENT bound"));
+});
+
+test("#1030-A5: the AMBIENT env path is fail-closed too (a resolver cannot out-close its own fallback)", () => {
+  // Found in the #1030 review cycle 1. `resolveStreamStallMs` rejects every bad
+  // OVERRIDE shape, but its fallback is `getStreamStallMs()`, which read
+  // `Number(env) || DEFAULT` — and `Number("Infinity")` / `Number("1e400")` are
+  // truthy and survive Math.max. So `TASK_STREAM_STALL_MS=Infinity` left
+  // S = Infinity and the silence clauses (`effStreamAge > S`) unable to fire: a
+  // resolver that correctly rejects `Infinity` still ended up at Infinity. Same
+  // gate as `getToolStallMs` / `getTaskHardCapMs`; non-positive fails CLOSED to
+  // the default rather than being clamped up.
+  for (const bad of ["Infinity", "1e400", "NaN", "0", "-5", "abc"]) {
+    withEnv({ TASK_STREAM_STALL_MS: bad }, () => {
+      equal(getStreamStallMs(), DEFAULT_STREAM_STALL_MS, `TASK_STREAM_STALL_MS=${bad} must fail closed`);
+      equal(
+        resolveStreamStallMs(Number.POSITIVE_INFINITY),
+        DEFAULT_STREAM_STALL_MS,
+        `an Infinity override under TASK_STREAM_STALL_MS=${bad} must not resolve to Infinity`,
+      );
+      ok(
+        Number.isFinite(resolveStreamStallMs(Number.POSITIVE_INFINITY)),
+        "the RESOLVED bound is always finite — the detector can always fire",
+      );
+    });
+  }
+  // a positive finite ambient value is still honoured (no over-correction)
+  withEnv({ TASK_STREAM_STALL_MS: "1800000" }, () => {
+    equal(getStreamStallMs(), 1_800_000, "a finite positive env bound is honoured");
+    equal(resolveStreamStallMs(null), 1_800_000, "…and is the no-override path");
+  });
+});
+
+test("#1030-B1: the override CHANGES THE VERDICT — the bound applied is the bound resolved", () => {
+  // Source pins prove the wiring; this proves the SEMANTICS. The state is the
+  // E-silence-1 shape (a tool that produced output, then went quiet) — the
+  // exact shape of all five measured #1030 wedges (pytest / repo-root grep).
+  const silentToolShape = (): HeartbeatState => {
+    const st = createHeartbeatState();
+    st.everSawWork = true;
+    st.turnActive = true;
+    st.toolsInFlight = 1;
+    st.toolAgeMaxMs = S + 60_000; // far BELOW the age backstop…
+    st.streamAgeMs = S + 1;       // …but no output for S: the wedge signal
+    st.toolUpdates = true;        // it HAD emitted, then stopped
+    st.lastMarkerAt = 500_000;
+    return st;
+  };
+  const decide = (st: HeartbeatState, bound: number) =>
+    heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, streamStallMs: bound }));
+
+  equal(decide(silentToolShape(), S).reason, "tool-silence", "fixture sanity: at the default bound this shape is a wedge");
+
+  const raised = resolveStreamStallMs(1_800_000);
+  equal(raised, 1_800_000, "the resolved override is the raised bound");
+  equal(
+    decide(silentToolShape(), raised).kill,
+    false,
+    "THE FIX: the same silent tool, under the raised bound, is NOT killed — a long QUIET test run survives",
+  );
+
+  // …and the raised bound is not INERT: past it the same clause fires again
+  const past = silentToolShape();
+  past.streamAgeMs = raised + 1;
+  const dPast = decide(past, raised);
+  equal(dPast.kill, true, "past the raised bound the child IS killed — the override moved the bound, it did not remove it");
+  equal(dPast.reason, "tool-silence", "the same clause, at the new bound");
+
+  // The age backstop and the hard cap are untouched by S (S only moves the
+  // SILENCE clauses). Raising S must never buy an unbounded child.
+  const aged = silentToolShape();
+  aged.toolAgeMaxMs = L + 1;
+  equal(decide(aged, raised).reason, "tool-stall", "the age backstop still owns a genuinely hung tool under a raised S");
+});
+
+test("#1030-B2: the inertness warning fires exactly AT the age backstop (warn, never clamp)", () => {
+  withEnv({ TASK_STREAM_STALL_MS: undefined, TASK_TOOL_STALL_MS: undefined, TASK_HARD_CAP_MS: undefined }, () => {
+    const backstop = getToolStallMs();
+    equal(
+      streamStallInertWarning(DEFAULT_STREAM_STALL_MS),
+      null,
+      "the shipped default path (1200 s << the 4 h backstop) is never noisy",
+    );
+    equal(streamStallInertWarning(backstop - 1), null, "one ms below the backstop the silence clauses are still reachable");
+    ok(streamStallInertWarning(backstop), "AT the backstop the silence clauses become structurally unreachable → warn");
+    const msg = streamStallInertWarning(backstop + 60_000) as string;
+    ok(msg, "above the backstop a warning is returned");
+    ok(msg.startsWith("[task]"), `carries the [task] prefix (got: ${msg.slice(0, 20)}…)`);
+    ok(msg.includes("#1030"), "names the issue");
+    ok(msg.includes(String(Math.round((backstop + 60_000) / 1000))), "names the RESOLVED bound the operator set");
+    ok(msg.includes(String(Math.round(backstop / 1000))), "names the backstop it collides with");
+  });
+});
+
+test("#1030-C1: the resolved bound is threaded to EVERY leg, and warned ONCE (source pin)", () => {
+  ok(
+    source.includes("export function resolveStreamStallMs(overrideMs?: number | null): number"),
+    "the resolver is exported (so this suite can pin its contract)",
+  );
+  ok(
+    source.includes("export function streamStallInertWarning(resolvedMs: number): string | null"),
+    "the inertness warning is exported",
+  );
+  ok(
+    source.includes("streamStallMs: streamStallMs ?? getStreamStallMs(),"),
+    "the SPAWN-side threshold honours the dispatch override (and falls back when absent)",
+  );
+  ok(
+    source.includes("const dispatchStreamStallMs = resolveStreamStallMs(params.stream_stall_ms);"),
+    "the bound is resolved ONCE per dispatch",
+  );
+  ok(
+    source.includes("if (streamStallWarning) console.error(streamStallWarning);"),
+    "the inertness warning is EMITTED (a returned-but-unprinted warning protects nobody)",
+  );
+  // Every spawn call site carries it — the #1071 cwd pattern: one resolved
+  // value feeds every consumer, so the bound applied cannot diverge from the
+  // bound reported. `params.cwd` appears in exactly the two spawn calls.
+  equal(
+    (source.match(/params\.cwd, dispatchStreamStallMs/g) ?? []).length,
+    2,
+    "BOTH the primary AND the provider-fallback leg pass the resolved bound",
+  );
+  ok(
+    !source.includes("params.cwd)"),
+    "no spawn call site omits the bound (an omitted leg would silently fall back to the env default)",
+  );
+  ok(/stream_stall_ms: Type\.Optional\(\s*Type\.Number\(/.test(source), "the schema exposes stream_stall_ms as a NUMBER");
+  ok(
+    source.includes("Overrides TASK_STREAM_STALL_MS"),
+    "the description names the env var it overrides (discoverability)",
+  );
+});
+
+test("#1030-C2: the task-child env is NON-INTERACTIVE for git (source pin)", () => {
+  // The measured root cause of the ONE genuinely-wedged #1030 child: a merge
+  // `git commit` with no -m/-F opened vim against a child with no TTY, emitted
+  // one screen of escapes, then 0 bytes for 1211 s until the bound killed it.
+  // A no-TTY child can never satisfy an interactive invoker, so the only
+  // correct behaviour is to fail closed. The runtime proof that these reach the
+  // real child process is in provider-failover.integration.test.ts.
+  ok(/^\s*GIT_EDITOR: "true",$/m.test(source), "GIT_EDITOR is the `true` no-op in the task-child env");
+  ok(/^\s*GIT_SEQUENCE_EDITOR: "true",$/m.test(source), "GIT_SEQUENCE_EDITOR is the `true` no-op (rebase -i)");
+  ok(/^\s*GIT_TERMINAL_PROMPT: "0",$/m.test(source), "GIT_TERMINAL_PROMPT=0 — a credential prompt must fail, not wait");
+});
+
 section("#318 network-down survival — heartbeatKillDecision suppression");
 
 test("E318a: stream-stall suppressed when network down + fresh markers (offline survival)", () => {
@@ -2278,8 +2484,11 @@ test("E271c: cut precedence + stateFresh interaction pin", () => {
     return st;
   };
   // (a) cut fires only while stateFresh — markerAge beyond the fresh window
-  // (max(2×T, 2×interval) = 120s here) → NO cut (the backstop owns that
-  // window, D4). Silence (121s > T, not exempt once stale) fires instead.
+  // (max(2×T, 2×interval) = 120s here) → NO cut. The guard is a shared
+  // precondition, not a cut-local freshness gate: on shipped
+  // defaults that far tail is the 6h hard cap's, not the backstop's (E271h
+  // pins the shipped-defaults ordering).
+  // Silence (121s > T, not exempt once stale) fires instead.
   const stA = mkSt();
   stA.lastMarkerAt = 1_000_000;
   const dA = heartbeatKillDecision(dinput({ now: 1_000_000 + 121_000, lastLifeSignAt: 1_000_000, state: stA, cutGapMs: 15_000 }));
@@ -2333,6 +2542,329 @@ test("E271e: default-config cut bound ≤ 60s (F3)", () => {
     const worst = cutGap + 10_000 + 5_000 + 2_000;
     ok(worst <= 60_000, `worst-case resolve ${worst}ms must be ≤ 60s`);
   });
+});
+
+/** Minimal state that reaches the cut clause: a marker stream, a tool in
+ * flight, and no other clause in play (tool age 0, toolUpdates false). Declared
+ * at MODULE level (not inside the results IIFE) so the E271h shipped-defaults
+ * probes can use it too; `mkCutState` below delegates here. */
+function cutClauseState(markerAgeMs: number, now: number): HeartbeatState {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.streamAgeMs = 0;
+  st.toolAgeMaxMs = 0;
+  st.lastMarkerAt = now - markerAgeMs;
+  return st;
+}
+
+test("E271h: shipped-defaults cut reachability — the effective bound is the gap, not the stateFresh guard (#1077)", () => {
+  // E271h OWNS: the shipped `stateFresh` window value, the gap < window
+  // relation (1x and the 3x load ceiling) probed at the SHIPPED lane's own
+  // boundary, the window boundary, the inert-override boundary, the guard's
+  // far-tail silence, and the far-tail ownership ORDERING (hard cap < backstop).
+  // The hard cap's non-gating attribute and the loop↔decision window coupling
+  // are pinned in E271i, not here.
+  // The gap's own default is pinned by E271e; the load bands by
+  // load-scale-contract.test.ts. Placed beside E271e (the other
+  // default-config bound) rather than at the end of the series, so the two
+  // shipped-defaults pins read together.
+  //
+  // T is a function-local const in index.ts (its shipped declaration is pinned
+  // by builtin-tools.test.ts:195 and the #1068 drift registry, and the hard
+  // boundary for #1077 forbids editing it), so the shipped default is PARSED
+  // from the source. This parse is whitespace-tolerant and accepts a trailing
+  // comma, but is line-anchored and asserted exactly-once so it cannot
+  // silently anchor on a mention in prose. (The older declaration pin at :195
+  // is byte-strict — that one, not this parse, is what reds on such a reflow.)
+  // The parse is the ANCHOR, never the assertion: every check below that uses
+  // it is a numeric or behavioural comparison against the real getters and the
+  // real `heartbeatKillDecision`, and the loop-wiring STRUCTURAL pins live in
+  // E271i, where they are named as source checks rather than dressed up as
+  // behaviour.
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  const declRe =
+    /^[ \t]*const\s+HEARTBEAT_TIMEOUT_MS\s*=\s*Math\.max\(\s*([\d_]+)\s*,\s*Number\(process\.env\.TASK_HEARTBEAT_TIMEOUT_MS\)\s*\|\|\s*([\d_]+)\s*,?\s*\)/gm;
+  const matches = [...src.matchAll(declRe)];
+  equal(matches.length, 1, "VACUITY GUARD: the HEARTBEAT_TIMEOUT_MS declaration must occur exactly once — otherwise the parse could anchor on a mention in prose and stay green");
+  // The EFFECTIVE shipped default is the CLAMPED value, not the raw fallback:
+  // parsing only the `|| N` half would false-RED if the fallback ever dropped
+  // below the 60s floor while the real (clamped) window still satisfied the
+  // invariant.
+  const shippedT = Math.max(
+    Number((matches[0]?.[1] ?? "0").replace(/_/g, "")),
+    Number((matches[0]?.[2] ?? "0").replace(/_/g, "")),
+  );
+  ok(Number.isFinite(shippedT) && shippedT >= 60_000, `the parsed shipped T must clear the 60s clamp floor, got ${shippedT}`);
+
+  withEnv(
+    {
+      TASK_HEARTBEAT_CUT_GAP_MS: undefined,
+      TASK_HEARTBEAT_TIMEOUT_MS: undefined,
+      TASK_HEARTBEAT_INTERVAL_MS: undefined,
+      TASK_LOAD_SCALE_OFF: undefined,
+      TASK_HARD_CAP_MS: undefined,
+      TASK_BACKSTOP_MS: undefined,
+      TASK_TOOL_STALL_MS: undefined,
+    },
+    () => {
+      const gap = getCutGapMs(); // 1x — 37.5s at the shipped 30s interval
+      const storm = getEffectiveCutGapMs(undefined, 1e9); // the 3x band ceiling
+      const windowMs = Math.max(2 * shippedT, 2 * getHeartbeatIntervalMs());
+      // The clause comment above quotes this window ("60 min at defaults") —
+      // pin the VALUE its formula yields at the shipped defaults. The formula
+      // itself is pinned by the loop↔decision coupling block in E271i (below),
+      // so a shape change that happened to preserve this product still reds.
+      equal(windowMs, 3_600_000, "the shipped stateFresh window the cut clause comment quotes (60 min)");
+      ok(gap < storm, "the 1e9-load probe must actually engage the load scale, else the storm check below is vacuous");
+      ok(gap < windowMs, `shipped cut gap ${gap}ms must stay inside the window ${windowMs}ms — at or above it the clause is silently dead`);
+      ok(storm < windowMs, `load-storm cut gap ${storm}ms must still stay inside the window ${windowMs}ms`);
+      // The far-tail ownership claim in the comment ("the 6h hard cap, with the
+      // #271 backstop above it") is a RELATION between three exported bounds —
+      // pin it here rather than trusting three separate constant tests that
+      // never compare them.
+      ok(getTaskHardCapMs() > windowMs, "the hard cap (not the guard) bounds the far tail — it must sit above the window");
+      ok(getTaskBackstopMs() > getTaskHardCapMs(), "on shipped defaults the #271 backstop sits ABOVE the hard cap, so the cap owns the far tail first");
+      // tool-stall is evaluated BEFORE cut: the shipped bound must also clear the
+      // window, or it would pre-empt the clause these probes are about.
+      ok(getToolStallMs() > windowMs, "the shipped tool-stall bound must sit above the window — it is checked before cut and must not pre-empt it");
+
+      const now = 10_000_000;
+      // The SHIPPED lane: the fixture `dinput` defaults (T=60s, tool-stall=1h,
+      // cutGap=1h) are deliberately NOT the shipped defaults, so every field
+      // these probes depend on is threaded from its real source — including
+      // `toolStallMs`, which is checked BEFORE cut and would pre-empt it if it
+      // fell near the in-band age.
+      const shipped = () => ({
+        heartbeatTimeoutMs: shippedT,
+        intervalMs: getHeartbeatIntervalMs(),
+        cutGapMs: gap,
+        toolStallMs: getToolStallMs(),
+      });
+      // `cutClauseState` is the fixture SHARED here and by the #1070 section
+      // (its `mkCutState` wrapper delegates): toolUpdates falsy (so
+      // tool-silence cannot fire), tool age 0, turnActive, tools in flight. The
+      // older cut tests (E271/E271b/E271c) keep their own inline states.
+      const decide = (markerAgeMs: number, cutGapMs = gap) =>
+        heartbeatKillDecision(
+          dinput({ now, lastLifeSignAt: now, state: cutClauseState(markerAgeMs, now), ...shipped(), cutGapMs }),
+        );
+
+      // THE GAP IS THE EFFECTIVE BOUND — probed at the SHIPPED lane's OWN
+      // boundary, not at a fixture age far above it. `gap + 1` cuts; `gap`
+      // (equality, since the clause is `markerAge > cutGapMs`) does not. A
+      // threshold moved in EITHER direction reds, which is what makes "the
+      // gap is the effective bound" an assertion rather than an inference.
+      const justOverGap = decide(gap + 1);
+      equal(justOverGap.kill, true, "one ms past the shipped gap the clause fires on the threshold alone — in-band the guard adds no constraint");
+      equal(justOverGap.reason, "cut");
+      const atGap = decide(gap);
+      equal(atGap.kill, false, "the shipped gap is the boundary: AT the gap (not past it) the clause is silent");
+      equal(atGap.reason, undefined);
+
+      // THE WINDOW BOUNDARY — `stateFresh` is inclusive (`markerAge <= window`),
+      // so the DECISION must still cut AT the window and go silent one ms past
+      // it. This pins the decision's own window against the parsed defaults,
+      // which the re-derived `windowMs` value above does not.
+      const atWindow = decide(windowMs);
+      equal(atWindow.kill, true, "the window boundary is inclusive — at the window the marker is still fresh and the gap still cuts");
+      equal(atWindow.reason, "cut");
+      // FAR TAIL: past the window. `lastLifeSignAt = now` keeps the silence
+      // clause quiet (silenceMs = 0) and `lastMarkerAt > 0` keeps the staleness
+      // attributable to the WINDOW, not to the never-saw-a-marker sentinel —
+      // so no other clause covers this shape and only the guard stands between
+      // it and a `cut`. Delete `stateFresh &&` and this reds: it is the "the
+      // guard must STAY" evidence.
+      const farState = cutClauseState(windowMs + 1, now);
+      ok(farState.lastMarkerAt > 0, "the far-tail probe must go stale via the window, not via the never-saw-a-marker sentinel");
+      const farTail = heartbeatKillDecision(
+        dinput({ now, lastLifeSignAt: now, state: farState, ...shipped() }),
+      );
+      equal(farTail.kill, false, "past the window the clause is silent by construction — the guard must stay");
+      equal(farTail.reason, undefined, "no kill reason in the far tail");
+
+      // THE INERT-OVERRIDE BOUNDARY — the comment claims an operator override
+      // that lifts the effective gap to/above the window makes cut inert
+      // outright. At gap == window the clause can never fire (equality is not
+      // `>`); one ms below the window it still does. This is the boundary where
+      // the clause silently dies, so it is asserted rather than described.
+      const inertAtWindow = decide(windowMs, windowMs);
+      equal(inertAtWindow.kill, false, "gap == window makes the clause structurally inert — markerAge > gap is unsatisfiable inside the fresh window");
+      equal(inertAtWindow.reason, undefined);
+      const aliveJustInside = decide(windowMs, windowMs - 1);
+      equal(aliveJustInside.kill, true, "one ms inside the window the clause is alive again — the inert boundary is exact");
+      equal(aliveJustInside.reason, "cut");
+
+      // THE CLAUSE READS THE MARKER CLOCK. `cutClauseState` zeroes the frozen
+      // ages, so the earlier POSITIVE probes (justOverGap / atWindow /
+      // aliveJustInside, which assert kill === true) already separate the RAW
+      // frozen readings — `0 > cutGapMs` is never true — and only the EFFECTIVE
+      // ages stayed interchangeable with the marker clock (with the frozen ages
+      // at 0, `effStreamAge`/`effToolAge` both equal `markerAge`). This probe
+      // closes that AND re-covers the raw readings in one shot: the marker age is
+      // one ms SHORT of the gap while BOTH frozen ages sit one ms ABOVE it (so
+      // the effective ages are 2·gap). Every reading except the marker clock
+      // cuts; the marker-clock clause does not.
+      const offClock = cutClauseState(gap - 1, now);
+      offClock.streamAgeMs = gap + 1;
+      offClock.toolAgeMaxMs = gap + 1;
+      const markerClockOnly = heartbeatKillDecision(
+        dinput({ now, lastLifeSignAt: now, state: offClock, ...shipped() }),
+      );
+      equal(markerClockOnly.kill, false, "the clause reads the MARKER age — frozen ages one ms ABOVE the gap (and effective ages 2·gap above) with the marker one ms short must not cut");
+      equal(markerClockOnly.reason, undefined);
+    },
+  );
+
+});
+
+test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owner (#1070/#1077)", () => {
+  // The loop's hoisted `freshWindowMs` (which gates the one-shot
+  // `cutInertWarned` warning) and `heartbeatKillDecision`'s inline stateFresh
+  // window are the SAME two inputs today only by wiring. These pins live in
+  // their OWN test — not bolted onto `#1070: loop wiring`, whose name describes
+  // the latch/threading concern — so a failure here reads as a coupling
+  // failure. They are STRUCTURAL by necessity: neither the loop's wiring nor
+  // the hard-cap timer has a unit-level entry point.
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+
+  // (a) `hbThresholds` carries the loop's own two window inputs, and BOTH
+  // decision call sites spread it — field presence and wiring asserted
+  // together, so an inline literal that stopped spreading would red.
+  // `code` is a NAIVE comment-strip (line comments to EOL, then block comments),
+  // used so that a mention of `heartbeatKillDecision(` or of `...hbThresholds`
+  // inside PROSE cannot satisfy a count or a wiring check. It is not
+  // tokenizer-aware — a `//` inside a string literal would truncate that line —
+  // which is fail-CLOSED for every use below: a lost anchor lowers a count or
+  // shortens the call-site split, and both red.
+  const code = src.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  // The literal must be UNIQUE in the RAW source — the same view `indexOf`
+  // anchors on below. Counted on `code`, a bare mention in a comment would pass
+  // the count while `indexOf` anchored on that mention, silently widening the
+  // region. The region's END is cross-checked by the literal's own final field
+  // (a terminator miss cannot end with it) — that check fixes both the last
+  // field AND the indent, so reordering or reindenting the literal is a
+  // deliberate, visible RED.
+  equal(src.split("const hbThresholds = {").length - 1, 1, "the hbThresholds literal must occur exactly ONCE in the raw source, else indexOf may anchor on a mention");
+  const hbStart = src.indexOf("const hbThresholds = {");
+  const hbEnd = src.indexOf("\n    };", hbStart);
+  ok(hbStart > -1 && hbEnd > hbStart, "the hbThresholds literal must be locatable for the coupling pin");
+  const hbBody = src.slice(hbStart, hbEnd);
+  ok(hbBody.trimEnd().endsWith("cutGapMs: getCutGapMs(),"), "the slice must END at the literal's own closing brace");
+  ok(hbBody.includes("heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,"), "hbThresholds threads the loop's own T (INSIDE the literal, value terminated so a scaled value cannot satisfy it)");
+  ok(hbBody.includes("intervalMs: getHeartbeatIntervalMs(),"), "hbThresholds threads the loop's own interval getter (INSIDE the literal, value terminated so a scaled value cannot satisfy it)");
+  // Wiring is pinned PER CALL SITE, not by a file-wide spread count: a decoy
+  // `{ ...hbThresholds }` elsewhere keeps a global count at 2 while a call site
+  // silently drops the loop's own thresholds (that call would then run on
+  // undefined bounds — every clause inert).
+  const callSites = code.split("heartbeatKillDecision({").slice(1);
+  equal(callSites.length, 2, "there must be exactly two decision call sites taking an inline threshold literal");
+  // Walk a site's OWN argument list by bracket depth instead of taking the first
+  // `});` in the slice. For the LAST site the slice runs to EOF, so
+  // `indexOf("});")` would land on any later terminator in the file and the
+  // `includes` checks below would then read a region that is not this call's.
+  // `depth` starts at 0 because the slice begins immediately after the call's own
+  // `({`, so the first closer at depth 0 is that call's `}`.
+  const ownArgsEnd = (body: string): number => {
+    let depth = 0;
+    for (let k = 0; k < body.length; k++) {
+      const c = body[k];
+      if (c === "{" || c === "(" || c === "[") depth++;
+      else if (c === "}" || c === ")" || c === "]") {
+        if (depth === 0) return k;
+        depth--;
+      }
+    }
+    return -1;
+  };
+  callSites.forEach((raw, i) => {
+    const close = ownArgsEnd(raw);
+    ok(close > -1 && raw.slice(close, close + 3) === "});", `decision call site ${i + 1} must be closed by its own }); (first depth-0 closer, then the shape is checked — on a parsable source that closer IS this call's)`);
+    const args = raw.slice(0, close);
+    ok(args.includes("...hbThresholds,"), `decision call site ${i + 1} must spread the loop's own hbThresholds`);
+    const namedKeys = (args.match(/(?:^|[\s,{])\s*["']?([A-Za-z_$][\w$]*)["']?\s*:/g) ?? []).map((k) => k.replace(/["':\s,{]/g, ""));
+    ok(!namedKeys.includes("heartbeatTimeoutMs") && !namedKeys.includes("intervalMs"), `decision call site ${i + 1} must not override the window inputs — a bare, quoted or computed-LITERAL key all reintroduce them (a literal-text key test sees only the first form)`);
+    ok(!/\[\s*["'](heartbeatTimeoutMs|intervalMs)["']\s*\]/.test(args), `decision call site ${i + 1} must not override the window inputs by computed key either`);
+    ok(args.indexOf("...") === args.lastIndexOf("..."), `decision call site ${i + 1} must spread hbThresholds and nothing else — a SECOND spread after it re-introduces the window inputs without naming either one`);
+  });
+  equal((code.match(/heartbeatKillDecision\s*\(/g) ?? []).length, 3, "one declaration + exactly two DIRECT-callee calls; an alias, a parenthesized callee (f)(…), f?.(…) and f.call/apply are NOT claimed — this pins the direct-call count, not every possible invocation");
+
+  // (b) The decision's window expression and the warning. The first is a
+  // single-occurrence check stated as such: it pins the expression COUNT, not
+  // its call site. The warning is pinned as a STATEMENT-LEVEL guard
+  // (line-anchored, so a mention in prose or a dead local cannot satisfy it)
+  // TOGETHER with the latch write and the emission inside it — otherwise "the
+  // loop warns once" would be asserted by nothing.
+  equal(src.split(/markerAge\s*<=\s*Math\.max\(2 \* i\.heartbeatTimeoutMs, 2 \* i\.intervalMs\)/).length - 1, 1, "the decision computes its window from the same two inputs the loop's freshWindowMs uses");
+  equal((src.match(/^[ \t]*if \(!cutInertWarned && effCutGapMs >= freshWindowMs\) \{/gm) ?? []).length, 1, "the unreachability warning is a real statement-level guard on `!cutInertWarned && effCutGapMs >= freshWindowMs` (>=, not >)");
+  equal((src.match(/if \(!cutInertWarned && effCutGapMs >= freshWindowMs\) \{\n\s*cutInertWarned = true;\n\s*console\.error\(/) ?? []).length, 1, "the latch is SET before the emission inside that guard");
+  equal(src.split("cutInertWarned = true").length - 1, 1, "the latch is written exactly ONCE — a second write before the guard would suppress the warning entirely");
+  ok(
+    src.indexOf("let cutInertWarned = false") > src.indexOf("const hbThresholds = {") &&
+      src.indexOf("let cutInertWarned = false") < src.indexOf("const heartbeat = setInterval"),
+    "the latch is declared INSIDE the dispatch (after the per-dispatch thresholds, before the tick callback) — module scope makes it per-PROCESS, a tick-scope declaration re-warns every tick",
+  );
+  equal(src.split("cutInertWarned = false").length - 1, 1, "the latch is initialised exactly ONCE — a per-tick re-arm would reproduce the spam it exists to prevent");
+
+  // (c) The far tail's OWNER must not be freshness-gated. Two checks with
+  // DIFFERENT blind spots are needed — neither is a superset of the other:
+  //   - the exact-CONDITION pin catches a freshness term folded into one of the
+  //     callback's `if (…)` headers, whatever its spelling (a denylist of
+  //     identifiers is a closed family: `clampHeartbeatIntervalMs`,
+  //     `*_INTERVAL_MS`, a local alias … all walk through it), and it catches an
+  //     added `else if (…)` / `if(…)` guard;
+  //   - the freshness-TOKEN check covers the REST of the body, i.e. a gate
+  //     expressed with no `if` header at all (`switch`, a ternary, a `||`
+  //     short-circuit, a helper) — which the condition pin cannot see.
+  // Only the two together pin "this callback is not freshness-gated".
+  // The far-tail region is sliced from the COMMENT-STRIPPED view: a commented-out
+  // guard (`// if (settled) return;`) or a comment naming a denied token must not
+  // satisfy — or falsely trip — a check. Both anchors are exact text with no
+  // comments between them, so the indices agree in either view.
+  const hcStart = code.indexOf("hardCapTimer: NodeJS.Timeout | null = setTimeout(");
+  const hcEnd = code.indexOf("}, getTaskHardCapMs());", hcStart);
+  ok(hcStart > -1 && hcEnd > hcStart, "the hard-cap timer callback must be locatable");
+  const hcBody = code.slice(hcStart, hcEnd);
+  ok(/if\s*\(\s*settled\s*\)\s*return;/.test(hcBody), "the hard-cap callback still short-circuits on `settled`");
+  ok(/if\s*\(\s*!hasOutput\s*\)/.test(hcBody), "the hard-cap callback still branches on `hasOutput`");
+  // Only the parenthesised CONDITION is normalised, so a WHITESPACE-ONLY
+  // reformat (a wrapped condition) stays green, and so does an in-condition
+  // comment — the region is sliced from the comment-stripped view above, so
+  // `if (settled /* c */) return;` reaches here as `if (settled )`. Redundant
+  // parens (`if ((!hasOutput))`) ARE a deliberate RED: the extraction cannot
+  // balance parens. Either way, a change to these two conditions changes the far
+  // tail's owner and must be re-reviewed, not silently accommodated.
+  const hcGuardConds = (hcBody.match(/\bif\s*\(([^)]*)\)/g) ?? []).map((g) => g.slice(g.indexOf("(") + 1, -1).replace(/\s+/g, " ").trim());
+  equal(hcGuardConds.slice().sort().join(" | "), "!hasOutput | settled", "the callback's guards are EXACTLY `settled` and `!hasOutput` — a freshness term folded into one of them is caught whatever its spelling");
+  ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS|heartbeatTimeoutMs|getHeartbeatIntervalMs|clampHeartbeatIntervalMs|HEARTBEAT_INTERVAL_MS|TASK_HEARTBEAT_INTERVAL_MS|DEFAULT_HEARTBEAT|intervalMs|hbThresholds|cutGapMs/.test(hcBody), "…and no freshness expression may appear in the callback OUTSIDE those `if` headers (a `switch`, ternary or `||`-shaped gate) — the condition pin cannot see those. A denylist can never be complete (cycle 6's set was itself narrower than cycle 4's: it had dropped `hbThresholds`, which is what caught a `hbThresholds.heartbeatTimeoutMs` fold); the MARKER-clock family below is pinned POSITIVELY instead, because it cannot be listed here at all");
+  // The marker clock cannot go in the denylist: the callback reads
+  // `hbCtx.state.lastMarkerAt` TWICE on its one report declaration, and the
+  // `markerAgeMs` local six times in the same report. Positive pins instead:
+  equal(hcBody.split("hbCtx.state.lastMarkerAt").length - 1, 2, "the callback reads the marker clock exactly twice — both on the single report declaration. A THIRD read is a freshness gate on the far tail (this is the read a `markerAgeMs`/`lastMarkerAt`-based gate needs)");
+  ok(/const markerAgeMs = [^;]+;\s*doResolve\(composeAbnormalExit\(/.test(hcBody), "the marker-age local flows STRAIGHT into the resolve — nothing (not even a ternary) may sit between them, which is how the far tail would become freshness-gated without adding an `if` header");
+  // The order pin reads the guard with the SAME whitespace-tolerant regex as the
+  // presence check: an exact-literal `indexOf` returned -1 on a reformatted guard
+  // (`if (settled)` newline `return;`) and `-1 < killIdx` then PASSED vacuously,
+  // so one whitespace-only edit silently disarmed the pin.
+  const settledGuardIdx = hcBody.search(/if\s*\(\s*settled\s*\)\s*return;/);
+  ok(settledGuardIdx > -1 && settledGuardIdx < hcBody.indexOf("killTreeAndEscalate()"), "the `settled` short-circuit precedes the tree kill — a settled dispatch's tree must not be killed; the guards' conditions alone do not pin their order");
+
+  // (d) Behavioural side of the same coupling: with the interval term dominating
+  // the max, the decision's window must follow `i.intervalMs` — a T-only window
+  // would classify `2*interval - 1` as stale and return no kill.
+  const cNow = 20_000_000;
+  const cT = 60_000;
+  const cInt = 600_000;
+  const cNear = heartbeatKillDecision(
+    dinput({ now: cNow, lastLifeSignAt: cNow, state: cutClauseState(2 * cInt - 1, cNow), heartbeatTimeoutMs: cT, intervalMs: cInt, cutGapMs: 15_000, toolStallMs: 24 * 3_600_000 }),
+  );
+  equal(cNear.kill, true, "fresh on the INTERVAL side of max(2T, 2*interval) — the clause still fires");
+  equal(cNear.reason, "cut");
+  const cPast = heartbeatKillDecision(
+    dinput({ now: cNow, lastLifeSignAt: cNow, state: cutClauseState(2 * cInt + 1, cNow), heartbeatTimeoutMs: cT, intervalMs: cInt, cutGapMs: 15_000, toolStallMs: 24 * 3_600_000 }),
+  );
+  equal(cPast.kill, false, "beyond the interval side the guard excludes it (the far tail)");
 });
 
 test("E271f: exit taxonomy — null → cut, 0+tools>0 → cut, 0+tools=0 → success, non-zero → failed", () => {
@@ -3998,14 +4530,7 @@ section("#1070 cut-gap load scaling + effective-age reporting");
  * stateFresh window, a tool in flight, and no other clause in play (tool age 0,
  * toolUpdates false, hasOutput true). */
 function mkCutState(markerAgeMs: number, now: number): HeartbeatState {
-  const st = createHeartbeatState();
-  st.everSawWork = true;
-  st.turnActive = true;
-  st.toolsInFlight = 1;
-  st.streamAgeMs = 0;
-  st.toolAgeMaxMs = 0;
-  st.lastMarkerAt = now - markerAgeMs;
-  return st;
+  return cutClauseState(markerAgeMs, now);
 }
 
 test("#1070 getEffectiveCutGapMs — load-scaled in the loadScaledBound bands, monotonic per dispatch", () => {
@@ -5588,8 +6113,11 @@ test("#1071: the target cwd is wired through spawn + repo probe + ledger row (so
 
 test("#1071: the task tool schema exposes `cwd` and threads it to every leg (source pin)", () => {
   ok(/cwd: Type\.Optional\(\s*Type\.String\(/.test(source), "schema exposes an optional cwd");
-  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd)"), "primary + failover-hop legs pass params.cwd");
-  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd)"), "the provider-fallback leg passes params.cwd");
+  // #1030 appended the dispatch's inactivity bound as the 8th argument, so
+  // these pins name the whole argument list (that is their point: the leg
+  // carries the target cwd — and now the bound resolved for the same dispatch).
+  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "primary + failover-hop legs pass params.cwd");
+  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "the provider-fallback leg passes params.cwd");
   ok(!/\{\s*\n\s*cwd: process\.cwd\(\),/.test(source), "no spawn options block pins the parent cwd (scoped to the block — a whole-file negative match is over-broad and its failure message cannot name a real spawn site)");
 });
 
