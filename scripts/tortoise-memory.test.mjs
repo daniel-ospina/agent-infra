@@ -828,6 +828,25 @@ test("usage: a --points-json that is not an array is a usage error, never a stor
   }
 });
 
+test("usage: an EMPTY --points-json array is a usage error, never a green no-op write", async () => {
+  // CYCLE-4 (P1). `write-points ... --points-json '[]'` never entered `for (const
+  // p of points)`, so `out({status:"ok",written:0})` fired even with NO key and
+  // an unreachable host — a green "I wrote nothing" that touched no store.
+  // Synthetic positive AND negative, so the guard cannot depend on the corpus:
+  // every empty spelling is EXIT_USAGE with no payload, and a one-point array
+  // is the positive control that still parses.
+  for (const bad of ["[]", "[] ", " []"]) {
+    const r = await run(["write-points", "--kind", "statement", "--points-json", bad], { TORTOISE_API_KEY: "tt_test" });
+    assert.equal(r.code, EXIT_USAGE, `--points-json ${JSON.stringify(bad)} must be a usage error (stderr: ${r.stderr})`);
+    assert.match(r.stderr, /--points-json must be a non-empty JSON array/);
+    assert.equal(r.payload, null, `--points-json ${JSON.stringify(bad)} must not emit a payload, got: ${r.stdout}`);
+  }
+  assert.deepEqual(parseArgs("write-points", ["--kind", "statement", "--points-json", '[{"content":"c"}]']), {
+    "--kind": "statement",
+    "--points-json": [{ content: "c" }],
+  });
+});
+
 test("usage: a non-numeric --limit is a usage error, never a store state", async () => {
   // Against a HEALTHY stub: unvalidated, `Number("abc")` is NaN; the request
   // still succeeded, so the run reported `ok` exit 0 — a bad invocation dressed
@@ -880,7 +899,7 @@ test("usage: a --points-json element that is not `{content: <non-empty string>}`
     ["[[]]", /--points-json\[0\] must be a non-null object/],
     ["[\"str\"]", /--points-json\[0\] must be a non-null object/],
     ["[{}]", /--points-json\[0\] must be a non-null object with a non-empty string content/],
-    ['[{"content":""}]', /--points-json\[0\] must be a non-null object with a non-empty string content/],
+    ['[{"content":""}]', /--points-json\[0\]\.content requires a non-empty value/],
     ['[{"content":123}]', /--points-json\[0\] must be a non-null object with a non-empty string content/],
     ['[{"content":"ok"},null]', /--points-json\[1\] must be a non-null object/],
   ]) {
@@ -934,11 +953,13 @@ test("usage: a VALUE-LESS flag is a usage error, never the string \"undefined\""
 });
 
 test("usage: an out-of-range or non-numeric --limit is a usage error, never a healthy read", async () => {
-  // CYCLE-3: `--limit 0` used to be accepted and sent. `--limit` is a
-  // `positiveInteger`, so the client says so LOCALLY, before the call.
+  // CYCLE-3: `--limit 0` used to be accepted and sent. CYCLE-4: `/v1/search`
+  // requires 1..100, so `--limit 5000` passed local validation, the API 422'd,
+  // and the data subcommand exited 0 with `{error:"request_rejected"}` — a bad
+  // invocation indistinguishable from a clean skip. The cap is a LOCAL type rule.
   const { server, url } = await emptyStoreStub();
   try {
-    for (const bad of ["0", "-3", "2.5", "abc"]) {
+    for (const bad of ["0", "-3", "2.5", "abc", "101", "5000"]) {
       const r = await run(["search", "--query", "x", "--limit", bad], {
         TORTOISE_API_KEY: "tt_test",
         TORTOISE_BASE_URL: url,
@@ -947,13 +968,15 @@ test("usage: an out-of-range or non-numeric --limit is a usage error, never a he
       assert.match(r.stderr, /--limit must be a positive integer/);
       assert.equal(r.payload, null, `--limit ${bad} must not emit a payload, got: ${r.stdout}`);
     }
-    // ...and a valid limit still reaches the API and is ok.
-    const ok = await run(["search", "--query", "x", "--limit", "5"], {
-      TORTOISE_API_KEY: "tt_test",
-      TORTOISE_BASE_URL: url,
-    });
-    assert.equal(ok.code, EXIT_OK, `stderr: ${ok.stderr}`);
-    assert.equal(ok.payload.status, STATUS_OK);
+    // ...and valid limits reach the API and are ok — including the 100 boundary.
+    for (const good of ["5", "100"]) {
+      const ok = await run(["search", "--query", "x", "--limit", good], {
+        TORTOISE_API_KEY: "tt_test",
+        TORTOISE_BASE_URL: url,
+      });
+      assert.equal(ok.code, EXIT_OK, `stderr: ${ok.stderr}`);
+      assert.equal(ok.payload.status, STATUS_OK);
+    }
   } finally {
     server.close();
   }
@@ -980,13 +1003,52 @@ test("usage: a BLANK --confidence is rejected, not silently coerced to 0", async
   }
 });
 
+test("usage: a WHITESPACE-ONLY string argument is a usage error, class-wide", async () => {
+  // CYCLE-4. `string` rejected only `length === 0`, so `write-claim --content
+  // '   '` wrote a blank Point and reported `ok`; the nested `--points-json`
+  // `content` had the same hole. The SAME `string` entry is exercised for the
+  // flag AND for the nested element, so the two cannot drift. Synthetic
+  // positive control: a string with real content still parses unchanged.
+  for (const blank of ["   ", "\t", "\n", " \t "]) {
+    const flag = await run(["write-claim", "--content", blank], { TORTOISE_API_KEY: "tt_test" });
+    assert.equal(flag.code, EXIT_USAGE, `--content ${JSON.stringify(blank)} must be a usage error (stderr: ${flag.stderr})`);
+    assert.match(flag.stderr, /--content requires a non-empty value/);
+    assert.equal(flag.payload, null, `got: ${flag.stdout}`);
+
+    const nested = await run(
+      ["write-points", "--kind", "statement", "--points-json", JSON.stringify([{ content: blank }])],
+      { TORTOISE_API_KEY: "tt_test" },
+    );
+    assert.equal(nested.code, EXIT_USAGE, `nested content ${JSON.stringify(blank)} must be a usage error`);
+    assert.match(nested.stderr, /--points-json\[0\]\.content requires a non-empty value/);
+    assert.equal(nested.payload, null, `got: ${nested.stdout}`);
+
+    const authored = await run(
+      ["write-points", "--kind", "statement", "--points-json", JSON.stringify([{ content: "c", authoredBy: blank }])],
+      { TORTOISE_API_KEY: "tt_test" },
+    );
+    assert.equal(authored.code, EXIT_USAGE, `authoredBy ${JSON.stringify(blank)} must be a usage error`);
+    assert.match(authored.stderr, /--points-json\[0\]\.authoredBy requires a non-empty value/);
+    assert.equal(authored.payload, null, `got: ${authored.stdout}`);
+  }
+  assert.equal(parseArgs("write-claim", ["--content", "  real  "])["--content"], "  real  ");
+});
+
 test("usage: a --points-json element carries the SAME types as the flag of the same name", async () => {
   // The table validated the top-level `--confidence`/`--authored-by` but not the
   // identical value nested in `--points-json`: `confidence: "abc"` was sent as
-  // `null`, and `authoredBy: 5` sailed through.
+  // `null`, `authoredBy: 5` sailed through, and (CYCLE-4) a JSON NATIVE coerced
+  // silently — `confidence: true` -> 1, `[]` -> 0, `[0.5]` -> 0.5 — while the
+  // flag form rejected the same shape. Synthetic negative set below; the
+  // positive control proves a numeric STRING normalizes through the SAME entry
+  // the flag uses (so the two cannot drift).
   for (const [bad, re] of [
     ['[{"content":"c","confidence":"abc"}]', /--points-json\[0\]\.confidence must be a number/],
     ['[{"content":"c","confidence":""}]', /--points-json\[0\]\.confidence must be a number/],
+    ['[{"content":"c","confidence":true}]', /--points-json\[0\]\.confidence must be a number/],
+    ['[{"content":"c","confidence":false}]', /--points-json\[0\]\.confidence must be a number/],
+    ['[{"content":"c","confidence":[]}]', /--points-json\[0\]\.confidence must be a number/],
+    ['[{"content":"c","confidence":[0.5]}]', /--points-json\[0\]\.confidence must be a number/],
     ['[{"content":"c","authoredBy":""}]', /--points-json\[0\]\.authoredBy requires a non-empty value/],
     ['[{"content":"c","authoredBy":5}]', /--points-json\[0\]\.authoredBy requires a non-empty value/],
   ]) {
@@ -997,6 +1059,21 @@ test("usage: a --points-json element carries the SAME types as the flag of the s
     assert.match(r.stderr, re);
     assert.equal(r.payload, null, `got: ${r.stdout}`);
   }
+  // Positive control: the nested `confidence` goes through the SAME `number`
+  // entry as the flag, so the numeric string is normalized exactly once and the
+  // normalized value (a number, not the raw string) is what the parser returns.
+  assert.deepEqual(
+    parseArgs("write-points", [
+      "--kind",
+      "statement",
+      "--points-json",
+      '[{"content":"c","confidence":"0.5","authoredBy":"research-skill"}]',
+    ]),
+    {
+      "--kind": "statement",
+      "--points-json": [{ content: "c", confidence: 0.5, authoredBy: "research-skill" }],
+    },
+  );
 });
 
 test("a value that STARTS WITH `--` is a value, not a missing one", async () => {
@@ -1229,8 +1306,15 @@ function readSkill(name) {
  * Factored out (rather than inlined into the scan below) so a synthetic sample
  * can pin the SCOPING itself; the shipped skills are clean, so a reverted scope
  * would otherwise stay green.
+ *
+ * The `ok` alternative matches the QUOTED status token (escaped or plain),
+ * NOT the bare English word: a `\bok\b` flagged a legitimate escaped JSON
+ * example such as `` `{\"ok\":true}` `` (the word "ok" as a KEY). The
+ * negative lookahead `(?!\s*:)` keeps a quoted `ok` that is a JSON key out,
+ * while a quoted `ok` VALUE — the status the client actually emits — still
+ * matches in both its plain (`` `"ok"` ``) and escaped (`` `\"ok\"` ``) forms.
  */
-const STATUS_SPAN_TOKEN = /status|not_configured|tortoise_unavailable|\bok\b/;
+const STATUS_SPAN_TOKEN = /status|not_configured|tortoise_unavailable|\\?"ok\\?"(?!\s*:)/;
 function backslashEscapedStatusSpans(src) {
   return (src.match(/`[^`\n]*`/g) || []).filter(
     (span) => span.includes('\\"') && STATUS_SPAN_TOKEN.test(span),
@@ -1244,13 +1328,14 @@ function backslashEscapedStatusSpans(src) {
  * so DROPPING the `i` flag would keep the scan above green while prose such as
  * `(skip if Tortoise unavailable)` ships.
  *
- * The separator is `[ \t]+` — SPACE/TAB ONLY, which is what keeps the canonical
- * `tortoise_unavailable` safe: the token contains no space, so it can never
- * match. A `.` class WOULD match that `_` (a false positive on every correct
- * skill), and `\s` would additionally treat a line break between the two words
- * as the retired phrase. The samples below pin both directions.
+ * The separator is `[\s-]+` — whitespace OR a hyphen, so a WRAPPED or
+ * HYPHENATED reintroduction (`"Tortoise is\nunavailable"`,
+ * `"tortoise-unavailable"`) is caught. It still cannot match the canonical
+ * `tortoise_unavailable`: `_` is neither whitespace nor a hyphen, so the token
+ * has no separator and never matches (a `.` class WOULD match that `_`, a false
+ * positive on every correct skill). The samples below pin both directions.
  */
-const RETIRED_PHRASE = /\btortoise[ \t]+(is[ \t]+)?unavailable\b/i;
+const RETIRED_PHRASE = /\btortoise[\s-]+(is[\s-]+)?unavailable\b/i;
 
 test("every memory skill names BOTH canonical states, never the retired 'tortoise unavailable'", () => {
   for (const name of MEMORY_SKILLS) {
@@ -1275,6 +1360,12 @@ test("the retired-phrase probe is case-insensitive and never matches the canonic
     "Tortoise is unavailable",
     "TORTOISE\tIS\tUNAVAILABLE",
     "the store is tortoise  is unavailable",
+    // CYCLE-4: a WRAPPED or HYPHENATED reintroduction is still the retired
+    // phrase — the old `[ \t]+` (and its must-NOT-match pin) let it ship.
+    "tortoise\nunavailable",
+    "Tortoise is\nunavailable",
+    "tortoise-unavailable",
+    "Tortoise-is-unavailable",
   ]) {
     assert.match(sample, RETIRED_PHRASE, `${JSON.stringify(sample)} must be flagged`);
   }
@@ -1285,8 +1376,7 @@ test("the retired-phrase probe is case-insensitive and never matches the canonic
     "status: `tortoise_unavailable`",
     "tortoise_unavailable is the outage word",
     "tortoiselike unavailable",
-    // `[ \t]` — a line break between the words is NOT the retired phrase shape.
-    "tortoise\nunavailable",
+    "tortoise_unavailable",
   ]) {
     assert.doesNotMatch(sample, RETIRED_PHRASE, `${JSON.stringify(sample)} must NOT be flagged`);
   }
@@ -1311,6 +1401,11 @@ test("the status-span detector catches an escaped span with NO literal `status:`
   assert.deepEqual(backslashEscapedStatusSpans('a `\\"not_configured\\"` b'), ['`\\"not_configured\\"`']);
   assert.deepEqual(backslashEscapedStatusSpans('a `\\"tortoise_unavailable\\"` b'), ['`\\"tortoise_unavailable\\"`']);
   assert.deepEqual(backslashEscapedStatusSpans('a `\\"ok\\"` b'), ['`\\"ok\\"`']);
+  // CYCLE-4 (`ok` scoping): an unescaped quoted `ok` VALUE in a span that also
+  // carries an escaped quote is a status span; a quoted `ok` used as a JSON KEY
+  // (followed by `:`) is NOT.
+  assert.deepEqual(backslashEscapedStatusSpans('a `"ok" \\"x\\"` b'), ['`"ok" \\"x\\"`']);
+  assert.deepEqual(backslashEscapedStatusSpans('a `{\\"ok\\":true}` b'), []);
   // ...and the corpus's own escape-sequence documentation is NOT a status span.
   assert.deepEqual(backslashEscapedStatusSpans('replace `"` with `\\"` before interpolation'), []);
 });

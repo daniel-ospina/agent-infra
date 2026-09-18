@@ -55,10 +55,16 @@
  * (agent-infra#1182 scope), so a rejected request never hard-fails a skill but is
  * still visible. A 5xx stays `tortoise_unavailable`: the service answered, failing.
  * Arguments are validated from ONE table (`ARG_TYPES` / `COMMANDS`) BEFORE any
- * network call: an unknown flag, a missing value, a wrong type, or a
- * `--points-json` element that is not a non-null `{content: <non-empty string>}`
- * exits EXIT_USAGE with no `status` field — a usage error must never wear a
- * store-state word.
+ * network call: an unknown flag, a missing value, a wrong type, a
+ * whitespace-only string, a `--limit` outside 1..100, or a `--points-json`
+ * element that is not a non-null `{content: <non-empty string>}` exits
+ * EXIT_USAGE with no `status` field — a usage error must never wear a
+ * store-state word. An EMPTY `--points-json` array is a usage error too: it
+ * writes nothing, so it must never report `{status:"ok",written:0}`. A nested
+ * element is validated through the SAME `ARG_TYPES` entry as the flag of the
+ * same name (and normalized there), so the two forms cannot drift — a JSON
+ * native such as `confidence: true` is rejected exactly as `--confidence true`
+ * is, and the body builder never re-coerces a value with a parallel `Number()`.
  * The `status` PROBE exits 0 (ok) / 3 (can't reach) / 4 (not set up), keeping 2
  * for usage errors; it is the surface a human or an agent harness checks.
  * DATA subcommands (query/search/write) keep the skip-cleanly contract
@@ -332,16 +338,27 @@ export function assertTeamPayload(res, path) {
 //   · `write-points` with no `--kind` → the literal string "undefined" was sent;
 //   · a value-less flag (`query-visions --point-kind`) → "undefined" was sent.
 const ARG_TYPES = {
-  /** A non-empty string. */
+  /** A non-empty string. The check is on `raw.trim()`: `write-claim --content
+   * '   '` used to write a blank Point and report `ok`, because `length === 0`
+   * did not fire on a whitespace-only value. Class-wide — every string the table
+   * validates, top-level OR nested, goes through THIS entry. */
   string(flag, raw) {
-    if (typeof raw !== "string" || raw.length === 0) {
+    if (typeof raw !== "string" || raw.trim() === "") {
       throw new UsageError(`${flag} requires a non-empty value`);
     }
     return raw;
   },
-  /** Any finite number (`--confidence`). A BLANK raw is rejected, not coerced:
-   * `Number("")` is 0, so an empty value used to become a real number. */
+  /** A finite number (`--confidence`). A BLANK raw is rejected, not coerced:
+   * `Number("")` is 0, so an empty value used to become a real number. The
+   * NATIVE type is checked too: a JSON native such as `true` (`Number(true)`
+   * is 1), `[]` (`0`) or `[0.5]` (`0.5`) used to coerce SILENTLY, while the
+   * string flag form rejected the same shape — a nested element and its flag
+   * must accept exactly the same set. A flag always arrives as a string; only
+   * a nested JSON number may arrive as a number. */
   number(flag, raw) {
+    if (typeof raw !== "number" && typeof raw !== "string") {
+      throw new UsageError(`${flag} must be a number (got: ${JSON.stringify(raw)})`);
+    }
     const blank = typeof raw === "string" && raw.trim() === "";
     const n = Number(raw);
     if (blank || !Number.isFinite(n)) {
@@ -349,16 +366,31 @@ const ARG_TYPES = {
     }
     return n;
   },
-  /** A whole number ≥ 1 (`--limit 0` used to be accepted and sent). */
-  positiveInteger(flag, raw) {
-    const n = Number(raw);
-    if (!Number.isInteger(n) || n < 1) {
+  /** A whole number ≥ 1 (`--limit 0` used to be accepted and sent), and no
+   * greater than `max` when the table row sets one — `/v1/search` requires
+   * 1..100, so `--limit 5000` passed local validation and then 422'd, which a
+   * data subcommand reported as a clean skip (`{error:"request_rejected"}`,
+   * exit 0) — a bad invocation indistinguishable from "nothing to do". */
+  positiveInteger(flag, raw, max) {
+    if (typeof raw !== "number" && typeof raw !== "string") {
       throw new UsageError(`${flag} must be a positive integer (got: ${JSON.stringify(raw)})`);
+    }
+    const n = Number(raw);
+    const bound = max === undefined ? "" : ` no greater than ${max}`;
+    if (!Number.isInteger(n) || n < 1 || (max !== undefined && n > max)) {
+      throw new UsageError(
+        `${flag} must be a positive integer${bound} (got: ${JSON.stringify(raw)})`,
+      );
     }
     return n;
   },
-  /** A JSON array of non-null objects with a non-empty string `content` and,
-   * when present, a non-empty string `authoredBy` / finite `confidence`. */
+  /** A non-empty JSON array of non-null objects with a non-empty string
+   * `content` and, when present, a non-empty string `authoredBy` / finite
+   * `confidence`. Every element is validated through the SAME `ARG_TYPES` entry
+   * as the flag of the same name, and the NORMALIZED values are returned — so
+   * the body builder cannot re-coerce them with a parallel `Number(...)`.
+   * An EMPTY array is a USAGE error: the old loop never ran and the client still
+   * reported `{status:"ok",written:0}` with no key and no reachable store. */
   pointsJson(flag, raw) {
     let parsed;
     try {
@@ -367,29 +399,30 @@ const ARG_TYPES = {
       throw new UsageError(`${flag} must be valid JSON`);
     }
     if (!Array.isArray(parsed)) throw new UsageError(`${flag} must be a JSON array`);
-    parsed.forEach((p, i) => {
-      if (
-        p === null ||
-        typeof p !== "object" ||
-        Array.isArray(p) ||
-        typeof p.content !== "string" ||
-        p.content.length === 0
-      ) {
+    if (parsed.length === 0) {
+      throw new UsageError(`${flag} must be a non-empty JSON array`);
+    }
+    return parsed.map((p, i) => {
+      if (p === null || typeof p !== "object" || Array.isArray(p) || typeof p.content !== "string") {
         throw new UsageError(
           `${flag}[${i}] must be a non-null object with a non-empty string content`,
         );
       }
-      // The SAME element-level types as the flags of the same name: a nested
+      // The SAME element-level entries as the flags of the same name: a nested
       // value must not reach the network in a shape the flag form rejects
-      // (`confidence: "abc"` used to be sent as `null`).
-      if (p.authoredBy !== undefined && p.authoredBy !== null) {
-        ARG_TYPES.string(`${flag}[${i}].authoredBy`, p.authoredBy);
+      // (`confidence: "abc"` used to be sent as `null`, `confidence: true` as
+      // `1`). The NORMALIZED result is what the caller sends.
+      const point = { content: ARG_TYPES.string(`${flag}[${i}].content`, p.content) };
+      if (p.authoredBy !== undefined) {
+        point.authoredBy =
+          p.authoredBy === null ? null : ARG_TYPES.string(`${flag}[${i}].authoredBy`, p.authoredBy);
       }
-      if (p.confidence !== undefined && p.confidence !== null) {
-        ARG_TYPES.number(`${flag}[${i}].confidence`, p.confidence);
+      if (p.confidence !== undefined) {
+        point.confidence =
+          p.confidence === null ? null : ARG_TYPES.number(`${flag}[${i}].confidence`, p.confidence);
       }
+      return point;
     });
-    return parsed;
   },
 };
 
@@ -406,7 +439,8 @@ const COMMANDS = {
   "query-visions": { "--point-kind": { type: "string", default: "vision" } },
   search: {
     "--query": { type: "string", required: true },
-    "--limit": { type: "positiveInteger", default: "10" },
+    // `/v1/search` requires 1..100; the cap is part of the flag's own type rule.
+    "--limit": { type: "positiveInteger", default: "10", max: 100 },
   },
   "write-points": {
     "--kind": { type: "string", required: true },
@@ -461,10 +495,10 @@ export function parseArgs(cmd, args) {
   for (const [flag, row] of Object.entries(spec)) {
     if (Object.prototype.hasOwnProperty.call(raw, flag)) continue;
     if (row.required) throw new UsageError(`${flag} required`);
-    if (row.default !== undefined) values[flag] = ARG_TYPES[row.type](flag, row.default);
+    if (row.default !== undefined) values[flag] = ARG_TYPES[row.type](flag, row.default, row.max);
   }
   for (const [flag, value] of Object.entries(raw)) {
-    values[flag] = ARG_TYPES[spec[flag].type](flag, value);
+    values[flag] = ARG_TYPES[spec[flag].type](flag, value, spec[flag].max);
   }
   return values;
 }
@@ -578,9 +612,12 @@ Mock: TORTOISE_MOCK=1`);
         if (mocked) return mockCall("write-points", { kind, points });
         const results = [];
         for (const p of points) {
+          // `p.authoredBy` / `p.confidence` are already NORMALIZED by the
+          // table (the same entry the flags use), so there is no parallel
+          // `Number(...)` re-coercion at the wire.
           const body = { kind, content: p.content };
           if (p.authoredBy) body.authoredBy = p.authoredBy;
-          if (p.confidence != null) body.confidence = Number(p.confidence);
+          if (p.confidence != null) body.confidence = p.confidence;
           results.push(
             assertWritePayload(await api("/v1/points", { method: "POST", body }), "/v1/points"),
           );
