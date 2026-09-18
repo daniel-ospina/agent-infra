@@ -404,12 +404,13 @@ def decide(
     #
     # Concretely, with the default 1.5, THE RATE CONDITION for exemption is
     # `pr_rate <= mr.rate * 1.5` — and note that this is the NECESSARY rate test, not the whole
-    # rule: three earlier conjuncts BLOCK first (the id must be present in `main_rates`, the
-    # signatures must overlap, and `mr.runs >= min_runs`). A PR failing every run has
-    # `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — ONCE MAIN IS ABOUT TWO-THIRDS BROKEN (~0.667)
-    # — the rate test no longer stops it, and it is EXEMPTED provided those other conjuncts hold.
-    # Past that point the gate reads a total, deterministic failure as "no worse than main", and
-    # the more broken main gets, the wider this door opens.
+    # rule: FIVE earlier gates BLOCK first and are checked in order ahead of it — an empty PR
+    # sample, a rotating/UNATTRIBUTABLE identity, an id absent from `main_rates`, non-overlapping
+    # signatures, and `mr.runs < min_runs`. Only if all five pass does the rate test decide.
+    # A PR failing every run has `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — ONCE MAIN IS
+    # ABOUT TWO-THIRDS BROKEN (~0.667) — the rate test no longer stops it, and it is EXEMPTED
+    # provided those earlier gates held. Past that point the gate reads a total, deterministic
+    # failure as "no worse than main", and the more broken main gets, the wider this door opens.
     #
     # Note the asymmetry, which is why this is a fail-open and not a tuning complaint: the input
     # on the PR side is a TOTAL failure (every run failed) while the input on the main side is a
