@@ -289,6 +289,11 @@ test("probe: /v1/team requires the WHOLE OrgInfoResponse shape, not just a numer
     { point_count: 0, org_id: "org_test" },
     { point_count: 0, org_id: "", tier: "free" },
     { point_count: 0, org_id: "org_test", tier: "" },
+    // The `typeof point_count === "number"` clause needs a negative that is
+    // otherwise a VALID OrgInfoResponse: without it every body above fails on
+    // `org_id`/`tier` anyway, so replacing the clause with `true` stayed green.
+    { org_id: "org_test", tier: "free" },
+    { point_count: "0", org_id: "org_test", tier: "free" },
   ];
   for (const body of bodies) {
     const { server, url } = await startStub((req, res) => {
@@ -338,19 +343,31 @@ test("probe: a host that accepts TCP and never answers is tortoise_unavailable, 
 });
 
 test("probe: NEVER CONFIGURED is not_configured (exit 4) — not tortoise_unavailable", async () => {
-  const r = await run(["status"], {});
+  // The inert host makes the LOCAL set-up guard the ONLY possible source of
+  // `not_configured`: with the guard deleted this run reaches a dead host and
+  // degrades to `tortoise_unavailable` (exit 3), so the exit-code assertion
+  // below is RED. Pointing at the live API let a real 401 masquerade as the
+  // guard's verdict, because a 401 also maps to `not_configured`.
+  const r = await run(["status"], { TORTOISE_BASE_URL: "http://127.0.0.1:1" });
   assert.equal(r.code, EXIT_NOT_CONFIGURED, `stderr: ${r.stderr}`);
   assert.equal(r.payload.status, STATUS_NOT_CONFIGURED);
   assert.equal(r.payload.error, STATUS_NOT_CONFIGURED);
+  // Name the LOCAL reason — not a server response ("REFUSED ... HTTP 401").
+  assert.match(r.payload.message, /TORTOISE_API_KEY not set/);
   // The setup gap must not be blamed on the service.
   assert.notEqual(r.payload.status, STATUS_UNAVAILABLE);
 });
 
 test("probe: the resolved default base URL is reported when no override is set", async () => {
   // No network is required to see the resolved URL: a never-configured run still
-  // reports the address the client would use.
+  // reports the address the client would use. This is the one never-configured
+  // case that CANNOT carry an inert `TORTOISE_BASE_URL` — that would stop it
+  // testing the default — so it pins the LOCAL guard by its message instead: a
+  // live-API 401 reads "REFUSED the request", so the assertion below is RED
+  // without the guard even though the base_url assertion would still pass.
   const r = await run(["status"], {});
   assert.equal(r.payload.base_url, API_HOST);
+  assert.match(r.payload.message, /TORTOISE_API_KEY not set/);
 });
 
 // ── the three states are pairwise distinct at the probe boundary ────────────
@@ -360,7 +377,11 @@ test("probe: empty / unreachable / never-configured are three distinct outcomes"
   try {
     const empty = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
     const down = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: "http://127.0.0.1:1" });
-    const never = await run(["status"], {});
+    // Inert host for the never-configured leg too: without the LOCAL guard it
+    // would resolve to `tortoise_unavailable` and stop being distinct from
+    // `down`, so the pairwise assertions below guard the guard.
+    const never = await run(["status"], { TORTOISE_BASE_URL: "http://127.0.0.1:1" });
+    assert.match(never.payload.message, /TORTOISE_API_KEY not set/);
     assert.notEqual(empty.code, down.code);
     assert.notEqual(empty.code, never.code);
     assert.notEqual(down.code, never.code);
@@ -434,9 +455,12 @@ test("data read: a JSON 200 that is not a list envelope degrades to tortoise_una
 });
 
 test("data read: never-configured reports not_configured but still skips cleanly", async () => {
-  const r = await run(["search", "--query", "anything"], {});
+  // Inert host so only the LOCAL guard can produce `not_configured`; a deleted
+  // guard would reach the dead host and report `tortoise_unavailable`.
+  const r = await run(["search", "--query", "anything"], { TORTOISE_BASE_URL: "http://127.0.0.1:1" });
   assert.equal(r.code, EXIT_OK); // skip-cleanly is preserved (agent-infra#1182)
   assert.equal(r.payload.status, STATUS_NOT_CONFIGURED);
+  assert.match(r.payload.message, /TORTOISE_API_KEY not set/);
 });
 
 test("data read: unreachable reports tortoise_unavailable but still skips cleanly", async () => {
@@ -644,6 +668,77 @@ test("write: a created Point (a non-empty string id) reports ok with the id", as
     assert.equal(claim.payload.status, STATUS_OK, `stderr: ${claim.stderr}`);
     assert.equal(claim.payload.id, "pt_created");
     assert.equal(claim.payload.written, true);
+  } finally {
+    server.close();
+  }
+});
+
+test("write: the client sends authoredBy and confidence in the /v1/points body (server drops them today — tortoise#4032)", async () => {
+  // The hosted API's `PointCreateBody` declares neither `authoredBy` nor
+  // `confidence`, and the route forwards neither, so both are dropped
+  // SERVER-SIDE today. That is a server-side question tracked in tortoise#4032,
+  // NOT a license for this client to silently stop sending them: deleting
+  // either assignment used to leave the whole suite green. This test pins the
+  // EXACT body the client actually puts on the wire — the CLIENT's request, not
+  // the server's persistence — so neither assignment can be removed or drift
+  // unnoticed while #4032 is open. (Do not "fix" this by dropping the fields
+  // here; that decision belongs to #4032.)
+  const seen = [];
+  const { server, url } = await startStub((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      seen.push({
+        method: req.method,
+        path: req.url,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      });
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ id: `pt_${seen.length}`, content: "c", kind: "statement" }));
+    });
+  });
+  try {
+    const claim = await run(
+      [
+        "write-claim",
+        "--content",
+        "c",
+        "--kind",
+        "statement",
+        "--authored-by",
+        "research-skill",
+        "--confidence",
+        "0.5",
+      ],
+      { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url },
+    );
+    assert.equal(claim.code, EXIT_OK, `stderr: ${claim.stderr}`);
+    assert.equal(claim.payload.status, STATUS_OK, `stderr: ${claim.stderr}`);
+
+    const points = await run(
+      [
+        "write-points",
+        "--kind",
+        "statement",
+        "--points-json",
+        '[{"content":"a","authoredBy":"research-skill","confidence":0.5}]',
+      ],
+      { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url },
+    );
+    assert.equal(points.code, EXIT_OK, `stderr: ${points.stderr}`);
+    assert.equal(points.payload.status, STATUS_OK, `stderr: ${points.stderr}`);
+
+    assert.equal(seen.length, 2, `expected one POST per write, got ${seen.length}`);
+    for (const { method, path, body } of seen) {
+      assert.equal(method, "POST");
+      assert.equal(path, "/v1/points");
+      // EXACT keys: a deleted assignment changes this SET, not just a value.
+      assert.deepEqual(Object.keys(body).sort(), ["authoredBy", "confidence", "content", "kind"]);
+      assert.equal(body.authoredBy, "research-skill");
+      assert.equal(body.confidence, 0.5);
+    }
+    assert.equal(seen[0].body.content, "c");
+    assert.equal(seen[1].body.content, "a");
   } finally {
     server.close();
   }
@@ -1101,9 +1196,12 @@ test("data write: NEVER CONFIGURED still skips cleanly (exit 0) for the WRITE su
     ["write-claim", "--content", "c"],
     ["write-points", "--kind", "statement", "--points-json", '[{"content":"c"}]'],
   ]) {
-    const r = await run(args, {});
+    // Inert host so only the LOCAL guard can produce `not_configured`; a
+    // deleted guard would reach the dead host and report `tortoise_unavailable`.
+    const r = await run(args, { TORTOISE_BASE_URL: "http://127.0.0.1:1" });
     assert.equal(r.code, EXIT_OK, `${args[0]} must still skip cleanly (stderr: ${r.stderr})`);
     assert.equal(r.payload.status, STATUS_NOT_CONFIGURED, args[0]);
+    assert.match(r.payload.message, /TORTOISE_API_KEY not set/);
   }
 });
 
