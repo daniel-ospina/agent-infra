@@ -369,7 +369,7 @@ node scripts/tortoise-memory.mjs write-claim \
 | Low (1 source) | 0.3 | hypothesis |
 | Speculative | 0.1 | hypothesis |
 
-**Graceful degradation:** If `tortoise unavailable` → skip. Log note: "Memory system offline — claims not persisted to epistemic graph."
+**Graceful degradation:** If `status` is `not_configured` (no `TORTOISE_API_KEY` on this machine — memory was never set up here, which is **not** an outage) or `tortoise_unavailable` (a key is set but the API was unreachable — the store is down or the address is wrong, the state worth surfacing) → skip this step. Log note: "Memory not available — claims not persisted to epistemic graph."
 
 ### Step 5.5 — Research Verifier (CPI-5: fresh-session review)
 

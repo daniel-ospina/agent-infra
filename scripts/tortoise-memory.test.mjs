@@ -26,6 +26,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -35,6 +36,7 @@ import { promisify } from "node:util";
 import {
   probeExitCode,
   resolveBaseUrl,
+  resolveTimeoutMs,
   STATUS_NOT_CONFIGURED,
   STATUS_OK,
   STATUS_UNAVAILABLE,
@@ -77,14 +79,45 @@ function emptyStoreStub() {
 }
 
 /**
+ * A stub that ACCEPTS the TCP connection and then never answers. The only way
+ * the client can terminate is its own request timeout, so this is the fixture
+ * that distinguishes a bounded client from a hanging one.
+ */
+function silentStub() {
+  return new Promise((resolve) => {
+    const sockets = new Set();
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      // Deliberately write nothing and never end the response.
+    });
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        server,
+        url: `http://127.0.0.1:${server.address().port}`,
+        close: () => {
+          for (const s of sockets) s.destroy();
+          server.close();
+        },
+      });
+    });
+  });
+}
+
+/**
  * Run the real script in a controlled env; parse the JSON payload.
  *
  * ASYNC on purpose: several tests answer the child from an HTTP stub running in
  * THIS process. A synchronous spawn would block this process's event loop, so the
  * stub could never reply while the parent waited on the child — a real deadlock,
  * and the one that wedged the first run of this suite. `spawn` must yield.
+ *
+ * `opts.timeout` is a PARENT-SIDE kill, used only to bound a test so an
+ * unbounded child fails the assertion instead of hanging the suite. A
+ * parent-killed child reports `killed: true` and `code: null` — never a
+ * fabricated exit code.
  */
-async function run(args, env = {}, script = SCRIPT) {
+async function run(args, env = {}, script = SCRIPT, opts = {}) {
   const childEnv = {
     PATH: process.env.PATH,
     HOME: process.env.HOME,
@@ -98,10 +131,16 @@ async function run(args, env = {}, script = SCRIPT) {
     ({ stdout, stderr } = await execFileAsync(process.execPath, [script, ...args], {
       env: childEnv,
       encoding: "utf8",
+      ...(opts.timeout ? { timeout: opts.timeout } : {}),
     }));
     code = 0;
   } catch (e) {
-    if (typeof e.code !== "number") throw e; // spawn failure (ENOENT), not an exit code
+    if (typeof e.code !== "number") {
+      if (e.killed === true) {
+        return { code: null, payload: null, stdout: e.stdout || "", stderr: e.stderr || "", killed: true };
+      }
+      throw e; // spawn failure (ENOENT), not an exit code
+    }
     code = e.code;
     stdout = e.stdout || "";
     stderr = e.stderr || "";
@@ -112,7 +151,7 @@ async function run(args, env = {}, script = SCRIPT) {
   } catch {
     payload = null;
   }
-  return { code, payload, stdout, stderr };
+  return { code, payload, stdout, stderr, killed: false };
 }
 
 // ── the resolver (executed, not grepped) ────────────────────────────────────
@@ -123,6 +162,17 @@ test("default base URL is the API host, never the dashboard", () => {
   assert.equal(resolveBaseUrl({ TORTOISE_BASE_URL: "http://localhost:9000/" }), "http://localhost:9000");
   // The override always wins.
   assert.equal(resolveBaseUrl({ TORTOISE_BASE_URL: "https://api.example.test" }), "https://api.example.test");
+});
+
+test("the request timeout is bounded and cannot be disabled by ambient env", () => {
+  assert.equal(resolveTimeoutMs({}), 10_000);
+  assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "300" }), 300);
+  // Out-of-clamp / non-finite values FALL BACK — never a zero or NaN timeout.
+  assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "0" }), 10_000);
+  assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "-1" }), 10_000);
+  assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "nope" }), 10_000);
+  assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "Infinity" }), 10_000);
+  assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "999999999" }), 10_000);
 });
 
 test("the probe exit-code map is the contract", () => {
@@ -149,11 +199,74 @@ test("probe: an EMPTY store is ok (exit 0), not unavailable", async () => {
   }
 });
 
+test("probe: a reachable host answering 200 text/html is tortoise_unavailable, not ok", async () => {
+  // The exact false PASS the reviewer reproduced: any HTTP 200 used to read as
+  // `{status: ok, available: true}` with no point_count, so a captive portal or
+  // the dashboard host at the API address looked healthy.
+  const { server, url } = await startStub((req, res) => {
+    res.statusCode = 200;
+    res.setHeader("content-type", "text/html");
+    res.end("<html><body>not the API</body></html>");
+  });
+  try {
+    const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+    assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE);
+    assert.notEqual(r.payload.status, STATUS_OK);
+    assert.equal(r.payload.point_count, undefined);
+  } finally {
+    server.close();
+  }
+});
+
+test("probe: a reachable JSON host with no point_count is tortoise_unavailable, not ok", async () => {
+  // Belt-and-braces over the non-JSON case: a JSON 200 that is not a team
+  // payload must also degrade, never report `ok` without a point_count.
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ hello: "not the API" }));
+  });
+  try {
+    const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+    assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE);
+    assert.notEqual(r.payload.status, STATUS_OK);
+    assert.equal(r.payload.point_count, undefined);
+  } finally {
+    server.close();
+  }
+});
+
 test("probe: an UNREACHABLE store is tortoise_unavailable (exit 3)", async () => {
   const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: "http://127.0.0.1:1" });
   assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
   assert.equal(r.payload.status, STATUS_UNAVAILABLE);
   assert.equal(r.payload.error, STATUS_UNAVAILABLE);
+});
+
+test("probe: a host that accepts TCP and never answers is tortoise_unavailable, bounded", async () => {
+  // The `unreachable` cases above are all immediate ECONNREFUSED, which cannot
+  // distinguish a bounded client from a hanging one. An accept-but-silent host
+  // can: without a request timeout the child waits out undici's ~5-minute
+  // default and produces NO verdict (the parent-side kill below then fails the
+  // assertion rather than hanging the suite).
+  const { url, close } = await silentStub();
+  try {
+    const started = Date.now();
+    const r = await run(
+      ["status"],
+      { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url, TORTOISE_TIMEOUT_MS: "300" },
+      SCRIPT,
+      { timeout: 6000 },
+    );
+    const elapsed = Date.now() - started;
+    assert.equal(r.killed, false, "the child must terminate on its own, not be killed by the test");
+    assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE);
+    assert.ok(elapsed < 5000, `bounded by the client's own timeout, took ${elapsed}ms`);
+  } finally {
+    close();
+  }
 });
 
 test("probe: NEVER CONFIGURED is not_configured (exit 4) — not tortoise_unavailable", async () => {
@@ -204,6 +317,23 @@ test("data read: reachable EMPTY store reports ok and exits 0", async () => {
   }
 });
 
+test("data read: a non-JSON 200 degrades to tortoise_unavailable and still skips cleanly", async () => {
+  // Same shared `api()` guard as the probe: a data subcommand must not read a
+  // captive-portal HTML body as `{count: undefined, results: []}` and report ok.
+  const { server, url } = await startStub((req, res) => {
+    res.statusCode = 200;
+    res.setHeader("content-type", "text/html");
+    res.end("<html>not the API</html>");
+  });
+  try {
+    const r = await run(["search", "--query", "x"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+    assert.equal(r.code, EXIT_OK); // skip-cleanly is preserved
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE);
+  } finally {
+    server.close();
+  }
+});
+
 test("data read: never-configured reports not_configured but still skips cleanly", async () => {
   const r = await run(["search", "--query", "anything"], {});
   assert.equal(r.code, EXIT_OK); // skip-cleanly is preserved (agent-infra#1182)
@@ -236,6 +366,61 @@ test("usage errors keep exit 2 (argparse-free, but the code is reserved)", async
   assert.equal(missing.code, EXIT_USAGE);
   const unknown = await run(["definitely-not-a-command"], { TORTOISE_API_KEY: "tt_test" });
   assert.equal(unknown.code, EXIT_USAGE);
+});
+
+test("usage errors carry no store-state word (mock and real paths)", async () => {
+  // The mock's unknown-command branch used to emit `{status: "tortoise_unavailable"}`
+  // at EXIT_USAGE — a USAGE error labelled with a STORE-STATE word. `main` now
+  // routes the unknown command through the mock (making the branch reachable),
+  // and neither path may name a store state.
+  const mocked = await run(["definitely-not-a-command"], { TORTOISE_API_KEY: "tt_test", TORTOISE_MOCK: "1" });
+  assert.equal(mocked.code, EXIT_USAGE, `stderr: ${mocked.stderr}`);
+  assert.ok(mocked.payload, `expected a JSON usage payload, got: ${JSON.stringify(mocked.stdout)}`);
+  assert.equal(mocked.payload.status, undefined);
+  assert.equal(mocked.payload.error, "unknown_command");
+  assert.doesNotMatch(mocked.stdout, /tortoise_unavailable|not_configured/);
+
+  const real = await run(["definitely-not-a-command"], { TORTOISE_API_KEY: "tt_test" });
+  assert.equal(real.code, EXIT_USAGE);
+  assert.doesNotMatch(real.stdout, /tortoise_unavailable|not_configured/);
+  assert.doesNotMatch(real.stderr, /tortoise_unavailable|not_configured/);
+});
+
+// ── entry-point guard: the client RUNS through a symlinked route (#708) ─────
+// Platform-independent on purpose. `os.tmpdir()` is `/var/folders` (a symlink
+// into `/private/var`) on macOS but a REAL `/tmp` on ubuntu-latest, so the
+// existing reformat leg only exercises the guard incidentally and only on macOS.
+// Building the fixture under the REALPATH of the temp dir and then symlinking a
+// directory ON TOP of it makes the invocation route's only symlink ours on every
+// platform — and the raw `import.meta.url === "file://" + process.argv[1]`
+// idiom then skips main() and exits 0 with NO output (payload null) instead of
+// the not-configured verdict.
+test("entry-point guard: `status` runs when invoked through a symlinked ancestor", async () => {
+  const realBase = fs.realpathSync(os.tmpdir()); // strip any platform symlink (/var → /private/var)
+  const real = fs.mkdtempSync(path.join(realBase, "tortoise-memory-entry-"));
+  const linkParent = fs.mkdtempSync(path.join(realBase, "tortoise-memory-entry-link-"));
+  const link = path.join(linkParent, "linked");
+  fs.copyFileSync(SCRIPT, path.join(real, "tortoise-memory.mjs"));
+  // The client imports the shared entry-point guard (`./is-main.mjs`, #708), so
+  // the standalone fixture needs it beside it.
+  fs.copyFileSync(path.join(HERE, "is-main.mjs"), path.join(real, "is-main.mjs"));
+  fs.symlinkSync(real, link, "dir");
+  const asInvoked = path.join(link, "tortoise-memory.mjs");
+  try {
+    // Pin the mechanism: the invocation path really does traverse a symlink, so
+    // the fixture cannot silently become a no-op.
+    assert.notEqual(asInvoked, fs.realpathSync(asInvoked), "fixture must traverse a symlink");
+    const r = await run(["status"], {}, asInvoked);
+    assert.equal(r.code, EXIT_NOT_CONFIGURED, `stderr: ${r.stderr}`);
+    assert.ok(r.payload, `expected a JSON verdict, got: ${JSON.stringify(r.stdout)}`);
+    assert.equal(r.payload.status, STATUS_NOT_CONFIGURED);
+    // The guard resolved DEFINITIVELY (realpath match) — it did not merely
+    // fail-closed into running, which would mask a regressed comparison.
+    assert.doesNotMatch(r.stderr, /\[is-main\]/, "expected a definitive realpath match, not a fail-closed fallback");
+  } finally {
+    fs.rmSync(real, { recursive: true, force: true });
+    fs.rmSync(linkParent, { recursive: true, force: true });
+  }
 });
 
 // ── GREEN under a behaviour-identical reformat ──────────────────────────────
@@ -289,5 +474,38 @@ test("behaviour-identical reformats keep every verdict (the guard is not a text 
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  }
+});
+
+// ── the skills that READ this client speak the SAME vocabulary ───────────────
+// The three-state contract is useless if the skill text tells an agent to act on
+// a word the client no longer emits (agent-infra#1182). These are the docs the
+// reviewer found still carrying the retired vocabulary (`tortoise unavailable`)
+// and a literal `\"` inside an inline code span, which renders verbatim and
+// drifts from the other two skills.
+
+const SKILLS_DIR = path.join(HERE, "..", "skills");
+const MEMORY_SKILLS = ["research", "define-strategy", "define-vision"];
+
+function readSkill(name) {
+  return fs.readFileSync(path.join(SKILLS_DIR, name, "SKILL.md"), "utf8");
+}
+
+test("every memory skill names BOTH canonical states, never the retired 'tortoise unavailable'", () => {
+  for (const name of MEMORY_SKILLS) {
+    const src = readSkill(name);
+    assert.ok(src.includes('"not_configured"'), `${name}: missing the quoted "not_configured" state`);
+    assert.ok(src.includes('"tortoise_unavailable"'), `${name}: missing the quoted "tortoise_unavailable" state`);
+    assert.doesNotMatch(src, /\btortoise unavailable\b/, `${name}: retired 'tortoise unavailable' vocabulary`);
+  }
+});
+
+test("no memory skill carries backslash-escaped quotes inside a status code span", () => {
+  for (const name of MEMORY_SKILLS) {
+    // A backslash escape is consumed in markdown PROSE but rendered VERBATIM
+    // inside a code span, so `` `status: \"not_configured\"` `` reads to an agent
+    // as a literal backslash. Scoped to `status:` spans so the corpus's own
+    // `` `\"` `` escape-sequence documentation is not a false positive.
+    assert.doesNotMatch(readSkill(name), /`status:\s*\\"/, `${name}: escaped quote inside a status code span`);
   }
 });

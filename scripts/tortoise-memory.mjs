@@ -20,12 +20,17 @@
  * Env:
  *   TORTOISE_API_KEY    hosted API key (tt_...)
  *   TORTOISE_BASE_URL   override of the API host; default https://api.premiselabs.co
+ *   TORTOISE_TIMEOUT_MS per-request timeout in ms (default 10000; clamped to 1..600000)
  *
  * ── Read-path failure contract (tortoise#3805 / #3832, agent-infra#1182) ──
  * ONE vocabulary, carried in the `status` field of every payload:
  *   "ok"                    — the store answered; an EMPTY store is `ok` + count 0
  *   "not_configured"        — TORTOISE_API_KEY is unset: a SET-UP gap, not an outage
  *   "tortoise_unavailable"  — configured, but the store could not be reached
+ * `ok` requires a REAL API payload: a reachable non-API (a non-JSON body, or a
+ * JSON body without a numeric `point_count`) degrades to `tortoise_unavailable`,
+ * and every request is bounded so an accept-but-silent host still produces a
+ * verdict instead of hanging.
  * The `status` PROBE exits 0 (ok) / 3 (can't reach) / 4 (not set up), keeping 2
  * for usage errors; it is the surface a human or an agent harness checks.
  * DATA subcommands (query/search/write) keep the skip-cleanly contract
@@ -44,6 +49,24 @@ export function resolveBaseUrl(env = process.env) {
   return (env.TORTOISE_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, "");
 }
 
+// Every request is BOUNDED. A host that accepts TCP but never answers would
+// otherwise hang the client for undici's ~5-minute default and produce no
+// verdict at all; the abort lands in `api()`'s existing catch and becomes the
+// SAME `tortoise_unavailable` payload as an immediate ECONNREFUSED.
+// `TORTOISE_TIMEOUT_MS` is a real knob (slow links), but it cannot DISABLE the
+// bound: a non-finite or out-of-clamp value falls back to the default, so no
+// ambient env turns the timeout off.
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const MIN_REQUEST_TIMEOUT_MS = 1;
+const MAX_REQUEST_TIMEOUT_MS = 600_000;
+
+export function resolveTimeoutMs(env = process.env) {
+  const raw = Number(env.TORTOISE_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= MIN_REQUEST_TIMEOUT_MS && raw <= MAX_REQUEST_TIMEOUT_MS
+    ? raw
+    : DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
 export const STATUS_OK = "ok";
 export const STATUS_NOT_CONFIGURED = "not_configured";
 export const STATUS_UNAVAILABLE = "tortoise_unavailable";
@@ -58,6 +81,7 @@ export const EXIT_NOT_CONFIGURED = 4;
 
 const BASE_URL = resolveBaseUrl();
 const API_KEY = process.env.TORTOISE_API_KEY || "";
+const REQUEST_TIMEOUT_MS = resolveTimeoutMs();
 
 /** A typed degradation: never-configured or unreachable (never a query error). */
 class MemoryStateError extends Error {
@@ -96,6 +120,7 @@ async function api(path, opts = {}) {
   try {
     res = await fetch(url.toString(), {
       method,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       headers: {
         Authorization: `Bearer ${API_KEY}`,
         ...(body ? { "Content-Type": "application/json" } : {}),
@@ -112,8 +137,21 @@ async function api(path, opts = {}) {
     const text = await res.text();
     throw new Error(`tortoise ${method} ${path} → HTTP ${res.status}: ${text.slice(0, 300)}`);
   }
+  // This is a JSON API. A 200 carrying a non-JSON body is NOT the hosted
+  // Tortoise API (a captive portal / proxy / the dashboard host), and reading it
+  // as an object yields `undefined` fields that a caller cannot tell from a real
+  // empty answer — the false PASS this guard exists to stop.
   const ct = res.headers.get("content-type") || "";
-  return ct.includes("json") ? res.json() : res.text();
+  if (!ct.includes("json")) {
+    const text = await res.text();
+    throw new MemoryStateError(
+      STATUS_UNAVAILABLE,
+      `the Tortoise API at ${BASE_URL} answered ${res.status} with a non-JSON body ` +
+        `(content-type: ${ct || "none"}) — that is not the hosted API. ` +
+        `First bytes: ${text.slice(0, 120)}`,
+    );
+  }
+  return res.json();
 }
 
 /** The graceful failure payload — ONE vocabulary in `status` and `error`. */
@@ -147,7 +185,9 @@ function mockCall(name, params = {}) {
     case "status":
       return out({ status: STATUS_OK, available: true, base_url: BASE_URL, mock: true, point_count: MOCK_POINTS.length });
     default:
-      return out({ status: STATUS_UNAVAILABLE, error: "unknown_command", name }, EXIT_USAGE);
+      // USAGE error: no `status` field — a store-state word here (the earlier
+      // `tortoise_unavailable`) collapsed "bad invocation" into "store down".
+      return out({ error: "unknown_command", name }, EXIT_USAGE);
   }
 }
 
@@ -218,9 +258,23 @@ export async function main() {
       case "status": {
         if (mocked) return mockCall("status");
         const team = await api("/v1/team");
+        // `ok` is reserved for a REAL team payload. A reachable-but-wrong server
+        // returning `200 {}` (or `200 text/html`, already rejected in `api()`)
+        // must degrade to tortoise_unavailable, never to a green probe with no
+        // point_count.
+        if (typeof team?.point_count !== "number") {
+          throw new MemoryStateError(
+            STATUS_UNAVAILABLE,
+            `the Tortoise API at ${BASE_URL} answered /v1/team without a numeric point_count ` +
+              `— not a real team payload: ${JSON.stringify(team).slice(0, 160)}`,
+          );
+        }
         return out({ status: STATUS_OK, available: true, base_url: BASE_URL, point_count: team.point_count, tier: team.tier });
       }
       default:
+        // The same usage surface in both modes, so an unknown command can never
+        // reach a payload that blends a USAGE error with a STORE-STATE word.
+        if (mocked) return mockCall(cmd);
         console.error(`Usage: node scripts/tortoise-memory.mjs <query-prior-research|query-strategies|query-visions|search|write-points|write-claim|status>
 Env: TORTOISE_API_KEY (tt_...), TORTOISE_BASE_URL (default ${BASE_URL})
 Status probe exits: 0 ok · 3 can't reach it · 4 not set up (data subcommands stay exit 0)
