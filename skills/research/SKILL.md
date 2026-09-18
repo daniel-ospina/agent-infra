@@ -392,6 +392,18 @@ ISSUE:
 
 **Gate:** If issues found → fix deterministically. Re-dispatch. Max 2 fix cycles. On 3rd cycle with issues → surface to user. Zero issues → CLEAN, proceed to wiki filing.
 
+### Step 5.6 — The Adoption Gate (step-0 of the adoption path: contradiction test + `OVERRIDES`)
+
+**MANDATORY before a convergent finding is applied anywhere — before cost, quality, convergence strength, or fit.** This is not a review of the research itself: a finding can be perfectly accurate and still **unadoptable**, because an owner decision outranks a convergent standard. *Adoption* means applying the standard — writing it into code, a plan, a promise, or a surface — and this gate runs before that.
+
+1. **Name what the standard would touch.** If applied, which decisions, promises, architectures, or plan sections does it change?
+2. **Check the record for each.** Search the decision surfaces: the ISSUE itself (`gh issue view <n> --comments`), `~/.pi/agent/state/DECISION-LEDGER.md`, plan docs, and Tortoise points. A **recorded decision** is an owner ruling, a decision section in a plan doc, a decision comment on an issue, or a Tortoise point carrying one — **not** an existing practice and **not** what the code happens to do today.
+3. **Is the contradiction marked `OVERRIDES`?** A decision that deliberately goes against the common default carries an **`OVERRIDES:`** line naming the default concretely (see `AGENTS.md` → USER QUESTIONS PROTOCOL); the line is what makes the contradiction **findable**. **Either way, a contradicted decision is a HARD STOP** — the marker is discoverability, not the trigger.
+4. **Hard stop → reopen, never adoption.** A standard that contradicts a decision is **not a candidate for adoption at all**: not "adopt with a caveat", not "escalate and adopt", not a footnote, and not a question to the owner with adoption presupposed. The route is to **reopen the decision in its own home** (its issue, plan doc, or Tortoise point), **put the evidence in front of the owner, and argue it.** Post the refusal on the issue — quote the `OVERRIDES` line if the decision carries one, otherwise name the decision and quote its own text — the finding is **not** discarded; it is the evidence for the reopen.
+5. **If no recorded decision is reached, split the cases.** The field converges, nothing recorded contradicts it, **and it is aligned with the rest of our work** → **adopt it** and record the adoption, with sources, on the issue (no owner question — this is the `AGENTS.md` → USER QUESTIONS PROTOCOL rule, which is conjunctive). Otherwise — it does **not** clearly converge, **or** it converges but is misaligned with the rest of our work — the finding is a live question to be **argued with the owner**, not a candidate to be killed by analogy.
+
+**Output line for the synthesis:** `Adoption gate: <adopt | reopen <decision ref> | owner question> — <why>`.
+
 ### Step 5b — Claim Verification (DebateCV)
 
 For research that surfaces academic papers, optionally run DebateCV on key claims before the synthesis review:

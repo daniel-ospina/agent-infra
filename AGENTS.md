@@ -102,6 +102,14 @@ When choosing between two approaches, prefer the one that produces the better ou
 
 A **recorded decision** means an owner ruling, a decision section in a plan doc, a decision comment on an issue, or a Tortoise point carrying one — not merely an existing practice, and not a thing the code happens to do today.
 
+**⛔ MARK A DELIBERATE DEPARTURE WITH AN `OVERRIDES:` LINE — ON THE ISSUE.** The contradiction test only bites if an adopter can tell a **deliberate ruling against the grain** from **an accident of history** — and a record that states the choice but not *what it overrides* reads identically either way, so the ruling survives only until a helpful reader holding a vendor's page treats it as legacy and tidies it away. Every decision that goes against the common/industry default therefore carries one line:
+
+> **OVERRIDES:** <the default, named concretely — the window, the pattern, the vendor practice> — <one sentence of reason>.
+
+The marker belongs **on the artifact a lane actually reads: the ISSUE** (a comment on the decision issue), with the decision ledger carrying the same line as the index. A marker that lives only in a ledger is invisible to the lane holding the vendor page — and that is exactly the lane that overwrites the ruling. Cost: one line. Effect: the ruling reads as **intentional at the point where adoption happens**, instead of as an accident waiting to be tidied.
+
+**The hard stop is the decision, not the marker — the `OVERRIDES` line only makes the contradiction findable.** A convergent standard that contradicts **any recorded decision, marked or not**, is **not a candidate for adoption at all**; the route is a **reopen** — evidence in front of the owner, argued — never a quiet adoption, never "adopt with a caveat", and never an inference that convergence has made the default right. The marker's job is to make an against-the-grain ruling **visible to the adopter before the research has to rediscover it** — not to decide whether the decision blocks, which it does either way.
+
 When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge, **and it contradicts no recorded decision (run the contradiction test above FIRST)**, and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be canonical, e.g. as per ontology document)
 
 ## ⛔ SESSION RECAP PROTOCOL: don't recount trivia about what happened, present state and decisions.
