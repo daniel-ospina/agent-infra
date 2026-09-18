@@ -50,6 +50,7 @@ import {
   probeExitCode,
   resolveBaseUrl,
   resolveTimeoutMs,
+  stateStatus,
   STATUS_NOT_CONFIGURED,
   STATUS_OK,
   STATUS_UNAVAILABLE,
@@ -220,6 +221,15 @@ test("the probe exit-code map is the contract", () => {
   assert.equal(EXIT_USAGE, 2);
 });
 
+test("the catch-all status default is fail-closed: an UNEXPECTED throw is tortoise_unavailable, never ok", () => {
+  // `api()` now types the malformed-base-URL throw, so this pins the BACKSTOP
+  // itself: any throw that is not a `MemoryStateError` must still degrade to
+  // `tortoise_unavailable`. Mutating the default to `STATUS_OK` reds this.
+  assert.equal(stateStatus(new TypeError("Invalid URL")), STATUS_UNAVAILABLE);
+  assert.equal(stateStatus(new Error("anything unforeseen")), STATUS_UNAVAILABLE);
+  assert.notEqual(stateStatus(new TypeError("Invalid URL")), STATUS_OK);
+});
+
 // ── RED direction: the three states must be DISTINCT ────────────────────────
 
 test("probe: an EMPTY store is ok (exit 0), not unavailable", async () => {
@@ -327,6 +337,36 @@ test("probe: an UNREACHABLE store is tortoise_unavailable (exit 3)", async () =>
   assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
   assert.equal(r.payload.status, STATUS_UNAVAILABLE);
   assert.equal(r.payload.error, STATUS_UNAVAILABLE);
+});
+
+test("probe: a MALFORMED base URL is tortoise_unavailable (exit 3), never a healthy store", async () => {
+  // `::::` and a scheme-less host both make `new URL()` throw BEFORE any fetch.
+  // Built outside every guard that throw was a raw TypeError reaching the
+  // catch-all default, so the verdict rested on that default happening to be
+  // `tortoise_unavailable`. It must be a typed, self-describing state error.
+  for (const base of ["::::", "api.example.test"]) {
+    const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: base });
+    assert.equal(r.code, EXIT_UNAVAILABLE, `base=${base} stderr: ${r.stderr}`);
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE, `base=${base}`);
+    assert.equal(r.payload.error, STATUS_UNAVAILABLE, `base=${base}`);
+    assert.notEqual(r.payload.status, STATUS_OK, `base=${base}`);
+    // The diagnostic names the offending address — never a bare "Invalid URL".
+    assert.match(r.payload.message, /not a usable API address/, `base=${base}`);
+  }
+});
+
+test("data: a MALFORMED base URL reports tortoise_unavailable and never ok", async () => {
+  for (const args of [
+    ["search", "--query", "x"],
+    ["query-prior-research", "--domain", "d"],
+    ["write-claim", "--content", "c", "--kind", "statement"],
+  ]) {
+    const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: "::::" });
+    assert.equal(r.code, EXIT_OK, `${args[0]} stderr: ${r.stderr}`);
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE, args[0]);
+    assert.equal(r.payload.error, STATUS_UNAVAILABLE, args[0]);
+    assert.notEqual(r.payload.status, STATUS_OK, args[0]);
+  }
 });
 
 test("probe: a host that accepts TCP and never answers is tortoise_unavailable, bounded", async () => {
@@ -491,6 +531,41 @@ test("data read: a populated store reports ok with the results", async () => {
     assert.equal(r.code, EXIT_OK);
     assert.equal(r.payload.status, STATUS_OK);
     assert.equal(r.payload.count, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test("the outbound query string carries each subcommand's own params", async () => {
+  // Every other stub matches only `startsWith("/v1/search")`, so deleting a
+  // `url.searchParams.set` (or sending a wrong key) stayed green. Capture the
+  // request URL and assert the exact param map per subcommand — including the
+  // ARG table's DEFAULT for `--limit` and `--point-kind`, which is easy to drop.
+  // Deterministic and local (a stub, never the network), so this pins the
+  // client's OWN outbound contract rather than a server behaviour.
+  const reqs = [];
+  const { server, url } = await startStub((req, res) => {
+    reqs.push(req.url);
+    res.setHeader("content-type", "application/json");
+    if (req.url.startsWith("/v1/search")) res.end(JSON.stringify({ count: 0, results: [] }));
+    else res.end(JSON.stringify({ count: 0, points: [] }));
+  });
+  const parsed = (raw) => {
+    const u = new URL(raw, "http://stub");
+    return { path: u.pathname, params: Object.fromEntries(u.searchParams) };
+  };
+  try {
+    const env = { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url };
+    await run(["search", "--query", "hello", "--limit", "5"], env);
+    await run(["query-prior-research", "--domain", "d1"], env);
+    await run(["query-strategies"], env);
+    await run(["query-visions"], env);
+    await run(["query-visions", "--point-kind", "strategy"], env);
+    assert.deepEqual(parsed(reqs[0]), { path: "/v1/search", params: { q: "hello", limit: "5" } });
+    assert.deepEqual(parsed(reqs[1]), { path: "/v1/search", params: { q: "d1", limit: "10" } });
+    assert.deepEqual(parsed(reqs[2]), { path: "/v1/points", params: { kind: "strategy", limit: "50" } });
+    assert.deepEqual(parsed(reqs[3]), { path: "/v1/points", params: { kind: "vision", limit: "50" } });
+    assert.deepEqual(parsed(reqs[4]), { path: "/v1/points", params: { kind: "strategy", limit: "50" } });
   } finally {
     server.close();
   }

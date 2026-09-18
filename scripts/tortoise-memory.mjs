@@ -184,8 +184,25 @@ async function api(path, opts = {}) {
         `${DEFAULT_BASE_URL} and can be overridden with TORTOISE_BASE_URL.`,
     );
   }
-  const url = new URL(`${BASE_URL}${path}`);
-  if (params) for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
+  // URL CONSTRUCTION is inside its own guard, not left to the caller's fallback.
+  // A malformed `TORTOISE_BASE_URL` (`::::`, a scheme-less host) makes `new URL`
+  // throw a raw `TypeError`; thrown from OUTSIDE every `MemoryStateError` guard
+  // it would fall through `main()`'s `e instanceof MemoryStateError` test to the
+  // DEFAULT status — correct only while that default happens to be
+  // `STATUS_UNAVAILABLE`, and a green verdict the moment it is not. Mapping it
+  // here makes a misconfigured address an explicit, self-describing state error
+  // rather than a bare `"Invalid URL"` riding an unasserted default.
+  let url;
+  try {
+    url = new URL(`${BASE_URL}${path}`);
+    if (params) for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
+  } catch (e) {
+    throw new MemoryStateError(
+      STATUS_UNAVAILABLE,
+      `TORTOISE_BASE_URL is not a usable API address — "${BASE_URL}" cannot be parsed ` +
+        `into a request URL (the store was never reached): ${String(e.message || e)}`,
+    );
+  }
   let res;
   try {
     res = await fetch(url.toString(), {
@@ -508,6 +525,17 @@ function degradation(status, message) {
   return { status, error: status, message, base_url: BASE_URL };
 }
 
+/**
+ * The status word for a caught error. A TYPED state error carries its own; any
+ * UNEXPECTED throw (not a `MemoryStateError`) is fail-closed to
+ * `STATUS_UNAVAILABLE` — never `ok`. Hoisted out of `main()`'s catch so the
+ * fail-closed default is EXECUTED by a test (the malformed-base-URL path is now
+ * typed at `api()`, but this is still the backstop for any unforeseen throw).
+ */
+export function stateStatus(e) {
+  return e instanceof MemoryStateError ? e.status : STATUS_UNAVAILABLE;
+}
+
 // ── Mock mode (TORTOISE_MOCK=1) — deterministic, no network ──
 const MOCK_POINTS = [
   { id: "pt_mock_1", content: "Prior research claim about the domain (mock)", kind: "statement", confidence: 0.8, authoredBy: "research-skill", createdAt: "2026-08-01T00:00:00Z" },
@@ -683,7 +711,7 @@ Mock: TORTOISE_MOCK=1`);
         EXIT_OK,
       );
     }
-    const status = e instanceof MemoryStateError ? e.status : STATUS_UNAVAILABLE;
+    const status = stateStatus(e);
     // The PROBE carries the distinct exit code; data subcommands keep skipping
     // cleanly (agent-infra#1182) while reporting the SAME vocabulary.
     const exitCode = cmd === "status" ? probeExitCode(status) : EXIT_OK;
