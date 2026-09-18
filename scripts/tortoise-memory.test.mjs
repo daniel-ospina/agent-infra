@@ -243,12 +243,16 @@ test("probe: a reachable host answering 200 with a non-JSON content-type is tort
   // The body is VALID JSON on purpose. An `<html>` body would make `res.json()`
   // throw, so the probe would degrade even with the content-type guard DELETED —
   // that test cannot distinguish the guard from a parse failure. A JSON-parsable
-  // body under `text/plain` can: only the content-type guard rejects it (the
-  // payload carries a numeric point_count, so no shape check fires either).
+  // body under `text/plain` can, but ONLY if it would otherwise be ACCEPTED: the
+  // body must be a complete `OrgInfoResponse` (`org_id`, `tier`, numeric
+  // `point_count`), because a body missing those is rejected by
+  // `assertTeamPayload` whether or not the guard exists — which would make this
+  // test pass for the wrong reason. So: only the content-type guard can
+  // degrade the run below.
   const { server, url } = await startStub((req, res) => {
     res.statusCode = 200;
     res.setHeader("content-type", "text/plain");
-    res.end(JSON.stringify({ point_count: 3, tier: "pro" }));
+    res.end(JSON.stringify({ point_count: 3, org_id: "org_test", tier: "pro" }));
   });
   try {
     const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
@@ -914,10 +918,23 @@ test("usage: a --points-json that is not an array is a usage error, never a stor
   // of an array that the store was DOWN, so they skip instead of fixing the
   // argument. A usage error must emit no `status` at all. None of these reach
   // the network (the throw/OBSERVED gap is local), so no stub is needed.
-  for (const bad of ["{}", "null", "5", "true"]) {
+  for (const [bad, pattern] of [
+    ["{}", /--points-json must be a JSON array/],
+    ["null", /--points-json must be a JSON array/],
+    ["5", /--points-json must be a JSON array/],
+    ["true", /--points-json must be a JSON array/],
+    // Malformed JSON takes the PARSE branch, BEFORE the array/shape checks.
+    // Without these the try/catch around `JSON.parse` is unpinned: a bare
+    // `JSON.parse(raw)` left the suite green while `--points-json '[{'` emitted
+    // `{"status":"tortoise_unavailable"}` at exit 0 — a usage error wearing a
+    // store-state word, the exact defect class this contract forbids.
+    ["[{", /--points-json must be valid JSON/],
+    ["{,}", /--points-json must be valid JSON/],
+    ['"unterminated', /--points-json must be valid JSON/],
+  ]) {
     const r = await run(["write-points", "--kind", "statement", "--points-json", bad], { TORTOISE_API_KEY: "tt_test" });
     assert.equal(r.code, EXIT_USAGE, `--points-json ${bad} must be a usage error (stderr: ${r.stderr})`);
-    assert.match(r.stderr, /--points-json must be a JSON array/);
+    assert.match(r.stderr, pattern);
     assert.equal(r.payload, null, `--points-json ${bad} must not emit a JSON payload, got: ${r.stdout}`);
     assert.doesNotMatch(r.stdout, /tortoise_unavailable|not_configured/);
   }
