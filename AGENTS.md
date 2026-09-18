@@ -77,7 +77,7 @@ Every infra issue, gate, guard, workflow step, or refactor is classified **A** o
 
 **The pattern to follow when something is broken:**
 1. **Diagnose first** — read the error, trace the root cause, confirm what's actually failing (skills: `debug-workflow`, `find-bugs`)
-2. **Research the canonical architecture and SOTA solution** — use the research skill to confirm what the canonical architecture and state-of-the-art solution are; we want to be a fast follower on best practices everywhere that is not unique to us.
+2. **Research the canonical architecture and SOTA solution** — use the research skill to confirm what the canonical architecture and state-of-the-art solution are; we want to be a fast follower on best practices everywhere that is not unique to us — **except where it contradicts a recorded decision**, which the contradiction test in USER QUESTIONS PROTOCOL settles first.
 3. **Fix the root cause with durable solutions** — reconnect, repair config, fix the bug. This is the default. Avoid patchy solutions that compound debt; we want clean architecture that is simple yet complete. If you need to change the current architecture, escalate.
 4. **If you cannot fix it** (needs credentials, external service access, decision) — **STOP and escalate**: report the diagnosis + proposed fallback to the human, get explicit approval BEFORE changing the architecture, backend, or workflow
 5. **Never ship a fallback as if it were the plan** — a workaround (embedded DB instead of managed, self-host instead of cloud, local instead of remote) is a red flag that must be surfaced, not absorbed
@@ -98,7 +98,11 @@ When choosing between two approaches, prefer the one that produces the better ou
 
 ## ⛔ USER QUESTIONS PROTOCOL: research and ask without jargon
 
-When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be canonical, e.g. as per ontology document)
+**⛔ ASK THE CONTRADICTION TEST FIRST — BEFORE YOUR OTHER TESTS.** Before adopting anything a research pass returns (a convergent standard, a SOTA pattern, a comparable's practice), ask **"is there a decision this would contradict?"** — and ask it *first*, ahead of cost, quality, convergence strength, or fit. A convergent answer that contradicts a decision **is not a candidate for adoption at all**: not "adopt with a caveat", not "escalate and adopt", not a footnote, and not something to park with the owner as an option. **Convergence describes what the field does. It does not describe what we have decided to be.** An owner decision outranks it — and where you believe the decision is wrong, the route is a **reopen**: reopen the decision itself (its issue, plan doc, or Tortoise point) and put the case on the record, never adopt quietly alongside it.
+
+A **recorded decision** means an owner ruling, a decision section in a plan doc, a decision comment on an issue, or a Tortoise point carrying one — not merely an existing practice, and not a thing the code happens to do today.
+
+When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge, **and it contradicts no recorded decision (run the contradiction test above FIRST)**, and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be canonical, e.g. as per ontology document)
 
 ## ⛔ SESSION RECAP PROTOCOL: don't recount trivia about what happened, present state and decisions.
 
