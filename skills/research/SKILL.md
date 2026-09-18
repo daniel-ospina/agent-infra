@@ -120,14 +120,23 @@ Other `--team` values belong to the #4930 2-axis scope system and are orthogonal
 
 ```bash
 # From the agent-infra checkout. Hosted Tortoise API — env: TORTOISE_API_KEY
-# (tt_... from tortoise.premiselabs.co), TORTOISE_BASE_URL (default https://tortoise.premiselabs.co).
-# No key → prints {"error":"tortoise_unavailable"} and exits 0 (skip step).
+# (tt_... from the dashboard at tortoise.premiselabs.co — that is the sign-up site,
+# NOT the API host). TORTOISE_BASE_URL overrides the API base; default
+# https://api.premiselabs.co.
+# The read path distinguishes three states in its `status` field (tortoise#3805):
+# "ok" (the store answered — an EMPTY store is still "ok", read `count`),
+# "not_configured" (no TORTOISE_API_KEY — never set up, not an outage), and
+# "tortoise_unavailable" (key set, but the store could not be reached).
+# Data subcommands always exit 0 so a missing optional dependency never fails the
+# skill (skip the step); the `status` probe exits 0 / 4 / 3 so a harness can tell
+# the three states apart.
 node scripts/tortoise-memory.mjs query-prior-research --domain "<topic-or-domain>"
 ```
 
 **Interpretation:**
 - **Results found:** Summarize prior claims. Use them to refine the research scope — what was already established? What gaps remain? What assumptions were made previously?
-- **"tortoise unavailable":** `TORTOISE_API_KEY` missing or API unreachable — memory system offline. Skip this step — proceed with fresh research.
+- **`"status": "not_configured"`:** no `TORTOISE_API_KEY` on this machine — memory was never set up here, which is **not** an outage. Skip this step — proceed with fresh research.
+- **`"status": "tortoise_unavailable"`:** a key is set but the API was unreachable — the store is down or the address is wrong. Skip this step and note it; this is the state worth surfacing.
 - **Zero results:** First research on this topic. Note "no prior epistemic claims found" and proceed.
 
 **Preserve provenance:** When citing prior claims in the research output, reference the Point ID and authoredBy field so the reader can trace the claim's origin.
