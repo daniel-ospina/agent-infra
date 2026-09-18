@@ -373,6 +373,34 @@ async function partB() {
       expectTrue(`B5c: read-only negative — \`${cmd}\` ALLOWED`, allowed(r), `blocked: ${r?.reason?.slice(0, 120)}`);
     }
 
+    // ── #1210: the script-indirection arm must read the target's STATE, not the
+    // command's TEXT. On a CLEAN tree there is nothing to discard, so an
+    // unresolvable script path must NOT block. Before this fix the arm failed
+    // closed here and reported the indirection AS THOUGH it had observed a dirty
+    // checkout — provably false — which froze the rail for four consecutive
+    // attempts across two clean worktrees and blocked every deploy in the fleet.
+    //
+    // This is exactly the case the old suite could not see: every existing
+    // script-indirection case ran with a DIRTY tree (B6/B10 below), so the suite
+    // passed both BEFORE and AFTER the fix and pinned nothing about it. These two
+    // cases must be adjacent and must move together — the first REDs if the state
+    // read is removed, the second REDs if it is widened into a fail-open.
+    const cleanUndoEarly = join(tmp, "undo-clean-early.sh");
+    write(cleanUndoEarly, "git checkout -- clean.txt\n");
+    expectTrue("B5d: CLEAN target + unresolvable script path (`S=…; bash $S`) → ALLOWED (state read, not text shape)",
+      allowed(await bash(`S=${cleanUndoEarly}; bash $S`, wt)),
+      "blocked — the arm is asserting a dirty tree it never observed");
+
+    // The converse: the SAME shape with a DIRTY target must STILL block. Without
+    // this, the new ALLOW could be satisfied by deleting the arm instead of
+    // fixing it.
+    write(join(wt, "dirty.txt"), "MUTANT-EARLY\n");
+    expectTrue("B5e: DIRTY target + the same unresolvable script path → STILL BLOCKED (no fail-open)",
+      blocked(await bash(`S=${cleanUndoEarly}; bash $S`, wt)),
+      "was allowed — a state read must never let a real discard through");
+    // Restore the committed content so the B6 sequence below starts from clean.
+    write(join(wt, "dirty.txt"), "v1\n");
+
     // ── B6: DIRTY tracked target in a LINKED WORKTREE → BLOCK (the #709 core) ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
     const core = await bash("git checkout -- dirty.txt", wt);
