@@ -40,15 +40,18 @@ Two aggravating defects in `agent-session.js`:
   failed compaction is recorded nowhere. (Closed separately — see **change (a)** below.)
 - `_overflowRecoveryAttempted` is a **latch**: it resets only on a turn that ends normally or on a
   new user message, so a `length` loop never clears it and the one compact-and-retry a session is
-  allowed can never be re-armed.
+  allowed can never be re-armed. This patch set deliberately **does not change it** — see
+  **Deliberately excluded** below.
 
-## The three changes, and where each one lives
+## The changes, and where each one lives
 
 | # | Change | Where | Status |
 |---|---|---|---|
 | **(a)** | Persist a failed compaction as a durable session entry | **extension-side only** — `extensions/compaction-watchdog.ts` (issue #1215, merged in `f082ec8`) | **already done, verified here** — see `tests/verify-a-durable-failure-record.mjs` |
-| **(b)** | Never clamp below a usable output floor | upstream source patch **+** `extensions/clamp-output-floor.ts` (upgrade-proof layer) | new |
-| **(c)** | Bound overflow recovery instead of latching it | upstream source patch only (not reachable from an extension) | new, **see the caveat below** |
+| **(b)** | Never clamp below a usable output floor | upstream source patch **+** `extensions/clamp-output-floor.ts` (upgrade-proof layer) | **new — the only change this patch set carries** |
+
+(a) is verified by this set but lives entirely in the #1215 extension; the source patch set itself
+carries **(b) only**.
 
 **(a) is deliberately not re-implemented in the patch.** The #1215 watchdog already writes
 `pi.appendEntry("compaction-watchdog", …)` on `session_compact_failed`, plus a fleet log and an
@@ -73,17 +76,21 @@ already routed into pi's overflow path — and otherwise the turn just works. **
 than death, because it is loud.** The trade is one wasted round-trip (and any input tokens the
 provider charges for it) in the genuinely-over-limit case.
 
-**⚠ (c) is an argued change, not a mechanical one, and it deviates from the instruction.**
-The instruction was "reset `_overflowRecoveryAttempted` on `length` stops so recovery can retry".
-A literal reset re-arms an **unbounded** compact-and-retry loop — each attempt spends a
-summarization call — so it is implemented as a **bounded attempt counter**
-(`MAX_OVERFLOW_RECOVERY_ATTEMPTS = 3`) that resets on a normal turn and on a new user message.
-That change **contradicts four existing upstream tests**, including a *named characterization
-test* (`does not retry overflow recovery more than once`) and
-`stops after one compact-and-retry when a second response is also truncated`. Those tests are
-updated in `0002`, and the deliberate one-shot design they encode is the reason `0002` is a
-**separate patch you can drop**: (b) alone closes the silent death, because with a usable floor the
-1-token turn cannot occur. Decide whether to take (c) on its merits.
+## Deliberately excluded — change (c): bounding overflow recovery
+
+This set does **not** touch `_overflowRecoveryAttempted`, the one-shot recovery latch in
+`agent-session.js`; the latch ships exactly as upstream wrote it. Bounding it was considered and
+rejected because:
+
+- **(b) alone closes the silent death** — with a usable output floor the 1-token turn cannot occur,
+  so the latch is never reached in the death scenario;
+- bounding it **contradicts four upstream tests** that encode the one-shot design as intentional —
+  including a *named characterization test* (`does not retry overflow recovery more than once`) and
+  `stops after one compact-and-retry when a second response is also truncated`;
+- the latch is a recovery **policy**: changing it belongs upstream, or in a decision of its own, not
+  in a version-pinned patch to `node_modules` riding along with a narrow clamp fix.
+
+The rejected patch remains in git history for that future decision.
 
 ## Artifacts
 
@@ -93,11 +100,12 @@ scripts/pi-patches/
 ├── apply.mjs                                 # version pin, two-pass apply, verification, backups
 ├── verify.sh                                 # re-runs ALL FOUR evidence classes in one command
 ├── make-manifest.mjs                         # re-derives manifests/<version>/manifest.json
-├── manifests/0.85.1/manifest.json            # 13 byte-exact replacements for the INSTALLED tree
+├── manifests/0.85.1/manifest.json            # 3 byte-exact replacements (change (b) only) for the INSTALLED tree
 ├── upstream/0001-pi-ai-never-clamp-below-a-usable-output-budget.patch   # change (b), source + test
-├── upstream/0002-pi-coding-agent-bound-overflow-recovery-instead-of-latching.patch  # change (c)
 ├── tests/verify-a-durable-failure-record.mjs # change (a), end to end
-└── evidence/2026-09-18/                      # raw outputs of every claim below
+└── evidence/
+    ├── 2026-09-18-b-only/                    # raw outputs of every claim in the Evidence section (the shipped (b)-only set)
+    └── 2026-09-18/                           # earlier snapshot, captured while change (c) was still in the set
 ```
 
 `manifests/` is deliberately not called `dist/` — a `dist/` directory is ignored by this repo's
@@ -111,8 +119,9 @@ nothing (a false PASS) cannot exist.
 A single pass that wrote as it went would leave a **half-patched tree** when a later file refused —
 some files carrying the fix and others not, which is worse than not patching at all. Individual
 writes go through a temp file + `rename`, so a crash cannot truncate a 4 MB bundle and a pi process
-starting up can never read a half-written file. `evidence/10-revert-roundtrip.txt` and
-`evidence/05-mangled-refusal.txt` both assert this by hashing the whole tree before and after.
+starting up can never read a half-written file. `evidence/2026-09-18-b-only/04-revert-roundtrip.txt`
+and `evidence/2026-09-18/05-mangled-refusal.txt` both assert this by diffing against a pristine tree
+or hashing the whole tree before and after.
 
 ## Re-arm after a pi upgrade
 
@@ -146,8 +155,8 @@ npx tsx extensions/clamp-output-floor.test.ts
 Backups are keyed by **pi root AND version** — `~/.pi/agent/state/pi-patches/backup-<version>-<hash of the pi root>/`.
 A version-only key would have let a `--revert` on a second install restore the *first* install's files
 over it, so the revert would be a corruption rather than a restore. `apply.sh --revert` restores from
-that directory, and `evidence/10-revert-roundtrip.txt` proves the restore is byte-identical to the
-pristine tree rather than merely "close".
+that directory, and `evidence/2026-09-18-b-only/04-revert-roundtrip.txt` proves the restore is
+byte-identical to the pristine tree rather than merely "close".
 
 ## Upstream status — READ BEFORE PROPOSING A PR
 
@@ -163,7 +172,7 @@ pristine tree rather than merely "close".
   - **#9409** (OPEN) — *Sessions wedge permanently at the context ceiling on reasoning models* —
     quotes our exact error string (`Truncated response recovery failed after one compact-and-retry
     attempt.`), reports `usage.output: 16`, and notes **not one compaction entry was written**.
-    This is the closest match and the natural home for a comment covering (b) and (c).
+    This is the closest match and the natural home for a comment covering (b).
   - **#8864** (CLOSED, auto-closed) — *Long sessions die unrecoverably: … max_tokens clamped to 1*
   - **#8691**, **#9726**, **#8061**, **#7270** — adjacent reports of the same clamp.
   - **#9718** — `--print` exits 0 with empty output when the budget is exhausted (the adjacent
@@ -173,8 +182,23 @@ pristine tree rather than merely "close".
 
 ## Evidence
 
-Evidence is raw output, kept in `scripts/pi-patches/evidence/2026-09-18/`. Each row is a real command
-with real output, not a claim:
+Evidence is raw output, kept in `scripts/pi-patches/evidence/`. Each row is a real command with real
+output, not a claim.
+
+The **shipped (b)-only set** is captured in `evidence/2026-09-18-b-only/`:
+
+| File | What it proves |
+|---|---|
+| `01-red-pristine-check.txt` | a pristine 0.85.1 tree: `--check` reproduces the defect — **8 behavioural failures** (both the bundled runtime and the pi-ai ESM return `max_tokens: 1` at `available ≤ 0`). Exit 1. |
+| `02-green-apply-verify.txt` | `apply.sh` applies **3 replacements** to 3 files, then `verify.sh` runs all four evidence classes — `ALL EVIDENCE HOLDS`, exit 0. A second apply writes nothing. |
+| `03-extension-negative-controls.txt` | `clamp-output-floor.test.ts` — **26 passed, 0 failed**, including every negative control (a healthy ceiling, a missing/non-numeric field, and a floor-or-above payload are left byte-identical). |
+| `04-revert-roundtrip.txt` | `--revert` then `--check` goes RED again, and `diff` against the pristine tree is **byte-identical** — a true restore. |
+| `05-c-absent.txt` | the manifest carries **zero** `_overflowRecoveryAttempt*` markers, and the installed `agent-session.js` + `chunk-JVUZSMYM.js` are byte-identical to the pristine tree. |
+
+`evidence/2026-09-18/` is the **earlier** snapshot and is left as a dated record: it was captured for
+the revision that still carried change (c), so its `apply` lines show **13 replacements**. Its claims
+about change (a), the drift/refusal behaviour and the revert round-trip still hold; only the
+replacement count and the `agent-session.js` entries are superseded.
 
 | File | What it proves |
 |---|---|
@@ -201,8 +225,8 @@ with real output, not a claim:
 4. **The extension is symlinked to this worktree** (`~/.pi/agent/extensions/clamp-output-floor.ts`).
    After merge, repoint the symlink at the hub path
    (`agent-infra/extensions/clamp-output-floor.ts`) or the guard dangles when the worktree goes.
-5. **(c) contradicts four upstream tests** and is still subject to the argument above; the
-   one-shot recovery design may be deliberate for reasons we cannot see.
+5. **The `_overflowRecoveryAttempted` latch is intentionally left as upstream ships it** — this set
+   changes the clamp only. See **Deliberately excluded** above.
 6. **The 1024-token floor is a judgement, not a measurement.** It matches the existing
    `MIN_ANSWER_TOKENS = 1024` in the same module and is 4x under the 4096 safety reserve. No
    measurement establishes that 1024 is the smallest usable budget.

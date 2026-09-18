@@ -2,6 +2,11 @@
 // pi-patches manifest generator — derives scripts/pi-patches/manifests/<version>/manifest.json
 // from the INSTALLED pi tree, so the `find` strings are byte-exact for that version.
 //
+// This set carries change (b) ONLY — the clamp output floor, never ask for a single token.
+// Change (c) (bounding the overflow-recovery latch in agent-session.js) is deliberately NOT in
+// this set: it contradicts four upstream tests that encode a one-shot recovery design, and (b)
+// alone closes the silent death because with a usable floor the 1-token turn cannot occur.
+//
 // It fails loudly if any anchor is missing or ambiguous: a manifest that silently matched
 // nothing would make apply.sh report "applied" over an unpatched tree — a false PASS.
 //
@@ -85,27 +90,6 @@ const CLAMP_BUNDLE_FIND =
 const CLAMP_BUNDLE_REPLACE =
 	'var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1,MIN_USABLE_MAX_TOKENS=1024;function clampMaxTokensToContext(model,context,maxTokens){/*pi-patch:#1214(b)*/if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return available<MIN_USABLE_MAX_TOKENS?Math.max(MIN_MAX_TOKENS,Math.min(maxTokens,MIN_USABLE_MAX_TOKENS)):Math.min(maxTokens,available)}';
 
-// ---- (c) bounded overflow recovery ------------------------------------------------------
-const SESS_ERROR_FIND = [
-	"            if (this._overflowRecoveryAttempted) {",
-	"                const errorMessage = contextOverflow",
-	'                    ? "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."',
-	'                    : "Truncated response recovery failed after one compact-and-retry attempt.";',
-].join("\n");
-
-const SESS_ERROR_REPLACE = [
-	"            if (this._overflowRecoveryAttempt >= 3) {",
-	"                const errorMessage = contextOverflow",
-	'                    ? "Context overflow recovery failed after 3 compact-and-retry attempts. Try reducing context or switching to a larger-context model."',
-	'                    : "Truncated response recovery failed after 3 compact-and-retry attempts.";',
-].join("\n");
-
-const BUNDLE_ERROR_FIND =
-	'if(this._overflowRecoveryAttempted){let errorMessage2=contextOverflow?"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.":"Truncated response recovery failed after one compact-and-retry attempt.";';
-
-const BUNDLE_ERROR_REPLACE =
-	'if(this._overflowRecoveryAttempt>=3){/*pi-patch:#1214(c)*/let errorMessage2=contextOverflow?"Context overflow recovery failed after 3 compact-and-retry attempts. Try reducing context or switching to a larger-context model.":"Truncated response recovery failed after 3 compact-and-retry attempts.";';
-
 const entries = [
 	// (b) the clamp — one copy in the unbundled ESM, one inlined copy per bundle chunk.
 	{
@@ -131,91 +115,6 @@ const entries = [
 		find: CLAMP_BUNDLE_FIND,
 		replace: CLAMP_BUNDLE_REPLACE,
 		verifyPresent: ["MIN_USABLE_MAX_TOKENS=1024", "available<MIN_USABLE_MAX_TOKENS?"],
-	},
-	// (c) the recovery latch -> bounded attempt counter, in both representations.
-	{
-		id: "c1-recovery-field-esm",
-		change: "c",
-		file: "dist/core/agent-session.js",
-		find: "    _autoCompactionAbortController = undefined;\n    _overflowRecoveryAttempted = false;\n",
-		replace:
-			"    _autoCompactionAbortController = undefined;\n    // pi-patch #1214(c): a COUNT, not a latch. As a boolean this was never cleared by a\n    // `length` stop, so the one compact-and-retry a session was allowed could not be re-armed.\n    _overflowRecoveryAttempt = 0;\n",
-		verifyPresent: ["    _overflowRecoveryAttempt = 0;"],
-	},
-	{
-		id: "c2-recovery-reset-user-esm",
-		change: "c",
-		file: "dist/core/agent-session.js",
-		find: '        if (event.type === "message_start" && event.message.role === "user") {\n            this._overflowRecoveryAttempted = false;\n',
-		replace:
-			'        if (event.type === "message_start" && event.message.role === "user") {\n            this._overflowRecoveryAttempt = 0;\n',
-		verifyPresent: ["            this._overflowRecoveryAttempt = 0;"],
-	},
-	{
-		id: "c3-recovery-reset-success-esm",
-		change: "c",
-		file: "dist/core/agent-session.js",
-		find: '                if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {\n                    this._overflowRecoveryAttempted = false;\n                }',
-		replace:
-			'                if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {\n                    this._overflowRecoveryAttempt = 0;\n                }',
-		verifyPresent: ["                    this._overflowRecoveryAttempt = 0;"],
-	},
-	{
-		id: "c4-recovery-cap-esm",
-		change: "c",
-		file: "dist/core/agent-session.js",
-		find: SESS_ERROR_FIND,
-		replace: SESS_ERROR_REPLACE,
-		verifyPresent: ["if (this._overflowRecoveryAttempt >= 3) {"],
-	},
-	{
-		id: "c5-recovery-increment-esm",
-		change: "c",
-		file: "dist/core/agent-session.js",
-		find: "            // retry once. The message remains in session history but is excluded from retry context.\n            this._overflowRecoveryAttempted = true;",
-		replace:
-			"            // retry. The message remains in session history but is excluded from retry context.\n            // Bounded by the attempt cap above (#1214(c)).\n            this._overflowRecoveryAttempt++;",
-		verifyPresent: ["            this._overflowRecoveryAttempt++;"],
-	},
-	{
-		id: "c6-recovery-field-bundle",
-		change: "c",
-		file: "dist/bundle/chunks/chunk-JVUZSMYM.js",
-		find: "_autoCompactionAbortController=void 0;_overflowRecoveryAttempted=!1;_branchSummaryAbortController",
-		replace: "_autoCompactionAbortController=void 0;_overflowRecoveryAttempt=0;_branchSummaryAbortController",
-		verifyPresent: ["_autoCompactionAbortController=void 0;_overflowRecoveryAttempt=0;"],
-	},
-	{
-		id: "c7-recovery-reset-user-bundle",
-		change: "c",
-		file: "dist/bundle/chunks/chunk-JVUZSMYM.js",
-		find: "this._overflowRecoveryAttempted=!1;let messageText",
-		replace: "this._overflowRecoveryAttempt=0;let messageText",
-		verifyPresent: ["this._overflowRecoveryAttempt=0;let messageText"],
-	},
-	{
-		id: "c8-recovery-reset-success-bundle",
-		change: "c",
-		file: "dist/bundle/chunks/chunk-JVUZSMYM.js",
-		find: "&&(this._overflowRecoveryAttempted=!1),assistantMsg",
-		replace: "&&(this._overflowRecoveryAttempt=0),assistantMsg",
-		verifyPresent: ["&&(this._overflowRecoveryAttempt=0),assistantMsg"],
-	},
-	{
-		id: "c9-recovery-cap-bundle",
-		change: "c",
-		file: "dist/bundle/chunks/chunk-JVUZSMYM.js",
-		find: BUNDLE_ERROR_FIND,
-		replace: BUNDLE_ERROR_REPLACE,
-		verifyPresent: ["if(this._overflowRecoveryAttempt>=3)"],
-	},
-	{
-		id: "c10-recovery-increment-bundle",
-		change: "c",
-		file: "dist/bundle/chunks/chunk-JVUZSMYM.js",
-		find: "!1}this._overflowRecoveryAttempted=!0;let messages=this.agent.state.messages",
-		replace: "!1}this._overflowRecoveryAttempt++;let messages=this.agent.state.messages",
-		verifyPresent: ["!1}this._overflowRecoveryAttempt++;let messages="],
 	},
 ];
 

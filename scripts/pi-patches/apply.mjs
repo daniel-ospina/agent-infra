@@ -223,12 +223,6 @@ for (const entry of manifest.entries) {
 	}
 }
 
-// The old latch symbol must be gone from both representations.
-for (const file of ["dist/core/agent-session.js", "dist/bundle/chunks/chunk-JVUZSMYM.js"]) {
-	const text = readFileSync(join(PI_ROOT, file), "utf8");
-	if (text.includes("_overflowRecoveryAttempted")) shapeErrors.push(`${file} still contains the un-bounded latch _overflowRecoveryAttempted`);
-}
-
 // ── 5. VERIFY — the clamp behaviour, against the LIVE runtime ────────────────────────────────
 const chunk = join(PI_ROOT, "dist", "bundle", "chunks", "chunk-AXIIZGTV.js");
 const esm = join(PI_ROOT, "node_modules", "@earendil-works", "pi-ai", "dist", "api", "simple-options.js");
