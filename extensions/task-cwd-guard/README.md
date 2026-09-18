@@ -20,12 +20,11 @@ One `tool_call` hook, scoped to the `task` tool only:
 
 1. Resolve the child's target directory — the tool's `cwd` argument if supplied,
    else the parent's cwd — with #1071 parity (`trim → resolve → realpath`).
-2. Classify it structurally with git (`git rev-parse --git-dir` vs
-   `--git-common-dir`, both realpath'd):
-   * **main checkout** — the two name the same directory (`<top>/.git`);
-   * **linked worktree** — `--git-dir` is `<common>/worktrees/<name>`, a
-     different realpath;
+2. Classify it structurally with git:
+   * **main checkout** — `realpath(git-dir) === realpath(git-common-dir)` (`<top>/.git`), **or** the target sits inside the repository's shared git directory (`.git`, a bare repo, or a linked worktree's admin dir);
+   * **linked worktree** — `git-dir` is `<common>/worktrees/<name>`, a different realpath;
    * **non-repo** — git says so, or git could not run.
+   Each flag is read by its own `git rev-parse <flag>` call (never by splitting a combined multi-flag output positionally — a repo path containing a newline would shift the fields and misread a main checkout as a worktree), and both spellings are resolved against the **target's realpath** (#1129 — git mixes relative/absolute output). `--show-toplevel` is best-effort (it fails inside a gitdir and in a bare repo) and can never degrade the classification.
 3. `main` → refuse (default), naming the checkout, the source of the target
    (`cwd` argument vs inherited), and the exact worktree remedy. Everything else
    passes untouched.
@@ -64,24 +63,34 @@ refused, and its message carries the one-command remedy.
 ## Scope
 
 `task` only. The `subagent` tool has the same failure mode but a different input
-shape (per-item `cwd` inside `tasks`/`chain` arrays); it is deliberately out of
-scope here and tracked separately. A `bash`/`read`/… tool call is untouched.
+shape (per-item `cwd` inside `tasks`/`chain` arrays, defaulting to `ctx.cwd` at
+`extensions/subagent/index.ts:1014`); it is deliberately out of scope here and
+tracked as [#1243]. A `bash`/`read`/… tool call is untouched.
 
 ## False positives
 
-Fail-open on unknowns is deliberate. A non-repo target, a missing `git`, and an
-unresolvable path all ALLOW: the gate's failure mode is over-block (friction),
-not a false PASS on something dangerous, and a child in `/tmp` or a fresh
-directory has no shared branch state to damage. A child targeting a directory
-that does not exist is reported asynchronously by the spawn itself (#1071's
-`taskCwdRefusal`) — this gate must not become a second, differently-worded
-refusal for that case.
+Fail-open on unknowns is deliberate. A non-repo target, a missing `git`, an
+unresolvable path, and a **deleted parent cwd** (a reaped worktree) all ALLOW: the
+gate's failure mode is over-block (friction), not a false PASS on something
+dangerous, and a child in `/tmp` or a fresh directory has no shared branch state
+to damage. The parent frame is read lazily and guarded, so a dead `process.cwd()`
+can neither throw out of the `tool_call` hook nor refuse a dispatch that names its
+own absolute `cwd`; the whole hook body is fail-open for the same reason. The git
+probe strips `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/
+`GIT_CEILING_DIRECTORIES`/`GIT_DISCOVERY_ACROSS_FILESYSTEM` from its own env, so an
+ambient redirect cannot make a shared-main target classify as a worktree. A child
+targeting a directory that does not exist is reported asynchronously by the spawn
+itself (#1071's `taskCwdRefusal`) — this gate must not become a second,
+differently-worded refusal for that case.
 
 The structural comparison has no path-substring false negative: a main checkout
 whose own path contains a `worktrees` segment is still classified `main` (the
 historical #618/#621 defect of the substring test). Conversely, a worktree
 *nested inside* the main checkout (`.worktrees/<name>`) is correctly classified
-`worktree` — pinned by `test-cwd-guard.mjs` B5/B6, and mutation-verified.
+`worktree` — pinned by `test-cwd-guard.mjs` B5/B6, and mutation-verified. A target
+inside the shared git directory (`<hub>/.git`, a bare repo, a linked worktree's
+admin dir) is `main`, where `--show-toplevel` fails and a target is literally the
+shared branch state.
 
 ## Tests
 
@@ -89,7 +98,11 @@ historical #618/#621 defect of the substring test). Conversely, a worktree
 node extensions/task-cwd-guard/test-cwd-guard.mjs
 ```
 
-77 assertions, both directions, with real git fixtures: shared main → blocked;
-nested linked worktree → allowed; non-repo → allowed; non-`task` tool untouched.
+104 assertions, both directions, with real git fixtures: shared main → blocked;
+nested linked worktree → allowed; non-repo → allowed; `<hub>/.git` and bare repos
+→ blocked; newline-bearing repo path → blocked; an ambient `GIT_DIR` override →
+still blocked; a deleted parent cwd → no throw; env postures; non-`task` tool
+untouched.
 
 [#1240]: https://github.com/daniel-ospina/agent-infra/issues/1240
+[#1243]: https://github.com/daniel-ospina/agent-infra/issues/1243

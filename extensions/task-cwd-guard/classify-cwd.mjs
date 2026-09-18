@@ -24,6 +24,20 @@
  * segment (the #618/#621 defect documented in main-worktree-guard's
  * classify-git.mjs). Structural equality has no such false negative.
  *
+ * Each flag is read by its OWN `git rev-parse <flag>` call, never by splitting a
+ * combined multi-flag output positionally: a repository root containing a
+ * newline (legal on POSIX) makes one flag occupy two output lines, which shifts
+ * every later field and misreads a main checkout as a worktree — a false PASS.
+ * One flag per call makes the output the value itself; only git's own trailing
+ * newline is stripped.
+ *
+ * A target INSIDE the repository's shared git directory is `main` regardless of
+ * the gitdir/common-dir comparison: inside `<common>/.git` git reports
+ * `--git-dir` as `.` (so the two differ), yet the target IS the shared branch
+ * state — and `--show-toplevel` fails outright there, which is exactly the shape
+ * that must not fall through to "non-repo". The same rule covers a bare repo
+ * (base === commonDir) and a linked worktree's admin dir.
+ *
  * Both git spellings are resolved against the TARGET's realpath, because git
  * prints relative paths when its cwd sits under the gitdir's parent and absolute
  * paths otherwise (#1129's probe: a symlinked `scripts/` made the two halves
@@ -50,7 +64,7 @@
 
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 /** Extension name, for the one-time degradation warning and message prefix. */
 export const GUARD_NAME = "task-cwd-guard";
@@ -66,8 +80,8 @@ export const GUARD_NAME = "task-cwd-guard";
  */
 export const GUARD_ENV = "TASK_CWD_GUARD";
 
-const OFF_VALUES = new Set(["0", "false", "no", "off", "disabled", "disable"]);
-const WARN_VALUES = new Set(["warn", "warning"]);
+const OFF_VALUES = new Set(["0", "false", "no", "off"]);
+const WARN_VALUES = new Set(["warn"]);
 
 /** Resolve `TASK_CWD_GUARD` into "block" | "warn" | "off". */
 export function guardMode(env = {}) {
@@ -88,20 +102,65 @@ export function normalizeDir(p) {
 }
 
 /**
+ * `process.cwd()`, or `null` when it is unavailable. The parent session's cwd
+ * can be GONE (a reaped worktree — this fleet creates that state), and
+ * `process.cwd()` then throws `ENOENT … uv_cwd`. A throw inside a `tool_call`
+ * hook would turn a would-succeed dispatch into a crash, so the frame is read
+ * through this guard and a null frame is handled, never thrown.
+ */
+function safeCwd() {
+  try {
+    return process.cwd();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * #1071 parity: the child's target spawn directory for one dispatch.
  * An explicit `cwd` is trimmed, resolved against the parent frame, and
  * canonicalized (realpath) so it matches the child's own `getcwd()`; a missing
  * target keeps the lexical absolute path. Omitted / blank → the parent frame.
+ *
+ * Returns `null` when the target cannot be resolved at all (an omitted or
+ * RELATIVE target with no readable parent frame). An ABSOLUTE target never
+ * consults the parent frame — exactly like `resolveTaskCwd`, whose `resolve()`
+ * is a no-op on an absolute path — so a deleted parent cwd cannot break a
+ * dispatch that names its own absolute destination.
  */
-export function resolveDispatchCwd(cwd, parentCwd = process.cwd()) {
+export function resolveDispatchCwd(cwd, parentCwd) {
   const trimmed = typeof cwd === "string" ? cwd.trim() : "";
-  if (!trimmed) return normalizeDir(parentCwd);
-  const absolute = resolve(parentCwd, trimmed);
-  try {
-    return realpathSync(absolute);
-  } catch {
-    return absolute;
+  if (!trimmed) {
+    const frame = parentCwd ?? safeCwd();
+    return frame ? normalizeDir(frame) : null;
   }
+  if (isAbsolute(trimmed)) return normalizeDir(trimmed);
+  const frame = parentCwd ?? safeCwd();
+  return frame ? normalizeDir(resolve(frame, trimmed)) : null;
+}
+
+/**
+ * Environment overrides that make git resolve a DIFFERENT repository than the
+ * one the target directory lives in, defeating the structural classification
+ * (a `GIT_DIR=<hub>/.git/worktrees/<name>` export made a shared-main `cwd`
+ * classify `worktree` → ALLOW — a fail-open on the gate's whole purpose). The
+ * probe must answer "what repo does THIS DIRECTORY belong to", so the ambient
+ * redirects are stripped for the probe only (the caller's env is untouched).
+ */
+export const GIT_ENV_OVERRIDES = [
+  "GIT_DIR",
+  "GIT_COMMON_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/** A copy of `env` with the repo-redirecting git overrides removed. */
+export function gitProbeEnv(env = process.env) {
+  const out = { ...env };
+  for (const key of GIT_ENV_OVERRIDES) delete out[key];
+  return out;
 }
 
 /** Default git runner: `git -C <dir> <args...>` → stdout. Throws on failure. */
@@ -110,6 +169,7 @@ export function defaultRunGit(args, dir) {
     encoding: "utf-8",
     timeout: 5000,
     stdio: ["ignore", "pipe", "ignore"],
+    env: gitProbeEnv(process.env),
   });
 }
 
@@ -134,47 +194,50 @@ function isGitUnavailable(err) {
 export function classifyTargetCwd(targetDir, deps = {}) {
   const runGit = deps.runGit ?? defaultRunGit;
   const base = normalizeDir(targetDir);
-  let out;
-  try {
-    out = runGit(["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"], base);
-  } catch (err) {
+  // ONE FLAG PER CALL — never positional parsing of a combined output (a
+  // newline in the path would shift the fields; see the module header). Strip
+  // only git's own trailing newline, never whitespace that may be part of the
+  // path.
+  const rev = (flag) => {
+    try {
+      return { value: String(runGit(["rev-parse", flag], base)).replace(/\r?\n$/, ""), error: null };
+    } catch (err) {
+      return { value: null, error: err };
+    }
+  };
+
+  const gitDirR = rev("--git-dir");
+  const commonR = rev("--git-common-dir");
+  if (gitDirR.error || commonR.error || !gitDirR.value || !commonR.value) {
+    const err = gitDirR.error ?? commonR.error ?? null;
     return {
       kind: "non-repo",
       base,
       topLevel: null,
       gitDir: null,
       commonDir: null,
-      gitError: err instanceof Error ? err.message : String(err),
+      gitError: err
+        ? err instanceof Error
+          ? err.message
+          : String(err)
+        : "git rev-parse returned an empty git-dir/common-dir",
       gitUnavailable: isGitUnavailable(err),
-    };
-  }
-  // One rev-parse, three output lines (order matches the flag order).
-  const [topRaw = "", gitDirRaw = "", commonDirRaw = ""] = String(out).split("\n");
-  if (!gitDirRaw.trim() || !commonDirRaw.trim()) {
-    return {
-      kind: "non-repo",
-      base,
-      topLevel: null,
-      gitDir: null,
-      commonDir: null,
-      gitError: "git rev-parse returned no git-dir/common-dir",
-      gitUnavailable: false,
     };
   }
   // #1129: resolve BOTH spellings against the TARGET's realpath (git mixes
   // relative and absolute output depending on where its cwd sits).
-  const gitDir = normalizeDir(resolve(base, gitDirRaw.trim()));
-  const commonDir = normalizeDir(resolve(base, commonDirRaw.trim()));
-  const topLevel = topRaw.trim() ? normalizeDir(resolve(base, topRaw.trim())) : null;
-  return {
-    kind: gitDir === commonDir ? "main" : "worktree",
-    base,
-    topLevel,
-    gitDir,
-    commonDir,
-    gitError: null,
-    gitUnavailable: false,
-  };
+  const gitDir = normalizeDir(resolve(base, gitDirR.value));
+  const commonDir = normalizeDir(resolve(base, commonR.value));
+  // A target inside the shared git directory IS shared repo state — see the
+  // module header (`.git` reports `--git-dir` as `.`, a bare repo has base ===
+  // commonDir).
+  const insideGitDir = base === commonDir || base.startsWith(commonDir + "/");
+  const kind = insideGitDir || gitDir === commonDir ? "main" : "worktree";
+  // Toplevel is BEST-EFFORT (naming only): it fails inside a gitdir and in a
+  // bare repo, which must not degrade the classification above.
+  const topR = rev("--show-toplevel");
+  const topLevel = topR.error || !topR.value ? null : normalizeDir(resolve(base, topR.value));
+  return { kind, base, topLevel, gitDir, commonDir, gitError: null, gitUnavailable: false };
 }
 
 /** Best-effort current branch of `dir` (`symbolic-ref` → null on detached HEAD). */
@@ -224,7 +287,7 @@ export function renderMainCheckoutMessage({ target, checkout, branch, explicit }
  * @returns {{
  *   action: "allow"|"warn"|"block",
  *   mode: "block"|"warn"|"off",
- *   target: string,
+ *   target: string|null,
  *   kind: "main"|"worktree"|"non-repo"|null,
  *   checkout: string|null,
  *   branch: string|null,
@@ -237,7 +300,10 @@ export function decideTaskCwd(input = {}) {
   const env = input.env ?? {};
   const mode = guardMode(env);
   const explicit = typeof input.cwd === "string" && input.cwd.trim() !== "";
-  const target = resolveDispatchCwd(input.cwd, input.parentCwd ?? process.cwd());
+  // `input.parentCwd === undefined` means "read the parent frame", done
+  // lazily and guarded inside resolveDispatchCwd — NEVER `process.cwd()`
+  // here, which throws for a deleted parent cwd (a reaped worktree).
+  const target = resolveDispatchCwd(input.cwd, input.parentCwd);
   const base = {
     mode,
     target,
@@ -250,6 +316,10 @@ export function decideTaskCwd(input = {}) {
   };
   // Disabled: do not even spawn git (the kill switch is observable as zero cost).
   if (mode === "off") return { ...base, action: "allow" };
+  // The target is unresolvable (no parent frame for an omitted/relative cwd) —
+  // fail open. The spawn itself will report an unspawnable cwd; this gate must
+  // not become a second, differently-worded refusal.
+  if (target === null) return { ...base, action: "allow" };
 
   const facts = classifyTargetCwd(target, input.runGit ? { runGit: input.runGit } : {});
   if (facts.kind !== "main") {

@@ -25,9 +25,11 @@ import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  GIT_ENV_OVERRIDES,
   GUARD_ENV,
   classifyTargetCwd,
   decideTaskCwd,
+  gitProbeEnv,
   guardMode,
   renderMainCheckoutMessage,
   resolveDispatchCwd,
@@ -56,22 +58,42 @@ const MAIN = join(ROOT, "hub");
 const NESTED_WT = join(MAIN, ".worktrees", "feat"); // the real-world geometry
 const OTHER = join(ROOT, "elsewhere"); // exists but is not a repo
 
-/** Fake `git`: MAIN is a main checkout, NESTED_WT a linked worktree of it. */
+/** The `rev-parse` flag (or `symbolic-ref`) an injected runner was called with. */
+const flagOf = (args) => (args[0] === "rev-parse" ? args[1] : args[0]);
+
+/** Fake `git`: MAIN is a main checkout, NESTED_WT a linked worktree of it.
+ * Called ONE FLAG PER INVOCATION (the classifier must not parse a combined
+ * multi-flag output positionally). */
 function fakeGit(calls = []) {
+  const GITDIR = join(MAIN, ".git");
   const run = (args, dir) => {
     calls.push({ args, dir });
-    if (args[0] === "symbolic-ref") {
-      if (dir === MAIN || dir.startsWith(MAIN + "/") && !dir.startsWith(NESTED_WT)) return "main\n";
-      if (dir.startsWith(NESTED_WT)) return "feat/nested\n";
+    const flag = flagOf(args);
+    const inWt = dir === NESTED_WT || dir.startsWith(NESTED_WT + "/");
+    const inGitDir = dir === GITDIR || dir.startsWith(GITDIR + "/");
+    const inMain = (dir === MAIN || dir.startsWith(MAIN + "/")) && !inWt && !inGitDir;
+    if (flag === "symbolic-ref") {
+      if (inWt) return "feat/nested\n";
+      if (inMain || inGitDir) return "main\n";
       throw new Error("fatal: not a git repository");
     }
-    if (dir === NESTED_WT || dir.startsWith(NESTED_WT + "/")) {
-      return `${NESTED_WT}\n${join(MAIN, ".git", "worktrees", "feat")}\n${join(MAIN, ".git")}\n`;
+    if (flag === "--git-dir") {
+      if (inGitDir) return ".\n"; // inside the gitdir git reports the cwd
+      if (inWt) return join(GITDIR, "worktrees", "feat") + "\n";
+      if (inMain) return GITDIR + "\n";
+      throw new Error("fatal: not a git repository");
     }
-    if (dir === MAIN || dir.startsWith(MAIN + "/")) {
-      return `${MAIN}\n${join(MAIN, ".git")}\n${join(MAIN, ".git")}\n`;
+    if (flag === "--git-common-dir") {
+      if (inGitDir || inWt || inMain) return GITDIR + "\n";
+      throw new Error("fatal: not a git repository");
     }
-    throw new Error("fatal: not a git repository");
+    if (flag === "--show-toplevel") {
+      if (inGitDir) throw new Error("fatal: this operation must be run in a work tree");
+      if (inWt) return NESTED_WT + "\n";
+      if (inMain) return MAIN + "\n";
+      throw new Error("fatal: not a git repository");
+    }
+    throw new Error(`unexpected flag ${flag}`);
   };
   return Object.assign(run, { calls });
 }
@@ -159,6 +181,11 @@ function fakeGit(calls = []) {
   equal("A9f warn → warn", guardMode({ [GUARD_ENV]: "warn" }), "warn");
   equal("A9g 0 → off", guardMode({ [GUARD_ENV]: "0" }), "off");
   equal("A9h off → off", guardMode({ [GUARD_ENV]: "off" }), "off");
+  // Undocumented aliases removed (review): the README/doc contract enumerates
+  // only 0/false/no/off and warn — `disabled`/`warning` must stay ENFORCING.
+  equal("A9i-1 'disabled' → block (not a documented off)", guardMode({ [GUARD_ENV]: "disabled" }), "block");
+  equal("A9i-2 'disable' → block", guardMode({ [GUARD_ENV]: "disable" }), "block");
+  equal("A9i-3 'warning' → block (not a documented warn)", guardMode({ [GUARD_ENV]: "warning" }), "block");
   const d = decideTaskCwd({ cwd: MAIN, parentCwd: MAIN, env: { [GUARD_ENV]: "1" }, runGit: fakeGit() });
   equal("A9i TASK_CWD_GUARD=1 ENFORCES (blocks)", d.action, "block");
 }
@@ -187,8 +214,11 @@ function fakeGit(calls = []) {
     // git is injected, but realpathSync runs for real — the alias must be
     // resolved to `real` before the classification sees it.
     const aliasGit = (args, dir) => {
-      if (args[0] === "symbolic-ref") return "main\n";
-      return `${real}\n${join(real, ".git")}\n${join(real, ".git")}\n`;
+      const flag = flagOf(args);
+      if (flag === "symbolic-ref") return "main\n";
+      if (flag === "--show-toplevel") return `${real}\n`;
+      if (flag === "--git-dir" || flag === "--git-common-dir") return `${join(real, ".git")}\n`;
+      throw new Error(`unexpected flag ${flag}`);
     };
     const viaLink = decideTaskCwd({ cwd: link, parentCwd: tmp, env: {}, runGit: aliasGit });
     equal("A11c symlinked alias of a main checkout → block", viaLink.action, "block");
@@ -202,8 +232,11 @@ function fakeGit(calls = []) {
 // A12 — detached HEAD is named honestly, never as a wrong branch.
 {
   const detached = (args, dir) => {
-    if (args[0] === "symbolic-ref") throw new Error("fatal: ref HEAD is not a symbolic ref");
-    return `${MAIN}\n${join(MAIN, ".git")}\n${join(MAIN, ".git")}\n`;
+    const flag = flagOf(args);
+    if (flag === "symbolic-ref") throw new Error("fatal: ref HEAD is not a symbolic ref");
+    if (flag === "--show-toplevel") return `${MAIN}\n`;
+    if (flag === "--git-dir" || flag === "--git-common-dir") return `${join(MAIN, ".git")}\n`;
+    throw new Error(`unexpected flag ${flag}`);
   };
   const d = decideTaskCwd({ cwd: MAIN, parentCwd: MAIN, env: {}, runGit: detached });
   check("A12a detached HEAD → message says so", /\(detached HEAD\)/.test(d.message), d.message.slice(0, 80));
@@ -236,6 +269,110 @@ function fakeGit(calls = []) {
 {
   const msg = renderMainCheckoutMessage({ target: MAIN, checkout: MAIN, branch: null, explicit: false });
   check("A15a no-branch render is still a full message", msg.includes(MAIN) && msg.includes("Remedy"));
+}
+
+// A16 — INSIDE the repository's shared git directory. Inside `<hub>/.git` git
+// reports `--git-dir` as `.` (differing from the common dir) and
+// `--show-toplevel` FAILS — which must not collapse to non-repo/allow.
+{
+  const plain = decideTaskCwd({ cwd: join(MAIN, ".git"), parentCwd: MAIN, env: {}, runGit: fakeGit() });
+  equal("A16a cwd=<hub>/.git → block", plain.action, "block");
+  equal("A16b kind=main", plain.kind, "main");
+  const admin = join(MAIN, ".git", "worktrees", "feat");
+  const facts = classifyTargetCwd(admin, { runGit: fakeGit() });
+  check(
+    "A16c a linked worktree's ADMIN dir (gitDir != commonDir, inside .git) → main",
+    facts.kind === "main" && facts.gitDir !== facts.commonDir,
+    JSON.stringify({ kind: facts.kind, gitDir: facts.gitDir, commonDir: facts.commonDir }),
+  );
+  const viaDecide = decideTaskCwd({ cwd: admin, parentCwd: MAIN, env: {}, runGit: fakeGit() });
+  equal("A16d ...and the decision blocks it", viaDecide.action, "block");
+}
+
+// A17 — bare repo: base === commonDir, and `--show-toplevel` fails there too.
+{
+  const bare = "/tcg-fake-1240/bare.git";
+  const bareGit = (args, dir) => {
+    const flag = flagOf(args);
+    if (flag === "symbolic-ref") return "main\n";
+    if (flag === "--show-toplevel") throw new Error("fatal: this operation must be run in a work tree");
+    if (flag === "--git-dir" || flag === "--git-common-dir") return `${bare}\n`;
+    throw new Error(`unexpected flag ${flag}`);
+  };
+  const d = decideTaskCwd({ cwd: bare, parentCwd: MAIN, env: {}, runGit: bareGit });
+  equal("A17a bare repo target → block", d.action, "block");
+  equal("A17b kind=main", d.kind, "main");
+  equal("A17c bare repo with no toplevel still names a checkout", typeof d.checkout, "string");
+}
+
+// A19 — a DELETED parent cwd (a reaped worktree) must not throw and must not
+// block a dispatch that names its own absolute destination. `resolveTaskCwd`#1071
+// never needs the parent frame for an absolute target; neither may the guard.
+{
+  const realCwd = process.cwd;
+  const boom = () => {
+    throw new Error("ENOENT: no such file or directory, uv_cwd");
+  };
+  process.cwd = boom;
+  try {
+    let threw = false;
+    let abs;
+    const absDecision = { action: null };
+    let mainDecision = { action: null };
+    let omitted;
+    try {
+      abs = resolveDispatchCwd(NESTED_WT, undefined);
+      Object.assign(absDecision, decideTaskCwd({ cwd: NESTED_WT, parentCwd: undefined, env: {}, runGit: fakeGit() }));
+      Object.assign(mainDecision, decideTaskCwd({ cwd: MAIN, parentCwd: undefined, env: {}, runGit: fakeGit() }));
+      omitted = decideTaskCwd({ parentCwd: undefined, env: {}, runGit: fakeGit() });
+    } catch {
+      threw = true;
+    }
+    check("A19a a deleted parent cwd never throws", !threw);
+    equal("A19b absolute cwd resolves without the parent frame", abs, NESTED_WT);
+    equal("A19c explicit absolute worktree cwd → allow", absDecision.action, "allow");
+    equal("A19d explicit absolute MAIN cwd → still blocks", mainDecision.action, "block");
+    equal("A19e omitted cwd + no readable frame → allow (unresolvable, fail-open)", omitted.action, "allow");
+    check("A19f ...and its target is null, not a fabricated path", omitted.target === null, JSON.stringify(omitted.target));
+  } finally {
+    process.cwd = realCwd;
+  }
+}
+
+// A20 — the git probe strips repo-redirecting env overrides (an ambient
+// `GIT_DIR` made a shared-main cwd classify as a worktree → fail-open).
+{
+  const env = gitProbeEnv({
+    PATH: "/usr/bin",
+    GIT_DIR: "/x/.git/worktrees/feat",
+    GIT_COMMON_DIR: "/x/.git",
+    GIT_WORK_TREE: "/x",
+    GIT_INDEX_FILE: "/x/.git/index",
+    GIT_CEILING_DIRECTORIES: "/x",
+    GIT_DISCOVERY_ACROSS_FILESYSTEM: "1",
+  });
+  equal("A20a PATH survives", env.PATH, "/usr/bin");
+  check(
+    "A20b every repo-redirecting override is stripped",
+    GIT_ENV_OVERRIDES.every((k) => !(k in env)),
+    JSON.stringify(GIT_ENV_OVERRIDES.filter((k) => k in env)),
+  );
+}
+{
+  const nlMain = "/tcg-fake-1240/hub\nX";
+  const nlGit = join(nlMain, ".git");
+  const nlGitRun = (args, dir) => {
+    const flag = flagOf(args);
+    if (flag === "symbolic-ref") return "main\n";
+    if (flag === "--show-toplevel") return `${nlMain}\n`;
+    if (flag === "--git-dir" || flag === "--git-common-dir") return `${nlGit}\n`;
+    throw new Error(`unexpected flag ${flag}`);
+  };
+  const facts = classifyTargetCwd(nlMain, { runGit: nlGitRun });
+  equal("A18a newline-in-path main checkout → main", facts.kind, "main");
+  const d = decideTaskCwd({ cwd: nlMain, parentCwd: "/tcg-fake-1240", env: {}, runGit: nlGitRun });
+  equal("A18b ...and it blocks", d.action, "block");
+  equal("A18c the newline survives in the parsed path", facts.gitDir, nlGit);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -418,6 +555,67 @@ try {
     mkdirSync(join(det, "sub"), { recursive: true });
     const r = await callTask(det, { prompt: "do x", cwd: join(det, "sub") });
     check("B14 detached-HEAD main checkout → BLOCKED", blocked(r), JSON.stringify(r));
+  }
+
+  // B15 — the `.git` directory itself (review P1): `--show-toplevel` FAILS here,
+  // and the old combined probe collapsed that to non-repo → ALLOW.
+  {
+    const r = await callTask(hub, { prompt: "do x", cwd: join(hub, ".git") });
+    check("B15 cwd=<hub>/.git → BLOCKED (shared git state)", blocked(r), JSON.stringify(r));
+  }
+
+  // B16 — a bare repo (review P1): base === commonDir, no work tree.
+  {
+    const bare = join(tmp, "bare.git");
+    git(["init", "-q", "--bare", bare], tmp);
+    const r = await callTask(tmp, { prompt: "do x", cwd: bare });
+    check("B16 bare repo target → BLOCKED", blocked(r), JSON.stringify(r));
+  }
+
+  // B17 — a repository root containing a NEWLINE (review P2): positional parsing
+  // of a combined rev-parse output misread this as a worktree → ALLOW.
+  {
+    const nl = join(tmp, "hub\nX");
+    git(["-c", "init.defaultBranch=main", "init", "-q", nl], tmp);
+    const r = await callTask(tmp, { prompt: "do x", cwd: nl });
+    check("B17 newline-in-path main checkout → BLOCKED", blocked(r), JSON.stringify(r));
+  }
+
+  // B18 — an ambient GIT_DIR override (review P2) must not defeat the probe.
+  {
+    const savedGitDir = process.env.GIT_DIR;
+    process.env.GIT_DIR = join(hub, ".git", "worktrees", "feat");
+    try {
+      const r = await callTask(hub);
+      check("B18 ambient GIT_DIR override → still BLOCKED", blocked(r), JSON.stringify(r));
+    } finally {
+      if (savedGitDir === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = savedGitDir;
+    }
+  }
+
+  // B19 — a DELETED parent cwd (review P1) must not throw out of the hook, and
+  // an explicit ABSOLUTE worktree `cwd` must still be allowed.
+  {
+    const realCwd = process.cwd;
+    process.cwd = () => {
+      throw new Error("ENOENT: no such file or directory, uv_cwd");
+    };
+    try {
+      let threw = false;
+      let r;
+      try {
+        // Call the handler DIRECTLY — not via `inDir`, whose own
+        // `process.cwd()` bookkeeping would throw first and mask the hook.
+        r = await toolCall({ toolName: "task", input: { prompt: "do x", cwd: wt } }, ctx);
+      } catch {
+        threw = true;
+      }
+      check("B19a deleted parent cwd → no throw out of the hook", !threw);
+      check("B19b explicit absolute worktree cwd → ALLOWED", allowed(r), JSON.stringify(r));
+    } finally {
+      process.cwd = realCwd;
+    }
   }
 } finally {
   if (savedEnv === undefined) delete process.env[GUARD_ENV];

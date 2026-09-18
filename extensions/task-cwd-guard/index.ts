@@ -43,39 +43,58 @@ interface TaskToolInput {
 /** One-time notice when git itself is unavailable (never per-dispatch spam). */
 let warnedGitUnavailable = false;
 
+/** One-time notice when the guard could not evaluate a dispatch (never a per-call spam). */
+let warnedGuardError = false;
+
 export default function taskCwdGuard(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event, ctx) => {
-    if (!isToolCallEventType<"task", TaskToolInput>("task", event)) return undefined;
+    // A throw here would break the tool call itself, so the WHOLE body is
+    // fail-open: a guard that cannot evaluate must never refuse a dispatch.
+    try {
+      if (!isToolCallEventType<"task", TaskToolInput>("task", event)) return undefined;
 
-    const decision = decideTaskCwd({
-      cwd: event.input?.cwd,
-      parentCwd: process.cwd(),
-      env: process.env,
-    });
+      // `parentCwd` is deliberately NOT read here — the resolver reads the
+      // parent frame lazily and guarded, so a deleted parent cwd (a reaped
+      // worktree) cannot throw, and an explicit ABSOLUTE `cwd` never consults
+      // it at all.
+      const decision = decideTaskCwd({
+        cwd: event.input?.cwd,
+        env: process.env,
+      });
 
-    if (decision.action === "allow") {
-      if (decision.gitUnavailable && !warnedGitUnavailable) {
-        warnedGitUnavailable = true;
+      if (decision.action === "allow") {
+        if (decision.gitUnavailable && !warnedGitUnavailable) {
+          warnedGitUnavailable = true;
+          console.warn(
+            `[${GUARD_NAME}] ⚠️ git could not be executed — shared-main-checkout detection is OFF ` +
+              `for this session (a target that cannot be classified is allowed).`,
+          );
+        }
+        return undefined;
+      }
+
+      if (decision.action === "warn") {
+        // Warn posture: an operator-visible notice, never a block.
+        try {
+          ctx?.ui?.notify?.(decision.message, "warning");
+        } catch {
+          /* UI unavailable (print/JSON mode) — the stderr line below still lands. */
+        }
+        console.warn(`[${GUARD_NAME}]\n${decision.message}`);
+        return undefined;
+      }
+
+      return { block: true, reason: decision.message };
+    } catch (err) {
+      if (!warnedGuardError) {
+        warnedGuardError = true;
         console.warn(
-          `[${GUARD_NAME}] ⚠️ git could not be executed — shared-main-checkout detection is OFF ` +
-            `for this session (a target that cannot be classified is allowed).`,
+          `[${GUARD_NAME}] ⚠️ could not evaluate a task dispatch — allowing it (fail-open): ` +
+            String(err instanceof Error ? err.message : err),
         );
       }
       return undefined;
     }
-
-    if (decision.action === "warn") {
-      // Warn posture: an operator-visible notice, never a block.
-      try {
-        ctx?.ui?.notify?.(decision.message, "warning");
-      } catch {
-        /* UI unavailable (print/JSON mode) — the stderr line below still lands. */
-      }
-      console.warn(`[${GUARD_NAME}]\n${decision.message}`);
-      return undefined;
-    }
-
-    return { block: true, reason: decision.message };
   });
 }
 
