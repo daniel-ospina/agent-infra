@@ -1,0 +1,185 @@
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+index 9ae0f0e..a41358b 100644
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -67,6 +67,17 @@ import {
+ 	shouldCompact,
+ } from "./compaction/index.ts";
+ import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
++
++/**
++ * Cap on CONSECUTIVE compact-and-retry attempts for one overflow / truncation episode.
++ *
++ * Recovery has to be bounded — each attempt spends a summarization call, and a compaction that
++ * cannot relieve the pressure must end in a reported failure rather than an endless compact loop.
++ * It must not be a LATCH, though: as a boolean, a `length` stop never cleared it, so the one
++ * recovery a session was allowed could not be re-armed and the session stayed alive-but-dead,
++ * returning 1-token turns forever. See `_overflowRecoveryAttempt`.
++ */
++const MAX_OVERFLOW_RECOVERY_ATTEMPTS = 3;
+ import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
+ import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
+ import {
+@@ -336,7 +347,13 @@ export class AgentSession {
+ 	// Compaction state
+ 	private _compactionAbortController: AbortController | undefined = undefined;
+ 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+-	private _overflowRecoveryAttempted = false;
++	/**
++	 * Consecutive compact-and-retry attempts spent in the current overflow / truncation episode.
++	 * Reset to 0 by a turn that ends normally and by a new user message; capped at
++	 * `MAX_OVERFLOW_RECOVERY_ATTEMPTS` so a compaction that cannot relieve the pressure reports a
++	 * failure instead of looping.
++	 */
++	private _overflowRecoveryAttempt = 0;
+ 
+ 	// Branch summarization state
+ 	private _branchSummaryAbortController: AbortController | undefined = undefined;
+@@ -660,7 +677,7 @@ export class AgentSession {
+ 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
+ 		// This ensures the UI sees the updated queue state
+ 		if (event.type === "message_start" && event.message.role === "user") {
+-			this._overflowRecoveryAttempted = false;
++			this._overflowRecoveryAttempt = 0;
+ 			const messageText = contentText(event.message.content, "");
+ 			if (messageText) {
+ 				// Check steering queue first
+@@ -713,7 +730,7 @@ export class AgentSession {
+ 
+ 				const assistantMsg = event.message as AssistantMessage;
+ 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
+-					this._overflowRecoveryAttempted = false;
++					this._overflowRecoveryAttempt = 0;
+ 				}
+ 
+ 				// Reset retry counter immediately on successful assistant response
+@@ -2264,10 +2281,11 @@ export class AgentSession {
+ 				return await this._runAutoCompaction("overflow", false);
+ 			}
+ 
+-			if (this._overflowRecoveryAttempted) {
++			if (this._overflowRecoveryAttempt >= MAX_OVERFLOW_RECOVERY_ATTEMPTS) {
++				const attempts = `${MAX_OVERFLOW_RECOVERY_ATTEMPTS} compact-and-retry attempts`;
+ 				const errorMessage = contextOverflow
+-					? "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
+-					: "Truncated response recovery failed after one compact-and-retry attempt.";
++					? `Context overflow recovery failed after ${attempts}. Try reducing context or switching to a larger-context model.`
++					: `Truncated response recovery failed after ${attempts}.`;
+ 				this._emit({
+ 					type: "compaction_end",
+ 					reason: "overflow",
+@@ -2287,8 +2305,9 @@ export class AgentSession {
+ 			}
+ 
+ 			// Case 1: remove the failed or truncated message from agent state, compact, and
+-			// retry once. The message remains in session history but is excluded from retry context.
+-			this._overflowRecoveryAttempted = true;
++			// retry. The message remains in session history but is excluded from retry context.
++			// Bounded by MAX_OVERFLOW_RECOVERY_ATTEMPTS — see the field comment.
++			this._overflowRecoveryAttempt++;
+ 			const messages = this.agent.state.messages;
+ 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+ 				this.agent.state.messages = messages.slice(0, -1);
+diff --git a/packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts b/packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts
+index 8c1769d..4c5c9fb 100644
+--- a/packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts
++++ b/packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts
+@@ -132,7 +132,7 @@ describe("AgentSession auto-compaction queue resume", () => {
+ 		expect(continueSpy).not.toHaveBeenCalled();
+ 	});
+ 
+-	it("should not compact repeatedly after overflow recovery already attempted", async () => {
++	it("should stop compacting after the bounded number of overflow recovery attempts", async () => {
+ 		const model = session.model!;
+ 		const overflowMessage: AssistantMessage = {
+ 			role: "assistant",
+@@ -177,13 +177,15 @@ describe("AgentSession auto-compaction queue resume", () => {
+ 
+ 		await checkCompaction(overflowMessage);
+ 		await checkCompaction({ ...overflowMessage, timestamp: Date.now() + 1 });
++		await checkCompaction({ ...overflowMessage, timestamp: Date.now() + 2 });
++		await checkCompaction({ ...overflowMessage, timestamp: Date.now() + 3 });
+ 
+-		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(1);
++		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(3);
+ 		expect(events).toContainEqual({
+ 			type: "compaction_end",
+ 			reason: "overflow",
+ 			errorMessage:
+-				"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
++				"Context overflow recovery failed after 3 compact-and-retry attempts. Try reducing context or switching to a larger-context model.",
+ 		});
+ 	});
+ 
+diff --git a/packages/coding-agent/test/suite/agent-session-compaction.test.ts b/packages/coding-agent/test/suite/agent-session-compaction.test.ts
+index 62dc2f1..ad19d6e 100644
+--- a/packages/coding-agent/test/suite/agent-session-compaction.test.ts
++++ b/packages/coding-agent/test/suite/agent-session-compaction.test.ts
+@@ -669,7 +669,7 @@ describe("AgentSession compaction characterization", () => {
+ 		expect(harness.eventsOfType("compaction_start")).toHaveLength(0);
+ 	});
+ 
+-	it("stops after one compact-and-retry when a second response is also truncated", async () => {
++	it("stops after the bounded number of compact-and-retry attempts when responses keep truncating", async () => {
+ 		const harness = await createHarness({
+ 			models: [{ id: "faux-1", contextWindow: 1_000_000, maxTokens: 100 }],
+ 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+@@ -690,14 +690,16 @@ describe("AgentSession compaction characterization", () => {
+ 		harness.setResponses([
+ 			() => fauxAssistantMessage("x".repeat(64), { stopReason: "length", timestamp: Date.now() + 10_000 }),
+ 			() => fauxAssistantMessage("y".repeat(64), { stopReason: "length", timestamp: Date.now() + 10_000 }),
++			() => fauxAssistantMessage("z".repeat(64), { stopReason: "length", timestamp: Date.now() + 10_000 }),
++			() => fauxAssistantMessage("w".repeat(64), { stopReason: "length", timestamp: Date.now() + 10_000 }),
+ 		]);
+ 
+ 		await harness.session.prompt("x".repeat(5000));
+ 
+-		expect(harness.faux.state.callCount).toBe(2);
+-		expect(harness.eventsOfType("compaction_start").filter((event) => event.reason === "overflow")).toHaveLength(1);
++		expect(harness.faux.state.callCount).toBe(4);
++		expect(harness.eventsOfType("compaction_start").filter((event) => event.reason === "overflow")).toHaveLength(3);
+ 		expect(harness.eventsOfType("compaction_end").at(-1)?.errorMessage).toBe(
+-			"Truncated response recovery failed after one compact-and-retry attempt.",
++			"Truncated response recovery failed after 3 compact-and-retry attempts.",
+ 		);
+ 	});
+ 
+@@ -722,10 +724,12 @@ describe("AgentSession compaction characterization", () => {
+ 
+ 		await sessionInternals._checkCompaction(lengthOverflowMessage);
+ 		await sessionInternals._checkCompaction({ ...lengthOverflowMessage, timestamp: Date.now() + 1 });
++		await sessionInternals._checkCompaction({ ...lengthOverflowMessage, timestamp: Date.now() + 2 });
++		await sessionInternals._checkCompaction({ ...lengthOverflowMessage, timestamp: Date.now() + 3 });
+ 
+-		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(1);
++		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(3);
+ 		expect(compactionErrors).toContain(
+-			"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
++			"Context overflow recovery failed after 3 compact-and-retry attempts. Try reducing context or switching to a larger-context model.",
+ 		);
+ 	});
+ 
+@@ -799,7 +803,7 @@ describe("AgentSession compaction characterization", () => {
+ 		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
+ 	});
+ 
+-	it("does not retry overflow recovery more than once", async () => {
++	it("does not retry overflow recovery more than the bounded number of attempts", async () => {
+ 		const harness = await createHarness();
+ 		harnesses.push(harness);
+ 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+@@ -818,10 +822,12 @@ describe("AgentSession compaction characterization", () => {
+ 
+ 		await sessionInternals._checkCompaction(overflowMessage);
+ 		await sessionInternals._checkCompaction({ ...overflowMessage, timestamp: Date.now() + 1 });
++		await sessionInternals._checkCompaction({ ...overflowMessage, timestamp: Date.now() + 2 });
++		await sessionInternals._checkCompaction({ ...overflowMessage, timestamp: Date.now() + 3 });
+ 
+-		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(1);
++		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(3);
+ 		expect(compactionErrors).toContain(
+-			"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
++			"Context overflow recovery failed after 3 compact-and-retry attempts. Try reducing context or switching to a larger-context model.",
+ 		);
+ 	});
+ 
