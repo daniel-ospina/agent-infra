@@ -2482,6 +2482,156 @@ grep -q '^rerun-timeout=110$' "$TMP/out" \
   && pass "(P2-13b) …and the minimum (100 + 10) is enforced in decimal" \
   || fail "(P2-13b) the minimum was not enforced in decimal: $(head -1 "$TMP/out")"
 
+# ── 44. THE `10#` BELT IS DECIMAL — PINNED BEYOND THE REFUSAL GATE (#1167 review P2) ──
+# Section 43 pins the REFUSAL of a leading zero, and that refusal exits FIRST: a
+# leading-zero knob is rejected before any `$((…))` site consumes it, so removing a
+# `10#` prefix changes nothing observable through the rail's front door — the exact
+# coverage hole this section closes. It loads the rail's function definitions (the
+# `main "$@"` entrypoint stripped) into a subshell and STUBS the refusal predicate
+# `counter_has_leading_zero`, so the arithmetic runs on a leading-zero operand and
+# the BASE is the only thing left deciding the outcome:
+#   * `validate_timing_knobs` and `main` are called directly, exercising
+#     `min_ceiling` (:440) and `min_wait` (:1092) — both operands of each;
+#   * `wait_for_run` is called directly with POLL_INTERVAL=010, exercising all four
+#     `+ 10#$step` advances (:816/:818/:824/:831) via the poll count and rc;
+#   * the file-scope `2 x` default (:220) is UNREACHABLE through its `case` guard (a
+#     leading zero is routed to the no-expansion branch), so its expression is read
+#     AS WRITTEN from the artifact and evaluated with a leading-zero operand.
+# EVERY assertion below goes RED when its `10#` is removed — each of the nine
+# prefixes was mutated in turn to prove it.
+echo "== 44. the 10# belt is decimal (independent of the refusal gate) =="
+
+# The rail's definitions with the entrypoint stripped. The refusal predicate and
+# `sleep` are stubbed in the probe: the whole point is to run the arithmetic the
+# gate normally shields, and `sleep 010` would really sleep 10s ten times over.
+BELT_DEFS="$TMP/belt-defs.sh"
+sed '$d' "$ADM" > "$BELT_DEFS"
+BELT_PROBE="$TMP/belt-probe.sh"
+cat > "$BELT_PROBE" <<'BELTEOF'
+set -uo pipefail
+. "$BELT_DEFS"
+counter_has_leading_zero() { return 1; }   # the refusal gate no longer intervenes
+sleep() { :; }                             # never wait; the arithmetic is the subject
+eval "$BELT_EVAL"
+BELTEOF
+
+# (B0) POSITIVE CONTROL — the harness is not "always refuses". With the belt in
+# place a floor that CLEARS the decimal minimum (110) is accepted, so a broken
+# probe cannot read as a pass.
+env BELT_DEFS="$BELT_DEFS" BELT_EVAL='validate_timing_knobs' \
+  ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=110 \
+  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
+[ "$?" -eq 0 ] && pass "(B0) the bypassed harness ACCEPTS a floor that clears the decimal minimum" \
+  || fail "(B0) the decimal control config was refused: $(head -1 "$TMP/err")"
+
+# (B1) :440 min_ceiling, the STALL operand. 10#0100 + 10#10 = 110 decimal, so a
+# floor of 100 is REFUSED; octal-reading the minimum is 64 + 10 = 74 and 100 clears
+# it. Pre-removal rc=1; with the prefix gone rc=0.
+env BELT_DEFS="$BELT_DEFS" BELT_EVAL='validate_timing_knobs' \
+  ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=100 \
+  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
+rc=$?
+{ [ "$rc" -eq 1 ] && grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='100'" "$TMP/err"; } \
+  && pass "(B1) min_ceiling reads STALL=0100 as DECIMAL (floor 100 < 110 → refused)" \
+  || fail "(B1) min_ceiling read 0100 as octal 64 (rc=$rc; a floor of 100 would clear 74)"
+
+# (B2) :440 min_ceiling, the STEP operand. STALL=100, POLL=010 → decimal 100 + 10 =
+# 110 refuses a floor of 109; octal 100 + 8 = 108 accepts it.
+env BELT_DEFS="$BELT_DEFS" BELT_EVAL='validate_timing_knobs' \
+  ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=010 ADMIN_MERGE_RERUN_FLOOR=109 \
+  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
+rc=$?
+{ [ "$rc" -eq 1 ] && grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='109'" "$TMP/err"; } \
+  && pass "(B2) min_ceiling reads POLL=010 as DECIMAL (floor 109 < 110 → refused)" \
+  || fail "(B2) min_ceiling read 010 as octal 8 (rc=$rc; a floor of 109 would clear 108)"
+
+# (B3) :1092 min_wait, the STALL operand — the reviewer's exact mutation site. An
+# explicit --rerun-timeout 100 must be REFUSED because the decimal minimum is
+# 0100 + 10 = 110; octal-reading it is 64 + 10 = 74 and 100 clears that.
+env BELT_DEFS="$BELT_DEFS" BELT_EVAL='main --print-bounds --rerun-timeout 100' \
+  ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=110 \
+  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
+rc=$?
+{ [ "$rc" -eq 2 ] && grep -q "refusing --rerun-timeout '100'" "$TMP/err"; } \
+  && pass "(B3) min_wait reads STALL=0100 as DECIMAL (timeout 100 < 110 → refused)" \
+  || fail "(B3) min_wait read 0100 as octal 64 (rc=$rc) — the mutation the review reproduced"
+
+# (B4) :1092 min_wait, the STEP operand. STALL=100, POLL=010, --rerun-timeout 109 →
+# decimal 100 + 10 = 110 refuses it; octal 100 + 8 = 108 accepts it.
+env BELT_DEFS="$BELT_DEFS" BELT_EVAL='main --print-bounds --rerun-timeout 109' \
+  ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=010 ADMIN_MERGE_RERUN_FLOOR=110 \
+  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
+rc=$?
+{ [ "$rc" -eq 2 ] && grep -q "refusing --rerun-timeout '109'" "$TMP/err"; } \
+  && pass "(B4) min_wait reads POLL=010 as DECIMAL (timeout 109 < 110 → refused)" \
+  || fail "(B4) min_wait read 010 as octal 8 (rc=$rc)"
+
+# The four `wait_for_run` advances, driven directly with POLL=010. The step is
+# DECIMAL 10 when the belt holds, so each window is reached on the poll count below;
+# an octal step of 8 stretches every one of them (counts 14 for the first, 13 for
+# the rest). rc comes from the return code, the count from the fake gh's calls.
+belt_wait() {  # belt_wait <frozen|unknown|changing> <stall> <timeout>
+  local mode="$1" stall="$2" timeout="$3" cnt="$TMP/belt-calls-$1-$2-$3" snippet
+  : > "$cnt"
+  snippet='belt_fake_gh() { printf "x\n" >> "$BELT_CNT"; case "$BELT_MODE" in
+      frozen)   printf "in_progress 2024-01-01T00:00:00Z\n" ;;
+      unknown)  printf "unknown \n" ;;
+      changing) printf "in_progress 2024-01-01T00:00:%s Z\n" "$(wc -l < "$BELT_CNT" | tr -d " ")" ;;
+    esac; }
+wait_for_run 1; belt_rc=$?
+printf "rc=%s polls=%s\n" "$belt_rc" "$(wc -l < "$BELT_CNT" | tr -d " ")"'
+  env BELT_DEFS="$BELT_DEFS" BELT_EVAL="$snippet" \
+      BELT_MODE="$mode" BELT_CNT="$cnt" ADMIN_MERGE_GH=belt_fake_gh \
+      RERUN_TIMEOUT="$timeout" RERUN_TIMEOUT_SOURCE=test \
+      ADMIN_MERGE_STALL_SECONDS="$stall" ADMIN_MERGE_POLL_INTERVAL=010 \
+      bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
+  local line
+  line="$(grep -E '^rc=[0-9]+ polls=[0-9]+$' "$TMP/out" | tail -1)"
+  BELT_RC="${line#rc=}"; BELT_RC="${BELT_RC%% *}"
+  BELT_POLLS="${line##*polls=}"
+}
+
+# (B5) :824 idle. A FROZEN clock reaches STALLED (rc=1) on the 11th poll with a
+# decimal step (the first poll only records `last_upd`); an octal step needs 14.
+belt_wait frozen 100 1000
+{ [ "$BELT_RC" = 1 ] && [ "$BELT_POLLS" = 11 ]; } \
+  && pass "(B5) wait_for_run idle advance (:824) is DECIMAL — STALLED on poll 11" \
+  || fail "(B5) idle advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want 11)"
+
+# (B6) :816 unobs. An UNREADABLE run reaches UNOBSERVABLE (rc=3) after 10 decimal
+# polls; an octal step needs 13.
+belt_wait unknown 100 1000
+{ [ "$BELT_RC" = 3 ] && [ "$BELT_POLLS" = 10 ]; } \
+  && pass "(B6) wait_for_run unobs advance (:816) is DECIMAL — UNOBSERVABLE on poll 10" \
+  || fail "(B6) unobs advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want 10)"
+
+# (B7) :818 waited, in the unobservable branch. With a stall far above the ceiling
+# the loop exits at the CEILING (rc=2) after 10 decimal polls; an octal step needs 13.
+belt_wait unknown 1000 100
+{ [ "$BELT_RC" = 2 ] && [ "$BELT_POLLS" = 10 ]; } \
+  && pass "(B7) wait_for_run waited/UNOBS branch (:818) is DECIMAL — CEILING on poll 10" \
+  || fail "(B7) the :818 advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want 10)"
+
+# (B8) :831 waited, on the progressing branch. Same ceiling, but the clock MOVES each
+# poll so `idle` never fires; the exit is the ceiling after 10 decimal polls.
+belt_wait changing 1000 100
+{ [ "$BELT_RC" = 2 ] && [ "$BELT_POLLS" = 10 ]; } \
+  && pass "(B8) wait_for_run waited advance (:831) is DECIMAL — CEILING on poll 10" \
+  || fail "(B8) the :831 advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want 10)"
+
+# (B9) :220 the file-scope `2 x` default. Its `10#` is unreachable through the case
+# guard, so the EXPRESSION is read as written and evaluated with STALL=0100: the
+# belt yields 2 x 100 = 200; the octal default yields 2 x 64 = 128.
+belt_line220="$(grep -m1 'RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-\$((' "$ADM")"
+belt_expr220="$(printf '%s\n' "$belt_line220" | sed -n 's/.*\$((\(.*\))).*/\1/p')"
+# eval, not a bare `$(( $belt_expr220 ))`: bash expands a parameter ONCE, so an
+# expression pulled out of a variable is not re-scanned for `$VAR` inside it. The
+# eval is what re-reads `$RERUN_STALL_SECONDS` at the leading-zero operand.
+belt_val220="$(RERUN_STALL_SECONDS=0100; eval "echo \$(( ${belt_expr220} ))")"
+[ "$belt_val220" = 200 ] \
+  && pass "(B9) the file-scope 2 x default (:220) reads STALL=0100 as DECIMAL (200, not 128)" \
+  || fail "(B9) the file-scope default fell to octal: got '${belt_val220}' (want 200)"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
