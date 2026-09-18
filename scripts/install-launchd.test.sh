@@ -102,7 +102,8 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh; do
+    # + #1142/#1143 reaper drivers (pi-reap-orphans, pi-reap-scratch).
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-orphans.sh pi-reap-scratch.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -165,12 +166,16 @@ assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekl
 assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reaper installed on fresh machine (#469)"
 assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
+assert_contains "$OUT" "pi-reap-orphans: installed + loaded" "pi-reap-orphans installed on fresh machine (#1142)"
+assert_contains "$OUT" "pi-reap-scratch: installed + loaded" "pi-reap-scratch installed on fresh machine (#1143)"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
 FLEET_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.fleet-cost-weekly.plist"
 REAPER_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-session-reaper.plist"
 PRUNE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-task-session-prune.plist"
 DBW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.deepseek-balance-watch.plist"
+ORPHANS_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-reap-orphans.plist"
+SCRATCH_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-reap-scratch.plist"
 HUB_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 ORACLE_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
 assert_contains "$(cat "$CANARY_INSTALLED")" "$HOME1/swarm/.venv/bin/python" "canary plist rendered PYTHON_BIN"
@@ -196,6 +201,31 @@ assert_contains "$(cat "$REAPER_INSTALLED")" "agent-infra-plist-version: 0.1.0" 
 # and silently broaden the kill set on every host at the next sync.
 assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_REAP_STUCK" "reaper plist does NOT arm the STUCK set (#947)"
 assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_STUCK_HOURS" "reaper plist does not override the stuck bound (#947)"
+# #1142 — pi-reap-orphans rendered-plist content asserts (farmed path, hourly
+# StartInterval 3600, DISARMED).
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-reap-orphans.sh" "orphan plist rendered with fake HOME (farmed path)"
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "<integer>3600</integer>" "orphan job hourly (StartInterval 3600)"
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "agent-infra-plist-version: 0.1.0" "orphan template carries version marker"
+# #1142 acceptance: "dry-run by default". The DEPLOYED invariant is that the
+# scheduled job REPORTS and does not kill — arming is a manual, per-machine,
+# owned decision, so a later template edit flipping this to 0 must fail here.
+# Without this assertion the flip would satisfy every other plist check and
+# silently arm an always-on killer on every host at the next sync.
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "REAP_ORPHAN_DRY_RUN" "orphan plist carries REAP_ORPHAN_DRY_RUN env"
+assert_contains "$(grep -A1 'REAP_ORPHAN_DRY_RUN' "$ORPHANS_INSTALLED" | tail -1)" "<string>1</string>" "orphan plist SHIPS DISARMED (REAP_ORPHAN_DRY_RUN=1, #1142)"
+# #1143 — pi-reap-scratch rendered-plist content asserts (farmed path,
+# 6-hourly conservative cadence, DISARMED).
+assert_contains "$(cat "$SCRATCH_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-reap-scratch.sh" "scratch plist rendered with fake HOME (farmed path)"
+assert_contains "$(cat "$SCRATCH_INSTALLED")" "<integer>21600</integer>" "scratch job runs every 6h (conservative, StartInterval 21600)"
+assert_contains "$(cat "$SCRATCH_INSTALLED")" "agent-infra-plist-version: 0.1.0" "scratch template carries version marker"
+# #1143 scope: "dry-run default, explicit arm" — same deployed invariant.
+assert_contains "$(cat "$SCRATCH_INSTALLED")" "REAP_SCRATCH_DRY_RUN" "scratch plist carries REAP_SCRATCH_DRY_RUN env"
+assert_contains "$(grep -A1 'REAP_SCRATCH_DRY_RUN' "$SCRATCH_INSTALLED" | tail -1)" "<string>1</string>" "scratch plist SHIPS DISARMED (REAP_SCRATCH_DRY_RUN=1, #1143)"
+# The scratch reaper deletes, so the deployed job must not widen its scope or
+# shorten its floors: a template edit that did would silently change what the
+# scheduled pass would remove the moment an operator arms it.
+assert_not_contains "$(cat "$SCRATCH_INSTALLED")" "REAP_SCRATCH_AGE_MIN" "scratch plist does not shorten the age floor (#1143)"
+assert_not_contains "$(cat "$SCRATCH_INSTALLED")" "REAP_SCRATCH_TMPDIR_AGE_MIN" "scratch plist does not shorten the TMPDIR floor (#1143)"
 # #783 Task 6 — pi-task-session-prune rendered-plist content asserts (farmed
 # path, DISARMED TASK_SESSION_PRUNE_DRY_RUN=1, hourly StartInterval 3600)
 assert_contains "$(cat "$PRUNE_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-task-session-prune.sh" "prune plist rendered with fake HOME (farmed path)"
@@ -220,7 +250,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "6" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune)"
+assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-reap-orphans + pi-reap-scratch)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- pi-reap-scratch (#1143): scheduled reclaim of AGED temp scratch under
+         /private/tmp and $TMPDIR. The manual pass that motivated it recovered
+         15,023 entries / 5.39 GB and took host load 42.9 -> 7.6.
+         The surface is produced by AUTOMATION (review/probe cycles), not by
+         hand, so it must be reclaimed by automation: macOS's own periodic
+         cleanup was not keeping up (9h-old dirs still present).
+         Safety posture, in gate order — system-owned names (com.* ssh-*
+         KCustom* .X11-unix) > advisory locks (wf-lock-*) > self-scratch >
+         live-held (ONE lsof -Fpn pass; a process holding a path as cwd or
+         having it open) > mount point > reclaimable. The liveness probe is
+         FAIL-CLOSED: an empty/failed/timed-out lsof aborts the whole pass
+         (exit 3) instead of reading as "nothing is held".
+         ⚠️ SHIPS DISARMED (REAP_SCRATCH_DRY_RUN=1) — #1143 scope: "dry-run
+         default, explicit arm". ARMING IS A SEPARATE, MANUAL, OWNED STEP: the
+         owner is the organisation-design-team operator on call for agent-infra,
+         and arming requires a dated trigger. Do NOT flip this to 0 in a routine
+         template bump. Disarmed still delivers Scope 3 ("report the reclaimable
+         set so drift is visible before it becomes load"): every pass writes
+         counts + sizes + an exact per-reason histogram to
+         ~/.pi/agent/state/pi-reap-scratch.log.
+         Floors are the documented ones (AGE_MIN 30 for /private/tmp, 360 for
+         $TMPDIR) and are deliberately NOT overridden here: the 6-hourly cadence
+         is this job's conservatism, since debris younger than 30 min still
+         belongs to a live cycle. Size probing (REAP_SCRATCH_SIZES) is left ON
+         so the log carries the reclaimable bytes, not just a count.
+         Canonical script: agent-infra/scripts/pi-reap-scratch.sh
+         (COPIED to ~/.pi/agent/scripts/ by pi-bootstrap/setup.sh scripts
+         farm; #427: launchd cannot read ~/Documents repos under macOS TCC).
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
+    <key>Label</key>
+    <string>com.eldato.pi-reap-scratch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/pi-reap-scratch.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>REAP_SCRATCH_DRY_RUN</key>
+        <string>1</string>
+    </dict>
+    <!-- Every 6 hours: deliberately conservative (see the head comment). A
+         fuller surface is reported six-hourly, and arm-time is an operator
+         decision, not a cadence decision. -->
+    <key>StartInterval</key>
+    <integer>21600</integer>
+</dict>
+</plist>

@@ -289,7 +289,9 @@ fi
 # driver, the reaper, and the prune sweep must ALL sit in ~/.pi/agent/scripts so
 # the drivers' sibling calls resolve and the plists' ProgramArguments targets
 # exist (broken-target guard). Same idempotent real-copy refresh model.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh)
+# #1142/#1143 — the scheduled reapers are launchd-invoked, so their drivers must
+# be farmed here too (launchd cannot read ~/Documents under macOS TCC, #427).
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-orphans.sh pi-reap-scratch.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
