@@ -1607,9 +1607,13 @@ printf '%s\n' "$HEAD_W3" > "$SCEN/head"
 lane_queued "$HEAD_W3" 9621 > "$SCEN/runs-$HEAD_W3"
 lane_fail mainw3 9622 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9622"
-run_admin 42 --main-runs 1 --rerun-timeout 99 >/dev/null 2>&1
+# 900, not 99: a ceiling must now EXCEED the stall window by at least one poll
+# interval (900 > 600 + 1), and validate_timing_knobs/--rerun-timeout refuse
+# anything shorter. The point here is unchanged — a RAISED bound must not change
+# the lane-terminal exit.
+run_admin 42 --main-runs 1 --rerun-timeout 900 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "(c) the lane-terminal precondition blocks (exit $rc), even with --rerun-timeout 99" \
+[ "$rc" -ne 0 ] && pass "(c) the lane-terminal precondition blocks (exit $rc), even with --rerun-timeout 900" \
   || fail "(c) a pending lane certified with a raised re-run bound"
 grep -q "precondition unmet: run still in_progress — no classification attempted" "$TMP/err" \
   && pass "(c) the refusal NAMES the precondition and that no classification was attempted" \
@@ -1644,11 +1648,20 @@ log_failed 'tests/test_flaky.py::test_slow' > "$SCEN/log-9631"
 lane_fail mainw4 9632 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9632"
 printf 'in_progress\n' > "$SCEN/status-9631"
-printf 't1\n' > "$SCEN/updated-9631"
+# The ceiling is reached with a run that is MAKING PROGRESS: `updatedAt` advances
+# on every poll, so `idle` never reaches the stall window and `waited` reaches the
+# ceiling. A FROZEN clock is a STALL, and the ordering rule now requires the
+# ceiling to CLEAR the window by a full poll interval — so a frozen clock with a
+# compliant ceiling is by construction a STALL, never a CEILING. The old fixture
+# froze the clock and put the window ABOVE the ceiling (stall=100, ceiling=5);
+# that combination WAS the B7 transposition, and validate_timing_knobs rightly
+# refuses it. 12 advancing clock lines cover the 5 polls to the ceiling.
+: > "$SCEN/updated-9631"
+_i=0; while [ "$_i" -lt 12 ]; do printf 'c%s\n' "$_i" >> "$SCEN/updated-9631"; _i=$((_i + 1)); done
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
-  ADMIN_MERGE_STALL_SECONDS=100 bash "$ADM" 42 --main-runs 1 --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
+  ADMIN_MERGE_STALL_SECONDS=2 bash "$ADM" 42 --main-runs 1 --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
 rc=$?
-[ "$rc" -ne 0 ] && pass "(d) the derived ceiling blocks when reached (exit $rc)" || fail "(d) the ceiling did not block"
+[ "$rc" -ne 0 ] && pass "(d) the explicit ceiling blocks when reached (exit $rc)" || fail "(d) the ceiling did not block"
 grep -q "still RUNNING at the 5s ceiling — explicit --rerun-timeout" "$TMP/err" \
   && pass "(d) the ceiling message names the bound's source, not a bare number" \
   || fail "(d) the ceiling message does not state its source"
@@ -2243,6 +2256,123 @@ grep -q "refusing ADMIN_MERGE_POLL_INTERVAL='abc'" "$TMP/err" \
 ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" --print-bounds >/dev/null 2>"$TMP/err"
 [ $? -eq 0 ] && pass "(P2-10) …and 0 stays LEGAL (the deterministic test seam)" \
   || fail "(P2-10) the 0 test seam was refused: $(head -1 "$TMP/err")"
+
+# ── 42. THE CEILING MUST *CLEAR* THE STALL WINDOW — EQUALITY AND THE ONE-POLL GAP ──
+# The #1167 cycle-3 review P1: the ordering refusal used `-lt`, so EQUALITY was
+# ACCEPTED. But wait_for_run's loop condition is the CEILING
+# (`waited < RERUN_TIMEOUT`) while the stall check is INSIDE the body, and
+# `waited`/`idle` both start at 0 and advance by the SAME step — so with
+# CEILING == STALL there is NO iteration where `waited < T` and `idle >= S` both
+# hold, and the loop ALWAYS exits via `return 2` (CEILING). STALLED is unreachable
+# and a wedged run is printed as "still RUNNING" — the opposite remedy, which is
+# exactly the transposition this rail exists to prevent. A ceiling one poll ABOVE
+# the window is unsafe for the same reason (only multiples of the step are
+# reachable: STALL=605, CEILING=606, POLL=10 first reaches waited=610 > 606), and
+# the explicit `--rerun-timeout` was a THIRD unchecked path. Every assertion below
+# FAILS against the pre-fix rail (which exited 0 = accepted).
+echo "== 42. the ceiling must clear the stall window (equality and the one-poll gap) =="
+
+# (P1-11) the EQUALITY boundary. FLOOR == STALL was accepted, and re-created B7.
+new_scen order-equality
+ADMIN_MERGE_RERUN_FLOOR=600 ADMIN_MERGE_STALL_SECONDS=600 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P1-11) FLOOR == STALL is refused (equality is no margin)" \
+  || fail "(P1-11) FLOOR == STALL was accepted (exit $rc) — STALLED is unreachable at the boundary"
+grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='600'" "$TMP/err" \
+  && pass "(P1-11) …named by knob and value" \
+  || { fail "(P1-11) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
+grep -q "610s or more is required" "$TMP/err" \
+  && pass "(P1-11) …and names the minimum (stall 600 + poll 10)" \
+  || fail "(P1-11) the refusal does not state the required minimum"
+
+# (P1-12) the fail-safe on a no-green-sample shard takes the value VERBATIM, so
+# FAILSAFE == STALL is the same hole.
+new_scen order-equality-failsafe
+ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK=600 ADMIN_MERGE_STALL_SECONDS=600 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P1-12) FAILSAFE == STALL is refused (equality is no margin)" \
+  || fail "(P1-12) FAILSAFE == STALL was accepted (exit $rc)"
+grep -q "refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='600'" "$TMP/err" \
+  && pass "(P1-12) …named by knob and value" \
+  || fail "(P1-12) the refusal does not name the knob/value"
+
+# (P1-13) THE ONE-POLL GAP — the reviewer-verified repro on the real rail:
+# STALL=605, CEILING=606, POLL=10. 606 > 605, so the old `-lt` refusal accepted it,
+# but the first reachable waited >= 605 is 610 > 606 — it exits at the CEILING with
+# the stall never observed.
+new_scen order-one-poll-gap
+ADMIN_MERGE_STALL_SECONDS=605 ADMIN_MERGE_POLL_INTERVAL=10 \
+  bash "$ADM" --print-bounds --rerun-timeout 606 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P1-13) a ceiling one poll above the window (606 over 605 @ poll 10) is refused" \
+  || fail "(P1-13) the one-poll gap was accepted (exit $rc) — the STALL would never be observed"
+grep -q "615s or more is required" "$TMP/err" \
+  && pass "(P1-13) …naming 615s (= 605 + 10) as the minimum" \
+  || fail "(P1-13) the refusal does not state the required minimum"
+
+# (P1-14) …and the boundary is exactly where the rule claims: 615 accepted, 614 not.
+new_scen order-one-poll-gap-ok
+ADMIN_MERGE_STALL_SECONDS=605 ADMIN_MERGE_POLL_INTERVAL=10 \
+  bash "$ADM" --print-bounds --rerun-timeout 615 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(P1-14) a ceiling AT the minimum (615 = 605 + 10) is accepted" \
+  || fail "(P1-14) the exact minimum was refused (exit $rc): $(head -1 "$TMP/err")"
+grep -q '^rerun-timeout=615$' "$TMP/out" \
+  && pass "(P1-14) …and the accepted value is what it prints" \
+  || fail "(P1-14) the accepted ceiling is not printed"
+ADMIN_MERGE_RERUN_FLOOR=614 ADMIN_MERGE_STALL_SECONDS=605 ADMIN_MERGE_POLL_INTERVAL=10 \
+  bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+[ "$?" -eq 2 ] && pass "(P1-14) …while one below it (614) is refused" \
+  || fail "(P1-14) a floor one below the minimum was accepted"
+
+# (P1-15) the DEFAULT path keeps clearing the margin: with a raised stall window and
+# no floor override, floor = 2 x stall, which still clears stall + poll.
+new_scen order-default-margin
+ADMIN_MERGE_STALL_SECONDS=600 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+[ "$?" -eq 0 ] && pass "(P1-15) the default floor (1200) still clears stall 600 + poll 10" \
+  || fail "(P1-15) the default path was refused: $(head -1 "$TMP/err")"
+
+# (P2-11) THE THIRD PATH: an explicit --rerun-timeout was checked for positivity
+# only, so `--rerun-timeout 5` over a 100s window was accepted and reported a
+# frozen-clock run as the CEILING at 5s — the same transposition.
+new_scen order-explicit
+ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=10 \
+  bash "$ADM" --print-bounds --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P2-11) an explicit --rerun-timeout below stall + poll is refused" \
+  || fail "(P2-11) --rerun-timeout 5 over a 100s window was accepted (exit $rc)"
+grep -q "refusing --rerun-timeout '5'" "$TMP/err" \
+  && pass "(P2-11) …naming the flag and its value" \
+  || fail "(P2-11) the refusal does not name the flag/value"
+grep -q "110s or more is required" "$TMP/err" \
+  && pass "(P2-11) …and the same minimum the floor/fail-safe use (100 + 10)" \
+  || fail "(P2-11) the refusal does not state the required minimum"
+ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=10 \
+  bash "$ADM" --print-bounds --rerun-timeout 110 >"$TMP/out" 2>"$TMP/err"
+[ "$?" -eq 0 ] && pass "(P2-11) …while a value AT the minimum (110) is accepted" \
+  || fail "(P2-11) the exact minimum was refused: $(head -1 "$TMP/err")"
+
+# (P2-12) POLL_INTERVAL: 'all digits' is not 'usable'. An all-digit value PAST the
+# shell's integer range passed counter_is_number and then made `[ "$step" -gt 0 ]`
+# error (step fell back to 1) while EVERY `sleep` failed — a tight gh busy-spin
+# (measured: 201 `gh run view` calls in 11s for a 200s window).
+new_scen order-poll-range
+ADMIN_MERGE_POLL_INTERVAL=99999999999999999999 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P2-12) an all-digit POLL_INTERVAL past the shell's integer range is refused" \
+  || fail "(P2-12) the huge poll interval was accepted (exit $rc) — sleep would fail on every poll"
+grep -q "refusing ADMIN_MERGE_POLL_INTERVAL='99999999999999999999'" "$TMP/err" \
+  && pass "(P2-12) …named by knob and value" \
+  || fail "(P2-12) the refusal does not name the knob/value"
+grep -q "beyond the usable range" "$TMP/err" \
+  && pass "(P2-12) …as beyond the usable range, not merely 'all digits'" \
+  || fail "(P2-12) the refusal does not say why it is unusable"
+ADMIN_MERGE_POLL_INTERVAL=3601 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+[ "$?" -eq 2 ] && pass "(P2-12) …and a value past the sane maximum (3601) is refused too" \
+  || fail "(P2-12) a poll interval beyond an hour was accepted"
+ADMIN_MERGE_POLL_INTERVAL=30 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+[ "$?" -eq 0 ] && pass "(P2-12) …while a paced value inside it (30) is accepted" \
+  || fail "(P2-12) the in-range poll interval was refused: $(head -1 "$TMP/err")"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
