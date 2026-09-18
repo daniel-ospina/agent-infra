@@ -128,6 +128,13 @@ export const OUT_OF_FAMILY_TERMS = [
   "FIRST_OUTPUT_TIMEOUT_MS",
   "DEFAULT_HARD_CAP_MS",
   "DEFAULT_MAX_DISPATCH_MS",
+  // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
+  // carry no stall-family token (the STALLED threshold is now the DERIVED
+  // per-shard bound, so the FLOOR and the fail-safe are the operator-reachable
+  // constants). Listed deliberately, with their value pins in this registry and
+  // their behaviour pinned by tests/admin-merge/run.sh §41.
+  "RERUN_FLOOR",
+  "FAILSAFE_RERUN_TIMEOUT",
 ] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
@@ -569,12 +576,20 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "checkpoint park trigger — parks state, kills nothing",
   },
   {
-    name: "RERUN_STALL_SECONDS",
+    name: "RERUN_FLOOR",
     owners: ["scripts/admin-merge.sh"],
-    value: "${ADMIN_MERGE_STALL_SECONDS:-600}",
+    value: "${ADMIN_MERGE_RERUN_FLOOR:-1200}",
     axis: "gate",
     guardedBy: NONE,
-    note: "the merge gate's re-run progress window (#3756): a main-lane re-run whose status never reaches completed AND whose updatedAt never moves for this long is STALLED and the gate refuses the merge. A still-running job is NOT a failure — only a STALL is. The value is an env seam for tests only (ADMIN_MERGE_STALL_SECONDS); the shipped default is 600 s.",
+    note: "the merge gate's re-run bound FLOOR (#1167): the bound is max(FLOOR, 2 × max(green duration) for the shard), and that DERIVED per-shard bound is the rail's ONLY STALLED threshold — a remote run exposes no within-job activity signal, so there is no second window to order against it. The FLOOR only ever RAISES a bound, so it cannot false-block a healthy run. Env seam ADMIN_MERGE_RERUN_FLOOR; shipped default 1200 s; behaviour pinned by tests/admin-merge/run.sh §41.",
+  },
+  {
+    name: "FAILSAFE_RERUN_TIMEOUT",
+    owners: ["scripts/admin-merge.sh"],
+    value: "${ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK:-3900}",
+    axis: "gate",
+    guardedBy: NONE,
+    note: "the merge gate's derivation FAIL-SAFE (#1167): the bound used when the per-shard derivation is unavailable. The shipped default (3900 s) is deliberately well above RERUN_FLOOR's 1200, because a derivation that failed must never produce a SMALL bound. Env seam ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK; behaviour pinned by tests/admin-merge/run.sh §41.",
   },
   // — reap axis (interactive session reaper) —
   {
