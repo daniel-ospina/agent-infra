@@ -306,6 +306,33 @@ for base in "${fleet_srcs[@]}"; do
 done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 
+# Shared-library farm (#1178): the fleet-scripts farm above copies pi-reap-idle.sh
+# FLAT into $DEST/scripts/, and that reaper resolves its process-identity rule
+# from a SIBLING directory — `$(dirname "${BASH_SOURCE[0]}")/lib/pid-identity.sh`
+# — the same sibling-resolution contract the checkout-hygiene drivers rely on.
+# Farming the reaper WITHOUT its library re-arms the hourly
+# com.eldato.pi-session-reaper job with a FAIL-CLOSED abort (exit 3, "identity
+# library missing") on every pass until the farm catches up. So the library is
+# farmed WITH it, preserving the relative positions
+# (scripts/pi-reap-idle.sh <-> scripts/lib/pid-identity.sh). Same idempotent
+# real-copy refresh model as the farms above (real files, not symlinks: #427).
+lib_srcs=(pid-identity.sh)
+mkdir -p "$DEST/scripts/lib"
+lib_copied=0
+for base in "${lib_srcs[@]}"; do
+  f="$INFRA_ROOT/scripts/lib/$base"
+  [ -f "$f" ] || continue
+  dest="$DEST/scripts/lib/$base"
+  if [ -L "$dest" ]; then
+    echo "    replacing farm symlink with real copy: lib/$base"
+    rm -f "$dest"
+  fi
+  cp -f "$f" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
+  lib_copied=$((lib_copied+1))
+done
+echo "    scripts lib farm: $lib_copied copied (pid-identity.sh, #1178)"
+
 # Merge-gate scripts farm (#562): record-review.sh — the review-enforcer's
 # merge-registry writer (issue #138).
 # NOT launchd-invoked (pi-session code resolves record-review.sh explicitly:

@@ -153,6 +153,36 @@ check_record_review_farmed() {
   fi
 }
 
+# #1178 — shared-library farm: scripts/lib/pid-identity.sh must land at
+# $DEST/scripts/lib/pid-identity.sh, byte-identical to the repo copy, and the
+# farmed reaper (which resolves the library from its OWN sibling directory) must
+# actually load it. Farming the reaper without the library re-arms the hourly
+# com.eldato.pi-session-reaper job with a fail-closed exit-3 abort on every pass.
+check_identity_lib_farmed() {
+  local label="$1"
+  local dest="$DEST/scripts/lib/pid-identity.sh"
+  local reaper="$DEST/scripts/pi-reap-idle.sh"
+  [ -f "$dest" ] \
+    || { fail "$label: lib/pid-identity.sh not farmed into scripts/lib/ (#1178 lib farm missing)"; return; }
+  if diff -q "$ROOT/scripts/lib/pid-identity.sh" "$dest" >/dev/null 2>&1; then
+    echo "ok: $label farmed lib/pid-identity.sh == repo copy (#1178)"
+  else
+    fail "$label: farmed lib/pid-identity.sh differs from scripts/lib/pid-identity.sh (stale copy!)"
+  fi
+  [ -f "$reaper" ] \
+    || { fail "$label: pi-reap-idle.sh missing from the farm — cannot test its library resolution"; return; }
+  # The farmed reaper sources the library BEFORE it parses argv, so a missing or
+  # broken library IS the exit-3 "identity library missing" abort. `--help` is
+  # the read-only mode: it signals nothing and touches no store.
+  local out rc
+  out="$(bash "$reaper" --help 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ] && ! grep -q "identity library missing" <<<"$out"; then
+    echo "ok: $label farmed reaper resolves sibling lib/pid-identity.sh (--help rc=0)"
+  else
+    fail "$label: farmed reaper could not load its library (rc=$rc): $(head -1 <<<"$out")"
+  fi
+}
+
 run_setup() {
   echo "---- setup.sh run (HOME=$HOME_DIR) ----" >> "$RUNS_LOG"
   bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1
@@ -196,8 +226,11 @@ grep -q "farm symlinks kept" "$RUNS_LOG" \
 check_content_matches "$DEST/extensions" "run1" mcp-client shared
 check_fix_markers "$DEST/extensions" "run1"
 check_record_review_farmed "run1"
+check_identity_lib_farmed "run1"
 grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
+grep -q "scripts lib farm: 1 copied (pid-identity.sh, #1178)" "$RUNS_LOG" \
+  || fail "run 1 did not report the shared-library farm copy (#1178)"
 
 # --- run 2: re-run must refresh the ACTIVE files --------------------------
 # (a) a dest mutation must be overwritten by the source (content-merge);
@@ -205,6 +238,9 @@ grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG"
 echo "== run 2: re-run refresh"
 echo "# machine-local mutation" >> "$DEST/agents/verifier.md"
 echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm refresh
+if [ -f "$DEST/scripts/lib/pid-identity.sh" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/lib/pid-identity.sh"  # #1178 farm refresh
+fi
 SRC_MARKER="$ROOT/pi-bootstrap/pi-config/agents/zz-setup-test-marker.md"
 echo "# issue-93 test marker" > "$SRC_MARKER"
 
@@ -221,10 +257,18 @@ else
   echo "ok: dest mutation reverted by source on re-run"
 fi
 check_record_review_farmed "run2"
+check_identity_lib_farmed "run2"
 if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
 else
   echo "ok: farmed record-review.sh refreshed on re-run (#562)"
+fi
+if [ ! -f "$DEST/scripts/lib/pid-identity.sh" ]; then
+  : # already reported by check_identity_lib_farmed "run2" (missing file is not "refreshed")
+elif grep -q "stale farm mutation" "$DEST/scripts/lib/pid-identity.sh"; then
+  fail "stale farm mutation survived re-run (farmed lib/pid-identity.sh was not refreshed)"
+else
+  echo "ok: farmed lib/pid-identity.sh refreshed on re-run (#1178)"
 fi
 [ ! -d "$DEST/agents/agents" ] || fail "nesting appeared after re-run"
 check_no_nesting "$DEST" "dest-after-rerun"

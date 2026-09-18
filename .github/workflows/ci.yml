@@ -215,6 +215,28 @@ jobs:
         # non-inert: an unwired suite passes in CI by never running.
         # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
         run: python3.12 -m pytest tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q
+      - name: Fleet liveness acceptance suite (#1178, zero-dep)
+        # #1178 — the liveness classifier (tools/fleet/liveness.py) and the
+        # shared process-identity rule it shells out to
+        # (scripts/lib/pid-identity.sh — the SAME library the kill-path reaper
+        # sources) were pinned by a suite CI did not execute, and an unwired
+        # suite passes by never running. Zero-dep by construction: the suite is
+        # a standalone script (no pytest), drives the Bash probe CLI through
+        # hermetic fake PS/DATE shims, and needs only python3 + bash. VISIBLE,
+        # not merge-blocking: `pipeline-compliance` is the repo's only required
+        # check (#646); the BLOCKING backstop is the post-merge ci-main.yml
+        # script-validate job, which runs the reaper's own regression suite
+        # (scripts/pi-reap-idle.test.sh) against the same library.
+        run: python3.12 tools/fleet/liveness.test.py
+      - name: Fleet liveness mutation evidence (#1178, zero-dep)
+        # The suite above is only a pin if it can FAIL. `--mutations`
+        # reintroduces each of the 12 defects into a TEMP copy of the module (or
+        # of the identity library) and re-runs the paired test against it in a
+        # subprocess — a mutation whose paired test still passes is reported as
+        # a suite failure. Its own step, not a second command in the step above:
+        # sequencing would suppress one verdict when the other fails, and each
+        # must report on its own (the same reason every suite here is separated).
+        run: python3.12 tools/fleet/liveness.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
       - name: Merge-scope subtraction suite (#755, SDK-free)
