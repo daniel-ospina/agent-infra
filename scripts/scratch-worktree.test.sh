@@ -37,7 +37,7 @@
 #   T22 a wrapped command that replaces `$D` with a DANGLING symlink still cleans
 #   T23 a forged marker+gitdir cannot deregister a real sibling (back-link proof);
 #       and a SYMLINK at the candidate path cannot redirect that proof to a
-#       live sibling (#1162)
+#       live sibling (#1162) — in every spelling of the link path
 #   T24 a mode-000 leftover is made removable and removed (retry path)
 #   T25 a truly UNDELETABLE leftover stays registered so `list` shows it
 #   T26 the orphan reclaim is TARGET-SPECIFIC (a foreign path stays rc 1 even
@@ -525,6 +525,42 @@ fi
 [ -f "$SIB2/WIP.txt" ] && ok 0 "T23f the linked sibling's files are intact" || ok 1 "T23f the linked sibling's files are intact"
 rm -f "$LINK2"
 git -C "$FIX/repo" worktree remove --force "$SIB2" >/dev/null 2>&1
+
+# ── T23g/T23h: the refusal must survive the SPELLING of the symlink path ────
+# `[ -L "$d" ]` is FALSE when the path ends in a separator or resolves through
+# `/.`: POSIX dereferences the final component there, so `link/` and `link/.`
+# read as "not a symlink" (bash 3.2: `-L link` true; `-L link/` and `-L link/.`
+# false). Every ownership proof then belongs to the TARGET again, and the result
+# is WORSE than the plain spelling: `rm -rf "$d/"` FOLLOWS the link and destroys
+# the sibling's FILES, not just its admin record (#1162 review P1). Each
+# spelling needs its own fixture — whichever one gets through destroys it.
+t23_spelling() { # <tag> <suffix>
+  local tag="$1" suffix="$2" sib link rc
+  sib="$SCRATCH_WORKTREE_ROOT/scratch-sib-$tag"
+  link="$SCRATCH_WORKTREE_ROOT/scratch-lnk-$tag"
+  git -C "$FIX/repo" worktree add --detach "$sib" "$C2" >/dev/null 2>&1
+  printf '%s\n' "$(cd "$FIX/repo" && pwd -P)" > "$sib/.scratch-worktree"
+  printf 'precious\n' > "$sib/WIP.txt"
+  ln -s "$sib" "$link"
+  sx clean "${link}${suffix}" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" != 0 ] && ok 0 "T23$tag the symlink spelling link$suffix is refused (rc=$rc)" \
+    || ok 1 "T23$tag the symlink spelling link$suffix was accepted (rc=$rc)"
+  if git -C "$sib" rev-parse --git-dir >/dev/null 2>&1; then
+    ok 0 "T23${tag}b the sibling is still a repository after link$suffix"
+  else
+    ok 1 "T23${tag}b link$suffix DEREGISTERED the sibling it pointed at"
+  fi
+  [ -f "$sib/WIP.txt" ] && ok 0 "T23${tag}c the sibling's files survive link$suffix" \
+    || ok 1 "T23${tag}c link$suffix was followed into the sibling and destroyed its files"
+  rm -f "$link"
+  git -C "$FIX/repo" worktree remove --force "$sib" >/dev/null 2>&1
+  rm -rf "$sib" 2>/dev/null || true
+}
+t23_spelling "g" "/"
+t23_spelling "h" "/."
+t23_spelling "i" "//"
+t23_spelling "j" "/./"
 
 # ── T24: an UNREMOVABLE leftover must stay visible, never become an orphan ───
 # If the probe leaves something `rm` cannot delete, pruning the record anyway

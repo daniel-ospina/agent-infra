@@ -169,7 +169,7 @@ realpath_file() { # <path-to-a-regular-file>
 # git, not by the caller — is the only step a forger cannot produce for a
 # worktree they do not control.
 owns() { # <repo> <path>
-  local repo="$1" d="$2" rp gd want common back link
+  local repo="$1" d="$2" rp gd want common back link cand
   # A SYMLINK at the candidate path REDIRECTS every proof below (#1162): `[ -d ]`
   # follows it, the marker and `.git` are read from the TARGET, `realpath_of "$d"`
   # returns the TARGET's physical path (still under ROOT), and the back-link then
@@ -181,9 +181,28 @@ owns() { # <repo> <path>
   # Refusing a symlinked candidate is safe: this tool never creates one — `mktemp
   # -d` and `git worktree add` both make real directories — and the one path that
   # MUST tolerate a symlink at $D (`remove_created`, pinned by T22) does not consult
-  # `owns()`. `-L` tests the final component only, so a caller whose scratch path is
-  # reached through a symlinked PARENT (/tmp -> /private/tmp; $TMPDIR) is unaffected.
-  if [ -L "$d" ]; then return 1; fi
+  # `owns()`.
+  #
+  # The test must run on a NORMALISED path (#1162 review P1). A bare `[ -L "$d" ]`
+  # is FALSE whenever the path names a directory: POSIX dereferences the final
+  # component for `link/` and for `link/.`, so both spellings read as "not a
+  # symlink" (bash 3.2: `-L link` true; `-L link/` and `-L link/.` false) and slip
+  # the guard. `link/` was measured WORSE than the plain spelling — `rm -rf "$d/"`
+  # FOLLOWS the link and destroys the sibling's FILES, not just its record. Strip
+  # trailing separators and `/.` until the string is stable, then test.
+  cand="$d"
+  while :; do
+    case "$cand" in
+      */)  cand="${cand%/}" ;;
+      */.) cand="${cand%/.}" ;;
+      *)   break ;;
+    esac
+  done
+  if [ -L "$cand" ]; then return 1; fi
+  # NB: `-L` tests the final component only, so a caller whose scratch path is
+  # reached through a symlinked PARENT (/tmp -> /private/tmp; $TMPDIR) is
+  # unaffected — which is why the anchor cannot simply be `realpath_of "$d"`
+  # equalling `$d`.
   [ -d "$d" ] && [ -f "$d/.scratch-worktree" ] || return 1
   rp="$(realpath_of "$d")" || return 1
   case "$rp/" in "$ROOT"/*) ;; *) return 1 ;; esac
