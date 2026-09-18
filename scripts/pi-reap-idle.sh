@@ -64,6 +64,8 @@
 #                   [--stuck-hours N] [--reap-stuck] [--list]
 #                   [--probe-jsonl FILE...] [--help]
 # Env seams: PS_BIN KILL_BIN DATE_BIN CMUX_STATE_DIR PI_SESSIONS_DIR
+#   PID_IDENTITY_LIB (the shared identity rule, #1178 — default: lib/
+#   pid-identity.sh beside this script)
 #   REAP_IDLE_HOURS REAP_STUCK_HOURS REAP_REAP_STUCK REAP_DRY_RUN
 #   REAP_GRACE_SECONDS REAP_NOW_EPOCH REAP_LOCK_STALE_SECONDS REAP_LOG
 #   REAP_MAX_HOURS (upper sanity bound for an explicitly supplied hour
@@ -109,7 +111,22 @@ LOCK_DIR="$STATE_DIR/pi-reap-idle.lock"
 # (even --apply) log a MODE=disabled footer and exit 0 without signaling.
 # Survives re-syncs that re-install the launchd job (#469).
 DISABLED_SENTINEL="$STATE_DIR/pi-reap-idle.disabled"
-FENCE_TOLERANCE_SECONDS=3
+# ── shared process-identity rule (#1178) ──────────────────────────────
+# The incarnation fence, the zombie rule, the untrusted-store-number gate and
+# the lstart parser live in ONE place (scripts/lib/pid-identity.sh) so this
+# reaper and the fleet liveness classifier (tools/fleet/liveness.py, which
+# shells that file's `probe` CLI) cannot drift into two identity opinions.
+# Fail CLOSED if it is missing: without it this script cannot decide identity,
+# and a silent continue would leave every candidate reading
+# `incarnation-unmatched` — a reaper that reaps nothing while its footer looks
+# healthy. (In-repo the file is a tracked sibling; the farm copies both.)
+PID_IDENTITY_LIB="${PID_IDENTITY_LIB:-$(dirname "${BASH_SOURCE[0]}")/lib/pid-identity.sh}"
+if [ ! -f "$PID_IDENTITY_LIB" ]; then
+    echo "FAIL-CLOSED abort: identity library missing ($PID_IDENTITY_LIB, exit 3)" >&2
+    exit 3
+fi
+# shellcheck source=lib/pid-identity.sh
+. "$PID_IDENTITY_LIB"
 
 MODE=unknown
 LIST_ONLY=0
@@ -155,36 +172,9 @@ now_epoch() {
     /bin/date +%s 2>/dev/null || date +%s
 }
 
-# date_bin_probe_mode — capability-probe ${DATE_BIN} (never uname): feed a
-# BSD-shaped invocation; exit 0 => BSD -j branch, else GNU -d branch. A
-# macOS-shape-only stub therefore forces the BSD branch on ANY platform.
-DATE_MODE=""
-date_bin_probe_mode() {
-    if [ -n "$DATE_MODE" ]; then printf '%s\n' "$DATE_MODE"; return 0; fi
-    if LC_ALL=C "$DATE_BIN" -j -f '%a %b %e %H:%M:%S %Y' 'Sat Jan  1 00:00:00 2000' +%s >/dev/null 2>&1; then
-        DATE_MODE=bsd
-    else
-        DATE_MODE=gnu
-    fi
-    printf '%s\n' "$DATE_MODE"
-}
-
-# lstart_to_epoch <ps-lstart-str> — "Sat Sep  5 12:34:56 2026" OR the
-# real macOS ps day-first order "Sat  5 Sep 12:34:56 2026" -> epoch.
-# Both orders are attempted on the BSD branch (ps lstart has shipped both).
-lstart_to_epoch() {
-    local lstart="$1" mode fmt e
-    mode="$(date_bin_probe_mode)"
-    if [ "$mode" = bsd ]; then
-        for fmt in '%a %b %e %H:%M:%S %Y' '%a %e %b %H:%M:%S %Y'; do
-            e="$(LC_ALL=C "$DATE_BIN" -j -f "$fmt" "$lstart" +%s 2>/dev/null)"
-            if [ -n "$e" ] && [ "$e" -gt 0 ] 2>/dev/null; then printf '%s\n' "$e"; return 0; fi
-        done
-        echo 0
-    else
-        LC_ALL=C "$DATE_BIN" -d "$lstart" +%s 2>/dev/null || echo 0
-    fi
-}
+# date_bin_probe_mode / lstart_to_epoch / FENCE_TOLERANCE_SECONDS live in
+# scripts/lib/pid-identity.sh (sourced above, #1178) — one definition of the
+# identity rule for the whole fleet.
 
 # ── pass 1: ps enumeration (single-pass awk — NO per-row subprocesses) ─
 # Retained full table "$PS_TABLE": "pid ppid pgid tty stat rss command [CAND]" —
@@ -437,21 +427,8 @@ store_records_for_pid() { # <pid> -> matching TSV lines ("" when none)
     grep -E "^${1}	" "$STORE_TSV" 2>/dev/null || true
 }
 
-# store_number_ok <value> <now> — the shared strictness gate for EVERY
-# store-derived number this script does arithmetic on. Store values are
-# UNTRUSTED: bash `$(( ))` re-parses an operand as an ARITHMETIC EXPRESSION,
-# so a crafted `pidStartSeconds` of the form `epoch[$(cmd)]` EXECUTES code as
-# the user (verified end-to-end, #947 review P1) while a bare word aborts the
-# whole pass. Only a strict decimal inside a plausible epoch window passes;
-# callers ignore anything else (fail closed — an unusable stamp can only
-# withhold a kill, never cause one). Arithmetic on an accepted value is still
-# done through `awk -v`, which never evaluates its argument as an expression.
-store_number_ok() {
-    local v="$1" now="$2"
-    grep -qE '^[0-9]+(\.[0-9]+)?$' <<<"$v" || return 1
-    awk -v u="$v" -v n="$now" 'BEGIN{exit !(u >= 1000000000 && u <= n + 86400)}'
-}
-updated_stamp_ok() { store_number_ok "$1" "$2"; }
+# store_number_ok / updated_stamp_ok live in scripts/lib/pid-identity.sh
+# (sourced above, #1178) — one definition of the untrusted-store-number gate.
 
 # stuck_record_still_frozen <sid> <pid> <now> — STUCK-settle re-verify. The
 # population inspected is deliberately the SAME one classify unions over:
@@ -676,7 +653,7 @@ classify_candidates() {
             # (see store_number_ok). An unusable pss abstains — it can neither
             # prove nor veto.
             store_number_ok "$rec_pss" "$now" || { abstain=$((abstain+1)); continue; }
-            diff="$(awk -v a="$epoch" -v b="$rec_pss" 'BEGIN{d=a-b; if (d<0) d=-d; printf "%d", d}')"
+            diff="$(pid_fence_diff "$epoch" "$rec_pss")"
             [ "$diff" -gt "$FENCE_TOLERANCE_SECONDS" ] && continue  # stale sibling: no vote
             matched_cnt=$((matched_cnt+1))
             matched="$(printf '%s\n%s' "$matched" "$rec" | sed '/^$/d')"
