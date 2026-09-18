@@ -256,8 +256,10 @@ assert_nofile "$T/o6.kills" "O6 no signal was sent"
 # ── O7: cpu-idle ───────────────────────────────────────────────────────
 echo "— O7/O8: cpu gates — idle, centisecond advance, backwards, unmeasurable —"
 DEADCWD7="$CWD_ROOT/gone7"; mkdir -p "$DEADCWD7"
-IDLE_A="$(fake_ps psIa "$(ps_row_line $ORPH 1 "$MY_UID" '0:05.00' '00:05:00' /bin/sh-spin)")"
-IDLE_B="$(fake_ps psIb "$(ps_row_line $ORPH 1 "$MY_UID" '0:05.00' '00:05:20' /bin/sh-spin)")"
+IDLE_A="$(fake_ps psIa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:05.00' '00:05:00' /bin/sh-spin)")"
+IDLE_B="$(fake_ps psIb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:05.00' '00:05:20' /bin/sh-spin)")"
 L7="$(lsof_fixture ls7 "$ORPH:$DEADCWD7")"
 rmdir "$DEADCWD7"
 OUT="$(run_reaper o7 "$IDLE_A:$IDLE_B" "$L7" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
@@ -266,19 +268,24 @@ assert_nofile "$T/o7.kills" "O7 no signal was sent"
 
 # O8: 0.20s -> 0.40s over the window = a 20cs advance. Integer-second truncation
 # read BOTH as 0 and classified a sustained 10%-of-a-core leak as cpu-idle.
-CS_A="$(fake_ps psCa "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.20' '00:05:00' /bin/sh-spin)")"
-CS_B="$(fake_ps psCb "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.40' '00:05:20' /bin/sh-spin)")"
+CS_A="$(fake_ps psCa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                   "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.20' '00:05:00' /bin/sh-spin)")"
+CS_B="$(fake_ps psCb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                   "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.40' '00:05:20' /bin/sh-spin)")"
 OUT="$(run_reaper o8 "$CS_A:$CS_B" "$L7" --min-elapsed-seconds 1 --sample-seconds 0)"
 assert_contains "$OUT" "reason=reapable cpu +20cs" "O8 a 20-centisecond advance is a REAP (regression: seconds-truncation hid it)"
 assert_contains "$OUT" "reapable=1" "O8 ... and it is the only reclaimable row"
 
-BACK_A="$(fake_ps psBa "$(ps_row_line $ORPH 1 "$MY_UID" '0:09.00' '00:05:00' /bin/sh-spin)")"
-BACK_B="$(fake_ps psBb "$(ps_row_line $ORPH 1 "$MY_UID" '0:02.00' '00:05:20' /bin/sh-spin)")"
+BACK_A="$(fake_ps psBa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:09.00' '00:05:00' /bin/sh-spin)")"
+BACK_B="$(fake_ps psBb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                     "$(ps_row_line $ORPH 1 "$MY_UID" '0:02.00' '00:05:20' /bin/sh-spin)")"
 OUT="$(run_reaper o8b "$BACK_A:$BACK_B" "$L7" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
 assert_contains "$OUT" "reason=cpu-unmeasurable" "O8b a cpu-time that goes BACKWARDS is unevaluable, not a reap"
 assert_nofile "$T/o8b.kills" "O8b ... and nothing is signalled"
 
-ABSENT_B="$(fake_ps psAb "$(ps_row_line $ORPH 1 "$MY_UID" '0:02.00' '00:05:20' /bin/sh-spin)")"
+ABSENT_B="$(fake_ps psAb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                       "$(ps_row_line $ORPH 1 "$MY_UID" '0:02.00' '00:05:20' /bin/sh-spin)")"
 OUT="$(run_reaper o8c "$GONE:$ABSENT_B" "$L7" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
 assert_contains "$OUT" "reason=cpu-unmeasurable" "O8c a pid absent from snapshot A is unevaluable, not a reap"
 assert_nofile "$T/o8c.kills" "O8c ... and nothing is signalled"
@@ -430,6 +437,83 @@ OUT="$(run_reaper o21 "$BIG_A:$BIG_B" "$(lsof_fixture lsNope 1:/)" --min-elapsed
 assert_absent "$OUT" "pid=5001" "O21 non-verbose does not print every preserved row"
 assert_contains "$OUT" "cpu-idle" "O21 ... but the reason histogram still reports the exact count"
 assert_contains "$OUT" "     2  cpu-idle" "O21 ... with the exact number"
+
+# ── O22–O26: the ancestry gate — PARKED IS NOT ORPHANED ────────
+# `ppid==1` says "the parent is gone". It does NOT say "nobody needs it": a
+# process whose parent was a login shell reparents to 1 exactly like a leaked
+# test child, and on the CPU layer the two are indistinguishable. Every fixture
+# below PASSES every other gate (ppid=1, deleted cwd under a scratch root,
+# advancing cpu), so ancestry is the ONLY thing that can preserve it. If these
+# pass while O1/O8 still reap, the gate discriminates rather than disables.
+echo "— O22–O26: ancestry — parked is not orphaned —"
+
+HUPID=4101
+DEADCWDHU="$CWD_ROOT/goneHu"; mkdir -p "$DEADCWDHU"
+HU_A="$(fake_ps psHua "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                      "$(ps_row_line $HUPID 1 "$MY_UID" '0:00.10' '09:00:00' 'login -pf someone')")"
+HU_B="$(fake_ps psHub "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                      "$(ps_row_line $HUPID 1 "$MY_UID" '0:09.00' '09:00:20' 'login -pf someone')")"
+LHU="$(lsof_fixture lsHu "$HUPID:$DEADCWDHU")"
+rmdir "$DEADCWDHU"
+OUT="$(run_reaper o22 "$HU_A:$HU_B" "$LHU" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O22 a parked login(1) is a PERSON'S process, not a leak"
+assert_contains "$OUT" "reapable=0" "O22 ... nothing is reapable"
+assert_nofile "$T/o22.kills" "O22 ... and NO signal was sent (the kill shim was never invoked)"
+
+# O23 pins the login-shell spelling. `ps` prints argv[0] WITH its leading '-';
+# matched naively against zsh|bash|sh|..., ``-zsh'' matches NOTHING and the gate
+# is silently dead for the exact spelling a real interactive session uses.
+LSH_A="$(fake_ps psLsha "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                       "$(ps_row_line 4102 1 "$MY_UID" '0:00.10' '09:00:00' -zsh)")"
+LSH_B="$(fake_ps psLshb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                       "$(ps_row_line 4102 1 "$MY_UID" '0:09.00' '09:00:20' -zsh)")"
+OUT="$(run_reaper o23 "$LSH_A:$LSH_B" "$LHU" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O23 a login shell (``-zsh'') is caught DESPITE the leading dash"
+assert_nofile "$T/o23.kills" "O23 ... and NO signal was sent"
+
+TERM_A="$(fake_ps psTerma "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                        "$(ps_row_line 4103 1 "$MY_UID" '0:00.10' '09:00:00' /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal)")"
+TERM_B="$(fake_ps psTermb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                        "$(ps_row_line 4103 1 "$MY_UID" '0:09.00' '09:00:20' /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal)")"
+OUT="$(run_reaper o24 "$TERM_A:$TERM_B" "$LHU" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O24 a terminal emulator is never reapable"
+assert_nofile "$T/o24.kills" "O24 ... and NO signal was sent"
+
+# O25: an UNREADABLE chain is not proof of independence. The fixture omits the
+# pid-1 row on purpose, so the walk cannot reach the top => REPORT, never reap.
+UN_A="$(fake_ps psUna "$(ps_row_line 4104 1 "$MY_UID" '0:00.10' '09:00:00' /bin/sh-spin)")"
+UN_B="$(fake_ps psUnb "$(ps_row_line 4104 1 "$MY_UID" '0:09.00' '09:00:20' /bin/sh-spin)")"
+OUT="$(run_reaper o25 "$UN_A:$UN_B" "$LHU" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-ancestry-unknown" "O25 an unreadable chain is REPORTED, not reaped"
+assert_nofile "$T/o25.kills" "O25 ... and NO signal was sent"
+
+# O26: THE MUTATION PROOF. A guard with no failing-mutation proof is not a
+# guard. Neuter human_anchor and the O22 candidate must flip to reapable; if it
+# does not, O22 was passing for some other reason and proves nothing.
+MUT="$T/mutant-no-anchor.sh"
+awk '
+  /^human_anchor\(\) \{/ { skip=1; print "human_anchor() { return 1; }"; next }
+  skip && /^\}/ { skip=0; next }
+  !skip { print }
+' "$REAPER" >"$MUT"
+# Invoke through a FUNCTION, exactly like reap_invoke above: a literal
+# `bash <path>` inside a `$( )` span is the form the #1484 script-content walker
+# cannot verify and fails closed on. The function form is the sanctioned shape.
+mutant_invoke() { bash "$MUT" "$@"; }
+if ! diff -q "$REAPER" "$MUT" >/dev/null 2>&1; then
+    ok "O26 the mutation applied (human_anchor rewritten)"
+    mutant_invoke --help >/dev/null 2>&1; assert_rc "$?" 0 "O26 the mutant parses"
+    : >"$T/o26.counter"; rm -f "$T/o26.kills"
+    MOUT="$(FAKE_PS_SEQ="$HU_A:$HU_B" FAKE_PS_COUNTER="$T/o26.counter" \
+            FAKE_LSOF_TABLE="$LHU" FAKE_KILL_LOG="$T/o26.kills" \
+            PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+            REAP_ORPHAN_STATE_DIR="$T/o26.state" REAP_ORPHAN_LOG="$T/o26.state/log" \
+            mutant_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)"
+    assert_absent "$MOUT" "reason=human-owned" "O26 MUTATION: human_anchor neutered => the gate is GONE (no human-owned)"
+    assert_contains "$MOUT" "reason=reapable" "O26 MUTATION: ... and the very same candidate becomes REAPABLE"
+else
+    bad "O26 the mutation did not apply (human_anchor not rewritten) — the proof is void"
+fi
 
 echo ""
 echo "── hermetic suite: $PASS passed, $FAIL failed ──"

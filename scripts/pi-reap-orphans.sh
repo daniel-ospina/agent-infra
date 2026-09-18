@@ -104,9 +104,13 @@
 #   --help          this text
 #
 # Gate order (first failure decides) — keep in sync with classify_one():
-#   not-orphan > wrong-uid > self-tree > cpu-unmeasurable > too-young >
-#   cpu-idle > cwd-unknown > cwd-live > cwd-unreadable > cwd-out-of-scope >
-#   reapable
+#   not-orphan(hint) > self-tree > launchd > wrong-uid > human-owned >
+#   human-ancestry-unknown > cpu-unmeasurable > too-young > cpu-idle >
+#   cwd-unknown > cwd-live > cwd-unreadable > cwd-out-of-scope > reapable
+#
+# ppid==1 is a HINT that selects candidates cheaply. It is never the test:
+# the test is ancestry (human-owned) plus progress judged against the
+# process's own expected distribution. See the ancestry section above.
 #
 # Env seams: PS_BIN LSOF_BIN KILL_BIN REAP_ORPHAN_LOG REAP_ORPHAN_DRY_RUN
 #   REAP_ORPHAN_SAMPLE_SECONDS REAP_ORPHAN_MIN_CPU_CENTISECONDS
@@ -154,6 +158,10 @@ PS_B=""
 # the iteration midway.
 PS_PROBE=""
 NORM_A=""
+# Normalized snapshot B. The ancestry walk MUST read B, not A: a pid can be
+# present in B and absent from A (that is precisely the cpu-unmeasurable case),
+# and the walk has to start from the table the candidate was drawn from.
+NORM_B=""
 LSOF_OUT=""
 SELF_PIDS=""
 WATCHDOGS=""
@@ -466,6 +474,95 @@ cwd_in_scope() { # <cwd> <newline-separated roots>
     return 1
 }
 
+# ── ancestry: the HUMAN-OWNERSHIP gate ─────────────────────────────────
+# `ppid==1` IS NOT THE DISCRIMINATOR. It says "the parent is gone" — true of a
+# leaked test child, but equally true of a process whose parent was a login
+# shell, and it says NOTHING about who still NEEDS the process. On 2026-09-25 a
+# sibling reaper nearly killed Daniel's live session, whose chain is:
+#     codex -> -zsh -> login -pf danielospina -> Terminal.app -> launchd
+# Every link is ppid-visible; a ppid==1 filter cannot see any of it. So walk
+# each candidate's chain to the TOP and look for a HUMAN ANCHOR.
+#
+# Anchors (matched on the normalized `ps` command; the walk stops at pid 1,
+# which is launchd and is deliberately NOT an anchor):
+#   Terminal.app / iTerm / iTerm2 / Apple_Terminal  — a terminal emulator
+#   login                                           — login(1)
+#   tmux / screen                                   — a human's multiplexer
+#   a LOGIN SHELL: argv[0] with a leading '-' (-zsh, -bash, -login)
+#
+# UNCONDITIONAL: evaluated before every other gate and NOT suppressible by
+# --any-cwd or any other flag. A parked process with a human ancestor is a
+# person's session, not a leak.
+ANCESTRY_MAX_DEPTH=64
+human_anchor() { # <command> — 0 when this process IS a human anchor
+    local cmd="$1" argv0 base
+    [ -n "$cmd" ] || return 1
+    argv0="${cmd%% *}"
+    base="${argv0##*/}"
+    # `ps` prints a LOGIN SHELL's argv[0] with its leading '-' (-zsh, -bash).
+    # Strip it BEFORE the name match: left in place, `base` is "-zsh", which
+    # matches none of zsh|bash|sh|... and every login shell slips the gate —
+    # and `-zsh` is exactly how a real interactive session appears in `ps`.
+    case "$base" in -*) base="${base#-}" ;; esac
+    [ -n "$base" ] || return 1
+    case "$base" in
+        launchd|init) return 1 ;;   # the TOP of the chain is not a human
+        login) return 0 ;;
+        Terminal|Terminal.app|iTerm|iTerm.app|iTerm2|iTerm2.app|Apple_Terminal) return 0 ;;
+        tmux|screen) return 0 ;;
+    esac
+    # A LOGIN SHELL — i.e. argv[0] carried the leading '-' stripped above. A
+    # plain `zsh` is NOT an anchor: an ordinary lane shell is not a human.
+    case "$argv0" in -*) : ;; *) return 1 ;; esac
+    case "$base" in
+        zsh|bash|sh|fish|dash|ksh|tcsh|csh|login) return 0 ;;
+    esac
+    return 1
+}
+
+# ancestry_human <normalized-file> <pid> — 0 when the candidate's ancestry
+# reaches a human anchor. Bounded in depth; an unreadable link means we cannot
+# prove independence, which the caller treats as human-owned (report, don't reap).
+ancestry_human() {
+    local file="$1" cursor="$2" depth=0 row ppid cmd
+    while [ "$depth" -lt "$ANCESTRY_MAX_DEPTH" ]; do
+        row="$(ps_row "$file" "$cursor")"
+        [ -n "$row" ] || return 1
+        ppid="$(printf '%s' "$row" | cut -f2)"
+        cmd="$(printf '%s' "$row" | cut -f6)"
+        human_anchor "$cmd" && return 0
+        [ -n "$ppid" ] || return 1
+        case "$ppid" in 0|"$cursor") return 1 ;; esac
+        cursor="$ppid"
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
+# ancestry_class <normalized-file> <pid> -> human|clear|unknown
+#   human    an ancestor is a terminal/login-shell/login — HUMAN-OWNED
+#   unknown  the chain could not be read (a missing link) — NOT proof of
+#            independence, so it is reported, never reaped
+#   clear    walked to the top with no human anchor
+ancestry_class() {
+    local file="$1" pid="$2" depth=0 cursor="$pid" row ppid cmd
+    while [ "$depth" -lt "$ANCESTRY_MAX_DEPTH" ]; do
+        row="$(ps_row "$file" "$cursor")"
+        [ -n "$row" ] || { printf 'unknown'; return 0; }
+        ppid="$(printf '%s' "$row" | cut -f2)"
+        cmd="$(printf '%s' "$row" | cut -f6)"
+        if human_anchor "$cmd"; then printf 'human'; return 0; fi
+        [ -n "$ppid" ] || { printf 'unknown'; return 0; }
+        case "$ppid" in
+            "$cursor") printf 'clear'; return 0 ;;
+            0) printf 'clear'; return 0 ;;
+        esac
+        cursor="$ppid"
+        depth=$((depth + 1))
+    done
+    printf 'unknown'
+}
+
 # ── classification ─────────────────────────────────────────────────────
 # classify_one <pid> <uid> <cpuA> <cpuB> <elapsed> <cmd> -> "<verdict>\t<reason>\t<detail>"
 # Reads $CWD_ROOTS_LIST.
@@ -476,6 +573,18 @@ classify_one() {
     case "$SELF_PIDS" in *" $pid "*) printf 'preserve\tps-self-or-ancestor\t%s\n' "$cmd"; return 0 ;; esac
     if [ "$pid" = 1 ]; then printf 'preserve\tlaunchd\t%s\n' "$cmd"; return 0; fi
     if [ "$uid" != "$MY_UID" ]; then printf 'preserve\twrong-uid\tuid=%s %s\n' "$uid" "$cmd"; return 0; fi
+    # HUMAN-OWNERSHIP, evaluated BEFORE every progress/cwd gate and NOT
+    # suppressible by --any-cwd or any other flag. Parked is not orphaned: a
+    # sub-tolerance CPU delta and a person's terminal redraw are
+    # indistinguishable at the CPU layer, so ancestry is what decides.
+    case "$(ancestry_class "$NORM_B" "$pid")" in
+        human)
+            printf 'preserve\thuman-owned\tancestry reaches a terminal/login shell %s\n' "$cmd"
+            return 0 ;;
+        unknown)
+            printf 'preserve\thuman-ancestry-unknown\tchain unreadable: cannot prove independence %s\n' "$cmd"
+            return 0 ;;
+    esac
     if [ -z "$ca" ] || [ -z "$cb" ]; then
         printf 'preserve\tcpu-unmeasurable\tcpu=%s->%s (cs) %s\n' "${ca:-?}" "${cb:-?}" "$cmd"; return 0
     fi
@@ -530,7 +639,7 @@ report_row() { # <verdict> <pid> <reason> <detail>
 # misses an operator needs to see. So: full detail for REAPABLE and NEAR-MISS
 # rows, plus a complete per-reason HISTOGRAM in the summary (nothing is hidden —
 # the counts are exact and the log holds every row). --verbose prints all.
-NEAR_MISS_REASONS=" cwd-unknown cwd-live cwd-unreadable cwd-out-of-scope cpu-unmeasurable "
+NEAR_MISS_REASONS=" cwd-unknown cwd-live cwd-unreadable cwd-out-of-scope cpu-unmeasurable human-owned human-ancestry-unknown "
 is_near_miss() { case "$NEAR_MISS_REASONS" in *" $1 "*) return 0 ;; esac; return 1; }
 
 print_footer() { # <now>
@@ -563,7 +672,7 @@ parse_args() {
 run() {
     local v rc norm_a norm_b now
 
-    trap 'watchdogs_reap; bound_cleanup; rm -f "$PS_A" "$PS_B" "$PS_PROBE" "$NORM_A" "$REASON_TMP" "$LSOF_OUT"; lock_release' EXIT
+    trap 'watchdogs_reap; bound_cleanup; rm -f "$PS_A" "$PS_B" "$PS_PROBE" "$NORM_A" "$NORM_B" "$REASON_TMP" "$LSOF_OUT"; lock_release' EXIT
 
     if [ "$MODE" = unknown ]; then
         if [ "$REAP_ORPHAN_DRY_RUN" = "0" ]; then MODE=apply; else MODE=dry-run; fi
@@ -588,8 +697,8 @@ run() {
     is_pos_int "$MY_UID" || { echo "FAIL-CLOSED abort: cannot determine uid (exit 3)" >&2; exit 3; }
 
     PS_A="$(scratch_file a)"; PS_B="$(scratch_file b)"; PS_PROBE="$(scratch_file p)"
-    NORM_A="$(scratch_file na)"; REASON_TMP="$(scratch_file reasons)"; LSOF_OUT="$(scratch_file cwd)"
-    if [ -z "$PS_A" ] || [ -z "$PS_B" ] || [ -z "$PS_PROBE" ] || [ -z "$NORM_A" ] || [ -z "$LSOF_OUT" ] || [ -z "$REASON_TMP" ]; then
+    NORM_A="$(scratch_file na)"; NORM_B="$(scratch_file nb)"; REASON_TMP="$(scratch_file reasons)"; LSOF_OUT="$(scratch_file cwd)"
+    if [ -z "$PS_A" ] || [ -z "$PS_B" ] || [ -z "$PS_PROBE" ] || [ -z "$NORM_A" ] || [ -z "$NORM_B" ] || [ -z "$LSOF_OUT" ] || [ -z "$REASON_TMP" ]; then
         echo "FAIL-CLOSED abort: cannot create the probe scratch files (exit 3)" >&2
         exit 3
     fi
@@ -648,6 +757,7 @@ run() {
     log "==== pi-reap-orphans pass: MODE=$MODE uid=$MY_UID sample=${REAP_ORPHAN_SAMPLE_SECONDS}s min_cpu=+${REAP_ORPHAN_MIN_CPU_CENTISECONDS}cs any_cwd=$ANY_CWD roots=[$(printf '%s' "$CWD_ROOTS_LIST" | tr '\n' ' ')] now=$now ===="
 
     ps_normalize "$PS_A" >"$NORM_A"
+    ps_normalize "$PS_B" >"$NORM_B"
     SELF_PIDS=" $$ "
     local pid="$$" depth=0 ppid
     while [ "$pid" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
@@ -729,7 +839,7 @@ run() {
         else
             PRESERVE_C=$((PRESERVE_C + 1))
         fi
-    done < <(ps_normalize "$PS_B" | awk -F'\t' '$2 == 1 && $1 != 1')
+    done < <(awk -F'\t' '$2 == 1 && $1 != 1' "$NORM_B")
 
     printf '\n%s\n' "── summary ──"
     printf 'mode=%s  reapable=%s  preserved=%s  reaped=%s  failed=%s  deferred=%s\n' \
