@@ -13,7 +13,7 @@
 // Usage: node scripts/pi-patches/make-manifest.mjs [--pi-root <dir>] [--out <file>]
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const args = process.argv.slice(2);
@@ -173,3 +173,19 @@ if (alreadyPatched > 0) {
 	);
 }
 console.log(`  manifest sha256 ${createHash("sha256").update(readFileSync(out)).digest("hex").slice(0, 16)}`);
+
+// Stale version directories are KEPT ON PURPOSE. `apply.mjs` selects the manifest by matching the
+// installed pi version against `writtenAgainst`, so a second directory is the normal post-upgrade
+// state and cannot confuse it. The old manifest is also the only thing that can still apply or
+// revert this patch set on an install that has not yet upgraded — deleting it would strand that
+// install. So this generator never prunes; it only says what it left behind.
+const manifestRoot = dirname(dirname(out));
+const kept = readdirSync(manifestRoot, { withFileTypes: true })
+	.filter((d) => d.isDirectory() && d.name !== CODING_VERSION)
+	.map((d) => d.name)
+	.sort();
+if (kept.length > 0) {
+	console.log(
+		`  note: keeping ${kept.length} other version directory(ies): ${kept.join(", ")} — apply.mjs selects by the INSTALLED version, so they are harmless, and they are the only way to apply or revert this patch set on those installs. Delete one only if you are sure no install still needs it.`,
+	);
+}

@@ -46,7 +46,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 /** The measured floors the clamp can produce: 1 on most APIs, 16 on openai-responses. */
 export const ABSURD_CEILING_MAX = 16;
 
-/** What we raise an absurd ceiling to. Matches `MIN_USABLE_MAX_TOKENS` in the source patch. */
+/**
+ * What we raise an absurd ceiling to.
+ *
+ * This is a JUDGEMENT, NOT A MEASUREMENT. 1024 matches `MIN_USABLE_MAX_TOKENS` in the source patch
+ * (which in turn matches `MIN_ANSWER_TOKENS` elsewhere in that module) and sits 4x under the
+ * 4096-token context-safety reserve. Nothing establishes it as the true smallest usable budget —
+ * it is the smallest value we are willing to defend, not a number a measurement produced. The job
+ * of the floor is to turn a silent 1-token death into a LOUD provider-side overflow; any value in
+ * this region does that, and this one is deliberately conservative.
+ */
 export const OUTPUT_FLOOR_TOKENS = 1024;
 
 export const CLAMP_OUTPUT_FLOOR_ENTRY_TYPE = "clamp-output-floor";

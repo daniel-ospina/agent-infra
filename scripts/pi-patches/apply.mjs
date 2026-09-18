@@ -52,7 +52,24 @@ function fail(code, lines) {
 
 const MANIFEST_DIR = join(HERE, "manifests");
 
-function loadManifest() {
+/**
+ * A manifest matches only when its `writtenAgainst` pin equals the installed version for EVERY
+ * package either side names. Selecting by this pin — rather than by "exactly one directory
+ * exists" — is what makes the NORMAL post-upgrade state work: after `make-manifest.mjs` the old
+ * version's directory is still on disk alongside the newly derived one, and the match picks the
+ * manifest for the version that is actually installed instead of refusing because there are two.
+ * A manifest the pin does not reach is never selected — the refusal below is the fail-closed loud
+ * path, and the version pin immediately after this function is the belt to this suspenders.
+ */
+function manifestMatches(manifest, current) {
+	const pinned = manifest?.writtenAgainst;
+	if (!pinned || typeof pinned !== "object") return false;
+	const keys = new Set([...Object.keys(pinned), ...Object.keys(current)]);
+	for (const key of keys) if (pinned[key] !== current[key]) return false;
+	return true;
+}
+
+function loadManifest(current) {
 	// A missing manifests/ directory is a broken CHECKOUT, not a version mismatch: say so plainly
 	// instead of letting an empty readdir masquerade as "found 0 version directories", which would
 	// send the reader to re-derive a manifest that cannot fix a missing directory. (#1214)
@@ -65,30 +82,92 @@ function loadManifest() {
 	}
 	const dirs = readdirSync(MANIFEST_DIR, { withFileTypes: true })
 		.filter((d) => d.isDirectory())
-		.map((d) => d.name);
+		.map((d) => d.name)
+		.sort();
+	const candidates = [];
+	for (const dir of dirs) {
+		const path = join(MANIFEST_DIR, dir, "manifest.json");
+		if (!existsSync(path)) continue;
+		try {
+			candidates.push({ dir, path, manifest: JSON.parse(readFileSync(path, "utf8")) });
+		} catch (error) {
+			candidates.push({ dir, path, error: error.message });
+		}
+	}
+
 	const wanted = process.env.PI_PATCH_VERSION;
-	const chosen = wanted
-		? join(MANIFEST_DIR, wanted, "manifest.json")
-		: dirs.length === 1
-			? join(MANIFEST_DIR, dirs[0], "manifest.json")
-			: undefined;
-	if (!chosen || !existsSync(chosen)) {
+	if (wanted) {
+		const forced = candidates.find((c) => c.dir === wanted);
+		if (!forced) {
+			fail(2, [
+				`PI_PATCH_VERSION=${wanted} was set, but there is no manifest at ${join(MANIFEST_DIR, wanted, "manifest.json")}`,
+				`version directories found: ${dirs.join(", ") || "(none)"}`,
+				"unset PI_PATCH_VERSION to let apply.mjs select the manifest by the INSTALLED version",
+			]);
+		}
+		if (forced.error) fail(2, [`could not parse ${forced.path}: ${forced.error}`]);
+		return { manifest: forced.manifest, path: forced.path };
+	}
+
+	const readable = candidates.filter((c) => !c.error);
+	if (readable.length === 0) {
 		fail(2, [
-			`no manifest found under ${MANIFEST_DIR}`,
-			wanted ? `looked for version ${wanted}` : `found ${dirs.length} version directories: ${dirs.join(", ") || "(none)"}`,
-			"the fix was written against ONE pi version — re-derive with make-manifest.mjs after an upgrade",
+			`no readable manifest under ${MANIFEST_DIR}`,
+			`version directories found: ${dirs.join(", ") || "(none)"}`,
+			...candidates.map((c) => `${c.dir}/manifest.json could not be parsed: ${c.error}`),
+			"this is a BROKEN CHECKOUT of scripts/pi-patches, not a version mismatch — restore it,",
+			"e.g. `git checkout -- scripts/pi-patches/manifests`",
+			"do NOT re-derive: make-manifest.mjs writes INTO this directory and cannot repair a missing manifest",
 		]);
 	}
-	return { manifest: JSON.parse(readFileSync(chosen, "utf8")), path: chosen };
+
+	const installedLine = Object.entries(current)
+		.map(([pkg, version]) => `${pkg} ${version}`)
+		.join(" / ");
+	const matches = readable.filter((c) => manifestMatches(c.manifest, current));
+	if (matches.length === 0) {
+		const issue = readable.map((c) => c.manifest?.issue).find(Boolean) ?? "#1214";
+		fail(3, [
+			"INSTALLED PI VERSION HAS MOVED — no manifest matches this install; nothing was written.",
+			"",
+			`installed:  ${installedLine}`,
+			`manifests: ${dirs.join(", ") || "(none)"}  (under ${MANIFEST_DIR})`,
+			...candidates
+				.filter((c) => c.error)
+				.map((c) => `⚠ ${c.dir}/manifest.json could not be parsed, and it may be the match: ${c.error}`),
+			"",
+			"No directory under manifests/ pins that installed version in `writtenAgainst`, so none can be",
+			"PROVEN to fit this tree. Refusing beats applying a stale or foreign patch set: the anchors are",
+			"byte-exact for the version they were derived from.",
+			"",
+			"To re-arm the fix for the installed version:",
+			`  1. read upstream ${issue} and confirm the defect is still present`,
+			`  2. node ${join(HERE, "make-manifest.mjs")}   # re-derives manifests/<installed version>/`,
+			`  3. node ${join(HERE, "apply.mjs")}          # applies + verifies`,
+			`  4. re-run the evidence tests listed in ${join(HERE, "README.md")}`,
+			"",
+			`to force one of the directories above anyway: PI_PATCH_VERSION=<dir> node ${join(HERE, "apply.mjs")}`,
+			"(forcing re-checks the pin and still refuses — with the drift table — if it does not match, so it",
+			" can never turn into a silent apply of the wrong patch set)",
+		]);
+	}
+	if (matches.length > 1) {
+		fail(2, [
+			`${matches.length} manifests match the installed version (${installedLine}): ${matches.map((c) => c.dir).join(", ")}`,
+			"ambiguous — remove the duplicate, or select one explicitly with PI_PATCH_VERSION=<dir>",
+		]);
+	}
+	return { manifest: matches[0].manifest, path: matches[0].path };
 }
 
 const PI_ROOT = resolvePiRoot();
-const { manifest, path: manifestPath } = loadManifest();
 
 const installed = {
 	"pi-coding-agent": JSON.parse(readFileSync(join(PI_ROOT, "package.json"), "utf8")).version,
 	"pi-ai": JSON.parse(readFileSync(join(PI_ROOT, "node_modules", "@earendil-works", "pi-ai", "package.json"), "utf8")).version,
 };
+
+const { manifest, path: manifestPath } = loadManifest(installed);
 
 // ── 1. VERSION PIN — an upgrade must be LOUD, never a silent revert ──────────────────────────
 const drift = Object.entries(manifest.writtenAgainst).filter(([pkg, version]) => installed[pkg] !== version);
@@ -255,7 +334,6 @@ async function probe(path, label) {
 		behaviourErrors.push(`${label}: clampMaxTokensToContext is not exported by ${path}`);
 		return;
 	}
-	const estimate = 1000;
 	const cases = [
 		{ available: 0, maxTokens: 8000, want: 1024, why: "no budget left -> must NOT be 1" },
 		{ available: -50_000, maxTokens: 8000, want: 1024, why: "estimate overran the window -> must NOT be 1" },
@@ -273,7 +351,11 @@ async function probe(path, label) {
 			behaviourErrors.push(`${label}: available=${c.available} maxTokens=${c.maxTokens} → ${got}, expected ${c.want} (${c.why})`);
 		}
 	}
-	const death = clamp(modelFor(0, 8000), contextWithTokens(estimate), 8000);
+	// The SAME context the `available = 0` case above uses. `modelFor(0, 8000)` builds a window whose
+	// clamp input is 0 (contextWindow 8193), so the probe must hold 4097 tokens — NOT the 1000-token
+	// `estimate` this once passed, which left `available` at 3097 and made the assertion INERT: the
+	// clamp could never return 1 on this input, so the line was green on a pristine tree too. (#1214)
+	const death = clamp(modelFor(0, 8000), contextWithTokens(Math.max(1000, SAFETY - 0 + 1)), 8000);
 	if (death === 1) behaviourErrors.push(`${label}: STILL ASKS FOR max_tokens: 1 — the fix is not in effect`);
 }
 

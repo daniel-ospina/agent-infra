@@ -115,6 +115,16 @@ every anchor to match **exactly once** — or, on an already-patched tree, to al
 form — and refuses to emit anything for a file that is **neither**. So a manifest that would replace
 nothing (a false PASS) cannot exist.
 
+**The manifest is selected by its `writtenAgainst` pin, not by "there is exactly one directory".**
+After an upgrade, `manifests/` normally holds the old version's directory *and* the newly derived one.
+`apply.mjs` reads every `manifest.json`, picks the one whose `writtenAgainst` equals the installed
+`pi-coding-agent`/`pi-ai` versions, and refuses (exit `3`) if none matches — so the **two-directory
+post-upgrade state is the normal state, not an error**. Old version directories are **kept on purpose**
+and never pruned by `make-manifest.mjs`: a manifest the pin does not select is still the only thing
+that can apply or revert the patch on an install that has not upgraded yet. To force one specific
+directory anyway, set `PI_PATCH_VERSION=<dir>` — the pin is still re-checked, so forcing cannot turn
+into a silent apply of a mismatched patch set.
+
 **The apply is two-pass on purpose.** Pass 1 plans every file and may refuse; only pass 2 writes.
 A single pass that wrote as it went would leave a **half-patched tree** when a later file refused —
 some files carrying the fix and others not, which is worse than not patching at all. Individual
@@ -140,6 +150,15 @@ NODE_ENV=test node scripts/pi-patches/tests/verify-a-durable-failure-record.mjs
 npx tsx extensions/clamp-output-floor.test.ts
 ```
 
+`make-manifest.mjs` **keeps** the old `manifests/<old version>/` directory. That is expected and
+deliberate: `apply.mjs` selects the manifest by matching the installed version against
+`writtenAgainst`, so the old directory cannot be mistaken for the new one — and it is the only thing
+that can still apply or revert the patch on an install that has not upgraded. **Do not delete it**
+unless you are certain no install still needs it. If you ever need to run the set against a specific
+version directory out of order, select it explicitly with `PI_PATCH_VERSION=<dir> bash
+scripts/pi-patches/apply.sh`; the version pin is re-checked, so a mismatch still refuses loudly
+(exit `3`) rather than applying anchors derived for another version.
+
 `apply.sh` behaviour, all of it non-silent:
 
 | Situation | Behaviour | Exit |
@@ -148,7 +167,10 @@ npx tsx extensions/clamp-output-floor.test.ts
 | anchor absent, patched form present | reports `already applied` (idempotent) | 0 |
 | anchor absent, patched form absent | **refuses** and writes nothing at all — the tree is left byte-identical, because the refusal is found in pass 1 | 2 |
 | `manifests/` directory missing | **refuses** and names it a broken checkout, rather than reporting "0 version directories" | 2 |
-| installed version ≠ pinned version | **refuses** with the drift table and runnable re-arm steps, writes nothing | 3 |
+| several version directories present | **selects the one whose `writtenAgainst` pin matches the installed version** — the normal post-upgrade state, not an error | 0 / 1 |
+| no version directory pins the installed version | **refuses**, names the installed version *and* the directories found, and names the `PI_PATCH_VERSION` escape | 3 |
+| `PI_PATCH_VERSION=<dir>` set but no such directory | **refuses** and lists the directories that do exist | 2 |
+| installed version ≠ pinned version (forced selection) | **refuses** with the drift table and runnable re-arm steps, writes nothing | 3 |
 | post-apply verification fails | **refuses** with the failing assertion | 4 |
 | `--check` on an unpatched tree | prints `NOT APPLIED` plus the behavioural evidence (`available=0 → max_tokens 1`) | 1 |
 
@@ -189,11 +211,12 @@ The **shipped (b)-only set** is captured in `evidence/2026-09-18-b-only/`:
 
 | File | What it proves |
 |---|---|
-| `01-red-pristine-check.txt` | a pristine 0.85.1 tree: `--check` reproduces the defect — **8 behavioural failures** (both the bundled runtime and the pi-ai ESM return `max_tokens: 1` at `available ≤ 0`). Exit 1. |
+| `01-red-pristine-check.txt` | a pristine 0.85.1 tree: `--check` reproduces the defect — **8 behavioural failures** as the probe set stood at capture (both the bundled runtime and the pi-ai ESM return `max_tokens: 1` at `available ≤ 0`). The death-probe line was **inert** in that capture — see `06-…` — so the current probe set reports **10**. Exit 1. |
 | `02-green-apply-verify.txt` | `apply.sh` applies **3 replacements** to 3 files, then `verify.sh` runs all four evidence classes — `ALL EVIDENCE HOLDS`, exit 0. A second apply writes nothing. |
 | `03-extension-negative-controls.txt` | `clamp-output-floor.test.ts` — **26 passed, 0 failed**, including every negative control (a healthy ceiling, a missing/non-numeric field, and a floor-or-above payload are left byte-identical). |
 | `04-revert-roundtrip.txt` | `--revert` then `--check` goes RED again, and `diff` against the pristine tree is **byte-identical** — a true restore. |
 | `05-c-absent.txt` | the manifest carries **zero** `_overflowRecoveryAttempt*` markers, and the installed `agent-session.js` + `chunk-JVUZSMYM.js` are byte-identical to the pristine tree. |
+| `06-manifest-selection-and-live-death-probe.txt` | the fix cycle: with two version directories the manifest matching the **installed** version is selected (`--check` exit 0, was exit 2 — the re-arm procedure no longer dead-ends); the no-match path fails **closed** (exit 3) naming the installed version, the candidate directories and the `PI_PATCH_VERSION` escape; and the death probe now fires, so a pristine tree's `--check` rises **8 → 10** behavioural failures. |
 
 `evidence/2026-09-18/` is the **earlier** snapshot and is left as a dated record: it was captured for
 the revision that still carried change (c), so its `apply` lines show **13 replacements**. Its claims
