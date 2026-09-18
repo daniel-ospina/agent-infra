@@ -352,7 +352,12 @@ jobs:
     secrets: inherit
     with:
       python-version: '3.12'
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q'
+      # #3761 — the CI-exemption decision suite rides the SAME single pytest
+      # invocation (concrete .py targets, never a `tests/` dir-suite → no #403
+      # finding). Post-merge, a RED here reaches auto-file-on-failure through
+      # this job's `needs:` entry, same as the vendored suite above it. Test
+      # half of tortoise#3761; the canonical module never leaves this repo.
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''

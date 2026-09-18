@@ -35,7 +35,9 @@
 #   T20 run is silent on stderr when it succeeds (20 samples)
 #   T21 a wrapped command that deletes `.git` still deregisters the record
 #   T22 a wrapped command that replaces `$D` with a DANGLING symlink still cleans
-#   T23 a forged marker+gitdir cannot deregister a real sibling (back-link proof)
+#   T23 a forged marker+gitdir cannot deregister a real sibling (back-link proof);
+#       and a SYMLINK at the candidate path cannot redirect that proof to a
+#       live sibling (#1162)
 #   T24 a mode-000 leftover is made removable and removed (retry path)
 #   T25 a truly UNDELETABLE leftover stays registered so `list` shows it
 #   T26 the orphan reclaim is TARGET-SPECIFIC (a foreign path stays rc 1 even
@@ -491,6 +493,38 @@ fi
 [ -f "$SIB/WIP.txt" ] && ok 0 "T23c the sibling's files are intact" || ok 1 "T23c the sibling's files are intact"
 rm -rf "$EVIL"
 git -C "$FIX/repo" worktree remove --force "$SIB" >/dev/null 2>&1
+
+# ── T23d: a SYMLINK to a LIVE sibling cannot be laundered into an owned path ─
+# #1162: every proof in `owns()` is resolved THROUGH the candidate path, so a
+# symlink under the scratch root pointing at a REAL sibling scratch worktree
+# satisfied all four at once — the marker, `.git`, the under-ROOT realpath and
+# the back-link all belong to the TARGET, and a genuine sibling legitimately has
+# them. `rm -rf "$d"` then removed only the LINK while `prune_admin` rm -rf'd the
+# SIBLING's admin dir: `clean` exited 0 having deregistered an unrelated
+# in-flight worktree, whose files stayed on disk as an invisible orphan that
+# `list` and `scripts/pi-reap-worktrees.sh` both report as clean. The tool never
+# creates a symlink here (`mktemp -d` and `git worktree add` make real dirs), and
+# the one path that MUST tolerate a symlink at $D — `remove_created`, pinned by
+# T22 — never consults `owns()`. So refusing a symlinked candidate is safe and
+# closes the redirect.
+SIB2="$SCRATCH_WORKTREE_ROOT/scratch-siblive"
+git -C "$FIX/repo" worktree add --detach "$SIB2" "$C2" >/dev/null 2>&1
+printf '%s\n' "$(cd "$FIX/repo" && pwd -P)" > "$SIB2/.scratch-worktree"
+printf 'precious\n' > "$SIB2/WIP.txt"
+LINK2="$SCRATCH_WORKTREE_ROOT/scratch-link"
+ln -s "$SIB2" "$LINK2"
+sx clean "$LINK2" >/dev/null 2>&1
+RC23D=$?
+[ "$RC23D" != 0 ] && ok 0 "T23d a symlinked candidate is refused (rc=$RC23D)" \
+  || ok 1 "T23d a symlinked candidate was accepted (rc=$RC23D)"
+if git -C "$SIB2" rev-parse --git-dir >/dev/null 2>&1; then
+  ok 0 "T23e the linked sibling is still a repository"
+else
+  ok 1 "T23e a symlink DEREGISTERED the sibling it pointed at"
+fi
+[ -f "$SIB2/WIP.txt" ] && ok 0 "T23f the linked sibling's files are intact" || ok 1 "T23f the linked sibling's files are intact"
+rm -f "$LINK2"
+git -C "$FIX/repo" worktree remove --force "$SIB2" >/dev/null 2>&1
 
 # ── T24: an UNREMOVABLE leftover must stay visible, never become an orphan ───
 # If the probe leaves something `rm` cannot delete, pruning the record anyway

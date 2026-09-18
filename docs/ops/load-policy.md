@@ -28,7 +28,7 @@ contract.
 ## 1. Signal — `os.loadavg()[0]` (1-min load average)
 
 - Read via injectable getters on both consumers: `getLoad1()` in
-  `extensions/builtin-tools/index.ts` (test seam `__setGetLoad1`), `readLoad1()`
+  `extensions/builtin-tools/index.ts` (test seam `setLoad1Override()`), `readLoad1()`
   in `scripts/load-gate.mjs` (CLI tests inject through `run()`'s `deps`).
 - **1-min exponential average** — trailing by design; supports hysteresis (never
   trust a single sample).
@@ -49,16 +49,20 @@ contract.
 
 ## 2. Thresholds — per-core normalized + hysteresis band
 
-Defaults are per-core so a fixed constant means the same thing on different
-hosts, anchored to the wt-291 documented operating point (load ~25 on 10
-cores ≈ 2.5×/core):
+These two are the **load-gate** thresholds (batch suspension). Defaults are
+per-core so a fixed constant means the same thing on different hosts, anchored
+to the wt-291 documented operating point (load ~25 on 10 cores ≈ 2.5×/core):
 
 | Threshold | Default | Rule |
 |---|---|---|
-| `LOAD_SUSPEND_THRESHOLD` | `2.5 × cores` (10-core: 25) | suspend batches at **≥** this. Does **not** drive the watchdog — its bands are fixed literals 8/16 (#1073, see §6) |
+| `LOAD_SUSPEND_THRESHOLD` | `2.5 × cores` (10-core: 25) | suspend batches at **≥** this. Does **not** drive the watchdog — the watchdog's bands are fixed and separate (#1073, see §6) |
 | `LOAD_RESUME_THRESHOLD` | `1.5 × cores` (10-core: 15) | resume only **below** this (40% hysteresis band) |
-| `TASK_LOAD_SCALE_START` | `1.5 × cores` (10-core: 15) | **inert for the watchdog — read by nothing (#1073)**; the watchdog's scale bands are fixed at 8/16 (see §6) |
-| `TASK_LOAD_SCALE_MAX` | `3` | **inert for the watchdog — read by nothing (#1073)**; the watchdog's multiplier is fixed at 3 (see §6) |
+
+The watchdog does **not** share these thresholds, and it has **no operator-tunable
+scale point or multiplier cap** — its bands are fixed literals and its only *scale*
+input is `TASK_LOAD_SCALE_OFF` (§6, #1073). The bands are absolute
+magnitudes rather than per-core; that calibration is documented, not corrected,
+here (recalibrating it moves live bounds and is tracked separately, #1116).
 
 **Hysteresis:** a batch that defers waits until load drops **below** the resume
 threshold — a single-sample dip between suspend and resume never thrash-resumes
@@ -71,20 +75,18 @@ threshold — a single-sample dip between suspend and resume never thrash-resume
 |---|---|---|---|
 | `LOAD_SUSPEND_THRESHOLD` | `2.5 × os.cpus().length` (10-core: 25) | load-gate.mjs (the watchdog reads none of it — #1073) | suspend batches at ≥ this; not a watchdog scale input |
 | `LOAD_RESUME_THRESHOLD` | `1.5 × os.cpus().length` (10-core: 15) | load-gate.mjs | resume only below this (hysteresis band) |
-| `TASK_LOAD_SCALE_START` | `1.5 × os.cpus().length` (10-core: 15) | — read by nothing (#1073) | documented as the watchdog scale point; `loadScaledBound` does not read it (bands are fixed at 8/16) |
-| `TASK_LOAD_SCALE_MAX` | `3` | — read by nothing (#1073) | documented as the watchdog multiplier cap; `loadScaledBound` hardcodes 3 |
 | `TASK_HEARTBEAT_CUT_GAP_MS` | derived `1.25 ×` tick interval (`37.5s` at the 30s default), floor `15_000` | builtin-tools cut clause | marker-gap cut deadline. **An explicit value is honoured VERBATIM and never load-rescaled** — only the derived default is scaled (#1070; see §6) |
 | `LOAD_GATE_MAX_WAIT_MIN` | `10` | wrappers (bounded poll) | minutes to poll before exit 3; `0` = no poll (deterministic defer for tests) |
 | `LOAD_GATE_FORCE` | unset | load-gate.mjs / wrappers | `1` bypasses the gate (`--force` flag sets it) |
-| `TASK_FIRST_OUTPUT_TIMEOUT_MS` | `60_000` | builtin-tools tier-1 | first-output bound (NOT load-scaled) |
+| `TASK_FIRST_OUTPUT_TIMEOUT_MS` | `60_000` | builtin-tools tier-1 | first-output bound (NOT load-scaled). `60_000` is a **floor** — a smaller value is silently clamped UP to it (a shorter bound would cut a slow-starting spawn), and a larger value now takes effect: the override was documented but unwired before #1073, so a host that had it exported sees the longer bound for the first time (bounded by the `TASK_HEARTBEAT_TIMEOUT_MS` silence clause, §6) |
 | `GIT_REMOTE_TIMEOUT_MS` | load-scaled base `5_000` (x1/2/3 by loadavg tier; `TASK_LOAD_SCALE_OFF=1` → `5_000`) | slack-bridge `gitRemoteTimeoutMs()` | git config lookup cap (#196 fold, #232) |
 | `TREE_KILL_EXEC_TIMEOUT_MS` | `5_000` | tree-kill `execTimeoutMs()` | pgrep/ps cap on the kill path (#196 fold) |
 | `PROCESS_SWEEP_EXEC_TIMEOUT_MS` | `5_000` | process-sweep `sweepExecTimeoutMs()` | pgrep/ps cap on the settle-path sweep + the own-pgid probe (#1074). Aligned with `TREE_KILL_EXEC_TIMEOUT_MS` for the same binaries; the override exists so a test can force a deterministic probe timeout with a PATH shim |
 
 **One-line ordering-clamp note:** the watchdog has no scale config to order —
-its bands are fixed literals and it reads **none** of `TASK_LOAD_SCALE_START`,
-`TASK_LOAD_SCALE_MAX` or `LOAD_SUSPEND_THRESHOLD` (#1073); `TASK_LOAD_SCALE_OFF=1`
-is its only scale input. `load-gate` clamps `resume > suspend` down to `suspend`
+its bands are fixed literals and it does **not** read `LOAD_SUSPEND_THRESHOLD`
+(#1073); `TASK_LOAD_SCALE_OFF=1` is its only scale input. `load-gate` clamps
+`resume > suspend` down to `suspend`
 (safe direction; preserves the `LOAD_SUSPEND_THRESHOLD=0` always-defer hook). Validity: absent/empty/
 non-finite/negative → default; `0` is **valid** for suspend/resume/maxWaitMin
 (the deterministic-defer test hook).
@@ -141,9 +143,16 @@ unconditionally.
 
 - **The scale function** is `loadScaledBound(base, load1)`: **three discrete
   bands, no linear region** — `1x` below load `8`, `2x` at `8 ≤ load1 < 16`, `3x`
-  at `load1 ≥ 16`; `TASK_LOAD_SCALE_OFF=1` → `1x`. (The `TASK_LOAD_SCALE_START`
-  / `TASK_LOAD_SCALE_MAX` rows in §2/§3 name a scale point and cap this function
-  does **not** read — its thresholds are fixed literals. See #1073.)
+  at `load1 ≥ 16`; `TASK_LOAD_SCALE_OFF=1` → `1x`. There is **no operator-tunable
+  scale point and no multiplier cap**: those thresholds are fixed literals and
+  `TASK_LOAD_SCALE_OFF` is the only env var this function reads (#1073). The
+  bands are absolute magnitudes anchored to the 10-core operating point
+  (8/16 = 0.8×/1.6× per core there), so a host with fewer cores scales later and
+  a larger one earlier; correcting that is a live-bound change tracked
+  separately (#1116). The same function and the same bands are duplicated as
+  `loadScaledTimeoutMs()` in `extensions/slack-bridge/socket-mode.ts`, and
+  `extensions/shared/load-scale-contract.test.ts` pins the two copies equal and
+  pins this doc's bands to the code's literals.
 - **First-message bound:** `effM = max(M, M × scale(load1))` where
   `scale ∈ {1,2,3}`. The scaling path does not round — `loadScaledBound`
   multiplies by 1/2/3 exactly. **Load only EXTENDS the bound**
@@ -207,6 +216,45 @@ unconditionally.
   `[task] cut-gap bound Xs >= the stateFresh window Ys …` warning when an override
   crosses it. Safe at the shipped defaults (T = 30min ⇒ window 60min, ~30× the 3x
   gap).
+- **Per-dispatch inactivity bound (`stream_stall_ms`, #1030):** S (the
+  in-flight-tool silence bound, and the idle-stream bound — one constant, two
+  clauses) is resolvable **per dispatch** by the task tool's `stream_stall_ms`
+  argument: `resolveStreamStallMs(param)` → the param when it is a positive
+  finite number (floored at 60s), else `max(60 s, TASK_STREAM_STALL_MS)` when
+  that env override is a positive finite number, else
+  `DEFAULT_STREAM_STALL_MS`. **Both paths are FAIL-CLOSED:** a non-finite or
+  non-positive value *on either path* (`Infinity`, `1e400`, `NaN`, `0`,
+  negative, non-numeric) resolves to the default — an override may RAISE S,
+  never disable it, and the ambient path carries the same gate so the fallback
+  cannot re-open what the override rejects. **An accepted value is honoured VERBATIM
+  and is never load-rescaled** — the same rule §3 already states for
+  `TASK_HEARTBEAT_CUT_GAP_MS`: an operator who names a number means it. A bad
+  shape (`Infinity`, `1e400`, `NaN`, `0`, negative, non-numeric) fails **CLOSED**
+  to the ambient bound — an override may RAISE S, never disable it, and the
+  ambient bound is itself fail-closed (#1030 review cycle 1: the env path used to
+  return `Infinity` for `TASK_STREAM_STALL_MS=Infinity`). Because S is
+  the bound that gates `tool-silence`/`stream-stall` while the tool-AGE backstop
+  (2/3 of the effective hard cap) ignores output, an S **at or above** that
+  backstop makes the silence clauses structurally unreachable: the loop emits the
+  one-shot `[task] inactivity bound Xs >= the tool-age backstop Ys …` warning.
+  **Warn, never clamp** (the #1070 precedent: kill timing is an operator
+  decision). One value is resolved per dispatch and threaded to every leg, so the
+  bound applied cannot diverge from the bound reported. Raised for a dispatch
+  that knowingly runs a long, QUIET tool (a full test suite, a repo-wide search)
+  — the measured #1030 wedges were five single silent calls of 1203–1341s against
+  the 1200s default. It is **not** a workaround for a genuinely wedged tool: the
+  age backstop and the hard cap are untouched by S.
+- A task child's git is **non-interactive by construction** (#1030): the child
+  env forces git's editor, sequence-editor and terminal-prompt variables to a
+  no-op / `0` respectively, and writes them *after* the ambient env spread so a
+  parent's own editor setting cannot leak in. A task child has no TTY
+  (`stdio: ["ignore","pipe","pipe"]`), so an interactive git invoker can never
+  succeed — it can only consume the dispatch's budget in silence (measured:
+  a merge `git commit` with no `-m`/`-F` opened vim, emitted one screen of
+  escapes, then 0 bytes for 1211s until the bound killed it). The pager class
+  and the SSH askpass hook are deliberately **not** covered here. (These are
+  SET, not read, so they are named only in code and in the builtin-tools suite —
+  the §3 doc↔reader gate exempts nothing a doc names that no source reads.)
 - Tier-1 (`TASK_FIRST_OUTPUT_TIMEOUT_MS`) is **NOT** load-scaled — scaling it
   delays hung-spawn detection, and spawn retry is cheap and stateless.
 
@@ -237,6 +285,16 @@ unconditionally.
   defaults calibrated to Linux; set per-host env thresholds; spurious
   suspension is the safe direction.
 - **cgroup/VM-steal blindness:** accepted for a same-host fleet (see §1).
+- **The watchdog's load bands are INERT below the first band on the fleet's
+  10-core hosts:** the bands §6 declares are absolute magnitudes anchored to that
+  operating point, and the first band's threshold sits below one× the core count
+  there (the second is above it) — so every load under the first band's
+  threshold, including the 6.6–7.3 range observed in #1074, leaves the load-aware
+  machinery doing nothing at all (the bound is 1x, i.e. the static
+  env-overridable value). #1073 documents the bands rather than recalibrating
+  them; a per-core rule is tracked in #1116, which is a live-bound change and
+  therefore its own decision. Read the thresholds themselves from §6, which is
+  the single declaration.
 
 ## 8. Swarm CLI contract (documented handoff — out of scope here)
 

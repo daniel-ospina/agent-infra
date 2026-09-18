@@ -116,7 +116,11 @@ export const OUT_OF_FAMILY_TERMS = [
   "getSubagentBackstopFreshMs",
   "getToolStallMs",
   "getStreamStallMs",
+  // #1030: camelCase (not `_MS`), so the name scan cannot see it — listed
+  // deliberately, with its own value+behaviour pin in builtin-tools.test.ts.
+  "resolveStreamStallMs",
   "getFirstMessageMs",
+  "getFirstOutputTimeoutMs",
   "getTaskMaxDispatchMs",
   "getCutGapMs",
   "getEffectiveCutGapMs",
@@ -363,10 +367,10 @@ export type HeartbeatKillReasonName = (typeof HEARTBEAT_KILL_REASONS)[number];
 export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string>> = {
   "zero-output": "FIRST_OUTPUT_TIMEOUT_MS — the tier-1 deadline that populates the entry's `firstOutputTimeoutMs`",
   "silence-threshold": "HEARTBEAT_TIMEOUT_MS (T)",
-  "stream-stall": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S)",
+  "stream-stall": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — resolvable PER DISPATCH from the task tool's stream_stall_ms arg (#1030) via resolveStreamStallMs, 60 s floor on every path",
   // Shares S with stream-stall: one constant, two conditions. Naming them as one
   // term would be wrong; naming them as two unrelated bounds would be wrong too.
-  "tool-silence": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — same bound as stream-stall, different condition",
+  "tool-silence": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — same bound as stream-stall, different condition; the dispatch override (stream_stall_ms, #1030) moves this clause too",
   // The EFFECTIVE bound is max(60 s, TASK_TOOL_STALL_MS) when the env override
   // is a positive finite number; otherwise max(60 s, fraction × cap). Recording
   // only the fraction would let the bound move through a path the registry
@@ -497,7 +501,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "= 1_200_000;",
     axis: "kill",
     guardedBy: NONE,
-    note: "S — gates BOTH stream-stall and tool-silence; the EFFECTIVE bound is resolved by getStreamStallMs (env override, 60 s floor)",
+    note: "S — gates BOTH stream-stall and tool-silence; the EFFECTIVE bound is resolved by getStreamStallMs (a positive finite env override, else the default; FAIL-CLOSED, 60 s floor), or PER DISPATCH by resolveStreamStallMs (#1030)",
   },
   {
     name: "DEFAULT_TOOL_STALL_MS",
@@ -563,6 +567,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "gate",
     guardedBy: NONE,
     note: "checkpoint park trigger — parks state, kills nothing",
+  },
+  {
+    name: "RERUN_STALL_SECONDS",
+    owners: ["scripts/admin-merge.sh"],
+    value: "${ADMIN_MERGE_STALL_SECONDS:-600}",
+    axis: "gate",
+    guardedBy: NONE,
+    note: "the merge gate's re-run progress window (#3756): a main-lane re-run whose status never reaches completed AND whose updatedAt never moves for this long is STALLED and the gate refuses the merge. A still-running job is NOT a failure — only a STALL is. The value is an env seam for tests only (ADMIN_MERGE_STALL_SECONDS); the shipped default is 600 s.",
   },
   // — reap axis (interactive session reaper) —
   {
@@ -739,7 +751,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: null,
     axis: "kill",
     guardedBy: BT_TEST,
-    note: "FUNCTION, not a const: the EFFECTIVE stream-stall/tool-silence bound (S) — max(60 s, TASK_STREAM_STALL_MS) when the override is set, else max(60 s, DEFAULT_STREAM_STALL_MS). Registered for the same reason as getToolStallMs: without it the env path and the 60 s floor are invisible and only the literal is recorded.",
+    note: "FUNCTION, not a const: the EFFECTIVE stream-stall/tool-silence bound (S) — max(60 s, TASK_STREAM_STALL_MS) when the override is a POSITIVE FINITE number, else MAX(60 s, DEFAULT_STREAM_STALL_MS). A non-finite or non-positive override (`Infinity`, `1e400`, `NaN`, `0`, negative) fails CLOSED to the default rather than being clamped up — the same inert-enforcer guard getToolStallMs and getTaskHardCapMs carry, added here in #1030's review cycle 1 (before it, `Number(env) || DEFAULT` let `TASK_STREAM_STALL_MS=Infinity` disarm the silence clauses, and the per-dispatch resolver's own fail-closed fallback inherited that). Registered for the same reason as getToolStallMs: without it the env path and the 60 s floor are invisible and only the literal is recorded.",
+  },
+  {
+    name: "resolveStreamStallMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the PER-DISPATCH resolver for S (#1030) — a positive finite override is honoured VERBATIM above a 60 s floor (never load-rescaled, per docs/ops/load-policy.md §3), and every bad shape (Infinity, 1e400, NaN, 0, negative, non-numeric) falls back to getStreamStallMs(). Registered for the same reason as its two sources: this is a THIRD path by which the silence bound moves, and a reader who saw only the env path and the literal would believe S cannot be raised per dispatch. A value at or above the age backstop is WARNED about (streamStallInertWarning), never clamped.",
   },
   {
     name: "getFirstMessageMs",
@@ -748,6 +768,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the EFFECTIVE first-message bound (M) — max(60 s, TASK_FIRST_MESSAGE_MS) when set, else max(60 s, DEFAULT_FIRST_MESSAGE_MS).",
+  },
+  {
+    name: "getFirstOutputTimeoutMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE tier-1 FIRST-OUTPUT bound (#1073) — max(60 s, TASK_FIRST_OUTPUT_TIMEOUT_MS) when the override is a positive finite number, else 60 s; a non-finite override fails CLOSED to 60 s so `1e400` cannot disarm the zero-output detector. The 60 s default is the literal the getter body carries (pinned against §3 of docs/ops/load-policy.md by load-scale-contract.test.ts); this entry exists so the effective bound is in the vocabulary, like every other env-overridable getter here.",
   },
   {
     name: "getTaskMaxDispatchMs",
@@ -766,10 +794,18 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   {
     name: "FIRST_OUTPUT_TIMEOUT_MS",
     owners: ["extensions/builtin-tools/index.ts"],
-    value: "= 60_000;",
+    // #1073 — this used to be the local literal `= 60_000;`. The bound is now
+    // READ from the env-aware getter, so the registry records the DERIVATION
+    // (that the clause's deadline keeps resolving through the getter, i.e. the
+    // documented TASK_FIRST_OUTPUT_TIMEOUT_MS override stays live) rather than
+    // a literal the declaration no longer carries. The 60 s number itself is
+    // pinned by the getter's own body — builtin-tools.test.ts
+    // value+behaviour pin, plus load-scale-contract.test.ts's §3-doc pin — and
+    // the effective bound is registered separately as `getFirstOutputTimeoutMs`.
+    value: "= getFirstOutputTimeoutMs();",
     axis: "kill",
-    guardedBy: NONE,
-    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test keeps it visible. It is also not referenced by name in any test — the registry's forward assertion is what pins the literal, hence NONE rather than BT_TEST.",
+    guardedBy: BT_TEST,
+    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause), per-dispatch and DERIVED from getFirstOutputTimeoutMs() so TASK_FIRST_OUTPUT_TIMEOUT_MS is live (#1073 — before that wiring the doc named an env var nothing read). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test plus this entry keep it visible.",
   },
   {
     name: "DEFAULT_HARD_CAP_MS",

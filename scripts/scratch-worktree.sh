@@ -170,6 +170,20 @@ realpath_file() { # <path-to-a-regular-file>
 # worktree they do not control.
 owns() { # <repo> <path>
   local repo="$1" d="$2" rp gd want common back link
+  # A SYMLINK at the candidate path REDIRECTS every proof below (#1162): `[ -d ]`
+  # follows it, the marker and `.git` are read from the TARGET, `realpath_of "$d"`
+  # returns the TARGET's physical path (still under ROOT), and the back-link then
+  # proves the TARGET is a scratch worktree — which a genuine sibling legitimately
+  # is. `rm -rf "$d"` removes only the LINK, so `remove_one` walks on to
+  # `prune_admin` and rm -rf's the SIBLING's admin dir: `clean` exits 0 having
+  # deregistered an unrelated in-flight worktree, whose files stay on disk as an
+  # invisible orphan (`list` and scripts/pi-reap-worktrees.sh both report clean).
+  # Refusing a symlinked candidate is safe: this tool never creates one — `mktemp
+  # -d` and `git worktree add` both make real directories — and the one path that
+  # MUST tolerate a symlink at $D (`remove_created`, pinned by T22) does not consult
+  # `owns()`. `-L` tests the final component only, so a caller whose scratch path is
+  # reached through a symlinked PARENT (/tmp -> /private/tmp; $TMPDIR) is unaffected.
+  if [ -L "$d" ]; then return 1; fi
   [ -d "$d" ] && [ -f "$d/.scratch-worktree" ] || return 1
   rp="$(realpath_of "$d")" || return 1
   case "$rp/" in "$ROOT"/*) ;; *) return 1 ;; esac
