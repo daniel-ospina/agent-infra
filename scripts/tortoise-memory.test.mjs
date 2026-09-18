@@ -48,6 +48,7 @@ import { promisify } from "node:util";
 import {
   parseArgs,
   probeExitCode,
+  readBodyText,
   resolveBaseUrl,
   resolveTimeoutMs,
   stateStatus,
@@ -90,6 +91,53 @@ function emptyStoreStub() {
       res.end(JSON.stringify({}));
     }
   });
+}
+
+/**
+ * A stub that answers with response HEADERS, then a PARTIAL body, then DESTROYS
+ * the connection. `Content-Length` promises more bytes than are sent, so the
+ * client's body read rejects with an untyped `TypeError: terminated`.
+ *
+ * This is the fixture that separates a TYPED body-read failure from the
+ * fail-closed default: the HTTP STATUS is already known when the read fails, so
+ * a typed guard must still map it (401/403 -> `not_configured`, 5xx -> outage,
+ * non-JSON -> outage) instead of letting the raw throw reach `stateStatus`.
+ */
+function truncatedStub(head) {
+  return new Promise((resolve) => {
+    const sockets = new Set();
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      socket.once("data", () => {
+        // Send the partial head, then abort once the bytes are flushed — a
+        // socket that sends headers plus a partial body and then destroys the
+        // connection. `Content-Length` still promises the full body.
+        socket.write(head, () => socket.destroy());
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        server,
+        url: `http://127.0.0.1:${server.address().port}`,
+        close: () => {
+          for (const s of sockets) s.destroy();
+          server.close();
+        },
+      });
+    });
+  });
+}
+
+/** A `Content-Length` head promising more bytes than `partial` carries. */
+function truncatedHead(status, contentType, partial) {
+  return (
+    `HTTP/1.1 ${status} X\r\n` +
+    `Content-Type: ${contentType}\r\n` +
+    `Content-Length: 4096\r\n` +
+    `Connection: close\r\n\r\n` +
+    partial
+  );
 }
 
 /**
@@ -364,11 +412,164 @@ test("probe: a 200 application/json with a MALFORMED body is tortoise_unavailabl
   }
 });
 
+test("probe: a TRUNCATED body is a TYPED verdict, never the fail-closed default", async () => {
+  // POST-CAP (agent-infra#1182). Round 9 typed the `res.json()` read; the two
+  // `res.text()` reads stayed unguarded. A socket that sends headers plus a
+  // PARTIAL body and then destroys the connection makes `res.text()` reject
+  // with a raw `TypeError: terminated`. Unguarded that reached `main()`'s catch
+  // and took the state word from `stateStatus`'s DEFAULT:
+  //   · a truncated 401/403 was `tortoise_unavailable` (exit 3) instead of
+  //     folding into `not_configured` (exit 4) — a documented-contract breach;
+  //   · with that default flipped to `STATUS_OK`, truncated 401 / 500 /
+  //     200-non-JSON ALL became a green `{"status":"ok"}` exit 0.
+  // Every body read now goes through ONE best-effort helper, so the STATUS
+  // decides the verdict and a truncated body only degrades the diagnostic.
+  // These assertions are exactly what the RED-mutation test below reds.
+
+  // A truncated 401/403 is STILL a rejected credential: exit 4, not an outage.
+  for (const code of [401, 403]) {
+    const { url, close } = await truncatedStub(
+      truncatedHead(code, "application/json", '{"detail":"inval'),
+    );
+    try {
+      const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_NOT_CONFIGURED, `truncated ${code} must exit 4 (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, STATUS_NOT_CONFIGURED, `truncated ${code}`);
+      // The diagnostic is the typed one, not the raw `terminated`.
+      assert.match(r.payload.message, /REFUSED the request/);
+      assert.notEqual(r.payload.status, STATUS_UNAVAILABLE);
+    } finally {
+      close();
+    }
+  }
+
+  // A truncated 5xx / non-JSON body keeps the outage word — exit 3, never ok.
+  for (const [name, status, ct, partial, re] of [
+    ["500 json", 500, "application/json", '{"detail":"boom', /HTTP 500/],
+    ["503 json", 503, "application/json", '{"detail":"later', /HTTP 503/],
+    ["200 text/html", 200, "text/html", "<html>partial", /non-JSON body/],
+    // A 2xx JSON body cut mid-write is the read+parse half of the same class.
+    ["200 application/json", 200, "application/json", '{"point_count":0,', /could not be read/],
+  ]) {
+    const { url, close } = await truncatedStub(truncatedHead(status, ct, partial));
+    try {
+      const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_UNAVAILABLE, `${name} must exit 3 (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, name);
+      assert.notEqual(r.payload.status, STATUS_OK, name);
+      assert.match(r.payload.message, re, name);
+    } finally {
+      close();
+    }
+  }
+
+  // The DATA subcommands share the same reader: the same status words, still
+  // at the skip-cleanly exit 0.
+  for (const [status, ct, partial, expected] of [
+    [401, "application/json", '{"detail":"inval', STATUS_NOT_CONFIGURED],
+    [503, "application/json", '{"detail":"later', STATUS_UNAVAILABLE],
+  ]) {
+    const { url, close } = await truncatedStub(truncatedHead(status, ct, partial));
+    try {
+      const r = await run(["search", "--query", "x"], {
+        TORTOISE_API_KEY: "tt_test",
+        TORTOISE_BASE_URL: url,
+      });
+      assert.equal(r.code, EXIT_OK, `data truncated ${status} keeps exit 0 (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, expected, `data truncated ${status}`);
+    } finally {
+      close();
+    }
+  }
+});
+
+test("the ONE body reader never throws: a rejecting body read returns the error", async () => {
+  // The structural half of the same guard: `readBodyText` is the only place a
+  // response body is read, and its contract is to return `{text: null, error}`
+  // on a failed read rather than rethrow. Replacing its catch-return with
+  // `throw e;` is the RED mutation (see the next test).
+  const ok = await readBodyText({ text: async () => "body" });
+  assert.deepEqual(ok, { text: "body", error: null });
+  const boom = new TypeError("terminated");
+  const failed = await readBodyText({
+    text: async () => {
+      throw boom;
+    },
+  });
+  assert.equal(failed.text, null);
+  assert.equal(failed.error, boom);
+});
+
+test("the ONE body reader is the ONLY body read (no unguarded read can be added)", () => {
+  // A structural tripwire, NOT a verdict guard (behaviour is pinned above):
+  // every body read must go through the single helper, so `res.text(` occurs
+  // exactly once and `res.json(` not at all. A future `await res.json()` or a
+  // second `res.text()` reds this. Comments are stripped first so documenting
+  // the pattern does not count.
+  const code = fs
+    .readFileSync(SCRIPT, "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^[ \t]*\/\/.*$/gm, "");
+  assert.equal((code.match(/\bres\.text\s*\(/g) || []).length, 1, "res.text() must appear only in readBodyText");
+  assert.equal((code.match(/\bres\.json\s*\(/g) || []).length, 0, "res.json() must not be used; JSON.parse(readBodyText(...)) instead");
+  assert.equal((code.match(/\breadBodyText\s*\(/g) || []).length, 4, "the helper must be defined once and called at all three read sites");
+});
+
+test("RED MUTATION: removing the body-read guard AND flipping the default reds every truncated verdict", async () => {
+  // Mutation testing, executed: take the shipped client, restore the untyped
+  // escape (`throw e;`) and flip `stateStatus`'s default to `STATUS_OK`, then
+  // run the SAME truncated-body scenarios. Every one must come out WRONG — the
+  // false PASS the integration test above forbids. That is what makes those
+  // assertions non-vacuous: if the guard were deleted, they would fail.
+  const original = fs.readFileSync(SCRIPT, "utf8");
+  const mutatedSrc = original
+    .replace("return { text: null, error: e };", "throw e;")
+    .replace(
+      "return e instanceof MemoryStateError ? e.status : STATUS_UNAVAILABLE;",
+      "return e instanceof MemoryStateError ? e.status : STATUS_OK;",
+    );
+  assert.ok(!mutatedSrc.includes("return { text: null, error: e };"), "the fixture must remove the body-read guard");
+  assert.ok(
+    mutatedSrc.includes("return e instanceof MemoryStateError ? e.status : STATUS_OK;"),
+    "the fixture must flip the fail-closed default",
+  );
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tortoise-memory-mutation-"));
+  const copy = path.join(dir, "tortoise-memory.mjs");
+  fs.writeFileSync(copy, mutatedSrc);
+  fs.copyFileSync(path.join(HERE, "is-main.mjs"), path.join(dir, "is-main.mjs"));
+  try {
+    for (const [name, status, ct, partial] of [
+      ["401", 401, "application/json", '{"detail":"inval'],
+      ["403", 403, "application/json", '{"detail":"forb'],
+      ["500", 500, "application/json", '{"detail":"boom'],
+      ["200 text/html", 200, "text/html", "<html>partial"],
+    ]) {
+      const { url, close } = await truncatedStub(truncatedHead(status, ct, partial));
+      try {
+        const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url }, copy);
+        // The guard-removed + default-flipped build reports a GREEN store for
+        // an unreadable body — exactly the outcome the shipped tests reject.
+        assert.equal(r.code, EXIT_OK, `mutated ${name} must be the false PASS (exit 0)`);
+        assert.equal(r.payload.status, STATUS_OK, `mutated ${name} must be the false PASS (ok)`);
+      } finally {
+        close();
+      }
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("probe: an UNREACHABLE store is tortoise_unavailable (exit 3)", async () => {
   const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: "http://127.0.0.1:1" });
   assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
   assert.equal(r.payload.status, STATUS_UNAVAILABLE);
   assert.equal(r.payload.error, STATUS_UNAVAILABLE);
+  // The fetch catch's throw is TYPED: the diagnostic names the typed path.
+  // Replacing it with `throw e;` leaves the verdict `tortoise_unavailable` via
+  // the default (so exit/status stay green) but the message becomes the raw
+  // undici error — this assertion is what reds that refactor.
+  assert.match(r.payload.message, /cannot reach the Tortoise API at/);
 });
 
 test("probe: a MALFORMED base URL is tortoise_unavailable (exit 3), never a healthy store", async () => {

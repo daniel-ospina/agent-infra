@@ -174,6 +174,49 @@ export function probeExitCode(status) {
   return EXIT_UNAVAILABLE;
 }
 
+/**
+ * ── THE body reader — the ONLY place a response body is read ────────────────
+ * Every body read in this module goes through here, so a future read cannot be
+ * added unguarded (agent-infra#1182, post-cap). The defect class is a body read
+ * that can throw an UNTYPED error: a socket that sends headers plus a PARTIAL
+ * body and then destroys the connection makes `res.text()` reject with a raw
+ * `TypeError: terminated`. Reaching `main()`'s catch from outside every
+ * `MemoryStateError` guard, that error took the state word from
+ * `stateStatus`'s fail-closed DEFAULT — so a truncated 401/403 was reported
+ * `tortoise_unavailable` (exit 3) instead of folding into `not_configured`
+ * (exit 4), and with that default flipped to `STATUS_OK` truncated 401/500/
+ * 200-non-JSON all became a green `{"status":"ok"}` exit 0. Round-9 guarded
+ * only the `res.json()` read; this is the class: NO body read may escape
+ * untyped, at any call site.
+ *
+ * The read is therefore BEST-EFFORT and itself never throws: it returns
+ * `{ text, error }`. The HTTP STATUS decides the verdict (the `!res.ok` branch
+ * maps 401/403 and 4xx/5xx from the status), so a body that cannot be read
+ * still yields that branch's TYPED error and the body is used only as the
+ * diagnostic. The one read that CAN decide a verdict is the 2xx JSON parse,
+ * and it consumes this result inside its OWN typed guard below — so a
+ * truncated/malformed JSON body is a typed `MemoryStateError`, never the
+ * fallback's default.
+ */
+export async function readBodyText(res) {
+  try {
+    return { text: await res.text(), error: null };
+  } catch (e) {
+    // BEST-EFFORT: returning the error (rather than rethrowing) is what keeps
+    // the status-based verdict TYPED. Replacing this line with `throw e;`
+    // restores the untyped escape and is the RED mutation the integration
+    // tests in tortoise-memory.test.mjs are pinned against.
+    return { text: null, error: e };
+  }
+}
+
+/** The body for a diagnostic message. An unreadable body is NAMED, not thrown. */
+function bodyOrUnreadable({ text, error }) {
+  return text !== null
+    ? text
+    : `<the response body could not be read: ${String(error?.message || error)}>`;
+}
+
 async function api(path, opts = {}) {
   const { method = "GET", body, params } = opts;
   if (!API_KEY) {
@@ -221,7 +264,9 @@ async function api(path, opts = {}) {
     );
   }
   if (!res.ok) {
-    const text = await res.text();
+    // BEST-EFFORT body read (see `readBodyText`): the HTTP status decides the
+    // verdict here, the body only supplies the diagnostic.
+    const body = bodyOrUnreadable(await readBodyText(res));
     // The store WAS reached and ANSWERED. 401/403 is a REJECTED CREDENTIAL — a
     // SET-UP gap (`not_configured`), not an outage. Any other 4xx is the API
     // refusing THIS request and must never be reported as `tortoise_unavailable`
@@ -234,16 +279,16 @@ async function api(path, opts = {}) {
         `the Tortoise API at ${BASE_URL} REFUSED the request (HTTP ${res.status}) — the key was ` +
           `rejected, or it lacks the scope/permission this call needs (403 also covers a suspended ` +
           `org, a graph-bound key, and a missing team membership). Either way it is a SET-UP gap ` +
-          `(key or permissions), not an outage: check TORTOISE_API_KEY. Body: ${text.slice(0, 200)}`,
+          `(key or permissions), not an outage: check TORTOISE_API_KEY. Body: ${body.slice(0, 200)}`,
       );
     }
     if (res.status >= 400 && res.status < 500) {
-      throw new MemoryHttpError(res.status, method, path, text);
+      throw new MemoryHttpError(res.status, method, path, body);
     }
     throw new MemoryStateError(
       STATUS_UNAVAILABLE,
       `the Tortoise API at ${BASE_URL} answered ${method} ${path} with HTTP ${res.status}: ` +
-        text.slice(0, 300),
+        body.slice(0, 300),
     );
   }
   // The guard keys on CONTENT-TYPE, not on whether the body happens to parse:
@@ -255,27 +300,37 @@ async function api(path, opts = {}) {
   // at the call sites below.)
   const ct = res.headers.get("content-type") || "";
   if (!ct.includes("json")) {
-    const text = await res.text();
+    // BEST-EFFORT read again: the verdict is `tortoise_unavailable` from the
+    // content-type, not from the body, so an unreadable body cannot change it.
+    const body = bodyOrUnreadable(await readBodyText(res));
     throw new MemoryStateError(
       STATUS_UNAVAILABLE,
       `the Tortoise API at ${BASE_URL} answered ${res.status} with a non-JSON body ` +
         `(content-type: ${ct || "none"}) — that is not the hosted API. ` +
-        `First bytes: ${text.slice(0, 120)}`,
+        `First bytes: ${body.slice(0, 120)}`,
     );
   }
   // PARSING is inside its own guard too, for the same reason as URL
   // construction above. A `content-type: application/json` header is a CLAIM,
   // not a proof: a stub, a truncated response, or a proxy cut mid-write serves
-  // the header with a malformed or empty body, and `res.json()` then throws a
-  // raw `SyntaxError`. Thrown from outside every typed guard it would reach
-  // `main()`'s `e instanceof MemoryStateError` test and take the state word
-  // from the fail-closed DEFAULT — correct only while that default is
+  // the header with a malformed or empty body. The body comes from the ONE
+  // `readBodyText` helper, so `res.json()` is gone and every body read is
+  // guarded in exactly one place; a read that FAILED is a typed state error
+  // here rather than an untyped throw, so the state word cannot come from
+  // `stateStatus`'s fail-closed DEFAULT — correct only while that default is
   // `STATUS_UNAVAILABLE`, and a reachable false PASS (`status: "ok"`) the
-  // moment it is not. Mapping it here makes a malformed body an explicit,
-  // self-describing state error like every other non-answer, so the state word
-  // does not depend on the fallback.
+  // moment it is not.
+  const { text, error } = await readBodyText(res);
+  if (error) {
+    throw new MemoryStateError(
+      STATUS_UNAVAILABLE,
+      `the Tortoise API at ${BASE_URL} answered ${method} ${path} ${res.status} with ` +
+        `content-type "${ct}" but its body could not be read (a truncated or aborted ` +
+        `response) — that is not the hosted API: ${String(error.message || error)}`,
+    );
+  }
   try {
-    return await res.json();
+    return JSON.parse(text);
   } catch (e) {
     throw new MemoryStateError(
       STATUS_UNAVAILABLE,
