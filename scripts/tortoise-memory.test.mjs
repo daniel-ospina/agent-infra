@@ -298,6 +298,14 @@ test("probe: /v1/team requires the WHOLE OrgInfoResponse shape, not just a numer
     // `org_id`/`tier` anyway, so replacing the clause with `true` stayed green.
     { org_id: "org_test", tier: "free" },
     { point_count: "0", org_id: "org_test", tier: "free" },
+    // CYCLE-7: the `typeof org_id === "string"` and `typeof tier === "string"`
+    // clauses had NO negative that pinned them. A missing/`undefined` field
+    // throws on `.length` and degrades ANYWAY, so deleting either `typeof`
+    // clause alone stayed green. A non-string field whose `.length` is truthy
+    // (an array) is otherwise a complete OrgInfoResponse and is ACCEPTED once
+    // the clause is gone — that is the body that reds it.
+    { point_count: 0, org_id: ["org_test"], tier: "free" },
+    { point_count: 0, org_id: "org_test", tier: ["free"] },
   ];
   for (const body of bodies) {
     const { server, url } = await startStub((req, res) => {
@@ -598,6 +606,38 @@ test("data read: a `count` that does not match the list length is not an envelop
     for (const args of [["search", "--query", "x"], ["query-strategies"]]) {
       const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
       assert.equal(r.payload.status, STATUS_UNAVAILABLE, `${args[0]} accepted a count/length mismatch`);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("data read: a non-ARRAY body whose `.length` equals `count` is NOT an envelope", async () => {
+  // CYCLE-7 P1. `Array.isArray(list)` was unpinned: replacing it with `true`
+  // left the suite 59/59 green. A `200 application/json` + `{"count":1,
+  // "results":"a"}` is then emitted VERBATIM as `{status:"ok",count:1,
+  // results:"a"}` — and `res.count === list.length` cannot stand in for the
+  // clause, because a STRING `"a"` also has `.length` 1. A non-array is the
+  // exact non-envelope false PASS this validator exists to stop.
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url.startsWith("/v1/search")) {
+      res.end(JSON.stringify({ count: 1, results: "a" }));
+    } else {
+      res.end(JSON.stringify({ count: 1, points: "a" }));
+    }
+  });
+  try {
+    for (const args of [
+      ["search", "--query", "x"],
+      ["query-prior-research", "--domain", "x"],
+      ["query-strategies"],
+      ["query-visions"],
+    ]) {
+      const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_OK, `${args[0]} must still skip cleanly (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, `${args[0]} read a non-array body as its envelope`);
+      assert.notEqual(r.payload.status, STATUS_OK);
     }
   } finally {
     server.close();
@@ -1239,7 +1279,18 @@ test("mock mode answers every data subcommand in the SAME shape as the API", asy
   const mock = { TORTOISE_API_KEY: "tt_test", TORTOISE_MOCK: "1" };
   const search = await run(["search", "--query", "x"], mock);
   assert.equal(search.payload.status, STATUS_OK);
+  // `search` falls back to `params.query` for `domain`; without the fallback
+  // this is `undefined` — an unasserted mock-drift (CYCLE-7 P2).
+  assert.equal(search.payload.domain, "x");
   assert.ok(Number.isInteger(search.payload.count) && Array.isArray(search.payload.results));
+
+  // CYCLE-7 P2: `query-prior-research` IS a data subcommand, and this test
+  // claims "every" one. Deleting its `case` label in `mockCall` made it fall
+  // through to `{error:"unknown_command"}` (exit 2) with the suite green.
+  const prior = await run(["query-prior-research", "--domain", "x"], mock);
+  assert.equal(prior.payload.status, STATUS_OK, `stderr: ${prior.stderr}`);
+  assert.equal(prior.payload.domain, "x");
+  assert.ok(Number.isInteger(prior.payload.count) && Array.isArray(prior.payload.results));
 
   const strategies = await run(["query-strategies"], mock);
   assert.equal(strategies.payload.status, STATUS_OK);
