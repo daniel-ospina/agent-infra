@@ -208,13 +208,16 @@ RERUN_STALL_SECONDS="${ADMIN_MERGE_STALL_SECONDS:-600}"
 # and applies to ANY derivation failure — a derivation that failed must never
 # produce a SMALL bound, because a too-tight bound is the original defect this
 # replaces.
-# The eager `case` guard matters: a non-numeric stall window would make the
-# `$((2 * …))` default error out (`value too great for base`), leaving
-# RERUN_FLOOR UNSET. validate_timing_knobs REFUSES such a value by name; this
-# only keeps the file-scope expansion from firing first.
+# The eager `case` guard matters, and it must cover BOTH classes that make the
+# `$((2 * …))` default error out: a NON-NUMERIC stall window, and an ALL-DIGIT
+# LEADING-ZERO one (`0999`, `08`) that bash reads as INVALID OCTAL. Either errors
+# with `value too great for base`, leaves RERUN_FLOOR UNSET, and aborts under
+# `set -u` BEFORE the operator receives the refusal promised below. So the guard
+# routes both to the no-expansion branch, and validate_timing_knobs REFUSES the
+# value by name; this only keeps the file-scope expansion from firing first.
 case "$RERUN_STALL_SECONDS" in
-  ''|*[!0-9]*) RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-}" ;;
-  *) RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-$((2 * RERUN_STALL_SECONDS))}" ;;
+  ''|*[!0-9]*|0[0-9]*) RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-}" ;;
+  *) RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-$((2 * 10#$RERUN_STALL_SECONDS))}" ;;
 esac
 FAILSAFE_RERUN_TIMEOUT="${ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK:-3900}"
 
@@ -265,12 +268,16 @@ counter_is_number() {
 }
 # TRUE only for an all-digit value STRICTLY GREATER than <max>, for a value of ANY
 # length. `counter_is_number` alone is not enough: it accepts a run of digits too
-# long for the shell's 64-bit integers, and such a value makes the `-lt`/`-ge`
-# comparisons that consume it ERROR (test returns 2, so the `if` body is SKIPPED)
-# or makes `$((… + …))` WRAP — a silent fail-OPEN in the very guard that exists to
-# fail closed. The comparison is therefore done by DIGIT COUNT first, so a 30-digit
-# string never reaches a `-gt` that would error out; equal lengths compare
-# lexicographically, which for all-digit strings is numeric.
+# long for the shell's 64-bit integers, and such a value breaks the guard TWO ways.
+# `$((RERUN_STALL_SECONDS + step))` WRAPS — a window at int64max plus one poll
+# interval goes NEGATIVE, so the "does the ceiling clear the window" comparison
+# PASSES; and a value PAST int64max makes the `-lt`/`-ge` comparisons that consume
+# it ERROR (test returns 2, so the `if` body is SKIPPED). The WRAP is the mechanism
+# the cycle-5 review reproduced: an all-digit over-range value was ACCEPTED and
+# yielded a minimum below zero — a silent fail-OPEN in the very guard that exists
+# to fail closed. The comparison is therefore done by DIGIT COUNT first, so a
+# 30-digit string never reaches a `-gt` or a `$((…))` that would error or wrap;
+# equal lengths compare lexicographically, which for all-digit strings is numeric.
 counter_exceeds_max() {
   local v="${1:-}" max="${2:-}"
   case "$v" in ''|*[!0-9]*) return 1 ;; esac
@@ -279,6 +286,23 @@ counter_exceeds_max() {
   [ "${#v}" -gt "${#max}" ] && return 0
   [ "${#v}" -lt "${#max}" ] && return 1
   [ "$v" \> "$max" ]
+}
+# TRUE for an all-digit value carrying a LEADING ZERO (`0100`, `08`, `0008`) — the
+# one numeric spelling the shell does NOT read uniformly. bash ARITHMETIC reads it
+# as OCTAL, while the `test` builtin, `sleep`, and the counter predicates above all
+# read it as DECIMAL. That split is load-bearing here: the guard computes its
+# required margin with `$((…))` (octal: `0100` → 64) while wait_for_run's
+# `[ "$idle" -ge "$RERUN_STALL_SECONDS" ]` enforces it with `test` (decimal: 100),
+# so `STALL=0100 --rerun-timeout 74` passed the guard (`64 + 10 = 74`) and then hit
+# the CEILING before STALLED could fire — B7. The sibling `sleep` divergence is the
+# same family: `POLL_INTERVAL=010` is accounted as 8 but sleeps 10s. And `08`/`0999`
+# are not valid octal at all, so the file-scope `2 x` expansion ERRORS and leaves
+# RERUN_FLOOR UNSET (a `set -u` abort instead of the promised named refusal).
+# Refusing the spelling outright is the contract; `10#` at the arithmetic sites is
+# defence in depth.
+counter_has_leading_zero() {
+  case "${1:-}" in 0[0-9]*) return 0 ;; esac
+  return 1
 }
 
 # TIMING_KNOB_MAX — the largest value any timing knob may take. NOT a policy bound:
@@ -328,10 +352,24 @@ POLL_INTERVAL_MAX=3600
 # same thing — "all digits" is not the same as "usable". 0 stays LEGAL: it is the
 # deterministic TEST SEAM (no real sleeping), never refused.
 #
+# LEADING ZEROS are refused on EVERY timing knob, before any arithmetic. bash reads
+# `0100` as OCTAL 64 in `$((…))` but as DECIMAL 100 in `test`/`sleep`, so a
+# leading-zero stall window made the guard's computed minimum (64 + poll) sit BELOW
+# the window the wait actually enforced — accepting `--rerun-timeout 74` over what
+# is really a 100s window, and re-creating B7. `08`/`0999` are not even valid octal
+# and error the file-scope expansion. One spelling, one meaning: refuse the zeros.
+#
 # Named, at startup, before any CI work.
 validate_timing_knobs() {
   local bad=0 numeric_ok=1
-  if ! counter_is_positive "$RERUN_STALL_SECONDS"; then
+  if counter_has_leading_zero "$RERUN_STALL_SECONDS"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL while the 'test' comparisons that gate the"
+    say_err "   wait read it as DECIMAL. The guard would compute a minimum BELOW the window actually"
+    say_err "   enforced, so the CEILING fires before STALLED can be observed. Write it without the"
+    say_err "   leading zero (e.g. '100', not '0100')."
+  elif ! counter_is_positive "$RERUN_STALL_SECONDS"; then
     bad=1; numeric_ok=0
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}' — the no-progress"
     say_err "   window must be a POSITIVE integer number of seconds. A non-numeric value makes every"
@@ -342,7 +380,13 @@ validate_timing_knobs() {
     say_err "   range (max ${TIMING_KNOB_MAX}s). An all-digit value past the shell's integer range makes"
     say_err "   every timing comparison error out, which SKIPS the guards instead of failing them."
   fi
-  if ! counter_is_positive "$RERUN_FLOOR"; then
+  if counter_has_leading_zero "$RERUN_FLOOR"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_FLOOR='${RERUN_FLOOR}' — a LEADING ZERO is ambiguous:"
+    say_err "   bash ARITHMETIC reads it as OCTAL while the 'test' comparisons that gate the wait read it"
+    say_err "   as DECIMAL, so the ordering check and the wait would disagree about the same value."
+    say_err "   Write it without the leading zero (e.g. '600', not '0600')."
+  elif ! counter_is_positive "$RERUN_FLOOR"; then
     bad=1; numeric_ok=0
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_FLOOR='${RERUN_FLOOR}' — the per-shard ceiling"
     say_err "   floor must be a POSITIVE integer number of seconds."
@@ -352,7 +396,12 @@ validate_timing_knobs() {
     say_err "   (max ${TIMING_KNOB_MAX}s). An all-digit value past the shell's integer range makes the"
     say_err "   ordering comparison error out, which SKIPS it instead of failing it."
   fi
-  if ! counter_is_positive "$FAILSAFE_RERUN_TIMEOUT"; then
+  if counter_has_leading_zero "$FAILSAFE_RERUN_TIMEOUT"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — a LEADING"
+    say_err "   ZERO is ambiguous: bash ARITHMETIC reads it as OCTAL while the comparisons that gate the"
+    say_err "   wait read it as DECIMAL. Write it without the leading zero (e.g. '3900', not '03900')."
+  elif ! counter_is_positive "$FAILSAFE_RERUN_TIMEOUT"; then
     bad=1; numeric_ok=0
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — the"
     say_err "   derivation fail-safe must be a POSITIVE integer number of seconds."
@@ -361,7 +410,13 @@ validate_timing_knobs() {
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — beyond"
     say_err "   the usable range (max ${TIMING_KNOB_MAX}s)."
   fi
-  if ! counter_is_number "$POLL_INTERVAL"; then
+  if counter_has_leading_zero "$POLL_INTERVAL"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_POLL_INTERVAL='${POLL_INTERVAL}' — a LEADING ZERO is"
+    say_err "   ambiguous and changes the PACING: bash ARITHMETIC accounts '010' as octal 8 while"
+    say_err "   'sleep' sleeps 10s, so the clock the wait advances and the clock it sleeps disagree."
+    say_err "   Write it without the leading zero (e.g. '10', not '010')."
+  elif ! counter_is_number "$POLL_INTERVAL"; then
     bad=1; numeric_ok=0
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_POLL_INTERVAL='${POLL_INTERVAL}' — the poll interval must be"
     say_err "   a NON-NEGATIVE integer number of seconds (0 is legal: the test seam). A non-numeric"
@@ -379,7 +434,10 @@ validate_timing_knobs() {
   # wrap (see counter_exceeds_max), and the checks above already set `bad`.
   if [ "$numeric_ok" -eq 1 ]; then
     local step="$POLL_INTERVAL"; [ "$step" -gt 0 ] || step=1
-    local min_ceiling=$((RERUN_STALL_SECONDS + step))
+    # 10# — defence in depth over the leading-zero refusal above: this margin is
+    # the number the wait is judged against, so it must be read in the SAME base
+    # the wait's `test` comparisons use (decimal), never bash's octal default.
+    local min_ceiling=$((10#$RERUN_STALL_SECONDS + 10#$step))
     if [ "$RERUN_FLOOR" -lt "$min_ceiling" ]; then
       bad=1
       say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_FLOOR='${RERUN_FLOOR}' — the per-shard ceiling floor"
@@ -755,22 +813,22 @@ wait_for_run() {
     # FALSE stall from frozen metadata while the child was still working; a
     # frozen clock cannot distinguish running-but-quiet from wedged.)
     if [ -z "$upd" ] || [ "$status" = "unknown" ]; then
-      unobs=$((unobs + step))
+      unobs=$((unobs + 10#$step))
       [ "$unobs" -ge "$RERUN_STALL_SECONDS" ] && return 3
-      sleep "$POLL_INTERVAL"; waited=$((waited + step)); continue
+      sleep "$POLL_INTERVAL"; waited=$((waited + 10#$step)); continue
     fi
     unobs=0
     if [ "$upd" != "$last_upd" ]; then
       idle=0; last_upd="$upd"
     else
-      idle=$((idle + step))
+      idle=$((idle + 10#$step))
     fi
     if [ "$idle" -ge "$RERUN_STALL_SECONDS" ]; then
       return 1
     fi
     info "admin-merge: … run $run_id STILL RUNNING (status=${status:-unknown}, ${waited}s of the ${RERUN_TIMEOUT}s ceiling — ${RERUN_TIMEOUT_SOURCE}). A running job is not a failure — waiting."
     sleep "$POLL_INTERVAL"
-    waited=$((waited + step))
+    waited=$((waited + 10#$step))
   done
   return 2
 }
@@ -992,7 +1050,10 @@ main() {
 
   # An explicit --rerun-timeout is a THIRD path to the ceiling, and it is checked
   # here (not in validate_timing_knobs, which runs before the flags are parsed) for
-  # the same two faults the other two paths are:
+  # the same three faults the other two paths are:
+  #   * a LEADING ZERO (`0100`) — bash ARITHMETIC reads it as OCTAL while the
+  #     `[ "$waited" -lt "$RERUN_TIMEOUT" ]` loop condition reads it as DECIMAL, so
+  #     the minimum computed below sits BELOW the window the wait enforces;
   #   * not a POSITIVE INTEGER — `[ "$waited" -lt "$RERUN_TIMEOUT" ]` returns 2, the
   #     loop body NEVER RUNS and the function falls through to `return 2` (CEILING)
   #     with ZERO polls, printing a false "still RUNNING at the ceiling" claim about
@@ -1005,6 +1066,13 @@ main() {
   #     stall window is never correct, so the flag is refused rather than treated as
   #     a raw escape hatch.
   if [ "$RERUN_TIMEOUT_EXPLICIT" -eq 1 ]; then
+    if counter_has_leading_zero "$RERUN_TIMEOUT"; then
+      say_err "admin-merge: ✗ refusing --rerun-timeout '${RERUN_TIMEOUT}' — a LEADING ZERO is ambiguous: bash"
+      say_err "   ARITHMETIC reads it as OCTAL while the 'test' comparisons that bound the wait read it as"
+      say_err "   DECIMAL, so the required minimum would be computed BELOW the window actually enforced."
+      say_err "   Write it without the leading zero (e.g. '100', not '0100')."
+      exit 2
+    fi
     if ! counter_is_positive "$RERUN_TIMEOUT"; then
       say_err "admin-merge: ✗ refusing --rerun-timeout '${RERUN_TIMEOUT}' — it must be a POSITIVE integer number of seconds."
       say_err "   A non-numeric or zero bound makes the re-run wait's comparison error out, so the"
@@ -1019,7 +1087,9 @@ main() {
       exit 2
     fi
     local wait_step="$POLL_INTERVAL"; [ "$wait_step" -gt 0 ] || wait_step=1
-    local min_wait=$((RERUN_STALL_SECONDS + wait_step))
+    # 10# — same base discipline as validate_timing_knobs: the minimum must be
+    # decimal, like the `test` comparison that immediately consumes it.
+    local min_wait=$((10#$RERUN_STALL_SECONDS + 10#$wait_step))
     if [ "$RERUN_TIMEOUT" -lt "$min_wait" ]; then
       say_err "admin-merge: ✗ refusing --rerun-timeout '${RERUN_TIMEOUT}' — it must EXCEED the stall window"
       say_err "   ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}' by at least one poll interval (${wait_step}s):"

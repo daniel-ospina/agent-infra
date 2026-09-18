@@ -2374,6 +2374,114 @@ ADMIN_MERGE_POLL_INTERVAL=30 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
 [ "$?" -eq 0 ] && pass "(P2-12) …while a paced value inside it (30) is accepted" \
   || fail "(P2-12) the in-range poll interval was refused: $(head -1 "$TMP/err")"
 
+# ── 43. A LEADING ZERO IS REFUSED — THE OCTAL/DECIMAL SPLIT (#1167 cycle-5 review) ──
+# Three parsers read the same timing string, and they disagree. bash ARITHMETIC
+# reads a leading-zero all-digit value as OCTAL; the `test` builtin, `sleep`, and
+# the counter predicates all read it as DECIMAL. So the guard's computed minimum
+# sat BELOW the window the wait actually enforced: `STALL=0100 --rerun-timeout 74`
+# was ACCEPTED (the guard computed 64 + 10 = 74) while `[ "$idle" -ge 0100 ]`
+# needed 100 — the loop exited via the CEILING and STALLED was NEVER observed,
+# printing a wedged run as "still RUNNING" with the OPPOSITE remedy. That is the
+# exact B7 transposition this PR exists to eliminate. The sibling divergence is
+# `sleep`: `POLL_INTERVAL=010` is accounted as octal 8 but sleeps 10s. And
+# `08`/`0999` are not valid octal at all, so the file-scope `2 x` expansion ERRORED
+# `value too great for base`, left RERUN_FLOOR UNSET, and aborted under `set -u`
+# with `RERUN_FLOOR: unbound variable` — fail-closed, but a crash instead of the
+# actionable named refusal the file-scope comment promised. Every assertion whose
+# comment says it FAILS pre-fix does so against HEAD 2603c0b.
+echo "== 43. a leading zero is refused (the octal/decimal split) =="
+
+# (P1-16) THE REVIEWER'S EXACT REPRO. Pre-fix: exit 0 (accepted) and a
+# `rerun-timeout=74` printed over what is really a 100s stall window.
+new_scen leading-zero-rerun
+ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 \
+  bash "$ADM" --print-bounds --rerun-timeout 74 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P1-16) STALL=0100 with --rerun-timeout 74 is refused (exit 2)" \
+  || fail "(P1-16) the octal/decimal hole was accepted (exit $rc) — STALLED would never fire"
+grep -q "refusing ADMIN_MERGE_STALL_SECONDS='0100'" "$TMP/err" \
+  && pass "(P1-16) …and the refusal names the leading-zero stall window" \
+  || { fail "(P1-16) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
+grep -q '^rerun-timeout=' "$TMP/out" \
+  && fail "(P1-16) the refused config still printed a ceiling" \
+  || pass "(P1-16) …and no ceiling was printed for the refused config"
+
+# (P1-17) the FLOOR in the band [74, 100): octal-reading, the guard's minimum is
+# 74 and the real window is 100 — a ceiling inside the band clears the octal
+# minimum while still falling short of the decimal window. Pre-fix: exit 0.
+new_scen leading-zero-floor
+ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=74 \
+  bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P1-17) STALL=0100 with FLOOR=74 (band [74,100)) is refused (exit 2)" \
+  || fail "(P1-17) a floor inside the band was accepted (exit $rc)"
+grep -q "refusing ADMIN_MERGE_STALL_SECONDS='0100'" "$TMP/err" \
+  && pass "(P1-17) …named by the leading-zero stall window" \
+  || fail "(P1-17) the refusal does not name the leading-zero stall window"
+
+# (P1-18) the refusal is UNIFORM across every timing knob, so no single knob can
+# still be read in two bases — including the `sleep` pacing divergence for
+# POLL_INTERVAL and the file-scope default for STALL. Each chosen value was
+# ACCEPTED (exit 0) by the pre-fix rail, so every iteration fails without the fix:
+# `0700` clears the decimal minimum (600 + 10) while the floor is the one knob the
+# old rail read consistently (test/python both decimal), and `03900` / `010` are
+# accepted outright.
+for spec in "ADMIN_MERGE_STALL_SECONDS|0100" "ADMIN_MERGE_RERUN_FLOOR|0700" \
+            "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010"; do
+  knob="${spec%%|*}"; val="${spec#*|}"
+  new_scen "leading-zero-$knob"
+  env "$knob=$val" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+  rc=$?
+  if [ "$rc" -eq 2 ] && grep -q "refusing $knob='$val'" "$TMP/err"; then
+    pass "(P1-18) $knob=$val is refused by name (exit 2)"
+  else
+    fail "(P1-18) $knob=$val was NOT refused (exit $rc): $(head -1 "$TMP/err")"
+  fi
+done
+# …and the explicit flag's own parse site is the third path. `0110` clears the
+# decimal minimum (100 + 10) so the PRE-fix rail ACCEPTED it (exit 0); the spelling
+# is ambiguous regardless, so it is refused by name now.
+new_scen leading-zero-flag
+ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=10 \
+  bash "$ADM" --print-bounds --rerun-timeout 0110 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(P1-18) --rerun-timeout 0110 is refused by name (exit 2)" \
+  || fail "(P1-18) a leading-zero --rerun-timeout was accepted (exit $rc)"
+grep -q "refusing --rerun-timeout '0110'" "$TMP/err" \
+  && pass "(P1-18) …naming the flag and its value" \
+  || fail "(P1-18) the flag refusal does not name the value"
+
+# (P2-13) THE FILE-SCOPE GUARD'S OWN CLASS: an all-digit INVALID-OCTAL value is
+# all-digit, so the old `''|*[!0-9]*` guard let it into `$((2 * …))`, which errored
+# `value too great for base`, left RERUN_FLOOR UNSET, and aborted under `set -u` at
+# the first use. Pre-fix: exit 1, no named refusal, both crash strings present.
+for bad in 0999 08 0008; do
+  new_scen "invalid-octal-$bad"
+  ADMIN_MERGE_STALL_SECONDS="$bad" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+  rc=$?
+  if [ "$rc" -eq 2 ] && grep -q "refusing ADMIN_MERGE_STALL_SECONDS='$bad'" "$TMP/err" \
+     && ! grep -q 'unbound variable' "$TMP/err" \
+     && ! grep -q 'value too great for base' "$TMP/err"; then
+    pass "(P2-13) STALL=$bad gives the NAMED refusal (exit 2), not a set -u crash"
+  else
+    fail "(P2-13) STALL=$bad did not give the promised refusal (exit $rc): $(head -1 "$TMP/err")"
+  fi
+done
+
+# (P2-13b) THE DECIMAL CONTRACT IS UNCHANGED — the refusal targets the SPELLING,
+# not the value, so a no-leading-zero window at the same numeric value still works.
+new_scen leading-zero-decimal-ok
+ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=10 \
+  bash "$ADM" --print-bounds --rerun-timeout 110 >"$TMP/out" 2>"$TMP/err"
+[ "$?" -eq 0 ] && pass "(P2-13b) the decimal spelling (STALL=100) is still accepted" \
+  || fail "(P2-13b) the decimal spelling was refused: $(head -1 "$TMP/err")"
+grep -q '^stall=100$' "$TMP/out" \
+  && pass "(P2-13b) …and the window is read as decimal and printed verbatim" \
+  || fail "(P2-13b) the stall window was not printed as 100"
+grep -q '^rerun-timeout=110$' "$TMP/out" \
+  && pass "(P2-13b) …and the minimum (100 + 10) is enforced in decimal" \
+  || fail "(P2-13b) the minimum was not enforced in decimal: $(head -1 "$TMP/out")"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
