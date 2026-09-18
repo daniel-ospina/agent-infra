@@ -13,15 +13,38 @@
 # that carries no head-bound evidence comment — so the bypass is safe or it does
 # not happen.
 #
-#   pr-fails.txt   ← scripts/ci-failure-set.sh --commit <head>   # the head SHA,
-#                    the exact revision the evidence marker binds to
-#   main-fails.txt ← scripts/ci-failure-set.sh --main-union N
-#   unique         ← scripts/ci-failure-set.sh --diff pr-fails.txt main-fails.txt
-#   unique EMPTY            → post head-bound evidence, then merge
-#   unique NON-EMPTY        → re-run the PR's failed jobs ONCE; anything that
-#                             passes on retry is flaky, not new (recorded in the
-#                             evidence). Residual unique still non-empty →
-#                             BLOCK, print the list, exit non-zero, NO merge.
+#   pr-rows.txt    ← scripts/ci-failure-set.sh --commit-rows <head>   # the head
+#                    SHA the evidence marker binds to, with each failure's rate
+#                    and its stable SIGNATURE
+#   main-rates.txt ← scripts/ci-failure-set.sh --main-union-rates N
+#   main-sigs.txt  ← scripts/ci-failure-set.sh --main-union-signatures N
+#   rotation       ← scripts/ci-failure-set.sh --commit-rows <head> --per-run:
+#                    the head's per-run failing-id sets, UNIONED across every
+#                    sample of the SAME head (pre- and post-re-run). An id whose
+#                    CLASS stays red while the ID moves between samples is
+#                    UNATTRIBUTABLE: it is neither PR-unique nor exempt (#3756 E5).
+#   residual       ← the EXEMPTION DECISION (scripts/ci_exemption.py decide):
+#                    an id is EXEMPT only when it was measured on main over
+#                    enough runs WITH a matching signature and the PR's failure
+#                    RATE is not materially higher. The residual is the
+#                    decision's BLOCKED ∪ UNATTRIBUTABLE set.
+#   residual EMPTY          → post head-bound evidence, then merge
+#   residual NON-EMPTY      → re-run the PR's failed jobs ONCE; anything the
+#                             decision then finds EXEMPT is flaky, not new
+#                             (recorded in the evidence). Residual still
+#                             non-empty → BLOCK, print the list, exit non-zero,
+#                             NO merge.
+#
+# WHY NOT `comm -23` (#3756 — CATEGORY A, a false PASS). The old classifier
+# decided ownership by MEMBERSHIP in a sample of main:
+# `unique = pr-fails − union(main's failing ids over N runs)`. An id that
+# appeared even ONCE in main's window was subtracted FOREVER, so a PR that
+# genuinely BROKE it was EXCUSED and the gate reported GREEN — the more main
+# flaked, the less the gate checked. Presence is never sufficient; only a
+# measured RATE on both trees is. The module that makes that decision ships WITH
+# THE RAIL (`scripts/ci_exemption.py`, next to this script) and is deliberately
+# never read from the repo being merged: a grader drawn from the graded system
+# is a bypass.
 #
 # THREE PRECONDITIONS THE FAILING SETS ALONE CANNOT EXPRESS:
 #   1. THE HEAD MUST HAVE BEEN TESTED. The lane must have at least one TESTED run
@@ -36,14 +59,15 @@
 #      immediately before the comment and again by GitHub via
 #      `--match-head-commit`, so a rebase inside the window cannot land an
 #      unanalyzed head behind SHA-bound evidence (review P1).
-#   3. THE LANE MUST BASELINE BOTH SIDES. `main-fails.txt` is `comm -23`'s right
-#      operand, so if it is EMPTY every failure the PR carries reads as new —
-#      including ones already red on main, which turns a safe merge into a false
-#      block. A lane is therefore usable only if it has TESTED runs on main too
-#      (the same `tested` counter as precondition 1). Repos that split their
-#      lanes by TRIGGER (a `pull_request`-only lane and a `push`-only lane) have
-#      no single --workflow spanning both sides; `--any-workflow` compares
-#      against every lane on main (#1003).
+#   3. THE LANE MUST BASELINE BOTH SIDES. The decision compares the PR's failure
+#      RATE and SIGNATURE against main's, so if main's measurement is EMPTY every
+#      failure the PR carries reads as new — including ones already red on main,
+#      which turns a safe merge into a false block. A lane is therefore usable
+#      only if it has TESTED runs on main too (the same `tested` counter as
+#      precondition 1). Repos that split their lanes by TRIGGER (a
+#      `pull_request`-only lane and a `push`-only lane) have no single --workflow
+#      spanning both sides; `--any-workflow` compares against every lane on main
+#      (#1003).
 #
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
@@ -163,6 +187,7 @@ GH="${ADMIN_MERGE_GH:-gh}"
 if command -v python3 >/dev/null 2>&1; then PYTHON_BIN=python3; else PYTHON_BIN=python; fi
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
+EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 # A run that is still RUNNING is not a failure — only a STALL is. This is the
 # real failure signal: the run is not `completed` and `updatedAt` has not moved
@@ -776,6 +801,52 @@ pending_run_id() {
   return 0
 }
 
+# run_exemption_decision <pr-rows> <main-rates> <main-sigs> <rotation> <prefix>
+#   Runs the exemption decision and writes `<prefix>.{verdict,blocked,unattributable,exempt}`.
+#   Returns 0 when a VERDICT was produced (BLOCK or CLEAN — both are decisions),
+#   1 when the decision could NOT run (module absent, unreadable input, crash).
+#   The distinction is load-bearing: the CLI exits 1 for a GATED verdict as well
+#   as for a crash, so the VERDICT FILE is the only thing that tells "the gate
+#   refused this PR" from "the gate is broken". Reading a crash as CLEAN is
+#   fail-open; reading it as BLOCK is merely a false block, so every ambiguous
+#   path returns 1 and the caller BLOCKS loudly.
+run_exemption_decision() {
+  local pr_rows="$1" main_rates="$2" main_sigs="$3" rotation="$4" prefix="$5"
+  if [ ! -f "$EXEMPTION_PY" ]; then
+    say_err "admin-merge: ✗ the exemption decision module is ABSENT at $EXEMPTION_PY."
+    say_err "   The rail refuses to fall back to presence-based subtraction — that is the"
+    say_err "   #3756 category-A defect (a PR that breaks a test main once flaked gets"
+    say_err "   excused and the gate reports GREEN). Restore the agent-infra checkout."
+    return 1
+  fi
+  rm -f "$prefix.verdict" "$prefix.blocked" "$prefix.unattributable" "$prefix.exempt"
+  local rot_args=()
+  [ -n "$rotation" ] && rot_args=(--rotation "$rotation")
+  "$PYTHON_BIN" "$EXEMPTION_PY" decide \
+    --pr-failures "$pr_rows" --main-rates "$main_rates" --main-signatures "$main_sigs" \
+    ${rot_args[@]+"${rot_args[@]}"} \
+    --blocked-out "$prefix.blocked" --unattributable-out "$prefix.unattributable" \
+    --exempt-out "$prefix.exempt" --verdict-out "$prefix.verdict" \
+    > "$prefix.lines" 2> "$prefix.err"
+  if [ ! -s "$prefix.verdict" ] || ! grep -q '^VERDICT' "$prefix.verdict"; then
+    say_err "admin-merge: ✗ BLOCK — the exemption decision produced NO verdict; refusing to"
+    say_err "   read a broken gate as a green one. The module said:"
+    sed 's/^/   /' "$prefix.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+# residual_of <prefix> <out-file> — the set the merge is refused over: the
+# decision's BLOCKED ∪ UNATTRIBUTABLE ids. They are disjoint, and both refuse.
+residual_of() {
+  local prefix="$1" out="$2"
+  : > "$out"
+  [ -s "$prefix.blocked" ] && cat "$prefix.blocked" >> "$out"
+  [ -s "$prefix.unattributable" ] && cat "$prefix.unattributable" >> "$out"
+  sort -u -o "$out" "$out"
+}
+
 # wait_for_run <run-id> — poll until the run is `completed`.
 #   return 0  completed.
 #   return 1  STALLED — not completed and `updatedAt` has not moved for
@@ -924,7 +995,7 @@ provenance_ids() {
 build_evidence() {
   local head="$1" main_prov="$2" pr_count="$3" main_count="$4"
   local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
-  local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}"
+  local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}" exempt_raw="${12:-}"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
@@ -941,17 +1012,21 @@ build_evidence() {
   local run_word="runs"
   if [ "$main_union_n" = "1" ]; then run_word="run"; fi
   printf 'main compared (union of %s %s of %s): %s\n' "$main_union_n" "$run_word" "$lane" "$(provenance_ids "$main_prov")"
-  printf 'PR failing: %s | main failing: %s | unique to this PR: 0\n' "$pr_count" "$main_count"
+  printf 'PR failing: %s | main failing: %s | blocked by the decision: 0\n' "$pr_count" "$main_count"
   printf '%s\n' "$analyzed"
-  # THE AUDITABLE DIFF, not just its verdict (#3467 item 2): with a zero
-  # residual the PR's own failing set IS the pre-existing set, so recording it is
-  # what lets a reviewer reach `unique: 0` from the comment instead of taking it
-  # on faith — and what distinguishes a real "all N were already red on main"
-  # from a comparison that never happened.
-  evidence_list "the $pr_count failure(s) this PR carries — all pre-existing on main" \
+  # THE AUDITABLE SET, not just its verdict (#3467 item 2): the decision only
+  # reaches this point with a zero residual, so every failure the PR carries IS
+  # exempt-with-evidence, and recording the set is what lets a reviewer reach
+  # `blocked: 0` from the comment instead of taking it on faith.
+  evidence_list "the $pr_count failure(s) this PR carries — all EXEMPT (measured on main with a matching signature and no worse rate)" \
     "$(cat "$pr_fails")" "(none — this PR carries no failure of its own)"
   evidence_list "main baseline: $main_count pre-existing failure(s), for comparison" \
     "$(cat "$main_fails")" "(none)"
+  # THE VISIBLE EXEMPTIONS (#3756). An exemption that exists only as an absence
+  # IS the fail-open defect, so every exempt id is printed with BOTH rates and
+  # the reason the decision permitted it.
+  evidence_list 'EXEMPT by the decision (visible — both rates, matching signature)' \
+    "$exempt_raw" "(none — no failure was exempted)"
   # The PRE-rerun residual, when the flake path ran. Labelled for what it IS: it
   # is NOT the diff of the two sets above (those are POST-rerun), so it must not
   # be presented under a "must be empty" heading.
@@ -959,8 +1034,8 @@ build_evidence() {
     evidence_list 'residual BEFORE the flake re-run — reclassified as flaky, NOT new failures' \
       "$unique_raw" "(none)"
   fi
-  evidence_list 'final residual (`comm -23` pr-fails main-fails) — must be empty' \
-    "$final_unique_raw" "(empty — nothing unique to this PR)"
+  evidence_list 'final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty' \
+    "$final_unique_raw" "(empty — the decision exempts every failure this PR carries)"
   printf '\nLists show at most %s entries of %s chars; the full sets are reproducible from the run ids above.\n' \
     "$EVIDENCE_ENTRIES" "$EVIDENCE_WIDTH"
   printf '%s\n' "$flake_line"
@@ -1169,13 +1244,17 @@ main() {
   # evidence marker names. `--pr` would re-resolve the head internally, so a push
   # between the two resolutions could analyze one SHA and certify another (#P1).
   local pr_status=0
-  run_failure_set --commit "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
-    --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" > "$TMP/pr-fails.txt" || pr_status=$?
+  run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+    --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" --per-run "$TMP/pr-per-run.txt" \
+    > "$TMP/pr-rows.txt" || pr_status=$?
   if [ "$pr_status" -ne 0 ]; then
     say_err "admin-merge: ✗ BLOCK — could not extract the PR's failing set (parser exit $pr_status)."
     say_err "   Refusing to certify a comparison computed over an unreadable set."
     exit 1
   fi
+  # The id set the evidence and the re-run loop use, derived from the ROWS the
+  # decision consumes, so the two can never disagree about which ids exist.
+  cut -f1 "$TMP/pr-rows.txt" 2>/dev/null | sort -u > "$TMP/pr-fails.txt"
 
   # ── 1b. THE HEAD MUST HAVE BEEN TESTED (review P0 #3) ────────────────────
   # `examined=0` is NOT the signal — a green lane legitimately has no failing
@@ -1295,7 +1374,7 @@ main() {
   if [ "$pr_extracted" -lt "$pr_examined" ]; then
     say_err "⛔ admin-merge: BLOCKED — $((pr_examined - pr_extracted)) of $pr_examined failing PR run(s)"
     say_err "   yielded NO parseable 'FAILED <nodeid>' line, so their failures are NOT in the"
-    say_err "   set and 'unique to this PR: 0' would be a false certificate (lane: $lane)."
+    say_err "   set and 'blocked by the decision: 0' would be a false certificate (lane: $lane)."
     say_err "   Either the run failed outside the test step (fix it), or the log format moved"
     say_err "   and the parser needs updating. This is a refusal, not a comparison."
     exit 1
@@ -1303,16 +1382,31 @@ main() {
 
   info "admin-merge: lane finished for $head (${pr_tested} tested of ${pr_completed} completed run(s))"
 
-  # ── 2. main's baseline: the UNION over the last N runs ───────────────────
+  # ── 2. main's baseline: the RATE table and the SIGNATURE table ───────────
+  # Both halves of ONE measurement. The rate table alone is not enough: an empty
+  # `main_signatures` makes the decision's subset rule fail CLOSED and no failure
+  # is ever exempt. Neither side is drawn from the repo being merged.
   local main_status=0
-  run_failure_set --main-union "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+  run_failure_set --main-union-rates "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
     --exclude "$head" --provenance "$TMP/main-runs.txt" --runs-report "$TMP/main-report.txt" \
-    > "$TMP/main-fails.txt" || main_status=$?
+    > "$TMP/main-rates.txt" || main_status=$?
   if [ "$main_status" -ne 0 ]; then
-    say_err "admin-merge: ✗ BLOCK — could not extract main's failing set (parser exit $main_status)."
+    say_err "admin-merge: ✗ BLOCK — could not extract main's rate table (parser exit $main_status)."
     say_err "   Refusing to certify a comparison computed over an unreadable baseline."
     exit 1
   fi
+  local main_sig_status=0
+  run_failure_set --main-union-signatures "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+    --exclude "$head" \
+    > "$TMP/main-signatures.txt" || main_sig_status=$?
+  if [ "$main_sig_status" -ne 0 ]; then
+    say_err "admin-merge: ✗ BLOCK — could not extract main's signature table (parser exit $main_sig_status)."
+    say_err "   Without it every signature check fails closed; that is a refusal, not a green."
+    exit 1
+  fi
+  # main's failing UNION — the baseline list the evidence shows — IS the rate
+  # table's id column. One measurement, one source, no second pass to disagree.
+  cut -f1 "$TMP/main-rates.txt" 2>/dev/null | sort -u > "$TMP/main-fails.txt"
 
   # ── 2b. is the selected lane a BASELINE at all? ───────────────────────────
   # A rail certificate claims "this PR carries no failure that is not already red
@@ -1351,24 +1445,36 @@ main() {
     exit 1
   fi
 
-  # ── 3. the shared comparison (one implementation, two consumers) ─────────
-  # Its OWN exit status is checked: a failed `--diff` leaves an EMPTY file, which
-  # reads as "no unique failures" and merges. That is fail-open (review P2).
-  if ! run_failure_set --diff "$TMP/pr-fails.txt" "$TMP/main-fails.txt" > "$TMP/unique.txt"; then
-    say_err "admin-merge: ✗ BLOCK — the shared comparison failed (parser exit). No merge."
+  # ── 3. THE EXEMPTION DECISION (one implementation, two consumers) ────────
+  # No `comm -23`: membership in main's sample is not evidence that a failure
+  # pre-exists, and the more main flakes the less the subtraction checks. The
+  # decision's own exit cannot distinguish a GATED verdict from a crash, so
+  # `run_exemption_decision` returns 0 for a VERDICT and 1 for a broken gate —
+  # and a broken gate BLOCKS.
+  local dec_rc=0
+  run_exemption_decision "$TMP/pr-rows.txt" "$TMP/main-rates.txt" "$TMP/main-signatures.txt" \
+    "$TMP/pr-per-run.txt" "$TMP/unique" || dec_rc=$?
+  if [ "$dec_rc" -ne 0 ]; then
+    say_err "admin-merge: ✗ BLOCK — the exemption decision could not run. No merge."
     exit 1
   fi
+  residual_of "$TMP/unique" "$TMP/unique.txt"
   local unique_before
   unique_before="$(count_lines "$TMP/unique.txt")"
 
-  local flake_line="Flake classification: none needed (no unique failures before re-run)"
+  local flake_line="Flake classification: none needed (nothing blocked before the re-run)"
   local rerun_residual=0
 
   if [ "$unique_before" -gt 0 ]; then
-    info "admin-merge: $unique_before failure(s) look unique to this PR — re-run classification:"
+    info "admin-merge: $unique_before failure(s) are blocked by the decision — re-run classification:"
     sed 's/^/   /' "$TMP/unique.txt"
     if [ "$NO_RERUN" -eq 1 ]; then
-      say_err "admin-merge: ✗ BLOCK — unique failures present and --no-rerun given. No merge."
+      say_err "admin-merge: ✗ BLOCK — failures are blocked by the decision and --no-rerun given. No merge."
+      # §37 (main): WHY each residual could not be attributed to this PR — the
+      # FILE-level diagnosis. Complementary to the decision's id-level reason
+      # lines below, not a replacement: the decision says WHAT it decided and on
+      # what evidence; this says why the residual's file was not attributable.
+      # BOTH block; no label here clears a failure.
       attribute_residual "$TMP/unique.txt" "$TMP/main-fails.txt" >&2
       exit 1
     fi
@@ -1431,22 +1537,58 @@ main() {
     fi
 
     local pr_status2=0
-    run_failure_set --commit "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
-      --runs-report "$TMP/pr-report2.txt" > "$TMP/pr-fails2.txt" || pr_status2=$?
+    run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+      --runs-report "$TMP/pr-report2.txt" --per-run "$TMP/pr-per-run2.txt" \
+      > "$TMP/pr-rows2.txt" || pr_status2=$?
     [ "$pr_status2" -eq 0 ] || { say_err "admin-merge: ✗ BLOCK — PR failing set unreadable after re-run"; exit 1; }
-    if ! run_failure_set --diff "$TMP/pr-fails2.txt" "$TMP/main-fails.txt" > "$TMP/unique2.txt"; then
-      say_err "admin-merge: ✗ BLOCK — the shared comparison failed after the re-run (parser exit). No merge."
+    cut -f1 "$TMP/pr-rows2.txt" 2>/dev/null | sort -u > "$TMP/pr-fails2.txt"
+    # THE SECOND DOOR (#3756): the post-rerun verdict is the DECISION again, not a
+    # second subtraction. A swap touching only the first would leave this verdict
+    # presence-based, so a failure excused on the first pass would be excused
+    # identically here.
+    #
+    # E5, DOOR 3 — the identity that MOVED. B7 measured it on #3749: the SAME
+    # head's SAME run id (35221282837) yielded DIFFERENT failure ids when sampled
+    # before and after the re-run. A single per-collection sample cannot see that,
+    # so the rotation observation is the UNION of every sample of THIS head — the
+    # head is provably unmoved (`head_after == head` above), so the samples are
+    # two observations of one revision, not a baseline drawn from a second tree.
+    # Without this the moved id is read as "unique to this PR" (a wrong reason,
+    # and a permanent one), or — when main also measures the new id — as EXEMPT
+    # AND SILENT, which is the fail-open direction B7's two cycles produced.
+    # With it the class is red across runs with a MOVING id, which
+    # `detect_rotating_identity` classifies UNATTRIBUTABLE: never PR-unique,
+    # never exempt, and therefore never a merge.
+    cat "$TMP/pr-per-run.txt" "$TMP/pr-per-run2.txt" > "$TMP/pr-rotation.txt"
+    local dec2_rc=0
+    run_exemption_decision "$TMP/pr-rows2.txt" "$TMP/main-rates.txt" "$TMP/main-signatures.txt" \
+      "$TMP/pr-rotation.txt" "$TMP/unique2" || dec2_rc=$?
+    if [ "$dec2_rc" -ne 0 ]; then
+      say_err "admin-merge: ✗ BLOCK — the exemption decision could not run after the re-run. No merge."
       exit 1
     fi
+    residual_of "$TMP/unique2" "$TMP/unique2.txt"
     rerun_residual="$(count_lines "$TMP/unique2.txt")"
 
     if [ "$rerun_residual" -gt 0 ]; then
-      say_err "admin-merge: ✗ BLOCK — $rerun_residual unique failure(s) SURVIVED the re-run:"
+      say_err "admin-merge: ✗ BLOCK — $rerun_residual failure(s) SURVIVED the re-run:"
+      # §33 (#1147): the REASON, not just the node id. An UNATTRIBUTABLE id (a rotating identity,
+      # or one with no main-side measurement) is created with `blocked=True`, so its
+      # verdict line is a `BLOCK` line whose reason names the class — and a refusal
+      # that printed ONLY the node id would read as an ordinary "unique to this PR",
+      # leaving the E5 class unreported. Never exempt-and-SILENT applies to the
+      # refusal too.
+      grep -v '^EXEMPT' "$TMP/unique2.lines" 2>/dev/null | sed 's/^/   /' >&2 \
+        || sed 's/^/   /' "$TMP/unique2.txt" >&2
+      # §37 (main): the FILE-level attribution. Complementary to the id-level
+      # reason lines above — BOTH are printed, BOTH block. Printing only one of
+      # them leaves either the E5 class or the file-level refusal unexplained.
       attribute_residual "$TMP/unique2.txt" "$TMP/main-fails.txt" >&2
       say_err "   The attribution above separates MEASURED-ABSENT (main's lane demonstrably"
       say_err "   measures this file and does not show this test red) from NOT-MEASURABLE"
       say_err "   (main's baseline carries no measurement of the file, so absence is NOT"
       say_err "   evidence of novelty). BOTH block; no label here clears a failure."
+      say_err "   The exemption decision still refuses them — merge refused."
       exit 1
     fi
     cp "$TMP/pr-fails2.txt" "$TMP/pr-fails.txt"
@@ -1494,7 +1636,7 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
     info "admin-merge: ⚠️  vacuous comparison — no failing runs on either side; nothing was compared (lane: $lane)"
   fi
 
-  info "admin-merge: PR failing: $pr_count | main failing: $main_count | unique to this PR: 0"
+  info "admin-merge: PR failing: $pr_count | main failing: $main_count | blocked by the decision: 0"
 
   # The set the "must be empty" claim is actually ABOUT: after a flake re-run,
   # unique2.txt is the post-rerun residual (pr-fails2 vs main-fails), while
@@ -1502,9 +1644,14 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
   # empty" heading contradicts the displayed (post-rerun) sets. (VGATE round 2.)
   local final_unique="$TMP/unique.txt"
   if [ -f "$TMP/unique2.txt" ]; then final_unique="$TMP/unique2.txt"; fi
+  # Post-rerun state wins when it exists: the evidence must describe the decision
+  # that actually authorised the merge, not the pre-rerun one.
+  local final_exempt="$TMP/unique.exempt"
+  if [ -f "$TMP/unique2.verdict" ]; then final_exempt="$TMP/unique2.exempt"; fi
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
     "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
-    "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" > "$TMP/evidence.md"
+    "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" \
+    "$(cat "$final_exempt" 2>/dev/null || true)" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"

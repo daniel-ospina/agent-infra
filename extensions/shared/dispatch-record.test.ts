@@ -645,7 +645,7 @@ test("#783 review: the spawn-error settle records a row — the abnormal populat
 test("attempt is threaded from retry() into every spawn leg (primary / failover / fallback)", () => {
 	ok(source.includes("retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions)"), "primary leg threads attempt");
 	ok(source.includes("retry((attempt) => spawnLeg(leg, attempt), retryOptions)"), "failover leg threads attempt");
-	ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd)"), "fallback leg threads attempt");
+	ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "fallback leg threads attempt");
 	ok(source.includes("const recordCtx = (attempt: number): DispatchRecordContext"), "recordCtx carries the identity");
 	ok(source.includes("const attempt = record?.attempt ?? 1;"), "missing metadata defaults to 1 (tsx does not typecheck)");
 });
