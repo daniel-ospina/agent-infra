@@ -25,6 +25,10 @@ SURVIVING_ISSUES_JSON = '[{"severity":"P1","location":"...","description":"...",
 ## Pre-loop setup
 
 ```bash
+# Preferred: `bash scripts/scratch-worktree.sh run --repo <repo> --ref <branch> -- <cmd>`
+# creates and removes the checkout itself (same shared object store, no copy).
+# The hand-rolled form below is the fallback when the helper is unavailable; it is
+# a WORKTREE, never a `git clone`/`cp -R`/`rsync` copy of the repo (#1141).
 PR_BRANCH=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName')
 WORKTREE_PATH="/tmp/code-review-fixer-${PR_NUMBER}-$$"
 SKIP_LOOP=false
@@ -327,6 +331,10 @@ SURVIVING_ISSUES_JSON="$CURRENT_ISSUES_JSON"
 
 ```bash
 git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
+# No `git worktree prune` here. It deregisters EVERY record whose directory is
+# not stat-able at that instant (unmounted volume, permission blip, stale mount),
+# so it destroys unrelated sibling checkouts while their files stay on disk
+# (#1141). `git worktree remove --force` already dropped this one's record.
 
 FIXER_ISSUES_AFTER=$(echo "$SURVIVING_ISSUES_JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
 

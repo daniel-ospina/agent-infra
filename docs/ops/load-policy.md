@@ -317,3 +317,108 @@ run fires a live BGSAVE, so bypass deliberately.
 Optional schedulers-side helpers that can coexist with the gate: a fixed
 low-load hour for daily-backup, and `nice`/`ionice` priority lowering. Reactive,
 not adaptive — complementary at most (the gate is the adaptive mechanism).
+
+## 11. Scratch checkouts — the un-metered I/O source (#1141)
+
+The load signals in §1–§6 describe a host that is *busy*; this section describes
+one that is busy for no reason. Review/probe/mutation sub-agents repeatedly
+materialised "an isolated copy of the repo" by hand under `/private/tmp`. A
+copy is a second full filesystem tree — on `tortoise` (2,361,772 files in the
+working tree, 698 MB `.git`) that is the single largest avoidable I/O generator
+on the host.
+
+### Producer evidence (2026-09-17, measured)
+
+Across 2,949 recorded pi transcripts (both `sessions/` and `task-sessions/`):
+
+| Producer | Count | Note |
+|---|---|---|
+| `git worktree add` → /tmp | 383 | the right primitive, **not** self-cleaning |
+| `git worktree remove` → /tmp | 335 | ~48 leaked admin records |
+| `cp -R …` → /tmp | 171 | full tree |
+| `git clone …` → /tmp | 66 | tree + a second `.git` |
+| `rsync -a --exclude .git …` → /tmp | 48 | full tree |
+
+No script in the repo emitted these at the time of measurement (`rg
+'/private/tmp' skills/` → 0 hits; this change *adds* mentions of the path to the
+skills, so that command returns 2 hits at the fixing commit). The producers were
+**agent improvisation** — so the durable fix is an explicit, checkable rule in the
+skill text plus a self-cleaning helper, not a reaper.
+
+Surviving artifacts on that host confirmed two copy shapes:
+`/private/tmp/rev13` and `rev14` — 126 MB each, 4,559 files, **no `.git`** (the
+`rsync` shape); `/private/tmp/p1` — 881 MB with nested `before/` + `mid/` trees.
+A third producer was **textual**: `extensions/main-worktree-guard`'s
+working-tree-discard block message *taught* `cp <file> /tmp/probe-<file>` and
+`git worktree add /tmp/probe <ref>, test inside it` with no cleanup obligation.
+
+### After-measurement — a review-shaped workload
+
+`scripts/scratch-worktree.sh` (worktree + `trap` cleanup, `--paths` sparse mode).
+Workload: 8 cycles of "obtain an isolated checkout of a ref and run a check in
+it" against `agent-infra`, measured with `ls -1 /private/tmp | wc -l` and
+`du -sk /private/tmp`.
+
+| Quantity | Value |
+|---|---|
+| `/private/tmp` entries before → after | 168 → 168 (**delta 0**) |
+| `/private/tmp` size before → after | 1,228,128 KB → 1,228,136 KB (**delta 8 KB**) |
+| Per cycle, `--paths skills/code-review` | 112 KB |
+| Per cycle, `--paths <one file>` | 8 KB |
+| Per cycle, `--full` | 22,056 KB (tree only — objects shared) |
+| Per cycle, `git clone --depth 1` (measured, independent reviewer run: tree 22,048 KB + shallow `.git` 8,508 KB) | ~30,600 KB |
+| Leftover scratch worktrees after the run | **0** |
+
+Reproduce it (from a checkout carrying `scripts/scratch-worktree.sh`):
+
+```bash
+SW=scripts/scratch-worktree.sh; R=$(git rev-parse --show-toplevel)
+E0=$(ls -1 /private/tmp | wc -l); S0=$(du -sk /private/tmp | awk '{print $1}')
+for i in 1 2 3 4 5; do bash "$SW" run --repo "$R" --ref origin/main --paths skills/code-review -- du -sk .; done
+for i in 1 2 3;     do bash "$SW" run --repo "$R" --ref origin/main --full -- du -sk .;        done
+bash "$SW" list --repo "$R" | wc -l          # leftovers: expect 0
+E1=$(ls -1 /private/tmp | wc -l); S1=$(du -sk /private/tmp | awk '{print $1}')
+echo "entries $E0 -> $E1 ; KB $S0 -> $S1"
+```
+
+(Read the per-cycle number from the `du` each `run` prints; the `/private/tmp`
+deltas are the entries/size line. Measured 2026-09-17 on Darwin 24.x.)
+
+For comparison, the debris this replaces measured 126 MB + 4,559 files **per
+cycle**, and `p1` alone 881 MB.
+
+### The rule
+
+- Scratch checkouts MUST come from `bash scripts/scratch-worktree.sh run …`
+  (`git worktree add` + `trap` on EXIT/INT/TERM/HUP). Full rule in
+  `skills/code-review/SKILL.md`, `skills/test-writing/SKILL.md`,
+  `skills/verification-before-completion/SKILL.md`.
+- `git clone`, `cp -R`/`cp -r`, `rsync` of the repo, and `git archive | tar -x`
+  into a temp dir are BANNED for scratch checkouts.
+- Leaked worktrees are recoverable by `scripts/pi-reap-worktrees.sh` (#1095) —
+  **except** ones this helper created, which carry an untracked `.scratch-worktree`
+  marker that the reaper classifies as `dirty` and PRESERVEs. Reclaim those with
+  `bash scripts/scratch-worktree.sh clean --repo <repo> --root <its root> <path>`
+  (or `... --root <its root> --all --force-all`). This section exists so they are
+  not created in the first place.
+- The mandated check is ROOT-SCOPED: `scratch-worktree.sh list --repo <repo>
+  --root <the root you used>` must not show a scratch worktree of YOURS. The
+  default root is `$SCRATCH_WORKTREE_ROOT` (else `/tmp`), so a `list` with default
+  arguments is a false PASS for a scratch worktree created under another root or by
+  the hand-rolled recipe below (`$REPO/.worktrees/scratch-$$`).
+- Cleanup deregisters **only its own record**. A bare `git worktree prune` is
+  banned: it deregisters *every* record whose directory is not stat-able at that
+  moment (unmounted volume, permission blip, stale network mount), so a routine
+  probe silently destroys an unrelated sibling worktree's checkout while its
+  files sit on disk. Since `run` is now the mandated path for every review cycle,
+  that fired constantly. The helper reads the worktree's own `gitdir:` line and
+  removes exactly that admin dir; the hand-rolled traps the skills show do the
+  same.
+- A bare `clean --all` is fail-closed (it lists candidates and exits 0): the
+  liveness probe only sees a holder whose **argv names the path**, so a cwd-only
+  holder would be swept. `clean --all --force-all` is the deliberate sibling
+  sweep, for when you have verified no sibling session is mid-probe.
+- `--paths` elements are anchored (`/foo`, not a bare `foo`): under
+  `--no-cone` a bare name is a patternspec matching at any depth, so
+  `--paths small` also pulled in `nested/small/` — inflating the I/O this tool
+  exists to cut and contradicting the "exactly these paths" contract.

@@ -160,6 +160,55 @@ All changed test files from this implementation batch are dispatched in a SINGLE
 
 **Surface map pre-check:** If no surface map exists for these test files AND files touch DB/API/auth boundaries → WARN "no surface map — test-review runs without layer assignment context."
 
+### Step 3.8 — Isolated checkouts — never copy the repo (#1141)
+
+When a test must run against a ref other than your current checkout (verifying a
+branch, reproducing on `main`, mutation-probing a file), get the checkout from a
+worktree — never a copy:
+
+```bash
+bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> \
+  [--paths <dir,file> | --full] -- <test-command...>
+```
+
+`run` shares the object store (no second `.git`) and **removes the worktree on
+EXIT/INT/TERM/HUP**, so a failing or killed test still leaves nothing behind.
+`--paths` is a sparse checkout (a few KB) — use it when the test only reads some
+paths. `--full` is the whole tracked tree.
+
+**BANNED for scratch checkouts:** `git clone`, `cp -R`, `cp -r`, `cp -a`, `rsync`
+of the repo, `git archive | tar -x` into a temp dir. If you create a worktree by
+hand, the trap is mandatory and MUST re-raise the status (a trap that does not
+`exit` swallows the signal and the script keeps running):
+
+```bash
+REPO=<repo>; D="$REPO/.worktrees/scratch-$$"
+git -C "$REPO" worktree add --detach "$D" <ref>
+GD="$(sed -n 's/^gitdir: //p' "$D/.git" 2>/dev/null)"
+trap 'rc=$?; rm -rf "${D:-/nonexistent}" 2>/dev/null || true; if [ ! -e "${D:-/nonexistent}" ]; then git -C "$REPO" worktree remove --force "${D:-/nonexistent}" 2>/dev/null || true; case "${GD:-}" in /*/.git/worktrees/*) rm -rf "$GD";; esac; else echo "leftover ${D:-?} - record KEPT so list shows it" >&2; fi; exit $rc' EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM
+```
+
+The trap removes the TREE first and only then deregisters: `git worktree remove --force`
+drops the record even when it FAILS to delete the directory, so deregistering first would
+leave a surviving checkout invisible to `list`, to a second `clean <path>` and to the
+reaper (#1141).
+The record removal is TARGETED: a bare `git worktree prune` deregisters every
+record whose directory is not currently stat-able (unmounted volume, permission
+blip, stale network mount), so it can silently destroy an unrelated sibling
+worktree's checkout while its files sit on disk. Remove your own record — the
+trap above reads its own `gitdir:` line — never prune the whole repo.
+
+Before reporting done, `bash scripts/scratch-worktree.sh list --repo <repo> --root <the root you used>` must not show a
+scratch worktree of YOURS. Clean only your own path (`scratch-worktree.sh clean
+<path>`). A bare `clean --all` refuses to sweep (it cannot see a holder whose argv
+does not name the path, so it would delete a sibling's in-flight probe);
+`clean --all --force-all` is the deliberate sibling sweep — do not run it while
+sibling sessions are running.
+The check is ROOT-SCOPED (`$SCRATCH_WORKTREE_ROOT`, else `/tmp`), so a bare `list` is
+a false PASS for a worktree created under another root.
+
+
 ### Step 4 — Green Phase (Run Test, Verify It Fails)
 
 Run the test and confirm it fails for the expected reason:

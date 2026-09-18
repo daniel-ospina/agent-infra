@@ -1421,8 +1421,18 @@ function _worktreeDiscardBlockReason(
           `   this command would revert (\`git status --porcelain\` was read for`,
           `   this scope).`,
           `   → Probe a mutation on a COPY, never in place (#664):`,
-          `       cp <file> /tmp/probe-<file>   # mutate + test the copy, then rm it`,
-          `       # or: git worktree add /tmp/probe <ref>, test inside it`,
+          `       D=$(git rev-parse --show-toplevel)/.worktrees/scratch-$$`,
+          `       git worktree add --detach "$D" <ref>; ( cd "$D" && <cmd> )`,
+          `       rm -rf "$D"                        # TREE first, then the record:`,
+          `       git worktree remove --force "$D"   # this drops the record even when it`,
+          `       # FAILS to delete the dir, so the reverse order hides a survivor.`,
+          `       # Remove THAT record too if needed — a bare \`git worktree prune\``,
+          `       # deregisters every worktree whose dir is not stat-able right now,`,
+          `       # unrelated siblings included (#1141).`,
+          `     A worktree shares the object store. NEVER \`git clone\` / \`cp -R\` /`,
+          `     \`rsync\` the repo into /tmp: the copy outlives its owner and costs`,
+          `     ~2.4M files of I/O per cycle (#1141). Where it exists, prefer`,
+          `     \`scripts/scratch-worktree.sh run ...\` — it removes the worktree itself.`,
           `   → Inspect first: git status --porcelain; git diff <path>.`,
           `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
           `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
@@ -1950,6 +1960,21 @@ const SANCTIONED_SCRIPT_RELPATHS = [
   "scripts/check-pipeline-compliance.sh",
   // The recovery helper most guard messages recommend.
   "scripts/checkout-hygiene/hub-worktree.sh",
+  // #1141 — the mandated scratch-checkout helper. It is the fix for the
+  // /tmp copy debris, and it is NOT usable from a hub-rooted session without
+  // this exemption: its content carries `git worktree add/remove/prune`,
+  // `sparse-checkout` and `read-tree`, so the content walk blocked exactly the
+  // hub-rooted reviewers the rule is written for — who then fell back to the
+  // improvisation the issue exists to stop (code-review cycle-2 P1, driven
+  // through this module's real handler). Same class as hub-worktree.sh (worktree
+  // create/remove, resolved at runtime), and TIGHTER than it: removal is
+  // confined by `owns()` to a path that is under the scratch root AND carries
+  // the tool's marker AND whose admin gitdir is under the COMMON
+  // .git/worktrees/ AND whose admin dir's own `gitdir` back-link names that
+  // checkout — the last of which is written by git, so it cannot be forged to
+  // deregister a worktree the caller does not control (code-review-cycle-9 P1),
+  // so it cannot be pointed at the hub or another checkout.
+  "scripts/scratch-worktree.sh",
 ];
 const _frameworkRoot: string | null = (() => {
   try {

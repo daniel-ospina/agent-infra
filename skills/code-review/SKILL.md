@@ -472,6 +472,45 @@ if [ -n "$INFRA_RISK" ]; then
 fi
 ```
 
+**Shared dispatch preamble — inject into EVERY reviewer prompt below** (#1141):
+```
+ISOLATED CHECKOUTS — never copy the repo. If your review needs a checkout other
+than the one you are in (e.g. to run a check or probe the PR branch), get it with
+    bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> [--paths <p1,p2> | --full] -- <cmd...>
+`run` uses a git worktree (object store SHARED — no second .git) and REMOVES it on
+EXIT/INT/TERM/HUP (SIGKILLing a TERM-ignoring child after a bounded grace), so a
+crashed probe leaves nothing behind. `--paths` is a sparse checkout (a few KB) —
+prefer it whenever you only read some paths. `--paths` is literal: absolute
+paths, `.`/`..`, and globs are refused, and an absent path fails rather than
+yielding an empty checkout.
+BANNED for scratch checkouts: `git clone`, `cp -R`, `cp -r`, `cp -a`, `rsync` of
+the repo, `git archive | tar -x` into a temp dir. One measured review loop left 13
+copies of ~126 MB each in /private/tmp and drove ~2.4M files of I/O per cycle; the
+debris helped take host load to 42.9. If you create a worktree by hand, the trap is
+mandatory and MUST re-raise the status and name the repo (a trap that does not
+`exit` swallows the signal and keeps running; one without `-C` silently fails once
+the probe has changed cwd):
+`REPO=<repo>; D="$REPO/.worktrees/scratch-$$"; git -C "$REPO" worktree add --detach "$D" <ref>; GD="$(sed -n 's/^gitdir: //p' "$D/.git" 2>/dev/null)"; trap 'rc=$?; rm -rf "${D:-/nonexistent}" 2>/dev/null || true; if [ ! -e "${D:-/nonexistent}" ]; then git -C "$REPO" worktree remove --force "${D:-/nonexistent}" 2>/dev/null || true; case "${GD:-}" in /*/.git/worktrees/*) rm -rf "$GD";; esac; else echo "leftover ${D:-?} - record KEPT so list shows it" >&2; fi; exit $rc' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM`.
+The trap removes the TREE first and only then deregisters: `git worktree remove --force`
+drops the record even when it FAILS to delete the directory, so deregistering first would
+leave a surviving checkout invisible to `list`, to a second `clean <path>` and to the
+reaper (#1141).
+Cleanup is TARGETED for a reason: a bare `git worktree prune` deregisters every
+record whose directory is not currently stat-able — an unmounted volume, a
+permission blip, a stale network mount — so it can silently destroy an unrelated
+sibling worktree's checkout while its files sit on disk. Remove your own record
+(the trap above reads its own `gitdir:` line); never prune the whole repo.
+Before reporting done: `bash scripts/scratch-worktree.sh list --repo <repo> --root <the root you used>` must not show a
+scratch worktree of YOURS. Clean only your own path (`scratch-worktree.sh clean
+<path>`). A bare `clean --all` refuses to sweep (it cannot see a holder whose argv
+does not name the path, so it would delete a sibling's in-flight probe);
+`clean --all --force-all` is the deliberate sibling sweep — do not run it while
+sibling sessions are running.
+The check is ROOT-SCOPED (`$SCRATCH_WORKTREE_ROOT`, else `/tmp`), so a bare `list` is
+a false PASS for a worktree created under another root.
+
+```
+
 **Agent #1 — Guidance Compliance** (merged CLAUDE.md + code comments):
 ```
 Audit the PR changes against:

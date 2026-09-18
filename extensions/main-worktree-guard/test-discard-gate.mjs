@@ -799,6 +799,18 @@ async function partB() {
       /Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1/.test(dirtyMsg) &&
       !/NOT a claim that the checkout is dirty/.test(dirtyMsg),
       `reason=${JSON.stringify(dirtyMsg).slice(0, 320)}`);
+    // #1141 — this same message was itself a measured TEXTUAL producer: it
+    // taught `cp <file> /tmp/probe-<file>` and `git worktree add /tmp/probe`
+    // with no cleanup obligation (docs/ops/load-policy.md, producer evidence).
+    // The dirty arm must now teach the self-cleaning worktree recipe and carry
+    // the ban — otherwise the rule the skills state and the gate the guard
+    // prints disagree, and the gate keeps minting the debris #1141 removed.
+    expectTrue("B12d2: #1141 — the dirty arm teaches a WORKTREE recipe, not a /tmp copy",
+      !/cp <file> \/tmp\/probe-<file>/.test(dirtyMsg) &&
+      !/worktree add \/tmp\/probe/.test(dirtyMsg) &&
+      /scratch-worktree\.sh run/.test(dirtyMsg) &&
+      /NEVER .git clone./.test(dirtyMsg),
+      `reason=${JSON.stringify(dirtyMsg).slice(0, 320)}`);
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
 
     // SET-scoped, not command-scoped: the exemption drops the sanctioned
