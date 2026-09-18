@@ -322,6 +322,7 @@ async function partB() {
   const tmp = realpathSync(mkdtempSync(join(tmpdir(), "discard-gate-")));
   const hub = join(tmp, "hub");
   const wt = join(tmp, "wt");
+  const wt2 = join(tmp, "wt2");
   const home = join(tmp, "home");
   const savedEnv = new Map([...HATCH_VARS, "HOME", "PI_SESSION_ID", "SKILL_ENFORCER_DISABLED"]
     .map((v) => [v, process.env[v]]));
@@ -339,6 +340,10 @@ async function partB() {
     write(join(hub, "-dashfile"), "v1\n");
     gg("add -A && git commit -qm init", hub);
     gg(`worktree add -q -b feat "${wt}"`, hub);
+    gg(`worktree add -q -b feat2 "${wt2}"`, hub);
+    // A SECOND linked worktree, deliberately DIRTY from the start — B5f below
+    // needs a real discard aimed at a tree OTHER than the one the command runs in.
+    write(join(wt2, "dirty.txt"), "MUTANT-WT2\n");
     const wtTop = execSync("git rev-parse --show-toplevel", { cwd: wt, encoding: "utf8" }).trim();
     const wtCommon = execSync("git rev-parse --git-common-dir", { cwd: wt, encoding: "utf8" }).trim();
     const wtGit = execSync("git rev-parse --git-dir", { cwd: wt, encoding: "utf8" }).trim();
@@ -372,6 +377,55 @@ async function partB() {
       const r = await bash(cmd, wt);
       expectTrue(`B5c: read-only negative — \`${cmd}\` ALLOWED`, allowed(r), `blocked: ${r?.reason?.slice(0, 120)}`);
     }
+
+    // ── #1210 / #1229: an unreadable script ALWAYS fails closed, and says WHY honestly.
+    //
+    // An unreadable path means the discard target is UNKNOWN, not "nothing": the
+    // script may discard in ANY checkout, so a clean session tree does not entail
+    // "nothing to lose". The block therefore stays; what changes is only its
+    // MESSAGE, which must not name a state the arm never measured.
+    //
+    // B5d is the fail-closed pin: it must block, and its reason must NOT claim
+    // the checkout is dirty (it provably is not — this runs before any dirtying).
+    const cleanUndoEarly = join(tmp, "undo-clean-early.sh");
+    write(cleanUndoEarly, "git checkout -- clean.txt\n");
+    const indefClean = await bash(`S=${cleanUndoEarly}; bash $S`, wt);
+    expectTrue("B5d: CLEAN tree + unresolvable script path → BLOCKED (unreadable ⇒ unverifiable ⇒ fail closed)",
+      blocked(indefClean),
+      "was allowed — an unreadable script's discard target is UNKNOWN, not nothing");
+    expectTrue("B5d2: its reason does NOT assert a state claim that was never observed",
+      !/carries\s+uncommitted changes/.test(indefClean?.reason ?? "") &&
+      /not statically resolvable/.test(indefClean?.reason ?? ""),
+      `reason=${JSON.stringify(indefClean?.reason ?? "").slice(0, 300)}`);
+
+    // B5d3 is the mutation pin for the MESSAGE. The pre-fix string ("the script
+    // path is not statically resolvable — it is built at runtime …") satisfies
+    // B5d and B5d2, so those two pin nothing; this additionally requires the
+    // OBSERVED text (a `$` or backtick in the path) and the remedy — neither of
+    // which the old message carries.
+    const reasonClean = indefClean?.reason ?? "";
+    expectTrue("B5d3: the reason names the observed text and the remedy, not an inferred cause",
+      /contains a \$ or a backtick/.test(reasonClean) &&
+      /pass the path literally/.test(reasonClean) &&
+      /bash \.\/tools\/your-script\.sh/.test(reasonClean),
+      `reason=${JSON.stringify(reasonClean).slice(0, 300)}`);
+
+    // The converse: the SAME shape with a DIRTY target must ALSO block — this is
+    // what stops the block being satisfied by an accident of the clean fixture.
+    write(join(wt, "dirty.txt"), "MUTANT-EARLY\n");
+    expectTrue("B5e: DIRTY target + the same unresolvable script path → STILL BLOCKED (no fail-open)",
+      blocked(await bash(`S=${cleanUndoEarly}; bash $S`, wt)),
+      "was allowed — an unreadable script must never let a real discard through");
+    // Restore the committed content so the B6 sequence below starts from clean.
+    write(join(wt, "dirty.txt"), "v1\n");
+
+    // B5f: an unresolvable script path plus a discard-shaped command must not be
+    // silently allowed. The session tree is CLEAN here, so this also pins that the
+    // refusal is not an accident of a dirty fixture; `wt2` is a DIFFERENT dirty
+    // worktree that the command really does discard.
+    expectTrue("B5f: CLEAN session tree + indirection + discard against a DIFFERENT dirty worktree → BLOCKED (not silently allowed)",
+      blocked(await bash(`S=${cleanUndoEarly}; bash $S; git -C ${wt2} checkout -- dirty.txt`, wt)),
+      "was allowed — an unresolvable script path does not excuse an accompanying discard");
 
     // ── B6: DIRTY tracked target in a LINKED WORKTREE → BLOCK (the #709 core) ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
