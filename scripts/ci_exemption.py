@@ -390,6 +390,33 @@ def decide(
     main_signatures: dict[str, frozenset[str]] | None = None,
     rotating: dict[str, frozenset[str]] | None = None,
     k_pr: int | None = None,
+
+    # ⚠️ KNOWN, ACCEPTED, DOCUMENTED GAP — owner-authorized "Option B" on tortoise #3756.
+    #
+    # THIS IS A FAIL-OPEN IN THE EXEMPTION PATH. It is documented, not fixed, and the fix is
+    # deferred BY THE OWNER — do not "fix" it here by surprise, and do not mistake it for an
+    # undiscovered bug.
+    #
+    # THE FAILURE MODE (state it plainly — the next reader needs this, not the arithmetic):
+    # the tolerance is MULTIPLICATIVE, so the band that counts as "rates equivalent" WIDENS in
+    # absolute terms as main's rate rises. A PR that fails EVERY SINGLE RUN is therefore EXCUSED
+    # once main is broken enough — A DETERMINISTIC TOTAL FAILURE TREATED AS A RATE FLUCTUATION.
+    #
+    # Concretely, with the default 1.5, the exemption path below exempts when
+    # `pr_rate <= mr.rate * 1.5`. A PR failing every run has `pr_rate == 1.0`, so it is EXCUSED
+    # once `mr.rate >= 1/1.5` — i.e. ONCE MAIN IS ABOUT TWO-THIRDS BROKEN (~0.667). Past that
+    # point the gate reads a total, deterministic failure as "no worse than main" and lets it
+    # through. The more broken main gets, the wider this door opens.
+    #
+    # Note the asymmetry, which is why this is a fail-open and not a tuning complaint: the input
+    # on the PR side is CERTAIN (every run failed) and the input on the main side is a SAMPLE.
+    # A certain signal is being overridden by an uncertain one, and the override grows with the
+    # uncertainty.
+    #
+    # DEFERRED FIX DIRECTION (owner-authorized as a follow-up, NOT to be applied here): a tolerance
+    # that cannot excuse a TOTAL failure — e.g. an absolute floor, or refusing to exempt whenever
+    # `pr_rate` is exactly 1.0 — since no rate comparison can make a 100% failure equivalent to
+    # anything.
     rate_tolerance: float = 1.5,
     min_runs: int = 3,
 ) -> Decision:
