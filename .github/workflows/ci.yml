@@ -230,6 +230,19 @@ jobs:
         # two anchors the rule's safety depends on (`:2204`'s tracking, and the
         # push/commit discrimination at the scope-resolution site).
         run: node extensions/verification-gate/test-subtract-scope.mjs
+      - name: Compaction-watchdog guard suite (#1215, zero-dep)
+        # #1215 — the context-clamp death (#1214) must never be silent. Zero-dep
+        # by construction: the extension imports `@earendil-works/pi-coding-agent`
+        # as a TYPE only (erased by tsx) and node stdlib otherwise, so it runs in
+        # THIS job (the job that performs no `npm ci`). All four sinks are driven
+        # through the NODE_ENV=test hook seam — hermetic, never touching ~/.pi —
+        # and negative pins assert that an aborted compaction, a legitimate
+        # `length` stop, max_tokens > 1 and a missing max_tokens record NOTHING.
+        # VISIBLE, not merge-blocking: `pipeline-compliance` is the repo's only
+        # required check (#646); the BLOCKING backstop is the post-merge
+        # ci-main.yml extension-tests job.
+        run: npx tsx extensions/compaction-watchdog.test.ts
+
       - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
         # VISIBLE, not merge-blocking (only pipeline-compliance is required).
         # The blocking backstop is ci-main.yml's extension-tests job, same

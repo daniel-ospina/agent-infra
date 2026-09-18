@@ -22,6 +22,7 @@
         "repo-freshness.ts",
         "task-heartbeat.ts",
         "session-checks.ts",
+        "compaction-watchdog.ts",
         "provider-exhaustion.ts",
         "carousel-designer.ts",
         "cmux-session.ts",
