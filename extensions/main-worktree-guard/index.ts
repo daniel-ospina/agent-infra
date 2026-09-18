@@ -1531,77 +1531,22 @@ function _worktreeDiscardBlock(command: string): string | null {
     }
   }
 
-  // A script path that is not statically resolvable (`bash $S`, `cat x.sh |
-  // sh`) cannot be read and walked. THIS ARM USED TO FAIL CLOSED WITHOUT EVER
-  // READING THE TARGET'S STATE — it reported the script-indirection as though
-  // it had observed a dirty checkout. On a PROVABLY CLEAN tree that false
-  // statement sent the reader hunting a phantom dirty tree: four consecutive
-  // rail attempts, both worktrees, identical result, `git status --porcelain`
-  // empty.
-  //
-  // The invariant this guard protects is "a DIRTY TREE is not discarded". A
-  // clean tree CANNOT violate it — there is nothing for any script to destroy.
-  // So the honest move is not to assume the target's state and assert it, but
-  // to READ it. This is not a relaxation of the gate: it is the invariant
-  // stated directly, instead of the command's TEXT SHAPE standing in for it,
-  // and it still fires on every case where a discard would actually lose work.
-  //
-  // Never assert a state claim that was not observed. Three outcomes:
-  //   false -> target is clean; nothing to destroy; do not fire THIS ARM.
-  //   true  -> target IS dirty and the script cannot be read, so we cannot
-  //            prove it is safe: fail closed, naming the indirection that
-  //            blocked us.
-  //   null  -> the target's status could not be read, OR the execution cwd
-  //            could not be resolved: fail closed naming THAT, which is what
-  //            we actually know.
-  //
-  // ⛔ P0 (review): `dirty === false` must NOT `return null`. That exits
-  // `_worktreeDiscardBlock` ENTIRELY, skipping every arm AFTER this point (the
-  // `sets` direct-argv probe loop, piped-shell-payload, eval, and the three
-  // interpreter `-c` arms). A command carrying BOTH an unresolvable script path
-  // AND a real discard against a DIFFERENT dirty checkout was thereby ALLOWED:
-  // `S=…; bash $S; git -C <dirty-elsewhere> checkout -- f` and four sibling
-  // shapes, all BLOCKED before this change. The guard returning undefined means
-  // the tool executes and the WIP is destroyed. This arm contributes an
-  // ARM-LOCAL verdict — it forgoes ONLY the script-indirection reason — and
-  // control FALLS THROUGH to the remaining arms.
-  //
-  // ⛔ CYCLE-2 REVIEW, AND IT SETTLES THE ARM: the arm ALWAYS fails closed on an
-  // unreadable script. An earlier revision allowed it when the SESSION tree was
-  // clean, reasoning "nothing to destroy". That is UNSOUND, and the proof is in
-  // the same run: `bash /tmp/hidden.sh` (literal path) is BLOCKED while
-  // `S=/tmp/hidden.sh; bash $S` — the SAME script, the SAME discard — is ALLOWED.
-  //
-  // An unreadable path means the discard target is UNKNOWN, not "nothing". A
-  // clean session tree does not entail "nothing to lose", because the script may
-  // discard in ANY checkout — and this guard already blocks `git -C <other>
-  // checkout` from a clean session tree, so its scope was never the session tree.
-  // Reading the session tree therefore answers a question nobody asked. An
-  // unreadable script is UNVERIFIABLE, and UNVERIFIABLE fails closed.
-  //
-  // ⛔ BUT WHAT WAS WRONG WITH THE ORIGINAL ARM WAS NEVER THE REFUSAL. It was
-  // that the refusal ASSERTED A STATE CLAIM IT NEVER OBSERVED — "this checkout
-  // carries uncommitted changes to tracked files" — against a PROVABLY CLEAN
-  // tree (`git status --porcelain` empty), which sent operators hunting a
-  // phantom dirty tree and made four consecutive attempts unactionable.
-  //
-  // So: KEEP THE BLOCK, AND DO NOT NAME A STATE YOU DID NOT MEASURE. The reason
-  // stated below is true — it names what could not be read, not what the tree
-  // was not observed to be.
+  // An unresolvable script path (`bash $S`, `cat x.sh | sh`) is refused
+  // unconditionally: the discard target is unknown, and an unreadable script may
+  // discard uncommitted work in ANY checkout, so it cannot be assumed safe
+  // (#709). The reason below names only what was measured — the shared helper
+  // already renders "NOT a claim that the checkout is dirty" (#1139/PR #1152),
+  // so this arm must never name a state it did not observe. What this change
+  // touches is the MESSAGE only; the arm already failed closed.
   if (_scriptPath && /[$`]/.test(_scriptPath)) {
     return _worktreeDiscardBlockReason(
       { form: "script-indirection", scope: "all", pathspecs: [] },
       execCwd,
-      // Three jobs, in one line, in the operator's order:
-      //   WHAT  — the script's path is built at runtime, so the guard cannot read it.
-      //   SO WHAT — an unreadable script may discard in ANY checkout, so it is refused
-      //             rather than assumed clean. (Deliberately NOT "your checkout is dirty":
-      //             the guard never measured that, and asserting it is what sent four
-      //             consecutive rail attempts hunting a phantom dirty tree.)
-      //   NOW WHAT — the exact edit that makes it verifiable: a literal path.
-      "the script path is not statically resolvable — it is built at runtime (`$VAR` or a " +
-        "backtick), so the guard cannot read the script, and an unreadable script may discard " +
-        "uncommitted work in ANY checkout; spell the path literally (e.g. " +
+      // WHAT was measured (the path's text), WHAT it costs (an unreadable script
+      // may discard anywhere), and the edit that makes it verifiable.
+      "the script path contains a $ or a backtick, so it is not statically " +
+        "resolvable — the shell may expand it at runtime, and an unreadable script may " +
+        "discard uncommitted work in ANY checkout; pass the path literally (e.g. " +
         "`bash ./tools/your-script.sh`) so its contents can be read and verified",
     );
   }

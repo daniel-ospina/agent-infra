@@ -341,9 +341,8 @@ async function partB() {
     gg("add -A && git commit -qm init", hub);
     gg(`worktree add -q -b feat "${wt}"`, hub);
     gg(`worktree add -q -b feat2 "${wt2}"`, hub);
-    // A SECOND linked worktree, deliberately DIRTY from the start. The P0 pin
-    // below needs a real discard aimed at a tree OTHER than the one the
-    // script-indirection arm probes.
+    // A SECOND linked worktree, deliberately DIRTY from the start — B5f below
+    // needs a real discard aimed at a tree OTHER than the one the command runs in.
     write(join(wt2, "dirty.txt"), "MUTANT-WT2\n");
     const wtTop = execSync("git rev-parse --show-toplevel", { cwd: wt, encoding: "utf8" }).trim();
     const wtCommon = execSync("git rev-parse --git-common-dir", { cwd: wt, encoding: "utf8" }).trim();
@@ -379,20 +378,14 @@ async function partB() {
       expectTrue(`B5c: read-only negative — \`${cmd}\` ALLOWED`, allowed(r), `blocked: ${r?.reason?.slice(0, 120)}`);
     }
 
-    // ── #1210: an unreadable script ALWAYS fails closed, and says WHY honestly.
-    //
-    // The arm's defect was never the refusal — it was that the refusal ASSERTED A
-    // STATE CLAIM IT NEVER OBSERVED ("this checkout carries uncommitted changes to
-    // tracked files") against a provably CLEAN tree, which sent operators hunting a
-    // phantom dirty tree and made four consecutive rail attempts unactionable.
+    // ── #1210 / #1229: an unreadable script ALWAYS fails closed, and says WHY honestly.
     //
     // An unreadable path means the discard target is UNKNOWN, not "nothing": the
-    // script may discard in ANY checkout. A clean session tree therefore does not
-    // entail "nothing to lose" — proved in one run by `bash /tmp/hidden.sh` being
-    // BLOCKED while the identical discard wrapped as `S=…; bash $S` was ALLOWED.
-    // So the block stays and the MESSAGE is what changes.
+    // script may discard in ANY checkout, so a clean session tree does not entail
+    // "nothing to lose". The block therefore stays; what changes is only its
+    // MESSAGE, which must not name a state the arm never measured.
     //
-    // B5d is the honest-message pin: it must block, and its reason must NOT claim
+    // B5d is the fail-closed pin: it must block, and its reason must NOT claim
     // the checkout is dirty (it provably is not — this runs before any dirtying).
     const cleanUndoEarly = join(tmp, "undo-clean-early.sh");
     write(cleanUndoEarly, "git checkout -- clean.txt\n");
@@ -405,6 +398,18 @@ async function partB() {
       /not statically resolvable/.test(indefClean?.reason ?? ""),
       `reason=${JSON.stringify(indefClean?.reason ?? "").slice(0, 300)}`);
 
+    // B5d3 is the mutation pin for the MESSAGE. The pre-fix string ("the script
+    // path is not statically resolvable — it is built at runtime …") satisfies
+    // B5d and B5d2, so those two pin nothing; this additionally requires the
+    // OBSERVED text (a `$` or backtick in the path) and the remedy — neither of
+    // which the old message carries.
+    const reasonClean = indefClean?.reason ?? "";
+    expectTrue("B5d3: the reason names the observed text and the remedy, not an inferred cause",
+      /contains a \$ or a backtick/.test(reasonClean) &&
+      /pass the path literally/.test(reasonClean) &&
+      /bash \.\/tools\/your-script\.sh/.test(reasonClean),
+      `reason=${JSON.stringify(reasonClean).slice(0, 300)}`);
+
     // The converse: the SAME shape with a DIRTY target must ALSO block — this is
     // what stops the block being satisfied by an accident of the clean fixture.
     write(join(wt, "dirty.txt"), "MUTANT-EARLY\n");
@@ -414,24 +419,13 @@ async function partB() {
     // Restore the committed content so the B6 sequence below starts from clean.
     write(join(wt, "dirty.txt"), "v1\n");
 
-    // ── #1210 P0 (review): the arm's ALLOW must be ARM-LOCAL, not function-local.
-    //
-    // The first cut of this fix did `if (dirty === false) return null`, which did
-    // not end THIS ARM — it exited `_worktreeDiscardBlock` entirely, skipping every
-    // arm AFTER it (the `sets` direct-argv loop, piped-shell-payload, eval, the
-    // three interpreter `-c` arms). A command carrying BOTH an unresolvable script
-    // path AND a real discard against a DIFFERENT dirty checkout was thereby
-    // ALLOWED — `S=…; bash $S; git -C <dirty-elsewhere> checkout -- f` and four
-    // sibling shapes, every one of them BLOCKED before the fix. The guard returning
-    // undefined means the tool executes and the WIP is destroyed.
-    //
-    // This case is the pin: the session tree is CLEAN (so the new state read says
-    // "nothing to destroy" and the arm declines to block) while `wt2` is DIRTY and
-    // the command really does discard it. It REDs if the arm ever short-circuits
-    // the remaining arms again. The suite had no case combining the two.
-    expectTrue("B5f: CLEAN session tree + indirection + discard against a DIFFERENT dirty worktree → BLOCKED (arm-local, not function-local)",
+    // B5f: an unresolvable script path plus a discard-shaped command must not be
+    // silently allowed. The session tree is CLEAN here, so this also pins that the
+    // refusal is not an accident of a dirty fixture; `wt2` is a DIFFERENT dirty
+    // worktree that the command really does discard.
+    expectTrue("B5f: CLEAN session tree + indirection + discard against a DIFFERENT dirty worktree → BLOCKED (not silently allowed)",
       blocked(await bash(`S=${cleanUndoEarly}; bash $S; git -C ${wt2} checkout -- dirty.txt`, wt)),
-      "was allowed — the arm exited the whole gate instead of contributing an arm-local verdict");
+      "was allowed — an unresolvable script path does not excuse an accompanying discard");
 
     // ── B6: DIRTY tracked target in a LINKED WORKTREE → BLOCK (the #709 core) ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
