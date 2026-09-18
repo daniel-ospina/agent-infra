@@ -332,6 +332,38 @@ test("probe: /v1/team requires the WHOLE OrgInfoResponse shape, not just a numer
   }
 });
 
+test("probe: a 200 application/json with a MALFORMED body is tortoise_unavailable (exit 3) — a TYPED state, not a fallback", async () => {
+  // The content-type guard is satisfied and `res.json()` is what fails, so this
+  // is the parse half of the same contract: a `content-type: application/json`
+  // HEADER is a claim, not a proof. The body is a TRUNCATED OrgInfoResponse on
+  // purpose — if it parsed it would be a complete team payload, so nothing but
+  // the parse guard can be the cause of the degradation.
+  //
+  // Unguarded, the raw `SyntaxError` reached `main()`'s catch and took the state
+  // word from `stateStatus`'s DEFAULT, so the correct `tortoise_unavailable`
+  // rested entirely on that default staying `STATUS_UNAVAILABLE`: mutating it to
+  // `STATUS_OK` turned this exact stub into exit 0 `{"status":"ok",...}` — a
+  // reachable false PASS no test caught. The MESSAGE assertion is what makes
+  // this test RED if the guard is deleted (the fallback would emit the raw
+  // SyntaxError text, not this diagnostic).
+  const malformed = '{"point_count": 0, "org_id": "org_test", "tier": "free"';
+  const { server, url } = await startStub((req, res) => {
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(malformed);
+  });
+  try {
+    const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+    assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE);
+    assert.equal(r.payload.error, STATUS_UNAVAILABLE);
+    assert.notEqual(r.payload.status, STATUS_OK);
+    assert.match(r.payload.message, /MALFORMED JSON/);
+  } finally {
+    server.close();
+  }
+});
+
 test("probe: an UNREACHABLE store is tortoise_unavailable (exit 3)", async () => {
   const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: "http://127.0.0.1:1" });
   assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
@@ -500,6 +532,37 @@ test("data read: a JSON 200 that is not a list envelope degrades to tortoise_una
       assert.equal(r.code, EXIT_OK, `${args[0]} must still skip cleanly (stderr: ${r.stderr})`);
       assert.equal(r.payload.status, STATUS_UNAVAILABLE, `${args[0]} read a non-envelope as ok`);
       assert.notEqual(r.payload.status, STATUS_OK);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("data subcommands: a 200 application/json with a MALFORMED body is tortoise_unavailable, never ok", async () => {
+  // The parse half of the guard is SHARED by every command, so a data read or
+  // write must degrade on a malformed body exactly as the probe does — never
+  // read it as a healthy empty store (`{status: "ok", count: undefined,
+  // results: []}`), which a skill reads as "first research on this topic".
+  const malformed = '{"count": 1, "results": [';
+  const { server, url } = await startStub((req, res) => {
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(malformed);
+  });
+  try {
+    for (const args of [
+      ["search", "--query", "x"],
+      ["query-prior-research", "--domain", "x"],
+      ["query-strategies"],
+      ["query-visions"],
+      ["write-claim", "--content", "c"],
+      ["write-points", "--kind", "statement", "--points-json", '[{"content":"c"}]'],
+    ]) {
+      const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_OK, `${args[0]} must still skip cleanly (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, `${args[0]} read a malformed body as ok`);
+      assert.notEqual(r.payload.status, STATUS_OK);
+      assert.match(r.payload.message, /MALFORMED JSON/, `${args[0]} did not report the typed parse failure`);
     }
   } finally {
     server.close();

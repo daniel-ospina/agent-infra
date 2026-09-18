@@ -263,7 +263,27 @@ async function api(path, opts = {}) {
         `First bytes: ${text.slice(0, 120)}`,
     );
   }
-  return res.json();
+  // PARSING is inside its own guard too, for the same reason as URL
+  // construction above. A `content-type: application/json` header is a CLAIM,
+  // not a proof: a stub, a truncated response, or a proxy cut mid-write serves
+  // the header with a malformed or empty body, and `res.json()` then throws a
+  // raw `SyntaxError`. Thrown from outside every typed guard it would reach
+  // `main()`'s `e instanceof MemoryStateError` test and take the state word
+  // from the fail-closed DEFAULT — correct only while that default is
+  // `STATUS_UNAVAILABLE`, and a reachable false PASS (`status: "ok"`) the
+  // moment it is not. Mapping it here makes a malformed body an explicit,
+  // self-describing state error like every other non-answer, so the state word
+  // does not depend on the fallback.
+  try {
+    return await res.json();
+  } catch (e) {
+    throw new MemoryStateError(
+      STATUS_UNAVAILABLE,
+      `the Tortoise API at ${BASE_URL} answered ${method} ${path} ${res.status} with ` +
+        `content-type "${ct}" but a MALFORMED JSON body — that is not the hosted API: ` +
+        `${String(e.message || e)}`,
+    );
+  }
 }
 
 /**
