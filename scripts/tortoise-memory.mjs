@@ -25,15 +25,40 @@
  * ── Read-path failure contract (tortoise#3805 / #3832, agent-infra#1182) ──
  * ONE vocabulary, carried in the `status` field of every payload:
  *   "ok"                    — the store answered; an EMPTY store is `ok` + count 0
- *   "not_configured"        — TORTOISE_API_KEY is unset: a SET-UP gap, not an outage
+ *   "not_configured"        — the key is UNSET *or REJECTED* (401/403): a SET-UP
+ *                             gap, not an outage
  *   "tortoise_unavailable"  — configured, but the store could not be reached
- * `ok` requires a REAL API payload. The `status` probe needs a numeric
- * `point_count`; a DATA READ needs a list envelope (an integer `count` plus an
- * array `results`/`points`). A reachable non-API — a non-JSON *content-type* (a
- * captive portal / proxy / the dashboard host), or any 200 JSON body that is not
- * the expected shape — degrades to `tortoise_unavailable`, never to a green
- * verdict with `undefined` fields. Every request is bounded so an
- * accept-but-silent host still produces a verdict instead of hanging.
+ * `ok` requires the REAL API payload for THAT ENDPOINT, asserted at EVERY call
+ * site before a payload is built:
+ *   · probe  GET /v1/team   → a numeric `point_count`  (`assertTeamPayload`)
+ *   · read   GET /v1/search → an integer `count` + a `results` array of that length
+ *   · read   GET /v1/points → an integer `count` + a `points`  array of that length
+ *     (`assertReadPayload(res, path, key)` — the KEY is per-endpoint. An either-or
+ *     `results`/`points` check let `/v1/points` read a foreign envelope; a `count`
+ *     that disagrees with the list length is not an envelope either.)
+ *   · write  POST /v1/points → a created Point with a NON-EMPTY STRING `id`
+ *     (`assertWritePayload` — without it a non-API body was reported as
+ *     `{status:"ok",written:true}`, i.e. an agent recorded a write that never
+ *     happened)
+ * A reachable non-API — a non-JSON *content-type* (a captive portal / proxy / the
+ * dashboard host), or any 2xx JSON body that is not the expected shape — degrades
+ * to `tortoise_unavailable`, never to a green verdict with `undefined` fields.
+ * Every request is bounded so an accept-but-silent host still produces a verdict
+ * instead of hanging.
+ * An ANSWERED 4xx is never `tortoise_unavailable` — the store WAS reached. 401/403
+ * (the credential was refused, or lacks the scope the call needs) folds into
+ * `not_configured`; any other 4xx is the API rejecting THIS request and carries
+ * NO `status` field (the frozen vocabulary has no true word for it, and a fourth
+ * is out of budget). The PROBE exits EXIT_USAGE (2) for it — 2 is the reserved
+ * usage code and the probe already owns a distinct exit per store state. DATA
+ * subcommands keep the skip-cleanly exit 0 with `{error: "request_rejected", …}`
+ * (agent-infra#1182 scope), so a rejected request never hard-fails a skill but is
+ * still visible. A 5xx stays `tortoise_unavailable`: the service answered, failing.
+ * Arguments are validated from ONE table (`ARG_TYPES` / `COMMANDS`) BEFORE any
+ * network call: an unknown flag, a missing value, a wrong type, or a
+ * `--points-json` element that is not a non-null `{content: <non-empty string>}`
+ * exits EXIT_USAGE with no `status` field — a usage error must never wear a
+ * store-state word.
  * The `status` PROBE exits 0 (ok) / 3 (can't reach) / 4 (not set up), keeping 2
  * for usage errors; it is the surface a human or an agent harness checks.
  * DATA subcommands (query/search/write) keep the skip-cleanly contract
@@ -101,6 +126,36 @@ class MemoryStateError extends Error {
   }
 }
 
+/**
+ * The API ANSWERED and REJECTED the request (a 4xx other than 401/403, which
+ * folds into `not_configured`). Deliberately NOT a `MemoryStateError`: neither
+ * "could not be reached" nor "not_configured" is true, and the frozen vocabulary
+ * has no word for it — so it is an invocation-level failure (EXIT_USAGE, no
+ * `status` field) rather than a fourth state word. See `main()`'s catch.
+ */
+class MemoryHttpError extends Error {
+  constructor(httpStatus, method, path, text) {
+    super(
+      `the Tortoise API at ${BASE_URL} answered ${method} ${path} with HTTP ${httpStatus} ` +
+        `(the store WAS reached; it rejected this request): ${text.slice(0, 300)}`,
+    );
+    this.name = "MemoryHttpError";
+    this.httpStatus = httpStatus;
+  }
+}
+
+/**
+ * A USAGE error — a bad invocation, never a store state. It carries NO `status`
+ * field and exits EXIT_USAGE, so "you typed the argument wrong" can never be
+ * read as "the store is down" (`tortoise_unavailable`) or as a set-up gap.
+ */
+class UsageError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UsageError";
+  }
+}
+
 function out(obj, exitCode = EXIT_OK) {
   console.log(JSON.stringify(obj, null, 2));
   process.exit(exitCode);
@@ -144,7 +199,29 @@ async function api(path, opts = {}) {
   }
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`tortoise ${method} ${path} → HTTP ${res.status}: ${text.slice(0, 300)}`);
+    // The store WAS reached and ANSWERED. 401/403 is a REJECTED CREDENTIAL — a
+    // SET-UP gap (`not_configured`), not an outage. Any other 4xx is the API
+    // refusing THIS request and must never be reported as `tortoise_unavailable`
+    // ("could not be reached"), which sends an operator to check the address
+    // when the fault is the key or the request. A 5xx is the service answering
+    // that it cannot serve — the one case the outage word is still true of.
+    if (res.status === 401 || res.status === 403) {
+      throw new MemoryStateError(
+        STATUS_NOT_CONFIGURED,
+        `the Tortoise API at ${BASE_URL} REFUSED the request (HTTP ${res.status}) — the key was ` +
+          `rejected, or it lacks the scope/permission this call needs (403 also covers a suspended ` +
+          `org, a graph-bound key, and a missing team membership). Either way it is a SET-UP gap ` +
+          `(key or permissions), not an outage: check TORTOISE_API_KEY. Body: ${text.slice(0, 200)}`,
+      );
+    }
+    if (res.status >= 400 && res.status < 500) {
+      throw new MemoryHttpError(res.status, method, path, text);
+    }
+    throw new MemoryStateError(
+      STATUS_UNAVAILABLE,
+      `the Tortoise API at ${BASE_URL} answered ${method} ${path} with HTTP ${res.status}: ` +
+        text.slice(0, 300),
+    );
   }
   // The guard keys on CONTENT-TYPE, not on whether the body happens to parse:
   // a JSON-parsable body served under a non-JSON content-type is still NOT the
@@ -167,27 +244,229 @@ async function api(path, opts = {}) {
 }
 
 /**
- * A DATA READ may report `ok` ONLY for a real list envelope. The content-type
- * guard in `api()` already rejects a non-JSON body, but a stub/proxy answering
- * `200 application/json` with a JSON body that is NOT an envelope (`{"hello":
- * "not the API"}`) yields `{status: "ok", count: undefined, results: []}` — a
- * healthy-looking EMPTY store, which a skill reads as "first research on this
- * topic". `ok` therefore requires the payload's OWN shape: an integer `count`
- * and an array `results`/`points`.
+ * A DATA READ may report `ok` ONLY for the list envelope of the endpoint it
+ * called. The content-type guard in `api()` already rejects a non-JSON body, but
+ * a stub/proxy answering `200 application/json` with a JSON body that is NOT an
+ * envelope (`{"hello": "not the API"}`) yielded `{status: "ok", count:
+ * undefined, results: []}` — a healthy-looking EMPTY store, which a skill reads
+ * as "first research on this topic".
+ *
+ * `key` is the endpoint's OWN list field and is REQUIRED: `/v1/search` answers
+ * `{count, results}` and `/v1/points` answers `{count, points}` (hosted_api.py
+ * `search` / `list_points`, both `count = len(list)`). An either-or check
+ * accepted a `results` envelope at `/v1/points` and vice versa; passing the key
+ * is what rejects it. `count` must MATCH the list length — a truncated or padded
+ * count is not the API's own answer.
  */
-function assertReadPayload(res, path) {
-  const ok =
-    Number.isInteger(res?.count) && (Array.isArray(res?.results) || Array.isArray(res?.points));
+export function assertReadPayload(res, path, key) {
+  const list = res?.[key];
+  const ok = Number.isInteger(res?.count) && Array.isArray(list) && res.count === list.length;
   if (!ok) {
     throw new MemoryStateError(
       STATUS_UNAVAILABLE,
-      `the Tortoise API at ${BASE_URL} answered ${path} with a body that is not a list ` +
-        `envelope (count: ${JSON.stringify(res?.count)}, results: ${Array.isArray(res?.results)}, ` +
-        `points: ${Array.isArray(res?.points)}) — not a real API payload: ` +
-        `${JSON.stringify(res).slice(0, 160)}`,
+      `the Tortoise API at ${BASE_URL} answered ${path} with a body that is not that ` +
+        `endpoint's list envelope (expected an integer count and a \`${key}\` array of exactly ` +
+        `that length; got count: ${JSON.stringify(res?.count)}, ${key}: ` +
+        `${Array.isArray(list) ? `array of ${list.length}` : JSON.stringify(list)}) — not a real ` +
+        `API payload: ${JSON.stringify(res).slice(0, 160)}`,
     );
   }
   return res;
+}
+
+/**
+ * A WRITE may report `ok` ONLY for a created Point. `POST /v1/points` answers a
+ * `PointResponse` whose `id` is a required non-empty string (hosted_api.py
+ * `PointResponse`). Without this check a reachable non-API answering
+ * `200 application/json` + `{"hello": "not the API"}` was reported as
+ * `{status: "ok", written: true}` — an agent records a memory write that never
+ * happened.
+ */
+export function assertWritePayload(res, path) {
+  const id = res?.id;
+  if (typeof id !== "string" || id.length === 0) {
+    throw new MemoryStateError(
+      STATUS_UNAVAILABLE,
+      `the Tortoise API at ${BASE_URL} answered ${path} with a body that is not a created ` +
+        `Point (expected a non-empty string \`id\`; got ${JSON.stringify(id)}) — the create did ` +
+        `NOT succeed, so it must never be reported as \`ok\`: ${JSON.stringify(res).slice(0, 160)}`,
+    );
+  }
+  return res;
+}
+
+/**
+ * The PROBE may report `ok` ONLY for a real team payload: `/v1/team` answers an
+ * `OrgInfoResponse` (hosted_api.py) whose `point_count`, `org_id` and `tier` are
+ * REQUIRED — a `200 {"point_count": 0}` that carries neither of the other two is
+ * a non-API body, and reporting `ok` for it would hand back `tier: undefined`.
+ * The content-type guard in `api()` already rejects `200 text/html`; this is the
+ * shape half.
+ */
+export function assertTeamPayload(res, path) {
+  const ok =
+    typeof res?.point_count === "number" &&
+    typeof res?.org_id === "string" &&
+    res.org_id.length > 0 &&
+    typeof res?.tier === "string" &&
+    res.tier.length > 0;
+  if (!ok) {
+    throw new MemoryStateError(
+      STATUS_UNAVAILABLE,
+      `the Tortoise API at ${BASE_URL} answered ${path} without a real team payload ` +
+        `(expected a numeric point_count plus non-empty string org_id and tier; got point_count: ` +
+        `${JSON.stringify(res?.point_count)}, org_id: ${JSON.stringify(res?.org_id)}, tier: ` +
+        `${JSON.stringify(res?.tier)}) — not a real team payload: ${JSON.stringify(res).slice(0, 160)}`,
+    );
+  }
+  return res;
+}
+
+// ── ONE table-driven argument validator, applied before ANY network call ────
+// A usage error is a usage error: EXIT_USAGE, and NO `status` field — so "you
+// typed the argument wrong" can never be read as "the store is down"
+// (`tortoise_unavailable`) or as a set-up gap (`not_configured`). Three concrete
+// defects this replaces, each of which reached the API as a real request:
+//   · `--points-json '[null]'` → `Cannot read properties of null (reading
+//     'content')` → the catch-all mapped it to `tortoise_unavailable`;
+//   · `write-points` with no `--kind` → the literal string "undefined" was sent;
+//   · a value-less flag (`query-visions --point-kind`) → "undefined" was sent.
+const ARG_TYPES = {
+  /** A non-empty string. */
+  string(flag, raw) {
+    if (typeof raw !== "string" || raw.length === 0) {
+      throw new UsageError(`${flag} requires a non-empty value`);
+    }
+    return raw;
+  },
+  /** Any finite number (`--confidence`). A BLANK raw is rejected, not coerced:
+   * `Number("")` is 0, so an empty value used to become a real number. */
+  number(flag, raw) {
+    const blank = typeof raw === "string" && raw.trim() === "";
+    const n = Number(raw);
+    if (blank || !Number.isFinite(n)) {
+      throw new UsageError(`${flag} must be a number (got: ${JSON.stringify(raw)})`);
+    }
+    return n;
+  },
+  /** A whole number ≥ 1 (`--limit 0` used to be accepted and sent). */
+  positiveInteger(flag, raw) {
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) {
+      throw new UsageError(`${flag} must be a positive integer (got: ${JSON.stringify(raw)})`);
+    }
+    return n;
+  },
+  /** A JSON array of non-null objects with a non-empty string `content` and,
+   * when present, a non-empty string `authoredBy` / finite `confidence`. */
+  pointsJson(flag, raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new UsageError(`${flag} must be valid JSON`);
+    }
+    if (!Array.isArray(parsed)) throw new UsageError(`${flag} must be a JSON array`);
+    parsed.forEach((p, i) => {
+      if (
+        p === null ||
+        typeof p !== "object" ||
+        Array.isArray(p) ||
+        typeof p.content !== "string" ||
+        p.content.length === 0
+      ) {
+        throw new UsageError(
+          `${flag}[${i}] must be a non-null object with a non-empty string content`,
+        );
+      }
+      // The SAME element-level types as the flags of the same name: a nested
+      // value must not reach the network in a shape the flag form rejects
+      // (`confidence: "abc"` used to be sent as `null`).
+      if (p.authoredBy !== undefined && p.authoredBy !== null) {
+        ARG_TYPES.string(`${flag}[${i}].authoredBy`, p.authoredBy);
+      }
+      if (p.confidence !== undefined && p.confidence !== null) {
+        ARG_TYPES.number(`${flag}[${i}].confidence`, p.confidence);
+      }
+    });
+    return parsed;
+  },
+};
+
+/**
+ * THE validator table: command → its accepted flags → {type, required?, default?}.
+ * `type` names a row of `ARG_TYPES`, which owns the error message. Every flag the
+ * CLI accepts appears here exactly once, and `parseArgs` refuses any token that
+ * is not a key of the command's own row — so a flag cannot be silently ignored
+ * and a required one cannot be silently absent.
+ */
+const COMMANDS = {
+  "query-prior-research": { "--domain": { type: "string", required: true } },
+  "query-strategies": {},
+  "query-visions": { "--point-kind": { type: "string", default: "vision" } },
+  search: {
+    "--query": { type: "string", required: true },
+    "--limit": { type: "positiveInteger", default: "10" },
+  },
+  "write-points": {
+    "--kind": { type: "string", required: true },
+    "--points-json": { type: "pointsJson", required: true },
+  },
+  "write-claim": {
+    "--content": { type: "string", required: true },
+    "--kind": { type: "string", default: "statement" },
+    "--authored-by": { type: "string" },
+    "--confidence": { type: "number" },
+  },
+  status: {},
+};
+
+/**
+ * Every flag ANY command accepts. `parseArgs` consults this — not the current
+ * command's own row — to tell "the next token is a flag, so this one has no
+ * value" from "the next token is a value". Using the command's own row instead
+ * would let `query-visions --point-kind --limit` send the string "--limit"; using
+ * a bare `startsWith("--")` would refuse a legitimate value that merely begins
+ * with two dashes (a claim whose text is `--force skips the check`).
+ */
+const KNOWN_FLAGS = new Set(Object.values(COMMANDS).flatMap((spec) => Object.keys(spec)));
+
+/**
+ * Validate argv against `COMMANDS` and return a flag → coerced-value map.
+ * Throws `UsageError` for an unknown flag, a flag with no value, a required flag
+ * that is absent, or a value the flag's type rejects. Called BEFORE any network
+ * call (and identically in mock mode), so no usage error can be observed as a
+ * store state.
+ */
+export function parseArgs(cmd, args) {
+  const spec = Object.prototype.hasOwnProperty.call(COMMANDS, cmd) ? COMMANDS[cmd] : null;
+  if (!spec) throw new UsageError(`unknown command "${cmd}"`);
+  const raw = {};
+  for (let i = 0; i < args.length; i += 1) {
+    const flag = args[i];
+    if (!Object.prototype.hasOwnProperty.call(spec, flag)) {
+      throw new UsageError(`unknown argument "${flag}" for \`${cmd}\``);
+    }
+    const value = args[i + 1];
+    // A token that is a KNOWN flag is not a value: `query-visions --point-kind`
+    // (nothing after it) and `--limit --kind` both used to send "undefined".
+    // Any other token IS a value — including one that starts with `--`.
+    if (value === undefined || KNOWN_FLAGS.has(value)) {
+      throw new UsageError(`${flag} requires a value`);
+    }
+    raw[flag] = value;
+    i += 1;
+  }
+  const values = {};
+  for (const [flag, row] of Object.entries(spec)) {
+    if (Object.prototype.hasOwnProperty.call(raw, flag)) continue;
+    if (row.required) throw new UsageError(`${flag} required`);
+    if (row.default !== undefined) values[flag] = ARG_TYPES[row.type](flag, row.default);
+  }
+  for (const [flag, value] of Object.entries(raw)) {
+    values[flag] = ARG_TYPES[spec[flag].type](flag, value);
+  }
+  return values;
 }
 
 /** The graceful failure payload — ONE vocabulary in `status` and `error`. */
@@ -215,7 +494,16 @@ function mockCall(name, params = {}) {
       return out({ status: STATUS_OK, count: results.length, results });
     }
     case "write-points":
-      return out({ status: STATUS_OK, written: (JSON.parse(params.pointsJson) || []).length, results: [], mock: true });
+      return out({
+        status: STATUS_OK,
+        written: params.points.length,
+        results: params.points.map((p, i) => ({
+          id: `pt_mock_written_${i + 1}`,
+          content: p.content,
+          kind: params.kind,
+        })),
+        mock: true,
+      });
     case "write-claim":
       return out({ status: STATUS_OK, id: "pt_mock_written", content: params.content, kind: params.kind, written: true, mock: true });
     case "status":
@@ -229,135 +517,135 @@ function mockCall(name, params = {}) {
 
 export async function main() {
   const [cmd, ...args] = process.argv.slice(2);
-  const opt = (name, dflt = "") => {
-    const i = args.indexOf(name);
-    return i >= 0 ? args[i + 1] : dflt;
-  };
-
   const mocked = process.env.TORTOISE_MOCK === "1";
   try {
+    // An unknown command is the SAME usage surface in both modes, so it can
+    // never reach a payload that blends a USAGE error with a STORE-STATE word.
+    if (!Object.prototype.hasOwnProperty.call(COMMANDS, cmd)) {
+      if (mocked) return mockCall(cmd);
+      console.error(`Usage: node scripts/tortoise-memory.mjs <query-prior-research|query-strategies|query-visions|search|write-points|write-claim|status>
+Env: TORTOISE_API_KEY (tt_...), TORTOISE_BASE_URL (default ${BASE_URL})
+Status probe exits: 0 ok · 3 can't reach it · 4 not set up (data subcommands stay exit 0)
+Mock: TORTOISE_MOCK=1`);
+      process.exit(EXIT_USAGE);
+    }
+    // EVERY flag is validated here — before any network call, in both modes.
+    const v = parseArgs(cmd, args);
     switch (cmd) {
       case "query-prior-research": {
-        const domain = opt("--domain");
-        if (!domain) { console.error("--domain required"); process.exit(EXIT_USAGE); }
+        const domain = v["--domain"];
         if (mocked) return mockCall("query-prior-research", { domain });
         const res = assertReadPayload(
           await api("/v1/search", { params: { q: domain, limit: 10 } }),
           "/v1/search",
+          "results",
         );
-        return out({ status: STATUS_OK, domain, count: res.count, results: res.results || [] });
+        return out({ status: STATUS_OK, domain, count: res.count, results: res.results });
       }
       case "query-strategies": {
         if (mocked) return mockCall("query-strategies");
         const res = assertReadPayload(
           await api("/v1/points", { params: { kind: "strategy", limit: 50 } }),
           "/v1/points",
+          "points",
         );
-        return out({ status: STATUS_OK, count: res.count, results: res.points || [] });
+        return out({ status: STATUS_OK, count: res.count, results: res.points });
       }
       case "query-visions": {
-        const kind = opt("--point-kind", "vision");
+        const kind = v["--point-kind"];
         if (mocked) return mockCall("query-visions", { pointKind: kind });
         const res = assertReadPayload(
           await api("/v1/points", { params: { kind, limit: 50 } }),
           "/v1/points",
+          "points",
         );
-        return out({ status: STATUS_OK, count: res.count, results: res.points || [] });
+        return out({ status: STATUS_OK, count: res.count, results: res.points });
       }
       case "search": {
-        const q = opt("--query");
-        const limitRaw = opt("--limit", "10");
-        if (!q) { console.error("--query required"); process.exit(EXIT_USAGE); }
-        const limit = Number(limitRaw);
-        // A non-numeric `--limit` is a USAGE error. Left unvalidated it reaches
-        // `api()` as `NaN`, whose failure would be reported with a STORE-STATE
-        // word — collapsing "you typed the argument wrong" into "the store is
-        // down", so an operator skips instead of fixing the invocation.
-        if (!Number.isFinite(limit)) {
-          console.error(`--limit must be a number (got: ${JSON.stringify(limitRaw)})`);
-          process.exit(EXIT_USAGE);
-        }
+        const q = v["--query"];
+        const limit = v["--limit"];
         if (mocked) return mockCall("search", { query: q });
         const res = assertReadPayload(
           await api("/v1/search", { params: { q, limit } }),
           "/v1/search",
+          "results",
         );
-        return out({ status: STATUS_OK, query: q, count: res.count, results: res.results || [] });
+        return out({ status: STATUS_OK, query: q, count: res.count, results: res.results });
       }
       case "write-points": {
-        const kind = opt("--kind");
-        const pointsJson = opt("--points-json");
-        let points;
-        try { points = JSON.parse(pointsJson); } catch { console.error("--points-json must be valid JSON"); process.exit(EXIT_USAGE); }
-        // Parsing succeeded but the value may not be a LIST (`{}`, `null`, `5`,
-        // `true`). Without this check `for (const p of points)` throws "points is
-        // not iterable", which the catch-all maps to `tortoise_unavailable` — a
-        // USAGE error labelled with a STORE-STATE word, telling an operator who
-        // passed one object instead of an array that the store is down.
-        if (!Array.isArray(points)) {
-          console.error("--points-json must be a JSON array");
-          process.exit(EXIT_USAGE);
-        }
-        if (mocked) return mockCall("write-points", { kind, pointsJson });
+        const kind = v["--kind"];
+        const points = v["--points-json"];
+        if (mocked) return mockCall("write-points", { kind, points });
         const results = [];
         for (const p of points) {
           const body = { kind, content: p.content };
           if (p.authoredBy) body.authoredBy = p.authoredBy;
           if (p.confidence != null) body.confidence = Number(p.confidence);
-          results.push(await api("/v1/points", { method: "POST", body }));
+          results.push(
+            assertWritePayload(await api("/v1/points", { method: "POST", body }), "/v1/points"),
+          );
         }
         return out({ status: STATUS_OK, written: results.length, results });
       }
       case "write-claim": {
-        const content = opt("--content");
-        const kind = opt("--kind", "statement");
-        const authoredBy = opt("--authored-by", "");
-        const confidenceRaw = opt("--confidence", "");
-        if (!content) { console.error("--content required"); process.exit(EXIT_USAGE); }
-        // Same usage-vs-store-state rule as `--limit`: a non-numeric
-        // `--confidence` is a bad invocation, never evidence the store is down.
-        let confidence;
-        if (confidenceRaw !== "") {
-          confidence = Number(confidenceRaw);
-          if (!Number.isFinite(confidence)) {
-            console.error(`--confidence must be a number (got: ${JSON.stringify(confidenceRaw)})`);
-            process.exit(EXIT_USAGE);
-          }
-        }
+        const content = v["--content"];
+        const kind = v["--kind"];
+        const authoredBy = v["--authored-by"];
+        const confidence = v["--confidence"];
         if (mocked) return mockCall("write-claim", { content, kind });
         const body = { kind, content };
         if (authoredBy) body.authoredBy = authoredBy;
         if (confidence !== undefined) body.confidence = confidence;
-        const created = await api("/v1/points", { method: "POST", body });
-        return out({ status: STATUS_OK, id: created.id, content: created.content, kind: created.kind, written: true });
+        const created = assertWritePayload(
+          await api("/v1/points", { method: "POST", body }),
+          "/v1/points",
+        );
+        // `content`/`kind` are echoed from the REQUEST (which the id proves was
+        // accepted), so a partial non-API body cannot surface `undefined` here.
+        return out({ status: STATUS_OK, id: created.id, content, kind, written: true });
       }
       case "status": {
         if (mocked) return mockCall("status");
-        const team = await api("/v1/team");
-        // `ok` is reserved for a REAL team payload. A reachable-but-wrong server
-        // returning `200 {}` (or `200 text/html`, already rejected in `api()`)
-        // must degrade to tortoise_unavailable, never to a green probe with no
-        // point_count.
-        if (typeof team?.point_count !== "number") {
-          throw new MemoryStateError(
-            STATUS_UNAVAILABLE,
-            `the Tortoise API at ${BASE_URL} answered /v1/team without a numeric point_count ` +
-              `— not a real team payload: ${JSON.stringify(team).slice(0, 160)}`,
-          );
-        }
+        const team = assertTeamPayload(await api("/v1/team"), "/v1/team");
         return out({ status: STATUS_OK, available: true, base_url: BASE_URL, point_count: team.point_count, tier: team.tier });
       }
       default:
-        // The same usage surface in both modes, so an unknown command can never
-        // reach a payload that blends a USAGE error with a STORE-STATE word.
-        if (mocked) return mockCall(cmd);
-        console.error(`Usage: node scripts/tortoise-memory.mjs <query-prior-research|query-strategies|query-visions|search|write-points|write-claim|status>
-Env: TORTOISE_API_KEY (tt_...), TORTOISE_BASE_URL (default ${BASE_URL})
-Status probe exits: 0 ok · 3 can't reach it · 4 not set up (data subcommands stay exit 0)
-Mock: TORTOISE_MOCK=1`);
+        // Unreachable (`cmd` is a key of COMMANDS), kept as the fail-closed usage
+        // surface so a future edit cannot silently fall through to a green run.
+        console.error("Usage: node scripts/tortoise-memory.mjs <query-prior-research|query-strategies|query-visions|search|write-points|write-claim|status>");
         process.exit(EXIT_USAGE);
     }
   } catch (e) {
+    if (e instanceof UsageError) {
+      // A bad invocation: no `status` field at all (see ARG_TYPES).
+      console.error(e.message);
+      process.exit(EXIT_USAGE);
+    }
+    if (e instanceof MemoryHttpError) {
+      // The store WAS reached and ANSWERED; a 4xx (other than the 401/403 folded
+      // into `not_configured` in `api()`) is the API rejecting THIS request. No
+      // frozen status word is true of it, so no `status` field is emitted rather
+      // than inventing a fourth word or reusing `tortoise_unavailable`, whose own
+      // definition is "could not be reached".
+      if (cmd === "status") {
+        // The PROBE owns a distinct exit per store state; a rejected request is
+        // none of them, so it exits EXIT_USAGE (2) on stderr with no payload.
+        console.error(e.message);
+        process.exit(EXIT_USAGE);
+      }
+      // DATA subcommands keep the skip-cleanly exit 0 (agent-infra#1182), but
+      // the payload carries NO `status` word — a skill skips, and an operator
+      // still sees `error: "request_rejected"` with the HTTP status.
+      return out(
+        {
+          error: "request_rejected",
+          http_status: e.httpStatus,
+          message: e.message,
+          base_url: BASE_URL,
+        },
+        EXIT_OK,
+      );
+    }
     const status = e instanceof MemoryStateError ? e.status : STATUS_UNAVAILABLE;
     // The PROBE carries the distinct exit code; data subcommands keep skipping
     // cleanly (agent-infra#1182) while reporting the SAME vocabulary.

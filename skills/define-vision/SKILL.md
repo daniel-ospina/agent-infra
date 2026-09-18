@@ -47,7 +47,7 @@ node scripts/tortoise-memory.mjs query-prior-research --domain "<domain>"
 
 **Interpretation:**
 - **Existing vision Points found:** Summarize prior worldview claims. What did we believe about the market? What competitors did we track? Use these to validate or challenge the current environmental scan.
-- **`status: "not_configured"`** (no `TORTOISE_API_KEY`) or **`status: "tortoise_unavailable"`** (key set, store unreachable): skip — memory is not available here.
+- **`status: "not_configured"`** (no usable `TORTOISE_API_KEY` — never set up, or the key was rejected with HTTP 401/403) or **`status: "tortoise_unavailable"`** (the store was unreachable): skip — memory is not available here.
 - **Zero results:** First vision cycle for this domain. Note and proceed.
 
 ### 5. Competitor Research

@@ -19,6 +19,18 @@
  *   - an EMPTY store is `ok` (count 0), never `tortoise_unavailable`
  *   - the default base URL is the API host, and a down daemon is NOT the
  *     never-configured case
+ *   - TOTAL response validation: `ok` requires the ENDPOINT's OWN payload — a
+ *     per-endpoint list key (`results` / `points`) whose length matches `count`,
+ *     and for a write a created Point with a non-empty string `id`. An `ok` on
+ *     any other body is the false PASS this suite exists to stop.
+ *   - ONE argument table, applied before any call: a bad flag, a missing value,
+ *     a wrong type or a non-`{content}` `--points-json` element is a USAGE error
+ *     (exit 2, no `status` field), never a store-state word.
+ *   - an ANSWERED 4xx is never `tortoise_unavailable`: 401/403 (the credential
+ *     was refused, or lacks scope) is `not_configured`; any other 4xx carries NO
+ *     `status` field (the frozen vocabulary has no word for it) — the probe exits
+ *     2, a data subcommand keeps exit 0 with `{error: "request_rejected"}`; a 5xx
+ *     keeps the outage word.
  *
  * Run: node --test scripts/tortoise-memory.test.mjs
  */
@@ -34,6 +46,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
+  parseArgs,
   probeExitCode,
   resolveBaseUrl,
   resolveTimeoutMs,
@@ -67,7 +80,7 @@ function emptyStoreStub() {
   return startStub((req, res) => {
     res.setHeader("content-type", "application/json");
     if (req.url.startsWith("/v1/team")) {
-      res.end(JSON.stringify({ point_count: 0, tier: "free" }));
+      res.end(JSON.stringify({ point_count: 0, org_id: "org_test", tier: "free" }));
     } else if (req.url.startsWith("/v1/search")) {
       res.end(JSON.stringify({ count: 0, results: [] }));
     } else if (req.url.startsWith("/v1/points")) {
@@ -266,6 +279,32 @@ test("probe: a reachable JSON host with no point_count is tortoise_unavailable, 
   }
 });
 
+test("probe: /v1/team requires the WHOLE OrgInfoResponse shape, not just a numeric point_count", async () => {
+  // A `200 {"point_count": 0}` (no `org_id`, no `tier`) is not an
+  // `OrgInfoResponse`; reporting `ok` for it would hand back `tier: undefined`,
+  // exactly the green verdict on a `undefined` field this contract forbids.
+  const bodies = [
+    { point_count: 0 },
+    { point_count: 0, tier: "free" },
+    { point_count: 0, org_id: "org_test" },
+    { point_count: 0, org_id: "", tier: "free" },
+    { point_count: 0, org_id: "org_test", tier: "" },
+  ];
+  for (const body of bodies) {
+    const { server, url } = await startStub((req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(body));
+    });
+    try {
+      const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_UNAVAILABLE, `body ${JSON.stringify(body)} must degrade (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, `body ${JSON.stringify(body)}`);
+    } finally {
+      server.close();
+    }
+  }
+});
+
 test("probe: an UNREACHABLE store is tortoise_unavailable (exit 3)", async () => {
   const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: "http://127.0.0.1:1" });
   assert.equal(r.code, EXIT_UNAVAILABLE, `stderr: ${r.stderr}`);
@@ -421,6 +460,331 @@ test("data read: a populated store reports ok with the results", async () => {
   }
 });
 
+// ── TOTAL response validation: every read, both endpoints, empty AND full ────
+// The contract sentence is "empty ≠ unavailable". It has to hold for BOTH
+// endpoints and EVERY read subcommand — `/v1/points` had zero positive
+// coverage, so a `points`-shaped regression there stayed green.
+
+test("data read: EVERY read is ok on an EMPTY store (empty ≠ unavailable on all four reads)", async () => {
+  const { server, url } = await emptyStoreStub();
+  try {
+    for (const args of [
+      ["search", "--query", "x"],
+      ["query-prior-research", "--domain", "x"],
+      ["query-strategies"],
+      ["query-visions"],
+    ]) {
+      const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_OK, `${args[0]} must exit 0 (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, STATUS_OK, `${args[0]} read an empty store as not-ok`);
+      assert.equal(r.payload.count, 0, args[0]);
+      assert.deepEqual(r.payload.results, [], args[0]);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("data read: EVERY read is ok on a POPULATED store of its own endpoint's shape", async () => {
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url.startsWith("/v1/search")) {
+      res.end(JSON.stringify({ count: 1, results: [{ id: "pt_search", content: "prior claim" }] }));
+    } else {
+      res.end(JSON.stringify({
+        count: 2,
+        points: [
+          { id: "pt_a", content: "a", kind: "strategy" },
+          { id: "pt_b", content: "b", kind: "vision" },
+        ],
+      }));
+    }
+  });
+  try {
+    const search = await run(["search", "--query", "x"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+    assert.equal(search.payload.status, STATUS_OK, `stderr: ${search.stderr}`);
+    assert.equal(search.payload.count, 1);
+    assert.equal(search.payload.results[0].id, "pt_search");
+
+    for (const args of [["query-strategies"], ["query-visions"]]) {
+      const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.payload.status, STATUS_OK, `${args[0]} must be ok on a points envelope (stderr: ${r.stderr})`);
+      assert.equal(r.payload.count, 2, args[0]);
+      assert.equal(r.payload.results.length, 2, args[0]);
+      assert.equal(r.payload.results[0].id, "pt_a", args[0]);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("data read: /v1/points REQUIRES the `points` key — a `results` envelope is NOT a points answer", async () => {
+  // CYCLE-3 P1 pinned. `assertReadPayload` used to accept `results` OR `points`
+  // at ANY endpoint, so the `points` branch could be deleted (`res.points ||`
+  // `[]`) with the suite green while `/v1/points` read a foreign envelope. Only
+  // the per-endpoint key rejects this body.
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ count: 1, results: [{ id: "pt_1", content: "prior claim" }] }));
+  });
+  try {
+    for (const args of [["query-strategies"], ["query-visions"]]) {
+      const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_OK, `${args[0]} still skips cleanly`);
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, `${args[0]} read a \`results\` body as its own envelope`);
+      assert.notEqual(r.payload.status, STATUS_OK);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("data read: /v1/search REQUIRES the `results` key — a `points` envelope is NOT a search answer", async () => {
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ count: 1, points: [{ id: "pt_1", content: "prior claim" }] }));
+  });
+  try {
+    for (const args of [["search", "--query", "x"], ["query-prior-research", "--domain", "x"]]) {
+      const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_OK, `${args[0]} still skips cleanly`);
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, `${args[0]} read a \`points\` body as its own envelope`);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("data read: a `count` that does not match the list length is not an envelope", async () => {
+  // The other half of the shape: a count that disagrees with the list is a
+  // truncated or padded body, not the API's own answer.
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url.startsWith("/v1/search")) {
+      res.end(JSON.stringify({ count: 5, results: [{ id: "pt_1", content: "one" }] }));
+    } else {
+      res.end(JSON.stringify({ count: 0, points: [{ id: "pt_1", content: "one" }] }));
+    }
+  });
+  try {
+    for (const args of [["search", "--query", "x"], ["query-strategies"]]) {
+      const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, `${args[0]} accepted a count/length mismatch`);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+// ── TOTAL response validation: a WRITE reports ok only for a created Point ──
+
+test("write: a non-API 200 JSON body is NEVER reported as a successful write", async () => {
+  // CYCLE-3. Against `200 application/json` + `{"hello":"not the API"}`,
+  // `write-claim` returned `{"status":"ok","written":true}` and `write-points`
+  // `{"status":"ok","written":1,"results":[…]}` — an agent recording a memory
+  // write that never happened. A write may report ok ONLY for a created Point
+  // with a non-empty string `id`.
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ hello: "not the API" }));
+  });
+  try {
+    const claim = await run(["write-claim", "--content", "c", "--kind", "statement"], {
+      TORTOISE_API_KEY: "tt_test",
+      TORTOISE_BASE_URL: url,
+    });
+    assert.equal(claim.code, EXIT_OK);
+    assert.equal(claim.payload.status, STATUS_UNAVAILABLE, `stderr: ${claim.stderr}`);
+    assert.notEqual(claim.payload.written, true);
+
+    const points = await run(
+      ["write-points", "--kind", "statement", "--points-json", '[{"content":"c"}]'],
+      { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url },
+    );
+    assert.equal(points.code, EXIT_OK);
+    assert.equal(points.payload.status, STATUS_UNAVAILABLE, `stderr: ${points.stderr}`);
+    assert.equal(points.payload.written, undefined, "a failed write must not report a written count");
+  } finally {
+    server.close();
+  }
+});
+
+test("write: an `id` that is missing, empty, or not a string is not a created Point", async () => {
+  for (const body of [
+    { content: "c", kind: "statement" },
+    { id: "", content: "c", kind: "statement" },
+    { id: 7, content: "c", kind: "statement" },
+    { id: null, content: "c", kind: "statement" },
+  ]) {
+    const { server, url } = await startStub((req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(body));
+    });
+    try {
+      const r = await run(["write-claim", "--content", "c"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, `body ${JSON.stringify(body)} read as a successful write`);
+      assert.notEqual(r.payload.written, true);
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test("write: a created Point (a non-empty string id) reports ok with the id", async () => {
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ id: "pt_created", content: "c", kind: "statement" }));
+  });
+  try {
+    const claim = await run(["write-claim", "--content", "c", "--kind", "statement"], {
+      TORTOISE_API_KEY: "tt_test",
+      TORTOISE_BASE_URL: url,
+    });
+    assert.equal(claim.code, EXIT_OK);
+    assert.equal(claim.payload.status, STATUS_OK, `stderr: ${claim.stderr}`);
+    assert.equal(claim.payload.id, "pt_created");
+    assert.equal(claim.payload.written, true);
+  } finally {
+    server.close();
+  }
+});
+
+test("write-points: each created Point must carry its own id (a partial batch is not a green verdict)", async () => {
+  let n = 0;
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    n += 1;
+    if (n === 1) res.end(JSON.stringify({ id: "pt_1", content: "a", kind: "statement" }));
+    else res.end(JSON.stringify({ hello: "not the API" }));
+  });
+  try {
+    const r = await run(
+      ["write-points", "--kind", "statement", "--points-json", '[{"content":"a"},{"content":"b"}]'],
+      { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url },
+    );
+    assert.equal(r.code, EXIT_OK);
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE, `stderr: ${r.stderr}`);
+    assert.notEqual(r.payload.status, STATUS_OK);
+  } finally {
+    server.close();
+  }
+});
+
+test("write-points: a batch of created Points reports each returned id", async () => {
+  let n = 0;
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    n += 1;
+    res.end(JSON.stringify({ id: `pt_${n}`, content: `c${n}`, kind: "statement" }));
+  });
+  try {
+    const r = await run(
+      ["write-points", "--kind", "statement", "--points-json", '[{"content":"a"},{"content":"b"}]'],
+      { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url },
+    );
+    assert.equal(r.code, EXIT_OK);
+    assert.equal(r.payload.status, STATUS_OK, `stderr: ${r.stderr}`);
+    assert.equal(r.payload.written, 2);
+    assert.deepEqual(r.payload.results.map((p) => p.id), ["pt_1", "pt_2"]);
+  } finally {
+    server.close();
+  }
+});
+
+// ── an ANSWERED 4xx is NOT an outage ────────────────────────────────────────
+
+test("probe: a REJECTED credential (401/403) is not_configured (exit 4), never tortoise_unavailable", async () => {
+  // CYCLE-3. The store WAS reached and answered; "could not be reached" is
+  // false, and the skills then tell the operator to check the address when the
+  // fault is the key. A rejected credential is a SET-UP gap, not an outage.
+  for (const code of [401, 403]) {
+    const { server, url } = await startStub((req, res) => {
+      res.statusCode = code;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ detail: "invalid api key" }));
+    });
+    try {
+      const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_NOT_CONFIGURED, `HTTP ${code} must exit 4 (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, STATUS_NOT_CONFIGURED, `HTTP ${code}`);
+      assert.notEqual(r.payload.status, STATUS_UNAVAILABLE);
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test("data read: a REJECTED credential (401/403) reports not_configured and still skips cleanly", async () => {
+  for (const code of [401, 403]) {
+    const { server, url } = await startStub((req, res) => {
+      res.statusCode = code;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ detail: "invalid api key" }));
+    });
+    try {
+      const r = await run(["search", "--query", "x"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_OK, `stderr: ${r.stderr}`);
+      assert.equal(r.payload.status, STATUS_NOT_CONFIGURED, `HTTP ${code}`);
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test("an ANSWERED 4xx other than 401/403 is a rejected request, never a store state", async () => {
+  // The frozen vocabulary is three words and none is true of a 400/404/422/429 —
+  // the store WAS reached and answered. The PROBE exits EXIT_USAGE (2) with no
+  // `status` field; a DATA subcommand keeps the skip-cleanly exit 0 but emits
+  // `{error: "request_rejected", http_status}` — no store-state word either way.
+  for (const code of [400, 404, 422, 429]) {
+    const { server, url } = await startStub((req, res) => {
+      res.statusCode = code;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ detail: "bad request" }));
+    });
+    try {
+      const probe = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.notEqual(probe.code, EXIT_UNAVAILABLE, `probe HTTP ${code} must not exit 3 (stderr: ${probe.stderr})`);
+      assert.equal(probe.code, EXIT_USAGE, `probe HTTP ${code}`);
+      assert.equal(probe.payload, null, `probe HTTP ${code} must carry no status field, got: ${probe.stdout}`);
+      assert.match(probe.stderr, new RegExp(`HTTP ${code}`));
+      assert.doesNotMatch(probe.stdout, /tortoise_unavailable|not_configured/);
+
+      const read = await run(["search", "--query", "x"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.notEqual(read.code, EXIT_UNAVAILABLE, `read HTTP ${code} must not exit 3`);
+      assert.equal(read.code, EXIT_OK, `read HTTP ${code} keeps the skip-cleanly exit 0`);
+      assert.equal(read.payload.error, "request_rejected", `read HTTP ${code}`);
+      assert.equal(read.payload.http_status, code);
+      assert.equal(read.payload.status, undefined, `read HTTP ${code} must carry NO store-state word`);
+      assert.doesNotMatch(read.stdout, /tortoise_unavailable|not_configured/);
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test("a 5xx means the service answered but is failing: tortoise_unavailable is still the true word", async () => {
+  // The counterpart to the 4xx rule: only a 5xx keeps the outage word — the
+  // service declares it cannot serve, which is an availability failure rather
+  // than a rejected request.
+  const { server, url } = await startStub((req, res) => {
+    res.statusCode = 503;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ detail: "unavailable" }));
+  });
+  try {
+    const probe = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+    assert.equal(probe.code, EXIT_UNAVAILABLE, `stderr: ${probe.stderr}`);
+    assert.equal(probe.payload.status, STATUS_UNAVAILABLE);
+
+    const read = await run(["search", "--query", "x"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+    assert.equal(read.code, EXIT_OK);
+    assert.equal(read.payload.status, STATUS_UNAVAILABLE);
+  } finally {
+    server.close();
+  }
+});
+
 test("usage errors keep exit 2 (argparse-free, but the code is reserved)", async () => {
   const missing = await run(["search"], { TORTOISE_API_KEY: "tt_test" });
   assert.equal(missing.code, EXIT_USAGE);
@@ -466,9 +830,9 @@ test("usage: a --points-json that is not an array is a usage error, never a stor
 
 test("usage: a non-numeric --limit is a usage error, never a store state", async () => {
   // Against a HEALTHY stub: unvalidated, `Number("abc")` is NaN; the request
-  // still succeeds, so the run reported `ok` exit 0 — a bad invocation dressed
+  // still succeeded, so the run reported `ok` exit 0 — a bad invocation dressed
   // as a healthy read (and, against a non-2xx server, dressed as the store
-  // being down).
+  // being down). The type is `positiveInteger`, so this message is the table's.
   const { server, url } = await emptyStoreStub();
   try {
     const r = await run(["search", "--query", "x", "--limit", "abc"], {
@@ -476,7 +840,7 @@ test("usage: a non-numeric --limit is a usage error, never a store state", async
       TORTOISE_BASE_URL: url,
     });
     assert.equal(r.code, EXIT_USAGE, `stderr: ${r.stderr}`);
-    assert.match(r.stderr, /--limit must be a number/);
+    assert.match(r.stderr, /--limit must be a positive integer/);
     assert.equal(r.payload, null, `expected no JSON payload, got: ${r.stdout}`);
   } finally {
     server.close();
@@ -500,6 +864,249 @@ test("usage: a non-numeric --confidence is a usage error, never a store state", 
     assert.equal(r.payload, null, `expected no JSON payload, got: ${r.stdout}`);
   } finally {
     server.close();
+  }
+});
+
+// ── TOTAL argument validation (one table, before ANY network call) ──────────
+
+test("usage: a --points-json element that is not `{content: <non-empty string>}` is a usage error", async () => {
+  // CYCLE-3. `[null]` reached `p.content` and threw `Cannot read properties of
+  // null`, which the catch-all reported as `tortoise_unavailable` — a usage
+  // error wearing a store-state word. Each element must be a NON-NULL OBJECT
+  // with a non-empty string `content`. None of these reach the network.
+  for (const [bad, re] of [
+    ["[null]", /--points-json\[0\] must be a non-null object with a non-empty string content/],
+    ["[5]", /--points-json\[0\] must be a non-null object/],
+    ["[[]]", /--points-json\[0\] must be a non-null object/],
+    ["[\"str\"]", /--points-json\[0\] must be a non-null object/],
+    ["[{}]", /--points-json\[0\] must be a non-null object with a non-empty string content/],
+    ['[{"content":""}]', /--points-json\[0\] must be a non-null object with a non-empty string content/],
+    ['[{"content":123}]', /--points-json\[0\] must be a non-null object with a non-empty string content/],
+    ['[{"content":"ok"},null]', /--points-json\[1\] must be a non-null object/],
+  ]) {
+    const r = await run(["write-points", "--kind", "statement", "--points-json", bad], {
+      TORTOISE_API_KEY: "tt_test",
+    });
+    assert.equal(r.code, EXIT_USAGE, `--points-json ${bad} must be a usage error (stderr: ${r.stderr})`);
+    assert.match(r.stderr, re, `--points-json ${bad}`);
+    assert.equal(r.payload, null, `--points-json ${bad} must not emit a payload, got: ${r.stdout}`);
+    assert.doesNotMatch(r.stdout, /tortoise_unavailable|not_configured/);
+  }
+});
+
+test("usage: a REQUIRED flag that is absent is a usage error, never the string \"undefined\"", async () => {
+  // CYCLE-3. `write-points` with no `--kind` sent the LITERAL string
+  // "undefined" as the kind, from `args.indexOf()` reading past the end.
+  const cases = [
+    [["write-points", "--points-json", '[{"content":"c"}]'], /--kind required/],
+    [["write-points", "--kind", "statement"], /--points-json required/],
+    [["search"], /--query required/],
+    [["query-prior-research"], /--domain required/],
+    [["write-claim"], /--content required/],
+    [["write-claim", "--content", "c", "--kind"], /--kind requires a value/],
+  ];
+  for (const [args, re] of cases) {
+    const r = await run(args, { TORTOISE_API_KEY: "tt_test" });
+    assert.equal(r.code, EXIT_USAGE, `${args.join(" ")} must be a usage error (stderr: ${r.stderr})`);
+    assert.match(r.stderr, re, args.join(" "));
+    assert.equal(r.payload, null, `${args.join(" ")} must not emit a payload, got: ${r.stdout}`);
+    assert.doesNotMatch(r.stdout, /tortoise_unavailable|not_configured/);
+  }
+});
+
+test("usage: a VALUE-LESS flag is a usage error, never the string \"undefined\"", async () => {
+  // CYCLE-3. `query-visions --point-kind` (nothing after it) sent the literal
+  // string "undefined" as the kind: `opt()` read past the end of argv. A token
+  // that is itself a flag is not a value either (`--limit --kind`).
+  for (const [args, flag] of [
+    [["query-visions", "--point-kind"], "--point-kind"],
+    [["search", "--query", "x", "--limit"], "--limit"],
+    [["search", "--query"], "--query"],
+    [["search", "--limit", "--query", "x"], "--limit"],
+    [["write-points", "--kind", "--points-json", "[]"], "--kind"],
+  ]) {
+    const r = await run(args, { TORTOISE_API_KEY: "tt_test" });
+    assert.equal(r.code, EXIT_USAGE, `${args.join(" ")} must be a usage error (stderr: ${r.stderr})`);
+    assert.match(r.stderr, new RegExp(`${flag} requires a value`), args.join(" "));
+    assert.equal(r.payload, null, `${args.join(" ")} must not emit a payload, got: ${r.stdout}`);
+    assert.doesNotMatch(r.stdout, /tortoise_unavailable|not_configured/);
+  }
+});
+
+test("usage: an out-of-range or non-numeric --limit is a usage error, never a healthy read", async () => {
+  // CYCLE-3: `--limit 0` used to be accepted and sent. `--limit` is a
+  // `positiveInteger`, so the client says so LOCALLY, before the call.
+  const { server, url } = await emptyStoreStub();
+  try {
+    for (const bad of ["0", "-3", "2.5", "abc"]) {
+      const r = await run(["search", "--query", "x", "--limit", bad], {
+        TORTOISE_API_KEY: "tt_test",
+        TORTOISE_BASE_URL: url,
+      });
+      assert.equal(r.code, EXIT_USAGE, `--limit ${bad} must be a usage error (stderr: ${r.stderr})`);
+      assert.match(r.stderr, /--limit must be a positive integer/);
+      assert.equal(r.payload, null, `--limit ${bad} must not emit a payload, got: ${r.stdout}`);
+    }
+    // ...and a valid limit still reaches the API and is ok.
+    const ok = await run(["search", "--query", "x", "--limit", "5"], {
+      TORTOISE_API_KEY: "tt_test",
+      TORTOISE_BASE_URL: url,
+    });
+    assert.equal(ok.code, EXIT_OK, `stderr: ${ok.stderr}`);
+    assert.equal(ok.payload.status, STATUS_OK);
+  } finally {
+    server.close();
+  }
+});
+
+test("usage: an unknown flag is a usage error, never a store state", async () => {
+  const r = await run(["search", "--query", "x", "--bogus", "1"], { TORTOISE_API_KEY: "tt_test" });
+  assert.equal(r.code, EXIT_USAGE);
+  assert.match(r.stderr, /unknown argument "--bogus"/);
+  assert.equal(r.payload, null, `got: ${r.stdout}`);
+  assert.doesNotMatch(r.stdout, /tortoise_unavailable|not_configured/);
+});
+
+test("usage: a BLANK --confidence is rejected, not silently coerced to 0", async () => {
+  // `Number("")` and `Number(" ")` are both 0, so a blank value used to become
+  // a real number — and `--confidence ""` was previously treated as ABSENT.
+  for (const bad of ["", " ", "\t"]) {
+    const r = await run(["write-claim", "--content", "c", "--confidence", bad], {
+      TORTOISE_API_KEY: "tt_test",
+    });
+    assert.equal(r.code, EXIT_USAGE, `--confidence ${JSON.stringify(bad)} must be a usage error (stderr: ${r.stderr})`);
+    assert.match(r.stderr, /--confidence must be a number/);
+    assert.equal(r.payload, null, `got: ${r.stdout}`);
+  }
+});
+
+test("usage: a --points-json element carries the SAME types as the flag of the same name", async () => {
+  // The table validated the top-level `--confidence`/`--authored-by` but not the
+  // identical value nested in `--points-json`: `confidence: "abc"` was sent as
+  // `null`, and `authoredBy: 5` sailed through.
+  for (const [bad, re] of [
+    ['[{"content":"c","confidence":"abc"}]', /--points-json\[0\]\.confidence must be a number/],
+    ['[{"content":"c","confidence":""}]', /--points-json\[0\]\.confidence must be a number/],
+    ['[{"content":"c","authoredBy":""}]', /--points-json\[0\]\.authoredBy requires a non-empty value/],
+    ['[{"content":"c","authoredBy":5}]', /--points-json\[0\]\.authoredBy requires a non-empty value/],
+  ]) {
+    const r = await run(["write-points", "--kind", "statement", "--points-json", bad], {
+      TORTOISE_API_KEY: "tt_test",
+    });
+    assert.equal(r.code, EXIT_USAGE, `--points-json ${bad} must be a usage error (stderr: ${r.stderr})`);
+    assert.match(r.stderr, re);
+    assert.equal(r.payload, null, `got: ${r.stdout}`);
+  }
+});
+
+test("a value that STARTS WITH `--` is a value, not a missing one", async () => {
+  // Fixing the value-less-flag case with a bare `startsWith("--")` would refuse
+  // a legitimate claim whose text begins with two dashes. Only a KNOWN flag is
+  // "not a value".
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ id: "pt_1", content: "c", kind: "statement" }));
+  });
+  try {
+    const r = await run(["write-claim", "--content", "--force skips the check"], {
+      TORTOISE_API_KEY: "tt_test",
+      TORTOISE_BASE_URL: url,
+    });
+    assert.equal(r.code, EXIT_OK, `stderr: ${r.stderr}`);
+    assert.equal(r.payload.status, STATUS_OK, `stderr: ${r.stderr}`);
+  } finally {
+    server.close();
+  }
+});
+
+test("data write: NEVER CONFIGURED still skips cleanly (exit 0) for the WRITE subcommands", async () => {
+  for (const args of [
+    ["write-claim", "--content", "c"],
+    ["write-points", "--kind", "statement", "--points-json", '[{"content":"c"}]'],
+  ]) {
+    const r = await run(args, {});
+    assert.equal(r.code, EXIT_OK, `${args[0]} must still skip cleanly (stderr: ${r.stderr})`);
+    assert.equal(r.payload.status, STATUS_NOT_CONFIGURED, args[0]);
+  }
+});
+
+test("data write: an UNREACHABLE store still skips cleanly (exit 0) for the WRITE subcommands", async () => {
+  for (const args of [
+    ["write-claim", "--content", "c"],
+    ["write-points", "--kind", "statement", "--points-json", '[{"content":"c"}]'],
+  ]) {
+    const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: "http://127.0.0.1:1" });
+    assert.equal(r.code, EXIT_OK, `${args[0]} must still skip cleanly (stderr: ${r.stderr})`);
+    assert.equal(r.payload.status, STATUS_UNAVAILABLE, args[0]);
+  }
+});
+
+test("mock mode answers every data subcommand in the SAME shape as the API", async () => {
+  // `TORTOISE_MOCK=1` mirrors the shape contract this suite pins for the real
+  // client, so a mock-only drift (a write that reports no `id`) cannot stay green.
+  const mock = { TORTOISE_API_KEY: "tt_test", TORTOISE_MOCK: "1" };
+  const search = await run(["search", "--query", "x"], mock);
+  assert.equal(search.payload.status, STATUS_OK);
+  assert.ok(Number.isInteger(search.payload.count) && Array.isArray(search.payload.results));
+
+  const strategies = await run(["query-strategies"], mock);
+  assert.equal(strategies.payload.status, STATUS_OK);
+  assert.ok(Array.isArray(strategies.payload.results));
+
+  const visions = await run(["query-visions"], mock);
+  assert.equal(visions.payload.status, STATUS_OK);
+  assert.ok(Array.isArray(visions.payload.results));
+
+  const claim = await run(["write-claim", "--content", "c"], mock);
+  assert.equal(claim.payload.status, STATUS_OK);
+  assert.ok(typeof claim.payload.id === "string" && claim.payload.id.length > 0);
+
+  const points = await run(
+    ["write-points", "--kind", "statement", "--points-json", '[{"content":"a"},{"content":"b"}]'],
+    mock,
+  );
+  assert.equal(points.payload.status, STATUS_OK);
+  assert.equal(points.payload.written, 2);
+  assert.ok(points.payload.results.every((p) => typeof p.id === "string" && p.id.length > 0));
+
+  const status = await run(["status"], mock);
+  assert.equal(status.payload.status, STATUS_OK);
+  assert.equal(typeof status.payload.point_count, "number");
+});
+
+test("the argument table defaults every optional flag and rejects before any call", () => {
+  // Executed against the real exported parser: the DEFAULTS are part of the
+  // table, so `query-visions` with no flag still asks for `vision`, and
+  // `search` still asks for 10 — without either flag being passed.
+  assert.deepEqual(parseArgs("query-visions", []), { "--point-kind": "vision" });
+  assert.deepEqual(parseArgs("query-visions", ["--point-kind", "strategy"]), { "--point-kind": "strategy" });
+  assert.deepEqual(parseArgs("search", ["--query", "x"]), { "--query": "x", "--limit": 10 });
+  assert.deepEqual(parseArgs("search", ["--query", "x", "--limit", "25"]), { "--query": "x", "--limit": 25 });
+  assert.deepEqual(parseArgs("write-claim", ["--content", "c"]), { "--content": "c", "--kind": "statement" });
+  assert.deepEqual(parseArgs("write-claim", ["--content", "c", "--confidence", "0.5"]), {
+    "--content": "c",
+    "--kind": "statement",
+    "--confidence": 0.5,
+  });
+  assert.deepEqual(parseArgs("status", []), {});
+  // A `null` nested value means ABSENT (the body builder skips it), not an error.
+  assert.deepEqual(
+    parseArgs("write-points", ["--kind", "statement", "--points-json", '[{"content":"c","confidence":null,"authoredBy":null}]']),
+    { "--kind": "statement", "--points-json": [{ content: "c", confidence: null, authoredBy: null }] },
+  );
+  // A command with NO required flags is not vacuous — it still refuses an
+  // unknown flag, which is what keeps the table the single door.
+  assert.throws(() => parseArgs("query-strategies", ["--nope", "1"]), /unknown argument "--nope"/);
+  // ...and an inherited `Object.prototype` key is not a command (the lookup is
+  // hasOwnProperty, not a bare index).
+  assert.throws(() => parseArgs("toString", []), /unknown command "toString"/);
+  for (const [cmd, args] of [
+    ["query-prior-research", []],
+    ["write-points", ["--kind", "statement", "--points-json", "[null]"]],
+    ["query-visions", ["--point-kind"]],
+    ["search", ["--query", "x", "--limit", "0"]],
+  ]) {
+    assert.throws(() => parseArgs(cmd, args), /./, `${cmd} ${args.join(" ")} must be rejected locally`);
   }
 });
 
@@ -630,6 +1237,21 @@ function backslashEscapedStatusSpans(src) {
   );
 }
 
+/**
+ * The retired PROSE phrasing ("tortoise unavailable"), factored to module level
+ * so the regex itself is pinned by a synthetic sample. No shipped skill carries
+ * a mixed-case sample any more (`skills/research/SKILL.md:384` was rewritten),
+ * so DROPPING the `i` flag would keep the scan above green while prose such as
+ * `(skip if Tortoise unavailable)` ships.
+ *
+ * The separator is `[ \t]+` — SPACE/TAB ONLY, which is what keeps the canonical
+ * `tortoise_unavailable` safe: the token contains no space, so it can never
+ * match. A `.` class WOULD match that `_` (a false positive on every correct
+ * skill), and `\s` would additionally treat a line break between the two words
+ * as the retired phrase. The samples below pin both directions.
+ */
+const RETIRED_PHRASE = /\btortoise[ \t]+(is[ \t]+)?unavailable\b/i;
+
 test("every memory skill names BOTH canonical states, never the retired 'tortoise unavailable'", () => {
   for (const name of MEMORY_SKILLS) {
     const src = readSkill(name);
@@ -638,7 +1260,35 @@ test("every memory skill names BOTH canonical states, never the retired 'tortois
     // CASE-INSENSITIVE: the retired phrasing is a prose phrase, so it survives
     // an `unavailable` sentence at the start of a line. A case-sensitive probe
     // left `skills/research/SKILL.md` (`(skip if Tortoise unavailable)`) green.
-    assert.doesNotMatch(src, /\btortoise unavailable\b/i, `${name}: retired 'tortoise unavailable' vocabulary`);
+    assert.doesNotMatch(src, RETIRED_PHRASE, `${name}: retired 'tortoise unavailable' vocabulary`);
+  }
+});
+
+test("the retired-phrase probe is case-insensitive and never matches the canonical token", () => {
+  // The synthetic half of the pin: the shipped skills are clean, so this is the
+  // ONLY assertion that fails if the `i` flag is dropped, or if the separator is
+  // narrowed until a real phrasing slips through.
+  for (const sample of [
+    "tortoise unavailable",
+    "(skip if Tortoise unavailable)",
+    "Tortoise  Unavailable",
+    "Tortoise is unavailable",
+    "TORTOISE\tIS\tUNAVAILABLE",
+    "the store is tortoise  is unavailable",
+  ]) {
+    assert.match(sample, RETIRED_PHRASE, `${JSON.stringify(sample)} must be flagged`);
+  }
+  // The CANONICAL token is NOT the retired phrase: `_` is deliberately not a
+  // separator, so a correct skill is never a false positive.
+  for (const sample of [
+    '"tortoise_unavailable"',
+    "status: `tortoise_unavailable`",
+    "tortoise_unavailable is the outage word",
+    "tortoiselike unavailable",
+    // `[ \t]` — a line break between the words is NOT the retired phrase shape.
+    "tortoise\nunavailable",
+  ]) {
+    assert.doesNotMatch(sample, RETIRED_PHRASE, `${JSON.stringify(sample)} must NOT be flagged`);
   }
 });
 
