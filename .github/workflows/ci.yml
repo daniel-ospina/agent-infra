@@ -331,6 +331,19 @@ jobs:
         # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
+        # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd
+        # (#1071), so ~124 dispatches/hour on the tortoise hub landed in a
+        # SHARED MAIN checkout — where one lane's unpushed commit gates git
+        # writes for every session rooted there. The gate resolves the child's
+        # target and refuses a shared main checkout, naming the worktree remedy.
+        # Behavioral: loads the REAL index.ts through loader-hooks.mjs and drives
+        # the tool_call handler against a hermetic hub + NESTED linked worktree
+        # (a path-prefix gate would false-positive on the nested worktree, which
+        # is exactly what B5/B6 pin). Zero-dep (`node:*` + the `git` binary), no
+        # `npm ci`, ~3s. Its own step (the post-merge `extensions/*/test*.mjs`
+        # glob in ci-main.yml is not PR-triggered).
+        run: node extensions/task-cwd-guard/test-cwd-guard.mjs
       - name: entry-point guard symlink regression (#708)
         # The entry-point idiom `pathToFileURL(process.argv[1]).href ===
         # import.meta.url` is symlink-SENSITIVE (pathToFileURL does no fs
