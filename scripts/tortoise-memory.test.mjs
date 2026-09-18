@@ -173,6 +173,29 @@ test("the request timeout is bounded and cannot be disabled by ambient env", () 
   assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "nope" }), 10_000);
   assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "Infinity" }), 10_000);
   assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "999999999" }), 10_000);
+  // FRACTIONAL values fall back too. `AbortSignal.timeout()` throws
+  // `delay … must be an integer`, and in `api()` that throw is caught and mapped
+  // to `tortoise_unavailable` — a healthy store reported as down.
+  assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "300.5" }), 10_000);
+  assert.equal(resolveTimeoutMs({ TORTOISE_TIMEOUT_MS: "2500.25" }), 10_000);
+});
+
+test("a fractional TORTOISE_TIMEOUT_MS does not turn a healthy store into tortoise_unavailable", async () => {
+  // Resolver-level proof above; this is the end-to-end shape an operator sees.
+  // Only the INTEGER guard keeps a healthy stub green here.
+  const { server, url } = await emptyStoreStub();
+  try {
+    const r = await run(["status"], {
+      TORTOISE_API_KEY: "tt_test",
+      TORTOISE_BASE_URL: url,
+      TORTOISE_TIMEOUT_MS: "300.5",
+    });
+    assert.equal(r.code, EXIT_OK, `stderr: ${r.stderr}`);
+    assert.equal(r.payload.status, STATUS_OK);
+    assert.equal(r.payload.point_count, 0);
+  } finally {
+    server.close();
+  }
 });
 
 test("the probe exit-code map is the contract", () => {
@@ -199,14 +222,20 @@ test("probe: an EMPTY store is ok (exit 0), not unavailable", async () => {
   }
 });
 
-test("probe: a reachable host answering 200 text/html is tortoise_unavailable, not ok", async () => {
+test("probe: a reachable host answering 200 with a non-JSON content-type is tortoise_unavailable, not ok", async () => {
   // The exact false PASS the reviewer reproduced: any HTTP 200 used to read as
   // `{status: ok, available: true}` with no point_count, so a captive portal or
   // the dashboard host at the API address looked healthy.
+  //
+  // The body is VALID JSON on purpose. An `<html>` body would make `res.json()`
+  // throw, so the probe would degrade even with the content-type guard DELETED —
+  // that test cannot distinguish the guard from a parse failure. A JSON-parsable
+  // body under `text/plain` can: only the content-type guard rejects it (the
+  // payload carries a numeric point_count, so no shape check fires either).
   const { server, url } = await startStub((req, res) => {
     res.statusCode = 200;
-    res.setHeader("content-type", "text/html");
-    res.end("<html><body>not the API</body></html>");
+    res.setHeader("content-type", "text/plain");
+    res.end(JSON.stringify({ point_count: 3, tier: "pro" }));
   });
   try {
     const r = await run(["status"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
@@ -317,18 +346,49 @@ test("data read: reachable EMPTY store reports ok and exits 0", async () => {
   }
 });
 
-test("data read: a non-JSON 200 degrades to tortoise_unavailable and still skips cleanly", async () => {
+test("data read: a non-JSON content-type 200 degrades to tortoise_unavailable and still skips cleanly", async () => {
   // Same shared `api()` guard as the probe: a data subcommand must not read a
-  // captive-portal HTML body as `{count: undefined, results: []}` and report ok.
+  // captive-portal body as `{count: undefined, results: []}` and report ok.
+  //
+  // Again the body is VALID JSON under `text/plain` (a well-formed list
+  // envelope, so the shape check cannot be what fires) — otherwise `res.json()`
+  // would throw and the guard could be deleted with this test still green.
   const { server, url } = await startStub((req, res) => {
     res.statusCode = 200;
-    res.setHeader("content-type", "text/html");
-    res.end("<html>not the API</html>");
+    res.setHeader("content-type", "text/plain");
+    res.end(JSON.stringify({ count: 1, results: [{ id: "pt_1", content: "prior claim" }] }));
   });
   try {
     const r = await run(["search", "--query", "x"], { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
     assert.equal(r.code, EXIT_OK); // skip-cleanly is preserved
     assert.equal(r.payload.status, STATUS_UNAVAILABLE);
+  } finally {
+    server.close();
+  }
+});
+
+test("data read: a JSON 200 that is not a list envelope degrades to tortoise_unavailable", async () => {
+  // `api()` already rejects a non-JSON content-type, but a stub/proxy answering
+  // `200 application/json` with a JSON object that is NOT an envelope used to
+  // read as `{status: "ok", count: undefined, results: []}` — a healthy-looking
+  // EMPTY store, which a skill reads as "first research on this topic". Every
+  // data read requires the payload's OWN shape before it may emit `ok`.
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ hello: "not the API" }));
+  });
+  try {
+    for (const args of [
+      ["search", "--query", "x"],
+      ["query-prior-research", "--domain", "x"],
+      ["query-strategies"],
+      ["query-visions"],
+    ]) {
+      const r = await run(args, { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url });
+      assert.equal(r.code, EXIT_OK, `${args[0]} must still skip cleanly (stderr: ${r.stderr})`);
+      assert.equal(r.payload.status, STATUS_UNAVAILABLE, `${args[0]} read a non-envelope as ok`);
+      assert.notEqual(r.payload.status, STATUS_OK);
+    }
   } finally {
     server.close();
   }
@@ -384,6 +444,63 @@ test("usage errors carry no store-state word (mock and real paths)", async () =>
   assert.equal(real.code, EXIT_USAGE);
   assert.doesNotMatch(real.stdout, /tortoise_unavailable|not_configured/);
   assert.doesNotMatch(real.stderr, /tortoise_unavailable|not_configured/);
+});
+
+// ── usage errors are NEVER labelled with a store state ──────────────────────
+
+test("usage: a --points-json that is not an array is a usage error, never a store state", async () => {
+  // Parsing succeeds for all of these, so the OLD code reached `for (const p of
+  // points)` and threw "points is not iterable"; the catch-all then reported
+  // `tortoise_unavailable` — telling an operator who passed one object instead
+  // of an array that the store was DOWN, so they skip instead of fixing the
+  // argument. A usage error must emit no `status` at all. None of these reach
+  // the network (the throw/OBSERVED gap is local), so no stub is needed.
+  for (const bad of ["{}", "null", "5", "true"]) {
+    const r = await run(["write-points", "--kind", "statement", "--points-json", bad], { TORTOISE_API_KEY: "tt_test" });
+    assert.equal(r.code, EXIT_USAGE, `--points-json ${bad} must be a usage error (stderr: ${r.stderr})`);
+    assert.match(r.stderr, /--points-json must be a JSON array/);
+    assert.equal(r.payload, null, `--points-json ${bad} must not emit a JSON payload, got: ${r.stdout}`);
+    assert.doesNotMatch(r.stdout, /tortoise_unavailable|not_configured/);
+  }
+});
+
+test("usage: a non-numeric --limit is a usage error, never a store state", async () => {
+  // Against a HEALTHY stub: unvalidated, `Number("abc")` is NaN; the request
+  // still succeeds, so the run reported `ok` exit 0 — a bad invocation dressed
+  // as a healthy read (and, against a non-2xx server, dressed as the store
+  // being down).
+  const { server, url } = await emptyStoreStub();
+  try {
+    const r = await run(["search", "--query", "x", "--limit", "abc"], {
+      TORTOISE_API_KEY: "tt_test",
+      TORTOISE_BASE_URL: url,
+    });
+    assert.equal(r.code, EXIT_USAGE, `stderr: ${r.stderr}`);
+    assert.match(r.stderr, /--limit must be a number/);
+    assert.equal(r.payload, null, `expected no JSON payload, got: ${r.stdout}`);
+  } finally {
+    server.close();
+  }
+});
+
+test("usage: a non-numeric --confidence is a usage error, never a store state", async () => {
+  // `Number("abc")` is NaN; unvalidated it went into the POST body as
+  // `confidence: null` and a healthy write reported `ok` exit 0.
+  const { server, url } = await startStub((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ id: "pt_1", content: "c", kind: "statement" }));
+  });
+  try {
+    const r = await run(
+      ["write-claim", "--content", "c", "--kind", "statement", "--confidence", "abc"],
+      { TORTOISE_API_KEY: "tt_test", TORTOISE_BASE_URL: url },
+    );
+    assert.equal(r.code, EXIT_USAGE, `stderr: ${r.stderr}`);
+    assert.match(r.stderr, /--confidence must be a number/);
+    assert.equal(r.payload, null, `expected no JSON payload, got: ${r.stdout}`);
+  } finally {
+    server.close();
+  }
 });
 
 // ── entry-point guard: the client RUNS through a symlinked route (#708) ─────
@@ -491,21 +608,59 @@ function readSkill(name) {
   return fs.readFileSync(path.join(SKILLS_DIR, name, "SKILL.md"), "utf8");
 }
 
+/**
+ * Code spans that render a backslash escape inside a STATUS context.
+ *
+ * A backslash escape is consumed in markdown PROSE but rendered VERBATIM inside
+ * a code span, so `` `status: \"not_configured\"` `` reads to an agent as a
+ * literal backslash. The detector is scoped by the SPAN'S OWN CONTENT — a status
+ * token — NOT by requiring the literal `` `status: `` prefix, which let a status
+ * span without that exact token (`` `\"not_configured\"` ``) slip through. The
+ * corpus's own `` `\"` `` escape-sequence documentation carries no status token,
+ * so it is not a false positive.
+ *
+ * Factored out (rather than inlined into the scan below) so a synthetic sample
+ * can pin the SCOPING itself; the shipped skills are clean, so a reverted scope
+ * would otherwise stay green.
+ */
+const STATUS_SPAN_TOKEN = /status|not_configured|tortoise_unavailable|\bok\b/;
+function backslashEscapedStatusSpans(src) {
+  return (src.match(/`[^`\n]*`/g) || []).filter(
+    (span) => span.includes('\\"') && STATUS_SPAN_TOKEN.test(span),
+  );
+}
+
 test("every memory skill names BOTH canonical states, never the retired 'tortoise unavailable'", () => {
   for (const name of MEMORY_SKILLS) {
     const src = readSkill(name);
     assert.ok(src.includes('"not_configured"'), `${name}: missing the quoted "not_configured" state`);
     assert.ok(src.includes('"tortoise_unavailable"'), `${name}: missing the quoted "tortoise_unavailable" state`);
-    assert.doesNotMatch(src, /\btortoise unavailable\b/, `${name}: retired 'tortoise unavailable' vocabulary`);
+    // CASE-INSENSITIVE: the retired phrasing is a prose phrase, so it survives
+    // an `unavailable` sentence at the start of a line. A case-sensitive probe
+    // left `skills/research/SKILL.md` (`(skip if Tortoise unavailable)`) green.
+    assert.doesNotMatch(src, /\btortoise unavailable\b/i, `${name}: retired 'tortoise unavailable' vocabulary`);
   }
 });
 
 test("no memory skill carries backslash-escaped quotes inside a status code span", () => {
   for (const name of MEMORY_SKILLS) {
-    // A backslash escape is consumed in markdown PROSE but rendered VERBATIM
-    // inside a code span, so `` `status: \"not_configured\"` `` reads to an agent
-    // as a literal backslash. Scoped to `status:` spans so the corpus's own
-    // `` `\"` `` escape-sequence documentation is not a false positive.
-    assert.doesNotMatch(readSkill(name), /`status:\s*\\"/, `${name}: escaped quote inside a status code span`);
+    const offenders = backslashEscapedStatusSpans(readSkill(name));
+    assert.deepEqual(
+      offenders,
+      [],
+      `${name}: escaped quote inside a status code span: ${offenders.join(" ")}`,
+    );
   }
+});
+
+test("the status-span detector catches an escaped span with NO literal `status:` prefix", () => {
+  // The reviewer's scoping gap pinned as a unit: keying on the literal
+  // `` `status: `` prefix left an escaped status span WITHOUT that token
+  // undetected. Reverting the scope to the prefix match fails here even though
+  // the shipped skills are clean.
+  assert.deepEqual(backslashEscapedStatusSpans('a `\\"not_configured\\"` b'), ['`\\"not_configured\\"`']);
+  assert.deepEqual(backslashEscapedStatusSpans('a `\\"tortoise_unavailable\\"` b'), ['`\\"tortoise_unavailable\\"`']);
+  assert.deepEqual(backslashEscapedStatusSpans('a `\\"ok\\"` b'), ['`\\"ok\\"`']);
+  // ...and the corpus's own escape-sequence documentation is NOT a status span.
+  assert.deepEqual(backslashEscapedStatusSpans('replace `"` with `\\"` before interpolation'), []);
 });

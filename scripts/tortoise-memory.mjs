@@ -27,10 +27,13 @@
  *   "ok"                    — the store answered; an EMPTY store is `ok` + count 0
  *   "not_configured"        — TORTOISE_API_KEY is unset: a SET-UP gap, not an outage
  *   "tortoise_unavailable"  — configured, but the store could not be reached
- * `ok` requires a REAL API payload: a reachable non-API (a non-JSON body, or a
- * JSON body without a numeric `point_count`) degrades to `tortoise_unavailable`,
- * and every request is bounded so an accept-but-silent host still produces a
- * verdict instead of hanging.
+ * `ok` requires a REAL API payload. The `status` probe needs a numeric
+ * `point_count`; a DATA READ needs a list envelope (an integer `count` plus an
+ * array `results`/`points`). A reachable non-API — a non-JSON *content-type* (a
+ * captive portal / proxy / the dashboard host), or any 200 JSON body that is not
+ * the expected shape — degrades to `tortoise_unavailable`, never to a green
+ * verdict with `undefined` fields. Every request is bounded so an
+ * accept-but-silent host still produces a verdict instead of hanging.
  * The `status` PROBE exits 0 (ok) / 3 (can't reach) / 4 (not set up), keeping 2
  * for usage errors; it is the surface a human or an agent harness checks.
  * DATA subcommands (query/search/write) keep the skip-cleanly contract
@@ -54,15 +57,21 @@ export function resolveBaseUrl(env = process.env) {
 // verdict at all; the abort lands in `api()`'s existing catch and becomes the
 // SAME `tortoise_unavailable` payload as an immediate ECONNREFUSED.
 // `TORTOISE_TIMEOUT_MS` is a real knob (slow links), but it cannot DISABLE the
-// bound: a non-finite or out-of-clamp value falls back to the default, so no
-// ambient env turns the timeout off.
+// bound: a non-finite, non-integer, or out-of-clamp value falls back to the
+// default, so no ambient env turns the timeout off. It must be an INTEGER:
+// `AbortSignal.timeout()` throws `delay … must be an integer` on a fractional
+// value, and that throw would be mapped to a false `tortoise_unavailable`
+// against a perfectly healthy store.
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MIN_REQUEST_TIMEOUT_MS = 1;
 const MAX_REQUEST_TIMEOUT_MS = 600_000;
 
 export function resolveTimeoutMs(env = process.env) {
   const raw = Number(env.TORTOISE_TIMEOUT_MS);
-  return Number.isFinite(raw) && raw >= MIN_REQUEST_TIMEOUT_MS && raw <= MAX_REQUEST_TIMEOUT_MS
+  // `Number.isInteger` (not `Number.isFinite`): a fractional value reaches
+  // `AbortSignal.timeout()`, which throws, and the throw lands in `api()`'s
+  // catch as a HEALTHY-store false `tortoise_unavailable`.
+  return Number.isInteger(raw) && raw >= MIN_REQUEST_TIMEOUT_MS && raw <= MAX_REQUEST_TIMEOUT_MS
     ? raw
     : DEFAULT_REQUEST_TIMEOUT_MS;
 }
@@ -137,10 +146,13 @@ async function api(path, opts = {}) {
     const text = await res.text();
     throw new Error(`tortoise ${method} ${path} → HTTP ${res.status}: ${text.slice(0, 300)}`);
   }
-  // This is a JSON API. A 200 carrying a non-JSON body is NOT the hosted
-  // Tortoise API (a captive portal / proxy / the dashboard host), and reading it
-  // as an object yields `undefined` fields that a caller cannot tell from a real
-  // empty answer — the false PASS this guard exists to stop.
+  // The guard keys on CONTENT-TYPE, not on whether the body happens to parse:
+  // a JSON-parsable body served under a non-JSON content-type is still NOT the
+  // hosted API (a captive portal / proxy / the dashboard host can return exactly
+  // that), and reading it as an object yields `undefined` fields that a caller
+  // cannot tell from a real empty answer — the false PASS this guard exists to
+  // stop. (A JSON content-type with a JSON body is a separate check, per-shape,
+  // at the call sites below.)
   const ct = res.headers.get("content-type") || "";
   if (!ct.includes("json")) {
     const text = await res.text();
@@ -152,6 +164,30 @@ async function api(path, opts = {}) {
     );
   }
   return res.json();
+}
+
+/**
+ * A DATA READ may report `ok` ONLY for a real list envelope. The content-type
+ * guard in `api()` already rejects a non-JSON body, but a stub/proxy answering
+ * `200 application/json` with a JSON body that is NOT an envelope (`{"hello":
+ * "not the API"}`) yields `{status: "ok", count: undefined, results: []}` — a
+ * healthy-looking EMPTY store, which a skill reads as "first research on this
+ * topic". `ok` therefore requires the payload's OWN shape: an integer `count`
+ * and an array `results`/`points`.
+ */
+function assertReadPayload(res, path) {
+  const ok =
+    Number.isInteger(res?.count) && (Array.isArray(res?.results) || Array.isArray(res?.points));
+  if (!ok) {
+    throw new MemoryStateError(
+      STATUS_UNAVAILABLE,
+      `the Tortoise API at ${BASE_URL} answered ${path} with a body that is not a list ` +
+        `envelope (count: ${JSON.stringify(res?.count)}, results: ${Array.isArray(res?.results)}, ` +
+        `points: ${Array.isArray(res?.points)}) — not a real API payload: ` +
+        `${JSON.stringify(res).slice(0, 160)}`,
+    );
+  }
+  return res;
 }
 
 /** The graceful failure payload — ONE vocabulary in `status` and `error`. */
@@ -205,26 +241,47 @@ export async function main() {
         const domain = opt("--domain");
         if (!domain) { console.error("--domain required"); process.exit(EXIT_USAGE); }
         if (mocked) return mockCall("query-prior-research", { domain });
-        const res = await api("/v1/search", { params: { q: domain, limit: 10 } });
+        const res = assertReadPayload(
+          await api("/v1/search", { params: { q: domain, limit: 10 } }),
+          "/v1/search",
+        );
         return out({ status: STATUS_OK, domain, count: res.count, results: res.results || [] });
       }
       case "query-strategies": {
         if (mocked) return mockCall("query-strategies");
-        const res = await api("/v1/points", { params: { kind: "strategy", limit: 50 } });
+        const res = assertReadPayload(
+          await api("/v1/points", { params: { kind: "strategy", limit: 50 } }),
+          "/v1/points",
+        );
         return out({ status: STATUS_OK, count: res.count, results: res.points || [] });
       }
       case "query-visions": {
         const kind = opt("--point-kind", "vision");
         if (mocked) return mockCall("query-visions", { pointKind: kind });
-        const res = await api("/v1/points", { params: { kind, limit: 50 } });
+        const res = assertReadPayload(
+          await api("/v1/points", { params: { kind, limit: 50 } }),
+          "/v1/points",
+        );
         return out({ status: STATUS_OK, count: res.count, results: res.points || [] });
       }
       case "search": {
         const q = opt("--query");
-        const limit = Number(opt("--limit", "10"));
+        const limitRaw = opt("--limit", "10");
         if (!q) { console.error("--query required"); process.exit(EXIT_USAGE); }
+        const limit = Number(limitRaw);
+        // A non-numeric `--limit` is a USAGE error. Left unvalidated it reaches
+        // `api()` as `NaN`, whose failure would be reported with a STORE-STATE
+        // word — collapsing "you typed the argument wrong" into "the store is
+        // down", so an operator skips instead of fixing the invocation.
+        if (!Number.isFinite(limit)) {
+          console.error(`--limit must be a number (got: ${JSON.stringify(limitRaw)})`);
+          process.exit(EXIT_USAGE);
+        }
         if (mocked) return mockCall("search", { query: q });
-        const res = await api("/v1/search", { params: { q, limit } });
+        const res = assertReadPayload(
+          await api("/v1/search", { params: { q, limit } }),
+          "/v1/search",
+        );
         return out({ status: STATUS_OK, query: q, count: res.count, results: res.results || [] });
       }
       case "write-points": {
@@ -232,6 +289,15 @@ export async function main() {
         const pointsJson = opt("--points-json");
         let points;
         try { points = JSON.parse(pointsJson); } catch { console.error("--points-json must be valid JSON"); process.exit(EXIT_USAGE); }
+        // Parsing succeeded but the value may not be a LIST (`{}`, `null`, `5`,
+        // `true`). Without this check `for (const p of points)` throws "points is
+        // not iterable", which the catch-all maps to `tortoise_unavailable` — a
+        // USAGE error labelled with a STORE-STATE word, telling an operator who
+        // passed one object instead of an array that the store is down.
+        if (!Array.isArray(points)) {
+          console.error("--points-json must be a JSON array");
+          process.exit(EXIT_USAGE);
+        }
         if (mocked) return mockCall("write-points", { kind, pointsJson });
         const results = [];
         for (const p of points) {
@@ -248,10 +314,20 @@ export async function main() {
         const authoredBy = opt("--authored-by", "");
         const confidenceRaw = opt("--confidence", "");
         if (!content) { console.error("--content required"); process.exit(EXIT_USAGE); }
+        // Same usage-vs-store-state rule as `--limit`: a non-numeric
+        // `--confidence` is a bad invocation, never evidence the store is down.
+        let confidence;
+        if (confidenceRaw !== "") {
+          confidence = Number(confidenceRaw);
+          if (!Number.isFinite(confidence)) {
+            console.error(`--confidence must be a number (got: ${JSON.stringify(confidenceRaw)})`);
+            process.exit(EXIT_USAGE);
+          }
+        }
         if (mocked) return mockCall("write-claim", { content, kind });
         const body = { kind, content };
         if (authoredBy) body.authoredBy = authoredBy;
-        if (confidenceRaw) body.confidence = Number(confidenceRaw);
+        if (confidence !== undefined) body.confidence = confidence;
         const created = await api("/v1/points", { method: "POST", body });
         return out({ status: STATUS_OK, id: created.id, content: created.content, kind: created.kind, written: true });
       }

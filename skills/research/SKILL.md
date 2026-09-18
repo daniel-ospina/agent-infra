@@ -381,7 +381,7 @@ task(prompt='[VGATE] Review this research output for completeness and accuracy. 
 1. Every claim section has a confidence tag
 2. Contradictions between sources are flagged in a Contradictions section
 3. Single-source claims have verify-when-available note
-4. KG facts filed for key claims (skip if Tortoise unavailable)
+4. KG facts filed for key claims (skip if `"not_configured"` — memory was never set up here, which is not an outage — or `"tortoise_unavailable"` — key set but the store was unreachable)
 5. Log entry appended to wiki/log.md per WIKI_SCHEMA.md INGEST format
 
 Return ISSUE blocks for any gaps found (zero issues = CLEAN).
