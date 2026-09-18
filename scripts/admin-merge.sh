@@ -86,19 +86,37 @@
 #                        THE BOGUS ZERO in ci-failure-set.sh.
 #   --any-workflow       drop the lane filter (opt-out; re-opens the bogus zero)
 #   --rerun-timeout S    bound (seconds) on the RE-RUN wait — the wait for a
-#                        re-run run to finish. Its DEFAULT is DERIVED, never a
-#                        flat round number: 2 x the slowest OBSERVED shard
-#                        `test (a)` (B4: 22m10s / 25m50s / 26m03s) = 2 x 1563s
-#                        = 3126s (~52 min), and the derivation is PRINTED. A
-#                        flat 1800s sat 13–27% above a 26-minute job and host
-#                        I/O load pushed past it (B5 lost both #2958 rails to
-#                        that bound). This wait separates STILL-RUNNING (keep
-#                        waiting) from STALLED (no `updatedAt` progress for
-#                        ADMIN_MERGE_STALL_SECONDS) — only a STALL is a failure.
+#                        re-run run to finish. This is an EXPLICIT override;
+#                        when absent the bound is DERIVED at rail runtime from a
+#                        recent GREEN population's PER-SHARD COMPLETED SUCCESSFUL
+#                        job durations (each shard's 2 x max, floored) — never
+#                        from the failing run, whose failing shard was truncated
+#                        by `pytest -x` (a short sample). There is deliberately NO
+#                        GLOBAL constant: B4's population falsifies one —
+#                        main-side `test (a)` n=5 median 18.8m / max 24.2m
+#                        against `test (b)` n=5 median 46.6m / max 49.9m, so
+#                        `test (b)`'s MEDIAN green run is 2.5x `test (a)`'s.
+#                        One number is wrong in BOTH directions: it blocks the
+#                        slow shard mid-distribution while being far
+#                        over-generous for a fast one. This wait separates
+#                        STILL-RUNNING (keep waiting) from STALLED (no
+#                        `updatedAt` progress for ADMIN_MERGE_STALL_SECONDS) —
+#                        only a STALL is a failure. An explicit value must
+#                        EXCEED the stall window by at least one poll interval
+#                        (ADMIN_MERGE_POLL_INTERVAL, default 10s) or the rail
+#                        REFUSES it: wait_for_run's loop condition is the
+#                        ceiling while the STALL check is inside its body, so a
+#                        ceiling at or just above the window exits via the
+#                        CEILING — a stalled run printed as "still RUNNING",
+#                        with the opposite remedy.
 #   --no-rerun           skip the flake re-run classification (a non-empty
 #                        unique set then blocks immediately)
-#   --print-bounds       print the DERIVED re-run ceiling + stall window and the
-#                        source of the derivation, then exit. No gh call.
+#   --print-bounds [<run-id>]
+#                        print the re-run ceiling + stall window, the per-shard
+#                        table (shard, n, max(D), ceiling) and the source of the
+#                        derivation, then exit. With NO run id there is nothing
+#                        to derive from, so it prints the FAIL-SAFE (3900s) and
+#                        makes no gh call at all.
 #   --dry-run            compute + print the decision; mutates nothing at all —
 #                        no CI re-run, no comment, no merge. On the flake path it
 #                        reports and exits 0 (it is an inspection, not a verdict;
@@ -134,7 +152,8 @@
 #     * the RE-RUN WAIT (`--rerun-timeout`) — a real wait, after a re-run, on a
 #       run that is still RUNNING. A still-RUNNING job is NOT a failure; only a
 #       STALL is. It prints STILL-RUNNING progress, and its ceiling is DERIVED
-#       (2 x the slowest OBSERVED shard) with the derivation in the message.
+#       PER SHARD from the run's own observed durations — never a global
+#       constant — with the derivation named in the message.
 #
 #   A DRAFT IS REFUSED EARLY. `commit-workflow` opens drafts deliberately and
 #   `gh` refuses to merge one ("Pull Request is still a draft"), so this is a
@@ -143,10 +162,17 @@
 #   a generic merge failure after the evidence marker.
 #
 # Env seams (tests only):
-#   ADMIN_MERGE_GH              the gh command (default: `gh`)
-#   ADMIN_MERGE_FAILURE_SET_SH  the parser to use (default: ./ci-failure-set.sh)
-#   ADMIN_MERGE_POLL_INTERVAL   seconds between re-run status polls (default 10)
-#   ADMIN_MERGE_STALL_SECONDS   no-progress window that means STALLED (default 600)
+#   ADMIN_MERGE_GH                       the gh command (default: `gh`)
+#   ADMIN_MERGE_FAILURE_SET_SH           the parser (default: ./ci-failure-set.sh)
+#   ADMIN_MERGE_POLL_INTERVAL            seconds between re-run polls (default 10)
+#   ADMIN_MERGE_STALL_SECONDS            no-progress window, STALLED (default 600)
+#   ADMIN_MERGE_GREEN_RUNS               recent SUCCESSFUL runs sampled per shard
+#                                         for the healthy duration (default 5)
+#   ADMIN_MERGE_RERUN_FLOOR              per-shard ceiling floor (default 2 x the
+#                                         stall window, i.e. 1200 at the default
+#                                         600 — deliberately NOT a round 900, so
+#                                         STALLED always fires before CEILING)
+#   ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK   derivation fail-safe (default 3900)
 
 set -uo pipefail
 
@@ -154,10 +180,14 @@ set -uo pipefail
 TMP=""
 
 GH="${ADMIN_MERGE_GH:-gh}"
+# The jobs-JSON parse and the ISO-8601 age both need a real JSON/timestamp
+# reader. python3 is already a hard dependency of this rail — ci-failure-set.sh
+# routes its FAILED-id parsing through ci_exemption.py — so this adds no new
+# dependency, and it is the portable reader (`date -d` is GNU-only).
+if command -v python3 >/dev/null 2>&1; then PYTHON_BIN=python3; else PYTHON_BIN=python; fi
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
 EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
-if command -v python3 >/dev/null 2>&1; then PYTHON_BIN=python3; else PYTHON_BIN=python; fi
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 # A run that is still RUNNING is not a failure — only a STALL is. This is the
 # real failure signal: the run is not `completed` and `updatedAt` has not moved
@@ -165,6 +195,62 @@ POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 # fastest OBSERVED shard (22m10s), whose step updates land far more often than
 # once every ten minutes. Env seam: ADMIN_MERGE_STALL_SECONDS (tests only).
 RERUN_STALL_SECONDS="${ADMIN_MERGE_STALL_SECONDS:-600}"
+
+# ── THE RE-RUN CEILING IS DERIVED PER SHARD, AT RAIL RUNTIME ────────────
+# There is deliberately NO GLOBAL CONSTANT. B4's population falsifies one:
+# on main, `test (a)` is n=5 median 18.8m / max 24.2m while `test (b)` is
+# n=5 median 46.6m / max 49.9m — so `test (b)`'s MEDIAN green run is 2.5x
+# `test (a)`'s. A single number is wrong in BOTH directions: the old
+# `observed_slowest_shard` (1563s) ceiling blocked `test (b)` mid-
+# distribution while being many times over-generous for a 1.6m shard.
+#
+# Per shard s, over a GREEN population — recent COMPLETED SUCCESSFUL jobs of the
+# SAME lane, never the failing run:
+#     ceiling(s) = max(FLOOR, 2 * max(D(s)))   # D(s) = a completed SUCCESSFUL job's duration
+# The failing shard's job was truncated by `pytest -x`, so a duration read off the
+# failing run is a SHORT failure sample: 2 x it can be SMALLER than the healthy
+# re-run it must cover — the exact too-tight-bound defect this replaces, in the
+# common case (the slow shard is the one that failed). A shard with NO green
+# sample takes the FAIL-SAFE, never the truncated failure.
+# The run ceiling C is the max over the shards the rail might still WAIT ON —
+# the NOT-completed ones. When every shard is completed (the normal case: the
+# run a re-run is about to replace is terminal), C is the max over ALL shards.
+#
+# FLOOR is load-bearing: a shard's green ceiling must never be tiny; AND it must
+# EXCEED the stall window BY CONSTRUCTION so the stall check can never be
+# transposed with the ceiling. wait_for_run's loop condition is the CEILING while
+# the STALL check is INSIDE the body, and `waited`/`idle` advance by the SAME step
+# from 0 — so only MULTIPLES of the step are reachable and a ceiling merely AT the
+# window (or one poll above it) still exits via `return 2` first. The margin the
+# ordering needs is the stall window PLUS one poll interval, not the window alone;
+# at a flat 900 the ordering held only while the stall window stayed under 900,
+# and an operator raising ADMIN_MERGE_STALL_SECONDS past ~450 would let the
+# CEILING fire first and re-create B7 (a stall reported as a still-running job:
+# opposite remedies). Hence the default is 2 x the stall window, not a round
+# number — AND validate_timing_knobs REFUSES an explicit floor, fail-safe, or
+# `--rerun-timeout` below `stall + poll`, so the invariant does not depend on the
+# default holding; a single knob cannot break it. The fail-safe is larger still
+# and applies to ANY derivation failure — a derivation that failed must never
+# produce a SMALL bound, because a too-tight bound is the original defect this
+# replaces.
+# The eager `case` guard matters, and it must cover BOTH classes that make the
+# `$((2 * …))` default error out: a NON-NUMERIC stall window, and an ALL-DIGIT
+# LEADING-ZERO one (`0999`, `08`) that bash reads as INVALID OCTAL. Either errors
+# with `value too great for base`, leaves RERUN_FLOOR UNSET, and aborts under
+# `set -u` BEFORE the operator receives the refusal promised below. So the guard
+# routes both to the no-expansion branch, and validate_timing_knobs REFUSES the
+# value by name; this only keeps the file-scope expansion from firing first.
+case "$RERUN_STALL_SECONDS" in
+  ''|*[!0-9]*|0[0-9]*) RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-}" ;;
+  *) RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-$((2 * 10#$RERUN_STALL_SECONDS))}" ;;
+esac
+FAILSAFE_RERUN_TIMEOUT="${ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK:-3900}"
+
+# The lane-run projection, mirrored from ci-failure-set.sh's LANE_RUN_JQ. Used
+# ONLY to locate a PENDING run id for the lane-terminal diagnostic: the parser's
+# provenance file records the FAILING runs, and a pending run has no conclusion,
+# so its id never reaches that file.
+LANE_RUN_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
@@ -205,6 +291,199 @@ counter_is_number() {
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
   return 0
 }
+# TRUE only for an all-digit value STRICTLY GREATER than <max>, for a value of ANY
+# length. `counter_is_number` alone is not enough: it accepts a run of digits too
+# long for the shell's 64-bit integers, and such a value breaks the guard TWO ways.
+# `$((RERUN_STALL_SECONDS + step))` WRAPS — a window at int64max plus one poll
+# interval goes NEGATIVE, so the "does the ceiling clear the window" comparison
+# PASSES; and a value PAST int64max makes the `-lt`/`-ge` comparisons that consume
+# it ERROR (test returns 2, so the `if` body is SKIPPED). The WRAP is the mechanism
+# the cycle-5 review reproduced: an all-digit over-range value was ACCEPTED and
+# yielded a minimum below zero — a silent fail-OPEN in the very guard that exists
+# to fail closed. The comparison is therefore done by DIGIT COUNT first, so a
+# 30-digit string never reaches a `-gt` or a `$((…))` that would error or wrap;
+# equal lengths compare lexicographically, which for all-digit strings is numeric.
+counter_exceeds_max() {
+  local v="${1:-}" max="${2:-}"
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  case "$max" in ''|*[!0-9]*) return 1 ;; esac
+  v="${v#"${v%%[!0]*}"}"; [ -n "$v" ] || v=0
+  [ "${#v}" -gt "${#max}" ] && return 0
+  [ "${#v}" -lt "${#max}" ] && return 1
+  [ "$v" \> "$max" ]
+}
+# TRUE for an all-digit value carrying a LEADING ZERO (`0100`, `08`, `0008`) — the
+# one numeric spelling the shell does NOT read uniformly. bash ARITHMETIC reads it
+# as OCTAL, while the `test` builtin, `sleep`, and the counter predicates above all
+# read it as DECIMAL. That split is load-bearing here: the guard computes its
+# required margin with `$((…))` (octal: `0100` → 64) while wait_for_run's
+# `[ "$idle" -ge "$RERUN_STALL_SECONDS" ]` enforces it with `test` (decimal: 100),
+# so `STALL=0100 --rerun-timeout 74` passed the guard (`64 + 10 = 74`) and then hit
+# the CEILING before STALLED could fire — B7. The sibling `sleep` divergence is the
+# same family: `POLL_INTERVAL=010` is accounted as 8 but sleeps 10s. And `08`/`0999`
+# are not valid octal at all, so the file-scope `2 x` expansion ERRORS and leaves
+# RERUN_FLOOR UNSET (a `set -u` abort instead of the promised named refusal).
+# Refusing the spelling outright is the contract; `10#` at the arithmetic sites is
+# defence in depth.
+counter_has_leading_zero() {
+  case "${1:-}" in 0[0-9]*) return 0 ;; esac
+  return 1
+}
+
+# TIMING_KNOB_MAX — the largest value any timing knob may take. NOT a policy bound:
+# an ARITHMETIC one. Nine digits is ~31 years, far beyond any usable bound and
+# comfortably inside the range these comparisons can hold, so a value above it is
+# nonsense AND unsafe (see counter_exceeds_max).
+TIMING_KNOB_MAX=999999999
+# POLL_INTERVAL_MAX — a tighter, POLICY bound. The poll interval PACES the stall
+# detection, so an hour between polls is already useless; more to the point, an
+# all-digit giant that `sleep` cannot take (BSD `sleep` rejects it with a usage
+# error) made EVERY poll's sleep fail, turning a 600s window into a tight gh BUSY
+# SPIN — measured at 201 `gh run view` calls in 11s. 0 stays LEGAL: it is the
+# deterministic TEST SEAM (no real sleeping), not an interval.
+POLL_INTERVAL_MAX=3600
+
+# validate_timing_knobs — REFUSE a timing knob that is not a positive integer,
+# and REFUSE a ceiling knob that does not CLEAR the stall window.
+# A comparison against a non-numeric value returns 2, and under `set -uo pipefail`
+# (no `-e`) the `if` body is SKIPPED: a bad value silently stops the guard from
+# gating. Both the stall window and the per-shard floor feed `-ge`/`-lt`, so a
+# `10m` window made BOTH STALLED and UNOBSERVABLE unreachable and turned every
+# outcome into the ceiling — the transposition this rail exists to prevent.
+#
+# The ORDERING is the same failure by a different door, and it is STRICTER than
+# "above the window". wait_for_run's loop condition is the CEILING
+# (`waited < RERUN_TIMEOUT`) while the STALL check is INSIDE the body, and
+# `waited`/`idle` both start at 0 and advance by the SAME step — so idle == waited
+# at the check and only MULTIPLES of the step are reachable. A ceiling merely AT
+# or barely above the window therefore still exits via `return 2` before any
+# reachable multiple lands ON the window: `STALL=600, CEILING=600` has NO
+# iteration with `waited < 600 && idle >= 600`, and even `STALL=605, CEILING=606,
+# POLL=10` exits via the CEILING (the first reachable waited >= 605 is 610 > 606).
+# A stalled run is then printed as "still RUNNING at the Ns ceiling" (B7) with the
+# OPPOSITE remedy (wait/retry vs escalate) — and this validator would have been
+# the thing that ACCEPTED the config producing it. The required margin is
+# therefore the stall window PLUS one poll interval, so the smallest reachable
+# multiple of the step (<= stall + step - 1) is strictly inside the loop.
+# The DEFAULT floor (2 x stall) satisfies this by construction, but the
+# construction does not cover an explicit knob: `ADMIN_MERGE_RERUN_FLOOR=300` over
+# a 600s stall — a fail-safe below the margin on a no-green-sample shard — or an
+# explicit `--rerun-timeout` (checked at ITS parse site, below) re-creates B7 with
+# one value. So each is REFUSED, by name.
+#
+# POLL_INTERVAL is validated too, and in two stages: a NON-NUMERIC value makes
+# `[ "$step" -gt 0 ]` error (step falls back to 1) while `sleep "$POLL_INTERVAL"`
+# then fails EVERY iteration; and a numeric value `sleep` cannot take does the
+# same thing — "all digits" is not the same as "usable". 0 stays LEGAL: it is the
+# deterministic TEST SEAM (no real sleeping), never refused.
+#
+# LEADING ZEROS are refused on EVERY timing knob, before any arithmetic. bash reads
+# `0100` as OCTAL 64 in `$((…))` but as DECIMAL 100 in `test`/`sleep`, so a
+# leading-zero stall window made the guard's computed minimum (64 + poll) sit BELOW
+# the window the wait actually enforced — accepting `--rerun-timeout 74` over what
+# is really a 100s window, and re-creating B7. `08`/`0999` are not even valid octal
+# and error the file-scope expansion. One spelling, one meaning: refuse the zeros.
+#
+# Named, at startup, before any CI work.
+validate_timing_knobs() {
+  local bad=0 numeric_ok=1
+  if counter_has_leading_zero "$RERUN_STALL_SECONDS"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL while the 'test' comparisons that gate the"
+    say_err "   wait read it as DECIMAL. The guard would compute a minimum BELOW the window actually"
+    say_err "   enforced, so the CEILING fires before STALLED can be observed. Write it without the"
+    say_err "   leading zero (e.g. '100', not '0100')."
+  elif ! counter_is_positive "$RERUN_STALL_SECONDS"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}' — the no-progress"
+    say_err "   window must be a POSITIVE integer number of seconds. A non-numeric value makes every"
+    say_err "   'idle >= stall' comparison error out, so STALLED and UNOBSERVABLE could never fire."
+  elif counter_exceeds_max "$RERUN_STALL_SECONDS" "$TIMING_KNOB_MAX"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}' — beyond the usable"
+    say_err "   range (max ${TIMING_KNOB_MAX}s). An all-digit value past the shell's integer range makes"
+    say_err "   every timing comparison error out, which SKIPS the guards instead of failing them."
+  fi
+  if counter_has_leading_zero "$RERUN_FLOOR"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_FLOOR='${RERUN_FLOOR}' — a LEADING ZERO is ambiguous:"
+    say_err "   bash ARITHMETIC reads it as OCTAL while the 'test' comparisons that gate the wait read it"
+    say_err "   as DECIMAL, so the ordering check and the wait would disagree about the same value."
+    say_err "   Write it without the leading zero (e.g. '600', not '0600')."
+  elif ! counter_is_positive "$RERUN_FLOOR"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_FLOOR='${RERUN_FLOOR}' — the per-shard ceiling"
+    say_err "   floor must be a POSITIVE integer number of seconds."
+  elif counter_exceeds_max "$RERUN_FLOOR" "$TIMING_KNOB_MAX"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_FLOOR='${RERUN_FLOOR}' — beyond the usable range"
+    say_err "   (max ${TIMING_KNOB_MAX}s). An all-digit value past the shell's integer range makes the"
+    say_err "   ordering comparison error out, which SKIPS it instead of failing it."
+  fi
+  if counter_has_leading_zero "$FAILSAFE_RERUN_TIMEOUT"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — a LEADING"
+    say_err "   ZERO is ambiguous: bash ARITHMETIC reads it as OCTAL while the comparisons that gate the"
+    say_err "   wait read it as DECIMAL. Write it without the leading zero (e.g. '3900', not '03900')."
+  elif ! counter_is_positive "$FAILSAFE_RERUN_TIMEOUT"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — the"
+    say_err "   derivation fail-safe must be a POSITIVE integer number of seconds."
+  elif counter_exceeds_max "$FAILSAFE_RERUN_TIMEOUT" "$TIMING_KNOB_MAX"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — beyond"
+    say_err "   the usable range (max ${TIMING_KNOB_MAX}s)."
+  fi
+  if counter_has_leading_zero "$POLL_INTERVAL"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_POLL_INTERVAL='${POLL_INTERVAL}' — a LEADING ZERO is"
+    say_err "   ambiguous and changes the PACING: bash ARITHMETIC accounts '010' as octal 8 while"
+    say_err "   'sleep' sleeps 10s, so the clock the wait advances and the clock it sleeps disagree."
+    say_err "   Write it without the leading zero (e.g. '10', not '010')."
+  elif ! counter_is_number "$POLL_INTERVAL"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_POLL_INTERVAL='${POLL_INTERVAL}' — the poll interval must be"
+    say_err "   a NON-NEGATIVE integer number of seconds (0 is legal: the test seam). A non-numeric"
+    say_err "   value makes the step guard error and every 'sleep' fail, turning the stall window into"
+    say_err "   a tight BUSY SPIN of gh calls instead of a paced poll."
+  elif counter_exceeds_max "$POLL_INTERVAL" "$POLL_INTERVAL_MAX"; then
+    bad=1; numeric_ok=0
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_POLL_INTERVAL='${POLL_INTERVAL}' — beyond the usable range"
+    say_err "   (max ${POLL_INTERVAL_MAX}s). 'all digits' is not enough: a value 'sleep' cannot take fails"
+    say_err "   on EVERY poll, so the stall window becomes a tight BUSY SPIN of gh calls instead of a"
+    say_err "   paced poll — and an interval beyond an hour paces nothing."
+  fi
+  # The ordering is checked ONLY when every operand is a usable number: a
+  # malformed or out-of-range operand would make the arithmetic below error or
+  # wrap (see counter_exceeds_max), and the checks above already set `bad`.
+  if [ "$numeric_ok" -eq 1 ]; then
+    local step="$POLL_INTERVAL"; [ "$step" -gt 0 ] || step=1
+    # 10# — defence in depth over the leading-zero refusal above: this margin is
+    # the number the wait is judged against, so it must be read in the SAME base
+    # the wait's `test` comparisons use (decimal), never bash's octal default.
+    local min_ceiling=$((10#$RERUN_STALL_SECONDS + 10#$step))
+    if [ "$RERUN_FLOOR" -lt "$min_ceiling" ]; then
+      bad=1
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_FLOOR='${RERUN_FLOOR}' — the per-shard ceiling floor"
+      say_err "   must EXCEED the stall window ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}' by at least one"
+      say_err "   poll interval (${step}s): ${min_ceiling}s or more is required. A ceiling at or below the"
+      say_err "   window reaches the WAIT's ceiling exit before the STALL check can fire, so a stalled run"
+      say_err "   is reported as still RUNNING — not a failure, with the OPPOSITE remedy. The default"
+      say_err "   floor is 2 x the stall window."
+    fi
+    if [ "$FAILSAFE_RERUN_TIMEOUT" -lt "$min_ceiling" ]; then
+      bad=1
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — the"
+      say_err "   derivation fail-safe must EXCEED the stall window ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}'"
+      say_err "   by at least one poll interval (${step}s): ${min_ceiling}s or more is required. A shard"
+      say_err "   with no green sample takes the fail-safe VERBATIM, so a shorter one reports a stalled run"
+      say_err "   as still RUNNING — the same B7 transposition as a short floor."
+    fi
+  fi
+  [ "$bad" -eq 0 ] || { say_err "   These are operator knobs; fix the value and re-run the rail."; return 1; }
+  return 0
+}
 
 resolve_head() {
   local pr="$1"; shift
@@ -230,6 +509,296 @@ resolve_draft() {
 run_failure_set() {
   # shellcheck disable=SC2086
   "$BASH" "$CFS" "$@"
+}
+
+# is_run_id — a GitHub run id is decimal. Used to accept the OPTIONAL
+# `--print-bounds <run-id>` argument without swallowing the next flag.
+is_run_id() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# fail_safe_rerun_timeout <reason> — install the fail-safe and say WHY, loudly.
+# NEVER small: the whole defect this replaces was a bound that was too tight.
+fail_safe_rerun_timeout() {
+  local reason="$1"
+  DERIVED_RERUN_TIMEOUT="$FAILSAFE_RERUN_TIMEOUT"
+  DERIVED_RERUN_SOURCE="fail-safe ${FAILSAFE_RERUN_TIMEOUT}s — derivation unavailable (${reason})"
+  DERIVED_TABLE=""
+  say_err "admin-merge: derivation unavailable (${reason}) — using the fail-safe ${FAILSAFE_RERUN_TIMEOUT}s (never a small bound)"
+}
+
+# fetch_run_jobs <run-id> → the raw jobs JSON on stdout. The API rather than
+# `gh run view --json jobs`, because only the API carries `started_at` /
+# `completed_at` per job. It goes through $GH so the harness can stub it — no new
+# network path. `{owner}/{repo}` is gh's own placeholder, used only when --repo
+# was not supplied. $GH is expanded UNQUOTED, like every other call site in this
+# rail: the seam is a COMMAND (the presence check reads `${GH%% *}`), so
+# `ADMIN_MERGE_GH="gh --hostname h"` must word-split into a command and its
+# flags — a quoted "$GH" ran a file literally named `gh --hostname h`.
+# shellcheck disable=SC2086
+fetch_run_jobs() {
+  local run_id="$1" slug
+  if [ -n "$REPO" ]; then
+    slug="repos/$REPO/actions/runs/$run_id/jobs?per_page=100"
+  else
+    slug="repos/{owner}/{repo}/actions/runs/$run_id/jobs?per_page=100"
+  fi
+  $GH api "$slug" --paginate
+}
+
+# ── THE GREEN POPULATION ────────────────────────────────────────────────
+# D(s) is sampled from recent COMPLETED SUCCESSFUL jobs of the SAME lane —
+# NEVER from the run about to be re-run. On that run the shard that failed was
+# truncated by `pytest -x`, so its completed duration is a SHORT failure sample
+# and `2 x` it can be SMALLER than the healthy re-run it must cover. That is the
+# too-tight-bound defect this derivation replaces, and it fires in the COMMON
+# case (the slow shard is the one that failed). `gh run list` is already on this
+# rail's network surface (pending_run_id uses it); the jobs fetch is the Jobs API
+# fetch_run_jobs already uses.
+GREEN_RUNS="${ADMIN_MERGE_GREEN_RUNS:-5}"
+
+# green_run_ids — recent COMPLETED SUCCESSFUL run ids for the selected lane, one
+# per line. `--any-workflow` is a PARSER flag, not a `gh run list` flag, so it is
+# deliberately NOT forwarded (real gh rejects it, and `2>/dev/null || true` would
+# hide that — the WAIT-vs-STALLED diagnostic would be silently dead).
+green_run_ids() {
+  local args=()
+  [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
+  if [ "${ANY_WORKFLOW:-0}" -ne 1 ] && [ -n "${WORKFLOW:-}" ]; then
+    args+=(--workflow "$WORKFLOW")
+  fi
+  # shellcheck disable=SC2086
+  $GH run list --status success --limit "$GREEN_RUNS" \
+    ${args[@]+"${args[@]}"} \
+    --json databaseId --jq '.[].databaseId' 2>/dev/null || true
+}
+
+# derive_rerun_timeout <run-id> — set DERIVED_RERUN_TIMEOUT / _SOURCE / _TABLE
+# from a GREEN population's observed per-shard job durations. NEVER fails the
+# caller: every failure path installs the fail-safe and says so loudly.
+#
+# The TARGET run supplies only the shard SET and which shards are unfinished (the
+# pool the rail might wait on). Its own durations are deliberately NOT used — a
+# failure-truncated sample must never stand in for a shard's healthy duration, and
+# a shard with no green sample takes the FAIL-SAFE.
+#
+# Shard normalisation: a job name is (1) stripped of a reusable-workflow caller
+# prefix (`<caller> / <called>`, which gh renders for a `workflow_call` job) and
+# (2) reduced to its FIRST matrix axis (`test (a, docker)` → `test (a)`), then
+# left verbatim. That is the shard identity the workflow's own `name:` template
+# produces — `test (a)`, `test (b)`, `test-slow (b)`, `test-carve-out` — so the
+# grouping survives the two things that actually vary between runs (the caller
+# prefix and extra matrix axes) without inventing a grouping key that is not the
+# shard.
+derive_rerun_timeout() {
+  local run_id="$1" json_file="" green_file="" gids="" gid="" out="" rc=0 line tag name n maxd ceil unfin sample
+  local green_files=()
+  DERIVED_RERUN_TIMEOUT="$FAILSAFE_RERUN_TIMEOUT"
+  DERIVED_RERUN_SOURCE=""
+  DERIVED_TABLE=""
+  [ -n "$run_id" ] || { fail_safe_rerun_timeout "no run id"; return 0; }
+  command -v "${GH%% *}" >/dev/null 2>&1 || { fail_safe_rerun_timeout "gh absent"; return 0; }
+  json_file="$(mktemp "${TMPDIR:-/tmp}/admin-merge-jobs.XXXXXX")"
+  if ! fetch_run_jobs "$run_id" > "$json_file" 2>/dev/null; then
+    rm -f "$json_file"
+    fail_safe_rerun_timeout "jobs API error"
+    return 0
+  fi
+  if [ ! -s "$json_file" ]; then
+    rm -f "$json_file"
+    fail_safe_rerun_timeout "empty jobs response"
+    return 0
+  fi
+  # The GREEN population: the failing run is the SHARD MAP, never the sample.
+  gids="$(green_run_ids)"
+  if [ -n "$gids" ]; then
+    while IFS= read -r gid; do
+      [ -n "$gid" ] || continue
+      green_file="$(mktemp "${TMPDIR:-/tmp}/admin-merge-green.XXXXXX")"
+      if fetch_run_jobs "$gid" > "$green_file" 2>/dev/null && [ -s "$green_file" ]; then
+        green_files+=("$green_file")
+      else
+        rm -f "$green_file"
+      fi
+    done <<< "$gids"
+  fi
+  out="$("$PYTHON_BIN" -c 'import datetime, json, re, sys
+floor, failsafe, tpath = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+gpaths = sys.argv[4:]
+def norm(name):
+    s = (name or "").strip()
+    if " / " in s:
+        s = s.rsplit(" / ", 1)[1].strip()
+    m = re.match(r"^(.*?)\s*\((.*)\)\s*$", s)
+    if m and m.group(1).strip():
+        s = "%s (%s)" % (m.group(1).strip(), m.group(2).split(",")[0].strip())
+    return s
+def ts(raw):
+    if not raw:
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d
+def secs(job):
+    a, b = ts(job.get("started_at")), ts(job.get("completed_at"))
+    if a is None or b is None:
+        return None
+    n = int((b - a).total_seconds())
+    return n if n >= 0 else None
+def jobs_of(path):
+    raw = open(path, "r", encoding="utf-8", errors="replace").read()
+    docs = []
+    dec = json.JSONDecoder()
+    i = 0
+    while i < len(raw):
+        while i < len(raw) and raw[i] in " \t\r\n":
+            i += 1
+        if i >= len(raw):
+            break
+        try:
+            obj, i = dec.raw_decode(raw, i)
+        except ValueError:
+            return None
+        docs.append(obj)
+    jobs = []
+    saw = False
+    for d in docs:
+        if isinstance(d, dict) and isinstance(d.get("jobs"), list):
+            saw = True
+            jobs.extend(j for j in d["jobs"] if isinstance(j, dict))
+    return jobs if saw else None
+target = jobs_of(tpath)
+if target is None:
+    raise SystemExit(2)
+shards = {}
+target_completed = 0
+for job in target:
+    name = norm(job.get("name"))
+    if not name:
+        continue
+    rec = shards.setdefault(name, {"unfinished": False})
+    if job.get("status") and job.get("status") != "completed":
+        rec["unfinished"] = True
+    if secs(job) is not None:
+        target_completed += 1
+if target_completed == 0:
+    raise SystemExit(3)
+green = {}
+for path in gpaths:
+    jobs = jobs_of(path)
+    if jobs is None:
+        continue
+    for job in jobs:
+        if job.get("conclusion") != "success":
+            continue
+        name = norm(job.get("name"))
+        if not name:
+            continue
+        secs_n = secs(job)
+        if secs_n is None:
+            continue
+        rec = green.setdefault(name, {"n": 0, "max": 0})
+        rec["n"] += 1
+        if secs_n > rec["max"]:
+            rec["max"] = secs_n
+if not green:
+    raise SystemExit(4)
+def shard_ceiling(name):
+    rec = green.get(name)
+    if rec is None:
+        return failsafe
+    return max(floor, 2 * rec["max"])
+for name in sorted(shards):
+    rec = green.get(name)
+    if rec is None:
+        n, mx, sample = 0, 0, "none"
+    else:
+        n, mx, sample = rec["n"], rec["max"], "green"
+    print("SHARD\t%s\t%d\t%d\t%d\t%d\t%s" % (name, n, mx, shard_ceiling(name), 1 if shards[name]["unfinished"] else 0, sample))
+unfinished = [s for s in shards if shards[s]["unfinished"]]
+if unfinished:
+    pool, reason = unfinished, "slowest unfinished shard"
+else:
+    pool, reason = list(shards), "slowest shard (every shard completed)"
+win = max(sorted(pool), key=shard_ceiling)
+rec = green.get(win)
+wn, wmax = (0, 0) if rec is None else (rec["n"], rec["max"])
+print("C\t%d\t%s\t%d\t%d\t%s" % (shard_ceiling(win), win, wn, wmax, reason))' "$RERUN_FLOOR" "$FAILSAFE_RERUN_TIMEOUT" "$json_file" ${green_files[@]+"${green_files[@]}"} 2>/dev/null)"
+  rc=$?
+  rm -f "$json_file" ${green_files[@]+"${green_files[@]}"}
+  case "$rc" in
+    0) [ -n "$out" ] || { fail_safe_rerun_timeout "unparsable jobs response"; return 0; } ;;
+    3) fail_safe_rerun_timeout "no job durations observed"; return 0 ;;
+    4) fail_safe_rerun_timeout "no completed SUCCESSFUL job observed for the lane"; return 0 ;;
+    *) fail_safe_rerun_timeout "unparsable jobs response"; return 0 ;;
+  esac
+  local table="" c_line="" c="" win="" winn="" winmax="" wreason="" state max_disp
+  while IFS= read -r line; do
+    case "$line" in
+      C$'\t'*) c_line="$line" ;;
+      SHARD$'\t'*)
+        IFS=$'\t' read -r tag name n maxd ceil unfin sample <<< "$line"
+        state="finished"
+        [ "$unfin" = "1" ] && state="unfinished"
+        if [ "$sample" = "green" ]; then max_disp="${maxd}s"; else max_disp="--"; fi
+        table="${table}shard ${name}	n=${n}	max=${max_disp}	ceiling=${ceil}s	state=${state}	sample=${sample}"$'\n'
+        ;;
+    esac
+  done <<< "$out"
+  DERIVED_TABLE="${table%$'\n'}"
+  IFS=$'\t' read -r tag c win winn winmax wreason <<< "$c_line"
+  counter_is_number "$c" || { fail_safe_rerun_timeout "unparsable jobs response"; return 0; }
+  DERIVED_RERUN_TIMEOUT="$c"
+  DERIVED_RERUN_SOURCE="derived per-shard green ceiling ${c}s (${wreason}: ${win}, green n=${winn}, green max=${winmax}s)"
+}
+
+# iso_age_seconds <iso-8601> → whole seconds since that instant, or EMPTY when it
+# cannot be read. `date -d` is GNU-only and `date -j -f` is BSD-only, and python
+# is already a rail dependency, so it is the portable reader. An unreadable
+# timestamp is reported as unknown — NEVER as "not moving".
+iso_age_seconds() {
+  "$PYTHON_BIN" -c '
+import datetime, sys
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw:
+    raise SystemExit(1)
+try:
+    ts = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+except ValueError:
+    raise SystemExit(1)
+if ts.tzinfo is None:
+    ts = ts.replace(tzinfo=datetime.timezone.utc)
+age = int((datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds())
+print(age if age >= 0 else 0)
+' "$1" 2>/dev/null
+}
+
+# pending_run_id <head> — the first NON-COMPLETED lane run id for this head, or
+# empty. Only the lane-terminal diagnostic needs it: the parser's provenance file
+# records the FAILING runs, and a pending run has no conclusion, so its id never
+# reaches that file.
+pending_run_id() {
+  local head="$1" line args=()
+  [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
+  # ONLY gh-native flags. `--any-workflow` is the PARSER's opt-out: real gh
+  # rejects it (`unknown flag`), and `2>/dev/null || true` hid that, so the
+  # WAIT-vs-STALLED diagnostic was silently dead for the very invocation
+  # commit-workflow's own docs prescribe.
+  if [ "${ANY_WORKFLOW:-0}" -ne 1 ] && [ -n "${WORKFLOW:-}" ]; then
+    args+=(--workflow "$WORKFLOW")
+  fi
+  # shellcheck disable=SC2086
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in completed$'\t'*) continue ;; esac
+    printf '%s' "${line##*:}"
+    return 0
+  done < <($GH run list --commit "$head" --limit 100 \
+      ${args[@]+"${args[@]}"} \
+      --json databaseId,status,conclusion,headSha --jq "$LANE_RUN_JQ" 2>/dev/null || true)
+  return 0
 }
 
 # run_exemption_decision <pr-rows> <main-rates> <main-sigs> <rotation> <prefix>
@@ -285,11 +854,15 @@ residual_of() {
 #   return 2  CEILING — still RUNNING at the derived RERUN_TIMEOUT. NOT a
 #             failure verdict: a still-running job is not a failure; the
 #             derived bound was simply reached.
+#   return 3  UNOBSERVABLE — gh could not be read for RERUN_STALL_SECONDS, so
+#             the run's state was NEVER OBSERVED. Deliberately distinct from
+#             STALLED (1): "no progress" is a claim about a field we read; an
+#             outage is the absence of that reading. Opposite remedies.
 # A still-RUNNING run prints progress (status, elapsed/ceiling, and the
 # derivation) instead of a verdict — the old flat message read as a failure
 # when it was only impatience (B5).
 wait_for_run() {
-  local run_id="$1" waited=0 idle=0 step status upd line last_upd=""
+  local run_id="$1" waited=0 idle=0 unobs=0 step status upd line last_upd=""
   # Wall-clock accounting must advance even when the test seam sets the interval
   # to 0 — a 0-step loop can never reach its own bound and spins forever.
   step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
@@ -301,19 +874,59 @@ wait_for_run() {
       --json status,updatedAt --jq '.status + " " + .updatedAt' 2>/dev/null || echo 'unknown ')"
     status="${line%% *}"; upd="${line#* }"
     [ "$status" = "completed" ] && return 0
-    if [ -n "$upd" ] && [ "$upd" != "$last_upd" ]; then
+    # "Could not read the run" is NOT "the run made no progress". A gh failure
+    # yields status=unknown and an empty clock; counting that as idle made a
+    # transient gh/auth/network outage report STALLED — a claim ("updatedAt
+    # never moved") the code cannot support, because it never read the field.
+    # The two faults have OPPOSITE remedies — repair gh, vs escalate a wedged
+    # run — so they must not share a diagnosis. Fail-closed either way: an
+    # unreadable run still blocks. (Field evidence: a loaded host produced a
+    # FALSE stall from frozen metadata while the child was still working; a
+    # frozen clock cannot distinguish running-but-quiet from wedged.)
+    if [ -z "$upd" ] || [ "$status" = "unknown" ]; then
+      unobs=$((unobs + 10#$step))
+      [ "$unobs" -ge "$RERUN_STALL_SECONDS" ] && return 3
+      sleep "$POLL_INTERVAL"; waited=$((waited + 10#$step)); continue
+    fi
+    unobs=0
+    if [ "$upd" != "$last_upd" ]; then
       idle=0; last_upd="$upd"
     else
-      idle=$((idle + step))
+      idle=$((idle + 10#$step))
     fi
     if [ "$idle" -ge "$RERUN_STALL_SECONDS" ]; then
       return 1
     fi
-    info "admin-merge: … run $run_id STILL RUNNING (status=${status:-unknown}, ${waited}s of the ${RERUN_TIMEOUT}s ceiling = 2 x the slowest OBSERVED shard 26m03s). A running job is not a failure — waiting."
+    info "admin-merge: … run $run_id STILL RUNNING (status=${status:-unknown}, ${waited}s of the ${RERUN_TIMEOUT}s ceiling — ${RERUN_TIMEOUT_SOURCE}). A running job is not a failure — waiting."
     sleep "$POLL_INTERVAL"
-    waited=$((waited + step))
+    waited=$((waited + 10#$step))
   done
   return 2
+}
+
+# print_bounds [<run-id>] — the re-run ceiling, its per-shard table (each figure
+# carrying its n), the source, and the stall window. `rerun-timeout=` stays the
+# FIRST line: existing greps depend on the key. With NO run id there is nothing to
+# derive from, so this is the one path that prints the fail-safe and makes no call.
+print_bounds() {
+  local run_id="$1"
+  if [ "$RERUN_TIMEOUT_EXPLICIT" -eq 1 ]; then
+    printf 'rerun-timeout=%s\n' "$RERUN_TIMEOUT"
+    printf 'source=explicit --rerun-timeout\n'
+    printf 'stall=%s\n' "$RERUN_STALL_SECONDS"
+    return 0
+  fi
+  if [ -z "$run_id" ]; then
+    printf 'rerun-timeout=%s\n' "$FAILSAFE_RERUN_TIMEOUT"
+    printf 'source=fail-safe %ss — no run id supplied; the derivation needs a run (pass one: --print-bounds <run-id>)\n' "$FAILSAFE_RERUN_TIMEOUT"
+    printf 'stall=%s\n' "$RERUN_STALL_SECONDS"
+    return 0
+  fi
+  derive_rerun_timeout "$run_id"
+  printf 'rerun-timeout=%s\n' "$DERIVED_RERUN_TIMEOUT"
+  [ -n "$DERIVED_TABLE" ] && printf '%s\n' "$DERIVED_TABLE"
+  printf 'source=%s\n' "$DERIVED_RERUN_SOURCE"
+  printf 'stall=%s\n' "$RERUN_STALL_SECONDS"
 }
 
 # build_evidence — the machine-readable comment. The marker binds the evidence
@@ -463,13 +1076,20 @@ attribute_residual() {
 main() {
   local PR="" MAIN_RUNS="${MAIN_RUNS:-10}" REPO="" DRY_RUN=0 NO_RERUN=0
   local WORKFLOW="${CI_FAILURE_SET_WORKFLOW:-python-ci.yml}" ANY_WORKFLOW=0
-  # DERIVED, not a round number: 2 x the slowest OBSERVED shard `test (a)`
-  # (B4: 22m10s / 25m50s / 26m03s → slowest 1563s; ceiling 3126s ≈ 52 min).
-  # A flat 1800s left only 13–27% headroom above a 26-minute job, and host I/O
-  # load pushed past it — B5 lost both #2958 rails to that bound. The source of
-  # the number is printed wherever the bound is reported.
-  observed_slowest_shard=1563
-  RERUN_TIMEOUT="${RERUN_TIMEOUT:-$((2 * observed_slowest_shard))}"
+  local PRINT_BOUNDS=0 PRINT_BOUNDS_RUN=""
+  # Numeric operator knobs are validated BEFORE anything reads them: a value that
+  # is not a positive integer makes the `-ge`/`-lt` guards return 2 and silently
+  # skip, which disables the gate rather than failing it.
+  validate_timing_knobs || exit 2
+  # NO GLOBAL CEILING. An explicit --rerun-timeout (or $RERUN_TIMEOUT) is a
+  # verbatim override; otherwise the bound is DERIVED from a GREEN population's
+  # observed shard durations at the re-run site, and the fail-safe applies only
+  # when the derivation is unavailable — never as a small default.
+  RERUN_TIMEOUT="${RERUN_TIMEOUT:-}"
+  RERUN_TIMEOUT_EXPLICIT=0
+  [ -n "$RERUN_TIMEOUT" ] && RERUN_TIMEOUT_EXPLICIT=1
+  RERUN_TIMEOUT_SOURCE=""
+  [ "$RERUN_TIMEOUT_EXPLICIT" -eq 1 ] && RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"
   local MERGE_ARGS=() MERGE_METHOD_SET=0
 
   while [ $# -gt 0 ]; do
@@ -478,13 +1098,17 @@ main() {
       --repo) REPO="${2:-}"; shift 2 ;;
       --workflow) WORKFLOW="${2:-}"; shift 2 ;;
       --any-workflow) ANY_WORKFLOW=1; shift ;;
-      --rerun-timeout) RERUN_TIMEOUT="${2:-}"; shift 2 ;;
+      --rerun-timeout) RERUN_TIMEOUT="${2:-}"; RERUN_TIMEOUT_EXPLICIT=1; RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"; shift 2 ;;
       --no-rerun) NO_RERUN=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       # Make the DERIVATION visible on demand: the re-run ceiling is not a round
       # number, and an operator must be able to see where it came from without
-      # reading the source. No gh call, no side effect.
-      --print-bounds) printf 'rerun-timeout=%s\nsource=2 x slowest OBSERVED shard 26m03s (observed 22m10s / 25m50s / 26m03s)\nstall=%s\n' "$RERUN_TIMEOUT" "$RERUN_STALL_SECONDS"; exit 0 ;;
+      # reading the source. Handled AFTER the loop so `--repo` may appear on
+      # either side of it; the run id is OPTIONAL and must not swallow a flag.
+      --print-bounds)
+        PRINT_BOUNDS=1
+        if [ $# -ge 2 ] && is_run_id "${2:-}"; then PRINT_BOUNDS_RUN="${2:-}"; shift; fi
+        shift ;;
       --help|-h) usage; exit 0 ;;
       --) shift; while [ $# -gt 0 ]; do
             case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
@@ -498,6 +1122,63 @@ main() {
         shift ;;
     esac
   done
+
+  # An explicit --rerun-timeout is a THIRD path to the ceiling, and it is checked
+  # here (not in validate_timing_knobs, which runs before the flags are parsed) for
+  # the same three faults the other two paths are:
+  #   * a LEADING ZERO (`0100`) — bash ARITHMETIC reads it as OCTAL while the
+  #     `[ "$waited" -lt "$RERUN_TIMEOUT" ]` loop condition reads it as DECIMAL, so
+  #     the minimum computed below sits BELOW the window the wait enforces;
+  #   * not a POSITIVE INTEGER — `[ "$waited" -lt "$RERUN_TIMEOUT" ]` returns 2, the
+  #     loop body NEVER RUNS and the function falls through to `return 2` (CEILING)
+  #     with ZERO polls, printing a false "still RUNNING at the ceiling" claim about
+  #     a run it never looked at;
+  #   * below the stall window PLUS one poll interval — the ORDERING fault: a
+  #     ceiling that does not clear the window by a full reachable step exits via
+  #     the CEILING before `idle` can reach the stall (validated identically for the
+  #     floor and the fail-safe; `--rerun-timeout 5` over a 100s window is the same
+  #     B7 transposition with an operator-supplied value). A ceiling below the
+  #     stall window is never correct, so the flag is refused rather than treated as
+  #     a raw escape hatch.
+  if [ "$RERUN_TIMEOUT_EXPLICIT" -eq 1 ]; then
+    if counter_has_leading_zero "$RERUN_TIMEOUT"; then
+      say_err "admin-merge: ✗ refusing --rerun-timeout '${RERUN_TIMEOUT}' — a LEADING ZERO is ambiguous: bash"
+      say_err "   ARITHMETIC reads it as OCTAL while the 'test' comparisons that bound the wait read it as"
+      say_err "   DECIMAL, so the required minimum would be computed BELOW the window actually enforced."
+      say_err "   Write it without the leading zero (e.g. '100', not '0100')."
+      exit 2
+    fi
+    if ! counter_is_positive "$RERUN_TIMEOUT"; then
+      say_err "admin-merge: ✗ refusing --rerun-timeout '${RERUN_TIMEOUT}' — it must be a POSITIVE integer number of seconds."
+      say_err "   A non-numeric or zero bound makes the re-run wait's comparison error out, so the"
+      say_err "   loop runs ZERO polls and the rail reports a still-running run at the ceiling without"
+      say_err "   ever having looked. Omit the flag to derive the bound per shard."
+      exit 2
+    fi
+    if counter_exceeds_max "$RERUN_TIMEOUT" "$TIMING_KNOB_MAX"; then
+      say_err "admin-merge: ✗ refusing --rerun-timeout '${RERUN_TIMEOUT}' — beyond the usable range"
+      say_err "   (max ${TIMING_KNOB_MAX}s). An all-digit value past the shell's integer range makes the"
+      say_err "   wait's comparison error out, which SKIPS the loop instead of bounding it."
+      exit 2
+    fi
+    local wait_step="$POLL_INTERVAL"; [ "$wait_step" -gt 0 ] || wait_step=1
+    # 10# — same base discipline as validate_timing_knobs: the minimum must be
+    # decimal, like the `test` comparison that immediately consumes it.
+    local min_wait=$((10#$RERUN_STALL_SECONDS + 10#$wait_step))
+    if [ "$RERUN_TIMEOUT" -lt "$min_wait" ]; then
+      say_err "admin-merge: ✗ refusing --rerun-timeout '${RERUN_TIMEOUT}' — it must EXCEED the stall window"
+      say_err "   ADMIN_MERGE_STALL_SECONDS='${RERUN_STALL_SECONDS}' by at least one poll interval (${wait_step}s):"
+      say_err "   ${min_wait}s or more is required. wait_for_run's loop condition is the CEILING while the"
+      say_err "   STALL check is inside its body, so a shorter bound exits at the ceiling before the stall"
+      say_err "   can fire — a stalled run reported as still RUNNING, with the OPPOSITE remedy. Omit the"
+      say_err "   flag to derive the bound per shard."
+      exit 2
+    fi
+  fi
+
+  # The derivation report is an inspection: print and exit BEFORE any PR is
+  # required, so `--print-bounds <run-id>` works on a bare invocation.
+  if [ "$PRINT_BOUNDS" -eq 1 ]; then print_bounds "$PRINT_BOUNDS_RUN"; exit 0; fi
 
   # gh REQUIRES a merge method when it is not interactive. Default it so an
   # omission cannot leave the evidence marker standing over an unmerged PR. An
@@ -598,6 +1279,38 @@ main() {
     else
       say_err "   the run report's 'pending' counter is unreadable ('${pr_pending:-}'), so the rail"
       say_err "   cannot show the lane finished (lane: $lane)."
+    fi
+    # ── WHICH WAIT IS THIS? BOTH waits must read differently (B7). One
+    # `gh run view` call, ONLY here, on the pending run: its status and the age of
+    # its progress clock. A run that is moving reads as a WAIT; a run whose clock
+    # has stopped for the stall window reads as STALLED — and NEITHER is the
+    # re-run ceiling, which has not started. The parser COUNTS pending runs but
+    # does not record their ids (a pending run has no conclusion), so the id is
+    # looked up here; this is the failure path, so the extra list costs nothing.
+    if counter_is_positive "$pr_pending"; then
+      local pend_id="" vline="" vstatus="" vupd="" idle=""
+      pend_id="$(pending_run_id "$head")"
+      if [ -n "$pend_id" ]; then
+        # shellcheck disable=SC2086
+        vline="$($GH run view "$pend_id" ${repo_args[@]+"${repo_args[@]}"} --json status,updatedAt --jq '.status + " " + .updatedAt' 2>/dev/null || true)"
+        vstatus="${vline%% *}"; vupd="${vline#* }"
+        if [ -n "$vstatus" ] && [ "$vstatus" != "completed" ]; then
+          idle="$(iso_age_seconds "$vupd")"
+          # An UNREADABLE timestamp is neither a WAIT nor a STALL: a WAIT asserts
+          # progress WAS observed, a STALL asserts the clock was read and stopped.
+          # Folding "could not read" into the WAIT branch is the same
+          # cannot-observe≠observed-progress fault this rail fixed in wait_for_run.
+          if [ -z "$idle" ]; then
+            say_err "   the lane run $pend_id reports status=$vstatus but its updatedAt ('${vupd:-}') could not be read — the progress clock is UNOBSERVABLE, so NEITHER a WAIT nor a STALL can be claimed. Remedy differs: check gh auth/network, then re-run."
+          elif [ "$idle" -ge "$RERUN_STALL_SECONDS" ]; then
+            say_err "   the lane run $pend_id is STALLED — no progress for ${idle}s (status=$vstatus, updatedAt=$vupd, stall window ${RERUN_STALL_SECONDS}s)."
+          else
+            say_err "   the lane run $pend_id reports status=$vstatus, updatedAt=$vupd — this is a WAIT, not a stall; the re-run bound is a different wait."
+          fi
+        elif [ "$vstatus" = "completed" ]; then
+          say_err "   the lane run $pend_id now reports status=completed — re-run the rail to re-list the lane."
+        fi
+      fi
     fi
     say_err "   An unfinished lane yields an empty failing set, which proves nothing."
     say_err "   Wait for CI to complete, then re-run the rail."
@@ -781,6 +1494,17 @@ main() {
     while IFS= read -r run_line; do
       [ -n "$run_line" ] || continue
       run_id="${run_line##*:}"
+      # DERIVE BEFORE THE RE-RUN. At this point the run is terminal (`pr-runs.txt`
+      # carries failing runs), so EVERY shard has a completed sample and the run
+      # ceiling is the slow shard's own 2 x max. Deriving AFTER the re-run would
+      # see the just-re-started shard as unfinished with no sample of its own —
+      # exactly the shard whose bound matters — and substitute a floor/fail-safe
+      # for the one measurement that was available a moment earlier.
+      if [ "$RERUN_TIMEOUT_EXPLICIT" -eq 0 ]; then
+        derive_rerun_timeout "$run_id"
+        RERUN_TIMEOUT="$DERIVED_RERUN_TIMEOUT"
+        RERUN_TIMEOUT_SOURCE="$DERIVED_RERUN_SOURCE"
+      fi
       info "admin-merge: ↻ re-running failed jobs of run $run_id"
       # shellcheck disable=SC2086
       if ! $GH run rerun "$run_id" --failed ${repo_args[@]+"${repo_args[@]}"} >/dev/null 2>&1; then
@@ -792,8 +1516,12 @@ main() {
         say_err "admin-merge: ✗ BLOCK — run $run_id STALLED: no progress for ${RERUN_STALL_SECONDS}s (status stayed non-completed and updatedAt never moved). A still-running job is not a failure; a STALL is. No merge."
         exit 1
       fi
+      if [ "$wait_rc" -eq 3 ]; then
+        say_err "admin-merge: ✗ BLOCK — run $run_id UNOBSERVABLE: gh could not be read for ${RERUN_STALL_SECONDS}s (neither status nor updatedAt was ever obtained). This is NOT a stall — a stall is a claim about progress, and this rail never saw the field. Remedy differs: check gh auth/network, then re-run. No merge."
+        exit 1
+      fi
       if [ "$wait_rc" -ne 0 ]; then
-        say_err "admin-merge: ✗ BLOCK — run $run_id still RUNNING at the ${RERUN_TIMEOUT}s ceiling = 2 x the slowest OBSERVED shard (26m03s). Not a stall — the DERIVED ceiling was reached. No merge."
+        say_err "admin-merge: ✗ BLOCK — run $run_id still RUNNING at the ${RERUN_TIMEOUT}s ceiling — ${RERUN_TIMEOUT_SOURCE}. Not a stall — the ceiling was reached. No merge."
         exit 1
       fi
     done < "$TMP/pr-runs.txt"
