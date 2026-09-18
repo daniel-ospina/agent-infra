@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning } from "./index.js";
 import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
@@ -1467,6 +1467,9 @@ function dinput(over: Partial<HeartbeatDecisionInput> & { state?: HeartbeatState
     intervalMs: INT,
     maxDispatchMs: 0,
     cutGapMs: CUT_GAP_FIXTURE,
+    // #928: explicit 0 = the dead-tool clause is inert in every pre-#928
+    // fixture (it is the default state of a child that cannot be probed).
+    cpuStallMs: 0,
     ...over,
   };
 }
@@ -2909,13 +2912,19 @@ test("full-format round-trip: every child formatter parses through the parent pa
   ok(st.everSawRealActivity, "formatToolStart latches through the parent parser");
   equal(parseHeartbeatLine(childHb.formatTurnStart(N, 3), st, 3, N), true);
   ok(st.turnActive);
-  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, toolUpdates: true, sawMsg: true, sawTool: false }), st, 4, N), true);
+  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, toolUpdates: true, cpuMs: 65_000, cpuStallMs: 1_500, cpuAdvanced: true, sawMsg: true, sawTool: false }), st, 4, N), true);
   equal(st.toolsInFlight, 1);
   equal(st.turnActive, true);
   equal(st.streamAgeMs, 4242);
   equal(st.toolAgeMaxMs, 2424);
   // #783 §6.6: the output-liveness latch crosses the wire (gates tool-silence).
   equal(st.toolUpdates, true, "tool_updates=1 parses into the state latch");
+  // #928: the CPU-liveness triple crosses the wire too (gates tool-dead). A
+  // MISSING field here would leave all three at 0/false — which is the fail-safe
+  // direction, so only the round-trip pins that the wire actually carries them.
+  equal(st.toolCpuMs, 65_000, "cpu_ms parses into the state latch");
+  equal(st.toolCpuStallMs, 1_500, "cpu_stall_ms parses into the state latch");
+  equal(st.toolCpuAdvanced, true, "cpu_advanced parses into the state latch");
   equal(st.turnSawMessage, true);
   equal(st.turnSawTool, false);
   equal(parseHeartbeatLine(childHb.formatToolEnd(N, "call-1"), st, 5, N), true);
@@ -2929,6 +2938,1023 @@ test("full-format round-trip: every child formatter parses through the parent pa
   // #191: session_end completion marker round-trips with the nonce and latches
   equal(parseHeartbeatLine(childHb.formatSessionEnd(N), st, 7, N), true);
   ok(st.sessionEnded, "session_end latches sessionEnded through the parent parser");
+});
+
+section("#928 — silent-tool CPU liveness: the child's sample → the parent's tool-dead clause");
+
+// The defect this section pins (#928). A silent in-flight tool keeps
+// `tool_updates=0`, so the PRIMARY tool-silence clause can never fire on it —
+// the toolUpdates gate is UNIVERSAL and is not weakened by this change. That
+// left the multi-hour age backstop as its only bound. The populations a bound
+// must separate are timing-IDENTICAL from the parent's view (a healthy nested
+// `task` and a wedged `grep` are both toolsInFlight=1, both never emitted an
+// update, both on the same stream_age_ms curve), so the fix is a NEW INPUT —
+// process liveness — not a new bound.
+//
+// ⚠️ THE NEGATIVE CASE IS REQUIRED, NOT OPTIONAL. Any test of the form "a
+// parent with a tool in flight whose last output was N minutes ago trips a
+// bound at N" is ALSO passed by a fix that false-kills a nested task — the
+// exact regression the toolUpdates gate exists to prevent. Every positive bound
+// test below is therefore paired with its negative twin, and the twins read the
+// state the CHILD actually produces (driven through the real parser), so they
+// cannot be satisfied by leaving a field unset.
+
+const C = 600_000; // #928 CPU-stall bound used by the fixtures below (a fixed
+//        fixture value, deliberately NOT read from the env: the clause tests are
+//        about the RULE, so they pass C explicitly. The SHIPPED default is
+//        pinned separately — see the `DEFAULT_CPU_STALL_MS` assertion at the end
+//        of the tool-dead block — because a silent drift of the default is the
+//        one change no clause fixture can catch.
+const NONCE928 = "nonce928";
+
+/** The decision-input shape shared by the positive twin and its negative twins:
+ * one silent in-flight tool, silent for longer than S, in a fresh-marker
+ * session. `over` is the ONLY thing that varies between the twins. */
+function silentToolState(over: Partial<HeartbeatState> = {}): HeartbeatState {
+  const st = createHeartbeatState();
+  st.toolsInFlight = 1;
+  st.toolUpdates = false;      // never emitted an update — clause 1 cannot fire
+  st.turnActive = true;
+  st.everSawRealActivity = true;
+  st.everSawTool = true;
+  st.streamAgeMs = S + 60_000; // silent past the tool-silence window
+  st.toolAgeMaxMs = S + 60_000;// in flight past the tool-silence window
+  st.toolCpuAdvanced = true;   // demonstrated CPU work — required for flat-CPU evidence
+  st.lastMarkerAt = 1_000_000;
+  return Object.assign(st, over);
+}
+
+/** The parent's `now`, one tick past the fixture's last marker, so
+ * `stateFresh` holds (markerAge ≤ max(2T, 2×interval)). */
+const NOW_928 = 1_000_000 + INT;
+
+// ── Child half: the probe helpers and the tick field ──────────────────
+
+test("#928 parsePsCpuTimeMs — macOS M:SS.ss (minutes unclamped) / H:MM:SS + Linux [[DD-]hh:]mm:ss", () => {
+  const p = childHb.parsePsCpuTimeMs;
+  equal(p("0:00.00"), 0, "macOS zero");
+  equal(p("0:04.20"), 4_200, "macOS hundredths");
+  // The macOS minutes field is NOT clamped to 60 — this is the shape the #928
+  // incident's 69m50s grep would actually have produced.
+  equal(p("337:23.88"), (337 * 60 + 23.88) * 1000, "macOS long minutes (337:23.88)");
+  equal(p("69:50.00"), (69 * 60 + 50) * 1000, "macOS 69m50s — the incident's CPU sample");
+  equal(p("1:02:03"), 3_723_000, "HH:MM:SS");
+  equal(p("03:04"), 184_000, "procps mm:ss");
+  equal(p("1-02:03:04"), (86_400 + 2 * 3_600 + 3 * 60 + 4) * 1000, "procps DD-hh:mm:ss");
+  equal(p("-"), null, "an unset cell is NOT zero CPU — it is not-probed");
+  equal(p(""), null, "empty is not-probed");
+  equal(p("   "), null, "blank is not-probed");
+  equal(p("n/a"), null, "garbage is not-probed");
+  equal(p("1:2:3:4"), null, "too many fields is not-probed");
+  // A LEADING dash is a negative value, not the procps `DD-` separator: without
+  // the explicit guard `-1:00` parses as 0 days + 1 min (cycle-1 finding F4).
+  equal(p("-1:00"), null, "a negative CPU time is not-probed, not 60s");
+  equal(p("-1-02:03:04"), null, "a negative day-prefixed time is not-probed");
+});
+
+test("#928 sumDescendantCpuMs — the TOOL's own process group is summed; the root and its non-tool children are not", () => {
+  // Columns are `ps -axo pid=,ppid=,pgid=,time=`. Two filters, both
+  // load-bearing and both pinned here:
+  //   · 900 is the child pi (the root) and must NOT be counted — its own CPU
+  //     advances on every tick (it is running the probe), so counting it would
+  //     mask a dead tool permanently.
+  //   · 150 is an MCP server: a NON-detached child of pi, so it shares pi's pgid
+  //     (900). A background MCP server accruing even a millisecond per tick
+  //     would otherwise advance the sample forever and the detector would never
+  //     fire. Only the tool's DETACHED tree (pi spawns the bash shell
+  //     `detached: true`) is evidence.
+  const ps = [
+    "  1     0     0 337:23.88",
+    " 900   800   900  9:00.00",  // root (child pi) — excluded by pid
+    " 150   900   900  0:03.00",  // MCP server — same pgid as root → excluded
+    " 100   900  9100  0:01.00",  // the bash tool's shell — DETACHED (own pgid)
+    " 101   900  9100  0:02.00",  // a second detached direct child, same group
+    " 102   100  9100  0:00.50",  // the tool's grandchild — inherits the group
+    " 200   101  9100  4:00.00",  // the tool's great-grandchild — depth is not truncated
+  ].join("\n");
+  const t = sumDesc(ps, 900);
+  equal(
+    t?.cpuMs,
+    1_000 + 2_000 + 500 + 240_000,
+    "the tool's whole detached tree (shell + grandchildren + great-grandchildren), root and MCP server excluded",
+  );
+  equal(t?.pgids.length, 1, "ONE detached group → the measurement is attributable to a single tool tree");
+  // ⚠️ ATTRIBUTION. Two detached groups means the snapshot cannot be pinned on
+  // one tool: `tortoise-capture`'s `python3` and a nested `task`/`subagent` child
+  // are detached too, so an in-flight `bash` would be credited with THEIR CPU and
+  // `cpu_advanced` would arm for a tool that never burned a cycle of its own. The
+  // tree count is what lets the caller refuse to sample; without it this fixture
+  // would report a perfectly plausible — and completely wrong — number.
+  const twoTrees = [...ps.split("\n"), " 300   900  9101  7:00.00"].join("\n");
+  equal(sumDesc(twoTrees, 900)?.pgids.length, 2, "a concurrent detached helper (capture python, nested task) is a SECOND group");
+  equal(
+    sumDesc(twoTrees, 900)?.cpuMs,
+    1_000 + 2_000 + 500 + 240_000 + 420_000,
+    "…and it IS summed by this pure function — refusing the unattributable snapshot is the CALLER's job, tested at the emitter",
+  );
+  // A same-group descendant does NOT count as a second tree: the bash shell and
+  // its own children share one pgid, so the ordinary case stays attributable.
+  equal(sumDesc(ps, 900)?.pgids.length, 1, "the shell, its children and grandchildren are ONE group");
+  equal(sumDesc(ps, 1), null, "a root with no descendants is NOT zero CPU — it is not-probed");
+  equal(sumDesc(ps, 4242), null, "a root absent from the snapshot → its pgid is unknown → not-probed");
+  equal(sumDesc("", 900), null, "an empty ps snapshot is not-probed");
+  equal(sumDesc("  abc    def  ghi", 900), null, "unparseable rows are skipped, not counted as 0");
+  // Only a same-pgid child → nothing to measure → not-probed (never 0).
+  const onlyMcp = [" 900   800   900  9:00.00", " 150   900   900  0:03.00"].join("\n");
+  equal(sumDesc(onlyMcp, 900), null, "a non-detached child alone is not tool evidence");
+});
+
+/** `ps -axo pid=,ppid=,pgid=,time=` is one process per line; the emitter's parser is
+ * the unit under test, so the fixture is literal ps output rather than a spawn. */
+function sumDesc(psOutput: string, rootPid: number): { cpuMs: number; pgids: number[] } | null {
+  return childHb.sumDescendantCpuMs(psOutput, rootPid);
+}
+
+testAsync("#928 probeToolTreeCpu (INTEGRATION, real processes) — the detached tool tree is counted; a non-detached sibling is invisible", async () => {
+  // The premise of the whole fix, verified against real processes rather than a
+  // fixture: pi spawns the `bash` shell `detached: true` (its own process
+  // group), so a real DETACHED child must be measured while a NON-detached
+  // sibling — the shape of an MCP server — must contribute nothing. Fails if
+  // the pgid filter is dropped (the ambient-CPU-masks-a-dead-tool hole) or if
+  // the root-exclusion is dropped.
+  //
+  // Assertions are POLL-with-deadline, not fixed-sleep margins: a starved burner
+  // on a loaded runner must not be able to flake this, and a margin assertion
+  // would pass for the wrong reason under load.
+  const sharedGroupBurner = spawn(process.execPath, ["-e", "const t=Date.now();while(Date.now()-t<20000){}"], {
+    detached: false,
+    stdio: "ignore",
+  });
+  let detachedBurner: ReturnType<typeof spawn> | undefined;
+  let detachedIdle: ReturnType<typeof spawn> | undefined;
+  const deadline = Date.now() + 8_000;
+  const spawned: Array<ReturnType<typeof spawn>> = [sharedGroupBurner];
+  try {
+    ok(sharedGroupBurner.pid !== undefined, "the non-detached burner was spawned (group membership is real, not simulated)");
+    // PHASE 1 — ONLY a shared-group burner exists, and it burns HARD. The probe
+    // must not be able to see it: it shares our pgid, so there is no tool tree
+    // to measure and the answer is `null` (not-probed), never a number. This is
+    // what stops a background MCP server's CPU from advancing the sample
+    // forever and hiding a genuinely deadlocked tool.
+    await sleep(400);
+    equal(
+      childHb.probeToolTreeCpu(),
+      null,
+      "a NON-detached sibling is invisible to the probe even while burning CPU — no tool tree, so not-probed",
+    );
+    // PHASE 2 — now add the DETACHED tree (the shape pi's `bash` tool really
+    // has). It must come into view and ADVANCE. Poll to a deadline rather than
+    // sleeping a fixed window: a load-starved burner must not flake this.
+    detachedBurner = spawn(process.execPath, ["-e", "const t=Date.now();while(Date.now()-t<20000){}"], { detached: true, stdio: "ignore" });
+    detachedIdle = spawn(process.execPath, ["-e", "setTimeout(()=>{}, 20000)"], { detached: true, stdio: "ignore" });
+    spawned.push(detachedBurner, detachedIdle);
+    ok(detachedBurner.pid !== undefined && detachedIdle.pid !== undefined, "the detached tree was spawned");
+    let first: { cpuMs: number; pgids: number[] } | null = null;
+    let advanced: { cpuMs: number; pgids: number[] } | null = null;
+    while (Date.now() < deadline && advanced === null) {
+      const s = childHb.probeToolTreeCpu();
+      if (s !== null) {
+        if (first === null) first = s;
+        else if (s.cpuMs > first.cpuMs) advanced = s;
+      }
+      if (advanced === null) await sleep(200);
+    }
+    ok(first !== null, "a DETACHED child brings the tool tree into view");
+    ok(advanced !== null, `the detached tree's CPU ADVANCES (${first?.cpuMs} → ${advanced?.cpuMs}) — this is the signal the fix reads`);
+    // ⚠️ The twin burners are BOTH `detached: true`, so they form TWO groups and
+    // the real probe must SAY SO. This is the attribution guard measured against
+    // real processes: a caller that ignored the group list would read the union
+    // of a tool and a concurrent nested `task` as one tool's CPU. The tree count
+    // is why the child can refuse that snapshot.
+    equal(first?.pgids.length, 2, "two detached burners are two groups — the probe reports the ambiguity rather than hiding it");
+    // The shared-group burner is STILL burning: the advance above is therefore
+    // attributable to the detached tree alone, not to it.
+    equal(
+      childHb.probeToolTreeCpu(999_999),
+      null,
+      "an unknown root pid → not-probed, never a wrong sum",
+    );
+  } finally {
+    for (const p of spawned) {
+      try { treeKill(p.pid ?? 0, "SIGKILL"); } catch { /* already gone */ }
+    }
+  }
+});
+
+testAsync("#928 child tick — `bash` is probed, an eligible tool RE-ARMS the evidence, and a nested `task` NEVER is", async () => {
+  // The wire half of the fix, driven through the REAL emitter. The probe is
+  // injected so the test pins the child's OWN logic (allowlist, advancement,
+  // eligibility re-arm) without spawning `ps`.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  let sample: { cpuMs: number; pgids: number[] } | null = { cpuMs: 5_000, pgids: [4242] }; // scripted: rises to 9_000 between tick 1 and tick 2
+  let tickCount = 0;
+  /** Wait for the next tick bearing the CPU fields, with a deadline — never a
+   * fixed sleep, which would flake under load. The target count is captured
+   * BEFORE the caller mutates state, so a tick emitted between the mutation and
+   * this call can never be returned as "the next" one (which would read the
+   * pre-change fields and make the assertion below pass for the wrong reason). */
+  const nextTick = async (): Promise<string> => {
+    const want = tickCount + 1;
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const found = lines.filter((l) => l.includes("tick") && l.includes("cpu_ms=")).length;
+      if (found >= want) {
+        tickCount = found;
+        return lines.filter((l) => l.includes("tick") && l.includes("cpu_ms=")).pop() ?? "";
+      }
+      await sleep(100);
+    }
+    throw new Error(`no tick #${want} within the deadline`);
+  };
+  try {
+    childHb.setCpuProbeOverride(() => sample);
+    await withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: NONCE928 }, async () => {
+      childFactory(api);
+      await handlers.session_start({} as any);
+      await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+      // (a) AN ELIGIBLE TOOL — `bash`. The first sample is only a baseline.
+      await handlers.tool_execution_start({ toolCallId: "c-bash-1", toolName: "bash", args: {} });
+      const tick1 = await nextTick();
+      ok(tick1.includes("cpu_ms=5000"), `an eligible tool reports its measured subtree CPU: ${tick1}`);
+      ok(tick1.includes("cpu_stall_ms=0"), `the baseline starts the stall clock at 0: ${tick1}`);
+      ok(tick1.includes("cpu_advanced=0"), `one sample proves nothing — the evidence latch is closed: ${tick1}`);
+      // (b) A SECOND ELIGIBLE TOOL starts while the first is STILL IN FLIGHT,
+      // and the probe RISES. The rise is real CPU work, but it belongs to a
+      // round that has not demonstrated anything of its own — so the latch must
+      // still be closed. The OVERLAP is what makes this assertion load-bearing:
+      // an end-then-start swap would also be reset by the set-is-empty branch,
+      // but here the set never empties, so only the eligibility branch can
+      // re-arm it. Without that re-arm the parent reads `cpu_advanced=1` from
+      // another tool's work and admits this fresh tool's later flat CPU as
+      // deadlock evidence.
+      sample = { cpuMs: 9_000, pgids: [4242] };
+      await handlers.tool_execution_start({ toolCallId: "c-bash-2", toolName: "bash", args: {} });
+      await handlers.tool_execution_end({ toolCallId: "c-bash-1", toolName: "bash", result: {}, isError: false });
+      const tick2 = await nextTick();
+      ok(tick2.includes("cpu_ms=9000"), `the probe's rise is reported: ${tick2}`);
+      ok(tick2.includes("cpu_advanced=0"), `a FRESH eligible round earns its own evidence — it does not inherit the rise: ${tick2}`);
+      ok(tick2.includes("cpu_stall_ms=0"), `nor a stall age: ${tick2}`);
+      // (c) AN INELIGIBLE TOOL — a nested `task`, the exact false-kill class.
+      await handlers.tool_execution_end({ toolCallId: "c-bash-2", toolName: "bash", result: {}, isError: false });
+      await handlers.tool_execution_start({ toolCallId: "c-task", toolName: "task", args: {} });
+      const tick3 = await nextTick();
+      ok(tick3.includes("tools=1"), `fixture check: the task is in flight: ${tick3}`);
+      ok(
+        tick3.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"),
+        `a nested task is NEVER probed — every field reads not-probed, so the parent's clause is doubly inert: ${tick3}`,
+      );
+      await handlers.session_shutdown({} as any);
+    });
+  } finally {
+    childHb.setCpuProbeOverride(null);
+    console.error = origErr;
+    // The emitter's tick timer is unref'd but still fires; clear it on the
+    // FAILURE path too, or a failed assertion leaves an interval writing into a
+    // captured console.error for the rest of the suite. session_shutdown is
+    // idempotent (the timer handle is nulled on first call).
+    try { await handlers.session_shutdown({} as any); } catch { /* not started */ }
+  }
+});
+
+testAsync("#928 child tick NEGATIVE TWIN 3 (mandatory) — the tool's OWN group disappearing is refused, so a foreign group's CPU can never be credited to it", async () => {
+  // The cycle-3 F1 finding, pinned. The `bash` shell EXITS but pi has not yet
+  // emitted `tool_execution_end` (it waits for the stdout/stderr pipes, and
+  // re-arms a 100 ms idle timer on every chunk). If a foreign detached group —
+  // a nested `task`, a `tortoise-capture` helper — is what remains, the tree
+  // COUNT is still 1, so a count-based guard admits the snapshot and credits the
+  // FOREIGN group's CPU to a tool whose own process is already gone. The
+  // identity pin refuses it: the round is about a specific group, and that group
+  // is no longer there.
+  //
+  // The window is short and could not be turned into a kill in practice, but it
+  // is a literal violation of the class-(f) invariant, and the pin closes it
+  // exactly rather than approximately.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  let sample: { cpuMs: number; pgids: number[] } | null = { cpuMs: 1_000, pgids: [4242] };
+  let tickCount = 0;
+  const nextTick = async (): Promise<string> => {
+    const want = tickCount + 1;
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const found = lines.filter((l) => l.includes("tick") && l.includes("cpu_ms=")).length;
+      if (found >= want) {
+        tickCount = found;
+        return lines.filter((l) => l.includes("tick") && l.includes("cpu_ms=")).pop() ?? "";
+      }
+      await sleep(100);
+    }
+    throw new Error(`no tick #${want} within the deadline`);
+  };
+  try {
+    childHb.setCpuProbeOverride(() => sample);
+    await withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: NONCE928 }, async () => {
+      childFactory(api);
+      await handlers.session_start({} as any);
+      await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+      await handlers.tool_execution_start({ toolCallId: "c-bash-1", toolName: "bash", args: {} });
+      // (a) The tool's own group is pinned. Control: without a working pin the
+      // refusals below would be indistinguishable from an inert fixture.
+      const t1 = await nextTick();
+      ok(t1.includes("cpu_ms=1000"), `control: the tool's group is measured: ${t1}`);
+      // (b) The SAME group keeps advancing — normal, must stay admitted.
+      sample = { cpuMs: 2_000, pgids: [4242] };
+      const t2 = await nextTick();
+      ok(t2.includes("cpu_ms=2000"), `the pinned group advancing is admitted: ${t2}`);
+      ok(t2.includes("cpu_advanced=1"), `…and it latches demonstrated work: ${t2}`);
+      // (b2) TWO detached groups in one snapshot — unattributable by count. The
+      // refusal must ALSO not drop the pin: if it did, the very next
+      // single-group snapshot would re-pin to whatever is visible and adopt the
+      // foreign group. (Cycle-2 finding A: at this site `clearCpuEvidence` keeps
+      // the pin while `resetCpuLiveness` drops it — a mutation swapping them
+      // survives the whole suite unless these two steps are asserted.)
+      sample = { cpuMs: 3_000_000, pgids: [4242, 7777] };
+      const t2b = await nextTick();
+      ok(t2b.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"), `two groups are unattributable — the union is refused: ${t2b}`);
+      sample = { cpuMs: 4_000_000, pgids: [7777] };
+      const t2c = await nextTick();
+      ok(
+        t2c.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"),
+        `the pin SURVIVES the unattributable tick — a lone foreign group cannot re-pin: ${t2c}`,
+      );
+      // (c) THE TOOL'S SHELL EXITS. A foreign group is now the only detached
+      // descendant and it is burning HARD. Count is still 1 — a count-based
+      // guard would read this as the tool working, and the rise would keep
+      // `cpu_stall_ms` at 0 while the foreign group keeps burning.
+      sample = { cpuMs: 5_000_000, pgids: [7777] };
+      const t3 = await nextTick();
+      ok(
+        t3.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"),
+        `a DIFFERENT group is not this tool — the snapshot is refused, not credited: ${t3}`,
+      );
+      // (d) …and the refusal is sticky for the round: a further foreign rise
+      // must not sneak back in through a re-pin.
+      sample = { cpuMs: 9_000_000, pgids: [7777] };
+      const t4 = await nextTick();
+      ok(
+        t4.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"),
+        `the refusal does not re-pin to whatever appears next: ${t4}`,
+      );
+      // (e) A NOT-PROBED tick (a failed `ps`, a timeout) must not drop the pin
+      // either — the round has not changed, so the group the round is about is
+      // still the one to insist on. Otherwise the very next tick re-pins to
+      // whatever is visible and adopts the foreign group the pin exists to
+      // refuse. (Mutation M20.)
+      sample = null;
+      const t5 = await nextTick();
+      ok(t5.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"), `a failed probe is not-probed: ${t5}`);
+      sample = { cpuMs: 12_000_000, pgids: [7777] };
+      const t6 = await nextTick();
+      ok(
+        t6.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"),
+        `after a failed probe the round STILL refuses the foreign group — the pin survives an unmeasurable tick: ${t6}`,
+      );
+      // (f) A NEW round legitimately pins a new group: end the tool and start a
+      // fresh one. Its own evidence must be usable — the pin is per round, not
+      // permanent, or the clause could never recover.
+      await handlers.tool_execution_end({ toolCallId: "c-bash-1", toolName: "bash", result: {}, isError: false });
+      sample = { cpuMs: 50, pgids: [7777] };
+      await handlers.tool_execution_start({ toolCallId: "c-bash-2", toolName: "bash", args: {} });
+      const t7 = await nextTick();
+      ok(t7.includes("cpu_ms=50"), `a fresh round re-pins and measures again (the pin is per round, not permanent): ${t7}`);
+      await handlers.session_shutdown({} as any);
+    });
+  } finally {
+    childHb.setCpuProbeOverride(null);
+    console.error = origErr;
+    try { await handlers.session_shutdown({} as any); } catch { /* not started */ }
+  }
+});
+
+testAsync("#928 child tick NEGATIVE — a failed/absent probe reports not-probed (cpu_stall_ms=0) AND CLEARS the latch, never a stall", async () => {
+  // Absence of evidence must never arm a kill. A `ps` that is missing, times
+  // out, or returns nothing leaves the parent with NO CPU signal — which is
+  // exactly the state that must keep the clause off.
+  //
+  // Cycle-1 adversarial review, finding F2: the ORIGINAL form of this test only
+  // ever fed a null sample, so it asserted a state the child reaches with the
+  // latch already closed — and a mutation replacing the null branch's
+  // `stepCpuLiveness(..., null, ...)` with the bare `notProbed` const (which
+  // does NOT re-base) survived the whole suite. The test now ARMS the latch
+  // first (a real rise), THEN fails the probe, and asserts the tick reports
+  // `cpu_advanced=0`: under the mutation the latch stays open and this fails.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  let sample: { cpuMs: number; pgids: number[] } | null = { cpuMs: 5_000, pgids: [4242] };
+  let tickCount = 0;
+  const nextTick = async (): Promise<string> => {
+    const want = tickCount + 1;
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const found = lines.filter((l) => l.includes("tick") && l.includes("cpu_ms=")).length;
+      if (found >= want) {
+        tickCount = found;
+        return lines.filter((l) => l.includes("tick") && l.includes("cpu_ms=")).pop() ?? "";
+      }
+      await sleep(100);
+    }
+    throw new Error(`no tick #${want} within the deadline`);
+  };
+  try {
+    childHb.setCpuProbeOverride(() => sample);
+    await withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: NONCE928 }, async () => {
+      childFactory(api);
+      await handlers.session_start({} as any);
+      await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+      await handlers.tool_execution_start({ toolCallId: "c-bash", toolName: "bash", args: {} });
+      const t1 = await nextTick();
+      ok(t1.includes("cpu_advanced=0"), `the baseline sample does not arm the latch: ${t1}`);
+      // ARM it with a strict rise — the state a real working tool reaches.
+      sample = { cpuMs: 9_000, pgids: [4242] };
+      const t2 = await nextTick();
+      ok(t2.includes("cpu_advanced=1"), `a strict rise arms the latch: ${t2}`);
+      // NOW the probe fails. The evidence must be CLEARED, not merely
+      // not-refreshed — `notProbed` alone would leave the armed latch behind.
+      sample = null;
+      const t3 = await nextTick();
+      ok(t3.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"), `probe failure reads not-probed AND clears the latch: ${t3}`);
+      // The DECISIVE step (this is what distinguishes a real re-base from
+      // returning a constant): the probe recovers on the NEXT tick, and the
+      // recovery sample is HIGHER than the pre-gap baseline. A re-basing null
+      // branch restarts the baseline and keeps the latch closed, so the FIRST
+      // post-gap sample is only ever a baseline — on a rise just as on a flat
+      // value — and reports `cpu_advanced=0` with `cpu_stall_ms=0`. The mutation
+      // that returns the `notProbed` const instead of calling
+      // `stepCpuLiveness(..., null, ...)` keeps `advanced=true` and the old
+      // `lastAdvanceAt`, so this rising sample reads as a strict rise and reports
+      // `cpu_advanced=1` — evidence the parent never measured. Verified: this
+      // assertion FAILS under that mutation. (Cycle-2 finding C: a RISING
+      // recovery is asserted, not only a flat one, so a refactor that armed on
+      // the first post-gap sample is caught in either shape.)
+      sample = { cpuMs: 20_000, pgids: [4242] };
+      const t4 = await nextTick();
+      ok(
+        t4.includes("cpu_ms=20000 cpu_stall_ms=0 cpu_advanced=0"),
+        `a recovered probe re-bases — the first post-gap sample is a baseline even on a rise: ${t4}`,
+      );
+      // …and the re-base does not permanently disarm: a strict rise AFTER the
+      // recovery baseline latches again, so the clause can still fire on a tool
+      // that wedges later in the same round.
+      sample = { cpuMs: 30_000, pgids: [4242] };
+      const t5 = await nextTick();
+      ok(
+        t5.includes("cpu_ms=30000") && t5.includes("cpu_stall_ms=0") && t5.includes("cpu_advanced=1"),
+        `a rise after the re-base latches normally — the re-base is not a disarm: ${t5}`,
+      );
+      await handlers.session_shutdown({} as any);
+    });
+  } finally {
+    childHb.setCpuProbeOverride(null);
+    console.error = origErr;
+    try { await handlers.session_shutdown({} as any); } catch { /* not started */ }
+  }
+});
+
+testAsync("#928 child tick NEGATIVE TWIN (mandatory) — a non-attributable measurement is NOT admitted, so a nested `task` can never borrow a `bash` round's CPU", async () => {
+  // The cycle-2 P1, pinned as a twin. The probe reports a HARD-RISING sample
+  // while an eligible `bash` is in flight — the exact input the positive test
+  // above treats as "the tool is working". Here the rise belongs to a
+  // concurrent detached helper (a nested `task`, or `tortoise-capture`'s
+  // `python3`), and the child must refuse it. Two independent refusals are
+  // pinned, so neither alone can be silently removed:
+  //   · more than one detached group — `pgids.length !== 1`;
+  //   · a second tool in flight — the union cannot be pinned on one tool.
+  // Both must leave EVERY field at not-probed. A caller that sampled anyway
+  // would arm `cpu_advanced` for a `bash` that never burned a cycle, and the
+  // parent would later fire `tool-dead` on an I/O-bound tool — the precise
+  // "never kill a legitimate tool" guarantee the whole item rests on.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  let sample: { cpuMs: number; pgids: number[] } | null = { cpuMs: 1_000, pgids: [4242] };
+  let tickCount = 0;
+  const nextTick = async (): Promise<string> => {
+    const want = tickCount + 1;
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const found = lines.filter((l) => l.includes("tick") && l.includes("cpu_ms=")).length;
+      if (found >= want) {
+        tickCount = found;
+        return lines.filter((l) => l.includes("tick") && l.includes("cpu_ms=")).pop() ?? "";
+      }
+      await sleep(100);
+    }
+    throw new Error(`no tick #${want} within the deadline`);
+  };
+  try {
+    childHb.setCpuProbeOverride(() => sample);
+    await withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: NONCE928 }, async () => {
+      childFactory(api);
+      await handlers.session_start({} as any);
+      await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+      // (a) ATTRIBUTABLE baseline: one eligible tool, one detached group. The
+      // control — without it the refusals below could pass on an inert fixture.
+      await handlers.tool_execution_start({ toolCallId: "c-bash-1", toolName: "bash", args: {} });
+      const t1 = await nextTick();
+      ok(t1.includes("cpu_ms=1000"), `control: an attributable sample IS reported: ${t1}`);
+      // (b) REFUSAL 1 — the probe now sees TWO detached groups (a concurrent
+      // nested `task` / capture helper) while the eligible `bash` is unchanged.
+      sample = { cpuMs: 900_000, pgids: [7777, 5000] };
+      const t2 = await nextTick();
+      ok(
+        t2.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"),
+        `an unattributable multi-tree snapshot is refused outright — not even reported as a number: ${t2}`,
+      );
+      // (c) The helper exits; the sample is attributable again but HIGHER than
+      // the pre-refusal baseline. The refusal must have cleared the baseline:
+      // a rise measured across a gap where the signal was UNKNOWN is not
+      // progress, and admitting it would arm the latch on evidence the child
+      // itself declined to collect. (Mutation M5b — leaving the internal state
+      // untouched on the refusal path — survives every assertion that only
+      // re-samples at a LOWER value, so this one deliberately rises.)
+      sample = { cpuMs: 400_000, pgids: [4242] };
+      const t3 = await nextTick();
+      ok(t3.includes("cpu_ms=400000"), `normal service resumes after the helper exits: ${t3}`);
+      ok(t3.includes("cpu_advanced=0"), `a rise measured across the refused gap is NOT admitted as proof of progress: ${t3}`);
+      ok(t3.includes("cpu_stall_ms=0"), `…and it re-bases the clock rather than extending it: ${t3}`);
+      // (d) REFUSAL 2 — a second tool (ineligible `task`) joins the SAME
+      // eligible `bash`, one detached group, rising CPU. The union cannot be
+      // pinned on the bash, so the sample must be refused even though there is one group.
+      await handlers.tool_execution_start({ toolCallId: "c-task", toolName: "task", args: {} });
+      sample = { cpuMs: 5_000_000, pgids: [4242] };
+      const t4 = await nextTick();
+      ok(t4.includes("tools=2"), `fixture check: two tools are in flight: ${t4}`);
+      ok(
+        t4.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"),
+        `a second in-flight tool makes the union unattributable → not-probed, however it rose: ${t4}`,
+      );
+      // (e) THE FIRST SAMPLE OF A ROUND SPANS TWO GROUPS. This is the only place
+      // the multi-group guard is load-bearing on its own: once a round is
+      // pinned, the pin comparison subsumes it, so dropping the guard would
+      // still look correct here — but at the FIRST sample there is nothing to
+      // compare against, and an unguarded round would PIN one of the two groups
+      // and then look internally consistent for the rest of its life. (Mutation
+      // M19.) A fresh round: end both tools, start one bash.
+      await handlers.tool_execution_end({ toolCallId: "c-bash-1", toolName: "bash", result: {}, isError: false });
+      await handlers.tool_execution_end({ toolCallId: "c-task", toolName: "task", result: {}, isError: false });
+      sample = { cpuMs: 42, pgids: [4242, 7777] };
+      await handlers.tool_execution_start({ toolCallId: "c-bash-3", toolName: "bash", args: {} });
+      const t5 = await nextTick();
+      ok(
+        t5.includes("cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0"),
+        `a round whose FIRST snapshot spans two groups is refused — nothing is pinned from it: ${t5}`,
+      );
+      await handlers.session_shutdown({} as any);
+    });
+  } finally {
+    childHb.setCpuProbeOverride(null);
+    console.error = origErr;
+    try { await handlers.session_shutdown({} as any); } catch { /* not started */ }
+  }
+});
+test("#928 loop-level wiring — the bound is actually threaded into `hbThresholds` (a one-line deletion silently disarms the clause)", () => {
+  // Mutation M-W: removing `cpuStallMs: getCpuStallMs(),` from `hbThresholds`
+  // leaves `i.cpuStallMs === undefined`, so `i.cpuStallMs > 0` is false and the
+  // clause can NEVER fire in production — the kill path is dead. NOTHING caught
+  // it: every clause fixture here passes `cpuStallMs` explicitly, and CI's
+  // typecheck self-skips because the repo has no `tsconfig.json`. So the wiring
+  // is pinned at the source level, exactly as the E14 drift guard pins the
+  // marker contract — the defect is in the composition, not in the rule.
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  ok(
+    src.includes("cpuStallMs: getCpuStallMs()"),
+    "hbThresholds must carry `cpuStallMs: getCpuStallMs()` — without it the clause is unreachable and the suite stays green",
+  );
+  // …and the value it is wired to must be a bound that can actually fire.
+  equal(getCpuStallMs(), DEFAULT_CPU_STALL_MS, "the loop threads the default bound when nothing overrides it");
+  withEnv({ TASK_CPU_STALL_MS: "0" }, () => {
+    equal(getCpuStallMs(), 0, "the loop threads the off switch through the same call — a disabled clause stays disabled end-to-end");
+  });
+  // The end-to-end consequence, using the wired value rather than a fixture
+  // constant: the clause fires (default) and does not (disabled).
+  const st = silentToolState({ toolCpuStallMs: DEFAULT_CPU_STALL_MS + 1, toolCpuAdvanced: true, lastMarkerAt: NOW_928 });
+  equal(
+    heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: st, cpuStallMs: getCpuStallMs() })).reason,
+    "tool-dead",
+    "with the wired default the dead-tool clause really fires",
+  );
+  withEnv({ TASK_CPU_STALL_MS: "0" }, () => {
+    equal(
+      heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: st, cpuStallMs: getCpuStallMs() })).kill,
+      false,
+      "…and with the wired off switch it really does not",
+    );
+  });
+});
+
+test("#928 stepCpuLiveness — the advancement rule: strict rise resets, FLAT grows, drop re-bases, null clears", () => {
+  // The whole discriminator, pinned without a timer. Mutation M1 from the
+  // adversarial review — `sample > lastSampleMs` relaxed to `>=` — makes a FLAT
+  // sample count as progress, which drives `cpu_stall_ms` to 0 forever and makes
+  // the fix INERT while every other test still passed. The FLAT assertion below
+  // is what fails under that mutant.
+  const s = childHb.newCpuLiveness();
+  // 1. First sample: establishes the baseline. Nothing is demonstrated yet.
+  const a = childHb.stepCpuLiveness(s, 5_000, 1_000);
+  equal(a.cpuMs, 5_000, "the sample is reported as-is (it is the evidence)");
+  equal(a.cpuStallMs, 0, "the clock starts at the baseline");
+  equal(a.cpuAdvanced, false, "one sample proves nothing about progress");
+  // 2. FLAT — identical sample one tick later. This is the deadlock signature.
+  const b = childHb.stepCpuLiveness(s, 5_000, 31_000);
+  equal(b.cpuStallMs, 30_000, "FLAT must grow the stall clock by the full elapsed time");
+  equal(b.cpuAdvanced, false, "a flat sample is NOT progress — this is the assertion the `>=` mutant fails");
+  // 3. RISE — CPU was consumed. Now the round has demonstrated work.
+  const c = childHb.stepCpuLiveness(s, 9_000, 61_000);
+  equal(c.cpuStallMs, 0, "a strict increase resets the stall clock");
+  equal(c.cpuAdvanced, true, "…and latches demonstrated CPU work, which admits later flat evidence");
+  // 4. DROP — a descendant exited (ps lists live processes only). Re-base
+  //    without treating the drop as progress, and without extending the stall.
+  const d = childHb.stepCpuLiveness(s, 2_000, 91_000);
+  equal(d.cpuMs, 2_000, "the dropped sample is re-based to, not ignored");
+  equal(d.cpuStallMs, 30_000, "the drop must NOT reset the clock (it is not progress)");
+  equal(d.cpuAdvanced, true, "demonstrated work survives a re-base — it was real");
+  // 5. A rise from the RE-BASED level counts (the re-base must not strand us).
+  const e = childHb.stepCpuLiveness(s, 2_500, 121_000);
+  equal(e.cpuStallMs, 0, "an increase from the re-based level clears the clock");
+  // 6. NOT PROBED clears both the baseline AND the demonstrated-work latch:
+  //    a signal that is not continuous must not be admitted on old evidence.
+  const f = childHb.stepCpuLiveness(s, null, 151_000);
+  equal(f.cpuMs, 0, "not probed reports 0, never a stale sample");
+  equal(f.cpuStallMs, 0, "not probed is NOT a stall");
+  equal(f.cpuAdvanced, false, "not probed clears the evidence — no admission across a gap");
+  // 7. resetCpuLiveness (a new eligible round) clears the evidence too.
+  childHb.stepCpuLiveness(s, 7_000, 200_000);
+  childHb.resetCpuLiveness(s);
+  const g = childHb.stepCpuLiveness(s, 7_000, 231_000);
+  equal(g.cpuAdvanced, false, "a fresh round starts with no inherited evidence");
+  equal(g.cpuStallMs, 0, "…and a fresh baseline");
+});
+
+test("#928 CPU_LIVENESS_TOOL_NAMES — the allowlist excludes `task` (and everything unlisted)", () => {
+  equal(childHb.CPU_LIVENESS_TOOL_NAMES.has("bash"), true, "`bash` is the CPU-bound, probeable kind");
+  equal(childHb.CPU_LIVENESS_TOOL_NAMES.has("task"), false, "a nested sub-agent's CPU-flat quiet is LEGITIMATE — probing it would re-create E279a2");
+  for (const t of ["read", "write", "edit", "grep", "glob", "webfetch", ""]) {
+    equal(childHb.CPU_LIVENESS_TOOL_NAMES.has(t), false, `unlisted tool \`${t}\` is never probed (a new kind cannot acquire a kill path by accident)`);
+  }
+});
+
+// ── Parent half: the clause, with its mandatory negative twin ─────────
+
+test("#928 tool-dead POSITIVE twin — a silent in-flight tool with NO CPU for C past S trips at C", () => {
+  const st = silentToolState({ toolCpuStallMs: C + 1 });
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
+  equal(d.kill, true, "a tool that is silent past S AND CPU-flat past C is deadlocked");
+  equal(d.reason, "tool-dead", "its own reason — the model is told WHICH evidence fired");
+  equal(d.resolveUndefined, false, "partial output exists → a defined result, per the sibling clauses");
+  // The boundary is strict: at exactly C the tool has not yet passed the bound.
+  equal(
+    heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: silentToolState({ toolCpuStallMs: C }), cpuStallMs: C })).kill,
+    false,
+    "boundary: exactly C does not trip (strict >)",
+  );
+});
+
+test("#928 tool-dead NEGATIVE TWIN (mandatory) — a parent awaiting a nested `task` for the same N minutes must NOT trip", () => {
+  // MANDATORY. The positive twin above is ALSO passed by a fix that false-kills
+  // a nested task — the regression the toolUpdates gate exists to prevent
+  // (E279a2). This twin differs from the positive in EXACTLY ONE input, and it
+  // is built from the wire the child really emits for a `task`: the emitter
+  // never probes a non-allowlisted tool, so `cpu_stall_ms` is 0 (not probed).
+  const taskTick = childHb.formatTick(NONCE928, {
+    tools: 1,
+    turn: true,
+    streamAgeMs: S + 60_000,
+    toolAgeMaxMs: S + 60_000,
+    toolUpdates: false, // a nested task passes _onUpdate UNUSED — silent by construction
+    cpuMs: 0,
+    cpuStallMs: 0,      // not probed — the child's allowlist excludes `task`
+    cpuAdvanced: false, // …and no demonstrated work, the second independent bar
+    sawMsg: true,
+    sawTool: true,
+  });
+  const st = createHeartbeatState();
+  equal(parseHeartbeatLine(childHb.formatReady(NONCE928), st, 1_000_000, NONCE928), true);
+  equal(parseHeartbeatLine(childHb.formatToolStart(NONCE928, "call-task", "task"), st, 1_000_000, NONCE928), true);
+  equal(parseHeartbeatLine(taskTick, st, 1_000_000, NONCE928), true);
+  equal(st.toolCpuStallMs, 0, "the child never probes `task` — the field is 0 (not probed), not a small live value");
+  equal(st.toolCpuAdvanced, false, "nor is any CPU work demonstrated for it — the clause has two independent bars, both closed");
+  equal(st.toolsInFlight, 1, "fixture check: one tool in flight, exactly as in the positive twin");
+  equal(st.toolUpdates, false, "fixture check: it has never emitted an update, exactly as in the positive twin");
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
+  equal(d.kill, false, "MANDATORY NEGATIVE CASE: a healthy nested task in flight past S must NOT be killed by the new clause");
+  equal(d.reason, undefined, "no reason at all — not even a reclassified one");
+});
+
+test("#928 tool-dead NEGATIVE — a tool that has NEVER burned CPU (a genuinely CPU-idle tool) is never killed on flat CPU", () => {
+  // Flat CPU has two causes: a deadlock, and a legitimate I/O block. The
+  // second is common and healthy. `cpu_advanced` keeps the clause off for a
+  // tool that has burned NO CPU AT ALL in its round — a `wait`, a `read`, a
+  // tool whose first tick already finds it blocked before it did any work.
+  //
+  // PRECISION (cycle-1 adversarial finding F1, from the original comment's
+  // inaccurate example): this guard protects "never burned CPU", NOT
+  // "I/O-bound by nature". A real `npm ci`/`curl`/`git fetch` burns some startup
+  // CPU (shell, libc, node, TLS) BEFORE it blocks on I/O, so it ARMS the latch
+  // and is governed by the C bound — the accepted, disclosed residual pinned by
+  // the trade-off test immediately below. This test must never be read as
+  // "downloads are safe".
+  const st = silentToolState({ toolCpuStallMs: 10 * C, toolCpuAdvanced: false });
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
+  equal(d.kill, false, "no demonstrated CPU work → flat CPU is NOT evidence of a deadlock");
+  equal(d.reason, undefined);
+});
+
+test("#928 tool-dead — ACCEPTED TRADE-OFF (pinned): a tool that DID burn CPU, then went flat past C, IS killed", () => {
+  // The design's residual, pinned as a VISIBLE calibration choice rather than a
+  // hidden behaviour. The cycle-1 adversarial reviewer composed the real probe
+  // + the real reducer + this clause and showed that a healthy `bash` which
+  // burned ~300 ms then blocked on I/O for > C composes all the way to
+  // kill("tool-dead"). That is intended: the only alternative that protects that
+  // population is to never kill on flat CPU, which reinstates the 4 h age
+  // backstop — the exact defect #928 exists to remove. C (30 min) is sized for
+  // this residual and the clause documents it. What must not change silently is
+  // THE BOUNDARY: if a future change means to protect the
+  // burned-then-blocked population it must deliberately rewrite this test.
+  const st = silentToolState({ toolCpuStallMs: C + 1, toolCpuAdvanced: true });
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
+  equal(d.kill, true, "armed latch + flat CPU past C = the disclosed residual, and it is LIVE (not inert)");
+  equal(d.reason, "tool-dead");
+});
+
+test("#928 tool-dead NEGATIVE TWIN 2 (mandatory) — a nested `task` carrying a stale flat-CPU latch must STILL not trip", () => {
+  // The LOST-tool_end transfer. A lost `tool_end` keeps `toolsInFlight` stale at
+  // >=1, so the next `tool_start` — gated on `toolsInFlight === 0` — cleared
+  // nothing, and a fresh healthy tool (a nested `task` included) was killed on
+  // the OLD tool's evidence. This drives the real parser through that exact
+  // sequence and asserts the fresh round starts with NO CPU evidence.
+  const st = createHeartbeatState();
+  st.lastMarkerAt = 1_000_000;
+  equal(parseHeartbeatLine(childHb.formatReady(NONCE928), st, 1_000_000, NONCE928), true);
+  equal(parseHeartbeatLine(childHb.formatTurnStart(NONCE928, 1), st, 1_000_000, NONCE928), true);
+  equal(parseHeartbeatLine(childHb.formatToolStart(NONCE928, "A", "bash"), st, 1_000_000, NONCE928), true);
+  // A's tick: silent past S, CPU demonstrated then flat for far past C.
+  equal(
+    parseHeartbeatLine(
+      childHb.formatTick(NONCE928, { tools: 1, turn: true, streamAgeMs: S + 60_000, toolAgeMaxMs: S + 60_000, toolUpdates: false, cpuMs: 700_000, cpuStallMs: 10 * C, cpuAdvanced: true, sawMsg: true, sawTool: true }),
+      st,
+      1_000_000,
+      NONCE928,
+    ),
+    true,
+  );
+  equal(st.toolCpuAdvanced, true, "fixture check: A's evidence is armed");
+  // A's tool_end is LOST. A fresh, healthy nested `task` B starts.
+  equal(parseHeartbeatLine(childHb.formatToolStart(NONCE928, "B", "task"), st, 1_000_001, NONCE928), true);
+  equal(st.toolCpuAdvanced, false, "a new tool must NOT inherit the previous round's demonstrated CPU work");
+  equal(st.toolCpuStallMs, 0, "nor its flat-CPU age");
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
+  equal(d.kill, false, "MANDATORY: the fresh tool is never killed on its predecessor's evidence, lost tool_end or not");
+  // Control: the SAME state with the evidence NOT cleared would have tripped —
+  // so the assertion above is about the reset, not about an inert fixture.
+  const stale = silentToolState({ toolCpuStallMs: 10 * C, toolCpuAdvanced: true, toolsInFlight: 2 });
+  equal(
+    heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: stale, cpuStallMs: C })).reason,
+    "tool-dead",
+    "positive control: had the latch survived, the clause fires — the reset is what prevents it",
+  );
+});
+
+test("#928 tool-dead NEGATIVE — an advancing CPU sample never trips the new clause, however long the tool runs", () => {
+  // The incident's own shape: the `grep` had accumulated 69m50s of CPU. It was
+  // genuinely WORKING. Alive-but-quiet must not be reclassified as dead.
+  //
+  // (a) anywhere below the age backstop: nothing kills it at all.
+  const st = silentToolState({ toolCpuStallMs: 0, toolCpuMs: 4_190_000, toolAgeMaxMs: S + 60_000 });
+  equal(
+    heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C })).kill,
+    false,
+    "CPU advancing → slow but alive → not killed by the new clause, however long it has run",
+  );
+  // (b) PAST the age backstop L the pre-existing `tool-stall` clause fires —
+  // and it is still NOT the new clause. A silent tool that is demonstrably
+  // burning CPU is never reclassified as dead; the #363/#489 age interaction
+  // is unchanged by this work. Stated here rather than hidden, because a
+  // reader could otherwise assume CPU-liveness exempts a tool from every bound.
+  const old = silentToolState({ toolCpuStallMs: 0, toolCpuMs: 4_190_000, toolAgeMaxMs: L + 1 });
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: old, cpuStallMs: C }));
+  equal(d.kill, true, "the age backstop still bounds an alive-but-old silent tool — as before this change");
+  equal(d.reason, "tool-stall", "…and it is the AGE clause, never tool-dead");
+});
+
+test("#928 tool-dead NEGATIVE — an older child that emits no cpu fields can never trip the clause", () => {
+  // Backward compatibility: a pre-#928 child's tick carries neither field, so
+  // the parser leaves both at 0/false. Fail-safe by construction — the clause
+  // is inert and the exact legacy bounds govern.
+  const st = createHeartbeatState();
+  equal(
+    parseHeartbeatLine(
+      `${HEARTBEAT_MARKER_PREFIX} tick nonce=${NONCE928} tools=1 turn=1 stream_age_ms=${S + 60_000} tool_age_max_ms=${S + 60_000} tool_updates=0 saw_msg=1 saw_tool=1`,
+      st,
+      1_000_000,
+      NONCE928,
+    ),
+    true,
+  );
+  equal(st.toolCpuStallMs, 0, "an absent field leaves the latch at 0 = not probed");
+  equal(st.toolCpuAdvanced, false, "and the evidence latch at false");
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
+  equal(d.kill, false, "no CPU evidence → the new clause cannot fire");
+});
+
+test("#928 tool-dead NEGATIVE — TASK_CPU_STALL_MS=0 disables the clause outright", () => {
+  equal(getCpuStallMs(), DEFAULT_CPU_STALL_MS, "unset → the default bound");
+  withEnv({ TASK_CPU_STALL_MS: "0" }, () => {
+    equal(getCpuStallMs(), 0, "0 is the explicit off switch (getTaskBackstopMs's literal-0 convention)");
+    const st = silentToolState({ toolCpuStallMs: 10 * C });
+    const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: getCpuStallMs() }));
+    equal(d.kill, false, "disabled → even an absurd flat-CPU age does not trip");
+  });
+  // ⚠️ A BLANK value is NOT the off switch. `TASK_CPU_STALL_MS="${UNSET}"` is a
+  // very ordinary launcher idiom and exports an empty string; reading that as
+  // "disabled" would silently un-arm the detector for someone who meant to
+  // configure it — a fail-OPEN kill switch, the worst kind. Only the literal
+  // `"0"` disables.
+  withEnv({ TASK_CPU_STALL_MS: "" }, () => {
+    equal(getCpuStallMs(), DEFAULT_CPU_STALL_MS, "a blank value is NOT the off switch — an unset var must not disarm a detector");
+  });
+  withEnv({ TASK_CPU_STALL_MS: "  " }, () => {
+    equal(getCpuStallMs(), DEFAULT_CPU_STALL_MS, "whitespace is blank too");
+  });
+  // The off switch is the VALUE being zero, not the exact spelling. An operator
+  // who wrote `0.0` or `" 0 "` meant to switch it off; silently arming it anyway
+  // is a surprise with no upside (and it fails CLOSED, so it is a foot-gun, not
+  // a hole — but there is no reason to keep it).
+  for (const sp of ["0.0", "+0", " 0 ", "0.00"]) {
+    withEnv({ TASK_CPU_STALL_MS: sp }, () => {
+      equal(getCpuStallMs(), 0, `\`${sp}\` is zero and therefore means OFF`);
+    });
+  }
+  withEnv({ TASK_CPU_STALL_MS: "-0" }, () => {
+    equal(getCpuStallMs(), 0, "negative zero is still zero");
+  });
+  withEnv({ TASK_CPU_STALL_MS: "nonsense" }, () => {
+    equal(getCpuStallMs(), DEFAULT_CPU_STALL_MS, "a typo must never read as disabled");
+  });
+  withEnv({ TASK_CPU_STALL_MS: "-1" }, () => {
+    equal(getCpuStallMs(), DEFAULT_CPU_STALL_MS, "a negative value is a typo, not an off switch");
+  });
+  withEnv({ TASK_CPU_STALL_MS: "1000" }, () => {
+    equal(getCpuStallMs(), 60_000, "a sub-60s value is clamped up (never kill between two ticks)");
+  });
+  withEnv({ TASK_CPU_STALL_MS: "1800000" }, () => {
+    equal(getCpuStallMs(), 1_800_000, "a positive value overrides");
+  });
+  // The SHIPPED default, pinned: 30 min. No clause fixture can catch a drift of
+  // this number (they all pass C explicitly), and the default IS the shipped
+  // behaviour — a bound that silently becomes 30s or 30h is a real regression
+  // that every one of them would happily keep passing through.
+  equal(DEFAULT_CPU_STALL_MS, 1_800_000, "the shipped default is 30 minutes — pinned here because no clause fixture reads it");
+  // …and it must stay inside the clamp's lower bound, or the clamp silently
+  // rewrites a deliberate default.
+  ok(DEFAULT_CPU_STALL_MS > 60_000, "the default survives the 60s clamp unchanged");
+});
+
+test("#928 tool-dead NEGATIVE — a tool that HAS streamed then stopped stays tool-silence's case", () => {
+  // The partition: clause 1 owns `tool_updates=1`, the new clause owns
+  // `tool_updates=0`. They are strict complements, so they can never disagree
+  // about the same tool — and this change cannot silently take over clause 1's
+  // population.
+  const st = silentToolState({ toolUpdates: true, toolCpuStallMs: C + 1 });
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
+  equal(d.kill, true);
+  equal(d.reason, "tool-silence", "precedence is unchanged for the streaming tool — clause 1 still owns it");
+});
+
+test("#928 tool-dead NEGATIVE — a tool that has emitted an update recently is never judged on CPU, even past S", () => {
+  // Mutation M13 — dropping `!st.toolUpdates` from the clause — left the suite
+  // GREEN, and the reason is a REAL reachable false kill, not an equivalent
+  // mutant. Clause 1 only fires when the STREAM has also been quiet past S, so a
+  // tool that is in flight past S, has demonstrated CPU, and went CPU-flat past
+  // C but STREAMED an update seconds ago satisfies clause 1's inputs NOT AT ALL
+  // (`stream_age_ms` is small) while satisfying every input of this clause. The
+  // guard is what keeps it alive; without it, a working tool that last spoke
+  // five seconds ago is reclassified as deadlocked on the strength of its CPU
+  // being flat while it waited on a child.
+  //
+  // This fixture also pins WHICH age the clause reads: `tool_age_max_ms` is past
+  // S while `stream_age_ms` is far below it, so it can only pass via the TOOL age
+  // (`effToolAge`). Swapping the clause to the stream age silently disables it —
+  // a change no other fixture here would notice.
+  const st = silentToolState({ toolUpdates: true, toolCpuStallMs: 10 * C, toolCpuAdvanced: true, toolAgeMaxMs: S + 120_000, streamAgeMs: 5_000, lastMarkerAt: NOW_928 });
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: st, cpuStallMs: C }));
+  equal(d.kill, false, "a streaming tool is NEVER deadlocked — flat CPU while it awaits a child is not evidence");
+  equal(d.reason, undefined, "and not reclassified either: clause 1 is the only clause that judges a streaming tool");
+  // Control: the SAME state with the tool having gone stream-quiet past S IS
+  // clause 1's case — so the assertion above is about the partition, not about
+  // an inert fixture.
+  const both = silentToolState({ toolUpdates: true, toolCpuStallMs: 10 * C, toolCpuAdvanced: true, toolAgeMaxMs: S + 120_000, streamAgeMs: S + 1, lastMarkerAt: NOW_928 });
+  equal(
+    heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: both, cpuStallMs: C })).reason,
+    "tool-silence",
+    "positive control: quiet stream + quiet CPU is clause 1's, never this clause's",
+  );
+});
+
+test("#928 tool-dead NEGATIVE — a STALE snapshot (markers stopped) never fires the CPU clause", () => {
+  // `stateFresh` gates every clause, and this one most of all: when the ticks
+  // stop, the frozen `cpu_stall_ms` / `cpu_advanced` describe a moment that is
+  // no longer observable. Reading them as fresh evidence would report a CPU
+  // deadlock the parent can no longer have measured — and would relabel the cut
+  // that the existing silence/threshold clause owns, silently changing the
+  // reason the model is given. Mutation M17 (dropping `stateFresh` here) is
+  // exactly that, and every other fixture in this block passes it.
+  const st = silentToolState({ toolCpuStallMs: 10 * C, toolCpuAdvanced: true });
+  st.lastMarkerAt = NOW_928 - (2 * 60_000 + 120_000 + 1); // just past the stateFresh window
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: st, cpuStallMs: C }));
+  equal(d.kill, false, "a stale snapshot is not evidence of a CPU deadlock — the clause stays inert");
+  equal(d.reason, undefined, "and the cut is NOT relabelled `tool-dead` off frozen fields nobody can still observe");
+  // Control: the SAME state with a FRESH marker does fire the CPU clause — so
+  // the assertion above is about staleness, not about an inert fixture.
+  const fresh = silentToolState({ toolCpuStallMs: 10 * C, toolCpuAdvanced: true, lastMarkerAt: NOW_928 });
+  equal(
+    heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: fresh, cpuStallMs: C })).reason,
+    "tool-dead",
+    "positive control: identical CPU state, fresh ticks → THIS clause's case. The only difference is staleness.",
+  );
+});
+
+test("#928 tool-dead NEGATIVE — a tool below the silence window is never judged on CPU", () => {
+  // A freshly-started tool can be legitimately CPU-flat for a moment (a cold
+  // spawn, an I/O block on its first read). `effToolAge > S` is what stops the
+  // clause from judging a tool whose CPU baseline has not had time to settle.
+  // `lastMarkerAt = now` pins markerAge at 0 so the assertion is about the
+  // tool's own age and not about the effective-age addend.
+  const st = silentToolState({ toolCpuStallMs: 10 * C, toolAgeMaxMs: S - 1, streamAgeMs: S - 1, lastMarkerAt: NOW_928 });
+  const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: st, cpuStallMs: C }));
+  equal(d.kill, false, "in flight for less than S → the new clause does not apply, whatever the CPU age says");
+  // The clause must key on the TOOL's age, not the stream's. This fixture makes
+  // the two diverge in the dangerous direction: the agent was stream-quiet for
+  // far past S (it spent minutes reasoning before emitting the tool call) while
+  // the tool itself is ONE SECOND old. Swapping the clause to the stream age
+  // kills this tool on its first tick — mutation M16, which every other fixture
+  // here passes.
+  const freshToolOldStream = silentToolState({ toolCpuStallMs: 10 * C, toolCpuAdvanced: true, toolAgeMaxMs: 1_000, streamAgeMs: S + 60_000, lastMarkerAt: NOW_928 });
+  equal(
+    heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: freshToolOldStream, cpuStallMs: C })).kill,
+    false,
+    "a ONE-SECOND-old tool is never judged on a long agent-level stream silence — the clause reads the tool's age",
+  );
+  // Control: the SAME state with the tool just past S does trip — so the
+  // assertion above is about the window, not about an inert fixture.
+  const past = silentToolState({ toolCpuStallMs: 10 * C, toolAgeMaxMs: S + 1, streamAgeMs: S + 1, lastMarkerAt: NOW_928 });
+  equal(
+    heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: NOW_928, state: past, cpuStallMs: C })).reason,
+    "tool-dead",
+    "positive control: one ms past the window, the same state does trip",
+  );
+});
+
+test("#928 tool-dead NEGATIVE — CPU-liveness resets at every tool/turn boundary, like its siblings", () => {
+  // A stale non-zero age inherited by a FRESH tool would kill it on its
+  // predecessor's evidence. The latch is cleared on the same edges as
+  // `tool_updates`.
+  const st = createHeartbeatState();
+  st.lastMarkerAt = 1_000_000;
+  equal(parseHeartbeatLine(`${HEARTBEAT_MARKER_PREFIX} tick nonce=${NONCE928} tools=1 turn=1 stream_age_ms=1 tool_age_max_ms=1 tool_updates=0 cpu_ms=1234 cpu_stall_ms=9999999 cpu_advanced=1 saw_msg=0 saw_tool=1`, st, 1_000_000, NONCE928), true);
+  equal(st.toolCpuStallMs, 9_999_999, "the tick carries the real age");
+  equal(st.toolCpuAdvanced, true, "the tick carries the evidence latch");
+  equal(parseHeartbeatLine(childHb.formatToolEnd(NONCE928, "call-x"), st, 1_000_001, NONCE928), true);
+  equal(st.toolCpuStallMs, 0, "no tool in flight → the pair is meaningless and must not survive");
+  equal(st.toolCpuMs, 0, "cpu_ms resets with its sibling");
+  equal(st.toolCpuAdvanced, false, "and so does the evidence latch");
+  // …and a round starting from idle resets before the new tool is counted.
+  const st2 = createHeartbeatState();
+  st2.lastMarkerAt = 1_000_000;
+  st2.toolCpuStallMs = 5_000_000;
+  st2.toolCpuMs = 42;
+  st2.toolCpuAdvanced = true;
+  equal(parseHeartbeatLine(childHb.formatToolStart(NONCE928, "call-y", "bash"), st2, 1_000_001, NONCE928), true);
+  equal(st2.toolCpuStallMs, 0, "a fresh round must not inherit the previous round's flat-CPU age");
+  equal(st2.toolCpuMs, 0);
+  equal(st2.toolCpuAdvanced, false, "nor its demonstrated-work latch");
+  // The turn boundary, same guarantee. Its siblings are asserted here too so
+  // the triple is pinned as a SET: a future field added to the reset must be
+  // added to every site, and the cheapest way to notice is for one assertion to
+  // cover all of them at each edge.
+  const st3 = createHeartbeatState();
+  st3.lastMarkerAt = 1_000_000;
+  st3.toolCpuStallMs = 5_000_000;
+  st3.toolCpuMs = 42;
+  st3.toolCpuAdvanced = true;
+  st3.toolsInFlight = 1;
+  equal(parseHeartbeatLine(childHb.formatTurnEnd(NONCE928, 1), st3, 1_000_001, NONCE928), true);
+  equal(st3.toolCpuStallMs, 0, "turn_end clears the CPU-liveness triple with its siblings");
+  equal(st3.toolCpuMs, 0, "…cpu_ms too");
+  equal(st3.toolCpuAdvanced, false, "…and the evidence latch");
+  equal(st3.streamAgeMs, 0, "sibling check: stream_age_ms clears at the same edge");
+  equal(st3.toolAgeMaxMs, 0, "sibling check: tool_age_max_ms clears at the same edge");
 });
 
 section("#176 heartbeat — child emitter (fake-pi harness)");
@@ -3561,7 +4587,9 @@ test("#1070: loop wiring — the effective gap is latched + threaded, and all fo
   // #1070 (review cycle 1): the headline must report the EFFECTIVE age too —
   // the clauses fire on effStreamAge/effToolAge, so a headline printing the raw
   // frozen sample contradicted the payload printed beside it.
-  equal(src.split("Math.round(effStreamAgeMs / 1000)").length - 1, 4, "headlines + the triage line print the EFFECTIVE stream age (3 headlines + the diagnostic)");
+  // #928: 3 → 4 age-reporting HEADLINES (the new `tool-dead` headline prints the
+  // effective stream age beside the CPU-stall age) + the diagnostic line = 5.
+  equal(src.split("Math.round(effStreamAgeMs / 1000)").length - 1, 5, "headlines + the triage line print the EFFECTIVE stream age (4 headlines + the diagnostic)");
   equal(src.split("Math.round(effToolAgeMs / 1000)").length - 1, 1, "the tool-stall headline prints the EFFECTIVE tool age");
   equal(src.split("hbCtx.state.streamAgeMs / 1000").length - 1, 0, "no headline prints the raw frozen stream age");
   equal(src.split("hbCtx.state.toolAgeMaxMs / 1000").length - 1, 0, "no headline prints the raw frozen tool age");
