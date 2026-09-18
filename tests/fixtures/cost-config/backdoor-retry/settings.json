@@ -6,7 +6,7 @@
   "httpIdleTimeoutMs": 300000,
   "compaction": {
     "enabled": true,
-    "reserveTokens": 16384,
+    "reserveTokens": 50000,
     "keepRecentTokens": 12000
   },
   "retry": {

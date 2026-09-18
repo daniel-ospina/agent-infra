@@ -1,5 +1,5 @@
 #!/bin/bash
-# check-cost-config.sh — #341 drift guard: deepseek context clamp @300K (shipped w/ #476 guard-sync).
+# check-cost-config.sh — #341 drift guard: deepseek context clamp @700K (shipped w/ #476 guard-sync; 300K→700K by #1213).
 #
 # Config-as-authority: models.json is the runtime clamp surface (pi's
 # provider-composer resolves override.contextWindow ?? model.contextWindow —
@@ -8,7 +8,7 @@
 #
 # Semantics (detect-not-block for the catalog class — a hard red on the store
 # would break auto-sync when pi's refresh legitimately reverts it):
-#   models.json    drift (any deepseek-served id > 300000)  → BLOCK (exit 1)
+#   models.json    drift (any deepseek-served id > 700000)  → BLOCK (exit 1)
 #   settings.json  drift (compaction block / settings-vs-guard
 #                  mismatch, or a DERIVED retry/hang window over
 #                  ceiling)                                  → BLOCK (exit 1)
@@ -46,7 +46,14 @@ set -uo pipefail
 # python3 previously produced a PASS on an unparsed config).
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 required (stdlib only) — present on ubuntu-latest + macOS" >&2; exit 2; }
 
-CLAMP=300000
+# #1213 (2026-09-18): 300000 → 700000. The clamp's ~4,082-token safety reserve
+# (contextWindow − estimate − 4096) was being read as session death: at
+# estimate ≥ 295,904 the turn returns stopReason=length with 1 output token and
+# the session can never reply again. A live probe reproduced that at 300000
+# (negative control: DEAD) and answered at 700000 (estimates 312,521 and
+# 690,021; the provider served 691,804 tokens in one request). §8 of
+# docs/ops/cost-config-policy.md carries the evidence + the cost delta.
+CLAMP=700000
 
 # ── retry/hang contract (#1088) — the bounded-retry window ────────────────
 # `retry.maxRetries` is an ATTEMPT budget with no wall-clock deadline in pi,
@@ -66,12 +73,20 @@ CLAMP=300000
 #                              DEFAULT_HTTP_IDLE_TIMEOUT_MS (300000,
 #                              dist/core/http-dispatcher.js) — do NOT go below
 #                              it without a measurement: it is also the ceiling
-#                              on a 300K-context prefill's time-to-first-byte.
+#                              on a 700K-context prefill's time-to-first-byte.
 #   RETRY_PROVIDER_TIMEOUT_MS  the legitimate-call ceiling (SDK total request
 #                              timeout). Must EXCEED the idle ceiling so a hung
 #                              attempt is cut by idle, not by the full budget;
-#                              must stay high enough that a 300K-context
+#                              must stay high enough that a 700K-context
 #                              compaction/summarization is not false-killed.
+#                              (#1213 residual: reserveTokens 50000 raises the
+#                              summarization OUTPUT cap to 40000 tokens; a
+#                              maximal summary could approach this 600s total
+#                              timeout. Measured summaries are ~13.6K tokens
+#                              (~3x under the cap) and an over-timeout
+#                              summarization is loud + retried + recorded by
+#                              extensions/compaction-watchdog.ts — never a
+#                              silent death. Latency measurement is filed.)
 #   RETRY_MAX_BACKOFF_MS       the patch's backoff cap (read back out of
 #                              scripts/patch-pi-retry.sh — one source of truth).
 #   HANG_WINDOW_CEILING_MS     declared bound on the no-progress window.
@@ -270,14 +285,14 @@ if not isinstance(d, dict):
 
 comp = d.get("compaction")
 if not isinstance(comp, dict):
-    issues.append("compaction.reserveTokens expected 16384, got 'missing'")
+    issues.append("compaction.reserveTokens expected 50000, got 'missing'")
     issues.append("compaction.keepRecentTokens expected 12000, got 'missing'")
     issues.append("compaction.enabled expected true, got 'missing'")
 else:
     if comp.get("enabled") is not True:
         issues.append(f"compaction.enabled expected true, got {q(comp.get('enabled'))}")
-    if comp.get("reserveTokens") != 16384:
-        issues.append(f"compaction.reserveTokens expected 16384, got {q(comp.get('reserveTokens'))}")
+    if comp.get("reserveTokens") != 50000:
+        issues.append(f"compaction.reserveTokens expected 50000, got {q(comp.get('reserveTokens'))}")
     if comp.get("keepRecentTokens") != 12000:
         issues.append(f"compaction.keepRecentTokens expected 12000, got {q(comp.get('keepRecentTokens'))}")
 
@@ -468,7 +483,7 @@ check_settings_file() {
       esac
     done <<< "$issues"
   else
-    ok "$label — compaction (enabled + 16384/12000) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
+    ok "$label — compaction (enabled + 50000/12000) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
   fi
 }
 
