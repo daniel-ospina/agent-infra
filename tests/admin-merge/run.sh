@@ -55,18 +55,22 @@
 #      never left standing over an unmerged PR (B1 lost #3754/#3755 to it).
 #  17. A DRAFT IS REFUSED EARLY: gh refuses to merge a draft and commit-workflow
 #      opens drafts, so the rail refuses before any CI work, by name.
-#  18. THE CEILING IS DERIVED PER SHARD (#1167): no global constant. The bound is
-#      a FUNCTION of the run's own observed job durations, C is the max over the
-#      NOT-completed shards (the ones a wait can land on), the FLOOR protects a
-#      sample-less shard, and ANY derivation failure is the 3900s fail-safe —
-#      never a small bound. The lane-terminal precondition names WAIT vs STALLED.
+#  18. THE RE-RUN BOUND IS DERIVED PER SHARD (#1167): no global constant. The
+#      bound is a FUNCTION of the run's own observed green job durations, C is the
+#      max over the NOT-completed shards (the ones a wait can land on), the FLOOR
+#      protects a sample-less shard, and ANY derivation failure is the 3900s
+#      fail-safe — never a small bound. (#1167 follow-on) For a REMOTE run this
+#      derived bound is the ONLY bound: `updatedAt` freezes for the whole of a
+#      single long step, so a flat "no progress" window fires on healthy long
+#      jobs — the false STALL this suite pins OUT. The lane-terminal precondition
+#      names WHICH wait it is and fabricates no stall.
 #  19. THE SAMPLE IS A GREEN POPULATION (#1167 review P1): the failing run's own
 #      truncated failure duration can never stand in for a shard's healthy
 #      duration — a shard with no completed SUCCESSFUL sample takes the fail-safe.
 #      The review's P2s: numeric timing knobs and an explicit --rerun-timeout are
 #      REFUSED when they are not positive integers; parser-only flags never reach
-#      gh; an unreadable progress clock is not a WAIT; and the gh-command seam is
-#      word-split consistently with every other call site.
+#      gh; an unreadable run is not a stall; and the gh-command seam is word-split
+#      consistently with every other call site.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -189,30 +193,40 @@ case "$key" in
       [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
       exit 0
     fi
-    # The status/updatedAt projection of the re-run wait. `status-<id>` and
-    # `updated-<id>` are consumed one line per poll and REPEAT their last line
-    # once exhausted (so an all-in_progress status models a run that never
-    # finishes, and a one-line `updated-<id>` models no progress = a stall).
+    # The run-state projection of the re-run wait. `status-<id>` is consumed one
+    # line per poll and REPEATS its last line once exhausted, so an
+    # all-in_progress status models a run that never finishes. The projection is
+    # STATUS-ONLY when the caller asks for `--json status`; a caller that asks for
+    # `--json status,updatedAt` also gets the `updated-<id>` clock, so a regression
+    # that reintroduces an updatedAt-based verdict is observable here. `updated-<id>`
+    # is frozen for the whole of a single long step, so it is NOT a progress
+    # signal for a remote run.
     # A run whose projection CANNOT be read at all (gh failure/auth/network).
     # Deliberately distinct from a run that is merely not progressing: the rail
     # must never call an unreadable run STALLED — "no progress" is a claim about
-    # a field we read, and an outage is the absence of that reading. Field
-    # evidence: frozen metadata produced a FALSE stall while the work was still
-    # running, so a metadata clock alone cannot separate running-but-quiet,
-    # dead, and wedged.
+    # a field we read, and an outage is the absence of that reading.
+    want_upd=0; uprev=""
+    for x in "$@"; do
+      if [ "$uprev" = "--json" ]; then case "$x" in *updatedAt*) want_upd=1 ;; esac; fi
+      uprev="$x"
+    done
     [ -f "$SCEN/unreadable-$id" ] && exit 1
     if [ -f "$SCEN/status-$id" ]; then
       n=$(( $(cat "$SCEN/status-count-$id" 2>/dev/null || echo 0) + 1 ))
       printf '%s' "$n" > "$SCEN/status-count-$id"
       s="$(sed -n "${n}p" "$SCEN/status-$id")"
       [ -n "$s" ] || s="$(tail -n1 "$SCEN/status-$id")"
-      u="$(sed -n "${n}p" "$SCEN/updated-$id" 2>/dev/null)"
-      [ -n "$u" ] || u="$(tail -n1 "$SCEN/updated-$id" 2>/dev/null)"
-      [ -n "$u" ] || u="2026-01-01T00:00:00Z"
-      printf '%s %s\n' "$s" "$u"
+      if [ "$want_upd" = 1 ]; then
+        u="$(sed -n "${n}p" "$SCEN/updated-$id" 2>/dev/null)"
+        [ -n "$u" ] || u="$(tail -n1 "$SCEN/updated-$id" 2>/dev/null)"
+        [ -n "$u" ] || u="2026-01-01T00:00:00Z"
+        printf '%s %s\n' "$s" "$u"
+      else
+        printf '%s\n' "$s"
+      fi
       exit 0
     fi
-    printf 'completed 2026-01-01T00:00:00Z\n'
+    printf 'completed\n'
     exit 0 ;;
   "run rerun")
     id="${3:-}"
@@ -272,6 +286,30 @@ run_admin() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
     ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
+}
+
+# ── bound-based wait fixtures (#1167 follow-on) ────────────────────────────
+# A remote run has NO within-job activity signal: `updatedAt` advances on
+# job/step transitions, so one long step freezes it for the whole job. The wait
+# therefore has ONE bound, DERIVED per shard from a green population — and the
+# tests must express a BOUND, never a progress fingerprint. These helpers write
+# that fixture. The rail derives max(FLOOR, 2 x secs) for the shard, so a test
+# sets ADMIN_MERGE_RERUN_FLOOR low when it wants a small bound.
+#
+# green_shard <green-run-id> <shard> <secs> → the GREEN population: one recent
+#   COMPLETED SUCCESSFUL job of <shard> lasting <secs>.
+# target_shard <run-id> <shard> → the terminal TARGET run whose shard SET is
+#   <shard>; its own duration is deliberately NOT the sample (green governs).
+green_shard() {
+  local gid="$1" shard="$2" secs="$3" mm ss
+  mm=$((secs / 60)); ss=$((secs % 60))
+  printf '%s\n' "$gid" > "$SCEN/green-runs"
+  printf '{"total_count":1,"jobs":[{"name":"%s","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:%02d:%02dZ"}]}\n' \
+    "$shard" "$mm" "$ss" > "$SCEN/jobs-$gid.json"
+}
+target_shard() {
+  printf '{"total_count":1,"jobs":[{"name":"%s","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:05:00Z"}]}\n' \
+    "$2" > "$SCEN/jobs-$1.json"
 }
 
 # A pytest-shaped failing-run log body in the REAL `gh run view --log-failed`
@@ -1710,7 +1748,6 @@ lane_fail mainw1 9602 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9602"
 log_passed "$LANE1" > "$SCEN/log-after-9601"
 printf 'in_progress\nin_progress\ncompleted\n' > "$SCEN/status-9601"
-printf 't1\nt2\nt3\n' > "$SCEN/updated-9601"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "(a) a run that was STILL RUNNING is waited to completion, not failed (exit 0)" \
@@ -1725,36 +1762,70 @@ grep -q "still RUNNING at the" "$TMP/err" && fail "(a) a still-running job hit t
 grep -q "pr merge 42 --admin" "$SCEN/calls" && pass "(a) the merge proceeded after the wait" \
   || fail "(a) no merge after a completed re-run"
 
-# (b) STALL: status never leaves in_progress and updatedAt never moves. The
-# stall window is the REAL failure signal, and its message is distinct from the
-# derived-ceiling message.
+# (a2) THE DEFECT ITSELF (failing-first). A shard whose GREEN bound is ~46m —
+# the recorded population for `test (b)` (median 46.6m, max 49.9m) — is healthy
+# well past the old flat 600s window. Pre-fix the frozen `updatedAt` fired
+# STALLED at 600s and blocked the merge; post-fix the derived bound is ~93m and
+# the run completes, so the rail must reach the flake path. This test FAILS
+# against the pre-fix rail (STALLED at poll 600) and PASSES against the fix.
+new_scen longhealthy
+printf '%s\n' "$HEAD_W1" > "$SCEN/head"
+LANE_LONG='tests/test_b.py::test_long_healthy'
+lane_fail "$HEAD_W1" 9661 > "$SCEN/runs-$HEAD_W1"
+log_failed "$LANE_LONG" > "$SCEN/log-9661"
+lane_fail mainlong 9662 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9662"
+log_passed "$LANE_LONG" > "$SCEN/log-after-9661"
+target_shard 9661 "test (b)"
+green_shard 9663 "test (b)" 2796        # 46.6m — the recorded MEDIAN
+# in_progress for 605 polls (just past the OLD 600s flat window), then completed.
+: > "$SCEN/status-9661"
+_i=0; while [ "$_i" -lt 605 ]; do printf 'in_progress\n' >> "$SCEN/status-9661"; _i=$((_i + 1)); done
+printf 'completed\n' >> "$SCEN/status-9661"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a2) a 46.6m shard healthy past 600s is NOT stalled (exit 0)" \
+  || { fail "(a2) the healthy long shard was blocked (exit $rc)"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'STALLED' "$TMP/err" && fail "(a2) the healthy long run was called STALLED" \
+  || pass "(a2) …and it is NOT called STALLED"
+grep -q 'pr merge 42 --admin' "$SCEN/calls" && pass "(a2) the merge proceeded for the healthy long run" \
+  || fail "(a2) no merge after the healthy long run"
+
+# (b) STALL: the run stays non-completed past its own DERIVED per-shard bound.
+# The bound comes from the GREEN population (9613) — NOT from a flat progress
+# window. The flat 600s window was the false block this fix removes: shard (b)'s
+# green MEDIAN is ~46m, so a 600s window fired while the job was healthy. Here
+# the green max is 30s, so the bound is 60s and a run that never completes is
+# STALLED at 60s.
 new_scen waitstall
 printf '%s\n' "$HEAD_W1" > "$SCEN/head"
 lane_fail "$HEAD_W1" 9611 > "$SCEN/runs-$HEAD_W1"
 log_failed 'tests/test_flaky.py::test_stalls' > "$SCEN/log-9611"
 lane_fail mainw1b 9612 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9612"
+target_shard 9611 "test (b)"
+green_shard 9613 "test (b)" 30
 printf 'in_progress\n' > "$SCEN/status-9611"
-printf 't1\n' > "$SCEN/updated-9611"
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
-  ADMIN_MERGE_STALL_SECONDS=2 bash "$ADM" 42 --main-runs 1 --rerun-timeout 30 >"$TMP/out" 2>"$TMP/err"
+  ADMIN_MERGE_RERUN_FLOOR=1 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
 [ "$rc" -ne 0 ] && pass "(b) a STALLED re-run blocks (exit $rc)" || fail "(b) a stalled run did not block"
-grep -q "STALLED: no progress for 2s" "$TMP/err" \
-  && pass "(b) the stall is reported by NAME, with its window" \
-  || fail "(b) the stall is not named"
+grep -q "STALLED: still non-completed at its DERIVED per-shard bound" "$TMP/err" \
+  && pass "(b) the stall is reported by NAME, as the DERIVED bound exceeded" \
+  || { fail "(b) the stall is not named"; sed 's/^/      /' "$TMP/err"; }
+grep -qF 'derived per-shard green bound 60s (slowest shard (every shard completed): test (b), green n=1, green max=30s)' "$TMP/err" \
+  && pass "(b) the stall names the shard, its green n and its green max" \
+  || fail "(b) the stall does not carry the derivation"
 grep -q "still RUNNING at the" "$TMP/err" && fail "(b) a stall was reported as the ceiling" \
   || pass "(b) the stall is DISTINCT from the ceiling message"
-# The pin is about the STALL MESSAGE, not the whole of stderr. The old assertion
-# grepped ALL of stderr for strings the stall message provably never contains, so
-# it could not fail for the reason it claimed — and a `fail-safe …` line from a
-# derivation (consulted on the derived-bound path) would have failed it for an
-# UNRELATED reason. Scope it to the STALL line.
+# The pin is about the STALL MESSAGE, not the whole of stderr: an unrelated
+# derivation line on stderr must not decide it. A STALL must never claim an
+# explicit operator cap — that is the CEILING verdict's provenance.
 stall_line="$(grep -m1 'STALLED' "$TMP/err")"
 case "$stall_line" in
-  *"ceiling"*|*"explicit --rerun-timeout"*|*"fail-safe"*|*"derived per-shard"*)
-    fail "(b) the STALL message carries a ceiling source — the two waits are not distinguishable" ;;
-  *) pass "(b) the STALL message carries NO ceiling source" ;;
+  *"explicit --rerun-timeout"*|*"operator cap"*)
+    fail "(b) the STALL message carries an explicit-ceiling source — the two verdicts are not distinguishable" ;;
+  *) pass "(b) the STALL message claims the DERIVED bound, never an explicit cap" ;;
 esac
 grep -q "pr merge" "$SCEN/calls" && fail "(b) no merge on a stall" || pass "(b) no merge attempted"
 
@@ -1767,10 +1838,8 @@ printf '%s\n' "$HEAD_W3" > "$SCEN/head"
 lane_queued "$HEAD_W3" 9621 > "$SCEN/runs-$HEAD_W3"
 lane_fail mainw3 9622 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9622"
-# 900, not 99: a ceiling must now EXCEED the stall window by at least one poll
-# interval (900 > 600 + 1), and validate_timing_knobs/--rerun-timeout refuse
-# anything shorter. The point here is unchanged — a RAISED bound must not change
-# the lane-terminal exit.
+# 900, not 99: an operator's explicit bound must be a positive integer, and the
+# point here is unchanged — a RAISED bound must not change the lane-terminal exit.
 run_admin 42 --main-runs 1 --rerun-timeout 900 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(c) the lane-terminal precondition blocks (exit $rc), even with --rerun-timeout 900" \
@@ -1789,18 +1858,18 @@ grep -q "still RUNNING at the" "$TMP/err" && fail "(c) the two waits read alike"
 grep -q "run rerun" "$SCEN/calls" && fail "(c) no re-run may start from a precondition block" \
   || pass "(c) no re-run was started"
 
-# (d) THE CEILING IS DERIVED, and its source is stated — not a round number.
+# (d) THE BOUND IS DERIVED, and its source is stated — not a round number.
 bash "$ADM" --print-bounds > "$TMP/bounds.txt" 2>&1 || true
 grep -q '^rerun-timeout=3900$' "$TMP/bounds.txt" \
   && pass "(d) no run id → the fail-safe 3900s (never a small bound)" \
-  || fail "(d) the default ceiling is not the fail-safe: $(head -1 "$TMP/bounds.txt")"
+  || fail "(d) the default bound is not the fail-safe: $(head -1 "$TMP/bounds.txt")"
 grep -q '^source=fail-safe 3900s — no run id supplied' "$TMP/bounds.txt" \
   && pass "(d) …and the fail-safe states why it applied" \
   || fail "(d) the derivation source is not stated"
-grep -q '^stall=600$' "$TMP/bounds.txt" \
-  && pass "(d) …and the stall window is its own, stated value" \
-  || fail "(d) the stall window is not stated"
-# …and the ceiling message itself carries the derivation.
+grep -q '^stall=' "$TMP/bounds.txt" \
+  && fail "(d) a FLAT stall window is still printed — the flat window must be gone" \
+  || pass "(d) …and there is NO separate flat stall window (one derived bound)"
+# …and the explicit-cap message itself carries the derivation.
 new_scen waitceiling
 printf '%s\n' "$HEAD_W1" > "$SCEN/head"
 lane_fail "$HEAD_W1" 9631 > "$SCEN/runs-$HEAD_W1"
@@ -1808,23 +1877,19 @@ log_failed 'tests/test_flaky.py::test_slow' > "$SCEN/log-9631"
 lane_fail mainw4 9632 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9632"
 printf 'in_progress\n' > "$SCEN/status-9631"
-# The ceiling is reached with a run that is MAKING PROGRESS: `updatedAt` advances
-# on every poll, so `idle` never reaches the stall window and `waited` reaches the
-# ceiling. A FROZEN clock is a STALL, and the ordering rule now requires the
-# ceiling to CLEAR the window by a full poll interval — so a frozen clock with a
-# compliant ceiling is by construction a STALL, never a CEILING. The old fixture
-# froze the clock and put the window ABOVE the ceiling (stall=100, ceiling=5);
-# that combination WAS the B7 transposition, and validate_timing_knobs rightly
-# refuses it. 12 advancing clock lines cover the 5 polls to the ceiling.
-: > "$SCEN/updated-9631"
-_i=0; while [ "$_i" -lt 12 ]; do printf 'c%s\n' "$_i" >> "$SCEN/updated-9631"; _i=$((_i + 1)); done
+# An EXPLICIT `--rerun-timeout` is an operator cap: the run is still going at
+# the cap, so the verdict is CEILING (2) — not STALLED. There is no progress
+# clock to consult: `updatedAt` is not read at all any more.
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
-  ADMIN_MERGE_STALL_SECONDS=2 bash "$ADM" 42 --main-runs 1 --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
+  bash "$ADM" 42 --main-runs 1 --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
 rc=$?
 [ "$rc" -ne 0 ] && pass "(d) the explicit ceiling blocks when reached (exit $rc)" || fail "(d) the ceiling did not block"
 grep -q "still RUNNING at the 5s ceiling — explicit --rerun-timeout" "$TMP/err" \
   && pass "(d) the ceiling message names the bound's source, not a bare number" \
   || fail "(d) the ceiling message does not state its source"
+grep -q 'STALLED' "$TMP/err" \
+  && fail "(d) an explicit operator cap was reported as a STALL" \
+  || pass "(d) the explicit cap is a CEILING, not a STALL"
 
 # (e) ATTRIBUTION: a failure main's lane has NOT measured must not be called
 # "unique to this PR" — but it STILL BLOCKS. main fails a Docker file; the PR
@@ -1871,7 +1936,7 @@ grep -q "measured on this lane, not present on main" "$TMP/err" \
 grep -q "not measurable on this lane" "$TMP/err" && fail "(e2) a measured failure was called unmeasurable" \
   || pass "(e2) the two labels are distinct"
 
-# ── 38. THE PER-SHARD CEILING DERIVATION (#1167) ────────────────────────────
+# ── 38. THE PER-SHARD BOUND DERIVATION (#1167) ────────────────────────
 # The old ceiling was ONE hardcoded shard constant (2 x 1563s). B4's population
 # falsifies that input: `test (b)`'s MEDIAN green run is 2.5x `test (a)`'s, so a
 # single number is too tight for the slow shard and absurdly generous for the
@@ -1888,8 +1953,9 @@ grep -q '^rerun-timeout=3900$' "$TMP/bounds-a.txt" \
 grep -q '^source=fail-safe 3900s — no run id supplied; the derivation needs a run (pass one: --print-bounds <run-id>)$' "$TMP/bounds-a.txt" \
   && pass "(a) …and the fail-safe source line" \
   || fail "(a) the fail-safe source line is missing"
-grep -q '^stall=600$' "$TMP/bounds-a.txt" \
-  && pass "(a) …and the stall window" || fail "(a) the stall line is missing"
+grep -q '^stall=' "$TMP/bounds-a.txt" \
+  && fail "(a) a flat stall window is still printed — the flat window must be gone" \
+  || pass "(a) …and no flat stall window (one derived bound)"
 new_scen bounds-offline
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds > "$TMP/out" 2>"$TMP/err"
 [ "$(wc -l < "$SCEN/calls")" -eq 0 ] \
@@ -1922,13 +1988,13 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds "$RUN_B" --repo x
 grep -q '^rerun-timeout=5592$' "$TMP/bounds-b.txt" \
   && pass "(b) C is the UNFINISHED shard's ceiling (5592s), not a global constant" \
   || { fail "(b) expected rerun-timeout=5592, got: $(head -1 "$TMP/bounds-b.txt")"; sed 's/^/      /' "$TMP/bounds-b.txt"; }
-grep -qE 'shard test \(a\)[[:space:]]+n=1[[:space:]]+max=1130s[[:space:]]+ceiling=2260s[[:space:]]+state=finished[[:space:]]+sample=green' "$TMP/bounds-b.txt" \
-  && pass "(b) the table prints test (a) WITH ITS GREEN n (n=1, max=1130s, ceiling=2260s)" \
+grep -qE 'shard test \(a\)[[:space:]]+n=1[[:space:]]+max=1130s[[:space:]]+bound=2260s[[:space:]]+state=finished[[:space:]]+sample=green' "$TMP/bounds-b.txt" \
+  && pass "(b) the table prints test (a) WITH ITS GREEN n (n=1, max=1130s, bound=2260s)" \
   || { fail "(b) the test (a) row is wrong/missing"; sed 's/^/      /' "$TMP/bounds-b.txt"; }
-grep -qE 'shard test \(b\)[[:space:]]+n=1[[:space:]]+max=2796s[[:space:]]+ceiling=5592s[[:space:]]+state=unfinished[[:space:]]+sample=green' "$TMP/bounds-b.txt" \
-  && pass "(b) the table prints test (b) WITH ITS GREEN n (n=1, max=2796s, ceiling=5592s)" \
+grep -qE 'shard test \(b\)[[:space:]]+n=1[[:space:]]+max=2796s[[:space:]]+bound=5592s[[:space:]]+state=unfinished[[:space:]]+sample=green' "$TMP/bounds-b.txt" \
+  && pass "(b) the table prints test (b) WITH ITS GREEN n (n=1, max=2796s, bound=5592s)" \
   || { fail "(b) the test (b) row is wrong/missing"; sed 's/^/      /' "$TMP/bounds-b.txt"; }
-grep -qF 'source=derived per-shard green ceiling 5592s (slowest unfinished shard: test (b), green n=1, green max=2796s)' "$TMP/bounds-b.txt" \
+grep -qF 'source=derived per-shard green bound 5592s (slowest unfinished shard: test (b), green n=1, green max=2796s)' "$TMP/bounds-b.txt" \
   && pass "(b) the source names the winning shard and its green n/max" \
   || fail "(b) the derivation source is not per-shard green: $(grep '^source=' "$TMP/bounds-b.txt")"
 grep -q '3126' "$TMP/bounds-b.txt" \
@@ -1963,7 +2029,7 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds "$RUN_B2" --repo 
 grep -q '^rerun-timeout=2000$' "$TMP/bounds-b2.txt" \
   && pass "(b) a DIFFERENT green fixture yields a DIFFERENT value (2000s) — a function, not a constant" \
   || fail "(b) the value did not track the fixture: $(head -1 "$TMP/bounds-b2.txt")"
-grep -qF 'source=derived per-shard green ceiling 2000s (slowest shard (every shard completed): test (b), green n=1, green max=1000s)' "$TMP/bounds-b2.txt" \
+grep -qF 'source=derived per-shard green bound 2000s (slowest shard (every shard completed): test (b), green n=1, green max=1000s)' "$TMP/bounds-b2.txt" \
   && pass "(b) an all-completed run takes the max over EVERY shard and says so" \
   || fail "(b) the all-completed source is wrong: $(grep '^source=' "$TMP/bounds-b2.txt")"
 # FLOOR is a FLOOR: a fast shard's 2 x max is lifted to it, never below it.
@@ -1997,7 +2063,7 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_RERUN_FLOOR=1200 bash "$ADM" --p
 grep -q '^rerun-timeout=2796$' "$TMP/bounds-f.txt" \
   && pass "(f) the GREEN sample governs (2796s), not 2 x the truncated failure (2256s)" \
   || { fail "(f) the failing run's truncated sample was used: $(head -1 "$TMP/bounds-f.txt")"; sed 's/^/      /' "$TMP/bounds-f.txt"; }
-grep -qE 'shard test \(b\)[[:space:]]+n=1[[:space:]]+max=1398s[[:space:]]+ceiling=2796s[[:space:]]+state=finished[[:space:]]+sample=green' "$TMP/bounds-f.txt" \
+grep -qE 'shard test \(b\)[[:space:]]+n=1[[:space:]]+max=1398s[[:space:]]+bound=2796s[[:space:]]+state=finished[[:space:]]+sample=green' "$TMP/bounds-f.txt" \
   && pass "(f) …and the row reports the green max (1398s), never the 300s failure" \
   || { fail "(f) the test (b) green row is wrong/missing"; sed 's/^/      /' "$TMP/bounds-f.txt"; }
 grep -q 'max=300' "$TMP/bounds-f.txt" \
@@ -2025,7 +2091,7 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_RERUN_FLOOR=1200 bash "$ADM" --p
 grep -q '^rerun-timeout=3900$' "$TMP/bounds-g.txt" \
   && pass "(g) a shard with NO green sample → the 3900s fail-safe, not the truncated failure" \
   || { fail "(g) expected rerun-timeout=3900, got: $(head -1 "$TMP/bounds-g.txt")"; sed 's/^/      /' "$TMP/bounds-g.txt"; }
-grep -qE 'shard test \(b\)[[:space:]]+n=0[[:space:]]+max=--[[:space:]]+ceiling=3900s[[:space:]]+state=finished[[:space:]]+sample=none' "$TMP/bounds-g.txt" \
+grep -qE 'shard test \(b\)[[:space:]]+n=0[[:space:]]+max=--[[:space:]]+bound=3900s[[:space:]]+state=finished[[:space:]]+sample=none' "$TMP/bounds-g.txt" \
   && pass "(g) …and the row states sample=none (no healthy sample was substituted)" \
   || { fail "(g) the no-sample row is wrong/missing"; sed 's/^/      /' "$TMP/bounds-g.txt"; }
 
@@ -2059,15 +2125,17 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" bash "$ADM" --print-bounds "$RUN_D" --repo x
 grep -q '^rerun-timeout=1234$' "$TMP/bounds-d.txt" \
   && pass "(d) --rerun-timeout overrides the derivation" \
   || fail "(d) the override was not honoured: $(head -1 "$TMP/bounds-d.txt")"
-grep -q '^source=explicit --rerun-timeout$' "$TMP/bounds-d.txt" \
-  && pass "(d) …and the source says so" || fail "(d) the override source is wrong"
+grep -q '^source=explicit --rerun-timeout (a CEILING, not a derived stall bound)$' "$TMP/bounds-d.txt" \
+  && pass "(d) …and the source says so (an explicit cap is a CEILING, not a stall)" || fail "(d) the override source is wrong"
 grep -q 'api ' "$SCEN/calls" \
   && fail "(d) the derivation was consulted despite an explicit override" \
   || pass "(d) …and the derivation was not consulted"
 
-# (e) STALLED and CEILING stay distinguishable, and a DERIVED ceiling fires end
-# to end naming its source. The run this re-run replaces is TERMINAL, so every
-# shard has a completed sample — the ordering the rail actually uses.
+# (e) A DERIVED bound fires end to end, naming its source — and, because a
+# remote run exposes no within-job activity signal, exceeding that bound IS the
+# STALL (there is no separate "ceiling" for a derived bound: they coincide, which
+# is exactly why the flat window had to go). The run this re-run replaces is
+# TERMINAL, so every shard has a green sample. `updatedAt` is NOT read.
 new_scen bounds-e2e
 HEAD_E="e0e0000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_E" > "$SCEN/head"
@@ -2089,37 +2157,31 @@ cat > "$SCEN/jobs-9733.json" <<'JOBS'
 ]}
 JOBS
 printf 'in_progress\n' > "$SCEN/status-9731"
-# The re-run makes PROGRESS on every poll (updatedAt advances), so `idle` never
-# reaches the stall window and the CEILING is what fires. The stall window is now
-# SMALLER than the ceiling (5s < 60s) — the ordering validate_timing_knobs
-# requires. The old fixture forced the ceiling with a stall window ABOVE it
-# (stall=100000, floor=5), which the validator now rightly refuses; the default
-# floor is 2 x 5s = 10s, still below the 60s derived ceiling, so 60s still wins.
-: > "$SCEN/updated-9731"
-_i=0; while [ "$_i" -lt 70 ]; do printf 'T%s\n' "$_i" >> "$SCEN/updated-9731"; _i=$((_i + 1)); done
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
-  ADMIN_MERGE_STALL_SECONDS=5 \
+  ADMIN_MERGE_RERUN_FLOOR=1 \
   bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
-[ "$rc" -ne 0 ] && pass "(e) the DERIVED ceiling blocks when reached (exit $rc)" \
-  || fail "(e) the derived ceiling did not block (exit 0)"
-grep -q 'still RUNNING at the 60s ceiling' "$TMP/err" \
-  && pass "(e) the CEILING message states the derived bound (60s = 2 x 30s)" \
-  || { fail "(e) the ceiling message is wrong"; sed 's/^/      /' "$TMP/err"; }
-grep -qF 'derived per-shard green ceiling 60s (slowest shard (every shard completed): test (b), green n=1, green max=30s)' "$TMP/err" \
+[ "$rc" -ne 0 ] && pass "(e) the DERIVED bound blocks when reached (exit $rc)" \
+  || fail "(e) the derived bound did not block (exit 0)"
+grep -q 'STALLED: still non-completed at its DERIVED per-shard bound' "$TMP/err" \
+  && pass "(e) the DERIVED bound being exceeded is reported as STALLED" \
+  || { fail "(e) the derived-bound stall is wrong"; sed 's/^/      /' "$TMP/err"; }
+grep -qF 'derived per-shard green bound 60s (slowest shard (every shard completed): test (b), green n=1, green max=30s)' "$TMP/err" \
   && pass "(e) …and carries the shard, its green n and its green max" \
-  || fail "(e) the ceiling message does not carry the derivation"
-grep -q 'STALLED' "$TMP/err" && fail "(e) a ceiling was reported as a stall" || pass "(e) the ceiling is DISTINCT from STALLED"
-grep -q 'explicit --rerun-timeout' "$TMP/err" && fail "(e) an unconfigured bound claimed to be explicit" || pass "(e) the ceiling does not claim an override it did not have"
-grep -q 'pr merge' "$SCEN/calls" && fail "(e) no merge on a ceiling" || pass "(e) no merge attempted"
+  || fail "(e) the stall message does not carry the derivation"
+grep -q 'still RUNNING at the' "$TMP/err" && fail "(e) a derived-bound overflow was reported as the explicit ceiling" || pass "(e) the derived-bound stall is DISTINCT from the explicit CEILING"
+grep -q 'explicit --rerun-timeout' "$TMP/err" && fail "(e) an unconfigured bound claimed to be explicit" || pass "(e) the bound does not claim an override it did not have"
+grep -q 'pr merge' "$SCEN/calls" && fail "(e) no merge on a stall" || pass "(e) no merge attempted"
 
-# ── 39. THE LANE-TERMINAL PRECONDITION COVERS BOTH WAITS (#1167) ───────────
-# The precondition must not merely refuse: it must say WHICH wait it is. A pending
-# run that is moving reads as a WAIT; one whose progress clock has stopped for the
-# stall window reads as STALLED. Neither is the re-run ceiling.
-echo "== 39. the precondition names WAIT vs STALLED =="
+# ── 39. THE LANE-TERMINAL PRECONDITION NAMES WHICH WAIT (#1167 follow-on) ──
+# The precondition must not merely refuse: it must say WHICH wait it is. It is
+# NOT the re-run wait — that bound has not been derived yet, so the precondition
+# claims NEITHER a WAIT NOR a STALL. A pending run reads as "still running"; a
+# frozen `updatedAt` is NOT evidence of a stall (it is frozen for the whole of a
+# single long step), which is the false claim this section now pins OUT.
+echo "== 39. the precondition names which wait, and never fabricates a stall =="
 
-# (i) a progressing run → WAIT
+# (i) a pending run → still running, NOT a stall claim
 new_scen precond-wait
 HEAD_PW="f9f9000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_PW" > "$SCEN/head"
@@ -2127,14 +2189,13 @@ lane_queued "$HEAD_PW" 9801 > "$SCEN/runs-$HEAD_PW"
 lane_fail mainpw 9802 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9802"
 printf 'in_progress\n' > "$SCEN/status-9801"
-printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SCEN/updated-9801"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(i) a pending lane blocks (exit $rc)" || fail "(i) the precondition did not block"
-grep -q 'this is a WAIT, not a stall; the re-run bound is a different wait' "$TMP/err" \
-  && pass "(i) a progressing lane reads as a WAIT, not a stall" \
-  || { fail "(i) the WAIT reading is missing"; sed 's/^/      /' "$TMP/err"; }
-grep -q 'STALLED' "$TMP/err" && fail "(i) a progressing lane was called STALLED" || pass "(i) …and NOT as STALLED"
+grep -q 'still running. A running job is not a failure, and this is NOT a stall claim' "$TMP/err" \
+  && pass "(i) a pending lane reads as still-running, NOT a stall" \
+  || { fail "(i) the still-running reading is missing"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'STALLED' "$TMP/err" && fail "(i) a pending lane was called STALLED" || pass "(i) …and NOT as STALLED"
 grep -q -- '--rerun-timeout never started' "$TMP/err" \
   && pass "(i) …and the re-run wait is still stated as never started" \
   || fail "(i) the never-started statement disappeared"
@@ -2142,8 +2203,12 @@ grep -q -- '--rerun-timeout never started' "$TMP/err" \
   && pass "(i) exactly ONE gh run view call for the diagnostic" \
   || fail "(i) expected one run view call, got $(grep -c '^run view 9801' "$SCEN/calls" || true)"
 
-# (ii) a frozen progress clock → STALLED
-new_scen precond-stall
+# (ii) THE FALSE STALL, pinned out. The run is in_progress and its `updatedAt` is
+# FROZEN at 2020 — exactly the field evidence that produced the false STALLED
+# verdict (#1167 follow-on: run 35295083845, job `test (b)`, healthy at 11m40s
+# with the run clock frozen the whole time). `updatedAt` is not read any more, so
+# this must read the SAME as (i): still running, NOT a stall.
+new_scen precond-frozen-clock
 printf '%s\n' "$HEAD_PW" > "$SCEN/head"
 lane_queued "$HEAD_PW" 9811 > "$SCEN/runs-$HEAD_PW"
 lane_fail mainpw2 9812 > "$SCEN/runs-main"
@@ -2152,29 +2217,38 @@ printf 'in_progress\n' > "$SCEN/status-9811"
 printf '2020-01-01T00:00:00Z\n' > "$SCEN/updated-9811"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "(ii) a stalled pending lane blocks (exit $rc)" || fail "(ii) the precondition did not block"
-grep -q 'STALLED — no progress for' "$TMP/err" \
-  && pass "(ii) a frozen progress clock reads as STALLED with the idle seconds" \
-  || { fail "(ii) the STALLED reading is missing"; sed 's/^/      /' "$TMP/err"; }
-grep -q 'this is a WAIT, not a stall' "$TMP/err" && fail "(ii) a stalled lane was called a WAIT" || pass "(ii) …and NOT as a WAIT"
-grep -q 'stall window 600s' "$TMP/err" \
-  && pass "(ii) …naming the stall window it exceeded" || fail "(ii) the stall window is not named"
+[ "$rc" -ne 0 ] && pass "(ii) a pending lane blocks (exit $rc)" || fail "(ii) the precondition did not block"
+grep -q 'STALLED' "$TMP/err" \
+  && fail "(ii) a FROZEN updatedAt was called STALLED — the false block this fix removes" \
+  || pass "(ii) a frozen updatedAt is NOT a stall (no progress claim is made)"
+grep -q 'still running. A running job is not a failure' "$TMP/err" \
+  && pass "(ii) …it reads as still-running, like any pending lane" \
+  || { fail "(ii) the still-running reading is missing"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'updatedAt' "$TMP/err" \
+  && fail "(ii) the diagnostic still reports an updatedAt claim" \
+  || pass "(ii) …and no updatedAt claim is made anywhere"
+grep -q 'updatedAt' "$SCEN/calls" \
+  && fail "(ii) the rail still ASKS gh for updatedAt — the frozen clock can return" \
+  || pass "(ii) …and gh is never asked for updatedAt (call-level tripwire)"
 
 # (iii) AN UNREADABLE RUN IS NOT A STALL. gh failing repeatedly means the run's
-# state was NEVER OBSERVED; STALLED asserts "updatedAt never moved", which the
-# rail cannot claim if it never read the field. The remedies are opposite
-# (repair gh vs escalate a wedged run), so the diagnoses must differ — and the
-# rail must still fail closed.
+# state was NEVER OBSERVED; the rail cannot claim the run exceeded its bound if it
+# never read the run. The remedies are opposite (repair gh vs escalate a wedged
+# run), so the diagnoses must differ — and the rail must still fail closed. The
+# derived bound is made small with a one-shard green fixture so the test polls a
+# bound, not a fingerprint.
 new_scen unobservable
 printf '%s\n' "$HEAD_W1" > "$SCEN/head"
 lane_fail "$HEAD_W1" 9641 > "$SCEN/runs-$HEAD_W1"
 log_failed 'tests/test_flaky.py::test_slow' > "$SCEN/log-9641"
 lane_fail mainw4 9642 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9642"
+target_shard 9641 "test (b)"
+green_shard 9643 "test (b)" 5
 # NO status-9641 file would mean "completed"; make the projection FAIL instead.
 : > "$SCEN/unreadable-9641"
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
-  ADMIN_MERGE_STALL_SECONDS=2 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+  ADMIN_MERGE_RERUN_FLOOR=1 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
 [ "$rc" -ne 0 ] && pass "(iii) an UNREADABLE run still blocks (exit $rc) — fail closed" \
   || fail "(iii) an unreadable run did not block"
@@ -2182,8 +2256,8 @@ grep -q 'UNOBSERVABLE' "$TMP/err" \
   && pass "(iii) …and is reported as UNOBSERVABLE" \
   || { fail "(iii) the UNOBSERVABLE diagnosis is missing"; sed 's/^/      /' "$TMP/err"; }
 grep -q 'STALLED' "$TMP/err" \
-  && fail "(iii) an unreadable run was called STALLED — that claims progress was observed" \
-  || pass "(iii) …and NOT as STALLED (it never saw the field)"
+  && fail "(iii) an unreadable run was called STALLED — that claims a run was observed" \
+  || pass "(iii) …and NOT as STALLED (it never saw the run)"
 grep -q 'gh auth/network' "$TMP/err" \
   && pass "(iii) …and names the different remedy" \
   || fail "(iii) the remedy is not named"
@@ -2207,7 +2281,6 @@ log_failed 'tests/test_flaky.py::test_rt' > "$SCEN/log-9901"
 lane_fail mainrt 9902 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9902"
 printf 'in_progress\n' > "$SCEN/status-9901"
-printf 't1\n' > "$SCEN/updated-9901"
 for bad in "0" "abc" ""; do
   rm -f "$SCEN/calls" "$SCEN/rerun-9901"
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
@@ -2221,68 +2294,71 @@ for bad in "0" "abc" ""; do
   grep -q "still RUNNING at the" "$TMP/err" \
     && fail "(P2-1) --rerun-timeout '$bad' produced the false zero-poll ceiling claim" \
     || pass "(P2-1) …and no 'still RUNNING at the ceiling' claim was printed for '$bad'"
-  [ "$(grep -c -e '--json status,updatedAt' "$SCEN/calls" 2>/dev/null || echo 0)" -eq 0 ] \
-    && pass "(P2-1) …and the wait never polled for '$bad' (no status,updatedAt call)" \
+  [ "$(grep -c '^run view' "$SCEN/calls" 2>/dev/null || echo 0)" -eq 0 ] \
+    && pass "(P2-1) …and the wait never polled for '$bad' (no run view call)" \
     || fail "(P2-1) --rerun-timeout '$bad' still polled"
 done
 
-# (P2-2) A non-numeric ADMIN_MERGE_STALL_SECONDS must be REFUSED at startup: its
-# `-ge` comparisons return 2, so STALLED and UNOBSERVABLE can never fire and the
-# file-scope 2 x floor arithmetic errors, leaving RERUN_FLOOR UNSET.
+# (P2-2) A non-numeric timing knob must be REFUSED at startup: its `-ge`/`-lt`
+# comparisons return 2, so a guard silently SKIPS instead of failing. The flat
+# stall window is gone, so the pin moves to the per-shard FLOOR.
 new_scen fix-timing-knobs
-SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_STALL_SECONDS=10m \
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_RERUN_FLOOR=10m \
   bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
-[ "$rc" -eq 2 ] && pass "(P2-2) a non-numeric ADMIN_MERGE_STALL_SECONDS is refused (exit 2)" \
-  || fail "(P2-2) a non-numeric stall window was not refused (exit $rc)"
-grep -q "refusing ADMIN_MERGE_STALL_SECONDS='10m'" "$TMP/err" \
+[ "$rc" -eq 2 ] && pass "(P2-2) a non-numeric ADMIN_MERGE_RERUN_FLOOR is refused (exit 2)" \
+  || fail "(P2-2) a non-numeric floor was not refused (exit $rc)"
+grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='10m'" "$TMP/err" \
   && pass "(P2-2) …and the refusal names the knob and its value" \
   || { fail "(P2-2) the refusal does not name the knob"; sed 's/^/      /' "$TMP/err"; }
 grep -q "value too great for base" "$TMP/err" \
-  && fail "(P2-2) the file-scope RERUN_FLOOR arithmetic still errored (RERUN_FLOOR unset)" \
-  || pass "(P2-2) …and the file-scope floor arithmetic did not error"
+  && fail "(P2-2) a file-scope arithmetic error leaked (an unset knob)" \
+  || pass "(P2-2) …and no file-scope arithmetic error occurred"
 
 # (P2-4) `--any-workflow` is the PARSER's opt-out, not a `gh run list` flag. Real
-# gh rejects it and `2>/dev/null || true` hid that, so the WAIT-vs-STALLED
-# diagnostic was silently dead for the invocation commit-workflow's docs prescribe.
+# gh rejects it and `2>/dev/null || true` hid that, so the precondition diagnostic
+# was silently dead for the invocation commit-workflow's docs prescribe.
 new_scen fix-anywf
 printf '%s\n' "$HEAD_PW" > "$SCEN/head"
 lane_queued "$HEAD_PW" 9911 > "$SCEN/runs-$HEAD_PW"
 lane_fail mainfix 9912 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9912"
 printf 'in_progress\n' > "$SCEN/status-9911"
-printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SCEN/updated-9911"
 run_admin 42 --main-runs 1 --any-workflow >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(P2-4) a pending lane blocks under --any-workflow (exit $rc)" \
   || fail "(P2-4) a pending lane certified under --any-workflow"
-grep -q 'this is a WAIT, not a stall' "$TMP/err" \
-  && pass "(P2-4) the WAIT-vs-STALLED diagnostic survives --any-workflow" \
+grep -q 'still running. A running job is not a failure' "$TMP/err" \
+  && pass "(P2-4) the precondition diagnostic survives --any-workflow" \
   || { fail "(P2-4) the diagnostic is silently dead under --any-workflow"; sed 's/^/      /' "$TMP/err"; }
 grep -q -- '--any-workflow' "$SCEN/calls" \
   && fail "(P2-4) a parser-only flag was forwarded to gh (real gh rejects it)" \
   || pass "(P2-4) …and --any-workflow never reached gh"
 
-# (P2-5) An UNREADABLE progress clock is neither a WAIT nor a STALL: a WAIT
-# asserts progress WAS observed. Folding it into the WAIT branch is the same
-# cannot-observe≠observed-progress fault this rail fixed in wait_for_run.
-new_scen fix-unreadable-clock
+# (P2-5) An UNREADABLE run is neither "still running" nor a stall: the rail cannot
+# claim a run is working, OR that it exceeded its bound, if it never read it. The
+# remedies are opposite (repair gh vs escalate a wedged run), so the diagnoses
+# must differ — and the rail must still fail closed.
+new_scen fix-unreadable-run
 printf '%s\n' "$HEAD_PW" > "$SCEN/head"
 lane_queued "$HEAD_PW" 9921 > "$SCEN/runs-$HEAD_PW"
 lane_fail mainfix2 9922 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9922"
-printf 'in_progress\n' > "$SCEN/status-9921"
-printf 'not-a-timestamp\n' > "$SCEN/updated-9921"
+# The lane run's STATE cannot be read at all (gh failure/auth/network).
+: > "$SCEN/unreadable-9921"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "(P2-5) an unreadable progress clock still blocks (exit $rc)" \
-  || fail "(P2-5) an unreadable clock did not block"
-grep -q 'this is a WAIT, not a stall' "$TMP/err" \
-  && fail "(P2-5) an unreadable clock was folded into the WAIT branch (cannot-observe ≠ progress)" \
-  || pass "(P2-5) …and NOT as a WAIT"
-grep -q 'progress clock is UNOBSERVABLE' "$TMP/err" \
-  && pass "(P2-5) …but as an explicitly UNOBSERVABLE clock" \
-  || { fail "(P2-5) the unobservable-clock reading is missing"; sed 's/^/      /' "$TMP/err"; }
+[ "$rc" -ne 0 ] && pass "(P2-5) an unreadable run still blocks (exit $rc)" \
+  || fail "(P2-5) an unreadable run did not block"
+grep -q 'could not be read' "$TMP/err" \
+  && pass "(P2-5) …and says the run could not be read" \
+  || { fail "(P2-5) the unreadable-run reading is missing"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'This is NOT a stall' "$TMP/err" \
+  && pass "(P2-5) …explicitly NOT as a stall (a stall is a claim about a run we watched)" \
+  || fail "(P2-5) the unreadable run was folded into a stall claim"
+grep -q 'STALLED' "$TMP/err" \
+  && fail "(P2-5) an unreadable run was called STALLED" \
+  || pass "(P2-5) …and the word STALLED never appears"
 
 # (P2-6) ADMIN_MERGE_GH is a COMMAND seam, not a path: a multi-word value must
 # word-split. `"$GH" api` ran a file literally named `gh --hostname h`, so the
@@ -2308,99 +2384,87 @@ grep -q '^rerun-timeout=2000$' "$TMP/bounds-mw.txt" \
   && pass "(P2-6) a multi-word ADMIN_MERGE_GH seam word-splits and reaches the Jobs API" \
   || { fail "(P2-6) the multi-word seam did not execute: $(head -1 "$TMP/bounds-mw.txt")"; sed 's/^/      /' "$TMP/bounds-mw.txt"; }
 
-# (P2-3) The ceiling-source pin must be scoped to the STALL MESSAGE, not to all
-# of stderr. Here the derivation is consulted (no explicit override) and its
-# fail-safe line lands on stderr, while the STALL message carries no source. The
-# OLD whole-stderr grep failed for that UNRELATED reason.
-new_scen fix-stall-source-scope
+# (P2-3) AN ADVANCING `updatedAt` MUST NOT POSTPONE THE BOUND. `updatedAt`
+# advances on job/step TRANSITIONS, so on a single long test step it is frozen —
+# but on a job with several steps it advances while the job is nowhere near done.
+# A wait that resets its idle counter on each move therefore NEVER stalls a slow
+# multi-step job; it just reports the ceiling. The bound must be the bound,
+# regardless of the clock. Pre-fix this scenario returned CEILING (2); the fix
+# returns STALLED (1).
+new_scen fix-advancing-clock
 printf '%s\n' "$HEAD_W1" > "$SCEN/head"
 lane_fail "$HEAD_W1" 9931 > "$SCEN/runs-$HEAD_W1"
 log_failed 'tests/test_flaky.py::test_stall_scope' > "$SCEN/log-9931"
 lane_fail mainfix3 9932 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9932"
+target_shard 9931 "test (b)"
+green_shard 9933 "test (b)" 5
 printf 'in_progress\n' > "$SCEN/status-9931"
-printf 't1\n' > "$SCEN/updated-9931"
+# A clock line per poll, all DISTINCT, covering the bound of 10s. The fake
+# repeats its last line once exhausted, but the bound is reached first.
+: > "$SCEN/updated-9931"
+_i=0; while [ "$_i" -lt 40 ]; do printf 'T%s\n' "$_i" >> "$SCEN/updated-9931"; _i=$((_i + 1)); done
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
-  ADMIN_MERGE_STALL_SECONDS=2 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+  ADMIN_MERGE_RERUN_FLOOR=1 bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
 rc=$?
-[ "$rc" -ne 0 ] && pass "(P2-3) a STALLED re-run with a derived (fail-safe) bound blocks (exit $rc)" \
-  || fail "(P2-3) a stalled derived run did not block"
-grep -q 'fail-safe' "$TMP/err" \
-  && pass "(P2-3) …and an unrelated derivation 'fail-safe' line IS on stderr (a whole-stderr grep is wrong)" \
-  || fail "(P2-3) the scenario did not exercise the derivation's fail-safe line"
-stall_line="$(grep -m1 'STALLED' "$TMP/err")"
-case "$stall_line" in
-  *ceiling*|*"explicit --rerun-timeout"*|*fail-safe*|*"derived per-shard"*)
-    fail "(P2-3) the STALL message carries a ceiling source" ;;
-  *) pass "(P2-3) …but the STALL message itself carries NO ceiling source (the pin is scoped)" ;;
-esac
+[ "$rc" -ne 0 ] && pass "(P2-3) an advancing updatedAt still blocks at the bound (exit $rc)" \
+  || fail "(P2-3) an advancing clock postponed the bound"
+grep -q 'STALLED: still non-completed at its DERIVED per-shard bound' "$TMP/err" \
+  && pass "(P2-3) …and the verdict is the DERIVED-bound STALL" \
+  || { fail "(P2-3) the derived-bound stall is missing"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'still RUNNING at the' "$TMP/err" \
+  && fail "(P2-3) an advancing clock turned the stall into the explicit ceiling" \
+  || pass "(P2-3) …NOT the explicit ceiling (updatedAt is not consulted)"
+grep -q 'updatedAt never moved\|no progress for' "$TMP/err" \
+  && fail "(P2-3) the wait still reports an updatedAt-based claim" \
+  || pass "(P2-3) …and no freeze-based claim is made in its output"
+grep -q 'updatedAt' "$SCEN/calls" \
+  && fail "(P2-3) the rail still ASKS gh for updatedAt — the clock can decide again" \
+  || pass "(P2-3) …and gh is never asked for updatedAt (call-level tripwire)"
 
-# ── 41. THE CEILING ORDERING IS ENFORCED, NOT LEFT TO THE DEFAULT ──────────
-# The #1167 review P2: the header claimed the floor "must exceed the stall window
-# BY CONSTRUCTION", but only the `2 x stall` DEFAULT did. wait_for_run's loop
-# condition is the CEILING while the STALL check is INSIDE the body, so a ceiling
-# below the stall window exits via `return 2` before `idle` can reach the stall:
-# a STALLED run printed as "still RUNNING at the Ns ceiling" (B7) with the
-# OPPOSITE remedy. One knob (`ADMIN_MERGE_RERUN_FLOOR=300` over a 600s stall)
-# broke it. validate_timing_knobs now REFUSES it by name.
-echo "== 41. the ceiling ordering is enforced, not left to the default =="
+# ── 41. ONE DERIVED BOUND — STALLED AND CEILING ARE A PROVENANCE SPLIT ──────
+# The #1167 follow-on defect: a FLAT 600s "no progress" window fired before the
+# derived per-shard bound, so a healthy `test (b)` (green median 46.6m, max 49.9m)
+# was STALLED at 600s while it was still running. A remote run has no within-job
+# activity signal to key a smaller window on, so the derived bound IS the stall
+# bound; there is no second window to order against it. STALLED (derived bound
+# exceeded) and CEILING (explicit `--rerun-timeout` exceeded) coexist by
+# PROVENANCE. The old ordering refusals (`FLOOR < stall + poll`, etc.) are gone:
+# a floor is now just a FLOOR, and a small one is legal.
+echo "== 41. one derived bound; STALLED and CEILING are distinguished by provenance =="
 
-# (P2-7) the exact repro: floor 300 < the default stall 600.
-new_scen order-floor
+# (P2-7) a small floor is now LEGAL — it only ever RAISES a per-shard bound, so
+# it cannot cause a false block. Pre-fix (`FLOOR=300` over a 600s stall) this
+# exited 2.
+new_scen bound-small-floor
 ADMIN_MERGE_RERUN_FLOOR=300 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
 rc=$?
-[ "$rc" -eq 2 ] && pass "(P2-7) a floor below the stall window is refused (exit 2)" \
-  || fail "(P2-7) a floor below the stall window was NOT refused (exit $rc)"
-grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='300'" "$TMP/err" \
-  && pass "(P2-7) …and the refusal names the knob and its value" \
-  || { fail "(P2-7) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
-grep -q "stall window ADMIN_MERGE_STALL_SECONDS='600'" "$TMP/err" \
-  && pass "(P2-7) …and names the stall window it must clear" \
-  || fail "(P2-7) the refusal does not name the stall window"
-grep -q 'still RUNNING at the' "$TMP/err" \
-  && fail "(P2-7) the refused config still printed a ceiling claim" \
-  || pass "(P2-7) …and no 'still RUNNING at the ceiling' claim was printed"
+[ "$rc" -eq 0 ] && pass "(P2-7) a small floor (300) is ACCEPTED — a floor cannot false-block" \
+  || fail "(P2-7) a small floor was refused (exit $rc): $(head -1 "$TMP/err")"
+grep -q 'refusing' "$TMP/err" \
+  && fail "(P2-7) the accepted floor still produced a refusal" \
+  || pass "(P2-7) …with no refusal"
 
-# (P2-8) the fail-safe on a no-green-sample shard takes the value VERBATIM, so a
-# fail-safe below the stall window has the same B7 transposition.
-new_scen order-failsafe
+# (P2-8) likewise the fail-safe — there is no window to clear, so any positive
+# value is accepted. A short one is the operator's own choice: it can only make
+# the rail LESS patient, never falsely block a healthy run past its own bound.
+new_scen bound-small-failsafe
 ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK=300 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
-rc=$?
-[ "$rc" -eq 2 ] && pass "(P2-8) a fail-safe below the stall window is refused (exit 2)" \
-  || fail "(P2-8) a fail-safe below the stall window was NOT refused (exit $rc)"
-grep -q "refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='300'" "$TMP/err" \
-  && pass "(P2-8) …and the refusal names the knob and its value" \
-  || { fail "(P2-8) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
-grep -q "stall window ADMIN_MERGE_STALL_SECONDS='600'" "$TMP/err" \
-  && pass "(P2-8) …and names the stall window it must clear" \
-  || fail "(P2-8) the refusal does not name the stall window"
+[ "$?" -eq 0 ] && pass "(P2-8) a small fail-safe (300) is ACCEPTED (no window to clear)" \
+  || fail "(P2-8) a small fail-safe was refused: $(head -1 "$TMP/err")"
 
-# (P2-9) the DEFAULT path still satisfies the ordering: with a raised stall
-# window and NO floor override, the floor is 2 x stall — the ceiling can never
-# sit below the stall. A regression that refused the default would fail here.
-new_scen order-default
+# (P2-9) the DEFAULT floor still applies when no override is given: a per-shard
+# green bound below it is lifted to it, so a fast shard is never given a
+# too-tight bound. The default is 1200s.
+new_scen bound-default-floor
 RUN_O=7831
-cat > "$SCEN/jobs-$RUN_O.json" <<'JOBS'
-{"total_count":2,"jobs":[
-{"name":"test (a)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:50Z"},
-{"name":"test (b)","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:50Z"}
-]}
-JOBS
-printf '7832\n' > "$SCEN/green-runs"
-cat > "$SCEN/jobs-7832.json" <<'JOBS'
-{"total_count":2,"jobs":[
-{"name":"test (a)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:50Z"},
-{"name":"test (b)","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:50Z"}
-]}
-JOBS
-SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_STALL_SECONDS=300 \
+target_shard "$RUN_O" "test (a)"
+green_shard 7832 "test (a)" 5
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" \
   bash "$ADM" --print-bounds "$RUN_O" --repo x/y >"$TMP/bounds-o.txt" 2>&1
-grep -q '^stall=300$' "$TMP/bounds-o.txt" \
-  && pass "(P2-9) a raised stall window (300s) is accepted with the default floor" \
-  || { fail "(P2-9) the default-order path was refused: $(head -1 "$TMP/bounds-o.txt")"; sed 's/^/      /' "$TMP/bounds-o.txt"; }
-grep -q '^rerun-timeout=600$' "$TMP/bounds-o.txt" \
-  && pass "(P2-9) …and the default floor is 2 x stall (600 = 2 x 300), above the 300s window" \
-  || fail "(P2-9) expected the default floor 600, got: $(head -1 "$TMP/bounds-o.txt")"
+grep -q '^rerun-timeout=1200$' "$TMP/bounds-o.txt" \
+  && pass "(P2-9) the default floor (1200) lifts a 10s green bound" \
+  || { fail "(P2-9) the default floor was not applied: $(head -1 "$TMP/bounds-o.txt")"; sed 's/^/      /' "$TMP/bounds-o.txt"; }
 
 # (P2-10) POLL_INTERVAL is a timing knob too: non-numeric is refused (a 600s
 # window would become a 600-poll busy spin of gh calls), while 0 stays LEGAL as
@@ -2416,101 +2480,6 @@ grep -q "refusing ADMIN_MERGE_POLL_INTERVAL='abc'" "$TMP/err" \
 ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" --print-bounds >/dev/null 2>"$TMP/err"
 [ $? -eq 0 ] && pass "(P2-10) …and 0 stays LEGAL (the deterministic test seam)" \
   || fail "(P2-10) the 0 test seam was refused: $(head -1 "$TMP/err")"
-
-# ── 42. THE CEILING MUST *CLEAR* THE STALL WINDOW — EQUALITY AND THE ONE-POLL GAP ──
-# The #1167 cycle-3 review P1: the ordering refusal used `-lt`, so EQUALITY was
-# ACCEPTED. But wait_for_run's loop condition is the CEILING
-# (`waited < RERUN_TIMEOUT`) while the stall check is INSIDE the body, and
-# `waited`/`idle` both start at 0 and advance by the SAME step — so with
-# CEILING == STALL there is NO iteration where `waited < T` and `idle >= S` both
-# hold, and the loop ALWAYS exits via `return 2` (CEILING). STALLED is unreachable
-# and a wedged run is printed as "still RUNNING" — the opposite remedy, which is
-# exactly the transposition this rail exists to prevent. A ceiling one poll ABOVE
-# the window is unsafe for the same reason (only multiples of the step are
-# reachable: STALL=605, CEILING=606, POLL=10 first reaches waited=610 > 606), and
-# the explicit `--rerun-timeout` was a THIRD unchecked path. Every assertion below
-# FAILS against the pre-fix rail (which exited 0 = accepted).
-echo "== 42. the ceiling must clear the stall window (equality and the one-poll gap) =="
-
-# (P1-11) the EQUALITY boundary. FLOOR == STALL was accepted, and re-created B7.
-new_scen order-equality
-ADMIN_MERGE_RERUN_FLOOR=600 ADMIN_MERGE_STALL_SECONDS=600 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
-rc=$?
-[ "$rc" -eq 2 ] && pass "(P1-11) FLOOR == STALL is refused (equality is no margin)" \
-  || fail "(P1-11) FLOOR == STALL was accepted (exit $rc) — STALLED is unreachable at the boundary"
-grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='600'" "$TMP/err" \
-  && pass "(P1-11) …named by knob and value" \
-  || { fail "(P1-11) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
-grep -q "610s or more is required" "$TMP/err" \
-  && pass "(P1-11) …and names the minimum (stall 600 + poll 10)" \
-  || fail "(P1-11) the refusal does not state the required minimum"
-
-# (P1-12) the fail-safe on a no-green-sample shard takes the value VERBATIM, so
-# FAILSAFE == STALL is the same hole.
-new_scen order-equality-failsafe
-ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK=600 ADMIN_MERGE_STALL_SECONDS=600 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
-rc=$?
-[ "$rc" -eq 2 ] && pass "(P1-12) FAILSAFE == STALL is refused (equality is no margin)" \
-  || fail "(P1-12) FAILSAFE == STALL was accepted (exit $rc)"
-grep -q "refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='600'" "$TMP/err" \
-  && pass "(P1-12) …named by knob and value" \
-  || fail "(P1-12) the refusal does not name the knob/value"
-
-# (P1-13) THE ONE-POLL GAP — the reviewer-verified repro on the real rail:
-# STALL=605, CEILING=606, POLL=10. 606 > 605, so the old `-lt` refusal accepted it,
-# but the first reachable waited >= 605 is 610 > 606 — it exits at the CEILING with
-# the stall never observed.
-new_scen order-one-poll-gap
-ADMIN_MERGE_STALL_SECONDS=605 ADMIN_MERGE_POLL_INTERVAL=10 \
-  bash "$ADM" --print-bounds --rerun-timeout 606 >"$TMP/out" 2>"$TMP/err"
-rc=$?
-[ "$rc" -eq 2 ] && pass "(P1-13) a ceiling one poll above the window (606 over 605 @ poll 10) is refused" \
-  || fail "(P1-13) the one-poll gap was accepted (exit $rc) — the STALL would never be observed"
-grep -q "615s or more is required" "$TMP/err" \
-  && pass "(P1-13) …naming 615s (= 605 + 10) as the minimum" \
-  || fail "(P1-13) the refusal does not state the required minimum"
-
-# (P1-14) …and the boundary is exactly where the rule claims: 615 accepted, 614 not.
-new_scen order-one-poll-gap-ok
-ADMIN_MERGE_STALL_SECONDS=605 ADMIN_MERGE_POLL_INTERVAL=10 \
-  bash "$ADM" --print-bounds --rerun-timeout 615 >"$TMP/out" 2>"$TMP/err"
-rc=$?
-[ "$rc" -eq 0 ] && pass "(P1-14) a ceiling AT the minimum (615 = 605 + 10) is accepted" \
-  || fail "(P1-14) the exact minimum was refused (exit $rc): $(head -1 "$TMP/err")"
-grep -q '^rerun-timeout=615$' "$TMP/out" \
-  && pass "(P1-14) …and the accepted value is what it prints" \
-  || fail "(P1-14) the accepted ceiling is not printed"
-ADMIN_MERGE_RERUN_FLOOR=614 ADMIN_MERGE_STALL_SECONDS=605 ADMIN_MERGE_POLL_INTERVAL=10 \
-  bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
-[ "$?" -eq 2 ] && pass "(P1-14) …while one below it (614) is refused" \
-  || fail "(P1-14) a floor one below the minimum was accepted"
-
-# (P1-15) the DEFAULT path keeps clearing the margin: with a raised stall window and
-# no floor override, floor = 2 x stall, which still clears stall + poll.
-new_scen order-default-margin
-ADMIN_MERGE_STALL_SECONDS=600 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
-[ "$?" -eq 0 ] && pass "(P1-15) the default floor (1200) still clears stall 600 + poll 10" \
-  || fail "(P1-15) the default path was refused: $(head -1 "$TMP/err")"
-
-# (P2-11) THE THIRD PATH: an explicit --rerun-timeout was checked for positivity
-# only, so `--rerun-timeout 5` over a 100s window was accepted and reported a
-# frozen-clock run as the CEILING at 5s — the same transposition.
-new_scen order-explicit
-ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=10 \
-  bash "$ADM" --print-bounds --rerun-timeout 5 >"$TMP/out" 2>"$TMP/err"
-rc=$?
-[ "$rc" -eq 2 ] && pass "(P2-11) an explicit --rerun-timeout below stall + poll is refused" \
-  || fail "(P2-11) --rerun-timeout 5 over a 100s window was accepted (exit $rc)"
-grep -q "refusing --rerun-timeout '5'" "$TMP/err" \
-  && pass "(P2-11) …naming the flag and its value" \
-  || fail "(P2-11) the refusal does not name the flag/value"
-grep -q "110s or more is required" "$TMP/err" \
-  && pass "(P2-11) …and the same minimum the floor/fail-safe use (100 + 10)" \
-  || fail "(P2-11) the refusal does not state the required minimum"
-ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=10 \
-  bash "$ADM" --print-bounds --rerun-timeout 110 >"$TMP/out" 2>"$TMP/err"
-[ "$?" -eq 0 ] && pass "(P2-11) …while a value AT the minimum (110) is accepted" \
-  || fail "(P2-11) the exact minimum was refused: $(head -1 "$TMP/err")"
 
 # (P2-12) POLL_INTERVAL: 'all digits' is not 'usable'. An all-digit value PAST the
 # shell's integer range passed counter_is_number and then made `[ "$step" -gt 0 ]`
@@ -2534,59 +2503,20 @@ ADMIN_MERGE_POLL_INTERVAL=30 bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
 [ "$?" -eq 0 ] && pass "(P2-12) …while a paced value inside it (30) is accepted" \
   || fail "(P2-12) the in-range poll interval was refused: $(head -1 "$TMP/err")"
 
-# ── 43. A LEADING ZERO IS REFUSED — THE OCTAL/DECIMAL SPLIT (#1167 cycle-5 review) ──
+# ── 43. A LEADING ZERO IS REFUSED — THE OCTAL/DECIMAL SPLIT ────────────────
 # Three parsers read the same timing string, and they disagree. bash ARITHMETIC
 # reads a leading-zero all-digit value as OCTAL; the `test` builtin, `sleep`, and
-# the counter predicates all read it as DECIMAL. So the guard's computed minimum
-# sat BELOW the window the wait actually enforced: `STALL=0100 --rerun-timeout 74`
-# was ACCEPTED (the guard computed 64 + 10 = 74) while `[ "$idle" -ge 0100 ]`
-# needed 100 — the loop exited via the CEILING and STALLED was NEVER observed,
-# printing a wedged run as "still RUNNING" with the OPPOSITE remedy. That is the
-# exact B7 transposition this PR exists to eliminate. The sibling divergence is
-# `sleep`: `POLL_INTERVAL=010` is accounted as octal 8 but sleeps 10s. And
-# `08`/`0999` are not valid octal at all, so the file-scope `2 x` expansion ERRORED
-# `value too great for base`, left RERUN_FLOOR UNSET, and aborted under `set -u`
-# with `RERUN_FLOOR: unbound variable` — fail-closed, but a crash instead of the
-# actionable named refusal the file-scope comment promised. Every assertion whose
-# comment says it FAILS pre-fix does so against HEAD 2603c0b.
+# the counter predicates all read it as DECIMAL. `POLL_INTERVAL=010` is the live
+# case: `10#$step` advances the clock by 10 while `sleep` sleeps 10 — one spelling
+# must have one meaning. `08`/`0999` are not valid octal at all. The flat stall
+# window is gone, so the refusal now covers the knobs that remain (floor,
+# fail-safe, poll interval) plus the explicit flag's own parse site.
 echo "== 43. a leading zero is refused (the octal/decimal split) =="
 
-# (P1-16) THE REVIEWER'S EXACT REPRO. Pre-fix: exit 0 (accepted) and a
-# `rerun-timeout=74` printed over what is really a 100s stall window.
-new_scen leading-zero-rerun
-ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 \
-  bash "$ADM" --print-bounds --rerun-timeout 74 >"$TMP/out" 2>"$TMP/err"
-rc=$?
-[ "$rc" -eq 2 ] && pass "(P1-16) STALL=0100 with --rerun-timeout 74 is refused (exit 2)" \
-  || fail "(P1-16) the octal/decimal hole was accepted (exit $rc) — STALLED would never fire"
-grep -q "refusing ADMIN_MERGE_STALL_SECONDS='0100'" "$TMP/err" \
-  && pass "(P1-16) …and the refusal names the leading-zero stall window" \
-  || { fail "(P1-16) the refusal does not name the knob/value"; sed 's/^/      /' "$TMP/err"; }
-grep -q '^rerun-timeout=' "$TMP/out" \
-  && fail "(P1-16) the refused config still printed a ceiling" \
-  || pass "(P1-16) …and no ceiling was printed for the refused config"
-
-# (P1-17) the FLOOR in the band [74, 100): octal-reading, the guard's minimum is
-# 74 and the real window is 100 — a ceiling inside the band clears the octal
-# minimum while still falling short of the decimal window. Pre-fix: exit 0.
-new_scen leading-zero-floor
-ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=74 \
-  bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
-rc=$?
-[ "$rc" -eq 2 ] && pass "(P1-17) STALL=0100 with FLOOR=74 (band [74,100)) is refused (exit 2)" \
-  || fail "(P1-17) a floor inside the band was accepted (exit $rc)"
-grep -q "refusing ADMIN_MERGE_STALL_SECONDS='0100'" "$TMP/err" \
-  && pass "(P1-17) …named by the leading-zero stall window" \
-  || fail "(P1-17) the refusal does not name the leading-zero stall window"
-
 # (P1-18) the refusal is UNIFORM across every timing knob, so no single knob can
-# still be read in two bases — including the `sleep` pacing divergence for
-# POLL_INTERVAL and the file-scope default for STALL. Each chosen value was
-# ACCEPTED (exit 0) by the pre-fix rail, so every iteration fails without the fix:
-# `0700` clears the decimal minimum (600 + 10) while the floor is the one knob the
-# old rail read consistently (test/python both decimal), and `03900` / `010` are
-# accepted outright.
-for spec in "ADMIN_MERGE_STALL_SECONDS|0100" "ADMIN_MERGE_RERUN_FLOOR|0700" \
+# still be read in two bases. `0700`/`03900` are ambiguous regardless; `010` is
+# the live pacing divergence (accounted as 8 by arithmetic, slept as 10).
+for spec in "ADMIN_MERGE_RERUN_FLOOR|0700" \
             "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010"; do
   knob="${spec%%|*}"; val="${spec#*|}"
   new_scen "leading-zero-$knob"
@@ -2598,11 +2528,9 @@ for spec in "ADMIN_MERGE_STALL_SECONDS|0100" "ADMIN_MERGE_RERUN_FLOOR|0700" \
     fail "(P1-18) $knob=$val was NOT refused (exit $rc): $(head -1 "$TMP/err")"
   fi
 done
-# …and the explicit flag's own parse site is the third path. `0110` clears the
-# decimal minimum (100 + 10) so the PRE-fix rail ACCEPTED it (exit 0); the spelling
-# is ambiguous regardless, so it is refused by name now.
+# …and the explicit flag's own parse site is a separate path.
 new_scen leading-zero-flag
-ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=10 \
+ADMIN_MERGE_POLL_INTERVAL=10 \
   bash "$ADM" --print-bounds --rerun-timeout 0110 >"$TMP/out" 2>"$TMP/err"
 rc=$?
 [ "$rc" -eq 2 ] && pass "(P1-18) --rerun-timeout 0110 is refused by name (exit 2)" \
@@ -2611,38 +2539,34 @@ grep -q "refusing --rerun-timeout '0110'" "$TMP/err" \
   && pass "(P1-18) …naming the flag and its value" \
   || fail "(P1-18) the flag refusal does not name the value"
 
-# (P2-13) THE FILE-SCOPE GUARD'S OWN CLASS: an all-digit INVALID-OCTAL value is
-# all-digit, so the old `''|*[!0-9]*` guard let it into `$((2 * …))`, which errored
-# `value too great for base`, left RERUN_FLOOR UNSET, and aborted under `set -u` at
-# the first use. Pre-fix: exit 1, no named refusal, both crash strings present.
+# (P2-13) an all-digit INVALID-OCTAL value (`08`, `0999`) must give the NAMED
+# refusal, not a crash: it is all-digit, so a naive `''|*[!0-9]*` guard would let
+# it into an arithmetic site that errors `value too great for base`.
 for bad in 0999 08 0008; do
   new_scen "invalid-octal-$bad"
-  ADMIN_MERGE_STALL_SECONDS="$bad" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
+  ADMIN_MERGE_RERUN_FLOOR="$bad" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
   rc=$?
-  if [ "$rc" -eq 2 ] && grep -q "refusing ADMIN_MERGE_STALL_SECONDS='$bad'" "$TMP/err" \
+  if [ "$rc" -eq 2 ] && grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='$bad'" "$TMP/err" \
      && ! grep -q 'unbound variable' "$TMP/err" \
      && ! grep -q 'value too great for base' "$TMP/err"; then
-    pass "(P2-13) STALL=$bad gives the NAMED refusal (exit 2), not a set -u crash"
+    pass "(P2-13) FLOOR=$bad gives the NAMED refusal (exit 2), not a crash"
   else
-    fail "(P2-13) STALL=$bad did not give the promised refusal (exit $rc): $(head -1 "$TMP/err")"
+    fail "(P2-13) FLOOR=$bad did not give the promised refusal (exit $rc): $(head -1 "$TMP/err")"
   fi
 done
 
 # (P2-13b) THE DECIMAL CONTRACT IS UNCHANGED — the refusal targets the SPELLING,
-# not the value, so a no-leading-zero window at the same numeric value still works.
+# not the value, so a no-leading-zero value at the same numeric value still works.
 new_scen leading-zero-decimal-ok
-ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=10 \
+ADMIN_MERGE_POLL_INTERVAL=10 \
   bash "$ADM" --print-bounds --rerun-timeout 110 >"$TMP/out" 2>"$TMP/err"
-[ "$?" -eq 0 ] && pass "(P2-13b) the decimal spelling (STALL=100) is still accepted" \
+[ "$?" -eq 0 ] && pass "(P2-13b) the decimal spelling (--rerun-timeout 110) is still accepted" \
   || fail "(P2-13b) the decimal spelling was refused: $(head -1 "$TMP/err")"
-grep -q '^stall=100$' "$TMP/out" \
-  && pass "(P2-13b) …and the window is read as decimal and printed verbatim" \
-  || fail "(P2-13b) the stall window was not printed as 100"
 grep -q '^rerun-timeout=110$' "$TMP/out" \
-  && pass "(P2-13b) …and the minimum (100 + 10) is enforced in decimal" \
-  || fail "(P2-13b) the minimum was not enforced in decimal: $(head -1 "$TMP/out")"
+  && pass "(P2-13b) …and read as decimal, printed verbatim" \
+  || fail "(P2-13b) the value was not printed as 110: $(head -1 "$TMP/out")"
 
-# ── 44. THE `10#` BELT IS DECIMAL — PINNED BEYOND THE REFUSAL GATE (#1167 review P2) ──
+# ── 44. THE `10#` BELT IS DECIMAL — PINNED BEYOND THE REFUSAL GATE ────────
 # Section 43 pins the REFUSAL of a leading zero, and that refusal exits FIRST: a
 # leading-zero knob is rejected before any `$((…))` site consumes it, so removing a
 # `10#` prefix changes nothing observable through the rail's front door — the exact
@@ -2650,15 +2574,10 @@ grep -q '^rerun-timeout=110$' "$TMP/out" \
 # `main "$@"` entrypoint stripped) into a subshell and STUBS the refusal predicate
 # `counter_has_leading_zero`, so the arithmetic runs on a leading-zero operand and
 # the BASE is the only thing left deciding the outcome:
-#   * `validate_timing_knobs` and `main` are called directly, exercising
-#     `min_ceiling` (:440) and `min_wait` (:1092) — both operands of each;
-#   * `wait_for_run` is called directly with POLL_INTERVAL=010, exercising all four
-#     `+ 10#$step` advances (:816/:818/:824/:831) via the poll count and rc;
-#   * the file-scope `2 x` default (:220) is UNREACHABLE through its `case` guard (a
-#     leading zero is routed to the no-expansion branch), so its expression is read
-#     AS WRITTEN from the artifact and evaluated with a leading-zero operand.
-# EVERY assertion below goes RED when its `10#` is removed — each of the nine
-# prefixes was mutated in turn to prove it.
+#   * `wait_for_run` is called directly with POLL_INTERVAL=010, exercising its
+#     `+ 10#$step` advances in BOTH branches — the unobservable branch (`unobs`
+#     and `waited`) and the progress branch (`waited`) — via the poll count and rc.
+# EVERY assertion below goes RED when its `10#` is removed.
 echo "== 44. the 10# belt is decimal (independent of the refusal gate) =="
 
 # The rail's definitions with the entrypoint stripped. The refusal predicate and
@@ -2676,74 +2595,30 @@ eval "$BELT_EVAL"
 BELTEOF
 
 # (B0) POSITIVE CONTROL — the harness is not "always refuses". With the belt in
-# place a floor that CLEARS the decimal minimum (110) is accepted, so a broken
-# probe cannot read as a pass.
+# place a positive floor is accepted, so a broken probe cannot read as a pass.
 env BELT_DEFS="$BELT_DEFS" BELT_EVAL='validate_timing_knobs' \
-  ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=110 \
+  ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=110 \
   bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
-[ "$?" -eq 0 ] && pass "(B0) the bypassed harness ACCEPTS a floor that clears the decimal minimum" \
-  || fail "(B0) the decimal control config was refused: $(head -1 "$TMP/err")"
+[ "$?" -eq 0 ] && pass "(B0) the bypassed harness ACCEPTS a valid floor" \
+  || fail "(B0) the control config was refused: $(head -1 "$TMP/err")"
 
-# (B1) :440 min_ceiling, the STALL operand. 10#0100 + 10#10 = 110 decimal, so a
-# floor of 100 is REFUSED; octal-reading the minimum is 64 + 10 = 74 and 100 clears
-# it. Pre-removal rc=1; with the prefix gone rc=0.
-env BELT_DEFS="$BELT_DEFS" BELT_EVAL='validate_timing_knobs' \
-  ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=100 \
-  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
-rc=$?
-{ [ "$rc" -eq 1 ] && grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='100'" "$TMP/err"; } \
-  && pass "(B1) min_ceiling reads STALL=0100 as DECIMAL (floor 100 < 110 → refused)" \
-  || fail "(B1) min_ceiling read 0100 as octal 64 (rc=$rc; a floor of 100 would clear 74)"
-
-# (B2) :440 min_ceiling, the STEP operand. STALL=100, POLL=010 → decimal 100 + 10 =
-# 110 refuses a floor of 109; octal 100 + 8 = 108 accepts it.
-env BELT_DEFS="$BELT_DEFS" BELT_EVAL='validate_timing_knobs' \
-  ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=010 ADMIN_MERGE_RERUN_FLOOR=109 \
-  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
-rc=$?
-{ [ "$rc" -eq 1 ] && grep -q "refusing ADMIN_MERGE_RERUN_FLOOR='109'" "$TMP/err"; } \
-  && pass "(B2) min_ceiling reads POLL=010 as DECIMAL (floor 109 < 110 → refused)" \
-  || fail "(B2) min_ceiling read 010 as octal 8 (rc=$rc; a floor of 109 would clear 108)"
-
-# (B3) :1092 min_wait, the STALL operand — the reviewer's exact mutation site. An
-# explicit --rerun-timeout 100 must be REFUSED because the decimal minimum is
-# 0100 + 10 = 110; octal-reading it is 64 + 10 = 74 and 100 clears that.
-env BELT_DEFS="$BELT_DEFS" BELT_EVAL='main --print-bounds --rerun-timeout 100' \
-  ADMIN_MERGE_STALL_SECONDS=0100 ADMIN_MERGE_POLL_INTERVAL=10 ADMIN_MERGE_RERUN_FLOOR=110 \
-  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
-rc=$?
-{ [ "$rc" -eq 2 ] && grep -q "refusing --rerun-timeout '100'" "$TMP/err"; } \
-  && pass "(B3) min_wait reads STALL=0100 as DECIMAL (timeout 100 < 110 → refused)" \
-  || fail "(B3) min_wait read 0100 as octal 64 (rc=$rc) — the mutation the review reproduced"
-
-# (B4) :1092 min_wait, the STEP operand. STALL=100, POLL=010, --rerun-timeout 109 →
-# decimal 100 + 10 = 110 refuses it; octal 100 + 8 = 108 accepts it.
-env BELT_DEFS="$BELT_DEFS" BELT_EVAL='main --print-bounds --rerun-timeout 109' \
-  ADMIN_MERGE_STALL_SECONDS=100 ADMIN_MERGE_POLL_INTERVAL=010 ADMIN_MERGE_RERUN_FLOOR=110 \
-  bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
-rc=$?
-{ [ "$rc" -eq 2 ] && grep -q "refusing --rerun-timeout '109'" "$TMP/err"; } \
-  && pass "(B4) min_wait reads POLL=010 as DECIMAL (timeout 109 < 110 → refused)" \
-  || fail "(B4) min_wait read 010 as octal 8 (rc=$rc)"
-
-# The four `wait_for_run` advances, driven directly with POLL=010. The step is
-# DECIMAL 10 when the belt holds, so each window is reached on the poll count below;
-# an octal step of 8 stretches every one of them (counts 14 for the first, 13 for
-# the rest). rc comes from the return code, the count from the fake gh's calls.
-belt_wait() {  # belt_wait <frozen|unknown|changing> <stall> <timeout>
-  local mode="$1" stall="$2" timeout="$3" cnt="$TMP/belt-calls-$1-$2-$3" snippet
+# The `wait_for_run` advances, driven directly with POLL=010 (DECIMAL 10; an
+# octal-reading step is 8, so a bound of 100 is reached on 10 polls vs 13). rc is
+# the return code, the count comes from the fake gh's calls.
+belt_wait() {  # belt_wait <unknown|progress> <bound> [explicit]
+  local mode="$1" bound="$2" explicit="${3:-0}"
+  local cnt="$TMP/belt-calls-$mode-$bound-$explicit" snippet
   : > "$cnt"
   snippet='belt_fake_gh() { printf "x\n" >> "$BELT_CNT"; case "$BELT_MODE" in
-      frozen)   printf "in_progress 2024-01-01T00:00:00Z\n" ;;
-      unknown)  printf "unknown \n" ;;
-      changing) printf "in_progress 2024-01-01T00:00:%s Z\n" "$(wc -l < "$BELT_CNT" | tr -d " ")" ;;
+      unknown)  printf "unknown\n" ;;
+      progress) printf "in_progress\n" ;;
     esac; }
 wait_for_run 1; belt_rc=$?
 printf "rc=%s polls=%s\n" "$belt_rc" "$(wc -l < "$BELT_CNT" | tr -d " ")"'
   env BELT_DEFS="$BELT_DEFS" BELT_EVAL="$snippet" \
       BELT_MODE="$mode" BELT_CNT="$cnt" ADMIN_MERGE_GH=belt_fake_gh \
-      RERUN_TIMEOUT="$timeout" RERUN_TIMEOUT_SOURCE=test \
-      ADMIN_MERGE_STALL_SECONDS="$stall" ADMIN_MERGE_POLL_INTERVAL=010 \
+      RERUN_TIMEOUT="$bound" RERUN_TIMEOUT_SOURCE=test RERUN_TIMEOUT_EXPLICIT="$explicit" \
+      ADMIN_MERGE_POLL_INTERVAL=010 \
       bash "$BELT_PROBE" >"$TMP/out" 2>"$TMP/err"
   local line
   line="$(grep -E '^rc=[0-9]+ polls=[0-9]+$' "$TMP/out" | tail -1)"
@@ -2751,46 +2626,27 @@ printf "rc=%s polls=%s\n" "$belt_rc" "$(wc -l < "$BELT_CNT" | tr -d " ")"'
   BELT_POLLS="${line##*polls=}"
 }
 
-# (B5) :824 idle. A FROZEN clock reaches STALLED (rc=1) on the 11th poll with a
-# decimal step (the first poll only records `last_upd`); an octal step needs 14.
-belt_wait frozen 100 1000
-{ [ "$BELT_RC" = 1 ] && [ "$BELT_POLLS" = 11 ]; } \
-  && pass "(B5) wait_for_run idle advance (:824) is DECIMAL — STALLED on poll 11" \
-  || fail "(B5) idle advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want 11)"
-
-# (B6) :816 unobs. An UNREADABLE run reaches UNOBSERVABLE (rc=3) after 10 decimal
-# polls; an octal step needs 13.
-belt_wait unknown 100 1000
+# (B6) the UNOBSERVABLE branch: an unreadable run reaches UNOBSERVABLE (rc=3)
+# after 10 decimal polls; an octal step needs 13. Both `unobs +=` and `waited +=`
+# in that branch are exercised.
+belt_wait unknown 100
 { [ "$BELT_RC" = 3 ] && [ "$BELT_POLLS" = 10 ]; } \
-  && pass "(B6) wait_for_run unobs advance (:816) is DECIMAL — UNOBSERVABLE on poll 10" \
-  || fail "(B6) unobs advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want 10)"
+  && pass "(B6) wait_for_run's unobservable-branch advances are DECIMAL — rc=3 on poll 10" \
+  || fail "(B6) the unobs-branch advances read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want rc=3 polls=10)"
 
-# (B7) :818 waited, in the unobservable branch. With a stall far above the ceiling
-# the loop exits at the CEILING (rc=2) after 10 decimal polls; an octal step needs 13.
-belt_wait unknown 1000 100
+# (B7) the PROGRESS branch: an in_progress run exceeds the DERIVED bound (rc=1) at
+# 10 decimal polls; an octal step needs 13.
+belt_wait progress 100
+{ [ "$BELT_RC" = 1 ] && [ "$BELT_POLLS" = 10 ]; } \
+  && pass "(B7) wait_for_run's progress-branch advance is DECIMAL — rc=1 on poll 10" \
+  || fail "(B7) the progress advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want rc=1 polls=10)"
+
+# (B8) …and an EXPLICIT bound returns CEILING (2) at the same decimal cadence, so
+# the belt is not silently swapping the verdict.
+belt_wait progress 100 1
 { [ "$BELT_RC" = 2 ] && [ "$BELT_POLLS" = 10 ]; } \
-  && pass "(B7) wait_for_run waited/UNOBS branch (:818) is DECIMAL — CEILING on poll 10" \
-  || fail "(B7) the :818 advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want 10)"
-
-# (B8) :831 waited, on the progressing branch. Same ceiling, but the clock MOVES each
-# poll so `idle` never fires; the exit is the ceiling after 10 decimal polls.
-belt_wait changing 1000 100
-{ [ "$BELT_RC" = 2 ] && [ "$BELT_POLLS" = 10 ]; } \
-  && pass "(B8) wait_for_run waited advance (:831) is DECIMAL — CEILING on poll 10" \
-  || fail "(B8) the :831 advance read POLL=010 as octal 8 (rc=$BELT_RC polls=$BELT_POLLS, want 10)"
-
-# (B9) :220 the file-scope `2 x` default. Its `10#` is unreachable through the case
-# guard, so the EXPRESSION is read as written and evaluated with STALL=0100: the
-# belt yields 2 x 100 = 200; the octal default yields 2 x 64 = 128.
-belt_line220="$(grep -m1 'RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-\$((' "$ADM")"
-belt_expr220="$(printf '%s\n' "$belt_line220" | sed -n 's/.*\$((\(.*\))).*/\1/p')"
-# eval, not a bare `$(( $belt_expr220 ))`: bash expands a parameter ONCE, so an
-# expression pulled out of a variable is not re-scanned for `$VAR` inside it. The
-# eval is what re-reads `$RERUN_STALL_SECONDS` at the leading-zero operand.
-belt_val220="$(RERUN_STALL_SECONDS=0100; eval "echo \$(( ${belt_expr220} ))")"
-[ "$belt_val220" = 200 ] \
-  && pass "(B9) the file-scope 2 x default (:220) reads STALL=0100 as DECIMAL (200, not 128)" \
-  || fail "(B9) the file-scope default fell to octal: got '${belt_val220}' (want 200)"
+  && pass "(B8) an explicit bound is a CEILING (rc=2) at the decimal cadence" \
+  || fail "(B8) the explicit bound mis-resolved (rc=$BELT_RC polls=$BELT_POLLS, want rc=2 polls=10)"
 
 # ── 45. E5 IN THE RAIL: an identity that MOVED is never exempt-and-silent ───
 # RENUMBERED TWICE (was §33 on the #1147 branch, then §38 on origin/main).
