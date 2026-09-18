@@ -390,6 +390,39 @@ def decide(
     main_signatures: dict[str, frozenset[str]] | None = None,
     rotating: dict[str, frozenset[str]] | None = None,
     k_pr: int | None = None,
+
+    # ⚠️ KNOWN, ACCEPTED, DOCUMENTED GAP — owner-authorized "Option B" on tortoise #3756.
+    #
+    # THIS IS A FAIL-OPEN IN THE EXEMPTION PATH. It is documented, not fixed, and the fix is
+    # deferred BY THE OWNER — do not "fix" it here by surprise, and do not mistake it for an
+    # undiscovered bug.
+    #
+    # THE FAILURE MODE (state it plainly — the next reader needs this, not the arithmetic):
+    # the tolerance is MULTIPLICATIVE, so the band that counts as "rates equivalent" WIDENS in
+    # absolute terms as main's rate rises. A PR that fails EVERY SINGLE RUN is therefore EXCUSED
+    # once main is broken enough — A DETERMINISTIC TOTAL FAILURE TREATED AS A RATE FLUCTUATION.
+    #
+    # Concretely, with the default 1.5, THE RATE CONDITION for exemption is
+    # `pr_rate <= mr.rate * 1.5` — and note that this is the NECESSARY rate test, not the whole
+    # rule: FIVE earlier gates BLOCK first and are checked in order ahead of it — an empty PR
+    # sample, a rotating/UNATTRIBUTABLE identity, an id absent from `main_rates`, non-overlapping
+    # signatures, and `mr.runs < min_runs`. Only if all five pass does the rate test decide.
+    # A PR failing every run has `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — ONCE MAIN IS
+    # ABOUT TWO-THIRDS BROKEN (~0.667) — the rate test no longer stops it, and it is EXEMPTED
+    # provided those earlier gates held. Past that point the gate reads a total, deterministic
+    # failure as "no worse than main", and the more broken main gets, the wider this door opens.
+    #
+    # Note the asymmetry, which is why this is a fail-open and not a tuning complaint: the input
+    # on the PR side is a TOTAL failure (every run failed) while the input on the main side is a
+    # SAMPLE over a finite `k`. The comparison therefore weighs a stronger signal against a weaker
+    # one, and the tolerance grows as the weaker side degrades. (`pr_rate` is still a rate over a
+    # finite sample, so "total" here means "every observed run", not an infinite certainty — the
+    # asymmetry is real but it is one of evidence strength, not of logical certainty.)
+    #
+    # DEFERRED FIX DIRECTION (owner-authorized as a follow-up, NOT to be applied here): a tolerance
+    # that cannot excuse a TOTAL failure — e.g. an absolute floor, or refusing to exempt whenever
+    # `pr_rate` is exactly 1.0 — since no rate comparison can make a 100% failure equivalent to
+    # anything.
     rate_tolerance: float = 1.5,
     min_runs: int = 3,
 ) -> Decision:
