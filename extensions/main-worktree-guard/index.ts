@@ -1592,7 +1592,17 @@ function _worktreeDiscardBlock(command: string): string | null {
     return _worktreeDiscardBlockReason(
       { form: "script-indirection", scope: "all", pathspecs: [] },
       execCwd,
-      "the script path is not statically resolvable, so its effect cannot be verified",
+      // Three jobs, in one line, in the operator's order:
+      //   WHAT  — the script's path is built at runtime, so the guard cannot read it.
+      //   SO WHAT — an unreadable script may discard in ANY checkout, so it is refused
+      //             rather than assumed clean. (Deliberately NOT "your checkout is dirty":
+      //             the guard never measured that, and asserting it is what sent four
+      //             consecutive rail attempts hunting a phantom dirty tree.)
+      //   NOW WHAT — the exact edit that makes it verifiable: a literal path.
+      "the script path is not statically resolvable — it is built at runtime (`$VAR` or a " +
+        "backtick), so the guard cannot read the script, and an unreadable script may discard " +
+        "uncommitted work in ANY checkout; spell the path literally (e.g. " +
+        "`bash ./tools/your-script.sh`) so its contents can be read and verified",
     );
   }
 
