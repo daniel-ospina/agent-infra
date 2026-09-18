@@ -348,7 +348,7 @@ fleet_gate() {
     exit 1
   fi
   echo ""
-  echo "✅ fleet gate clean — thresholds within the shipped 300K-clamp regime."
+  echo "✅ fleet gate clean — thresholds within the shipped 700K-clamp regime."
   exit 0
 }
 
