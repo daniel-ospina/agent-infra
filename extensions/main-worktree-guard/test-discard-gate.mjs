@@ -379,31 +379,38 @@ async function partB() {
       expectTrue(`B5c: read-only negative — \`${cmd}\` ALLOWED`, allowed(r), `blocked: ${r?.reason?.slice(0, 120)}`);
     }
 
-    // ── #1210: the script-indirection arm must read the target's STATE, not the
-    // command's TEXT. On a CLEAN tree there is nothing to discard, so an
-    // unresolvable script path must NOT block. Before this fix the arm failed
-    // closed here and reported the indirection AS THOUGH it had observed a dirty
-    // checkout — provably false — which froze the rail for four consecutive
-    // attempts across two clean worktrees and blocked every deploy in the fleet.
+    // ── #1210: an unreadable script ALWAYS fails closed, and says WHY honestly.
     //
-    // This is exactly the case the old suite could not see: every existing
-    // script-indirection case ran with a DIRTY tree (B6/B10 below), so the suite
-    // passed both BEFORE and AFTER the fix and pinned nothing about it. These two
-    // cases must be adjacent and must move together — the first REDs if the state
-    // read is removed, the second REDs if it is widened into a fail-open.
+    // The arm's defect was never the refusal — it was that the refusal ASSERTED A
+    // STATE CLAIM IT NEVER OBSERVED ("this checkout carries uncommitted changes to
+    // tracked files") against a provably CLEAN tree, which sent operators hunting a
+    // phantom dirty tree and made four consecutive rail attempts unactionable.
+    //
+    // An unreadable path means the discard target is UNKNOWN, not "nothing": the
+    // script may discard in ANY checkout. A clean session tree therefore does not
+    // entail "nothing to lose" — proved in one run by `bash /tmp/hidden.sh` being
+    // BLOCKED while the identical discard wrapped as `S=…; bash $S` was ALLOWED.
+    // So the block stays and the MESSAGE is what changes.
+    //
+    // B5d is the honest-message pin: it must block, and its reason must NOT claim
+    // the checkout is dirty (it provably is not — this runs before any dirtying).
     const cleanUndoEarly = join(tmp, "undo-clean-early.sh");
     write(cleanUndoEarly, "git checkout -- clean.txt\n");
-    expectTrue("B5d: CLEAN target + unresolvable script path (`S=…; bash $S`) → ALLOWED (state read, not text shape)",
-      allowed(await bash(`S=${cleanUndoEarly}; bash $S`, wt)),
-      "blocked — the arm is asserting a dirty tree it never observed");
+    const indefClean = await bash(`S=${cleanUndoEarly}; bash $S`, wt);
+    expectTrue("B5d: CLEAN tree + unresolvable script path → BLOCKED (unreadable ⇒ unverifiable ⇒ fail closed)",
+      blocked(indefClean),
+      "was allowed — an unreadable script's discard target is UNKNOWN, not nothing");
+    expectTrue("B5d2: its reason does NOT assert a state claim that was never observed",
+      !/carries\s+uncommitted changes/.test(indefClean?.reason ?? "") &&
+      /not statically resolvable/.test(indefClean?.reason ?? ""),
+      `reason=${JSON.stringify(indefClean?.reason ?? "").slice(0, 300)}`);
 
-    // The converse: the SAME shape with a DIRTY target must STILL block. Without
-    // this, the new ALLOW could be satisfied by deleting the arm instead of
-    // fixing it.
+    // The converse: the SAME shape with a DIRTY target must ALSO block — this is
+    // what stops the block being satisfied by an accident of the clean fixture.
     write(join(wt, "dirty.txt"), "MUTANT-EARLY\n");
     expectTrue("B5e: DIRTY target + the same unresolvable script path → STILL BLOCKED (no fail-open)",
       blocked(await bash(`S=${cleanUndoEarly}; bash $S`, wt)),
-      "was allowed — a state read must never let a real discard through");
+      "was allowed — an unreadable script must never let a real discard through");
     // Restore the committed content so the B6 sequence below starts from clean.
     write(join(wt, "dirty.txt"), "v1\n");
 

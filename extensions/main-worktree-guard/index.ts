@@ -1565,26 +1565,35 @@ function _worktreeDiscardBlock(command: string): string | null {
   // the tool executes and the WIP is destroyed. This arm contributes an
   // ARM-LOCAL verdict — it forgoes ONLY the script-indirection reason — and
   // control FALLS THROUGH to the remaining arms.
+  //
+  // ⛔ CYCLE-2 REVIEW, AND IT SETTLES THE ARM: the arm ALWAYS fails closed on an
+  // unreadable script. An earlier revision allowed it when the SESSION tree was
+  // clean, reasoning "nothing to destroy". That is UNSOUND, and the proof is in
+  // the same run: `bash /tmp/hidden.sh` (literal path) is BLOCKED while
+  // `S=/tmp/hidden.sh; bash $S` — the SAME script, the SAME discard — is ALLOWED.
+  //
+  // An unreadable path means the discard target is UNKNOWN, not "nothing". A
+  // clean session tree does not entail "nothing to lose", because the script may
+  // discard in ANY checkout — and this guard already blocks `git -C <other>
+  // checkout` from a clean session tree, so its scope was never the session tree.
+  // Reading the session tree therefore answers a question nobody asked. An
+  // unreadable script is UNVERIFIABLE, and UNVERIFIABLE fails closed.
+  //
+  // ⛔ BUT WHAT WAS WRONG WITH THE ORIGINAL ARM WAS NEVER THE REFUSAL. It was
+  // that the refusal ASSERTED A STATE CLAIM IT NEVER OBSERVED — "this checkout
+  // carries uncommitted changes to tracked files" — against a PROVABLY CLEAN
+  // tree (`git status --porcelain` empty), which sent operators hunting a
+  // phantom dirty tree and made four consecutive attempts unactionable.
+  //
+  // So: KEEP THE BLOCK, AND DO NOT NAME A STATE YOU DID NOT MEASURE. The reason
+  // stated below is true — it names what could not be read, not what the tree
+  // was not observed to be.
   if (_scriptPath && /[$`]/.test(_scriptPath)) {
-    // ⛔ P1 (review): only trust the probe when the execution cwd is RESOLVABLE.
-    // `execCwd` above falls back to `sessionCwd` when the cd chain cannot be
-    // resolved, which would probe the SESSION tree instead of the tree the
-    // command actually runs in — the wrong tree, silently, and the probe's
-    // answer would be about a tree the discard does not touch.
-    const resolvedCwd = commandExecutionCwd(command, sessionCwd);
-    const dirty = resolvedCwd === null
-      ? null
-      : _discardStatusPorcelain(execCwd, { scope: "all", pathspecs: [] });
-    if (dirty !== false) {
-      return _worktreeDiscardBlockReason(
-        { form: "script-indirection", scope: "all", pathspecs: [] },
-        execCwd,
-        dirty === null
-          ? "the target checkout's status could not be read"
-          : "the script path is not statically resolvable",
-      );
-    }
-    // dirty === false: nothing for THIS arm to protect. Fall through.
+    return _worktreeDiscardBlockReason(
+      { form: "script-indirection", scope: "all", pathspecs: [] },
+      execCwd,
+      "the script path is not statically resolvable, so its effect cannot be verified",
+    );
   }
 
   // Probe sets: the command itself, plus any script FILES it runs/sources
