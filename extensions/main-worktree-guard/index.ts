@@ -1532,9 +1532,37 @@ function _worktreeDiscardBlock(command: string): string | null {
   }
 
   // A script path that is not statically resolvable (`bash $S`, `cat x.sh |
-  // sh`) cannot be read and walked — fail closed (reviewer round-5 P1).
+  // sh`) cannot be read and walked. THIS ARM USED TO FAIL CLOSED WITHOUT EVER
+  // READING THE TARGET'S STATE — it reported the script-indirection as though
+  // it had observed a dirty checkout. On a PROVABLY CLEAN tree that false
+  // statement sent the reader hunting a phantom dirty tree: four consecutive
+  // rail attempts, both worktrees, identical result, `git status --porcelain`
+  // empty.
+  //
+  // The invariant this guard protects is "a DIRTY TREE is not discarded". A
+  // clean tree CANNOT violate it — there is nothing for any script to destroy.
+  // So the honest move is not to assume the target's state and assert it, but
+  // to READ it. This is not a relaxation of the gate: it is the invariant
+  // stated directly, instead of the command's TEXT SHAPE standing in for it,
+  // and it still fires on every case where a discard would actually lose work.
+  //
+  // Never assert a state claim that was not observed. Three outcomes:
+  //   false -> target is clean; nothing to destroy; do not fire.
+  //   true  -> target IS dirty and the script cannot be read, so we cannot
+  //            prove it is safe: fail closed, naming the indirection that
+  //            blocked us.
+  //   null  -> the target's status could not be read: fail closed naming THAT,
+  //            which is what we actually know.
   if (_scriptPath && /[$`]/.test(_scriptPath)) {
-    return _worktreeDiscardBlockReason({ form: "script-indirection", scope: "all", pathspecs: [] }, execCwd, "the script path is not statically resolvable");
+    const dirty = _discardStatusPorcelain(execCwd, { scope: "all", pathspecs: [] });
+    if (dirty === false) return null;
+    return _worktreeDiscardBlockReason(
+      { form: "script-indirection", scope: "all", pathspecs: [] },
+      execCwd,
+      dirty === null
+        ? "the target checkout's status could not be read"
+        : "the script path is not statically resolvable",
+    );
   }
 
   // Probe sets: the command itself, plus any script FILES it runs/sources
