@@ -21,6 +21,21 @@ Execute plan by dispatching fresh subagent per task, with two-stage review after
 
 **Core principle:** Fresh subagent per task + two-stage review (spec then quality) = high quality, fast iteration
 
+## Controller Step 0 — Collision Pre-flight
+
+**⛔ Collision pre-flight (tortoise #3061/#4027) — before ANY dispatch.** Where the issue's repo provides `tools/collision_preflight.py` (tortoise), run it and read the exit code. **`--repo` is mandatory:**
+
+```bash
+# TORTOISE=$(git -C <a tortoise worktree> rev-parse --show-toplevel)
+python3 "$TORTOISE"/tools/collision_preflight.py <N> --repo <owner/name>
+```
+
+- `--repo .` **only** when your current worktree IS the issue's repo; otherwise name the target
+  (`--repo daniel-ospina/agent-infra`) — the tool resolves it and prints the issue's full title.
+- **Omitting `--repo` no longer means "use the cwd" — the run REFUSES** (`exit 2`, ambiguous) when
+  the number resolves in more than one repo.
+- `0` CLEAN → proceed · `1` COLLISION → do **not** dispatch · `2` INCOMPLETE → **not** clean.
+
 ## Worktree Ownership Rule (anti-nesting)
 
 **The controller — not the subagent — owns worktree creation.** Subagents must never invoke `using-git-worktrees` or call `git worktree add` on their own. When a subagent dispatched from inside a worktree tries to create its own worktree, the new worktree nests inside the current one (`.worktrees/agent-A/.worktrees/agent-B`), which breaks teardown, leaks commits, and can cascade to 3+ levels.

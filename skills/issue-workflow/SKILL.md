@@ -108,6 +108,19 @@ fi
 
 ## Dispatch
 
+**⛔ Collision pre-flight (tortoise #3061/#4027) — before ANY dispatch.** Where the issue's repo provides `tools/collision_preflight.py` (tortoise), run it and read the exit code. **`--repo` is mandatory:**
+
+```bash
+# TORTOISE=$(git -C <a tortoise worktree> rev-parse --show-toplevel)
+python3 "$TORTOISE"/tools/collision_preflight.py <N> --repo <owner/name>
+```
+
+- `--repo .` **only** when your current worktree IS the issue's repo; otherwise name the target
+  (`--repo daniel-ospina/agent-infra`) — the tool resolves it and prints the issue's full title.
+- **Omitting `--repo` no longer means "use the cwd" — the run REFUSES** (`exit 2`, ambiguous) when
+  the number resolves in more than one repo.
+- `0` CLEAN → proceed · `1` COLLISION → do **not** dispatch · `2` INCOMPLETE → **not** clean.
+
 | Level | Complexity | Dispatches to | Depth |
 |-------|-----------|--------------|-------|
 | `epic` | any | `epic-workflow` | Full: 6 stages, all review gates, 3 human gates |

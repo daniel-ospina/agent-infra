@@ -235,6 +235,19 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 
 **Never create a worktree from inside a worktree.**
 
+**⛔ Collision pre-flight (tortoise #3061/#4027) — before ANY dispatch.** Where the issue's repo provides `tools/collision_preflight.py` (tortoise), run it and read the exit code. **`--repo` is mandatory:**
+
+```bash
+# TORTOISE=$(git -C <a tortoise worktree> rev-parse --show-toplevel)
+python3 "$TORTOISE"/tools/collision_preflight.py <N> --repo <owner/name>
+```
+
+- `--repo .` **only** when your current worktree IS the issue's repo; otherwise name the target
+  (`--repo daniel-ospina/agent-infra`) — the tool resolves it and prints the issue's full title.
+- **Omitting `--repo` no longer means "use the cwd" — the run REFUSES** (`exit 2`, ambiguous) when
+  the number resolves in more than one repo.
+- `0` CLEAN → proceed · `1` COLLISION → do **not** dispatch · `2` INCOMPLETE → **not** clean.
+
 ## Proportional Gating Summary
 
 > This skill uses proportional gates (see proportional-gates v1.0.0). Instead of "always run X," match verification depth to change risk and novelty. A reviewer sub-agent validates gate-skip decisions. The gating decisions scale with: code impact, surface risk, novelty, and reversibility.

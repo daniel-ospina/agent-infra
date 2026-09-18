@@ -64,6 +64,19 @@ done
 
 If `gh` CLI is unavailable, warn and proceed (graceful degradation).
 
+**⛔ Collision pre-flight (tortoise #3061/#4027) — before ANY dispatch.** Where the issue's repo provides `tools/collision_preflight.py` (tortoise), run it and read the exit code. **`--repo` is mandatory:**
+
+```bash
+# TORTOISE=$(git -C <a tortoise worktree> rev-parse --show-toplevel)
+python3 "$TORTOISE"/tools/collision_preflight.py <N> --repo <owner/name>
+```
+
+- `--repo .` **only** when your current worktree IS the issue's repo; otherwise name the target
+  (`--repo daniel-ospina/agent-infra`) — the tool resolves it and prints the issue's full title.
+- **Omitting `--repo` no longer means "use the cwd" — the run REFUSES** (`exit 2`, ambiguous) when
+  the number resolves in more than one repo.
+- `0` CLEAN → proceed · `1` COLLISION → do **not** dispatch · `2` INCOMPLETE → **not** clean.
+
 **Concurrency control:** Max 16 parallel sub-agents per dependency level (bounded by fan-in context + worktree contention, NOT API limits — direct DeepSeek API is concurrency-only: 500 v4-pro / 2,500 v4-flash, #317). Stagger launches by 200ms between agents to smooth provider load. On rate-limit errors, retry with exponential backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for full pattern.
 
 For each dependency level (issues that can run in parallel):
