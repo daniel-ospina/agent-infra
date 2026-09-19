@@ -12,7 +12,7 @@
 // Secrets never sync: auth.json and env vars stay machine-local by design.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, lstatSync, readFileSync, readlinkSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { execSync, execFileSync } from "node:child_process";
 import { isPrintMode } from "./shared/print-mode.js";
@@ -51,22 +51,22 @@ export function syncState(repo: string, branch = "main"): "current" | "behind" |
   const remoteRef = `origin/${branch}`;
   let head: string, remote: string;
   try {
-    head = execSync(`git -C "${repo}" rev-parse HEAD`, { encoding: "utf-8" }).trim();
-    remote = execSync(`git -C "${repo}" rev-parse ${remoteRef}`, { encoding: "utf-8" }).trim();
+    head = execSync(`git -C "${repo}" rev-parse HEAD`, { encoding: "utf-8", timeout: 10_000 }).trim();
+    remote = execSync(`git -C "${repo}" rev-parse ${remoteRef}`, { encoding: "utf-8", timeout: 10_000 }).trim();
   } catch {
     return "current"; // can't determine — don't act
   }
   if (head === remote) return "current";
   // HEAD is an ancestor of origin/<branch> → local is behind (equality excluded above).
   try {
-    execSync(`git -C "${repo}" merge-base --is-ancestor HEAD ${remoteRef}`, { stdio: "ignore" });
+    execSync(`git -C "${repo}" merge-base --is-ancestor HEAD ${remoteRef}`, { stdio: "ignore", timeout: 10_000 });
     return "behind";
   } catch {
     /* not behind */
   }
   // origin/<branch> is an ancestor of HEAD → local has unpushed commits.
   try {
-    execSync(`git -C "${repo}" merge-base --is-ancestor ${remoteRef} HEAD`, { stdio: "ignore" });
+    execSync(`git -C "${repo}" merge-base --is-ancestor ${remoteRef} HEAD`, { stdio: "ignore", timeout: 10_000 });
     return "ahead";
   } catch {
     /* neither is an ancestor → true divergence */
@@ -94,8 +94,15 @@ export function isSafeBranchName(branch: string): boolean {
  *   - the tracked working tree is byte-identical to origin/<branch>
  *     (`git diff origin/<branch> --quiet` exits 0), AND
  *   - every untracked file is absent from origin/<branch> (→ abort: new work) or
- *     byte-identical to it (→ safe to remove; the branch switch restores it).
- * On success the checkout ends on `<branch>` at origin/<branch> (0 divergence)
+ *     byte-identical to it (same mode and same blob) — otherwise abort (→ safe to
+ *     remove; the branch switch restores it), AND
+ *   - the INDEX holds nothing origin/<branch> lacks (a `MM` staged-only edit is
+ *     invisible to a worktree diff, yet the switch resets the index), AND
+ *   - every index-flagged path (`git ls-files -v`, any tag other than `H`) holds
+ *     the same (mode, blob) as origin/<branch> — `assume-unchanged` /
+ *     `skip-worktree` are invisible to `git diff`, so the checks above read clean
+ *     for pinned local content.
+ * On success the checkout ends on `<branch>` at `origin/<branch>` (0 divergence)
  * — the stranded branch itself is left untouched (refs preserved). Never runs
  * in "ahead" state (unpushed commits are real work) and never when the tree
  * holds genuine uncommitted changes.
@@ -116,7 +123,21 @@ export function tryLosslessRecover(
   repo: string,
   opts: { lockHeld?: boolean; branch?: string } = {},
 ): { recovered: boolean; reason?: string } {
-  const key = repoKey(repo);
+  // #1245 (review): canonicalise to the WORK TREE ROOT before anything else.
+  // The checks below run with `-C <root>` and every join() is relative to it,
+  // while the mutation (`checkout -f` + `merge --ff-only`) is WORKTREE-WIDE. A
+  // caller passing a SUBDIRECTORY would otherwise scope `ls-files` and
+  // `diff -- .` to that subtree while still switching the whole worktree — a
+  // modification outside the subtree would be invisible and then destroyed.
+  // The repo lock is keyed on the root for the same reason.
+  let root: string;
+  try {
+    root = execFileSync("git", ["-C", repo, "rev-parse", "--show-toplevel"], { encoding: "utf-8", timeout: 10_000 }).trim();
+  } catch {
+    return { recovered: false, reason: "could not resolve the work tree root (fail-closed)" };
+  }
+  if (!root) return { recovered: false, reason: "not a git work tree — recovery skipped" };
+  const key = repoKey(root);
   let lock: { held: boolean } | null = null;
   if (!opts.lockHeld) {
     lock = key ? acquireRepoLock(key, process.pid, { timeoutMs: 3000 }) : { held: false };
@@ -125,7 +146,7 @@ export function tryLosslessRecover(
     }
   }
   try {
-    return tryLosslessRecoverUnderLock(repo, opts.branch ?? "main");
+    return tryLosslessRecoverUnderLock(root, opts.branch ?? "main");
   } finally {
     if (lock && key) releaseRepoLock(key, process.pid);
   }
@@ -148,6 +169,9 @@ const MAX_COMPARE_BYTES = 64 * 1024 * 1024;
  * `mode` is the git mode (100644 / 100755 / 120000). Anything that is neither a
  * bounded regular file nor a symlink is reported `unusable` WITHOUT being
  * opened — reading a FIFO would block forever while holding the repo lock.
+ * ONLY `ENOENT` is `absent`: folding EACCES/ENOTDIR/ELOOP onto "absent" would let
+ * a caller that treats absent as skippable (step 3b) skip the guard on a path it
+ * could not actually inspect — fail-open in a fail-closed check (#873's class).
  * Exported for direct unit testing. */
 export type LocalEntryRead =
   | { kind: "absent" }
@@ -157,36 +181,49 @@ export type LocalEntryRead =
 export function readLocalEntry(repo: string, rel: string): LocalEntryRead {
   const abs = join(repo, rel);
   let st: ReturnType<typeof lstatSync>;
-  try { st = lstatSync(abs); } catch { return { kind: "absent" }; }
+  try {
+    st = lstatSync(abs);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return { kind: "absent" };
+    return { kind: "unusable", why: `unreadable (${(e as NodeJS.ErrnoException)?.code ?? "unknown error"})` };
+  }
   let mode: string;
   let input: string | Buffer;
-  if (st.isSymbolicLink()) {
-    mode = "120000";
-    input = readlinkSync(abs);
-  } else if (st.isFile()) {
-    if (st.size > MAX_COMPARE_BYTES) return { kind: "unusable", why: `a ${st.size}-byte file (over the ${MAX_COMPARE_BYTES}-byte comparison cap)` };
-    mode = (st.mode & 0o111) !== 0 ? "100755" : "100644";
-    input = readFileSync(abs);
-  } else {
-    return { kind: "unusable", why: "not a regular file or symlink" };
+  try {
+    if (st.isSymbolicLink()) {
+      mode = "120000";
+      input = readlinkSync(abs);
+    } else if (st.isFile()) {
+      if (st.size > MAX_COMPARE_BYTES) return { kind: "unusable", why: `a ${st.size}-byte file (over the ${MAX_COMPARE_BYTES}-byte comparison cap)` };
+      mode = (st.mode & 0o111) !== 0 ? "100755" : "100644";
+      input = readFileSync(abs);
+    } else {
+      return { kind: "unusable", why: "not a regular file or symlink" };
+    }
+  } catch (e) {
+    // A read that fails (EACCES, ENOENT after the lstat, …) must never throw out
+    // of here: `freshnessTick` wraps the call, but auto-sync's session_start
+    // block has no catch, so a throw becomes a rejected handler.
+    return { kind: "unusable", why: `unreadable (${(e as NodeJS.ErrnoException)?.code ?? "unknown error"})` };
   }
   try {
     const blob = execFileSync("git", ["-C", repo, "hash-object", "--stdin"], { input, encoding: "utf-8", timeout: 30_000 }).trim();
     return { kind: "entry", mode, blob };
   } catch {
-    return { kind: "unusable", why: "not readable/hashable" };
+    return { kind: "unusable", why: "not hashable" };
   }
 }
 
 /** The (mode, blob) pair origin holds at `rel`, in ONE `ls-tree` read. Null when
- * origin does not track a single plain-file entry there — absent, a directory,
- * or a gitlink (160000, a submodule: not a file we may overwrite). */
+ * origin does not track a BLOB there — absent, a directory (mode 040000), or a
+ * gitlink (160000, a submodule). Those are not blobs, so no content comparison
+ * is meaningful and the caller must refuse rather than compare a tree id. */
 export function readOriginEntry(repo: string, remoteRef: string, rel: string): { mode: string; blob: string } | null {
   try {
     const entry = execFileSync("git", ["-C", repo, "ls-tree", "-z", remoteRef, "--", `:(literal)${rel}`], { encoding: "utf-8", timeout: 10_000 })
       .split("\0").filter(Boolean)[0] ?? "";
     const m = /^(\d{6}) \w+ ([0-9a-f]+)\t/.exec(entry);
-    if (!m || m[1] === "160000") return null;
+    if (!m || (m[1] !== "100644" && m[1] !== "100755" && m[1] !== "120000")) return null;
     return { mode: m[1], blob: m[2] };
   } catch {
     return null;
@@ -225,6 +262,26 @@ function tryLosslessRecoverUnderLock(repo: string, branch: string): { recovered:
     execFileSync("git", ["-C", repo, "diff", remoteRef, "--quiet", "--", ".", ...excludePaths], { stdio: "ignore", timeout: 30_000 });
   } catch {
     return { recovered: false, reason: `tracked tree differs from origin/${branch} (real uncommitted work — keep)` };
+  }
+  // 2b. #1245 (review): the INDEX must not hold staged content origin/<branch>
+  //     lacks. Step 2 compares the WORKTREE to the ref, so it is blind to an
+  //     index-only difference when the worktree file matches origin (the `MM`
+  //     shape: stage v3, then write the worktree back to origin's bytes). Tag-'H'
+  //     paths are skipped by step 3b on the assumption step 2 covers them, and
+  //     step 4's `checkout -f` RESETS the index — so staged-only content was
+  //     silently destroyed. `D`-only entries are allowed: origin has a file the
+  //     index lacks and the switch restores it, so nothing local is lost — the
+  //     same allowance the sibling reset path makes (repo-freshness
+  //     dirtySuperseded, #178 L2).
+  let staged: string;
+  try {
+    staged = execFileSync("git", ["-C", repo, "diff", "--cached", "--name-status", remoteRef, "--"], { encoding: "utf-8", timeout: 30_000 });
+  } catch {
+    return { recovered: false, reason: "could not compare the index to origin (fail-closed)" };
+  }
+  const stagedOnly = staged.split("\n").filter(Boolean).filter((l) => (l.split("\t")[0] || l) !== "D");
+  if (stagedOnly.length > 0) {
+    return { recovered: false, reason: `index holds ${stagedOnly.length} staged path(s) not on origin/${branch} (staged-only content — keep)` };
   }
   // 3. untracked files must not collide with origin/<branch> content — EACH
   //    file re-read immediately before removal (never based on pre-lock state).
@@ -295,6 +352,83 @@ function tryLosslessRecoverUnderLock(repo: string, branch: string): { recovered:
     if (local.mode !== origin.mode) {
       return { recovered: false, reason: `index-flagged path "${f}" (tag '${tag}') has local mode ${local.mode} vs origin/${branch} ${origin.mode} (file/symlink/exec-bit change — keep)` };
     }
+  }
+  // 3c. #1245 (review): the paths the switch can WRITE are the union of the local
+  //     <branch> tree and origin/<branch>'s tree — `checkout -f` writes the
+  //     former from the index, the ff-merge then moves to the latter. An IGNORED
+  //     file sitting at one of those paths (e.g. a gitignored file where the
+  //     LOCAL branch still tracks a path origin deleted) is invisible to steps
+  //     1-3 and would be destroyed. Files at paths in NEITHER tree (node_modules,
+  //     a .env elsewhere) are never written, so they must NOT block recovery.
+  //     The collision test is SYMMETRIC: a directory entry collides when a
+  //     tracked path sits at or under it, and a FILE entry collides when its own
+  //     path is tracked OR a tracked path sits UNDER it — `checkout -f` would
+  //     replace that ignored file with a directory, destroying its only copy.
+  const written = new Set<string>();
+  for (const ref of [branch, remoteRef]) {
+    try {
+      for (const p of execFileSync("git", ["-C", repo, "ls-tree", "-r", "--name-only", "-z", ref], { encoding: "utf-8", timeout: 30_000 }).split("\0")) {
+        if (p) written.add(p);
+      }
+    } catch {
+      return { recovered: false, reason: `could not list the tree of ${ref} (fail-closed)` };
+    }
+  }
+  let statusZ: string;
+  try {
+    statusZ = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z", "--ignored=traditional"], { encoding: "utf-8", timeout: 30_000 });
+  } catch {
+    return { recovered: false, reason: "could not list untracked/ignored paths (fail-closed)" };
+  }
+  const writtenArr = [...written];
+  for (const entry of statusZ.split("\0").filter(Boolean)) {
+    if (!entry.startsWith("?? ") && !entry.startsWith("!! ")) continue;
+    const raw = entry.slice(3);
+    const isDir = raw.endsWith("/");
+    const p = isDir ? raw.slice(0, -1) : raw;
+    const collides = written.has(p) || writtenArr.some((t) => t.startsWith(p + "/"));
+    if (!collides) continue;                 // never written by the switch — not a blocker
+    if (!isDir && untracked.includes(p)) continue; // already identity-checked in step 3
+    return { recovered: false, reason: `untracked/ignored path "${raw}" sits where the switch writes (keep)` };
+  }
+  // 3d. #1245 (review): the switch is only possible when no OTHER worktree holds
+  //     <branch> — `git checkout -f <branch>` aborts with "already checked out"
+  //     AFTER step 4 has already deleted the untracked residue. Kept INSIDE the
+  //     primitive so the residue is never spent on a switch that cannot happen,
+  //     whatever the caller believes: a `prunable` record (directory gone, record
+  //     kept) still blocks GIT, so it must block this step even though it must
+  //     not block a pull.
+  let worktrees: string;
+  let toplevel: string;
+  try {
+    worktrees = execFileSync("git", ["-C", repo, "worktree", "list", "--porcelain"], { encoding: "utf-8", timeout: 10_000 });
+    toplevel = execFileSync("git", ["-C", repo, "rev-parse", "--show-toplevel"], { encoding: "utf-8", timeout: 10_000 }).trim();
+  } catch {
+    return { recovered: false, reason: "could not list worktrees (fail-closed)" };
+  }
+  const same = (p: string): string => {
+    try { return realpathSync(p); } catch { return p; }
+  };
+  const selfTop = same(toplevel);
+  for (const entry of worktrees.split("\n\n")) {
+    const lines = entry.split("\n");
+    const wtLine = lines.find((l) => l.startsWith("worktree "));
+    const branchLine = lines.find((l) => l.startsWith("branch "));
+    if (!wtLine || !branchLine) continue;
+    if (branchLine.slice("branch ".length).replace(/^refs\/heads\//, "") !== branch) continue;
+    if (same(wtLine.slice("worktree ".length)) === selfTop) continue;
+    return { recovered: false, reason: `another worktree holds ${branch} — the switch would fail, refusing BEFORE touching any residue` };
+  }
+  // 3e. #1245 (review): step 4 is `checkout -f <branch>` THEN `merge --ff-only
+  //     origin/<branch>`. If the local <branch> is not an ancestor of
+  //     origin/<branch>, the merge fails AFTER the checkout has already MOVED the
+  //     worktree and the residue was removed — a failed recovery that still moved
+  //     the checkout (and overwrote files from the local branch's stale tree).
+  //     Verify the fast-forward is possible BEFORE anything is touched.
+  try {
+    execFileSync("git", ["-C", repo, "merge-base", "--is-ancestor", branch, remoteRef], { stdio: "ignore", timeout: 10_000 });
+  } catch {
+    return { recovered: false, reason: `local ${branch} is not an ancestor of origin/${branch} — the fast-forward would fail, refusing before any move` };
   }
   // 4. lossless — drop residue, switch to the default branch, fast-forward.
   try {

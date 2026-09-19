@@ -12,7 +12,9 @@
 //   - default branch + clean tree + not-ahead + no merge/rebase/lock →
 //       mode auto (default): git pull --ff-only, logged per pull
 //       mode warn:           hint only
-//   - feature branch → report-only "N behind origin/<default>" (NEVER pulls)
+//   - feature branch → report-only "N behind origin/<default>" (never pulled);
+//     the stranded-and-provably-lossless case is recovered by the #1245 block
+//     below instead
 //   - ahead → report unpushed; diverged-on-default → guidance, never pull
 //   - #1245: a checkout STRANDED on a non-default branch whose tree is
 //     byte-identical to origin/<default> (squash-merge residue) is recovered
@@ -22,8 +24,10 @@
 //     gate as #203 (never relaxed), never on a busy checkout, never when
 //     another worktree holds the default branch, and disabled by
 //     mode=warn / AGENT_REPO_FRESHNESS_NO_AUTOHEAL like the auto-reset below.
-//   - agent-infra excluded from the PULL path only — auto-sync.ts owns that
-//     repo (no double-pull); its recovery is now this same tick call
+//   - agent-infra: only the recovery block above runs — every path below (the
+//     ff-pull, the feature-branch report, the ahead/diverged guidance, the
+//     superseded-dirty auto-clean) is skipped, because auto-sync.ts owns that
+//     repo (no double-pull). Its recovery is now this same tick call.
 //
 // Safety envelope (research-verified, project #178): pulls only ever happen
 // on the default branch with a clean tree, ff-only; git re-checks dirtiness
@@ -34,9 +38,14 @@
 //
 // Self-contained by default: only the ExtensionAPI type is imported — except
 // shared helpers (./shared/print-mode.js; the #5611 sibling-import constraint
-// is stale for the current jiti/static loader, verified 2026-08-13) and the
+// is stale for the current jiti/static loader, verified 2026-08-13), the
 // session-checks exec seam used by asyncRepoState (#783 Task 2 — reusing the
-// existing promisified execFile rather than adding a second wrapper).
+// existing promisified execFile rather than adding a second wrapper), and the
+// #1245 recovery primitive (./auto-sync.js, which transitively pulls
+// ./shared/branch-ownership.mjs for the repo lock). The static import is
+// deliberate: repo-freshness's recovery would be meaningless without it, and a
+// missing auto-sync.ts is a loud load error, never a silent half-working
+// extension.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
@@ -120,6 +129,14 @@ export function defaultBranch(cwd: string): string {
     if (name) return name;
   }
   return "main";
+}
+
+/** True only when origin/HEAD RESOLVES. The read-only pull/report paths accept
+ * the `"main"` fallback above, but the #1245 RECOVERY path must not: acting on a
+ * guessed name could force-switch a `master`-default checkout that also has an
+ * `origin/main` whose tree happens to match. Undetermined ⇒ refuse. */
+export function defaultBranchKnown(cwd: string): boolean {
+  return tryGit(cwd, "symbolic-ref --short refs/remotes/origin/HEAD") !== null;
 }
 
 export function currentBranch(cwd: string): string | null {
@@ -401,9 +418,12 @@ export async function asyncRepoState(
  * `/tmp` → `/private/tmp`). */
 export function defaultBranchInOtherWorktree(cwd: string, branch: string): boolean {
   const out = tryGit(cwd, "worktree list --porcelain");
-  if (!out) return false;
+  // UNDETERMINED ⇒ true. Both callers' next step is a MUTATION (a pull, or the
+  // #1245 force-switch), and the residue cleanup happens before the switch — so
+  // "cannot tell" must not authorise the mutation (fail-closed).
+  if (!out) return true;
   const self = tryGit(cwd, "rev-parse --show-toplevel");
-  if (!self) return false;
+  if (!self) return true;
   const norm = (p: string): string => {
     try { return realpathSync(p); } catch { return p; }
   };
@@ -414,6 +434,11 @@ export function defaultBranchInOtherWorktree(cwd: string, branch: string): boole
     const wtLine = lines.find((l) => l.startsWith("worktree "));
     const branchLine = lines.find((l) => l.startsWith("branch "));
     if (!wtLine || !branchLine) continue;
+    // A `prunable` registration is a worktree whose DIRECTORY IS GONE (the fleet
+    // reaps .worktrees/* paths; git keeps the record). It holds nothing, so it
+    // must not block a pull or a switch — otherwise one deleted worktree that
+    // once held the default branch would block recovery forever.
+    if (lines.some((l) => l.startsWith("prunable"))) continue;
     const b = branchLine.slice("branch ".length).replace(/^refs\/heads\//, "");
     if (b !== branch) continue;
     // self-exclusion (mandatory): skip our own checkout
@@ -534,6 +559,7 @@ export function freshnessTick(
   // checkout+ff-merge cannot resolve it, so it stays report-only.
   if (
     current !== branch &&
+    defaultBranchKnown(cwd) &&
     getFreshnessMode(env) !== "warn" &&
     !autoHealDisabled(env) &&
     !mergeOrRebaseInProgress(cwd) &&
@@ -551,6 +577,13 @@ export function freshnessTick(
     if (rec.recovered) {
       log(`[repo-freshness] 🔁 ${cwd}: stranded checkout on '${current}' recovered onto ${branch} (tree matched origin/${branch} losslessly) — now at ${tryGit(cwd, "rev-parse --short HEAD") ?? "?"}`);
       return report("recovered-stranded", `was=${current}`);
+    }
+    // Refusal is the COMMON case (an active feature branch is simply not
+    // `diverged`), so it stays quiet — but any other refusal (pinned local
+    // content, staged-only index, repo lock busy, unresolvable root) is the one
+    // thing an operator needs to see, and it must not look like "never tried".
+    if (rec.reason && !/^not diverged/.test(rec.reason)) {
+      log(`[repo-freshness] ⓘ ${cwd}: lossless recovery not applied — ${rec.reason}`);
     }
   }
 

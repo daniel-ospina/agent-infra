@@ -19,6 +19,7 @@ import repoFreshness, {
   getFreshnessMode,
   freshnessDisabled,
   defaultBranch,
+  defaultBranchKnown,
   currentBranch,
   syncState,
   behindCount,
@@ -74,6 +75,11 @@ function makeRepo(name: string): { base: string; origin: string; clone: string; 
   writeFileSync(join(clone, "a.txt"), "base\n");
   sh("git add a.txt && git commit -qm base", clone);
   sh("git push -q origin main", clone);
+  // #1245: a real clone of a NON-empty repo has refs/remotes/origin/HEAD set;
+  // this fixture clones while the origin is still empty, so set it explicitly —
+  // the recovery path requires an assertively-known default branch
+  // (defaultBranchKnown), it never acts on the "main" fallback name.
+  sh("git remote set-head origin -a", clone);
   sh(`git clone "${origin}" other`, base);
   const other = join(base, "other");
   sh("git config user.email t@t && git config user.name t", other);
@@ -911,6 +917,156 @@ await test("(q) a GLOB metachar in an untracked name cannot hide a modified trac
   try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
   equal(r.action, "report-feature-branch", `the hidden modification must refuse recovery, got ${JSON.stringify(r)}`);
   equal(execSync("cat a.txt", { cwd: clone, encoding: "utf-8" }), "MODIFIED\n", "the tracked modification must survive");
+});
+
+await test("(r) staged-ONLY index content still refuses (the `MM` hole) — review find", () => {
+  // Step 2 compares the WORKTREE to the ref, so an index-only edit whose
+  // worktree bytes match origin reads CLEAN — yet step 4's `checkout -f` resets
+  // the index. The sibling reset path guards this exact shape (dirtySuperseded).
+  const { clone, other } = makeRepo("1245-staged");
+  strand(clone, other);
+  writeFileSync(join(clone, "s.txt"), "v3-STAGED-ONLY\n");
+  sh("git add s.txt", clone);
+  writeFileSync(join(clone, "s.txt"), "same\n"); // worktree back to origin's bytes
+  equal(sh("git diff origin/main --quiet -- . ; echo $?", clone), "0",
+    "control: step 2 (worktree vs ref) is blind to the staged-only edit");
+  const staged = sh("git show :s.txt", clone);
+  equal(staged, "v3-STAGED-ONLY", "fixture: the index holds content origin does not");
+  const direct = tryLosslessRecover(clone);
+  ok(!direct.recovered, `staged-only content must refuse recovery, got ${JSON.stringify(direct)}`);
+  ok(/staged/.test(direct.reason ?? ""), `the reason must name the staged path, got ${direct.reason}`);
+  equal(sh("git show :s.txt", clone), staged, "the staged blob must survive");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse too, got ${JSON.stringify(r)}`);
+  equal(sh("git show :s.txt", clone), staged, "the staged blob must survive the tick");
+});
+
+await test("(s) a SUBDIRECTORY cwd cannot scope the checks — the switch is worktree-wide (review P0)", () => {
+  // `ls-files`/`diff -- .` are cwd-relative; `checkout -f` is not. Before the
+  // root canonicalisation in tryLosslessRecover, calling it with a subdirectory
+  // read nothing outside that subtree and then switched the WHOLE checkout.
+  const { clone, other } = makeRepo("1245-subdir");
+  strand(clone, other);
+  mkdirSync(join(clone, "sub"), { recursive: true });
+  writeFileSync(join(clone, "a.txt"), "ROOT-MODIFIED\n"); // tracked, OUTSIDE the passed dir
+  equal(sh("git diff origin/main --quiet -- . ; echo $?", join(clone, "sub")), "0",
+    "control: from sub/ the diff sees nothing (the hazard)");
+  const direct = tryLosslessRecover(join(clone, "sub"));
+  ok(!direct.recovered, `a subdirectory call must not recover, got ${JSON.stringify(direct)}`);
+  equal(execSync("cat a.txt", { cwd: clone, encoding: "utf-8" }), "ROOT-MODIFIED\n", "root content must survive");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(join(clone, "sub"), BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse from a subdirectory too, got ${JSON.stringify(r)}`);
+  equal(execSync("cat a.txt", { cwd: clone, encoding: "utf-8" }), "ROOT-MODIFIED\n", "root content must survive the tick");
+  equal(currentBranch(clone), "stranded", "the checkout must not have been switched");
+});
+
+await test("(u) an UNDETERMINED default branch (no origin/HEAD) is never acted on — review find", () => {
+  const { clone, other } = makeRepo("1245-nohead");
+  strand(clone, other);
+  sh("git remote set-head origin -d", clone);
+  equal(defaultBranchKnown(clone), false, "fixture: origin/HEAD must be gone");
+  equal(freshnessTick(clone, BASE_ENV).action, "report-feature-branch", "never recover onto a GUESSED branch name");
+  equal(currentBranch(clone), "stranded");
+});
+
+await test("(t) a PRUNABLE worktree record never blocks a pull, and never spends the residue on a doomed switch", () => {
+  const { clone, other } = makeRepo("1245-prunable");
+  strand(clone, other);
+  const wt = join(clone, "..", "prunable-wt");
+  sh(`git worktree add -q "${wt}" main`, clone); // main is free: the checkout is on `stranded`
+  equal(defaultBranchInOtherWorktree(clone, "main"), true, "a LIVE linked worktree holding main must block a pull");
+  rmSync(wt, { recursive: true, force: true });
+  equal(defaultBranchInOtherWorktree(clone, "main"), false, "a PRUNABLE record must not block a PULL forever (review find)");
+  // …but git STILL refuses `checkout -f main` for a prunable holder, so the
+  // switch must be refused BEFORE the untracked residue is removed. Residue that
+  // is byte-identical to origin is exactly what step 4 would delete.
+  writeFileSync(join(other, "res.txt"), "r\n");
+  sh("git add res.txt && git commit -qm res && git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  writeFileSync(join(clone, "res.txt"), "r\n"); // untracked, byte-identical to origin (removable)
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `a doomed switch must not be attempted, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded", "the checkout must not have been switched");
+  ok(existsSync(join(clone, "res.txt")), "the removable residue must NOT be spent on a failed switch");
+  ok(logs.some((l) => l.includes("another worktree holds")), `the refusal must be logged, got: ${logs.join(" | ")}`);
+});
+
+await test("(v) a fast-forward that CANNOT succeed refuses before moving — review find", () => {
+  // Local main carries an (empty) unpushed commit, so `checkout -f main` would
+  // move the worktree and `merge --ff-only origin/main` would then FAIL — a
+  // failed recovery that still moved the checkout and wrote main's stale tree.
+  const { clone, other } = makeRepo("1245-ffcheck");
+  sh("git commit -q --allow-empty -m main-unpushed", clone);
+  strand(clone, other);
+  equal(syncState(clone, "main"), "diverged", "fixture must be diverged");
+  ok(sh("git merge-base --is-ancestor main origin/main ; echo $?", clone) !== "0",
+    "fixture: local main must NOT be an ancestor of origin/main");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `an impossible fast-forward must refuse, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded", "the checkout must NOT have moved on a failed recovery");
+  ok(logs.some((l) => l.includes("not an ancestor")), `the refusal must be logged, got: ${logs.join(" | ")}`);
+});
+
+await test("(w) an IGNORED file where the switch writes still refuses — review find", () => {
+  // The switch writes the LOCAL branch's tree too: local main still tracks P
+  // while origin/main deleted it. P is untracked+ignored in the worktree, so
+  // `diff`/`status`/`ls-files -v` all read clean — and `checkout -f main` writes
+  // P from main's index, destroying the local file.
+  const { clone, other } = makeRepo("1245-ignored");
+  writeFileSync(join(clone, ".gitignore"), "P\n");
+  writeFileSync(join(clone, "P"), "MAIN-TRACKED\n");
+  sh("git add -f .gitignore P && git commit -qm main-tracks-P && git push -q origin main", clone);
+  sh("git pull -q origin main", other);
+  sh("git rm -q P && printf 'same\\n' > s.txt && git add s.txt && git commit -qm rm-P-and-s && git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  sh("git checkout -qb stranded", clone);
+  sh("git rm -q --cached P && printf 'same\\n' > s.txt && git add s.txt && git commit -qm stranded", clone);
+  writeFileSync(join(clone, "P"), "LOCAL-IGNORED-WORK\n"); // ignored, untracked, holds the only copy
+  ok(sh("git merge-base --is-ancestor main origin/main ; echo $?", clone) === "0",
+    "fixture: local main IS an ancestor of origin/main (so only the ignored-file gate can refuse)");
+  equal(sh("git status --porcelain", clone), "", "fixture: P must be invisible to status");
+  equal(sh("git diff origin/main --quiet -- . ; echo $?", clone), "0", "control: the tree diff reads clean");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `an ignored file in the switch's path must refuse, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded", "the checkout must not have been switched");
+  equal(execSync("cat P", { cwd: clone, encoding: "utf-8" }), "LOCAL-IGNORED-WORK\n", "the ignored file must survive");
+});
+
+await test("(x) an ignored FILE under a tracked directory path still refuses — review find", () => {
+  // The collision test must be symmetric: local main tracks `foo/bar` while
+  // origin/main deleted `foo/`, and an ignored FILE sits at `foo`. Its own path
+  // is not in either tree, but a tracked path sits UNDER it — `checkout -f main`
+  // replaces the file with a directory and its only copy is gone.
+  const { clone, other } = makeRepo("1245-ignored-parent");
+  writeFileSync(join(clone, ".gitignore"), "foo\n");
+  mkdirSync(join(clone, "foo"), { recursive: true });
+  writeFileSync(join(clone, "foo", "bar"), "x\n");
+  sh("git add -f .gitignore foo/bar && git commit -qm main-tracks-foo && git push -q origin main", clone);
+  sh("git pull -q origin main", other);
+  sh("git rm -q -r foo && printf 'same\\n' > s.txt && git add s.txt && git commit -qm rm-foo-and-s && git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  sh("git checkout -qb stranded", clone);
+  sh("git rm -q -r --cached foo && printf 'same\\n' > s.txt && git add s.txt && git commit -qm stranded", clone);
+  rmSync(join(clone, "foo"), { recursive: true, force: true });
+  writeFileSync(join(clone, "foo"), "LOCAL-IGNORED-FILE\n"); // ignored file where main tracks foo/bar
+  ok(sh("git merge-base --is-ancestor main origin/main ; echo $?", clone) === "0",
+    "fixture: local main IS an ancestor of origin/main (so only the collision gate can refuse)");
+  equal(sh("git status --porcelain --ignored=traditional", clone), "!! foo", "fixture: the ignored file must be the only status entry");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `an ignored file above a tracked path must refuse, got ${JSON.stringify(r)}`);
+  equal(execSync("cat foo", { cwd: clone, encoding: "utf-8" }), "LOCAL-IGNORED-FILE\n", "the ignored file must survive");
 });
 
 await test("warn mode / NO_AUTOHEAL → recovery is NOT attempted (never mutates on a hint-only setting)", () => {
