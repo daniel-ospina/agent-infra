@@ -248,6 +248,15 @@ replacement count and the `agent-session.js` entries are superseded.
 4. **The extension is symlinked to this worktree** (`~/.pi/agent/extensions/clamp-output-floor.ts`).
    After merge, repoint the symlink at the hub path
    (`agent-infra/extensions/clamp-output-floor.ts`) or the guard dangles when the worktree goes.
+   That is no longer prose-only: `scripts/check-pi-config-extensions.sh` check 5 fails loudly
+   when a shipped live-farm link dangles, naming the entry and its dead target. The script runs in
+   `ci.yml`'s `pi-config-extensions` job, in `ci-main.yml`, and in `.husky/pre-commit` — but check 5
+   only has a farm to inspect on a machine (on a CI runner it prints an explicit `⏭️` skip), so the
+   loud report is a local one.
+   **What check 5 cannot catch:** a *resolvable but non-canonical* target — a link still parked on a
+   worktree that is still on disk resolves fine, so it passes until the worktree is removed. That
+   half belongs to `bin/agent-infra.js check`, which reports any live-farm target that differs from
+   the installed `extensions/` path as `⚠️ stale`.
 5. **The `_overflowRecoveryAttempted` latch is intentionally left as upstream ships it** — this set
    changes the clamp only. See **Deliberately excluded** above.
 6. **The 1024-token floor is a judgement, not a measurement.** It matches the existing
