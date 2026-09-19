@@ -371,6 +371,21 @@ jobs:
         # vulnerable form (`find <dir>/`, `find -H`, `find -L`) is executed and
         # asserted to LEAK, then the fixed form is asserted not to.
         run: node extensions/shared/test-infra-verify-scan.mjs
+      - name: read-path failure contract — tortoise-memory.mjs (tortoise#3805 / #1182)
+        # The skills' memory client used to exit 0 in every direction (never
+        # configured, unreachable, and a genuinely empty store were ONE
+        # observable) and defaulted its base URL to the DASHBOARD host while the
+        # API lives on api.premiselabs.co.
+        # Its own step (like #744/#708/#709/#1051 above): the `test-command`
+        # accumulator is exact-pinned by check-pi-pin-lockstep.mjs (guard (j)), so
+        # a new suite cannot be appended there; and ci-main.yml has NO
+        # `scripts/*.test.mjs` glob (it names the older scripts suites
+        # explicitly), so a new one is not auto-collected post-merge either.
+        # The suite EXECUTES the real client as a subprocess against a local HTTP
+        # stub (a source-text scan is a false PASS) and pins both directions:
+        # RED on the defect, GREEN under a behaviour-identical reformat. Zero-dep
+        # (`node:*` only), no `npm ci`, ~4s.
+        run: node --test scripts/tortoise-memory.test.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
