@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- lane-liveness (#1178, unit 3): the SCHEDULED lane-liveness report. The
+         owner requirement is "a way to check which lanes are stuck, independent
+         of the orchestrator being dead" — a pull tool is silent in exactly that
+         scenario, so this job runs on a timer and escalates a dead lane to a
+         deduped GitHub issue with no orchestrator alive.
+
+         WHAT IT DOES: enumerates the fleet's lanes from the durable cmux hook
+         store (one lane per workspace, newest non-child record), so a lane whose
+         pi process is GONE is still enumerated — the population is not derived
+         from the live process table — and asks the ONE shared identity predicate
+         (scripts/lib/pid-identity.sh, the same library the kill-path reaper
+         sources) for a verdict. It never uses a bare kill(0) presence check.
+         It also never calls the `cmux` CLI: `cmux workspace list` refuses
+         launchd callers with "Access denied - only processes started inside
+         cmux can connect" (measured by running this very job), so every runtime
+         input is a FILE — the hook store, the session JSONLs, `ps`.
+
+         SCHEDULE: every 30 min. Measured cost on this host: ~27 lanes →
+         ~60 forks of a full `ps` table → ~85 s per pass (well under the
+         interval, and the box's other load dominates). 30 min rather than
+         hourly because the incident this closes was a lane dead for FIVE HOURS;
+         the first pass after a lane dies files the issue.
+
+         TCC (#427/#432): launchd cannot read ~/Documents, so every runtime path
+         is outside that wall —
+           * the driver + its classifier
+                                            {{HOME}}/.pi/agent/tools/fleet/
+             (pi-bootstrap/setup.sh tools/fleet farm; real copies, not symlinks)
+           * the probe library
+                                            {{HOME}}/.pi/agent/scripts/lib/
+             (the #1178 lib farm, unit 2)
+           * store / sessions / log         ~/.cmuxterm, ~/.pi/agent/state/
+         PI_PID_IDENTITY_LIB is pinned explicitly rather than left to the
+         driver's relative resolution, so the TCC safety is auditable in the
+         installed plist: liveness.lib_path() would otherwise resolve
+         <here>/../../scripts/lib/pid-identity.sh, which farmed at
+         ~/.pi/agent/tools/fleet/ is the SAME file — pinned, not incidental.
+
+         No StandardOutPath/StandardErrorPath: the pass appends a capped footer
+         to ~/.pi/agent/state/lane-liveness.log (world-writable /tmp siblings are
+         a symlink-truncation surface + an unbounded-launchd-capture twin — the
+         same reasoning as the reaper's plist).
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
+    <key>Label</key>
+    <string>com.eldato.lane-liveness</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>{{HOME}}/.pi/agent/tools/fleet/lane_liveness.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>PI_PID_IDENTITY_LIB</key>
+        <string>{{HOME}}/.pi/agent/scripts/lib/pid-identity.sh</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+</dict>
+</plist>

@@ -106,6 +106,17 @@ mkfakehome() { # $1 = home dir
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
+    mkdir -p "$1/.pi/agent/scripts/lib"
+    touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
+    chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
+    # #1178 unit 3 — the scheduled lane-liveness report runs the FARMED tools:
+    # the driver + its sibling classifier under tools/fleet/ (the broken-target
+    # guard refuses the install when they are absent).
+    mkdir -p "$1/.pi/agent/tools/fleet"
+    touch "$1/.pi/agent/tools/fleet/lane_liveness.py"
+    touch "$1/.pi/agent/tools/fleet/liveness.py"
+    chmod +x "$1/.pi/agent/tools/fleet/lane_liveness.py"
+    chmod +x "$1/.pi/agent/tools/fleet/liveness.py"
     mkdir -p "$1/swarm/.venv/bin"
     touch "$1/swarm/.venv/bin/python"
     chmod +x "$1/swarm/.venv/bin/python"
@@ -164,6 +175,7 @@ assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider
 assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekly installed on fresh machine (#373)"
 assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reaper installed on fresh machine (#469)"
 assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
+assert_contains "$OUT" "lane-liveness: installed + loaded" "lane-liveness installed on fresh machine (#1178)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
@@ -204,6 +216,16 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "<string>1</string>" "prune plist SH
 assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interval-scheduled"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
+# #1178 unit 3 — lane-liveness rendered-plist content asserts (farmed tools path,
+# the PINNED probe library, and the interval schedule).
+LANE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.lane-liveness.plist"
+assert_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/tools/fleet/lane_liveness.py" "lane-liveness plist rendered with fake HOME (farmed tools path)"
+assert_contains "$(cat "$LANE_INSTALLED")" "PI_PID_IDENTITY_LIB" "lane-liveness plist pins the shared identity library"
+assert_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/scripts/lib/pid-identity.sh" "lane-liveness plist pins the FARMED library (never ~/Documents)"
+assert_contains "$(cat "$LANE_INSTALLED")" "python3" "lane-liveness plist runs the python driver"
+assert_contains "$(cat "$LANE_INSTALLED")" "StartInterval" "lane-liveness is interval-scheduled"
+assert_contains "$(cat "$LANE_INSTALLED")" "<integer>1800</integer>" "lane-liveness every 30 min (StartInterval 1800)"
+assert_contains "$(cat "$LANE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "lane-liveness template carries version marker"
 assert_contains "$(cat "$DBW_INSTALLED")" "$HOME1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh" "balance-watch plist rendered with fake HOME (#476)"
 assert_contains "$(cat "$DBW_INSTALLED")" "agent-infra-plist-version: 0.1.0" "balance-watch template carries version marker"
 # #476 — the balance poller is the SINGLE restore authority: must run every
@@ -220,7 +242,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "6" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune)"
+assert_eq "$BOOTSTRAP_COUNT1" "7" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

@@ -306,6 +306,62 @@ for base in "${fleet_srcs[@]}"; do
 done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 
+# Shared-library farm (#1178): the fleet-scripts farm above copies pi-reap-idle.sh
+# FLAT into $DEST/scripts/, and that reaper resolves its process-identity rule
+# from a SIBLING directory — `$(dirname "${BASH_SOURCE[0]}")/lib/pid-identity.sh`
+# — the same sibling-resolution contract the checkout-hygiene drivers rely on.
+# Farming the reaper WITHOUT its library re-arms the hourly
+# com.eldato.pi-session-reaper job with a FAIL-CLOSED abort (exit 3, "identity
+# library missing") on every pass until the farm catches up. So the library is
+# farmed WITH it, preserving the relative positions
+# (scripts/pi-reap-idle.sh <-> scripts/lib/pid-identity.sh). Same idempotent
+# real-copy refresh model as the farms above (real files, not symlinks: #427).
+lib_srcs=(pid-identity.sh)
+mkdir -p "$DEST/scripts/lib"
+lib_copied=0
+for base in "${lib_srcs[@]}"; do
+  f="$INFRA_ROOT/scripts/lib/$base"
+  [ -f "$f" ] || continue
+  dest="$DEST/scripts/lib/$base"
+  if [ -L "$dest" ]; then
+    echo "    replacing farm symlink with real copy: lib/$base"
+    rm -f "$dest"
+  fi
+  cp -f "$f" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
+  lib_copied=$((lib_copied+1))
+done
+echo "    scripts lib farm: $lib_copied copied (pid-identity.sh, #1178)"
+
+# Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
+# (templates/launchd/com.eldato.lane-liveness.plist) runs
+# $DEST/tools/fleet/lane_liveness.py under launchd. That driver imports its
+# sibling classifier ($DEST/tools/fleet/liveness.py) and forks the shared
+# identity library (scripts/lib/pid-identity.sh, farmed above in the #1178 lib
+# farm); launchd cannot read ~/Documents (#427), so these are COPIED, not
+# symlinked. The farm preserves the tools/fleet/ <-> scripts/lib/ relative
+# positions so liveness.lib_path() (<here>/../../scripts/lib/pid-identity.sh)
+# resolves to the FARMED library under ~/.pi/agent and never to the repo — the
+# plist pins PI_PID_IDENTITY_LIB as well, but the layout is what makes the
+# relative fallback safe. A missing classifier is a loud exit 2 in the driver,
+# never a silent "no lanes". Same idempotent real-copy refresh model as above.
+fleet_tools=(liveness.py lane_liveness.py)
+mkdir -p "$DEST/tools/fleet"
+tools_copied=0
+for base in "${fleet_tools[@]}"; do
+  f="$INFRA_ROOT/tools/fleet/$base"
+  [ -f "$f" ] || continue
+  dest="$DEST/tools/fleet/$base"
+  if [ -L "$dest" ]; then
+    echo "    replacing farm symlink with real copy: tools/fleet/$base"
+    rm -f "$dest"
+  fi
+  cp -f "$f" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
+  tools_copied=$((tools_copied+1))
+done
+echo "    tools/fleet farm: $tools_copied copied (lane-liveness, #1178)"
+
 # Merge-gate scripts farm (#562): record-review.sh — the review-enforcer's
 # merge-registry writer (issue #138).
 # NOT launchd-invoked (pi-session code resolves record-review.sh explicitly:
