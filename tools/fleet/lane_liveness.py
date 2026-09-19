@@ -66,13 +66,15 @@ them out of the issue. A lane with no store record at all is not enumerable
 THE ESCALATION POLICY
 ---------------------
 Escalate on **``dead``** only. ``wedged``/``idle``/``running-quiet``/``unknown``
-are REPORTED (named, with evidence) but do not file an issue, because
-``liveness.evaluate`` reaches ``wedged`` for a merely-idle interactive REPL —
-measured, not assumed: the live orchestrator lane reads ``wedged``
-(``jsonl-frozen``) 47 minutes after a completed turn while it is simply waiting
-for input. Scheduling an issue on that would be exactly the noise class
-("three wrong orchestrator calls") this issue exists to remove. ``dead`` is
-unambiguous and is the state that was structurally invisible.
+are REPORTED (named, with evidence) but do not file an issue. ``dead`` is
+unambiguous and is the state that was structurally invisible. This was
+originally forced by a classifier defect (#1254): a merely-idle interactive
+REPL read ``wedged`` (``jsonl-frozen``) 47 minutes after a completed turn,
+because ``wedged`` fired on any frozen transcript. ``liveness.py`` now requires
+POSITIVE evidence of an open turn, so a turn-complete lane reports
+``running-quiet`` (``turn-complete``) however long it rests, and ``wedged``
+means what it says. The escalation policy still stays ``dead``-only — a
+reporting fix is not a licence to file issues on a diagnostic state.
 
 Exit codes (mirroring ``scripts/fleet-cost-weekly.sh``):
     0  clean  — no dead lane
@@ -154,8 +156,10 @@ DEFAULT_CMUX_STATE = os.path.join(
 TITLE_PREFIX = "lane-liveness escalation"
 DEDUP_QUERY = '"lane-liveness escalation" in:title'
 
-# `dead` only — see the module docstring (an idle interactive REPL reads
-# `wedged`; filing on that is the false-positive class this issue removes).
+# `dead` only. A reporting fix is not a licence to escalate a diagnostic state:
+# `wedged` requires an open-turn proof, but it is still a judgment about a
+# lane that has a live holder, and `dead` (every incarnation gone) remains the
+# only unambiguous, structurally-invisible state.
 ESCALATE_STATES = frozenset({"dead"})
 
 # A dead lane escalates only while it is still an ACTIVE lane: its last transcript
@@ -417,9 +421,11 @@ def render_report(
     lines.append("")
     lines.append(
         "Escalation policy: **%s**, and only while the lane is still active "
-        "(last activity within %.0fh — the reaper's own idle proof). An idle "
-        "interactive lane can read `wedged` (a completed turn + a quiet "
-        "transcript), so only a lane whose every incarnation is gone files an "
+        "(last activity within %.0fh — the reaper's own idle proof). "
+        "`wedged` requires positive evidence of an OPEN turn (a pending tool "
+        "call, or no assistant reply) frozen past the stream bound; a lane whose "
+        "last turn completed reads `running-quiet`/`turn-complete` however long "
+        "it rests, so only a lane whose every incarnation is gone files an "
         "issue." % (", ".join(sorted(escalate_states)), window_ms / 3_600_000.0)
     )
     lines.append("")
@@ -428,8 +434,14 @@ def render_report(
     ordered = sorted(lanes, key=lambda lv: (STATE_ORDER.index(lv[1].state)
                                             if lv[1].state in STATE_ORDER else 99, lv[0].name.lower()))
     for lane, v, _ev in ordered:
-        evidence = v.detail or (", ".join(v.witnesses) if v.witnesses else
-                                ("holder=%d" % v.holder_pid if v.holder_pid else "—"))
+        # Both halves of the evidence stay visible: the open turn the verdict
+        # named (#1254) AND the holder/witness row it was decided from.
+        parts = [v.detail] if v.detail else []
+        if v.witnesses:
+            parts.append(", ".join(v.witnesses))
+        elif v.holder_pid:
+            parts.append("holder=%d" % v.holder_pid)
+        evidence = ", ".join(parts) or "—"
         lines.append("| %s | `%s` | `%s` | **%s** | `%s` | %s |"
                      % (lane.name, _short(lane.workspace), lane.sid[:8], v.state, v.reason, evidence))
 

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Twelve mutation tests: every one is paired with a PRECISE source mutation that
+Eighteen mutation tests: every one is paired with a PRECISE source mutation that
 reintroduces the defect the test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical.
+evidence mechanical. Six of the eighteen (#1254) pin the TURN-BOUNDARY rule:
+``wedged`` requires positive evidence of an OPEN turn, so a turn-complete lane
+is never a stall and a frozen lane with an unreadable boundary abstains.
 
-    python3 tools/fleet/liveness.test.py                # the 12 tests, green
+    python3 tools/fleet/liveness.test.py                # the 17 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
@@ -88,6 +90,23 @@ def ev(**kw):
     base = dict(sid="sid-1", now_ms=NOW_MS, jsonl_grew=False, jsonl_age_ms=H)
     base.update(kw)
     return liv.Evidence(**base)
+
+
+# #1254 — the turn boundary. The exact entry shapes pi writes (measured over 426
+# live session files), and the two Turn values the ladder distinguishes.
+def entry(role, **msg):
+    base = {"role": role}
+    base.update(msg)
+    return {"type": "message", "message": base}
+
+
+def assistant_tooluse(*calls):
+    return entry("assistant", stopReason="toolUse",
+                 content=[{"type": "toolCall", "name": n, "id": i} for n, i in calls])
+
+
+COMPLETE_TURN = liv.Turn(False, "turn-complete", "terminal stopReason=stop")
+OPEN_TURN = liv.Turn(True, "turn-open:pending-tool-call", "unanswered bash(call_test)")
 
 
 # ── the probe shim (a fake `ps` + `date`, mirroring the reaper's test shim) ──
@@ -365,7 +384,7 @@ def t9_hung_tool_bound():
 
     # (b) turn INACTIVE -> bound = min(4h, 30min) = 30min -> 31min expires it.
     v2 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=31 * M,
-                         tool=hung(tool_age_ms=31 * M, turn_active=False)))
+                         tool=hung(tool_age_ms=31 * M, turn_active=False), jsonl_turn=OPEN_TURN))
     check(v2.state == "wedged",
           "a turn-inactive hung tool past 30min is wedged-eligible; got %s/%s" % (v2.state, v2.reason))
 
@@ -381,7 +400,8 @@ def t9_hung_tool_bound():
 
     # (e) tool-silence shape: S = 20min, not load-scaled, and not 4h.
     v5 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M,
-                         tool=hung(tool_updates=True, silence_age_ms=21 * M, tool_age_ms=21 * M)))
+                         tool=hung(tool_updates=True, silence_age_ms=21 * M, tool_age_ms=21 * M),
+                         jsonl_turn=OPEN_TURN))
     check(v5.state == "wedged",
           "a streamed-then-silent tool past S=20min is wedged-eligible; got %s/%s" % (v5.state, v5.reason))
     v6 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=19 * M,
@@ -402,7 +422,8 @@ def t10_record_veto_bound():
     stale = liv.Record(non_idle=True, updated_at=NOW_S - 100 * 3600)
     fresh = liv.Record(non_idle=True, updated_at=NOW_S - 3600)
 
-    v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=30 * M, record=stale))
+    v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=30 * M, record=stale,
+                        jsonl_turn=OPEN_TURN))
     check(v.state == "wedged",
           "a non-idle record stale past 72h must not immunise the lane; got %s/%s" % (v.state, v.reason))
 
@@ -420,7 +441,8 @@ def t10_record_veto_bound():
           "an unusable updatedAt keeps the veto (fail closed); got %s" % v4.state)
 
     v5 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=30 * M,
-                         record=liv.Record(non_idle=False, updated_at=NOW_S - 3600)))
+                         record=liv.Record(non_idle=False, updated_at=NOW_S - 3600),
+                         jsonl_turn=OPEN_TURN))
     check(v5.state == "wedged", "an idle record never vetoes; got %s" % v5.state)
 
     check(liv.RECORD_VETO_MS == 72 * H, "the #947 bound is 3 x 24h = 72h")
@@ -443,7 +465,8 @@ def t11_nested_task_cpu_flat():
 
     bash = liv.Tool(name="bash", **flat)
     check(liv.cpu_attributable(bash) is True, "`bash` IS attributable")
-    v2 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=35 * M, tool=bash))
+    v2 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=35 * M, tool=bash,
+                         jsonl_turn=OPEN_TURN))
     check(v2.state == "wedged",
           "the same shape for an attributable tool IS wedged-eligible (tool-dead); got %s" % v2.state)
 
@@ -485,6 +508,184 @@ def t12_named_abstention():
     for verdict in (v, v2, v3, v4):
         check(verdict.reason and verdict.reason != "unknown",
               "an abstention must carry a NAMED reason; got %r" % verdict.reason)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T13 — a frozen transcript is NOT a stall (#1254). A turn that ended with a
+# terminal stopReason is RESTING: the fleet's normal state. It must never read
+# `wedged`, however long it is quiet short of the retirement proof.
+# ══════════════════════════════════════════════════════════════════════════
+@test("T13 turn-complete + frozen -> running-quiet/turn-complete, never wedged (#1254)")
+def t13_turn_complete_is_not_wedged():
+    complete = liv.turn_from_entry(entry("assistant", stopReason="stop"))
+    check(complete.stalled is False, "a terminal stopReason ends the turn; got %s" % complete)
+    check(complete.reason == "turn-complete", "the boundary names itself; got %s" % complete.reason)
+
+    for age in (21 * M, H, 23 * H):
+        v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=age, jsonl_turn=complete))
+        check(v.state == "running-quiet",
+              "a resting lane must be running-quiet; got %s/%s at age=%d" % (v.state, v.reason, age))
+        check(v.reason == "turn-complete", "the reason names the boundary; got %s" % v.reason)
+        check(v.holder_pid == 1, "the fenced holder is still named; got %s" % v.holder_pid)
+
+    # EVERY terminal stopReason ends the turn — only `toolUse` continues it.
+    for stop in ("stop", "length", "error", "aborted"):
+        t = liv.turn_from_entry(entry("assistant", stopReason=stop))
+        v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=2 * H, jsonl_turn=t))
+        check(v.state == "running-quiet" and v.reason == "turn-complete",
+              "stopReason=%s is terminal; got %s/%s" % (stop, v.state, v.reason))
+
+    # The retirement proof is UNCHANGED: past it the lane is `idle`, not resting
+    # and not wedged (the reaper's own 24h proof still owns that band).
+    v_idle = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=25 * H,
+                             jsonl_turn=complete))
+    check(v_idle.state == "idle" and v_idle.reason == "jsonl-old",
+          "past the idle proof a turn-complete lane is idle; got %s/%s" % (v_idle.state, v_idle.reason))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T14 — the inverse, and the whole point of the fix: a transcript frozen with an
+# OPEN turn IS a stall, and the verdict names the open call so the report says
+# WHY. Dropping this half would make `wedged` unreachable (the fail-open
+# direction) — the #1178 incident shape.
+# ══════════════════════════════════════════════════════════════════════════
+@test("T14 a frozen OPEN turn -> wedged, naming the open call (#1254)")
+def t14_open_turn_is_wedged():
+    t = liv.turn_from_entry(assistant_tooluse(("bash", "call_00_ABC"), ("read", "call_01_DEF")))
+    check(t.stalled is True, "an unanswered tool call is an open turn; got %s" % t)
+    check(t.reason == "turn-open:pending-tool-call", "the open shape is named; got %s" % t.reason)
+    v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=t))
+    check(v.state == "wedged", "an open turn frozen past S is a stall; got %s/%s" % (v.state, v.reason))
+    check(v.reason == "turn-open:pending-tool-call", "the reason names the open shape; got %s" % v.reason)
+    check("bash" in v.detail and "call_00_ABC" in v.detail,
+          "the verdict names the unanswered call; got detail=%r" % v.detail)
+
+    tr = liv.turn_from_entry(entry("toolResult", toolName="bash", toolCallId="call_00_XYZ",
+                                   content=[{"type": "text", "text": "ok"}]))
+    check(tr.stalled is True and tr.reason == "turn-open:awaiting-assistant",
+          "a toolResult with no reply after it is an open turn; got %s" % tr)
+    v2 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=tr))
+    check(v2.state == "wedged", "a toolResult frozen past S is a stall; got %s" % v2.state)
+    check("call_00_XYZ" in v2.detail, "the verdict names the result's call; got %r" % v2.detail)
+
+    u = liv.turn_from_entry(entry("user", content=[{"type": "text", "text": "hello"}]))
+    check(u.stalled is True and u.reason == "turn-open:awaiting-response",
+          "an unanswered prompt is an open turn; got %s" % u)
+    v3 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=u))
+    check(v3.state == "wedged", "an unanswered prompt frozen past S is a stall; got %s" % v3.state)
+
+    ns = liv.turn_from_entry(entry("assistant", content=[{"type": "text", "text": "x"}]))
+    check(ns.stalled is True and ns.reason == "turn-open:no-terminal-stop",
+          "an assistant message with no stopReason is not terminal; got %s" % ns)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T15 — the boundary is the transcript's LAST entry. A forward scan would return
+# an ancient turn and call a live mid-turn lane resting (or the reverse), which
+# is why the read is bounded AND backwards. Non-message trailers (a compaction
+# / model_change record) carry no boundary and must not change the answer.
+# ══════════════════════════════════════════════════════════════════════════
+@test("T15 the turn boundary is the transcript's LAST entry, read backwards (#1254)")
+def t15_tail_read():
+    d = tempfile.mkdtemp(prefix="liv-jsonl-")
+    try:
+        path = os.path.join(d, "session.jsonl")
+        lines = [
+            entry("user", content=[{"type": "text", "text": "hello"}]),
+            entry("assistant", stopReason="stop", content=[{"type": "text", "text": "early"}]),
+            assistant_tooluse(("bash", "call_LAST")),
+        ]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e) for e in lines) + "\n")
+        t = liv.turn_from_jsonl(path)
+        check(t is not None and t.stalled is True,
+              "the LAST (open) boundary decides, not the first; got %s" % t)
+        check("call_LAST" in t.detail, "the last call is the one named; got %r" % t.detail)
+
+        # A non-message trailer is not a turn boundary.
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "compaction", "summary": "…"}) + "\n")
+        t2 = liv.turn_from_jsonl(path)
+        check(t2 is not None and "call_LAST" in t2.detail,
+              "a compaction trailer must not change the boundary; got %s" % t2)
+
+        # A terminal assistant message flips it to resting.
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry("assistant", stopReason="stop",
+                                      content=[{"type": "text", "text": "done"}])) + "\n")
+        t3 = liv.turn_from_jsonl(path)
+        check(t3 is not None and t3.stalled is False and t3.reason == "turn-complete",
+              "the new last entry flips the verdict; got %s" % t3)
+
+        # gather() wires the boundary in (hermetic store + probe shims).
+        sessions = os.path.join(d, "sessions")
+        os.makedirs(os.path.join(sessions, "--x--"))
+        sfile = os.path.join(sessions, "--x--", "2026-01-01T00-00-00-000Z_sid-1.jsonl")
+        shutil.copy(path, sfile)
+        os.utime(sfile, (NOW_S - 1800, NOW_S - 1800))
+        payload = {"sessions": {"sid-1": {"pid": 555, "pidStartSeconds": PROBE_EPOCH,
+                                           "cwd": "/x", "agentLifecycle": "idle",
+                                           "runtimeStatus": "idle"}}}
+        with temp_store(payload) as (store, _sd):
+            with ps_env([ps_row(555)]):
+                e = liv.gather("sid-1", store_path=store, sessions_dir=sessions, now_ms=NOW_MS)
+        check(e.jsonl_turn is not None and e.jsonl_turn.stalled is False,
+              "gather must carry the boundary; got %s" % e.jsonl_turn)
+        check(e.jsonl_age_ms is not None and e.jsonl_age_ms > liv.STREAM_STALL_MS,
+              "the fixture must be frozen past S; got %s" % e.jsonl_age_ms)
+        g = liv.evaluate(e)
+        check(g.state == "running-quiet" and g.reason == "turn-complete",
+              "a turn-complete lane past S is resting, not wedged; got %s/%s" % (g.state, g.reason))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T16 — `dead` is untouched. It is decided from fenced-holder identity BEFORE
+# the ladder, so no turn classification may reach it: a turn-complete lane whose
+# every incarnation is gone is STILL dead, and a stalled one is too. Nothing
+# added for #1254 may move the one state the classifier exists to report.
+# ══════════════════════════════════════════════════════════════════════════
+@test("T16 dead is decided before the turn ladder — never gated by turn state (#1254)")
+def t16_dead_unchanged():
+    for turn in (None, COMPLETE_TURN, OPEN_TURN,
+                 liv.Turn(True, "turn-open:awaiting-response", "user prompt")):
+        v = liv.evaluate(ev(candidates=[C(100, "absent")], jsonl_grew=False,
+                            jsonl_age_ms=H, jsonl_turn=turn))
+        check(v.state == "dead",
+              "a gone incarnation is dead whatever the turn state; got %s/%s" % (v.state, v.reason))
+        check("100:absent" in v.witnesses, "the death witness is named; got %s" % (v.witnesses,))
+        check(v.holder_pid is None, "dead has no holder; got %s" % v.holder_pid)
+
+    check(liv.is_dead_evidence([]) is False, "the dead predicate stays non-vacuous")
+    check(liv.is_dead_evidence([C(1, "off-fence")]) is False, "off-fence is not a death witness")
+    check(liv.is_dead_evidence([C(1, "absent")]) is True, "absent is the death witness")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T17 — absence of turn evidence is an ABSTENTION, and the bounds are verbatim.
+# An unreadable boundary must not fall into `wedged` (that is the original
+# defect with a different trigger), an OPEN turn inside S is still just quiet,
+# and no bound is load-rescaled.
+# ══════════════════════════════════════════════════════════════════════════
+@test("T17 unclassifiable turn -> unknown; bounds verbatim and unscaled (#1254)")
+def t17_unknown_turn_and_bounds():
+    v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=None))
+    check(v.state == "unknown", "an unreadable boundary abstains; got %s/%s" % (v.state, v.reason))
+    check(v.reason == "turn-state-unknown", "the abstention is named; got %s" % v.reason)
+
+    v2 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=19 * M, jsonl_turn=OPEN_TURN))
+    check(v2.state == "running-quiet" and v2.reason == "quiet-within-bound",
+          "an open turn inside S is still quiet; got %s/%s" % (v2.state, v2.reason))
+    v3 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=20 * M, jsonl_turn=OPEN_TURN))
+    check(v3.state == "running-quiet", "exactly at S does NOT yet license wedged (strict >); got %s" % v3.state)
+    v4 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=20 * M + 1, jsonl_turn=OPEN_TURN))
+    check(v4.state == "wedged", "one ms past S does; got %s" % v4.state)
+
+    check(liv.STREAM_STALL_MS == 20 * M, "S is the watchdog's verbatim 20min bound; got %s" % liv.STREAM_STALL_MS)
+    check(liv.IDLE_MS == 24 * H, "the idle proof is the reaper's verbatim 24h; got %s" % liv.IDLE_MS)
+    check(liv.turn_from_jsonl(None) is None, "no path is no boundary")
+    check(liv.turn_from_jsonl("/nonexistent/nope.jsonl") is None, "an unreadable file is no boundary")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -582,6 +783,55 @@ MUTATIONS = [
         '        return Verdict("unknown", "ps-unreadable")\n',
         '',
         "the ps-availability guard is removed, so a failed read falls into the dead path (C3)",
+    ),
+    Mutation(
+        "T13", "module",
+        '    if not turn.stalled:\n'
+        '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
+        '    if False:\n'
+        '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
+        "the turn-complete protection is dropped, so a merely-idle REPL reads wedged again (#1254)",
+    ),
+    Mutation(
+        "T17", "module",
+        '    turn = ev.jsonl_turn\n'
+        '    if turn is None:\n'
+        '        return Verdict("unknown", "turn-state-unknown", holder_pid=holder.pid)\n',
+        '    turn = ev.jsonl_turn or Turn(True, "turn-open:no-terminal-stop", "")\n'
+        '    if turn is None:\n'
+        '        return Verdict("unknown", "turn-state-unknown", holder_pid=holder.pid)\n',
+        "an unclassifiable boundary is treated as an open turn — absence of evidence reads wedged (#1254)",
+    ),
+    Mutation(
+        "T14", "module",
+        'NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})',
+        'NON_TERMINAL_STOP_REASONS = frozenset()',
+        "toolUse stops being non-terminal, so a genuinely stuck mid-turn lane reads resting (fail-open, #1254)",
+    ),
+    Mutation(
+        "T14", "module",
+        '            labels = _tool_call_labels(msg)\n'
+        '            return Turn(\n'
+        '                True,\n'
+        '                "turn-open:pending-tool-call",\n'
+        '                "unanswered %s" % (", ".join(labels) if labels else "tool call"),\n'
+        '            )\n',
+        '            return Turn(True, "turn-open:pending-tool-call", "")\n',
+        "the verdict stops naming the open call, so the report no longer says why (#1254)",
+    ),
+    Mutation(
+        "T16", "module",
+        '    holders = [c for c in cands if c.observed == HOLDER]',
+        '    if ev.jsonl_turn is not None and ev.jsonl_turn.stalled:\n'
+        '        return Verdict("unknown", "turn-open-hold")\n'
+        '    holders = [c for c in cands if c.observed == HOLDER]',
+        "the turn boundary gates identity, so a stalled lane with every incarnation gone stops being dead (#1254)",
+    ),
+    Mutation(
+        "T15", "module",
+        '        for raw in reversed(lines):',
+        '        for raw in lines:',
+        "the tail scan runs forward, so an ancient boundary decides instead of the last (#1254)",
     ),
 ]
 

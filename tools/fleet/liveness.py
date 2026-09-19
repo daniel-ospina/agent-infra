@@ -20,6 +20,33 @@ So the verdict lives here, once, as a pure function over evidence:
 is a NAMED abstention, never a dumping ground. ``dead`` is reachable ONLY from
 positive evidence that every incarnation is gone.
 
+``wedged`` needs ONE condition more than a frozen transcript (#1254). A session
+file stops growing for two opposite reasons: the lane is **at a prompt**, or it
+is **stuck mid-turn** — and "quiet for 20 minutes" is the fleet's normal
+resting state, so firing ``wedged`` on it makes the state read as "not written
+to lately", not "stuck". ``wedged`` therefore requires POSITIVE evidence of an
+OPEN turn, read from the transcript's last message-bearing entry:
+
+* an assistant message whose ``stopReason`` is non-terminal (``toolUse`` — the
+  assistant is awaiting a tool result);
+* a ``toolResult`` with no assistant reply after it;
+* a user prompt with no assistant reply after it.
+
+A transcript whose last turn ended with a TERMINAL ``stopReason`` (``stop`` /
+``length`` / ``error`` / ``aborted``) is RESTING: however long it has been quiet
+short of the retirement proof it reads ``running-quiet (turn-complete)``, never
+``wedged``. ``turn-state-unknown`` (a tail that cannot be read as a turn
+boundary) is an ABSTENTION — absence of evidence is not a stall. Reasons this
+rule introduces, none of them escalating:
+
+    turn-complete                    the last turn ended; the lane awaits input
+    no-turn-yet                      no turn boundary in the transcript yet
+    turn-open:pending-tool-call      an assistant toolCall with no result
+    turn-open:awaiting-assistant     a toolResult with no assistant reply
+    turn-open:awaiting-response      a user prompt with no assistant reply
+    turn-open:no-terminal-stop       the last assistant message has no stopReason
+    turn-state-unknown               the tail could not be read as a turn
+
 ORDERING IS THE SAFETY PROPERTY
 -------------------------------
 Identity is decided FIRST (it is the only source of ``dead``), and every "still
@@ -29,6 +56,12 @@ is the direction ``docs/ops/pi-idle-repl-reaper-policy.md`` already mandates
 
 THE CONTRACT, AS FORMAL CONDITIONS (each re-derived, not paraphrased)
 ---------------------------------------------------------------------
+* **``wedged`` requires a POSITIVELY OPEN turn** (#1254): frozen past the
+  watchdog's stream bound **and** the transcript's last message-bearing entry
+  shows an unfinished turn. A turn-complete transcript is ``running-quiet``
+  however long it rests (short of the retirement proof); a turn that cannot be
+  classified is ``unknown``. This gates ``wedged`` ONLY — ``dead`` is decided
+  from fenced-holder identity BEFORE the ladder and no turn state may reach it.
 * **dead** ⟺ the candidate set is NON-EMPTY **and** every candidate was
   positively OBSERVED absent or a zombie in a fresh ``ps`` read **and** the
   session JSONL did not grow inside the window. An empty candidate set is
@@ -90,6 +123,7 @@ __all__ = [
     "Candidate",
     "Tool",
     "Record",
+    "Turn",
     "Evidence",
     "Verdict",
     "tool_stall_ms",
@@ -98,6 +132,8 @@ __all__ = [
     "record_vetoes",
     "is_dead_evidence",
     "observed_from_probe",
+    "turn_from_entry",
+    "turn_from_jsonl",
     "evaluate",
     "collect_candidates",
     "gather",
@@ -107,6 +143,23 @@ __all__ = [
 ]
 
 STATES = ("dead", "running-quiet", "wedged", "idle", "unknown")
+
+# #1254: the turn boundary is read from the transcript's TAIL — bounded, so a
+# multi-MB session file is never read whole (the boundary is always at the
+# end). The window grows only when a transcript carries no message entry in the
+# first read (a shape pi does not write; measured over 426 live session files,
+# every one had a message entry inside the first 256 KiB).
+TURN_TAIL_BYTES = 262_144
+TURN_TAIL_CAP_BYTES = 16 * 1024 * 1024
+# The ONLY non-terminal assistant `stopReason` in pi's session vocabulary —
+# `stop` / `length` / `error` / `aborted` all END the turn; `toolUse` awaits a
+# tool result. Measured over 426 live session files (147,221 toolUse vs 8,218
+# terminal records), never guessed.
+NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})
+# The message roles that carry a turn boundary; every other entry type
+# (compaction / model_change / thinking_level_change / session / custom) is
+# skipped when scanning back for the last boundary.
+TURN_MESSAGE_ROLES = frozenset({"assistant", "user", "toolResult"})
 
 # ── the bounds — every one a copy of a reviewed constant, never invented ──
 # S: the in-flight-tool silence bound. `DEFAULT_STREAM_STALL_MS`,
@@ -215,6 +268,28 @@ class Record:
     updated_at: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class Turn:
+    """The last turn's boundary, read from the session JSONL tail (#1254).
+
+    ``stalled`` is the POSITIVE statement "the transcript shows an unfinished
+    turn". It is the only thing that may license ``wedged`` when the file is
+    frozen — a merely frozen file is not a stall. ``reason`` is the verdict
+    reason this boundary licenses (``turn-complete`` / ``no-turn-yet`` /
+    ``turn-open:*``); ``detail`` names the specific open call/step where one is
+    known, so the report says *why* rather than merely *that* nothing was
+    written.
+
+    Absent evidence is NOT this object: an unreadable tail is ``None`` on
+    ``Evidence.jsonl_turn``, an abstention the ladder names
+    ``turn-state-unknown``.
+    """
+
+    stalled: bool
+    reason: str
+    detail: str = ""
+
+
 @dataclass
 class Evidence:
     """Everything a verdict may rest on. Absent fields are ``None``/defaults."""
@@ -226,6 +301,9 @@ class Evidence:
     # True/False/None — None means the JSONL's growth could not be established.
     jsonl_grew: Optional[bool] = None
     jsonl_age_ms: Optional[int] = None
+    # The last turn's boundary (#1254). None = could not be established, which
+    # is an ABSTENTION and never a stall.
+    jsonl_turn: Optional[Turn] = None
     tool: Optional[Tool] = None
     record: Optional[Record] = None
     now_ms: int = 0
@@ -418,11 +496,20 @@ def evaluate(ev: Evidence) -> Verdict:
         return Verdict("unknown", "jsonl-age-unknown", holder_pid=holder.pid)
     if ev.jsonl_age_ms > ev.idle_ms:
         return Verdict("idle", "jsonl-old", holder_pid=holder.pid)
-    if ev.jsonl_age_ms > STREAM_STALL_MS:
-        # Frozen past the watchdog's no-tool stream bound (`stream-stall`,
-        # index.ts:2706) and short of the idle proof.
-        return Verdict("wedged", "jsonl-frozen", holder_pid=holder.pid)
-    return Verdict("running-quiet", "quiet-within-bound", holder_pid=holder.pid)
+    if ev.jsonl_age_ms <= STREAM_STALL_MS:
+        return Verdict("running-quiet", "quiet-within-bound", holder_pid=holder.pid)
+    # (5) Frozen past the watchdog's no-tool stream bound (`stream-stall`,
+    #     index.ts:2706) and short of the idle proof. A frozen transcript has
+    #     TWO causes and only one is a stall (#1254): the turn ENDED (the lane
+    #     is resting at a prompt — the fleet's normal state) or it is OPEN.
+    #     `wedged` requires the POSITIVE evidence of an open turn; a turn that
+    #     cannot be classified is an ABSTENTION, never a stall.
+    turn = ev.jsonl_turn
+    if turn is None:
+        return Verdict("unknown", "turn-state-unknown", holder_pid=holder.pid)
+    if not turn.stalled:
+        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)
+    return Verdict("wedged", turn.reason, holder_pid=holder.pid, detail=turn.detail)
 
 
 # ── the process boundary (scripts/lib/pid-identity.sh) ───────────────────
@@ -590,6 +677,114 @@ def jsonl_state(path: Optional[str], now_ms: int, window_ms: int = STREAM_STALL_
     return age <= window_ms, age
 
 
+# ── the turn boundary (#1254) ─────────────────────────────────────────────
+def _tool_call_labels(msg: dict) -> List[str]:
+    """``["bash(call_00_…)", …]`` for an assistant message's toolCall items."""
+    labels: List[str] = []
+    for item in msg.get("content") or []:
+        if not isinstance(item, dict) or item.get("type") != "toolCall":
+            continue
+        name = str(item.get("name") or "?")
+        cid = str(item.get("id") or "")
+        labels.append("%s(%s)" % (name, cid) if cid else name)
+    return labels
+
+
+def turn_from_entry(entry) -> Turn:
+    """Classify a transcript's LAST message-bearing entry as open or ended.
+
+    Pure and total: an entry that is not a message (a compaction /
+    model_change / session record) carries no turn boundary and reads
+    ``no-turn-yet`` — never a stall. The direction is deliberate: ``stalled`` is
+    asserted only on a POSITIVE open-turn shape, so a shape this parser does not
+    recognize can never manufacture ``wedged`` (#1254).
+    """
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    if not isinstance(msg, dict):
+        return Turn(False, "no-turn-yet")
+    role = msg.get("role")
+    if role == "assistant":
+        stop = msg.get("stopReason")
+        if stop in NON_TERMINAL_STOP_REASONS:
+            labels = _tool_call_labels(msg)
+            return Turn(
+                True,
+                "turn-open:pending-tool-call",
+                "unanswered %s" % (", ".join(labels) if labels else "tool call"),
+            )
+        if not stop:
+            return Turn(True, "turn-open:no-terminal-stop",
+                        "last assistant message carries no stopReason")
+        return Turn(False, "turn-complete", "terminal stopReason=%s" % stop)
+    if role == "toolResult":
+        name = str(msg.get("toolName") or "")
+        cid = str(msg.get("toolCallId") or "")
+        label = ("%s(%s)" % (name, cid)) if (name and cid) else (name or cid or "tool result")
+        return Turn(True, "turn-open:awaiting-assistant",
+                    "%s recorded with no assistant reply after it" % label)
+    if role == "user":
+        return Turn(True, "turn-open:awaiting-response",
+                    "user prompt with no assistant reply")
+    return Turn(False, "no-turn-yet")
+
+
+def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
+    """The last JSONL entry carrying a user/assistant/toolResult message.
+
+    Read BACKWARDS from EOF — the last turn boundary is always at the end, so a
+    bounded read suffices and the file is never read whole. ``(None, size)``
+    means no such entry was found in the window (or the file could not be
+    read); the caller abstains, it never guesses.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None, 0
+    window = limit_bytes
+    while True:
+        read = min(size, window)
+        start = size - read
+        try:
+            with open(path, "rb") as fh:
+                if start:
+                    fh.seek(start)
+                blob = fh.read(read)
+        except OSError:
+            return None, size
+        lines = blob.split(b"\n")
+        if start:
+            # The read began mid-entry: the first line is a partial record.
+            lines = lines[1:]
+        for raw in reversed(lines):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw.decode("utf-8", "replace"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            msg = entry.get("message") if isinstance(entry, dict) else None
+            if isinstance(msg, dict) and msg.get("role") in TURN_MESSAGE_ROLES:
+                return entry, size
+        if start == 0 or window >= TURN_TAIL_CAP_BYTES:
+            return None, size
+        window = min(window * 4, TURN_TAIL_CAP_BYTES)
+
+
+def turn_from_jsonl(path: Optional[str]) -> Optional[Turn]:
+    """Read the tail of a session JSONL and classify its last turn (#1254).
+
+    ``None`` means the boundary could not be established — an ABSTENTION, never
+    a stall. The ladder names it ``turn-state-unknown``.
+    """
+    if not path:
+        return None
+    entry, _size = _last_message_entry(path)
+    if entry is None:
+        return None
+    return turn_from_entry(entry)
+
+
 def session_file_for(sid: str, cwd: Optional[str], sessions_dir: str = DEFAULT_SESSIONS_DIR) -> Optional[str]:
     """The session JSONL for ``sid`` (the reaper's sid-token-boundary match)."""
     enc = (cwd or "").lstrip("/").replace("/", "-")
@@ -646,6 +841,7 @@ def gather(
     cwd = rec.get("cwd") if isinstance(rec, dict) else None
     sfile = session_file_for(sid, cwd if isinstance(cwd, str) else None, sessions_dir)
     grew, age = jsonl_state(sfile, now)
+    turn = turn_from_jsonl(sfile)
 
     tool = _tool_from_record(rec) if isinstance(rec, dict) else None
     record = None
@@ -660,6 +856,7 @@ def gather(
         candidates=candidates,
         jsonl_grew=grew,
         jsonl_age_ms=age,
+        jsonl_turn=turn,
         tool=tool,
         record=record,
         now_ms=now,

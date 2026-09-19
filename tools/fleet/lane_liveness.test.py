@@ -13,13 +13,19 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 never escalated (the retired-pane noise class)
     CHILD-EXCL  a task child's newer record on the parent's workspace does not
                 become the lane's verdict
+    TURN-BOUNDARY a lane whose transcript ended is `running-quiet`/`turn-complete`
+                however long it rests, while a lane frozen with an OPEN turn is
+                still `wedged` — the #1254 contract at the report layer
 
 RED CONTROL (the part fleet-cost-weekly.test.sh has no equivalent of) — a green
-suite is only a pin if it can FAIL. Three mutations of the report, each run
-against the leg that must catch it:
-  * escalate every state      → CLEAN must go red
-  * escalate nothing          → TRIP must go red
-  * drop the child exclusion  → CLEAN must go red
+suite is only a pin if it can FAIL. Five mutations, each run against the leg
+that must catch it (four mutate the report; the fifth mutates the CLASSIFIER it
+consumes, which is the seam #1254 actually broke):
+  * escalate every state        → CLEAN must go red
+  * escalate nothing            → TRIP must go red
+  * drop the child exclusion    → CLEAN must go red
+  * drop the open-workspace filter → CLOSED-WORKSPACE must go red
+  * drop the turn-complete guard   → TURN-BOUNDARY must go red
 A mutation the suite does not catch is reported as a suite failure.
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;
@@ -92,6 +98,12 @@ PID_ALIVE = 1111
 PID_DEAD = 2222
 PID_STALE = 3333
 PID_CHILD = 4444
+WS_TURN_DONE = "44444444-4444-4444-8444-444444444444"
+WS_TURN_OPEN = "55555555-5555-4555-8555-555555555555"
+SID_TURN_DONE = "eeeeeeee-0000-4000-8000-000000000005"
+SID_TURN_OPEN = "ffffffff-0000-4000-8000-000000000006"
+PID_TURN_DONE = 5555
+PID_TURN_OPEN = 6666
 
 PS_SHIM = """#!/usr/bin/env bash
 [ "${1:-}" = "-axo" ] || exit 1
@@ -271,6 +283,38 @@ def child_record():
                               cwd="/tmp/lane-child"))
 
 
+# ── #1254 fixtures: a resting lane and a mid-turn lane, both frozen ──────
+def turn_done_lane():
+    return ("turn-done", WS_TURN_DONE, SID_TURN_DONE,
+            # non_idle=False so the record veto does NOT fire and the ladder runs.
+            record(SID_TURN_DONE, WS_TURN_DONE, PID_TURN_DONE, updated_at=NOW_S,
+                   non_idle=False, cwd="/tmp/turn-done"))
+
+
+def turn_open_lane():
+    return ("turn-open", WS_TURN_OPEN, SID_TURN_OPEN,
+            record(SID_TURN_OPEN, WS_TURN_OPEN, PID_TURN_OPEN, updated_at=NOW_S,
+                   non_idle=False, cwd="/tmp/turn-open"))
+
+
+def msg_entry(role, **msg):
+    base = {"role": role}
+    base.update(msg)
+    return {"type": "message", "message": base}
+
+
+def write_transcript(fx, sid, cwd, entries, *, age_s=1800):
+    """Write a session JSONL where session_file_for() will find it, frozen."""
+    d = os.path.join(fx.sessions_dir, "--%s--" % cwd.lstrip("/").replace("/", "-"))
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "2026-01-01T00-00-00-000Z_%s.jsonl" % sid)
+    with open(path, "w", encoding="utf-8") as fh:
+        for e in entries:
+            fh.write(json.dumps(e) + "\n")
+    os.utime(path, (NOW_S - age_s, NOW_S - age_s))
+    return path
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # The legs
 # ══════════════════════════════════════════════════════════════════════════
@@ -445,23 +489,68 @@ def leg_closed_workspace(module=None):
         fx.close()
 
 
+def leg_turn_boundary(module=None):
+    print("── TURN-BOUNDARY — resting is not wedged; an open turn still is (#1254) ──")
+    fx = Fixture([turn_done_lane(), turn_open_lane()],
+                 ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN)])
+    try:
+        # Both transcripts are frozen 30 min (past S = 20 min, inside the 24h
+        # idle proof). The ONLY difference is the turn boundary.
+        write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
+                         [msg_entry("assistant", stopReason="stop",
+                                    content=[{"type": "text", "text": "done"}])])
+        write_transcript(fx, SID_TURN_OPEN, "/tmp/turn-open",
+                         [msg_entry("assistant", stopReason="toolUse",
+                                    content=[{"type": "toolCall", "name": "bash",
+                                              "id": "call_00_OPEN"}])])
+        rc, out, gh = run_report(fx, "--json", module=module)
+        assert_eq(rc, 0, "neither lane escalates (both have a live holder)")
+        parsed = json.loads(out.splitlines()[0])
+        verdicts = {l["lane"]: l for l in parsed["lanes"]}
+        done = verdicts.get("turn-done", {})
+        assert_eq(done.get("state"), "running-quiet",
+                  "a turn-complete lane is running-quiet, never wedged")
+        assert_eq(done.get("reason"), "turn-complete", "the reason names the turn boundary")
+        if "terminal stopReason=stop" in out:
+            ok("the report's evidence names the terminal stopReason")
+        else:
+            bad("the report must say WHY the lane is resting (terminal stopReason absent)")
+        opened = verdicts.get("turn-open", {})
+        assert_eq(opened.get("state"), "wedged", "a frozen OPEN turn is still wedged")
+        assert_eq(opened.get("reason"), "turn-open:pending-tool-call",
+                  "the wedged reason names the open turn")
+        if "call_00_OPEN" in out:
+            ok("the report names the unanswered call")
+        else:
+            bad("the wedged row must name the open call")
+        assert_eq(parsed["counts"].get("wedged"), 1,
+                  "exactly one wedged lane: the open turn, not the resting one")
+        if gh:
+            bad("a live-holder wedge must not escalate: %s" % gh)
+        else:
+            ok("neither verdict escalates (dead-only policy)")
+    finally:
+        fx.close()
+
+
 LEGS = [("CLEAN", leg_clean), ("TRIP", leg_trip), ("DEDUP", leg_dedup),
         ("DRY-RUN", leg_dry_run), ("ENV-ERROR", leg_env_error),
         ("STALE-DEAD", leg_stale_dead), ("CLOSED-WORKSPACE", leg_closed_workspace),
-        ("PS-CACHE", leg_ps_cache)]
+        ("PS-CACHE", leg_ps_cache), ("TURN-BOUNDARY", leg_turn_boundary)]
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # The RED control — the suite must catch a broken report
 # ══════════════════════════════════════════════════════════════════════════
 class Mutation:
-    def __init__(self, name, old, new, leg, want_rc, why):
+    def __init__(self, name, old, new, leg, want_rc, why, target="report"):
         self.name = name
         self.old = old
         self.new = new
         self.leg = leg
         self.want_rc = want_rc
         self.why = why
+        self.target = target          # "report" | "classifier"
 
 
 MUTATIONS = [
@@ -493,20 +582,39 @@ MUTATIONS = [
         leg_closed_workspace, 1,
         "a retired/closed pane escalates again; CLOSED-WORKSPACE catches it",
     ),
+    Mutation(
+        "drop-turn-complete-protection",
+        '    if not turn.stalled:\n'
+        '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
+        '    if False:\n'
+        '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
+        leg_turn_boundary, 0,
+        "a resting lane reads wedged again at the report layer; TURN-BOUNDARY catches it (#1254)",
+        target="classifier",
+    ),
 ]
 
 
 def _mutant_dir(mut):
     tmp = tempfile.mkdtemp(prefix="lane-liv-mutant-")
-    shutil.copy(LIVENESS_PATH, os.path.join(tmp, "liveness.py"))
+    with open(LIVENESS_PATH, "r", encoding="utf-8") as fh:
+        liv_src = fh.read()
     with open(MODULE_PATH, "r", encoding="utf-8") as fh:
-        src = fh.read()
-    if src.count(mut.old) != 1:
+        rep_src = fh.read()
+    target_path = LIVENESS_PATH if mut.target == "classifier" else MODULE_PATH
+    target_src = liv_src if mut.target == "classifier" else rep_src
+    if target_src.count(mut.old) != 1:
         raise SystemExit("mutation anchor not unique in %s (%d hits):\n%s"
-                         % (MODULE_PATH, src.count(mut.old), mut.old))
+                         % (target_path, target_src.count(mut.old), mut.old))
+    if mut.target == "classifier":
+        liv_src = liv_src.replace(mut.old, mut.new, 1)
+    else:
+        rep_src = rep_src.replace(mut.old, mut.new, 1)
+    with open(os.path.join(tmp, "liveness.py"), "w", encoding="utf-8") as fh:
+        fh.write(liv_src)
     out = os.path.join(tmp, "lane_liveness.py")
     with open(out, "w", encoding="utf-8") as fh:
-        fh.write(src.replace(mut.old, mut.new, 1))
+        fh.write(rep_src)
     return tmp, out
 
 
