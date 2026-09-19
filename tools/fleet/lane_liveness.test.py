@@ -13,19 +13,24 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 never escalated (the retired-pane noise class)
     CHILD-EXCL  a task child's newer record on the parent's workspace does not
                 become the lane's verdict
-    TURN-BOUNDARY a lane whose transcript ended is `running-quiet`/`turn-complete`
-                however long it rests, while a lane frozen with an OPEN turn is
-                still `wedged` — the #1254 contract at the report layer
+    TURN-BOUNDARY a lane whose transcript ended is `running-quiet`/`turn-ended`
+                however long it rests (short of the 24h retirement proof), while a
+                lane frozen with an OPEN turn is still `wedged` — the #1254
+                contract at the report layer
+    COMPACTION    a lane whose last transcript entry is a `compaction` abstains
+                (`unknown`/`tail-after-compaction`), never a decided turn (#1254 P1)
 
 RED CONTROL (the part fleet-cost-weekly.test.sh has no equivalent of) — a green
-suite is only a pin if it can FAIL. Five mutations, each run against the leg
-that must catch it (four mutate the report; the fifth mutates the CLASSIFIER it
+suite is only a pin if it can FAIL. Seven mutations, each run against the leg
+that must catch it (five mutate the report; two mutate the CLASSIFIER it
 consumes, which is the seam #1254 actually broke):
   * escalate every state        → CLEAN must go red
   * escalate nothing            → TRIP must go red
   * drop the child exclusion    → CLEAN must go red
   * drop the open-workspace filter → CLOSED-WORKSPACE must go red
-  * drop the turn-complete guard   → TURN-BOUNDARY must go red
+  * drop the turn-ended guard   → TURN-BOUNDARY must go red
+  * compaction tail stops abstaining → COMPACTION must go red
+  * policy text loses the 24h carve-out → TURN-BOUNDARY must go red
 A mutation the suite does not catch is reported as a suite failure.
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;
@@ -509,8 +514,8 @@ def leg_turn_boundary(module=None):
         verdicts = {l["lane"]: l for l in parsed["lanes"]}
         done = verdicts.get("turn-done", {})
         assert_eq(done.get("state"), "running-quiet",
-                  "a turn-complete lane is running-quiet, never wedged")
-        assert_eq(done.get("reason"), "turn-complete", "the reason names the turn boundary")
+                  "a turn-ended lane is running-quiet, never wedged")
+        assert_eq(done.get("reason"), "turn-ended", "the reason names the turn boundary")
         if "terminal stopReason=stop" in out:
             ok("the report's evidence names the terminal stopReason")
         else:
@@ -525,6 +530,13 @@ def leg_turn_boundary(module=None):
             bad("the wedged row must name the open call")
         assert_eq(parsed["counts"].get("wedged"), 1,
                   "exactly one wedged lane: the open turn, not the resting one")
+        # P2: the emitted policy text must say what the code does — a resting
+        # lane is running-quiet only SHORT OF the 24h retirement proof (past it
+        # the `idle`/`jsonl-old` branch returns first).
+        assert_contains(out, "short of the 24h retirement proof",
+                        "the policy text names the retirement-proof carve-out")
+        assert_contains(out, "`turn-ended`",
+                        "the policy text uses the renamed (non-colliding) reason")
         if gh:
             bad("a live-holder wedge must not escalate: %s" % gh)
         else:
@@ -533,10 +545,51 @@ def leg_turn_boundary(module=None):
         fx.close()
 
 
+def leg_compaction(module=None):
+    print("── COMPACTION — a between-turns summary abstains, never decides (#1254 P1) ──")
+    fx = Fixture([turn_done_lane(), turn_open_lane()],
+                 ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN)])
+    try:
+        # Both transcripts are frozen 30 min and BOTH end with a `compaction`
+        # entry: pi writes it between turns, so it is not evidence the previous
+        # turn ended. Measured over the real corpus: 483 compactions, 477
+        # followed by a message entry and 357 of those an open assistant/toolUse.
+        write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
+                         [msg_entry("assistant", stopReason="stop",
+                                    content=[{"type": "text", "text": "done"}]),
+                          {"type": "compaction", "summary": "…"}])
+        write_transcript(fx, SID_TURN_OPEN, "/tmp/turn-open",
+                         [msg_entry("assistant", stopReason="toolUse",
+                                    content=[{"type": "toolCall", "name": "bash",
+                                              "id": "call_00_OPEN"}]),
+                          {"type": "compaction", "summary": "…"}])
+        rc, out, gh = run_report(fx, "--json", module=module)
+        assert_eq(rc, 0, "no lane escalates: an abstention is not a death witness")
+        parsed = json.loads(out.splitlines()[0])
+        verdicts = {l["lane"]: l for l in parsed["lanes"]}
+        for label in ("turn-done", "turn-open"):
+            v = verdicts.get(label, {})
+            assert_eq(v.get("state"), "unknown",
+                      "%s: a compaction tail is an abstention, never wedged" % label)
+            assert_eq(v.get("reason"), "tail-after-compaction",
+                      "%s: the abstention names the compaction tail" % label)
+        assert_eq(parsed["counts"].get("wedged", 0), 0,
+                  "the open turn behind a compaction must NOT read wedged")
+        assert_eq(parsed["counts"].get("unknown"), 2,
+                  "both compaction-tailed lanes abstain")
+        if gh:
+            bad("an abstention must not escalate: %s" % gh)
+        else:
+            ok("abstention never escalates (dead-only policy)")
+    finally:
+        fx.close()
+
+
 LEGS = [("CLEAN", leg_clean), ("TRIP", leg_trip), ("DEDUP", leg_dedup),
         ("DRY-RUN", leg_dry_run), ("ENV-ERROR", leg_env_error),
         ("STALE-DEAD", leg_stale_dead), ("CLOSED-WORKSPACE", leg_closed_workspace),
-        ("PS-CACHE", leg_ps_cache), ("TURN-BOUNDARY", leg_turn_boundary)]
+        ("PS-CACHE", leg_ps_cache), ("TURN-BOUNDARY", leg_turn_boundary),
+        ("COMPACTION", leg_compaction)]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -583,7 +636,7 @@ MUTATIONS = [
         "a retired/closed pane escalates again; CLOSED-WORKSPACE catches it",
     ),
     Mutation(
-        "drop-turn-complete-protection",
+        "drop-turn-ended-protection",
         '    if not turn.stalled:\n'
         '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
         '    if False:\n'
@@ -591,6 +644,24 @@ MUTATIONS = [
         leg_turn_boundary, 0,
         "a resting lane reads wedged again at the report layer; TURN-BOUNDARY catches it (#1254)",
         target="classifier",
+    ),
+    Mutation(
+        "compaction-tail-decides",
+        '    if (last_entry is not None and isinstance(last_entry, dict)\n'
+        '            and last_entry.get("type") == "compaction"):\n'
+        '        return turn_from_entry(last_entry)\n',
+        '',
+        leg_compaction, 0,
+        "a compaction tail falls through to the previous message, so a between-turns summary decides (#1254 P1)",
+        target="classifier",
+    ),
+    Mutation(
+        "policy-text-loses-the-carve-out",
+        '        "rests short of the 24h retirement proof, so only a lane whose every "\n',
+        '        "rests, so only a lane whose every "\n',
+        leg_turn_boundary, 1,
+        "the emitted policy text asserts a rule the code does not implement (no 24h carve-out, T13) (#1254 P2)",
+        target="report",
     ),
 ]
 

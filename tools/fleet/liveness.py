@@ -27,24 +27,29 @@ resting state, so firing ``wedged`` on it makes the state read as "not written
 to lately", not "stuck". ``wedged`` therefore requires POSITIVE evidence of an
 OPEN turn, read from the transcript's last message-bearing entry:
 
-* an assistant message whose ``stopReason`` is non-terminal (``toolUse`` — the
-  assistant is awaiting a tool result);
+* an assistant message CARRYING tool calls whose ``stopReason`` is not one
+  under which pi discards them (``error`` / ``aborted``) — pi **suspends** on
+  ``length`` to execute the calls, so a ``length`` message with calls is still
+  awaiting their results;
+* an assistant message whose ``stopReason`` is ``toolUse``;
 * a ``toolResult`` with no assistant reply after it;
 * a user prompt with no assistant reply after it.
 
-A transcript whose last turn ended with a TERMINAL ``stopReason`` (``stop`` /
-``length`` / ``error`` / ``aborted``) is RESTING: however long it has been quiet
-short of the retirement proof it reads ``running-quiet (turn-complete)``, never
-``wedged``. ``turn-state-unknown`` (a tail that cannot be read as a turn
-boundary) is an ABSTENTION — absence of evidence is not a stall. Reasons this
-rule introduces, none of them escalating:
+A transcript whose last turn ended with a TERMINAL ``stopReason`` (``stop``, or
+``length`` / ``error`` / ``aborted`` on a message carrying NO tool calls) is
+RESTING: however long it has been quiet short of the retirement proof it reads
+``running-quiet (turn-ended)``, never ``wedged``. ``turn-state-unknown`` (a tail
+that cannot be read as a turn boundary) and ``tail-after-compaction`` (a summary
+line pi writes *between* turns) are ABSTENTIONS — absence of evidence is not a
+stall. Reasons this rule introduces, none of them escalating:
 
-    turn-complete                    the last turn ended; the lane awaits input
+    turn-ended                       the last turn ended; the lane awaits input
     no-turn-yet                      no turn boundary in the transcript yet
     turn-open:pending-tool-call      an assistant toolCall with no result
     turn-open:awaiting-assistant     a toolResult with no assistant reply
     turn-open:awaiting-response      a user prompt with no assistant reply
     turn-open:no-terminal-stop       the last assistant message has no stopReason
+    tail-after-compaction            a compaction entry is the last entry
     turn-state-unknown               the tail could not be read as a turn
 
 ORDERING IS THE SAFETY PROPERTY
@@ -58,8 +63,8 @@ THE CONTRACT, AS FORMAL CONDITIONS (each re-derived, not paraphrased)
 ---------------------------------------------------------------------
 * **``wedged`` requires a POSITIVELY OPEN turn** (#1254): frozen past the
   watchdog's stream bound **and** the transcript's last message-bearing entry
-  shows an unfinished turn. A turn-complete transcript is ``running-quiet``
-  however long it rests (short of the retirement proof); a turn that cannot be
+  shows an unfinished turn. A turn-ended transcript is ``running-quiet`` however
+  long it rests (short of the retirement proof); a turn that cannot be
   classified is ``unknown``. This gates ``wedged`` ONLY — ``dead`` is decided
   from fenced-holder identity BEFORE the ladder and no turn state may reach it.
 * **dead** ⟺ the candidate set is NON-EMPTY **and** every candidate was
@@ -126,6 +131,7 @@ __all__ = [
     "Turn",
     "Evidence",
     "Verdict",
+    "CALL_DISCARDING_STOP_REASONS",
     "tool_stall_ms",
     "cpu_attributable",
     "tool_veto_expired",
@@ -151,11 +157,24 @@ STATES = ("dead", "running-quiet", "wedged", "idle", "unknown")
 # every one had a message entry inside the first 256 KiB).
 TURN_TAIL_BYTES = 262_144
 TURN_TAIL_CAP_BYTES = 16 * 1024 * 1024
-# The ONLY non-terminal assistant `stopReason` in pi's session vocabulary —
-# `stop` / `length` / `error` / `aborted` all END the turn; `toolUse` awaits a
-# tool result. Measured over 426 live session files (147,221 toolUse vs 8,218
-# terminal records), never guessed.
+# The stop reasons under which an assistant turn CONTINUES even with no
+# parseable tool call: `toolUse` awaits a tool result. `stop` / `length` /
+# `error` / `aborted` end the turn WHEN THE MESSAGE CARRIES NO TOOL CALL; when
+# it does carry calls, `CALL_DISCARDING_STOP_REASONS` decides.
 NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})
+# #1254 cycle-1 P0: a message CARRYING tool calls is OPEN unless its stop reason
+# is one under which pi DISCARDS those calls. Measured over the 426 live session
+# files in `~/.pi/agent/sessions` — assistant messages carrying toolCalls, and
+# whether a matching toolResult follows:
+#     stopReason  withToolCalls  answeredNext  unanswered
+#     toolUse        147,466       147,431        35
+#     error              115             0       115   <- calls discarded
+#     length              78            78         0   <- calls EXECUTED, so OPEN
+#     aborted             16             0        16   <- calls discarded
+# pi SUSPENDS on `length` to execute the calls, so `length` is NOT terminal
+# here. Reading a message by its stopReason alone made an executing turn read
+# `turn-ended` — the #1254 fail-open shape, aimed at the classifier itself.
+CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted"})
 # The message roles that carry a turn boundary; every other entry type
 # (compaction / model_change / thinking_level_change / session / custom) is
 # skipped when scanning back for the last boundary.
@@ -275,10 +294,15 @@ class Turn:
     ``stalled`` is the POSITIVE statement "the transcript shows an unfinished
     turn". It is the only thing that may license ``wedged`` when the file is
     frozen — a merely frozen file is not a stall. ``reason`` is the verdict
-    reason this boundary licenses (``turn-complete`` / ``no-turn-yet`` /
-    ``turn-open:*``); ``detail`` names the specific open call/step where one is
-    known, so the report says *why* rather than merely *that* nothing was
-    written.
+    reason this boundary licenses (``turn-ended`` / ``no-turn-yet`` /
+    ``turn-open:*`` / ``tail-after-compaction``); ``detail`` names the specific
+    open call/step where one is known, so the report says *why* rather than
+    merely *that* nothing was written.
+
+    ``abstain`` marks a tail that carries NO turn boundary at all (a
+    ``compaction`` written between turns). Such an entry can neither license
+    ``wedged`` nor be read as a finished turn, so the ladder returns ``unknown``
+    naming ``reason`` — a third disposition, not a weaker ``stalled``.
 
     Absent evidence is NOT this object: an unreadable tail is ``None`` on
     ``Evidence.jsonl_turn``, an abstention the ladder names
@@ -288,6 +312,7 @@ class Turn:
     stalled: bool
     reason: str
     detail: str = ""
+    abstain: bool = False
 
 
 @dataclass
@@ -503,10 +528,13 @@ def evaluate(ev: Evidence) -> Verdict:
     #     TWO causes and only one is a stall (#1254): the turn ENDED (the lane
     #     is resting at a prompt — the fleet's normal state) or it is OPEN.
     #     `wedged` requires the POSITIVE evidence of an open turn; a turn that
-    #     cannot be classified is an ABSTENTION, never a stall.
+    #     cannot be classified is an ABSTENTION, never a stall — as is a
+    #     compaction written after the last turn (pi writes it BETWEEN turns).
     turn = ev.jsonl_turn
     if turn is None:
         return Verdict("unknown", "turn-state-unknown", holder_pid=holder.pid)
+    if turn.abstain:
+        return Verdict("unknown", turn.reason, holder_pid=holder.pid, detail=turn.detail)
     if not turn.stalled:
         return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)
     return Verdict("wedged", turn.reason, holder_pid=holder.pid, detail=turn.detail)
@@ -691,31 +719,48 @@ def _tool_call_labels(msg: dict) -> List[str]:
 
 
 def turn_from_entry(entry) -> Turn:
-    """Classify a transcript's LAST message-bearing entry as open or ended.
+    """Classify ONE transcript entry as open, ended, or carrying no boundary.
 
-    Pure and total: an entry that is not a message (a compaction /
-    model_change / session record) carries no turn boundary and reads
-    ``no-turn-yet`` — never a stall. The direction is deliberate: ``stalled`` is
-    asserted only on a POSITIVE open-turn shape, so a shape this parser does not
-    recognize can never manufacture ``wedged`` (#1254).
+    Three dispositions, decided in this order of evidence:
+
+    * OPEN (``stalled=True``) — a shape that POSITIVELY shows an unfinished
+      turn. An assistant message CARRYING tool calls is open unless its
+      ``stopReason`` is in ``CALL_DISCARDING_STOP_REASONS``: pi suspends on
+      ``length`` to execute the calls, so ``length`` + calls awaits their
+      results rather than resting.
+    * ENDED (``stalled=False``, ``abstain=False``, reason ``turn-ended``) — a
+      terminal ``stopReason`` on a message carrying no tool calls.
+    * NO BOUNDARY (``abstain=True``) — a ``compaction`` entry. pi writes it
+      BETWEEN turns, so it decides neither disposition (see ``turn_from_jsonl``
+      for the measurement).
+
+    Pure and total, and the direction is deliberate: ``stalled`` is asserted
+    only on a POSITIVE open-turn shape, so a shape this parser does not
+    recognize can never manufacture ``wedged`` (#1254). A non-message entry that
+    is NOT a compaction (``session`` / ``model_change`` /
+    ``thinking_level_change`` / ``custom``) reads ``no-turn-yet``; the wired path
+    (``turn_from_jsonl``) passes only message-bearing entries, so that fallback
+    is reachable only when this function is called directly.
     """
+    if isinstance(entry, dict) and entry.get("type") == "compaction":
+        return Turn(False, "tail-after-compaction",
+                    "a compaction entry is the last entry", abstain=True)
     msg = entry.get("message") if isinstance(entry, dict) else None
     if not isinstance(msg, dict):
         return Turn(False, "no-turn-yet")
     role = msg.get("role")
     if role == "assistant":
         stop = msg.get("stopReason")
+        calls = _tool_call_labels(msg)
+        if calls and stop not in CALL_DISCARDING_STOP_REASONS:
+            return Turn(True, "turn-open:pending-tool-call",
+                        "unanswered %s" % ", ".join(calls))
         if stop in NON_TERMINAL_STOP_REASONS:
-            labels = _tool_call_labels(msg)
-            return Turn(
-                True,
-                "turn-open:pending-tool-call",
-                "unanswered %s" % (", ".join(labels) if labels else "tool call"),
-            )
+            return Turn(True, "turn-open:pending-tool-call", "unanswered tool call")
         if not stop:
             return Turn(True, "turn-open:no-terminal-stop",
                         "last assistant message carries no stopReason")
-        return Turn(False, "turn-complete", "terminal stopReason=%s" % stop)
+        return Turn(False, "turn-ended", "terminal stopReason=%s" % stop)
     if role == "toolResult":
         name = str(msg.get("toolName") or "")
         cid = str(msg.get("toolCallId") or "")
@@ -729,18 +774,22 @@ def turn_from_entry(entry) -> Turn:
 
 
 def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
-    """The last JSONL entry carrying a user/assistant/toolResult message.
+    """The last message-bearing entry AND the file's actual last entry.
 
     Read BACKWARDS from EOF — the last turn boundary is always at the end, so a
-    bounded read suffices and the file is never read whole. ``(None, size)``
-    means no such entry was found in the window (or the file could not be
-    read); the caller abstains, it never guesses.
+    bounded read suffices and the file is never read whole. Every pass reaches
+    EOF, so the first parseable line it meets is the file's LAST entry. Returns
+    ``(message_entry, last_entry, size)``: ``message_entry`` is ``None`` when no
+    message-bearing entry was found in the window (or the file could not be
+    read); ``last_entry`` is ``None`` only when the window held no parseable
+    entry at all. The caller abstains, it never guesses.
     """
     try:
         size = os.path.getsize(path)
     except OSError:
-        return None, 0
+        return None, None, 0
     window = limit_bytes
+    last_entry = None
     while True:
         read = min(size, window)
         start = size - read
@@ -750,7 +799,7 @@ def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
                     fh.seek(start)
                 blob = fh.read(read)
         except OSError:
-            return None, size
+            return None, None, size
         lines = blob.split(b"\n")
         if start:
             # The read began mid-entry: the first line is a partial record.
@@ -763,23 +812,48 @@ def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
                 entry = json.loads(raw.decode("utf-8", "replace"))
             except (ValueError, UnicodeDecodeError):
                 continue
+            if last_entry is None:
+                last_entry = entry
             msg = entry.get("message") if isinstance(entry, dict) else None
             if isinstance(msg, dict) and msg.get("role") in TURN_MESSAGE_ROLES:
-                return entry, size
+                return entry, last_entry, size
         if start == 0 or window >= TURN_TAIL_CAP_BYTES:
-            return None, size
+            return None, last_entry, size
         window = min(window * 4, TURN_TAIL_CAP_BYTES)
 
 
 def turn_from_jsonl(path: Optional[str]) -> Optional[Turn]:
     """Read the tail of a session JSONL and classify its last turn (#1254).
 
-    ``None`` means the boundary could not be established — an ABSTENTION, never
-    a stall. The ladder names it ``turn-state-unknown``.
+    A ``compaction`` as the LAST entry ABSTAINS (``tail-after-compaction``)
+    rather than letting the message before it decide. pi writes the compaction
+    BETWEEN turns and immediately starts the next call — measured over the 426
+    live session files in `~/.pi/agent/sessions`: 483 compaction entries exist,
+    477 are followed by a message entry, and 357 of those are an open
+    ``assistant/toolUse``. A frozen transcript whose last entry is a compaction
+    is therefore NOT evidence that the turn before it ended, and reading it that
+    way would classify an OPEN turn as resting — the #1254 fail-open shape.
+
+    This is a DELIBERATE, DISCLOSED UNDER-REPORT: ``unknown`` neither licenses
+    ``wedged`` nor claims the lane is resting, so the cost is a lane left
+    unnamed in the diagnostic band rather than one mislabelled. Revisit it if
+    the population ever justifies the inference; until then a population
+    statistic is not per-case evidence, and the module's principle (``wedged``
+    requires positive per-case evidence of an OPEN turn) governs.
+
+    Other trailer types (``session`` / ``model_change`` /
+    ``thinking_level_change``) carry no boundary of their own and keep the
+    existing behaviour: the previous message-bearing entry decides.
+
+    ``None`` means the boundary could not be established at all — an ABSTENTION,
+    never a stall. The ladder names it ``turn-state-unknown``.
     """
     if not path:
         return None
-    entry, _size = _last_message_entry(path)
+    entry, last_entry, _size = _last_message_entry(path)
+    if (last_entry is not None and isinstance(last_entry, dict)
+            and last_entry.get("type") == "compaction"):
+        return turn_from_entry(last_entry)
     if entry is None:
         return None
     return turn_from_entry(entry)

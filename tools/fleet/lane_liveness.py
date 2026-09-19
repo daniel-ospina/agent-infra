@@ -71,9 +71,10 @@ unambiguous and is the state that was structurally invisible. This was
 originally forced by a classifier defect (#1254): a merely-idle interactive
 REPL read ``wedged`` (``jsonl-frozen``) 47 minutes after a completed turn,
 because ``wedged`` fired on any frozen transcript. ``liveness.py`` now requires
-POSITIVE evidence of an open turn, so a turn-complete lane reports
-``running-quiet`` (``turn-complete``) however long it rests, and ``wedged``
-means what it says. The escalation policy still stays ``dead``-only — a
+POSITIVE evidence of an open turn, so a turn-ended lane reports
+``running-quiet`` (``turn-ended``) however long it rests short of the 24h
+retirement proof, and ``wedged`` means what it says. The escalation policy
+still stays ``dead``-only — a
 reporting fix is not a licence to file issues on a diagnostic state.
 
 Exit codes (mirroring ``scripts/fleet-cost-weekly.sh``):
@@ -424,9 +425,9 @@ def render_report(
         "(last activity within %.0fh — the reaper's own idle proof). "
         "`wedged` requires positive evidence of an OPEN turn (a pending tool "
         "call, or no assistant reply) frozen past the stream bound; a lane whose "
-        "last turn completed reads `running-quiet`/`turn-complete` however long "
-        "it rests, so only a lane whose every incarnation is gone files an "
-        "issue." % (", ".join(sorted(escalate_states)), window_ms / 3_600_000.0)
+        "last turn ended reads `running-quiet`/`turn-ended` however long it "
+        "rests short of the 24h retirement proof, so only a lane whose every "
+        "incarnation is gone files an issue." % (", ".join(sorted(escalate_states)), window_ms / 3_600_000.0)
     )
     lines.append("")
     lines.append("| lane | workspace | session | state | reason | evidence |")

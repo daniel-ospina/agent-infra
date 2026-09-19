@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Eighteen mutation tests: every one is paired with a PRECISE source mutation that
-reintroduces the defect the test exists to catch, so "the test fails without the
+Nineteen tests with twenty-three paired mutations: every mutation re-
+introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Six of the eighteen (#1254) pin the TURN-BOUNDARY rule:
-``wedged`` requires positive evidence of an OPEN turn, so a turn-complete lane
-is never a stall and a frozen lane with an unreadable boundary abstains.
+evidence mechanical. Seven of the nineteen (#1254) pin the TURN-BOUNDARY rule:
+``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
+is never a stall and a frozen lane with an unreadable boundary abstains. Two
+more close cycle-1 review findings on that rule: a message carrying tool calls
+is OPEN unless its stop reason discards them (``length`` executes them, so it is
+OPEN), and a ``compaction`` as the last entry abstains rather than letting the
+turn before it decide.
 
-    python3 tools/fleet/liveness.test.py                # the 17 tests, green
+    python3 tools/fleet/liveness.test.py                # the 19 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
@@ -105,7 +109,7 @@ def assistant_tooluse(*calls):
                  content=[{"type": "toolCall", "name": n, "id": i} for n, i in calls])
 
 
-COMPLETE_TURN = liv.Turn(False, "turn-complete", "terminal stopReason=stop")
+COMPLETE_TURN = liv.Turn(False, "turn-ended", "terminal stopReason=stop")
 OPEN_TURN = liv.Turn(True, "turn-open:pending-tool-call", "unanswered bash(call_test)")
 
 
@@ -515,24 +519,25 @@ def t12_named_abstention():
 # terminal stopReason is RESTING: the fleet's normal state. It must never read
 # `wedged`, however long it is quiet short of the retirement proof.
 # ══════════════════════════════════════════════════════════════════════════
-@test("T13 turn-complete + frozen -> running-quiet/turn-complete, never wedged (#1254)")
-def t13_turn_complete_is_not_wedged():
+@test("T13 turn-ended + frozen -> running-quiet/turn-ended, never wedged (#1254)")
+def t13_turn_ended_is_not_wedged():
     complete = liv.turn_from_entry(entry("assistant", stopReason="stop"))
     check(complete.stalled is False, "a terminal stopReason ends the turn; got %s" % complete)
-    check(complete.reason == "turn-complete", "the boundary names itself; got %s" % complete.reason)
+    check(complete.reason == "turn-ended", "the boundary names itself; got %s" % complete.reason)
 
     for age in (21 * M, H, 23 * H):
         v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=age, jsonl_turn=complete))
         check(v.state == "running-quiet",
               "a resting lane must be running-quiet; got %s/%s at age=%d" % (v.state, v.reason, age))
-        check(v.reason == "turn-complete", "the reason names the boundary; got %s" % v.reason)
+        check(v.reason == "turn-ended", "the reason names the boundary; got %s" % v.reason)
         check(v.holder_pid == 1, "the fenced holder is still named; got %s" % v.holder_pid)
 
-    # EVERY terminal stopReason ends the turn — only `toolUse` continues it.
+    # EVERY terminal stopReason on a message carrying NO tool calls ends the
+    # turn — the call-carrying cases are T18's (#1254 P0).
     for stop in ("stop", "length", "error", "aborted"):
         t = liv.turn_from_entry(entry("assistant", stopReason=stop))
         v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=2 * H, jsonl_turn=t))
-        check(v.state == "running-quiet" and v.reason == "turn-complete",
+        check(v.state == "running-quiet" and v.reason == "turn-ended",
               "stopReason=%s is terminal; got %s/%s" % (stop, v.state, v.reason))
 
     # The retirement proof is UNCHANGED: past it the lane is `idle`, not resting
@@ -540,7 +545,7 @@ def t13_turn_complete_is_not_wedged():
     v_idle = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=25 * H,
                              jsonl_turn=complete))
     check(v_idle.state == "idle" and v_idle.reason == "jsonl-old",
-          "past the idle proof a turn-complete lane is idle; got %s/%s" % (v_idle.state, v_idle.reason))
+          "past the idle proof a turn-ended lane is idle; got %s/%s" % (v_idle.state, v_idle.reason))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -602,19 +607,26 @@ def t15_tail_read():
               "the LAST (open) boundary decides, not the first; got %s" % t)
         check("call_LAST" in t.detail, "the last call is the one named; got %r" % t.detail)
 
-        # A non-message trailer is not a turn boundary.
+        # A compaction trailer is not a turn boundary AT ALL: it abstains (#1254
+        # P1, T19) rather than letting the open turn before it decide.
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"type": "compaction", "summary": "…"}) + "\n")
         t2 = liv.turn_from_jsonl(path)
-        check(t2 is not None and "call_LAST" in t2.detail,
-              "a compaction trailer must not change the boundary; got %s" % t2)
+        check(t2 is not None and t2.abstain is True and t2.reason == "tail-after-compaction",
+              "a compaction trailer abstains rather than deciding; got %s" % t2)
+        # A NON-compaction trailer keeps the boundary: the last message decides.
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "model_change"}) + "\n")
+        t2b = liv.turn_from_jsonl(path)
+        check(t2b is not None and "call_LAST" in t2b.detail,
+              "a non-compaction trailer must not change the boundary; got %s" % t2b)
 
         # A terminal assistant message flips it to resting.
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry("assistant", stopReason="stop",
                                       content=[{"type": "text", "text": "done"}])) + "\n")
         t3 = liv.turn_from_jsonl(path)
-        check(t3 is not None and t3.stalled is False and t3.reason == "turn-complete",
+        check(t3 is not None and t3.stalled is False and t3.reason == "turn-ended",
               "the new last entry flips the verdict; got %s" % t3)
 
         # gather() wires the boundary in (hermetic store + probe shims).
@@ -634,15 +646,15 @@ def t15_tail_read():
         check(e.jsonl_age_ms is not None and e.jsonl_age_ms > liv.STREAM_STALL_MS,
               "the fixture must be frozen past S; got %s" % e.jsonl_age_ms)
         g = liv.evaluate(e)
-        check(g.state == "running-quiet" and g.reason == "turn-complete",
-              "a turn-complete lane past S is resting, not wedged; got %s/%s" % (g.state, g.reason))
+        check(g.state == "running-quiet" and g.reason == "turn-ended",
+              "a turn-ended lane past S is resting, not wedged; got %s/%s" % (g.state, g.reason))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # T16 — `dead` is untouched. It is decided from fenced-holder identity BEFORE
-# the ladder, so no turn classification may reach it: a turn-complete lane whose
+# the ladder, so no turn classification may reach it: a turn-ended lane whose
 # every incarnation is gone is STILL dead, and a stalled one is too. Nothing
 # added for #1254 may move the one state the classifier exists to report.
 # ══════════════════════════════════════════════════════════════════════════
@@ -686,6 +698,113 @@ def t17_unknown_turn_and_bounds():
     check(liv.IDLE_MS == 24 * H, "the idle proof is the reaper's verbatim 24h; got %s" % liv.IDLE_MS)
     check(liv.turn_from_jsonl(None) is None, "no path is no boundary")
     check(liv.turn_from_jsonl("/nonexistent/nope.jsonl") is None, "an unreadable file is no boundary")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T18 — the cycle-1 P0 (#1254). A message CARRYING tool calls is OPEN unless its
+# stop reason is one under which pi DISCARDS the calls. pi SUSPENDS on `length`
+# to execute them, so a `length` message with unanswered calls is an open turn,
+# not a resting one. Measured over the 426 live session files in
+# ~/.pi/agent/sessions: toolUse 147,466 with calls / 147,431 answered; error 115
+# with calls / 0 answered; length 78 with calls / 78 answered (EXECUTED);
+# aborted 16 with calls / 0 answered.
+# ══════════════════════════════════════════════════════════════════════════
+@test("T18 tool calls decide openness: `length`+calls OPEN, `error`/`aborted`+calls ENDED (#1254 P0)")
+def t18_call_carrying_stop_reasons():
+    # (a) `length` with calls is EXECUTED by pi (78/78) -> OPEN.
+    t = liv.turn_from_entry(entry("assistant", stopReason="length",
+                                  content=[{"type": "toolCall", "name": "bash",
+                                            "id": "call_00_LEN"}]))
+    check(t.stalled is True, "`length` with calls is an open turn; got %s" % t)
+    check(t.reason == "turn-open:pending-tool-call", "the open shape is named; got %s" % t.reason)
+    v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=t))
+    check(v.state == "wedged", "a `length`+calls turn frozen past S is a stall; got %s/%s" % (v.state, v.reason))
+    check("call_00_LEN" in v.detail, "the verdict names the unanswered call; got %r" % v.detail)
+
+    # (b) `error` and `aborted` DISCARD their calls (0/115, 0/16) -> ENDED.
+    for stop in ("error", "aborted"):
+        t2 = liv.turn_from_entry(entry("assistant", stopReason=stop,
+                                       content=[{"type": "toolCall", "name": "bash",
+                                                 "id": "call_00_%s" % stop}]))
+        check(t2.stalled is False and t2.reason == "turn-ended",
+              "`%s` discards its calls and ends the turn; got %s" % (stop, t2))
+        v2 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=t2))
+        check(v2.state == "running-quiet" and v2.reason == "turn-ended",
+              "a `%s`+calls lane is resting, never wedged; got %s/%s" % (stop, v2.state, v2.reason))
+
+    # (c) a TERMINAL stopReason with NO tool calls stays ended — the resting case
+    # #1254 fixed must not regress.
+    for stop in ("stop", "length", "error", "aborted"):
+        t3 = liv.turn_from_entry(entry("assistant", stopReason=stop,
+                                       content=[{"type": "text", "text": "done"}]))
+        check(t3.stalled is False and t3.reason == "turn-ended",
+              "stopReason=%s with no calls is terminal; got %s" % (stop, t3))
+
+    # (d) `toolUse` with no parseable call is still non-terminal.
+    t4 = liv.turn_from_entry(entry("assistant", stopReason="toolUse"))
+    check(t4.stalled is True and t4.reason == "turn-open:pending-tool-call",
+          "`toolUse` with no parseable call is still open; got %s" % t4)
+
+    check(liv.CALL_DISCARDING_STOP_REASONS == frozenset({"error", "aborted"}),
+          "the discard set is exactly the measured discarders; got %s" % liv.CALL_DISCARDING_STOP_REASONS)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T19 — the cycle-1 P1 (#1254). A `compaction` as the LAST entry is an
+# ABSTENTION: pi writes it BETWEEN turns (483 compaction entries over the 426
+# live session files, 477 followed by a message entry and 357 of those an open
+# assistant/toolUse), so it is not evidence that the turn before it ended.
+# ══════════════════════════════════════════════════════════════════════════
+@test("T19 compaction tail -> unknown/tail-after-compaction, never a decided turn (#1254 P1)")
+def t19_compaction_tail_abstains():
+    d = tempfile.mkdtemp(prefix="liv-compaction-")
+    try:
+        path = os.path.join(d, "session.jsonl")
+
+        def write(entries):
+            with open(path, "w", encoding="utf-8") as fh:
+                for e in entries:
+                    fh.write(json.dumps(e) + "\n")
+
+        # A terminal assistant message followed by a compaction: the compaction
+        # must not let the terminal message decide (it is not evidence of rest).
+        write([entry("assistant", stopReason="stop", content=[{"type": "text", "text": "ok"}]),
+               {"type": "compaction", "summary": "…"}])
+        t = liv.turn_from_jsonl(path)
+        check(t is not None and t.abstain is True, "a compaction tail abstains; got %s" % t)
+        check(t.reason == "tail-after-compaction", "the abstention is named; got %s" % t.reason)
+        v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=t))
+        check(v.state == "unknown" and v.reason == "tail-after-compaction",
+              "a compaction tail is unknown, never wedged and never resting; got %s/%s"
+              % (v.state, v.reason))
+
+        # The OPEN shape is the fail-open case: an open turn + a compaction tail
+        # must NOT fall through to `wedged`.
+        write([assistant_tooluse(("bash", "call_00_OPEN")),
+               {"type": "compaction", "summary": "…"}])
+        t2 = liv.turn_from_jsonl(path)
+        check(t2 is not None and t2.abstain is True and t2.reason == "tail-after-compaction",
+              "an open turn + compaction tail abstains rather than wedging; got %s" % t2)
+        v2 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=t2))
+        check(v2.state == "unknown", "the open-turn compaction tail is an abstention; got %s" % v2.state)
+
+        # Other trailers keep the existing behaviour: the previous message decides.
+        for trailer in ("model_change", "session", "thinking_level_change"):
+            write([entry("assistant", stopReason="stop", content=[{"type": "text", "text": "ok"}]),
+                   {"type": trailer}])
+            t3 = liv.turn_from_jsonl(path)
+            check(t3 is not None and t3.stalled is False and t3.reason == "turn-ended",
+                  "a %s trailer leaves the previous message deciding; got %s" % (trailer, t3))
+        write([assistant_tooluse(("bash", "call_00_NEXT")), {"type": "model_change"}])
+        t4 = liv.turn_from_jsonl(path)
+        check(t4 is not None and t4.stalled is True and "call_00_NEXT" in t4.detail,
+              "a non-compaction trailer keeps the open boundary; got %s" % t4)
+
+        # A non-message, non-compaction entry passed directly carries no boundary.
+        check(liv.turn_from_entry({"type": "model_change"}).reason == "no-turn-yet",
+              "turn_from_entry stays total for a non-message entry")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -785,12 +904,53 @@ MUTATIONS = [
         "the ps-availability guard is removed, so a failed read falls into the dead path (C3)",
     ),
     Mutation(
-        "T13", "module",
-        '    if not turn.stalled:\n'
-        '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
-        '    if False:\n'
-        '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
-        "the turn-complete protection is dropped, so a merely-idle REPL reads wedged again (#1254)",
+        "T18", "module",
+        'NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})',
+        'NON_TERMINAL_STOP_REASONS = frozenset()',
+        "`toolUse` with no parseable call goes terminal, so a mid-turn lane reads resting (fail-open)",
+    ),
+    Mutation(
+        "T18", "module",
+        'CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted"})',
+        'CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted", "length"})',
+        "the cycle-1 P0: `length`+calls is treated as discarding, so an executing turn reads ended",
+    ),
+    Mutation(
+        "T18", "module",
+        '        if calls and stop not in CALL_DISCARDING_STOP_REASONS:',
+        '        if calls and stop in NON_TERMINAL_STOP_REASONS:',
+        "the pre-fix rule — only `toolUse` is open, so `length`+calls reads ended (P0)",
+    ),
+    Mutation(
+        "T18", "module",
+        'CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted"})',
+        'CALL_DISCARDING_STOP_REASONS = frozenset()',
+        "`error`/`aborted` calls stop being discarded, so a discarded turn reads open (over-report)",
+    ),
+    Mutation(
+        "T14", "module",
+        '        if calls and stop not in CALL_DISCARDING_STOP_REASONS:\n'
+        '            return Turn(True, "turn-open:pending-tool-call",\n'
+        '                        "unanswered %s" % ", ".join(calls))\n',
+        '        if calls and stop not in CALL_DISCARDING_STOP_REASONS:\n'
+        '            return Turn(True, "turn-open:pending-tool-call", "")\n',
+        "the verdict stops naming the open call, so the report no longer says why (#1254)",
+    ),
+    Mutation(
+        "T19", "module",
+        '    if (last_entry is not None and isinstance(last_entry, dict)\n'
+        '            and last_entry.get("type") == "compaction"):\n'
+        '        return turn_from_entry(last_entry)\n',
+        '',
+        "the compaction-tail abstention is dropped, so the turn before it decides (P1)",
+    ),
+    Mutation(
+        "T19", "module",
+        '    if isinstance(entry, dict) and entry.get("type") == "compaction":\n'
+        '        return Turn(False, "tail-after-compaction",\n'
+        '                    "a compaction entry is the last entry", abstain=True)\n',
+        '',
+        "turn_from_entry stops treating a compaction as no-boundary, so it reads as a decided turn",
     ),
     Mutation(
         "T17", "module",
@@ -803,21 +963,12 @@ MUTATIONS = [
         "an unclassifiable boundary is treated as an open turn — absence of evidence reads wedged (#1254)",
     ),
     Mutation(
-        "T14", "module",
-        'NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})',
-        'NON_TERMINAL_STOP_REASONS = frozenset()',
-        "toolUse stops being non-terminal, so a genuinely stuck mid-turn lane reads resting (fail-open, #1254)",
-    ),
-    Mutation(
-        "T14", "module",
-        '            labels = _tool_call_labels(msg)\n'
-        '            return Turn(\n'
-        '                True,\n'
-        '                "turn-open:pending-tool-call",\n'
-        '                "unanswered %s" % (", ".join(labels) if labels else "tool call"),\n'
-        '            )\n',
-        '            return Turn(True, "turn-open:pending-tool-call", "")\n',
-        "the verdict stops naming the open call, so the report no longer says why (#1254)",
+        "T13", "module",
+        '    if not turn.stalled:\n'
+        '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
+        '    if False:\n'
+        '        return Verdict("running-quiet", turn.reason, holder_pid=holder.pid, detail=turn.detail)\n',
+        "the turn-ended protection is dropped, so a merely-idle REPL reads wedged again (#1254)",
     ),
     Mutation(
         "T16", "module",
