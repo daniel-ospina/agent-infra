@@ -354,6 +354,24 @@ sleep 1
 sx clean --all --force-all >/dev/null 2>&1
 [ ! -e "$D14" ] && ok 0 "T14b the released scratch worktree is removed" || ok 1 "T14b the released scratch worktree is removed"
 
+# ── T14c/T14d: a holder the path is in the ARGV of is preserved too ──────────
+# T14's fixture puts the path in the holder's CWD only (exec sleep), so it pins
+# the CWD arm and the ARGV arm alone would have NO fixture — deleting the argv
+# match line left the suite green, i.e. a line this change touches with no test
+# that notices its removal. `tail -f <file inside $D>` names the path in ARGV
+# ONLY (its cwd is the test's, not the worktree), so this pins the ARGV arm the
+# way T14 pins the CWD arm.
+D14A="$(sx create --ref "$C2" --full 2>/dev/null)"
+tail -f "$D14A/.scratch-worktree" >/dev/null 2>&1 &
+HOLD_A=$!
+sleep 1
+sx clean --all --force-all >/dev/null 2>&1
+[ -d "$D14A" ] && ok 0 "T14c an argv-named holder is PRESERVED" || ok 1 "T14c an argv-named holder is PRESERVED"
+kill "$HOLD_A" 2>/dev/null; wait "$HOLD_A" 2>/dev/null
+sleep 1
+sx clean --all --force-all >/dev/null 2>&1
+[ ! -e "$D14A" ] && ok 0 "T14d the released argv holder's worktree is removed" || ok 1 "T14d the released argv holder's worktree is removed"
+
 # ── T15: a straggler DESCENDANT (leader exits first) is still SIGKILLed ──────
 # The leader exits immediately, so `wait` returns at once; the TERM-ignoring
 # descendant stays in the group. If the watchdog were cancelled at that point

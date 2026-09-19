@@ -79,8 +79,11 @@
 # blind to the holder shape bash 5 creates, which is how T14a went red on main).
 # Because that probe is best-effort — it still cannot see a holder that names the
 # path neither in argv nor as its cwd — a bare `clean --all` refuses to sweep and
-# `--force-all` is the deliberate opt-in. No `find`, no recursive walk of the
-# repo, no glob over the scratch root.
+# `--force-all` is the deliberate opt-in. A host whose cwd probe is PRESENT but
+# fails (incompatible `lsof`, sandbox denial, stale shim) is DEGRADED, never
+# silent: it warns once, PRESERVES candidates whose liveness it cannot rule out,
+# and reports `CWD_PROBE=degraded` in the sweep footer. No `find`, no recursive
+# walk of the repo, no glob over the scratch root.
 
 set -uo pipefail
 
@@ -369,7 +372,10 @@ list_scratch() { # <repo>
     | while IFS= read -r d; do case "$d" in "$ROOT"/scratch-*) printf '%s\n' "$d" ;; esac; done
 }
 
-CWD_PROBE_DEGRADED=0
+CWD_PROBE_DEGRADED=0   # the cwd probe is unusable (absent OR present-but-failed) — footer
+CWD_PROBE_WARNED=0     # the degraded warning fires ONCE per run, never per candidate
+CWD_DEGRADED_HOLD=0    # set by held_by_live_process when it PRESERVES a candidate
+                       # because a degraded probe could not rule liveness OUT
 
 # Every process's working directory, one snapshot, one line each. Linux reads
 # the kernel's /proc (GNU `readlink` takes many FILEs, so this is ONE spawn); a
@@ -377,20 +383,39 @@ CWD_PROBE_DEGRADED=0
 # to a per-pid loop — correct, just slower, and only on a Linux box without
 # coreutils. macOS/BSD has no /proc: one `lsof -a -d cwd` snapshot (never `+D`,
 # which would walk the very tree whose liveness is in question).
+#
+# EXIT STATUS IS LOAD-BEARING (P1, 2026-09-18): 0 = a USABLE snapshot was read;
+# 1 = DEGRADED — the mechanism is present but yielded nothing usable, so
+# liveness is UNKNOWN. The discarded status was the P1: an empty snapshot was
+# read as "nobody's cwd is here" and the caller deleted a LIVE-HELD worktree.
+# Required here: (a) the command's own exit status, and (b) non-empty output.
 cwd_snapshot() {
-  local c t
+  local c t q rc
   if [ -d /proc/self ]; then
+    # GNU readlink takes many FILEs (ONE spawn). EACCES on other users' /proc
+    # entries is expected and non-fatal: only SOME row must be read.
     t="$(readlink /proc/[0-9]*/cwd 2>/dev/null)"
     if [ -n "$t" ]; then printf '%s\n' "$t"; return 0; fi
+    # Non-GNU readlink (busybox) refuses several operands: per-pid fallback.
+    # Append ONLY a successful read — an unconditional `$'\n'` would make $t
+    # non-empty on total failure and reintroduce the bug this function fixes.
+    t=""
     for c in /proc/[0-9]*/cwd; do
-      readlink "$c" 2>/dev/null || true
+      q="$(readlink "$c" 2>/dev/null)" && t="$t$q"$'\n'
     done
+    [ -n "$t" ] || return 1
+    printf '%s\n' "$t"
     return 0
   fi
   if command -v lsof >/dev/null 2>&1; then
-    lsof -a -d cwd -Fpn 2>/dev/null | sed -n 's/^n//p'
+    t="$(lsof -a -d cwd -Fpn 2>/dev/null)"; rc=$?
+    [ "$rc" = 0 ] || return 1
+    t="$(printf '%s\n' "$t" | sed -n 's/^n//p')"
+    [ -n "$t" ] || return 1
+    printf '%s\n' "$t"
+    return 0
   fi
-  return 0
+  return 1
 }
 
 # Is there a cwd probe on this host at all? (Kernel /proc, or lsof.)
@@ -419,8 +444,19 @@ have_cwd_probe() { [ -d /proc/self ] || command -v lsof >/dev/null 2>&1; }
 # than degrading silently. That is why a bare `clean --all` still refuses to
 # sweep at all (see the dispatch below) and the SKILLs tell an agent to clean
 # only its own path; this probe is a second line of defence, not the guarantee.
+#
+# A PRESENT-BUT-BROKEN probe (an incompatible `lsof` build, a sandbox denial, a
+# stale shim) is the one case that must never read as "not held": the probe RAN
+# and told us NOTHING, which is not the same as "nobody's cwd is here". It is
+# treated as UNKNOWN and the candidate is PRESERVED (P1, 2026-09-18) — a
+# degraded probe can no longer silently `rm -rf` a live-held worktree, and the
+# healthy case is unaffected because a working probe always yields a non-empty
+# snapshot. The cost is bounded and visible: only `clean --all` on such a host,
+# only until the probe is fixed, and `clean <path>` (caller-supplied identity)
+# still reclaims any path because it does not consult this probe at all.
 held_by_live_process() { # <path>
-  local d="$1" out phys t
+  local d="$1" out phys t rows rc
+  CWD_DEGRADED_HOLD=0
   # (1) ARGV.
   out="$(/bin/ps -axo args= 2>/dev/null)" || out=""
   case "$out" in *"$d"*) return 0 ;; esac
@@ -433,9 +469,24 @@ held_by_live_process() { # <path>
   phys="$(realpath_of "$d")" || phys=""
   [ -n "$phys" ] || return 1
   if have_cwd_probe; then
-    while IFS= read -r t; do
-      case "$t" in "$phys"|"$phys"/*) return 0 ;; esac
-    done < <(cwd_snapshot)
+    rows="$(cwd_snapshot)"; rc=$?
+    if [ "$rc" = 0 ]; then
+      while IFS= read -r t; do
+        case "$t" in "$phys"|"$phys"/*) return 0 ;; esac
+      done <<< "$rows"
+    else
+      # Present but produced nothing usable. "We cannot tell" is NOT "not
+      # held" — see the header. Preserve, and say so LOUDLY (once) so the
+      # condition is visible in the log AND in the sweep's footer, never only
+      # in a silent empty result.
+      CWD_PROBE_DEGRADED=1
+      if [ "$CWD_PROBE_WARNED" = 0 ]; then
+        CWD_PROBE_WARNED=1
+        warn "CWD probe degraded: failed/empty — cwd liveness UNKNOWN, candidates preserved"
+      fi
+      CWD_DEGRADED_HOLD=1
+      return 0
+    fi
   elif [ "$CWD_PROBE_DEGRADED" = 0 ]; then
     # Never a SILENT fail-open: the whole bug this arm fixes was an argv-only
     # probe that looked like it was checking liveness. The sibling reaper
@@ -468,6 +519,7 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
       exit 0
     fi
     failed=0
+    preserved_unknown=0
     while IFS= read -r d; do
       [ -n "$d" ] || continue
       # A directory that is already gone is the reaper's job below, not a removal
@@ -475,7 +527,12 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
       # would just set `failed` and make a successful sweep exit 1.
       [ -e "$d" ] || [ -L "$d" ] || continue
       if held_by_live_process "$d"; then
-        warn "$d is held by a live process — PRESERVED"
+        if [ "$CWD_DEGRADED_HOLD" = 1 ]; then
+          warn "$d PRESERVED — cwd liveness UNKNOWN (probe degraded)"
+          preserved_unknown=$((preserved_unknown + 1))
+        else
+          warn "$d is held by a live process — PRESERVED"
+        fi
         continue
       fi
       remove_one "$REPO" "$d" || failed=1
@@ -483,6 +540,13 @@ if [ "$MODE" = clean ] || [ "$MODE" = list ]; then
     # A directory that is already gone leaves a record `owns()` cannot prove;
     # reclaim exactly those, by the admin dir's own back-link.
     sweep_orphan_records "$REPO" >/dev/null || true
+    # The sweep's FOOTER: a degraded cwd probe changes what this run means, so
+    # it is reported as a machine-readable line (the sibling reaper prints the
+    # same CWD_PROBE=degraded token in its footer), not only in the per-run
+    # warning above — a one-off stderr line is easy to lose, the summary is not.
+    if [ "$CWD_PROBE_DEGRADED" = 1 ]; then
+      printf '%s: CWD_PROBE=degraded PRESERVED_UNKNOWN=%s\n' "$PROG" "$preserved_unknown" >&2
+    fi
     [ "$failed" = 0 ] || exit 1
     exit 0
   fi
