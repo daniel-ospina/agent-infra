@@ -120,14 +120,24 @@ Other `--team` values belong to the #4930 2-axis scope system and are orthogonal
 
 ```bash
 # From the agent-infra checkout. Hosted Tortoise API — env: TORTOISE_API_KEY
-# (tt_... from tortoise.premiselabs.co), TORTOISE_BASE_URL (default https://tortoise.premiselabs.co).
-# No key → prints {"error":"tortoise_unavailable"} and exits 0 (skip step).
+# (tt_... from the dashboard at tortoise.premiselabs.co — that is the sign-up site,
+# NOT the API host). TORTOISE_BASE_URL overrides the API base; default
+# https://api.premiselabs.co.
+# The read path distinguishes three states in its `status` field (tortoise#3805):
+# "ok" (the store answered — an EMPTY store is still "ok", read `count`),
+# "not_configured" (no USABLE TORTOISE_API_KEY — never set up, or the key was
+# rejected with HTTP 401/403; a set-up gap, not an outage), and
+# "tortoise_unavailable" (key set, but the store could not be reached).
+# Data subcommands always exit 0 so a missing optional dependency never fails the
+# skill (skip the step); the `status` probe exits 0 / 4 / 3 so a harness can tell
+# the three states apart.
 node scripts/tortoise-memory.mjs query-prior-research --domain "<topic-or-domain>"
 ```
 
 **Interpretation:**
 - **Results found:** Summarize prior claims. Use them to refine the research scope — what was already established? What gaps remain? What assumptions were made previously?
-- **"tortoise unavailable":** `TORTOISE_API_KEY` missing or API unreachable — memory system offline. Skip this step — proceed with fresh research.
+- **`"status": "not_configured"`:** no usable `TORTOISE_API_KEY` on this machine — memory was never set up here, or the configured key was rejected (HTTP 401/403). Either way it is **not** an outage: check/re-set `TORTOISE_API_KEY`. Skip this step — proceed with fresh research.
+- **`"status": "tortoise_unavailable"`:** a key is set but the API was unreachable — the store is down or the address is wrong. Skip this step and note it; this is the state worth surfacing.
 - **Zero results:** First research on this topic. Note "no prior epistemic claims found" and proceed.
 
 **Preserve provenance:** When citing prior claims in the research output, reference the Point ID and authoredBy field so the reader can trace the claim's origin.
@@ -360,7 +370,7 @@ node scripts/tortoise-memory.mjs write-claim \
 | Low (1 source) | 0.3 | hypothesis |
 | Speculative | 0.1 | hypothesis |
 
-**Graceful degradation:** If `tortoise unavailable` → skip. Log note: "Memory system offline — claims not persisted to epistemic graph."
+**Graceful degradation:** If `status` is `not_configured` (no usable `TORTOISE_API_KEY` — memory was never set up here, or the key was rejected with HTTP 401/403; a set-up gap, **not** an outage) or `tortoise_unavailable` (the API could not be reached — the store is down or the address is wrong, the state worth surfacing) → skip this step. Log note: "Memory not available — claims not persisted to epistemic graph."
 
 ### Step 5.5 — Research Verifier (CPI-5: fresh-session review)
 
@@ -372,7 +382,7 @@ task(prompt='[VGATE] Review this research output for completeness and accuracy. 
 1. Every claim section has a confidence tag
 2. Contradictions between sources are flagged in a Contradictions section
 3. Single-source claims have verify-when-available note
-4. KG facts filed for key claims (skip if Tortoise unavailable)
+4. KG facts filed for key claims (skip if `"not_configured"` — no usable key: never set up, or the key was rejected with HTTP 401/403 — or `"tortoise_unavailable"` — the store was unreachable)
 5. Log entry appended to wiki/log.md per WIKI_SCHEMA.md INGEST format
 
 Return ISSUE blocks for any gaps found (zero issues = CLEAN).

@@ -1531,10 +1531,24 @@ function _worktreeDiscardBlock(command: string): string | null {
     }
   }
 
-  // A script path that is not statically resolvable (`bash $S`, `cat x.sh |
-  // sh`) cannot be read and walked — fail closed (reviewer round-5 P1).
+  // An unresolvable script path (`bash $S`, `cat x.sh | sh`) is refused
+  // unconditionally: the discard target is unknown, and an unreadable script may
+  // discard uncommitted work in ANY checkout, so it cannot be assumed safe
+  // (#709). The reason below names only what was measured — the shared helper
+  // already renders "NOT a claim that the checkout is dirty" (#1139/PR #1152),
+  // so this arm must never name a state it did not observe. What this change
+  // touches is the MESSAGE only; the arm already failed closed.
   if (_scriptPath && /[$`]/.test(_scriptPath)) {
-    return _worktreeDiscardBlockReason({ form: "script-indirection", scope: "all", pathspecs: [] }, execCwd, "the script path is not statically resolvable");
+    return _worktreeDiscardBlockReason(
+      { form: "script-indirection", scope: "all", pathspecs: [] },
+      execCwd,
+      // WHAT was measured (the path's text), WHAT it costs (an unreadable script
+      // may discard anywhere), and the edit that makes it verifiable.
+      "the script path contains a $ or a backtick, so it is not statically " +
+        "resolvable — the shell may expand it at runtime, and an unreadable script may " +
+        "discard uncommitted work in ANY checkout; pass the path literally (e.g. " +
+        "`bash ./tools/your-script.sh`) so its contents can be read and verified",
+    );
   }
 
   // Probe sets: the command itself, plus any script FILES it runs/sources

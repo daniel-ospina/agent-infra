@@ -1543,6 +1543,51 @@ else
   fail "the duration pin is not doing its job"; sed -n '1,30p' "$OUT"
 fi
 
+echo ""
+# ── 35. the reserve expectation must fail closed on a WRONG VALUE, not just on
+#      a MISSING block. backdoor-settings' injected defect is the MISSING
+#      compaction block (the `not isinstance(comp, dict)` arm), so the
+#      wrong-value arm (`comp.get("reserveTokens") != 50000`) had no fixture at
+#      all — raising the expectation 16384 -> 50000 (#1213) would then have
+#      been assertable only by reading the code. Both arms are settings-class,
+#      hence override-immune.
+echo "35. reserveTokens wrong value (block present) → BLOCK, and the override does not silence it"
+TMP35="$(mktemp -d /tmp/cost-config-reserve-value.XXXXXX)"
+mkroot "$TMP35"
+python3 - "$TMP35/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["compaction"]["reserveTokens"] = 16384          # the PRE-#1213 value
+json.dump(d, open(p, "w"), indent=2)
+PYEOF
+bash "$TMP35/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "reserveTokens=16384 (block present) → exit 1"; else fail "expected exit 1 for a wrong reserveTokens value, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "compaction.reserveTokens expected 50000, got 16384" "$OUT"; then pass "wrong-value message names the expected and actual value"; else fail "expected the wrong-value reserveTokens message"; sed -n '1,30p' "$OUT"; fi
+COST_CLAMP_OVERRIDE=1 bash "$TMP35/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "wrong-value reserveTokens + override → still exit 1 (settings class is override-immune)"; else fail "expected exit 1 under the override, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP35"
+
+echo ""
+# ── 36. an UNPARSEABLE shipped models.json must fail closed on the default
+#      path — a config the guard cannot parse must never read green. NOTE: on
+#      the --shipped-only path COST_CLAMP_OVERRIDE=1 still exits 0 for this arm
+#      (absent/unparseable models.json are emitted in the clamp class). That is
+#      a PRE-EXISTING property of the documented escape, it reproduces against
+#      the pre-#1213 guard, and it is filed as its own issue — so it is
+#      deliberately NOT pinned here as correct behaviour.
+echo "36. unparseable shipped models.json → exit 1 (fail-closed)"
+TMP36="$(mktemp -d /tmp/cost-config-models-parse.XXXXXX)"
+mkroot "$TMP36"
+printf '{ bad json' >"$TMP36/pi-bootstrap/pi-config/models.json"
+bash "$TMP36/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "unparseable models.json → exit 1 (fail-closed)"; else fail "expected exit 1 for an unparseable models.json, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "cannot assert the clamp on unparseable config" "$OUT"; then pass "the parse-failure block is explicit (not a silent skip)"; else fail "expected an explicit parse-failure block"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP36"
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"
   exit 0

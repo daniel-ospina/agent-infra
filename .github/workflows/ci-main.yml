@@ -313,9 +313,10 @@ jobs:
           node scripts/check-skill-lint.mjs --skills-dir skills
 
   cost-config-guard:
-    # #341 — post-merge re-check of the deepseek context clamp @300K on shipped
+    # #341 — post-merge re-check of the deepseek context clamp @700K on shipped
     # configs (models.json + models-store.json + settings.json contract; #476
-    # guard-sync shipped the 400K→300K clamp + keepRecentTokens 12000).
+    # guard-sync shipped the 400K→300K clamp, #1213 the 300K→700K + reserve
+    # 16384→50000 re-clamp — see docs/ops/cost-config-policy.md §8).
     # Shipped-only: the live pass runs at sync.sh; catalog-store drift is
     # DETECTED (warn) not blocked — the 4h pi.dev refresh may legitimately
     # revert the store, and the weekly report + tripwire are the alert path.
