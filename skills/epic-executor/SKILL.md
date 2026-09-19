@@ -50,7 +50,86 @@ If results found: report prior progress. Skip already-completed issues. Only dis
 
 ### Step 3: Build Dependency Map and Parallel Dispatch
 
-**Pre-dispatch check:** Before constructing prompts, verify each issue is still open. Closed issues may have been completed by a parallel agent:
+**Pre-dispatch gate — collision pre-flight (#3061), FAIL-CLOSED:** the FIRST check before any dispatch is the collision pre-flight. It checks every in-flight surface (open + closed PRs, local + remote branches, worktrees, assignee/claim comments) and fails loudly in both directions — a hit, and a surface that could not be queried. It gates **every issue in the batch**, not just the first: a single `<N>` invocation would leave the rest unchecked.
+
+The gate is provided by **tortoise** (the only repo carrying `tools/collision_preflight.py`) and applies to *any* issue's repo through `--repo`.
+
+```bash
+# 1. The tool lives ONLY in tortoise. Resolve that checkout EXPLICITLY — unset, `"$TORTOISE"/tools/…`
+#    collapses to `/tools/…` and PYTHON exits 2, which the loop would report as INCOMPLETE
+#    ("a surface could not be queried"): a caller misconfiguration wearing a real verdict's face.
+#    $TORTOISE if set; else the cwd itself (when it IS tortoise), the tortoise sibling of the cwd's
+#    MAIN checkout (so it still resolves from a linked worktree), then the standard GITHUB root.
+if [ -z "${TORTOISE:-}" ]; then
+  TOPLEVEL="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
+  COMMON="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  for CAND in "$TOPLEVEL" "$(dirname "${COMMON%/.git}")/tortoise" "${HOME:-/nonexistent}/Documents/GitHub/tortoise"; do
+    if [ -n "$CAND" ] && [ -f "$CAND/tools/collision_preflight.py" ]; then
+      TORTOISE="$(cd "$CAND" && pwd -P)"; break
+    fi
+  done
+fi
+if [ ! -f "${TORTOISE:-}/tools/collision_preflight.py" ]; then
+  echo "❌ no tortoise checkout resolved (TORTOISE='${TORTOISE:-}') — #3061 pre-flight NOT run for this batch."
+  echo "   Record this in the dispatch log; do NOT silently skip. Set TORTOISE=<a tortoise worktree> and re-run."
+  exit 1   # do not dispatch the batch
+fi
+
+# 2. --repo is MANDATORY. Omitted it means "cwd", and the tool then silently resolved the WRONG
+#    repository's issue — a tortoise worktree asked for an agent-infra #NNNN and returned CLEAN (#4027).
+REPO="${REPO:-<owner/name>}"                   # the issues' repo, e.g. daniel-ospina/agent-infra
+case "$REPO" in ''|*'<'*|*'>'*) echo "❌ REPO is unset or still the literal placeholder ('$REPO') — set it to the issues' repo owner/name; #3061 pre-flight NOT run."; exit 1 ;; esac
+#    The `owner/name` form needs tortoise #3978. Until it lands, tortoise main rejects a slug with
+#    exit 3 (`--repo not a directory`), so probe the tool's own usage and pass the form it accepts.
+if python3 "$TORTOISE"/tools/collision_preflight.py --help 2>&1 | grep -q 'owner/name'; then
+  REPO_ARG="$REPO"                                # slug form
+else
+  #    Pre-#3978 only a PATH is accepted, and it must be a checkout of $REPO. Falling back to `.`
+  #    would check the CWD's repo and return CLEAN — the ONE code that authorizes dispatch, i.e.
+  #    the #4027 wrong-repo false CLEAN. Resolve a path whose origin slug really is $REPO, or stop.
+  SLOT="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed -e 's#/\.git$##')"
+  REPO_ARG=""
+  for CAND in "${ISSUE_REPO_PATH:-}" "$PWD" "$TORTOISE" "$(dirname "$SLOT")/$(basename "$REPO")"; do
+    [ -n "$CAND" ] || continue   # `git -C ""` silently uses the CWD — an empty candidate would "match" anything
+    SLUG="$(git -C "$CAND" config --get remote.origin.url 2>/dev/null | sed -e 's#.*github\.com[:/]##' -e 's#\.git$##')"
+    [ -n "$SLUG" ] && [ "$SLUG" = "$REPO" ] && { REPO_ARG="$CAND"; break; }
+  done
+  [ -n "$REPO_ARG" ] || { echo "❌ pre-#3978 tool: no local checkout of $REPO — '.' would check the WRONG repo (#4027). Set ISSUE_REPO_PATH=<a checkout of $REPO>; pre-flight NOT run."; exit 1; }
+fi
+
+# 3. Gate EVERY issue in the batch — one <N> invocation would leave the rest unchecked.
+#    $ISSUE_LIST — the batch, from Step 1's extracted issue list. It is COUNTED, not merely tested
+#    for non-emptiness: a whitespace-only list word-splits to zero issues, and a zero-iteration loop
+#    exits 0 — a "checked nothing" pass that would authorize the whole batch ungated.
+#    ANY non-zero exit stops the WHOLE batch: 1 COLLISION, 2 INCOMPLETE (NOT clean), 3 usage error.
+GATED=0
+for ISSUE in ${ISSUE_LIST:-}; do
+  case $ISSUE in ''|*[!0-9]*) echo "❌ '$ISSUE' is not an integer issue number — a usage error, not a verdict. STOP the batch."
+                             exit 3 ;;
+  esac
+  GATED=$((GATED + 1))
+  python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE" --repo "$REPO_ARG"
+  RC=$?
+  case $RC in
+    0) echo "✅ #$ISSUE: CLEAN — dispatch eligible." ;;
+    1) echo "⛔ #$ISSUE: COLLISION — a worktree/branch/PR/claim already covers it. DO NOT dispatch; report it."
+       exit 1 ;;
+    2) echo "❌ #$ISSUE: INCOMPLETE — a surface could not be queried. THIS IS NOT CLEAN. STOP the batch, fix gh auth/network, re-run."
+       exit 2 ;;
+    *) echo "❌ #$ISSUE: pre-flight usage/internal error (exit $RC). STOP the batch."
+       exit "$RC" ;;
+  esac
+done
+[ "$GATED" -gt 0 ] || { echo "❌ ISSUE_LIST contained no issue numbers — the #3061 pre-flight checked NOTHING. Populate it and re-run."; exit 1; }
+```
+
+⛔ **There is no graceful degradation.** If `gh` is unavailable the tool returns exit 2 (INCOMPLETE) **by construction** — that is a **stop**, not a warn-and-proceed. A pre-flight that cannot tell "no collision" from "could not check" is exactly the bug #3061 fixed; hand-waving past a non-zero exit reintroduces it. Only exit 0 authorizes dispatch.
+
+**Distinguish the two exit-`2` causes.** A `VERDICT: INCOMPLETE` line on stdout is the tool's INCOMPLETE. An argparse `usage:` line with no `VERDICT:` line is a **wrong invocation** (unsubstituted or non-integer `<N>`) — fix the argument, not `gh`.
+
+**Pre-run precondition — do NOT run this from an issue's own worktree.** The tool has no self-exclusion: a branch/worktree this checkout already owns is reported as a `strong` hit under `[local branches]` / `[local worktrees]`, so a run from inside `feat/<N>-…` / `.worktrees/<N>-…` collides with the artifact of the very work being gated. That is a property of the tool, **not** a licence to excuse a non-zero exit: "ANY non-zero exit stops the dispatch" is unaffected, and a surface reported INCOMPLETE is never excused either. Run the gate from a checkout that does not carry any batch issue's number (the dispatcher's checkout, or a separate clone of `$REPO`). If none exists — this batch is resumable (`Step 2`), so a resume can re-enter from such a worktree — record in the dispatch log that the pre-flight could not be run untainted and defer to the per-issue pre-dispatch gate (`issue-workflow`), which runs before any worktree exists.
+
+**Secondary check — prune closed issues:** after the pre-flight, verify each issue is still open (closed issues may have been completed by a parallel agent):
 
 ```bash
 for ISSUE in $ISSUE_LIST; do
@@ -62,7 +141,7 @@ for ISSUE in $ISSUE_LIST; do
 done
 ```
 
-If `gh` CLI is unavailable, warn and proceed (graceful degradation).
+If this `gh` call cannot run, the pre-flight above has already returned INCOMPLETE (exit 2) and the batch is stopped — do not proceed.
 
 **Concurrency control:** Max 16 parallel sub-agents per dependency level (bounded by fan-in context + worktree contention, NOT API limits — direct DeepSeek API is concurrency-only: 500 v4-pro / 2,500 v4-flash, #317). Stagger launches by 200ms between agents to smooth provider load. On rate-limit errors, retry with exponential backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for full pattern.
 
