@@ -151,14 +151,18 @@ jobs:
     # files.extensions.entries (the consumer ship-list — a tree entry with no
     # manifest row ships on NO consumer, #498 staleness class). Repo-tree only,
     # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
-    # checks 1–4 (materialized copy / mistargeted link / unwired entry /
-    # manifest↔tree row drift) + the *.test.ts exclusion.
+    # checks 1–5 (materialized copy / mistargeted link / unwired entry /
+    # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
+    # exclusion. Check 5 is the ONE machine-local check: it aims at
+    # ${PI_EXTENSIONS_DIR:-$HOME/.pi/agent/extensions}, so on a runner it prints
+    # an explicit ⏭️ skip and the CI verdict stays repo-tree-only; its
+    # fail/pass behaviour is pinned here by the fixture suite's cases 10–12.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Extension-farm parity gate (symlink farm + manifest.json into extensions/)
         run: bash scripts/check-pi-config-extensions.sh
-      - name: Extension-farm parity gate tests (fixtures, checks 1-4)
+      - name: Extension-farm parity gate tests (fixtures, checks 1-5)
         run: bash tests/pi-config-extensions/run.sh
 
   actionlint:
