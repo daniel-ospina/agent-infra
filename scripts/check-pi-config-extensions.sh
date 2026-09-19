@@ -18,6 +18,19 @@
 #      both sides). A new extension with no manifest row ships on NO consumer
 #      (#498 staleness class); a stale manifest row for a deleted extension
 #      breaks every consumer bootstrap.
+#   5. LIVE-FARM LIVENESS (machine-local — checks 1-4 gate the repo, this one
+#      gates the materialized farm at ~/.pi/agent/extensions/). Every
+#      manifest-listed entry that IS a symlink there must RESOLVE to a path
+#      that exists. A dangling link is silent: pi does not load the extension,
+#      so a guard the link was carrying is simply ABSENT with nothing anywhere
+#      reporting it (#1214b parked the clamp-output-floor link on a worktree
+#      while its PR was open; that link dies the moment the worktree is
+#      removed). Scope is the manifest ship-list on purpose — machine-local
+#      links this repo does not ship are not this gate's business, so it cannot
+#      false-block on someone else's half-installed farm. An absent farm prints
+#      an explicit STOP line and passes, and an absent link for a row is simply
+#      not inspected; PI_EXTENSIONS_DIR overrides the farm root for
+#      tests/pi-config-extensions/run.sh.
 #
 # Because each entry IS the extensions/ file/dir (via symlink), content can
 # never drift between the two trees; checks 1-3 close every farm drift mode:
@@ -26,6 +39,8 @@
 #   - entry deleted, or new ext not added      -> fails check 3
 # Check 4 closes the manifest drift mode:
 #   - tree and manifest rows diverge           -> fails check 4
+# Check 5 closes the machine-local half of that same row set:
+#   - a shipped link's target was removed      -> fails check 5
 #
 # Usage:  bash scripts/check-pi-config-extensions.sh
 # Exit:   0 = invariant holds, 1 = drift found (details printed to stdout).
@@ -159,6 +174,29 @@ if [ "$parse_ok" -eq 1 ]; then
       FAILURES=$((FAILURES + 1))
     fi
   done <<< "$manifest_rows"
+fi
+
+# --- check 5: live-farm liveness (machine-local; CI has no ~/.pi) ------------
+# See the header. Only manifest-listed entries are inspected, and only when they
+# are present as symlinks: an absent live link is not this gate's business (the
+# machine may simply not be bootstrapped for that row), and a link this repo
+# does not ship is somebody else's state. Guarded by parse_ok because
+# manifest_rows only exists once the manifest parsed.
+if [ "$parse_ok" -eq 1 ]; then
+  LIVE_FARM="${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent/extensions}"
+  if [ ! -d "$LIVE_FARM" ]; then
+    echo "⏭️  live extension farm not found at $LIVE_FARM — check 5 (dangling shipped links) skipped; set PI_EXTENSIONS_DIR to aim it at a farm"
+  else
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      live="$LIVE_FARM/$row"
+      [ -L "$live" ] || continue   # not farmed as a link here — not this gate's row
+      if [ ! -e "$live" ]; then
+        echo "❌ live farm link $row -> $(readlink "$live") is DANGLING (target does not exist) — pi loads NOTHING for it, so that extension is silently absent; repoint it at an existing checkout (bin/agent-infra.js, or \`ln -sf\`)"
+        FAILURES=$((FAILURES + 1))
+      fi
+    done <<< "$manifest_rows"
+  fi
 fi
 
 if [ "$FAILURES" -gt 0 ]; then

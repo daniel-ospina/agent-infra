@@ -294,8 +294,9 @@ fi
 [ "$(live_scratch)" = 0 ] && ok 0 "T11c no admin record survives the TERM-ignoring child" || ok 1 "T11c no admin record survives the TERM-ignoring child"
 
 # ── T16: a BARE `clean --all` refuses to sweep (fail-closed) ────────────────
-# The argv liveness probe fails OPEN for a cwd-only holder, so the bare sweep
-# must not run at all; `--force-all` is the deliberate opt-in.
+# The liveness probe is best-effort — it cannot see a holder that names the path
+# neither in argv nor as its cwd — so the bare sweep must not run at all;
+# `--force-all` is the deliberate opt-in.
 D16="$(sx create --ref "$C2" --full 2>/dev/null)"
 sx clean --all 2>"$FIX/t16err" >/dev/null
 [ -d "$D16" ] && ok 0 "T16a a bare clean --all removes nothing" || ok 1 "T16a a bare clean --all removed a worktree"
@@ -328,7 +329,21 @@ fi
 
 # ── T14: `clean --all --force-all` PRESERVES a live-held scratch worktree ────
 D14="$(sx create --ref "$C2" --full 2>/dev/null)"
-bash -c "cd '$D14' && sleep 8" >/dev/null 2>&1 &
+# `exec` makes the holder ONE process on every platform — which is what bash 5
+# already does by itself on Linux/CI, where it EXECs the last command of a `-c`
+# string. Spelled out, the fixture does the same thing everywhere, and two latent
+# platform divergences go away:
+#   * T14a exercises the CWD arm (the path in the holder's cwd, NOT its argv),
+#     which is the only arm CI has — without `exec`, bash 3.2 on macOS forks and
+#     leaves the path in argv, so an argv-only probe measures GREEN on a dev box
+#     while CI deletes a live-held worktree (this is what turned main red for
+#     16h on 2026-09-18).
+#   * The release below actually releases. Without `exec`, macOS keeps a `bash -c`
+#     wrapper plus a `sleep` child; `kill $HOLD` kills only the wrapper, and the
+#     reparented child is no longer findable by `pkill -P $HOLD`, so an orphan
+#     kept its cwd inside $D14 and T14b's "released" premise was FALSE on macOS
+#     while being true on CI.
+bash -c "cd '$D14' && exec sleep 8" >/dev/null 2>&1 &
 HOLD=$!
 sleep 1
 sx clean --all --force-all >/dev/null 2>&1
@@ -338,6 +353,24 @@ pkill -P "$HOLD" 2>/dev/null
 sleep 1
 sx clean --all --force-all >/dev/null 2>&1
 [ ! -e "$D14" ] && ok 0 "T14b the released scratch worktree is removed" || ok 1 "T14b the released scratch worktree is removed"
+
+# ── T14c/T14d: a holder the path is in the ARGV of is preserved too ──────────
+# T14's fixture puts the path in the holder's CWD only (exec sleep), so it pins
+# the CWD arm and the ARGV arm alone would have NO fixture — deleting the argv
+# match line left the suite green, i.e. a line this change touches with no test
+# that notices its removal. `tail -f <file inside $D>` names the path in ARGV
+# ONLY (its cwd is the test's, not the worktree), so this pins the ARGV arm the
+# way T14 pins the CWD arm.
+D14A="$(sx create --ref "$C2" --full 2>/dev/null)"
+tail -f "$D14A/.scratch-worktree" >/dev/null 2>&1 &
+HOLD_A=$!
+sleep 1
+sx clean --all --force-all >/dev/null 2>&1
+[ -d "$D14A" ] && ok 0 "T14c an argv-named holder is PRESERVED" || ok 1 "T14c an argv-named holder is PRESERVED"
+kill "$HOLD_A" 2>/dev/null; wait "$HOLD_A" 2>/dev/null
+sleep 1
+sx clean --all --force-all >/dev/null 2>&1
+[ ! -e "$D14A" ] && ok 0 "T14d the released argv holder's worktree is removed" || ok 1 "T14d the released argv holder's worktree is removed"
 
 # ── T15: a straggler DESCENDANT (leader exits first) is still SIGKILLed ──────
 # The leader exits immediately, so `wait` returns at once; the TERM-ignoring

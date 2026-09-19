@@ -102,6 +102,15 @@ jobs:
         # `length` stop, max_tokens > 1 and missing max_tokens all record nothing.
         echo "== extensions/compaction-watchdog.test.ts =="
         npx tsx extensions/compaction-watchdog.test.ts || failures=$((failures+1))
+        # #1214 (b) — clamp-output-floor: the upgrade-proof half of the same fix.
+        # Wired here deliberately: the whole point of this extension is that it is
+        # the layer still standing AFTER a pi upgrade reverts scripts/pi-patches.
+        # A guard whose own test CI never runs is a guard nobody has checked.
+        # Zero-dep (no pi import at all); negative pins: a floor-or-above ceiling,
+        # a missing/non-numeric field, and an already-healthy payload must all be
+        # left BYTE-IDENTICAL — the guard must never rewrite a good request.
+        echo "== extensions/clamp-output-floor.test.ts =="
+        npx tsx extensions/clamp-output-floor.test.ts || failures=$((failures+1))
         # #723 — loop-enforcer TIER_CONFIG vs the canonical Review Cycles table
         # in skills/proportional-gates/SKILL.md: the runtime-vs-governance
         # drift class (complex.maxCycles sat at 2× the canonical bound with no

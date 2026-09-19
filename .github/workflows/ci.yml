@@ -151,14 +151,18 @@ jobs:
     # files.extensions.entries (the consumer ship-list — a tree entry with no
     # manifest row ships on NO consumer, #498 staleness class). Repo-tree only,
     # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
-    # checks 1–4 (materialized copy / mistargeted link / unwired entry /
-    # manifest↔tree row drift) + the *.test.ts exclusion.
+    # checks 1–5 (materialized copy / mistargeted link / unwired entry /
+    # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
+    # exclusion. Check 5 is the ONE machine-local check: it aims at
+    # ${PI_EXTENSIONS_DIR:-$HOME/.pi/agent/extensions}, so on a runner it prints
+    # an explicit ⏭️ skip and the CI verdict stays repo-tree-only; its
+    # fail/pass behaviour is pinned here by the fixture suite's cases 10–12.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Extension-farm parity gate (symlink farm + manifest.json into extensions/)
         run: bash scripts/check-pi-config-extensions.sh
-      - name: Extension-farm parity gate tests (fixtures, checks 1-4)
+      - name: Extension-farm parity gate tests (fixtures, checks 1-5)
         run: bash tests/pi-config-extensions/run.sh
 
   actionlint:
@@ -280,6 +284,22 @@ jobs:
         # ci-main.yml extension-tests job.
         run: npx tsx extensions/compaction-watchdog.test.ts
 
+      - name: Clamp-output-floor suite (#1214b — the PR-lane half, not post-merge only)
+        # #1250 — the defect this step exists to not repeat: a suite wired ONLY
+        # into ci-main.yml (push: main) is a suite that runs AFTER the merge, so
+        # it reports the breakage on main instead of on the PR that caused it.
+        # scratch-worktree.test.sh went in that way and main was red for 16h.
+        # The post-merge leg in ci-main.yml is KEPT (it is the upgrade-proof
+        # backstop for this extension) — this step is an ADDITION, not a move.
+        # Zero-dep by construction: the extension imports the pi package as a
+        # TYPE only (erased by tsx) and node stdlib otherwise, so it runs in THIS
+        # job (the job that performs no `npm ci`); every sink is driven through
+        # the NODE_ENV=test hook seam, so it never touches the real ~/.pi.
+        # Negative pins are first-class: a floor-or-above ceiling, a missing or
+        # non-numeric field, and an already-healthy payload must all be left
+        # BYTE-IDENTICAL — the guard must never rewrite a good request.
+        run: npx tsx extensions/clamp-output-floor.test.ts
+
       - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
         # VISIBLE, not merge-blocking (only pipeline-compliance is required).
         # The blocking backstop is ci-main.yml's extension-tests job, same
@@ -368,6 +388,19 @@ jobs:
         # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
+        # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd
+        # (#1071), so ~124 dispatches/hour on the tortoise hub landed in a
+        # SHARED MAIN checkout — where one lane's unpushed commit gates git
+        # writes for every session rooted there. The gate resolves the child's
+        # target and refuses a shared main checkout, naming the worktree remedy.
+        # Behavioral: loads the REAL index.ts through loader-hooks.mjs and drives
+        # the tool_call handler against a hermetic hub + NESTED linked worktree
+        # (a path-prefix gate would false-positive on the nested worktree, which
+        # is exactly what B5/B6 pin). Zero-dep (`node:*` + the `git` binary), no
+        # `npm ci`, ~3s. Its own step (the post-merge `extensions/*/test*.mjs`
+        # glob in ci-main.yml is not PR-triggered).
+        run: node extensions/task-cwd-guard/test-cwd-guard.mjs
       - name: entry-point guard symlink regression (#708)
         # The entry-point idiom `pathToFileURL(process.argv[1]).href ===
         # import.meta.url` is symlink-SENSITIVE (pathToFileURL does no fs
@@ -395,6 +428,21 @@ jobs:
         # vulnerable form (`find <dir>/`, `find -H`, `find -L`) is executed and
         # asserted to LEAK, then the fixed form is asserted not to.
         run: node extensions/shared/test-infra-verify-scan.mjs
+      - name: read-path failure contract — tortoise-memory.mjs (tortoise#3805 / #1182)
+        # The skills' memory client used to exit 0 in every direction (never
+        # configured, unreachable, and a genuinely empty store were ONE
+        # observable) and defaulted its base URL to the DASHBOARD host while the
+        # API lives on api.premiselabs.co.
+        # Its own step (like #744/#708/#709/#1051 above): the `test-command`
+        # accumulator is exact-pinned by check-pi-pin-lockstep.mjs (guard (j)), so
+        # a new suite cannot be appended there; and ci-main.yml has NO
+        # `scripts/*.test.mjs` glob (it names the older scripts suites
+        # explicitly), so a new one is not auto-collected post-merge either.
+        # The suite EXECUTES the real client as a subprocess against a local HTTP
+        # stub (a source-text scan is a false PASS) and pins both directions:
+        # RED on the defect, GREEN under a behaviour-identical reformat. Zero-dep
+        # (`node:*` only), no `npm ci`, ~4s.
+        run: node --test scripts/tortoise-memory.test.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
