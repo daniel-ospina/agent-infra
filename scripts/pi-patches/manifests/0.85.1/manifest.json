@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "issue": "#1214",
+  "writtenAgainst": {
+    "pi-coding-agent": "0.85.1",
+    "pi-ai": "0.85.1"
+  },
+  "note": "Derived by scripts/pi-patches/make-manifest.mjs from the installed tree. Re-derive (do not hand-edit) after a pi upgrade, then re-run the verification suite.",
+  "entries": [
+    {
+      "id": "b1-clamp-floor-esm",
+      "change": "b",
+      "file": "node_modules/@earendil-works/pi-ai/dist/api/simple-options.js",
+      "find": "const CONTEXT_SAFETY_TOKENS = 4096;\nconst MIN_MAX_TOKENS = 1;\nexport function clampMaxTokensToContext(model, context, maxTokens) {\n    if (model.contextWindow <= 0)\n        return Math.max(MIN_MAX_TOKENS, maxTokens);\n    const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;\n    return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));\n}",
+      "replace": "const CONTEXT_SAFETY_TOKENS = 4096;\nconst MIN_MAX_TOKENS = 1;\n// pi-patch #1214(b): never clamp below a usable output budget. Asking for a single token\n// turns \"no output budget left\" into stopReason \"length\" with output 1 - a turn that looks\n// normal and leaves the session unable to ever reply again. Ask for a usable floor instead\n// and let the provider reject a request that is genuinely over its limit (loud, and the\n// overflow path already handles it) rather than dying silently.\nconst MIN_USABLE_MAX_TOKENS = 1024;\nexport function clampMaxTokensToContext(model, context, maxTokens) {\n    if (model.contextWindow <= 0)\n        return Math.max(MIN_MAX_TOKENS, maxTokens);\n    const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;\n    if (available < MIN_USABLE_MAX_TOKENS)\n        return Math.max(MIN_MAX_TOKENS, Math.min(maxTokens, MIN_USABLE_MAX_TOKENS));\n    return Math.min(maxTokens, available);\n}",
+      "verifyPresent": [
+        "const MIN_USABLE_MAX_TOKENS = 1024;",
+        "if (available < MIN_USABLE_MAX_TOKENS)"
+      ]
+    },
+    {
+      "id": "b2-clamp-floor-bundle-http",
+      "change": "b",
+      "file": "dist/bundle/chunks/chunk-AXIIZGTV.js",
+      "find": "var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1;function clampMaxTokensToContext(model,context,maxTokens){if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return Math.min(maxTokens,Math.max(MIN_MAX_TOKENS,available))}",
+      "replace": "var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1,MIN_USABLE_MAX_TOKENS=1024;function clampMaxTokensToContext(model,context,maxTokens){/*pi-patch:#1214(b)*/if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return available<MIN_USABLE_MAX_TOKENS?Math.max(MIN_MAX_TOKENS,Math.min(maxTokens,MIN_USABLE_MAX_TOKENS)):Math.min(maxTokens,available)}",
+      "verifyPresent": [
+        "MIN_USABLE_MAX_TOKENS=1024",
+        "available<MIN_USABLE_MAX_TOKENS?"
+      ]
+    },
+    {
+      "id": "b3-clamp-floor-bundle-bedrock",
+      "change": "b",
+      "file": "dist/bundle/chunks/bedrock-converse-stream.js",
+      "find": "var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1;function clampMaxTokensToContext(model,context,maxTokens){if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return Math.min(maxTokens,Math.max(MIN_MAX_TOKENS,available))}",
+      "replace": "var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1,MIN_USABLE_MAX_TOKENS=1024;function clampMaxTokensToContext(model,context,maxTokens){/*pi-patch:#1214(b)*/if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return available<MIN_USABLE_MAX_TOKENS?Math.max(MIN_MAX_TOKENS,Math.min(maxTokens,MIN_USABLE_MAX_TOKENS)):Math.min(maxTokens,available)}",
+      "verifyPresent": [
+        "MIN_USABLE_MAX_TOKENS=1024",
+        "available<MIN_USABLE_MAX_TOKENS?"
+      ]
+    }
+  ]
+}

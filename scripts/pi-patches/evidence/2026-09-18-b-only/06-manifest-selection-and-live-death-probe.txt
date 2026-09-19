@@ -1,0 +1,117 @@
+### FIX CYCLE (#1214 P1 + P2) — manifest selection by writtenAgainst, and a death probe that actually fires
+###
+### P1: the old loader refused whenever manifests/ held != 1 version directory, so the README re-arm
+### procedure DEAD-ENDED on its first use (make-manifest left the old dir in place).
+### P2: the death assertion passed a 1000-token context to a model built for available=0, leaving
+### available=3097, so it could never observe max_tokens=1 and contributed 0 failures on pristine.
+
+### SCENARIO: two version directories (0.85.1 + 0.86.0), installed pi 0.85.1
+### BEFORE (old loader): exit 2 — the documented re-arm procedure cannot be used
+$ node apply.mjs --check --pi-root <patched 0.85.1>
+
+╔══════════════════════════════════════════════════════════════════════════════
+║  ⛔  PI PATCH FAILED — THE CLAMP DEATH FIX IS NOT IN PLACE
+╚══════════════════════════════════════════════════════════════════════════════
+   no manifest found under /private/tmp/pi-1214/sim-before/scripts/pi-patches/manifests
+   found 2 version directories: 0.85.1, 0.86.0
+   the fix was written against ONE pi version — re-derive with make-manifest.mjs after an upgrade
+
+
+### AFTER (loader selects by `writtenAgainst`): exit 0 — it picks 0.85.1 and verifies
+$ node apply.mjs --check --pi-root <patched 0.85.1>
+pi-patches check — pi-coding-agent 0.85.1 / pi-ai 0.85.1
+  manifest: /private/tmp/pi-1214/sim-after/scripts/pi-patches/manifests/0.85.1/manifest.json
+  pi root:  /tmp/pi-1214/patched
+  = b1-clamp-floor-esm — already applied
+  = b2-clamp-floor-bundle-http — already applied
+  = b3-clamp-floor-bundle-bedrock — already applied
+✅ all replacements present — the fix is in place
+
+### NO MATCH still FAILS CLOSED (installed 0.99.0; directories 0.85.1 + 0.86.0): exit 3
+### names the installed version, lists the directories, and names the PI_PATCH_VERSION escape
+$ node apply.mjs --check --pi-root <fake 0.99.0>
+
+╔══════════════════════════════════════════════════════════════════════════════
+║  ⛔  PI PATCH FAILED — THE CLAMP DEATH FIX IS NOT IN PLACE
+╚══════════════════════════════════════════════════════════════════════════════
+   INSTALLED PI VERSION HAS MOVED — no manifest matches this install; nothing was written.
+   
+   installed:  pi-coding-agent 0.99.0 / pi-ai 0.99.0
+   manifests: 0.85.1, 0.86.0  (under /private/tmp/pi-1214/sim-after/scripts/pi-patches/manifests)
+   
+   No directory under manifests/ pins that installed version in `writtenAgainst`, so none can be
+   PROVEN to fit this tree. Refusing beats applying a stale or foreign patch set: the anchors are
+   byte-exact for the version they were derived from.
+   
+   To re-arm the fix for the installed version:
+     1. read upstream #1214 and confirm the defect is still present
+     2. node /private/tmp/pi-1214/sim-after/scripts/pi-patches/make-manifest.mjs   # re-derives manifests/<installed version>/
+     3. node /private/tmp/pi-1214/sim-after/scripts/pi-patches/apply.mjs          # applies + verifies
+     4. re-run the evidence tests listed in /private/tmp/pi-1214/sim-after/scripts/pi-patches/README.md
+   
+   to force one of the directories above anyway: PI_PATCH_VERSION=<dir> node /private/tmp/pi-1214/sim-after/scripts/pi-patches/apply.mjs
+   (forcing re-checks the pin and still refuses — with the drift table — if it does not match, so it
+    can never turn into a silent apply of the wrong patch set)
+
+
+### P2: pristine tree --check — BEFORE the probe fix: 8 behavioural failures, death line 0x
+$ node apply.mjs --check --pi-root <pristine 0.85.1>
+pi-patches check — pi-coding-agent 0.85.1 / pi-ai 0.85.1
+  manifest: /private/tmp/pi-1214/sim-before-1dir/scripts/pi-patches/manifests/0.85.1/manifest.json
+  pi root:  /tmp/pi-1214/pristine
+  - b1-clamp-floor-esm — NOT applied
+  - b2-clamp-floor-bundle-http — NOT applied
+  - b3-clamp-floor-bundle-bedrock — NOT applied
+❌ NOT APPLIED — the fix is not in effect:
+   - b1-clamp-floor-esm: missing "const MIN_USABLE_MAX_TOKENS = 1024;" in node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+   - b1-clamp-floor-esm: missing "if (available < MIN_USABLE_MAX_TOKENS)" in node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+   - b2-clamp-floor-bundle-http: missing "MIN_USABLE_MAX_TOKENS=1024" in dist/bundle/chunks/chunk-AXIIZGTV.js
+   - b2-clamp-floor-bundle-http: missing "available<MIN_USABLE_MAX_TOKENS?" in dist/bundle/chunks/chunk-AXIIZGTV.js
+   - b3-clamp-floor-bundle-bedrock: missing "MIN_USABLE_MAX_TOKENS=1024" in dist/bundle/chunks/bedrock-converse-stream.js
+   - b3-clamp-floor-bundle-bedrock: missing "available<MIN_USABLE_MAX_TOKENS?" in dist/bundle/chunks/bedrock-converse-stream.js
+   - bundled runtime: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - bundled runtime: available=-50000 maxTokens=8000 → 1, expected 1024 (estimate overran the window -> must NOT be 1)
+   - bundled runtime: available=1023 maxTokens=100000 → 1023, expected 1024 (just below the floor)
+   - bundled runtime: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+   - pi-ai ESM: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - pi-ai ESM: available=-50000 maxTokens=8000 → 1, expected 1024 (estimate overran the window -> must NOT be 1)
+   - pi-ai ESM: available=1023 maxTokens=100000 → 1023, expected 1024 (just below the floor)
+   - pi-ai ESM: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+
+### P2: the SAME pristine tree AFTER the probe fix: 10 behavioural failures, death line 2x
+###   bundled runtime: STILL ASKS FOR max_tokens: 1 — the fix is not in effect
+###   pi-ai ESM:      STILL ASKS FOR max_tokens: 1 — the fix is not in effect
+$ node apply.mjs --check --pi-root <pristine 0.85.1>
+pi-patches check — pi-coding-agent 0.85.1 / pi-ai 0.85.1
+  manifest: /private/tmp/pi-1214/sim-after/scripts/pi-patches/manifests/0.85.1/manifest.json
+  pi root:  /tmp/pi-1214/pristine
+  - b1-clamp-floor-esm — NOT applied
+  - b2-clamp-floor-bundle-http — NOT applied
+  - b3-clamp-floor-bundle-bedrock — NOT applied
+❌ NOT APPLIED — the fix is not in effect:
+   - b1-clamp-floor-esm: missing "const MIN_USABLE_MAX_TOKENS = 1024;" in node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+   - b1-clamp-floor-esm: missing "if (available < MIN_USABLE_MAX_TOKENS)" in node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+   - b2-clamp-floor-bundle-http: missing "MIN_USABLE_MAX_TOKENS=1024" in dist/bundle/chunks/chunk-AXIIZGTV.js
+   - b2-clamp-floor-bundle-http: missing "available<MIN_USABLE_MAX_TOKENS?" in dist/bundle/chunks/chunk-AXIIZGTV.js
+   - b3-clamp-floor-bundle-bedrock: missing "MIN_USABLE_MAX_TOKENS=1024" in dist/bundle/chunks/bedrock-converse-stream.js
+   - b3-clamp-floor-bundle-bedrock: missing "available<MIN_USABLE_MAX_TOKENS?" in dist/bundle/chunks/bedrock-converse-stream.js
+   - bundled runtime: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - bundled runtime: available=-50000 maxTokens=8000 → 1, expected 1024 (estimate overran the window -> must NOT be 1)
+   - bundled runtime: available=1023 maxTokens=100000 → 1023, expected 1024 (just below the floor)
+   - bundled runtime: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+   - bundled runtime: STILL ASKS FOR max_tokens: 1 — the fix is not in effect
+   - pi-ai ESM: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - pi-ai ESM: available=-50000 maxTokens=8000 → 1, expected 1024 (estimate overran the window -> must NOT be 1)
+   - pi-ai ESM: available=1023 maxTokens=100000 → 1023, expected 1024 (just below the floor)
+   - pi-ai ESM: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+   - pi-ai ESM: STILL ASKS FOR max_tokens: 1 — the fix is not in effect
+
+### REGRESSION: the REAL (patched) installed tree is still green with the live death probe
+$ bash scripts/pi-patches/apply.sh --check
+pi-patches check — pi-coding-agent 0.85.1 / pi-ai 0.85.1
+  manifest: /Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix/1214-pi-clamp-output-floor/scripts/pi-patches/manifests/0.85.1/manifest.json
+  pi root:  /Users/danielospina/.local/share/pi-node/node-v22.23.2-darwin-arm64/lib/node_modules/@earendil-works/pi-coding-agent
+  = b1-clamp-floor-esm — already applied
+  = b2-clamp-floor-bundle-http — already applied
+  = b3-clamp-floor-bundle-bedrock — already applied
+✅ all replacements present — the fix is in place

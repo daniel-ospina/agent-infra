@@ -23,6 +23,7 @@
         "task-heartbeat.ts",
         "session-checks.ts",
         "compaction-watchdog.ts",
+        "clamp-output-floor.ts",
         "provider-exhaustion.ts",
         "carousel-designer.ts",
         "cmux-session.ts",

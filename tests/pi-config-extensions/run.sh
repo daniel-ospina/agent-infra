@@ -16,10 +16,18 @@
 #   7. manifest row with no matching tree entry (check 4b, #502)   → BLOCK
 #   8. no manifest.json at all (check 4 fail-closed)               → BLOCK
 #   9. malformed manifest.json (check 4 fail-closed)               → BLOCK
+#  10. live farm link whose target is gone (check 5, #1214b)       → BLOCK
+#  11. live farm links that all resolve (check 5)                  → PASS
+#  12. no live farm at all — the CI shape (check 5)                → PASS +
+#      an explicit ⏭️ skip line (never a silent pass)
 #
 # Fixture trees mirror the real farm: relative symlinks ../../../extensions/<e>
 # from pi-bootstrap/pi-config/extensions/ into extensions/, plus a manifest.json
 # at the tree root (the consumer ship-list check 4 gates).
+#
+# Check 5 (the machine-local live farm at ~/.pi/agent/extensions) is aimed at a
+# fixture dir via PI_EXTENSIONS_DIR in EVERY case, so this suite's verdict never
+# depends on the developer's own ~/.pi state.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -55,7 +63,11 @@ write_manifest() {
 
 # build_farm <mode> — fresh tmp tree per case; echoes the tree path.
 # mode: clean | copy | retarget | broken | unwired | manifest-missing |
-#       manifest-stale | no-manifest | bad-manifest
+#       manifest-stale | no-manifest | bad-manifest | live-healthy |
+#       live-dangling
+# The live-farm dir is always $TMP/live-extensions (run_gate points
+# PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
+# exercises check 5's explicit skip.
 build_farm() {
   local mode="$1"
   local TMP
@@ -77,6 +89,8 @@ build_farm() {
 
   case "$mode" in
     clean)    ln -s ../../../extensions/b.ts "$FARM/b.ts" ;;
+    live-healthy)  ln -s ../../../extensions/b.ts "$FARM/b.ts" ;;   # farm fine; live link resolves
+    live-dangling) ln -s ../../../extensions/b.ts "$FARM/b.ts" ;;   # farm fine; live link dangles
     copy)     : > "$FARM/b.ts" ;;                                    # materialized copy
     retarget) ln -s ../../../extensions/a.ts "$FARM/b.ts" ;;         # resolves, wrong target
     broken)   ln -s ../../../extensions/missing.ts "$FARM/b.ts" ;;   # resolves to ""
@@ -101,6 +115,16 @@ build_farm() {
 ' > "$TMP/manifest.json" ;;
     *)                write_manifest "$TMP/manifest.json" a.ts b.ts d/ ;;
   esac
+
+  # Live farm (check 5) — the materialized ~/.pi/agent/extensions shape. A
+  # shipped row farmed as a symlink: live-healthy resolves, live-dangling does
+  # not. Any other mode leaves $TMP/live-extensions absent (the CI shape).
+  case "$mode" in
+    live-healthy)  mkdir -p "$TMP/live-extensions"
+                   ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts" ;;
+    live-dangling) mkdir -p "$TMP/live-extensions"
+                   ln -s "$TMP/extensions/gone.ts" "$TMP/live-extensions/a.ts" ;;
+  esac
   echo "$TMP"
 }
 
@@ -112,6 +136,9 @@ run_gate() {
   local mode="$1"; shift
   local TMP
   TMP="$(build_farm "$mode")"
+  # Check 5 is aimed at the fixture dir in every case (see the suite header), so
+  # the verdict is hermetic and the real ~/.pi never participates.
+  export PI_EXTENSIONS_DIR="$TMP/live-extensions"
   bash "$TMP/scripts/check-pi-config-extensions.sh" >"$OUT" 2>&1
   local code=$?
   if [ "$code" -eq "$expected" ]; then
@@ -168,6 +195,18 @@ run_gate 1 "missing manifest file" no-manifest "manifest.json missing at"
 echo ""
 echo "9. Malformed manifest.json (check 4 fail-closed, #502) → BLOCK, exit 1"
 run_gate 1 "malformed manifest" bad-manifest "cannot parse"
+
+echo ""
+echo "10. Live farm link whose target is gone (check 5, #1214b) → BLOCK, exit 1"
+run_gate 1 "dangling live farm link" live-dangling "is DANGLING"
+
+echo ""
+echo "11. Live farm links that all resolve (check 5) → PASS, exit 0"
+run_gate 0 "healthy live farm links" live-healthy "symlink farm into extensions/"
+
+echo ""
+echo "12. No live farm at all — the CI shape (check 5) → PASS + explicit skip line"
+run_gate 0 "absent live farm" clean "check 5 (dangling shipped links) skipped"
 
 echo ""
 if [ "$failures" -gt 0 ]; then

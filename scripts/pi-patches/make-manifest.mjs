@@ -1,0 +1,191 @@
+#!/usr/bin/env node
+// pi-patches manifest generator — derives scripts/pi-patches/manifests/<version>/manifest.json
+// from the INSTALLED pi tree, so the `find` strings are byte-exact for that version.
+//
+// This set carries change (b) ONLY — the clamp output floor, never ask for a single token.
+// Change (c) (bounding the overflow-recovery latch in agent-session.js) is deliberately NOT in
+// this set: it contradicts four upstream tests that encode a one-shot recovery design, and (b)
+// alone closes the silent death because with a usable floor the 1-token turn cannot occur.
+//
+// It fails loudly if any anchor is missing or ambiguous: a manifest that silently matched
+// nothing would make apply.sh report "applied" over an unpatched tree — a false PASS.
+//
+// Usage: node scripts/pi-patches/make-manifest.mjs [--pi-root <dir>] [--out <file>]
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+const args = process.argv.slice(2);
+function arg(name, fallback) {
+	const i = args.indexOf(name);
+	return i === -1 ? fallback : args[i + 1];
+}
+
+function resolvePiRoot() {
+	const explicit = arg("--pi-root", process.env.PI_ROOT);
+	if (explicit) return explicit;
+	const candidates = [];
+	// <prefix>/bin/pi -> <prefix>/lib/node_modules/@earendil-works/pi-coding-agent
+	try {
+		const real = realpathSync(execFileSync("bash", ["-lc", "command -v pi"], { encoding: "utf8" }).trim());
+		candidates.push(
+			join(dirname(dirname(dirname(real))), "lib", "node_modules", "@earendil-works", "pi-coding-agent"),
+		);
+	} catch {
+		/* fall through */
+	}
+	for (const prefix of ["/Users/danielospina/.local/share/pi-node/node-v22.23.2-darwin-arm64"]) {
+		candidates.push(join(prefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent"));
+	}
+	for (const c of candidates) if (existsSync(join(c, "package.json"))) return c;
+	throw new Error("could not locate the installed @earendil-works/pi-coding-agent tree; pass --pi-root");
+}
+
+const PI_ROOT = resolvePiRoot();
+const AGENT_PKG = join(PI_ROOT, "package.json");
+const AI_PKG = join(PI_ROOT, "node_modules", "@earendil-works", "pi-ai", "package.json");
+const CODING_VERSION = JSON.parse(readFileSync(AGENT_PKG, "utf8")).version;
+const AI_VERSION = JSON.parse(readFileSync(AI_PKG, "utf8")).version;
+if (CODING_VERSION !== AI_VERSION) {
+	throw new Error(`pi-coding-agent ${CODING_VERSION} and pi-ai ${AI_VERSION} disagree; re-derive before pinning`);
+}
+
+const BUNDLE = join(PI_ROOT, "dist", "bundle", "chunks");
+
+// ---- (b) output floor -------------------------------------------------------------------
+const CLAMP_ESM_FIND = [
+	"const CONTEXT_SAFETY_TOKENS = 4096;",
+	"const MIN_MAX_TOKENS = 1;",
+	"export function clampMaxTokensToContext(model, context, maxTokens) {",
+	"    if (model.contextWindow <= 0)",
+	"        return Math.max(MIN_MAX_TOKENS, maxTokens);",
+	"    const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;",
+	"    return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));",
+	"}",
+].join("\n");
+
+const CLAMP_ESM_REPLACE = [
+	"const CONTEXT_SAFETY_TOKENS = 4096;",
+	"const MIN_MAX_TOKENS = 1;",
+	"// pi-patch #1214(b): never clamp below a usable output budget. Asking for a single token",
+	"// turns \"no output budget left\" into stopReason \"length\" with output 1 - a turn that looks",
+	"// normal and leaves the session unable to ever reply again. Ask for a usable floor instead",
+	"// and let the provider reject a request that is genuinely over its limit (loud, and the",
+	"// overflow path already handles it) rather than dying silently.",
+	"const MIN_USABLE_MAX_TOKENS = 1024;",
+	"export function clampMaxTokensToContext(model, context, maxTokens) {",
+	"    if (model.contextWindow <= 0)",
+	"        return Math.max(MIN_MAX_TOKENS, maxTokens);",
+	"    const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;",
+	"    if (available < MIN_USABLE_MAX_TOKENS)",
+	"        return Math.max(MIN_MAX_TOKENS, Math.min(maxTokens, MIN_USABLE_MAX_TOKENS));",
+	"    return Math.min(maxTokens, available);",
+	"}",
+].join("\n");
+
+const CLAMP_BUNDLE_FIND =
+	'var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1;function clampMaxTokensToContext(model,context,maxTokens){if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return Math.min(maxTokens,Math.max(MIN_MAX_TOKENS,available))}';
+
+const CLAMP_BUNDLE_REPLACE =
+	'var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1,MIN_USABLE_MAX_TOKENS=1024;function clampMaxTokensToContext(model,context,maxTokens){/*pi-patch:#1214(b)*/if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return available<MIN_USABLE_MAX_TOKENS?Math.max(MIN_MAX_TOKENS,Math.min(maxTokens,MIN_USABLE_MAX_TOKENS)):Math.min(maxTokens,available)}';
+
+const entries = [
+	// (b) the clamp — one copy in the unbundled ESM, one inlined copy per bundle chunk.
+	{
+		id: "b1-clamp-floor-esm",
+		change: "b",
+		file: "node_modules/@earendil-works/pi-ai/dist/api/simple-options.js",
+		find: CLAMP_ESM_FIND,
+		replace: CLAMP_ESM_REPLACE,
+		verifyPresent: ["const MIN_USABLE_MAX_TOKENS = 1024;", "if (available < MIN_USABLE_MAX_TOKENS)"],
+	},
+	{
+		id: "b2-clamp-floor-bundle-http",
+		change: "b",
+		file: "dist/bundle/chunks/chunk-AXIIZGTV.js",
+		find: CLAMP_BUNDLE_FIND,
+		replace: CLAMP_BUNDLE_REPLACE,
+		verifyPresent: ["MIN_USABLE_MAX_TOKENS=1024", "available<MIN_USABLE_MAX_TOKENS?"],
+	},
+	{
+		id: "b3-clamp-floor-bundle-bedrock",
+		change: "b",
+		file: "dist/bundle/chunks/bedrock-converse-stream.js",
+		find: CLAMP_BUNDLE_FIND,
+		replace: CLAMP_BUNDLE_REPLACE,
+		verifyPresent: ["MIN_USABLE_MAX_TOKENS=1024", "available<MIN_USABLE_MAX_TOKENS?"],
+	},
+];
+
+// Resolve every anchor against the installed tree; refuse to emit a manifest that does not match.
+//
+// A tree that is ALREADY PATCHED has no pristine anchors left, and that is not a reason to refuse:
+// re-deriving from a patched install is exactly what you do when you want to reproduce the patch
+// elsewhere or record what is in place. So an entry is satisfied by EITHER the pristine anchor
+// appearing exactly once OR the patched form already being present. The false-manifest guard is
+// preserved, because a file that is NEITHER pristine NOR patched still fails — which is the case
+// that matters (a version bump that moved or deleted the code).
+const problems = [];
+let alreadyPatched = 0;
+for (const entry of entries) {
+	const abs = join(PI_ROOT, entry.file);
+	if (!existsSync(abs)) {
+		problems.push(`${entry.id}: missing file ${entry.file}`);
+		continue;
+	}
+	const text = readFileSync(abs, "utf8");
+	const count = text.split(entry.find).length - 1;
+	if (count === 1) continue;
+	const patched =
+		entry.patched !== undefined
+			? text.includes(entry.patched)
+			: (entry.verifyPresent ?? []).length > 0 && entry.verifyPresent.every((v) => text.includes(v));
+	if (patched) {
+		alreadyPatched += 1;
+		continue;
+	}
+	problems.push(`${entry.id}: anchor matched ${count} times in ${entry.file} (expected exactly 1)`);
+}
+if (problems.length > 0) {
+	console.error("FATAL: the installed pi tree does not match this patch set — refusing to emit a manifest.");
+	for (const p of problems) console.error(`  - ${p}`);
+	process.exit(2);
+}
+
+const manifest = {
+	schema: 1,
+	issue: "#1214",
+	writtenAgainst: { "pi-coding-agent": CODING_VERSION, "pi-ai": AI_VERSION },
+	note:
+		"Derived by scripts/pi-patches/make-manifest.mjs from the installed tree. Re-derive (do not hand-edit) after a pi upgrade, then re-run the verification suite.",
+	entries,
+};
+
+const out = arg("--out", join(import.meta.dirname, "manifests", `${CODING_VERSION}`, "manifest.json"));
+mkdirSync(dirname(out), { recursive: true });
+writeFileSync(out, `${JSON.stringify(manifest, null, 2)}\n`);
+console.log(`wrote ${out}`);
+console.log(`  pi-coding-agent ${CODING_VERSION} / pi-ai ${AI_VERSION} — ${entries.length} replacements`);
+if (alreadyPatched > 0) {
+	console.log(
+		`  note: ${alreadyPatched}/${entries.length} anchors were ALREADY in their patched form (this tree is patched); the manifest still carries the pristine anchor for each, so it applies correctly to an unpatched tree.`,
+	);
+}
+console.log(`  manifest sha256 ${createHash("sha256").update(readFileSync(out)).digest("hex").slice(0, 16)}`);
+
+// Stale version directories are KEPT ON PURPOSE. `apply.mjs` selects the manifest by matching the
+// installed pi version against `writtenAgainst`, so a second directory is the normal post-upgrade
+// state and cannot confuse it. The old manifest is also the only thing that can still apply or
+// revert this patch set on an install that has not yet upgraded — deleting it would strand that
+// install. So this generator never prunes; it only says what it left behind.
+const manifestRoot = dirname(dirname(out));
+const kept = readdirSync(manifestRoot, { withFileTypes: true })
+	.filter((d) => d.isDirectory() && d.name !== CODING_VERSION)
+	.map((d) => d.name)
+	.sort();
+if (kept.length > 0) {
+	console.log(
+		`  note: keeping ${kept.length} other version directory(ies): ${kept.join(", ")} — apply.mjs selects by the INSTALLED version, so they are harmless, and they are the only way to apply or revert this patch set on those installs. Delete one only if you are sure no install still needs it.`,
+	);
+}
