@@ -237,6 +237,18 @@ jobs:
         # sequencing would suppress one verdict when the other fails, and each
         # must report on its own (the same reason every suite here is separated).
         run: python3.12 tools/fleet/liveness.test.py --mutations
+      - name: Scheduled lane-liveness report suite (#1178 unit 3, zero-dep)
+        # #1178 unit 3 — the DELIVERY half. tools/fleet/liveness.py is a pull
+        # tool, so it is silent exactly when the orchestrator is dead; this step
+        # pins the scheduled report (tools/fleet/lane_liveness.py) that runs
+        # under launchd with no agent in the loop. Zero-dep by construction: the
+        # suite is a standalone script, drives the report as a subprocess
+        # against temp fixtures with hermetic ps/date shims and a stubbed gh, and
+        # carries a RED control that mutates the report three ways (escalate
+        # every state / escalate nothing / drop the child exclusion) and requires
+        # each paired leg to catch it. python3 + bash only; its own step so one
+        # verdict cannot suppress the other (same rule as every suite here).
+        run: python3.12 tools/fleet/lane_liveness.test.py
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
       - name: Merge-scope subtraction suite (#755, SDK-free)

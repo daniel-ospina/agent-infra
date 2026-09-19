@@ -183,6 +183,47 @@ check_identity_lib_farmed() {
   fi
 }
 
+# #1178 unit 3 — fleet-tools farm: the scheduled lane-liveness report driver
+# (tools/fleet/lane_liveness.py) and its sibling classifier
+# (tools/fleet/liveness.py) must land under $DEST/tools/fleet/, byte-identical to
+# the repo copies, in the layout that makes liveness.lib_path() resolve to the
+# FARMED library (tools/fleet/ <-> scripts/lib/ preserved). Farming the driver
+# without the classifier is the driver's loud exit-2 "cannot import" abort on
+# every 30-minute pass; farming either into a repo symlink is the #427 TCC
+# failure (launchd cannot read ~/Documents).
+check_fleet_tools_farmed() {
+  local label="$1"
+  local driver="$DEST/tools/fleet/lane_liveness.py"
+  local classifier="$DEST/tools/fleet/liveness.py"
+  [ -f "$driver" ] \
+    || { fail "$label: lane_liveness.py not farmed into tools/fleet/ (#1178 unit 3 farm missing)"; return; }
+  [ -f "$classifier" ] \
+    || { fail "$label: liveness.py not farmed beside the driver (the import would exit 2)"; return; }
+  if diff -q "$ROOT/tools/fleet/lane_liveness.py" "$driver" >/dev/null 2>&1; then
+    echo "ok: $label farmed lane_liveness.py == repo copy (#1178)"
+  else
+    fail "$label: farmed lane_liveness.py differs from tools/fleet/lane_liveness.py (stale copy!)"
+  fi
+  if diff -q "$ROOT/tools/fleet/liveness.py" "$classifier" >/dev/null 2>&1; then
+    echo "ok: $label farmed liveness.py == repo copy (#1178)"
+  else
+    fail "$label: farmed liveness.py differs from tools/fleet/liveness.py (stale copy!)"
+  fi
+  # The farmed driver must actually start from the farmed layout: it imports its
+  # sibling classifier and forks the shared identity library. `--help` is the
+  # read-only mode (no cmux call, no store read, no issue); the pinned
+  # PI_PID_IDENTITY_LIB is the farmed library, never the repo's.
+  local out rc
+  out="$(cd "$TMP" && env HOME="$HOME_DIR" \
+         PI_PID_IDENTITY_LIB="$DEST/scripts/lib/pid-identity.sh" \
+         python3 "$driver" --help 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ] && ! grep -q "cannot import" <<<"$out"; then
+    echo "ok: $label farmed driver imports its classifier (--help rc=0)"
+  else
+    fail "$label: farmed lane-liveness driver failed to start (rc=$rc): $(head -1 <<<"$out")"
+  fi
+}
+
 run_setup() {
   echo "---- setup.sh run (HOME=$HOME_DIR) ----" >> "$RUNS_LOG"
   bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1
@@ -227,10 +268,13 @@ check_content_matches "$DEST/extensions" "run1" mcp-client shared
 check_fix_markers "$DEST/extensions" "run1"
 check_record_review_farmed "run1"
 check_identity_lib_farmed "run1"
+check_fleet_tools_farmed "run1"
 grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
 grep -q "scripts lib farm: 1 copied (pid-identity.sh, #1178)" "$RUNS_LOG" \
   || fail "run 1 did not report the shared-library farm copy (#1178)"
+grep -q "tools/fleet farm: 2 copied (lane-liveness, #1178)" "$RUNS_LOG" \
+  || fail "run 1 did not report the fleet-tools farm copy (#1178 unit 3)"
 
 # --- run 2: re-run must refresh the ACTIVE files --------------------------
 # (a) a dest mutation must be overwritten by the source (content-merge);
@@ -240,6 +284,12 @@ echo "# machine-local mutation" >> "$DEST/agents/verifier.md"
 echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm refresh
 if [ -f "$DEST/scripts/lib/pid-identity.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/lib/pid-identity.sh"  # #1178 farm refresh
+fi
+if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/tools/fleet/lane_liveness.py"   # #1178 unit 3 farm refresh
+fi
+if [ -f "$DEST/tools/fleet/liveness.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/tools/fleet/liveness.py"        # #1178 unit 3 farm refresh
 fi
 SRC_MARKER="$ROOT/pi-bootstrap/pi-config/agents/zz-setup-test-marker.md"
 echo "# issue-93 test marker" > "$SRC_MARKER"
@@ -258,6 +308,17 @@ else
 fi
 check_record_review_farmed "run2"
 check_identity_lib_farmed "run2"
+check_fleet_tools_farmed "run2"
+if grep -q "stale farm mutation" "$DEST/tools/fleet/lane_liveness.py" 2>/dev/null; then
+  fail "stale farm mutation survived re-run (farmed lane_liveness.py was not refreshed)"
+else
+  echo "ok: farmed lane_liveness.py refreshed on re-run (#1178)"
+fi
+if grep -q "stale farm mutation" "$DEST/tools/fleet/liveness.py" 2>/dev/null; then
+  fail "stale farm mutation survived re-run (farmed liveness.py was not refreshed)"
+else
+  echo "ok: farmed liveness.py refreshed on re-run (#1178)"
+fi
 if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
 else
