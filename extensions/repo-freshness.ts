@@ -13,8 +13,17 @@
 //       mode auto (default): git pull --ff-only, logged per pull
 //       mode warn:           hint only
 //   - feature branch → report-only "N behind origin/<default>" (NEVER pulls)
-//   - ahead → report unpushed; diverged → guidance, never pull
-//   - agent-infra excluded — auto-sync.ts owns that repo (no double-pull)
+//   - ahead → report unpushed; diverged-on-default → guidance, never pull
+//   - #1245: a checkout STRANDED on a non-default branch whose tree is
+//     byte-identical to origin/<default> (squash-merge residue) is recovered
+//     onto the default branch — auto-sync's #203 path, now available to EVERY
+//     repo (agent-infra included) and re-attempted on every tick, so a checkout
+//     that goes bad MID-SESSION is recovered without a restart. Same lossless
+//     gate as #203 (never relaxed), never on a busy checkout, never when
+//     another worktree holds the default branch, and disabled by
+//     mode=warn / AGENT_REPO_FRESHNESS_NO_AUTOHEAL like the auto-reset below.
+//   - agent-infra excluded from the PULL path only — auto-sync.ts owns that
+//     repo (no double-pull); its recovery is now this same tick call
 //
 // Safety envelope (research-verified, project #178): pulls only ever happen
 // on the default branch with a clean tree, ff-only; git re-checks dirtiness
@@ -34,6 +43,10 @@ import { execSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { isPrintMode } from "./shared/print-mode.js";
 import { execFileAsync, type ExecFn } from "./session-checks.js";
+// #1245: the #203 lossless-recovery primitive, shared (never duplicated — a
+// second copy of the tree-byte-identity gate would drift). Flat→flat sibling
+// imports resolve under pi's jiti exactly like ./session-checks.js above.
+import { tryLosslessRecover } from "./auto-sync.js";
 
 // ── Knobs ───────────────────────────────────────────────────────────────
 
@@ -377,22 +390,34 @@ export async function asyncRepoState(
 /** Default branch checked out in any worktree ≠ current checkout → true.
  * SELF-EXCLUSION is mandatory: `git worktree list --porcelain` includes the
  * current checkout — without excluding it, the main checkout on the default
- * branch would always "find itself elsewhere" and never pull (plan-review P3). */
+ * branch would always "find itself elsewhere" and never pull (plan-review P3).
+ *
+ * #1245 fix: self-exclusion is by WORKTREE PATH. The previous version keyed on a
+ * `gitdir <path>` line, which `git worktree list --porcelain` does NOT emit (git
+ * 2.50.1) — every entry failed the `gitdirLine` lookup, so this predicate always
+ * returned false and the "default branch held elsewhere" guard was INERT (it
+ * could never fire, not even on a forced duplicate). Verified: 0 `gitdir` lines
+ * in the real output. Paths are realpath-normalised on both sides (macOS
+ * `/tmp` → `/private/tmp`). */
 export function defaultBranchInOtherWorktree(cwd: string, branch: string): boolean {
   const out = tryGit(cwd, "worktree list --porcelain");
   if (!out) return false;
-  const selfGitDir = tryGit(cwd, "rev-parse --absolute-git-dir");
-  if (!selfGitDir) return false;
+  const self = tryGit(cwd, "rev-parse --show-toplevel");
+  if (!self) return false;
+  const norm = (p: string): string => {
+    try { return realpathSync(p); } catch { return p; }
+  };
+  const selfPath = norm(self);
   // porcelain entries are separated by blank lines
   for (const entry of out.split("\n\n")) {
     const lines = entry.split("\n");
-    const gitdirLine = lines.find((l) => l.startsWith("gitdir "));
+    const wtLine = lines.find((l) => l.startsWith("worktree "));
     const branchLine = lines.find((l) => l.startsWith("branch "));
-    if (!gitdirLine || !branchLine) continue;
+    if (!wtLine || !branchLine) continue;
     const b = branchLine.slice("branch ".length).replace(/^refs\/heads\//, "");
     if (b !== branch) continue;
     // self-exclusion (mandatory): skip our own checkout
-    if (gitdirLine.slice("gitdir ".length) === selfGitDir) continue;
+    if (norm(wtLine.slice("worktree ".length)) === selfPath) continue;
     return true;
   }
   return false;
@@ -463,7 +488,7 @@ export interface FreshnessReport {
     | "skipped-agent-infra" | "skipped-detached" | "skipped-busy"
     | "skipped-worktree" | "current" | "ahead" | "diverged"
     | "pulled" | "pull-failed" | "warn-behind" | "report-feature-branch"
-    | "cleaned-superseded";
+    | "cleaned-superseded" | "recovered-stranded";
   repo?: string;
   detail?: string;
 }
@@ -479,11 +504,57 @@ export function freshnessTick(
   if (freshnessDisabled(env)) return report("skipped-disabled");
   if (!isGitRepo(cwd)) return report("skipped-not-git");
   if (!hasOrigin(cwd)) return report("skipped-no-origin");
-  if (isAgentInfraRepo(cwd, env)) return report("skipped-agent-infra");
 
   const branch = defaultBranch(cwd);
   const current = currentBranch(cwd);
   if (!current) return report("skipped-detached");
+
+  // ── #1245 Gap 1 + Gap 2 — lossless recovery for EVERY repo, mid-run ────
+  //
+  // A checkout stranded on a non-default branch whose tree is byte-identical
+  // to origin/<branch> (the squash-merge residue shape) blocks every agent git
+  // op that would un-strand it. #1245 promotes auto-sync's #203 recovery to all
+  // repos, and because this function also runs on the periodic freshness tick
+  // (session_start is no longer the only trigger) a checkout that goes bad
+  // MID-SESSION recovers on the next tick.
+  //
+  // The gate itself is UNCHANGED and is carried by tryLosslessRecover: it
+  // refuses unless syncState is exactly "diverged" AND the tracked tree is
+  // byte-identical to origin/<branch> AND every untracked file is already on
+  // origin/<branch>. A fresh/behind/ahead branch, an ACTIVE feature branch, or
+  // any uncommitted delta is therefore refused and still only reported below.
+  //
+  // Extra pre-checks mirror the behind-path envelope and each remove a way
+  // recovery could fire when it should not:
+  //  - mode=warn / NO_AUTOHEAL → the operator asked for hints, never a mutation
+  //  - merge/rebase/index.lock → never touch a checkout mid-operation
+  //  - default branch held by ANOTHER worktree → the switch would collide AND
+  //    `checkout -f` would abort AFTER the residue cleanup; skip instead
+  // Note: on the DEFAULT branch (diverged-on-main) recovery is not attempted —
+  // checkout+ff-merge cannot resolve it, so it stays report-only.
+  if (
+    current !== branch &&
+    getFreshnessMode(env) !== "warn" &&
+    !autoHealDisabled(env) &&
+    !mergeOrRebaseInProgress(cwd) &&
+    !indexLocked(cwd) &&
+    !defaultBranchInOtherWorktree(cwd, branch)
+  ) {
+    // The lossless test is only meaningful against a CURRENT origin/<branch>:
+    // a stale ref would refuse a genuinely-lossless checkout (and note the
+    // default-branch merge below targets origin/<branch>, so it must be a ref
+    // that actually contains the tree we just verified). The feature-branch
+    // path below re-fetches only in this already-narrow case, so the common
+    // tick's fetch count is unchanged. A fetch mutates nothing.
+    tryGit(cwd, `fetch origin ${q(branch)} --quiet`, { timeout: FETCH_TIMEOUT_MS });
+    const rec = tryLosslessRecover(cwd, { branch });
+    if (rec.recovered) {
+      log(`[repo-freshness] 🔁 ${cwd}: stranded checkout on '${current}' recovered onto ${branch} (tree matched origin/${branch} losslessly) — now at ${tryGit(cwd, "rev-parse --short HEAD") ?? "?"}`);
+      return report("recovered-stranded", `was=${current}`);
+    }
+  }
+
+  if (isAgentInfraRepo(cwd, env)) return report("skipped-agent-infra");
 
   // Feature branch → report-only. NEVER pull non-default branches.
   if (current !== branch) {
