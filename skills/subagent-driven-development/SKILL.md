@@ -26,6 +26,37 @@ Execute plan by dispatching fresh subagent per task, with two-stage review after
 **The controller — not the subagent — owns worktree creation.** Subagents must never invoke `using-git-worktrees` or call `git worktree add` on their own. When a subagent dispatched from inside a worktree tries to create its own worktree, the new worktree nests inside the current one (`.worktrees/agent-A/.worktrees/agent-B`), which breaks teardown, leaks commits, and can cascade to 3+ levels.
 
 **Controller responsibilities (this skill, running in the main conversation):**
+0. **Run the collision pre-flight (#3061) FIRST — before any dispatch and before any worktree.**
+   It is FAIL-CLOSED: `0` CLEAN is the **only** outcome that authorizes dispatch · `1` COLLISION
+   (a worktree/branch/PR/claim already covers #N) · `2` INCOMPLETE (a surface could not be queried
+   — **NOT clean**) · `3` usage/internal error. **ANY non-zero exit stops the dispatch. There is no
+   "warn and proceed" and no graceful degradation.** The gate is provided by **tortoise** (the only
+   repo carrying `tools/collision_preflight.py`) and applies to *any* issue's repo through `--repo`.
+
+   ```bash
+   # 1. Resolve the tortoise checkout EXPLICITLY — unset, `"$TORTOISE"/tools/…` collapses to
+   #    `/tools/…` and PYTHON exits 2, which the exit codes above would report as INCOMPLETE
+   #    ("a surface could not be queried"): a misconfiguration wearing a real verdict's face.
+   TORTOISE="${TORTOISE:-$(git -C "${TORTOISE_WORKTREE:-../tortoise}" rev-parse --show-toplevel 2>/dev/null)}"
+   if [ ! -f "$TORTOISE/tools/collision_preflight.py" ]; then
+     echo "❌ collision pre-flight: no tortoise checkout resolved (TORTOISE='$TORTOISE') — #3061 pre-flight NOT run."
+     echo "   Record this in the dispatch log; do NOT silently skip. Set TORTOISE=<a tortoise worktree> and re-run."
+     exit 1   # do not dispatch
+   fi
+
+   # 2. --repo is MANDATORY. Omitted it means "cwd", and the tool then silently resolved the WRONG
+   #    repository's issue — a tortoise worktree asked for an agent-infra #NNNN and returned CLEAN
+   #    (#4027). Name the target repo: its `owner/name`, or `.` when the cwd IS that repo.
+   REPO="<owner/name of the issue's repo>"       # e.g. daniel-ospina/agent-infra
+   #    The `owner/name` form needs tortoise #3978. Until it lands, tortoise main rejects a slug
+   #    with exit 3 (`--repo not a directory`), so probe the usage and pass the form it accepts.
+   if python3 "$TORTOISE"/tools/collision_preflight.py --help 2>&1 | grep -q 'owner/name'; then
+     REPO_ARG="$REPO"                             # slug form
+   else
+     REPO_ARG="${ISSUE_REPO_PATH:-.}"             # pre-#3978: path form; '.' when cwd is the issue's repo
+   fi
+   python3 "$TORTOISE"/tools/collision_preflight.py <N> --repo "$REPO_ARG"
+   ```
 1. Invoke `using-git-worktrees` ONCE, before dispatching any implementer subagent.
 2. After the worktree is created, capture its absolute path.
 3. Include the worktree path in every implementer subagent's prompt: `Your working directory is <absolute-path>. cd there first. Do NOT create a worktree — one already exists.`

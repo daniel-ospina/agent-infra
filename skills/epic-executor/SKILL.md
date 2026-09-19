@@ -50,7 +50,53 @@ If results found: report prior progress. Skip already-completed issues. Only dis
 
 ### Step 3: Build Dependency Map and Parallel Dispatch
 
-**Pre-dispatch check:** Before constructing prompts, verify each issue is still open. Closed issues may have been completed by a parallel agent:
+**Pre-dispatch gate — collision pre-flight (#3061), FAIL-CLOSED:** the FIRST check before any dispatch is the collision pre-flight. It checks every in-flight surface (open + closed PRs, local + remote branches, worktrees, assignee/claim comments) and fails loudly in both directions — a hit, and a surface that could not be queried. It gates **every issue in the batch**, not just the first: a single `<N>` invocation would leave the rest unchecked.
+
+The gate is provided by **tortoise** (the only repo carrying `tools/collision_preflight.py`) and applies to *any* issue's repo through `--repo`.
+
+```bash
+# 1. The tool lives ONLY in tortoise. Resolve that checkout EXPLICITLY — unset, `"$TORTOISE"/tools/…`
+#    collapses to `/tools/…` and PYTHON exits 2, which the loop would report as INCOMPLETE
+#    ("a surface could not be queried"): a caller misconfiguration wearing a real verdict's face.
+TORTOISE="${TORTOISE:-$(git -C "${TORTOISE_WORKTREE:-../tortoise}" rev-parse --show-toplevel 2>/dev/null)}"
+if [ ! -f "$TORTOISE/tools/collision_preflight.py" ]; then
+  echo "❌ no tortoise checkout resolved (TORTOISE='$TORTOISE') — #3061 pre-flight NOT run for this batch."
+  echo "   Record this in the dispatch log; do NOT silently skip. Set TORTOISE=<a tortoise worktree> and re-run."
+  exit 1   # do not dispatch the batch
+fi
+
+# 2. --repo is MANDATORY. Omitted it means "cwd", and the tool then silently resolved the WRONG
+#    repository's issue — a tortoise worktree asked for an agent-infra #NNNN and returned CLEAN (#4027).
+#    Name the target repo: its `owner/name`, or `.` when the cwd IS that repo.
+REPO="<owner/name of the issues' repo>"          # e.g. daniel-ospina/agent-infra
+#    The `owner/name` form needs tortoise #3978. Until it lands, tortoise main rejects a slug with
+#    exit 3 (`--repo not a directory`), so probe the tool's own usage and pass the form it accepts.
+if python3 "$TORTOISE"/tools/collision_preflight.py --help 2>&1 | grep -q 'owner/name'; then
+  REPO_ARG="$REPO"                                # slug form
+else
+  REPO_ARG="${ISSUE_REPO_PATH:-.}"                # pre-#3978: path form; '.' when cwd is the issues' repo
+fi
+
+# Gate EVERY issue in the batch. ANY non-zero exit stops the WHOLE batch — 1 COLLISION,
+# 2 INCOMPLETE (NOT clean), 3 usage/internal error. There is no "warn and proceed".
+for ISSUE in $ISSUE_LIST; do
+  python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE" --repo "$REPO_ARG"
+  RC=$?
+  case $RC in
+    0) echo "✅ #$ISSUE: CLEAN — dispatch eligible." ;;
+    1) echo "⛔ #$ISSUE: COLLISION — a worktree/branch/PR/claim already covers it. DO NOT dispatch; report it."
+       exit 1 ;;
+    2) echo "❌ #$ISSUE: INCOMPLETE — a surface could not be queried. THIS IS NOT CLEAN. STOP the batch, fix gh auth/network, re-run."
+       exit 2 ;;
+    *) echo "❌ #$ISSUE: pre-flight usage/internal error (exit $RC). STOP the batch."
+       exit "$RC" ;;
+  esac
+done
+```
+
+⛔ **There is no graceful degradation.** If `gh` is unavailable the tool returns exit 2 (INCOMPLETE) **by construction** — that is a **stop**, not a warn-and-proceed. A pre-flight that cannot tell "no collision" from "could not check" is exactly the bug #3061 fixed; hand-waving past a non-zero exit reintroduces it. Only exit 0 authorizes dispatch.
+
+**Secondary check — prune closed issues:** after the pre-flight, verify each issue is still open (closed issues may have been completed by a parallel agent):
 
 ```bash
 for ISSUE in $ISSUE_LIST; do
@@ -62,7 +108,7 @@ for ISSUE in $ISSUE_LIST; do
 done
 ```
 
-If `gh` CLI is unavailable, warn and proceed (graceful degradation).
+If this `gh` call cannot run, the pre-flight above has already returned INCOMPLETE (exit 2) and the batch is stopped — do not proceed.
 
 **Concurrency control:** Max 16 parallel sub-agents per dependency level (bounded by fan-in context + worktree contention, NOT API limits — direct DeepSeek API is concurrency-only: 500 v4-pro / 2,500 v4-flash, #317). Stagger launches by 200ms between agents to smooth provider load. On rate-limit errors, retry with exponential backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for full pattern.
 

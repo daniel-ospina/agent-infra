@@ -108,6 +108,42 @@ fi
 
 ## Dispatch
 
+**⛔ Collision pre-flight (#3061) — FAIL-CLOSED, before ANY dispatch.** The gate is provided by **tortoise** (the only repo carrying `tools/collision_preflight.py`) and applies to *any* issue's repo through `--repo`. Run it before dispatching ANY work for the issue — worktree, branch, sub-agent, or parallel workstream. It checks every in-flight surface (open + closed PRs, local + remote branches, worktrees, assignee/claim comments) and fails loudly in **both** directions: a hit, and a surface that could not be queried.
+
+```bash
+# 1. The tool lives ONLY in tortoise. Resolve that checkout EXPLICITLY — unset, `"$TORTOISE"/tools/…`
+#    collapses to `/tools/…` and PYTHON exits 2, which the exit table would report as INCOMPLETE
+#    ("a surface could not be queried"): a caller misconfiguration wearing a real verdict's face.
+TORTOISE="${TORTOISE:-$(git -C "${TORTOISE_WORKTREE:-../tortoise}" rev-parse --show-toplevel 2>/dev/null)}"
+if [ ! -f "$TORTOISE/tools/collision_preflight.py" ]; then
+  echo "❌ collision pre-flight: no tortoise checkout resolved (TORTOISE='$TORTOISE') — #3061 pre-flight NOT run."
+  echo "   Record this in the dispatch log; do NOT silently skip. Set TORTOISE=<a tortoise worktree> and re-run."
+  exit 1   # do not dispatch
+fi
+
+# 2. --repo is MANDATORY. Omitted it means "cwd", and the tool then silently resolved the WRONG
+#    repository's issue — a tortoise worktree asked for an agent-infra #NNNN and returned CLEAN (#4027).
+#    Name the target repo: its `owner/name`, or `.` when the cwd IS that repo.
+REPO="<owner/name of the issue's repo>"          # e.g. daniel-ospina/agent-infra
+#    The `owner/name` form needs tortoise #3978. Until it lands, tortoise main rejects a slug with
+#    exit 3 (`--repo not a directory`), so probe the tool's own usage and pass the form it accepts.
+if python3 "$TORTOISE"/tools/collision_preflight.py --help 2>&1 | grep -q 'owner/name'; then
+  REPO_ARG="$REPO"                                # slug form
+else
+  REPO_ARG="${ISSUE_REPO_PATH:-.}"                # pre-#3978: path form; '.' when cwd is the issue's repo
+fi
+python3 "$TORTOISE"/tools/collision_preflight.py <N> --repo "$REPO_ARG"
+```
+
+| Exit | Verdict | Action |
+|------|---------|--------|
+| `0` | CLEAN | every surface queried, no in-flight work — the **only** outcome that authorizes dispatch |
+| `1` | COLLISION | a worktree/branch/PR/claim already covers #N — **do NOT dispatch**; report the named surface |
+| `2` | INCOMPLETE | a surface could not be queried — **NOT clean**; fix `gh` auth/network, re-run |
+| `3` | usage/internal error | **stop** |
+
+**ANY non-zero exit stops the dispatch.** There is no "warn and proceed" and no graceful degradation: if `gh` is unavailable the tool returns INCOMPLETE (`2`) **by construction** — a stop, not a fallback path. A pre-flight that cannot tell "no collision" from "could not check" is exactly the bug this gate exists to prevent.
+
 | Level | Complexity | Dispatches to | Depth |
 |-------|-----------|--------------|-------|
 | `epic` | any | `epic-workflow` | Full: 6 stages, all review gates, 3 human gates |
