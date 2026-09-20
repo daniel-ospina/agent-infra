@@ -397,6 +397,25 @@ def _short(uuid: str) -> str:
     return (uuid or "")[:8]
 
 
+def _md_cell(text: str) -> str:
+    """Safe markdown inline text from possibly transcript-derived input (#1272).
+
+    ``reason`` / ``detail`` / the lane label / the workspaceId / the sid / the
+    witness row are read from the session JSONL and the hook store, and the
+    report body is ALSO posted as a
+    GitHub issue body when a lane is ``dead``. An unescaped ``|`` adds a table
+    column, a backtick closes the enclosing code span, and a newline starts a
+    line that can forge a heading — so each is neutralised here, at the RENDER
+    layer (which also covers the pre-existing ``detail`` path: tool names and
+    call ids). Every caller additionally wraps the result in a code span, which
+    neutralises the inline-markdown / raw-HTML vector (``[x](url)``, ``<h1>``).
+    """
+    out = str(text)
+    out = out.replace("|", "\\|")
+    out = out.replace("`", "'")
+    return "".join(ch if ch.isprintable() else " " for ch in out)
+
+
 def _ts(now_ms: int) -> str:
     return datetime.datetime.fromtimestamp(now_ms / 1000.0, datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -448,8 +467,10 @@ def render_report(
         elif v.holder_pid:
             parts.append("holder=%d" % v.holder_pid)
         evidence = ", ".join(parts) or "—"
-        lines.append("| %s | `%s` | `%s` | **%s** | `%s` | %s |"
-                     % (lane.name, _short(lane.workspace), lane.sid[:8], v.state, v.reason, evidence))
+        lines.append("| `%s` | `%s` | `%s` | **%s** | `%s` | `%s` |"
+                     % (_md_cell(lane.name), _md_cell(_short(lane.workspace)),
+                        _md_cell(lane.sid[:8]), _md_cell(v.state), _md_cell(v.reason),
+                        _md_cell(evidence)))
 
     dead = [(lane, v, ev) for lane, v, ev in ordered if v.state in escalate_states]
     active = [(lane, v, ev) for lane, v, ev in dead
@@ -461,15 +482,17 @@ def render_report(
         lines.append("")
         for lane, v, _ev in active:
             lines.append(
-                "- **%s** (`%s`, session `%s`): `%s` — %s"
-                % (lane.name, _short(lane.workspace), lane.sid, v.state,
-                   ", ".join(v.witnesses) or v.detail or v.reason)
+                "- **`%s`** (`%s`, session `%s`): `%s` — `%s`"
+                % (_md_cell(lane.name), _md_cell(_short(lane.workspace)),
+                   _md_cell(lane.sid), _md_cell(v.state),
+                   _md_cell(", ".join(v.witnesses) or v.detail or v.reason))
             )
         lines.append("")
         lines.append(
             "A dead lane is the one state no live-process-derived detector can show: "
             "its process is gone, so it drops out of every population built from `ps`. "
-            "Confirm with `cmux read-screen --workspace %s` before acting." % active[0][0].workspace
+            "Confirm with `cmux read-screen --workspace %s` before acting."
+            % _md_cell(active[0][0].workspace)
         )
     if stale:
         lines.append("")
@@ -477,7 +500,8 @@ def render_report(
             "%d dead lane(s) withheld from escalation — quiet longer than the "
             "reaper's %.0fh idle proof (retirement, not a stuck lane; still "
             "listed above): %s."
-            % (len(stale), window_ms / 3_600_000.0, ", ".join(l.name for l, _v, _e in stale))
+            % (len(stale), window_ms / 3_600_000.0,
+               ", ".join("`%s`" % _md_cell(l.name) for l, _v, _e in stale))
         )
     if not dead:
         lines.append("")

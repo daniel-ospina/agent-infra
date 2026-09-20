@@ -98,6 +98,14 @@ calls (`stop` / `length` / `error` / `aborted`), or with `error` / `aborted` on 
 (`quiet-within-bound` inside the 20 min bound, `turn-ended` past it, `record-non-idle-fresh` or
 `tool-in-flight` while those vetoes hold).
 
+Terminality is an **explicit set**, never a fall-through: on a message carrying **no** tool calls, a
+`stopReason` outside it — including one pi has not emitted yet — **abstains** (`unknown` /
+`turn-unknown:<stopReason>`) rather than asserting the lane is resting. A message **carrying**
+calls is decided by the rule above first, so an unrecognized reason with calls is an OPEN turn,
+not an abstention. `turn-ended` is RESTING (unescalatable, never `wedged`), so a
+default that lands there would read a genuinely suspended lane as merely quiet — the fail-open
+direction this classifier exists to remove (#1272).
+
 > **pi behaviour, and how it was established.** The stop-reason rule rests on pi's own semantics.
 > Measured by the #1254 unit over **426 live session files**: of assistant messages carrying tool
 > calls, `toolUse` 147,466 with 147,431 `resultFollows`; `error` 115 with **0**; `length` 78 with
@@ -203,7 +211,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (T1–T19 with 23 paired mutations) and by the
+> all pinned by `tools/fleet/liveness.test.py` (T1–T20 with 24 paired mutations) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
@@ -223,6 +231,7 @@ not a stall.
 | `off-fence` | a live process whose recorded start could not be matched |
 | `incarnation-unmatched` | no fenced holder and at least one candidate abstained (not all abstainers `off-fence`) |
 | `turn-state-unknown` | the transcript tail could not be read as a turn boundary |
+| `turn-unknown:<stopReason>` | on a message carrying **no** tool calls, the last assistant message's `stopReason` is outside `TERMINAL_STOP_REASONS` — unrecognized is not terminal (#1272) |
 | `tail-after-compaction` | a compaction entry is the last entry (see below) |
 
 **A trailing compaction tail abstains rather than asserting `wedged`.** pi writes a
@@ -343,7 +352,7 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 19 tests
+python3 tools/fleet/liveness.test.py               # 20 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 ```

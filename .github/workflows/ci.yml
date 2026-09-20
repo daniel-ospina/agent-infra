@@ -234,7 +234,7 @@ jobs:
         run: python3.12 tools/fleet/liveness.test.py
       - name: Fleet liveness mutation evidence (#1178, zero-dep)
         # The suite above is only a pin if it can FAIL. `--mutations`
-        # reintroduces each of the 23 defects into a TEMP copy of the module (or
+        # reintroduces each of the 24 defects into a TEMP copy of the module (or
         # of the identity library) and re-runs the paired test against it in a
         # subprocess — a mutation whose paired test still passes is reported as
         # a suite failure. Its own step, not a second command in the step above:
@@ -248,10 +248,11 @@ jobs:
         # under launchd with no agent in the loop. Zero-dep by construction: the
         # suite is a standalone script, drives the report as a subprocess
         # against temp fixtures with hermetic ps/date shims and a stubbed gh, and
-        # carries a RED control that mutates the report six ways (escalate
+        # carries a RED control that mutates the report seven ways (escalate
         # every state / escalate nothing / drop the child exclusion / drop the
         # open-workspace filter / drop the policy text's 24h carve-out / name
-        # one reason for a state several paths reach, #1273) and the
+        # one reason for a state several paths reach, #1273 / drop the
+        # markdown-cell escape, #1272) and the
         # CLASSIFIER it consumes two more (drop the turn-ended guard and drop
         # the compaction-tail abstention, #1254), requiring each paired leg to
         # catch it. python3 + bash only; its own step so one
