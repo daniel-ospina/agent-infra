@@ -61,10 +61,11 @@ verdict):
 0. **Evidence availability** — a failed `ps` or an unreadable store abstains (`ps-unreadable` /
    `store-unreadable`). A failed read is never `dead`.
 1. **Growth** — a JSONL that grew inside the window is **positive liveness evidence**, decided
-   *before* identity, so a growing lane can never read `dead` (`jsonl-grew`, naming the
-   un-fenced writer when there is no holder).
+   *before* identity, so a growing lane can never read `dead` (`jsonl-grew`, reporting
+   `writer-unidentified` when there is no fenced holder).
 2. **Identity** — the **only** source of `dead`. Non-empty candidate set, every candidate a
-   positive `absent`/`zombie` witness, non-growth positively known (`is_dead_evidence`).
+   positive `absent`/`zombie` witness (`is_dead_evidence`), non-growth positively known (the
+   separate `jsonl_grew is False` guard).
 3. **The vetoes** — a fenced holder exists; every "still working" signal is a **veto against
    `wedged`**, never a reason to escalate: un-expired tool veto, then fresh non-idle record.
 4. **Age** — past the `IDLE_MS` proof (24 h) ⇒ `idle`; within the `STREAM_STALL_MS` bound (20 min)
@@ -90,9 +91,10 @@ entry** (read backwards from EOF; the boundary is always at the end):
 | `turn-open:awaiting-response` | a user prompt with no assistant reply after it |
 | `turn-open:no-terminal-stop` | the last assistant message carries no `stopReason` |
 
-A transcript whose last turn ended with a terminal `stopReason` (`stop`, or `length` / `error` /
-`aborted` on a message carrying **no** tool calls) is **RESTING**: it reads `running-quiet`
-(`turn-ended`) however long it is quiet short of the 24 h retirement proof.
+A transcript whose last turn ended with a terminal `stopReason` on a message carrying **no** tool
+calls (`stop` / `length` / `error` / `aborted`), or with `error` / `aborted` on a message
+**carrying** tool calls, is **RESTING**: it reads `running-quiet` (`turn-ended`) however long it
+is quiet short of the 24 h retirement proof.
 
 > **pi behaviour, and how it was established.** The stop-reason rule rests on pi's own semantics,
 > measured by the #1254 unit over **426 live session files** (the measurements are recorded in
@@ -209,7 +211,7 @@ not a stall.
 | `jsonl-age-unknown` | the session file could not be aged, so non-growth cannot be proven |
 | `no-holder-record` | the candidate set is empty (the non-vacuity guard) |
 | `off-fence` | a live process whose recorded start could not be matched |
-| `incarnation-unmatched` | every candidate abstained; no fenced holder |
+| `incarnation-unmatched` | no fenced holder and at least one candidate abstained (not all abstainers `off-fence`) |
 | `turn-state-unknown` | the transcript tail could not be read as a turn boundary |
 | `tail-after-compaction` | a compaction entry is the last entry (see below) |
 
@@ -253,8 +255,9 @@ verdict.
    bound is safe because the boundary is always at the end; over the 426 live session files every
    one had a message entry inside the first 256 KiB.
 
-4. **The population comes from the durable store, and includes closed panes.** The store retains
-   workspaces whose pane has since been closed (measured on this host: 8 of 34). The driver filters
+4. **The population comes from the durable store; closed panes are filtered out when the cmux
+   layout is readable.** The store retains workspaces whose pane has since been closed (measured
+   on this host: 8 of 34), so they can appear only on the fallback path. The driver filters
    to the set of workspace ids cmux currently has open (read from cmux's persisted layout — the
    `cmux` CLI is **unusable from launchd**, which refuses non-cmux callers), and falls back to the
    store's own workspace set, **saying so in the report**, if that file is unreadable. It never
@@ -267,9 +270,9 @@ verdict.
    but withheld from escalation (retirement, not a stuck lane).
 
 6. **No liveness input is read from a PR or issue body.** The verdict's inputs are the store, the
-   session JSONL, and a fresh `ps` read. The only reader of a PR body in this pipeline is the
-   compliance gate's linked-issue check (`scripts/check-pipeline-compliance.sh`), and it reads the
-   body only to decide that gate's outcome — it is not a liveness input. Where this doc cites an
+   session JSONL, and a fresh `ps` read. Other tooling on the merge rail does read PR bodies — the
+   compliance gate (`scripts/check-pipeline-compliance.sh`) and `scripts/record-review.sh` — but
+   none of that output is an input to a liveness verdict. Where this doc cites an
    issue or PR number, the citation is a **pointer**; the substantive claim is cited to code, a
    test, or a stated measurement.
 
