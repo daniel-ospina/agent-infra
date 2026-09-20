@@ -292,9 +292,10 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: NOOP_MESSAGE }], details: {} };
       },
     });
-    pi.on("session_start", async (_event, ctx) => {
-      ctx.ui.notify("design-reviewer: ELDATO_ROOT not set — tool registered as no-op", "info");
-    });
+    // No `session_start` banner here: the extension is symlinked into the global
+    // farm, so ELDATO_ROOT-unset is the permanent, expected state on every
+    // non-El-Dato repo. The description above and the NOOP_MESSAGE the tool
+    // returns already say exactly this, at the moment it matters.
     return;
   }
 
