@@ -18,7 +18,7 @@ DRY-RUN / rc=2) plus the legs this surface adds:
     TURN-BOUNDARY a lane whose transcript ended is `running-quiet` however long
                 it rests (short of the 24h retirement proof; this fixture's row
                 reason is `turn-ended`, but the emitted POLICY sentence asserts
-                only the state, since three paths reach it), while a
+                only the state, since several paths reach it), while a
                 lane frozen with an OPEN turn is still `wedged` — the #1254
                 contract at the report layer. The child-exclusion scenario (a
                 task child's newer record must not become the parent's verdict)
@@ -37,7 +37,7 @@ consumes, which is the seam #1254 actually broke):
   * drop the turn-ended guard   → TURN-BOUNDARY must go red
   * compaction tail stops abstaining → COMPACTION must go red
   * policy text loses the 24h carve-out → TURN-BOUNDARY must go red
-  * policy text names one reason for a state three paths reach → TURN-BOUNDARY must go red
+  * policy text names one reason for a state several paths reach → TURN-BOUNDARY must go red
 A mutation the suite does not catch is reported as a suite failure.
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;
@@ -554,13 +554,14 @@ def leg_turn_boundary(module=None):
         # the historical reason name.
         assert_contains(out, "reads `running-quiet` however long it",
                         "the policy text asserts the STATE alone for a turn-ended lane (#1273)")
-        # #1273: the policy sentence must assert the STATE alone — three paths
-        # return `running-quiet` for a turn-ended lane (`quiet-within-bound`
-        # inside the stream bound, `turn-ended` past it, `record-non-idle-fresh`
-        # while the input-consumption veto holds), so naming ONE reason for it
-        # was false. The row's own `reason` column is what names the path.
+        # #1273: the policy sentence must assert the STATE alone — several
+        # paths return `running-quiet` (`quiet-within-bound` inside the stream
+        # bound, `turn-ended` past it, `record-non-idle-fresh` while the
+        # input-consumption veto holds, `tool-in-flight` while a tool veto
+        # holds), so naming ONE reason for it was false. The row's own `reason`
+        # column is what names the path.
         assert_not_contains(out, "`running-quiet`/`turn-ended`",
-                            "the policy text does not name one reason for a state three paths reach (#1273)")
+                            "the policy text does not name one reason for a state several paths reach (#1273)")
         if gh:
             bad("a live-holder wedge must not escalate: %s" % gh)
         else:
@@ -688,11 +689,11 @@ MUTATIONS = [
         target="report",
     ),
     Mutation(
-        "policy-text-names-one-reason-for-three-paths",
+        "policy-text-names-one-reason",
         '        "last turn ended reads `running-quiet` however long it "\n',
         '        "last turn ended reads `running-quiet`/`turn-ended` however long it "\n',
         leg_turn_boundary, 1,
-        "the emitted policy text names ONE reason for a state three paths reach (#1273)",
+        "the emitted policy text names ONE reason for a state several paths reach (#1273)",
         target="report",
     ),
 ]

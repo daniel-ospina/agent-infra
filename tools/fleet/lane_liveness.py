@@ -74,10 +74,11 @@ because ``wedged`` fired on any frozen transcript. ``liveness.py`` now requires
 POSITIVE evidence of an open turn, so a turn-ended lane reports
 ``running-quiet`` however long it rests short of the 24h retirement proof, and
 ``wedged`` means what it says. The lane's own ``reason`` names which path
-returned that state (``quiet-within-bound`` inside the stream bound,
-``turn-ended`` past it, ``record-non-idle-fresh`` while the input-consumption
-veto holds) — the sentence above asserts the STATE, and the reason is rendered
-per lane. The escalation policy
+returned that state — for example ``quiet-within-bound`` inside the stream
+bound, ``turn-ended`` past it, ``record-non-idle-fresh`` while the
+input-consumption veto holds, or ``tool-in-flight`` while a tool veto holds —
+the sentence above asserts the STATE, and the reason is rendered per lane. The
+escalation policy
 still stays ``dead``-only — a
 reporting fix is not a licence to file issues on a diagnostic state.
 
