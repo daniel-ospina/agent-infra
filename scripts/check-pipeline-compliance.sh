@@ -384,6 +384,110 @@ parse_issue_ref() {
 # for an ARTIFACT-ONLY PR — see resolve_issue_ref / pr_is_artifact_only.
 parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 
+# ── #1274 — the closing-word HAZARD scan ────────────────────────────────────
+# GitHub decides whether to close an issue by matching WORDS, not by reading
+# the sentence those words sit in. Two failures follow, and both happened for
+# real on PR #1271:
+#
+#   H1  A closing word next to an issue reference closes that issue even when
+#       the sentence says the opposite. The PR body carried the heading
+#       "## ⚠️ This PR does NOT close #1178" — that text contains `close #1178`,
+#       and GitHub closed #1178, whose units 4–5 were unbuilt. The word "NOT"
+#       is invisible to the parser. A NEGATION IS AN INSTRUCTION.
+#   H2  GitHub SKIPS inline code, so a closing keyword wrapped in backticks
+#       closes nothing. The same body's INTENDED keyword was written as
+#       `` `Closes #1254` ``: check (a) PASSED it (REFCTX tolerates a backtick
+#       prefix, pinned by this file's own self-test) while GitHub ignored it and
+#       #1254 was closed by hand instead.
+#
+# So check (a)'s question is not "is there a reference?" but "is the SET of
+# issues this body will close exactly the set the author means to close?". The
+# two functions below compute the difference; scan_close_word_hazards renders
+# it as the gate's failure text. Position is deliberately irrelevant to H1 —
+# GitHub acts on the words wherever they sit, which is also why the mid-sentence
+# rule in check (a) cannot see this class: it treats a mid-sentence mention as
+# NOT a reference, and it is one.
+#
+# SCOPE, stated rather than implied: this scans the PR BODY only. GitHub also
+# acts on closing keywords in COMMIT MESSAGES, which this gate does not read —
+# a known boundary, so do not read a PASS here as "no accidental closure".
+#
+# A second boundary, and it is the CONSERVATIVE direction on purpose: a FENCE,
+# an HTML comment (`<!-- … -->`) and raw `<code>` HTML are all scanned as LIVE.
+# For fenced code I could not establish whether GitHub skips it, and the earlier
+# attempt to MODEL it produced four fail-opens in three review rounds (see the
+# comment above all_close_refs); for HTML comments I could not establish it
+# either. So this does NOT guess: a false block cleared by a one-word edit is the
+# safe error, and refusing is the direction this gate exists for. A fenced body
+# that quotes the keyword form is therefore refused — use inline code, which is
+# inert, or drop the number from the sentence.
+#
+# The keyword class is word-boundary-anchored (`\b`): CLOSING_KW's class is a
+# SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), so an
+# unanchored scan invents hazards out of prose that closes nothing — the same
+# false-refusal trap record-review.sh's tier guard documents.
+
+# A FENCE IS NOT MODELLED — and that is deliberate. An earlier revision stripped
+# fenced blocks so a body that QUOTED the keyword form would not be refused. That
+# cost four defects in three review rounds, every one a FAIL-OPEN in the
+# direction this gate exists to catch, each in a different input dimension of the
+# same question "is this line a fence?": opener indentation (a 4-column opener is
+# an indented code block, not a fence), an info string containing a backtick
+# (CommonMark forbids it, so the line is a paragraph), and a fence-looking line
+# inside an HTML comment (never a fence). A line-toggle that must be right about
+# that question in every dimension is a net loss: getting it wrong HIDES a live
+# closure, while not having it at all merely refuses a body that quotes a keyword
+# inside a fence — visible, and cleared by using inline code or dropping the
+# number.
+#
+# So the model is one rule: INLINE CODE IS INERT; EVERYTHING ELSE IS LIVE. That is
+# the conservative direction, it needs no fence parser, and the inline-code half
+# is the half GitHub's behaviour actually verifies (a backticked intended keyword
+# demonstrably did not close its issue on PR #1271).
+# all_close_refs <text> — every issue number <text> names with a closing
+# keyword, one per line, ascending, deduped. This is the set of issues the body
+# WILL close on merge. The cross-repo owner/repo prefix is dropped, so the
+# returned value is the issue NUMBER; a cross-repo reference sharing a number
+# with the target is therefore indistinguishable from it (conservative: the
+# gate's message names the number either way).
+all_close_refs() {
+  printf '%s\n' "$1" \
+    | grep -ioE "\\b${CLOSING_KW}[[:space:]]*:?[[:space:]]*(#[0-9]+|[^/[:space:],;)]+/[^/[:space:],;)]+#[0-9]+|https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+)" \
+    | grep -oE '(#[0-9]+$|/[0-9]+$)' | grep -oE '[0-9]+' | sort -n -u
+}
+
+# code_span_close_refs <text> — the issue numbers whose closing keyword sits
+# INSIDE inline code (backticks). GitHub skips code spans, so these are inert:
+# they close nothing. Separated from all_close_refs rather than folded in,
+# because an inert mention of a DIFFERENT issue is harmless noise while an inert
+# mention of the INTENDED issue is the H2 failure.
+code_span_close_refs() {
+  printf '%s\n' "$1" \
+    | grep -ioE '`[^`]*'"${CLOSING_KW}"'[^`]*(#[0-9]+|/[0-9]+)[^`]*`' \
+    | grep -oE '(#[0-9]+|/[0-9]+)' | grep -oE '[0-9]+' | sort -n -u
+}
+
+# scan_close_word_hazards <text> <intended-number> — the gate's hazard text, or
+# empty when clean. Disjointness is the whole point:
+#   H1 = will-close MINUS inert MINUS intended  → an unintended closure
+#   H2 = intended INTERSECT inert               → the intended closure disarmed
+# An inert mention of some OTHER issue is neither (it closes nothing and was not
+# intended), so it is not reported.
+scan_close_word_hazards() {
+  local text="$1" intended="$2" out="" n inert=" "
+  for n in $(code_span_close_refs "$text"); do inert="$inert$n "; done
+  for n in $(all_close_refs "$text"); do
+    [[ "$n" == "$intended" ]] && continue
+    case "$inert" in *" $n "*) continue ;; esac
+    out+="      ⚠️  H1 unintended close: the body names #$n with a closing keyword, so GitHub will CLOSE #$n on merge. Its parser reads the words and not the sentence — a negation is not understood, so \"this does NOT close #$n\" IS that instruction."$'\n'
+  done
+  for n in $(code_span_close_refs "$text"); do
+    [[ "$n" == "$intended" ]] || continue
+    out+="      ⚠️  H2 disarmed close: the closing keyword for #$n is inside inline code (backticks). GitHub SKIPS code spans, so this closes NOTHING — the link the body intends will not be created and #$n stays open."$'\n'
+  done
+  printf '%s' "$out"
+}
+
 # has_scoping_marker <scoping-comment-text> — true when the text carries the
 # `<!-- issue-scoping:` marker as a REAL scoping artifact rather than as a
 # substring of prose.
@@ -622,7 +726,7 @@ fetch_json() {
 # COMMIT_MSGS, FILES. Prints pass/fail per check; returns failure count.
 
 run_checks() {
-  local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no"
+  local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no" close_hazards=""
   local is_micro=false is_stdcomplex=false
   local tier="unspecified"
   local files_plain="" runtime_file="" test_evidence="" files_valid="" files_ok="false"
@@ -687,10 +791,24 @@ run_checks() {
     echo "ℹ️  [a] Skipped: --issue-only mode evaluates the target issue's artifacts directly (no PR body exists yet)."
     echo ""
   elif [[ -n "$issue_ref" ]]; then
-    if [[ "$issue_ref_kind" == "closing" ]]; then
-      pass a "linked issue $issue_display (closing keyword in PR body)"
+    # #1274 — resolve_issue_ref found the reference the author MEANT. This asks
+    # the other half of the question: does the body also close something it
+    # never claimed to? See scan_close_word_hazards for the two failure shapes
+    # (a negation read as an instruction; an intended keyword disarmed by
+    # inline code). Both were live on PR #1271 and this gate passed it.
+    close_hazards="$(scan_close_word_hazards "$PR_BODY" "$issue_number")"
+    if [[ -n "$close_hazards" ]]; then
+      fail a "closing keyword hazard — GitHub acts on the WORDS in the PR body, not on the sentence: this body would close an issue it does not claim to close, or has disarmed the one it does."
+      printf '%s\n' "$close_hazards"
+      echo "      Remedy: to say an issue stays open, do NOT write a closing word next to its number — write \"leaves #N open\" or \"#N stays open\". And never wrap a real closing keyword in backticks: GitHub skips code spans, so it closes nothing."
+      echo "      Invoke:  commit-workflow — rewrite the PR body, then re-run this gate."
+      echo ""
     else
-      pass a "linked issue $issue_display (traceability keyword in PR body — artifact-only PR, closure not implied)"
+      if [[ "$issue_ref_kind" == "closing" ]]; then
+        pass a "linked issue $issue_display (closing keyword in PR body)"
+      else
+        pass a "linked issue $issue_display (traceability keyword in PR body — artifact-only PR, closure not implied)"
+      fi
     fi
   else
     fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
@@ -1074,7 +1192,61 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_ref '- [ ] Closes #173' "$GH_REPO#173"
   expect_ref '- [x] Closes #173' "$GH_REPO#173"
   expect_ref '**Closes #173**' "$GH_REPO#173"
+  # #1274 — PARITY GAP, pinned rather than silently changed. REFCTX tolerates a
+  # backtick prefix, so parse_issue_ref resolves this — while GitHub SKIPS inline
+  # code and closes nothing. The parser stays permissive (REFCTX is a
+  # byte-identical cross-script invariant shared with record-review.sh, pinned by
+  # record-review.test.sh §8.13, and narrowing it here would desynchronise the
+  # two copies); the GATE is where the shape is refused, by the H2 hazard below.
   expect_ref '`Closes #173`' "$GH_REPO#173"
+  # #1274 — the closing-word hazard scan. Each vector is a real shape: the first
+  # is PR #1271's actual heading, the second is the same body's backticked
+  # intended keyword.
+  expect_hazard() {
+    local input="$1" intended="$2" want="$3" got
+    got="$(scan_close_word_hazards "$input" "$intended")"
+    if { [[ "$want" == "yes" && -n "$got" ]] || [[ "$want" == "no" && -z "$got" ]]; }; then
+      printf '✅ scan_close_word_hazards(%q, %s) → hazards=%s\n' "$input" "$intended" "$want"
+    else
+      printf '❌ scan_close_word_hazards(%q, %s) → want hazards=%s, got %q\n' "$input" "$intended" "$want" "$got" >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+  expect_hazard 'Closes #173' 173 no
+  expect_hazard 'Fixes #173, Closes #173' 173 no
+  # THE INCIDENT: a heading that says the issue must stay open.
+  expect_hazard $'Closes #173\n\n## ⚠️ This PR does NOT close #174' 173 yes
+  expect_hazard $'Closes #173\nThis also fixes #174 in passing.' 173 yes
+  expect_hazard $'Closes #173\nCloses #174' 173 yes
+  # H2 — the intended keyword disarmed by inline code.
+  expect_hazard '`Closes #173`' 173 yes
+  # Precision: an INERT mention of some OTHER issue is neither closure nor
+  # disarmed intent — flagging it would be noise, and noise is how a gate gets
+  # routed around.
+  expect_hazard $'Closes #173\nsee `Closes #174` for how the keyword works' 173 no
+  # The keyword class is a SUFFIX of ordinary words: prose that closes nothing
+  # must not manufacture a hazard.
+  expect_hazard $'Closes #173\nthe prefix #99 discloses #98' 173 no
+  expect_ref '`Closes #173`' "$GH_REPO#173"
+  # A FENCE IS NOT MODELLED — everything but inline code is treated as LIVE, so a
+  # fenced close-word is REPORTED rather than stripped. Refusing a doc-only body
+  # is the visible, one-edit-remedy error; modelling fences wrongly HID a live
+  # closure in three dimensions (indentation, an info string with a backtick, a
+  # fence line inside an HTML comment), each one a fail-open. Pinned as contract.
+  expect_hazard $'Closes #173\n\n```text\nFixes #999\n```' 173 yes
+  # N3 (verifier, this PR) — CommonMark forbids a backtick in a backtick fence's
+  # info string, so ```Closes #173``` is a PARAGRAPH rendering as a code span:
+  # inert, hence H2 — never a fence opener that hides what follows it.
+  expect_hazard '```Closes #173```' 173 yes
+  # ...and the mirror image stripping got wrong: a live closure AFTER such a line
+  # is live too.
+  expect_hazard $'Closes #173\n\n```Closes #999```\nCloses #174' 173 yes
+  # N4 (verifier, this PR) — a fence-looking line inside an HTML comment is never
+  # a fence, so the closure after the comment is live.
+  expect_hazard $'Closes #173\n\n<!--\n```\n-->\nCloses #174' 173 yes
+  # P1 (verifier, this PR) — H2 must see every reference FORM parse_issue_ref
+  # accepts, not just bare #N: a backticked URL is just as disarmed.
+  expect_hazard '`Closes https://github.com/daniel-ospina/agent-infra/issues/173`' 173 yes
   # #1012 r3 — the prefix + checkbox groups are REPEATABLE, so a COMPOUND
   # line-leading prefix (nested blockquote; list inside a quote) is a reference
   # context too. A single-consumption group false-BLOCKED check (a) on these
