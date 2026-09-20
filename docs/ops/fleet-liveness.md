@@ -231,7 +231,7 @@ not a stall.
 | `off-fence` | a live process whose recorded start could not be matched |
 | `incarnation-unmatched` | no fenced holder and at least one candidate abstained (not all abstainers `off-fence`) |
 | `turn-state-unknown` | the transcript tail could not be read as a turn boundary |
-| `turn-unknown:<stopReason>` | the last assistant message's `stopReason` is outside `TERMINAL_STOP_REASONS` — unrecognized is not terminal (#1272) |
+| `turn-unknown:<stopReason>` | on a message carrying **no** tool calls, the last assistant message's `stopReason` is outside `TERMINAL_STOP_REASONS` — unrecognized is not terminal (#1272) |
 | `tail-after-compaction` | a compaction entry is the last entry (see below) |
 
 **A trailing compaction tail abstains rather than asserting `wedged`.** pi writes a

@@ -25,10 +25,11 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 is asserted inside CLEAN, paired with its own RED control.
     COMPACTION    a lane whose last transcript entry is a `compaction` abstains
                 (`unknown`/`tail-after-compaction`), never a decided turn (#1254 P1)
-    MD-ESCAPE   a transcript-derived value (`turn-unknown:<stopReason>` in the
-                `reason` cell, and tool names/call ids in `detail`) cannot add a
-                table column, close the code span, or start a line that renders
-                as a heading — the report body is ALSO a filed issue body (#1272)
+    MD-ESCAPE   a transcript-derived value (the `reason` cell's
+                `turn-unknown:<stopReason>`, and the `detail`/evidence cell's
+                tool name and call id) cannot add a table column, close the code
+                span, open a link, or start a line that renders as a heading —
+                the report body is ALSO a filed issue body (#1272)
 
 RED CONTROL (the part fleet-cost-weekly.test.sh has no equivalent of) — a green
 suite is only a pin if it can FAIL. Nine mutations, each run against the leg
@@ -617,36 +618,50 @@ def leg_compaction(module=None):
 
 
 def leg_md_escape(module=None):
-    print("── MD-ESCAPE — a transcript value cannot forge a row or a heading (#1272) ──")
-    fx = Fixture([turn_done_lane()], ps_rows=[ps_row(PID_TURN_DONE)])
+    print("── MD-ESCAPE — a transcript value cannot forge a row, a link or a heading (#1272) ──")
+    fx = Fixture([turn_done_lane(), turn_open_lane()],
+                 ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN)])
     try:
-        # The last message's `stopReason` is read from the session JSONL and flows
-        # into the verdict `reason` (`turn-unknown:<value>`). The report body is
-        # ALSO the body of a filed escalation issue, so a `|` must not add a
-        # column, a backtick must not close the code span, and a newline must not
-        # start a line that renders as a heading.
+        # Two transcript-derived fields reach the report body, which is ALSO the
+        # body of a filed escalation issue: the `reason` (here
+        # `turn-unknown:<stopReason>`) and the `detail`/evidence (the open turn's
+        # tool name and call id). Neither may add a table column, close the code
+        # span, open a link, or start a line that renders as a heading.
         hostile = "a|b`c\r\n### forged — escalated"
         write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
                          [msg_entry("assistant", stopReason=hostile,
                                     content=[{"type": "text", "text": "x"}])])
+        write_transcript(fx, SID_TURN_OPEN, "/tmp/turn-open",
+                         [msg_entry("assistant", stopReason="toolUse",
+                                    content=[{"type": "toolCall", "name": "evil|x`y",
+                                              "id": "call_00_\r\n### forged-detail"}])])
         rc, out, gh = run_report(fx, module=module)
-        assert_eq(rc, 0, "an unknown lane decides nothing (exit 0, no escalation)")
-        rows = [l for l in out.splitlines() if l.startswith("| turn-done ")]
-        assert_eq(len(rows), 1, "the hostile value yields exactly ONE table row")
-        if rows:
+        assert_eq(rc, 0, "an unknown lane and a live-holder wedge both decide nothing (exit 0)")
+        for label, needle, what in (
+                ("turn-done", "turn-unknown:a\\|b'c", "the reason cell (stopReason)"),
+                ("turn-open", "evil\\|x'y", "the evidence cell (tool name)")):
+            rows = [l for l in out.splitlines() if l.startswith("| `%s` " % label)]
+            assert_eq(len(rows), 1, "%s: the hostile value yields exactly ONE table row" % label)
+            if not rows:
+                bad("%s: the lane's table row is missing" % label)
+                continue
             # Split on UNESCAPED pipes: a well-formed six-cell row yields 8 parts.
             assert_eq(len(re.split(r"(?<!\\)\|", rows[0])), 8,
-                      "the escaped pipe keeps the row at six cells")
-            assert_contains(rows[0], "turn-unknown:a\\|b'c",
-                            "the hostile value is escaped into the reason cell")
-        else:
-            bad("the lane's table row is missing")
+                      "%s: the escaped pipe keeps the row at six cells" % label)
+            assert_contains(rows[0], needle, "%s: %s is escaped" % (label, what))
         assert_eq(any(l.startswith("### forged") for l in out.splitlines()), False,
                   "a transcript value cannot START a line (which is what renders as a heading)")
+        for label in ("turn-done", "turn-open"):
+            row = [l for l in out.splitlines() if l.startswith("| `%s` " % label)]
+            if row and row[0].count("`") != 10:
+                bad("%s: the cells must stay inside their code spans (got %d backticks)"
+                    % (label, row[0].count("`")))
+            else:
+                ok("%s: the cells stay inside their code spans" % label)
         if gh:
-            bad("an unknown lane must not escalate: %s" % gh)
+            bad("neither an unknown lane nor a live-holder wedge may escalate: %s" % gh)
         else:
-            ok("no issue filed (unknown is not escalatable)")
+            ok("no issue filed (neither state is escalatable)")
     finally:
         fx.close()
 
@@ -739,10 +754,12 @@ MUTATIONS = [
     ),
     Mutation(
         "drop-md-cell-escape",
-        '    out = str(text).replace("|", "\\\\|").replace("`", "\'")\n',
-        '    out = str(text)\n',
+        '    out = out.replace("|", "\\\\|")\n'
+        '    out = out.replace("`", "\'")\n'
+        '    return "".join(ch if ch.isprintable() else " " for ch in out)\n',
+        '    return out\n',
         leg_md_escape, 1,
-        "a transcript-derived value is interpolated unescaped, so a `|`/backtick/newline can forge the table or a heading (#1272)",
+        "a transcript-derived value is interpolated unescaped, so a `|`/backtick/newline can forge the table, the code span or a heading (#1272)",
         target="report",
     ),
 ]

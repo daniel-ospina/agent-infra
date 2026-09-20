@@ -37,9 +37,10 @@ OPEN turn, read from the transcript's last message-bearing entry:
 * a user prompt with no assistant reply after it.
 
 A transcript whose last turn ended with a TERMINAL ``stopReason`` (``stop``, or
-``length`` / ``error`` / ``aborted`` on a message carrying NO tool calls) is
-RESTING: however long it has been quiet short of the retirement proof it reads
-``running-quiet``, never ``wedged``; the ``reason`` field names which path
+``length`` on a message carrying NO tool calls, or ``error`` / ``aborted`` with or
+without calls) is RESTING: however long it has been quiet short of the retirement
+proof it reads ``running-quiet``, never ``wedged``; the ``reason`` field names
+which path
 returned that state. Terminality is an EXPLICIT set
 (``TERMINAL_STOP_REASONS``), never a fall-through: on a CALL-FREE message a
 ``stopReason`` outside it — including one pi has not emitted yet — ABSTAINS with
@@ -767,11 +768,13 @@ def turn_from_entry(entry) -> Turn:
       turn. An assistant message CARRYING tool calls is open unless its
       ``stopReason`` is in ``CALL_DISCARDING_STOP_REASONS``: on ``length`` pi
       FAILS those calls and CONTINUES the turn, so ``length`` + calls awaits
-      the turn's next step rather than resting. This rule is decided FIRST, so
-      a call-carrying message is OPEN whatever set the reason belongs to.
+      the turn's next step rather than resting. This rule is decided FIRST, so a
+      call-carrying message whose reason is NOT one that discards calls is OPEN
+      whatever set that reason belongs to.
     * ENDED (``stalled=False``, ``abstain=False``, reason ``turn-ended``) — a
       ``stopReason`` in ``TERMINAL_STOP_REASONS`` on a message carrying no tool
-      calls.
+      calls, **or** ``error`` / ``aborted`` (which discard their calls) on a
+      message carrying calls.
     * UNKNOWN (``stalled=False``, ``abstain=True``, reason
       ``turn-unknown:<stopReason>``) — on a message carrying NO tool calls, a
       ``stopReason`` outside ``TERMINAL_STOP_REASONS``. Unrecognized is NOT
