@@ -40,7 +40,10 @@ A transcript whose last turn ended with a TERMINAL ``stopReason`` (``stop``, or
 ``length`` / ``error`` / ``aborted`` on a message carrying NO tool calls) is
 RESTING: however long it has been quiet short of the retirement proof it reads
 ``running-quiet``, never ``wedged``; the ``reason`` field names which path
-returned that state. ``turn-state-unknown`` (a tail
+returned that state. Terminality is an EXPLICIT set
+(``TERMINAL_STOP_REASONS``), never a fall-through: a ``stopReason`` outside it —
+including one pi has not emitted yet — ABSTAINS with ``turn-unknown:<value>``
+rather than asserting the lane is resting (#1272). ``turn-state-unknown`` (a tail
 that cannot be read as a turn boundary) and ``tail-after-compaction`` (a summary
 line pi writes *between* turns) are ABSTENTIONS — absence of evidence is not a
 stall. Reasons this rule introduces, none of them escalating:
@@ -51,6 +54,7 @@ stall. Reasons this rule introduces, none of them escalating:
     turn-open:awaiting-assistant     a toolResult with no assistant reply
     turn-open:awaiting-response      a user prompt with no assistant reply
     turn-open:no-terminal-stop       the last assistant message has no stopReason
+    turn-unknown:<stopReason>        an UNRECOGNIZED stopReason; an abstention
     tail-after-compaction            a compaction entry is the last entry
     turn-state-unknown               the tail could not be read as a turn
 
@@ -134,6 +138,7 @@ __all__ = [
     "Evidence",
     "Verdict",
     "CALL_DISCARDING_STOP_REASONS",
+    "TERMINAL_STOP_REASONS",
     "tool_stall_ms",
     "cpu_attributable",
     "tool_veto_expired",
@@ -183,6 +188,26 @@ NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})
 # still-running turn read `turn-ended` — the #1254 fail-open shape, aimed at
 # the classifier itself.
 CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted"})
+# #1272: the stop reasons on a CALL-FREE message under which pi ENDS the turn.
+# `stop` and `length` end a completed turn; `error` and `aborted` END THE AGENT
+# RUN outright — pi's loop returns before any tool batch
+# (`pi-agent-core/dist/agent-loop.js:124-128`), so all four are terminal with or
+# without calls (the call-carrying rule above already covers `length`+calls and
+# `error`/`aborted`+calls). The set is EXPLICIT so that `turn-ended` is a
+# DECISION, never the fall-through for every stop reason the code has never
+# seen: `turn-ended` is RESTING — unescalatable and never `wedged` — so a
+# default that lands there inverts the module's own principle (`wedged` needs
+# POSITIVE evidence of an open turn) and reads a genuinely suspended lane as
+# merely quiet. A reason outside this set ABSTAINS (`turn-unknown:<value>`).
+# Measured over 7,820 transcripts / 384,657 assistant messages: the only
+# stopReason values that occur are exactly these four and `toolUse`, so the
+# abstention is LATENT today (0 cases) — what is fixed is the DEFAULT's
+# direction, not a live misclassification. The values pi's contract also names —
+# `pending` (pi-ai's in-flight placeholder) and `deferred` (the harness runtime
+# settles it as `deferred.suspended`) — are deliberately NOT terminal: pi has
+# neither ended the turn nor closed the run, so the classifier must not claim it
+# is resting (#1272).
+TERMINAL_STOP_REASONS = frozenset({"stop", "length", "error", "aborted"})
 # The message roles that carry a turn boundary; every other entry type
 # (compaction / model_change / thinking_level_change / session / custom) is
 # skipped when scanning back for the last boundary.
@@ -737,7 +762,13 @@ def turn_from_entry(entry) -> Turn:
       FAILS those calls and CONTINUES the turn, so ``length`` + calls awaits
       the turn's next step rather than resting.
     * ENDED (``stalled=False``, ``abstain=False``, reason ``turn-ended``) — a
-      terminal ``stopReason`` on a message carrying no tool calls.
+      ``stopReason`` in ``TERMINAL_STOP_REASONS`` on a message carrying no tool
+      calls.
+    * UNKNOWN (``stalled=False``, ``abstain=True``, reason
+      ``turn-unknown:<stopReason>``) — a ``stopReason`` outside
+      ``TERMINAL_STOP_REASONS``. Unrecognized is NOT terminal: the classifier
+      abstains rather than asserting the lane is resting, which is the only
+      fail-closed reading of a value it cannot classify (#1272).
     * NO BOUNDARY (``abstain=True``) — a ``compaction`` entry. pi writes it
       BETWEEN turns, so it decides neither disposition (see ``turn_from_jsonl``
       for the measurement).
@@ -768,7 +799,12 @@ def turn_from_entry(entry) -> Turn:
         if not stop:
             return Turn(True, "turn-open:no-terminal-stop",
                         "last assistant message carries no stopReason")
-        return Turn(False, "turn-ended", "terminal stopReason=%s" % stop)
+        if stop in TERMINAL_STOP_REASONS:
+            return Turn(False, "turn-ended", "terminal stopReason=%s" % stop)
+        # #1272: the DEFAULT is the abstention, never `turn-ended`. A stop reason
+        # this classifier has not seen carries no evidence the turn ended, and
+        # `turn-ended` means RESTING — the fail-open direction the module forbids.
+        return Turn(False, "turn-unknown:%s" % stop, abstain=True)
     if role == "toolResult":
         name = str(msg.get("toolName") or "")
         cid = str(msg.get("toolCallId") or "")

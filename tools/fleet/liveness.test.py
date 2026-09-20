@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Nineteen tests with twenty-three paired mutations: every mutation re-
+Twenty tests with twenty-four paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven of the nineteen (#1254) pin the TURN-BOUNDARY rule:
+evidence mechanical. Seven of the twenty (#1254) pin the TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
 is OPEN unless its stop reason discards them (on ``length`` pi fails those calls
 and continues the turn, so it is OPEN), and a ``compaction`` as the last entry
-abstains rather than letting the turn before it decide.
+abstains rather than letting the turn before it decide. T20 (#1272) closes the
+other direction: `turn-ended` is an EXPLICIT terminal set, and a stopReason
+outside it abstains (`turn-unknown:<value>`) instead of defaulting to resting.
 
-    python3 tools/fleet/liveness.test.py                # the 19 tests, green
+    python3 tools/fleet/liveness.test.py                # the 20 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
@@ -816,6 +818,73 @@ def t19_compaction_tail_abstains():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# T20 — the classifier's default is FAIL-CLOSED (#1272). `turn-ended` is an
+# explicit terminal SET, not the fall-through for every stop reason the code has
+# never seen. `turn-ended` means RESTING — unescalatable and never `wedged` — so
+# a default that lands there reads a genuinely suspended lane as merely quiet,
+# the fail-open shape the module's own principle forbids.
+#
+# Terminality (`TERMINAL_STOP_REASONS`): `stop` and `length` end a completed
+# turn; `error` and `aborted` END THE AGENT RUN outright — pi's loop returns
+# before any tool batch (`pi-agent-core/dist/agent-loop.js:124-128`) — so all
+# four are terminal on a call-free message. Everything else ABSTAINS, naming the
+# value.
+#
+# Reachability: measured over 7,820 transcripts / 384,657 assistant messages in
+# ~/.pi/agent/sessions and ~/.pi/agent/task-sessions, the only stopReason values
+# that occur are exactly `stop` / `toolUse` / `error` / `length` / `aborted`, so
+# the abstention is LATENT today (0 cases). What this pins is the DEFAULT's
+# direction, not a live misclassification; `pending` (pi-ai's in-flight
+# placeholder) and `deferred` (settled by pi's harness runtime as
+# `deferred.suspended`) are values pi's contract names but the corpus does not
+# yet produce, and both are deliberately NOT terminal.
+# ══════════════════════════════════════════════════════════════════════════
+@test("T20 an unrecognized stopReason ABSTAINS (turn-unknown:<value>), never turn-ended (#1272)")
+def t20_unrecognized_stop_reason_abstains():
+    # (a) The four KNOWN terminal values still end the turn on a call-free
+    #     message — the fix changes the default, not the decisions.
+    for stop in ("stop", "length", "error", "aborted"):
+        t = liv.turn_from_entry(entry("assistant", stopReason=stop,
+                                      content=[{"type": "text", "text": "…"}]))
+        check(t.stalled is False and t.reason == "turn-ended" and t.abstain is False,
+              "`%s` with no calls still ends the turn; got %s" % (stop, t))
+
+    # (b) An unrecognized, non-terminal value with no calls is NOT `turn-ended`:
+    #     it abstains, names the value, and the ladder returns `unknown`.
+    for stop in ("deferred", "deferred.suspended", "pending", "quotaExceeded"):
+        t2 = liv.turn_from_entry(entry("assistant", stopReason=stop,
+                                       content=[{"type": "text", "text": "…"}]))
+        check(t2.stalled is False,
+              "an unrecognized stop reason is not POSITIVELY open; got %s" % t2)
+        check(t2.abstain is True,
+              "an unrecognized stop reason must ABSTAIN, never read as resting; got %s" % t2)
+        check(t2.reason == "turn-unknown:%s" % stop,
+              "the abstention names the unrecognized value; got %s" % t2.reason)
+        v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=t2))
+        check(v.state == "unknown" and v.reason == "turn-unknown:%s" % stop,
+              "`%s` frozen past S is unknown, never resting and never wedged; got %s/%s"
+              % (stop, v.state, v.reason))
+
+    # (c) The non-terminal set is untouched: `toolUse` with no parseable call is
+    #     still an open turn, and a missing stopReason still reads open.
+    t3 = liv.turn_from_entry(entry("assistant", stopReason="toolUse",
+                                   content=[{"type": "text", "text": "…"}]))
+    check(t3.stalled is True and t3.reason == "turn-open:pending-tool-call",
+          "`toolUse` with no parseable call is still open; got %s" % t3)
+    t4 = liv.turn_from_entry(entry("assistant", content=[{"type": "text", "text": "…"}]))
+    check(t4.stalled is True and t4.reason == "turn-open:no-terminal-stop",
+          "a missing stopReason is still open; got %s" % t4)
+
+    # (d) The terminal set is a DECISION, not a fall-through: it must not be
+    #     empty (then nothing reads resting) and must contain the four measured
+    #     terminal values.
+    check(liv.TERMINAL_STOP_REASONS == frozenset({"stop", "length", "error", "aborted"}),
+          "the terminal set is explicit; got %s" % (liv.TERMINAL_STOP_REASONS,))
+    check(liv.NON_TERMINAL_STOP_REASONS == frozenset({"toolUse"}),
+          "the non-terminal set is unchanged; got %s" % (liv.NON_TERMINAL_STOP_REASONS,))
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # The mutation map: each entry reintroduces the defect its test catches.
 # ══════════════════════════════════════════════════════════════════════════
 class Mutation:
@@ -991,6 +1060,12 @@ MUTATIONS = [
         '        for raw in reversed(lines):',
         '        for raw in lines:',
         "the tail scan runs forward, so an ancient boundary decides instead of the last (#1254)",
+    ),
+    Mutation(
+        "T20", "module",
+        '        return Turn(False, "turn-unknown:%s" % stop, abstain=True)\n',
+        '        return Turn(False, "turn-ended", "terminal stopReason=%s" % stop)\n',
+        "the pre-fix fall-through returns: an unrecognized stop reason reads RESTING (fail-open, #1272)",
     ),
 ]
 

@@ -234,7 +234,7 @@ jobs:
         run: python3.12 tools/fleet/liveness.test.py
       - name: Fleet liveness mutation evidence (#1178, zero-dep)
         # The suite above is only a pin if it can FAIL. `--mutations`
-        # reintroduces each of the 23 defects into a TEMP copy of the module (or
+        # reintroduces each of the 24 defects into a TEMP copy of the module (or
         # of the identity library) and re-runs the paired test against it in a
         # subprocess — a mutation whose paired test still passes is reported as
         # a suite failure. Its own step, not a second command in the step above:
