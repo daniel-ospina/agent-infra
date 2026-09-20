@@ -9,9 +9,9 @@ evidence mechanical. Seven of the nineteen (#1254) pin the TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
-is OPEN unless its stop reason discards them (``length`` executes them, so it is
-OPEN), and a ``compaction`` as the last entry abstains rather than letting the
-turn before it decide.
+is OPEN unless its stop reason discards them (on ``length`` pi fails those calls
+and continues the turn, so it is OPEN), and a ``compaction`` as the last entry
+abstains rather than letting the turn before it decide.
 
     python3 tools/fleet/liveness.test.py                # the 19 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
@@ -434,6 +434,11 @@ def t10_record_veto_bound():
     v2 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=30 * M, record=fresh))
     check(v2.state == "running-quiet",
           "a FRESH non-idle record vetoes wedged; got %s/%s" % (v2.state, v2.reason))
+    # #1273: the veto's reason is named in the corrected prose (how a
+    # turn-ended lane reaches running-quiet), so it is pinned here rather than
+    # asserted in prose alone.
+    check(v2.reason == "record-non-idle-fresh",
+          "the veto names its own reason; got %s" % v2.reason)
 
     v3 = liv.evaluate(ev(candidates=[C(1, "absent")], jsonl_grew=False, jsonl_age_ms=H, record=fresh))
     check(v3.state == "dead",
@@ -702,16 +707,19 @@ def t17_unknown_turn_and_bounds():
 
 # ══════════════════════════════════════════════════════════════════════════
 # T18 — the cycle-1 P0 (#1254). A message CARRYING tool calls is OPEN unless its
-# stop reason is one under which pi DISCARDS the calls. pi SUSPENDS on `length`
-# to execute them, so a `length` message with unanswered calls is an open turn,
-# not a resting one. Measured over the 426 live session files in
-# ~/.pi/agent/sessions: toolUse 147,466 with calls / 147,431 answered; error 115
-# with calls / 0 answered; length 78 with calls / 78 answered (EXECUTED);
-# aborted 16 with calls / 0 answered.
+# stop reason is one under which pi DISCARDS the calls. On `length` pi FAILS the
+# calls and CONTINUES the turn, so a `length` message with calls leaves the turn
+# open, not resting. Measured over the 426 live session files in
+# ~/.pi/agent/sessions: toolUse 147,466 with calls / 147,431 with a following
+# result; error 115 with calls / 0 with a result; length 78 with calls / 78 with
+# a result — EVERY one of those 78 results is `isError: true` ("Tool call ... was
+# not executed"), i.e. the calls were FAILED, not executed; aborted 16 with calls
+# / 0 with a result.
 # ══════════════════════════════════════════════════════════════════════════
 @test("T18 tool calls decide openness: `length`+calls OPEN, `error`/`aborted`+calls ENDED (#1254 P0)")
 def t18_call_carrying_stop_reasons():
-    # (a) `length` with calls is EXECUTED by pi (78/78) -> OPEN.
+    # (a) `length` with calls leaves the turn OPEN — pi fails those calls
+    #     (`failToolCallsFromTruncatedMessage`; all 78 results carry isError).
     t = liv.turn_from_entry(entry("assistant", stopReason="length",
                                   content=[{"type": "toolCall", "name": "bash",
                                             "id": "call_00_LEN"}]))
@@ -913,7 +921,7 @@ MUTATIONS = [
         "T18", "module",
         'CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted"})',
         'CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted", "length"})',
-        "the cycle-1 P0: `length`+calls is treated as discarding, so an executing turn reads ended",
+        "the cycle-1 P0: `length`+calls is treated as discarding, so a still-running turn reads ended",
     ),
     Mutation(
         "T18", "module",

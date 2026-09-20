@@ -28,9 +28,10 @@ to lately", not "stuck". ``wedged`` therefore requires POSITIVE evidence of an
 OPEN turn, read from the transcript's last message-bearing entry:
 
 * an assistant message CARRYING tool calls whose ``stopReason`` is not one
-  under which pi discards them (``error`` / ``aborted``) — pi **suspends** on
-  ``length`` to execute the calls, so a ``length`` message with calls is still
-  awaiting their results;
+  under which pi discards them (``error`` / ``aborted``) — on ``length`` pi
+  **fails** the truncated message's calls (``failToolCallsFromTruncatedMessage``,
+  pi-agent-core ``dist/agent-loop.js``) and then CONTINUES the turn, so a
+  ``length`` message with calls is still awaiting the turn's next step;
 * an assistant message whose ``stopReason`` is ``toolUse``;
 * a ``toolResult`` with no assistant reply after it;
 * a user prompt with no assistant reply after it.
@@ -38,7 +39,8 @@ OPEN turn, read from the transcript's last message-bearing entry:
 A transcript whose last turn ended with a TERMINAL ``stopReason`` (``stop``, or
 ``length`` / ``error`` / ``aborted`` on a message carrying NO tool calls) is
 RESTING: however long it has been quiet short of the retirement proof it reads
-``running-quiet (turn-ended)``, never ``wedged``. ``turn-state-unknown`` (a tail
+``running-quiet``, never ``wedged``; the ``reason`` field names which path
+returned that state. ``turn-state-unknown`` (a tail
 that cannot be read as a turn boundary) and ``tail-after-compaction`` (a summary
 line pi writes *between* turns) are ABSTENTIONS — absence of evidence is not a
 stall. Reasons this rule introduces, none of them escalating:
@@ -166,14 +168,20 @@ NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})
 # is one under which pi DISCARDS those calls. Measured over the 426 live session
 # files in `~/.pi/agent/sessions` — assistant messages carrying toolCalls, and
 # whether a matching toolResult follows:
-#     stopReason  withToolCalls  answeredNext  unanswered
-#     toolUse        147,466       147,431        35
-#     error              115             0       115   <- calls discarded
-#     length              78            78         0   <- calls EXECUTED, so OPEN
-#     aborted             16             0        16   <- calls discarded
-# pi SUSPENDS on `length` to execute the calls, so `length` is NOT terminal
-# here. Reading a message by its stopReason alone made an executing turn read
-# `turn-ended` — the #1254 fail-open shape, aimed at the classifier itself.
+#     stopReason  withToolCalls  resultFollows  unanswered
+#     toolUse        147,466       147,431         35
+#     error              115             0        115   <- calls discarded
+#     length              78            78          0   <- calls FAILED, so OPEN
+#     aborted             16             0         16   <- calls discarded
+# `resultFollows` is NOT `executed`: on `length` pi FAILS the truncated
+# message's calls (`failToolCallsFromTruncatedMessage`, pi-agent-core
+# `dist/agent-loop.js:136-138`) — all 78 results after a `length`+calls message
+# carry `isError: true` ("Tool call ... was not executed") — and the loop
+# CONTINUES the turn. `length` is NOT terminal here. The earlier 78/78 count
+# measured that a RESULT was written, not that the call RAN; a count of results
+# is not evidence of work. Reading a message by its stopReason alone made a
+# still-running turn read `turn-ended` — the #1254 fail-open shape, aimed at
+# the classifier itself.
 CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted"})
 # The message roles that carry a turn boundary; every other entry type
 # (compaction / model_change / thinking_level_change / session / custom) is
@@ -725,9 +733,9 @@ def turn_from_entry(entry) -> Turn:
 
     * OPEN (``stalled=True``) — a shape that POSITIVELY shows an unfinished
       turn. An assistant message CARRYING tool calls is open unless its
-      ``stopReason`` is in ``CALL_DISCARDING_STOP_REASONS``: pi suspends on
-      ``length`` to execute the calls, so ``length`` + calls awaits their
-      results rather than resting.
+      ``stopReason`` is in ``CALL_DISCARDING_STOP_REASONS``: on ``length`` pi
+      FAILS those calls and CONTINUES the turn, so ``length`` + calls awaits
+      the turn's next step rather than resting.
     * ENDED (``stalled=False``, ``abstain=False``, reason ``turn-ended``) — a
       terminal ``stopReason`` on a message carrying no tool calls.
     * NO BOUNDARY (``abstain=True``) — a ``compaction`` entry. pi writes it
