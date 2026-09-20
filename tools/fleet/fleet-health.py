@@ -10,13 +10,18 @@ previous run of this script (state kept in fleet-health-prev.json). CPU time onl
 while the process does work, so a live pid with ~0 delta AND a stale transcript is a wedge.
 
 A pid is **dead only under the fleet's ONE process-identity rule** (#1178). `_alive()` used
-to be a bare `os.kill(pid, 0)` — no start-time fence, no zombie exclusion — so a pid that
-was ALIVE but no longer the process that owned the session (pid reuse) read `PID DEAD`. The
-read now goes through `scripts/lib/pid-identity.sh`, the same library the kill-path reaper
-sources and the liveness classifier shells out to. An **unresolvable read ABSTAINS**
-(`PID ? (...)`) instead of reporting a death it cannot witness.
+to be a bare `os.kill(pid, 0)` — no start-time fence, no zombie exclusion — which was wrong
+in BOTH directions, and the directions were MEASURED, not assumed. A pid that a replacement
+process had reused, and a ZOMBIE (on which `kill(pid, 0)` also succeeds), read as a LIVING
+lane — an empty flag, a FAIL-OPEN that reported a dead lane healthy by silence. The opposite
+false `PID DEAD` came from `os.kill` raising for a process that IS alive (`EPERM` on a
+foreign-user pid) and from a failed `ps` read. The read now goes through
+`scripts/lib/pid-identity.sh`, the same library the kill-path reaper sources and the liveness
+classifier shells out to. An **unresolvable read ABSTAINS** (`PID ? (...)`) instead of
+reporting a death it cannot witness — and an abstention never SUPPRESSES the quiet/CPU
+suspect ladder, so an unreadable identity can never turn a stale lane into "no suspects".
 """
-import json, os, re, subprocess, sys, time, glob
+import json, os, subprocess, sys, time, glob
 
 # ── the fleet's ONE process-identity rule (#1178) ────────────────────────
 # This module does NOT decide liveness. A Python file cannot source a Bash library, so the
@@ -91,17 +96,30 @@ def walk_records(obj, out):
 
 
 def load_hook():
+    """Read the cmux hook store. Returns (ok, sid-keyed records).
+
+    `ok` is False when the store could not be read, or when records WERE found but none
+    carried a session id — a store-shape drift. Either way the lane lookup is unusable,
+    so the caller reports the scan INCOMPLETE instead of a clean result: a read that did
+    not happen must abstain here exactly as the identity probe does (the same fail-closed
+    direction as `PID ? (...)`), or a dead lane is reported healthy by silence.
+    """
     recs = []
+    ok = True
     try:
         walk_records(json.load(open(HOOK)), recs)
     except Exception as e:
         print(f"  (hook file unreadable: {e})")
+        ok = False
     by_sid = {}
     for r in recs:
         sid = r.get("sessionId") or r.get("session_id")
         if sid:
             by_sid.setdefault(sid, {}).update(r)
-    return by_sid
+    if recs and not by_sid:
+        print("  (hook store shape drifted: records carry no session id)")
+        ok = False
+    return ok, by_sid
 
 
 def cputime_secs(pid):
@@ -138,7 +156,7 @@ def main():
             prev = json.load(open(STATE))
         except Exception:
             prev = {}
-    hook = load_hook()
+    hook_ok, hook = load_hook()
     snap = {}
     suspects = []
 
@@ -164,21 +182,28 @@ def main():
             delta_txt = "(first)"
 
         flag = ""
+        quiet = ""
         observed = _observed(pid, rec.get("pidStartSeconds")) if pid else None
         if observed in DEAD_OBSERVED:
+            # A positively absent/zombie incarnation: the process is gone, so the
+            # transcript ladder has nothing left to add.
             flag = "PID DEAD"
-        elif observed is not None and observed != HOLDER_OBSERVED:
-            # An unresolvable read ABSTAINS (#1178 C1/C3): the pid is present but its
-            # incarnation could not be matched, or the read failed. Never `PID DEAD`.
-            flag = "PID ? (%s)" % observed
-        elif age is not None and age > SUSPECT_AGE:
-            if delta is None:
-                flag = f"** CHECK: quiet {age:.0f}s, no CPU delta yet **"
-            elif delta < 0.5:
-                flag = f"** SUSPECT: quiet {age:.0f}s AND no CPU consumed **"
-            else:
-                flag = f"quiet {age:.0f}s, CPU +{delta:.1f}s -> working"
-        if flag.startswith("**"):
+        else:
+            # An ABSTENTION is NOT a clean bill of health. Name it, and STILL run the
+            # quiet/CPU ladder — an unresolvable identity read must never SUPPRESS the
+            # suspect signal, or a stale lane reads as "no suspects" precisely when the
+            # identity subsystem (or the whole store) is unavailable.
+            if observed is not None and observed != HOLDER_OBSERVED:
+                flag = "PID ? (%s)" % observed
+            if age is not None and age > SUSPECT_AGE:
+                if delta is None:
+                    quiet = f"** CHECK: quiet {age:.0f}s, no CPU delta yet **"
+                elif delta < 0.5:
+                    quiet = f"** SUSPECT: quiet {age:.0f}s AND no CPU consumed **"
+                else:
+                    quiet = f"quiet {age:.0f}s, CPU +{delta:.1f}s -> working"
+                flag = f"{flag} | {quiet}" if flag else quiet
+        if quiet.startswith("**"):
             suspects.append((lane, flag))
 
         age_txt = f"{age:.0f}s" if age is not None else "-"
@@ -210,6 +235,11 @@ def main():
                    for r in hook.values() if r.get("pid")}, fh)
 
     print()
+    if not hook_ok:
+        # The lane lookup was unusable, so NOTHING above is a verdict. Saying "no suspects"
+        # here is the false-PASS this branch exists to forbid, hence the non-zero exit.
+        print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (no lane was assessed)")
+        return 1
     if suspects:
         print(f"⚠️  {len(suspects)} suspect(s) — confirm with cmux read-screen before acting:")
         for name, why in suspects:

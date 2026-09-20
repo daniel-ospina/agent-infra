@@ -246,14 +246,18 @@ check_fleet_tools_farmed() {
 #   * the dead witness still FIRES — an absent pid, and a ZOMBIE. A zombie is the
 #     crisp pre-fix failure: `os.kill(zombie, 0)` SUCCEEDS, so the bare existence
 #     check read a defunct process as a live lane (no flag at all).
-#   * an unresolvable read ABSTAINS as `PID ? (...)`, never `PID DEAD` — including
+#   * an unresolvable read ABSTAINS as `PID ? (...)`, never `PID DEAD` — for pid
+#     REUSE (off-fence), for a broken `ps`, for an unusable recorded start, and
 #     when the canonical library is ABSENT. That last leg is the NEGATIVE control:
 #     a "promotion" that fell back to a bare existence check prints `PID DEAD`
 #     with no library on disk, and this test fails.
+#   * an ABSTENTION must not SUPPRESS the quiet/CPU suspect ladder (#1178 A-class):
+#     a stale lane whose identity could not be read is still a SUSPECT, never a
+#     clean `✅ no suspects`.
 #
-# The positive legs run WITHOUT PI_PID_IDENTITY_LIB on purpose, so a green pin
-# also proves the tools/fleet/ <-> scripts/lib/ RELATIVE layout survived the farm:
-# move the farmed library and they degrade to `PID ? (unreadable)`.
+# The positive legs are HERMETIC about the environment (see `run_promotion`), so a
+# green pin also proves the tools/fleet/ <-> scripts/lib/ RELATIVE layout survived
+# the farm: move the farmed library and they degrade to `PID ? (unreadable)`.
 check_fleet_health_promotion() {
   local label="$1"
   local tool="$DEST/tools/fleet/fleet-health.py"
@@ -261,10 +265,13 @@ check_fleet_health_promotion() {
   local phome="$TMP/prom-home"
   local sid="01a08ca6-3539-71ed-a0d7-7cee52feee03"   # lane B1 (the LANES hardcode)
   local store="$phome/.cmuxterm/pi-hook-sessions.json"
-  local zpid_file="$TMP/zombie.pid" zparent="" zpid="" out
+  local zpid_file="$TMP/zombie.pid" zparent="" zpid="" zstat="" out
 
   [ -f "$tool" ] || { fail "$label: farmed fleet-health.py missing — the promotion is unpinnable"; return; }
   [ -f "$lib" ]  || { fail "$label: farmed lib/pid-identity.sh missing — the promotion cannot load the rule"; return; }
+  # fleet-health.py writes its CPU-delta cache to ~/.pi/agent/state/fleet-health-prev.json
+  # and RAISES FileNotFoundError when that directory is absent (it does not create it).
+  # A fresh HOME has no state/, so create the three directories the tool reads/writes.
   mkdir -p "$phome/.cmuxterm" "$phome/.pi/agent/state" "$phome/.pi/agent/sessions"
   rm -f "$zpid_file"
 
@@ -282,20 +289,32 @@ time.sleep(60)' "$zpid_file" &
     [ -s "$zpid_file" ] && { zpid="$(cat "$zpid_file")"; break; }
     sleep 0.2
   done
+  # Pin the fixture's IDENTITY, not just its pid: a zombie that gets reaped before the
+  # assertion degrades to plain `absent`, and the leg below would then pass for the wrong
+  # reason (`PID DEAD` from absence, not from the zombie rule).
+  [ -n "$zpid" ] && zstat="$(ps -o stat= -p "$zpid" 2>/dev/null | tr -d ' ')"
 
-  # Fixture store, one lane record. pidStartSeconds is deliberately far from a
-  # real start: it is only ever reached AFTER a presence check, so an absent pid
-  # is still an absent pid, and a live pid is off-fence.
+  # write_prom_store <pid> [startSeconds|__absent__] — one lane record. A start of
+  # 1000000000 is deliberately far from any real start: it is only reached AFTER a
+  # presence check, so an absent pid is still absent and a live pid is off-fence.
   write_prom_store() {
-    printf '{"sessions":{"%s":{"sessionId":"%s","pid":%s,"pidStartSeconds":1000000000,"agentLifecycle":"running"}}}' \
-      "$sid" "$sid" "$1" > "$store"
-  }
-  run_promotion() {
-    if [ -n "${1:-}" ]; then
-      env HOME="$phome" PI_PID_IDENTITY_LIB="$1" python3 "$tool" 2>&1
+    local pid="$1" start="${2:-1000000000}"
+    if [ "$start" = "__absent__" ]; then
+      printf '{"sessions":{"%s":{"sessionId":"%s","pid":%s,"agentLifecycle":"running"}}}' \
+        "$sid" "$sid" "$pid" > "$store"
     else
-      env HOME="$phome" python3 "$tool" 2>&1
+      printf '{"sessions":{"%s":{"sessionId":"%s","pid":%s,"pidStartSeconds":%s,"agentLifecycle":"running"}}}' \
+        "$sid" "$sid" "$pid" "$start" > "$store"
     fi
+  }
+  # run_promotion [NAME=value ...] — HERMETIC by construction. PI_PID_IDENTITY_LIB,
+  # PS_BIN and DATE_BIN are UNSET so the tool must resolve the FARMED library by
+  # RELATIVE position (tools/fleet/ <-> scripts/lib/): liveness.lib_path() prefers the
+  # env var, so an exported value (the lane-liveness plist pins it) would silently
+  # replace the farmed library and make the whole layout pin vacuous. Extra NAME=value
+  # arguments are applied on top — leg (d) uses that for its explicit override.
+  run_promotion() {
+    env -u PI_PID_IDENTITY_LIB -u PS_BIN -u DATE_BIN HOME="$phome" "$@" python3 "$tool" 2>&1
   }
 
   # (a) absent pid → the dead witness still fires.
@@ -318,23 +337,24 @@ time.sleep(60)' "$zpid_file" &
     fail "$label: off-fence pid neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
   fi
 
-  # (c) zombie → PID DEAD. The pre-fix bare existence check could not.
-  if [ -n "$zpid" ]; then
+  # (c) zombie → PID DEAD. The pre-fix bare existence check could not, and the probe
+  # detail must be the ZOMBIE rule, not plain absence.
+  if [[ "$zstat" == Z* ]]; then
     write_prom_store "$zpid"
     out="$(run_promotion)"
     if grep -q "PID DEAD" <<<"$out"; then
-      echo "ok: $label zombie pid ($zpid) reads PID DEAD (no bare-existence read is possible)"
+      echo "ok: $label zombie pid ($zpid, stat=$zstat) reads PID DEAD (no bare-existence read is possible)"
     else
       fail "$label: zombie pid read neither PID DEAD nor an abstention: $(grep -E '^B1 ' <<<"$out")"
     fi
   else
-    fail "$label: could not create a zombie fixture — the zombie pin did not run"
+    fail "$label: the zombie fixture is not a zombie (stat='${zstat:-none}') — the A4 pin did not run"
   fi
   [ -n "$zparent" ] && kill "$zparent" 2>/dev/null || true
 
   # (d) NEGATIVE control — the canonical library absent.
   write_prom_store 999999
-  out="$(run_promotion "/nonexistent/pid-identity.sh")"
+  out="$(run_promotion "PI_PID_IDENTITY_LIB=/nonexistent/pid-identity.sh")"
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: NEGATIVE CONTROL FAILED — with the canonical library absent fleet-health.py still printed PID DEAD (bare-existence fallback)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -342,6 +362,56 @@ time.sleep(60)' "$zpid_file" &
   else
     fail "$label: NEGATIVE CONTROL inconclusive — library absent yielded neither PID DEAD nor an abstention: $(grep -E '^B1 ' <<<"$out")"
   fi
+
+  # (e) the `ps` READ fails (live pid, valid start) → abstain, never PID DEAD.
+  # `PS_BIN` is the library's own documented injection point for exactly this shape.
+  write_prom_store "$$"
+  out="$(run_promotion PS_BIN=/nonexistent/ps)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: a failed ps read rendered PID DEAD (a read that did not happen is not a death witness)"
+  elif grep -q "PID ? (unreadable)" <<<"$out"; then
+    echo "ok: $label broken ps read ABSTAINS as PID ? (unreadable), never PID DEAD"
+  else
+    fail "$label: broken ps read neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
+  fi
+
+  # (f)+(g) an UNUSABLE recorded start (absent / negative) with a LIVE pid → abstain.
+  write_prom_store "$$" __absent__
+  out="$(run_promotion)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: a record with NO pidStartSeconds read PID DEAD (an unfenceable start must abstain)"
+  elif grep -q "PID ? (unreadable)" <<<"$out"; then
+    echo "ok: $label missing pidStartSeconds ABSTAINS as PID ? (unreadable), never PID DEAD"
+  else
+    fail "$label: missing pidStartSeconds neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
+  fi
+  write_prom_store "$$" -1
+  out="$(run_promotion)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: pidStartSeconds=-1 read PID DEAD (an unusable start must abstain)"
+  elif grep -q "PID ? (unreadable)" <<<"$out"; then
+    echo "ok: $label pidStartSeconds=-1 ABSTAINS as PID ? (unreadable), never PID DEAD"
+  else
+    fail "$label: pidStartSeconds=-1 neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
+  fi
+
+  # (h) an ABSTENTION must not SUPPRESS the suspect ladder: off-fence + a STALE
+  # transcript is still a suspect, never a clean report.
+  local tfile="$phome/.pi/agent/sessions/--stale--/x_$sid.jsonl"
+  mkdir -p "$(dirname "$tfile")"
+  python3 -c 'import os,sys,time
+open(sys.argv[1], "a").close()
+os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
+  write_prom_store "$$"
+  out="$(run_promotion)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: off-fence + stale transcript read PID DEAD"
+  elif grep -q "PID ? (off-fence)" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then
+    echo "ok: $label an abstaining lane with a stale transcript stays a SUSPECT (the abstention does not suppress the ladder)"
+  else
+    fail "$label: abstention SUPPRESSED the suspect ladder — a stale lane read as clean: $(grep -E '^B1 |no suspects' <<<"$out")"
+  fi
+  rm -f "$tfile"
 }
 
 run_setup() {

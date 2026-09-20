@@ -348,10 +348,11 @@ echo "    scripts lib farm: $lib_copied copied (pid-identity.sh, #1178)"
 # fleet-health.py and map-sessions.py joined this farm in #1178 unit 4: both lived
 # ONLY as untracked files in ~/.pi/agent/state/, so one disk loss took the recovery
 # primitive (map-sessions.py identifies every session by its FIRST USER MESSAGE —
-# how a lane holding an issue is found) and the only tool that reads the dead state
-# (fleet-health.py). fleet-health.py must sit BESIDE liveness.py: it imports that
-# sibling classifier for the identity probe, and that classifier resolves the rule
-# from the sibling scripts/lib/ above.
+# how a lane holding an issue is found) and the only untracked tool that computed
+# `PID DEAD` from its own private rule (fleet-health.py; the fleet's shared verdict
+# lives in tools/fleet/liveness.py, farmed just above). fleet-health.py must sit
+# BESIDE liveness.py: it imports that sibling classifier for the identity probe, and
+# that classifier resolves the rule from the sibling scripts/lib/ above.
 fleet_tools=(liveness.py lane_liveness.py fleet-health.py map-sessions.py)
 mkdir -p "$DEST/tools/fleet"
 tools_copied=0
