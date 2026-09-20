@@ -397,6 +397,20 @@ def _short(uuid: str) -> str:
     return (uuid or "")[:8]
 
 
+def _md_cell(text: str) -> str:
+    """One markdown TABLE cell from possibly transcript-derived text (#1272).
+
+    ``reason`` / ``detail`` / the lane label are read from the session JSONL and
+    the hook store, and the report body is ALSO posted as a GitHub issue body
+    when a lane is ``dead``. An unescaped ``|`` adds a column, a backtick closes
+    the enclosing code span, and a newline starts a line that can forge a
+    heading — so each is neutralised here, at the RENDER layer (which also
+    covers the pre-existing ``detail`` path: tool names and call ids).
+    """
+    out = str(text).replace("|", "\\|").replace("`", "'")
+    return "".join(ch if ch.isprintable() else " " for ch in out)
+
+
 def _ts(now_ms: int) -> str:
     return datetime.datetime.fromtimestamp(now_ms / 1000.0, datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -449,7 +463,8 @@ def render_report(
             parts.append("holder=%d" % v.holder_pid)
         evidence = ", ".join(parts) or "—"
         lines.append("| %s | `%s` | `%s` | **%s** | `%s` | %s |"
-                     % (lane.name, _short(lane.workspace), lane.sid[:8], v.state, v.reason, evidence))
+                     % (_md_cell(lane.name), _short(lane.workspace), lane.sid[:8],
+                        _md_cell(v.state), _md_cell(v.reason), _md_cell(evidence)))
 
     dead = [(lane, v, ev) for lane, v, ev in ordered if v.state in escalate_states]
     active = [(lane, v, ev) for lane, v, ev in dead
@@ -462,8 +477,9 @@ def render_report(
         for lane, v, _ev in active:
             lines.append(
                 "- **%s** (`%s`, session `%s`): `%s` — %s"
-                % (lane.name, _short(lane.workspace), lane.sid, v.state,
-                   ", ".join(v.witnesses) or v.detail or v.reason)
+                % (_md_cell(lane.name), _short(lane.workspace), lane.sid,
+                   _md_cell(v.state),
+                   _md_cell(", ".join(v.witnesses) or v.detail or v.reason))
             )
         lines.append("")
         lines.append(

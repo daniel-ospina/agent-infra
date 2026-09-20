@@ -13,7 +13,9 @@ is OPEN unless its stop reason discards them (on ``length`` pi fails those calls
 and continues the turn, so it is OPEN), and a ``compaction`` as the last entry
 abstains rather than letting the turn before it decide. T20 (#1272) closes the
 other direction: `turn-ended` is an EXPLICIT terminal set, and a stopReason
-outside it abstains (`turn-unknown:<value>`) instead of defaulting to resting.
+outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
+defaulting to resting (a call-carrying message is decided by the call-carrying
+rule first).
 
     python3 tools/fleet/liveness.test.py                # the 20 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
@@ -827,8 +829,10 @@ def t19_compaction_tail_abstains():
 # Terminality (`TERMINAL_STOP_REASONS`): `stop` and `length` end a completed
 # turn; `error` and `aborted` END THE AGENT RUN outright — pi's loop returns
 # before any tool batch (`pi-agent-core/dist/agent-loop.js:124-128`) — so all
-# four are terminal on a call-free message. Everything else ABSTAINS, naming the
-# value.
+# four are terminal on a CALL-FREE message. On a message CARRYING calls the
+# call-carrying rule is decided FIRST, so `length`/`stop` + calls stay OPEN and
+# an unrecognized reason + calls is OPEN too; only a call-free unrecognized
+# reason ABSTAINS, naming the value.
 #
 # Reachability: measured over 7,820 transcripts / 384,657 assistant messages in
 # ~/.pi/agent/sessions and ~/.pi/agent/task-sessions, the only stopReason values
@@ -875,7 +879,22 @@ def t20_unrecognized_stop_reason_abstains():
     check(t4.stalled is True and t4.reason == "turn-open:no-terminal-stop",
           "a missing stopReason is still open; got %s" % t4)
 
-    # (d) The terminal set is a DECISION, not a fall-through: it must not be
+    # (d) The call-carrying rule is decided FIRST and outranks the new
+    #     abstention: `stop`+calls and an UNRECOGNIZED reason + calls are OPEN
+    #     (NOT an abstention), because the message may be awaiting its results.
+    for stop in ("stop", "deferred", "quotaExceeded"):
+        t5 = liv.turn_from_entry(entry("assistant", stopReason=stop,
+                                       content=[{"type": "toolCall", "name": "bash",
+                                                 "id": "call_00_%s" % stop}]))
+        check(t5.stalled is True and t5.abstain is False
+              and t5.reason == "turn-open:pending-tool-call",
+              "`%s`+calls is an OPEN turn, never an abstention; got %s" % (stop, t5))
+        v5 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=t5))
+        check(v5.state == "wedged",
+              "`%s`+calls frozen past S is a stall, not resting; got %s/%s"
+              % (stop, v5.state, v5.reason))
+
+    # (e) The terminal set is a DECISION, not a fall-through: it must not be
     #     empty (then nothing reads resting) and must contain the four measured
     #     terminal values.
     check(liv.TERMINAL_STOP_REASONS == frozenset({"stop", "length", "error", "aborted"}),

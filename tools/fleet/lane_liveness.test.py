@@ -25,10 +25,14 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 is asserted inside CLEAN, paired with its own RED control.
     COMPACTION    a lane whose last transcript entry is a `compaction` abstains
                 (`unknown`/`tail-after-compaction`), never a decided turn (#1254 P1)
+    MD-ESCAPE   a transcript-derived value (`turn-unknown:<stopReason>` in the
+                `reason` cell, and tool names/call ids in `detail`) cannot add a
+                table column, close the code span, or start a line that renders
+                as a heading — the report body is ALSO a filed issue body (#1272)
 
 RED CONTROL (the part fleet-cost-weekly.test.sh has no equivalent of) — a green
-suite is only a pin if it can FAIL. Eight mutations, each run against the leg
-that must catch it (six mutate the report; two mutate the CLASSIFIER it
+suite is only a pin if it can FAIL. Nine mutations, each run against the leg
+that must catch it (seven mutate the report; two mutate the CLASSIFIER it
 consumes, which is the seam #1254 actually broke):
   * escalate every state        → CLEAN must go red
   * escalate nothing            → TRIP must go red
@@ -38,6 +42,7 @@ consumes, which is the seam #1254 actually broke):
   * compaction tail stops abstaining → COMPACTION must go red
   * policy text loses the 24h carve-out → TURN-BOUNDARY must go red
   * policy text names one reason for a state several paths reach → TURN-BOUNDARY must go red
+  * drop the markdown-cell escape → MD-ESCAPE must go red
 A mutation the suite does not catch is reported as a suite failure.
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;
@@ -53,6 +58,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -610,11 +616,46 @@ def leg_compaction(module=None):
         fx.close()
 
 
+def leg_md_escape(module=None):
+    print("── MD-ESCAPE — a transcript value cannot forge a row or a heading (#1272) ──")
+    fx = Fixture([turn_done_lane()], ps_rows=[ps_row(PID_TURN_DONE)])
+    try:
+        # The last message's `stopReason` is read from the session JSONL and flows
+        # into the verdict `reason` (`turn-unknown:<value>`). The report body is
+        # ALSO the body of a filed escalation issue, so a `|` must not add a
+        # column, a backtick must not close the code span, and a newline must not
+        # start a line that renders as a heading.
+        hostile = "a|b`c\r\n### forged — escalated"
+        write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
+                         [msg_entry("assistant", stopReason=hostile,
+                                    content=[{"type": "text", "text": "x"}])])
+        rc, out, gh = run_report(fx, module=module)
+        assert_eq(rc, 0, "an unknown lane decides nothing (exit 0, no escalation)")
+        rows = [l for l in out.splitlines() if l.startswith("| turn-done ")]
+        assert_eq(len(rows), 1, "the hostile value yields exactly ONE table row")
+        if rows:
+            # Split on UNESCAPED pipes: a well-formed six-cell row yields 8 parts.
+            assert_eq(len(re.split(r"(?<!\\)\|", rows[0])), 8,
+                      "the escaped pipe keeps the row at six cells")
+            assert_contains(rows[0], "turn-unknown:a\\|b'c",
+                            "the hostile value is escaped into the reason cell")
+        else:
+            bad("the lane's table row is missing")
+        assert_eq(any(l.startswith("### forged") for l in out.splitlines()), False,
+                  "a transcript value cannot START a line (which is what renders as a heading)")
+        if gh:
+            bad("an unknown lane must not escalate: %s" % gh)
+        else:
+            ok("no issue filed (unknown is not escalatable)")
+    finally:
+        fx.close()
+
+
 LEGS = [("CLEAN", leg_clean), ("TRIP", leg_trip), ("DEDUP", leg_dedup),
         ("DRY-RUN", leg_dry_run), ("ENV-ERROR", leg_env_error),
         ("STALE-DEAD", leg_stale_dead), ("CLOSED-WORKSPACE", leg_closed_workspace),
         ("PS-CACHE", leg_ps_cache), ("TURN-BOUNDARY", leg_turn_boundary),
-        ("COMPACTION", leg_compaction)]
+        ("COMPACTION", leg_compaction), ("MD-ESCAPE", leg_md_escape)]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -694,6 +735,14 @@ MUTATIONS = [
         '        "last turn ended reads `running-quiet`/`turn-ended` however long it "\n',
         leg_turn_boundary, 1,
         "the emitted policy text names ONE reason for a state several paths reach (#1273)",
+        target="report",
+    ),
+    Mutation(
+        "drop-md-cell-escape",
+        '    out = str(text).replace("|", "\\\\|").replace("`", "\'")\n',
+        '    out = str(text)\n',
+        leg_md_escape, 1,
+        "a transcript-derived value is interpolated unescaped, so a `|`/backtick/newline can forge the table or a heading (#1272)",
         target="report",
     ),
 ]

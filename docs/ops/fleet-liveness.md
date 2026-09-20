@@ -98,9 +98,11 @@ calls (`stop` / `length` / `error` / `aborted`), or with `error` / `aborted` on 
 (`quiet-within-bound` inside the 20 min bound, `turn-ended` past it, `record-non-idle-fresh` or
 `tool-in-flight` while those vetoes hold).
 
-Terminality is an **explicit set**, never a fall-through: a `stopReason` outside it — including
-one pi has not emitted yet — **abstains** (`unknown` / `turn-unknown:<stopReason>`) rather than
-asserting the lane is resting. `turn-ended` is RESTING (unescalatable, never `wedged`), so a
+Terminality is an **explicit set**, never a fall-through: on a message carrying **no** tool calls, a
+`stopReason` outside it — including one pi has not emitted yet — **abstains** (`unknown` /
+`turn-unknown:<stopReason>`) rather than asserting the lane is resting. A message **carrying**
+calls is decided by the rule above first, so an unrecognized reason with calls is an OPEN turn,
+not an abstention. `turn-ended` is RESTING (unescalatable, never `wedged`), so a
 default that lands there would read a genuinely suspended lane as merely quiet — the fail-open
 direction this classifier exists to remove (#1272).
 
