@@ -158,11 +158,14 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    lane dead. Without the argv source, "the record's incarnation is gone" would be silently
    equated with "the lane is dead".
 
-2. **A pid HOLDS a session only if the fence matches.** A fresh `ps` read must show it present,
-   **not a zombie**, and its `lstart` must be within **±`FENCE_TOLERANCE_SECONDS`** (default 3 s) of
-   the recorded `pidStartSeconds`. The fence exists because second-granularity rounding differs by
-   up to ~1 s; its whole purpose is to make an identity *uncertainty* fail safe. An unrelated
-   process that inherits a dead session's pid fails the fence and is **not** its holder.
+2. **A pid holds the session its store record names only if the fence matches.** A fresh `ps`
+   read must show it present, **not a zombie**, and its `lstart` must be within
+   **±`FENCE_TOLERANCE_SECONDS`** (default 3 s) of the recorded `pidStartSeconds`. The fence
+   exists because second-granularity rounding differs by up to ~1 s; its whole purpose is to make
+   an identity *uncertainty* fail safe. An unrelated process that inherits a dead session's pid
+   fails the fence and is **not** its holder. A pid whose **argv** names the session is a *direct*
+   identity claim instead (`probe-argv`): a live, non-zombie argv-claiming pid is the holder with
+   **no fence applied** — there is no recorded start to fence against.
 
 3. **A zombie is a corpse, not a holder.** `stat` `Z*` (`<defunct>`) is excluded from the holder
    set: the probe returns `zombie` at exit 1, and the reaper's classify loop skips it. Without
@@ -238,7 +241,8 @@ verdict.
    cmux hook store does not carry them. So the `CPU_LIVENESS_TOOL_NAMES = {"bash"}` refinement
    (`task` deliberately absent, so a CPU-flat nested sub-agent is not mislabelled) is correct and
    tested, but **unreachable for a fleet lane today**. Consequence: **for fleet sessions `wedged`
-   rests on JSONL freeze + no un-expired tool veto + no fresh record** — nothing more. This was
+   rests on JSONL freeze + no un-expired tool veto + no fresh record + a positively OPEN turn in
+   the transcript tail** (the only open-turn signal — boundary 2 below) — nothing more. This was
    flagged, not hidden, by the unit-1 report.
 
 2. **The tool-veto layer is inert in the CLI path.** `_tool_from_record` builds a `Tool` from the
@@ -324,7 +328,7 @@ The report is appended to a capped durable log (`~/.pi/agent/state/lane-liveness
 python3 tools/fleet/liveness.py --sid <session-id>
 python3 tools/fleet/liveness.py --sid <session-id> --json
 
-# the whole fleet, no side effects
+# the whole fleet; no GitHub side effects (it still appends to the durable log)
 python3 tools/fleet/lane_liveness.py --dry-run
 ```
 
