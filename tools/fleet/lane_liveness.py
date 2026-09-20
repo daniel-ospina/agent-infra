@@ -400,8 +400,9 @@ def _short(uuid: str) -> str:
 def _md_cell(text: str) -> str:
     """Safe markdown inline text from possibly transcript-derived input (#1272).
 
-    ``reason`` / ``detail`` / the lane label / the witness row are read from the
-    session JSONL and the hook store, and the report body is ALSO posted as a
+    ``reason`` / ``detail`` / the lane label / the workspaceId / the sid / the
+    witness row are read from the session JSONL and the hook store, and the
+    report body is ALSO posted as a
     GitHub issue body when a lane is ``dead``. An unescaped ``|`` adds a table
     column, a backtick closes the enclosing code span, and a newline starts a
     line that can forge a heading — so each is neutralised here, at the RENDER
@@ -467,8 +468,9 @@ def render_report(
             parts.append("holder=%d" % v.holder_pid)
         evidence = ", ".join(parts) or "—"
         lines.append("| `%s` | `%s` | `%s` | **%s** | `%s` | `%s` |"
-                     % (_md_cell(lane.name), _short(lane.workspace), lane.sid[:8],
-                        _md_cell(v.state), _md_cell(v.reason), _md_cell(evidence)))
+                     % (_md_cell(lane.name), _md_cell(_short(lane.workspace)),
+                        _md_cell(lane.sid[:8]), _md_cell(v.state), _md_cell(v.reason),
+                        _md_cell(evidence)))
 
     dead = [(lane, v, ev) for lane, v, ev in ordered if v.state in escalate_states]
     active = [(lane, v, ev) for lane, v, ev in dead
@@ -481,15 +483,16 @@ def render_report(
         for lane, v, _ev in active:
             lines.append(
                 "- **`%s`** (`%s`, session `%s`): `%s` — `%s`"
-                % (_md_cell(lane.name), _short(lane.workspace), lane.sid,
-                   _md_cell(v.state),
+                % (_md_cell(lane.name), _md_cell(_short(lane.workspace)),
+                   _md_cell(lane.sid), _md_cell(v.state),
                    _md_cell(", ".join(v.witnesses) or v.detail or v.reason))
             )
         lines.append("")
         lines.append(
             "A dead lane is the one state no live-process-derived detector can show: "
             "its process is gone, so it drops out of every population built from `ps`. "
-            "Confirm with `cmux read-screen --workspace %s` before acting." % active[0][0].workspace
+            "Confirm with `cmux read-screen --workspace %s` before acting."
+            % _md_cell(active[0][0].workspace)
         )
     if stale:
         lines.append("")

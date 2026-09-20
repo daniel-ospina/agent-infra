@@ -25,11 +25,13 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 is asserted inside CLEAN, paired with its own RED control.
     COMPACTION    a lane whose last transcript entry is a `compaction` abstains
                 (`unknown`/`tail-after-compaction`), never a decided turn (#1254 P1)
-    MD-ESCAPE   a transcript-derived value (the `reason` cell's
-                `turn-unknown:<stopReason>`, and the `detail`/evidence cell's
-                tool name and call id) cannot add a table column, close the code
-                span, open a link, or start a line that renders as a heading —
-                the report body is ALSO a filed issue body (#1272)
+    MD-ESCAPE   no store/transcript-derived value (the `reason` cell's
+                `turn-unknown:<stopReason>`; the `detail`/evidence cell's tool
+                name and call id; the lane label, workspaceId and sid; the
+                active escalation bullet; the withheld-from-escalation list)
+                can add a table column, close the code span, open a link, or
+                start a line that renders as a heading — the report body is
+                ALSO a filed issue body (#1272)
 
 RED CONTROL (the part fleet-cost-weekly.test.sh has no equivalent of) — a green
 suite is only a pin if it can FAIL. Nine mutations, each run against the leg
@@ -130,17 +132,18 @@ SID_TURN_DONE = "eeeeeeee-0000-4000-8000-000000000005"
 SID_TURN_OPEN = "ffffffff-0000-4000-8000-000000000006"
 PID_TURN_DONE = 5555
 PID_TURN_OPEN = 6666
-# #1272 — hostile lane labels for the markdown-escape leg. ``Lane.name`` is
-# ``os.path.basename(cwd)`` (a directory name), so it reaches the report body as
-# transcript/store-derived text.
-WS_MD_ACTIVE = "66666666-6666-4666-8666-666666666666"
-WS_MD_STALE = "77777777-7777-4777-8777-777777777777"
-SID_MD_ACTIVE = "12121212-0000-4000-8000-000000000011"
-SID_MD_STALE = "12121212-0000-4000-8000-000000000012"
+# #1272 — hostile fixture values for the markdown-escape leg. ``Lane.name`` is
+# ``os.path.basename(cwd)`` (a directory name) and ``Lane.workspace`` / ``Lane.sid``
+# are store keys — none is validated as a UUID — so all three reach the report
+# body as store/transcript-derived text.
+WS_MD_ACTIVE = "W0|a`b\r\n### forged-ws"
+WS_MD_STALE = "W1|a`b\r\n### forged-ws2"
+SID_MD_ACTIVE = "S0|a`b##forged-sid"
+SID_MD_STALE = "S1|a`b##forged-sid2"
 PID_MD_ACTIVE = 7777
 PID_MD_STALE = 8888
-HOSTILE_ACTIVE_LABEL = "evil|x`y\r\n### forged-lane"
-HOSTILE_STALE_LABEL = "stale|z`q\r\n### forged-withheld"
+HOSTILE_ACTIVE_LABEL = "L|a`b\r\n### forged-lane"
+HOSTILE_STALE_LABEL = "S|a`b\r\n### forged-withheld"
 
 PS_SHIM = """#!/usr/bin/env bash
 [ "${1:-}" = "-axo" ] || exit 1
@@ -335,16 +338,18 @@ def turn_open_lane():
 
 
 def md_active_dead_lane():
-    """A DEAD lane whose label (cwd basename) is hostile: it exercises the table
-    lane cell AND the active escalation bullet (its pid is absent from ps)."""
+    """A DEAD lane whose label, workspaceId and sid are hostile (its pid is absent
+    from ps): it exercises the table lane/workspace/sid cells AND the active
+    escalation bullet."""
     return (HOSTILE_ACTIVE_LABEL, WS_MD_ACTIVE, SID_MD_ACTIVE,
             record(SID_MD_ACTIVE, WS_MD_ACTIVE, PID_MD_ACTIVE, updated_at=NOW_S,
                    cwd="/tmp/" + HOSTILE_ACTIVE_LABEL))
 
 
 def md_stale_dead_lane():
-    """A DEAD lane quiet past the idle proof with a hostile label: it exercises
-    the withheld-from-escalation list (no transcript ⇒ age unknown ⇒ withheld)."""
+    """A DEAD lane quiet past the idle proof with hostile label/workspaceId/sid:
+    it exercises the withheld-from-escalation list (withheld by the 24h window,
+    `updatedAt` = NOW-30h, not by an unknown age)."""
     return (HOSTILE_STALE_LABEL, WS_MD_STALE, SID_MD_STALE,
             record(SID_MD_STALE, WS_MD_STALE, PID_MD_STALE,
                    updated_at=NOW_S - 30 * 3600, cwd="/tmp/" + HOSTILE_STALE_LABEL))
@@ -649,47 +654,76 @@ def leg_md_escape(module=None):
     fx = Fixture([turn_done_lane(), turn_open_lane(), md_active_dead_lane(), md_stale_dead_lane()],
                  ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN)])
     try:
-        # FOUR transcript/store-derived fields reach the report body, which is ALSO
-        # the body of a filed escalation issue: the `reason` (here
+        # Every store/transcript-derived field reaches the report body, which is
+        # ALSO the body of a filed escalation issue: the `reason` (here
         # `turn-unknown:<stopReason>`), the `detail`/evidence (the open turn's tool
-        # name and call id), the lane label (a cwd basename) in the table, the
-        # active escalation bullet, and the withheld-from-escalation list. None
-        # may add a cell, close a code span, open a link, or start a heading line.
-        hostile = "a|b`c\r\n### forged — escalated"
+        # name and call id — with a backslash, pinning that it is NOT doubled), the
+        # lane label (a cwd basename), the workspaceId, and the sid. None may add a
+        # cell, close a code span, open a link, or start a heading line.
         write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
-                         [msg_entry("assistant", stopReason=hostile,
+                         [msg_entry("assistant", stopReason="R|a`b\r\n### forged-reason",
                                     content=[{"type": "text", "text": "x"}])])
         write_transcript(fx, SID_TURN_OPEN, "/tmp/turn-open",
                          [msg_entry("assistant", stopReason="toolUse",
-                                    content=[{"type": "toolCall", "name": "evil|x`y",
+                                    content=[{"type": "toolCall", "name": "E|x`y\\z",
                                               "id": "call_00_\r\n### forged-detail"}])])
         rc, out, gh = run_report(fx, module=module)
         assert_eq(rc, 1, "the active dead lane escalates (its body is what gh posts)")
         assert_contains(gh, "issue create", "the dead lane filed an issue")
-        for raw, escaped, what in (
-                ("a|b`c", "a\\|b'c", "the reason cell (stopReason)"),
-                ("evil|x`y", "evil\\|x'y", "the evidence cell (tool name)"),
-                (HOSTILE_ACTIVE_LABEL, "evil\\|x'y  ### forged-lane",
-                 "the table lane cell / active escalation bullet"),
-                (HOSTILE_STALE_LABEL, "stale\\|z'q  ### forged-withheld",
-                 "the withheld-from-escalation list")):
-            assert_contains(out, escaped, "%s: the hostile value is escaped" % what)
-            assert_eq(raw in out, False, "%s: the RAW value never reaches the body" % what)
-        assert_contains(gh, "evil\\|x'y  ### forged-lane",
-                        "the POSTED issue body carries the escaped label")
+
+        # Rows are located by a needle that only that row holds, and every
+        # assertion is scoped to the ROW — a global `raw in out` check would blame
+        # one field for another field's leak.
+        cases = (
+            (SID_TURN_DONE[:8], ["R\\|a'b  ### forged-reason"], ["R|a`b"],
+             "the reason cell (stopReason)"),
+            (SID_TURN_OPEN[:8], ["E\\|x'y\\z"], ["E|x`y"],
+             "the evidence cell (tool name)"),
+            ("W0\\|a'b", ["W0\\|a'b", "S0\\|a'b##", "L\\|a'b  ### forged-lane"],
+             ["W0|a`b", "S0|a`b##forged-sid", "L|a`b"],
+             "the active dead lane (workspace / sid / label)"),
+            ("W1\\|a'b", ["W1\\|a'b", "S1\\|a'b##", "S\\|a'b  ### forged-withheld"],
+             ["W1|a`b", "S1|a`b##forged-sid2", "S|a`b"],
+             "the withheld dead lane (workspace / sid / label)"),
+        )
+        for locator, needles, raws, what in cases:
+            rows = [l for l in out.splitlines() if locator in l and l.startswith("| `")]
+            assert_eq(len(rows), 1, "%s: exactly one table row" % what)
+            if not rows:
+                continue
+            for needle in needles:
+                assert_contains(rows[0], needle, "%s: %r is escaped into the row" % (what, needle))
+            for raw in raws:
+                assert_eq(raw in rows[0], False, "%s: no raw %r in the row" % (what, raw))
+
+        bullet = [l for l in out.splitlines() if l.startswith("- **`") and "L\\|a'b" in l]
+        assert_eq(len(bullet), 1, "the active escalation bullet carries the escaped label")
+        assert_contains(bullet[0], "S0\\|a'b##forged-sid",
+                        "the escalation bullet escapes the FULL sid")
+        assert_eq(any(raw in l for l in bullet
+                      for raw in ("L|a`b", "W0|a`b", "S0|a`b##forged-sid")), False,
+                  "the escalation bullet carries no raw store text")
+        withheld = [l for l in out.splitlines() if "withheld from escalation" in l]
+        assert_eq(len(withheld), 1, "the withheld sentence is present")
+        assert_contains(withheld[0], "S\\|a'b  ### forged-withheld",
+                        "the withheld list escapes the label")
         assert_eq(any(l.startswith("### forged") for l in out.splitlines()), False,
-                  "a transcript value cannot START a line (which is what renders as a heading)")
-        # Structural: every table row keeps six cells (no raw pipe forged a
-        # column), every code span is balanced (no raw backtick closed one), and
-        # every row ends with its closing pipe.
+                  "no hostile value STARTS a line (that is what renders as a heading)")
+        assert_contains(gh, "L\\|a'b  ### forged-lane",
+                        "the POSTED issue body carries the escaped label")
+
+        # Structural: every row keeps six cells (a raw pipe forged none), ends
+        # with its closing pipe (a raw newline split none), and keeps its five
+        # variable cells each inside exactly one code span (a raw backtick closed
+        # none early). Per-cell, not a backtick-parity count.
         rows = [l for l in out.splitlines() if l.startswith("| `")]
         assert_eq(len(rows) >= 4, True, "every lane got a table row")
-        assert_eq(all(len(re.split(r"(?<!\\)\|", r)) == 8 for r in rows), True,
-                  "every row keeps six cells (a raw pipe forged none)")
-        assert_eq(all(r.count("`") % 2 == 0 for r in rows), True,
-                  "every row's code spans are balanced (a raw backtick closed none)")
-        assert_eq(all(r.endswith(" |") for r in rows), True,
-                  "every row ends with its closing pipe (no raw newline split one)")
+        for row in rows:
+            cells = [c.strip() for c in re.split(r"(?<!\\)\|", row)[1:-1]]
+            assert_eq(len(cells), 6, "six cells: %r" % row[:60])
+            assert_eq(row.endswith(" |"), True, "the closing pipe survives: %r" % row[:60])
+            fenced = [c for c in cells if len(c) >= 2 and c.startswith("`") and c.endswith("`")]
+            assert_eq(len(fenced), 5, "five variable cells are each one code span: %r" % row[:60])
     finally:
         fx.close()
 

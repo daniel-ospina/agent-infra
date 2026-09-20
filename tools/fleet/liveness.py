@@ -44,8 +44,9 @@ proof it reads ``running-quiet``, never ``wedged``; the ``reason`` field names
 which path
 returned that state. Terminality is an EXPLICIT set
 (``TERMINAL_STOP_REASONS``), never a fall-through: on a CALL-FREE message a
-``stopReason`` outside it — including one pi has not emitted yet — ABSTAINS with
-``turn-unknown:<value>`` rather than asserting the lane is resting (#1272). A
+``stopReason`` in NEITHER that set nor ``NON_TERMINAL_STOP_REASONS`` — including
+one pi has not emitted yet — ABSTAINS with ``turn-unknown:<value>`` rather than
+asserting the lane is resting (#1272). A
 message CARRYING calls is decided first by the call-carrying rule above, which
 keeps ``length``+calls and ``stop``+calls OPEN. ``turn-state-unknown`` (a tail
 that cannot be read as a turn boundary) and ``tail-after-compaction`` (a summary
@@ -342,10 +343,10 @@ class Turn:
 
     ``abstain`` marks a boundary that licenses no disposition: a ``compaction``
     written between turns, or, on a message carrying NO tool calls, an assistant
-    ``stopReason`` whose terminality is not in ``TERMINAL_STOP_REASONS`` (#1272).
-    Such an entry can neither license ``wedged`` nor be read as a finished turn,
-    so the ladder returns ``unknown`` naming ``reason`` — a third disposition,
-    not a weaker ``stalled``.
+    ``stopReason`` in neither ``TERMINAL_STOP_REASONS`` nor
+    ``NON_TERMINAL_STOP_REASONS`` (#1272). Such an entry can neither license
+    ``wedged`` nor be read as a finished turn, so the ladder returns ``unknown``
+    naming ``reason`` — a third disposition, not a weaker ``stalled``.
 
     Absent evidence is NOT this object: an unreadable tail is ``None`` on
     ``Evidence.jsonl_turn``, an abstention the ladder names
