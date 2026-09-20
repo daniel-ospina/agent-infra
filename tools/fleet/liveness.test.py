@@ -702,16 +702,19 @@ def t17_unknown_turn_and_bounds():
 
 # ══════════════════════════════════════════════════════════════════════════
 # T18 — the cycle-1 P0 (#1254). A message CARRYING tool calls is OPEN unless its
-# stop reason is one under which pi DISCARDS the calls. pi SUSPENDS on `length`
-# to execute them, so a `length` message with unanswered calls is an open turn,
-# not a resting one. Measured over the 426 live session files in
-# ~/.pi/agent/sessions: toolUse 147,466 with calls / 147,431 answered; error 115
-# with calls / 0 answered; length 78 with calls / 78 answered (EXECUTED);
-# aborted 16 with calls / 0 answered.
+# stop reason is one under which pi DISCARDS the calls. On `length` pi FAILS the
+# calls and CONTINUES the turn, so a `length` message with unresolved calls is an
+# open turn, not a resting one. Measured over the 426 live session files in
+# ~/.pi/agent/sessions: toolUse 147,466 with calls / 147,431 with a following
+# result; error 115 with calls / 0 with a result; length 78 with calls / 78 with
+# a result — EVERY one of those 78 results is `isError: true` ("Tool call ... was
+# not executed"), i.e. the calls were FAILED, not executed; aborted 16 with calls
+# / 0 with a result.
 # ══════════════════════════════════════════════════════════════════════════
 @test("T18 tool calls decide openness: `length`+calls OPEN, `error`/`aborted`+calls ENDED (#1254 P0)")
 def t18_call_carrying_stop_reasons():
-    # (a) `length` with calls is EXECUTED by pi (78/78) -> OPEN.
+    # (a) `length` with calls leaves the turn OPEN — pi fails those calls
+    #     (`failToolCallsFromTruncatedMessage`; all 78 results carry isError).
     t = liv.turn_from_entry(entry("assistant", stopReason="length",
                                   content=[{"type": "toolCall", "name": "bash",
                                             "id": "call_00_LEN"}]))

@@ -72,8 +72,12 @@ originally forced by a classifier defect (#1254): a merely-idle interactive
 REPL read ``wedged`` (``jsonl-frozen``) 47 minutes after a completed turn,
 because ``wedged`` fired on any frozen transcript. ``liveness.py`` now requires
 POSITIVE evidence of an open turn, so a turn-ended lane reports
-``running-quiet`` (``turn-ended``) however long it rests short of the 24h
-retirement proof, and ``wedged`` means what it says. The escalation policy
+``running-quiet`` however long it rests short of the 24h retirement proof, and
+``wedged`` means what it says. The lane's own ``reason`` names which path
+returned that state (``quiet-within-bound`` inside the stream bound,
+``turn-ended`` past it, ``record-non-idle-fresh`` while the input-consumption
+veto holds) — the sentence above asserts the STATE, and the reason is rendered
+per lane. The escalation policy
 still stays ``dead``-only — a
 reporting fix is not a licence to file issues on a diagnostic state.
 
@@ -275,7 +279,6 @@ def open_workspace_ids(path: str = DEFAULT_CMUX_STATE):
 
 def _lane_label(rec: dict, workspace: str) -> str:
     """A human label for the lane: the cwd's last path component."""
-    """A human label for the lane: the cwd's last path component."""
     cwd = rec.get("cwd")
     if isinstance(cwd, str) and cwd.strip("/"):
         base = os.path.basename(cwd.rstrip("/"))
@@ -425,9 +428,10 @@ def render_report(
         "(last activity within %.0fh — the reaper's own idle proof). "
         "`wedged` requires positive evidence of an OPEN turn (a pending tool "
         "call, or no assistant reply) frozen past the stream bound; a lane whose "
-        "last turn ended reads `running-quiet`/`turn-ended` however long it "
+        "last turn ended reads `running-quiet` however long it "
         "rests short of the 24h retirement proof, so only a lane whose every "
-        "incarnation is gone files an issue." % (", ".join(sorted(escalate_states)), window_ms / 3_600_000.0)
+        "incarnation is gone files an issue. This row's `reason` names which "
+        "path returned that state." % (", ".join(sorted(escalate_states)), window_ms / 3_600_000.0)
     )
     lines.append("")
     lines.append("| lane | workspace | session | state | reason | evidence |")

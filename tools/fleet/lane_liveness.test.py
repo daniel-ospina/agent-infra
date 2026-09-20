@@ -13,16 +13,18 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 never escalated (the retired-pane noise class)
     CHILD-EXCL  a task child's newer record on the parent's workspace does not
                 become the lane's verdict
-    TURN-BOUNDARY a lane whose transcript ended is `running-quiet`/`turn-ended`
-                however long it rests (short of the 24h retirement proof), while a
+    TURN-BOUNDARY a lane whose transcript ended is `running-quiet` however long
+                it rests (short of the 24h retirement proof; this fixture's row
+                reason is `turn-ended`, but the emitted POLICY sentence asserts
+                only the state, since three paths reach it), while a
                 lane frozen with an OPEN turn is still `wedged` — the #1254
                 contract at the report layer
     COMPACTION    a lane whose last transcript entry is a `compaction` abstains
                 (`unknown`/`tail-after-compaction`), never a decided turn (#1254 P1)
 
 RED CONTROL (the part fleet-cost-weekly.test.sh has no equivalent of) — a green
-suite is only a pin if it can FAIL. Seven mutations, each run against the leg
-that must catch it (five mutate the report; two mutate the CLASSIFIER it
+suite is only a pin if it can FAIL. Eight mutations, each run against the leg
+that must catch it (six mutate the report; two mutate the CLASSIFIER it
 consumes, which is the seam #1254 actually broke):
   * escalate every state        → CLEAN must go red
   * escalate nothing            → TRIP must go red
@@ -31,6 +33,7 @@ consumes, which is the seam #1254 actually broke):
   * drop the turn-ended guard   → TURN-BOUNDARY must go red
   * compaction tail stops abstaining → COMPACTION must go red
   * policy text loses the 24h carve-out → TURN-BOUNDARY must go red
+  * policy text names one reason for a state three paths reach → TURN-BOUNDARY must go red
 A mutation the suite does not catch is reported as a suite failure.
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;
@@ -84,6 +87,13 @@ def assert_contains(haystack, needle, msg):
         ok(msg)
     else:
         bad("%s (missing: %r)" % (msg, needle))
+
+
+def assert_not_contains(haystack, needle, msg):
+    if needle not in haystack:
+        ok(msg)
+    else:
+        bad("%s (unexpected: %r)" % (msg, needle))
 
 
 # ── clock + fixtures ─────────────────────────────────────────────────────
@@ -535,8 +545,13 @@ def leg_turn_boundary(module=None):
         # the `idle`/`jsonl-old` branch returns first).
         assert_contains(out, "short of the 24h retirement proof",
                         "the policy text names the retirement-proof carve-out")
-        assert_contains(out, "`turn-ended`",
-                        "the policy text uses the renamed (non-colliding) reason")
+        # #1273: the policy sentence must assert the STATE alone — three paths
+        # return `running-quiet` for a turn-ended lane (`quiet-within-bound`
+        # inside the stream bound, `turn-ended` past it, `record-non-idle-fresh`
+        # while the input-consumption veto holds), so naming ONE reason for it
+        # was false. The row's own `reason` column is what names the path.
+        assert_not_contains(out, "`running-quiet`/`turn-ended`",
+                            "the policy text does not name one reason for a state three paths reach (#1273)")
         if gh:
             bad("a live-holder wedge must not escalate: %s" % gh)
         else:
@@ -661,6 +676,14 @@ MUTATIONS = [
         '        "rests, so only a lane whose every "\n',
         leg_turn_boundary, 1,
         "the emitted policy text asserts a rule the code does not implement (no 24h carve-out, T13) (#1254 P2)",
+        target="report",
+    ),
+    Mutation(
+        "policy-text-names-one-reason-for-three-paths",
+        '        "last turn ended reads `running-quiet` however long it "\n',
+        '        "last turn ended reads `running-quiet`/`turn-ended` however long it "\n',
+        leg_turn_boundary, 1,
+        "the emitted policy text names ONE reason for a state three paths reach (#1273)",
         target="report",
     ),
 ]
