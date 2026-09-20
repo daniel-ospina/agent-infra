@@ -209,6 +209,18 @@ check_fleet_tools_farmed() {
   else
     fail "$label: farmed liveness.py differs from tools/fleet/liveness.py (stale copy!)"
   fi
+  # #1178 unit 4 — the two tools that lived ONLY as untracked files in
+  # ~/.pi/agent/state/: the recovery primitive and the dead-lane reader.
+  if diff -q "$ROOT/tools/fleet/fleet-health.py" "$DEST/tools/fleet/fleet-health.py" >/dev/null 2>&1; then
+    echo "ok: $label farmed fleet-health.py == repo copy (#1178 unit 4)"
+  else
+    fail "$label: farmed fleet-health.py differs from (or is missing vs) tools/fleet/fleet-health.py"
+  fi
+  if diff -q "$ROOT/tools/fleet/map-sessions.py" "$DEST/tools/fleet/map-sessions.py" >/dev/null 2>&1; then
+    echo "ok: $label farmed map-sessions.py == repo copy (#1178 unit 4)"
+  else
+    fail "$label: farmed map-sessions.py differs from (or is missing vs) tools/fleet/map-sessions.py"
+  fi
   # The farmed driver must actually start from the farmed layout: it imports its
   # sibling classifier and forks the shared identity library. `--help` is the
   # read-only mode (no cmux call, no store read, no issue); the pinned
@@ -222,6 +234,207 @@ check_fleet_tools_farmed() {
   else
     fail "$label: farmed lane-liveness driver failed to start (rc=$rc): $(head -1 <<<"$out")"
   fi
+}
+
+# #1178 unit 4 — the PROMOTED liveness read in tools/fleet/fleet-health.py.
+#
+# Its `PID DEAD` used to come from `_alive(pid)` = a bare `os.kill(pid, 0)`: no
+# start-time fence, no zombie rule. It now reads through the FARMED
+# scripts/lib/pid-identity.sh via its sibling classifier's probe boundary (the
+# same library the kill-path reaper sources). These controls pin both directions:
+#
+#   * the dead witness still FIRES — an absent pid, and a ZOMBIE. A zombie is the
+#     crisp pre-fix failure: `os.kill(zombie, 0)` SUCCEEDS, so the bare existence
+#     check read a defunct process as a live lane (no flag at all).
+#   * an unresolvable read ABSTAINS as `PID ? (...)`, never `PID DEAD` — for pid
+#     REUSE (off-fence), for a broken `ps`, for an unusable recorded start, and
+#     when the canonical library is ABSENT. That last leg is the NEGATIVE control:
+#     a "promotion" that fell back to a bare existence check prints `PID DEAD`
+#     with no library on disk, and this test fails.
+#   * an ABSTENTION must not SUPPRESS the quiet/CPU suspect ladder (#1178 A-class):
+#     a stale lane whose identity could not be read is still a SUSPECT, never a
+#     clean `✅ no suspects`. The same holds one level up: an unreadable or
+#     shape-drifted HOOK STORE reports the scan INCOMPLETE with exit 1, and still
+#     lists any suspect the ladder found.
+#
+# The positive legs are HERMETIC about the environment (see `run_promotion`), so a
+# green pin also proves the tools/fleet/ <-> scripts/lib/ RELATIVE layout survived
+# the farm: move the farmed library and they degrade to `PID ? (unreadable)`.
+check_fleet_health_promotion() {
+  local label="$1"
+  local tool="$DEST/tools/fleet/fleet-health.py"
+  local lib="$DEST/scripts/lib/pid-identity.sh"
+  local phome="$TMP/prom-home"
+  local sid="01a08ca6-3539-71ed-a0d7-7cee52feee03"   # lane B1 (the LANES hardcode)
+  local store="$phome/.cmuxterm/pi-hook-sessions.json"
+  local zpid_file="$TMP/zombie.pid" zparent="" zpid="" zstat="" out rc=0
+
+  [ -f "$tool" ] || { fail "$label: farmed fleet-health.py missing — the promotion is unpinnable"; return; }
+  [ -f "$lib" ]  || { fail "$label: farmed lib/pid-identity.sh missing — the promotion cannot load the rule"; return; }
+  # fleet-health.py writes its CPU-delta cache to ~/.pi/agent/state/fleet-health-prev.json
+  # and RAISES FileNotFoundError when that directory is absent (it does not create it).
+  # A fresh HOME has no state/, so create the three directories the tool reads/writes.
+  mkdir -p "$phome/.cmuxterm" "$phome/.pi/agent/state" "$phome/.pi/agent/sessions"
+  rm -f "$zpid_file"
+
+  # A ZOMBIE fixture: a child that exited and was never reaped, held by a live
+  # parent for the duration of the checks. `os.kill(zpid, 0)` succeeds on it.
+  python3 -c 'import os,sys,time
+p = os.fork()
+if p == 0:
+    os._exit(0)
+open(sys.argv[1], "w").write(str(p))
+time.sleep(60)' "$zpid_file" &
+  zparent=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$zpid_file" ] && { zpid="$(cat "$zpid_file")"; break; }
+    sleep 0.2
+  done
+  # Pin the fixture's IDENTITY, not just its pid: a zombie that gets reaped before the
+  # assertion degrades to plain `absent`, and the leg below would then pass for the wrong
+  # reason (`PID DEAD` from absence, not from the zombie rule).
+  [ -n "$zpid" ] && zstat="$(ps -o stat= -p "$zpid" 2>/dev/null | tr -d ' ')"
+
+  # write_prom_store <pid> [startSeconds|__absent__] — one lane record. A start of
+  # 1000000000 is deliberately far from any real start: it is only reached AFTER a
+  # presence check, so an absent pid is still absent and a live pid is off-fence.
+  write_prom_store() {
+    local pid="$1" start="${2:-1000000000}"
+    if [ "$start" = "__absent__" ]; then
+      printf '{"sessions":{"%s":{"sessionId":"%s","pid":%s,"agentLifecycle":"running"}}}' \
+        "$sid" "$sid" "$pid" > "$store"
+    else
+      printf '{"sessions":{"%s":{"sessionId":"%s","pid":%s,"pidStartSeconds":%s,"agentLifecycle":"running"}}}' \
+        "$sid" "$sid" "$pid" "$start" > "$store"
+    fi
+  }
+  # run_promotion [NAME=value ...] — HERMETIC by construction. PI_PID_IDENTITY_LIB,
+  # PS_BIN and DATE_BIN are UNSET so the tool must resolve the FARMED library by
+  # RELATIVE position (tools/fleet/ <-> scripts/lib/): liveness.lib_path() prefers the
+  # env var, so an exported value (the lane-liveness plist pins it) would silently
+  # replace the farmed library and make the whole layout pin vacuous. Extra NAME=value
+  # arguments are applied on top — leg (d) uses that for its explicit override.
+  run_promotion() {
+    env -u PI_PID_IDENTITY_LIB -u PS_BIN -u DATE_BIN HOME="$phome" "$@" python3 "$tool" 2>&1
+  }
+
+  # (a) absent pid → the dead witness still fires.
+  write_prom_store 999999
+  out="$(run_promotion)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    echo "ok: $label absent pid reads PID DEAD through the farmed library"
+  else
+    fail "$label: absent pid did NOT read PID DEAD — the promotion disabled the witness: $(grep -E '^B1 ' <<<"$out")"
+  fi
+
+  # (b) pid REUSE: a live pid whose recorded start is off-fence → abstain.
+  write_prom_store "$$"
+  out="$(run_promotion)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: a LIVE pid with an off-fence start read PID DEAD (fence bypass)"
+  elif grep -q "PID ? (off-fence)" <<<"$out"; then
+    echo "ok: $label live-but-off-fence pid ABSTAINS as PID ? (off-fence), never PID DEAD"
+  else
+    fail "$label: off-fence pid neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
+  fi
+
+  # (c) zombie → PID DEAD. The pre-fix bare existence check could not, and the probe
+  # detail must be the ZOMBIE rule, not plain absence.
+  if [[ "$zstat" == Z* ]]; then
+    write_prom_store "$zpid"
+    out="$(run_promotion)"
+    if grep -q "PID DEAD" <<<"$out"; then
+      echo "ok: $label zombie pid ($zpid, stat=$zstat) reads PID DEAD (no bare-existence read is possible)"
+    else
+      fail "$label: zombie pid read neither PID DEAD nor an abstention: $(grep -E '^B1 ' <<<"$out")"
+    fi
+  else
+    fail "$label: the zombie fixture is not a zombie (stat='${zstat:-none}') — the A4 pin did not run"
+  fi
+  [ -n "$zparent" ] && kill "$zparent" 2>/dev/null || true
+
+  # (d) NEGATIVE control — the canonical library absent.
+  write_prom_store 999999
+  out="$(run_promotion "PI_PID_IDENTITY_LIB=/nonexistent/pid-identity.sh")"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: NEGATIVE CONTROL FAILED — with the canonical library absent fleet-health.py still printed PID DEAD (bare-existence fallback)"
+  elif grep -q "PID ? (unreadable)" <<<"$out"; then
+    echo "ok: $label NEGATIVE CONTROL — library absent ⇒ PID ? (unreadable), never PID DEAD"
+  else
+    fail "$label: NEGATIVE CONTROL inconclusive — library absent yielded neither PID DEAD nor an abstention: $(grep -E '^B1 ' <<<"$out")"
+  fi
+
+  # (e) the `ps` READ fails (live pid, valid start) → abstain, never PID DEAD.
+  # `PS_BIN` is the library's own documented injection point for exactly this shape.
+  write_prom_store "$$"
+  out="$(run_promotion PS_BIN=/nonexistent/ps)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: a failed ps read rendered PID DEAD (a read that did not happen is not a death witness)"
+  elif grep -q "PID ? (unreadable)" <<<"$out"; then
+    echo "ok: $label broken ps read ABSTAINS as PID ? (unreadable), never PID DEAD"
+  else
+    fail "$label: broken ps read neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
+  fi
+
+  # (f)+(g) an UNUSABLE recorded start (absent / negative) with a LIVE pid → abstain.
+  write_prom_store "$$" __absent__
+  out="$(run_promotion)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: a record with NO pidStartSeconds read PID DEAD (an unfenceable start must abstain)"
+  elif grep -q "PID ? (unreadable)" <<<"$out"; then
+    echo "ok: $label missing pidStartSeconds ABSTAINS as PID ? (unreadable), never PID DEAD"
+  else
+    fail "$label: missing pidStartSeconds neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
+  fi
+  write_prom_store "$$" -1
+  out="$(run_promotion)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: pidStartSeconds=-1 read PID DEAD (an unusable start must abstain)"
+  elif grep -q "PID ? (unreadable)" <<<"$out"; then
+    echo "ok: $label pidStartSeconds=-1 ABSTAINS as PID ? (unreadable), never PID DEAD"
+  else
+    fail "$label: pidStartSeconds=-1 neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
+  fi
+
+  # (h) an ABSTENTION must not SUPPRESS the suspect ladder: off-fence + a STALE
+  # transcript is still a suspect, never a clean report. The stale transcript is reused by
+  # leg (i), which needs a lane to remain suspect while the STORE is unusable.
+  local tfile="$phome/.pi/agent/sessions/--stale--/x_$sid.jsonl"
+  mkdir -p "$(dirname "$tfile")"
+  python3 -c 'import os,sys,time
+open(sys.argv[1], "a").close()
+os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
+  write_prom_store "$$"
+  out="$(run_promotion)"
+  if grep -q "PID DEAD" <<<"$out"; then
+    fail "$label: off-fence + stale transcript read PID DEAD"
+  elif grep -q "PID ? (off-fence)" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then
+    echo "ok: $label an abstaining lane with a stale transcript stays a SUSPECT (the abstention does not suppress the ladder)"
+  else
+    fail "$label: abstention SUPPRESSED the suspect ladder — a stale lane read as clean: $(grep -E '^B1 |no suspects' <<<"$out")"
+  fi
+
+  # (i) the DATA SOURCE abstains: an unreadable store and a shape-drifted store must each
+  # report the scan INCOMPLETE with exit 1 — never `no suspects` — AND must still list a
+  # suspect the ladder found (a failed read may not suppress it either). The exit code is
+  # captured with `|| rc=$?` because `out="$(cmd)"; rc=$?` aborts the suite under `set -e`.
+  printf '{"sessions":{' > "$store"
+  rc=0; out="$(run_promotion)" || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q "INCOMPLETE" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then
+    echo "ok: $label unreadable hook store ⇒ INCOMPLETE (exit 1) and the stale lane is still a SUSPECT"
+  else
+    fail "$label: unreadable hook store did not abstain (rc=$rc): $(grep -E '^B1 |no suspects|INCOMPLETE' <<<"$out")"
+  fi
+  printf '{"sessions":{"drift":{"pid":%s}}}' "$$" > "$store"
+  rc=0; out="$(run_promotion)" || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q "INCOMPLETE" <<<"$out"; then
+    echo "ok: $label shape-drifted hook store ⇒ INCOMPLETE (exit 1), never 'no suspects'"
+  else
+    fail "$label: shape-drifted hook store did not abstain (rc=$rc): $(grep -E '^B1 |no suspects|INCOMPLETE' <<<"$out")"
+  fi
+  write_prom_store 999999
+  rm -f "$tfile"
 }
 
 run_setup() {
@@ -269,12 +482,13 @@ check_fix_markers "$DEST/extensions" "run1"
 check_record_review_farmed "run1"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
+check_fleet_health_promotion "run1"
 grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
 grep -q "scripts lib farm: 1 copied (pid-identity.sh, #1178)" "$RUNS_LOG" \
   || fail "run 1 did not report the shared-library farm copy (#1178)"
-grep -q "tools/fleet farm: 2 copied (lane-liveness, #1178)" "$RUNS_LOG" \
-  || fail "run 1 did not report the fleet-tools farm copy (#1178 unit 3)"
+grep -q "tools/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
+  || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
 
 # --- run 2: re-run must refresh the ACTIVE files --------------------------
 # (a) a dest mutation must be overwritten by the source (content-merge);
@@ -290,6 +504,12 @@ if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then
 fi
 if [ -f "$DEST/tools/fleet/liveness.py" ]; then
   echo "# stale farm mutation" >> "$DEST/tools/fleet/liveness.py"        # #1178 unit 3 farm refresh
+fi
+if [ -f "$DEST/tools/fleet/fleet-health.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/tools/fleet/fleet-health.py"     # #1178 unit 4 farm refresh
+fi
+if [ -f "$DEST/tools/fleet/map-sessions.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/tools/fleet/map-sessions.py"     # #1178 unit 4 farm refresh
 fi
 SRC_MARKER="$ROOT/pi-bootstrap/pi-config/agents/zz-setup-test-marker.md"
 echo "# issue-93 test marker" > "$SRC_MARKER"
@@ -318,6 +538,16 @@ if grep -q "stale farm mutation" "$DEST/tools/fleet/liveness.py" 2>/dev/null; th
   fail "stale farm mutation survived re-run (farmed liveness.py was not refreshed)"
 else
   echo "ok: farmed liveness.py refreshed on re-run (#1178)"
+fi
+if grep -q "stale farm mutation" "$DEST/tools/fleet/fleet-health.py" 2>/dev/null; then
+  fail "stale farm mutation survived re-run (farmed fleet-health.py was not refreshed)"
+else
+  echo "ok: farmed fleet-health.py refreshed on re-run (#1178 unit 4)"
+fi
+if grep -q "stale farm mutation" "$DEST/tools/fleet/map-sessions.py" 2>/dev/null; then
+  fail "stale farm mutation survived re-run (farmed map-sessions.py was not refreshed)"
+else
+  echo "ok: farmed map-sessions.py refreshed on re-run (#1178 unit 4)"
 fi
 if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
