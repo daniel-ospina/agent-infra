@@ -8,8 +8,55 @@ to its transcript, so mtime alone proves nothing — confirm any suspect with
 Strongest cheap "is it actually running" signal: **CPU-time delta** for the pid since the
 previous run of this script (state kept in fleet-health-prev.json). CPU time only advances
 while the process does work, so a live pid with ~0 delta AND a stale transcript is a wedge.
+
+A pid is **dead only under the fleet's ONE process-identity rule** (#1178). `_alive()` used
+to be a bare `os.kill(pid, 0)` — no start-time fence, no zombie exclusion — so a pid that
+was ALIVE but no longer the process that owned the session (pid reuse) read `PID DEAD`. The
+read now goes through `scripts/lib/pid-identity.sh`, the same library the kill-path reaper
+sources and the liveness classifier shells out to. An **unresolvable read ABSTAINS**
+(`PID ? (...)`) instead of reporting a death it cannot witness.
 """
 import json, os, re, subprocess, sys, time, glob
+
+# ── the fleet's ONE process-identity rule (#1178) ────────────────────────
+# This module does NOT decide liveness. A Python file cannot source a Bash library, so the
+# read goes through the SAME probe boundary the classifier uses:
+#     tools/fleet/liveness.py -> scripts/lib/pid-identity.sh probe <pid> <startSeconds>
+# Importing the sibling classifier (rather than re-implementing the CLI call) keeps ONE
+# rc->status mapping and ONE library-path resolution; a second copy here would recreate
+# exactly the two-contracts-for-one-safety-rule defect this replaces.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import liveness as _liveness
+except Exception:
+    # No sibling classifier: abstain rather than guess. NEVER fall back to a bare
+    # existence check — that is the defect, not the fallback.
+    _liveness = None
+
+# The probe vocabulary (the library's CLI contract). Only `absent` and `zombie` are death
+# witnesses; `off-fence` (a live but UNMATCHED incarnation — pid reuse) and `unreadable`
+# (a failed read) are ABSTENTIONS.
+DEAD_OBSERVED = ("absent", "zombie")
+HOLDER_OBSERVED = "holder"
+
+
+def _observed(pid, start_seconds):
+    """The canonical identity read for a lane's recorded incarnation (#1178).
+
+    Returns one of holder | absent | zombie | off-fence | unreadable. EVERY failure — a
+    missing sibling classifier, a missing or unrunnable identity library, a failed `ps`,
+    an unusable recorded start — returns `unreadable`, which the caller renders as an
+    abstention. It must never be collapsed into `absent`: that would manufacture
+    "PID DEAD" out of a read that did not happen (#1178 C3).
+    """
+    if _liveness is None:
+        return "unreadable"
+    try:
+        res = _liveness.probe_pid(pid, start_seconds)
+        return _liveness.observed_from_probe(res.rc, res.status)
+    except Exception:
+        return "unreadable"
+
 
 STATE = os.path.expanduser("~/.pi/agent/state/fleet-health-prev.json")
 HOOK = os.path.expanduser("~/.cmuxterm/pi-hook-sessions.json")
@@ -117,8 +164,13 @@ def main():
             delta_txt = "(first)"
 
         flag = ""
-        if pid and not _alive(pid):
+        observed = _observed(pid, rec.get("pidStartSeconds")) if pid else None
+        if observed in DEAD_OBSERVED:
             flag = "PID DEAD"
+        elif observed is not None and observed != HOLDER_OBSERVED:
+            # An unresolvable read ABSTAINS (#1178 C1/C3): the pid is present but its
+            # incarnation could not be matched, or the read failed. Never `PID DEAD`.
+            flag = "PID ? (%s)" % observed
         elif age is not None and age > SUSPECT_AGE:
             if delta is None:
                 flag = f"** CHECK: quiet {age:.0f}s, no CPU delta yet **"
@@ -164,14 +216,6 @@ def main():
             print(f"   - {name}: {why}")
     else:
         print("✅ no suspects")
-
-
-def _alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except Exception:
-        return False
 
 
 if __name__ == "__main__":
