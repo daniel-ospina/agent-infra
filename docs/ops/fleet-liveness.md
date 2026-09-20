@@ -89,20 +89,27 @@ entry** (read backwards from EOF; the boundary is always at the end):
 | `turn-open:pending-tool-call` | an assistant message **carrying tool calls** whose `stopReason` is not one under which pi discards them (`error` / `aborted`); or `stopReason: toolUse` |
 | `turn-open:awaiting-assistant` | a `toolResult` with no assistant reply after it |
 | `turn-open:awaiting-response` | a user prompt with no assistant reply after it |
-| `turn-open:no-terminal-stop` | the last assistant message carries no `stopReason` |
+| `turn-open:no-terminal-stop` | the last assistant message carries no `stopReason` **and no tool calls** (a call-carrying message with no `stopReason` is `turn-open:pending-tool-call`) |
 
 A transcript whose last turn ended with a terminal `stopReason` on a message carrying **no** tool
 calls (`stop` / `length` / `error` / `aborted`), or with `error` / `aborted` on a message
-**carrying** tool calls, is **RESTING**: it reads `running-quiet` (`turn-ended`) however long it
-is quiet short of the 24 h retirement proof.
+**carrying** tool calls, is **RESTING**: it reads `running-quiet`, never `wedged`, short of the
+24 h retirement proof — and the `reason` names the path that returned that state
+(`quiet-within-bound` inside the 20 min bound, `turn-ended` past it, `record-non-idle-fresh` or
+`tool-in-flight` while those vetoes hold).
 
-> **pi behaviour, and how it was established.** The stop-reason rule rests on pi's own semantics,
-> measured by the #1254 unit over **426 live session files** (the measurements are recorded in
-> `liveness.py`): of assistant messages carrying tool calls, `toolUse` 147,466 with 147,431
-> answered; `error` 115 with **0** answered; `length` 78 with **78** answered; `aborted` 16 with
-> **0** answered. pi **suspends on `length`** to execute the calls, so `length`+calls is an OPEN
-> turn, while `error`/`aborted` **discard** their calls. This is third-party behaviour, not our
-> contract — if pi changes it, the measurement is what must be re-run.
+> **pi behaviour, and how it was established.** The stop-reason rule rests on pi's own semantics.
+> Measured by the #1254 unit over **426 live session files**: of assistant messages carrying tool
+> calls, `toolUse` 147,466 with 147,431 `resultFollows`; `error` 115 with **0**; `length` 78 with
+> **78**; `aborted` 16 with **0**. `resultFollows` is **not** `executed`: pi's own source
+> (`pi-agent-core` `dist/agent-loop.js`, `failToolCallsFromTruncatedMessage`) routes a `length`
+> message's calls to a failure path — every result after a `length`+calls message carries
+> `isError: true` ("Tool call … was not executed") — and then **continues the turn**. So
+> `length`+calls is an OPEN turn awaiting the turn's next step, while `error` / `aborted`
+> **discard** their calls and end the turn. (An earlier reading of the same 78/78 count called
+> those calls "executed"; a count of results is not evidence of work.) This is third-party
+> behaviour, not our contract — if pi changes it, the measurement and the source are what must be
+> re-checked. The classifier's verdict is unaffected either way: `length`+calls is OPEN.
 
 ---
 
@@ -355,8 +362,8 @@ This doc's value is being **true**. Claims are labelled by how they were establi
   session files, recorded in `liveness.py` by the #1254 unit); the store field count (**0 of 1409**
   records carry any heartbeat/tool field, this host, 2026-09-20); closed-pane count (8 of 34);
   every session file having a message entry within 256 KiB.
-- **pi behaviour (third-party)** — the meaning of `stopReason` (`length` executes calls;
-  `error`/`aborted` discard them), where pi writes a compaction entry, the session JSONL layout,
+- **pi behaviour (third-party)** — the meaning of `stopReason` (`length` **fails** the truncated
+  calls and continues the turn; `error` / `aborted` discard them), where pi writes a compaction entry, the session JSONL layout,
   and the `--session <id>` resume form. These are established by the measurements named above and
   by the classifier's own parsing tests, **not** by a documented pi contract. If pi changes them,
   the measurement is what must be re-run.
