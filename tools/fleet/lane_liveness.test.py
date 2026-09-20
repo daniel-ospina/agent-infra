@@ -11,14 +11,18 @@ DRY-RUN / rc=2) plus the legs this surface adds:
     ENV-ERROR   a corrupt store is exit 2, no issue (§5)
     STALE-DEAD  a dead lane quiet past the reaper's idle proof is REPORTED,
                 never escalated (the retired-pane noise class)
-    CHILD-EXCL  a task child's newer record on the parent's workspace does not
-                become the lane's verdict
+    CLOSED-WORKSPACE a retired/closed pane is filtered out of the population
+                and does not escalate
+    PS-CACHE    the driver's one-read-per-pass `ps` cache is exercised on every
+                leg (a cache miss would re-read the process table per lane)
     TURN-BOUNDARY a lane whose transcript ended is `running-quiet` however long
                 it rests (short of the 24h retirement proof; this fixture's row
                 reason is `turn-ended`, but the emitted POLICY sentence asserts
                 only the state, since three paths reach it), while a
                 lane frozen with an OPEN turn is still `wedged` — the #1254
-                contract at the report layer
+                contract at the report layer. The child-exclusion scenario (a
+                task child's newer record must not become the parent's verdict)
+                is asserted inside CLEAN, paired with its own RED control.
     COMPACTION    a lane whose last transcript entry is a `compaction` abstains
                 (`unknown`/`tail-after-compaction`), never a decided turn (#1254 P1)
 
@@ -545,6 +549,11 @@ def leg_turn_boundary(module=None):
         # the `idle`/`jsonl-old` branch returns first).
         assert_contains(out, "short of the 24h retirement proof",
                         "the policy text names the retirement-proof carve-out")
+        # Positive pin on the corrected clause: the sentence must assert the
+        # STATE (`running-quiet`) for a lane whose turn ended — not merely omit
+        # the historical reason name.
+        assert_contains(out, "reads `running-quiet` however long it",
+                        "the policy text asserts the STATE alone for a turn-ended lane (#1273)")
         # #1273: the policy sentence must assert the STATE alone — three paths
         # return `running-quiet` for a turn-ended lane (`quiet-within-bound`
         # inside the stream bound, `turn-ended` past it, `record-non-idle-fresh`
