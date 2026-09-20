@@ -424,6 +424,8 @@ Before recording any information, find the correct home first:
 4. **Raw coding gotcha** (trips you up mid-code, no natural docs home)? → One concise line in `MEMORY.md`
 
 <!-- REPO-SPECIFIC: Add your doc routing rules (e.g., "For topic-to-file routing, see docs/00_index.md") -->
+<!-- REPO-SPECIFIC (agent-infra): doc routing — this repo has no docs index. -->
+**Fleet session liveness** (the five states, the identity ordering, the abstention doctrine): see `docs/ops/fleet-liveness.md`.
 
 ### Entity Annotation
 
