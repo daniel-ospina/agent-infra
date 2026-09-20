@@ -418,72 +418,123 @@ parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 # attempt to MODEL it produced four fail-opens in three review rounds (see the
 # comment above all_close_refs); for HTML comments I could not establish it
 # either. So this does NOT guess: a false block cleared by a one-word edit is the
-# safe error, and refusing is the direction this gate exists for. A fenced body
-# that quotes the keyword form is therefore refused — use inline code, which is
-# inert, or drop the number from the sentence.
+# safe error, and refusing is the direction this gate exists for. A body that
+# quotes the keyword form — in a fence OR in inline code — is therefore refused
+# when the number is not the intended one: name it without the keyword, or drop
+# the number. Inline code is NOT suppressed anywhere in the blocking path; the
+# advisory in close_word_notes explains the one consequence that would otherwise
+# be silent.
 #
 # The keyword class is word-boundary-anchored (`\b`): CLOSING_KW's class is a
 # SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), so an
 # unanchored scan invents hazards out of prose that closes nothing — the same
 # false-refusal trap record-review.sh's tier guard documents.
 
-# A FENCE IS NOT MODELLED — and that is deliberate. An earlier revision stripped
-# fenced blocks so a body that QUOTED the keyword form would not be refused. That
-# cost four defects in three review rounds, every one a FAIL-OPEN in the
-# direction this gate exists to catch, each in a different input dimension of the
-# same question "is this line a fence?": opener indentation (a 4-column opener is
-# an indented code block, not a fence), an info string containing a backtick
-# (CommonMark forbids it, so the line is a paragraph), and a fence-looking line
-# inside an HTML comment (never a fence). A line-toggle that must be right about
-# that question in every dimension is a net loss: getting it wrong HIDES a live
-# closure, while not having it at all merely refuses a body that quotes a keyword
-# inside a fence — visible, and cleared by using inline code or dropping the
-# number.
+# WHAT IS MODELLED, AND WHY IT IS ONLY THIS (adversarial review, cycle 1). Four
+# fixes across three rounds all failed the same way: each tried to MODELF text —
+# first fences, then inline-code subtraction — and each attempt produced
+# FAIL-OPENS, hiding the very closure this gate exists to catch. So the blocking
+# rule now SUPPRESSES NOTHING:
 #
-# So the model is one rule: INLINE CODE IS INERT; EVERYTHING ELSE IS LIVE. That is
-# the conservative direction, it needs no fence parser, and the inline-code half
-# is the half GitHub's behaviour actually verifies (a backticked intended keyword
-# demonstrably did not close its issue on PR #1271).
-# all_close_refs <text> — every issue number <text> names with a closing
-# keyword, one per line, ascending, deduped. This is the set of issues the body
-# WILL close on merge. The cross-repo owner/repo prefix is dropped, so the
-# returned value is the issue NUMBER; a cross-repo reference sharing a number
-# with the target is therefore indistinguishable from it (conservative: the
-# gate's message names the number either way).
+#   H1 (BLOCKING) — every reference the body names with a closing keyword must
+#   resolve to the issue the author meant. No subtraction, no inert set.
+#   Suppressing a suppression can only make the scan MORE conservative, so H1
+#   cannot fail open by construction; it can only false-block, and a false block
+#   is visible, is one edit to clear, and reports its remedy.
+#
+#   H2 (ADVISORY, NON-blocking) — the intended keyword also appearing inside
+#   inline code. Its harm is an issue that stays open: visible, and requiring no
+#   gate to notice. Gating it produced a false block whose own message asserted
+#   the opposite of the truth, so it advises instead.
+#
+# The three fail-opens this deletes, every one reproduced by the reviewer:
+#   P1 — the span regex paired ANY two backticks, so a line holding two inline
+#        spans made a live unintended closure look inert.
+#   P2 — the inert set held NUMBERS, so one inert mention of N disarmed the
+#        report for every live mention of N.
+#   P3 — references were compared as bare numbers, so "Closes other/repo#N" plus
+#        a bare "closes #N" collapsed into one value and the unintended closure
+#        of the LOCAL issue went unreported. References are QUALIFIED now.
+# And the false block it removes:
+#   P4 — a body with a live intended keyword AND a backticked quotation of it was
+#        refused, with a message claiming the link would not be created.
+#
+# What is deliberately NOT modelled, so the omission is not mistaken for an
+# oversight: fences, HTML comments and raw `<code>` HTML are all scanned as LIVE.
+# Whether GitHub skips them could not be established, and guessing is what
+# produced the fail-opens above, so the gate refuses rather than waves through.
+
+# normalize_ref <raw-ref> — a closing reference as a QUALIFIED owner/repo#N ref,
+# lowercased so case differences cannot manufacture a hazard. Handles the bare,
+# owner/repo and full-URL forms parse_issue_ref accepts; a bare #N belongs to the
+# repo the gate runs against.
+normalize_ref() {
+  local ref rest
+  # LOWERCASE FIRST. The case pattern below matches the URL's scheme and host, and
+  # matching those case-sensitively while parse_issue_ref accepts any case made the
+  # gate refuse a body's OWN intended issue whenever the host was capitalised — a
+  # false block, found independently by both cycle-2 reviewers.
+  ref="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$ref" in
+    https://github.com/*/issues/*)
+      rest="${ref#https://github.com/}"
+      # SHORTEST suffix match (`%/issues/*`, NOT `%%`), so a repository actually
+      # named "issues" keeps its name: owner/issues/issues/173 → owner/issues#173.
+      # The greedy form ate the repo name and mismatched the intended ref — the
+      # second false block the cycle-2 reviewers reproduced.
+      ref="${rest%/issues/*}#${rest##*/}" ;;
+    \#*) ref="${GH_REPO}${ref}" ;;
+  esac
+  printf '%s\n' "$ref" | tr '[:upper:]' '[:lower:]'
+}
+
+# all_close_refs <text> — every reference <text> names with a closing keyword,
+# one per line, deduped: the set of issues this body WILL close on merge.
 all_close_refs() {
   printf '%s\n' "$1" \
-    | grep -ioE "\\b${CLOSING_KW}[[:space:]]*:?[[:space:]]*(#[0-9]+|[^/[:space:],;)]+/[^/[:space:],;)]+#[0-9]+|https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+)" \
-    | grep -oE '(#[0-9]+$|/[0-9]+$)' | grep -oE '[0-9]+' | sort -n -u
+    | grep -ioE "\\b${CLOSING_KW}[[:space:]]*:?[[:space:]]*(#[0-9]+|https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+|[[:alnum:]_.-]+/[[:alnum:]_.-]+#[0-9]+)" \
+    | sed -E 's/^[[:alpha:]]+[[:space:]]*:?[[:space:]]*//' \
+    | while read -r raw; do [[ -n "$raw" ]] && normalize_ref "$raw"; done \
+    | sort -u
 }
 
 # code_span_close_refs <text> — the issue numbers whose closing keyword sits
-# INSIDE inline code (backticks). GitHub skips code spans, so these are inert:
-# they close nothing. Separated from all_close_refs rather than folded in,
-# because an inert mention of a DIFFERENT issue is harmless noise while an inert
-# mention of the INTENDED issue is the H2 failure.
+# INSIDE inline code (backticks). ADVISORY ONLY (see close_word_notes): this set
+# is NEVER subtracted from the blocking scan. It is a naive span matcher — it
+# pairs any two backticks, so a line holding two spans can mis-pair them — and
+# that is tolerable only because a wrong answer here changes a NOTE, never a
+# verdict. Do not reintroduce it into the blocking path.
 code_span_close_refs() {
   printf '%s\n' "$1" \
     | grep -ioE '`[^`]*'"${CLOSING_KW}"'[^`]*(#[0-9]+|/[0-9]+)[^`]*`' \
     | grep -oE '(#[0-9]+|/[0-9]+)' | grep -oE '[0-9]+' | sort -n -u
 }
 
-# scan_close_word_hazards <text> <intended-number> — the gate's hazard text, or
-# empty when clean. Disjointness is the whole point:
-#   H1 = will-close MINUS inert MINUS intended  → an unintended closure
-#   H2 = intended INTERSECT inert               → the intended closure disarmed
-# An inert mention of some OTHER issue is neither (it closes nothing and was not
-# intended), so it is not reported.
+# scan_close_word_hazards <text> <intended-ref> — H1 only: the BLOCKING hazard
+# text, or empty when clean. Every reference named with a closing keyword must be
+# the intended one; nothing is suppressed (see the comment above normalize_ref).
+# <intended-ref> is the QUALIFIED ref resolve_issue_ref returned.
 scan_close_word_hazards() {
-  local text="$1" intended="$2" out="" n inert=" "
-  for n in $(code_span_close_refs "$text"); do inert="$inert$n "; done
-  for n in $(all_close_refs "$text"); do
-    [[ "$n" == "$intended" ]] && continue
-    case "$inert" in *" $n "*) continue ;; esac
-    out+="      ⚠️  H1 unintended close: the body names #$n with a closing keyword, so GitHub will CLOSE #$n on merge. Its parser reads the words and not the sentence — a negation is not understood, so \"this does NOT close #$n\" IS that instruction."$'\n'
+  local text="$1" intended="$2" out="" ref want
+  want="$(printf '%s' "$intended" | tr '[:upper:]' '[:lower:]')"
+  for ref in $(all_close_refs "$text"); do
+    [[ "$ref" == "$want" ]] && continue
+    out+="      ⚠️  H1 unintended close: the body names ${ref} with a closing keyword, so GitHub will CLOSE it on merge. Its parser reads the words and not the sentence — a negation is not understood, so a sentence saying the work does NOT close it IS that instruction."$'\n'
   done
+  printf '%s' "$out"
+}
+
+# close_word_notes <text> <intended-ref> — the ADVISORY text for H2, NEVER a
+# failure. Hedged deliberately: the span matcher behind it can be wrong in either
+# direction, so it states the consequence of the SHAPE rather than asserting what
+# GitHub will do (the unhedged version asserted the opposite of the truth on a
+# body whose intended keyword was also live — review cycle 1, P4).
+close_word_notes() {
+  local text="$1" intended="$2" out="" n want_num
+  want_num="${intended##*#}"
   for n in $(code_span_close_refs "$text"); do
-    [[ "$n" == "$intended" ]] || continue
-    out+="      ⚠️  H2 disarmed close: the closing keyword for #$n is inside inline code (backticks). GitHub SKIPS code spans, so this closes NOTHING — the link the body intends will not be created and #$n stays open."$'\n'
+    [[ "$n" == "$want_num" ]] || continue
+    out+="      ℹ️  note (NOT a failure): the closing keyword for #$n also appears inside inline code. GitHub skips code spans, so if that is the ONLY occurrence, the link this description intends will not be created. Write it in plain text to be sure."$'\n'
   done
   printf '%s' "$out"
 }
@@ -726,7 +777,7 @@ fetch_json() {
 # COMMIT_MSGS, FILES. Prints pass/fail per check; returns failure count.
 
 run_checks() {
-  local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no" close_hazards=""
+  local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no" close_hazards="" close_notes=""
   local is_micro=false is_stdcomplex=false
   local tier="unspecified"
   local files_plain="" runtime_file="" test_evidence="" files_valid="" files_ok="false"
@@ -792,18 +843,20 @@ run_checks() {
     echo ""
   elif [[ -n "$issue_ref" ]]; then
     # #1274 — resolve_issue_ref found the reference the author MEANT. This asks
-    # the other half of the question: does the body also close something it
-    # never claimed to? See scan_close_word_hazards for the two failure shapes
-    # (a negation read as an instruction; an intended keyword disarmed by
-    # inline code). Both were live on PR #1271 and this gate passed it.
-    close_hazards="$(scan_close_word_hazards "$PR_BODY" "$issue_number")"
+    # the other half of the question: does the body also close something it never
+    # claimed to? See scan_close_word_hazards — the blocking shape is an
+    # unintended closure; close_word_notes carries the non-blocking one. Both
+    # were live on PR #1271 and the old check passed it.
+    close_hazards="$(scan_close_word_hazards "$PR_BODY" "${issue_ref:-${GH_REPO}#${issue_number}}")"
     if [[ -n "$close_hazards" ]]; then
-      fail a "closing keyword hazard — GitHub acts on the WORDS in the PR body, not on the sentence: this body would close an issue it does not claim to close, or has disarmed the one it does."
+      fail a "closing keyword hazard — GitHub acts on the WORDS in the PR body, not on the sentence: this body would close an issue it does not claim to close."
       printf '%s\n' "$close_hazards"
       echo "      Remedy: to say an issue stays open, do NOT write a closing word next to its number — write \"leaves #N open\" or \"#N stays open\". And never wrap a real closing keyword in backticks: GitHub skips code spans, so it closes nothing."
       echo "      Invoke:  commit-workflow — rewrite the PR body, then re-run this gate."
       echo ""
     else
+      close_notes="$(close_word_notes "$PR_BODY" "${issue_ref:-${GH_REPO}#${issue_number}}")"
+      if [[ -n "$close_notes" ]]; then printf '%s\n' "$close_notes"; fi
       if [[ "$issue_ref_kind" == "closing" ]]; then
         pass a "linked issue $issue_display (closing keyword in PR body)"
       else
@@ -1203,12 +1256,34 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # is PR #1271's actual heading, the second is the same body's backticked
   # intended keyword.
   expect_hazard() {
-    local input="$1" intended="$2" want="$3" got
+    local input="$1" intended="$(printf '%s' "${GH_REPO}#$2" | tr '[:upper:]' '[:lower:]')" want="$3" got
     got="$(scan_close_word_hazards "$input" "$intended")"
     if { [[ "$want" == "yes" && -n "$got" ]] || [[ "$want" == "no" && -z "$got" ]]; }; then
       printf '✅ scan_close_word_hazards(%q, %s) → hazards=%s\n' "$input" "$intended" "$want"
     else
       printf '❌ scan_close_word_hazards(%q, %s) → want hazards=%s, got %q\n' "$input" "$intended" "$want" "$got" >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+  # The ADVISORY half. Never a failure, so a wrong answer here costs a note.
+  expect_note() {
+    local input="$1" intended="$(printf '%s' "${GH_REPO}#$2" | tr '[:upper:]' '[:lower:]')" want="$3" got
+    got="$(close_word_notes "$input" "$intended")"
+    if { [[ "$want" == "yes" && -n "$got" ]] || [[ "$want" == "no" && -z "$got" ]]; }; then
+      printf '✅ close_word_notes(%q, %s) → note=%s\n' "$input" "${GH_REPO}#$2" "$want"
+    else
+      printf '❌ close_word_notes(%q, %s) → want note=%s, got %q\n' "$input" "${GH_REPO}#$2" "$want" "$got" >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+  # normalize_ref directly — the qualifier the blocking compare depends on.
+  expect_normalize() {
+    local input="$1" want="$2" got
+    got="$(normalize_ref "$input")"
+    if [[ "$got" == "$want" ]]; then
+      printf '✅ normalize_ref(%q) → %s\n' "$input" "$got"
+    else
+      printf '❌ normalize_ref(%q) → want %s, got %s\n' "$input" "$want" "$got" >&2
       selffail=$((selffail + 1))
     fi
   }
@@ -1219,11 +1294,38 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_hazard $'Closes #173\nThis also fixes #174 in passing.' 173 yes
   expect_hazard $'Closes #173\nCloses #174' 173 yes
   # H2 — the intended keyword disarmed by inline code.
-  expect_hazard '`Closes #173`' 173 yes
+  expect_hazard '`Closes #173`' 173 no
+  expect_note '`Closes #173`' 173 yes
   # Precision: an INERT mention of some OTHER issue is neither closure nor
   # disarmed intent — flagging it would be noise, and noise is how a gate gets
   # routed around.
-  expect_hazard $'Closes #173\nsee `Closes #174` for how the keyword works' 173 no
+  expect_hazard $'Closes #173\nsee `Closes #174` for how the keyword works' 173 yes
+  # ==== adversarial review, cycle 1 — four findings, all reproduced ====
+  # P1 — the span regex paired ANY two backticks, so two inline spans on one line
+  # disguised a LIVE unintended closure as inert. Nothing is subtracted now.
+  expect_hazard $'Closes #173\nThe `fleet` note says this also Closes #174 (see `docs/ops`).' 173 yes
+  # P2 — the inert set held NUMBERS, so one inert mention of N disarmed the report
+  # for every live mention of N.
+  expect_hazard $'Closes #173\nAlso Closes #174.\nNote: `Closes #174` was the historical form.' 173 yes
+  # P3 — refs were compared as bare numbers, so a cross-repo ref and a local one
+  # sharing a number collapsed and the unintended local closure went unreported.
+  expect_hazard $'Closes other/repo#173\nAlso closes #173 in the local repo' 173 yes
+  # P4 — a live intended keyword AND a backticked quotation of it used to be
+  # REFUSED, with a message asserting the link would not be created. Now there is
+  # no H1, and the consequence is a hedged note rather than a false failure.
+  expect_hazard $'Closes #173\nThe `Closes #173` form is what GitHub reads.' 173 no
+  expect_note $'Closes #173\nThe `Closes #173` form is what GitHub reads.' 173 yes
+  expect_note 'Closes #173' 173 no
+  # ==== cycle 2 — both reviewers independently reproduced these two ====
+  # A FALSE BLOCK in normalize_ref: the URL branch matched case-sensitively, so a
+  # capitalised host never qualified and the body's OWN intended issue was
+  # reported as an unintended close.
+  expect_normalize 'https://GitHub.com/Daniel-Ospina/Agent-Infra/issues/173' 'daniel-ospina/agent-infra#173'
+  expect_normalize 'HTTPS://GITHUB.COM/owner/repo/issues/173' 'owner/repo#173'
+  # ...and the greedy suffix strip ate a repository named "issues".
+  expect_normalize 'https://github.com/owner/issues/issues/173' 'owner/issues#173'
+  # The end-to-end shape: a capitalised intended URL must not be refused.
+  expect_hazard 'Closes https://GitHub.com/daniel-ospina/agent-infra/issues/173' 173 no
   # The keyword class is a SUFFIX of ordinary words: prose that closes nothing
   # must not manufacture a hazard.
   expect_hazard $'Closes #173\nthe prefix #99 discloses #98' 173 no
@@ -1237,7 +1339,8 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # N3 (verifier, this PR) — CommonMark forbids a backtick in a backtick fence's
   # info string, so ```Closes #173``` is a PARAGRAPH rendering as a code span:
   # inert, hence H2 — never a fence opener that hides what follows it.
-  expect_hazard '```Closes #173```' 173 yes
+  expect_hazard '```Closes #173```' 173 no
+  expect_note '```Closes #173```' 173 yes
   # ...and the mirror image stripping got wrong: a live closure AFTER such a line
   # is live too.
   expect_hazard $'Closes #173\n\n```Closes #999```\nCloses #174' 173 yes
@@ -1246,7 +1349,8 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_hazard $'Closes #173\n\n<!--\n```\n-->\nCloses #174' 173 yes
   # P1 (verifier, this PR) — H2 must see every reference FORM parse_issue_ref
   # accepts, not just bare #N: a backticked URL is just as disarmed.
-  expect_hazard '`Closes https://github.com/daniel-ospina/agent-infra/issues/173`' 173 yes
+  expect_hazard '`Closes https://github.com/daniel-ospina/agent-infra/issues/173`' 173 no
+  expect_note '`Closes https://github.com/daniel-ospina/agent-infra/issues/173`' 173 yes
   # #1012 r3 — the prefix + checkbox groups are REPEATABLE, so a COMPOUND
   # line-leading prefix (nested blockquote; list inside a quote) is a reference
   # context too. A single-consumption group false-BLOCKED check (a) on these
