@@ -253,7 +253,9 @@ check_fleet_tools_farmed() {
 #     with no library on disk, and this test fails.
 #   * an ABSTENTION must not SUPPRESS the quiet/CPU suspect ladder (#1178 A-class):
 #     a stale lane whose identity could not be read is still a SUSPECT, never a
-#     clean `✅ no suspects`.
+#     clean `✅ no suspects`. The same holds one level up: an unreadable or
+#     shape-drifted HOOK STORE reports the scan INCOMPLETE with exit 1, and still
+#     lists any suspect the ladder found.
 #
 # The positive legs are HERMETIC about the environment (see `run_promotion`), so a
 # green pin also proves the tools/fleet/ <-> scripts/lib/ RELATIVE layout survived
@@ -265,7 +267,7 @@ check_fleet_health_promotion() {
   local phome="$TMP/prom-home"
   local sid="01a08ca6-3539-71ed-a0d7-7cee52feee03"   # lane B1 (the LANES hardcode)
   local store="$phome/.cmuxterm/pi-hook-sessions.json"
-  local zpid_file="$TMP/zombie.pid" zparent="" zpid="" zstat="" out
+  local zpid_file="$TMP/zombie.pid" zparent="" zpid="" zstat="" out rc=0
 
   [ -f "$tool" ] || { fail "$label: farmed fleet-health.py missing — the promotion is unpinnable"; return; }
   [ -f "$lib" ]  || { fail "$label: farmed lib/pid-identity.sh missing — the promotion cannot load the rule"; return; }
@@ -396,7 +398,8 @@ time.sleep(60)' "$zpid_file" &
   fi
 
   # (h) an ABSTENTION must not SUPPRESS the suspect ladder: off-fence + a STALE
-  # transcript is still a suspect, never a clean report.
+  # transcript is still a suspect, never a clean report. The stale transcript is reused by
+  # leg (i), which needs a lane to remain suspect while the STORE is unusable.
   local tfile="$phome/.pi/agent/sessions/--stale--/x_$sid.jsonl"
   mkdir -p "$(dirname "$tfile")"
   python3 -c 'import os,sys,time
@@ -411,6 +414,26 @@ os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   else
     fail "$label: abstention SUPPRESSED the suspect ladder — a stale lane read as clean: $(grep -E '^B1 |no suspects' <<<"$out")"
   fi
+
+  # (i) the DATA SOURCE abstains: an unreadable store and a shape-drifted store must each
+  # report the scan INCOMPLETE with exit 1 — never `no suspects` — AND must still list a
+  # suspect the ladder found (a failed read may not suppress it either). The exit code is
+  # captured with `|| rc=$?` because `out="$(cmd)"; rc=$?` aborts the suite under `set -e`.
+  printf '{"sessions":{' > "$store"
+  rc=0; out="$(run_promotion)" || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q "INCOMPLETE" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then
+    echo "ok: $label unreadable hook store ⇒ INCOMPLETE (exit 1) and the stale lane is still a SUSPECT"
+  else
+    fail "$label: unreadable hook store did not abstain (rc=$rc): $(grep -E '^B1 |no suspects|INCOMPLETE' <<<"$out")"
+  fi
+  printf '{"sessions":{"drift":{"pid":%s}}}' "$$" > "$store"
+  rc=0; out="$(run_promotion)" || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q "INCOMPLETE" <<<"$out"; then
+    echo "ok: $label shape-drifted hook store ⇒ INCOMPLETE (exit 1), never 'no suspects'"
+  else
+    fail "$label: shape-drifted hook store did not abstain (rc=$rc): $(grep -E '^B1 |no suspects|INCOMPLETE' <<<"$out")"
+  fi
+  write_prom_store 999999
   rm -f "$tfile"
 }
 

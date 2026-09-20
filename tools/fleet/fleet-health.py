@@ -15,7 +15,8 @@ in BOTH directions, and the directions were MEASURED, not assumed. A pid that a 
 process had reused, and a ZOMBIE (on which `kill(pid, 0)` also succeeds), read as a LIVING
 lane — an empty flag, a FAIL-OPEN that reported a dead lane healthy by silence. The opposite
 false `PID DEAD` came from `os.kill` raising for a process that IS alive (`EPERM` on a
-foreign-user pid) and from a failed `ps` read. The read now goes through
+foreign-user pid). A failed `ps` read is a shape `_alive()` never had: the promoted path
+maps it to `PID ? (unreadable)` — an abstention, never absence (the library's C3 split). The read now goes through
 `scripts/lib/pid-identity.sh`, the same library the kill-path reaper sources and the liveness
 classifier shells out to. An **unresolvable read ABSTAINS** (`PID ? (...)`) instead of
 reporting a death it cannot witness — and an abstention never SUPPRESSES the quiet/CPU
@@ -200,8 +201,15 @@ def main():
                     quiet = f"** CHECK: quiet {age:.0f}s, no CPU delta yet **"
                 elif delta < 0.5:
                     quiet = f"** SUSPECT: quiet {age:.0f}s AND no CPU consumed **"
-                else:
+                elif observed == HOLDER_OBSERVED:
                     quiet = f"quiet {age:.0f}s, CPU +{delta:.1f}s -> working"
+                else:
+                    # The CPU delta belongs to a pid the identity rule REFUSED to
+                    # attribute to this session (reused / unreadable start). Report the
+                    # raw evidence, never a "working" verdict — an unmatched pid's CPU is
+                    # not admissible positive evidence (mirrors liveness.py, which reads
+                    # such a candidate as `unknown`).
+                    quiet = f"quiet {age:.0f}s, CPU +{delta:.1f}s (identity unmatched — not attributable)"
                 flag = f"{flag} | {quiet}" if flag else quiet
         if quiet.startswith("**"):
             suspects.append((lane, flag))
@@ -235,17 +243,20 @@ def main():
                    for r in hook.values() if r.get("pid")}, fh)
 
     print()
-    if not hook_ok:
-        # The lane lookup was unusable, so NOTHING above is a verdict. Saying "no suspects"
-        # here is the false-PASS this branch exists to forbid, hence the non-zero exit.
-        print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (no lane was assessed)")
-        return 1
     if suspects:
         print(f"⚠️  {len(suspects)} suspect(s) — confirm with cmux read-screen before acting:")
         for name, why in suspects:
             print(f"   - {name}: {why}")
-    else:
+    elif hook_ok:
         print("✅ no suspects")
+    if not hook_ok:
+        # The lane lookup was unusable, so the rows above are NOT a verdict about the
+        # lanes they name — hence the non-zero exit and the explicit marker. But this
+        # branch runs AFTER the enumeration on purpose: a failed store read must not
+        # SUPPRESS a suspect the ladder did find, which is the same defect one level up
+        # from where the identity abstention was fixed.
+        print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
+        return 1
 
 
 if __name__ == "__main__":
