@@ -407,12 +407,9 @@ def _md_cell(text: str) -> str:
     line that can forge a heading — so each is neutralised here, at the RENDER
     layer (which also covers the pre-existing ``detail`` path: tool names and
     call ids). Every caller additionally wraps the result in a code span, which
-    neutralises the inline-markdown / raw-HTML vector (``[x](url)``, ``<h1>``);
-    the backslash escape keeps a value ending in ``\\`` from escaping that
-    closing backtick.
+    neutralises the inline-markdown / raw-HTML vector (``[x](url)``, ``<h1>``).
     """
     out = str(text)
-    out = out.replace("\\", "\\\\")
     out = out.replace("|", "\\|")
     out = out.replace("`", "'")
     return "".join(ch if ch.isprintable() else " " for ch in out)

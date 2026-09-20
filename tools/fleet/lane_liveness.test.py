@@ -130,6 +130,17 @@ SID_TURN_DONE = "eeeeeeee-0000-4000-8000-000000000005"
 SID_TURN_OPEN = "ffffffff-0000-4000-8000-000000000006"
 PID_TURN_DONE = 5555
 PID_TURN_OPEN = 6666
+# #1272 — hostile lane labels for the markdown-escape leg. ``Lane.name`` is
+# ``os.path.basename(cwd)`` (a directory name), so it reaches the report body as
+# transcript/store-derived text.
+WS_MD_ACTIVE = "66666666-6666-4666-8666-666666666666"
+WS_MD_STALE = "77777777-7777-4777-8777-777777777777"
+SID_MD_ACTIVE = "12121212-0000-4000-8000-000000000011"
+SID_MD_STALE = "12121212-0000-4000-8000-000000000012"
+PID_MD_ACTIVE = 7777
+PID_MD_STALE = 8888
+HOSTILE_ACTIVE_LABEL = "evil|x`y\r\n### forged-lane"
+HOSTILE_STALE_LABEL = "stale|z`q\r\n### forged-withheld"
 
 PS_SHIM = """#!/usr/bin/env bash
 [ "${1:-}" = "-axo" ] || exit 1
@@ -321,6 +332,22 @@ def turn_open_lane():
     return ("turn-open", WS_TURN_OPEN, SID_TURN_OPEN,
             record(SID_TURN_OPEN, WS_TURN_OPEN, PID_TURN_OPEN, updated_at=NOW_S,
                    non_idle=False, cwd="/tmp/turn-open"))
+
+
+def md_active_dead_lane():
+    """A DEAD lane whose label (cwd basename) is hostile: it exercises the table
+    lane cell AND the active escalation bullet (its pid is absent from ps)."""
+    return (HOSTILE_ACTIVE_LABEL, WS_MD_ACTIVE, SID_MD_ACTIVE,
+            record(SID_MD_ACTIVE, WS_MD_ACTIVE, PID_MD_ACTIVE, updated_at=NOW_S,
+                   cwd="/tmp/" + HOSTILE_ACTIVE_LABEL))
+
+
+def md_stale_dead_lane():
+    """A DEAD lane quiet past the idle proof with a hostile label: it exercises
+    the withheld-from-escalation list (no transcript ⇒ age unknown ⇒ withheld)."""
+    return (HOSTILE_STALE_LABEL, WS_MD_STALE, SID_MD_STALE,
+            record(SID_MD_STALE, WS_MD_STALE, PID_MD_STALE,
+                   updated_at=NOW_S - 30 * 3600, cwd="/tmp/" + HOSTILE_STALE_LABEL))
 
 
 def msg_entry(role, **msg):
@@ -619,14 +646,15 @@ def leg_compaction(module=None):
 
 def leg_md_escape(module=None):
     print("── MD-ESCAPE — a transcript value cannot forge a row, a link or a heading (#1272) ──")
-    fx = Fixture([turn_done_lane(), turn_open_lane()],
+    fx = Fixture([turn_done_lane(), turn_open_lane(), md_active_dead_lane(), md_stale_dead_lane()],
                  ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN)])
     try:
-        # Two transcript-derived fields reach the report body, which is ALSO the
-        # body of a filed escalation issue: the `reason` (here
-        # `turn-unknown:<stopReason>`) and the `detail`/evidence (the open turn's
-        # tool name and call id). Neither may add a table column, close the code
-        # span, open a link, or start a line that renders as a heading.
+        # FOUR transcript/store-derived fields reach the report body, which is ALSO
+        # the body of a filed escalation issue: the `reason` (here
+        # `turn-unknown:<stopReason>`), the `detail`/evidence (the open turn's tool
+        # name and call id), the lane label (a cwd basename) in the table, the
+        # active escalation bullet, and the withheld-from-escalation list. None
+        # may add a cell, close a code span, open a link, or start a heading line.
         hostile = "a|b`c\r\n### forged — escalated"
         write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
                          [msg_entry("assistant", stopReason=hostile,
@@ -636,32 +664,32 @@ def leg_md_escape(module=None):
                                     content=[{"type": "toolCall", "name": "evil|x`y",
                                               "id": "call_00_\r\n### forged-detail"}])])
         rc, out, gh = run_report(fx, module=module)
-        assert_eq(rc, 0, "an unknown lane and a live-holder wedge both decide nothing (exit 0)")
-        for label, needle, what in (
-                ("turn-done", "turn-unknown:a\\|b'c", "the reason cell (stopReason)"),
-                ("turn-open", "evil\\|x'y", "the evidence cell (tool name)")):
-            rows = [l for l in out.splitlines() if l.startswith("| `%s` " % label)]
-            assert_eq(len(rows), 1, "%s: the hostile value yields exactly ONE table row" % label)
-            if not rows:
-                bad("%s: the lane's table row is missing" % label)
-                continue
-            # Split on UNESCAPED pipes: a well-formed six-cell row yields 8 parts.
-            assert_eq(len(re.split(r"(?<!\\)\|", rows[0])), 8,
-                      "%s: the escaped pipe keeps the row at six cells" % label)
-            assert_contains(rows[0], needle, "%s: %s is escaped" % (label, what))
+        assert_eq(rc, 1, "the active dead lane escalates (its body is what gh posts)")
+        assert_contains(gh, "issue create", "the dead lane filed an issue")
+        for raw, escaped, what in (
+                ("a|b`c", "a\\|b'c", "the reason cell (stopReason)"),
+                ("evil|x`y", "evil\\|x'y", "the evidence cell (tool name)"),
+                (HOSTILE_ACTIVE_LABEL, "evil\\|x'y  ### forged-lane",
+                 "the table lane cell / active escalation bullet"),
+                (HOSTILE_STALE_LABEL, "stale\\|z'q  ### forged-withheld",
+                 "the withheld-from-escalation list")):
+            assert_contains(out, escaped, "%s: the hostile value is escaped" % what)
+            assert_eq(raw in out, False, "%s: the RAW value never reaches the body" % what)
+        assert_contains(gh, "evil\\|x'y  ### forged-lane",
+                        "the POSTED issue body carries the escaped label")
         assert_eq(any(l.startswith("### forged") for l in out.splitlines()), False,
                   "a transcript value cannot START a line (which is what renders as a heading)")
-        for label in ("turn-done", "turn-open"):
-            row = [l for l in out.splitlines() if l.startswith("| `%s` " % label)]
-            if row and row[0].count("`") != 10:
-                bad("%s: the cells must stay inside their code spans (got %d backticks)"
-                    % (label, row[0].count("`")))
-            else:
-                ok("%s: the cells stay inside their code spans" % label)
-        if gh:
-            bad("neither an unknown lane nor a live-holder wedge may escalate: %s" % gh)
-        else:
-            ok("no issue filed (neither state is escalatable)")
+        # Structural: every table row keeps six cells (no raw pipe forged a
+        # column), every code span is balanced (no raw backtick closed one), and
+        # every row ends with its closing pipe.
+        rows = [l for l in out.splitlines() if l.startswith("| `")]
+        assert_eq(len(rows) >= 4, True, "every lane got a table row")
+        assert_eq(all(len(re.split(r"(?<!\\)\|", r)) == 8 for r in rows), True,
+                  "every row keeps six cells (a raw pipe forged none)")
+        assert_eq(all(r.count("`") % 2 == 0 for r in rows), True,
+                  "every row's code spans are balanced (a raw backtick closed none)")
+        assert_eq(all(r.endswith(" |") for r in rows), True,
+                  "every row ends with its closing pipe (no raw newline split one)")
     finally:
         fx.close()
 

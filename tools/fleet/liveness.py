@@ -36,9 +36,10 @@ OPEN turn, read from the transcript's last message-bearing entry:
 * a ``toolResult`` with no assistant reply after it;
 * a user prompt with no assistant reply after it.
 
-A transcript whose last turn ended with a TERMINAL ``stopReason`` (``stop``, or
+A transcript whose last turn ended with a TERMINAL ``stopReason`` — ``stop`` or
 ``length`` on a message carrying NO tool calls, or ``error`` / ``aborted`` with or
-without calls) is RESTING: however long it has been quiet short of the retirement
+without calls (they end the agent run outright) — is RESTING: however long it has
+been quiet short of the retirement
 proof it reads ``running-quiet``, never ``wedged``; the ``reason`` field names
 which path
 returned that state. Terminality is an EXPLICIT set
@@ -340,10 +341,11 @@ class Turn:
     *why* rather than merely *that* nothing was written.
 
     ``abstain`` marks a boundary that licenses no disposition: a ``compaction``
-    written between turns, or an assistant ``stopReason`` whose terminality is
-    not in ``TERMINAL_STOP_REASONS`` (#1272). Such an entry can neither license
-    ``wedged`` nor be read as a finished turn, so the ladder returns ``unknown``
-    naming ``reason`` — a third disposition, not a weaker ``stalled``.
+    written between turns, or, on a message carrying NO tool calls, an assistant
+    ``stopReason`` whose terminality is not in ``TERMINAL_STOP_REASONS`` (#1272).
+    Such an entry can neither license ``wedged`` nor be read as a finished turn,
+    so the ladder returns ``unknown`` naming ``reason`` — a third disposition,
+    not a weaker ``stalled``.
 
     Absent evidence is NOT this object: an unreadable tail is ``None`` on
     ``Evidence.jsonl_turn``, an abstention the ladder names
