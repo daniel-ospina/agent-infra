@@ -246,13 +246,18 @@ for (const [file, entries] of perFile) {
 	for (const entry of entries) {
 		const occurrences = next.split(entry.find).length - 1;
 		if (occurrences === 0) {
-			const verified = entry.verifyPresent.every((needle) => next.includes(needle));
+			// The proof that the patched form is present is the entry's OWN replacement payload,
+			// verbatim — NEVER the scattered `verifyPresent` substrings. A substring test answers a
+			// different question ("does this text appear anywhere?"), so a comment that merely QUOTES
+			// the needles satisfied it and read as "already applied" over a tree whose fix code was
+			// gone — a false PASS. A comment cannot supply the payload.
+			const verified = next.includes(entry.replace);
 			if (verified) {
 				report.push(`  = ${entry.id} — already applied`);
 				continue;
 			}
 			fail(2, [
-				`${entry.id} (${file}): the anchor is absent AND the patched form is absent.`,
+				`${entry.id} (${file}): the anchor is absent AND the patched payload is absent.`,
 				"The tree is neither pristine nor patched — this file has been modified by something else.",
 				`expected one of: ${entry.verifyPresent.join(" | ")}`,
 				"NOTHING WAS WRITTEN — no file in this tree has been touched. Restore from backup, or re-derive the manifest.",
@@ -294,11 +299,14 @@ if (MODE === "apply") {
 }
 
 // ── 4. VERIFY — source shape ─────────────────────────────────────────────────────────────────
+// The patched REGION must be present verbatim. A `verifyPresent` substring loop here is the same
+// scattered-substring false PASS the already-applied branch above was hardened against: a comment
+// quoting the needles would satisfy it over a tree with no fix code.
 const shapeErrors = [];
 for (const entry of manifest.entries) {
 	const text = readFileSync(join(PI_ROOT, entry.file), "utf8");
-	for (const needle of entry.verifyPresent) {
-		if (!text.includes(needle)) shapeErrors.push(`${entry.id}: missing "${needle}" in ${entry.file}`);
+	if (!text.includes(entry.replace)) {
+		shapeErrors.push(`${entry.id}: the patched payload is not present verbatim in ${entry.file}`);
 	}
 }
 

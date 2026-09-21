@@ -42,9 +42,11 @@
 //   3. before_provider_request: the API-specific output ceiling field, resolved
 //        in a fixed order (max_tokens, max_completion_tokens, max_output_tokens,
 //        maxTokens, generationConfig.maxOutputTokens, inferenceConfig.maxTokens)
-//        → "clamp-imminent" — the PRE-death alarm (also fires for the
-//        compaction summarization call, which is intended: a summarization
-//        request clamped to 1 token is exactly what kills the session).
+//        → "clamp-imminent" — the PRE-death alarm for normal turns. It does
+//        NOT fire for the compaction summarization call: compaction calls
+//        `agent.streamFunction` directly and `createSummarizationOptions`
+//        builds its options without `onPayload`, so `before_provider_request`
+//        is never emitted for that request (#1263, verified against 0.85.1).
 //        Fires at 1, and at 16 only for `max_output_tokens` (the Responses
 //        floor); 0/negative never fires — the clamp's floor is Math.max(1, …).
 //        Latched: once per session.

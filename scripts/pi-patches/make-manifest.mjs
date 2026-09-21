@@ -2,7 +2,15 @@
 // pi-patches manifest generator — derives scripts/pi-patches/manifests/<version>/manifest.json
 // from the INSTALLED pi tree, so the `find` strings are byte-exact for that version.
 //
-// This set carries change (b) ONLY — the clamp output floor, never ask for a single token.
+// This set carries two changes:
+//   (b) the clamp output floor (#1214) — never ask for a single token.
+//   (d) the summarization budget floor (#1263) — never ask the update prompt to preserve more
+//       than it can emit. The update prompt instructs the model to PRESERVE the entire previous
+//       summary, so a budget below that summary's own size is unsatisfiable: the generation runs
+//       to the cap, returns stopReason "length", and the partial summary is discarded. The floor
+//       is applied ONLY when a previous summary exists, so the initial-summary budget is
+//       unchanged; it covers three copies (the ESM, and both inlined copies in the bundle chunk
+//       the CLI loads).
 // Change (c) (bounding the overflow-recovery latch in agent-session.js) is deliberately NOT in
 // this set: it contradicts four upstream tests that encode a one-shot recovery design, and (b)
 // alone closes the silent death because with a usable floor the 1-token turn cannot occur.
@@ -90,6 +98,59 @@ const CLAMP_BUNDLE_FIND =
 const CLAMP_BUNDLE_REPLACE =
 	'var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1,MIN_USABLE_MAX_TOKENS=1024;function clampMaxTokensToContext(model,context,maxTokens){/*pi-patch:#1214(b)*/if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return available<MIN_USABLE_MAX_TOKENS?Math.max(MIN_MAX_TOKENS,Math.min(maxTokens,MIN_USABLE_MAX_TOKENS)):Math.min(maxTokens,available)}';
 
+// ---- (d) summarization budget floor (#1263) ----------------------------------------------
+// The update-summarization prompt tells the model to PRESERVE the entire previous summary, so a
+// budget below that summary's own size can never be satisfied: the generation runs to the cap,
+// comes back stopReason "length", and getSummarizationFailure() throws the partial summary away
+// and fails the whole compaction — which then fails identically on the overflow path, so the
+// session can never compact again. Floor the budget at the size of the summary it must preserve,
+// bounded by the model's own ceiling. An upper bound costs nothing unless the model emits it.
+const SUMMARIZATION_BUDGET_ESM_FIND =
+	"    const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);";
+
+const SUMMARIZATION_BUDGET_ESM_REPLACE = [
+	"    // pi-patch #1263(d): the update prompt (UPDATE_SUMMARIZATION_PROMPT) instructs the model to",
+	"    // PRESERVE the previous summary, so a budget below that summary's own size is unsatisfiable:",
+	'    // the generation runs to the cap, returns stopReason "length", and getSummarizationFailure()',
+	"    // discards the partial summary and fails the whole compaction - which then fails identically",
+	"    // on the overflow path, so the session can never compact again. Measured on this fleet when",
+	"    // reserveTokens was 16384 (cap 13,107) against a 56,077-char previous summary (13,452 output",
+	"    // tokens): 21 session files were over the cap. Floor the budget at what we are asking it to",
+	"    // preserve. An upper bound costs nothing unless the model actually emits it. chars/2 is a",
+	"    // deliberately conservative token estimate: pi's own estimateTextTokens uses chars/4, and the",
+	"    // densest summary measured on this fleet is 3.19 chars per summary token (81,542 chars / 25,534",
+	"    // output tokens net of reasoning) - so chars/2 over-estimates the summary's own token count.",
+	"    const modelCeiling = model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY;",
+	"    const summaryCap = Math.min(Math.floor(0.8 * reserveTokens), modelCeiling);",
+	"    const priorTokens = previousSummary ? Math.ceil(previousSummary.length / 2) : 0;",
+	"    // Applied ONLY when there IS a previous summary to preserve. With none, the budget stays",
+	"    // exactly min(floor(0.8 * reserveTokens), model.maxTokens), so the initial-summary path is",
+	"    // provably unchanged — a residual the VGATE verifier proved for the unconditional form.",
+	"    const maxTokens = previousSummary ? Math.max(summaryCap, Math.min(priorTokens + 4096, modelCeiling)) : summaryCap;",
+].join("\n");
+
+// The bundle copy sits INSIDE the existing `let a=..., b=...` comma chain: the replacement must
+// introduce no semicolon before `,basePrompt`. The find string therefore starts at `let` and ends
+// before the comma, and the replacement re-declares the same single `let` statement.
+const SUMMARIZATION_BUDGET_BUNDLE_FIND =
+	"let maxTokens=Math.min(Math.floor(.8*reserveTokens),model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY)";
+
+const SUMMARIZATION_BUDGET_BUNDLE_REPLACE =
+	"/*pi-patch:#1263(d)*/let modelCeiling=model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY,summaryCap=Math.min(Math.floor(.8*reserveTokens),modelCeiling),priorTokens=previousSummary?Math.ceil(previousSummary.length/2):0,maxTokens=previousSummary?Math.max(summaryCap,Math.min(priorTokens+4096,modelCeiling)):summaryCap";
+
+// A SECOND, independent copy of the same computation is inlined in the same bundle chunk as
+// `generateSummaryWithRequest` (the pi-agent-core facade, bundled). It is not reachable from pi's
+// own auto-compaction paths — `generateSummaryWithUsage2` has no live caller — but an SDK or
+// extension consumer importing pi-agent-core's `compact` would reach it, so it carries the same
+// floor rather than leaving a copy that can still fail. Its anchor is disambiguated by the
+// destructuring that precedes it: the other copy declares `let maxTokens=...`, this one continues
+// an existing `let {…}=options,` chain.
+const SUMMARIZATION_BUDGET_REQUEST_FIND =
+	"previousSummary,thinkingLevel}=options,maxTokens=Math.min(Math.floor(.8*reserveTokens),model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY)";
+
+const SUMMARIZATION_BUDGET_REQUEST_REPLACE =
+	"previousSummary,thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY,summaryCap=Math.min(Math.floor(.8*reserveTokens),modelCeiling),priorTokens=previousSummary?Math.ceil(previousSummary.length/2):0,maxTokens=previousSummary?Math.max(summaryCap,Math.min(priorTokens+4096,modelCeiling)):summaryCap";
+
 const entries = [
 	// (b) the clamp — one copy in the unbundled ESM, one inlined copy per bundle chunk.
 	{
@@ -116,6 +177,36 @@ const entries = [
 		replace: CLAMP_BUNDLE_REPLACE,
 		verifyPresent: ["MIN_USABLE_MAX_TOKENS=1024", "available<MIN_USABLE_MAX_TOKENS?"],
 	},
+	// (d) the summarization budget floor — the unbundled ESM copy, and the inlined copy in the
+	// bundle chunk the running CLI actually loads (#1263).
+	{
+		id: "d1-summarization-budget-esm",
+		change: "d",
+		file: "dist/core/compaction/compaction.js",
+		find: SUMMARIZATION_BUDGET_ESM_FIND,
+		replace: SUMMARIZATION_BUDGET_ESM_REPLACE,
+		// CODE-shaped needles, never the marker comment. With a marker-only needle, a tree where the
+		// comment survived and the floor was reverted read as "already applied": `apply.sh --check`
+		// exited 0 over an unpatched tree. That is a false PASS, and it was found by the VGATE
+		// verifier — the marker is provenance, not evidence the code is installed.
+		verifyPresent: ["maxTokens = previousSummary ? Math.max(summaryCap", "const priorTokens = previousSummary"],
+	},
+	{
+		id: "d2-summarization-budget-bundle",
+		change: "d",
+		file: "dist/bundle/chunks/chunk-JVUZSMYM.js",
+		find: SUMMARIZATION_BUDGET_BUNDLE_FIND,
+		replace: SUMMARIZATION_BUDGET_BUNDLE_REPLACE,
+		verifyPresent: ["maxTokens=previousSummary?Math.max(summaryCap", "/*pi-patch:#1263(d)*/let modelCeiling="],
+	},
+	{
+		id: "d3-summarization-budget-bundle-request",
+		change: "d",
+		file: "dist/bundle/chunks/chunk-JVUZSMYM.js",
+		find: SUMMARIZATION_BUDGET_REQUEST_FIND,
+		replace: SUMMARIZATION_BUDGET_REQUEST_REPLACE,
+		verifyPresent: ["thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=", "maxTokens=previousSummary?Math.max(summaryCap"],
+	},
 ];
 
 // Resolve every anchor against the installed tree; refuse to emit a manifest that does not match.
@@ -137,10 +228,14 @@ for (const entry of entries) {
 	const text = readFileSync(abs, "utf8");
 	const count = text.split(entry.find).length - 1;
 	if (count === 1) continue;
+	// The "already patched" decision verifies the patched REGION verbatim, never scattered
+	// substring needles: a comment that merely QUOTES the needles satisfies a substring test, so a
+	// needle-based proof would emit a manifest over a tree with no patched code (#1263 review,
+	// adversarial finding 2 — the same hardening `apply.mjs` carries).
 	const patched =
 		entry.patched !== undefined
 			? text.includes(entry.patched)
-			: (entry.verifyPresent ?? []).length > 0 && entry.verifyPresent.every((v) => text.includes(v));
+			: entry.replace !== undefined && text.includes(entry.replace);
 	if (patched) {
 		alreadyPatched += 1;
 		continue;

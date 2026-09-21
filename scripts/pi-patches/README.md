@@ -6,10 +6,10 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-18
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-1214, issue-1215, issue-1178
+aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-1214, issue-1215, issue-1178, issue-1263
 ---
 
-# pi patch set — the silent auto-compaction death (#1214)
+# pi patch set — the silent auto-compaction death (#1214, #1263)
 
 > **WRITTEN AGAINST `@earendil-works/pi-coding-agent` 0.85.1 / `@earendil-works/pi-ai` 0.85.1.**
 > **EXPIRY: any pi upgrade reverts `dist/` and this patch set stops being applied.** That is not
@@ -48,10 +48,11 @@ Two aggravating defects in `agent-session.js`:
 | # | Change | Where | Status |
 |---|---|---|---|
 | **(a)** | Persist a failed compaction as a durable session entry | **extension-side only** — `extensions/compaction-watchdog.ts` (issue #1215, merged in `f082ec8`) | **already done, verified here** — see `tests/verify-a-durable-failure-record.mjs` |
-| **(b)** | Never clamp below a usable output floor | upstream source patch **+** `extensions/clamp-output-floor.ts` (upgrade-proof layer) | **new — the only change this patch set carries** |
+| **(b)** | Never clamp below a usable output floor | upstream source patch **+** `extensions/clamp-output-floor.ts` (upgrade-proof layer) | **new — the change this set originally carried** |
+| **(d)** | Floor the summarization budget at the size of the summary it must preserve | upstream source patch (the ESM copy + both inlined copies in the bundle chunk, #1263) | **new — added to this set** — see `tests/verify-summarization-budget-floor.mjs` |
 
 (a) is verified by this set but lives entirely in the #1215 extension; the source patch set itself
-carries **(b) only**.
+carries **(b) and (d)**.
 
 **(a) is deliberately not re-implemented in the patch.** The #1215 watchdog already writes
 `pi.appendEntry("compaction-watchdog", …)` on `session_compact_failed`, plus a fleet log and an
@@ -76,6 +77,85 @@ already routed into pi's overflow path — and otherwise the turn just works. **
 than death, because it is loud.** The trade is one wasted round-trip (and any input tokens the
 provider charges for it) in the genuinely-over-limit case.
 
+### (d) the summarization budget floor (#1263)
+
+A second, independent death in the same compaction path. Before compacting, pi asks the model to
+merge the previous summary into a new one, and `UPDATE_SUMMARIZATION_PROMPT` instructs the model to
+**PRESERVE the entire previous summary**. The output budget for that call was a flat
+`floor(0.8 * reserveTokens)` — with no relationship to the size of the summary it was being told to
+preserve. When the previous summary was larger than the budget, the generation ran to the cap, came
+back `stopReason: "length"`, and `getSummarizationFailure()` discarded the partial summary and
+failed the whole compaction — then failed identically on the overflow path, so the session could
+never compact again.
+
+Measured on this fleet (2026-09-21): `reserveTokens = 16384` ⇒ cap **13,107**; a session's previous
+summary was **56,077 chars ≈ 13,452 output tokens** (> cap). **21** session files carried a summary
+at or above the cap, and `~/.pi/agent/state/compaction-failures.log` held **4** `compaction-failed`
+records plus **1** `clamp-death` record.
+
+The fix floors the budget at the size of the summary it must preserve, bounded by the model's own
+ceiling:
+
+```js
+const modelCeiling = model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY;
+const summaryCap = Math.min(Math.floor(0.8 * reserveTokens), modelCeiling);
+const priorTokens = previousSummary ? Math.ceil(previousSummary.length / 2) : 0;
+const maxTokens = previousSummary ? Math.max(summaryCap, Math.min(priorTokens + 4096, modelCeiling)) : summaryCap;
+```
+
+An upper bound costs nothing unless the model actually emits it, so the safe direction is generous.
+`chars/2` is a deliberately conservative token estimate: pi's own `estimateTextTokens` uses
+`chars/4`, and the densest summary measured across the fleet's compaction records is **3.19 chars per
+summary token** (81,542 chars / 25,534 output tokens net of reasoning), so `chars/2` over-estimates
+the summary's own token count.
+
+The floor is applied **only when there is a previous summary to preserve**. With none, the budget
+stays exactly `min(floor(0.8 * reserveTokens), model.maxTokens)`, so the initial-summary path is
+provably unchanged — the test asserts `pristine === patched` for that case at the shipped reserve
+(`16384`) and at `2048`, a value below the `5120` where an unconditional `+ 4096` term would have
+shifted the initial budget upward.
+
+As with (b), the change is carried in **three copies**: the ESM
+(`dist/core/compaction/compaction.js`) and the two independent inlined copies in the bundle chunk
+the running CLI loads (`dist/bundle/chunks/chunk-JVUZSMYM.js`) — `generateSummaryWithUsage`, which
+is the one pi's own auto-compaction reaches, and `generateSummaryWithRequest` (the bundled
+pi-agent-core facade), which pi's auto-compaction paths do not reach but an SDK consumer importing
+pi-agent-core's `compact` would. What (d) does **not** cover is listed under **Known gaps** 9–10.
+
+One property of the manifest is load-bearing and easy to lose: every `verifyPresent` needle must be
+**code-shaped**, i.e. absent from the **marker-only rendering of its own payload**, never a
+fragment of the `pi-patch #1263(d)` provenance marker (`"pi-patch"`, `"1263"`, `"#1263(d)"` are all
+fragments a naive strip leaves behind). With a marker-only needle, a tree where the marker survived
+and the floor code was **gone** (and no pristine anchor present either) read as "already applied" —
+`apply.sh --check` exited 0 and printed "the fix is in place" over a tree with no floor, a
+verification gate passing on nothing.
+`tests/verify-summarization-budget-floor.mjs` builds that shape **for every `d` entry** (the patched
+block replaced by its marker-only stub, so the anchor is absent too; the file is rebuilt from the
+pristine copy per entry so `d2`/`d3`, which share a bundle chunk, cannot contaminate each other) and
+asserts `--check` **exits non-zero** — the neither-pristine-nor-patched refusal, exit 2 — never
+prints "the fix is in place" and never reports that entry as applied. It also covers the
+scattered-substring bypass directly: a tree whose floor code is replaced by a **comment that quotes
+the needles** must not read as applied. And it carries a direct unit table over the classifier —
+every fragment of the marker classifies NOT code-shaped, every real code needle classifies
+code-shaped — so the non-vacuity predicate is falsifiable rather than merely asserted.
+
+That second shape is why `apply.mjs` decides "already applied" on the entry's **own replacement
+payload present verbatim** (`next.includes(entry.replace)`), not on scattered `verifyPresent`
+substrings. A substring test answers "does this text appear anywhere?", and a comment that merely
+quotes the needles satisfies it over a tree whose fix code is gone. `verifyPresent` is kept for the
+diagnostics — the "neither pristine nor patched" refusal names the expected needles — but it is no
+longer the *proof* that the fix is installed.
+
+The change is proved by `tests/verify-summarization-budget-floor.mjs`, which is hermetic: it builds
+a pristine tree and a patched tree in a temp dir (a copy of the installed `dist/` plus a symlinked
+`node_modules`), drives the real `generateSummaryWithUsage` with a stub `streamFn`, and asserts the
+budget **handed to the stream function** — the pre-clamp value, since the real clamp
+(`clampMaxTokensToContext`) runs later inside `buildBaseOptions` and this probe never exercises it
+(**gap 10**) — **13,107 unpatched → 32,135 patched** against the measured 56,077-char summary. The
+RED leg fails on the unpatched code by construction (it asserts the value is exactly the old cap and
+that the green assertion is false), so "no-repro → green" is impossible. The installed tree is never
+modified.
+
 ## Deliberately excluded — change (c): bounding overflow recovery
 
 This set does **not** touch `_overflowRecoveryAttempted`, the one-shot recovery latch in
@@ -98,13 +178,14 @@ The rejected patch remains in git history for that future decision.
 scripts/pi-patches/
 ├── apply.sh                                  # the entrypoint — apply / --check / --revert
 ├── apply.mjs                                 # version pin, two-pass apply, verification, backups
-├── verify.sh                                 # re-runs ALL FOUR evidence classes in one command
+├── verify.sh                                 # re-runs ALL FIVE evidence classes in one command
 ├── make-manifest.mjs                         # re-derives manifests/<version>/manifest.json
-├── manifests/0.85.1/manifest.json            # 3 byte-exact replacements (change (b) only) for the INSTALLED tree
+├── manifests/0.85.1/manifest.json            # 6 byte-exact replacements (changes (b) + (d)) for the INSTALLED tree
 ├── upstream/0001-pi-ai-never-clamp-below-a-usable-output-budget.patch   # change (b), source + test
 ├── tests/verify-a-durable-failure-record.mjs # change (a), end to end
+├── tests/verify-summarization-budget-floor.mjs # change (d), pristine → patched max_tokens
 └── evidence/
-    ├── 2026-09-18-b-only/                    # raw outputs of every claim in the Evidence section (the shipped (b)-only set)
+    ├── 2026-09-18-b-only/                    # raw outputs of every claim in the Evidence section (the (b)-only revision, pre-(d))
     └── 2026-09-18/                           # earlier snapshot, captured while change (c) was still in the set
 ```
 
@@ -137,7 +218,7 @@ or hashing the whole tree before and after.
 
 ```bash
 bash scripts/pi-patches/apply.sh --check   # 0 = in place · 1 = ABSENT · 2 = broken checkout · 3 = drift
-bash scripts/pi-patches/verify.sh          # all four evidence classes, then ALL EVIDENCE HOLDS
+bash scripts/pi-patches/verify.sh          # all five evidence classes, then ALL EVIDENCE HOLDS
 ```
 
 If it exits `3`, the version moved. Re-derive, do not hand-edit:
@@ -147,6 +228,7 @@ If it exits `3`, the version moved. Re-derive, do not hand-edit:
 node scripts/pi-patches/make-manifest.mjs          # writes manifests/<new version>/manifest.json
 bash scripts/pi-patches/apply.sh                   # applies + verifies
 NODE_ENV=test node scripts/pi-patches/tests/verify-a-durable-failure-record.mjs
+NODE_ENV=test node scripts/pi-patches/tests/verify-summarization-budget-floor.mjs
 npx tsx extensions/clamp-output-floor.test.ts
 ```
 
@@ -164,7 +246,7 @@ scripts/pi-patches/apply.sh`; the version pin is re-checked, so a mismatch still
 | Situation | Behaviour | Exit |
 |---|---|---|
 | anchor present | replaces it, backing up the original first | 0 |
-| anchor absent, patched form present | reports `already applied` (idempotent) | 0 |
+| anchor absent, the entry's replacement payload present verbatim | reports `already applied` (idempotent) | 0 |
 | anchor absent, patched form absent | **refuses** and writes nothing at all — the tree is left byte-identical, because the refusal is found in pass 1 | 2 |
 | `manifests/` directory missing | **refuses** and names it a broken checkout, rather than reporting "0 version directories" | 2 |
 | several version directories present | **selects the one whose `writtenAgainst` pin matches the installed version** — the normal post-upgrade state, not an error | 0 / 1 |
@@ -207,7 +289,9 @@ byte-identical to the pristine tree rather than merely "close".
 Evidence is raw output, kept in `scripts/pi-patches/evidence/`. Each row is a real command with real
 output, not a claim.
 
-The **shipped (b)-only set** is captured in `evidence/2026-09-18-b-only/`:
+The **shipped (b)-only revision** is captured in `evidence/2026-09-18-b-only/` — a dated snapshot
+taken before change (d) was added, so its "3 replacements" and "four evidence classes" counts are
+historical, not the current shape of the set:
 
 | File | What it proves |
 |---|---|
@@ -233,6 +317,12 @@ replacement count and the `agent-session.js` entries are superseded.
 | `06-`/`07-coding-agent-*.txt` | the 8 coding-agent compaction suites: **identical** failure sets before and after (12 pre-existing), 35/35 green in the two suites that assert retry semantics |
 | `08-`/`09-ai-*.txt` | the ai package across 71 test files: **identical** failure sets before and after (5 files / 47 tests, all pre-existing network/provider-key) |
 | `10-revert-roundtrip.txt` | revert then re-check goes RED again; `diff -r` against pristine reports **IDENTICAL**, so the restore is a true restore |
+
+Change **(d)** is covered by `tests/verify-summarization-budget-floor.mjs`, which prints its own raw
+evidence on every run (the pristine→patched `maxTokens`, the shape of both trees, the patched files'
+`node --check` result, and the `apply.sh --check` output against a pristine tree). It is a live
+evidence class, not a stored capture, because it must re-prove the defect against whatever version is
+installed. It is run as section 5/5 of `verify.sh`.
 
 ## Known gaps — stated, not hidden
 
@@ -268,3 +358,14 @@ replacement count and the `agent-session.js` entries are superseded.
    in the version it is running against** — the anchors are byte-exact for that version (they came
    from it), but the generator can only see the patched form and says so in its output. Re-derive on
    a pristine tree whenever one is available.
+9. **Change (d) does not patch the turn-prefix summarization budget.** It uses
+   `Math.floor(0.5 * reserveTokens)` and is the same defect class, but its anchor occurs **twice**
+   in `chunk-JVUZSMYM.js`, so `apply.mjs`'s unique-anchor resolver refuses it
+   (`"ambiguous — remove the duplicate, or select one explicitly with PI_PATCH_VERSION"`). It needs
+   its own entry with distinct surrounding context.
+10. **Change (d) leaves `clampMaxTokensToContext` applied to the summarization request.** It only
+    cuts when `contextWindow - estimateContextTokens(serialized prompt) - 4096 < budget`. Measured
+    on the live box the summarization context estimates **~193K tokens against a 300,000-token
+    window** — ~100K of margin — so it is not the binding constraint in this regime. Exempting the
+    summarization call from the clamp (the other half of #1263) requires patching `buildBaseOptions`
+    at ~10 call sites and is deliberately not in this set.
