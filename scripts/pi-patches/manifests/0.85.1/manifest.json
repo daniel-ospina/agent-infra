@@ -39,6 +39,39 @@
         "MIN_USABLE_MAX_TOKENS=1024",
         "available<MIN_USABLE_MAX_TOKENS?"
       ]
+    },
+    {
+      "id": "d1-summarization-budget-esm",
+      "change": "d",
+      "file": "dist/core/compaction/compaction.js",
+      "find": "    const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);",
+      "replace": "    // pi-patch #1263(d): the update prompt (UPDATE_SUMMARIZATION_PROMPT) instructs the model to\n    // PRESERVE the previous summary, so a budget below that summary's own size is unsatisfiable:\n    // the generation runs to the cap, returns stopReason \"length\", and getSummarizationFailure()\n    // discards the partial summary and fails the whole compaction - which then fails identically\n    // on the overflow path, so the session can never compact again. Measured on this fleet when\n    // reserveTokens was 16384 (cap 13,107) against a 56,077-char previous summary (13,452 output\n    // tokens): 21 session files were over the cap. Floor the budget at what we are asking it to\n    // preserve. An upper bound costs nothing unless the model actually emits it. chars/2 is a\n    // deliberately conservative token estimate: pi's own estimateTextTokens uses chars/4, and the\n    // densest summary measured on this fleet is 3.19 chars per summary token (81,542 chars / 25,534\n    // output tokens net of reasoning) - so chars/2 over-estimates the summary's own token count.\n    const modelCeiling = model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY;\n    const summaryCap = Math.min(Math.floor(0.8 * reserveTokens), modelCeiling);\n    const priorTokens = previousSummary ? Math.ceil(previousSummary.length / 2) : 0;\n    // Applied ONLY when there IS a previous summary to preserve. With none, the budget stays\n    // exactly min(floor(0.8 * reserveTokens), model.maxTokens), so the initial-summary path is\n    // provably unchanged — a residual the VGATE verifier proved for the unconditional form.\n    const maxTokens = previousSummary ? Math.max(summaryCap, Math.min(priorTokens + 4096, modelCeiling)) : summaryCap;",
+      "verifyPresent": [
+        "maxTokens = previousSummary ? Math.max(summaryCap",
+        "const priorTokens = previousSummary"
+      ]
+    },
+    {
+      "id": "d2-summarization-budget-bundle",
+      "change": "d",
+      "file": "dist/bundle/chunks/chunk-JVUZSMYM.js",
+      "find": "let maxTokens=Math.min(Math.floor(.8*reserveTokens),model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY)",
+      "replace": "/*pi-patch:#1263(d)*/let modelCeiling=model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY,summaryCap=Math.min(Math.floor(.8*reserveTokens),modelCeiling),priorTokens=previousSummary?Math.ceil(previousSummary.length/2):0,maxTokens=previousSummary?Math.max(summaryCap,Math.min(priorTokens+4096,modelCeiling)):summaryCap",
+      "verifyPresent": [
+        "maxTokens=previousSummary?Math.max(summaryCap",
+        "/*pi-patch:#1263(d)*/let modelCeiling="
+      ]
+    },
+    {
+      "id": "d3-summarization-budget-bundle-request",
+      "change": "d",
+      "file": "dist/bundle/chunks/chunk-JVUZSMYM.js",
+      "find": "previousSummary,thinkingLevel}=options,maxTokens=Math.min(Math.floor(.8*reserveTokens),model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY)",
+      "replace": "previousSummary,thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY,summaryCap=Math.min(Math.floor(.8*reserveTokens),modelCeiling),priorTokens=previousSummary?Math.ceil(previousSummary.length/2):0,maxTokens=previousSummary?Math.max(summaryCap,Math.min(priorTokens+4096,modelCeiling)):summaryCap",
+      "verifyPresent": [
+        "thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=",
+        "maxTokens=previousSummary?Math.max(summaryCap"
+      ]
     }
   ]
 }
