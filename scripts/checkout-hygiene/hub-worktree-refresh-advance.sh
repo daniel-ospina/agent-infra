@@ -38,7 +38,7 @@
 # target must be a MAIN checkout (a linked worktree carries a `.git` FILE, not
 # a directory), on main/master, with an empty porcelain (tracked AND untracked)
 # read AFTER the fetch, and with no hub-local IGNORED path that the upstream
-# changes (that collision would be overwritten by either move). The
+# writes (that collision would be overwritten by either move). The
 # `discard-contentless` path additionally re-runs the content-loss check — a
 # per-local-only-commit `git show --name-only` scan (empty for an empty commit
 # or a clean merge, non-empty for any real change) — so it is safe even if the
@@ -97,33 +97,40 @@ fi
 # `--no-overwrite-ignore` covers the merge, but `git reset` has no such flag, so
 # refuse on a collision before either move.
 #
-# The test is path-aware and covers exactly the paths the move would write: the
-# diff of HEAD against the upstream. For each changed path it takes the first
-# existing component — that path itself, or, when the path does not exist, the
-# nearest existing ancestor that is not a directory. That catches a hub-side
-# ignored DIRECTORY colliding with an upstream FILE (the changed path itself is
-# that directory), a hub-side ignored FILE colliding with an upstream path
-# UNDER it (the ancestor exists as a non-directory, so the move must delete it),
-# a dangling ignored symlink, and a case-only difference on a case-insensitive
-# filesystem — all of which a line-by-line compare of the ignored and tracked
-# path lists misses. `git check-ignore` consults the index, so a tracked path
-# that merely matches an ignore pattern is not mis-flagged.
+# The test is path-aware and covers the ways the move can destroy hub-local
+# ignored content:
+#   - the diff of HEAD against the upstream gives the paths the move writes;
+#   - for each changed path, the first existing component is the candidate —
+#     that path itself (a file, a symlink, or a DIRECTORY the move would replace
+#     with a non-directory), or, when the path does not exist, the nearest
+#     existing ancestor, which matters only when it is a non-directory (a
+#     directory ancestor does not block writing the path);
+#   - when the candidate at the changed path is a directory and the upstream
+#     replaces it with a non-directory, the ignored entries INSIDE it are
+#     destroyed with it and no changed path names them, so that subtree is
+#     scanned too.
+# `git check-ignore` consults the index, so a tracked path that merely matches an
+# ignore pattern is not mis-flagged.
 DIFF_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-diff.XXXXXX")"
 HIT_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-hits.XXXXXX")"
-trap 'rm -f "${DIFF_LIST:-}" "${HIT_LIST:-}"' EXIT
+SUB_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-subs.XXXXXX")"
+trap 'rm -f "${DIFF_LIST:-}" "${HIT_LIST:-}" "${SUB_LIST:-}"' EXIT
 if ! git -C "$MAIN_REPO" diff --name-only -z HEAD "$UPSTREAM" > "$DIFF_LIST"; then
   echo "hub-worktree-refresh-advance: could not diff the hub against $UPSTREAM — refusing" >&2
   exit 1
 fi
 HITS=0
+SUBS=0
 while IFS= read -r -d '' P; do
   [ -z "$P" ] && continue
   HIT=""
   CUR="$P"
   while [ -n "$CUR" ]; do
     if [ -e "$MAIN_REPO/$CUR" ] || [ -L "$MAIN_REPO/$CUR" ]; then
-      # Only an existing NON-directory can be destroyed: the path itself, or an
-      # ancestor that blocks writing the path (a directory does not).
+      # The changed path itself is always a candidate (it may be a directory the
+      # move replaces with a non-directory); an ancestor matters only when it is
+      # a non-directory, because a directory ancestor does not block writing the
+      # path.
       if [ "$CUR" = "$P" ] || [ ! -d "$MAIN_REPO/$CUR" ]; then HIT="$CUR"; fi
       break
     fi
@@ -133,22 +140,43 @@ while IFS= read -r -d '' P; do
   [ -n "$HIT" ] || continue
   printf '%s\0' "$HIT" >> "$HIT_LIST"
   HITS=$((HITS + 1))
+  # A directory at the changed path that the upstream replaces with a
+  # non-directory: the ignored entries inside it die with it, and no changed
+  # path names them.
+  if [ "$HIT" = "$P" ] && [ -d "$MAIN_REPO/$P" ]; then
+    UP_MODE="$(git -C "$MAIN_REPO" ls-tree "$UPSTREAM" -- "$P" 2>/dev/null | sed -n '1s/ .*//p')"
+    if [ -n "$UP_MODE" ] && [ "$UP_MODE" != "040000" ]; then
+      if ! SUB_IGNORED="$(git -C "$MAIN_REPO" ls-files -z --others --ignored --exclude-standard -- "$P")"; then
+        echo "hub-worktree-refresh-advance: could not list the ignored files under '$P' — refusing" >&2
+        exit 1
+      fi
+      if [ -n "$SUB_IGNORED" ]; then
+        printf '%s\0' "$P" >> "$SUB_LIST"
+        SUBS=$((SUBS + 1))
+      fi
+    fi
+  fi
 done < "$DIFF_LIST"
+COLLIDE=""
+if [ "$SUBS" -gt 0 ]; then
+  COLLIDE="$(tr '\0' '\n' < "$SUB_LIST")"
+fi
 if [ "$HITS" -gt 0 ]; then
   # One batched `check-ignore --stdin` (a stale hub's diff is thousands of paths;
   # one process per path would be thousands of subprocesses).
   RC=0
-  COLLIDE="$(git -C "$MAIN_REPO" check-ignore -z --stdin < "$HIT_LIST" | tr '\0' '\n')" || RC=$?
+  IGNORED_HITS="$(git -C "$MAIN_REPO" check-ignore -z --stdin < "$HIT_LIST" | tr '\0' '\n')" || RC=$?
   if [ "$RC" -gt 1 ]; then
     echo "hub-worktree-refresh-advance: could not determine the ignore status of the hub's local paths — refusing" >&2
     exit 1
   fi
-  if [ -n "$COLLIDE" ]; then
-    echo "hub-worktree-refresh-advance: the upstream writes path(s) this hub IGNORES — the move would overwrite them (and git would not warn):" >&2
-    printf '%s\n' "$COLLIDE" | sed '/^$/d' | sort -u | sed 's/^/     /' >&2
-    echo "   Move the hub-local file(s) aside, or refresh from a human terminal — nothing was moved." >&2
-    exit 1
-  fi
+  COLLIDE="${COLLIDE}${IGNORED_HITS}"
+fi
+if [ -n "$(printf '%s\n' "$COLLIDE" | sed '/^$/d')" ]; then
+  echo "hub-worktree-refresh-advance: the upstream writes path(s) this hub IGNORES — the move would overwrite them (and git would not warn):" >&2
+  printf '%s\n' "$COLLIDE" | sed '/^$/d' | sort -u | sed 's/^/     /' >&2
+  echo "   Move the hub-local file(s) aside, or refresh from a human terminal — nothing was moved." >&2
+  exit 1
 fi
 
 if [ "$MODE" = "discard-contentless" ]; then

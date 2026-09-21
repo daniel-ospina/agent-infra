@@ -481,6 +481,25 @@ assert_eq "$rc" 1 "refresh refuses a dangling ignored symlink at a changed path 
 assert_contains "$out" "IGNORES" "dangling-symlink refusal names the state"
 [ -L "$REPO/.env.local" ] && ok "the dangling ignored symlink was not replaced" || bad "the dangling ignored symlink was replaced"
 
+# 8q. a directory the upstream REPLACES with a non-directory, where the hub
+# ignores a file INSIDE it: no changed path names that file, so the subtree has
+# to be scanned or the reset destroys it together with the directory.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+mkdir -p "$REPO/col" && printf 'tracked\n' > "$REPO/col/t.txt"
+printf 'keep-me\n' > "$REPO/col/keep.local"
+printf 'col/keep.local\n' >> "$REPO/.gitignore"
+git -C "$REPO" add .gitignore col/t.txt && git -C "$REPO" commit -qm col-dir
+git -C "$REPO" push -q origin main
+git -C "$CLONE" fetch -q origin main && git -C "$CLONE" reset -q --hard origin/main
+rm -rf "$CLONE/col" && printf 'upstream-collapsed\n' > "$CLONE/col"
+git -C "$CLONE" add -A col && git -C "$CLONE" commit -qm upstream-collapses-col
+git -C "$CLONE" push -q origin main
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses a collapsed dir holding an ignored file → exit 1"
+assert_contains "$out" "IGNORES" "collapsed-dir refusal names the state"
+assert_eq "$(cat "$REPO/col/keep.local")" "keep-me" "the ignored file inside the replaced directory survived"
+
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
