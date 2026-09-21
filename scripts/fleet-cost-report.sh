@@ -38,7 +38,7 @@
 # bought for, at a recurring ~+20% fleet spend), so (b)'s regime floor is back
 # at 283616. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions that
 # compacted 2026-09-18..21 ran the retired 700K clamp, and 3 compaction records
-# in that era's 69 session files sit at/above the 650000 trigger
+# in that era's session files sit at/above the 650000 trigger
 # (650,134–650,426), putting the 2 sessions carrying them into n_clamp and into
 # the cache-share pools of a run whose window still reaches them. The number is still reported
 # (it is the same cache economics — cache-level independent); read n_clamp on

@@ -354,7 +354,8 @@ property; this guard is the pattern to copy, not a substitute for it.
   **Residual, stated plainly:** it has **not** been verified that the floor fix
   subsumes *every* failure the wider window covered — only the silent-death
   one. The retired regime left **no** truncation records — 0
-  `stopReason:"length"` across its 69 session files (2026-09-18..21) — so
+  `stopReason:"length"` across its session files (2026-09-18..21; measured
+  2026-09-21) — so
   `watch-truncation.sh`'s `700K-clamp-era(650-900K)` bucket is **empty**: it
   exists so a record from that era cannot be mislabelled, not because one is
   waiting there. What the era did leave is **compaction** records — 3

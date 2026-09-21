@@ -40,8 +40,9 @@
 # (650,000 = 700,000 − 50,000) up to the shared 1M-drift floor at 900,000 — so
 # a record from that era is neither read as current geometry nor excluded as
 # small-window, the mirror of how #1226 kept the 300K era visible on the way
-# up. Against this box's corpus that bucket is EMPTY: the era's 69 session
-# files (2026-09-18..21) carry no stopReason:"length" records, which is the
+# up. Against this box's corpus that bucket is EMPTY: the era's session
+# files (2026-09-18..21) carry no stopReason:"length" records (measured
+# 2026-09-21), which is the
 # honest reading of a regime that did not truncate, not a missing mechanism.
 # Any such record still COUNTS toward the literal pre-commitment above
 # (≥1 length record → revert to 1M): that trigger is
