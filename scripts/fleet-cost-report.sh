@@ -34,15 +34,17 @@
 # REGIME HISTORY (withdrawal, 2026-09-21): the #1213/#1226 300K→700K re-clamp
 # is WITHDRAWN (the deployed floor fix — `MIN_USABLE_MAX_TOKENS = 1024`,
 # pi-patch #1214(b) — closes the one-token silent death the wider window was
-# bought for, at a recurring ~+20% fleet spend), so (b)'s regime-pure floor is
-# back at 283616. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions that
-# compacted 2026-09-18..21 ran the retired 700K clamp and their compaction
-# tokensBefore sit at/above 650000, so they are counted in n_clamp and in the
-# cache-share pools of a run whose window still reaches them. The number is
-# still reported (it is the same cache economics — cache-level independent);
-# read n_clamp on the first post-withdrawal run knowing it mixes regimes, and
-# note that watch-truncation.sh buckets those same records as
-# `700K-clamp-era(650-900K)` rather than as a 1M-drift signal.
+# bought for, at a recurring ~+20% fleet spend), so (b)'s regime floor is back
+# at 283616. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions that
+# compacted 2026-09-18..21 ran the retired 700K clamp, and 3 compaction records
+# in that era's 69 session files sit at/above the 650000 trigger
+# (650,134–650,426), so they are counted in n_clamp and in the cache-share
+# pools of a run whose window still reaches them. The number is still reported
+# (it is the same cache economics — cache-level independent); read n_clamp on
+# the first post-withdrawal run knowing it mixes regimes for that one window.
+# The TRUNCATION instrument is unaffected: it buckets only
+# stopReason:"length" records, and the retired era produced none — its bucket
+# is empty (watch-truncation.sh, header).
 #   (c) output+reasoning share over non-cache tokens — the #365 TREND
 #       instrument (recorded every run, never escalates). Formula matches the
 #       pre-registered "real median 58%": per-session (output+reasoning) /
