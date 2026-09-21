@@ -397,8 +397,9 @@ git -C "$REPO" branch -q -D master
 git -C "$CLONE" checkout -q main
 
 # 8l. an upstream path the hub IGNORES → refused before either move. porcelain
-# cannot see ignored files, so without this check the move would silently
-# overwrite the hub-local file (git does not warn) — the SEC-001 data-loss path.
+# cannot see ignored files, so without this check the reset would silently delete
+# the hub-local file (the fast-forward aborts on it instead) — the SEC-001
+# data-loss path.
 git -C "$REPO" fetch -q origin main
 git -C "$REPO" reset -q --hard origin/main
 printf 'upstream-env\n' > "$CLONE/.env"
@@ -500,6 +501,26 @@ assert_eq "$rc" 1 "refresh refuses a collapsed dir holding an ignored file → e
 assert_contains "$out" "IGNORES" "collapsed-dir refusal names the state"
 assert_contains "$out" "col/keep.local" "collapsed-dir refusal names the IGNORED entry, not the tracked directory"
 assert_eq "$(cat "$REPO/col/keep.local")" "keep-me" "the ignored file inside the replaced directory survived"
+
+# 8r. a hub-local IGNORED SYMLINK whose target is an existing directory, with an
+# upstream path UNDER it: `-d` follows the link, so the ancestor has to be
+# recognised through `-L` — otherwise `reset --hard` replaces the symlink with a
+# real directory without a refusal.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+mkdir -p "$REPO/realdir" && printf 'real-kept\n' > "$REPO/realdir/keep.txt"
+ln -s realdir "$REPO/hubd"
+printf 'hubd\n' >> "$REPO/.gitignore"
+git -C "$REPO" add .gitignore realdir/keep.txt && git -C "$REPO" commit -qm symlink-ancestor
+git -C "$REPO" push -q origin main
+git -C "$CLONE" fetch -q origin main && git -C "$CLONE" reset -q --hard origin/main
+mkdir -p "$CLONE/hubd" && printf 'upstream-under-symlink\n' > "$CLONE/hubd/newfile"
+git -C "$CLONE" add -f hubd/newfile && git -C "$CLONE" commit -qm upstream-under-symlink
+git -C "$CLONE" push -q origin main
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses an ignored symlink ancestor with an upstream path under it"
+assert_contains "$out" "IGNORES" "symlink-ancestor refusal names the state"
+[ -L "$REPO/hubd" ] && ok "the ignored symlink ancestor was not replaced" || bad "the ignored symlink ancestor was replaced"
 
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"

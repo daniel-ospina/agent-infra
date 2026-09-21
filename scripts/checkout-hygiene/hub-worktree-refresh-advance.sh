@@ -105,8 +105,9 @@ fi
 #   - for each changed path, the first existing component is the candidate —
 #     that path itself (a file, a symlink, or a DIRECTORY the move would replace
 #     with a non-directory), or, when the path does not exist, the nearest
-#     existing ancestor, which matters only when it is a non-directory (a
-#     directory ancestor does not block writing the path);
+#     existing ancestor, which matters when it is a non-directory (it blocks
+#     writing the path) or a symlink (git replaces it with a real directory) —
+#     a plain directory ancestor does not;
 #   - when the candidate at the changed path is a directory and the upstream
 #     replaces it with a non-directory, the ignored entries INSIDE it are
 #     destroyed with it and no changed path names them, so that subtree is
@@ -117,6 +118,14 @@ DIFF_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-diff.XXXXXX")"
 HIT_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-hits.XXXXXX")"
 COLLIDE_FILE="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-collide.XXXXXX")"
 trap 'rm -f "${DIFF_LIST:-}" "${HIT_LIST:-}" "${COLLIDE_FILE:-}"' EXIT
+# Write through a pre-opened fd: with a plain `cmd >> file` a redirect-open
+# failure and "nothing matched" are both status 1, which would read as a clean
+# result — a fail-open in the very guard. The open below is checked instead, so
+# the recorded status is the COMMAND's.
+if ! exec 9>> "$COLLIDE_FILE"; then
+  echo "hub-worktree-refresh-advance: could not open the collision list at $COLLIDE_FILE — refusing" >&2
+  exit 1
+fi
 if ! git -C "$MAIN_REPO" diff --name-only -z HEAD "$UPSTREAM" > "$DIFF_LIST"; then
   echo "hub-worktree-refresh-advance: could not diff the hub against $UPSTREAM — refusing" >&2
   exit 1
@@ -129,10 +138,10 @@ while IFS= read -r -d '' P; do
   while [ -n "$CUR" ]; do
     if [ -e "$MAIN_REPO/$CUR" ] || [ -L "$MAIN_REPO/$CUR" ]; then
       # The changed path itself is always a candidate (it may be a directory the
-      # move replaces with a non-directory); an ancestor matters only when it is
-      # a non-directory, because a directory ancestor does not block writing the
-      # path.
-      if [ "$CUR" = "$P" ] || [ ! -d "$MAIN_REPO/$CUR" ]; then HIT="$CUR"; fi
+      # move replaces with a non-directory); an ancestor matters when it is a
+      # non-directory (which blocks writing the path) or a SYMLINK, which git
+      # replaces with a real directory — a plain directory ancestor does not.
+      if [ "$CUR" = "$P" ] || [ ! -d "$MAIN_REPO/$CUR" ] || [ -L "$MAIN_REPO/$CUR" ]; then HIT="$CUR"; fi
       break
     fi
     [ "$CUR" = "${CUR%/*}" ] && break
@@ -148,7 +157,7 @@ while IFS= read -r -d '' P; do
   if [ "$HIT" = "$P" ] && [ -d "$MAIN_REPO/$P" ]; then
     UP_MODE="$(git -C "$MAIN_REPO" ls-tree "$UPSTREAM" -- "$P" 2>/dev/null | sed -n '1s/ .*//p')"
     if [ -n "$UP_MODE" ] && [ "$UP_MODE" != "040000" ]; then
-      if ! git -C "$MAIN_REPO" ls-files -z --others --ignored --exclude-standard -- "$P" >> "$COLLIDE_FILE"; then
+      if ! git -C "$MAIN_REPO" ls-files -z --others --ignored --exclude-standard -- "$P" >&9; then
         echo "hub-worktree-refresh-advance: could not list the ignored files under '$P' — refusing" >&2
         exit 1
       fi
@@ -159,12 +168,13 @@ if [ "$HITS" -gt 0 ]; then
   # One batched `check-ignore --stdin` (a stale hub's diff is thousands of paths;
   # one process per path would be thousands of subprocesses).
   RC=0
-  git -C "$MAIN_REPO" check-ignore -z --stdin < "$HIT_LIST" >> "$COLLIDE_FILE" || RC=$?
+  git -C "$MAIN_REPO" check-ignore -z --stdin < "$HIT_LIST" >&9 || RC=$?
   if [ "$RC" -gt 1 ]; then
     echo "hub-worktree-refresh-advance: could not determine the ignore status of the hub's local paths — refusing" >&2
     exit 1
   fi
 fi
+exec 9>&-
 if [ -s "$COLLIDE_FILE" ]; then
   echo "hub-worktree-refresh-advance: the upstream writes path(s) this hub IGNORES — refusing (the merge would abort on them; the reset would overwrite them silently):" >&2
   tr '\0' '\n' < "$COLLIDE_FILE" | sed '/^$/d' | sort -u | sed 's/^/     /' >&2

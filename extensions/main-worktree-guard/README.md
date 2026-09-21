@@ -462,8 +462,8 @@ exemptions).
 (`bash`/`sh`/`zsh`/`source`/`./x.sh`) in the hub whose content performs a
 non-sanctioned git mutation is blocked: the script's git ops are gated by the
 SAME recovery allowlist. Recovery scripts keep working (`hub-worktree.sh`'s own
-git surface is `fetch` + `worktree add` + read-only verbs, with the one
-destructive final move delegated to a sub-script), and read-only git in scripts is fine.
+git surface is `fetch` + `worktree add` + read-only verbs, with its destructive
+moves delegated to sub-scripts), and read-only git in scripts is fine.
 **#347:** the script path + content gating resolve against the command's
 EXECUTION cwd (cd-resolved, subshell/pipe-scoped) — `cd <wt> && bash x.sh`
 resolves x.sh inside the worktree; worktree-targeted script content is exempt,
