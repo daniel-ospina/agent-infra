@@ -92,40 +92,63 @@ if [ -n "$PORCELAIN" ]; then
   exit 1
 fi
 
-# `git status --porcelain` OMITS ignored files, and BOTH moves will overwrite a
-# hub-local ignored file the upstream now tracks (a hub's .env, typically).
-# `--no-overwrite-ignore` covers the merge, but `git reset` has no such flag,
-# so refuse on a collision before either move.
+# `git status --porcelain` OMITS ignored files, and BOTH moves would write over a
+# hub-local ignored path the upstream now writes (a hub's .env, typically).
+# `--no-overwrite-ignore` covers the merge, but `git reset` has no such flag, so
+# refuse on a collision before either move.
 #
-# The test is path-aware, not a string compare of the ignored-vs-tracked lists:
-# `git check-ignore` also catches a hub-side ignored DIRECTORY colliding with an
-# upstream FILE of the same name, and a case-only difference on a
-# case-insensitive filesystem — both of which a line-by-line `comm` misses.
-COLLIDE=""
+# The test is path-aware and covers exactly the paths the move would write: the
+# diff of HEAD against the upstream. For each changed path it takes the first
+# existing component — that path itself, or, when the path does not exist, the
+# nearest existing ancestor that is not a directory. That catches a hub-side
+# ignored DIRECTORY colliding with an upstream FILE (the changed path itself is
+# that directory), a hub-side ignored FILE colliding with an upstream path
+# UNDER it (the ancestor exists as a non-directory, so the move must delete it),
+# a dangling ignored symlink, and a case-only difference on a case-insensitive
+# filesystem — all of which a line-by-line compare of the ignored and tracked
+# path lists misses. `git check-ignore` consults the index, so a tracked path
+# that merely matches an ignore pattern is not mis-flagged.
 DIFF_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-diff.XXXXXX")"
-trap 'rm -f "${DIFF_LIST:-}"' EXIT
+HIT_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-hits.XXXXXX")"
+trap 'rm -f "${DIFF_LIST:-}" "${HIT_LIST:-}"' EXIT
 if ! git -C "$MAIN_REPO" diff --name-only -z HEAD "$UPSTREAM" > "$DIFF_LIST"; then
   echo "hub-worktree-refresh-advance: could not diff the hub against $UPSTREAM — refusing" >&2
   exit 1
 fi
+HITS=0
 while IFS= read -r -d '' P; do
   [ -z "$P" ] && continue
-  [ -e "$MAIN_REPO/$P" ] || continue
-  if git -C "$MAIN_REPO" check-ignore -q -- "$P"; then
-    COLLIDE="${COLLIDE}${P}"$'\n'
-  else
-    RC=$?
-    if [ "$RC" -gt 1 ]; then
-      echo "hub-worktree-refresh-advance: could not determine the ignore status of '$P' — refusing" >&2
-      exit 1
+  HIT=""
+  CUR="$P"
+  while [ -n "$CUR" ]; do
+    if [ -e "$MAIN_REPO/$CUR" ] || [ -L "$MAIN_REPO/$CUR" ]; then
+      # Only an existing NON-directory can be destroyed: the path itself, or an
+      # ancestor that blocks writing the path (a directory does not).
+      if [ "$CUR" = "$P" ] || [ ! -d "$MAIN_REPO/$CUR" ]; then HIT="$CUR"; fi
+      break
     fi
-  fi
+    [ "$CUR" = "${CUR%/*}" ] && break
+    CUR="${CUR%/*}"
+  done
+  [ -n "$HIT" ] || continue
+  printf '%s\0' "$HIT" >> "$HIT_LIST"
+  HITS=$((HITS + 1))
 done < "$DIFF_LIST"
-if [ -n "$COLLIDE" ]; then
-  echo "hub-worktree-refresh-advance: the upstream tracks path(s) this hub IGNORES — the move would overwrite them (and git would not warn):" >&2
-  printf '%s\n' "$COLLIDE" | sort -u | sed 's/^/     /' >&2
-  echo "   Move the hub-local file(s) aside, or refresh from a human terminal — nothing was moved." >&2
-  exit 1
+if [ "$HITS" -gt 0 ]; then
+  # One batched `check-ignore --stdin` (a stale hub's diff is thousands of paths;
+  # one process per path would be thousands of subprocesses).
+  RC=0
+  COLLIDE="$(git -C "$MAIN_REPO" check-ignore -z --stdin < "$HIT_LIST" | tr '\0' '\n')" || RC=$?
+  if [ "$RC" -gt 1 ]; then
+    echo "hub-worktree-refresh-advance: could not determine the ignore status of the hub's local paths — refusing" >&2
+    exit 1
+  fi
+  if [ -n "$COLLIDE" ]; then
+    echo "hub-worktree-refresh-advance: the upstream writes path(s) this hub IGNORES — the move would overwrite them (and git would not warn):" >&2
+    printf '%s\n' "$COLLIDE" | sed '/^$/d' | sort -u | sed 's/^/     /' >&2
+    echo "   Move the hub-local file(s) aside, or refresh from a human terminal — nothing was moved." >&2
+    exit 1
+  fi
 fi
 
 if [ "$MODE" = "discard-contentless" ]; then

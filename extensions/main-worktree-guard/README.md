@@ -566,9 +566,11 @@ apply (there is no dirty set), and the M4-sanctioned recovery (`git checkout
 main && git pull --ff-only`) cannot apply to a divergent branch — git refuses a
 non-fast-forward — while `reset --hard` is refused by the destructive-git gate
 and `repo-freshness`'s `auto` mode deliberately declines to recover a
-*diverged* default branch. (The guard's ownership allowance does still let
-`git rebase` through on this state — that is the pre-existing defect tracked by
-#1144, not a remedy.) The hub-state check then still reports PASS because it
+*diverged* default branch. (The guard's ownership allowance does still admit the
+sync verbs on the session's own baseline — `merge`/`pull`/`rebase`; the
+rewriting arm is the pre-existing defect tracked by #1144, and an admitted plain
+merge mints a merge commit no other session expects, so neither is the
+sanctioned remedy.) The hub-state check then still reports PASS because it
 tests on-main + clean, not freshness — so the staleness hid itself: **an absent
 guard reads as a passing guard**. Observed live: the tortoise hub sat **3 days /
 308 commits** stale, with files merged upstream since simply absent from its
@@ -587,8 +589,8 @@ would move the wrong branch on a repo where both exist). It **refuses by
 default and exits non-zero rather than moving anything** when the hub is not on
 main/master (the stranded-branch case), when the working tree is dirty (the
 `salvage` remedy is named), when a local-only commit would be discarded and any
-of them changes files (the files are named), or when the upstream tracks a path
-the hub **ignores** (either move would overwrite that hub-local file — a hub's
+of them changes files (the files are named), or when the upstream writes a path
+the hub **ignores** (either move would overwrite that hub-local path — a hub's
 `.env`, typically — and git would not warn). A **contentless** divergence (an
 empty commit, or a merge whose own delta is nil — `git show`'s combined diff is
 empty) is refused unless `--discard-contentless` is passed, and then the SHAs it

@@ -58,11 +58,12 @@
 #     On a DIVERGED hub, though, that ff-pull cannot apply (git refuses a
 #     non-fast-forward), `reset --hard` is refused by the destructive-git gate,
 #     and repo-freshness deliberately declines to recover a diverged default
-#     branch — so no SANCTIONED path moves the tip. (The one verb the guard's
-#     ownership allowance still lets through on this state is `git rebase`,
-#     which is the defect tracked by #1144, not a remedy.) Meanwhile the
-#     hub-state check still reports PASS because it tests on-main + clean, not
-#     freshness — so the staleness hid itself: an absent guard reads as a
+#     branch — so no SANCTIONED path moves the tip. (The guard's ownership
+#     allowance does still admit the sync verbs on the session's own baseline —
+#     `merge`/`pull`/`rebase`; the rewriting arm is the hole tracked by #1144,
+#     and an admitted plain merge mints a merge commit no other session expects,
+#     which is why neither is the sanctioned remedy.) Meanwhile the hub-state
+#     check still reports PASS because it tests on-main + clean, not freshness — so the staleness hid itself: an absent guard reads as a
 #     passing guard. Observed live: the tortoise hub sat 3 days / 308 commits
 #     stale, with files merged upstream since simply absent from it.
 #
@@ -73,8 +74,8 @@
 #       - the working tree is dirty → the salvage case is named as the remedy;
 #       - local-only commits would be discarded AND any of them carries file
 #         content → the differing files are named and nothing is moved;
-#       - the upstream tracks a path this hub ignores → refused, because the
-#         move would overwrite that hub-local file (a hub's .env, typically).
+#       - the upstream writes a path this hub ignores → refused, because the
+#         move would overwrite that hub-local path (a hub's .env, typically).
 #     A diverged hub whose local-only commits are CONTENTLESS (an empty commit;
 #     a merge whose own delta is nil — neither changes a file; the observed
 #     tortoise case) is ALSO refused unless --discard-contentless is given; with
@@ -418,10 +419,12 @@ salvage() {
 # refused by the destructive-git gate, and repo-freshness deliberately declines
 # to recover a diverged default branch — so a clone nobody could refresh sat 308
 # commits stale, and because an absent guard reads as a passing guard nothing
-# signalled it. (The ownership allowance still lets `git rebase` through on this
-# state; that is the #1144 defect, not a remedy.) This mode is that fix — and it
-# refuses by default: a dirty hub is the SALVAGE case, and a local-only commit
-# is never dropped implicitly.
+# signalled it. (The ownership allowance still admits `merge`/`pull`/`rebase` on
+# the session's own baseline; the rewriting arm is the #1144 defect and an
+# admitted plain merge mints a merge commit no other session expects — neither
+# is the sanctioned remedy.) This mode is that fix — and it refuses by default:
+# a dirty hub is the SALVAGE case, and a local-only commit is never dropped
+# implicitly.
 #
 # Guard posture (no allowlist change): this function runs ONLY the
 # M4-sanctioned/read-only surface — fetch / status / branch --show-current /

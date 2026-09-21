@@ -446,6 +446,41 @@ assert_eq "$rc" 1 "refresh refuses an ignored DIRECTORY vs an upstream FILE → 
 assert_contains "$out" "IGNORES" "directory/file collision refusal names the state"
 assert_eq "$(cat "$REPO/hubdir/k.txt")" "hub-kept" "the ignored directory contents were not overwritten"
 
+# 8o. the MIRROR of 8n: a hub-local ignored FILE that the upstream writes UNDER
+# (the changed path `hubfile/x` does not exist locally, so the check must look at
+# its nearest existing non-directory ancestor — otherwise `reset --hard` deletes
+# the hub-local file to create the directory).
+rm -rf "$REPO/hubdir"
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+printf 'hub-file-kept\n' > "$REPO/hubfile"
+printf 'hubfile\n' >> "$REPO/.gitignore"
+git -C "$REPO" add .gitignore && git -C "$REPO" commit -qm ignore-hubfile
+git -C "$REPO" push -q origin main
+git -C "$CLONE" fetch -q origin main && git -C "$CLONE" reset -q --hard origin/main
+mkdir -p "$CLONE/hubfile" && printf 'upstream-under\n' > "$CLONE/hubfile/x"
+git -C "$CLONE" add -f hubfile/x && git -C "$CLONE" commit -qm upstream-under-hubfile
+git -C "$CLONE" push -q origin main
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses an ignored FILE with an upstream path UNDER it → exit 1"
+assert_contains "$out" "IGNORES" "file/ancestor collision refusal names the state"
+assert_eq "$(cat "$REPO/hubfile")" "hub-file-kept" "the ignored hub-local file was not deleted"
+
+# 8p. a DANGLING ignored symlink at a changed path: `-e` follows the link and
+# reports absence, so the check must also test `-L` or the reset replaces it.
+rm -f "$REPO/hubfile"
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+ln -s /nonexistent-hub-target "$REPO/.env.local"
+git -C "$CLONE" fetch -q origin main && git -C "$CLONE" reset -q --hard origin/main
+printf 'upstream-env-local\n' > "$CLONE/.env.local"
+git -C "$CLONE" add -f .env.local && git -C "$CLONE" commit -qm upstream-env-local
+git -C "$CLONE" push -q origin main
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses a dangling ignored symlink at a changed path → exit 1"
+assert_contains "$out" "IGNORES" "dangling-symlink refusal names the state"
+[ -L "$REPO/.env.local" ] && ok "the dangling ignored symlink was not replaced" || bad "the dangling ignored symlink was replaced"
+
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
