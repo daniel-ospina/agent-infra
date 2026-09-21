@@ -277,7 +277,7 @@
       ],
       "modelOverrides": {
         "deepseek-v4-flash-vision-exp": {
-          "contextWindow": 700000,
+          "contextWindow": 300000,
           "cost": {
             "input": 0.15,
             "output": 0.6,
@@ -314,7 +314,7 @@
           "input": [
             "text"
           ],
-          "contextWindow": 700000,
+          "contextWindow": 300000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
             "minimal": null,
@@ -340,7 +340,7 @@
           "input": [
             "text"
           ],
-          "contextWindow": 700000,
+          "contextWindow": 300000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
             "minimal": null,
@@ -400,73 +400,73 @@
     "openrouter": {
       "modelOverrides": {
         "deepseek/deepseek-v4-flash": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4.1-flash": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4-flash-0731": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4-flash-vision-exp": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4-pro": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4-pro-0813": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "~deepseek/deepseek-v4-flash-latest": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         }
       }
     },
     "qwen-token-plan": {
       "modelOverrides": {
         "deepseek-v4-flash": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-flash-0731": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro-0813": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         }
       }
     },
     "qwen-token-plan-cn": {
       "modelOverrides": {
         "deepseek-v4-flash": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-flash-0731": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro-0813": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         }
       }
     },
     "qwen-token-plan-individual": {
       "modelOverrides": {
         "deepseek-v4-flash": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-flash-0731": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro-0813": {
-          "contextWindow": 700000
+          "contextWindow": 300000
         }
       }
     },
@@ -482,7 +482,7 @@
           "input": [
             "text"
           ],
-          "contextWindow": 700000,
+          "contextWindow": 300000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
             "minimal": null,
@@ -506,7 +506,7 @@
             "text",
             "image"
           ],
-          "contextWindow": 700000,
+          "contextWindow": 300000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
             "minimal": null,

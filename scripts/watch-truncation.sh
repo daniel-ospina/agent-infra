@@ -4,7 +4,7 @@
 #
 # Scans session JSONLs for stopReason:"length" — the real truncation marker.
 # Compaction is checked on agent_end, so multi-tool turns can exceed the
-# compaction trigger mid-turn (650,000 @700K / 983,616 @1M) and hit the
+# compaction trigger mid-turn (283,616 @300K / 983,616 @1M) and hit the
 # window's generation budget → the response is truncated (stopReason:length).
 # Verified against the real corpus at #373 (400K/1M-era windows — historical):
 # every corpus length record sat at its session's own ceiling (ctx ≥ 0.92 ×
@@ -24,15 +24,36 @@
 # Note on the length leg (expected week-1 behavior): the clamp DOES produce
 # mid-turn overruns in the real fleet — measured under the 400K clamp (91
 # post-clamp records across 28 sessions at 383–406K context; historical, pre-
-# #511). The shipped 700K clamp (#1213) has the same compaction-on-agent_end
-# geometry with its trigger at 650,000, so the analogous band is ~650–700K
-# (the pre-#1213 300K clamp's ~283.6–300K band is kept as its own LEGACY
-# bucket: those records are the evidence that motivated the re-clamp, and
-# mislabelling them small-window would wrongly exclude them). A clean
+# #511). The shipped 300K clamp has the same compaction-on-agent_end geometry
+# with its trigger at 283,616, so the analogous band is ~283.6–300K. A clean
 # instrument therefore fires on the first weekly run against a clamped fleet —
 # that is the pre-committed design (≥1 length record → revert), not a defect.
 # The report prints the event context distribution so the owner can triage
 # small-window vs clamp-regime records before executing the rollback.
+#
+# REGIME HISTORY (withdrawal, 2026-09-21). The #1213/#1226 300K→700K re-clamp
+# was WITHDRAWN — the floor fix it was sequenced behind is deployed
+# (`MIN_USABLE_MAX_TOKENS = 1024`, pi-patch #1214(b): never clamp below a
+# usable output budget), which closes the one-token silent-death mechanism the
+# wider window was bought for, at a recurring ~+20% fleet model spend. The
+# retired 700K regime gets a distinct LEGACY bucket — from its trigger
+# (650,000 = 700,000 − 50,000) up to the shared 1M-drift floor at 900,000 — so
+# a record from that era is neither read as current geometry nor excluded as
+# small-window, the mirror of how #1226 kept the 300K era visible on the way
+# up. Against this box's corpus that bucket is EMPTY: the era's session
+# files (2026-09-18..21) carry no stopReason:"length" records (measured
+# 2026-09-21), which is the
+# honest reading of a regime that did not truncate, not a missing mechanism.
+# Any such record still COUNTS toward the literal pre-commitment above
+# (≥1 length record → revert to 1M): that trigger is
+# owner-owned, and narrowing its firing surface in code is an owner decision,
+# not this change's. The triage note therefore names the band a firing record
+# came from, which is the discriminator. NOTE the trigger has already fired
+# once (188 records — the corpus scan behind the re-clamp, recorded in §7 of
+# cost-config-policy.md) and the
+# owner's response to it
+# was the 700K re-clamp and then this withdrawal: the floor fix, not a wider
+# window, is what closes that class.
 #
 # Regenerated Aug baseline (fixed parser, #373): 8 pre-clamp compacting
 # sessions — calls mean 1867, re-read volume mean 1,969,341 tokens. Trigger =
@@ -177,18 +198,27 @@ for r in rows:
         # tokensBefore) — a length stop in a session that never compacted must
         # still land in the right regime, not a bogus "small-window(<0)".
         tb = max(r["max_ctx"], r["max_tokensBefore"])
-        # shipped 700K-clamp band: floor = the clamp's compaction trigger
-        # 650,000 (= 700,000 − 50,000 reserveTokens, #1213; the same dial #570
-        # applied to fleet-cost-report's regime floor). A length stop in the
-        # 650–700K band IS a 700K-clamp session — it must NOT fall to
+        # shipped 300K-clamp band: floor = the clamp's compaction trigger
+        # 283,616 (= 300,000 − 16,384 reserveTokens; the same dial #570
+        # applied to fleet-cost-report's regime floor). A length stop AT OR
+        # ABOVE the trigger IS a clamp session — it must NOT fall to
         # small-window (which would tell the owner to exclude a clamp-era
-        # record from the revert decision). The previous clamp's
-        # 283.6–650K band is its own LEGACY bucket, and pre-clamp
-        # legacy/200K-transient sessions (~196–205K) stay below the floor.
-        bucket = "700K-clamp(650-700K)" if 650000 <= tb < 900000 else \
-                 ("1M-era(≥900K)" if tb >= 900000 else
-                  ("300K-clamp-era(283.6-650K)" if 283616 <= tb < 650000 else
-                   f"small-window(<{tb:,})"))
+        # record from the revert decision); pre-clamp legacy/200K-transient
+        # sessions (~196–205K) stay below the floor. The band runs up to the
+        # next era's floor, and the label names that true band because this
+        # label is the owner-facing discriminator: a record sitting well above
+        # ~300K inside it is an EARLIER clamp era's (e.g. the 400K records the
+        # header describes), not this clamp's own mid-turn overrun — the
+        # current geometry's tight band is ~283.6–300K.
+        # The WITHDRAWN (#1213/#1226) 700K era gets its own LEGACY bucket,
+        # floor = its own compaction trigger 650,000 (= 700,000 − 50,000),
+        # running up to the shared 1M-drift floor at 900,000. Its label names
+        # that same true band, for the same reason: a record in this bucket is
+        # neither current geometry nor small-window. (Empty against this box's
+        # corpus — see the header.)
+        bucket = "300K-clamp(283.6-650K)" if 283616 <= tb < 650000 else \
+                 ("700K-clamp-era(650-900K)" if 650000 <= tb < 900000 else \
+                  ("1M-era(≥900K)" if tb >= 900000 else f"small-window(<{tb:,})"))
         len_ctx_buckets[bucket] += gl
 
 # B) volume/calls leg: per-compacting-session means vs 2× baseline over any
@@ -251,16 +281,26 @@ for t in trig:
     print(f"- {t}")
 print("")
 print("Pre-committed procedure (policy §7 — the weekly report reader is the owner):")
-print("  1. Revert the clamp: models.json contextWindow 700000 → 1000000 for every")
+print("  1. Revert the clamp: models.json contextWindow 300000 → 1000000 for every")
 print("     deepseek-served id (and models-store.json checkedAt bump, defense-in-depth).")
 print("  2. Update the guard threshold scripts/check-cost-config.sh in the SAME commit")
-print("     (the revert must not leave the drift guard asserting ≤700K).")
+print("     (the revert must not leave the drift guard asserting ≤300K).")
 print("  3. Window: COST_CLAMP_OVERRIDE=1 silences the guard for the rollback run;")
 print("     it never enables a live 1M session past the window.")
-print("  4. Re-clamping afterwards requires re-approval (policy §7).")
+print("  4. Re-clamping to 300K afterwards requires re-approval (policy §7).")
 print("")
-print("Owner triage (this run): length records at the 700K-clamp regime are the")
+print("Owner triage (this run): length records at the 300K-clamp regime are the")
 print("predicted C8 mid-turn-overrun class; records in small-window sessions are")
-print("not clamp-related — exclude them from the revert decision.")
+print("not clamp-related — exclude them from the revert decision. The 300K-clamp")
+print("bucket spans the trigger up to the withdrawn era's floor, so a record")
+print("sitting well above ~300K is an EARLIER clamp era's, not this clamp's — the")
+print("current geometry's own band is ~283.6–300K.")
+print("")
+print("Records bucketed 700K-clamp-era(650-900K) sit at or above the WITHDRAWN")
+print("700K regime's compaction trigger and below the 1M-drift floor. They still")
+print("count toward this trigger (it is owner-owned and this instrument does not")
+print("narrow it), but they are NOT evidence about the restored 300K clamp. When")
+print("every record this run carries that bucket, no current-geometry truncation")
+print("was observed; the firing records age out of the window and stop counting.")
 sys.exit(1)
 PYEOF

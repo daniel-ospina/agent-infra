@@ -73,9 +73,9 @@ jobs:
         run: bash tests/materialize-agents/run.sh
 
   cost-config:
-    # #341 — cost-config drift guard (config clamp @700K; #1213): asserts the
-    # shipped deepseek context clamp + settings compaction/retry contract, then
-    # runs the fixture suite (backdoor drift blocks/warns, clean passes,
+    # #341 — cost-config drift guard (config clamp @300K): asserts the shipped
+    # deepseek context clamp + settings compaction/retry contract, then runs
+    # the fixture suite (backdoor drift blocks/warns, clean 300K passes,
     # override honored). Shipped-only — CI has no live ~/.pi/agent.
     runs-on: ubuntu-latest
     steps:

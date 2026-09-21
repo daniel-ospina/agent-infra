@@ -17,16 +17,16 @@ guidance that is consistent with the #363 6h sub-agent cap. Delivered by issue
 #365 (indicator 1 + 2 ship now; indicator 3's escalation is **pre-committed
 with a calibration-pending threshold** — no fabricated numbers). Sibling
 policy: `docs/ops/cost-config-policy.md` (the deepseek context clamp + drift
-guard). NOTE: this contract states the LIVE clamp regime (700K since #1213;
+guard). NOTE: this contract states the LIVE clamp regime (300K, since #476's
 Compaction fix / PR #511, 2026-09-05); cost-config-policy.md and
 fleet-cost-report.sh's prose/constants are re-anchored from the pre-dial 400K
-regime to the shipped clamp by issue #570 — this doc restates only the
+regime to the shipped 300K clamp by issue #570 — this doc restates only the
 shipped regime.
 
 **Driver vs amplifier (honest framing):** #341's postmortem named two
 different cost problems. The **amplifier** is cold compaction at the 1M
 ceiling destroying the cache prefix (~50x re-ingestion) — addressed by the
-context clamp (`cost-config-policy.md`; shipped 700K since the #1213 dial). The
+context clamp (`cost-config-policy.md`; shipped 300K since the #511 dial). The
 **driver** this contract owns is
 session *shape*: marathon sessions running 1,000–3,800 assistant calls each
 (the measured Aug fleet; see #341), recurring handoffs that seeded **100+ KB
@@ -113,11 +113,10 @@ repo artifacts / the session JSONL / the plan doc, not in the seed.
 
 Sessions MUST expect compaction, not be surprised by it. The trigger is pi's
 `compaction.js`: compaction fires when
-`contextTokens > contextWindow − reserveTokens`. With the shipped **700K
-clamp** (dialed 400K→300K by #476's Compaction fix / PR #511, 2026-09-05, then
-300K→700K by #1213, 2026-09-18 — see `cost-config-policy.md` §8) and
-`reserveTokens 50000`, a marathon session
-**crosses the trigger at ~650,000 tokens and compacts — that is the design,
+`contextTokens > contextWindow − reserveTokens`. With the shipped **300K
+clamp** (dialed 400K→300K by #476's Compaction fix / PR #511, 2026-09-05) and
+`reserveTokens 16384` (the #341 shipped compaction block), a marathon session
+**crosses the trigger at ~283,616 tokens and compacts — that is the design,
 not a failure.** Under the clamp the compaction lands in the cache-read area
 instead of destroying the prefix at the 1M ceiling.
 
@@ -125,11 +124,11 @@ Expected vs drift:
 
 | Observation | Meaning |
 |---|---|
-| Compaction at `tokensBefore` in the ~650K+ band (at/above the 700K-clamp trigger 650,000) | Normal post-clamp marathon behavior — cache-read area retained |
+| Compaction at `tokensBefore` in the ~283.6K+ band (at/above the 300K-clamp trigger 283,616) | Normal post-clamp marathon behavior — cache-read area retained |
 | Compaction with `tokensBefore ≥ 900K` | **Drift** — a 1M-window session exists (clamp not live). Threshold (a) of the weekly report escalates |
 | `stopReason: "length"` on a message | **Ceiling truncation** — the real truncation marker; the watch-truncation.sh leg + the pre-committed rollback trigger (#341 Task C8) |
 
-So the correct mental model: a long session WILL compact around 650K; that
+So the correct mental model: a long session WILL compact around 283.6K; that
 fact alone does not justify killing or restarting it. The alarms are the
 drift classes (≥900K ceiling records, `length` stops, sustained cache-share
 below the fleet-cost-report (b) floor). The lifecycle lever against
@@ -154,7 +153,7 @@ Max-call guidance is therefore a **flag band, not a kill line**:
   the #373 regenerated baseline). The 6h cap is the outer bound on that band.
 - **At ~2,000 assistant calls (≈3h of continuous work), pause and check
   session shape:** is this still ONE issue? Are handoffs/reads staying under
-  the §2 budget? Has context crossed the ~650K compaction trigger more than
+  the §2 budget? Has context crossed the ~283.6K compaction trigger more than
   the marathon norm? If the answers are "one issue, bounded handoffs, normal
   compactions" → continue (the #363-sanctioned shape). If a session is
   multi-issue, re-seeding oversized context, or looping review churn without
@@ -208,11 +207,11 @@ waits on data.**
 
 ## 6. Relationship to the config clamp and #363
 
-- The **clamp** (700K since the #1213 dial) reduces what a marathon session
+- The **clamp** (300K since the #511 dial) reduces what a marathon session
   *pays*; this contract
   reduces how *bloated* a session *gets*. They are complementary: the clamp's
   savings are measured over compacting sessions only (cost-config-policy §1,
-  re-anchored to the shipped clamp at #570),
+  re-anchored to the shipped 300K clamp at #570),
   and the cheapest compacting session is the one that never needed the
   context that triggered compaction — which is §1 + §2's job.
 - **#363 (6h cap) amplifies the marathon shape** — longer sanctioned runs
@@ -246,7 +245,7 @@ Task D item 10); issue #365 owns the follow-up so the deferral does not
 evaporate. Measured anchors (no new claims): marathon band 1,000–3,800 calls,
 100+ KB handoff seeds, 500–800K pre-clamp context — #341 issue body + #340
 plan (docs/plans/2026-09-05-issue-340-session-cost-guardrail-plan.md); the
-live clamp regime (700K / trigger 650,000 / keepRecentTokens 12K) — the
+live clamp regime (300K / trigger 283,616 / keepRecentTokens 12K) — the
 SHIPPED pi-bootstrap/pi-config config + guard (the #511 dial;
 cost-config-policy.md + fleet-cost-report.sh carry the 400K-era prose
 re-anchored by issue #570); the (c) 58%

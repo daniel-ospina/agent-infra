@@ -30,14 +30,7 @@ export default function (pi: ExtensionAPI) {
       // at runtime (s7) — without them a hop-leg dispatch would fail to
       // resolve the model. Cost/maxTokens sourced from the equivalent
       // openrouter.models[] rows in models-store.json (catalog authority, s7);
-      // contextWindow tracks the global clamp (700K since #1213; 300K
-      // before it) so this declared table cannot silently disagree with the
-      // shipped `models.json` modelOverrides, which are applied LAST and had
-      // already resolved these slugs at 700K. NOTE: these outgoing legs are
-      // UNPROBED at 700K (filed — only api.deepseek.com was driven past 300K);
-      // an over-ceiling request on a leg fails LOUDLY (recoverable provider
-      // error) and is recorded by extensions/compaction-watchdog.ts.
-      // (Exception: the V4.1 row
+      // contextWindow honors the global clamp (300K). (Exception: the V4.1 row
       // below has NO entry in the shipped store — see its own comment for the
       // provenance of its rates.)
       //
@@ -72,7 +65,7 @@ export default function (pi: ExtensionAPI) {
         thinkingLevelMap: { off: "none", minimal: null, low: null, medium: null, high: "high", max: "max" },
         input: ["text", "image"],
         cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
-        contextWindow: 700000,
+        contextWindow: 300000,
         maxTokens: 384000
       },
       // Legacy-generation leg (upstream "DeepSeek V4 Flash 0423"), kept in the
@@ -90,7 +83,7 @@ export default function (pi: ExtensionAPI) {
         reasoning: false,
         input: ["text"],
         cost: { input: 0.0882, output: 0.1764, cacheRead: 0.01764, cacheWrite: 0 },
-        contextWindow: 700000,
+        contextWindow: 300000,
         maxTokens: 131072
       },
       {
@@ -99,7 +92,7 @@ export default function (pi: ExtensionAPI) {
         reasoning: false,
         input: ["text"],
         cost: { input: 0.435, output: 0.87, cacheRead: 0.003625, cacheWrite: 0 },
-        contextWindow: 700000,
+        contextWindow: 300000,
         maxTokens: 384000
       }
     ]
