@@ -27,6 +27,24 @@
 #           block + stale-break; RESIDUAL semantics (fresh-read, dry-run =
 #           would-be-reaped); strict-> boundary; threshold override; DATE_BIN
 #           branch seam (BSD forced on any platform via capability probe)
+#   pack E  candidate-ancestry gate 3 (#1207) — ADDITIVE refusal. E1 a
+#           Terminal.app chain is report-only; E2 a cmux-rooted chain is
+#           report-only; E3 an unresolvable chain is refused (unknown); E4 a
+#           RED control: the scenario copy (below) signals the SAME cmux
+#           fixture, so E2 is load-bearing and would go RED if the cmux arm
+#           were relaxed; E0 pins the scenario copy to a one-line diff.
+#
+# ── the gate-3-relaxed SCENARIO COPY (#1207) ──────────────────────────
+# Under the recorded decision gate 3 refuses EVERY chain class, so the
+# shipped reaper signals nothing at all — its kill path is unreachable by
+# construction. Packs A–D exercise that machinery (TERM/KILL shape, settle
+# suppression, the #947 stuck arm), so `run_reaper` invokes a copy that
+# differs from the shipped script by EXACTLY ONE LINE: the cmux arm of
+# `gate3_allows` is relaxed to allow. Pack E pins gate 3's refusals against
+# the REAL script via `run_reaper_real`, and asserts the copy's diff is one
+# line — so the copy can never drift into a different artifact, and every
+# other line it runs IS the shipped code.
+#
 # Real-tty assertions are NOT in this suite (the self-skip contract is
 # exercised by shims); real-tty verification is dev-box steps (plan/scope).
 
@@ -100,8 +118,21 @@ if [ "${1:-}" = "-axo" ]; then
     # self-exclusion is exercised deterministically.
     SELF_PID="${PI_REAP_SELF_PID:-$PPID}"
     echo "$SELF_PID 400000 400000 ${FAKE_SELF_TTY:-tts000} R 0 0 /usr/bin/env bash pi-reap-idle-self"
-    echo "400000 400001 400000 ${FAKE_SELF_TTY:-tts000} S 0 0 /bin/launchd-self"
-    echo "400001 1 400001 ?? S 0 0 /sbin/launchd"
+    # 400000 carries a full lstart too: the PS_TABLE awk keeps pid/ppid from a
+    # yearless row but the chain walk needs 400000's OWN parent link to step
+    # past it, and a row the parser reduces to four fields is dropped from the
+    # host-class map entirely (the walk then stops at 400000 and answers
+    # `unknown`).
+    echo "400000 400001 400000 ${FAKE_SELF_TTY:-tts000} Thu Sep  3 20:00:00 2026 S 0 /bin/launchd-self"
+    # gate 3 (#1207): the synthetic chain is cmux-ROOTED, mirroring the real
+    # fleet (every live lane is spawned by cmux.app; the earlier 400001 -> 1
+    # shape had NO recognised host app and would classify `unknown`, which
+    # gate 3 fail-closed refuses). The row carries a full lstart because the
+    # PS_TABLE awk finds the command only AFTER a 4-digit year token — a
+    # yearless row keeps pid/ppid but loses its argv, and the chain walk reads
+    # argv[0] to recognise a host app.
+    echo "400001 400002 400001 ?? Thu Sep  3 20:00:00 2026 S 0 /Applications/cmux.app/Contents/MacOS/cmux"
+    echo "400002 1 400002 ?? S 0 0 /sbin/launchd"
     exit 0
 fi
 PID=""
@@ -187,10 +218,19 @@ LOOK
 # `home` dir and a `HOME` file in the same base (they collide).
 mk_env() { mkdir -p "$T/$1/home" "$T/$1/state"; }
 
-run_reaper() { # <env-name> args... — reaper with full shim env
-    local envname="$1"; shift
+# gate-3-relaxed scenario copy (#1207) — see the header. Exactly one line:
+# `cmux) return 1 ;;` (report-only) -> `cmux) return 0 ;;` (may signal).
+REAPER_G3OFF="$T/bin/pi-reap-idle-g3off.sh"
+sed 's/cmux) return 1 ;;/cmux) return 0 ;;/' "$REAPER" > "$REAPER_G3OFF"
+
+run_reaper_bin() { # <binary> <env-name> args... — reaper with full shim env
+    local bin="$1" envname="$2"; shift 2
     HOME="$T/$envname/home" \
     PATH="$T/bin:$PATH" \
+    # The scenario copy lives in $T/bin, so the script's own sibling
+    # lib/pid-identity.sh lookup would miss (and the reaper FAIL-CLOSES exit 3
+    # without it). Point the documented seam at the REAL library.
+    PID_IDENTITY_LIB="$SCRIPT_DIR/lib/pid-identity.sh" \
     PS_BIN="$T/bin/ps" KILL_BIN="$T/bin/kill" DATE_BIN="${DATE_BIN:-$T/bin/date}" \
     FAKE_PS_SOURCE="$T/$envname/ps-source" \
     FAKE_SELF_TTY="${FAKE_SELF_TTY:-tts900}" \
@@ -203,8 +243,13 @@ run_reaper() { # <env-name> args... — reaper with full shim env
     PI_SESSIONS_DIR="$T/$envname/sessions" \
     REAP_LOG="$T/$envname/reap.log" \
     REAP_LOCK_STALE_SECONDS="${REAP_LOCK_STALE_SECONDS:-5}" \
-    bash "$REAPER" "$@"
+    bash "$bin" "$@"
 }
+
+# Packs A–D run the gate-3-relaxed scenario copy so their kill-path machinery
+# stays reachable; pack E uses run_reaper_real for gate 3's own refusals.
+run_reaper() { run_reaper_bin "$REAPER_G3OFF" "$@"; }
+run_reaper_real() { run_reaper_bin "$REAPER" "$@"; }
 
 # ps row builder: pid ppid pgid tty lstart stat rss cmd
 psrow() { printf '%s %s %s %s %s %s %s %s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"; }
@@ -1666,6 +1711,110 @@ assert_contains "$(cat "$T/D/reap.log")" "activity advanced" "D24 normal-row uni
 rm -rf "$T/D/sessions" "$T/D/norm-union-side.sh"
 
 rm -rf "$T/D"
+
+echo "fixture pack E: candidate-ancestry gate 3 (#1207) — ADDITIVE refusals"
+mk_env E
+make_lookup "$T/E/date.lookup"
+FAKE_SELF_TTY=tts900
+
+# E0: the scenario copy is the shipped script plus EXACTLY the one relaxed
+# line. Without this pin the copy could drift into a different artifact while
+# every pack below stayed green.
+assert_eq "$(diff "$REAPER" "$REAPER_G3OFF" | grep -c '^[<>]')" "2" \
+    "E0 scenario copy differs from the shipped reaper by exactly one line (1 removed + 1 added)"
+assert_contains "$(cat "$REAPER_G3OFF")" "cmux) return 0 ;;" "E0 scenario copy carries the relaxed cmux arm"
+assert_not_contains "$(cat "$REAPER")" "cmux) return 0 ;;" "E0 the SHIPPED reaper keeps cmux report-only (option A)"
+
+# E1: Terminal.app -> login -> -zsh -> <target> with an idle-30h (parked)
+# profile. The near-miss shape. Must NOT be signalled, on the REAL reaper, and
+# must be refused on the human-terminal ground.
+printf '%s\n' \
+    "$(psrow 21001 500001 21001 ttys500 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/e1")" \
+    "$(psrow 500001 500002 500001 ?? "Thu Sep  3 20:00:00 2026" S 0 "-zsh")" \
+    "$(psrow 500002 500003 500002 ?? "Thu Sep  3 20:00:00 2026" S 0 "/usr/bin/login -flp danielospina /bin/bash --noprofile --norc -c exec -l /bin/zsh")" \
+    "$(psrow 500003 1 500003 ?? "Thu Sep  3 20:00:00 2026" S 0 "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal")" \
+    > "$T/E/ps-source"
+printf '{"e1":{"pid":21001,"pidStartSeconds":%s,"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/e1"}}' "$E_SEP3_2000" | cmux_store E
+session_jsonl E /Users/t/e1 e1 "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+: > "$T/E/kill.log"; : > "$T/E/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper_real E --apply 2>&1)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "E1 Terminal.app chain is NEVER reap-eligible"
+assert_contains "$OUT" "REPORT-ONLY gate3=human-terminal" "E1 refused, and the ground named, as human-terminal"
+[ ! -s "$T/E/kill.log" ] && ok "E1 armed pass sent ZERO signals for the human-terminal chain" \
+    || bad "E1 armed pass sent ZERO signals for the human-terminal chain"
+assert_contains "$(cat "$T/E/reap.log")" "GATE3_REFUSED=1 GATE3_HUMAN=1 GATE3_CMUX=0 GATE3_UNKNOWN=0 GATE3_ALLOWED=0" \
+    "E1 footer carries the gate-3 refusal counters by ground"
+rm -rf "$T/E/sessions"
+
+# E2: the SAME idle-30h profile on a cmux-rooted chain (the shim's default —
+# the live fleet's real shape). Option A: report-only, never signalled. The
+# output must also SAY the zero harvest is the intended state, so a future
+# reader does not read it as a broken reaper.
+idle30h_fixture E 21002 ttys501 e2 /Users/t/e2
+: > "$T/E/kill.log"; : > "$T/E/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper_real E --apply 2>&1)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "E2 cmux-rooted chain is NEVER reap-eligible (option A)"
+assert_contains "$OUT" "REPORT-ONLY gate3=cmux" "E2 refused, and the ground named, as cmux-rooted"
+assert_contains "$OUT" "the harvest is ZERO by DECISION, not by fault" \
+    "E2 the report says the zero harvest is intended, not a fault"
+[ ! -s "$T/E/kill.log" ] && ok "E2 armed pass sent ZERO signals for the cmux-rooted chain" \
+    || bad "E2 armed pass sent ZERO signals for the cmux-rooted chain"
+assert_contains "$(cat "$T/E/reap.log")" "GATE3_REFUSED=1 GATE3_HUMAN=0 GATE3_CMUX=1 GATE3_UNKNOWN=0 GATE3_ALLOWED=0" \
+    "E2 footer attributes the refusal to the cmux-rooted ground"
+rm -rf "$T/E/sessions"
+
+# E3: an UNRESOLVABLE chain (the candidate's parent is not in the table).
+# Fail closed: reported, not killed.
+printf '%s\n' \
+    "$(psrow 21003 600001 21003 ttys502 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/e3")" \
+    > "$T/E/ps-source"
+printf '{"e3":{"pid":21003,"pidStartSeconds":%s,"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/e3"}}' "$E_SEP3_2000" | cmux_store E
+session_jsonl E /Users/t/e3 e3 "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+: > "$T/E/kill.log"; : > "$T/E/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper_real E --apply 2>&1)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "E3 unresolvable chain is reported, not killed"
+assert_contains "$OUT" "REPORT-ONLY gate3=unknown" "E3 refusal names the unknown (fail-closed) ground"
+[ ! -s "$T/E/kill.log" ] && ok "E3 armed pass sent ZERO signals for the unresolvable chain" \
+    || bad "E3 armed pass sent ZERO signals for the unresolvable chain"
+assert_contains "$(cat "$T/E/reap.log")" "GATE3_REFUSED=1 GATE3_HUMAN=0 GATE3_CMUX=0 GATE3_UNKNOWN=1 GATE3_ALLOWED=0" \
+    "E3 footer attributes the refusal to the unknown ground"
+rm -rf "$T/E/sessions"
+
+# E4 (RED CONTROL): the very same cmux-rooted idle-30h fixture, run on the
+# scenario copy whose cmux arm is relaxed. It IS eligible and IS signalled —
+# which is what makes E2 load-bearing: relax the cmux arm and E2 goes RED.
+idle30h_fixture E 21004 ttys503 e4 /Users/t/e4
+: > "$T/E/kill.log"; : > "$T/E/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper E --apply 2>&1)"
+assert_contains "$OUT" "REAP-ELIGIBLE" \
+    "E4 RED control: with the cmux arm relaxed the SAME chain IS eligible (E2 would go RED)"
+assert_contains "$(cat "$T/E/kill.log")" "kill -TERM -21004" \
+    "E4 RED control: the mutated copy actually signals the cmux chain"
+assert_contains "$OUT" "GATE 3 (candidate-ancestry)" "E4 the report block is emitted on every classified pass"
+assert_not_contains "$OUT" "the harvest is ZERO by DECISION" \
+    "E4 the zero-harvest wording is suppressed once a candidate is allowed (truthful on the mutant)"
+rm -rf "$T/E/sessions"
+
+# E5 (defence in depth): a candidate whose CLASSIFY-time verdict is bypassed
+# is still refused at the SIGNAL point by reap_one's re-ask. Mutant: neutralise
+# ONLY the two classify-site checks (the settle-time check is the same
+# function and stays live), so the candidate reaches REAP_CANDIDATES and the
+# settle gate is the single thing that can stop the signal.
+REAPER_NOCLASSIFY="$T/bin/pi-reap-idle-noclassify.sh"
+sed 's/if \[ "\$gate3_ok" != 1 \]; then/if [ "$gate3_ok" = 99 ]; then/g' "$REAPER" > "$REAPER_NOCLASSIFY"
+assert_eq "$(diff "$REAPER" "$REAPER_NOCLASSIFY" | grep -c '^[<>]')" "4" \
+    "E5 precondition: the bypass mutant changed the two classify checks and nothing else"
+idle30h_fixture E 21005 ttys504 e5 /Users/t/e5
+: > "$T/E/kill.log"; : > "$T/E/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper_bin "$REAPER_NOCLASSIFY" E --apply 2>&1)"
+assert_contains "$OUT" "REAP-ELIGIBLE" "E5 precondition: the classify-site bypass marks the candidate eligible"
+assert_contains "$(cat "$T/E/reap.log")" "SETTLE-SKIP 21005 gate 3 refused" \
+    "E5 the settle-time re-ask is what suppresses the signal (defence in depth)"
+[ ! -s "$T/E/kill.log" ] && ok "E5 zero signals despite the classify-site bypass" \
+    || bad "E5 zero signals despite the classify-site bypass"
+rm -rf "$T/E/sessions"
+
+rm -rf "$T/E"
 
 echo "════════════════════════════════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"
