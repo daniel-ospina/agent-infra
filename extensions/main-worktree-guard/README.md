@@ -558,7 +558,7 @@ the point.
 
 ### The clean-but-stale hub — `hub-worktree.sh refresh` (#1309)
 
-The hub state that had no agent-reachable path is a **clean but
+The hub state that had no **sanctioned** path is a **clean but
 non-fast-forwardable** hub: a local `main` that has **diverged** from
 `origin/main`, i.e. it carries local-only commits (the observed tortoise shape:
 an empty commit, then a merge of the upstream on top of it). `salvage` does not
@@ -566,17 +566,19 @@ apply (there is no dirty set), and the M4-sanctioned recovery (`git checkout
 main && git pull --ff-only`) cannot apply to a divergent branch — git refuses a
 non-fast-forward — while `reset --hard` is refused by the destructive-git gate
 and `repo-freshness`'s `auto` mode deliberately declines to recover a
-*diverged* default branch. The hub-state check then still reports PASS because
-it tests on-main + clean, not freshness — so the staleness hid itself: **an
-absent guard reads as a passing guard**. Observed live: the tortoise hub sat
-**3 days / 308 commits** stale, with files merged upstream since simply absent
-from its tree.
+*diverged* default branch. (The guard's ownership allowance does still let
+`git rebase` through on this state — that is the pre-existing defect tracked by
+#1144, not a remedy.) The hub-state check then still reports PASS because it
+tests on-main + clean, not freshness — so the staleness hid itself: **an absent
+guard reads as a passing guard**. Observed live: the tortoise hub sat **3 days /
+308 commits** stale, with files merged upstream since simply absent from its
+tree. A follow-up to make that detector report the staleness: #1313.
 
 Note the boundary: a merely **behind** hub is already handled — `git checkout
-main && git pull --ff-only` is M4-sanctioned recovery, `repo-freshness`'s `auto`
-mode ff-pulls a clean default branch (every 20 min), and the guard's own block
-message names the same one-liner. `refresh` exists for the case those cannot
-reach.
+main && git pull --ff-only` is M4-sanctioned recovery, and `repo-freshness`'s
+`auto` mode ff-pulls a clean default branch every 20 min in the **sibling** hubs
+(agent-infra is deliberately skipped there — `auto-sync` ff-pulls it at session
+start). `refresh` exists for the case those cannot reach.
 
 `hub-worktree.sh refresh [--repo <path>] [--discard-contentless]` is the
 sanctioned path. It fetches, then advances a CLEAN hub's **own** branch to its

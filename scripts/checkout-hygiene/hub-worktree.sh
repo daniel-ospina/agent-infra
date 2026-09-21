@@ -46,21 +46,25 @@
 #
 #   hub-worktree.sh refresh [--repo <path>] [--discard-contentless]
 #     Clean-but-stale hub refresh (#1309): fetch, then advance a CLEAN hub's
-#     local main to its upstream.
+#     own branch (main/master) to its upstream.
 #
 #     The state this fills is the NON-FAST-FORWARDABLE clean hub — a local main
 #     that has DIVERGED from the upstream (the observed tortoise shape: an empty
 #     commit, then a merge of the upstream on top of it). A merely *behind* hub
 #     is already handled: `git pull --ff-only` (with `git checkout main`) is
-#     M4-sanctioned recovery, repo-freshness's `auto` mode ff-pulls a clean
-#     default branch, and the guard's block message names the same one-liner.
+#     M4-sanctioned recovery, and repo-freshness's `auto` mode ff-pulls a clean
+#     default branch every 20 min in the SIBLING hubs (agent-infra is
+#     deliberately skipped there — auto-sync ff-pulls it at session start).
 #     On a DIVERGED hub, though, that ff-pull cannot apply (git refuses a
 #     non-fast-forward), `reset --hard` is refused by the destructive-git gate,
-#     repo-freshness deliberately declines to recover a diverged default branch,
-#     and the hub-state check still reports PASS because it tests on-main +
-#     clean, not freshness — so the staleness hid itself: an absent guard reads
-#     as a passing guard. Observed live: the tortoise hub sat 3 days / 308
-#     commits stale, with files merged upstream since simply absent from it.
+#     and repo-freshness deliberately declines to recover a diverged default
+#     branch — so no SANCTIONED path moves the tip. (The one verb the guard's
+#     ownership allowance still lets through on this state is `git rebase`,
+#     which is the defect tracked by #1144, not a remedy.) Meanwhile the
+#     hub-state check still reports PASS because it tests on-main + clean, not
+#     freshness — so the staleness hid itself: an absent guard reads as a
+#     passing guard. Observed live: the tortoise hub sat 3 days / 308 commits
+#     stale, with files merged upstream since simply absent from it.
 #
 #     Refresh REFUSES by default (exit 1) rather than moving anything:
 #       - the hub is not on main/master (or is detached) → refused; an off-main
@@ -95,8 +99,8 @@
 # Exits: 0 success · 1 operational failure (nothing to salvage, /tmp repo,
 # existing worktree, off-main/dirty/diverged/ignored-collision refresh refusal,
 # git failure) · 2 usage error. Worktree add + salvage never modify the hub's
-# branch; refresh moves a CLEAN hub's main to its upstream (that is its
-# purpose). All modes are safe against the main-worktree-guard.
+# branch; refresh moves a CLEAN hub's own branch (main/master) to its upstream
+# (that is its purpose). All modes are safe against the main-worktree-guard.
 
 set -euo pipefail
 
@@ -408,14 +412,16 @@ salvage() {
 }
 
 # ── REFRESH MODE (#1309) ────────────────────────────────────────────────────
-# Advance a CLEAN hub's own branch to its upstream. The unreachable state is a
-# NON-FAST-FORWARDABLE clean hub: the M4-sanctioned `git pull --ff-only` cannot
-# apply to a diverged local main, `reset --hard` is refused by the
-# destructive-git gate, and repo-freshness deliberately declines to recover a
-# diverged default branch — so a clone nobody could refresh sat 308 commits
-# stale, and because an absent guard reads as a passing guard nothing signalled
-# it. This mode is that fix — and it refuses by default: a dirty hub is the
-# SALVAGE case, and a local-only commit is never dropped implicitly.
+# Advance a CLEAN hub's own branch to its upstream. The unreachable-by-a-
+# SANCTIONED-path state is a NON-FAST-FORWARDABLE clean hub: the M4-sanctioned
+# `git pull --ff-only` cannot apply to a diverged local main, `reset --hard` is
+# refused by the destructive-git gate, and repo-freshness deliberately declines
+# to recover a diverged default branch — so a clone nobody could refresh sat 308
+# commits stale, and because an absent guard reads as a passing guard nothing
+# signalled it. (The ownership allowance still lets `git rebase` through on this
+# state; that is the #1144 defect, not a remedy.) This mode is that fix — and it
+# refuses by default: a dirty hub is the SALVAGE case, and a local-only commit
+# is never dropped implicitly.
 #
 # Guard posture (no allowlist change): this function runs ONLY the
 # M4-sanctioned/read-only surface — fetch / status / branch --show-current /

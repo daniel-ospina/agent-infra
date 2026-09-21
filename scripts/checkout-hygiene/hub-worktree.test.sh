@@ -206,13 +206,14 @@ git -C "$REPO" worktree remove --force "$REPO/.worktrees/feat/salvage-symlink" 2
 git -C "$REPO" branch -q -D feat/salvage-symlink 2>/dev/null || true
 
 # ── 8. refresh (#1309): clean-but-stale hub → advance the hub to its upstream ─
-# The state with no agent-reachable path: a CLEAN hub whose local main has
-# DIVERGED from origin/main (a merely behind hub is already covered by the
-# M4-sanctioned `git pull --ff-only` and by repo-freshness). refresh must
-# advance it — and must refuse, by default and non-zero, to discard a dirty
-# tree, a local-only commit that carries any file content, or a hub-local
-# IGNORED file the upstream now tracks. Hermetic: every repo here is a
-# throwaway under $FIX, never a real hub.
+# The state with no SANCTIONED path: a CLEAN hub whose local main has DIVERGED
+# from origin/main (a merely behind hub is already covered by the M4-sanctioned
+# `git pull --ff-only`; repo-freshness covers the sibling hubs automatically).
+# refresh must refuse a diverged hub by default and print the local-only SHA(s);
+# `--discard-contentless` advances it only when every local-only commit is
+# contentless. It must also refuse, by default and non-zero, a dirty tree, a
+# content-carrying local-only commit, or a hub-local IGNORED path the upstream
+# changes. Hermetic: every repo here is a throwaway under $FIX, never a real hub.
 git -C "$REPO" checkout -q main 2>/dev/null || true
 git -C "$REPO" fetch -q origin main
 git -C "$REPO" reset -q --hard origin/main
@@ -411,15 +412,39 @@ assert_contains "$out" ".env" "ignored-collision refusal names the file"
 assert_eq "$(cat "$REPO/.env")" "hub-local-secret" "the hub-local ignored file was not overwritten"
 rm -f "$REPO/.env"
 
-# 8m. the ignored-collision check does NOT false-refuse when the ignored file
-# has no upstream counterpart.
+# 8m. the ignored-collision check does NOT false-refuse when the ignored path
+# has no upstream counterpart. The hub is left genuinely BEHIND so the
+# sub-script actually runs — on the "already up to date" path the check would
+# never be exercised and this group would be inert.
 git -C "$REPO" fetch -q origin main
 git -C "$REPO" reset -q --hard origin/main
+echo "m-upstream" > "$CLONE/m-upstream.txt"
+git -C "$CLONE" add m-upstream.txt && git -C "$CLONE" commit -qm m-upstream
+git -C "$CLONE" push -q origin main
 printf 'still-local\n' > "$REPO/.env.local"
 out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 0 "an unrelated hub-local ignored file still refreshes → exit 0"
+assert_contains "$out" "fast-forward" "the ignored-collision check ran on the advancing path"
 assert_eq "$(cat "$REPO/.env.local")" "still-local" "the unrelated ignored file is untouched"
 rm -f "$REPO/.env.local"
+
+# 8n. the collision check is PATH-AWARE, not a string compare: a hub-local
+# ignored DIRECTORY that collides with an upstream FILE of the same name is
+# caught (a line-by-line ignored-vs-tracked `comm` misses it).
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+mkdir -p "$REPO/hubdir" && printf 'hub-kept\n' > "$REPO/hubdir/k.txt"
+printf 'hubdir/\n' >> "$REPO/.gitignore"
+git -C "$REPO" add .gitignore && git -C "$REPO" commit -qm ignore-hubdir
+git -C "$REPO" push -q origin main
+git -C "$CLONE" fetch -q origin main && git -C "$CLONE" reset -q --hard origin/main
+printf 'upstream-file\n' > "$CLONE/hubdir"
+git -C "$CLONE" add hubdir && git -C "$CLONE" commit -qm upstream-hubdir-file
+git -C "$CLONE" push -q origin main
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses an ignored DIRECTORY vs an upstream FILE → exit 1"
+assert_contains "$out" "IGNORES" "directory/file collision refusal names the state"
+assert_eq "$(cat "$REPO/hubdir/k.txt")" "hub-kept" "the ignored directory contents were not overwritten"
 
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"

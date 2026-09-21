@@ -37,8 +37,8 @@
 # Safety (self-contained failsafes, all re-run at the point of mutation): the
 # target must be a MAIN checkout (a linked worktree carries a `.git` FILE, not
 # a directory), on main/master, with an empty porcelain (tracked AND untracked)
-# read AFTER the fetch, and with no hub-local IGNORED file that the upstream now
-# tracks (that collision would be overwritten by either move). The
+# read AFTER the fetch, and with no hub-local IGNORED path that the upstream
+# changes (that collision would be overwritten by either move). The
 # `discard-contentless` path additionally re-runs the content-loss check — a
 # per-local-only-commit `git show --name-only` scan (empty for an empty commit
 # or a clean merge, non-empty for any real change) — so it is safe even if the
@@ -92,26 +92,40 @@ if [ -n "$PORCELAIN" ]; then
   exit 1
 fi
 
-# Porcelain OMITS ignored files, and BOTH moves will overwrite a hub-local
-# ignored file if the upstream now tracks that path (a hub's .env, typically).
+# `git status --porcelain` OMITS ignored files, and BOTH moves will overwrite a
+# hub-local ignored file the upstream now tracks (a hub's .env, typically).
 # `--no-overwrite-ignore` covers the merge, but `git reset` has no such flag,
 # so refuse on a collision before either move.
-if ! IGNORED="$(git -C "$MAIN_REPO" ls-files -z --others --ignored --exclude-standard 2>/dev/null | tr '\0' '\n' | LC_ALL=C sort)"; then
-  echo "hub-worktree-refresh-advance: could not list the hub's ignored files — refusing" >&2
+#
+# The test is path-aware, not a string compare of the ignored-vs-tracked lists:
+# `git check-ignore` also catches a hub-side ignored DIRECTORY colliding with an
+# upstream FILE of the same name, and a case-only difference on a
+# case-insensitive filesystem — both of which a line-by-line `comm` misses.
+COLLIDE=""
+DIFF_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-diff.XXXXXX")"
+trap 'rm -f "${DIFF_LIST:-}"' EXIT
+if ! git -C "$MAIN_REPO" diff --name-only -z HEAD "$UPSTREAM" > "$DIFF_LIST"; then
+  echo "hub-worktree-refresh-advance: could not diff the hub against $UPSTREAM — refusing" >&2
   exit 1
 fi
-if [ -n "$IGNORED" ]; then
-  if ! TRACKED="$(git -C "$MAIN_REPO" ls-tree -r -z --name-only "$UPSTREAM" 2>/dev/null | tr '\0' '\n' | LC_ALL=C sort)"; then
-    echo "hub-worktree-refresh-advance: could not read the upstream tree — refusing" >&2
-    exit 1
+while IFS= read -r -d '' P; do
+  [ -z "$P" ] && continue
+  [ -e "$MAIN_REPO/$P" ] || continue
+  if git -C "$MAIN_REPO" check-ignore -q -- "$P"; then
+    COLLIDE="${COLLIDE}${P}"$'\n'
+  else
+    RC=$?
+    if [ "$RC" -gt 1 ]; then
+      echo "hub-worktree-refresh-advance: could not determine the ignore status of '$P' — refusing" >&2
+      exit 1
+    fi
   fi
-  COLLIDE="$(LC_ALL=C comm -12 <(printf '%s\n' "$IGNORED") <(printf '%s\n' "$TRACKED"))"
-  if [ -n "$COLLIDE" ]; then
-    echo "hub-worktree-refresh-advance: the upstream tracks path(s) this hub IGNORES — the move would overwrite them (and git would not warn):" >&2
-    printf '%s\n' "$COLLIDE" | sed 's/^/     /' >&2
-    echo "   Move the hub-local file(s) aside, or refresh from a human terminal — nothing was moved." >&2
-    exit 1
-  fi
+done < "$DIFF_LIST"
+if [ -n "$COLLIDE" ]; then
+  echo "hub-worktree-refresh-advance: the upstream tracks path(s) this hub IGNORES — the move would overwrite them (and git would not warn):" >&2
+  printf '%s\n' "$COLLIDE" | sort -u | sed 's/^/     /' >&2
+  echo "   Move the hub-local file(s) aside, or refresh from a human terminal — nothing was moved." >&2
+  exit 1
 fi
 
 if [ "$MODE" = "discard-contentless" ]; then
