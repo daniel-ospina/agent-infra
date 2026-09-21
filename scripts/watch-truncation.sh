@@ -36,7 +36,8 @@
 # (`MIN_USABLE_MAX_TOKENS = 1024`, pi-patch #1214(b): never clamp below a
 # usable output budget), which closes the one-token silent-death mechanism the
 # wider window was bought for, at a recurring ~+20% fleet model spend. The
-# retired 700K regime's own band (~650–700K; its trigger was 700,000 − 50,000)
+# retired 700K regime's own band (~650–900K — from its trigger up to the
+# 1M-drift floor; its trigger was 700,000 − 50,000)
 # is kept as a LEGACY bucket, the exact mirror of what #1226 did for the 300K
 # era: the records produced 2026-09-18..21 are evidence about the RETIRED
 # regime, and mislabelling them small-window (which the triage note tells the
@@ -214,8 +215,15 @@ for r in rows:
         # mid-turn overrun — the current geometry's tight band is 283.6–300K.
         # Labelling it "…(283.6-300K)" while the condition spans to 650,000
         # would print a pre-#511 record as current-geometry evidence.
+        # The stored label states the bucket's TRUE band — the same rule the
+        # 300K bucket above follows, and the reason this one is not labelled
+        # "…(650-700K)": the condition runs to the 1M-drift floor, so a record
+        # above 700K would be printed under a band that excludes it. (It can
+        # legitimately sit there: under the 700K clamp an over-window session
+        # got the one-token length stop too, so the era's records run from its
+        # 695,904 death threshold upward.)
         bucket = "300K-clamp(283.6-650K)" if 283616 <= tb < 650000 else \
-                 ("700K-clamp-era(650-700K)" if 650000 <= tb < 900000 else \
+                 ("700K-clamp-era(650-900K)" if 650000 <= tb < 900000 else \
                   ("1M-era(≥900K)" if tb >= 900000 else f"small-window(<{tb:,})"))
         len_ctx_buckets[bucket] += gl
 
@@ -294,7 +302,7 @@ print("bucket spans the trigger up to the withdrawn era's floor, so a record")
 print("sitting well above ~300K is an EARLIER clamp era's, not this clamp's — the")
 print("current geometry's own band is ~283.6–300K.")
 print("")
-print("Records bucketed 700K-clamp-era(650-700K) come from the WITHDRAWN")
+print("Records bucketed 700K-clamp-era(650-900K) come from the WITHDRAWN")
 print("2026-09-18..21 700K regime. They still count toward this trigger (it is")
 print("owner-owned and this instrument does not narrow it), but they are evidence")
 print("about that retired regime — NOT about the restored 300K clamp. When every")

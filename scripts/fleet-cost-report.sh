@@ -42,7 +42,7 @@
 # still reported (it is the same cache economics — cache-level independent);
 # read n_clamp on the first post-withdrawal run knowing it mixes regimes, and
 # note that watch-truncation.sh buckets those same records as
-# `700K-clamp-era(650-700K)` rather than as a 1M-drift signal.
+# `700K-clamp-era(650-900K)` rather than as a 1M-drift signal.
 #   (c) output+reasoning share over non-cache tokens — the #365 TREND
 #       instrument (recorded every run, never escalates). Formula matches the
 #       pre-registered "real median 58%": per-session (output+reasoning) /

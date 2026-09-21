@@ -84,7 +84,7 @@ assert_contains "$OUT" "'300K-clamp(283.6-650K)': 1" "290K length record buckets
 # test #1226 added when the geometry pointed the other way.
 D="$T/length-legacy"; mk_sess "$D" 9 0 20000 660000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
-assert_contains "$OUT" "'700K-clamp-era(650-700K)': 1" "660K length record buckets as the withdrawn 700K era, not small-window"
+assert_contains "$OUT" "'700K-clamp-era(650-900K)': 1" "660K length record buckets as the withdrawn 700K era, not small-window"
 
 # LEG-B: 3 consecutive days each exceeding 2× re-read baseline
 #   reread/session = msg_input + comp_input; want > 3,938,682 → use 4.5M each
