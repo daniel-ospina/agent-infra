@@ -44,42 +44,130 @@
 #     git reset; rare). Auto-symlinked env fixtures (.env/.mcp.json/.venv)
 #     are never captured or removed.
 #
+#   hub-worktree.sh refresh [--repo <path>] [--discard-contentless]
+#     Clean-but-stale hub refresh (#1309): fetch, then advance a CLEAN hub's
+#     own branch (main/master) to its upstream.
+#
+#     The state this fills is the NON-FAST-FORWARDABLE clean hub — a local main
+#     that has DIVERGED from the upstream (the observed tortoise shape: an empty
+#     commit, then a merge of the upstream on top of it). A merely *behind* hub
+#     is already handled: `git pull --ff-only` (with `git checkout main`) is
+#     M4-sanctioned recovery, and repo-freshness's `auto` mode ff-pulls a clean
+#     default branch every 20 min in the SIBLING hubs (agent-infra is
+#     deliberately skipped there — auto-sync ff-pulls it at session start).
+#     On a DIVERGED hub, though, that ff-pull cannot apply (git refuses a
+#     non-fast-forward), `reset --hard` is refused by the destructive-git gate,
+#     and repo-freshness deliberately declines to recover a diverged default
+#     branch — so no SANCTIONED path moves the tip. (The guard's ownership
+#     allowance does still admit the sync verbs on the session's own baseline —
+#     `merge`/`pull`/`rebase`; the rewriting arm is the hole tracked by #1144,
+#     and an admitted plain merge mints a merge commit no other session expects,
+#     which is why neither is the sanctioned remedy.) Meanwhile the hub-state
+#     check still reports PASS because it tests on-main + clean, not freshness — so the staleness hid itself: an absent guard reads as a
+#     passing guard. Observed live: the tortoise hub sat 3 days / 308 commits
+#     stale, with files merged upstream since simply absent from it.
+#
+#     Refresh REFUSES by default (exit 1) rather than moving anything:
+#       - the hub is not on main/master (or is detached) → refused; an off-main
+#         hub is the stranded-branch case (push the branch, return the hub to
+#         main first);
+#       - the working tree is dirty → the salvage case is named as the remedy;
+#       - local-only commits would be discarded AND any of them carries file
+#         content → the differing files are named and nothing is moved;
+#       - the upstream writes a path this hub ignores → refused; the merge would
+#         abort on that collision, the reset would overwrite it without warning
+#         (a hub's .env, typically).
+#     A diverged hub whose local-only commits are CONTENTLESS (an empty commit;
+#     a merge whose own delta is nil — neither changes a file; the observed
+#     tortoise case) is ALSO refused unless --discard-contentless is given; with
+#     the flag their SHAs are printed and exactly those commits are discarded.
+#     Refresh never drops a commit implicitly.
+#
+#     Guard posture (no allowlist change): this mode runs ONLY the
+#     M4-sanctioned/read-only surface — fetch / status / branch --show-current
+#     / rev-parse / rev-list / show. The two DESTRUCTIVE verbs the final move
+#     needs (`git merge --ff-only` / `git reset --hard`) are delegated to the
+#     INTERNAL sub-script hub-worktree-refresh-advance.sh (direct-exec), exactly
+#     as salvage delegates its add/commit/push. The delegation is load-bearing
+#     even though this file is on the guard's SANCTIONED_SCRIPT_RELPATHS
+#     exemption (#1129, so the runtime content walk skips it): (a) the guard's
+#     own real-file probe pins scriptGitVerdict(hub-worktree.sh) === "allow"
+#     (#444), so a destructive verb here would redden the guard suite; and (b) a
+#     copy of this script at the same relpath in a NON-sanctioned checkout is a
+#     different realpath and stays gated. The sub-script re-checks at runtime
+#     that the target is a clean, on-main MAIN checkout (and, on the discard
+#     path, re-runs the per-commit content-loss scan) before it moves anything.
+#
 # Exits: 0 success · 1 operational failure (nothing to salvage, /tmp repo,
-# existing worktree, git failure) · 2 usage error. Never modifies the hub's
-# branch. Worktree add + salvage are safe against the main-worktree-guard.
+# existing worktree, off-main/dirty/diverged/ignored-collision refresh refusal,
+# git failure) · 2 usage error. Worktree add + salvage never modify the hub's
+# branch; refresh moves a CLEAN hub's own branch (main/master) to its upstream
+# (that is its purpose). All modes are safe against the main-worktree-guard.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" # hub-worktree.sh's own dir (the internal sub-script lives here)
 
 MODE=create
+DISCARD_CONTENTLESS=0
 if [ "${1:-}" = "salvage" ]; then
   MODE=salvage
   BRANCH="${2:-}"
   REPO_ARG="${3:-$PWD}"
+elif [ "${1:-}" = "refresh" ]; then
+  MODE=refresh
+  BRANCH="" # refresh has no feature branch; keep `set -u` from tripping on the checks below
+  shift
+  REPO_ARG="$PWD"
+  saw_repo=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --repo)
+        if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "hub-worktree: refresh: --repo needs a path" >&2; exit 2
+        fi
+        REPO_ARG="$2"; saw_repo=1; shift 2 ;;
+      --discard-contentless) DISCARD_CONTENTLESS=1; shift ;;
+      --) shift; break ;;
+      -*) echo "hub-worktree: refresh: unknown option '$1'" >&2; exit 2 ;;
+      *)
+        if [ "$saw_repo" -ne 0 ]; then
+          echo "hub-worktree: refresh: unexpected argument '$1'" >&2; exit 2
+        fi
+        REPO_ARG="$1"; saw_repo=1; shift ;;
+    esac
+  done
+  if [ "$#" -gt 0 ]; then
+    echo "hub-worktree: refresh: unexpected argument '$1'" >&2; exit 2
+  fi
 else
   BRANCH="${1:-}"
   REPO_ARG="${2:-$PWD}"
 fi
 
-if [[ -z "$BRANCH" ]]; then
-  echo "usage: hub-worktree.sh <branch> [<repo>]" >&2
-  echo "       hub-worktree.sh salvage <branch> [<repo>]" >&2
-  echo "  e.g. hub-worktree.sh feat/1484-hub /Users/me/Documents/GitHub/tortoise" >&2
-  echo "  e.g. hub-worktree.sh salvage chore/4580-salvage-dirty /Users/me/Documents/GitHub/tortoise" >&2
-  exit 2
-fi
+# The branch-name checks are create/salvage-only: refresh has no branch — it
+# advances the hub's own main.
+if [[ "$MODE" != "refresh" ]]; then
+  if [[ -z "$BRANCH" ]]; then
+    echo "usage: hub-worktree.sh <branch> [<repo>]" >&2
+    echo "       hub-worktree.sh salvage <branch> [<repo>]" >&2
+    echo "       hub-worktree.sh refresh [--repo <path>] [--discard-contentless]" >&2
+    echo "  e.g. hub-worktree.sh feat/1484-hub /Users/me/Documents/GitHub/tortoise" >&2
+    echo "  e.g. hub-worktree.sh salvage chore/4580-salvage-dirty /Users/me/Documents/GitHub/tortoise" >&2
+    exit 2
+  fi
 
-# Branch-name hygiene: no path traversal, no absolute/~/tmp tricks, and NEVER
-# the hub branch itself (the hub stays on main+clean). Slashes are fine
-# (feat/x → .worktrees/feat/x).
-case "$BRANCH" in
-  ""|main|master) echo "hub-worktree: branch must be a feature branch (not '$BRANCH')" >&2; exit 2 ;;
-  /*|~*) echo "hub-worktree: invalid branch name '$BRANCH'" >&2; exit 2 ;;
-esac
-if [[ "$BRANCH" == *".."* ]]; then
-  echo "hub-worktree: invalid branch name '$BRANCH' (no '..' allowed)" >&2
-  exit 2
+  # Branch-name hygiene: no path traversal, no absolute/~/tmp tricks, and NEVER
+  # the hub branch itself (the hub stays on main+clean). Slashes are fine
+  # (feat/x → .worktrees/feat/x).
+  case "$BRANCH" in
+    ""|main|master) echo "hub-worktree: branch must be a feature branch (not '$BRANCH')" >&2; exit 2 ;;
+    /*|~*) echo "hub-worktree: invalid branch name '$BRANCH'" >&2; exit 2 ;;
+  esac
+  if [[ "$BRANCH" == *".."* ]]; then
+    echo "hub-worktree: invalid branch name '$BRANCH' (no '..' allowed)" >&2
+    exit 2
+  fi
 fi
 
 if [[ ! -d "$REPO_ARG" ]]; then
@@ -106,14 +194,15 @@ case "$MAIN_REPO" in
 esac
 
 WT_PATH="$MAIN_REPO/.worktrees/$BRANCH"
-if [[ -e "$WT_PATH" ]]; then
+if [[ "$MODE" != "refresh" && -e "$WT_PATH" ]]; then
   echo "hub-worktree: worktree already exists at $WT_PATH" >&2
   exit 1
 fi
 
 # The skill's Safety Verification: .worktrees/ must be gitignored or its
 # contents risk being committed. Warn (not block) — the helper still works.
-if ! git -C "$MAIN_REPO" check-ignore -q .worktrees 2>/dev/null; then
+# Create/salvage only: refresh creates no worktree.
+if [[ "$MODE" != "refresh" ]] && ! git -C "$MAIN_REPO" check-ignore -q .worktrees 2>/dev/null; then
   echo "⚠️  hub-worktree: $MAIN_REPO/.worktrees is NOT gitignored — add '.worktrees/' to .gitignore" >&2
 fi
 
@@ -324,8 +413,169 @@ salvage() {
   echo "   Next: gh pr create --repo $(cd "$MAIN_REPO" && git remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]##; s#\.git$##' || echo '<origin>') --base main --head $BRANCH"
 }
 
+# ── REFRESH MODE (#1309) ────────────────────────────────────────────────────
+# Advance a CLEAN hub's own branch to its upstream. The unreachable-by-a-
+# SANCTIONED-path state is a NON-FAST-FORWARDABLE clean hub: the M4-sanctioned
+# `git pull --ff-only` cannot apply to a diverged local main, `reset --hard` is
+# refused by the destructive-git gate, and repo-freshness deliberately declines
+# to recover a diverged default branch — so a clone nobody could refresh sat 308
+# commits stale, and because an absent guard reads as a passing guard nothing
+# signalled it. (The ownership allowance still admits `merge`/`pull`/`rebase` on
+# the session's own baseline; the rewriting arm is the #1144 defect and an
+# admitted plain merge mints a merge commit no other session expects — neither
+# is the sanctioned remedy.) This mode is that fix — and it refuses by default:
+# a dirty hub is the SALVAGE case, and a local-only commit is never dropped
+# implicitly.
+#
+# Guard posture (no allowlist change): this function runs ONLY the
+# M4-sanctioned/read-only surface — fetch / status / branch --show-current /
+# rev-parse / rev-list / show. The two DESTRUCTIVE verbs the final move
+# needs (fast-forward advance and the contentless discard) are delegated to the
+# INTERNAL sub-script hub-worktree-refresh-advance.sh (direct-exec below),
+# exactly as salvage delegates its add/commit/push. The delegation is
+# load-bearing even though this file is on the guard's
+# SANCTIONED_SCRIPT_RELPATHS exemption (#1129): the guard's own real-file probe
+# pins scriptGitVerdict(hub-worktree.sh) === "allow" (#444), so a destructive
+# verb here would redden the guard suite, and a copy at the same relpath in a
+# non-sanctioned checkout stays gated.
+refresh() {
+  local hub_branch porcelain head origin_head local_only changed count sha subj
+
+  hub_branch="$(git -C "$MAIN_REPO" branch --show-current 2>/dev/null || echo "detached")"
+  if [[ "$hub_branch" != "main" && "$hub_branch" != "master" ]]; then
+    echo "hub-worktree: refresh: refusing — the hub is on '$hub_branch' (not main/master)." >&2
+    echo "   refresh advances a CLEAN hub's own branch to its upstream. An off-main hub" >&2
+    echo "   is the stranded-branch case: push the branch, then return the hub to main." >&2
+    exit 1
+  fi
+
+  # Dirty hub → the SALVAGE case, not this one. RAW -z porcelain (verbatim
+  # paths, -uall so untracked WIP counts) mirrors salvage's cleanliness test.
+  # Fail CLOSED: a `git status` error must not read as CLEAN — this mode's
+  # whole safety rests on the tree being clean.
+  if ! porcelain="$(git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 -z --untracked-files=all 2>/dev/null | tr '\0' '\n')"; then
+    echo "hub-worktree: refresh: could not read the hub status at $MAIN_REPO — refusing." >&2
+    exit 1
+  fi
+  if [[ -n "$porcelain" ]]; then
+    echo "hub-worktree: refresh: refusing — the hub working tree is DIRTY." >&2
+    echo "   refresh only ever moves a CLEAN main; a dirty hub is the SALVAGE case:" >&2
+    echo "     hub-worktree.sh salvage NEW-BRANCH $MAIN_REPO" >&2
+    echo "   Capture the dirty set first, then re-run refresh on the cleaned hub." >&2
+    exit 1
+  fi
+
+  # The hub's OWN upstream — never a hardcoded origin/main. `master` is accepted
+  # above, so a hardcoded origin/main would, on a repo where both refs exist,
+  # move the WRONG branch on the destructive path.
+  local upstream="origin/$hub_branch"
+
+  echo "hub-worktree: refresh: fetching origin ${hub_branch}…"
+  git -C "$MAIN_REPO" fetch origin "$hub_branch" --quiet
+
+  if ! git -C "$MAIN_REPO" rev-parse --verify --quiet "$upstream" >/dev/null; then
+    echo "hub-worktree: refresh: refusing — the hub's upstream '$upstream' does not exist." >&2
+    exit 1
+  fi
+
+  head="$(git -C "$MAIN_REPO" rev-parse HEAD)"
+  origin_head="$(git -C "$MAIN_REPO" rev-parse "$upstream")"
+  if [[ "$head" = "$origin_head" ]]; then
+    echo "hub-worktree: refresh: hub $hub_branch is already at $upstream — nothing to do."
+    exit 0
+  fi
+
+  # Local-only commits = reachable from HEAD but not from the upstream.
+  local_only="$(git -C "$MAIN_REPO" rev-list "$upstream..HEAD")"
+  if [[ -z "$local_only" ]]; then
+    # Pure behind (fast-forwardable): no local-only commit is discarded.
+    echo "hub-worktree: refresh: hub $hub_branch is behind $upstream — advancing (fast-forward)…"
+    if ! "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$MAIN_REPO" ff; then
+      exit 1
+    fi
+    echo "✅ hub-worktree: refresh: $MAIN_REPO is now at $upstream ($(git -C "$MAIN_REPO" rev-parse --short HEAD))."
+    exit 0
+  fi
+
+  count="$(printf '%s\n' "$local_only" | grep -c . || true)"
+  # Print the FULL SHA + subject of every local-only commit (recoverable from
+  # the reflog even after a discard) — used by both refusal and the flag path.
+  print_local_only() {
+    while IFS= read -r sha; do
+      [[ -z "$sha" ]] && continue
+      subj="$(git -C "$MAIN_REPO" show -s --format='%s' "$sha" 2>/dev/null || true)"
+      echo "     $sha  $subj"
+    done <<< "$local_only"
+  }
+
+  echo "hub-worktree: refresh: hub $hub_branch has $count local-only commit(s) not on $upstream:" >&2
+  print_local_only >&2
+
+  # Per-commit content check: a local-only commit "changes files" iff
+  # `git show --name-only` reports any. `show` is a READONLY guard verb, and
+  # on a merge it is the COMBINED diff — empty for a clean merge (the merge
+  # whose own delta is nil), non-empty when the merge carried conflict
+  # resolution. So an empty commit and a clean merge both report nothing →
+  # contentless, while any real file change is caught.
+  changed=""
+  while IFS= read -r sha; do
+    [[ -z "$sha" ]] && continue
+    # Fail CLOSED: an unreadable local-only commit must never read as contentless.
+    if ! files="$(git -C "$MAIN_REPO" show --name-only --format= "$sha" 2>/dev/null | sed '/^$/d')"; then
+      echo "hub-worktree: refresh: REFUSING — could not read local-only commit $sha" >&2
+      exit 1
+    fi
+    if [[ -n "$files" ]]; then
+      changed="${changed}${files}"$'\n'
+    fi
+  done <<< "$local_only"
+
+  if [[ -n "$changed" ]]; then
+    local changed_list
+    changed_list="$(printf '%s\n' "$changed" | sed '/^$/d' | sort -u)"
+    if [[ "${DISCARD_CONTENTLESS:-0}" = "1" ]]; then
+      echo "hub-worktree: refresh: REFUSING — --discard-contentless only drops CONTENTLESS commits;" >&2
+      echo "   these local-only commits carry file content that is not on $upstream:" >&2
+    else
+      echo "hub-worktree: refresh: REFUSING — advancing $hub_branch to $upstream would DISCARD content" >&2
+      echo "   in these $(printf '%s\n' "$changed_list" | grep -c . || true) file(s), which differ from the upstream:" >&2
+    fi
+    printf '%s\n' "$changed_list" | sed 's/^/     /' >&2
+    echo "   refresh never discards content. Resolve by hand (push the commits, or" >&2
+    echo "   re-apply the changes on $upstream) — nothing was moved." >&2
+    exit 1
+  fi
+
+  # Contentless divergence (the observed tortoise case: an empty commit + a
+  # merge whose own delta is nil — neither changes a file). Discarding commits
+  # is never implicit — even with the SHAs printed, the flag must be explicit.
+  if [[ "${DISCARD_CONTENTLESS:-0}" != "1" ]]; then
+    echo "" >&2
+    echo "hub-worktree: refresh: REFUSING — hub $hub_branch is not fast-forwardable." >&2
+    echo "   The local-only commits above are CONTENTLESS (none of them changes a" >&2
+    echo "   file, so discarding them loses no content), but refresh never drops a commit" >&2
+    echo "   implicitly. Re-run with --discard-contentless to discard EXACTLY those:" >&2
+    echo "     hub-worktree.sh refresh --discard-contentless --repo $MAIN_REPO" >&2
+    exit 1
+  fi
+
+  echo ""
+  echo "hub-worktree: refresh: --discard-contentless given — discarding the contentless local-only commit(s) above:"
+  print_local_only
+  if ! "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$MAIN_REPO" discard-contentless; then
+    exit 1
+  fi
+  echo "✅ hub-worktree: refresh: $MAIN_REPO is now at $upstream ($(git -C "$MAIN_REPO" rev-parse --short HEAD))."
+  exit 0
+}
+
 if [[ "$MODE" = "salvage" ]]; then
   salvage
+  exit 0
+fi
+
+if [[ "$MODE" = "refresh" ]]; then
+  refresh
   exit 0
 fi
 

@@ -461,8 +461,9 @@ exemptions).
 /tmp/x.sh` — executed arbitrary git unblocked. Now a shell-script execution
 (`bash`/`sh`/`zsh`/`source`/`./x.sh`) in the hub whose content performs a
 non-sanctioned git mutation is blocked: the script's git ops are gated by the
-SAME recovery allowlist. Recovery scripts keep working (`hub-worktree.sh`
-contains only `fetch` + `worktree add`), and read-only git in scripts is fine.
+SAME recovery allowlist. Recovery scripts keep working (`hub-worktree.sh`'s own
+git surface is `fetch` + `worktree add` + read-only verbs, with its destructive
+moves delegated to sub-scripts), and read-only git in scripts is fine.
 **#347:** the script path + content gating resolve against the command's
 EXECUTION cwd (cd-resolved, subshell/pipe-scoped) — `cd <wt> && bash x.sh`
 resolves x.sh inside the worktree; worktree-targeted script content is exempt,
@@ -554,6 +555,67 @@ the point.
   other hub. Shared-state edits (MEMORY.md, skills, config) land via worktree
   → merge → sync, or the commit-workflow micro fast-path.
 - **Not a terminal gate:** humans in a terminal can always run the one-liner.
+
+### The clean-but-stale hub — `hub-worktree.sh refresh` (#1309)
+
+The hub state that had no **sanctioned** path is a **clean but
+non-fast-forwardable** hub: a local `main` that has **diverged** from
+`origin/main`, i.e. it carries local-only commits (the observed tortoise shape:
+an empty commit, then a merge of the upstream on top of it). `salvage` does not
+apply (there is no dirty set), and the M4-sanctioned recovery (`git checkout
+main && git pull --ff-only`) cannot apply to a divergent branch — git refuses a
+non-fast-forward — while `reset --hard` is refused by the destructive-git gate
+and `repo-freshness`'s `auto` mode deliberately declines to recover a
+*diverged* default branch. (The guard's ownership allowance does still admit the
+sync verbs on the session's own baseline — `merge`/`pull`/`rebase`; the
+rewriting arm is the pre-existing defect tracked by #1144, and an admitted plain
+merge mints a merge commit no other session expects, so neither is the
+sanctioned remedy.) The hub-state check then still reports PASS because it
+tests on-main + clean, not freshness — so the staleness hid itself: **an absent
+guard reads as a passing guard**. Observed live: the tortoise hub sat **3 days /
+308 commits** stale, with files merged upstream since simply absent from its
+tree. A follow-up to make that detector report the staleness: #1313.
+
+Note the boundary: a merely **behind** hub is already handled — `git checkout
+main && git pull --ff-only` is M4-sanctioned recovery, and `repo-freshness`'s
+`auto` mode ff-pulls a clean default branch every 20 min in the **sibling** hubs
+(agent-infra is deliberately skipped there — `auto-sync` ff-pulls it at session
+start). `refresh` exists for the case those cannot reach.
+
+`hub-worktree.sh refresh [--repo <path>] [--discard-contentless]` is the
+sanctioned path. It fetches, then advances a CLEAN hub's **own** branch to its
+upstream (`origin/<branch>` — `master` is accepted, and a hardcoded `origin/main`
+would move the wrong branch on a repo where both exist). It **refuses by
+default and exits non-zero rather than moving anything** when the hub is not on
+main/master (the stranded-branch case), when the working tree is dirty (the
+`salvage` remedy is named), when a local-only commit would be discarded and any
+of them changes files (the files are named), or when the upstream writes a path
+the hub **ignores** (the merge aborts on that collision; the reset would
+overwrite it without warning — a hub's `.env`, typically). A **contentless**
+divergence (an
+empty commit, or a merge whose own delta is nil — `git show`'s combined diff is
+empty) is refused unless `--discard-contentless` is passed, and then the SHAs it
+drops are printed. A plain `refresh` on a diverged hub never silently drops a
+commit.
+
+The `--discard-contentless` path deliberately departs from #1144's confirmed
+rule that only a provable fast-forward may move a shared hub's baseline tip —
+see the OVERRIDES note on #1309. It is bounded: the flag is explicit, the hub
+must be clean and on-main, and every local-only commit must be contentless.
+
+Guard posture is unchanged. The destructive verbs the final move needs
+(`merge --ff-only`, `reset --hard`) live in the nested sub-script
+`scripts/checkout-hygiene/hub-worktree-refresh-advance.sh`, exactly as
+salvage's add/commit/push do. The delegation is load-bearing even though
+`hub-worktree.sh` is on `SANCTIONED_SCRIPT_RELPATHS` (#1129 exempts the runtime
+content walk): the guard's own real-file probe pins
+`scriptGitVerdict(hub-worktree.sh) === "allow"` (#444), so a destructive verb in
+it would redden the guard suite, and a copy of the script at the same relpath in
+a non-sanctioned checkout is a different realpath and stays gated. Everything the
+outer mode runs is M4-sanctioned or read-only (fetch / status / branch
+--show-current / rev-parse / rev-list / show), and the sub-script independently
+refuses a non-main-checkout, an off-main hub, a dirty hub, or — on the discard
+path — a content-carrying commit.
 
 ## Hub-WIP hygiene warnings — put WIP in a worktree (#350) + #437 tracked-write gate
 
