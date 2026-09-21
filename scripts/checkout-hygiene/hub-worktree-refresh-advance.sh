@@ -38,7 +38,8 @@
 # target must be a MAIN checkout (a linked worktree carries a `.git` FILE, not
 # a directory), on main/master, with an empty porcelain (tracked AND untracked)
 # read AFTER the fetch, and with no hub-local IGNORED path that the upstream
-# writes (that collision would be overwritten by either move). The
+# writes (the merge aborts on such a collision; `git reset` would overwrite it
+# without warning). The
 # `discard-contentless` path additionally re-runs the content-loss check — a
 # per-local-only-commit `git show --name-only` scan (empty for an empty commit
 # or a clean merge, non-empty for any real change) — so it is safe even if the
@@ -94,8 +95,9 @@ fi
 
 # `git status --porcelain` OMITS ignored files, and BOTH moves would write over a
 # hub-local ignored path the upstream now writes (a hub's .env, typically).
-# `--no-overwrite-ignore` covers the merge, but `git reset` has no such flag, so
-# refuse on a collision before either move.
+# `--no-overwrite-ignore` makes the merge abort on such a collision, but
+# `git reset` has no such flag — it overwrites silently — so refuse before
+# either move.
 #
 # The test is path-aware and covers the ways the move can destroy hub-local
 # ignored content:
@@ -113,14 +115,13 @@ fi
 # ignore pattern is not mis-flagged.
 DIFF_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-diff.XXXXXX")"
 HIT_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-hits.XXXXXX")"
-SUB_LIST="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-subs.XXXXXX")"
-trap 'rm -f "${DIFF_LIST:-}" "${HIT_LIST:-}" "${SUB_LIST:-}"' EXIT
+COLLIDE_FILE="$(mktemp "${TMPDIR:-/tmp}/hub-refresh-collide.XXXXXX")"
+trap 'rm -f "${DIFF_LIST:-}" "${HIT_LIST:-}" "${COLLIDE_FILE:-}"' EXIT
 if ! git -C "$MAIN_REPO" diff --name-only -z HEAD "$UPSTREAM" > "$DIFF_LIST"; then
   echo "hub-worktree-refresh-advance: could not diff the hub against $UPSTREAM — refusing" >&2
   exit 1
 fi
 HITS=0
-SUBS=0
 while IFS= read -r -d '' P; do
   [ -z "$P" ] && continue
   HIT=""
@@ -142,39 +143,31 @@ while IFS= read -r -d '' P; do
   HITS=$((HITS + 1))
   # A directory at the changed path that the upstream replaces with a
   # non-directory: the ignored entries inside it die with it, and no changed
-  # path names them.
+  # path names them — so record those entries themselves (not the directory,
+  # which is tracked and not itself ignored).
   if [ "$HIT" = "$P" ] && [ -d "$MAIN_REPO/$P" ]; then
     UP_MODE="$(git -C "$MAIN_REPO" ls-tree "$UPSTREAM" -- "$P" 2>/dev/null | sed -n '1s/ .*//p')"
     if [ -n "$UP_MODE" ] && [ "$UP_MODE" != "040000" ]; then
-      if ! SUB_IGNORED="$(git -C "$MAIN_REPO" ls-files -z --others --ignored --exclude-standard -- "$P")"; then
+      if ! git -C "$MAIN_REPO" ls-files -z --others --ignored --exclude-standard -- "$P" >> "$COLLIDE_FILE"; then
         echo "hub-worktree-refresh-advance: could not list the ignored files under '$P' — refusing" >&2
         exit 1
-      fi
-      if [ -n "$SUB_IGNORED" ]; then
-        printf '%s\0' "$P" >> "$SUB_LIST"
-        SUBS=$((SUBS + 1))
       fi
     fi
   fi
 done < "$DIFF_LIST"
-COLLIDE=""
-if [ "$SUBS" -gt 0 ]; then
-  COLLIDE="$(tr '\0' '\n' < "$SUB_LIST")"
-fi
 if [ "$HITS" -gt 0 ]; then
   # One batched `check-ignore --stdin` (a stale hub's diff is thousands of paths;
   # one process per path would be thousands of subprocesses).
   RC=0
-  IGNORED_HITS="$(git -C "$MAIN_REPO" check-ignore -z --stdin < "$HIT_LIST" | tr '\0' '\n')" || RC=$?
+  git -C "$MAIN_REPO" check-ignore -z --stdin < "$HIT_LIST" >> "$COLLIDE_FILE" || RC=$?
   if [ "$RC" -gt 1 ]; then
     echo "hub-worktree-refresh-advance: could not determine the ignore status of the hub's local paths — refusing" >&2
     exit 1
   fi
-  COLLIDE="${COLLIDE}${IGNORED_HITS}"
 fi
-if [ -n "$(printf '%s\n' "$COLLIDE" | sed '/^$/d')" ]; then
-  echo "hub-worktree-refresh-advance: the upstream writes path(s) this hub IGNORES — the move would overwrite them (and git would not warn):" >&2
-  printf '%s\n' "$COLLIDE" | sed '/^$/d' | sort -u | sed 's/^/     /' >&2
+if [ -s "$COLLIDE_FILE" ]; then
+  echo "hub-worktree-refresh-advance: the upstream writes path(s) this hub IGNORES — refusing (the merge would abort on them; the reset would overwrite them silently):" >&2
+  tr '\0' '\n' < "$COLLIDE_FILE" | sed '/^$/d' | sort -u | sed 's/^/     /' >&2
   echo "   Move the hub-local file(s) aside, or refresh from a human terminal — nothing was moved." >&2
   exit 1
 fi

@@ -74,8 +74,9 @@
 #       - the working tree is dirty → the salvage case is named as the remedy;
 #       - local-only commits would be discarded AND any of them carries file
 #         content → the differing files are named and nothing is moved;
-#       - the upstream writes a path this hub ignores → refused, because the
-#         move would overwrite that hub-local path (a hub's .env, typically).
+#       - the upstream writes a path this hub ignores → refused; the merge would
+#         abort on that collision, the reset would overwrite it without warning
+#         (a hub's .env, typically).
 #     A diverged hub whose local-only commits are CONTENTLESS (an empty commit;
 #     a merge whose own delta is nil — neither changes a file; the observed
 #     tortoise case) is ALSO refused unless --discard-contentless is given; with

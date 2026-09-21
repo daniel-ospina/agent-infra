@@ -498,6 +498,7 @@ git -C "$CLONE" push -q origin main
 out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "refresh refuses a collapsed dir holding an ignored file → exit 1"
 assert_contains "$out" "IGNORES" "collapsed-dir refusal names the state"
+assert_contains "$out" "col/keep.local" "collapsed-dir refusal names the IGNORED entry, not the tracked directory"
 assert_eq "$(cat "$REPO/col/keep.local")" "keep-me" "the ignored file inside the replaced directory survived"
 
 echo ""

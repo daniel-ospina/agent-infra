@@ -590,8 +590,9 @@ default and exits non-zero rather than moving anything** when the hub is not on
 main/master (the stranded-branch case), when the working tree is dirty (the
 `salvage` remedy is named), when a local-only commit would be discarded and any
 of them changes files (the files are named), or when the upstream writes a path
-the hub **ignores** (either move would overwrite that hub-local path — a hub's
-`.env`, typically — and git would not warn). A **contentless** divergence (an
+the hub **ignores** (the merge aborts on that collision; the reset would
+overwrite it without warning — a hub's `.env`, typically). A **contentless**
+divergence (an
 empty commit, or a merge whose own delta is nil — `git show`'s combined diff is
 empty) is refused unless `--discard-contentless` is passed, and then the SHAs it
 drops are printed. A plain `refresh` on a diverged hub never silently drops a
