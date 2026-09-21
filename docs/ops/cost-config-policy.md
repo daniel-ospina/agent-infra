@@ -346,7 +346,7 @@ property; this guard is the pattern to copy, not a substitute for it.
   **Residual, stated plainly:** it has **not** been verified that the floor fix
   subsumes *every* failure the wider window covered — only the silent-death
   one. The retired regime's records stay visible as `watch-truncation.sh`'s
-  `700K-clamp-era(650-700K)` LEGACY bucket; §7's trigger below is unchanged.
+  `700K-clamp-era(650-700K)` LEGACY bucket; §7's trigger above is unchanged.
 
   **OVERRIDES:** the vendor's full deepseek window (1,000,000) — clamped at
   300,000, because cold re-ingestion at the 1M ceiling is the cost amplifier

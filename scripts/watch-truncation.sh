@@ -199,13 +199,22 @@ for r in rows:
         # 283.6–300K band IS a 300K-clamp session — it must NOT fall to
         # small-window (which would tell the owner to exclude a clamp-era
         # record from the revert decision). Pre-clamp legacy/200K-transient
-        # sessions (~196–205K) stay below the floor.
+        # sessions (~196–205K) stay below the floor. The bucket extends up to
+        # the withdrawn era's floor because a session that crossed the trigger
+        # is a clamp session whatever era it ran in; the label names that band.
         # The WITHDRAWN (#1213/#1226) 700K regime's band — floor = its own
         # compaction trigger 650,000 (= 700,000 − 50,000 reserveTokens) — is
         # its own LEGACY bucket, the mirror of what #1226 did for the 300K-era
         # band: those records belong to the retired regime, so they are neither
         # the restored clamp's mid-turn-overrun class NOR small-window.
-        bucket = "300K-clamp(283.6-300K)" if 283616 <= tb < 650000 else \
+        # The stored label states the bucket's TRUE band. It must: this label
+        # is the owner-facing discriminator, and a record sitting well above
+        # ~300K inside this bucket is an EARLIER clamp era's (e.g. the 400K
+        # records the header describes) rather than this clamp's own
+        # mid-turn overrun — the current geometry's tight band is 283.6–300K.
+        # Labelling it "…(283.6-300K)" while the condition spans to 650,000
+        # would print a pre-#511 record as current-geometry evidence.
+        bucket = "300K-clamp(283.6-650K)" if 283616 <= tb < 650000 else \
                  ("700K-clamp-era(650-700K)" if 650000 <= tb < 900000 else \
                   ("1M-era(≥900K)" if tb >= 900000 else f"small-window(<{tb:,})"))
         len_ctx_buckets[bucket] += gl
@@ -280,7 +289,10 @@ print("  4. Re-clamping to 300K afterwards requires re-approval (policy §7).")
 print("")
 print("Owner triage (this run): length records at the 300K-clamp regime are the")
 print("predicted C8 mid-turn-overrun class; records in small-window sessions are")
-print("not clamp-related — exclude them from the revert decision.")
+print("not clamp-related — exclude them from the revert decision. The 300K-clamp")
+print("bucket spans the trigger up to the withdrawn era's floor, so a record")
+print("sitting well above ~300K is an EARLIER clamp era's, not this clamp's — the")
+print("current geometry's own band is ~283.6–300K.")
 print("")
 print("Records bucketed 700K-clamp-era(650-700K) come from the WITHDRAWN")
 print("2026-09-18..21 700K regime. They still count toward this trigger (it is")

@@ -68,14 +68,14 @@ assert_contains "$OUT" "## ✅ CLEAN" "clean fixture reports no trigger"
 assert_contains "$OUT" "(window-ceiling truncation) records: 0" "clean fixture has no length records"
 
 # LENGTH: 1 session today with a genuine ceiling length stop at 290K ctx —
-# in the shipped 300K-clamp trigger band (283,616–300K), so it MUST classify
+# in the shipped 300K-clamp trigger band (at/above 283,616), so it MUST classify
 # as a 300K-clamp session (not fall through to small-window → exit 1)
 D="$T/length"; mk_sess "$D" 9 0 50000 290000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
 assert_eq "$RC" "1" "length-record fixture exits 1"
 assert_contains "$OUT" "❌ TRIGGERED" "length fixture prints TRIGGERED"
 assert_contains "$OUT" "pre-committed rollback" "length fixture prints rollback procedure"
-assert_contains "$OUT" "'300K-clamp(283.6-300K)': 1" "290K length record buckets as 300K-clamp-regime, not small-window"
+assert_contains "$OUT" "'300K-clamp(283.6-650K)': 1" "290K length record buckets as 300K-clamp-regime, not small-window"
 
 # LENGTH-LEGACY: a 660K-ceiling length stop from the WITHDRAWN (#1213/#1226)
 # 700K regime must bucket as its own legacy era — NOT small-window (the triage
