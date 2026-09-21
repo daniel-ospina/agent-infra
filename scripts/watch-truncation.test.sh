@@ -86,6 +86,16 @@ D="$T/length-legacy"; mk_sess "$D" 9 0 20000 660000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
 assert_contains "$OUT" "'700K-clamp-era(650-900K)': 1" "660K length record buckets as the withdrawn 700K era, not small-window"
 
+# LENGTH-LEGACY-EDGE: the legacy band's UPPER edge must be pinned too — a
+# record in the top of the band (>= 700K, still below the 1M-drift floor) must
+# bucket as the withdrawn era and must NOT fall to small-window. Without this
+# fixture the band's upper bound is unpinned: narrowing the condition to
+# `< 700000` passes the suite unnoticed, which is the very label/condition gap
+# the labels exist to close.
+D="$T/length-legacy-edge"; mk_sess "$D" 9 0 20000 890000 1
+RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
+assert_contains "$OUT" "'700K-clamp-era(650-900K)': 1" "890K length record stays in the withdrawn era's band, not small-window"
+
 # LEG-B: 3 consecutive days each exceeding 2× re-read baseline
 #   reread/session = msg_input + comp_input; want > 3,938,682 → use 4.5M each
 D="$T/legb"; mk_sess "$D" 1 1 4000000 400000 0; mk_sess "$D" 2 2 4000000 400000 0; mk_sess "$D" 3 3 4000000 400000 0

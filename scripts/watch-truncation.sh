@@ -36,12 +36,14 @@
 # (`MIN_USABLE_MAX_TOKENS = 1024`, pi-patch #1214(b): never clamp below a
 # usable output budget), which closes the one-token silent-death mechanism the
 # wider window was bought for, at a recurring ~+20% fleet model spend. The
-# retired 700K regime's own band (~650–900K — from its trigger up to the
-# 1M-drift floor; its trigger was 700,000 − 50,000)
-# is kept as a LEGACY bucket, the exact mirror of what #1226 did for the 300K
-# era: the records produced 2026-09-18..21 are evidence about the RETIRED
-# regime, and mislabelling them small-window (which the triage note tells the
-# owner to EXCLUDE) would lose that. They still COUNT toward the literal
+# retired 700K regime gets a distinct LEGACY bucket — from its trigger
+# (650,000 = 700,000 − 50,000) up to the shared 1M-drift floor at 900,000 — so
+# a record from that era is neither read as current geometry nor excluded as
+# small-window, the mirror of how #1226 kept the 300K era visible on the way
+# up. Against this box's corpus that bucket is EMPTY: the era's 69 session
+# files (2026-09-18..21) carry no stopReason:"length" records, which is the
+# honest reading of a regime that did not truncate, not a missing mechanism.
+# Any such record still COUNTS toward the literal
 # pre-commitment below (≥1 length record → revert to 1M): that trigger is
 # owner-owned, and narrowing its firing surface in code is an owner decision,
 # not this change's. The triage note therefore names the band a firing record
@@ -196,32 +198,22 @@ for r in rows:
         tb = max(r["max_ctx"], r["max_tokensBefore"])
         # shipped 300K-clamp band: floor = the clamp's compaction trigger
         # 283,616 (= 300,000 − 16,384 reserveTokens; the same dial #570
-        # applied to fleet-cost-report's regime floor). A length stop in the
-        # 283.6–300K band IS a 300K-clamp session — it must NOT fall to
+        # applied to fleet-cost-report's regime floor). A length stop AT OR
+        # ABOVE the trigger IS a clamp session — it must NOT fall to
         # small-window (which would tell the owner to exclude a clamp-era
-        # record from the revert decision). Pre-clamp legacy/200K-transient
-        # sessions (~196–205K) stay below the floor. The bucket extends up to
-        # the withdrawn era's floor because a session that crossed the trigger
-        # is a clamp session whatever era it ran in; the label names that band.
-        # The WITHDRAWN (#1213/#1226) 700K regime's band — floor = its own
-        # compaction trigger 650,000 (= 700,000 − 50,000 reserveTokens) — is
-        # its own LEGACY bucket, the mirror of what #1226 did for the 300K-era
-        # band: those records belong to the retired regime, so they are neither
-        # the restored clamp's mid-turn-overrun class NOR small-window.
-        # The stored label states the bucket's TRUE band. It must: this label
-        # is the owner-facing discriminator, and a record sitting well above
-        # ~300K inside this bucket is an EARLIER clamp era's (e.g. the 400K
-        # records the header describes) rather than this clamp's own
-        # mid-turn overrun — the current geometry's tight band is 283.6–300K.
-        # Labelling it "…(283.6-300K)" while the condition spans to 650,000
-        # would print a pre-#511 record as current-geometry evidence.
-        # The stored label states the bucket's TRUE band — the same rule the
-        # 300K bucket above follows, and the reason this one is not labelled
-        # "…(650-700K)": the condition runs to the 1M-drift floor, so a record
-        # above 700K would be printed under a band that excludes it. (It can
-        # legitimately sit there: under the 700K clamp an over-window session
-        # got the one-token length stop too, so the era's records run from its
-        # 695,904 death threshold upward.)
+        # record from the revert decision); pre-clamp legacy/200K-transient
+        # sessions (~196–205K) stay below the floor. The band runs up to the
+        # next era's floor, and the label names that true band because this
+        # label is the owner-facing discriminator: a record sitting well above
+        # ~300K inside it is an EARLIER clamp era's (e.g. the 400K records the
+        # header describes), not this clamp's own mid-turn overrun — the
+        # current geometry's tight band is ~283.6–300K.
+        # The WITHDRAWN (#1213/#1226) 700K era gets its own LEGACY bucket,
+        # floor = its own compaction trigger 650,000 (= 700,000 − 50,000),
+        # running up to the shared 1M-drift floor at 900,000. Its label names
+        # that same true band, for the same reason: a record in this bucket is
+        # neither current geometry nor small-window. (Empty against this box's
+        # corpus — see the header.)
         bucket = "300K-clamp(283.6-650K)" if 283616 <= tb < 650000 else \
                  ("700K-clamp-era(650-900K)" if 650000 <= tb < 900000 else \
                   ("1M-era(≥900K)" if tb >= 900000 else f"small-window(<{tb:,})"))
@@ -302,11 +294,11 @@ print("bucket spans the trigger up to the withdrawn era's floor, so a record")
 print("sitting well above ~300K is an EARLIER clamp era's, not this clamp's — the")
 print("current geometry's own band is ~283.6–300K.")
 print("")
-print("Records bucketed 700K-clamp-era(650-900K) come from the WITHDRAWN")
-print("2026-09-18..21 700K regime. They still count toward this trigger (it is")
-print("owner-owned and this instrument does not narrow it), but they are evidence")
-print("about that retired regime — NOT about the restored 300K clamp. When every")
-print("record this run carries that bucket, no current-geometry truncation was")
-print("observed; the firing records age out of the window and stop counting.")
+print("Records bucketed 700K-clamp-era(650-900K) sit at or above the WITHDRAWN")
+print("700K regime's compaction trigger and below the 1M-drift floor. They still")
+print("count toward this trigger (it is owner-owned and this instrument does not")
+print("narrow it), but they are NOT evidence about the restored 300K clamp. When")
+print("every record this run carries that bucket, no current-geometry truncation")
+print("was observed; the firing records age out of the window and stop counting.")
 sys.exit(1)
 PYEOF
