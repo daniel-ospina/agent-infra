@@ -426,19 +426,20 @@ def classify(argv0):
 
 ppid = {}
 argv0 = {}
-# errors="replace": a single undecodable argv byte must not sink the whole map
-# (a failed map classifies `unknown` => refuse-everything; recoverable, but a
-# noisy permanent zero harvest). A malformed row is skipped for the same
-# reason. The row shape is PS_TABLE's: "pid ppid pgid tty stat rss cmd [CAND]".
+# A row whose command column is EMPTY still carries pid/ppid (the awk writes
+# seven space-separated fields, the last empty), and a row the awk reduced to
+# four fields still carries pid/ppid. Record the parent link even then:
+# dropping it truncated the walk at that pid and reported a RESOLVABLE chain
+# as `unknown`. Only the command needs column 7.
 for ln in open(ps_table, encoding="utf-8", errors="replace"):
     f = ln.rstrip("\n").split(None, 6)
-    if len(f) < 7:
+    if len(f) < 2:
         continue
     try:
         pid, parent = int(f[0]), int(f[1])
     except ValueError:
         continue
-    cmd = f[6]
+    cmd = f[6] if len(f) >= 7 else ""
     if cmd == "CAND":
         cmd = ""
     elif cmd.endswith(" CAND"):
@@ -711,11 +712,17 @@ STUCK_COUNT=0
 STUCK_RSS=0
 # Gate 3 (#1207) audit counters, rebuilt on emit=1 only (the silent RESIDUAL
 # re-classification must not double-count them).
+# GATE3_REFUSED_* is a CENSUS by ground over every classified candidate;
+# GATE3_SUPPRESSED counts only the ones refused at an eligibility site — i.e.
+# the ones gate 3 actually changed the pass's outcome for. Conflating the two
+# let the report read as though gate 3 produced a zero harvest that another
+# gate had already produced.
 GATE3_REFUSED_TOTAL=0
 GATE3_REFUSED_HUMAN=0
 GATE3_REFUSED_CMUX=0
 GATE3_REFUSED_UNKNOWN=0
 GATE3_ALLOWED=0
+GATE3_SUPPRESSED=0
 
 candidate_detail() { # <pid> -> "lstart_epoch pgid stat rss" via FRESH probe
     local pid="$1" line lstart epoch pgid stat rss
@@ -761,7 +768,7 @@ classify_candidates() {
     REAP_CANDIDATES=""; REAP_COUNT=0
     if [ "$emit" = 1 ]; then STUCK_CANDIDATES=""; STUCK_COUNT=0; STUCK_RSS=0;
         GATE3_REFUSED_TOTAL=0; GATE3_REFUSED_HUMAN=0; GATE3_REFUSED_CMUX=0
-        GATE3_REFUSED_UNKNOWN=0; GATE3_ALLOWED=0; fi
+        GATE3_REFUSED_UNKNOWN=0; GATE3_ALLOWED=0; GATE3_SUPPRESSED=0; fi
     if [ -z "$CANDIDATES" ]; then
         [ "$emit" = 1 ] && say "(no tty'd pi candidates)"
         return 0
@@ -938,6 +945,7 @@ classify_candidates() {
                     # the refusal is emitted here too (the audit's arm note
                     # names it as report-only).
                     if [ "$gate3_ok" != 1 ]; then
+                        [ "$emit" = 1 ] && GATE3_SUPPRESSED=$((GATE3_SUPPRESSED+1))
                         [ "$emit" = 1 ] && say "$pid tty=$tty REPORT-ONLY gate3=$GATE3_CLASS (STUCK arm refused; candidate-ancestry gate — never signalled)"
                         continue
                     fi
@@ -966,6 +974,7 @@ classify_candidates() {
             # refused unless its chain class is one the recorded decision
             # authorizes — under option A, none. Reported, never signalled.
             if [ "$gate3_ok" != 1 ]; then
+                [ "$emit" = 1 ] && GATE3_SUPPRESSED=$((GATE3_SUPPRESSED+1))
                 [ "$emit" = 1 ] && say "$pid tty=$tty REPORT-ONLY gate3=$GATE3_CLASS (candidate-ancestry gate — never signalled) idle_h=${idle_age_h}h session=$sid jsonl=$sfile"
                 continue
             fi
@@ -1035,10 +1044,11 @@ reap_one() { # <cand-line> <now>
     # settle 1: still self/ancestor?
     is_self_like "$pid" && { log "SETTLE-SKIP $pid now-self — suppress"; return 0; }
     # settle 1b: gate 3 (#1207) — the candidate-ancestry verdict is re-asked
-    # immediately before the first possible signal, so nothing can be signalled
-    # off a stale or bypassed classification. A failed/empty HOST_MAP makes
-    # candidate_host_class() answer `unknown`, which refuses — a broken read is
-    # never "may signal".
+    # immediately before the first possible signal. The re-ask defends against
+    # a BYPASSED classify-site check; it is NOT a fresh chain read — the class
+    # comes from the pass-start HOST_MAP snapshot (ancestry is stable, and the
+    # incarnation fence in settle 2 covers pid reuse). A failed/empty map
+    # answers `unknown`, which refuses — a broken read is never "may signal".
     if ! gate3_allows "$pid"; then
         log "SETTLE-SKIP $pid gate 3 refused (chain class=$GATE3_CLASS) — suppress"
         return 0
@@ -1414,17 +1424,22 @@ run() {
     fi
 
     # ── gate 3 audit block (#1207): the candidate-ancestry decision IN WORDS.
-    # Under the recorded decision every class refuses, so the harvest is ZERO —
-    # and this block exists so a future reader cannot mistake that expected
-    # zero for a broken reaper. `allowed` is non-zero only when the mutation is
-    # present (the suite's RED control), hence the conditional wording.
+    # The census (classified / by ground) and the SUPPRESSION count (refusals
+    # that happened at an eligibility site, i.e. changed the pass's outcome)
+    # are reported separately, so a zero harvest another gate produced is never
+    # attributed to gate 3. `allowed` is non-zero only when the mutation is
+    # present (the suite's RED control), hence the conditional wording — and the
+    # zero-harvest sentence additionally requires a NON-EMPTY census
+    # (GATE3_REFUSED_TOTAL > 0): a pass where every candidate was excluded
+    # before the census is a zero gate 3 never produced and must not claim.
     if [ "$pre_count" -gt 0 ]; then
         say ""
-        say "GATE 3 (candidate-ancestry): classified $((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) live candidate(s) — refused ${GATE3_REFUSED_TOTAL} (human-terminal=${GATE3_REFUSED_HUMAN}, cmux-rooted=${GATE3_REFUSED_CMUX}, unknown/unresolvable=${GATE3_REFUSED_UNKNOWN}), allowed ${GATE3_ALLOWED}."
-        if [ "$GATE3_ALLOWED" -eq 0 ]; then
-            say "   → the harvest is ZERO by DECISION, not by fault: the recorded rule keeps every chain class report-only because cmux is the fleet's own workspace host and nothing on this box records who spawned a pane, so the owner's own interactive pane is indistinguishable from a fleet lane. Gate 3 can only refuse — it never authorizes a signal."
+        say "GATE 3 (candidate-ancestry): classified $((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) live candidate(s) — human-terminal=${GATE3_REFUSED_HUMAN}, cmux-rooted=${GATE3_REFUSED_CMUX}, unknown/unresolvable=${GATE3_REFUSED_UNKNOWN}, allowed=${GATE3_ALLOWED}."
+        say "   → suppressed at an eligibility site: ${GATE3_SUPPRESSED} (0 means every candidate was already excluded by another gate; a refusal recorded here is one that changed the pass's outcome)."
+        if [ "$GATE3_ALLOWED" -eq 0 ] && [ "$GATE3_REFUSED_TOTAL" -gt 0 ]; then
+            say "   → no chain class is authorized, so the harvest for this population is ZERO BY DECISION, not by fault: the recorded rule keeps every class report-only because cmux is the fleet's own workspace host and nothing on this box records who spawned a pane, so the owner's own interactive pane is indistinguishable from a fleet lane. Gate 3 can only refuse — it never authorizes a signal."
         fi
-        log "GATE3 classified=$((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) refused=$GATE3_REFUSED_TOTAL human=$GATE3_REFUSED_HUMAN cmux=$GATE3_REFUSED_CMUX unknown=$GATE3_REFUSED_UNKNOWN allowed=$GATE3_ALLOWED"
+        log "GATE3 classified=$((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) human=$GATE3_REFUSED_HUMAN cmux=$GATE3_REFUSED_CMUX unknown=$GATE3_REFUSED_UNKNOWN allowed=$GATE3_ALLOWED suppressed=$GATE3_SUPPRESSED"
     fi
 
     if [ "$MODE" = apply ] && [ -n "$REAP_CANDIDATES" ]; then
@@ -1478,7 +1493,7 @@ run() {
     if [ "$MODE" = dry-run ]; then
         say "DRY-RUN — no signals sent"
     fi
-    log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS STUCK=$STUCK_COUNT STUCK_RSS=$STUCK_RSS STUCK_ARMED=$REAP_REAP_STUCK CANDIDATES=$pre_count PRE=$pre_count POST=$post_count RESIDUAL=$residual_count KILLED=$KILLED YIELD=$YIELD_RSS GATE3_REFUSED=$GATE3_REFUSED_TOTAL GATE3_HUMAN=$GATE3_REFUSED_HUMAN GATE3_CMUX=$GATE3_REFUSED_CMUX GATE3_UNKNOWN=$GATE3_REFUSED_UNKNOWN GATE3_ALLOWED=$GATE3_ALLOWED"
+    log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS STUCK=$STUCK_COUNT STUCK_RSS=$STUCK_RSS STUCK_ARMED=$REAP_REAP_STUCK CANDIDATES=$pre_count PRE=$pre_count POST=$post_count RESIDUAL=$residual_count KILLED=$KILLED YIELD=$YIELD_RSS GATE3_CLASSED=$((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) GATE3_HUMAN=$GATE3_REFUSED_HUMAN GATE3_CMUX=$GATE3_REFUSED_CMUX GATE3_UNKNOWN=$GATE3_REFUSED_UNKNOWN GATE3_ALLOWED=$GATE3_ALLOWED GATE3_SUPPRESSED=$GATE3_SUPPRESSED"
     if [ "$MODE" = apply ]; then
         echo "armed pass complete: KILLED=$KILLED YIELD_RSS=${YIELD_RSS}KB RESIDUAL=$residual_count STUCK=$STUCK_COUNT"
     fi
