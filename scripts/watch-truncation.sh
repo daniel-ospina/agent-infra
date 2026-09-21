@@ -43,12 +43,13 @@
 # up. Against this box's corpus that bucket is EMPTY: the era's 69 session
 # files (2026-09-18..21) carry no stopReason:"length" records, which is the
 # honest reading of a regime that did not truncate, not a missing mechanism.
-# Any such record still COUNTS toward the literal
-# pre-commitment below (≥1 length record → revert to 1M): that trigger is
+# Any such record still COUNTS toward the literal pre-commitment above
+# (≥1 length record → revert to 1M): that trigger is
 # owner-owned, and narrowing its firing surface in code is an owner decision,
 # not this change's. The triage note therefore names the band a firing record
 # came from, which is the discriminator. NOTE the trigger has already fired
-# once (188 records — cost-config-policy.md §7's withdrawal record) and the
+# once (188 records — the corpus scan behind the re-clamp, recorded in §7 of
+# cost-config-policy.md) and the
 # owner's response to it
 # was the 700K re-clamp and then this withdrawal: the floor fix, not a wider
 # window, is what closes that class.

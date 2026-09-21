@@ -13,18 +13,19 @@
 #       at 270K — below the 283,616 trigger — and would classify every
 #       post-clamp compaction as ceiling). Expected post-clamp: 0.
 #       Escalate when > 0.
-#   (b) cache-share of spend over COMPACTING sessions in the shipped
-#       300K-clamp regime (max compaction tokensBefore ≥ FLEET_REGIME_TB
-#       283616 = the 300K-clamp compaction trigger, 300000 − 16384 — sessions
-#       compacting in the 283.6–300K band ARE post-clamp, not legacy; the
-#       floor only excludes the pre-clamp 200K-transient legacy sessions
-#       (~196–205K), whose smaller window has different cache economics and
-#       never belonged to the clamp):
+#   (b) cache-share of spend over COMPACTING sessions in the clamp population
+#       (max compaction tokensBefore ≥ FLEET_REGIME_TB 283616 = the 300K-clamp
+#       compaction trigger, 300000 − 16384 — sessions compacting AT/ABOVE the
+#       trigger ARE post-clamp, not legacy; the floor only excludes the
+#       pre-clamp 200K-transient legacy sessions (~196–205K), whose smaller
+#       window has different cache economics and never belonged to the clamp).
+#       The population is regime-MIXED for one window after the 2026-09-21
+#       withdrawal — see REGIME HISTORY below:
 #       Σ cost.cacheRead+cacheWrite / Σ cost.total over MESSAGE usage, pooled
 #       over the whole window. Compaction summarizer calls (cacheRead≈0,
 #       distinct LLM call) are reported separately, excluded from (b) so the
-#       metric matches the pre-registered 65–70% band (measured regime-pure
-#       message-only: 85.9% pre-clamp / ~70% post-clamp — #373-era anchors,
+#       metric matches the pre-registered 65–70% band (measured message-only
+#       in a single-regime window: 85.9% pre-clamp / ~70% post-clamp — #373-era
 #       clamp-level independent; compaction-included would read ~62% and
 #       false-alarm). Escalate below the floor (FLEET_CACHE_FLOOR default
 #       0.65 = the pre-registered band low) — real drift below the 300K-clamp
@@ -38,8 +39,8 @@
 # at 283616. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions that
 # compacted 2026-09-18..21 ran the retired 700K clamp, and 3 compaction records
 # in that era's 69 session files sit at/above the 650000 trigger
-# (650,134–650,426), so they are counted in n_clamp and in the cache-share
-# pools of a run whose window still reaches them. The number is still reported
+# (650,134–650,426), putting the 2 sessions carrying them into n_clamp and into
+# the cache-share pools of a run whose window still reaches them. The number is still reported
 # (it is the same cache economics — cache-level independent); read n_clamp on
 # the first post-withdrawal run knowing it mixes regimes for that one window.
 # The TRUNCATION instrument is unaffected: it buckets only
@@ -64,7 +65,7 @@
 #   PI_SESSIONS_DIR / --sessions-dir   session JSONL root (default ~/.pi/agent/sessions)
 #   FLEET_WINDOW_DAYS / --days         report window (default 7)
 #   FLEET_CACHE_FLOOR                  cache-share escalation floor (default 0.65)
-#   FLEET_REGIME_TB                    regime purity floor (default 283616 =
+#   FLEET_REGIME_TB                    clamp-population floor (default 283616 =
 #                                       the 300K-clamp compaction trigger)
 #   SPM_SH                             shared-parser script path override (tests)
 # NOTE: the ceiling classification (tokensBefore ≥ 900000) lives in the SHARED
@@ -184,12 +185,13 @@ rows = [json.loads(l) for l in raw.splitlines() if l.strip()]
 rows = [r for r in rows if not r.get("error")]
 
 comps = [r for r in rows if r["compacting"]]
-# regime-pure clamp population: compactions at/above the 300K-clamp
-# compaction trigger (283,616 = 300,000 − 16,384) — incl. the 283.6–300K band
+# clamp population: compactions at/above the 300K-clamp
+# compaction trigger (283,616 = 300,000 − 16,384) — incl. the band
 # a pre-dial sub-300K floor would have misclassified as legacy. Pre-clamp
 # 1M-drift sessions (≥900K) also belong here (they ARE the drift (a) detects);
 # only the sub-trigger legacy/200K-window sessions (~196–205K) are excluded
-# from the cache-share economics pool.
+# from the cache-share economics pool. NOT single-regime for one window after
+# the 2026-09-21 withdrawal — see REGIME HISTORY above.
 clamp_comps = [r for r in comps if r["max_tokensBefore"] >= regime_tb]
 legacy_comps = [r for r in comps if r["max_tokensBefore"] < regime_tb]
 n_comp_recs = sum(r["comp_count"] for r in comps)
