@@ -29,17 +29,26 @@
          TCC (#427/#432): launchd cannot read ~/Documents, so every runtime path
          is outside that wall —
            * the driver + its classifier
-                                            {{HOME}}/.pi/agent/tools/fleet/
-             (pi-bootstrap/setup.sh tools/fleet farm; real copies, not symlinks)
+                                            {{HOME}}/.pi/agent/scripts/fleet/
+             (pi-bootstrap/setup.sh scripts/fleet farm; real copies, not symlinks)
            * the probe library
                                             {{HOME}}/.pi/agent/scripts/lib/
              (the #1178 lib farm, unit 2)
            * store / sessions / log         ~/.cmuxterm, ~/.pi/agent/state/
+         This job used to be farmed into ~/.pi/agent/tools/fleet/, which is Pi's
+         RETIRED custom-tools namespace: Pi's startup check
+         (dist/migrations.js checkDeprecatedExtensionDirs) rejects any entry
+         there that is not fd/rg, and its deprecation prompt is an untimed
+         keypress wait — so the misplaced farm blocked every fresh
+         interactive Pi boot (#1277). scripts/fleet/ is outside that scan.
          PI_PID_IDENTITY_LIB is pinned explicitly rather than left to the
          driver's relative resolution, so the TCC safety is auditable in the
          installed plist: liveness.lib_path() would otherwise resolve
          <here>/../../scripts/lib/pid-identity.sh, which farmed at
-         ~/.pi/agent/tools/fleet/ is the SAME file — pinned, not incidental.
+         ~/.pi/agent/scripts/fleet/ is exactly the PINNED
+         ~/.pi/agent/scripts/lib/pid-identity.sh — the farmed fleet/ sits
+         visibly beside the farmed lib/, so the pin and the fallback agree by
+         construction rather than by coincidence.
 
          No StandardOutPath/StandardErrorPath: the pass appends a capped footer
          to ~/.pi/agent/state/lane-liveness.log (world-writable /tmp siblings are
@@ -52,7 +61,7 @@
     <array>
         <string>/usr/bin/env</string>
         <string>python3</string>
-        <string>{{HOME}}/.pi/agent/tools/fleet/lane_liveness.py</string>
+        <string>{{HOME}}/.pi/agent/scripts/fleet/lane_liveness.py</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

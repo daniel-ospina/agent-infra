@@ -91,16 +91,23 @@ TCC CONSTRAINT, END TO END (#427/#432)
 --------------------------------------
 launchd cannot read ``~/Documents``. Every path this job touches at runtime is
 therefore outside that wall, and the plist pins the probe library explicitly:
-  * the driver + ``liveness.py``  → ``~/.pi/agent/tools/fleet/``   (farmed)
-  * the probe library             → ``~/.pi/agent/scripts/lib/``  (farmed, unit 2)
+  * the driver + ``liveness.py``  → ``~/.pi/agent/scripts/fleet/``  (farmed)
+  * the probe library             → ``~/.pi/agent/scripts/lib/``    (farmed, unit 2)
   * store / sessions / log        → ``~/.cmuxterm``, ``~/.pi/agent``
 ``liveness.lib_path()`` resolves ``<here>/../../scripts/lib/pid-identity.sh``;
-farmed at ``~/.pi/agent/tools/fleet/`` that is exactly
+farmed at ``~/.pi/agent/scripts/fleet/`` that is exactly
 ``~/.pi/agent/scripts/lib/pid-identity.sh`` — the farm layout is what makes the
-relative resolution land inside the wall. The plist also sets
+relative resolution land inside the wall, and the farmed ``fleet/`` sits beside
+the farmed ``lib/`` so the two agree by construction. The plist also sets
 ``PI_PID_IDENTITY_LIB`` so the resolution is auditable rather than incidental.
 There is no ``cmux`` socket call to fail (see trap 1) and no ``~/Documents`` read
 anywhere on the runtime path.
+
+The farm used to land in ``~/.pi/agent/tools/fleet/``. That is pi's RETIRED
+custom-tools namespace: pi's startup scan treats any entry there other than
+fd/rg as a legacy tools directory, and its deprecation prompt is an untimed
+keypress wait — so the misplaced farm blocked every interactive ``pi`` boot
+(#1277). Never re-farm into ``tools/``.
 
 Env seams (tests + tuning; production uses the defaults):
     GH_BIN                gh binary (default: gh; stubbed in tests)
@@ -136,8 +143,10 @@ try:  # the farm promise: lane_liveness.py and liveness.py land side by side.
 except ImportError as _exc:  # pragma: no cover - env dependent
     sys.stderr.write(
         "lane-liveness: FATAL: cannot import the liveness classifier next to this "
-        "driver (%s). The pi-bootstrap farm must copy tools/fleet/liveness.py and "
-        "tools/fleet/lane_liveness.py together.\n" % _exc
+        "driver (%s). The pi-bootstrap farm must copy liveness.py and "
+        "lane_liveness.py together, to ~/.pi/agent/scripts/fleet/ (never the "
+        "deprecated ~/.pi/agent/tools/, which blocks interactive pi boot, #1277).\n"
+        % _exc
     )
     raise SystemExit(2)
 
