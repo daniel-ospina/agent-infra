@@ -205,6 +205,152 @@ assert_eq "$hubdirty" "0" "hub CLEAN after symlink salvage"
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/feat/salvage-symlink" 2>/dev/null || true
 git -C "$REPO" branch -q -D feat/salvage-symlink 2>/dev/null || true
 
+# ── 8. refresh (#1309): clean-but-stale hub → advance main to origin/main ───
+# The state the guard made unreachable: a CLEAN hub whose local main is behind
+# origin/main (the ordinary result of a clone nobody has pulled). refresh must
+# advance it — and must refuse, by default and non-zero, to discard a dirty
+# tree or a local-only commit that carries any file content. Hermetic: every
+# repo here is a throwaway under $FIX, never a real hub.
+git -C "$REPO" checkout -q main 2>/dev/null || true
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+git -C "$REPO" clean -fdq
+
+# A second clone that plays the role of "someone else pushed to origin".
+CLONE="$REAL_FIX/refresh-upstream"
+git clone -q "$ORIGIN" "$CLONE"
+git -C "$CLONE" config user.email t@t
+git -C "$CLONE" config user.name t
+
+# 8a. clean hub BEHIND origin/main → refresh advances it (fast-forward).
+echo "refreshed-content" > "$CLONE/refreshed.txt"
+git -C "$CLONE" add refreshed.txt && git -C "$CLONE" commit -qm refresh-upstream
+git -C "$CLONE" push -q origin main
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "refresh advances a clean behind-hub → exit 0"
+assert_contains "$out" "fast-forward" "refresh reports the fast-forward path"
+assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$(git -C "$REPO" rev-parse origin/main)" "hub main == origin/main after refresh"
+assert_eq "$(git -C "$REPO" branch --show-current)" "main" "hub still on main after refresh"
+[ -e "$REPO/refreshed.txt" ] && ok "refreshed tree contains the upstream file" || bad "refreshed tree missing the upstream file"
+
+# 8b. DIRTY hub → refused, non-zero, and the salvage remedy is named.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+head_before="$(git -C "$REPO" rev-parse HEAD)"
+echo "dirty-here" >> "$REPO/a.txt"
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses a dirty hub → exit 1"
+assert_contains "$out" "working tree is DIRTY" "dirty refusal names the state"
+assert_contains "$out" "salvage" "dirty refusal names the salvage remedy"
+assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head_before" "dirty refusal does not move HEAD"
+git -C "$REPO" reset -q --hard origin/main
+# untracked-only dirt counts as dirty too (untracked WIP is not refreshed away).
+touch "$REPO/untracked-junk.tmp"
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses an untracked-only dirty hub → exit 1"
+rm -f "$REPO/untracked-junk.tmp"
+
+# 8c. local-only commit that CARRIES content → refused, file named; the
+# discard flag does NOT override a content-carrying commit.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+echo "local-only-content" > "$REPO/local-only.txt"
+git -C "$REPO" add local-only.txt && git -C "$REPO" commit -qm local-only-content
+head_before="$(git -C "$REPO" rev-parse HEAD)"
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses a content-carrying local-only commit → exit 1"
+assert_contains "$out" "REFUSING" "content refusal is explicit"
+assert_contains "$out" "local-only.txt" "content refusal names the file"
+assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head_before" "content refusal does not move HEAD"
+out="$(bash "$HELPER" refresh --repo "$REPO" --discard-contentless 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "--discard-contentless does not bypass a content-carrying commit"
+assert_contains "$out" "only drops CONTENTLESS" "flag refusal states the contentless scope"
+git -C "$REPO" reset -q --hard origin/main
+
+# 8d. CONTENTLESS local-only commits (an empty commit, the observed tortoise
+# case) → plain refresh still refuses and prints the SHA; the explicit flag
+# discards exactly those commits and advances.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+# Divergence with no content on the local side: an empty local commit while
+# origin/main advances independently.
+git -C "$REPO" commit -q --allow-empty -m "empty local-only commit"
+EMPTY_SHA="$(git -C "$REPO" rev-parse HEAD)"
+echo "upstream-diverge" > "$CLONE/diverge.txt"
+git -C "$CLONE" add diverge.txt && git -C "$CLONE" commit -qm diverge-upstream
+git -C "$CLONE" push -q origin main
+head_before="$(git -C "$REPO" rev-parse HEAD)"
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "plain refresh refuses a contentless divergence → exit 1"
+assert_contains "$out" "not fast-forwardable" "contentless refusal names the divergence"
+assert_contains "$out" "$EMPTY_SHA" "contentless refusal prints the local-only SHA"
+assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head_before" "plain refresh does not move HEAD"
+out="$(bash "$HELPER" refresh --repo "$REPO" --discard-contentless 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "--discard-contentless proceeds on a contentless divergence"
+assert_contains "$out" "$EMPTY_SHA" "flag path prints the discarded SHA before the move"
+assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$(git -C "$REPO" rev-parse origin/main)" "hub main == origin/main after flagged refresh"
+[ -e "$REPO/diverge.txt" ] && ok "flagged refresh brought in the upstream content" || bad "flagged refresh missed the upstream content"
+
+# 8d2. the OBSERVED tortoise topology: an empty local commit, then a CLEAN
+# merge of origin/main on top of it (a merge whose own delta is nil). Both
+# local-only commits are contentless, so --discard-contentless drops them.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+git -C "$REPO" commit -q --allow-empty -m "empty before merge"
+git -C "$CLONE" fetch -q origin main && git -C "$CLONE" reset -q --hard origin/main
+echo "merge-time" > "$CLONE/merge-time.txt"
+git -C "$CLONE" add merge-time.txt && git -C "$CLONE" commit -qm merge-time-upstream
+git -C "$CLONE" push -q origin main
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" merge -q --no-ff -m "merge origin into empty commit" origin/main
+MERGE_SHA="$(git -C "$REPO" rev-parse HEAD)"
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "plain refresh refuses the empty-commit + clean-merge divergence"
+assert_contains "$out" "$MERGE_SHA" "merge refusal prints the merge SHA"
+assert_contains "$out" "CONTENTLESS" "clean-merge divergence is classified contentless"
+out="$(bash "$HELPER" refresh --repo "$REPO" --discard-contentless 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "flag discards the contentless empty+merge divergence"
+assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$(git -C "$REPO" rev-parse origin/main)" "hub main == origin/main after merge-case refresh"
+
+# 8e. already up to date → no-op success; off-main hub → refused.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "refresh on an up-to-date hub → exit 0"
+assert_contains "$out" "already at origin/main" "up-to-date refresh reports a no-op"
+git -C "$REPO" checkout -q -b refresh-strand
+echo stranded > "$REPO/stranded.txt" && git -C "$REPO" add stranded.txt && git -C "$REPO" commit -qm stranded
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses an off-main hub → exit 1"
+assert_contains "$out" "not main/master" "off-main refusal names the branch condition"
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -q -D refresh-strand
+
+# 8f. refresh accepts --repo.
+assert_contains "$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" "already at origin/main" "refresh accepts --repo"
+
+# 8g. the destructive verbs live ONLY in the nested sub-script (guard posture,
+# #444): hub-worktree.sh's own content must contain no destructive git verb
+# outside a comment (the guard strips comments before it gates).
+outer_src="$(cat "$HELPER")"
+outer_code="$(printf '%s\n' "$outer_src" | grep -Ev '^[[:space:]]*#' | sed 's/"[^"]*"//g' | grep -E '(^|[^-A-Za-z_])git\b.*[[:space:]]+(merge|reset)([[:space:]]|$)' || true)"
+assert_eq "$outer_code" "" "hub-worktree.sh has no destructive git invocation outside comments"
+[ -x "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" ] && ok "refresh sub-script exists and is executable" || bad "refresh sub-script missing/not executable"
+grep -Eq '(^|[^-A-Za-z_])git\b.*[[:space:]]+reset([[:space:]]|$)' "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" && ok "destructive verbs are delegated to the sub-script" || bad "sub-script carries no destructive verb"
+
+# 8h. the sub-script self-refuses a NON-main-checkout target (a linked worktree
+# has a .git FILE, not a directory) — defense in depth if invoked directly.
+out="$(bash "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$REPO/.worktrees/feat/from-wt" ff 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh sub-script refuses a linked worktree target"
+assert_contains "$out" "not a main checkout" "sub-script refusal explains the target check"
+
+# 8i. the sub-script refuses a DIRTY hub even if called directly.
+echo "sub-dirty" >> "$REPO/a.txt"
+out="$(bash "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$REPO" ff 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh sub-script refuses a dirty hub"
+assert_contains "$out" "is DIRTY" "sub-script dirty refusal names the state"
+git -C "$REPO" reset -q --hard origin/main
+
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

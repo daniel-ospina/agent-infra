@@ -555,6 +555,37 @@ the point.
   → merge → sync, or the commit-workflow micro fast-path.
 - **Not a terminal gate:** humans in a terminal can always run the one-liner.
 
+### The clean-but-stale hub — `hub-worktree.sh refresh` (#1309)
+
+The one hub state the gate left unreachable was a hub whose tree is **clean** but
+whose local `main` is **behind `origin/main`** — the ordinary result of a clone
+nobody has pulled. `salvage` does not apply (there is no dirty set), no
+sanctioned verb advances `main` (M4 blocks `merge`/`pull`/`reset`/`checkout`),
+and the hub-state check still reports PASS because it tests on-main + clean, not
+freshness — so the staleness hid itself: **an absent guard reads as a passing
+guard**. Observed live: the tortoise hub sat **308 commits / 3+ days** stale,
+with every file merged upstream since simply absent from its tree.
+
+`hub-worktree.sh refresh [--repo <path>] [--discard-contentless]` is the
+sanctioned path. It fetches, then advances a CLEAN hub's `main` to
+`origin/main`. It **refuses by default and exits non-zero rather than moving
+anything** when the working tree is dirty (the `salvage` remedy is named), or
+when a local-only commit would be discarded: a commit that changes files is
+refused outright and the files are named; a **contentless** divergence (an empty
+commit, or a merge whose own delta is nil — `git show`'s combined diff is empty)
+is refused unless `--discard-contentless` is passed, and then the SHAs it drops
+are printed. A plain `refresh` on a diverged hub never silently drops a commit.
+
+Guard posture is unchanged. The destructive verbs the final move needs
+(`merge --ff-only`, `reset --hard`) live in the nested sub-script
+`scripts/checkout-hygiene/hub-worktree-refresh-advance.sh`, exactly as
+salvage's add/commit/push do — an arg-taking invocation resolves and gates the
+WHOLE `hub-worktree.sh` file (#444), so a destructive verb in it would block the
+file and break worktree creation for every session. Everything the outer mode
+runs is M4-sanctioned or read-only (fetch / status / branch --show-current /
+rev-parse / rev-list / show), and the sub-script independently refuses a
+non-main-checkout, an off-main hub, a dirty hub, or a content-carrying commit.
+
 ## Hub-WIP hygiene warnings — put WIP in a worktree (#350) + #437 tracked-write gate
 
 The **#347 amplifier**: agents write WIP (plan docs to `docs/plans/`,
