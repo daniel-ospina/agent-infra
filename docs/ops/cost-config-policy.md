@@ -1,5 +1,5 @@
 ---
-title: "Cost-Config Policy — deepseek context clamp @700K, drift guard (#341) & bounded retry/hang contract (#1088)"
+title: "Cost-Config Policy — deepseek context clamp @300K, drift guard (#341) & bounded retry/hang contract (#1088)"
 type: engineering
 domain: operations
 doc_status: live
@@ -9,12 +9,11 @@ aboutSubjects: organisation-design-team
 aboutObjects: agent-infra, issue-341, issue-1088, issue-1078, issue-1110, pi-config, cost-config-policy
 ---
 
-# Cost-Config Policy — deepseek context clamp @700K & drift guard (#341)
+# Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)
 
 One place that pins the agent-infra fleet's **token-cost guardrail contract**:
-what the shipped 700K deepseek context clamp means (300K until §8's #1213
-re-clamp), why the guard's classes are BLOCK-vs-WARN, and how a deliberate
-revert (rollback) is done. Delivered by
+what the shipped 300K deepseek context clamp means, why the guard's classes
+are BLOCK-vs-WARN, and how a deliberate revert (rollback) is done. Delivered by
 issue #341 PR-A (config-as-authority); scope/plan:
 `docs/scoping/2026-08-28-issue-341-token-cost-driver-solution-diverge.md` +
 `docs/plans/2026-08-28-issue-341-session-lifecycle.md`.
@@ -24,10 +23,9 @@ issue #341 PR-A (config-as-authority); scope/plan:
 1M that is ~983K — but pi caches the conversation prefix, so a **ceiling
 compaction re-ingests 629–821K fresh tokens at full price** (cacheRead ≈ 0):
 measured 9 low-threshold compactions ≈ $0.16 vs 7 ceiling ≈ $0.70. The clamp
-cuts that amplifier: at the shipped 700K the trigger is **~650,000** (700,000 − 50,000
+cuts that amplifier: at 300K the trigger is **~283,616** (300,000 − 16,384
 `reserveTokens`) and marathon-session cache share stays in the cache-read
-area instead of collapsing. (§8 records the 2026-09-18 300K→700K re-clamp and
-its evidence; the 1M→300K argument above is the original #341 framing.)
+area instead of collapsing.
 
 **Sibling policy (#365):** this file pins the *config* clamp + drift guard;
 the *behavioral* cap on the marathon class (one-issue-per-session, handoff-size
@@ -35,23 +33,21 @@ budget, compaction-trigger expectation, max-call guidance, and the
 pre-committed output+reasoning escalation with its calibration-pending
 threshold) is `docs/ops/session-lifecycle-contract.md`.
 
-**Shipped regime (the #1213 dial):** this policy pins the LIVE config numbers —
-clamp **700K**, compaction trigger **~650,000** (= 700,000 − 50,000
-`reserveTokens`), `keepRecentTokens` **12000**. Dialed 300K→700K by #1213
-(2026-09-18) — see §8 for the evidence, the cost delta, and the residuals.
-Prior dial: 400K→300K by #476's Compaction fix / PR #511 (commit `3211574`,
-2026-09-05): pi-config/models.json (23 deepseek entries 400000→300000),
-settings.json (`keepRecentTokens` 20000→12000), and the guard `CLAMP`
-400000→300000 (`scripts/check-cost-config.sh`). The 400K-selected-at-#341
-context in §3 is history; the pin below is the shipped 700K regime.
+**Shipped regime (the #511 dial):** this policy pins the LIVE config numbers —
+clamp **300K**, compaction trigger **~283,616** (= 300,000 − 16,384
+`reserveTokens`), `keepRecentTokens` **12000**. Dialed 400K→300K by #476's
+Compaction fix / PR #511 (commit `3211574`, 2026-09-05): pi-config/models.json
+(23 deepseek entries 400000→300000), settings.json (`keepRecentTokens`
+20000→12000), and the guard `CLAMP` 400000→300000
+(`scripts/check-cost-config.sh`). The 400K-selected-at-#341 context in §3 is
+history; the pin below is the shipped 300K regime.
 
 ---
 
 ## 1. The conditioned savings claim (honest framing)
 
 - The clamp only changes behavior for sessions whose context crosses
-  **~650K** (the shipped 700K-clamp trigger, 650,000 = 700,000 − 50,000; the
-  #341-era text below and §8 record the 300K-clamp supersession) — **marathon
+  **~283.6K** (the shipped 300K-clamp trigger, 283,616) — **marathon
   sessions**. The 85–87% cache-share figure is marathon-derived;
   the fleet median cache-share is 30%.
 - The pre-registered win is over **COMPACTING sessions**, not fleet-wide: the
@@ -118,9 +114,7 @@ Derived, and enforced by the guard:
   silent hang is bounded by the **idle** ceiling, because a hung attempt emits
   no bytes — exactly the measured 0 B signature. 5 minutes of zero-byte silence
   is ~1.5 orders of magnitude above a normal time-to-first-token on a
-  300K-context request (the #1213 700K re-clamp raises that prefill ~2.3x —
-  see the §8 residual; the margin is still ~0.5–1 order and a breach is loud,
-  not silent); 8 attempts x (<=5 min idle + <=1 min backoff) bounds the
+  300K-context request; 8 attempts x (<=5 min idle + <=1 min backoff) bounds the
   whole hang to ~43 min — a coffee break, not a season. (On this host the
   observed cost was 34-104 days.)
 - *Transient outage* — wifi handoff, load-balancer restart, short provider
@@ -135,14 +129,14 @@ Derived, and enforced by the guard:
   ordering between them is what keeps that true. `httpIdleTimeoutMs` =
   `300000` is pi's own `DEFAULT_HTTP_IDLE_TIMEOUT_MS`; it maps to undici
   `headersTimeout`/`bodyTimeout`, so it bounds a call that **never emits a
-  byte** (a 700K-context prefill's time-to-first-byte, or a mid-stream stall).
+  byte** (a 300K-context prefill's time-to-first-byte, or a mid-stream stall).
   `retry.provider.timeoutMs` = `600000` (unchanged) bounds a call that *is*
   streaming. The enforced invariant is `httpIdleTimeoutMs < provider.timeoutMs`:
   if the total ceiling were at or below the idle ceiling, the idle ceiling could
   never fire first and the no-progress window would silently become
   `maxRetries x providerTimeout`. Going *below* pi's default idle ceiling is
   deliberately **not** done — that would need a measured time-to-first-byte
-  distribution for 700K-context requests, which we do not have; 5 minutes is the
+  distribution for 300K-context requests, which we do not have; 5 minutes is the
   upstream-considered value, so the fleet's previous 10 minutes was the
   unmeasured outlier.
 
@@ -221,13 +215,11 @@ property; this guard is the pattern to copy, not a substitute for it.
 
 - On **2026-08-25 11:51–12:33** the live config transiently ran a **200K**
   context window (trigger ≈ 196K implies `reserveTokens` ≈ **4096** during
-  the proof — the value then shipped, 16384 until §8's #1213 re-clamp to 50000)
-  and was silently reverted. That window is
+  the proof — NOT the shipped 16384) and was silently reverted. That window is
   the existence proof that the compaction trigger fires early and cheaply when
   the clamp is in place, and that live-config writes can silently drift back.
-- The clamp target of **300K** at #341-#511 (dialed 400K→300K by #476's
-  Compaction fix / PR #511, 2026-09-05; #341 originally selected 400K over
-  200K) — **superseded 2026-09-18 by #1213, current target 700K, see §8** — was
+- The clamp target of **300K** (dialed 400K→300K by #476's Compaction fix /
+  PR #511, 2026-09-05; #341 originally selected 400K over 200K) is
   deliberately conservative: it keeps headroom for the p95 45–64KB multi-tool
   reads near the trigger while still avoiding the 1M ceiling.
 
@@ -267,9 +259,8 @@ property; this guard is the pattern to copy, not a substitute for it.
   4h refresh may re-write the live store back to 1M, and that is **DETECTED,
   not blocked**.
 - **Guard classes** (`scripts/check-cost-config.sh`):
-  - `models.json` drift (any deepseek-served id > 700K; **300K until §8's
-    #1213 re-clamp**) → **BLOCK (exit 1)**.
-  - `settings.json` drift (compaction block: enabled + `reserveTokens` 50000 +
+  - `models.json` drift (any deepseek-served id > 300K) → **BLOCK (exit 1)**.
+  - `settings.json` drift (compaction block: enabled + `reserveTokens` 16384 +
     `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract —
     the keys are `retry.maxRetries`, `httpIdleTimeoutMs`, `retry.baseDelayMs`,
     `retry.provider.timeoutMs`, `retry.provider.maxRetries`; **the table in §2
@@ -294,7 +285,7 @@ property; this guard is the pattern to copy, not a substitute for it.
     moment pi's refresh legitimately reverts the store — the verifier P0).
     The alert path is the **weekly report** (`fleet-cost-report.sh`, PR-B) and
     the **tripwire**: any compaction record with `tokensBefore ≥ 900K`
-    (0.9 × 1M — NOT 0.9 × 700K, which sits at 630K — below the 650,000
+    (0.9 × 1M — NOT 0.9 × 300K, which sits at 270K — below the 283,616
     trigger — and would misclassify every post-clamp compaction as a ceiling).
   - **PR-A ships a detect-only store-drift signal**: the store WARN goes to
     stdout and the sync log only — there is **no escalation recipient yet**
@@ -329,7 +320,7 @@ property; this guard is the pattern to copy, not a substitute for it.
 
 - The only true escape from the clamp is a **deliberate revert commit**:
   context windows back to 1M **and the guard's `CLAMP` constant updated in
-  the SAME commit** — a stale-clamp guard would block
+  the SAME commit** — a reverted clamp with a stale 300K guard would block
   every sync/commit (or force override usage indefinitely, which is exactly
   the drift the guard exists to surface).
 - Trigger (pre-committed, owner = weekly report reader): re-read volume or
@@ -338,84 +329,26 @@ property; this guard is the pattern to copy, not a substitute for it.
   → revert to 1M. The 200K dial is the pre-registered upside if week-2+ shows
   < 1.5x cost reduction over compacting sessions.
 - Re-clamping after a revert requires **re-approval** (the same
-  human-gated decision as the original clamp). The 2026-09-18 300K→700K
-  re-clamp was owner-directed (the W0 compaction work order + its orchestrator
-  relay) and is recorded in §8, which is the re-approval record.
+  human-gated decision as the original clamp).
+- **Withdrawal record (2026-09-21).** The 2026-09-18 dial **300K→700K** (#1213,
+  PR #1226) is **withdrawn**; the shipped numbers are back at clamp **300K**,
+  trigger **~283,616**, `reserveTokens` **16384**, guard `CLAMP` **300000**.
+  Reason: the wider window published its own sequencing — *withdraw only after
+  the floor fix deploys* — and that condition is now met. The installed
+  `pi-ai` carries `MIN_USABLE_MAX_TOKENS = 1024` with
+  `clampMaxTokensToContext()` returning `min(maxTokens, 1024)` whenever the
+  available budget falls under it (`pi-patch:#1214(b)` — never clamp below a
+  usable output budget), so the one mechanism the window was bought for —
+  `estimate ≥ contextWindow − 4096` → a single-token `stopReason:"length"`
+  turn, silently un-answerable — is closed in code. Against that, the window
+  costs roughly **+20% fleet-level model spend, recurring** (trigger
+  283,616→650,000; summary cap 13,107→40,000; ceiling re-ingestion ~2.3×).
+  **Residual, stated plainly:** it has **not** been verified that the floor fix
+  subsumes *every* failure the wider window covered — only the silent-death
+  one. The retired regime's records stay visible as `watch-truncation.sh`'s
+  `700K-clamp-era(650-700K)` LEGACY bucket; §7's trigger below is unchanged.
 
----
-
-## 8. Amendment 2026-09-18 — clamp 300K → 700K (#1213)
-
-**OVERRIDES:** the vendor's full model window (deepseek 1M) — clamped at
-700,000, not because 1M is unreachable but because 700,000 is the largest
-window whose worst-case request stays inside the measured serving ceiling.
-
-**What changed (one commit, as §7 requires):** `pi-config/models.json`
-deepseek-family `contextWindow` 300000 → 700000 (27 entries);
-`pi-config/models-store.json` deepseek-family 300000 → 700000 (10 entries —
-the catalog's **non-deepseek rows are UNCHANGED**, they were never probed);
-`settings.json` `compaction.reserveTokens` 16384 → 50000; the guard `CLAMP`
-300000 → 700000 and its reserve expectation → 50000
-(`scripts/check-cost-config.sh`); `scripts/fleet-cost-report.sh`
-`FLEET_REGIME_TB` 283616 → 650000 (the report answers "did the clamp work?"
-and feeds §7's rollback trigger, so a stale floor would corrupt the owner's
-decision input).
-
-**Why — the §7 pre-registered trigger fired.** §7's revert trigger is "≥ 1
-`stopReason:\"length\"` truncation record". A scan of the session corpus found
-**188 such records across 49 sessions**, in four window eras, each sitting at
-`configured window − ~4,082` — the clamp's own reserve
-(`contextWindow − estimate − 4096`). The failure: at
-`estimate ≥ contextWindow − 4096`, pi clamps `max_tokens` to `max(1, …)`, the
-provider returns **1 output token** with `stopReason:"length"`, and the
-session can never answer again. It is silent — no error, no event, a
-plausible one-token assistant turn. The 188 are the threshold's 188×
-satisfaction.
-
-**Evidence (a live probe — the acceptance test, with its negative control):**
-
-| arm | configured | estimate | result |
-|---|---|---|---|
-| negative control | 300000 | 312,521 | `stopReason=length`, output=1 → **DEAD** (defect reproduced) |
-| proposed | 700000 | 312,521 | `stop` → answered |
-| proposed (ceiling) | 700000 | 690,021 | `stop` → answered |
-
-The provider served **691,804 tokens in one request** (input 320,088 +
-cacheRead 371,712 + output 4). The prior ceiling was less than half of what
-the endpoint serves, so withheld capacity was being misread as session death.
-
-**Why `reserveTokens` moves with it.** `reserveTokens` drives BOTH the trigger
-(`tokens > contextWindow − reserve`, pi `compaction.js:160-163`) and the
-summarization output cap (`min(0.8 × reserve, model.maxTokens)`,
-`compaction.js:489`). At 16384 the cap is 13,107, which refused a measured
-~13.6K-token summary. 50000 is the **smallest** value satisfying the
-worst-case inequality `(700,000 − 50,000) + 0.8 × 50,000 = 690,000`
-≤ 691,804 (the probe's served total).
-
-**Cost delta (accepted, reversible).** Trigger 283,616 → 650,000; summary cap
-13,107 → 40,000; the reserve held back for the summary 16,384 → 50,000. A
-compacting session's ceiling re-ingestion therefore grows ~2.3×. §7 unchanged
-as the rollback: revert the windows AND the guard's `CLAMP` in the same commit.
-
-**Known residuals (filed, not hidden):**
-
-- Only `api.deepseek.com` was probed. The other legs serving the same ids
-  (openrouter / qwen-token-plan / venice) read 700,000 but are **unmeasured**;
-  an over-ceiling request there fails LOUDLY (recoverable provider error), not
-  silently, and `extensions/compaction-watchdog.ts` (#1215) records it.
-- The 40,000-token summary cap can approach `retry.provider.timeoutMs`
-  (600,000ms) in the worst case. Measured summaries are ~13.6K tokens (~3×
-  under the cap); an over-timeout summarization is loud, retried, and
-  watchdog-recorded — never a silent death.
-- The 300,000ms `httpIdleTimeoutMs` idle ceiling was justified against a
-  **300K-context** prefill's time-to-first-byte; the 700K window raises that
-  prefill ~2.3×, narrowing the margin (still ~0.5–1 order of magnitude). A
-  breach is loud and retried, never silent. Time-to-first-byte measurement at
-  700K is filed, not assumed.
-- Long-context **answer quality** at ≥300K is a CHECK, not a gate: measurement
-  is filed, not assumed.
-- Global `reserveTokens: 50000` inverts the trigger for catalog rows with
-  16,384 ≤ `contextWindow` < 50,000 (9 rows, e.g. the nvidia 32,768 entry),
-  making them compact every turn. Filed; the affected rows were already
-  degenerate at 16,384 and most are unreachable while the openrouter
-  extension replaces that provider's model list.
+  **OVERRIDES:** the vendor's full deepseek window (1,000,000) — clamped at
+  300,000, because cold re-ingestion at the 1M ceiling is the cost amplifier
+  the clamp exists to stop, and the mechanism that once justified widening it
+  (the single-token clamp death) is now closed in code.

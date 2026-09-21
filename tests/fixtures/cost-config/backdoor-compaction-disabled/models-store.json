@@ -17,7 +17,7 @@
           "cacheRead": 0.0028,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 384000,
         "compat": {
           "supportsStore": false,
@@ -50,7 +50,7 @@
           "cacheRead": 0.0028,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 384000,
         "compat": {
           "supportsStore": false,
@@ -83,7 +83,7 @@
           "cacheRead": 0.003625,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 384000,
         "compat": {
           "supportsStore": false,
@@ -1199,7 +1199,7 @@
           "cacheRead": 0.01764,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 131072,
         "compat": {
           "supportsDeveloperRole": false,
@@ -1231,7 +1231,7 @@
           "cacheRead": 0.018,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 65536,
         "compat": {
           "supportsDeveloperRole": false,
@@ -1263,7 +1263,7 @@
           "cacheRead": 0.003625,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 384000,
         "compat": {
           "supportsDeveloperRole": false,
@@ -6546,7 +6546,7 @@
           "cacheRead": 0.018,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 65536,
         "compat": {
           "supportsDeveloperRole": false,
@@ -8776,7 +8776,7 @@
           "cacheRead": 0,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 384000
       },
       {
@@ -8809,7 +8809,7 @@
           "cacheRead": 0,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 384000
       },
       {
@@ -8842,7 +8842,7 @@
           "cacheRead": 0,
           "cacheWrite": 0
         },
-        "contextWindow": 700000,
+        "contextWindow": 300000,
         "maxTokens": 384000
       },
       {

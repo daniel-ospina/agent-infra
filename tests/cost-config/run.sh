@@ -1547,10 +1547,11 @@ echo ""
 # ── 35. the reserve expectation must fail closed on a WRONG VALUE, not just on
 #      a MISSING block. backdoor-settings' injected defect is the MISSING
 #      compaction block (the `not isinstance(comp, dict)` arm), so the
-#      wrong-value arm (`comp.get("reserveTokens") != 50000`) had no fixture at
-#      all — raising the expectation 16384 -> 50000 (#1213) would then have
-#      been assertable only by reading the code. Both arms are settings-class,
-#      hence override-immune.
+#      wrong-value arm (`comp.get("reserveTokens") != 16384`) had no fixture at
+#      all. Both arms are settings-class, hence override-immune. (Added under
+#      #1213 when the expectation was 50000, then re-pointed to the restored
+#      16384 by the withdrawal — the COVERAGE is value-independent, which is
+#      exactly why it is kept rather than reverted.)
 echo "35. reserveTokens wrong value (block present) → BLOCK, and the override does not silence it"
 TMP35="$(mktemp -d /tmp/cost-config-reserve-value.XXXXXX)"
 mkroot "$TMP35"
@@ -1558,13 +1559,13 @@ python3 - "$TMP35/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
-d["compaction"]["reserveTokens"] = 16384          # the PRE-#1213 value
+d["compaction"]["reserveTokens"] = 50000          # the WITHDRAWN #1213 value
 json.dump(d, open(p, "w"), indent=2)
 PYEOF
 bash "$TMP35/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
-if [ "$code" -eq 1 ]; then pass "reserveTokens=16384 (block present) → exit 1"; else fail "expected exit 1 for a wrong reserveTokens value, got $code"; sed -n '1,30p' "$OUT"; fi
-if grep -q "compaction.reserveTokens expected 50000, got 16384" "$OUT"; then pass "wrong-value message names the expected and actual value"; else fail "expected the wrong-value reserveTokens message"; sed -n '1,30p' "$OUT"; fi
+if [ "$code" -eq 1 ]; then pass "reserveTokens=50000 (block present) → exit 1"; else fail "expected exit 1 for a wrong reserveTokens value, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "compaction.reserveTokens expected 16384, got 50000" "$OUT"; then pass "wrong-value message names the expected and actual value"; else fail "expected the wrong-value reserveTokens message"; sed -n '1,30p' "$OUT"; fi
 COST_CLAMP_OVERRIDE=1 bash "$TMP35/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "wrong-value reserveTokens + override → still exit 1 (settings class is override-immune)"; else fail "expected exit 1 under the override, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1577,7 +1578,9 @@ echo ""
 #      (absent/unparseable models.json are emitted in the clamp class). That is
 #      a PRE-EXISTING property of the documented escape, it reproduces against
 #      the pre-#1213 guard, and it is filed as its own issue — so it is
-#      deliberately NOT pinned here as correct behaviour.
+#      deliberately NOT pinned here as correct behaviour. (Added under #1213;
+#      KEPT by the withdrawal — it tests the guard's fail-closed property, not
+#      any window/reserve value.)
 echo "36. unparseable shipped models.json → exit 1 (fail-closed)"
 TMP36="$(mktemp -d /tmp/cost-config-models-parse.XXXXXX)"
 mkroot "$TMP36"

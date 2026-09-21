@@ -15,6 +15,9 @@
 #   LEG-B    re-read volume > 2× regenerated Aug baseline sustained over 3
 #            consecutive calendar days → exit 1 (leg A, label names re-read)
 #   DRY-RUN  --dry-run prints the trigger path without claiming a revert
+#   LENGTH-LEGACY  a length stop from the WITHDRAWN (#1213/#1226) 700K regime
+#            must bucket as its own legacy era, NOT small-window and NOT the
+#            restored 300K primary band
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,25 +67,24 @@ assert_eq "$RC" "0" "clean fixture exits 0"
 assert_contains "$OUT" "## ✅ CLEAN" "clean fixture reports no trigger"
 assert_contains "$OUT" "(window-ceiling truncation) records: 0" "clean fixture has no length records"
 
-# LENGTH: 1 session today with a genuine ceiling length stop at 660K ctx —
-# in the shipped 700K-clamp trigger band (650K–700K, #1213), so it MUST
-# classify as a 700K-clamp session (not fall through to small-window → exit 1)
-# (regime = the assistant message's own ctx = input + cacheRead; the
-#  parser's genuine_len_stops floor is ctx >= 0.92 x the session's max ctx)
-D="$T/length"; mk_sess "$D" 9 0 20000 660000 1
+# LENGTH: 1 session today with a genuine ceiling length stop at 290K ctx —
+# in the shipped 300K-clamp trigger band (283,616–300K), so it MUST classify
+# as a 300K-clamp session (not fall through to small-window → exit 1)
+D="$T/length"; mk_sess "$D" 9 0 50000 290000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
 assert_eq "$RC" "1" "length-record fixture exits 1"
 assert_contains "$OUT" "❌ TRIGGERED" "length fixture prints TRIGGERED"
 assert_contains "$OUT" "pre-committed rollback" "length fixture prints rollback procedure"
-assert_contains "$OUT" "'700K-clamp(650-700K)': 1" "660K length record buckets as 700K-clamp-regime, not small-window"
+assert_contains "$OUT" "'300K-clamp(283.6-300K)': 1" "290K length record buckets as 300K-clamp-regime, not small-window"
 
-# LENGTH-LEGACY: a 400K-ceiling length stop from the PREVIOUS (300K-era)
-# clamp must bucket as its own legacy era — NOT small-window (which would
-# wrongly tell the owner to exclude a clamp-era record from the decision),
-# and NOT the current 700K band.
-D="$T/length-legacy"; mk_sess "$D" 9 0 20000 380000 1
+# LENGTH-LEGACY: a 660K-ceiling length stop from the WITHDRAWN (#1213/#1226)
+# 700K regime must bucket as its own legacy era — NOT small-window (the triage
+# note tells the owner to exclude those) and NOT the restored 300K primary
+# band (it is not current-geometry evidence). Mirror of the 300K-era legacy
+# test #1226 added when the geometry pointed the other way.
+D="$T/length-legacy"; mk_sess "$D" 9 0 20000 660000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
-assert_contains "$OUT" "'300K-clamp-era(283.6-650K)': 1" "400K length record buckets as the previous clamp era, not small-window"
+assert_contains "$OUT" "'700K-clamp-era(650-700K)': 1" "660K length record buckets as the withdrawn 700K era, not small-window"
 
 # LEG-B: 3 consecutive days each exceeding 2× re-read baseline
 #   reread/session = msg_input + comp_input; want > 3,938,682 → use 4.5M each
