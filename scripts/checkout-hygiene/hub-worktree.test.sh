@@ -35,7 +35,7 @@ REAL_FIX="$(cd "$FIX" && pwd -P)" # canonical (macOS: /var → /private/var)
 
 ORIGIN="$REAL_FIX/origin.git"
 REPO="$REAL_FIX/repo"
-git init -q --bare "$ORIGIN"
+git init -q --bare -b main "$ORIGIN"
 git init -q -b main "$REPO"
 git -C "$REPO" config user.email t@t
 git -C "$REPO" config user.name t
@@ -205,12 +205,14 @@ assert_eq "$hubdirty" "0" "hub CLEAN after symlink salvage"
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/feat/salvage-symlink" 2>/dev/null || true
 git -C "$REPO" branch -q -D feat/salvage-symlink 2>/dev/null || true
 
-# ── 8. refresh (#1309): clean-but-stale hub → advance main to origin/main ───
-# The state the guard made unreachable: a CLEAN hub whose local main is behind
-# origin/main (the ordinary result of a clone nobody has pulled). refresh must
+# ── 8. refresh (#1309): clean-but-stale hub → advance the hub to its upstream ─
+# The state with no agent-reachable path: a CLEAN hub whose local main has
+# DIVERGED from origin/main (a merely behind hub is already covered by the
+# M4-sanctioned `git pull --ff-only` and by repo-freshness). refresh must
 # advance it — and must refuse, by default and non-zero, to discard a dirty
-# tree or a local-only commit that carries any file content. Hermetic: every
-# repo here is a throwaway under $FIX, never a real hub.
+# tree, a local-only commit that carries any file content, or a hub-local
+# IGNORED file the upstream now tracks. Hermetic: every repo here is a
+# throwaway under $FIX, never a real hub.
 git -C "$REPO" checkout -q main 2>/dev/null || true
 git -C "$REPO" fetch -q origin main
 git -C "$REPO" reset -q --hard origin/main
@@ -350,6 +352,74 @@ out="$(bash "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$REPO" ff 2>&1)" && r
 assert_eq "$rc" 1 "refresh sub-script refuses a dirty hub"
 assert_contains "$out" "is DIRTY" "sub-script dirty refusal names the state"
 git -C "$REPO" reset -q --hard origin/main
+
+# 8j. MUTATION COVER for the sub-script's OWN content-loss re-check: a clean,
+# on-main hub with a content-carrying local-only commit must be refused at the
+# point of mutation even when the sub-script is the entry point (the outer
+# caller's analysis is bypassed here).
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+git -C "$REPO" checkout -q main
+echo "sub-upstream" > "$CLONE/sub-upstream.txt"
+git -C "$CLONE" add sub-upstream.txt && git -C "$CLONE" commit -qm sub-upstream
+git -C "$CLONE" push -q origin main
+printf 'sub-content\n' > "$REPO/sub-only.txt"
+git -C "$REPO" add sub-only.txt && git -C "$REPO" commit -qm sub-content
+sub_head="$(git -C "$REPO" rev-parse HEAD)"
+out="$(bash "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$REPO" discard-contentless 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "sub-script refuses a content-carrying commit on the discard path"
+assert_contains "$out" "carries file content" "sub-script content refusal names the reason"
+assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$sub_head" "sub-script content refusal does not move HEAD"
+git -C "$REPO" reset -q --hard origin/main
+
+# 8k. a `master` hub → refresh must advance origin/master, never origin/main
+# (the upstream is the hub's OWN branch, not a hardcoded origin/main).
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+git -C "$REPO" branch -q -f master origin/main
+git -C "$REPO" push -q origin master
+git -C "$REPO" checkout -q master
+main_before="$(git -C "$REPO" rev-parse origin/main)"
+git -C "$CLONE" fetch -q origin main && git -C "$CLONE" reset -q --hard origin/main
+git -C "$CLONE" fetch -q origin master
+git -C "$CLONE" checkout -q -B master origin/master
+echo "master-only" > "$CLONE/master-only.txt"
+git -C "$CLONE" add master-only.txt && git -C "$CLONE" commit -qm master-advance
+git -C "$CLONE" push -q origin master
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "refresh advances a master hub → exit 0"
+assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$(git -C "$REPO" rev-parse origin/master)" "master hub == origin/master after refresh"
+assert_eq "$(git -C "$REPO" rev-parse origin/main)" "$main_before" "master refresh did not touch origin/main"
+[ -e "$REPO/master-only.txt" ] && ok "master refresh brought in origin/master content" || bad "master refresh missed origin/master content"
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -q -D master
+git -C "$CLONE" checkout -q main
+
+# 8l. an upstream path the hub IGNORES → refused before either move. porcelain
+# cannot see ignored files, so without this check the move would silently
+# overwrite the hub-local file (git does not warn) — the SEC-001 data-loss path.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+printf 'upstream-env\n' > "$CLONE/.env"
+git -C "$CLONE" add -f .env && git -C "$CLONE" commit -qm add-env
+git -C "$CLONE" push -q origin main
+printf 'hub-local-secret\n' > "$REPO/.env"
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "refresh refuses an upstream path the hub ignores → exit 1"
+assert_contains "$out" "IGNORES" "ignored-collision refusal names the state"
+assert_contains "$out" ".env" "ignored-collision refusal names the file"
+assert_eq "$(cat "$REPO/.env")" "hub-local-secret" "the hub-local ignored file was not overwritten"
+rm -f "$REPO/.env"
+
+# 8m. the ignored-collision check does NOT false-refuse when the ignored file
+# has no upstream counterpart.
+git -C "$REPO" fetch -q origin main
+git -C "$REPO" reset -q --hard origin/main
+printf 'still-local\n' > "$REPO/.env.local"
+out="$(bash "$HELPER" refresh --repo "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "an unrelated hub-local ignored file still refreshes → exit 0"
+assert_eq "$(cat "$REPO/.env.local")" "still-local" "the unrelated ignored file is untouched"
+rm -f "$REPO/.env.local"
 
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"

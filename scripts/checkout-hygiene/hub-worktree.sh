@@ -46,17 +46,31 @@
 #
 #   hub-worktree.sh refresh [--repo <path>] [--discard-contentless]
 #     Clean-but-stale hub refresh (#1309): fetch, then advance a CLEAN hub's
-#     local main to origin/main. This is the state the guard made unreachable
-#     — a clone nobody has pulled is neither dirty (salvage does not apply) nor
-#     broken, yet M4 blocks merge/pull/reset/checkout, the only verbs that
-#     would fix it, so a hub sat 308 commits stale with no sanctioned path.
-#     Because an absent guard reads as a passing guard, the staleness hid
-#     itself; this mode is the sanctioned fix.
+#     local main to its upstream.
+#
+#     The state this fills is the NON-FAST-FORWARDABLE clean hub — a local main
+#     that has DIVERGED from the upstream (the observed tortoise shape: an empty
+#     commit, then a merge of the upstream on top of it). A merely *behind* hub
+#     is already handled: `git pull --ff-only` (with `git checkout main`) is
+#     M4-sanctioned recovery, repo-freshness's `auto` mode ff-pulls a clean
+#     default branch, and the guard's block message names the same one-liner.
+#     On a DIVERGED hub, though, that ff-pull cannot apply (git refuses a
+#     non-fast-forward), `reset --hard` is refused by the destructive-git gate,
+#     repo-freshness deliberately declines to recover a diverged default branch,
+#     and the hub-state check still reports PASS because it tests on-main +
+#     clean, not freshness — so the staleness hid itself: an absent guard reads
+#     as a passing guard. Observed live: the tortoise hub sat 3 days / 308
+#     commits stale, with files merged upstream since simply absent from it.
 #
 #     Refresh REFUSES by default (exit 1) rather than moving anything:
+#       - the hub is not on main/master (or is detached) → refused; an off-main
+#         hub is the stranded-branch case (push the branch, return the hub to
+#         main first);
 #       - the working tree is dirty → the salvage case is named as the remedy;
 #       - local-only commits would be discarded AND any of them carries file
-#         content → the differing files are named and nothing is moved.
+#         content → the differing files are named and nothing is moved;
+#       - the upstream tracks a path this hub ignores → refused, because the
+#         move would overwrite that hub-local file (a hub's .env, typically).
 #     A diverged hub whose local-only commits are CONTENTLESS (an empty commit;
 #     a merge whose own delta is nil — neither changes a file; the observed
 #     tortoise case) is ALSO refused unless --discard-contentless is given; with
@@ -65,21 +79,24 @@
 #
 #     Guard posture (no allowlist change): this mode runs ONLY the
 #     M4-sanctioned/read-only surface — fetch / status / branch --show-current
-#     / rev-parse / rev-list / show. The two DESTRUCTIVE verbs the final
-#     move needs (`git merge --ff-only` / `git reset --hard`) are delegated to
-#     the INTERNAL sub-script hub-worktree-refresh-advance.sh (direct-exec),
-#     exactly as salvage delegates its add/commit/push — and for the same #444
-#     reason: an arg-taking invocation resolves and gates THIS file's whole
-#     content, so a destructive verb here would block the file and break
-#     worktree creation for every session. The sub-script re-checks at runtime
+#     / rev-parse / rev-list / show. The two DESTRUCTIVE verbs the final move
+#     needs (`git merge --ff-only` / `git reset --hard`) are delegated to the
+#     INTERNAL sub-script hub-worktree-refresh-advance.sh (direct-exec), exactly
+#     as salvage delegates its add/commit/push. The delegation is load-bearing
+#     even though this file is on the guard's SANCTIONED_SCRIPT_RELPATHS
+#     exemption (#1129, so the runtime content walk skips it): (a) the guard's
+#     own real-file probe pins scriptGitVerdict(hub-worktree.sh) === "allow"
+#     (#444), so a destructive verb here would redden the guard suite; and (b) a
+#     copy of this script at the same relpath in a NON-sanctioned checkout is a
+#     different realpath and stays gated. The sub-script re-checks at runtime
 #     that the target is a clean, on-main MAIN checkout (and, on the discard
 #     path, re-runs the per-commit content-loss scan) before it moves anything.
 #
 # Exits: 0 success · 1 operational failure (nothing to salvage, /tmp repo,
-# existing worktree, dirty/diverged refresh refusal, git failure) · 2 usage
-# error. Worktree add + salvage never modify the hub's branch; refresh moves a
-# CLEAN hub's main to origin/main (that is its purpose). All modes are safe
-# against the main-worktree-guard.
+# existing worktree, off-main/dirty/diverged/ignored-collision refresh refusal,
+# git failure) · 2 usage error. Worktree add + salvage never modify the hub's
+# branch; refresh moves a CLEAN hub's main to its upstream (that is its
+# purpose). All modes are safe against the main-worktree-guard.
 
 set -euo pipefail
 
@@ -391,29 +408,34 @@ salvage() {
 }
 
 # ── REFRESH MODE (#1309) ────────────────────────────────────────────────────
-# Advance a CLEAN hub's local main to origin/main. The hub is the ONE checkout
-# no agent may move by hand (M4 blocks merge/pull/reset/checkout there), so a
-# clone nobody has pulled sat 308 commits stale with no sanctioned fix; because
-# an absent guard reads as a passing guard, nothing signalled it. This mode is
-# that fix — and it refuses by default: a dirty hub is the SALVAGE case, and a
-# local-only commit is never dropped implicitly.
+# Advance a CLEAN hub's own branch to its upstream. The unreachable state is a
+# NON-FAST-FORWARDABLE clean hub: the M4-sanctioned `git pull --ff-only` cannot
+# apply to a diverged local main, `reset --hard` is refused by the
+# destructive-git gate, and repo-freshness deliberately declines to recover a
+# diverged default branch — so a clone nobody could refresh sat 308 commits
+# stale, and because an absent guard reads as a passing guard nothing signalled
+# it. This mode is that fix — and it refuses by default: a dirty hub is the
+# SALVAGE case, and a local-only commit is never dropped implicitly.
 #
 # Guard posture (no allowlist change): this function runs ONLY the
 # M4-sanctioned/read-only surface — fetch / status / branch --show-current /
 # rev-parse / rev-list / show. The two DESTRUCTIVE verbs the final move
 # needs (fast-forward advance and the contentless discard) are delegated to the
 # INTERNAL sub-script hub-worktree-refresh-advance.sh (direct-exec below),
-# exactly as salvage delegates its add/commit/push — #444 makes an arg-taking
-# invocation resolve and gate THIS file's WHOLE content, so a destructive verb
-# here would block the file and break worktree creation for every session.
+# exactly as salvage delegates its add/commit/push. The delegation is
+# load-bearing even though this file is on the guard's
+# SANCTIONED_SCRIPT_RELPATHS exemption (#1129): the guard's own real-file probe
+# pins scriptGitVerdict(hub-worktree.sh) === "allow" (#444), so a destructive
+# verb here would redden the guard suite, and a copy at the same relpath in a
+# non-sanctioned checkout stays gated.
 refresh() {
   local hub_branch porcelain head origin_head local_only changed count sha subj
 
   hub_branch="$(git -C "$MAIN_REPO" branch --show-current 2>/dev/null || echo "detached")"
   if [[ "$hub_branch" != "main" && "$hub_branch" != "master" ]]; then
     echo "hub-worktree: refresh: refusing — the hub is on '$hub_branch' (not main/master)." >&2
-    echo "   refresh advances a CLEAN hub's main to origin/main. An off-main hub is" >&2
-    echo "   the stranded-branch case: preserve the branch, return the hub to main." >&2
+    echo "   refresh advances a CLEAN hub's own branch to its upstream. An off-main hub" >&2
+    echo "   is the stranded-branch case: push the branch, then return the hub to main." >&2
     exit 1
   fi
 
@@ -433,23 +455,35 @@ refresh() {
     exit 1
   fi
 
-  echo "hub-worktree: refresh: fetching origin main…"
-  git -C "$MAIN_REPO" fetch origin main --quiet
+  # The hub's OWN upstream — never a hardcoded origin/main. `master` is accepted
+  # above, so a hardcoded origin/main would, on a repo where both refs exist,
+  # move the WRONG branch on the destructive path.
+  local upstream="origin/$hub_branch"
+
+  echo "hub-worktree: refresh: fetching origin ${hub_branch}…"
+  git -C "$MAIN_REPO" fetch origin "$hub_branch" --quiet
+
+  if ! git -C "$MAIN_REPO" rev-parse --verify --quiet "$upstream" >/dev/null; then
+    echo "hub-worktree: refresh: refusing — the hub's upstream '$upstream' does not exist." >&2
+    exit 1
+  fi
 
   head="$(git -C "$MAIN_REPO" rev-parse HEAD)"
-  origin_head="$(git -C "$MAIN_REPO" rev-parse origin/main)"
+  origin_head="$(git -C "$MAIN_REPO" rev-parse "$upstream")"
   if [[ "$head" = "$origin_head" ]]; then
-    echo "hub-worktree: refresh: hub $hub_branch is already at origin/main — nothing to do."
+    echo "hub-worktree: refresh: hub $hub_branch is already at $upstream — nothing to do."
     exit 0
   fi
 
-  # Local-only commits = reachable from HEAD but not from origin/main.
-  local_only="$(git -C "$MAIN_REPO" rev-list origin/main..HEAD)"
+  # Local-only commits = reachable from HEAD but not from the upstream.
+  local_only="$(git -C "$MAIN_REPO" rev-list "$upstream..HEAD")"
   if [[ -z "$local_only" ]]; then
     # Pure behind (fast-forwardable): no local-only commit is discarded.
-    echo "hub-worktree: refresh: hub $hub_branch is behind origin/main — advancing (fast-forward)…"
-    "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$MAIN_REPO" ff
-    echo "✅ hub-worktree: refresh: $MAIN_REPO is now at origin/main ($(git -C "$MAIN_REPO" rev-parse --short HEAD))."
+    echo "hub-worktree: refresh: hub $hub_branch is behind $upstream — advancing (fast-forward)…"
+    if ! "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$MAIN_REPO" ff; then
+      exit 1
+    fi
+    echo "✅ hub-worktree: refresh: $MAIN_REPO is now at $upstream ($(git -C "$MAIN_REPO" rev-parse --short HEAD))."
     exit 0
   fi
 
@@ -464,7 +498,7 @@ refresh() {
     done <<< "$local_only"
   }
 
-  echo "hub-worktree: refresh: hub $hub_branch has $count local-only commit(s) not on origin/main:" >&2
+  echo "hub-worktree: refresh: hub $hub_branch has $count local-only commit(s) not on $upstream:" >&2
   print_local_only >&2
 
   # Per-commit content check: a local-only commit "changes files" iff
@@ -491,14 +525,14 @@ refresh() {
     changed_list="$(printf '%s\n' "$changed" | sed '/^$/d' | sort -u)"
     if [[ "${DISCARD_CONTENTLESS:-0}" = "1" ]]; then
       echo "hub-worktree: refresh: REFUSING — --discard-contentless only drops CONTENTLESS commits;" >&2
-      echo "   these local-only commits carry file content that is not on origin/main:" >&2
+      echo "   these local-only commits carry file content that is not on $upstream:" >&2
     else
-      echo "hub-worktree: refresh: REFUSING — advancing $hub_branch to origin/main would DISCARD content" >&2
-      echo "   in these $(printf '%s\n' "$changed_list" | grep -c . || true) file(s), which differ from origin/main:" >&2
+      echo "hub-worktree: refresh: REFUSING — advancing $hub_branch to $upstream would DISCARD content" >&2
+      echo "   in these $(printf '%s\n' "$changed_list" | grep -c . || true) file(s), which differ from the upstream:" >&2
     fi
     printf '%s\n' "$changed_list" | sed 's/^/     /' >&2
     echo "   refresh never discards content. Resolve by hand (push the commits, or" >&2
-    echo "   re-apply the changes on origin/main) — nothing was moved." >&2
+    echo "   re-apply the changes on $upstream) — nothing was moved." >&2
     exit 1
   fi
 
@@ -518,8 +552,10 @@ refresh() {
   echo ""
   echo "hub-worktree: refresh: --discard-contentless given — discarding the contentless local-only commit(s) above:"
   print_local_only
-  "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$MAIN_REPO" discard-contentless
-  echo "✅ hub-worktree: refresh: $MAIN_REPO is now at origin/main ($(git -C "$MAIN_REPO" rev-parse --short HEAD))."
+  if ! "$SCRIPT_DIR/hub-worktree-refresh-advance.sh" "$MAIN_REPO" discard-contentless; then
+    exit 1
+  fi
+  echo "✅ hub-worktree: refresh: $MAIN_REPO is now at $upstream ($(git -C "$MAIN_REPO" rev-parse --short HEAD))."
   exit 0
 }
 

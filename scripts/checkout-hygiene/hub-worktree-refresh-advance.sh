@@ -2,32 +2,47 @@
 # hub-worktree-refresh-advance.sh — INTERNAL sub-script of hub-worktree.sh
 # (refresh mode, #1309). Do NOT call it directly from a hub.
 #
-# Why this file exists (#444), same reason as hub-worktree-salvage-commit.sh:
-# the refresh mode's final move advances the hub's OWN main with
-# `git merge --ff-only` / `git reset --hard`. Both are DESTRUCTIVE verbs in the
-# guard's static walker, and an arg-taking invocation resolves and gates the
-# WHOLE hub-worktree.sh file (#444) — so embedding them in hub-worktree.sh
-# would block that file entirely and break worktree creation for EVERY session.
-# This sub-script is direct-exec'd BY hub-worktree.sh as a nested subprocess
-# (the guard gates the OUTER file's content, not subprocesses) and is the same
-# shape as the exempted `git -C <hub> …` recovery forms. A STANDALONE
-# invocation is content-blocked by the guard itself (its `git -C "$1"
-# merge/reset` is not statically provable safe) — run it only through
+# Why the destructive verbs live HERE and not in hub-worktree.sh: the refresh
+# mode's final move advances the hub's own branch with `git merge --ff-only` /
+# `git reset --hard`, and `hub-worktree.sh` is pinned by the guard's own
+# real-file probe to scriptGitVerdict === "allow" (#444 test.mjs), so a
+# destructive verb in the outer file would redden the guard suite. The outer
+# file is also on the guard's SANCTIONED_SCRIPT_RELPATHS exemption (#1129), but
+# that exemption is realpath-keyed to the framework checkout — a copy of the
+# script at the same relpath in a non-sanctioned checkout is a different
+# realpath and is gated — so the delegation is what keeps every copy of the
+# outer file on the sanctioned surface.
+#
+# Standalone protection is NOT uniform: `hub-worktree.sh` (and so this file,
+# reached through it) is reached as a nested subprocess, which the guard does
+# not walk. A direct `bash <this file> …` from a HUB-rooted session is
+# content-blocked by the script-backdoor walk (its `git -C "$1" merge/reset` is
+# not statically provable safe). From a WORKTREE-rooted session that walk
+# returns early by design (worktree sessions are isolated), so the only
+# protection there is this file's own failsafes — which is why they are
+# self-contained and re-run at the point of mutation. Run it only through
 # hub-worktree.sh refresh.
 #
-# Refresh is the ONE sanctioned way a hub's own branch may move (M4 blocks
-# merge/pull/reset/checkout there). It is safe because the move is bounded at
-# runtime — this file refuses anything that is not a clean, on-main MAIN
-# checkout, and (on the discard path) anything whose tree differs from
-# origin/main.
+# Which upstream: the hub's OWN `origin/<branch>` (never a hardcoded
+# origin/main) — `master` is accepted, and on a repo where both refs exist a
+# hardcoded origin/main would move the wrong branch.
 #
-# Safety (self-contained failsafes): the target must be a MAIN checkout (a
-# linked worktree carries a `.git` FILE, not a directory), on main/master, with
-# an empty porcelain (tracked AND untracked). The `discard-contentless` path
-# additionally re-runs the content-loss check itself — a per-local-only-commit
-# `git show --name-only` scan (empty for an empty commit or a clean merge,
-# non-empty for any real change) — so the sub-script is safe even if the outer
-# caller's analysis is bypassed.
+# The discard path (`reset --hard`) deliberately departs from issue #1144's
+# confirmed rule that only a provable fast-forward may move a shared hub's
+# baseline tip. It is reachable only via the explicit `--discard-contentless`
+# flag, only on a clean on-main hub, and only when every local-only commit is
+# contentless (none changes a file) — so nothing is lost. Recorded on #1309 as
+# an OVERRIDES line.
+#
+# Safety (self-contained failsafes, all re-run at the point of mutation): the
+# target must be a MAIN checkout (a linked worktree carries a `.git` FILE, not
+# a directory), on main/master, with an empty porcelain (tracked AND untracked)
+# read AFTER the fetch, and with no hub-local IGNORED file that the upstream now
+# tracks (that collision would be overwritten by either move). The
+# `discard-contentless` path additionally re-runs the content-loss check — a
+# per-local-only-commit `git show --name-only` scan (empty for an empty commit
+# or a clean merge, non-empty for any real change) — so it is safe even if the
+# outer caller's analysis is bypassed.
 #
 # Usage: hub-worktree-refresh-advance.sh <main-repo> <ff|discard-contentless>
 # Exit: 0 advanced · 1 refusal or git failure. Never discards content: `ff`
@@ -55,9 +70,19 @@ case "$BRANCH" in
   *) echo "hub-worktree-refresh-advance: $MAIN_REPO is on '$BRANCH' (not main/master) — refusing" >&2; exit 1 ;;
 esac
 
-# Dirty (tracked OR untracked) → the salvage case, never this one. Fail CLOSED:
-# a `git status` error must not read as CLEAN (that is the shape where
-# `reset --hard` could discard uncommitted work).
+UPSTREAM="origin/$BRANCH"
+git -C "$MAIN_REPO" fetch origin "$BRANCH" --quiet
+
+if ! git -C "$MAIN_REPO" rev-parse --verify --quiet "$UPSTREAM" >/dev/null; then
+  echo "hub-worktree-refresh-advance: the hub's upstream '$UPSTREAM' does not exist — refusing" >&2
+  exit 1
+fi
+
+# Dirty (tracked OR untracked) → the salvage case, never this one. Read AFTER
+# the fetch, immediately before the mutation, so a concurrent writer during the
+# fetch cannot have its work discarded. Fail CLOSED: a `git status` error must
+# not read as CLEAN (that is the shape where `reset --hard` could discard
+# uncommitted work).
 if ! PORCELAIN="$(git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 -z --untracked-files=all 2>/dev/null | tr '\0' '\n')"; then
   echo "hub-worktree-refresh-advance: could not read the hub status at $MAIN_REPO — refusing" >&2
   exit 1
@@ -67,8 +92,27 @@ if [ -n "$PORCELAIN" ]; then
   exit 1
 fi
 
-echo "hub-worktree: refresh: fetching origin main…"
-git -C "$MAIN_REPO" fetch origin main --quiet
+# Porcelain OMITS ignored files, and BOTH moves will overwrite a hub-local
+# ignored file if the upstream now tracks that path (a hub's .env, typically).
+# `--no-overwrite-ignore` covers the merge, but `git reset` has no such flag,
+# so refuse on a collision before either move.
+if ! IGNORED="$(git -C "$MAIN_REPO" ls-files -z --others --ignored --exclude-standard 2>/dev/null | tr '\0' '\n' | LC_ALL=C sort)"; then
+  echo "hub-worktree-refresh-advance: could not list the hub's ignored files — refusing" >&2
+  exit 1
+fi
+if [ -n "$IGNORED" ]; then
+  if ! TRACKED="$(git -C "$MAIN_REPO" ls-tree -r -z --name-only "$UPSTREAM" 2>/dev/null | tr '\0' '\n' | LC_ALL=C sort)"; then
+    echo "hub-worktree-refresh-advance: could not read the upstream tree — refusing" >&2
+    exit 1
+  fi
+  COLLIDE="$(LC_ALL=C comm -12 <(printf '%s\n' "$IGNORED") <(printf '%s\n' "$TRACKED"))"
+  if [ -n "$COLLIDE" ]; then
+    echo "hub-worktree-refresh-advance: the upstream tracks path(s) this hub IGNORES — the move would overwrite them (and git would not warn):" >&2
+    printf '%s\n' "$COLLIDE" | sed 's/^/     /' >&2
+    echo "   Move the hub-local file(s) aside, or refresh from a human terminal — nothing was moved." >&2
+    exit 1
+  fi
+fi
 
 if [ "$MODE" = "discard-contentless" ]; then
   # Content-loss check, re-run at the point of mutation: the local-only commits
@@ -78,7 +122,7 @@ if [ "$MODE" = "discard-contentless" ]; then
   # conflict-resolution merge.
   # Fail CLOSED on an unreadable range: the here-string masks a `rev-list`
   # failure, so enumerate it explicitly first.
-  if ! LOCAL_ONLY="$(git -C "$MAIN_REPO" rev-list origin/main..HEAD)"; then
+  if ! LOCAL_ONLY="$(git -C "$MAIN_REPO" rev-list "$UPSTREAM..HEAD")"; then
     echo "hub-worktree-refresh-advance: could not enumerate local-only commits — refusing to discard" >&2
     exit 1
   fi
@@ -100,10 +144,16 @@ if [ "$MODE" = "discard-contentless" ]; then
     exit 1
   fi
   echo "hub-worktree: refresh: discarding these contentless local-only commit(s):"
-  git -C "$MAIN_REPO" log --format='     %H  %s' origin/main..HEAD
-  git -C "$MAIN_REPO" reset --hard origin/main
+  git -C "$MAIN_REPO" log --format='     %H  %s' "$UPSTREAM..HEAD"
+  if ! git -C "$MAIN_REPO" reset --hard "$UPSTREAM"; then
+    echo "hub-worktree-refresh-advance: the reset to $UPSTREAM failed — refusing" >&2
+    exit 1
+  fi
 else
-  git -C "$MAIN_REPO" merge --ff-only origin/main
+  if ! git -C "$MAIN_REPO" merge --ff-only --no-overwrite-ignore "$UPSTREAM"; then
+    echo "hub-worktree-refresh-advance: the fast-forward to $UPSTREAM failed (the hub is not a fast-forward of it, or the move would overwrite an ignored file) — refusing" >&2
+    exit 1
+  fi
 fi
 
-echo "hub-worktree: refresh: $BRANCH is now at $(git -C "$MAIN_REPO" rev-parse --short HEAD) (origin/main)."
+echo "hub-worktree: refresh: $BRANCH is now at $(git -C "$MAIN_REPO" rev-parse --short HEAD) ($UPSTREAM)."
