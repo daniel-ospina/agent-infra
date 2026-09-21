@@ -379,12 +379,17 @@ has_live_child() {
 }
 
 # ── gate 3: candidate-ancestry (#1207) — ADDITIVE (refuses only) ───────
-# Recorded decision (option A): the FIRST RECOGNISED HOST APP anywhere in a
-# candidate's chain decides, NOT the chain's root (every chain on this box
-# roots at /sbin/launchd, so a root test answers `launchd` for a human's
-# terminal and for a fleet lane alike) and NOT the presence of a login shell
-# (cmux spawns `/usr/bin/login -flp …` per pane, so that clause matches every
-# lane and would make the gate refuse everything indiscriminately).
+# Recorded decision (option A): a candidate's chain is classified by its
+# recognised host app with HUMAN-TERMINAL DOMINANCE — if ANY node on the walk
+# is a human terminal the class is `human-terminal`, and a cmux node classifies
+# the chain as `cmux-rooted` only when NO human terminal is present anywhere on
+# the walk. That is what makes the recorded rule ("any Terminal.app/iTerm"
+# ancestor ⇒ human ⇒ never signal") literally true: a nearer recognised name
+# must never mask a human ancestor. It is NOT the chain's root (every chain on
+# this box roots at /sbin/launchd, so a root test answers `launchd` for a
+# human's terminal and for a fleet lane alike) and NOT the presence of a login
+# shell (cmux spawns `/usr/bin/login -flp …` per pane, so that clause matches
+# every lane and would make the gate refuse everything indiscriminately).
 #
 # The chain walk is precomputed ONCE per pass into HOST_MAP ("pid class"), the
 # same shape and rationale as DESC_MAP: a per-candidate awk walk over the full
@@ -402,10 +407,14 @@ import sys
 
 ps_table, out_path = sys.argv[1], sys.argv[2]
 
-# Recognised host applications. The first one found walking UP from the
-# candidate decides the class. `Terminal.app`/`iTerm.app` are app-bundle
-# components; the bare names cover a PATH-less or relocated binary. A host app
-# is matched by its own argv[0] (executable) only — matching the whole
+# Recognised host applications. The walk up from the candidate scans the WHOLE
+# chain and classifies it with human-terminal DOMINANCE: any human terminal on
+# the walk wins (a nearer cmux node must not mask a human ancestor — that is
+# what makes "no chain that REACHES a human terminal can ever be signalled"
+# true); a cmux node decides `cmux` only when no human terminal is present
+# anywhere on the walk; otherwise `unknown`. `Terminal.app`/`iTerm.app` are
+# app-bundle components; the bare names cover a PATH-less or relocated binary. A
+# host app is matched by its own argv[0] (executable) only — matching the whole
 # command line would let an argument mention (e.g. a script that quotes
 # `Terminal.app`) masquerade as a host.
 HUMAN_NAMES = {"Terminal", "iTerm", "iTerm2"}
@@ -449,19 +458,28 @@ for ln in open(ps_table, encoding="utf-8", errors="replace"):
 
 
 def chain_class(pid):
-    """FIRST recognised host app anywhere in the chain, else `unknown`."""
+    """Chain class with human-terminal DOMINANCE, else `unknown`.
+
+    A human terminal ANYWHERE on the walk wins outright; `cmux` is returned
+    only when no human terminal was seen; otherwise `unknown`. Never stop at
+    the first recognised name: the nearer name could be cmux while the chain
+    still reaches the owner's terminal above it.
+    """
     cur, hops, seen = pid, 0, set()
+    saw_cmux = False
     while cur > 0 and cur not in seen and hops < 256:
         seen.add(cur)
         cls = classify(argv0.get(cur, ""))
-        if cls:
-            return cls
+        if cls == "human-terminal":
+            return "human-terminal"
+        if cls == "cmux":
+            saw_cmux = True
         nxt = ppid.get(cur)
         if nxt is None or nxt == cur:
             break
         cur = nxt
         hops += 1
-    return "unknown"
+    return "cmux" if saw_cmux else "unknown"
 
 
 with open(out_path, "w", encoding="utf-8") as out:
@@ -1430,13 +1448,16 @@ run() {
     # attributed to gate 3. `allowed` is non-zero only when the mutation is
     # present (the suite's RED control), hence the conditional wording — and the
     # zero-harvest sentence additionally requires a NON-EMPTY census
-    # (GATE3_REFUSED_TOTAL > 0): a pass where every candidate was excluded
-    # before the census is a zero gate 3 never produced and must not claim.
+    # (GATE3_REFUSED_TOTAL > 0) AND a non-zero SUPPRESSION count
+    # (GATE3_SUPPRESSED > 0): a pass where every candidate was excluded before
+    # the census is a zero gate 3 never produced, and a census that classified a
+    # candidate but refused none at an eligibility site is a zero ANOTHER gate
+    # produced — neither may be attributed to gate 3.
     if [ "$pre_count" -gt 0 ]; then
         say ""
         say "GATE 3 (candidate-ancestry): classified $((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) live candidate(s) — human-terminal=${GATE3_REFUSED_HUMAN}, cmux-rooted=${GATE3_REFUSED_CMUX}, unknown/unresolvable=${GATE3_REFUSED_UNKNOWN}, allowed=${GATE3_ALLOWED}."
         say "   → suppressed at an eligibility site: ${GATE3_SUPPRESSED} (0 means every candidate was already excluded by another gate; a refusal recorded here is one that changed the pass's outcome)."
-        if [ "$GATE3_ALLOWED" -eq 0 ] && [ "$GATE3_REFUSED_TOTAL" -gt 0 ]; then
+        if [ "$GATE3_ALLOWED" -eq 0 ] && [ "$GATE3_REFUSED_TOTAL" -gt 0 ] && [ "$GATE3_SUPPRESSED" -gt 0 ]; then
             say "   → no chain class is authorized, so the harvest for this population is ZERO BY DECISION, not by fault: the recorded rule keeps every class report-only because cmux is the fleet's own workspace host and nothing on this box records who spawned a pane, so the owner's own interactive pane is indistinguishable from a fleet lane. Gate 3 can only refuse — it never authorizes a signal."
         fi
         log "GATE3 classified=$((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) human=$GATE3_REFUSED_HUMAN cmux=$GATE3_REFUSED_CMUX unknown=$GATE3_REFUSED_UNKNOWN allowed=$GATE3_ALLOWED suppressed=$GATE3_SUPPRESSED"

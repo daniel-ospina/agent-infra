@@ -40,11 +40,14 @@
 #           walk; E9/E9b a host name in an ARGUMENT is never the class, in
 #           either direction; E10 an app-bundle helper whose basename is
 #           outside the name set is recognised via its `iTerm.app` path
-#           component; E11 the FIRST recognised host app decides (a deeper
-#           human host does not outrank a nearer cmux); E12 the STUCK
+#           component; E11 human-terminal DOMINANCE (a chain reaching a human
+#           host is human-terminal however near a cmux node sits, and is still
+#           refused under the relaxed copy — E11b); E12 the STUCK
 #           authorization site is refused and counted too; E13 the
 #           zero-harvest sentence is not attributed to gate 3 when gate 3
-#           classified nothing.
+#           classified nothing; E13b the same sentence is withheld when gate 3
+#           classified a candidate but suppressed nothing (another gate
+#           produced the zero).
 #
 # ── the gate-3-relaxed SCENARIO COPY (#1207) ──────────────────────────
 # Under the recorded decision gate 3 refuses EVERY chain class, so the
@@ -1954,9 +1957,12 @@ assert_not_contains "$OUT" "gate3=unknown" "E10 the bundle component is what rec
     || bad "E10 zero signals for the iTerm bundle chain"
 rm -rf "$T/E/sessions"
 
-# E11: FIRST recognised host app wins. A cmux node BELOW a Terminal node means
-# the candidate is cmux-rooted; a "human anywhere in the chain wins" mutation
-# would answer human-terminal here and reverse option A's direction.
+# E11: human-terminal DOMINANCE. A cmux node nearer the candidate does not
+# mask the Terminal node ABOVE it: the chain REACHES a human terminal, so it is
+# human-terminal and refused on that ground. E11b is the load-bearing pin —
+# under the relaxed scenario copy (the cmux arm ALLOWS) the chain is STILL
+# refused and signalled nothing, so "no chain that reaches a human terminal can
+# ever be signalled" goes RED if the class regresses to nearest-wins.
 printf '%s\n' \
     "$(psrow 21012 400020 21012 ttys511 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/e11")" \
     "$(psrow 400020 400021 400020 '??' "Thu Sep  3 20:00:00 2026" S 0 "/Applications/cmux.app/Contents/MacOS/cmux")" \
@@ -1966,12 +1972,26 @@ printf '{"e11":{"pid":21012,"pidStartSeconds":%s,"agentLifecycle":"idle","runtim
 session_jsonl E /Users/t/e11 e11 "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
 : > "$T/E/kill.log"; : > "$T/E/reap.log"
 OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper_real E --apply 2>&1)"
-assert_contains "$OUT" "REPORT-ONLY gate3=cmux" \
-    "E11 the FIRST recognised host app decides (cmux nearer than the Terminal above it)"
-assert_not_contains "$OUT" "gate3=human-terminal" \
-    "E11 a deeper human host does not outrank the nearer cmux"
-[ ! -s "$T/E/kill.log" ] && ok "E11 zero signals on the cmux-rooted chain" \
-    || bad "E11 zero signals on the cmux-rooted chain"
+assert_contains "$OUT" "REPORT-ONLY gate3=human-terminal" \
+    "E11 a chain REACHING a human terminal is human-terminal (dominance, not nearest)"
+assert_not_contains "$OUT" "gate3=cmux" \
+    "E11 a nearer cmux node does not mask the human ancestor"
+[ ! -s "$T/E/kill.log" ] && ok "E11 zero signals on the mixed chain (shipped script)" \
+    || bad "E11 zero signals on the mixed chain (shipped script)"
+assert_contains "$(cat "$T/E/reap.log")" "GATE3_CLASSED=1 GATE3_HUMAN=1 GATE3_CMUX=0 GATE3_UNKNOWN=0 GATE3_ALLOWED=0 GATE3_SUPPRESSED=1" \
+    "E11 footer attributes the census to the human-terminal ground"
+# E11b: the SAME fixture on the relaxed copy, where the cmux arm ALLOWS. Only
+# human-terminal dominance can refuse it here, so this is the assertion that
+# fails if the class regresses to nearest-wins. The session is kept on disk
+# (E11's rm is below) so the candidate would really be eligible on the mutant.
+: > "$T/E/kill.log"; : > "$T/E/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper E --apply 2>&1)"
+assert_contains "$OUT" "REPORT-ONLY gate3=human-terminal" \
+    "E11b under the RELAXED copy the mixed chain is still classified human-terminal"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" \
+    "E11b no chain reaching a human terminal can ever be signalled (relaxed copy)"
+[ ! -s "$T/E/kill.log" ] && ok "E11b zero signals on the mixed chain under the relaxed copy" \
+    || bad "E11b zero signals on the mixed chain under the relaxed copy"
 rm -rf "$T/E/sessions"
 
 # E12 (T1, second authorization site): an ARMED STUCK candidate on the REAL
@@ -2013,6 +2033,26 @@ assert_not_contains "$OUT" "ZERO BY DECISION" \
     "E13 the zero-harvest sentence is not attributed to gate 3 when it classified nothing"
 assert_contains "$(cat "$T/E/reap.log")" "GATE3_CLASSED=0 GATE3_HUMAN=0 GATE3_CMUX=0 GATE3_UNKNOWN=0 GATE3_ALLOWED=0 GATE3_SUPPRESSED=0" \
     "E13 footer records an empty census"
+rm -rf "$T/E/sessions"
+
+# E13b: the OTHER half of the same rule. Gate 3 classifies a candidate but
+# REFUSES none at an eligibility site (the cmux allowlist vetoes it first), so
+# GATE3_SUPPRESSED=0 and gate 3 did not produce the zero harvest — the sentence
+# that attributes a zero to the recorded decision must be withheld, exactly as
+# it is when the census is empty (E13).
+printf '%s\n' \
+    "$(psrow 21015 400000 21015 ttys515 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/e13b")" \
+    > "$T/E/ps-source"
+printf '{"e13b":{"pid":21015,"pidStartSeconds":%s,"agentLifecycle":"running","runtimeStatus":"running","updatedAt":%s,"cwd":"/Users/t/e13b"}}' "$E_SEP3_2000" "$E_SEP5_0100" | cmux_store E
+session_jsonl E /Users/t/e13b e13b "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+: > "$T/E/kill.log"; : > "$T/E/reap.log"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper_real E --dry-run 2>&1)"
+assert_contains "$OUT" "suppressed at an eligibility site: 0" \
+    "E13b the suppression line reads 0 (another gate produced the zero)"
+assert_not_contains "$OUT" "ZERO BY DECISION" \
+    "E13b the zero-harvest sentence is withheld when gate 3 suppressed nothing"
+assert_contains "$(cat "$T/E/reap.log")" "GATE3_CLASSED=1 GATE3_HUMAN=0 GATE3_CMUX=1 GATE3_UNKNOWN=0 GATE3_ALLOWED=0 GATE3_SUPPRESSED=0" \
+    "E13b footer: classified 1, suppressed 0"
 rm -rf "$T/E/sessions"
 
 rm -rf "$T/E"
