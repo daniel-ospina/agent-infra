@@ -335,40 +335,98 @@ echo "    scripts lib farm: $lib_copied copied (pid-identity.sh, #1178)"
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
 # (templates/launchd/com.eldato.lane-liveness.plist) runs
-# $DEST/tools/fleet/lane_liveness.py under launchd. That driver imports its
-# sibling classifier ($DEST/tools/fleet/liveness.py) and forks the shared
+# $DEST/scripts/fleet/lane_liveness.py under launchd. That driver imports its
+# sibling classifier ($DEST/scripts/fleet/liveness.py) and forks the shared
 # identity library (scripts/lib/pid-identity.sh, farmed above in the #1178 lib
 # farm); launchd cannot read ~/Documents (#427), so these are COPIED, not
-# symlinked. The farm preserves the tools/fleet/ <-> scripts/lib/ relative
-# positions so liveness.lib_path() (<here>/../../scripts/lib/pid-identity.sh)
-# resolves to the FARMED library under ~/.pi/agent and never to the repo — the
-# plist pins PI_PID_IDENTITY_LIB as well, but the layout is what makes the
-# relative fallback safe. A missing classifier is a loud exit 2 in the driver,
-# never a silent "no lanes". Same idempotent real-copy refresh model as above.
+# symlinked. A missing classifier is a loud exit 2 in the driver, never a
+# silent "no lanes". Same idempotent real-copy refresh model as above.
+#
+# WHY scripts/fleet/ AND NOT tools/fleet/ (#1277): the installed pi package's
+# startup migration (dist/migrations.js checkDeprecatedExtensionDirs) scans
+# ~/.pi/agent/tools/ and treats ANY entry other than fd/rg/fd.exe/rg.exe as a
+# legacy "custom tools" directory (hidden files ignored). On a hit it prints a
+# deprecation notice and then BLOCKS in showDeprecationWarnings() — an
+# untimed `stdin.once("data")` keypress wait with no end/error handler. Farming
+# the fleet tools there made EVERY fresh interactive `pi` hang forever at
+# "Press any key to continue...", which is the fleet's entire dispatch path
+# (every lane is an interactive pi). scripts/fleet/ is outside that scan.
+#
+# The relative resolution the driver relies on is preserved: liveness.lib_path()
+# resolves <here>/../../scripts/lib/pid-identity.sh, which at
+# $DEST/scripts/fleet/ is exactly $DEST/scripts/lib/pid-identity.sh — the same
+# FARMED library the plist pins as PI_PID_IDENTITY_LIB. The farmed fleet/ now
+# sits visibly beside the farmed lib/, so the layout no longer merely coincides
+# with the pin. The plist still pins the env var, but the layout is what makes
+# the relative fallback safe.
 # fleet-health.py and map-sessions.py joined this farm in #1178 unit 4: both lived
 # ONLY as untracked files in ~/.pi/agent/state/, so one disk loss took the recovery
 # primitive (map-sessions.py identifies every session by its FIRST USER MESSAGE —
 # how a lane holding an issue is found) and the only untracked tool that computed
 # `PID DEAD` from its own private rule (fleet-health.py; the fleet's shared verdict
-# lives in tools/fleet/liveness.py, farmed just above). fleet-health.py must sit
-# BESIDE liveness.py: it imports that sibling classifier for the identity probe, and
+# lives in tools/fleet/liveness.py, farmed just above — the REPO path; only the
+# farmed destination is scripts/fleet/). fleet-health.py must sit BESIDE
+# liveness.py: it imports that sibling classifier for the identity probe, and
 # that classifier resolves the rule from the sibling scripts/lib/ above.
 fleet_tools=(liveness.py lane_liveness.py fleet-health.py map-sessions.py)
-mkdir -p "$DEST/tools/fleet"
+mkdir -p "$DEST/scripts/fleet"
 tools_copied=0
 for base in "${fleet_tools[@]}"; do
   f="$INFRA_ROOT/tools/fleet/$base"
   [ -f "$f" ] || continue
-  dest="$DEST/tools/fleet/$base"
+  dest="$DEST/scripts/fleet/$base"
   if [ -L "$dest" ]; then
-    echo "    replacing farm symlink with real copy: tools/fleet/$base"
+    echo "    replacing farm symlink with real copy: scripts/fleet/$base"
     rm -f "$dest"
   fi
   cp -f "$f" "$dest"
   chmod +x "$dest" 2>/dev/null || true
   tools_copied=$((tools_copied+1))
 done
-echo "    tools/fleet farm: $tools_copied copied (lane-liveness + fleet-health + map-sessions, #1178)"
+echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + fleet-health + map-sessions, #1178)"
+
+# Migration off the deprecated location (#1277). The farm used to write
+# $DEST/tools/fleet/, one of the very paths pi's startup scan rejects — so a
+# machine that already has it keeps hanging on every interactive boot until the
+# directory is GONE. Copying to the new path is not enough; remove the old one.
+# Never touch $DEST/tools/fd or $DEST/tools/rg (pi auto-extracts those binaries
+# there and they are the one entry the scan permits): remove only fleet/, then
+# remove tools/ itself only when the removal left it empty.
+if [ -d "$DEST/tools/fleet" ]; then
+  rm -rf "$DEST/tools/fleet"
+  echo "    migrated fleet farm out of the deprecated tools/fleet/ (pi boot-blocker)"
+fi
+if [ -d "$DEST/tools" ] && [ -z "$(ls -A "$DEST/tools" 2>/dev/null)" ]; then
+  if rmdir "$DEST/tools" 2>/dev/null; then
+    echo "    removed now-empty $DEST/tools/"
+  fi
+fi
+
+# Regression guard (#1277): the farm must NEVER leave a non-fd/rg entry in
+# $DEST/tools/. pi's startup scan blocks interactive boot on one (see the
+# WHY comment above), and a local workaround is not durable — this farm
+# re-creates whatever it is told to, within minutes. Fail LOUD here instead of
+# shipping a machine on which no interactive pi can start: this is the durable
+# fix; farming to scripts/fleet/ is the immediate one.
+if [ -d "$DEST/tools" ]; then
+  tools_stray=""
+  tools_entry=""
+  while IFS= read -r tools_entry; do
+    [ -n "$tools_entry" ] || continue
+    case "$(printf '%s' "$tools_entry" | tr '[:upper:]' '[:lower:]')" in
+      fd|rg|fd.exe|rg.exe) ;;   # pi's own auto-extracted binaries — permitted
+      .*) ;;                    # hidden entries (.DS_Store etc.) — pi ignores them
+      *) tools_stray="$tools_stray $tools_entry" ;;
+    esac
+  done <<< "$(ls -A "$DEST/tools" 2>/dev/null)"
+  if [ -n "$tools_stray" ]; then
+    echo "ERROR: $DEST/tools/ contains non-fd/rg entries:$tools_stray" >&2
+    echo "       pi's startup scan blocks EVERY interactive boot on these" >&2
+    echo "       (deprecation notice + an untimed keypress prompt)." >&2
+    echo "       Fleet tools belong in $DEST/scripts/fleet/, never tools/." >&2
+    exit 1
+  fi
+fi
 
 # Merge-gate scripts farm (#562): record-review.sh — the review-enforcer's
 # merge-registry writer (issue #138).

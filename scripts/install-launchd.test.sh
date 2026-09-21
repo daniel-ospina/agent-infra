@@ -110,13 +110,14 @@ mkfakehome() { # $1 = home dir
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
     # #1178 unit 3 — the scheduled lane-liveness report runs the FARMED tools:
-    # the driver + its sibling classifier under tools/fleet/ (the broken-target
-    # guard refuses the install when they are absent).
-    mkdir -p "$1/.pi/agent/tools/fleet"
-    touch "$1/.pi/agent/tools/fleet/lane_liveness.py"
-    touch "$1/.pi/agent/tools/fleet/liveness.py"
-    chmod +x "$1/.pi/agent/tools/fleet/lane_liveness.py"
-    chmod +x "$1/.pi/agent/tools/fleet/liveness.py"
+    # the driver + its sibling classifier under scripts/fleet/ (the broken-target
+    # guard refuses the install when they are absent). NOT tools/fleet/: pi's
+    # startup scan blocks interactive boot on any non-fd/rg entry there (#1277).
+    mkdir -p "$1/.pi/agent/scripts/fleet"
+    touch "$1/.pi/agent/scripts/fleet/lane_liveness.py"
+    touch "$1/.pi/agent/scripts/fleet/liveness.py"
+    chmod +x "$1/.pi/agent/scripts/fleet/lane_liveness.py"
+    chmod +x "$1/.pi/agent/scripts/fleet/liveness.py"
     mkdir -p "$1/swarm/.venv/bin"
     touch "$1/swarm/.venv/bin/python"
     chmod +x "$1/swarm/.venv/bin/python"
@@ -217,9 +218,12 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interv
 assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
 # #1178 unit 3 — lane-liveness rendered-plist content asserts (farmed tools path,
-# the PINNED probe library, and the interval schedule).
+# the PINNED probe library, and the interval schedule). #1277: the farmed path is
+# scripts/fleet/, never tools/fleet/ (pi's startup scan blocks interactive boot on
+# any non-fd/rg entry in tools/).
 LANE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.lane-liveness.plist"
-assert_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/tools/fleet/lane_liveness.py" "lane-liveness plist rendered with fake HOME (farmed tools path)"
+assert_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/scripts/fleet/lane_liveness.py" "lane-liveness plist rendered with fake HOME (farmed scripts/fleet path, #1277)"
+assert_not_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/tools/fleet/lane_liveness.py" "lane-liveness plist does NOT point at the deprecated tools/fleet/ (#1277)"
 assert_contains "$(cat "$LANE_INSTALLED")" "PI_PID_IDENTITY_LIB" "lane-liveness plist pins the shared identity library"
 assert_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/scripts/lib/pid-identity.sh" "lane-liveness plist pins the FARMED library (never ~/Documents)"
 assert_contains "$(cat "$LANE_INSTALLED")" "python3" "lane-liveness plist runs the python driver"

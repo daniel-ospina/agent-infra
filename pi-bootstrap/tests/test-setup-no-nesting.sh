@@ -184,19 +184,23 @@ check_identity_lib_farmed() {
 }
 
 # #1178 unit 3 — fleet-tools farm: the scheduled lane-liveness report driver
-# (tools/fleet/lane_liveness.py) and its sibling classifier
-# (tools/fleet/liveness.py) must land under $DEST/tools/fleet/, byte-identical to
-# the repo copies, in the layout that makes liveness.lib_path() resolve to the
-# FARMED library (tools/fleet/ <-> scripts/lib/ preserved). Farming the driver
+# (tools/fleet/lane_liveness.py in the REPO) and its sibling classifier
+# (tools/fleet/liveness.py) must land under $DEST/scripts/fleet/, byte-identical
+# to the repo copies, in the layout that makes liveness.lib_path() resolve to the
+# FARMED library (scripts/fleet/ <-> scripts/lib/ preserved). Farming the driver
 # without the classifier is the driver's loud exit-2 "cannot import" abort on
 # every 30-minute pass; farming either into a repo symlink is the #427 TCC
 # failure (launchd cannot read ~/Documents).
+#
+# #1277: the farmed destination is scripts/fleet/, NEVER tools/fleet/. Repo
+# copies stay in the repo's tools/fleet/ (pi's scan only looks at
+# ~/.pi/agent/tools/) — do not rename the source directory.
 check_fleet_tools_farmed() {
   local label="$1"
-  local driver="$DEST/tools/fleet/lane_liveness.py"
-  local classifier="$DEST/tools/fleet/liveness.py"
+  local driver="$DEST/scripts/fleet/lane_liveness.py"
+  local classifier="$DEST/scripts/fleet/liveness.py"
   [ -f "$driver" ] \
-    || { fail "$label: lane_liveness.py not farmed into tools/fleet/ (#1178 unit 3 farm missing)"; return; }
+    || { fail "$label: lane_liveness.py not farmed into scripts/fleet/ (#1178 unit 3 farm missing)"; return; }
   [ -f "$classifier" ] \
     || { fail "$label: liveness.py not farmed beside the driver (the import would exit 2)"; return; }
   if diff -q "$ROOT/tools/fleet/lane_liveness.py" "$driver" >/dev/null 2>&1; then
@@ -211,12 +215,12 @@ check_fleet_tools_farmed() {
   fi
   # #1178 unit 4 — the two tools that lived ONLY as untracked files in
   # ~/.pi/agent/state/: the recovery primitive and the dead-lane reader.
-  if diff -q "$ROOT/tools/fleet/fleet-health.py" "$DEST/tools/fleet/fleet-health.py" >/dev/null 2>&1; then
+  if diff -q "$ROOT/tools/fleet/fleet-health.py" "$DEST/scripts/fleet/fleet-health.py" >/dev/null 2>&1; then
     echo "ok: $label farmed fleet-health.py == repo copy (#1178 unit 4)"
   else
     fail "$label: farmed fleet-health.py differs from (or is missing vs) tools/fleet/fleet-health.py"
   fi
-  if diff -q "$ROOT/tools/fleet/map-sessions.py" "$DEST/tools/fleet/map-sessions.py" >/dev/null 2>&1; then
+  if diff -q "$ROOT/tools/fleet/map-sessions.py" "$DEST/scripts/fleet/map-sessions.py" >/dev/null 2>&1; then
     echo "ok: $label farmed map-sessions.py == repo copy (#1178 unit 4)"
   else
     fail "$label: farmed map-sessions.py differs from (or is missing vs) tools/fleet/map-sessions.py"
@@ -233,6 +237,46 @@ check_fleet_tools_farmed() {
     echo "ok: $label farmed driver imports its classifier (--help rc=0)"
   else
     fail "$label: farmed lane-liveness driver failed to start (rc=$rc): $(head -1 <<<"$out")"
+  fi
+}
+
+# #1277 — the DURABLE regression guard. pi's startup scan
+# (dist/migrations.js checkDeprecatedExtensionDirs) treats ANY entry in
+# ~/.pi/agent/tools/ other than fd/rg/fd.exe/rg.exe as a legacy "custom tools"
+# directory. On a hit it prints a deprecation notice and then BLOCKS in an
+# untimed keypress wait (showDeprecationWarnings: stdin.once("data") with no
+# timeout and no end/error handler) — so one stray entry there hangs EVERY
+# fresh interactive pi boot, which is the entire fleet's dispatch path. This
+# asserts the FINAL state independently of setup.sh's own guard, so removing
+# that guard still leaves the regression caught.
+check_tools_dir_clean() {
+  local label="$1" stray="" entry
+  [ -d "$DEST/tools" ] \
+    || { echo "ok: $label no $DEST/tools/ at all (nothing for pi's scan to reject)"; return; }
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$(printf '%s' "$entry" | tr '[:upper:]' '[:lower:]')" in
+      fd|rg|fd.exe|rg.exe) ;;   # pi's own auto-extracted binaries — permitted
+      .*) ;;                    # hidden entries are ignored by pi's check too
+      *) stray="$stray $entry" ;;
+    esac
+  done <<< "$(ls -A "$DEST/tools" 2>/dev/null)"
+  if [ -n "$stray" ]; then
+    fail "$label: $DEST/tools/ has non-fd/rg entries:$stray — pi blocks interactive boot on these (#1277)"
+  else
+    echo "ok: $label \$DEST/tools/ has no non-fd/rg entry (pi's startup scan stays quiet)"
+  fi
+}
+
+# #1277 migration — a machine that ALREADY has the deprecated farm must end up
+# without it, or the freeze persists (the farm re-created the directory within
+# minutes of a local workaround, which is why the repo had to change).
+check_legacy_tools_farm_removed() {
+  local label="$1"
+  if [ -e "$DEST/tools/fleet" ]; then
+    fail "$label: deprecated $DEST/tools/fleet/ still present (the pi boot-blocker survives the migration)"
+  else
+    echo "ok: $label deprecated tools/fleet/ is gone (#1277 migration)"
   fi
 }
 
@@ -258,11 +302,11 @@ check_fleet_tools_farmed() {
 #     lists any suspect the ladder found.
 #
 # The positive legs are HERMETIC about the environment (see `run_promotion`), so a
-# green pin also proves the tools/fleet/ <-> scripts/lib/ RELATIVE layout survived
+# green pin also proves the scripts/fleet/ <-> scripts/lib/ RELATIVE layout survived
 # the farm: move the farmed library and they degrade to `PID ? (unreadable)`.
 check_fleet_health_promotion() {
   local label="$1"
-  local tool="$DEST/tools/fleet/fleet-health.py"
+  local tool="$DEST/scripts/fleet/fleet-health.py"
   local lib="$DEST/scripts/lib/pid-identity.sh"
   local phome="$TMP/prom-home"
   local sid="01a08ca6-3539-71ed-a0d7-7cee52feee03"   # lane B1 (the LANES hardcode)
@@ -311,7 +355,7 @@ time.sleep(60)' "$zpid_file" &
   }
   # run_promotion [NAME=value ...] — HERMETIC by construction. PI_PID_IDENTITY_LIB,
   # PS_BIN and DATE_BIN are UNSET so the tool must resolve the FARMED library by
-  # RELATIVE position (tools/fleet/ <-> scripts/lib/): liveness.lib_path() prefers the
+  # RELATIVE position (scripts/fleet/ <-> scripts/lib/): liveness.lib_path() prefers the
   # env var, so an exported value (the lane-liveness plist pins it) would silently
   # replace the farmed library and make the whole layout pin vacuous. Extra NAME=value
   # arguments are applied on top — leg (d) uses that for its explicit override.
@@ -442,6 +486,18 @@ run_setup() {
   bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1
 }
 
+# #1277 — a setup run that is EXPECTED to be refused by the tools/ guard. The
+# log header deliberately does NOT match '^---- setup.sh run', so it stays out
+# of the #446 setup-run count (a guard-refused run never reaches
+# install-launchd and so never prints the temp-HOME refusal). Prints the exit
+# code on stdout for the caller to assert on.
+run_setup_expect_guard_fail() {
+  echo "---- guard probe: setup.sh with a stray \$DEST/tools/ entry (HOME=$HOME_DIR) ----" >> "$RUNS_LOG"
+  local rc=0
+  bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1 || rc=$?
+  echo "$rc"
+}
+
 # --- run 1: fresh install -------------------------------------------------
 echo "== run 1: fresh install"
 run_setup
@@ -487,8 +543,70 @@ grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG"
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
 grep -q "scripts lib farm: 1 copied (pid-identity.sh, #1178)" "$RUNS_LOG" \
   || fail "run 1 did not report the shared-library farm copy (#1178)"
-grep -q "tools/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
+grep -q "scripts/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
   || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
+check_tools_dir_clean "run1-final"
+
+# --- run 1b: #1277 legacy migration + durable regression guard -----------------
+# The defect: the farm used to write $DEST/tools/fleet/, which is pi's RETIRED
+# custom-tools namespace. pi's startup scan rejects ANY non-fd/rg entry there and
+# then waits for a keypress with no timeout, so a farmed host cannot boot an
+# interactive pi at all — and the farm re-created the directory within minutes,
+# so a machine-local workaround was not durable. Both halves are pinned here:
+# the migration that REMOVES a pre-existing legacy farm, and the guard that makes
+# the farm FAIL LOUD rather than recreate one.
+echo "== run 1b: legacy tools/fleet migration + tools/ regression guard (#1277)"
+mkdir -p "$DEST/tools/fleet"
+for f in lane_liveness.py liveness.py fleet-health.py map-sessions.py; do
+  echo "# legacy farm replica (the pi boot-blocker)" > "$DEST/tools/fleet/$f"
+done
+if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then
+  echo "ok: legacy tools/fleet/ fixture staged"
+else
+  fail "legacy tools/fleet/ fixture was not staged — the migration cannot be tested"
+fi
+run_setup
+check_legacy_tools_farm_removed "run1b"
+check_tools_dir_clean "run1b"
+if [ -d "$DEST/tools" ]; then
+  fail "legacy run left $DEST/tools/ behind (it was empty after fleet/ was removed)"
+else
+  echo "ok: empty \$DEST/tools/ removed once the legacy farm was migrated out (#1277)"
+fi
+check_fleet_tools_farmed "run1b"
+
+# The guard must FAIL, not warn, when a non-fd/rg entry reappears — the exact
+# re-introduction path the farm itself took. fd/rg stay permitted (pi extracts
+# those binaries there), so the stray is a differently-named file.
+mkdir -p "$DEST/tools"
+echo "# a re-introduced non-pi tool" > "$DEST/tools/custom-fleet-tool.py"
+guard_rc="$(run_setup_expect_guard_fail)"
+if [ "$guard_rc" -ne 0 ]; then
+  echo "ok: setup.sh exits $guard_rc on a non-fd/rg entry in \$DEST/tools/ (#1277 guard)"
+else
+  fail "setup.sh exited 0 with a stray entry in \$DEST/tools/ — the guard does not fail on re-introduction"
+fi
+if grep -q "non-fd/rg entries" "$RUNS_LOG"; then
+  echo "ok: the guard names the non-fd/rg entry and refuses (#1277)"
+else
+  fail "the guard did not name the non-fd/rg entry in its output"
+fi
+if grep -q "custom-fleet-tool.py" "$RUNS_LOG"; then
+  echo "ok: the guard names the offending entry"
+else
+  fail "the guard did not name the offending entry (custom-fleet-tool.py)"
+fi
+# fd/rg alone must NOT trip the guard, and must survive the migration.
+rm -f "$DEST/tools/custom-fleet-tool.py"
+for b in fd rg; do echo '#!/bin/sh' > "$DEST/tools/$b"; done
+run_setup
+check_tools_dir_clean "run1b-fd-rg"
+if [ -f "$DEST/tools/fd" ] && [ -f "$DEST/tools/rg" ]; then
+  echo "ok: fd/rg alone keep \$DEST/tools/ intact and the guard silent (pi's own binaries survive)"
+else
+  fail "fd/rg were removed from \$DEST/tools/ — the migration must touch fleet/ only"
+fi
+rm -rf "$DEST/tools"
 
 # --- run 2: re-run must refresh the ACTIVE files --------------------------
 # (a) a dest mutation must be overwritten by the source (content-merge);
@@ -499,17 +617,17 @@ echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm r
 if [ -f "$DEST/scripts/lib/pid-identity.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/lib/pid-identity.sh"  # #1178 farm refresh
 fi
-if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then
-  echo "# stale farm mutation" >> "$DEST/tools/fleet/lane_liveness.py"   # #1178 unit 3 farm refresh
+if [ -f "$DEST/scripts/fleet/lane_liveness.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/fleet/lane_liveness.py"   # #1178 unit 3 farm refresh
 fi
-if [ -f "$DEST/tools/fleet/liveness.py" ]; then
-  echo "# stale farm mutation" >> "$DEST/tools/fleet/liveness.py"        # #1178 unit 3 farm refresh
+if [ -f "$DEST/scripts/fleet/liveness.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/fleet/liveness.py"        # #1178 unit 3 farm refresh
 fi
-if [ -f "$DEST/tools/fleet/fleet-health.py" ]; then
-  echo "# stale farm mutation" >> "$DEST/tools/fleet/fleet-health.py"     # #1178 unit 4 farm refresh
+if [ -f "$DEST/scripts/fleet/fleet-health.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/fleet/fleet-health.py"     # #1178 unit 4 farm refresh
 fi
-if [ -f "$DEST/tools/fleet/map-sessions.py" ]; then
-  echo "# stale farm mutation" >> "$DEST/tools/fleet/map-sessions.py"     # #1178 unit 4 farm refresh
+if [ -f "$DEST/scripts/fleet/map-sessions.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/fleet/map-sessions.py"     # #1178 unit 4 farm refresh
 fi
 SRC_MARKER="$ROOT/pi-bootstrap/pi-config/agents/zz-setup-test-marker.md"
 echo "# issue-93 test marker" > "$SRC_MARKER"
@@ -529,26 +647,27 @@ fi
 check_record_review_farmed "run2"
 check_identity_lib_farmed "run2"
 check_fleet_tools_farmed "run2"
-if grep -q "stale farm mutation" "$DEST/tools/fleet/lane_liveness.py" 2>/dev/null; then
+if grep -q "stale farm mutation" "$DEST/scripts/fleet/lane_liveness.py" 2>/dev/null; then
   fail "stale farm mutation survived re-run (farmed lane_liveness.py was not refreshed)"
 else
   echo "ok: farmed lane_liveness.py refreshed on re-run (#1178)"
 fi
-if grep -q "stale farm mutation" "$DEST/tools/fleet/liveness.py" 2>/dev/null; then
+if grep -q "stale farm mutation" "$DEST/scripts/fleet/liveness.py" 2>/dev/null; then
   fail "stale farm mutation survived re-run (farmed liveness.py was not refreshed)"
 else
   echo "ok: farmed liveness.py refreshed on re-run (#1178)"
 fi
-if grep -q "stale farm mutation" "$DEST/tools/fleet/fleet-health.py" 2>/dev/null; then
+if grep -q "stale farm mutation" "$DEST/scripts/fleet/fleet-health.py" 2>/dev/null; then
   fail "stale farm mutation survived re-run (farmed fleet-health.py was not refreshed)"
 else
   echo "ok: farmed fleet-health.py refreshed on re-run (#1178 unit 4)"
 fi
-if grep -q "stale farm mutation" "$DEST/tools/fleet/map-sessions.py" 2>/dev/null; then
+if grep -q "stale farm mutation" "$DEST/scripts/fleet/map-sessions.py" 2>/dev/null; then
   fail "stale farm mutation survived re-run (farmed map-sessions.py was not refreshed)"
 else
   echo "ok: farmed map-sessions.py refreshed on re-run (#1178 unit 4)"
 fi
+check_tools_dir_clean "run2"
 if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
 else
@@ -653,7 +772,7 @@ check_content_matches "$DEST/extensions" "run6"
 check_fix_markers "$DEST/extensions" "run6"
 
 # --- done -----------------------------------------------------------------
-# #446: seven setup.sh runs happened under the temp HOME; the launchctl shim
+# #446: every setup.sh run happened under the temp HOME; the launchctl shim
 # must be SILENT (no call escaped to any launchctl) and the installer's
 # temp-HOME guard must have refused every time (message present per run).
 # Darwin-only in practice (setup.sh reaches install-launchd only on Darwin);

@@ -329,7 +329,7 @@ A reader must not trust two contracts for one rule. Concretely:
 `com.eldato.lane-liveness` (`StartInterval` **1800 s**). It runs with no orchestrator alive —
 which is the point: a pull tool is silent in exactly the scenario the owner requirement names
 ("a way to check which lanes are stuck, independent of the orchestrator being dead"). Farmed
-copies live under `~/.pi/agent/tools/fleet/` and `~/.pi/agent/scripts/lib/`, outside launchd's
+copies live under `~/.pi/agent/scripts/fleet/` and `~/.pi/agent/scripts/lib/`, outside launchd's
 `~/Documents` wall; the plist pins `PI_PID_IDENTITY_LIB` explicitly so the resolution is
 auditable.
 
