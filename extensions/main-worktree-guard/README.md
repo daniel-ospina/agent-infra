@@ -570,11 +570,13 @@ and `repo-freshness`'s `auto` mode deliberately declines to recover a
 sync verbs on the session's own baseline — `merge`/`pull`/`rebase`; the
 rewriting arm is the pre-existing defect tracked by #1144, and an admitted plain
 merge mints a merge commit no other session expects, so neither is the
-sanctioned remedy.) The hub-state check then still reports PASS because it
-tests on-main + clean, not freshness — so the staleness hid itself: **an absent
-guard reads as a passing guard**. Observed live: the tortoise hub sat **3 days /
-308 commits** stale, with files merged upstream since simply absent from its
-tree. A follow-up to make that detector report the staleness: #1313.
+sanctioned remedy.) The hub-state check tested only on-main + clean, so it
+reported PASS here too — **an absent guard reads as a passing guard**, and the
+staleness hid itself. Observed live: the tortoise hub sat **3 days / 308
+commits** stale, with files merged upstream since simply absent from its tree.
+Resolved by **#1313**: the detector now also compares the tip with its upstream
+and emits `HUB_DISORDER=behind` / `diverged` / `no_upstream` (all FAIL), so this
+state is signalled instead of hidden.
 
 Note the boundary: a merely **behind** hub is already handled — `git checkout
 main && git pull --ff-only` is M4-sanctioned recovery, and `repo-freshness`'s

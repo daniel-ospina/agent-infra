@@ -33,6 +33,10 @@ assert_eq() { # <actual> <expected> <label>
   if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', want '$2')"; fi
 }
 
+assert_not_contains() { # <haystack> <needle> <label>
+  if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi
+}
+
 FIX="$(mktemp -d)"
 trap 'rm -rf "$FIX"' EXIT
 
@@ -74,6 +78,7 @@ assert_contains "$out" "FAIL  $HUB" "untracked prints FAIL"
 assert_contains "$out" "HUB_DISORDER=dirty" "untracked → HUB_DISORDER=dirty"
 assert_contains "$out" "salvage <new-branch> $HUB" "dirty-on-main FAIL prints the #435 salvage step"
 assert_contains "$out" "hub-worktree.sh salvage" "dirty-on-main FAIL prints salvage"
+assert_not_contains "$out" "UNRECOGNISED disorder class" "plain dirty hub does not print an unrecognised-class line"
 rm "$HUB/untracked.txt"
 
 # ── 3. FAIL on staged + unstaged ──────────────────────────────────────────
@@ -230,7 +235,22 @@ assert_eq "$rc" 1 "clean+on-main+behind → exit 1 (was PASS before #1313)"
 assert_contains "$out" "FAIL  $SHUB" "behind prints FAIL"
 assert_contains "$out" "HUB_DISORDER=behind" "behind → HUB_DISORDER=behind"
 assert_contains "$out" "ahead=0 behind=1" "behind line names the counts"
-assert_contains "$out" "git pull --ff-only" "behind FAIL prints the fast-forward recovery"
+assert_contains "$out" "git merge --ff-only upstream/main" "behind FAIL prints the fast-forward recovery (the resolved ref, not @{u})"
+
+# 9b2. dirty + BEHIND → the --gh-report leg must reconstruct BOTH classes. This
+# is the composed-token case: a suffix parse of `*dirty` misses the staleness
+# token appended AFTER `dirty`, so the filed issue body would claim "clean" and
+# drop the salvage step (#1324 review P1).
+touch "$SHUB/wip.txt"
+: > "$GH_STUB_LOG"
+rm -f "$GH_EXISTING"
+out="$(bash "$CHECK" --repo "$SHUB" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "dirty+behind+gh-report exits 1"
+assert_contains "$out" "HUB_DISORDER=dirty+behind" "dirty+behind composes both tokens"
+assert_contains "$(cat "$GH_STUB_LOG")" "hub-state FAIL: $SHUB (dirty+behind)" "issue title carries dirty+behind"
+assert_contains "$(cat "$GH_STUB_LOG")" "dirty ON MAIN" "issue body keeps the dirty-on-main salvage guidance"
+assert_contains "$(cat "$GH_STUB_LOG")" "also BEHIND" "issue body keeps the behind note"
+rm -f "$SHUB/wip.txt"
 
 # 9c. fast-forward the hub → PASS again (no false positive once healthy).
 git -C "$SHUB" merge -q --ff-only upstream/main
@@ -285,6 +305,7 @@ out="$(bash "$CHECK" --repo "$NOUP" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "clean+on-main+no upstream → exit 1 (fail closed)"
 assert_contains "$out" "HUB_DISORDER=no_upstream" "no upstream → HUB_DISORDER=no_upstream"
 assert_contains "$out" "UNVERIFIABLE" "no-upstream FAIL says freshness is unverifiable"
+assert_contains "$out" "git -C $NOUP remote -v" "no-upstream guidance names the remote instead of presuming origin"
 
 # 9h. detached HEAD must not crash: reported as off_main (no upstream to compare).
 git -C "$SHUB" checkout -q --detach HEAD
