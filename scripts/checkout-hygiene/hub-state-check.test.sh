@@ -285,6 +285,7 @@ assert_contains "$out" "refresh --discard-contentless" "diverged FAIL names the 
 assert_contains "$out" "CARRY content" "diverged FAIL names the content-carrying route"
 assert_contains "$out" "git push upstream main:<new-branch>" "content-carrying route preserves the commits (on the RESOLVED remote)"
 assert_contains "$out" "git reset --hard upstream/main" "content-carrying route realigns to the resolved upstream"
+assert_contains "$out" "#1325" "non-origin diverged guide marks refresh's origin assumption (#1325)"
 
 # 9f. The --gh-report leg parses the staleness token SEPARATELY (#1313: two
 # parse sites). The filed issue body must carry the SAME diverged guidance — a
@@ -295,7 +296,8 @@ out="$(bash "$CHECK" --repo "$SHUB" --gh-report 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "diverged+gh-report exits 1"
 assert_contains "$out" "opened hub-state issue" "diverged+gh-report opens an issue"
 assert_contains "$(cat "$GH_STUB_LOG")" "hub-state FAIL: $SHUB (diverged)" "issue title carries the diverged token"
-assert_contains "$(cat "$GH_STUB_LOG")" "hub-worktree.sh refresh --repo $SHUB" "issue body carries the diverged recovery guidance"
+assert_contains "$(cat "$GH_STUB_LOG")" "hub-worktree.sh refresh --discard-contentless --repo $SHUB" "issue body carries the diverged recovery guidance"
+assert_contains "$(cat "$GH_STUB_LOG")" "#1325" "issue body marks refresh's origin assumption (#1325)"
 
 # 9i. a MISTRACKED hub: branch.main's configured upstream names ANOTHER branch.
 # The comparison must be against the SAME-NAMED tracking ref (origin/main), not

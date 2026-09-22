@@ -38,9 +38,10 @@
 # #1125). Freshness is compared against the SAME-NAMED, ALREADY-FETCHED
 # remote-tracking ref — refs/remotes/<remote>/<branch>, with <remote> read from
 # `branch.<branch>.remote` (else `origin`) — and NOT `@{u}` itself, which is free
-# to name an UNRELATED branch, a LOCAL branch, or `.` (each would otherwise be
-# compared against itself and PASS while arbitrarily behind mainline). No fetch is
-# issued here: the session's freshness machinery (repo-freshness's auto mode /
+# to name an UNRELATED branch or a LOCAL branch (either would otherwise be
+# compared against itself and PASS while arbitrarily behind mainline). A config
+# remote of `.` (self-tracking) is treated as no remote, so resolution falls back
+# to `origin/<branch>`. No fetch is issued here: the session's freshness machinery (repo-freshness's auto mode /
 # auto-sync at session start) owns the fetch, so this detector stays network-free
 # and fast. Residual: if that ref is itself stale, a behind-vs-ref gap can persist
 # until the next session fetch — but it is bounded by that fetch instead of
@@ -116,7 +117,7 @@ recovery_guide() {
     case "$stale" in
       "")          ;;   # plain dirty-on-main (#2238) / off_main+dirty: no staleness class
       behind)      lines+=("The hub is also BEHIND its upstream — after the capture, fast-forward: cd $repo && git merge --ff-only $upstream") ;;
-      diverged)    lines+=("The hub also has LOCAL-ONLY commits (diverged) — after the capture above: if they are CONTENTLESS, bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo; if they CARRY content, preserve them FIRST, then realign: cd $repo && git push $push_remote $branch:<new-branch> && git reset --hard $upstream") ;;
+      diverged)    lines+=("The hub also has LOCAL-ONLY commits (diverged) — after the capture above inspect them (git -C $repo log --stat $upstream..HEAD); if CONTENTLESS: bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo (assumes an 'origin' remote, #1325); if they CARRY content, preserve them FIRST, then realign: cd $repo && git push $push_remote $branch:<new-branch> && git reset --hard $upstream") ;;
       no_upstream) lines+=("The hub's upstream ref is also missing — freshness is UNVERIFIABLE. Name the remote (do not assume 'origin'), then fetch: git -C $repo remote -v") ;;
       *)           lines+=("The hub is also in an UNRECOGNISED disorder class '$stale' — inspect: git -C $repo status -sb") ;;
     esac
@@ -134,12 +135,16 @@ recovery_guide() {
         ;;
       diverged)
         lines+=("The hub is clean and on main, but DIVERGED from its upstream (local-only commits — a fast-forward cannot apply).")
-        lines+=("Two shapes, two routes. Ask refresh first: it names every local-only SHA and refuses unless they are CONTENTLESS:")
-        lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --repo $repo")
-        lines+=("Those commits are CONTENTLESS → drop exactly them and realign (#1309):")
+        lines+=("Inspect the local-only commits and their content first (remote-agnostic):")
+        lines+=("cd $repo && git log --stat $upstream..HEAD")
+        lines+=("CONTENTLESS → drop exactly them and realign (#1309):")
         lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo")
-        lines+=("Those commits CARRY content → refresh refuses them by design (nothing is discarded implicitly). Preserve them on a branch, THEN realign main — the reset is safe only after the push succeeded:")
+        lines+=("CARRY content → refresh refuses them by design (nothing is discarded implicitly). Preserve them on a branch, THEN realign main — the reset is safe only after the push succeeded:")
         lines+=("cd $repo && git push $push_remote $branch:<new-branch> && git reset --hard $upstream")
+        # hub-worktree.sh refresh hardcodes the remote as `origin` (#1309's
+        # deliberate, documented assumption; reopen tracked in #1325): mark it, so
+        # the emitted guide is never silently broken on a non-origin hub.
+        [[ "$push_remote" == origin ]] || lines+=("⚠️  hub-worktree.sh refresh assumes the hub's remote is 'origin'; this hub's is '$push_remote' (#1325). The git commands above are remote-explicit — prefer them.")
         ;;
       no_upstream)
         lines+=("The hub is clean and on main, but no upstream ref resolves — its freshness is UNVERIFIABLE (never read as PASS).")
@@ -161,9 +166,10 @@ recovery_guide() {
 #
 # The reference of record is refs/remotes/<remote>/<branch>, with <remote> read
 # from `branch.<branch>.remote` — NOT `@{u}`, and NOT a `/`-split of it. `@{u}`
-# may name an UNRELATED branch (`origin/feat/x`), a LOCAL branch (`wip/main`), or
-# `.` (self-tracking), all of which would be compared against themselves and PASS
-# while arbitrarily behind mainline — the false PASS #1313 closes. Reading the
+# may name an UNRELATED branch (`origin/feat/x`) or a LOCAL branch (`wip/main`);
+# either would be compared against itself and PASS while arbitrarily behind
+# mainline — the false PASS #1313 closes. A config remote of `.` (self-tracking)
+# is treated as no remote, falling back to `origin/<branch>`. Reading the
 # remote from config (rather than splitting `@{u}` on the first `/`) also keeps a
 # remote whose NAME contains `/` (e.g. `fork/origin`) resolving to its own ref.
 resolve_upstream() { # $1=repo $2=branch
