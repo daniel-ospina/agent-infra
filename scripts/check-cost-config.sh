@@ -64,19 +64,47 @@ CLAMP=300000
 
 # The compaction trigger the truncation watcher and the cost report band on:
 #   FLEET_REGIME_TB = CLAMP − compaction.reserveTokens   (283,616 = 300,000 − 16,384)
-# The reserve is asserted as a DERIVED relation against this floor, not as a pinned literal: the
-# invariant is the CONFIGURATION GEOMETRY (the reserve must derive the trigger the instruments
-# band on), not the number 16384. The floor is READ FROM the instruments, never restated here — a
-# literal in this file would only prove the shell agrees with itself. The cost report's
-# `FLEET_REGIME_TB:-<n>` default and the watcher's clamp-bucket boundary are the two independent
-# statements of the floor; this guard requires them to AGREE, and requires settings.json's
-# reserveTokens to derive that shared floor. So: change the reserve without moving the floor (the
-# #1213/#1304 withdrawal moved 50000→16384, the trigger 250000→283616) and it fires, and change
-# ONE instrument without the other and it fires too.
-REGIME_TB_REPORT="$(sed -n 's/.*FLEET_REGIME_TB:-\([0-9][0-9]*\)}.*/\1/p' "$ROOT/scripts/fleet-cost-report.sh" 2>/dev/null | head -1)"
-REGIME_TB_WATCH="$(sed -n 's/.*if \([0-9][0-9]*\) <= tb <.*/\1/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null | head -1)"
+#
+# Two assertions, and BOTH are needed:
+#
+#   1. INDEPENDENT — reserveTokens must equal the reviewed value (16384). This is the only
+#      constraint that survives a COORDINATED move of the window and the reserve. Asserting only
+#      the geometry below reads green on `contextWindow 1000000 / reserveTokens 716384`, which
+#      preserves the 283616 trigger while inflating the summarization cap to 0.8 x 716384 — the
+#      exact reserve-inflation workaround the recorded owner directive on #1227 forbids
+#      ("Do not implement the decoupling by inflating reserveTokens"). Removing this pin
+#      introduced that false PASS, and a guard whose only reserve constraint CLAMP can move is
+#      not a constraint.
+#
+#   2. DERIVED — the geometry must match the floor the instruments band on. The FLOOR is READ
+#      FROM the instruments (`fleet-cost-report.sh`'s `FLEET_REGIME_TB:-<n>` default and
+#      `watch-truncation.sh`'s clamp-bucket boundary), never restated here, so a literal in this
+#      file cannot prove the shell agrees with itself. The window term is the guard's own CLAMP —
+#      the ceiling the models.json check enforces — not a second copy of the floor. This leg
+#      catches a CLAMP drift and an instrument drift (the #1213/#1304 withdrawal moved 50000→16384,
+#      the trigger 250000→283616; moving ONE instrument alone must also fail).
+REGIME_TB_REPORT_ALL="$(sed -n 's/.*FLEET_REGIME_TB:-\([0-9][0-9]*\)}.*/\1/p' "$ROOT/scripts/fleet-cost-report.sh" 2>/dev/null)"
+# Anchored on the BUCKET LABEL, not on the bare `if N <= tb <` shape: the watcher states
+# `<= tb <` in more than one bucket boundary (the retired 700K-era `if 650000 <= tb < 900000`
+# still sits beside the live one), so the shape alone is ambiguous. The uniqueness assertion
+# below is kept as the backstop: if the label moves or a second labelled statement appears,
+# the guard refuses rather than picking by source order.
+REGIME_TB_WATCH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9][0-9]*\) <= tb <.*/\1/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
+REGIME_TB_REPORT="$(printf '%s\n' "$REGIME_TB_REPORT_ALL" | sed '/^$/d' | head -1)"
+REGIME_TB_WATCH="$(printf '%s\n' "$REGIME_TB_WATCH_ALL" | sed '/^$/d' | head -1)"
 if [ -z "$REGIME_TB_REPORT" ] || [ -z "$REGIME_TB_WATCH" ]; then
   echo "error: cannot read the fleet regime floor from scripts/fleet-cost-report.sh ($REGIME_TB_REPORT) / scripts/watch-truncation.sh ($REGIME_TB_WATCH) — the reserve cannot be asserted as a derived relation, so it must not read green" >&2
+  exit 2
+fi
+# AMBIGUITY is a refusal, not a pick. The watcher states the floor in more than one bucket
+# boundary (the retired 700K-era `if 650000 <= tb < 900000` still sits beside the live one), so a
+# bare `head -1` silently resolves the floor by SOURCE ORDER: a legitimate reorder, or a comment
+# line containing `if N <= tb <`, would make the guard report "the instruments disagree" when they
+# do not. An ambiguous derivation is not a derivation.
+REGIME_TB_REPORT_N="$(printf '%s\n' "$REGIME_TB_REPORT_ALL" | sed '/^$/d' | wc -l | tr -d ' ')"
+REGIME_TB_WATCH_N="$(printf '%s\n' "$REGIME_TB_WATCH_ALL" | sed '/^$/d' | wc -l | tr -d ' ')"
+if [ "$REGIME_TB_REPORT_N" != "1" ] || [ "$REGIME_TB_WATCH_N" != "1" ]; then
+  echo "error: the fleet regime floor is AMBIGUOUS in the instruments (fleet-cost-report.sh: ${REGIME_TB_REPORT_N} match(es): $(printf '%s' "$REGIME_TB_REPORT_ALL" | tr '\n' ' '); watch-truncation.sh: ${REGIME_TB_WATCH_N} match(es): $(printf '%s' "$REGIME_TB_WATCH_ALL" | tr '\n' ' ')) — exactly one statement per instrument is required, so the floor cannot be derived by source order" >&2
   exit 2
 fi
 if [ "$REGIME_TB_REPORT" != "$REGIME_TB_WATCH" ]; then
@@ -84,6 +112,8 @@ if [ "$REGIME_TB_REPORT" != "$REGIME_TB_WATCH" ]; then
   exit 2
 fi
 FLEET_REGIME_TB="$REGIME_TB_REPORT"
+# The reviewed reserve (#1227). Asserted independently of the geometry — see note 1 above.
+REVIEWED_RESERVE=16384
 
 # ── retry/hang contract (#1088) — the bounded-retry window ────────────────
 # `retry.maxRetries` is an ATTEMPT budget with no wall-clock deadline in pi,
@@ -267,14 +297,14 @@ settings_violations() {
   python3 - "$1" "$2" "$HTTP_IDLE_TIMEOUT_MS" "$RETRY_MAX_RETRIES" \
     "$RETRY_BASE_DELAY_MS" "$RETRY_MAX_BACKOFF_MS" "$RETRY_PROVIDER_TIMEOUT_MS" \
     "$HANG_WINDOW_CEILING_MS" "$WORST_WINDOW_CEILING_MS" \
-    "$PATCH_CAP_RESOLVED" "$PATCH_CAP_WHY" "$CLAMP" "$FLEET_REGIME_TB" <<'PYEOF'
+    "$PATCH_CAP_RESOLVED" "$PATCH_CAP_WHY" "$CLAMP" "$FLEET_REGIME_TB" "$REVIEWED_RESERVE" <<'PYEOF'
 import json, re, sys
 
 path, patch_path = sys.argv[1], sys.argv[2]
 # The cap, RESOLVED by the shell that owns it (the resolver above) — never
 # parsed out of the assignment text. argv[10] = value or "", argv[11] = why.
 CAP_RESOLVED, CAP_WHY = sys.argv[10], sys.argv[11]
-CLAMP_VALUE, REGIME_TB = int(sys.argv[12]), int(sys.argv[13])
+CLAMP_VALUE, REGIME_TB, REVIEWED_RESERVE = int(sys.argv[12]), int(sys.argv[13]), int(sys.argv[14])
 (IDLE_EXPECTED, MR_EXPECTED, BASE_EXPECTED, CAP_EXPECTED,
  PROVIDER_EXPECTED, HANG_CEILING, WORST_CEILING) = map(int, sys.argv[3:10])
 
@@ -313,18 +343,33 @@ if not isinstance(comp, dict):
 else:
     if comp.get("enabled") is not True:
         issues.append(f"compaction.enabled expected true, got {q(comp.get('enabled'))}")
-    # DERIVED, not pinned: the reserve must derive the regime floor the truncation watcher and the
-    # cost report band on. A wrong reserve moves the trigger and is caught even though no literal
-    # is compared. A reserve that is merely a different valid-looking number (e.g. the withdrawn
-    # 50000) still fails, because its trigger (250000) is not the floor the instruments use.
+    # INDEPENDENT leg (#1227): the reserve must be the reviewed value. Without this, a
+    # coordinated move of the window AND the reserve satisfies the geometry below while
+    # inflating the summarization cap — a false PASS this guard must not produce.
+    # Whole-number floats are accepted (JSON `16384.0` IS 16384 — `_as_int` documents the same
+    # doctrine elsewhere in this block); bool is not a number.
     reserve = comp.get("reserveTokens")
-    if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve <= 0:
-        issues.append(f"compaction.reserveTokens expected a positive integer deriving the {REGIME_TB} clamp trigger, got {q(reserve)}")
+    reserve_ok = (
+        not isinstance(reserve, bool)
+        and isinstance(reserve, (int, float))
+        and reserve == int(reserve)
+        and reserve > 0
+    )
+    if not reserve_ok:
+        issues.append(f"compaction.reserveTokens expected the reviewed integer {REVIEWED_RESERVE}, got {q(reserve)}")
     else:
+        reserve = int(reserve)
+        if reserve != REVIEWED_RESERVE:
+            issues.append(
+                f"compaction.reserveTokens = {reserve}, but the reviewed value is {REVIEWED_RESERVE} "
+                f"(owner directive on #1227: the decoupling is not to be faked by inflating the "
+                f"reserve — that inflates the summarization cap to 0.8 x reserve)"
+            )
+        # DERIVED leg: the geometry must match the floor the instruments band on.
         trigger = CLAMP_VALUE - reserve
         if trigger != REGIME_TB:
             issues.append(
-                f"compaction.reserveTokens = {reserve} derives the clamp trigger {trigger} "
+                f"the guard's clamp/reserve geometry derives {trigger} "
                 f"({CLAMP_VALUE} clamp − {reserve}), but the fleet regime floor is {REGIME_TB} "
                 f"(read from scripts/fleet-cost-report.sh / scripts/watch-truncation.sh) — "
                 f"the reserve and the regime band have drifted apart"
@@ -519,7 +564,7 @@ check_settings_file() {
       esac
     done <<< "$issues"
   else
-    ok "$label — compaction (enabled + reserve/keep contract deriving the ${FLEET_REGIME_TB} trigger) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
+    ok "$label — compaction (enabled + reserve ${REVIEWED_RESERVE} + keep 12000; guard geometry ${CLAMP}−${REVIEWED_RESERVE}=$((CLAMP - REVIEWED_RESERVE)) matches the instruments' ${FLEET_REGIME_TB} floor) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
   fi
 }
 

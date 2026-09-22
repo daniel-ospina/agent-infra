@@ -1558,10 +1558,10 @@ echo ""
 #      a MISSING block. backdoor-settings' injected defect is the MISSING
 #      compaction block (the `not isinstance(comp, dict)` arm), so the
 #      wrong-value arm had no fixture at all. Both arms are settings-class,
-#      hence override-immune. The wrong-value arm is now a DERIVED relation
-#      (`CLAMP − reserveTokens == FLEET_REGIME_TB`), not a pinned literal, so
-#      50000 is caught because its trigger (250000) is not the regime floor —
-#      the coverage is value-independent, which is exactly why it is kept.
+#      hence override-immune. The wrong-value arm is now BOTH an independent
+#      reviewed-value pin (#1227) AND a derived geometry relation
+#      (`CLAMP − reserveTokens == FLEET_REGIME_TB`), so 50000 is caught twice —
+#      the coverage is value-independent, which is why it is kept.
 echo "35. reserveTokens wrong value (block present) → BLOCK, and the override does not silence it"
 TMP35="$(mktemp -d /tmp/cost-config-reserve-value.XXXXXX)"
 mkroot "$TMP35"
@@ -1575,7 +1575,8 @@ PYEOF
 bash "$TMP35/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "reserveTokens=50000 (block present) → exit 1"; else fail "expected exit 1 for a wrong reserveTokens value, got $code"; sed -n '1,30p' "$OUT"; fi
-if grep -q "compaction.reserveTokens = 50000 derives the clamp trigger 250000" "$OUT"; then pass "wrong-value message names the derived trigger and the regime floor"; else fail "expected the derived reserveTokens message"; sed -n '1,30p' "$OUT"; fi
+if grep -q "compaction.reserveTokens = 50000, but the reviewed value is 16384" "$OUT"; then pass "wrong-value message names the reviewed reserve (#1227)"; else fail "expected the reserve-value message"; sed -n '1,30p' "$OUT"; fi
+if grep -q "geometry derives 250000" "$OUT"; then pass "the derived geometry leg also names the off-floor trigger"; else fail "expected the derived-geometry message"; sed -n '1,30p' "$OUT"; fi
 COST_CLAMP_OVERRIDE=1 bash "$TMP35/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "wrong-value reserveTokens + override → still exit 1 (settings class is override-immune)"; else fail "expected exit 1 under the override, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1636,7 +1637,70 @@ mkroot "$TMP37"
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 0 ]; then pass "the pristine fixture root still reads green (the new checks are not blanket-failing)"; else fail "expected exit 0 on the pristine root, got $code"; sed -n '1,30p' "$OUT"; fi
+# (e) BOTH instruments moved TOGETHER to a new self-consistent floor → the instrument-agreement
+# leg passes, so the guard reaches the settings check and the DERIVED geometry leg must fire on
+# its own (proving it is not dead code behind the instrument check).
+sed -i.bak 's/FLEET_REGIME_TB:-283616/FLEET_REGIME_TB:-290000/' "$TMP37/scripts/fleet-cost-report.sh"
+sed -i.bak 's/if 283616 <= tb < 650000/if 290000 <= tb < 650000/' "$TMP37/scripts/watch-truncation.sh"
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "both instruments moved together → the derived geometry leg fires alone (exit 1)"; else fail "expected exit 1 from the derived geometry leg, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "geometry derives 283616" "$OUT"; then pass "the derived leg names the geometry and the new floor"; else fail "expected the derived-geometry message"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (f) a SECOND labelled `300K-clamp` bucket statement makes the floor ambiguous → exit 2, never a
+# source-order pick.
+printf '\nbucket_dup = "300K-clamp-dup" if 283616 <= tb < 650000 else None\n' >> "$TMP37/scripts/watch-truncation.sh"
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "a duplicate labelled floor statement → exit 2 (ambiguous, never source-order picked)"; else fail "expected exit 2 on an ambiguous floor, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "AMBIGUOUS" "$OUT"; then pass "the ambiguity refusal is explicit"; else fail "expected an explicit ambiguity refusal"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP37"
+
+echo ""
+# ── 38. the independent reserve pin is what survives a COORDINATED window+reserve move.
+#      `contextWindow 1000000 / reserveTokens 716384` preserves the 283616 trigger, so a
+#      geometry-only guard reads GREEN while inflating the summarization cap to 0.8 x 716384 —
+#      the reserve-inflation workaround the recorded owner directive on #1227 forbids. This is
+#      a regression test for the false PASS that removing the pin introduced.
+echo "38. coordinated window+reserve move → BLOCK (the independent pin is load-bearing, #1227)"
+TMP38="$(mktemp -d /tmp/cost-config-reserve-inflate.XXXXXX)"
+mkroot "$TMP38"
+python3 - "$TMP38/scripts/check-cost-config.sh" "$TMP38/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
+import json, sys
+g, sp = sys.argv[1], sys.argv[2]
+src = open(g).read()
+assert "CLAMP=300000" in src, "guard constant shape changed — update this test"
+open(g, "w").write(src.replace("CLAMP=300000", "CLAMP=1000000"))
+d = json.load(open(sp))
+d["compaction"]["reserveTokens"] = 716384     # 1000000 - 283616: the geometry still matches
+json.dump(d, open(sp, "w"), indent=2)
+PYEOF
+bash "$TMP38/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "inflated reserve (same trigger) → exit 1"; else fail "expected exit 1 for the inflated reserve, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "but the reviewed value is 16384" "$OUT"; then pass "the block names the reviewed value (#1227)"; else fail "expected the reviewed-value message"; sed -n '1,30p' "$OUT"; fi
+if grep -q "geometry derives" "$OUT"; then fail "the geometry leg fired — the fixture does not isolate the independent pin"; else pass "the geometry leg stayed green (the pin is what caught it)"; fi
+rm -rf "$TMP38"
+
+echo ""
+# ── 39. a whole-number JSON float reserve is a NUMBER, not drift: `16384.0` IS 16384 (the same
+#      doctrine the block's own `_as_int` documents). The pin must not narrow this into a block.
+echo "39. reserveTokens 16384.0 (whole float) → accepted, not drift"
+TMP39="$(mktemp -d /tmp/cost-config-reserve-float.XXXXXX)"
+mkroot "$TMP39"
+python3 - "$TMP39/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["compaction"]["reserveTokens"] = 16384.0
+open(p, "w").write(json.dumps(d, indent=2))
+PYEOF
+bash "$TMP39/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "reserveTokens 16384.0 → exit 0 (a whole float is the same number)"; else fail "expected exit 0 for a whole-float reserve, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "reserveTokens" "$OUT"; then fail "the float reserve raised a reserveTokens block"; else pass "no reserveTokens block for the whole float"; fi
+rm -rf "$TMP39"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

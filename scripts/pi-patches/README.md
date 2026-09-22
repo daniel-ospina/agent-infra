@@ -152,7 +152,7 @@ a pristine tree and a patched tree in a temp dir (a copy of the installed `dist/
 `node_modules`), drives the real `generateSummaryWithUsage` with a stub `streamFn`, and asserts the
 budget **handed to the stream function** — the pre-clamp value, since the real clamp
 (`clampMaxTokensToContext`) runs later inside `buildBaseOptions` and this probe never exercises it
-(**gap 10**, now closed by change (e)) — **13,107 unpatched → 32,135 patched** against the measured 56,077-char summary. The
+(**the residual formerly recorded as gap 10**, now closed by change (e)) — **13,107 unpatched → 32,135 patched** against the measured 56,077-char summary. The
 RED leg fails on the unpatched code by construction (it asserts the value is exactly the old cap and
 that the green assertion is false), so "no-repro → green" is impossible. The installed tree is never
 modified.
@@ -243,7 +243,8 @@ lands in the request. Pre-change the marker is ignored (marked and unmarked both
 post-change it survives the adapter (marked **40,327** = budget + thinking budget, unmarked 5,904;
 normal turns identical across both trees). `bedrock-converse-stream` cannot be driven this way — it
 authenticates through the AWS SDK, not `fetch` — so its two re-clamp entries are proved by the same
-region-verbatim shape plus `node --check` discipline `apply.mjs` uses. The test builds its own trees,
+region-verbatim shape verification `apply.mjs` uses plus a `node --check` of each patched file,
+which this test performs. The test builds its own trees,
 and — because change (e) patches a file **under `node_modules/`** — it copies
 `node_modules/@earendil-works/pi-ai` for real rather than symlinking `node_modules`: a symlinked
 `node_modules` made the false-PASS fixtures write straight through into the live install (reproduced

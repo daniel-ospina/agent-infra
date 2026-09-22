@@ -260,7 +260,11 @@ property; this guard is the pattern to copy, not a substitute for it.
   not blocked**.
 - **Guard classes** (`scripts/check-cost-config.sh`):
   - `models.json` drift (any deepseek-served id > 300K) → **BLOCK (exit 1)**.
-  - `settings.json` drift (compaction block: enabled + `reserveTokens` 16384 +
+  - `settings.json` drift (compaction block: enabled + `reserveTokens` **16384**
+    (the reviewed value — asserted independently, see the `#1227` note below) +
+    a geometry check that `300000 − reserveTokens` equals the fleet regime floor
+    the instruments band on (READ from `scripts/fleet-cost-report.sh` and
+    `scripts/watch-truncation.sh`, never restated in the guard) +
     `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract —
     the keys are `retry.maxRetries`, `httpIdleTimeoutMs`, `retry.baseDelayMs`,
     `retry.provider.timeoutMs`, `retry.provider.maxRetries`; **the table in §2
@@ -277,6 +281,23 @@ property; this guard is the pattern to copy, not a substitute for it.
     contract cap is **BLOCK (exit 1)**: the guard reads the DEFAULT cap, so
     without this the environment could install a different cap while the guard
     stayed green.
+  - **The reserve is pinned AND derived — both legs are required** (#1316,
+    `#1227`). The independent leg (reserve == 16384) is the only constraint that
+    survives a coordinated move of the window and the reserve; the derived leg
+    (`CLAMP − reserve ==` the floor read from the two instruments) catches a
+    `CLAMP` drift or an instrument drift. Removing the independent leg made the
+    guard read green on `contextWindow 1000000 / reserveTokens 716384`, which
+    preserves the 283616 trigger while inflating the summarization cap to
+    `0.8 × 716384` — the reserve-inflation workaround the recorded owner
+    directive on #1227 forbids.
+  - **Fleet regime floor unreadable, ambiguous, or inconsistent → BLOCK
+    (exit 2)**: if the guard cannot read exactly one floor value from EACH of
+    `scripts/fleet-cost-report.sh` and `scripts/watch-truncation.sh`, or the two
+    disagree, it refuses rather than picks. A bare source-order pick would let a
+    legitimate reorder of the watcher's bucket boundaries (or a comment line
+    containing `if N <= tb <`) read as an instrument disagreement, which points
+    the reader at the wrong root cause. This class is **not** covered by
+    `COST_CLAMP_OVERRIDE=1`.
   - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
     deletion of the clamp authority is itself terminal drift (clamp gone while
     CI stays green). Store-class and live-dir-missing (first-install) stay
@@ -323,6 +344,17 @@ property; this guard is the pattern to copy, not a substitute for it.
   the SAME commit** — a reverted clamp with a stale 300K guard would block
   every sync/commit (or force override usage indefinitely, which is exactly
   the drift the guard exists to surface).
+- **The revert must move the whole geometry, or the escape does not work
+  (#1316).** Since the guard asserts `CLAMP − reserveTokens ==` the floor the
+  two instruments band on, flipping `CLAMP` alone now reddens a
+  **settings-class** check, and `COST_CLAMP_OVERRIDE=1` does **not** silence
+  that class (it covers the `models.json` clamp block only). A 1M revert
+  therefore updates, in one commit: `contextWindow` in `models.json`, the
+  guard's `CLAMP`, `settings.json`'s `reserveTokens` (from the reviewed 16384),
+  and the floor literal in **both** instruments —
+  `scripts/fleet-cost-report.sh` (`FLEET_REGIME_TB:-<n>`) and
+  `scripts/watch-truncation.sh`'s clamp-bucket boundary. `watch-truncation.sh`'s
+  printed procedure states the same list.
 - Trigger (pre-committed, owner = weekly report reader): re-read volume or
   LLM call count per compacting session > 2× the regenerated Aug baseline over
   any 3 consecutive days, **or** ≥ 1 `stopReason:"length"` truncation record

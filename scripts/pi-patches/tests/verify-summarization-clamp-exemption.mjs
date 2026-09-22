@@ -31,9 +31,12 @@
 // `buildBaseOptions` is not the only place the budget can be reduced: the anthropic-messages and
 // bedrock adapters clamp AGAIN inside their own streamSimple, after it, for the budget-based
 // thinking branch — reachable for a summarization request whenever the model reasons and the
-// session thinking level is on. Driving those adapters end-to-end needs a live provider client, so
-// the gate there is proven the same way `apply.mjs` proves every entry: the patched REGION
-// verbatim in the post-change tree, and the UNGATED call present only in the pre-change tree.
+// session thinking level is on. Those four sites are covered two ways: the `anthropic-messages`
+// copies (ESM + bundle) are driven END TO END with a stubbed `fetch`, reading the `max_tokens`
+// that actually lands in the request body; `bedrock-converse-stream` authenticates through the AWS
+// SDK and cannot be `fetch`-stubbed, so its two copies are proven the way `apply.mjs` proves every
+// entry — the patched REGION verbatim in the post-change tree and the UNGATED call present only
+// pre-change — plus a `node --check` of each patched file.
 //
 // It also runs `apply.sh --check` against trees the check must reject: the pre-change temp tree
 // (anchors present → every (e) entry NOT applied, exit 1), a MARKER-ONLY tree per (e) entry
@@ -561,7 +564,13 @@ check("--check does NOT claim the fix is in place", !checkOut.includes("the fix 
 // The (d) guard's first version stripped only the exact marker spellings, so a FRAGMENT ("pi-patch",
 // "1263", "#1263(d)") survived the strip, was called code-shaped, and was present on a marker-only
 // stub — passing both assertions vacuously (#1314 review). Same predicate, same falsifiability.
-const MARKER_RE = /(\/\/\s*pi-patch[^\n]*|\/\*\s*pi-patch[^*]*\*\/)/g;
+//
+// The pattern captures a WHOLE marker block, not one line: the ESM replacements carry a multi-line
+// `// pi-patch #1316(e): ...` block, and a single-line `[^\n]*` capture left the continuation lines
+// in the "marker-only" rendering — where a needle landing on one of them was misclassified as
+// code-shaped. `markerStub` is also asserted non-empty per entry below, because an EMPTY stub would
+// make `isCodeShaped` true for every needle and every fixture assertion vacuous.
+const MARKER_RE = /(\/\/[^\n]*pi-patch[^\n]*(?:\n[ \t]*\/\/[^\n]*)*|\/\*[\s\S]*?pi-patch[\s\S]*?\*\/)/g;
 const markerStub = (s) => (s.match(MARKER_RE) || []).join("\n");
 const isCodeShaped = (entry, needle) => !markerStub(entry.replace).includes(needle);
 
@@ -571,6 +580,13 @@ const isCodeShaped = (entry, needle) => !markerStub(entry.replace).includes(need
 // in-place message. The file is rebuilt from the pre-change copy on every iteration, so entries
 // that share a file (e2 with d2/d3) cannot contaminate one another.
 for (const e of E_ENTRIES) {
+	// The fixture is only a fault injection if the marker SURVIVES it. An empty stub would render the
+	// "marker-only" tree as "payload deleted", and `isCodeShaped` would call every needle code-shaped.
+	check(
+		`FALSE-PASS FIXTURE (${e.id}): the payload carries a provenance marker, so the stub is non-empty`,
+		markerStub(e.replace).length > 0,
+		`markerStub=${JSON.stringify(markerStub(e.replace).slice(0, 70))}`,
+	);
 	const markerOnlyRoot = buildTree(`marker-only-${e.id}`);
 	revertToPristine(markerOnlyRoot, E_ENTRIES);
 	applyEntries(markerOnlyRoot, E_ENTRIES);
@@ -680,6 +696,15 @@ for (const e of E_ENTRIES) {
 			`MARKER-CLASSIFIER UNIT: "${needle}" is NOT code-shaped in ${id}`,
 			entry !== undefined && !isCodeShaped(entry, needle),
 			`isCodeShaped=${entry ? isCodeShaped(entry, needle) : "(missing entry)"}`,
+		);
+	}
+	// EVERY entry carries at least one non-code (marker) fragment — not just e1-e4. The per-entry
+	// marker-presence check above is the guard; this pins the classifier's agreement with it.
+	for (const e of E_ENTRIES) {
+		check(
+			`MARKER-CLASSIFIER: ${e.id} has at least one marker fragment that is NOT code-shaped`,
+			markerStub(e.replace).length > 0 && !isCodeShaped(e, markerStub(e.replace).split("\n")[0]),
+			`isCodeShaped(first marker line)=${isCodeShaped(e, markerStub(e.replace).split("\n")[0])}`,
 		);
 	}
 	const realCodeNeedles = E_ENTRIES.flatMap((e) => e.verifyPresent.map((n) => [e.id, n]));
