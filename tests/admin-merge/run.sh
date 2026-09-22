@@ -327,6 +327,15 @@ case "$key" in
       *"/check-runs"*)
         sha="$(printf '%s' "$a2" | sed -n 's#.*/commits/\([^/]*\)/check-runs.*#\1#p')"
         [ -f "$SCEN/main-health-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+        # THE MERGE SHA CARRIES NO CHECK SURFACE (#1261 — verified, not assumed):
+        # GitHub keys the merge-ref evaluation's checks to the PR HEAD sha, so
+        # probing `refs/pull/<N>/merge`'s sha returns total_count 0. Modelling
+        # that makes a regression BACK to probing the merge sha FAIL the incident
+        # scenario (empty -> UNMEASURED -> it would merge a red tree) instead of
+        # silently passing on the same fixture.
+        if [ "$sha" = "$(cat "$SCEN/pr-merge-sha" 2>/dev/null || printf 'mergefeed00000000000000000000000000000000')" ]; then
+          printf '{"total_count":0,"check_runs":[]}\n'; exit 0
+        fi
         if [ "$sha" = "$(cat "$SCEN/main-sha" 2>/dev/null || printf 'feedface0000000000000000000000000000000000')" ]; then
           if [ -f "$SCEN/main-check-runs.json" ]; then cat "$SCEN/main-check-runs.json"; exit 0; fi
         else
@@ -337,6 +346,10 @@ case "$key" in
       */"status")
         sha="$(printf '%s' "$a2" | sed -n 's#.*/commits/\([^/]*\)/status.*#\1#p')"
         [ -f "$SCEN/main-health-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+        # Same as check-runs: the merge ref carries no legacy statuses either.
+        if [ "$sha" = "$(cat "$SCEN/pr-merge-sha" 2>/dev/null || printf 'mergefeed00000000000000000000000000000000')" ]; then
+          printf '{"state":"pending","total_count":0,"statuses":[]}\n'; exit 0
+        fi
         if [ "$sha" = "$(cat "$SCEN/main-sha" 2>/dev/null || printf 'feedface0000000000000000000000000000000000')" ]; then
           if [ -f "$SCEN/main-statuses.json" ]; then cat "$SCEN/main-statuses.json"; exit 0; fi
         else
@@ -2933,6 +2946,7 @@ write_pr_checks \
   "$(check_run 3001 lint completed failure 6601)" \
   "$(check_run 3002 'test (a)' completed success 6601)"
 pr_run_map 6601 pull_request 'Post-merge validation'
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
 run_admin 42 --dry-run >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a red on the PR's OWN evaluated tree BLOCKS (exit $rc)" \
@@ -2944,6 +2958,17 @@ grep -q "• lint — workflow 'Post-merge validation'" "$TMP/err" \
   || fail "the refusal does not name the failing job/workflow"
 grep -q "actions/runs/6601" "$TMP/err" && pass "…and the run URL" \
   || fail "the refusal does not name the run URL"
+# THE SOURCE IS PINNED, not just the outcome: GitHub keys the merge-ref
+# evaluation's checks to the HEAD sha, so the rail must read the head's surface.
+# The fake serves the MERGE sha an EMPTY surface (as real GitHub does), so a
+# regression back to probing refs/pull/<N>/merge would read UNMEASURED and merge
+# — and this assertion would fail even before the outcome one did.
+grep -q "commits/$HEAD_IN/check-runs" "$SCEN/calls" \
+  && pass "…read from the HEAD sha, where GitHub reports the merge-ref evaluation" \
+  || fail "the tree surface was not read from the head sha"
+grep -q "commits/67c72331b2466a7cd326375621be897366277a89/check-runs" "$SCEN/calls" \
+  && fail "the rail probed the MERGE sha's check surface (EMPTY on every real PR — an inert gate)" \
+  || pass "…and NOT from the merge sha, whose check surface is EMPTY on a real PR"
 [ -f "$SCEN/comment" ] && fail "evidence was posted over a red tree" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a red tree" || pass "no merge attempted"
 
