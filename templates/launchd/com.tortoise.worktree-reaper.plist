@@ -5,34 +5,50 @@
 <dict>
     <!-- worktree reaper (#1095, armed via #1311): a daily pass over the
          tortoise repo's worktrees. The reaper itself is
-         agent-infra/scripts/pi-reap-worktrees.sh, and it is FARMED to
+         agent-infra/scripts/pi-reap-worktrees.sh, farmed to
          {{HOME}}/.pi/agent/scripts/ by pi-bootstrap/setup.sh's fleet-scripts
-         farm — that copy is what this template targets, and it is not
-         optional: launchd cannot read a script under ~/Documents, because
-         macOS TCC is per-binary and denies a launchd-spawned `bash` the read
-         ("Operation not permitted") and a launchd-spawned `git` the repo read
-         ("not a git repository"). Running the script from ~/.pi/agent/scripts
-         is the whole fix (#427), the same mechanism the pi-session-reaper
-         above already relies on.
+         farm.
 
-         SHIPS IN DRY-RUN (the `dry_run` flag below): this job deletes
-         worktrees and branches it classifies as provably dead, so arming it
-         live is a deliberate, per-machine operator decision, not a default.
-         Flip it by removing that flag HERE and re-running
-         scripts/install-launchd.sh.
+         WHY THE ENTRY POINT IS THE CHECKOUT'S OWN PYTHON, NOT `bash`.
+         macOS TCC is per-binary and denies a launchd-spawned `bash` the read of
+         a script under ~/Documents ("Operation not permitted") AND a
+         launchd-spawned `git` the read of the repo there ("not a git
+         repository"). The reaper's whole job is `git -C <repo> ...` against
+         that checkout, so a `bash <script>` entry point cannot work no matter
+         where the script lives: farming it out of ~/Documents fixes the script
+         read and nothing else. The binary that DOES hold the access is the
+         checkout's own interpreter ({{TORTOISE_REPO}}/.venv/bin/python), the
+         same one the already-working com.tortoise.embedded-reaper agent runs.
+         So launchd starts that interpreter on
+         pi-reap-worktrees-launchd.py, which reads the script itself and hands
+         it to bash on stdin; bash and the `git` it spawns inherit the access
+         from that process. This mirrors the configuration recorded as PROVEN
+         end-to-end (WORKTREES=454 ... GH=ok), not the falsified `bash` one.
+
+         SHIPS IN DRY-RUN. The argument list below carries the reaper's
+         dry-run flag. Arming it is a deliberate, per-machine operator decision:
+         replace that flag with the reaper's apply flag HERE and re-run
+         scripts/install-launchd.sh. Removing the flag is NOT arming: with no
+         mode flag the reaper falls back to REAP_WT_DRY_RUN, whose default is 1,
+         so it would keep dry-running silently. The apply flag (or
+         REAP_WT_DRY_RUN=0) is the only arming switch.
 
          The pass is bounded by REAP_WT_BUDGET_SECONDS (default 300s); a pass
          that exhausts it defers the remainder and reports DEFERRED rather than
          removing anything unclassified. A dry-run pass on the live estate
          reported REMOVE=0 DEFERRED=432 of 454 worktrees, so this job's present
-         effect is a report, not a removal, and the budget (agent-infra #1095)
-         is the lever that decides how much one pass can classify.
+         effect is a report, not a removal, and that budget (agent-infra #1095)
+         is the lever deciding how much one pass can classify.
 
-         The `repo` argument is {{TORTOISE_REPO}} because the reaper takes the
-         repo to operate on. A machine without a tortoise checkout leaves that
-         placeholder unresolved, and install-launchd.sh then SKIPS this
-         template by design (unresolved placeholder) instead of installing a
-         broken target.
+         The repo argument is {{TORTOISE_REPO}}. A machine without a tortoise
+         checkout leaves that placeholder unresolved, and install-launchd.sh
+         then SKIPS this template by design (unresolved placeholder) instead of
+         installing a broken target.
+
+         OWNERSHIP: this label is the one the job was originally armed under by
+         hand. Installing this template therefore REPLACES that hand-made agent
+         with the tracked one: same interpreter, same launcher, now reproducible
+         from source. That replacement is the point, not a collision.
 
          No StandardOutPath/StandardErrorPath: every pass writes its own capped
          log at ~/.pi/agent/state/pi-reap-worktrees.log (an unbounded
@@ -42,8 +58,9 @@
     <string>com.tortoise.worktree-reaper</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>bash</string>
+        <string>{{TORTOISE_REPO}}/.venv/bin/python</string>
+        <string>{{HOME}}/.pi/agent/scripts/pi-reap-worktrees-launchd.py</string>
+        <string>--script</string>
         <string>{{HOME}}/.pi/agent/scripts/pi-reap-worktrees.sh</string>
         <string>--repo</string>
         <string>{{TORTOISE_REPO}}</string>

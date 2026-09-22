@@ -291,7 +291,7 @@ fi
 # ~/.pi/agent/scripts so
 # the drivers' sibling calls resolve and the plists' ProgramArguments targets
 # exist (broken-target guard). Same idempotent real-copy refresh model.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
