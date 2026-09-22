@@ -8,7 +8,13 @@
 #
 # Semantics (detect-not-block for the catalog class — a hard red on the store
 # would break auto-sync when pi's refresh legitimately reverts it):
-#   models.json    drift (any deepseek-served id > 300000)  → BLOCK (exit 1)
+#   models.json    drift — any deepseek-served id with a contextWindow
+#                  above 300000, OR any deepseek-served entry whose
+#                  contextWindow is absent, non-numeric, or not equal to
+#                  300000 (the GEOMETRY ANCHOR: `<= 300000` alone is an
+#                  UPPER BOUND, so a window BELOW the ceiling would leave
+#                  the derived reserve leg certifying a trigger the runtime
+#                  does not use)                             → BLOCK (exit 1)
 #   settings.json  drift (compaction block / settings-vs-guard
 #                  mismatch, or a DERIVED retry/hang window over
 #                  ceiling)                                  → BLOCK (exit 1)
@@ -20,14 +26,20 @@
 #     clamp authority deleted = clamp gone while CI stays green)
 #   MISSING store / live-dir files                           → WARN (4h
 #     refresh / first-install path)
+#   the regime floor unreadable, AMBIGUOUS, or disagreed on by
+#     the two instruments; an empty/inverted watcher band; or a
+#     models.json with no deepseek-served entry to anchor   → REFUSE (exit 2)
 # The weekly report (fleet-cost-report.sh) + tripwire are the store alert path.
 #
 # Escape hatch: COST_CLAMP_OVERRIDE=1 silences the CLAMP BLOCK (models.json /
 # models-store/catalog class) — prints a loud warning, still detects
 # (exit 0) — documented in docs/ops/cost-config-policy.md; sanctioned only for
-# the clamp's rollback window. It does NOT cover the retry/hang contract
-# (#1088): those violations count in RETRY_BLOCKS and still exit 1. An ambient
-# env var must not be able to defeat the retry bound.
+# the clamp's rollback window. It does NOT cover the models.json geometry
+# anchor (a settings-class BLOCK, deliberately override-immune: a window that
+# disagrees with the geometry is a settings drift, not a clamp rollback). It
+# does NOT cover the retry/hang contract either (#1088): those violations count
+# in RETRY_BLOCKS and still exit 1. An ambient env var must not be able to
+# defeat the retry bound.
 #
 # Usage:
 #   check-cost-config.sh                  shipped + live (live = $HOME/.pi/agent)
@@ -96,7 +108,7 @@ CLAMP=300000
 #      `$CAP_MS`. The parse reads the COMMITTED default literal, so an ambient `FLEET_REGIME_TB`
 #      override is outside what this leg certifies. That divergence, and the watcher's
 #      label-anchored boundary, are tracked in #1342.
-REGIME_TB_REPORT_ALL="$(sed -n 's/.*FLEET_REGIME_TB:-\([0-9][0-9]*\)}.*/\1/p' "$ROOT/scripts/fleet-cost-report.sh" 2>/dev/null)"
+REGIME_TB_REPORT_ALL="$(sed -n 's/.*FLEET_REGIME_TB:-\([0-9]\{1,15\}\)}.*/\1/p' "$ROOT/scripts/fleet-cost-report.sh" 2>/dev/null)"
 # Anchored on the BUCKET LABEL, not on the bare `if N <= tb <` shape: the watcher states
 # `<= tb <` in more than one bucket boundary (the retired 700K-era `if 650000 <= tb < 900000`
 # still sits beside the live one), so the shape alone is ambiguous. The uniqueness assertion
@@ -107,12 +119,18 @@ REGIME_TB_REPORT_ALL="$(sed -n 's/.*FLEET_REGIME_TB:-\([0-9][0-9]*\)}.*/\1/p' "$
 # inverted can never place a record in the clamp regime while this guard still derives a floor from
 # it. Reproduced: moving only the lower bound to 983616 yields `if 983616 <= tb < 650000` — a dead
 # band — and the guard exited 0 on it.
-REGIME_TB_WATCH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9][0-9]*\) <= tb < \([0-9][0-9]*\).*/\1/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
-REGIME_TB_WATCH_HIGH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9][0-9]*\) <= tb < \([0-9][0-9]*\).*/\2/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
+#
+# The capture is bounded to 15 digits on purpose: an unbounded `[0-9][0-9]*` lets a literal above
+# bash's int64 range through, and `[ N -ge M ]` on such a value ERRORS (rc=2) — which the `if`
+# reads as "not >=", i.e. as a COHERENT band, silently disarming the inverted-band refusal and
+# pointing the operator at "instrument disagreement" for a band they just wrote. A literal that
+# long cannot match, so it takes the unreadable-floor refusal below instead.
+REGIME_TB_WATCH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9]\{1,15\}\) <= tb < \([0-9]\{1,15\}\).*/\1/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
+REGIME_TB_WATCH_HIGH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9]\{1,15\}\) <= tb < \([0-9]\{1,15\}\).*/\2/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
 REGIME_TB_REPORT="$(printf '%s\n' "$REGIME_TB_REPORT_ALL" | sed '/^$/d' | head -1)"
 REGIME_TB_WATCH="$(printf '%s\n' "$REGIME_TB_WATCH_ALL" | sed '/^$/d' | head -1)"
 if [ -z "$REGIME_TB_REPORT" ] || [ -z "$REGIME_TB_WATCH" ]; then
-  echo "error: cannot read the fleet regime floor from scripts/fleet-cost-report.sh ($REGIME_TB_REPORT) / scripts/watch-truncation.sh ($REGIME_TB_WATCH) — the reserve cannot be asserted as a derived relation, so it must not read green" >&2
+  echo "error: cannot read the fleet regime floor — fleet-cost-report.sh gives '${REGIME_TB_REPORT}' and watch-truncation.sh gives '${REGIME_TB_WATCH}'. The report side is read from its FLEET_REGIME_TB default literal; the watcher side is read from a clamp-bucket boundary that must carry this guard's label anchor '300K-clamp' (the shape is '\"300K-clamp...\" if N <= tb < M'), so a renamed or re-labelled bucket reads as unreadable here. The reserve cannot be asserted as a derived relation, and an underivable floor must not read green (fail-closed; not covered by COST_CLAMP_OVERRIDE=1)." >&2
   exit 2
 fi
 # AMBIGUITY is a refusal, not a pick. A bare `head -1` would silently resolve the floor by SOURCE
@@ -575,26 +593,47 @@ check_model_file() {
 # Scope: this anchors the SHIPPED models.json — the committed config authority this guard guards.
 # The live file stays `warn`-class, exactly as `check_model_file` treats it.
 check_models_window_anchor() {
-  local file="$1" label="$2" bad b
+  local file="$1" label="$2" out anchored bad b
   # An absent file is check_model_file business, not this anchor business.
   [ -f "$file" ] || return 0
-  bad="$(models_window_anchor_violations "$file")"
-  if printf '%s\n' "$bad" | grep -q '^PARSE_ERROR'; then
-    block_settings "$label — the window geometry anchor could not be read, so the derived reserve leg is unassertable (fail-closed): $bad"
+  out="$(models_window_anchor_violations "$file")"
+  if printf '%s\n' "$out" | grep -q '^PARSE_ERROR'; then
+    block_settings "$label — the window geometry anchor could not be read, so the derived reserve leg is unassertable (fail-closed): $out"
     return
   fi
+  anchored="$(printf '%s\n' "$out" | sed -n 's/^ANCHORED \([0-9][0-9]*\)$/\1/p')"
+  bad="$(printf '%s\n' "$out" | grep -v '^ANCHORED ')"
   if [ -n "$bad" ]; then
     while IFS= read -r b; do
       [ -n "$b" ] && block_settings "$label — $b"
     done <<< "$bad"
     return
   fi
-  ok "$label — every deepseek-served contextWindow is the geometry anchor ${CLAMP}"
+  # An anchor that recognised NOTHING is not a green. "Every deepseek-served window is the anchor"
+  # over an empty set asserts nothing, and the guard's premise (a deepseek clamp to protect) is
+  # gone. Refuse before the override path, exactly like an underivable floor.
+  if [ -z "$anchored" ] || [ "$anchored" -eq 0 ]; then
+    echo "error: no deepseek-served entry was recognised in $file — the geometry anchor has nothing to assert, so the derived reserve leg must not read green (fail-closed; not covered by COST_CLAMP_OVERRIDE=1). Check the matcher and the model ids before treating this as a clean tree." >&2
+    exit 2
+  fi
+  ok "$label — every deepseek-served contextWindow is the geometry anchor ${CLAMP} (${anchored} entries)"
 }
 
 # models_window_anchor_violations <file> — one line per deepseek-served entry whose `contextWindow`
-# is present and NOT the geometry anchor `CLAMP`. Same shape as `deepseek_violations`: the heredoc
-# sits in a plain function body, never nested inside a command substitution.
+# is ABSENT, non-numeric, or not the geometry anchor `CLAMP`, followed by a final `ANCHORED <n>` line
+# counting the entries that DID satisfy it. Same shape as `deepseek_violations`: the heredoc sits in
+# a plain function body, never nested inside a command substitution.
+#
+# Why an ABSENT key is a violation and not a skip — this anchor's claim is "the window the
+# compaction trigger uses IS `CLAMP`", and neither recognised shape delivers that with the key
+# missing: a `providers.*.models[]` row resolves `contextWindow ?? 128000` (pi's `modelFromJson`),
+# and a `modelOverrides` value resolves `override.contextWindow ?? model.contextWindow` against the
+# 4h-refreshed catalog (which this guard's own header says may legitimately revert to 1M). Skipping
+# it left the derived leg certifying `CLAMP − reserve` while the runtime trigger was neither — the
+# same window-below-the-ceiling false PASS this anchor exists to close, reached by DELETION instead
+# of by lowering. A non-numeric value is worse still: pi's schema declares `contextWindow` a Number
+# and `ModelConfig.load` then rejects the WHOLE file, leaving an empty provider map — the clamp
+# authority gone with the file present, which the "MISSING models.json → BLOCK" arm exists to catch.
 models_window_anchor_violations() {
   python3 - "$CLAMP" "$1" <<'PYEOF'
 import json, re, sys
@@ -609,13 +648,19 @@ def norm(id_):
 
 
 bad = []
+anchored = 0
 
 
 def note(where, cw):
-    # An ABSENT contextWindow is not this anchor finding (a catalog entry may inherit one); a
-    # PRESENT one that disagrees is.
-    if isinstance(cw, (int, float)) and cw != clamp:
+    global anchored
+    if isinstance(cw, bool) or not isinstance(cw, (int, float)):
+        bad.append(f'{where} has no numeric contextWindow (found {cw!r}), so pi does not resolve this '
+                   f'entry to the {clamp} geometry — the derived reserve leg must not certify it '
+                   f'(fail-closed)')
+    elif cw != clamp:
         bad.append(f'{where} contextWindow={cw}, but the geometry anchor is {clamp}')
+    else:
+        anchored += 1
 
 
 def walk(node):
@@ -640,6 +685,7 @@ except Exception as e:
 
 for b in bad:
     print(b)
+print(f'ANCHORED {anchored}')
 sys.exit(0)
 PYEOF
 }
@@ -647,7 +693,7 @@ PYEOF
 # check_settings_file <file> <label> <missing> — compaction block (enabled +
 # reserve/keep) + the bounded retry/hang contract, BLOCK on drift.
 check_settings_file() {
-  local file="$1" label="$2" missing="$3" raw window_hung window_worst issues i
+  local file="$1" label="$2" missing="$3" anchor="${4:-yes}" raw window_hung window_worst geometry issues i
   if [ ! -f "$file" ]; then
     if [ "$missing" = "block" ]; then
       # block_retry, not block: this file carries the bounded retry/hang contract
@@ -694,7 +740,12 @@ check_settings_file() {
       esac
     done <<< "$issues"
   else
-    ok "$label — compaction (enabled + reserve ${REVIEWED_RESERVE} + keep 12000; guard geometry ${CLAMP}−${REVIEWED_RESERVE}=$((CLAMP - REVIEWED_RESERVE)) matches the instruments' ${FLEET_REGIME_TB} floor) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
+    geometry="guard geometry ${CLAMP}−${REVIEWED_RESERVE}=$((CLAMP - REVIEWED_RESERVE)) matches the instruments' ${FLEET_REGIME_TB} floor"
+    # The geometry is ANCHORED on the shipped surface only (`check_models_window_anchor`); a live
+    # file's windows are `warn`-class and never asserted, so printing the derived claim here would
+    # certify a geometry this guard does not enforce on that file (code-review cycle 2).
+    [ "$anchor" = "no" ] && geometry="window geometry anchored on the shipped surface only — not certified for this file"
+    ok "$label — compaction (enabled + reserve ${REVIEWED_RESERVE} + keep 12000; ${geometry}) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
   fi
 }
 
@@ -862,7 +913,7 @@ else
   else
     check_model_file "$LIVE_DIR/models.json" "live models.json ($LIVE_DIR)" models warn
     check_model_file "$LIVE_DIR/models-store.json" "live models-store.json ($LIVE_DIR)" store warn
-    check_settings_file "$LIVE_DIR/settings.json" "live settings.json ($LIVE_DIR)" warn
+    check_settings_file "$LIVE_DIR/settings.json" "live settings.json ($LIVE_DIR)" warn no
   fi
 fi
 

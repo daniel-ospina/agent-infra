@@ -259,7 +259,9 @@ property; this guard is the pattern to copy, not a substitute for it.
   4h refresh may re-write the live store back to 1M, and that is **DETECTED,
   not blocked**.
 - **Guard classes** (`scripts/check-cost-config.sh`):
-  - `models.json` drift (any deepseek-served id > 300K) → **BLOCK (exit 1)**.
+  - `models.json` drift (any deepseek-served id > 300K), **or** a
+    deepseek-served entry whose `contextWindow` is absent, non-numeric, or not
+    equal to `300000` (the geometry anchor below) → **BLOCK (exit 1)**.
   - `settings.json` drift (compaction block: enabled + `reserveTokens` **16384**
     (the reviewed value — asserted independently, see the `#1227` note below) +
     a geometry check that `300000 − reserveTokens` equals the fleet regime floor
@@ -269,7 +271,16 @@ property; this guard is the pattern to copy, not a substitute for it.
     above is only an upper bound (`≤ CLAMP`), so without that anchor a window
     *below* the ceiling left the real trigger at `window − reserve` while the
     geometry leg certified `300000 − reserve` — a false PASS, closed 2026-09-22
-    (`scripts/check-cost-config.sh`'s `check_models_window_anchor`) +
+    (`scripts/check-cost-config.sh`'s `check_models_window_anchor`). The anchor
+    is carried on the **shipped** `models.json` only (the live file stays
+    WARN-class, and its geometry is not certified); it treats an **absent or
+    non-numeric** `contextWindow` as a violation rather than a skip — pi resolves
+    an absent one to `128000` (a `providers.*.models[]` row) or to the
+    4h-refreshed catalog (a `modelOverrides` value), and rejects the *whole*
+    file on a non-numeric one, leaving an empty provider map — and it refuses
+    with exit 2 when **no** deepseek-served entry is recognised at all, because
+    "every deepseek-served window equals the anchor" over an empty set asserts
+    nothing (its green line names the entry count it checked); and
     `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract —
     the keys are `retry.maxRetries`, `httpIdleTimeoutMs`, `retry.baseDelayMs`,
     `retry.provider.timeoutMs`, `retry.provider.maxRetries`; **the table in §2
@@ -304,8 +315,12 @@ property; this guard is the pattern to copy, not a substitute for it.
     statement the label anchor also matches (a re-labelled band, a duplicated
     boundary) read as an instrument disagreement, which points the reader at the
     wrong root cause; an *unlabelled* `if N <= tb <` line cannot match the
-    label-anchored pattern at all. This class is **not** covered by
-    `COST_CLAMP_OVERRIDE=1`.
+    label-anchored pattern at all. The numeric capture is bounded to 15 digits,
+    so an unrepresentable literal cannot slip past the coherence comparison as
+    a bash integer-comparison error. The **same exit-2 class** covers a
+    `models.json` in which no deepseek-served entry is recognised — a geometry
+    anchor with nothing to assert must not read green. This class is **not**
+    covered by `COST_CLAMP_OVERRIDE=1`.
   - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
     deletion of the clamp authority is itself terminal drift (clamp gone while
     CI stays green). Store-class and live-dir-missing (first-install) stay

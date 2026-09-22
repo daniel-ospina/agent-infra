@@ -1648,6 +1648,18 @@ if [ "$code" -eq 1 ]; then pass "both instruments moved together → the derived
 if grep -q "geometry derives 283616" "$OUT"; then pass "the derived leg names the geometry and the new floor"; else fail "expected the derived-geometry message"; sed -n '1,30p' "$OUT"; fi
 mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
 mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (g) an EMPTY/INVERTED band — the watcher's lower bound moved ABOVE its upper bound, with the
+# report default moved to match so the disagreement leg stays silent. Without the coherence
+# refusal the guard certifies a floor the watcher can never band a record into. The guard's own
+# comment records `if 983616 <= tb < 650000` as the reproduction; this arm pins it.
+sed -i.bak 's/FLEET_REGIME_TB:-283616/FLEET_REGIME_TB:-983616/' "$TMP37/scripts/fleet-cost-report.sh"
+sed -i.bak 's/if 283616 <= tb < 650000/if 983616 <= tb < 650000/' "$TMP37/scripts/watch-truncation.sh"
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "an empty/inverted watcher band -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on an inverted band, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "band is empty or inverted" "$OUT"; then pass "the inverted-band refusal is explicit"; else fail "expected an explicit inverted-band refusal"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
 # (f) a SECOND labelled `300K-clamp` bucket statement makes the floor ambiguous → exit 2, never a
 # source-order pick.
 printf '\nbucket_dup = "300K-clamp-dup" if 283616 <= tb < 650000 else None\n' >> "$TMP37/scripts/watch-truncation.sh"
@@ -1702,6 +1714,24 @@ PYEOF
 then
   grep -q '^CLAMP=1000000$' "$TMP38/scripts/check-cost-config.sh" || fail "38 fixture: the CLAMP mutation did not take effect"
   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["compaction"]["reserveTokens"] == 716384 else 1)' "$TMP38/pi-bootstrap/pi-config/settings.json" || fail "38 fixture: the reserve mutation did not take effect"
+  # The third mutation — the models.json window walk — must also be asserted (as test 40 does for
+  # its own). Unguarded, a no-op walk leaves the windows at 300000, the ANCHOR fires instead of the
+  # independent pin, the guard still exits 1, and the two arms below still pass: the test would
+  # report that it isolated the pin when it did not.
+  python3 -c 'import json,re,sys
+d=json.load(open(sys.argv[1]))
+DS=re.compile(r"^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)")
+ws=[]
+def walk(n):
+    if isinstance(n,dict):
+        if isinstance(n.get("id"),str) and DS.match(n["id"].split("/")[-1]) and isinstance(n.get("contextWindow"),(int,float)): ws.append(n["contextWindow"])
+        for k,v in n.items():
+            if isinstance(k,str) and isinstance(v,dict) and DS.match(k.split("/")[-1]) and isinstance(v.get("contextWindow"),(int,float)): ws.append(v["contextWindow"])
+            walk(v)
+    elif isinstance(n,list):
+        for i in n: walk(i)
+walk(d)
+sys.exit(0 if ws and all(w==1000000 for w in ws) else 1)' "$TMP38/pi-bootstrap/pi-config/models.json" || fail "38 fixture: the models.json window mutation did not take effect"
   bash "$TMP38/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
   code=$?
   if [ "$code" -eq 1 ]; then pass "inflated reserve (same trigger) → exit 1"; else fail "expected exit 1 for the inflated reserve, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1948,6 +1978,66 @@ bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 0 ]; then pass "the pristine root is green (the anchor accepts the shipped geometry)"; else fail "expected exit 0 on the pristine root, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "every deepseek-served contextWindow is the geometry anchor 300000" "$OUT"; then pass "the green run states the anchor it verified"; else fail "expected the anchor's green line"; sed -n '1,30p' "$OUT"; fi
+# …and it states HOW MANY entries it anchored: "every deepseek-served window" over an empty set is
+# a green that asserts nothing, so the count is what makes this line non-vacuous.
+if grep -Eq "geometry anchor 300000 \([1-9][0-9]* entries\)" "$OUT"; then pass "the green line names a non-zero entry count (the anchor is not vacuous)"; else fail "expected the anchor's green line to report a non-zero entry count"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP43"
+# (d) an ABSENT contextWindow on a deepseek-served entry. pi resolves it to 128000 (a models[] row)
+# or to the 4h-refreshed catalog (a modelOverrides value) — never to the ceiling — so the anchor
+# must block rather than skip it. This is the window-below-the-ceiling false PASS reached by
+# DELETION instead of by lowering.
+TMP43="$(mktemp -d /tmp/cost-config-window-anchor.XXXXXX)"
+mkroot "$TMP43"
+if python3 - "$TMP43/pi-bootstrap/pi-config/models.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+del d["providers"]["deepseek"]["models"][0]["contextWindow"]
+json.dump(d, open(p, "w"), indent=2)
+PYEOF
+then
+  bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "an ABSENT contextWindow on a deepseek-served row -> exit 1"; else fail "expected exit 1 for an absent contextWindow, got $code"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "no numeric contextWindow" "$OUT"; then pass "the block names the missing window"; else fail "expected the missing-window message"; sed -n '1,30p' "$OUT"; fi
+else
+  fail "43 fixture (d) mutation FAILED — the test cannot observe the condition, so it must not report the arms"
+fi
+rm -rf "$TMP43"
+# (e) a PRESENT but NON-NUMERIC contextWindow. pi's schema declares it a Number and rejects the
+# WHOLE file, leaving an empty provider map — the clamp authority gone while the file is still
+# there, the same class the "MISSING models.json -> BLOCK" arm exists to catch.
+TMP43="$(mktemp -d /tmp/cost-config-window-anchor.XXXXXX)"
+mkroot "$TMP43"
+if python3 - "$TMP43/pi-bootstrap/pi-config/models.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["providers"]["deepseek"]["models"][0]["contextWindow"] = "300000"
+json.dump(d, open(p, "w"), indent=2)
+PYEOF
+then
+  bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "a NON-NUMERIC contextWindow (\"300000\") -> exit 1"; else fail "expected exit 1 for a non-numeric contextWindow, got $code"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "no numeric contextWindow" "$OUT"; then pass "the block names the non-numeric value"; else fail "expected the non-numeric-window message"; sed -n '1,30p' "$OUT"; fi
+else
+  fail "43 fixture (e) mutation FAILED — the test cannot observe the condition, so it must not report the arms"
+fi
+rm -rf "$TMP43"
+# (f) a models.json with NO deepseek-served entry at all: the anchor has nothing to assert, so it
+# must REFUSE (exit 2) rather than print a vacuous "every … is the anchor" green.
+TMP43="$(mktemp -d /tmp/cost-config-window-anchor.XXXXXX)"
+mkroot "$TMP43"
+python3 - "$TMP43/pi-bootstrap/pi-config/models.json" <<'PYEOF'
+import json, sys
+json.dump({"providers": {"anthropic": {"models": [{"id": "claude-sonnet", "contextWindow": 200000}]}}},
+          open(sys.argv[1], "w"), indent=2)
+PYEOF
+bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "no deepseek-served entry to anchor -> exit 2 (fail-closed, never a vacuous green)"; else fail "expected exit 2 when the anchor recognises nothing, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "no deepseek-served entry was recognised" "$OUT"; then pass "the zero-entry refusal is explicit"; else fail "expected an explicit zero-entry refusal"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP43"
 
 if [ "$failures" -eq 0 ]; then

@@ -168,8 +168,11 @@ const SUMMARIZATION_BUDGET_REQUEST_REPLACE =
 // the summary the update prompt is told to PRESERVE, so the generation hits the cap, comes back
 // stopReason "length", and getSummarizationFailure() discards it — the (d) failure again, through
 // the clamp. The fix is two-sided and lives at ONE seam:
-//   * createSummarizationOptions (the shared choke point for every summarization call, in
-//     compaction.js) marks the request;
+//   * createSummarizationOptions (the compaction module's shared constructor — the caller
+//     `generateSummaryWithUsage` and `generateTurnPrefixSummary` both go through it, in
+//     compaction.js) marks the request. The summarization call sites that build their options
+//     inline do NOT reach it and are therefore NOT marked — that set is listed in README
+//     **Known gaps** 13, and carrying (e) to them is follow-up work (#1340);
 //   * buildBaseOptions (pi-ai, reached by every provider adapter) honours the marker, and throws
 //     an explicit error naming the prompt size and the window when the prompt cannot fit at all.
 //   * the anthropic-messages and bedrock adapters clamp a SECOND time in streamSimple, for the

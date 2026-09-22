@@ -188,7 +188,8 @@ is real but not casually reachable at the 300K window; the 2,000-char tool-resul
 
 **The seam.** `clampMaxTokensToContext` is called from `buildBaseOptions`, which has ~10 call sites,
 so a blanket removal would exempt every normal turn — a regression. The exemption is therefore
-gated on a marker set at the one shared summarization choke point:
+gated on a marker set at the compaction module's one shared summarization choke point (what that
+does **not** cover is listed under **Known gaps** 13):
 
 - `createSummarizationOptions` (the shared constructor the compaction module's summarization
   callers go through — `generateSummaryWithUsage` **and** `generateTurnPrefixSummary`) sets
@@ -517,22 +518,42 @@ trees. It builds its own trees and never modifies the installed one.
     runs against a **registered** model on a deliberately shrunk window (see the (e) section); no
     claim is made that the shipped configuration exercises it.
 13. **Change (e) is carried only where the summarization options are built by
-    `createSummarizationOptions`; four other summarization construction sites build their options
-    inline and are still clamped.** The bundled pi-agent-core facade's `generateSummaryWithRequest`,
-    `generateTurnPrefixSummary2` and `generateBranchSummaryWithRequest` (all in
-    `dist/bundle/chunks/chunk-JVUZSMYM.js`) construct `{ maxTokens, … }` themselves and pass it
-    through `createSummaryRequestOptions`, which spreads the object but never adds the marker; the
-    ESM `dist/core/compaction/branch-summarization.js` does the same with its own
-    `{ apiKey, headers, env, signal, maxTokens }`. Their options therefore reach `buildBaseOptions`
+    `createSummarizationOptions`; the summarization call sites that build their options inline are
+    still clamped.** The installed 0.85.1 tree carries **five** such sites:
+    - `generateSummaryWithRequest` and `generateTurnPrefixSummary2` in
+      `dist/bundle/chunks/chunk-JVUZSMYM.js` (the bundled pi-agent-core facade) construct
+      `{ maxTokens, reasoning }` themselves;
+    - `generateBranchSummaryWithRequest`, in the same chunk, passes `{ maxTokens: 2048 }` to
+      `createSummaryRequestOptions`;
+    - `function generateBranchSummary` in the same chunk — the **inlined minified copy** of
+      `branch-summarization.js` — builds `{ apiKey, headers, env: env2, signal, maxTokens }`
+      inline. This is the copy the CLI actually runs: the package `bin` is `dist/bundle/cli.js`, so
+      the `/tree` branch summarization goes through it, **not** the ESM file below;
+    - the ESM `dist/core/compaction/branch-summarization.js` builds the same
+      `{ apiKey, headers, env, signal, maxTokens }` shape.
+    None of them reaches `createSummarizationOptions`, so their options arrive at `buildBaseOptions`
     with `options?.skipContextClamp === undefined`, take the un-gated arm and keep the clamp — and
     the `available <= 0` throw is unreachable for them, so a starved branch summary still collapses
-    to the 1024 floor and is discarded by `getSummarizationFailure`. pi's own auto-compaction
-    reaches none of them (it uses the inlined compaction copy, which does go through
-    `createSummarizationOptions`), so the shipped behaviour and the (e) test are unaffected; the
-    exposure is an SDK consumer importing pi-agent-core's `compact`, and the branch-summarization
-    path. **This is not the same shape as gap 12's carried-but-unreachable entries**: change (d)
+    to the 1024 floor and is discarded by `getSummarizationFailure`. The sibling ESM package
+    `node_modules/@earendil-works/pi-agent-core/dist/harness/compaction/` (0.85.1 — the package an
+    SDK `compact` import resolves to, and the path gap 2's "third consumer" would take) is unmarked
+    the same way; whether it is inside this manifest's declared scope or explicitly outside it is to
+    be settled with #1340, together with the exact site list. pi's own auto-compaction reaches none
+    of them (it uses the inlined compaction copy, which does go through `createSummarizationOptions`),
+    so the shipped behaviour and the (e) test are unaffected; the exposure is an SDK consumer
+    importing pi-agent-core's `compact`, and the branch-summarization path.
+    **This is not the same shape as gap 12's carried-but-unreachable entries**: change (d)
     *is* carried on `generateSummaryWithRequest` (entry `d3-summarization-budget-bundle-request`), so
     (e) not being carried there is a genuine asymmetry rather than a scope boundary. Carrying (e)
     there is deliberate follow-up work, tracked as agent-infra **#1340** — the manifest's `find` must
     include the enclosing function signature, because the inline options expression occurs **twice**
     in the chunk and a bare expression anchor is (correctly) refused as ambiguous.
+14. **`apply.mjs`'s "already applied" test is payload-verbatim-anywhere, so a neutralised copy reads
+    as applied.** The test is `next.includes(entry.replace)`: it answers "is this payload string
+    present?", not "is the fix in force?". A tree that retains the payload verbatim inside an inert
+    literal — a string, a `/* … */` block, a dead branch — therefore reads as applied over a tree
+    with no working fix, and `--check` exits 0. It is strictly better than the scattered-substring
+    test it replaced (which a comment quoting the needles satisfied), and it is the best signal
+    available without executing the tree, so it is **kept** — but it is a heuristic, not proof, and
+    the `apply.sh` table's "anchor absent, the entry's replacement payload present verbatim →
+    already applied" row inherits that limit. Tracked as agent-infra **#1341**.
