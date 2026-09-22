@@ -208,7 +208,12 @@ SETTINGS_BLOCKS=0
 WARNS=0
 
 usage() {
-  sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the LEADING COMMENT BLOCK, derived rather than a fixed line range. A fixed `2,41p`
+  # silently truncated `--help` mid-sentence when the header grew (it reached 53 lines in the
+  # #1316 cycle-3 commit), dropping the whole `Usage:` section and the dep-free note — and the
+  # unknown-argument path calls this too, so the same truncation hid the usage from a bad invocation
+  # (code-review cycle 3, P1). Stop at the first non-comment line, as scripts/ci-failure-set.sh does.
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 while [ $# -gt 0 ]; do
@@ -601,8 +606,30 @@ check_models_window_anchor() {
     block_settings "$label — the window geometry anchor could not be read, so the derived reserve leg is unassertable (fail-closed): $out"
     return
   fi
-  anchored="$(printf '%s\n' "$out" | sed -n 's/^ANCHORED \([0-9][0-9]*\)$/\1/p')"
-  bad="$(printf '%s\n' "$out" | grep -v '^ANCHORED ')"
+  # The analyser emits every violation and then a FINAL `ANCHORED <n>` line. Identify that line by
+  # POSITION, never by a content prefix: a violation's first field is a model id (or a
+  # `modelOverrides` key), ids are data, and a diagnostic line begins with `where` verbatim — so an
+  # entry whose id normalises to a deepseek match but is written as `ANCHORED 5/deepseek-v4-flash`
+  # emits a line satisfying any `^ANCHORED ` prefix filter. Such a filter DELETES that violation,
+  # and with the other 27 entries anchoring normally the guard prints a green over 27 entries while
+  # the bad window goes unchecked — the window-below-the-ceiling false PASS this anchor exists to
+  # close, reached through the parser (code-review cycle 3, P1; reproduced, and pre-delta the same
+  # tree correctly exited 1). Position is unambiguous; content is not.
+  anchored="$(printf '%s\n' "$out" | tail -1)"
+  case "$anchored" in
+    ANCHORED\ [0-9]*) anchored="${anchored#ANCHORED }" ;;
+    *) anchored="" ;;
+  esac
+  case "$anchored" in
+    ''|*[!0-9]*) anchored="" ;;
+  esac
+  if [ -z "$anchored" ]; then
+    # Truncated or empty analyser output: it never reached its count line, so NOTHING is asserted.
+    # Same fail-closed arm as PARSE_ERROR — an unreadable anchor is not an assertion.
+    block_settings "$label — the window geometry anchor produced no readable count line, so the derived reserve leg is unassertable (fail-closed): $out"
+    return
+  fi
+  bad="$(printf '%s\n' "$out" | sed '$d')"
   if [ -n "$bad" ]; then
     while IFS= read -r b; do
       [ -n "$b" ] && block_settings "$label — $b"
@@ -613,7 +640,7 @@ check_models_window_anchor() {
   # over an empty set asserts nothing, and the guard's premise (a deepseek clamp to protect) is
   # gone. Refuse before the override path, exactly like an underivable floor.
   if [ -z "$anchored" ] || [ "$anchored" -eq 0 ]; then
-    echo "error: no deepseek-served entry was recognised in $file — the geometry anchor has nothing to assert, so the derived reserve leg must not read green (fail-closed; not covered by COST_CLAMP_OVERRIDE=1). Check the matcher and the model ids before treating this as a clean tree." >&2
+    echo "error: no deepseek-served entry was recognised in $file — the geometry anchor has nothing to assert, so the derived reserve leg must not read green (fail-closed; not covered by COST_CLAMP_OVERRIDE=1). Check the matcher and the model ids before treating this as a clean tree. NOTE: because this refusal exits before the settings checks, a concurrent compaction or retry/hang violation is NOT reported in this run — fix the anchor and re-run to see it." >&2
     exit 2
   fi
   ok "$label — every deepseek-served contextWindow is the geometry anchor ${CLAMP} (${anchored} entries)"
@@ -625,15 +652,23 @@ check_models_window_anchor() {
 # a plain function body, never nested inside a command substitution.
 #
 # Why an ABSENT key is a violation and not a skip — this anchor's claim is "the window the
-# compaction trigger uses IS `CLAMP`", and neither recognised shape delivers that with the key
-# missing: a `providers.*.models[]` row resolves `contextWindow ?? 128000` (pi's `modelFromJson`),
-# and a `modelOverrides` value resolves `override.contextWindow ?? model.contextWindow` against the
-# 4h-refreshed catalog (which this guard's own header says may legitimately revert to 1M). Skipping
-# it left the derived leg certifying `CLAMP − reserve` while the runtime trigger was neither — the
-# same window-below-the-ceiling false PASS this anchor exists to close, reached by DELETION instead
-# of by lowering. A non-numeric value is worse still: pi's schema declares `contextWindow` a Number
-# and `ModelConfig.load` then rejects the WHOLE file, leaving an empty provider map — the clamp
-# authority gone with the file present, which the "MISSING models.json → BLOCK" arm exists to catch.
+# compaction trigger uses IS `CLAMP`". For a `providers.*.models[]` row pi's `modelFromJson`
+# resolves `contextWindow ?? 128000`, and for a `modelOverrides` value `applyModelOverride`
+# resolves `override.contextWindow ?? model.contextWindow` against a base that may be the
+# 4h-refreshed catalog (which this guard's own header says may legitimately revert to 1M).
+# Skipping it left the derived leg certifying `CLAMP − reserve` while the runtime trigger was
+# neither — the same window-below-the-ceiling false PASS this anchor exists to close, reached by
+# DELETION instead of by lowering. A non-numeric value is worse still: pi's schema declares
+# `contextWindow` a Number and `ModelConfig.load` then rejects the WHOLE file, leaving an empty
+# provider map — the clamp authority gone with the file present, which the "MISSING models.json →
+# BLOCK" arm exists to catch.
+#
+# STATED LIMIT: this walk is per-entry and does NOT model same-file inheritance, so it also
+# refuses a layout that is runtime-correct — a `models[]` row with no window whose co-located
+# `modelOverrides[<same id>]` supplies `contextWindow: CLAMP`. The refusal message says so rather
+# than inventing a cause, because the alternative (resolving the composition) would have to
+# reproduce pi's per-provider override lookup inside the guard, and a wrong answer there is a
+# false PASS, which is worse than a false block. Documented in docs/ops/cost-config-policy.md.
 models_window_anchor_violations() {
   python3 - "$CLAMP" "$1" <<'PYEOF'
 import json, re, sys
@@ -654,8 +689,9 @@ anchored = 0
 def note(where, cw):
     global anchored
     if isinstance(cw, bool) or not isinstance(cw, (int, float)):
-        bad.append(f'{where} has no numeric contextWindow (found {cw!r}), so pi does not resolve this '
-                   f'entry to the {clamp} geometry — the derived reserve leg must not certify it '
+        bad.append(f'{where} has no numeric contextWindow (found {cw!r}); this anchor does not model '
+                   f'same-file modelOverrides inheritance, so it cannot certify that pi resolves this '
+                   f'entry to the {clamp} geometry — give it an explicit numeric contextWindow '
                    f'(fail-closed)')
     elif cw != clamp:
         bad.append(f'{where} contextWindow={cw}, but the geometry anchor is {clamp}')
@@ -693,7 +729,7 @@ PYEOF
 # check_settings_file <file> <label> <missing> — compaction block (enabled +
 # reserve/keep) + the bounded retry/hang contract, BLOCK on drift.
 check_settings_file() {
-  local file="$1" label="$2" missing="$3" anchor="${4:-yes}" raw window_hung window_worst geometry issues i
+  local file="$1" label="$2" missing="$3" anchor="${4:-no}" raw window_hung window_worst geometry issues i
   if [ ! -f "$file" ]; then
     if [ "$missing" = "block" ]; then
       # block_retry, not block: this file carries the bounded retry/hang contract
@@ -742,9 +778,11 @@ check_settings_file() {
   else
     geometry="guard geometry ${CLAMP}−${REVIEWED_RESERVE}=$((CLAMP - REVIEWED_RESERVE)) matches the instruments' ${FLEET_REGIME_TB} floor"
     # The geometry is ANCHORED on the shipped surface only (`check_models_window_anchor`); a live
-    # file's windows are `warn`-class and never asserted, so printing the derived claim here would
-    # certify a geometry this guard does not enforce on that file (code-review cycle 2).
-    [ "$anchor" = "no" ] && geometry="window geometry anchored on the shipped surface only — not certified for this file"
+    # file's windows are `warn`-class and never asserted, so printing the derived claim there would
+    # certify a geometry this guard does not enforce on that file (code-review cycle 2). The DEFAULT
+    # is the disclaiming branch: a printed certification must be opted into by the caller that
+    # actually asserts it, not inherited by a caller that simply forgot the argument.
+    [ "$anchor" = "yes" ] || geometry="window geometry anchored on the shipped surface only — not certified for this file"
     ok "$label — compaction (enabled + reserve ${REVIEWED_RESERVE} + keep 12000; ${geometry}) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
   fi
 }
@@ -900,7 +938,7 @@ fi
 check_model_file "$SHIPPED_DIR/models.json" "shipped models.json" models block
 check_models_window_anchor "$SHIPPED_DIR/models.json" "shipped models.json"
 check_model_file "$SHIPPED_DIR/models-store.json" "shipped models-store.json" store warn
-check_settings_file "$SHIPPED_DIR/settings.json" "shipped settings.json" block
+check_settings_file "$SHIPPED_DIR/settings.json" "shipped settings.json" block yes
 check_project_settings
 
 if [ "$SHIPPED_ONLY" = 1 ]; then

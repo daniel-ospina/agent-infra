@@ -2039,6 +2039,38 @@ code=$?
 if [ "$code" -eq 2 ]; then pass "no deepseek-served entry to anchor -> exit 2 (fail-closed, never a vacuous green)"; else fail "expected exit 2 when the anchor recognises nothing, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "no deepseek-served entry was recognised" "$OUT"; then pass "the zero-entry refusal is explicit"; else fail "expected an explicit zero-entry refusal"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP43"
+# (g) a deepseek-normalising id whose FIRST FIELD would satisfy a `^ANCHORED ` prefix filter. The
+# analyser prints the id verbatim as each diagnostic's first field, so filtering violations by that
+# prefix deleted this one and the guard still printed its green over the remaining entries — the
+# window-below-the-ceiling false PASS, reached through the parser. The count line is now found by
+# POSITION. Regression test for the cycle-3 P1.
+TMP43="$(mktemp -d /tmp/cost-config-window-anchor.XXXXXX)"
+mkroot "$TMP43"
+if python3 - "$TMP43/pi-bootstrap/pi-config/models.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["providers"]["deepseek"]["models"].append({"id": "ANCHORED 5/deepseek-v4-pro", "contextWindow": 250000})
+json.dump(d, open(p, "w"), indent=2)
+PYEOF
+then
+  bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "an id whose diagnostic line starts with 'ANCHORED ' -> exit 1 (the count line is found by position, not by a content prefix)"; else fail "expected exit 1 for the ANCHORED-prefixed id, got $code (a prefix filter would swallow this violation)"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "ANCHORED 5/deepseek-v4-pro contextWindow=250000" "$OUT"; then pass "the prefixed violation is reported, not swallowed"; else fail "expected the ANCHORED-prefixed violation to be reported"; sed -n '1,30p' "$OUT"; fi
+else
+  fail "43 fixture (g) mutation FAILED — the test cannot observe the condition, so it must not report the arms"
+fi
+rm -rf "$TMP43"
+
+echo ""
+# ── 44. `--help` prints the WHOLE leading comment block. `usage()` used a fixed line range, which
+#       silently truncated the header the moment it grew — dropping the entire `Usage:` section —
+#       and the unknown-argument path calls the same function, so a bad invocation lost it too.
+echo "44. --help prints the full header (the range is derived, not a fixed line count)"
+if bash "$GUARD" --help >"$OUT" 2>&1; then pass "--help exits 0"; else fail "--help did not exit 0"; sed -n '1,10p' "$OUT"; fi
+if grep -q '^Usage:' "$OUT"; then pass "the Usage section is present"; else fail "the Usage section is missing — usage() is printing a truncated header"; sed -n '1,10p' "$OUT"; fi
+if grep -q 'Dep-free of npm' "$OUT"; then pass "the header's tail is present (no mid-sentence truncation)"; else fail "the header is truncated"; sed -n '1,10p' "$OUT"; fi
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

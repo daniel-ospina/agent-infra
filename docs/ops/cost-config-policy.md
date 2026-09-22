@@ -277,7 +277,13 @@ property; this guard is the pattern to copy, not a substitute for it.
     non-numeric** `contextWindow` as a violation rather than a skip — pi resolves
     an absent one to `128000` (a `providers.*.models[]` row) or to the
     4h-refreshed catalog (a `modelOverrides` value), and rejects the *whole*
-    file on a non-numeric one, leaving an empty provider map — and it refuses
+    file on a non-numeric one, leaving an empty provider map. The walk is
+    **per-entry and does not model same-file inheritance**, so a `models[]` row
+    that omits the window while the same provider's `modelOverrides[<id>]`
+    supplies `contextWindow: 300000` is refused too, and the message says so
+    rather than inventing a cause: reproducing pi's per-provider override
+    lookup inside the guard risks a wrong answer, and a wrong answer here is a
+    false PASS, which is worse than the false block. It also refuses
     with exit 2 when **no** deepseek-served entry is recognised at all, because
     "every deepseek-served window equals the anchor" over an empty set asserts
     nothing (its green line names the entry count it checked); and

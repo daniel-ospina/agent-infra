@@ -519,7 +519,7 @@ trees. It builds its own trees and never modifies the installed one.
     claim is made that the shipped configuration exercises it.
 13. **Change (e) is carried only where the summarization options are built by
     `createSummarizationOptions`; the summarization call sites that build their options inline are
-    still clamped.** The installed 0.85.1 tree carries **five** such sites:
+    still clamped.** The installed `pi-coding-agent` 0.85.1 package carries **five** such sites:
     - `generateSummaryWithRequest` and `generateTurnPrefixSummary2` in
       `dist/bundle/chunks/chunk-JVUZSMYM.js` (the bundled pi-agent-core facade) construct
       `{ maxTokens, reasoning }` themselves;
