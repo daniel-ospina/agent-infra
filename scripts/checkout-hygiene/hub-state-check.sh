@@ -34,9 +34,8 @@
 # arbitrarily behind or diverged reported PASS — a false PASS on exactly the
 # state that hides itself. Everything merged upstream is simply ABSENT from the
 # checkout, so a lane reading the hub learns a stale answer and an absent guard
-# reads as a passing guard (tortoise hub: 3 days / 308 commits stale, #1309,
-# #1125). Freshness is compared against the SAME-NAMED, ALREADY-FETCHED
-# remote-tracking ref — refs/remotes/<remote>/<branch>, with <remote> read from
+# reads as a passing guard (#1309, #1125). Freshness is compared against the
+# SAME-NAMED, ALREADY-FETCHED remote-tracking ref — refs/remotes/<remote>/<branch>, with <remote> read from
 # `branch.<branch>.remote` (else `origin`) — and NOT `@{u}` itself, which is free
 # to name an UNRELATED branch or a LOCAL branch (either would otherwise be
 # compared against itself and PASS while arbitrarily behind mainline). A config
