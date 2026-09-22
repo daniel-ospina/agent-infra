@@ -71,10 +71,10 @@
 #   4. THE TREE MUST BE GREEN WHERE THE RAIL CAN SEE IT. Preconditions 1-3 are
 #      all LANE-SCOPED. A lane-scoped comparison is blind to the rest of the
 #      tree, and that blindness is a false PASS at the merge level — not a
-#      wording problem (#1261, proven twice in one day). See MAIN'S TREE HEALTH
+#      wording problem (#1261, proven twice in one day). See THE PR'S EVALUATED TREE
 #      below.
 #
-# ── MAIN'S TREE HEALTH (#1261) ────────────────────────────────────────────
+# ── THE PR'S EVALUATED TREE (#1261) ───────────────────────────────────────
 # The incident, exactly. PR #4589 (commit ebe4e7e8f) landed three ruff
 # violations in `tools/embedded_evidence.py`. The ruff gate is the
 # `agent-infra-ci / lint` job of `ci.yml`, which runs on the PULL REQUEST MERGE
@@ -82,21 +82,60 @@
 # touching neither file. The rail was watching `python-ci.yml`: green on both
 # sides, so both failing sets were empty, the vacuous branch merged, and PR
 # #4600 then merged onto the same red main. The repair came from a HUMAN
-# noticing. The fact was sitting on main's own commit check surface the whole
-# time — measured on the real commit: `lint` -> completed/failure (run
-# 35694314270, workflow `Post-merge validation`), beside 27 check runs that
-# were green.
+# noticing.
 #
-# WHAT IS MEASURED, AND WHY IT IS THE RIGHT SOURCE. Main's health is read from
-# the CHECK RUNS AND COMMIT STATUSES ATTACHED TO MAIN'S HEAD COMMIT
-# (`GET /repos/{owner}/{repo}/commits/{base}/check-runs` + `/status`) — the same
-# object a reviewer sees on the commit, EVERY workflow and EVERY app, not just
-# `--workflow`. It names the failing JOB (the lane comparison can only name
-# test node ids) and each check run carries its own run URL. REQUIRED CHECKS ARE
-# DELIBERATELY NOT THE SOURCE: this rail merges with `--admin`, which BYPASSES
-# required checks, so a check that is not required gates nothing — and in the
-# incident the red job was not a required check at all. Reading branch
-# protection would have proved nothing.
+# WHY MAIN'S HEAD WAS THE WRONG TREE. The first fix read MAIN'S HEAD surface.
+# That catches the incident, but it also refuses the PR that REPAIRS a red
+# main — while main is red, the repair is red-looking for as long as it is
+# unmerged — so the rail could not land its own recovery and pushed it onto the
+# manual `AGENT_ADMIN_MERGE_OVERRIDE=1` escape. The question has to be asked
+# about the tree THIS PR PRODUCES, not the tree main is already on.
+#
+# WHAT CI ACTUALLY EVALUATES (#1261 CORRECTION, VERIFIED — NOT ASSUMED). For an
+# open, mergeable PR the `pull_request` event sets `GITHUB_REF` to the merge
+# branch and `GITHUB_SHA` to the merge commit
+# (docs: Events that trigger workflows → pull_request), and `actions/checkout`
+# uses that ref — so the tested TREE IS the merge ref `refs/pull/<N>/merge`.
+# Verified on a live run: the job log fetches
+# `+67c72331…:refs/remotes/pull/1333/merge` and reports `HEAD is now at 67c7233
+# Merge e55b123c… into 59a08fcd…`.
+#
+# BUT THE CHECK SURFACE IS KEYED TO THE HEAD SHA, NOT TO THE MERGE SHA. GitHub
+# attaches the run's check suite to the PR HEAD commit while the runner's
+# GITHUB_SHA is the merge commit. Measured: `GET …/commits/<merge-sha>/check-runs`
+# returns `total_count: 0` and `…/check-suites` returns `total_count: 0`, while
+# the SAME PR's head sha carries the 10 check suites (verified on
+# daniel-ospina/agent-infra #1333 — `merge_commit_sha` 67c72331 = the
+# `refs/pull/1333/merge` ref sha, zero checks; head e55b123c, 42 check runs —
+# and on cli/cli #14485, vitejs/vite #23552, microsoft/TypeScript #64385).
+# PROBING `refs/pull/<N>/merge` WOULD THEREFORE READ AN EMPTY SURFACE ON EVERY
+# PR, report UNMEASURED and merge — an INERT gate, which is exactly the false
+# PASS this rail exists to prevent. So the blocking surface is read from the
+# HEAD sha: `GET /repos/{owner}/{repo}/commits/{head}/check-runs` + `/status`.
+# That surface IS the merge-ref evaluation (the runs that produced it checked
+# out the merge branch), and it is the surface where the incident's inherited
+# `lint` red actually appears on a non-repairing PR and is ABSENT on a repair.
+#
+# WHAT IS REPORTED, AND WHAT BLOCKS. The PR's evaluated-tree surface BLOCKS.
+# MAIN'S HEAD SURFACE IS STILL MEASURED AND REPORTED (it is useful context — it
+# says whether the base is currently red) but it NEVER blocks: while main is
+# red, the repair PR is green on its own tree and must merge. Required checks
+# are deliberately NOT the source: this rail merges with `--admin`, which
+# BYPASSES required checks, so a check that is not required gates nothing — and
+# in the incident the red job was not a required check at all.
+#
+# THE MERGE REF ITSELF IS RESOLVED AND CHECKED, even though the surface is not
+# keyed to it, because its ABSENCE/STALENESS is the thing that makes a surface
+# untrustworthy. `GET /repos/{owner}/{repo}/pulls/<N>` gives `merge_commit_sha`
+# (the merge ref's sha for an open mergeable PR — verified equal to
+# `GET …/git/ref/pull/<N>/merge`, `.object.sha`) plus `mergeable`; `gh pr view
+# --json mergeCommit` does NOT work for this (GraphQL `mergeCommit` is null for
+# an unmerged PR — verified). A CONFLICTED PR (`mergeable: false`) has a NULL
+# `merge_commit_sha` while the ref may still exist with a STALE sha (verified on
+# #1161: ref ff2cede's parents are neither the current head 44e5ed1b nor the
+# current base 6d734f07) — so it is refused loudly rather than measured. An
+# ABSENT ref (fresh PR, `mergeable: null`, bounded re-poll then give up) is also
+# refused loudly: a surface we cannot tie to a merge is not a certificate.
 #
 # CLASSIFICATION. RED = a completed check run whose conclusion is `failure`,
 # `timed_out`, `action_required` or `startup_failure`; or a commit status whose
@@ -108,7 +147,7 @@
 # time a post-merge run starts. The pending COUNT is printed, so an unmeasured
 # surface is legible rather than silent.
 #
-# AND RED ONLY BLOCKS WHEN IT MEASURES CODE. Main's surface is dominated by
+# AND RED ONLY BLOCKS WHEN IT MEASURES CODE. MAIN's surface is dominated by
 # lanes that measure no revision: on tortoise's last eight main commits SEVEN
 # carried a failure-like check, and over the repo's last 100 main runs 6 of the
 # 12 failure-like runs were `registry-backup-cron` (event `schedule`) and 1 was
@@ -117,6 +156,16 @@
 # its own URL) to the EVENT that produced it: `schedule`/`issues`/`issue_comment`
 # are REPORTED but do not block; every other event, and any red whose run cannot
 # be resolved, BLOCKS. See MAIN_HEALTH_RUN_MAP_LIMIT.
+#
+# ON THE PR'S OWN TREE THAT FILTER IS VACUOUS — AND THAT IS THE POINT. A
+# `schedule`/`issues` run executes against the DEFAULT BRANCH head, so it can
+# never attach to a PR head sha: every red on the PR's surface is a
+# `pull_request`/`pull_request_target`/`push` run, i.e. a lane that measures a
+# revision, and it BLOCKS. The classifier is kept (shared code, and an
+# unresolved event still fails closed) but it is EXPECTED to exclude nothing
+# here; a non-code event appearing on a PR surface would itself be an anomaly.
+# The run map for a sha is selected by `gh run list --commit <sha>` (a sha is not
+# a branch name, so `--branch` cannot be used there as it is for main).
 #
 # SUPERSEDED RUNS. Re-running a failed check leaves the OLD failing check run in
 # place beside the new one — verified on tortoise commit fb27fff: `ai-review-gate`
@@ -482,8 +531,9 @@ resolve_draft() {
   $GH pr view "$pr" "$@" --json isDraft --jq .isDraft 2>/dev/null
 }
 
-# resolve_base_ref <pr> → the PR's TARGET branch (`baseRefName`). Main's health
-# is measured on that branch's head, because that is the tree the merge lands on.
+# resolve_base_ref <pr> → the PR's TARGET branch (`baseRefName`). The base branch's
+# head surface is measured for CONTEXT ONLY (it says whether main is currently
+# red); the tree that GATES the merge is the PR's own evaluated tree (#1261).
 # An unreadable or empty answer is not fatal — the caller defaults to `main`,
 # which every repo in this fleet uses — but the root cause is that a PR can
 # target a non-default branch, so the answer is preferred when it exists.
@@ -491,6 +541,83 @@ resolve_base_ref() {
   local pr="$1"; shift
   # shellcheck disable=SC2086
   $GH pr view "$pr" "$@" --json baseRefName --jq .baseRefName 2>/dev/null
+}
+
+# resolve_merge_ref <pr> — resolve the PR's MERGE REF identity, and stop loudly
+# when it cannot be trusted. Sets:
+#   MERGE_REF_STATUS   ok | conflicted | absent | unreadable
+#   MERGE_REF_SHA      the merge ref's sha (empty unless ok)
+#   MERGE_REF_SUMMARY  ONE legible line naming what was found
+#
+# WHY THIS IS READ AT ALL when the check surface is keyed to the head sha: the
+# merge ref's own state is the only way to tell a real evaluated tree from a
+# stale one. A CONFLICTED PR has `mergeable: false` and a NULL `merge_commit_sha`,
+# and `refs/pull/<N>/merge` — if it exists at all — is a STALE leftover from the
+# last time the PR was mergeable (verified: PR #1161's ref ff2cede has parents
+# that are neither the current head nor the current base). A FRESH PR has no
+# computed merge ref yet (`mergeable: null`). Both are refused LOUDLY rather
+# than measured: GitHub cannot merge a conflicted PR anyway, and a surface we
+# cannot tie to a merge is not a certificate.
+#
+# THE SOURCE IS THE REST PR OBJECT, NOT `gh pr view --json mergeCommit`: GraphQL
+# `mergeCommit` is NULL for any unmerged PR (verified on an open PR whose REST
+# `merge_commit_sha` was populated), so the GraphQL field would read as
+# "absent" for every PR the rail ever handles. The REST `merge_commit_sha` was
+# verified equal to the `refs/pull/<N>/merge` ref sha for open mergeable PRs.
+#
+# `mergeable: null` means GitHub has not finished computing mergeability
+# (documented: a background job starts and the value is null until it
+# completes), so it is RE-POLLED a bounded number of times before giving up —
+# the documented remedy, not a workaround. `MERGE_POLL_ATTEMPTS` is the bound;
+# POLL_INTERVAL paces it (0 in the harness).
+MERGE_POLL_ATTEMPTS="${ADMIN_MERGE_MERGE_POLL_ATTEMPTS:-3}"
+resolve_merge_ref() {
+  local pr="$1"
+  local slug line attempt=0 state
+  MERGE_REF_STATUS=""; MERGE_REF_SHA=""; MERGE_REF_SUMMARY=""
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  while :; do
+    # ONE call: mergeability and the merge ref sha together. `--jq` is real gh's
+    # projection; the harness stub answers with the already-projected line.
+    line="$($GH api "$slug/pulls/$pr" --jq '"\(.mergeable)" + "\t" + (.merge_commit_sha // "")' 2>/dev/null || true)"
+    attempt=$((attempt + 1))
+    if [ -z "$line" ]; then
+      MERGE_REF_STATUS="unreadable"
+      MERGE_REF_SUMMARY="UNREADABLE — 'gh api .../pulls/$pr' failed: the PR's mergeability and merge ref were never read"
+      return 0
+    fi
+    state="${line%%$'\t'*}"
+    MERGE_REF_SHA="${line#*$'\t'}"
+    [ "$state" = "$line" ] && MERGE_REF_SHA=""
+    case "$state" in
+      true|false) break ;;
+      *)
+        # `null` (still computing) or an unrecognised token: re-poll while we can,
+        # then give up LOUDLY. Never guess a tree.
+        if [ "$attempt" -ge "$MERGE_POLL_ATTEMPTS" ]; then break; fi
+        sleep "$POLL_INTERVAL"
+        ;;
+    esac
+  done
+  case "$state" in
+    false)
+      MERGE_REF_STATUS="conflicted"
+      MERGE_REF_SUMMARY="CONFLICTED — GitHub cannot compute a merge of head into the base (mergeable=false), so refs/pull/$pr/merge is ABSENT or STALE: there is no evaluated tree to measure and no merge to make"
+      return 0 ;;
+    true)
+      if [ -n "$MERGE_REF_SHA" ] && [ "$MERGE_REF_SHA" != "null" ]; then
+        MERGE_REF_STATUS="ok"
+        MERGE_REF_SUMMARY="merge ref refs/pull/$pr/merge = $MERGE_REF_SHA"
+      else
+        MERGE_REF_STATUS="absent"
+        MERGE_REF_SUMMARY="ABSENT — mergeable=true but GitHub returned NO merge_commit_sha: the evaluated tree cannot be named yet"
+      fi
+      return 0 ;;
+    *)
+      MERGE_REF_STATUS="absent"
+      MERGE_REF_SUMMARY="ABSENT — GitHub has not computed mergeability/merge ref for PR #$pr (mergeable=$state after $attempt attempt(s)): no merge ref exists yet, so no CI has evaluated a merge of this PR"
+      return 0 ;;
+  esac
 }
 
 # run_failure_set <mode...> — invoke the shared parser, splitting its stdout
@@ -817,33 +944,44 @@ residual_of() {
   sort -u -o "$out" "$out"
 }
 
-# ── MAIN'S TREE HEALTH (#1261) ───────────────────────────────────────────
+# ── THE CHECK SURFACE PROBE (#1261) ─────────────────────────────────────
 # The lane-scoped comparison in steps 1-3 answers "did this PR introduce a
-# failure in the one workflow I watch?". It cannot answer "is the tree I am
-# merging ONTO green?", and the difference is a false PASS: #4589 landed ruff
+# failure in the one workflow I watch?". It cannot answer "is the tree this
+# merge produces green?", and the difference is a false PASS: #4589 landed ruff
 # violations, every open PR's merge ref went lint-red, and the rail merged two
 # PRs onto it because `python-ci.yml` was green on both sides (both failing sets
 # EMPTY, so nothing was compared). See the header for the source, the
 # red/not-red/pending table, and the superseded-run rule.
 #
+# ONE PROBE, TWO SURFACES. This measures check runs and commit statuses attached
+# to an arbitrary rev, and is called TWICE:
+#   * the PR'S EVALUATED TREE (its head sha, which is where GitHub reports the
+#     merge-ref evaluation) — this BLOCKS; and
+#   * MAIN'S HEAD — this is REPORTED for context and NEVER blocks, because while
+#     main is red the PR that repairs it is green on its own tree and must land.
+# The caller snapshots the scratch set into BASE_* / TREE_* right after each
+# call.
+#
 # Sets, NEVER exits — so no caller can forget which branch it took:
 #   MAIN_HEALTH_STATUS   green | red | unmeasured | unreadable
-#   MAIN_HEALTH_REF      the base ref probed
-#   MAIN_HEALTH_SHA      main's head sha (the base ref name when unresolvable)
+#   MAIN_HEALTH_REF      the ref probed
+#   MAIN_HEALTH_SHA      the probed commit sha (the ref name when unresolvable)
 #   MAIN_HEALTH_SUMMARY  ONE legible line naming what was measured
 #   MAIN_HEALTH_REDS     display lines, one per failing check (job, workflow, url)
 #   MAIN_HEALTH_TOTAL / MAIN_HEALTH_RED / MAIN_HEALTH_PENDING   the counts
 #
-# WHY THE RUN LIST IS READ TOO — THE GATE IS UNUSABLE WITHOUT IT. Main's check
-# surface is dominated by lanes that measure NO revision: on tortoise's last
+# WHY THE RUN LIST IS READ TOO — THE GATE IS UNUSABLE WITHOUT IT on MAIN. Main's
+# check surface is dominated by lanes that measure NO revision: on tortoise's last
 # eight main commits, SEVEN carried a failure-like check, and over the repo's
 # last 100 main runs 6 of the 12 failure-like runs were `registry-backup-cron`
 # (event `schedule`) and 1 was `finding-provenance` (event `issues`) — neither
-# measures the tree a merge lands on. An
-# unconditional "any red check on main refuses" gate would therefore refuse
-# essentially EVERY merge in that repo, which is the blunt refusal this rail must
-# not become. So each failing check is resolved — by the run id in its own URL —
-# to the EVENT that produced it, and only an event that MEASURES CODE blocks.
+# measures the tree a merge lands on. An unconditional "any red check on main
+# refuses" gate would therefore refuse essentially EVERY merge in that repo,
+# which is the blunt refusal this rail must not become. So each failing check is
+# resolved — by the run id in its own URL — to the EVENT that produced it, and
+# only an event that MEASURES CODE blocks. On the PR's own tree that filter is
+# VACUOUS (a cron run cannot attach to a PR head sha) and kept only because it is
+# shared code and an unresolved red must still fail closed.
 #
 #   REPORT-ONLY (no code measured): schedule, issues, issue_comment.
 #   BLOCKING (code health):         push, pull_request, pull_request_target,
@@ -856,12 +994,20 @@ residual_of() {
 #
 # ONE `gh run list` resolves them all (id -> event, workflow name), so no single
 # red costs an extra call, and it is fetched ONLY when a red exists. BOUNDED at
-# 200 runs: main's head is the newest commit, so its runs sit at the top.
+# 200 runs; the probed commit is the newest one, so its runs sit at the top. The
+# listing is selected by branch for a branch ref and by --commit for a sha.
 MAIN_HEALTH_RUN_MAP_LIMIT=200
 
-main_health_probe() {
-  local ref="$1"
+# check_surface_probe <ref> <label> — measure EVERY workflow's check runs and
+# commit statuses attached to <ref> (a branch name OR a sha), into the
+# MAIN_HEALTH_* scratch set. The `label` names the surface in the summary lines,
+# so a probe of the PR's evaluated tree never claims to be about main. Callers
+# snapshot the scratch into their own prefix (BASE_* / TREE_*) immediately; see
+# step 2c and step 4.5.
+check_surface_probe() {
+  local ref="$1" label="${2:-main}"
   local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest
+  local map_sel=()
   local blocking=0 other=0
   local repo_args=()
   [ -n "${REPO:-}" ] && repo_args=(--repo "$REPO")
@@ -1000,8 +1146,17 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   map_file=""
   if grep -q '^RED' <<< "$py_out"; then
     map_file="$(mktemp "${TMPDIR:-/tmp}/admin-merge-runmap.XXXXXX")"
+    # WHICH LISTING ANSWERS FOR THIS SURFACE? `--branch` names a branch; a SHA
+    # is not a branch, so a sha-keyed surface (the PR's tree) must be listed by
+    # `--commit`. Real gh has both flags; using the wrong one silently yields an
+    # empty map here, which would report every red's workflow as unresolved.
+    if [ "${#ref}" -eq 40 ] && [ -z "${ref//[0-9a-f]/}" ]; then
+      map_sel=(--commit "$ref")
+    else
+      map_sel=(--branch "$ref")
+    fi
     # shellcheck disable=SC2086
-    $GH run list --branch "$ref" --limit "$MAIN_HEALTH_RUN_MAP_LIMIT" \
+    $GH run list "${map_sel[@]}" --limit "$MAIN_HEALTH_RUN_MAP_LIMIT" \
       ${repo_args[@]+"${repo_args[@]}"} \
       --json databaseId,event,workflowName \
       --jq '.[] | "\(.databaseId)\t\(.event)\t\(.workflowName)"' \
@@ -1055,7 +1210,7 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   MAIN_HEALTH_RED_OTHER="$other"
   if [ "$MAIN_HEALTH_TOTAL" -eq 0 ]; then
     MAIN_HEALTH_STATUS="unmeasured"
-    MAIN_HEALTH_SUMMARY="UNMEASURED — 0 check runs and 0 commit statuses are attached to '$ref' ($sha): main's checks may not have started, so this certifies NOTHING about the tree"
+    MAIN_HEALTH_SUMMARY="UNMEASURED — 0 check runs and 0 commit statuses are attached to '$ref' ($sha): $label has no checks yet, so this certifies NOTHING about the tree"
     return 0
   fi
   if [ "$MAIN_HEALTH_RED" -gt 0 ]; then
@@ -1649,67 +1804,91 @@ main() {
     exit 1
   fi
 
-  # ── 2c. IS THE TREE THIS PR MERGES ONTO GREEN? (#1261) ───────────────────
+  # ── 2c. THE PR'S EVALUATED TREE — RESOLVED HERE; THE BASE IS CONTEXT (#1261) ───────────────────
   # Steps 1-2b are LANE-SCOPED: they answer "did this PR introduce a failure in
-  # the one workflow I watch?". A red main on any OTHER workflow is invisible to
-  # that question — and the vacuous branch below then merges, because both
-  # failing sets are empty. That is not a wording problem; it is a false PASS at
-  # the merge level, and it happened twice in one day (#4589's ruff violations,
-  # then #4600 on top of them). See the header for the source and the
-  # classification, and `main_health_probe` for the measurement.
+  # the one workflow I watch?". A red on any OTHER workflow is invisible to that
+  # question — and the vacuous branch below then merges, because both failing
+  # sets are empty. That is not a wording problem; it is a false PASS at the
+  # merge level (#4589's ruff violations, then #4600 on top of them).
   #
-  # ORDER. This sits AFTER main's lane baseline has been measured, so a lane that
-  # never TESTED main still reports THAT fault (step 2b) rather than being blamed
-  # on main's redness — and BEFORE the exemption decision, the flake re-run and
-  # any evidence, so a doomed merge never mutates the PR's CI or posts a marker.
+  # THREE THINGS HAPPEN HERE, AND NONE OF THEM IS THE GATE:
+  #   (1) the base ref is resolved;
+  #   (2) the PR's MERGE REF is resolved and its state CHECKED — a CONFLICTED or
+  #       ABSENT merge ref is refused HERE, loudly, before the exemption decision
+  #       and before any CI mutation: such a PR has no trustworthy evaluated tree
+  #       (and GitHub cannot merge it anyway);
+  #   (3) MAIN'S HEAD SURFACE is measured and REPORTED — NEVER blocking. While
+  #       main is red, the PR that REPAIRS it is green on its own tree, and the
+  #       old main-head refusal made the rail unable to land its own recovery.
   #
-  # The probe REFUSES on red, REFUSES on unreadable (the rail failing to look is
-  # never a green), and PROCEEDS on unmeasured (a fresh head's checks have not
-  # started — refusing there would block the common case), always stating which
-  # of the three it found.
+  # THE GATE IS STEP 4.5, not here. It reads the PR's OWN evaluated-tree surface
+  # (the head sha, where GitHub reports the merge-ref evaluation — see the
+  # header). It deliberately runs AFTER the lane adjudication and the flake
+  # re-run: a red the PR itself introduced is the rail's own business and the
+  # re-run may clear it, so the tree must be judged on the REFRESHED surface.
+  # Judging it here would make the flake path unreachable for any PR whose lane
+  # run is red — i.e. exactly when the rail's comparison matters.
   local base_ref
   base_ref="$(resolve_base_ref "$PR" ${repo_args[@]+"${repo_args[@]}"})"
   [ -n "$base_ref" ] || base_ref="main"
-  main_health_probe "$base_ref"
-  case "$MAIN_HEALTH_STATUS" in
-    green)
-      info "admin-merge: main tree ${MAIN_HEALTH_SUMMARY}" ;;
-    unmeasured)
-      info "admin-merge: ⚠️  main tree ${MAIN_HEALTH_SUMMARY}" ;;
-    red)
-      say_err "admin-merge: ✗ BLOCK — MAIN IS RED: the tree this PR merges ONTO is already failing."
-      say_err "   $MAIN_HEALTH_SUMMARY"
-      say_err "   Every CODE-MEASURING check failing on main's head — every workflow and app, NOT only the watched lane '$lane':"
-      printf '%s\n' "$MAIN_HEALTH_REDS" >&2
-      if [ -n "$MAIN_HEALTH_REDS_OTHER" ]; then
-        say_err "   (Also red, but on NON-code lanes — reported for completeness, NOT blocking:)"
-        printf '%s\n' "$MAIN_HEALTH_REDS_OTHER" >&2
-      fi
-      say_err "   Main's health is read from the CHECK RUNS AND COMMIT STATUSES ATTACHED TO"
-      say_err "   MAIN'S HEAD COMMIT because the lane comparison this rail makes cannot see a"
-      say_err "   failure outside its lane. Merging onto a red main ratchets the tree redder and"
-      say_err "   makes every open PR's merge ref fail — that is exactly how #1261 merged two PRs"
-      say_err "   onto a red main (a ruff violation in a file neither diff touched)."
-      say_err "   Remedy: repair main, then re-run the rail. This is NOT this PR's fault and NOT a"
-      say_err "   lane-failure verdict — nothing about the PR was compared, and no evidence was"
-      say_err "   posted. If this PR IS the repair, land it deliberately with the audited enforcer"
-      say_err "   override (AGENT_ADMIN_MERGE_OVERRIDE=1) — do not weaken this gate."
+
+  resolve_merge_ref "$PR"
+  case "$MERGE_REF_STATUS" in
+    ok)
+      info "admin-merge: evaluated tree: ${MERGE_REF_SUMMARY}" ;;
+    conflicted)
+      say_err "admin-merge: ✗ BLOCK — ${MERGE_REF_SUMMARY}"
+      say_err "   A CONFLICTED PR has no simulated merge — GitHub cannot compute one — so there"
+      say_err "   is no tree to evaluate and no merge to make. Resolve the conflict and re-run."
+      say_err "   This is NOT a CI verdict: nothing about the PR was compared and no evidence"
+      say_err "   was posted. GitHub keeps the OLD merge ref around after a PR becomes"
+      say_err "   conflicted, which is why its sha is never measured as if it were current."
+      exit 1 ;;
+    absent)
+      say_err "admin-merge: ✗ BLOCK — ${MERGE_REF_SUMMARY}"
+      say_err "   GitHub has not produced the merge ref yet, so no CI run has evaluated the"
+      say_err "   merge of this PR into its base — measuring anything else would certify a tree"
+      say_err "   that is not this merge. This is the fresh-PR race, not a failure: re-run the"
+      say_err "   rail once the PR's checks have started. No evidence was posted."
       exit 1 ;;
     unreadable)
-      say_err "admin-merge: ✗ BLOCK — main's check surface could NOT be read, so the rail cannot"
-      say_err "   show the tree it is merging onto is green."
-      say_err "   $MAIN_HEALTH_SUMMARY"
-      say_err "   A probe that FAILED is not a green tree: this rail merges with --admin, and"
-      say_err "   certifying a merge it never measured is the #1261 false PASS. Check gh"
-      say_err "   auth/network (and --repo), then re-run. No evidence was posted."
+      say_err "admin-merge: ✗ BLOCK — ${MERGE_REF_SUMMARY}"
+      say_err "   The rail could not tell whether this PR's evaluated tree can be read at all,"
+      say_err "   and an unread probe is never a certificate. Check gh auth/network (and"
+      say_err "   --repo), then re-run. No evidence was posted."
       exit 1 ;;
     *)
-      # The probe sets a state on EVERY path, so an unrecognised one means the
-      # state was LOST between the probe and here. Fail closed: a rail that
-      # cannot say whether it looked must not certify.
-      say_err "admin-merge: ✗ BLOCK — the main-health probe returned an unrecognised state"
-      say_err "   ('${MAIN_HEALTH_STATUS:-<empty>}'), so the rail cannot report on the tree it is"
-      say_err "   merging onto. No evidence was posted."
+      say_err "admin-merge: ✗ BLOCK — the merge-ref probe returned an unrecognised state"
+      say_err "   ('${MERGE_REF_STATUS:-<empty>}'). No evidence was posted."
+      exit 1 ;;
+  esac
+
+  # MAIN'S HEAD SURFACE — CONTEXT ONLY (#1261). It is measured so the evidence can
+  # say whether the base is itself red — which is what makes a repair PR a repair —
+  # but it NEVER blocks. It was the BLOCKING source in the previous revision, and
+  # that is precisely what refused the PR that repairs a red main.
+  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA
+  check_surface_probe "$base_ref" "the base branch '$base_ref'"
+  BASE_STATUS="$MAIN_HEALTH_STATUS"; BASE_SUMMARY="$MAIN_HEALTH_SUMMARY"
+  BASE_REDS="$MAIN_HEALTH_REDS"; BASE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  BASE_TOTAL="$MAIN_HEALTH_TOTAL"; BASE_RED="$MAIN_HEALTH_RED"; BASE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
+  BASE_PENDING="$MAIN_HEALTH_PENDING"; BASE_REF="$MAIN_HEALTH_REF"; BASE_SHA="$MAIN_HEALTH_SHA"
+  case "$BASE_STATUS" in
+    green)
+      info "admin-merge: base tree ('$base_ref') ${BASE_SUMMARY}" ;;
+    unmeasured)
+      info "admin-merge: ⚠️  base tree ('$base_ref') ${BASE_SUMMARY}" ;;
+    red)
+      info "admin-merge: ⚠️  base tree ('$base_ref') ${BASE_SUMMARY}"
+      info "admin-merge:    NOT blocking — the base is context. The gate is the PR's OWN tree"
+      info "admin-merge:    (step 4.5): a PR that repairs this red must still be able to land."
+      printf '%s\n' "$BASE_REDS" | sed 's/^/      /' >&2 ;;
+    unreadable)
+      info "admin-merge: ⚠️  base tree ('$base_ref') ${BASE_SUMMARY}"
+      info "admin-merge:    NOT blocking — this is context; the gate is the PR's own tree." ;;
+    *)
+      say_err "admin-merge: ✗ BLOCK — the base-surface probe returned an unrecognised state"
+      say_err "   ('${BASE_STATUS:-<empty>}'). No evidence was posted."
       exit 1 ;;
   esac
 
@@ -1879,6 +2058,81 @@ main() {
     exit 1
   fi
 
+  # ── 4.5. THE GATE: IS THE PR'S OWN EVALUATED TREE GREEN? (#1261) ─────────
+  # THE ONLY TREE-SCOPED REFUSAL IN THE RAIL, and the fix for #1261. Steps 1-3
+  # compare ONE lane; the base surface at step 2c is context. This asks the
+  # question the merge actually needs answered: CI evaluated the MERGE of this
+  # head into its base (the `pull_request` merge ref — see the header), and
+  # GitHub reports the resulting checks against the HEAD commit, so the
+  # head-keyed surface IS the evaluated tree's surface. A code-measuring red
+  # there means the tree this merge lands is red.
+  #
+  # THE DISCRIMINATION THAT MATTERS. A PR that REPAIRS a red base has the red
+  # GONE from its own tree -> this passes and the merge lands. A PR opened onto
+  # an already-red base that does NOT fix it keeps the red on its own tree ->
+  # this refuses, naming the job, its workflow and its run URL. That is exactly
+  # #4600-on-#4589, and it no longer depends on the base still being red at read
+  # time — it depends on what CI measured for THIS tree.
+  #
+  # WHY HERE, AND NOT IN STEP 2C. A red the PR itself introduced is what the
+  # lane comparison and the flake re-run above exist to adjudicate; a flaky red
+  # clears when its run is re-run (the LATEST check run per (app,name) wins —
+  # the superseded-run rule). Judging the tree before that would refuse every PR
+  # whose watched lane is red — i.e. make the flake path dead code — and
+  # over-block on exactly the red the rail is built to re-test. The head is
+  # re-resolved immediately above, so this measures the SAME sha the evidence
+  # will be bound to.
+  #
+  # PROCEEDS on UNMEASURED (a surface with no checks certifies nothing, but is
+  # not a refusal — same rule as before) and REFUSES on UNREADABLE (failing to
+  # look is never a green).
+  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_REF TREE_SHA
+  check_surface_probe "$head" "the PR's evaluated tree (head $head)"
+  TREE_STATUS="$MAIN_HEALTH_STATUS"; TREE_SUMMARY="$MAIN_HEALTH_SUMMARY"
+  TREE_REDS="$MAIN_HEALTH_REDS"; TREE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  TREE_TOTAL="$MAIN_HEALTH_TOTAL"; TREE_RED="$MAIN_HEALTH_RED"; TREE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
+  TREE_PENDING="$MAIN_HEALTH_PENDING"; TREE_REF="$MAIN_HEALTH_REF"; TREE_SHA="$MAIN_HEALTH_SHA"
+  case "$TREE_STATUS" in
+    green)
+      info "admin-merge: ✅ evaluated tree ${TREE_SUMMARY}" ;;
+    unmeasured)
+      info "admin-merge: ⚠️  evaluated tree ${TREE_SUMMARY}" ;;
+    red)
+      say_err "admin-merge: ✗ BLOCK — THE TREE THIS PR PRODUCES IS RED."
+      say_err "   $TREE_SUMMARY"
+      say_err "   CI evaluates a PR as the MERGE of its head into its base — the tree the base"
+      say_err "   becomes if this PR lands — and GitHub reports those checks against the PR's"
+      say_err "   head commit. A CODE-MEASURING check failing there fails the tree this merge"
+      say_err "   lands, whatever the watched lane '$lane' says."
+      say_err "   Failing checks (every workflow and app, not only the watched lane):"
+      printf '%s\n' "$TREE_REDS" >&2
+      if [ -n "$TREE_REDS_OTHER" ]; then
+        say_err "   (Also red on NON-code events — reported, not blocking here; a PR surface"
+        say_err "    is not expected to carry one, so this is an anomaly:)"
+        printf '%s\n' "$TREE_REDS_OTHER" >&2
+      fi
+      say_err "   BASE CONTEXT: $BASE_SUMMARY"
+      say_err "   If the base is red and THIS PR is the repair, the red should already be GONE"
+      say_err "   from this tree — a red still here means the repair is incomplete. If this PR is"
+      say_err "   NOT the repair, fix the failing check (here or on the base) and re-run. Landing"
+      say_err "   a red tree on purpose is the audited enforcer override:"
+      say_err "   AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was posted and no merge attempted."
+      exit 1 ;;
+    unreadable)
+      say_err "admin-merge: ✗ BLOCK — the PR's evaluated-tree surface could NOT be read, so the"
+      say_err "   rail cannot show that the tree this merge produces is green."
+      say_err "   $TREE_SUMMARY"
+      say_err "   A probe that FAILED is not a green tree: this rail merges with --admin, and"
+      say_err "   certifying a merge it never measured is the #1261 false PASS. Check gh"
+      say_err "   auth/network (and --repo), then re-run. No evidence was posted."
+      exit 1 ;;
+    *)
+      say_err "admin-merge: ✗ BLOCK — the evaluated-tree probe returned an unrecognised state"
+      say_err "   ('${TREE_STATUS:-<empty>}'), so the rail cannot report on the tree this merge"
+      say_err "   produces. No evidence was posted."
+      exit 1 ;;
+  esac
+
   local pr_count main_count
   pr_count="$(count_lines "$TMP/pr-fails.txt")"
   main_count="$(count_lines "$TMP/main-fails.txt")"
@@ -1893,11 +2147,14 @@ main() {
   # makes an empty failing set mean "tested and green" rather than "never ran".
   analyzed="$analyzed
 Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tested=$(report_value "$TMP/pr-report.txt" tested) pending=$(report_value "$TMP/pr-report.txt" pending) | main completed=$(report_value "$TMP/main-report.txt" completed) tested=$(report_value "$TMP/main-report.txt" tested) pending=$(report_value "$TMP/main-report.txt" pending)"
-  # THE TREE'S HEALTH, not just the lane's (#1261). Step 2c measured it; this is
-  # where it becomes part of the auditable record, so a reviewer can tell "main's
-  # LANE is green" from "main's TREE is green" without re-running anything.
+  # THE TWO SURFACES, in the auditable record (#1261): the tree that GATES the
+  # merge (the PR's own evaluated tree — the head-keyed surface the merge-ref
+  # evaluation is reported on) and the base's head surface, which is CONTEXT
+  # ONLY. A reviewer must be able to tell "the lane is green" from "the tree is
+  # green" from "the base is red but this PR is not responsible for it".
   local health_line
-  health_line="Main check surface (every workflow and app on main's head): ${MAIN_HEALTH_SUMMARY}"
+  health_line="PR evaluated-tree surface (every workflow and app on head $head): ${TREE_STATUS} — ${TREE_RED} failing of ${TREE_TOTAL} measured, ${TREE_PENDING} pending
+Base check surface (every workflow and app on head of '$base_ref'): ${BASE_STATUS} — ${BASE_RED} failing of ${BASE_TOTAL} measured, ${BASE_PENDING} pending (reported for CONTEXT, never blocking)"
   analyzed="$analyzed
 $health_line"
 
@@ -1918,9 +2175,10 @@ $health_line"
    measured sets: PR failing runs=0 | main failing runs=0 (lane: $lane)
    PR side: ${pr_examined:-0} failing run(s) of ${pr_completed:-0} completed / ${pr_tested:-0} tested for head $head (${pr_pending:-0} pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable 'FAILED <nodeid>' line would have BLOCKED at step 1c, not read as zero.
    main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b).
-   main check surface: $MAIN_HEALTH_STATUS — $MAIN_HEALTH_RED failing of $MAIN_HEALTH_TOTAL measured, $MAIN_HEALTH_PENDING pending; read across EVERY workflow, not just this lane.
+   main check surface: $BASE_STATUS — $BASE_RED failing of $BASE_TOTAL measured, $BASE_PENDING pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
+   PR evaluated tree: $TREE_STATUS — $TREE_RED failing of $TREE_TOTAL measured, $TREE_PENDING pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
    Correct when the lane is green on both sides — but if the lane selector (--workflow '$lane') is wrong this certifies nothing. The per-side counters above are what tell 'green' from 'never run'."
-    info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lane: $lane); main check surface: $MAIN_HEALTH_STATUS ($MAIN_HEALTH_RED failing of $MAIN_HEALTH_TOTAL measured)"
+    info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lane: $lane); PR tree: $TREE_STATUS ($TREE_RED failing of $TREE_TOTAL measured); main check surface: $BASE_STATUS ($BASE_RED failing of $BASE_TOTAL measured, context only)"
   fi
 
   info "admin-merge: PR failing: $pr_count | main failing: $main_count | blocked by the decision: 0"
