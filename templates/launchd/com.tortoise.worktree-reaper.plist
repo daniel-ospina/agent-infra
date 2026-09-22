@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- worktree reaper (#1095, armed via #1311): a daily pass over the
+         tortoise repo's worktrees. The reaper itself is
+         agent-infra/scripts/pi-reap-worktrees.sh, and it is FARMED to
+         {{HOME}}/.pi/agent/scripts/ by pi-bootstrap/setup.sh's fleet-scripts
+         farm — that copy is what this template targets, and it is not
+         optional: launchd cannot read a script under ~/Documents, because
+         macOS TCC is per-binary and denies a launchd-spawned `bash` the read
+         ("Operation not permitted") and a launchd-spawned `git` the repo read
+         ("not a git repository"). Running the script from ~/.pi/agent/scripts
+         is the whole fix (#427), the same mechanism the pi-session-reaper
+         above already relies on.
+
+         SHIPS IN DRY-RUN (the `dry_run` flag below): this job deletes
+         worktrees and branches it classifies as provably dead, so arming it
+         live is a deliberate, per-machine operator decision, not a default.
+         Flip it by removing that flag HERE and re-running
+         scripts/install-launchd.sh.
+
+         The pass is bounded by REAP_WT_BUDGET_SECONDS (default 300s); a pass
+         that exhausts it defers the remainder and reports DEFERRED rather than
+         removing anything unclassified. A dry-run pass on the live estate
+         reported REMOVE=0 DEFERRED=432 of 454 worktrees, so this job's present
+         effect is a report, not a removal, and the budget (agent-infra #1095)
+         is the lever that decides how much one pass can classify.
+
+         The `repo` argument is {{TORTOISE_REPO}} because the reaper takes the
+         repo to operate on. A machine without a tortoise checkout leaves that
+         placeholder unresolved, and install-launchd.sh then SKIPS this
+         template by design (unresolved placeholder) instead of installing a
+         broken target.
+
+         No StandardOutPath/StandardErrorPath: every pass writes its own capped
+         log at ~/.pi/agent/state/pi-reap-worktrees.log (an unbounded
+         launchd-captured log is the twin of the symlink-truncation surface the
+         reaper already guards). -->
+    <key>Label</key>
+    <string>com.tortoise.worktree-reaper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/pi-reap-worktrees.sh</string>
+        <string>--repo</string>
+        <string>{{TORTOISE_REPO}}</string>
+        <string>--dry-run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>86400</integer>
+</dict>
+</plist>

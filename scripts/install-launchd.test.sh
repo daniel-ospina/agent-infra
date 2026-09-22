@@ -417,6 +417,20 @@ if command -v plutil >/dev/null 2>&1; then
         plutil -lint "$t" >/dev/null 2>&1 || LINT_OK=0
     done
     assert_eq "$LINT_OK" "1" "all repo templates lint clean"
+    # plutil -lint is LENIENT: it accepts a template whose comment contains
+    # `--`, which is ILLEGAL inside an XML comment and makes the file
+    # unparseable by a strict reader (launchd's own loader is strict). A strict
+    # parse is therefore the real check. #1311.
+    if command -v python3 >/dev/null 2>&1; then
+        STRICT_OK=1
+        for t in "$REPO_TEMPLATES"/*.plist; do
+            python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$t" >/dev/null 2>&1 \
+                || { STRICT_OK=0; echo "  ✗ strict parse failed: $(basename "$t")"; }
+        done
+        assert_eq "$STRICT_OK" "1" "all repo templates parse under a strict plist reader"
+    else
+        echo "  ⚠️  python3 not found — strict-parse check skipped"
+    fi
     # rendered output must lint too (fresh HOME render, after uninstall)
     OUT="$(run_installer "$HOME1" >/dev/null; plutil -lint "$TRIPWIRE_INSTALLED" >/dev/null 2>&1; echo $?)"
     assert_eq "$OUT" "0" "rendered+installed tripwire plist lints clean"
