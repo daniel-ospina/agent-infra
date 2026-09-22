@@ -102,7 +102,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CFS="$ROOT/scripts/ci-failure-set.sh"
-ADM="$ROOT/scripts/admin-merge.sh"
+ADM="${ADMIN_MERGE_SUITE_ADM:-$ROOT/scripts/admin-merge.sh}"
 DETECTOR="$ROOT/.github/workflows/admin-merge-detector.yml"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge-suite.XXXXXX")"
 checks=0
@@ -366,6 +366,21 @@ case "$key" in
         printf '{"state":"pending","total_count":0,"statuses":[]}\n'; exit 0 ;;
       */commits/*)
         [ -f "$SCEN/main-health-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+        ref="$(printf '%s' "$a2" | sed -n 's#.*/commits/\(.*\)$#\1#p')"
+        # #1261 (step 4.7): the MERGE REF'S FIRST PARENT — the base commit the
+        # merge ref was computed against. The rail asks with `--jq
+        # '.parents[0].sha'`; the fake answers from its OWN fixture so a LAGGING
+        # merge ref is expressible. With no fixture the parent IS the base head
+        # (no lag), which is what every pre-existing scenario means.
+        jqexpr="$(flag_val --jq "$@")"
+        case "$jqexpr" in
+          *parents*)
+            [ -f "$SCEN/merge-parent-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+            if [ -f "$SCEN/merge-parent" ]; then cat "$SCEN/merge-parent"
+            elif [ -f "$SCEN/main-sha" ]; then cat "$SCEN/main-sha"
+            else printf 'feedface0000000000000000000000000000000000\n'; fi
+            exit 0 ;;
+        esac
         # `commits/<ref> --jq .sha`: a BARE 40-hex sha resolves to ITSELF (real
         # GitHub returns that commit); a BRANCH resolves through the fixture.
         ref="$(printf '%s' "$a2" | sed -n 's#.*/commits/\(.*\)$#\1#p')"
@@ -526,6 +541,12 @@ pr_run_map() {
     shift 3
   done
 }
+
+# merge_parent <sha> → $SCEN/merge-parent, the BASE commit a PR's merge ref was
+#   computed against (the rail's step-4.7 discriminator: the merge commit's
+#   `parents[0]`). A DIFFERENT sha models a LAGGING merge ref. With no fixture
+#   the fake answers the base head, i.e. no lag.
+merge_parent() { printf '%s\n' "$1" > "$SCEN/merge-parent"; }
 
 # pr_merge_ref <mergeable> <merge-sha> → the `pulls/<N>` projection the rail's
 # resolve_merge_ref reads. With NO fixture the fake answers `true` + a fixed sha,
