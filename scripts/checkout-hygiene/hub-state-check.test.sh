@@ -258,8 +258,10 @@ out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 0 "hub fast-forwarded to upstream → exit 0"
 assert_contains "$out" "PASS  $SHUB" "up-to-date hub prints PASS again"
 
-# 9d. local-only commit → not fast-forwardable → diverged (ahead-only sub-case:
-# `diverged` is the local-only-commit class, because both shapes need `refresh`).
+# 9d. local-only commit carrying content → not fast-forwardable → diverged
+# (ahead-only sub-case; `diverged` is the local-only-commit class, and the
+# emitted guide must offer a route for the CONTENT-CARRYING shape too — `refresh`
+# alone refuses it).
 echo local > "$SHUB/local.txt"
 git -C "$SHUB" add .
 git -C "$SHUB" commit -qm local-only
@@ -280,6 +282,9 @@ assert_contains "$out" "HUB_DISORDER=diverged" "true divergence → HUB_DISORDER
 assert_contains "$out" "ahead=1 behind=1" "diverged line names both counts"
 assert_contains "$out" "hub-worktree.sh refresh" "diverged FAIL names the #1309 refresh recovery"
 assert_contains "$out" "refresh --discard-contentless" "diverged FAIL names the contentless flag"
+assert_contains "$out" "CARRY content" "diverged FAIL names the content-carrying route"
+assert_contains "$out" "git push origin main:<new-branch>" "content-carrying route preserves the commits"
+assert_contains "$out" "git reset --hard upstream/main" "content-carrying route realigns to the resolved upstream"
 
 # 9f. The --gh-report leg parses the staleness token SEPARATELY (#1313: two
 # parse sites). The filed issue body must carry the SAME diverged guidance — a
@@ -291,6 +296,40 @@ assert_eq "$rc" 1 "diverged+gh-report exits 1"
 assert_contains "$out" "opened hub-state issue" "diverged+gh-report opens an issue"
 assert_contains "$(cat "$GH_STUB_LOG")" "hub-state FAIL: $SHUB (diverged)" "issue title carries the diverged token"
 assert_contains "$(cat "$GH_STUB_LOG")" "hub-worktree.sh refresh --repo $SHUB" "issue body carries the diverged recovery guidance"
+
+# 9i. a MISTRACKED hub: branch.main's configured upstream names ANOTHER branch.
+# The comparison must be against the SAME-NAMED tracking ref (origin/main), not
+# `@{u}` — otherwise a hub arbitrarily behind mainline reports PASS, the exact
+# false PASS #1313 closes (#1324 review P1; reproduced on a deployed hub).
+MHUB="$FIX/mistracked-hub"
+MREMOTE="$FIX/mistracked-origin.git"
+git init -q --bare -b main "$MREMOTE"
+git init -q -b main "$MHUB"
+git -C "$MHUB" config user.email t@t
+git -C "$MHUB" config user.name t
+echo base > "$MHUB/base.txt"
+git -C "$MHUB" add .
+git -C "$MHUB" commit -qm init
+git -C "$MHUB" remote add origin "$MREMOTE"
+git -C "$MHUB" push -qu origin main
+git -C "$MHUB" push -q origin main:feat/other
+git -C "$MHUB" fetch -q origin
+git -C "$MHUB" branch --set-upstream-to=origin/feat/other main >/dev/null 2>&1
+# advance origin/main by one commit → the hub is genuinely behind mainline while
+# `@{u}` (origin/feat/other) still points at the hub's own HEAD.
+MSEED="$FIX/mistracked-seed"
+git clone -q "$MREMOTE" "$MSEED"
+git -C "$MSEED" config user.email t@t
+git -C "$MSEED" config user.name t
+echo next > "$MSEED/next.txt"
+git -C "$MSEED" add .
+git -C "$MSEED" commit -qm next
+git -C "$MSEED" push -q origin main
+git -C "$MHUB" fetch -q origin
+out="$(bash "$CHECK" --repo "$MHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "mistracked-upstream hub → exit 1 (compares against the same-named ref)"
+assert_contains "$out" "HUB_DISORDER=behind" "mistracked-upstream hub reports behind mainline"
+assert_contains "$out" "upstream=origin/main" "the reference of record is origin/main, not @{u}"
 
 # 9g. no upstream configured → FAIL CLOSED. An unverifiable hub must never read
 # as PASS (that is the failure direction #1313 exists to close).

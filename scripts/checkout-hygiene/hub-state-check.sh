@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # hub-state-check.sh — session-gated local hub-discipline check (#1484).
 #
-# The shared main checkout (the hub) must stay on `main` and CLEAN. This script
-# verifies it locally (a GitHub Actions runner cannot observe the local hub —
-# the check must run on the machine that owns the checkout) and reports FAILs
-# to GitHub as one deduped issue per repo.
+# The shared main checkout (the hub) must stay on `main`, CLEAN, and up to date
+# with its upstream. This script verifies it locally (a GitHub Actions runner
+# cannot observe the local hub — the check must run on the machine that owns the
+# checkout) and reports FAILs to GitHub as one deduped issue per repo.
 #
 # Per repo: resolves $MAIN_REPO via `git rev-parse --git-common-dir` (the
 # using-git-worktrees Step 0 pattern) so the check works from inside a worktree
@@ -18,13 +18,14 @@
 #   dirty        `git status --porcelain` is non-empty. Untracked files count
 #                (the 2026-08-18 incident: pr1467 in the hub + 3 untracked files
 #                + 38 commits ahead of main, 29h silent).
-#   behind       clean + on main, but the upstream has commits this checkout
-#                lacks — a fast-forward is available.
-#   diverged     clean + on main, but this checkout has LOCAL-ONLY commits, so
-#                it is not fast-forwardable. Covers the ahead-only sub-case too:
-#                any local-only commit makes the hub not a mirror of upstream.
-#   no_upstream  clean + on main, but no upstream ref resolves, so freshness is
-#                UNVERIFIABLE — never treated as PASS (#1313).
+#   behind       on main, but the upstream has commits this checkout lacks — a
+#                fast-forward is available. May co-occur with `dirty`
+#                (`dirty+behind`); only `off_main` suppresses the class.
+#   diverged     on main, but this checkout has LOCAL-ONLY commits, so it is not
+#                fast-forwardable. Covers the ahead-only sub-case too: any
+#                local-only commit makes the hub not a mirror of upstream.
+#   no_upstream  on main, but no SAME-NAMED upstream ref resolves, so freshness
+#                is UNVERIFIABLE — never treated as PASS (#1313).
 #
 # `off_main` suppresses the staleness class: a stranded branch's own tip is not
 # the hub's freshness.
@@ -34,12 +35,15 @@
 # state that hides itself. Everything merged upstream is simply ABSENT from the
 # checkout, so a lane reading the hub learns a stale answer and an absent guard
 # reads as a passing guard (tortoise hub: 3 days / 308 commits stale, #1309,
-# #1125). Freshness is compared against the ALREADY-FETCHED remote-tracking ref
-# (no fetch is issued here): the session's freshness machinery (repo-freshness's
-# auto mode / auto-sync at session start) owns the fetch, so this detector stays
-# network-free and fast. Residual: if that ref is itself stale, a behind-vs-ref
-# gap can persist until the next session fetch — but it is bounded by that fetch
-# instead of growing forever.
+# #1125). Freshness is compared against the SAME-NAMED, ALREADY-FETCHED
+# remote-tracking ref — refs/remotes/<remote>/<branch>, remote taken from `@{u}`
+# else `origin` — and NOT `@{u}` itself, which is free to name an UNRELATED branch
+# (a `main` mistracked to `origin/feat/x` would otherwise PASS while arbitrarily
+# behind mainline). No fetch is issued here: the session's freshness machinery
+# (repo-freshness's auto mode / auto-sync at session start) owns the fetch, so
+# this detector stays network-free and fast. Residual: if that ref is itself
+# stale, a behind-vs-ref gap can persist until the next session fetch — but it is
+# bounded by that fetch instead of growing forever.
 #
 # Usage:
 #   hub-state-check.sh [--repo <path>]... [--gh-report]
@@ -110,7 +114,7 @@ recovery_guide() {
     case "$stale" in
       "")          ;;   # plain dirty-on-main (#2238) / off_main+dirty: no staleness class
       behind)      lines+=("The hub is also BEHIND its upstream — after the capture, fast-forward: cd $repo && git merge --ff-only $upstream") ;;
-      diverged)    lines+=("The hub has also DIVERGED from its upstream (local-only commits) — after the capture: bash $SCRIPT_DIR/hub-worktree.sh refresh --repo $repo") ;;
+      diverged)    lines+=("The hub has also DIVERGED from its upstream (local-only commits) — after the capture run 'hub-worktree.sh refresh' to see whether they are contentless, then follow its route (the clean-diverged guidance below covers the content-carrying case)") ;;
       no_upstream) lines+=("The hub's upstream ref is also missing — freshness is UNVERIFIABLE. Name the remote (do not assume 'origin'), then fetch: git -C $repo remote -v") ;;
       *)           lines+=("The hub is also in an UNRECOGNISED disorder class '$stale' — inspect: git -C $repo status -sb") ;;
     esac
@@ -128,10 +132,12 @@ recovery_guide() {
         ;;
       diverged)
         lines+=("The hub is clean and on main, but DIVERGED from its upstream (local-only commits — a fast-forward cannot apply).")
-        lines+=("Sanctioned recovery (#1309 / hub-worktree.sh refresh):")
+        lines+=("Two shapes, two routes. Ask refresh first: it names every local-only SHA and refuses unless they are CONTENTLESS:")
         lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --repo $repo")
-        lines+=("If those local-only commits are CONTENTLESS, refresh names their SHAs; discard exactly them with:")
+        lines+=("Those commits are CONTENTLESS → drop exactly them and realign (#1309):")
         lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo")
+        lines+=("Those commits CARRY content → refresh refuses them by design (nothing is discarded implicitly). Preserve them on a branch, THEN realign main — the reset is safe only after the push succeeded:")
+        lines+=("cd $repo && git push origin $branch:<new-branch> && git reset --hard $upstream")
         ;;
       no_upstream)
         lines+=("The hub is clean and on main, but no upstream ref resolves — its freshness is UNVERIFIABLE (never read as PASS).")
@@ -145,6 +151,26 @@ recovery_guide() {
     esac
   fi
   printf '%s\n' "${lines[@]}"
+}
+
+resolve_upstream() { # $1=repo $2=branch
+  local repo="$1" branch="$2" u remote="" candidate
+  local -a candidates=()
+  u="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name "$branch@{u}" 2>/dev/null || true)"
+  # Configured AND same-named: the configured ref already IS the reference of
+  # record, so trust it (this is the ordinary case).
+  if [[ -n "$u" && "${u##*/}" == "$branch" ]]; then printf '%s' "$u"; return 0; fi
+  # Mistracked (`@{u}` names another branch) or unset: keep the remote, fix the
+  # branch — the reference of record is <remote>/<branch>, never the other branch.
+  [[ -n "$u" ]] && remote="${u%%/*}"
+  [[ -n "$remote" ]] && candidates+=("$remote")
+  candidates+=(origin)
+  for candidate in "${candidates[@]}"; do
+    if git -C "$repo" rev-parse --verify --quiet "refs/remotes/$candidate/$branch" >/dev/null 2>&1; then
+      printf '%s' "$candidate/$branch"; return 0
+    fi
+  done
+  return 1
 }
 
 usage() {
@@ -215,10 +241,7 @@ for repo_arg in "${REPOS[@]}"; do
   # freshness, and a detached HEAD has no upstream at all (off_main, no crash).
   UPSTREAM=""; STALE=""; AHEAD=0; BEHIND=0
   if [[ $on_main -eq 1 ]]; then
-    UPSTREAM="$(git -C "$MAIN_REPO" rev-parse --abbrev-ref --symbolic-full-name "$BRANCH@{u}" 2>/dev/null || true)"
-    if [[ -z "$UPSTREAM" ]] && git -C "$MAIN_REPO" rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
-      UPSTREAM="origin/$BRANCH"
-    fi
+    UPSTREAM="$(resolve_upstream "$MAIN_REPO" "$BRANCH")" || UPSTREAM=""
     if [[ -z "$UPSTREAM" ]]; then
       # No upstream ref → freshness is unverifiable. FAIL closed (#1313):
       # an unverified hub must never read as PASS.
@@ -294,16 +317,13 @@ if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
       # 4-field record, so the ref is not carried in it (same resolution as the
       # check above; only meaningful on main/master).
       if [[ "$on_main" -eq 1 ]]; then
-        upstream="$(git -C "$repo_path" rev-parse --abbrev-ref --symbolic-full-name "$branch@{u}" 2>/dev/null || true)"
-        if [[ -z "$upstream" ]] && git -C "$repo_path" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null 2>&1; then
-          upstream="origin/$branch"
-        fi
+        upstream="$(resolve_upstream "$repo_path" "$branch")" || upstream=""
       fi
       guide="$(recovery_guide "$on_main" "$dirty" "$stale" "$repo_path" "$branch" "$upstream")"
       body="Hub-discipline check FAILED for **$repo_path** at $ts.
 
 - \`HUB_DISORDER=$disorder\` (branch=\`$branch\`, porcelain=$porcelain_count)
-- The shared main checkout must stay on \`main\` and clean (hub discipline, #1484).
+- The shared main checkout must stay on \`main\`, clean, AND up to date with its upstream (hub discipline, #1484, #1313).
 - Untracked files count as dirty. Checked via \`git status --porcelain\` from the local hub.
 
 **Recovery steps (by disorder class):**
