@@ -461,12 +461,18 @@ write_main_checks() {
   printf '{"total_count":%s,"check_runs":[%s]}\n' "$#" "$body" > "$SCEN/main-check-runs.json"
 }
 
-# check_run <id> <job> <status> <conclusion> <run-id> → one check-run object. The
-#   run id is embedded in the run URL because that is where the rail resolves a
-#   check's EVENT from.
+# check_run <id> <job> <status> <conclusion> <run-id> [<started_at>] [<completed_at>] → one
+#   check-run object. The run id is embedded in the run URL because that is where
+#   the rail resolves a check's EVENT from. The timestamps are the rail's
+#   STALENESS anchor (#1261): a completed check carries `completed_at` (default
+#   2026-01-01T00:05:00Z); a non-completed one carries JSON null (it produced no
+#   measurement). Defaults are shared, so a scenario that does not set them
+#   compares 00:05 against a red at 00:00 and is NOT stale.
 check_run() {
-  printf '{"id":%s,"name":"%s","status":"%s","conclusion":"%s","app":{"slug":"github-actions"},"html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/%s/job/1"}' \
-    "$1" "$2" "$3" "$4" "$5"
+  local start="${6:-2026-01-01T00:00:00Z}" comp="null"
+  [ "$3" = "completed" ] && comp="\"${7:-2026-01-01T00:05:00Z}\""
+  printf '{"id":%s,"name":"%s","status":"%s","conclusion":"%s","app":{"slug":"github-actions"},"started_at":"%s","completed_at":%s,"html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/%s/job/1"}' \
+    "$1" "$2" "$3" "$4" "$start" "$comp" "$5"
 }
 
 # main_run_map <run-id> <event> <workflow-name>... → $SCEN/main-run-map, the

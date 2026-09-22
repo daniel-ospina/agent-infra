@@ -1006,7 +1006,7 @@ MAIN_HEALTH_RUN_MAP_LIMIT=200
 # step 2c and step 4.5.
 check_surface_probe() {
   local ref="$1" label="${2:-main}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch
   local map_sel=()
   local blocking=0 other=0
   local repo_args=()
@@ -1017,6 +1017,14 @@ check_surface_probe() {
   MAIN_HEALTH_SUMMARY=""
   MAIN_HEALTH_REDS=""
   MAIN_HEALTH_REDS_OTHER=""
+  # Structured BLOCKING reds, for the staleness comparison (step 4.6):
+  # `<name>\t<started_iso>\t<started_epoch>\t<url>`, one per code-measuring red.
+  MAIN_HEALTH_RED_TS=""
+  # The surface's own last-production time (max completed_at over its completed
+  # checks) and that time as epoch seconds. Empty when the surface has no
+  # completed check at all.
+  MAIN_HEALTH_MAX_COMPLETED=""
+  MAIN_HEALTH_MAX_COMPLETED_EPOCH=""
   MAIN_HEALTH_TOTAL=0
   MAIN_HEALTH_RED=0
   MAIN_HEALTH_RED_OTHER=0
@@ -1046,7 +1054,7 @@ check_surface_probe() {
     MAIN_HEALTH_SUMMARY="UNREADABLE — 'gh api .../status' failed for '$ref' ($sha): the surface was only half read"
     return 0
   fi
-  py_out="$("$PYTHON_BIN" -c 'import json, sys
+  py_out="$("$PYTHON_BIN" -c 'import datetime, json, sys
 RED_CONC = {"failure", "timed_out", "action_required", "startup_failure"}
 RED_STATE = {"failure", "error"}
 
@@ -1070,6 +1078,25 @@ def docs(path):
         out.append(obj)
     return out
 
+# A CHECK RUN TIME, AS WHOLE EPOCH SECONDS, FOR THE STALENESS COMPARISON.
+# GitHub returns ISO-8601 (`2026-09-22T15:52:53Z`); the rail compares these
+# STRICTLY, so a value it cannot read must be distinguishable from epoch 0 (a
+# real 1970 timestamp) - it is returned as the EMPTY STRING, and the caller
+# fails closed rather than treating unparsable as "old".
+def ts_epoch(raw):
+    if not raw:
+        return ""
+    try:
+        d = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return str(int(d.timestamp()))
+    except (OverflowError, OSError, ValueError):
+        return ""
+
 cr_runs = []
 for d in docs(sys.argv[1]):
     if isinstance(d, dict) and isinstance(d.get("check_runs"), list):
@@ -1090,7 +1117,9 @@ for r in cr_runs:
         rid = 0
     key = (app, name)
     if key not in best or rid > best[key][0]:
-        best[key] = (rid, name, app, str(r.get("status") or ""), str(r.get("conclusion") or ""), str(r.get("html_url") or ""))
+        best[key] = (rid, name, app, str(r.get("status") or ""), str(r.get("conclusion") or ""),
+                     str(r.get("html_url") or ""), str(r.get("started_at") or ""),
+                     str(r.get("completed_at") or ""))
 
 statuses = []
 for d in docs(sys.argv[2]):
@@ -1109,24 +1138,38 @@ for s in statuses:
     if ctx not in sbest or stamp > sbest[ctx][0]:
         sbest[ctx] = (stamp, ctx, str(s.get("state") or ""), str(s.get("target_url") or ""))
 
-reds = []
+# THE SURFACE OWN TIME - the last moment ANY completed check on this surface
+# was produced. The staleness rule compares a later base red against it: a red
+# whose run STARTED after this time cannot be part of what the surface measured.
+# Emitted for every probe; only the PR-tree call consumes it.
+surface_epoch = 0
+surface_iso = ""
+reds = []   # (name, app, conclusion, url, started_iso)
 pend = []
-for _, name, app, status, concl, url in best.values():
+for _, name, app, status, concl, url, started, completed in best.values():
     if status != "completed":
         pend.append((name, app))
-    elif concl in RED_CONC:
-        reds.append((name, app, concl, url))
-for _, ctx, state, url in sbest.values():
+        continue
+    e = ts_epoch(completed)
+    if e != "" and (surface_iso == "" or int(e) > surface_epoch):
+        surface_epoch, surface_iso = int(e), completed
+    if concl in RED_CONC:
+        reds.append((name, app, concl, url, started))
+for stamp, ctx, state, url in sbest.values():
     if state in RED_STATE:
-        reds.append((ctx, "commit-status", state, url))
+        reds.append((ctx, "commit-status", state, url, stamp))
     elif state == "pending":
         pend.append((ctx, "commit-status"))
+    e = ts_epoch(stamp)
+    if e != "" and (surface_iso == "" or int(e) > surface_epoch):
+        surface_epoch, surface_iso = int(e), stamp
 
 total = len(best) + len(sbest)
-for name, app, concl, url in reds:
-    sys.stdout.write("RED\t%s\t%s\t%s\t%s\n" % (name, app, concl, url))
+for name, app, concl, url, tiso in reds:
+    sys.stdout.write("RED\t%s\t%s\t%s\t%s\t%s\t%s\n" % (name, app, concl, url, tiso, ts_epoch(tiso)))
 for name, app in pend:
     sys.stdout.write("PENDING\t%s\t%s\n" % (name, app))
+sys.stdout.write("SURFACE\t%s\t%s\n" % (surface_iso, ("" if surface_iso == "" else str(surface_epoch))))
 sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), total - len(reds) - len(pend)))' \
     "$cr_json" "$st_json" 2>/dev/null)"
   rc=$?
@@ -1167,8 +1210,14 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
       COUNTS$'\t'*)
         IFS=$'\t' read -r tag MAIN_HEALTH_TOTAL _ MAIN_HEALTH_PENDING ok_rest <<< "$line"
         ;;
+      SURFACE$'\t'*)
+        # The surface's own production time; consumed by the PR-tree probe in
+        # step 4.6. A missing second field (the epoch) means "no completed
+        # check", which the comparison treats as "no measurement time".
+        IFS=$'\t' read -r tag MAIN_HEALTH_MAX_COMPLETED MAIN_HEALTH_MAX_COMPLETED_EPOCH <<< "$line"
+        ;;
       RED$'\t'*)
-        IFS=$'\t' read -r tag job app concl url <<< "$line"
+        IFS=$'\t' read -r tag job app concl url started_iso started_epoch <<< "$line"
         # WHICH EVENT PRODUCED THIS CHECK? A red on a `schedule`/`issues` lane
         # measures no revision, and blocking on it would refuse every merge (see
         # MAIN_HEALTH_RUN_MAP_LIMIT). The run id is in the check run's own URL.
@@ -1192,6 +1241,11 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
             else
               MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — ${concl} — ${url}"
             fi
+            # Keep the red's own START time for the staleness comparison: a red
+            # whose run began after the PR's surface was produced cannot have
+            # been measured by it (step 4.6).
+            [ -n "$MAIN_HEALTH_RED_TS" ] && MAIN_HEALTH_RED_TS="${MAIN_HEALTH_RED_TS}"$'\n'
+            MAIN_HEALTH_RED_TS="${MAIN_HEALTH_RED_TS}${job}"$'\t'"${started_iso}"$'\t'"${started_epoch}"$'\t'"${url}"
             blocking=$((blocking + 1))
             ;;
         esac
@@ -1867,12 +1921,17 @@ main() {
   # say whether the base is itself red — which is what makes a repair PR a repair —
   # but it NEVER blocks. It was the BLOCKING source in the previous revision, and
   # that is precisely what refused the PR that repairs a red main.
-  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA
+  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA BASE_RED_TS BASE_MAX_COMPLETED BASE_MAX_COMPLETED_EPOCH
   check_surface_probe "$base_ref" "the base branch '$base_ref'"
   BASE_STATUS="$MAIN_HEALTH_STATUS"; BASE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   BASE_REDS="$MAIN_HEALTH_REDS"; BASE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
   BASE_TOTAL="$MAIN_HEALTH_TOTAL"; BASE_RED="$MAIN_HEALTH_RED"; BASE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   BASE_PENDING="$MAIN_HEALTH_PENDING"; BASE_REF="$MAIN_HEALTH_REF"; BASE_SHA="$MAIN_HEALTH_SHA"
+  # The base's BLOCKING reds with their start times, and the base surface's own
+  # production time — snapshotted for step 4.6's staleness comparison (#1261).
+  BASE_RED_TS="$MAIN_HEALTH_RED_TS"
+  BASE_MAX_COMPLETED="$MAIN_HEALTH_MAX_COMPLETED"
+  BASE_MAX_COMPLETED_EPOCH="$MAIN_HEALTH_MAX_COMPLETED_EPOCH"
   case "$BASE_STATUS" in
     green)
       info "admin-merge: base tree ('$base_ref') ${BASE_SUMMARY}" ;;
@@ -2086,12 +2145,16 @@ main() {
   # PROCEEDS on UNMEASURED (a surface with no checks certifies nothing, but is
   # not a refusal — same rule as before) and REFUSES on UNREADABLE (failing to
   # look is never a green).
-  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_REF TREE_SHA
+  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH
   check_surface_probe "$head" "the PR's evaluated tree (head $head)"
   TREE_STATUS="$MAIN_HEALTH_STATUS"; TREE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   TREE_REDS="$MAIN_HEALTH_REDS"; TREE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
   TREE_TOTAL="$MAIN_HEALTH_TOTAL"; TREE_RED="$MAIN_HEALTH_RED"; TREE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   TREE_PENDING="$MAIN_HEALTH_PENDING"; TREE_REF="$MAIN_HEALTH_REF"; TREE_SHA="$MAIN_HEALTH_SHA"
+  # The PR surface's own production time — the anchor step 4.6 compares a base
+  # red against. Empty means the surface has produced no completed check at all.
+  TREE_MAX_COMPLETED="$MAIN_HEALTH_MAX_COMPLETED"
+  TREE_MAX_COMPLETED_EPOCH="$MAIN_HEALTH_MAX_COMPLETED_EPOCH"
   case "$TREE_STATUS" in
     green)
       info "admin-merge: ✅ evaluated tree ${TREE_SUMMARY}" ;;
@@ -2132,6 +2195,79 @@ main() {
       say_err "   produces. No evidence was posted."
       exit 1 ;;
   esac
+
+  # ── 4.6. STALENESS: A RED BASE THIS PR HAS NOT MEASURED (#1261) ──────────
+  # THE HOLE IN STEP 4.5. The PR's evaluated-tree surface reflects the base AS OF
+  # THE LAST RUN, and GitHub does NOT reliably re-run PR workflows when the base
+  # moves. So a base red that appeared AFTER this PR's checks were produced is
+  # invisible to the tree gate: the surface is a STALE GREEN, and the merge lands
+  # a tree the PR never measured. That is the incident's shape (#4600 opened
+  # before #4589 made main red, merged after).
+  #
+  # WHY THIS IS RED-RELATIVE, NOT MOVEMENT-RELATIVE. A busy base moves
+  # constantly, and almost all of that movement is irrelevant. Refusing whenever
+  # the base moved would refuse essentially every open PR — an over-block, which
+  # is a failure, not safety. The ONLY thing a stale surface can fail to cover is
+  # a red: if the base moved and is green, there is nothing this PR has not
+  # measured, so it merges. So the comparison runs ONLY when the base head
+  # carries a code-measuring red, and refuses only when such a red's run STARTED
+  # after the PR surface was last produced.
+  #
+  # WHY `started_at > TREE_MAX_COMPLETED`. `TREE_MAX_COMPLETED` is the latest
+  # `completed_at` among the PR surface's completed checks — the last moment the
+  # evaluated surface was produced. A base red whose run STARTED after that
+  # moment cannot be part of what the surface measured: the run did not exist
+  # yet. The repair direction falls out for free — a base red that predates the
+  # PR's evaluation WAS measured by it, the PR's own tree carries the fix, and
+  # this passes — so the PR that repairs a red base still merges. (MEASURED, not
+  # assumed: on tortoise, main head 1f5d6efc49 carried `welcome-e2e` failure
+  # started 2026-09-22T16:13:22Z while open PR 4591's surface was last produced
+  # 2026-09-22T06:23:46Z — a stale green of ~10h; the merge ref's base parent
+  # also lagged main by hours, which is why a merge-ref comparison alone would
+  # MISS the recomputed-but-unre-run case, while this timestamp comparison
+  # catches both.)
+  #
+  # WHAT IT DOES NOT FIX, STATED: a base red whose run started BEFORE the surface
+  # was produced but on a base the surface did not actually use (the merge ref can
+  # lag the base) is not caught here; the merge-ref base parent is the other
+  # signal, tracked as a residual rather than pretended away.
+  if [ "$BASE_STATUS" = "red" ]; then
+    local stale_any=0 stale_reds="" stale_name stale_iso stale_epoch stale_url
+    if counter_is_number "$TREE_MAX_COMPLETED_EPOCH"; then
+      while IFS=$'\t' read -r stale_name stale_iso stale_epoch stale_url; do
+        [ -n "$stale_name" ] || continue
+        if ! counter_is_number "$stale_epoch"; then
+          stale_any=1
+          stale_reds="${stale_reds}   • ${stale_name} — ${stale_url} — began at an UNREADABLE time, so the rail cannot show this PR measured it"$'\n'
+        elif counter_exceeds_max "$stale_epoch" "$TREE_MAX_COMPLETED_EPOCH"; then
+          stale_any=1
+          stale_reds="${stale_reds}   • ${stale_name} — ${stale_url} — began ${stale_iso}, AFTER this PR's surface was last produced (${TREE_MAX_COMPLETED})"$'\n'
+        fi
+      done <<< "$BASE_RED_TS"
+    else
+      # No completed check on the PR surface: there is no measurement time to
+      # compare against, so the rail cannot show this PR measured the base's red.
+      stale_any=1
+      stale_reds="   • the PR's evaluated surface has produced NO completed check run, so it has no time to compare against the base's red(s)"$'\n'
+    fi
+    if [ "$stale_any" -eq 1 ]; then
+      say_err "admin-merge: ✗ BLOCK — THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE surface)."
+      say_err "   $BASE_SUMMARY"
+      say_err "   Base red(s) this PR's evaluated surface does not cover:"
+      printf '%s' "$stale_reds" >&2
+      say_err "   CI evaluates a PR as the MERGE of its head into its base, and GitHub does not"
+      say_err "   re-run PR checks when the base moves. This base red began after this PR's checks"
+      say_err "   were produced, so the PR's green surface is STALE for it — it certifies a tree"
+      say_err "   that no longer includes this red. This is the #1261 incident (a PR opened before"
+      say_err "   the base went red and merged after)."
+      say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
+      say_err "   ('gh run rerun' the PR's runs, or push an empty commit) so the merge-ref"
+      say_err "   evaluation covers the base's red. If this PR is the REPAIR, its own checks pass"
+      say_err "   on the re-measured tree and the merge then proceeds."
+      say_err "   No evidence was posted and no merge attempted."
+      exit 1
+    fi
+  fi
 
   local pr_count main_count
   pr_count="$(count_lines "$TMP/pr-fails.txt")"
