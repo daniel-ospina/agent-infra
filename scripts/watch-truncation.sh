@@ -15,11 +15,16 @@
 #   A) re-read volume OR LLM call count per compacting session > 2× the
 #      regenerated Aug baseline over any 3 consecutive days, OR
 #   B) ≥1 stopReason:"length" record in the window
-#   → REVERT TO 1M. The rollback commit updates the guard's threshold
-#     (scripts/check-cost-config.sh) in the SAME commit. COST_CLAMP_OVERRIDE=1
-#     is the in-window escape. Owner: the weekly report reader (this exit 1 +
-#     the printed procedure is the escalation — the instrument does NOT
-#     auto-revert; a revert is a deliberate committed change).
+#   → REVERT TO 1M. The rollback commit moves the WHOLE geometry in the SAME
+#     commit — the deepseek `contextWindow` in `models.json`, the guard's
+#     `CLAMP` (scripts/check-cost-config.sh), and the regime-floor literal in
+#     BOTH instruments (scripts/fleet-cost-report.sh's `FLEET_REGIME_TB:-<n>`
+#     and this file's labelled clamp-bucket boundary) — leaving `reserveTokens`
+#     at the reviewed 16384. The printed procedure below states the same list.
+#     `COST_CLAMP_OVERRIDE=1` covers the models.json clamp class only, not the
+#     geometry and not the retry/hang contract. Owner: the weekly report reader
+#     (this exit 1 + the printed procedure is the escalation — the instrument
+#     does NOT auto-revert; a revert is a deliberate committed change).
 #
 # Note on the length leg (expected week-1 behavior): the clamp DOES produce
 # mid-turn overruns in the real fleet — measured under the 400K clamp (91

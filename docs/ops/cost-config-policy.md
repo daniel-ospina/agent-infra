@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-28
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-341, issue-1088, issue-1078, issue-1110, pi-config, cost-config-policy
+aboutObjects: agent-infra, issue-341, issue-1088, issue-1078, issue-1110, issue-1227, issue-1316, pi-config, cost-config-policy
 ---
 
 # Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)
@@ -264,7 +264,12 @@ property; this guard is the pattern to copy, not a substitute for it.
     (the reviewed value — asserted independently, see the `#1227` note below) +
     a geometry check that `300000 − reserveTokens` equals the fleet regime floor
     the instruments band on (READ from `scripts/fleet-cost-report.sh` and
-    `scripts/watch-truncation.sh`, never restated in the guard) +
+    `scripts/watch-truncation.sh`, never restated in the guard), **anchored** on
+    every deepseek-served `contextWindow` EQUALLING `300000`: the models check
+    above is only an upper bound (`≤ CLAMP`), so without that anchor a window
+    *below* the ceiling left the real trigger at `window − reserve` while the
+    geometry leg certified `300000 − reserve` — a false PASS, closed 2026-09-22
+    (`scripts/check-cost-config.sh`'s `check_models_window_anchor`) +
     `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract —
     the keys are `retry.maxRetries`, `httpIdleTimeoutMs`, `retry.baseDelayMs`,
     `retry.provider.timeoutMs`, `retry.provider.maxRetries`; **the table in §2
@@ -293,10 +298,13 @@ property; this guard is the pattern to copy, not a substitute for it.
   - **Fleet regime floor unreadable, ambiguous, or inconsistent → BLOCK
     (exit 2)**: if the guard cannot read exactly one floor value from EACH of
     `scripts/fleet-cost-report.sh` and `scripts/watch-truncation.sh`, or the two
-    disagree, it refuses rather than picks. A bare source-order pick would let a
-    legitimate reorder of the watcher's bucket boundaries (or a comment line
-    containing `if N <= tb <`) read as an instrument disagreement, which points
-    the reader at the wrong root cause. This class is **not** covered by
+    disagree, it refuses rather than picks — and it also refuses when the
+    watcher's band is empty or inverted (`floor >= ceiling`), which would certify
+    a floor no record can reach. A bare source-order pick would let a second
+    statement the label anchor also matches (a re-labelled band, a duplicated
+    boundary) read as an instrument disagreement, which points the reader at the
+    wrong root cause; an *unlabelled* `if N <= tb <` line cannot match the
+    label-anchored pattern at all. This class is **not** covered by
     `COST_CLAMP_OVERRIDE=1`.
   - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
     deletion of the clamp authority is itself terminal drift (clamp gone while

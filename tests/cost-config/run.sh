@@ -1669,15 +1669,35 @@ mkroot "$TMP38"
 # A fixture whose mutation SILENTLY FAILS would leave the tree pristine, the guard would return 0,
 # and the arm would report a pass it did not earn (run.sh is `set -uo pipefail`, no `-e`, so an
 # unguarded `assert` inside the heredoc is invisible). Gate on the mutation's status.
-if python3 - "$TMP38/scripts/check-cost-config.sh" "$TMP38/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
-import json, sys
-g, sp = sys.argv[1], sys.argv[2]
+if python3 - "$TMP38/scripts/check-cost-config.sh" "$TMP38/pi-bootstrap/pi-config/settings.json" "$TMP38/pi-bootstrap/pi-config/models.json" <<'PYEOF'
+import json, re, sys
+g, sp, mp = sys.argv[1], sys.argv[2], sys.argv[3]
 src = open(g).read()
 assert "CLAMP=300000" in src, "guard constant shape changed — update this test"
 open(g, "w").write(src.replace("CLAMP=300000", "CLAMP=1000000"))
 d = json.load(open(sp))
 d["compaction"]["reserveTokens"] = 716384     # 1000000 - 283616: the geometry still matches
 json.dump(d, open(sp, "w"), indent=2)
+# The GEOMETRY ANCHOR must hold too: a 1000000 CLAMP with 300000 windows is exactly the window the
+# derived leg would be wrong about. Move the deepseek-served windows with the CLAMP so this fixture
+# isolates the INDEPENDENT pin rather than tripping the anchor first (test 43 exercises the anchor).
+DS = re.compile(r'^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)')
+def norm(i):
+    return re.sub(r'^~?[^/]*/', '', i) if '/' in i else i
+m = json.load(open(mp))
+def walk(n):
+    if isinstance(n, dict):
+        if isinstance(n.get("id"), str) and DS.match(norm(n["id"])) and isinstance(n.get("contextWindow"), (int, float)):
+            n["contextWindow"] = 1000000
+        for k, v in n.items():
+            if isinstance(k, str) and isinstance(v, dict) and DS.match(norm(k)) and isinstance(v.get("contextWindow"), (int, float)):
+                v["contextWindow"] = 1000000
+            walk(v)
+    elif isinstance(n, list):
+        for i in n:
+            walk(i)
+walk(m)
+json.dump(m, open(mp, "w"), indent=2)
 PYEOF
 then
   grep -q '^CLAMP=1000000$' "$TMP38/scripts/check-cost-config.sh" || fail "38 fixture: the CLAMP mutation did not take effect"
@@ -1721,9 +1741,9 @@ TMP40="$(mktemp -d /tmp/cost-config-1m-revert.XXXXXX)"
 mkroot "$TMP40"
 # Gated on the mutation's status: an unguarded `assert` would leave the tree PRISTINE, the guard
 # would return 0, and the arm would report a pass it never earned (run.sh has no `-e`).
-if python3 - "$TMP40/scripts/check-cost-config.sh" "$TMP40/scripts/fleet-cost-report.sh" "$TMP40/scripts/watch-truncation.sh" <<'PYEOF'
-import sys
-g, rep, wat = sys.argv[1], sys.argv[2], sys.argv[3]
+if python3 - "$TMP40/scripts/check-cost-config.sh" "$TMP40/scripts/fleet-cost-report.sh" "$TMP40/scripts/watch-truncation.sh" "$TMP40/pi-bootstrap/pi-config/models.json" <<'PYEOF'
+import json, re, sys
+g, rep, wat, mp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 src = open(g).read()
 assert "CLAMP=300000" in src, "guard constant shape changed — update this test"
 open(g, "w").write(src.replace("CLAMP=300000", "CLAMP=1000000"))
@@ -1733,11 +1753,45 @@ open(rep, "w").write(r.replace("FLEET_REGIME_TB:-283616", "FLEET_REGIME_TB:-9836
 w = open(wat).read()
 assert "if 283616 <= tb < 650000" in w, "watcher bucket shape changed"
 open(wat, "w").write(w.replace("if 283616 <= tb < 650000", "if 983616 <= tb < 1000000"))
+# The documented 1M revert moves the WINDOW too (policy §7: "updates, in one commit: contextWindow
+# in models.json, the guard's CLAMP, and the floor literal in both instruments"). Without this the
+# fixture models a half-revert and the geometry anchor (test 43) correctly refuses it.
+DS = re.compile(r'^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)')
+def norm(i):
+    return re.sub(r'^~?[^/]*/', '', i) if '/' in i else i
+m = json.load(open(mp))
+def walk(n):
+    if isinstance(n, dict):
+        if isinstance(n.get("id"), str) and DS.match(norm(n["id"])) and isinstance(n.get("contextWindow"), (int, float)):
+            n["contextWindow"] = 1000000
+        for k, v in n.items():
+            if isinstance(k, str) and isinstance(v, dict) and DS.match(norm(k)) and isinstance(v.get("contextWindow"), (int, float)):
+                v["contextWindow"] = 1000000
+            walk(v)
+    elif isinstance(n, list):
+        for i in n:
+            walk(i)
+walk(m)
+json.dump(m, open(mp, "w"), indent=2)
 PYEOF
 then
   grep -q '^CLAMP=1000000$' "$TMP40/scripts/check-cost-config.sh" || fail "40 fixture: the CLAMP mutation did not take effect"
   grep -q 'FLEET_REGIME_TB:-983616' "$TMP40/scripts/fleet-cost-report.sh" || fail "40 fixture: the report floor mutation did not take effect"
   grep -q 'if 983616 <= tb < 1000000' "$TMP40/scripts/watch-truncation.sh" || fail "40 fixture: the watcher floor mutation did not take effect"
+  python3 -c 'import json,re,sys
+d=json.load(open(sys.argv[1]))
+DS=re.compile(r"^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)")
+ws=[]
+def walk(n):
+    if isinstance(n,dict):
+        if isinstance(n.get("id"),str) and DS.match(n["id"].split("/")[-1]) and isinstance(n.get("contextWindow"),(int,float)): ws.append(n["contextWindow"])
+        for k,v in n.items():
+            if isinstance(k,str) and isinstance(v,dict) and DS.match(k.split("/")[-1]) and isinstance(v.get("contextWindow"),(int,float)): ws.append(v["contextWindow"])
+            walk(v)
+    elif isinstance(n,list):
+        for i in n: walk(i)
+walk(d)
+sys.exit(0 if ws and all(w==1000000 for w in ws) else 1)' "$TMP40/pi-bootstrap/pi-config/models.json" || fail "40 fixture: the models.json window mutation did not take effect"
   bash "$TMP40/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
   code=$?
   if [ "$code" -eq 0 ]; then pass "1M revert (CLAMP + both floors moved, reserve 16384) → exit 0"; else fail "expected exit 0 on the documented 1M revert, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1819,6 +1873,82 @@ PYEOF
   if grep -q "could not be analysed" "$OUT"; then fail "$field=10**400 took the unanalysable fail-closed arm instead of reporting the field"; else pass "$field=10**400 was actually analysed"; fi
 done
 rm -rf "$TMP42"
+
+echo ""
+# ── 43. the GEOMETRY ANCHOR: the derived reserve leg (`CLAMP − reserveTokens == FLEET_REGIME_TB`)
+#      is only a statement about this fleet if the deepseek-served windows ARE `CLAMP`. The models
+#      check enforces `<= CLAMP`, an upper bound, so a window BELOW the ceiling left the real
+#      trigger at `window − reserve` while the guard certified `CLAMP − reserve`. (Round-4 review
+#      finding, 2026-09-22: guard exit 0 with the real trigger 233616.)
+echo "43. a deepseek window that is not the geometry anchor → BLOCK (the derived leg's premise)"
+TMP43="$(mktemp -d /tmp/cost-config-window-anchor.XXXXXX)"
+# (a) the reverse direction: CLAMP raised with the windows left behind — the half-revert the §7
+#     procedure forbids (test 40 moves the windows; this arm proves moving only CLAMP + the floors
+#     is refused).
+mkroot "$TMP43"
+if python3 - "$TMP43/scripts/check-cost-config.sh" "$TMP43/scripts/fleet-cost-report.sh" "$TMP43/scripts/watch-truncation.sh" <<'PYEOF'
+import sys
+g, rep, wat = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(g).read()
+assert "CLAMP=300000" in src
+open(g, "w").write(src.replace("CLAMP=300000", "CLAMP=1000000"))
+r = open(rep).read()
+assert "FLEET_REGIME_TB:-283616" in r
+open(rep, "w").write(r.replace("FLEET_REGIME_TB:-283616", "FLEET_REGIME_TB:-983616"))
+w = open(wat).read()
+assert "if 283616 <= tb < 650000" in w
+open(wat, "w").write(w.replace("if 283616 <= tb < 650000", "if 983616 <= tb < 1000000"))
+PYEOF
+then
+  bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "1M floors moved but the windows left at 300000 → exit 1"; else fail "expected exit 1 for the half-revert (windows left behind), got $code"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "geometry anchor is 1000000" "$OUT"; then pass "the block names the anchor and the window it found"; else fail "expected the geometry-anchor message"; sed -n '1,30p' "$OUT"; fi
+else
+  fail "43 fixture (a) mutation FAILED — the test cannot observe the condition, so it must not report the arms"
+fi
+rm -rf "$TMP43"
+# (b) the forward direction: a window BELOW the ceiling, everything else untouched.
+TMP43="$(mktemp -d /tmp/cost-config-window-anchor.XXXXXX)"
+mkroot "$TMP43"
+if python3 - "$TMP43/pi-bootstrap/pi-config/models.json" <<'PYEOF'
+import json, re, sys
+p = sys.argv[1]
+DS = re.compile(r'^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)')
+def norm(i):
+    return re.sub(r'^~?[^/]*/', '', i) if '/' in i else i
+d = json.load(open(p))
+def walk(n):
+    if isinstance(n, dict):
+        if isinstance(n.get("id"), str) and DS.match(norm(n["id"])) and isinstance(n.get("contextWindow"), (int, float)):
+            n["contextWindow"] = 250000
+        for k, v in n.items():
+            if isinstance(k, str) and isinstance(v, dict) and DS.match(norm(k)) and isinstance(v.get("contextWindow"), (int, float)):
+                v["contextWindow"] = 250000
+            walk(v)
+    elif isinstance(n, list):
+        for i in n:
+            walk(i)
+walk(d)
+json.dump(d, open(p, "w"), indent=2)
+PYEOF
+then
+  bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "deepseek windows lowered to 250000 (≤ CLAMP) → exit 1"; else fail "expected exit 1 for a window below the ceiling, got $code"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "geometry anchor is 300000" "$OUT"; then pass "the block names the anchor and the 250000 window"; else fail "expected the geometry-anchor message"; sed -n '1,30p' "$OUT"; fi
+else
+  fail "43 fixture (b) mutation FAILED — the test cannot observe the condition, so it must not report the arms"
+fi
+rm -rf "$TMP43"
+# (c) the pristine root still reads green on the anchor — the check is not blanket-failing.
+TMP43="$(mktemp -d /tmp/cost-config-window-anchor.XXXXXX)"
+mkroot "$TMP43"
+bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "the pristine root is green (the anchor accepts the shipped geometry)"; else fail "expected exit 0 on the pristine root, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "every deepseek-served contextWindow is the geometry anchor 300000" "$OUT"; then pass "the green run states the anchor it verified"; else fail "expected the anchor's green line"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP43"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

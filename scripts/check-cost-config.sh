@@ -78,29 +78,47 @@ CLAMP=300000
 #
 #   2. DERIVED — the geometry must match the floor the instruments band on. The FLOOR is READ
 #      FROM the instruments (`fleet-cost-report.sh`'s `FLEET_REGIME_TB:-<n>` default and
-#      `watch-truncation.sh`'s clamp-bucket boundary), never restated here, so a literal in this
-#      file cannot prove the shell agrees with itself. The window term is the guard's own CLAMP —
-#      the ceiling the models.json check enforces — not a second copy of the floor. This leg
-#      catches a CLAMP drift and an instrument drift (the #1213/#1304 withdrawal moved 50000→16384,
-#      the trigger 250000→283616; moving ONE instrument alone must also fail).
+#      `watch-truncation.sh`'s labelled clamp-bucket boundary), never restated here, so a literal
+#      in this file cannot prove the shell agrees with itself. This leg catches a CLAMP drift and
+#      an instrument drift (the #1213/#1304 withdrawal moved 50000→16384, the trigger
+#      250000→283616; moving ONE instrument alone must also fail).
+#
+#      The window term is the guard's own CLAMP, and its ANCHOR is `check_models_window_anchor`
+#      below: it asserts the deepseek-served windows EQUAL that ceiling. `check_model_file` only
+#      enforces `<= CLAMP`, an UPPER BOUND, so without that anchor a window BELOW the ceiling
+#      leaves the real trigger at `window − reserve` while this leg certifies `CLAMP − reserve` —
+#      a false PASS. Reproduced (2026-09-22): with every window at 250000 the guard exited 0 and
+#      printed `guard geometry 300000−16384=283616 matches the instruments' 283616 floor` while
+#      the live trigger was 233616.
+#
+#      SCOPE, recorded (#1342): the FLOOR is still read by PARSING the instruments' assignment text
+#      rather than by executing them — the mechanism the #1088 review on this file forbade for
+#      `$CAP_MS`. The parse reads the COMMITTED default literal, so an ambient `FLEET_REGIME_TB`
+#      override is outside what this leg certifies. That divergence, and the watcher's
+#      label-anchored boundary, are tracked in #1342.
 REGIME_TB_REPORT_ALL="$(sed -n 's/.*FLEET_REGIME_TB:-\([0-9][0-9]*\)}.*/\1/p' "$ROOT/scripts/fleet-cost-report.sh" 2>/dev/null)"
 # Anchored on the BUCKET LABEL, not on the bare `if N <= tb <` shape: the watcher states
 # `<= tb <` in more than one bucket boundary (the retired 700K-era `if 650000 <= tb < 900000`
 # still sits beside the live one), so the shape alone is ambiguous. The uniqueness assertion
 # below is kept as the backstop: if the label moves or a second labelled statement appears,
 # the guard refuses rather than picking by source order.
-REGIME_TB_WATCH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9][0-9]*\) <= tb <.*/\1/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
+#
+# BOTH bounds are captured. Only the lower one is the floor, but a boundary whose band is empty or
+# inverted can never place a record in the clamp regime while this guard still derives a floor from
+# it. Reproduced: moving only the lower bound to 983616 yields `if 983616 <= tb < 650000` — a dead
+# band — and the guard exited 0 on it.
+REGIME_TB_WATCH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9][0-9]*\) <= tb < \([0-9][0-9]*\).*/\1/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
+REGIME_TB_WATCH_HIGH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9][0-9]*\) <= tb < \([0-9][0-9]*\).*/\2/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
 REGIME_TB_REPORT="$(printf '%s\n' "$REGIME_TB_REPORT_ALL" | sed '/^$/d' | head -1)"
 REGIME_TB_WATCH="$(printf '%s\n' "$REGIME_TB_WATCH_ALL" | sed '/^$/d' | head -1)"
 if [ -z "$REGIME_TB_REPORT" ] || [ -z "$REGIME_TB_WATCH" ]; then
   echo "error: cannot read the fleet regime floor from scripts/fleet-cost-report.sh ($REGIME_TB_REPORT) / scripts/watch-truncation.sh ($REGIME_TB_WATCH) — the reserve cannot be asserted as a derived relation, so it must not read green" >&2
   exit 2
 fi
-# AMBIGUITY is a refusal, not a pick. The watcher states the floor in more than one bucket
-# boundary (the retired 700K-era `if 650000 <= tb < 900000` still sits beside the live one), so a
-# bare `head -1` silently resolves the floor by SOURCE ORDER: a legitimate reorder, or a comment
-# line containing `if N <= tb <`, would make the guard report "the instruments disagree" when they
-# do not. An ambiguous derivation is not a derivation.
+# AMBIGUITY is a refusal, not a pick. A bare `head -1` would silently resolve the floor by SOURCE
+# ORDER. The hazard is a SECOND statement the label anchor also matches — a re-labelled band, a
+# duplicated boundary. An unlabelled `if N <= tb <` line cannot match this pattern at all, because
+# the anchor is the label. An ambiguous derivation is not a derivation.
 REGIME_TB_REPORT_N="$(printf '%s\n' "$REGIME_TB_REPORT_ALL" | sed '/^$/d' | wc -l | tr -d ' ')"
 REGIME_TB_WATCH_N="$(printf '%s\n' "$REGIME_TB_WATCH_ALL" | sed '/^$/d' | wc -l | tr -d ' ')"
 if [ "$REGIME_TB_REPORT_N" != "1" ] || [ "$REGIME_TB_WATCH_N" != "1" ]; then
@@ -109,6 +127,14 @@ if [ "$REGIME_TB_REPORT_N" != "1" ] || [ "$REGIME_TB_WATCH_N" != "1" ]; then
 fi
 if [ "$REGIME_TB_REPORT" != "$REGIME_TB_WATCH" ]; then
   echo "error: the fleet regime floor disagrees between the instruments: fleet-cost-report.sh says $REGIME_TB_REPORT, watch-truncation.sh says $REGIME_TB_WATCH — the reserve cannot derive a floor the instruments disagree on" >&2
+  exit 2
+fi
+# A band the watcher can never place a record in is not a floor. `lower < upper` is the coherence
+# the capture above makes checkable; an empty or inverted band fails closed (exit 2) rather than
+# certifying a floor no record can reach.
+REGIME_TB_WATCH_HIGH="$(printf '%s\n' "$REGIME_TB_WATCH_HIGH_ALL" | sed '/^$/d' | head -1)"
+if [ -z "$REGIME_TB_WATCH_HIGH" ] || [ "$REGIME_TB_WATCH" -ge "$REGIME_TB_WATCH_HIGH" ]; then
+  echo "error: the watcher's clamp-bucket band is empty or inverted (floor $REGIME_TB_WATCH, ceiling ${REGIME_TB_WATCH_HIGH:-<unreadable>}) — the guard cannot derive a floor the watcher never bands on" >&2
   exit 2
 fi
 FLEET_REGIME_TB="$REGIME_TB_REPORT"
@@ -531,6 +557,93 @@ check_model_file() {
   fi
 }
 
+# check_models_window_anchor <file> <label> — the GEOMETRY ANCHOR for the derived reserve leg.
+#
+# `check_model_file` above enforces `contextWindow <= CLAMP` — an UPPER BOUND. The derived leg
+# asserts `CLAMP − reserveTokens == FLEET_REGIME_TB`, which is only a statement about THIS fleet if
+# the window the compaction trigger actually uses IS `CLAMP`. A window BELOW the ceiling leaves the
+# real trigger at `window − reserve` while the derived leg still certifies the geometry against
+# `CLAMP`. Reproduced (2026-09-22, code-review): with every deepseek-served window lowered to
+# 250000 and nothing else touched, the guard exited 0 and printed
+# `guard geometry 300000−16384=283616 matches the instruments' 283616 floor` while the live trigger
+# was 233616 — the exact mis-triage the watcher's band comment forbids (a clamp-era length record
+# would bucket as `small-window` and be told to the owner as "exclude from the revert decision").
+# The mirror case is the same false PASS: `CLAMP` raised to 1000000 with the windows left at
+# 300000. Equality is therefore the anchor. It is BLOCK-level and override-immune: a window that
+# disagrees with the geometry is a settings drift, not a clamp rollback.
+#
+# Scope: this anchors the SHIPPED models.json — the committed config authority this guard guards.
+# The live file stays `warn`-class, exactly as `check_model_file` treats it.
+check_models_window_anchor() {
+  local file="$1" label="$2" bad b
+  # An absent file is check_model_file business, not this anchor business.
+  [ -f "$file" ] || return 0
+  bad="$(models_window_anchor_violations "$file")"
+  if printf '%s\n' "$bad" | grep -q '^PARSE_ERROR'; then
+    block_settings "$label — the window geometry anchor could not be read, so the derived reserve leg is unassertable (fail-closed): $bad"
+    return
+  fi
+  if [ -n "$bad" ]; then
+    while IFS= read -r b; do
+      [ -n "$b" ] && block_settings "$label — $b"
+    done <<< "$bad"
+    return
+  fi
+  ok "$label — every deepseek-served contextWindow is the geometry anchor ${CLAMP}"
+}
+
+# models_window_anchor_violations <file> — one line per deepseek-served entry whose `contextWindow`
+# is present and NOT the geometry anchor `CLAMP`. Same shape as `deepseek_violations`: the heredoc
+# sits in a plain function body, never nested inside a command substitution.
+models_window_anchor_violations() {
+  python3 - "$CLAMP" "$1" <<'PYEOF'
+import json, re, sys
+
+clamp = int(sys.argv[1])
+path = sys.argv[2]
+DS = re.compile(r'^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)')
+
+
+def norm(id_):
+    return re.sub(r'^~?[^/]*/', '', id_) if '/' in id_ else id_
+
+
+bad = []
+
+
+def note(where, cw):
+    # An ABSENT contextWindow is not this anchor finding (a catalog entry may inherit one); a
+    # PRESENT one that disagrees is.
+    if isinstance(cw, (int, float)) and cw != clamp:
+        bad.append(f'{where} contextWindow={cw}, but the geometry anchor is {clamp}')
+
+
+def walk(node):
+    if isinstance(node, dict):
+        if isinstance(node.get("id"), str) and DS.match(norm(node["id"])):
+            note(node["id"], node.get("contextWindow"))
+        for key, val in node.items():
+            if isinstance(key, str) and isinstance(val, dict) and DS.match(norm(key)):
+                note(key, val.get("contextWindow"))
+            walk(val)
+    elif isinstance(node, list):
+        for item in node:
+            walk(item)
+
+
+try:
+    with open(path) as f:
+        walk(json.load(f))
+except Exception as e:
+    print(f'PARSE_ERROR {e}')
+    sys.exit(1)
+
+for b in bad:
+    print(b)
+sys.exit(0)
+PYEOF
+}
+
 # check_settings_file <file> <label> <missing> — compaction block (enabled +
 # reserve/keep) + the bounded retry/hang contract, BLOCK on drift.
 check_settings_file() {
@@ -734,6 +847,7 @@ if [ -n "${PI_MAX_RETRY_DELAY_MS:-}" ] && [ "${PI_MAX_RETRY_DELAY_MS}" != "$RETR
 fi
 
 check_model_file "$SHIPPED_DIR/models.json" "shipped models.json" models block
+check_models_window_anchor "$SHIPPED_DIR/models.json" "shipped models.json"
 check_model_file "$SHIPPED_DIR/models-store.json" "shipped models-store.json" store warn
 check_settings_file "$SHIPPED_DIR/settings.json" "shipped settings.json" block
 check_project_settings

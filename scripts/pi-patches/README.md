@@ -50,7 +50,7 @@ Two aggravating defects in `agent-session.js`:
 | **(a)** | Persist a failed compaction as a durable session entry | **extension-side only** — `extensions/compaction-watchdog.ts` (issue #1215, merged in `f082ec8`) | **already done, verified here** — see `tests/verify-a-durable-failure-record.mjs` |
 | **(b)** | Never clamp below a usable output floor | upstream source patch **+** `extensions/clamp-output-floor.ts` (upgrade-proof layer) | **new — the change this set originally carried** |
 | **(d)** | Floor the summarization budget at the size of the summary it must preserve | upstream source patch (the ESM copy + both inlined copies in the bundle chunk, #1263) | **new — added to this set** — see `tests/verify-summarization-budget-floor.mjs` |
-| **(e)** | Exempt the summarization request from `clampMaxTokensToContext`; fail loudly when the prompt cannot fit | upstream source patch (the caller marker in `compaction.js` + the honouring side in every `buildBaseOptions` copy, #1316) | **new — added to this set** — see `tests/verify-summarization-clamp-exemption.mjs` |
+| **(e)** | Exempt the summarization request from `clampMaxTokensToContext`; fail loudly when the prompt cannot fit | upstream source patch (the caller marker in `compaction.js`, the honouring side in every `buildBaseOptions` copy, and the four provider-adapter re-clamp sites, #1316) | **new — added to this set** — see `tests/verify-summarization-clamp-exemption.mjs` |
 
 (a) is verified by this set but lives entirely in the #1215 extension; the source patch set itself
 carries **(b), (d) and (e)**.
@@ -190,8 +190,10 @@ is real but not casually reachable at the 300K window; the 2,000-char tool-resul
 so a blanket removal would exempt every normal turn — a regression. The exemption is therefore
 gated on a marker set at the one shared summarization choke point:
 
-- `createSummarizationOptions` (the single constructor every summarization call goes through —
-  `generateSummaryWithUsage` **and** `generateTurnPrefixSummary`) sets `skipContextClamp: true`;
+- `createSummarizationOptions` (the shared constructor the compaction module's summarization
+  callers go through — `generateSummaryWithUsage` **and** `generateTurnPrefixSummary`) sets
+  `skipContextClamp: true`. That is the path pi's own auto-compaction takes; what it does **not**
+  cover is listed under **Known gaps** 13;
 - `buildBaseOptions` honours the marker and, when the prompt cannot fit (`promptTokens +
   CONTEXT_SAFETY_TOKENS >= contextWindow`, i.e. `available <= 0`), throws an explicit error naming
   the prompt size and the window, distinguishable from the token-cap error. Otherwise it returns
@@ -514,3 +516,23 @@ trees. It builds its own trees and never modifies the installed one.
     matching is caught loudly rather than rotting. The behavioural proof of the two anthropic copies
     runs against a **registered** model on a deliberately shrunk window (see the (e) section); no
     claim is made that the shipped configuration exercises it.
+13. **Change (e) is carried only where the summarization options are built by
+    `createSummarizationOptions`; four other summarization construction sites build their options
+    inline and are still clamped.** The bundled pi-agent-core facade's `generateSummaryWithRequest`,
+    `generateTurnPrefixSummary2` and `generateBranchSummaryWithRequest` (all in
+    `dist/bundle/chunks/chunk-JVUZSMYM.js`) construct `{ maxTokens, … }` themselves and pass it
+    through `createSummaryRequestOptions`, which spreads the object but never adds the marker; the
+    ESM `dist/core/compaction/branch-summarization.js` does the same with its own
+    `{ apiKey, headers, env, signal, maxTokens }`. Their options therefore reach `buildBaseOptions`
+    with `options?.skipContextClamp === undefined`, take the un-gated arm and keep the clamp — and
+    the `available <= 0` throw is unreachable for them, so a starved branch summary still collapses
+    to the 1024 floor and is discarded by `getSummarizationFailure`. pi's own auto-compaction
+    reaches none of them (it uses the inlined compaction copy, which does go through
+    `createSummarizationOptions`), so the shipped behaviour and the (e) test are unaffected; the
+    exposure is an SDK consumer importing pi-agent-core's `compact`, and the branch-summarization
+    path. **This is not the same shape as gap 12's carried-but-unreachable entries**: change (d)
+    *is* carried on `generateSummaryWithRequest` (entry `d3-summarization-budget-bundle-request`), so
+    (e) not being carried there is a genuine asymmetry rather than a scope boundary. Carrying (e)
+    there is deliberate follow-up work, tracked as agent-infra **#1340** — the manifest's `find` must
+    include the enclosing function signature, because the inline options expression occurs **twice**
+    in the chunk and a bare expression anchor is (correctly) refused as ambiguous.
