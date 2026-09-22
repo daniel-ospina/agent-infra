@@ -121,7 +121,9 @@ As with (b), the change is carried in **three copies**: the ESM
 the running CLI loads (`dist/bundle/chunks/chunk-JVUZSMYM.js`) — `generateSummaryWithUsage`, which
 is the one pi's own auto-compaction reaches, and `generateSummaryWithRequest` (the bundled
 pi-agent-core facade), which pi's auto-compaction paths do not reach but an SDK consumer importing
-pi-agent-core's `compact` would. What (d) does **not** cover is listed under **Known gaps** 9.
+pi-agent-core's `compact` would. What (d) does **not** cover is the turn-prefix budget in
+**Known gaps** 9 (a verified non-defect, #1318); the clamp residual (d) also left open is closed by
+change (e) below.
 
 One property of the manifest is load-bearing and easy to lose: every `verifyPresent` needle must be
 **code-shaped**, i.e. absent from the **marker-only rendering of its own payload**, never a
@@ -152,7 +154,8 @@ a pristine tree and a patched tree in a temp dir (a copy of the installed `dist/
 `node_modules`), drives the real `generateSummaryWithUsage` with a stub `streamFn`, and asserts the
 budget **handed to the stream function** — the pre-clamp value, since the real clamp
 (`clampMaxTokensToContext`) runs later inside `buildBaseOptions` and this probe never exercises it
-(**the residual formerly recorded as gap 10**, now closed by change (e)) — **13,107 unpatched → 32,135 patched** against the measured 56,077-char summary. The
+(**formerly the open residual “change (d) leaves the clamp applied to the summarization request”,
+now closed by change (e)**) — **13,107 unpatched → 32,135 patched** against the measured 56,077-char summary. The
 RED leg fails on the unpatched code by construction (it asserts the value is exactly the old cap and
 that the green assertion is false), so "no-repro → green" is impossible. The installed tree is never
 modified.
@@ -459,11 +462,31 @@ trees. It builds its own trees and never modifies the installed one.
    in the version it is running against** — the anchors are byte-exact for that version (they came
    from it), but the generator can only see the patched form and says so in its output. Re-derive on
    a pristine tree whenever one is available.
-9. **Change (d) does not patch the turn-prefix summarization budget.** It uses
-   `Math.floor(0.5 * reserveTokens)` and is the same defect class, but its anchor occurs **twice**
-   in `chunk-JVUZSMYM.js`, so `apply.mjs`'s unique-anchor resolver refuses it
-   (`"ambiguous — remove the duplicate, or select one explicitly with PI_PATCH_VERSION"`). It needs
-   its own entry with distinct surrounding context.
+9. **The turn-prefix summarization budget is NOT the same defect class — verified, no patch
+   needed (#1318).** It uses `Math.floor(0.5 * reserveTokens)`, but unlike the update path it is
+   **not asked to preserve anything**: `generateTurnPrefixSummary` takes no `previousSummary`
+   parameter, injects no `<previous-summary>` block, and `TURN_PREFIX_SUMMARIZATION_PROMPT` asks
+   only for a concise summary of the prefix — "Be concise. Focus on what's needed to understand the
+   kept suffix." There is **no** `PRESERVE all existing information` rule (that lives in
+   `UPDATE_SUMMARIZATION_INSTRUCTIONS`), so its output has no lower bound derived from a prior
+   artifact and a fixed fraction of `reserveTokens` cannot be *structurally* starved. The
+   same-shaped initial-summary path (`SUMMARIZATION_PROMPT`, `0.8 * reserveTokens`) is likewise
+   unfloored by (d), and branch summarization caps at a flat `min(4096, model.maxTokens)`
+   (`branch-summarization.js`) with no floor and no preservation rule. Fleet evidence agrees:
+   `~/.pi/agent/state/compaction-failures.log` holds **0** turn-prefix `length`-stop records; its
+   one turn-prefix record is `Turn prefix summarization failed: This operation was aborted` (an
+   operator abort — Issue E of `docs/upstream-pi-bugs.md`), not a token-cap stop.
+   **Why it still cannot be a second `find`/`replace` pair in change (d):** the budget line occurs
+   **twice** in `chunk-JVUZSMYM.js`, and a patch entry's `find` must match exactly once:
+   `make-manifest.mjs` refuses at generation time (`anchor matched 2 times in <file> (expected
+   exactly 1)`) and `apply.mjs` refuses at apply time
+   (`"<id> (<file>): anchor matched 2 times, expected exactly 1."`). The two
+   sites are `generateTurnPrefixSummary(messages,model,reserveTokens,apiKey,headers,env2,signal,…,sessionId)`
+   and the pi-agent-core facade
+   `generateTurnPrefixSummary2(messages,model,reserveTokens,thinkingLevel,request,context)`; a future
+   entry would need the function signature in its `find`, not the bare budget line.
+   (`PI_PATCH_VERSION` does not help here: it selects a manifest *directory*, not one occurrence
+   inside a file.)
 10. **Change (e) throws locally when `available <= 0`, where (b) deliberately chose to let the
     provider reject an over-long request.** The two are consistent (the (b) reasoning is about an
     *estimator that over-counts*, not about a request that cannot fit by pi's own accounting), but

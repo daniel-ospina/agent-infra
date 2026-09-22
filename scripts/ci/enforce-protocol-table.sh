@@ -83,11 +83,15 @@ ROOT="${ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$(cd "$(dirna
 #   2. $ROOT/operations/enforcement/dangerous-ops.txt (consumer layout)
 #   3. ${AGENT_INFRA_PATH}/enforcement/dangerous-ops.txt — the manifest actually IN FORCE
 #
-# Why 3 exists (#3462): skill-enforcer resolves its gate map at extensions/
-# skill-enforcer.ts:75 as `resolve(__dirname, "..", "enforcement", "dangerous-ops.txt")`
-# — the *extension's* install location, i.e. agent-infra's manifest — and never reads the
-# per-repo path. So a consumer repo with no repo-local manifest is enforced by the global
-# one, and the audit must validate against it rather than fail-closed on its absence.
+# Why 3 exists (#3462): skill-enforcer resolves its gate map next to the REAL
+# module file — `realpathSync(__filename)`, not `__dirname` (#1321), because pi
+# loads extensions through jiti, which keeps the SYMLINK path in `__dirname`.
+# So a consumer repo whose extension is symlinked in from agent-infra is enforced
+# by agent-infra's manifest, and never reads the per-repo path. `${AGENT_INFRA_PATH}`
+# is now only a FALLBACK, used when no manifest sits next to the module (a COPY
+# rather than a symlink), and the extension announces that loudly. A consumer repo
+# with no repo-local manifest is therefore enforced by the global one, and the
+# audit must validate against it rather than fail-closed on its absence.
 # Repo-local wins when present (a repo declaring its own manifest is audited against that).
 # Fail-closed survives for the one genuinely dangerous case: NO manifest anywhere
 # (e.g. a bare CI checkout with AGENT_INFRA_PATH unset), where the extension really would

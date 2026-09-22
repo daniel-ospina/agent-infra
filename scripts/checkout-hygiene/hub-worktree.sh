@@ -62,10 +62,14 @@
 #     allowance does still admit the sync verbs on the session's own baseline —
 #     `merge`/`pull`/`rebase`; the rewriting arm is the hole tracked by #1144,
 #     and an admitted plain merge mints a merge commit no other session expects,
-#     which is why neither is the sanctioned remedy.) Meanwhile the hub-state
-#     check still reports PASS because it tests on-main + clean, not freshness — so the staleness hid itself: an absent guard reads as a
-#     passing guard. Observed live: the tortoise hub sat 3 days / 308 commits
-#     stale, with files merged upstream since simply absent from it.
+#     which is why neither is the sanctioned remedy.) The hub-state check used to
+#     test on-main + clean only, so it reported PASS here too — an absent guard
+#     read as a passing guard, and the staleness hid itself. Observed live: the
+#     tortoise hub sat 3 days / 308 commits stale, with files merged upstream
+#     since simply absent from it. #1313 closes that: the detector now also
+#     compares the tip with its upstream and emits a FAIL
+#     (`HUB_DISORDER=behind|diverged|no_upstream`), naming `refresh` below as the
+#     diverged recovery.
 #
 #     Refresh REFUSES by default (exit 1) rather than moving anything:
 #       - the hub is not on main/master (or is detached) → refused; an off-main

@@ -122,6 +122,13 @@ jobs:
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
         echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
         npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
+        # #1321/#1322 — skill-enforcer: manifest resolution under the deployed
+        # symlink layout (the `dirname(__filename)` farm bug #1321), a repeated
+        # manifest line clobbering a skill's other rules, and layout-independent
+        # read identity (#1322). Zero-dep; spawns temp farms through `npx tsx`
+        # and through real jiti where resolvable. Mirrors the ci.yml verify step.
+        echo "== extensions/skill-enforcer.test.ts =="
+        npx tsx extensions/skill-enforcer.test.ts || failures=$((failures+1))
         # #426 — review-enforcer: the merge-registry gate (gates EVERY merge in
         # this account). Needs the pi package (real runtime import): installed as
         # a devDep (package.json) from the public registry, pinned to the pi
@@ -252,6 +259,23 @@ jobs:
             bash -n "$f" || errors=$((errors+1))
           done
           bash scripts/checkout-hygiene/deepseek-balance-watch.test.sh || errors=$((errors+1))
+          # #1313 — hub-state-check: the DETECTOR. Its PASS contract is on-main
+          # + clean + tip==upstream; a clean-but-stale hub used to report PASS
+          # (the false PASS #1313 closes, so an absent guard read as a passing
+          # guard). The suite pins the whole matrix: behind and diverged FAIL,
+          # up-to-date PASSes, an unverifiable (no-upstream) hub FAILs CLOSED,
+          # detached HEAD reports off_main without crashing, and the --gh-report
+          # leg carries the same staleness guidance. Hermetic: throwaway temp
+          # repos, a LOCAL bare remote (no network), a stubbed `gh` for the
+          # dedup emitter, never a real hub.
+          bash scripts/checkout-hygiene/hub-state-check.test.sh || errors=$((errors+1))
+          # #1309/#1313 — hub-worktree: the RECOVERY half. Pins `refresh`
+          # (fast-forward a behind hub; refuse a content-carrying divergence;
+          # discard only contentless commits, and only with the flag), the
+          # salvage capture, and test 8g's guard posture (hub-worktree.sh
+          # itself carries no destructive git verb). Hermetic: throwaway temp
+          # bare origin + repo, no network, never a real hub.
+          bash scripts/checkout-hygiene/hub-worktree.test.sh || errors=$((errors+1))
           bash scripts/install-launchd.test.sh || errors=$((errors+1))
           # #469 — pi-session-reaper hermetic suite (fake PS/KILL/DATE shims +
           # temp HOME/cmux store/sessions; never signals real processes). Runs
