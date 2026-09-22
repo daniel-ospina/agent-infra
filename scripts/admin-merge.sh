@@ -193,6 +193,19 @@
 # surface was read. An UNREADABLE probe (gh error, unparseable body) is a third
 # thing again: that is the rail FAILING to look, and it REFUSES, by name.
 #
+# A PARTIAL READ IS A FAILURE TO LOOK, NOT HALF A CERTIFICATE (#1261 fix round).
+# The probe reads TWO endpoints — `/check-runs` and `/status` — and it used to
+# return UNREADABLE as soon as EITHER failed. That discarded the other endpoint's
+# reds, and on the BASE it silently DISARMED 4.6/4.7: both are gated on the base
+# being RED, so a base the rail could not read was treated as a base that is not
+# red, and a stale green merged. Now the two endpoints are read independently:
+# whatever WAS read is consumed and reported (a red on the readable half is named
+# in the refusal), but a read missing one endpoint is a PARTIAL surface and is
+# refused outright — on the base and on the tree alike. The endpoint that failed
+# may carry a red, and with a COMPLETE read that red would have refused, so a
+# partial read must never convert a refusal into a merge. Only BOTH endpoints
+# failing is the "never read at all" state.
+#
 # STALENESS: A RED BASE THE PR HAS NOT MEASURED (#1261, step 4.6). The tree
 # surface above reflects the base AS OF THE PR'S LAST RUN, and GitHub does not
 # reliably re-run PR workflows when the base moves. So a base red that appeared
@@ -1087,6 +1100,10 @@ check_surface_probe() {
   MAIN_HEALTH_SUMMARY=""
   MAIN_HEALTH_REDS=""
   MAIN_HEALTH_REDS_OTHER=""
+  # The endpoint(s) that could NOT be read, named for the PARTIAL refusal. Empty
+  # means the whole surface was read (both endpoints), or BOTH failed (which is
+  # UNREADABLE).
+  MAIN_HEALTH_UNREAD_EPS=""
   # Structured BLOCKING reds, for the staleness comparison (step 4.6):
   # `<name>\t<started_iso>\t<started_epoch>\t<url>`, one per code-measuring red.
   MAIN_HEALTH_RED_TS=""
@@ -1108,20 +1125,28 @@ check_surface_probe() {
   MAIN_HEALTH_SHA="$sha"
   cr_json="$(mktemp "${TMPDIR:-/tmp}/admin-merge-checks.XXXXXX")"
   st_json="$(mktemp "${TMPDIR:-/tmp}/admin-merge-statuses.XXXXXX")"
-  # BOTH surfaces must be READABLE. A gh failure here is the rail failing to
-  # look, and "I did not look" is never green — the caller REFUSES. (An EMPTY
-  # surface is a THIRD state: main's checks have not started. Also not green,
-  # but not a refusal — see the header.)
+  # READ EACH ENDPOINT INDEPENDENTLY — A PARTIAL READ IS CONSUMED, NEVER
+  # DISCARDED (#1261 fix round). The old shape returned UNREADABLE the moment
+  # EITHER call failed, which threw away the other endpoint's reds AND (on the
+  # BASE) silently disarmed 4.6/4.7 — both are gated on the base being RED, so a
+  # base that could not be read was treated as a base that is not red. A failed
+  # call leaves an EMPTY file, so the parser sees no data for that half instead
+  # of a half-written body (an unparseable body would also fail closed below).
+  local cr_ok=1 st_ok=1 unread_eps=""
   if ! $GH api "$slug/commits/$sha/check-runs?per_page=100" --paginate > "$cr_json" 2>/dev/null; then
-    rm -f "$cr_json" "$st_json"
-    MAIN_HEALTH_STATUS="unreadable"
-    MAIN_HEALTH_SUMMARY="UNREADABLE — 'gh api .../check-runs' failed for '$ref' ($sha): the surface was never read"
-    return 0
+    cr_ok=0; : > "$cr_json"; unread_eps="check-runs"
   fi
   if ! $GH api "$slug/commits/$sha/status" > "$st_json" 2>/dev/null; then
+    st_ok=0; : > "$st_json"
+    unread_eps="${unread_eps:+$unread_eps and }status"
+  fi
+  # BOTH unreadable: the surface was never read AT ALL. That is the UNREADABLE
+  # state proper, and the caller refuses loudly. (One unread endpoint is PARTIAL
+  # — decided below, once what WAS read has been parsed.)
+  if [ "$cr_ok" -eq 0 ] && [ "$st_ok" -eq 0 ]; then
     rm -f "$cr_json" "$st_json"
     MAIN_HEALTH_STATUS="unreadable"
-    MAIN_HEALTH_SUMMARY="UNREADABLE — 'gh api .../status' failed for '$ref' ($sha): the surface was only half read"
+    MAIN_HEALTH_SUMMARY="UNREADABLE — BOTH 'gh api .../check-runs' and '.../status' failed for '$ref' ($sha): the surface was never read"
     return 0
   fi
   py_out="$("$PYTHON_BIN" -c 'import datetime, json, sys
@@ -1340,6 +1365,23 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   # red count: the raw count would refuse on a failing cron lane.
   MAIN_HEALTH_RED="$blocking"
   MAIN_HEALTH_RED_OTHER="$other"
+  # A PARTIAL SURFACE IS NOT A CERTIFICATE (#1261 fix round). One endpoint was
+  # never read, so the rail cannot show that half carries no red — and on the
+  # BASE, a red hidden there is exactly what disarmed 4.6/4.7 and merged the
+  # stale green this rail exists to stop. Whatever WAS read is kept and reported
+  # (the RED lines below), so a red visible on the readable endpoint is named in
+  # the refusal rather than discarded. Refusing is the counterfactual-correct
+  # answer: with a COMPLETE read, a red there would have refused, so a partial
+  # read must never convert a refusal into a merge.
+  if [ -n "$unread_eps" ]; then
+    MAIN_HEALTH_UNREAD_EPS="$unread_eps"
+    MAIN_HEALTH_STATUS="partial"
+    MAIN_HEALTH_SUMMARY="PARTIAL — 'gh api .../$unread_eps' failed for '$ref' ($sha): only the OTHER endpoint was read, so this surface is only HALF measured"
+    if [ "$MAIN_HEALTH_RED" -gt 0 ]; then
+      MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; the half that WAS read already carries $MAIN_HEALTH_RED code-measuring red(s)"
+    fi
+    return 0
+  fi
   if [ "$MAIN_HEALTH_TOTAL" -eq 0 ]; then
     MAIN_HEALTH_STATUS="unmeasured"
     MAIN_HEALTH_SUMMARY="UNMEASURED — 0 check runs and 0 commit statuses are attached to '$ref' ($sha): $label has no checks yet, so this certifies NOTHING about the tree"
@@ -2021,8 +2063,28 @@ main() {
       info "admin-merge:    (step 4.5): a PR that repairs this red must still be able to land."
       printf '%s\n' "$BASE_REDS" | sed 's/^/      /' >&2 ;;
     unreadable)
-      info "admin-merge: ⚠️  base tree ('$base_ref') ${BASE_SUMMARY}"
-      info "admin-merge:    NOT blocking — this is context; the gate is the PR's own tree." ;;
+      say_err "admin-merge: ✗ BLOCK — THE BASE BRANCH'S CHECK SURFACE COULD NOT BE READ."
+      say_err "   ${BASE_SUMMARY}"
+      say_err "   The base is context, not the gate — but 4.6 and 4.7 are BOTH gated on the"
+      say_err "   base being RED, so a base the rail could not read is a base whose red would"
+      say_err "   silently disarm them, and the stale green this rail exists to stop would merge"
+      say_err "   (#1261). A surface that was never read is never a certificate: this rail merges"
+      say_err "   with --admin. Check gh auth/network (and --repo), then re-run. No evidence was"
+      say_err "   posted."
+      exit 1 ;;
+    partial)
+      say_err "admin-merge: ✗ BLOCK — THE BASE BRANCH'S CHECK SURFACE WAS ONLY HALF READ."
+      say_err "   ${BASE_SUMMARY}"
+      if [ -n "$BASE_REDS" ]; then
+        say_err "   The half that WAS read already carries this code-measuring red:"
+        printf '%s\n' "$BASE_REDS" | sed 's/^/      /' >&2
+      fi
+      say_err "   Consuming the readable endpoint is not enough on its own: the endpoint that"
+      say_err "   failed could carry a red this PR has not measured, and 4.6/4.7 are BOTH gated"
+      say_err "   on the base being RED — so a half-read base is exactly the disarm this refusal"
+      say_err "   closes (#1261). No evidence was posted and no merge attempted."
+      say_err "   Check gh auth/network (and --repo), then re-run."
+      exit 1 ;;
     *)
       say_err "admin-merge: ✗ BLOCK — the base-surface probe returned an unrecognised state"
       say_err "   ('${BASE_STATUS:-<empty>}'). No evidence was posted."
@@ -2258,6 +2320,19 @@ main() {
       say_err "   NOT the repair, fix the failing check (here or on the base) and re-run. Landing"
       say_err "   a red tree on purpose is the audited enforcer override:"
       say_err "   AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was posted and no merge attempted."
+      exit 1 ;;
+    partial)
+      say_err "admin-merge: ✗ BLOCK — the PR's evaluated-tree surface was only HALF read, so the"
+      say_err "   rail cannot show the tree this merge produces is green."
+      say_err "   $TREE_SUMMARY"
+      if [ -n "$TREE_REDS" ]; then
+        say_err "   The half that WAS read already carries this red:"
+        printf '%s\n' "$TREE_REDS" >&2
+      fi
+      say_err "   One probe FAILED and the other is no certificate for it: the endpoint that"
+      say_err "   could not be read may carry a red this merge would land. This rail merges with"
+      say_err "   --admin, so an incomplete read is not a green. Check gh auth/network (and"
+      say_err "   --repo), then re-run. No evidence was posted."
       exit 1 ;;
     unreadable)
       say_err "admin-merge: ✗ BLOCK — the PR's evaluated-tree surface could NOT be read, so the"
