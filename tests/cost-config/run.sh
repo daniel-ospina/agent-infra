@@ -2043,7 +2043,7 @@ rm -rf "$TMP43"
 # analyser prints the id verbatim as each diagnostic's first field, so filtering violations by that
 # prefix deleted this one and the guard still printed its green over the remaining entries — the
 # window-below-the-ceiling false PASS, reached through the parser. The count line is now found by
-# POSITION. Regression test for the cycle-3 P1.
+# POSITION. The prefix filter this replaces swallowed exactly this violation.
 TMP43="$(mktemp -d /tmp/cost-config-window-anchor.XXXXXX)"
 mkroot "$TMP43"
 if python3 - "$TMP43/pi-bootstrap/pi-config/models.json" <<'PYEOF'

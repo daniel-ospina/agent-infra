@@ -209,10 +209,10 @@ WARNS=0
 
 usage() {
   # Print the LEADING COMMENT BLOCK, derived rather than a fixed line range. A fixed `2,41p`
-  # silently truncated `--help` mid-sentence when the header grew (it reached 53 lines in the
-  # #1316 cycle-3 commit), dropping the whole `Usage:` section and the dep-free note — and the
-  # unknown-argument path calls this too, so the same truncation hid the usage from a bad invocation
-  # (code-review cycle 3, P1). Stop at the first non-comment line, as scripts/ci-failure-set.sh does.
+  # silently truncated `--help` mid-sentence once the header grew past it, dropping the whole
+  # `Usage:` section and the dep-free note — and the unknown-argument path calls this too, so the
+  # same truncation hid the usage from a bad invocation. Stop at the first non-comment line, as
+  # scripts/ci-failure-set.sh does.
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
@@ -613,8 +613,7 @@ check_models_window_anchor() {
   # emits a line satisfying any `^ANCHORED ` prefix filter. Such a filter DELETES that violation,
   # and with the other 27 entries anchoring normally the guard prints a green over 27 entries while
   # the bad window goes unchecked — the window-below-the-ceiling false PASS this anchor exists to
-  # close, reached through the parser (code-review cycle 3, P1; reproduced, and pre-delta the same
-  # tree correctly exited 1). Position is unambiguous; content is not.
+  # close, reached through the parser. Position is unambiguous; content is not.
   anchored="$(printf '%s\n' "$out" | tail -1)"
   case "$anchored" in
     ANCHORED\ [0-9]*) anchored="${anchored#ANCHORED }" ;;
@@ -779,7 +778,7 @@ check_settings_file() {
     geometry="guard geometry ${CLAMP}−${REVIEWED_RESERVE}=$((CLAMP - REVIEWED_RESERVE)) matches the instruments' ${FLEET_REGIME_TB} floor"
     # The geometry is ANCHORED on the shipped surface only (`check_models_window_anchor`); a live
     # file's windows are `warn`-class and never asserted, so printing the derived claim there would
-    # certify a geometry this guard does not enforce on that file (code-review cycle 2). The DEFAULT
+    # certify a geometry this guard does not enforce on that file. The DEFAULT
     # is the disclaiming branch: a printed certification must be opted into by the caller that
     # actually asserts it, not inherited by a caller that simply forgot the argument.
     [ "$anchor" = "yes" ] || geometry="window geometry anchored on the shipped surface only — not certified for this file"
