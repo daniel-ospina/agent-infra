@@ -1666,7 +1666,10 @@ echo ""
 echo "38. coordinated window+reserve move → BLOCK (the independent pin is load-bearing, #1227)"
 TMP38="$(mktemp -d /tmp/cost-config-reserve-inflate.XXXXXX)"
 mkroot "$TMP38"
-python3 - "$TMP38/scripts/check-cost-config.sh" "$TMP38/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
+# A fixture whose mutation SILENTLY FAILS would leave the tree pristine, the guard would return 0,
+# and the arm would report a pass it did not earn (run.sh is `set -uo pipefail`, no `-e`, so an
+# unguarded `assert` inside the heredoc is invisible). Gate on the mutation's status.
+if python3 - "$TMP38/scripts/check-cost-config.sh" "$TMP38/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
 import json, sys
 g, sp = sys.argv[1], sys.argv[2]
 src = open(g).read()
@@ -1676,11 +1679,17 @@ d = json.load(open(sp))
 d["compaction"]["reserveTokens"] = 716384     # 1000000 - 283616: the geometry still matches
 json.dump(d, open(sp, "w"), indent=2)
 PYEOF
-bash "$TMP38/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
-code=$?
-if [ "$code" -eq 1 ]; then pass "inflated reserve (same trigger) → exit 1"; else fail "expected exit 1 for the inflated reserve, got $code"; sed -n '1,30p' "$OUT"; fi
-if grep -q "but the reviewed value is 16384" "$OUT"; then pass "the block names the reviewed value (#1227)"; else fail "expected the reviewed-value message"; sed -n '1,30p' "$OUT"; fi
-if grep -q "geometry derives" "$OUT"; then fail "the geometry leg fired — the fixture does not isolate the independent pin"; else pass "the geometry leg stayed green (the pin is what caught it)"; fi
+then
+  grep -q '^CLAMP=1000000$' "$TMP38/scripts/check-cost-config.sh" || fail "38 fixture: the CLAMP mutation did not take effect"
+  python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["compaction"]["reserveTokens"] == 716384 else 1)' "$TMP38/pi-bootstrap/pi-config/settings.json" || fail "38 fixture: the reserve mutation did not take effect"
+  bash "$TMP38/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "inflated reserve (same trigger) → exit 1"; else fail "expected exit 1 for the inflated reserve, got $code"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "but the reviewed value is 16384" "$OUT"; then pass "the block names the reviewed value (#1227)"; else fail "expected the reviewed-value message"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "geometry derives" "$OUT"; then fail "the geometry leg fired — the fixture does not isolate the independent pin"; else pass "the geometry leg stayed green (the pin is what caught it)"; fi
+else
+  fail "38 fixture mutation FAILED — the test cannot observe the condition, so it must not report the arms"
+fi
 rm -rf "$TMP38"
 
 echo ""
@@ -1710,7 +1719,9 @@ echo ""
 echo "40. the pre-committed 1M revert is executable (whole geometry moves, reserve stays)"
 TMP40="$(mktemp -d /tmp/cost-config-1m-revert.XXXXXX)"
 mkroot "$TMP40"
-python3 - "$TMP40/scripts/check-cost-config.sh" "$TMP40/scripts/fleet-cost-report.sh" "$TMP40/scripts/watch-truncation.sh" <<'PYEOF'
+# Gated on the mutation's status: an unguarded `assert` would leave the tree PRISTINE, the guard
+# would return 0, and the arm would report a pass it never earned (run.sh has no `-e`).
+if python3 - "$TMP40/scripts/check-cost-config.sh" "$TMP40/scripts/fleet-cost-report.sh" "$TMP40/scripts/watch-truncation.sh" <<'PYEOF'
 import sys
 g, rep, wat = sys.argv[1], sys.argv[2], sys.argv[3]
 src = open(g).read()
@@ -1723,19 +1734,26 @@ w = open(wat).read()
 assert "if 283616 <= tb < 650000" in w, "watcher bucket shape changed"
 open(wat, "w").write(w.replace("if 283616 <= tb < 650000", "if 983616 <= tb < 1000000"))
 PYEOF
-bash "$TMP40/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
-code=$?
-if [ "$code" -eq 0 ]; then pass "1M revert (CLAMP + both floors moved, reserve 16384) → exit 0"; else fail "expected exit 0 on the documented 1M revert, got $code"; sed -n '1,30p' "$OUT"; fi
-python3 - "$TMP40/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
+then
+  grep -q '^CLAMP=1000000$' "$TMP40/scripts/check-cost-config.sh" || fail "40 fixture: the CLAMP mutation did not take effect"
+  grep -q 'FLEET_REGIME_TB:-983616' "$TMP40/scripts/fleet-cost-report.sh" || fail "40 fixture: the report floor mutation did not take effect"
+  grep -q 'if 983616 <= tb < 1000000' "$TMP40/scripts/watch-truncation.sh" || fail "40 fixture: the watcher floor mutation did not take effect"
+  bash "$TMP40/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 0 ]; then pass "1M revert (CLAMP + both floors moved, reserve 16384) → exit 0"; else fail "expected exit 0 on the documented 1M revert, got $code"; sed -n '1,30p' "$OUT"; fi
+  python3 - "$TMP40/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
 d["compaction"]["reserveTokens"] = 716384    # what the procedure forbids moving to
 json.dump(d, open(p, "w"), indent=2)
 PYEOF
-bash "$TMP40/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
-code=$?
-if [ "$code" -eq 1 ]; then pass "the same revert WITH the reserve moved → exit 1 (the #1227 pin)"; else fail "expected exit 1 when the revert moves the reserve, got $code"; sed -n '1,30p' "$OUT"; fi
+  bash "$TMP40/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "the same revert WITH the reserve moved → exit 1 (the #1227 pin)"; else fail "expected exit 1 when the revert moves the reserve, got $code"; sed -n '1,30p' "$OUT"; fi
+else
+  fail "40 fixture mutation FAILED — the test cannot observe the condition, so it must not report the arms"
+fi
 rm -rf "$TMP40"
 
 echo ""
@@ -1753,6 +1771,15 @@ for bad in NaN Infinity; do
   if grep -q "reserveTokens" "$OUT"; then pass "reserveTokens=$bad is reported as a reserveTokens problem"; else fail "expected a reserveTokens diagnostic for $bad"; sed -n '1,30p' "$OUT"; fi
   if grep -q "Traceback\|cannot convert float\|OverflowError" "$OUT"; then fail "reserveTokens=$bad leaked a traceback"; else pass "reserveTokens=$bad produced no traceback"; fi
 done
+# A >1.8e308 INTEGER is VALID JSON (json.load accepts it) and must be a clean settings diagnostic:
+# `math.isfinite` raises OverflowError on a huge int, so the finiteness guard must be float-only.
+HUGE="$(python3 -c 'print(10**400)')"
+printf '{"compaction": {"enabled": true, "reserveTokens": %s, "keepRecentTokens": 12000}}\n' "$HUGE" >"$TMP41/pi-bootstrap/pi-config/settings.json"
+bash "$TMP41/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "a 400-digit integer reserve → exit 1"; else fail "expected exit 1 for the huge integer reserve, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "reserveTokens" "$OUT"; then pass "the huge integer reserve is reported as a reserveTokens problem"; else fail "expected a reserveTokens diagnostic for the huge integer"; sed -n '1,30p' "$OUT"; fi
+if grep -q "Traceback\|OverflowError\|cannot convert" "$OUT"; then fail "the huge integer reserve leaked a traceback"; else pass "the huge integer reserve produced no traceback"; fi
 rm -rf "$TMP41"
 
 if [ "$failures" -eq 0 ]; then

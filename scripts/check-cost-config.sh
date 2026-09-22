@@ -349,13 +349,14 @@ else:
     # Whole-number floats are accepted (JSON `16384.0` IS 16384 — `_as_int` documents the same
     # doctrine elsewhere in this block); bool is not a number.
     reserve = comp.get("reserveTokens")
-    # `math.isfinite` FIRST: `json.load` accepts NaN/Infinity, and `int(nan)` raises inside
-    # this heredoc — which would turn a clean settings diagnostic into a retry/hang-contract
-    # block with a raw traceback (the wrong cause, attributed to the wrong class).
+    # `math.isfinite` applies to FLOATS only: it raises `OverflowError: int too large to convert
+    # to float` for an int beyond ~1.8e308, which would turn a VALID JSON integer into a
+    # retry/hang-contract block with a raw traceback (the wrong cause, attributed to the wrong
+    # class). Python ints are exact and always finite, so guard the float arm explicitly.
     reserve_ok = (
         not isinstance(reserve, bool)
         and isinstance(reserve, (int, float))
-        and math.isfinite(reserve)
+        and not (isinstance(reserve, float) and not math.isfinite(reserve))
         and reserve == int(reserve)
         and reserve > 0
     )
@@ -426,7 +427,10 @@ if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (idle, p
 def _as_int(v):
     """Positive whole number as int (JSON `8.0` IS 8 — pi reads it as a number),
     else None. A None anywhere means the window cannot be derived."""
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    # Finiteness is a FLOAT question: `math.isfinite` raises OverflowError on a huge int.
+    if isinstance(v, float) and not math.isfinite(v):
         return None
     if v <= 0 or v != int(v):
         return None

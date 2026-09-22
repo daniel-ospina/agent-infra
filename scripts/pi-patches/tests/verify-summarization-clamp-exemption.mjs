@@ -699,6 +699,13 @@ for (const e of E_ENTRIES) {
 			[e.id, "#1316(e)"],
 		]),
 	];
+	// The comment above promises coverage; assert it, or a tenth change-(e) entry (or a rename)
+	// silently shrinks the table and the loop contracts without failing.
+	check(
+		"MARKER-CLASSIFIER: the marker table covers EVERY change-(e) entry",
+		new Set(markerFragments.map(([id]) => id)).size === E_ENTRIES.length,
+		`ids covered=${new Set(markerFragments.map(([id]) => id)).size} expected ${E_ENTRIES.length}`,
+	);
 	for (const [id, needle] of markerFragments) {
 		const entry = byId.get(id);
 		check(
