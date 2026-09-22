@@ -29,7 +29,17 @@ assert_eq() { # <actual> <expected> <label>
   if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', want '$2')"; fi
 }
 
-FIX="$(mktemp -d)"
+# Fixture root: hub-worktree.sh REFUSES a main repo under /tmp (or /private/tmp),
+# and on Linux `mktemp -d` returns /tmp/… — so a bare temp root makes THIS suite
+# fail on ubuntu-latest even though it passes on macOS (where mktemp uses
+# /var/folders). Prefer RUNNER_TEMP (GitHub Actions), then a non-/tmp TMPDIR,
+# else a HOME-based root. (#1324 review — this suite is wired into ci-main.yml.)
+FIX_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+case "$FIX_ROOT" in
+  /tmp|/tmp/*|/private/tmp|/private/tmp/*) FIX_ROOT="${HOME:-$PWD}/.hubwt-fixtures" ;;
+esac
+mkdir -p "$FIX_ROOT"
+FIX="$(mktemp -d "$FIX_ROOT/hubwt-XXXXXX")"
 trap 'rm -rf "$FIX"' EXIT
 REAL_FIX="$(cd "$FIX" && pwd -P)" # canonical (macOS: /var → /private/var)
 
@@ -79,7 +89,10 @@ for bad_branch in main master "" "/abs" "~/x" "feat/../x"; do
 done
 
 # ── 4. /tmp refusal → exit 1 ───────────────────────────────────────────────
-TMPREPO="/private/tmp/hubwt-test-$$"
+# /tmp on BOTH platforms: macOS /tmp is a symlink to /private/tmp and `pwd -P`
+# resolves there, so the helper's refusal matches either spelling. The old
+# hardcoded `/private/tmp` literal does not exist on Linux (#1324 review).
+TMPREPO="/tmp/hubwt-test-$$"
 git init -q -b main "$TMPREPO" 2>/dev/null
 git -C "$TMPREPO" config user.email t@t && git -C "$TMPREPO" config user.name t
 touch "$TMPREPO/a.txt" && git -C "$TMPREPO" add . && git -C "$TMPREPO" commit -qm init
