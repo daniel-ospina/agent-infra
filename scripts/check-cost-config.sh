@@ -602,7 +602,7 @@ check_models_window_anchor() {
   # An absent file is check_model_file business, not this anchor business.
   [ -f "$file" ] || return 0
   out="$(models_window_anchor_violations "$file")"
-  if printf '%s\n' "$out" | grep -q '^PARSE_ERROR'; then
+  if grep -q '^PARSE_ERROR' <<<"$out"; then
     block_settings "$label — the window geometry anchor could not be read, so the derived reserve leg is unassertable (fail-closed): $out"
     return
   fi
