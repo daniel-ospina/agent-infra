@@ -286,6 +286,8 @@ assert_contains "$out" "CARRY content" "diverged FAIL names the content-carrying
 assert_contains "$out" "git push upstream main:<new-branch>" "content-carrying route preserves the commits (on the RESOLVED remote)"
 assert_contains "$out" "git reset --hard upstream/main" "content-carrying route realigns to the resolved upstream"
 assert_contains "$out" "#1325" "non-origin diverged guide marks refresh's origin assumption (#1325)"
+assert_contains "$out" "git log --name-only --diff-merges=combined upstream/main..HEAD" "diverged inspection mirrors refresh's combined content test"
+assert_not_contains "$out" "log --stat" "diverged inspection does not use --stat (hides merge content)"
 
 # 9f. The --gh-report leg parses the staleness token SEPARATELY (#1313: two
 # parse sites). The filed issue body must carry the SAME diverged guidance — a

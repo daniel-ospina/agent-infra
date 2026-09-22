@@ -117,7 +117,7 @@ recovery_guide() {
     case "$stale" in
       "")          ;;   # plain dirty-on-main (#2238) / off_main+dirty: no staleness class
       behind)      lines+=("The hub is also BEHIND its upstream — after the capture, fast-forward: cd $repo && git merge --ff-only $upstream") ;;
-      diverged)    lines+=("The hub also has LOCAL-ONLY commits (diverged) — after the capture above inspect them (git -C $repo log --stat $upstream..HEAD); if CONTENTLESS: bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo (assumes an 'origin' remote, #1325); if they CARRY content, preserve them FIRST, then realign: cd $repo && git push $push_remote $branch:<new-branch> && git reset --hard $upstream") ;;
+      diverged)    lines+=("The hub also has LOCAL-ONLY commits (diverged) — after the capture above inspect them (git -C $repo log --name-only --diff-merges=combined $upstream..HEAD — combined, so a content-carrying merge is not misread as contentless); if CONTENTLESS: bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo (assumes an 'origin' remote, #1325); if they CARRY content, preserve them FIRST, then realign: cd $repo && git push $push_remote $branch:<new-branch> && git reset --hard $upstream") ;;
       no_upstream) lines+=("The hub's upstream ref is also missing — freshness is UNVERIFIABLE. Name the remote (do not assume 'origin'), then fetch: git -C $repo remote -v") ;;
       *)           lines+=("The hub is also in an UNRECOGNISED disorder class '$stale' — inspect: git -C $repo status -sb") ;;
     esac
@@ -135,8 +135,8 @@ recovery_guide() {
         ;;
       diverged)
         lines+=("The hub is clean and on main, but DIVERGED from its upstream (local-only commits — a fast-forward cannot apply).")
-        lines+=("Inspect the local-only commits and their content first (remote-agnostic):")
-        lines+=("cd $repo && git log --stat $upstream..HEAD")
+        lines+=("Inspect the local-only commits and their content first — this MIRRORS hub-worktree.sh refresh's own content test. '--diff-merges=combined' is load-bearing: a plain '--stat' (git's default diff-merges=off) shows NO files for a merge, so a merge that carried conflict resolution would read as contentless (verified: six such merges in this repo print 0 files under --stat and N under the combined form):")
+        lines+=("cd $repo && git log --name-only --diff-merges=combined $upstream..HEAD")
         lines+=("CONTENTLESS → drop exactly them and realign (#1309):")
         lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo")
         lines+=("CARRY content → refresh refuses them by design (nothing is discarded implicitly). Preserve them on a branch, THEN realign main — the reset is safe only after the push succeeded:")
