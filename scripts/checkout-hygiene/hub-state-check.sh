@@ -36,14 +36,15 @@
 # checkout, so a lane reading the hub learns a stale answer and an absent guard
 # reads as a passing guard (tortoise hub: 3 days / 308 commits stale, #1309,
 # #1125). Freshness is compared against the SAME-NAMED, ALREADY-FETCHED
-# remote-tracking ref — refs/remotes/<remote>/<branch>, remote taken from `@{u}`
-# else `origin` — and NOT `@{u}` itself, which is free to name an UNRELATED branch
-# (a `main` mistracked to `origin/feat/x` would otherwise PASS while arbitrarily
-# behind mainline). No fetch is issued here: the session's freshness machinery
-# (repo-freshness's auto mode / auto-sync at session start) owns the fetch, so
-# this detector stays network-free and fast. Residual: if that ref is itself
-# stale, a behind-vs-ref gap can persist until the next session fetch — but it is
-# bounded by that fetch instead of growing forever.
+# remote-tracking ref — refs/remotes/<remote>/<branch>, with <remote> read from
+# `branch.<branch>.remote` (else `origin`) — and NOT `@{u}` itself, which is free
+# to name an UNRELATED branch, a LOCAL branch, or `.` (each would otherwise be
+# compared against itself and PASS while arbitrarily behind mainline). No fetch is
+# issued here: the session's freshness machinery (repo-freshness's auto mode /
+# auto-sync at session start) owns the fetch, so this detector stays network-free
+# and fast. Residual: if that ref is itself stale, a behind-vs-ref gap can persist
+# until the next session fetch — but it is bounded by that fetch instead of
+# growing forever.
 #
 # Usage:
 #   hub-state-check.sh [--repo <path>]... [--gh-report]
@@ -81,9 +82,10 @@ GH_BIN="${GH_BIN:-gh}"
 # unhandled token silently falls through to the wrong (or no) guidance. The
 # trailing `*)` is the guard against exactly that.
 # $1=on_main(0/1) $2=dirty(0/1) $3=stale(behind|diverged|no_upstream|"")
-# $4=repo $5=branch $6=upstream ref (the resolved `@{u}`/`origin/<branch>`, or "")
+# $4=repo $5=branch $6=upstream ref (the resolved remote-tracking ref, or "")
+# $7=that ref's remote (for the push in the content-carrying route; default origin)
 recovery_guide() {
-  local on_main="$1" dirty="$2" stale="${3:-}" repo="$4" branch="$5" upstream="${6:-}"
+  local on_main="$1" dirty="$2" stale="${3:-}" repo="$4" branch="$5" upstream="${6:-}" push_remote="${7:-origin}"
   local lines=()
   if [[ "$branch" == "detached" || -z "$branch" ]]; then
     if [[ $dirty -eq 1 ]]; then
@@ -114,7 +116,7 @@ recovery_guide() {
     case "$stale" in
       "")          ;;   # plain dirty-on-main (#2238) / off_main+dirty: no staleness class
       behind)      lines+=("The hub is also BEHIND its upstream — after the capture, fast-forward: cd $repo && git merge --ff-only $upstream") ;;
-      diverged)    lines+=("The hub has also DIVERGED from its upstream (local-only commits) — after the capture run 'hub-worktree.sh refresh' to see whether they are contentless, then follow its route (the clean-diverged guidance below covers the content-carrying case)") ;;
+      diverged)    lines+=("The hub also has LOCAL-ONLY commits (diverged) — after the capture above: if they are CONTENTLESS, bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo; if they CARRY content, preserve them FIRST, then realign: cd $repo && git push $push_remote $branch:<new-branch> && git reset --hard $upstream") ;;
       no_upstream) lines+=("The hub's upstream ref is also missing — freshness is UNVERIFIABLE. Name the remote (do not assume 'origin'), then fetch: git -C $repo remote -v") ;;
       *)           lines+=("The hub is also in an UNRECOGNISED disorder class '$stale' — inspect: git -C $repo status -sb") ;;
     esac
@@ -137,7 +139,7 @@ recovery_guide() {
         lines+=("Those commits are CONTENTLESS → drop exactly them and realign (#1309):")
         lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo")
         lines+=("Those commits CARRY content → refresh refuses them by design (nothing is discarded implicitly). Preserve them on a branch, THEN realign main — the reset is safe only after the push succeeded:")
-        lines+=("cd $repo && git push origin $branch:<new-branch> && git reset --hard $upstream")
+        lines+=("cd $repo && git push $push_remote $branch:<new-branch> && git reset --hard $upstream")
         ;;
       no_upstream)
         lines+=("The hub is clean and on main, but no upstream ref resolves — its freshness is UNVERIFIABLE (never read as PASS).")
@@ -153,23 +155,29 @@ recovery_guide() {
   printf '%s\n' "${lines[@]}"
 }
 
+# Sets RESOLVED_UPSTREAM (the remote-tracking ref the hub is compared against,
+# e.g. `origin/main`) and RESOLVED_REMOTE (that ref's remote); sets both to ""
+# and returns 1 when no same-named tracking ref resolves (freshness UNVERIFIABLE).
+#
+# The reference of record is refs/remotes/<remote>/<branch>, with <remote> read
+# from `branch.<branch>.remote` — NOT `@{u}`, and NOT a `/`-split of it. `@{u}`
+# may name an UNRELATED branch (`origin/feat/x`), a LOCAL branch (`wip/main`), or
+# `.` (self-tracking), all of which would be compared against themselves and PASS
+# while arbitrarily behind mainline — the false PASS #1313 closes. Reading the
+# remote from config (rather than splitting `@{u}` on the first `/`) also keeps a
+# remote whose NAME contains `/` (e.g. `fork/origin`) resolving to its own ref.
 resolve_upstream() { # $1=repo $2=branch
-  local repo="$1" branch="$2" u remote="" candidate
-  local -a candidates=()
-  u="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name "$branch@{u}" 2>/dev/null || true)"
-  # Configured AND same-named: the configured ref already IS the reference of
-  # record, so trust it (this is the ordinary case).
-  if [[ -n "$u" && "${u##*/}" == "$branch" ]]; then printf '%s' "$u"; return 0; fi
-  # Mistracked (`@{u}` names another branch) or unset: keep the remote, fix the
-  # branch — the reference of record is <remote>/<branch>, never the other branch.
-  [[ -n "$u" ]] && remote="${u%%/*}"
-  [[ -n "$remote" ]] && candidates+=("$remote")
-  candidates+=(origin)
-  for candidate in "${candidates[@]}"; do
-    if git -C "$repo" rev-parse --verify --quiet "refs/remotes/$candidate/$branch" >/dev/null 2>&1; then
-      printf '%s' "$candidate/$branch"; return 0
-    fi
-  done
+  local repo="$1" branch="$2" remote
+  RESOLVED_UPSTREAM=""; RESOLVED_REMOTE=""
+  remote="$(git -C "$repo" config --get "branch.$branch.remote" 2>/dev/null || true)"
+  case "$remote" in ""|.) remote="" ;; esac   # '.' = self-tracking, not a remote
+  if [[ -n "$remote" ]] && git -C "$repo" rev-parse --verify --quiet "refs/remotes/$remote/$branch" >/dev/null 2>&1; then
+    RESOLVED_UPSTREAM="$remote/$branch"; RESOLVED_REMOTE="$remote"; return 0
+  fi
+  # No configured remote (or its same-named ref is absent): fall back to origin.
+  if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null 2>&1; then
+    RESOLVED_UPSTREAM="origin/$branch"; RESOLVED_REMOTE="origin"; return 0
+  fi
   return 1
 }
 
@@ -239,9 +247,10 @@ for repo_arg in "${REPOS[@]}"; do
   # the ALREADY-FETCHED remote-tracking ref (no fetch here; see the header).
   # Computed only on main/master: a stranded branch's own tip is not the hub's
   # freshness, and a detached HEAD has no upstream at all (off_main, no crash).
-  UPSTREAM=""; STALE=""; AHEAD=0; BEHIND=0
+  UPSTREAM=""; UPSTREAM_REMOTE=""; STALE=""; AHEAD=0; BEHIND=0
   if [[ $on_main -eq 1 ]]; then
-    UPSTREAM="$(resolve_upstream "$MAIN_REPO" "$BRANCH")" || UPSTREAM=""
+    resolve_upstream "$MAIN_REPO" "$BRANCH" || true
+    UPSTREAM="$RESOLVED_UPSTREAM"; UPSTREAM_REMOTE="$RESOLVED_REMOTE"
     if [[ -z "$UPSTREAM" ]]; then
       # No upstream ref → freshness is unverifiable. FAIL closed (#1313):
       # an unverified hub must never read as PASS.
@@ -276,7 +285,7 @@ for repo_arg in "${REPOS[@]}"; do
   else
     echo "FAIL  $MAIN_REPO (branch=$BRANCH, porcelain=$PORCELAIN_COUNT$fresh_fields)"
     echo "HUB_DISORDER=$disorder branch=$BRANCH repo=$MAIN_REPO porcelain_count=$PORCELAIN_COUNT$fresh_fields ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    recovery_guide "$on_main" "$dirty" "$STALE" "$MAIN_REPO" "$BRANCH" "$UPSTREAM" | sed 's/^/  /' 
+    recovery_guide "$on_main" "$dirty" "$STALE" "$MAIN_REPO" "$BRANCH" "$UPSTREAM" "$UPSTREAM_REMOTE" | sed 's/^/  /' 
     FAIL_LINES+=("$MAIN_REPO|$disorder|$BRANCH|$PORCELAIN_COUNT")
     FAIL=$((FAIL + 1))
   fi
@@ -300,7 +309,7 @@ if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
         continue
       fi
       ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      on_main=1; dirty=0; stale=""; upstream=""
+      on_main=1; dirty=0; stale=""; upstream=""; upstream_remote=""
       [[ "$disorder" == off_main* ]] && on_main=0
       # Membership, not suffix: the staleness token is appended AFTER `dirty`
       # (#1313), so a suffix match would miss `dirty+behind` / `dirty+diverged`
@@ -317,9 +326,10 @@ if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
       # 4-field record, so the ref is not carried in it (same resolution as the
       # check above; only meaningful on main/master).
       if [[ "$on_main" -eq 1 ]]; then
-        upstream="$(resolve_upstream "$repo_path" "$branch")" || upstream=""
+        resolve_upstream "$repo_path" "$branch" || true
+        upstream="$RESOLVED_UPSTREAM"; upstream_remote="$RESOLVED_REMOTE"
       fi
-      guide="$(recovery_guide "$on_main" "$dirty" "$stale" "$repo_path" "$branch" "$upstream")"
+      guide="$(recovery_guide "$on_main" "$dirty" "$stale" "$repo_path" "$branch" "$upstream" "$upstream_remote")"
       body="Hub-discipline check FAILED for **$repo_path** at $ts.
 
 - \`HUB_DISORDER=$disorder\` (branch=\`$branch\`, porcelain=$porcelain_count)

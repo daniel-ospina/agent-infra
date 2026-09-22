@@ -283,7 +283,7 @@ assert_contains "$out" "ahead=1 behind=1" "diverged line names both counts"
 assert_contains "$out" "hub-worktree.sh refresh" "diverged FAIL names the #1309 refresh recovery"
 assert_contains "$out" "refresh --discard-contentless" "diverged FAIL names the contentless flag"
 assert_contains "$out" "CARRY content" "diverged FAIL names the content-carrying route"
-assert_contains "$out" "git push origin main:<new-branch>" "content-carrying route preserves the commits"
+assert_contains "$out" "git push upstream main:<new-branch>" "content-carrying route preserves the commits (on the RESOLVED remote)"
 assert_contains "$out" "git reset --hard upstream/main" "content-carrying route realigns to the resolved upstream"
 
 # 9f. The --gh-report leg parses the staleness token SEPARATELY (#1313: two
@@ -330,6 +330,70 @@ out="$(bash "$CHECK" --repo "$MHUB" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "mistracked-upstream hub → exit 1 (compares against the same-named ref)"
 assert_contains "$out" "HUB_DISORDER=behind" "mistracked-upstream hub reports behind mainline"
 assert_contains "$out" "upstream=origin/main" "the reference of record is origin/main, not @{u}"
+
+# 9j. `@{u}` naming a LOCAL branch (`wip/main`) shares the branch's basename, so
+# a basename guard would TRUST it and compare the hub against itself — PASS while
+# arbitrarily behind mainline (#1324 review P1, residual shape). Config is
+# `branch.main.remote=.` here, so the fix falls back to origin/main.
+LHUB="$FIX/local-track-hub"
+LREMOTE="$FIX/local-track-origin.git"
+git init -q --bare -b main "$LREMOTE"
+git init -q -b main "$LHUB"
+git -C "$LHUB" config user.email t@t
+git -C "$LHUB" config user.name t
+echo base > "$LHUB/base.txt"
+git -C "$LHUB" add .
+git -C "$LHUB" commit -qm init
+git -C "$LHUB" remote add origin "$LREMOTE"
+git -C "$LHUB" push -qu origin main
+git -C "$LHUB" branch wip/main
+git -C "$LHUB" branch --set-upstream-to=wip/main main >/dev/null 2>&1
+LSEED="$FIX/local-track-seed"
+git clone -q "$LREMOTE" "$LSEED"
+git -C "$LSEED" config user.email t@t
+git -C "$LSEED" config user.name t
+echo next > "$LSEED/next.txt"
+git -C "$LSEED" add .
+git -C "$LSEED" commit -qm next
+git -C "$LSEED" push -q origin main
+git -C "$LHUB" fetch -q origin
+out="$(bash "$CHECK" --repo "$LHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "local-branch upstream hub → exit 1 (never compared against itself)"
+assert_contains "$out" "HUB_DISORDER=behind" "local-branch upstream hub reports behind mainline"
+assert_contains "$out" "upstream=origin/main" "local-branch upstream falls back to origin/main"
+
+# 9k. a remote whose NAME contains '/' (`fork/origin`), MISTRACKED: splitting
+# `@{u}` on the first '/' would derive `fork`, find no `fork/main`/`origin/main`,
+# and wrongly report `no_upstream` — a false FAIL on a hub whose same-named
+# tracking ref is present. The remote is read from
+# `branch.<branch>.remote` instead, so `fork/origin/main` resolves.
+KHUB="$FIX/slash-remote-hub"
+KREMOTE="$FIX/slash-remote-origin.git"
+git init -q --bare -b main "$KREMOTE"
+git init -q -b main "$KHUB"
+git -C "$KHUB" config user.email t@t
+git -C "$KHUB" config user.name t
+echo base > "$KHUB/base.txt"
+git -C "$KHUB" add .
+git -C "$KHUB" commit -qm init
+git -C "$KHUB" remote add fork/origin "$KREMOTE"
+git -C "$KHUB" push -qu fork/origin main
+git -C "$KHUB" push -q fork/origin main:feat/other
+git -C "$KHUB" fetch -q fork/origin
+git -C "$KHUB" branch --set-upstream-to=fork/origin/feat/other main >/dev/null 2>&1
+KSEED="$FIX/slash-remote-seed"
+git clone -q "$KREMOTE" "$KSEED"
+git -C "$KSEED" config user.email t@t
+git -C "$KSEED" config user.name t
+echo next > "$KSEED/next.txt"
+git -C "$KSEED" add .
+git -C "$KSEED" commit -qm next
+git -C "$KSEED" push -q origin main
+git -C "$KHUB" fetch -q fork/origin
+out="$(bash "$CHECK" --repo "$KHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "slash-named-remote mistracked hub → exit 1 (not no_upstream)"
+assert_contains "$out" "HUB_DISORDER=behind" "slash-named remote reports behind, not no_upstream"
+assert_contains "$out" "upstream=fork/origin/main" "slash-named remote resolves its own same-named ref"
 
 # 9g. no upstream configured → FAIL CLOSED. An unverifiable hub must never read
 # as PASS (that is the failure direction #1313 exists to close).
