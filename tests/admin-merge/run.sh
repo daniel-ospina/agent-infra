@@ -353,8 +353,14 @@ case "$key" in
           printf '{"total_count":0,"check_runs":[]}\n'; exit 0
         fi
         if [ "$sha" = "$(cat "$SCEN/main-sha" 2>/dev/null || printf 'feedface0000000000000000000000000000000000')" ]; then
+          # #1261 fix round: the BASE's own endpoint, failed ALONE, so a PARTIAL
+          # read (one endpoint readable, the other not) is expressible. The
+          # pre-existing `main-health-unreadable` fails EVERY surface call; this
+          # one fails only this endpoint of the base.
+          [ -f "$SCEN/main-check-runs-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
           if [ -f "$SCEN/main-check-runs.json" ]; then cat "$SCEN/main-check-runs.json"; exit 0; fi
         else
+          [ -f "$SCEN/pr-check-runs-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
           [ -f "$SCEN/pr-health-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
           if [ -f "$SCEN/pr-check-runs.json" ]; then cat "$SCEN/pr-check-runs.json"; exit 0; fi
         fi
@@ -367,8 +373,10 @@ case "$key" in
           printf '{"state":"pending","total_count":0,"statuses":[]}\n'; exit 0
         fi
         if [ "$sha" = "$(cat "$SCEN/main-sha" 2>/dev/null || printf 'feedface0000000000000000000000000000000000')" ]; then
+          [ -f "$SCEN/main-status-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
           if [ -f "$SCEN/main-statuses.json" ]; then cat "$SCEN/main-statuses.json"; exit 0; fi
         else
+          [ -f "$SCEN/pr-status-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
           [ -f "$SCEN/pr-health-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
           if [ -f "$SCEN/pr-statuses.json" ]; then cat "$SCEN/pr-statuses.json"; exit 0; fi
         fi
@@ -3417,6 +3425,226 @@ grep -q "BASE PARENT COULD NOT BE READ" "$TMP/err" && pass "…and the refusal n
   || fail "the unreadable-parent refusal is not named"
 [ -f "$SCEN/comment" ] && fail "evidence posted on an unreadable merge-ref parent" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on an unreadable merge-ref parent" || pass "no merge attempted"
+
+# ── 47. THE CLASSIFIER IS AN ALLOW-LIST — AN UNRECOGNISED SPELLING IS RED (#1261 fix round) ─
+# The header documented an allow-list ("NOT red, by name: success; neutral;
+# skipped; cancelled; stale") but the code was a DENY-list: a COMPLETED check run
+# was red only for `failure`/`timed_out`/`action_required`/`startup_failure`, and
+# a legacy status only for `failure`/`error`. Every other token was silently
+# NON-RED, so an unrecognised spelling merged. This repo's rule is the opposite:
+# a guard must fail CLOSED on an unrecognised spelling. Each scenario below is
+# GREEN under the deny-list and REFUSES under the allow-list; the over-block
+# guard (d) is the other half — the five NAMED non-red conclusions must still
+# merge.
+echo "== 47. an unrecognised conclusion/state is RED, never silently non-red (#1261 fix round) =="
+
+# (a) AN UNRECOGNISED CONCLUSION ON THE PR'S OWN TREE IS RED. The deny-list read
+# `mystery_failure` as neither red nor pending, so the tree surface was GREEN and
+# the rail posted evidence and merged.
+new_scen allowlist-tree-conc
+HEAD_AL1="d1d1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AL1" > "$SCEN/head"
+lane_pass "$HEAD_AL1" 5801 > "$SCEN/runs-$HEAD_AL1"
+lane_pass mainal1 5802 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 3501 lint completed mystery_failure 6601)"
+pr_run_map 6601 pull_request 'Post-merge validation'
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNRECOGNISED conclusion on the PR tree BLOCKS (exit $rc)" \
+  || fail "an unrecognised conclusion read as non-red and MERGED — the deny-list hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$TMP/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,4p' "$TMP/err" 2>/dev/null)"
+grep -q "mystery_failure" "$TMP/err" && pass "…naming the unrecognised conclusion verbatim" \
+  || fail "the refusal does not name the unrecognised token"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an unrecognised red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an unrecognised red" || pass "no merge attempted"
+
+# (b) A COMPLETED RUN WITH AN EMPTY CONCLUSION IS RED TOO — it is an anomaly, and
+# "completed with no conclusion" is not a name this rail knows.
+new_scen allowlist-tree-empty-conc
+HEAD_AL2="d2d2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AL2" > "$SCEN/head"
+lane_pass "$HEAD_AL2" 5803 > "$SCEN/runs-$HEAD_AL2"
+lane_pass mainal2 5804 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 3502 lint completed '' 6602)"
+pr_run_map 6602 pull_request 'Post-merge validation'
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a COMPLETED run with an EMPTY conclusion BLOCKS (exit $rc)" \
+  || fail "a completed run with an empty conclusion read as non-red and merged"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$TMP/err" && pass "…as the tree-red refusal" \
+  || fail "the empty-conclusion refusal is not the tree-red one"
+
+# (c) AN UNRECOGNISED LEGACY STATUS STATE IS RED, and it is not PENDING either
+# (the deny-list put it in neither bucket, so it vanished from both).
+new_scen allowlist-tree-state
+HEAD_AL3="d3d3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AL3" > "$SCEN/head"
+lane_pass "$HEAD_AL3" 5805 > "$SCEN/runs-$HEAD_AL3"
+lane_pass mainal3 5806 > "$SCEN/runs-main"
+main_green_surface
+printf '{"state":"mystery","total_count":1,"statuses":[{"context":"supabase-preview","state":"mystery","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNRECOGNISED status state BLOCKS (exit $rc)" \
+  || fail "an unrecognised status state read as neither red nor pending and merged"
+grep -q "supabase-preview" "$TMP/err" && pass "…naming the status context that carried it" \
+  || fail "the refusal does not name the unrecognised status state"
+
+# (d) THE SAME SPELLING ON THE BASE, WITH A LAGGING MERGE REF, REFUSES AT 4.7.
+# This is the verifier's second reproduction: `failure` here refuses (test (r));
+# under the deny-list `mystery_failure` merged.
+new_scen allowlist-base-conc-lag
+HEAD_AL4="d4d4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AL4" > "$SCEN/head"
+lane_pass "$HEAD_AL4" 5807 > "$SCEN/runs-$HEAD_AL4"
+lane_pass mainal4 5808 > "$SCEN/runs-main"
+write_main_checks "$(check_run 6501 lint completed mystery_failure 7501)"
+main_run_map 7501 push 'Post-merge validation'
+pr_green_surface
+merge_parent deadbeef00000000000000000000000000000000
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNRECOGNISED base conclusion + a LAGGING merge ref REFUSES at 4.7 (exit $rc)" \
+  || fail "an unrecognised base red merged where 'failure' refuses at 4.7 — the deny-list hole"
+grep -q "LAGGING MERGE REF" "$TMP/err" && pass "…and this is the 4.7 discriminator, not the 4.6 ordering rule" \
+  || fail "the refusal is not the merge-ref-lag one: $(sed -n '1,4p' "$TMP/err" 2>/dev/null)"
+grep -q "mystery_failure" "$TMP/err" && pass "…naming the unrecognised base red" \
+  || fail "the refusal does not name the base red"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an unrecognised base red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an unrecognised base red" || pass "no merge attempted"
+
+# (e) THE OVER-BLOCK GUARD: every NAMED non-red conclusion still merges, on BOTH
+# surfaces. An allow-list is only correct if it is exactly the documented set — a
+# classifier that reddened `neutral`/`skipped`/`cancelled`/`stale` would refuse
+# essentially every real PR (path-gated jobs skip; superseded runs are cancelled).
+new_scen allowlist-nonred-known
+HEAD_AL5="d5d5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AL5" > "$SCEN/head"
+lane_pass "$HEAD_AL5" 5809 > "$SCEN/runs-$HEAD_AL5"
+lane_pass mainal5 5810 > "$SCEN/runs-main"
+write_main_checks \
+  "$(check_run 6601 'base / success' completed success 7601)" \
+  "$(check_run 6602 'base / neutral' completed neutral 7601)" \
+  "$(check_run 6603 'base / skipped' completed skipped 7601)" \
+  "$(check_run 6604 'base / cancelled' completed cancelled 7601)" \
+  "$(check_run 6605 'base / stale' completed stale 7601)"
+main_run_map 7601 push 'Post-merge validation'
+write_pr_checks \
+  "$(check_run 5601 'pr / success' completed success 7701)" \
+  "$(check_run 5602 'pr / neutral' completed neutral 7701)" \
+  "$(check_run 5603 'pr / skipped' completed skipped 7701)" \
+  "$(check_run 5604 'pr / cancelled' completed cancelled 7701)" \
+  "$(check_run 5605 'pr / stale' completed stale 7701)"
+pr_run_map 7701 pull_request 'CI'
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "the five NAMED non-red conclusions still merge (the over-block guard)" \
+  || fail "a legitimately non-red conclusion was refused (exit $rc): $(sed -n '1,3p' "$TMP/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge actually happened" || fail "no merge attempted"
+[ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+grep -q "PARTIAL\|UNREADABLE" "$TMP/out" && fail "a fully readable surface was reported as partial/unreadable" \
+  || pass "…and both endpoints READ (no PARTIAL/UNREADABLE state)"
+
+# ── 48. A PARTIAL BASE READ IS NEVER A CERTIFICATE (#1261 fix round) ────────
+# The probe reads TWO endpoints — `/check-runs` and `/status`. It used to return
+# UNREADABLE the moment EITHER failed, which discarded the other's reds and, on
+# the BASE, silently DISARMED 4.6/4.7: both are gated on the base being RED, so a
+# base that could not be read was treated as a base that is NOT RED and the stale
+# green merged. The fix consumes the readable endpoint AND refuses a half-read
+# base outright; only BOTH failing is the "never read at all" state.
+echo "== 48. a half-read base surface refuses; only both endpoints failing is unreadable (#1261 fix round) =="
+
+# (a) THE REPRODUCTION. A base red readable ONLY on `/status` (`deploy-verify`),
+# with only `/check-runs` forced to fail. The old rail merged (RC=0, "base tree
+# UNREADABLE", evidence posted).
+new_scen base-partial-status-red
+HEAD_BP1="d6d6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BP1" > "$SCEN/head"
+lane_pass "$HEAD_BP1" 5811 > "$SCEN/runs-$HEAD_BP1"
+lane_pass mainbp1 5812 > "$SCEN/runs-main"
+pr_green_surface
+: > "$SCEN/main-check-runs-unreadable"
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"deploy-verify","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/main-statuses.json"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a base red readable ONLY on /status (check-runs failed) REFUSES (exit $rc)" \
+  || fail "a half-read base was read as 'not red' and MERGED — 4.6/4.7 silently disarmed"
+grep -q "ONLY HALF READ" "$TMP/err" && pass "…as the half-read refusal, by name" \
+  || fail "the partial-base refusal is not named: $(sed -n '1,4p' "$TMP/err" 2>/dev/null)"
+grep -q "deploy-verify" "$TMP/err" && pass "…naming the red the READABLE endpoint DID carry (consumed, not discarded)" \
+  || fail "the partial refusal discarded the red that WAS read"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$TMP/err" \
+  && fail "the refusal is only the 4.6 ordering rule — a partial read must refuse on its own" \
+  || pass "…and it refuses even before the staleness rules could run"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a half-read base" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a half-read base" || pass "no merge attempted"
+
+# (b) THE CONTROL — THE IDENTICAL FIXTURE WITH BOTH ENDPOINTS READABLE. This is
+# the verifier's comparison: without the failed `/check-runs`, the same red
+# refuses via 4.6. Both variants must refuse.
+new_scen base-partial-control
+HEAD_BP2="d7d7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BP2" > "$SCEN/head"
+lane_pass "$HEAD_BP2" 5813 > "$SCEN/runs-$HEAD_BP2"
+lane_pass mainbp2 5814 > "$SCEN/runs-main"
+pr_green_surface
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"deploy-verify","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/main-statuses.json"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "the CONTROL (both endpoints read) refuses at 4.6, as before (exit $rc)" \
+  || fail "the fully-readable control did not refuse — the fix changed the readable path"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$TMP/err" \
+  && pass "…naming the staleness, exactly as the pre-fix rail does" \
+  || fail "the control refusal is not the 4.6 staleness one"
+
+# (c) BOTH ENDPOINTS FAILING IS THE "NEVER READ AT ALL" STATE — a loud refusal,
+# not the old context-only line that let the merge proceed.
+new_scen base-both-unreadable
+HEAD_BP3="d8d8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BP3" > "$SCEN/head"
+lane_pass "$HEAD_BP3" 5815 > "$SCEN/runs-$HEAD_BP3"
+lane_pass mainbp3 5816 > "$SCEN/runs-main"
+pr_green_surface
+: > "$SCEN/main-check-runs-unreadable"
+: > "$SCEN/main-status-unreadable"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "BOTH base endpoints failing is a loud refusal (exit $rc)" \
+  || fail "a base surface that was never read at all still merged"
+grep -q "BOTH" "$TMP/err" && grep -q "never read" "$TMP/err" \
+  && pass "…and the refusal says BOTH endpoints failed, not that the base was not red" \
+  || fail "the both-unreadable refusal does not name the both-endpoint failure: $(sed -n '1,4p' "$TMP/err" 2>/dev/null)"
+[ -f "$SCEN/comment" ] && fail "evidence was posted on a never-read base" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a never-read base" || pass "no merge attempted"
+
+# (d) THE TREE IS STRICT TOO. A PR surface missing one endpoint is refused, and
+# the red the READABLE half carried is named — an incomplete read is never a
+# green on the surface that GATES the merge.
+new_scen tree-partial
+HEAD_BP4="d9d9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BP4" > "$SCEN/head"
+lane_pass "$HEAD_BP4" 5817 > "$SCEN/runs-$HEAD_BP4"
+lane_pass mainbp4 5818 > "$SCEN/runs-main"
+main_green_surface
+: > "$SCEN/pr-check-runs-unreadable"
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"supabase-preview","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a PR tree missing one endpoint REFUSES (exit $rc)" \
+  || fail "a half-read PR tree was read as green"
+grep -q "only HALF read" "$TMP/err" && pass "…as the half-read refusal, by name" \
+  || fail "the partial-tree refusal is not named"
+grep -q "supabase-preview" "$TMP/err" && pass "…naming the red the readable half carried" \
+  || fail "the partial-tree refusal discarded the red that WAS read"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a half-read tree" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a half-read tree" || pass "no merge attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
