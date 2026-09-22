@@ -121,7 +121,7 @@ As with (b), the change is carried in **three copies**: the ESM
 the running CLI loads (`dist/bundle/chunks/chunk-JVUZSMYM.js`) — `generateSummaryWithUsage`, which
 is the one pi's own auto-compaction reaches, and `generateSummaryWithRequest` (the bundled
 pi-agent-core facade), which pi's auto-compaction paths do not reach but an SDK consumer importing
-pi-agent-core's `compact` would. What (d) does **not** cover is listed under **Known gaps** 9–10.
+pi-agent-core's `compact` would. What (d) does **not** cover is listed under **Known gaps** 9.
 
 One property of the manifest is load-bearing and easy to lose: every `verifyPresent` needle must be
 **code-shaped**, i.e. absent from the **marker-only rendering of its own payload**, never a

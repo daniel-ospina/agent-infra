@@ -345,16 +345,23 @@ property; this guard is the pattern to copy, not a substitute for it.
   every sync/commit (or force override usage indefinitely, which is exactly
   the drift the guard exists to surface).
 - **The revert must move the whole geometry, or the escape does not work
-  (#1316).** Since the guard asserts `CLAMP − reserveTokens ==` the floor the
-  two instruments band on, flipping `CLAMP` alone now reddens a
-  **settings-class** check, and `COST_CLAMP_OVERRIDE=1` does **not** silence
-  that class (it covers the `models.json` clamp block only). A 1M revert
-  therefore updates, in one commit: `contextWindow` in `models.json`, the
-  guard's `CLAMP`, `settings.json`'s `reserveTokens` (from the reviewed 16384),
-  and the floor literal in **both** instruments —
+  (#1316).** Since the guard asserts both `CLAMP − reserveTokens ==` the floor
+  the two instruments band on **and** `reserveTokens ==` the reviewed 16384,
+  a 1M revert updates, in one commit: `contextWindow` in `models.json`, the
+  guard's `CLAMP`, and the floor literal in **both** instruments —
   `scripts/fleet-cost-report.sh` (`FLEET_REGIME_TB:-<n>`) and
-  `scripts/watch-truncation.sh`'s clamp-bucket boundary. `watch-truncation.sh`'s
-  printed procedure states the same list.
+  `scripts/watch-truncation.sh`'s clamp-bucket boundary. `settings.json`'s
+  `reserveTokens` **stays at the reviewed 16384**: the 1M geometry only needs
+  the window, the guard clamp, and the two floors to move, and moving the
+  reserve is exactly the inflation the `#1227` directive forbids. If the
+  reserve ever legitimately moves, the guard's `REVIEWED_RESERVE` must be
+  updated in the same commit. The guard's `"300K-clamp"` label anchor must
+  also move with the bucket label (or stay if the label stays) — an unlabelled
+  or re-labelled bucket makes the floor unreadable and the guard refuses
+  (exit 2). Flipping only `CLAMP` trips a **settings-class** block that
+  `COST_CLAMP_OVERRIDE=1` does **not** silence — it covers the `models.json`
+  clamp block only — so the guard must be green *before* the revert commit.
+  `watch-truncation.sh`'s printed procedure states the same list.
 - Trigger (pre-committed, owner = weekly report reader): re-read volume or
   LLM call count per compacting session > 2× the regenerated Aug baseline over
   any 3 consecutive days, **or** ≥ 1 `stopReason:"length"` truncation record

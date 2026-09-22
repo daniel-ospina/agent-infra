@@ -1702,6 +1702,59 @@ if [ "$code" -eq 0 ]; then pass "reserveTokens 16384.0 → exit 0 (a whole float
 if grep -q "reserveTokens" "$OUT"; then fail "the float reserve raised a reserveTokens block"; else pass "no reserveTokens block for the whole float"; fi
 rm -rf "$TMP39"
 
+echo ""
+# ── 40. the documented 1M REVERT must actually work (#1316): move the guard CLAMP and BOTH
+#      instrument floors together, leave `reserveTokens` at the reviewed 16384 → green. Moving the
+#      reserve too is the #1227 inflation → blocked. This is the fixture the rollback procedure in
+#      docs/ops/cost-config-policy.md §7 and watch-truncation.sh promises.
+echo "40. the pre-committed 1M revert is executable (whole geometry moves, reserve stays)"
+TMP40="$(mktemp -d /tmp/cost-config-1m-revert.XXXXXX)"
+mkroot "$TMP40"
+python3 - "$TMP40/scripts/check-cost-config.sh" "$TMP40/scripts/fleet-cost-report.sh" "$TMP40/scripts/watch-truncation.sh" <<'PYEOF'
+import sys
+g, rep, wat = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(g).read()
+assert "CLAMP=300000" in src, "guard constant shape changed — update this test"
+open(g, "w").write(src.replace("CLAMP=300000", "CLAMP=1000000"))
+r = open(rep).read()
+assert "FLEET_REGIME_TB:-283616" in r, "report default shape changed"
+open(rep, "w").write(r.replace("FLEET_REGIME_TB:-283616", "FLEET_REGIME_TB:-983616"))
+w = open(wat).read()
+assert "if 283616 <= tb < 650000" in w, "watcher bucket shape changed"
+open(wat, "w").write(w.replace("if 283616 <= tb < 650000", "if 983616 <= tb < 1000000"))
+PYEOF
+bash "$TMP40/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "1M revert (CLAMP + both floors moved, reserve 16384) → exit 0"; else fail "expected exit 0 on the documented 1M revert, got $code"; sed -n '1,30p' "$OUT"; fi
+python3 - "$TMP40/pi-bootstrap/pi-config/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["compaction"]["reserveTokens"] = 716384    # what the procedure forbids moving to
+json.dump(d, open(p, "w"), indent=2)
+PYEOF
+bash "$TMP40/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "the same revert WITH the reserve moved → exit 1 (the #1227 pin)"; else fail "expected exit 1 when the revert moves the reserve, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP40"
+
+echo ""
+# ── 41. a non-finite reserve (JSON `NaN`/`Infinity`, which json.load accepts) must be a clean
+#      SETTINGS diagnostic, not `int(nan)` raising inside the heredoc — which would report the
+#      wrong class (retry/hang-contract) and leak a traceback.
+echo "41. reserveTokens NaN/Infinity → settings-class BLOCK, not a heredoc crash"
+TMP41="$(mktemp -d /tmp/cost-config-reserve-nan.XXXXXX)"
+mkroot "$TMP41"
+for bad in NaN Infinity; do
+  printf '{"compaction": {"enabled": true, "reserveTokens": %s, "keepRecentTokens": 12000}}\n' "$bad" >"$TMP41/pi-bootstrap/pi-config/settings.json"
+  bash "$TMP41/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "reserveTokens=$bad → exit 1"; else fail "expected exit 1 for reserveTokens=$bad, got $code"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "reserveTokens" "$OUT"; then pass "reserveTokens=$bad is reported as a reserveTokens problem"; else fail "expected a reserveTokens diagnostic for $bad"; sed -n '1,30p' "$OUT"; fi
+  if grep -q "Traceback\|cannot convert float\|OverflowError" "$OUT"; then fail "reserveTokens=$bad leaked a traceback"; else pass "reserveTokens=$bad produced no traceback"; fi
+done
+rm -rf "$TMP41"
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"
   exit 0

@@ -298,7 +298,7 @@ settings_violations() {
     "$RETRY_BASE_DELAY_MS" "$RETRY_MAX_BACKOFF_MS" "$RETRY_PROVIDER_TIMEOUT_MS" \
     "$HANG_WINDOW_CEILING_MS" "$WORST_WINDOW_CEILING_MS" \
     "$PATCH_CAP_RESOLVED" "$PATCH_CAP_WHY" "$CLAMP" "$FLEET_REGIME_TB" "$REVIEWED_RESERVE" <<'PYEOF'
-import json, re, sys
+import json, math, re, sys
 
 path, patch_path = sys.argv[1], sys.argv[2]
 # The cap, RESOLVED by the shell that owns it (the resolver above) — never
@@ -349,9 +349,13 @@ else:
     # Whole-number floats are accepted (JSON `16384.0` IS 16384 — `_as_int` documents the same
     # doctrine elsewhere in this block); bool is not a number.
     reserve = comp.get("reserveTokens")
+    # `math.isfinite` FIRST: `json.load` accepts NaN/Infinity, and `int(nan)` raises inside
+    # this heredoc — which would turn a clean settings diagnostic into a retry/hang-contract
+    # block with a raw traceback (the wrong cause, attributed to the wrong class).
     reserve_ok = (
         not isinstance(reserve, bool)
         and isinstance(reserve, (int, float))
+        and math.isfinite(reserve)
         and reserve == int(reserve)
         and reserve > 0
     )
@@ -422,7 +426,7 @@ if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (idle, p
 def _as_int(v):
     """Positive whole number as int (JSON `8.0` IS 8 — pi reads it as a number),
     else None. A None anywhere means the window cannot be derived."""
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
         return None
     if v <= 0 or v != int(v):
         return None

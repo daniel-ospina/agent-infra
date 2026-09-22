@@ -689,6 +689,15 @@ for (const e of E_ENTRIES) {
 		[E_ESM_OPTIONS.id, "#1316(e)"],
 		[E_BUNDLE_OPTIONS.id, "pi-patch"],
 		[E_BUNDLE_OPTIONS.id, "/*pi-patch:#1316(e)*/"],
+		// e5-e9 too — the marker table must cover EVERY entry, or the classifier's agreement with
+		// the per-entry non-empty-stub assertion is only tested on the first four. These are
+		// INDEPENDENT expected values (literal strings), never derived from `markerStub` — an
+		// assertion whose input is `markerStub(...).split("\n")[0]` is true by construction and
+		// adds no coverage.
+		...E_ENTRIES.filter((e) => ["e5", "e6", "e7", "e8", "e9"].some((p) => e.id.startsWith(p))).flatMap((e) => [
+			[e.id, "pi-patch"],
+			[e.id, "#1316(e)"],
+		]),
 	];
 	for (const [id, needle] of markerFragments) {
 		const entry = byId.get(id);
@@ -696,15 +705,6 @@ for (const e of E_ENTRIES) {
 			`MARKER-CLASSIFIER UNIT: "${needle}" is NOT code-shaped in ${id}`,
 			entry !== undefined && !isCodeShaped(entry, needle),
 			`isCodeShaped=${entry ? isCodeShaped(entry, needle) : "(missing entry)"}`,
-		);
-	}
-	// EVERY entry carries at least one non-code (marker) fragment — not just e1-e4. The per-entry
-	// marker-presence check above is the guard; this pins the classifier's agreement with it.
-	for (const e of E_ENTRIES) {
-		check(
-			`MARKER-CLASSIFIER: ${e.id} has at least one marker fragment that is NOT code-shaped`,
-			markerStub(e.replace).length > 0 && !isCodeShaped(e, markerStub(e.replace).split("\n")[0]),
-			`isCodeShaped(first marker line)=${isCodeShaped(e, markerStub(e.replace).split("\n")[0])}`,
 		);
 	}
 	const realCodeNeedles = E_ENTRIES.flatMap((e) => e.verifyPresent.map((n) => [e.id, n]));
