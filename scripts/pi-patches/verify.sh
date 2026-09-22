@@ -7,7 +7,8 @@
 #
 # Exit codes: 0 all evidence holds · 1 patch absent (or patch state unverifiable) · 2 the durable-
 #             record test failed · 3 the extension guard test failed · 4 the #1215 watchdog suite
-#             failed · 5 the summarization budget floor test failed.
+#             failed · 5 the summarization budget floor test failed · 6 the summarization clamp
+#             exemption test failed.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +18,7 @@ export NODE_ENV="${NODE_ENV:-test}"
 status=0
 section() { printf '\n\033[1m──── %s ────\033[0m\n' "$1"; }
 
-section "1/5  patch state + clamp behaviour against the LIVE bundle (change b)"
+section "1/6  patch state + clamp behaviour against the LIVE bundle (change b)"
 bash "$HERE/apply.sh" --check
 patch_status=$?
 [ "$patch_status" -eq 0 ] || {
@@ -25,7 +26,7 @@ patch_status=$?
 	status=1
 }
 
-section "2/5  a failed compaction leaves a DURABLE session-file entry (change a)"
+section "2/6  a failed compaction leaves a DURABLE session-file entry (change a)"
 if node "$HERE/tests/verify-a-durable-failure-record.mjs"; then
 	printf '\n✅ change (a) holds\n'
 else
@@ -33,7 +34,7 @@ else
 	status=2
 fi
 
-section "3/5  the upgrade-proof extension guard (change b, extension layer)"
+section "3/6  the upgrade-proof extension guard (change b, extension layer)"
 if npx --yes tsx "$REPO_ROOT/extensions/clamp-output-floor.test.ts"; then
 	printf '\n✅ change (b) extension layer holds\n'
 else
@@ -41,7 +42,7 @@ else
 	status=3
 fi
 
-section "4/5  the shipped detector is still green (change a, #1215 — untouched by this patch)"
+section "4/6  the shipped detector is still green (change a, #1215 — untouched by this patch)"
 if npx --yes tsx "$REPO_ROOT/extensions/compaction-watchdog.test.ts"; then
 	printf '\n✅ the #1215 watchdog suite still holds\n'
 else
@@ -50,13 +51,22 @@ else
 	[ "$status" -eq 0 ] && status=4
 fi
 
-section "5/5  the summarization budget never sits below the summary it must preserve (change d, #1263)"
+section "5/6  the summarization budget never sits below the summary it must preserve (change d, #1263)"
 if node "$HERE/tests/verify-summarization-budget-floor.mjs"; then
 	printf '\n✅ change (d) holds\n'
 else
 	printf '\n⛔ change (d) FAILED\n' >&2
 	status="${status:-5}"
 	[ "$status" -eq 0 ] && status=5
+fi
+
+section "6/6  the summarization request is exempt from the clamp, normal turns are not (change e, #1316)"
+if node "$HERE/tests/verify-summarization-clamp-exemption.mjs"; then
+	printf '\n✅ change (e) holds\n'
+else
+	printf '\n⛔ change (e) FAILED\n' >&2
+	status="${status:-6}"
+	[ "$status" -eq 0 ] && status=6
 fi
 
 printf '\n'
