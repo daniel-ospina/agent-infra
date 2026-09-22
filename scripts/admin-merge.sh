@@ -184,6 +184,31 @@
 # surface was read. An UNREADABLE probe (gh error, unparseable body) is a third
 # thing again: that is the rail FAILING to look, and it REFUSES, by name.
 #
+# STALENESS: A RED BASE THE PR HAS NOT MEASURED (#1261, step 4.6). The tree
+# surface above reflects the base AS OF THE PR'S LAST RUN, and GitHub does not
+# reliably re-run PR workflows when the base moves. So a base red that appeared
+# AFTER this PR's checks were produced is invisible to the tree gate: the surface
+# is a STALE GREEN and the merge lands a tree the PR never measured. That is the
+# incident's shape — #4600 was opened before #4589 made main red and merged
+# after. The refusal is RED-RELATIVE, never movement-relative: it runs only when
+# the base head carries a CODE-MEASURING red (the same schedule/issues filter as
+# the base context), and refuses only when such a red's run STARTED after the PR
+# surface was last produced (the max `completed_at` over the PR surface's
+# completed checks). If the base moved and is GREEN there is nothing the PR has
+# failed to measure, and it MERGES — refusing on movement alone would refuse
+# essentially every open PR, and an over-block is a failure, not safety. The
+# repair direction falls out for free: a base red that predates the PR's
+# evaluation WAS measured by it, so the PR that repairs the base still lands.
+# MEASURED, not assumed: on tortoise, main head 1f5d6efc49 carried `welcome-e2e`
+# failure started 2026-09-22T16:13:22Z while open PR 4591's surface was last
+# produced 2026-09-22T06:23:46Z (a stale green of ~10h); PR 1153's merge ref was
+# recomputed 2026-09-22T14:12:42Z with base 59a08fcd while main had moved — so a
+# merge-ref-parent comparison alone would MISS the recomputed-but-unre-run case,
+# while the timestamp comparison catches both. RESIDUAL: a base red whose run
+# started BEFORE the surface was produced but on a base the surface did not
+# actually use (the merge ref can lag the base) is not caught here; the merge-ref
+# base parent is the other signal, not yet wired.
+#
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
 #                              [--workflow <file|name>] [--any-workflow]

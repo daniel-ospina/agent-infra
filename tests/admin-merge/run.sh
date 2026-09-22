@@ -87,7 +87,14 @@
 #      refusal; a corrupted/absent/conflicted merge ref is its own loud refusal;
 #      and a red on a non-code event (schedule/issues) is reported without
 #      blocking, because blocking on those would refuse every merge in a repo
-#      whose cron lanes are red most days.
+#      whose cron lanes are red most days. STALENESS is the last hole: the tree
+#      surface reflects the base as of the PR's LAST run and GitHub does not
+#      re-run PR checks when the base moves, so a base red that appeared after
+#      this PR's checks were produced is invisible to the tree gate. The rail
+#      refuses when a code-measuring base red's run STARTED after the PR surface
+#      was last produced — red-relative, never movement-relative, so a base that
+#      moved but is GREEN still merges, and the PR that REPAIRS a red base still
+#      lands (its evaluation postdates the red it removes).
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -3201,6 +3208,90 @@ rc=$?
   || fail "an unreadable merge-ref probe was read as permission"
 grep -q "mergeability and merge ref were never read" "$TMP/err" && pass "…naming the failed probe" \
   || fail "the unreadable merge-ref refusal is not named"
+# (o) STALE GREEN vs A RED BASE — THE INCIDENT. The PR's evaluated tree is GREEN,
+# but it was produced BEFORE the base went red. GitHub does not re-run PR checks
+# when the base moves, so that green does not cover the new red: it is a STALE
+# GREEN, and merging it lands a tree the PR never measured. This is
+# #4600-on-#4589 — a PR opened before the base went red and merged after.
+new_scen treehealth-stale
+HEAD_STALE="c3c3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_STALE" > "$SCEN/head"
+lane_pass "$HEAD_STALE" 5701 > "$SCEN/runs-$HEAD_STALE"
+lane_pass mainstale 5702 > "$SCEN/runs-main"
+# The PR's OWN tree is GREEN, produced at an OLD time.
+write_pr_checks \
+  "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 5002 'ci / test' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7301 pull_request 'CI'
+# The base is RED on 'lint', and that red BEGAN AFTER the PR's surface.
+write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 7401 push 'Post-merge validation'
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a STALE green (produced before the base went red) does NOT merge (exit $rc)" \
+  || fail "the rail merged a stale green onto a red base it had not measured — the #1261 incident"
+grep -q "STALE surface" "$TMP/err" && pass "…and the refusal names the staleness" \
+  || fail "the staleness refusal is not named: $(sed -n '1,4p' "$TMP/err" 2>/dev/null)"
+grep -q "lint" "$TMP/err" && grep -q "7401" "$TMP/err" \
+  && pass "…naming the base red (job and run URL) it failed to cover" \
+  || fail "the refusal does not name the base red"
+grep -q "RE-MEASURE" "$TMP/err" && pass "…and tells the operator to re-measure this PR's checks" \
+  || fail "the refusal offers no re-measure remedy"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a stale green" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a stale green" || pass "no merge attempted"
+
+# (p) MOVED BUT GREEN — THE ANTI-OVER-BLOCK GUARD, and it matters as much as (o).
+# The base MOVED after the PR's surface was produced, but it is GREEN there.
+# There is nothing this PR has failed to measure, so it MUST merge: refusing on
+# movement alone would refuse essentially every open PR on a busy base, and an
+# over-block is a failure, not safety.
+new_scen treehealth-moved-green
+HEAD_MG="c4c4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_MG" > "$SCEN/head"
+lane_pass "$HEAD_MG" 5711 > "$SCEN/runs-$HEAD_MG"
+lane_pass mainmg 5712 > "$SCEN/runs-main"
+# PR surface GREEN at an OLD time; the base GREEN at a NEW time (it moved).
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7311 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7311 pull_request 'CI'
+write_main_checks "$(check_run 6001 lint completed success 7411 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 7411 push 'Post-merge validation'
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a base that MOVED but is GREEN still MERGES (the anti-over-block guard)" \
+  || fail "the rail refused a PR onto a moved-but-green base (exit $rc): $(sed -n '1,3p' "$TMP/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge actually happened" || fail "no merge attempted"
+[ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+
+# (q) A NEWER NON-CODE BASE RED DOES NOT MAKE A GREEN PR STALE. The base's cron
+# lanes measure no revision (see the header), and a staleness gate that used the
+# RAW red list would refuse every merge whenever a scheduled lane is newly red —
+# the blunt refusal that would stop the fleet. The base here carries an OLD
+# blocking red (a `push` lane, measured by the PR and NOT newer, so not stale)
+# AND a NEWER `schedule` red; the correct gate filters the non-code red and
+# merges, while a raw-list gate would refuse.
+new_scen treehealth-stale-noncode
+HEAD_SN="c5c5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SN" > "$SCEN/head"
+lane_pass "$HEAD_SN" 5721 > "$SCEN/runs-$HEAD_SN"
+lane_pass mainnc 5722 > "$SCEN/runs-main"
+# PR surface GREEN produced after the OLD blocking base red (so it measured it).
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7321 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7321 pull_request 'CI'
+# An OLD `push` red (not newer than the PR surface) + a NEWER `schedule` red.
+write_main_checks \
+  "$(check_run 6001 lint completed failure 7411 2026-01-01T00:00:00Z 2026-01-01T00:00:30Z)" \
+  "$(check_run 6002 backup completed failure 7421 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 7411 push 'Post-merge validation' 7421 schedule registry-backup-cron
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a NEWER schedule red on the base does not make a green PR stale" \
+  || fail "a newly-red cron lane blocked the merge — the blunt refusal that would stop the fleet"
+grep -q "NON-code events" "$TMP/out" && pass "…but it IS still reported as a non-code red" \
+  || fail "the non-code red is SILENT"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
