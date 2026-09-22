@@ -122,6 +122,13 @@ jobs:
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
         echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
         npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
+        # #1321/#1322 — skill-enforcer: manifest resolution under the deployed
+        # symlink layout (the `dirname(__filename)` farm bug #1321), a repeated
+        # manifest line clobbering a skill's other rules, and layout-independent
+        # read identity (#1322). Zero-dep; spawns temp farms through `npx tsx`
+        # and through real jiti where resolvable. Mirrors the ci.yml verify step.
+        echo "== extensions/skill-enforcer.test.ts =="
+        npx tsx extensions/skill-enforcer.test.ts || failures=$((failures+1))
         # #426 — review-enforcer: the merge-registry gate (gates EVERY merge in
         # this account). Needs the pi package (real runtime import): installed as
         # a devDep (package.json) from the public registry, pinned to the pi
