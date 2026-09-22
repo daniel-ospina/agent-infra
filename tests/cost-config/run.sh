@@ -1782,6 +1782,44 @@ if grep -q "reserveTokens" "$OUT"; then pass "the huge integer reserve is report
 if grep -q "Traceback\|OverflowError\|cannot convert" "$OUT"; then fail "the huge integer reserve leaked a traceback"; else pass "the huge integer reserve produced no traceback"; fi
 rm -rf "$TMP41"
 
+echo ""
+# ── 42. a huge VALID JSON integer in a RETRY field must stay a retry/hang-contract block with a
+#      clean message — not a crash after the WINDOW line, which would re-attribute it to the
+#      settings class and leak a traceback (round-4 P2).
+echo "42. huge-integer retry fields → retry/hang-contract BLOCK, no traceback"
+TMP42="$(mktemp -d /tmp/cost-config-retry-huge.XXXXXX)"
+mkroot "$TMP42"
+for field in httpIdleTimeoutMs retry.maxRetries retry.provider.timeoutMs; do
+  python3 - "$TMP42/pi-bootstrap/pi-config/settings.json" "$field" <<'PYEOF'
+import json, sys
+p, dotted = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+node = d
+for k in dotted.split(".")[:-1]:
+    node = node.setdefault(k, {})
+node[dotted.split(".")[-1]] = 10**400
+json.dump(d, open(p, "w"), indent=2)
+PYEOF
+  bash "$TMP42/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 1 ]; then pass "$field=10**400 → exit 1"; else fail "expected exit 1 for $field=10**400, got $code"; sed -n '1,30p' "$OUT"; fi
+  # The class is observable ONLY in the summary counters. The analyser tags retry-class problems
+  # with an internal `RETRY_CONTRACT:` prefix, but `check_settings_file` consumes those lines and
+  # `block_retry` prints the message with the tag STRIPPED — so the tag never reaches stdout and
+  # grepping for it can never pass. Assert the counters the classifier itself emits: at least one
+  # retry/hang-contract block and zero settings-contract blocks. On the pre-fix script the huge
+  # int crashes the heredoc, the traceback is read as unclassifiable `*` lines, and this reads
+  # `0 retry/hang-contract + <n> settings-contract` — so the assertion is a real RED leg.
+  if grep -qE "[1-9][0-9]* retry/hang-contract" "$OUT" && grep -qE "^[[:space:]]*0 settings-contract\." "$OUT"; then
+    pass "$field=10**400 is a retry/hang-contract block (retry>0, settings=0)"
+  else
+    fail "expected the retry/hang-contract class for $field (and 0 settings-contract)"; sed -n '1,40p' "$OUT"
+  fi
+  if grep -q "Traceback\|OverflowError\|integer division" "$OUT"; then fail "$field=10**400 leaked a traceback"; else pass "$field=10**400 produced no traceback"; fi
+  if grep -q "could not be analysed" "$OUT"; then fail "$field=10**400 took the unanalysable fail-closed arm instead of reporting the field"; else pass "$field=10**400 was actually analysed"; fi
+done
+rm -rf "$TMP42"
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"
   exit 0

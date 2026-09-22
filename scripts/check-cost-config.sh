@@ -456,13 +456,22 @@ if all(v is not None for v in _ints.values()):
         i += 1
     hang = (n + 1) * idle + backoff
     worst = (n + 1) * ptimeout + backoff
+    # `ms / 60000` on a valid JSON integer beyond ~1.8e308 raises OverflowError. Letting it escape
+    # would abort the heredoc AFTER the WINDOW line, so `check_settings_file` would skip its
+    # fail-closed retry-class arm and re-attribute the block to the SETTINGS class with a leaked
+    # traceback — the wrong cause. Format defensively instead.
+    def _minutes(ms):
+        try:
+            return f"{ms / 60000:.1f} min"
+        except OverflowError:
+            return "a value too large to express in minutes"
     print(f"WINDOW hung={hang} worst={worst} backoff={backoff}")
     if hang > HANG_CEILING:
-        retry_issues.append(f"hang window {hang}ms ({hang / 60000:.1f} min) exceeds the declared "
+        retry_issues.append(f"hang window {hang}ms ({_minutes(hang)}) exceeds the declared "
                             f"ceiling {HANG_CEILING}ms — the retry budget and the per-attempt "
                             f"ceiling drifted apart")
     if worst > WORST_CEILING:
-        retry_issues.append(f"worst-case window {worst}ms ({worst / 60000:.1f} min) exceeds the "
+        retry_issues.append(f"worst-case window {worst}ms ({_minutes(worst)}) exceeds the "
                             f"declared ceiling {WORST_CEILING}ms")
 else:
     # NO WINDOW line here. `check_settings_file` treats a MISSING derived window
