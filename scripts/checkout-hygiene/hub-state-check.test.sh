@@ -9,7 +9,11 @@
 # Coverage: PASS on main+clean | FAIL on off-main | FAIL on dirty (untracked +
 # staged + unstaged) | recovery command in FAIL output | HUB_DISORDER= line |
 # --repo arg | --gh-report creates one issue / comments on existing (dedup) |
-# exit 2 on usage | resolves the MAIN checkout from inside a worktree.
+# exit 2 on usage | resolves the MAIN checkout from inside a worktree |
+# #1313 staleness: PASS on main+clean+up-to-date | FAIL on behind | FAIL on
+# diverged (ahead-only and true divergence) | FAIL (closed) on no upstream |
+# detached HEAD reports off_main without crashing | the --gh-report leg carries
+# the SAME staleness guidance (both parse sites of the token string).
 
 set -euo pipefail
 
@@ -42,6 +46,18 @@ for r in "$HUB" "$OTHER"; do
   touch "$r/a.txt"
   git -C "$r" add .
   git -C "$r" commit -qm init
+done
+
+# #1313: each fixture gets an upstream, so the clean case is genuinely
+# up-to-date AND the freshness fact is testable. The remote is named `upstream`
+# (not `origin`) deliberately — case 8 below adds a fresh `origin` to exercise
+# the repo-slug parse, and a bare name clash there would silently break it.
+# Local bare paths: no network, fully hermetic.
+for r in "$HUB" "$OTHER"; do
+  bare="$FIX/$(basename "$r")-origin.git"
+  git init -q --bare -b main "$bare"
+  git -C "$r" remote add upstream "$bare"
+  git -C "$r" push -qu upstream main
 done
 
 # ── 1. PASS on main+clean ─────────────────────────────────────────────────
@@ -170,6 +186,113 @@ if [ -s "$GH_STUB_LOG" ]; then bad "not-a-git-repo: zero gh traffic"; else ok "n
 rm -f "$GH_EXISTING"
 git -C "$HUB" checkout -q main 2>/dev/null || true
 rm -f "$HUB/untracked.txt"
+
+# ── 9. Staleness (#1313): the tip vs its upstream ─────────────────────────
+# A dedicated hub + bare remote so the earlier cases' state is untouched. The
+# detector NEVER fetches (the session's freshness machinery owns that), so the
+# fixture fetches into the stale hub itself. Remote named `upstream`; a fresh
+# `origin` is added for the gh-report leg's slug parse.
+SHUB="$FIX/stale-hub"
+SREMOTE="$FIX/stale-origin.git"
+git init -q --bare -b main "$SREMOTE"
+git init -q -b main "$SHUB"
+git -C "$SHUB" config user.email t@t
+git -C "$SHUB" config user.name t
+echo base > "$SHUB/base.txt"
+git -C "$SHUB" add .
+git -C "$SHUB" commit -qm init
+git -C "$SHUB" remote add upstream "$SREMOTE"
+git -C "$SHUB" push -qu upstream main
+git -C "$SHUB" remote add origin "https://github.com/daniel-ospina/tortoise.git"
+
+# 9a. clean + on main + UP-TO-DATE → PASS. Exercise the full matrix start here:
+# a stale assertion must not be the only PASS case (a detector that reds a
+# healthy hub is its own failure).
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "clean+on-main+up-to-date → exit 0"
+assert_contains "$out" "PASS  $SHUB" "up-to-date hub prints PASS"
+assert_contains "$out" "upstream=upstream/main" "PASS line names the verified upstream"
+
+# Advance the remote, then fetch it INTO the hub (upstream/main moves; HEAD stays).
+SCLONE="$FIX/stale-clone"
+git clone -q "$SREMOTE" "$SCLONE"
+git -C "$SCLONE" config user.email t@t
+git -C "$SCLONE" config user.name t
+echo upstream > "$SCLONE/upstream.txt"
+git -C "$SCLONE" add .
+git -C "$SCLONE" commit -qm upstream
+git -C "$SCLONE" push -q origin main
+git -C "$SHUB" fetch -q upstream main
+
+# 9b. clean + on main + BEHIND → FAIL (exactly the pre-#1313 false PASS)
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "clean+on-main+behind → exit 1 (was PASS before #1313)"
+assert_contains "$out" "FAIL  $SHUB" "behind prints FAIL"
+assert_contains "$out" "HUB_DISORDER=behind" "behind → HUB_DISORDER=behind"
+assert_contains "$out" "ahead=0 behind=1" "behind line names the counts"
+assert_contains "$out" "git pull --ff-only" "behind FAIL prints the fast-forward recovery"
+
+# 9c. fast-forward the hub → PASS again (no false positive once healthy).
+git -C "$SHUB" merge -q --ff-only upstream/main
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "hub fast-forwarded to upstream → exit 0"
+assert_contains "$out" "PASS  $SHUB" "up-to-date hub prints PASS again"
+
+# 9d. local-only commit → not fast-forwardable → diverged (ahead-only sub-case:
+# `diverged` is the local-only-commit class, because both shapes need `refresh`).
+echo local > "$SHUB/local.txt"
+git -C "$SHUB" add .
+git -C "$SHUB" commit -qm local-only
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "clean+on-main+ahead-only → exit 1"
+assert_contains "$out" "HUB_DISORDER=diverged" "ahead-only → HUB_DISORDER=diverged (local-only commits)"
+assert_contains "$out" "ahead=1 behind=0" "diverged line names the counts"
+
+# 9e. remote advances too → true divergence → diverged, with the refresh recovery.
+echo upstream2 > "$SCLONE/upstream2.txt"
+git -C "$SCLONE" add .
+git -C "$SCLONE" commit -qm upstream2
+git -C "$SCLONE" push -q origin main
+git -C "$SHUB" fetch -q upstream main
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "clean+on-main+diverged → exit 1"
+assert_contains "$out" "HUB_DISORDER=diverged" "true divergence → HUB_DISORDER=diverged"
+assert_contains "$out" "ahead=1 behind=1" "diverged line names both counts"
+assert_contains "$out" "hub-worktree.sh refresh" "diverged FAIL names the #1309 refresh recovery"
+assert_contains "$out" "refresh --discard-contentless" "diverged FAIL names the contentless flag"
+
+# 9f. The --gh-report leg parses the staleness token SEPARATELY (#1313: two
+# parse sites). The filed issue body must carry the SAME diverged guidance — a
+# token handled in only one place mis-fires here, silently.
+: > "$GH_STUB_LOG"
+rm -f "$GH_EXISTING"
+out="$(bash "$CHECK" --repo "$SHUB" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "diverged+gh-report exits 1"
+assert_contains "$out" "opened hub-state issue" "diverged+gh-report opens an issue"
+assert_contains "$(cat "$GH_STUB_LOG")" "hub-state FAIL: $SHUB (diverged)" "issue title carries the diverged token"
+assert_contains "$(cat "$GH_STUB_LOG")" "hub-worktree.sh refresh --repo $SHUB" "issue body carries the diverged recovery guidance"
+
+# 9g. no upstream configured → FAIL CLOSED. An unverifiable hub must never read
+# as PASS (that is the failure direction #1313 exists to close).
+NOUP="$FIX/no-upstream-hub"
+git init -q -b main "$NOUP"
+git -C "$NOUP" config user.email t@t
+git -C "$NOUP" config user.name t
+echo x > "$NOUP/x.txt"
+git -C "$NOUP" add .
+git -C "$NOUP" commit -qm init
+out="$(bash "$CHECK" --repo "$NOUP" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "clean+on-main+no upstream → exit 1 (fail closed)"
+assert_contains "$out" "HUB_DISORDER=no_upstream" "no upstream → HUB_DISORDER=no_upstream"
+assert_contains "$out" "UNVERIFIABLE" "no-upstream FAIL says freshness is unverifiable"
+
+# 9h. detached HEAD must not crash: reported as off_main (no upstream to compare).
+git -C "$SHUB" checkout -q --detach HEAD
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "detached HEAD → exit 1 (no crash)"
+assert_contains "$out" "HUB_DISORDER=off_main" "detached HEAD → HUB_DISORDER=off_main"
+assert_contains "$out" "The hub is detached." "detached HEAD prints the detached recovery guidance"
+git -C "$SHUB" checkout -q main
 
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"

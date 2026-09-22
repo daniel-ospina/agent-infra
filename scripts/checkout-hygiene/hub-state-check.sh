@@ -8,10 +8,38 @@
 #
 # Per repo: resolves $MAIN_REPO via `git rev-parse --git-common-dir` (the
 # using-git-worktrees Step 0 pattern) so the check works from inside a worktree
-# too. The hub is PASS iff the checked-out branch is main/master AND
-# `git status --porcelain` is empty — untracked files count as dirty
-# (the 2026-08-18 incident: pr1467 in the hub + 3 untracked files + 38 commits
-# ahead of main, 29h silent).
+# too. The hub is PASS iff the checked-out branch is main/master, the tree is
+# CLEAN, AND the tip matches its upstream. Three facts, and the disorder tokens
+# they emit (composed with `+`, e.g. `off_main+dirty`):
+#
+#   off_main     the checked-out branch is not main/master. A stranded branch,
+#                or a detached HEAD (`detached` reports as off_main; there is no
+#                upstream to compare, and it must never crash).
+#   dirty        `git status --porcelain` is non-empty. Untracked files count
+#                (the 2026-08-18 incident: pr1467 in the hub + 3 untracked files
+#                + 38 commits ahead of main, 29h silent).
+#   behind       clean + on main, but the upstream has commits this checkout
+#                lacks — a fast-forward is available.
+#   diverged     clean + on main, but this checkout has LOCAL-ONLY commits, so
+#                it is not fast-forwardable. Covers the ahead-only sub-case too:
+#                any local-only commit makes the hub not a mirror of upstream.
+#   no_upstream  clean + on main, but no upstream ref resolves, so freshness is
+#                UNVERIFIABLE — never treated as PASS (#1313).
+#
+# `off_main` suppresses the staleness class: a stranded branch's own tip is not
+# the hub's freshness.
+#
+# #1313: before this, the verdict was on-main + clean ONLY, so a hub that was
+# arbitrarily behind or diverged reported PASS — a false PASS on exactly the
+# state that hides itself. Everything merged upstream is simply ABSENT from the
+# checkout, so a lane reading the hub learns a stale answer and an absent guard
+# reads as a passing guard (tortoise hub: 3 days / 308 commits stale, #1309,
+# #1125). Freshness is compared against the ALREADY-FETCHED remote-tracking ref
+# (no fetch is issued here): the session's freshness machinery (repo-freshness's
+# auto mode / auto-sync at session start) owns the fetch, so this detector stays
+# network-free and fast. Residual: if that ref is itself stale, a behind-vs-ref
+# gap can persist until the next session fetch — but it is bounded by that fetch
+# instead of growing forever.
 #
 # Usage:
 #   hub-state-check.sh [--repo <path>]... [--gh-report]
@@ -42,9 +70,16 @@ GH_BIN="${GH_BIN:-gh}"
 # (#435) — captures the dirty set (tracked + untracked minus tool junk) into
 # a PR-ready branch and returns the hub to main+CLEAN. Emits by disorder
 # class; prints nothing on clean.
-# $1=on_main(0/1) $2=dirty(0/1) $3=repo $4=branch
+#
+# #1313: the staleness classes (behind / diverged / no_upstream) get their own
+# guidance. EVERY clause of $disorder must be handled here — this function and
+# the --gh-report leg below both derive the class from the token string, so an
+# unhandled token silently falls through to the wrong (or no) guidance. The
+# trailing `*)` is the guard against exactly that.
+# $1=on_main(0/1) $2=dirty(0/1) $3=stale(behind|diverged|no_upstream|"")
+# $4=repo $5=branch
 recovery_guide() {
-  local on_main="$1" dirty="$2" repo="$3" branch="$4"
+  local on_main="$1" dirty="$2" stale="${3:-}" repo="$4" branch="$5"
   local lines=()
   if [[ "$branch" == "detached" || -z "$branch" ]]; then
     if [[ $dirty -eq 1 ]]; then
@@ -70,16 +105,51 @@ recovery_guide() {
       lines+=("Then capture any remaining dirty-on-main leftovers:")
       lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
     fi
-  else
+    # A dirty hub can ALSO be stale. The dirty set is the first thing to fix, so
+    # the staleness step is appended rather than replacing the guidance above.
+    case "$stale" in
+      behind)      lines+=("The hub is also BEHIND its upstream — after the capture, fast-forward: cd $repo && git pull --ff-only") ;;
+      diverged)    lines+=("The hub has also DIVERGED from its upstream (local-only commits) — after the capture: bash $SCRIPT_DIR/hub-worktree.sh refresh --repo $repo") ;;
+      no_upstream) lines+=("The hub's upstream ref is also missing — freshness is UNVERIFIABLE: cd $repo && git fetch origin $branch") ;;
+    esac
+  elif [[ $on_main -eq 0 ]]; then
     lines+=("The hub is off main (stranded branch). Preserve the branch state, then return:")
     lines+=("cd $repo && git push origin $branch")
     lines+=("cd $repo && git checkout main && git pull --ff-only")
+  else
+    # Clean + on main: the ONLY way to reach here is a staleness class (#1313).
+    case "$stale" in
+      behind)
+        lines+=("The hub is clean and on main, but BEHIND its upstream — the commits merged since are ABSENT, so an agent reading the hub gets a stale answer.")
+        lines+=("Fast-forward it (#1309; repo-freshness's auto mode also clears this in the sibling hubs):")
+        lines+=("cd $repo && git pull --ff-only")
+        ;;
+      diverged)
+        lines+=("The hub is clean and on main, but DIVERGED from its upstream (local-only commits — a fast-forward cannot apply).")
+        lines+=("Sanctioned recovery (#1309 / hub-worktree.sh refresh):")
+        lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --repo $repo")
+        lines+=("If those local-only commits are CONTENTLESS, refresh names their SHAs; discard exactly them with:")
+        lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo")
+        ;;
+      no_upstream)
+        lines+=("The hub is clean and on main, but no upstream ref resolves — its freshness is UNVERIFIABLE (never read as PASS).")
+        lines+=("Fetch the upstream, then re-run this check:")
+        lines+=("cd $repo && git fetch origin $branch")
+        ;;
+      *)
+        lines+=("The hub is clean and on main but in an UNRECOGNISED disorder class '$stale' — inspect and fix:")
+        lines+=("git -C $repo status -sb")
+        ;;
+    esac
   fi
   printf '%s\n' "${lines[@]}"
 }
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the whole header comment block: line 2 up to (and excluding) the first
+  # non-comment line. A fixed line range silently truncates the moment the
+  # header grows (this function used to print `2,22p`).
+  sed -n '2,/^[^#]/p' "$0" | sed '/^[^#]/d; s/^# \{0,1\}//'
   exit 2
 }
 
@@ -137,16 +207,51 @@ for repo_arg in "${REPOS[@]}"; do
   [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]] && on_main=1
   [[ "$PORCELAIN_COUNT" -gt 0 ]] && dirty=1
 
+  # #1313: the missing third fact — the tip vs its upstream. Compared against
+  # the ALREADY-FETCHED remote-tracking ref (no fetch here; see the header).
+  # Computed only on main/master: a stranded branch's own tip is not the hub's
+  # freshness, and a detached HEAD has no upstream at all (off_main, no crash).
+  UPSTREAM=""; STALE=""; AHEAD=0; BEHIND=0
+  if [[ $on_main -eq 1 ]]; then
+    UPSTREAM="$(git -C "$MAIN_REPO" rev-parse --abbrev-ref --symbolic-full-name "$BRANCH@{u}" 2>/dev/null || true)"
+    if [[ -z "$UPSTREAM" ]] && git -C "$MAIN_REPO" rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
+      UPSTREAM="origin/$BRANCH"
+    fi
+    if [[ -z "$UPSTREAM" ]]; then
+      # No upstream ref → freshness is unverifiable. FAIL closed (#1313):
+      # an unverified hub must never read as PASS.
+      STALE="no_upstream"
+    elif ! counts="$(git -C "$MAIN_REPO" rev-list --left-right --count "$UPSTREAM...HEAD" 2>/dev/null)"; then
+      # Could not compare → fail closed to the class that needs an action.
+      STALE="diverged"
+    else
+      # `--left-right --count A...B` prints "<only-in-A> <only-in-B>":
+      # left = upstream-only (BEHIND), right = HEAD-only (AHEAD).
+      read -r BEHIND AHEAD <<<"$counts" || true
+      [[ "$BEHIND" =~ ^[0-9]+$ ]] || BEHIND=0
+      [[ "$AHEAD" =~ ^[0-9]+$ ]] || AHEAD=0
+      if [[ "$AHEAD" -eq 0 && "$BEHIND" -eq 0 ]]; then STALE=""
+      elif [[ "$AHEAD" -eq 0 ]]; then STALE="behind"
+      else STALE="diverged"   # any local-only commit: not a fast-forward
+      fi
+    fi
+  fi
+
   disorder=""
   [[ $on_main -eq 0 ]] && disorder="off_main"
   [[ $dirty -eq 1 ]] && disorder="${disorder:+${disorder}+}dirty"
+  [[ -n "$STALE" ]] && disorder="${disorder:+${disorder}+}${STALE}"
+  # Freshness fields appear only when an upstream was resolvable (a detached /
+  # off-main / no-upstream FAIL has nothing to report here).
+  fresh_fields=""
+  [[ -n "$UPSTREAM" ]] && fresh_fields=" upstream=$UPSTREAM ahead=$AHEAD behind=$BEHIND"
   if [[ -z "$disorder" ]]; then
-    echo "PASS  $MAIN_REPO (branch=$BRANCH, clean)"
+    echo "PASS  $MAIN_REPO (branch=$BRANCH, clean, upstream=$UPSTREAM)"
     PASS=$((PASS + 1))
   else
-    echo "FAIL  $MAIN_REPO (branch=$BRANCH, porcelain=$PORCELAIN_COUNT)"
-    echo "HUB_DISORDER=$disorder branch=$BRANCH repo=$MAIN_REPO porcelain_count=$PORCELAIN_COUNT ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    recovery_guide "$on_main" "$dirty" "$MAIN_REPO" "$BRANCH" | sed 's/^/  /' 
+    echo "FAIL  $MAIN_REPO (branch=$BRANCH, porcelain=$PORCELAIN_COUNT$fresh_fields)"
+    echo "HUB_DISORDER=$disorder branch=$BRANCH repo=$MAIN_REPO porcelain_count=$PORCELAIN_COUNT$fresh_fields ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    recovery_guide "$on_main" "$dirty" "$STALE" "$MAIN_REPO" "$BRANCH" | sed 's/^/  /' 
     FAIL_LINES+=("$MAIN_REPO|$disorder|$BRANCH|$PORCELAIN_COUNT")
     FAIL=$((FAIL + 1))
   fi
@@ -170,10 +275,17 @@ if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
         continue
       fi
       ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      on_main=1; dirty=0
+      on_main=1; dirty=0; stale=""
       [[ "$disorder" == off_main* ]] && on_main=0
       [[ "$disorder" == *dirty ]] && dirty=1
-      guide="$(recovery_guide "$on_main" "$dirty" "$repo_path" "$branch")"
+      # Parse the staleness token back out of the composed string (#1313).
+      # `off_main` suppresses it, so these never co-occur with off_main.
+      case "$disorder" in
+        *no_upstream*) stale="no_upstream" ;;
+        *diverged*)    stale="diverged" ;;
+        *behind*)      stale="behind" ;;
+      esac
+      guide="$(recovery_guide "$on_main" "$dirty" "$stale" "$repo_path" "$branch")"
       body="Hub-discipline check FAILED for **$repo_path** at $ts.
 
 - \`HUB_DISORDER=$disorder\` (branch=\`$branch\`, porcelain=$porcelain_count)
