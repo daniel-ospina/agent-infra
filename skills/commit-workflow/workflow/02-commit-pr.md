@@ -204,6 +204,20 @@ scripts/admin-merge.sh <PR> --squash
 # matters for repos that split their lanes by TRIGGER: agent-infra's `ci.yml` is
 # `pull_request`-only and `ci-main.yml` is `push`-only, so neither spans both
 # sides. Pass `--any-workflow` there to compare against every lane on main.
+#
+# A VACUOUS comparison is NOT a certificate (#1319). `PR failing: 0 | main
+# failing: 0` is an ABSENCE of a measurement, not a clean one: the two zeros mean
+# "both lanes were green" only if both sides ran the SAME lane. tortoise #4263
+# merged on exactly that line while its tier-2 PR lane had SKIPPED shards main's
+# push lane runs; the failure lived in one of them, so it could appear in
+# NEITHER set, and the merge reddened main's required check for the whole fleet
+# (#4457). The rail therefore REFUSES a vacuous comparison — verdict `NOT
+# COMPARABLE`, distinct from "compared, clean" and "compared, dirty" — unless
+# the PR demonstrably EXECUTED every test shard main's lane executed, and it
+# fails CLOSED: an unreadable shard list is never read as "the same lane". The
+# refusal NAMES both lanes. Remedy: run the FULL lane for the head — the shards
+# named in the refusal are what main measures. If this repo's test shards are not
+# named `test*`, set `ADMIN_MERGE_LANE_JOB_PREFIX` to the prefix they use.
 ```
 
 ⚠️ The baseline is the **union of main's last N runs** (default 10), never a
