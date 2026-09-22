@@ -94,7 +94,16 @@
 #      refuses when a code-measuring base red's run STARTED after the PR surface
 #      was last produced — red-relative, never movement-relative, so a base that
 #      moved but is GREEN still merges, and the PR that REPAIRS a red base still
-#      lands (its evaluation postdates the red it removes).
+#      lands (its evaluation postdates the red it removes). The ordering rule
+#      cannot see a base red whose run PREDATES the surface but which lives on a
+#      base the surface never used: GitHub recomputes the merge ref when the base
+#      moves and does NOT re-run the PR's checks, so the PR's green can be a
+#      LAGGING evaluation. The second, independent signal is the merge ref's
+#      FIRST PARENT — the base commit it was computed against. When that differs
+#      from the current base head AND the base carries a blocking red, the rail
+#      refuses; when the base is green it still merges (the merge ref lags by a
+#      commit or two routinely), and an unreadable parent on a red base fails
+#      closed.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -3312,6 +3321,102 @@ rc=$?
   || fail "a newly-red cron lane blocked the merge — the blunt refusal that would stop the fleet"
 grep -q "NON-code events" "$TMP/out" && pass "…but it IS still reported as a non-code red" \
   || fail "the non-code red is SILENT"
+
+# (r) THE MERGE-REF-LAG CASE — THE HOLE 4.6 CANNOT SEE, AND THE NEW
+# DISCRIMINATOR. The PR's tree is GREEN and the base is RED, but the base red's
+# run STARTED BEFORE the PR's surface was produced — so the ordering rule at step
+# 4.6 does NOT fire. What makes the green stale anyway is that the merge ref was
+# computed against an OLDER base: the PR's checks are keyed to a tree that does
+# not contain the current base, and GitHub recomputes the merge ref on base
+# movement without re-running the PR's checks. The rail MUST refuse on the merge
+# ref's FIRST PARENT (step 4.7) — and the assertion that 4.6 did NOT fire is what
+# proves this test is about the NEW discriminator, not the timestamp rule.
+new_scen treehealth-merge-ref-lag-red
+HEAD_LGR="c6c6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LGR" > "$SCEN/head"
+lane_pass "$HEAD_LGR" 5731 > "$SCEN/runs-$HEAD_LGR"
+lane_pass mainlgr 5732 > "$SCEN/runs-main"
+# PR tree GREEN, produced AFTER the base red began (00:00) — so 4.6 is not stale.
+pr_green_surface
+# Base RED on a code-measuring `push` lane, its run STARTED at 00:00, BEFORE the
+# PR's surface completed at 00:05: the ordering rule cannot refuse this one.
+write_main_checks "$(check_run 6001 lint completed failure 7501)"
+main_run_map 7501 push 'Post-merge validation'
+# The merge ref was computed against an OLDER base than the branch now points at.
+merge_parent deadbeef00000000000000000000000000000000
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a LAGGING merge ref onto a RED base refuses (exit $rc)" \
+  || fail "the rail merged a green that was evaluated against an OLDER base than the red one — the merge-ref-lag hole"
+grep -q "LAGGING MERGE REF" "$TMP/err" && pass "…and the refusal names the lagging merge ref" \
+  || fail "the merge-ref-lag refusal is not named: $(sed -n '1,4p' "$TMP/err" 2>/dev/null)"
+grep -q "STALE surface" "$TMP/err" \
+  && fail "the refusal is the 4.6 ordering rule, not the merge-ref discriminator — this test would not pin 4.7" \
+  || pass "…and it is NOT the 4.6 ordering rule (the base red predates the PR surface)"
+grep -q "lint" "$TMP/err" && grep -q "7501" "$TMP/err" \
+  && pass "…naming the base red (job and run URL) this PR has not measured" \
+  || fail "the refusal does not name the base red it failed to measure"
+grep -q "deadbeef00000000000000000000000000000000" "$TMP/err" \
+  && grep -q "feedface0000000000000000000000000000000000" "$TMP/err" \
+  && pass "…and names BOTH the base parent it was evaluated against and the current base head" \
+  || fail "the refusal does not name the lagging parent and the current base head"
+grep -q "RE-MEASURE" "$TMP/err" && pass "…with the re-run remedy" \
+  || fail "the merge-ref-lag refusal offers no re-measure remedy"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a lagging evaluation" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a lagging evaluation" || pass "no merge attempted"
+
+# (s) LAGGING MERGE REF ONTO A GREEN BASE — THE ANTI-OVER-BLOCK GUARD, AND IT
+# MATTERS AS MUCH AS (r). The merge ref lags (its parent differs from the base
+# head) but the base is GREEN, so there is nothing the PR failed to measure: it
+# MUST merge. The merge ref is recomputed continuously, so a lag of a commit or
+# two is the NORMAL state (measured on 12 of 12 open tortoise PRs while main was
+# green); refusing on the comparison alone would refuse essentially every open PR.
+new_scen treehealth-merge-ref-lag-green
+HEAD_LGG="c7c7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LGG" > "$SCEN/head"
+lane_pass "$HEAD_LGG" 5741 > "$SCEN/runs-$HEAD_LGG"
+lane_pass mainlgg 5742 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+# The merge ref lags the base head, but the base is GREEN.
+merge_parent deadbeef00000000000000000000000000000000
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a LAGGING merge ref onto a GREEN base still MERGES (the anti-over-block guard)" \
+  || fail "the rail refused a PR whose merge ref lags a GREEN base (exit $rc): $(sed -n '1,3p' "$TMP/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge actually happened" || fail "no merge attempted"
+[ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+# THE COMPARISON IS RED-BASE-ONLY, so a green base makes NO parent probe at all.
+# A wrong implementation that probes unconditionally and refuses on the mismatch
+# fails the outcome assertion above; this pins the cheaper, narrower shape too.
+grep -q 'parents\[0\]' "$SCEN/calls" \
+  && fail "the rail probed the merge ref's parent for a GREEN base — the comparison must be red-base-only" \
+  || pass "…and no merge-ref parent probe is made when the base is green"
+
+# (t) AN UNREADABLE MERGE-REF PARENT ON A RED BASE FAILS CLOSED. "I could not
+# read the parent" cannot show the PR measured the current base, and this rail
+# merges with --admin, so it is a refusal — the same rule as an unreadable tree
+# surface at 4.5. A fail-open here would readmit exactly the (r) case.
+new_scen treehealth-merge-ref-parent-unreadable
+HEAD_LGU="c8c8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LGU" > "$SCEN/head"
+lane_pass "$HEAD_LGU" 5751 > "$SCEN/runs-$HEAD_LGU"
+lane_pass mainlgu 5752 > "$SCEN/runs-main"
+write_main_checks "$(check_run 6001 lint completed failure 7511)"
+main_run_map 7511 push 'Post-merge validation'
+pr_green_surface
+: > "$SCEN/merge-parent-unreadable"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNREADABLE merge-ref parent on a RED base refuses (exit $rc)" \
+  || fail "an unreadable merge-ref parent was read as permission"
+grep -q "BASE PARENT COULD NOT BE READ" "$TMP/err" && pass "…and the refusal names the failed probe, actionably" \
+  || fail "the unreadable-parent refusal is not named"
+[ -f "$SCEN/comment" ] && fail "evidence posted on an unreadable merge-ref parent" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on an unreadable merge-ref parent" || pass "no merge attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
