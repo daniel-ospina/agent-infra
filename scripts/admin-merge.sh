@@ -204,10 +204,25 @@
 # produced 2026-09-22T06:23:46Z (a stale green of ~10h); PR 1153's merge ref was
 # recomputed 2026-09-22T14:12:42Z with base 59a08fcd while main had moved — so a
 # merge-ref-parent comparison alone would MISS the recomputed-but-unre-run case,
-# while the timestamp comparison catches both. RESIDUAL: a base red whose run
-# started BEFORE the surface was produced but on a base the surface did not
-# actually use (the merge ref can lag the base) is not caught here; the merge-ref
-# base parent is the other signal, not yet wired.
+# while the timestamp comparison catches both.
+#
+# AND THE MERGE REF'S BASE PARENT IS THE SECOND, INDEPENDENT SIGNAL (#1261, step
+# 4.7). The timestamp rule above is blind to a base red whose run STARTED BEFORE
+# the PR surface was produced but on a base the surface never used; GitHub
+# recomputes `refs/pull/<N>/merge` when the base moves and does NOT re-run the
+# PR's checks, so a surface can be produced LATER while still evaluating an OLDER
+# base. The merge ref is a merge commit whose parents are `[<base>, <head>]`, so
+# its FIRST PARENT is the base it was computed against: when that differs from
+# the CURRENT base head AND the base carries a blocking red, the PR's green was
+# measured against a base that does not contain the red, and the rail refuses —
+# naming the base red and the re-run remedy. A lagging ref onto a GREEN base is
+# harmless and MERGES (the merge ref lags by a commit or two routinely — measured
+# on 12 of 12 open tortoise PRs while main was green — so refusing on movement
+# alone would refuse essentially every open PR). MEASURED live 2026-09-22:
+# tortoise #4659's merge ref 6f0b119a has base parent 283e919dd1 while main's
+# head was 1f5d6efc49 (8 code-measuring reds, `welcome-e2e` started 16:13:22Z),
+# and #4659's own surface was last produced 18:41:31Z — so the STARTED-AFTER rule
+# did NOT fire, while the merge-ref parent did not contain the red head.
 #
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
@@ -643,6 +658,27 @@ resolve_merge_ref() {
       MERGE_REF_SUMMARY="ABSENT — GitHub has not computed mergeability/merge ref for PR #$pr (mergeable=$state after $attempt attempt(s)): no merge ref exists yet, so no CI has evaluated a merge of this PR"
       return 0 ;;
   esac
+}
+
+# resolve_merge_base_parent <merge-sha> — the FIRST PARENT of the PR's merge ref,
+# i.e. the BASE commit that merge ref was computed against. Prints the sha, or
+# EMPTY when it cannot be read (the caller fails closed: see step 4.7).
+#
+# WHY parents[0] IS THE BASE, AND THAT IT IS NOT ASSUMED. GitHub's
+# `refs/pull/<N>/merge` is a merge commit whose parents are `[<base>, <head>]` —
+# the job log in the header shows `Merge e55b123c… into 59a08fcd…`. Verified on
+# live data 2026-09-22 across three repos (agent-infra, tortoise, premise-labs):
+# on every open PR measured, `parents[1]` equalled the PR head sha and
+# `parents[0]` equalled the base the merge ref was computed against — e.g.
+# agent-infra #1153 merge d61a3411 parents [59a08fcd, cfad4a5f]; premise-labs #309
+# merge 7b4356a4 parents [0fd0f714, 39ca23bd]; tortoise #4659 merge 6f0b119a
+# parents [73acefdd, ad324fdc].
+resolve_merge_base_parent() {
+  local sha="$1" slug
+  [ -n "$sha" ] || { printf ''; return 0; }
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  # shellcheck disable=SC2086
+  $GH api "$slug/commits/$sha" --jq '.parents[0].sha' 2>/dev/null || true
 }
 
 # run_failure_set <mode...> — invoke the shared parser, splitting its stdout
@@ -2252,10 +2288,11 @@ main() {
   # MISS the recomputed-but-unre-run case, while this timestamp comparison
   # catches both.)
   #
-  # WHAT IT DOES NOT FIX, STATED: a base red whose run started BEFORE the surface
-  # was produced but on a base the surface did not actually use (the merge ref can
-  # lag the base) is not caught here; the merge-ref base parent is the other
-  # signal, tracked as a residual rather than pretended away.
+  # WHAT THIS DOES NOT FIX. A base red whose run started BEFORE the surface was
+  # produced but on a base the surface never used (the merge ref can lag the
+  # base) is not caught HERE — the ordering rule cannot see it. That case is step
+  # 4.7, which compares the merge ref's base parent against the current base head
+  # and refuses when they differ while the base is red.
   if [ "$BASE_STATUS" = "red" ]; then
     local stale_any=0 stale_reds="" stale_name stale_iso stale_epoch stale_url
     if counter_is_number "$TREE_MAX_COMPLETED_EPOCH"; then
@@ -2289,6 +2326,75 @@ main() {
       say_err "   ('gh run rerun' the PR's runs, or push an empty commit) so the merge-ref"
       say_err "   evaluation covers the base's red. If this PR is the REPAIR, its own checks pass"
       say_err "   on the re-measured tree and the merge then proceeds."
+      say_err "   No evidence was posted and no merge attempted."
+      exit 1
+    fi
+  fi
+
+  # ── 4.7. THE MERGE REF'S BASE PARENT — A LAGGING EVALUATION (#1261) ─────
+  # THE LAST HOLE IN 4.6. Step 4.6 compares TIMES: it refuses a base red that
+  # STARTED after the PR's surface was produced. That misses the merge-ref-lag
+  # case — `refs/pull/<N>/merge` is recomputed when the base moves but the PR's
+  # checks are NOT re-run, so a surface produced AFTER a base red began can still
+  # have been evaluated against an OLDER base that does not contain that red. The
+  # ordering rule then says "not stale" while the tree the merge will actually
+  # produce (head merged into the CURRENT base) was never measured. MEASURED live
+  # 2026-09-22: tortoise #4659's merge ref 6f0b119a has base parent 283e919dd1
+  # while main's head was 1f5d6efc49, which carried 8 code-measuring reds
+  # including `welcome-e2e` started 16:13:22Z — and #4659's own surface was last
+  # produced at 18:41:31Z, so the STARTED-AFTER rule did NOT fire, while its
+  # merge ref demonstrably did not contain the red head.
+  #
+  # THE DISCRIMINATOR IS THE BASE PARENT. The merge ref's first parent is the
+  # base commit it was computed against. If it differs from the CURRENT base
+  # head, then the PR's checks — keyed to a merge ref whose base is not the
+  # current one — cannot have measured a merge into the current base (the base
+  # only moves forward and a recompute always takes the tip, so a lagging parent
+  # is strictly older). AND ONLY A RED BASE MATTERS: if the base is green there
+  # is nothing the PR failed to measure, so a lagging ref onto a green base
+  # MERGES — refusing on movement alone would refuse essentially every open PR,
+  # because GitHub recomputes the merge ref continuously and a lag of a commit or
+  # two is the normal state (measured on 12 of 12 open tortoise PRs while main
+  # was green).
+  #
+  # WHY IT DOES NOT OVER-BLOCK THE REPAIR. A PR that repairs a red base must be
+  # evaluated against a base that CONTAINS the red; if its merge ref lags, the
+  # refusal names the re-run as the remedy, and re-running recomputes the merge
+  # ref against the current base — at which point a genuine repair is green on
+  # its own tree (step 4.5) and 4.6 sees a surface that postdates the red, so it
+  # lands. The refusal is a re-measurement request, never a verdict on the PR.
+  #
+  # FAIL CLOSED ON AN UNREADABLE PARENT. The probe runs ONLY when the base is red
+  # (so a green base costs no extra call), and if it cannot read the parent there
+  # is no way to show the PR measured the current base — "I did not look" is
+  # never a green (the same rule as 4.5's unreadable surface).
+  if [ "$BASE_STATUS" = "red" ]; then
+    local merge_base_parent=""
+    merge_base_parent="$(resolve_merge_base_parent "$MERGE_REF_SHA")"
+    if [ -z "$merge_base_parent" ] || [ "$merge_base_parent" = "null" ]; then
+      say_err "admin-merge: ✗ BLOCK — THE BASE IS RED AND THE MERGE REF'S BASE PARENT COULD NOT BE READ."
+      say_err "   $BASE_SUMMARY"
+      say_err "   The merge ref ${MERGE_REF_SHA:-<none>} could not be resolved to its first parent"
+      say_err "   (the base commit it was computed against), so the rail cannot show this PR's"
+      say_err "   checks were evaluated against the base that is now red. An unread probe is"
+      say_err "   never a certificate: this rail merges with --admin."
+      say_err "   Check gh auth/network (and --repo), then re-run. No evidence was posted."
+      exit 1
+    fi
+    if [ "$merge_base_parent" != "$BASE_SHA" ]; then
+      say_err "admin-merge: ✗ BLOCK — THE BASE IS RED AND THIS PR WAS EVALUATED AGAINST AN OLDER BASE (a LAGGING MERGE REF)."
+      say_err "   $BASE_SUMMARY"
+      say_err "   The PR's merge ref (refs/pull/$PR/merge = $MERGE_REF_SHA) was computed against"
+      say_err "   base commit $merge_base_parent, but the base branch '$base_ref' is now at $BASE_SHA."
+      say_err "   The PR's checks are keyed to a tree that does not contain the current base, so"
+      say_err "   its green does not cover this base red — GitHub recomputes the merge ref when the"
+      say_err "   base moves but does NOT re-run the PR's checks. This is the #1261 merge-ref-lag case."
+      say_err "   Base red(s) this PR has not measured:"
+      printf '%s\n' "$BASE_REDS" >&2
+      say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
+      say_err "   ('gh run rerun' the PR's runs, or update the branch / push an empty commit) so the"
+      say_err "   merge ref is recomputed against $BASE_SHA and the PR's checks evaluate it. If this PR"
+      say_err "   is the REPAIR, its own checks then pass on the re-measured tree and the merge proceeds."
       say_err "   No evidence was posted and no merge attempted."
       exit 1
     fi
