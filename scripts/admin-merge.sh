@@ -137,12 +137,21 @@
 # ABSENT ref (fresh PR, `mergeable: null`, bounded re-poll then give up) is also
 # refused loudly: a surface we cannot tie to a merge is not a certificate.
 #
-# CLASSIFICATION. RED = a completed check run whose conclusion is `failure`,
-# `timed_out`, `action_required` or `startup_failure`; or a commit status whose
-# state is `failure`/`error`. NOT red, by name: `success`; `neutral`; `skipped`
-# (a path-gated job legitimately skips — agent-infra's own `python-ci / lint`
-# skips); `cancelled` (a superseded run — `cancel-in-progress: true` is normal);
-# and `stale`. A check still `queued`/`in_progress` is PENDING, never red: main
+# CLASSIFICATION — AN ALLOW-LIST OF NON-RED SPELLINGS, NEVER A DENY-LIST. A
+# COMPLETED check run is non-red ONLY for a conclusion this line names: `success`;
+# `neutral`; `skipped` (a path-gated job legitimately skips — agent-infra's own
+# `python-ci / lint` skips); `cancelled` (a superseded run —
+# `cancel-in-progress: true` is normal); and `stale`. A legacy commit status is
+# non-red ONLY for `success`. EVERY OTHER VALUE IS RED — including a spelling
+# this rail has never seen (a vendor adds a conclusion, or GitHub returns a token
+# from a newer API), a completed run with a null/empty conclusion, and any
+# unrecognised status state. That is the fail-closed direction this repo requires
+# ("a guard must fail closed on an unrecognised spelling"): the earlier DENY-list
+# named the red tokens, so `mystery_failure` was neither red nor pending and the
+# rail merged on it (#1261 fix round). The tokens the old list named —
+# `failure`, `timed_out`, `action_required`, `startup_failure`, and the status
+# states `failure`/`error` — are red under the allow-list too, because none of
+# them is in it. A check still `queued`/`in_progress` is PENDING, never red: main
 # always has something running, and refusing on that would block the fleet every
 # time a post-merge run starts. The pending COUNT is printed, so an unmeasured
 # surface is legible rather than silent.
@@ -1116,8 +1125,13 @@ check_surface_probe() {
     return 0
   fi
   py_out="$("$PYTHON_BIN" -c 'import datetime, json, sys
-RED_CONC = {"failure", "timed_out", "action_required", "startup_failure"}
-RED_STATE = {"failure", "error"}
+# ALLOW-LISTS, matching the header contract exactly. A conclusion/state is
+# NON-RED only if it is NAMED here; "not in the red set" is not a synonym for
+# non-red, because a token this list has never seen must fail closed. The old
+# deny-list read `mystery_failure` (and `""`, and a status `state:"mystery"`) as
+# silently non-red and merged on it (#1261 fix round).
+NON_RED_CONC = {"success", "neutral", "skipped", "cancelled", "stale"}
+NON_RED_STATE = {"success"}
 
 def docs(path):
     try:
@@ -1214,13 +1228,16 @@ for _, name, app, status, concl, url, started, completed in best.values():
     e = ts_epoch(completed)
     if e != "" and (surface_iso == "" or int(e) > surface_epoch):
         surface_epoch, surface_iso = int(e), completed
-    if concl in RED_CONC:
+    if concl not in NON_RED_CONC:
         reds.append((name, app, concl, url, started))
 for stamp, ctx, state, url in sbest.values():
-    if state in RED_STATE:
-        reds.append((ctx, "commit-status", state, url, stamp))
-    elif state == "pending":
+    if state == "pending":
+        # PENDING is checked FIRST and is its own state, never red: the GitHub
+        # combined-status body reports aggregate `pending` for a body carrying
+        # ZERO statuses, and that is not a failure.
         pend.append((ctx, "commit-status"))
+    elif state not in NON_RED_STATE:
+        reds.append((ctx, "commit-status", state, url, stamp))
     e = ts_epoch(stamp)
     if e != "" and (surface_iso == "" or int(e) > surface_epoch):
         surface_epoch, surface_iso = int(e), stamp
