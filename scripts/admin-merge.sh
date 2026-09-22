@@ -46,7 +46,7 @@
 # never read from the repo being merged: a grader drawn from the graded system
 # is a bypass.
 #
-# THREE PRECONDITIONS THE FAILING SETS ALONE CANNOT EXPRESS:
+# FOUR PRECONDITIONS THE FAILING SETS ALONE CANNOT EXPRESS:
 #   1. THE HEAD MUST HAVE BEEN TESTED. The lane must have at least one TESTED run
 #      for this head (a run that finished `success`, `failure` or `timed_out`) and
 #      none still running. A queued run — or a run that finished `cancelled`,
@@ -68,6 +68,72 @@
 #      `pull_request`-only lane and a `push`-only lane) have no single --workflow
 #      spanning both sides; `--any-workflow` compares against every lane on main
 #      (#1003).
+#   4. THE TREE MUST BE GREEN WHERE THE RAIL CAN SEE IT. Preconditions 1-3 are
+#      all LANE-SCOPED. A lane-scoped comparison is blind to the rest of the
+#      tree, and that blindness is a false PASS at the merge level — not a
+#      wording problem (#1261, proven twice in one day). See MAIN'S TREE HEALTH
+#      below.
+#
+# ── MAIN'S TREE HEALTH (#1261) ────────────────────────────────────────────
+# The incident, exactly. PR #4589 (commit ebe4e7e8f) landed three ruff
+# violations in `tools/embedded_evidence.py`. The ruff gate is the
+# `agent-infra-ci / lint` job of `ci.yml`, which runs on the PULL REQUEST MERGE
+# REF — so once those bytes were on main, EVERY OPEN PR was lint-red on a diff
+# touching neither file. The rail was watching `python-ci.yml`: green on both
+# sides, so both failing sets were empty, the vacuous branch merged, and PR
+# #4600 then merged onto the same red main. The repair came from a HUMAN
+# noticing. The fact was sitting on main's own commit check surface the whole
+# time — measured on the real commit: `lint` -> completed/failure (run
+# 35694314270, workflow `Post-merge validation`), beside 27 check runs that
+# were green.
+#
+# WHAT IS MEASURED, AND WHY IT IS THE RIGHT SOURCE. Main's health is read from
+# the CHECK RUNS AND COMMIT STATUSES ATTACHED TO MAIN'S HEAD COMMIT
+# (`GET /repos/{owner}/{repo}/commits/{base}/check-runs` + `/status`) — the same
+# object a reviewer sees on the commit, EVERY workflow and EVERY app, not just
+# `--workflow`. It names the failing JOB (the lane comparison can only name
+# test node ids) and each check run carries its own run URL. REQUIRED CHECKS ARE
+# DELIBERATELY NOT THE SOURCE: this rail merges with `--admin`, which BYPASSES
+# required checks, so a check that is not required gates nothing — and in the
+# incident the red job was not a required check at all. Reading branch
+# protection would have proved nothing.
+#
+# CLASSIFICATION. RED = a completed check run whose conclusion is `failure`,
+# `timed_out`, `action_required` or `startup_failure`; or a commit status whose
+# state is `failure`/`error`. NOT red, by name: `success`; `neutral`; `skipped`
+# (a path-gated job legitimately skips — agent-infra's own `python-ci / lint`
+# skips); `cancelled` (a superseded run — `cancel-in-progress: true` is normal);
+# and `stale`. A check still `queued`/`in_progress` is PENDING, never red: main
+# always has something running, and refusing on that would block the fleet every
+# time a post-merge run starts. The pending COUNT is printed, so an unmeasured
+# surface is legible rather than silent.
+#
+# AND RED ONLY BLOCKS WHEN IT MEASURES CODE. Main's surface is dominated by
+# lanes that measure no revision: on tortoise's last eight main commits SEVEN
+# carried a failure-like check, and over the repo's last 100 main runs 6 of the
+# 12 failure-like runs were `registry-backup-cron` (event `schedule`) and 1 was
+# `finding-provenance` (event `issues`). Blocking on those would refuse
+# essentially every merge in that repo, so each red is resolved (by the run id in
+# its own URL) to the EVENT that produced it: `schedule`/`issues`/`issue_comment`
+# are REPORTED but do not block; every other event, and any red whose run cannot
+# be resolved, BLOCKS. See MAIN_HEALTH_RUN_MAP_LIMIT.
+#
+# SUPERSEDED RUNS. Re-running a failed check leaves the OLD failing check run in
+# place beside the new one — verified on tortoise commit fb27fff: `ai-review-gate`
+# failure (id 106676366486) sits beside `ai-review-gate` success (id 106676728197)
+# on the same commit. "Any failure-like check run is red" would call that commit
+# red and block every merge. The rule is therefore GitHub's own: the LATEST check
+# run (highest id) per (app, name) decides. Residual, stated: two DISTINCT
+# workflows sharing one job name are conflated by that key — the same conflation
+# GitHub's own check rollup makes.
+#
+# AN EMPTY SURFACE IS UNMEASURED, NOT GREEN, AND NOT A REFUSAL. Right after a
+# merge, main's head has no check runs YET. Refusing there would block the common
+# case, and the rail ALREADY refuses when the watched lane never tested main
+# (precondition 3) — the lane-scoped half of "I did not look". So a zero-check
+# surface prints UNMEASURED and proceeds; what it must never do is pretend the
+# surface was read. An UNREADABLE probe (gh error, unparseable body) is a third
+# thing again: that is the rail FAILING to look, and it REFUSES, by name.
 #
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
@@ -416,6 +482,17 @@ resolve_draft() {
   $GH pr view "$pr" "$@" --json isDraft --jq .isDraft 2>/dev/null
 }
 
+# resolve_base_ref <pr> → the PR's TARGET branch (`baseRefName`). Main's health
+# is measured on that branch's head, because that is the tree the merge lands on.
+# An unreadable or empty answer is not fatal — the caller defaults to `main`,
+# which every repo in this fleet uses — but the root cause is that a PR can
+# target a non-default branch, so the answer is preferred when it exists.
+resolve_base_ref() {
+  local pr="$1"; shift
+  # shellcheck disable=SC2086
+  $GH pr view "$pr" "$@" --json baseRefName --jq .baseRefName 2>/dev/null
+}
+
 # run_failure_set <mode...> — invoke the shared parser, splitting its stdout
 # into the set (stdout) while surfacing an EXTRACTION FAILURE as our own exit 1.
 # An extraction error must never be read as "no unique failures" — that is the
@@ -738,6 +815,260 @@ residual_of() {
   [ -s "$prefix.blocked" ] && cat "$prefix.blocked" >> "$out"
   [ -s "$prefix.unattributable" ] && cat "$prefix.unattributable" >> "$out"
   sort -u -o "$out" "$out"
+}
+
+# ── MAIN'S TREE HEALTH (#1261) ───────────────────────────────────────────
+# The lane-scoped comparison in steps 1-3 answers "did this PR introduce a
+# failure in the one workflow I watch?". It cannot answer "is the tree I am
+# merging ONTO green?", and the difference is a false PASS: #4589 landed ruff
+# violations, every open PR's merge ref went lint-red, and the rail merged two
+# PRs onto it because `python-ci.yml` was green on both sides (both failing sets
+# EMPTY, so nothing was compared). See the header for the source, the
+# red/not-red/pending table, and the superseded-run rule.
+#
+# Sets, NEVER exits — so no caller can forget which branch it took:
+#   MAIN_HEALTH_STATUS   green | red | unmeasured | unreadable
+#   MAIN_HEALTH_REF      the base ref probed
+#   MAIN_HEALTH_SHA      main's head sha (the base ref name when unresolvable)
+#   MAIN_HEALTH_SUMMARY  ONE legible line naming what was measured
+#   MAIN_HEALTH_REDS     display lines, one per failing check (job, workflow, url)
+#   MAIN_HEALTH_TOTAL / MAIN_HEALTH_RED / MAIN_HEALTH_PENDING   the counts
+#
+# WHY THE RUN LIST IS READ TOO — THE GATE IS UNUSABLE WITHOUT IT. Main's check
+# surface is dominated by lanes that measure NO revision: on tortoise's last
+# eight main commits, SEVEN carried a failure-like check, and over the repo's
+# last 100 main runs 6 of the 12 failure-like runs were `registry-backup-cron`
+# (event `schedule`) and 1 was `finding-provenance` (event `issues`) — neither
+# measures the tree a merge lands on. An
+# unconditional "any red check on main refuses" gate would therefore refuse
+# essentially EVERY merge in that repo, which is the blunt refusal this rail must
+# not become. So each failing check is resolved — by the run id in its own URL —
+# to the EVENT that produced it, and only an event that MEASURES CODE blocks.
+#
+#   REPORT-ONLY (no code measured): schedule, issues, issue_comment.
+#   BLOCKING (code health):         push, pull_request, pull_request_target,
+#                                   merge_group, workflow_dispatch, and every
+#                                   event NOT in the list above.
+# That is a DENY-list of the observed non-code events, deliberately: an
+# UNRECOGNISED event BLOCKS (fail closed). A red check whose run id cannot be
+# resolved at all (a non-Actions app, or a run outside the map window) also
+# BLOCKS — "I could not tell what this is" is not "this is noise".
+#
+# ONE `gh run list` resolves them all (id -> event, workflow name), so no single
+# red costs an extra call, and it is fetched ONLY when a red exists. BOUNDED at
+# 200 runs: main's head is the newest commit, so its runs sit at the top.
+MAIN_HEALTH_RUN_MAP_LIMIT=200
+
+main_health_probe() {
+  local ref="$1"
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest
+  local blocking=0 other=0
+  local repo_args=()
+  [ -n "${REPO:-}" ] && repo_args=(--repo "$REPO")
+  MAIN_HEALTH_STATUS=""
+  MAIN_HEALTH_REF="$ref"
+  MAIN_HEALTH_SHA=""
+  MAIN_HEALTH_SUMMARY=""
+  MAIN_HEALTH_REDS=""
+  MAIN_HEALTH_REDS_OTHER=""
+  MAIN_HEALTH_TOTAL=0
+  MAIN_HEALTH_RED=0
+  MAIN_HEALTH_RED_OTHER=0
+  MAIN_HEALTH_PENDING=0
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  # The head SHA is for the RECORD: main moves, and the evidence must say which
+  # commit was measured. Unresolvable is not fatal — a branch ref addresses
+  # check-runs just as well — but it is then reported AS the ref, never as a sha.
+  sha="$($GH api "$slug/commits/$ref" --jq .sha 2>/dev/null || true)"
+  [ -n "$sha" ] && [ "$sha" != "null" ] || sha="$ref"
+  MAIN_HEALTH_SHA="$sha"
+  cr_json="$(mktemp "${TMPDIR:-/tmp}/admin-merge-checks.XXXXXX")"
+  st_json="$(mktemp "${TMPDIR:-/tmp}/admin-merge-statuses.XXXXXX")"
+  # BOTH surfaces must be READABLE. A gh failure here is the rail failing to
+  # look, and "I did not look" is never green — the caller REFUSES. (An EMPTY
+  # surface is a THIRD state: main's checks have not started. Also not green,
+  # but not a refusal — see the header.)
+  if ! $GH api "$slug/commits/$sha/check-runs?per_page=100" --paginate > "$cr_json" 2>/dev/null; then
+    rm -f "$cr_json" "$st_json"
+    MAIN_HEALTH_STATUS="unreadable"
+    MAIN_HEALTH_SUMMARY="UNREADABLE — 'gh api .../check-runs' failed for '$ref' ($sha): the surface was never read"
+    return 0
+  fi
+  if ! $GH api "$slug/commits/$sha/status" > "$st_json" 2>/dev/null; then
+    rm -f "$cr_json" "$st_json"
+    MAIN_HEALTH_STATUS="unreadable"
+    MAIN_HEALTH_SUMMARY="UNREADABLE — 'gh api .../status' failed for '$ref' ($sha): the surface was only half read"
+    return 0
+  fi
+  py_out="$("$PYTHON_BIN" -c 'import json, sys
+RED_CONC = {"failure", "timed_out", "action_required", "startup_failure"}
+RED_STATE = {"failure", "error"}
+
+def docs(path):
+    try:
+        raw = open(path, "r", encoding="utf-8", errors="replace").read()
+    except OSError:
+        raise SystemExit(2)
+    dec = json.JSONDecoder()
+    out = []
+    i = 0
+    while i < len(raw):
+        while i < len(raw) and raw[i] in " \t\r\n":
+            i += 1
+        if i >= len(raw):
+            break
+        try:
+            obj, i = dec.raw_decode(raw, i)
+        except ValueError:
+            raise SystemExit(2)
+        out.append(obj)
+    return out
+
+cr_runs = []
+for d in docs(sys.argv[1]):
+    if isinstance(d, dict) and isinstance(d.get("check_runs"), list):
+        cr_runs.extend(x for x in d["check_runs"] if isinstance(x, dict))
+
+# THE LATEST CHECK RUN PER (app, name) DECIDES - a re-run leaves the OLD
+# failing run in place beside the new one, so "any failure-like run" would
+# report a RED that GitHub itself reports green (see the header).
+best = {}
+for r in cr_runs:
+    name = str(r.get("name") or "")
+    if not name:
+        continue
+    app = str((r.get("app") or {}).get("slug") or "unknown")
+    try:
+        rid = int(r.get("id") or 0)
+    except (TypeError, ValueError):
+        rid = 0
+    key = (app, name)
+    if key not in best or rid > best[key][0]:
+        best[key] = (rid, name, app, str(r.get("status") or ""), str(r.get("conclusion") or ""), str(r.get("html_url") or ""))
+
+statuses = []
+for d in docs(sys.argv[2]):
+    if isinstance(d, dict) and isinstance(d.get("statuses"), list):
+        statuses.extend(x for x in d["statuses"] if isinstance(x, dict))
+
+# Legacy commit statuses: latest per context. NOTE the combined-status body
+# reports aggregate state "pending" when it carries ZERO statuses, so the
+# aggregate is NEVER read here - only the per-context entries.
+sbest = {}
+for s in statuses:
+    ctx = str(s.get("context") or "")
+    if not ctx:
+        continue
+    stamp = str(s.get("updated_at") or s.get("created_at") or "")
+    if ctx not in sbest or stamp > sbest[ctx][0]:
+        sbest[ctx] = (stamp, ctx, str(s.get("state") or ""), str(s.get("target_url") or ""))
+
+reds = []
+pend = []
+for _, name, app, status, concl, url in best.values():
+    if status != "completed":
+        pend.append((name, app))
+    elif concl in RED_CONC:
+        reds.append((name, app, concl, url))
+for _, ctx, state, url in sbest.values():
+    if state in RED_STATE:
+        reds.append((ctx, "commit-status", state, url))
+    elif state == "pending":
+        pend.append((ctx, "commit-status"))
+
+total = len(best) + len(sbest)
+for name, app, concl, url in reds:
+    sys.stdout.write("RED\t%s\t%s\t%s\t%s\n" % (name, app, concl, url))
+for name, app in pend:
+    sys.stdout.write("PENDING\t%s\t%s\n" % (name, app))
+sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), total - len(reds) - len(pend)))' \
+    "$cr_json" "$st_json" 2>/dev/null)"
+  rc=$?
+  rm -f "$cr_json" "$st_json"
+  if [ "$rc" -ne 0 ] || [ -z "$py_out" ]; then
+    MAIN_HEALTH_STATUS="unreadable"
+    MAIN_HEALTH_SUMMARY="UNREADABLE — the check surface for '$ref' ($sha) could not be parsed"
+    return 0
+  fi
+  # Resolve every failing check's EVENT — from ONE bounded `gh run list`. Only
+  # fetched when a red actually exists, so the green path costs no extra call. A
+  # failure here leaves the map empty, and an unresolved red BLOCKS (below):
+  # failing to classify a red is not a reason to ignore it. (A HERE-STRING, not a
+  # pipe into `grep -q`: on a large enough payload the writer takes SIGPIPE under
+  # `pipefail` and `grep -q` reports "not found" for a match that is present —
+  # #841, and scripts/check-no-sigpipe-grep.sh enforces it.)
+  map_file=""
+  if grep -q '^RED' <<< "$py_out"; then
+    map_file="$(mktemp "${TMPDIR:-/tmp}/admin-merge-runmap.XXXXXX")"
+    # shellcheck disable=SC2086
+    $GH run list --branch "$ref" --limit "$MAIN_HEALTH_RUN_MAP_LIMIT" \
+      ${repo_args[@]+"${repo_args[@]}"} \
+      --json databaseId,event,workflowName \
+      --jq '.[] | "\(.databaseId)\t\(.event)\t\(.workflowName)"' \
+      > "$map_file" 2>/dev/null || true
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      COUNTS$'\t'*)
+        IFS=$'\t' read -r tag MAIN_HEALTH_TOTAL _ MAIN_HEALTH_PENDING ok_rest <<< "$line"
+        ;;
+      RED$'\t'*)
+        IFS=$'\t' read -r tag job app concl url <<< "$line"
+        # WHICH EVENT PRODUCED THIS CHECK? A red on a `schedule`/`issues` lane
+        # measures no revision, and blocking on it would refuse every merge (see
+        # MAIN_HEALTH_RUN_MAP_LIMIT). The run id is in the check run's own URL.
+        run_id="$(printf '%s' "$url" | sed -n 's#.*/runs/\([0-9][0-9]*\).*#\1#p' | head -1)"
+        wf=""; ev=""
+        if [ -n "$run_id" ] && [ -s "$map_file" ]; then
+          ev="$(awk -F'\t' -v id="$run_id" '$1 == id { print $2; exit }' "$map_file")"
+          wf="$(awk -F'\t' -v id="$run_id" '$1 == id { print $3; exit }' "$map_file")"
+        fi
+        [ -n "$wf" ] || wf="(workflow unresolved)"
+        case "$ev" in
+          schedule|issues|issue_comment)
+            [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
+            MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl} — NOT a code measurement, so NOT blocking — ${url}"
+            other=$((other + 1))
+            ;;
+          *)
+            [ -n "$MAIN_HEALTH_REDS" ] && MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}"$'\n'
+            if [ -n "$ev" ]; then
+              MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl} — ${url}"
+            else
+              MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — ${concl} — ${url}"
+            fi
+            blocking=$((blocking + 1))
+            ;;
+        esac
+        ;;
+    esac
+  done <<< "$py_out"
+  [ -n "$map_file" ] && rm -f "$map_file"
+  if ! counter_is_number "$MAIN_HEALTH_TOTAL"; then
+    MAIN_HEALTH_STATUS="unreadable"
+    MAIN_HEALTH_SUMMARY="UNREADABLE — the check surface for '$ref' ($sha) produced unreadable counters"
+    return 0
+  fi
+  # MAIN_HEALTH_RED is the BLOCKING count (code-measuring events), not the raw
+  # red count: the raw count would refuse on a failing cron lane.
+  MAIN_HEALTH_RED="$blocking"
+  MAIN_HEALTH_RED_OTHER="$other"
+  if [ "$MAIN_HEALTH_TOTAL" -eq 0 ]; then
+    MAIN_HEALTH_STATUS="unmeasured"
+    MAIN_HEALTH_SUMMARY="UNMEASURED — 0 check runs and 0 commit statuses are attached to '$ref' ($sha): main's checks may not have started, so this certifies NOTHING about the tree"
+    return 0
+  fi
+  if [ "$MAIN_HEALTH_RED" -gt 0 ]; then
+    MAIN_HEALTH_STATUS="red"
+    MAIN_HEALTH_SUMMARY="RED — $MAIN_HEALTH_RED code-measuring check(s) FAIL on '$ref' ($sha) (of $MAIN_HEALTH_TOTAL measured, pending $MAIN_HEALTH_PENDING)"
+  else
+    MAIN_HEALTH_STATUS="green"
+    MAIN_HEALTH_SUMMARY="GREEN — no code-measuring check fails among $MAIN_HEALTH_TOTAL check(s) on '$ref' ($sha) (pending $MAIN_HEALTH_PENDING)"
+  fi
+  if [ "$other" -gt 0 ]; then
+    MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $other further red check(s) on NON-code events (schedule/issues) — reported, not blocking"
+  fi
+  return 0
 }
 
 # wait_for_run <run-id> — poll until the run is `completed`.
@@ -1318,6 +1649,70 @@ main() {
     exit 1
   fi
 
+  # ── 2c. IS THE TREE THIS PR MERGES ONTO GREEN? (#1261) ───────────────────
+  # Steps 1-2b are LANE-SCOPED: they answer "did this PR introduce a failure in
+  # the one workflow I watch?". A red main on any OTHER workflow is invisible to
+  # that question — and the vacuous branch below then merges, because both
+  # failing sets are empty. That is not a wording problem; it is a false PASS at
+  # the merge level, and it happened twice in one day (#4589's ruff violations,
+  # then #4600 on top of them). See the header for the source and the
+  # classification, and `main_health_probe` for the measurement.
+  #
+  # ORDER. This sits AFTER main's lane baseline has been measured, so a lane that
+  # never TESTED main still reports THAT fault (step 2b) rather than being blamed
+  # on main's redness — and BEFORE the exemption decision, the flake re-run and
+  # any evidence, so a doomed merge never mutates the PR's CI or posts a marker.
+  #
+  # The probe REFUSES on red, REFUSES on unreadable (the rail failing to look is
+  # never a green), and PROCEEDS on unmeasured (a fresh head's checks have not
+  # started — refusing there would block the common case), always stating which
+  # of the three it found.
+  local base_ref
+  base_ref="$(resolve_base_ref "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+  [ -n "$base_ref" ] || base_ref="main"
+  main_health_probe "$base_ref"
+  case "$MAIN_HEALTH_STATUS" in
+    green)
+      info "admin-merge: main tree ${MAIN_HEALTH_SUMMARY}" ;;
+    unmeasured)
+      info "admin-merge: ⚠️  main tree ${MAIN_HEALTH_SUMMARY}" ;;
+    red)
+      say_err "admin-merge: ✗ BLOCK — MAIN IS RED: the tree this PR merges ONTO is already failing."
+      say_err "   $MAIN_HEALTH_SUMMARY"
+      say_err "   Every CODE-MEASURING check failing on main's head — every workflow and app, NOT only the watched lane '$lane':"
+      printf '%s\n' "$MAIN_HEALTH_REDS" >&2
+      if [ -n "$MAIN_HEALTH_REDS_OTHER" ]; then
+        say_err "   (Also red, but on NON-code lanes — reported for completeness, NOT blocking:)"
+        printf '%s\n' "$MAIN_HEALTH_REDS_OTHER" >&2
+      fi
+      say_err "   Main's health is read from the CHECK RUNS AND COMMIT STATUSES ATTACHED TO"
+      say_err "   MAIN'S HEAD COMMIT because the lane comparison this rail makes cannot see a"
+      say_err "   failure outside its lane. Merging onto a red main ratchets the tree redder and"
+      say_err "   makes every open PR's merge ref fail — that is exactly how #1261 merged two PRs"
+      say_err "   onto a red main (a ruff violation in a file neither diff touched)."
+      say_err "   Remedy: repair main, then re-run the rail. This is NOT this PR's fault and NOT a"
+      say_err "   lane-failure verdict — nothing about the PR was compared, and no evidence was"
+      say_err "   posted. If this PR IS the repair, land it deliberately with the audited enforcer"
+      say_err "   override (AGENT_ADMIN_MERGE_OVERRIDE=1) — do not weaken this gate."
+      exit 1 ;;
+    unreadable)
+      say_err "admin-merge: ✗ BLOCK — main's check surface could NOT be read, so the rail cannot"
+      say_err "   show the tree it is merging onto is green."
+      say_err "   $MAIN_HEALTH_SUMMARY"
+      say_err "   A probe that FAILED is not a green tree: this rail merges with --admin, and"
+      say_err "   certifying a merge it never measured is the #1261 false PASS. Check gh"
+      say_err "   auth/network (and --repo), then re-run. No evidence was posted."
+      exit 1 ;;
+    *)
+      # The probe sets a state on EVERY path, so an unrecognised one means the
+      # state was LOST between the probe and here. Fail closed: a rail that
+      # cannot say whether it looked must not certify.
+      say_err "admin-merge: ✗ BLOCK — the main-health probe returned an unrecognised state"
+      say_err "   ('${MAIN_HEALTH_STATUS:-<empty>}'), so the rail cannot report on the tree it is"
+      say_err "   merging onto. No evidence was posted."
+      exit 1 ;;
+  esac
+
   # ── 3. THE EXEMPTION DECISION (one implementation, two consumers) ────────
   # No `comm -23`: membership in main's sample is not evidence that a failure
   # pre-exists, and the more main flakes the less the subtraction checks. The
@@ -1498,15 +1893,34 @@ main() {
   # makes an empty failing set mean "tested and green" rather than "never ran".
   analyzed="$analyzed
 Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tested=$(report_value "$TMP/pr-report.txt" tested) pending=$(report_value "$TMP/pr-report.txt" pending) | main completed=$(report_value "$TMP/main-report.txt" completed) tested=$(report_value "$TMP/main-report.txt" tested) pending=$(report_value "$TMP/main-report.txt" pending)"
+  # THE TREE'S HEALTH, not just the lane's (#1261). Step 2c measured it; this is
+  # where it becomes part of the auditable record, so a reviewer can tell "main's
+  # LANE is green" from "main's TREE is green" without re-running anything.
+  local health_line
+  health_line="Main check surface (every workflow and app on main's head): ${MAIN_HEALTH_SUMMARY}"
+  analyzed="$analyzed
+$health_line"
 
   # A vacuous comparison is STATED, never implied. Both sides empty is usually a
   # correct outcome (the lane is green on both sides) — but it is also exactly
   # what a WRONG lane selector looks like, so the two must be distinguishable by
   # a reader of the evidence. See the bogus-zero trap in ci-failure-set.sh.
+  #
+  # #1261 — AND THE MESSAGE MUST SAY WHICH SET WAS MEASURED AND WHY IT IS EMPTY.
+  # "no failing runs" and "I did not look" are different facts, and the old line
+  # ("nothing was compared") left both behind one glyph. A failing run whose log
+  # yielded no parseable 'FAILED <nodeid>' line already BLOCKS on the PR side
+  # (step 1c), and a lane that never TESTED main already BLOCKS (step 2b) — so an
+  # empty set HERE is one of exactly two things, and each is named per side.
   if [ "$pr_count" -eq 0 ] && [ "$main_count" -eq 0 ]; then
     analyzed="$analyzed
-⚠️ vacuous comparison: no failing runs were observed on EITHER side, so nothing was actually compared. Correct when the lane is green on both sides — but if the lane selector is wrong (--workflow), this certifies nothing."
-    info "admin-merge: ⚠️  vacuous comparison — no failing runs on either side; nothing was compared (lane: $lane)"
+⚠️ vacuous comparison — no failure was compared, because NEITHER measured set carried one.
+   measured sets: PR failing runs=0 | main failing runs=0 (lane: $lane)
+   PR side: ${pr_examined:-0} failing run(s) of ${pr_completed:-0} completed / ${pr_tested:-0} tested for head $head (${pr_pending:-0} pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable 'FAILED <nodeid>' line would have BLOCKED at step 1c, not read as zero.
+   main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b).
+   main check surface: $MAIN_HEALTH_STATUS — $MAIN_HEALTH_RED failing of $MAIN_HEALTH_TOTAL measured, $MAIN_HEALTH_PENDING pending; read across EVERY workflow, not just this lane.
+   Correct when the lane is green on both sides — but if the lane selector (--workflow '$lane') is wrong this certifies nothing. The per-side counters above are what tell 'green' from 'never run'."
+    info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lane: $lane); main check surface: $MAIN_HEALTH_STATUS ($MAIN_HEALTH_RED failing of $MAIN_HEALTH_TOTAL measured)"
   fi
 
   info "admin-merge: PR failing: $pr_count | main failing: $main_count | blocked by the decision: 0"
