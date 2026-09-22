@@ -2,7 +2,7 @@
 // pi-patches manifest generator — derives scripts/pi-patches/manifests/<version>/manifest.json
 // from the INSTALLED pi tree, so the `find` strings are byte-exact for that version.
 //
-// This set carries two changes:
+// This set carries three changes:
 //   (b) the clamp output floor (#1214) — never ask for a single token.
 //   (d) the summarization budget floor (#1263) — never ask the update prompt to preserve more
 //       than it can emit. The update prompt instructs the model to PRESERVE the entire previous
@@ -11,6 +11,15 @@
 //       is applied ONLY when a previous summary exists, so the initial-summary budget is
 //       unchanged; it covers three copies (the ESM, and both inlined copies in the bundle chunk
 //       the CLI loads).
+//   (e) the summarization clamp exemption (#1316) — never let the shared
+//       clampMaxTokensToContext reduce the summarization budget. The summarization prompt IS the
+//       conversation being summarized, so it is large by construction; the clamp would cut the
+//       budget to what fits the window, below the summary the model is told to preserve — the
+//       same (d) failure reached through a different binding constraint. The caller marks the
+//       request in createSummarizationOptions and buildBaseOptions exempts ONLY that marker; a
+//       normal turn carries no marker and stays clamped. When the prompt cannot fit the window
+//       at all, buildBaseOptions throws an explicit error naming the prompt size and the window,
+//       instead of letting the provider truncate the generation into a discarded summary.
 // Change (c) (bounding the overflow-recovery latch in agent-session.js) is deliberately NOT in
 // this set: it contradicts four upstream tests that encode a one-shot recovery design, and (b)
 // alone closes the silent death because with a usable floor the 1-token turn cannot occur.
@@ -151,6 +160,135 @@ const SUMMARIZATION_BUDGET_REQUEST_FIND =
 const SUMMARIZATION_BUDGET_REQUEST_REPLACE =
 	"previousSummary,thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY,summaryCap=Math.min(Math.floor(.8*reserveTokens),modelCeiling),priorTokens=previousSummary?Math.ceil(previousSummary.length/2):0,maxTokens=previousSummary?Math.max(summaryCap,Math.min(priorTokens+4096,modelCeiling)):summaryCap";
 
+// ---- (e) the summarization clamp exemption (#1316) -----------------------------------------
+// The summarization request is the other half of #1263. Its prompt is the serialized conversation
+// — the thing being summarized — so it is large by construction. `clampMaxTokensToContext`
+// (patched by (b) so it never returns 1) computes `available = contextWindow - promptTokens -
+// 4096` and cuts the budget to it. As the prompt approaches the window, `available` falls below
+// the summary the update prompt is told to PRESERVE, so the generation hits the cap, comes back
+// stopReason "length", and getSummarizationFailure() discards it — the (d) failure again, through
+// the clamp. The fix is two-sided and lives at ONE seam:
+//   * createSummarizationOptions (the shared choke point for every summarization call, in
+//     compaction.js) marks the request;
+//   * buildBaseOptions (pi-ai, reached by every provider adapter) honours the marker, and throws
+//     an explicit error naming the prompt size and the window when the prompt cannot fit at all.
+//   * the anthropic-messages and bedrock adapters clamp a SECOND time in streamSimple, for the
+//     budget-based thinking branch, AFTER buildBaseOptions — so those re-clamp sites carry the
+//     same marker gate, or the exemption is undone for every reasoning model on those APIs.
+// The marker is what makes the exemption caller-scoped: a normal turn's options never carry it, so
+// the shared clamp still cuts every other caller.
+const SUMMARIZATION_CLAMP_ESM_FIND =
+	"function createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId) {\n    const options = { maxTokens, signal, apiKey, headers, env, sessionId };";
+
+const SUMMARIZATION_CLAMP_ESM_REPLACE = [
+	"function createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId) {",
+	"    // pi-patch #1316(e): mark the summarization request so buildBaseOptions exempts it from the",
+	"    // shared output-budget clamp. The summarization prompt IS the conversation being summarized,",
+	"    // so it is large by construction; the clamp assumes a normal turn's leaf context and would",
+	"    // cut this budget below the summary the model is told to PRESERVE. That is the #1263(d)",
+	"    // failure reached through a different binding constraint. The budget is already bounded by",
+	"    // the model ceiling and by the preserved summary's own size, and the exemption is scoped to",
+	"    // this caller alone: a normal turn carries no marker and stays clamped.",
+	"    const options = { maxTokens, signal, apiKey, headers, env, sessionId, skipContextClamp: true };",
+].join("\n");
+
+// The bundle copy is minified. Same marker, same scope: only this function sets it.
+const SUMMARIZATION_CLAMP_BUNDLE_FIND =
+	"function createSummarizationOptions(model,maxTokens,apiKey,headers,env2,signal,thinkingLevel,sessionId){let options={maxTokens,signal,apiKey,headers,env:env2,sessionId};";
+
+const SUMMARIZATION_CLAMP_BUNDLE_REPLACE =
+	"function createSummarizationOptions(model,maxTokens,apiKey,headers,env2,signal,thinkingLevel,sessionId){/*pi-patch:#1316(e)*/let options={maxTokens,signal,apiKey,headers,env:env2,sessionId,skipContextClamp:!0};";
+
+// The honouring side. `buildBaseOptions` is the shared choke point every provider adapter calls
+// (~10 call sites); the exemption is gated on the marker set above, so none of those call sites
+// changes and a normal turn is bit-for-bit unaffected. When the marker IS set and the prompt
+// cannot fit the window, fail loudly with the sizes and a message that is explicitly NOT the
+// token-cap truncation error `getSummarizationFailure()` produces.
+const CLAMP_EXEMPTION_ESM_FIND = [
+	"export function buildBaseOptions(model, context, options, apiKey) {",
+	"    const samplingParams = model.samplingParams || options?.samplingParams",
+	"        ? { ...model.samplingParams, ...options?.samplingParams }",
+	"        : undefined;",
+	"    return {",
+	"        temperature: options?.temperature,",
+	"        samplingParams,",
+	"        maxTokens: clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens),",
+].join("\n");
+
+const CLAMP_EXEMPTION_ESM_REPLACE = [
+	"function summarizationMaxTokens(model, context, maxTokens) {",
+	"    // pi-patch #1316(e): the summarization request is exempt from clampMaxTokensToContext. Its",
+	"    // prompt is the conversation being summarized, so it is large by construction; the clamp",
+	"    // would cut the output budget to what fits the window, below the summary the model is told",
+	"    // to PRESERVE. The budget is already bounded by the model ceiling and by that summary. If",
+	"    // the prompt cannot fit the window at all, fail LOUDLY here and name the sizes — never let",
+	"    // the provider truncate the generation into a summary getSummarizationFailure() throws away.",
+	"    // This is NOT the token-cap error, and it is reachable only for the marked caller.",
+	"    if (model.contextWindow > 0) {",
+	"        const promptTokens = estimateContextTokens(context).tokens;",
+	"        if (promptTokens + CONTEXT_SAFETY_TOKENS >= model.contextWindow)",
+	"            throw new Error(`Summarization prompt does not fit the model context window: prompt ~${promptTokens} tokens against a ${model.contextWindow}-token window (safety reserve ${CONTEXT_SAFETY_TOKENS}). This is NOT the \"generation hit the token cap\" truncation and the output budget was not clamped: the prompt itself must shrink before compaction can run.`);",
+	"    }",
+	"    return Math.max(MIN_MAX_TOKENS, maxTokens);",
+	"}",
+	"export function buildBaseOptions(model, context, options, apiKey) {",
+	"    const samplingParams = model.samplingParams || options?.samplingParams",
+	"        ? { ...model.samplingParams, ...options?.samplingParams }",
+	"        : undefined;",
+	"    return {",
+	"        temperature: options?.temperature,",
+	"        samplingParams,",
+	"        maxTokens: options?.skipContextClamp",
+	"            ? summarizationMaxTokens(model, context, options?.maxTokens ?? model.maxTokens)",
+	"            : clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens),",
+].join("\n");
+
+const CLAMP_EXEMPTION_BUNDLE_FIND =
+	"function buildBaseOptions(model,context,options,apiKey){let samplingParams=model.samplingParams||options?.samplingParams?{...model.samplingParams,...options?.samplingParams}:void 0;return{temperature:options?.temperature,samplingParams,maxTokens:clampMaxTokensToContext(model,context,options?.maxTokens??model.maxTokens),";
+
+const CLAMP_EXEMPTION_BUNDLE_REPLACE =
+	'function summarizationMaxTokens(model,context,maxTokens){/*pi-patch:#1316(e)*/if(model.contextWindow>0){let promptTokens=estimateContextTokens(context).tokens;if(promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow)throw new Error(`Summarization prompt does not fit the model context window: prompt ~${promptTokens} tokens against a ${model.contextWindow}-token window (safety reserve ${CONTEXT_SAFETY_TOKENS}). This is NOT the "generation hit the token cap" truncation and the output budget was not clamped: the prompt itself must shrink before compaction can run.`)}return Math.max(MIN_MAX_TOKENS,maxTokens)}function buildBaseOptions(model,context,options,apiKey){let samplingParams=model.samplingParams||options?.samplingParams?{...model.samplingParams,...options?.samplingParams}:void 0;return{temperature:options?.temperature,samplingParams,maxTokens:options?.skipContextClamp?summarizationMaxTokens(model,context,options?.maxTokens??model.maxTokens):clampMaxTokensToContext(model,context,options?.maxTokens??model.maxTokens),';
+
+// The anthropic-messages and bedrock adapters clamp a SECOND time inside their own streamSimple,
+// for the budget-based thinking branch, AFTER buildBaseOptions has already run. This is reachable
+// for a summarization request whenever the model reasons and the session thinking level is on:
+// createSummarizationOptions sets `options.reasoning`, so the adapter computes
+// `adjusted = adjustMaxTokensForThinking(base.maxTokens, ...)` and then re-clamps it. Without the
+// same marker gate here the exemption would be silently undone for every reasoning model on these
+// APIs — the provider adapter's clamp, not the shared one, would bind. Both ESM copies and both
+// inlined bundle copies are carried, and the unmarked (normal-turn) arm keeps the clamp verbatim.
+const RECLAMP_ANTHROPIC_ESM_FIND = [
+	"    const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);",
+	"    const maxTokens = clampMaxTokensToContext(model, context, adjusted.maxTokens);",
+].join("\n");
+
+const RECLAMP_ANTHROPIC_ESM_REPLACE = [
+	"    const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);",
+	"    // pi-patch #1316(e): the provider adapter clamps AGAIN, after buildBaseOptions, for the",
+	"    // budget-based thinking branch. The same marker gate as buildBaseOptions, or the summarization",
+	"    // exemption is undone here for every reasoning model on this API.",
+	"    const maxTokens = options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens);",
+].join("\n");
+
+const RECLAMP_BEDROCK_ESM_FIND = [
+	"        const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);",
+	"        const maxTokens = clampMaxTokensToContext(model, context, adjusted.maxTokens);",
+].join("\n");
+
+const RECLAMP_BEDROCK_ESM_REPLACE = [
+	"        const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);",
+	"        // pi-patch #1316(e): same second-clamp gate as anthropic-messages — see that entry.",
+	"        const maxTokens = options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens);",
+].join("\n");
+
+// Minified bundle form. The statement is the tail of a `let {…}=options, … ,maxTokens=…;return`
+// chain, so the marker comment sits after the comma and the replacement stays one expression.
+const RECLAMP_BUNDLE_FIND =
+	",maxTokens=clampMaxTokensToContext(model,context,adjusted.maxTokens);return stream(model,context,{";
+
+const RECLAMP_BUNDLE_REPLACE =
+	",/*pi-patch:#1316(e)*/maxTokens=options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens);return stream(model,context,{";
+
 const entries = [
 	// (b) the clamp — one copy in the unbundled ESM, one inlined copy per bundle chunk.
 	{
@@ -207,6 +345,83 @@ const entries = [
 		replace: SUMMARIZATION_BUDGET_REQUEST_REPLACE,
 		verifyPresent: ["thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=", "maxTokens=previousSummary?Math.max(summaryCap"],
 	},
+	// (e) the summarization clamp exemption (#1316) — the caller marker (ESM + bundle) and the
+	// honouring side in every buildBaseOptions copy (pi-ai ESM, the shared bundle chunk, and
+	// bedrock's inlined copy).
+	{
+		id: "e1-summarization-clamp-esm",
+		change: "e",
+		file: "dist/core/compaction/compaction.js",
+		find: SUMMARIZATION_CLAMP_ESM_FIND,
+		replace: SUMMARIZATION_CLAMP_ESM_REPLACE,
+		verifyPresent: ["skipContextClamp: true", "sessionId, skipContextClamp: true };"],
+	},
+	{
+		id: "e2-summarization-clamp-bundle",
+		change: "e",
+		file: "dist/bundle/chunks/chunk-JVUZSMYM.js",
+		find: SUMMARIZATION_CLAMP_BUNDLE_FIND,
+		replace: SUMMARIZATION_CLAMP_BUNDLE_REPLACE,
+		verifyPresent: ["skipContextClamp:!0", "env:env2,sessionId,skipContextClamp:!0"],
+	},
+	{
+		id: "e3-clamp-exemption-esm",
+		change: "e",
+		file: "node_modules/@earendil-works/pi-ai/dist/api/simple-options.js",
+		find: CLAMP_EXEMPTION_ESM_FIND,
+		replace: CLAMP_EXEMPTION_ESM_REPLACE,
+		verifyPresent: ["? summarizationMaxTokens(model, context, options?.maxTokens", "promptTokens + CONTEXT_SAFETY_TOKENS >= model.contextWindow", "does not fit the model context window"],
+	},
+	{
+		id: "e4-clamp-exemption-bundle-http",
+		change: "e",
+		file: "dist/bundle/chunks/chunk-AXIIZGTV.js",
+		find: CLAMP_EXEMPTION_BUNDLE_FIND,
+		replace: CLAMP_EXEMPTION_BUNDLE_REPLACE,
+		verifyPresent: ["?summarizationMaxTokens(model,context,options?.maxTokens", "promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow", "does not fit the model context window"],
+	},
+	{
+		id: "e5-clamp-exemption-bundle-bedrock",
+		change: "e",
+		file: "dist/bundle/chunks/bedrock-converse-stream.js",
+		find: CLAMP_EXEMPTION_BUNDLE_FIND,
+		replace: CLAMP_EXEMPTION_BUNDLE_REPLACE,
+		verifyPresent: ["?summarizationMaxTokens(model,context,options?.maxTokens", "promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow", "does not fit the model context window"],
+	},
+	// (e) the provider adapters' SECOND clamp (budget-based thinking branch), which runs after
+	// buildBaseOptions. Same marker gate, or the exemption is undone for reasoning models.
+	{
+		id: "e6-reclamp-anthropic-esm",
+		change: "e",
+		file: "node_modules/@earendil-works/pi-ai/dist/api/anthropic-messages.js",
+		find: RECLAMP_ANTHROPIC_ESM_FIND,
+		replace: RECLAMP_ANTHROPIC_ESM_REPLACE,
+		verifyPresent: ["options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens)"],
+	},
+	{
+		id: "e7-reclamp-bedrock-esm",
+		change: "e",
+		file: "node_modules/@earendil-works/pi-ai/dist/api/bedrock-converse-stream.js",
+		find: RECLAMP_BEDROCK_ESM_FIND,
+		replace: RECLAMP_BEDROCK_ESM_REPLACE,
+		verifyPresent: ["options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens)"],
+	},
+	{
+		id: "e8-reclamp-anthropic-bundle",
+		change: "e",
+		file: "dist/bundle/chunks/anthropic-messages-VWZZOSJQ.js",
+		find: RECLAMP_BUNDLE_FIND,
+		replace: RECLAMP_BUNDLE_REPLACE,
+		verifyPresent: ["options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens)"],
+	},
+	{
+		id: "e9-reclamp-bedrock-bundle",
+		change: "e",
+		file: "dist/bundle/chunks/bedrock-converse-stream.js",
+		find: RECLAMP_BUNDLE_FIND,
+		replace: RECLAMP_BUNDLE_REPLACE,
+		verifyPresent: ["options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens)"],
+	},
 ];
 
 // Resolve every anchor against the installed tree; refuse to emit a manifest that does not match.
@@ -250,7 +465,7 @@ if (problems.length > 0) {
 
 const manifest = {
 	schema: 1,
-	issue: "#1214",
+	issue: "#1214, #1263, #1316",
 	writtenAgainst: { "pi-coding-agent": CODING_VERSION, "pi-ai": AI_VERSION },
 	note:
 		"Derived by scripts/pi-patches/make-manifest.mjs from the installed tree. Re-derive (do not hand-edit) after a pi upgrade, then re-run the verification suite.",

@@ -46,6 +46,12 @@ set -uo pipefail
 # python3 previously produced a PASS on an unparsed config).
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 required (stdlib only) — present on ubuntu-latest + macOS" >&2; exit 2; }
 
+# Repo root, resolved once. Defined here (not next to the retry constants below) because the
+# compaction-regime block further down READS the fleet regime floor out of two instrument scripts
+# under $ROOT — under `set -u` a use-before-assignment would make every run take the fail-closed
+# exit-2 path.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
 # #1213's 300K→700K dial (2026-09-18, PR #1226) is WITHDRAWN (2026-09-21):
 # the floor fix it was sequenced behind is deployed (pi-patch #1214(b),
 # `MIN_USABLE_MAX_TOKENS = 1024` — never clamp below a usable output budget),
@@ -55,6 +61,29 @@ command -v python3 >/dev/null 2>&1 || { echo "error: python3 required (stdlib on
 # (the floor fix is verified against the silent-death failure only, not every
 # failure the wider window covered).
 CLAMP=300000
+
+# The compaction trigger the truncation watcher and the cost report band on:
+#   FLEET_REGIME_TB = CLAMP − compaction.reserveTokens   (283,616 = 300,000 − 16,384)
+# The reserve is asserted as a DERIVED relation against this floor, not as a pinned literal: the
+# invariant is the CONFIGURATION GEOMETRY (the reserve must derive the trigger the instruments
+# band on), not the number 16384. The floor is READ FROM the instruments, never restated here — a
+# literal in this file would only prove the shell agrees with itself. The cost report's
+# `FLEET_REGIME_TB:-<n>` default and the watcher's clamp-bucket boundary are the two independent
+# statements of the floor; this guard requires them to AGREE, and requires settings.json's
+# reserveTokens to derive that shared floor. So: change the reserve without moving the floor (the
+# #1213/#1304 withdrawal moved 50000→16384, the trigger 250000→283616) and it fires, and change
+# ONE instrument without the other and it fires too.
+REGIME_TB_REPORT="$(sed -n 's/.*FLEET_REGIME_TB:-\([0-9][0-9]*\)}.*/\1/p' "$ROOT/scripts/fleet-cost-report.sh" 2>/dev/null | head -1)"
+REGIME_TB_WATCH="$(sed -n 's/.*if \([0-9][0-9]*\) <= tb <.*/\1/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null | head -1)"
+if [ -z "$REGIME_TB_REPORT" ] || [ -z "$REGIME_TB_WATCH" ]; then
+  echo "error: cannot read the fleet regime floor from scripts/fleet-cost-report.sh ($REGIME_TB_REPORT) / scripts/watch-truncation.sh ($REGIME_TB_WATCH) — the reserve cannot be asserted as a derived relation, so it must not read green" >&2
+  exit 2
+fi
+if [ "$REGIME_TB_REPORT" != "$REGIME_TB_WATCH" ]; then
+  echo "error: the fleet regime floor disagrees between the instruments: fleet-cost-report.sh says $REGIME_TB_REPORT, watch-truncation.sh says $REGIME_TB_WATCH — the reserve cannot derive a floor the instruments disagree on" >&2
+  exit 2
+fi
+FLEET_REGIME_TB="$REGIME_TB_REPORT"
 
 # ── retry/hang contract (#1088) — the bounded-retry window ────────────────
 # `retry.maxRetries` is an ATTEMPT budget with no wall-clock deadline in pi,
@@ -94,7 +123,6 @@ RETRY_MAX_BACKOFF_MS=60000
 RETRY_PROVIDER_TIMEOUT_MS=600000
 HANG_WINDOW_CEILING_MS=2700000
 WORST_WINDOW_CEILING_MS=5400000
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PATCH_SCRIPT="$ROOT/scripts/patch-pi-retry.sh"
 SHIPPED_DIR="$ROOT/pi-bootstrap/pi-config"
 LIVE_DIR="${HOME}/.pi/agent"
@@ -239,13 +267,14 @@ settings_violations() {
   python3 - "$1" "$2" "$HTTP_IDLE_TIMEOUT_MS" "$RETRY_MAX_RETRIES" \
     "$RETRY_BASE_DELAY_MS" "$RETRY_MAX_BACKOFF_MS" "$RETRY_PROVIDER_TIMEOUT_MS" \
     "$HANG_WINDOW_CEILING_MS" "$WORST_WINDOW_CEILING_MS" \
-    "$PATCH_CAP_RESOLVED" "$PATCH_CAP_WHY" <<'PYEOF'
+    "$PATCH_CAP_RESOLVED" "$PATCH_CAP_WHY" "$CLAMP" "$FLEET_REGIME_TB" <<'PYEOF'
 import json, re, sys
 
 path, patch_path = sys.argv[1], sys.argv[2]
 # The cap, RESOLVED by the shell that owns it (the resolver above) — never
 # parsed out of the assignment text. argv[10] = value or "", argv[11] = why.
 CAP_RESOLVED, CAP_WHY = sys.argv[10], sys.argv[11]
+CLAMP_VALUE, REGIME_TB = int(sys.argv[12]), int(sys.argv[13])
 (IDLE_EXPECTED, MR_EXPECTED, BASE_EXPECTED, CAP_EXPECTED,
  PROVIDER_EXPECTED, HANG_CEILING, WORST_CEILING) = map(int, sys.argv[3:10])
 
@@ -278,14 +307,28 @@ if not isinstance(d, dict):
 
 comp = d.get("compaction")
 if not isinstance(comp, dict):
-    issues.append("compaction.reserveTokens expected 16384, got 'missing'")
+    issues.append(f"compaction.reserveTokens expected (a positive integer deriving the {REGIME_TB} clamp trigger), got 'missing'")
     issues.append("compaction.keepRecentTokens expected 12000, got 'missing'")
     issues.append("compaction.enabled expected true, got 'missing'")
 else:
     if comp.get("enabled") is not True:
         issues.append(f"compaction.enabled expected true, got {q(comp.get('enabled'))}")
-    if comp.get("reserveTokens") != 16384:
-        issues.append(f"compaction.reserveTokens expected 16384, got {q(comp.get('reserveTokens'))}")
+    # DERIVED, not pinned: the reserve must derive the regime floor the truncation watcher and the
+    # cost report band on. A wrong reserve moves the trigger and is caught even though no literal
+    # is compared. A reserve that is merely a different valid-looking number (e.g. the withdrawn
+    # 50000) still fails, because its trigger (250000) is not the floor the instruments use.
+    reserve = comp.get("reserveTokens")
+    if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve <= 0:
+        issues.append(f"compaction.reserveTokens expected a positive integer deriving the {REGIME_TB} clamp trigger, got {q(reserve)}")
+    else:
+        trigger = CLAMP_VALUE - reserve
+        if trigger != REGIME_TB:
+            issues.append(
+                f"compaction.reserveTokens = {reserve} derives the clamp trigger {trigger} "
+                f"({CLAMP_VALUE} clamp − {reserve}), but the fleet regime floor is {REGIME_TB} "
+                f"(read from scripts/fleet-cost-report.sh / scripts/watch-truncation.sh) — "
+                f"the reserve and the regime band have drifted apart"
+            )
     if comp.get("keepRecentTokens") != 12000:
         issues.append(f"compaction.keepRecentTokens expected 12000, got {q(comp.get('keepRecentTokens'))}")
 
@@ -476,7 +519,7 @@ check_settings_file() {
       esac
     done <<< "$issues"
   else
-    ok "$label — compaction (enabled + 16384/12000) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
+    ok "$label — compaction (enabled + reserve/keep contract deriving the ${FLEET_REGIME_TB} trigger) + bounded retry contract (maxRetries ${RETRY_MAX_RETRIES}, idle ${HTTP_IDLE_TIMEOUT_MS}ms, backoff cap ${RETRY_MAX_BACKOFF_MS}ms → hung ${window_hung}ms / worst ${window_worst}ms)"
   fi
 }
 

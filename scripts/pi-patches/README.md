@@ -6,10 +6,10 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-18
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-1214, issue-1215, issue-1178, issue-1263
+aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-1214, issue-1215, issue-1178, issue-1263, issue-1316
 ---
 
-# pi patch set — the silent auto-compaction death (#1214, #1263)
+# pi patch set — the silent auto-compaction death (#1214, #1263, #1316)
 
 > **WRITTEN AGAINST `@earendil-works/pi-coding-agent` 0.85.1 / `@earendil-works/pi-ai` 0.85.1.**
 > **EXPIRY: any pi upgrade reverts `dist/` and this patch set stops being applied.** That is not
@@ -50,9 +50,10 @@ Two aggravating defects in `agent-session.js`:
 | **(a)** | Persist a failed compaction as a durable session entry | **extension-side only** — `extensions/compaction-watchdog.ts` (issue #1215, merged in `f082ec8`) | **already done, verified here** — see `tests/verify-a-durable-failure-record.mjs` |
 | **(b)** | Never clamp below a usable output floor | upstream source patch **+** `extensions/clamp-output-floor.ts` (upgrade-proof layer) | **new — the change this set originally carried** |
 | **(d)** | Floor the summarization budget at the size of the summary it must preserve | upstream source patch (the ESM copy + both inlined copies in the bundle chunk, #1263) | **new — added to this set** — see `tests/verify-summarization-budget-floor.mjs` |
+| **(e)** | Exempt the summarization request from `clampMaxTokensToContext`; fail loudly when the prompt cannot fit | upstream source patch (the caller marker in `compaction.js` + the honouring side in every `buildBaseOptions` copy, #1316) | **new — added to this set** — see `tests/verify-summarization-clamp-exemption.mjs` |
 
 (a) is verified by this set but lives entirely in the #1215 extension; the source patch set itself
-carries **(b) and (d)**.
+carries **(b), (d) and (e)**.
 
 **(a) is deliberately not re-implemented in the patch.** The #1215 watchdog already writes
 `pi.appendEntry("compaction-watchdog", …)` on `session_compact_failed`, plus a fleet log and an
@@ -151,10 +152,102 @@ a pristine tree and a patched tree in a temp dir (a copy of the installed `dist/
 `node_modules`), drives the real `generateSummaryWithUsage` with a stub `streamFn`, and asserts the
 budget **handed to the stream function** — the pre-clamp value, since the real clamp
 (`clampMaxTokensToContext`) runs later inside `buildBaseOptions` and this probe never exercises it
-(**gap 10**) — **13,107 unpatched → 32,135 patched** against the measured 56,077-char summary. The
+(**gap 10**, now closed by change (e)) — **13,107 unpatched → 32,135 patched** against the measured 56,077-char summary. The
 RED leg fails on the unpatched code by construction (it asserts the value is exactly the old cap and
 that the green assertion is false), so "no-repro → green" is impossible. The installed tree is never
 modified.
+
+### (e) the summarization clamp exemption (#1316)
+
+The other half of #1263, and the half (d) explicitly left open. Even with the budget
+floored at the summary it must preserve, the summarization request is still handed to the same
+`clampMaxTokensToContext` that (b) patched — and that clamp does not know the request is a
+summarization:
+
+```
+available = contextWindow − estimateContextTokens(serialized conversation) − CONTEXT_SAFETY_TOKENS
+```
+
+The summarization context **is** the serialized conversation, so it is large by construction. As it
+approaches the window, `available` falls below both the requested budget and (via the update prompt)
+the size of the summary that must be preserved — the **same** `stopReason: "length"` →
+`getSummarizationFailure()` → discarded-summary failure (d) fixed, reached through a different
+binding constraint. The clamp's starvation branch (`available < MIN_USABLE_MAX_TOKENS`) is the
+single-token death (b) closed for normal turns; for this caller a starved budget is not survivable
+at all, because the output cannot be smaller than the summary it must reproduce.
+
+**Measured margin, so this is a residual and not an urgent defect.** Reconstructed on the live
+failure (session `01a093d5`, 2026-09-21): the summarization prompt estimated **201,637** tokens
+against a 300,000-token window, so `available ≈ 94,267` against a requested **29,625** — the clamp
+only binds above ~266,000 prompt tokens (and reaches the 1024 floor near ~294,880). The mechanism
+is real but not casually reachable at the 300K window; the 2,000-char tool-result truncation in
+`serializeConversation` keeps the summarization input at ~67% of the turn's context.
+
+**The seam.** `clampMaxTokensToContext` is called from `buildBaseOptions`, which has ~10 call sites,
+so a blanket removal would exempt every normal turn — a regression. The exemption is therefore
+gated on a marker set at the one shared summarization choke point:
+
+- `createSummarizationOptions` (the single constructor every summarization call goes through —
+  `generateSummaryWithUsage` **and** `generateTurnPrefixSummary`) sets `skipContextClamp: true`;
+- `buildBaseOptions` honours the marker and, when the prompt cannot fit (`promptTokens +
+  CONTEXT_SAFETY_TOKENS >= contextWindow`, i.e. `available <= 0`), throws an explicit error naming
+  the prompt size and the window, distinguishable from the token-cap error. Otherwise it returns
+  the requested budget with no clamp at all.
+
+A normal turn's options never carry the marker, so the shared clamp is untouched for every other
+caller — asserted as a CONTROL rather than argued. The loud throw replaces a silently truncated
+generation with a message that says what actually happened and that it is *not* the cap error:
+
+```
+Summarization prompt does not fit the model context window: prompt ~297000 tokens against a
+300000-token window (safety reserve 4096). This is NOT the "generation hit the token cap"
+truncation and the output budget was not clamped: the prompt itself must shrink before compaction
+can run.
+```
+
+Note the trade, and why it is the safe direction: when `available` is positive but smaller than the
+requested budget (the starvation window), the request now goes out with its full budget and the
+provider either serves it or rejects it — **loud**, and already routed into pi's overflow path.
+That is the same reasoning as (b): an estimator that over-counts is not proof the request is too
+long, and refusing locally would fail a request the provider would have served. The one case that
+cannot be served — `available <= 0` — now fails locally with the sizes named, instead of spending a
+round-trip to get the same discarded 1024-token truncation.
+
+Carried in **five copies**: the caller marker in the compaction ESM and the inlined compaction copy
+in the bundle chunk, and the honouring side in all three `buildBaseOptions` copies (the pi-ai ESM,
+the shared bundle chunk, and bedrock's inlined copy). The bedrock payload is byte-identical to the
+shared chunk's.
+
+**A second clamp, in the provider adapters.** `buildBaseOptions` is not the only place the budget
+can be cut. The `anthropic-messages` and `bedrock-converse-stream` adapters clamp **again** inside
+their own `streamSimple` — `adjusted = adjustMaxTokensForThinking(base.maxTokens, …)` and then
+`clampMaxTokensToContext(model, context, adjusted.maxTokens)` — *after* `buildBaseOptions` has
+already run. That branch is reached whenever the model reasons and the session thinking level is on,
+which the summarization request satisfies (`createSummarizationOptions` sets `options.reasoning`
+when the model supports it). Without the same marker gate there, the exemption would be silently
+undone inside the adapter for every reasoning model on those two APIs — the adapter's clamp, not the
+shared one, would bind. All four re-clamp sites therefore carry the same gate: the two ESM copies
+and the two inlined bundle copies (the minified form is byte-identical in both bundle files).
+
+The change is proved by `tests/verify-summarization-clamp-exemption.mjs`, which is hermetic and
+drives the REAL caller in **both** representations (the pi-ai ESM and the bundle chunks the CLI
+loads). Its stub `streamFn` calls the REAL `buildBaseOptions` on a fabricated context whose
+`available` is **5,000** — below the requested **32,135** budget and above the 1,024 floor — and on a
+prompt that cannot fit at all. RED (pre-change): the request is clamped to 5,000 and the un-fittable
+prompt silently collapses to 1,024. GREEN (post-change): 32,135 and a loud throw. CONTROL (both
+trees, both representations): the same call with no marker is still clamped to 5,000 and still does
+not throw. For the adapter re-clamp the proof is **end-to-end on the request body**: the test drives
+the real `streamSimple` for `anthropic-messages`, again in both representations, with a registered
+reasoning model on a shrunk window and a stubbed `fetch`, and reads the `max_tokens` that actually
+lands in the request. Pre-change the marker is ignored (marked and unmarked both **5,904**);
+post-change it survives the adapter (marked **40,327** = budget + thinking budget, unmarked 5,904;
+normal turns identical across both trees). `bedrock-converse-stream` cannot be driven this way — it
+authenticates through the AWS SDK, not `fetch` — so its two re-clamp entries are proved by the same
+region-verbatim shape plus `node --check` discipline `apply.mjs` uses. The test builds its own trees,
+and — because change (e) patches a file **under `node_modules/`** — it copies
+`node_modules/@earendil-works/pi-ai` for real rather than symlinking `node_modules`: a symlinked
+`node_modules` made the false-PASS fixtures write straight through into the live install (reproduced
+on the first run of this test).
 
 ## Deliberately excluded — change (c): bounding overflow recovery
 
@@ -178,12 +271,13 @@ The rejected patch remains in git history for that future decision.
 scripts/pi-patches/
 ├── apply.sh                                  # the entrypoint — apply / --check / --revert
 ├── apply.mjs                                 # version pin, two-pass apply, verification, backups
-├── verify.sh                                 # re-runs ALL FIVE evidence classes in one command
+├── verify.sh                                 # re-runs ALL SIX evidence classes in one command
 ├── make-manifest.mjs                         # re-derives manifests/<version>/manifest.json
-├── manifests/0.85.1/manifest.json            # 6 byte-exact replacements (changes (b) + (d)) for the INSTALLED tree
+├── manifests/0.85.1/manifest.json            # 15 byte-exact replacements (changes (b) + (d) + (e)) for the INSTALLED tree
 ├── upstream/0001-pi-ai-never-clamp-below-a-usable-output-budget.patch   # change (b), source + test
 ├── tests/verify-a-durable-failure-record.mjs # change (a), end to end
 ├── tests/verify-summarization-budget-floor.mjs # change (d), pristine → patched max_tokens
+├── tests/verify-summarization-clamp-exemption.mjs # change (e), clamp exemption + normal-turn control + loud failure
 └── evidence/
     ├── 2026-09-18-b-only/                    # raw outputs of every claim in the Evidence section (the (b)-only revision, pre-(d))
     └── 2026-09-18/                           # earlier snapshot, captured while change (c) was still in the set
@@ -218,7 +312,7 @@ or hashing the whole tree before and after.
 
 ```bash
 bash scripts/pi-patches/apply.sh --check   # 0 = in place · 1 = ABSENT · 2 = broken checkout · 3 = drift
-bash scripts/pi-patches/verify.sh          # all five evidence classes, then ALL EVIDENCE HOLDS
+bash scripts/pi-patches/verify.sh          # all six evidence classes, then ALL EVIDENCE HOLDS
 ```
 
 If it exits `3`, the version moved. Re-derive, do not hand-edit:
@@ -229,6 +323,7 @@ node scripts/pi-patches/make-manifest.mjs          # writes manifests/<new versi
 bash scripts/pi-patches/apply.sh                   # applies + verifies
 NODE_ENV=test node scripts/pi-patches/tests/verify-a-durable-failure-record.mjs
 NODE_ENV=test node scripts/pi-patches/tests/verify-summarization-budget-floor.mjs
+NODE_ENV=test node scripts/pi-patches/tests/verify-summarization-clamp-exemption.mjs
 npx tsx extensions/clamp-output-floor.test.ts
 ```
 
@@ -322,7 +417,12 @@ Change **(d)** is covered by `tests/verify-summarization-budget-floor.mjs`, whic
 evidence on every run (the pristine→patched `maxTokens`, the shape of both trees, the patched files'
 `node --check` result, and the `apply.sh --check` output against a pristine tree). It is a live
 evidence class, not a stored capture, because it must re-prove the defect against whatever version is
-installed. It is run as section 5/5 of `verify.sh`.
+installed. It is run as section 5/6 of `verify.sh`.
+
+Change **(e)** is covered by `tests/verify-summarization-clamp-exemption.mjs`, also a live evidence
+class (section 6/6). It prints the RED/GREEN/control values for both representations, the loud-failure
+message, and the raw `apply.sh --check` output for the pre-change, marker-only and quoted-needle
+trees. It builds its own trees and never modifies the installed one.
 
 ## Known gaps — stated, not hidden
 
@@ -363,9 +463,30 @@ installed. It is run as section 5/5 of `verify.sh`.
    in `chunk-JVUZSMYM.js`, so `apply.mjs`'s unique-anchor resolver refuses it
    (`"ambiguous — remove the duplicate, or select one explicitly with PI_PATCH_VERSION"`). It needs
    its own entry with distinct surrounding context.
-10. **Change (d) leaves `clampMaxTokensToContext` applied to the summarization request.** It only
-    cuts when `contextWindow - estimateContextTokens(serialized prompt) - 4096 < budget`. Measured
-    on the live box the summarization context estimates **~193K tokens against a 300,000-token
-    window** — ~100K of margin — so it is not the binding constraint in this regime. Exempting the
-    summarization call from the clamp (the other half of #1263) requires patching `buildBaseOptions`
-    at ~10 call sites and is deliberately not in this set.
+10. **Change (e) throws locally when `available <= 0`, where (b) deliberately chose to let the
+    provider reject an over-long request.** The two are consistent (the (b) reasoning is about an
+    *estimator that over-counts*, not about a request that cannot fit by pi's own accounting), but
+    the trade is real: if pi's estimator over-counts a summarization prompt that the provider would
+    have served, (e) refuses it locally. The alternative — send it anyway and let the provider
+    decide — was rejected because a provider rejection at that point is already a failure of the
+    summarization, and the local error names the sizes, which the provider's does not. No measurement
+    establishes where pi's estimator diverges from a provider's own tokenizer on a summarization
+    prompt; the 1024-floor judgement (gap 6) is the only related measurement. The turn-prefix
+    summarization budget (gap 9) *does* get the (e) exemption and the (e) loud failure, because both
+    summarization callers share `createSummarizationOptions` and `buildBaseOptions`.
+11. **The (e) test must copy `node_modules/@earendil-works/pi-ai` rather than symlink
+    `node_modules`** (the (d) test symlinks it). Change (e) patches a file under `node_modules/`, so
+    a symlinked `node_modules` let the false-PASS fixtures write straight through into the live
+    install; the first run of this test corrupted the installed pi-ai ESM and it was restored from
+    the patch backup. The fixture is a temp tree, but the audit lesson is recorded here because the
+    failure mode is silent: `apply.sh --check` then read the live tree as "already applied".
+12. **The adapter re-clamp is not reachable in the current fleet — it is carried because the
+    manifest must be the whole fix, not the reachable half.** Every model this fleet serves
+    (`deepseek-flash`, the `openai-completions` API) takes the shared `buildBaseOptions` clamp and
+    never the anthropic/bedrock adapter branch, so the four (e6–e9) entries change nothing that runs
+    here today. They are carried (and gate-tested) because a patch set that fixes only the reachable
+    path silently undoes itself the first time a reasoning Anthropic or Bedrock model is enabled —
+    and because `apply.mjs` verifies every carried entry on every apply, so an entry that stops
+    matching is caught loudly rather than rotting. The behavioural proof of the two anthropic copies
+    runs against a **registered** model on a deliberately shrunk window (see the (e) section); no
+    claim is made that the shipped configuration exercises it.

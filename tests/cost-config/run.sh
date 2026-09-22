@@ -111,6 +111,11 @@ mkroot() {
   mkdir -p "$root/scripts" "$root/pi-bootstrap/pi-config"
   cp "$GUARD" "$root/scripts/check-cost-config.sh"
   cp "$ROOT/scripts/patch-pi-retry.sh" "$root/scripts/patch-pi-retry.sh"
+  # The guard READS the fleet regime floor from these two instruments (it is asserted as a derived
+  # relation, not a pinned literal), so they are part of the guard's input surface and the fixture
+  # root must carry them. Test 37 mutates one of them to prove the disagreement is caught.
+  cp "$ROOT/scripts/fleet-cost-report.sh" "$root/scripts/fleet-cost-report.sh"
+  cp "$ROOT/scripts/watch-truncation.sh" "$root/scripts/watch-truncation.sh"
   cp "$FIX/clean/models.json" "$FIX/clean/models-store.json" "$FIX/clean/settings.json" \
      "$root/pi-bootstrap/pi-config/"
 }
@@ -229,6 +234,11 @@ echo "10. missing SHIPPED models.json → BLOCK, exit 1 (clamp authority deleted
 TMP_ROOT="$(mktemp -d /tmp/cost-config-missing.XXXXXX)"
 mkdir -p "$TMP_ROOT/scripts"
 cp "$GUARD" "$TMP_ROOT/scripts/check-cost-config.sh"
+# The guard READS the fleet regime floor from these two instruments (#1316), so a root that omits
+# them is not a deployable shape — the guard would take its unreadable-floor exit-2 path before it
+# ever reaches the missing-models.json block. Carry them, as mkroot() does, so this test isolates
+# the missing-CLAMP-AUTHORITY arm it is named for.
+cp "$ROOT/scripts/fleet-cost-report.sh" "$ROOT/scripts/watch-truncation.sh" "$TMP_ROOT/scripts/"
 mkdir -p "$TMP_ROOT/pi-bootstrap/pi-config"
 cp "$FIX/missing-models/models-store.json" "$FIX/missing-models/settings.json" "$TMP_ROOT/pi-bootstrap/pi-config/"
 bash "$TMP_ROOT/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
@@ -1547,11 +1557,11 @@ echo ""
 # ── 35. the reserve expectation must fail closed on a WRONG VALUE, not just on
 #      a MISSING block. backdoor-settings' injected defect is the MISSING
 #      compaction block (the `not isinstance(comp, dict)` arm), so the
-#      wrong-value arm (`comp.get("reserveTokens") != 16384`) had no fixture at
-#      all. Both arms are settings-class, hence override-immune. (Added under
-#      #1213 when the expectation was 50000, then re-pointed to the restored
-#      16384 by the withdrawal — the COVERAGE is value-independent, which is
-#      exactly why it is kept rather than reverted.)
+#      wrong-value arm had no fixture at all. Both arms are settings-class,
+#      hence override-immune. The wrong-value arm is now a DERIVED relation
+#      (`CLAMP − reserveTokens == FLEET_REGIME_TB`), not a pinned literal, so
+#      50000 is caught because its trigger (250000) is not the regime floor —
+#      the coverage is value-independent, which is exactly why it is kept.
 echo "35. reserveTokens wrong value (block present) → BLOCK, and the override does not silence it"
 TMP35="$(mktemp -d /tmp/cost-config-reserve-value.XXXXXX)"
 mkroot "$TMP35"
@@ -1565,7 +1575,7 @@ PYEOF
 bash "$TMP35/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "reserveTokens=50000 (block present) → exit 1"; else fail "expected exit 1 for a wrong reserveTokens value, got $code"; sed -n '1,30p' "$OUT"; fi
-if grep -q "compaction.reserveTokens expected 16384, got 50000" "$OUT"; then pass "wrong-value message names the expected and actual value"; else fail "expected the wrong-value reserveTokens message"; sed -n '1,30p' "$OUT"; fi
+if grep -q "compaction.reserveTokens = 50000 derives the clamp trigger 250000" "$OUT"; then pass "wrong-value message names the derived trigger and the regime floor"; else fail "expected the derived reserveTokens message"; sed -n '1,30p' "$OUT"; fi
 COST_CLAMP_OVERRIDE=1 bash "$TMP35/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "wrong-value reserveTokens + override → still exit 1 (settings class is override-immune)"; else fail "expected exit 1 under the override, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1590,6 +1600,43 @@ code=$?
 if [ "$code" -eq 1 ]; then pass "unparseable models.json → exit 1 (fail-closed)"; else fail "expected exit 1 for an unparseable models.json, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "cannot assert the clamp on unparseable config" "$OUT"; then pass "the parse-failure block is explicit (not a silent skip)"; else fail "expected an explicit parse-failure block"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP36"
+
+echo ""
+# ── 37. the derived reserve relation must be anchored to the INSTRUMENTS, not to a
+#      second copy of the constant. The guard READS the regime floor from
+#      fleet-cost-report.sh (`FLEET_REGIME_TB:-<n>`) and watch-truncation.sh (its
+#      clamp-bucket boundary) and requires them to AGREE. Drift either one alone
+#      and the guard must refuse to certify a floor it can no longer derive —
+#      exit 2, not a green. (Added under #1316: without this, the “derived
+#      relation” would be tautological — two local constants, one comparison.)
+echo "37. instrument drift / unreadable floor → exit 2 (the derived relation is instrument-anchored)"
+TMP37="$(mktemp -d /tmp/cost-config-regime-drift.XXXXXX)"
+mkroot "$TMP37"
+# (a) the two instruments disagree with each other.
+sed -i.bak 's/FLEET_REGIME_TB:-283616/FLEET_REGIME_TB:-290000/' "$TMP37/scripts/fleet-cost-report.sh"
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "fleet-cost-report floor moved alone → exit 2"; else fail "expected exit 2 on instrument disagreement, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "regime floor disagrees between the instruments" "$OUT"; then pass "the disagreement names both instruments' values"; else fail "expected the instrument-disagreement message"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
+# (b) the watcher's boundary moved alone — the other direction.
+sed -i.bak 's/if 283616 <= tb < 650000/if 290000 <= tb < 650000/' "$TMP37/scripts/watch-truncation.sh"
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "watch-truncation floor moved alone → exit 2"; else fail "expected exit 2 on instrument disagreement, got $code"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (c) an instrument is missing entirely → the floor cannot be read → fail closed, not green.
+rm -f "$TMP37/scripts/fleet-cost-report.sh"
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "unreadable floor → exit 2 (fail-closed, never green)"; else fail "expected exit 2 on an unreadable floor, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "cannot read the fleet regime floor" "$OUT"; then pass "the unreadable-floor refusal is explicit"; else fail "expected an explicit unreadable-floor refusal"; sed -n '1,30p' "$OUT"; fi
+# (d) and with both instruments intact the SAME tree reads green on this relation.
+mkroot "$TMP37"
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "the pristine fixture root still reads green (the new checks are not blanket-failing)"; else fail "expected exit 0 on the pristine root, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP37"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"
