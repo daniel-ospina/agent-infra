@@ -71,6 +71,17 @@
 #      REFUSED when they are not positive integers; parser-only flags never reach
 #      gh; an unreadable run is not a stall; and the gh-command seam is word-split
 #      consistently with every other call site.
+#  20. MAIN'S TREE, NOT JUST THE WATCHED LANE (#1261). A lane-scoped comparison
+#      cannot see a red main on another workflow, so the vacuous branch merged
+#      onto one (a ruff violation reddened every open PR's merge ref, then two
+#      PRs merged on top). The rail now reads main's own check surface across
+#      every workflow and refuses a red tree — naming the job, the workflow and
+#      the run URL — while STILL merging a clean PR onto a clean main (the
+#      over-refusal guard). A superseded check run is not a red; a pending check
+#      is not a red; an empty surface is UNMEASURED (stated, not green); a probe
+#      that FAILED is a refusal; and a red on a non-code event (schedule/issues)
+#      is reported without blocking, because blocking on those would refuse every
+#      merge in a repo whose cron lanes are red most days.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -126,17 +137,24 @@ case "$key" in
     pr="${3:-}"
     # The draft probe is a DISTINCT question from the head resolutions: answer it
     # from its own fixture and never let it consume the head-seq sequence.
-    want_draft=0; want_head=0; jprev=""
+    want_draft=0; want_head=0; want_base=0; jprev=""
     for x in "$@"; do
       if [ "$jprev" = "--json" ]; then
         case "$x" in *isDraft*) want_draft=1 ;; esac
         case "$x" in *headRefOid*) want_head=1 ;; esac
+        case "$x" in *baseRefName*) want_base=1 ;; esac
       fi
       jprev="$x"
     done
     if [ "$want_draft" = 1 ] && [ "$want_head" = 0 ]; then
       [ -f "$SCEN/draft" ] && { cat "$SCEN/draft"; exit 0; }
       printf 'false\n'; exit 0
+    fi
+    # #1261: the PR's TARGET branch, for the main-health probe. Its own fixture
+    # (default `main`), and it must NOT consume the head-seq sequence either.
+    if [ "$want_base" = 1 ] && [ "$want_head" = 0 ] && [ "$want_draft" = 0 ]; then
+      [ -f "$SCEN/base-ref" ] && { cat "$SCEN/base-ref"; exit 0; }
+      printf 'main\n'; exit 0
     fi
     # head-seq models a PR head that MOVES between resolutions (a rebase landing
     # mid-run): the Nth `pr view` returns the Nth line.
@@ -174,6 +192,19 @@ case "$key" in
     # empty population → the shard's fail-safe governs (never the failure sample).
     if [ "$st" = "success" ]; then
       [ -f "$SCEN/green-runs" ] && cat "$SCEN/green-runs"
+      exit 0
+    fi
+    # #1261: the RUN MAP for main-health event resolution (`--json` carries
+    # `event`). Its OWN fixture, never the lane's runs-main projection — that is
+    # a different shape (`status\tconclusion\tsha:id`) and reusing it here would
+    # make the health probe read lane lines as a run map.
+    want_event=0; jp=""
+    for x in "$@"; do
+      [ "$jp" = "--json" ] && case "$x" in *event*) want_event=1 ;; esac
+      jp="$x"
+    done
+    if [ "$want_event" = 1 ]; then
+      [ -f "$SCEN/main-run-map" ] && cat "$SCEN/main-run-map"
       exit 0
     fi
     if [ "$mode" = "commit" ]; then f="$SCEN/runs-$val"; else f="$SCEN/runs-main"; fi
@@ -261,6 +292,24 @@ case "$key" in
     fi
     exit 0 ;;
   api*)
+    # ── #1261: MAIN'S TREE HEALTH. These three URLs are answered from their OWN
+    # fixtures and NEVER from the jobs fallback below — that fallback is a
+    # catch-all for the #1167 API seam, and letting a health call fall into it
+    # returned a jobs body as a check surface (a silent misread).
+    case "$a2" in
+      *"/check-runs"*)
+        [ -f "$SCEN/main-health-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+        if [ -f "$SCEN/main-check-runs.json" ]; then cat "$SCEN/main-check-runs.json"; exit 0; fi
+        printf '{"total_count":0,"check_runs":[]}\n'; exit 0 ;;
+      */"status")
+        [ -f "$SCEN/main-health-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+        if [ -f "$SCEN/main-statuses.json" ]; then cat "$SCEN/main-statuses.json"; exit 0; fi
+        printf '{"state":"pending","total_count":0,"statuses":[]}\n'; exit 0 ;;
+      */commits/*)
+        [ -f "$SCEN/main-health-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+        if [ -f "$SCEN/main-sha" ]; then cat "$SCEN/main-sha"; exit 0; fi
+        printf 'feedface0000000000000000000000000000000000\n'; exit 0 ;;
+    esac
     # The Jobs API seam for the per-shard ceiling derivation (#1167). The run id
     # is parsed out of the URL so a fixture is per-run; a bare `$SCEN/jobs.json`
     # serves every run. No fixture is an API error (never a small bound).
@@ -339,6 +388,46 @@ main_red_n() {  # <sha> <base-run-id> <n> <id>  -> lane-run lines on stdout
     log_failed "$id" > "$SCEN/log-$((base + i))"
     i=$((i + 1))
   done
+}
+
+# ── #1261 main-health fixtures ──────────────────────────────────────────
+# write_main_checks <check_run-json>... → $SCEN/main-check-runs.json (RAW, so the
+#   rail's own JSON reader is exercised). NO fixture means an EMPTY surface, i.e.
+#   the rail's UNMEASURED state — which is not a refusal.
+write_main_checks() {
+  local body="" one
+  for one in "$@"; do
+    [ -n "$body" ] && body="${body},"
+    body="${body}${one}"
+  done
+  printf '{"total_count":%s,"check_runs":[%s]}\n' "$#" "$body" > "$SCEN/main-check-runs.json"
+}
+
+# check_run <id> <job> <status> <conclusion> <run-id> → one check-run object. The
+#   run id is embedded in the run URL because that is where the rail resolves a
+#   check's EVENT from.
+check_run() {
+  printf '{"id":%s,"name":"%s","status":"%s","conclusion":"%s","app":{"slug":"github-actions"},"html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/%s/job/1"}' \
+    "$1" "$2" "$3" "$4" "$5"
+}
+
+# main_run_map <run-id> <event> <workflow-name>... → $SCEN/main-run-map, the
+#   `gh run list` projection the rail uses to resolve a red check's EVENT.
+main_run_map() {
+  : > "$SCEN/main-run-map"
+  while [ $# -ge 3 ]; do
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SCEN/main-run-map"
+    shift 3
+  done
+}
+
+# A main surface that is genuinely MEASURED AND GREEN (two successes), so the
+# "still merges" regression guard cannot pass on the UNMEASURED state by accident.
+main_green_surface() {
+  write_main_checks \
+    "$(check_run 4001 'test (a)' completed success 6101)" \
+    "$(check_run 4002 'test (b)' completed success 6101)"
+  main_run_map 6101 push 'Python CI'
 }
 
 # Shared comparison helper. The captures below go through this function rather
@@ -2684,6 +2773,207 @@ grep -q 'UNATTRIBUTABLE' "$TMP/err" && pass "…and the refusal is attributed UN
   || fail "the refusal does not name UNATTRIBUTABLE: $(grep -m3 'BLOCK\|UNATTRIBUTABLE' "$TMP/err" 2>/dev/null)"
 [ -f "$SCEN/comment" ] && fail "evidence was posted for a moving identity" || pass "no evidence comment"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted" || pass "no merge attempted"
+
+# ── 46. MAIN'S TREE IS MEASURED, NOT JUST THE WATCHED LANE (#1261) ──────────
+# The rail asked "did this PR introduce failures in the one workflow I watch?"
+# and never "is the tree I am merging ONTO green?". With the watched lane green
+# on BOTH sides the vacuous branch merged, so a red main on any OTHER workflow
+# was invisible: #4589 landed three ruff violations, every open PR's merge ref
+# went lint-red on a diff touching neither file, and #4600 merged on top of it.
+# These cases pin the fix in BOTH directions — refuse the red tree, and STILL
+# merge a clean PR onto a clean tree (the over-refusal guard).
+echo "== 46. main's TREE health, not just the watched lane (#1261) =="
+
+# (a) THE INCIDENT. The watched lane (python-ci.yml) is GREEN on both sides —
+# the exact vacuous shape — but main's own check surface carries a red `lint`
+# from a PUSH-triggered workflow. The rail must REFUSE, naming the job, the
+# workflow and the run URL.
+new_scen treehealth-red
+HEAD_TR="b0b0000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TR" > "$SCEN/head"
+lane_pass "$HEAD_TR" 5501 > "$SCEN/runs-$HEAD_TR"
+lane_pass maintr 5502 > "$SCEN/runs-main"
+write_main_checks \
+  "$(check_run 3001 lint completed failure 6601)" \
+  "$(check_run 3002 'test (a)' completed success 6601)"
+main_run_map 6601 push 'Post-merge validation'
+run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a main red on ANOTHER workflow BLOCKS (exit $rc)" \
+  || fail "the rail merged a PR whose tree is red on another workflow — the #1261 false PASS"
+grep -q "MAIN IS RED" "$TMP/err" && pass "…and the refusal is named MAIN IS RED" \
+  || fail "the refusal does not say main is red: $(sed -n '1,4p' "$TMP/err" 2>/dev/null)"
+grep -q "• lint — workflow 'Post-merge validation'" "$TMP/err" \
+  && pass "…naming the failing JOB (lint) and its WORKFLOW" \
+  || fail "the refusal does not name the failing job/workflow"
+grep -q "actions/runs/6601" "$TMP/err" && pass "…and the run URL" \
+  || fail "the refusal does not name the run URL"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a red main" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted onto a red main" || pass "no merge attempted"
+
+# (b) THE OVER-REFUSAL GUARD. A clean PR onto a MEASURED-GREEN main must still
+# MERGE. This is the case the fix must not break: it is the common one, and a
+# blunt refusal here would stop the whole fleet. The surface is populated with
+# successes so it cannot pass on the UNMEASURED state by accident.
+new_scen treehealth-green
+HEAD_TG="b1b1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TG" > "$SCEN/head"
+lane_pass "$HEAD_TG" 5511 > "$SCEN/runs-$HEAD_TG"
+lane_pass maingreen 5512 > "$SCEN/runs-main"
+main_green_surface
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a clean PR onto a measured-GREEN main still MERGES (the over-refusal guard)" \
+  || fail "the rail REFUSED a clean PR on a green main (exit $rc): $(sed -n '1,3p' "$TMP/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge actually happened" || fail "no merge was attempted"
+[ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+
+# (c) THE VACUOUS MESSAGE MUST SAY WHICH SET WAS MEASURED. "nothing is broken"
+# and "I did not look" are different facts and used to share one glyph.
+new_scen treehealth-vacuous
+HEAD_TV="b2b2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TV" > "$SCEN/head"
+lane_pass "$HEAD_TV" 5521 > "$SCEN/runs-$HEAD_TV"
+lane_pass mainvac 5522 > "$SCEN/runs-main"
+main_green_surface
+run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a lane green on both sides, onto a green main, stays certifiable" \
+  || fail "expected exit 0, got $rc"
+grep -q "measured sets: PR failing runs=0 | main failing runs=0" "$TMP/out" \
+  && pass "the vacuous message names BOTH measured sets" \
+  || fail "the vacuous message does not name the measured sets"
+grep -q "main check surface: green" "$TMP/out" \
+  && pass "…and states main's full check surface, not just the lane" \
+  || fail "the vacuous message omits main's check surface"
+grep -q "EMPTY because nothing FAILED" "$TMP/out" \
+  && pass "…and WHY the PR side is empty (green, not an unparsed FAILED line)" \
+  || fail "the vacuous message does not distinguish green from unparsed"
+grep -q "EMPTY because the lane is GREEN" "$TMP/out" \
+  && pass "…and why the main side is empty (a green window, not a missing lane)" \
+  || fail "the vacuous message does not distinguish a green window from a missing lane"
+
+# (d) A SUPERSEDED RUN IS NOT A RED. Re-running a failed check leaves the OLD
+# failing run in place beside the new one (tortoise fb27fff: ai-review-gate
+# failure id 106676366486 beside success id 106676728197). "Any failure-like
+# check run" would report a red GitHub itself calls green.
+new_scen treehealth-superseded
+HEAD_TS="b3b3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TS" > "$SCEN/head"
+lane_pass "$HEAD_TS" 5531 > "$SCEN/runs-$HEAD_TS"
+lane_pass mainsup 5532 > "$SCEN/runs-main"
+write_main_checks \
+  "$(check_run 3101 ai-review-gate completed failure 6701)" \
+  "$(check_run 3102 ai-review-gate completed success 6702)"
+main_run_map 6701 push ai-review-gate 6702 push ai-review-gate
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a red SUPERSEDED by a later green of the same check is not a red main" \
+  || fail "a superseded check run false-blocked the merge (exit $rc — the fb27fff shape)"
+
+# (e) AN UNREADABLE PROBE IS NOT A GREEN TREE. The rail merges with --admin, so
+# "I could not look" must never certify.
+new_scen treehealth-unreadable
+HEAD_TU="b4b4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TU" > "$SCEN/head"
+lane_pass "$HEAD_TU" 5541 > "$SCEN/runs-$HEAD_TU"
+lane_pass mainun 5542 > "$SCEN/runs-main"
+: > "$SCEN/main-health-unreadable"
+run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNREADABLE main surface BLOCKS (exit $rc)" \
+  || fail "a probe that failed was read as a green tree"
+grep -q "check surface could NOT be read" "$TMP/err" && pass "…and the refusal names the failed probe, actionably" \
+  || fail "the unreadable refusal is not named"
+[ -f "$SCEN/comment" ] && fail "evidence posted on an unreadable surface" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on an unreadable surface" || pass "no merge attempted"
+
+# (f) A CHECK STILL RUNNING IS NOT A RED. Main always has something in flight
+# after a merge; refusing on that would block the fleet every time.
+new_scen treehealth-pending
+HEAD_TP="b5b5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TP" > "$SCEN/head"
+lane_pass "$HEAD_TP" 5551 > "$SCEN/runs-$HEAD_TP"
+lane_pass mainpend 5552 > "$SCEN/runs-main"
+write_main_checks "$(check_run 3201 lint in_progress null 6801)"
+main_run_map 6801 push 'Post-merge validation'
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a main whose checks are still RUNNING is not a red main" \
+  || fail "a PENDING check on main blocked the merge (exit $rc)"
+grep -q "pending 1" "$TMP/out" && pass "…and the pending check is COUNTED in the evidence, not dropped" \
+  || fail "the pending count is not reported"
+
+# (g) AN EMPTY SURFACE IS UNMEASURED — stated, never silently green. Right after
+# a merge main's head has no checks YET, so refusing here would block the common
+# case; the lane-scoped half of "I did not look" is step 2b.
+new_scen treehealth-unmeasured
+HEAD_TN="b7b7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TN" > "$SCEN/head"
+lane_pass "$HEAD_TN" 5571 > "$SCEN/runs-$HEAD_TN"
+lane_pass mainnew 5572 > "$SCEN/runs-main"
+run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a fresh main head with NO checks is not a refusal" \
+  || fail "an empty check surface blocked the merge (exit $rc)"
+grep -q "UNMEASURED" "$TMP/out" && pass "…and the state is NAMED, not silently green" \
+  || fail "the empty surface is not named in the evidence"
+
+# (h) A NON-CODE RED IS REPORTED, NOT BLOCKING. Tortoise's main carries red
+# `schedule`/`issues` lanes (registry-backup-cron, finding-provenance) most days;
+# blocking on those would refuse every merge in that repo.
+new_scen treehealth-noncode
+HEAD_TC="b8b8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TC" > "$SCEN/head"
+lane_pass "$HEAD_TC" 5581 > "$SCEN/runs-$HEAD_TC"
+lane_pass maincron 5582 > "$SCEN/runs-main"
+write_main_checks "$(check_run 3301 backup completed failure 6901)"
+main_run_map 6901 schedule registry-backup-cron
+run_admin 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a red on a SCHEDULED lane does not block (it measures no revision)" \
+  || fail "a cron red blocked the merge — the blunt refusal that would stop the fleet"
+grep -q "NON-code events" "$TMP/out" && pass "…but it IS reported as a non-code red" \
+  || fail "the non-code red is SILENT — invisible is the defect class too"
+
+# (i) A RED LEGACY COMMIT STATUS BLOCKS TOO (fail closed: it has no event to
+# classify, so it is not assumed to be noise).
+new_scen treehealth-status
+HEAD_TX="b9b9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TX" > "$SCEN/head"
+lane_pass "$HEAD_TX" 5591 > "$SCEN/runs-$HEAD_TX"
+lane_pass mainstat 5592 > "$SCEN/runs-main"
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"supabase-preview","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/main-statuses.json"
+run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a red legacy commit status on main blocks (fail closed)" \
+  || fail "a red commit status on main was ignored"
+grep -q "supabase-preview" "$TMP/err" && pass "…naming the status context" \
+  || fail "the refusal does not name the red status"
+
+# (j) THE ONE DELIBERATE NARROWING, PINNED. Main red in the WATCHED lane is
+# still a red tree, so the flake/exemption path no longer authorizes a merge
+# while main is red — "already red on main" IS "the tree is red". Pinned so the
+# narrowing is intentional and reviewable, not a silent side effect. The remedy
+# for a PR that REPAIRS main is the audited enforcer override, which the refusal
+# names.
+new_scen treehealth-lane-red
+HEAD_TL="b6b6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_TL" > "$SCEN/head"
+FAIL_TL='tests/test_main.py::test_already_red_on_main'
+lane_fail "$HEAD_TL" 5561 > "$SCEN/runs-$HEAD_TL"
+log_failed "$FAIL_TL" > "$SCEN/log-5561"
+main_red_n mainlane 5562 3 "$FAIL_TL" > "$SCEN/runs-main"
+write_main_checks "$(check_run 3401 'test (a)' completed failure 6911)"
+main_run_map 6911 push 'Python CI'
+run_admin 42 --main-runs 3 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "main red in the WATCHED lane also blocks (a red tree is a red tree)" \
+  || fail "the rail merged onto a main it had measured red in its own lane"
+grep -q "MAIN IS RED" "$TMP/err" && pass "…as the TREE refusal, not a lane verdict" \
+  || fail "the lane-red case did not report the tree refusal"
+grep -q "AGENT_ADMIN_MERGE_OVERRIDE" "$TMP/err" && pass "…and names the audited remedy for a repairing PR" \
+  || fail "the refusal offers no remedy for the PR that repairs main"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
