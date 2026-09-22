@@ -289,6 +289,17 @@ assert_contains "$out" "#1325" "non-origin diverged guide marks refresh's origin
 assert_contains "$out" "git log --name-only --diff-merges=combined upstream/main..HEAD" "diverged inspection mirrors refresh's combined content test"
 assert_not_contains "$out" "log --stat" "diverged inspection does not use --stat (hides merge content)"
 
+# 9e2. dirty + DIVERGED → exercises the SECOND emitted inspection site (the dirty
+# branch appends its own diverged guidance, line 120). Reverting only that site to
+# `--stat` used to leave the suite green (#1324 review P2), so pin it here.
+touch "$SHUB/wip.txt"
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "dirty+diverged → exit 1"
+assert_contains "$out" "HUB_DISORDER=dirty+diverged" "dirty+diverged composes both tokens"
+assert_contains "$out" "git -C $SHUB log --name-only --diff-merges=combined upstream/main..HEAD" "dirty+diverged inspection uses the combined form"
+assert_not_contains "$out" "log --stat" "dirty+diverged inspection does not use --stat"
+rm -f "$SHUB/wip.txt"
+
 # 9f. The --gh-report leg parses the staleness token SEPARATELY (#1313: two
 # parse sites). The filed issue body must carry the SAME diverged guidance — a
 # token handled in only one place mis-fires here, silently.

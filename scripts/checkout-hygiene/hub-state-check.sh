@@ -135,7 +135,7 @@ recovery_guide() {
         ;;
       diverged)
         lines+=("The hub is clean and on main, but DIVERGED from its upstream (local-only commits — a fast-forward cannot apply).")
-        lines+=("Inspect the local-only commits and their content first — this MIRRORS hub-worktree.sh refresh's own content test. '--diff-merges=combined' is load-bearing: a plain '--stat' (git's default diff-merges=off) shows NO files for a merge, so a merge that carried conflict resolution would read as contentless (verified: six such merges in this repo print 0 files under --stat and N under the combined form):")
+        lines+=("Inspect the local-only commits and their content first — this MIRRORS hub-worktree.sh refresh's own content test. '--diff-merges=combined' is load-bearing: a plain '--stat' (git's default diff-merges=off) shows NO files for a merge, so a merge that carried conflict resolution would read as contentless:")
         lines+=("cd $repo && git log --name-only --diff-merges=combined $upstream..HEAD")
         lines+=("CONTENTLESS → drop exactly them and realign (#1309):")
         lines+=("bash $SCRIPT_DIR/hub-worktree.sh refresh --discard-contentless --repo $repo")
