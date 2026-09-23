@@ -218,6 +218,16 @@ scripts/admin-merge.sh <PR> --squash
 # refusal NAMES both lanes. Remedy: run the FULL lane for the head — the shards
 # named in the refusal are what main measures. If this repo's test shards are not
 # named `test*`, set `ADMIN_MERGE_LANE_JOB_PREFIX` to the prefix they use.
+#
+# A repo whose PR lane CANNOT run a shard main's push lane runs (a trigger-split
+# repo — this one: main's push calls the reusable `python-ci.yml` and no PR lane
+# does, #1349) has an AUDITED escape: `ADMIN_MERGE_LANE_PARITY=declared-off`. It
+# CERTIFIES the vacuous comparison but says so out loud — the posted evidence and
+# stderr both carry `lane parity: NOT ESTABLISHED — declared off`, and the parity
+# check still RUNS and still reports the divergent shards. Any other value is
+# refused at startup, so a typo cannot read as 'off'. Narrowing
+# `ADMIN_MERGE_LANE_JOB_PREFIX` is NOT the escape: it removes the excluded shard
+# family from the gate, which is the family the gate exists to protect.
 ```
 
 ⚠️ The baseline is the **union of main's last N runs** (default 10), never a

@@ -185,10 +185,18 @@
 #                                         this, or the gate refuses EVERY
 #                                         vacuous comparison (fail-closed: an
 #                                         unreadable lane is never `the same`).
-#   ADMIN_MERGE_LANE_PARITY_RUNS         lane runs sampled per side for the
-#                                         coverage comparison (default 3) — a
-#                                         bound on the gate's gh cost, never a
-#                                         quality threshold.
+#                                         A job outside the prefix LEAVES the
+#                                         comparison — narrowing it disables the
+#                                         gate for the excluded family.
+#   ADMIN_MERGE_LANE_PARITY              `require` (default) or `declared-off`.
+#                                         `declared-off` certifies a vacuous
+#                                         comparison while STATING, in the
+#                                         evidence and on stderr, that lane
+#                                         parity was NOT established — the
+#                                         audited escape for a repo whose PR
+#                                         lane cannot run a shard main's push
+#                                         lane runs (#1349). Any other value is
+#                                         refused at startup.
 
 set -uo pipefail
 
@@ -406,6 +414,19 @@ validate_timing_knobs() {
     say_err "   on EVERY poll, so the wait becomes a tight BUSY SPIN of gh calls instead of a paced"
     say_err "   poll — and an interval beyond an hour paces nothing."
   fi
+  # Not a timing knob, but the same startup-refusal discipline and the same
+  # reason: an unrecognised value must not silently behave like a recognised one.
+  # `ADMIN_MERGE_LANE_PARITY=declared_of` (a typo) or `Declared-Off` would have
+  # been read as "not require" and certified the vacuous comparison WITHOUT the
+  # disclosure — a typo is not a declaration. Compare literally, refuse the rest.
+  if [ "$LANE_PARITY_MODE" != "require" ] && [ "$LANE_PARITY_MODE" != "declared-off" ]; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_LANE_PARITY='${LANE_PARITY_MODE}' — the lane-coverage"
+    say_err "   gate accepts exactly 'require' (default) or 'declared-off' (the audited escape for a"
+    say_err "   repo whose PR lane cannot run the shards main's push lane runs — see #1349)."
+    say_err "   Any other value would silently read as 'off' and certify a comparison that was never"
+    say_err "   established."
+  fi
   [ "$bad" -eq 0 ] || { say_err "   These are operator knobs; fix the value and re-run the rail."; return 1; }
   return 0
 }
@@ -504,9 +525,26 @@ GREEN_RUNS="${ADMIN_MERGE_GREEN_RUNS:-5}"
 #   * a repo that varies the TEST SELECTION *within* one shard name (files
 #     chosen per-diff inside `test (a)`) is outside what a job list can show.
 #     That residual is #1319's option-3 shape (a selection attestation) and is
-#     tracked separately; it is a declared OUT-OF-SCOPE class, not a silent gap.
+#     DECLARED and TRACKED as agent-infra #1350 — not a silent gap.
+#   * the parity key is ONE job-name FAMILY, selected by $LANE_JOB_PREFIX. A job
+#     outside the prefix LEAVES the comparison, so narrowing the prefix to
+#     silence a refusal removes that family from the gate — which is why the
+#     refusal names the prefix and the evidence states it.
+#   * a comparison can only be as complete as the window it samples. Both sides
+#     are read over the SAME window: the PR's lane runs for the head, main's last
+#     $MAIN_RUNS lane runs. A shard main executed only OUTSIDE that window is
+#     unobserved. Sampling FEWER runs than the baseline window was a cycle-1
+#     fail-open (a shard present only in an older run vanished from the
+#     reference), so there is no independent sampling cap any more.
 LANE_JOB_PREFIX="${ADMIN_MERGE_LANE_JOB_PREFIX:-test}"
-LANE_PARITY_RUNS="${ADMIN_MERGE_LANE_PARITY_RUNS:-3}"
+# require (default) | declared-off. `declared-off` is the AUDITED escape for a
+# repo whose PR lane legitimately CANNOT run a shard main's push lane runs (a
+# trigger-split repo — agent-infra itself: main's push calls the reusable
+# python-ci.yml and no PR lane does; see #1349). It never hides: the evidence and
+# stderr both carry "lane parity: NOT ESTABLISHED — declared off", and the parity
+# check still RUNS so the divergence is reported. There is no silent third value
+# — any other value is refused at startup.
+LANE_PARITY_MODE="${ADMIN_MERGE_LANE_PARITY:-require}"
 
 # green_run_ids — recent COMPLETED SUCCESSFUL run ids for the selected lane, one
 # per line. `--any-workflow` is a PARSER flag, not a `gh run list` flag, so it is
@@ -524,13 +562,15 @@ green_run_ids() {
     --json databaseId --jq '.[].databaseId' 2>/dev/null || true
 }
 
-# lane_run_ids <flag> <value> <limit> — the side's lane runs, one per line as
-# `<status>\t<conclusion>\t<sha>:<id>` (the raw fixture shape; real gh renders
-# `<status>\t<conclusion>\t<id>`, and every consumer takes `${line##*:}`, so both
-# read the same). ONLY gh-native flags are forwarded: the parser's
+# lane_run_ids <flag> <value> <limit> — the side's lane runs on stdout as
+# `<status>\t<conclusion>\t<sha>:<id>` (LANE_RUN_JQ interpolates headSha; the
+# suite's fixtures serve the same shape, and every consumer takes `${line##*:}`,
+# so both read identically). ONLY gh-native flags are forwarded: the parser's
 # `--any-workflow` opt-out is NOT a `gh run list` flag, real gh rejects it, and
-# the error is swallowed here — forwarding it would silently empty every lane
-# query and take the coverage gate down with it.
+# forwarding it would silently empty every lane query and take the coverage gate
+# down with it. The gh EXIT STATUS is returned, never swallowed: an auth/network
+# failure must read as "could not list", not as "no runs" — those have opposite
+# remedies, and reading the first as the second charges the PR for the outage.
 lane_run_ids() {
   local flag="$1" value="$2" limit="$3" args=()
   [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
@@ -540,7 +580,19 @@ lane_run_ids() {
   # shellcheck disable=SC2086
   $GH run list "$flag" "$value" --limit "$limit" \
     ${args[@]+"${args[@]}"} \
-    --json databaseId,status,conclusion,headSha --jq "$LANE_RUN_JQ" 2>/dev/null || true
+    --json databaseId,status,conclusion,headSha --jq "$LANE_RUN_JQ" 2>/dev/null
+}
+
+# lane_count <file> — how many REAL shard names a shard-set file holds. NOT
+# `wc -l` and NOT `[ -s ]`: a set with no names must count ZERO, and the two
+# failure modes that make a non-empty file hold no names (a stray blank line, a
+# whitespace-only line) must not read as one shard. This is the difference
+# between "no shard was observed" and "one shard was observed" — the whole gate
+# turns on it (#1319 cycle-1 review: a blank line certified an EMPTY lane).
+lane_count() {
+  local n
+  n="$(grep -c '[^[:space:]]' "$1" 2>/dev/null)"
+  printf '%s' "${n:-0}"
 }
 
 # lane_shards <run-id> — the TEST shards this run EXECUTED, one name per line.
@@ -552,8 +604,12 @@ lane_run_ids() {
 #     parser's `tested` counter. A `skipped` shard exercised NOTHING, so it is
 #     not coverage; that distinction IS the gate (a PR that skipped a shard main
 #     ran has not measured what main measures).
-# Returns 1 when the job list cannot be read (gh error, empty, unparsable). An
-# unreadable shard list is NEVER an empty one.
+# NO OUTPUT when the run executed no matching shard: an empty set must be an
+# EMPTY stream, never a blank line. `printf '%s\n' ""` emits one newline, which
+# makes the file non-empty, defeats every `[ -s ]` guard downstream, and matches
+# the empty pattern under `grep -xF` — i.e. it turns "nothing was observed" into
+# "no difference". Returns 1 when the job list cannot be READ (gh error, empty,
+# unparsable): an unreadable shard list is NEVER an empty one.
 lane_shards() {
   local run_id="$1" json_file out rc=0
   json_file="$(mktemp "${TMPDIR:-/tmp}/admin-merge-lane.XXXXXX")"
@@ -600,36 +656,48 @@ for n in sorted(names):
     print(n)' "$json_file" "$LANE_JOB_PREFIX")" || rc=$?
   rm -f "$json_file"
   [ "$rc" -eq 0 ] || return 1
+  [ -n "$out" ] || return 0
   printf '%s\n' "$out"
   return 0
 }
 
 # lane_shard_set <flag> <value> <list-limit> <out-file> — the union of EXECUTED
-# test shards across the side's lane runs. Only COMPLETED runs are consulted (a
-# queued run has no job list yet), and the number of runs actually FETCHED is
-# capped at $LANE_PARITY_RUNS so the gate's gh cost is bounded and predictable.
-# A run whose jobs cannot be read makes the WHOLE side unreadable (return 1):
-# partial coverage silently read as full is the fail-open this gate prevents.
+# test shards across the side's lane runs, for the SAME window the operator's
+# comparison uses. Only COMPLETED runs are consulted (a queued run has no job
+# list). There is deliberately NO independent sampling cap: sampling fewer runs
+# than the window the baseline was drawn from lets a shard main executed go
+# unobserved and certifies a PR that skipped it (cycle-1 review, reproduced).
+# A run whose jobs cannot be read — or a run LISTING that fails — makes the WHOLE
+# side unreadable (return 1): partial coverage silently read as full is the
+# fail-open this gate prevents. No name is written for an empty shard set.
 lane_shard_set() {
   local flag="$1" value="$2" limit="$3" out="$4"
-  local used=0 line status conclusion id rc=0
+  local listing="$TMP/lane-runs.tmp" status conclusion id rc=0
   : > "$out"
+  if ! lane_run_ids "$flag" "$value" "$limit" > "$listing"; then
+    say_err "admin-merge: ✗ could not list the lane runs for $flag $value — lane coverage unverifiable"
+    return 1
+  fi
   while IFS=$'\t' read -r status conclusion id; do
     [ -n "$id" ] || continue
     [ "$status" = "completed" ] || continue
     id="${id##*:}"
     [ -n "$id" ] || continue
-    [ "$used" -ge "$LANE_PARITY_RUNS" ] && break
-    used=$((used + 1))
     rc=0
     lane_shards "$id" > "$TMP/lane-shards.tmp" || rc=$?
     if [ "$rc" -ne 0 ]; then
       say_err "admin-merge: ✗ could not read the job list of lane run $id — lane coverage unverifiable"
       return 1
     fi
-    cat "$TMP/lane-shards.tmp" >> "$out"
-  done < <(lane_run_ids "$flag" "$value" "$limit")
-  sort -u -o "$out" "$out"
+    if [ -s "$TMP/lane-shards.tmp" ]; then cat "$TMP/lane-shards.tmp" >> "$out"; fi
+  done < "$listing"
+  # Drop any blank line before the union: a single blank entry would be counted
+  # as a shard by `wc -l` and would match the empty pattern under `grep -xF`.
+  if [ -s "$out" ]; then
+    grep '[^[:space:]]' "$out" > "$TMP/lane-set.tmp" || true
+    mv "$TMP/lane-set.tmp" "$out"
+    sort -u -o "$out" "$out"
+  fi
   return 0
 }
 
@@ -638,24 +706,40 @@ lane_shard_set() {
 # the refusal can state the lanes instead of asserting a bare `0 | 0`.
 #   0  parity holds — the PR executed every test shard main's lane executed.
 #   1  parity FAILS   — a shard main executed was not executed by the PR.
-#   2  NOT ESTABLISHED — a side's shard list could not be read, or main's lane
-#                        showed no test shards at all. Fail CLOSED: a comparison
-#                        against an unobserved reference certifies nothing.
+#   2  NOT ESTABLISHED — a side's shard list could not be read, or EITHER side
+#                        observed no test shard at all (main's reference is
+#                        unobserved, or the PR's set is empty because the prefix
+#                        matches nothing it ran). Fail CLOSED: a comparison
+#                        against an unobserved reference certifies nothing, and
+#                        an empty set means EVERY shard is missing — never "no
+#                        difference".
 lane_parity_check() {
-  local head="$1" main_runs="$2"
+  local head="$1" main_runs="$2" rc=0
+  if [ -z "${TMP:-}" ] || [ ! -d "${TMP:-}" ]; then
+    say_err "admin-merge: ✗ internal error — lane parity called without a TMP directory"
+    return 2
+  fi
   : > "$TMP/lane-pr.txt"
   : > "$TMP/lane-main.txt"
   : > "$TMP/lane-missing.txt"
   lane_shard_set --commit "$head" 100 "$TMP/lane-pr.txt" || return 2
   lane_shard_set --branch main "$main_runs" "$TMP/lane-main.txt" || return 2
-  [ -s "$TMP/lane-main.txt" ] || return 2
-  # The subtraction is deliberately NOT `comm -23`: the one `comm` in this rail
-  # belongs to the parser's `--diff`, and a second one here is the shape the
-  # suite's PARITY test forbids (a reader must not confuse a coverage subtraction
-  # with the exemption comparison). An empty PR set means NOTHING the PR ran
-  # matched — every shard main ran is missing — never "no difference".
-  if [ -s "$TMP/lane-pr.txt" ]; then
-    grep -vxF -f "$TMP/lane-pr.txt" "$TMP/lane-main.txt" > "$TMP/lane-missing.txt" || true
+  # Decide on NAMES, never on file size (see lane_count).
+  [ "$(lane_count "$TMP/lane-main.txt")" -gt 0 ] || return 2
+  if [ "$(lane_count "$TMP/lane-pr.txt")" -gt 0 ]; then
+    # The subtraction is deliberately NOT `comm -23`: the one `comm` in this rail
+    # belongs to the parser's `--diff`, and a second one here is the shape the
+    # suite's PARITY test forbids (a reader must not confuse a coverage
+    # subtraction with the exemption comparison).
+    grep -vxF -f "$TMP/lane-pr.txt" "$TMP/lane-main.txt" > "$TMP/lane-missing.txt"
+    rc=$?
+    # 0 = differences found (refuse); 1 = no differences (parity holds). Any
+    # other status is a grep ERROR, and reading it as "no differences" is the
+    # fail-open this gate exists to prevent.
+    if [ "$rc" -gt 1 ]; then
+      say_err "admin-merge: ✗ the lane-coverage subtraction failed (grep rc $rc) — lane coverage unverifiable"
+      return 2
+    fi
   else
     cp "$TMP/lane-main.txt" "$TMP/lane-missing.txt"
   fi
@@ -1689,40 +1773,66 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
   # fails CLOSED: a side whose shard list cannot be read is never read as "the
   # same". See the LANE COVERAGE block for the declared parity key and its bound.
   if [ "$pr_count" -eq 0 ] && [ "$main_count" -eq 0 ]; then
-    local parity_rc=0
+    local parity_rc=0 parity_note
     lane_parity_check "$head" "$MAIN_RUNS" || parity_rc=$?
-    if [ "$parity_rc" -eq 2 ]; then
-      say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY and the"
-      say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
-      say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
-      say_err "   readable — and an unreadable shard list is NOT an empty one."
-      say_err "   This is a refusal, not a comparison. No merge."
-      say_err "   If this lane's test shards are not named '${LANE_JOB_PREFIX}*', set"
-      say_err "   ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they do use."
-      exit 1
+    if [ "$parity_rc" -eq 0 ]; then
+      parity_note="it certifies ONLY because LANE PARITY holds: the PR executed every test shard main's lane executed ($(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side; $(lane_count "$TMP/lane-main.txt") on main). A shard main ran that this head skipped would have made this a REFUSAL (NOT COMPARABLE)."
+    elif [ "$parity_rc" -eq 2 ]; then
+      parity_note="lane parity was NOT ESTABLISHED: main showed $(lane_count "$TMP/lane-main.txt") test shard(s), this head $(lane_count "$TMP/lane-pr.txt"), and a side's shard list could not be read (or held none) — an unreadable shard list is NOT an empty one."
+    else
+      parity_note="lane parity FAILS: this head did NOT execute $(lane_count "$TMP/lane-missing.txt") test shard(s) main's lane executes, so 'PR failing: 0 | main failing: 0' compares TWO DIFFERENT LANES (tortoise #4263 → #4457)."
     fi
-    if [ "$parity_rc" -eq 1 ]; then
+    if [ "$parity_rc" -ne 0 ] && [ "$LANE_PARITY_MODE" != "declared-off" ]; then
+      if [ "$parity_rc" -eq 2 ]; then
+        say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY and the"
+        say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
+        say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
+        say_err "   readable — and an unreadable shard list is NOT an empty one."
+        say_err "   This is a refusal, not a comparison. No merge."
+        say_err "   If this lane's test shards are not named '${LANE_JOB_PREFIX}*', set"
+        say_err "   ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they do use. If this repo's PR"
+        say_err "   lane CANNOT run the shards main's push lane runs (a trigger-split repo,"
+        say_err "   see #1349), the audited escape is ADMIN_MERGE_LANE_PARITY=declared-off:"
+        say_err "   it certifies only while STATING in the evidence that parity was not"
+        say_err "   established."
+        exit 1
+      fi
       say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY, and the"
-      say_err "   PR's lane did NOT EXECUTE $(count_lines "$TMP/lane-missing.txt") test shard(s) that main's lane executes."
+      say_err "   PR's lane did NOT EXECUTE $(lane_count "$TMP/lane-missing.txt") test shard(s) that main's lane executes."
       say_err "   'PR failing: 0 | main failing: 0' therefore compares TWO DIFFERENT LANES: a"
       say_err "   failure in a shard this head never ran can appear in NEITHER set, so the"
       say_err "   zeros certify nothing (tortoise #4263 → #4457). No merge."
       say_err "   shard(s) main EXECUTED and this head did not:"
       sed 's/^/      /' "$TMP/lane-missing.txt" >&2
-      say_err "   PR lane — executed $(count_lines "$TMP/lane-pr.txt") test shard(s):"
+      say_err "   PR lane — executed $(lane_count "$TMP/lane-pr.txt") test shard(s):"
       sed 's/^/      /' "$TMP/lane-pr.txt" >&2
-      say_err "   main lane — executed $(count_lines "$TMP/lane-main.txt") test shard(s):"
+      say_err "   main lane — executed $(lane_count "$TMP/lane-main.txt") test shard(s):"
       sed 's/^/      /' "$TMP/lane-main.txt" >&2
       say_err "   Remedy: run the FULL lane for this head (the shards above are what main"
-      say_err "   measures), then re-run the rail."
+      say_err "   measures), then re-run the rail. If this repo's PR lane CANNOT run them by"
+      say_err "   design (a trigger-split repo, see #1349), the audited escape is"
+      say_err "   ADMIN_MERGE_LANE_PARITY=declared-off — it certifies only while STATING in"
+      say_err "   the evidence that parity was not established."
       exit 1
     fi
-    # Parity holds. The vacuous outcome is STATED, never implied — and it now
-    # states WHAT it rests on: a comparison of the same lane that happened to be
-    # green on both sides, not a bare pair of zeros.
+    if [ "$parity_rc" -ne 0 ]; then
+      # `declared-off`: the operator has taken the audited escape (#1349). The
+      # comparison still RAN and its outcome is still REPORTED, here and in the
+      # posted evidence — the escape buys a certificate, never silence.
+      say_err "⚠️  admin-merge: LANE PARITY NOT ESTABLISHED (lane: $lane) — certifying the"
+      say_err "   vacuous comparison because ADMIN_MERGE_LANE_PARITY=declared-off."
+      say_err "   $parity_note"
+      [ -s "$TMP/lane-missing.txt" ] && sed 's/^/      /' "$TMP/lane-missing.txt" >&2
+    fi
+    # The vacuous outcome is STATED, never implied — and it now states WHAT it
+    # rests on: the comparison and its coverage, not a bare pair of zeros.
     analyzed="$analyzed
-⚠️ vacuous comparison: no failing runs were observed on EITHER side, so no failing set was compared. This is an ABSENCE of a failure measurement, not a clean one — it certifies ONLY because LANE PARITY holds: the PR executed every test shard main's lane executed ($(count_lines "$TMP/lane-pr.txt") shard(s) on the PR side; $(count_lines "$TMP/lane-main.txt") on main). A shard main ran that this head skipped would have made this a REFUSAL (NOT COMPARABLE)."
-    info "admin-merge: ⚠️  vacuous comparison — no failing runs on either side; nothing was compared, and it certifies ONLY on lane parity (lane: $lane; PR shards ⊇ main shards)"
+⚠️ vacuous comparison: no failing runs were observed on EITHER side, so no failing set was compared. This is an ABSENCE of a failure measurement, not a clean one — $(if [ "$parity_rc" -eq 0 ]; then printf 'lane parity: PR ⊇ main'; else printf 'lane parity: NOT ESTABLISHED — declared off'; fi); $parity_note"
+    if [ "$parity_rc" -eq 0 ]; then
+      info "admin-merge: ⚠️  vacuous comparison — no failing runs on either side; nothing was compared, and it certifies ONLY on lane parity (lane: $lane; PR shards ⊇ main shards)"
+    else
+      info "admin-merge: ⚠️  vacuous comparison — no failing runs on either side; nothing was compared, and lane parity is NOT ESTABLISHED (lane: $lane; ADMIN_MERGE_LANE_PARITY=declared-off)"
+    fi
   fi
 
   info "admin-merge: PR failing: $pr_count | main failing: $main_count | blocked by the decision: 0"

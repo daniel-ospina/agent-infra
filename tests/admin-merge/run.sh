@@ -78,12 +78,20 @@
 #      SKIPPED shards main's push lane runs; the failure lived in one of them,
 #      appeared in NEITHER collected set, and reddened main's required check for
 #      the whole fleet (#4457). The gate is fail-CLOSED: an unreadable shard list
-#      is never read as "the same lane", a `skipped` shard is not coverage, and
-#      the parity key is the VERBATIM shard name (the matrix axis is NOT
-#      normalised away — `test (a, docker)` and `test (a, embedded)` are
-#      different lanes). Declared OUT of scope: a repo that varies the test
-#      SELECTION within one shard name (files chosen per-diff inside
-#      `test (a)`), which a job list cannot show.
+#      is never read as "the same lane", a `skipped` shard is not coverage, an
+#      EMPTY shard set is not parity (an empty set used to render as a blank line
+#      that matched itself and certified having observed nothing — cycle-1 P0),
+#      a failed `gh run list` is a LISTING failure and not a thinner lane, and the
+#      parity key is the VERBATIM shard name (the matrix axis is NOT normalised
+#      away — `test (a, docker)` and `test (a, embedded)` are different lanes).
+#      Both sides are read over the SAME window (the PR's lane runs for the head;
+#      main's last `--main-runs`), so a shard main ran only inside the operator's
+#      window cannot be sampled away. `ADMIN_MERGE_LANE_PARITY=declared-off` is
+#      the AUDITED escape (a trigger-split repo, #1349): it certifies while
+#      STATING in the evidence and on stderr that parity was NOT established, and
+#      any other value is refused at startup. Declared OUT of scope: a repo that
+#      varies the test SELECTION within one shard name (files chosen per-diff
+#      inside `test (a)`), which a job list cannot show — filed as #1350.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -164,6 +172,18 @@ case "$key" in
     exit 1 ;;
   "run list")
     [ -f "$SCEN/fail-run-list" ] && exit 1
+    # A COUNTED failure seam, for the one place where NO flag can separate the
+    # callers: the parser (ci-failure-set.sh) and the rail's lane-coverage gate
+    # issue BYTE-IDENTICAL `gh run list` invocations (same flags, same jq). The
+    # CALL ORDER is deterministic, so fail exactly the Nth `run list` of the
+    # scenario. A test that targets the wrong call fails LOUDLY — the parser's
+    # own listing failure reports a different reason — so a shifted order can
+    # never let this seam silently decompose into a no-op.
+    if [ -f "$SCEN/fail-run-list-nth" ]; then
+      nth=$(( $(cat "$SCEN/run-list-count" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$nth" > "$SCEN/run-list-count"
+      [ "$nth" = "$(cat "$SCEN/fail-run-list-nth")" ] && exit 1
+    fi
     # Real gh REJECTS a parser-only flag: `--any-workflow` is ci-failure-set's
     # opt-out, not a `gh run list` flag. The fake used to ignore unknown flags,
     # which hid admin-merge forwarding it and silently killing the
@@ -372,6 +392,11 @@ lane_jobs() {
     json="$json{\"name\":\"$name\",\"status\":\"completed\",\"conclusion\":\"$concl\",\"started_at\":\"2026-01-01T00:00:00Z\",\"completed_at\":\"2026-01-01T00:05:00Z\"}"
   done
   json="$json]}"
+  # `total_count` must be the number of jobs ACTUALLY listed (the API's smallest
+  # true value), not the 0 the helper was first written with: a fixture that
+  # contradicts its own list is a fixture a future reader has to disbelieve.
+  local count=$(( $# ))
+  json="$(printf '%s' "$json" | sed "s/\"total_count\":0/\"total_count\":$count/")"
   printf '%s\n' "$json" > "$SCEN/jobs-$id.json"
 }
 
@@ -2763,9 +2788,19 @@ grep -q "NOT COMPARABLE" "$TMP/err" && pass "the verdict is NAMED: NOT COMPARABL
   || fail "expected the NOT-COMPARABLE verdict on stderr, got: $(head -3 "$TMP/err" 2>/dev/null)"
 grep -q "did NOT EXECUTE 3 test shard" "$TMP/err" && pass "the refusal counts the shards this head never ran" \
   || fail "the refusal does not say how many shards the PR did not run"
-grep -q "test-slow (a)" "$TMP/err" && pass "…and NAMES them (option 2: 0|0 must be legible, not silent)" \
-  || fail "the refusal does not say which lane the PR did not run"
-grep -q "test-carve-out" "$TMP/err" && pass "…all of them, not just the first" || fail "only one missing shard named"
+# The missing-shard list is its OWN block, bounded by the two headers below. It
+# must be asserted INSIDE that block: a bare `grep test-slow (a) "$TMP/err"` also
+# matches the main-lane dump further down and would pass even if the refusal
+# named nothing at all.
+missing_block="$(sed -n '/shard(s) main EXECUTED and this head did not:/,/PR lane — executed/p' "$TMP/err")"
+case "$missing_block" in *"test-slow (a)"*) pass "…and NAMES them (option 2: 0|0 must be legible, not silent)" ;;
+  *) fail "the refusal's MISSING block does not name the lane the PR did not run" ;; esac
+case "$missing_block" in *"test-carve-out"*) pass "…all of them, not just the first" ;;
+  *) fail "only one missing shard named in the missing block" ;; esac
+# …and EXACTLY them: 3 missing shards, not main's 5-name dump bleeding in.
+[ "$(printf '%s\n' "$missing_block" | grep -c '^      test')" -eq 3 ] \
+  && pass "…and the block lists EXACTLY the 3 missing shards (not main's fuller dump)" \
+  || fail "the missing block is not the missing set (it holds $(printf '%s\n' "$missing_block" | grep -c '^      test') shard lines)"
 grep -q "main lane — executed 5 test shard" "$TMP/err" && pass "the main lane is named too" \
   || fail "the main side's shard set is not reported"
 grep -q "PR lane — executed 2 test shard" "$TMP/err" && pass "…and so is the PR lane" || fail "the PR side's shard set is not reported"
@@ -2846,10 +2881,157 @@ grep -q "certifies ONLY on lane parity" "$TMP/out" && pass "…and the operator-
   || fail "the vacuous line still carries no signal about what it rests on"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds once parity is established" \
   || fail "no merge issued for a certified vacuous comparison"
+# A parity certificate must not weaken the merge's OWN head pin: the evidence is
+# bound to $HEAD_VP and GitHub must enforce that head at merge time.
+grep -q -- "--match-head-commit $HEAD_VP" "$SCEN/calls" \
+  && pass "…and the merge is HEAD-PINNED, so parity does not relax the head binding" \
+  || fail "the certified merge lost --match-head-commit"
 
+# (f) AN EMPTY SHARD SET IS NOT PARITY (#1319 cycle-1 review P0, REPRODUCED).
+# `lane_shards` used to `printf '%s\n' "$out"` unconditionally, so a run that
+# executed NO matching shard emitted a BLANK LINE: both sides' sets were then
+# 1-byte files, `[ -s ]` passed, `grep -xF` matched the blank pattern against the
+# blank line, the difference came out EMPTY — and the rail CERTIFIED AND MERGED
+# having observed nothing at all. That is #4457 exactly, one level down. The set
+# must be empty as a STREAM and the decision must be taken on NAMES.
+new_scen vacuousblank
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9801 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainffff 9802 > "$SCEN/runs-main"
+# Readable job lists — every shard present but SKIPPED on BOTH sides.
+lane_jobset 9801 skipped 'test (a)' 'test (b)'
+lane_jobset 9802 skipped 'test (a)' 'test (b)'
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "both lanes observed ZERO executed shards → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an EMPTY shard set was read as parity (the #4457 hole, re-opened a level down)"
+grep -q "coverage could not be established" "$TMP/err" && pass "…and the reason is the unobserved lane, not a comparison" \
+  || fail "the empty-lane refusal does not say the coverage was never established"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on an unobserved lane" || pass "no merge attempted"
+
+# (g) same hole, other shape: the job lists are readable and ALL jobs EXECUTED,
+# but no job name matches the parity prefix. A prefix that selects nothing is an
+# empty reference, never a pass — and the refusal has to say which knob fixes it.
+new_scen vacuousnoprefix
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9851 > "$SCEN/runs-$HEAD_VP"
+lane_pass main9999 9852 > "$SCEN/runs-main"
+lane_jobset 9851 success 'unit-test' 'lint'
+lane_jobset 9852 success 'unit-test' 'lint'
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "no job matches the shard prefix on either side → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an empty reference certified a vacuous comparison"
+grep -q "ADMIN_MERGE_LANE_JOB_PREFIX" "$TMP/err" && pass "…naming the knob for a differently-named lane" \
+  || fail "the refusal does not name ADMIN_MERGE_LANE_JOB_PREFIX"
+
+# (h) A LISTING FAILURE IS NOT "FEWER SHARDS". `lane_run_ids` swallowed gh's exit
+# status, so an auth/network failure produced an EMPTY listing — which read as
+# "no runs to compare" and certified. The parser and the rail issue BYTE-IDENTICAL
+# `gh run list` calls, so no flag can separate them; the CALL ORDER can. The
+# rail's lane listing for the PR head is the 4th `run list` of this scenario
+# (parser: pr rows, main rates, main signatures; then the lane pass). If that
+# ordering ever shifts, the parser's OWN listing fails and the assertion below
+# fails loudly — it cannot silently stop testing what it names.
+new_scen vacuouslistfail
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9861 > "$SCEN/runs-$HEAD_VP"
+lane_pass main1010 9862 > "$SCEN/runs-main"
+lane_jobset 9861 success 'test (a)'
+lane_jobset 9862 success 'test (a)'
+printf '%s\n' 4 > "$SCEN/fail-run-list-nth"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unreadable lane RE-LISTING → BLOCK (exit $rc), never a certificate" \
+  || fail "expected a non-zero exit, got 0 — a failed `gh run list` was read as 'fewer shards'"
+grep -q "could not list the lane runs" "$TMP/err" && pass "…and the failure is named as a LISTING failure, not as coverage" \
+  || fail "the refusal does not distinguish a listing failure from a thin lane: $(head -2 "$TMP/err")"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on an unreadable lane" || pass "no merge attempted"
+
+# (i) THE WINDOW IS THE OPERATOR'S WINDOW. The gate used to sample only the first
+# 3 lane runs per side, independently of `--main-runs`: a shard main executed only
+# in an OLDER run inside the operator's window vanished from the reference, and a
+# PR that never ran it certified. Here main's 4th run carries `test (b)`; the PR
+# ran only `test (a)`. With a 3-run cap this certified — a fail-open.
+new_scen vacuouswindow
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9871 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainw0 9872
+  lane_pass mainw0 9873
+  lane_pass mainw0 9874
+  lane_pass mainw0 9875
+} > "$SCEN/runs-main"
+lane_jobset 9871 success 'test (a)'
+lane_jobset 9872 success 'test (a)'
+lane_jobset 9873 success 'test (a)'
+lane_jobset 9874 success 'test (a)'
+lane_jobset 9875 success 'test (a)' 'test (b)'
+run_admin 42 --main-runs 4 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a shard main ran only INSIDE the operator's window is still a reference → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — the sampling cap hid a shard main had executed (fail-open)"
+grep -q "test (b)" "$TMP/err" && pass "…and the window-boundary shard is the one named" \
+  || fail "the shard that exists only in an older window run is not reported"
+
+# (j) THE AUDITED ESCAPE. A repo whose PR lane legitimately cannot run a shard
+# main's push lane runs (a trigger-split repo — this one, #1349) needs a way to
+# merge; it does NOT need a SILENT way. `declared-off` still RUNS the comparison,
+# still reports the divergence on stderr and in the POSTED evidence, and states
+# `NOT ESTABLISHED — declared off` — a certificate that says out loud what it did
+# not check.
+new_scen vacuousdeclaredoff
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9881 > "$SCEN/runs-$HEAD_VP"
+lane_pass maindd00 9882 > "$SCEN/runs-main"
+lane_jobset 9881 success 'test (a)'
+lane_jobset 9882 success 'test (a)' 'test-slow (a)'
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_LANE_PARITY=declared-off bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 0 ] && pass "declared-off certifies the vacuous comparison (exit 0) — the escape works" \
+  || fail "declared-off did not certify (exit $rc); the escape is unusable"
+grep -q "NOT ESTABLISHED — declared off" "$SCEN/comment" \
+  && pass "…and the POSTED evidence STATES the parity was not established" \
+  || fail "the escape certified SILENTLY: the evidence does not disclose it"
+grep -q "LANE PARITY NOT ESTABLISHED" "$TMP/err" && pass "…as does stderr, before the merge" \
+  || fail "the escape did not warn on stderr"
+grep -q "test-slow (a)" "$TMP/err" && pass "…and the DIVERGENCE is still reported, so the escape is not a blindfold" \
+  || fail "declared-off suppressed the divergence report"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds under the declared escape" \
+  || fail "declared-off still refused the merge"
+
+# (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
+# (`declared_of`) or a casing variant would otherwise take the "not require"
+# branch and certify WITHOUT the disclosure — a typo is not a declaration.
+new_scen vacuousbadmode
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9891 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainbad0 9892 > "$SCEN/runs-main"
+lane_jobset 9891 success 'test (a)'
+lane_jobset 9892 success 'test (a)'
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_LANE_PARITY=declared_of bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "a MISSPELLED ADMIN_MERGE_LANE_PARITY is refused at startup (exit 2)" \
+  || fail "expected the startup refusal (exit 2), got $rc — a typo could certify without disclosure"
+grep -q "refusing ADMIN_MERGE_LANE_PARITY" "$TMP/err" && pass "…naming the knob and its two legal values" \
+  || fail "the startup refusal does not name the knob"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted after a refused knob" || pass "no merge attempted"
+
+# The parity key exists ONCE, in `lane_parity_check`, and it is not a second
+# `comm -23`: the one `comm` in this rail belongs to the parser's `--diff` (test
+# 9's parity invariant), and a reader must not have to guess which subtraction a
+# `comm` line belongs to. Asserted at BOTH scopes — the function, so the claim is
+# about the coverage gate; and the whole rail, so the invariant is not re-broken
+# elsewhere.
+lane_parity_fn="$(sed -n '/^lane_parity_check()/,/^}/p' "$ADM")"
+printf '%s\n' "$lane_parity_fn" | grep -qE '^[[:space:]]*comm[[:space:]]+-23' \
+  && fail "lane_parity_check re-implements comm -23 (test 9's parity invariant)" \
+  || pass "lane_parity_check's subtraction is NOT comm -23 (the invariant holds where it was claimed)"
 grep -qE '^[[:space:]]*comm[[:space:]]+-23' "$ADM" \
   && fail "the lane-coverage subtraction re-implements comm -23 in the rail" \
-  || pass "the coverage subtraction is NOT a second comm -23 (test 9's parity invariant holds)"
+  || pass "…and no comm -23 was reintroduced anywhere in the rail"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
