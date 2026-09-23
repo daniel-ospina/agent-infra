@@ -247,6 +247,18 @@ base_tip() {
   gh_ api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true
 }
 
+# Does the PR body carry a SIGNED marker with a diff= identity for this PR and
+# verdict? Mirrors the producer's own carry-forward regex (scripts/record-review.sh,
+# #767/#2982) — keep both in sync. A marker WITHOUT `diff=` (every pre-#767 record)
+# can never be carried forward, so an update is destructive with certainty when
+# this returns non-zero.
+pr_has_carry_evidence() {
+  local body=""
+  body="$(gh_ api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+  [ -n "$body" ] || return 1
+  printf '%s' "$body" | grep -qE "^review recorded: reviews/${PR}\\.json verdict=${RECORD_VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(.*\\) sig=[0-9a-f]{64}$"
+}
+
 resolve_repo() {
   if [ -z "$REPO" ]; then
     REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
@@ -345,6 +357,16 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND — nothing to update"
       return 3 ;;
   esac
+  # B5 — never SPEND an attestation the unit cannot restore. A branch update moves
+  # the head and invalidates the record; the #767 carry-forward can re-bind it only
+  # if the PR body carries a SIGNED marker whose `diff=` equals the live diff. With
+  # no such marker (every pre-#767 record) the update is destructive with certainty,
+  # and the cost is measured: a 22-PR sweep invalidated 17 fresh attestations and
+  # landed 0. This is a PRESENCE test — does an identity-bearing marker exist at all
+  # — NOT an equivalence computation: the producer owns the equivalence decision.
+  if [ "$RECORD_HEAD" = "$HEAD" ] && ! pr_has_carry_evidence; then
+    stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and nothing could re-mint it — the PR carries no signed marker with a diff= identity for verdict '$RECORD_VERDICT' (a pre-#767 record). Record the review in the current format first; then the update carries it. Nothing was merged."
+  fi
   say "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
   if [ "$DRY_RUN" -eq 1 ]; then
     say "atomic-land:     (dry-run) would run: gh pr update-branch $PR"

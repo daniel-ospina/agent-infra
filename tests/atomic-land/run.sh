@@ -131,6 +131,7 @@ case "${1:-} ${2:-}" in
         exit 0 ;;
       */pulls/*)
         case "$jqprog" in
+          *body*) cat "$SCEN/pr-body" 2>/dev/null || echo ""; exit 0 ;;
           *base*)
             if [ -f "$SCEN/base-tip-seq" ]; then
               n=$(( $(cat "$SCEN/base-tip-count" 2>/dev/null || echo 0) + 1 ))
@@ -222,6 +223,11 @@ new_scen() {
   SCEN_RECORD_FILE="$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
   printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
     > "$SCEN_RECORD_FILE"
+  # default PR body: a SIGNED marker WITH a diff= identity, i.e. the post-#767
+  # shape. Scenarios that model a pre-#767 record overwrite this fixture.
+  printf 'review recorded: reviews/42.json verdict=clean @ %s diff=%s (%s) sig=%s\n' \
+    "$HEAD_OLD" "1111111111111111111111111111111111111111111111111111111111111111" "$REPO" \
+    "2222222222222222222222222222222222222222222222222222222222222222" > "$SCEN/pr-body"
 }
 
 run_rail() { # <extra args...>
@@ -298,6 +304,12 @@ echo "── 5. an unaccepted verdict is refused"
 new_scen badverdict
 printf '{"pr":42,"head_sha":"%s","verdict":"pending","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
   > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+# Give the PR a marker carrying the SAME (unaccepted) verdict, so the B5 update
+# guard passes and this scenario isolates the VERDICT check: with the check
+# disabled, nothing else stands between the record and a land.
+printf 'review recorded: reviews/42.json verdict=pending @ %s diff=%s (%s) sig=%s\n' \
+  "$HEAD_OLD" "1111111111111111111111111111111111111111111111111111111111111111" "$REPO" \
+  "2222222222222222222222222222222222222222222222222222222222222222" > "$SCEN/pr-body"
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
 [ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
@@ -536,6 +548,22 @@ rc=$?
 [ "$rc" -eq 0 ] && pass "reclaimed and completed (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
 called "admin-merge" && pass "the unit landed after reclaiming a stale lock" || fail "did not proceed after reclaiming a stale lock"
 
+# ═══ 17f. B5 — never spend an attestation the unit cannot restore ═══════
+# Measured cost of NOT checking this: a 22-PR sweep invalidated 17 fresh
+# attestations and landed 0. A pre-#767 marker is signed but carries no `diff=`,
+# so the carry-forward can never re-bind it — updating is destructive with
+# certainty.
+echo "── 17f. a pre-#767 record refuses to be spent on a branch update (B5)"
+new_scen precarry
+printf 'review recorded: reviews/42.json verdict=clean @ %s (%s) sig=%s\n' \
+  "$HEAD_OLD" "$REPO" "3333333333333333333333333333333333333333333333333333333333333333" > "$SCEN/pr-body"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) — refused to destroy an unrestorable attestation" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch" && fail "updated the branch and spent the attestation (B5)" || pass "did NOT update (the record would have been destroyed)"
+called "admin-merge" && fail "landed after spending the attestation" || pass "did not land"
+grep -qi "no signed marker with a diff=" "$SCEN/err" && pass "the stop names the missing identity" || fail "the stop does not name the missing identity"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B8 must be covered by a test that FAILS against the revision before
@@ -572,6 +600,8 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B5   's/if \[ "\$IS_DRAFT" = "true" \]; then/if false; then/'
   # B8b: trust the delegate's exit status instead of re-reading the record
   mutate_and_expect_fail B8b  's/^  if \[ "\$RECORD_HEAD" != "\$HEAD" \]; then/  if false; then/m'
+  # B5b: spend an attestation without checking it can be re-bound
+  mutate_and_expect_fail B5b  's/if \[ "\$RECORD_HEAD" = "\$HEAD" \] && ! pr_has_carry_evidence; then/if false; then/'
   # B6c: do not re-poll a transient UNKNOWN — a computed-later state false-blocks
   mutate_and_expect_fail B6c  's/while \[ "\$t" -lt "\${ATOMIC_LAND_UNKNOWN_POLLS:-5}" \]; do/while false; do/'
   # B6b: read an undetermined merge state as "up to date" and certify anyway
