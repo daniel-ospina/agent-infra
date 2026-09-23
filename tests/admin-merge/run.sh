@@ -158,8 +158,11 @@
 #      DROPPED". The parser drops a FAILED token that is not a test id (never in
 #      the set), so the rail now NAMES the dropped count and the tokens in its
 #      output and in the POSTED EVIDENCE, and states whether each set is
-#      COMPLETE or CLIPPED. A run whose failures are ENTIRELY unattributable
-#      still refuses (step 1c, preserved).
+#      COMPLETE or CLIPPED. In the evidence the token text is rendered with its
+#      markdown metacharacters ESCAPED and the escape is disclosed, so the
+#      disclosure and #3756's "a hostile token cannot break the evidence" hold at
+#      once; stderr keeps the token verbatim. A run whose failures are ENTIRELY
+#      unattributable still refuses (step 1c, preserved).
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -544,6 +547,11 @@ target_shard() {
 # prefix the summary line does not parse and every failure would be unsigned.
 log_failed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED %s - AssertionError: boom\n' "$1"; }
 log_passed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z PASSED %s\n' "$1"; }
+# A FAILED line whose token is NOT a test id (the reproduced shape: `FAILED (HTTP`).
+# The canonical parser DROPS it and counts it, so the failing set is CLIPPED — the
+# attribution half of #1353 is about naming that instead of letting it read as a
+# measured zero.
+log_unattributable() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED %s upstream error\n' "$1"; }
 
 # Lane-run fixture lines. The parser reads the lane's COMPLETION state from the
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
@@ -1498,7 +1506,8 @@ else
   fail "no evidence comment posted on the flake path"
 fi
 
-# ── 26. a non-nodeid FAILED payload never reaches the evidence (#3756) ─────
+# ── 26. a non-nodeid FAILED payload is dropped + reported, and reaches the
+# evidence only ESCAPED (#3756 / #1353) ───────────────────────────────────
 # A PR author controls test names, so a test can print a bare fence marker in the
 # `FAILED <token>` position. #3756 defect 1: that token is NOT a test id, so the
 # canonical parser DROPS it (counted and reported) before it can ever enter the
@@ -1506,6 +1515,14 @@ fi
 # inert. The evidence stays LISTS-of-ids, and the sound id in the SAME capture
 # still certifies. Reverting the extractor to the shell `awk` puts ` ``` ` back
 # into the evidence and turns this RED.
+#
+# #1353 ADDS A SECOND REQUIREMENT, AND THE TWO ARE RECONCILED, NOT TRADED OFF: the
+# dropped token must now be NAMED in the posted evidence, and it must still not be
+# able to break it. The evidence therefore renders the token with its markdown
+# metacharacters ESCAPED and DISCLOSES that, so the raw fence marker never reaches
+# the comment (the assertion below) while the token IS named (section 54's
+# hostile-token case pins both halves). `UNATTRIBUTABLE` on stderr is still
+# verbatim.
 #
 # Equivalently: an unparseable failure id is DROPPED + REPORTED, never carried,
 # and because the evidence is LISTS there is no fence algorithm to get right. A
@@ -1516,7 +1533,7 @@ fi
 # COUNTS it and REPORTS it as UNATTRIBUTABLE; a run whose ids were all garbage
 # still refuses via the caller's `examined > extracted` gate, and a sound id in
 # the SAME run still certifies.
-echo "== 26. a non-nodeid FAILED payload is dropped before the evidence =="
+echo "== 26. a non-nodeid FAILED payload is dropped, reported, and escaped in the evidence =="
 new_scen btick
 HEAD_BT="dddd333300000000000000000000000000000000"
 printf '%s\n' "$HEAD_BT" > "$SCEN/head"
@@ -4470,6 +4487,141 @@ grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 2 check(s)" "$SCEN/
   && pass "…and BOTH unnamed objects are COUNTED in the TREE surface, not dropped" \
   || fail "the unnamed objects vanish from the tree's measured count: $(grep -m1 'evaluated tree' "$SCEN/out")"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# ── 54. THE ATTRIBUTION HALF: A CLIPPED SET IS NAMED, NOT A ZERO (#1353) ────
+# `PR failing: 0` can mean "no failures", "not comparable" (the parity gate,
+# #1319) OR "the failures were DROPPED": the parser drops a FAILED token that is
+# not a test id, and it is never in the set. The count and the tokens must be
+# named in the rail's OUTPUT and in the POSTED EVIDENCE, so a COMPLETE set is
+# distinguishable from a CLIPPED one. A run whose failures are ENTIRELY
+# unattributable still refuses (step 1c — verified here, not changed).
+echo "== 54. an unattributable FAILED token is NAMED in the output and the evidence (#1353) =="
+
+# (a) THE REPRODUCTION. The PR carries ONE real id AND one dropped token; main
+# measures the real id, so the decision exempts it and the rail MERGES with
+# evidence. The drop must appear in both streams: `PR failing: 0`-style zeros must
+# never be readable as complete when a token was dropped.
+new_scen attribution-named
+HEAD_AT1="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AT1" > "$SCEN/head"
+FAIL_AT='tests/test_other.py::test_red_on_main'
+lane_fail "$HEAD_AT1" 8801 > "$SCEN/runs-$HEAD_AT1"
+{ log_failed "$FAIL_AT"; log_unattributable '(HTTP'; } > "$SCEN/log-8801"
+main_red_n mainat 9001 3 "$FAIL_AT" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a PR with one exempt failure and one DROPPED token still merges (exit 0)" \
+  || fail "the attribution disclosure blocked a merge it must not (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "the PR's failing set" "$SCEN/err" && grep -q "CLIPPED" "$SCEN/err" \
+  && pass "the RAIL'S OUTPUT names the drop count and says the set is CLIPPED" \
+  || fail "the rail does not name the dropped token on stderr: $(grep -m1 DROPPED "$SCEN/err")"
+grep -q -- "DROPPED: (HTTP" "$SCEN/err" && pass "…naming the dropped TOKEN verbatim" \
+  || fail "the dropped token is not named on stderr"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "Attribution — FAILED tokens DROPPED by the parser" "$SCEN/comment" \
+    && pass "the POSTED EVIDENCE states the attribution line" \
+    || fail "the posted evidence has no attribution line"
+  grep -q "PR=1 | main=0" "$SCEN/comment" && pass "…with BOTH counts (PR drops=1, main drops=0)" \
+    || fail "the evidence does not state the drop counts"
+  grep -q -- "- (HTTP" "$SCEN/comment" && pass "…and the dropped TOKEN in the evidence's own list" \
+    || fail "the dropped token is not in the posted evidence"
+  grep -q "CLIPPED" "$SCEN/comment" && pass "…naming the set CLIPPED (not comparable to a measured zero)" \
+    || fail "the evidence does not say the set is CLIPPED"
+  # A REAL newline, not a `\n` that bash double quotes do not expand — a literal
+  # escape shipped into a posted comment is exactly the kind of unreadable line
+  # this evidence block exists to avoid.
+  grep -qF 'main=0.\n' "$SCEN/comment" \
+    && fail "the attribution line ships a LITERAL backslash-n instead of a line break" \
+    || pass "…and its line break is a REAL newline"
+else
+  fail "no evidence comment posted for the attribution case"
+fi
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (b) A COMPLETE SET IS STATED AS COMPLETE — the disclosure is unconditional, so
+# an empty drop list means "none", not "not measured".
+new_scen attribution-complete
+HEAD_AT2="f5f5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AT2" > "$SCEN/head"
+lane_pass "$HEAD_AT2" 8901 > "$SCEN/runs-$HEAD_AT2"
+lane_pass mainat2 8902 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a fully readable, green surface still merges (exit 0)" \
+  || fail "the attribution disclosure blocked a clean merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=0 | main=0" "$SCEN/comment" && pass "…and the evidence states ZERO drops explicitly" \
+    || fail "the evidence omits the drop count when it is zero"
+  grep -q "COMPLETE" "$SCEN/comment" && pass "…and says the failing sets are COMPLETE, not merely empty" \
+    || fail "the evidence does not distinguish COMPLETE from unmeasured"
+else
+  fail "no evidence comment posted for the complete case"
+fi
+
+# (c) THE RECONCILIATION WITH #3756's INJECTION PIN. A DROPPED token can be
+# HOSTILE — a bare fence marker in the `FAILED` position is the reproduced
+# payload — and #1353 still requires it NAMED in the posted evidence. Both hold
+# because the evidence renders the token with its markdown metacharacters ESCAPED
+# (disclosed in the block heading) while stderr keeps it verbatim: the token is
+# named AND the #3756 property (a hostile token cannot open a fence or close a
+# details block) is preserved.
+new_scen attribution-hostile-token
+HEAD_AT4="f7f7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AT4" > "$SCEN/head"
+lane_fail "$HEAD_AT4" 8904 > "$SCEN/runs-$HEAD_AT4"
+{ log_failed 'tests/test_other.py::test_red_on_main'; log_failed '```'; } > "$SCEN/log-8904"
+main_red_n mainat4 9004 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a hostile dropped token does not block a sound merge (exit 0)" \
+  || fail "the hostile-token disclosure blocked a merge (exit $rc)"
+# STDERR keeps the token VERBATIM — that is the byte-exact surface an operator
+# greps, and a terminal is not markdown.
+grep -qF 'DROPPED: ```' "$SCEN/err" && pass "the rail's OUTPUT carries the hostile token VERBATIM on stderr" \
+  || fail "the hostile token is not named verbatim on stderr"
+if [ -f "$SCEN/comment" ]; then
+  grep -qF 'markdown metacharacters escaped' "$SCEN/comment" \
+    && pass "the POSTED EVIDENCE discloses that the rendering is escaped" \
+    || fail "the evidence does not disclose the escape"
+  grep -qF '\`\`\`' "$SCEN/comment" \
+    && pass "…and the token IS named there (escaped), so the set is still not a bare zero" \
+    || fail "the dropped token is not named at all in the evidence"
+  grep -qF '```' "$SCEN/comment" \
+    && fail "raw backticks reached the evidence — the #3756 fence surface is back" \
+    || pass "…while NO raw fence token reaches the evidence (the #3756 property holds)"
+  d_open=$(grep -c '^<details>' "$SCEN/comment"); d_close=$(grep -c '^</details>$' "$SCEN/comment")
+  [ "$d_open" -ge 3 ] && [ "$d_open" -eq "$d_close" ] \
+    && pass "…and every evidence block stays balanced ($d_open/$d_close)" \
+    || fail "block structure damaged ($d_open opened, $d_close closed)"
+else
+  fail "no evidence comment posted for the hostile-token case"
+fi
+
+# (d) A RUN WHOSE FAILURES ARE ENTIRELY UNATTRIBUTABLE REFUSES. This is the
+# PRE-EXISTING step-1c gate (`examined > extracted`) — verified to still hold,
+# now with the dropped tokens named at the point of refusal.
+new_scen attribution-all-dropped
+HEAD_AT3="f6f6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AT3" > "$SCEN/head"
+lane_fail "$HEAD_AT3" 8903 > "$SCEN/runs-$HEAD_AT3"
+log_unattributable '(HTTP' > "$SCEN/log-8903"
+main_red_n mainat3 9003 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a run whose failures were ENTIRELY dropped REFUSES (exit $rc)" \
+  || fail "an entirely-unattributable failing run was read as an empty set and MERGED"
+grep -q "yielded NO parseable" "$SCEN/err" && pass "…via the preserved step-1c gate" \
+  || fail "the refusal is not the extraction gate: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q -- "DROPPED: (HTTP" "$SCEN/err" && pass "…and the DROPPED token is named at the refusal" \
+  || fail "the refusal does not name the token it dropped"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an entirely-dropped set" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an entirely-dropped set" || pass "no merge attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

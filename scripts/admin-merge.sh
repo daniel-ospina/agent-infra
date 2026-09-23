@@ -230,6 +230,21 @@
 # partial read must never convert a refusal into a merge. Only BOTH endpoints
 # failing is the "never read at all" state.
 #
+# THE FAILING SET IS COMPLETE OR CLIPPED, AND THE DIFFERENCE IS NAMED (#1353).
+# The parser DROPS a `FAILED` token that is not a test id — it never enters the
+# set — so `PR failing: 0` has three meanings: "no failures", "not comparable"
+# (the lane-parity gate, #1319) and "the failures were DROPPED". The parser names
+# every dropped token on its stderr; the rail CAPTURES that stream per call site,
+# names the count and the tokens on stderr, and carries BOTH into the posted
+# evidence (an `Attribution — FAILED tokens DROPPED…` line with the counts, plus a
+# token list that states COMPLETE when empty). In the EVIDENCE the token text is
+# rendered with its markdown metacharacters ESCAPED, so #1353's disclosure and
+# #3756's "the evidence is inert to a hostile token" hold at once; on STDERR the
+# text is verbatim. A run whose failures are ENTIRELY
+# unattributable still BLOCKS at step 1c — preserved, and now naming the tokens it
+# dropped. A PARTIAL drop does not block: the run yielded ids, and the set is
+# merely CLIPPED — which the evidence states rather than leaving to be inferred.
+#
 # STALENESS: A RED BASE THE PR HAS NOT MEASURED (#1261, step 4.6). The tree
 # surface above reflects the base AS OF THE PR'S LAST RUN, and GitHub does not
 # reliably re-run PR workflows when the base moves. So a base red that appeared
@@ -471,6 +486,76 @@ count_lines() { wc -l < "$1" | tr -d ' '; }
 report_value() {
   [ -n "$1" ] && [ -r "$1" ] || { printf ''; return 0; }
   awk -F= -v k="$2" '$1 == k { print $2 }' "$1"
+}
+
+# ── THE ATTRIBUTION HALF (#1353) — a CLIPPED set is not an EMPTY one ──────
+# The parser DROPS a `FAILED` token that is not a test id: it never enters the
+# failure set, so `PR failing: 0` can mean "no failures", "not comparable" (the
+# lane-parity gate, #1319) OR "the failures were DROPPED". The parser NAMES every
+# dropped token on its stderr; the rail CAPTURES that stream per call site (it
+# used to be inherited and lost) so the count and the tokens can be reported and
+# put in the POSTED EVIDENCE. The wording follows the parity gate rather than
+# inventing a competing vocabulary: a set with drops is NOT COMPARABLE to a
+# measured zero.
+#
+# FAIL CLOSED ON THE COUNT. The parser's own `unattributable=N` summaries are
+# SUMMED and the DROPPED token lines are counted; `unattributable_count` reports
+# the LARGER, so a renamed/missing summary line cannot make a clipped set read as
+# complete, and a summary with no token text cannot make the drops vanish.
+unattributable_count() {
+  local f="${1:-}" reported named n
+  [ -n "$f" ] && [ -s "$f" ] || { printf '0'; return 0; }
+  reported="$(sed -n 's/.*unattributable=\([0-9][0-9]*\).*/\1/p' "$f" | awk '{s += $1} END {print s + 0}')"
+  counter_is_number "$reported" || reported=0
+  named="$(grep -c 'DROPPED (never in the failure set):' "$f" 2>/dev/null || true)"; named="${named:-0}"
+  counter_is_number "$named" || named=0
+  if counter_exceeds_max "$reported" "$named"; then n="$reported"; else n="$named"; fi
+  printf '%s' "$n"
+}
+
+# unattributable_tokens <parser-stderr-file> → the dropped tokens, one per line.
+unattributable_tokens() {
+  local f="${1:-}"
+  [ -n "$f" ] && [ -s "$f" ] || return 0
+  sed -n 's/.*DROPPED (never in the failure set): //p' "$f"
+  return 0
+}
+
+# unattributable_count_of <file>... → the counts of several collections, summed.
+unattributable_count_of() {
+  local f c n=0
+  for f in "$@"; do
+    c="$(unattributable_count "$f")"
+    counter_is_number "$c" || c=0
+    n=$((n + c))
+  done
+  printf '%s' "$n"
+}
+
+# unattributable_tokens_of <file>... → the DISTINCT dropped tokens, one per line.
+unattributable_tokens_of() {
+  local f
+  for f in "$@"; do unattributable_tokens "$f"; done | sort -u
+  return 0
+}
+
+# report_unattributable <parser-stderr-file> <label> — NAME the drops on stderr.
+# Returns 0 when nothing was dropped, 1 when anything was.
+report_unattributable() {
+  local f="${1:-}" label="${2:-a failing set}" n tokens
+  n="$(unattributable_count "$f")"
+  tokens="$(unattributable_tokens "$f")"
+  if counter_is_zero "$n" && [ -z "$tokens" ]; then return 0; fi
+  say_err "admin-merge: ⚠️  $label — $n FAILED token(s) were DROPPED by the parser: they are not"
+  say_err "   test ids, so they are NOT in the failing set. The set is CLIPPED, not empty, and a"
+  say_err "   CLIPPED set is NOT COMPARABLE to a measured zero (the lane-parity gate's"
+  say_err "   vocabulary, #1319). The tokens are named here and carried in the posted evidence."
+  if [ -n "$tokens" ]; then
+    printf '%s\n' "$tokens" | sed 's/^/      DROPPED: /' >&2
+  else
+    say_err "      (the parser reported $n drop(s) but named no token text in its diagnostics)"
+  fi
+  return 1
 }
 
 # Counter predicates — and why they are written this way.
@@ -1947,6 +2032,22 @@ print_bounds() {
 EVIDENCE_ENTRIES=25
 EVIDENCE_WIDTH=300
 
+# evidence_token_escape — neutralise the markdown/HTML metacharacters a hostile
+# `FAILED` token could carry, before it is written into the POSTED EVIDENCE. This
+# is the RECONCILIATION of two properties that pull in opposite directions:
+#   * #1353 requires a DROPPED token to be NAMED in the posted evidence, and
+#   * #3756 requires the evidence to stay INERT to a hostile token — a ` ``` `
+#     payload must not open a code fence and swallow the comment, a `~~~` fence
+#     must not do the same, and a `</details>` must not close a block early.
+# The evidence is the ONE rendered surface; the escape is DISCLOSED in the list
+# heading, so a reader knows the text is the token with metacharacters escaped
+# rather than the raw bytes. The rail's STDERR keeps the token VERBATIM — a
+# terminal is not a markdown surface, and the byte-exact text is what an operator
+# greps for.
+evidence_token_escape() {
+  sed -e 's/\\/\\\\/g' -e 's/`/\\`/g' -e 's/</\\</g' -e 's/>/\\>/g' -e 's/~/\\~/g'
+}
+
 # One <details> block: a list, capped, with a single stated remainder.
 #   $1 summary   $2 newline-separated content   $3 what to say when empty
 evidence_list() {
@@ -1987,6 +2088,7 @@ build_evidence() {
   local head="$1" main_prov="$2" pr_count="$3" main_count="$4"
   local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
   local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}" exempt_raw="${12:-}"
+  local unattr_tokens="${13:-}"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
@@ -2027,6 +2129,15 @@ build_evidence() {
   fi
   evidence_list 'final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty' \
     "$final_unique_raw" "(empty — the decision exempts every failure this PR carries)"
+  # THE ATTRIBUTION HALF (#1353) — one line per merge, ALWAYS, so a CLIPPED set is
+  # never mistaken for a measured zero and a COMPLETE set is stated rather than
+  # assumed. The count itself is in the analysed block above; this is the tokens.
+  # The token text is ESCAPED for this markdown surface only (see
+  # evidence_token_escape): the token is NAMED and the evidence stays inert, so
+  # #1353's disclosure and #3756's injection pin hold at the same time.
+  evidence_list 'FAILED token(s) the parser DROPPED — not test ids, so NOT in any failing set (a CLIPPED set is NOT COMPARABLE to a measured zero, #1319). Rendering: the token text with markdown metacharacters escaped, so the evidence block structure cannot be broken.' \
+    "$(printf '%s\n' "$unattr_tokens" | evidence_token_escape)" \
+    "(none — every FAILED token was a test id, so the failing sets above are COMPLETE)"
   printf '\nLists show at most %s entries of %s chars; the full sets are reproducible from the run ids above.\n' \
     "$EVIDENCE_ENTRIES" "$EVIDENCE_WIDTH"
   printf '%s\n' "$flake_line"
@@ -2235,9 +2346,14 @@ main() {
   # evidence marker names. `--pr` would re-resolve the head internally, so a push
   # between the two resolutions could analyze one SHA and certify another (#P1).
   local pr_status=0
+  # THE PARSER'S DIAGNOSTICS ARE CAPTURED, NOT INHERITED (#1353): the dropped
+  # FAILED tokens it names are the ONLY source of the attribution half, and they
+  # must reach the posted evidence. They are re-emitted verbatim below, so nothing
+  # that used to be visible on stderr is silenced.
   run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
     --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" --per-run "$TMP/pr-per-run.txt" \
-    > "$TMP/pr-rows.txt" || pr_status=$?
+    > "$TMP/pr-rows.txt" 2> "$TMP/pr-drops.err" || pr_status=$?
+  [ -s "$TMP/pr-drops.err" ] && cat "$TMP/pr-drops.err" >&2
   if [ "$pr_status" -ne 0 ]; then
     say_err "admin-merge: ✗ BLOCK — could not extract the PR's failing set (parser exit $pr_status)."
     say_err "   Refusing to certify a comparison computed over an unreadable set."
@@ -2363,8 +2479,20 @@ main() {
     say_err "   set and 'blocked by the decision: 0' would be a false certificate (lane: $lane)."
     say_err "   Either the run failed outside the test step (fix it), or the log format moved"
     say_err "   and the parser needs updating. This is a refusal, not a comparison."
+    # NAME the dropped tokens here too: when a run's failures were ENTIRELY
+    # unattributable this refusal is the one the operator sees, and the reason is
+    # exactly the drop (#1353).
+    if ! counter_is_zero "$(unattributable_count "$TMP/pr-drops.err")"; then
+      say_err "   The parser DROPPED $(unattributable_count "$TMP/pr-drops.err") FAILED token(s) in these runs — not test ids, so NOT in the set:"
+      unattributable_tokens "$TMP/pr-drops.err" | sed 's/^/      DROPPED: /' >&2
+    fi
     exit 1
   fi
+
+  # NAME the drops on the ordinary path too: a partial drop does not block (the
+  # run DID yield ids), but the set it produced is CLIPPED and must not be read as
+  # a complete measurement (#1353).
+  report_unattributable "$TMP/pr-drops.err" "the PR's failing set" || true
 
   info "admin-merge: lane finished for $head (${pr_tested} tested of ${pr_completed} completed run(s))"
 
@@ -2375,21 +2503,31 @@ main() {
   local main_status=0
   run_failure_set --main-union-rates "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
     --exclude "$head" --provenance "$TMP/main-runs.txt" --runs-report "$TMP/main-report.txt" \
-    > "$TMP/main-rates.txt" || main_status=$?
+    > "$TMP/main-rates.txt" 2> "$TMP/main-drops.err" || main_status=$?
+  [ -s "$TMP/main-drops.err" ] && cat "$TMP/main-drops.err" >&2
   if [ "$main_status" -ne 0 ]; then
     say_err "admin-merge: ✗ BLOCK — could not extract main's rate table (parser exit $main_status)."
     say_err "   Refusing to certify a comparison computed over an unreadable baseline."
     exit 1
   fi
   local main_sig_status=0
+  # A SEPARATE capture for the signature pass. It re-parses the SAME main runs, so
+  # its drops are the same tokens the rate pass already counted — capturing them
+  # into the rate file would DOUBLE the count in the evidence. They are re-emitted
+  # for visibility and deliberately NOT counted.
   run_failure_set --main-union-signatures "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
     --exclude "$head" \
-    > "$TMP/main-signatures.txt" || main_sig_status=$?
+    > "$TMP/main-signatures.txt" 2> "$TMP/main-sig-drops.err" || main_sig_status=$?
+  [ -s "$TMP/main-sig-drops.err" ] && cat "$TMP/main-sig-drops.err" >&2
   if [ "$main_sig_status" -ne 0 ]; then
     say_err "admin-merge: ✗ BLOCK — could not extract main's signature table (parser exit $main_sig_status)."
     say_err "   Without it every signature check fails closed; that is a refusal, not a green."
     exit 1
   fi
+  # NAME main's drops: a dropped token under-reports the BASELINE, which can only
+  # make a residual look larger (a false block, the re-run path's business) — but
+  # it is still a CLIPPED measurement and is named as one (#1353).
+  report_unattributable "$TMP/main-drops.err" "main's baseline failing set" || true
   # main's failing UNION — the baseline list the evidence shows — IS the rate
   # table's id column. One measurement, one source, no second pass to disagree.
   cut -f1 "$TMP/main-rates.txt" 2>/dev/null | sort -u > "$TMP/main-fails.txt"
@@ -2638,7 +2776,9 @@ main() {
     local pr_status2=0
     run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
       --runs-report "$TMP/pr-report2.txt" --per-run "$TMP/pr-per-run2.txt" \
-      > "$TMP/pr-rows2.txt" || pr_status2=$?
+      > "$TMP/pr-rows2.txt" 2> "$TMP/pr-drops2.err" || pr_status2=$?
+    [ -s "$TMP/pr-drops2.err" ] && cat "$TMP/pr-drops2.err" >&2
+    report_unattributable "$TMP/pr-drops2.err" "the PR's failing set (post-rerun collection)" || true
     [ "$pr_status2" -eq 0 ] || { say_err "admin-merge: ✗ BLOCK — PR failing set unreadable after re-run"; exit 1; }
     cut -f1 "$TMP/pr-rows2.txt" 2>/dev/null | sort -u > "$TMP/pr-fails2.txt"
     # THE SECOND DOOR (#3756): the post-rerun verdict is the DECISION again, not a
@@ -2970,6 +3110,24 @@ Base check surface (every workflow and app on head of '$base_ref'): ${BASE_STATU
   analyzed="$analyzed
 $health_line"
 
+  # ── THE ATTRIBUTION HALF, IN THE POSTED EVIDENCE (#1353) ────────────────
+  # `PR failing: 0` can mean "no failures", "not comparable" (the parity gate)
+  # OR "the failures were DROPPED". The parser puts every dropped token on
+  # stderr; this states the COUNT for each side in the evidence, and the token
+  # list follows as its own list block, so a COMPLETE set is distinguishable from
+  # a CLIPPED one. Named as its own step so the number is not inferable only from
+  # a token list that may be empty for a reason other than "none".
+  local pr_drops main_drops attribution_line unattr_tokens
+  pr_drops="$(unattributable_count_of "$TMP/pr-drops.err" "$TMP/pr-drops2.err")"
+  main_drops="$(unattributable_count_of "$TMP/main-drops.err")"
+  unattr_tokens="$(unattributable_tokens_of "$TMP/pr-drops.err" "$TMP/pr-drops2.err" "$TMP/main-drops.err")"
+  # NOTE: a REAL newline, not `\n` — bash does not expand escapes inside double
+  # quotes, and a literal `\n` would ship into the posted evidence.
+  attribution_line="Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=${pr_drops} | main=${main_drops}.
+   A set carrying a dropped token is CLIPPED, and a CLIPPED set is NOT COMPARABLE to a measured zero (the lane-parity gate's vocabulary, #1319). COMPLETE is the drop count 0 with no token listed below."
+  analyzed="$analyzed
+$attribution_line"
+
   # ── 4c. A VACUOUS PASS IS AN ABSENCE, NOT A MEASUREMENT (#1319) ──────────
   # `PR failing: 0 | main failing: 0` certifies nothing on its own: the two
   # zeros mean "the lanes were green" ONLY if both sides ran the SAME lane. On
@@ -3082,7 +3240,7 @@ $health_line"
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
     "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
     "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" \
-    "$(cat "$final_exempt" 2>/dev/null || true)" > "$TMP/evidence.md"
+    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"
