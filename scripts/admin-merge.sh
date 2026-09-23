@@ -168,6 +168,14 @@
 # non-completed run is never a MEASUREMENT either, so it cannot set the surface's
 # last-production time (the staleness anchor).
 #
+# AND NOTHING IS DROPPED BEFORE CLASSIFICATION (#1353). A check run with an empty
+# `name` — or a legacy status with an empty `context` — used to be `continue`d
+# away, so a RED on it appeared in NEITHER the red nor the pending list, the
+# surface read `unmeasured — 0 failing of 0 measured`, and the rail merged. An
+# unnamed check takes a PLACEHOLDER name and is classified by its conclusion like
+# any other; an unnamed JOB likewise stays in the re-run bound's shard map (with
+# no green sample, so it takes the fail-safe bound — never a too-small one).
+#
 # AND RED ONLY BLOCKS WHEN IT MEASURES CODE. MAIN's surface is dominated by
 # lanes that measure no revision: on tortoise's last eight main commits SEVEN
 # carried a failure-like check, and over the repo's last 100 main runs 6 of the
@@ -1236,9 +1244,12 @@ if target is None:
 shards = {}
 target_completed = 0
 for job in target:
-    name = norm(job.get("name"))
-    if not name:
-        continue
+    # An unnamed JOB is not dropped either (#1353): a name-less shard must not
+    # vanish from the shard map, or an UNFINISHED one disappears from the bound
+    # pool and the bound is derived from a set that excludes it. The
+    # placeholder has no green sample, so it takes the FAIL-SAFE bound — the
+    # direction that can never make a bound too small.
+    name = norm(job.get("name")) or "(unnamed job)"
     rec = shards.setdefault(name, {"unfinished": False})
     if job.get("status") and job.get("status") != "completed":
         rec["unfinished"] = True
@@ -1254,9 +1265,7 @@ for path in gpaths:
     for job in jobs:
         if job.get("conclusion") != "success":
             continue
-        name = norm(job.get("name"))
-        if not name:
-            continue
+        name = norm(job.get("name")) or "(unnamed job)"
         secs_n = secs(job)
         if secs_n is None:
             continue
@@ -1576,11 +1585,17 @@ for d in docs(sys.argv[1]):
 # THE LATEST CHECK RUN PER (app, name) DECIDES - a re-run leaves the OLD
 # failing run in place beside the new one, so "any failure-like run" would
 # report a RED that GitHub itself reports green (see the header).
+# AN UNNAMED CHECK RUN IS CLASSIFIED, NOT DROPPED (#1353). `if not name: continue`
+# let a RED vanish before classification: an unnamed run never entered `best`, so
+# it appeared in NEITHER the red nor the pending list and the surface read
+# `unmeasured — 0 failing of 0 measured` and MERGED. A check GitHub reports is a
+# check the rail must CLASSIFY, so an unnamed one takes a PLACEHOLDER identity and
+# is classified by its conclusion like any other — RED unless that conclusion is
+# one this rail names as non-red.
+UNNAMED_CHECK = "(unnamed check)"
 best = {}
 for r in cr_runs:
-    name = str(r.get("name") or "")
-    if not name:
-        continue
+    name = str(r.get("name") or "") or UNNAMED_CHECK
     app = str((r.get("app") or {}).get("slug") or "unknown")
     try:
         rid = int(r.get("id") or 0)
@@ -1599,12 +1614,13 @@ for d in docs(sys.argv[2]):
 
 # Legacy commit statuses: latest per context. NOTE the combined-status body
 # reports aggregate state "pending" when it carries ZERO statuses, so the
-# aggregate is NEVER read here - only the per-context entries.
+# aggregate is NEVER read here - only the per-context entries. An UNNAMED context
+# is NOT dropped either (#1353): it takes a placeholder and is classified by its
+# state, so a red cannot vanish before classification.
+UNNAMED_STATUS = "(unnamed status)"
 sbest = {}
 for s in statuses:
-    ctx = str(s.get("context") or "")
-    if not ctx:
-        continue
+    ctx = str(s.get("context") or "") or UNNAMED_STATUS
     stamp = str(s.get("updated_at") or s.get("created_at") or "")
     if ctx not in sbest or stamp > sbest[ctx][0]:
         sbest[ctx] = (stamp, ctx, str(s.get("state") or ""), str(s.get("target_url") or ""))

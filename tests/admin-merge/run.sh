@@ -4406,6 +4406,71 @@ grep -q "NON-code events" "$SCEN/out" && pass "…and the base's non-code red is
   || fail "the base's non-code red is no longer reported"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
 
+# ── 53. AN UNNAMED CHECK IS CLASSIFIED, NEVER DROPPED (#1353) ───────────────
+# `if not name: continue` dropped a check run before classification: a RED on an
+# unnamed run appeared in NEITHER the red nor the pending list, the surface read
+# `unmeasured — 0 failing of 0 measured`, and the rail merged. "Unnamed" is a
+# value the posture must NAME and classify, not one it may discard.
+echo "== 53. an unnamed check run is classified under a placeholder, never dropped (#1353) =="
+
+# (a) THE REPRODUCTION — an UNNAMED RED CHECK RUN on the PR's evaluated tree.
+new_scen unnamed-tree-check
+HEAD_U1="f1f1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_U1" > "$SCEN/head"
+lane_pass "$HEAD_U1" 5931 > "$SCEN/runs-$HEAD_U1"
+lane_pass mainu1 5932 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 9104 '' completed failure 6911)"
+pr_run_map 6911 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNNAMED completed-failure check BLOCKS (exit $rc)" \
+  || fail "an unnamed red was dropped before classification and MERGED — the silent-drop hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "(unnamed check)" "$SCEN/err" && pass "…naming the PLACEHOLDER identity it was classified under" \
+  || fail "the refusal does not name the placeholder"
+grep -q "UNMEASURED" "$SCEN/err" && fail "the unnamed red was read as an EMPTY surface" \
+  || pass "…and the surface is NOT reported as empty"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a dropped red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a dropped red" || pass "no merge attempted"
+
+# (b) THE SAME DROP FOR A LEGACY STATUS with an EMPTY context — the other half of
+# the rule, and the one the statuses loop owned separately.
+new_scen unnamed-tree-status
+HEAD_U2="f2f2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_U2" > "$SCEN/head"
+lane_pass "$HEAD_U2" 5933 > "$SCEN/runs-$HEAD_U2"
+lane_pass mainu2 5934 > "$SCEN/runs-main"
+main_green_surface
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNNAMED red legacy status BLOCKS too (exit $rc)" \
+  || fail "an unnamed status context was dropped and MERGED"
+grep -q "(unnamed status)" "$SCEN/err" && pass "…naming the placeholder for the status" \
+  || fail "the refusal does not name the unnamed status"
+
+# (c) THE OVER-BLOCK GUARD: an UNNAMED but NON-RED check is not reddened by the
+# placeholder — it is classified by its conclusion exactly like a named one.
+new_scen unnamed-nonred
+HEAD_U3="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_U3" > "$SCEN/head"
+lane_pass "$HEAD_U3" 5935 > "$SCEN/runs-$HEAD_U3"
+lane_pass mainu3 5936 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 9105 '' completed success 6913)"
+pr_run_map 6913 pull_request 'CI'
+printf '{"state":"success","total_count":1,"statuses":[{"context":"","state":"success","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/2"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "an unnamed SUCCESS check/status is classified non-red and MERGES (exit 0)" \
+  || fail "the placeholder reddened a legitimately non-red check (exit $rc): $(sed -n '1,3p' "$SCEN/err" 2>/dev/null)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 2 check(s)" "$SCEN/out" \
+  && pass "…and BOTH unnamed objects are COUNTED in the TREE surface, not dropped" \
+  || fail "the unnamed objects vanish from the tree's measured count: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
