@@ -89,6 +89,8 @@
 #                           Deliberately NOT under $TMPDIR, which is caller-controlled.
 #   ATOMIC_LAND_LOCK_GRACE  seconds a pid-less lock is treated as LIVE, not stale
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
+#   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
+#                           before failing closed (default: 5).
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
@@ -313,17 +315,32 @@ verdict_accepted() {
 
 # ── step 1: update ───────────────────────────────────────────────────────
 do_update() { # 0 = updated, 3 = not behind (no-op)
-  local before="$HEAD" after="" i
+  local before="$HEAD" after="" i t=0
+  case "$MERGE_STATE" in
+    UNKNOWN|""|null)
+      # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
+      # determine the merge state. Reading it as "nothing to update" would certify
+      # the head against a base relation nobody established, then land on it.
+      # But UNKNOWN is TRANSIENT — GitHub computes mergeability lazily — so re-poll
+      # a bounded number of times before refusing: a state that is merely still
+      # being computed must not false-block the unit, while a genuinely
+      # undetermined state still fails CLOSED.
+      while [ "$t" -lt "${ATOMIC_LAND_UNKNOWN_POLLS:-5}" ]; do
+        t=$((t + 1))
+        sleep "$POLL"
+        resolve_state
+        case "$MERGE_STATE" in UNKNOWN|""|null) : ;; *) break ;; esac
+      done
+      case "$MERGE_STATE" in
+        UNKNOWN|""|null)
+          stop "the merge state of $REPO#$PR is still undetermined after $t re-poll(s) (mergeStateStatus=${MERGE_STATE:-<none>}) — refusing to certify a head whose base relation is unknown (B6/B12)" ;;
+      esac ;;
+  esac
   case "$MERGE_STATE" in
     BEHIND) : ;;
     CLEAN)
       say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
       return 3 ;;
-    UNKNOWN|""|null)
-      # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
-      # determine the merge state. Reading it as "nothing to update" would certify
-      # the head against a base relation nobody established, then land on it.
-      stop "the merge state of $REPO#$PR could not be determined (mergeStateStatus=${MERGE_STATE:-<none>}) — refusing to certify a head whose base relation is unknown (B6/B12)" ;;
     *)
       say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND — nothing to update"
       return 3 ;;

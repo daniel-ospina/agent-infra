@@ -68,6 +68,17 @@ printf '%s\n' "$*" >> "$SCEN/calls"
 
 # current head: starts at the fixture and moves when update-branch succeeds
 cur_head() { cat "$SCEN/head" 2>/dev/null || cat "$SCEN/head-old"; }
+# A transient `mergeStateStatus` is modelled with a sequence file: line N feeds the
+# Nth read (GitHub computes mergeability lazily, so UNKNOWN is usually temporary).
+cur_state() {
+  if [ -f "$SCEN/state-seq" ]; then
+    local n; n=$(( $(cat "$SCEN/state-count" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$n" > "$SCEN/state-count"
+    sed -n "${n}p" "$SCEN/state-seq"
+  else
+    cat "$SCEN/state" 2>/dev/null || echo BEHIND
+  fi
+}
 
 case "${1:-} ${2:-}" in
   "repo view")
@@ -86,7 +97,7 @@ case "${1:-} ${2:-}" in
     case "$json" in
       *isDraft*)
         printf '%s\t%s\t%s\t%s\n' "$(cur_head)" "$(cat "$SCEN/base" 2>/dev/null || echo main)" \
-          "$(cat "$SCEN/state" 2>/dev/null || echo BEHIND)" "$(cat "$SCEN/draft" 2>/dev/null || echo false)"
+          "$(cur_state)" "$(cat "$SCEN/draft" 2>/dev/null || echo false)"
         exit 0 ;;
       *baseRefName*)
         printf '%s\t%s\n' "$(cur_head)" "$(cat "$SCEN/base" 2>/dev/null || echo main)"; exit 0 ;;
@@ -192,6 +203,7 @@ new_scen() {
   SCEN_RECORD_NO_WRITE=0
   SCEN_RECORD_MOVES_HEAD=0; SCEN_RECORD_REPOINTS_BASE=0; HEAD_MOVED="cccccccccccccccccccccccccccccccccccccccc"
   unset mb_seq 2>/dev/null || true
+  rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
   mkdir -p "$SCEN" "$SCEN/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_OLD" > "$SCEN/head-old"
   printf '%s\n' "$HEAD_NEW" > "$SCEN/head-new"
@@ -475,7 +487,15 @@ rc=$?
 [ "$rc" -eq 1 ] && pass "stopped (rc 1)" || fail "expected rc 1, got $rc"
 called "pr update-branch" && fail "mutated on an undetermined merge state" || pass "no update on an undetermined state"
 called "admin-merge" && fail "landed on an undetermined merge state (B6/B12 fail-open)" || pass "did NOT land on an undetermined merge state"
-grep -qi "could not be determined" "$SCEN/err" && pass "the stop names the undetermined state" || fail "the stop does not name the undetermined state"
+grep -qi "still undetermined" "$SCEN/err" && pass "the stop names the undetermined state" || fail "the stop does not name the undetermined state"
+
+printf 'UNKNOWN\n' > "$SCEN/state"
+printf 'UNKNOWN\nUNKNOWN\nCLEAN\n' > "$SCEN/state-seq"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "re-polled the transient UNKNOWN and settled (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "admin-merge" && pass "the unit proceeded once the state settled" || fail "did not proceed after the state settled"
+rm -f "$SCEN/state-seq" "$SCEN/state-count"
 
 # ═══ 17c. B11 — a pid-less (young) lock is LIVE, not stale ═══════════════
 # The lock directory exists before the pid is written, so a rail in that window
@@ -552,8 +572,10 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B5   's/if \[ "\$IS_DRAFT" = "true" \]; then/if false; then/'
   # B8b: trust the delegate's exit status instead of re-reading the record
   mutate_and_expect_fail B8b  's/^  if \[ "\$RECORD_HEAD" != "\$HEAD" \]; then/  if false; then/m'
+  # B6c: do not re-poll a transient UNKNOWN — a computed-later state false-blocks
+  mutate_and_expect_fail B6c  's/while \[ "\$t" -lt "\${ATOMIC_LAND_UNKNOWN_POLLS:-5}" \]; do/while false; do/'
   # B6b: read an undetermined merge state as "up to date" and certify anyway
-  mutate_and_expect_fail B6b  's/^      stop "the merge state of .*$/      return 3/m'
+  mutate_and_expect_fail B6b  's/^(\s*)stop "the merge state of .*$/$1return 3/m'
   # B11b: reclaim a pid-less lock immediately — the mkdir→pid TOCTOU
   mutate_and_expect_fail B11b 's/if \[ "\$age" -lt "\${ATOMIC_LAND_LOCK_GRACE:-60}" \]; then/if false; then/'
   # B6: never stop on the terminal-check wait expiry
