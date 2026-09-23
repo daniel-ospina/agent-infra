@@ -288,7 +288,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       # producer IS the signer (#784). So verify the HMAC over the marker text.
       # VERDICT is pinned in the pattern too, so a prior clean-micro attestation
       # cannot authorize a full clean record.
-      PRIOR_LINE="$(printf '%s\n' "$PRIOR_BODY" | grep -E "^review recorded: reviews/${PR}\.json verdict=${VERDICT} @ [0-9a-f]{40} diff=${DIFF_HASH} \(.*\) sig=[0-9a-f]{64}$" | head -1 || true)"
+      PRIOR_LINE="$(grep -m1 -E "^review recorded: reviews/${PR}\.json verdict=${VERDICT} @ [0-9a-f]{40} diff=${DIFF_HASH} \(.*\) sig=[0-9a-f]{64}$" <<<"$PRIOR_BODY" || true)"
       if [ -n "$PRIOR_LINE" ] && [ -n "$GATE_KEY" ]; then
         PRIOR_TEXT="${PRIOR_LINE% sig=*}"
         PRIOR_SIG="${PRIOR_LINE##* sig=}"

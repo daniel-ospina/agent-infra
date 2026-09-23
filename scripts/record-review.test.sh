@@ -66,16 +66,16 @@ fi
 if [ "$1" = "api" ]; then
     # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
     # --jq, so it would otherwise fall through to the generic body answer.
-    if printf '%s' "$*" | grep -qF -- "application/vnd.github.v3.diff"; then
+    if grep -qF -- "application/vnd.github.v3.diff" <<<"$*"; then
         [ "${STUB_DIFF_FAIL:-0}" = "1" ] && exit 1
         cat "${STUB_DIFF_FILE:-/dev/null}"
         exit 0
     fi
-    if printf '%s' "$*" | grep -qF -- "--jq .head.sha"; then
+    if grep -qF -- "--jq .head.sha" <<<"$*"; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
     fi
-    if printf '%s' "$*" | grep -qF -- "--jq .body"; then
+    if grep -qF -- "--jq .body" <<<"$*"; then
         # Faithful to `--jq .body`: the RAW body text. Real gh applies the jq
         # filter and prints the string bare — it does not emit a JSON wrapper.
         # #2982's carry-forward check greps the body for a marker LINE, so it
@@ -616,7 +616,7 @@ run_record_diff 424503 "$STALE" "body with no markers" "$D_F"
 # 10.5 diff fetch unavailable → legacy sha-only marker (gate's sha path governs).
 run_record_diff 424504 "$SHA" "PR body" "$D_F" "1"
 [ "$RECORD_RC" = "0" ] && ok "10.5 diff fetch failure still records (rc 0)" || bad "10.5 diff-fail record (rc=$RECORD_RC)"
-if printf '%s' "$RECORD_CAP" | grep -qF "diff="; then bad "10.5 legacy marker must not carry diff="; else ok "10.5 falls back to a legacy sha-only marker"; fi
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "10.5 legacy marker must not carry diff="; else ok "10.5 falls back to a legacy sha-only marker"; fi
 assert_contains "$RECORD_ERR" "could not compute this PR's diff hash" "10.5 warns that the marker cannot carry forward"
 if grep -q '"diff_sha256"' "$(Q2 424504)" 2>/dev/null; then bad "10.5 record must omit diff_sha256"; else ok "10.5 record omits diff_sha256"; fi
 
@@ -629,7 +629,7 @@ rm -f "$(Q2 424505)"
 run_record_diff 424505 "$STALE" "body with no markers" "$D_F" 0 --force-stale
 [ "$RECORD_RC" = "0" ] && ok "10.6 #784 --force-stale still records (rc 0)" || bad "10.6 #784 --force-stale record (rc=$RECORD_RC)"
 [ -f "$(Q2 424505)" ] && ok "10.6 #784 the record is still written (force-stale stays usable)" || bad "10.6 #784 record not written"
-if printf '%s' "$RECORD_CAP" | grep -qF "diff="; then bad "10.6 #784 --force-stale must NOT emit diff= (rule (b) would accept a pair that never coexisted)"; else ok "10.6 #784 --force-stale marker is legacy sha-only"; fi
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "10.6 #784 --force-stale must NOT emit diff= (rule (b) would accept a pair that never coexisted)"; else ok "10.6 #784 --force-stale marker is legacy sha-only"; fi
 if grep -q '"diff_sha256"' "$(Q2 424505)" 2>/dev/null; then bad "10.6 #784 record must omit diff_sha256"; else ok "10.6 #784 record omits diff_sha256"; fi
 
 # 10.7 #784 head-fetch failure — the WIDER half of the same class. When the head
@@ -642,7 +642,7 @@ if grep -q '"diff_sha256"' "$(Q2 424505)" 2>/dev/null; then bad "10.6 #784 recor
 rm -f "$(Q2 424506)"
 STUB_HEAD_SHA="API rate limit exceeded" run_record_diff 424506 "$STALE" "body with no markers" "$D_F" 0 --force-stale
 [ "$RECORD_RC" = "0" ] && ok "10.7 #784 head-fetch failure still records (rc 0)" || bad "10.7 #784 head-fetch record (rc=$RECORD_RC)"
-if printf '%s' "$RECORD_CAP" | grep -qF "diff="; then bad "10.7 #784 an UNVERIFIED head must NOT be bound to a diff (rule (b) accepts it at face value)"; else ok "10.7 #784 head-fetch failure degrades to a sha-only marker"; fi
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "10.7 #784 an UNVERIFIED head must NOT be bound to a diff (rule (b) accepts it at face value)"; else ok "10.7 #784 head-fetch failure degrades to a sha-only marker"; fi
 if grep -q '"diff_sha256"' "$(Q2 424506)" 2>/dev/null; then bad "10.7 #784 record must omit diff_sha256 when the head is unverified"; else ok "10.7 #784 record omits diff_sha256"; fi
 
 # 10.8 #784 cycle-2 — a FORGED prior marker must NOT carry forward. The PR body
