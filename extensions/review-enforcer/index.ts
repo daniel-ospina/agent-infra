@@ -656,6 +656,15 @@ export interface ReviewRecord {
   verdict: string;
   reviewed_at?: string;
   repo?: string; // owner/name — written by record-review.sh (optional, older records lack it)
+  /** #1348 — the MERGE BASE the clean-low guard certified. The attestation is the
+   * three-dot diff `compare/<base>...<head>`, and `merge_base_commit.sha` is the
+   * commit that diff is taken FROM: it identifies the certified CONTENT. Pinning
+   * the base branch's TIP instead would false-block every record on the next
+   * unrelated merge to the base branch, while still being the weaker signal.
+   * Written ONLY for clean-low (every other verdict keeps its record shape) and
+   * REQUIRED for a clean-low merge: a post-record `gh pr edit --base` moves the
+   * merge base and changes what merges while the head sha still matches. */
+  merge_base_sha?: string;
 }
 
 /**
@@ -913,6 +922,51 @@ export function getPrHeadShaViaRest(pr: number, ctx: RepoContext): string | null
   }
 }
 
+/** #1348 — the PR's CURRENT base sha (the base branch's tip), read from the REST
+ * pool. Used only by getPrMergeBaseSha below. Returns null on ANY failure. */
+export function getPrBaseSha(pr: number, ctx: RepoContext): string | null {
+  try {
+    const out = runGh(`gh api repos/{owner}/{repo}/pulls/${pr} --jq .base.sha`, {
+      cwd: ctx.cwd,
+      timeout: 15000,
+      env: ctx.repo ? { ...process.env, GH_REPO: ctx.repo } : undefined,
+    });
+    const sha = out.trim();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+/** #1348 — the MERGE BASE of the PR's current base branch and its head, read from
+ * the REST pool. Only the clean-low record reader needs it, so it is called
+ * lazily (never on a plain `clean` merge, where two extra API calls would have no
+ * reader). Two calls: the base sha, then `.merge_base_commit.sha` of
+ * `compare/<base>...<head>` — exactly the field the producer's guard pinned, so
+ * the two sides compare like with like.
+ *
+ * Returns null on ANY failure (network, bad repo, a fork head, a response without
+ * a merge base). clean-low treats an unverifiable merge base as a BLOCK — its
+ * whole attestation is the base-relative diff, and it is the cheapest verdict to
+ * re-record — so a transient failure is a false block, never a fail-open. Both
+ * interpolated values are 40-hex-validated BEFORE they reach the command string. */
+export function getPrMergeBaseSha(pr: number, head: string | null, ctx: RepoContext): string | null {
+  if (head === null || !/^[0-9a-f]{40}$/.test(head)) return null;
+  const env = ctx.repo ? { ...process.env, GH_REPO: ctx.repo } : undefined;
+  const baseSha = getPrBaseSha(pr, ctx);
+  if (baseSha === null) return null;
+  try {
+    const out = runGh(
+      `gh api repos/{owner}/{repo}/compare/${baseSha}...${head} --jq .merge_base_commit.sha`,
+      { cwd: ctx.cwd, timeout: 15000, env }
+    );
+    const mb = out.trim();
+    return /^[0-9a-f]{40}$/.test(mb) ? mb : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Current PR head via the gate's own gh call, using the resolved repo context
  * (cwd for `cd ... &&` prefixes, --repo flag for explicit owner/name). Returns
@@ -975,8 +1029,33 @@ export async function getPrHeadSha(pr: number, ctx: RepoContext): Promise<string
   }
 }
 
+/**
+ * #1348 — the verdicts that unlock a merge, in ONE place. The allowlist in
+ * evaluateMergeGate and mergeGateBlockReason used to be two independent
+ * expressions of the same vocabulary, so a new verdict added to one site and
+ * forgotten at the other would silently mislabel the merge telemetry. Both now
+ * consult this list.
+ *
+ * `clean-low` attests the Low value of the canonical tier table's §Change
+ * Classification `Code impact` column (agent-infra #1348): every changed path of
+ * the recorded revision is prose or a stylesheet.
+ * This gate deliberately does NOT re-derive that shape — the record IS the
+ * attestation, and the only place the shape can be read is the producer's
+ * clean-low guard in record-review.sh. A local re-check here would be a second,
+ * weaker writer of the class.
+ *
+ * The refusal text below is DERIVED from this list, never re-literalised: a
+ * verdict added here that was forgotten in the message is exactly the drift the
+ * single source exists to prevent.
+ */
+export const ACCEPTED_VERDICTS: readonly string[] = ["clean", "clean-micro", "clean-low"];
+
+export function isAcceptedVerdict(verdict: string): boolean {
+  return ACCEPTED_VERDICTS.includes(verdict);
+}
+
 export type MergeGateResult =
-  | { status: "block"; reason: string }
+  | { status: "block"; reason: string; reasonTag?: string }
   | { status: "failopen"; warning: string }
   | { status: "allow"; message: string };
 
@@ -987,6 +1066,7 @@ export function evaluateMergeGate(
   currentHead: string | null,
   ctx: RepoContext,
   taskSubAgent: boolean = false,
+  currentMergeBase: string | null = null,
 ): MergeGateResult {
   if (!record) {
     // #285 Fix C: the emergency-bypass line is FALSE for task sub-agents — the
@@ -1002,8 +1082,9 @@ export function evaluateMergeGate(
           "✅ Review enforcement (merge registry) gate is working correctly.",
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
           "   → The parent session must record the review for the PR's tier:",
-          "   →   Micro issue (complexity:micro): record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-          "   →   Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
+          "   → Micro issue (complexity:micro): record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+          "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
           "   → The bypass flag does NOT unlock sub-agent merges (#285).",
         ]
       : [
@@ -1011,6 +1092,7 @@ export function evaluateMergeGate(
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
           "   → Micro issue (complexity:micro): complete the micro flow (pre-flight + a review dispatch naming the diff), then",
           "   →   record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+          "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier, no code paths): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
           "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), then",
           "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
           "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
@@ -1020,15 +1102,16 @@ export function evaluateMergeGate(
       reason: lines.join("\n"),
     };
   }
-  if (record.verdict !== "clean" && record.verdict !== "clean-micro") {
+  if (!isAcceptedVerdict(record.verdict)) {
     // #513: two-path remediation — the record's tier is not readable from the
     // record (only the verdict), so both paths are named statically.
     return {
       status: "block",
       reason: [
-        `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only "clean" or "clean-micro" unlocks a merge.`,
+        `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only ${ACCEPTED_VERDICTS.map((v) => `"${v}"`).join(", ")} unlocks a merge.`,
         "   → Micro issue (complexity:micro): re-record via the micro flow: record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-        "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
+        "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+        "   → Standard/complex issue with any code path: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
       ].join("\n"),
     };
   }
@@ -1039,6 +1122,12 @@ export function evaluateMergeGate(
     // sub-agent cannot: under the restricted-agent posture an unverifiable
     // head must NOT merge silently. It escalates to the parent session, which
     // runs the merge ceremony interactively (where fail-open still applies).
+    //
+    // #1348: this path also bypasses the clean-low merge-base binding further
+    // down — an unverifiable head means the base cannot be compared either.
+    // DECLARED rather than narrowed: the interactive fail-open is #138's
+    // decision to make, and clean-low inherits it here exactly as
+    // clean/clean-micro do (see the #1348 plan, class C7).
     if (taskSubAgent) {
       return {
         status: "block",
@@ -1076,14 +1165,97 @@ export function evaluateMergeGate(
     // #513: re-record at the SAME verdict the record holds (a micro PR's
     // re-record is clean-micro via the micro flow; a standard/complex PR's is
     // clean via the code-review skill) — never a hardcoded `clean`.
+    //
+    // #1348: EXCEPT clean-low, whose advice must NOT be "re-record at the same
+    // verdict". That verdict is a claim about the DIFF's SHAPE, not about
+    // reaching a tier through a flow, and a moved head has an unverified shape —
+    // the producer's guard refuses (exit 4) as soon as code arrived, so the
+    // same-verdict advice is unsatisfiable in exactly the case that fires it.
+    // The shape has to be re-derived, not carried forward.
+    const reRecordAdvice =
+      record.verdict === "clean-low"
+        ? "   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (record-review.sh <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (record-review.sh <PR> <head_sha> clean [owner/repo])."
+        : `   → The branch moved — re-review the new head and re-record at the same verdict: record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo]`;
     return {
       status: "block",
       reason: [
         `❌ PR #${pr} head has advanced since the review was recorded.`,
         `   Recorded: ${record.head_sha.slice(0, 12)}   Current: ${currentHead.slice(0, 12)}`,
-        `   → The branch moved — re-review the new head and re-record at the same verdict: record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo]`,
+        reRecordAdvice,
       ].join("\n"),
+      reasonTag: "head_advanced",
     };
+  }
+  // #1348 — the clean-low attestation is CONTENT-relative: its guard certifies
+  // `compare/<base>...<head>`, whose content is identified by the MERGE BASE.
+  // Pinning only the head lets a post-record `gh pr edit --base` swap what
+  // merges into main while the head sha still matches and the certified diff
+  // stayed docs-only. This is the same hazard the producer guard already closes
+  // for `--force-stale`, and the same class of revision binding as the head
+  // check above.
+  //
+  // Why the merge base and NOT `.base.sha`: the base branch's tip moves on every
+  // unrelated merge into it while the certified diff is unchanged, so binding the
+  // tip would expire every clean-low record within minutes and false-block the
+  // very merge the record was minted for. The merge base is invariant under those
+  // advances and moves exactly when the base is repointed or rewritten.
+  //
+  // Scope: clean-low ONLY. clean/clean-micro records carry no merge base (their
+  // record shape is unchanged) and their identical base-blindness is
+  // pre-existing — filed as agent-infra #1362, not silently widened here.
+  //
+  // Fail-CLOSED on an unreadable merge base, unlike the interactive #138 head
+  // fail-open above: the whole attestation IS the base-relative diff, and
+  // clean-low is the cheapest verdict to re-record, so "could not verify" must
+  // never read as "certified Low".
+  //
+  // Unreachable when the HEAD itself is unverifiable: the branch above returns
+  // first (fail-closed for a task sub-agent, fail-open for an interactive
+  // session), so the #138 interactive fail-open bypasses this binding too —
+  // declared in the #1348 plan (C7), not silently claimed away here.
+  if (record.verdict === "clean-low") {
+    const recordMb =
+      typeof record.merge_base_sha === "string" && /^[0-9a-f]{40}$/.test(record.merge_base_sha)
+        ? record.merge_base_sha
+        : null;
+    // Distinguished in the MACHINE tag, not only in the prose: "the attestation
+    // was invalidated" and "we could not read it" are different operational
+    // events, and the audit trail (gate-events.jsonl) is what reconstructs block
+    // rates by reason.
+    if (recordMb === null || currentMergeBase === null) {
+      return {
+        status: "block",
+        reasonTag: "base_unverifiable",
+        reason: [
+          `❌ PR #${pr} carries a clean-low record whose certified merge base cannot be confirmed.`,
+          `   Recorded: ${recordMb ? recordMb.slice(0, 12) : "(absent from the record)"}   Current: ${currentMergeBase ? currentMergeBase.slice(0, 12) : "(unreadable)"}`,
+          "   clean-low certifies the three-dot diff of the PR's base branch against the head, and",
+          "   the merge base is the commit that identifies its content. One side could not be read",
+          "   (a gh/API failure, an unreachable fork head, or a hand-minted record).",
+          "   → Re-record once the base is readable, naming the verdict explicitly:",
+          "   →   record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          "   → If the diff is no longer content-only, run the code-review skill and record clean:",
+          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+        ].join("\n"),
+      };
+    }
+    if (currentMergeBase !== recordMb) {
+      return {
+        status: "block",
+        reasonTag: "base_advanced",
+        reason: [
+          `❌ PR #${pr} has a clean-low record certified against a DIFFERENT merge base.`,
+          `   Recorded: ${recordMb.slice(0, 12)}   Current: ${currentMergeBase.slice(0, 12)}`,
+          "   The PR's base branch was repointed (gh pr edit --base) or rewritten, so the certified",
+          "   diff is no longer the diff that would merge — at the SAME head sha.",
+          "   → Re-check whether the current diff is still content-only, then re-record with the",
+          "     verdict named explicitly:",
+          "   →   record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          "   → Otherwise run the code-review skill and record clean:",
+          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+        ].join("\n"),
+      };
+    }
   }
   return {
     status: "allow",
@@ -1111,10 +1283,13 @@ export function logGateEvent(
 }
 
 // Short tag for merge_gate_block entries — mirrors evaluateMergeGate's
-// block branches (no review record / non-clean verdict / head advanced).
+// block branches (no review record / non-clean verdict / head advanced / merge
+// base advanced or unverifiable). The tag is the authoritative source when the
+// branch sets one (#1348); this fallback covers the branches that do not, and is
+// only reached through logMergeGateDecision when no tag was set.
 export function mergeGateBlockReason(record: ReviewRecord | null): string {
   if (!record) return "no_review_record";
-  if (record.verdict !== "clean" && record.verdict !== "clean-micro") return "verdict_not_clean";
+  if (!isAcceptedVerdict(record.verdict)) return "verdict_not_clean";
   return "head_advanced";
 }
 
@@ -1137,7 +1312,7 @@ export function logMergeGateDecision(
   if (result.status === "block") {
     logGateEvent(
       "merge_gate_block",
-      { pr, ...verdict, reason: mergeGateBlockReason(record) },
+      { pr, ...verdict, reason: result.reasonTag ?? mergeGateBlockReason(record) },
       file
     );
   } else {
@@ -2038,9 +2213,25 @@ export default function (pi: ExtensionAPI) {
         const ctx = envRepo ? { ...cmdCtx, repo: envRepo } : cmdCtx;
         const record = readReviewRecord(prNumber, envRepo ?? undefined);
         const currentHead = await getPrHeadSha(prNumber, ctx);
+        // #1348: fetch the merge base ONLY for a clean-low record whose HEAD has
+        // already matched — it is the one verdict whose attestation is
+        // content-relative, so any other merge must not pay for extra API calls
+        // with no reader (null is safe there: the base branch in evaluateMergeGate
+        // is clean-low-scoped), and a PR that is going to block on `head_advanced`
+        // must not pay two synchronous reads (15s timeout each) whose result no
+        // branch reads. A head-mismatched clean-low returns at the head branch,
+        // which precedes the base branch.
+        const currentMergeBase =
+          record && record.verdict === "clean-low" &&
+          currentHead !== null &&
+          record.head_sha === currentHead
+            ? getPrMergeBaseSha(prNumber, currentHead, ctx)
+            : null;
         // #285 Fix C: the no-record block message is shape-aware (task
         // sub-agents get the "parent must record the review" variant).
-        const result = evaluateMergeGate(prNumber, record, currentHead, ctx, isTaskSubAgent());
+        const result = evaluateMergeGate(
+          prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase
+        );
         if (result.status === "block") {
           console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");
           logMergeGateDecision(prNumber, result, record); // #60: durable audit record

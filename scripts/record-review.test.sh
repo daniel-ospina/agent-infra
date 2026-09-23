@@ -93,6 +93,38 @@ if [ "$1" = "api" ]; then
         printf '%s\n' "${STUB_LABELS:-}"
         exit 0
     fi
+    # #1348 clean-low: the head/base/changed_files meta read.
+    if grep -qF -- "--jq [(.head.sha), (.base.sha)" <<<"$*"; then
+        [ "${STUB_META_FAIL:-0}" = "1" ] && exit 1
+        derived=0
+        if [ -n "${STUB_COMPARE:-}" ]; then
+            derived="$(printf '%s\n' "$STUB_COMPARE" | sed '/^$/d' | wc -l | tr -d ' ')"
+        elif [ -n "${STUB_FILES:-}" ]; then
+            derived="$(printf '%s\n' "$STUB_FILES" | sed '/^$/d' | wc -l | tr -d ' ')"
+        fi
+        [ "${derived:-0}" = "0" ] && derived=1
+        printf '%s\t%s\t%s' \
+            "${STUB_META_HEAD:-${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}" \
+            "${STUB_META_BASE:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" \
+            "${STUB_CHANGED_FILES:-$derived}"
+        echo; exit 0
+    fi
+    # #1348 clean-low: the sha-addressable diff read. The guard reads the MERGE
+    # BASE out of the SAME response (it is the commit the three-dot diff is taken
+    # from, and the sha the record pins), so the stub returns a leading
+    # `mb<TAB><sha>` line followed by the rows. STUB_MERGE_BASE lets a vector
+    # simulate a response with no merge base (→ refuse).
+    if grep -qF -- "compare/" <<<"$*"; then
+        [ "${STUB_COMPARE_FAIL:-0}" = "1" ] && exit 1
+        printf 'mb\t%s\n' "${STUB_MERGE_BASE-cccccccccccccccccccccccccccccccccccccccc}"
+        if [ -n "${STUB_COMPARE:-}" ]; then
+            printf '%s\n' "$STUB_COMPARE"
+            exit 0
+        fi
+        out="$(printf '%s\n' "${STUB_FILES:-}" | sed '/^$/d' | awk -F'\t' '{ print "added\t" $1 "\t" }')"
+        [ -n "$out" ] && printf '%s\n' "$out"
+        exit 0
+    fi
     printf '{"body": "PR body"}' ; exit 0
 fi
 exit 0
@@ -569,7 +601,7 @@ run_record_raw 424509 "$SHA" clean "daniel-ospina/agent-infra" --force-stale
 run_record_raw 424510 "$SHA" clean "daniel-ospina/agent-infra"
 [ "$RECORD_RC" = "0" ] && ok "guard: plain 4-positional form still records (rc 0)" || bad "guard: plain form (rc=$RECORD_RC)"
 [ -f "$(rec_path 424510)" ] && ok "guard: plain form wrote a record" || bad "guard: plain form wrote no record"
-echo "── 10. #2982: diff binding (reviewed artifact = the diff) ──────"
+echo "── 11. #2982: diff binding (reviewed artifact = the diff) ──────"
 D_F="$T/diff.txt"; printf 'diff --git a/x b/x\n+hello\n' > "$D_F"
 DH="$(openssl dgst -sha256 < "$D_F" | awk '{print $NF}')"
 D_F2="$T/diff2.txt"; printf 'diff --git a/x b/x\n+other\n' > "$D_F2"
@@ -577,24 +609,24 @@ DH2="$(openssl dgst -sha256 < "$D_F2" | awk '{print $NF}')"
 STALE="$(printf 'b%.0s' $(seq 1 40))"
 Q2() { printf '%s/.pi/agent/reviews/daniel-ospina-agent-infra-%s.json' "$F_HOME" "$1"; }
 
-# 10.1 normal path: the record and the signed marker both carry the diff hash.
+# 11.1 normal path: the record and the signed marker both carry the diff hash.
 run_record_diff 424500 "$SHA" "PR body" "$D_F"
-[ "$RECORD_RC" = "0" ] && ok "10.1 normal record succeeds" || bad "10.1 normal record (rc=$RECORD_RC)"
-assert_contains "$(cat "$(Q2 424500)" 2>/dev/null)" "\"diff_sha256\":\"$DH\"" "10.1 record carries diff_sha256"
-assert_contains "$RECORD_CAP" "diff=$DH" "10.1 posted marker carries diff="
-assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "10.1 marker format: '@ <sha> diff=<hash> ('"
+[ "$RECORD_RC" = "0" ] && ok "11.1 normal record succeeds" || bad "11.1 normal record (rc=$RECORD_RC)"
+assert_contains "$(cat "$(Q2 424500)" 2>/dev/null)" "\"diff_sha256\":\"$DH\"" "11.1 record carries diff_sha256"
+assert_contains "$RECORD_CAP" "diff=$DH" "11.1 posted marker carries diff="
+assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "11.1 marker format: '@ <sha> diff=<hash> ('"
 
-# 10.2 stale sha + prior evidence for the SAME diff → carry forward to the head.
+# 11.2 stale sha + prior evidence for the SAME diff → carry forward to the head.
 PRIOR="review recorded: reviews/424501.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra) sig=$(printf '%s' "review recorded: reviews/424501.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra)" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
 run_record_diff 424501 "$STALE" "body
 
 $PRIOR" "$D_F"
-[ "$RECORD_RC" = "0" ] && ok "10.2 stale sha + same diff carries forward (rc 0)" || bad "10.2 carry-forward (rc=$RECORD_RC, err=$RECORD_ERR)"
-assert_contains "$RECORD_ERR" "carry-forward" "10.2 explains the carry-forward"
-assert_contains "$(cat "$(Q2 424501)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "10.2 re-records against the CURRENT head"
-assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "10.2 posted marker binds the current head + the same diff"
+[ "$RECORD_RC" = "0" ] && ok "11.2 stale sha + same diff carries forward (rc 0)" || bad "11.2 carry-forward (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "carry-forward" "11.2 explains the carry-forward"
+assert_contains "$(cat "$(Q2 424501)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "11.2 re-records against the CURRENT head"
+assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "11.2 posted marker binds the current head + the same diff"
 
-# 10.3 stale sha + prior evidence for a DIFFERENT diff → still refused (exit 3).
+# 11.3 stale sha + prior evidence for a DIFFERENT diff → still refused (exit 3).
 # The prior marker's sig must be a WELL-FORMED 64-hex value, or the carry-forward
 # shape check rejects it on the SIG and this case would pass for the wrong
 # reason — deleting the diff comparison would leave the suite green. (It did:
@@ -604,35 +636,35 @@ rm -f "$(Q2 424502)"
 run_record_diff 424502 "$STALE" "body
 
 $PRIOR3" "$D_F"
-[ "$RECORD_RC" = "3" ] && ok "10.3 stale sha + CHANGED diff still refuses (rc 3)" || bad "10.3 changed-diff refusal (rc=$RECORD_RC)"
-[ ! -f "$(Q2 424502)" ] && ok "10.3 no record written when the diff changed" || bad "10.3 wrote a record for an unreviewed diff"
-assert_contains "$RECORD_ERR" "cannot be shown unchanged" "10.3 names the reason"
+[ "$RECORD_RC" = "3" ] && ok "11.3 stale sha + CHANGED diff still refuses (rc 3)" || bad "11.3 changed-diff refusal (rc=$RECORD_RC)"
+[ ! -f "$(Q2 424502)" ] && ok "11.3 no record written when the diff changed" || bad "11.3 wrote a record for an unreviewed diff"
+assert_contains "$RECORD_ERR" "cannot be shown unchanged" "11.3 names the reason"
 
-# 10.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
+# 11.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
 rm -f "$(Q2 424503)"
 run_record_diff 424503 "$STALE" "body with no markers" "$D_F"
-[ "$RECORD_RC" = "3" ] && ok "10.4 stale sha + no prior evidence refuses (rc 3)" || bad "10.4 no-evidence refusal (rc=$RECORD_RC)"
+[ "$RECORD_RC" = "3" ] && ok "11.4 stale sha + no prior evidence refuses (rc 3)" || bad "11.4 no-evidence refusal (rc=$RECORD_RC)"
 
-# 10.5 diff fetch unavailable → legacy sha-only marker (gate's sha path governs).
+# 11.5 diff fetch unavailable → legacy sha-only marker (gate's sha path governs).
 run_record_diff 424504 "$SHA" "PR body" "$D_F" "1"
-[ "$RECORD_RC" = "0" ] && ok "10.5 diff fetch failure still records (rc 0)" || bad "10.5 diff-fail record (rc=$RECORD_RC)"
-if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "10.5 legacy marker must not carry diff="; else ok "10.5 falls back to a legacy sha-only marker"; fi
-assert_contains "$RECORD_ERR" "could not compute this PR's diff hash" "10.5 warns that the marker cannot carry forward"
-if grep -q '"diff_sha256"' "$(Q2 424504)" 2>/dev/null; then bad "10.5 record must omit diff_sha256"; else ok "10.5 record omits diff_sha256"; fi
+[ "$RECORD_RC" = "0" ] && ok "11.5 diff fetch failure still records (rc 0)" || bad "11.5 diff-fail record (rc=$RECORD_RC)"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.5 legacy marker must not carry diff="; else ok "11.5 falls back to a legacy sha-only marker"; fi
+assert_contains "$RECORD_ERR" "could not compute this PR's diff hash" "11.5 warns that the marker cannot carry forward"
+if grep -q '"diff_sha256"' "$(Q2 424504)" 2>/dev/null; then bad "11.5 record must omit diff_sha256"; else ok "11.5 record omits diff_sha256"; fi
 
-# 10.6 #784 — --force-stale must NOT mint a diff-binding marker. A stale sha's
+# 11.6 #784 — --force-stale must NOT mint a diff-binding marker. A stale sha's
 # diff cannot be shown unchanged, so emitting diff= would create a
 # (stale_sha, live_diff) pair that never coexisted — and rule (b) accepts on
 # diff-equality ALONE, so the gate would accept it and attest to an unreviewable
 # revision. REGRESSION-SENSITIVE: before the fix this marker carried diff=.
 rm -f "$(Q2 424505)"
 run_record_diff 424505 "$STALE" "body with no markers" "$D_F" 0 --force-stale
-[ "$RECORD_RC" = "0" ] && ok "10.6 #784 --force-stale still records (rc 0)" || bad "10.6 #784 --force-stale record (rc=$RECORD_RC)"
-[ -f "$(Q2 424505)" ] && ok "10.6 #784 the record is still written (force-stale stays usable)" || bad "10.6 #784 record not written"
-if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "10.6 #784 --force-stale must NOT emit diff= (rule (b) would accept a pair that never coexisted)"; else ok "10.6 #784 --force-stale marker is legacy sha-only"; fi
-if grep -q '"diff_sha256"' "$(Q2 424505)" 2>/dev/null; then bad "10.6 #784 record must omit diff_sha256"; else ok "10.6 #784 record omits diff_sha256"; fi
+[ "$RECORD_RC" = "0" ] && ok "11.6 #784 --force-stale still records (rc 0)" || bad "11.6 #784 --force-stale record (rc=$RECORD_RC)"
+[ -f "$(Q2 424505)" ] && ok "11.6 #784 the record is still written (force-stale stays usable)" || bad "11.6 #784 record not written"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.6 #784 --force-stale must NOT emit diff= (rule (b) would accept a pair that never coexisted)"; else ok "11.6 #784 --force-stale marker is legacy sha-only"; fi
+if grep -q '"diff_sha256"' "$(Q2 424505)" 2>/dev/null; then bad "11.6 #784 record must omit diff_sha256"; else ok "11.6 #784 record omits diff_sha256"; fi
 
-# 10.7 #784 head-fetch failure — the WIDER half of the same class. When the head
+# 11.7 #784 head-fetch failure — the WIDER half of the same class. When the head
 # cannot be confirmed the stale-sha guard block is skipped ENTIRELY, so the
 # original fix (nested inside the verified-stale arm) never ran and DIFF_HASH
 # survived into the marker: `@ <unverified_sha> diff=<live_diff>`, which rule (b)
@@ -641,11 +673,11 @@ if grep -q '"diff_sha256"' "$(Q2 424505)" 2>/dev/null; then bad "10.6 #784 recor
 # binding. REGRESSION-SENSITIVE: before the fix this marker carried diff=.
 rm -f "$(Q2 424506)"
 STUB_HEAD_SHA="API rate limit exceeded" run_record_diff 424506 "$STALE" "body with no markers" "$D_F" 0 --force-stale
-[ "$RECORD_RC" = "0" ] && ok "10.7 #784 head-fetch failure still records (rc 0)" || bad "10.7 #784 head-fetch record (rc=$RECORD_RC)"
-if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "10.7 #784 an UNVERIFIED head must NOT be bound to a diff (rule (b) accepts it at face value)"; else ok "10.7 #784 head-fetch failure degrades to a sha-only marker"; fi
-if grep -q '"diff_sha256"' "$(Q2 424506)" 2>/dev/null; then bad "10.7 #784 record must omit diff_sha256 when the head is unverified"; else ok "10.7 #784 record omits diff_sha256"; fi
+[ "$RECORD_RC" = "0" ] && ok "11.7 #784 head-fetch failure still records (rc 0)" || bad "11.7 #784 head-fetch record (rc=$RECORD_RC)"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.7 #784 an UNVERIFIED head must NOT be bound to a diff (rule (b) accepts it at face value)"; else ok "11.7 #784 head-fetch failure degrades to a sha-only marker"; fi
+if grep -q '"diff_sha256"' "$(Q2 424506)" 2>/dev/null; then bad "11.7 #784 record must omit diff_sha256 when the head is unverified"; else ok "11.7 #784 record omits diff_sha256"; fi
 
-# 10.8 #784 cycle-2 — a FORGED prior marker must NOT carry forward. The PR body
+# 11.8 #784 cycle-2 — a FORGED prior marker must NOT carry forward. The PR body
 # is attacker-writable, so matching the SHAPE `sig=[0-9a-f]{64}` is not evidence:
 # before this fix a forged line with sig=<64 zeros> was accepted, carried to the
 # current head, and RE-SIGNED with the real key — a genuine attestation for a
@@ -656,11 +688,11 @@ FORGED="review recorded: reviews/424507.json verdict=clean @ $STALE diff=$DH (da
 run_record_diff 424507 "$STALE" "body
 
 $FORGED" "$D_F"
-[ "$RECORD_RC" = "3" ] && ok "10.8 #784 a forged prior marker does NOT carry forward (rc 3)" || bad "10.8 #784 FORGED marker carried forward! (rc=$RECORD_RC)"
-[ ! -f "$(Q2 424507)" ] && ok "10.8 #784 no record written from forged evidence" || bad "10.8 #784 wrote a record from forged evidence"
-assert_contains "$RECORD_ERR" "BAD SIGNATURE" "10.8 #784 names the bad signature"
+[ "$RECORD_RC" = "3" ] && ok "11.8 #784 a forged prior marker does NOT carry forward (rc 3)" || bad "11.8 #784 FORGED marker carried forward! (rc=$RECORD_RC)"
+[ ! -f "$(Q2 424507)" ] && ok "11.8 #784 no record written from forged evidence" || bad "11.8 #784 wrote a record from forged evidence"
+assert_contains "$RECORD_ERR" "BAD SIGNATURE" "11.8 #784 names the bad signature"
 
-# 10.9 #784 cycle-2 — the prior verdict must MATCH. A clean-micro attestation is
+# 11.9 #784 cycle-2 — the prior verdict must MATCH. A clean-micro attestation is
 # evidence of the MICRO process; it must not authorize a full clean record at a
 # new head. REGRESSION-SENSITIVE: a `clean(-micro)?` pattern let it escalate.
 rm -f "$(Q2 424508)"
@@ -669,7 +701,284 @@ PSIG="$(printf '%s' "$PM" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{
 run_record_diff 424508 "$STALE" "body
 
 $PM sig=$PSIG" "$D_F"
-[ "$RECORD_RC" = "3" ] && ok "10.9 #784 a clean-micro prior does NOT authorize a clean record (rc 3)" || bad "10.9 #784 clean-micro escalated to clean (rc=$RECORD_RC)"
+[ "$RECORD_RC" = "3" ] && ok "11.9 #784 a clean-micro prior does NOT authorize a clean record (rc 3)" || bad "11.9 #784 clean-micro escalated to clean (rc=$RECORD_RC)"
+# ─────────────────────────────────────────────────────────────────────────
+# 10. #1348 clean-low content-shape guard — ADVERSARIAL DOMAIN
+# ─────────────────────────────────────────────────────────────────────────
+# Correctness claim: a clean-low record cannot be obtained for a revision
+# whose diff is not provably content-only. Every declared class (C1-C6 in
+# docs/plans/2026-09-22-issue-1348-clean-low-verdict.md) has its own vector.
+#
+# MUTATION DISCIPLINE — why this section is not vacuous. Against the
+# PRE-CHANGE script every clean-low vector is RED for one uninteresting reason
+# (the verdict is rejected at the `case` with rc 2), which alone would prove
+# nothing about the guard: a guard that refused EVERY clean-low would pass the
+# whole attack suite. So the section pins THREE things, not one:
+#   (i)   POSITIVE controls — legitimate content-only diffs must record (rc 0);
+#   (ii)  attack vectors — must refuse with the GUARD's rc 4 and its named
+#         message, never the verdict `case`'s rc 2;
+#   (iii) MUTATION HARNESS (§10.9) — two mutants, built from THIS script:
+#         neuter the guard  → the code-bearing attack must go GREEN (rc 0),
+#         i.e. the suite would fail if the guard were removed; revert the
+#         verdict arm → the positive vector must go RED (rc 2), i.e. the
+#         positive vector is genuinely red against the pre-change script.
+# Only (iii) makes the suite regression-sensitive; (i)+(ii) alone would not.
+echo "── 10. #1348 clean-low content-shape guard ──────────────────────"
+
+low_path_ok() { # <path> — direct unit call on the sourceable predicate
+    bash -c 'source "$1" >/dev/null 2>&1 || exit 1; clean_low_path_ok "$2"' _ "$RECORD" "$1" 2>/dev/null
+}
+# <pr> <label> [want-rc] — refusal assertions: exit code AND no record written.
+assert_low_refused() {
+    local pr="$1" label="$2" want="${3:-4}"
+    [ "$RECORD_RC" = "$want" ] && ok "$label (rc $want)" || bad "$label (rc=$RECORD_RC, want $want)"
+    [ -f "$(rec_path "$pr")" ] && bad "$label wrote a record" || ok "$label writes no record"
+}
+
+# ── 10.1 C1 code-bearing diffs (accept-side discrimination) ─────────────
+STUB_FILES="src/app.ts" run_record_verdict clean-low "daniel-ospina/agent-infra" 424600
+assert_low_refused 424600 "C1 code-bearing src/app.ts refuses"
+assert_contains "$RECORD_ERR" "NOT content-only" "C1 refusal names the content-shape cause (not the verdict case)"
+[ "$RECORD_RC" != "2" ] && ok "C1 refusal is the guard's rc 4, not the verdict case's rc 2" || bad "C1 refused at the verdict case instead of the guard"
+STUB_FILES="package.json" run_record_verdict clean-low "daniel-ospina/agent-infra" 424601
+assert_low_refused 424601 "C1 build manifest package.json refuses"
+STUB_FILES="requirements.txt" run_record_verdict clean-low "daniel-ospina/agent-infra" 424602
+assert_low_refused 424602 "C1 root build input requirements.txt refuses"
+
+# ── 10.2 C2 enforcement inputs — refused even under a docs-looking prefix ─
+for _spec in \
+    "424610:scripts/record-review.sh:gate script" \
+    "424611:extensions/review-enforcer/index.ts:gate extension" \
+    "424612:.github/workflows/ai-review-gate.yml:required-check workflow" \
+    "424613:skills/code-review/SKILL.md:skill instruction layer" \
+    "424614:templates/AGENTS.base.md:materialized instruction template" \
+    "424615:AGENTS.md:always-loaded instruction file" \
+    "424616:MEMORY.md:always-loaded memory file" \
+    "424617:VENDOR.md:always-loaded vendored-doc file" \
+    "424618:docs/evil.sh:executable under a docs prefix" \
+    "424619:docs/.github/workflows/x.yml:config under a docs prefix" ; do
+    _pr="${_spec%%:*}"; _rest="${_spec#*:}"; _path="${_rest%%:*}"; _label="${_rest#*:}"
+    STUB_FILES="$_path" run_record_verdict clean-low "daniel-ospina/agent-infra" "$_pr"
+    assert_low_refused "$_pr" "C2 $_label ($_path) refuses"
+done
+# Mixed diffs: one enforcement path poisons an otherwise content-only set.
+STUB_FILES=$'docs/a.md\ndocs/b.css\nAGENTS.md' run_record_verdict clean-low "daniel-ospina/agent-infra" 424620
+assert_low_refused 424620 "C2 one enforcement path in a mixed diff refuses"
+
+# ── 10.3 C3 unverifiable shape — FAIL-CLOSED ────────────────────────────
+run_record_verdict clean-low "" 424630
+assert_low_refused 424630 "C3 repo undetectable refuses"
+assert_contains "$RECORD_ERR" "repo undetectable or gh missing" "C3 repo-less refusal names the cause"
+# C3 (`gh` ABSENT from PATH entirely, not merely a stubbed failure). The guard's
+# condition is `-z $REPO || ! command -v gh`; every other vector has a stub gh on
+# PATH, so without this one the SECOND disjunct is untested — deleting it leaves
+# the suite green.
+run_record_no_gh() { # <verdict> <repo> <pr>
+    local verdict="$1" repo="$2" pr="$3" rcfile="$T/nrc" errfile="$T/nerr" nogh
+    nogh="$(printf '%s' "$PATH" | tr ':' '\n' | while read -r _d; do [ -n "$_d" ] && [ -x "$_d/gh" ] || printf '%s\n' "$_d"; done | paste -sd: -)"
+    rm -f "$errfile"
+    (
+        export HOME="$F_HOME" PATH="$nogh" GH_STUB_LOG="$LOG"
+        rc=0
+        bash "$RECORD" "$pr" "$SHA" "$verdict" "$repo" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+run_record_no_gh clean-low "daniel-ospina/agent-infra" 424629
+assert_low_refused 424629 "C3 gh absent from PATH refuses"
+assert_contains "$RECORD_ERR" "repo undetectable or gh missing" "C3 the gh-absent refusal names the cause (only the new guard emits this)"
+STUB_FILES="docs/a.md" STUB_COMPARE_FAIL=1 run_record_verdict clean-low "daniel-ospina/agent-infra" 424631
+assert_low_refused 424631 "C3 compare API failure refuses"
+# The merge base is the commit the certified diff is taken FROM, so a response
+# without one must refuse (an absent merge base is unverifiable content, not an
+# empty diff).
+STUB_FILES="docs/a.md" STUB_MERGE_BASE="" run_record_verdict clean-low "daniel-ospina/agent-infra" 424638
+assert_low_refused 424638 "C3 a response with no merge base refuses"
+assert_contains "$RECORD_ERR" "read no merge base" "C3 the merge-base refusal names the cause"
+STUB_FILES="docs/a.md" STUB_MERGE_BASE="not-a-sha" run_record_verdict clean-low "daniel-ospina/agent-infra" 424639
+assert_low_refused 424639 "C3 a malformed merge base refuses"
+STUB_FILES="" run_record_verdict clean-low "daniel-ospina/agent-infra" 424632
+assert_low_refused 424632 "C3 empty/absent file list refuses"
+STUB_FILES="docs/a.md" STUB_META_FAIL=1 run_record_verdict clean-low "daniel-ospina/agent-infra" 424633
+assert_low_refused 424633 "C3 PR meta read failure refuses"
+STUB_FILES="docs/a.md" STUB_CHANGED_FILES=2 run_record_verdict clean-low "daniel-ospina/agent-infra" 424634
+assert_low_refused 424634 "C3 list short of .changed_files refuses (truncation/forgery)"
+STUB_FILES="docs/a.md" STUB_CHANGED_FILES=0 run_record_verdict clean-low "daniel-ospina/agent-infra" 424636
+assert_low_refused 424636 "C3 zero/absent .changed_files refuses (the truncation detector cannot run)"
+STUB_FILES="docs/a.md" STUB_CHANGED_FILES=abc run_record_verdict clean-low "daniel-ospina/agent-infra" 424637
+assert_low_refused 424637 "C3 unparseable .changed_files refuses"
+CAPFILES="$(printf 'docs/cap-%s.md\n' $(seq 1 300))"
+STUB_FILES="$CAPFILES" run_record_verdict clean-low "daniel-ospina/agent-infra" 424635
+assert_low_refused 424635 "C3 file list AT the 300-entry compare cap refuses (may be truncated)"
+
+# ── 10.4 C4 revision mismatch ───────────────────────────────────────────
+run_record_raw 424640 "$SHA" clean-low "daniel-ospina/agent-infra" --force-stale
+[ "$RECORD_RC" = "2" ] && ok "C4 clean-low + --force-stale refused (rc 2)" || bad "C4 --force-stale (rc=$RECORD_RC, want 2)"
+assert_contains "$RECORD_ERR" "incompatible with the clean-low verdict" "C4 refusal names the incompatibility (only the new guard emits this)"
+[ -f "$(rec_path 424640)" ] && bad "C4 --force-stale wrote a record" || ok "C4 --force-stale writes no record"
+STUB_FILES="docs/a.md" STUB_META_HEAD="$(printf 'c%.0s' $(seq 1 40))" run_record_verdict clean-low "daniel-ospina/agent-infra" 424641
+assert_low_refused 424641 "C4 head != recorded sha refuses"
+assert_contains "$RECORD_ERR" "is not the current head" "C4 head-mismatch refusal names the cause"
+
+# ── 10.5 C5 path-shape spoofing ─────────────────────────────────────────
+for _spec in \
+    "424650:notes.md.ts:extension is a substring, not a suffix" \
+    "424651:docs/x.md.bak:extension suffix is .bak" \
+    "424652:docs/../src/a.ts:path traversal" \
+    "424653:docs//x.md:empty segment" \
+    "424654:/docs/x.md:absolute path" \
+    "424655:docs/./x.md:dot segment" \
+    "424656:docs/x.mdx:mdx compiles JSX to JS" \
+    "424657:docs/x.html:html can carry script" ; do
+    _pr="${_spec%%:*}"; _rest="${_spec#*:}"; _path="${_rest%%:*}"; _label="${_rest#*:}"
+    STUB_FILES="$_path" run_record_verdict clean-low "daniel-ospina/agent-infra" "$_pr"
+    assert_low_refused "$_pr" "C5 $_label ($_path) refuses"
+done
+# Direct predicate vectors for the control characters a TSV row cannot carry
+# faithfully. DEFENCE IN DEPTH, not live coverage: the guard's own rows come from
+# `jq @tsv`, which ESCAPES \t and \n, so a real control character cannot reach the
+# class test from production and an ESCAPED one is a literal in-class filename.
+# Both halves are pinned: the raw form refuses (the arm exists), and the escaped
+# form is ADMITTED (the live production behaviour — §10.8).
+low_path_ok "$(printf 'docs/a\nb.md')" && bad "C5 newline inside a filename must refuse" || ok "C5 raw newline inside a filename refuses (defence in depth)"
+low_path_ok "$(printf 'docs/a\tb.md')" && bad "C5 tab inside a filename must refuse" || ok "C5 raw tab inside a filename refuses (defence in depth)"
+# A tab-split row: 4 TSV fields → malformed framing, refused before any class test.
+STUB_COMPARE="$(printf 'added\tdocs/a.md\tscripts/evil.sh')x" run_record_verdict clean-low "daniel-ospina/agent-infra" 424658
+assert_low_refused 424658 "C5 old-path poisoned row refuses"
+STUB_COMPARE="$(printf 'added\tdocs/a.md\textra\tfields')" run_record_verdict clean-low "daniel-ospina/agent-infra" 424659
+assert_low_refused 424659 "C5 malformed (NF!=3) row refuses"
+
+# ── 10.6 C6 row framing / old path ──────────────────────────────────────
+STUB_COMPARE="$(printf 'renamed\tdocs/evil.md\tscripts/evil.sh')" run_record_verdict clean-low "daniel-ospina/agent-infra" 424660
+assert_low_refused 424660 "C6 rename with a code OLD path refuses"
+STUB_COMPARE="$(printf 'renamed\tdocs/evil.md\t')" run_record_verdict clean-low "daniel-ospina/agent-infra" 424661
+assert_low_refused 424661 "C6 rename without its old path refuses"
+STUB_COMPARE="$(printf 'copied\tdocs/a.md\tdocs/b.md')" run_record_verdict clean-low "daniel-ospina/agent-infra" 424662
+assert_low_refused 424662 "C6 copied row refuses (copy source is absent from the diff — refused by ABSENCE from the status enum)"
+assert_contains "$RECORD_ERR" "malformed diff row" "C6 the copied refusal is the framing arm, not the shape arm"
+STUB_COMPARE="$(printf 'junked\tdocs/a.md\t')" run_record_verdict clean-low "daniel-ospina/agent-infra" 424663
+assert_low_refused 424663 "C6 unknown status enum refuses"
+STUB_COMPARE="$(printf 'added\t\t')" run_record_verdict clean-low "daniel-ospina/agent-infra" 424664
+assert_low_refused 424664 "C6 empty filename refuses"
+
+# ── 10.7 POSITIVE controls — the legitimate path must actually record ────
+# Without these, a guard that refused everything would pass §10.1-10.6.
+PATCH="$T/patch-cleanlow.json"
+: > "$PATCH"
+export AI_REVIEW_GATE_KEY="test-key-clean-low"
+STUB_FILES="docs/plans/2026-09-22-x.md" GH_STUB_PATCH_BODY="$PATCH" run_record_verdict clean-low "daniel-ospina/agent-infra" 424670
+QLOW="$(rec_path 424670)"
+[ "$RECORD_RC" = "0" ] && ok "positive: content-only docs diff records (rc 0)" || bad "positive: content-only must record (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$QLOW" ] && ok "positive: record written" || bad "positive: record written"
+assert_contains "$(cat "$QLOW" 2>/dev/null || true)" '"verdict":"clean-low"' "positive: record carries verdict clean-low"
+assert_contains "$(cat "$QLOW" 2>/dev/null || true)" "\"head_sha\":\"$SHA\"" "positive: record is head-bound"
+# #1348 content pin: the attestation is the three-dot diff compare/<base>...<head>,
+# whose CONTENT is identified by the merge base — not by the base branch's tip,
+# which moves on every unrelated merge while the certified diff is unchanged. The
+# record must carry the merge base, or a post-record `gh pr edit --base` silently
+# changes what merges while the head sha still matches.
+assert_contains "$(cat "$QLOW" 2>/dev/null || true)" '"merge_base_sha":"cccccccccccccccccccccccccccccccccccccccc"' "positive: clean-low record is CONTENT-bound (merge base)"
+# The certified diff must be read at the merge base's compare, i.e. against the
+# BASE — not against the head. Nothing else in the suite observes that argument,
+# so flipping it to $META_HEAD (which makes the base pin certify a diff the guard
+# never read) would otherwise stay green.
+assert_contains "$(cat "$LOG" 2>/dev/null || true)" "compare/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb...$SHA" "positive: the diff is read against the BASE, not the head"
+# The FIELD the guard reads is the token that distinguishes this binding from the
+# rejected tip binding, and the stub answers any `compare/` call with a canned
+# mb line — so a one-token rewrite back to `.base.sha` (which would pin the base
+# branch's moving tip and expire every record on the next unrelated merge) leaves
+# the record assertion above GREEN. Only the argv observes it.
+assert_contains "$(cat "$LOG" 2>/dev/null || true)" ".merge_base_commit.sha" "positive: the diff read pins the MERGE BASE field, not the base tip"
+assert_contains "$(cat "$PATCH" 2>/dev/null || true)" "verdict=clean-low @ $SHA" "positive: signed marker posted with the clean-low verdict"
+# Multi-path, mixed content extensions, nested docs, root prose.
+STUB_FILES=$'docs/a.md\ndocs/nested/deep/b.rst\ndocs/c.css\nREADME.md\nCHANGELOG.md' run_record_verdict clean-low "daniel-ospina/agent-infra" 424671
+[ "$RECORD_RC" = "0" ] && ok "positive: multi-path mixed content extensions record (rc 0)" || bad "positive: multi-path (rc=$RECORD_RC, err=$RECORD_ERR)"
+# A delete+add of ONE path is two rows for one distinct path — must not be
+# falsely refused by the changed_files equality check.
+STUB_COMPARE="$(printf 'removed\tdocs/a.md\t\nadded\tdocs/a.md\t')" STUB_CHANGED_FILES=1 run_record_verdict clean-low "daniel-ospina/agent-infra" 424672
+[ "$RECORD_RC" = "0" ] && ok "positive: delete+add of one path records (rows != distinct paths)" || bad "positive: delete+add (rc=$RECORD_RC, err=$RECORD_ERR)"
+# A rename WITHIN the class must record (both ends are content).
+STUB_COMPARE="$(printf 'renamed\tdocs/new.md\tdocs/old.md')" run_record_verdict clean-low "daniel-ospina/agent-infra" 424673
+[ "$RECORD_RC" = "0" ] && ok "positive: content-to-content rename records" || bad "positive: content rename (rc=$RECORD_RC, err=$RECORD_ERR)"
+# clean/clean-micro are untouched by the new guard.
+STUB_FILES="src/app.ts" run_record_verdict clean "daniel-ospina/agent-infra" 424674
+[ "$RECORD_RC" = "0" ] && ok "positive: clean is not shape-guarded (rc 0 on a code diff)" || bad "positive: clean must not be shape-guarded (rc=$RECORD_RC)"
+# The content pin is clean-low only: clean/clean-micro keep their record shape
+# byte-identical (their base-blindness is pre-existing — agent-infra #1362).
+QCLEAN="$(rec_path 424674)"
+if [ -f "$QCLEAN" ] && ! grep -qF '"merge_base_sha"' "$QCLEAN"; then
+  ok "positive: clean record carries no merge_base_sha (shape unchanged)"
+else
+  bad "positive: clean record must EXIST and carry no merge_base_sha (shape unchanged)"
+fi
+unset AI_REVIEW_GATE_KEY
+
+# ── 10.8 direct predicate corpus (no gh; pins the class itself) ──────────
+for _spec in \
+    "docs/plans/x.md:PASS" "docs/a.css:PASS" "docs/deep/nested/x.rst:PASS" \
+    "docs/x.markdown:PASS" "docs/x.txt:PASS" "docs/x.adoc:PASS" "docs/x.scss:PASS" \
+    "README.md:PASS" "CHANGELOG.md:PASS" "CONTRIBUTING.md:PASS" "SECURITY.md:PASS" "CODE_OF_CONDUCT.md:PASS" \
+    "docs/x.md.ts:REFUSE" "notes.md.ts:REFUSE" "docs/evil.sh:REFUSE" "docs/x.py:REFUSE" \
+    "AGENTS.md:REFUSE" "MEMORY.md:REFUSE" "VENDOR.md:REFUSE" "requirements.txt:REFUSE" \
+    "LICENSE:REFUSE" "src/README.md:REFUSE" "skills/x.md:REFUSE" "templates/x.md:REFUSE" \
+    "docs/../src/a.ts:REFUSE" "docs//x.md:REFUSE" "/docs/x.md:REFUSE" "docs/./x.md:REFUSE" \
+    "docs/x.mdx:REFUSE" "docs/x.html:REFUSE" "docs:REFUSE" "docs/:REFUSE" \
+    "docs/c\\nd.md:PASS" "docs/c\\td.md:PASS" ; do
+    _p="${_spec%%:*}"; _want="${_spec#*:}"
+    if low_path_ok "$_p"; then _got="PASS"; else _got="REFUSE"; fi
+    assert_eq "$_got" "$_want" "predicate: $_p -> $_want"
+done
+
+# ── 10.9 MUTATION HARNESS — the suite is regression-sensitive ───────────
+# Two mutants built from THIS script. Without them, §10.1-10.7 prove only that
+# the new code rejects or accepts; they do not prove the GUARD is load-bearing.
+MUTANT_LOOSE="$T/mutant-guard-neutered.sh"
+MUTANT_PRE="$T/mutant-verdict-reverted.sh"
+# Portable across GNU and BSD sed: a `c\` command is not portable, so the
+# loose mutant neutralises the guard's DECISION at its call site instead.
+sed 's#clean_low_shape_ok "\$ROWS"#true#' "$RECORD" > "$MUTANT_LOOSE"
+sed 's#^  clean|clean-micro|clean-low) ;;#  clean|clean-micro) ;;#' "$RECORD" > "$MUTANT_PRE"
+bash -n "$MUTANT_LOOSE" && ok "mutation: neutered-guard mutant parses" || bad "mutation: neutered-guard mutant is not valid bash"
+bash -n "$MUTANT_PRE" && ok "mutation: reverted-verdict mutant parses" || bad "mutation: reverted-verdict mutant is not valid bash"
+if cmp -s "$MUTANT_LOOSE" "$RECORD"; then bad "mutation: guard-neutering sed did not change the script"; else ok "mutation: guard-neutering sed changed the script"; fi
+if cmp -s "$MUTANT_PRE" "$RECORD"; then bad "mutation: reverted-verdict sed did not change the script"; else ok "mutation: reverted-verdict sed changed the script"; fi
+
+run_mutant() { # <script> <verdict> <repo> <pr>
+    local script="$1" rcfile="$T/mrc"
+    : > "$T/merr"
+    (
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+        rc=0
+        bash "$script" "$4" "$SHA" "$2" "$3" >/dev/null 2>"$T/merr" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    MUTANT_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    MUTANT_ERR="$(cat "$T/merr" 2>/dev/null || true)"
+}
+# (a) Neutering the guard must let the code-bearing attack THROUGH (rc 0). If it
+#     did not, §10.1 would be passing for some reason other than the guard and
+#     the suite would be vacuous.
+STUB_FILES="src/app.ts" run_mutant "$MUTANT_LOOSE" clean-low "daniel-ospina/agent-infra" 424680
+[ "$MUTANT_RC" = "0" ] && ok "mutation(a): neutered guard ADMITS the code-bearing diff (guard is load-bearing)" || bad "mutation(a): neutered guard still refused (rc=$MUTANT_RC, err=$MUTANT_ERR) — §10.1 is not testing the guard"
+# (b) Reverting the verdict arm must make the POSITIVE vector RED (rc 2) — this
+#     is the durable, in-suite form of "the test fails against the pre-change
+#     script": the pre-change script has no clean-low verdict at all.
+STUB_FILES="docs/a.md" run_mutant "$MUTANT_PRE" clean-low "daniel-ospina/agent-infra" 424681
+[ "$MUTANT_RC" = "2" ] && ok "mutation(b): pre-change verdict arm REFUSES the positive vector (rc 2 — positive vector is RED pre-change)" || bad "mutation(b): expected rc 2 without the verdict arm (rc=$MUTANT_RC)"
+# (c) Sanity: the mutants do not break an unrelated verdict (`clean` still records).
+STUB_FILES="src/app.ts" run_mutant "$MUTANT_LOOSE" clean "daniel-ospina/agent-infra" 424682
+[ "$MUTANT_RC" = "0" ] && ok "mutation(c): mutants leave the clean path intact" || bad "mutation(c): clean path broken by mutation (rc=$MUTANT_RC)"
+
+# ── 10.10 no gh reads for a verdict that does not need them ─────────────
+run_record "daniel-ospina/agent-infra" 424690
+if grep -q "compare/" "$LOG"; then
+    bad "clean verdict performs no clean-low diff read"
+else
+    ok "clean verdict performs no clean-low diff read"
+fi
+
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
