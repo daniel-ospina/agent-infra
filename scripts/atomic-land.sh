@@ -174,18 +174,24 @@ acquire_lock() {
   local dir="${ATOMIC_LAND_LOCK_DIR:-$HOME/.pi/agent/locks}"
   mkdir -p "$dir" 2>/dev/null || true
   LOCKDIR="$dir/atomic-land-$(printf '%s' "$REPO" | tr '/' '-')-$PR.lock"
-  if mkdir "$LOCKDIR" 2>/dev/null; then :; else
-    local other=""
+  # B11 — the RECLAIM is the hard part. Deciding "stale" and then `rm -rf` + `mkdir`
+  # is check-then-act: two rails can both decide stale, and the second's `rm -rf`
+  # deletes the first's freshly-created lock — both then land (reproduced at
+  # ~25-38% naturally against a stale lock). The steal is therefore an ATOMIC
+  # RENAME: `mv` of the lock directory succeeds for exactly ONE contender, so the
+  # others fall through to the loop and re-read the lock that now exists.
+  local tries=0 other age now_s mt stolen
+  while :; do
+    tries=$((tries + 1))
+    if mkdir "$LOCKDIR" 2>/dev/null; then break; fi
     other="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
     if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
       stop "another atomic-land is already running for $REPO#$PR (pid $other) — refusing to interleave"
     fi
-    # B11 — an ABSENT pid is not proof of a dead holder. The directory exists
-    # before the pid is written, so a rail in that window would be reclaimed out
-    # from under by a check-then-act. A young, pid-less lock is treated as LIVE
-    # (fail closed); only a pid-less lock older than the grace is reclaimed, once.
+    # An ABSENT pid is not proof of a dead holder (the directory exists before the
+    # pid is written), so a young pid-less lock is LIVE and refuses; only one older
+    # than the grace is a reclaim candidate.
     if [ -z "$other" ]; then
-      local now_s mt age
       now_s="$(date +%s)"
       # Portable mtime read: GNU first, BSD second. A missing/unreadable mtime is
       # treated as age 0 (i.e. LIVE) so the failure direction stays fail-closed.
@@ -195,11 +201,13 @@ acquire_lock() {
         stop "another atomic-land holds the lock for $REPO#$PR (no pid yet — still starting) — refusing to interleave"
       fi
     fi
-    rm -rf "$LOCKDIR"                       # stale holder — reclaim ONCE
-    if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    # Stale: claim it by rename (atomic; at most one rail can win), then retry mkdir.
+    stolen="$LOCKDIR.reclaim.$$"
+    mv "$LOCKDIR" "$stolen" 2>/dev/null && rm -rf "$stolen"
+    if [ "$tries" -ge 5 ]; then
       stop "could not acquire the per-PR lock ($LOCKDIR) — refusing to race"
     fi
-  fi
+  done
   printf '%s\n' "$$" > "$LOCKDIR/pid"
   trap 'rm -rf "$LOCKDIR"' EXIT INT TERM HUP
 }
@@ -399,9 +407,6 @@ do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
     rm -f "$log"
     stop "record-review.sh exited $rc — refusing to land without a record"
   fi
-  # Cite BEFORE the binding refresh (the citation names both ends).
-  if [ "$NO_CITE" -eq 0 ]; then cite_reuse "$log" "$prior"; fi
-  rm -f "$log"
   # B8 — the delegated record must ACTUALLY name THIS head. A zero exit is not
   # proof: the carry-forward arm sets the recorded sha to the CURRENT head only
   # when the reviewed diff is unchanged, and `record-review.sh` fails OPEN on a
@@ -411,17 +416,26 @@ do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
   # sequencer, not the equivalence authority.)
   read_record || {
     err "atomic-land: the record could not be re-read after the record step — refusing to land unrecorded"
+    rm -f "$log"
     return 1
   }
   if [ "$RECORD_HEAD" != "$HEAD" ]; then
     err "atomic-land: the record names ${RECORD_HEAD:0:12}… but the head is ${HEAD:0:12}… — this unit has NO record for the head it would land."
     err "atomic-land: a zero exit must leave a record naming the CURRENT head (carry-forward does that only when the reviewed diff is byte-unchanged). Nothing was merged."
+    rm -f "$log"
     return 1
   fi
   if ! verdict_accepted "$RECORD_VERDICT"; then
     err "atomic-land: the re-read record's verdict '${RECORD_VERDICT:-<none>}' is not accepted — refusing to land (B2)"
+    rm -f "$log"
     return 1
   fi
+  # Cite ONLY after the binding is VERIFIED. Posting the citation before the
+  # re-read publishes a claim the rail has not yet established — a delegate that
+  # exits 0 without writing makes "reused verdict …" false, and a comment cannot
+  # be un-posted. The citation records a VERIFIED reuse.
+  if [ "$NO_CITE" -eq 0 ]; then cite_reuse "$log" "$prior"; fi
+  rm -f "$log"
   return 0
 }
 

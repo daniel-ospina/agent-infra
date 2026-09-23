@@ -157,9 +157,14 @@ if [ "${SCEN_RECORD_LOG:-}" = 1 ]; then
   echo "the reviewed diff is unchanged (diff=1111111111111111111111111111111111111111111111111111111111111111)"
 fi
 cur="$(cat "$SCEN/head" 2>/dev/null || printf '%s' "${HEAD:-}")"
-printf '{"pr":%s,"head_sha":"%s","verdict":"%s","repo":"%s","diff_sha256":"%s"}\n' \
-  "$1" "$cur" "$3" "${4:-}" "1111111111111111111111111111111111111111111111111111111111111111" \
-  > "$SCEN_RECORD_FILE"
+# SCEN_RECORD_NO_WRITE models the FAIL-OPEN delegate: a zero exit that writes no
+# record at all (record-review.sh fails open on a transient head read). This is
+# the only path that exercises the rail's post-record binding guard.
+if [ "${SCEN_RECORD_NO_WRITE:-0}" != 1 ]; then
+  printf '{"pr":%s,"head_sha":"%s","verdict":"%s","repo":"%s","diff_sha256":"%s"}\n' \
+    "$1" "$cur" "$3" "${4:-}" "1111111111111111111111111111111111111111111111111111111111111111" \
+    > "$SCEN_RECORD_FILE"
+fi
 # Hooks that model a mutation landing AFTER the record step completes — i.e.
 # inside the unit, between the record and the land (B9 head move, B10 repoint).
 [ "${SCEN_RECORD_MOVES_HEAD:-0}" = 1 ] && printf '%s\n' "$HEAD_MOVED" > "$SCEN/head"
@@ -184,6 +189,7 @@ new_scen() {
   SCEN="$TMP/scen-$1"
   # reset every scenario-scoped switch (a leak between scenarios is a test bug)
   SCEN_RECORD_RC=0; SCEN_RECORD_LOG=; SCEN_ADMIN_RC=0; ATOMIC_LAND_CONFIRM_MAX=60
+  SCEN_RECORD_NO_WRITE=0
   SCEN_RECORD_MOVES_HEAD=0; SCEN_RECORD_REPOINTS_BASE=0; HEAD_MOVED="cccccccccccccccccccccccccccccccccccccccc"
   unset mb_seq 2>/dev/null || true
   mkdir -p "$SCEN" "$SCEN/home/.pi/agent/reviews"
@@ -210,6 +216,7 @@ run_rail() { # <extra args...>
   SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="$REPO" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
+  SCEN_RECORD_NO_WRITE="${SCEN_RECORD_NO_WRITE:-0}" \
   SCEN_RECORD_MOVES_HEAD="${SCEN_RECORD_MOVES_HEAD:-0}" \
   SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
@@ -484,6 +491,31 @@ called "admin-merge" && fail "landed by reclaiming a pid-less live lock (B11 fai
 grep -qi "no pid yet" "$SCEN/err" && pass "the refusal names the pid-less holder" || fail "the refusal does not name the pid-less holder"
 rm -rf "$LOCK2"
 
+# ═══ 17d. B8 — a zero exit that writes no record must be refused ══════
+# The live delegate fails OPEN when it cannot read the PR's head. A rail that
+# trusted the exit status would land with no record for the head it merges.
+echo "── 17d. a zero exit that writes no record for HEAD is refused (B8)"
+new_scen liardelegate
+SCEN_RECORD_NO_WRITE=1
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1)" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "landed with no record for the head it would land (B8 fail-open)" || pass "did NOT land without a record naming HEAD"
+grep -q "the record names" "$SCEN/err" && pass "the stop names the record/head mismatch" || fail "the stop does not name the record/head mismatch"
+grep -qF "reused verdict" "$SCEN/calls" && fail "published a reuse citation BEFORE the binding was verified" || pass "no reuse citation published before verification"
+
+# ═══ 17e. B11 — a STALE lock is reclaimed and the unit proceeds ═════════
+echo "── 17e. a dead-pid lock is reclaimed and the unit proceeds (B11)"
+new_scen stalereclaim
+LOCK3="$SCEN/home/.pi/agent/locks/atomic-land-daniel-ospina-agent-infra-42.lock"
+mkdir -p "$LOCK3" && printf '999999\n' > "$LOCK3/pid"   # a pid that is certainly not alive
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "reclaimed and completed (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "admin-merge" && pass "the unit landed after reclaiming a stale lock" || fail "did not proceed after reclaiming a stale lock"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B8 must be covered by a test that FAILS against the revision before
@@ -518,6 +550,8 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B4   's/confirm_merged\(\) \{/confirm_merged() { return 0;/'
   # B5: allow a draft
   mutate_and_expect_fail B5   's/if \[ "\$IS_DRAFT" = "true" \]; then/if false; then/'
+  # B8b: trust the delegate's exit status instead of re-reading the record
+  mutate_and_expect_fail B8b  's/^  if \[ "\$RECORD_HEAD" != "\$HEAD" \]; then/  if false; then/m'
   # B6b: read an undetermined merge state as "up to date" and certify anyway
   mutate_and_expect_fail B6b  's/^      stop "the merge state of .*$/      return 3/m'
   # B11b: reclaim a pid-less lock immediately — the mkdir→pid TOCTOU
