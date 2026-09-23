@@ -89,6 +89,8 @@
 #                           Deliberately NOT under $TMPDIR, which is caller-controlled.
 #   ATOMIC_LAND_LOCK_GRACE  seconds a pid-less lock is treated as LIVE, not stale
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
+#   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
+#                           before failing closed (default: 5).
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
@@ -245,6 +247,50 @@ base_tip() {
   gh_ api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true
 }
 
+# The review gate key — the SAME source and normalisation as the producer
+# (scripts/record-review.sh: AI_REVIEW_GATE_KEY, else ~/.pi/agent/.ai-review-gate-key).
+# The PR body is attacker-writable, so a matching marker SHAPE is not evidence that
+# the record can be carried: the producer carries a prior marker only after
+# verifying its HMAC (#784/#2982), and refuses when no key is available. The rail
+# therefore VERIFIES the attestation — presence of a diff= identity AND a valid
+# signature — instead of trusting its shape.
+GATE_KEY_RAW="${AI_REVIEW_GATE_KEY:-}"
+if [ -z "$GATE_KEY_RAW" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+  GATE_KEY_RAW="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+fi
+GATE_KEY="$(printf '%s' "$GATE_KEY_RAW" | tr -d '[:space:]')"
+
+# Can the record at the current head be RESTORED by the producer's carry-forward
+# after an update? Requires a marker that is (a) shape-valid WITH a diff= identity
+# and (b) authentically signed by the gate key. Mirrors the producer's own carry
+# regex and signature check (record-review.sh:446-458) — keep both in sync.
+# This is a presence + authenticity test, NOT an equivalence computation: whether
+# the marker's diff= still matches the live diff is the producer's decision alone.
+pr_has_carry_evidence() {
+  local line="" text="" sig="" expect=""
+  line="$(gh_ api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null \
+    | grep -m1 -E "^review recorded: reviews/${PR}\\.json verdict=${RECORD_VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(.*\\) sig=[0-9a-f]{64}$" || true)"
+  [ -n "$line" ] || return 1
+  [ -n "$GATE_KEY" ] || return 1
+  text="${line% sig=*}"; sig="${line##* sig=}"
+  expect="$(printf '%s' "$text" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+  [ -n "$expect" ] || return 1
+  [ "$sig" = "$expect" ]
+}
+# WHY the FIRST matching line, and not any line: the producer's carry pins
+# `diff=${DIFF_HASH}` — the LIVE diff — which is a post-update property the rail
+# cannot know without computing equivalence (the producer's decision, not the
+# rail's). So the rail cannot tell a stale-diff line from a live-diff one, and the
+# two candidate behaviours are:
+#   narrow (this one): over-block a body whose first matching line is stale;
+#   wide:              accept it, call the update, and SPEND an attestation the
+#                      producer then refuses to carry.
+# Over-blocking is friction (recoverable, visible); spending is silent destruction
+# of a fresh attestation (the 22-updated / 17-invalidated / 0-landed mode this
+# guard exists to prevent). Fail-closed wins. The over-block is a DECLARED residual
+# (B), retired by #1397 (content identity) — with identity on the record an update
+# stops invalidating it at all.
+
 resolve_repo() {
   if [ -z "$REPO" ]; then
     REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
@@ -313,21 +359,49 @@ verdict_accepted() {
 
 # ── step 1: update ───────────────────────────────────────────────────────
 do_update() { # 0 = updated, 3 = not behind (no-op)
-  local before="$HEAD" after="" i
+  local before="$HEAD" after="" i t=0
+  case "$MERGE_STATE" in
+    UNKNOWN|""|null)
+      # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
+      # determine the merge state. Reading it as "nothing to update" would certify
+      # the head against a base relation nobody established, then land on it.
+      # But UNKNOWN is TRANSIENT — GitHub computes mergeability lazily — so re-poll
+      # a bounded number of times before refusing: a state that is merely still
+      # being computed must not false-block the unit, while a genuinely
+      # undetermined state still fails CLOSED.
+      while [ "$t" -lt "${ATOMIC_LAND_UNKNOWN_POLLS:-5}" ]; do
+        t=$((t + 1))
+        sleep "$POLL"
+        resolve_state
+        case "$MERGE_STATE" in UNKNOWN|""|null) : ;; *) break ;; esac
+      done
+      case "$MERGE_STATE" in
+        UNKNOWN|""|null)
+          stop "the merge state of $REPO#$PR is still undetermined after $t re-poll(s) (mergeStateStatus=${MERGE_STATE:-<none>}) — refusing to certify a head whose base relation is unknown (B6/B12)" ;;
+      esac ;;
+  esac
   case "$MERGE_STATE" in
     BEHIND) : ;;
     CLEAN)
       say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
       return 3 ;;
-    UNKNOWN|""|null)
-      # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
-      # determine the merge state. Reading it as "nothing to update" would certify
-      # the head against a base relation nobody established, then land on it.
-      stop "the merge state of $REPO#$PR could not be determined (mergeStateStatus=${MERGE_STATE:-<none>}) — refusing to certify a head whose base relation is unknown (B6/B12)" ;;
     *)
       say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND — nothing to update"
       return 3 ;;
   esac
+  # B5 — never SPEND an attestation the unit cannot restore. A branch update moves
+  # the head and invalidates the record; the #767 carry-forward can re-bind it only
+  # if the PR body carries a SIGNED marker whose `diff=` equals the live diff. With
+  # no such marker (every pre-#767 record) the update is destructive with certainty,
+  # and the cost is measured: a 22-PR sweep invalidated 17 fresh attestations and
+  # landed 0. This is a PRESENCE test — does an identity-bearing marker exist at all
+  # — NOT an equivalence computation: the producer owns the equivalence decision.
+  if [ "$RECORD_HEAD" = "$HEAD" ] && ! pr_has_carry_evidence; then
+    if [ -z "$GATE_KEY" ]; then
+      stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and nothing could re-mint it — no review gate key is available (AI_REVIEW_GATE_KEY or ~/.pi/agent/.ai-review-gate-key), so the carry-forward could never verify a prior marker. Nothing was merged."
+    fi
+    stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and this rail could not show it would be restored — the PR carries no VERIFIABLE signed marker with a diff= identity for verdict '$RECORD_VERDICT' (a pre-#767 marker, one signed with a different key, or a line whose signature does not verify; the PR body is attacker-writable, so a matching shape is not evidence). Record the review in the current format first; then the update carries it. Nothing was merged."
+  fi
   say "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
   if [ "$DRY_RUN" -eq 1 ]; then
     say "atomic-land:     (dry-run) would run: gh pr update-branch $PR"
