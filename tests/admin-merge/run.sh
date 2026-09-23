@@ -5128,6 +5128,30 @@ else
   fail "no evidence comment posted for the absurd-token case"
 fi
 
+# ── 59. A SKIPPED-ONLY SURFACE ON A GREEN BASE MERGES (the FIX A guard) ───────
+# The narrowest form of the #55 over-block guard, run after the attribution
+# scenarios: a surface whose ONLY completed check is SKIPPED, on a GREEN base.
+# Nothing measurable was produced, and 4.6 is not entered on a green base, so it
+# must MERGE — the EMPTY anchor is a refusal only when the base is RED.
+echo "== 59. a skipped-only surface on a green base still merges (#1353) =="
+
+new_scen skipped-only-on-green-base
+HEAD_NM6="a6a6${HEX36}"
+printf '%s\n' "$HEAD_NM6" > "$SCEN/head"
+lane_pass "$HEAD_NM6" 5973 > "$SCEN/runs-$HEAD_NM6"
+lane_pass mainnm6 5974 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5301 'ci / lint' completed skipped 7367 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7367 pull_request 'CI'
+main_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a SKIPPED-only surface on a GREEN base MERGES (exit 0)" \
+  || fail "a skipped-only surface was refused on a green base (exit $rc): $(sed -n '1,5p' "$SCEN/err" 2>/dev/null)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 1 check(s)" "$SCEN/out" \
+  && pass "…and the skipped check is still COUNTED and reported GREEN" \
+  || fail "the skipped-only surface is not reported: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
