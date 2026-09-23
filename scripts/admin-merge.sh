@@ -520,11 +520,62 @@ RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 #
 # ci-failure-set.sh holds this same expression by design; see its copy for the other
 # splitter.
+#
+# #1358: that script now EMITS these same three fields from a WIDER (raw) listing
+# instead of asking gh for them directly, because it drops SUPERSEDED failing runs
+# first (`drop_superseded_runs` there). The three fields, their order, their
+# separators and the sentinel above are UNCHANGED, so this copy and that emitter
+# stay byte-equal — which is why the sentinel is load-bearing on BOTH sides.
+#
+# The supersede rule is deliberately NOT applied to the copy HERE. This projection
+# feeds the pending-run diagnostic and lane_shard_set's coverage listing, and a run
+# that EXECUTED a shard is coverage however stale its conclusion — the question
+# #1319's parity gate asks, which is a different question from "did this commit
+# fail". Dropping such a run here would let a lane look as though it never ran the
+# shard at all.
 LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
 info() { printf '%s\n' "$*"; }
+
+# ── write_merge_retraction <pr> <head> <reason> <detail-file> <detail-label> ──
+#
+# CORRECT THE MARKER. A posted evidence marker must never be left standing over
+# an unmerged PR, so a head-bound RETRACTION is posted (best effort) stating that
+# the merge did NOT happen and the evidence above is not a successful merge.
+#
+# The retraction is deliberately NOT a certificate — it carries no
+# `unique to this PR: 0` line — so the merge gate will not accept it in place of
+# the evidence.
+#
+# Factored into ONE function because there are now TWO ways for a merge to fail
+# AFTER the marker is posted (#1359): the command exits non-zero, or it exits ZERO
+# while the artifact (state=MERGED) was never observed. Two copies of a retraction
+# body would drift, and the drift would be invisible in exactly the situation it
+# exists for.
+write_merge_retraction() {
+  local pr="$1" head="$2" reason="$3" detail="$4" label="$5"
+  {
+    printf '<!-- admin-merge-retraction: %s -->\n' "$head"
+    printf '⚠️ RETRACTED — the admin merge of head `%s` FAILED and did NOT happen.\n\n' "$head"
+    printf 'The evidence comment above (`admin-merge-safety: %s`) records that the safety\n' "$head"
+    printf 'comparison passed and the evidence was posted. It does NOT mean this PR merged:\n'
+    printf '%s\n\n' "$reason"
+    if [ -n "$detail" ] && [ -s "$detail" ]; then
+      printf '%s\n\n' "$label"
+      # Indented, never fenced: this body is machine-read too, and a fence is a
+      # parser with state.
+      sed 's/^/    /' "$detail"
+      printf '\n'
+    fi
+    printf 'Re-run the rail once the cause is fixed; the evidence above is still head-bound to `%s`.\n' "$head"
+  } > "$TMP/retraction.md"
+  # shellcheck disable=SC2086
+  if ! $GH pr comment "$pr" ${repo_args[@]+"${repo_args[@]}"} --body-file "$TMP/retraction.md" >/dev/null 2>&1; then
+    say_err "   (could not post the retraction comment — the FAILED merge above still stands)"
+  fi
+}
 
 count_lines() { wc -l < "$1" | tr -d ' '; }
 
@@ -3134,7 +3185,7 @@ main() {
       # measurement time to compare against, so the rail cannot show this PR
       # measured the base's red.
       stale_any=1
-      stale_reds="   • the PR's evaluated surface has produced NO MEASURING completed check run (none at all, or only `skipped`/`cancelled`/`neutral`/`stale` checks, which measured nothing), so it has no time to compare against the base's red(s)"$'\n'
+      stale_reds="   • the PR's evaluated surface has produced NO MEASURING completed check run (none at all, or only \`skipped\`/\`cancelled\`/\`neutral\`/\`stale\` checks, which measured nothing), so it has no time to compare against the base's red(s)"$'\n'
     fi
     if [ "$stale_any" -eq 1 ]; then
       say_err "admin-merge: ✗ BLOCK — THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE surface)."
@@ -3414,6 +3465,75 @@ $attribution_line"
   # shellcheck disable=SC2086
   $GH pr merge "$PR" --admin ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} --match-head-commit "$head" ${repo_args[@]+"${repo_args[@]}"} \
     >"$TMP/merge.out" 2>"$TMP/merge.err" || merge_status=$?
+
+  # ── THE ARTIFACT, NOT THE SEND (#1359) ─────────────────────────────────────
+  #
+  # `gh pr merge` exiting 0 is a SEND. It is not the artifact. `--auto` enqueues a
+  # merge and exits 0 while the PR is still OPEN (and MERGE_ARGS is CALLER-
+  # supplied, so `-- --auto` reaches this line); an enqueued or asynchronously-
+  # completed merge can also lag the command's return. Either way the next line
+  # asserts a fact about the REPOSITORY, so the repository is what gets read.
+  #
+  # BOUNDED POLL: a genuine merge can take a moment to be reflected, so we ask a
+  # few times before concluding it did not happen — and we ask the API, never a
+  # local inference, because a wrong "merged" is the one error that cannot be
+  # walked back (the evidence comment is already standing).
+  local merge_state="" merge_merged_at=""
+  if [ "$merge_status" -eq 0 ]; then
+    local attempt=0 attempts="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
+    # A non-numeric bound would make `[ "$attempt" -ge "$attempts" ]` exit 2 on
+    # every pass, so the poll would never terminate — a HANG, not a refusal. So
+    # would a bound at or above the integer ceiling (all digits, so the guard below
+    # cannot see it: `-ge` can never be satisfied and `[` starts erroring past
+    # int64 — adversarial cycle 2, reproduced). Ten digits is already far beyond any
+    # sane bound, so anything longer falls back to the default.
+    case "$attempts" in ''|*[!0-9]*|??????????*) attempts=6 ;; esac
+    while : ; do
+      local observed state_tab
+      # ASK FOR EXACTLY WHAT WE MEAN and let the producer project it. A `sed` over
+      # the whole JSON takes the LAST `"state"` anywhere in the output, so a nested
+      # or repeated object could be read as the merge state while the TOP-LEVEL
+      # state said OPEN (adversarial cycle 1 — LATENT: real `gh pr view --json
+      # state,mergedAt` emits only those two keys, so it was not reachable today, but
+      # this guard's correctness must not rest on the producer's output shape).
+      # `--jq` reads the TOP-LEVEL fields: one tab-separated `<state>\t<mergedAt>`,
+      # with mergedAt sentineled because it is null for an unmerged PR.
+      observed="$($GH pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json state,mergedAt --jq '[.state, (.mergedAt // "-")] | @tsv' 2>/dev/null || true)"
+      state_tab="$(printf '%s' "$observed" | head -1)"
+      # THE SEPARATOR IS REQUIRED. `${x%%$'\t'*}` returns the WHOLE STRING when
+      # there is no TAB, so a producer that ignores `--jq` and answers a bare
+      # `MERGED` would set merge_state=MERGED with mergedAt never observed, and the
+      # break below would fire on the first pass — an assertion of MERGED with no
+      # observation of the artifact, which is the one thing this guard exists to
+      # prevent (adversarial cycle 2, reproduced). The absence of the separator is
+      # the absence of the response: unreadable, and therefore a REFUSAL.
+      case "$state_tab" in
+        *$'\t'*) merge_state="${state_tab%%$'\t'*}"
+                  merge_merged_at="${state_tab#*$'\t'}"
+                  [ -n "$merge_merged_at" ] || merge_merged_at="<unreadable>" ;;
+        *)        merge_state="<unreadable>"
+                  merge_merged_at="<unreadable>" ;;
+      esac
+      [ "$merge_state" = "MERGED" ] && break
+      attempt=$((attempt + 1))
+      [ "$attempt" -ge "$attempts" ] && break
+      sleep "${ADMIN_MERGE_VERIFY_POLL:-2}"
+    done
+    if [ "$merge_state" != "MERGED" ]; then
+      say_err "⛔ admin-merge: FAILED — gh pr merge reported SUCCESS (exit 0), but PR #$PR is NOT merged."
+      say_err "   The API reports state=${merge_state:-<unreadable>} mergedAt=${merge_merged_at:-<unreadable>} after $attempts attempt(s)."
+      say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
+      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. A QUEUED merge is"
+      say_err "   not a merge: the rail certifies the ARTIFACT, not the command's exit code. If you"
+      say_err "   passed '--auto' through MERGE_ARGS, that is the cause."
+      write_merge_retraction "$PR" "$head" \
+        "gh pr merge exited 0, but the API does not report this PR as MERGED (state=${merge_state:-<unreadable>}, mergedAt=${merge_merged_at:-<unreadable>}) after $attempts attempt(s). A merge that is still QUEUED (for example one requested with '--auto') is not a merge that happened." \
+        "$TMP/merge.err" "gh pr merge said:"
+      exit 1
+    fi
+  fi
+
   if [ "$merge_status" -ne 0 ]; then
     say_err "⛔ admin-merge: FAILED — the merge of PR #$PR did NOT happen (gh pr merge exit $merge_status)."
     say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
@@ -3428,34 +3548,12 @@ $attribution_line"
       say_err "   gh pr merge stdout:"
       sed 's/^/      /' "$TMP/merge.out" >&2
     fi
-    # CORRECT THE MARKER. A posted marker must never be left standing over an
-    # unmerged PR, so a head-bound RETRACTION is posted (best effort) stating that
-    # the merge FAILED and the evidence above is not a successful merge. The
-    # retraction is deliberately NOT a certificate — it carries no
-    # `unique to this PR: 0` line — so the merge gate will not accept it in place
-    # of the evidence.
-    {
-      printf '<!-- admin-merge-retraction: %s -->\n' "$head"
-      printf '⚠️ RETRACTED — the admin merge of head `%s` FAILED and did NOT happen.\n\n' "$head"
-      printf 'The evidence comment above (`admin-merge-safety: %s`) records that the safety\n' "$head"
-      printf 'comparison passed and the evidence was posted. It does NOT mean this PR merged:\n'
-      printf '`gh pr merge` exited %s after that marker was posted.\n\n' "$merge_status"
-      if [ -s "$TMP/merge.err" ]; then
-        printf 'gh pr merge said:\n\n'
-        # Indented, never fenced: this body is machine-read too, and a fence is a
-        # parser with state.
-        sed 's/^/    /' "$TMP/merge.err"
-        printf '\n'
-      fi
-      printf 'Re-run the rail once the cause is fixed; the evidence above is still head-bound to `%s`.\n' "$head"
-    } > "$TMP/retraction.md"
-    # shellcheck disable=SC2086
-    if ! $GH pr comment "$PR" ${repo_args[@]+"${repo_args[@]}"} --body-file "$TMP/retraction.md" >/dev/null 2>&1; then
-      say_err "   (could not post the retraction comment — the FAILED merge above still stands)"
-    fi
+    write_merge_retraction "$PR" "$head" \
+      "\`gh pr merge\` exited $merge_status after that marker was posted." \
+      "$TMP/merge.err" "gh pr merge said:"
     exit 1
   fi
-  info "admin-merge: ✅ merged PR #$PR at $head"
+  info "admin-merge: ✅ merged PR #$PR at $head (state=$merge_state confirmed via the API)"
 }
 
 main "$@"
