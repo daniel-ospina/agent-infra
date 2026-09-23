@@ -287,16 +287,40 @@ case "$key" in
       [ -f "$SCEN/green-runs" ] && cat "$SCEN/green-runs"
       exit 0
     fi
-    # #1261: the RUN MAP for main-health event resolution (`--json` carries
-    # `event`). Its OWN fixture, never the lane's runs-main projection — that is
-    # a different shape (`status\tconclusion\tsha:id`) and reusing it here would
-    # make the health probe read lane lines as a run map.
-    want_event=0; jp=""
+    # The projection a caller asks for is named by its `--json` FIELD LIST, and
+    # the two lane-shaped callers now differ BY THAT LIST (#1358), so they can no
+    # longer be told apart by a single field name:
+    #   * the RUN MAP (`--json databaseId,event,workflowName`) — #1261 main-health
+    #     event resolution. Recognised by `event` WITHOUT `status`/`conclusion`.
+    #   * the RAW supersede listing (`… headSha,workflowDatabaseId,workflowName,
+    #     event`) — recognised by `workflowDatabaseId`, which NO other caller asks
+    #     for. Served WHOLE: the fixture IS that 6-field projection.
+    #   * the canonical 3-field lane listing (`… headSha`, `LANE_RUN_JQ`) — served
+    #     as the FIRST THREE FIELDS, so one fixture answers both the raw consumer
+    #     (the parser) and the canonical one (the rail's coverage gate, which
+    #     reads `<status>\t<conclusion>\t<sha>:<id>`). A 3-field fixture is
+    #     unchanged by that projection, which is why every older scenario in this
+    #     suite keeps its exact meaning.
+    fields=""; jp=""
     for x in "$@"; do
-      [ "$jp" = "--json" ] && case "$x" in *event*) want_event=1 ;; esac
+      [ "$jp" = "--json" ] && fields="$x"
       jp="$x"
     done
-    if [ "$want_event" = 1 ]; then
+    # #1358: the field list is the discriminator. A list carrying
+    # `workflowDatabaseId` is the PARSER's raw projection (`LANE_RUN_RAW_JQ`) — its
+    # fixture is handed over verbatim (no cut, no projection), because the supersede
+    # rule needs the identity fields and must also be able to see a line the lister
+    # did NOT produce. Everything else keeps the canonical 3-field shape the rail's
+    # coverage gate and pending probe read. An `event`-bearing list ALONE cannot
+    # decide this: the raw projection carries `event` too, so the map branch takes
+    # `event` only when the list is neither the lane's status/conclusion shape.
+    want_map=0 want_raw=0
+    case "$fields" in
+      *workflowDatabaseId*) want_raw=1 ;;
+      *event*)
+        case "$fields" in *status*|*conclusion*) ;; *) want_map=1 ;; esac ;;
+    esac
+    if [ "$want_map" = 1 ]; then
       # The map is keyed the same way the rail keyed the listing: `--commit` for a
       # sha-keyed surface (the PR's evaluated tree), `--branch` for main.
       if [ "$mode" = "commit" ]; then
@@ -310,8 +334,18 @@ case "$key" in
     # A per-lane fixture, when present, models the FILTERED listing; the bare
     # file models the unfiltered one (the bogus-zero window).
     if [ -n "$wf" ] && [ -f "$f.by-workflow.$wf" ]; then f="$f.by-workflow.$wf"; fi
-    if [ -f "$f" ] && [ -n "$limit" ]; then head -n "$limit" "$f"; exit 0; fi
-    [ -f "$f" ] && cat "$f"
+    if [ "$want_raw" = 1 ]; then
+      # The raw projection: the fixture verbatim (a legacy 3-field line is handed
+      # over as-is, which is exactly how a line the lister did not produce reaches
+      # the rule — see the opacity contract in ci-failure-set.sh).
+      if [ -f "$f" ] && [ -n "$limit" ]; then head -n "$limit" "$f"; exit 0; fi
+      [ -f "$f" ] && cat "$f"
+      exit 0
+    fi
+    # The canonical 3-field projection. Applied AFTER the limit, because gh
+    # truncates the listing and only then projects it.
+    if [ -f "$f" ] && [ -n "$limit" ]; then head -n "$limit" "$f" | cut -f1-3; exit 0; fi
+    [ -f "$f" ] && cut -f1-3 "$f"
     exit 0 ;;
   "run view")
     id="${3:-}"
@@ -5287,6 +5321,372 @@ grep -q "not measurable on this lane" "$TMP/err" && pass "(e) …as not-measurab
   || fail "(e) the absence of a main-side guard unit was mis-described: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-unique guard failure" \
   || pass "(e) no merge attempted"
+
+# ── 51. a SUPERSEDED failing run is NOT a failing run (#1358) ──────────────
+#
+# THE DEFECT. The parser selected EVERY failing run at the head with no notion of
+# recency, so a failing run that a LATER run of the same workflow had already
+# replaced stayed in the failing set. For a GATE failure — one whose log carries
+# no `FAILED <nodeid>` line, so it can never be attributed — that made
+# `examined > extracted`, and the rail refused a head whose own surface was green
+# (reproduced on PR #1354 at `e52d4e75`: two `pipeline-compliance` runs counted,
+# both since re-run green, and the merge only went through after the operator
+# DELETED the two runs — they 404 today). Deleting CI records to satisfy a stale
+# reading is not a remedy the rail may require.
+#
+# THE RULE. A failing run is SUPERSEDED — and not counted at all — when a LATER
+# run of the same (commit, workflow id, workflow name, event) concluded `success`.
+# "Later" is creation order (a run's id increases with creation, the same notion
+# admin-merge.sh's check-surface step uses). Every other conclusion (failure /
+# cancelled / skipped / neutral / startup_failure) is not evidence that the commit
+# is green, so it supersedes nothing — and anything whose identity cannot be read
+# supersedes nothing AND is never superseded. The fixtures below write the parser's
+# OWN 6-field raw projection (`<status>\t<conclusion>\t<sha>:<id>\t<workflow-id>\t<workflow-name>\t<event>`);
+# the fake projects it DOWN to the canonical 3 fields for the rail's coverage
+# gate, so scenario (a) exercises both projections at once. NOTHING here asks gh
+# for a CLOCK: §39/§40 forbid `updatedAt` in these scripts, and ordering does not
+# need it.
+echo "== 51. a SUPERSEDED failing run is not a failing run (#1358) =="
+
+lane7() { printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7"; }
+lane7_fail() { lane7 completed failure "$1" "$2" "$3" "$4" "$5"; }
+lane7_pass() { lane7 completed success "$1" "$2" "$3" "$4" "$5"; }
+# A failing run whose log carries NO test id — the #1358 shape: the failure is a
+# GATE failure (compliance/lock), not a test failure, so no `FAILED <nodeid>` line
+# exists and `examined > extracted` is the only thing the parser can report.
+log_gate_fail() { printf 'test (a)\tRun tests\tCompliance check failed: no evidence bound to this head\n'; }
+
+SS_HEAD="5e5e000000000000000000000000000000000000"
+SS_WFID=331293210
+SS_WFNAME='Pipeline Compliance'
+SS_EV=pull_request
+# The #1354 head: gate failure, second gate failure, then the SAME workflow run
+# again and GREEN — one commit, one workflow, one event. Newest FIRST, as gh
+# returns it. The two failing ids (13001/13002) and their gate-failure logs are
+# shared by the scenarios below on purpose: the shape is the subject, not the ids.
+ss_pr_runs() {  # <green-run-id>
+  { lane7_pass "$SS_HEAD" "$1" "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+    lane7_fail "$SS_HEAD" 13002 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+    lane7_fail "$SS_HEAD" 13001 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  }
+}
+ss_pr_jobs() {  # every run in the listing executed the same two shards
+  lane_jobset 13001 success 'test (a)' 'test (b)'
+  lane_jobset 13002 success 'test (a)' 'test (b)'
+  lane_jobset "$1" success 'test (a)' 'test (b)'
+}
+
+# (a) THE DEFECT, end to end. Two superseded gate failures plus a green re-run →
+# the head IS green, so the rail must merge — and must not reach the refusal that
+# only a deleted CI run could clear.
+new_scen superseded
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+ss_pr_runs 13003 > "$SCEN/runs-$SS_HEAD"
+ss_pr_jobs 13003
+log_gate_fail > "$SCEN/log-13001"
+log_gate_fail > "$SCEN/log-13002"
+lane_pass mainss00 13004 > "$SCEN/runs-main"
+lane_jobset 13004 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) two superseded gate failures do NOT block (exit 0)" \
+  || { fail "(a) a superseded failure blocked the merge (exit $rc) — the #1354 refusal"; sed 's/^/      /' "$SCEN/err" | head -8; }
+grep -q "parseable" "$SCEN/err" && fail "(a)  …but the stale 'no parseable FAILED line' refusal is still what stopped it" \
+  || pass "(a)  …and the stale refusal is gone"
+grep -q "pr merge 42" "$SCEN/calls" && pass "(a)  …the merge ran, with no CI run deleted" \
+  || fail "(a)  …no merge was attempted"
+# The drop is a SELECTION, not a counter patch: a superseded run's log is never
+# fetched, so the rail cannot report on a failure it has already replaced.
+grep -q "run view 13001 " "$SCEN/calls" && fail "(a)  …but the superseded run 13001's log was still fetched" \
+  || pass "(a)  …and the superseded run's log was never fetched"
+grep -q "run view 13002 " "$SCEN/calls" && fail "(a)  …and 13002's log was fetched too" \
+  || pass "(a)  …for either superseded run"
+# DISCLOSED, never silent: the dropped run and its superseder are both named.
+grep -q "superseded by run 13003" "$SCEN/err" && grep -q "run 13001 " "$SCEN/err" \
+  && pass "(a)  …and the supersession is DISCLOSED on stderr (13001 superseded by 13003)" \
+  || fail "(a)  …the drop is SILENT: stderr names neither the dropped run nor its superseder"
+
+# (b) THE COUNTERS. The refusal is `extracted < examined`, so a selection that left
+# `examined` counting the dropped runs would re-open the same refusal by another
+# route. Asserted on the parser's own report, where those counters live — together
+# with the provenance, which must name only what was actually measured.
+new_scen supersedecounters
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+ss_pr_runs 13103 > "$SCEN/runs-$SS_HEAD"
+log_gate_fail > "$SCEN/log-13001"
+log_gate_fail > "$SCEN/log-13002"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep.txt" --provenance "$TMP/cfs-prov.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(b) the parser exits 0 (a superseded run is not an extraction failure)" \
+  || { fail "(b) parser exit $rc: $(tr '\n' ' ' < "$TMP/cfs-err")"; }
+grep -q '^examined=0$' "$TMP/cfs-rep.txt" && pass "(b) …examined=0 — the superseded runs are not counted" \
+  || fail "(b) examined is not 0: $(tr '\n' ' ' < "$TMP/cfs-rep.txt")"
+grep -q '^tested=1$' "$TMP/cfs-rep.txt" && pass "(b) …tested=1 — the green re-run still proves the revision was exercised" \
+  || fail "(b) tested is not 1: $(tr '\n' ' ' < "$TMP/cfs-rep.txt")"
+grep -q "13001" "$TMP/cfs-prov.txt" && fail "(b) …but a superseded run is still in the PROVENANCE (the evidence names an unmeasured failure)" \
+  || pass "(b) …and the provenance carries only the measured run"
+grep -q "13001" "$TMP/cfs-prov.txt" && fail "(b) …but a superseded run is still in the PROVENANCE (the evidence would name an unmeasured failure)" \
+  || pass "(b) …and no superseded run is in the provenance"
+[ -s "$TMP/cfs-prov.txt" ] && fail "(b) …but the provenance is non-empty after a drop: $(tr '\n' ' ' < "$TMP/cfs-prov.txt")" \
+  || pass "(b) …(verified empty, not merely free of that id)"
+
+# (c) THE OTHER HALF — the fail-closed direction must not move. A later FAILING run
+# replaces nothing, so a lane whose newest measurement is red still refuses (the
+# lone-failure shape is test 29(a)).
+new_scen supersededfails
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_fail "$SS_HEAD" 13203 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7_fail "$SS_HEAD" 13202 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7_fail "$SS_HEAD" 13201 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+for i in 13201 13202 13203; do log_gate_fail > "$SCEN/log-$i"; done
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) failing runs with NO later green still BLOCK (exit $rc)" \
+  || fail "(c) a lane whose every measurement is red merged"
+grep -q "parseable" "$SCEN/err" && pass "(c) …with the same named reason as before" \
+  || fail "(c) …but the refusal is unexplained: $(head -2 "$SCEN/err")"
+
+# (d) NOT-SUCCESS DOES NOT SUPERSEDE. `cancelled` (which is what
+# `cancel-in-progress` produces), `skipped` (it exercised nothing) and `neutral`
+# are all terminal — and none of them is evidence that the commit is green.
+for c in cancelled skipped neutral; do
+  new_scen "supersedelater-$c"
+  printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+  { lane7 completed "$c" "$SS_HEAD" 13303 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+    lane7_fail "$SS_HEAD" 13301 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  } > "$SCEN/runs-$SS_HEAD"
+  cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-$c.txt"
+  grep -q '^examined=1$' "$TMP/cfs-rep-$c.txt" \
+    && pass "(d) a later '$c' run does NOT supersede a failure (still examined)" \
+    || fail "(d) a later '$c' run superseded a failure — it is not evidence of green: $(tr '\n' ' ' < "$TMP/cfs-rep-$c.txt")"
+done
+
+# (e) ANOTHER WORKFLOW SUPERSEDES NOTHING. The lane may be `--any-workflow`, where
+# the listing MIXES workflows: grouped by commit alone, workflow B's green would
+# erase workflow A's red.
+new_scen supersededotherwf
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 13403 999999 'Workflow lock (base-branch checker)' "$SS_EV"
+  lane7_fail "$SS_HEAD" 13401 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-wf.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-wf.txt" \
+  && pass "(e) another workflow's green does not clear this workflow's red" \
+  || fail "(e) a DIFFERENT workflow's green superseded a failure — the --any-workflow fail-open"
+# …and the ID is the identity, not the name: two files both called "CI" are two
+# lanes, so a same-named green must not clear the other's red either.
+new_scen supersededotherwfid
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 13503 111111 'CI' "$SS_EV"
+  lane7_fail "$SS_HEAD" 13501 222222 'CI' "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-wfid.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-wfid.txt" \
+  && pass "(e2) same NAME, different workflow ID → still a different lane" \
+  || fail "(e2) a same-named workflow's green cleared another workflow's red"
+
+# (f) ANOTHER EVENT IS ANOTHER MEASUREMENT. One commit is often both a PR head and
+# pushed to a branch, and the lane's jobs are event-conditioned — so a `push` run
+# is not the same measurement as the `pull_request` run it would replace.
+new_scen supersededotherevent
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 13603 "$SS_WFID" "$SS_WFNAME" push
+  lane7_fail "$SS_HEAD" 13601 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-ev.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-ev.txt" \
+  && pass "(f) another EVENT's green does not clear this event's red" \
+  || fail "(f) a different event's green superseded a failure"
+
+# (g) ANOTHER COMMIT IS ANOTHER MEASUREMENT — the MAIN side's shape, where the
+# listing spans commits by design (the union over the last N runs). A green at a
+# NEWER commit must not erase a red at an older one: that would shrink main's
+# baseline, and a shrunken baseline is what EXCUSES a genuinely new PR failure.
+new_scen supersededothercommit
+printf '%s\n' "aaaa111111111111111111111111111111111111" > "$SCEN/head"
+{ lane7_pass "bbbb222222222222222222222222222222222222" 13703 "$SS_WFID" "$SS_WFNAME" push
+  lane7_fail "cccc333333333333333333333333333333333333" 13701 "$SS_WFID" "$SS_WFNAME" push
+} > "$SCEN/runs-main"
+log_failed 'tests/test_red_on_main.py::test_x' > "$SCEN/log-13701"
+cfs_run --main-union-rates 2 --runs-report "$TMP/cfs-rep-sha.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-sha.txt" \
+  && pass "(g) a green at another COMMIT does not clear a red at this one (main's baseline survives)" \
+  || fail "(g) main's baseline was collapsed across commits — a PR failure could be excused"
+grep -q 'test_red_on_main' "$TMP/cfs-out" && pass "(g) …and the failing id is still in main's rate table" \
+  || fail "(g) the red vanished from main's baseline"
+
+# (h) UNREADABLE IDENTITY FAILS CLOSED, in BOTH directions: a run whose identity we
+# cannot read supersedes nothing, and is never superseded — and the refusal to
+# decide is SAID OUT LOUD rather than assumed silently.
+new_scen supersededopaque
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 13803 '' "$SS_WFNAME" "$SS_EV"
+  lane7_fail "$SS_HEAD" 13801 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-op.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-op.txt" \
+  && pass "(h) a run with an unreadable workflow id supersedes nothing (fail closed)" \
+  || fail "(h) an opaque run was read as a superseder"
+grep -q 'can neither supersede nor be superseded' "$TMP/cfs-err" && grep -q '13803' "$TMP/cfs-err" \
+  && pass "(h) …and the unreadable run is NAMED on stderr" \
+  || fail "(h) …but the refusal to decide is silent: $(tr '\n' ' ' < "$TMP/cfs-err")"
+new_scen supersededopaquefail
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 13903 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7 completed failure "$SS_HEAD" 13901 '' "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-opf.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-opf.txt" \
+  && pass "(h2) an unreadable FAILING run is NOT dropped (a green cannot clear an unidentified red)" \
+  || fail "(h2) a green superseded a red it could not be shown to match"
+
+# (i) THE RULE RANKS; IT DOES NOT TRUST ORDER. gh returns newest-first, but the
+# verdict is computed from CREATION ORDER (the run's own id — never a clock:
+# §39/§40 forbid asking gh for `updatedAt` at all) — a listing whose green line
+# comes LAST must reach the same verdict, or the gate would depend on an
+# undocumented ordering that a future caller could change.
+new_scen supersededorder
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_fail "$SS_HEAD" 14001 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7_fail "$SS_HEAD" 14002 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7_pass "$SS_HEAD" 14003 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-ord.txt"
+grep -q '^examined=0$' "$TMP/cfs-rep-ord.txt" \
+  && pass "(i) the same verdict whatever order the listing arrives in" \
+  || fail "(i) the verdict depends on the listing's order: $(tr '\n' ' ' < "$TMP/cfs-rep-ord.txt")"
+# (i2) CREATION ORDER DECIDES — which leaves ONE stated limit. A run RE-RUN long
+# after a NEWER run of the same workflow was created is the fresher measurement but
+# not the higher id, so its green does NOT clear the newer run's red and the rail
+# refuses. That is the fail-CLOSED direction (the remedy is to re-run the newer run
+# too), and the only field that would close it is a completion CLOCK — which
+# §39/§40 forbid this pair of scripts to ask for. The limit is ASSERTED here rather
+# than tolerated by accident: a change that makes this certify must rewrite it.
+new_scen supersededcreationorder
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_fail "$SS_HEAD" 14202 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7_pass "$SS_HEAD" 14101 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-ord2.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-ord2.txt" \
+  && pass "(i2) a re-run of an OLDER run does not clear a NEWER red (creation order; fail closed, stated limit)" \
+  || fail "(i2) a newer red was cleared by an older run's re-run — if that is intended, the stated limit must be rewritten: $(tr '\n' ' ' < "$TMP/cfs-rep-ord2.txt")"
+# (i3) THE FILTER REMOVES FAILURES ONLY. A queued run is not a failing run and must
+# survive it: `pending` is the whole input of the lane-terminal PRECONDITION, so
+# dropping it would be a fail-open at the rail's FIRST check.
+new_scen supersededpending
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 14303 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7 queued "" "$SS_HEAD" 14302 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7_fail "$SS_HEAD" 14301 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-pend.txt"
+grep -q '^examined=0$' "$TMP/cfs-rep-pend.txt" \
+  && pass "(i3) the superseded failure is dropped" \
+  || fail "(i3) the superseded failure survived: $(tr '\n' ' ' < "$TMP/cfs-rep-pend.txt")"
+grep -q '^pending=1$' "$TMP/cfs-rep-pend.txt" \
+  && pass "(i3) …and the QUEUED run survives the filter (the precondition still fires)" \
+  || fail "(i3) a queued run was swallowed by the filter — the lane-terminal precondition would be blind: $(tr '\n' ' ' < "$TMP/cfs-rep-pend.txt")"
+
+# (j) THE RULE'S INPUT IS THE LISTER'S OWN PROJECTION. A 3-field line — the shape
+# every fixture written before this change has, and the shape the rail's coverage
+# gate reads — carries no identity, so it is never grouped and never a group
+# member: the rule cannot invent a measurement identity it was not given. That is
+# also WHY the whole pre-existing suite keeps its meaning; the scenarios above fail
+# loudly if the projection ever loses a field.
+new_scen supersededlegacy3
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane_pass "$SS_HEAD" 14403
+  lane_fail "$SS_HEAD" 14401
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-leg.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-leg.txt" \
+  && pass "(j) a 3-field line is opaque: kept, and never grouped with anything" \
+  || fail "(j) a line with no identity was grouped anyway: $(tr '\n' ' ' < "$TMP/cfs-rep-leg.txt")"
+
+# (k) THE SAME RULE ON MAIN CLOSES A FAIL-OPEN. A stale red on main — superseded by
+# a green re-run at the SAME commit — used to inflate main's baseline, so a PR
+# failing the same test was excused as "already red on main" and a genuine
+# regression merged. main's baseline now carries live measurements only.
+new_scen supersededmainstale
+printf '%s\n' "bbbb222222222222222222222222222222222222" > "$SCEN/head"
+{ lane7_pass "bbbb222222222222222222222222222222222222" 14503 "$SS_WFID" "$SS_WFNAME" push
+  lane7_fail "bbbb222222222222222222222222222222222222" 14501 "$SS_WFID" "$SS_WFNAME" push
+} > "$SCEN/runs-main"
+log_failed 'tests/test_stale_on_main.py::test_stale' > "$SCEN/log-14501"
+cfs_run --main-union-rates 2 --runs-report "$TMP/cfs-rep-stale.txt"
+grep -q '^examined=0$' "$TMP/cfs-rep-stale.txt" \
+  && pass "(k) a superseded main failure leaves the baseline (it can no longer excuse a PR failure)" \
+  || fail "(k) a superseded main red still inflates the baseline: $(tr '\n' ' ' < "$TMP/cfs-rep-stale.txt")"
+grep -q 'test_stale_on_main' "$TMP/cfs-out" && fail "(k) …but the stale red is still in main's rate table" \
+  || pass "(k) …and it is gone from main's rate table"
+
+# (l) A FIELD BOUNDARY THAT CANNOT BE TRUSTED IS UNREADABLE IDENTITY (code-review
+# cycle 1, 2026-09-23). `NF < 6` — the first spelling of the opacity guard — was a
+# FAIL-OPEN: a literal TAB inside a workflow NAME makes a SEVEN-field line, so `$5`
+# and `$6` hold a FRAGMENT of the name and the group key silently STOPS CARRYING
+# THE EVENT. A green run whose own fields shifted the same way then matched that
+# truncated key and superseded a red under a DIFFERENT event, while the disclosure
+# insisted the event matched. Exactly six fields, or the line is opaque — in BOTH
+# directions — and the widening is NAMED (a widened projection is never expected,
+# so silence would hide a parser/projection drift).
+new_scen supersededwide
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\n' completed success "$SS_HEAD" 14103 "$SS_WFID"
+  printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\tpull_request\n' completed failure "$SS_HEAD" 14101 "$SS_WFID"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-wide.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-wide.txt" \
+  && pass "(l) a >6-field line is never superseded (a TAB in the workflow NAME is unreadable identity)" \
+  || fail "(l) the event left the group key — a shifted green superseded a red at another event: $(tr '\n' ' ' < "$TMP/cfs-rep-wide.txt")"
+grep -q 'MORE than the six fields' "$TMP/cfs-err" \
+  && pass "(l) …and the widened projection is NAMED on stderr (not silently tolerated)" \
+  || fail "(l) …but the widening was silent: $(tr '\n' ' ' < "$TMP/cfs-err")"
+new_scen supersededwidefail
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' completed success "$SS_HEAD" 14203 "$SS_WFID" Deploy push
+  printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\tpull_request\n' completed failure "$SS_HEAD" 14201 "$SS_WFID"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-widef.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-widef.txt" \
+  && pass "(l2) …and a widened FAILING line is never superseded (it stays counted)" \
+  || fail "(l2) a green superseded a red whose shape could not be read"
+
+# (m) A SUPERSEDE CERTIFICATE MUST HAVE FINISHED. Cycle 2 showed that checking only
+# `conclusion == success` let a synthetic `queued`/`success` line drop a red — a
+# contradiction `gh` cannot emit, so the check closes a class by CONSTRUCTION rather
+# than by a claim about the producer's behaviour, and it keeps the disclosure's own
+# premise true.
+new_scen supersededunfinished
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' queued success "$SS_HEAD" 14303 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7_fail "$SS_HEAD" 14301 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-unfin.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-unfin.txt" \
+  && pass "(m) a success that never FINISHED supersedes nothing (only completed+success certifies)" \
+  || fail "(m) an unfinished run was read as a certificate: $(tr '\n' ' ' < "$TMP/cfs-rep-unfin.txt")"
+# …and the same fixture proves the PENDING probe still sees the queued run: the
+# superseder above IS a queued lane run, so `pending` must count it rather than
+# the filter having swallowed it.
+grep -q '^pending=1$' "$TMP/cfs-rep-unfin.txt" \
+  && pass "(m) …and the QUEUED certifier is still a pending run (it was not swallowed)" \
+  || fail "(m) the queued run left the pending count: $(tr '\n' ' ' < "$TMP/cfs-rep-unfin.txt")"
+
+# (m2) A BLANK LINE IS NOT A RUN. Emitting it as `\t\t` would be counted as a
+# PENDING run, so a listing with a trailing newline could never satisfy the rail's
+# lane-terminal precondition (a confusing over-block with no remedy named).
+new_scen supersededblank
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 14403 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  lane7_fail "$SS_HEAD" 14401 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  printf '\n'
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-blank.txt"
+grep -q '^pending=0$' "$TMP/cfs-rep-blank.txt" \
+  && pass "(m2) a blank line is not emitted as a pending run" \
+  || fail "(m2) a blank line became pending: $(tr '\n' ' ' < "$TMP/cfs-rep-blank.txt")"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

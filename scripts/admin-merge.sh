@@ -520,6 +520,16 @@ RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 #
 # ci-failure-set.sh holds this same expression by design; see its copy for the other
 # splitter.
+#
+# THE SUPERSEDE RULE IS DELIBERATELY NOT APPLIED HERE (#1358). ci-failure-set.sh now
+# widens its own listing and drops failing runs a later green run of the same
+# workflow at the same commit/event already replaced — but that is a rule about
+# FAILURE COUNTING, and this listing answers a different question: which shards a
+# lane EXECUTED (the coverage parity gate) and whether a run is still pending. A run
+# that executed a shard is coverage however stale its conclusion, and a superseded
+# run is still a run that must be seen as pending while it is pending. Applying the
+# rule here would silently THIN the lane's shard set and turn a coverage failure
+# into a pass — the one direction this file must never fail in.
 LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
