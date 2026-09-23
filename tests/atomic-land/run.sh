@@ -418,6 +418,22 @@ rc=$?
 called "admin-merge" && fail "landed after the base advanced (B12 fail-open)" || pass "did NOT land after the base advanced"
 grep -qi "advanced after verification" "$SCEN/err" && pass "the stop names the advance" || fail "the stop does not name the advance"
 
+# ═══ 16b. B12 — the CAPTURE read itself must fail closed ═════════════════
+# An empty base-tip read is a transient API failure, not a licence to skip the
+# binding. The pre-land arm runs only when the captured tip is non-empty, so an
+# unreadable capture would silently disable B12 — and the unit would land on a
+# base its checks never covered (the same fail-open, reached by a different
+# path). An unreadable tip must STOP at capture, exactly like the merge base.
+echo "── 16b. an UNREADABLE base tip at capture stops the unit (B12, fail-closed)"
+new_scen basetipunreadable
+printf '\n8888888888888888888888888888888888888888\n' > "$SCEN/base-tip-seq"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) — refused to certify without a base binding" || fail "expected rc 1, got $rc (landed with NO base binding)"
+called "admin-merge" && fail "landed with an unreadable base tip — B12 was silently skipped" || pass "did NOT land without a base-binding capture"
+grep -qi "could not read the base tip" "$SCEN/err" && pass "the stop names the unreadable base tip" || fail "the stop does not name the unreadable base tip"
+
 # ═══ 17. B11 — two rails on the same PR must not interleave ═════════════
 echo "── 17. a held per-PR lock refuses before any mutation (B11)"
 new_scen lock
@@ -481,6 +497,9 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B10c 's/if \[ -z "\$live_mb" \] || \[ "\$live_mb" != "\$RECORD_MB" \]; then/if false; then/'
   # B12: never detect a concurrent base ADVANCE
   mutate_and_expect_fail B12  's/if \[ "\$now_tip" != "\$CERT_BASE_TIP" \]; then/if false; then/'
+  # B12b: the CAPTURE read must fail closed — an empty capture must not silently
+  # disable the pre-land comparison (the path the reviewer reproduced).
+  mutate_and_expect_fail B12b 's/if \[ -z "\$CERT_BASE_TIP" \]; then/if false; then/'
   # B11: never take the per-PR lock
   mutate_and_expect_fail B11  's/\[ "\$DRY_RUN" -eq 0 \] && acquire_lock//'
 fi

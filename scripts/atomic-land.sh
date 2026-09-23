@@ -80,6 +80,9 @@
 #   ATOMIC_LAND_RECORD_SH   record-review.sh (default: sibling record-review.sh,
 #                           else $HOME/.pi/agent/scripts/record-review.sh)
 #   ATOMIC_LAND_ADMIN_MERGE admin-merge.sh (default: sibling admin-merge.sh)
+#   ATOMIC_LAND_CONFIRM_MAX how many times to confirm the merge via the API
+#                           (default: 3) — a non-zero admin-merge exit is never
+#                           read as success; the .merged poll is the only proof.
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
@@ -305,7 +308,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
 # ── step 2: verify (the head's checks must be terminal) ──────────────────
 wait_terminal() {
   if [ "$NO_WAIT" -eq 1 ]; then
-    say "atomic-land: [2/4] verify — --no-wait: the rail's own tested-head precondition decides"
+    say "atomic-land: [2/4] verify — --no-wait: admin-merge.sh's tested-head precondition decides"
     return 0
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -470,6 +473,15 @@ while :; do
   CERT_BASE_TIP="$(base_tip)"
   if [ -z "$CERT_MB" ]; then
     stop "could not read the merge base of $BASE...${HEAD:0:12}… — refusing to certify without a base binding (B10)"
+  fi
+  # B12 — the base TIP is captured here and compared before the land. The CAPTURE
+  # read must be fail-CLOSED exactly like CERT_MB above: a transient API error
+  # yielding empty would otherwise leave nothing to compare against, and the
+  # pre-land arm (which runs only when this is non-empty) would skip silently —
+  # landing on a base the checks never covered. An unreadable tip is not a
+  # licence to certify without a base binding.
+  if [ -z "$CERT_BASE_TIP" ]; then
+    stop "could not read the base tip of $BASE — refusing to certify without a base binding (B12)"
   fi
   wait_terminal
   if ! do_record; then exit 1; fi
