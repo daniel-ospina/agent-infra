@@ -626,12 +626,52 @@ assert_contains "$RECORD_ERR" "repo undetectable or gh missing" "C3 repo-less re
 # condition is `-z $REPO || ! command -v gh`; every other vector has a stub gh on
 # PATH, so without this one the SECOND disjunct is untested — deleting it leaves
 # the suite green.
+#
+# The path must lose `gh` WITHOUT losing everything else in the directory `gh`
+# happens to live in. Dropping the whole directory (the obvious filter) is
+# runner-dependent: on a usrmerge distro `/bin` is a symlink to `/usr/bin`, so a
+# runner whose `gh` is `/usr/bin/gh` loses `bash`, `jq`, `date` and `mktemp` with
+# it and the script dies with **127** instead of refusing 4 — green on macOS
+# (`gh` in `/opt/homebrew/bin`), red on the ubuntu runner. That is the exact
+# failure this vector produced in CI on its first main push.
+#
+# So: replace each gh-bearing directory with a SHADOW directory that re-exports
+# its executable files (symlinked) minus `gh` itself, and keep every directory
+# that does not carry `gh` as-is. Cost is a few hundred symlinks; the effect is
+# that `command -v gh` is the only thing the PATH loses.
 run_record_no_gh() { # <verdict> <repo> <pr>
-    local verdict="$1" repo="$2" pr="$3" rcfile="$T/nrc" errfile="$T/nerr" nogh
-    nogh="$(printf '%s' "$PATH" | tr ':' '\n' | while read -r _d; do [ -n "$_d" ] && [ -x "$_d/gh" ] || printf '%s\n' "$_d"; done | paste -sd: -)"
+    local verdict="$1" repo="$2" pr="$3" rcfile="$T/nrc" errfile="$T/nerr"
+    local shadow="$T/nogh-bin" _dir _cand _base _kept=""
+    rm -rf "$shadow"; mkdir -p "$shadow"
+    while IFS= read -r _dir; do
+        [ -n "$_dir" ] || continue
+        if [ -x "$_dir/gh" ]; then
+            for _cand in "$_dir"/*; do
+                [ -f "$_cand" ] && [ -x "$_cand" ] || continue
+                _base="${_cand##*/}"
+                [ "$_base" = "gh" ] && continue
+                [ -e "$shadow/$_base" ] || ln -s "$_cand" "$shadow/$_base" 2>/dev/null || true
+            done
+        else
+            _kept="$_kept$_dir:"
+        fi
+    done <<< "$(printf '%s' "$PATH" | tr ':' '\n')"
+    # Fail loudly rather than silently testing the wrong thing: if the shadow
+    # cannot run the script, or still resolves gh, this vector would pass for a
+    # reason of its own. RECORD_RC is poisoned so the assertions that follow
+    # cannot pass on the PREVIOUS vector's stale values (that vector's refusal is
+    # the same message this one asserts).
+    if ! PATH="$shadow:${_kept%:}" command -v bash >/dev/null 2>&1; then
+        bad "C3 gh-absent vector: the shadow PATH cannot resolve bash — the vector would be vacuous"
+        RECORD_RC=99; RECORD_ERR=""; return 0
+    fi
+    if PATH="$shadow:${_kept%:}" command -v gh >/dev/null 2>&1; then
+        bad "C3 gh-absent vector: gh is STILL resolvable — the vector would be vacuous"
+        RECORD_RC=99; RECORD_ERR=""; return 0
+    fi
     rm -f "$errfile"
     (
-        export HOME="$F_HOME" PATH="$nogh" GH_STUB_LOG="$LOG"
+        export HOME="$F_HOME" PATH="$shadow:${_kept%:}" GH_STUB_LOG="$LOG"
         rc=0
         bash "$RECORD" "$pr" "$SHA" "$verdict" "$repo" 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
