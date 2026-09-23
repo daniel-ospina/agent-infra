@@ -185,7 +185,16 @@ WORKFLOW_ARGS=()
 # a superseded run is cancelled, not red) — and it is not EVIDENCE either: it
 # counts toward `completed` (the run is over) but never toward `tested` (the run
 # exercised nothing) nor toward `examined` (it has no failing set).
-LANE_RUN_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha):\(.databaseId)"'
+# Byte-identical to admin-merge.sh's LANE_RUN_JQ by design; see the note there.
+# This file splits the line with `${line%%$'\t'*}` / `${rest%%$'\t'*}` (literal TAB,
+# no IFS, so an empty field is harmless here). admin-merge.sh splits it with
+# `IFS=$'\t' read`, where an empty field collapses the delimiter and shifts the
+# payload — which is why every field must be non-empty (#1368).
+#
+# The sentinel must not be a conclusion token: the `case "$conclusion"` statements in
+# collect_union below credit `success|failure|timed_out` to `tested` and
+# `failure|timed_out|startup_failure` to `examined`.
+LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
