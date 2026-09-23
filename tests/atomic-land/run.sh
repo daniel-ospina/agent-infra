@@ -600,6 +600,40 @@ rc=$?
 called "pr update-branch" && fail "spent the attestation with no way to restore it (B5)" || pass "did NOT update without a key"
 grep -qi "no review gate key is available" "$SCEN/err" && pass "the stop names the missing key" || fail "the stop does not name the missing key"
 
+# 17i. DECLARED RESIDUAL (B, fail-closed). The producer APPENDS a marker per record
+# and never removes old ones, so bodies accumulate lines. The rail cannot tell a
+# stale-diff line from a live-diff one (that needs the LIVE diff = the producer's
+# equivalence decision), so when the first matching line is stale it REFUSES even
+# though the producer might carry from a later line. That is an over-block:
+# friction, recoverable and visible. The alternative — accepting any later line —
+# SPENDS an attestation the producer then refuses to carry (silent destruction,
+# the 22-updated / 17-invalidated / 0-landed mode this guard exists to prevent).
+# This scenario pins the CHOSEN behaviour so a future widening cannot land silently.
+echo "── 17i. stale FIRST marker blocks a possibly-restorable later marker (declared B residual)"
+new_scen multimarker
+# older lines come FIRST: stale/unverifiable line, then the genuine one
+printf 'review recorded: reviews/42.json verdict=clean @ %s diff=%s (%s) sig=%s\n' \
+  "$HEAD_OLD" "9999999999999999999999999999999999999999999999999999999999999999" "$REPO" \
+  "5555555555555555555555555555555555555555555555555555555555555555" > "$SCEN/pr-body"
+marker_fixture 42 clean "$HEAD_OLD" >> "$SCEN/pr-body"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1) — fail-closed: no spend on an unverifiable first line" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "SPENT the attestation on a possibly-stale marker (fail-open)" || pass "did NOT update — the attestation is intact"
+
+# 17j. …and the same body with the key rotated so NO line verifies also refuses.
+echo "── 17j. stale FIRST marker + unverifiable second marker → refuse (B5)"
+new_scen multimarkerbad
+printf 'review recorded: reviews/42.json verdict=clean @ %s diff=%s (%s) sig=%s\n' \
+  "$HEAD_OLD" "9999999999999999999999999999999999999999999999999999999999999999" "$REPO" \
+  "5555555555555555555555555555555555555555555555555555555555555555" > "$SCEN/pr-body"
+marker_fixture 42 clean "$HEAD_OLD" >> "$SCEN/pr-body"
+printf '%s' "a-completely-different-key-0002" > "$SCEN/home/.pi/agent/.ai-review-gate-key"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1) — no line verified under the current key" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "spent the attestation under a rotated key (B5)" || pass "did NOT update"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B8 must be covered by a test that FAILS against the revision before
@@ -639,7 +673,7 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # B5b: spend an attestation without checking it can be re-bound
   mutate_and_expect_fail B5b  's/if \[ "\$RECORD_HEAD" = "\$HEAD" \] && ! pr_has_carry_evidence; then/if false; then/'
   # B5c: accept a marker on SHAPE alone — the PR body is attacker-writable
-  mutate_and_expect_fail B5c  's/  \[ "\$sig" = "\$expect" \]/  :/'
+  mutate_and_expect_fail B5c  's/\[ "\$sig" = "\$expect" \]/[ -n "\$sig" ]/'
   # B6c: do not re-poll a transient UNKNOWN — a computed-later state false-blocks
   mutate_and_expect_fail B6c  's/while \[ "\$t" -lt "\${ATOMIC_LAND_UNKNOWN_POLLS:-5}" \]; do/while false; do/'
   # B6b: read an undetermined merge state as "up to date" and certify anyway

@@ -277,6 +277,19 @@ pr_has_carry_evidence() {
   [ -n "$expect" ] || return 1
   [ "$sig" = "$expect" ]
 }
+# WHY the FIRST matching line, and not any line: the producer's carry pins
+# `diff=${DIFF_HASH}` — the LIVE diff — which is a post-update property the rail
+# cannot know without computing equivalence (the producer's decision, not the
+# rail's). So the rail cannot tell a stale-diff line from a live-diff one, and the
+# two candidate behaviours are:
+#   narrow (this one): over-block a body whose first matching line is stale;
+#   wide:              accept it, call the update, and SPEND an attestation the
+#                      producer then refuses to carry.
+# Over-blocking is friction (recoverable, visible); spending is silent destruction
+# of a fresh attestation (the 22-updated / 17-invalidated / 0-landed mode this
+# guard exists to prevent). Fail-closed wins. The over-block is a DECLARED residual
+# (B), retired by #1397 (content identity) — with identity on the record an update
+# stops invalidating it at all.
 
 resolve_repo() {
   if [ -z "$REPO" ]; then
