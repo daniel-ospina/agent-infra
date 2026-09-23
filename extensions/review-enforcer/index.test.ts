@@ -263,23 +263,15 @@ test("allow: clean-micro verdict with matching head", () => {
 // attestation is the three-dot diff, whose content that commit identifies. It
 // does NOT re-derive the content shape: the record IS the attestation, and the
 // only place the shape can be read is the producer's guard in record-review.sh.
+// The tip-vs-merge-base distinction is observable only in getPrMergeBaseSha — the
+// gate never receives a base tip — so the benign-ADVANCE invariance is pinned
+// there, in the reader's section, not here.
 test("allow: clean-low verdict with matching head AND merge base", () => {
   const r = evaluateMergeGate(
     138, cleanLowRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
   );
   equal(r.status, "allow");
   ok((r as any).message.includes("clean-low"), "pass message names the verdict it acted on");
-});
-
-test("allow: a benign ADVANCE of the base branch does NOT invalidate the record", () => {
-  // The false block that binding `.base.sha` (the tip) would produce: main moves
-  // forward with unrelated commits, the merge base with an unchanged head is the
-  // same commit, the certified diff is identical — so the merge must proceed.
-  // Pinned because the ORIGINAL fix compared the tip and would have blocked here.
-  const r = evaluateMergeGate(
-    138, cleanLowRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
-  );
-  equal(r.status, "allow", "the base branch advancing must not expire a clean-low record");
 });
 
 test("block: clean-low with a REPOINTED base (gh pr edit --base) — same head, different merged diff", () => {
@@ -429,13 +421,16 @@ test("vocabulary: ACCEPTED_VERDICTS is exactly the three verdicts (single source
 
 test("declared boundary: the local gate does NOT re-derive the content shape", () => {
   // #1348 declares this out of scope deliberately: a local shape re-check would
-  // be a second, weaker writer of the Low class. Pinned so that adding one later
-  // is a decision, not an accident — and pinned as an OBSERVABLE, not as another
-  // `status === "allow"` on an already-allowed record (which a later shape
-  // re-check that happened to allow this diff would leave green). The observable:
-  // a local re-check would have to READ something (the compare/diff endpoint), so
-  // a clean-low merge must issue no such call, and the source must not name a
-  // shape predicate from the producer's class.
+  // be a second, weaker writer of the Low class. Pinned as OBSERVABLES, not as
+  // another `status === "allow"` on an already-allowed record (which a later
+  // shape re-check that happened to allow this diff would leave green):
+  //   (a) the pure gate decision issues no gh/API call of its own;
+  //   (b) the extension never reads the file LIST (`pulls/N/files`) — the input
+  //       any local shape re-check would need;
+  //   (c) the merge base it does read is the ONLY revision read added for it.
+  // It does NOT prove the hook's call site adds no other read; the call-site
+  // fetch set is asserted in the C8 tests above (the fetch happens only for a
+  // clean-low record whose head already matched).
   const cmds: string[] = [];
   _setRunGhOverride((cmd) => { cmds.push(cmd); return "a".repeat(40); });
   try {
@@ -448,9 +443,10 @@ test("declared boundary: the local gate does NOT re-derive the content shape", (
   }
   equal(cmds.length, 0, "the pure gate decision issues no gh/API call of its own");
   const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-  for (const name of ["clean_low_path_ok", "CLEAN_LOW_DOCS_RE", "clean_low_shape_ok"]) {
-    ok(!src.includes(name), `the consumer must not import the producer's shape predicate (${name})`);
-  }
+  // (An assertion that a bash identifier from record-review.sh is absent here
+  // would be unconditionally true — the reviewer reproduced that tautology.)
+  ok(!/pulls\/[^\s"'`]*\/files/.test(src), "no file-list read anywhere in the extension (a local shape check needs one)");
+  ok(src.includes(".merge_base_commit.sha"), "the only revision read added for clean-low is the merge base");
 });
 
 test("C7 drift pin: the verdict vocabulary is CONSULTED, never re-literalised", () => {
@@ -883,9 +879,64 @@ test("resolves the merge base and builds the compare URL from the BASE and the h
     cmds[1].includes(`compare/${"b".repeat(40)}...${"a".repeat(40)}`),
     `the compare is BASE...HEAD, the exact diff the producer certified: ${cmds[1]}`
   );
+  // The FIELD is the token that distinguishes this binding from the rejected
+  // tip binding, and every stub matches on `compare/` rather than on the jq
+  // filter — so without this assertion a one-token rewrite back to `.base.sha`
+  // (which would re-point every clean-low record at the moving tip) stays green.
+  ok(
+    cmds[1].includes(".merge_base_commit.sha"),
+    `the compare reads merge_base_commit, never base.sha: ${cmds[1]}`
+  );
   // `gh api` does NOT accept --repo — the repo comes via GH_REPO env.
   ok(!cmds[1].includes("--repo") && !cmds[1].includes("-R "), `no --repo flag: ${cmds[1]}`);
   ok(env?.env?.GH_REPO === "owner/repo", "repo injected via GH_REPO env");
+});
+
+test("the binding is the MERGE BASE, not the base branch's tip — a benign ADVANCE is invisible", () => {
+  // The false block that binding `.base.sha` (the base branch's TIP) would
+  // produce: main advances with unrelated commits, the merge base of an
+  // unchanged head is the SAME commit, the certified diff is identical — so the
+  // gate must see the same value and allow. This is the only place the tip is
+  // observable: `evaluateMergeGate` never receives it, so a gate-level case with
+  // the tip moved would pass for the same reason the matching-merge-base test
+  // above passes and would pin nothing (the reviewer reproduced exactly that).
+  const tips = ["b".repeat(40), "e".repeat(40)];
+  const seen: string[] = [];
+  _setRunGhOverride((cmd) => {
+    if (cmd.includes("compare/")) return "c".repeat(40); // merge base: unchanged
+    const tip = tips.shift() ?? "e".repeat(40);
+    seen.push(tip); // the base branch TIP: advanced between the two reads
+    return tip;
+  });
+  try {
+    equal(getPrMergeBaseSha(138, "a".repeat(40), { source: "flag", repo: "owner/repo" }), "c".repeat(40));
+    equal(
+      getPrMergeBaseSha(138, "a".repeat(40), { source: "flag", repo: "owner/repo" }),
+      "c".repeat(40),
+      "the base tip advancing must not change what the reader binds to"
+    );
+    ok(seen[0] !== seen[1], `the two reads really saw different tips, else this pins nothing (${seen.join(", ")})`);
+  } finally {
+    _setRunGhOverride(null);
+  }
+});
+
+test("null when the COMPARE call throws after a good base sha (a throw must never reach the hook)", () => {
+  // The wrapper's contract is "null on ANY failure", and the merge hook relies
+  // on it never throwing. The first call succeeding is what makes this the
+  // compare arm: a throw on the first call returns before the compare is built.
+  let calls = 0;
+  _setRunGhOverride((cmd) => {
+    calls += 1;
+    if (cmd.includes("compare/")) throw new Error("connection reset by peer");
+    return "b".repeat(40);
+  });
+  try {
+    equal(getPrMergeBaseSha(138, "a".repeat(40), { source: "record", repo: "owner/repo" }), null);
+    equal(calls, 2, "the compare WAS attempted and its throw swallowed");
+  } finally {
+    _setRunGhOverride(null);
+  }
 });
 
 test("null when the base sha is unreadable or not a full sha (no compare call is made)", () => {
@@ -1334,6 +1385,83 @@ testAsync("task sub-agent gh pr merge WITH clean record + matching head → allo
       await fire("session_start");
       const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
       equal(res, undefined, "clean record + matching head → merge allowed in the task sub-agent");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("clean-low merge with an ADVANCED head pays for no merge-base read (the fetch is head-gated)", async () => {
+  // The hook fetched the merge base for ANY clean-low record, before the head
+  // was compared — two synchronous reads (15s timeout each) whose result no
+  // branch reads, because a head-mismatched record blocks at the head branch.
+  // Observed at the CALL SITE, which is where the cost is (the pure gate takes
+  // currentMergeBase as an argument and cannot show it).
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999995;
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    fs.writeFileSync(
+      resolvePath(reviews, `${pr}.json`),
+      JSON.stringify({ pr, head_sha: "b".repeat(40), verdict: "clean-low", merge_base_sha: "c".repeat(40) })
+    );
+    const cmds: string[] = [];
+    _setRunGhOverride((cmd) => { cmds.push(cmd); return "d".repeat(40); }); // the head ADVANCED
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      ok(res && (res as any).block === true, "an advanced head is blocked");
+      ok(String((res as any).reason).includes("head has advanced"), `blocked by the HEAD binding: ${JSON.stringify((res as any).reason).slice(0, 120)}`);
+      equal(cmds.filter((c) => c.includes("compare/")).length, 0, "a merge that will block on the head must not pay for the merge-base reads");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("clean-low merge with a MATCHING head does read the merge base (the laziness is not a skip)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999994;
+    const head = "b".repeat(40);
+    const mb = "c".repeat(40);
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    fs.writeFileSync(
+      resolvePath(reviews, `${pr}.json`),
+      JSON.stringify({ pr, head_sha: head, verdict: "clean-low", merge_base_sha: mb })
+    );
+    const cmds: string[] = [];
+    _setRunGhOverride((cmd) => { cmds.push(cmd); return cmd.includes("compare/") ? mb : head; });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      equal(res, undefined, "matching head AND matching merge base → allowed");
+      ok(
+        cmds.some((c) => c.includes("compare/") && c.includes(".merge_base_commit.sha")),
+        `the clean-low path really reads the merge base: ${cmds.join(" || ")}`
+      );
     } finally {
       _setRunGhOverride(null);
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;

@@ -61,10 +61,11 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    WARNS and proceeds — tier attestation UNVERIFIED at mint. **Content-only
    diffs record `clean-low`** regardless of the linked issue's tier (#1348):
    when EVERY changed path is prose or a stylesheet (`docs/**` with a content
-   extension, or a named root prose file) the Low risk row of the canonical
-   tier table applies, and `record-review.sh <PR> <head-sha> clean-low
-   <owner/repo>` is the honest record. Its class is deliberately NARROWER than
-   the Low row — config and strings are excluded, because a config change is
+   extension, or a named root prose file) the Low value of the canonical tier
+   table's §Change Classification `Code impact` column applies, and
+   `record-review.sh <PR> <head-sha> clean-low <owner/repo>` is the honest
+   record. Its class is deliberately NARROWER than that cell — config and
+   strings are excluded, because a config change is
    where a runtime-behaviour change hides — and its guard is FAIL-CLOSED on
    every arm, so an unreadable or truncated diff is never certified Low; a
    `clean-low` record is only obtainable for a diff `record-review.sh` actually

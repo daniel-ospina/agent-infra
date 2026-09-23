@@ -1186,11 +1186,13 @@ micro), then record.
 
 ### Step 10b — Low-risk content-only recording: verdict `clean-low` (#1348)
 
-The canonical tier table's Low row (docs/CSS/strings → a single reviewer, no
-cycle loop) had no representation in the merge gate. A PR whose DIFF is
+The canonical tier table's Low *code-impact* class — the `Code impact` column's
+Low value in `proportional-gates` §Change Classification (`docs`/CSS/strings,
+mapped by that file's §Review Cycles to a single reviewer and no cycle loop) —
+had no representation in the merge gate. A PR whose DIFF is
 content-only but whose LINKED ISSUE is `complexity:standard`/`complex` could
 record neither verdict honestly: `clean` attests a code-review convergence
-that, per the Low row, did not happen; `clean-micro` is refused (exit 4) by
+that, per the Low class, did not happen; `clean-micro` is refused (exit 4) by
 the #513 tier guard, because that guard reads the LINKED ISSUE's tier, not the
 DIFF's shape. `clean-low` is that missing representation. It attests:
 
@@ -1198,13 +1200,13 @@ DIFF's shape. `clean-low` is that missing representation. It attests:
 > program code, no config file, no enforcement input. (The class is path+extension
 > based and does not consult a build graph: a repo may package or consume a
 > `docs/**` file as build data. That is accepted, declared, and the attestation
-> wording is scoped to what the guard can actually read. The Low row's single
+> wording is scoped to what the guard can actually read. The Low tier's single
 > reviewer pass is your obligation — nothing in the script can observe it.)
 
 Use it ONLY when the whole diff is content-only. `record-review.sh` verifies the
 shape itself, from the diff AT THE RECORDED SHA, and REFUSES (exit 4, no record,
 no marker) otherwise. The class is deliberately NARROWER than the tier table's
-Low row: **config and i18n strings are excluded** (a config change is where a
+Low *code-impact* class: **config and i18n strings are excluded** (a config change is where a
 runtime-behaviour change hides), and so are root-level instruction files
 (`AGENTS.md`, `MEMORY.md`, `VENDOR.md`), `skills/**`, `.github/**`,
 `templates/**`, `scripts/**` and `extensions/**`. Admitted: `docs/**` with a
@@ -1244,13 +1246,23 @@ base branch, which changes its tip but not the merge base, does NOT block: the
 certified diff is unchanged. It does NOT re-derive the content shape (the record
 is the attestation, and the producer guard is the only place the shape is read).
 
-The two `base_*` refusals are different events — one means the PR's base was
-repointed (`gh pr edit --base`) or rewritten, so the certified diff is no longer
-the diff that would merge at the SAME head sha; the other means the base could
-not be read. Both are cleared the same way: re-record.
+The two `base_*` refusals are different events, and they are NOT cleared the same
+way. `base_advanced` means the certified diff ITSELF changed — re-check whether
+the current diff is still content-only and only then re-record `clean-low`; if it
+is not, take the normal route (the code-review skill, then `clean`).
+`base_unverifiable` is a read failure (a `gh`/API error, an absent or invalid
+field in the record) and is cleared by re-recording once the base is readable.
 
-Two boundaries worth knowing, both declared rather than silent:
+Three boundaries worth knowing, all declared rather than silent:
 
+- **The #138 interactive fail-open also bypasses the content binding.** When the
+  HEAD itself cannot be fetched, an interactive session's merge gets fail-open
+  (a task sub-agent's is fail-closed) BEFORE the merge-base branch is reached, so
+  a `clean-low` record can merge there with its merge base never compared. That is
+  the pre-existing #138 posture — the same path already merged `clean`/
+  `clean-micro` with no head verification at all, so the content binding is
+  strictly additive — and narrowing it is #138's decision to make, not this
+  verdict's.
 - **The remote `ai-review-gate` required check must accept the verdict.** It is a
   cross-repo contract (the marker regex lives in the consuming repo), so a repo
   whose workflow still matches `verdict=clean(-micro)?` will keep failing the

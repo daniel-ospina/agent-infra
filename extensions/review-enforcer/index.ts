@@ -1036,8 +1036,9 @@ export async function getPrHeadSha(pr: number, ctx: RepoContext): Promise<string
  * forgotten at the other would silently mislabel the merge telemetry. Both now
  * consult this list.
  *
- * `clean-low` attests the Low risk row of the canonical tier table (agent-infra
- * #1348): every changed path of the recorded revision is prose or a stylesheet.
+ * `clean-low` attests the Low value of the canonical tier table's §Change
+ * Classification `Code impact` column (agent-infra #1348): every changed path of
+ * the recorded revision is prose or a stylesheet.
  * This gate deliberately does NOT re-derive that shape — the record IS the
  * attestation, and the only place the shape can be read is the producer's
  * clean-low guard in record-review.sh. A local re-check here would be a second,
@@ -1121,6 +1122,12 @@ export function evaluateMergeGate(
     // sub-agent cannot: under the restricted-agent posture an unverifiable
     // head must NOT merge silently. It escalates to the parent session, which
     // runs the merge ceremony interactively (where fail-open still applies).
+    //
+    // #1348: this path also bypasses the clean-low merge-base binding further
+    // down — an unverifiable head means the base cannot be compared either.
+    // DECLARED rather than narrowed: the interactive fail-open is #138's
+    // decision to make, and clean-low inherits it here exactly as
+    // clean/clean-micro do (see the #1348 plan, class C7).
     if (taskSubAgent) {
       return {
         status: "block",
@@ -1201,6 +1208,11 @@ export function evaluateMergeGate(
   // fail-open above: the whole attestation IS the base-relative diff, and
   // clean-low is the cheapest verdict to re-record, so "could not verify" must
   // never read as "certified Low".
+  //
+  // Unreachable when the HEAD itself is unverifiable: the branch above returns
+  // first (fail-closed for a task sub-agent, fail-open for an interactive
+  // session), so the #138 interactive fail-open bypasses this binding too —
+  // declared in the #1348 plan (C7), not silently claimed away here.
   if (record.verdict === "clean-low") {
     const recordMb =
       typeof record.merge_base_sha === "string" && /^[0-9a-f]{40}$/.test(record.merge_base_sha)
@@ -2201,12 +2213,18 @@ export default function (pi: ExtensionAPI) {
         const ctx = envRepo ? { ...cmdCtx, repo: envRepo } : cmdCtx;
         const record = readReviewRecord(prNumber, envRepo ?? undefined);
         const currentHead = await getPrHeadSha(prNumber, ctx);
-        // #1348: fetch the merge base ONLY for a clean-low record — it is the one
-        // verdict whose attestation is content-relative, so any other merge must
-        // not pay for extra API calls with no reader (null is safe there: the
-        // base branch in evaluateMergeGate is clean-low-scoped).
+        // #1348: fetch the merge base ONLY for a clean-low record whose HEAD has
+        // already matched — it is the one verdict whose attestation is
+        // content-relative, so any other merge must not pay for extra API calls
+        // with no reader (null is safe there: the base branch in evaluateMergeGate
+        // is clean-low-scoped), and a PR that is going to block on `head_advanced`
+        // must not pay two synchronous reads (15s timeout each) whose result no
+        // branch reads. A head-mismatched clean-low returns at the head branch,
+        // which precedes the base branch.
         const currentMergeBase =
-          record && record.verdict === "clean-low"
+          record && record.verdict === "clean-low" &&
+          currentHead !== null &&
+          record.head_sha === currentHead
             ? getPrMergeBaseSha(prNumber, currentHead, ctx)
             : null;
         // #285 Fix C: the no-record block message is shape-aware (task

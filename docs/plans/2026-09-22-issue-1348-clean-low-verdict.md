@@ -21,12 +21,12 @@ is genuinely content-only (prose / stylesheet) but whose linked same-repo issue 
 `complexity:standard` or `complexity:complex` can record **neither honestly**:
 
 - `clean` records fine but attests *"a code-review skill convergence recorded its clean verdict"* —
-  a review that, per `proportional-gates`' Low row (1 reviewer, no cycle loop), did not happen.
+  a review that, per `proportional-gates`' Low tier (§Review Cycles: 1 reviewer, no cycle loop), did not happen.
   Recording it is a false attestation, not merely a shortcut.
 - `clean-micro` is refused (exit 4) by the #513 tier guard (`:245-320`), because the guard reads the
   *linked issue's* tier, not the *diff's* shape.
 
-So `proportional-gates`' Low row has **no representation in the gate**. That is a real correctness
+So `proportional-gates`' Low code-impact class has **no representation in the gate**. That is a real correctness
 defect: the gate offers a well-behaved PR an *untrue* certificate as its only exit.
 
 ### Framing that the issue body does not state — the dominant cause is different
@@ -66,10 +66,10 @@ Measurement command:
 
 A third verdict. It attests:
 
-> the Low risk row of the canonical tier table applies to this diff — every changed path is prose or
-> a stylesheet (no program code, no config file, no enforcement input). The shape is the whole
-> VERIFIABLE attestation: the Low row's single reviewer pass is the caller's obligation, and the
-> guard cannot observe it.
+> the Low value of the canonical tier table's §Change Classification `Code impact` column applies to
+> this diff — every changed path is prose or a stylesheet (no program code, no config file, no
+> enforcement input). The shape is the whole VERIFIABLE attestation: the Low tier's single reviewer
+> pass is the caller's obligation, and the guard cannot observe it.
 
 Its guard is **content-shape and fail-CLOSED on every arm**: the content shape *is* the entire
 attestation, so "could not verify" must never read as "certified Low". This is the decisive
@@ -89,7 +89,7 @@ micro flow that already ran its own pre-flight and dispatch floor.
   (`scripts/check-pipeline-compliance.sh:916` → `fail c`), so this "no new verdict" option in fact
   requires weakening a separate deliberate fail-closed guard. Recorded so a later lane does not
   "simplify" `clean-low` back into `clean-micro`.
-- **Widen `clean`'s documented attestation to cover the Low row (one verdict, no companion change).**
+- **Widen `clean`'s documented attestation to cover the Low code-impact class (one verdict, no companion change).**
   Rejected: `clean` is the machine-readable token the required check and the merge gate branch on;
   collapsing two different attestations into one token destroys the ability to audit *which* review
   happened, and re-creates exactly the false-attestation defect this issue is about.
@@ -121,8 +121,8 @@ without needing a deny rule that extension reasoning could re-open.
 `.html` is also excluded. The attestation wording therefore does not claim "non-executable"; it
 claims **prose/stylesheet content, not build-consumed program code**.
 
-**Deliberately narrower than `proportional-gates`' Low row** (which reads "Docs, **config**, CSS,
-**strings** only"): config and i18n strings can change runtime behaviour — the issue's own `#4708`
+**Deliberately narrower than the Low value of `proportional-gates`' §Change Classification `Code
+impact` column** (which reads "Docs, **config**, CSS, **strings** only"): config and i18n strings can change runtime behaviour — the issue's own `#4708`
 CSP regression *is* a config change. Root `requirements.txt` / `constraints.txt` are build inputs and
 are excluded for the same reason.
 
@@ -150,7 +150,7 @@ shape guard refused, **no record written** (neither `<owner>-<repo>-<pr>.json` n
 | C4 | Revision mismatch | `clean-low` with `--force-stale`; `clean-low` at a sha ≠ current head | **exit 2** for the flag/verdict combination (named message); exit 4 when the head cannot be confirmed equal to the recorded sha; no write |
 | C5 | Path-shape spoof | `notes.md.ts`; `docs/x.md.bak`; `docs/../src/a.ts`; `docs//x.md`; `/docs/x.md`; `docs/.`; a split row (`docs/a.md\tscripts/evil.sh`) | refuse, exit 4, no write. **Not** a filename carrying a real `\n`/`\t`: `jq @tsv` ESCAPES those, so the row arrives with a literal `\n` inside an in-class path and is ADMITTED (declared, pinned by a test). The control-character arms stay as defence in depth for a raw-row caller — the sibling gate builds rows with a raw template, where they ARE live. |
 | C6 | Row-framing / old path | `renamed` `scripts/evil.sh` → `docs/evil.md`; `copied`; a row whose `previous_filename` is outside the class; a row with `NF != 3`; an unknown status enum | refuse, exit 4, no write (both ends of every row) |
-| C7 | Local merge gate | a `clean-low` record whose head has advanced; a non-`clean-low` verdict; a `clean-low` record on a mismatched head; a matching `clean-low` record | with a **verifiable head**, `evaluateMergeGate` allows **only** the head-AND-base-matching `clean-low`; every other case blocks with the right audit reason — `clean-low` gets the same head binding as `clean`, PLUS the base binding below. (Two pre-existing paths allow a merge without a verified head: the #138 **interactive** fail-open when the head cannot be fetched, and a hand-minted record — both disclosed below, both identical for `clean`/`clean-micro`, neither introduced here.) |
+| C7 | Local merge gate | a `clean-low` record whose head has advanced; a non-`clean-low` verdict; a `clean-low` record on a mismatched head; a matching `clean-low` record | with a **verifiable head**, `evaluateMergeGate` allows **only** the head-AND-base-matching `clean-low`; every other case blocks with the right audit reason — `clean-low` gets the same head binding as `clean`, PLUS the base binding below. (Two pre-existing paths allow a merge without a verified head: the #138 **interactive** fail-open when the head cannot be fetched, and a hand-minted record — both disclosed below, both identical for `clean`/`clean-micro`, neither introduced here.) **The #138 fail-open ALSO bypasses the C8 content binding**, because an unverifiable head returns before the base branch is reached; declared, not narrowed — narrowing the interactive fail-open is #138's decision to make, and the binding is strictly additive (that path previously merged with no revision binding at all). |
 | C8 | **Content swap (base repoint)** | `clean-low` + `gh pr edit --base main` after recording; a `clean-low` record with no or invalid merge base; an unreadable merge base | the attestation is the three-dot diff `compare/<base>...<head>`, whose content is identified by the MERGE BASE. The record pins `merge_base_sha`; `evaluateMergeGate` blocks with `base_advanced` on a mismatch and `base_unverifiable` when either side cannot be read — fail-CLOSED, both. A BENIGN advance of the base branch must NOT block (the merge base is invariant under it) — that false block is why the binding is the merge base and not `.base.sha`, and it is pinned by its own test. `clean`/`clean-micro` stay merge-base-blind (declared, #1362). |
 
 ### Out of scope — declared, with reason
@@ -223,12 +223,16 @@ shape guard refused, **no record written** (neither `<owner>-<repo>-<pr>.json` n
 3. `extensions/review-enforcer/index.ts` — accept `clean-low` at **both** verdict sites through ONE
    exported vocabulary (`ACCEPTED_VERDICTS` / `isAcceptedVerdict`), and the refusal text is DERIVED
    from that list rather than re-literalised. No local content re-check (the record is the
-   attestation). Adds the **base binding** for `clean-low` (record `base_sha` vs the PR's current
-   base, refused with reason `base_advanced`).
+   attestation). Adds the **base binding** for `clean-low`: the record pins `merge_base_sha` — the
+   MERGE BASE of the three-dot compare, which is what identifies the certified content, NOT the base
+   branch's tip (repointing the base moves it; an unrelated merge into the base branch does not) —
+   and `evaluateMergeGate` refuses with `base_advanced` on a mismatch or `base_unverifiable` when
+   either side cannot be read.
 4. `extensions/review-enforcer/index.test.ts` — the C7 + C8 vectors (this is the suite that covers them).
 5. `skills/code-review/SKILL.md` — Step 10b beside Step 10a; `skills/commit-workflow/workflow/`
    `03-code-review.md` + `04-merge-deploy.md` — the verdict-by-tier sentence.
-6. `skills/proportional-gates/SKILL.md` — cite the class; the Low row's wording is unchanged.
+6. `skills/proportional-gates/SKILL.md` — cite the class; the §Review Cycles table (the one the
+   parity test parses) is unchanged.
 
 **companion (separate repo, separate unit):**
 
@@ -249,8 +253,8 @@ shape guard refused, **no record written** (neither `<owner>-<repo>-<pr>.json` n
 
 ## Verification
 
-- `bash scripts/record-review.test.sh` — full suite. **Observed: `PASS=247 FAIL=0`.**
-- `NODE_ENV=test npx tsx extensions/review-enforcer/index.test.ts` — **observed: `181 passed, 0 failed`.**
+- `bash scripts/record-review.test.sh` — full suite. **Observed: `PASS=248 FAIL=0`.**
+- `NODE_ENV=test npx tsx extensions/review-enforcer/index.test.ts` — **observed: `184 passed, 0 failed`.**
 - `bash scripts/check-no-sigpipe-grep.sh` + `bash tests/sigpipe-grep/run.sh` (the suite's own
   #841 guard caught two `printf | grep -q` sites in this change; they are here-strings now).
 - `node scripts/check-skill-lint.mjs --skills-dir skills`; `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts`;
@@ -276,13 +280,19 @@ shape guard refused, **no record written** (neither `<owner>-<repo>-<pr>.json` n
   | delete the truncation detector (main validation + both arms) | **6 failures** (C3) |
   | stop writing the merge base in the record | **1 failure** (the content-bound positive vector) |
   | certify the diff against the HEAD instead of the BASE | **1 failure** (the compare-argv assertion) |
+  | read the base TIP (`.base.sha`) instead of the merge base, producer side | **1 failure** (the producer argv pin — the RECORD assertion stays green, because the stub answers any `compare/` call with a canned merge base) |
+  | read the base TIP instead of the merge base, consumer side | **1 failure** (the consumer argv pin) |
+  | remove the compare call's `try/catch` | **1 failure** (the compare-throws vector) |
+  | un-gate the hook's merge-base fetch from the head comparison | **1 failure** (the call-site test: an advanced head must issue no `compare/` read) |
   | drop the `command -v gh` disjunct from the clean-low guard | **1 failure** (the gh-absent vector) |
   | neuter the `clean-low` content branch in `evaluateMergeGate` | **4 failures** (the C8 vectors) |
   | re-literalise the refusal message's verdict list | **1 failure** (the derivation pin) |
-  The last five were found by review as **silent** mutations (the first version of the drift pin was
-  itself too weak, and the first version of the gh-absent vector passed for the wrong reason); each is
-  covered now. Every one of these
-  was verified by mutation, not by assertion — a test that passes before the change proves nothing.
+  Nine of these were found by review as **silent** mutations — the first version of the drift pin was
+  itself too weak, the first version of the gh-absent vector passed for the wrong reason, and BOTH
+  `.merge_base_commit.sha` field reads were unpinned (every stub matches `compare/`, so the field text
+  was never observed and a rewrite to the base tip re-pointed every record at a moving sha with both
+  suites green). Each is covered now. Every one was verified by mutation, not by assertion — a test
+  that passes before the change proves nothing.
 - C7/C8's RED evidence is **structural, not behavioural**: pre-change, `index.ts` exports neither
   `ACCEPTED_VERDICTS` nor `isAcceptedVerdict` and has no base branch, so the suite fails at import with
   0 tests run. The durable complement is the in-suite **drift pin**: the pre-change expression
@@ -334,12 +344,12 @@ nine P2s. The P1 and the material P2s, and their dispositions:
 | # | Finding | Disposition |
 |---|---|---|
 | P1 | **The attestation was content-relative but the record pinned only the HEAD.** The guard reads `compare/<base>...<head>`; `gh pr edit --base main` after recording leaves the head sha unchanged, so the certified docs-only diff and the merged diff diverge — and the local gate allowed it. The reviewer reproduced it with real `git` three-dot semantics. | **Fixed — new class C8.** The record now carries the MERGE BASE (`merge_base_sha`, clean-low only) and `evaluateMergeGate` blocks with `base_advanced` / `base_unverifiable`; fail-CLOSED on an unreadable base. 6 vectors + 3 mutations. The remote marker stays base-blind → the requirement is a scope addition on **tortoise#4755**; `clean`/`clean-micro` base-blindness → **#1362**. |
-| P1 (found by cycle 2) | **The first C8 fix pinned the base branch's TIP (`.base.sha`), which is the wrong signal in both directions**: it moves on every unrelated merge into the base branch (so every clean-low record would expire within minutes and false-block the merge it was minted for) while still not identifying the certified content. | **Fixed** — bind the MERGE BASE, which is invariant under a benign advance and moves exactly when the base is repointed or rewritten. The benign-advance case now has its own test (it would have failed against the tip-binding) and the compare-base argv is asserted so the two sides are demonstrably reading the same revision. |
+| P1 (found by cycle 2) | **The first C8 fix pinned the base branch's TIP (`.base.sha`), which is the wrong signal in both directions**: it moves on every unrelated merge into the base branch (so every clean-low record would expire within minutes and false-block the merge it was minted for) while still not identifying the certified content. | **Fixed** — bind the MERGE BASE, which is invariant under a benign advance and moves exactly when the base is repointed or rewritten. The benign-advance invariance is pinned where the tip is observable — `getPrMergeBaseSha`, twice, with the stubbed base tip changed between the calls — because `evaluateMergeGate` never receives a tip, so a gate-level case with the tip moved would pass for the same reason the matching-merge-base case does; the compare-base and the compare-FIELD argv are both asserted, so the two sides demonstrably read the same revision. |
 | P2 | The plan doc has no YAML frontmatter → `check-doc-affiliation.cjs` FAILS (a real pre-flight gate, under-run by me). | Fixed (frontmatter added); the gate is now in the verification list. |
 | P2 | The refusal message hard-codes the verdict list, so the drift-pin comment's "the two decision sites are consulted" overclaimed single-source-of-truth. | Fixed: the message is DERIVED from `ACCEPTED_VERDICTS`, and the pin was STRENGTHENED to forbid any line outside the declaration from naming two or more verdicts. |
 | P2 | The two control-character arms are **unreachable on the guard's own path** — `jq @tsv` escapes `\t`/`\n`, so C5's "filename containing `\n` or `\t`" is admitted, not refused; the direct-predicate vectors cannot exercise it. | Declared, not papered over: C5 corrected, the arms kept as defence in depth with the reason, a test pins the escaped-admit behaviour, and those vectors are NOT counted as RED coverage. No fail-open. |
 | P2 | `clean_low_rows`' header claimed framing parity with `files_rows` on the status enum — false for `copied`. | Fixed (comment states the one divergence). |
-| P2 | The header said both "the Low row's single reviewer pass ran" AND "the content shape IS the whole attestation" — the guard observes no dispatch. | Fixed: the reviewer pass is named as the caller's obligation, unobservable here. |
+| P2 | The attestation claimed a reviewer dispatch the guard cannot observe. | Fixed in every copy, including the plan's own blockquote: the reviewer pass is named as the caller's obligation. |
 | P2 | "`./*.md` would admit `.github/…`" — factually wrong illustration. | Fixed. |
 | P2 | §10.15 cited for a §10.9 harness. | Fixed. |
 | P2 | "docs/ or a stylesheet" understated the class (5 root prose basenames) at 4 sites — a `README.md`-only PR was told the verdict did not apply to it. | Fixed in 03-code-review.md + all three remediation messages + Step 10b. |
@@ -348,20 +358,50 @@ nine P2s. The P1 and the material P2s, and their dispositions:
 | P2 | `clean-low` is **inert in tortoise** until the consumer widening lands — the remediation text recommended it unconditionally, so the agent would fall back to recording a false `clean`. | Fixed: `record-review.sh` warns on stderr at record time (same posture as the existing missing-HMAC-key warning), Step 10b documents the dependency, and the requirement is on tortoise#4755. |
 
 | P2 | The plan's own "It attests" blockquote still carried the "single reviewer pass ran" overclaim after the script header and Step 10b were corrected. | Fixed (the plan is the declaration — it must not be the last place the overclaim survives). |
-| P2 | The `OVERRIDES:` anchor named `§Pre-flight Verification / Low row`, but "config, strings" is the Low COLUMN value of §Change Classification's `Code impact` row — a section with no such wording, so a future adopter would look in the wrong place. | Fixed in all three copies (plan, `record-review.sh`, and a correction comment on issue #1348), with the two tables in that file explicitly distinguished. |
+| P2 | The `OVERRIDES:` anchor pointed at a section that does not contain the wording it quotes, so a future adopter would look in the wrong place. | Fixed in all three copies (plan, `record-review.sh`, and a correction comment on issue #1348), with the two tables in that file explicitly distinguished. |
 | P1 (found by cycle 2) | The remediation lines read `record-review.sh <PR> <head_sha> [owner/repo]` — but position 3 IS the verdict, so a literal run either exits 2 (repo parsed as a verdict) or, without the bracket, DEFAULTS to `clean` and mints exactly the false attestation this verdict exists to remove. | Fixed: every advice/refusal line now names the verdict explicitly, with the `clean` fallback on its own line; a test asserts both tokens are present. |
 | P2 (found by cycle 2) | `getPrMergeBaseSha` (then `getPrBaseSha`) had zero test coverage, and the `declared boundary` test could not fail for the property it named; the vocabulary-consistency loop was unfalsifiable; `tempAuditFile` leaked a directory per call. | All fixed: 5 I/O unit tests (validation, GH_REPO env, no `--repo`, null mappings, no-call-on-bad-head), the boundary test now asserts an observable (zero gate-issued API calls + no producer predicate imported), the vocabulary test asserts against a literal and a behavioural derivation pin, and audit temp dirs are removed at exit. |
 
 ### code-review gate — Cycle 2 (fresh context)
 
 Skill-infrastructure, extension-safety, ontology/templates and test-quality reviewers, plus a focused
-adversarial verifier on the NEW C8 class and on the Cycle-1 fixes. Verdicts: **ISSUES** — 3 P1 and ~15
-P2, all in evidence quality or documentation rather than in the gate's correctness. The reviewer
+adversarial verifier on the NEW C8 class and on the Cycle-1 fixes. Verdict: **ISSUES**, every finding
+in evidence quality, test quality or documentation rather than in the gate's correctness; the reviewer
 independently reproduced every declared class, reproduced the C8 mutation, and found **no in-scope
-bypass**. Findings and dispositions: see the table above (the P1s are the base-TIP binding, the
-non-executable remediation, and the unpinned compare-base argument).
+bypass**. Findings and dispositions: see the table above.
 
-One process point, recorded because it changed what the reviewers reviewed: cycle 2 ran against the
-WORKING TREE while the pushed head (`ecb5803`) still lacked the C8 work. A reviewer reading
-`gh pr diff` sees a different artifact from the one the plan describes — so the fixes are committed
-and the review re-recorded at the new head before the gate closes.
+Cycle 2 ran against the WORKING TREE. The fixed artifact must therefore be COMMITTED and the review
+re-recorded at the new head before the gate closes — a reviewer reading `gh pr diff` otherwise sees a
+different artifact from the one this plan describes.
+
+### code-review gate — Cycle 3 (fresh context, re-review of the Cycle-2 fixes)
+
+A focused adversarial verifier on the NEW merge-base binding (can a base change still slip through?),
+plus extension-safety/test-quality and skill/ontology/doc-consistency reviewers.
+
+- **Adversarial verifier: `THREAT SURFACE COVERED`** — the domain's clean equivalent, with
+  `[ADVERSARIAL-BOUND] threats=6 covered=6 residuals=#1362,#1355,#1356,tortoise#4755`. It re-derived
+  the binding from the three-dot semantics (head pinned by `head_sha`, content pinned by
+  `merge_base_sha`, `allow` reachable only with both equal) and probed the gate directly with ~30
+  malformed/foreign values: absent, `null`, number, boolean, array, boxed `String`, 39/41-hex,
+  uppercase, whitespace-padded — every one `base_unverifiable` or `base_advanced`, none `allow`. It
+  also demonstrated the tip/merge-base discrimination by mutation (re-pinning `.base.sha` → exactly
+  one failure, the content-binding assertion) and against the live API (main advanced `eb6361a` →
+  `45d1127` with both non-ancestors; the merge base stayed `a8740be`).
+- Findings fixed: (P1) **the `.merge_base_commit.sha` field was pinned by neither suite** — every stub
+  matches `compare/`, so a one-token rewrite back to the base tip left BOTH suites green while
+  re-pointing every clean-low record at a moving sha; the field is now asserted on the producer's argv
+  and the consumer's argv, each verified by mutation. (P2) the "benign advance" test was byte-identical
+  to its predecessor and could not fail for the property it named — re-homed to the reader, where the
+  tip is observable. (P2) the compare call's `try/catch` was never exercised — vector added, verified
+  by removing the catch. (P2) the "declared boundary" test's three source-name assertions were
+  tautological (bash identifiers cannot occur in `index.ts`) — replaced with two falsifiable
+  observables. (P2) the hook fetched the merge base before comparing the head, paying two 15s-timeout
+  reads for a merge that would block anyway — the fetch is now head-gated, with a call-site test that
+  fails if the gate is relaxed, plus its complement (a matching head does read it). (P2) the #138
+  fail-open also bypasses the content binding — now disclosed at all three sites (code comment, plan
+  C7, Step 10b) instead of reading as covered. Plus the doc/ontology findings: the "Low row" naming
+  conflation (a §Change Classification *column* value called a §Review Cycles *row*), the two
+  `base_*` refusals described as cleared the same way when `base_advanced` requires re-deriving the
+  shape first, and the plan's change-set item still describing the superseded tip binding.
+- Residuals unchanged and OPEN: #1355, #1356, #1362, tortoise#4755.

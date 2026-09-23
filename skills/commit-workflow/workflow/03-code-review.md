@@ -42,7 +42,7 @@ flow the record is `clean-micro`, and `clean` is never refused at any tier (a
 micro session that ran the code-review skill and records `clean` is a
 stronger claim, not a false one). **Content-only diffs (`docs/**` with a
 content extension, or a named root prose file, at ANY tier) record `clean-low`** (04-merge-deploy.md condition 6,
-code-review Step 10b) — the Low risk row's representation in the gate. Its
+code-review Step 10b) — the Low code-impact class's representation in the gate. Its
 class excludes config and strings, and its guard is fail-closed, so an
 unreadable or truncated diff is never certified Low. Proceed directly to
 Step 3 (`04-merge-deploy.md`).

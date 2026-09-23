@@ -738,6 +738,12 @@ assert_contains "$(cat "$QLOW" 2>/dev/null || true)" '"merge_base_sha":"cccccccc
 # so flipping it to $META_HEAD (which makes the base pin certify a diff the guard
 # never read) would otherwise stay green.
 assert_contains "$(cat "$LOG" 2>/dev/null || true)" "compare/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb...$SHA" "positive: the diff is read against the BASE, not the head"
+# The FIELD the guard reads is the token that distinguishes this binding from the
+# rejected tip binding, and the stub answers any `compare/` call with a canned
+# mb line — so a one-token rewrite back to `.base.sha` (which would pin the base
+# branch's moving tip and expire every record on the next unrelated merge) leaves
+# the record assertion above GREEN. Only the argv observes it.
+assert_contains "$(cat "$LOG" 2>/dev/null || true)" ".merge_base_commit.sha" "positive: the diff read pins the MERGE BASE field, not the base tip"
 assert_contains "$(cat "$PATCH" 2>/dev/null || true)" "verdict=clean-low @ $SHA" "positive: signed marker posted with the clean-low verdict"
 # Multi-path, mixed content extensions, nested docs, root prose.
 STUB_FILES=$'docs/a.md\ndocs/nested/deep/b.rst\ndocs/c.css\nREADME.md\nCHANGELOG.md' run_record_verdict clean-low "daniel-ospina/agent-infra" 424671

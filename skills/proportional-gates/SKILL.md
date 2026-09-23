@@ -92,10 +92,11 @@ Before deciding what gates to run, classify the change:
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers.
 
-**The Low row is a property of the CHANGE, not of the linked issue (#1348).** A docs/stylesheet-only
-PR may be linked to a `complexity:standard` issue and still be Low. The merge gate represents that
-with the `clean-low` verdict (`scripts/record-review.sh`), whose class is deliberately **NARROWER**
-than this table's Low row: **config and strings are excluded**, because a config change is where a
+**The Low *code-impact* class is a property of the CHANGE, not of the linked issue (#1348).** A
+docs/stylesheet-only PR may be linked to a `complexity:standard` issue and still be Low. The merge gate
+represents that with the `clean-low` verdict (`scripts/record-review.sh`), whose class is deliberately
+**NARROWER** than the Low value of §Change Classification's `Code impact` column (the cell that reads
+"Docs, config, CSS, strings only"): **config and strings are excluded**, because a config change is where a
 runtime-behaviour change hides (agent-infra #1348's own motivating regression, #4708, was a config
 change), and so are root instruction files and any enforcement input. Its guard is fail-closed — an
 unreadable or truncated diff is never certified Low. See the `OVERRIDES:` line on agent-infra #1348.
