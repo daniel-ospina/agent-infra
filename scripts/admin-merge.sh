@@ -426,11 +426,24 @@ POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 FAILSAFE_RERUN_TIMEOUT="${ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK:-3900}"
 RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 
-# The lane-run projection, mirrored from ci-failure-set.sh's LANE_RUN_JQ. Used
-# ONLY to locate a PENDING run id for the lane-terminal diagnostic: the parser's
-# provenance file records the FAILING runs, and a pending run has no conclusion,
-# so its id never reaches that file.
-LANE_RUN_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha):\(.databaseId)"'
+# The lane-run projection, mirrored from ci-failure-set.sh's LANE_RUN_JQ, and used
+# by BOTH the pending-run diagnostic and lane_shard_set's coverage listing.
+#
+# DO NOT simplify the `if … == ""` to `//` (#1368). Two facts, both load-bearing:
+#
+#   1. All three fields must be NON-EMPTY. `lane_shard_set` splits this line with
+#      `IFS=$'\t' read`, and TAB is IFS WHITESPACE, so adjacent tabs collapse into
+#      one delimiter and the payload shifts into the wrong variable — `id` comes out
+#      empty and the guard refuses the listing.
+#   2. `(.conclusion // "-")` does NOT fix it: jq's `//` fires only on false/null,
+#      and an empty string is neither.
+#
+# And the sentinel must not be a conclusion token, or the `case "$conclusion"`
+# statements in ci-failure-set.sh's collect_union will credit it. `"-"` is not one.
+#
+# ci-failure-set.sh holds this same expression by design; see its copy for the other
+# splitter.
+LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
