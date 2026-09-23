@@ -187,13 +187,58 @@ jobs:
       - name: Actionlint gate tests (fixtures, #394 regression)
         run: bash tests/actionlint/run.sh
 
+  test:
+    # #1349 — THE LANE-PARITY SHARD. The rail compares lane coverage by the LAST
+    # SEGMENT of each job's name, filtered by `ADMIN_MERGE_LANE_JOB_PREFIX`
+    # (default `test`), so the push lane contributes exactly one shard — `test`,
+    # from the reusable call `python-ci / test` in ci-main.yml — while the PR lane
+    # contributed none (its pytest ran inside this file's `verify` job, whose
+    # segment is `verify`). A clean merge was therefore refused as "PR lane does
+    # not cover main's lane" although the coverage was identical. This job's
+    # segment is the same `test`, and it runs the SAME command ci-main passes to
+    # python-ci.yml — byte-identical targets, flags and interpreter — so parity is
+    # an equality of MEASUREMENT, not a name mapped onto another name.
+    #
+    # WHY INLINE, NOT `uses: …/python-ci.yml@main`: inside a PR a reusable call is
+    # resolved against the BASE branch, so an edit to the reusable file cannot be
+    # exercised by the PR that makes it — the reason for the #383 landing split
+    # (docs/scoping/2026-08-29-issue-383-plan.md:70/73/290), which this job
+    # honours. Replacing this duplication with the reusable call is a deliberate
+    # reopen of that split, not a side effect of fixing the refusal.
+    #
+    # ONE canonical interpreter (3.12) across the Task 1 local env, the push
+    # lane's python-ci call and this job — a 3.11/3.12 divergence would pass PR CI
+    # and only break post-merge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest + pytest-timeout
+        run: pip install pytest pytest-timeout
+      - name: "Vendored suite + CI-exemption decision suite (#383, #3761)"
+        # ONE invocation, deliberately byte-identical to `test-command` in
+        # ci-main.yml's python-ci caller: the parity gate compares the shard NAME,
+        # so an equal name carrying a different command would be a name match over
+        # a coverage divergence — the exact fail-open this job exists to avoid.
+        # #3761 — `scripts/ci_exemption.py` is exec'd by the rail BY PATH and its
+        # 58 assertions previously lived only in tortoise, against a vendored COPY
+        # (`tools/ci_exemption.py`): a suite over a copy is a false-PASS generator,
+        # green while the real module drifts. The suite lives here, loads the
+        # canonical file BY LOCATION and pins `__file__` to it. This step is what
+        # keeps it non-inert — an unwired suite passes in CI by never running.
+        # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q
+
   verify:
-    # #383 — vendored parallel_work_check pytest suite (self-contained) +
-    # sequence-enforcer tsx suite (incl. the joint checker→enforcer token-shape
-    # test) + the Task 4 literal-path fence (machine-checked, not manual).
+    # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
+    # reports the same shard segment the push lane reports. What remains here is
+    # the sequence-enforcer tsx suite (incl. the joint checker→enforcer
+    # token-shape test) + the Task 4 literal-path fence (machine-checked, not manual).
     # Self-contained per-PR: no dependency on post-merge python-ci or the
     # private swarm checkout. ONE canonical interpreter (3.12) across the
-    # Task 1 local env, this job, and ci-main's python-ci caller — a
+    # Task 1 local env, the `test` job, and ci-main's python-ci caller — a
     # 3.11/3.12 divergence would pass PR CI and only break post-merge.
     runs-on: ubuntu-latest
     steps:
@@ -204,26 +249,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install pytest + pytest-timeout + pyyaml
+      - name: Install pyyaml
         # pyyaml: the sequence-enforcer's loadSteps frontmatter fallback runs
         # `python3 -c 'import yaml'` — the CI runner's python3 has no PyYAML by
         # default (local macOS python3 does), which fails the token_phase +
         # F2 activation tests (loadSteps returns null → no steps parsed).
-        run: pip install pytest pytest-timeout pyyaml
-      - name: Vendored parallel_work_check suite (pytest, B1–B34)
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q
-      - name: CI-exemption decision suite (#3761 — pytest, its own step)
-        # #3761 — `scripts/ci_exemption.py` is exec'd by the rail BY PATH
-        # (scripts/admin-merge.sh:159 `EXEMPTION_PY`, :246 the fail-closed
-        # guard, :256 the exec) and had ZERO tests in this repo: the 58
-        # assertions covering it lived only in tortoise, against a vendored
-        # COPY (`tools/ci_exemption.py`). A suite over a copy is a false-PASS
-        # generator — green while the real module drifts — so the suite lives
-        # here, loads the canonical file BY LOCATION and pins `__file__` to it
-        # (test_tests_load_the_file_the_rail_execs). THIS step is what makes it
-        # non-inert: an unwired suite passes in CI by never running.
-        # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
-        run: python3.12 -m pytest tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q
+        # pytest/pytest-timeout moved to the `test` job with the suites that use
+        # them (#1349) — this job no longer imports pytest.
+        run: pip install pyyaml
       - name: Fleet liveness acceptance suite (#1178, zero-dep)
         # #1178 — the liveness classifier (tools/fleet/liveness.py) and the
         # shared process-identity rule it shells out to
