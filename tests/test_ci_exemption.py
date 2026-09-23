@@ -610,3 +610,212 @@ def test_tests_load_the_file_the_rail_execs():
     assert Path(ci_exemption.__file__).resolve() == (
         repo_root / "scripts" / "ci_exemption.py"
     ).resolve(), f"the suite loaded a DIFFERENT file: {ci_exemption.__file__}"
+
+
+# ==========================================================================
+# #4469 — GUARD-STEP ATTRIBUTION
+# ==========================================================================
+#
+# THE DEFECT. The id universe was pytest nodeids ONLY, so a failing run whose
+# failure lived in a non-pytest GUARD STEP yielded NO id. `examined=1 /
+# extracted=0` then tripped the rail's fail-closed refusal — "yielded NO
+# parseable 'FAILED <nodeid>' line … This is a refusal" — and a green,
+# review-clean PR could not be merged through the sanctioned path, although the
+# failure was a real, attributable, and FLAKY guard owned by another lane.
+#
+# THE FIX under test attributes the guard-step failure as an identity in the set,
+# so the PR-vs-main comparison runs exactly as it does for a test nodeid. The
+# refusal is PRESERVED for a run that carries neither a nodeid nor a substantive
+# annotation (the runner's own `Process completed with exit code <N>.` is not
+# one — it is emitted for the pytest step too).
+#
+# GROUNDED IN THE REAL CAPTURE: tortoise PR #4672, run 35785085760
+# (`gh run view --log-failed`, 2026-09-23). `pytest` exited rc 0; the failing
+# step was the post-suite orphan guard. The echoed script SOURCE is included
+# DELIBERATELY: a mid-line search for `::error::` would manufacture a second,
+# `$COUNT`-bearing identity for the same run, and this fixture makes that
+# regression a RED.
+_GUARD_JOB = "test (b)"
+_GUARD_STEP = "Assert no redislite orphans (issue"
+_GUARD_KEY = (
+    "guard-step::Assert-no-redislite-orphans-issue::"
+    "redislite-server-leak-N-orphans-after-suite-threshold-N-issue-N-epic-N-E2E--N"
+)
+_GUARD_SIG = (
+    "redislite server leak: <N> orphans after suite, threshold <N> "
+    "(issue #<N> / epic #<N> E2E-<N>)"
+)
+_GUARD_RUNNER_EXIT = "##[error]Process completed with exit code 1."
+
+
+def _real_capture(orphans: int = 16) -> str:
+    """The production `--log-failed` shape, byte-shaped like the measured run."""
+    prefix = f"{_GUARD_JOB}\t{_GUARD_STEP}\t"
+    echo_source = (
+        '2026-09-23T01:19:53.8474165Z \x1b[36;1m    echo "::error::redislite server'
+        ' leak: $COUNT orphans after suite, threshold $THRESHOLD (issue #1005 /'
+        ' epic #1647 E2E-7)"\x1b[0m'
+    )
+    lines = [
+        # The echoed script source — the annotation marker is MID-LINE here.
+        prefix + echo_source,
+        prefix
+        + "2026-09-23T01:19:53.8634323Z orphaned redislite servers after suite:"
+        + f" {orphans} (pytest rc: 0, threshold: 12)",
+        prefix
+        + f"2026-09-23T01:19:53.8645102Z ##[error]redislite server leak: {orphans}"
+        + " orphans after suite, threshold 12 (issue #1005 / epic #1647 E2E-7)",
+        prefix + f"2026-09-23T01:19:53.8649910Z {_GUARD_RUNNER_EXIT}",
+        # The aggregate gate step: the runner's generic annotation ONLY.
+        "python-ci-gate\tAggregate matrix result\t2026-09-23T01:20:00.3040113Z "
+        + _GUARD_RUNNER_EXIT,
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def test_guard_step_failure_is_attributed_from_the_real_capture():
+    """The measured guard step becomes ONE id, with the measured signature.
+
+    MUTATION: drop the guard pass from ``parse_failed_ids`` → ``ids == []`` and
+    ``ok is False`` → RED (and the rail refuses the run forever).
+    MUTATION: search for the annotation marker anywhere instead of anchoring it
+    → the echoed `echo "::error::… $COUNT …"` line adds a SECOND, `$COUNT`-bearing
+    id → the exact-key and one-id assertions RED.
+    MUTATION: treat the runner's generic exit annotation as attribution → the
+    aggregate gate step adds a third id → RED.
+    """
+    parsed = parse_failed_ids(_real_capture(), raw_log=True)
+
+    assert parsed.ids == [_GUARD_KEY]
+    assert parsed.guard_steps == [_GUARD_KEY]
+    assert parsed.rejected == []
+    assert parsed.ok is True, "an attributed run is no longer an unreadable set"
+
+
+def test_guard_step_identity_masks_the_run_varying_count():
+    """16 orphans and 14 orphans are the SAME guard failure.
+
+    MUTATION: remove the integer mask from ``normalize_guard_error`` → the two
+    captures yield two different keys → this REDs, and the same guard on main can
+    never match the PR (the failure would read as PR-unique forever).
+    """
+    a = parse_failed_ids(_real_capture(16), raw_log=True)
+    b = parse_failed_ids(_real_capture(14), raw_log=True)
+
+    assert a.ids == b.ids == [_GUARD_KEY]
+
+
+def test_guard_step_discrimination_is_preserved():
+    """Two DIFFERENT guard errors in one step do NOT collapse into one identity.
+
+    The integer mask is the declared trade; this pins its boundary — the error
+    TEXT still discriminates, so masking numbers is not a blanket equality.
+    """
+    other = _real_capture().replace(
+        "redislite server leak:", "redislite server leak detected:"
+    )
+    parsed = parse_failed_ids(other, raw_log=True)
+
+    assert parsed.ids and parsed.ids != [_GUARD_KEY]
+    assert _GUARD_KEY not in parsed.ids
+
+
+def test_guard_step_failure_is_compared_against_the_main_union():
+    """THE POINT: the attributed guard id participates in the decision.
+
+    Main's own rate table carries the SAME guard identity (measured over the
+    ``min_runs`` floor) with the same error shape; the PR failed it at an
+    equivalent rate. Before this change there was no id to compare and the rail
+    simply refused; now the decision runs and EXEMPTS it, visibly.
+    """
+    key = parse_failed_ids(_real_capture(17), raw_log=True).ids[0]
+    main_rates = parse_rates(f"{key}\t3\t8\n")
+
+    assert main_rates.rejected == []
+    assert main_rates.rates[key] == Rate(3, 8)
+
+    decision = decide(
+        {key: Failure(rate=Rate(3, 8), signatures=frozenset({_GUARD_SIG}))},
+        main_rates.rates,
+        main_signatures={key: frozenset({_GUARD_SIG})},
+        k_pr=8,
+    )
+
+    assert not decision.any_blocked
+    assert decision.visible_exemptions(), "the guard exemption must be RECORDED"
+    assert key in decision.visible_exemptions()[0]
+
+
+def test_guard_step_absent_from_main_still_blocks():
+    """The other direction: an id absent from main is NOT exempt — it BLOCKS.
+
+    The change widens what is PARSEABLE, never what is EXCUSED. A guard failure
+    main never carried is still a PR-unique failure.
+    """
+    decision = decide(
+        {_GUARD_KEY: Failure(rate=Rate(3, 8), signatures=frozenset({_GUARD_SIG}))},
+        {},
+        main_signatures={},
+        k_pr=8,
+    )
+
+    assert decision.any_blocked
+    assert "no main-side measurement" in decision.blocked[0].reason
+
+
+def test_a_pytest_nodeid_is_never_re_keyed_as_a_guard_step():
+    """NO REGRESSION on the existing id class: a FAILED nodeid stays a nodeid.
+
+    MUTATION: route every line through the guard path → the nodeid would leave
+    the set (or gain a phantom guard twin) → RED.
+    """
+    parsed = parse_failed_ids(f"FAILED {ID}\n", raw_log=True)
+
+    assert parsed.ids == [ID]
+    assert parsed.guard_steps == [], "a nodeid is not a guard-step identity"
+
+
+def test_the_two_id_classes_coexist_and_stay_distinct():
+    """A run may carry BOTH (failing tests AND a failing guard) — both count."""
+    parsed = parse_failed_ids(f"FAILED {ID}\n" + _real_capture(), raw_log=True)
+
+    assert parsed.ids == sorted([ID, _GUARD_KEY])
+    assert parsed.guard_steps == [_GUARD_KEY]
+
+
+def test_the_fail_closed_refusal_survives_the_widening():
+    """A run carrying NEITHER a nodeid NOR a substantive annotation is REFUSED.
+
+    This is the exact shape the refusal exists for — "the log format moved" /
+    "the run failed outside the test step": pytest rc≠0 with no `FAILED` line.
+    The only annotation such a run carries is the runner's own generic exit line,
+    which names no failure and must NOT be an identity. Without this test, the
+    widening would have silently converted every unparseable run into a
+    certificate.
+    """
+    moved = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+    )
+    parsed = parse_failed_ids(moved, raw_log=True)
+
+    assert parsed.ids == [], "the runner's own exit annotation is NOT an identity"
+    assert parsed.guard_steps == []
+    assert parsed.ok is False, "an unreadable failure set must still read as such"
+
+
+def test_a_bare_error_annotation_with_no_step_is_still_attributable():
+    """An unprefixed annotation still attributes — the step is only the key part.
+
+    A capture that lost its `<job>\t<step>\t<ts> ` head (a stripped log) must not
+    lose the failure: the message is the attribution, and ``unknown`` is a
+    declared placeholder rather than a silent drop.
+    """
+    parsed = parse_failed_ids(
+        "##[error]packaging guard: wheel is missing\n", raw_log=True
+    )
+
+    assert parsed.guard_steps == [
+        "guard-step::unknown::packaging-guard-wheel-is-missing"
+    ]

@@ -24,6 +24,26 @@ Two defects motivated it:
   red across runs with a NON-CONSTANT id, so a decision sees UNATTRIBUTABLE
   rather than a PR-unique failure (or a silent exemption) it cannot justify.
 
+HALF 1b — GUARD-STEP ATTRIBUTION (#4469)
+
+The id universe was pytest nodeids ONLY, so a failing run whose failure lives in a
+non-pytest **guard step** (an orphan-count assert, a packaging guard, a health
+gate) yielded NO id. ``examined=1 / extracted=0`` then tripped the rail's
+fail-closed refusal ("yielded NO parseable 'FAILED <nodeid>' line … This is a
+refusal") and the merge could not proceed through the sanctioned path — even
+though the failure was real, attributable, and often a flaky guard owned by
+another lane. That class is the one most likely to be flaky, and the rail could
+neither compare it against main nor certify it as new.
+
+A GitHub Actions error ANNOTATION in a non-pytest step therefore becomes an
+identity in the set — keyed by the failing STEP plus the error shape — so it
+participates in the PR-vs-main comparison exactly like a test nodeid. The
+fail-closed refusal is PRESERVED: an annotation that names no failure (the
+runner's own ``Process completed with exit code <N>.``, emitted for every failing
+step, pytest's included) is NOT an identity, so a run whose log carries neither a
+nodeid nor a substantive annotation is still refused. See the section header
+below for the measured capture this is grounded on.
+
 HALF 2 — THE PRE-MERGE EXEMPTION DECISION (``signatures``, ``decide``)
 
 The pre-merge classifier used to decide ownership of a failure by MEMBERSHIP IN A
@@ -123,6 +143,10 @@ class ParseResult:
 
     ids: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from a non-pytest GUARD-STEP annotation
+    #: (#4469). Recorded separately so the caller REPORTS the attribution instead
+    #: of leaving it invisible among the nodeids.
+    guard_steps: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -137,7 +161,7 @@ class ParseResult:
 
 
 def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
-    """Extract test ids from failure records — THE canonical id parser.
+    """Extract failure ids from a log — THE canonical id parser.
 
     Two input shapes, ONE candidate rule (:func:`_failed_candidate`) and ONE
     definition of "is this a test id" (``_NODEID_LOOSE_RE``), so the shell cannot
@@ -146,14 +170,17 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
     * ``raw_log=False`` (default) — a file of ``FAILED <nodeid>`` / ``ERROR
       <nodeid>`` records. A non-blank line that carries no ``FAILED``/``ERROR``
       field is **rejected**: in an id file, prose IS a defect (nothing else
-      belongs there).
+      belongs there). No guard-step pass runs here — an id file IS the set.
     * ``raw_log=True`` — a raw ``gh run view --log-failed`` capture. ANSI SGR
       escapes and the ``<job>\t<step>\t<ts>Z `` prefix are stripped, then the
       candidate after the first ``FAILED``/``ERROR`` field is shape-checked. A
       line with no such field is not a failure record and is skipped — a raw log
       is mostly prose, and rejecting every prose line would drown the signal.
+      A second pass attributes non-pytest GUARD-STEP failures (#4469) from their
+      GitHub Actions error annotations, so a failure main can also be red on is
+      COMPARED rather than refused.
 
-    In BOTH shapes a candidate that is not a test id is **DROPPED, COUNTED and
+    In BOTH shapes a candidate that is not a failure id is **DROPPED, COUNTED and
     REPORTED** (``rejected``) and never enters ``ids``. This is the #3756 ``may``
     leak: an English word in the candidate position used to be emitted verbatim
     as a failure id, and a garbage id matches nothing on main — it cannot be
@@ -192,7 +219,18 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
             rejected.append(unit)
             continue
         ids.append(candidate)
-    return ParseResult(ids=sorted(set(ids)), rejected=rejected)
+    guard_steps: list[str] = []
+    if raw_log:
+        # Pass 2 — GUARD-STEP failures (#4469). A non-pytest step announces its
+        # failure with a GitHub Actions error ANNOTATION, which the FAILED-field
+        # pass above cannot see. Those become ids too, so a guard-step failure is
+        # COMPARED instead of refused. Deliberately not done for an id-file
+        # (raw_log=False): there the file IS the id set already.
+        guard_steps, _guard_signatures = guard_step_failures(lines)
+        ids.extend(guard_steps)
+    return ParseResult(
+        ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps
+    )
 
 
 # --------------------------------------------------------------------------
@@ -245,8 +283,9 @@ def parse_rates(lines: str) -> RatesResult:
     Fail-closed, for the same reason as :func:`parse_failed_ids`: this table feeds
     the comparison that OVERRIDES a failure, so a line the reader does not fully
     understand must never become evidence of main-side unhealth. Anything not
-    exactly three tab-separated fields -- a valid nodeid, a non-negative failure
-    count, and a **positive** run count -- is rejected, counted and reported.
+    exactly three tab-separated fields -- a valid failure key (a pytest nodeid
+    OR a guard-step identity, #4469), a non-negative failure count, and a
+    **positive** run count -- is rejected, counted and reported.
 
     ``runs`` must be positive: ``X\\t0\\t0`` would give a ``0/0`` rate of ``0.0``
     and read as "main never fails this", which is the exemption-by-vacuity this
@@ -266,7 +305,7 @@ def parse_rates(lines: str) -> RatesResult:
         nodeid = m.group("nodeid")
         failures = int(m.group("failures"))
         runs = int(m.group("runs"))
-        if not _NODEID_RE.match(nodeid) or runs <= 0 or failures > runs:
+        if not is_failure_key(nodeid) or runs <= 0 or failures > runs:
             rejected.append(line)
             continue
         if nodeid in rates:
@@ -653,6 +692,8 @@ class SignatureParse:
     rejected: list[str] = field(default_factory=list)
     unsigned: list[str] = field(default_factory=list)
     unattributed: list[str] = field(default_factory=list)
+    #: The guard-step ids that entered ``ids`` (#4469) — REPORTED, never silent.
+    guard_steps: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -698,10 +739,187 @@ def _signature_from(e_line: str | None, exc: str | None) -> str:
     return core
 
 
-def parse_pr_failure_text(text: str) -> SignatureParse:
-    """Extract ``{nodeid: signature}`` from a raw ``--log-failed`` capture.
+# ==========================================================================
+# HALF 1b (#4469) — GUARD-STEP ATTRIBUTION
+# ==========================================================================
+#
+# THE DEFECT. The id universe was pytest nodeids ONLY, so a failing run whose
+# failure lived in a non-pytest GUARD STEP (an orphan-count assert, a packaging
+# guard, a health gate) yielded NO id. The rail then could not certify it:
+# `examined=1 extracted=0` tripped the fail-closed refusal in admin-merge.sh
+# ("yielded NO parseable 'FAILED <nodeid>' line … This is a refusal") and a green,
+# review-clean PR became unmergeable through the sanctioned path — even though
+# the failure was a real, attributable, and often FLAKY guard owned by another
+# lane. A genuinely new guard-step regression could never be CERTIFIED as new,
+# only refused.
+#
+# GROUNDED IN THE REAL CAPTURE, not an invented format. tortoise PR #4672, run
+# 35785085760 (python-ci.yml, 2026-09-23), `gh run view --log-failed`:
+#
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z orphaned redislite servers after suite: 16 (pytest rc: 0, threshold: 12)
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z ##[error]redislite server leak: 16 orphans after suite, threshold 12 (issue #1005 / epic #1647 E2E-7)
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z ##[error]Process completed with exit code 1.
+#   python-ci-gate\tAggregate matrix result\t<ts>Z ##[error]Process completed with exit code 1.
+#
+# Four facts from that capture shape this parser, and each is load-bearing:
+#
+#   * `pytest` exited rc 0; the failure is the POST-SUITE guard, not a test.
+#   * ANNOTATIONS ARE ANCHORED. The log also ECHOES the script source
+#     (line 40 of the capture: `echo "::error::redislite server leak: $COUNT …"`),
+#     so a mid-line search would manufacture a second, `$COUNT`-bearing identity
+#     for the SAME run and put a phantom failure in the set.
+#   * THE RUNNER'S OWN EXIT ANNOTATION IS NOT AN IDENTITY. `##[error]Process
+#     completed with exit code <N>.` is emitted for EVERY failing step — the
+#     pytest step included, and the aggregate gate step too. Attributing it
+#     would convert a genuinely unparseable run (log format moved; pytest rc≠0
+#     with no FAILED line) into a "guard-step" id, i.e. exactly the fail-closed
+#     refusal this change must PRESERVE. It is excluded, and a step carrying
+#     ONLY it stays unattributable.
+#   * THE IDENTITY IS (STEP, ERROR SHAPE) AND IS WHITESPACE-FREE. The main RATE
+#     table is built with `uniq -c | awk` and is whitespace-delimited (the count
+#     is field 1, the id field 2), so a key containing a space is mangled there;
+#     and the comparison needs the same identity on both trees despite an orphan
+#     COUNT that changes every run. So the step is slugged into the key and the
+#     error SHAPE rides the key tail AND the signature column the decision
+#     already carries.
 
-    Two passes over the same normalized lines:
+#: The one prefix no pytest nodeid can produce, so a guard key cannot collide
+#: with a test id.
+_GUARD_KEY_PREFIX = "guard-step::"
+
+#: The runner's OWN annotations for a failing step, emitted for EVERY failing
+#: step. They name no failure, so they are never an identity (see above).
+_RUNNER_GENERIC_ANNOTATIONS = (
+    re.compile(r"^Process completed with exit code -?\d+\.?$"),
+    re.compile(r"^The process .+ failed with exit code -?\d+\.?$"),
+    re.compile(r"^Bash exited with code -?\d+\.?$"),
+)
+
+#: A GitHub Actions error annotation, ANCHORED at the start of the line content.
+#: `gh run view` renders it as `##[error]<message>`; the workflow-command form is
+#: `::error[ props]::<message>`. The anchor is what keeps the echoed script
+#: source (`echo "::error::…"`) out of the id set.
+_ANNOTATION_RE = re.compile(r"^(?:##\[error\]|::error(?: [^:]*)?::)(?P<msg>.*)$")
+
+#: The `<job>\t<step>\t\ufeff<ISO>Z ` head, used to recover the STEP. Split on
+#: tabs (never a greedy `.*`) so the step is the real second column, and require
+#: the timestamp head so a content line that merely contains tabs is not mistaken
+#: for a prefix.
+_TS_HEAD_RE = re.compile(
+    r"^\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]"
+)
+
+#: The CLI's whitespace-free guard key — see the section header for WHY one token
+#: is mandatory. The charset is exactly what :func:`_slug` emits.
+_GUARD_KEY_RE = re.compile(r"^guard-step::[A-Za-z0-9_.\-]+::[A-Za-z0-9_.\-]+$")
+
+#: An integer RUN — the run-varying quantity in a guard message (an orphan COUNT,
+#: a measured value). Masked in the identity so the same guard on main and on the
+#: PR compares despite a different number, exactly as a test signature masks a
+#: per-run id. THE TRADE IS DECLARED: guard failures differing ONLY numerically
+#: collapse into one identity, and the rate comparison (plus the per-id
+#: `min_runs` floor) is the backstop that still has to hold for an exemption.
+_GUARD_INT_RE = re.compile(r"\b\d+\b")
+
+
+def is_failure_key(key: str) -> bool:
+    """Is ``key`` in the universe the RATE table accepts (#4469)?
+
+    A pytest nodeid AND a guard-step identity are both failure keys; the same
+    predicate must gate :func:`parse_rates`, or main's rate row is dropped and
+    every guard failure reads as PR-unique forever.
+    """
+    return bool(_NODEID_RE.match(key) or _GUARD_KEY_RE.match(key))
+
+
+def is_failure_key_loose(key: str) -> bool:
+    """The LOOSE (parameter-space-permitting) form of :func:`is_failure_key`."""
+    return bool(_NODEID_LOOSE_RE.match(key) or _GUARD_KEY_RE.match(key))
+
+
+def _split_log_line(line: str) -> tuple[str, str, str]:
+    """``(job, step, content)`` from a gh ``--log-failed`` line.
+
+    Returns ``('', '', line)`` when the line carries no ``<job>\t<step>\t<ts>Z ``
+    head — the caller then has no step and must not invent one.
+    """
+    parts = line.split("\t", 2)
+    if len(parts) == 3:
+        head = _TS_HEAD_RE.match(parts[2])
+        if head:
+            return parts[0], parts[1], parts[2][head.end():]
+    return "", "", line
+
+
+def _slug(text: str) -> str:
+    """A whitespace-free token for a guard key; never empty."""
+    slug = re.sub(r"[^A-Za-z0-9_.\-]+", "-", text).strip("-")
+    return slug or "unknown"
+
+
+def normalize_guard_error(message: str) -> str:
+    """The STABLE shape of a guard-step error message, or ``''``.
+
+    Whitespace is collapsed and the SAME closed volatile-identifier list as
+    :func:`normalize_signature` is applied, then integer runs are masked too (see
+    ``_GUARD_INT_RE`` for the declared trade).
+    """
+    shape = normalize_signature(message)
+    if not shape:
+        return ""
+    return _GUARD_INT_RE.sub("<N>", shape)
+
+
+def guard_step_key(step: str, error_shape: str) -> str:
+    """``guard-step::<step>::<error shape>`` — one whitespace-free identity."""
+    return f"{_GUARD_KEY_PREFIX}{_slug(step)}::{_slug(error_shape)}"
+
+
+def _attributable_annotation(content: str) -> str:
+    """The guard failure message on ``content``, or ``''`` when there is none.
+
+    The runner's generic exit annotations are deliberately NOT attribution — see
+    the section header. A step carrying only them stays unattributable, which is
+    what keeps the rail's refusal for a genuinely unparseable run.
+    """
+    m = _ANNOTATION_RE.match(content)
+    if not m:
+        return ""
+    message = " ".join(m.group("msg").split())
+    if not message:
+        return ""
+    if any(generic.match(message) for generic in _RUNNER_GENERIC_ANNOTATIONS):
+        return ""
+    return message
+
+
+def guard_step_failures(text: str) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(keys, {key: signatures})`` for the guard-step failures in a capture.
+
+    Pure and fail-closed: a line that is not an annotation, whose message is
+    empty, or whose message is only the runner's own exit annotation contributes
+    NOTHING (so the run stays unattributable and the rail refuses it).
+    """
+    keys: list[str] = []
+    signatures: dict[str, set[str]] = {}
+    for raw in text.splitlines():
+        _job, step, content = _split_log_line(_ANSI_RE.sub("", raw))
+        message = _attributable_annotation(content.strip())
+        if not message:
+            continue
+        shape = normalize_guard_error(message)
+        if not shape:
+            continue
+        key = guard_step_key(step, shape)
+        keys.append(key)
+        signatures.setdefault(key, set()).add(shape)
+    return sorted(set(keys)), {k: frozenset(v) for k, v in signatures.items()}
+
+
+def parse_pr_failure_text(text: str) -> SignatureParse:
+    """Extract ``{id: signature}`` from a raw ``--log-failed`` capture.
+
+    Three passes over the same normalized lines:
 
     1. the ``FAILED <nodeid> [- <detail>]`` short-summary lines — the
        authoritative id set, the same lines ``extract_failed_tests`` reads;
@@ -793,12 +1011,23 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
             signatures[nodeid] = frozenset(details[nodeid])
         else:
             unsigned.append(nodeid)
+
+    # Pass 3 — GUARD-STEP failures (#4469). Their ids and signatures come from the
+    # SAME helper the `ids` CLI uses, so the two doors cannot disagree about the
+    # guard universe. Merged AFTER the nodeid attribution so a guard key can
+    # never be pulled into the `by_name` join above.
+    guard_keys, guard_signatures = guard_step_failures(text)
+    for key, sigs in guard_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(guard_keys)
+
     return SignatureParse(
         ids=sorted(set(id_list)),
         signatures=signatures,
         rejected=rejected,
         unsigned=unsigned,
         unattributed=unattributed,
+        guard_steps=guard_keys,
     )
 
 
@@ -865,7 +1094,7 @@ def parse_failure_rows(text: str) -> FailureRowsResult:
         failures_n = int(m.group("failures"))
         runs_n = int(m.group("runs"))
         if (
-            not _NODEID_LOOSE_RE.match(nodeid)
+            not is_failure_key_loose(nodeid)
             or runs_n <= 0
             or failures_n > runs_n
         ):
@@ -908,7 +1137,7 @@ def parse_signature_rows(text: str) -> dict[str, frozenset[str]]:
             continue
         nodeid = m.group("nodeid")
         sig = normalize_signature(m.group("sig"))
-        if not sig or not _NODEID_LOOSE_RE.match(nodeid):
+        if not sig or not is_failure_key_loose(nodeid):
             continue
         out.setdefault(nodeid, set()).add(sig)
     return {k: frozenset(v) for k, v in out.items()}
@@ -959,9 +1188,15 @@ def _cmd_ids(args: argparse.Namespace) -> int:
         )
     print(
         f"ci-exemption: ids={len(parsed.ids)} "
-        f"unattributable={len(parsed.rejected)}",
+        f"unattributable={len(parsed.rejected)} "
+        f"guard-steps={len(parsed.guard_steps)}",
         file=sys.stderr,
     )
+    for key in parsed.guard_steps:
+        print(
+            f"ci-exemption: guard-step failure ATTRIBUTED (no test nodeid): {key}",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -985,7 +1220,8 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
     print(
         f"ci-exemption: ids={len(parsed.ids)} signed={len(parsed.signatures)} "
         f"unsigned={len(parsed.unsigned)} rejected={len(parsed.rejected)} "
-        f"unattributed={len(parsed.unattributed)}",
+        f"unattributed={len(parsed.unattributed)} "
+        f"guard-steps={len(parsed.guard_steps)}",
         file=sys.stderr,
     )
     return 0 if parsed.ok else 1
@@ -1080,14 +1316,16 @@ def main(argv: list[str] | None = None) -> int:
 
     sig = sub.add_parser(
         "signatures",
-        help="extract stable signatures from a raw `gh run view --log-failed` capture",
+        help="extract stable signatures from a raw `gh run view --log-failed` capture "
+        "(pytest nodeids AND guard-step annotations, #4469)",
     )
     sig.add_argument("--log", required=True, help="raw --log-failed file")
     sig.set_defaults(func=_cmd_signatures)
 
     ids = sub.add_parser(
         "ids",
-        help="THE canonical FAILED-id extraction from a raw `gh run view --log-failed` capture",
+        help="THE canonical FAILED-id extraction from a raw `gh run view --log-failed` "
+        "capture — pytest nodeids plus attributable guard-step failures (#4469)",
     )
     ids.add_argument("--log", required=True, help="raw --log-failed file")
     ids.set_defaults(func=_cmd_ids)

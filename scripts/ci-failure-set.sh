@@ -11,8 +11,15 @@
 #   1. lists the FAILING check runs for a selector (a PR head, a commit, or the
 #      last N runs on main);
 #   2. fetches each failing run's failed-step log (`gh run view --log-failed`);
-#   3. extracts `FAILED <nodeid>` lines and emits a sorted, unique, one-test-
-#      per-line set.
+#   3. extracts `FAILED <nodeid>` lines AND attributable non-pytest GUARD-STEP
+#      failures (#4469 — a failure announced by a GitHub Actions error annotation
+#      in a step that is not the test step), and emits a sorted, unique,
+#      one-identity-per-line set.
+#
+# Guard-step attribution exists so a guard failure is COMPARED against main like a
+# test nodeid instead of tripping the caller's fail-closed refusal; the refusal is
+# untouched for a run that carries neither a nodeid nor a substantive annotation
+# (the runner's own `Process completed with exit code <N>.` is NOT one).
 #
 # Modes:
 #   --pr <N>                  failing set of PR #N's head commit
@@ -80,7 +87,8 @@
 #
 # Exit codes:
 #   0  extracted (the set may legitimately be EMPTY — no failing runs, or
-#      failing runs whose failures are not `FAILED <nodeid>` shaped)
+#      failing runs whose failures carry no parseable identity: neither a
+#      `FAILED <nodeid>` line nor an attributable guard-step annotation)
 #   1  the extraction itself failed (gh error, unreadable log) — the caller MUST
 #      treat this as "cannot certify", never as "no unique failures". A rail
 #      that reads an extraction error as an empty set is vacuously green.
@@ -110,7 +118,9 @@
 #
 # WHAT `--runs-report` MEANS (the completion doctrine):
 #   examined   failing runs in the lane (the ones whose logs are parsed)
-#   extracted  failing runs that yielded at least one `FAILED <nodeid>` line
+#   extracted  failing runs that yielded at least one failure identity — a
+#              `FAILED <nodeid>` line OR (since #4469) an attributable guard-step
+#              error annotation
 #   completed  lane runs that FINISHED (any conclusion)
 #   tested     of `completed`, the runs that actually EXERCISED the code:
 #              `success`, `failure`, `timed_out`. NOT `cancelled`/`skipped`
@@ -432,10 +442,11 @@ collect_union_signatures() {
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
     log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
     if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file" "$tmp_sigs"; return 1; fi
-    # A failing run with NO `FAILED <nodeid>` line contributes nothing to either
-    # table. Skip the extractor for it: the `signatures` CLI exits 1 on a capture
-    # that yields no ids, which is correct for a capture that PROVES nothing but
-    # wrong for a run we already know carried no parseable failure (the
+    # A failing run with NO failure identity contributes nothing to either table
+    # (no `FAILED <nodeid>` line AND no attributable guard-step annotation, #4469).
+    # Skip the extractor for it: the `signatures` CLI exits 1 on a capture that
+    # yields no ids, which is correct for a capture that PROVES nothing but wrong
+    # for a run we already know carried no parseable failure (the
     # `extracted < examined` gate in admin-merge.sh owns that case).
     local ids="" one=""
     ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_sigs"; return 1; }
