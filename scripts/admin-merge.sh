@@ -168,6 +168,16 @@
 # non-completed run is never a MEASUREMENT either, so it cannot set the surface's
 # last-production time (the staleness anchor).
 #
+# AND A COMPLETED RUN THAT MEASURED NOTHING IS NOT A MEASUREMENT EITHER (#1353).
+# The anchor used to be set by EVERY completed check — including `skipped`,
+# `cancelled`, `neutral` and `stale`, which exercise nothing (the rail's own
+# doctrine: "a `skipped` shard is not coverage", #4457). Stamping it with such a
+# run moved the surface's last-production time FORWARD past its real evaluation,
+# so a base red that began in between compared as already-measured and the stale
+# green merged. The predicate is now EXPLICIT, NAMED in ONE place, and used at
+# BOTH sites that can set the anchor (check runs AND legacy statuses), so the two
+# halves cannot drift apart again.
+#
 # AND NOTHING IS DROPPED BEFORE CLASSIFICATION (#1353). A check run with an empty
 # `name` — or a legacy status with an empty `context` — used to be `continue`d
 # away, so a RED on it appeared in NEITHER the red nor the pending list, the
@@ -255,8 +265,10 @@
 # the base head carries a CODE-MEASURING red (the same schedule/issues filter as
 # the base context), and refuses only when such a red's run STARTED after the PR
 # surface was last produced (the max `completed_at` over the PR surface's
-# completed checks — a PENDING legacy status is not a completed check and does
-# NOT set this anchor: its `updated_at` marks when it was last QUEUED or
+# MEASURING completed checks — a PENDING legacy status is not a completed check
+# and does NOT set this anchor, and neither does a COMPLETED check that measured
+# nothing (`skipped`/`cancelled`/`neutral`/`stale`, or an unrecognised token):
+# a pending status's `updated_at` marks when it was last QUEUED or
 # re-announced, not when anything was measured, so letting it advance the anchor
 # moved the last-production time FORWARD past the PR's real evaluation and made
 # a base red that began in between read as "already measured" (#1353)). If the
@@ -1622,6 +1634,24 @@ check_surface_probe() {
 # silently non-red and merged on it (#1261 fix round).
 NON_RED_CONC = {"success", "neutral", "skipped", "cancelled", "stale"}
 NON_RED_STATE = {"success"}
+# THE MEASUREMENT PREDICATE — ONE predicate, used at EVERY site that can set the
+# surface anchor (#1353). `SURFACE` below is the surface LAST PRODUCTION TIME
+# and step 4.6 compares a later base red against it: a red whose run STARTED after
+# that moment cannot be part of what the surface measured. A COMPLETED check that
+# measured NOTHING must not advance it — `skipped`/`cancelled`/`neutral`/`stale`
+# exercised nothing, so stamping the anchor with such a run moved the
+# last-production time FORWARD past the surface real evaluation and made an
+# uncovered base red compare as already-measured (the stale green merged).
+#   MEASURING_CONC — a completed CHECK RUN that actually RAN something. NAMED
+#     explicitly and positive-direction: anything else (the non-measuring non-red
+#     conclusions, and any token this rail has never seen) is NOT a measurement.
+#   MEASURING_STATE — the legacy-status half (the GitHub status vocabulary is
+#     `error|failure|pending|success`; `pending` is its own branch above and never
+#     reaches the anchor).
+# A surface with NO measuring completed check leaves the anchor EMPTY, which makes
+# 4.6 refuse (fail closed) rather than compare against a non-measurement time.
+MEASURING_CONC = {"success", "failure", "timed_out", "action_required"}
+MEASURING_STATE = {"success", "failure", "error"}
 
 def docs(path):
     try:
@@ -1739,7 +1769,7 @@ for _, name, app, status, concl, url, started, completed in best.values():
         # `completed_at`, so it can never set the surface time below.
         continue
     e = ts_epoch(completed)
-    if e != "" and (surface_iso == "" or int(e) > surface_epoch):
+    if concl in MEASURING_CONC and e != "" and (surface_iso == "" or int(e) > surface_epoch):
         surface_epoch, surface_iso = int(e), completed
     if concl not in NON_RED_CONC:
         reds.append((name, app, concl, url, started, ""))
@@ -1759,7 +1789,7 @@ for stamp, ctx, state, url in sbest.values():
     elif state not in NON_RED_STATE:
         reds.append((ctx, "commit-status", state, url, stamp, ""))
     e = ts_epoch(stamp)
-    if e != "" and (surface_iso == "" or int(e) > surface_epoch):
+    if state in MEASURING_STATE and e != "" and (surface_iso == "" or int(e) > surface_epoch):
         surface_epoch, surface_iso = int(e), stamp
 
 total = len(best) + len(sbest)
@@ -2992,10 +3022,12 @@ main() {
         fi
       done <<< "$BASE_RED_TS"
     else
-      # No completed check on the PR surface: there is no measurement time to
-      # compare against, so the rail cannot show this PR measured the base's red.
+      # No MEASURING completed check on the PR surface — none at all, or only
+      # checks that completed without exercising anything (#1353): there is no
+      # measurement time to compare against, so the rail cannot show this PR
+      # measured the base's red.
       stale_any=1
-      stale_reds="   • the PR's evaluated surface has produced NO completed check run, so it has no time to compare against the base's red(s)"$'\n'
+      stale_reds="   • the PR's evaluated surface has produced NO MEASURING completed check run (none at all, or only `skipped`/`cancelled`/`neutral`/`stale` checks, which measured nothing), so it has no time to compare against the base's red(s)"$'\n'
     fi
     if [ "$stale_any" -eq 1 ]; then
       say_err "admin-merge: ✗ BLOCK — THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE surface)."

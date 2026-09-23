@@ -4623,6 +4623,164 @@ grep -q -- "DROPPED: (HTTP" "$SCEN/err" && pass "…and the DROPPED token is nam
 [ -f "$SCEN/comment" ] && fail "evidence was posted over an entirely-dropped set" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an entirely-dropped set" || pass "no merge attempted"
 
+# ── 55. A COMPLETED CHECK THAT MEASURED NOTHING IS NOT A MEASUREMENT (#1353) ─
+# The staleness anchor (`surface_epoch`) is the surface's last PRODUCTION time,
+# and step 4.6 refuses a base red whose run STARTED after it. The anchor used to
+# be set by EVERY completed check — including `skipped`/`cancelled`/`neutral`/
+# `stale`, which exercise nothing — so a non-measuring run stamped the anchor
+# FORWARD past the surface's real evaluation and a base red that began in between
+# compared as already-measured. One explicit predicate (MEASURING_CONC /
+# MEASURING_STATE) now gates BOTH sites that can set it.
+echo "== 55. a completed-but-NON-MEASURING check must not advance the staleness anchor (#1353) =="
+
+# 36 zeros, so a fixture sha below is exactly 40 hex chars.
+HEX36="000000000000000000000000000000000000"
+
+# (a) THE REPRODUCTION. The PR's own last MEASUREMENT was at 00:01; a SKIPPED
+# check completed at 00:06 and used to stamp the anchor with 00:06, so the base
+# red that began at 00:03 looked already-measured and the stale green merged.
+new_scen stale-nonmeasuring-skipped
+HEAD_NM1="a1a1${HEX36}"
+printf '%s\n' "$HEAD_NM1" > "$SCEN/head"
+lane_pass "$HEAD_NM1" 5961 > "$SCEN/runs-$HEAD_NM1"
+lane_pass mainnm1 5962 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5001 'python-ci / test (a)' completed success 7361 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 5002 'agent-infra-ci / lint' completed skipped 7361 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7361 pull_request 'CI'
+write_main_checks "$(check_run 6001 'agent-infra-ci / lint' completed failure 7461 2026-01-01T00:03:00Z 2026-01-01T00:03:30Z)"
+main_run_map 7461 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a base red at 00:03 is STALE despite a SKIPPED check completing at 00:06 (exit $rc)" \
+  || fail "a SKIPPED check advanced the anchor past the real measurement and the stale green MERGED"
+grep -q "STALE surface" "$SCEN/err" && pass "…and the refusal names the staleness" \
+  || fail "the refusal is not the staleness one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "surface was last produced (2026-01-01T00:01:00Z)" "$SCEN/err" \
+  && pass "…anchored on the MEASURING check (00:01), not the skipped one (00:06)" \
+  || fail "the anchor is not the measuring check's completion: $(grep -m1 'last produced' "$SCEN/err")"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a stale green" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a stale green" || pass "no merge attempted"
+
+# (b) THE SAME FOR EVERY OTHER NON-MEASURING NON-RED CONCLUSION.
+for pair in "cancelled:c1" "neutral:d1" "stale:e1"; do
+  concl="${pair%%:*}"; tag="${pair##*:}"
+  new_scen "stale-nonmeasuring-$concl"
+  HEAD_NM="f9${tag}${HEX36}"
+  printf '%s\n' "$HEAD_NM" > "$SCEN/head"
+  lane_pass "$HEAD_NM" 5963 > "$SCEN/runs-$HEAD_NM"
+  lane_pass "main${tag}" 5964 > "$SCEN/runs-main"
+  write_pr_checks \
+    "$(check_run 5001 'python-ci / test (a)' completed success 7362 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+    "$(check_run 5002 'agent-infra-ci / lint' completed "$concl" 7362 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+  pr_run_map 7362 pull_request 'CI'
+  write_main_checks "$(check_run 6001 'agent-infra-ci / lint' completed failure 7462 2026-01-01T00:03:00Z 2026-01-01T00:03:30Z)"
+  main_run_map 7462 push 'Post-merge validation'
+  run_admin_here 42 >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "…a COMPLETED $concl does not advance the anchor either (exit $rc)" \
+    || fail "a COMPLETED $concl advanced the anchor and the stale green MERGED"
+  grep -q "STALE surface" "$SCEN/err" && pass "…$concl refuses via the staleness rule" \
+    || fail "the $concl refusal is not the staleness one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+done
+
+# (c) AND WHEN THE NON-MEASURING CHECK IS THE SURFACE'S ONLY COMPLETED CHECK
+# the anchor is EMPTY, which makes 4.6 refuse (fail closed) rather than compare
+# against a non-measurement's time.
+new_scen stale-nonmeasuring-only
+HEAD_NM2="a2a2${HEX36}"
+printf '%s\n' "$HEAD_NM2" > "$SCEN/head"
+lane_pass "$HEAD_NM2" 5965 > "$SCEN/runs-$HEAD_NM2"
+lane_pass mainnm2 5966 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'agent-infra-ci / lint' completed skipped 7363 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7363 pull_request 'CI'
+write_main_checks "$(check_run 6001 'agent-infra-ci / lint' completed failure 7463 2026-01-01T00:03:00Z 2026-01-01T00:03:30Z)"
+main_run_map 7463 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a SKIPPED-only surface leaves NO anchor, so a red base REFUSES (exit $rc)" \
+  || fail "a skipped-only surface certified a red base — the anchor was set by a non-measurement"
+grep -q "NO MEASURING completed check run" "$SCEN/err" \
+  && pass "…and the refusal names the absence of a MEASURING check, not of any check" \
+  || fail "the no-anchor refusal does not distinguish measuring from non-measuring: $(sed -n '1,8p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a stale green" || pass "no merge attempted"
+
+# (d) THE OVER-BLOCK GUARD — A MEASURING COMPLETION STILL ADVANCES THE ANCHOR.
+# The same fixture with the skipped check replaced by a MEASURING success at
+# 00:06 covers the base red that began at 00:02, so the merge MUST proceed.
+# Without this the fix could pass by never advancing the anchor at all — which
+# would refuse every PR whose surface carries a non-measuring check.
+new_scen stale-measuring-anchor
+HEAD_NM3="a3a3${HEX36}"
+printf '%s\n' "$HEAD_NM3" > "$SCEN/head"
+lane_pass "$HEAD_NM3" 5967 > "$SCEN/runs-$HEAD_NM3"
+lane_pass mainnm3 5968 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7364 2026-01-01T00:05:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7364 pull_request 'CI'
+write_main_checks "$(check_run 6001 'agent-infra-ci / lint' completed failure 7464 2026-01-01T00:02:00Z 2026-01-01T00:02:30Z)"
+main_run_map 7464 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a base red at 00:02 IS covered by the PR's 00:06 MEASURING success — it MERGES (exit 0)" \
+  || fail "a covered base red was refused (exit $rc) — the anchor stopped advancing from a measurement: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+[ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+
+# (e) THE OVER-BLOCK GUARD FOR THE ALLOW-LIST — all FIVE named non-red
+# conclusions still merge on BOTH surfaces when the base is green, because a
+# green base never enters 4.6 at all.
+new_scen nonmeasuring-both-surfaces-green
+HEAD_NM4="a4a4${HEX36}"
+printf '%s\n' "$HEAD_NM4" > "$SCEN/head"
+lane_pass "$HEAD_NM4" 5969 > "$SCEN/runs-$HEAD_NM4"
+lane_pass mainnm4 5970 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5101 'ci / a' completed success 7365 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 5102 'ci / b' completed neutral 7365 2026-01-01T00:00:00Z 2026-01-01T00:02:00Z)" \
+  "$(check_run 5103 'ci / c' completed skipped 7365 2026-01-01T00:00:00Z 2026-01-01T00:03:00Z)" \
+  "$(check_run 5104 'ci / d' completed cancelled 7365 2026-01-01T00:00:00Z 2026-01-01T00:04:00Z)" \
+  "$(check_run 5105 'ci / e' completed stale 7365 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+pr_run_map 7365 pull_request 'CI'
+write_main_checks \
+  "$(check_run 6101 'ci / a' completed success 7465 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 6102 'ci / b' completed neutral 7465 2026-01-01T00:00:00Z 2026-01-01T00:02:00Z)" \
+  "$(check_run 6103 'ci / c' completed skipped 7465 2026-01-01T00:00:00Z 2026-01-01T00:03:00Z)" \
+  "$(check_run 6104 'ci / d' completed cancelled 7465 2026-01-01T00:00:00Z 2026-01-01T00:04:00Z)" \
+  "$(check_run 6105 'ci / e' completed stale 7465 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+main_run_map 7465 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "the five named non-red conclusions merge on BOTH surfaces on a green base (exit 0)" \
+  || fail "a non-red conclusion was reddened (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 5 check(s)" "$SCEN/out" \
+  && pass "…and all five tree checks are still COUNTED and reported GREEN" \
+  || fail "the tree surface lost its non-measuring checks: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (f) THE OVER-BLOCK GUARD FOR IN-FLIGHT SPELLINGS — all five remain PENDING
+# (never red, never a measurement), so a green lane/base still merges.
+new_scen in-flight-spellings-still-pending
+HEAD_NM5="a5a5${HEX36}"
+printf '%s\n' "$HEAD_NM5" > "$SCEN/head"
+lane_pass "$HEAD_NM5" 5971 > "$SCEN/runs-$HEAD_NM5"
+lane_pass mainnm5 5972 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5201 'ci / q' queued '' 7366)" \
+  "$(check_run 5202 'ci / p' in_progress '' 7366)" \
+  "$(check_run 5203 'ci / w' waiting '' 7366)" \
+  "$(check_run 5204 'ci / r' requested '' 7366)" \
+  "$(check_run 5205 'ci / n' pending '' 7366)"
+pr_run_map 7366 pull_request 'CI'
+main_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "all five in-flight spellings stay PENDING and merge on a green base (exit 0)" \
+  || fail "an in-flight spelling was reddened (exit $rc): $(sed -n '1,5p' "$SCEN/err" 2>/dev/null)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "pending 5" "$SCEN/out" \
+  && pass "…and all five are COUNTED as pending, not red" \
+  || fail "the in-flight count is wrong: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
