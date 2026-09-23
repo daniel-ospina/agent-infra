@@ -230,6 +230,14 @@ WORKFLOW_ARGS=()
 # tests/admin-merge/run.sh) — and ordering does not need it either: a run's
 # `databaseId` IS its creation order (#1358's own residual, stated there).
 LANE_RUN_RAW_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha // ""):\(.databaseId // "")\t\(.workflowDatabaseId // "")\t\(.workflowName // "")\t\(.event // "")\t\(.headBranch // "")"'
+# THIS EXPRESSION IS EXECUTED BY A TEST, not only by production: test §60 (p)
+# feeds a JSON listing through the REAL `--jq` and asserts the identity reaches the
+# rule. Raising that test is what makes the claim "the projection cannot lose a
+# field unnoticed" TRUE — the earlier comment said it while every fixture handed
+# the rule its own 7-field shape, so a one-character regression here (a dropped
+# `headBranch`, a renamed `--json` field) turned every line opaque, reverted the
+# fix to its pre-#1358 behaviour, and left the tests green (code-review cycle 5,
+# 2026-09-23).
 
 # ── drop_superseded_runs — THE SUPERSEDE RULE (#1358) ────
 #
@@ -244,11 +252,12 @@ LANE_RUN_RAW_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else
 # same idea — the latest check run per (app, name) decides — so this is the lane
 # path agreeing with it, not a new concept.
 #
-# WHAT MAY SUPERSEDE: only `success`. `cancelled` (what `cancel-in-progress`
-# produces), `skipped` (it exercised nothing), `neutral`, `failure` and
-# `startup_failure` are all terminal, and none of them is evidence that the commit
-# is green, so none may drop a red. Fail CLOSED: an over-block costs a re-run; the
-# other direction merges a broken tree.
+# WHAT MAY SUPERSEDE: only a run that FINISHED and SUCCEEDED (`completed`
+# `success`). `cancelled` (what `cancel-in-progress` produces), `skipped` (it
+# exercised nothing), `neutral`, `failure`, `timed_out` and `startup_failure` are all
+# terminal, and none of them is evidence that the commit is green, so none may drop
+# a red — a later red is another red, not a certificate (test §60 (o)). Fail CLOSED:
+# an over-block costs a re-run; the other direction merges a broken tree.
 #
 # "LATER" MEANS CREATED LATER: a run's `databaseId` increases with creation, so
 # the highest id in a group is the group's newest run — the same notion step 4.5
@@ -329,9 +338,16 @@ drop_superseded_runs() {
         opaque[NR] = "a " NF "-field line (this projection defines 7 fields: status, conclusion, sha:id, workflow id, workflow name, event, head branch)"
         next
       }
+      # EXACTLY ONE colon. The consumers take the LAST colon-separated segment
+      # (`${runref##*:}`, ci-failure-set.sh:498/556/608/668), so a reference with a
+      # second colon would have THIS rule rank the id it read first while the log
+      # fetch used a different one — the rule would be reasoning about a run that is
+      # not the one it later inspected. Unreadable identity, named, fail closed
+      # (code-review cycle 5; the live projection cannot emit it, so this is
+      # defence in depth, not a fix for an observed failure).
       split($3, parts, ":")
       sha = parts[1]; id = parts[2]
-      if (blank(sha) || blank(id) || id !~ /^[0-9]+$/) { opaque[NR] = "an unparsable run reference (" $3 ")"; next }
+      if (length(parts) != 2 || blank(sha) || blank(id) || id !~ /^[0-9]+$/) { opaque[NR] = "an unparsable run reference (" $3 ")"; next }
       if (blank($4)) { opaque[NR] = "an empty workflow id"; next }
       if (blank($5)) { opaque[NR] = "an empty workflow name"; next }
       if (blank($6)) { opaque[NR] = "an empty event"; next }
@@ -344,6 +360,11 @@ drop_superseded_runs() {
       # a job is routinely `if: github.ref …`, so a green on `main` says nothing about
       # a red on a release branch at the same commit (code-review cycle 4, 2026-09-23;
       # the same class as the tab-in-name fail-open the cycle-1 review found).
+      # THE REF IS CARRIED AS `headBranch`: `gh run list --json` serves no `ref` field,
+      # and for the run this rail governs (a `push` lane) the head branch and the ref are
+      # the same string. The stated residual — two `pull_request` runs at one commit whose
+      # heads share a branch name are two refs carrying the same field — is in the note
+      # below and in the PR (code-review cycle 5).
       k[NR] = sha SUBSEP $4 SUBSEP $5 SUBSEP $6 SUBSEP $7
       # A SUPERSEDE CERTIFICATE is a run that FINISHED and succeeded. Requiring
       # `completed` as well as `success` keeps the premise of the certificate true
@@ -362,7 +383,14 @@ drop_superseded_runs() {
           printf "ci-failure-set: note: %s carries %s, so it can neither supersede nor be superseded — kept as a FAILING RUN, and never read as a certificate that the commit is green (fail closed)\n", (ref[i] == "" ? "line " i : ref[i]), opaque[i] > "/dev/stderr"
         }
         if (cand[i] && is_failing(concl[i]) && (k[i] in best) && (idof[i] + 0) < (best[k[i]] + 0)) {
-          printf "ci-failure-set: note: run %s (at %s) concluded %s but was superseded by run %s, a LATER run of the SAME workflow at the same commit, event and ref — NOT counted as a failing run\n", idof[i], shaof[i], concl[i], bestid[k[i]] > "/dev/stderr"
+          # The disclosure names the HEAD BRANCH, which is what the key carries: `gh run
+          # list --json` exposes no `ref`. For the lane this rail runs (a `push` run) the
+          # head branch IS the ref (`refs/heads/<headBranch>`) and the correspondence is
+          # exact. For a `pull_request` run it is not: two PRs whose heads share a branch
+          # NAME are two refs (`refs/pull/N/merge`) carrying the same field, so this note
+          # would over-claim. That residual is STATED rather than papered over — no field
+          # served by `gh run list` can close it (code-review cycle 5).
+          printf "ci-failure-set: note: run %s (at %s) concluded %s but was superseded by run %s, a LATER run of the SAME workflow at the same commit, event and head branch — NOT counted as a failing run\n", idof[i], shaof[i], concl[i], bestid[k[i]] > "/dev/stderr"
           continue
         }
         print out[i]

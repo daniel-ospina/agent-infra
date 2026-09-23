@@ -293,8 +293,11 @@ case "$key" in
     #   * the RUN MAP (`--json databaseId,event,workflowName`) — #1261 main-health
     #     event resolution. Recognised by `event` WITHOUT `status`/`conclusion`.
     #   * the RAW supersede listing (`… headSha,workflowDatabaseId,workflowName,
-    #     event`) — recognised by `workflowDatabaseId`, which NO other caller asks
-    #     for. Served WHOLE: the fixture IS that 6-field projection.
+    #     event,headBranch`) — recognised by `workflowDatabaseId`, which NO other
+    #     caller asks for. Served WHOLE (a TAB fixture: the fixture IS that 7-field
+    #     projection), OR — when the fixture is JSON and the caller passed `--jq` —
+    #     with the caller's own jq expression applied, which is what puts the real
+    #     projection under test (§60 (p)).
     #   * the canonical 3-field lane listing (`… headSha`, `LANE_RUN_JQ`) — served
     #     as the FIRST THREE FIELDS, so one fixture answers both the raw consumer
     #     (the parser) and the canonical one (the rail's coverage gate, which
@@ -315,6 +318,12 @@ case "$key" in
     # decide this: the raw projection carries `event` too, so the map branch takes
     # `event` only when the list is neither the lane's status/conclusion shape.
     want_map=0 want_raw=0
+    jqexpr=""
+    for x in "$@"; do
+      [ "$jp" = "--json" ] && fields="$x"
+      [ "$jp" = "--jq" ] && jqexpr="$x"
+      jp="$x"
+    done
     case "$fields" in
       *workflowDatabaseId*) want_raw=1 ;;
       *event*)
@@ -335,6 +344,24 @@ case "$key" in
     # file models the unfiltered one (the bogus-zero window).
     if [ -n "$wf" ] && [ -f "$f.by-workflow.$wf" ]; then f="$f.by-workflow.$wf"; fi
     if [ "$want_raw" = 1 ]; then
+      # A JSON fixture is the FAITHFUL double: the caller's REAL `--jq` expression is
+      # applied with real jq, so the projection itself is under test. Without this,
+      # `LANE_RUN_RAW_JQ` is never evaluated by anything here — every fixture hands the
+      # rule its own 7-field shape — and a one-character regression in it (a dropped
+      # `headBranch`, a renamed `--json` field) makes every line opaque, silently
+      # reverting #1358 to its pre-fix behaviour while the suite stays green
+      # (code-review cycle 5; the §52 (p) case is what pins this).
+      if [ -f "$f" ] && [ -n "$jqexpr" ] && [ "$(head -c 1 "$f")" = "[" ]; then
+        # …and `gh` serves ONLY the fields the caller ASKED for, so the fixture is
+        # projected down to the `--json` list first. Skipping this would let the fixture
+        # keep serving a field the caller had stopped requesting — hiding exactly the
+        # regression in question, since the jq template would still find its input.
+        proj="$(mktemp "${TMPDIR:-/tmp}/fake-gh-json.XXXXXX")"
+        if jq -c --arg f "$fields" '[.[] | with_entries(select(.key as $k | ($f | split(",") | index($k))))]' "$f" > "$proj" 2>/dev/null; then f="$proj"; fi
+        if [ -n "$limit" ]; then jq -r "$jqexpr" "$f" | head -n "$limit"; else jq -r "$jqexpr" "$f"; fi
+        rm -f "$proj"
+        exit 0
+      fi
       # The raw projection: the fixture verbatim (a legacy 3-field line is handed
       # over as-is, which is exactly how a line the lister did not produce reaches
       # the rule — see the opacity contract in ci-failure-set.sh).
@@ -5322,7 +5349,12 @@ grep -q "not measurable on this lane" "$TMP/err" && pass "(e) …as not-measurab
 grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-unique guard failure" \
   || pass "(e) no merge attempted"
 
-# ── 51. a SUPERSEDED failing run is NOT a failing run (#1358) ──────────────
+# ── 60. a SUPERSEDED failing run is NOT a failing run (#1358) ──────────────
+# The section NUMBER is the next free one, not a reservation: nothing enforces
+# uniqueness across branches, so a number merged here can be taken by another
+# lane's section tomorrow (it happened twice while this change was in flight).
+# The identifiers that matter are the issue tag and the case letters — a future
+# collision is cosmetic, and renumbering on merge is not worth a gate.
 #
 # THE DEFECT. The parser selected EVERY failing run at the head with no notion of
 # recency, so a failing run that a LATER run of the same workflow had already
@@ -5347,7 +5379,7 @@ grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-uniq
 # gate, so scenario (a) exercises both projections at once. NOTHING here asks gh
 # for a CLOCK: §39/§40 forbid `updatedAt` in these scripts, and ordering does not
 # need it.
-echo "== 51. a SUPERSEDED failing run is not a failing run (#1358) =="
+echo "== 60. a SUPERSEDED failing run is not a failing run (#1358) =="
 
 lane7() { printf '%s\t%s\t%s:%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-main}"; }
 lane7_fail() { lane7 completed failure "$1" "$2" "$3" "$4" "$5" "${6:-main}"; }
@@ -5659,9 +5691,16 @@ grep -q '^examined=1$' "$TMP/cfs-rep-widef.txt" \
 # contradiction `gh` cannot emit, so the check closes a class by CONSTRUCTION rather
 # than by a claim about the producer's behaviour, and it keeps the disclosure's own
 # premise true.
+# THIS CASE WAS VACUOUS UNTIL CYCLE 5: the fixture was written with a hand-rolled
+# printf whose format had SIX field slots (`%s:%s` spends two arguments on one
+# field), so the line was 6 fields and hit the OPACITY guard — `examined=1` came
+# from the line being unreadable, not from the completion check. Deleting
+# `$1 == "completed"` from the rule left this case green (code-review cycle 5,
+# 2026-09-23). The fixture now goes through `lane7`, so exactly the `completed`
+# clause is what the assertion turns on.
 new_scen supersededunfinished
 printf '%s\n' "$SS_HEAD" > "$SCEN/head"
-{ printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' queued success "$SS_HEAD" 14303 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+{ lane7 queued success "$SS_HEAD" 14303 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
   lane7_fail "$SS_HEAD" 14301 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
 } > "$SCEN/runs-$SS_HEAD"
 cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-unfin.txt"
@@ -5689,6 +5728,31 @@ grep -q '^pending=0$' "$TMP/cfs-rep-blank.txt" \
   && pass "(m2) a blank line is not emitted as a pending run" \
   || fail "(m2) a blank line became pending: $(tr '\n' ' ' < "$TMP/cfs-rep-blank.txt")"
 
+# (o) A LATER RED IS NOT A CERTIFICATE (code-review cycle 5). Only `completed` +
+# `success` supersedes. A newer FAILING (or `timed_out`) run of the same group
+# replaces nothing: two reds in one group are TWO measurements, and dropping the
+# older would be a silent loss of a failing run — the direction this gate must never
+# take. Asserted on the COUNT (both reds examined) and on the DISCLOSURE (nothing
+# was claimed to be superseded), because the mutant's harm is invisible to the
+# refusal itself: the newest red still refuses, so a test that asserted only "it
+# refuses" would pass while the older red had vanished from the evidence.
+for c in failure timed_out; do
+  new_scen "supersededred-$c"
+  printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+  { lane7 completed "$c" "$SS_HEAD" 14803 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+    lane7_fail "$SS_HEAD" 14801 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  } > "$SCEN/runs-$SS_HEAD"
+  log_failed 'tests/red_later.py::test_x' > "$SCEN/log-14801"
+  log_failed 'tests/red_later.py::test_y' > "$SCEN/log-14803"
+  cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-red-$c.txt"
+  grep -q '^examined=2$' "$TMP/cfs-rep-red-$c.txt" \
+    && pass "(o) a later '$c' run does NOT supersede an older red (both are counted)" \
+    || fail "(o) a later '$c' run replaced a red — a failing run vanished from the evidence: $(tr '\n' ' ' < "$TMP/cfs-rep-red-$c.txt")"
+  grep -q 'superseded by run 14803' "$TMP/cfs-err" \
+    && fail "(o)  …but the older red was DISCLOSED as superseded by a '$c' run" \
+    || pass "(o)  …and nothing was disclosed as superseded (because nothing was)"
+done
+
 # (n) THE REF IS PART OF THE GROUP KEY (code-review cycle 4). One commit is often
 # the tip of two branches and a `push` lane runs on both; a job is routinely
 # `if: github.ref …`, so a green on `main` is NOT a measurement of a red on a
@@ -5712,6 +5776,54 @@ cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-refs.txt"
 grep -q '^examined=0$' "$TMP/cfs-rep-refs.txt" \
   && pass "(n2) …but the SAME ref's later green still supersedes (control)" \
   || fail "(n2) the ref narrowed the rule: a genuine green re-run no longer clears the red: $(tr '\n' ' ' < "$TMP/cfs-rep-refs.txt")"
+
+# (p) THE PROJECTION ITSELF IS UNDER TEST (code-review cycle 5). Every fixture above
+# hands the rule its own 7-field shape, so `LANE_RUN_RAW_JQ` was never executed by
+# anything here: a one-character regression (a dropped `headBranch`, a renamed
+# `--json` field, a lost `headSha`) made EVERY line opaque — which silently reverts
+# #1358 to its pre-fix behaviour, since no line can then be grouped — and the whole
+# suite stayed green. This fixture is JSON and the fake `gh` runs the caller's REAL
+# `--jq` over it with real jq, so the identity the rule receives is the identity
+# production would produce: the assertion that the red is superseded can only be
+# satisfied by a projection that carries all seven fields.
+new_scen supersededprojection
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+cat > "$SCEN/runs-$SS_HEAD" <<JSON
+[{"databaseId":14903,"status":"completed","conclusion":"success","headSha":"$SS_HEAD","workflowDatabaseId":$SS_WFID,"workflowName":"$SS_WFNAME","event":"$SS_EV","headBranch":"main"},
+ {"databaseId":14901,"status":"completed","conclusion":"failure","headSha":"$SS_HEAD","workflowDatabaseId":$SS_WFID,"workflowName":"$SS_WFNAME","event":"$SS_EV","headBranch":"main"},
+ {"databaseId":14900,"status":"completed","conclusion":null,"headSha":"$SS_HEAD","workflowDatabaseId":$SS_WFID,"workflowName":"$SS_WFNAME","event":"$SS_EV","headBranch":"main"}]
+JSON
+log_failed 'tests/projected.py::test_x' > "$SCEN/log-14901"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-proj.txt"
+grep -q '^examined=0$' "$TMP/cfs-rep-proj.txt" \
+  && pass "(p) the REAL projection drives the rule (a JSON listing through the real --jq)" \
+  || fail "(p) the projection did not carry the identity — every line opaque? $(tr '\n' ' ' < "$TMP/cfs-rep-proj.txt") $(tr '\n' ' ' < "$TMP/cfs-err")"
+grep -q 'superseded by run 14903' "$TMP/cfs-err" \
+  && pass "(p)  …and the supersession is the one the real projection produced" \
+  || fail "(p)  …no supersession happened, so the projection is not reaching the rule: $(tr '\n' ' ' < "$TMP/cfs-err")"
+grep -q '^pending=0$' "$TMP/cfs-rep-proj.txt" \
+  && pass "(p)  …and the null conclusion came through as the sentinel, not as a pending run" \
+  || fail "(p)  …a null conclusion read as pending: $(tr '\n' ' ' < "$TMP/cfs-rep-proj.txt")"
+
+# (q) A RUN REFERENCE WITH MORE THAN ONE COLON IS UNREADABLE IDENTITY (code-review
+# cycle 5, P2-7). Every consumer of this field takes the LAST colon-separated
+# segment (`${runref##*:}`, ci-failure-set.sh:498/556/608/668), while this rule ranks
+# the id it read FIRST — so a second colon would leave the rule reasoning about one
+# run and the log fetch inspecting another. `gh` cannot emit it (a hex sha and a
+# numeric id), so this is defence in depth, not a fix for an observed failure — but
+# the guard must still be able to FAIL, or it is decoration.
+new_scen supersededextracolon
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 15003 "$SS_WFID" "$SS_WFNAME" "$SS_EV"
+  printf '%s\t%s\t%s:%s:9\t%s\t%s\t%s\t%s\n' completed failure "$SS_HEAD" 15001 "$SS_WFID" "$SS_WFNAME" "$SS_EV" main
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-col.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-col.txt" \
+  && pass "(q) a run reference with a second colon is opaque (kept, never superseded)" \
+  || fail "(q) a green superseded a red whose run reference the two readers would read differently: $(tr '\n' ' ' < "$TMP/cfs-rep-col.txt")"
+grep -q 'an unparsable run reference' "$TMP/cfs-err" \
+  && pass "(q)  …and the unparsable reference is NAMED on stderr" \
+  || fail "(q)  …but the refusal to decide is silent: $(tr '\n' ' ' < "$TMP/cfs-err")"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
