@@ -658,14 +658,20 @@ run_record_no_gh() { # <verdict> <repo> <pr>
     done <<< "$(printf '%s' "$PATH" | tr ':' '\n')"
     # Fail loudly rather than silently testing the wrong thing: if the shadow
     # cannot run the script, or still resolves gh, this vector would pass for a
-    # reason of its own. RECORD_RC is poisoned so the assertions that follow
-    # cannot pass on the PREVIOUS vector's stale values (that vector's refusal is
-    # the same message this one asserts).
-    if ! PATH="$shadow:${_kept%:}" command -v bash >/dev/null 2>&1; then
+    # reason of its own. Two details matter:
+    #   * each probe runs in a SUBSHELL whose first statement SETS the PATH and
+    #     then clears bash's command hash (`hash -r`). A `PATH=… command -v x`
+    #     prefix assignment does NOT clear the hash, so on a host where bash has
+    #     already resolved `x` the probe consults the stale entry instead of the
+    #     shadow PATH and reports the opposite of the truth.
+    #   * RECORD_RC is poisoned on a vacuity hit so the assertions that follow
+    #     cannot pass on the PREVIOUS vector's stale values (that vector's
+    #     refusal carries the same message this one asserts).
+    if ! ( PATH="$shadow:${_kept%:}"; hash -r; command -v bash >/dev/null 2>&1 ); then
         bad "C3 gh-absent vector: the shadow PATH cannot resolve bash — the vector would be vacuous"
         RECORD_RC=99; RECORD_ERR=""; return 0
     fi
-    if PATH="$shadow:${_kept%:}" command -v gh >/dev/null 2>&1; then
+    if ( PATH="$shadow:${_kept%:}"; hash -r; command -v gh >/dev/null 2>&1 ); then
         bad "C3 gh-absent vector: gh is STILL resolvable — the vector would be vacuous"
         RECORD_RC=99; RECORD_ERR=""; return 0
     fi
