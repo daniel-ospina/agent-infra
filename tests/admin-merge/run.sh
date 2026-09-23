@@ -4944,6 +4944,105 @@ grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 2 check(s)" "$SCEN/
   || fail "the unnamed non-red checks vanished: $(grep -m1 'evaluated tree' "$SCEN/out")"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
 
+# ── 57. A POSITIVE DROP COUNT WITH NO TOKEN TEXT IS CLIPPED, NOT COMPLETE ────
+# An empty TOKEN on a DROPPED line (a bare `FAILED` where FAILED is the last
+# field) is a COUNTED drop that renders nothing, so the token block printed the
+# COMPLETE empty-text body directly under a stated positive drop count — the
+# COMPLETE/CLIPPED claim contradicted the count it had just reported.
+echo "== 57. a positive drop count with no token text renders CLIPPED, not COMPLETE (#1353) =="
+
+# 36 zeros, so a fixture sha below is exactly 40 hex chars (also defined at 55).
+HEX36="000000000000000000000000000000000000"
+
+# log_bare_failed — a `FAILED` record with NOTHING after it: the parser's
+# candidate is the EMPTY string, a DROPPED drop whose token text renders blank.
+log_bare_failed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED\n'; }
+
+# (a) THE REPRODUCTION. One real FAILED id (exempted by main) + TWO bare FAILED
+# lines: the count is 2, the token text renders blank, and the evidence used to
+# claim the sets were COMPLETE.
+new_scen attribution-empty-token-text
+HEAD_AT5="c1c1${HEX36}"
+printf '%s\n' "$HEAD_AT5" > "$SCEN/head"
+FAIL_AT5='tests/test_other.py::test_red_on_main'
+lane_fail "$HEAD_AT5" 8805 > "$SCEN/runs-$HEAD_AT5"
+{ log_failed "$FAIL_AT5"; log_bare_failed; log_bare_failed; } > "$SCEN/log-8805"
+main_red_n mainat5 9005 3 "$FAIL_AT5" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a PR with one exempt failure and TWO text-less drops still merges (exit 0)" \
+  || fail "the attribution disclosure blocked a merge it must not (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "the parser reported 2 drop(s) but named no token text" "$SCEN/err" \
+  && pass "the RAIL'S OUTPUT states the count AND that no token text was named" \
+  || fail "the rail does not state the missing token text: $(grep -m1 'DROP' "$SCEN/err")"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=2 | main=0" "$SCEN/comment" && pass "the POSTED EVIDENCE states the drop count (PR=2, main=0)" \
+    || fail "the evidence does not state the drop counts: $(grep -m1 'Attribution' "$SCEN/comment")"
+  grep -q "NO token text to render" "$SCEN/comment" \
+    && pass "…and the token block renders the CLIPPED body naming the MISSING text" \
+    || fail "the token block does not name the missing token text"
+  grep -q "every FAILED token was a test id, so the failing sets above are COMPLETE" "$SCEN/comment" \
+    && fail "the evidence claims COMPLETE while stating a positive drop count" \
+    || pass "…and it does NOT claim COMPLETE over a stated positive drop count"
+  grep -q -- "- (HTTP" "$SCEN/comment" && fail "a token appeared from nowhere" || pass "…with no fabricated token"
+else
+  fail "no evidence comment posted for the text-less-drop case"
+fi
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (b) THE GUARD THE OTHER WAY — a REAL token still renders as a token, and the
+# no-text CLIPPED body must NOT replace a populated token list.
+new_scen attribution-empty-plus-real-token
+HEAD_AT6="c2c2${HEX36}"
+printf '%s\n' "$HEAD_AT6" > "$SCEN/head"
+lane_fail "$HEAD_AT6" 8806 > "$SCEN/runs-$HEAD_AT6"
+{ log_failed "$FAIL_AT5"; log_bare_failed; log_unattributable '(HTTP'; } > "$SCEN/log-8806"
+main_red_n mainat6 9006 3 "$FAIL_AT5" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a text-less drop BESIDE a real token still merges (exit 0)" \
+  || fail "the mixed drop case blocked a sound merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q -- "- (HTTP" "$SCEN/comment" && pass "…and the REAL token is still rendered in the list" \
+    || fail "the real token vanished from the evidence"
+  grep -q "NO token text to render" "$SCEN/comment" \
+    && fail "the no-text CLIPPED body replaced a populated token list" \
+    || pass "…and the no-text CLIPPED body is NOT used when token text exists"
+  grep -q "PR=2 | main=0" "$SCEN/comment" && pass "…with the count (2 drops: one text-less, one real token)" \
+    || fail "the mixed count is wrong"
+else
+  fail "no evidence comment posted for the mixed case"
+fi
+
+# (c) THE OVER-BLOCK GUARD FOR THE COMPLETE BRANCH — a zero drop count still
+# states COMPLETE explicitly (the disclosure stays unconditional).
+new_scen attribution-still-complete
+HEAD_AT7="c3c3${HEX36}"
+printf '%s\n' "$HEAD_AT7" > "$SCEN/head"
+lane_pass "$HEAD_AT7" 8807 > "$SCEN/runs-$HEAD_AT7"
+lane_pass mainat7 8808 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a clean merge still merges (exit 0)" \
+  || fail "the attribution disclosure blocked a clean merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=0 | main=0" "$SCEN/comment" && pass "…and the evidence states ZERO drops" \
+    || fail "the evidence omits the zero drop count"
+  grep -q "every FAILED token was a test id, so the failing sets above are COMPLETE" "$SCEN/comment" \
+    && pass "…and says COMPLETE, not merely empty" \
+    || fail "the COMPLETE claim was lost when the count is zero"
+  grep -q "NO token text to render" "$SCEN/comment" && fail "the CLIPPED body leaked into a zero-drop set" \
+    || pass "…and the CLIPPED body is absent"
+else
+  fail "no evidence comment posted for the complete case"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1

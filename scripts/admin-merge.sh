@@ -267,6 +267,15 @@
 # dropped. A PARTIAL drop does not block: the run yielded ids, and the set is
 # merely CLIPPED — which the evidence states rather than leaving to be inferred.
 #
+# AND THE COMPLETE/CLIPPED CLAIM IS MADE FROM THE COUNT, NOT FROM WHETHER THE
+# RENDERED TOKEN LINES ARE BLANK (#1353). A DROPPED line whose TOKEN TEXT is
+# empty (a bare `FAILED` / `FAILED ` line) is still a counted drop, but it renders
+# nothing — so the token block printed the COMPLETE empty-text body while the
+# attribution line one line above stated a positive drop count, and the evidence
+# contradicted itself. A positive drop count with no non-blank token text now
+# renders a CLIPPED body that NAMES the missing text, instead of a COMPLETE body
+# that denies the count.
+#
 # STALENESS: A RED BASE THE PR HAS NOT MEASURED (#1261, step 4.6). The tree
 # surface above reflects the base AS OF THE PR'S LAST RUN, and GitHub does not
 # reliably re-run PR workflows when the base moves. So a base red that appeared
@@ -2150,7 +2159,7 @@ build_evidence() {
   local head="$1" main_prov="$2" pr_count="$3" main_count="$4"
   local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
   local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}" exempt_raw="${12:-}"
-  local unattr_tokens="${13:-}"
+  local unattr_tokens="${13:-}" unattr_count="${14:-0}"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
@@ -2197,9 +2206,24 @@ build_evidence() {
   # The token text is ESCAPED for this markdown surface only (see
   # evidence_token_escape): the token is NAMED and the evidence stays inert, so
   # #1353's disclosure and #3756's injection pin hold at the same time.
+  #
+  # AND THE EMPTY-TEXT BODY IS CHOSEN FROM THE COUNT, NOT FROM THE RENDERED LINES
+  # (#1353). An empty TOKEN on a DROPPED line (a bare `FAILED`) is a counted drop
+  # that renders nothing: deciding "empty" from the rendered text alone printed
+  # COMPLETE directly under a stated positive drop count, so the COMPLETE claim
+  # contradicted the count the same block had just reported. A positive count with
+  # no non-blank token text renders the CLIPPED body and NAMES the missing text.
+  local unattr_rendered unattr_empty
+  unattr_rendered="$(printf '%s\n' "$unattr_tokens" | evidence_token_escape)"
+  if counter_is_positive "$unattr_count" \
+     && [ -z "$(printf '%s' "$unattr_rendered" | tr -d '[:space:]')" ]; then
+    unattr_empty="⛔ CLIPPED — ${unattr_count} drop(s) were reported with NO token text to render, so the failing sets above are NOT COMPARABLE to a measured zero. The parser COUNTED the drops but named no token for them (#1353)."
+  else
+    unattr_empty="(none — every FAILED token was a test id, so the failing sets above are COMPLETE)"
+  fi
   evidence_list 'FAILED token(s) the parser DROPPED — not test ids, so NOT in any failing set (a CLIPPED set is NOT COMPARABLE to a measured zero, #1319). Rendering: the token text with markdown metacharacters escaped, so the evidence block structure cannot be broken.' \
-    "$(printf '%s\n' "$unattr_tokens" | evidence_token_escape)" \
-    "(none — every FAILED token was a test id, so the failing sets above are COMPLETE)"
+    "$unattr_rendered" \
+    "$unattr_empty"
   printf '\nLists show at most %s entries of %s chars; the full sets are reproducible from the run ids above.\n' \
     "$EVIDENCE_ENTRIES" "$EVIDENCE_WIDTH"
   printf '%s\n' "$flake_line"
@@ -3181,10 +3205,13 @@ $health_line"
   # list follows as its own list block, so a COMPLETE set is distinguishable from
   # a CLIPPED one. Named as its own step so the number is not inferable only from
   # a token list that may be empty for a reason other than "none".
-  local pr_drops main_drops attribution_line unattr_tokens
+  local pr_drops main_drops unattr_total attribution_line unattr_tokens
   pr_drops="$(unattributable_count_of "$TMP/pr-drops.err" "$TMP/pr-drops2.err")"
   main_drops="$(unattributable_count_of "$TMP/main-drops.err")"
   unattr_tokens="$(unattributable_tokens_of "$TMP/pr-drops.err" "$TMP/pr-drops2.err" "$TMP/main-drops.err")"
+  # The TOTAL the empty-text decision reads: every collected drop, so a positive
+  # count with blank token text renders CLIPPED rather than COMPLETE (#1353).
+  unattr_total="$(unattributable_count_of "$TMP/pr-drops.err" "$TMP/pr-drops2.err" "$TMP/main-drops.err")"
   # NOTE: a REAL newline, not `\n` — bash does not expand escapes inside double
   # quotes, and a literal `\n` would ship into the posted evidence.
   attribution_line="Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=${pr_drops} | main=${main_drops}.
@@ -3304,7 +3331,7 @@ $attribution_line"
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
     "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
     "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" \
-    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" > "$TMP/evidence.md"
+    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"
