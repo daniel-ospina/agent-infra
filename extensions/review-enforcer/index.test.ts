@@ -3328,6 +3328,71 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   for (const s of splicingSpellings) {
     ok(hasAdminMergeFlag(`gh pr merge 123 ${s}`), `${JSON.stringify(s)} is a bypass (spliced name or unresolvable value)`);
   }
+  // ── #1420: the ANSI-C rule must NOT fire on a `$` that merely ENDS an
+  // ordinary quoted string.
+  //
+  // The naive `/\$['"]/` test read the closing quote of `"bug$"` as an ANSI-C
+  // opener, so `hasAdminMergeFlag` flipped true; `isAdminMergeCommand`'s
+  // `gh`-word fallback then turned an ordinary READ command into an admin merge
+  // and the gate blocked it with "carries no resolvable PR number". Production
+  // shape: 927 of 981 `merge_gate_block reason=admin_merge_no_evidence` events
+  // carried NO resolvable PR number — a false positive, not a merge.
+  const ansiCFalsePositives = [
+    ['gh label list --repo o/r --limit 5 --json name | grep -E "bug$"', "a regex anchored at end-of-line"],
+    ["gh label list --repo o/r | grep -E 'bug$'", "the same regex in single quotes"],
+    ['grep -E "bug$" file && echo ok', "the anchored regex mid-command"],
+    ["gh pr list --search 'merge$'", "a search term that both ends in `$` and names a merge"],
+  ];
+  // NOT in this list — these are a SIBLING over-block by a different rule
+  // (`hasUnresolvableConstruct && /admin/`, and an ANSI-C quote in a benign
+  // VALUE), still open and tracked as #1421: `gh issue comment 5 --body
+  // $'multi line'`, `echo $'done' && gh issue list`, `git commit -m $'fix:
+  // thing'`, `gh pr view 1 --json body --jq '.body | test("admin$")'`. They are
+  // unchanged behaviour, and asserting them here would force this fix to widen,
+  // which is what made it fail OPEN twice.
+  for (const [c, why] of ansiCFalsePositives) {
+    ok(!hasAdminMergeFlag(c), `#1420: ${why} is not an admin flag: ${JSON.stringify(c)}`);
+    ok(!isAdminMergeCommand(c), `#1420: ...and not an admin merge: ${JSON.stringify(c)}`);
+  }
+  // ...while every ANSI-C shape that can really carry the flag stays caught —
+  // including the FULLY-spliced forms naming neither `merge` nor `admin`.
+  for (const c of [
+    "gh pr merge 999 $'--admin'",
+    "gh pr merge 999 $'--adm\\x69n'",
+    "gh pr merge 999 --adm$'\\x69'n=true",
+    "gh pr merge 999 $'\\x2d\\x2d\\x61dmin'",
+    "gh pr merge 999 $''--admin",
+    "gh pr merge 999 \"$'--admin'\"",
+    "gh p$'r' merge 999 --admin",
+    "gh p$'r' m$'erge' 999 $'\\x2d\\x2d\\x61dmin'",
+    "gh pr m$'erge' 999 $'\\x2d\\x2d\\x61dmin'",
+    // VGATE cycle 2: the SPLICED-VERB + hidden-flag shape that a companion
+    // `merge`/`admin` WORD condition let through — bash runs it as
+    // `gh pr merge 999 --admin`, yet no raw word `merge` or `admin` appears, and
+    // `hasConstructTokenAfter` cannot recover it (`dequote("$'gh'") !== "gh"`).
+    // It is why this fix adds NO companion condition.
+    "$'gh' p$'r' m$'erge' 999 $'\\x2d\\x2d\\x61dmin'",
+  ]) {
+    ok(isAdminMergeCommand(c), `#1420: the ANSI-C admin merge is still caught: ${JSON.stringify(c)}`);
+  }
+  // Fresh-context VGATE cycle 1 on this fix found a FAIL-OPEN: a predicate that
+  // asks quote state whether the `$` is unquoted models ONE shell, so the `$'`
+  // of `bash -c "gh pr merge $'\x2d…'"` — inside the OUTER shell's double-quoted
+  // region but evaluated by the INNER shell — slipped through. Text shape, not
+  // quote state, is what separates the `$`-at-end-of-string false positive from
+  // these; every nested-shell/escaped spelling must stay caught.
+  for (const c of [
+    `bash -c "gh pr merge $'\\x2d\\x2d\\x61dmin'"`,
+    `sh -c "gh pr merge $'\\x2d\\x2d\\x61dmin'"`,
+    `sudo bash -lc "gh pr merge $'\\x2d\\x2d\\x61dmin'"`,
+    `bash -c "gh pr merge $'\\x2d\\x2d\\x61dmin' 999"`,
+    `echo "gh pr merge $'\\x2d\\x2d\\x61dmin'" | bash`,
+    `bash -c "gh pr merge 999 $'--admin'"`,
+    `bash -c "$'gh' p$'r' m$'erge' 999 $'\\x2d\\x2d\\x61dmin'"`,
+    String.raw`bash -c 'gh pr merge $'\''\x2d\x2d\x61dmin'\'''`,
+  ]) {
+    ok(isAdminMergeCommand(c), `#1420: the nested-shell/escaped ANSI-C admin merge is still caught: ${JSON.stringify(c)}`);
+  }
   // `gh pr "merge"` is the same family one level up: bash re-joins it, so the
   // CALLER's guard must see the normalized form or the whole gate is skipped.
   ok(isGhPrMergeCommand('gh pr "merge" 123 --admin=true'), 'gh pr "merge" is recognized as a merge command (normalized)');

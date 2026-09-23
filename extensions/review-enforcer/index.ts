@@ -242,7 +242,9 @@ function normalizeForFlagScan(command: string): string {
  * scanner REFUSES rather than guesses at?
  *
  *   - ANSI-C / locale quoting: `$'--admin'`, `$'--adm\x69n'`, `--adm$'\x69'n`.
- *     Decoding `\xNN` is exactly the guessing this gate must not do.
+ *     Decoding `\xNN` is exactly the guessing this gate must not do. WHICH
+ *     `$'` counts is decided by `hasLiveAnsiCQuote` — the naive `$['"]` test was
+ *     a false-red generator (#1420).
  *   - a substitution inside a LITERAL `--` token: `--admi${X}n=true`,
  *     `--admin=$(echo true)`, `` --admin=`true` ``.
  *
@@ -255,8 +257,75 @@ function normalizeForFlagScan(command: string): string {
  * inside a dash-token" in general: it covers the case where the `--` is visible.
  */
 function isUnresolvableFlagToken(command: string, probe: string): boolean {
-  if (/\$['"]/.test(command)) return true;
+  if (hasLiveAnsiCQuote(command)) return true;
   return /--[^\s]*[$`]/.test(probe);
+}
+
+/**
+ * Does the command carry a LIVE ANSI-C / locale quote (`$'…'` / `$"…"`)?
+ *
+ * The naive `/\$['"]/` test read a `$` that merely ENDS an ordinary quoted string
+ * as an ANSI-C opener — `grep -E "bug$"` contains `$"` — so read-only commands
+ * were classified as admin merges and blocked (#1420: 981 production
+ * `admin_merge_no_evidence` blocks, 927 of them carrying no resolvable PR
+ * number, i.e. never a merge at all).
+ *
+ * The judgement that separates the two is whether the quote after the `$` OPENS a
+ * quoted region or CLOSES one. The raw text answers it: a genuine opener begins a
+ * quoted PAYLOAD — an escape, a flag character, anything the shell consumes as
+ * part of the word — while the `$`-at-end-of-string shape leaves a token
+ * separator (or nothing at all) behind.
+ *
+ * ⛔ This is PROVABLY A SUBSET of the test it replaces, which is the whole point:
+ * `hasLiveAnsiCQuote(c)` implies `/\$['"]/.test(c)`, so the change can only REMOVE
+ * detections, never add one. The only detections it removes are the
+ * `$`-at-end-of-a-quoted-string shapes, and those cannot carry a flag. Nothing
+ * here needs a companion tightening — a companion is what makes an over-block fix
+ * into a fail-OPEN, which is exactly what a first attempt at this did (see the
+ * two VGATE notes below).
+ *
+ * ⛔ The skip is narrow and cannot hide a flag. The only shapes skipped are
+ * ANSI-C payloads that BEGIN with a separator, and such a payload is never a
+ * flag: `gh pr merge 1 $' --admin'` hands gh one argument, ` --admin` with a
+ * leading space, which Go's flag parser does not read as `--admin` (verified
+ * against bash: the word is a single argv element whose first character is the
+ * separator). Every other shape — `$''`, `$'--admin'`, `--adm$'\x69'n`,
+ * `"$'--admin'"` — is still flagged. Pinned by the adversarial cases in
+ * index.test.ts.
+ *
+ * ⛔ It deliberately does NOT consult quote STATE. `unquotedMask` models ONE
+ * shell, and the `$'` of `bash -c "gh pr merge $'\x2d\x2d\x61dmin'"` sits inside
+ * the outer shell's double-quoted region while the INNER shell evaluates it to
+ * `--admin`, so a mask-based "is the `$` unquoted?" test let a real hidden flag
+ * through (fresh-context VGATE cycle 1). The same single-shell blind spot also
+ * skips the `'\''`-escaped spelling; this text test catches both, because the
+ * character after that closing quote is a backslash, not a separator.
+ *
+ * ⛔ It also deliberately does NOT gate on the words `merge`/`admin`. That was
+ * VGATE cycle 2's fail-open: `$'gh' p$'r' m$'erge' 999 $'\x2d\x2d\x61dmin'`
+ * reaches gh as a real admin merge while naming neither word, and the downstream
+ * `hasConstructTokenAfter` cannot recover it (it compares
+ * `dequote(token) === "gh"`, which `$'gh'` never matches). A rule that fires on
+ * MORE than the old test cannot be fixed by adding a condition that fires on
+ * LESS.
+ *
+ * A sibling over-block by a DIFFERENT rule — `hasUnresolvableConstruct &&
+ * /admin/` firing on `--jq '.x | test("admin$")'`, and an ANSI-C quote in a
+ * benign VALUE — is tracked as #1421 and is deliberately not addressed here, so
+ * that this change stays a strict subset of the behaviour it replaces.
+ */
+const ANSI_C_PAYLOAD_SEPARATOR_RE = /[\s;&|)]/;
+
+function hasLiveAnsiCQuote(command: string): boolean {
+  for (let i = 0; i < command.length - 1; i++) {
+    if (command[i] !== "$") continue;
+    const q = command[i + 1];
+    if (q !== "'" && q !== '"') continue;
+    const after = command[i + 2];
+    if (after === undefined || ANSI_C_PAYLOAD_SEPARATOR_RE.test(after)) continue;
+    return true;
+  }
+  return false;
 }
 
 /**
