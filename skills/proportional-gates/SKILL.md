@@ -92,6 +92,14 @@ Before deciding what gates to run, classify the change:
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers.
 
+**The Low row is a property of the CHANGE, not of the linked issue (#1348).** A docs/stylesheet-only
+PR may be linked to a `complexity:standard` issue and still be Low. The merge gate represents that
+with the `clean-low` verdict (`scripts/record-review.sh`), whose class is deliberately **NARROWER**
+than this table's Low row: **config and strings are excluded**, because a config change is where a
+runtime-behaviour change hides (agent-infra #1348's own motivating regression, #4708, was a config
+change), and so are root instruction files and any enforcement input. Its guard is fail-closed — an
+unreadable or truncated diff is never certified Low. See the `OVERRIDES:` line on agent-infra #1348.
+
 **Adversarial domain (bound: 2 cycles) — orthogonal to the rows above.** For gate/enforcement code whose correctness is "an attacker cannot make it fail open" (argv/path/symlink resolution, working-tree discard, merge and verification gates), the budget is bounded by the **declared threat surface**, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. A fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) is this domain's clean exit — a literal `NO ISSUES FOUND` is not required; when the merge rests on threat-list coverage, disclose it in the PR body as `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`. The declaration is mandatory at scoping (`issue-scoping` §Adversarial Threat Surface). Statement of record: `AGENTS.md` §Hard Cap.
 <!-- adversarial-bound: cap=2 -->
 

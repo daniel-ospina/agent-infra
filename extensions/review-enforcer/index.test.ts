@@ -50,6 +50,8 @@ import {
   evidenceBodyIsCertifying,
   evaluateAdminMergeGate,
   getPrComments,
+  ACCEPTED_VERDICTS,
+  isAcceptedVerdict,
   _setRunGhOverride,
   BLOCK_MESSAGE,
   MICRO_BLOCK_MESSAGE,
@@ -231,6 +233,84 @@ test("allow: clean-micro verdict with matching head", () => {
   const rec = { ...cleanRecord, verdict: "clean-micro" };
   const r = evaluateMergeGate(138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" });
   equal(r.status, "allow");
+});
+
+// ── #1348: the clean-low verdict (C7) ─────────────────
+// The local merge gate accepts clean-low when, and only when, the record is
+// head-bound — exactly the same binding `clean` and `clean-micro` get. It does
+// NOT re-derive the content shape: the record IS the attestation, and the only
+// place the shape can be read is the producer's guard in record-review.sh.
+test("allow: clean-low verdict with matching head", () => {
+  const rec = { ...cleanRecord, verdict: "clean-low" };
+  const r = evaluateMergeGate(138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" });
+  equal(r.status, "allow");
+  ok((r as any).message.includes("clean-low"), "pass message names the verdict it acted on");
+});
+
+test("block: clean-low with an advanced head (same binding as clean)", () => {
+  const rec = { ...cleanRecord, verdict: "clean-low" };
+  const r = evaluateMergeGate(138, rec, "b".repeat(40), { source: "record", repo: "owner/repo" });
+  equal(r.status, "block");
+  ok((r as any).reason.includes("advanced"));
+});
+
+test("block: clean-low with an advanced head → reason head_advanced, not verdict_not_clean", () => {
+  const rec = { ...cleanRecord, verdict: "clean-low" };
+  equal(mergeGateBlockReason(rec), "head_advanced");
+  const file = tempAuditFile();
+  const r = evaluateMergeGate(138, rec, "b".repeat(40), { source: "record", repo: "owner/repo" });
+  logMergeGateDecision(138, r as any, rec, file);
+  equal(readAuditLines(file)[0].reason, "head_advanced");
+});
+
+test("block: clean-low with an unverifiable head does NOT fail open for a task sub-agent", () => {
+  const rec = { ...cleanRecord, verdict: "clean-low" };
+  const r = evaluateMergeGate(138, rec, null, { source: "record", repo: "owner/repo" }, true);
+  equal(r.status, "block");
+});
+
+test("vocabulary is CLOSED: an out-of-vocabulary verdict still blocks", () => {
+  // Widening the accepted set to `clean-low` must not become `verdict=.*` —
+  // a near-miss token (clean-high, clean-lowx, CLEAN-LOW) stays refused.
+  for (const v of ["clean-high", "clean-lowx", "CLEAN-LOW", "clean-microx", "", "fail"]) {
+    const rec = { ...cleanRecord, verdict: v };
+    equal(isAcceptedVerdict(v), false, `isAcceptedVerdict(${JSON.stringify(v)}) is false`);
+    equal(mergeGateBlockReason(rec), "verdict_not_clean");
+    const r = evaluateMergeGate(138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" });
+    equal(r.status, "block", `verdict ${JSON.stringify(v)} blocks`);
+    ok((r as any).reason.includes("clean-low"), "refusal names the full accepted vocabulary");
+  }
+});
+
+test("vocabulary: ACCEPTED_VERDICTS is exactly the three verdicts (single source of truth)", () => {
+  equal(ACCEPTED_VERDICTS.join(","), "clean,clean-micro,clean-low");
+  // Both gate sites consult the list, so the allowlist and the block-reason
+  // classifier cannot drift apart.
+  for (const v of ACCEPTED_VERDICTS) ok(isAcceptedVerdict(v), `${v} accepted`);
+});
+
+test("declared boundary: the local gate does NOT re-derive the content shape", () => {
+  // #1348 declares this out of scope deliberately: a local shape re-check
+  // would be a second, weaker writer of the Low class. Pinned so that adding
+  // one later is a decision, not an accident.
+  const rec = { ...cleanRecord, verdict: "clean-low" };
+  const r = evaluateMergeGate(138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" });
+  equal(r.status, "allow");
+});
+
+test("C7 drift pin: the verdict vocabulary is CONSULTED, never re-literalised", () => {
+  // The pre-change code expressed the vocabulary ad hoc, twice, as
+  // `record.verdict !== "clean" && record.verdict !== "clean-micro"`. That is
+  // exactly what this change replaced, and exactly what must not come back —
+  // a re-introduced literal comparison would silently exclude clean-low at one
+  // site. A source-shape pin (the repo's drift-pin idiom) is the durable form
+  // of the RED claim: the pre-change expression is asserted ABSENT.
+  const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  ok(!/record\.verdict !== "clean"/.test(src), "no ad-hoc `record.verdict !== \"clean\"` comparison");
+  ok(!/record\.verdict === "clean"/.test(src), "no ad-hoc `record.verdict === \"clean\"` comparison");
+  // Both acceptance sites must route through the shared predicate.
+  const consults = (src.match(/isAcceptedVerdict\(record\.verdict\)/g) ?? []).length;
+  equal(consults, 2, "both verdict sites consult isAcceptedVerdict (allowlist + block-reason)");
 });
 
 test("fail-open: unresolvable repo (fallback) → warning with repo advice, not block", () => {

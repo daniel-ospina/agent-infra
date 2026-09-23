@@ -975,6 +975,25 @@ export async function getPrHeadSha(pr: number, ctx: RepoContext): Promise<string
   }
 }
 
+/**
+ * #1348 — the verdicts that unlock a merge, in ONE place. The allowlist in
+ * evaluateMergeGate and mergeGateBlockReason used to be two independent
+ * expressions of the same vocabulary, so a new verdict added to one site and
+ * forgotten at the other would silently mislabel the merge telemetry. Both now
+ * consult this list.
+ *
+ * `clean-low` attests the Low risk row of the canonical tier table (agent-infra
+ * #1348): every changed path of the recorded revision is prose or a stylesheet. This gate deliberately does NOT
+ * re-derive that shape — the record IS the attestation, and the only place the
+ * shape can be read is the producer's clean-low guard in record-review.sh. A
+ * local re-check here would be a second, weaker writer of the class.
+ */
+export const ACCEPTED_VERDICTS: readonly string[] = ["clean", "clean-micro", "clean-low"];
+
+export function isAcceptedVerdict(verdict: string): boolean {
+  return ACCEPTED_VERDICTS.includes(verdict);
+}
+
 export type MergeGateResult =
   | { status: "block"; reason: string }
   | { status: "failopen"; warning: string }
@@ -1002,8 +1021,9 @@ export function evaluateMergeGate(
           "✅ Review enforcement (merge registry) gate is working correctly.",
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
           "   → The parent session must record the review for the PR's tier:",
-          "   →   Micro issue (complexity:micro): record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-          "   →   Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
+          "   → Micro issue (complexity:micro): record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+          "   → Content-only diff (docs/ or a stylesheet, any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
           "   → The bypass flag does NOT unlock sub-agent merges (#285).",
         ]
       : [
@@ -1011,6 +1031,7 @@ export function evaluateMergeGate(
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
           "   → Micro issue (complexity:micro): complete the micro flow (pre-flight + a review dispatch naming the diff), then",
           "   →   record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+          "   → Content-only diff (docs/ or a stylesheet, any tier, no code paths): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
           "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), then",
           "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
           "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
@@ -1020,15 +1041,16 @@ export function evaluateMergeGate(
       reason: lines.join("\n"),
     };
   }
-  if (record.verdict !== "clean" && record.verdict !== "clean-micro") {
+  if (!isAcceptedVerdict(record.verdict)) {
     // #513: two-path remediation — the record's tier is not readable from the
     // record (only the verdict), so both paths are named statically.
     return {
       status: "block",
       reason: [
-        `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only "clean" or "clean-micro" unlocks a merge.`,
+        `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only "clean", "clean-micro" or "clean-low" unlocks a merge.`,
         "   → Micro issue (complexity:micro): re-record via the micro flow: record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-        "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
+        "   → Content-only diff (docs/ or a stylesheet, any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+        "   → Standard/complex issue with any code path: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
       ].join("\n"),
     };
   }
@@ -1114,7 +1136,7 @@ export function logGateEvent(
 // block branches (no review record / non-clean verdict / head advanced).
 export function mergeGateBlockReason(record: ReviewRecord | null): string {
   if (!record) return "no_review_record";
-  if (record.verdict !== "clean" && record.verdict !== "clean-micro") return "verdict_not_clean";
+  if (!isAcceptedVerdict(record.verdict)) return "verdict_not_clean";
   return "head_advanced";
 }
 

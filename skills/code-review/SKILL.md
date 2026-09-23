@@ -1184,6 +1184,56 @@ NOT self-certify a fresh record: if the gate blocks, run the review
 appropriate to the tier (this skill at standard/complex; the micro flow at
 micro), then record.
 
+### Step 10b — Low-risk content-only recording: verdict `clean-low` (#1348)
+
+The canonical tier table's Low row (docs/CSS/strings → a single reviewer, no
+cycle loop) had no representation in the merge gate. A PR whose DIFF is
+content-only but whose LINKED ISSUE is `complexity:standard`/`complex` could
+record neither verdict honestly: `clean` attests a code-review convergence
+that, per the Low row, did not happen; `clean-micro` is refused (exit 4) by
+the #513 tier guard, because that guard reads the LINKED ISSUE's tier, not the
+DIFF's shape. `clean-low` is that missing representation. It attests:
+
+> every changed path of the recorded revision is prose or a stylesheet — no
+> program code, no config file, no enforcement input — and the Low row's single
+> reviewer pass ran. (The class is path+extension based and does not consult a
+> build graph: a repo may package or consume a `docs/**` file as build data.
+> That is accepted, declared, and the attestation wording is scoped to what the
+> guard can actually read.)
+
+Use it ONLY when the whole diff is content-only. `record-review.sh` verifies the
+shape itself, from the diff AT THE RECORDED SHA, and REFUSES (exit 4, no record,
+no marker) otherwise. The class is deliberately NARROWER than the tier table's
+Low row: **config and i18n strings are excluded** (a config change is where a
+runtime-behaviour change hides), and so are root-level instruction files
+(`AGENTS.md`, `MEMORY.md`, `VENDOR.md`), `skills/**`, `.github/**`,
+`templates/**`, `scripts/**` and `extensions/**`. Admitted: `docs/**` with a
+content extension (`.md`, `.markdown`, `.txt`, `.rst`, `.adoc`, `.css`,
+`.scss`) and the named root prose files (`README.md`, `CHANGELOG.md`,
+`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`). `.mdx` and `.html` are
+NOT admitted — both are build-consumed program content.
+
+```bash
+# ~/.pi/agent/scripts/record-review.sh is not on PATH — use the explicit path.
+~/.pi/agent/scripts/record-review.sh <PR_NUMBER> <FULL_HEAD_SHA> clean-low <owner/repo>
+```
+
+Every guard arm is FAIL-CLOSED — an unverifiable shape is never "certified
+Low". Unlike `clean-micro`, whose fail-open arm is safe because its label only
+cross-checks a flow that already ran, there is no second evidence behind
+`clean-low`: the shape IS the attestation. Refused: repo undetectable or `gh`
+missing; the PR-meta or diff read fails; an empty file list; a file list at
+GitHub's 300-entry compare cap (it may be truncated); a distinct-path count
+that disagrees with the PR's `.changed_files`; a malformed diff row, a rename
+without its old path, a copy, or an unknown status; `--force-stale` (the
+attestation must describe the revision a consumer will actually read); and any
+path outside the class — including a content-only path mixed into a diff that
+also touches code. Re-record at the current head after any push.
+
+The local merge gate accepts `clean-low` under exactly the same head binding as
+`clean`; it does NOT re-derive the content shape (the record is the
+attestation, and the producer guard is the only place the shape is read).
+
 ## Standard-Tier Review (`--standard-tier`)
 
 Runs 2 agents. Used when full review is disproportionate.
