@@ -503,11 +503,24 @@ POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 FAILSAFE_RERUN_TIMEOUT="${ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK:-3900}"
 RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 
-# The lane-run projection, mirrored from ci-failure-set.sh's LANE_RUN_JQ. Used
-# ONLY to locate a PENDING run id for the lane-terminal diagnostic: the parser's
-# provenance file records the FAILING runs, and a pending run has no conclusion,
-# so its id never reaches that file.
-LANE_RUN_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha):\(.databaseId)"'
+# The lane-run projection, mirrored from ci-failure-set.sh's LANE_RUN_JQ, and used
+# by BOTH the pending-run diagnostic and lane_shard_set's coverage listing.
+#
+# DO NOT simplify the `if … == ""` to `//` (#1368). Two facts, both load-bearing:
+#
+#   1. All three fields must be NON-EMPTY. `lane_shard_set` splits this line with
+#      `IFS=$'\t' read`, and TAB is IFS WHITESPACE, so adjacent tabs collapse into
+#      one delimiter and the payload shifts into the wrong variable — `id` comes out
+#      empty and the guard refuses the listing.
+#   2. `(.conclusion // "-")` does NOT fix it: jq's `//` fires only on false/null,
+#      and an empty string is neither.
+#
+# And the sentinel must not be a conclusion token, or the `case "$conclusion"`
+# statements in ci-failure-set.sh's collect_union will credit it. `"-"` is not one.
+#
+# ci-failure-set.sh holds this same expression by design; see its copy for the other
+# splitter.
+LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
@@ -2244,11 +2257,16 @@ build_evidence() {
 # no — a gate cannot adjudicate causation, and accepting it once lets the next
 # genuinely-new failure in that file ride the same argument).
 #
+# The UNIT is the failure's own grouping: a pytest nodeid groups by FILE (before
+# the first `::`), a guard-step identity (#4469, `guard-step::<step>::<shape>`)
+# groups by STEP — it has no `.py` path, and reporting the bare `guard-step`
+# prefix would name the whole mechanism instead of the failing check.
+#
 #   measured on this lane, not present on main
-#       main's baseline carries a failure in the SAME test file, so the lane is
-#       demonstrably measuring that file and does not show this test red.
+#       main's baseline carries a failure in the SAME unit, so the lane is
+#       demonstrably measuring it and does not show this one red.
 #   not measurable on this lane
-#       main's baseline carries NO failure in that file. A FAILURE-ONLY baseline
+#       main's baseline carries NO failure in that unit. A FAILURE-ONLY baseline
 #       cannot tell "green on main" from "never run on main", so absence is NOT
 #       evidence of novelty — the rail must not call it "unique to this PR".
 #       (B1: CI's docker lane reproduces ZERO occurrences of the embedded lane's
@@ -2256,10 +2274,19 @@ build_evidence() {
 #       wording asserted uniqueness with nothing to compare against.)
 attribute_residual() {
   local residual="$1" mainfails="$2" nodeid file main_files=""
-  [ -s "$mainfails" ] && main_files="$(sed 's/::.*//' "$mainfails" | sort -u)"
+  if [ -s "$mainfails" ]; then
+    main_files="$(
+      sed '/^guard-step::/d; s/::.*//' "$mainfails"
+      sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+    )"
+    main_files="$(printf '%s\n' "$main_files" | sort -u)"
+  fi
   while IFS= read -r nodeid; do
     [ -n "$nodeid" ] || continue
-    file="${nodeid%%::*}"
+    case "$nodeid" in
+      guard-step::*::*) file="${nodeid#guard-step::}"; file="${file%%::*}" ;;
+      *) file="${nodeid%%::*}" ;;
+    esac
     if [ -n "$main_files" ] && grep -qxF -- "$file" <<<"$main_files"; then
       printf '   %s\n      -> measured on this lane, not present on main\n' "$nodeid"
     else
@@ -2542,12 +2569,28 @@ main() {
   fi
   # ── 1c. EVERY FAILING RUN MUST BE ATTRIBUTED (cycle-3 review) ────────────
   # `examined` counts the lane's failing runs; `extracted` counts those whose log
-  # yielded at least one `FAILED <nodeid>` line. A failing run that contributes
-  # NOTHING leaves the residual UNKNOWN while the certificate would print
-  # `PR failing: 0` for a lane that is RED — a FALSE certificate, the one severity
-  # this rail exists to prevent (the cycle-3 repro: a head run failing with
-  # `ImportError: no module named y` certified as zero-residual, and the rail
-  # merged). A gate whose output authorises a bypass fails CLOSED here.
+  # yielded at least one failure IDENTITY — a `FAILED <nodeid>` line, or (since
+  # #4469) an attributable guard-step error annotation FROM THE RUN'S ROOT
+  # FAILING STEP. A failing run
+  # that contributes NOTHING leaves the residual UNKNOWN while the certificate
+  # would print `PR failing: 0` for a lane that is RED — a FALSE certificate, the
+  # one severity this rail exists to prevent (the cycle-3 repro: a head run
+  # failing with `ImportError: no module named y` certified as zero-residual, and
+  # the rail merged). A gate whose output authorises a bypass fails CLOSED here.
+  #
+  # #4469 WIDENED WHAT IS PARSEABLE, IT DID NOT WEAKEN THE REFUSAL: a guard-step
+  # failure becomes an id so it is COMPARED like a test nodeid, while a run
+  # carrying neither a nodeid nor a substantive annotation (the runner's generic
+  # `Process completed with exit code <N>.` is not one) still trips this block.
+  # Three conditions carry that, all in `guard_step_failures`: the annotation must
+  # come from a step the RUNNER marked failed; the run's ROOT failing step (keyed
+  # by job+step, because matrix legs use the same step NAMES) must itself yield an
+  # identity; and a step showing pytest's own `E   <exception>` output must yield a
+  # NODEID. So neither a sibling — nor a same-step — annotation can stand in for an
+  # unparseable pytest failure (the cycle-3 false certificate, pinned by
+  # tests/admin-merge/run.sh section 50(d)). What remains is an unparseable failure
+  # that leaves no pytest-shaped line and is not the root: the declared residual,
+  # agent-infra #1366.
   #
   # ORDER MATTERS: this sits AFTER the not-finished / not-tested diagnostics. Run
   # first, an absent or unreadable report made THIS the reported reason, masking the
@@ -2568,7 +2611,8 @@ main() {
   fi
   if [ "$pr_extracted" -lt "$pr_examined" ]; then
     say_err "⛔ admin-merge: BLOCKED — $((pr_examined - pr_extracted)) of $pr_examined failing PR run(s)"
-    say_err "   yielded NO parseable 'FAILED <nodeid>' line, so their failures are NOT in the"
+    say_err "   yielded NO parseable failure identity (neither a 'FAILED <nodeid>' line nor an"
+    say_err "   attributable guard-step '::error::' annotation), so their failures are NOT in the"
     say_err "   set and 'blocked by the decision: 0' would be a false certificate (lane: $lane)."
     say_err "   Either the run failed outside the test step (fix it), or the log format moved"
     say_err "   and the parser needs updating. This is a refusal, not a comparison."
@@ -3246,7 +3290,7 @@ $attribution_line"
   # #1261 — AND THE MESSAGE MUST SAY WHICH SET WAS MEASURED AND WHY IT IS EMPTY.
   # "no failing runs" and "I did not look" are different facts, and the old line
   # ("nothing was compared") left both behind one glyph. A failing run whose log
-  # yielded no parseable 'FAILED <nodeid>' line already BLOCKS on the PR side
+  # yielded no parseable failure identity already BLOCKS on the PR side
   # (step 1c), and a lane that never TESTED main already BLOCKS (step 2b) — so an
   # empty set HERE is one of exactly two things, and each is named per side.
   # #1319 adds the third: the two sides must also have run the SAME LANE, which
@@ -3315,7 +3359,7 @@ $attribution_line"
 ⚠️ vacuous comparison — no failure was compared, because NEITHER measured set carried one.
    measured sets: PR failing runs=0 | main failing runs=0 (lane: $lane)
    lane parity: $parity_evidence
-   PR side: ${pr_examined:-0} failing run(s) of ${pr_completed:-0} completed / ${pr_tested:-0} tested for head $head (${pr_pending:-0} pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable 'FAILED <nodeid>' line would have BLOCKED at step 1c, not read as zero.
+   PR side: ${pr_examined:-0} failing run(s) of ${pr_completed:-0} completed / ${pr_tested:-0} tested for head $head (${pr_pending:-0} pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
    main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b).
    main check surface: $BASE_STATUS — $BASE_RED failing of $BASE_TOTAL measured, $BASE_PENDING pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: $TREE_STATUS — $TREE_RED failing of $TREE_TOTAL measured, $TREE_PENDING pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.

@@ -11,8 +11,18 @@
 #   1. lists the FAILING check runs for a selector (a PR head, a commit, or the
 #      last N runs on main);
 #   2. fetches each failing run's failed-step log (`gh run view --log-failed`);
-#   3. extracts `FAILED <nodeid>` lines and emits a sorted, unique, one-test-
-#      per-line set.
+#   3. extracts `FAILED <nodeid>` lines AND attributable GUARD-STEP failures
+#      (#4469 — a substantive GitHub Actions error annotation in a step the
+#      RUNNER marked failed, when the run's ROOT failing step also yields an
+#      identity and no step showed an UNCLASSIFIED pytest failure), and emits a
+#      sorted, unique, one-identity-per-line set.
+#
+# Guard-step attribution exists so a guard failure is COMPARED against main like a
+# test nodeid instead of tripping the caller's fail-closed refusal. The refusal is
+# NOT weakened: the runner's own `Process completed with exit code <N>.` is never
+# an identity, an annotation from a step that did not fail the run is never one, a
+# sibling annotation may not stand in for an unparseable ROOT failure, and a step
+# showing pytest's `E   <exception>` output must yield a NODEID.
 #
 # Modes:
 #   --pr <N>                  failing set of PR #N's head commit
@@ -80,7 +90,8 @@
 #
 # Exit codes:
 #   0  extracted (the set may legitimately be EMPTY — no failing runs, or
-#      failing runs whose failures are not `FAILED <nodeid>` shaped)
+#      failing runs whose failures carry no parseable identity: neither a
+#      `FAILED <nodeid>` line nor an attributable guard-step annotation)
 #   1  the extraction itself failed (gh error, unreadable log) — the caller MUST
 #      treat this as "cannot certify", never as "no unique failures". A rail
 #      that reads an extraction error as an empty set is vacuously green.
@@ -110,7 +121,9 @@
 #
 # WHAT `--runs-report` MEANS (the completion doctrine):
 #   examined   failing runs in the lane (the ones whose logs are parsed)
-#   extracted  failing runs that yielded at least one `FAILED <nodeid>` line
+#   extracted  failing runs that yielded at least one failure identity — a
+#              `FAILED <nodeid>` line OR (since #4469) an attributable guard-step
+#              error annotation from the run's ROOT failing step
 #   completed  lane runs that FINISHED (any conclusion)
 #   tested     of `completed`, the runs that actually EXERCISED the code:
 #              `success`, `failure`, `timed_out`. NOT `cancelled`/`skipped`
@@ -133,13 +146,15 @@
 # THE MODULE IS RESOLVED FROM THE RAIL'S OWN DIRECTORY (#3756 defect 1 + the
 # decision).
 #   `ci_exemption.py`, shipped next to this script, holds BOTH halves: the ONE
-#   definition of "is this a test id", and the signature/rate exemption decision
+#   definition of a failure KEY — a pytest nodeid OR (since #4469) an
+#   attributable guard-step identity — and the signature/rate exemption decision
 #   built on top of it. The id extraction routes through it (`ci_exemption.py
 #   ids`) instead of a second shell regex, so the rail and the decision can
-#   never disagree about the id universe — and a candidate that is not a test id
-#   is DROPPED, COUNTED and REPORTED as UNATTRIBUTABLE rather than carried as a
-#   failure id (the `may` leak: a garbage id can never match main, so it reads
-#   as "unique to this PR" on every run, forever).
+#   never disagree about the id universe — and a candidate that is NEITHER a test
+#   nodeid NOR an attributable guard-step annotation is DROPPED, COUNTED and
+#   REPORTED as UNATTRIBUTABLE rather than carried as a failure id (the `may`
+#   leak: a garbage id can never match main, so it reads as "unique to this PR"
+#   on every run, forever).
 #
 #   Signature extraction and the exemption decision are the SAME single
 #   implementation (`ci_exemption.py signatures`, `ci_exemption.py decide`). It is
@@ -185,7 +200,16 @@ WORKFLOW_ARGS=()
 # a superseded run is cancelled, not red) — and it is not EVIDENCE either: it
 # counts toward `completed` (the run is over) but never toward `tested` (the run
 # exercised nothing) nor toward `examined` (it has no failing set).
-LANE_RUN_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha):\(.databaseId)"'
+# Byte-identical to admin-merge.sh's LANE_RUN_JQ by design; see the note there.
+# This file splits the line with `${line%%$'\t'*}` / `${rest%%$'\t'*}` (literal TAB,
+# no IFS, so an empty field is harmless here). admin-merge.sh splits it with
+# `IFS=$'\t' read`, where an empty field collapses the delimiter and shifts the
+# payload — which is why every field must be non-empty (#1368).
+#
+# The sentinel must not be a conclusion token: the `case "$conclusion"` statements in
+# collect_union below credit `success|failure|timed_out` to `tested` and
+# `failure|timed_out|startup_failure` to `examined`.
+LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
@@ -432,10 +456,11 @@ collect_union_signatures() {
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
     log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
     if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file" "$tmp_sigs"; return 1; fi
-    # A failing run with NO `FAILED <nodeid>` line contributes nothing to either
-    # table. Skip the extractor for it: the `signatures` CLI exits 1 on a capture
-    # that yields no ids, which is correct for a capture that PROVES nothing but
-    # wrong for a run we already know carried no parseable failure (the
+    # A failing run with NO failure identity contributes nothing to either table
+    # (no `FAILED <nodeid>` line AND no attributable guard-step annotation, #4469).
+    # Skip the extractor for it: the `signatures` CLI exits 1 on a capture that
+    # yields no ids, which is correct for a capture that PROVES nothing but wrong
+    # for a run we already know carried no parseable failure (the
     # `extracted < examined` gate in admin-merge.sh owns that case).
     local ids="" one=""
     ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_sigs"; return 1; }
