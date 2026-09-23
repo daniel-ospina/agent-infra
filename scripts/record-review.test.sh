@@ -702,6 +702,44 @@ run_record_diff 424508 "$STALE" "body
 
 $PM sig=$PSIG" "$D_F"
 [ "$RECORD_RC" = "3" ] && ok "11.9 #784 a clean-micro prior does NOT authorize a clean record (rc 3)" || bad "11.9 #784 clean-micro escalated to clean (rc=$RECORD_RC)"
+
+# 11.10 R1 (merge resolution) — the COMPOSED record must be well-formed JSON in
+# EVERY field combination, and the MB+DIFF combination must actually be REACHED.
+# The merge composed #1348's MB_FIELD (clean-low only) with #2982's DIFF_FIELD
+# (only when a diff hash exists). A doubled comma or a dropped trailing comma
+# keeps every SUBSTRING grep green, so only a JSON parse can falsify it. Before
+# this test the suite reached MB+DIFF ZERO times and never parsed a record at
+# all — an adversarial review found the mutants M1 (`%s%s` -> `%s,%s`), M2
+# (DIFF_FIELD's trailing comma dropped) and M3 (MB_FIELD's) all left it green.
+json_valid() { python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$1" 2>/dev/null; }
+MB="cccccccccccccccccccccccccccccccccccccccc"
+P2="$T/patch-compose.json"; : > "$P2"
+# A: DIFF only — clean, diff hash available.
+run_record_diff 424510 "$SHA" "PR body" "$D_F"
+json_valid "$(Q2 424510)" && ok "11.10 A DIFF-only record is well-formed JSON" || bad "11.10 A DIFF-only record is MALFORMED: $(cat "$(Q2 424510)" 2>/dev/null)"
+# B: MB+DIFF — the combination this merge exists to enable.
+STUB_FILES="docs/plans/2026-09-22-x.md" GH_STUB_PATCH_BODY="$P2" STUB_DIFF_FILE="$D_F" \
+  run_record_verdict clean-low "daniel-ospina/agent-infra" 424511
+json_valid "$(Q2 424511)" && ok "11.10 B MB+DIFF record is well-formed JSON" || bad "11.10 B MB+DIFF record is MALFORMED: $(cat "$(Q2 424511)" 2>/dev/null)"
+assert_contains "$(cat "$(Q2 424511)" 2>/dev/null)" "\"merge_base_sha\":\"$MB\"" "11.10 B carries merge_base_sha"
+assert_contains "$(cat "$(Q2 424511)" 2>/dev/null)" "\"diff_sha256\":\"$DH\"" "11.10 B carries diff_sha256"
+# C: MB only — clean-low with the diff fetch unavailable.
+STUB_FILES="docs/plans/2026-09-22-x.md" GH_STUB_PATCH_BODY="$P2" \
+  run_record_verdict clean-low "daniel-ospina/agent-infra" 424512
+json_valid "$(Q2 424512)" && ok "11.10 C MB-only record is well-formed JSON" || bad "11.10 C MB-only record is MALFORMED: $(cat "$(Q2 424512)" 2>/dev/null)"
+# D: NEITHER — clean, diff fetch forced to fail.
+run_record_diff 424513 "$SHA" "PR body" "$D_F" "1"
+json_valid "$(Q2 424513)" && ok "11.10 D NEITHER record is well-formed JSON" || bad "11.10 D NEITHER record is MALFORMED: $(cat "$(Q2 424513)" 2>/dev/null)"
+# Two cleanups, for two DIFFERENT reasons:
+#  (1) PR NUMBERS. §10 (#1348) runs AFTER this section and its C1 vector asserts
+#      "writes no record" for PR 424600. Reusing any number up there would leave a
+#      record behind and make C1 fail for a reason that has nothing to do with C1.
+#      That is why these use 424510-424513 — a range this suite does not otherwise touch.
+#  (2) The env-prefix assignments LEAK: `VAR=val func` does not restore VAR if it
+#      was previously UNSET (bash semantics), so STUB_FILES/STUB_DIFF_FILE would
+#      persist into §10 and make its code-bearing vectors see a docs-only diff.
+unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
+
 # ─────────────────────────────────────────────────────────────────────────
 # 10. #1348 clean-low content-shape guard — ADVERSARIAL DOMAIN
 # ─────────────────────────────────────────────────────────────────────────
