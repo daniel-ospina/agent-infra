@@ -5335,22 +5335,23 @@ grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-uniq
 # reading is not a remedy the rail may require.
 #
 # THE RULE. A failing run is SUPERSEDED — and not counted at all — when a LATER
-# run of the same (commit, workflow id, workflow name, event) concluded `success`.
-# "Later" is creation order (a run's id increases with creation, the same notion
-# admin-merge.sh's check-surface step uses). Every other conclusion (failure /
+# run of the same (commit, workflow id, workflow name, event, REF) concluded
+# `success`. "Later" is creation order (a run's id increases with creation, the same
+# notion admin-merge.sh's check-surface step uses). Every other conclusion (failure /
 # cancelled / skipped / neutral / startup_failure) is not evidence that the commit
 # is green, so it supersedes nothing — and anything whose identity cannot be read
 # supersedes nothing AND is never superseded. The fixtures below write the parser's
-# OWN 6-field raw projection (`<status>\t<conclusion>\t<sha>:<id>\t<workflow-id>\t<workflow-name>\t<event>`);
+# OWN 7-field raw projection
+# (`<status>\t<conclusion>\t<sha>:<id>\t<workflow-id>\t<workflow-name>\t<event>\t<ref>`);
 # the fake projects it DOWN to the canonical 3 fields for the rail's coverage
 # gate, so scenario (a) exercises both projections at once. NOTHING here asks gh
 # for a CLOCK: §39/§40 forbid `updatedAt` in these scripts, and ordering does not
 # need it.
 echo "== 51. a SUPERSEDED failing run is not a failing run (#1358) =="
 
-lane7() { printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7"; }
-lane7_fail() { lane7 completed failure "$1" "$2" "$3" "$4" "$5"; }
-lane7_pass() { lane7 completed success "$1" "$2" "$3" "$4" "$5"; }
+lane7() { printf '%s\t%s\t%s:%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-main}"; }
+lane7_fail() { lane7 completed failure "$1" "$2" "$3" "$4" "$5" "${6:-main}"; }
+lane7_pass() { lane7 completed success "$1" "$2" "$3" "$4" "$5" "${6:-main}"; }
 # A failing run whose log carries NO test id — the #1358 shape: the failure is a
 # GATE failure (compliance/lock), not a test failure, so no `FAILED <nodeid>` line
 # exists and `examined > extracted` is the only thing the parser can report.
@@ -5628,24 +5629,24 @@ grep -q 'test_stale_on_main' "$TMP/cfs-out" && fail "(k) …but the stale red is
 # and `$6` hold a FRAGMENT of the name and the group key silently STOPS CARRYING
 # THE EVENT. A green run whose own fields shifted the same way then matched that
 # truncated key and superseded a red under a DIFFERENT event, while the disclosure
-# insisted the event matched. Exactly six fields, or the line is opaque — in BOTH
+# insisted the event matched. Exactly seven fields, or the line is opaque — in BOTH
 # directions — and the widening is NAMED (a widened projection is never expected,
 # so silence would hide a parser/projection drift).
 new_scen supersededwide
 printf '%s\n' "$SS_HEAD" > "$SCEN/head"
-{ printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\n' completed success "$SS_HEAD" 14103 "$SS_WFID"
-  printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\tpull_request\n' completed failure "$SS_HEAD" 14101 "$SS_WFID"
+{ printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\tpull_request\n' completed success "$SS_HEAD" 14103 "$SS_WFID"
+  printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\tpull_request\tmain\n' completed failure "$SS_HEAD" 14101 "$SS_WFID"
 } > "$SCEN/runs-$SS_HEAD"
 cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-wide.txt"
 grep -q '^examined=1$' "$TMP/cfs-rep-wide.txt" \
-  && pass "(l) a >6-field line is never superseded (a TAB in the workflow NAME is unreadable identity)" \
+  && pass "(l) a >7-field line is never superseded (a TAB in the workflow NAME is unreadable identity)" \
   || fail "(l) the event left the group key — a shifted green superseded a red at another event: $(tr '\n' ' ' < "$TMP/cfs-rep-wide.txt")"
-grep -q 'MORE than the six fields' "$TMP/cfs-err" \
+grep -q 'this projection defines 7 fields' "$TMP/cfs-err" \
   && pass "(l) …and the widened projection is NAMED on stderr (not silently tolerated)" \
   || fail "(l) …but the widening was silent: $(tr '\n' ' ' < "$TMP/cfs-err")"
 new_scen supersededwidefail
 printf '%s\n' "$SS_HEAD" > "$SCEN/head"
-{ printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' completed success "$SS_HEAD" 14203 "$SS_WFID" Deploy push
+{ printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\tpull_request\tmain\n' completed success "$SS_HEAD" 14203 "$SS_WFID"
   printf '%s\t%s\t%s:%s\t%s\tDeploy\tpush\tpull_request\n' completed failure "$SS_HEAD" 14201 "$SS_WFID"
 } > "$SCEN/runs-$SS_HEAD"
 cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-widef.txt"
@@ -5687,6 +5688,30 @@ cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-blank.txt"
 grep -q '^pending=0$' "$TMP/cfs-rep-blank.txt" \
   && pass "(m2) a blank line is not emitted as a pending run" \
   || fail "(m2) a blank line became pending: $(tr '\n' ' ' < "$TMP/cfs-rep-blank.txt")"
+
+# (n) THE REF IS PART OF THE GROUP KEY (code-review cycle 4). One commit is often
+# the tip of two branches and a `push` lane runs on both; a job is routinely
+# `if: github.ref …`, so a green on `main` is NOT a measurement of a red on a
+# release branch at the same commit, workflow and event. Without the ref, that green
+# would clear the red — the same class as the tab-in-name hole of cycle 1.
+new_scen supersededref
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 14603 "$SS_WFID" "$SS_WFNAME" push main
+  lane7_fail "$SS_HEAD" 14601 "$SS_WFID" "$SS_WFNAME" push release/x
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-ref.txt"
+grep -q '^examined=1$' "$TMP/cfs-rep-ref.txt" \
+  && pass "(n) a green on ANOTHER REF does not clear a red at the same commit (the ref is in the key)" \
+  || fail "(n) a green push run on main cleared a red on release/x: $(tr '\n' ' ' < "$TMP/cfs-rep-ref.txt")"
+new_scen supersededrefsame
+printf '%s\n' "$SS_HEAD" > "$SCEN/head"
+{ lane7_pass "$SS_HEAD" 14703 "$SS_WFID" "$SS_WFNAME" push main
+  lane7_fail "$SS_HEAD" 14701 "$SS_WFID" "$SS_WFNAME" push main
+} > "$SCEN/runs-$SS_HEAD"
+cfs_run --commit-rows "$SS_HEAD" --runs-report "$TMP/cfs-rep-refs.txt"
+grep -q '^examined=0$' "$TMP/cfs-rep-refs.txt" \
+  && pass "(n2) …but the SAME ref's later green still supersedes (control)" \
+  || fail "(n2) the ref narrowed the rule: a genuine green re-run no longer clears the red: $(tr '\n' ' ' < "$TMP/cfs-rep-refs.txt")"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
