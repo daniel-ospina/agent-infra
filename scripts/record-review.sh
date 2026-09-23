@@ -30,11 +30,14 @@
 #                 REFUSES (exit 4, no write) when any same-repo closing ref
 #                 is a non-micro complexity:* issue. Clean verdicts make zero
 #                 extra gh calls.
-#   clean-low   — the Low risk row: every changed path is prose or a stylesheet
-#                 (no program code, no config file, no enforcement input), and
-#                 the Low row's single reviewer pass ran. The content shape IS
-#                 the whole attestation, so its guard is FAIL-CLOSED on every
-#                 arm — "could not verify" must never read as "certified Low"
+#   clean-low   — the Low risk row: every changed path of the recorded revision
+#                 is prose or a stylesheet (no program code, no config file, no
+#                 enforcement input). The content shape is the whole VERIFIABLE
+#                 attestation — the Low row's single reviewer pass is the
+#                 caller's obligation and nothing here can observe it. Because
+#                 the shape is the whole attestation, the guard below is
+#                 FAIL-CLOSED on every arm — "could not verify" must never read
+#                 as "certified Low"
 #                 (unlike clean-micro, whose fail-open arm is safe because the
 #                 label only cross-checks a flow that already ran its own
 #                 pre-flight and dispatch floor). NOTE the class is PATH +
@@ -132,11 +135,19 @@ closing_issue_refs() {
 
 # ── clean-low content-shape predicates (#1348) ────────────────────────────
 # The LOW CLASS. This is a POSITIVE, ANCHORED allowlist and it is deliberately
-# NARROWER than proportional-gates' Low row, which reads "Docs, config, CSS,
-# strings only": config and i18n strings can change runtime behaviour — issue
-# #1348's own motivating regression (#4708, a CSP config change) IS a config
-# change — so they are excluded.         OVERRIDES: proportional-gates §Pre-flight
-# Verification / Low row's "config, strings" — prose and stylesheets only.
+# NARROWER than the Low change-classification cell in proportional-gates
+# (§Change Classification → the `Code impact` column's **Low** value:
+# "Docs, config, CSS, strings only"): config and i18n strings can change runtime
+# behaviour — issue #1348's own motivating regression (#4708, a CSP config
+# change) IS a config change — so they are excluded, as are root instruction
+# files and any enforcement input.
+#         OVERRIDES: proportional-gates §Change Classification → Code impact →
+#         Low ("Docs, config, CSS, strings only") — this class admits prose and
+#         stylesheets only, never config or strings. NOTE that the §Review
+#         Cycles table's Low ROW (1 reviewer, no cycle loop) is a DIFFERENT
+#         artifact in the same file; conflating the two is what makes such a
+#         marker hard to find, so the anchor above names the table and the
+#         column explicitly.
 #
 # It is also deliberately narrower than the other two content-shape classes in
 # this repo, and it must NOT be replaced by either:
@@ -153,7 +164,7 @@ closing_issue_refs() {
 # inherit a class chosen for a different purpose.
 #
 # Layout rule, stated as an ANCHORED regex rather than a bash glob on purpose:
-# in bash pattern matching `*` crosses `/`, so `./*.md` would admit
+# in bash pattern matching `*` crosses `/`, so `*.md` would admit
 # `.github/workflows/x.md` and `skills/code-review/SKILL.md` — every enforcement
 # root this class exists to exclude.
 CLEAN_LOW_DOCS_RE='^docs/[^/].*\.(md|markdown|txt|rst|adoc|css|scss)$'
@@ -165,9 +176,14 @@ CLEAN_LOW_DOCS_RE='^docs/[^/].*\.(md|markdown|txt|rst|adoc|css|scss)$'
 clean_low_path_ok() {
   local p="$1"
   [ -n "$p" ] || return 1
-  # A path GitHub reports raw must not carry a control character: git allows
+  # A path carrying a RAW control character must not be admitted: git allows
   # them inside a filename, and a newline/tab splits one real file into several
   # well-formed-looking rows (each of which could pass the class on its own).
+  # Defence in depth, NOT a live arm for this guard: its rows come from `jq
+  # @tsv`, which ESCAPES \t and \n (`docs/c<LF>d.md` arrives as the literal
+  # `docs/c\nd.md`), so a real one cannot reach here from that path — and an
+  # ESCAPED one is an in-class filename, admitted on purpose. Kept for a caller
+  # that feeds raw rows.
   case "$p" in
     *[$'\n\r\t']*) return 1 ;;
   esac
@@ -188,10 +204,11 @@ clean_low_path_ok() {
 }
 
 # clean_low_rows — read TSV rows ("<status>\t<filename>\t<old>") on stdin,
-# validate the FRAMING, print the accepted rows. Mirrors the contract of
+# validate the FRAMING, print the accepted rows. Same FRAMING as
 # check-pipeline-compliance.sh::files_rows (NF==3, non-empty filename, the
-# GitHub diff-entry status enum, `renamed` must carry its old path) without
-# sharing its class. `copied` is refused by ABSENCE from the accepted enum,
+# GitHub diff-entry status enum, `renamed` must carry its old path) with ONE
+# deliberate divergence and no shared class: `copied`. `copied` is refused by
+# ABSENCE from the accepted enum,
 # not by an extra arm: a copy's source is absent from the file list, so a
 # new-path-only check cannot see whether executable content was duplicated into
 # a docs path. (The adjacent gate ACCEPTS `copied` for a closure fallback,
@@ -473,13 +490,27 @@ if [ "$VERDICT" = "clean-low" ]; then
     echo "❌ clean-low content-shape guard: recorded sha $SHA is not the current head $META_HEAD of $REPO#$PR — the two revisions can differ in shape, so certifying Low for the recorded one would describe the wrong diff. Refusing (exit 4, no record); re-record at the current head without --force-stale." >&2
     exit 4
   fi
-  RAW="$(gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv' 2>/dev/null || true)"
+  # One read returns BOTH the merge base and the rows. `.merge_base_commit.sha`
+  # is the commit the three-dot diff is taken FROM — i.e. the sha that actually
+  # identifies the certified CONTENT, which `$META_BASE` (the base branch's TIP)
+  # does not: a base that merely ADVANCES leaves the merge base untouched and
+  # the certified diff identical, while a base that is REPOINTED does not. The
+  # record pins the merge base, the consumer re-derives it, and the gate blocks
+  # only when the content can actually differ. Pinning the tip instead would
+  # false-block every clean-low PR on the next unrelated merge to main.
+  CMP="$(gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
+  MB="$(printf '%s\n' "$CMP" | head -1 | cut -f2)"
+  RAW="$(printf '%s\n' "$CMP" | tail -n +2)"
+  if ! [[ "$MB" =~ ^[0-9a-f]{40}$ ]]; then
+    # Empty diff, a compare/API failure, a fork head not reachable from the
+    # base repo (compare 404s there), or a response with no merge base. All are
+    # fail-CLOSED: a fork PR is a predictable FALSE BLOCK, recorded in the #1348
+    # plan so it is not later re-diagnosed as a bug.
+    echo "❌ clean-low content-shape guard: read no merge base for $REPO#$PR at $SHA (empty diff, API failure, or an unreachable fork head) — an unverifiable shape cannot be certified Low. Refusing (exit 4, no record)." >&2
+    exit 4
+  fi
   if [ -z "$RAW" ]; then
-    # Empty diff, a compare/API failure, or a fork head not reachable from the
-    # base repo (compare 404s there). All three are fail-CLOSED: a fork PR is a
-    # predictable FALSE BLOCK, recorded in the #1348 plan so it is not later
-    # re-diagnosed as a bug.
-    echo "❌ clean-low content-shape guard: read no changed files for $REPO#$PR at $SHA (empty diff, API failure, or an unreachable fork head) — an unverifiable shape cannot be certified Low. Refusing (exit 4, no record)." >&2
+    echo "❌ clean-low content-shape guard: no changed files under merge base ${MB:0:12}… for $REPO#$PR — refusing (exit 4, no record)." >&2
     exit 4
   fi
   if ! ROWS="$(clean_low_rows <<< "$RAW")"; then
@@ -492,8 +523,18 @@ if [ "$VERDICT" = "clean-low" ]; then
     printf '%s\n' "$ROWS" | LC_ALL=C awk -F '\t' '{ print "     " $1 " " $2 }' >&2
     echo "   → Run the code-review skill on the current head, then record clean:" >&2
     echo "   →   record-review.sh $PR $SHA clean $REPO" >&2
+    echo "   → A docs change that ALSO adds a non-prose file (an image, a data or" >&2
+    echo "     config file under docs/, .html, .mdx) is refused the same way: only" >&2
+    echo "     the prose/stylesheet extensions are in class, so it has no Low verdict." >&2
     exit 4
   fi
+  # The verdict is new, and a REMOTE ai-review-gate required check that still
+  # regex-matches `verdict=clean(-micro)?` will keep failing on this marker.
+  # Same posture as the missing-HMAC-key warning below: say it loudly at record
+  # time rather than let the agent discover it as a red required check and fall
+  # back to recording a false `clean`. The record and the LOCAL merge gate are
+  # unaffected. Widen the consumer at daniel-ospina/tortoise#4755.
+  echo "ℹ️ clean-low recorded. A remote ai-review-gate still matching 'verdict=clean(-micro)?' will reject this marker until the consumer is widened (tortoise#4755) — the record and the local merge gate are unaffected." >&2
 fi
 
 DIR="$HOME/.pi/agent/reviews"
@@ -509,12 +550,29 @@ else
   LEGACY=""
 fi
 TMP="$FILE.tmp"
+# #1348 — pin the MERGE BASE the clean-low guard certified. The attestation is
+# a function of the three-dot diff `compare/<base>...<head>`, whose CONTENT is
+# identified by `merge_base_commit.sha` — not by the base branch's tip. Pinning
+# the tip would be both wrong (a benign advance of the base branch moves the tip
+# while the certified diff is identical, so every clean-low record would expire
+# on the next unrelated merge to main) and weaker (the tip does not identify the
+# content). Pinning the merge base catches the case that matters — the PR's base
+# being REPOINTED (`gh pr edit --base`), which moves the merge base and changes
+# what would merge while the head sha stays the same — and is stable otherwise.
+# extensions/review-enforcer re-derives it and refuses with `base_advanced` on a
+# mismatch, or `base_unverifiable` when it cannot be read. Empty for
+# clean/clean-micro: their record shape is unchanged (the same base-blindness
+# there is pre-existing, filed as agent-infra #1362).
+MB_FIELD=""
+if [ "$VERDICT" = "clean-low" ] && [ -n "${MB:-}" ]; then
+  MB_FIELD="\"merge_base_sha\":\"$MB\","
+fi
 if [ -n "$REPO" ]; then
-  printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$VERDICT" "$REPO" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
+  printf '{"pr":%d,"head_sha":"%s",%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$VERDICT" "$REPO" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
 else
-  printf '{"pr":%d,"head_sha":"%s","verdict":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$VERDICT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
+  printf '{"pr":%d,"head_sha":"%s",%s"verdict":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$VERDICT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
 fi
 mv "$TMP" "$FILE"
 # Migration (#426): a legacy <pr>.json that belongs to THIS repo is

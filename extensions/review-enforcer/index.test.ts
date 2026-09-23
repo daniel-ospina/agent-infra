@@ -39,6 +39,7 @@ import {
   isGraphQLRateLimitError,
   rateLimitMaxWaitMs,
   getPrHeadShaViaRest,
+  getPrMergeBaseSha,
   getPrHeadSha,
   hasAdminMergeFlag,
   isGhPrMergeCommand,
@@ -91,6 +92,20 @@ function section(name: string) {
   console.log(`\n${name}:`);
 }
 
+// #1348: every audit-temp dir created by this suite, removed at exit. Declared
+// up here because tests run at module-evaluation time — a declaration further
+// down the file would be in its temporal dead zone when the first test runs.
+const AUDIT_TMP_DIRS: string[] = [];
+process.on("exit", () => {
+  for (const d of AUDIT_TMP_DIRS) {
+    try {
+      fs.rmSync(d, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+});
+
 // ── #192: gh runner override ───────────────────────────
 // index.ts routes gh calls through runGh(), which honors _setRunGhOverride().
 // Tests swap in a fake runner (returns stdout or throws) and restore with null
@@ -126,6 +141,13 @@ const cleanRecord: ReviewRecord = {
   reviewed_at: "2026-01-01T00:00:00Z",
   repo: "owner/repo",
 };
+
+// #1348 — a clean-low record carries the MERGE BASE its guard certified (the
+// commit the three-dot diff is taken from), NOT the base branch's tip: the tip
+// moves on every unrelated merge into the base branch while the certified diff is
+// unchanged. Distinct from the head, so a swap is detectable.
+const MERGE_BASE = "c".repeat(40);
+const cleanLowRecord: ReviewRecord = { ...cleanRecord, verdict: "clean-low", merge_base_sha: MERGE_BASE };
 
 // ── Drift-pin: ONE copy of the command parsers (#966) ─
 //
@@ -235,37 +257,151 @@ test("allow: clean-micro verdict with matching head", () => {
   equal(r.status, "allow");
 });
 
-// ── #1348: the clean-low verdict (C7) ─────────────────
+// ── #1348: the clean-low verdict (C7 head binding + C8 content binding) ──
 // The local merge gate accepts clean-low when, and only when, the record is
-// head-bound — exactly the same binding `clean` and `clean-micro` get. It does
-// NOT re-derive the content shape: the record IS the attestation, and the only
-// place the shape can be read is the producer's guard in record-review.sh.
-test("allow: clean-low verdict with matching head", () => {
-  const rec = { ...cleanRecord, verdict: "clean-low" };
-  const r = evaluateMergeGate(138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" });
+// HEAD-bound AND its certified MERGE BASE is still the PR's merge base — the
+// attestation is the three-dot diff, whose content that commit identifies. It
+// does NOT re-derive the content shape: the record IS the attestation, and the
+// only place the shape can be read is the producer's guard in record-review.sh.
+test("allow: clean-low verdict with matching head AND merge base", () => {
+  const r = evaluateMergeGate(
+    138, cleanLowRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
+  );
   equal(r.status, "allow");
   ok((r as any).message.includes("clean-low"), "pass message names the verdict it acted on");
 });
 
+test("allow: a benign ADVANCE of the base branch does NOT invalidate the record", () => {
+  // The false block that binding `.base.sha` (the tip) would produce: main moves
+  // forward with unrelated commits, the merge base with an unchanged head is the
+  // same commit, the certified diff is identical — so the merge must proceed.
+  // Pinned because the ORIGINAL fix compared the tip and would have blocked here.
+  const r = evaluateMergeGate(
+    138, cleanLowRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
+  );
+  equal(r.status, "allow", "the base branch advancing must not expire a clean-low record");
+});
+
+test("block: clean-low with a REPOINTED base (gh pr edit --base) — same head, different merged diff", () => {
+  // The exploit this closes: record clean-low on a docs-only diff off a base
+  // that does not contain the unreviewed code, then re-point the PR at main.
+  // A base edit does NOT change the head sha, so the head pin alone allows it.
+  const r = evaluateMergeGate(
+    138, cleanLowRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, "d".repeat(40)
+  );
+  equal(r.status, "block");
+  equal((r as any).reasonTag, "base_advanced");
+  ok((r as any).reason.includes("DIFFERENT merge base"), "refusal names the cause");
+  // The remediation must name the verdict: position 3 of record-review.sh IS the
+  // verdict, so `record-review.sh <PR> <sha> <owner/repo>` would treat the repo as
+  // a verdict (exit 2), and omitting it would DEFAULT to `clean` — minting
+  // exactly the false attestation this verdict exists to remove.
+  ok((r as any).reason.includes("clean-low [owner/repo]"), "advice names the clean-low verdict");
+  ok((r as any).reason.includes("clean [owner/repo]"), "advice names the clean fallback");
+});
+
+test("block: clean-low whose record carries NO usable merge base", () => {
+  for (const rec of [
+    { ...cleanRecord, verdict: "clean-low" },
+    { ...cleanRecord, verdict: "clean-low", merge_base_sha: "not-a-sha" },
+    { ...cleanRecord, verdict: "clean-low", merge_base_sha: "" },
+    { ...cleanRecord, verdict: "clean-low", merge_base_sha: "C".repeat(40) },
+  ]) {
+    const r = evaluateMergeGate(
+      138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
+    );
+    equal(r.status, "block", `merge base ${JSON.stringify(rec.merge_base_sha)} blocks`);
+    equal((r as any).reasonTag, "base_unverifiable", "absence is UNVERIFIABLE, not ADVANCED");
+  }
+});
+
+test("block: clean-low with an UNREADABLE merge base (gh failure) — fail-closed, not #138 fail-open", () => {
+  const r = evaluateMergeGate(
+    138, cleanLowRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, null
+  );
+  equal(r.status, "block");
+  equal((r as any).reasonTag, "base_unverifiable");
+  ok((r as any).reason.includes("unreadable"), "refusal says the merge base could not be read");
+});
+
+test("audit: base_advanced and base_unverifiable are DISTINCT from each other and from head_advanced", () => {
+  // The machine tag is what reconstructs block rates by reason, so "the
+  // attestation was invalidated" must not look like "we could not read it".
+  const cases: Array<[string | null, string]> = [
+    ["d".repeat(40), "base_advanced"],
+    [null, "base_unverifiable"],
+  ];
+  for (const [current, want] of cases) {
+    const file = tempAuditFile();
+    const r = evaluateMergeGate(
+      138, cleanLowRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, current
+    );
+    logMergeGateDecision(138, r as any, cleanLowRecord, file);
+    equal(readAuditLines(file)[0].reason, want, `tag for current=${current}`);
+  }
+  // A moved head keeps its own tag (the head is checked first).
+  const f2 = tempAuditFile();
+  const headR = evaluateMergeGate(
+    138, cleanLowRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
+  );
+  logMergeGateDecision(138, headR as any, cleanLowRecord, f2);
+  equal(readAuditLines(f2)[0].reason, "head_advanced");
+});
+
+test("scope: clean/clean-micro records stay merge-base-BLIND (shape unchanged, #1362)", () => {
+  // Deliberate: their record carries no merge_base_sha at all, so the C8 branch is
+  // clean-low-scoped. Widening it here would change a record schema and a gate
+  // decision for the two pre-existing verdicts — filed as agent-infra #1362.
+  for (const v of ["clean", "clean-micro"]) {
+    const r = evaluateMergeGate(
+      138, { ...cleanRecord, verdict: v }, "a".repeat(40),
+      { source: "record", repo: "owner/repo" }, false, "d".repeat(40)
+    );
+    equal(r.status, "allow", `${v} is not merge-base-bound`);
+  }
+});
+
 test("block: clean-low with an advanced head (same binding as clean)", () => {
-  const rec = { ...cleanRecord, verdict: "clean-low" };
-  const r = evaluateMergeGate(138, rec, "b".repeat(40), { source: "record", repo: "owner/repo" });
+  const r = evaluateMergeGate(
+    138, cleanLowRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
+  );
   equal(r.status, "block");
   ok((r as any).reason.includes("advanced"));
 });
 
 test("block: clean-low with an advanced head → reason head_advanced, not verdict_not_clean", () => {
-  const rec = { ...cleanRecord, verdict: "clean-low" };
-  equal(mergeGateBlockReason(rec), "head_advanced");
+  equal(mergeGateBlockReason(cleanLowRecord), "head_advanced");
   const file = tempAuditFile();
-  const r = evaluateMergeGate(138, rec, "b".repeat(40), { source: "record", repo: "owner/repo" });
-  logMergeGateDecision(138, r as any, rec, file);
+  const r = evaluateMergeGate(
+    138, cleanLowRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
+  );
+  logMergeGateDecision(138, r as any, cleanLowRecord, file);
   equal(readAuditLines(file)[0].reason, "head_advanced");
 });
 
+test("clean-low head-advanced advice RE-DERIVES the shape instead of prescribing the same verdict", () => {
+  // A moved head that brought code is refused by the producer's guard (exit 4),
+  // so "re-record at the same verdict: … clean-low" would be unsatisfiable in
+  // exactly the case that fires it. clean-low's claim is about the diff's SHAPE,
+  // not about reaching a tier through a flow.
+  const r = evaluateMergeGate(
+    138, cleanLowRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
+  );
+  const reason = (r as any).reason as string;
+  ok(reason.includes("content-only"), "advice names the shape re-check");
+  ok(reason.includes("clean-low [owner/repo]"), "advice names the verdict in the clean-low branch");
+  ok(reason.includes("clean [owner/repo]"), "advice names the clean fallback");
+  // The SAME-verdict advice must survive for the tier-bearing verdicts (#513).
+  for (const v of ["clean", "clean-micro"]) {
+    const rr = evaluateMergeGate(
+      138, { ...cleanRecord, verdict: v }, "b".repeat(40), { source: "record", repo: "owner/repo" }
+    );
+    ok((rr as any).reason.includes(v), `${v} keeps the same-verdict re-record advice`);
+  }
+});
+
 test("block: clean-low with an unverifiable head does NOT fail open for a task sub-agent", () => {
-  const rec = { ...cleanRecord, verdict: "clean-low" };
-  const r = evaluateMergeGate(138, rec, null, { source: "record", repo: "owner/repo" }, true);
+  const r = evaluateMergeGate(138, cleanLowRecord, null, { source: "record", repo: "owner/repo" }, true);
   equal(r.status, "block");
 });
 
@@ -283,19 +419,38 @@ test("vocabulary is CLOSED: an out-of-vocabulary verdict still blocks", () => {
 });
 
 test("vocabulary: ACCEPTED_VERDICTS is exactly the three verdicts (single source of truth)", () => {
+  // Asserted against a LITERAL, not by iterating the list under test: the
+  // earlier form (`for (const v of ACCEPTED_VERDICTS) ok(isAcceptedVerdict(v))`)
+  // could not fail — isAcceptedVerdict IS `ACCEPTED_VERDICTS.includes`, so the
+  // loop only ever asserted the list contains itself.
   equal(ACCEPTED_VERDICTS.join(","), "clean,clean-micro,clean-low");
-  // Both gate sites consult the list, so the allowlist and the block-reason
-  // classifier cannot drift apart.
-  for (const v of ACCEPTED_VERDICTS) ok(isAcceptedVerdict(v), `${v} accepted`);
+  ok(isAcceptedVerdict("clean") && isAcceptedVerdict("clean-micro") && isAcceptedVerdict("clean-low"));
 });
 
 test("declared boundary: the local gate does NOT re-derive the content shape", () => {
-  // #1348 declares this out of scope deliberately: a local shape re-check
-  // would be a second, weaker writer of the Low class. Pinned so that adding
-  // one later is a decision, not an accident.
-  const rec = { ...cleanRecord, verdict: "clean-low" };
-  const r = evaluateMergeGate(138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" });
-  equal(r.status, "allow");
+  // #1348 declares this out of scope deliberately: a local shape re-check would
+  // be a second, weaker writer of the Low class. Pinned so that adding one later
+  // is a decision, not an accident — and pinned as an OBSERVABLE, not as another
+  // `status === "allow"` on an already-allowed record (which a later shape
+  // re-check that happened to allow this diff would leave green). The observable:
+  // a local re-check would have to READ something (the compare/diff endpoint), so
+  // a clean-low merge must issue no such call, and the source must not name a
+  // shape predicate from the producer's class.
+  const cmds: string[] = [];
+  _setRunGhOverride((cmd) => { cmds.push(cmd); return "a".repeat(40); });
+  try {
+    const r = evaluateMergeGate(
+      138, cleanLowRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, MERGE_BASE
+    );
+    equal(r.status, "allow");
+  } finally {
+    _setRunGhOverride(null);
+  }
+  equal(cmds.length, 0, "the pure gate decision issues no gh/API call of its own");
+  const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  for (const name of ["clean_low_path_ok", "CLEAN_LOW_DOCS_RE", "clean_low_shape_ok"]) {
+    ok(!src.includes(name), `the consumer must not import the producer's shape predicate (${name})`);
+  }
 });
 
 test("C7 drift pin: the verdict vocabulary is CONSULTED, never re-literalised", () => {
@@ -308,9 +463,53 @@ test("C7 drift pin: the verdict vocabulary is CONSULTED, never re-literalised", 
   const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
   ok(!/record\.verdict !== "clean"/.test(src), "no ad-hoc `record.verdict !== \"clean\"` comparison");
   ok(!/record\.verdict === "clean"/.test(src), "no ad-hoc `record.verdict === \"clean\"` comparison");
-  // Both acceptance sites must route through the shared predicate.
-  const consults = (src.match(/isAcceptedVerdict\(record\.verdict\)/g) ?? []).length;
-  equal(consults, 2, "both verdict sites consult isAcceptedVerdict (allowlist + block-reason)");
+  // Both acceptance sites must route through the shared predicate — asserted
+  // STRUCTURALLY (by the surrounding expression), not by counting occurrences of
+  // a substring, which a COMMENT satisfied while the real call was replaced.
+  const declLine = src.split("\n").find((l) => l.includes("export const ACCEPTED_VERDICTS")) ?? "";
+  ok(declLine.includes("clean-low"), "the declaration lists clean-low");
+  ok(
+    /if \(!isAcceptedVerdict\(record\.verdict\)\) \{/.test(src),
+    "the allowlist consults isAcceptedVerdict as its predicate"
+  );
+  const blockFn = src.slice(src.indexOf("export function mergeGateBlockReason"));
+  const blockBody = blockFn.slice(0, blockFn.indexOf("\n}"));
+  ok(
+    blockBody.includes("isAcceptedVerdict(record.verdict)"),
+    "mergeGateBlockReason consults isAcceptedVerdict IN ITS BODY"
+  );
+  // The refusal message must be DERIVED from the vocabulary, not re-listed. The
+  // earlier attempt pinned "no line outside the declaration names 2+ verdicts",
+  // which is unsatisfiable (the remediation lines must NAME the verdict to use)
+  // and which a differently-ordered/multi-line re-listing evaded. Pin the
+  // mechanism instead: the message site must reference the list, and the message
+  // ITSELF must name every member of the list — so a 4th verdict added to
+  // ACCEPTED_VERDICTS without updating the message fails the behavioural test.
+  const msgLine = src.split("\n").find((l) => l.includes("unlocks a merge")) ?? "";
+  ok(
+    msgLine.includes("ACCEPTED_VERDICTS"),
+    `the refusal message is DERIVED from the vocabulary (found: ${msgLine.trim()})`
+  );
+  ok(!/"clean"\s*,\s*"clean-micro"/.test(msgLine), "the refusal message does not hard-code the list");
+});
+
+test("the out-of-vocabulary refusal NAMES every accepted verdict (derivation, not a literal)", () => {
+  // Iterating the LIVE list is the point: if a verdict is added to
+  // ACCEPTED_VERDICTS and the message keeps its own copy of the old set, this
+  // fails. That is the drift the single-source-of-truth claim is about.
+  const r = evaluateMergeGate(
+    138, { ...cleanRecord, verdict: "bogus" }, "a".repeat(40),
+    { source: "record", repo: "owner/repo" }
+  );
+  equal(r.status, "block");
+  for (const v of ACCEPTED_VERDICTS) {
+    ok((r as any).reason.includes(`"${v}"`), `refusal names the accepted verdict ${v}`);
+  }
+  equal(
+    ((r as any).reason.match(/"clean(-micro|-low)?"/g) ?? []).length,
+    ACCEPTED_VERDICTS.length,
+    "refusal names exactly the accepted vocabulary — no more, no less"
+  );
 });
 
 test("fail-open: unresolvable repo (fallback) → warning with repo advice, not block", () => {
@@ -521,6 +720,10 @@ section("logGateEvent — durable JSONL audit append (#60)");
 
 function tempAuditFile(): string {
   const dir = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-audit-"));
+  // These used to accumulate one directory per call (413 were observed in
+  // $TMPDIR). Register the dir for removal at process exit so every suite run
+  // cleans up after itself.
+  AUDIT_TMP_DIRS.push(dir);
   return resolvePath(dir, "gate-events.jsonl");
 }
 
@@ -654,6 +857,93 @@ test("respects env override; invalid values fall back to default", () => {
 });
 
 // ── #192: REST fallback for GraphQL pool exhaustion ───
+section("getPrMergeBaseSha — content binding for clean-low (#1348)");
+
+test("resolves the merge base and builds the compare URL from the BASE and the head", () => {
+  const cmds: string[] = [];
+  let env: any = null;
+  _setRunGhOverride((cmd, opts) => {
+    cmds.push(cmd);
+    env = opts;
+    return cmd.includes("compare/")
+      ? "c".repeat(40)
+      : "b".repeat(40);
+  });
+  try {
+    equal(
+      getPrMergeBaseSha(138, "a".repeat(40), { source: "flag", repo: "owner/repo" }),
+      "c".repeat(40)
+    );
+  } finally {
+    _setRunGhOverride(null);
+  }
+  equal(cmds.length, 2, "two reads: the base sha, then the merge base");
+  ok(cmds[0].includes("pulls/138"), `first read targets the PR: ${cmds[0]}`);
+  ok(
+    cmds[1].includes(`compare/${"b".repeat(40)}...${"a".repeat(40)}`),
+    `the compare is BASE...HEAD, the exact diff the producer certified: ${cmds[1]}`
+  );
+  // `gh api` does NOT accept --repo — the repo comes via GH_REPO env.
+  ok(!cmds[1].includes("--repo") && !cmds[1].includes("-R "), `no --repo flag: ${cmds[1]}`);
+  ok(env?.env?.GH_REPO === "owner/repo", "repo injected via GH_REPO env");
+});
+
+test("null when the base sha is unreadable or not a full sha (no compare call is made)", () => {
+  for (const bad of ["", "branch-name", "b".repeat(39), "b".repeat(41), "B".repeat(40)]) {
+    const cmds: string[] = [];
+    _setRunGhOverride((cmd) => { cmds.push(cmd); return bad; });
+    try {
+      equal(
+        getPrMergeBaseSha(138, "a".repeat(40), { source: "record", repo: "owner/repo" }),
+        null,
+        `base ${JSON.stringify(bad)} → null`
+      );
+    } finally {
+      _setRunGhOverride(null);
+    }
+    equal(cmds.length, 1, "an invalid base sha short-circuits before the compare call");
+  }
+});
+
+test("null when the compare response carries no usable merge base", () => {
+  for (const bad of ["", "not-a-sha", "c".repeat(39), "C".repeat(40)]) {
+    _setRunGhOverride((cmd) => (cmd.includes("compare/") ? bad : "b".repeat(40)));
+    try {
+      equal(
+        getPrMergeBaseSha(138, "a".repeat(40), { source: "record", repo: "owner/repo" }),
+        null,
+        `merge base ${JSON.stringify(bad)} → null`
+      );
+    } finally {
+      _setRunGhOverride(null);
+    }
+  }
+});
+
+test("null when gh throws (fail-closed input to the gate, never a partial value)", () => {
+  _setRunGhOverride(() => { throw new Error("connection refused"); });
+  try {
+    equal(
+      getPrMergeBaseSha(138, "a".repeat(40), { source: "record", repo: "owner/repo" }),
+      null
+    );
+  } finally {
+    _setRunGhOverride(null);
+  }
+});
+
+test("null without any gh call when the head is null or not a full sha", () => {
+  const cmds: string[] = [];
+  _setRunGhOverride((cmd) => { cmds.push(cmd); return "c".repeat(40); });
+  try {
+    equal(getPrMergeBaseSha(138, null, { source: "record", repo: "owner/repo" }), null);
+    equal(getPrMergeBaseSha(138, "a".repeat(39), { source: "record", repo: "owner/repo" }), null);
+  } finally {
+    _setRunGhOverride(null);
+  }
+  equal(cmds.length, 0, "an unusable head issues no API call at all");
+});
+
 section("getPrHeadShaViaRest — REST-pool head lookup (#192)");
 
 test("resolves the head SHA via the REST pulls endpoint", () => {

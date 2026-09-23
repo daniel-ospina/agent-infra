@@ -90,9 +90,14 @@ if [ "$1" = "api" ]; then
             "${STUB_CHANGED_FILES:-$derived}"
         echo; exit 0
     fi
-    # #1348 clean-low: the sha-addressable diff read.
+    # #1348 clean-low: the sha-addressable diff read. The guard reads the MERGE
+    # BASE out of the SAME response (it is the commit the three-dot diff is taken
+    # from, and the sha the record pins), so the stub returns a leading
+    # `mb<TAB><sha>` line followed by the rows. STUB_MERGE_BASE lets a vector
+    # simulate a response with no merge base (→ refuse).
     if grep -qF -- "compare/" <<<"$*"; then
         [ "${STUB_COMPARE_FAIL:-0}" = "1" ] && exit 1
+        printf 'mb\t%s\n' "${STUB_MERGE_BASE-cccccccccccccccccccccccccccccccccccccccc}"
         if [ -n "${STUB_COMPARE:-}" ]; then
             printf '%s\n' "$STUB_COMPARE"
             exit 0
@@ -565,7 +570,7 @@ run_record_raw 424510 "$SHA" clean "daniel-ospina/agent-infra"
 #   (i)   POSITIVE controls — legitimate content-only diffs must record (rc 0);
 #   (ii)  attack vectors — must refuse with the GUARD's rc 4 and its named
 #         message, never the verdict `case`'s rc 2;
-#   (iii) MUTATION HARNESS (§10.15) — two mutants, built from THIS script:
+#   (iii) MUTATION HARNESS (§10.9) — two mutants, built from THIS script:
 #         neuter the guard  → the code-bearing attack must go GREEN (rc 0),
 #         i.e. the suite would fail if the guard were removed; revert the
 #         verdict arm → the positive vector must go RED (rc 2), i.e. the
@@ -617,8 +622,36 @@ assert_low_refused 424620 "C2 one enforcement path in a mixed diff refuses"
 run_record_verdict clean-low "" 424630
 assert_low_refused 424630 "C3 repo undetectable refuses"
 assert_contains "$RECORD_ERR" "repo undetectable or gh missing" "C3 repo-less refusal names the cause"
+# C3 (`gh` ABSENT from PATH entirely, not merely a stubbed failure). The guard's
+# condition is `-z $REPO || ! command -v gh`; every other vector has a stub gh on
+# PATH, so without this one the SECOND disjunct is untested — deleting it leaves
+# the suite green.
+run_record_no_gh() { # <verdict> <repo> <pr>
+    local verdict="$1" repo="$2" pr="$3" rcfile="$T/nrc" errfile="$T/nerr" nogh
+    nogh="$(printf '%s' "$PATH" | tr ':' '\n' | while read -r _d; do [ -n "$_d" ] && [ -x "$_d/gh" ] || printf '%s\n' "$_d"; done | paste -sd: -)"
+    rm -f "$errfile"
+    (
+        export HOME="$F_HOME" PATH="$nogh" GH_STUB_LOG="$LOG"
+        rc=0
+        bash "$RECORD" "$pr" "$SHA" "$verdict" "$repo" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+run_record_no_gh clean-low "daniel-ospina/agent-infra" 424629
+assert_low_refused 424629 "C3 gh absent from PATH refuses"
+assert_contains "$RECORD_ERR" "repo undetectable or gh missing" "C3 the gh-absent refusal names the cause (only the new guard emits this)"
 STUB_FILES="docs/a.md" STUB_COMPARE_FAIL=1 run_record_verdict clean-low "daniel-ospina/agent-infra" 424631
 assert_low_refused 424631 "C3 compare API failure refuses"
+# The merge base is the commit the certified diff is taken FROM, so a response
+# without one must refuse (an absent merge base is unverifiable content, not an
+# empty diff).
+STUB_FILES="docs/a.md" STUB_MERGE_BASE="" run_record_verdict clean-low "daniel-ospina/agent-infra" 424638
+assert_low_refused 424638 "C3 a response with no merge base refuses"
+assert_contains "$RECORD_ERR" "read no merge base" "C3 the merge-base refusal names the cause"
+STUB_FILES="docs/a.md" STUB_MERGE_BASE="not-a-sha" run_record_verdict clean-low "daniel-ospina/agent-infra" 424639
+assert_low_refused 424639 "C3 a malformed merge base refuses"
 STUB_FILES="" run_record_verdict clean-low "daniel-ospina/agent-infra" 424632
 assert_low_refused 424632 "C3 empty/absent file list refuses"
 STUB_FILES="docs/a.md" STUB_META_FAIL=1 run_record_verdict clean-low "daniel-ospina/agent-infra" 424633
@@ -657,10 +690,13 @@ for _spec in \
     assert_low_refused "$_pr" "C5 $_label ($_path) refuses"
 done
 # Direct predicate vectors for the control characters a TSV row cannot carry
-# faithfully (a filename containing a tab becomes NF=4 and is caught as a
-# malformed row; a newline splits one file into two rows).
-low_path_ok "$(printf 'docs/a\nb.md')" && bad "C5 newline inside a filename must refuse" || ok "C5 newline inside a filename refuses"
-low_path_ok "$(printf 'docs/a\tb.md')" && bad "C5 tab inside a filename must refuse" || ok "C5 tab inside a filename refuses"
+# faithfully. DEFENCE IN DEPTH, not live coverage: the guard's own rows come from
+# `jq @tsv`, which ESCAPES \t and \n, so a real control character cannot reach the
+# class test from production and an ESCAPED one is a literal in-class filename.
+# Both halves are pinned: the raw form refuses (the arm exists), and the escaped
+# form is ADMITTED (the live production behaviour — §10.8).
+low_path_ok "$(printf 'docs/a\nb.md')" && bad "C5 newline inside a filename must refuse" || ok "C5 raw newline inside a filename refuses (defence in depth)"
+low_path_ok "$(printf 'docs/a\tb.md')" && bad "C5 tab inside a filename must refuse" || ok "C5 raw tab inside a filename refuses (defence in depth)"
 # A tab-split row: 4 TSV fields → malformed framing, refused before any class test.
 STUB_COMPARE="$(printf 'added\tdocs/a.md\tscripts/evil.sh')x" run_record_verdict clean-low "daniel-ospina/agent-infra" 424658
 assert_low_refused 424658 "C5 old-path poisoned row refuses"
@@ -691,6 +727,17 @@ QLOW="$(rec_path 424670)"
 [ -f "$QLOW" ] && ok "positive: record written" || bad "positive: record written"
 assert_contains "$(cat "$QLOW" 2>/dev/null || true)" '"verdict":"clean-low"' "positive: record carries verdict clean-low"
 assert_contains "$(cat "$QLOW" 2>/dev/null || true)" "\"head_sha\":\"$SHA\"" "positive: record is head-bound"
+# #1348 content pin: the attestation is the three-dot diff compare/<base>...<head>,
+# whose CONTENT is identified by the merge base — not by the base branch's tip,
+# which moves on every unrelated merge while the certified diff is unchanged. The
+# record must carry the merge base, or a post-record `gh pr edit --base` silently
+# changes what merges while the head sha still matches.
+assert_contains "$(cat "$QLOW" 2>/dev/null || true)" '"merge_base_sha":"cccccccccccccccccccccccccccccccccccccccc"' "positive: clean-low record is CONTENT-bound (merge base)"
+# The certified diff must be read at the merge base's compare, i.e. against the
+# BASE — not against the head. Nothing else in the suite observes that argument,
+# so flipping it to $META_HEAD (which makes the base pin certify a diff the guard
+# never read) would otherwise stay green.
+assert_contains "$(cat "$LOG" 2>/dev/null || true)" "compare/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb...$SHA" "positive: the diff is read against the BASE, not the head"
 assert_contains "$(cat "$PATCH" 2>/dev/null || true)" "verdict=clean-low @ $SHA" "positive: signed marker posted with the clean-low verdict"
 # Multi-path, mixed content extensions, nested docs, root prose.
 STUB_FILES=$'docs/a.md\ndocs/nested/deep/b.rst\ndocs/c.css\nREADME.md\nCHANGELOG.md' run_record_verdict clean-low "daniel-ospina/agent-infra" 424671
@@ -705,6 +752,14 @@ STUB_COMPARE="$(printf 'renamed\tdocs/new.md\tdocs/old.md')" run_record_verdict 
 # clean/clean-micro are untouched by the new guard.
 STUB_FILES="src/app.ts" run_record_verdict clean "daniel-ospina/agent-infra" 424674
 [ "$RECORD_RC" = "0" ] && ok "positive: clean is not shape-guarded (rc 0 on a code diff)" || bad "positive: clean must not be shape-guarded (rc=$RECORD_RC)"
+# The content pin is clean-low only: clean/clean-micro keep their record shape
+# byte-identical (their base-blindness is pre-existing — agent-infra #1362).
+QCLEAN="$(rec_path 424674)"
+if [ -f "$QCLEAN" ] && ! grep -qF '"merge_base_sha"' "$QCLEAN"; then
+  ok "positive: clean record carries no merge_base_sha (shape unchanged)"
+else
+  bad "positive: clean record must EXIST and carry no merge_base_sha (shape unchanged)"
+fi
 unset AI_REVIEW_GATE_KEY
 
 # ── 10.8 direct predicate corpus (no gh; pins the class itself) ──────────
@@ -716,7 +771,8 @@ for _spec in \
     "AGENTS.md:REFUSE" "MEMORY.md:REFUSE" "VENDOR.md:REFUSE" "requirements.txt:REFUSE" \
     "LICENSE:REFUSE" "src/README.md:REFUSE" "skills/x.md:REFUSE" "templates/x.md:REFUSE" \
     "docs/../src/a.ts:REFUSE" "docs//x.md:REFUSE" "/docs/x.md:REFUSE" "docs/./x.md:REFUSE" \
-    "docs/x.mdx:REFUSE" "docs/x.html:REFUSE" "docs:REFUSE" "docs/:REFUSE" ; do
+    "docs/x.mdx:REFUSE" "docs/x.html:REFUSE" "docs:REFUSE" "docs/:REFUSE" \
+    "docs/c\\nd.md:PASS" "docs/c\\td.md:PASS" ; do
     _p="${_spec%%:*}"; _want="${_spec#*:}"
     if low_path_ok "$_p"; then _got="PASS"; else _got="REFUSE"; fi
     assert_eq "$_got" "$_want" "predicate: $_p -> $_want"

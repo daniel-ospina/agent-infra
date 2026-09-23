@@ -68,15 +68,25 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    where a runtime-behaviour change hides — and its guard is FAIL-CLOSED on
    every arm, so an unreadable or truncated diff is never certified Low; a
    `clean-low` record is only obtainable for a diff `record-review.sh` actually
-   read at the recorded sha. If
+   read at the recorded sha. The record is bound to BOTH ends of what was certified:
+   the head sha AND the MERGE BASE of `compare/<base>...<head>` (the commit the
+   three-dot diff is taken from, i.e. what identifies the certified content).
+   Repointing the PR's base (`gh pr edit --base`) or rewriting it moves that merge
+   base, so the gate refuses with `base_advanced` rather than merge a diff nobody
+   certified; a base branch that merely ADVANCES does not move it, so the record
+   survives unrelated merges to main. When either side cannot be read the gate
+   refuses with `base_unverifiable` instead — fail-closed, and re-record clears it. If
    the head moved after the record (fix commits, merge of main): re-run the
    review appropriate to the tier (the `code-review` skill at
    standard/complex; the micro flow at micro) on the new head, then re-record
    at the SAME verdict —
    `~/.pi/agent/scripts/record-review.sh <PR> <full-head-sha> clean
-   <owner/repo>` (standard/complex), `… clean-micro <owner/repo>` (micro), or
-   `… clean-low <owner/repo>` (content-only diff)
-   (the script is not on PATH — use the explicit path).
+   <owner/repo>` (standard/complex), `… clean-micro <owner/repo>` (micro), or for a
+   content-only diff re-check the NEW head's shape and record `… clean-low
+   <owner/repo>` only if it is still content-only (otherwise take the normal route:
+   the code-review skill, then `clean`) — `clean-low`'s claim is about the diff's
+   shape, not about a tier, so it must be re-derived rather than carried forward.
+   (The script is not on PATH — use the explicit path.)
    NEVER re-record a moved head without a fresh review: the `ai-review-gate` required check
    verifies signature + full-sha freshness, and the review-enforcer blocks the merge command
    without a matching record, so the ceremony stays red until evidence is genuinely refreshed.

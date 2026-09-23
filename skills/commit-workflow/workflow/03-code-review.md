@@ -40,8 +40,8 @@ record-review.sh WARNS and proceeds — tier attestation UNVERIFIED at mint.
 ≥1-dispatch floor above), NOT a multi-agent review — by the standard micro
 flow the record is `clean-micro`, and `clean` is never refused at any tier (a
 micro session that ran the code-review skill and records `clean` is a
-stronger claim, not a false one). **Content-only diffs (docs/ or stylesheet
-only, at ANY tier) record `clean-low`** (04-merge-deploy.md condition 6,
+stronger claim, not a false one). **Content-only diffs (`docs/**` with a
+content extension, or a named root prose file, at ANY tier) record `clean-low`** (04-merge-deploy.md condition 6,
 code-review Step 10b) — the Low risk row's representation in the gate. Its
 class excludes config and strings, and its guard is fail-closed, so an
 unreadable or truncated diff is never certified Low. Proceed directly to

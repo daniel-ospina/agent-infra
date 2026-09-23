@@ -1195,11 +1195,11 @@ the #513 tier guard, because that guard reads the LINKED ISSUE's tier, not the
 DIFF's shape. `clean-low` is that missing representation. It attests:
 
 > every changed path of the recorded revision is prose or a stylesheet — no
-> program code, no config file, no enforcement input — and the Low row's single
-> reviewer pass ran. (The class is path+extension based and does not consult a
-> build graph: a repo may package or consume a `docs/**` file as build data.
-> That is accepted, declared, and the attestation wording is scoped to what the
-> guard can actually read.)
+> program code, no config file, no enforcement input. (The class is path+extension
+> based and does not consult a build graph: a repo may package or consume a
+> `docs/**` file as build data. That is accepted, declared, and the attestation
+> wording is scoped to what the guard can actually read. The Low row's single
+> reviewer pass is your obligation — nothing in the script can observe it.)
 
 Use it ONLY when the whole diff is content-only. `record-review.sh` verifies the
 shape itself, from the diff AT THE RECORDED SHA, and REFUSES (exit 4, no record,
@@ -1211,7 +1211,10 @@ runtime-behaviour change hides), and so are root-level instruction files
 content extension (`.md`, `.markdown`, `.txt`, `.rst`, `.adoc`, `.css`,
 `.scss`) and the named root prose files (`README.md`, `CHANGELOG.md`,
 `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`). `.mdx` and `.html` are
-NOT admitted — both are build-consumed program content.
+NOT admitted — both are build-consumed program content. Because the class is an
+ALLOWLIST, a docs change that ALSO adds a non-prose file (an image, `.json`,
+`.csv`, `.svg`) is refused as well: it has no honest Low verdict, so it takes
+the normal route — the code-review skill, then `clean`.
 
 ```bash
 # ~/.pi/agent/scripts/record-review.sh is not on PATH — use the explicit path.
@@ -1225,14 +1228,38 @@ cross-checks a flow that already ran, there is no second evidence behind
 missing; the PR-meta or diff read fails; an empty file list; a file list at
 GitHub's 300-entry compare cap (it may be truncated); a distinct-path count
 that disagrees with the PR's `.changed_files`; a malformed diff row, a rename
-without its old path, a copy, or an unknown status; `--force-stale` (the
-attestation must describe the revision a consumer will actually read); and any
+without its old path, a copy, or an unknown status; `--force-stale` (refused at
+**exit 2** as an argument-level contradiction, not exit 4 — the attestation must
+describe the revision a consumer will actually read); and any
 path outside the class — including a content-only path mixed into a diff that
 also touches code. Re-record at the current head after any push.
 
-The local merge gate accepts `clean-low` under exactly the same head binding as
-`clean`; it does NOT re-derive the content shape (the record is the
-attestation, and the producer guard is the only place the shape is read).
+The local merge gate accepts `clean-low` under the SAME head binding as `clean`
+PLUS a content binding. The record carries the **merge base** of the three-dot
+diff `compare/<base>...<head>` — the commit that identifies the certified
+content — and the gate re-derives it, refusing with reason `base_advanced` when
+it no longer matches and `base_unverifiable` when either side cannot be read
+(absent/invalid in the record, or a `gh`/API failure). A benign advance of the
+base branch, which changes its tip but not the merge base, does NOT block: the
+certified diff is unchanged. It does NOT re-derive the content shape (the record
+is the attestation, and the producer guard is the only place the shape is read).
+
+The two `base_*` refusals are different events — one means the PR's base was
+repointed (`gh pr edit --base`) or rewritten, so the certified diff is no longer
+the diff that would merge at the SAME head sha; the other means the base could
+not be read. Both are cleared the same way: re-record.
+
+Two boundaries worth knowing, both declared rather than silent:
+
+- **The remote `ai-review-gate` required check must accept the verdict.** It is a
+  cross-repo contract (the marker regex lives in the consuming repo), so a repo
+  whose workflow still matches `verdict=clean(-micro)?` will keep failing the
+  check on a `clean-low` marker. `record-review.sh` says so on stderr at record
+  time (widening tracked in `daniel-ospina/tortoise#4755`); the record and the
+  local merge gate are unaffected.
+- **The remote check is still base-blind for every verdict**, `clean-low`
+  included — the signed marker binds the head only. Tracked with the widening
+  requirement above.
 
 ## Standard-Tier Review (`--standard-tier`)
 
