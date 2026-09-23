@@ -219,6 +219,18 @@
 # workflows sharing one job name are conflated by that key — the same conflation
 # GitHub's own check rollup makes.
 #
+# AND THE SUPERSEDED-RUN KEY MUST NOT DISCARD AN UNNAMED RED (#1353). That key is
+# correct for an IDENTIFIED entry and is preserved — but EVERY unnamed entry
+# shares the placeholder name, so one key let a newer unnamed NON-red supersede
+# an older unnamed RED and discard it BEFORE classification: the red vanished,
+# the surface read `green — 0 failing of 1 measured`, and the rail merged. A
+# check literally NAMED the placeholder collides identically. An unnamed (or
+# placeholder-named) entry is therefore keyed by a STABLE PER-ENTRY IDENTITY
+# alongside (app, name) — its own check-run id, falling back to its position in
+# the payload — so distinct unnamed entries cannot supersede one another. The
+# legacy-status half uses the same rule (its per-entry identity is position,
+# since a status carries no id).
+#
 # AN EMPTY SURFACE IS UNMEASURED, NOT GREEN, AND NOT A REFUSAL. Right after a
 # merge, main's head has no check runs YET. Refusing there would block the common
 # case, and the rail ALREADY refuses when the watched lane never tested main
@@ -1709,18 +1721,27 @@ for d in docs(sys.argv[1]):
 # one this rail names as non-red.
 UNNAMED_CHECK = "(unnamed check)"
 best = {}
-for r in cr_runs:
-    name = str(r.get("name") or "") or UNNAMED_CHECK
+for cr_idx, r in enumerate(cr_runs):
+    raw_name = str(r.get("name") or "")
+    name = raw_name or UNNAMED_CHECK
     app = str((r.get("app") or {}).get("slug") or "unknown")
     try:
         rid = int(r.get("id") or 0)
     except (TypeError, ValueError):
         rid = 0
-    key = (app, name)
-    if key not in best or rid > best[key][0]:
-        best[key] = (rid, name, app, str(r.get("status") or ""), str(r.get("conclusion") or ""),
-                     str(r.get("html_url") or ""), str(r.get("started_at") or ""),
-                     str(r.get("completed_at") or ""))
+    entry = (rid, name, app, str(r.get("status") or ""), str(r.get("conclusion") or ""),
+             str(r.get("html_url") or ""), str(r.get("started_at") or ""),
+             str(r.get("completed_at") or ""))
+    if raw_name and raw_name != UNNAMED_CHECK:
+        # IDENTIFIED: the superseded-run rule (latest id per (app, name) wins).
+        key = (app, name)
+        if key not in best or rid > best[key][0]:
+            best[key] = entry
+    else:
+        # UNNAMED or placeholder-named: key by the entry OWN identity as well, so
+        # a newer unnamed non-red cannot SUPERSEDE an older unnamed red and
+        # discard it before classification (#1353).
+        best[(app, name, rid if rid else ("entry", cr_idx))] = entry
 
 statuses = []
 for d in docs(sys.argv[2]):
@@ -1734,15 +1755,26 @@ for d in docs(sys.argv[2]):
 # state, so a red cannot vanish before classification.
 UNNAMED_STATUS = "(unnamed status)"
 sbest = {}
-for s in statuses:
-    ctx = str(s.get("context") or "") or UNNAMED_STATUS
+for st_idx, s in enumerate(statuses):
+    raw_ctx = str(s.get("context") or "")
+    ctx = raw_ctx or UNNAMED_STATUS
     stamp = str(s.get("updated_at") or s.get("created_at") or "")
-    if ctx not in sbest or stamp > sbest[ctx][0]:
-        sbest[ctx] = (stamp, ctx, str(s.get("state") or ""), str(s.get("target_url") or ""))
+    entry = (stamp, ctx, str(s.get("state") or ""), str(s.get("target_url") or ""))
+    if raw_ctx and raw_ctx != UNNAMED_STATUS:
+        # IDENTIFIED: latest per context wins (a re-announced status supersedes).
+        if ctx not in sbest or stamp > sbest[ctx][0]:
+            sbest[ctx] = entry
+    else:
+        # UNNAMED or placeholder-named: same per-entry identity rule as the check
+        # half — two `context: ""` entries share one key otherwise, so a newer
+        # unnamed non-red would supersede and DISCARD an older unnamed red.
+        sbest[(ctx, st_idx)] = entry
 
-# THE SURFACE OWN TIME - the last moment ANY completed check on this surface
-# was produced. The staleness rule compares a later base red against it: a red
-# whose run STARTED after this time cannot be part of what the surface measured.
+# THE SURFACE OWN TIME - the last moment ANY MEASURING completed check on this
+# surface was produced (see MEASURING_CONC / MEASURING_STATE: a completed check
+# that ran nothing is not a measurement). The staleness rule compares a later
+# base red against it: a red whose run STARTED after this time cannot be part of
+# what the surface measured.
 # Emitted for every probe; only the PR-tree call consumes it.
 surface_epoch = 0
 surface_iso = ""

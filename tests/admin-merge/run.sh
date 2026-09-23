@@ -4781,6 +4781,169 @@ grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "pending 5" "$SCEN/out" \
   || fail "the in-flight count is wrong: $(grep -m1 'evaluated tree' "$SCEN/out")"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
 
+# ── 56. AN UNNAMED (OR PLACEHOLDER-NAMED) CHECK IS KEYED BY ITS OWN IDENTITY ─
+# `best`/`sbest` are keyed by (app, name) / context, so ALL unnamed entries shared
+# one key: a newer unnamed NON-red superseded an older unnamed RED and the red was
+# DISCARDED before classification — the surface read `green — 0 failing of 1
+# measured` and the rail merged. Identified entries keep the superseded-run rule.
+# (HEX36, the 36-zero sha suffix, is defined at scenario 55.)
+echo "== 56. distinct UNNAMED checks cannot supersede one another (#1353) =="
+
+# 36 zeros, so a fixture sha below is exactly 40 hex chars (also defined at 55).
+HEX36="000000000000000000000000000000000000"
+
+# raw_unnamed_check <id> <app> <status> <conclusion> <run-id> [completed_at]
+raw_unnamed_check() {
+  printf '{"id":%s,"name":"","status":"%s","conclusion":"%s","app":{"slug":"%s"},"started_at":"2026-01-01T00:00:00Z","completed_at":"%s","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/%s/job/1"}' \
+    "$1" "$3" "$4" "$2" "${6:-2026-01-01T00:05:00Z}" "$5"
+}
+
+# (a) THE REPRODUCTION. Two unnamed checks on the same app: an older RED (id 9)
+# and a newer green (id 10). The green used to overwrite the red in `best`.
+new_scen unnamed-collision-red-then-green
+HEAD_UC1="b1b1${HEX36}"
+printf '%s\n' "$HEAD_UC1" > "$SCEN/head"
+lane_pass "$HEAD_UC1" 5981 > "$SCEN/runs-$HEAD_UC1"
+lane_pass mainuc1 5982 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(raw_unnamed_check 9 github-actions completed failure 6909 2026-01-01T00:01:00Z)" \
+  "$(raw_unnamed_check 10 github-actions completed success 6910 2026-01-01T00:05:00Z)"
+pr_run_map 6909 pull_request 'CI' 6910 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "two NAME-LESS checks (older RED + newer green) REFUSE (exit $rc)" \
+  || fail "a newer unnamed non-red superseded an older unnamed RED and MERGED — the collision hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,5p' "$SCEN/err" 2>/dev/null)"
+grep -q "(unnamed check)" "$SCEN/err" && pass "…naming the unnamed red it classified" \
+  || fail "the refusal does not name the unnamed red"
+grep -q "of 2 measured" "$SCEN/err" && pass "…and BOTH unnamed entries are COUNTED (of 2 measured)" \
+  || fail "the unnamed entries are not both measured: $(grep -m1 'THE TREE' "$SCEN/err")"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a dropped red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a dropped red" || pass "no merge attempted"
+
+# (b) THE REVERSE (older green, newer RED) — a control: both the pre-fix and the
+# fixed rail refuse here, so (a)'s pre-fix merge is attributable to the collision.
+new_scen unnamed-collision-green-then-red
+HEAD_UC2="b2b2${HEX36}"
+printf '%s\n' "$HEAD_UC2" > "$SCEN/head"
+lane_pass "$HEAD_UC2" 5983 > "$SCEN/runs-$HEAD_UC2"
+lane_pass mainuc2 5984 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(raw_unnamed_check 9 github-actions completed success 6911 2026-01-01T00:01:00Z)" \
+  "$(raw_unnamed_check 10 github-actions completed failure 6912 2026-01-01T00:05:00Z)"
+pr_run_map 6911 pull_request 'CI' 6912 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "the REVERSE (older green + newer RED) still REFUSES (exit $rc)" \
+  || fail "a newer unnamed red was lost — the superseded rule is inverted"
+
+# (c) DIFFERENT APPS — a control showing the loss in (a) is the placeholder
+# COLLISION, not the superseded rule: separate apps never shared a key.
+new_scen unnamed-collision-different-apps
+HEAD_UC3="b3b3${HEX36}"
+printf '%s\n' "$HEAD_UC3" > "$SCEN/head"
+lane_pass "$HEAD_UC3" 5985 > "$SCEN/runs-$HEAD_UC3"
+lane_pass mainuc3 5986 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(raw_unnamed_check 9 app-a completed failure 6913 2026-01-01T00:01:00Z)" \
+  "$(raw_unnamed_check 10 app-b completed success 6914 2026-01-01T00:05:00Z)"
+pr_run_map 6913 pull_request 'CI' 6914 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "unnamed checks on DIFFERENT apps still REFUSE (exit $rc)" \
+  || fail "an unnamed red on another app was lost"
+
+# (d) THE STATUS HALF. Two `context: ""` statuses share the placeholder key, so a
+# newer unnamed `success` used to supersede an older unnamed `failure`.
+new_scen unnamed-collision-status
+HEAD_UC4="b4b4${HEX36}"
+printf '%s\n' "$HEAD_UC4" > "$SCEN/head"
+lane_pass "$HEAD_UC4" 5987 > "$SCEN/runs-$HEAD_UC4"
+lane_pass mainuc4 5988 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+printf '{"state":"failure","total_count":2,"statuses":[{"context":"","state":"failure","updated_at":"2026-01-01T00:01:00Z","target_url":"https://example.com/status/9"},{"context":"","state":"success","updated_at":"2026-01-01T00:05:00Z","target_url":"https://example.com/status/10"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "two NAME-LESS statuses (older failure + newer success) REFUSE (exit $rc)" \
+  || fail "a newer unnamed status superseded an older unnamed FAILURE and MERGED"
+grep -q "(unnamed status)" "$SCEN/err" && pass "…naming the unnamed failure" \
+  || fail "the refusal does not name the unnamed status"
+
+# (e) A CHECK LITERALLY NAMED THE PLACEHOLDER collides identically.
+new_scen unnamed-collision-placeholder-name
+HEAD_UC5="b5b5${HEX36}"
+printf '%s\n' "$HEAD_UC5" > "$SCEN/head"
+lane_pass "$HEAD_UC5" 5989 > "$SCEN/runs-$HEAD_UC5"
+lane_pass mainuc5 5990 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 9 '(unnamed check)' completed failure 6915 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 10 '(unnamed check)' completed success 6916 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+pr_run_map 6915 pull_request 'CI' 6916 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a check NAMED '(unnamed check)' collides the same way and REFUSES (exit $rc)" \
+  || fail "placeholder-NAMED checks collided and a red was lost"
+
+# (f) THE OVER-BLOCK GUARD — IDENTIFIED superseded runs still do NOT red.
+new_scen identified-superseded-still-green
+HEAD_UC6="b6b6${HEX36}"
+printf '%s\n' "$HEAD_UC6" > "$SCEN/head"
+lane_pass "$HEAD_UC6" 5991 > "$SCEN/runs-$HEAD_UC6"
+lane_pass mainuc6 5992 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 3101 'ai-review-gate' completed failure 6917 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 3102 'ai-review-gate' completed success 6918 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+pr_run_map 6917 pull_request 'CI' 6918 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "an IDENTIFIED red superseded by a later green still MERGES (exit 0)" \
+  || fail "the superseded-run rule was weakened for identified entries (exit $rc)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (g) …AND THE IDENTIFIED RULE STILL RUNS THE OTHER WAY: a newer red of the same
+# name is NOT superseded by the older green.
+new_scen identified-newer-red-still-red
+HEAD_UC7="b7b7${HEX36}"
+printf '%s\n' "$HEAD_UC7" > "$SCEN/head"
+lane_pass "$HEAD_UC7" 5993 > "$SCEN/runs-$HEAD_UC7"
+lane_pass mainuc7 5994 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 3101 'ai-review-gate' completed success 6919 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 3102 'ai-review-gate' completed failure 6920 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+pr_run_map 6919 pull_request 'CI' 6920 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an IDENTIFIED newer red still REFUSES (exit $rc)" \
+  || fail "an identified newer red was superseded by an older green"
+
+# (h) …AND two unnamed NON-red checks still merge (the fix must not redden them).
+new_scen unnamed-two-nonred
+HEAD_UC8="b8b8${HEX36}"
+printf '%s\n' "$HEAD_UC8" > "$SCEN/head"
+lane_pass "$HEAD_UC8" 5995 > "$SCEN/runs-$HEAD_UC8"
+lane_pass mainuc8 5996 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(raw_unnamed_check 9 github-actions completed success 6921 2026-01-01T00:01:00Z)" \
+  "$(raw_unnamed_check 10 github-actions completed neutral 6922 2026-01-01T00:05:00Z)"
+pr_run_map 6921 pull_request 'CI' 6922 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "two unnamed NON-red checks still MERGE (exit 0)" \
+  || fail "the per-entry key reddened unnamed non-red checks (exit $rc)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 2 check(s)" "$SCEN/out" \
+  && pass "…and both are still COUNTED" \
+  || fail "the unnamed non-red checks vanished: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
