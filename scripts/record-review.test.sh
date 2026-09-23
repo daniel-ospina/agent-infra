@@ -47,8 +47,16 @@ cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
 if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
-    # PATCH body — capture stdin when GH_STUB_PATCH_BODY is set (#716), else swallow
-    if [ -n "${GH_STUB_PATCH_BODY:-}" ]; then
+    # PATCH body — capture stdin to whichever sink the test asked for, else swallow.
+    # STUB_CAPTURE (#2982, the diff-binding sink) is checked FIRST so precedence is
+    # deterministic; GH_STUB_PATCH_BODY is retained as a fallback because main's
+    # harness spelled it that way (#716 — that subsystem was removed, so no current
+    # test sets it). Neither name is dropped: keeping only one would silently turn
+    # the other's capture into a no-op, and a negative assertion ("the marker must
+    # NOT carry diff=") would then pass VACUOUSLY by capturing nothing at all.
+    if [ -n "${STUB_CAPTURE:-}" ]; then
+        cat >"$STUB_CAPTURE"
+    elif [ -n "${GH_STUB_PATCH_BODY:-}" ]; then
         cat > "$GH_STUB_PATCH_BODY"
     else
         cat >/dev/null
@@ -56,11 +64,22 @@ if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
     exit 0
 fi
 if [ "$1" = "api" ]; then
+    # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
+    # --jq, so it would otherwise fall through to the generic body answer.
+    if grep -qF -- "application/vnd.github.v3.diff" <<<"$*"; then
+        [ "${STUB_DIFF_FAIL:-0}" = "1" ] && exit 1
+        cat "${STUB_DIFF_FILE:-/dev/null}"
+        exit 0
+    fi
     if grep -qF -- "--jq .head.sha" <<<"$*"; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
     fi
     if grep -qF -- "--jq .body" <<<"$*"; then
+        # Faithful to `--jq .body`: the RAW body text. Real gh applies the jq
+        # filter and prints the string bare — it does not emit a JSON wrapper.
+        # #2982's carry-forward check greps the body for a marker LINE, so it
+        # needs real newlines rather than "\n" escapes.
         printf '%s' "${STUB_BODY:-PR body}"
         exit 0
     fi
@@ -115,6 +134,13 @@ chmod +x "$T/bin/gh"
 F_HOME="$T/home"
 mkdir -p "$F_HOME/.pi/agent/reviews"
 LOG="$T/gh.log"
+# Deterministic gate key for the WHOLE suite. The recorder signs markers with
+# AI_REVIEW_GATE_KEY, and #784's carry-forward now VERIFIES that HMAC (a
+# shape-only check let a forged marker in the attacker-writable PR body be
+# carried forward and re-signed with the real key). So the suite must not depend
+# on the ambient key — or on its absence.
+export AI_REVIEW_GATE_KEY="test-key-2982"
+TEST_GATE_KEY="$AI_REVIEW_GATE_KEY"
 
 run_record() { # <repo-or-empty> <pr>
     run_record_rc "$1" "$2" "$SHA"
@@ -184,6 +210,27 @@ refs_for_any() { # <repo> <text> — boundary-anchored keyword-class scan
         export REPO="$repo"
         bash -c 'source "$1" >/dev/null 2>&1 || exit 1; closing_issue_refs "$2" "\b$CLOSING_KW"' _ "$RECORD" "$text"
     ) 2>/dev/null || true
+}
+
+# #2982: diff-binding runner — lets a test set the PR body AND the diff bytes
+# the stubbed `gh` returns for the `Accept: …v3.diff` fetch.
+run_record_diff() { # <pr> <sha> <body> [diff-file] [diff-fail] [extra record args…]
+    local pr="$1" sha="$2" body="$3" dfile="${4:-/dev/null}" dfail="${5:-0}"
+    shift $(( $# > 5 ? 5 : $# ))   # remaining args pass verbatim to record-review.sh
+    local rcfile="$T/rc" errfile="$T/err" cap="$T/cap"
+    : > "$LOG"; : > "$cap"; rm -f "$errfile"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_BODY="$body" STUB_DIFF_FILE="$dfile" STUB_DIFF_FAIL="$dfail" STUB_CAPTURE="$cap"
+        rc=0
+        bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+    RECORD_CAP="$(cat "$cap" 2>/dev/null || true)"
 }
 
 echo "── 1. Repo known → qualified key ───────────────────────────────"
@@ -554,6 +601,144 @@ run_record_raw 424509 "$SHA" clean "daniel-ospina/agent-infra" --force-stale
 run_record_raw 424510 "$SHA" clean "daniel-ospina/agent-infra"
 [ "$RECORD_RC" = "0" ] && ok "guard: plain 4-positional form still records (rc 0)" || bad "guard: plain form (rc=$RECORD_RC)"
 [ -f "$(rec_path 424510)" ] && ok "guard: plain form wrote a record" || bad "guard: plain form wrote no record"
+echo "── 11. #2982: diff binding (reviewed artifact = the diff) ──────"
+D_F="$T/diff.txt"; printf 'diff --git a/x b/x\n+hello\n' > "$D_F"
+DH="$(openssl dgst -sha256 < "$D_F" | awk '{print $NF}')"
+D_F2="$T/diff2.txt"; printf 'diff --git a/x b/x\n+other\n' > "$D_F2"
+DH2="$(openssl dgst -sha256 < "$D_F2" | awk '{print $NF}')"
+STALE="$(printf 'b%.0s' $(seq 1 40))"
+Q2() { printf '%s/.pi/agent/reviews/daniel-ospina-agent-infra-%s.json' "$F_HOME" "$1"; }
+
+# 11.1 normal path: the record and the signed marker both carry the diff hash.
+run_record_diff 424500 "$SHA" "PR body" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "11.1 normal record succeeds" || bad "11.1 normal record (rc=$RECORD_RC)"
+assert_contains "$(cat "$(Q2 424500)" 2>/dev/null)" "\"diff_sha256\":\"$DH\"" "11.1 record carries diff_sha256"
+assert_contains "$RECORD_CAP" "diff=$DH" "11.1 posted marker carries diff="
+assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "11.1 marker format: '@ <sha> diff=<hash> ('"
+
+# 11.2 stale sha + prior evidence for the SAME diff → carry forward to the head.
+PRIOR="review recorded: reviews/424501.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra) sig=$(printf '%s' "review recorded: reviews/424501.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra)" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+run_record_diff 424501 "$STALE" "body
+
+$PRIOR" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "11.2 stale sha + same diff carries forward (rc 0)" || bad "11.2 carry-forward (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "carry-forward" "11.2 explains the carry-forward"
+assert_contains "$(cat "$(Q2 424501)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "11.2 re-records against the CURRENT head"
+assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "11.2 posted marker binds the current head + the same diff"
+
+# 11.3 stale sha + prior evidence for a DIFFERENT diff → still refused (exit 3).
+# The prior marker's sig must be a WELL-FORMED 64-hex value, or the carry-forward
+# shape check rejects it on the SIG and this case would pass for the wrong
+# reason — deleting the diff comparison would leave the suite green. (It did:
+# an 8-hex `sig=deadbeef` fixture made this test vacuous until #784's review.)
+PRIOR3="review recorded: reviews/424502.json verdict=clean @ $STALE diff=$DH2 (daniel-ospina/agent-infra) sig=$(printf '%064d' 0)"
+rm -f "$(Q2 424502)"
+run_record_diff 424502 "$STALE" "body
+
+$PRIOR3" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3 stale sha + CHANGED diff still refuses (rc 3)" || bad "11.3 changed-diff refusal (rc=$RECORD_RC)"
+[ ! -f "$(Q2 424502)" ] && ok "11.3 no record written when the diff changed" || bad "11.3 wrote a record for an unreviewed diff"
+assert_contains "$RECORD_ERR" "cannot be shown unchanged" "11.3 names the reason"
+
+# 11.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
+rm -f "$(Q2 424503)"
+run_record_diff 424503 "$STALE" "body with no markers" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.4 stale sha + no prior evidence refuses (rc 3)" || bad "11.4 no-evidence refusal (rc=$RECORD_RC)"
+
+# 11.5 diff fetch unavailable → legacy sha-only marker (gate's sha path governs).
+run_record_diff 424504 "$SHA" "PR body" "$D_F" "1"
+[ "$RECORD_RC" = "0" ] && ok "11.5 diff fetch failure still records (rc 0)" || bad "11.5 diff-fail record (rc=$RECORD_RC)"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.5 legacy marker must not carry diff="; else ok "11.5 falls back to a legacy sha-only marker"; fi
+assert_contains "$RECORD_ERR" "could not compute this PR's diff hash" "11.5 warns that the marker cannot carry forward"
+if grep -q '"diff_sha256"' "$(Q2 424504)" 2>/dev/null; then bad "11.5 record must omit diff_sha256"; else ok "11.5 record omits diff_sha256"; fi
+
+# 11.6 #784 — --force-stale must NOT mint a diff-binding marker. A stale sha's
+# diff cannot be shown unchanged, so emitting diff= would create a
+# (stale_sha, live_diff) pair that never coexisted — and rule (b) accepts on
+# diff-equality ALONE, so the gate would accept it and attest to an unreviewable
+# revision. REGRESSION-SENSITIVE: before the fix this marker carried diff=.
+rm -f "$(Q2 424505)"
+run_record_diff 424505 "$STALE" "body with no markers" "$D_F" 0 --force-stale
+[ "$RECORD_RC" = "0" ] && ok "11.6 #784 --force-stale still records (rc 0)" || bad "11.6 #784 --force-stale record (rc=$RECORD_RC)"
+[ -f "$(Q2 424505)" ] && ok "11.6 #784 the record is still written (force-stale stays usable)" || bad "11.6 #784 record not written"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.6 #784 --force-stale must NOT emit diff= (rule (b) would accept a pair that never coexisted)"; else ok "11.6 #784 --force-stale marker is legacy sha-only"; fi
+if grep -q '"diff_sha256"' "$(Q2 424505)" 2>/dev/null; then bad "11.6 #784 record must omit diff_sha256"; else ok "11.6 #784 record omits diff_sha256"; fi
+
+# 11.7 #784 head-fetch failure — the WIDER half of the same class. When the head
+# cannot be confirmed the stale-sha guard block is skipped ENTIRELY, so the
+# original fix (nested inside the verified-stale arm) never ran and DIFF_HASH
+# survived into the marker: `@ <unverified_sha> diff=<live_diff>`, which rule (b)
+# accepts at face value. A transient gh/API failure (403 rate-limit, 5xx, expired
+# token) would thus launder ANY caller-supplied sha into a gate-accepted diff
+# binding. REGRESSION-SENSITIVE: before the fix this marker carried diff=.
+rm -f "$(Q2 424506)"
+STUB_HEAD_SHA="API rate limit exceeded" run_record_diff 424506 "$STALE" "body with no markers" "$D_F" 0 --force-stale
+[ "$RECORD_RC" = "0" ] && ok "11.7 #784 head-fetch failure still records (rc 0)" || bad "11.7 #784 head-fetch record (rc=$RECORD_RC)"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.7 #784 an UNVERIFIED head must NOT be bound to a diff (rule (b) accepts it at face value)"; else ok "11.7 #784 head-fetch failure degrades to a sha-only marker"; fi
+if grep -q '"diff_sha256"' "$(Q2 424506)" 2>/dev/null; then bad "11.7 #784 record must omit diff_sha256 when the head is unverified"; else ok "11.7 #784 record omits diff_sha256"; fi
+
+# 11.8 #784 cycle-2 — a FORGED prior marker must NOT carry forward. The PR body
+# is attacker-writable, so matching the SHAPE `sig=[0-9a-f]{64}` is not evidence:
+# before this fix a forged line with sig=<64 zeros> was accepted, carried to the
+# current head, and RE-SIGNED with the real key — a genuine attestation for a
+# diff nobody reviewed, undetectable by the gate because the producer is the
+# signer. REGRESSION-SENSITIVE: with a shape-only check this carries forward.
+rm -f "$(Q2 424507)"
+FORGED="review recorded: reviews/424507.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra) sig=$(printf '%064d' 0)"
+run_record_diff 424507 "$STALE" "body
+
+$FORGED" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.8 #784 a forged prior marker does NOT carry forward (rc 3)" || bad "11.8 #784 FORGED marker carried forward! (rc=$RECORD_RC)"
+[ ! -f "$(Q2 424507)" ] && ok "11.8 #784 no record written from forged evidence" || bad "11.8 #784 wrote a record from forged evidence"
+assert_contains "$RECORD_ERR" "BAD SIGNATURE" "11.8 #784 names the bad signature"
+
+# 11.9 #784 cycle-2 — the prior verdict must MATCH. A clean-micro attestation is
+# evidence of the MICRO process; it must not authorize a full clean record at a
+# new head. REGRESSION-SENSITIVE: a `clean(-micro)?` pattern let it escalate.
+rm -f "$(Q2 424508)"
+PM="review recorded: reviews/424508.json verdict=clean-micro @ $STALE diff=$DH (daniel-ospina/agent-infra)"
+PSIG="$(printf '%s' "$PM" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+run_record_diff 424508 "$STALE" "body
+
+$PM sig=$PSIG" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.9 #784 a clean-micro prior does NOT authorize a clean record (rc 3)" || bad "11.9 #784 clean-micro escalated to clean (rc=$RECORD_RC)"
+
+# 11.10 R1 (merge resolution) — the COMPOSED record must be well-formed JSON in
+# EVERY field combination, and the MB+DIFF combination must actually be REACHED.
+# The merge composed #1348's MB_FIELD (clean-low only) with #2982's DIFF_FIELD
+# (only when a diff hash exists). A doubled comma or a dropped trailing comma
+# keeps every SUBSTRING grep green, so only a JSON parse can falsify it. Before
+# this test the suite reached MB+DIFF ZERO times and never parsed a record at
+# all — an adversarial review found the mutants M1 (`%s%s` -> `%s,%s`), M2
+# (DIFF_FIELD's trailing comma dropped) and M3 (MB_FIELD's) all left it green.
+json_valid() { python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$1" 2>/dev/null; }
+MB="cccccccccccccccccccccccccccccccccccccccc"
+P2="$T/patch-compose.json"; : > "$P2"
+# A: DIFF only — clean, diff hash available.
+run_record_diff 424510 "$SHA" "PR body" "$D_F"
+json_valid "$(Q2 424510)" && ok "11.10 A DIFF-only record is well-formed JSON" || bad "11.10 A DIFF-only record is MALFORMED: $(cat "$(Q2 424510)" 2>/dev/null)"
+# B: MB+DIFF — the combination this merge exists to enable.
+STUB_FILES="docs/plans/2026-09-22-x.md" GH_STUB_PATCH_BODY="$P2" STUB_DIFF_FILE="$D_F" \
+  run_record_verdict clean-low "daniel-ospina/agent-infra" 424511
+json_valid "$(Q2 424511)" && ok "11.10 B MB+DIFF record is well-formed JSON" || bad "11.10 B MB+DIFF record is MALFORMED: $(cat "$(Q2 424511)" 2>/dev/null)"
+assert_contains "$(cat "$(Q2 424511)" 2>/dev/null)" "\"merge_base_sha\":\"$MB\"" "11.10 B carries merge_base_sha"
+assert_contains "$(cat "$(Q2 424511)" 2>/dev/null)" "\"diff_sha256\":\"$DH\"" "11.10 B carries diff_sha256"
+# C: MB only — clean-low with the diff fetch unavailable.
+STUB_FILES="docs/plans/2026-09-22-x.md" GH_STUB_PATCH_BODY="$P2" \
+  run_record_verdict clean-low "daniel-ospina/agent-infra" 424512
+json_valid "$(Q2 424512)" && ok "11.10 C MB-only record is well-formed JSON" || bad "11.10 C MB-only record is MALFORMED: $(cat "$(Q2 424512)" 2>/dev/null)"
+# D: NEITHER — clean, diff fetch forced to fail.
+run_record_diff 424513 "$SHA" "PR body" "$D_F" "1"
+json_valid "$(Q2 424513)" && ok "11.10 D NEITHER record is well-formed JSON" || bad "11.10 D NEITHER record is MALFORMED: $(cat "$(Q2 424513)" 2>/dev/null)"
+# Two cleanups, for two DIFFERENT reasons:
+#  (1) PR NUMBERS. §10 (#1348) runs AFTER this section and its C1 vector asserts
+#      "writes no record" for PR 424600. Reusing any number up there would leave a
+#      record behind and make C1 fail for a reason that has nothing to do with C1.
+#      That is why these use 424510-424513 — a range this suite does not otherwise touch.
+#  (2) The env-prefix assignments LEAK: `VAR=val func` does not restore VAR if it
+#      was previously UNSET (bash semantics), so STUB_FILES/STUB_DIFF_FILE would
+#      persist into §10 and make its code-bearing vectors see a docs-only diff.
+unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
 
 # ─────────────────────────────────────────────────────────────────────────
 # 10. #1348 clean-low content-shape guard — ADVERSARIAL DOMAIN
