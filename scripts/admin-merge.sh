@@ -178,13 +178,17 @@
 # are REPORTED but do not block; every other event, and any red whose run cannot
 # be resolved, BLOCKS. See MAIN_HEALTH_RUN_MAP_LIMIT.
 #
-# ON THE PR'S OWN TREE THAT FILTER IS VACUOUS — AND THAT IS THE POINT. A
-# `schedule`/`issues` run executes against the DEFAULT BRANCH head, so it can
-# never attach to a PR head sha: every red on the PR's surface is a
+# ON THE PR'S OWN TREE THAT FILTER IS VACUOUS — AND THE EXEMPTION IS NOW SCOPED
+# TO THE BASE, THE ONLY SURFACE IT WAS WRITTEN FOR (#1353). A `schedule`/`issues`
+# run executes against the DEFAULT BRANCH head, so it can never attach to a PR
+# head sha: every red on the PR's surface is a
 # `pull_request`/`pull_request_target`/`push` run, i.e. a lane that measures a
-# revision, and it BLOCKS. The classifier is kept (shared code, and an
-# unresolved event still fails closed) but it is EXPECTED to exclude nothing
-# here; a non-code event appearing on a PR surface would itself be an anomaly.
+# revision, and it BLOCKS. The exemption used to be applied UNCONDITIONALLY, so
+# a `schedule`-attributed red on the TREE was routed to the non-blocking list —
+# the rail merged the very red this paragraph called "an anomaly". The probe now
+# takes the surface EXPLICITLY: the BASE exempts the named non-code events, and
+# the TREE treats them as BLOCKING. An unresolved event still fails closed on
+# both.
 # The run map for a sha is selected by `gh run list --commit <sha>` (a sha is not
 # a branch name, so `--branch` cannot be used there as it is for main).
 #
@@ -1418,9 +1422,11 @@ residual_of() {
 # refuses" gate would therefore refuse essentially EVERY merge in that repo,
 # which is the blunt refusal this rail must not become. So each failing check is
 # resolved — by the run id in its own URL — to the EVENT that produced it, and
-# only an event that MEASURES CODE blocks. On the PR's own tree that filter is
-# VACUOUS (a cron run cannot attach to a PR head sha) and kept only because it is
-# shared code and an unresolved red must still fail closed.
+# only an event that MEASURES CODE blocks — AND ONLY ON THE BASE SURFACE, which
+# is the surface that filter was written for. The PR's own tree resolves the same
+# event the same way but does NOT exempt the named non-code events: a
+# default-branch run cannot attach to a PR head sha, so such a red there is an
+# ANOMALY and BLOCKS (#1353). An unresolved red still fails closed on both.
 #
 #   REPORT-ONLY (no code measured): schedule, issues, issue_comment.
 #   BLOCKING (code health):         push, pull_request, pull_request_target,
@@ -1437,15 +1443,24 @@ residual_of() {
 # listing is selected by branch for a branch ref and by --commit for a sha.
 MAIN_HEALTH_RUN_MAP_LIMIT=200
 
-# check_surface_probe <ref> <label> — measure EVERY workflow's check runs and
-# commit statuses attached to <ref> (a branch name OR a sha), into the
-# MAIN_HEALTH_* scratch set. The `label` names the surface in the summary lines,
-# so a probe of the PR's evaluated tree never claims to be about main. Callers
-# snapshot the scratch into their own prefix (BASE_* / TREE_*) immediately; see
-# step 2c and step 4.5.
+# check_surface_probe <ref> <label> [<exempt-noncode-events>] — measure EVERY
+# workflow's check runs and commit statuses attached to <ref> (a branch name OR a
+# sha), into the MAIN_HEALTH_* scratch set. The `label` names the surface in the
+# summary lines, so a probe of the PR's evaluated tree never claims to be about
+# main. <exempt-noncode-events> is 1 ONLY for the BASE surface (the
+# `schedule`/`issues`/`issue_comment` exemption); the PR's evaluated tree passes 0
+# and BLOCKS on them — the third argument is explicit so the exemption can never
+# drift back onto the surface that gates the merge. Callers snapshot the scratch
+# into their own prefix (BASE_* / TREE_*) immediately; see step 2c and step 4.5.
+#
+# A NON-CODE EVENT IS EXEMPT BY SURFACE, NOT BY EVENT (#1353). "Does this lane
+# measure a revision?" is a property of the EVENT; "would refusing this red
+# refuse every merge in a cron-noisy repo?" is a property of the SURFACE the red
+# appears on — the BASE. On the TREE the exemption can only ever exempt an
+# anomaly, because a default-branch run cannot attach to a PR head sha.
 check_surface_probe() {
-  local ref="$1" label="${2:-main}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix
+  local ref="$1" label="${2:-main}" allow_noncode="${3:-0}"
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason
   local map_sel=()
   local blocking=0 other=0
   local repo_args=()
@@ -1716,16 +1731,35 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
           wf="$(awk -F'\t' -v id="$run_id" '$1 == id { print $3; exit }' "$map_file")"
         fi
         [ -n "$wf" ] || wf="(workflow unresolved)"
+        # WHICH NON-CODE EVENTS ARE EXEMPT, AND ON WHICH SURFACE (#1353).
+        # `schedule`/`issues`/`issue_comment` measure no revision, so on the BASE
+        # such a red is REPORTED and does not block — otherwise a repo whose cron
+        # lanes are red most days refuses every merge. The exemption is scoped to
+        # the base because on the PR's EVALUATED TREE it is VACUOUS BY
+        # CONSTRUCTION: a run on the DEFAULT BRANCH cannot attach to a PR head
+        # sha, so a non-code red there is not noise but an ANOMALY — a red this
+        # merge would land. Treating it as noise (the old unconditional branch)
+        # routed it to the non-blocking list and merged. The surface decides; the
+        # event merely names itself. An UNRESOLVED event blocks on both.
         case "$ev" in
-          schedule|issues|issue_comment)
+          schedule|issues|issue_comment) noncode=1 ;;
+          *) noncode=0 ;;
+        esac
+        # The reason a NON-CODE red blocks. Only reachable when allow_noncode is
+        # 0 (the base exempts and returns above), so the reason is stated in the
+        # display line rather than left to be inferred.
+        blocking_reason=""
+        if [ "$noncode" -eq 1 ]; then
+          blocking_reason=" — NOT EXEMPT ON THIS SURFACE: a non-code event on the PR's evaluated tree is an ANOMALY, so BLOCKING"
+        fi
+        if [ "$noncode" -eq 1 ] && [ "$allow_noncode" -eq 1 ]; then
             [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
             MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl}${red_note_suffix} — NOT a code measurement, so NOT blocking — ${url}"
             other=$((other + 1))
-            ;;
-          *)
+        else
             [ -n "$MAIN_HEALTH_REDS" ] && MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}"$'\n'
             if [ -n "$ev" ]; then
-              MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl}${red_note_suffix} — ${url}"
+              MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl}${red_note_suffix}${blocking_reason} — ${url}"
             else
               MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — ${concl}${red_note_suffix} — ${url}"
             fi
@@ -1735,8 +1769,7 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
             [ -n "$MAIN_HEALTH_RED_TS" ] && MAIN_HEALTH_RED_TS="${MAIN_HEALTH_RED_TS}"$'\n'
             MAIN_HEALTH_RED_TS="${MAIN_HEALTH_RED_TS}${job}"$'\t'"${started_iso}"$'\t'"${started_epoch}"$'\t'"${url}"
             blocking=$((blocking + 1))
-            ;;
-        esac
+        fi
         ;;
     esac
   done <<< "$py_out"
@@ -2446,7 +2479,7 @@ main() {
   # but it NEVER blocks. It was the BLOCKING source in the previous revision, and
   # that is precisely what refused the PR that repairs a red main.
   local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA BASE_RED_TS BASE_MAX_COMPLETED BASE_MAX_COMPLETED_EPOCH
-  check_surface_probe "$base_ref" "the base branch '$base_ref'"
+  check_surface_probe "$base_ref" "the base branch '$base_ref'" 1
   BASE_STATUS="$MAIN_HEALTH_STATUS"; BASE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   BASE_REDS="$MAIN_HEALTH_REDS"; BASE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
   BASE_TOTAL="$MAIN_HEALTH_TOTAL"; BASE_RED="$MAIN_HEALTH_RED"; BASE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
@@ -2690,7 +2723,7 @@ main() {
   # not a refusal — same rule as before) and REFUSES on UNREADABLE (failing to
   # look is never a green).
   local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH
-  check_surface_probe "$head" "the PR's evaluated tree (head $head)"
+  check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0
   TREE_STATUS="$MAIN_HEALTH_STATUS"; TREE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   TREE_REDS="$MAIN_HEALTH_REDS"; TREE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
   TREE_TOTAL="$MAIN_HEALTH_TOTAL"; TREE_RED="$MAIN_HEALTH_RED"; TREE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"

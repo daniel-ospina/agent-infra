@@ -142,6 +142,24 @@
 #      `ADMIN_MERGE_LANE_PARITY` is refused rather than silently read as 'off';
 #      and the certifying path DISCLOSES the family it compared. Every one of
 #      these has a test that FAILS against the revision before its fix.
+#  23. THE CHECK-SURFACE POSTURE (#1353): every non-red value is NAMED; anything
+#      unnamed, absent, unmeasured or unattributable is a NAMED state — never a
+#      zero, and never dropped before classification. Four fail-opens, one per
+#      posture clause: the in-flight spelling is an ALLOW-LIST (an unrecognised
+#      `status` is classified by its conclusion, RED unless named non-red — on
+#      the tree AND the base, where the old deny-list also disarmed 4.6/4.7);
+#      only a COMPLETED measurement sets the staleness anchor (a PENDING status
+#      no longer advances it); the non-code-event exemption is scoped to the
+#      BASE surface (a `schedule` red on the tree BLOCKS — it cannot be noise
+#      there); and an UNNAMED check is classified under a placeholder, never
+#      dropped. §50-§53 pin all four, plus the attribution half (index 24).
+#  24. THE ATTRIBUTION HALF — #1319's sibling (#1353): `PR failing: 0` can mean
+#      "no failures", "not comparable" (the parity gate) OR "the failures were
+#      DROPPED". The parser drops a FAILED token that is not a test id (never in
+#      the set), so the rail now NAMES the dropped count and the tokens in its
+#      output and in the POSTED EVIDENCE, and states whether each set is
+#      COMPLETE or CLIPPED. A run whose failures are ENTIRELY unattributable
+#      still refuses (step 1c, preserved).
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -4334,6 +4352,59 @@ rc=$?
   || fail "a covered base red was refused (exit $rc) — the anchor stopped advancing from a completed measurement: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
 [ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+
+# ── 52. THE NON-CODE EXEMPTION IS SCOPED TO THE BASE SURFACE (#1353) ────────
+# `schedule`/`issues`/`issue_comment` are REPORT-ONLY so a cron-noisy base does
+# not refuse every merge. That exemption was applied UNCONDITIONALLY — including
+# to the PR's EVALUATED TREE, where the same header calls such an event "an
+# anomaly", because a default-branch run cannot attach to a PR head sha. So a red
+# on the TREE whose run map said `schedule` was routed to the non-blocking list
+# and merged. The exemption is now scoped to the surface it was written for.
+echo "== 52. the non-code-event exemption is BASE-only; on the tree it BLOCKS (#1353) =="
+
+# (a) THE REPRODUCTION. The tree's only check is a `completed failure` whose run
+# map says `schedule` (the fixture models the impossible-but-observed shape, i.e.
+# a mis-keyed run map or a future GitHub change). The old rail routed it to
+# REDS_OTHER, the tree read GREEN, and the merge ran.
+new_scen noncode-tree
+HEAD_NC1="e8e8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC1" > "$SCEN/head"
+lane_pass "$HEAD_NC1" 5921 > "$SCEN/runs-$HEAD_NC1"
+lane_pass mainnc1 5922 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 3301 backup completed failure 6901)"
+pr_run_map 6901 schedule registry-backup-cron
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a schedule-attributed red on the PR's TREE BLOCKS (exit $rc)" \
+  || fail "a non-code red on the evaluated tree was exempted and MERGED — the unconditional-exemption hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "3301\|backup" "$SCEN/err" && pass "…naming the failing check" \
+  || fail "the refusal does not name the check"
+grep -q "NOT EXEMPT ON THIS SURFACE" "$SCEN/err" && pass "…and SAYING the exemption does not apply on this surface" \
+  || fail "the refusal does not state that the non-code exemption is base-only"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an exempted tree red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an exempted tree red" || pass "no merge attempted"
+
+# (b) THE OVER-BLOCK GUARD — THE EXEMPTION STILL APPLIES ON THE BASE. A
+# `schedule` red on main must NOT block (the fleet-stopping blunt refusal the
+# exemption exists to avoid), and it must still be REPORTED.
+new_scen noncode-base-exempt
+HEAD_NC2="e9e9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC2" > "$SCEN/head"
+lane_pass "$HEAD_NC2" 5923 > "$SCEN/runs-$HEAD_NC2"
+lane_pass mainnc2 5924 > "$SCEN/runs-main"
+write_main_checks "$(check_run 3302 backup completed failure 6902)"
+main_run_map 6902 schedule registry-backup-cron
+pr_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a schedule-attributed red on the BASE still does NOT block (exit 0)" \
+  || fail "the base's cron exemption was lost (exit $rc) — that would refuse the fleet on a cron-noisy base: $(sed -n '1,3p' "$SCEN/err" 2>/dev/null)"
+grep -q "NON-code events" "$SCEN/out" && pass "…and the base's non-code red is still REPORTED, not silently dropped" \
+  || fail "the base's non-code red is no longer reported"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
