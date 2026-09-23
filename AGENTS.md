@@ -230,6 +230,19 @@ This applies even for "obvious" fixes — the cost of a wrong diagnosis is highe
 
 ---
 
+## ⛔ Reading verification state — a rollup is not a result
+
+**A check-run rollup is NOT "is main green".** GitHub KEEPS every attempt, so one commit can carry dozens of check-runs and the SAME workflow can hold both `failure` and `success` (measured 2026-09-23: **66 check-runs on one commit**; the `provenance` workflow had **10 attempts**, conclusions `{failure, success}`). **A re-run ADDS a red — it does not clear one** — so the more a flaky check is retried, the redder a green commit looks. Retrying is the correct response to flake and it makes the aggregate worse.
+
+Read the RUNS, on the EXACT sha, newest attempt per name:
+
+1. `git rev-parse origin/main` — never inherit a sha from a listing.
+2. `gh api repos/<o>/<r>/commits/<SHA>/check-runs?per_page=100 --paginate`
+3. Group by workflow/job **name**; take the **newest** `started_at`.
+4. Never `/commits/<sha>/status` — legacy endpoint: where CI is check-runs it returns `state=pending` with `statuses=0`, which reads as "not green" from a field that was never populated.
+
+A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main.**
+
 ## Sub-agent Dispatch
 
 Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context → construct their prompts with exactly what they need.
