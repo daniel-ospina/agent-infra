@@ -156,6 +156,18 @@
 # time a post-merge run starts. The pending COUNT is printed, so an unmeasured
 # surface is legible rather than silent.
 #
+# AND IN-FLIGHT IS AN ALLOW-LIST TOO (#1353). The same deny-list defect lived in
+# the STATUS half of that rule: `status != "completed"` was the WHOLE test, so
+# ANY spelling this rail had never seen — `completely_finished`, `Completed`, the
+# empty string, a vendor's newer token — was filed as PENDING. Pending is never
+# red, so the surface still read GREEN and the rail merged a check GitHub had
+# already concluded `failure`. PENDING is therefore only for a NAMED in-flight
+# spelling (`queued`, `in_progress`, `waiting`, `requested`, `pending`); any
+# OTHER non-completed status is classified by its CONCLUSION under the same
+# allow-list — RED unless that conclusion is one this line names as non-red. A
+# non-completed run is never a MEASUREMENT either, so it cannot set the surface's
+# last-production time (the staleness anchor).
+#
 # AND RED ONLY BLOCKS WHEN IT MEASURES CODE. MAIN's surface is dominated by
 # lanes that measure no revision: on tortoise's last eight main commits SEVEN
 # carried a failure-like check, and over the repo's last 100 main runs 6 of the
@@ -1428,7 +1440,7 @@ MAIN_HEALTH_RUN_MAP_LIMIT=200
 # step 2c and step 4.5.
 check_surface_probe() {
   local ref="$1" label="${2:-main}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix
   local map_sel=()
   local blocking=0 other=0
   local repo_args=()
@@ -1585,15 +1597,31 @@ surface_epoch = 0
 surface_iso = ""
 reds = []   # (name, app, conclusion, url, started_iso)
 pend = []
+# A NON-COMPLETED CHECK RUN IS PENDING ONLY FOR A NAMED IN-FLIGHT SPELLING.
+# `status != "completed"` used to be the whole test — a DENY-list — so a spelling
+# this rail had never seen (`completely_finished`, `Completed`, the empty string)
+# became PENDING, PENDING is never red, and the surface still read GREEN (#1353).
+# The in-flight set is NAMED here; any OTHER non-completed status is classified by
+# its CONCLUSION, RED unless that conclusion is one this rail names as non-red.
+IN_FLIGHT_STATUS = {"queued", "in_progress", "waiting", "requested", "pending"}
 for _, name, app, status, concl, url, started, completed in best.values():
     if status != "completed":
-        pend.append((name, app))
+        if status in IN_FLIGHT_STATUS:
+            pend.append((name, app))
+        elif concl not in NON_RED_CONC:
+            # The STATUS is the token that failed closed, so it is CARRIED on the
+            # red line (its last field) and named in the refusal — an operator
+            # must be able to see WHICH spelling was unrecognised.
+            reds.append((name, app, concl, url, started,
+                         "status '%s' is not a NAMED in-flight spelling (queued/in_progress/waiting/requested/pending)" % status))
+        # NEITHER branch is a MEASUREMENT: a non-completed run has no
+        # `completed_at`, so it can never set the surface time below.
         continue
     e = ts_epoch(completed)
     if e != "" and (surface_iso == "" or int(e) > surface_epoch):
         surface_epoch, surface_iso = int(e), completed
     if concl not in NON_RED_CONC:
-        reds.append((name, app, concl, url, started))
+        reds.append((name, app, concl, url, started, ""))
 for stamp, ctx, state, url in sbest.values():
     if state == "pending":
         # PENDING is checked FIRST and is its own state, never red: the GitHub
@@ -1601,14 +1629,14 @@ for stamp, ctx, state, url in sbest.values():
         # ZERO statuses, and that is not a failure.
         pend.append((ctx, "commit-status"))
     elif state not in NON_RED_STATE:
-        reds.append((ctx, "commit-status", state, url, stamp))
+        reds.append((ctx, "commit-status", state, url, stamp, ""))
     e = ts_epoch(stamp)
     if e != "" and (surface_iso == "" or int(e) > surface_epoch):
         surface_epoch, surface_iso = int(e), stamp
 
 total = len(best) + len(sbest)
-for name, app, concl, url, tiso in reds:
-    sys.stdout.write("RED\t%s\t%s\t%s\t%s\t%s\t%s\n" % (name, app, concl, url, tiso, ts_epoch(tiso)))
+for name, app, concl, url, tiso, note in reds:
+    sys.stdout.write("RED\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (name, app, concl, url, tiso, ts_epoch(tiso), note))
 for name, app in pend:
     sys.stdout.write("PENDING\t%s\t%s\n" % (name, app))
 sys.stdout.write("SURFACE\t%s\t%s\n" % (surface_iso, ("" if surface_iso == "" else str(surface_epoch))))
@@ -1659,7 +1687,13 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         IFS=$'\t' read -r tag MAIN_HEALTH_MAX_COMPLETED MAIN_HEALTH_MAX_COMPLETED_EPOCH <<< "$line"
         ;;
       RED$'\t'*)
-        IFS=$'\t' read -r tag job app concl url started_iso started_epoch <<< "$line"
+        IFS=$'\t' read -r tag job app concl url started_iso started_epoch red_note <<< "$line"
+        # A NOTE carried by the row — the token that FAILED CLOSED (an
+        # unrecognised non-completed status, #1353). Appended to the display line
+        # wherever the red lands, so the operator sees WHICH spelling was not
+        # NAMED rather than only the conclusion it was classified by.
+        red_note_suffix=""
+        [ -n "$red_note" ] && red_note_suffix=" — ${red_note}"
         # WHICH EVENT PRODUCED THIS CHECK? A red on a `schedule`/`issues` lane
         # measures no revision, and blocking on it would refuse every merge (see
         # MAIN_HEALTH_RUN_MAP_LIMIT). The run id is in the check run's own URL.
@@ -1673,15 +1707,15 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         case "$ev" in
           schedule|issues|issue_comment)
             [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
-            MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl} — NOT a code measurement, so NOT blocking — ${url}"
+            MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl}${red_note_suffix} — NOT a code measurement, so NOT blocking — ${url}"
             other=$((other + 1))
             ;;
           *)
             [ -n "$MAIN_HEALTH_REDS" ] && MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}"$'\n'
             if [ -n "$ev" ]; then
-              MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl} — ${url}"
+              MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl}${red_note_suffix} — ${url}"
             else
-              MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — ${concl} — ${url}"
+              MAIN_HEALTH_REDS="${MAIN_HEALTH_REDS}   • ${job} — workflow '${wf}' — ${concl}${red_note_suffix} — ${url}"
             fi
             # Keep the red's own START time for the staleness comparison: a red
             # whose run began after the PR's surface was produced cannot have

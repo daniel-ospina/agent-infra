@@ -4152,6 +4152,108 @@ grep -qE '^[[:space:]]*comm[[:space:]]+-23' "$ADM" \
   && fail "the lane-coverage subtraction re-implements comm -23 in the rail" \
   || pass "…and no comm -23 was reintroduced anywhere in the rail"
 
+# ── 50. IN-FLIGHT IS AN ALLOW-LIST — AN UNRECOGNISED STATUS IS RED (#1353) ──
+# The pending half of the classifier was a DENY-list: `status != "completed"` was
+# the WHOLE test, so any spelling this rail had never seen became PENDING — and
+# PENDING is never red, so the surface still read GREEN and the rail merged a
+# check GitHub had already concluded `failure`. The in-flight spellings are now
+# NAMED (`queued`, `in_progress`, `waiting`, `requested`, `pending`); any OTHER
+# non-completed status is classified by its CONCLUSION, RED unless that
+# conclusion is one the rail names as non-red. The same hole on the BASE read
+# `base tree GREEN` and silently DISARMED 4.6/4.7, which are both gated on the
+# base being red — so the last scenario shows the staleness rule firing again.
+echo "== 50. an unrecognised check-run STATUS is classified, never assumed PENDING (#1353) =="
+
+# (a) THE REPRODUCTION, ON THE PR'S OWN TREE. The tree's only check is
+# `status=completely_finished, conclusion=failure`: the deny-list filed it as
+# PENDING, the tree read GREEN (`green — 0 failing of 1 measured, 1 pending`),
+# evidence was posted and the merge ran.
+new_scen status-tree-unknown
+HEAD_S1="e1e1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_S1" > "$SCEN/head"
+lane_pass "$HEAD_S1" 5901 > "$SCEN/runs-$HEAD_S1"
+lane_pass mains1 5902 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 9101 lint completely_finished failure 9911)"
+pr_run_map 9911 pull_request 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNRECOGNISED non-completed status + a red conclusion BLOCKS (exit $rc)" \
+  || fail "an unrecognised status read as PENDING (never red) and MERGED — the deny-list hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "completely_finished" "$SCEN/err" && pass "…naming the STATUS that failed closed" \
+  || fail "the refusal does not name the unrecognised status: $(grep -m1 '^   • ' "$SCEN/err")"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an unrecognised red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an unrecognised red" || pass "no merge attempted"
+
+# (b) THE SAME SPELLING IN ITS OTHER GUISES — an EMPTY status and a CAPITALISED
+# one are both spellings this rail has never NAMED, and both used to become
+# PENDING. (`Completed` is the trap a case-sensitive vendor integration ships.)
+for variant in "" "Completed"; do
+  new_scen "status-tree-var${variant:-empty}"
+  HEAD_SV="e2e2000000000000000000000000000000000000"
+  printf '%s\n' "$HEAD_SV" > "$SCEN/head"
+  lane_pass "$HEAD_SV" 5903 > "$SCEN/runs-$HEAD_SV"
+  lane_pass mainsv 5904 > "$SCEN/runs-main"
+  main_green_surface
+  write_pr_checks "$(check_run 9102 lint "$variant" failure 9912)"
+  pr_run_map 9912 pull_request 'Post-merge validation'
+  run_admin_here 42 >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "status='${variant:-<empty>}' with a red conclusion BLOCKS too (exit $rc)" \
+    || fail "status='${variant:-<empty>}' read as PENDING and merged"
+done
+
+# (c) THE SAME HOLE ON THE BASE DISARMS THE STALENESS RULES. The base's only
+# check is `status=in_progress_y, conclusion=failure`, started AFTER this PR's
+# surface was produced. Read as PENDING, the base looks GREEN, so neither 4.6
+# (a red newer than the surface) nor 4.7 (a lagging merge ref) is even reached —
+# the stale green merges over a red base. Classified by its conclusion, the base
+# is RED and 4.6 refuses.
+new_scen status-base-unknown
+HEAD_S2="e3e3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_S2" > "$SCEN/head"
+lane_pass "$HEAD_S2" 5905 > "$SCEN/runs-$HEAD_S2"
+lane_pass mains2 5906 > "$SCEN/runs-main"
+# The PR's own tree is GREEN, produced at 00:01.
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7301 pull_request 'CI'
+# The base carries a red at 00:02 — AFTER the PR surface, so 4.6 must fire.
+write_main_checks "$(check_run 6100 lint in_progress_y failure 9951 2026-01-01T00:02:00Z)"
+main_run_map 9951 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unrecognised BASE status hides a red base no longer (exit $rc)" \
+  || fail "an unrecognised base status read as PENDING disarmed 4.6/4.7 and MERGED over a red base"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" && pass "…so the 4.6 staleness rule runs again (the disarm is repaired)" \
+  || fail "the refusal is not the staleness one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "in_progress_y" "$SCEN/err" && pass "…naming the base status that failed closed" \
+  || fail "the base refusal does not name the unrecognised status"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a hidden red base" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a hidden red base" || pass "no merge attempted"
+
+# (d) THE OVER-BLOCK GUARD: the NAMED in-flight spellings are still PENDING and
+# still do not block. Main always has something running, so reddening these would
+# refuse the fleet on every post-merge run.
+new_scen status-inflight-pending
+HEAD_S3="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_S3" > "$SCEN/head"
+lane_pass "$HEAD_S3" 5907 > "$SCEN/runs-$HEAD_S3"
+lane_pass mains3 5908 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 9201 'pr / lint' in_progress null 9921)" \
+  "$(check_run 9202 'pr / test' queued null 9922)"
+pr_run_map 9921 pull_request 'CI' 9922 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "in_progress/queued are still PENDING, never red (exit 0)" \
+  || fail "a legitimately in-flight check was reddened (exit $rc): $(sed -n '1,3p' "$SCEN/err" 2>/dev/null)"
+grep -q "pending 2" "$SCEN/out" && pass "…and BOTH in-flight checks are COUNTED in the evidence" \
+  || fail "the in-flight checks are not counted: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge was attempted"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
