@@ -245,6 +245,27 @@ refusal_keys() {
   '
 }
 
+# fold_continuations — join a backslash-continued command into one logical line BEFORE any tail
+# test. Without this the tail is judged on the physical line only, so a redirection prefix makes
+# the allow-list match and the real tail is never seen:
+#   run: |
+#     bash scripts/run-bash-shards.sh > /dev/null \
+#       || true          <- rc 0, while a failing shard still cannot fail the run
+# Folding runs AFTER strip_noise on purpose: folding first would let a `\`-terminated line inside
+# a heredoc body swallow the line after the heredoc.
+fold_continuations() {
+  awk '
+    {
+      line = $0
+      while (line ~ /\\$/) {
+        if ((getline nxt) > 0) { sub(/\\$/, " ", line); line = line nxt }
+        else break
+      }
+      print line
+    }
+  '
+}
+
 # calls_runner <relpath> — print "<good> <refused>" for command-position `bash <rel>` sites on
 # stdin. A site counts as coverage only when the call is BARE: nothing after the path except
 # redirections. Everything else is REFUSED (uncounted, and the guard exits 2) because it can let
@@ -254,6 +275,8 @@ refusal_keys() {
 #   the cat), and any other `;`-separated tail. The accumulator form
 #   (`runner || errors=$((errors+1))`) is refused too: the guard cannot see whether the
 #   accumulator is ever read, so accepting it accepts 'count the failure and exit 0'.
+# The `|`/`;` scan covers the WHOLE remainder (not a prefix), and the remainder is a folded
+# logical line, so `> log || true` and `> log \` + `| tee x` are both refused.
 # Quoting the path (`bash 'runner'`) is accepted.
 calls_runner() {
   awk -v rel="$1" '
@@ -358,7 +381,7 @@ for lane in "PR:$PR_WORKFLOW:$PR_JOB" "main:$MAIN_WORKFLOW:$MAIN_JOB"; do
     note "guard's own CI_LANE_* inputs (a job that configures the gate is not coverage); exiting 2"
     exit 2
   fi
-  read -r n refused <<<"$(printf '%s\n' "$body" | run_blocks | strip_noise | calls_runner "$RUNNER_REL")"
+  read -r n refused <<<"$(printf '%s\n' "$body" | run_blocks | fold_continuations | strip_noise | calls_runner "$RUNNER_REL")"
   if [ "$refused" -gt 0 ]; then
     err "$name lane job '$job' calls $RUNNER_REL in a form that cannot count as coverage — a"
     note "trailing flag (e.g. --list runs no shard), a pipe, an accumulator or other || /; tail"

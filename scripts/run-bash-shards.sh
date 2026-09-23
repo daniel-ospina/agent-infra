@@ -63,6 +63,7 @@ sweep_file() { swept=$((swept + 1)); bash -n "$1" || shard_errors=$((shard_error
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report "14 shards passed" having
 # run none of the suites — the counter arm alone cannot tell the difference.
+checkout_real="$(pwd -P)"
 while IFS= read -r t; do
   case "$t" in
     /*|*..*) echo "❌ shard target '$t' is not inside this checkout"; exit 1 ;;
@@ -71,6 +72,13 @@ while IFS= read -r t; do
     echo "❌ shard target '$t' is a symlink — it may resolve outside the checkout"
     exit 1
   fi
+  # The leaf check above is not enough: a symlinked PARENT directory (scripts/ -> elsewhere)
+  # resolves the same target out of the checkout while the leaf itself is a regular file.
+  # `cd … && pwd -P` resolves every component, so containment is judged on the real path.
+  case "$(cd "$(dirname "$t")" 2>/dev/null && pwd -P)/" in
+    "$checkout_real"/*) : ;;
+    *) echo "❌ shard target '$t' resolves outside this checkout ($(cd "$(dirname "$t")" 2>/dev/null && pwd -P))"; exit 1 ;;
+  esac
   if [ ! -f "$t" ]; then
     echo "❌ shard target '$t' does not exist — the list and the checkout disagree"
     exit 1

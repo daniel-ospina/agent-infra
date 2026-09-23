@@ -666,6 +666,49 @@ else
   fi
 fi
 
+echo ""
+echo "8z. A BACKSLASH-CONTINUED SWALLOW → rc 2 (the tail is not only the first physical line)"
+awk '{ if ($0 ~ /^        run: bash scripts\/run-bash-shards\.sh$/) { print "        run: |"; print "          bash scripts/run-bash-shards.sh > /dev/null \\"; print "            || true"; next } print }' \
+  "$PR" >"$TMP/ci-pr-cont-swallow.yml"
+if cmp -s "$PR" "$TMP/ci-pr-cont-swallow.yml"; then
+  fail "the continued-swallow mutation did not change the file"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-cont-swallow.yml"
+  if [ "$RC" -eq 2 ]; then
+    pass "a re-direction then a continued '|| true' exits 2 (the fold is what makes the tail visible)"
+  else
+    fail "a continued '|| true' returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+awk '{ if ($0 ~ /^        run: bash scripts\/run-bash-shards\.sh$/) { print "        run: |"; print "          bash scripts/run-bash-shards.sh 2>&1 \\"; print "            | tee /tmp/shards.log"; next } print }' \
+  "$PR" >"$TMP/ci-pr-cont-pipe.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-cont-pipe.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a continued pipe exits 2 (no pipefail in the default shell)"
+else
+  fail "a continued pipe returned rc $RC (want 2): $OUT"
+fi
+
+echo ""
+echo "8aa. A SYMLINKED PARENT DIRECTORY → the RUNNER must refuse it"
+PARENTDIR="$TMP/parentrepo"
+mkdir -p "$PARENTDIR" "$TMP/outside-dir"
+printf 'exit 0\n' >"$TMP/outside-dir/stub.sh"
+ln -sfn "$TMP/outside-dir" "$PARENTDIR/scripts"
+awk -v cheap="scripts/stub.sh" '
+  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
+  { print }
+' "$RUNNER" >"$PARENTDIR/runner.sh"
+( cd "$PARENTDIR" && bash runner.sh ) >"$TMP/runner-parentsym.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-parentsym.out")"
+if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'resolves outside this checkout'; then
+  pass "a symlinked PARENT directory is refused (the leaf check alone would pass it)"
+else
+  fail "a symlinked parent dir returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -1)"
+fi
+
 bash "$GUARD" --no-such-flag >"$TMP/badflag.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/badflag.out")"
