@@ -232,16 +232,17 @@ This applies even for "obvious" fixes — the cost of a wrong diagnosis is highe
 
 ## ⛔ Reading verification state — a rollup is not a result
 
-**A check-run rollup is NOT "is main green".** GitHub KEEPS every attempt, so one commit can carry dozens of check-runs and the SAME workflow can hold both `failure` and `success` (measured 2026-09-23: **66 check-runs on one commit**; the `provenance` workflow had **10 attempts**, conclusions `{failure, success}`). **A re-run ADDS a red — it does not clear one** — so the more a flaky check is retried, the redder a green commit looks. Retrying is the correct response to flake and it makes the aggregate worse.
+**A check-run rollup is NOT "is main green".** GitHub KEEPS every attempt, so one commit can carry dozens of check-runs and the SAME workflow can hold both `failure` and `success`. **A re-run ADDS a red — it does not clear one** — so the more a flaky check is retried, the redder a green commit looks. Retrying is the correct response to flake and it makes the aggregate worse. (One commit carried dozens of check-runs, one workflow holding 10 attempts at measurement. Every re-run grows these counts — re-measure before quoting a number, or cite the mechanism and not the integers.)
 
-Read the RUNS, on the EXACT sha, newest attempt per name:
+Read the RUNS, on the EXACT sha, newest attempt per check:
 
-1. `git rev-parse origin/main` — never inherit a sha from a listing.
-2. `gh api repos/<o>/<r>/commits/<SHA>/check-runs?per_page=100 --paginate`
-3. Group by workflow/job **name**; take the **newest** `started_at`.
-4. Never `/commits/<sha>/status` — legacy endpoint: where CI is check-runs it returns `state=pending` with `statuses=0`, which reads as "not green" from a field that was never populated.
+1. `git fetch origin main && git rev-parse origin/main` — a bare `rev-parse` reads the LOCAL remote-tracking ref, only as fresh as the last fetch, and a stale sha yields a false **green** (the inverse error, and the more dangerous one). `git ls-remote origin refs/heads/main` needs no fetch.
+2. `gh api "repos/<o>/<r>/commits/<SHA>/check-runs?per_page=100&filter=all" --paginate` — pin `filter=all` so "every attempt" is stated rather than inferred from the default.
+3. Group by **app + job name** and take the newest per group, ordered by **`id`** — `started_at` is nullable (a queued attempt has none) and is a tiebreak only.
+4. **Decide the verdict, don't infer it.** GREEN means every group's newest attempt is `status == "completed"` AND `conclusion` is one of `success`, `neutral`, `skipped`. NOT green: `failure`, `timed_out`, `action_required`, `cancelled`. **Any newest attempt still queued or in progress means NOT YET KNOWN** — report that. Guessing a verdict from a pending check is the same error as reading a rollup.
+5. Never `/commits/<sha>/status` — legacy endpoint: where CI is check-runs it returns `state=pending` with `statuses=0`, which reads as "not green" from a field that was never populated.
 
-A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main.**
+A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main** — the defect is `#4877`, and the instruction-file divergence it exposed is `#1399`.
 
 ## Sub-agent Dispatch
 
