@@ -86,12 +86,29 @@
 #      away — `test (a, docker)` and `test (a, embedded)` are different lanes).
 #      Both sides are read over the SAME window (the PR's lane runs for the head;
 #      main's last `--main-runs`), so a shard main ran only inside the operator's
-#      window cannot be sampled away. `ADMIN_MERGE_LANE_PARITY=declared-off` is
-#      the AUDITED escape (a trigger-split repo, #1349): it certifies while
-#      STATING in the evidence and on stderr that parity was NOT established, and
-#      any other value is refused at startup. Declared OUT of scope: a repo that
-#      varies the test SELECTION within one shard name (files chosen per-diff
-#      inside `test (a)`), which a job list cannot show — filed as #1350.
+#      window cannot be sampled away. A listing that is only PARTLY readable is
+#      UNREADABLE, not a thinner lane (cycle-2 P1: an unparsable run line used to
+#      be skipped, silently shrinking the reference; an unterminated final line
+#      was dropped outright). A family whose every member is a workflow LIFECYCLE
+#      job measured nothing and is refused (cycle-2 P1: `=changes` certified on
+#      bookkeeping while main's real shard went uncompared), which is why the
+#      evidence and the refusal both NAME the parity family. `--main-runs` is
+#      validated (positive, ≤ 200) before any CI work — the window is also the
+#      gate's Jobs-API call budget. `ADMIN_MERGE_LANE_PARITY=declared-off` is the
+#      AUDITED escape (a trigger-split repo, #1349): it certifies while STATING in
+#      the evidence and on stderr that parity was NOT established, and any other
+#      value is refused at startup. Declared OUT of scope: a repo that varies the
+#      test SELECTION within one shard name (files chosen per-diff inside
+#      `test (a)`), which a job list cannot show — filed as #1350.
+#  21. THE LANE-PARITY GATE'S OWN FAIL-OPEN PATHS (#1319 cycle-1/2 review): the
+#      gate must not itself conclude from an absence. An EMPTY shard set is not
+#      an empty FILE (a blank line used to match itself and certify); a shard
+#      main ran only INSIDE the operator's window must not be sampled away; a
+#      failed `gh run list` is a LISTING failure; a partly-readable listing is
+#      unreadable; a lifecycle-only "family" measured nothing; a misspelled
+#      `ADMIN_MERGE_LANE_PARITY` is refused rather than silently read as 'off';
+#      and the certifying path DISCLOSES the family it compared. Every one of
+#      these has a test that FAILS against the revision before its fix.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -3018,6 +3035,123 @@ rc=$?
 grep -q "refusing ADMIN_MERGE_LANE_PARITY" "$TMP/err" && pass "…naming the knob and its two legal values" \
   || fail "the startup refusal does not name the knob"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted after a refused knob" || pass "no merge attempted"
+
+# (l) THE CLASSIC #4457 SHAPE, on the PR side: main's reference is REAL, and the
+# PR's set is EMPTY because it SKIPPED everything. Every shard main ran is then
+# missing — never "no difference". (The both-sides-empty form is (f); this pins
+# the asymmetric direction, where a naive `if pr set non-empty` guard would take
+# the `cp main → missing` branch and must still refuse.)
+new_scen vacuousprempty
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9921 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainempty 9922 > "$SCEN/runs-main"
+lane_jobset 9921 skipped 'test (a)' 'test (b)' 'test-slow (a)'
+lane_jobset 9922 success 'test (a)' 'test (b)' 'test-slow (a)'
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "main non-empty + the PR's executed set EMPTY → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an empty PR set was read as 'no difference'"
+grep -q "did NOT EXECUTE 3 test shard" "$TMP/err" && pass "…counting EVERY shard main ran as missing" \
+  || fail "the empty-PR-set refusal does not count main's shards as missing"
+
+# (m) AN UNTERMINATED LISTING LINE IS STILL A RUN (#1319 cycle-2 P1). `read`
+# returns non-zero on a final line with no trailing newline; a `while read` body
+# then never sees it, so the run is DROPPED — a silently thinner reference. The
+# run that is dropped is the one that names the shard main ran and the PR did
+# not, so the drop turns a refusal into a certificate.
+new_scen vacuousnonewline
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9951 > "$SCEN/runs-$HEAD_VP"
+# Run 9952 is terminated; 9953 is the UNTERMINATED last line (no trailing \n).
+lane_pass mainnl00 9952 > "$SCEN/runs-main"
+printf 'completed\tsuccess\tmainnl00:9953' >> "$SCEN/runs-main"
+lane_jobset 9951 success 'test (a)'
+lane_jobset 9952 success 'test (a)'
+lane_jobset 9953 success 'test (a)' 'test (b)'
+run_admin 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a final listing line with NO trailing newline is still a run → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — the unterminated line was dropped, shrinking the reference"
+grep -q "test (b)" "$TMP/err" && pass "…and the shard it named is the one reported missing" \
+  || fail "the run on the unterminated line was not read at all"
+
+# (n) A LISTING THAT IS ONLY PARTLY READABLE IS UNREADABLE (#1319 cycle-2 P1). A
+# line that does not parse into a run id used to be `continue`d away — a partial
+# listing read as a THINNER LANE, which is the one thing the doctrine forbids.
+new_scen vacuouspartial
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9961 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainpt00 9962 > "$SCEN/runs-main"
+# A truncated line: status only, no conclusion and no run id.
+printf 'completed\n' >> "$SCEN/runs-main"
+lane_jobset 9961 success 'test (a)'
+lane_jobset 9962 success 'test (a)'
+run_admin 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a truncated listing line → BLOCK (exit $rc), never a thinner lane" \
+  || fail "expected a non-zero exit, got 0 — a partial listing was read as 'main ran fewer shards'"
+grep -q "unparsable lane-run listing line" "$TMP/err" && pass "…named as an UNPARSABLE listing line" \
+  || fail "the partial-listing refusal is not named: $(head -2 "$TMP/err")"
+
+# (o) THE FAMILY MUST MEASURE SOMETHING (#1319 cycle-2 P1). The prefix is a family
+# SELECTOR; `ADMIN_MERGE_LANE_JOB_PREFIX=changes` matches the workflow's
+# bookkeeping job, and certifying on it compares nothing while main's real
+# `test-slow (a)` sits outside the gate. A family of only lifecycle jobs is
+# refused — the knob exists for MISNAMED test shards, not for excluding tests.
+new_scen vacuouslifecycle
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9971 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainlc00 9972 > "$SCEN/runs-main"
+lane_jobset 9971 success 'changes' 'python-ci-gate'
+lane_jobset 9972 success 'changes' 'python-ci-gate' 'test-slow (a)'
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_LANE_JOB_PREFIX=changes bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a parity family of ONLY lifecycle jobs → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — the gate certified on bookkeeping jobs while main's test-slow (a) went uncompared"
+grep -q "matched ONLY lifecycle jobs" "$TMP/err" && pass "…naming the lifecycle family as the reason" \
+  || fail "the lifecycle-family refusal is not named: $(head -2 "$TMP/err")"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on a bookkeeping-only family" || pass "no merge attempted"
+
+# (p) THE CERTIFICATE NAMES THE FAMILY IT COMPARED (#1319 cycle-2 P1). The
+# declared residual (a narrowed prefix removes a family from the gate) is
+# acceptable ONLY because the disclosure is real — on the path that CERTIFIES,
+# which is exactly the path that used to be silent.
+grep -q "parity family: test\*" "$TMP/scen-vacuouscertify/comment" \
+  && pass "the certifying evidence NAMES the parity family it compared (test*)" \
+  || fail "the certificate does not name the family, so a narrowed prefix is silent"
+# The refusal path too: `run_admin` writes stderr to a SHARED $TMP/err, so the
+# refusal is re-run against its own preserved scenario dir rather than read back
+# from a file a later scenario overwrote.
+SCEN="$TMP/scen-vacuousparity"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] || fail "the failed-parity scenario stopped refusing on a re-run"
+grep -q "parity family: test\*" "$TMP/err" \
+  && pass "…and so does the REFUSAL, so a narrowed prefix is legible there too" \
+  || fail "the refusal does not name the family it compared"
+
+# (q) THE BASELINE WINDOW IS VALIDATED. A non-numeric window makes `gh run list
+# --limit abc` fail (a named BLOCK, but one the operator could have been told
+# about before any CI work); an unbounded window is a COST blow-up, because the
+# lane gate fetches one Jobs API listing per run on each side.
+new_scen vacuouswindowneg
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+run_admin 42 --main-runs abc >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "a NON-NUMERIC --main-runs is refused at startup (exit 2)" \
+  || fail "expected the startup refusal (exit 2), got $rc"
+grep -q "refusing --main-runs" "$TMP/err" && pass "…naming the flag and its value" \
+  || fail "the refusal does not name --main-runs"
+grep -q "pr view" "$SCEN/calls" && fail "the window was validated only AFTER CI work started" \
+  || pass "…before ANY gh call"
+new_scen vacuouswindowbig
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+run_admin 42 --main-runs 100000 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "an UNBOUNDED --main-runs window is refused (exit 2)" \
+  || fail "expected the startup refusal (exit 2), got $rc — an unbounded window is an unbounded call budget"
+grep -q "beyond the usable window" "$TMP/err" && pass "…naming the bound" || fail "the window bound is not named"
 
 # The parity key exists ONCE, in `lane_parity_check`, and it is not a second
 # `comm -23`: the one `comm` in this rail belongs to the parser's `--diff` (test
