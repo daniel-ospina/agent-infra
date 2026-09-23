@@ -120,7 +120,10 @@
 #   must come from the SAME lane, or `comm -23` compares two different things.
 #
 # WHAT `--runs-report` MEANS (the completion doctrine):
-#   examined   failing runs in the lane (the ones whose logs are parsed)
+#   examined   failing runs in the lane (the ones whose logs are parsed), AFTER
+#              the supersede rule drops any failing run that a later successful
+#              run of the same workflow replaced (#1358, see drop_superseded_runs
+#              below — the SELECTION is corrected, so every counter reads it)
 #   extracted  failing runs that yielded at least one failure identity — a
 #              `FAILED <nodeid>` line OR (since #4469) an attributable guard-step
 #              error annotation from the run's ROOT failing step
@@ -211,6 +214,182 @@ WORKFLOW_ARGS=()
 # `failure|timed_out|startup_failure` to `examined`.
 LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
 
+#
+# THE RAW PROJECTION (#1358). The canonical three fields — which ARE the whole of
+# admin-merge.sh's mirrored `LANE_RUN_JQ`, so its coverage gate and the pending-run
+# probe keep reading exactly what they always read — PLUS the identity fields the
+# supersede rule needs: which workflow, and which event. `drop_superseded_runs`
+# re-emits exactly those three fields, so no consumer of this script can observe
+# the wider listing.
+#
+# NO CLOCK IS ASKED FOR, deliberately. `updatedAt` is frozen for the whole of a
+# single long step, so this repo's tests forbid it as a liveness signal (§39/§40 in
+# tests/admin-merge/run.sh) — and ordering does not need it either: a run's
+# `databaseId` IS its creation order (#1358's own residual, stated there).
+#
+# ⛔ THE THREE IDENTITY FIELDS ARE BASE64-ENCODED, and that is a FAIL-CLOSED
+# REQUIREMENT, not tidiness (adversarial cycle 1, 2026-09-23). A workflow's `name:`
+# is AUTHOR-CONTROLLED free text, and YAML carries a literal NEWLINE happily in a
+# double-quoted scalar. `gh --jq` interpolates that name RAW, so a run whose
+# workflow name contains "…\npython-ci\t…\t<sha>:<huge id>\t…" SPLITS this
+# projection into TWO records — and the tail is a syntactically perfect six-field
+# line whose group key the AUTHOR chose. It then superseded the run's own red and
+# the lane read `examined=0`: a fail-OPEN, the one direction this rule must never
+# take. The `NF != 6` guard in drop_superseded_runs defends a TAB (one record with
+# a bogus boundary); it CANNOT defend a NEWLINE, because awk's record separator has
+# already split the input before the guard runs. A record separator that cannot be
+# told from a field boundary is unreadable identity, exactly as a TAB inside a
+# field is — so the fields that form the GROUP KEY are encoded into an alphabet
+# that can contain neither. They are compared, never printed, so the encoding
+# costs nothing and cannot drift from a human-readable form.
+#
+# The canonical three fields stay RAW, and deliberately: they are GitHub enums and
+# a hex sha, with no free text among them — and they are what every consumer reads.
+LANE_RUN_RAW_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha // ""):\(.databaseId // "")\t\((.workflowDatabaseId // "") | tostring | @base64)\t\((.workflowName // "") | @base64)\t\((.event // "") | @base64)"'
+
+# ── drop_superseded_runs — THE SUPERSEDE RULE (#1358) ────
+#
+# A failing run that a LATER run of the SAME workflow, at the SAME commit, under
+# the SAME event, replaced is NOT a failing run. Without this, a run re-run green
+# on the same head left the old red in the failing set — and for a GATE failure,
+# one whose log carries no `FAILED <nodeid>` line and so can never be attributed,
+# that made `examined > extracted` and the rail REFUSED a head whose own surface
+# was green. The only remedy left was `gh run delete`: destroying CI records to
+# satisfy a stale reading (PR #1354; both counted runs are deleted and 404
+# today). The check-surface path (admin-merge.sh step 4.5) has always applied the
+# same idea — the latest check run per (app, name) decides — so this is the lane
+# path agreeing with it, not a new concept.
+#
+# WHAT MAY SUPERSEDE: only `success`. `cancelled` (what `cancel-in-progress`
+# produces), `skipped` (it exercised nothing), `neutral`, `failure` and
+# `startup_failure` are all terminal, and none of them is evidence that the commit
+# is green, so none may drop a red. Fail CLOSED: an over-block costs a re-run; the
+# other direction merges a broken tree.
+#
+# "LATER" MEANS CREATED LATER: a run's `databaseId` increases with creation, so
+# the highest id in a group is the group's newest run — the same notion step 4.5
+# uses for the check surface (the latest check run per (app, name) decides).
+#
+# A STATED LIMIT, deliberately not closed: a run RE-RUN long after a NEWER run of
+# the same workflow was created is the fresher measurement but not the higher id,
+# so its green does not clear the newer run's red and the rail refuses. That is
+# the fail-CLOSED direction — the operator's remedy is to re-run the newer run
+# too — and the only field that would close it is a completion clock, which is
+# exactly the signal this pair of scripts forbids (`updatedAt` is frozen for the
+# whole of a long step; §39/§40 pin that it is never ASKED for). An over-block
+# with a named remedy is acceptable; a clock-driven certificate is not.
+#
+# ⛔ A SECOND STATED LIMIT, and the sharper one: A SUCCESS THAT MEASURED NOTHING IS
+# STILL A CERTIFICATE HERE. This rule reads a run LISTING; whether a run's jobs
+# actually EXECUTED lives in its jobs, which this projection does not carry — so a
+# `completed`+`success` run whose jobs were ALL SKIPPED still drops a red. That is
+# reachable by a PR author without touching the commit or the event (the workflow
+# file is theirs, and `github.run_attempt` increments on re-run, so a job gated
+# `if: github.run_attempt == 1` is skipped on the re-run while the run concludes
+# success). Adversarial cycle 2 reproduced it at the rule level (PR #1394) and it is
+# filed as #1401 rather than fixed here: closing it needs a jobs call per candidate,
+# which is a design decision — and the rail's own direction is that ONE measurement
+# predicate governs every surface (#1319), so inventing a second one here would be
+# the same mistake one level up. Until then, `success` at the same commit, workflow
+# and event means green, WHATEVER IT MEASURED. Say it out loud; do not assume it.
+#
+# THE GROUP KEY is (sha, workflowDatabaseId, workflowName, event) — every part
+# required. The commit alone would collapse main's window, which spans commits BY
+# DESIGN (the union over the last N runs), and silently shrink the baseline; a
+# shrunken baseline is what EXCUSES a genuinely new PR failure, so on main this
+# rule closes a fail-open rather than opening one. The workflow NAME alone would
+# let two different files both called "CI" clear each other, so the ID is required
+# too. The event, because one commit is often both a PR head and pushed to a
+# branch, and the lane's jobs are event-conditioned — a `push` run is not the same
+# measurement as the `pull_request` run it would replace.
+#
+# AN UNREADABLE LINE FAILS CLOSED IN BOTH DIRECTIONS: it supersedes nothing and is
+# never superseded, and the refusal to decide is SAID OUT LOUD on stderr — a
+# SILENT assumption about identity is how this class of defect starts. Such a line
+# is still COUNTED as a failing run (it is a run, and it is red); what it cannot be
+# is a CERTIFICATE that the commit is green, in either direction. A line with
+# FEWER THAN 6 fields is not from this lister's projection at all (a caller using
+# the canonical shape, or a fixture written before the projection grew): it is
+# RE-EMITTED in the canonical shape and never grouped, because the rule cannot
+# invent an identity it was not handed. A BLANK line is not a run and is not
+# emitted at all — an empty line can carry no measurement, and passing it through
+# as `\t\t` would be counted as a PENDING run. The rule's own tests fail loudly if
+# this projection ever loses a field, so that path cannot rot into a silent no-op.
+#
+# Input: the RAW projection, one run per line. Output: the CANONICAL
+# `<status>\t<conclusion>\t<sha>:<id>` projection with superseded FAILING runs
+# removed — so the counters, the provenance, the union, the rate table, the
+# signature table and the per-run rotation input all see ONE selection, and
+# nothing downstream needs to know this rule exists.
+#
+drop_superseded_runs() {
+  awk -F'\t' -v OFS='\t' '
+    function is_failing(c) { return (c == "failure" || c == "timed_out" || c == "startup_failure") }
+    function blank(v) { return (v == "" || v == "null") }
+    {
+      # A blank line is not a run: emitting `\t\t` would be counted as PENDING.
+      if (NF == 0) { empty[NR] = 1; next }
+      # The re-emitted CONSUMPTION FORM must carry the same non-empty sentinel the
+      # canonical projection uses (#1368): admin-merge.sh reads these rows with
+      # `IFS=$'\t' read -r status conclusion id`, and TAB is IFS WHITESPACE, so an
+      # empty conclusion collapses the delimiter and shifts `sha:id` into `id`,
+      # which the listing guard reads as a REFUSED listing rather than a pending
+      # run. A pending run has status!=completed and an EMPTY conclusion, so this
+      # is the COMMON case, not an edge one — the raw projection may leave the
+      # conclusion empty, but nothing downstream of this rule may.
+      out[NR] = $1 OFS (blank($2) ? "-" : $2) OFS $3
+      ref[NR] = $3
+      concl[NR] = $2
+      cand[NR] = 0
+      # EXACTLY six fields, or the line is OPAQUE (kept, never grouped). `NF < 6`
+      # was the first spelling and it was a FAIL-OPEN (code-review cycle 1,
+      # 2026-09-23): a workflow NAME containing a literal TAB — a >6-field line —
+      # left `$5`/`$6` holding a fragment of the name, so the group key silently
+      # DID NOT CARRY THE EVENT, and a green run under a different event could
+      # supersede a red while the disclosure insisted the event matched. A field
+      # separator that cannot be told from a field boundary is unreadable
+      # identity (the same class as an empty field), so it fails closed.
+      if (NF != 6) {
+        if (NF > 6) unreadwide[NR] = 1
+        next
+      }
+      split($3, parts, ":")
+      sha = parts[1]; id = parts[2]
+      if (blank(sha) || blank(id) || id !~ /^[0-9]+$/ || blank($4) || blank($5) || blank($6)) {
+        unread[NR] = 1
+        next
+      }
+      cand[NR] = 1
+      idof[NR] = id; shaof[NR] = sha
+      k[NR] = sha SUBSEP $4 SUBSEP $5 SUBSEP $6
+      # A SUPERSEDE CERTIFICATE is a run that FINISHED and succeeded. Requiring
+      # `completed` as well as `success` keeps the premise of the certificate true
+      # (a conclusion on a non-completed run is a contradiction the producer cannot
+      # emit, and cycle 2 showed a synthetic `queued<TAB>success` line would
+      # otherwise drop a red).
+      if ($1 == "completed" && concl[NR] == "success" && (!(k[NR] in best) || id + 0 > best[k[NR]] + 0)) {
+        best[k[NR]] = id + 0
+        bestid[k[NR]] = id
+      }
+    }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (empty[i]) continue
+        if (unreadwide[i]) {
+          printf "ci-failure-set: note: %s carries MORE than the six fields this projection defines (status, conclusion, sha:id, workflow id, workflow name, event), so a TAB inside a workflow NAME cannot be told from a field boundary — the run can neither supersede nor be superseded; kept as a FAILING RUN, and never read as a certificate that the commit is green (fail closed)\n", ref[i] > "/dev/stderr"
+        }
+        if (unread[i]) {
+          printf "ci-failure-set: note: %s carries an unreadable workflow/event field, so it can neither supersede nor be superseded — kept as a FAILING RUN, and never read as a certificate that the commit is green (fail closed)\n", ref[i] > "/dev/stderr"
+        }
+        if (cand[i] && is_failing(concl[i]) && (k[i] in best) && (idof[i] + 0) < (best[k[i]] + 0)) {
+          printf "ci-failure-set: note: run %s (at %s) concluded %s but was superseded by run %s, a LATER run of the SAME workflow at the same commit and event — NOT counted as a failing run\n", idof[i], shaof[i], concl[i], bestid[k[i]] > "/dev/stderr"
+          continue
+        }
+        print out[i]
+      }
+    }'
+}
+
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 
 say_err() { printf '%s\n' "$*" >&2; }
@@ -218,15 +397,17 @@ say_err() { printf '%s\n' "$*" >&2; }
 # ── selectors ─────────────────────────────────────────────
 
 # list_lane_runs <flag> <value> <limit> → tagged `<status>\t<conclusion>\t<sha>:<id>`
-# lines for the selector's runs IN THE LANE. <flag> is `--commit` or `--branch`.
-# Exits 1 when gh fails (fail-closed: an unreadable run list must never read as
-# "nothing ran").
+# lines for the selector's runs IN THE LANE, with SUPERSEDED failing runs dropped
+# (#1358). <flag> is `--commit` or `--branch`. Exits 1 when gh fails (fail-closed:
+# an unreadable run list must never read as "nothing ran") — `pipefail` carries
+# gh's exit status through the filter.
 list_lane_runs() {
   local flag="$1" value="$2" limit="$3"
   # shellcheck disable=SC2086
   $GH run list "$flag" "$value" --limit "$limit" \
     ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} \
-    --json databaseId,status,conclusion,headSha --jq "$LANE_RUN_JQ"
+    --json databaseId,status,conclusion,headSha,workflowDatabaseId,workflowName,event \
+    --jq "$LANE_RUN_RAW_JQ" | drop_superseded_runs
 }
 
 # extract_failed_tests <run-id> → sorted-unique nodeids, one per line.
