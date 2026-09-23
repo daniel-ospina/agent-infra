@@ -242,95 +242,20 @@ jobs:
             exit 1
           fi
           echo "✅ All scripts validated"
-      - name: Validate bash scripts + run installer tests (#304)
-        run: |
-          errors=0
-          for f in scripts/*.sh; do
-            [ -f "$f" ] || continue
-            bash -n "$f" || errors=$((errors+1))
-          done
-          # #476 — checkout-hygiene farm scripts (launchd-invoked) syntax + the
-          # balance-poller suite (network-free seam). The TS/python cross-writer
-          # parity suite (extensions/shared/provider-failover.poller.test.ts)
-          # runs separately under extension-tests via the shared glob — the two
-          # #476 poller suites cover different seams; neither runs twice.
-          for f in scripts/checkout-hygiene/*.sh; do
-            [ -f "$f" ] || continue
-            bash -n "$f" || errors=$((errors+1))
-          done
-          bash scripts/checkout-hygiene/deepseek-balance-watch.test.sh || errors=$((errors+1))
-          # #1313 — hub-state-check: the DETECTOR. Its PASS contract is on-main
-          # + clean + tip==upstream; a clean-but-stale hub used to report PASS
-          # (the false PASS #1313 closes, so an absent guard read as a passing
-          # guard). The suite pins the whole matrix: behind and diverged FAIL,
-          # up-to-date PASSes, an unverifiable (no-upstream) hub FAILs CLOSED,
-          # detached HEAD reports off_main without crashing, and the --gh-report
-          # leg carries the same staleness guidance. Hermetic: throwaway temp
-          # repos, a LOCAL bare remote (no network), a stubbed `gh` for the
-          # dedup emitter, never a real hub.
-          bash scripts/checkout-hygiene/hub-state-check.test.sh || errors=$((errors+1))
-          # #1309/#1313 — hub-worktree: the RECOVERY half. Pins `refresh`
-          # (fast-forward a behind hub; refuse a content-carrying divergence;
-          # discard only contentless commits, and only with the flag), the
-          # salvage capture, and test 8g's guard posture (hub-worktree.sh
-          # itself carries no destructive git verb). Hermetic: throwaway temp
-          # bare origin + repo, no network, never a real hub.
-          bash scripts/checkout-hygiene/hub-worktree.test.sh || errors=$((errors+1))
-          bash scripts/install-launchd.test.sh || errors=$((errors+1))
-          # #469 — pi-session-reaper hermetic suite (fake PS/KILL/DATE shims +
-          # temp HOME/cmux store/sessions; never signals real processes). Runs
-          # POST-merge here by family precedent (script-validate is main-push
-          # only); real-tty assertions are dev-box verification steps in the
-          # #469 plan, not CI.
-          bash scripts/pi-reap-idle.test.sh || errors=$((errors+1))
-          # #783 — task-session retention sweep: live child survives every pass,
-          # ps-probe failure deletes nothing (fail-closed), TOCTOU re-probe,
-          # dry-run default. Hermetic (fake PS shim + throwaway root/log).
-          bash scripts/pi-task-session-prune.test.sh || errors=$((errors+1))
-          # #1095 — worktree reaper: real temp git repos for every git gate
-          # (clean / reachable / unreferenced) + shimmed ps/lsof/gh, so each
-          # gate's fail path is driven to PRESERVE (or a loud fail-closed
-          # abort) and `--apply` is proven to remove only what it classified
-          # as reclaimable while the branch ref survives. Hermetic: temp HOME,
-          # temp state dir, no real worktree touched, no network.
-          bash scripts/pi-reap-worktrees.test.sh || errors=$((errors+1))
-          # #1141 — scratch-checkout helper: real temp git repos; proves
-          # `run` leaves neither a directory nor an admin record on success,
-          # non-zero exit, SIGTERM, SIGINT, after a TERM-ignoring child (leader
-          # OR straggler descendant) and after the wrapped command destroys the
-          # ownership marker; that `--paths` never yields a silent empty
-          # checkout; that a BARE `clean --all` sweeps nothing and
-          # `clean --all --force-all` spares a live-held worktree and refuses
-          # every path this tool did not create (plain dir, forged marker,
-          # registered-but-unmarked worktree). Hermetic: temp repo + temp root.
-          bash scripts/scratch-worktree.test.sh || errors=$((errors+1))
-          bash scripts/record-review.test.sh || errors=$((errors+1))
-          # #930 — safe-admin-merge rail: the ONE failing-set parser
-          # (scripts/ci-failure-set.sh) plus the chokepoint that consumes it
-          # (scripts/admin-merge.sh). Post-merge re-check of the same hermetic
-          # suite ci.yml runs per-PR.
-          bash tests/admin-merge/run.sh || errors=$((errors+1))
-          # #1367 — the atomic land unit (update → verify → record → land). It
-          # delegates the land step to admin-merge.sh and the record step to
-          # record-review.sh; this suite pins the sequencing + fail-closed gates.
-          bash tests/atomic-land/run.sh || errors=$((errors+1))
-          # #984 — the ARGV-LEVEL half: scripts/gh-shim/gh decides from its own argv
-          # (where bash has finished), so a splice cannot hide the flag. Same hermetic
-          # suite ci.yml runs per-PR.
-          bash tests/gh-shim/run.sh || errors=$((errors+1))
-          # #1069 — fleet search cost: the corpus must not teach an ignore-blind
-          # recursive search, and the guard must not refuse a taught one. Post-merge
-          # re-run of the same hermetic harness ci.yml runs per-PR.
-          bash tests/search-cost/run.sh || errors=$((errors+1))
-          # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
-          # farm-link preservation, extensions/ content parity = #447 ship-list drift
-          # tripwire, #446 launchctl isolation). Real setup.sh, hermetic (~2min).
-          bash pi-bootstrap/tests/test-setup-no-nesting.sh || errors=$((errors+1))
-          if [ $errors -gt 0 ]; then
-            echo "❌ $errors bash script(s)/test(s) failed validation"
-            exit 1
-          fi
-          echo "✅ All bash scripts validated + installer tests passed"
+      - name: Lane-parity guard — both lanes must call the one shard runner (#1369)
+        # Bare call: its exit code IS the step's. `runner || errors=$((errors+1))` was the old
+        # form and is REFUSED by scripts/check-ci-lane-parity.sh — the guard cannot see whether
+        # an accumulator is ever read, so accepting it accepts "count the failure and exit 0".
+        run: bash scripts/check-ci-lane-parity.sh
+      - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        run: bash tests/ci-lane-parity/run.sh
+      - name: Bash shards — the ONE list both lanes run (#1369)
+        # #1369 — the ONE list of bash shards is scripts/run-bash-shards.sh, and BOTH lanes
+        # call it: a shard added there is in both lanes by construction, so a lane split
+        # cannot recur by drift. The runner's runtime self-checks (executed == listed, a sweep
+        # sentinel, a failure-recording sentinel) fail the step if its arms are disabled.
+        # Bare call, one step: a shard failure must fail the RUN, not just a counter.
+        run: bash scripts/run-bash-shards.sh
 
   skill-lint:
     runs-on: ubuntu-latest
