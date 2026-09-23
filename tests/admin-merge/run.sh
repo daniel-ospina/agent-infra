@@ -142,6 +142,27 @@
 #      `ADMIN_MERGE_LANE_PARITY` is refused rather than silently read as 'off';
 #      and the certifying path DISCLOSES the family it compared. Every one of
 #      these has a test that FAILS against the revision before its fix.
+#  23. THE CHECK-SURFACE POSTURE (#1353): every non-red value is NAMED; anything
+#      unnamed, absent, unmeasured or unattributable is a NAMED state — never a
+#      zero, and never dropped before classification. Four fail-opens, one per
+#      posture clause: the in-flight spelling is an ALLOW-LIST (an unrecognised
+#      `status` is classified by its conclusion, RED unless named non-red — on
+#      the tree AND the base, where the old deny-list also disarmed 4.6/4.7);
+#      only a COMPLETED measurement sets the staleness anchor (a PENDING status
+#      no longer advances it); the non-code-event exemption is scoped to the
+#      BASE surface (a `schedule` red on the tree BLOCKS — it cannot be noise
+#      there); and an UNNAMED check is classified under a placeholder, never
+#      dropped. §50-§53 pin all four, plus the attribution half (index 24).
+#  24. THE ATTRIBUTION HALF — #1319's sibling (#1353): `PR failing: 0` can mean
+#      "no failures", "not comparable" (the parity gate) OR "the failures were
+#      DROPPED". The parser drops a FAILED token that is not a test id (never in
+#      the set), so the rail now NAMES the dropped count and the tokens in its
+#      output and in the POSTED EVIDENCE, and states whether each set is
+#      COMPLETE or CLIPPED. In the evidence the token text is rendered with its
+#      markdown metacharacters ESCAPED and the escape is disclosed, so the
+#      disclosure and #3756's "a hostile token cannot break the evidence" hold at
+#      once; stderr keeps the token verbatim. A run whose failures are ENTIRELY
+#      unattributable still refuses (step 1c, preserved).
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -526,6 +547,11 @@ target_shard() {
 # prefix the summary line does not parse and every failure would be unsigned.
 log_failed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED %s - AssertionError: boom\n' "$1"; }
 log_passed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z PASSED %s\n' "$1"; }
+# A FAILED line whose token is NOT a test id (the reproduced shape: `FAILED (HTTP`).
+# The canonical parser DROPS it and counts it, so the failing set is CLIPPED — the
+# attribution half of #1353 is about naming that instead of letting it read as a
+# measured zero.
+log_unattributable() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED %s upstream error\n' "$1"; }
 
 # Lane-run fixture lines. The parser reads the lane's COMPLETION state from the
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
@@ -1480,7 +1506,8 @@ else
   fail "no evidence comment posted on the flake path"
 fi
 
-# ── 26. a non-nodeid FAILED payload never reaches the evidence (#3756) ─────
+# ── 26. a non-nodeid FAILED payload is dropped + reported, and reaches the
+# evidence only ESCAPED (#3756 / #1353) ───────────────────────────────────
 # A PR author controls test names, so a test can print a bare fence marker in the
 # `FAILED <token>` position. #3756 defect 1: that token is NOT a test id, so the
 # canonical parser DROPS it (counted and reported) before it can ever enter the
@@ -1488,6 +1515,14 @@ fi
 # inert. The evidence stays LISTS-of-ids, and the sound id in the SAME capture
 # still certifies. Reverting the extractor to the shell `awk` puts ` ``` ` back
 # into the evidence and turns this RED.
+#
+# #1353 ADDS A SECOND REQUIREMENT, AND THE TWO ARE RECONCILED, NOT TRADED OFF: the
+# dropped token must now be NAMED in the posted evidence, and it must still not be
+# able to break it. The evidence therefore renders the token with its markdown
+# metacharacters ESCAPED and DISCLOSES that, so the raw fence marker never reaches
+# the comment (the assertion below) while the token IS named (section 54's
+# hostile-token case pins both halves). `UNATTRIBUTABLE` on stderr is still
+# verbatim.
 #
 # Equivalently: an unparseable failure id is DROPPED + REPORTED, never carried,
 # and because the evidence is LISTS there is no fence algorithm to get right. A
@@ -1498,7 +1533,7 @@ fi
 # COUNTS it and REPORTS it as UNATTRIBUTABLE; a run whose ids were all garbage
 # still refuses via the caller's `examined > extracted` gate, and a sound id in
 # the SAME run still certifies.
-echo "== 26. a non-nodeid FAILED payload is dropped before the evidence =="
+echo "== 26. a non-nodeid FAILED payload is dropped, reported, and escaped in the evidence =="
 new_scen btick
 HEAD_BT="dddd333300000000000000000000000000000000"
 printf '%s\n' "$HEAD_BT" > "$SCEN/head"
@@ -4152,7 +4187,971 @@ grep -qE '^[[:space:]]*comm[[:space:]]+-23' "$ADM" \
   && fail "the lane-coverage subtraction re-implements comm -23 in the rail" \
   || pass "…and no comm -23 was reintroduced anywhere in the rail"
 
-# ── 50. a GUARD-STEP failure is ATTRIBUTED and COMPARED (#4469) ────────────
+# ── 50. IN-FLIGHT IS AN ALLOW-LIST — AN UNRECOGNISED STATUS IS RED (#1353) ──
+# The pending half of the classifier was a DENY-list: `status != "completed"` was
+# the WHOLE test, so any spelling this rail had never seen became PENDING — and
+# PENDING is never red, so the surface still read GREEN and the rail merged a
+# check GitHub had already concluded `failure`. The in-flight spellings are now
+# NAMED (`queued`, `in_progress`, `waiting`, `requested`, `pending`); any OTHER
+# non-completed status is classified by its CONCLUSION, RED unless that
+# conclusion is one the rail names as non-red. The same hole on the BASE read
+# `base tree GREEN` and silently DISARMED 4.6/4.7, which are both gated on the
+# base being red — so the last scenario shows the staleness rule firing again.
+echo "== 50. an unrecognised check-run STATUS is classified, never assumed PENDING (#1353) =="
+
+# (a) THE REPRODUCTION, ON THE PR'S OWN TREE. The tree's only check is
+# `status=completely_finished, conclusion=failure`: the deny-list filed it as
+# PENDING, the tree read GREEN (`green — 0 failing of 1 measured, 1 pending`),
+# evidence was posted and the merge ran.
+new_scen status-tree-unknown
+HEAD_S1="e1e1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_S1" > "$SCEN/head"
+lane_pass "$HEAD_S1" 5901 > "$SCEN/runs-$HEAD_S1"
+lane_pass mains1 5902 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 9101 lint completely_finished failure 9911)"
+pr_run_map 9911 pull_request 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNRECOGNISED non-completed status + a red conclusion BLOCKS (exit $rc)" \
+  || fail "an unrecognised status read as PENDING (never red) and MERGED — the deny-list hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "completely_finished" "$SCEN/err" && pass "…naming the STATUS that failed closed" \
+  || fail "the refusal does not name the unrecognised status: $(grep -m1 '^   • ' "$SCEN/err")"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an unrecognised red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an unrecognised red" || pass "no merge attempted"
+
+# (b) THE SAME SPELLING IN ITS OTHER GUISES — an EMPTY status and a CAPITALISED
+# one are both spellings this rail has never NAMED, and both used to become
+# PENDING. (`Completed` is the trap a case-sensitive vendor integration ships.)
+for variant in "" "Completed"; do
+  new_scen "status-tree-var${variant:-empty}"
+  HEAD_SV="e2e2000000000000000000000000000000000000"
+  printf '%s\n' "$HEAD_SV" > "$SCEN/head"
+  lane_pass "$HEAD_SV" 5903 > "$SCEN/runs-$HEAD_SV"
+  lane_pass mainsv 5904 > "$SCEN/runs-main"
+  main_green_surface
+  write_pr_checks "$(check_run 9102 lint "$variant" failure 9912)"
+  pr_run_map 9912 pull_request 'Post-merge validation'
+  run_admin_here 42 >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "status='${variant:-<empty>}' with a red conclusion BLOCKS too (exit $rc)" \
+    || fail "status='${variant:-<empty>}' read as PENDING and merged"
+done
+
+# (c) THE SAME HOLE ON THE BASE DISARMS THE STALENESS RULES. The base's only
+# check is `status=in_progress_y, conclusion=failure`, started AFTER this PR's
+# surface was produced. Read as PENDING, the base looks GREEN, so neither 4.6
+# (a red newer than the surface) nor 4.7 (a lagging merge ref) is even reached —
+# the stale green merges over a red base. Classified by its conclusion, the base
+# is RED and 4.6 refuses.
+new_scen status-base-unknown
+HEAD_S2="e3e3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_S2" > "$SCEN/head"
+lane_pass "$HEAD_S2" 5905 > "$SCEN/runs-$HEAD_S2"
+lane_pass mains2 5906 > "$SCEN/runs-main"
+# The PR's own tree is GREEN, produced at 00:01.
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7301 pull_request 'CI'
+# The base carries a red at 00:02 — AFTER the PR surface, so 4.6 must fire.
+write_main_checks "$(check_run 6100 lint in_progress_y failure 9951 2026-01-01T00:02:00Z)"
+main_run_map 9951 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unrecognised BASE status hides a red base no longer (exit $rc)" \
+  || fail "an unrecognised base status read as PENDING disarmed 4.6/4.7 and MERGED over a red base"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" && pass "…so the 4.6 staleness rule runs again (the disarm is repaired)" \
+  || fail "the refusal is not the staleness one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "in_progress_y" "$SCEN/err" && pass "…naming the base status that failed closed" \
+  || fail "the base refusal does not name the unrecognised status"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a hidden red base" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a hidden red base" || pass "no merge attempted"
+
+# (d) THE OVER-BLOCK GUARD: the NAMED in-flight spellings are still PENDING and
+# still do not block. Main always has something running, so reddening these would
+# refuse the fleet on every post-merge run.
+new_scen status-inflight-pending
+HEAD_S3="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_S3" > "$SCEN/head"
+lane_pass "$HEAD_S3" 5907 > "$SCEN/runs-$HEAD_S3"
+lane_pass mains3 5908 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 9201 'pr / lint' in_progress null 9921)" \
+  "$(check_run 9202 'pr / test' queued null 9922)"
+pr_run_map 9921 pull_request 'CI' 9922 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "in_progress/queued are still PENDING, never red (exit 0)" \
+  || fail "a legitimately in-flight check was reddened (exit $rc): $(sed -n '1,3p' "$SCEN/err" 2>/dev/null)"
+grep -q "pending 2" "$SCEN/out" && pass "…and BOTH in-flight checks are COUNTED in the evidence" \
+  || fail "the in-flight checks are not counted: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge was attempted"
+
+# ── 51. ONLY A COMPLETED MEASUREMENT SETS THE STALENESS ANCHOR (#1353) ──────
+# The statuses loop advanced `surface_epoch` for EVERY legacy status — including
+# the `state == "pending"` branch. A PENDING status's `updated_at` marks when it
+# was last QUEUED or re-announced, not when anything was measured, so it moved
+# the PR surface's last-production time FORWARD past the PR's real evaluation.
+# A base red that began between the two then compared as "already measured" and
+# the stale green merged. This is the highest-reachability of the four: any
+# ordinary in-flight deploy/preview status triggers it.
+echo "== 51. a PENDING legacy status must not advance the staleness anchor (#1353) =="
+
+# (a) THE REPRODUCTION. The PR's only completed check was produced at 00:01; a
+# pending `deploy-preview` status was updated at 00:03; the base went red at
+# 00:02. The anchor used the PENDING status's 00:03, so the 00:02 red looked
+# already-measured and the rail merged.
+new_scen staleness-pending-status
+HEAD_ST1="e5e5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_ST1" > "$SCEN/head"
+lane_pass "$HEAD_ST1" 5911 > "$SCEN/runs-$HEAD_ST1"
+lane_pass mainst1 5912 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7301 pull_request 'CI'
+printf '{"state":"pending","total_count":1,"statuses":[{"context":"deploy-preview","state":"pending","updated_at":"2026-01-01T00:03:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/pr-statuses.json"
+write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-01T00:02:00Z 2026-01-01T00:02:30Z)"
+main_run_map 7401 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a base red AFTER the PR's completed check is STALE despite a pending status (exit $rc)" \
+  || fail "a PENDING status advanced the anchor and the stale green MERGED over a red base"
+grep -q "STALE surface" "$SCEN/err" && pass "…and the refusal names the staleness" \
+  || fail "the refusal is not the staleness one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "began 2026-01-01T00:02:00Z, AFTER this PR's surface was last produced" "$SCEN/err" \
+  && pass "…naming the base red it failed to cover, and the anchor it compared" \
+  || fail "the staleness refusal does not name the red it covers or the anchor: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+# The status is still COUNTED as pending — the fix moves the ANCHOR, it does not
+# drop the state. An unmeasured surface must stay legible.
+grep -q "pending 1" "$SCEN/out" && pass "…while the pending status is still COUNTED, not dropped" \
+  || fail "the pending status vanished from the surface accounting: $(grep -m1 'evaluated tree' "$SCEN/out")"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a stale green" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a stale green" || pass "no merge attempted"
+
+# (b) THE CONTROL — the IDENTICAL fixture with NO pending status. Both the
+# pre-fix and the fixed rail refuse here; the pair is what shows the pending
+# status was the disarming element rather than the base red itself.
+new_scen staleness-control-nostatus
+HEAD_ST2="e6e6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_ST2" > "$SCEN/head"
+lane_pass "$HEAD_ST2" 5913 > "$SCEN/runs-$HEAD_ST2"
+lane_pass mainst2 5914 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7301 pull_request 'CI'
+write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-01T00:02:00Z 2026-01-01T00:02:30Z)"
+main_run_map 7401 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "the CONTROL (no pending status) refuses at 4.6, as before (exit $rc)" \
+  || fail "the control did not refuse — the pre-fix path was not the one under test"
+grep -q "STALE surface" "$SCEN/err" && pass "…via the same staleness refusal" \
+  || fail "the control refusal is not the staleness one"
+# (c) AND A COMPLETED MEASUREMENT STILL DOES ADVANCE THE ANCHOR — a completed
+# success at 00:04 covers the base red that began at 00:02, so the merge MUST
+# proceed. Without this the fix could pass by never advancing the anchor at all,
+# which would refuse every PR whose surface carries a pending status (an
+# over-block) — `surface_iso` is the ONLY source of the anchor, so if it stopped
+# advancing, 4.6 would report "no completed check" and refuse.
+new_scen staleness-completed-anchor
+HEAD_ST3="e7e7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_ST3" > "$SCEN/head"
+lane_pass "$HEAD_ST3" 5915 > "$SCEN/runs-$HEAD_ST3"
+lane_pass mainst3 5916 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:04:00Z)"
+pr_run_map 7301 pull_request 'CI'
+printf '{"state":"pending","total_count":1,"statuses":[{"context":"deploy-preview","state":"pending","updated_at":"2026-01-01T00:03:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/pr-statuses.json"
+write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-01T00:02:00Z 2026-01-01T00:02:30Z)"
+main_run_map 7401 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a base red at 00:02 is COVERED by the PR's 00:04 completed check — it MERGES (exit 0)" \
+  || fail "a covered base red was refused (exit $rc) — the anchor stopped advancing from a completed measurement: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+[ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+
+# ── 52. THE NON-CODE EXEMPTION IS SCOPED TO THE BASE SURFACE (#1353) ────────
+# `schedule`/`issues`/`issue_comment` are REPORT-ONLY so a cron-noisy base does
+# not refuse every merge. That exemption was applied UNCONDITIONALLY — including
+# to the PR's EVALUATED TREE, where the same header calls such an event "an
+# anomaly", because a default-branch run cannot attach to a PR head sha. So a red
+# on the TREE whose run map said `schedule` was routed to the non-blocking list
+# and merged. The exemption is now scoped to the surface it was written for.
+echo "== 52. the non-code-event exemption is BASE-only; on the tree it BLOCKS (#1353) =="
+
+# (a) THE REPRODUCTION. The tree's only check is a `completed failure` whose run
+# map says `schedule` (the fixture models the impossible-but-observed shape, i.e.
+# a mis-keyed run map or a future GitHub change). The old rail routed it to
+# REDS_OTHER, the tree read GREEN, and the merge ran.
+new_scen noncode-tree
+HEAD_NC1="e8e8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC1" > "$SCEN/head"
+lane_pass "$HEAD_NC1" 5921 > "$SCEN/runs-$HEAD_NC1"
+lane_pass mainnc1 5922 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 3301 backup completed failure 6901)"
+pr_run_map 6901 schedule registry-backup-cron
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a schedule-attributed red on the PR's TREE BLOCKS (exit $rc)" \
+  || fail "a non-code red on the evaluated tree was exempted and MERGED — the unconditional-exemption hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "3301\|backup" "$SCEN/err" && pass "…naming the failing check" \
+  || fail "the refusal does not name the check"
+grep -q "NOT EXEMPT ON THIS SURFACE" "$SCEN/err" && pass "…and SAYING the exemption does not apply on this surface" \
+  || fail "the refusal does not state that the non-code exemption is base-only"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an exempted tree red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an exempted tree red" || pass "no merge attempted"
+
+# (b) THE OVER-BLOCK GUARD — THE EXEMPTION STILL APPLIES ON THE BASE. A
+# `schedule` red on main must NOT block (the fleet-stopping blunt refusal the
+# exemption exists to avoid), and it must still be REPORTED.
+new_scen noncode-base-exempt
+HEAD_NC2="e9e9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC2" > "$SCEN/head"
+lane_pass "$HEAD_NC2" 5923 > "$SCEN/runs-$HEAD_NC2"
+lane_pass mainnc2 5924 > "$SCEN/runs-main"
+write_main_checks "$(check_run 3302 backup completed failure 6902)"
+main_run_map 6902 schedule registry-backup-cron
+pr_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a schedule-attributed red on the BASE still does NOT block (exit 0)" \
+  || fail "the base's cron exemption was lost (exit $rc) — that would refuse the fleet on a cron-noisy base: $(sed -n '1,3p' "$SCEN/err" 2>/dev/null)"
+grep -q "NON-code events" "$SCEN/out" && pass "…and the base's non-code red is still REPORTED, not silently dropped" \
+  || fail "the base's non-code red is no longer reported"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# ── 53. AN UNNAMED CHECK IS CLASSIFIED, NEVER DROPPED (#1353) ───────────────
+# `if not name: continue` dropped a check run before classification: a RED on an
+# unnamed run appeared in NEITHER the red nor the pending list, the surface read
+# `unmeasured — 0 failing of 0 measured`, and the rail merged. "Unnamed" is a
+# value the posture must NAME and classify, not one it may discard.
+echo "== 53. an unnamed check run is classified under a placeholder, never dropped (#1353) =="
+
+# (a) THE REPRODUCTION — an UNNAMED RED CHECK RUN on the PR's evaluated tree.
+new_scen unnamed-tree-check
+HEAD_U1="f1f1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_U1" > "$SCEN/head"
+lane_pass "$HEAD_U1" 5931 > "$SCEN/runs-$HEAD_U1"
+lane_pass mainu1 5932 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 9104 '' completed failure 6911)"
+pr_run_map 6911 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNNAMED completed-failure check BLOCKS (exit $rc)" \
+  || fail "an unnamed red was dropped before classification and MERGED — the silent-drop hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "(unnamed check)" "$SCEN/err" && pass "…naming the PLACEHOLDER identity it was classified under" \
+  || fail "the refusal does not name the placeholder"
+grep -q "UNMEASURED" "$SCEN/err" && fail "the unnamed red was read as an EMPTY surface" \
+  || pass "…and the surface is NOT reported as empty"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a dropped red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a dropped red" || pass "no merge attempted"
+
+# (b) THE SAME DROP FOR A LEGACY STATUS with an EMPTY context — the other half of
+# the rule, and the one the statuses loop owned separately.
+new_scen unnamed-tree-status
+HEAD_U2="f2f2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_U2" > "$SCEN/head"
+lane_pass "$HEAD_U2" 5933 > "$SCEN/runs-$HEAD_U2"
+lane_pass mainu2 5934 > "$SCEN/runs-main"
+main_green_surface
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNNAMED red legacy status BLOCKS too (exit $rc)" \
+  || fail "an unnamed status context was dropped and MERGED"
+grep -q "(unnamed status)" "$SCEN/err" && pass "…naming the placeholder for the status" \
+  || fail "the refusal does not name the unnamed status"
+
+# (c) THE OVER-BLOCK GUARD: an UNNAMED but NON-RED check is not reddened by the
+# placeholder — it is classified by its conclusion exactly like a named one.
+new_scen unnamed-nonred
+HEAD_U3="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_U3" > "$SCEN/head"
+lane_pass "$HEAD_U3" 5935 > "$SCEN/runs-$HEAD_U3"
+lane_pass mainu3 5936 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 9105 '' completed success 6913)"
+pr_run_map 6913 pull_request 'CI'
+printf '{"state":"success","total_count":1,"statuses":[{"context":"","state":"success","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/status/2"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "an unnamed SUCCESS check/status is classified non-red and MERGES (exit 0)" \
+  || fail "the placeholder reddened a legitimately non-red check (exit $rc): $(sed -n '1,3p' "$SCEN/err" 2>/dev/null)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 2 check(s)" "$SCEN/out" \
+  && pass "…and BOTH unnamed objects are COUNTED in the TREE surface, not dropped" \
+  || fail "the unnamed objects vanish from the tree's measured count: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# ── 54. THE ATTRIBUTION HALF: A CLIPPED SET IS NAMED, NOT A ZERO (#1353) ────
+# `PR failing: 0` can mean "no failures", "not comparable" (the parity gate,
+# #1319) OR "the failures were DROPPED": the parser drops a FAILED token that is
+# not a test id, and it is never in the set. The count and the tokens must be
+# named in the rail's OUTPUT and in the POSTED EVIDENCE, so a COMPLETE set is
+# distinguishable from a CLIPPED one. A run whose failures are ENTIRELY
+# unattributable still refuses (step 1c — verified here, not changed).
+echo "== 54. an unattributable FAILED token is NAMED in the output and the evidence (#1353) =="
+
+# (a) THE REPRODUCTION. The PR carries ONE real id AND one dropped token; main
+# measures the real id, so the decision exempts it and the rail MERGES with
+# evidence. The drop must appear in both streams: `PR failing: 0`-style zeros must
+# never be readable as complete when a token was dropped.
+new_scen attribution-named
+HEAD_AT1="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AT1" > "$SCEN/head"
+FAIL_AT='tests/test_other.py::test_red_on_main'
+lane_fail "$HEAD_AT1" 8801 > "$SCEN/runs-$HEAD_AT1"
+{ log_failed "$FAIL_AT"; log_unattributable '(HTTP'; } > "$SCEN/log-8801"
+main_red_n mainat 9001 3 "$FAIL_AT" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a PR with one exempt failure and one DROPPED token still merges (exit 0)" \
+  || fail "the attribution disclosure blocked a merge it must not (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "the PR's failing set" "$SCEN/err" && grep -q "CLIPPED" "$SCEN/err" \
+  && pass "the RAIL'S OUTPUT names the drop count and says the set is CLIPPED" \
+  || fail "the rail does not name the dropped token on stderr: $(grep -m1 DROPPED "$SCEN/err")"
+grep -q -- "DROPPED: (HTTP" "$SCEN/err" && pass "…naming the dropped TOKEN verbatim" \
+  || fail "the dropped token is not named on stderr"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "Attribution — FAILED tokens DROPPED by the parser" "$SCEN/comment" \
+    && pass "the POSTED EVIDENCE states the attribution line" \
+    || fail "the posted evidence has no attribution line"
+  grep -q "PR=1 | main=0" "$SCEN/comment" && pass "…with BOTH counts (PR drops=1, main drops=0)" \
+    || fail "the evidence does not state the drop counts"
+  grep -q -- "- (HTTP" "$SCEN/comment" && pass "…and the dropped TOKEN in the evidence's own list" \
+    || fail "the dropped token is not in the posted evidence"
+  grep -q "CLIPPED" "$SCEN/comment" && pass "…naming the set CLIPPED (not comparable to a measured zero)" \
+    || fail "the evidence does not say the set is CLIPPED"
+  # A REAL newline, not a `\n` that bash double quotes do not expand — a literal
+  # escape shipped into a posted comment is exactly the kind of unreadable line
+  # this evidence block exists to avoid.
+  grep -qF 'main=0.\n' "$SCEN/comment" \
+    && fail "the attribution line ships a LITERAL backslash-n instead of a line break" \
+    || pass "…and its line break is a REAL newline"
+else
+  fail "no evidence comment posted for the attribution case"
+fi
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (b) A COMPLETE SET IS STATED AS COMPLETE — the disclosure is unconditional, so
+# an empty drop list means "none", not "not measured".
+new_scen attribution-complete
+HEAD_AT2="f5f5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AT2" > "$SCEN/head"
+lane_pass "$HEAD_AT2" 8901 > "$SCEN/runs-$HEAD_AT2"
+lane_pass mainat2 8902 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a fully readable, green surface still merges (exit 0)" \
+  || fail "the attribution disclosure blocked a clean merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=0 | main=0" "$SCEN/comment" && pass "…and the evidence states ZERO drops explicitly" \
+    || fail "the evidence omits the drop count when it is zero"
+  grep -q "COMPLETE" "$SCEN/comment" && pass "…and says the failing sets are COMPLETE, not merely empty" \
+    || fail "the evidence does not distinguish COMPLETE from unmeasured"
+else
+  fail "no evidence comment posted for the complete case"
+fi
+
+# (c) THE RECONCILIATION WITH #3756's INJECTION PIN. A DROPPED token can be
+# HOSTILE — a bare fence marker in the `FAILED` position is the reproduced
+# payload — and #1353 still requires it NAMED in the posted evidence. Both hold
+# because the evidence renders the token with its markdown metacharacters ESCAPED
+# (disclosed in the block heading) while stderr keeps it verbatim: the token is
+# named AND the #3756 property (a hostile token cannot open a fence or close a
+# details block) is preserved.
+new_scen attribution-hostile-token
+HEAD_AT4="f7f7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AT4" > "$SCEN/head"
+lane_fail "$HEAD_AT4" 8904 > "$SCEN/runs-$HEAD_AT4"
+{ log_failed 'tests/test_other.py::test_red_on_main'; log_failed '```'; } > "$SCEN/log-8904"
+main_red_n mainat4 9004 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a hostile dropped token does not block a sound merge (exit 0)" \
+  || fail "the hostile-token disclosure blocked a merge (exit $rc)"
+# STDERR keeps the token VERBATIM — that is the byte-exact surface an operator
+# greps, and a terminal is not markdown.
+grep -qF 'DROPPED: ```' "$SCEN/err" && pass "the rail's OUTPUT carries the hostile token VERBATIM on stderr" \
+  || fail "the hostile token is not named verbatim on stderr"
+if [ -f "$SCEN/comment" ]; then
+  grep -qF 'markdown metacharacters escaped' "$SCEN/comment" \
+    && pass "the POSTED EVIDENCE discloses that the rendering is escaped" \
+    || fail "the evidence does not disclose the escape"
+  grep -qF '\`\`\`' "$SCEN/comment" \
+    && pass "…and the token IS named there (escaped), so the set is still not a bare zero" \
+    || fail "the dropped token is not named at all in the evidence"
+  grep -qF '```' "$SCEN/comment" \
+    && fail "raw backticks reached the evidence — the #3756 fence surface is back" \
+    || pass "…while NO raw fence token reaches the evidence (the #3756 property holds)"
+  d_open=$(grep -c '^<details>' "$SCEN/comment"); d_close=$(grep -c '^</details>$' "$SCEN/comment")
+  [ "$d_open" -ge 3 ] && [ "$d_open" -eq "$d_close" ] \
+    && pass "…and every evidence block stays balanced ($d_open/$d_close)" \
+    || fail "block structure damaged ($d_open opened, $d_close closed)"
+else
+  fail "no evidence comment posted for the hostile-token case"
+fi
+
+# (d) A RUN WHOSE FAILURES ARE ENTIRELY UNATTRIBUTABLE REFUSES. This is the
+# PRE-EXISTING step-1c gate (`examined > extracted`) — verified to still hold,
+# now with the dropped tokens named at the point of refusal.
+new_scen attribution-all-dropped
+HEAD_AT3="f6f6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AT3" > "$SCEN/head"
+lane_fail "$HEAD_AT3" 8903 > "$SCEN/runs-$HEAD_AT3"
+log_unattributable '(HTTP' > "$SCEN/log-8903"
+main_red_n mainat3 9003 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a run whose failures were ENTIRELY dropped REFUSES (exit $rc)" \
+  || fail "an entirely-unattributable failing run was read as an empty set and MERGED"
+grep -q "yielded NO parseable" "$SCEN/err" && pass "…via the preserved step-1c gate" \
+  || fail "the refusal is not the extraction gate: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q -- "DROPPED: (HTTP" "$SCEN/err" && pass "…and the DROPPED token is named at the refusal" \
+  || fail "the refusal does not name the token it dropped"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an entirely-dropped set" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an entirely-dropped set" || pass "no merge attempted"
+
+# ── 55. A COMPLETED CHECK THAT MEASURED NOTHING IS NOT A MEASUREMENT (#1353) ─
+# The staleness anchor (`surface_epoch`) is the surface's last PRODUCTION time,
+# and step 4.6 refuses a base red whose run STARTED after it. The anchor used to
+# be set by EVERY completed check — including `skipped`/`cancelled`/`neutral`/
+# `stale`, which exercise nothing — so a non-measuring run stamped the anchor
+# FORWARD past the surface's real evaluation and a base red that began in between
+# compared as already-measured. One explicit predicate (MEASURING_CONC /
+# MEASURING_STATE) now gates BOTH sites that can set it.
+echo "== 55. a completed-but-NON-MEASURING check must not advance the staleness anchor (#1353) =="
+
+# 36 zeros, so a fixture sha below is exactly 40 hex chars.
+HEX36="000000000000000000000000000000000000"
+
+# (a) THE REPRODUCTION. The PR's own last MEASUREMENT was at 00:01; a SKIPPED
+# check completed at 00:06 and used to stamp the anchor with 00:06, so the base
+# red that began at 00:03 looked already-measured and the stale green merged.
+new_scen stale-nonmeasuring-skipped
+HEAD_NM1="a1a1${HEX36}"
+printf '%s\n' "$HEAD_NM1" > "$SCEN/head"
+lane_pass "$HEAD_NM1" 5961 > "$SCEN/runs-$HEAD_NM1"
+lane_pass mainnm1 5962 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5001 'python-ci / test (a)' completed success 7361 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 5002 'agent-infra-ci / lint' completed skipped 7361 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7361 pull_request 'CI'
+write_main_checks "$(check_run 6001 'agent-infra-ci / lint' completed failure 7461 2026-01-01T00:03:00Z 2026-01-01T00:03:30Z)"
+main_run_map 7461 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a base red at 00:03 is STALE despite a SKIPPED check completing at 00:06 (exit $rc)" \
+  || fail "a SKIPPED check advanced the anchor past the real measurement and the stale green MERGED"
+grep -q "STALE surface" "$SCEN/err" && pass "…and the refusal names the staleness" \
+  || fail "the refusal is not the staleness one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "surface was last produced (2026-01-01T00:01:00Z)" "$SCEN/err" \
+  && pass "…anchored on the MEASURING check (00:01), not the skipped one (00:06)" \
+  || fail "the anchor is not the measuring check's completion: $(grep -m1 'last produced' "$SCEN/err")"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a stale green" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a stale green" || pass "no merge attempted"
+
+# (b) THE SAME FOR EVERY OTHER NON-MEASURING NON-RED CONCLUSION.
+for pair in "cancelled:c1" "neutral:d1" "stale:e1"; do
+  concl="${pair%%:*}"; tag="${pair##*:}"
+  new_scen "stale-nonmeasuring-$concl"
+  HEAD_NM="f9${tag}${HEX36}"
+  printf '%s\n' "$HEAD_NM" > "$SCEN/head"
+  lane_pass "$HEAD_NM" 5963 > "$SCEN/runs-$HEAD_NM"
+  lane_pass "main${tag}" 5964 > "$SCEN/runs-main"
+  write_pr_checks \
+    "$(check_run 5001 'python-ci / test (a)' completed success 7362 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+    "$(check_run 5002 'agent-infra-ci / lint' completed "$concl" 7362 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+  pr_run_map 7362 pull_request 'CI'
+  write_main_checks "$(check_run 6001 'agent-infra-ci / lint' completed failure 7462 2026-01-01T00:03:00Z 2026-01-01T00:03:30Z)"
+  main_run_map 7462 push 'Post-merge validation'
+  run_admin_here 42 >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "…a COMPLETED $concl does not advance the anchor either (exit $rc)" \
+    || fail "a COMPLETED $concl advanced the anchor and the stale green MERGED"
+  grep -q "STALE surface" "$SCEN/err" && pass "…$concl refuses via the staleness rule" \
+    || fail "the $concl refusal is not the staleness one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+done
+
+# (c) AND WHEN THE NON-MEASURING CHECK IS THE SURFACE'S ONLY COMPLETED CHECK
+# the anchor is EMPTY, which makes 4.6 refuse (fail closed) rather than compare
+# against a non-measurement's time.
+new_scen stale-nonmeasuring-only
+HEAD_NM2="a2a2${HEX36}"
+printf '%s\n' "$HEAD_NM2" > "$SCEN/head"
+lane_pass "$HEAD_NM2" 5965 > "$SCEN/runs-$HEAD_NM2"
+lane_pass mainnm2 5966 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'agent-infra-ci / lint' completed skipped 7363 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7363 pull_request 'CI'
+write_main_checks "$(check_run 6001 'agent-infra-ci / lint' completed failure 7463 2026-01-01T00:03:00Z 2026-01-01T00:03:30Z)"
+main_run_map 7463 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a SKIPPED-only surface leaves NO anchor, so a red base REFUSES (exit $rc)" \
+  || fail "a skipped-only surface certified a red base — the anchor was set by a non-measurement"
+grep -q "NO MEASURING completed check run" "$SCEN/err" \
+  && pass "…and the refusal names the absence of a MEASURING check, not of any check" \
+  || fail "the no-anchor refusal does not distinguish measuring from non-measuring: $(sed -n '1,8p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a stale green" || pass "no merge attempted"
+
+# (d) THE OVER-BLOCK GUARD — A MEASURING COMPLETION STILL ADVANCES THE ANCHOR.
+# The same fixture with the skipped check replaced by a MEASURING success at
+# 00:06 covers the base red that began at 00:02, so the merge MUST proceed.
+# Without this the fix could pass by never advancing the anchor at all — which
+# would refuse every PR whose surface carries a non-measuring check.
+new_scen stale-measuring-anchor
+HEAD_NM3="a3a3${HEX36}"
+printf '%s\n' "$HEAD_NM3" > "$SCEN/head"
+lane_pass "$HEAD_NM3" 5967 > "$SCEN/runs-$HEAD_NM3"
+lane_pass mainnm3 5968 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7364 2026-01-01T00:05:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7364 pull_request 'CI'
+write_main_checks "$(check_run 6001 'agent-infra-ci / lint' completed failure 7464 2026-01-01T00:02:00Z 2026-01-01T00:02:30Z)"
+main_run_map 7464 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a base red at 00:02 IS covered by the PR's 00:06 MEASURING success — it MERGES (exit 0)" \
+  || fail "a covered base red was refused (exit $rc) — the anchor stopped advancing from a measurement: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+[ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+
+# (e) THE OVER-BLOCK GUARD FOR THE ALLOW-LIST — all FIVE named non-red
+# conclusions still merge on BOTH surfaces when the base is green, because a
+# green base never enters 4.6 at all.
+new_scen nonmeasuring-both-surfaces-green
+HEAD_NM4="a4a4${HEX36}"
+printf '%s\n' "$HEAD_NM4" > "$SCEN/head"
+lane_pass "$HEAD_NM4" 5969 > "$SCEN/runs-$HEAD_NM4"
+lane_pass mainnm4 5970 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5101 'ci / a' completed success 7365 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 5102 'ci / b' completed neutral 7365 2026-01-01T00:00:00Z 2026-01-01T00:02:00Z)" \
+  "$(check_run 5103 'ci / c' completed skipped 7365 2026-01-01T00:00:00Z 2026-01-01T00:03:00Z)" \
+  "$(check_run 5104 'ci / d' completed cancelled 7365 2026-01-01T00:00:00Z 2026-01-01T00:04:00Z)" \
+  "$(check_run 5105 'ci / e' completed stale 7365 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+pr_run_map 7365 pull_request 'CI'
+write_main_checks \
+  "$(check_run 6101 'ci / a' completed success 7465 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 6102 'ci / b' completed neutral 7465 2026-01-01T00:00:00Z 2026-01-01T00:02:00Z)" \
+  "$(check_run 6103 'ci / c' completed skipped 7465 2026-01-01T00:00:00Z 2026-01-01T00:03:00Z)" \
+  "$(check_run 6104 'ci / d' completed cancelled 7465 2026-01-01T00:00:00Z 2026-01-01T00:04:00Z)" \
+  "$(check_run 6105 'ci / e' completed stale 7465 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+main_run_map 7465 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "the five named non-red conclusions merge on BOTH surfaces on a green base (exit 0)" \
+  || fail "a non-red conclusion was reddened (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 5 check(s)" "$SCEN/out" \
+  && pass "…and all five tree checks are still COUNTED and reported GREEN" \
+  || fail "the tree surface lost its non-measuring checks: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (f) THE OVER-BLOCK GUARD FOR IN-FLIGHT SPELLINGS — all five remain PENDING
+# (never red, never a measurement), so a green lane/base still merges.
+new_scen in-flight-spellings-still-pending
+HEAD_NM5="a5a5${HEX36}"
+printf '%s\n' "$HEAD_NM5" > "$SCEN/head"
+lane_pass "$HEAD_NM5" 5971 > "$SCEN/runs-$HEAD_NM5"
+lane_pass mainnm5 5972 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5201 'ci / q' queued '' 7366)" \
+  "$(check_run 5202 'ci / p' in_progress '' 7366)" \
+  "$(check_run 5203 'ci / w' waiting '' 7366)" \
+  "$(check_run 5204 'ci / r' requested '' 7366)" \
+  "$(check_run 5205 'ci / n' pending '' 7366)"
+pr_run_map 7366 pull_request 'CI'
+main_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "all five in-flight spellings stay PENDING and merge on a green base (exit 0)" \
+  || fail "an in-flight spelling was reddened (exit $rc): $(sed -n '1,5p' "$SCEN/err" 2>/dev/null)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "pending 5" "$SCEN/out" \
+  && pass "…and all five are COUNTED as pending, not red" \
+  || fail "the in-flight count is wrong: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# ── 56. AN UNNAMED (OR PLACEHOLDER-NAMED) CHECK IS KEYED BY ITS OWN IDENTITY ─
+# `best`/`sbest` are keyed by (app, name) / context, so ALL unnamed entries shared
+# one key: a newer unnamed NON-red superseded an older unnamed RED and the red was
+# DISCARDED before classification — the surface read `green — 0 failing of 1
+# measured` and the rail merged. Identified entries keep the superseded-run rule.
+# (HEX36, the 36-zero sha suffix, is defined at scenario 55.)
+echo "== 56. distinct UNNAMED checks cannot supersede one another (#1353) =="
+
+# 36 zeros, so a fixture sha below is exactly 40 hex chars (also defined at 55).
+HEX36="000000000000000000000000000000000000"
+
+# raw_unnamed_check <id> <app> <status> <conclusion> <run-id> [completed_at]
+raw_unnamed_check() {
+  printf '{"id":%s,"name":"","status":"%s","conclusion":"%s","app":{"slug":"%s"},"started_at":"2026-01-01T00:00:00Z","completed_at":"%s","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/%s/job/1"}' \
+    "$1" "$3" "$4" "$2" "${6:-2026-01-01T00:05:00Z}" "$5"
+}
+
+# (a) THE REPRODUCTION. Two unnamed checks on the same app: an older RED (id 9)
+# and a newer green (id 10). The green used to overwrite the red in `best`.
+new_scen unnamed-collision-red-then-green
+HEAD_UC1="b1b1${HEX36}"
+printf '%s\n' "$HEAD_UC1" > "$SCEN/head"
+lane_pass "$HEAD_UC1" 5981 > "$SCEN/runs-$HEAD_UC1"
+lane_pass mainuc1 5982 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(raw_unnamed_check 9 github-actions completed failure 6909 2026-01-01T00:01:00Z)" \
+  "$(raw_unnamed_check 10 github-actions completed success 6910 2026-01-01T00:05:00Z)"
+pr_run_map 6909 pull_request 'CI' 6910 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "two NAME-LESS checks (older RED + newer green) REFUSE (exit $rc)" \
+  || fail "a newer unnamed non-red superseded an older unnamed RED and MERGED — the collision hole"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" && pass "…as the tree-red refusal" \
+  || fail "the refusal is not the tree-red one: $(sed -n '1,5p' "$SCEN/err" 2>/dev/null)"
+grep -q "(unnamed check)" "$SCEN/err" && pass "…naming the unnamed red it classified" \
+  || fail "the refusal does not name the unnamed red"
+grep -q "of 2 measured" "$SCEN/err" && pass "…and BOTH unnamed entries are COUNTED (of 2 measured)" \
+  || fail "the unnamed entries are not both measured: $(grep -m1 'THE TREE' "$SCEN/err")"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a dropped red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a dropped red" || pass "no merge attempted"
+
+# (b) THE REVERSE (older green, newer RED) — a control: both the pre-fix and the
+# fixed rail refuse here, so (a)'s pre-fix merge is attributable to the collision.
+new_scen unnamed-collision-green-then-red
+HEAD_UC2="b2b2${HEX36}"
+printf '%s\n' "$HEAD_UC2" > "$SCEN/head"
+lane_pass "$HEAD_UC2" 5983 > "$SCEN/runs-$HEAD_UC2"
+lane_pass mainuc2 5984 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(raw_unnamed_check 9 github-actions completed success 6911 2026-01-01T00:01:00Z)" \
+  "$(raw_unnamed_check 10 github-actions completed failure 6912 2026-01-01T00:05:00Z)"
+pr_run_map 6911 pull_request 'CI' 6912 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "the REVERSE (older green + newer RED) still REFUSES (exit $rc)" \
+  || fail "a newer unnamed red was lost — the superseded rule is inverted"
+
+# (c) DIFFERENT APPS — a control showing the loss in (a) is the placeholder
+# COLLISION, not the superseded rule: separate apps never shared a key.
+new_scen unnamed-collision-different-apps
+HEAD_UC3="b3b3${HEX36}"
+printf '%s\n' "$HEAD_UC3" > "$SCEN/head"
+lane_pass "$HEAD_UC3" 5985 > "$SCEN/runs-$HEAD_UC3"
+lane_pass mainuc3 5986 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(raw_unnamed_check 9 app-a completed failure 6913 2026-01-01T00:01:00Z)" \
+  "$(raw_unnamed_check 10 app-b completed success 6914 2026-01-01T00:05:00Z)"
+pr_run_map 6913 pull_request 'CI' 6914 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "unnamed checks on DIFFERENT apps still REFUSE (exit $rc)" \
+  || fail "an unnamed red on another app was lost"
+
+# (d) THE STATUS HALF. Two `context: ""` statuses share the placeholder key, so a
+# newer unnamed `success` used to supersede an older unnamed `failure`.
+new_scen unnamed-collision-status
+HEAD_UC4="b4b4${HEX36}"
+printf '%s\n' "$HEAD_UC4" > "$SCEN/head"
+lane_pass "$HEAD_UC4" 5987 > "$SCEN/runs-$HEAD_UC4"
+lane_pass mainuc4 5988 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+printf '{"state":"failure","total_count":2,"statuses":[{"context":"","state":"failure","updated_at":"2026-01-01T00:01:00Z","target_url":"https://example.com/status/9"},{"context":"","state":"success","updated_at":"2026-01-01T00:05:00Z","target_url":"https://example.com/status/10"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "two NAME-LESS statuses (older failure + newer success) REFUSE (exit $rc)" \
+  || fail "a newer unnamed status superseded an older unnamed FAILURE and MERGED"
+grep -q "(unnamed status)" "$SCEN/err" && pass "…naming the unnamed failure" \
+  || fail "the refusal does not name the unnamed status"
+
+# (e) A CHECK LITERALLY NAMED THE PLACEHOLDER collides identically.
+new_scen unnamed-collision-placeholder-name
+HEAD_UC5="b5b5${HEX36}"
+printf '%s\n' "$HEAD_UC5" > "$SCEN/head"
+lane_pass "$HEAD_UC5" 5989 > "$SCEN/runs-$HEAD_UC5"
+lane_pass mainuc5 5990 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 9 '(unnamed check)' completed failure 6915 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 10 '(unnamed check)' completed success 6916 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+pr_run_map 6915 pull_request 'CI' 6916 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a check NAMED '(unnamed check)' collides the same way and REFUSES (exit $rc)" \
+  || fail "placeholder-NAMED checks collided and a red was lost"
+
+# (f) THE OVER-BLOCK GUARD — IDENTIFIED superseded runs still do NOT red.
+new_scen identified-superseded-still-green
+HEAD_UC6="b6b6${HEX36}"
+printf '%s\n' "$HEAD_UC6" > "$SCEN/head"
+lane_pass "$HEAD_UC6" 5991 > "$SCEN/runs-$HEAD_UC6"
+lane_pass mainuc6 5992 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 3101 'ai-review-gate' completed failure 6917 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 3102 'ai-review-gate' completed success 6918 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+pr_run_map 6917 pull_request 'CI' 6918 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "an IDENTIFIED red superseded by a later green still MERGES (exit 0)" \
+  || fail "the superseded-run rule was weakened for identified entries (exit $rc)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (g) …AND THE IDENTIFIED RULE STILL RUNS THE OTHER WAY: a newer red of the same
+# name is NOT superseded by the older green.
+new_scen identified-newer-red-still-red
+HEAD_UC7="b7b7${HEX36}"
+printf '%s\n' "$HEAD_UC7" > "$SCEN/head"
+lane_pass "$HEAD_UC7" 5993 > "$SCEN/runs-$HEAD_UC7"
+lane_pass mainuc7 5994 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 3101 'ai-review-gate' completed success 6919 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)" \
+  "$(check_run 3102 'ai-review-gate' completed failure 6920 2026-01-01T00:00:00Z 2026-01-01T00:05:00Z)"
+pr_run_map 6919 pull_request 'CI' 6920 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an IDENTIFIED newer red still REFUSES (exit $rc)" \
+  || fail "an identified newer red was superseded by an older green"
+
+# (h) …AND two unnamed NON-red checks still merge (the fix must not redden them).
+new_scen unnamed-two-nonred
+HEAD_UC8="b8b8${HEX36}"
+printf '%s\n' "$HEAD_UC8" > "$SCEN/head"
+lane_pass "$HEAD_UC8" 5995 > "$SCEN/runs-$HEAD_UC8"
+lane_pass mainuc8 5996 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(raw_unnamed_check 9 github-actions completed success 6921 2026-01-01T00:01:00Z)" \
+  "$(raw_unnamed_check 10 github-actions completed neutral 6922 2026-01-01T00:05:00Z)"
+pr_run_map 6921 pull_request 'CI' 6922 pull_request 'CI'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "two unnamed NON-red checks still MERGE (exit 0)" \
+  || fail "the per-entry key reddened unnamed non-red checks (exit $rc)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 2 check(s)" "$SCEN/out" \
+  && pass "…and both are still COUNTED" \
+  || fail "the unnamed non-red checks vanished: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# ── 57. A POSITIVE DROP COUNT WITH NO TOKEN TEXT IS CLIPPED, NOT COMPLETE ────
+# An empty TOKEN on a DROPPED line (a bare `FAILED` where FAILED is the last
+# field) is a COUNTED drop that renders nothing, so the token block printed the
+# COMPLETE empty-text body directly under a stated positive drop count — the
+# COMPLETE/CLIPPED claim contradicted the count it had just reported.
+echo "== 57. a positive drop count with no token text renders CLIPPED, not COMPLETE (#1353) =="
+
+# 36 zeros, so a fixture sha below is exactly 40 hex chars (also defined at 55).
+HEX36="000000000000000000000000000000000000"
+
+# log_bare_failed — a `FAILED` record with NOTHING after it: the parser's
+# candidate is the EMPTY string, a DROPPED drop whose token text renders blank.
+log_bare_failed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED\n'; }
+
+# (a) THE REPRODUCTION. One real FAILED id (exempted by main) + TWO bare FAILED
+# lines: the count is 2, the token text renders blank, and the evidence used to
+# claim the sets were COMPLETE.
+new_scen attribution-empty-token-text
+HEAD_AT5="c1c1${HEX36}"
+printf '%s\n' "$HEAD_AT5" > "$SCEN/head"
+FAIL_AT5='tests/test_other.py::test_red_on_main'
+lane_fail "$HEAD_AT5" 8805 > "$SCEN/runs-$HEAD_AT5"
+{ log_failed "$FAIL_AT5"; log_bare_failed; log_bare_failed; } > "$SCEN/log-8805"
+main_red_n mainat5 9005 3 "$FAIL_AT5" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a PR with one exempt failure and TWO text-less drops still merges (exit 0)" \
+  || fail "the attribution disclosure blocked a merge it must not (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "the parser reported 2 drop(s) but named no token text" "$SCEN/err" \
+  && pass "the RAIL'S OUTPUT states the count AND that no token text was named" \
+  || fail "the rail does not state the missing token text: $(grep -m1 'DROP' "$SCEN/err")"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=2 | main=0" "$SCEN/comment" && pass "the POSTED EVIDENCE states the drop count (PR=2, main=0)" \
+    || fail "the evidence does not state the drop counts: $(grep -m1 'Attribution' "$SCEN/comment")"
+  grep -q "NO token text to render" "$SCEN/comment" \
+    && pass "…and the token block renders the CLIPPED body naming the MISSING text" \
+    || fail "the token block does not name the missing token text"
+  grep -q "every FAILED token was a test id, so the failing sets above are COMPLETE" "$SCEN/comment" \
+    && fail "the evidence claims COMPLETE while stating a positive drop count" \
+    || pass "…and it does NOT claim COMPLETE over a stated positive drop count"
+  grep -q -- "- (HTTP" "$SCEN/comment" && fail "a token appeared from nowhere" || pass "…with no fabricated token"
+else
+  fail "no evidence comment posted for the text-less-drop case"
+fi
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (b) THE GUARD THE OTHER WAY — a REAL token still renders as a token, and the
+# no-text CLIPPED body must NOT replace a populated token list.
+new_scen attribution-empty-plus-real-token
+HEAD_AT6="c2c2${HEX36}"
+printf '%s\n' "$HEAD_AT6" > "$SCEN/head"
+lane_fail "$HEAD_AT6" 8806 > "$SCEN/runs-$HEAD_AT6"
+{ log_failed "$FAIL_AT5"; log_bare_failed; log_unattributable '(HTTP'; } > "$SCEN/log-8806"
+main_red_n mainat6 9006 3 "$FAIL_AT5" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a text-less drop BESIDE a real token still merges (exit 0)" \
+  || fail "the mixed drop case blocked a sound merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q -- "- (HTTP" "$SCEN/comment" && pass "…and the REAL token is still rendered in the list" \
+    || fail "the real token vanished from the evidence"
+  grep -q "NO token text to render" "$SCEN/comment" \
+    && fail "the no-text CLIPPED body replaced a populated token list" \
+    || pass "…and the no-text CLIPPED body is NOT used when token text exists"
+  grep -q "PR=2 | main=0" "$SCEN/comment" && pass "…with the count (2 drops: one text-less, one real token)" \
+    || fail "the mixed count is wrong"
+else
+  fail "no evidence comment posted for the mixed case"
+fi
+
+# (c) THE OVER-BLOCK GUARD FOR THE COMPLETE BRANCH — a zero drop count still
+# states COMPLETE explicitly (the disclosure stays unconditional).
+new_scen attribution-still-complete
+HEAD_AT7="c3c3${HEX36}"
+printf '%s\n' "$HEAD_AT7" > "$SCEN/head"
+lane_pass "$HEAD_AT7" 8807 > "$SCEN/runs-$HEAD_AT7"
+lane_pass mainat7 8808 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a clean merge still merges (exit 0)" \
+  || fail "the attribution disclosure blocked a clean merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=0 | main=0" "$SCEN/comment" && pass "…and the evidence states ZERO drops" \
+    || fail "the evidence omits the zero drop count"
+  grep -q "every FAILED token was a test id, so the failing sets above are COMPLETE" "$SCEN/comment" \
+    && pass "…and says COMPLETE, not merely empty" \
+    || fail "the COMPLETE claim was lost when the count is zero"
+  grep -q "NO token text to render" "$SCEN/comment" && fail "the CLIPPED body leaked into a zero-drop set" \
+    || pass "…and the CLIPPED body is absent"
+else
+  fail "no evidence comment posted for the complete case"
+fi
+
+# ── 58. THE DROP-COUNT SUMMARY MATCH IS ANCHORED TO ITS OWN LINE ─────────────
+# `unattributable_count`'s greedy `.*unattributable=` also matched the TOKEN TEXT
+# of a DROPPED line, so a dropped token that literally contained
+# `unattributable=7` reported 8 for ONE drop (and the evidence said `PR=8`).
+echo "== 58. a token's own text cannot inflate the drop count (#1353) =="
+
+# 36 zeros, so a fixture sha below is exactly 40 hex chars (also defined at 55).
+HEX36="000000000000000000000000000000000000"
+
+log_bare_failed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED\n'; }
+
+# (a) THE REPRODUCTION. One real exempt failure + ONE token whose text is
+# `unattributable=7`. The summary says unattributable=1; the old greedy match also
+# read the token and summed 1 + 7 = 8.
+new_scen dropcount-token-inflation
+HEAD_AT8="c4c4${HEX36}"
+printf '%s\n' "$HEAD_AT8" > "$SCEN/head"
+FAIL_AT8='tests/test_other.py::test_red_on_main'
+lane_fail "$HEAD_AT8" 8809 > "$SCEN/runs-$HEAD_AT8"
+{ log_failed "$FAIL_AT8"; log_unattributable 'unattributable=7'; } > "$SCEN/log-8809"
+main_red_n mainat8 9008 3 "$FAIL_AT8" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a token containing 'unattributable=7' does not block a sound merge (exit 0)" \
+  || fail "the token-text inflation blocked a merge (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "1 FAILED token(s) were DROPPED" "$SCEN/err" \
+  && pass "the RAIL'S OUTPUT reports ONE drop, not 8" \
+  || fail "the rail's drop count is inflated by the token text: $(grep -m1 'FAILED token' "$SCEN/err")"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=1 | main=0" "$SCEN/comment" && pass "the POSTED EVIDENCE states PR=1 | main=0" \
+    || fail "the evidence drop count is inflated: $(grep -m1 'Attribution' "$SCEN/comment")"
+  grep -q "PR=8" "$SCEN/comment" && fail "the evidence still counts the token's own 'unattributable=7'" \
+    || pass "…and the token's own text did NOT inflate it"
+  grep -q -- "- unattributable=7" "$SCEN/comment" \
+    && pass "…while the token is STILL NAMED in the drop list" \
+    || fail "the token was dropped from the evidence instead of named"
+else
+  fail "no evidence comment posted for the inflation case"
+fi
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (b) THE MIXED CASE — text-less drops are still counted through the DROPPED-line
+# path, and the token text still does not add to them.
+new_scen dropcount-mixed
+HEAD_AT9="c5c5${HEX36}"
+printf '%s\n' "$HEAD_AT9" > "$SCEN/head"
+lane_fail "$HEAD_AT9" 8810 > "$SCEN/runs-$HEAD_AT9"
+{ log_failed "$FAIL_AT8"; log_unattributable 'unattributable=7'; log_bare_failed; log_bare_failed; } > "$SCEN/log-8810"
+main_red_n mainat9 9009 3 "$FAIL_AT8" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a mixed drop set still merges (exit 0)" \
+  || fail "the mixed drop set blocked a sound merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=3 | main=0" "$SCEN/comment" \
+    && pass "…and the evidence counts 3 drops (one token + two text-less), not 10" \
+    || fail "the mixed drop count is wrong: $(grep -m1 'Attribution' "$SCEN/comment")"
+else
+  fail "no evidence comment posted for the mixed case"
+fi
+
+# (c) A token carrying an ABSURD number is still not read as a count.
+new_scen dropcount-absurd-token
+HEAD_ATA="c6c6${HEX36}"
+printf '%s\n' "$HEAD_ATA" > "$SCEN/head"
+lane_fail "$HEAD_ATA" 8811 > "$SCEN/runs-$HEAD_ATA"
+{ log_failed "$FAIL_AT8"; log_unattributable 'unattributable=99999999999999999999'; } > "$SCEN/log-8811"
+main_red_n mainata 9010 3 "$FAIL_AT8" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "an absurd in-token number does not block a sound merge (exit 0)" \
+  || fail "the absurd in-token number blocked a merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=1 | main=0" "$SCEN/comment" && pass "…and the evidence still states PR=1" \
+    || fail "the absurd token changed the count: $(grep -m1 'Attribution' "$SCEN/comment")"
+else
+  fail "no evidence comment posted for the absurd-token case"
+fi
+
+# ── 59. A SKIPPED-ONLY SURFACE ON A GREEN BASE MERGES (the FIX A guard) ───────
+# The narrowest form of the #55 over-block guard, run after the attribution
+# scenarios: a surface whose ONLY completed check is SKIPPED, on a GREEN base.
+# Nothing measurable was produced, and 4.6 is not entered on a green base, so it
+# must MERGE — the EMPTY anchor is a refusal only when the base is RED.
+echo "== 59. a skipped-only surface on a green base still merges (#1353) =="
+
+new_scen skipped-only-on-green-base
+HEAD_NM6="a6a6${HEX36}"
+printf '%s\n' "$HEAD_NM6" > "$SCEN/head"
+lane_pass "$HEAD_NM6" 5973 > "$SCEN/runs-$HEAD_NM6"
+lane_pass mainnm6 5974 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5301 'ci / lint' completed skipped 7367 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7367 pull_request 'CI'
+main_green_surface
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a SKIPPED-only surface on a GREEN base MERGES (exit 0)" \
+  || fail "a skipped-only surface was refused on a green base (exit $rc): $(sed -n '1,5p' "$SCEN/err" 2>/dev/null)"
+grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "among 1 check(s)" "$SCEN/out" \
+  && pass "…and the skipped check is still COUNTED and reported GREEN" \
+  || fail "the skipped-only surface is not reported: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+# ── 60. a GUARD-STEP failure is ATTRIBUTED and COMPARED (#4469) ────────────
 # The measured defect: `pytest` exited rc 0 and the failure was the post-suite
 # orphan guard. Because no id existed, the rail REFUSED the run outright
 # ("yielded NO parseable 'FAILED <nodeid>' line") and a green, review-clean PR
