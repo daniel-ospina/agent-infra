@@ -136,6 +136,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Safe admin-merge rail suite (parser, #3469 trap, flake, parity)
         run: bash tests/admin-merge/run.sh
+      - name: Atomic land unit suite (#1367)
+        # update → verify → record → land as ONE unit. The land step DELEGATES to
+        # admin-merge.sh (the suite above) and the record step to record-review.sh;
+        # this suite pins only the sequencing and the fail-closed preconditions.
+        run: bash tests/atomic-land/run.sh
       - name: Argv-level admin-merge guard suite (#984)
         # The layer that makes obfuscation irrelevant: the shim inspects its OWN argv,
         # where bash has already resolved `-${V:--}admin=true` into `--admin`. The

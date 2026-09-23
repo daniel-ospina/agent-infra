@@ -310,6 +310,10 @@ jobs:
           # (scripts/admin-merge.sh). Post-merge re-check of the same hermetic
           # suite ci.yml runs per-PR.
           bash tests/admin-merge/run.sh || errors=$((errors+1))
+          # #1367 — the atomic land unit (update → verify → record → land). It
+          # delegates the land step to admin-merge.sh and the record step to
+          # record-review.sh; this suite pins the sequencing + fail-closed gates.
+          bash tests/atomic-land/run.sh || errors=$((errors+1))
           # #984 — the ARGV-LEVEL half: scripts/gh-shim/gh decides from its own argv
           # (where bash has finished), so a splice cannot hide the flag. Same hermetic
           # suite ci.yml runs per-PR.
