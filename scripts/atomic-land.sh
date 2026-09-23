@@ -247,16 +247,35 @@ base_tip() {
   gh_ api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true
 }
 
-# Does the PR body carry a SIGNED marker with a diff= identity for this PR and
-# verdict? Mirrors the producer's own carry-forward regex (scripts/record-review.sh,
-# #767/#2982) — keep both in sync. A marker WITHOUT `diff=` (every pre-#767 record)
-# can never be carried forward, so an update is destructive with certainty when
-# this returns non-zero.
+# The review gate key — the SAME source and normalisation as the producer
+# (scripts/record-review.sh: AI_REVIEW_GATE_KEY, else ~/.pi/agent/.ai-review-gate-key).
+# The PR body is attacker-writable, so a matching marker SHAPE is not evidence that
+# the record can be carried: the producer carries a prior marker only after
+# verifying its HMAC (#784/#2982), and refuses when no key is available. The rail
+# therefore VERIFIES the attestation — presence of a diff= identity AND a valid
+# signature — instead of trusting its shape.
+GATE_KEY_RAW="${AI_REVIEW_GATE_KEY:-}"
+if [ -z "$GATE_KEY_RAW" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+  GATE_KEY_RAW="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+fi
+GATE_KEY="$(printf '%s' "$GATE_KEY_RAW" | tr -d '[:space:]')"
+
+# Can the record at the current head be RESTORED by the producer's carry-forward
+# after an update? Requires a marker that is (a) shape-valid WITH a diff= identity
+# and (b) authentically signed by the gate key. Mirrors the producer's own carry
+# regex and signature check (record-review.sh:446-458) — keep both in sync.
+# This is a presence + authenticity test, NOT an equivalence computation: whether
+# the marker's diff= still matches the live diff is the producer's decision alone.
 pr_has_carry_evidence() {
-  local body=""
-  body="$(gh_ api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
-  [ -n "$body" ] || return 1
-  printf '%s' "$body" | grep -qE "^review recorded: reviews/${PR}\\.json verdict=${RECORD_VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(.*\\) sig=[0-9a-f]{64}$"
+  local line="" text="" sig="" expect=""
+  line="$(gh_ api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null \
+    | grep -m1 -E "^review recorded: reviews/${PR}\\.json verdict=${RECORD_VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(.*\\) sig=[0-9a-f]{64}$" || true)"
+  [ -n "$line" ] || return 1
+  [ -n "$GATE_KEY" ] || return 1
+  text="${line% sig=*}"; sig="${line##* sig=}"
+  expect="$(printf '%s' "$text" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+  [ -n "$expect" ] || return 1
+  [ "$sig" = "$expect" ]
 }
 
 resolve_repo() {
@@ -365,7 +384,10 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
   # landed 0. This is a PRESENCE test — does an identity-bearing marker exist at all
   # — NOT an equivalence computation: the producer owns the equivalence decision.
   if [ "$RECORD_HEAD" = "$HEAD" ] && ! pr_has_carry_evidence; then
-    stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and nothing could re-mint it — the PR carries no signed marker with a diff= identity for verdict '$RECORD_VERDICT' (a pre-#767 record). Record the review in the current format first; then the update carries it. Nothing was merged."
+    if [ -z "$GATE_KEY" ]; then
+      stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and nothing could re-mint it — no review gate key is available (AI_REVIEW_GATE_KEY or ~/.pi/agent/.ai-review-gate-key), so the carry-forward could never verify a prior marker. Nothing was merged."
+    fi
+    stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and this rail could not show it would be restored — the PR carries no VERIFIABLE signed marker with a diff= identity for verdict '$RECORD_VERDICT' (a pre-#767 marker, one signed with a different key, or a line whose signature does not verify; the PR body is attacker-writable, so a matching shape is not evidence). Record the review in the current format first; then the update carries it. Nothing was merged."
   fi
   say "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
   if [ "$DRY_RUN" -eq 1 ]; then

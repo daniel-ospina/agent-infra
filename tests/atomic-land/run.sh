@@ -197,6 +197,18 @@ chmod +x "$ADM"
 
 # ── harness ───────────────────────────────────────────────────────────────
 # new_scen: a scenario dir + a temp HOME carrying the review record fixture.
+# A fixture gate key and a marker that is GENUINELY signed with it. The rail verifies
+# the signature, so a fixture that only imitates the shape would (correctly) be
+# refused as unverifiable.
+GATE_KEY_FIXTURE="test-gate-key-arbitrary-0001"
+marker_fixture() { # <pr> <verdict> <sha> [diff-hex]
+  local pr="$1" v="$2" sha="$3"
+  local diff="${4:-1111111111111111111111111111111111111111111111111111111111111111}"
+  local text="review recorded: reviews/${pr}.json verdict=${v} @ ${sha} diff=${diff} (${REPO})"
+  printf '%s sig=%s\n' "$text" \
+    "$(printf '%s' "$text" | openssl dgst -sha256 -hmac "$GATE_KEY_FIXTURE" | awk '{print $NF}')"
+}
+
 new_scen() {
   SCEN="$TMP/scen-$1"
   # reset every scenario-scoped switch (a leak between scenarios is a test bug)
@@ -223,11 +235,11 @@ new_scen() {
   SCEN_RECORD_FILE="$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
   printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
     > "$SCEN_RECORD_FILE"
-  # default PR body: a SIGNED marker WITH a diff= identity, i.e. the post-#767
-  # shape. Scenarios that model a pre-#767 record overwrite this fixture.
-  printf 'review recorded: reviews/42.json verdict=clean @ %s diff=%s (%s) sig=%s\n' \
-    "$HEAD_OLD" "1111111111111111111111111111111111111111111111111111111111111111" "$REPO" \
-    "2222222222222222222222222222222222222222222222222222222222222222" > "$SCEN/pr-body"
+  # Gate key + a GENUINELY SIGNED marker with a diff= identity (the post-#767
+  # shape). The rail VERIFIES the signature, so the fixture must really sign:
+  # a body that merely LOOKS like a marker is not evidence (it is attacker-writable).
+  printf '%s' "$GATE_KEY_FIXTURE" > "$SCEN/home/.pi/agent/.ai-review-gate-key"
+  marker_fixture 42 clean "$HEAD_OLD" > "$SCEN/pr-body"
 }
 
 run_rail() { # <extra args...>
@@ -304,12 +316,10 @@ echo "── 5. an unaccepted verdict is refused"
 new_scen badverdict
 printf '{"pr":42,"head_sha":"%s","verdict":"pending","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
   > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
-# Give the PR a marker carrying the SAME (unaccepted) verdict, so the B5 update
-# guard passes and this scenario isolates the VERDICT check: with the check
-# disabled, nothing else stands between the record and a land.
-printf 'review recorded: reviews/42.json verdict=pending @ %s diff=%s (%s) sig=%s\n' \
-  "$HEAD_OLD" "1111111111111111111111111111111111111111111111111111111111111111" "$REPO" \
-  "2222222222222222222222222222222222222222222222222222222222222222" > "$SCEN/pr-body"
+# Give the PR a VALIDLY SIGNED marker carrying the SAME (unaccepted) verdict, so
+# the B5 update guard passes and this scenario isolates the VERDICT check: with
+# the check disabled, nothing else stands between the record and a land.
+marker_fixture 42 pending "$HEAD_OLD" > "$SCEN/pr-body"
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
 [ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
@@ -562,7 +572,33 @@ rc=$?
 [ "$rc" -eq 1 ] && pass "stopped (rc 1) — refused to destroy an unrestorable attestation" || fail "expected rc 1, got $rc ($(tail -1 "$SCEN/err"))"
 called "pr update-branch" && fail "updated the branch and spent the attestation (B5)" || pass "did NOT update (the record would have been destroyed)"
 called "admin-merge" && fail "landed after spending the attestation" || pass "did not land"
-grep -qi "no signed marker with a diff=" "$SCEN/err" && pass "the stop names the missing identity" || fail "the stop does not name the missing identity"
+grep -qi "no VERIFIABLE signed marker with a diff=" "$SCEN/err" && pass "the stop names the missing identity" || fail "the stop does not name the missing identity"
+
+# 17g. The PR body is ATTACKER-WRITABLE, so a marker that merely LOOKS right is not
+# evidence. A forged line (right shape, signature that does not verify) must not be
+# accepted as proof the record can be restored — the producer would refuse to carry
+# it, and the update would have spent the attestation for nothing.
+echo "── 17g. a FORGED marker (valid shape, invalid signature) is not evidence (B5)"
+new_scen forgedcarry
+printf 'review recorded: reviews/42.json verdict=clean @ %s diff=%s (%s) sig=%s\n' \
+  "$HEAD_OLD" "1111111111111111111111111111111111111111111111111111111111111111" "$REPO" \
+  "4444444444444444444444444444444444444444444444444444444444444444" > "$SCEN/pr-body"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) — a shape match is not evidence" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "spent the attestation on a FORGED marker (B5)" || pass "did NOT update on a forged marker"
+called "admin-merge" && fail "landed on a forged marker" || pass "did not land"
+
+# 17h. With no gate key the producer can never carry a previous marker, so the rail
+# must not spend the attestation: fail closed.
+echo "── 17h. no gate key available → refuse to spend (B5)"
+new_scen nokey
+rm -f "$SCEN/home/.pi/agent/.ai-review-gate-key"   # the signed body stays; the KEY is gone
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) when no key is available" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "spent the attestation with no way to restore it (B5)" || pass "did NOT update without a key"
+grep -qi "no review gate key is available" "$SCEN/err" && pass "the stop names the missing key" || fail "the stop does not name the missing key"
 
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
@@ -602,6 +638,8 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B8b  's/^  if \[ "\$RECORD_HEAD" != "\$HEAD" \]; then/  if false; then/m'
   # B5b: spend an attestation without checking it can be re-bound
   mutate_and_expect_fail B5b  's/if \[ "\$RECORD_HEAD" = "\$HEAD" \] && ! pr_has_carry_evidence; then/if false; then/'
+  # B5c: accept a marker on SHAPE alone — the PR body is attacker-writable
+  mutate_and_expect_fail B5c  's/  \[ "\$sig" = "\$expect" \]/  :/'
   # B6c: do not re-poll a transient UNKNOWN — a computed-later state false-blocks
   mutate_and_expect_fail B6c  's/while \[ "\$t" -lt "\${ATOMIC_LAND_UNKNOWN_POLLS:-5}" \]; do/while false; do/'
   # B6b: read an undetermined merge state as "up to date" and certify anyway
