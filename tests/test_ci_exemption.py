@@ -52,6 +52,8 @@ Failure = ci_exemption.Failure
 Rate = ci_exemption.Rate
 decide = ci_exemption.decide
 detect_rotating_identity = ci_exemption.detect_rotating_identity
+guard_step_key = ci_exemption.guard_step_key
+normalize_guard_error = ci_exemption.normalize_guard_error
 parse_failed_ids = ci_exemption.parse_failed_ids
 parse_rates = ci_exemption.parse_rates
 
@@ -805,17 +807,291 @@ def test_the_fail_closed_refusal_survives_the_widening():
     assert parsed.ok is False, "an unreadable failure set must still read as such"
 
 
-def test_a_bare_error_annotation_with_no_step_is_still_attributable():
-    """An unprefixed annotation still attributes — the step is only the key part.
+def test_a_stripped_capture_with_no_step_head_is_not_attributable():
+    """No ``<job>\t<step>\t<ts> `` head → no step → NO attribution.
 
-    A capture that lost its `<job>\t<step>\t<ts> ` head (a stripped log) must not
-    lose the failure: the message is the attribution, and ``unknown`` is a
-    declared placeholder rather than a silent drop.
+    gh always emits the head, so a head-less capture is hand-made input; the
+    module must not found an attribution on a step it cannot name (see
+    ``_split_log_line``). Before the root-step rule, this fixture asserted an
+    ``unknown``-keyed identity — exactly the step INVENTION that rule removes.
+
+    MUTATION: re-invent the step for a head-less line
+    (``guard_step_key('', …)``) → ``ids == []`` REDs.
     """
     parsed = parse_failed_ids(
         "##[error]packaging guard: wheel is missing\n", raw_log=True
     )
 
-    assert parsed.guard_steps == [
-        "guard-step::unknown::packaging-guard-wheel-is-missing"
+    assert parsed.ids == []
+    assert parsed.guard_steps == []
+    assert parsed.ok is False
+
+
+def test_an_unparseable_test_failure_is_not_laundered_by_a_sibling_guard():
+    """A run's ROOT failure cannot be replaced by a sibling annotation.
+
+    The cycle-3 false certificate step 1c exists for: pytest fails with
+    ``ImportError: no module named y`` — no ``FAILED`` line, so the run yields NO
+    id — and the SAME run also carries a legitimate guard-step annotation. Under
+    an unqualified widening the sibling supplies an id, ``examined > extracted``
+    stops firing, and the decision certifies a run whose real failure was never
+    classified. (Found by three reviewers on this PR, reproduced against the
+    shipped module.)
+
+    The ROOT failing step — the first the runner marked — is the pytest step, and
+    it yields nothing, so the run contributes NO identity of any kind.
+
+    MUTATION: drop the ``failing[0] not in evidence`` condition → ``ids == []``
+    REDs (and ``guard_steps == []`` with it).
+    """
+    mixed = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00.0000000Z "
+        "E   ImportError: no module named y\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:01.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+        + _real_capture()
+    )
+    parsed = parse_failed_ids(mixed, raw_log=True)
+
+    assert parsed.ids == [], "the root failing step yielded nothing to attribute"
+    assert parsed.guard_steps == []
+    assert parsed.ok is False, "the rail must still REFUSE this run (step 1c)"
+
+
+def test_a_same_named_step_in_another_matrix_leg_is_not_evidence():
+    """Two matrix legs run same-NAMED steps — the step is (job, step), not a name.
+
+    Cycle-2 review, reproduced: with the bookkeeping keyed on the step NAME alone,
+    leg ``a``'s unparseable failure was attested by leg ``b``'s guard annotation
+    (same step name, different job), so the run was attributed and leg ``a``'s real
+    failure stayed invisible. (The ``E   `` clause also refuses this capture; the
+    keying must too — see the non-pytest fixture below, which has no ``E   ``.)
+
+    MUTATION: key ``failing``/``evidence`` on the step name only → ``ids == []``
+    REDs.
+    """
+    collision = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00.0000000Z "
+        "E   ImportError: no module named y\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:01.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+        "test (b)\tRun fast test suite\t2026-09-23T01:00:02.0000000Z "
+        "##[error]packaging guard: wheel is missing\n"
+        "test (b)\tRun fast test suite\t2026-09-23T01:00:03.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+    )
+    parsed = parse_failed_ids(collision, raw_log=True)
+
+    assert parsed.ids == [], "a sibling LEG's step name is not the root failure"
+    assert parsed.ok is False
+
+
+def test_a_same_named_step_in_another_matrix_leg_is_not_evidence_without_e_line():
+    """The same collision with NO pytest-shaped line: the (job, step) key refuses.
+
+    Isolates the keying clause from the ``E   `` clause — a non-pytest unparseable
+    failure in leg ``a`` must not be attested by leg ``b``'s same-named step.
+    """
+    collision = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00.0000000Z "
+        "ImportError: no module named y\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:01.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+        "test (b)\tRun fast test suite\t2026-09-23T01:00:02.0000000Z "
+        "##[error]packaging guard: wheel is missing\n"
+        "test (b)\tRun fast test suite\t2026-09-23T01:00:03.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+    )
+    parsed = parse_failed_ids(collision, raw_log=True)
+
+    assert parsed.ids == [], "the ROOT leg failed and yielded nothing"
+    assert parsed.ok is False
+
+
+def test_a_pytest_failure_line_must_yield_a_nodeid_not_an_annotation():
+    """A step showing pytest's own failure output must produce a NODEID.
+
+    Cycle-2 review, reproduced: when the ROOT step both fails unparseably
+    (``E   ImportError``) and prints a wrapper annotation, the annotation satisfied
+    the root condition and ``decide`` certified the run off a key that never named
+    the failure. An annotation is not pytest's classification.
+
+    MUTATION: drop the ``e_line_steps - nodeid_steps`` clause → ``ids == []``
+    REDs.
+    """
+    wrapped = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00.0000000Z "
+        "E   ImportError: no module named y\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:01.0000000Z "
+        "##[error]tests failed\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:02.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+    )
+    parsed = parse_failed_ids(wrapped, raw_log=True)
+
+    assert parsed.ids == [], "pytest reported a failure the parser did not classify"
+    assert parsed.ok is False
+
+
+def test_an_explained_pytest_failure_line_does_not_refuse_the_run():
+    """The ``E   `` clause is bound to the NODEID, not to the shape of any text.
+
+    A parsed nodeid explains pytest's output for its step, so a run carrying both
+    a nodeid and ``E   `` lines is fully attributed — the clause must not become a
+    blanket refusal of every pytest log.
+    """
+    parsed = parse_failed_ids(
+        f"test (a)\tRun fast test suite\t2026-09-23T01:00:00.0000000Z "
+        f"E   AssertionError: 1 != 2\n"
+        f"test (a)\tRun fast test suite\t2026-09-23T01:00:01.0000000Z FAILED {ID}\n",
+        raw_log=True,
+    )
+
+    assert parsed.ids == [ID]
+
+
+_RUNNER_WRAPPERS = (
+    "##[error]Process completed with exit code 1.",
+    "##[error]Bash exited with code '1'.",
+    "##[error]The process '/usr/bin/bash' failed with exit code 1.",
+    "##[error]Docker failed with exit code 1",
+    "##[error]Failed to run container step: exec format error",
+    "##[error]Failed to initialize containers, pull access denied",
+    "##[error]The action 'actions/checkout@v4' has timed out after 10 minutes.",
+)
+
+
+@pytest.mark.parametrize("wrapper", _RUNNER_WRAPPERS)
+def test_no_runner_or_hook_wrapper_is_ever_an_identity(wrapper):
+    """EVERY harness wrapper is excluded — and the list is pinned in full.
+
+    Cycle-3 review, reproduced on the container hooks: `Docker failed with exit
+    code 1` was absent from a three-entry denylist, so a container step that failed
+    for a reason the parser did not classify became a
+    `guard-step::…Docker-failed-with-exit-code-N` identity, satisfied
+    `examined > extracted`, and could then be EXEMPTED off main's own same wrapper —
+    a false certificate from a live lane shape. The parameters are the harness's
+    measured forms; a missing one costs BOTH roles at once (the exclusion, and the
+    "the runner marked this step failed" signal).
+
+    MUTATION: drop a form from `_RUNNER_GENERIC_ANNOTATIONS` → its parameter REDs.
+    """
+    parsed = parse_failed_ids(
+        f"test (a)\tRun tests in container\t2026-09-23T01:00:00.0000000Z {wrapper}\n",
+        raw_log=True,
+    )
+
+    assert parsed.ids == [], f"{wrapper!r} became a failure identity"
+    assert parsed.ok is False
+
+
+def test_colliding_step_slug_pairs_do_not_attest_each_other():
+    """The unit is the RAW (job, step) pair — ``_slug`` is lossy, so it would fuse them.
+
+    Cycle-3 review, reproduced: ``_slug('test (py 3.12)') == _slug('test (py-3.12)')``,
+    so slugged units collapsed and one leg's annotation attested the other leg's
+    unparseable failure. A PR author edits ``.github/workflows``, so a step named
+    ``Run-tests`` beside ``Run tests`` is author-choosable.
+
+    MUTATION: build the unit as ``f"{_slug(job)}::{_slug(step)}"`` → ``ids == []``
+    REDs (the colliding leg's annotation gets attributed).
+    """
+    capture = (
+        "test (py 3.12)\tGuard\t2026-09-23T01:00:00.0000000Z "
+        "ImportError: no module named y\n"
+        "test (py 3.12)\tGuard\t2026-09-23T01:00:01.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+        "test (py-3.12)\tGuard\t2026-09-23T01:00:02.0000000Z "
+        "##[error]redislite server leak: 16 orphans after suite, threshold 12\n"
+        "test (py-3.12)\tGuard\t2026-09-23T01:00:03.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+    )
+    parsed = parse_failed_ids(capture, raw_log=True)
+
+    assert parsed.ids == [], "a slug collision fused two different (job, step) pairs"
+    assert parsed.ok is False
+
+
+def test_a_tab_inside_a_step_name_does_not_hide_the_guard_failure():
+    """The guard pass recovers the prefix the NODEID pass uses (greedy fallback).
+
+    A tab inside a step name defeated the field split, so the guard pass silently
+    skipped every line of that step while the nodeid pass (which uses the greedy
+    ``_LOG_PREFIX_RE``) parsed it — the two passes disagreeing about one capture,
+    which is the permanent false refusal #4469 exists to remove.
+    """
+    parsed = parse_failed_ids(
+        "test\t(a)\tGuard step\t2026-09-23T01:00:00.0000000Z "
+        "##[error]redislite server leak: 16 orphans after suite, threshold 12\n"
+        "test\t(a)\tGuard step\t2026-09-23T01:00:01.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n",
+        raw_log=True,
+    )
+
+    assert parsed.ids == [
+        "guard-step::a-Guard-step::redislite-server-leak-N-orphans-after-suite-threshold-N"
     ]
+
+
+def test_every_runner_failure_marker_form_marks_the_step_failed():
+    """All three runner forms are recognised, INCLUDING the quoted exit code.
+
+    ``_runner_step_failure`` is both the generator's exclusion list and the only
+    detector of "the runner marked this step failed"; a form missing from the list
+    costs BOTH, silently refusing a genuine guard run. The runner emits
+    ``Bash exited with code '1'.`` for a ``shell: bash`` step — quoted — so the
+    quoted code must parse.
+    """
+    generic = normalize_guard_error("redislite server leak: 16 orphans")
+    for marker in (
+        "##[error]Process completed with exit code 1.",
+        "##[error]Bash exited with code '1'.",
+        "##[error]The process '/usr/bin/bash' failed with exit code 1.",
+        "##[error]Docker failed with exit code 1",
+    ):
+        parsed = parse_failed_ids(
+            "test (b)\tAssert no redislite orphans (issue\t2026-09-23T01:19:53.8645102Z "
+            + "##[error]redislite server leak: 16 orphans\n"
+            "test (b)\tAssert no redislite orphans (issue\t2026-09-23T01:19:53.8649910Z "
+            + marker
+            + "\n",
+            raw_log=True,
+        )
+        assert parsed.ids == [guard_step_key("Assert no redislite orphans (issue", generic)], (
+            f"the runner marker {marker!r} did not mark its step failed"
+        )
+
+
+def test_declared_residual_an_unparseable_failure_with_no_pytest_signal():
+    """DECLARED RESIDUAL (agent-infra #1366) — pinned, so closing it is a RED.
+
+    An unparseable failure that leaves NO ``E   `` line and sits in a step OTHER
+    than the root is invisible: the guard root is attributed first, and nothing
+    marks the later step's failure except prose. This is the honest, narrow form
+    of the residual — the pytest-shaped and same-named-step variants are refused
+    by the ``E   `` and ``(job, step)`` clauses above. Closing the class needs
+    per-step conclusions from the run metadata (#1366); a capture alone cannot tell
+    a consequence step from an unparseably-failed one.
+    """
+    residual = _real_capture() + (
+        "test (a)\tDeploy preview\t2026-09-23T01:00:02.0000000Z "
+        "ImportError: no module named y\n"
+        "test (a)\tDeploy preview\t2026-09-23T01:00:03.0000000Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+    )
+    parsed = parse_failed_ids(residual, raw_log=True)
+
+    assert parsed.ids == [_GUARD_KEY], (
+        "the guard is the ROOT failing step so it is attributed — the residual is "
+        "that a LATER unparseable, pytest-signal-free failure is invisible; #1366"
+    )

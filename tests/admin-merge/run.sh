@@ -4152,14 +4152,19 @@ grep -qE '^[[:space:]]*comm[[:space:]]+-23' "$ADM" \
   && fail "the lane-coverage subtraction re-implements comm -23 in the rail" \
   || pass "…and no comm -23 was reintroduced anywhere in the rail"
 
-# ── 49. a GUARD-STEP failure is ATTRIBUTED and COMPARED (#4469) ────────────
+# ── 50. a GUARD-STEP failure is ATTRIBUTED and COMPARED (#4469) ────────────
 # The measured defect: `pytest` exited rc 0 and the failure was the post-suite
 # orphan guard. Because no id existed, the rail REFUSED the run outright
 # ("yielded NO parseable 'FAILED <nodeid>' line") and a green, review-clean PR
 # could not merge through the sanctioned path. The fix attributes the guard-step
 # annotation — keyed by the failing STEP plus the `::error::` shape — so it
-# participates in the PR-vs-main comparison exactly like a test nodeid.
-echo "== 49. a guard-step failure is attributed and compared (#4469) =="
+# participates in the PR-vs-main comparison exactly like a test nodeid, while the
+# fail-closed refusal is PRESERVED on three conditions, all in the parser: the
+# annotation must come from a step the RUNNER marked failed; the run's ROOT
+# failing step (keyed by job+step, because matrix legs share step NAMES) must
+# itself yield an identity; and a step showing pytest's own `E   ` output must
+# yield a NODEID. Cases (c)/(d) pin the refusal; (e) pins the residual diagnosis.
+echo "== 50. a guard-step failure is attributed and compared (#4469) =="
 
 # The REAL capture shape (tortoise PR #4672, run 35785085760): the echoed script
 # SOURCE (a MID-LINE `::error::`, which must NOT become an identity), the guard's
@@ -4231,6 +4236,58 @@ grep -q "parseable failure identity" "$TMP/err" && pass "(c) …naming the refus
   || fail "(c) the refusal is unexplained: $(head -2 "$TMP/err")"
 grep -q "pr merge" "$SCEN/calls" && fail "(c) a merge was attempted on an unattributable run" \
   || pass "(c) no merge attempted"
+
+# (d) THE MIXED RUN IS STILL REFUSED (found by three reviewers on this PR). An
+# unparseable ROOT failure — pytest `ImportError: no module named y` with no
+# `FAILED` line — PLUS a sibling guard annotation must NOT be laundered: the root
+# failing step is the pytest step and it yields nothing, so the run contributes no
+# identity at all and step 1c still BLOCKS. Without this, the widening certifies a
+# run whose real failure was never classified — the cycle-3 false certificate.
+new_scen guardmixed
+HEAD_GM="e3e3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_GM" > "$SCEN/head"
+lane_fail "$HEAD_GM" 9601 > "$SCEN/runs-$HEAD_GM"
+{
+  printf 'test (a)\tRun fast test suite\t2026-09-23T01:00:00.0000000Z E   ImportError: no module named y\n'
+  printf 'test (a)\tRun fast test suite\t2026-09-23T01:00:01.0000000Z ##[error]Process completed with exit code 1.\n'
+  guard_log 16
+} > "$SCEN/log-9601"
+lane_fail maingm 9602 > "$SCEN/runs-main"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9602"
+run_admin 42 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(d) an unparseable ROOT failure beside a guard hit STILL BLOCKS (exit $rc)" \
+  || fail "(d) the sibling guard annotation laundered the root failure — a false certificate"
+grep -q "parseable failure identity" "$TMP/err" && pass "(d) …naming the refusal" \
+  || fail "(d) the refusal is unexplained: $(head -2 "$TMP/err")"
+grep -q "pr merge" "$SCEN/calls" && fail "(d) a merge was attempted on the mixed run" \
+  || pass "(d) no merge attempted"
+
+# (e) THE RESIDUAL DIAGNOSIS names the guard STEP, not the bare mechanism. The
+# widened id universe must reach `attribute_residual` as a STEP unit: the shell
+# must not derive the key's shape with its own regex (the #1165 doctrine — a
+# second parser in the shell), and the bare `guard-step` prefix must never be
+# reported as a unit no real failure occupies, which would flip the diagnosis to
+# "measured on this lane, not present on main". Here main is red on a DIFFERENT
+# unit, so the guard failure is "not measurable on this lane" — and the STEP is
+# what is named.
+new_scen guardresid
+HEAD_GR="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_GR" > "$SCEN/head"
+lane_fail "$HEAD_GR" 9701 > "$SCEN/runs-$HEAD_GR"
+guard_log 16 > "$SCEN/log-9701"
+lane_fail maingr 9702 > "$SCEN/runs-main"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-9702"
+run_admin 42 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(e) a guard failure main does not carry BLOCKS (exit $rc)" \
+  || fail "(e) a PR-unique guard failure was certified (exit $rc)"
+grep -q "Assert-no-redislite-orphans-issue" "$TMP/out" && pass "(e) …and the residual NAMES the guard step" \
+  || fail "(e) the guard step is not named in the residual: $(grep -c . "$TMP/out") line(s)"
+grep -q "no failure in guard-step" "$TMP/err" && fail "(e) the bare mechanism was reported as the unit" \
+  || pass "(e) …never the bare 'guard-step' prefix as a unit"
+grep -q "not measurable on this lane" "$TMP/err" && pass "(e) …as not-measurable (absence is not novelty)" \
+  || fail "(e) the absence of a main-side guard unit was mis-described: $(grep -c . "$TMP/err") line(s)"
+grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-unique guard failure" \
+  || pass "(e) no merge attempted"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

@@ -1964,7 +1964,7 @@ attribute_residual() {
   local residual="$1" mainfails="$2" nodeid file main_files=""
   if [ -s "$mainfails" ]; then
     main_files="$(
-      sed 's/::.*//' "$mainfails"
+      sed '/^guard-step::/d; s/::.*//' "$mainfails"
       sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     )"
     main_files="$(printf '%s\n' "$main_files" | sort -u)"
@@ -2253,7 +2253,8 @@ main() {
   # ── 1c. EVERY FAILING RUN MUST BE ATTRIBUTED (cycle-3 review) ────────────
   # `examined` counts the lane's failing runs; `extracted` counts those whose log
   # yielded at least one failure IDENTITY — a `FAILED <nodeid>` line, or (since
-  # #4469) an attributable non-pytest guard-step error annotation. A failing run
+  # #4469) an attributable guard-step error annotation FROM THE RUN'S ROOT
+  # FAILING STEP. A failing run
   # that contributes NOTHING leaves the residual UNKNOWN while the certificate
   # would print `PR failing: 0` for a lane that is RED — a FALSE certificate, the
   # one severity this rail exists to prevent (the cycle-3 repro: a head run
@@ -2264,6 +2265,15 @@ main() {
   # failure becomes an id so it is COMPARED like a test nodeid, while a run
   # carrying neither a nodeid nor a substantive annotation (the runner's generic
   # `Process completed with exit code <N>.` is not one) still trips this block.
+  # Three conditions carry that, all in `guard_step_failures`: the annotation must
+  # come from a step the RUNNER marked failed; the run's ROOT failing step (keyed
+  # by job+step, because matrix legs use the same step NAMES) must itself yield an
+  # identity; and a step showing pytest's own `E   <exception>` output must yield a
+  # NODEID. So neither a sibling — nor a same-step — annotation can stand in for an
+  # unparseable pytest failure (the cycle-3 false certificate, pinned by
+  # tests/admin-merge/run.sh section 50(d)). What remains is an unparseable failure
+  # that leaves no pytest-shaped line and is not the root: the declared residual,
+  # agent-infra #1366.
   #
   # ORDER MATTERS: this sits AFTER the not-finished / not-tested diagnostics. Run
   # first, an absent or unreadable report made THIS the reported reason, masking the

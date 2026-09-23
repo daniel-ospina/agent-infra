@@ -35,14 +35,32 @@ though the failure was real, attributable, and often a flaky guard owned by
 another lane. That class is the one most likely to be flaky, and the rail could
 neither compare it against main nor certify it as new.
 
-A GitHub Actions error ANNOTATION in a non-pytest step therefore becomes an
-identity in the set — keyed by the failing STEP plus the error shape — so it
-participates in the PR-vs-main comparison exactly like a test nodeid. The
-fail-closed refusal is PRESERVED: an annotation that names no failure (the
-runner's own ``Process completed with exit code <N>.``, emitted for every failing
-step, pytest's included) is NOT an identity, so a run whose log carries neither a
-nodeid nor a substantive annotation is still refused. See the section header
-below for the measured capture this is grounded on.
+A GitHub Actions error ANNOTATION in a failing step therefore becomes an identity
+in the set — keyed by the failing STEP plus the error shape — so it participates
+in the PR-vs-main comparison exactly like a test nodeid. The fail-closed refusal
+is PRESERVED, on THREE conditions that are the whole safety of this half:
+
+* the annotation is only an identity when it comes from a step the RUNNER ITSELF
+  marked failed (its non-zero ``Process completed with exit code <N>.``), because
+  an annotation printed by a step that did not fail the run is not evidence of a
+  failure — junk in the union is a zero-evidence pass;
+* the run's ROOT failing step — the FIRST one the runner marked, keyed by
+  **(job, step)** because matrix legs run same-NAMED steps — must YIELD an
+  identity (a ``FAILED`` nodeid on its lines, or a substantive annotation);
+  otherwise the run contributes NO guard identity even when a LATER step carries a
+  perfectly good annotation; and
+* a step that shows pytest's own failure output (``E   <exception>``) must yield a
+  NODEID. An annotation is not that classification, so the run is refused — the
+  cycle-3 ``ImportError: no module named y`` case, which prints ``E   ImportError``
+  and no ``FAILED`` line, and which would otherwise be LAUNDERED by a sibling — or
+  same-step — annotation, letting ``examined > extracted`` pass and ``decide``
+  certify a run whose real failure was never classified.
+
+A DECLARED RESIDUAL remains (agent-infra #1366): an unparseable failure that
+leaves NO pytest-shaped line AND whose step is not the root — e.g. a guard root
+attributed first, then a non-pytest step failing with bare prose. Closing it needs
+per-step conclusions from the run metadata. See :func:`guard_step_failures` and
+the measured capture this is grounded on.
 
 HALF 2 — THE PRE-MERGE EXEMPTION DECISION (``signatures``, ``decide``)
 
@@ -81,7 +99,9 @@ compared** and **visible**:
 And the parser is **fail-closed** (#3705's rule applied to the exemption parser):
 the union IS an allowlist, so junk in it is a zero-evidence pass. An unparseable or
 non-nodeid line must REFUSE the exemption and be COUNTED AND REPORTED -- never
-silently swallowed, never read as "no failures".
+silently swallowed, never read as "no failures". Since #4469 the failure-key
+universe is a pytest nodeid OR an attributable guard-step annotation (HALF 1b);
+a line that is NEITHER is still refused, counted and reported.
 
 Pure functions only: no I/O, no network, no git — except :func:`_read`, the
 ``ids`` CLI and the ``signatures`` CLI, which read the caller's own capture file.
@@ -789,10 +809,24 @@ _GUARD_KEY_PREFIX = "guard-step::"
 
 #: The runner's OWN annotations for a failing step, emitted for EVERY failing
 #: step. They name no failure, so they are never an identity (see above).
+#: The RUNNER's and its container-hook's own WRAPPERS around a failed step — the
+#: generic messages the harness emits for a step that failed, not the step's own
+#: logic. They are emitted for EVERY failing step, so they name no failure: they
+#: are NEVER an identity, and (where they carry an exit code) they are the positive
+#: signal for "the runner marked this step failed". A closed, documented list
+#: because each entry is a measured harness string — the runner's
+#: `ScriptHandler.cs` form and the container hooks' `core.error` wrappers. A form
+#: MISSING from this list costs BOTH roles at once (the step is not marked failed,
+#: and its wrapper can become a phantom identity), so every form is pinned by a
+#: test: `test_no_runner_or_hook_wrapper_is_ever_an_identity`.
 _RUNNER_GENERIC_ANNOTATIONS = (
-    re.compile(r"^Process completed with exit code -?\d+\.?$"),
-    re.compile(r"^The process .+ failed with exit code -?\d+\.?$"),
-    re.compile(r"^Bash exited with code -?\d+\.?$"),
+    re.compile(r"^Process completed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^The process .+ failed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^Bash exited with code '?-?\d+'?\.?$"),
+    re.compile(r"^Docker failed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^Failed to run container step:?\b.*$"),
+    re.compile(r"^Failed to initialize containers,?\b.*$"),
+    re.compile(r"^The action .+ has timed out after .+$"),
 )
 
 #: A GitHub Actions error annotation, ANCHORED at the start of the line content.
@@ -841,13 +875,24 @@ def _split_log_line(line: str) -> tuple[str, str, str]:
     """``(job, step, content)`` from a gh ``--log-failed`` line.
 
     Returns ``('', '', line)`` when the line carries no ``<job>\t<step>\t<ts>Z ``
-    head — the caller then has no step and must not invent one.
+    head — the caller then has no step and must not invent one. The guard pass
+    SKIPS such a line entirely (``guard_step_failures``), so a stripped capture
+    cannot manufacture a step nor an attribution.
+
+    A tab INSIDE the job or step name defeats the field split, so the same greedy
+    prefix the nodeid pass uses (:data:`_LOG_PREFIX_RE`) is the fallback — the two
+    passes must not disagree about one capture.
     """
     parts = line.split("\t", 2)
     if len(parts) == 3:
         head = _TS_HEAD_RE.match(parts[2])
         if head:
             return parts[0], parts[1], parts[2][head.end():]
+    m = _LOG_PREFIX_RE.match(line)
+    if m:
+        fields = m.group(0).split("\t")
+        if len(fields) >= 3:
+            return fields[0], "\t".join(fields[1:-1]), line[m.end():]
     return "", "", line
 
 
@@ -893,23 +938,125 @@ def _attributable_annotation(content: str) -> str:
     return message
 
 
+def _runner_step_failure(content: str) -> int | None:
+    """The exit code in the runner's OWN step-failure annotation, else ``None``.
+
+    gh renders ``##[error]Process completed with exit code <N>.`` as the LAST
+    annotation of every step whose command failed. It names no failure — so it is
+    never an identity — but it is the ONLY signal a ``--log-failed`` capture
+    carries for *this step failed the run*, independent of what the step printed.
+    """
+    m = _ANNOTATION_RE.match(content)
+    if not m:
+        return None
+    message = " ".join(m.group("msg").split())
+    if not any(generic.match(message) for generic in _RUNNER_GENERIC_ANNOTATIONS):
+        return None
+    tail = re.search(r"(-?\d+)'?\.?$", message)
+    return int(tail.group(1)) if tail else None
+
+
 def guard_step_failures(text: str) -> tuple[list[str], dict[str, frozenset[str]]]:
     """``(keys, {key: signatures})`` for the guard-step failures in a capture.
 
-    Pure and fail-closed: a line that is not an annotation, whose message is
-    empty, or whose message is only the runner's own exit annotation contributes
-    NOTHING (so the run stays unattributable and the rail refuses it).
+    THREE conditions, ALL required — and it is their conjunction that keeps the
+    rail's cycle-3 refusal intact while making a guard failure comparable:
+
+    1. **A guard identity comes only from a step the RUNNER marked failed** — one
+       that emitted its own non-zero ``Process completed with exit code <N>.``. An
+       annotation printed by a step that did NOT fail the run says nothing about a
+       failure, and ``_slug('')`` must never let a head-less line found one.
+    2. **The run's ROOT failing step must itself yield an identity.** The root is
+       the FIRST step the runner marked failed, keyed by **(job, step)** — a
+       matrix leg runs steps with the SAME NAME as its siblings, so a step NAME
+       alone would let leg ``b``'s annotation stand in for leg ``a``'s
+       unparseable failure. The root is attributed only when its own lines carry a
+       ``FAILED``/``ERROR`` nodeid or a substantive annotation. If it does not,
+       the run contributes NO guard identity AT ALL — even when a LATER step
+       carries a perfectly good annotation. This is what refuses the mixed run (an
+       unparseable pytest failure PLUS a sibling guard annotation) that the
+       refusal exists for; see the HALF 1b header.
+    3. **A step that shows pytest failure output must yield a NODEID.** An
+       ``E   <exception>`` line is pytest's own report of a failure, so a step
+       carrying one has a pytest failure the parser did not classify. An
+       ANNOTATION from that step is NOT that classification (it is a wrapper, at
+       best), so the run is refused — the cycle-3 ``ImportError: no module named
+       y`` case, which prints ``E   ImportError`` and no ``FAILED`` line.
+       This clause is STEP-scoped: it refuses when the whole step yielded no
+       nodeid. A pytest run that prints BOTH a classified nodeid and an
+       unclassified block in one step (``--continue-on-collection-errors``) is a
+       PRE-EXISTING gap in the per-run refusal — ``main``'s parser returns the
+       same single nodeid — so it is filed (agent-infra #1372), not claimed here.
+
+    A line with no ``<job>\t<step>\t<ts>Z `` head has NO step, so it can neither
+    found the failing-step set nor be attributed: the step is never invented.
+
+    DECLARED RESIDUAL (agent-infra #1366): clauses 2 and 3 are the strongest
+    guarantee a ``--log-failed`` capture ALONE can give. What survives is an
+    unparseable failure that leaves NO pytest-shaped line AND whose step is not
+    the root — e.g. a guard root attributed first, then a non-pytest step failing
+    with bare prose. A source line that ITSELF starts with the annotation marker
+    (an echoed heredoc, not the ``echo "::error::…"`` form) is likewise
+    indistinguishable from a real annotation. Both need data the capture does not
+    carry; the measured capture places the guard before its aggregate gate, carries
+    no ``E   `` line and no line-start marker, so the guard IS the root and IS
+    attributed.
     """
+    failing: list[tuple[str, str]] = []   # (job, step) pairs the runner failed
+    evidence: set[tuple[str, str]] = set()  # pairs that yielded an identity
+    nodeid_steps: set[tuple[str, str]] = set()  # pairs that yielded a NODEID
+    e_line_steps: set[tuple[str, str]] = set()  # pairs showing pytest output
+    candidates: list[tuple[tuple[str, str], str, str]] = []  # (unit, step, msg)
+    for raw in text.splitlines():
+        job, step, content = _split_log_line(_ANSI_RE.sub("", raw))
+        if not step:
+            continue
+        # The unit is the RAW pair, not a slug of it: `_slug` is lossy, so
+        # slugging both fields would let two DIFFERENT (job, step) pairs collapse
+        # (`test (py 3.12)`/`test (py-3.12)`, `Run-tests`/`Run tests`) and one
+        # leg's evidence attest another leg's unparseable failure. The slug is only
+        # ever the WIRE key's step component.
+        unit = (job, step)
+        payload = content.strip()
+        code = _runner_step_failure(payload)
+        if code is not None:
+            if code != 0 and unit not in failing:
+                failing.append(unit)
+            continue
+        if _E_LINE_RE.match(payload):
+            e_line_steps.add(unit)
+        message = _attributable_annotation(payload)
+        if message:
+            candidates.append((unit, step, message))
+            evidence.add(unit)
+            continue
+        candidate = _failed_candidate(payload)
+        if candidate is not None and _NODEID_LOOSE_RE.match(candidate):
+            evidence.add(unit)
+            nodeid_steps.add(unit)
+
+    if not failing or failing[0] not in evidence:
+        # No step the runner failed, or the ROOT failing step carries nothing we
+        # can attribute: the run is NOT attributed (fail-closed). An annotation
+        # from a later step is NOT allowed to stand in for it.
+        return [], {}
+    if e_line_steps - nodeid_steps:
+        # A step reported a pytest failure that produced no nodeid, so the run
+        # carries an UNCLASSIFIED failure. An annotation elsewhere in the run — or
+        # in that very step — does not classify it.
+        return [], {}
+
     keys: list[str] = []
     signatures: dict[str, set[str]] = {}
-    for raw in text.splitlines():
-        _job, step, content = _split_log_line(_ANSI_RE.sub("", raw))
-        message = _attributable_annotation(content.strip())
-        if not message:
+    failing_set = set(failing)
+    for unit, step, message in candidates:
+        if unit not in failing_set:
+            # Clause 1: printed by a step the runner did NOT fail — a same-NAMED
+            # step in another leg is a different unit.
             continue
         shape = normalize_guard_error(message)
         if not shape:
-            continue
+            continue  # defensive: a future normalizer may void a message
         key = guard_step_key(step, shape)
         keys.append(key)
         signatures.setdefault(key, set()).add(shape)
@@ -1169,7 +1316,8 @@ def _read(path: str) -> str:
 def _cmd_ids(args: argparse.Namespace) -> int:
     """`ids --log <capture>` — the canonical FAILED-id extraction (the shell's door).
 
-    stdout: the test ids, sorted and unique, one per line (possibly empty).
+    stdout: the failure ids — pytest nodeids AND attributable guard-step
+    identities (#4469) — sorted and unique, one per line (possibly empty).
     stderr: every rejected candidate, tagged UNATTRIBUTABLE, plus counts.
 
     Exits 0 whenever the capture was READ — an empty id set is a legitimate

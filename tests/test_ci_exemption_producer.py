@@ -656,6 +656,64 @@ def test_cli_signatures_still_fails_closed_on_a_generic_only_capture(tmp_path, c
     assert "guard-steps=0" in captured.err
 
 
+def test_cli_signatures_refuses_a_mixed_capture(tmp_path, capsys):
+    """The producer door refuses an unparseable ROOT failure beside a guard hit.
+
+    A sibling annotation must not stand in for the run's root failure: the
+    `signatures` CLI still exits 1 with ZERO ids, so the rail's step-1c refusal
+    fires. This is the shell-facing half of
+    `test_an_unparseable_test_failure_is_not_laundered_by_a_sibling_guard`.
+
+    MUTATION: drop the root-step condition in `guard_step_failures` → rc flips to
+    0 with `ids=1`, and the cycle-3 false certificate is back → RED.
+    """
+    mixed = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00Z "
+        "E   ImportError: no module named y\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:01Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+        + _guard_capture()
+    )
+    log = _write(tmp_path, "mixed.log", mixed)
+
+    rc = main(["signatures", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == ""
+    assert "guard-steps=0" in captured.err
+
+
+def test_cli_signatures_refuses_a_wrapper_annotation_in_the_failing_step(
+    tmp_path, capsys
+):
+    """A same-step wrapper annotation is not pytest's classification.
+
+    The cycle-2 finding at the producer door: a step that prints `E   ImportError`
+    (pytest's own failure report) AND a substantive annotation must still refuse,
+    because the annotation does not classify the failure. Without this the run is
+    certified off a key that never names the failure.
+
+    MUTATION: drop the `e_line_steps - nodeid_steps` clause → rc flips to 0 with
+    `ids=1` → RED.
+    """
+    wrapped = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00Z "
+        "E   ImportError: no module named y\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:01Z ##[error]tests failed\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:02Z " + _GUARD_RUNNER_EXIT + "\n"
+    )
+    log = _write(tmp_path, "wrapped.log", wrapped)
+
+    rc = main(["signatures", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == ""
+    assert "guard-steps=0" in captured.err
+
+
 def test_guard_key_flows_through_the_wire_rows_into_an_exemption():
     """END TO END through the producer's own wire formats: a guard exemption.
 
