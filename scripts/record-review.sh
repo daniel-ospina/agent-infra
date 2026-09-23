@@ -247,7 +247,17 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
   # gh api prints 4xx error bodies to stdout — only a well-formed 40-hex
   # sha counts as a successful fetch; anything else fails open.
   if ! [[ "$CURRENT_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "⚠️ stale-sha guard: could not fetch the current head of $REPO#$PR (gh/API failure?) — continuing fail-open; double-check the sha before relying on the gate" >&2
+    # #784: the head could NOT be confirmed, so nothing shows that the caller's
+    # sha and this diff were ever observed together. Binding them would mint
+    # `@ <sha> diff=<live_diff>` on an UNVERIFIED sha — and a diff-equality
+    # acceptance rule takes that at face value, so a transient gh/API failure
+    # (403 rate-limit, 5xx, expired token) would launder any sha into a
+    # gate-accepted diff binding. Degrade to a legacy sha-only marker instead:
+    # the gate's strict sha path then governs. This keeps the documented
+    # fail-open (a transient failure still allows a record) WITHOUT letting that
+    # failure become a PASS.
+    DIFF_HASH=""
+    echo "⚠️ stale-sha guard: could not fetch the current head of $REPO#$PR (gh/API failure?) — continuing fail-open and WITHOUT a diff binding (#784); double-check the sha before relying on the gate" >&2
   elif [ "$CURRENT_HEAD" != "$SHA" ]; then
     echo "stale-sha guard: provided sha $SHA is NOT the current PR head $CURRENT_HEAD" >&2
     # Carry-forward arm (#2982): does the PR already carry evidence for this

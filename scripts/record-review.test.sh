@@ -48,13 +48,16 @@ cat > "$T/bin/gh" <<'STUB'
 echo "$*" >> "${GH_STUB_LOG:?}"
 if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
     # PATCH body — capture stdin to whichever sink the test asked for, else swallow.
-    # BOTH names are honoured: #716's GH_STUB_PATCH_BODY and #2982's STUB_CAPTURE
-    # are separate callers, so keeping only one would silently turn the other
-    # caller's capture into a no-op and make its assertions vacuous.
-    if [ -n "${GH_STUB_PATCH_BODY:-}" ]; then
-        cat > "$GH_STUB_PATCH_BODY"
-    elif [ -n "${STUB_CAPTURE:-}" ]; then
+    # STUB_CAPTURE (#2982, the diff-binding sink) is checked FIRST so precedence is
+    # deterministic; GH_STUB_PATCH_BODY is retained as a fallback because main's
+    # harness spelled it that way (#716 — that subsystem was removed, so no current
+    # test sets it). Neither name is dropped: keeping only one would silently turn
+    # the other's capture into a no-op, and a negative assertion ("the marker must
+    # NOT carry diff=") would then pass VACUOUSLY by capturing nothing at all.
+    if [ -n "${STUB_CAPTURE:-}" ]; then
         cat >"$STUB_CAPTURE"
+    elif [ -n "${GH_STUB_PATCH_BODY:-}" ]; then
+        cat > "$GH_STUB_PATCH_BODY"
     else
         cat >/dev/null
     fi
@@ -585,7 +588,11 @@ assert_contains "$(cat "$(Q2 424501)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "10.
 assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "10.2 posted marker binds the current head + the same diff"
 
 # 10.3 stale sha + prior evidence for a DIFFERENT diff → still refused (exit 3).
-PRIOR3="review recorded: reviews/424502.json verdict=clean @ $STALE diff=$DH2 (daniel-ospina/agent-infra) sig=deadbeef"
+# The prior marker's sig must be a WELL-FORMED 64-hex value, or the carry-forward
+# shape check rejects it on the SIG and this case would pass for the wrong
+# reason — deleting the diff comparison would leave the suite green. (It did:
+# an 8-hex `sig=deadbeef` fixture made this test vacuous until #784's review.)
+PRIOR3="review recorded: reviews/424502.json verdict=clean @ $STALE diff=$DH2 (daniel-ospina/agent-infra) sig=$(printf '%064d' 0)"
 rm -f "$(Q2 424502)"
 run_record_diff 424502 "$STALE" "body
 
@@ -617,6 +624,19 @@ run_record_diff 424505 "$STALE" "body with no markers" "$D_F" 0 --force-stale
 [ -f "$(Q2 424505)" ] && ok "10.6 #784 the record is still written (force-stale stays usable)" || bad "10.6 #784 record not written"
 if printf '%s' "$RECORD_CAP" | grep -qF "diff="; then bad "10.6 #784 --force-stale must NOT emit diff= (rule (b) would accept a pair that never coexisted)"; else ok "10.6 #784 --force-stale marker is legacy sha-only"; fi
 if grep -q '"diff_sha256"' "$(Q2 424505)" 2>/dev/null; then bad "10.6 #784 record must omit diff_sha256"; else ok "10.6 #784 record omits diff_sha256"; fi
+
+# 10.7 #784 head-fetch failure — the WIDER half of the same class. When the head
+# cannot be confirmed the stale-sha guard block is skipped ENTIRELY, so the
+# original fix (nested inside the verified-stale arm) never ran and DIFF_HASH
+# survived into the marker: `@ <unverified_sha> diff=<live_diff>`, which rule (b)
+# accepts at face value. A transient gh/API failure (403 rate-limit, 5xx, expired
+# token) would thus launder ANY caller-supplied sha into a gate-accepted diff
+# binding. REGRESSION-SENSITIVE: before the fix this marker carried diff=.
+rm -f "$(Q2 424506)"
+STUB_HEAD_SHA="API rate limit exceeded" run_record_diff 424506 "$STALE" "body with no markers" "$D_F" 0 --force-stale
+[ "$RECORD_RC" = "0" ] && ok "10.7 #784 head-fetch failure still records (rc 0)" || bad "10.7 #784 head-fetch record (rc=$RECORD_RC)"
+if printf '%s' "$RECORD_CAP" | grep -qF "diff="; then bad "10.7 #784 an UNVERIFIED head must NOT be bound to a diff (rule (b) accepts it at face value)"; else ok "10.7 #784 head-fetch failure degrades to a sha-only marker"; fi
+if grep -q '"diff_sha256"' "$(Q2 424506)" 2>/dev/null; then bad "10.7 #784 record must omit diff_sha256 when the head is unverified"; else ok "10.7 #784 record omits diff_sha256"; fi
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
