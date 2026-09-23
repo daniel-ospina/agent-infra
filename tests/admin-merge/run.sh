@@ -4254,6 +4254,87 @@ grep -q "pending 2" "$SCEN/out" && pass "…and BOTH in-flight checks are COUNTE
   || fail "the in-flight checks are not counted: $(grep -m1 'evaluated tree' "$SCEN/out")"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge was attempted"
 
+# ── 51. ONLY A COMPLETED MEASUREMENT SETS THE STALENESS ANCHOR (#1353) ──────
+# The statuses loop advanced `surface_epoch` for EVERY legacy status — including
+# the `state == "pending"` branch. A PENDING status's `updated_at` marks when it
+# was last QUEUED or re-announced, not when anything was measured, so it moved
+# the PR surface's last-production time FORWARD past the PR's real evaluation.
+# A base red that began between the two then compared as "already measured" and
+# the stale green merged. This is the highest-reachability of the four: any
+# ordinary in-flight deploy/preview status triggers it.
+echo "== 51. a PENDING legacy status must not advance the staleness anchor (#1353) =="
+
+# (a) THE REPRODUCTION. The PR's only completed check was produced at 00:01; a
+# pending `deploy-preview` status was updated at 00:03; the base went red at
+# 00:02. The anchor used the PENDING status's 00:03, so the 00:02 red looked
+# already-measured and the rail merged.
+new_scen staleness-pending-status
+HEAD_ST1="e5e5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_ST1" > "$SCEN/head"
+lane_pass "$HEAD_ST1" 5911 > "$SCEN/runs-$HEAD_ST1"
+lane_pass mainst1 5912 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7301 pull_request 'CI'
+printf '{"state":"pending","total_count":1,"statuses":[{"context":"deploy-preview","state":"pending","updated_at":"2026-01-01T00:03:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/pr-statuses.json"
+write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-01T00:02:00Z 2026-01-01T00:02:30Z)"
+main_run_map 7401 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a base red AFTER the PR's completed check is STALE despite a pending status (exit $rc)" \
+  || fail "a PENDING status advanced the anchor and the stale green MERGED over a red base"
+grep -q "STALE surface" "$SCEN/err" && pass "…and the refusal names the staleness" \
+  || fail "the refusal is not the staleness one: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "began 2026-01-01T00:02:00Z, AFTER this PR's surface was last produced" "$SCEN/err" \
+  && pass "…naming the base red it failed to cover, and the anchor it compared" \
+  || fail "the staleness refusal does not name the red it covers or the anchor: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+# The status is still COUNTED as pending — the fix moves the ANCHOR, it does not
+# drop the state. An unmeasured surface must stay legible.
+grep -q "pending 1" "$SCEN/out" && pass "…while the pending status is still COUNTED, not dropped" \
+  || fail "the pending status vanished from the surface accounting: $(grep -m1 'evaluated tree' "$SCEN/out")"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over a stale green" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a stale green" || pass "no merge attempted"
+
+# (b) THE CONTROL — the IDENTICAL fixture with NO pending status. Both the
+# pre-fix and the fixed rail refuse here; the pair is what shows the pending
+# status was the disarming element rather than the base red itself.
+new_scen staleness-control-nostatus
+HEAD_ST2="e6e6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_ST2" > "$SCEN/head"
+lane_pass "$HEAD_ST2" 5913 > "$SCEN/runs-$HEAD_ST2"
+lane_pass mainst2 5914 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7301 pull_request 'CI'
+write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-01T00:02:00Z 2026-01-01T00:02:30Z)"
+main_run_map 7401 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "the CONTROL (no pending status) refuses at 4.6, as before (exit $rc)" \
+  || fail "the control did not refuse — the pre-fix path was not the one under test"
+grep -q "STALE surface" "$SCEN/err" && pass "…via the same staleness refusal" \
+  || fail "the control refusal is not the staleness one"
+# (c) AND A COMPLETED MEASUREMENT STILL DOES ADVANCE THE ANCHOR — a completed
+# success at 00:04 covers the base red that began at 00:02, so the merge MUST
+# proceed. Without this the fix could pass by never advancing the anchor at all,
+# which would refuse every PR whose surface carries a pending status (an
+# over-block) — `surface_iso` is the ONLY source of the anchor, so if it stopped
+# advancing, 4.6 would report "no completed check" and refuse.
+new_scen staleness-completed-anchor
+HEAD_ST3="e7e7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_ST3" > "$SCEN/head"
+lane_pass "$HEAD_ST3" 5915 > "$SCEN/runs-$HEAD_ST3"
+lane_pass mainst3 5916 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:04:00Z)"
+pr_run_map 7301 pull_request 'CI'
+printf '{"state":"pending","total_count":1,"statuses":[{"context":"deploy-preview","state":"pending","updated_at":"2026-01-01T00:03:00Z","target_url":"https://example.com/status/1"}]}\n' > "$SCEN/pr-statuses.json"
+write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-01T00:02:00Z 2026-01-01T00:02:30Z)"
+main_run_map 7401 push 'Post-merge validation'
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a base red at 00:02 is COVERED by the PR's 00:04 completed check — it MERGES (exit 0)" \
+  || fail "a covered base red was refused (exit $rc) — the anchor stopped advancing from a completed measurement: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+[ -f "$SCEN/comment" ] && pass "…with its head-bound evidence" || fail "no evidence posted"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1

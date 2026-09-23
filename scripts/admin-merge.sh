@@ -228,7 +228,12 @@
 # the base head carries a CODE-MEASURING red (the same schedule/issues filter as
 # the base context), and refuses only when such a red's run STARTED after the PR
 # surface was last produced (the max `completed_at` over the PR surface's
-# completed checks). If the base moved and is GREEN there is nothing the PR has
+# completed checks — a PENDING legacy status is not a completed check and does
+# NOT set this anchor: its `updated_at` marks when it was last QUEUED or
+# re-announced, not when anything was measured, so letting it advance the anchor
+# moved the last-production time FORWARD past the PR's real evaluation and made
+# a base red that began in between read as "already measured" (#1353)). If the
+# base moved and is GREEN there is nothing the PR has
 # failed to measure, and it MERGES — refusing on movement alone would refuse
 # essentially every open PR, and an over-block is a failure, not safety. The
 # repair direction falls out for free: a base red that predates the PR's
@@ -1613,7 +1618,7 @@ for _, name, app, status, concl, url, started, completed in best.values():
             # red line (its last field) and named in the refusal — an operator
             # must be able to see WHICH spelling was unrecognised.
             reds.append((name, app, concl, url, started,
-                         "status '%s' is not a NAMED in-flight spelling (queued/in_progress/waiting/requested/pending)" % status))
+                         "status %r is not a NAMED in-flight spelling (queued/in_progress/waiting/requested/pending)" % status))
         # NEITHER branch is a MEASUREMENT: a non-completed run has no
         # `completed_at`, so it can never set the surface time below.
         continue
@@ -1628,6 +1633,13 @@ for stamp, ctx, state, url in sbest.values():
         # combined-status body reports aggregate `pending` for a body carrying
         # ZERO statuses, and that is not a failure.
         pend.append((ctx, "commit-status"))
+        # AND IT IS NOT A MEASUREMENT (#1353). `updated_at` on a PENDING status is
+        # the last time it was queued or re-announced — no revision was measured.
+        # Letting it advance the surface time moved the staleness anchor FORWARD
+        # past the PR real last production, so a base red that began in between
+        # compared as already measured and the stale green merged. Only a status
+        # that actually measured something may set the anchor.
+        continue
     elif state not in NON_RED_STATE:
         reds.append((ctx, "commit-status", state, url, stamp, ""))
     e = ts_epoch(stamp)
