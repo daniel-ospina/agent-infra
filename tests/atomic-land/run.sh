@@ -145,16 +145,26 @@ cat > "$REC" <<'RECEOF'
 set -uo pipefail
 SCEN="${SCEN:?SCEN must be set}"
 printf 'record-review %s\n' "$*" >> "$SCEN/calls"
-# hooks that model a mutation landing INSIDE the unit (between the record and the land)
+case "${SCEN_RECORD_RC:-0}" in
+  3) echo "carry-forward: no prior evidence for this PR's current diff (diff=deadbeefdeadbeef…) — the reviewed artifact cannot be shown unchanged" >&2; exit 3 ;;
+esac
+# The LIVE contract (#767): a zero exit leaves a record naming the PR's CURRENT
+# head — either it already did (sha == head), or the carry-forward arm re-bound it
+# because the reviewed diff is byte-unchanged and the prior marker's signature
+# verified. A fake that exits 0 WITHOUT writing a record models a delegate that
+# does not implement the contract, and hides every binding defect from the suite.
+if [ "${SCEN_RECORD_LOG:-}" = 1 ]; then
+  echo "the reviewed diff is unchanged (diff=1111111111111111111111111111111111111111111111111111111111111111)"
+fi
+cur="$(cat "$SCEN/head" 2>/dev/null || printf '%s' "${HEAD:-}")"
+printf '{"pr":%s,"head_sha":"%s","verdict":"%s","repo":"%s","diff_sha256":"%s"}\n' \
+  "$1" "$cur" "$3" "${4:-}" "1111111111111111111111111111111111111111111111111111111111111111" \
+  > "$SCEN_RECORD_FILE"
+# Hooks that model a mutation landing AFTER the record step completes — i.e.
+# inside the unit, between the record and the land (B9 head move, B10 repoint).
 [ "${SCEN_RECORD_MOVES_HEAD:-0}" = 1 ] && printf '%s\n' "$HEAD_MOVED" > "$SCEN/head"
 [ "${SCEN_RECORD_REPOINTS_BASE:-0}" = 1 ] && printf 'develop\n' > "$SCEN/base"
-case "${SCEN_RECORD_RC:-0}" in
-  3) echo "carry-forward: no prior evidence for this PR's current diff — refusing" >&2; exit 3 ;;
-  *) if [ "${SCEN_RECORD_LOG:-}" = 1 ]; then
-       echo "the reviewed diff is unchanged (diff=1111111111111111111111111111111111111111111111111111111111111111)"
-     fi
-     exit "$SCEN_RECORD_RC" ;;
-esac
+exit "${SCEN_RECORD_RC:-0}"
 RECEOF
 chmod +x "$REC"
 
@@ -191,13 +201,15 @@ new_scen() {
   mkdir -p "$SCEN/tmp"
   : > "$SCEN/calls"
   # default fixture record: verdict clean at the OLD head
+  SCEN_RECORD_FILE="$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
   printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
-    > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+    > "$SCEN_RECORD_FILE"
 }
 
 run_rail() { # <extra args...>
   SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="$REPO" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
+  SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
   SCEN_RECORD_MOVES_HEAD="${SCEN_RECORD_MOVES_HEAD:-0}" \
   SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
@@ -437,7 +449,7 @@ grep -qi "could not read the base tip" "$SCEN/err" && pass "the stop names the u
 # ═══ 17. B11 — two rails on the same PR must not interleave ═════════════
 echo "── 17. a held per-PR lock refuses before any mutation (B11)"
 new_scen lock
-LOCK="$SCEN/tmp/atomic-land-daniel-ospina-agent-infra-42.lock"
+LOCK="$SCEN/home/.pi/agent/locks/atomic-land-daniel-ospina-agent-infra-42.lock"
 mkdir -p "$LOCK" && printf '%s\n' "$$" > "$LOCK/pid"
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
@@ -446,6 +458,31 @@ called "pr update-branch" && fail "mutated while another rail held the lock" || 
 called "admin-merge" && fail "landed while another rail held the lock" || pass "no land while locked"
 grep -qi "already running" "$SCEN/err" && pass "the refusal names the concurrent rail" || fail "the refusal does not name the concurrent rail"
 rm -rf "$LOCK"
+
+# ═══ 17b. B6/B12 — an UNKNOWN merge state is not "up to date" ═══════════
+echo "── 17b. an UNKNOWN mergeStateStatus stops the unit (B6/B12)"
+new_scen unknownstate
+printf 'UNKNOWN\n' > "$SCEN/state"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1)" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "mutated on an undetermined merge state" || pass "no update on an undetermined state"
+called "admin-merge" && fail "landed on an undetermined merge state (B6/B12 fail-open)" || pass "did NOT land on an undetermined merge state"
+grep -qi "could not be determined" "$SCEN/err" && pass "the stop names the undetermined state" || fail "the stop does not name the undetermined state"
+
+# ═══ 17c. B11 — a pid-less (young) lock is LIVE, not stale ═══════════════
+# The lock directory exists before the pid is written, so a rail in that window
+# sees no pid. Reading that as "stale" reclaims a LIVE holder and both rails land.
+echo "── 17c. a pid-less young lock refuses (B11 TOCTOU)"
+new_scen locknopid
+LOCK2="$SCEN/home/.pi/agent/locks/atomic-land-daniel-ospina-agent-infra-42.lock"
+mkdir -p "$LOCK2"   # no pid file — the mkdir→printf window
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "landed by reclaiming a pid-less live lock (B11 fail-open)" || pass "did NOT land by reclaiming a pid-less lock"
+grep -qi "no pid yet" "$SCEN/err" && pass "the refusal names the pid-less holder" || fail "the refusal does not name the pid-less holder"
+rm -rf "$LOCK2"
 
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
@@ -473,14 +510,18 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B1   's/"\$RECORD_SH" "\$PR" "\$prior"/"$RECORD_SH" "$PR" "$HEAD"/'
   # B2a: drop the record precondition
   mutate_and_expect_fail B2a  's/if ! read_record; then/if false; then/'
-  # B2b: accept every verdict
-  mutate_and_expect_fail B2b  's/if ! verdict_accepted "\$RECORD_VERDICT"; then/if false; then/'
+  # B2b: accept every verdict (BOTH the pre-unit gate and the post-record re-read guard)
+  mutate_and_expect_fail B2b  's/if ! verdict_accepted "\$RECORD_VERDICT"; then/if false; then/g'
   # B3: add a hand-rolled --admin merge beside the mandated rail
   mutate_and_expect_fail B3   's/bash "\$ADMIN_MERGE" "\$PR"/"$GH" pr merge "$PR" --admin; bash "$ADMIN_MERGE" "$PR"/'
   # B4: never confirm the merge
   mutate_and_expect_fail B4   's/confirm_merged\(\) \{/confirm_merged() { return 0;/'
   # B5: allow a draft
   mutate_and_expect_fail B5   's/if \[ "\$IS_DRAFT" = "true" \]; then/if false; then/'
+  # B6b: read an undetermined merge state as "up to date" and certify anyway
+  mutate_and_expect_fail B6b  's/^      stop "the merge state of .*$/      return 3/m'
+  # B11b: reclaim a pid-less lock immediately — the mkdir→pid TOCTOU
+  mutate_and_expect_fail B11b 's/if \[ "\$age" -lt "\${ATOMIC_LAND_LOCK_GRACE:-60}" \]; then/if false; then/'
   # B6: never stop on the terminal-check wait expiry
   mutate_and_expect_fail B6   's/^      stop "the checks at.*$/      return 0/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)

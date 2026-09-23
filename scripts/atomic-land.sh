@@ -18,7 +18,9 @@
 #                                                                  a base move can change
 #                                                                  the code AROUND the
 #                                                                  reviewed lines)
-#   3. RECORD      — record-review.sh at the NEW head
+#   3. RECORD      — record-review.sh, given the PRIOR head as the equivalence
+#                    input; its carry-forward arm (#767) re-binds the record to
+#                    the NEW head iff the reviewed diff is byte-unchanged
 #   4. land        — the repo's mandated rail, never a hand-rolled merge
 #
 # Steps 1-3 are atomic per PR: an update that ends without a record at the new
@@ -81,8 +83,12 @@
 #                           else $HOME/.pi/agent/scripts/record-review.sh)
 #   ATOMIC_LAND_ADMIN_MERGE admin-merge.sh (default: sibling admin-merge.sh)
 #   ATOMIC_LAND_CONFIRM_MAX how many times to confirm the merge via the API
-#                           (default: 3) — a non-zero admin-merge exit is never
+#                           (default: 60) — a non-zero admin-merge exit is never
 #                           read as success; the .merged poll is the only proof.
+#   ATOMIC_LAND_LOCK_DIR    the per-PR lock directory (default: $HOME/.pi/agent/locks).
+#                           Deliberately NOT under $TMPDIR, which is caller-controlled.
+#   ATOMIC_LAND_LOCK_GRACE  seconds a pid-less lock is treated as LIVE, not stale
+#                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
@@ -162,12 +168,32 @@ gh_() { "$GH" "$@"; }
 # flock); a crashed holder is reclaimed by PID liveness, bounded to one reclaim.
 LOCKDIR=""
 acquire_lock() {
-  LOCKDIR="${TMPDIR:-/tmp}/atomic-land-$(printf '%s' "$REPO" | tr '/' '-')-$PR.lock"
+  # B11 — the lock base is NOT derived from TMPDIR. TMPDIR is caller-controlled,
+  # so a second rail with a different TMPDIR would use a different lock path and
+  # both would land (reproduced). Keep it in a per-user fixed location instead.
+  local dir="${ATOMIC_LAND_LOCK_DIR:-$HOME/.pi/agent/locks}"
+  mkdir -p "$dir" 2>/dev/null || true
+  LOCKDIR="$dir/atomic-land-$(printf '%s' "$REPO" | tr '/' '-')-$PR.lock"
   if mkdir "$LOCKDIR" 2>/dev/null; then :; else
     local other=""
     other="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
     if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
       stop "another atomic-land is already running for $REPO#$PR (pid $other) — refusing to interleave"
+    fi
+    # B11 — an ABSENT pid is not proof of a dead holder. The directory exists
+    # before the pid is written, so a rail in that window would be reclaimed out
+    # from under by a check-then-act. A young, pid-less lock is treated as LIVE
+    # (fail closed); only a pid-less lock older than the grace is reclaimed, once.
+    if [ -z "$other" ]; then
+      local now_s mt age
+      now_s="$(date +%s)"
+      # Portable mtime read: GNU first, BSD second. A missing/unreadable mtime is
+      # treated as age 0 (i.e. LIVE) so the failure direction stays fail-closed.
+      mt="$({ stat -c %Y "$LOCKDIR" 2>/dev/null || stat -f %m "$LOCKDIR" 2>/dev/null; } || true)"
+      case "$mt" in ''|*[!0-9]*) age=0 ;; *) age=$(( now_s - mt )) ;; esac
+      if [ "$age" -lt "${ATOMIC_LAND_LOCK_GRACE:-60}" ]; then
+        stop "another atomic-land holds the lock for $REPO#$PR (no pid yet — still starting) — refusing to interleave"
+      fi
     fi
     rm -rf "$LOCKDIR"                       # stale holder — reclaim ONCE
     if ! mkdir "$LOCKDIR" 2>/dev/null; then
@@ -280,10 +306,20 @@ verdict_accepted() {
 # ── step 1: update ───────────────────────────────────────────────────────
 do_update() { # 0 = updated, 3 = not behind (no-op)
   local before="$HEAD" after="" i
-  if [ "$MERGE_STATE" != "BEHIND" ]; then
-    say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND — nothing to update"
-    return 3
-  fi
+  case "$MERGE_STATE" in
+    BEHIND) : ;;
+    CLEAN)
+      say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
+      return 3 ;;
+    UNKNOWN|""|null)
+      # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
+      # determine the merge state. Reading it as "nothing to update" would certify
+      # the head against a base relation nobody established, then land on it.
+      stop "the merge state of $REPO#$PR could not be determined (mergeStateStatus=${MERGE_STATE:-<none>}) — refusing to certify a head whose base relation is unknown (B6/B12)" ;;
+    *)
+      say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND — nothing to update"
+      return 3 ;;
+  esac
   say "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
   if [ "$DRY_RUN" -eq 1 ]; then
     say "atomic-land:     (dry-run) would run: gh pr update-branch $PR"
@@ -363,15 +399,29 @@ do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
     rm -f "$log"
     stop "record-review.sh exited $rc — refusing to land without a record"
   fi
-  # Cite BEFORE overwriting the prior binding (the citation names both ends).
+  # Cite BEFORE the binding refresh (the citation names both ends).
   if [ "$NO_CITE" -eq 0 ]; then cite_reuse "$log" "$prior"; fi
   rm -f "$log"
-  # The re-record certified the LIVE base at THIS head, so the in-memory prior
-  # merge base is now stale and must not drive the pre-land comparison (it would
-  # false-block the very carry-forward the rail exists for). Refresh from disk,
-  # and fall back to the certified base if the file could not be re-read.
-  read_record || true
-  RECORD_HEAD="$HEAD"
+  # B8 — the delegated record must ACTUALLY name THIS head. A zero exit is not
+  # proof: the carry-forward arm sets the recorded sha to the CURRENT head only
+  # when the reviewed diff is unchanged, and `record-review.sh` fails OPEN on a
+  # transient head-read failure. Re-read from disk and require the binding rather
+  # than assuming it. (This is the belt-and-braces catch for a delegate that lies;
+  # the decision itself stays with the script that owns the record — the rail is a
+  # sequencer, not the equivalence authority.)
+  read_record || {
+    err "atomic-land: the record could not be re-read after the record step — refusing to land unrecorded"
+    return 1
+  }
+  if [ "$RECORD_HEAD" != "$HEAD" ]; then
+    err "atomic-land: the record names ${RECORD_HEAD:0:12}… but the head is ${HEAD:0:12}… — this unit has NO record for the head it would land."
+    err "atomic-land: a zero exit must leave a record naming the CURRENT head (carry-forward does that only when the reviewed diff is byte-unchanged). Nothing was merged."
+    return 1
+  fi
+  if ! verdict_accepted "$RECORD_VERDICT"; then
+    err "atomic-land: the re-read record's verdict '${RECORD_VERDICT:-<none>}' is not accepted — refusing to land (B2)"
+    return 1
+  fi
   return 0
 }
 
