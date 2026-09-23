@@ -236,6 +236,20 @@ fi
 # transient gh/API failure must not block a legitimate record); skip when no
 # repo is detectable (backward compat — record as before).
 #
+# ── Gate key (#2055), hoisted for #784 ─────────────────────────────────────
+# Resolved BEFORE the stale-sha guard, because the carry-forward arm must VERIFY
+# a prior marker's HMAC before treating it as evidence. The PR body is
+# attacker-writable, so a shape-only `sig=[0-9a-f]{64}` check lets a forged
+# `sig=<64 zeros>` line be carried forward and RE-SIGNED with the real key —
+# minting a genuine attestation at the current head for a diff nobody reviewed.
+GATE_KEY="${AI_REVIEW_GATE_KEY:-}"
+if [ -z "$GATE_KEY" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+  GATE_KEY="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+fi
+# Normalize the key exactly like the workflow does (secrets arrive clean, but a
+# file/env key may carry stray whitespace).
+GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
+
 # #2982 — carry-forward arm: when the head has moved but the PR already carries
 # signed evidence for EXACTLY this diff (a marker whose diff= equals the live
 # diff hash), the head moved without the reviewed artifact changing (a
@@ -266,8 +280,24 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     if [ -n "$DIFF_HASH" ]; then
       PRIOR_BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
       [ "$PRIOR_BODY" = "null" ] && PRIOR_BODY=""
-      if [ -n "$PRIOR_BODY" ] && printf '%s\n' "$PRIOR_BODY" | grep -qE "^review recorded: reviews/${PR}\.json verdict=clean(-micro)? @ [0-9a-f]{40} diff=${DIFF_HASH} \(.*\) sig=[0-9a-f]{64}$"; then
-        PRIOR_DIFF="$DIFF_HASH"
+      # The prior marker is evidence ONLY if it is AUTHENTIC. The PR body is
+      # attacker-writable, so matching `sig=[0-9a-f]{64}` is not enough: a forged
+      # `sig=<64 zeros>` line would satisfy the shape, be carried forward, and be
+      # RE-SIGNED with the real key — minting a genuine signature at the current
+      # head for a diff nobody reviewed, which the gate cannot detect because the
+      # producer IS the signer (#784). So verify the HMAC over the marker text.
+      # VERDICT is pinned in the pattern too, so a prior clean-micro attestation
+      # cannot authorize a full clean record.
+      PRIOR_LINE="$(printf '%s\n' "$PRIOR_BODY" | grep -E "^review recorded: reviews/${PR}\.json verdict=${VERDICT} @ [0-9a-f]{40} diff=${DIFF_HASH} \(.*\) sig=[0-9a-f]{64}$" | head -1 || true)"
+      if [ -n "$PRIOR_LINE" ] && [ -n "$GATE_KEY" ]; then
+        PRIOR_TEXT="${PRIOR_LINE% sig=*}"
+        PRIOR_SIG="${PRIOR_LINE##* sig=}"
+        PRIOR_EXPECT="$(printf '%s' "$PRIOR_TEXT" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+        if [ -n "$PRIOR_EXPECT" ] && [ "$PRIOR_SIG" = "$PRIOR_EXPECT" ]; then
+          PRIOR_DIFF="$DIFF_HASH"
+        else
+          echo "⚠️ #784: found prior evidence in the PR body with the right shape but a BAD SIGNATURE — ignoring it (the PR body is not a trust boundary)" >&2
+        fi
       fi
     fi
     if [ -n "$PRIOR_DIFF" ]; then
@@ -429,15 +459,9 @@ fi
 if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   # Sign the marker (HMAC-SHA256 over the marker text, AI_REVIEW_GATE_KEY) so
   # the GitHub ai-review-gate required check cannot be satisfied by editing
-  # the PR body (#2055). Key: env AI_REVIEW_GATE_KEY or ~/.pi/agent/.ai-review-gate-key.
+  # the PR body (#2055). GATE_KEY is resolved once, ABOVE the stale-sha guard,
+  # because the carry-forward arm must verify a prior marker's HMAC there.
   # Missing key → warn loudly and post UNSIGNED (the gate will fail closed).
-  GATE_KEY="${AI_REVIEW_GATE_KEY:-}"
-  if [ -z "$GATE_KEY" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
-    GATE_KEY="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
-  fi
-  # Normalize the key exactly like the workflow does (secrets arrive clean,
-  # but a file/env key may carry stray whitespace).
-  GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
   # The record is written from these same args, so record and marker are
   # consistent by construction (head_sha == $SHA, verdict == $VERDICT).
   # The marker text is a SEPARATE contract from the record filename: the
