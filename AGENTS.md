@@ -230,6 +230,23 @@ This applies even for "obvious" fixes — the cost of a wrong diagnosis is highe
 
 ---
 
+## ⛔ Reading verification state — a rollup is not a result
+
+**A check-run rollup is NOT "is main green".** GitHub keeps every attempt (up to 1,000 per name per check suite, after which older ones are auto-deleted), so one commit can carry dozens of check-runs and the SAME job can hold both `failure` and `success`. **A re-run ADDS a red — it does not clear one** — so the more a flaky check is retried, the redder a green commit looks. Retrying is the correct response to flake and it makes the aggregate worse. (One commit carried dozens of check-runs, one job holding 10 attempts at measurement. Every re-run grows these counts — re-measure before quoting a number, or cite the mechanism and not the integers.)
+
+Read the RUNS, on the EXACT sha, newest attempt per check:
+
+1. `git fetch origin main && git rev-parse origin/main` — a bare `rev-parse` reads the LOCAL remote-tracking ref, only as fresh as the last fetch, and a stale sha yields a false **green** (the inverse error, and the more dangerous one). `git ls-remote origin refs/heads/main` needs no fetch.
+2. `gh api "repos/<o>/<r>/commits/<SHA>/check-runs?per_page=100&filter=all" --paginate --jq '.check_runs[]'` — pin `filter=all` (the default is not all: on real commits it returned 26 of 40), and merge every page, because `--paginate` emits one JSON object PER PAGE.
+3. **Resolve the workflow before grouping.** A check-run's `name` is the JOB name, not the workflow's, and two workflows can publish the same job name — grouping on the name alone merges them, so the newest of one masks the other (measured: two `packaging-smoke` runs, one `cancelled`, the other `success`). Take the run id from `details_url`, resolve its workflow, and group by **(app.slug, workflow, job name)**, newest attempt per group ordered by **`id`** — `started_at` is nullable (a queued attempt has none) and is a tiebreak only. A check-run with no resolvable Actions workflow groups under its `app.slug` alone; leaving any check-run ungrouped is unsafe, because a check that forms no group can never make the verdict red. Do not group by `check_suite.id`: every re-run gets its own suite, which would shatter one check into one group per attempt.
+4. **Decide the verdict by POLARITY, not by vocabulary.** A group whose newest attempt is not `completed` is **in flight** (`queued`, `in_progress`, `waiting`, `requested`, `pending`). Of the completed ones, only `success`, `neutral` and `skipped` are green; `cancelled` and `stale` are non-red. **EVERY OTHER CONCLUSION IS RED — including one GitHub has not documented yet, and a null one.** That allow-list polarity is not invented here: it is the merge rail's, adopted after a real incident in which an unrecognised conclusion was neither red nor pending and a merge went ahead on it — so an unnamed value must never be allowed to fall through a gap.
+   Read the surface in this order: **RED if any group is red** — a completed red is final, and nothing in flight can un-fail it; **otherwise NOT YET KNOWN while any group is in flight**; **otherwise GREEN only if the surface is non-empty and every group is non-red.** A missing check is not a green check: if the surface is empty, report that you read nothing there and stop — never extrapolate from absence to green.
+5. Never `/commits/<sha>/status` — legacy endpoint: where CI is check-runs it returns `state=pending` with `statuses=0`, which reads as "not green" from a field that was never populated.
+
+**What this rule does NOT decide: mergeability — and step 4's verdict is not a merge gate.** For "may I merge", read the rail, not this rule: `scripts/admin-merge.sh` groups checks by **`(app, name)`** and treats `{success, neutral, skipped, cancelled, stale}` as non-red. Its key merges two workflows that share a job name — the conflation step 3 above separates — and the rail states that as an accepted residual, so it is referenced here, not overridden. **Read the rail to merge; read this rule to know whether the tree is healthy.**
+
+A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main** — the defect is `tortoise#4877`, and the instruction-file divergence it exposed is `agent-infra#1399`.
+
 ## Sub-agent Dispatch
 
 Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context → construct their prompts with exactly what they need.
