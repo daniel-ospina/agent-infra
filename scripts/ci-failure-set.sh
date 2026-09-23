@@ -226,7 +226,26 @@ LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .co
 # single long step, so this repo's tests forbid it as a liveness signal (§39/§40 in
 # tests/admin-merge/run.sh) — and ordering does not need it either: a run's
 # `databaseId` IS its creation order (#1358's own residual, stated there).
-LANE_RUN_RAW_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha // ""):\(.databaseId // "")\t\(.workflowDatabaseId // "")\t\(.workflowName // "")\t\(.event // "")"'
+#
+# ⛔ THE THREE IDENTITY FIELDS ARE BASE64-ENCODED, and that is a FAIL-CLOSED
+# REQUIREMENT, not tidiness (adversarial cycle 1, 2026-09-23). A workflow's `name:`
+# is AUTHOR-CONTROLLED free text, and YAML carries a literal NEWLINE happily in a
+# double-quoted scalar. `gh --jq` interpolates that name RAW, so a run whose
+# workflow name contains "…\npython-ci\t…\t<sha>:<huge id>\t…" SPLITS this
+# projection into TWO records — and the tail is a syntactically perfect six-field
+# line whose group key the AUTHOR chose. It then superseded the run's own red and
+# the lane read `examined=0`: a fail-OPEN, the one direction this rule must never
+# take. The `NF != 6` guard in drop_superseded_runs defends a TAB (one record with
+# a bogus boundary); it CANNOT defend a NEWLINE, because awk's record separator has
+# already split the input before the guard runs. A record separator that cannot be
+# told from a field boundary is unreadable identity, exactly as a TAB inside a
+# field is — so the fields that form the GROUP KEY are encoded into an alphabet
+# that can contain neither. They are compared, never printed, so the encoding
+# costs nothing and cannot drift from a human-readable form.
+#
+# The canonical three fields stay RAW, and deliberately: they are GitHub enums and
+# a hex sha, with no free text among them — and they are what every consumer reads.
+LANE_RUN_RAW_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha // ""):\(.databaseId // "")\t\((.workflowDatabaseId // "") | tostring | @base64)\t\((.workflowName // "") | @base64)\t\((.event // "") | @base64)"'
 
 # ── drop_superseded_runs — THE SUPERSEDE RULE (#1358) ────
 #
@@ -259,6 +278,20 @@ LANE_RUN_RAW_JQ='.[] | "\(.status)\t\(.conclusion)\t\(.headSha // ""):\(.databas
 # exactly the signal this pair of scripts forbids (`updatedAt` is frozen for the
 # whole of a long step; §39/§40 pin that it is never ASKED for). An over-block
 # with a named remedy is acceptable; a clock-driven certificate is not.
+#
+# ⛔ A SECOND STATED LIMIT, and the sharper one: A SUCCESS THAT MEASURED NOTHING IS
+# STILL A CERTIFICATE HERE. This rule reads a run LISTING; whether a run's jobs
+# actually EXECUTED lives in its jobs, which this projection does not carry — so a
+# `completed`+`success` run whose jobs were ALL SKIPPED still drops a red. That is
+# reachable by a PR author without touching the commit or the event (the workflow
+# file is theirs, and `github.run_attempt` increments on re-run, so a job gated
+# `if: github.run_attempt == 1` is skipped on the re-run while the run concludes
+# success). Adversarial cycle 2 reproduced it at the rule level (PR #1394) and it is
+# filed as #1401 rather than fixed here: closing it needs a jobs call per candidate,
+# which is a design decision — and the rail's own direction is that ONE measurement
+# predicate governs every surface (#1319), so inventing a second one here would be
+# the same mistake one level up. Until then, `success` at the same commit, workflow
+# and event means green, WHATEVER IT MEASURED. Say it out loud; do not assume it.
 #
 # THE GROUP KEY is (sha, workflowDatabaseId, workflowName, event) — every part
 # required. The commit alone would collapse main's window, which spans commits BY

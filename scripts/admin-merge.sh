@@ -3481,11 +3481,39 @@ $attribution_line"
   local merge_state="" merge_merged_at=""
   if [ "$merge_status" -eq 0 ]; then
     local attempt=0 attempts="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
+    # A non-numeric bound would make `[ "$attempt" -ge "$attempts" ]` exit 2 on
+    # every pass, so the poll would never terminate — a HANG, not a refusal. So
+    # would a bound at or above the integer ceiling (all digits, so the guard below
+    # cannot see it: `-ge` can never be satisfied and `[` starts erroring past
+    # int64 — adversarial cycle 2, reproduced). Ten digits is already far beyond any
+    # sane bound, so anything longer falls back to the default.
+    case "$attempts" in ''|*[!0-9]*|??????????*) attempts=6 ;; esac
     while : ; do
-      local observed
-      observed="$($GH pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json state,mergedAt 2>/dev/null || true)"
-      merge_state="$(printf '%s' "$observed" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-      merge_merged_at="$(printf '%s' "$observed" | sed -n 's/.*"mergedAt"[[:space:]]*:[[:space:]]*\(null\|"[^"]*\)\([,}].*\|\)$/\1/p' | head -1)"
+      local observed state_tab
+      # ASK FOR EXACTLY WHAT WE MEAN and let the producer project it. A `sed` over
+      # the whole JSON takes the LAST `"state"` anywhere in the output, so a nested
+      # or repeated object could be read as the merge state while the TOP-LEVEL
+      # state said OPEN (adversarial cycle 1 — LATENT: real `gh pr view --json
+      # state,mergedAt` emits only those two keys, so it was not reachable today, but
+      # this guard's correctness must not rest on the producer's output shape).
+      # `--jq` reads the TOP-LEVEL fields: one tab-separated `<state>\t<mergedAt>`,
+      # with mergedAt sentineled because it is null for an unmerged PR.
+      observed="$($GH pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json state,mergedAt --jq '[.state, (.mergedAt // "-")] | @tsv' 2>/dev/null || true)"
+      state_tab="$(printf '%s' "$observed" | head -1)"
+      # THE SEPARATOR IS REQUIRED. `${x%%$'\t'*}` returns the WHOLE STRING when
+      # there is no TAB, so a producer that ignores `--jq` and answers a bare
+      # `MERGED` would set merge_state=MERGED with mergedAt never observed, and the
+      # break below would fire on the first pass — an assertion of MERGED with no
+      # observation of the artifact, which is the one thing this guard exists to
+      # prevent (adversarial cycle 2, reproduced). The absence of the separator is
+      # the absence of the response: unreadable, and therefore a REFUSAL.
+      case "$state_tab" in
+        *$'\t'*) merge_state="${state_tab%%$'\t'*}"
+                  merge_merged_at="${state_tab#*$'\t'}"
+                  [ -n "$merge_merged_at" ] || merge_merged_at="<unreadable>" ;;
+        *)        merge_state="<unreadable>"
+                  merge_merged_at="<unreadable>" ;;
+      esac
       [ "$merge_state" = "MERGED" ] && break
       attempt=$((attempt + 1))
       [ "$attempt" -ge "$attempts" ] && break

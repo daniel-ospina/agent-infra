@@ -245,10 +245,17 @@ case "$key" in
     # can model the case this check exists for (a `gh pr merge` that exits 0 while
     # the PR is still OPEN, e.g. a queued `--auto`) by setting `merge-noop`.
     if [ "$want_merged" = 1 ]; then
+      # The rail asks for a PROJECTION (`--jq '… | @tsv'`), so the fake must answer
+      # in the PROJECTED form real gh would print: one tab-separated
+      # `<state>\t<mergedAt>`, with mergedAt sentineled because it is null for an
+      # unmerged PR. The state is SIMULATED, not assumed — `merged` is created by
+      # the `pr merge` handler below only when the merge actually happens, so a
+      # scenario can model a `gh pr merge` that exits 0 while the PR stays OPEN
+      # (a queued `--auto`) by setting `merge-noop` instead.
       if [ -f "$SCEN/merged" ]; then
-        printf '%s\n' '{"state":"MERGED","mergedAt":"2026-09-23T00:00:00Z"}'
+        printf 'MERGED\t2026-09-23T00:00:00Z\n'
       else
-        printf '%s\n' '{"state":"OPEN","mergedAt":null}'
+        printf 'OPEN\t-\n'
       fi
       exit 0
     fi
@@ -5358,7 +5365,15 @@ grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-uniq
 # need it.
 echo "== 51. a SUPERSEDED failing run is not a failing run (#1358) =="
 
-lane7() { printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7"; }
+# gh's `--jq` interpolates the identity fields RAW; the projection BASE64-ENCODES the
+# three that form the supersede rule's GROUP KEY, because a workflow `name:` is
+# author-controlled free text and may carry a TAB (one record, bogus boundary) or a
+# NEWLINE (two records — a forged certificate; adversarial cycle 1, 2026-09-23). The
+# fixture must model what gh actually EMITS, so it encodes the same three fields with
+# the same alphabet: `base64` here, `@base64` in the projection. The line wrapping
+# `base64(1)` adds is stripped, because jq's `@base64` does not wrap.
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+lane7() { printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$(b64 "$5")" "$(b64 "$6")" "$(b64 "$7")"; }
 lane7_fail() { lane7 completed failure "$1" "$2" "$3" "$4" "$5"; }
 lane7_pass() { lane7 completed success "$1" "$2" "$3" "$4" "$5"; }
 # A failing run whose log carries NO test id — the #1358 shape: the failure is a
@@ -5755,6 +5770,96 @@ grep -q 'confirmed via the API' "$SCEN/out" \
   && pass "the success line STATES the API-confirmed state" \
   || fail "the success line does not state the confirmation"
 unset ADMIN_MERGE_VERIFY_ATTEMPTS
+
+# ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
+# Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow
+# `name:` is author-controlled free text and YAML carries a literal NEWLINE in a
+# double-quoted scalar; `gh --jq` interpolates it RAW, so an UNENCODED identity
+# field SPLITS the projection into TWO records — and the tail is a perfectly-formed
+# six-field line whose group key the author chose, so it superseded the run's own
+# RED and the lane read examined=0. The `NF != 6` guard cannot catch it: awk's
+# record separator has already split the input before that guard runs.
+#
+# This drives the REAL projection expression (`LANE_RUN_RAW_JQ`, read out of the
+# script) through the REAL awk rule (the script with its `main` call neutralised,
+# sourced in a subshell), so it FAILS if the base64 encoding is ever dropped.
+echo "== 63. #1358: a newline in a workflow name cannot forge a supersede =="
+new_scen newline-forge
+FORGE_SHA="dddd000000000000000000000000000000000000"
+printf '%s\n' "$FORGE_SHA" > "$SCEN/head"
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq is unavailable, so the projection cannot be exercised — the forge is UNPROVEN"
+else
+  RAW_JQ="$(grep -m1 '^LANE_RUN_RAW_JQ=' "$CFS" | sed "s/^LANE_RUN_RAW_JQ='//; s/'\$//")"
+  TAB=$'\t'
+  # ⛔ A REAL newline — `$'\n'`, never `\n` inside a double-quoted string, which
+  # is a LITERAL BACKSLASH-N and would make this whole block VACUOUS (cycle 2
+  # proved exactly that: the test passed with the encoding REMOVED, because the
+  # projection never split). The self-check below exists so it cannot regress.
+  NL=$'\n'
+  malicious="python-ci${TAB}pull_request${NL}completed${TAB}success${TAB}${FORGE_SHA}:99999999999${TAB}331293210${TAB}python-ci"
+  case "$malicious" in
+    *$'\n'*) pass "the probe's name carries a LITERAL NEWLINE (not an escaped backslash-n)" ;;
+    *)        fail "the probe string holds no real newline — every check below would be VACUOUS" ;;
+  esac
+  jq -n --arg sha "$FORGE_SHA" --arg bad "$malicious" '
+    [ {status:"completed",conclusion:"failure",headSha:$sha,databaseId:100,workflowDatabaseId:331293210,workflowName:"python-ci",event:"pull_request"},
+      {status:"completed",conclusion:"failure",headSha:$sha,databaseId:100,workflowDatabaseId:331293210,workflowName:$bad,event:"pull_request"} ]' > "$SCEN/forge.json"
+  jq -r "$RAW_JQ" "$SCEN/forge.json" > "$SCEN/forge-raw.txt"
+  nlines="$(grep -c . "$SCEN/forge-raw.txt")"
+  [ "$nlines" = "2" ] \
+    && pass "the projection emits 2 records for 2 runs — the newline is ENCODED, not emitted" \
+    || fail "the projection emitted $nlines record(s) for 2 runs: a NEWLINE in the name SPLIT the projection"
+  sed 's/^main "\$@"$/:/' "$CFS" > "$SCEN/forge-lib.sh"
+  ( set +e; . "$SCEN/forge-lib.sh" >/dev/null 2>&1; drop_superseded_runs < "$SCEN/forge-raw.txt" ) > "$SCEN/forge-out.txt" 2> "$SCEN/forge-note.txt"
+  kept="$(grep -c . "$SCEN/forge-out.txt")"
+  [ "$kept" = "2" ] \
+    && pass "both runs survive the rule — the forged tail cannot drop a red" \
+    || fail "the rule emitted $kept line(s) for 2 red runs: a forged certificate superseded one"
+  grep -q 'superseded by' "$SCEN/forge-note.txt" \
+    && fail "a run was DROPPED as superseded ($(head -c 160 < "$SCEN/forge-note.txt"))" \
+    || pass "no run was dropped — nothing was read as a certificate that the commit is green"
+fi
+
+# ── 64. the MERGE-STATE projection is exercised, not assumed ────────────────
+# §61/§62 drive the fake, and the fake HARDCODES the projected TSV — so a wrong
+# `--jq` expression (field order, a dropped sentinel, a quote) would pass them
+# while the real producer emitted something else (adversarial cycle 2). This runs
+# the expression the rail actually passes to gh, extracted from the rail, against
+# crafted responses. The nested case is the one cycle 1 proved a greedy `sed` over
+# the whole JSON got WRONG (it read the inner state as the merge state).
+echo "== 64. the rail's merge-state projection reads the TOP-LEVEL fields only =="
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq is unavailable, so the merge-state projection cannot be exercised"
+else
+  MJQ="$(grep -o -- "--jq '\[.state[^']*'" "$ADM" | head -1 | sed "s/^--jq '//; s/'\$//")"
+  [ -n "$MJQ" ] \
+    && pass "the rail's merge-state projection is present and extractable" \
+    || fail "could not extract the rail's merge-state --jq expression"
+  proj() { printf '%s' "$1" | jq -r "$MJQ" 2>/dev/null | head -1; }
+  t="$(proj '{"state":"OPEN","mergedAt":null}')"
+  [ "$t" = "OPEN	-" ] \
+    && pass "an UNMERGED response projects to OPEN<tab>-" \
+    || fail "unmerged projected to [$t]"
+  t="$(proj '{"state":"MERGED","mergedAt":"2026-09-23T00:00:00Z"}')"
+  [ "$t" = "MERGED	2026-09-23T00:00:00Z" ] \
+    && pass "a MERGED response projects to MERGED<tab>timestamp" \
+    || fail "merged projected to [$t]"
+  t="$(proj '{"state":"OPEN","mergedAt":null,"note":{"state":"MERGED"}}')"
+  case "$t" in
+    MERGED*) fail "a NESTED state was read as the merge state — the greedy-parse defect is back" ;;
+    *)       pass "a nested state=MERGED does NOT leak into the projected state ([$t])" ;;
+  esac
+  t="$(proj '{"mergedAt":null}')"
+  case "$t" in
+    MERGED*) fail "a response with NO state projected as MERGED" ;;
+    *)       pass "a response with no state is not MERGED ([$t])" ;;
+  esac
+  t="$(proj '{"state":"MERGED"}')"
+  [ "$t" = "MERGED	-" ] \
+    && pass "a missing mergedAt is sentineled, so the line still carries its TAB" \
+    || fail "missing mergedAt projected to [$t] (the separator must never be absent)"
+fi
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
