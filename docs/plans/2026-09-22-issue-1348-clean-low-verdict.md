@@ -311,8 +311,8 @@ code-review gate closes on its own reviewers' clean verdict.
 ## Review Cycle Log
 
 ### adversarial review — Cycle 1 (fresh context)
-- Verdict: `ISSUES:` — 1 P2, 4 P3. **No in-scope bypass found**; every declared class C1–C7
-  reproduced as covered, and the §10.9 mutation harness reproduced independently.
+- Verdict: `ISSUES` — **no in-scope bypass found**; every declared class C1–C7 reproduced as
+  covered, and the §10.9 mutation harness reproduced independently.
 - Fixed: P2 attestation overclaim ("no build-consumed artifact" → narrowed); P3 two SILENT mutations
   (truncation detector, `copied` arm) — arm 1 made redundant + fail-closed, arm 2 removed as dead
   code, and both now have catching vectors; P3 plan `--self-test` invocation corrected; P3 false
@@ -338,8 +338,9 @@ code-review gate closes on its own reviewers' clean verdict.
 
 ### code-review gate — Cycle 1 (fresh context, 4 always-on reviewers)
 
-Guidance, Bug (blind + deep passes), History/PR-comments, Security. Verdicts: **ISSUES** — one P1 and
-nine P2s. The P1 and the material P2s, and their dispositions:
+Guidance, Bug (blind + deep passes), History/PR-comments, Security. Verdict: **ISSUES**. Every
+finding and its disposition (severities are on the rows, not counted here — a count of a process
+output can only re-stale):
 
 | # | Finding | Disposition |
 |---|---|---|
@@ -356,11 +357,10 @@ nine P2s. The P1 and the material P2s, and their dispositions:
 | P2 | The head-advanced advice told a `clean-low` holder to "re-record at the SAME verdict" — unsatisfiable, since a moved head with code is refused (exit 4) by the guard. | Fixed: the advice branches on verdict; `clean-low` re-derives the shape. Pinned by a test asserting the tier-bearing verdicts KEEP the same-verdict advice. |
 | P2 | A docs change that also adds an inert asset/data file is refused, and the exclusion was silent. | Disclosed at the refusal site + Step 10b, with the honest fallback named; the class stays an allowlist (widening it re-imports the config ambiguity it excludes). |
 | P2 | `clean-low` is **inert in tortoise** until the consumer widening lands — the remediation text recommended it unconditionally, so the agent would fall back to recording a false `clean`. | Fixed: `record-review.sh` warns on stderr at record time (same posture as the existing missing-HMAC-key warning), Step 10b documents the dependency, and the requirement is on tortoise#4755. |
-
 | P2 | The plan's own "It attests" blockquote still carried the "single reviewer pass ran" overclaim after the script header and Step 10b were corrected. | Fixed (the plan is the declaration — it must not be the last place the overclaim survives). |
 | P2 | The `OVERRIDES:` anchor pointed at a section that does not contain the wording it quotes, so a future adopter would look in the wrong place. | Fixed in all three copies (plan, `record-review.sh`, and a correction comment on issue #1348), with the two tables in that file explicitly distinguished. |
 | P1 (found by cycle 2) | The remediation lines read `record-review.sh <PR> <head_sha> [owner/repo]` — but position 3 IS the verdict, so a literal run either exits 2 (repo parsed as a verdict) or, without the bracket, DEFAULTS to `clean` and mints exactly the false attestation this verdict exists to remove. | Fixed: every advice/refusal line now names the verdict explicitly, with the `clean` fallback on its own line; a test asserts both tokens are present. |
-| P2 (found by cycle 2) | `getPrMergeBaseSha` (then `getPrBaseSha`) had zero test coverage, and the `declared boundary` test could not fail for the property it named; the vocabulary-consistency loop was unfalsifiable; `tempAuditFile` leaked a directory per call. | All fixed: 5 I/O unit tests (validation, GH_REPO env, no `--repo`, null mappings, no-call-on-bad-head), the boundary test now asserts an observable (zero gate-issued API calls + no producer predicate imported), the vocabulary test asserts against a literal and a behavioural derivation pin, and audit temp dirs are removed at exit. |
+| P2 (found by cycle 2) | `getPrMergeBaseSha` (then `getPrBaseSha`) had zero test coverage, and the `declared boundary` test could not fail for the property it named; the vocabulary-consistency loop was unfalsifiable; `tempAuditFile` leaked a directory per call. | All fixed: 5 I/O unit tests (validation, GH_REPO env, no `--repo`, null mappings, no-call-on-bad-head), the boundary test now asserts observables (zero gate-issued API calls, no file-list read, and the compare expression's `merge_base_commit.sha` — the earlier form was satisfied by the module's own comments), the vocabulary test asserts against a literal and a behavioural derivation pin, and audit temp dirs are removed at exit. |
 
 ### code-review gate — Cycle 2 (fresh context)
 

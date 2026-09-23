@@ -30,10 +30,13 @@
 #                 REFUSES (exit 4, no write) when any same-repo closing ref
 #                 is a non-micro complexity:* issue. Clean verdicts make zero
 #                 extra gh calls.
-#   clean-low   — the Low risk row: every changed path of the recorded revision
+#   clean-low   — the Low code-impact class (the Low value of proportional-gates'
+#                 §Change Classification `Code impact` column — NOT that file's
+#                 §Review Cycles Low ROW, which has no file class at all): every
+#                 changed path of the recorded revision
 #                 is prose or a stylesheet (no program code, no config file, no
 #                 enforcement input). The content shape is the whole VERIFIABLE
-#                 attestation — the Low row's single reviewer pass is the
+#                 attestation — the Low tier's single reviewer pass is the
 #                 caller's obligation and nothing here can observe it. Because
 #                 the shape is the whole attestation, the guard below is
 #                 FAIL-CLOSED on every arm — "could not verify" must never read

@@ -444,9 +444,19 @@ test("declared boundary: the local gate does NOT re-derive the content shape", (
   equal(cmds.length, 0, "the pure gate decision issues no gh/API call of its own");
   const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
   // (An assertion that a bash identifier from record-review.sh is absent here
-  // would be unconditionally true — the reviewer reproduced that tautology.)
-  ok(!/pulls\/[^\s"'`]*\/files/.test(src), "no file-list read anywhere in the extension (a local shape check needs one)");
-  ok(src.includes(".merge_base_commit.sha"), "the only revision read added for clean-low is the merge base");
+  // would be unconditionally true — the reviewer reproduced that tautology. So
+  // would a BARE `src.includes(".merge_base_commit.sha")`, which the module's own
+  // COMMENTS satisfy: it stayed green when the jq filter was mutated back to
+  // `.base.sha`. Both assertions below are pinned to the EXPRESSION, not to a
+  // substring that prose can supply.)
+  ok(
+    !/pulls\/[^\s"'`]*\/files|--json\s+[^\s"']*files/.test(src),
+    "no file-list read (REST `pulls/N/files` or `--json files`) — a local shape re-check would need one"
+  );
+  ok(
+    /compare\/[^\s"'`]*\s--jq\s\.merge_base_commit\.sha/.test(src),
+    "the compare read's jq filter is merge_base_commit.sha, not the base tip"
+  );
 });
 
 test("C7 drift pin: the verdict vocabulary is CONSULTED, never re-literalised", () => {

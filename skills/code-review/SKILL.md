@@ -1251,7 +1251,9 @@ way. `base_advanced` means the certified diff ITSELF changed — re-check whethe
 the current diff is still content-only and only then re-record `clean-low`; if it
 is not, take the normal route (the code-review skill, then `clean`).
 `base_unverifiable` is a read failure (a `gh`/API error, an absent or invalid
-field in the record) and is cleared by re-recording once the base is readable.
+field in the record) and is cleared by re-recording once the base is readable —
+and, as with `base_advanced`, only if the diff is still content-only; otherwise
+take the normal route (the code-review skill, then `clean`).
 
 Three boundaries worth knowing, all declared rather than silent:
 
