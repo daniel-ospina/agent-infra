@@ -535,10 +535,17 @@ report_value() {
 # SUMMED and the DROPPED token lines are counted; `unattributable_count` reports
 # the LARGER, so a renamed/missing summary line cannot make a clipped set read as
 # complete, and a summary with no token text cannot make the drops vanish.
+# THE SUMMARY MATCH IS ANCHORED TO ITS OWN LINE PREFIX (#1353). The greedy
+# `.*unattributable=` also matched the TOKEN TEXT of a DROPPED line, so a dropped
+# token that literally contained `unattributable=7` reported 8 for ONE drop. The
+# summary line is `ci-exemption: ids=N unattributable=M`; matching from the line
+# START means a DROPPED line — which begins `ci-exemption: UNATTRIBUTABLE: …` —
+# cannot match it, while a format drift simply yields 0 from this side and the
+# DROPPED-line count still reports the drops.
 unattributable_count() {
   local f="${1:-}" reported named n
   [ -n "$f" ] && [ -s "$f" ] || { printf '0'; return 0; }
-  reported="$(sed -n 's/.*unattributable=\([0-9][0-9]*\).*/\1/p' "$f" | awk '{s += $1} END {print s + 0}')"
+  reported="$(sed -n 's/^ci-exemption: ids=[0-9][0-9]*[[:space:]]*unattributable=\([0-9][0-9]*\).*/\1/p' "$f" | awk '{s += $1} END {print s + 0}')"
   counter_is_number "$reported" || reported=0
   named="$(grep -c 'DROPPED (never in the failure set):' "$f" 2>/dev/null || true)"; named="${named:-0}"
   counter_is_number "$named" || named=0

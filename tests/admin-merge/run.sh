@@ -5043,6 +5043,91 @@ else
   fail "no evidence comment posted for the complete case"
 fi
 
+# ── 58. THE DROP-COUNT SUMMARY MATCH IS ANCHORED TO ITS OWN LINE ─────────────
+# `unattributable_count`'s greedy `.*unattributable=` also matched the TOKEN TEXT
+# of a DROPPED line, so a dropped token that literally contained
+# `unattributable=7` reported 8 for ONE drop (and the evidence said `PR=8`).
+echo "== 58. a token's own text cannot inflate the drop count (#1353) =="
+
+# 36 zeros, so a fixture sha below is exactly 40 hex chars (also defined at 55).
+HEX36="000000000000000000000000000000000000"
+
+log_bare_failed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED\n'; }
+
+# (a) THE REPRODUCTION. One real exempt failure + ONE token whose text is
+# `unattributable=7`. The summary says unattributable=1; the old greedy match also
+# read the token and summed 1 + 7 = 8.
+new_scen dropcount-token-inflation
+HEAD_AT8="c4c4${HEX36}"
+printf '%s\n' "$HEAD_AT8" > "$SCEN/head"
+FAIL_AT8='tests/test_other.py::test_red_on_main'
+lane_fail "$HEAD_AT8" 8809 > "$SCEN/runs-$HEAD_AT8"
+{ log_failed "$FAIL_AT8"; log_unattributable 'unattributable=7'; } > "$SCEN/log-8809"
+main_red_n mainat8 9008 3 "$FAIL_AT8" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a token containing 'unattributable=7' does not block a sound merge (exit 0)" \
+  || fail "the token-text inflation blocked a merge (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "1 FAILED token(s) were DROPPED" "$SCEN/err" \
+  && pass "the RAIL'S OUTPUT reports ONE drop, not 8" \
+  || fail "the rail's drop count is inflated by the token text: $(grep -m1 'FAILED token' "$SCEN/err")"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=1 | main=0" "$SCEN/comment" && pass "the POSTED EVIDENCE states PR=1 | main=0" \
+    || fail "the evidence drop count is inflated: $(grep -m1 'Attribution' "$SCEN/comment")"
+  grep -q "PR=8" "$SCEN/comment" && fail "the evidence still counts the token's own 'unattributable=7'" \
+    || pass "…and the token's own text did NOT inflate it"
+  grep -q -- "- unattributable=7" "$SCEN/comment" \
+    && pass "…while the token is STILL NAMED in the drop list" \
+    || fail "the token was dropped from the evidence instead of named"
+else
+  fail "no evidence comment posted for the inflation case"
+fi
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (b) THE MIXED CASE — text-less drops are still counted through the DROPPED-line
+# path, and the token text still does not add to them.
+new_scen dropcount-mixed
+HEAD_AT9="c5c5${HEX36}"
+printf '%s\n' "$HEAD_AT9" > "$SCEN/head"
+lane_fail "$HEAD_AT9" 8810 > "$SCEN/runs-$HEAD_AT9"
+{ log_failed "$FAIL_AT8"; log_unattributable 'unattributable=7'; log_bare_failed; log_bare_failed; } > "$SCEN/log-8810"
+main_red_n mainat9 9009 3 "$FAIL_AT8" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a mixed drop set still merges (exit 0)" \
+  || fail "the mixed drop set blocked a sound merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=3 | main=0" "$SCEN/comment" \
+    && pass "…and the evidence counts 3 drops (one token + two text-less), not 10" \
+    || fail "the mixed drop count is wrong: $(grep -m1 'Attribution' "$SCEN/comment")"
+else
+  fail "no evidence comment posted for the mixed case"
+fi
+
+# (c) A token carrying an ABSURD number is still not read as a count.
+new_scen dropcount-absurd-token
+HEAD_ATA="c6c6${HEX36}"
+printf '%s\n' "$HEAD_ATA" > "$SCEN/head"
+lane_fail "$HEAD_ATA" 8811 > "$SCEN/runs-$HEAD_ATA"
+{ log_failed "$FAIL_AT8"; log_unattributable 'unattributable=99999999999999999999'; } > "$SCEN/log-8811"
+main_red_n mainata 9010 3 "$FAIL_AT8" > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "an absurd in-token number does not block a sound merge (exit 0)" \
+  || fail "the absurd in-token number blocked a merge (exit $rc)"
+if [ -f "$SCEN/comment" ]; then
+  grep -q "PR=1 | main=0" "$SCEN/comment" && pass "…and the evidence still states PR=1" \
+    || fail "the absurd token changed the count: $(grep -m1 'Attribution' "$SCEN/comment")"
+else
+  fail "no evidence comment posted for the absurd-token case"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
