@@ -1,0 +1,492 @@
+#!/usr/bin/env bash
+# tests/atomic-land/run.sh — the atomic land unit: update → verify → record → land (#1367).
+#
+# The rail: `strict: true` requires an up-to-date head, and the head-bound review
+# evidence requires a record at the head sha. Satisfying the first moves the head
+# and stales the record, and `main` moves faster than a CI cycle, so the four
+# steps performed as separate turns lose the window (tortoise #4764: 48/69 open
+# PRs with no valid attestation; the O3 sweep: 22 updated, 17 invalidated, 0
+# landed). The rail is
+#
+#   scripts/atomic-land.sh      update → verify → record → land, as ONE unit
+#   scripts/record-review.sh    the record's diff guard + carry-forward (#767)
+#   scripts/admin-merge.sh      the land step (never a hand-rolled merge)
+#
+# What this suite pins:
+#  1. THE UNIT IS ORDERED AND ATOMIC: on a BEHIND PR the rail updates, waits for
+#     terminal checks, re-records at the NEW head, and only then lands.
+#  2. NO REVIEW → NO RECORD → NO LAND. A PR with no accepted-verdict record is
+#     refused BEFORE any mutation (no update-branch, no record, no merge).
+#  3. A CHANGED DIFF IS NEVER CARRIED. When record-review refuses (exit 3) the
+#     rail STOPS, names the fresh review required, and never calls the land step.
+#  4. THE MERGE IS NOT HAND-ROLLED: the rail never issues `gh pr merge`; it calls
+#     admin-merge.sh, which owns the evidence and the decision.
+#  5. A MERGE IS CONFIRMED, NOT INFERRED: admin-merge.sh exiting 0 while the PR
+#     is still OPEN is a FAILURE (the #1359 false-success shape).
+#  6. A NON-TERMINAL HEAD IS NOT LANDED: the wait is bounded and its expiry stops
+#     the rail without recording or merging.
+#  7. A DRAFT IS REFUSED BEFORE ANY CI WORK.
+#  8. AN UNACCEPTED VERDICT IS REFUSED.
+#  9. `--dry-run` MUTATES NOTHING (no update, no record, no comment, no merge).
+# 10. A FRESH RECORD AT THE HEAD SKIPS update AND record (no dilution of an
+#     unchanged head) and lands directly.
+# 11. A FRESH REVIEW IS REQUIRED, NOT IMPROVISED: the rail calls record-review.sh
+#     with the PRIOR head as its sha argument (the carry-forward input), never
+#     the current head — passing the current head would record without any
+#     equivalence proof.
+#
+# Hermetic: a fake gh, fake record-review and fake admin-merge serve every call;
+# HOME is a temp dir so no real review record is read or written.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RAIL="${ATOMIC_LAND_SUITE_RAIL:-$ROOT/scripts/atomic-land.sh}"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/atomic-land-suite.XXXXXX")"
+checks=0
+failures=0
+
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+pass() { checks=$((checks + 1)); echo "   ✅ $1"; }
+fail() { checks=$((checks + 1)); echo "   ❌ $1"; failures=$((failures + 1)); }
+
+[ -f "$RAIL" ] || { echo "❌ missing $RAIL"; exit 1; }
+
+HEAD_OLD="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+HEAD_NEW="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+REPO="daniel-ospina/agent-infra"
+
+# ── fake gh ───────────────────────────────────────────────────────────────
+FAKE="$TMP/fake-gh"
+cat > "$FAKE" <<'FAKEEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+printf '%s\n' "$*" >> "$SCEN/calls"
+
+# current head: starts at the fixture and moves when update-branch succeeds
+cur_head() { cat "$SCEN/head" 2>/dev/null || cat "$SCEN/head-old"; }
+
+case "${1:-} ${2:-}" in
+  "repo view")
+    printf '%s\n' "$REPO_FIXTURE"; exit 0 ;;
+  "pr update-branch")
+    # Model the branch update: the head moves to head-new.
+    [ "${SCEN_UPDATE_FAIL:-0}" = 1 ] && exit 1
+    cp "$SCEN/head-new" "$SCEN/head"; exit 0 ;;
+  "pr view")
+    pr="${3:-}"; json=""; jqprog=""; prev=""
+    for x in "$@"; do
+      [ "$prev" = "--json" ] && json="$x"
+      [ "$prev" = "--jq" ] && jqprog="$x"
+      prev="$x"
+    done
+    case "$json" in
+      *isDraft*)
+        printf '%s\t%s\t%s\t%s\n' "$(cur_head)" "$(cat "$SCEN/base" 2>/dev/null || echo main)" \
+          "$(cat "$SCEN/state" 2>/dev/null || echo BEHIND)" "$(cat "$SCEN/draft" 2>/dev/null || echo false)"
+        exit 0 ;;
+      *baseRefName*)
+        printf '%s\t%s\n' "$(cur_head)" "$(cat "$SCEN/base" 2>/dev/null || echo main)"; exit 0 ;;
+      *headRefOid*)
+        cur_head; exit 0 ;;
+    esac
+    exit 1 ;;
+  "pr comment")
+    exit 0 ;;
+  "api"*)
+    ep="${2:-}"; jqprog=""
+    prev=""
+    for x in "$@"; do [ "$prev" = "--jq" ] && jqprog="$x"; prev="$x"; done
+    case "$ep" in
+      */commits/*/check-runs)
+        case "$jqprog" in
+          *'!= "completed"'*) cat "$SCEN/pending" 2>/dev/null || echo 0 ;;
+          *'== "completed"'*) cat "$SCEN/completed" 2>/dev/null || echo 1 ;;
+          *) echo 0 ;;
+        esac
+        exit 0 ;;
+      */compare/*)
+        # model a base REWRITE inside the unit: the Nth compare returns the Nth line
+        if [ -f "$SCEN/mb-seq" ]; then
+          n=$(( $(cat "$SCEN/mb-count" 2>/dev/null || echo 0) + 1 ))
+          printf '%s' "$n" > "$SCEN/mb-count"
+          sed -n "${n}p" "$SCEN/mb-seq"
+          exit 0
+        fi
+        cat "$SCEN/merge-base" 2>/dev/null || echo cccccccccccccccccccccccccccccccccccccccc
+        exit 0 ;;
+      */pulls/*)
+        case "$jqprog" in
+          *base*)
+            if [ -f "$SCEN/base-tip-seq" ]; then
+              n=$(( $(cat "$SCEN/base-tip-count" 2>/dev/null || echo 0) + 1 ))
+              printf '%s' "$n" > "$SCEN/base-tip-count"
+              sed -n "${n}p" "$SCEN/base-tip-seq"
+              exit 0
+            fi
+            cat "$SCEN/base-tip" 2>/dev/null || echo 9999999999999999999999999999999999999999
+            exit 0 ;;
+        esac
+        cat "$SCEN/merged" 2>/dev/null || echo OPEN; exit 0 ;;
+    esac
+    exit 1 ;;
+esac
+exit 1
+FAKEEOF
+chmod +x "$FAKE"
+
+# ── fake record-review / admin-merge ──────────────────────────────────────
+REC="$TMP/fake-record-review"
+cat > "$REC" <<'RECEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+printf 'record-review %s\n' "$*" >> "$SCEN/calls"
+# hooks that model a mutation landing INSIDE the unit (between the record and the land)
+[ "${SCEN_RECORD_MOVES_HEAD:-0}" = 1 ] && printf '%s\n' "$HEAD_MOVED" > "$SCEN/head"
+[ "${SCEN_RECORD_REPOINTS_BASE:-0}" = 1 ] && printf 'develop\n' > "$SCEN/base"
+case "${SCEN_RECORD_RC:-0}" in
+  3) echo "carry-forward: no prior evidence for this PR's current diff — refusing" >&2; exit 3 ;;
+  *) if [ "${SCEN_RECORD_LOG:-}" = 1 ]; then
+       echo "the reviewed diff is unchanged (diff=1111111111111111111111111111111111111111111111111111111111111111)"
+     fi
+     exit "$SCEN_RECORD_RC" ;;
+esac
+RECEOF
+chmod +x "$REC"
+
+ADM="$TMP/fake-admin-merge"
+cat > "$ADM" <<'ADMEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+printf 'admin-merge %s\n' "$*" >> "$SCEN/calls"
+exit "${SCEN_ADMIN_RC:-0}"
+ADMEOF
+chmod +x "$ADM"
+
+# ── harness ───────────────────────────────────────────────────────────────
+# new_scen: a scenario dir + a temp HOME carrying the review record fixture.
+new_scen() {
+  SCEN="$TMP/scen-$1"
+  # reset every scenario-scoped switch (a leak between scenarios is a test bug)
+  SCEN_RECORD_RC=0; SCEN_RECORD_LOG=; SCEN_ADMIN_RC=0; ATOMIC_LAND_CONFIRM_MAX=60
+  SCEN_RECORD_MOVES_HEAD=0; SCEN_RECORD_REPOINTS_BASE=0; HEAD_MOVED="cccccccccccccccccccccccccccccccccccccccc"
+  unset mb_seq 2>/dev/null || true
+  mkdir -p "$SCEN" "$SCEN/home/.pi/agent/reviews"
+  printf '%s\n' "$HEAD_OLD" > "$SCEN/head-old"
+  printf '%s\n' "$HEAD_NEW" > "$SCEN/head-new"
+  printf '%s\n' "$HEAD_OLD" > "$SCEN/head"
+  printf 'main\n' > "$SCEN/base"
+  printf 'BEHIND\n' > "$SCEN/state"
+  printf 'false\n' > "$SCEN/draft"
+  printf '0\n' > "$SCEN/pending"
+  printf '5\n' > "$SCEN/completed"
+  printf 'MERGED\n' > "$SCEN/merged"
+  printf 'cccccccccccccccccccccccccccccccccccccccc\n' > "$SCEN/merge-base"
+  printf '9999999999999999999999999999999999999999\n' > "$SCEN/base-tip"
+  mkdir -p "$SCEN/tmp"
+  : > "$SCEN/calls"
+  # default fixture record: verdict clean at the OLD head
+  printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
+    > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+}
+
+run_rail() { # <extra args...>
+  SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="$REPO" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
+  SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
+  SCEN_RECORD_MOVES_HEAD="${SCEN_RECORD_MOVES_HEAD:-0}" \
+  SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
+  SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
+  ATOMIC_LAND_GH="$FAKE" ATOMIC_LAND_RECORD_SH="$REC" ATOMIC_LAND_ADMIN_MERGE="$ADM" \
+    bash "$RAIL" "$@" >"$SCEN/out" 2>"$SCEN/err"
+}
+
+calls() { cat "$SCEN/calls"; }
+called() { grep -qF -- "$1" "$SCEN/calls"; }
+count_call() { grep -cF -- "$1" "$SCEN/calls"; }
+
+# ═══ 1. the ordered atomic unit on a BEHIND PR ═══════════════════════════
+echo "── 1. BEHIND PR with an unchanged diff: update → verify → record → land"
+new_scen happy
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the unit completes (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch 42" && pass "step 1: the branch was updated" || fail "step 1: update-branch was never called"
+called "record-review 42 $HEAD_OLD clean $REPO" \
+  && pass "step 3: record-review got the PRIOR head (the carry-forward input), not the new head" \
+  || fail "step 3: record-review was not called with the prior head + verdict (calls: $(calls))"
+called "admin-merge 42" && pass "step 4: the land step is admin-merge.sh" || fail "step 4: admin-merge.sh was never called"
+# ordering: update before record before land
+awk '/pr update-branch/{u=NR} /record-review/{r=NR} /admin-merge/{a=NR} END{exit !(u<r && r<a)}' "$SCEN/calls" \
+  && pass "the steps ran in order (update < record < land)" \
+  || fail "the steps are out of order (calls: $(calls))"
+called "reused verdict" && pass "the reuse was cited" || fail "no reuse citation comment was posted"
+# the citation is PROSE — the review-marker format is a cross-repo contract, so
+# this rail must never emit a marker segment it would inherit a land order for.
+grep -qF -- '<!--' "$SCEN/calls" && fail "the rail wrote a marker segment (cross-repo land order)" \
+  || pass "the citation is prose only — no marker segment written by the rail"
+
+# ═══ 2. a changed diff is never carried ══════════════════════════════════
+echo "── 2. record-review refuses (exit 3): STOP, no land, name the fresh review"
+new_scen changed
+SCEN_RECORD_RC=3
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "the land step ran on an unprovable diff" || pass "the land step did NOT run"
+grep -q "FRESH review" "$SCEN/err" && pass "the refusal names the fresh review required" || fail "the refusal does not name a fresh review"
+
+# ═══ 3. no record → refuse before any mutation ═══════════════════════════
+echo "── 3. no review record: refuse before ANY mutation"
+new_scen norec
+rm -f "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "mutated before the precondition (update-branch)" || pass "no update-branch before the precondition"
+called "admin-merge" && fail "landed without a record" || pass "no land without a record"
+grep -q "no review record" "$SCEN/err" && pass "the refusal names the missing record" || fail "the refusal does not name the missing record"
+
+# ═══ 4. a draft is refused ════════════════════════════════════════════════
+echo "── 4. a draft is refused before any CI work"
+new_scen draft
+printf 'true\n' > "$SCEN/draft"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "did CI work on a draft" || pass "no mutation on a draft"
+grep -q "DRAFT" "$SCEN/err" && pass "the refusal names the draft" || fail "the refusal does not name the draft"
+
+# ═══ 5. an unaccepted verdict is refused ═════════════════════════════════
+echo "── 5. an unaccepted verdict is refused"
+new_scen badverdict
+printf '{"pr":42,"head_sha":"%s","verdict":"pending","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "landed on an unaccepted verdict" || pass "no land on an unaccepted verdict"
+
+# ═══ 6. a merge is confirmed, not inferred ═══════════════════════════════
+echo "── 6. admin-merge exits 0 but the PR is still OPEN: FAILURE, not success"
+new_scen unmerged
+printf 'OPEN\n' > "$SCEN/merged"
+SCEN_RECORD_LOG=1
+ATOMIC_LAND_CONFIRM_MAX=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "the rail reports failure (rc 1)" || fail "expected rc 1, got $rc (a false success)"
+grep -q "NOT confirmed" "$SCEN/err" && pass "the failure names the unconfirmed merge" || { fail "the failure does not name the unconfirmed merge"; echo "      --- err ---"; sed 's/^/      /' "$SCEN/err"; }
+
+# ═══ 7. a non-terminal head is not landed ════════════════════════════════
+echo "── 7. the terminal-check wait is bounded; its expiry stops the rail"
+new_scen pending
+printf '3\n' > "$SCEN/pending"
+run_rail 42 --repo "$REPO" --poll 0 --wait-timeout 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stops on wait expiry (rc 1)" || fail "expected rc 1, got $rc"
+called "record-review" && fail "recorded without terminal checks" || pass "no record before terminal checks"
+called "admin-merge" && fail "landed without terminal checks" || pass "no land before terminal checks"
+grep -q "not terminal" "$SCEN/err" && pass "the refusal names the wait" || fail "the refusal does not name the wait"
+
+# ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
+echo "── 8. --dry-run mutates nothing"
+new_scen dryrun
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0 --dry-run
+rc=$?
+[ "$rc" -eq 0 ] && pass "dry-run completes (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" && fail "dry-run updated the branch" || pass "no update in dry-run"
+called "record-review" && fail "dry-run recorded" || pass "no record in dry-run"
+called "pr comment" && fail "dry-run posted a comment" || pass "no comment in dry-run"
+grep -q "admin-merge 42 --repo $REPO --dry-run" "$SCEN/calls" \
+  && pass "the land step is invoked read-only (--dry-run)" \
+  || fail "the land step was not invoked with --dry-run (calls: $(calls))"
+
+# ═══ 9. a fresh record at the head skips update and record ═══════════════
+echo "── 9. a fresh record at the head is not diluted; it lands directly"
+new_scen fresh
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" && fail "updated a PR that was not BEHIND" || pass "no update (not BEHIND)"
+called "record-review" && fail "re-recorded an unchanged head (dilutes the evidence)" || pass "no re-record of a fresh head"
+called "admin-merge 42" && pass "landed directly" || fail "did not land"
+
+# ═══ 10. the merge is never hand-rolled, and the rail never reads protection ═
+echo "── 10. the rail never issues a raw merge, and has no branch-protection dependency"
+new_scen norewrite
+for s in "$TMP/scen-happy" "$TMP/scen-fresh" "$TMP/scen-dryrun"; do
+  grep -qE '(^|[[:space:]])pr[[:space:]]+merge([[:space:]]|$)' "$s/calls" \
+    && fail "a raw \`gh pr merge\` was issued from $(basename "$s")" \
+    || pass "no raw \`gh pr merge\` in $(basename "$s")"
+  grep -qE 'protection|required_status_checks' "$s/calls" \
+    && fail "the rail read a branch-protection setting from $(basename "$s") (undeclared dependency on strict)" \
+    || pass "no branch-protection read in $(basename "$s") (no strict dependency)"
+done
+
+# ═══ 11. B9 — the head must not move between the record and the land ════
+echo "── 11. the head moving between the record and the land stops the unit"
+new_scen headmoved
+SCEN_RECORD_MOVES_HEAD=1
+HEAD_MOVED="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0 --max-rounds 1
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1)" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "landed after the head moved (B9 fail-open)" || pass "did NOT land after the head moved"
+grep -q "head moved between the record" "$SCEN/err" && pass "the stop names the mid-unit head move" || fail "the stop does not name the head move"
+
+# ═══ 12. B10 — the BASE must not move inside the unit ══════════════════
+echo "── 12. a base REPOINT inside the unit stops the unit (B10)"
+new_scen baserepoint
+SCEN_RECORD_REPOINTS_BASE=1
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1)" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "landed after the base was repointed (B10 fail-open)" || pass "did NOT land after the base was repointed"
+grep -q "base was repointed" "$SCEN/err" && pass "the stop names the repoint" || fail "the stop does not name the repoint"
+
+# ═══ 13. B10 — a base REWRITE (same branch name) inside the unit ════════
+echo "── 13. a base REWRITE (merge base moves, same branch) stops the unit"
+new_scen baserewrite
+printf 'cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\n' > "$SCEN/mb-seq"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1)" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "landed after the base was rewritten (B10 fail-open)" || pass "did NOT land after the base was rewritten"
+grep -q "merge base moved" "$SCEN/err" && pass "the stop names the merge-base move" || fail "the stop does not name the merge-base move"
+
+# ═══ 14. B10 — a PRE-UNIT repoint on a FRESH record (clean-low) ═════════
+echo "── 14. a fresh record whose merge_base_sha disagrees with the live base is refused"
+new_scen preunit
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean-low","merge_base_sha":"ffffffffffffffffffffffffffffffffffffffff","repo":"%s"}\n' \
+  "$HEAD_NEW" "$REPO" > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1)" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "mutated before the base-binding check" || pass "refused before any mutation"
+called "admin-merge" && fail "landed with a record bound to a different base" || pass "did NOT land on a base-mismatched record"
+grep -q "certified against merge base" "$SCEN/err" && pass "the stop names the record's base" || fail "the stop does not name the record's base"
+
+# ═══ 15. B10 under strict OFF — no BEHIND, fresh record, base rewritten ══
+# The live criterion ("lands a real BEHIND PR") only ever exercises strict ON.
+# This case has NO `BEHIND` (state CLEAN) and a FRESH record, so the rail updates
+# and records nothing — and the base is still rewritten between verify and land.
+# It must STILL refuse; that is the strict-off window the rail exists to make
+# unnecessary, so the binding must not depend on the protection setting.
+echo "── 15. a base rewrite with NO BEHIND (strict off) still stops the unit"
+new_scen strictoff
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+printf 'cccccccccccccccccccccccccccccccccccccccc\ndddddddddddddddddddddddddddddddddddddddd\n' > "$SCEN/mb-seq"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) with no BEHIND and a fresh record" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "landed after a strict-off base rewrite (the window bypass)" || pass "did NOT land on the strict-off base rewrite"
+called "pr update-branch" && fail "updated a non-BEHIND PR" || pass "no update (BEHIND was absent, as in the window)"
+grep -q "merge base moved" "$SCEN/err" && pass "the stop names the merge-base move" || fail "the stop does not name the merge-base move"
+
+# ═══ 16. B12 — a concurrent merge advances the base after verification ═══
+# Two rails (or two lanes) verify against base X; A merges; the base becomes X+A;
+# B would land via --admin onto a base its checks never covered. The merge base is
+# UNCHANGED, so B10 does not fire: this is the multi-agent form of the race, and
+# it must be re-verified (or refused), never landed.
+echo "── 16. a concurrent base ADVANCE after verification stops the unit (B12)"
+new_scen baseadvance
+printf '9999999999999999999999999999999999999999\n8888888888888888888888888888888888888888\n' > "$SCEN/base-tip-seq"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0 --max-rounds 1
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) — did not land on an unverified base" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "landed after the base advanced (B12 fail-open)" || pass "did NOT land after the base advanced"
+grep -qi "advanced after verification" "$SCEN/err" && pass "the stop names the advance" || fail "the stop does not name the advance"
+
+# ═══ 17. B11 — two rails on the same PR must not interleave ═════════════
+echo "── 17. a held per-PR lock refuses before any mutation (B11)"
+new_scen lock
+LOCK="$SCEN/tmp/atomic-land-daniel-ospina-agent-infra-42.lock"
+mkdir -p "$LOCK" && printf '%s\n' "$$" > "$LOCK/pid"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "mutated while another rail held the lock" || pass "no mutation while locked"
+called "admin-merge" && fail "landed while another rail held the lock" || pass "no land while locked"
+grep -qi "already running" "$SCEN/err" && pass "the refusal names the concurrent rail" || fail "the refusal does not name the concurrent rail"
+rm -rf "$LOCK"
+
+# ═══ 18. mutation coverage for the declared threat surface ═══════════════
+# The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
+# class B1-B8 must be covered by a test that FAILS against the revision before
+# its fix. This section mutates the rail and asserts the suite reddens. A mutation
+# that leaves the suite green means the class is NOT covered.
+if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
+  echo "── 18. mutation coverage — each declared bypass class must be caught"
+  MUT="$TMP/mut"; mkdir -p "$MUT"
+  mutate_and_expect_fail() { # <name> <perl-expr>
+    local name="$1"
+    local expr="$2"
+    local src="$MUT/$name.sh"
+    cp "$RAIL" "$src"
+    if ! perl -0pi -e "$expr" "$src" 2>/dev/null; then fail "mutation $name: perl failed"; return; fi
+    if cmp -s "$src" "$RAIL"; then fail "mutation $name reddened nothing — the mutation did not apply"; return; fi
+    ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_SUITE_RAIL="$src" bash "$0" >"$MUT/$name.log" 2>&1
+    if [ $? -ne 0 ]; then
+      pass "mutation $name reddens the suite (class covered)"
+    else
+      fail "mutation $name did NOT redden the suite (class NOT covered)"
+    fi
+  }
+  # B1: pass the CURRENT head to record-review instead of the prior head
+  mutate_and_expect_fail B1   's/"\$RECORD_SH" "\$PR" "\$prior"/"$RECORD_SH" "$PR" "$HEAD"/'
+  # B2a: drop the record precondition
+  mutate_and_expect_fail B2a  's/if ! read_record; then/if false; then/'
+  # B2b: accept every verdict
+  mutate_and_expect_fail B2b  's/if ! verdict_accepted "\$RECORD_VERDICT"; then/if false; then/'
+  # B3: add a hand-rolled --admin merge beside the mandated rail
+  mutate_and_expect_fail B3   's/bash "\$ADMIN_MERGE" "\$PR"/"$GH" pr merge "$PR" --admin; bash "$ADMIN_MERGE" "$PR"/'
+  # B4: never confirm the merge
+  mutate_and_expect_fail B4   's/confirm_merged\(\) \{/confirm_merged() { return 0;/'
+  # B5: allow a draft
+  mutate_and_expect_fail B5   's/if \[ "\$IS_DRAFT" = "true" \]; then/if false; then/'
+  # B6: never stop on the terminal-check wait expiry
+  mutate_and_expect_fail B6   's/^      stop "the checks at.*$/      return 0/m'
+  # B7: make --dry-run a no-op (the inspection path starts mutating)
+  mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
+  # B8: treat every record as fresh
+  mutate_and_expect_fail B8   's/if \[ "\$RECORD_HEAD" = "\$HEAD" \]; then/if true; then/'
+  # B9: never re-check the head before landing
+  mutate_and_expect_fail B9   's/if \[ "\$now" != "\$HEAD" \]; then/if false; then/'
+  # B10a: never re-check the base BRANCH before landing
+  mutate_and_expect_fail B10a 's/if \[ "\$now_base" != "\$CERT_BASE" \]; then/if false; then/'
+  # B10b: never re-check the base's MERGE BASE before landing
+  mutate_and_expect_fail B10b 's/if \[ -z "\$now_mb" \] || \[ "\$now_mb" != "\$CERT_MB" \]; then/if false; then/'
+  # B10c: never compare the record's own merge base to the live one (pre-unit)
+  mutate_and_expect_fail B10c 's/if \[ -z "\$live_mb" \] || \[ "\$live_mb" != "\$RECORD_MB" \]; then/if false; then/'
+  # B12: never detect a concurrent base ADVANCE
+  mutate_and_expect_fail B12  's/if \[ "\$now_tip" != "\$CERT_BASE_TIP" \]; then/if false; then/'
+  # B11: never take the per-PR lock
+  mutate_and_expect_fail B11  's/\[ "\$DRY_RUN" -eq 0 \] && acquire_lock//'
+fi
+
+if [ "$failures" -gt 0 ]; then
+  echo "❌ $failures of $checks atomic-land test(s) failed"
+  exit 1
+fi
+echo "✅ all $checks atomic-land tests passed"
