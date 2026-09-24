@@ -59,7 +59,7 @@ fi
 # (a list kept anywhere else would be the very duplication this file exists to remove).
 # `shard_ran` is what makes the list SELF-CHECKING at runtime: the counters are compared
 # against the listed count at the end, so a neutered helper (executing nothing while the list
-# still reads 14) fails loudly instead of reporting "all bash shards passed". A static check
+# still reads its full count) fails loudly instead of reporting "all bash shards passed". A static check
 # over this file's text could never catch that; running it can.
 shard_errors=0
 shard_ran=0
@@ -74,7 +74,7 @@ swept=0
 sweep_file() { swept=$((swept + 1)); bash -n "$1" || shard_errors=$((shard_errors + 1)); }
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
-# keeps the line count but points the list at a /tmp stub would report "14 shards passed" having
+# keeps the line count but points the list at a /tmp stub would report every shard as passed having
 # run none of the suites — the counter arm alone cannot tell the difference.
 checkout_real="$(pwd -P)"
 while IFS= read -r t; do
@@ -114,10 +114,10 @@ echo "── hermetic suites ─────────────────
 # Every suite below is hermetic (temp repos / temp HOME / stubbed tools, no network).
 #
 # PROVENANCE, and one caveat: these lines were moved out of ci-main.yml's `script-validate`, so
-# each keeps the note that workflow carried. Five of them are ALSO run by a dedicated per-PR job in
-# ci.yml — the four marked "post-merge re-check of a per-PR job", plus pi-bootstrap. That
+# each keeps the note that workflow carried. Some of them are ALSO run by a dedicated per-PR job or
+# step in ci.yml (each such line carries an "(also a per-PR … in ci.yml)" note). That
 # duplication is deliberate here: this file is the ONE list both lanes run, so the PR lane runs
-# those five twice (once in their own job, once inside this list). Dropping them from this list to
+# those twice (once in their own job, once inside this list). Dropping them from this list to
 # save the minutes would recreate the second, hand-kept list that #1369 exists to remove — the
 # alternative is to retire the dedicated jobs and let this list be the PR lane's only coverage,
 # which changes PR feedback granularity and is the owner's call, not a silent edit.
@@ -130,6 +130,7 @@ run_shard scripts/pi-task-session-prune.test.sh                            # #78
 run_shard scripts/pi-reap-worktrees.test.sh                                # #1095 worktree reaper gates
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
 run_shard scripts/record-review.test.sh                                    # #1348 THE INCIDENT: runner-only rc=127 shipped green
+run_shard scripts/diff-normalize.test.sh                                  # #1362 D1 review-evidence diff normalizer (one impl, shared with the gate) (also a per-PR job in ci.yml)
 run_shard tests/admin-merge/run.sh                                         # #930 safe-admin-merge rail (also a per-PR job in ci.yml)
 run_shard tests/atomic-land/run.sh                                         # #1367 atomic land unit (also a per-PR job in ci.yml)
 run_shard tests/gh-shim/run.sh                                             # #984 argv-level gh shim (also a per-PR job in ci.yml)
@@ -138,7 +139,7 @@ run_shard pi-bootstrap/tests/test-setup-no-nesting.sh                      # #44
 
 echo "───────────────────────────────────────────────────────────────────"
 # Runtime self-check 1: every listed shard must have been EXECUTED. This is the arm that catches
-# a helper whose execution was disabled — a text-only floor would still see 14 listed shards.
+# a helper whose execution was disabled — a text-only floor would still see the same listed count.
 listed="$(sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}" | grep -c .)"
 if [ "$shard_ran" -ne "$listed" ]; then
   echo "❌ executed $shard_ran of $listed listed shard(s) — the list and the execution disagree"
@@ -154,9 +155,9 @@ if [ "$swept" -lt 1 ]; then
 fi
 
 # Runtime self-check 2b: the SWEEP ARM must still be wired. The `swept` counter above proves the
-# loop body RAN, but a body rewritten as `swept=$((swept+1))` alone keeps that counter at 73 while
-# checking no syntax at all — so the arm is proven the same way as the shard arm: run a file that
-# MUST fail, and require the failure to be recorded.
+# loop body RAN, but a body rewritten as `swept=$((swept+1))` alone leaves that counter reading a
+# full, non-zero count while checking no syntax at all — so the arm is proven the same way as the
+# shard arm: run a file that MUST fail, and require the failure to be recorded.
 sentinel_sweep="$(mktemp)"
 printf 'if then\n' >"$sentinel_sweep"
 before_sweep_err=$shard_errors

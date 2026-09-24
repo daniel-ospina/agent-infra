@@ -162,7 +162,7 @@ case "${SCEN_RECORD_RC:-0}" in
 esac
 # The LIVE contract (#767): a zero exit leaves a record naming the PR's CURRENT
 # head — either it already did (sha == head), or the carry-forward arm re-bound it
-# because the reviewed diff is byte-unchanged and the prior marker's signature
+# because the reviewed diff is content-unchanged and the prior marker's signature
 # verified. A fake that exits 0 WITHOUT writing a record models a delegate that
 # does not implement the contract, and hides every binding defect from the suite.
 if [ "${SCEN_RECORD_LOG:-}" = 1 ]; then
@@ -289,6 +289,14 @@ rc=$?
 [ "$rc" -eq 1 ] && pass "the rail stops (rc 1)" || fail "expected rc 1, got $rc"
 called "admin-merge" && fail "the land step ran on an unprovable diff" || pass "the land step did NOT run"
 grep -q "FRESH review" "$SCEN/err" && pass "the refusal names the fresh review required" || fail "the refusal does not name a fresh review"
+# #1362 D1 — a PARTIAL INSTALL is a second cause of exit 3, and blaming the diff
+# for it would send a lane to re-review an unchanged artifact (the exact false
+# obligation D1 removes). The fixture's record script has no sibling normalizer,
+# so the diagnostic must fire here. REGRESSION-SENSITIVE: removing the
+# `[ ! -f "$DIFF_NORMALIZER_SH" ]` guard leaves the suite red.
+grep -q "diff normalizer" "$SCEN/err" \
+  && pass "12/D1: a missing producer normalizer is named (partial install, not a changed diff)" \
+  || fail "12/D1: the missing diff normalizer was NOT named — a partial install would masquerade as a changed diff"
 
 # ═══ 3. no record → refuse before any mutation ═══════════════════════════
 echo "── 3. no review record: refuse before ANY mutation"
@@ -636,7 +644,7 @@ called "pr update-branch" && fail "spent the attestation under a rotated key (B5
 
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
-# class B1-B8 must be covered by a test that FAILS against the revision before
+# class B1-B12 must be covered by a test that FAILS against the revision before
 # its fix. This section mutates the rail and asserts the suite reddens. A mutation
 # that leaves the suite green means the class is NOT covered.
 if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
@@ -701,6 +709,9 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B12b 's/if \[ -z "\$CERT_BASE_TIP" \]; then/if false; then/'
   # B11: never take the per-PR lock
   mutate_and_expect_fail B11  's/\[ "\$DRY_RUN" -eq 0 \] && acquire_lock//'
+  # D1d (#1362): the partial-install diagnostic is not a bypass class, but it is
+  # a D1 behavior the suite pins — removing its guard must redden scenario 2.
+  mutate_and_expect_fail D1d  's/if \[ ! -f "\$DIFF_NORMALIZER_SH" \]; then/if false; then/'
 fi
 
 if [ "$failures" -gt 0 ]; then
