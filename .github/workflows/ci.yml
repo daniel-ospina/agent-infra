@@ -551,6 +551,50 @@ jobs:
       - name: pi-bootstrap setup regression suite
         run: bash pi-bootstrap/tests/test-setup-no-nesting.sh
 
+  bash-suites:
+    # #1369 — Route A of the lane-split fix: the PR lane must RUN the bash work its check
+    # name implies. Before this job, `ci / script-validate` ran `node --check` only (~4s)
+    # while main's `script-validate` ran the bash sweeps + fourteen hermetic suites (~5m20s)
+    # — one check name over two different bodies of work. A runner-only failure therefore
+    # reached main with a GREEN PR: scripts/record-review.test.sh exited 127 on the ubuntu
+    # runner (its PATH-shim vector) and reddened main (#1348 → #1369).
+    #
+    # BOTH lanes call `scripts/run-bash-shards.sh`, which IS the shard list. The first repair
+    # duplicated the list into each workflow and compared the two; two independent reviews
+    # then showed every text form that reads as coverage without executing (a shard named in
+    # a heredoc body, an `env:` value, after `true ||`, on a `for f in a.sh …` continuation
+    # line, or as `env bash x.sh`). Comparing two hand-kept lists cannot be made sound — so
+    # there is now ONE list, and drift between the lanes is impossible by construction.
+    #
+    # scripts/check-ci-lane-parity.sh asserts the narrow residue: each lane calls the runner,
+    # and the runner is not gutted (vacuity floors). tests/ci-lane-parity/run.sh exercises
+    # those arms with mutations.
+    #
+    # NOT a required check: the repo's only required status is `pipeline-compliance` (#646
+    # records code CI as advisory). Making this required is a REOPEN of that decision with
+    # evidence, never a quiet branch-protection edit.
+    #
+    # `bash-suites` deliberately does NOT begin with the admin-merge rail's parity prefix
+    # (`ADMIN_MERGE_LANE_JOB_PREFIX`, default `test`), so it stays outside that family and
+    # cannot move the rail's lane-coverage comparison (#1349 — a separate remedy; nothing
+    # here helps or hinders it).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The runner below includes `tests/search-cost/run.sh`, whose harness type-strips index.ts and
+      # needs Node >= 22.13 — ci.yml's own `search-cost` job pins it for exactly this reason, with the
+      # note that inheriting the runner's Node "is not a contract". Same pin here, and the same pin in
+      # ci-main.yml's `script-validate`: one runtime for the list, in both lanes.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Lane parity — both lanes must call the one bash-shard runner (#1369)
+        run: bash scripts/check-ci-lane-parity.sh
+      - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        run: bash tests/ci-lane-parity/run.sh
+      - name: Bash shards — the ONE list both lanes run (#1369)
+        run: bash scripts/run-bash-shards.sh
+
   vendor-drift:
     # #383 — the SINGLE vendor drift gate: bash syntax + manifest verification
     # (identical@base sha256s + ledger patches reverse-apply to the swarm base).
