@@ -13,7 +13,10 @@
 # #1313 staleness: PASS on main+clean+up-to-date | FAIL on behind | FAIL on
 # diverged (ahead-only and true divergence) | FAIL (closed) on no upstream |
 # detached HEAD reports off_main without crashing | the --gh-report leg carries
-# the SAME staleness guidance (both parse sites of the token string).
+# the SAME staleness guidance (both parse sites of the token string) |
+# #1410: a healthy worktree is PASS | a worktree whose .git link is deleted is a
+# worktree_unlinked FAIL naming the directory and the repair | empty debris under
+# .worktrees/ is not flagged | restoring the link returns the hub to PASS.
 
 set -euo pipefail
 
@@ -433,6 +436,68 @@ assert_eq "$rc" 1 "detached HEAD → exit 1 (no crash)"
 assert_contains "$out" "HUB_DISORDER=off_main" "detached HEAD → HUB_DISORDER=off_main"
 assert_contains "$out" "The hub is detached." "detached HEAD prints the detached recovery guidance"
 git -C "$SHUB" checkout -q main
+
+# ── 10. #1410: a worktree under the hub whose .git LINK is gone ───────────────
+# Deleting a worktree's `.git` makes git walk UP to the hub: commits and pushes made
+# from that directory target the hub's branch and report success. From inside the
+# directory the fallback is invisible (both `$PWD` and `--show-toplevel` are the hub),
+# so the check is hub-side and is exercised from the hub here.
+echo ""
+echo "== #1410: an unlinked worktree under the hub =="
+HW="$FIX/hub1410"
+git init -q -b main "$HW"
+git -C "$HW" config user.email t@t
+git -C "$HW" config user.name t
+printf '.worktrees\n' > "$HW/.gitignore"
+touch "$HW/a.txt"
+git -C "$HW" add .
+git -C "$HW" commit -qm init
+hw_bare="$FIX/hub1410-origin.git"
+git init -q --bare -b main "$hw_bare"
+git -C "$HW" remote add upstream "$hw_bare"
+git -C "$HW" push -qu upstream main
+
+W1410="$HW/.worktrees/wt1410"
+git -C "$HW" worktree add -q "$W1410" -b wt1410 HEAD
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a healthy worktree leaves the hub PASS"
+assert_not_contains "$out" "worktree_unlinked" "…and prints no worktree_unlinked token"
+
+rm -f "$W1410/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an UNLINKED worktree → exit 1"
+assert_contains "$out" "HUB_DISORDER=worktree_unlinked" "…→ HUB_DISORDER=worktree_unlinked"
+assert_contains "$out" "$W1410" "…and names the directory that is no longer a worktree"
+assert_contains "$out" "#1410" "…and points at the issue"
+assert_contains "$out" "printf 'gitdir: %s" "…and prints a printf repair line"
+assert_contains "$out" "$HW/.git/worktrees/wt1410" "…naming the hub's own record for that worktree"
+
+mkdir -p "$HW/.worktrees/debris1410"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_contains "$out" "HUB_DISORDER=worktree_unlinked" "empty debris does not mask the broken worktree"
+
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wt1410" > "$W1410/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "restoring the link returns the hub to PASS (empty debris is not flagged)"
+
+# 10b. The --gh-report leg must SURVIVE a worktree_unlinked-only hub and carry the
+# guidance into the FILED body. This leg parses each disorder back out of the token
+# string; #1410 is a filesystem fact, so if it is not re-derived there the leg reaches
+# recovery_guide with an empty staleness class. A guide that appends nothing for that
+# class returns an EMPTY array, and `${lines[@]}` on an empty array is an unbound-variable
+# ABORT under `set -u` on bash 3.2 (#431 — same hazard the FAIL_LINES comment records):
+# the leg dies before filing, so the hub-disorder issue is never opened.
+git -C "$HW" remote add origin "https://github.com/daniel-ospina/tortoise.git" 2>/dev/null || true
+rm -f "$W1410/.git"
+rm -f "$GH_STUB_LOG"
+out="$(bash "$CHECK" --repo "$HW" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "worktree_unlinked + --gh-report exits 1"
+assert_not_contains "$out" "unbound variable" "…and does not abort on an empty guide array (#431 hazard)"
+assert_contains "$out" "opened hub-state issue" "…and files the hub-disorder issue"
+gh_body="$(cat "$GH_STUB_LOG" 2>/dev/null)"
+assert_contains "$gh_body" "worktree_unlinked" "…whose FILED body names the class"
+assert_contains "$gh_body" "printf 'gitdir: %s" "…and carries the repair command, not just stdout"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wt1410" > "$W1410/.git"
 
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"

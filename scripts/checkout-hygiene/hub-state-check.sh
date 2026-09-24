@@ -26,6 +26,15 @@
 #                local-only commit makes the hub not a mirror of upstream.
 #   no_upstream  on main, but no SAME-NAMED upstream ref resolves, so freshness
 #                is UNVERIFIABLE — never treated as PASS (#1313).
+#   worktree_unlinked  a NON-EMPTY directory under <hub>/.worktrees/ has no `.git`
+#                entry, so it is no longer a worktree: git walks UP and resolves it
+#                to the hub, and a session working there commits and pushes against
+#                `main` while every command reports success (#1410). Independent of
+#                the branch/freshness facts (it composes with them, like `dirty`);
+#                an EMPTY directory is debris, not an alias, and is not flagged.
+#                Detected HERE, hub-side, because the fallback is undetectable from
+#                the worktree itself: inside a pre-commit hook `$PWD` and
+#                `git rev-parse --show-toplevel` are BOTH the hub (measured).
 #
 # `off_main` suppresses the staleness class: a stranded branch's own tip is not
 # the hub's freshness.
@@ -84,8 +93,11 @@ GH_BIN="${GH_BIN:-gh}"
 # $1=on_main(0/1) $2=dirty(0/1) $3=stale(behind|diverged|no_upstream|"")
 # $4=repo $5=branch $6=upstream ref (the resolved remote-tracking ref, or "")
 # $7=that ref's remote (for the push in the content-carrying route; default origin)
+# $8=`unlinked_worktrees` output for this hub — one `dir|record` pair per LINE, or empty
+#    when that class is absent (#1410)
+# $9=the composed disorder token, used only by the empty-guard at the end
 recovery_guide() {
-  local on_main="$1" dirty="$2" stale="${3:-}" repo="$4" branch="$5" upstream="${6:-}" push_remote="${7:-origin}"
+  local on_main="$1" dirty="$2" stale="${3:-}" repo="$4" branch="$5" upstream="${6:-}" push_remote="${7:-origin}" unlinked="${8:-}" disorder_token="${9:-}"
   local lines=()
   if [[ "$branch" == "detached" || -z "$branch" ]]; then
     if [[ $dirty -eq 1 ]]; then
@@ -125,8 +137,11 @@ recovery_guide() {
     lines+=("cd $repo && git push origin $branch")
     lines+=("cd $repo && git checkout main && git pull --ff-only")
   else
-    # Clean + on main: the ONLY way to reach here is a staleness class (#1313).
+    # Clean + on main: here it is a staleness class (#1313) or an unlinked worktree
+    # (#1410, where the branch/freshness facts are all healthy). Both are handled without
+    # falling through to the unrecognised-class line, which exists for neither.
     case "$stale" in
+      "")          ;;   # #1410 only: no staleness class to report
       behind)
         lines+=("The hub is clean and on main, but BEHIND its upstream — the commits merged since are ABSENT, so an agent reading the hub gets a stale answer.")
         lines+=("Fast-forward it (#1309; repo-freshness's auto mode also clears this in the sibling hubs):")
@@ -156,7 +171,66 @@ recovery_guide() {
         ;;
     esac
   fi
+  if [[ -n "$unlinked" ]]; then
+    lines+=("")
+    lines+=("#1410 — worktree directory(ies) under .worktrees/ with NO .git link:")
+    while IFS='|' read -r d rec; do
+      [[ -n "$d" ]] || continue
+      lines+=("  $d")
+      if [[ -n "$rec" ]]; then
+        lines+=("    git resolves it UP to this hub: commits and pushes made there target")
+        lines+=("    '$branch' (the hub's branch) and report success. Repair with the hub's record:")
+        lines+=("      printf 'gitdir: %s\\n' '$rec' > '$d/.git'")
+      else
+        lines+=("    git resolves it UP to this hub, and the hub keeps NO record for it,")
+        lines+=("    so it is debris: remove it deliberately once you have checked it holds")
+        lines+=("    no work you need.")
+      fi
+    done <<<"$unlinked"
+  fi
+  # #431: an EMPTY array expands to an unbound variable under `set -u` on bash 3.2, so a
+  # guide that produced no lines would abort its caller instead of reporting. Every class
+  # above appends, but this keeps a future arm from turning "no guidance" into a crash.
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    lines+=("The hub is in disorder class '$disorder_token' — inspect: git -C $repo status -sb")
+  fi
   printf '%s\n' "${lines[@]}"
+}
+
+# #1410 — the unlinked-worktree set for a hub: one `dir|record` pair per LINE (empty when
+# the class is absent), consumed by recovery_guide's `while IFS='|' read -r d rec`.
+#
+# A NON-EMPTY directory under `<hub>/.worktrees/` with no `.git` entry is no longer a
+# worktree: git walks UP and resolves it to the hub, so a session working there commits
+# and pushes against the hub's branch while every command reports success.
+#
+# Detected hub-side because the fallback is undetectable from the worktree itself —
+# measured: inside a pre-commit hook `$PWD` and `git rev-parse --show-toplevel` are BOTH
+# the hub. The hub sees every worktree as a directory, and this script already runs at
+# session start, the placement that cannot be forgotten.
+#
+# `rec` is the hub's own record for that worktree (<hub>/.git/worktrees/<name>), resolved
+# so the printed repair is exact rather than a template, and so "the hub keeps no record"
+# reads as what it is (debris). It is matched on the worktree's place in the layout
+# (`.worktrees/<name>/.git`) rather than on the literal path: a symlinked prefix
+# (/tmp -> /private/tmp on macOS) would otherwise hide a record the hub really holds.
+unlinked_worktrees() { # $1=hub
+  local hub="$1" d rec r hw_records out=""
+  for d in "$hub"/.worktrees/*/; do
+    [[ -d "$d" ]] || continue
+    [[ -e "${d}.git" ]] && continue
+    d="${d%/}"
+    # An EMPTY directory is debris (a failed rm), not a checkout that can alias the hub.
+    [[ -n "$(ls -A "$d" 2>/dev/null || true)" ]] || continue
+    rec=""
+    hw_records="$(git -C "$hub" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$hub/.git")"
+    for r in "$hw_records"/worktrees/*/; do
+      [[ -f "${r}gitdir" ]] || continue
+      if [[ "$(cat "${r}gitdir" 2>/dev/null)" == *"/.worktrees/${d##*/}/.git" ]]; then rec="${r%/}"; break; fi
+    done
+    out="${out}${out:+$'\n'}${d}|${rec}"
+  done
+  printf '%s' "$out"
 }
 
 # Sets RESOLVED_UPSTREAM (the remote-tracking ref the hub is compared against,
@@ -276,10 +350,20 @@ for repo_arg in "${REPOS[@]}"; do
     fi
   fi
 
+  # #1410: a directory under this hub's .worktrees/ whose `.git` LINK is gone is no
+  # longer a worktree — git walks UP and resolves it to this hub, so a session working
+  # there commits and pushes against the hub's branch. Nothing else can see it: from
+  # inside the directory both `$PWD` and `git rev-parse --show-toplevel` are the hub
+  # (measured), and a pre-commit hook runs with that resolved cwd. The hub sees every
+  # worktree as a directory, so the detection lives here — and this script already runs
+  # at session start, which is the placement that cannot be forgotten.
+  UNLINKED="$(unlinked_worktrees "$MAIN_REPO")"
+
   disorder=""
   [[ $on_main -eq 0 ]] && disorder="off_main"
   [[ $dirty -eq 1 ]] && disorder="${disorder:+${disorder}+}dirty"
   [[ -n "$STALE" ]] && disorder="${disorder:+${disorder}+}${STALE}"
+  [[ -n "$UNLINKED" ]] && disorder="${disorder:+${disorder}+}worktree_unlinked"
   # Freshness fields appear only when an upstream was resolvable (a detached /
   # off-main / no-upstream FAIL has nothing to report here).
   fresh_fields=""
@@ -290,7 +374,7 @@ for repo_arg in "${REPOS[@]}"; do
   else
     echo "FAIL  $MAIN_REPO (branch=$BRANCH, porcelain=$PORCELAIN_COUNT$fresh_fields)"
     echo "HUB_DISORDER=$disorder branch=$BRANCH repo=$MAIN_REPO porcelain_count=$PORCELAIN_COUNT$fresh_fields ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    recovery_guide "$on_main" "$dirty" "$STALE" "$MAIN_REPO" "$BRANCH" "$UPSTREAM" "$UPSTREAM_REMOTE" | sed 's/^/  /' 
+    recovery_guide "$on_main" "$dirty" "$STALE" "$MAIN_REPO" "$BRANCH" "$UPSTREAM" "$UPSTREAM_REMOTE" "$UNLINKED" "$disorder" | sed 's/^/  /' 
     FAIL_LINES+=("$MAIN_REPO|$disorder|$BRANCH|$PORCELAIN_COUNT")
     FAIL=$((FAIL + 1))
   fi
@@ -334,7 +418,12 @@ if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
         resolve_upstream "$repo_path" "$branch" || true
         upstream="$RESOLVED_UPSTREAM"; upstream_remote="$RESOLVED_REMOTE"
       fi
-      guide="$(recovery_guide "$on_main" "$dirty" "$stale" "$repo_path" "$branch" "$upstream" "$upstream_remote")"
+      # #1410 is the one class the token string cannot carry back on its own (it is a
+      # filesystem fact about this hub), so it is re-derived with the SAME function the
+      # check uses — a second implementation is how the two sites would drift.
+      unlinked=""
+      [[ "$disorder" == *worktree_unlinked* ]] && unlinked="$(unlinked_worktrees "$repo_path")"
+      guide="$(recovery_guide "$on_main" "$dirty" "$stale" "$repo_path" "$branch" "$upstream" "$upstream_remote" "$unlinked" "$disorder")"
       body="Hub-discipline check FAILED for **$repo_path** at $ts.
 
 - \`HUB_DISORDER=$disorder\` (branch=\`$branch\`, porcelain=$porcelain_count)
