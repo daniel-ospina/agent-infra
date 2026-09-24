@@ -131,11 +131,14 @@ slice_job() {
 
 # strip_noise — drop full-line comments and QUOTE-AWARE trailing comments, then drop HEREDOC
 # BODIES. Only what remains can execute, so only what remains may count.
+# A `<<` is treated as a heredoc ONLY when it is a real redirection AND its terminator actually
+# appears later in the block. Otherwise `$((1 << 3))` or `echo "a << b"` would set a terminator
+# that never comes and swallow the rest of the step — which both false-blocks a real call and can
+# hide a refused one behind the noise (both reproduced by the bug-scan reviewer).
 strip_noise() {
   awk '
     BEGIN { sq = sprintf("%c", 39) }
     {
-      if (hd) { if ($0 ~ endre) hd = 0; next }
       line = $0; out = ""; q = 0; n = length(line)
       for (i = 1; i <= n; i++) {
         c = substr(line, i, 1)
@@ -147,21 +150,35 @@ strip_noise() {
         else if (q == 2 && c == sq) { q = 0 }
         out = out c
       }
-      p = index(out, "<<")
-      if (p > 0) {
-        rest = substr(out, p + 2)
-        sub(/^-/, "", rest)
-        sub(/^[ \t]+/, "", rest)
-        qc = substr(rest, 1, 1)
-        if (qc == "\"" || qc == sq) rest = substr(rest, 2)
-        word = ""
-        for (k = 1; k <= length(rest); k++) {
-          c = substr(rest, k, 1)
-          if (c ~ /[A-Za-z0-9_]/) word = word c; else break
+      text[NR] = out
+      total = NR
+    }
+    END {
+      i = 1
+      while (i <= total) {
+        out = text[i]
+        p = index(out, "<<")
+        opened = 0
+        if (p > 0 && substr(out, p + 2, 1) != "<" && (p == 1 || substr(out, p - 1, 1) != "<")) {
+          rest = substr(out, p + 2)
+          sub(/^-/, "", rest)
+          sub(/^[ \t]+/, "", rest)
+          qc = substr(rest, 1, 1)
+          if (qc == "\"" || qc == sq) rest = substr(rest, 2)
+          word = ""
+          for (k = 1; k <= length(rest); k++) {
+            c = substr(rest, k, 1)
+            if (c ~ /[A-Za-z0-9_]/) word = word c; else break
+          }
+          if (word != "" && substr(rest, 1, 1) != "<") {
+            endre = "^[ \t]*" word "$"
+            for (j = i + 1; j <= total; j++) {
+              if (text[j] ~ endre) { i = j + 1; print out; opened = 1; break }
+            }
+          }
         }
-        if (word != "" && substr(rest, 1, 1) != "<") { hd = 1; endre = "^[ \t]*" word "$"; print out; next }
+        if (opened == 0) { print out; i++ }
       }
-      print out
     }
   '
 }
@@ -182,12 +199,14 @@ run_blocks() {
       while (i <= length(line) && substr(line, i, 1) == " ") i++
       indent = i - 1
       body = substr(line, i)
-      # A `run:` line counts as a STEP only at the indentation of the step list. Without this, a
-      # key literally named `run` anywhere else in the job (a job-level `env:` entry, say) reads
-      # as a step, and a lane that invokes the runner NOWHERE passes the call-site arm.
-      if (list_indent == "" && body ~ /^- /) list_indent = indent
+      # A `run:` line counts as a STEP only at the indentation of the sequence under `steps:` —
+      # latched from the first list item DEEPER than `steps:`, never from the first `- ` in the
+      # job body (a strategy/matrix list before `steps:` would otherwise latch the wrong indent and
+      # every real step would stop being read).
+      if (body == "steps:") steps_indent = indent
+      if (steps_indent != "" && list_indent == "" && body ~ /^- / && indent > steps_indent) list_indent = indent
       isstep = 0
-      if (body ~ /^- /) { if (list_indent == "" || indent == list_indent) isstep = 1 }
+      if (list_indent != "" && body ~ /^- /) { if (indent == list_indent) isstep = 1 }
       else if (list_indent != "" && indent == list_indent + 2) isstep = 1
       if (isstep && body ~ ("^-? *" q "run" q " *: *[|>]")) { inblk = 1; blk_indent = indent; next }
       if (isstep && body ~ ("^-? *" q "run" q " *:")) {
@@ -227,7 +246,12 @@ refusal_keys() {
       line = $0
       sub(/^[ ]+/, "", line)
       sub(/^- /, "", line)
-      if (line ~ /^CI_LANE_[A-Za-z0-9_]*[ ]*:/) { print "CI_LANE_ENV"; next }
+      # A CI_LANE_* key is refused in EVERY spelling — quoting it, or using flow style, must not
+      # step around an arm that exists to stop the audited job configuring this guard.
+      nq = line
+      gsub(dq, "", nq)
+      gsub(sq, "", nq)
+      if (nq ~ /(^|[ \t{,[])CI_LANE_[A-Za-z0-9_]*[ \t]*:/) { print "CI_LANE_ENV"; next }
       if (index(line, ":") == 0) next
       key = line
       sub(/[ ]*:.*$/, "", key)
@@ -283,7 +307,7 @@ calls_runner() {
     BEGIN {
       sq = sprintf("%c", 39); dq = "\""
       q = "[" dq sq "]?"
-      pat = "^bash[ ]+" q rel q
+      pat = "^bash[ ]+" q "(\\./)?" rel q
     }
     {
       line = $0
@@ -352,7 +376,25 @@ else
   note "so nothing it calls can red a PR; exiting 2"
   exit 2
 fi
-pr_block="$(awk '/^[[:space:]]*pull_request:/{f=1} f && /^[a-zA-Z]/{f=0} f' "$PR_WORKFLOW" | grep -v '^[[:space:]]*#')"
+pr_block="$(awk '
+  /^[ ]*pull_request:/ {
+    f = 1; pi = 0
+    while (pi < length($0) && substr($0, pi + 1, 1) == " ") pi++
+    next
+  }
+  f {
+    ind = 0
+    while (ind < length($0) && substr($0, ind + 1, 1) == " ") ind++
+    # A comment (or a blank line) never ends a mapping: the pre-existing 8p fixture appends the
+    # paths lines AFTER the comments that follow `pull_request:`, and YAML still reads them as
+    # part of that block. Stopping on a comment would make the arm unable to see a real filter.
+    if ($0 != "" && substr($0, 1, 1) != "#" && ind <= pi) f = 0
+    if (f) print
+  }
+' "$PR_WORKFLOW" | grep -v '^[[:space:]]*#')"
+# The slice stops at the next key at the SAME indentation as `pull_request:` — not at the next
+# column-0 key. Otherwise a sibling `push:` block that legitimately filters paths would be read
+# as narrowing the pull_request trigger (a false block, reproduced by the bug-scan reviewer).
 # Whitespace is stripped before matching so every spelling of the same key is caught:
 # `paths :`, `paths-ignore :`, and flow style `{paths: [...], paths-ignore: [...]}` (which becomes
 # `{paths:[...]`), all of which parse as a narrowing filter and defeat an anchored line regex.
@@ -381,7 +423,7 @@ for lane in "PR:$PR_WORKFLOW:$PR_JOB" "main:$MAIN_WORKFLOW:$MAIN_JOB"; do
     note "guard's own CI_LANE_* inputs (a job that configures the gate is not coverage); exiting 2"
     exit 2
   fi
-  read -r n refused <<<"$(printf '%s\n' "$body" | run_blocks | fold_continuations | strip_noise | calls_runner "$RUNNER_REL")"
+  read -r n refused <<<"$(printf '%s\n' "$body" | run_blocks | strip_noise | fold_continuations | calls_runner "$RUNNER_REL")"
   if [ "$refused" -gt 0 ]; then
     err "$name lane job '$job' calls $RUNNER_REL in a form that cannot count as coverage — a"
     note "trailing flag (e.g. --list runs no shard), a pipe, an accumulator or other || /; tail"

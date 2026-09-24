@@ -281,7 +281,7 @@ fi
 echo ""
 echo "8h. FAILURE-RECORDING ARM — dropping it must make the RUNNER fail at runtime"
 sed 's/ || shard_errors=$((shard_errors + 1))//' "$TMP/runner-fast.sh" >"$TMP/runner-norecord.sh"
-if cmp -s "$RUNNER" "$TMP/runner-norecord.sh"; then
+if cmp -s "$TMP/runner-fast.sh" "$TMP/runner-norecord.sh"; then
   fail "the no-record mutation did not change the file"
 else
   bash "$TMP/runner-norecord.sh" >"$TMP/runner-norecord.out" 2>&1
@@ -354,7 +354,7 @@ echo "8d. RUNTIME SELF-CHECK — a neutered runner helper must fail, not report 
 # execution, so the runner can no longer claim it ran anything.
 awk '{ if ($0 ~ /^run_shard\(\) \{/) { print "run_shard() { :; }"; next } print }' \
   "$TMP/runner-fast.sh" >"$TMP/runner-neutered.sh"
-if cmp -s "$RUNNER" "$TMP/runner-neutered.sh"; then
+if cmp -s "$TMP/runner-fast.sh" "$TMP/runner-neutered.sh"; then
   fail "the neutered-helper mutation did not change the file"
 else
   bash "$TMP/runner-neutered.sh" >"$TMP/runner-neutered.out" 2>&1
@@ -707,6 +707,86 @@ if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'resolves outside this checko
   pass "a symlinked PARENT directory is refused (the leaf check alone would pass it)"
 else
   fail "a symlinked parent dir returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -1)"
+fi
+
+echo ""
+echo "8ab. FALSE-BLOCK CONTROLS — legitimate spellings must still be read as calls"
+# Each of these was a real false block found by the code-review bug scan. A guard that refuses a
+# lane which DOES call the runner is a category-B false block, and on a workflow nobody edited it
+# would block every PR.
+for spelling in "bash scripts/run-bash-shards.sh" "bash ./scripts/run-bash-shards.sh"; do
+  awk -v r="        run: bash scripts/run-bash-shards.sh" -v s="        run: $spelling" \
+    '{ if ($0 == r) { print s; next } print }' "$PR" >"$TMP/ci-pr-spell.yml"
+  guard_rc "$MAIN" "$TMP/ci-pr-spell.yml"
+  if [ "$RC" -eq 0 ]; then
+    pass "the equivalent spelling '$spelling' is accepted"
+  else
+    fail "the spelling '$spelling' was refused (rc $RC): $OUT"
+  fi
+done
+
+# A `<<` that is not a redirection (an arithmetic shift) must not swallow the rest of the step.
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: |"; print "          echo $((1 << 3))"; print r; next } print }' \
+  "$PR" >"$TMP/ci-pr-shift.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-shift.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "an arithmetic '<<' does not swallow the call that follows it"
+else
+  fail "an arithmetic '<<' false-blocked a real call (rc $RC): $OUT"
+fi
+
+# Same, when the swallowed region would also have hidden a refused site: both must be visible.
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: |"; print "          echo $((1 << 3))"; print "          bash scripts/run-bash-shards.sh"; print "          bash scripts/run-bash-shards.sh || true"; next } print }' \
+  "$PR" >"$TMP/ci-pr-shift2.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-shift2.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a refused site after an arithmetic '<<' is still refused (no hiding behind noise)"
+else
+  fail "a refused site after a '<<' returned rc $RC (want 2): $OUT"
+fi
+
+# A heredoc body whose line ends in a backslash must not swallow its own terminator.
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: |"; print "          cat <<EOF"; print "          body \\"; print "          EOF"; print r; next } print }' \
+  "$PR" >"$TMP/ci-pr-hdcont.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-hdcont.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a backslash inside a heredoc body does not eat the terminator or the call"
+else
+  fail "a heredoc body with a backslash false-blocked the call (rc $RC): $OUT"
+fi
+
+# A matrix list before `steps:` must not latch the step indent.
+awk '{ print } /^  bash-suites:$/ { inb = 1; next } inb && /^    runs-on: ubuntu-latest$/ { print "    strategy:"; print "      matrix:"; print "        os:"; print "          - ubuntu-latest"; inb = 0 }' \
+  "$PR" >"$TMP/ci-pr-matrix.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-matrix.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a strategy/matrix list before steps: does not hide the steps"
+else
+  fail "a matrix list before steps: false-blocked the call (rc $RC): $OUT"
+fi
+
+# A sibling `push:` block that filters paths must not be read as narrowing pull_request.
+awk '{ print; if ($0 ~ /^  pull_request:$/) { print "  push:"; print "    paths:"; print "      - \x27scripts/**\x27" } }' \
+  "$PR" >"$TMP/ci-pr-pushpaths.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-pushpaths.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a paths filter on a sibling push: trigger is not attributed to pull_request"
+else
+  fail "a sibling push: paths filter refused the lane (rc $RC): $OUT"
+fi
+
+echo ""
+echo "8ac. A QUOTED CI_LANE_* KEY → rc 2 (the refusal arm is not spelling-blind)"
+awk '{ print } /^  bash-suites:$/ { inb = 1; next } inb && /^    runs-on: ubuntu-latest$/ { print "    env:"; print "      \"CI_LANE_MIN_SUITES\": \"0\""; inb = 0 }' \
+  "$PR" >"$TMP/ci-pr-quotedlane.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-quotedlane.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a quoted CI_LANE_* key exits 2 (quoting is not an escape)"
+else
+  fail "a quoted CI_LANE_* key returned rc $RC (want 2): $OUT"
 fi
 
 bash "$GUARD" --no-such-flag >"$TMP/badflag.out" 2>&1
