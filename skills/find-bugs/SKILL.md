@@ -99,7 +99,7 @@ See [research-protocol Quick Reference](../reference/research-protocol/SKILL.md#
 
 ### Phase 4.5 — External Vulnerability Cross-Reference (NEW)
 
-For each HIGH-confidence finding, run 1 targeted `perplexity_search`:
+For each HIGH-confidence finding, run 1 targeted external-search query **via the [research skill's Step 0.0 search ladder](../research/SKILL.md)** — rung 1 `perplexity_search` only if `mcp_load seo-intelligence` succeeds; otherwise rung 2 `web_search` with `model="sonar"` passed **explicitly** (never the gated models), or rung 3 `web_fetch` for primary sources. Name the tool + model + rung in the output — never substitute silently. Query:
 - `"[pattern description] security vulnerability CVE known exploit"`
 
 This catches patterns that are independently known vulnerabilities beyond OWASP checklists. Cap: 1 search per HIGH finding, max 5 searches total. Skip if no HIGH-confidence findings.
