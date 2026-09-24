@@ -193,6 +193,17 @@ strip_noise() {
 run_blocks() {
   awk '
     BEGIN { sq = sprintf("%c", 39); dq = "\""; q = "[" dq sq "]?" }
+    # flushacc — emit a pending FOLDED block as its one joined logical line and empty the buffer.
+    # Called on a dedent, in END, and BEFORE a new block starts: two consecutive `run: >` steps
+    # otherwise dropped the first one entirely (a fail-open, reproduced by the bug-scan reviewer).
+    function flushacc() {
+      if (nacc > 0) {
+        joined = acc[1]
+        for (kk = 2; kk <= nacc; kk++) joined = joined acc[kk]
+        print joined
+        nacc = 0
+      }
+    }
     {
       line = $0
       i = 1
@@ -211,7 +222,8 @@ run_blocks() {
       if (list_indent != "" && body ~ /^- /) { if (indent == list_indent) isstep = 1 }
       else if (list_indent != "" && indent == list_indent + 2) isstep = 1
       if (isstep && body ~ ("^-? *" q "run" q " *: *[|>]")) {
-        inblk = 1; blk_indent = indent; blk_fold = (body ~ /[>]/); nacc = 0
+        flushacc()
+        inblk = 1; blk_indent = indent; blk_fold = (body ~ /[>]/)
         next
       }
       if (isstep && body ~ ("^-? *" q "run" q " *:")) {
@@ -238,7 +250,7 @@ run_blocks() {
           else print line
           next
         }
-        if (blk_fold) { joined = acc[1]; for (k = 2; k <= nacc; k++) joined = joined acc[k]; print joined; nacc = 0 }
+        flushacc()
         blk_fold = 0
         inblk = 0
       }
@@ -246,13 +258,7 @@ run_blocks() {
     # A folded block scalar that ends at EOF must still be flushed: the bash-suites step IS the
     # last step of the last job in ci.yml, so without this its folded call was never emitted and
     # the lane read as calling nothing (a false block).
-    END {
-      if (nacc > 0) {
-        joined = acc[1]
-        for (k = 2; k <= nacc; k++) joined = joined acc[k]
-        print joined
-      }
-    }
+    END { flushacc() }
   '
 }
 
@@ -429,7 +435,7 @@ pr_block="$(awk '
     if ($0 != "" && firstc != "#" && ind <= pi) f = 0
     if (f) print
   }
-' "$PR_WORKFLOW")"
+' "$PR_WORKFLOW" | grep -v '^[[:space:]]*#')"
 # The slice stops at the next key at the SAME indentation as `pull_request:` — not at the next
 # column-0 key. Otherwise a sibling `push:` block that legitimately filters paths would be read
 # as narrowing the pull_request trigger (a false block, reproduced by the bug-scan reviewer).

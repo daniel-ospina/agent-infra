@@ -866,6 +866,43 @@ else
   fail "'steps:' with a trailing comment returned rc $RC (want 0): $OUT"
 fi
 
+echo ""
+echo "8ai. TWO CONSECUTIVE FOLDED STEPS → the first is not dropped (a pending fold must flush)"
+awk '
+  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; pend = 1; next }
+  pend && /^        run: bash scripts\/run-bash-shards\.sh$/ { pend = 0; next }
+  { print }
+' "$PR" >"$TMP/ci-pr-twofold.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-twofold.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a refused folded step followed by a bare folded step exits 2 (the first fold is not lost)"
+else
+  fail "two consecutive folded steps returned rc $RC (want 2): $OUT"
+fi
+
+awk '
+  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; pend = 1; next }
+  pend && /^        run: bash scripts\/run-bash-shards\.sh$/ { pend = 0; next }
+  { print }
+' "$PR" >"$TMP/ci-pr-twofoldok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-twofoldok.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "two consecutive bare folded steps are both read (no false block from the flush)"
+else
+  fail "two bare folded steps returned rc $RC (want 0): $OUT"
+fi
+
+echo ""
+echo "8aj. A COMMENT MENTIONING paths: → rc 0 (a comment is not a filter)"
+awk '{ print; if ($0 ~ /^  pull_request:$/) { print "    # NOTE: a paths: filter is deliberately NOT used here" } }' \
+  "$PR" >"$TMP/ci-pr-commentpaths.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-commentpaths.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a comment mentioning 'paths:' does not read as a narrowing filter"
+else
+  fail "a comment mentioning 'paths:' was read as a filter (rc $RC): $OUT"
+fi
+
 bash "$GUARD" --no-such-flag >"$TMP/badflag.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/badflag.out")"
