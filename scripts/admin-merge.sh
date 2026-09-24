@@ -1631,21 +1631,24 @@ residual_of() {
 #                                   merge_group, workflow_dispatch, and every
 #                                   event NOT in the list above.
 # That is a DENY-list of the observed non-code events, deliberately: an
-# UNRECOGNISED event BLOCKS (fail closed). The bulk run map is ONE bounded
-# `gh run list` window, so a run created after that listing was taken (or one an
-# event-scoped listing omits) can be MISSING from it; such a run is resolved
-# INDIVIDUALLY by its own run id (#1446) before the verdict is taken, because
-# otherwise a non-code base red reads as unresolved and fail-closes into a
-# code-measuring red that blocks every stale-surface PR (the observed
-# `finding-provenance` / `issues` shape). A red check whose run id cannot be
-# resolved AT ALL — a non-Actions app, or a run the individual resolve cannot
-# read either — still BLOCKS: "I could not tell what this is" is not "this is
-# noise", and the two cases must stay DISTINGUISHABLE (never default an
-# unresolved run to exempt).
+# UNRECOGNISED event BLOCKS (fail closed). The run map is a SNAPSHOT — one
+# bounded, branch- or sha-scoped `gh run list` (and an EMPTY one when that
+# listing fails) — so it can simply not carry a red's run. A red whose run the
+# snapshot does not carry is resolved INDIVIDUALLY by its own run id (#1446)
+# before the verdict is taken, because otherwise a non-code base red reads as
+# unresolved and fail-closes into a code-measuring red that blocks every
+# stale-surface PR (the observed `finding-provenance` / `issues` shape: that run
+# WAS inside the window when re-checked, so the miss is a snapshot miss, not a
+# cap). WHY a particular snapshot missed it is deliberately not assumed. A red
+# check whose run id cannot be resolved AT ALL — a non-Actions app, or a run the
+# individual resolve cannot read either — still BLOCKS: "I could not tell what
+# this is" is not "this is noise", and the two cases must stay DISTINGUISHABLE
+# (never default an unresolved run to exempt).
 #
 # ONE `gh run list` resolves them all (id -> event, workflow name), so no single
-# red costs an extra call UNLESS the map missed it — then exactly ONE per-run
-# `gh api .../actions/runs/<id>` is spent on that red (the #1446 resolve above).
+# red costs an extra call UNLESS the snapshot did not carry it — then exactly
+# ONE per-run `gh api .../actions/runs/<id>` is spent on that red (the #1446
+# resolve below).
 # The listing is fetched ONLY when a red exists. BOUNDED at
 # 200 runs; the probed commit is the newest one, so its runs sit at the top. The
 # listing is selected by branch for a branch ref and by --commit for a sha.
@@ -1983,13 +1986,14 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
           ev="$(awk -F'\t' -v id="$run_id" '$1 == id { print $2; exit }' "$map_file")"
           wf="$(awk -F'\t' -v id="$run_id" '$1 == id { print $3; exit }' "$map_file")"
         fi
-        # ── #1446: RESOLVE A RUN THE BOUNDED BULK MAP MISSED ────────────────
-        # The map is ONE bounded `gh run list` window (MAIN_HEALTH_RUN_MAP_LIMIT),
-        # so a run created after that listing was taken — or one an event-scoped
-        # listing omits — is simply absent from it. Left unresolved, a
-        # `schedule`/`issues` base red would classify as code-measuring and step
-        # 4.6 would refuse every stale-surface PR (the observed
-        # `finding-provenance` refusal). Resolve THIS run by its own id instead.
+        # ── #1446: RESOLVE A RUN THE SNAPSHOT DID NOT CARRY ─────────────────
+        # The map above is a SNAPSHOT — one bounded, branch- or sha-scoped
+        # `gh run list` (empty when that listing fails) — so it can simply not
+        # carry a red's run. Left unresolved, a `schedule`/`issues` base red
+        # would classify as code-measuring and step 4.6 would refuse every
+        # stale-surface PR (the observed `finding-provenance` refusal — a run
+        # that WAS inside the window when re-checked). Resolve THIS run by its
+        # own id instead.
         # THE TWO CASES STAY DISTINGUISHABLE and only one of them is exempt:
         #   * the resolve SUCCEEDS and names a non-code event -> `ev` is set and
         #     the existing base-side exemption below applies;

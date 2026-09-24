@@ -5986,6 +5986,86 @@ grep -q "(workflow unresolved)" "$SCEN/err" && pass "…and it stays UNRESOLVED"
   || fail "the malformed answer was accepted as a resolution"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a malformed resolution" || pass "no merge attempted"
 
+# (e) THE MAP STAYS THE PRIMARY SOURCE — the per-run resolve is a FALLBACK. A red
+# the map DOES carry must cost no per-run call, and its verdict must not move.
+new_scen noncode-mapresolved-precedence
+HEAD_NC7="eeee000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC7" > "$SCEN/head"
+lane_pass "$HEAD_NC7" 5945 > "$SCEN/runs-$HEAD_NC7"
+lane_pass mainnc7 5946 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5015 'ci / lint' completed success 7345 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7345 pull_request 'CI'
+write_main_checks "$(check_run 6015 provenance completed failure 8405 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+# The map HAS the event, and a fixture also exists for 8405 — so a rail that
+# resolves it anyway (dropping the `[ -z "$ev" ]` guard) records the call.
+main_run_map 8405 issues finding-provenance
+printf 'issues\tfinding-provenance\n' > "$SCEN/run-8405"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a red the MAP carries is still exempt and merges (the map is still primary)" \
+  || fail "a map-resolved non-code red blocked (exit $rc)"
+grep -q "actions/runs/8405" "$SCEN/calls" && fail "the rail spent a per-run resolve on a red the map already resolved — the fallback is no longer a fallback" \
+  || pass "…and NO per-run call was spent on a red the map resolved"
+
+# (f) THE EVALUATED TREE STILL BLOCKS A NON-CODE RED — through the per-run
+# resolve too. The #1353 contract is SURFACE-scoped, so a non-code red on the
+# PR's tree is an anomaly and BLOCKS whether its event came from the map or from
+# the new resolve. This pins that the resolve did not open the tree surface.
+new_scen noncode-tree-resolved
+HEAD_NC8="efef000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC8" > "$SCEN/head"
+lane_pass "$HEAD_NC8" 5947 > "$SCEN/runs-$HEAD_NC8"
+lane_pass mainnc8 5948 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5016 provenance completed failure 8406)"
+# The TREE map does NOT carry 8406; the per-run resolve answers `schedule`.
+pr_run_map 8309 push 'Python CI'
+printf 'schedule\tregistry-backup-cron\n' > "$SCEN/run-8406"
+main_green_surface
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a non-code red on the EVALUATED TREE still BLOCKS, per-run-resolved or not (exit $rc)" \
+  || fail "a non-code red on the evaluated tree was exempted — the #1353 hole reopened"
+grep -q "NOT EXEMPT ON THIS SURFACE" "$SCEN/err" && pass "…with the surface-scoped reason named" \
+  || fail "the tree refusal does not state the exemption is base-only"
+grep -q "actions/runs/8406" "$SCEN/calls" && pass "…after the per-run resolve was attempted on the tree too" \
+  || fail "the tree probe did not attempt the per-run resolve"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a tree red" || pass "no merge attempted"
+
+# (g) THE RESOLVE'S PROJECTION IS ITSELF PINNED. The fake `gh` answers the
+# per-run call by `cat`-ing an ALREADY-PROJECTED fixture and IGNORES `--jq`, so a
+# wrong field order/name in the rail's expression would pass every arm above
+# while the fix is silently ineffective in production (the #1446 over-block
+# returns, suite green). Section 64 guards the merge-state projection this way;
+# do the same for the resolve.
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq is unavailable, so the resolve projection cannot be exercised"
+else
+  RJQ="$(sed -n "s/^.*--jq '\(\[(.event.*\)' 2>.*$/\1/p" "$ADM" | head -1)"
+  [ -n "$RJQ" ] && pass "the rail's per-run resolve --jq expression is present and extractable" \
+    || fail "could not extract the resolve --jq expression from the rail"
+  rproj() { printf '%s' "$1" | jq -r "$RJQ" 2>/dev/null; }
+  t="$(rproj '{"event":"issues","name":"finding-provenance"}')"
+  [ "$t" = "$(printf 'issues\tfinding-provenance')" ] \
+    && pass "the projection emits <event><TAB><workflow>" \
+    || fail "the projection emitted [$t]"
+  t="$(rproj '{"event":"push","name":"issues"}')"
+  [ "$t" = "$(printf 'push\tissues')" ] \
+    && pass "…with the EVENT first — a swapped field order cannot pass" \
+    || fail "the projection's field order is not event-then-name ([$t])"
+  t="$(rproj '{}')"
+  [ "$t" = "$(printf '\t')" ] \
+    && pass "…an empty run projects to an EMPTY event, so the rail blocks it" \
+    || fail "an empty run projected to [$t]"
+  t="$(rproj '{"event":"issues\npush","name":"wf"}')"
+  if [ "$(printf '%s' "$t" | wc -l | tr -d ' ')" = "0" ]; then
+    pass "…and a newline inside the event is ESCAPED, so it cannot forge a second field"
+  else
+    fail "a newline in the event produced a RAW newline — a lenient parse could read a forged event ([$t])"
+  fi
+fi
+
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
