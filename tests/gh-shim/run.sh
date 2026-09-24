@@ -59,8 +59,15 @@ new_scen() {
 }
 
 # A body that satisfies the certifying contract, bound to <head>.
+# (#1388) The residual clause is the producer's CURRENT spelling — `blocked by the
+# decision: 0` — and the attribution line must state a zero drop count, or the
+# zero is not a MEASURED zero and the certificate is not valid. A fixture that
+# pinned the retired spelling went stale the day the producer moved (bcbb7df) and
+# was one of the reasons six days passed with every suite green; the contract
+# itself is now pinned against a real captured body by
+# tests/admin-merge-evidence-contract/run.sh.
 cert_body() {
-  printf '<!-- admin-merge-safety: %s -->\nPR head: %s\ntest lane: python-ci.yml\nmain compared (union of 7 runs of python-ci.yml): a:1\nPR failing: 15 | main failing: 19 | unique to this PR: 0\n' "$1" "$1"
+  printf '<!-- admin-merge-safety: %s -->\nPR head: %s\ntest lane: python-ci.yml\nmain compared (union of 7 runs of python-ci.yml): a:1\nPR failing: 15 | main failing: 19 | blocked by the decision: 0\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n' "$1" "$1"
 }
 
 # run through the fake real-gh for every invocation (AGENT_GH_REAL is exported).
@@ -120,7 +127,7 @@ grep -q "pr merge" "$SCEN/calls" && fail "a stale-head merge reached the real gh
 new_scen split
 jq -n '{headRefOid:"'"$HEAD_A"'",comments:[
   {body:"<!-- admin-merge-safety: '"$HEAD_A"' -->\nPR head: '"$HEAD_A"'"},
-  {body:"main compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 0 | unique to this PR: 0"}]}' > "$SCEN/pr.json"
+  {body:"main compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 0 | blocked by the decision: 0\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0."}]}' > "$SCEN/pr.json"
 bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
 [ "$rc" -ne 0 ] && pass "a marker in one comment + a verdict in another → REFUSED (exit $rc)" \
   || fail "the contract was satisfied ACROSS two comments — a forgery class"
@@ -229,10 +236,12 @@ for shape in '--repo owner/other' '--repo=owner/other' '-R owner/other' '-Rowner
 done
 
 # (d) The verifier's zero clause must not accept a LARGER number beginning with 0.
-printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | unique to this PR: 0.5\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-half"
+#     The attribution line is present so the ONLY reason this refuses is the
+#     boundary — otherwise the test would pass for the wrong reason.
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | blocked by the decision: 0.5\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-half"
 bash "$VERIFY" --body-file "$TMP/body-half" --head "$HEAD_A" >/dev/null 2>&1 \
-  && fail "\`unique to this PR: 0.5\` certified — a non-zero residual passed" \
-  || pass "\`unique to this PR: 0.5\` does NOT certify (the zero clause is exact)"
+  && fail "\`blocked by the decision: 0.5\` certified — a non-zero residual passed" \
+  || pass "\`blocked by the decision: 0.5\` does NOT certify (the zero clause is exact)"
 
 # ── 9. the shapes VGATE cycle 2 found open (fail-open, fixed) ─────────────
 echo "== 9. the test seam, endpoint case, GraphQL, and value-flag completeness ="
@@ -287,10 +296,10 @@ grep -q -- "--repo owner/other" "$SCEN/calls" \
 
 # (f) …and the zero clause must not accept a delimiter that only LOOKS like a number.
 for evil in '0,5' '0x' '0/9'; do
-  printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | unique to this PR: %s\n' "$HEAD_A" "$HEAD_A" "$evil" > "$TMP/body-evil"
+  printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | blocked by the decision: %s\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n' "$HEAD_A" "$HEAD_A" "$evil" > "$TMP/body-evil"
   bash "$VERIFY" --body-file "$TMP/body-evil" --head "$HEAD_A" >/dev/null 2>&1 \
-    && fail "\`unique to this PR: $evil\` certified" \
-    || pass "\`unique to this PR: $evil\` does NOT certify"
+    && fail "\`blocked by the decision: $evil\` certified" \
+    || pass "\`blocked by the decision: $evil\` does NOT certify"
 done
 
 # ── 10. the shapes VGATE cycle 3 found open (fail-open / hang, fixed) ──────

@@ -59,19 +59,70 @@ case "${HEAD:-}" in
 esac
 
 # One jq pass, ONE comment at a time: `select` appears inside the per-comment
-# pipeline, so every clause must hold for the SAME comment. `contains` (not
-# `test`) for the literal phrases — no regex escaping to get wrong.
-jq_program='[ .comments[].body
-  | select(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
-  | select(contains("PR head: '"$HEAD"'"))
-  | select(contains("main compared (union of "))
-  | select(test("unique to this PR: 0([ \t\r\n]|$)"))
-] | length'
+# pipeline, so every clause must hold for the SAME comment. Literal phrases use
+# `contains`; the clauses whose SHAPE carries the guarantee (provenance, the
+# count line, the attribution) use `test`, because a substring cannot express
+# "a well-formed zero".
+#
+# CLAUSE 4 (#1388): the producer RENAMED this field in bcbb7df (2026-09-17,
+# #3756/PR #1147) from `unique to this PR: 0` to `blocked by the decision: 0`,
+# in four places, and both gates kept requiring the OLD name — which refused
+# every admin merge fleet-wide for six days. The producer's vocabulary is the
+# contract; the gate follows it. Verified against the emission site
+# (scripts/admin-merge.sh:2250) before writing it here.
+#
+# CLAUSE 5 (#1388 §3): the zero must be MEASURED and COMPARABLE, not merely
+# printed — otherwise swapping a strong claim for a weaker one would be a net
+# LOOSENING of this gate.
+#   * `PR=0 | main=0` (the attribution line, admin-merge.sh:3318) is the
+#     positive test that the parser dropped NO token. A clipped set is not a
+#     measured zero, so a zero over it does not certify.
+#   * when the comparison was VACUOUS (`measured sets: PR failing …`), require
+#     the positive line `lane parity: PR ⊇ main` (value built at
+#     admin-merge.sh:3354, printed at :3412). `lane parity: NOT ESTABLISHED`
+#     therefore does NOT certify — #1319's own rule, a vacuous comparison is
+#     not comparable without parity.
+# THE CLAUSES MIRROR THE PRODUCER'S REAL EMISSION AND ARE SHAPE-CHECKED, not
+# substring-matched. The first cut of this change used bare `contains` for the
+# provenance, count and attribution clauses, and the main-only suite immediately
+# showed three fail-opens it had introduced: `union of 1 banana` (provenance
+# unverified), `blocked by the decision: 0.5` / `01` (the zero unbounded), and a
+# bare `PR=0 | main=0` that also matches the unrelated `Failing runs examined:`
+# line. A substring test cannot say "this is a well-formed zero"; a regex can, and
+# this is exactly the precision the retired shim implementation had.
+#
+# `\b` is NOT enough to bound the zero, which is worth stating because it looks
+# like it is: in `0.5` there IS a word boundary between `0` and `.`, so `0\b`
+# accepts a fractional residual. The clause therefore requires the zero to be
+# followed by whitespace or end-of-line — which is precisely how the producer
+# emits it (`printf 'PR failing: %s | main failing: %s | blocked by the decision:
+# 0\n'`, admin-merge.sh:2250), verified at the emission site.
+#
+# The provenance lane is spelled `( of .+)?:` GREEDILY and not a character class:
+# a lane may be named by a workflow NAME, and `gh` accepts names containing `:`
+# and `()` — `--workflow 'CI: tests'` and `--workflow 'tests (unit)'` both emit
+# valid rail evidence, and a narrow class refused a legitimate merge (cycle-3
+# review of the retired implementation). The tolerance is carried over, not
+# re-invented.
+#
+# The refusal vocabulary (`CLIPPED`, `NOT COMPARABLE`, `UNATTRIBUTABLE`) is
+# deliberately NOT matched: the attribution area prints those words as
+# UNCONDITIONAL explanatory prose in every evidence comment, including the clean
+# ones, so a bare `contains` on them would refuse every certificate.
+CLAUSE_FILTER='(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
+  and (contains("PR head: '"$HEAD"'"))
+  and (test("main compared \\(union of [0-9]+ runs?( of .+)?\\):"))
+  and (test("PR failing:\\s*[0-9]+\\s*\\|\\s*main failing:\\s*[0-9]+\\s*\\|\\s*blocked by the decision:\\s*0([ \\t\\r\\n]|$)"))
+  and (test("PR=0 \\| main=0\\.([ \\t\\r\\n]|$)"))
+  and ((contains("measured sets: PR failing") | not) or test("(^|\\n)[ \\t]*lane parity: PR ⊇ main"))'
+jq_program='[ .comments[].body | select('"$CLAUSE_FILTER"') ] | length'
 
 if [ -n "$BODY_FILE" ]; then
-  # Offline mode: the body is the whole input, so wrap it as one comment.
+  # Offline mode: the body is the whole input, so wrap it as one comment. The
+  # clause filter is the SAME string as the live path — one implementation of the
+  # contract, so the two cannot drift apart (#1388 clause 6).
   body="$(cat "$BODY_FILE")"
-  count="$(jq -n --arg b "$body" "[ \$b | select(contains(\"<!-- admin-merge-safety: $HEAD -->\")) | select(contains(\"PR head: $HEAD\")) | select(contains(\"main compared (union of \")) | select(test(\"unique to this PR: 0([ \t\r\n]|$)\")) ] | length" 2>/dev/null)"
+  count="$(jq -n --arg b "$body" "[ \$b | select($CLAUSE_FILTER) ] | length" 2>/dev/null)"
 else
   count="$("$GH" pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json comments --jq "$jq_program" 2>/dev/null)"
 fi

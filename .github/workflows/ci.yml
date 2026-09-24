@@ -147,6 +147,16 @@ jobs:
         # suite drives the real shim through a real shell with the splices that
         # defeated the string scanner, and asserts refusal.
         run: bash tests/gh-shim/run.sh
+      - name: Certificate contract suite (#1388)
+        # The ONE contract, pinned against a REAL captured evidence comment rather
+        # than a hand-written fixture. bcbb7df (#3756) renamed the producer's
+        # residual clause and BOTH gates kept requiring the old name; every admin
+        # merge was refused fleet-wide for six days with every suite green, because
+        # a hand-written fixture cannot notice that the producer moved. This suite
+        # extracts the required literals FROM the gate, asserts each exists in real
+        # evidence, mutates the producer's clause one word and requires refusal, and
+        # pins clause 6 — that the TS gate owns no copy of the clause set.
+        run: bash tests/admin-merge-evidence-contract/run.sh
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
