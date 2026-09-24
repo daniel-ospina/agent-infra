@@ -3932,6 +3932,15 @@ test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
     "a residual of '0.5' never certifies (the zero clause is exact, not a substring)");
   ok(!evidenceBodyIsCertifying(good.replace("PR=0 | main=0.", "PR=0 | main=01."), MARK),
     "an attribution count of '01' never certifies (the clause is bounded)");
+  // #1429: the PR side must be a MEASURED zero; the MAIN side is DISCLOSED. The
+  // producer emits `main=${main_drops}` (admin-merge.sh:3319) and a main-side drop
+  // under-reports the BASELINE, which can only make the residual look larger — the
+  // false-block direction. A disclosed count therefore certifies, while staying a
+  // BOUNDED canonical integer so it cannot be widened into "anything".
+  ok(evidenceBodyIsCertifying(good.replace("PR=0 | main=0.", "PR=0 | main=3."), MARK),
+    "a DISCLOSED main-side drop count (PR=0 | main=3) certifies (#1429 — the tortoise#5003 shape)");
+  ok(!evidenceBodyIsCertifying(good.replace("PR=0 | main=0.", "PR=0 | main=-1."), MARK),
+    "a non-canonical main-side count never certifies (the disclosed count is a bounded integer)");
   // A MEASURED zero requires the attribution line: without it the zero cannot be
   // distinguished from an unmeasured one.
   ok(!evidenceBodyIsCertifying(good.replace(ATTR, ""), MARK),
@@ -3951,6 +3960,13 @@ test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
   const PARITY_POSITIVE = "lane parity: PR ⊇ main — the PR executed every test shard main's lane executed (parity family: ci*; 3 shard(s) on the PR side, 3 on main)";
   ok(evidenceBodyIsCertifying(vac.replace("lane parity: NOT ESTABLISHED — declared off", PARITY_POSITIVE), MARK),
     "a vacuous comparison WITH the producer's established-parity sentence certifies (clause 5)");
+  // …but on a VACUOUS body the main-side zero is LOAD-BEARING: it is half of the
+  // condition that selects the parity branch, and the producer's own `main side:`
+  // prose reads it as "EMPTY because the lane is GREEN". A clipped main baseline
+  // can produce that zero without the lane being green, so a disclosed main-side
+  // clip must NOT certify here (#1429) — while on a REAL comparison it does.
+  ok(!evidenceBodyIsCertifying(vac.replace("lane parity: NOT ESTABLISHED — declared off", PARITY_POSITIVE).replace("PR=0 | main=0.", "PR=0 | main=3."), MARK),
+    "a VACUOUS body with a disclosed main-side clip (main=3) never certifies (the main-side zero is load-bearing there, #1429)");
   // …and the negation a confirming review reproduced one spelling further in: the
   // em dash is a SEPARATOR, not a truth value, so a negation can follow it. Both
   // spellings must refuse, and this pair is the test that keeps that closed.

@@ -113,6 +113,19 @@ if certifies "$TMP/vac-par.md"; then
 else
   bad "vacuous + positive parity was REFUSED (clause 5 is unsatisfiable)"
 fi
+# …and the VACUOUS case is exactly where main's drop count must still be ZERO
+# (#1429). The main-side zero is load-bearing there: it is half of the condition
+# that selects the parity branch, and the producer's own `main side:` prose reads
+# that zero as "EMPTY because the lane is GREEN" (admin-merge.sh:3414). A CLIPPED
+# main baseline can produce the zero without the lane being green, so a disclosed
+# main-side clip on a vacuous body must NOT certify — while the same disclosure on
+# a REAL comparison does (that is #5003's `PR failing: 0 | main failing: 1`).
+sed 's/PR=0 | main=0/PR=0 | main=3/' "$TMP/vac-par.md" > "$TMP/m-vac-main3.md"
+if grep -q 'PR=0 | main=3\.' "$TMP/m-vac-main3.md"; then
+  if certifies "$TMP/m-vac-main3.md"; then bad "a VACUOUS body with a disclosed main-side clip (main=3) CERTIFIED — the main-side zero is load-bearing in the vacuous branch (#1429)"; else ok "mutation: vacuous + a disclosed main-side clip refuses (main=0 is required when the comparison is vacuous)"; fi
+else
+  bad "the vacuous main=3 mutation did not apply, so it proves nothing"
+fi
 
 # ── 4. MUTATIONS — each must flip the verdict ───────────────────────────────
 # (a) ONE WORD of the producer's own clause. This is the #1388 mutation: the
@@ -218,7 +231,29 @@ if certifies "$TMP/m-zero01.md"; then bad "'blocked by the decision: 01' CERTIFI
 sed 's/PR=0 | main=0/PR=0 | main=01/' "$POS" > "$TMP/m-attr01.md"
 if certifies "$TMP/m-attr01.md"; then bad "a dropped-token count of '01' CERTIFIED (the attribution clause is not bounded)"; else ok "mutation: an '01' attribution count refuses (bounded)"; fi
 sed 's/PR=0 | main=0/PR=0 | main=2/' "$POS" > "$TMP/m-attr2.md"
-if certifies "$TMP/m-attr2.md"; then bad "a dropped main-side token CERTIFIED (clause 5 fail-open)"; else ok "mutation: a main-side dropped token refuses"; fi
+if certifies "$TMP/m-attr2.md"; then ok "a DISCLOSED main-side drop count (PR=0 | main=2) CERTIFIES (#1429)"; else bad "a DISCLOSED main-side drop count was REFUSED — that is the #1429 false block, and it is exactly the tortoise#5003 shape (PR=0 | main=3.)"; fi
+# …and the count stays BOUNDED while it is disclosed: the class is a canonical
+# non-negative integer, so a sign, a fraction, a leading zero, an empty value or a
+# non-numeric value all refuse. `main=01` above already pins the leading zero; these
+# pin the rest of the class so "disclosed" cannot be widened into "anything".
+for bad_main in '-1' '3.5' '0.0' '' 'x' '3e0'; do
+  sed "s/PR=0 | main=0/PR=0 | main=${bad_main}/" "$POS" > "$TMP/m-attr-bad.md"
+  if certifies "$TMP/m-attr-bad.md"; then bad "an attribution main-side count of '${bad_main}' CERTIFIED (the disclosed count is not a bounded canonical integer)"; else ok "mutation: a non-canonical main-side count ('${bad_main}') refuses"; fi
+done
+# …and the #5003 shape ITSELF — PR green (`PR failing: 0`), main red
+# (`main failing: 1`), a disclosed main-side drop count. `$POS` cannot catch a
+# regression that keys vacuity on the PR side alone (`PR failing: 0 |`), because
+# `$POS` still carries the producer's vacuous-block PROSE while its counts are
+# non-vacuous; this mutation removes that accident.
+sed 's/^PR failing: 2 | main failing: 7 | blocked by the decision: 0/PR failing: 0 | main failing: 1 | blocked by the decision: 0/; s/PR=0 | main=0/PR=0 | main=3/' "$POS" > "$TMP/m-5003.md"
+if grep -q 'PR failing: 0 | main failing: 1 | blocked by the decision: 0' "$TMP/m-5003.md"; then
+  if certifies "$TMP/m-5003.md"; then ok "the tortoise#5003 shape (PR failing: 0 | main failing: 1, PR=0 | main=3.) CERTIFIES"; else bad "the tortoise#5003 shape was REFUSED — the #1429 false block is back"; fi
+else
+  bad "the #5003-shape mutation did not apply, so it proves nothing"
+fi
+# …and multi-digit values are legitimate, so the bound is not accidentally a single digit.
+sed 's/PR=0 | main=0/PR=0 | main=12/' "$POS" > "$TMP/m-attr-ok.md"
+if certifies "$TMP/m-attr-ok.md"; then ok "a multi-digit disclosed main-side count (PR=0 | main=12) CERTIFIES"; else bad "a multi-digit disclosed main-side count was REFUSED (the bound is too tight)"; fi
 # (g) ZEROING BOTH COUNTS must newly REQUIRE parity — the counterpart of 1b. A
 #     body whose comparison came out vacuous is held to clause 5's parity
 #     requirement even though it carries no vacuous-state PROSE.

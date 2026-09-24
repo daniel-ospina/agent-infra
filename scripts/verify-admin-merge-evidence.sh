@@ -16,7 +16,17 @@
 #   <!-- admin-merge-safety: <HEAD> -->   the marker, bound to the CURRENT head
 #   PR head: <HEAD>                       the body names the same revision
 #   main compared (union of …             the comparison actually happened
-#   … unique to this PR: 0                the residual is zero
+#   … blocked by the decision: 0          the residual is zero — the producer's
+#                                         CURRENT clause. `… unique to this PR: 0`
+#                                         is the retired spelling (renamed by
+#                                         bcbb7df, #3756/#1147) and does not
+#                                         certify: the producer can no longer
+#                                         prove that stronger claim when the set
+#                                         is clipped or not measurable.
+#   PR=0 | main=<n>.                      the PR-side drop count is a MEASURED zero
+#                                         (`PR=0`); main's is DISCLOSED, a bounded
+#                                         canonical integer (#1429 — main-side
+#                                         drops are the false-block direction)
 #
 # Env:
 #   AGENT_GH_REAL   the real gh binary (set by the shim; default: `gh`). It must NOT
@@ -74,9 +84,42 @@ esac
 # CLAUSE 5 (#1388 §3): the zero must be MEASURED and COMPARABLE, not merely
 # printed — otherwise swapping a strong claim for a weaker one would be a net
 # LOOSENING of this gate.
-#   * `PR=0 | main=0` (the attribution line, admin-merge.sh:3319) is the
-#     positive test that the parser dropped NO token. A clipped set is not a
-#     measured zero, so a zero over it does not certify.
+#   * `PR=0` (the attribution line, admin-merge.sh:3319) is the positive test
+#     that the parser dropped NO token ON THE PR SIDE. A clipped PR set is not a
+#     measured zero, so a zero over it does not certify — that is the whole
+#     soundness rule, and it is one-sided on purpose.
+#
+#     THE MAIN SIDE IS DISCLOSED WHEN THE COMPARISON IS REAL, AND ZERO WHEN IT IS
+#     VACUOUS (#1429). The producer emits `main=${main_drops}`
+#     (`admin-merge.sh:3319`) and that count is NOT clamped: a main-side `FAILED`
+#     token that is not a test id is dropped, named and counted, and the
+#     certificate is still posted. Requiring the literal `main=0`
+#     UNCONDITIONALLY therefore refuses a legitimate certificate (measured on real
+#     evidence: tortoise#5003 head f32af08d carries `PR=0 | main=3.`).
+#
+#     The reason `main=0` was never the guard for a REAL comparison: a main-side
+#     drop under-reports the BASELINE, which can only make the residual look
+#     LARGER — the producer states this at its own main-side handling
+#     (`admin-merge.sh:2663-2665` "Deliberately NOT applied to the MAIN side … a
+#     false block, whose designed remedy is the retry path"; `:2715-2717` "still
+#     a CLIPPED measurement and is named as one"). So the false-certificate
+#     direction is the PR side, and only `PR=0` is load-bearing there.
+#
+#     IT *IS* THE GUARD WHEN THE COMPARISON IS VACUOUS. When
+#     `PR failing: 0 | main failing: 0`, the main-side zero is LOAD-BEARING: it is
+#     half of the condition that selects the parity branch, and the producer's own
+#     `main side:` prose reads that zero as "EMPTY because the lane is GREEN"
+#     (`admin-merge.sh:3414`). A CLIPPED main baseline can produce that zero
+#     without the lane being green, so the certificate would certify a claim its
+#     own evidence contradicts. `main=0` is therefore required EXACTLY in the
+#     vacuous case — which is also the case #1388's decision scoped clause 5 to
+#     ("the non-vacuous case … needs clauses 1–4 only") and the case #1347/#1353
+#     guard is about. #5003 is non-vacuous (`main failing: 1`).
+#     Main's count stays BOUNDED (`(0|[1-9][0-9]*)`, no leading zeros) where it is
+#     disclosed: `main=01`, `main=-1`, `main=3.5`, `main=3e0` and `main=` all
+#     refuse, as does a disclosed count on a vacuous body. `PR=0` remains
+#     mandatory everywhere, so `PR=2` (a clipped PR set) still refuses — the
+#     #1347/#1353 guard is preserved, not loosened.
 #   * when BOTH counts are zero — `PR failing: 0 | main failing: 0` — the
 #     comparison was VACUOUS, so the positive line `lane parity: PR ⊇ main`
 #     (value built at admin-merge.sh:3354, printed at :3412) is required.
@@ -189,7 +232,9 @@ CLAUSE_FILTER='(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
   and (contains("<!-- admin-merge-safety: "))
   and (test("main compared \\(union of [0-9]+ runs?( of .+)?\\):"))
   and (test("PR failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*main failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*blocked by the decision:\\s*0([ \\t\\r\\n]|$)"))
-  and (test("PR=0 \\| main=0\\.([ \\t\\r\\n]|$)"))
+  and (test("PR=0 \\| main=(0|[1-9][0-9]*)\\.([ \\t\\r\\n]|$)"))
+  and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not)
+       or (test("PR=0 \\| main=0\\.([ \\t\\r\\n]|$)")))
   and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not)
        or (test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( \\(parity family: [^;\\n[:cntrl:]\\x{2028}\\x{2029}]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")
            and ([match("lane parity:[^\\n]*"; "g") | .string
