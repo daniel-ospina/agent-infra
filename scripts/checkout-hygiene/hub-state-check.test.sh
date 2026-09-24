@@ -594,9 +594,9 @@ rm -f "$WUNREAD/.git"
 chmod 000 "$HW/.git/worktrees/wtunread1410/gitdir"
 out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "an unreadable worktree record → exit 1 (fail-closed, not a silent PASS)"
-assert_contains "$out" "UNREADABLE worktree record" "…and is reported as unverifiable"
+assert_contains "$out" "UNVERIFIABLE worktree record" "…and is reported as unverifiable"
 chmod 644 "$HW/.git/worktrees/wtunread1410/gitdir"
-printf 'gitdir: %s\n' "$WUNREAD/.git" > "$WUNREAD/.git"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wtunread1410" > "$WUNREAD/.git"
 
 # 10f. A worktree OUTSIDE the hub cannot resolve up to it, so the guide must not claim that
 # it does (the repair is the same; the stated hazard is not).
@@ -609,6 +609,53 @@ assert_contains "$out" "sits OUTSIDE this hub" "…and the hazard is stated per-
 apply_repair "$out" 2>/dev/null || true
 assert_contains "$(git -C "$WOUTSIDE" rev-parse --show-toplevel 2>/dev/null)" "$WOUTSIDE" \
   "…and its repair works too"
+
+# 10g. HEALTH IS RESOLUTION, NOT EXISTENCE (#1410). A `.git` that is PRESENT but is not this
+# worktree's admin dir — a file naming another gitdir, or a symlink to the hub's own `.git` —
+# leaves git resolving the directory to the HUB, so a commit there lands on the hub's branch.
+# Measured: rc=0 "hub discipline holds" for all of these while `git -C <wt> rev-parse
+# --abbrev-ref HEAD` was the hub's branch.
+WW="$HW/.worktrees/wronglink1410"
+git -C "$HW" worktree add -q "$WW" -b wronglink1410 HEAD
+rm -f "$WW/.git"
+printf 'gitdir: %s\n' "$HW/.git" > "$WW/.git"          # a well-formed link to the WRONG gitdir
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a .git present but pointing at the hub's gitdir → exit 1 (not a healthy hub)"
+assert_contains "$out" "$WW" "…and names that worktree"
+assert_contains "$out" "is not this worktree's link" "…and says the entry is the wrong link"
+assert_contains "$out" "rm -f" "…and prints a remove-then-replace repair, not a bare write"
+apply_repair "$out" 2>/dev/null || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the printed repair restores it"
+assert_contains "$(git -C "$WW" rev-parse --absolute-git-dir 2>/dev/null)" ".git/worktrees/wronglink1410" \
+  "…so the directory resolves to its OWN record, not the hub's"
+
+# 10h. The repair must not write THROUGH a symlink: a bare `>` follows it and creates the link
+# at its target, in an unrelated directory.
+WV="$HW/.worktrees/symlink1410"
+git -C "$HW" worktree add -q "$WV" -b symlink1410 HEAD
+rm -f "$WV/.git"
+VICTIM="$FIX/victim1410"
+ln -s "$VICTIM" "$WV/.git"                              # dangling symlink
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a symlinked .git that is not this worktree's link → exit 1"
+apply_repair "$out" 2>/dev/null || true
+assert_eq "$([ -e "$VICTIM" ] && echo present || echo absent)" "absent" \
+  "…and the repair does not create the link at the symlink's TARGET"
+assert_contains "$(git -C "$WV" rev-parse --absolute-git-dir 2>/dev/null)" ".git/worktrees/symlink1410" \
+  "…and the worktree is restored"
+
+# 10i. A record that does not name a `.../.git` link cannot be verified, so it is reported —
+# never skipped as if the hub were healthy (the same doctrine as an unreadable record).
+WF2="$HW/.worktrees/mangled1410"
+git -C "$HW" worktree add -q "$WF2" -b mangled1410 HEAD
+rm -f "$WF2/.git"
+printf '%s \n' "$WF2/.git" > "$HW/.git/worktrees/mangled1410/gitdir"   # trailing space
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a mangled record with a genuinely missing link → exit 1"
+assert_contains "$out" "UNVERIFIABLE worktree record" "…and is reported as unverifiable"
+printf '%s\n' "$WF2/.git" > "$HW/.git/worktrees/mangled1410/gitdir"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/mangled1410" > "$WF2/.git"
 
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"

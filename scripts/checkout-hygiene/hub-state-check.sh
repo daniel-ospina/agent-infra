@@ -186,8 +186,8 @@ recovery_guide() {
         '!'*) n="${line#!}"
             lines+=("  $n worktree record(s) could not be shown safely (a path contains a")
             lines+=("  newline) — inspect the hub's .git/worktrees directory by hand.") ;;
-        $'T\t'*)
-            d="${line#$'T\t'}"
+        $'T\t'*|$'X\t'*)
+            case "$line" in $'T\t'*) d="${line#$'T\t'}" ;; *) d="${line#$'X\t'}" ;; esac
             IFS= read -r rec || rec=""
             lines+=("  $d")
             case "$d" in
@@ -196,11 +196,17 @@ recovery_guide() {
               *)         lines+=("    git no longer treats it as a worktree. It sits OUTSIDE this hub,")
                          lines+=("    so it does not resolve to it.") ;;
             esac
-            lines+=("    Restore the hub's link:")
-            lines+=("      printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
+            case "$line" in
+              $'T\t'*) lines+=("    Restore the hub's link:")
+                        lines+=("      printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
+              *)        lines+=("    The .git entry THERE is not this worktree's link — inspect it, then")
+                        lines+=("    replace the entry (rm -f removes the entry itself, never what a")
+                        lines+=("    symlink points at; a directory needs a deliberate look first):")
+                        lines+=("      rm -f $(printf '%q' "$d/.git") && printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
+            esac ;;
         $'M\t'*) IFS= read -r rec || rec=""
-            lines+=("  UNREADABLE worktree record: $rec")
-            lines+=("  (its worktree cannot be verified — inspect the record, then the hub's list)") ;;
+            lines+=("  UNVERIFIABLE worktree record: $rec")
+            lines+=("  (its worktree cannot be checked — inspect the record, then the hub's list)") ;;
       esac
     done <<<"$unlinked"
   fi
@@ -238,7 +244,7 @@ recovery_guide() {
 #
 # `rec` is that record, so the printed repair is exact rather than a template.
 unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the record, two lines per entry
-  local hub="$1" r dir raw out="" records mark bad=0 nl=$'\n' tab=$'\t' 
+  local hub="$1" r dir raw out="" records mark bad=0 resolved="" nl=$'\n' tab=$'\t' 
   records="$(git -C "$hub" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$hub/.git")"
   for r in "$records"/worktrees/*/; do
     [[ -d "$r" ]] || continue
@@ -259,18 +265,33 @@ unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the reco
             dir="${r}/${raw}"
             dir="${dir%/.git}" ;;
     esac
-    [[ "$mark" == "M" || "$raw" == */.git ]] || continue   # an unexpected shape is not our class
     # Canonicalize EVERY directory, not just relative records: git's record and the hub's
     # `$repo` (derived from a logical pwd) otherwise live in different canonical domains, and
     # the guide's "is this inside the hub?" test would misclassify an in-hub worktree.
     if [[ -n "$dir" ]]; then
       dir="$( (cd "$dir" 2>/dev/null && pwd -P) || printf '%s' "$dir" )"
     fi
+    # A record that does not name a `.../.git` link cannot be verified, so it is REPORTED
+    # (never skipped as if the hub were healthy — the #1313 no_upstream doctrine).
+    if [[ "$mark" == "T" && "$raw" != */.git ]]; then mark="M"; fi
+    # The directory must still exist to be anyone's working directory; a record whose
+    # directory is gone is `git worktree prune`'s business, not a silent hub alias.
+    if [[ "$mark" == "T" && ! -d "$dir" ]]; then continue; fi
     if [[ "$mark" == "T" ]]; then
-      # The directory must still exist to be anyone's working directory; a record whose
-      # directory is gone is `git worktree prune`'s business, not a silent hub alias.
-      [[ -d "$dir" ]] || continue
-      [[ -e "${dir}/.git" ]] && continue                   # healthy: the link is there
+      # HEALTH IS RESOLUTION, NOT EXISTENCE (#1410, measured). A `.git` that is PRESENT but
+      # is not this worktree's admin dir — a file naming another gitdir, a symlink to the
+      # hub's, an empty or junk DIRECTORY — still leaves git resolving the directory to the
+      # hub, where commits and pushes land on the hub's branch with no error. Ask git the
+      # question it will actually answer: which git dir does THIS directory resolve to?
+      resolved="$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" || resolved=""
+      resolved="$( (cd "$resolved" 2>/dev/null && pwd -P) || printf '%s' "$resolved" )"
+      [[ "$resolved" == "$r" ]] && continue    # healthy: it resolves to its own record
+      # The link is wrong. When an entry EXISTS it is reported (`X`), never repaired blind:
+      # the printed repair's `rm -f` is what makes the write safe (a bare `>` would FOLLOW a
+      # symlink and create the link at its target, in an unrelated directory). `-L` is
+      # required as well as `-e`: a DANGLING symlink fails `-e` (which follows the link), and
+      # measured, that is exactly the shape that let the bare write through to its target.
+      if [[ -e "${dir}/.git" || -L "${dir}/.git" ]]; then mark="X"; fi
     fi
     # The transport is line-oriented, so a field carrying a newline cannot ride in it: it
     # would split one entry into two and print a repair for the WRONG directory. Such a
@@ -278,8 +299,8 @@ unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the reco
     if [[ "$r" == *$'\n'* || "$dir" == *$'\n'* ]]; then bad=$((bad + 1)); continue; fi
     # $nl/$tab keep the separator out of the nested quoting above (a `$'\n'` inside
     # `${x:+...}` is literal text, not a newline — it must not ride in the transport).
-    if [[ "$mark" == "T" ]]; then out="${out}${out:+$nl}T${tab}${dir}${nl}${r}"
-    else out="${out}${out:+$nl}M${tab}${nl}${r}"; fi
+    if [[ "$mark" == "M" ]]; then out="${out}${out:+$nl}M${tab}${nl}${r}"
+    else out="${out}${out:+$nl}${mark}${tab}${dir}${nl}${r}"; fi
   done
   [[ "$bad" -gt 0 ]] && out="!${bad}${out:+$nl}${out}"
   printf '%s' "$out"
