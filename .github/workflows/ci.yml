@@ -318,6 +318,13 @@ jobs:
         run: python3.12 tools/fleet/lane_liveness.test.py
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Kill-switch / session-escape suite (#1419)
+        # #1419 — the deadlock escape. Zero-dependency (node stdlib + tsx), so it
+        # MUST run in THIS job, which performs no `npm ci`; it is also invoked
+        # post-merge from ci-main.yml. It pins the escape's CHANNEL as well as its
+        # behaviour: the state lives on `globalThis`, so two module instances (the
+        # loader gives every extension its own graph) still share one escape.
+        run: npx tsx extensions/shared/kill-switch.test.ts
       - name: Skill-enforcer suite (#1321/#1322, zero-dep)
         # #1321 — under the DEPLOYED (symlinked) layout the manifest was resolved
         # from the farm directory rather than the real module, so the extension

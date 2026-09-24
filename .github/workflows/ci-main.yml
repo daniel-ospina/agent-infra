@@ -83,6 +83,7 @@ jobs:
           case "$t" in
             extensions/shared/print-mode.test.ts|extensions/shared/print-mode-wiring.test.ts) continue ;;
             extensions/shared/dispatch-record.test.ts) continue ;;
+            extensions/shared/kill-switch.test.ts) continue ;;  # #1419 — run explicitly below
           esac
           echo "== $t =="
           npx tsx "$t" || failures=$((failures+1))
@@ -122,6 +123,17 @@ jobs:
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
         echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
         npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
+        # #1419 — the deadlock escape. `KILL_SWITCH_FILE` was a FREE identifier in
+        # loop-enforcer (5 uses, 0 definitions/imports), so every write threw
+        # ReferenceError into a swallowed catch and the documented escape was inert
+        # while still advertising a guarantee. The agent escape is now session-local
+        # and the machine-global switch stays the human's, so the suite covers the
+        # no-active-loop path, the single-home invariant, the call ORDER inside
+        # `stop`, and — because pi's loader gives every extension its own module
+        # graph — that the escape CHANNEL is process-global rather than module-local
+        # (the first version of this fix shipped the module-local bug).
+        echo "== extensions/shared/kill-switch.test.ts =="
+        npx tsx extensions/shared/kill-switch.test.ts || failures=$((failures+1))
         # #1321/#1322 — skill-enforcer: manifest resolution under the deployed
         # symlink layout (the `dirname(__filename)` farm bug #1321), a repeated
         # manifest line clobbering a skill's other rules, and layout-independent
