@@ -416,14 +416,23 @@ diff_hash_for_pr() { # <pr>
        "repos/$REPO/pulls/$pr" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
     LEGACY_DIFF_HASH="$(openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
     if command -v python3 >/dev/null 2>&1 && [ -f "$DIFF_NORMALIZER" ] \
-       && python3 "$DIFF_NORMALIZER" < "$tmp" > "$norm" 2>/dev/null; then
+       && [ -s "$DIFF_NORMALIZER" ] \
+       && python3 "$DIFF_NORMALIZER" < "$tmp" > "$norm" 2>/dev/null \
+       && [ -s "$norm" ]; then
       DIFF_HASH="$(openssl dgst -sha256 < "$norm" | awk '{print $NF}')"
     else
       # Fail OPEN to the pre-#1362 raw digest: the consumer still accepts it as
       # the legacy hash, so the marker stays verifiable — but a base-only update
       # will keep refusing carry-forward. Name that loudly rather than minting a
       # digest no consumer can verify.
-      echo "⚠️ #1362: the diff normalizer is unavailable (need python3 + $DIFF_NORMALIZER) — hashing the RAW diff; a base-only update will keep refusing carry-forward until it is installed" >&2
+      #
+      # `[ -s ]` on the SOURCE and on the OUTPUT is load-bearing (#1362 review):
+      # a zero-byte normalizer exits 0 and prints NOTHING, so without the output
+      # check `$norm` is empty and DIFF_HASH becomes sha256("") — a CONSTANT that
+      # collides for every diff and lets the carry-forward arm mint head-bound
+      # evidence for an unreviewed revision (a false accept). Absent, unreadable,
+      # failing, and empty all take this raw-digest arm.
+      echo "⚠️ #1362: the diff normalizer is unavailable or produced no output (need a non-empty python3 + $DIFF_NORMALIZER) — hashing the RAW diff; a base-only update will keep refusing carry-forward until it is installed" >&2
       DIFF_HASH="$LEGACY_DIFF_HASH"
     fi
   fi

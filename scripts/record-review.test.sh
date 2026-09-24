@@ -914,6 +914,22 @@ assert_contains "$RECORD_ERR" "diff normalizer is unavailable" "12e fail-open: t
 assert_contains "$RECORD_CAP" "diff=$RH" "12e fail-open: the marker carries the RAW digest (a verifiable legacy hash)"
 if grep -qF "diff=$NH" <<<"$RECORD_CAP"; then bad "12e fail-open: the marker must NOT carry a normalized digest when the normalizer is missing"; else ok "12e fail-open: no normalized digest is minted without the normalizer"; fi
 
+# M_EMPTYLIB — the normalizer EXISTS but is EMPTY (a truncated / non-atomic
+# farm: setup.sh copies the lib in place). `python3 empty.py` exits 0 and prints
+# NOTHING, so without an output guard DIFF_HASH becomes sha256("") — a CONSTANT
+# that collides for EVERY diff and lets the carry-forward arm mint head-bound
+# evidence for an unreviewed revision. The producer must treat empty output
+# exactly like an absent normalizer (raw fallback), never mint the constant.
+mkdir -p "$T/mut-emptylib/lib"
+cp "$RECORD" "$T/mut-emptylib/record-review.sh"
+: > "$T/mut-emptylib/lib/diff-normalize.py"
+NPR_m=424715; rm -f "$(Q2 $NPR_m)"
+run_record_diff_with "$T/mut-emptylib/record-review.sh" "$NPR_m" "$SHA" "body" "$NFX2"
+[ "$RECORD_RC" = "0" ] && ok "12e fail-open: an EMPTY normalizer still records (rc 0)" || bad "12e fail-open: empty normalizer blocked the record (rc=$RECORD_RC)"
+assert_contains "$RECORD_ERR" "produced no output" "12e fail-open: the empty normalizer is warned about loudly"
+assert_contains "$RECORD_CAP" "diff=$RH" "12e fail-open: the empty-normalizer marker carries the RAW digest"
+if grep -qF 'diff=e3b0c442' <<<"$RECORD_CAP"; then bad '12e fail-open: the marker carries sha256("") — a CONSTANT digest that collides for every diff'; else ok '12e fail-open: no sha256("") constant is minted from an empty normalizer'; fi
+
 # ── 12f THE BINARY FAIL-OPEN (2026-09-23 amendment) ──────────────────────
 # A binary entry has NO hunk, so its `index` line is its ONLY content-bearing
 # field (`Binary files … differ` is content-independent). Before the amendment

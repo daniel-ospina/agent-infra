@@ -114,10 +114,12 @@ echo "── hermetic suites ─────────────────
 # Every suite below is hermetic (temp repos / temp HOME / stubbed tools, no network).
 #
 # PROVENANCE, and one caveat: these lines were moved out of ci-main.yml's `script-validate`, so
-# each keeps the note that workflow carried. Five of them are ALSO run by a dedicated per-PR job in
-# ci.yml — the four marked "post-merge re-check of a per-PR job", plus pi-bootstrap. That
+# each keeps the note that workflow carried. Six of them are ALSO run by a dedicated per-PR job in
+# ci.yml — the five marked "(also a per-PR job in ci.yml)" (four "post-merge re-check of a per-PR
+# job" plus pi-bootstrap) and script/diff-normalize.test.sh, whose dedicated step is added by #1362
+# D1. That
 # duplication is deliberate here: this file is the ONE list both lanes run, so the PR lane runs
-# those five twice (once in their own job, once inside this list). Dropping them from this list to
+# those six twice (once in their own job, once inside this list). Dropping them from this list to
 # save the minutes would recreate the second, hand-kept list that #1369 exists to remove — the
 # alternative is to retire the dedicated jobs and let this list be the PR lane's only coverage,
 # which changes PR feedback granularity and is the owner's call, not a silent edit.
@@ -130,7 +132,7 @@ run_shard scripts/pi-task-session-prune.test.sh                            # #78
 run_shard scripts/pi-reap-worktrees.test.sh                                # #1095 worktree reaper gates
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
 run_shard scripts/record-review.test.sh                                    # #1348 THE INCIDENT: runner-only rc=127 shipped green
-run_shard scripts/diff-normalize.test.sh                                  # #1362 D1 review-evidence diff normalizer (one impl, shared with the gate)
+run_shard scripts/diff-normalize.test.sh                                  # #1362 D1 review-evidence diff normalizer (one impl, shared with the gate) (also a per-PR job in ci.yml)
 run_shard tests/admin-merge/run.sh                                         # #930 safe-admin-merge rail (also a per-PR job in ci.yml)
 run_shard tests/atomic-land/run.sh                                         # #1367 atomic land unit (also a per-PR job in ci.yml)
 run_shard tests/gh-shim/run.sh                                             # #984 argv-level gh shim (also a per-PR job in ci.yml)

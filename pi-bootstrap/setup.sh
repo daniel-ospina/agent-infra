@@ -329,19 +329,39 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 lib_srcs=(pid-identity.sh diff-normalize.py)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
+lib_failed=0
 for base in "${lib_srcs[@]}"; do
   f="$INFRA_ROOT/scripts/lib/$base"
-  [ -f "$f" ] || continue
+  if [ ! -f "$f" ]; then
+    echo "    scripts lib farm: MISSING $f — a declared sibling did not land, so the producer will fall back to the RAW digest" >&2
+    lib_failed=$((lib_failed+1))
+    continue
+  fi
   dest="$DEST/scripts/lib/$base"
   if [ -L "$dest" ]; then
     echo "    replacing farm symlink with real copy: lib/$base"
     rm -f "$dest"
   fi
-  cp -f "$f" "$dest"
-  chmod +x "$dest" 2>/dev/null || true
-  lib_copied=$((lib_copied+1))
+  # Atomic install (#1362 review): copy to a sibling temp then rename, so a
+  # concurrent reader (record-review.sh runs during merges; this farm runs at
+  # session_start) can NEVER observe a truncated/zero-byte lib. An empty
+  # normalizer exits 0 printing nothing, which would hash the EMPTY string into
+  # a constant digest — a false accept — so the reader also guards `[ -s ]`.
+  if cp -f "$f" "$dest.tmp.$$" 2>/dev/null \
+     && chmod +x "$dest.tmp.$$" 2>/dev/null \
+     && mv -f "$dest.tmp.$$" "$dest" 2>/dev/null; then
+    lib_copied=$((lib_copied+1))
+  else
+    echo "    scripts lib farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
+    rm -f "$dest.tmp.$$"
+    lib_failed=$((lib_failed+1))
+  fi
 done
-echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py, #1178)"
+if [ "$lib_failed" -gt 0 ]; then
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py, #1178)" >&2
+else
+  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py, #1178)"
+fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
 # (templates/launchd/com.eldato.lane-liveness.plist) runs

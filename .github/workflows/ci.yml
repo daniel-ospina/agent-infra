@@ -144,10 +144,12 @@ jobs:
       - name: Review-evidence diff normalizer (#1362 D1)
         # The ONE implementation of the diff normalization the review-evidence
         # digest is computed over, plus the three byte-level D1 properties
-        # (base-move invariant, content change, whitespace change). The
-        # PRODUCER integration, the raw-hash backward-compat arm and the four
-        # mutation pins live in scripts/record-review.test.sh §12, which runs
-        # post-merge in ci-main.yml — not here.
+        # (base-move invariant, content change, whitespace change). This is a
+        # dedicated per-PR step AND the suite is registered in the one shard
+        # list (scripts/run-bash-shards.sh) that both lanes run — same
+        # deliberate double-run as the admin-merge suites above. The producer's
+        # integration pins live in scripts/record-review.test.sh §12, which is
+        # likewise in the shard list, so it runs in BOTH lanes.
         run: bash scripts/diff-normalize.test.sh
       - name: Argv-level admin-merge guard suite (#984)
         # The layer that makes obfuscation irrelevant: the shim inspects its OWN argv,
