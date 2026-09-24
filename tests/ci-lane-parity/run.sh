@@ -852,6 +852,67 @@ for key in BASH_ENV PROMPT_COMMAND; do
 done
 
 echo ''
+echo '8ac5. defaults.run.shell -> rc 2 (the SAME knob one level up: the step never executes)'
+# `defaults.run.shell: 'true {0}'` runs the step as `true <file>` — exit 0, runner never executed —
+# while the step's own `run:` still reads as the bare call. Job-level and workflow-level spellings
+# (the workflow-level one reaches EVERY job, so auditing the named job alone is not enough).
+awk '{ print; if ($0 ~ /^  bash-suites:$/) { j = 1; next } if (j && $0 ~ /^    runs-on: ubuntu-latest$/) { print "    defaults:"; print "      run:"; print "        shell: \x27true {0}\x27"; j = 0 } }' \
+  "$PR" >"$TMP/ci-pr-dshell.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-dshell.yml"
+if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q 'defaults.run.shell'; then
+  pass "a job-level defaults.run.shell exits 2 and names the key"
+else
+  fail "a job-level defaults.run.shell returned rc $RC (want 2, naming it): $OUT"
+fi
+awk 'NR == 1 { print; print "defaults:"; print "  run:"; print "    shell: \x27true {0}\x27"; next } { print }' \
+  "$PR" >"$TMP/ci-pr-wfdshell.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-wfdshell.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a workflow-level defaults.run.shell exits 2 (it reaches every job)"
+else
+  fail "a workflow-level defaults.run.shell returned rc $RC (want 2): $OUT"
+fi
+
+# The control: `defaults.run.shell: bash` is the shipped shell and must stay accepted — without
+# this, a guard that refused every `defaults:` key would make the two pins above vacuous.
+awk 'NR == 1 { print; print "defaults:"; print "  run:"; print "    shell: bash"; next } { print }' \
+  "$PR" >"$TMP/ci-pr-dshell-ok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-dshell-ok.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "defaults.run.shell: bash is NOT a false block (rc 0)"
+else
+  fail "defaults.run.shell: bash was refused (rc $RC): $OUT"
+fi
+
+echo ''
+echo '8ac6. AN EMPTY pull_request VALUE -> rc 0 (no filter can narrow; not a false block)'
+for spec in '{}' '[]'; do
+  awk -v v="$spec" 'NR == 1 { print "on:"; print "  pull_request: " v; skip = 1 } skip && /^  pull_request:$/ { next } /^on:$/ { next } { print }' \
+    "$PR" >"$TMP/ci-pr-emptytrig.yml"
+  guard_rc "$MAIN" "$TMP/ci-pr-emptytrig.yml"
+  if [ "$RC" -eq 0 ]; then
+    pass "pull_request: $spec is accepted (an empty value carries no filter)"
+  else
+    fail "pull_request: $spec returned rc $RC (want 0): $OUT"
+  fi
+done
+
+echo ''
+echo '8ac7. A DUPLICATED SHARD LIST -> rc 2 (a repeated target is not extra coverage)'
+# 13 of the 14 lines pointed at one cheap script: any length floor is satisfied while 13 suites
+# never run (ledger-sourced, cycle 2 — the substitution variant of the runner-body residual).
+awk -v cheap="scripts/check-no-sigpipe-grep.sh" '
+  /^run_shard [a-z]/ && n < 13 { print "run_shard " cheap; n++; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-dupes.sh"
+guard_rc "$MAIN" "$PR" "$TMP/runner-dupes.sh"
+if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q 'duplicate'; then
+  pass "a runner listing the same script 13 times exits 2 and says why"
+else
+  fail "a duplicated shard list returned rc $RC (want 2, naming duplicates): $OUT"
+fi
+
+echo ''
 echo '8ad. A FOLDED block scalar (`run: >`) joins its lines -> the tail is visible'
 awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; next } print }' \
@@ -936,10 +997,14 @@ awk '
   { print }
 ' "$PR" >"$TMP/ci-pr-twofold.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-twofold.yml"
-if [ "$RC" -eq 2 ]; then
-  pass "a refused folded step followed by a bare folded step exits 2 (the first fold is not lost)"
+# rc 0 is correct here, and this pin used to assert 2: the second (bare, folded) step IS the call,
+# so the lane executes the full list, while the first folded step only mentions the runner. A
+# mention is refused only when it STANDS IN for the call (`exact === 0`) — a lane that carries the
+# bare call somewhere is not a bypass, and refusing it would over-block an extra `--list` step.
+if [ "$RC" -eq 0 ]; then
+  pass "a mention beside a bare call is not a bypass (the lane still executes the runner)"
 else
-  fail "two consecutive folded steps returned rc $RC (want 2): $OUT"
+  fail "a mention beside a real bare call was refused (rc $RC — want 0): $OUT"
 fi
 
 # The control makes the FIRST fold the only matching call, so losing it changes the verdict: with

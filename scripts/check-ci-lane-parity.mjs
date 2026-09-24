@@ -138,6 +138,11 @@ function refusalKeys(node) {
   if (Object.prototype.hasOwnProperty.call(node, "shell")) {
     if (String(node.shell).trim() !== "bash") bad.push("shell");
   }
+  // NOTE: `defaults.run.shell` (the same knob one level up — job-level `defaults:` and
+  // workflow-level `defaults:`, which reaches EVERY job) is asserted by the document-wide walk in
+  // deepForbiddenKeys, since a job's own `defaults:` is a node that walk visits. Asserting it here
+  // as well was dead code: removing this arm reddened no test, because the other arm caught the
+  // job-level spelling too.
   for (const k of Object.keys(node)) if (/^CI_LANE_/.test(k)) bad.push(k);
   // ...and inside the node's own `env:` mapping, where a job or step would actually set them.
   if (node.env && typeof node.env === "object" && !Array.isArray(node.env)) {
@@ -165,6 +170,10 @@ function deepForbiddenKeys(node, path, out) {
   if (!node || typeof node !== "object") return out;
   for (const [k, v] of Object.entries(node)) {
     if (/^CI_LANE_/.test(k) || STARTUP_INJECTION_KEYS.test(k)) out.push(`${path}.${k}`);
+    // workflow-level `defaults:` — reaches every job, so it is not enough to scan the audited one.
+    if (k === "shell" && /\.defaults\.run$/.test(path) && String(v).trim() !== "bash") {
+      out.push(`${path}.${k}`);
+    }
     deepForbiddenKeys(v, `${path}.${k}`, out);
   }
   return out;
@@ -202,12 +211,22 @@ function checkLane(label, workflowFile, jobName) {
     }
     const prValue =
       on && typeof on === "object" && !Array.isArray(on) ? on.pull_request : null;
-    // The bare trigger is the only form this lane needs. ANY value narrows it: `paths:`/
+    // The bare trigger is the only form this lane needs. ANY VALUE narrows it: `paths:`/
     // `paths-ignore:` stop the lane running for a scripts/ change, `types: [closed]` stops it
     // running on a PR's commits at all, `branches-ignore: ['**']` matches every base. All of them
     // leave the parity assertion green while the lane does not run — the #1369 split re-created
     // with a different key. Refusing the value wholesale also retires the key-by-key enumeration.
-    if (prValue !== null && prValue !== undefined) {
+    // An EMPTY mapping or list carries no filter at all, so it is the bare trigger (accepting it
+    // keeps the rule from over-blocking a spelling that cannot narrow anything). The structural
+    // parser returns flow style as its source text, so `{}`/`[]` arrive as strings.
+    const emptyLiteral =
+      typeof prValue === "string" && (prValue.trim() === "{}" || prValue.trim() === "[]");
+    const isEmptyTrigger =
+      emptyLiteral ||
+      (prValue !== null &&
+        typeof prValue === "object" &&
+        (Array.isArray(prValue) ? prValue.length === 0 : Object.keys(prValue).length === 0));
+    if (prValue !== null && prValue !== undefined && !isEmptyTrigger) {
       const shape = Array.isArray(prValue)
         ? `a [types] list (${prValue.length} entr${prValue.length === 1 ? "y" : "ies"})`
         : Object.keys(prValue).join(", ") || "an empty mapping";
@@ -249,7 +268,11 @@ function checkLane(label, workflowFile, jobName) {
     for (const line of lines) if (line.includes(RUNNER)) mentions.push(line);
   }
 
-  if (mentions.length > 0) {
+  // Refused only when the lane does NOT also make the bare call: a step that mentions the runner
+  // beside a bare call is an extra step (a syntax check, a `--list` for the log), and the bare
+  // call is what the lane executes. What must never happen is a MENTION standing in for the call —
+  // counting text that runs nothing or swallows a failure — which is the `exact === 0` case.
+  if (mentions.length > 0 && exact === 0) {
     err(
       `${label} lane job '${jobName}' calls ${RUNNER} in a form that is not the bare call — [${mentions
         .slice(0, 3)
@@ -279,7 +302,7 @@ function checkLane(label, workflowFile, jobName) {
  * `\s` and not to the runner's `sed`), which let a lane run 2 of 14 shards and report success.
  */
 function runnerList(flag, what) {
-  const r = spawnSync("bash", [RUNNER_FILE, flag], { encoding: "utf8" });
+  const r = spawnSync("bash", [RUNNER_FILE, flag], { encoding: "utf8", timeout: 120_000 });
   if (r.error) {
     refuse(
       `cannot run '${RUNNER_FILE} ${flag}' (${r.error.message}) — the lane's own ${what} list is unreadable; exiting 2`
@@ -304,6 +327,15 @@ function checkRunner() {
   if (shards.length < MIN_SUITES) {
     refuse(
       `the runner lists ${shards.length} shard(s) (floor ${MIN_SUITES}) — a gutted list would certify parity over nothing; exiting 2`
+    );
+  }
+  // …and they must be DISTINCT: 14 copies of one cheap script satisfy any length floor while 13 of
+  // the suites never run (ledger-sourced, cycle 2). The count is not a coverage proof, but a
+  // duplicate is never coverage.
+  const dupes = shards.filter((s, i) => shards.indexOf(s) !== i);
+  if (dupes.length > 0) {
+    refuse(
+      `the runner lists ${dupes.length} duplicate shard(s) (e.g. ${dupes[0]}) — a repeated target is not extra coverage; exiting 2`
     );
   }
   const globs = runnerList("--list-sweeps", "sweep");
