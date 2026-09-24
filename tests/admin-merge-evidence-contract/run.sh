@@ -139,6 +139,16 @@ if grep -q 'PR failing: 0 | main failing: 0 | blocked by the decision: 0' "$TMP/
 else
   bad "the zeroing mutation did not apply, so it proves nothing"
 fi
+# (h) A LEADING-ZERO ZERO counts as zero, and must be treated as vacuous rather than
+#     smuggled past the vacuity test by its spelling. `00` is refused by clause 4's
+#     canonical-count rule as well — this pins the SECOND line of defence, so the
+#     class stays closed if the count predicate is ever relaxed.
+sed 's/PR failing: 2 | main failing: 7 | blocked by the decision: 0/PR failing: 00 | main failing: 0 | blocked by the decision: 0/' "$POS" > "$TMP/m-leadzero.md"
+if grep -q 'PR failing: 00 | main failing: 0 | blocked by the decision: 0' "$TMP/m-leadzero.md"; then
+  if certifies "$TMP/m-leadzero.md"; then bad "a non-canonical zero ('PR failing: 00') CERTIFIED — it dodges the vacuity test while satisfying the count clause (fail-open)"; else ok "mutation: a leading-zero count refuses"; fi
+else
+  bad "the leading-zero mutation did not apply, so it proves nothing"
+fi
 
 # ── 5. DRIFT-PIN — every literal phrase the GATE requires by `contains(...)` must
 # EXIST in evidence the producer really writes. This is the instrument the
@@ -173,8 +183,24 @@ done <<< "$LITS"
 # ── 6. DRIFT-PIN — the producer still emits the clause the gate requires, and
 # the gate requires the producer's spelling (both directions, so neither can
 # move alone).
+#
+# THIS SECTION EXISTS BECAUSE A COMMITTED CAPTURE CANNOT NOTICE A LATER PRODUCER
+# MOVE. The drift-pin in §5 checks the gate's extractable literals against the real
+# capture — but the capture is a FILE, so renaming the producer's line leaves §1–§5
+# green with a stale fixture, which is the six-day outage all over again. Every
+# STATIC literal the filter requires is therefore also grepped in the producer
+# itself, including the two head-bound ones (`PR head: `, the marker prefix) whose
+# head-substituted forms cannot be extracted. A review round found this gap: the
+# static prefix `PR head: ` was pinned by nothing.
+for lit in '<!-- admin-merge-safety' 'PR head: ' 'main compared (union of ' 'blocked by the decision: 0'; do
+  if grep -qF "$lit" "$PRODUCER"; then
+    ok "the producer still emits: $lit"
+  else
+    bad "the gate requires '$lit' and the PRODUCER no longer emits it (the #1388 class — a committed capture cannot notice this)"
+  fi
+done
 if grep -qF 'blocked by the decision: 0' "$PRODUCER"; then
-  ok "the producer still emits 'blocked by the decision: 0'"
+  : # already asserted by the loop above
 else
   bad "the producer no longer emits the clause-4 spelling the gate requires"
 fi

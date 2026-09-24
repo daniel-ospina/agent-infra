@@ -4006,6 +4006,7 @@ test("evidenceBodyIsCertifying: delegation to the shim's verifier is GENUINE (#1
     ["a vacuous comparison WITH parity", body(vacuous) + "\nlane parity: PR ⊇ main — the PR executed every shard main's lane executed", true],
     ["a fractional residual", body("PR failing: 0 | main failing: 0 | blocked by the decision: 0.5"), false],
     ["a zero-prefixed residual", body("PR failing: 0 | main failing: 0 | blocked by the decision: 01"), false],
+    ["a leading-zero count (a vacuous body spelled non-canonically)", body("PR failing: 00 | main failing: 0 | blocked by the decision: 0"), false],
     ["the retired, stronger claim", body("PR failing: 0 | main failing: 0 | unique to this PR: 0"), false],
     ["malformed provenance", body(nonVacuous).replace("union of 3 runs", "union of 1 banana"), false],
     ["no provenance", body(nonVacuous).replace("main compared (union of 3 runs of python-ci.yml): a:1\n", ""), false],
