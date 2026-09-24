@@ -2,8 +2,26 @@
 # verify-admin-merge-evidence.sh — is this admin merge JUSTIFIED? (#984)
 #
 # The argv-level layer's decision rule. `scripts/gh-shim/gh` calls it when a
-# RESOLVED argv is an admin merge, and it is available to the TypeScript gate so
-# the certifying contract has one home rather than two that can drift.
+# RESOLVED argv is an admin merge. This is the CANONICAL definition of the
+# certificate; the TypeScript gate (`extensions/review-enforcer/index.ts`,
+# `evidenceBodyIsCertifying`) mirrors it IN-PROCESS, and the two must stay in step:
+# a drift between two copies of this contract is exactly what #1429 was (the #3076
+# class).
+#
+# HOW THE TWO ARE KEPT IN STEP, HONESTLY. `tests/admin-merge/run.sh` §35b binds
+# THIS definition to the rail's OWN posted body (producer → this verifier) and
+# mutates that body every way the zero could be faked. The TypeScript mirror is
+# bound to the same contract by its own unit tests, NOT by that captured body — the
+# admin-merge CI job runs bash only (no node), so the captured body cannot be fed to
+# the TS gate there. The durable single-source fix (the TS gate delegating HERE) is
+# a separate change and is recorded in #1388 clause 6, not done in this one.
+# KNOWN ASYMMETRY — the two differ in strictness on two axes: `PR head:` is a
+# literal containment here while the TS gate accepts a SHA PREFIX either way (TS
+# looser), and the provenance line's lane is parsed and required by the TS gate
+# while this one only requires the `main compared (union of ` prefix (TS stricter).
+# Neither is uniformly stricter — but a merge is admitted only when BOTH certify
+# (the tool-call gate runs first, the shim second), so an asymmetry cannot widen
+# the conjunction.
 #
 # Usage:
 #   verify-admin-merge-evidence.sh <PR> [--repo owner/repo] [--head <sha>]
@@ -84,26 +102,104 @@ esac
 # THE CERTIFICATE PREDICATE — defined ONCE, above both call paths, so the
 # online (comment list) and offline (--body-file) forms cannot diverge.
 #
-# `residual_section` carves the `evidence_list` block out by its summary line.
-# The `[^<]*` runs matter: the summary must be a SUMMARY (no nested tag) and it
-# must still NAME the residual, so a body whose block is absent or re-titled is
-# refused rather than read as empty. `[\s\S]*?` is non-greedy, so the capture
-# stops at the FIRST `</details>` — the block's own close, not a later one.
+# `residual_verdict` classifies the residual section(s); `certifies` is the ONLY
+# place the zero is decided. The SECTION is the semantic anchor (#1429): the rail
+# renders it through `evidence_list`, which prints one `- ` bullet per entry and
+# falls back to its empty text ONLY when the list is empty — so "the section
+# carries no entry" IS "the residual is zero", however the prose is worded, and
+# the empty text may be REPHRASED without breaking the contract.
 #
-# `residual_is_empty` requires the section to (a) be present and STATE something
-# and (b) carry no `- ` entry. (b) is the semantic zero: it does not name the
-# rail's empty-text wording, so that wording may be rephrased without breaking
-# the contract; and any non-empty list renders bullets, so a nonzero residual
-# can never satisfy it.
+# HOW THE SECTION IS DELIMITED — and why the obvious read is unsafe. The body is
+# taken from after the FIRST `final residual` summary to the FIRST `</details>`,
+# and that region is REFUSED as `ambiguous` when either:
+#   * a second `final residual` summary follows it, or
+#   * the region before the close carries `<details` or `<!--`.
+# The first rule is threat T2: a first-match read certifies an empty decoy placed
+# before the real, bulleted section, so the evaluator must never guess WHICH
+# section is the certificate. The second closes the T2 variant that a
+# first-`</details>` read still allows — a NESTED `<details>…</details>`, or a
+# close hidden inside an HTML comment (`<!-- </details> -->`), ends the region
+# early, so a `- ` entry rendered AFTER it is never seen and the truncated prefix
+# reads as the empty zero. Neither shape is anything the rail emits (its residual
+# section is ONE `<details>` block whose body is the empty text or `- ` entries),
+# so refusing both is the correct reading AND the fail-closed one. A MISSING close
+# is `ambiguous` for the same reason: the rail always closes its block, so an
+# unclosed one is not that block.
+#
+# WHY FIVE STATES AND NOT A BOOLEAN:
+#   absent    — no `final residual` section at all. A LEGACY certificate (posted
+#               before #3756) may omit it; the CURRENT clause must NOT accept it,
+#               because absence of a measurement is not a measured zero.
+#   empty     — exactly one section, stating something, rendering no entry. The
+#               one shape that certifies beside the current clause.
+#   entries   — a section renders at least one `- ` entry: a NON-ZERO residual.
+#               Refused. `blocked by the decision: 0` is a literal `printf` the
+#               rail prints unconditionally, so a clause-only predicate would
+#               certify this — a fail-open.
+#   ambiguous — more than one section, an unclosed one, or a section whose region
+#               is broken by nesting/an HTML comment (above). Refused.
+#   silent    — the section exists but carries no non-whitespace text. Refused; a
+#               blank section measures nothing.
+#
+# The list-item test is LINE-ANCHORED (`(^|\n)[ \t]*([-*+]|[0-9]+\.)[ \t]`), not
+# a bare search for `- `: the rail's empty text must stay free to contain a hyphen,
+# and the TypeScript mirror uses the same form so the two cannot disagree on a body
+# (an unanchored test refused a placeholder that merely contained `- `, false-blocking
+# a legitimate zero-residual merge). It matches the OTHER markers GitHub renders as a
+# list item (`* `, `+ `, `1. `) as well as the producer's `- `: the producer emits only
+# `- `, so the extra markers cost nothing and close the "the section renders an entry
+# but the gate reads it as empty" surface.
+#
+# THE CLAUSE IS THE COUNTS LINE, NOT A FREE-FLOATING PHRASE. Each accepted zero is
+# matched as the TAIL of `PR failing: <n> | main failing: <m> | `, exactly as the
+# TypeScript mirror does. Matching the phrase alone (as an earlier cut did) let a body
+# with NO counts at all certify — the vacuity the docstring above says this closes.
+#
+# ENGINE PARITY IS PART OF THE CONTRACT. This program is shipped to `gh --jq`
+# (gojq, whose regex engine is Go/RE2) AND run by system `jq` (Oniguruma) in
+# `--body-file` mode, and mirrored in TypeScript. `\s`, `\S` and `[[:space:]]`
+# DISAGREE between those engines on invisible spaces — Oniguruma's `\s` matches
+# U+00A0, U+2000…, U+0085; RE2's is ASCII-only — so a predicate written with them
+# CERTIFIES in production what the test suite REFUSES (a gate whose proven
+# contract is not the shipped one). Every class here is therefore written out in
+# ASCII — `[ \t\r\n]` for the clause terminator and `[!-~]` (printable ASCII)
+# for "the section states something" — never `\s`, `\S`, or a POSIX class.
+# `[!-~]` is the STRICTER choice: a section carrying only an invisible space
+# (U+00A0 and friends) is `silent` in EVERY engine, so parity costs no refusal.
+# §35b asserts this file's program carries none of them.
+#
+# BOUNDED, AND OFFSET-FREE ON PURPOSE. The only scans are one `capture` (which
+# hands back the text after the first summary via its `(?<rest>…)` group), then
+# `test`/`split` on that text — no global match, no loop, and NO OFFSET
+# ARITHMETIC, so a hostile 64 KB comment cannot buy a stall by packing itself
+# with tags or with `final residual` summaries. Offsets are avoided deliberately:
+# in this jq build `index` returns a BYTE offset while string slicing is by
+# CODEPOINT, so `$s[0:($s|index("x"))]` silently overshoots on any multibyte body
+# — and the rail's empty text carries an em dash, so that is the NORMAL case, not
+# a corner. `match.offset` is codepoint-consistent with slicing, but `capture` +
+# `split` makes the point moot in every engine.
 CERT_JQ='
-def residual_section:
-  try (capture("<summary>[^<]*final residual[^<]*</summary>(?<r>[\\s\\S]*?)</details>") | .r) catch "";
-def residual_is_empty:
-  (residual_section) as $r
-  | (($r | gsub("\\s"; "") | length) > 0) and ((("\n" + $r) | test("- ")) | not);
+def residual_verdict:
+  ("(?s)<summary>[^<]*final residual[^<]*</summary>(?<rest>.*)") as $re
+  | ([capture($re)] | .[0]) as $c
+  | if $c == null then "absent"
+    else
+      ($c.rest) as $after
+      | if ($after | test("<summary>[^<]*final residual[^<]*</summary>")) then "ambiguous"
+        elif ($after | test("</details>")) then
+          ($after | split("</details>") | .[0]) as $r
+          | if ($r | test("<details|<!--")) then "ambiguous"
+            elif (($r | test("[!-~]")) | not) then "silent"
+            elif ($r | test("(^|\\n)[ \\t]*([-*+]|[0-9]+\\.)[ \\t]")) then "entries"
+            else "empty"
+            end
+        else "ambiguous"
+        end
+    end;
 def certifies:
-  test("unique to this PR: 0([ \t\r\n]|$)")
-  or (test("blocked by the decision: 0([ \t\r\n]|$)") and residual_is_empty);
+  (residual_verdict) as $rv
+  | (test("PR failing: [0-9]+[ \t\r\n]*\\|[ \t\r\n]*main failing: [0-9]+[ \t\r\n]*\\|[ \t\r\n]*unique to this PR: 0([ \t\r\n]|$)") and ($rv == "absent" or $rv == "empty"))
+    or (test("PR failing: [0-9]+[ \t\r\n]*\\|[ \t\r\n]*main failing: [0-9]+[ \t\r\n]*\\|[ \t\r\n]*blocked by the decision: 0([ \t\r\n]|$)") and $rv == "empty");
 '
 
 jq_program="$CERT_JQ

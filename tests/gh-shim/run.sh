@@ -108,6 +108,79 @@ bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
 grep -q "^pr merge 123 --admin$" "$SCEN/calls" && pass "the real gh received the ORIGINAL argv unchanged" \
   || fail "argv was not passed through intact: $(cat "$SCEN/calls")"
 
+# ...and the PRODUCER'S CURRENT vocabulary opens it too (#1429). Every fixture above
+# still carries the pre-#3756 `unique to this PR: 0` clause, so without this the
+# shim's ONLINE `gh --jq` program — the production path — was only ever executed
+# against a vocabulary the rail no longer emits.
+new_scen good_current
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 1 | blocked by the decision: 0\n<details><summary>final residual (x) - must be empty</summary>\n\n(empty - the decision exempts)\n\n</details>\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-current"
+jq -n --rawfile b "$TMP/body-current" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && pass "the rail's CURRENT clause + an empty residual section → allowed (exit 0)" \
+  || { fail "the CURRENT certificate shape was REFUSED by the shim's online path"; sed 's/^/      /' "$TMP/err"; }
+
+# ...and the SECTION is what certifies it, on that same online path: the clause alone
+# beside a rendered residual entry must still be refused.
+new_scen current_bullet
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 1 | blocked by the decision: 0\n<details><summary>final residual (x) - must be empty</summary>\n\n- tests/test_new.py::test_new\n\n</details>\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-bullet"
+jq -n --rawfile b "$TMP/body-bullet" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "the current clause beside a RENDERED residual entry → REFUSED (exit $rc)" \
+  || fail "the clause alone certified a body that lists a residual failure"
+
+# ...and the counts line is required, on the online path too: the clause alone is vacuous.
+new_scen current_nocounts
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 7 runs of x): a:1\nblocked by the decision: 0\n<details><summary>final residual (x) - must be empty</summary>\n\n(empty)\n\n</details>\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-nocounts"
+jq -n --rawfile b "$TMP/body-nocounts" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "a zero clause with NO counts line → REFUSED on the online path (exit $rc)" \
+  || fail "a vacuous certificate was ALLOWED by the shim's online path"
+
+# ...and a section of only INVISIBLE space is not a measured zero: the emptiness test
+# is ASCII-explicit precisely because Oniguruma treats U+00A0 as a space-class
+# character and RE2 (the online `gh --jq` path) does not — a class-based test would
+# certify this body on the online path while refusing it offline.
+new_scen current_nbsp
+{ printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 1 | blocked by the decision: 0\n<details><summary>final residual (x) - must be empty</summary>\n\n'; printf '\302\240'; printf '\n\n</details>\n'; } > "$TMP/body-nbsp"
+jq -n --rawfile b "$TMP/body-nbsp" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "a residual section of only invisible space → REFUSED on the online path (exit $rc)" \
+  || fail "an invisible-space-only section certified the merge"
+
+# ...and the section is delimited STRUCTURALLY: a close hidden inside an HTML comment
+# truncates a first-close read before the real entry beneath it, so it is refused as
+# ambiguous rather than read as empty.
+new_scen current_hiddenclose
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 1 | blocked by the decision: 0\n<details><summary>final residual (x) - must be empty</summary>\n\n<!-- </details> -->\n\n- tests/test_new.py::test_new\n\n</details>\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-hiddenclose"
+jq -n --rawfile b "$TMP/body-hiddenclose" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "a close HIDDEN in an HTML comment → REFUSED on the online path (exit $rc)" \
+  || fail "a hidden close truncated the residual section into a false empty"
+
+# ...and a NESTED <details> before the entry cannot stand in for the outer close either.
+new_scen current_nested
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 1 | blocked by the decision: 0\n<details><summary>final residual (x) - must be empty</summary>\n\n<details><summary>nested</summary>\n\n</details>\n\n- tests/test_new.py::test_new\n\n</details>\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-nested"
+jq -n --rawfile b "$TMP/body-nested" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "a NESTED <details> before the entry → REFUSED on the online path (exit $rc)" \
+  || fail "a nested block truncated the residual section into a false empty"
+
+# ...and a list entry is ANY list marker GitHub renders, not just `- `: an entry the
+# rail renders as `* ` or `1. ` is a residual failure like any other.
+new_scen current_star
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 1 | blocked by the decision: 0\n<details><summary>final residual (x) - must be empty</summary>\n\n* tests/test_new.py::test_new\n\n</details>\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-star"
+jq -n --rawfile b "$TMP/body-star" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "a \`* \` residual entry → REFUSED on the online path (exit $rc)" \
+  || fail "a \`* \` entry read as an empty section"
+
+new_scen current_ordered
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 7 runs of x): a:1\nPR failing: 1 | main failing: 1 | blocked by the decision: 0\n<details><summary>final residual (x) - must be empty</summary>\n\n1. tests/test_new.py::test_new\n\n</details>\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-ordered"
+jq -n --rawfile b "$TMP/body-ordered" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr merge 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && pass "a \`1. \` residual entry → REFUSED on the online path (exit $rc)" \
+  || fail "a \`1. \` entry read as an empty section"
+
 # ...but evidence bound to a DIFFERENT head must not open it: the marker IS the binding.
 new_scen stale
 jq -n --rawfile b "$TMP/body-good" '{headRefOid:"'"$HEAD_B"'",comments:[{body:$b}]}' > "$SCEN/pr.json"

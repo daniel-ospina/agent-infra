@@ -2195,6 +2195,110 @@ else
   rc=$?
   [ "$rc" -ne 0 ] && pass "MUTATION: a NON-ZERO residual beside a zero clause is REFUSED (exit $rc)" \
     || fail "MUTATION: a non-zero residual CERTIFIED — the clause alone was treated as the zero"
+  # MUTATION 3 — the DECOY (threat T2): an EMPTY residual section placed BEFORE the
+  # real, bulleted one. A first-match read of the section accepts the decoy and
+  # certifies a body that lists an unexempted failure; the evaluator must never have
+  # to guess which section is the certificate.
+  cp "$SCEN/comment-1" "$TMP/evil-decoy"
+  {
+    printf '<details><summary>final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty</summary>\n\n'
+    printf -- '- tests/test_new.py::test_brand_new\n\n</details>\n'
+  } >> "$TMP/evil-decoy"
+  n=$(grep -c 'final residual' "$TMP/evil-decoy" || true)
+  [ "$n" = "2" ] && pass "  (the decoy mutation applied — two residual sections)" \
+    || fail "  (the decoy mutation did NOT apply; got $n section(s))"
+  bash "$VERIFY" --body-file "$TMP/evil-decoy" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: an empty DECOY section before a bulleted one is REFUSED (exit $rc)" \
+    || fail "MUTATION: a decoy section CERTIFIED a body that lists a residual failure (T2)"
+  # MUTATION 4 — the same fail-open must not be reachable through the LEGACY
+  # wording: the pre-#3756 producer also printed its zero as an unconditional
+  # literal, so the residual rule applies whichever clause matched.
+  sed 's/blocked by the decision: 0/unique to this PR: 0/' "$TMP/evil-residual" > "$TMP/evil-legacy"
+  bash "$VERIFY" --body-file "$TMP/evil-legacy" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: LEGACY wording + a bulleted residual section is REFUSED (exit $rc)" \
+    || fail "MUTATION: the legacy wording bypassed the residual rule"
+  # MUTATION 5 — an UNTERMINATED residual section. The rail always closes its
+  # block, so a missing `</details>` must not let the remainder read as empty.
+  awk '{ print } /final residual[^<]*<\/summary>/ { print ""; print "(empty — the decision exempts)"; exit }' \
+    "$SCEN/comment-1" > "$TMP/evil-unterminated"
+  bash "$VERIFY" --body-file "$TMP/evil-unterminated" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: an UNTERMINATED residual section is REFUSED (exit $rc)" \
+    || fail "MUTATION: an unterminated section CERTIFIED (a truncated block read as empty)"
+  # MUTATION 6 — a `</details>` HIDDEN IN AN HTML COMMENT before the entry. A
+  # first-`</details>` read ends the region at the hidden close, so the bullet
+  # after it was never seen and the truncated prefix certified. GitHub strips the
+  # comment when rendering, so the entry IS visible inside the block.
+  awk '{ print } /final residual[^<]*<\/summary>/ { print ""; print "<!-- </details> -->"; print "- tests/test_new.py::test_brand_new" }' \
+    "$SCEN/comment-1" > "$TMP/evil-hidden-close"
+  grep -q '</details> -->' "$TMP/evil-hidden-close" \
+    && pass "  (the hidden-close mutation applied)" \
+    || fail "  (the hidden-close mutation did NOT apply; the assertion below would prove nothing)"
+  bash "$VERIFY" --body-file "$TMP/evil-hidden-close" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: a closing tag hidden in an HTML comment is REFUSED (exit $rc)" \
+    || fail "MUTATION: a hidden close TRUNCATED the section and certified a listed residual"
+  # MUTATION 7 — the same truncation through a NESTED balanced block.
+  awk '{ print } /final residual[^<]*<\/summary>/ { print ""; print "<details><summary>n</summary>x</details>"; print "- tests/test_new.py::test_brand_new" }' \
+    "$SCEN/comment-1" > "$TMP/evil-nested"
+  bash "$VERIFY" --body-file "$TMP/evil-nested" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: a NESTED <details> before an entry is REFUSED (exit $rc)" \
+    || fail "MUTATION: a nested block TRUNCATED the section and certified a listed residual"
+  # MUTATION 8 — a section body of ONLY an invisible space (U+00A0). `\S` is
+  # Unicode-aware under Oniguruma (system jq) but ASCII-only under RE2 (the
+  # production `gh --jq`), so a `\S`-based test made the SAME body certify in
+  # production and be refused here. `[!-~]` makes EVERY engine refuse it, so this
+  # pins the jq side of the parity decision.
+  awk -v nb="$(printf '\302\240')" '{ print } /final residual[^<]*<\/summary>/ { print ""; print nb; print ""; print "</details>"; exit }' \
+    "$SCEN/comment-1" > "$TMP/evil-invisible"
+  grep -q "$(printf '\302\240')" "$TMP/evil-invisible" \
+    && pass "  (the invisible-space mutation applied)" \
+    || fail "  (the invisible-space mutation did NOT apply; the assertion below would prove nothing)"
+  bash "$VERIFY" --body-file "$TMP/evil-invisible" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: a section of only an invisible space is REFUSED (exit $rc)" \
+    || fail "MUTATION: an invisible-space-only section CERTIFIED — the silent rule was widened away"
+  # THE RE-DRIFT GUARD for engine parity. The program is shipped to gojq/RE2
+  # (production `gh --jq`) AND run by Oniguruma (system jq, `--body-file`), whose
+  # `\s`/`\S`/`[[:space:]]` DISAGREE on Unicode spaces. One such class
+  # reintroduced here silently re-arms the divergence — a gate whose tested
+  # contract is not the shipped one — so the program text itself is asserted clean.
+  cert_prog="$(sed -n "/^CERT_JQ='$/,/^'$/p" "$VERIFY" | sed '1d;$d')"
+  if [ -z "$cert_prog" ]; then
+    fail "  (could not extract the CERT_JQ program — the parity guard would prove nothing)"
+  elif printf '%s\n' "$cert_prog" | grep -qE '\\[sS]|\[\[:space:\]\]'; then
+    fail "the verifier's jq program uses an engine-sensitive whitespace class — gojq (production) and jq (tests) disagree on it"
+  else
+    pass "the verifier's jq program carries no engine-sensitive whitespace class (gojq/jq parity holds by construction)"
+  fi
+  # MUTATION 9 — the clause with NO counts line. The widening accepts the rail's
+  # clause, so the predicate must still be the COUNTS LINE's tail: matching the
+  # phrase alone would certify a body with no measurement at all, which is the
+  # vacuity the gate claims to close (review cycle 3).
+  sed 's/^PR failing: [0-9]* | main failing: [0-9]* | blocked by the decision: 0$/blocked by the decision: 0/' \
+    "$SCEN/comment-1" > "$TMP/evil-nocounts"
+  grep -q '^blocked by the decision: 0$' "$TMP/evil-nocounts" \
+    && pass "  (the no-counts mutation applied)" \
+    || fail "  (the no-counts mutation did NOT apply; the assertion below would prove nothing)"
+  bash "$VERIFY" --body-file "$TMP/evil-nocounts" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: a zero clause with NO counts line is REFUSED (exit $rc)" \
+    || fail "MUTATION: a clause with no measurement CERTIFIED — the gate was widened into vacuity"
+  # MUTATION 10 — a residual entry rendered with a marker OTHER than `- `. GitHub
+  # renders `* ` / `+ ` / `1. ` as list items inside the block, so a predicate that
+  # only knows `- ` reads a visibly-populated residual as empty (review cycle 3).
+  awk '{ print } /final residual[^<]*<\/summary>/ { print ""; print "* tests/test_new.py::test_brand_new" }' \
+    "$SCEN/comment-1" > "$TMP/evil-star"
+  grep -q '^\* tests/test_new' "$TMP/evil-star" \
+    && pass "  (the star-bullet mutation applied)" \
+    || fail "  (the star-bullet mutation did NOT apply; the assertion below would prove nothing)"
+  bash "$VERIFY" --body-file "$TMP/evil-star" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: a `* ` list entry in the residual section is REFUSED (exit $rc)" \
+    || fail "MUTATION: a star-bulleted residual CERTIFIED — the list-item test is too narrow"
   # ALREADY-POSTED evidence must not be invalidated by the widening.
   {
     printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | unique to this PR: 0\n' "$HEAD_MF" "$HEAD_MF"

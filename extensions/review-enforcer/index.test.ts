@@ -3994,6 +3994,117 @@ test("evidenceBodyIsCertifying: the rail's CURRENT residual shape (#1429)", () =
   ok(!evidenceBodyIsCertifying(retraction, MARK), "a retraction body does NOT certify");
 });
 
+test("evidenceBodyIsCertifying: the residual SECTION is the anchor, in every direction (#1429)", () => {
+  const MARK = "f".repeat(40);
+  const SUM =
+    "<details><summary>final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty</summary>";
+  const block = (rendered: string) => SUM + "\n\n" + rendered + "\n\n</details>";
+  // A body with the CURRENT clause and NO residual section: absence must never
+  // read as a measured zero (only a LEGACY body may omit the section).
+  const head = "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
+    "\nmain compared (union of 1 run of x): a:1\n";
+  const decisionNoSection = head + "PR failing: 0 | main failing: 0 | blocked by the decision: 0\n";
+  const legacyNoSection = head + "PR failing: 0 | main failing: 0 | unique to this PR: 0\n";
+  ok(!evidenceBodyIsCertifying(decisionNoSection, MARK),
+    "the decision clause with NO residual section does NOT certify");
+  ok(evidenceBodyIsCertifying(legacyNoSection, MARK),
+    "the LEGACY clause with no section still certifies (already-posted evidence stays valid)");
+  const legacyEmpty = legacyNoSection + block("(empty — nothing unique to this PR)");
+  ok(evidenceBodyIsCertifying(legacyEmpty, MARK), "a legacy body WITH an empty section certifies");
+  // The same fail-open must not be reachable through the legacy wording, and a
+  // first-match read must not let an empty decoy cover the real section.
+  ok(!evidenceBodyIsCertifying(legacyNoSection + block("- tests/test_new.py::test_new"), MARK),
+    "a legacy body whose section renders ENTRIES does NOT certify (the rule applies to both clauses)");
+  const decoy = decisionNoSection + block("(empty — the decision exempts)") +
+    block("- tests/test_new.py::test_brand_new");
+  ok(!evidenceBodyIsCertifying(decoy, MARK),
+    "an empty decoy section BEFORE the real bulleted one does NOT certify (T2)");
+  ok(!evidenceBodyIsCertifying(decisionNoSection + block("(empty — a)") + block("(empty — b)"), MARK),
+    "TWO sections do NOT certify — the evaluator must not guess which is the certificate");
+  ok(!evidenceBodyIsCertifying(decisionNoSection + SUM + "\n\n(empty — nothing)\n\n", MARK),
+    "an UNTERMINATED section does NOT certify (the rail always closes its block)");
+  // The bullet test is LINE-ANCHORED in both consumers: an empty text that merely
+  // contains a hyphen must not be read as an entry (an unanchored test here would
+  // disagree with the jq predicate and false-block a legitimate merge).
+  ok(evidenceBodyIsCertifying(decisionNoSection + block("(empty - the decision exempts)"), MARK),
+    "an empty placeholder containing `- ` mid-line still certifies (the bullet test is anchored)");
+});
+
+test("evidenceBodyIsCertifying: a hidden or nested close cannot truncate the residual section (#1429)", () => {
+  const MARK = "a".repeat(40);
+  const SUM =
+    "<details><summary>final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty</summary>";
+  const head = "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
+    "\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | blocked by the decision: 0\n";
+  // A `</details>` hidden inside an HTML comment ends a first-close read EARLY, so
+  // the `- ` entry after it was never seen and the truncated prefix certified.
+  // GitHub strips the comment when rendering, so the entry IS visible in the block.
+  ok(!evidenceBodyIsCertifying(
+    head + SUM + "\n\n<!-- </details> -->\n- tests/test_new.py::test_new\n\n</details>", MARK),
+    "a `</details>` hidden inside an HTML comment does NOT certify");
+  // A NESTED balanced pair does the same without a comment.
+  ok(!evidenceBodyIsCertifying(
+    head + SUM + "\n\n<details><summary>nested</summary>\nignored\n</details>\n- tests/test_new.py::test_new\n\n</details>",
+    MARK),
+    "a NESTED <details> block before an entry does NOT certify");
+  // The same nesting with no entry is still not the rail's shape (its residual
+  // section is ONE `<details>` block), so it is refused rather than parsed.
+  ok(!evidenceBodyIsCertifying(head + SUM + "\n\n<details><summary>n</summary>x</details>\n\n</details>", MARK),
+    "a nested block with no entry still does NOT certify (the rail never nests)");
+  ok(evidenceBodyIsCertifying(head + SUM + "\n\n(empty — the decision exempts)\n\n</details>", MARK),
+    "…and the plain, honest empty section still certifies");
+});
+
+test("evidenceBodyIsCertifying: a section of only invisible space is refused, in every engine (#1429)", () => {
+  // `\s` is Unicode-aware in JS but ASCII-only under RE2 (production `gh --jq`),
+  // so a `\S`-based "states something" test made the SAME body certify in one
+  // consumer and be refused in the other. `[!-~]` (printable ASCII) removes the
+  // disagreement AND is the stricter reading: a section carrying only U+00A0 /
+  // U+2003 measures nothing, so it is `silent` here and in both jq engines.
+  const MARK = "c".repeat(40);
+  const head = "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
+    "\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | blocked by the decision: 0\n";
+  const SUM =
+    "<details><summary>final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty</summary>";
+  ok(!evidenceBodyIsCertifying(head + SUM + "\n\n\u00a0\u00a0\n\n</details>", MARK),
+    "a section of only U+00A0 does NOT certify (silent in every engine)");
+  ok(!evidenceBodyIsCertifying(head + SUM + "\n\n\u2003\u2003\n\n</details>", MARK),
+    "a section of only U+2003 does NOT certify (silent in every engine)");
+  ok(evidenceBodyIsCertifying(head + SUM + "\n\n(empty \u00a0 — the decision exempts)\n\n</details>", MARK),
+    "…but ordinary emptiness text containing an invisible space still certifies (not over-broad)");
+  // The zero clause's terminator is ASCII-explicit for the same reason.
+  ok(!evidenceBodyIsCertifying(head.replace("blocked by the decision: 0", "blocked by the decision: 0\u00a0"), MARK),
+    "`0` followed by a Unicode space is NOT the zero clause");
+});
+
+test("evidenceBodyIsCertifying: the zero clause is the COUNTS LINE, and any list marker counts (#1429)", () => {
+  const MARK = "d".repeat(40);
+  const SUM =
+    "<details><summary>final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty</summary>";
+  const head = "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
+    "\nmain compared (union of 1 run of x): a:1\n";
+  const empty = SUM + "\n\n(empty — the decision exempts)\n\n</details>";
+  const counts = (clause: string) => "PR failing: 1 | main failing: 1 | " + clause + "\n";
+  // THE VACUITY CASE. Matching the clause alone (as an earlier cut did) let a body
+  // with NO counts at all certify — precisely what the "cannot be non-vacuous"
+  // docstring claims to prevent. The clause is the TAIL of the counts line.
+  ok(!evidenceBodyIsCertifying(head + "blocked by the decision: 0\n" + empty, MARK),
+    "the decision clause with NO counts line does NOT certify");
+  ok(!evidenceBodyIsCertifying(head + "unique to this PR: 0\n" + empty, MARK),
+    "the legacy clause with NO counts line does NOT certify");
+  ok(evidenceBodyIsCertifying(head + counts("blocked by the decision: 0") + empty, MARK),
+    "…and the same clause WITH its counts line certifies");
+  // ANY list marker the reader SEES must count as an entry, not only the `- ` the
+  // producer happens to emit. GitHub renders `* `, `+ ` and `1. ` as list items
+  // inside the block too, so reading only `- ` would certify a section that
+  // visibly lists residual failures.
+  for (const marker of ["- ", "* ", "+ ", "1. "]) {
+    ok(!evidenceBodyIsCertifying(head + counts("blocked by the decision: 0") +
+      SUM + "\n\n" + marker + "tests/test_new.py::test_new\n\n</details>", MARK),
+      "a residual entry rendered with `" + marker.trim() + "` does NOT certify");
+  }
+});
+
 test("evaluateAdminMergeGate: pure decisions", () => {
   const head = "b".repeat(40);
   const commented = (sha: string, body: string) => [body.split("<SHA>").join(sha)];

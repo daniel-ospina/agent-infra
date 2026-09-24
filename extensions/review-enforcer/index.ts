@@ -1800,39 +1800,80 @@ export function extractMergeSelector(command: string): MergeSelector {
  */
 
 /**
- * The rail's residual section — the `evidence_list` block whose entries are the
- * final residual (BLOCKED ∪ UNATTRIBUTABLE) — or null when the body carries none.
+ * Classify the body's `final residual` section(s) — the `evidence_list` block
+ * whose entries are the residual (BLOCKED ∪ UNATTRIBUTABLE) — as one of
+ * `absent` | `empty` | `entries` | `ambiguous` | `silent`.
  *
- * `[^<]*` on either side of the phrase keeps this a SUMMARY match (no nested tag,
- * and the block must still NAME the residual), and `[\s\S]*?` is non-greedy, so
- * the capture stops at the block's own `</details>` rather than a later one.
- */
-function residualSection(body: string): string | null {
-  const m = /<summary>[^<]*final residual[^<]*<\/summary>([\s\S]*?)<\/details>/.exec(body);
-  return m ? m[1] : null;
-}
-
-/**
- * Does the residual section render NO entries?
+ * THE SECTION IS THE SEMANTIC ANCHOR (#1429): the rail renders it through
+ * `evidence_list`, which prints one `- ` bullet per entry and falls back to its
+ * empty text ONLY when the list is empty. So "renders no entry" IS "the residual
+ * is zero", however either side words its prose.
  *
- * THIS is the semantic zero, not the clause's wording (#1429). The rail renders
- * the section through `evidence_list`, which prints one `- ` bullet per entry and
- * falls back to its empty text ONLY when the list is empty — so "the section
- * carries no bullet" IS "the residual is zero", however either side words its
- * prose. The clause alone is not enough: `blocked by the decision: 0` is a
- * literal the rail prints unconditionally, so on its own it would certify a body
- * that lists residual failures beside it — a fail-open. A missing section is NOT
- * an empty one: absence of a measurement must never read as a measured zero.
+ * This is a five-way state, not a boolean, because "no entry in the section" is
+ * satisfied by four things that are NOT a measured zero:
+ *   absent    — no section at all. A legacy certificate may omit it, but the
+ *               current clause must never read absence as a measured zero;
+ *   ambiguous — more than one section, an unclosed one, or one whose region is
+ *               broken by nesting/an HTML comment (below). A first-match read
+ *               would accept an empty decoy placed before the real, bulleted
+ *               section (declared threat T2), and the rail always closes its
+ *               block, so a missing `</details>` means this is not that block;
+ *   silent    — the section exists but states nothing;
+ *   entries   — it renders at least one `- ` entry, i.e. a NON-ZERO residual.
+ *
+ * DELIMITING THE SECTION. The body runs from after the FIRST summary to the
+ * FIRST `</details>`, and is refused as `ambiguous` when the region before that
+ * close carries `<details` or `<!--`. That closes the T2 variant a
+ * first-`</details>` read still allows: a NESTED `<details>…</details>`, or a
+ * close hidden inside an HTML comment (`<!-- </details> -->`), ends the region
+ * EARLY, so a `- ` entry rendered AFTER it is never seen and the truncated
+ * prefix reads as the empty zero. The rail emits neither shape, so refusing both
+ * is correct AND fail-closed. Mirrors `scripts/verify-admin-merge-evidence.sh`.
+ *
+ * ENGINE PARITY. This is the mirror of the jq predicate, which is shipped to
+ * `gh --jq` (gojq/RE2) and also run by system `jq` (Oniguruma). Those disagree
+ * on `\s`/`\S`/`[[:space:]]` for invisible spaces, so every class here is
+ * written out in ASCII (`[ \t\r\n]`, `[!-~]`) to match the jq side exactly.
+ * `[!-~]` is the stricter choice: a section carrying only an invisible space is
+ * `silent` in every engine, so parity does not cost the refusal.
+ *
+ * LINEAR on purpose: one `exec`, one `test`, one `indexOf` — no `g`-flag walk and
+ * no lazy `[\s\S]*?` capture. This runs once PER MARKER inside the caller's loop,
+ * so a hostile 64 KB comment carrying many markers, tags, or summaries must not
+ * be able to stall the gate.
  */
-function residualSectionIsEmpty(body: string): boolean {
-  const section = residualSection(body);
-  if (section === null) return false;
-  if (!/\S/.test(section)) return false; // the section must STATE its emptiness
-  return !/(^|\n)\s*-\s/.test(section); // evidence_list renders one bullet per entry
+const RESIDUAL_SUMMARY = /<summary>[^<]*final residual[^<]*<\/summary>/;
+function residualSectionState(
+  body: string,
+): "absent" | "empty" | "entries" | "ambiguous" | "silent" {
+  const first = RESIDUAL_SUMMARY.exec(body);
+  if (first === null) return "absent";
+  const after = body.slice(first.index + first[0].length);
+  if (RESIDUAL_SUMMARY.test(after)) return "ambiguous"; // a second section — never guess which
+  const end = after.indexOf("</details>");
+  if (end === -1) return "ambiguous"; // unterminated — the rail always closes its block
+  const section = after.slice(0, end);
+  if (/<details|<!--/.test(section)) return "ambiguous"; // nesting/a hidden close ends it early
+  // The section must STATE its emptiness — at least one PRINTABLE ASCII
+  // character. NOT `\S`, which is Unicode-aware in JS but ASCII-only in the jq
+  // engines: `[!-~]` is engine-independent, and it is the STRICTER choice (a
+  // section carrying only an invisible space is `silent` everywhere, so parity
+  // costs no refusal). Mirrors the jq predicate's `[!-~]` exactly.
+  if (!/[!-~]/.test(section)) return "silent";
+  // LINE-ANCHORED list item — `evidence_list` renders `- <entry>` at a line
+  // start, and the empty text must stay free to contain a hyphen. The test also
+  // covers the OTHER markers GitHub renders as a list item (`* `, `+ `, `1. `):
+  // the producer only ever emits `- `, so covering them costs nothing and closes
+  // the "the section renders an entry but the gate reads it as empty" surface.
+  // This mirrors the jq predicate's `(^|\n)[ \t]*([-*+]|[0-9]+\.)[ \t]`
+  // exactly: an unanchored or narrower test on either side makes the two
+  // consumers disagree on the same body.
+  if (/(^|\n)[ \t]*([-*+]|\d+\.)[ \t]/.test(section)) return "entries";
+  return "empty";
 }
 /** The body's `PR head:` value, lowercased, or null when absent. */
 export function evidenceHeadInBody(body: string): string | null {
-  const m = /PR head:\s*([0-9a-fA-F]{7,40})\b/.exec(body);
+  const m = /PR head:[ \t\r\n]*([0-9a-fA-F]{7,40})\b/.exec(body);
   return m ? m[1].toLowerCase() : null;
 }
 
@@ -1866,13 +1907,24 @@ export function evidenceBodyIsCertifying(body: string, markerSha: string): boole
   // contract, while the legacy clause keeps evidence posted before the #3756
   // rename valid — narrowing the rail back to the obsolete literal would
   // re-legalise the stronger, unsupported `unique to this PR` claim.
-  // The `(?=\s|$)` tail (not `\b`) is what refuses a fractional/numeric
-  // continuation like `0.5` or `01`, mirroring the argv-level verifier.
-  const legacyZero = /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0(?=\s|$)/;
+  // The `(?=[ \t\r\n]|$)` tail (not `\b`) is what refuses a fractional/numeric
+  // continuation like `0.5` or `01`, mirroring the argv-level verifier. The
+  // whitespace class is ASCII-explicit for the engine-parity reason above: the
+  // jq side is `[ \t\r\n]`, and `\s` here would also swallow U+00A0/U+2000….
+  //
+  // The residual rule applies WHENEVER a section is PRESENT, whichever clause
+  // matched. The pre-#3756 producer also printed its zero as an unconditional
+  // literal, so a body that lists residual entries must not be able to certify by
+  // choosing the legacy wording instead — that is the same fail-open. A legacy
+  // body that omits the section ENTIRELY is still accepted: that is the shape
+  // already posted before the rename.
+  const legacyZero = /PR failing:[ \t\r\n]*\d+[ \t\r\n]*\|[ \t\r\n]*main failing:[ \t\r\n]*\d+[ \t\r\n]*\|[ \t\r\n]*unique to this PR:[ \t\r\n]*0(?=[ \t\r\n]|$)/;
   const decisionZero =
-    /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*blocked by the decision:\s*0(?=\s|$)/;
+    /PR failing:[ \t\r\n]*\d+[ \t\r\n]*\|[ \t\r\n]*main failing:[ \t\r\n]*\d+[ \t\r\n]*\|[ \t\r\n]*blocked by the decision:[ \t\r\n]*0(?=[ \t\r\n]|$)/;
+  const residualState = residualSectionState(body);
   const zeroResidualCertifies =
-    legacyZero.test(body) || (decisionZero.test(body) && residualSectionIsEmpty(body));
+    (legacyZero.test(body) && (residualState === "absent" || residualState === "empty")) ||
+    (decisionZero.test(body) && residualState === "empty");
   return (
     headNamesTheMarker &&
     zeroResidualCertifies &&
