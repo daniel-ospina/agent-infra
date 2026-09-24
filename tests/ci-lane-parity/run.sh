@@ -790,6 +790,17 @@ else
 fi
 
 echo ""
+echo "8ac2. A WORKFLOW-LEVEL CI_LANE_* KEY → rc 2 (a doc under audit cannot configure the guard)"
+awk '{ print; if ($0 == "on:") { print "env:"; print "  CI_LANE_RUNNER: /tmp/fake.sh" } }' \
+  "$PR" >"$TMP/ci-pr-wflane.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-wflane.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a workflow-level env: CI_LANE_* key exits 2 (it would redirect the guard's own inputs)"
+else
+  fail "a workflow-level CI_LANE_* key returned rc $RC (want 2): $OUT"
+fi
+
+echo ""
 echo "8ad. A FOLDED block scalar (`run: >`) joins its lines → the tail is visible"
 awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; next } print }' \

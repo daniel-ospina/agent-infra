@@ -142,9 +142,38 @@ function refusalKeys(node) {
   return bad;
 }
 
+/**
+ * A CI_LANE_* key ANYWHERE in the document. The guard reads its inputs from the environment, and a
+ * workflow-level `env:` reaches every step of every job — so a workflow that sets one of these
+ * could point the guard at a different workflow, job, or runner file and buy a green parity check
+ * for a lane that runs something else. Auditing only the job and its steps misses that, so the scan
+ * runs over the whole parsed document, keys only, any depth.
+ */
+function deepLaneKeys(node, path, out) {
+  if (Array.isArray(node)) {
+    node.forEach((v, i) => deepLaneKeys(v, `${path}[${i}]`, out));
+    return out;
+  }
+  if (!node || typeof node !== "object") return out;
+  for (const [k, v] of Object.entries(node)) {
+    if (/^CI_LANE_/.test(k)) out.push(`${path}.${k}`);
+    deepLaneKeys(v, `${path}.${k}`, out);
+  }
+  return out;
+}
+
 function checkLane(label, workflowFile, jobName) {
   const wf = parse(workflowFile);
   const file = base(workflowFile);
+
+  // The audited document must not be able to configure this guard (see deepLaneKeys).
+  const laneKeys = deepLaneKeys(wf, file, []);
+  if (laneKeys.length > 0) {
+    err(
+      `${file} sets CI_LANE_* input(s) [${laneKeys.slice(0, 3).join(" ")}] anywhere in the workflow — a document under audit must not be able to redirect the guard's own view of which lane runs what (a lane that configures the gate is not coverage); exiting 2`
+    );
+    process.exit(2);
+  }
 
   if (label === "PR") {
     const on = wf.on;
