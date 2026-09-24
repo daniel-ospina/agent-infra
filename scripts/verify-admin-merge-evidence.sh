@@ -134,6 +134,12 @@ esac
 #       the prefix (so `… test*; NOT COMPARABLE …; 3 shard(s) …` cannot ride along), and
 #       at most ONE `parity family:` occurrence per parity statement (so
 #       `… (parity family: FAKE) (parity family: test*; 3 shard(s) …)` cannot).
+#       THE `;` BAN IS A CONSTRAINT ON THE LANE-JOB PREFIX: a job family whose name
+#       contains `;` would emit a line this gate refuses (fail-closed, but a refusal of
+#       legitimate evidence). The fleet default is `test`; an operator setting
+#       ADMIN_MERGE_LANE_JOB_PREFIX must avoid `;` until the producer validates it
+#       (filed: the producer accepts any string). Control characters and the Unicode
+#       line separators are excluded for the same reason.
 #
 # AND THE FILTER MUST BE COMPILABLE BY THE ENGINE THAT ACTUALLY RUNS IT LIVE. That is
 # not the same engine as the offline path, and a verifier pass caught this the hard way:

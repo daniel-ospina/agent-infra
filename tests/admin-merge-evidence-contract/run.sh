@@ -580,24 +580,34 @@ fi
 # for EVERY certificate — the #1388 outage class with all offline assertions green. A
 # verifier pass reproduced exactly that on gh 2.97.0; this section is the guard that
 # was missing, and it is why a green offline suite is not evidence about the live path.
-# The extraction is a companion script, and it DECODES each literal once before judging
-# it. Re-embedding the file's raw text double-escapes every pattern (`\K` → `\\K`), so a
-# compile check built that way tests regexes the filter does not use — a verifier pass
-# reproduced a green suite with an RE2-rejected `\K` in the filter because of exactly
-# that. A run that finds NO patterns is treated as a failure, never as a pass: an empty
-# extraction made both assertions below report ✅ over nothing.
-PATTERNS="$(python3 "$HERE/filter-patterns.py" "$VERIFIER")"
-PAT_COUNT="$(printf '%s\n' "$PATTERNS" | sed -n 's/^N //p')"
-if [ -z "$PAT_COUNT" ] || [ "$PAT_COUNT" -lt 6 ]; then
-  bad "the clause filter's test() patterns could not be extracted (found '${PAT_COUNT:-none}', expected at least 6) — the RE2 checks below would pass over nothing"
-elif [ -n "$(printf '%s\n' "$PATTERNS" | grep '^OFFENDER' || true)" ]; then
-  bad "the clause filter uses regex the LIVE engine (gh's gojq over Go/RE2) REJECTS: $(printf '%s\n' "$PATTERNS" | grep '^OFFENDER' | head -1 | cut -c1-120) — the live path would refuse every certificate, however green this suite is"
+# The extraction runs against the RUNTIME filter — the string the verifier actually
+# evaluates, after the shell has expanded it — not against the file's source text. A
+# source-text scan is a proxy that a verifier pass defeated three ways in a row
+# (`test((…))`, `test ( "…" )`, a pattern built with the file's own `"$HEAD"` splice),
+# each leaving the suite green while the LIVE path could not compile the filter. The
+# companion script also fails CLOSED on any regex argument it cannot decode, and reports
+# a count floor, so a filter it cannot see cannot pass as a filter it cleared.
+RUNTIME_FILTER="$(HEAD=fixture-head-not-a-real-sha; eval "$(sed -n '/^HEAD=/d;/^CLAUSE_FILTER=/,/^jq_program=/p' "$VERIFIER" | sed '$d')"; printf '%s' "$CLAUSE_FILTER")"
+if [ -z "$RUNTIME_FILTER" ]; then
+  bad "the clause filter could not be evaluated at all — the RE2 checks below would pass over nothing"
 else
-  ok "all $PAT_COUNT clause-filter patterns are RE2-compilable: no lookaround, no backreferences, no Oniguruma-only escapes"
+  printf '%s' "$RUNTIME_FILTER" > "$TMP/runtime-filter.txt"
+  PATTERNS="$(python3 "$HERE/filter-patterns.py" "$TMP/runtime-filter.txt")"
+  PAT_COUNT="$(printf '%s\n' "$PATTERNS" | sed -n 's/^N //p')"
+  if [ -z "$PAT_COUNT" ] || [ "$PAT_COUNT" -lt 6 ]; then
+    bad "the clause filter's regex arguments could not be extracted (found '${PAT_COUNT:-none}', expected at least 6) — the RE2 checks below would pass over nothing"
+  elif [ -n "$(printf '%s\n' "$PATTERNS" | grep '^UNCHECKABLE' || true)" ]; then
+    bad "a clause-filter regex argument is not a plain literal, so it cannot be checked against the live engine: $(printf '%s\n' "$PATTERNS" | grep '^UNCHECKABLE' | head -1 | cut -c1-120)"
+  elif [ -n "$(printf '%s\n' "$PATTERNS" | grep '^OFFENDER' || true)" ]; then
+    bad "the clause filter uses regex the LIVE engine (gh's gojq over Go/RE2) REJECTS: $(printf '%s\n' "$PATTERNS" | grep '^OFFENDER' | head -1 | cut -c1-120) — the live path would refuse every certificate, however green this suite is"
+  else
+    ok "all $PAT_COUNT clause-filter patterns are free of constructs RE2 rejects (lookaround, backreferences, Oniguruma-only escapes, atomic/possessive forms)"
+  fi
 fi
 # …and compile them on the REAL engine when gh is available, rather than trusting the
-# rule above. Needs network+auth, so it prints a SKIP it cannot run: a skip that is
-# PRINTED is honest, a skip that is silent is a no-op gate.
+# list above. Needs network+auth, so it prints a SKIP it cannot run: a skip that is
+# PRINTED is honest, a skip that is silent is a no-op gate — and while that SKIP stands,
+# the check above is a NAME LIST, not proof, which is what its wording says.
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   PROG="$(printf '%s\n' "$PATTERNS" | sed -n 's/^P //p' | python3 -c '
 import json, sys
@@ -608,12 +618,12 @@ if lits:
   if [ -z "$PROG" ]; then
     echo "    (SKIP: no pattern could be extracted — the live-engine compile check did NOT run)"
   elif gh api /rate_limit --jq "$PROG" >/dev/null 2>&1; then
-    ok "gh's own jq engine (gojq/RE2) compiles all $PAT_COUNT patterns the filter hands to test()"
+    ok "gh's own jq engine (gojq/RE2) compiles all ${PAT_COUNT:-?} patterns the filter hands to test()/match()"
   else
     bad "gh's own jq engine REJECTED a pattern in the filter — the LIVE path cannot certify anything, however green this suite is"
   fi
 else
-  echo "    (SKIP: gh unavailable or unauthenticated — the live-engine compile check did NOT run)"
+  echo "    (SKIP: gh unavailable or unauthenticated — the live-engine compile check did NOT run; only the name list above applies)"
 fi
 
 echo
