@@ -107,14 +107,26 @@ esac
 # review of the retired implementation). The tolerance is carried over, not
 # re-invented.
 #
-# `lane parity: PR ⊇ main` IS SHAPE-CHECKED WITH ITS SEPARATOR, not as a prefix. A
-# confirming review found that a prefix test accepts a line that NEGATES parity —
-# `lane parity: PR ⊇ main is NOT established — this head did NOT execute every
-# shard` — and certified a vacuous body, which is the #1319 fail-open this clause
-# exists to close. The producer's positive value is
-# `PR ⊇ main — the PR executed every test shard…` (built at admin-merge.sh:3354), so
-# the em dash is required: a negation cannot follow it. §6 pins that spelling in the
-# producer, so the two move together or the pin reddens first.
+# PARITY IS SHAPE-CHECKED, NOT PREFIX-MATCHED, AND THAT TOOK TWO ROUNDS TO GET RIGHT.
+# Round one found that a bare prefix test accepted a line that NEGATES parity
+# (`lane parity: PR ⊇ main is NOT established — …`); requiring the em dash closed
+# that spelling. Round two (a fresh adversarial reviewer) then reproduced the SAME
+# class one spelling further in: `lane parity: PR ⊇ main — NOT established: this
+# head did NOT execute every shard…` still certified, because the em dash is a
+# separator, not a truth value — a negation can follow it. The clause therefore
+# requires the producer's ACTUAL POSITIVE SENTENCE, essentially as emitted
+# (`parity_evidence="PR ⊇ main — the PR executed every test shard main's lane
+# executed (parity family: …)"`, admin-merge.sh:3355), with only the parenthetical
+# optional and any other trailing text — including an appended `NOT established`
+# inside the parenthetical — refused by requiring the line to END there, plus an
+# explicit negation exclusion as a second, independent guard (the same shape as the
+# `0+` guard on the vacuity test).
+#
+# The sentence is pinned in the PRODUCER by §6 of the contract suite, so the two
+# move together: a producer reword reddens the suite at the PR that causes it, and
+# the gate cannot silently require a spelling the producer no longer emits. That
+# pin is the mechanism that turns "pin the producer's sentence" from brittle into
+# safe, and it is why the sentence — and not a loose prefix — is what is checked.
 #
 # VACUITY IS DERIVED FROM THE COUNTS, NOT FROM THE PRODUCER'S DESCRIPTIVE LINE, and
 # this is a fail-open that BOTH reviewers of the first revision reproduced
@@ -148,7 +160,9 @@ CLAUSE_FILTER='(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
   and (test("main compared \\(union of [0-9]+ runs?( of .+)?\\):"))
   and (test("PR failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*main failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*blocked by the decision:\\s*0([ \\t\\r\\n]|$)"))
   and (test("PR=0 \\| main=0\\.([ \\t\\r\\n]|$)"))
-  and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not) or test("(^|\\n)[ \\t]*lane parity: PR ⊇ main —"))'
+  and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not)
+       or (test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( \\([^\\n]*\\))?[ \\t]*(\\n|$)")
+           and (test("(^|\\n)[ \\t]*lane parity:[^\\n]*(NOT ESTABLISHED|NOT established|not established)") | not)))'
 jq_program='[ .comments[].body | select('"$CLAUSE_FILTER"') ] | length'
 
 if [ -n "$BODY_FILE" ]; then

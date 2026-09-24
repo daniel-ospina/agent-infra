@@ -40,7 +40,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # rather than dressed up as "every class fails before its fix".
 VERIFIER="${VERIFIER_UNDER_TEST:-$ROOT/scripts/verify-admin-merge-evidence.sh}"
 TS_GATE="${TS_GATE_UNDER_TEST:-$ROOT/extensions/review-enforcer/index.ts}"
-PRODUCER="$ROOT/scripts/admin-merge.sh"
+PRODUCER="${PRODUCER_UNDER_TEST:-$ROOT/scripts/admin-merge.sh}"
 NEG="$HERE/captured-1406-vacuous-parity-not-established.md"
 POS="$HERE/derived-1406-nonvacuous-counts.md"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
@@ -109,22 +109,53 @@ fi
 #     check is not a spelling preference, it is the certification itself.
 sed 's/blocked by the decision: 0/blocked by the decision: 1/' "$POS" > "$TMP/m-clause4.md"
 if certifies "$TMP/m-clause4.md"; then bad "a wrong clause-4 value still CERTIFIED (the requirement is not load-bearing)"; else ok "mutation: a wrong clause-4 value refuses"; fi
+# (a2) …and the RETIRED spelling must not certify either. This is the outage's own
+#      shape: the gate must require what the producer emits TODAY, so a body still
+#      carrying `unique to this PR: 0` is refused — not because the claim is wrong
+#      (it was stronger) but because the producer can no longer prove it and this
+#      gate must track the producer. Both directions are pinned: the retired spelling
+#      is refused here, and §5's LITS pin keeps it out of the FILTER.
+sed 's/blocked by the decision: 0/unique to this PR: 0/' "$POS" > "$TMP/m-retired.md"
+if grep -q 'unique to this PR: 0' "$TMP/m-retired.md"; then
+  if certifies "$TMP/m-retired.md"; then bad "a body carrying the RETIRED clause ('unique to this PR: 0') CERTIFIED — the gate accepts a spelling the producer no longer emits"; else ok "mutation: the retired clause spelling refuses"; fi
+else
+  bad "the retired-clause mutation did not apply, so it proves nothing"
+fi
 # (b) the attribution count — a dropped token means a CLIPPED set, not a measured zero.
 sed 's/PR=0 | main=0/PR=2 | main=0/' "$POS" > "$TMP/m-attr.md"
 if certifies "$TMP/m-attr.md"; then bad "a CLIPPED set (PR=2) still CERTIFIED (clause 5 fail-open)"; else ok "mutation: a CLIPPED set refuses"; fi
 # (c) remove the parity line from the vacuous case.
 grep -v 'lane parity: PR ⊇ main' "$TMP/vac-par.md" > "$TMP/m-parity.md"
 if certifies "$TMP/m-parity.md"; then bad "vacuous WITHOUT parity still CERTIFIED (clause 5 fail-open)"; else ok "mutation: vacuous without parity refuses"; fi
-# (c2) …and a parity line that NEGATES parity must not certify either. A confirming
-#      review reproduced this against the earlier PREFIX test: `lane parity: PR ⊇ main
-#      is NOT established` matched `^(...)[ \t]*lane parity: PR ⊇ main`, so a vacuous
-#      body with an explicitly negated parity claim certified — the #1319 wrong-lane
-#      fail-open. The value is now shape-checked with its em dash.
+# (c2) …and a parity line that NEGATES parity must not certify either, IN EITHER
+#      SPELLING. A confirming review reproduced the first spelling against an earlier
+#      PREFIX test (`lane parity: PR ⊇ main is NOT established` matched
+#      `^(...)[ \t]*lane parity: PR ⊇ main`). Requiring the em dash closed that one,
+#      and a SECOND confirming review then reproduced the class one spelling further
+#      in: `lane parity: PR ⊇ main — NOT established: …` still certified, because a
+#      separator is not a truth value. Both are pinned here, and the clause now
+#      requires the producer's actual positive sentence (see the verifier's comment).
 sed 's/^   lane parity: .*/   lane parity: PR ⊇ main is NOT established — this head did NOT execute every shard/' "$NEG" > "$TMP/m-parity-negated.md"
 if grep -q 'PR ⊇ main is NOT established' "$TMP/m-parity-negated.md"; then
-  if certifies "$TMP/m-parity-negated.md"; then bad "a NEGATED parity line ('PR ⊇ main is NOT established') CERTIFIED (clause 5 fail-open — the parity value is not shape-checked)"; else ok "mutation: a NEGATED parity line refuses (the parity value is shape-checked, not a prefix)"; fi
+  if certifies "$TMP/m-parity-negated.md"; then bad "a NEGATED parity line ('PR ⊇ main is NOT established') CERTIFIED (clause 5 fail-open)"; else ok "mutation: a NEGATED parity line (no em dash) refuses"; fi
 else
   bad "the negated-parity mutation did not apply, so it proves nothing"
+fi
+# (c3) THE SAME NEGATION *AFTER* THE EM DASH — the spelling the first fix left open.
+sed 's/^   lane parity: .*/   lane parity: PR ⊇ main — NOT established: this head did NOT execute every shard main ran/' "$NEG" > "$TMP/m-parity-postdash.md"
+if grep -q 'PR ⊇ main — NOT established' "$TMP/m-parity-postdash.md"; then
+  if certifies "$TMP/m-parity-postdash.md"; then bad "a parity line that NEGATES parity AFTER the em dash CERTIFIED (clause 5 fail-open — an em dash is a separator, not a truth value)"; else ok "mutation: a negation AFTER the em dash refuses"; fi
+else
+  bad "the post-em-dash negation mutation did not apply, so it proves nothing"
+fi
+# (c4) …and a body that states the producer's positive sentence and then DISCLAIMS it
+#      (the disclaimer inside the parenthetical the clause tolerates) must refuse too:
+#      the line must END at the sentence, and this is the second guard's job.
+sed 's/^   lane parity: .*/   lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family: ci*; 3 shard(s) — BUT parity was NOT established)/' "$NEG" > "$TMP/m-parity-trap.md"
+if grep -q 'BUT parity was NOT established' "$TMP/m-parity-trap.md"; then
+  if certifies "$TMP/m-parity-trap.md"; then bad "the positive sentence with an appended negation CERTIFIED (clause 5 fail-open)"; else ok "mutation: the positive sentence with an appended disclaimer refuses"; fi
+else
+  bad "the appended-disclaimer mutation did not apply, so it proves nothing"
 fi
 # (d) the marker — an unrelated body must not certify.
 grep -v 'admin-merge-safety' "$POS" > "$TMP/m-marker.md"
@@ -236,13 +267,39 @@ PIN_EMISSION=(
   '<!-- admin-merge-safety: %s -->'
   'PR head: %s'
   'main compared (union of %s %s of %s): %s'
-  'PR failing: %s | main failing: %s | blocked by the decision: 0'
+  # WITH ITS TERMINATOR: the pin stops at the end of the FORMAT STRING (`0\n'`), so a
+  # producer that emitted `…blocked by the decision: 0X` would break this instead of
+  # satisfying a pin that stops at `0`. (The line continues with printf ARGUMENTS, so
+  # this one cannot be an end-of-line check.) A reviewer reproduced the `0X` case.
+  "PR failing: %s | main failing: %s | blocked by the decision: 0\\n'"
 )
 PIN_OTHER=(
   'run_word="runs"'
   'run_word="run"'
-  'attribution_line="Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=${pr_drops} | main=${main_drops}.'
 )
+# …AND THIS ONE MUST *END ITS LINE*, checked as such rather than as a substring: the
+# attribution's first line ends at `${main_drops}.`, so a producer that emitted
+# `main=${main_drops}.Z` would ship a body the gate REFUSES while a substring pin
+# stayed green. The line stops there because the string continues on the next line
+# (the CLIPPED/COMPARABLE explanation), which is why the terminator is the period and
+# not a quote. A reviewer reproduced the `.Z` case.
+PIN_ENDLINE=(
+  'main=${main_drops}.'
+)
+# The producer's PARITY VALUE, pinned as a SENTENCE rather than as the delimiter the
+# gate checks. A pin on `PR ⊇ main —` is satisfied by `PR ⊇ main — NOT established: …`,
+# so a producer that reworded or negated its positive value could keep this green
+# while the gate accepted a negation. The gate now requires this sentence, so the pin
+# must cover the sentence: a producer reword reddens here, at the PR that causes it.
+PIN_PARITY_VALUE='parity_evidence="PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family:'
+endline_present() {  # the literal must END a line of the file
+  python3 - "$1" "$2" <<'PY'
+import sys
+path, lit = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+sys.exit(0 if any(line.endswith(lit) for line in text.splitlines()) else 1)
+PY
+}
 producer_pin_missing() {  # prints the first missing requirement, or nothing when OK
   local f="$1" blk lit
   blk="$(emission_block "$f")"
@@ -253,8 +310,18 @@ producer_pin_missing() {  # prints the first missing requirement, or nothing whe
   for lit in "${PIN_OTHER[@]}"; do
     if ! grep -qF "$lit" "$f"; then printf '%s\n' "$lit"; return; fi
   done
-  if ! parity_block "$f" | grep -qF 'lane parity: $parity_evidence'; then
-    printf '%s\n' 'lane parity: $parity_evidence (in the vacuous block)'
+  for lit in "${PIN_ENDLINE[@]}"; do
+    if ! endline_present "$f" "$lit"; then printf '%s\n' "$lit (must END its line)"; return; fi
+  done
+  if ! grep -qF "$PIN_PARITY_VALUE" "$f"; then
+    printf '%s\n' "$PIN_PARITY_VALUE"; return
+  fi
+  # …and the parity REFERENCE must be its own line's start, indentation aside: the
+  # gate anchors `(^|\n)[ \t]*lane parity:`, so a producer edit that prefixes the
+  # line (`NOTE lane parity: …`) would make every certificate refuse while a
+  # substring pin stayed green. A reviewer reproduced that too.
+  if ! parity_block "$f" | grep -qE '^[[:space:]]*lane parity: \$parity_evidence[[:space:]]*$'; then
+    printf '%s\n' 'a line of the form `lane parity: $parity_evidence` (line-initial, nothing else on the line)'
   fi
 }
 if miss="$(producer_pin_missing "$PRODUCER")"; [ -z "$miss" ]; then
@@ -267,7 +334,7 @@ fi
 # log line would still satisfy a file-wide grep, and the first version of this
 # self-test was fooled by exactly that.)
 MUTN=0
-for lit in "${PIN_EMISSION[@]}" "${PIN_OTHER[@]}" 'lane parity: $parity_evidence'; do
+for lit in "${PIN_EMISSION[@]}" "${PIN_OTHER[@]}" "${PIN_ENDLINE[@]}" "$PIN_PARITY_VALUE" 'lane parity: $parity_evidence'; do
   MUTN=$((MUTN+1))
   cp "$PRODUCER" "$TMP/producer-mut.sh"
   python3 - "$TMP/producer-mut.sh" "$lit" <<'PY'
@@ -351,10 +418,19 @@ fi
 #   v2b) excluded any line containing `PR failing:` -> MISSED the HISTORICAL
 #       re-implementation itself, whose regex spells the whole count clause
 #       (`/PR failing:\s*\d+ … unique to this PR:\s*0\b/.test(body)`).
+# A THIRD was reported by a confirming review and is the reason for the NORMALIZATION
+# below: v3 matched the phrases CONTIGUOUSLY, so a re-implementation that split a
+# literal across adjacent fragments (`"blocked by the " + "decision: 0"`, an array
+# `.join("")`, or a `\u0020` escape) named the clause while the pin stayed green. The
+# line is now folded (whitespace, quotes, `+`, `\u0020`, case) BEFORE matching, so the
+# fragments cannot be separated; the alternative spelling of the count clause is
+# checked as a FRAGMENT (`uniquetothis`) for the same reason.
 # The self-tests below run the pin against exactly those spellings, including the
-# historical one, so the pin cannot pass by being unable to see what it exists to see.
+# historical one and the three split ones, so the pin cannot pass by being unable to
+# see what it exists to see.
 TS_CODE="$(sed 's://.*::' "$TS_GATE" | grep -v '^[[:space:]]*[*]')"
-pin_flags() { printf '%s\n' "$1" | grep -E 'blocked by the decision|unique to this PR' | grep -vq 'blocked by the decision: 1'; }
+fold_clause_text() { tr -d ' \t' | sed 's/\\u0020//g' | sed 's/["\x27+]//g' | tr 'A-Z' 'a-z'; }
+pin_flags() { printf '%s\n' "$1" | fold_clause_text | grep -E 'blockedbythe|uniquetothis' | grep -vq 'blockedbythedecision:1'; }
 if pin_flags "$TS_CODE"; then
   bad "the TS gate re-implements the contract's clauses instead of delegating (clause 6)"
 else
@@ -372,6 +448,9 @@ done <<'PROBES'
 const CLAUSE = "blocked by the decision";
 const RESIDUAL_RE = /blocked by the decision:\s*0/;
 body.includes("blocked by the decision: 0")
+const SPLIT = "blocked by the " + "decision: 0";
+const SPLIT2 = ["blocked by the ", "decision"].join("");
+const SPLIT3 = "blocked by the\u0020decision: 0";
 PROBES
 # …and the probe DATA line must NOT fire (it is the one legitimate occurrence).
 if pin_flags '    "\nPR failing: 1 | main failing: 0 | blocked by the decision: 1" +'; then

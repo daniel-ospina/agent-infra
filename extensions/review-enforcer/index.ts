@@ -1803,7 +1803,12 @@ export function evidenceHeadInBody(body: string): string | null {
 }
 
 /**
- * Is `body` a CERTIFYING evidence comment for the marker SHA `markerSha`?
+ * Is `body` a CERTIFYING evidence comment for the revision `currentHead`?
+ *
+ * The second argument is the CURRENT head being merged — never the sha read out of the
+ * marker. A caller that passed the marker's own value would make the verifier's
+ * head-bound clauses self-satisfying (every comment reaching this function contains
+ * that marker by construction); see the note inside for the reproduced bypass.
  *
  * What this CANNOT do: prove the comparison actually ran. The counts line is
  * text, and a determined agent can type it. No agent-side check can close that
@@ -1915,7 +1920,7 @@ export function resolveAdminMergeEvidenceVerifier(): string | null {
   return null;
 }
 
-export function evidenceBodyIsCertifying(body: string, markerSha: string): boolean {
+export function evidenceBodyIsCertifying(body: string, currentHead: string): boolean {
   // #1388 clause 6 — SINGLE SOURCE, and this is the fix for the six-day outage.
   //
   // This function used to re-implement the clause set as its own regexes. That
@@ -1937,6 +1942,17 @@ export function evidenceBodyIsCertifying(body: string, markerSha: string): boole
   // FAIL CLOSED on every failure below: a gate that cannot run its check must
   // block, never allow. That is why a missing script or a missing `jq` refuses
   // the merge instead of silently certifying it.
+  // THE HEAD PASSED HERE IS THE CURRENT HEAD, NOT THE MARKER'S OWN VALUE, and that
+  // distinction is the whole of this gate's head binding. A confirming adversarial
+  // review found the earlier call passing the sha CAPTURED FROM THE MARKER: since a
+  // comment only reaches this function because it contains that marker, passing the
+  // marker's own value made the verifier's head-bound clauses (`<!-- admin-merge-safety:
+  // <head> -->`, `PR head: <head>`) SELF-SATISFYING, so a marker naming a 12-char
+  // prefix certified in this layer while the shim refused it — two layers, two
+  // verdicts, on the one clause (T5) that stops stale evidence unlocking a new head.
+  // The marker's own binding is checked by `bound` at the CALL SITE (a prefix of the
+  // current head, never of an earlier one); what is checked HERE is that the evidence
+  // is the evidence for the head that is actually being merged.
   const verifier = resolveAdminMergeEvidenceVerifier();
   if (verifier === null) return false;
   // …and the delegate must first prove it is a CONTRACT and not a no-op. This is a
@@ -1956,7 +1972,7 @@ export function evidenceBodyIsCertifying(body: string, markerSha: string): boole
     // `execFileSync`, not `execSync`: no shell, so the script path and the head
     // are argv rather than a command string. An enforcement gate should not have
     // a shell-interpolation surface at all.
-    execFileSync("bash", [verifier, "--body-file", tmp, "--head", markerSha], {
+    execFileSync("bash", [verifier, "--body-file", tmp, "--head", currentHead], {
       stdio: "ignore",
       timeout: 15_000,
     });
@@ -2051,7 +2067,7 @@ export function evaluateAdminMergeGate(
       const bound = sha.length >= 40
         ? currentHead.toLowerCase() === sha
         : currentHead.toLowerCase().startsWith(sha);
-      if (bound && evidenceBodyIsCertifying(body, sha)) {
+      if (bound && evidenceBodyIsCertifying(body, currentHead)) {
         return {
           status: "allow",
           message:

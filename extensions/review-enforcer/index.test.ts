@@ -3943,8 +3943,21 @@ test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
   const vac = good.replace("PR failing: 0 | main failing: 3 | blocked by the decision: 0",
     "measured sets: PR failing=0, main failing=0\nPR failing: 0 | main failing: 0 | blocked by the decision: 0\nlane parity: NOT ESTABLISHED — declared off");
   ok(!evidenceBodyIsCertifying(vac, MARK), "a vacuous comparison with parity NOT ESTABLISHED does NOT certify (clause 5)");
-  ok(evidenceBodyIsCertifying(vac.replace("NOT ESTABLISHED — declared off", "PR ⊇ main — main's failing node ids are a subset of the PR's"), MARK),
-    "a vacuous comparison WITH established lane parity certifies (clause 5)");
+  // THE PRODUCER'S OWN SENTENCE, not a paraphrase of it: the clause requires the
+  // producer's actual positive value, so a fixture that said something *like* it
+  // (`… main's failing node ids are a subset of the PR's`) would have hidden the
+  // fact that the gate now demands the real spelling — and a fixture is the one
+  // thing that cannot notice the producer moving (#1388).
+  const PARITY_POSITIVE = "lane parity: PR ⊇ main — the PR executed every test shard main's lane executed (parity family: ci*; 3 shard(s) on the PR side, 3 on main)";
+  ok(evidenceBodyIsCertifying(vac.replace("lane parity: NOT ESTABLISHED — declared off", PARITY_POSITIVE), MARK),
+    "a vacuous comparison WITH the producer's established-parity sentence certifies (clause 5)");
+  // …and the negation a confirming review reproduced one spelling further in: the
+  // em dash is a SEPARATOR, not a truth value, so a negation can follow it. Both
+  // spellings must refuse, and this pair is the test that keeps that closed.
+  ok(!evidenceBodyIsCertifying(vac.replace("NOT ESTABLISHED — declared off", "PR ⊇ main — NOT established: this head did NOT execute every shard main ran"), MARK),
+    "a parity line that NEGATES parity AFTER the em dash does NOT certify (clause 5)");
+  ok(!evidenceBodyIsCertifying(vac.replace("NOT ESTABLISHED — declared off", PARITY_POSITIVE.replace(" executed (parity family:", " executed (parity family: BUT parity was NOT established;")), MARK),
+    "the positive sentence with an appended disclaimer does NOT certify (the line must END at the sentence)");
   ok(!evidenceBodyIsCertifying(good.replace("main compared (union of 10 runs of python-ci.yml): s1:1,s2:2\n", ""), MARK),
     "missing main provenance does NOT certify");
   // The rail prints the runs that ACTUALLY CONTRIBUTED to the union, so a one-run
@@ -4003,7 +4016,8 @@ test("evidenceBodyIsCertifying: delegation to the shim's verifier is GENUINE (#1
   const corpus: Array<[string, string, boolean]> = [
     ["a non-vacuous zero residual", body(nonVacuous), true],
     ["a vacuous comparison WITHOUT parity", body(vacuous), false],
-    ["a vacuous comparison WITH parity", body(vacuous) + "\nlane parity: PR ⊇ main — the PR executed every shard main's lane executed", true],
+    ["a vacuous comparison WITH parity", body(vacuous) + "\nlane parity: PR ⊇ main — the PR executed every test shard main's lane executed (parity family: ci*; 3 shard(s) on the PR side, 3 on main)", true],
+    ["a vacuous comparison whose parity line negates parity AFTER the em dash", body(vacuous) + "\nlane parity: PR ⊇ main — NOT established: this head did NOT execute every shard main ran", false],
     ["a fractional residual", body("PR failing: 0 | main failing: 0 | blocked by the decision: 0.5"), false],
     ["a zero-prefixed residual", body("PR failing: 0 | main failing: 0 | blocked by the decision: 01"), false],
     ["a leading-zero count (a vacuous body spelled non-canonically)", body("PR failing: 00 | main failing: 0 | blocked by the decision: 0"), false],
@@ -4107,6 +4121,15 @@ test("evaluateAdminMergeGate: pure decisions", () => {
   equal(evaluateAdminMergeGate(1, head, commented("c".repeat(40), ev), false).status, "block", "stale evidence (head X, now Y) → block");
   equal(evaluateAdminMergeGate(1, head, ["<!-- admin-merge-safety: " + head + " -->"], false).status, "block", "vacuous marker → block");
   equal(evaluateAdminMergeGate(1, head, commented(head, ev), false).status, "allow", "head-bound non-vacuous evidence → allow");
+  // A SHORT-SHA MARKER AT THE GATE LEVEL. `bound` accepts a marker that is a prefix of
+  // the current head, but the verifier must be asked about the CURRENT HEAD — not about
+  // the marker's own value, which is self-satisfying (every comment that reaches the
+  // predicate contains that marker by construction). A confirming review found the
+  // earlier call passing the marker's value: a 12-char marker then certified HERE while
+  // the shim refused it, i.e. two layers, two verdicts, on the clause that stops stale
+  // evidence unlocking a new head. This is the production call shape.
+  equal(evaluateAdminMergeGate(1, head, [ev.split("<SHA>").join(head.slice(0, 12))], false).status, "block",
+    "a short-sha marker (a prefix of the current head, but not the head) → block");
   // A marker bound to the current head, pasted onto a body that names a DIFFERENT
   // revision: refused (the forgery case the review found open).
   equal(evaluateAdminMergeGate(1, head, [ev.split("<SHA>").join(head)
