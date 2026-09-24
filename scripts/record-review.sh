@@ -361,9 +361,20 @@ fi
 # differ, and `git patch-id --stable`/`--verbatim` both MATCH while the raw
 # diff hash did not (5 of 6 sampled BEHIND PRs refused a still-correct
 # verdict). Those refusals are false obligations: the change is identical;
-# only derived rendering moved. The normalization drops `index` lines and
-# zeros the hunk-header start lines; hunk CONTENT and COUNTS are untouched
-# (counts derive from content, so they move only when content moves).
+# only derived rendering moved. The normalization drops the `index` line
+# exactly when the ENTRY's hunk content already carries the change, and zeros
+# the hunk-header start lines; hunk CONTENT and COUNTS are untouched (counts
+# derive from content, so they move only when content moves).
+#
+# #1362 AMENDMENT (2026-09-23, recorded on the issue): the drop is
+# ENTRY-SCOPED. A binary entry has NO hunk, so its `index` line is its ONLY
+# content-bearing field — dropping it made two different binaries at the same
+# path normalize to the SAME digest, a fail-open in a required merge gate
+# (sign a marker over binary v1, swap in v2, the gate accepts an unreviewed
+# binary). Rule: drop the `index` line exactly when the hunk content already
+# carries the change; keep it verbatim otherwise (binary entries, and the
+# hunk-less empty-file add/delete). The predicate is hunk presence, never a
+# binary marker. Implemented in the shared normalizer — see its docstring.
 #
 # THE BINDING STAYS A SHA256 over content — deliberately NOT `git patch-id`:
 # `--stable` and the default both IGNORE whitespace (a false ACCEPT: a

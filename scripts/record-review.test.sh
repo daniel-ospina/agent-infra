@@ -751,7 +751,9 @@ unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
 # ─────────────────────────────────────────────────────────────────────────
 # The normalization itself is pinned BYTE-FOR-BYTE by
 # scripts/diff-normalize.test.sh. THIS section pins the PRODUCER's use of it
-# end-to-end and carries the four required mutation pins ((a)-(d)). Each mutant
+# end-to-end and carries the four required mutation pins ((a)-(d)) plus §12f,
+# the binary fail-open the 2026-09-23 amendment closed (with its own mutation
+# pin). Each mutant
 # is a real copy of record-review.sh whose SIBLING lib/diff-normalize.py is a
 # different primitive — the shared-normalizer design is what makes the mutation
 # a single-file swap — so every property test is shown to FAIL when its own
@@ -912,7 +914,58 @@ assert_contains "$RECORD_ERR" "diff normalizer is unavailable" "12e fail-open: t
 assert_contains "$RECORD_CAP" "diff=$RH" "12e fail-open: the marker carries the RAW digest (a verifiable legacy hash)"
 if grep -qF "diff=$NH" <<<"$RECORD_CAP"; then bad "12e fail-open: the marker must NOT carry a normalized digest when the normalizer is missing"; else ok "12e fail-open: no normalized digest is minted without the normalizer"; fi
 
-unset NFX NFX2 NFXC NFXW NORM_PY NH RH MNC_H MWS_H NPR_a NPR_b NPR_c NPR_d NPR_m
+# ── 12f THE BINARY FAIL-OPEN (2026-09-23 amendment) ──────────────────────
+# A binary entry has NO hunk, so its `index` line is its ONLY content-bearing
+# field (`Binary files … differ` is content-independent). Before the amendment
+# the normalizer dropped it unconditionally, so a signed marker over binary v1
+# carried to binary v2 at the same path: review v1, sign the marker, swap in v2,
+# digest unchanged → the gate accepts an UNREVIEWED binary. The amendment scopes
+# the drop to entries that HAVE a hunk; the predicate is hunk PRESENCE, never a
+# binary marker (an empty-file add/delete keeps its index line too).
+NBFA="$T/nb-a.diff"; printf 'diff --git a/f.bin b/f.bin\nindex 1111111..2222222 100644\nBinary files a/f.bin and b/f.bin differ\n' > "$NBFA"
+NBFB="$T/nb-b.diff"; printf 'diff --git a/f.bin b/f.bin\nindex 1111111..3333333 100644\nBinary files a/f.bin and b/f.bin differ\n' > "$NBFB"
+NBH="$(norm_sha "$NBFA")"
+assert_ne "$NBH" "$(norm_sha "$NBFB")" "12f direct: two DIFFERENT binaries have DIFFERENT normalized digests (fail-open closed)"
+assert_ne "$(raw_sha "$NBFA")" "$(raw_sha "$NBFB")" "12f control: the raw digests also differ (the fixtures are not degenerate)"
+NPR_f=424704; rm -f "$(Q2 $NPR_f)"
+run_record_diff "$NPR_f" "$STALE" "body
+
+$(signed_marker $NPR_f "$STALE" "$NBH")" "$NBFB"
+[ "$RECORD_RC" = "3" ] && ok "12f a signed marker over binary v1 does NOT carry to a swapped binary v2 (rc 3)" || bad "12f carried an unreviewed binary (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$(Q2 $NPR_f)" ] && ok "12f no record written for the swapped binary" || bad "12f wrote a record for a swapped binary"
+
+# MUTATION PIN — the (a) evidence. Rebuild the pre-amendment primitive
+# (unconditional index drop) and show the SAME end-to-end vector FALSELY CARRIES
+# under it (rc 0). That is precisely the hole the entry-scoping closes, and it is
+# why §12f's refusal above is load-bearing rather than an artifact.
+mut_dir "$T/mut-unscoped"
+cat > "$T/mut-unscoped/lib/diff-normalize.py" <<'PY'
+import re, sys
+out = []
+for line in sys.stdin.buffer.read().decode("latin-1").split("\n"):
+    if re.match(r"^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]{6})?$", line):
+        continue   # MUTATION: unconditional drop (the pre-amendment rule)
+    m = re.match(r"^@@ -([0-9]+)(,([0-9]+))? \+([0-9]+)(,([0-9]+))? @@(.*)$", line)
+    if m:
+        line = "@@ -0,%s +0,%s @@%s" % (m.group(3) or "1", m.group(6) or "1", m.group(7))
+    out.append(line)
+sys.stdout.buffer.write("\n".join(out).encode("latin-1"))
+PY
+MUS_H="$(norm_sha_with "$T/mut-unscoped/lib/diff-normalize.py" "$NBFA")"
+assert_eq "$MUS_H" "$(norm_sha_with "$T/mut-unscoped/lib/diff-normalize.py" "$NBFB")" \
+  "12f mutation control: under the pre-amendment primitive the two binaries COLLAPSE to one digest"
+if cmp -s <(python3 "$NORM_PY" < "$NBFA") <(python3 "$T/mut-unscoped/lib/diff-normalize.py" < "$NBFA"); then
+  bad "12f mutation control: the mutant normalizer is not actually a mutation on the binary fixture"
+else
+  ok "12f mutation control: the mutant differs from the shipped normalizer on the binary fixture (it is a genuine mutation)"
+fi
+NPR_m=424715; rm -f "$(Q2 $NPR_m)"
+run_record_diff_with "$T/mut-unscoped/record-review.sh" "$NPR_m" "$STALE" "body
+
+$(signed_marker $NPR_m "$STALE" "$MUS_H")" "$NBFB"
+[ "$RECORD_RC" = "0" ] && ok "12f MUTATION PIN: with entry-scoping REMOVED the swapped binary WOULD carry (rc 0) — §12f is load-bearing" || bad "12f mutation: expected a false carry (rc=$RECORD_RC) — §12f is NOT testing entry-scoping"
+
+unset NFX NFX2 NFXC NFXW NORM_PY NH RH MNC_H MWS_H NPR_a NPR_b NPR_c NPR_d NPR_f NPR_m NBFA NBFB NBH MUS_H
 # ─────────────────────────────────────────────────────────────────────────
 # 10. #1348 clean-low content-shape guard — ADVERSARIAL DOMAIN
 # ─────────────────────────────────────────────────────────────────────────
