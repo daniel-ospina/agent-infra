@@ -245,6 +245,27 @@ attr_case clipped-masked 'Attribution — FAILED tokens DROPPED by the parser (n
 attr_case planted-over-clipped 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=3 | main=0.\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.' refuse
 attr_case control-char 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): \x01PR=0 | main=0.' refuse
 attr_case indented-real '    Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.' certify
+
+# (b5) …AND THE SELECTION MUST POLICE EVERY LINE THAT CARRIES THE FRAMING. A first
+#      narrowing excluded control characters from the SELECTION as well as from the
+#      match, so a contradictory attribution line written with a TAB inside its framing
+#      span was never collected and never checked: the REAL line certified the body and
+#      the tab-framing decoy rode along unchecked. The selection is LF-only now; the
+#      exact pattern polices everything it collects, which is where control characters
+#      belong. This decoy is APPENDED (the fixture keeps its real line), because that is
+#      the shape that distinguishes the two revisions — replacing the line outright
+#      refuses on both.
+python3 - "$POS" "$TMP/m-attr-tab-decoy.md" <<'PYEOF'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+decoy = "Attribution — FAILED\ttokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=3 | main=0.\n"
+pathlib.Path(sys.argv[2]).write_text(text + decoy, encoding="utf-8")
+PYEOF
+if certifies "$TMP/m-attr-tab-decoy.md"; then
+  bad "a TAB-framing decoy line rode along unchecked beside the real attribution (the guard's SELECTION is narrower than the claim it polices)"
+else
+  ok "attribution guard: a TAB-framing decoy line is policed too (refuse, as required)"
+fi
 if certifies "$TMP/m-attr.md"; then bad "a CLIPPED set (PR=2) still CERTIFIED (clause 5 fail-open)"; else ok "mutation: a CLIPPED set refuses"; fi
 # (c) remove the parity line from the vacuous case.
 grep -v 'lane parity: PR ⊇ main' "$TMP/vac-par.md" > "$TMP/m-parity.md"
