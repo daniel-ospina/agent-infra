@@ -748,6 +748,20 @@ out="$(bash "$CHECK" --repo 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 2 "--repo with no value exits 2 (usage), not 1"
 assert_contains "$out" "worktree_unlinked" "…and prints the usage header"
 
+# 10p. A `.git` that is a DIRECTORY (a partial delete, or git metadata left behind) is a hazard
+# shape the header names — and `rm -f` REFUSES a directory, so the printed repair used to be a
+# silent no-op that left the hub red. The instruction must match the entry's type.
+WDIR="$HW/.worktrees/wtdir1410"
+git -C "$HW" worktree add -q "$WDIR" -b wtdir1410 HEAD
+rm -f "$WDIR/.git"
+mkdir "$WDIR/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a .git DIRECTORY that is not this worktree's link → exit 1"
+assert_contains "$out" "It is a DIRECTORY" "…and the repair says so, rather than printing rm -f"
+apply_repair "$out" 2>/dev/null || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the printed repair actually repairs it (no silent no-op)"
+
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -204,9 +204,16 @@ recovery_guide() {
               T*) lines+=("    Restore the hub's link:")
                         lines+=("      printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
               *)  lines+=("    The .git entry THERE is not this worktree's link — inspect it, then")
-                        lines+=("    replace the entry (rm -f removes the entry itself, never what a")
-                        lines+=("    symlink points at; a directory needs a deliberate look first):")
-                        lines+=("      rm -f $(printf '%q' "$d/.git") && printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
+                        # `rm -f` REFUSES a directory, so printing it for that shape emitted a chain
+                        # that silently did nothing and left the hub red (measured).
+                        if [[ -d "$d/.git" ]]; then
+                          lines+=("    replace the entry. It is a DIRECTORY, so remove it deliberately:")
+                          lines+=("      rm -rf $(printf '%q' "$d/.git") && printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")")
+                        else
+                          lines+=("    replace the entry (rm -f removes the entry itself, never what a")
+                          lines+=("    symlink points at):")
+                          lines+=("      rm -f $(printf '%q' "$d/.git") && printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")")
+                        fi ;;
             esac ;;
         $'M\t'*) IFS= read -r rec || rec=""
             lines+=("  UNVERIFIABLE worktree record: $rec")
