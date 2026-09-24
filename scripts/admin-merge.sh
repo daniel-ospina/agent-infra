@@ -1631,12 +1631,25 @@ residual_of() {
 #                                   merge_group, workflow_dispatch, and every
 #                                   event NOT in the list above.
 # That is a DENY-list of the observed non-code events, deliberately: an
-# UNRECOGNISED event BLOCKS (fail closed). A red check whose run id cannot be
-# resolved at all (a non-Actions app, or a run outside the map window) also
-# BLOCKS — "I could not tell what this is" is not "this is noise".
+# UNRECOGNISED event BLOCKS (fail closed). The run map is a SNAPSHOT — one
+# bounded, branch- or sha-scoped `gh run list` (and an EMPTY one when that
+# listing fails) — so it can simply not carry a red's run. A red whose run the
+# snapshot does not carry is resolved INDIVIDUALLY by its own run id (#1446)
+# before the verdict is taken, because otherwise a non-code base red reads as
+# unresolved and fail-closes into a code-measuring red that blocks every
+# stale-surface PR (the observed `finding-provenance` / `issues` shape: that run
+# WAS inside the window when re-checked, so the miss is a snapshot miss, not a
+# cap). WHY a particular snapshot missed it is deliberately not assumed. A red
+# check whose run id cannot be resolved AT ALL — a non-Actions app, or a run the
+# individual resolve cannot read either — still BLOCKS: "I could not tell what
+# this is" is not "this is noise", and the two cases must stay DISTINGUISHABLE
+# (never default an unresolved run to exempt).
 #
 # ONE `gh run list` resolves them all (id -> event, workflow name), so no single
-# red costs an extra call, and it is fetched ONLY when a red exists. BOUNDED at
+# red costs an extra call UNLESS the snapshot did not carry it — then exactly
+# ONE per-run `gh api .../actions/runs/<id>` is spent on that red (the #1446
+# resolve below).
+# The listing is fetched ONLY when a red exists. BOUNDED at
 # 200 runs; the probed commit is the newest one, so its runs sit at the top. The
 # listing is selected by branch for a branch ref and by --commit for a sha.
 MAIN_HEALTH_RUN_MAP_LIMIT=200
@@ -1658,7 +1671,7 @@ MAIN_HEALTH_RUN_MAP_LIMIT=200
 # anomaly, because a default-branch run cannot attach to a PR head sha.
 check_surface_probe() {
   local ref="$1" label="${2:-main}" allow_noncode="${3:-0}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one
   local map_sel=()
   local blocking=0 other=0
   local repo_args=()
@@ -1905,11 +1918,25 @@ for stamp, ctx, state, url in sbest.values():
         surface_epoch, surface_iso = int(e), stamp
 
 total = len(best) + len(sbest)
+
+def sane(v):
+    # ⛔ THE ROW IS READ POSITIONALLY (`IFS=$'\t' read -r tag name app ...`), so a
+    # TAB or NEWLINE inside ANY upstream free-text field IMPERSONATES the field
+    # separator and SHIFTS every later field: a status `context` carrying three
+    # tabs moves `app` off "commit-status" (defeating the legacy-status gate
+    # that keys on it) and lands an attacker-chosen URL in the field the run-id
+    # regex reads, so a `schedule` run is exempted for a code-measuring red. The
+    # same shift forges `started_iso`/`epoch`, which the staleness anchor uses.
+    # Every interpolated field is flattened to one line here — at the ONE
+    # producer — so the whole shift class is closed at its source.
+    return str(v).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
 for name, app, concl, url, tiso, note in reds:
-    sys.stdout.write("RED\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (name, app, concl, url, tiso, ts_epoch(tiso), note))
+    sys.stdout.write("RED\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"
+                     % tuple(sane(x) for x in (name, app, concl, url, tiso, ts_epoch(tiso), note)))
 for name, app in pend:
-    sys.stdout.write("PENDING\t%s\t%s\n" % (name, app))
-sys.stdout.write("SURFACE\t%s\t%s\n" % (surface_iso, ("" if surface_iso == "" else str(surface_epoch))))
+    sys.stdout.write("PENDING\t%s\t%s\n" % (sane(name), sane(app)))
+sys.stdout.write("SURFACE\t%s\t%s\n" % (sane(surface_iso), ("" if surface_iso == "" else str(surface_epoch))))
 sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), total - len(reds) - len(pend)))' \
     "$cr_json" "$st_json" 2>/dev/null)"
   rc=$?
@@ -1969,9 +1996,47 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         # MAIN_HEALTH_RUN_MAP_LIMIT). The run id is in the check run's own URL.
         run_id="$(printf '%s' "$url" | sed -n 's#.*/runs/\([0-9][0-9]*\).*#\1#p' | head -1)"
         wf=""; ev=""
+        # ⛔ A LEGACY COMMIT STATUS IS NEVER RUN-RESOLVED. The `url` on a status
+        # row is the status's OWN, app-supplied `target_url` — an arbitrary link
+        # — so a `/runs/<N>` inside it names SOME run, not the run that produced
+        # this row; a commit status has NO triggering Actions event at all. Left
+        # ungated, a status red could inherit a `schedule`/`issues` event from
+        # such a URL and be EXEMPTED on the base, though an app's verdict on the
+        # commit measures code. Clearing the id closes BOTH the map path and the
+        # per-run resolve (#1446 review): the row stays code-measuring and BLOCKS.
+        [ "$app" = "commit-status" ] && run_id=""
         if [ -n "$run_id" ] && [ -s "$map_file" ]; then
           ev="$(awk -F'\t' -v id="$run_id" '$1 == id { print $2; exit }' "$map_file")"
           wf="$(awk -F'\t' -v id="$run_id" '$1 == id { print $3; exit }' "$map_file")"
+        fi
+        # ── #1446: RESOLVE A RUN THE SNAPSHOT DID NOT CARRY ─────────────────
+        # The map above is a SNAPSHOT — one bounded, branch- or sha-scoped
+        # `gh run list` (empty when that listing fails) — so it can simply not
+        # carry a red's run. Left unresolved, a `schedule`/`issues` base red
+        # would classify as code-measuring and step 4.6 would refuse every
+        # stale-surface PR (the observed `finding-provenance` refusal — a run
+        # that WAS inside the window when re-checked). Resolve THIS run by its
+        # own id instead.
+        # THE TWO CASES STAY DISTINGUISHABLE and only one of them is exempt:
+        #   * the resolve SUCCEEDS and names a non-code event -> `ev` is set and
+        #     the existing base-side exemption below applies;
+        #   * the resolve SUCCEEDS and names a code event -> `ev` is set and the
+        #     red BLOCKS exactly as before (the workflow is named now, not
+        #     `(workflow unresolved)`);
+        #   * the resolve ANSWERS NOTHING -> `ev` stays empty, `wf` stays
+        #     `(workflow unresolved)`, and the red BLOCKS on BOTH surfaces — the
+        #     fail-closed arm is unchanged. Never default an unresolved run to
+        #     exempt; that would convert this guard into a fail-open.
+        if [ -z "$ev" ] && [ -n "$run_id" ]; then
+          one="$($GH api "$slug/actions/runs/$run_id" \
+                   --jq '[(.event // ""), (.name // "")] | @tsv' 2>/dev/null || true)"
+          # Accept ONLY the projected shape (an event AND the tab separator). A
+          # tab-less answer is not a resolution, so `ev` stays empty and the red
+          # stays fail-closed — the same arm as a resolve that answered nothing.
+          if [ -n "$one" ] && [ "${one#*$'\t'}" != "$one" ]; then
+            ev="${one%%$'\t'*}"
+            wf="${one#*$'\t'}"
+          fi
         fi
         [ -n "$wf" ] || wf="(workflow unresolved)"
         # WHICH NON-CODE EVENTS ARE EXEMPT, AND ON WHICH SURFACE (#1353).
