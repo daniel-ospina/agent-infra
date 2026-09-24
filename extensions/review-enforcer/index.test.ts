@@ -3998,17 +3998,20 @@ test("evidenceBodyIsCertifying: delegation to the shim's verifier is GENUINE (#1
   const body = (extra: string) => "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
     "\nmain compared (union of 3 runs of python-ci.yml): a:1\n" + extra +
     "\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.";
-  const zero = "PR failing: 0 | main failing: 0 | blocked by the decision: 0";
+  const nonVacuous = "PR failing: 2 | main failing: 7 | blocked by the decision: 0";
+  const vacuous = "PR failing: 0 | main failing: 0 | blocked by the decision: 0";
   const corpus: Array<[string, string, boolean]> = [
-    ["a well-formed zero", body(zero), true],
+    ["a non-vacuous zero residual", body(nonVacuous), true],
+    ["a vacuous comparison WITHOUT parity", body(vacuous), false],
+    ["a vacuous comparison WITH parity", body(vacuous) + "\nlane parity: PR ⊇ main — the PR executed every shard main's lane executed", true],
     ["a fractional residual", body("PR failing: 0 | main failing: 0 | blocked by the decision: 0.5"), false],
     ["a zero-prefixed residual", body("PR failing: 0 | main failing: 0 | blocked by the decision: 01"), false],
     ["the retired, stronger claim", body("PR failing: 0 | main failing: 0 | unique to this PR: 0"), false],
-    ["malformed provenance", body(zero).replace("union of 3 runs", "union of 1 banana"), false],
-    ["no provenance", body(zero).replace("main compared (union of 3 runs of python-ci.yml): a:1\n", ""), false],
-    ["no attribution line", body(zero).replace(/\nAttribution[^\n]*/, ""), false],
+    ["malformed provenance", body(nonVacuous).replace("union of 3 runs", "union of 1 banana"), false],
+    ["no provenance", body(nonVacuous).replace("main compared (union of 3 runs of python-ci.yml): a:1\n", ""), false],
+    ["no attribution line", body(nonVacuous).replace(/\nAttribution[^\n]*/, ""), false],
     ["a clipped set stated as zero", body("PR failing: 2 | main failing: 0 | blocked by the decision: 0"), true],
-    ["a marker naming another revision", body(zero).split("PR head: " + MARK).join("PR head: " + "c".repeat(40)), false],
+    ["a marker naming another revision", body(nonVacuous).split("PR head: " + MARK).join("PR head: " + "c".repeat(40)), false],
   ];
   // NO ENV PINNING IS NEEDED, and that is the fix for a fresh-context review's
   // finding: an earlier draft resolved the verifier from the shim's tree
@@ -4063,7 +4066,7 @@ test("evidenceBodyIsCertifying: an environment seam CANNOT redirect the verifier
   // clauses and delegated to nothing, so a planted file was inert.
   const MARK = "d".repeat(40);
   const certifying = "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
-    "\nmain compared (union of 2 runs of python-ci.yml): s1:1\nPR failing: 0 | main failing: 0 | blocked by the decision: 0" +
+    "\nmain compared (union of 2 runs of python-ci.yml): s1:1\nPR failing: 2 | main failing: 7 | blocked by the decision: 0" +
     "\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.";
   const savedShimDir = process.env.AGENT_GH_SHIM_DIR;
   const root = fs.mkdtempSync(resolvePath(os.tmpdir(), "vgate-stub-"));

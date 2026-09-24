@@ -77,11 +77,13 @@ esac
 #   * `PR=0 | main=0` (the attribution line, admin-merge.sh:3318) is the
 #     positive test that the parser dropped NO token. A clipped set is not a
 #     measured zero, so a zero over it does not certify.
-#   * when the comparison was VACUOUS (`measured sets: PR failing …`), require
-#     the positive line `lane parity: PR ⊇ main` (value built at
-#     admin-merge.sh:3354, printed at :3412). `lane parity: NOT ESTABLISHED`
-#     therefore does NOT certify — #1319's own rule, a vacuous comparison is
-#     not comparable without parity.
+#   * when BOTH counts are zero — `PR failing: 0 | main failing: 0` — the
+#     comparison was VACUOUS, so the positive line `lane parity: PR ⊇ main`
+#     (value built at admin-merge.sh:3354, printed at :3412) is required.
+#     `lane parity: NOT ESTABLISHED` therefore does NOT certify — #1319's own
+#     rule, a vacuous comparison is not comparable without parity. Vacuity is
+#     read from the COUNTS (see below), not from the producer's descriptive
+#     `measured sets:` line.
 # THE CLAUSES MIRROR THE PRODUCER'S REAL EMISSION AND ARE SHAPE-CHECKED, not
 # substring-matched. The first cut of this change used bare `contains` for the
 # provenance, count and attribution clauses, and the main-only suite immediately
@@ -105,16 +107,32 @@ esac
 # review of the retired implementation). The tolerance is carried over, not
 # re-invented.
 #
+# VACUITY IS DERIVED FROM THE COUNTS, NOT FROM THE PRODUCER'S DESCRIPTIVE LINE, and
+# this is a fail-open that BOTH reviewers of the first revision reproduced
+# independently. Clause 5 originally treated a body as vacuous when it contained
+# `measured sets: PR failing` — a line whose only role is to DESCRIBE the state. A
+# body stating the same zeros (`PR failing: 0 | main failing: 0`) with that one line
+# deleted, renamed or reformatted therefore certified with NO parity statement at
+# all — including `lane parity: NOT ESTABLISHED`, the exact #1319 / tortoise #4263
+# wrong-lane fail-open this clause exists to close. A requirement keyed on a
+# deletable DESCRIPTION is a requirement an editor can delete; the two zeros are the
+# condition itself, so the counts are what is tested.
+#
+# `contains("<!-- admin-merge-safety: ")` is kept WITHOUT the head on purpose: it is
+# the literal the drift-pin extracts and checks against a REAL capture, and the
+# head-bound literals are substituted at runtime so they cannot be pinned that way.
+#
 # The refusal vocabulary (`CLIPPED`, `NOT COMPARABLE`, `UNATTRIBUTABLE`) is
 # deliberately NOT matched: the attribution area prints those words as
 # UNCONDITIONAL explanatory prose in every evidence comment, including the clean
 # ones, so a bare `contains` on them would refuse every certificate.
 CLAUSE_FILTER='(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
   and (contains("PR head: '"$HEAD"'"))
+  and (contains("<!-- admin-merge-safety: "))
   and (test("main compared \\(union of [0-9]+ runs?( of .+)?\\):"))
   and (test("PR failing:\\s*[0-9]+\\s*\\|\\s*main failing:\\s*[0-9]+\\s*\\|\\s*blocked by the decision:\\s*0([ \\t\\r\\n]|$)"))
   and (test("PR=0 \\| main=0\\.([ \\t\\r\\n]|$)"))
-  and ((contains("measured sets: PR failing") | not) or test("(^|\\n)[ \\t]*lane parity: PR ⊇ main"))'
+  and ((test("PR failing:\\s*0\\s*\\|\\s*main failing:\\s*0\\s*\\|") | not) or test("(^|\\n)[ \\t]*lane parity: PR ⊇ main"))'
 jq_program='[ .comments[].body | select('"$CLAUSE_FILTER"') ] | length'
 
 if [ -n "$BODY_FILE" ]; then

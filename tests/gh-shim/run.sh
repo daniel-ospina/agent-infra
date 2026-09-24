@@ -236,9 +236,11 @@ for shape in '--repo owner/other' '--repo=owner/other' '-R owner/other' '-Rowner
 done
 
 # (d) The verifier's zero clause must not accept a LARGER number beginning with 0.
-#     The attribution line is present so the ONLY reason this refuses is the
-#     boundary — otherwise the test would pass for the wrong reason.
-printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | blocked by the decision: 0.5\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-half"
+#     The count line is NON-VACUOUS (PR failing: 1) and the attribution line is
+#     present, so the ONLY reason this refuses is the boundary — otherwise the
+#     test would pass for the wrong reason (a vacuous body is refused by clause 5
+#     whether or not the zero is bounded).
+printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 1 | main failing: 0 | blocked by the decision: 0.5\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n' "$HEAD_A" "$HEAD_A" > "$TMP/body-half"
 bash "$VERIFY" --body-file "$TMP/body-half" --head "$HEAD_A" >/dev/null 2>&1 \
   && fail "\`blocked by the decision: 0.5\` certified — a non-zero residual passed" \
   || pass "\`blocked by the decision: 0.5\` does NOT certify (the zero clause is exact)"
@@ -296,7 +298,7 @@ grep -q -- "--repo owner/other" "$SCEN/calls" \
 
 # (f) …and the zero clause must not accept a delimiter that only LOOKS like a number.
 for evil in '0,5' '0x' '0/9'; do
-  printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | blocked by the decision: %s\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n' "$HEAD_A" "$HEAD_A" "$evil" > "$TMP/body-evil"
+  printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 1 | main failing: 0 | blocked by the decision: %s\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n' "$HEAD_A" "$HEAD_A" "$evil" > "$TMP/body-evil"
   bash "$VERIFY" --body-file "$TMP/body-evil" --head "$HEAD_A" >/dev/null 2>&1 \
     && fail "\`blocked by the decision: $evil\` certified" \
     || pass "\`blocked by the decision: $evil\` does NOT certify"

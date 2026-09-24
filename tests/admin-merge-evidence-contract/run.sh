@@ -9,8 +9,17 @@
 #  admin merge was refused fleet-wide for six days, with EVERY suite green. The
 #  reason no suite noticed is the reason this one is built the way it is: each
 #  suite pinned HAND-WRITTEN fixtures, and a hand-written fixture cannot notice
-#  that the producer moved. So the load-bearing fixtures here are a REAL captured
-#  certificate, and the suite asserts the GATE's required literals against it.
+#  that the producer moved. So the refusal case here is a REAL captured
+#  certificate, and the drift-pin asserts the GATE's required literals against it.
+#
+#  PROVENANCE, STATED PER FIXTURE (a claim about "real evidence" is only worth
+#  what it can be checked against):
+#    NEG  = the REAL capture, byte for byte, and the drift-pin's reference.
+#    POS  = the real ENVELOPE with synthetic non-vacuous counts (the producer emits
+#           no such body today because no captured PR had failures). It proves the
+#           clause-4 spelling is accepted; it does NOT prove the producer emits it.
+#    vac-par = the real vacuous body plus the producer's real parity VALUE, so the
+#           vacuous positive half is exercised without claiming it was captured.
 #
 #  Sets its own exit code so it can run standalone or inside another job.
 set -uo pipefail
@@ -18,15 +27,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 # The versions under test default to this worktree. Both are overridable so the
 # suite can be pointed at the PRE-FIX revision and shown to REDDEN — that is how
-# "every declared class has a test that fails against the revision before its
-# fix" is demonstrated rather than asserted:
+# the coverage claim is DEMONSTRATED rather than asserted:
 #   VERIFIER_UNDER_TEST=$(git show <base>:scripts/verify-admin-merge-evidence.sh) …
-# The knobs are for producing evidence; CI runs the defaults.
+# It reddens 5 of its assertions against origin/main, and those 5 are the honest
+# extent of what any suite can show against a gate that refuses everything: a
+# pre-fix gate that refuses EVERY body carrying the new vocabulary cannot
+# distinguish a mutation from a legitimate body, so the per-class mutation tests
+# are provable only against the CURRENT revision. The classes are covered by
+# tests that FAIL against the fix they belong to, which is stated in the PR body.
 VERIFIER="${VERIFIER_UNDER_TEST:-$ROOT/scripts/verify-admin-merge-evidence.sh}"
 TS_GATE="${TS_GATE_UNDER_TEST:-$ROOT/extensions/review-enforcer/index.ts}"
 PRODUCER="$ROOT/scripts/admin-merge.sh"
 NEG="$HERE/captured-1406-vacuous-parity-not-established.md"
-POS="$HERE/captured-1406-parity-established.md"
+POS="$HERE/derived-1406-nonvacuous-counts.md"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 F=0; P=0
 ok()  { P=$((P+1)); printf '   ✅ %s\n' "$1"; }
@@ -41,27 +54,47 @@ echo "=== the certificate contract (#1388) — real captured evidence ==="
 echo "    head under test: ${HEAD:0:12}… (read from the capture)"
 
 # ── 1. the real capture, as the producer actually wrote it ──────────────────
-# It is VACUOUS (measured sets runs=0) and its parity line reads NOT ESTABLISHED
-# — the #1319 rule says a vacuous comparison is not comparable without parity,
-# so this must NOT certify even though every other clause is present.
+# It is VACUOUS (both counts 0) and its parity line reads NOT ESTABLISHED — the
+# #1319 rule says a vacuous comparison is not comparable without parity, so this
+# must NOT certify even though every other clause is present.
 if certifies "$NEG"; then
   bad "a VACUOUS comparison with 'lane parity: NOT ESTABLISHED' CERTIFIED (clause 5 fail-open)"
 else
   ok "a vacuous comparison with parity NOT ESTABLISHED does NOT certify (clause 5)"
 fi
 
-# ── 2. a real comparison, zero residual → certifies ─────────────────────────
-if certifies "$POS"; then
-  ok "the same envelope as a NON-vacuous comparison CERTIFIES (clause 4)"
+# ── 1b. THE BYPASS BOTH REVIEWERS FOUND, pinned shut ────────────────────────
+# Vacuity used to be read from the producer's DESCRIPTIVE line
+# (`measured sets: PR failing …`), so deleting that one line from the real body
+# certified it with no parity statement at all. Vacuity is now read from the two
+# counts, which is the condition itself: remove the description and the verdict
+# must not move. This mutation is the reviewer's reproduction, kept as a test.
+sed '/measured sets: PR failing/d' "$NEG" > "$TMP/m-nodesc.md"
+if [ "$(grep -c 'measured sets' "$TMP/m-nodesc.md")" -ne 0 ]; then
+  bad "the mutation did not remove the 'measured sets:' line, so it proves nothing"
+elif certifies "$TMP/m-nodesc.md"; then
+  bad "DELETING the 'measured sets:' description line CERTIFIED a vacuous body with no parity (clause 5 fail-open — the class both reviewers reproduced)"
 else
-  bad "a real, non-vacuous certificate was REFUSED — the gate requires something the producer does not emit"
+  ok "deleting the 'measured sets:' line does NOT change the verdict (vacuity is read from the counts, not the description)"
+fi
+
+# ── 2. a NON-vacuous comparison, zero residual → certifies ──────────────────
+# POS has SYNTHETIC counts over the real envelope (see the header); what it
+# proves is that clause 4 accepts the producer's current spelling, and that a
+# non-vacuous body does NOT additionally need a parity line.
+if certifies "$POS"; then
+  ok "a NON-vacuous body in the producer's current clause-4 spelling CERTIFIES (synthetic counts, real envelope)"
+else
+  bad "a non-vacuous body carrying the producer's clause-4 spelling was REFUSED — clause 4 is unsatisfiable against real evidence"
 fi
 
 # ── 3. the vacuous case WITH established parity → certifies ─────────────────
-{ cat "$POS"
-  printf '   measured sets: PR failing runs=0 | main failing runs=0 (lane: ci.yml)\n'
-  printf '   lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family: test*; 1 shard(s) on the PR side, 1 on main)\n'
-} > "$TMP/vac-par.md"
+# Built from the REAL vacuous body (both counts 0, so clause 5 applies) with its
+# parity line REPLACED by the producer's real positive VALUE — the positive half
+# of clause 5, exercised without claiming the combination was captured, and
+# without leaving the contradictory `NOT ESTABLISHED` line in place.
+sed 's/^   lane parity: NOT ESTABLISHED.*/   lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family: test*; 1 shard(s) on the PR side, 1 on main)/' "$NEG" > "$TMP/vac-par.md"
+grep -q 'lane parity: PR ⊇ main' "$TMP/vac-par.md" || bad "the vacuous+parity fixture was not built (its parity line was not replaced), so §3 proves nothing"
 if certifies "$TMP/vac-par.md"; then
   ok "a vacuous comparison WITH 'lane parity: PR ⊇ main' CERTIFIES (clause 5 positive half)"
 else
@@ -97,40 +130,43 @@ sed 's/PR=0 | main=0/PR=0 | main=01/' "$POS" > "$TMP/m-attr01.md"
 if certifies "$TMP/m-attr01.md"; then bad "a dropped-token count of '01' CERTIFIED (the attribution clause is not bounded)"; else ok "mutation: an '01' attribution count refuses (bounded)"; fi
 sed 's/PR=0 | main=0/PR=0 | main=2/' "$POS" > "$TMP/m-attr2.md"
 if certifies "$TMP/m-attr2.md"; then bad "a dropped main-side token CERTIFIED (clause 5 fail-open)"; else ok "mutation: a main-side dropped token refuses"; fi
+# (g) ZEROING BOTH COUNTS must newly REQUIRE parity — the counterpart of 1b. A
+#     body whose comparison came out vacuous is held to clause 5's parity
+#     requirement even though it carries no vacuous-state PROSE.
+sed 's/PR failing: 2 | main failing: 7 | blocked by the decision: 0/PR failing: 0 | main failing: 0 | blocked by the decision: 0/' "$POS" > "$TMP/m-vacuous-noparity.md"
+if grep -q 'PR failing: 0 | main failing: 0 | blocked by the decision: 0' "$TMP/m-vacuous-noparity.md"; then
+  if certifies "$TMP/m-vacuous-noparity.md"; then bad "a body with BOTH counts zero and NO parity line CERTIFIED (clause 5 fail-open)"; else ok "mutation: both counts zero without parity refuses (vacuity comes from the counts)"; fi
+else
+  bad "the zeroing mutation did not apply, so it proves nothing"
+fi
 
 # ── 5. DRIFT-PIN — every literal phrase the GATE requires by `contains(...)` must
 # EXIST in evidence the producer really writes. This is the instrument the
 # six-day outage needed: it extracts the required literals FROM the verifier (not
-# from a copy of them) and asserts each is present in a body the producer really
-# wrote. Had it existed on 2026-09-17 it would have reddened on the rename.
+# from a copy of them) and asserts each is present in the REAL capture.
 #
-# The BOUNDED clauses (the two zero clauses and the parity line) are regexes, so
-# they are not extractable as literal phrases; they are covered instead by the
-# behaviour tests above (POS certifies, and each boundary mutation refuses) plus
-# the producer greps in §6. That split is stated rather than left implicit,
-# because a pin that silently checks less than it appears to is worse than none.
+# THE REFERENCE IS THE REAL CAPTURE, and nothing the suite wrote. An earlier
+# version checked the literals against `$POS` plus a hand-written variant, which
+# made the pin SELF-REFERENTIAL: the only literal it extracted was matched against
+# text this suite had typed to mirror the gate, so a producer rename would have
+# left it green. A reviewer reproduced that reasoning; the reference is now
+# `$NEG` alone, which is byte-for-byte the producer's output.
 #
-# SCOPE MATTERS, and this is the same rule as the refusal vocabulary above: a
-# literal is only required in the state it describes. `lane parity: PR ⊇ main` is
-# required only when the comparison is VACUOUS, so checking it against the
-# non-vacuous POS body would be a false alarm — the error this pin exists to
-# catch, made by the pin itself. So the reference is the UNION of the two
-# legitimate states, both derived from the same real capture.
-cat "$POS" "$TMP/vac-par.md" > "$TMP/states.md"
+# The BOUNDED clauses (the two zero clauses, the provenance shape and the parity
+# line) are regexes, so they are not extractable as literal phrases; they are
+# covered by the behaviour tests above plus the producer greps in §6. The
+# extraction is scoped to the FILTER ASSIGNMENT, never the whole file: the file's
+# comments quote the retired clause to explain the rename, and a pin that reads
+# prose reports requirements the code does not have.
 LITS="$(sed -n '/^CLAUSE_FILTER=/,/^jq_program=/p' "$VERIFIER" | grep -o 'contains("[^"]*")' | sed 's/^contains("//; s/")$//' | grep -v '\$' | sort -u)"
 [ -n "$LITS" ] || bad "could not extract any required literal from the verifier's CLAUSE_FILTER (the extraction is broken, so this pin proves nothing)"
-# The extraction is scoped to the FILTER ASSIGNMENT, not the file: the file's
-# comments quote the retired clause to explain the rename, and a pin that reads
-# prose reports requirements the code does not have. (This pin made exactly that
-# mistake on its first run — it picked the literal up out of the explanatory
-# comment. Same rule as the refusal vocabulary: match the state, not the prose.)
-echo "    (pinning $(printf '%s\n' "$LITS" | grep -c .) literal phrase(s) extracted from the CLAUSE_FILTER)"
+echo "    (pinning $(printf '%s\n' "$LITS" | grep -c .) literal phrase(s) extracted from the CLAUSE_FILTER against the REAL capture)"
 while IFS= read -r lit; do
   [ -n "$lit" ] || continue
-  if grep -qF "$lit" "$TMP/states.md"; then
-    ok "required literal is present in real evidence: ${lit:0:52}"
+  if grep -qF "$lit" "$NEG"; then
+    ok "required literal is present in the REAL capture: ${lit:0:52}"
   else
-    bad "the gate REQUIRES a literal no real evidence contains: '$lit' (this is the #1388 class)"
+    bad "the gate REQUIRES a literal the real capture does not contain: '$lit' (this is the #1388 class)"
   fi
 done <<< "$LITS"
 

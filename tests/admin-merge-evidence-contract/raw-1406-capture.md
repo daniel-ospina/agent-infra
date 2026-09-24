@@ -10,7 +10,9 @@ Base check surface (every workflow and app on head of 'main'): green — 0 faili
 Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.
    A set carrying a dropped token is CLIPPED, and a CLIPPED set is NOT COMPARABLE to a measured zero (the lane-parity gate's vocabulary, #1319). COMPLETE is the drop count 0 with no token listed below.
 ⚠️ vacuous comparison — no failure was compared, because NEITHER measured set carried one.
-         PR side: 0 failing run(s) of 7 completed / 7 tested for head 6f5366c6f4dbcfd9158fc3b2172758eac0390b45 (0 pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
+   measured sets: PR failing runs=0 | main failing runs=0 (lane: any workflow)
+   lane parity: NOT ESTABLISHED — declared off; lane parity FAILS: this head did NOT execute 1 test shard(s) main's lane executes (parity family: test*), so 'PR failing: 0 | main failing: 0' compares TWO DIFFERENT LANES (tortoise #4263 → #4457).
+   PR side: 0 failing run(s) of 7 completed / 7 tested for head 6f5366c6f4dbcfd9158fc3b2172758eac0390b45 (0 pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
    main side: 0 failing run(s) of 10 completed / 10 tested over the window (10 run(s) requested). EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b).
    main check surface: green — 0 failing of 15 measured, 0 pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: green — 0 failing of 19 measured, 0 pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
@@ -72,7 +74,9 @@ Base check surface (every workflow and app on head of 'main'): green — 0 faili
 Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.
    A set carrying a dropped token is CLIPPED, and a CLIPPED set is NOT COMPARABLE to a measured zero (the lane-parity gate's vocabulary, #1319). COMPLETE is the drop count 0 with no token listed below.
 ⚠️ vacuous comparison — no failure was compared, because NEITHER measured set carried one.
-         PR side: 0 failing run(s) of 7 completed / 7 tested for head 6f5366c6f4dbcfd9158fc3b2172758eac0390b45 (0 pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
+   measured sets: PR failing runs=0 | main failing runs=0 (lane: any workflow)
+   lane parity: NOT ESTABLISHED — declared off; lane parity FAILS: this head did NOT execute 1 test shard(s) main's lane executes (parity family: test*), so 'PR failing: 0 | main failing: 0' compares TWO DIFFERENT LANES (tortoise #4263 → #4457).
+   PR side: 0 failing run(s) of 7 completed / 7 tested for head 6f5366c6f4dbcfd9158fc3b2172758eac0390b45 (0 pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
    main side: 0 failing run(s) of 10 completed / 10 tested over the window (10 run(s) requested). EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b).
    main check surface: green — 0 failing of 15 measured, 0 pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: green — 0 failing of 19 measured, 0 pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
@@ -134,7 +138,9 @@ Base check surface (every workflow and app on head of 'main'): green — 0 faili
 Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.
    A set carrying a dropped token is CLIPPED, and a CLIPPED set is NOT COMPARABLE to a measured zero (the lane-parity gate's vocabulary, #1319). COMPLETE is the drop count 0 with no token listed below.
 ⚠️ vacuous comparison — no failure was compared, because NEITHER measured set carried one.
-         PR side: 0 failing run(s) of 7 completed / 7 tested for head 6f5366c6f4dbcfd9158fc3b2172758eac0390b45 (0 pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
+   measured sets: PR failing runs=0 | main failing runs=0 (lane: any workflow)
+   lane parity: NOT ESTABLISHED — declared off; lane parity FAILS: this head did NOT execute 1 test shard(s) main's lane executes (parity family: test*), so 'PR failing: 0 | main failing: 0' compares TWO DIFFERENT LANES (tortoise #4263 → #4457).
+   PR side: 0 failing run(s) of 7 completed / 7 tested for head 6f5366c6f4dbcfd9158fc3b2172758eac0390b45 (0 pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
    main side: 0 failing run(s) of 10 completed / 10 tested over the window (10 run(s) requested). EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b).
    main check surface: green — 0 failing of 15 measured, 0 pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: green — 0 failing of 19 measured, 0 pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
