@@ -480,6 +480,31 @@ printf 'gitdir: %s\n' "$HW/.git/worktrees/wt1410" > "$W1410/.git"
 out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 0 "restoring the link returns the hub to PASS (empty debris is not flagged)"
 
+# 10a. A plain directory that CONTAINS worktrees must never be flagged, and a NESTED
+# worktree (the fleet layout: <hub>/.worktrees/<group>/<name>) must be found just the same.
+# A one-level `.worktrees/*` scan fails both: it flags the group directory — which holds
+# healthy worktrees — and tells the operator to delete it (measured on the live hub, where
+# `.worktrees/fix` holds active worktrees). Detection reads the hub's own records instead.
+GROUP="$HW/.worktrees/group1410"
+mkdir -p "$GROUP"
+touch "$GROUP/README"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a directory that merely CONTAINS no worktree is not flagged"
+assert_not_contains "$out" "group1410" "…and is not named as an unlinked worktree"
+
+WNESTED="$GROUP/wt-nested1410"
+git -C "$HW" worktree add -q "$WNESTED" -b wt-nested1410 HEAD
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a NESTED worktree is healthy → PASS (the group dir is not mistaken for one)"
+rm -f "$WNESTED/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an UNLINKED NESTED worktree → exit 1 (layout-independent: records, not a glob)"
+assert_contains "$out" "$WNESTED" "…and names the nested worktree, not its parent"
+if grep -qxF "  $GROUP" <<<"$out"; then bad "…and does not name the PARENT directory as the offender"; else ok "…and does not name the PARENT directory as the offender"; fi
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wt-nested1410" > "$WNESTED/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and restoring the nested link returns the hub to PASS (group dir still fine)"
+
 # 10b. The --gh-report leg must SURVIVE a worktree_unlinked-only hub and carry the
 # guidance into the FILED body. This leg parses each disorder back out of the token
 # string; #1410 is a filesystem fact, so if it is not re-derived there the leg reaches

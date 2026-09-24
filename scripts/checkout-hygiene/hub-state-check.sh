@@ -26,12 +26,13 @@
 #                local-only commit makes the hub not a mirror of upstream.
 #   no_upstream  on main, but no SAME-NAMED upstream ref resolves, so freshness
 #                is UNVERIFIABLE — never treated as PASS (#1313).
-#   worktree_unlinked  a NON-EMPTY directory under <hub>/.worktrees/ has no `.git`
-#                entry, so it is no longer a worktree: git walks UP and resolves it
-#                to the hub, and a session working there commits and pushes against
-#                `main` while every command reports success (#1410). Independent of
-#                the branch/freshness facts (it composes with them, like `dirty`);
-#                an EMPTY directory is debris, not an alias, and is not flagged.
+#   worktree_unlinked  a worktree the hub still RECORDS has no `.git` link on disk,
+#                so it is no longer a worktree: git walks UP and resolves the
+#                directory to the hub, and a session working there commits and pushes
+#                against `main` while every command reports success (#1410).
+#                Independent of the branch/freshness facts (it composes with them,
+#                like `dirty`). Taken from the hub's own worktree records, so a plain
+#                directory that merely CONTAINS worktrees is never flagged.
 #                Detected HERE, hub-side, because the fallback is undetectable from
 #                the worktree itself: inside a pre-commit hook `$PWD` and
 #                `git rev-parse --show-toplevel` are BOTH the hub (measured).
@@ -177,15 +178,9 @@ recovery_guide() {
     while IFS='|' read -r d rec; do
       [[ -n "$d" ]] || continue
       lines+=("  $d")
-      if [[ -n "$rec" ]]; then
-        lines+=("    git resolves it UP to this hub: commits and pushes made there target")
-        lines+=("    '$branch' (the hub's branch) and report success. Repair with the hub's record:")
-        lines+=("      printf 'gitdir: %s\\n' '$rec' > '$d/.git'")
-      else
-        lines+=("    git resolves it UP to this hub, and the hub keeps NO record for it,")
-        lines+=("    so it is debris: remove it deliberately once you have checked it holds")
-        lines+=("    no work you need.")
-      fi
+      lines+=("    git resolves it UP to this hub: commits and pushes made there target")
+      lines+=("    '$branch' (the hub's branch) and report success. Restore the hub's link:")
+      lines+=("      printf 'gitdir: %s\\n' '$rec' > '$d/.git'")
     done <<<"$unlinked"
   fi
   # #431: an EMPTY array expands to an unbound variable under `set -u` on bash 3.2, so a
@@ -200,35 +195,37 @@ recovery_guide() {
 # #1410 — the unlinked-worktree set for a hub: one `dir|record` pair per LINE (empty when
 # the class is absent), consumed by recovery_guide's `while IFS='|' read -r d rec`.
 #
-# A NON-EMPTY directory under `<hub>/.worktrees/` with no `.git` entry is no longer a
-# worktree: git walks UP and resolves it to the hub, so a session working there commits
-# and pushes against the hub's branch while every command reports success.
+# A registered worktree whose `.git` link is gone stops being a worktree: git walks UP
+# from the directory and resolves it to the hub, so a session working there commits and
+# pushes against the hub's branch while every command reports success.
 #
 # Detected hub-side because the fallback is undetectable from the worktree itself —
 # measured: inside a pre-commit hook `$PWD` and `git rev-parse --show-toplevel` are BOTH
-# the hub. The hub sees every worktree as a directory, and this script already runs at
+# the hub. The hub sees every worktree as a record, and this script already runs at
 # session start, the placement that cannot be forgotten.
 #
-# `rec` is the hub's own record for that worktree (<hub>/.git/worktrees/<name>), resolved
-# so the printed repair is exact rather than a template, and so "the hub keeps no record"
-# reads as what it is (debris). It is matched on the worktree's place in the layout
-# (`.worktrees/<name>/.git`) rather than on the literal path: a symlinked prefix
-# (/tmp -> /private/tmp on macOS) would otherwise hide a record the hub really holds.
+# The HUB'S OWN RECORDS are the source of truth (<hub>/.git/worktrees/<name>/gitdir names
+# the link file it expects), NOT a scan of `.worktrees/*`. A directory scan cannot tell a
+# worktree from a plain directory that merely CONTAINS them: the fleet nests worktrees
+# (`<hub>/.worktrees/fix/<name>`), so a one-level scan flags the `fix/` container — which
+# holds healthy worktrees — and tells the operator to delete it. Measured on the live hub:
+# exactly that false positive. Records also make the detection layout-independent: any
+# registered worktree under the hub is covered, wherever it sits.
+#
+# `rec` is that record, so the printed repair is exact rather than a template.
 unlinked_worktrees() { # $1=hub
-  local hub="$1" d rec r hw_records out=""
-  for d in "$hub"/.worktrees/*/; do
-    [[ -d "$d" ]] || continue
-    [[ -e "${d}.git" ]] && continue
-    d="${d%/}"
-    # An EMPTY directory is debris (a failed rm), not a checkout that can alias the hub.
-    [[ -n "$(ls -A "$d" 2>/dev/null || true)" ]] || continue
-    rec=""
-    hw_records="$(git -C "$hub" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$hub/.git")"
-    for r in "$hw_records"/worktrees/*/; do
-      [[ -f "${r}gitdir" ]] || continue
-      if [[ "$(cat "${r}gitdir" 2>/dev/null)" == *"/.worktrees/${d##*/}/.git" ]]; then rec="${r%/}"; break; fi
-    done
-    out="${out}${out:+$'\n'}${d}|${rec}"
+  local hub="$1" r dir out="" records
+  records="$(git -C "$hub" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$hub/.git")"
+  for r in "$records"/worktrees/*/; do
+    [[ -f "${r}gitdir" ]] || continue
+    dir="$(cat "${r}gitdir" 2>/dev/null)" || continue
+    [[ "$dir" == */.git ]] || continue          # an unexpected record shape is not our class
+    dir="${dir%/.git}"
+    # The directory must still exist to be anyone's working directory; a record whose
+    # directory is gone is `git worktree prune`'s business, not a silent hub alias.
+    [[ -d "$dir" ]] || continue
+    [[ -e "${dir}/.git" ]] && continue          # healthy: the link is there
+    out="${out}${out:+$'\n'}${dir}|${r%/}"
   done
   printf '%s' "$out"
 }
