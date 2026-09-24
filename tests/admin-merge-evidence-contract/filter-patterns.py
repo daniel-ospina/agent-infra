@@ -86,7 +86,15 @@ def check(pat: str):
 
 
 def extract_arg(text: str, open_paren: int):
-    """Return (literal_or_None, reason). The argument must be one JSON string."""
+    """Return (literal_or_None, reason). The argument must be one JSON string.
+
+    A DANGLING CONTINUATION IS A FAILURE, not a prefix to accept. A verifier pass
+    reproduced a bypass where the argument was CONCATENATED (`test("main compared" +
+    " \\(union of (?!x)[0-9]+ runs?")`): decoding only the first literal compiled the
+    prefix — a valid RE2 regex — and the lookahead in the tail reached the live engine
+    unexamined. So after the literal the only legal continuations are `;` (a second
+    argument, e.g. the `"i"` flag) or `)`; anything else is UNCHECKABLE.
+    """
     i = open_paren + 1
     while i < len(text) and text[i] in " \t\r\n":
         i += 1
@@ -107,9 +115,16 @@ def extract_arg(text: str, open_paren: int):
         return None, "an unterminated regex argument"
     raw = text[i : j + 1]
     try:
-        return json.loads(raw), None
+        value = json.loads(raw)
     except json.JSONDecodeError as exc:
         return None, f"an undecodable regex argument ({exc.msg})"
+    k = j + 1
+    while k < len(text) and text[k] in " \t\r\n":
+        k += 1
+    if k < len(text) and text[k] not in ";)":
+        tail = text[k : k + 24].replace("\n", " ")
+        return None, f"a regex argument continued after its literal ({tail!r})"
+    return value, None
 
 
 def main() -> int:
@@ -117,17 +132,32 @@ def main() -> int:
     count = 0
     offenders = []
     uncheckable = []
-    for m in re.finditer(REGEX_FUNCS + r"[ \t]*\(", text):
+    values = []
+    for m in re.finditer(REGEX_FUNCS + r"[ \t\r\n]*\(", text):
         open_paren = m.end() - 1
         value, reason = extract_arg(text, open_paren)
         if value is None:
             uncheckable.append(reason)
             continue
         count += 1
+        values.append(value)
         print("P " + json.dumps(value))
         hit = check(value)
         if hit:
             offenders.append(f"{hit} {value[:120]}")
+    # LITERAL WORDS, for the drift cross-check: the regex CONSTRUCT vocabulary a filter
+    # legitimately contains (`[:cntrl:]`, `\n`, `{0,40}`, `(?:...)`) is not evidence the
+    # producer must carry. Escapes and bracket expressions are stripped before
+    # tokenising, so the cross-check compares words the evidence is matched ON, not the
+    # grammar it is written in.
+    words = sorted(
+        {
+            w
+            for value in values
+            for w in re.findall(r"[A-Za-z]{4,}", re.sub(r"\\.|\[[^\]]*\]", " ", value))
+        }
+    )
+    print("W " + json.dumps(words))
     print(f"N {count}")
     for off in offenders:
         print("OFFENDER " + off)

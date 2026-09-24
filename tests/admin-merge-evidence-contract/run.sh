@@ -48,6 +48,12 @@ PRODUCER="${PRODUCER_UNDER_TEST:-$ROOT/scripts/admin-merge.sh}"
 NEG="$HERE/captured-1406-vacuous-parity-not-established.md"
 POS="$HERE/derived-1406-nonvacuous-counts.md"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# THE FILTER AS THE VERIFIER ACTUALLY EVALUATES IT — the shell-expanded string, not the
+# file's source text. Both section 6 (the token cross-check) and section 8 (the engine
+# check) read THIS: a source-text scan is a proxy that a review defeated three ways, each
+# leaving the suite green while the live path could not compile the filter.
+RUNTIME_FILTER="$(HEAD=fixture-head-not-a-real-sha; eval "$(sed -n '/^HEAD=/d;/^CLAUSE_FILTER=/,/^jq_program=/p' "$VERIFIER" | sed '$d')"; printf '%s' "$CLAUSE_FILTER")"
+FILTER_SCAN="$(python3 "$(dirname "$0")/filter-patterns.py" <(printf '%s' "$RUNTIME_FILTER") 2>&1 || true)"
 F=0; P=0
 ok()  { P=$((P+1)); printf '   ✅ %s\n' "$1"; }
 bad() { F=$((F+1)); printf '   ❌ %s\n' "$1"; }
@@ -445,7 +451,12 @@ fi
 # set (a line carrying them must NOT certify), so demanding the producer spell them would
 # be backwards — and the earlier run of this cross-check said exactly that about
 # `MISMATCH`, which is the check working as written and the exclusion being missing.
-FILTER_TOKENS="$(sed -n '/^CLAUSE_FILTER=/,/^jq_program=/p' "$VERIFIER" | grep -oE '(contains|test)\("[^"]*"' | grep -oE '[A-Za-z]{4,}' | sort -u | grep -vxE 'contains|test|NOT|ESTABLISHED|FAILED|MISMATCH|DID|NEVER')"
+FILTER_TOKENS="$(printf '%s\n' "$FILTER_SCAN" | sed -n 's/^W //p' | python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+words = json.loads(raw.splitlines()[-1]) if raw else []
+skip = {"contains", "test", "NOT", "ESTABLISHED", "FAILED", "MISMATCH", "DID", "NEVER"}
+print("\n".join(w for w in words if w not in skip))')"
 TOKN=0
 while IFS= read -r tok; do
   [ -n "$tok" ] || continue
@@ -456,6 +467,9 @@ while IFS= read -r tok; do
     bad "the filter's pattern depends on '$tok' and the producer no longer carries it (the #1388 class)"
   fi
 done <<< "$FILTER_TOKENS"
+if [ "$TOKN" -eq 0 ]; then
+  bad "no token could be extracted from the filter, so the cross-check above proved nothing (a failed extraction must not read as a clean sweep)"
+fi
 echo "    (producer pin: $MUTN requirements, each mutation-tested; token cross-check: $TOKN tokens)"
 # Scope to the CLAUSE FILTER, not the file: the verifier's comments DISCUSS the
 # retired name to explain the rename, so a file-wide grep reports it as still
@@ -591,8 +605,7 @@ RUNTIME_FILTER="$(HEAD=fixture-head-not-a-real-sha; eval "$(sed -n '/^HEAD=/d;/^
 if [ -z "$RUNTIME_FILTER" ]; then
   bad "the clause filter could not be evaluated at all — the RE2 checks below would pass over nothing"
 else
-  printf '%s' "$RUNTIME_FILTER" > "$TMP/runtime-filter.txt"
-  PATTERNS="$(python3 "$HERE/filter-patterns.py" "$TMP/runtime-filter.txt")"
+  PATTERNS="$FILTER_SCAN"
   PAT_COUNT="$(printf '%s\n' "$PATTERNS" | sed -n 's/^N //p')"
   if [ -z "$PAT_COUNT" ] || [ "$PAT_COUNT" -lt 6 ]; then
     bad "the clause filter's regex arguments could not be extracted (found '${PAT_COUNT:-none}', expected at least 6) — the RE2 checks below would pass over nothing"
@@ -625,6 +638,40 @@ if lits:
 else
   echo "    (SKIP: gh unavailable or unauthenticated — the live-engine compile check did NOT run; only the name list above applies)"
 fi
+
+# ── 8b. THE EXTRACTOR IS ITSELF MUTATION-TESTED ────────────────────────────────
+# A check about a check must be shown to fail. Three successive versions of the
+# extraction above were defeated — a source-text scan, a decode that accepted a
+# CONCATENATED argument by reading only its first literal, and a function-name regex
+# that did not allow a newline before `(` — each leaving this whole suite green while
+# the LIVE path could not compile the filter. So the extractor's own failure modes are
+# pinned here: every case below asserts an output the CURRENT extractor produces, and a
+# regression in any of them reddens. The one limit that remains is stated, not hidden:
+# a regex called through a name outside REGEX_FUNCS is invisible to this scan (the
+# filter uses none, and the live-engine compile below is the backstop for the filter as
+# it exists — it cannot see a call the extractor never found, which is why the count
+# floor above is the guard that a smuggling edit trips first).
+scan_case() {  # scan_case <name> <filter-text> <expected-substring>
+  printf '%s' "$2" > "$TMP/case-filter.txt"
+  case_out="$(python3 "$HERE/filter-patterns.py" "$TMP/case-filter.txt" 2>&1)"
+  if printf '%s\n' "$case_out" | grep -qF -- "$3"; then
+    ok "the extractor is not fooled by $1"
+  else
+    bad "the extractor's own self-test failed for $1 (expected '$3', got: $(printf '%s' "$case_out" | tr '\n' ' ' | cut -c1-90))"
+  fi
+}
+scan_case "an argument wrapped in extra parens" \
+  'x | test((("NEVERQ(?!x)Z")) or true)' 'UNCHECKABLE a regex argument that is not a string literal'
+scan_case "a call split across a newline" \
+  'x
+ | test
+("NEVERQ(?!x)Z")' 'OFFENDER lookaround'
+scan_case "an argument concatenated after its literal" \
+  'x | test("main compared" + " (?!x)[0-9]+")' 'UNCHECKABLE a regex argument continued after its literal'
+scan_case "a literal-backslash pattern (must NOT be flagged)" \
+  'x | test("\\\\K")' 'N 1'
+scan_case "an empty filter (proving nothing is not passing)" \
+  'x | contains("PR head:")' 'N 0'
 
 echo
 if [ "$F" -eq 0 ]; then echo "✅ all $P admin-merge evidence-contract test(s) passed"; exit 0; fi
