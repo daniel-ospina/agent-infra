@@ -155,9 +155,9 @@ if [ "$swept" -lt 1 ]; then
 fi
 
 # Runtime self-check 2b: the SWEEP ARM must still be wired. The `swept` counter above proves the
-# loop body RAN, but a body rewritten as `swept=$((swept+1))` alone keeps that counter at 73 while
-# checking no syntax at all — so the arm is proven the same way as the shard arm: run a file that
-# MUST fail, and require the failure to be recorded.
+# loop body RAN, but a body rewritten as `swept=$((swept+1))` alone leaves that counter reading a
+# full, non-zero count while checking no syntax at all — so the arm is proven the same way as the
+# shard arm: run a file that MUST fail, and require the failure to be recorded.
 sentinel_sweep="$(mktemp)"
 printf 'if then\n' >"$sentinel_sweep"
 before_sweep_err=$shard_errors
