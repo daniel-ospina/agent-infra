@@ -191,7 +191,7 @@ recovery_guide() {
             IFS= read -r rec || rec=""
             lines+=("  $d")
             case "$d" in
-              "$repo_canon"/*) lines+=("    git resolves it UP to this hub: commits and pushes made there")
+              "$repo_canon"|"$repo_canon"/*) lines+=("    git resolves it UP to this hub: commits and pushes made there")
                          lines+=("    target '$branch' (the hub's branch) and report success.") ;;
               *)         lines+=("    git no longer treats it as a worktree. It sits OUTSIDE this hub,")
                          lines+=("    so it does not resolve to it.") ;;
@@ -254,6 +254,11 @@ unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the reco
     # were healthy: an unverifiable verdict is never a PASS (the doctrine #1313's
     # no_upstream class exists for).
     if [[ -r "${r}/gitdir" ]]; then raw="$(cat "${r}/gitdir" 2>/dev/null)" || raw=""; fi
+    # Records git ITSELF accepts must not red the hub: a CRLF record on a healthy worktree is
+    # valid (`git worktree list` and `status` are both fine), and reporting it would leave no
+    # route back — `git worktree prune` and `repair` both leave the record as it is (measured).
+    raw="${raw%$'\r'}"
+    raw="${raw%/}"
     mark="T"; dir=""
     case "$raw" in
       "")   mark="M" ;;          # unreadable or empty: unverifiable → report, never skip
@@ -265,18 +270,28 @@ unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the reco
             dir="${r}/${raw}"
             dir="${dir%/.git}" ;;
     esac
+    # A record that does not name a `.../.git` link cannot be verified, so it is REPORTED
+    # (never skipped as if the hub were healthy — the #1313 no_upstream doctrine).
+    if [[ "$mark" == "T" && "$raw" != */.git ]]; then mark="M"; fi
+    # The directory must still exist to be anyone's working directory; a record whose directory
+    # is gone is `git worktree prune`'s business, not a silent hub alias. Tested BEFORE the
+    # canonicalization below, which is lossy for a path that ends in a newline: a directory that
+    # is genuinely gone must not be reported as an uncarryable entry forever.
+    if [[ "$mark" == "T" && ! -d "$dir" ]]; then continue; fi
+    # TRANSPORT SAFETY, BEFORE canonicalization. `$( … )` strips TRAILING newlines, so a
+    # worktree whose path ends in LF would be canonicalized into a path that does not exist,
+    # dropped by the gate above, and reported as PASS — while git resolves it to the hub and
+    # commits there land on the hub's branch (measured: the hub's own main moved). Git sanitizes
+    # the record DIRECTORY name for such a path, so a guard keyed on the record cannot see it;
+    # the derived path is the only place the newline is visible. Such an entry is REPORTED, not
+    # repaired: it cannot ride in the line-oriented transport.
+    if [[ "$r" == *$'\n'* || "$dir" == *$'\n'* ]]; then bad=$((bad + 1)); continue; fi
     # Canonicalize EVERY directory, not just relative records: git's record and the hub's
     # `$repo` (derived from a logical pwd) otherwise live in different canonical domains, and
     # the guide's "is this inside the hub?" test would misclassify an in-hub worktree.
     if [[ -n "$dir" ]]; then
       dir="$( (cd "$dir" 2>/dev/null && pwd -P) || printf '%s' "$dir" )"
     fi
-    # A record that does not name a `.../.git` link cannot be verified, so it is REPORTED
-    # (never skipped as if the hub were healthy — the #1313 no_upstream doctrine).
-    if [[ "$mark" == "T" && "$raw" != */.git ]]; then mark="M"; fi
-    # The directory must still exist to be anyone's working directory; a record whose
-    # directory is gone is `git worktree prune`'s business, not a silent hub alias.
-    if [[ "$mark" == "T" && ! -d "$dir" ]]; then continue; fi
     if [[ "$mark" == "T" ]]; then
       # HEALTH IS RESOLUTION, NOT EXISTENCE (#1410, measured). A `.git` that is PRESENT but
       # is not this worktree's admin dir — a file naming another gitdir, a symlink to the
@@ -293,10 +308,6 @@ unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the reco
       # measured, that is exactly the shape that let the bare write through to its target.
       if [[ -e "${dir}/.git" || -L "${dir}/.git" ]]; then mark="X"; fi
     fi
-    # The transport is line-oriented, so a field carrying a newline cannot ride in it: it
-    # would split one entry into two and print a repair for the WRONG directory. Such a
-    # record is counted and reported for manual inspection instead.
-    if [[ "$r" == *$'\n'* || "$dir" == *$'\n'* ]]; then bad=$((bad + 1)); continue; fi
     # $nl/$tab keep the separator out of the nested quoting above (a `$'\n'` inside
     # `${x:+...}` is literal text, not a newline — it must not ride in the transport).
     if [[ "$mark" == "M" ]]; then out="${out}${out:+$nl}M${tab}${nl}${r}"

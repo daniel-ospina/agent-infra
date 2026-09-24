@@ -657,6 +657,55 @@ assert_contains "$out" "UNVERIFIABLE worktree record" "…and is reported as unv
 printf '%s\n' "$WF2/.git" > "$HW/.git/worktrees/mangled1410/gitdir"
 printf 'gitdir: %s\n' "$HW/.git/worktrees/mangled1410" > "$WF2/.git"
 
+# 10j. A worktree whose path ENDS in a newline. `$( … )` strips trailing newlines, so the
+# canonicalization would produce a path that does not exist; if the `-d` gate ran first the
+# entry would be dropped and the hub would report PASS while git resolves the directory to the
+# HUB (measured against the pre-fix revision: a commit there moved the hub's main). The entry is
+# reported, not repaired: a newline cannot ride in the line-oriented transport.
+WTNL="$HW/.worktrees/wtnl1410"$'\n'
+git -C "$HW" worktree add -q "$WTNL" -b wtnl1410 HEAD
+rm -f "$WTNL/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree path ending in a newline is not a PASS"
+assert_contains "$out" "could not be shown safely" "…it is reported as uncarryable, fail-closed"
+assert_not_contains "$out" "PASS  $HW " "…and the hub is not reported healthy"
+rm -rf "$WTNL"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the hub returns to PASS once the directory is gone (no permanent red)"
+git -C "$HW" worktree prune >/dev/null 2>&1 || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and stays PASS after the record is pruned (fixture cleanup)"
+
+# 10k. A CRLF record is a shape GIT accepts: on a healthy worktree it must not red the hub
+# (measured: `git worktree list` and `status` are both fine, while the check said UNVERIFIABLE
+# with no repair line and neither `prune` nor `repair` cleared it — no route back).
+WCRLF="$HW/.worktrees/wtcrlf1410"
+git -C "$HW" worktree add -q "$WCRLF" -b wtcrlf1410 HEAD
+printf '%s\r\n' "$WCRLF/.git" > "$HW/.git/worktrees/wtcrlf1410/gitdir"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a CRLF record on a HEALTHY worktree still PASSes"
+rm -f "$WCRLF/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "…and the same record with the link GONE still FAILs"
+printf '%s\n' "$WCRLF/.git" > "$HW/.git/worktrees/wtcrlf1410/gitdir"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wtcrlf1410" > "$WCRLF/.git"
+
+# 10l. A record naming the hub's OWN gitdir makes the directory the hub root, which does
+# resolve up to the hub — the sentence must not be inverted for it.
+# The RECORD must name the hub's own gitdir: the directory then IS the hub root. (Mangling the
+# worktree's link only changes what git resolves; the offender directory comes from the record.)
+WROOT="$HW/.worktrees/wtroot1410"
+git -C "$HW" worktree add -q "$WROOT" -b wtroot1410 HEAD
+printf '%s\n' "$HW/.git" > "$HW/.git/worktrees/wtroot1410/gitdir"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a record naming the hub's own gitdir is reported"
+assert_contains "$out" "resolves it UP to this hub" "…with the hub-alias sentence"
+# The inverted claim is the defect: the hub root DOES resolve up to the hub, so a run whose only
+# offender is this one must not print the outside sentence at all.
+assert_not_contains "$out" "sits OUTSIDE this hub" "…and not the outside sentence"
+printf '%s\n' "$WROOT/.git" > "$HW/.git/worktrees/wtroot1410/gitdir"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wtroot1410" > "$WROOT/.git"
+
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
