@@ -186,20 +186,21 @@ recovery_guide() {
         '!'*) n="${line#!}"
             lines+=("  $n worktree record(s) could not be shown safely (a path contains a")
             lines+=("  newline) — inspect the hub's .git/worktrees directory by hand.") ;;
-        T1$'\t'*|T0$'\t'*|X1$'\t'*|X0$'\t'*)
+        T1$'\t'*|T0$'\t'*|T-$'\t'*|X1$'\t'*|X0$'\t'*|X-$'\t'*)
             mk="${line%%$'\t'*}"; d="${line#*$'\t'}"
             IFS= read -r rec || rec=""
             lines+=("  $d")
             # The sentence follows GIT'S OWN ANSWER (the marker), not a path prefix: a directory
             # inside a nested repo under the hub does not resolve to the hub, so naming the hub's
             # branch there would be false (measured).
-            if [[ "${mk#?}" == "1" ]]; then
-              lines+=("    git resolves it UP to this hub: commits and pushes made there")
-              lines+=("    target '$branch' (the hub's branch) and report success.")
-            else
-              lines+=("    git no longer treats it as a worktree, and it does NOT fall through to")
-              lines+=("    this hub — inspect what it does resolve to before committing there.")
-            fi
+            case "${mk#?}" in
+              1) lines+=("    git resolves it UP to this hub: commits and pushes made there")
+                 lines+=("    target '$branch' (the hub's branch) and report success.") ;;
+              0) lines+=("    git no longer treats it as a worktree, and it does NOT fall through to")
+                 lines+=("    this hub — inspect what it does resolve to before committing there.") ;;
+              *) lines+=("    git cannot resolve this directory at all, so nothing here is a")
+                 lines+=("    worktree — inspect it and its record before committing anywhere.") ;;
+            esac
             case "$mk" in
               T*) lines+=("    Restore the hub's link:")
                         lines+=("      printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
@@ -299,12 +300,20 @@ unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the reco
       # newlines, and a directory whose name ends in one is healthy in git's eyes — checking
       # health only after canonicalization reported such a worktree forever (measured).
       resolved="$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" || resolved=""
-      resolved="$( (cd "$resolved" 2>/dev/null && pwd -P) || printf '%s' "$resolved" )"
+      # Guarded: `cd ""` SUCCEEDS (it stays put), so canonicalizing an empty result substituted
+      # the INVOKER'S CWD — which made the verdict depend on where the check was run from, and
+      # reported a broken worktree as healthy when run from that worktree's record dir (#1410).
+      if [[ -n "$resolved" ]]; then
+        resolved="$( (cd "$resolved" 2>/dev/null && pwd -P) || printf '%s' "$resolved" )"
+      fi
       # `up` is git's own answer to "does this directory fall through to the hub?", carried to
       # the guide so the warning names the branch the commits would really land on: a worktree
-      # inside a nested repo under the hub resolves to THAT repo, not to the hub.
-      up=0
-      [[ "$resolved" == "$records" || -z "$resolved" ]] && up=1
+      # inside a nested repo under the hub resolves to THAT repo, not to the hub. `-` means git
+      # could not resolve the directory at all (it errors rather than walking up) — reported,
+      # and never claimed to fall through to the hub.
+      up=-
+      [[ "$resolved" == "$records" ]] && up=1
+      [[ -z "$resolved" ]] || [[ "$resolved" == "$records" ]] || up=0
       [[ "$resolved" == "$r" ]] && continue    # healthy: it resolves to its own record
     fi
     # TRANSPORT SAFETY, before canonicalization and only for an entry that is unhealthy: such

@@ -607,7 +607,9 @@ out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "a worktree outside the hub with no link is still flagged"
 # The sentence follows GIT'S answer, so an out-of-hub offender must not be told its commits
 # would land on the hub's branch.
-assert_contains "$out" "does NOT fall through to" "…and the hazard is stated per-directory"
+# Outside any repo, git cannot resolve it at all — the honest sentence, and never the claim that
+# its commits would land on the hub's branch.
+assert_contains "$out" "cannot resolve this directory" "…and the hazard is stated per-directory"
 assert_not_contains "$out" "resolves it UP to this hub" "…without claiming the hub's branch"
 apply_repair "$out" 2>/dev/null || true
 assert_contains "$(git -C "$WOUTSIDE" rev-parse --show-toplevel 2>/dev/null)" "$WOUTSIDE" \
@@ -761,6 +763,24 @@ assert_contains "$out" "It is a DIRECTORY" "…and the repair says so, rather th
 apply_repair "$out" 2>/dev/null || true
 out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 0 "…and the printed repair actually repairs it (no silent no-op)"
+
+# 10q. A `.git` FILE whose content git rejects (`fatal: invalid gitfile format`) makes git UNABLE
+# to resolve the directory. `cd ""` succeeds in bash 3.2, so the canonicalization of that empty
+# result substituted the INVOKER'S CWD: run from the worktree's own record dir the check reported
+# "hub discipline holds" and the broken entry was never mentioned (measured), and run from
+# `<hub>/.git` it claimed the commits would land on the hub's branch.
+WBAD="$HW/.worktrees/wtbad1410"
+git -C "$HW" worktree add -q "$WBAD" -b wtbad1410 HEAD
+rm -f "$WBAD/.git"
+printf 'not a gitdir\n' > "$WBAD/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an invalid .git file → exit 1 (reported, not a silent PASS)"
+assert_contains "$out" "cannot resolve this directory" "…and says git cannot resolve it"
+out="$(cd "$HW/.git/worktrees/wtbad1410" && bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "…and it is STILL reported when run from that worktree's own record dir"
+assert_not_contains "$out" "hub discipline holds" "…not a PASS that depends on the invoker's CWD"
+rm -f "$WBAD/.git"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wtbad1410" > "$WBAD/.git"
 
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
