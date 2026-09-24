@@ -3,7 +3,7 @@ name: research
 description: "Use for ANY non-trivial research — whether the user says 'research this' or the agent needs to investigate a technical question, compare approaches, evaluate trade-offs, understand a new domain, or make architecture decisions. Provides problem reframing, domain detection (Clear/Complicated/Complex), internal+external search, adversarial queries, and depth scaling. NOT for trivial single-fact lookups or content-pipeline keyword/SERP research (use content-research for that)."
 subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task mcp_load mcp__seo-intelligence__perplexity_search mcp__seo-intelligence__perplexity_research mcp__exa__web_search_exa mcp__exa__web_fetch_exa
-version: 1.1.0
+version: 1.2.0
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
@@ -74,7 +74,7 @@ The bias is toward **using all three sources**, especially external search. Outs
 - `mcp_load seo-intelligence` → **`Unknown MCP server 'seo-intelligence'`** — the server is absent from this machine's `.mcp.json`. **Rung 1 is currently UNAVAILABLE here.** Restoring it is a server-config/credential decision for a human — do not invent a config.
 - `web_search` with `model="sonar"` → **works** (verified with a live call). **This is the tested fallback when rung 1 is unavailable.**
 - `mcp_load exa` → **succeeds**, registering `mcp__exa__web_search_exa` + `mcp__exa__web_fetch_exa`. Rung 3's exa half is available (its `web_fetch` half needs no precondition).
-- `mcp_load brave-search` → **`MCP error -32000: Connection closed`** — configured, but its env carries an unresolved `${BRAVE_API_KEY}` placeholder with the variable unset, so the server cannot spawn. Record it and move on; do not retry-loop (lazy-load failure class #199/#358).
+- `mcp_load brave-search` → **`MCP error -32000: Connection closed`**. The `${BRAVE_API_KEY}` placeholder is **not** the cause: mcp-client expands an unset `${VAR}` to the **empty string** (`extensions/mcp-client/index.ts` — *"Plain ${VAR} → process.env[VAR] (empty string when unset)"*), so the server **does spawn** and then **exits 1** with `Error: A Brave API key is required via --brave-api-key, BRAVE_API_KEY, …` (re-verified 2026-09-24: exit code 1, *"Invalid configuration"*). The client surfaces that exit as the closed connection. **brave-search is not a rung of this ladder** — take the lowest rung that loads; record it and move on, do not retry-loop (lazy-load failure class #199/#358).
 
 **PREFLIGHT output line (required in the research output):** `Search tool: <tool + model actually used> — <rung N | rung 1 unavailable: <observed error>>`. If you moved past rung 1, the reason is stated there.
 
@@ -241,7 +241,7 @@ YouTube is often the first place leading-edge practice appears — before papers
 
 **Exa** — semantic search for academic papers and technical content. **Secondary, on-demand source — NOT primary** (#419). Perplexity is the primary source for all web research **when rung 1 loads (Step 0.0)**; Exa is a lazy fallback used only when a query needs semantic/scholarly/entity discovery that keyword retrieval misses: specific papers, arXiv preprints, technical documentation, people/company/prospect research. **It is no longer loaded at session start.** Invocation: `mcp_load exa` → next turn `mcp__exa__web_search_exa` / `mcp__exa__web_fetch_exa` (or stdin: `npx -y exa-mcp-server`). If `mcp_load` fails, degrade gracefully to the next available rung of the Step 0.0 ladder (`web_search` with `model="sonar"`) — do not retry-loop (lazy-load failure class #199/#358). **Sub-agents:** dispatched `task` sub-agents start with zero eager MCP connects (#286) — when a sub-agent may need semantic/scholarly discovery, name `exa` in the task tool's `mcp_servers` param, or instruct it to `mcp_load exa` mid-run.
 
-**Brave** — backup only, and **NOT currently loadable on this machine**: it is configured in `.mcp.json`, but `mcp_load brave-search` fails with `MCP error -32000: Connection closed` because its `BRAVE_API_KEY` is an unresolved `${BRAVE_API_KEY}` placeholder and the variable is unset (measured 2026-09-24, premise-labs#400). Do not count it as an available rung until that key is set — resolve the route via the Step 0.0 ladder. Same invocation pattern once it loads. Not a primary source — Perplexity returns better results for all tested query types.
+**Brave** — backup only, and **NOT currently loadable on this machine**: it is configured in `.mcp.json`, but `mcp_load brave-search` fails with `MCP error -32000: Connection closed`. The placeholder is **not** the cause — mcp-client expands an unset `${VAR}` to the empty string, so the server **spawns** and then **exits 1** for the missing key (`Error: A Brave API key is required via --brave-api-key, BRAVE_API_KEY, …`), which the client reports as the closed connection (measured 2026-09-24, premise-labs#400). Setting `BRAVE_API_KEY` is the only thing that restores it; until then **it is not a rung** — resolve the route via the Step 0.0 ladder. Same invocation pattern once it loads. Not a primary source — Perplexity returns better results for all tested query types.
 
 #### Exa + Brave (legacy — formerly P1 add-ons)
 
@@ -411,6 +411,7 @@ task(prompt='[VGATE] Review this research output for completeness and accuracy. 
 3. Single-source claims have verify-when-available note
 4. KG facts filed for key claims (skip if `"not_configured"` — no usable key: never set up, or the key was rejected with HTTP 401/403 — or `"tortoise_unavailable"` — the store was unreachable)
 5. Log entry appended to wiki/log.md per WIKI_SCHEMA.md INGEST format
+6. The Step 0.0 PREFLIGHT line is present, names the search tool + model actually used, and states the rung taken (or that rung 1 was unavailable and the reason) — a silently substituted rung is a gap
 
 Return ISSUE blocks for any gaps found (zero issues = CLEAN).
 RESEARCH OUTPUT: <full text>
@@ -420,7 +421,7 @@ RESEARCH OUTPUT: <full text>
 **ISSUE block format:**
 ```
 ISSUE:
-  check_type: missing-confidence|unflagged-contradiction|untagged-single-source|missing-kg-fact|missing-log-entry
+  check_type: missing-confidence|unflagged-contradiction|untagged-single-source|missing-kg-fact|missing-log-entry|missing-search-preflight
   severity: P1|P2
   location: [claim section name]
   description: <what is missing>
@@ -488,6 +489,7 @@ RESEARCH OUTPUT: <the full research summary>
 3. Are there contradictions or gaps in the evidence?
 4. Does the recommendation follow from the evidence presented?
 5. Were adversarial queries included and addressed?
+6. Does the output carry the Step 0.0 PREFLIGHT line — the search tool + model actually used, and the rung taken (or that rung 1 was unavailable and why)?
 
 Return: PASS or ISSUES with specific gaps and suggested fixes.
 ```
