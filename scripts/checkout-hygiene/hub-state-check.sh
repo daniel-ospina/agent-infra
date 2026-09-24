@@ -94,12 +94,14 @@ GH_BIN="${GH_BIN:-gh}"
 # $1=on_main(0/1) $2=dirty(0/1) $3=stale(behind|diverged|no_upstream|"")
 # $4=repo $5=branch $6=upstream ref (the resolved remote-tracking ref, or "")
 # $7=that ref's remote (for the push in the content-carrying route; default origin)
-# $8=`unlinked_worktrees` output for this hub — one `dir|record` pair per LINE, or empty
-#    when that class is absent (#1410)
+# $8=`unlinked_worktrees` output for this hub — `T<TAB><dir>` / `M<TAB>` + record lines
+#    (a leading `!<n>` counts uncarryable entries), or empty when that class is absent (#1410)
 # $9=the composed disorder token, used only by the empty-guard at the end
 recovery_guide() {
   local on_main="$1" dirty="$2" stale="${3:-}" repo="$4" branch="$5" upstream="${6:-}" push_remote="${7:-origin}" unlinked="${8:-}" disorder_token="${9:-}"
   local lines=()
+  local repo_canon
+  repo_canon="$( (cd "$repo" 2>/dev/null && pwd -P) || printf '%s' "$repo" )"
   if [[ "$branch" == "detached" || -z "$branch" ]]; then
     if [[ $dirty -eq 1 ]]; then
       lines+=("The hub is detached AND dirty. Name the stray HEAD commit first if it matters:")
@@ -174,13 +176,32 @@ recovery_guide() {
   fi
   if [[ -n "$unlinked" ]]; then
     lines+=("")
-    lines+=("#1410 — worktree directory(ies) under .worktrees/ with NO .git link:")
-    while IFS='|' read -r d rec; do
-      [[ -n "$d" ]] || continue
-      lines+=("  $d")
-      lines+=("    git resolves it UP to this hub: commits and pushes made there target")
-      lines+=("    '$branch' (the hub's branch) and report success. Restore the hub's link:")
-      lines+=("      printf 'gitdir: %s\\n' '$rec' > '$d/.git'")
+    lines+=("#1410 — worktree(s) the hub still records but with no .git link on disk:")
+    # The helper did the verifying and the resolving, so this loop only formats: one
+    # entry is `T<TAB><dir>` (repairable) or `M<TAB>` (report it, never repair it) on one
+    # line, followed by the record on the next. A field that could not be carried is
+    # counted on a leading `!<n>` line rather than silently dropped.
+    while IFS= read -r line; do
+      case "$line" in
+        '!'*) n="${line#!}"
+            lines+=("  $n worktree record(s) could not be shown safely (a path contains a")
+            lines+=("  newline) — inspect the hub's .git/worktrees directory by hand.") ;;
+        $'T\t'*)
+            d="${line#$'T\t'}"
+            IFS= read -r rec || rec=""
+            lines+=("  $d")
+            case "$d" in
+              "$repo_canon"/*) lines+=("    git resolves it UP to this hub: commits and pushes made there")
+                         lines+=("    target '$branch' (the hub's branch) and report success.") ;;
+              *)         lines+=("    git no longer treats it as a worktree. It sits OUTSIDE this hub,")
+                         lines+=("    so it does not resolve to it.") ;;
+            esac
+            lines+=("    Restore the hub's link:")
+            lines+=("      printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
+        $'M\t'*) IFS= read -r rec || rec=""
+            lines+=("  UNREADABLE worktree record: $rec")
+            lines+=("  (its worktree cannot be verified — inspect the record, then the hub's list)") ;;
+      esac
     done <<<"$unlinked"
   fi
   # #431: an EMPTY array expands to an unbound variable under `set -u` on bash 3.2, so a
@@ -192,8 +213,11 @@ recovery_guide() {
   printf '%s\n' "${lines[@]}"
 }
 
-# #1410 — the unlinked-worktree set for a hub: one `dir|record` pair per LINE (empty when
-# the class is absent), consumed by recovery_guide's `while IFS='|' read -r d rec`.
+# #1410 — the unlinked-worktree set for a hub, consumed by recovery_guide's
+# `while IFS= read -r line` marker loop. One entry is two lines: `T<TAB><dir>` when the
+# entry is repairable, or `M<TAB>` when the record could not be read (report it, never
+# repair it), followed by the record directory. A leading `!<n>` line counts entries whose
+# paths carry a newline and therefore cannot be carried in this transport.
 #
 # A registered worktree whose `.git` link is gone stops being a worktree: git walks UP
 # from the directory and resolves it to the hub, so a session working there commits and
@@ -213,20 +237,51 @@ recovery_guide() {
 # registered worktree under the hub is covered, wherever it sits.
 #
 # `rec` is that record, so the printed repair is exact rather than a template.
-unlinked_worktrees() { # $1=hub
-  local hub="$1" r dir out="" records
+unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the record, two lines per entry
+  local hub="$1" r dir raw out="" records mark bad=0 nl=$'\n' tab=$'\t' 
   records="$(git -C "$hub" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$hub/.git")"
   for r in "$records"/worktrees/*/; do
-    [[ -f "${r}gitdir" ]] || continue
-    dir="$(cat "${r}gitdir" 2>/dev/null)" || continue
-    [[ "$dir" == */.git ]] || continue          # an unexpected record shape is not our class
-    dir="${dir%/.git}"
-    # The directory must still exist to be anyone's working directory; a record whose
-    # directory is gone is `git worktree prune`'s business, not a silent hub alias.
-    [[ -d "$dir" ]] || continue
-    [[ -e "${dir}/.git" ]] && continue          # healthy: the link is there
-    out="${out}${out:+$'\n'}${dir}|${r%/}"
+    [[ -d "$r" ]] || continue
+    r="${r%/}"
+    raw=""
+    # An UNREADABLE record cannot be verified. It is REPORTED, not skipped as if the hub
+    # were healthy: an unverifiable verdict is never a PASS (the doctrine #1313's
+    # no_upstream class exists for).
+    if [[ -r "${r}/gitdir" ]]; then raw="$(cat "${r}/gitdir" 2>/dev/null)" || raw=""; fi
+    mark="T"; dir=""
+    case "$raw" in
+      "")   mark="M" ;;          # unreadable or empty: unverifiable → report, never skip
+      /*)   dir="${raw%/.git}" ;;                     # absolute record
+      *)    # A RELATIVE record is relative to the RECORD directory, not to our CWD
+            # (`git worktree add --relative-paths`, `worktree.useRelativePaths=true`).
+            # Read against `$PWD` it turns a real loss into PASS from everywhere but the
+            # record dir — a false PASS on the very class this detects.
+            dir="${r}/${raw}"
+            dir="${dir%/.git}" ;;
+    esac
+    [[ "$mark" == "M" || "$raw" == */.git ]] || continue   # an unexpected shape is not our class
+    # Canonicalize EVERY directory, not just relative records: git's record and the hub's
+    # `$repo` (derived from a logical pwd) otherwise live in different canonical domains, and
+    # the guide's "is this inside the hub?" test would misclassify an in-hub worktree.
+    if [[ -n "$dir" ]]; then
+      dir="$( (cd "$dir" 2>/dev/null && pwd -P) || printf '%s' "$dir" )"
+    fi
+    if [[ "$mark" == "T" ]]; then
+      # The directory must still exist to be anyone's working directory; a record whose
+      # directory is gone is `git worktree prune`'s business, not a silent hub alias.
+      [[ -d "$dir" ]] || continue
+      [[ -e "${dir}/.git" ]] && continue                   # healthy: the link is there
+    fi
+    # The transport is line-oriented, so a field carrying a newline cannot ride in it: it
+    # would split one entry into two and print a repair for the WRONG directory. Such a
+    # record is counted and reported for manual inspection instead.
+    if [[ "$r" == *$'\n'* || "$dir" == *$'\n'* ]]; then bad=$((bad + 1)); continue; fi
+    # $nl/$tab keep the separator out of the nested quoting above (a `$'\n'` inside
+    # `${x:+...}` is literal text, not a newline — it must not ride in the transport).
+    if [[ "$mark" == "T" ]]; then out="${out}${out:+$nl}T${tab}${dir}${nl}${r}"
+    else out="${out}${out:+$nl}M${tab}${nl}${r}"; fi
   done
+  [[ "$bad" -gt 0 ]] && out="!${bad}${out:+$nl}${out}"
   printf '%s' "$out"
 }
 

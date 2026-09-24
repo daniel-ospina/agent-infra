@@ -32,6 +32,16 @@ assert_contains() { # <haystack> <needle> <label>
   if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
 
+apply_repair() { # <check-output> — apply the FIRST printed `gitdir:` repair, verbatim.
+  # Extracted from the guide's own text, so this tests what an operator would paste. The
+  # `|| true` matters: a missing line makes the pipeline non-zero and the suite runs under
+  # `set -euo pipefail`.
+  local line
+  line="$(printf '%s\n' "$1" | grep -F "printf 'gitdir:" | head -1 | sed 's/^ *//' || true)"
+  [ -n "$line" ] || return 1
+  bash -c "$line"
+}
+
 assert_eq() { # <actual> <expected> <label>
   if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', want '$2')"; fi
 }
@@ -468,6 +478,10 @@ out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "an UNLINKED worktree → exit 1"
 assert_contains "$out" "HUB_DISORDER=worktree_unlinked" "…→ HUB_DISORDER=worktree_unlinked"
 assert_contains "$out" "$W1410" "…and names the directory that is no longer a worktree"
+# The hazard sentence is chosen per directory, comparing canonical paths. Without that, a
+# hub reached through a symlink (/var, /tmp on macOS — every mktemp fixture) misreads an
+# IN-HUB offender as sitting outside the hub and drops this load-bearing warning.
+assert_contains "$out" "resolves it UP to this hub" "…and warns that commits there land on the hub's branch"
 assert_contains "$out" "#1410" "…and points at the issue"
 assert_contains "$out" "printf 'gitdir: %s" "…and prints a printf repair line"
 assert_contains "$out" "$HW/.git/worktrees/wt1410" "…naming the hub's own record for that worktree"
@@ -523,6 +537,78 @@ gh_body="$(cat "$GH_STUB_LOG" 2>/dev/null)"
 assert_contains "$gh_body" "worktree_unlinked" "…whose FILED body names the class"
 assert_contains "$gh_body" "printf 'gitdir: %s" "…and carries the repair command, not just stdout"
 printf 'gitdir: %s\n' "$HW/.git/worktrees/wt1410" > "$W1410/.git"
+
+# 10c. A RELATIVE record must be resolved against the RECORD directory, never against the
+# invoker's CWD. Git writes these with `worktree.useRelativePaths=true` / `worktree add
+# --relative-paths`; read against $PWD, a real loss reports PASS from everywhere except the
+# record dir — a false PASS on the class itself.
+git -C "$HW" config worktree.useRelativePaths true
+WREL="$HW/.worktrees/wtrel1410"
+git -C "$HW" worktree add -q "$WREL" -b wtrel1410 HEAD
+assert_contains "$(cat "$HW/.git/worktrees/wtrel1410/gitdir" 2>/dev/null)" "../" \
+  "fixture: git wrote a RELATIVE record for this worktree"
+rm -f "$WREL/.git"
+mkdir -p "$FIX/elsewhere"
+out="$(cd "$FIX/elsewhere" && bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a RELATIVE record is flagged from a CWD outside the record dir"
+assert_contains "$out" "$WREL" "…and names that worktree"
+assert_contains "$out" "$HW/.git/worktrees/wtrel1410" "…with its own record"
+apply_repair "$out" 2>/dev/null || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the printed repair restores it"
+git -C "$HW" config --unset worktree.useRelativePaths
+
+# 10d. The transport must survive a path containing `|` or `'`. Packing `dir|record` into
+# one line split a `|` path into a wrong directory AND a wrong record, and printed a repair
+# that writes a .git file into an unrelated directory. The printed repair must also actually
+# work for such a path (an unquoted `'` turns it into a silent no-op).
+WPIPE="$HW/.worktrees/wtpipe|alt"
+git -C "$HW" worktree add -q "$WPIPE" -b wtpipe HEAD
+rm -f "$WPIPE/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree path containing | is flagged"
+assert_contains "$out" "$WPIPE" "…and carried intact, not truncated at the |"
+# The record path is printed %q-quoted (so a `|` cannot be misread when pasted), and git
+# reports the hub's common dir canonically on macOS (/var -> /private/var).
+assert_contains "$out" '.git/worktrees/wtpipe\|alt' "…with its own record, pipe escaped for pasting"
+apply_repair "$out" 2>/dev/null || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the printed repair restores it (no wrong-directory write)"
+assert_contains "$(git -C "$WPIPE" rev-parse --show-toplevel 2>/dev/null)" "$WPIPE" \
+  "…and git treats it as the worktree again"
+
+WQUOTE="$HW/.worktrees/don$(printf "'")t"
+git -C "$HW" worktree add -q "$WQUOTE" -b wtquote HEAD
+rm -f "$WQUOTE/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree path containing a single quote is flagged"
+apply_repair "$out" 2>/dev/null || true
+assert_contains "$(git -C "$WQUOTE" rev-parse --show-toplevel 2>/dev/null)" "$WQUOTE" \
+  "…and the printed repair still restores it (quote is escaped, not a silent no-op)"
+
+# 10e. An UNREADABLE record cannot be verified, so it is reported — never skipped as if the
+# hub were healthy (#1313's no_upstream doctrine: an unverifiable verdict is not a PASS).
+WUNREAD="$HW/.worktrees/wtunread1410"
+git -C "$HW" worktree add -q "$WUNREAD" -b wtunread1410 HEAD
+rm -f "$WUNREAD/.git"
+chmod 000 "$HW/.git/worktrees/wtunread1410/gitdir"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an unreadable worktree record → exit 1 (fail-closed, not a silent PASS)"
+assert_contains "$out" "UNREADABLE worktree record" "…and is reported as unverifiable"
+chmod 644 "$HW/.git/worktrees/wtunread1410/gitdir"
+printf 'gitdir: %s\n' "$WUNREAD/.git" > "$WUNREAD/.git"
+
+# 10f. A worktree OUTSIDE the hub cannot resolve up to it, so the guide must not claim that
+# it does (the repair is the same; the stated hazard is not).
+WOUTSIDE="$FIX/outside1410"
+git -C "$HW" worktree add -q "$WOUTSIDE" -b outside1410 HEAD
+rm -f "$WOUTSIDE/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree outside the hub with no link is still flagged"
+assert_contains "$out" "sits OUTSIDE this hub" "…and the hazard is stated per-directory"
+apply_repair "$out" 2>/dev/null || true
+assert_contains "$(git -C "$WOUTSIDE" rev-parse --show-toplevel 2>/dev/null)" "$WOUTSIDE" \
+  "…and its repair works too"
 
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
