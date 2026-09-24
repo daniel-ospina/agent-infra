@@ -604,7 +604,7 @@ fi
 
 echo ""
 echo "8v. FLOW-STYLE paths filter → rc 2 (the same narrowing, another spelling)"
-awk '{ if ($0 ~ /^on:$/) { print "on: {pull_request: {paths: [\x27scripts/**\x27]}}"; skip = 1; next } skip && /^$|^[a-z]/ { skip = 0 } skip { next } { print }' \
+awk '{ if ($0 ~ /^  pull_request:$/) { print "  pull_request: {paths: [\x27scripts/**\x27]}"; next } print }' \
   "$PR" >"$TMP/ci-pr-flowpaths.yml"
 if cmp -s "$PR" "$TMP/ci-pr-flowpaths.yml"; then
   fail "the flow-style paths mutation did not change the file"
@@ -787,6 +787,83 @@ if [ "$RC" -eq 2 ]; then
   pass "a quoted CI_LANE_* key exits 2 (quoting is not an escape)"
 else
   fail "a quoted CI_LANE_* key returned rc $RC (want 2): $OUT"
+fi
+
+echo ""
+echo "8ad. A FOLDED block scalar (`run: >`) joins its lines → the tail is visible"
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; next } print }' \
+  "$PR" >"$TMP/ci-pr-fold.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-fold.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a folded scalar whose single command carries --list exits 2 (YAML folds it into one line)"
+else
+  fail "a folded scalar with --list returned rc $RC (want 2): $OUT"
+fi
+
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: >"; print "          bash scripts/run-bash-shards.sh"; next } print }' \
+  "$PR" >"$TMP/ci-pr-foldok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-foldok.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a folded scalar whose single command is the bare call is accepted"
+else
+  fail "a bare folded scalar was refused (rc $RC): $OUT"
+fi
+
+echo ""
+echo "8ae. A FLOW VALUE on the trigger line itself → rc 2 (the value lives on the trigger line)"
+awk '{ if ($0 ~ /^  pull_request:$/) { print "  pull_request: {paths: [\x27scripts/**\x27]}"; next } print }' \
+  "$PR" >"$TMP/ci-pr-flowvalue.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-flowvalue.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a flow value on the pull_request line exits 2"
+else
+  fail "a flow value on the trigger line returned rc $RC (want 2): $OUT"
+fi
+
+echo ""
+echo "8af. AN INDENTED COMMENT before the paths filter → rc 2 (a comment never ends a mapping)"
+awk '{ print; if ($0 ~ /^  pull_request:$/) { print "  # a comment"; print "    paths:"; print "      - \x27scripts/**\x27" } }' \
+  "$PR" >"$TMP/ci-pr-indcomment.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-indcomment.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "an indented comment does not end the trigger block (the filter is still seen)"
+else
+  fail "an indented comment hid the paths filter (rc $RC, want 2): $OUT"
+fi
+
+echo ""
+echo "8ag. A BACKGROUNDED CALL → rc 2 (exit 0 immediately, so no shard can fail the run)"
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: bash scripts/run-bash-shards.sh > /dev/null &"; next } print }' \
+  "$PR" >"$TMP/ci-pr-bg.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-bg.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a backgrounded call exits 2"
+else
+  fail "a backgrounded call returned rc $RC (want 2): $OUT"
+fi
+
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: bash scripts/run-bash-shards.sh 2>&1"; next } print }' \
+  "$PR" >"$TMP/ci-pr-stderr.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-stderr.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a '2>&1' redirection is still accepted (the & scan strips real redirections)"
+else
+  fail "'2>&1' was refused (rc $RC): $OUT"
+fi
+
+echo ""
+echo "8ah. `steps:` WITH A TRAILING COMMENT → rc 0 (still the step list)"
+awk '{ if ($0 ~ /^    steps:$/) { print "    steps:  # the steps"; next } print }' \
+  "$PR" >"$TMP/ci-pr-stepscomment.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-stepscomment.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "'steps:  # comment' still anchors the step list"
+else
+  fail "'steps:' with a trailing comment returned rc $RC (want 0): $OUT"
 fi
 
 bash "$GUARD" --no-such-flag >"$TMP/badflag.out" 2>&1

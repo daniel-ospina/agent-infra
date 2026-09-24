@@ -203,12 +203,17 @@ run_blocks() {
       # latched from the first list item DEEPER than `steps:`, never from the first `- ` in the
       # job body (a strategy/matrix list before `steps:` would otherwise latch the wrong indent and
       # every real step would stop being read).
-      if (body == "steps:") steps_indent = indent
+      # `steps:` must be recognised with a trailing space or comment: `steps:  # the steps` is
+      # ordinary YAML, and missing it meant no step was ever read (a false block).
+      if (body ~ /^steps:[ \t]*(#.*)?$/) steps_indent = indent
       if (steps_indent != "" && list_indent == "" && body ~ /^- / && indent > steps_indent) list_indent = indent
       isstep = 0
       if (list_indent != "" && body ~ /^- /) { if (indent == list_indent) isstep = 1 }
       else if (list_indent != "" && indent == list_indent + 2) isstep = 1
-      if (isstep && body ~ ("^-? *" q "run" q " *: *[|>]")) { inblk = 1; blk_indent = indent; next }
+      if (isstep && body ~ ("^-? *" q "run" q " *: *[|>]")) {
+        inblk = 1; blk_indent = indent; blk_fold = (body ~ /[>]/); nacc = 0
+        next
+      }
       if (isstep && body ~ ("^-? *" q "run" q " *:")) {
         v = body
         sub(("^-? *" q "run" q " *: *"), "", v)
@@ -218,13 +223,34 @@ run_blocks() {
           if ((first == dq && last == dq) || (first == sq && last == sq)) v = substr(v, 2, length(v) - 2)
         }
         inblk = 0
+        blk_fold = 0
         print v
         next
       }
       if (inblk) {
-        if (line ~ /^[ ]*$/) { print ""; next }
-        if (indent > blk_indent) { print line; next }
+        if (line ~ /^[ ]*$/) { if (!blk_fold) print ""; next }
+        if (indent > blk_indent) {
+          # A folded scalar (`run: >`) joins its lines into ONE command, so emitting them as
+          # separate lines let `run: >` + a bare call + `--list` on the next line read as a bare
+          # call while YAML would run `runner --list` — zero shards, guard green. Folded content
+          # is joined here; a literal block (`|`) keeps its lines.
+          if (blk_fold) { nacc++; acc[nacc] = substr(line, blk_indent + 1) }
+          else print line
+          next
+        }
+        if (blk_fold) { joined = acc[1]; for (k = 2; k <= nacc; k++) joined = joined acc[k]; print joined; nacc = 0 }
+        blk_fold = 0
         inblk = 0
+      }
+    }
+    # A folded block scalar that ends at EOF must still be flushed: the bash-suites step IS the
+    # last step of the last job in ci.yml, so without this its folded call was never emitted and
+    # the lane read as calling nothing (a false block).
+    END {
+      if (nacc > 0) {
+        joined = acc[1]
+        for (k = 2; k <= nacc; k++) joined = joined acc[k]
+        print joined
       }
     }
   '
@@ -319,7 +345,14 @@ calls_runner() {
         sub(/^[ ]+/, "", rest)
         ok = 1
         if (rest != "") {
-          if (rest ~ /[|;]/) ok = 0
+          probe = rest
+          # Strip the redirections that legitimately contain `&` before looking for a control
+          # operator, so `2>&1` stays allowed while a BACKGROUNDING `&` is refused: a backgrounded
+          # call exits 0 immediately, so every shard may fail without failing the run.
+          gsub(/2>&1/, "", probe)
+          gsub(/>&2/, "", probe)
+          gsub(/&>[ \t]*/, "", probe)
+          if (probe ~ /[|;&]/) ok = 0
           else if (rest !~ /^(>>?|2>|2>&1|&>|>&2)/) ok = 0
         }
         if (ok) n++
@@ -380,18 +413,23 @@ pr_block="$(awk '
   /^[ ]*pull_request:/ {
     f = 1; pi = 0
     while (pi < length($0) && substr($0, pi + 1, 1) == " ") pi++
+    # PRINT the trigger line itself: a same-line flow value
+    # (`pull_request: {paths: [...]}`) narrows the trigger and lives only on this line. Dropping
+    # it (the first version of this slicer did) re-opened the exact spelling the whitespace
+    # normalization exists to catch.
+    print
     next
   }
   f {
     ind = 0
     while (ind < length($0) && substr($0, ind + 1, 1) == " ") ind++
-    # A comment (or a blank line) never ends a mapping: the pre-existing 8p fixture appends the
-    # paths lines AFTER the comments that follow `pull_request:`, and YAML still reads them as
-    # part of that block. Stopping on a comment would make the arm unable to see a real filter.
-    if ($0 != "" && substr($0, 1, 1) != "#" && ind <= pi) f = 0
+    firstc = substr($0, ind + 1, 1)
+    # A comment NEVER ends a mapping — at column 0 OR indented. YAML ignores it, so stopping on
+    # one would hide a real `paths:` filter that follows.
+    if ($0 != "" && firstc != "#" && ind <= pi) f = 0
     if (f) print
   }
-' "$PR_WORKFLOW" | grep -v '^[[:space:]]*#')"
+' "$PR_WORKFLOW")"
 # The slice stops at the next key at the SAME indentation as `pull_request:` — not at the next
 # column-0 key. Otherwise a sibling `push:` block that legitimately filters paths would be read
 # as narrowing the pull_request trigger (a false block, reproduced by the bug-scan reviewer).
