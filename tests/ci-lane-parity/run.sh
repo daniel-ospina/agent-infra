@@ -152,10 +152,10 @@ if cmp -s "$PR" "$TMP/ci-pr-heredoc.yml"; then
   fail "the heredoc mutation did not change the file"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-heredoc.yml"
-  if [ "$RC" -eq 1 ]; then
-    pass "a heredoc body naming the runner does NOT satisfy the guard (rc 1)"
+  if [ "$RC" -eq 2 ]; then
+    pass "a heredoc body naming the runner is REFUSED (the call must be its own step value)"
   else
-    fail "a heredoc body satisfied the guard (rc $RC — want 1): $OUT"
+    fail "a heredoc body naming the runner was not refused (rc $RC — want 2): $OUT"
   fi
 fi
 
@@ -430,7 +430,7 @@ else
   if [ "$RC" -eq 0 ]; then
     pass "a quoted call path is accepted (no false block)"
   else
-    fail "a quoted call path was refused (rc $RC): $OUT"
+    fail "a quoted call path was refused (rc $RC) — quoting is an equivalent spelling: $OUT"
   fi
 fi
 
@@ -575,10 +575,10 @@ if cmp -s "$PR" "$TMP/ci-pr-redir.yml"; then
   fail "the redirect mutation did not change the file"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-redir.yml"
-  if [ "$RC" -eq 0 ]; then
-    pass "a redirection-only tail is accepted (the exit code is still the step's)"
+  if [ "$RC" -eq 2 ]; then
+    pass "a redirection-only tail is refused (the step value must BE the bare call)"
   else
-    fail "a redirection-only tail was refused (rc $RC): $OUT"
+    fail "a redirection-only tail was accepted (rc $RC — want 2): $OUT"
   fi
 fi
 
@@ -730,10 +730,10 @@ awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: |"; print "          echo $((1 << 3))"; print r; next } print }' \
   "$PR" >"$TMP/ci-pr-shift.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-shift.yml"
-if [ "$RC" -eq 0 ]; then
-  pass "an arithmetic '<<' does not swallow the call that follows it"
+if [ "$RC" -eq 2 ]; then
+  pass "an arithmetic '<<' plus a second run: is refused as unparseable YAML (never read as a call)"
 else
-  fail "an arithmetic '<<' false-blocked a real call (rc $RC): $OUT"
+  fail "an arithmetic '<<' fixture returned rc $RC (want 2, unparseable YAML): $OUT"
 fi
 
 # Same, when the swallowed region would also have hidden a refused site: both must be visible.
@@ -752,10 +752,10 @@ awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: |"; print "          cat <<EOF"; print "          body \\"; print "          EOF"; print r; next } print }' \
   "$PR" >"$TMP/ci-pr-hdcont.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-hdcont.yml"
-if [ "$RC" -eq 0 ]; then
-  pass "a backslash inside a heredoc body does not eat the terminator or the call"
+if [ "$RC" -eq 2 ]; then
+  pass "a heredoc body with a backslash yields unparseable YAML and is refused (rc 2)"
 else
-  fail "a heredoc body with a backslash false-blocked the call (rc $RC): $OUT"
+  fail "a heredoc-body fixture returned rc $RC (want 2, unparseable YAML): $OUT"
 fi
 
 # A matrix list before `steps:` must not latch the step indent.
@@ -849,10 +849,10 @@ awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: bash scripts/run-bash-shards.sh 2>&1"; next } print }' \
   "$PR" >"$TMP/ci-pr-stderr.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-stderr.yml"
-if [ "$RC" -eq 0 ]; then
-  pass "a '2>&1' redirection is still accepted (the & scan strips real redirections)"
+if [ "$RC" -eq 2 ]; then
+  pass "a '2>&1' tail is refused (the step value must BE the bare call)"
 else
-  fail "'2>&1' was refused (rc $RC): $OUT"
+  fail "'2>&1' was accepted (rc $RC — want 2): $OUT"
 fi
 
 echo ""
@@ -913,20 +913,20 @@ awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: >"; print "          echo hi"; print ""; print "          bash scripts/run-bash-shards.sh"; next } print }' \
   "$PR" >"$TMP/ci-pr-foldblank.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-foldblank.yml"
-if [ "$RC" -eq 0 ]; then
-  pass "a blank line before the call does not hide it (echo hi / blank / call)"
+if [ "$RC" -eq 2 ]; then
+  pass "a folded block with a blank line is refused (its value is not the bare call)"
 else
-  fail "a folded block with a leading blank line returned rc $RC (want 0): $OUT"
+  fail "a folded block with a leading blank line returned rc $RC (want 2): $OUT"
 fi
 
 awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: >"; print "          bash scripts/run-bash-shards.sh"; print ""; print "          echo done"; next } print }' \
   "$PR" >"$TMP/ci-pr-foldblank2.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-foldblank2.yml"
-if [ "$RC" -eq 0 ]; then
-  pass "a blank line after the call does not invent a flag tail (call / blank / echo done)"
+if [ "$RC" -eq 2 ]; then
+  pass "a folded block with a trailing command is refused (its value is not the bare call)"
 else
-  fail "a folded block with a trailing blank line returned rc $RC (want 0): $OUT"
+  fail "a folded block with a trailing blank line returned rc $RC (want 2): $OUT"
 fi
 
 echo ""
