@@ -453,6 +453,19 @@ case "$key" in
     # reality, so the fake keeps them separate: a `<head>` fixture for the PR
     # surface, the `main-*` fixtures for main's. That split is the point of
     # #1261 — a red on MAIN must not block when the PR's own tree is green.
+    #
+    # #1446: A SINGLE RUN, resolved by its own id — the arm the rail falls back
+    # to when the bounded `gh run list` map did not carry that run. It is tried
+    # BEFORE the check-surface case and anchored on a URL that ENDS at the run
+    # id, so the Jobs seam (`…/runs/<id>/jobs…`) is never swallowed by it. The
+    # fixture is `$SCEN/run-<id>` holding the rail's own projected shape
+    # (`<event>\t<workflow-name>`); NO fixture is an unresolvable run, which the
+    # rail must treat as fail-closed — never as a non-code exemption.
+    if [ -n "$(printf '%s' "$a2" | sed -n 's#.*/actions/runs/[0-9][0-9]*$#&#p')" ]; then
+      id="$(printf '%s' "$a2" | sed -n 's#.*/actions/runs/\([0-9][0-9]*\)$#\1#p')"
+      if [ -f "$SCEN/run-$id" ]; then cat "$SCEN/run-$id"; exit 0; fi
+      exit 1
+    fi
     case "$a2" in
       */pulls/*)
         # ONE projected line, matching the rail's `gh api ... --jq` expression:
@@ -5860,6 +5873,294 @@ else
     && pass "a missing mergedAt is sentineled, so the line still carries its TAB" \
     || fail "missing mergedAt projected to [$t] (the separator must never be absent)"
 fi
+
+# ── 65. A RUN THE BOUNDED MAP MISSED IS RESOLVED INDIVIDUALLY (#1446) ─────────
+# The base-health run map is a SNAPSHOT — one bounded, branch- or sha-scoped
+# `gh run list` (empty when that listing fails) — so it can simply not carry a
+# red's run, even though `…/actions/runs/<id>` answers for it. (Observed on a
+# `finding-provenance` run, event `issues`, that the snapshot did not carry; WHY
+# a particular snapshot misses a run is deliberately not assumed.) Left
+# unresolved, the non-code exemption cannot match, the red classifies as
+# code-measuring, and step 4.6 refuses every stale-surface PR. The fix resolves
+# the run by id, and the outcomes must stay DISTINGUISHABLE: a resolved
+# non-code run is exempt, while a run that resolves to NOTHING stays unresolved
+# and BLOCKS (never "unresolved therefore exempt").
+echo "== 65. #1446: a run the bulk map missed is resolved individually (base), and an unresolvable one still BLOCKS =="
+
+# (a) THE REPRODUCTION, FIXED. Base RED only on a non-code-event lane whose run
+# is missing from the map but resolves by id -> EXEMPT (the PR is not stale
+# against a lane that measures no revision) and the red is still REPORTED.
+new_scen noncode-mapmiss-resolved
+HEAD_NC3="eaea000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC3" > "$SCEN/head"
+lane_pass "$HEAD_NC3" 5937 > "$SCEN/runs-$HEAD_NC3"
+lane_pass mainnc3 5938 > "$SCEN/runs-main"
+# PR surface GREEN, produced BEFORE the base red (so a code-measuring red here
+# WOULD be a stale surface and block — the exact #1446 refusal).
+write_pr_checks "$(check_run 5011 'ci / lint' completed success 7341 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7341 pull_request 'CI'
+write_main_checks "$(check_run 6011 provenance completed failure 8401 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+# The map does NOT carry 8401 (an unrelated run only) — the miss.
+main_run_map 8302 push 'Python CI'
+# …but the run RESOLVES by id to a non-code event + its workflow name.
+printf 'issues\tfinding-provenance\n' > "$SCEN/run-8401"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a map-missed run that resolves to a NON-code event is EXEMPT — the PR merges (exit 0)" \
+  || fail "a resolvable non-code base red still blocked (exit $rc) — the #1446 over-block is unfixed: $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+grep -q "NON-code events" "$SCEN/out" && pass "…and the non-code red is still REPORTED, not silently dropped" \
+  || fail "the resolved non-code red is SILENT"
+grep -q "actions/runs/8401" "$SCEN/calls" && pass "…and the rail resolved it INDIVIDUALLY by run id (not from the bounded map)" \
+  || fail "the rail never attempted the per-run resolve — the run was left to the bounded map"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
+
+# (b) THE FAIL-CLOSED ARM. The same miss, but the individual resolve ALSO fails
+# (no fixture = the API cannot answer for that run). `ev` stays empty, the red
+# stays UNRESOLVED, and it BLOCKS — "I could not tell what this is" is not
+# "this is noise". This is the arm that must NOT be widened away.
+new_scen noncode-mapmiss-unresolved
+HEAD_NC4="ebeb000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC4" > "$SCEN/head"
+lane_pass "$HEAD_NC4" 5939 > "$SCEN/runs-$HEAD_NC4"
+lane_pass mainnc4 5940 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5012 'ci / lint' completed success 7342 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7342 pull_request 'CI'
+write_main_checks "$(check_run 6012 provenance completed failure 8402 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8304 push 'Python CI'
+# NO $SCEN/run-8402 fixture: the individual resolve answers nothing.
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an UNRESOLVABLE base red still BLOCKS (exit $rc) — the fail-closed arm is intact" \
+  || fail "an unresolvable base red was EXEMPTED — the guard was widened into fail-open"
+grep -q "(workflow unresolved)" "$SCEN/err" && pass "…and it is named UNRESOLVED, not silently reclassified" \
+  || fail "the unresolved red is not named unresolved"
+grep -q "actions/runs/8402" "$SCEN/calls" && pass "…AFTER attempting the per-run resolve, which answered nothing" \
+  || fail "the rail did not even attempt the per-run resolve in the unresolvable case"
+[ -f "$SCEN/comment" ] && fail "evidence was posted over an unresolved red" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an unresolved red" || pass "no merge attempted"
+
+# (c) A CODE EVENT IS NOT A LOOPHOLE. A map-missed run that resolves to a
+# code-measuring event must STILL BLOCK — the resolve is not a blanket
+# exemption, and the workflow is now named rather than reported unresolved.
+new_scen noncode-mapmiss-code
+HEAD_NC5="ecec000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC5" > "$SCEN/head"
+lane_pass "$HEAD_NC5" 5941 > "$SCEN/runs-$HEAD_NC5"
+lane_pass mainnc5 5942 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5013 'ci / lint' completed success 7343 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7343 pull_request 'CI'
+write_main_checks "$(check_run 6013 lint completed failure 8403 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8306 push 'Python CI'
+printf 'push\tPython CI\n' > "$SCEN/run-8403"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a map-missed run resolving to a CODE event still BLOCKS (exit $rc)" \
+  || fail "a code-measuring red was exempted — the resolve became a blanket exemption"
+grep -q "workflow 'Python CI'" "$SCEN/err" && pass "…and the resolved workflow name is named in the refusal" \
+  || fail "the resolved code red is still reported as '(workflow unresolved)'"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a code red" || pass "no merge attempted"
+
+# (d) A MALFORMED ANSWER IS NOT A RESOLUTION. A tab-less response is not the
+# projected `<event>\t<workflow>` shape, so it must NOT be read as an event —
+# the red stays unresolved and BLOCKS. This pins the strict accept: an
+# over-eager parse would read `issues` out of a malformed line and exempt a red
+# on evidence the producer never actually supplied.
+new_scen noncode-mapmiss-malformed
+HEAD_NC6="eded000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC6" > "$SCEN/head"
+lane_pass "$HEAD_NC6" 5943 > "$SCEN/runs-$HEAD_NC6"
+lane_pass mainnc6 5944 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5014 'ci / lint' completed success 7344 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7344 pull_request 'CI'
+write_main_checks "$(check_run 6014 provenance completed failure 8404 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8308 push 'Python CI'
+printf 'issues\n' > "$SCEN/run-8404"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a TAB-LESS (malformed) resolve answer is NOT read as an event — still BLOCKS (exit $rc)" \
+  || fail "a malformed resolve answer was parsed as a non-code exemption — an over-eager parse"
+grep -q "(workflow unresolved)" "$SCEN/err" && pass "…and it stays UNRESOLVED" \
+  || fail "the malformed answer was accepted as a resolution"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a malformed resolution" || pass "no merge attempted"
+
+# (e) THE MAP STAYS THE PRIMARY SOURCE — the per-run resolve is a FALLBACK. A red
+# the map DOES carry must cost no per-run call, and its verdict must not move.
+new_scen noncode-mapresolved-precedence
+HEAD_NC7="eeee000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC7" > "$SCEN/head"
+lane_pass "$HEAD_NC7" 5945 > "$SCEN/runs-$HEAD_NC7"
+lane_pass mainnc7 5946 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5015 'ci / lint' completed success 7345 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7345 pull_request 'CI'
+write_main_checks "$(check_run 6015 provenance completed failure 8405 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+# The map HAS the event, and a fixture also exists for 8405 — so a rail that
+# resolves it anyway (dropping the `[ -z "$ev" ]` guard) records the call.
+main_run_map 8405 issues finding-provenance
+printf 'issues\tfinding-provenance\n' > "$SCEN/run-8405"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a red the MAP carries is still exempt and merges (the map is still primary)" \
+  || fail "a map-resolved non-code red blocked (exit $rc)"
+grep -q "actions/runs/8405" "$SCEN/calls" && fail "the rail spent a per-run resolve on a red the map already resolved — the fallback is no longer a fallback" \
+  || pass "…and NO per-run call was spent on a red the map resolved"
+
+# (f) THE EVALUATED TREE STILL BLOCKS A NON-CODE RED — through the per-run
+# resolve too. The #1353 contract is SURFACE-scoped, so a non-code red on the
+# PR's tree is an anomaly and BLOCKS whether its event came from the map or from
+# the new resolve. This pins that the resolve did not open the tree surface.
+new_scen noncode-tree-resolved
+HEAD_NC8="efef000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC8" > "$SCEN/head"
+lane_pass "$HEAD_NC8" 5947 > "$SCEN/runs-$HEAD_NC8"
+lane_pass mainnc8 5948 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5016 provenance completed failure 8406)"
+# The TREE map does NOT carry 8406; the per-run resolve answers `schedule`.
+pr_run_map 8309 push 'Python CI'
+printf 'schedule\tregistry-backup-cron\n' > "$SCEN/run-8406"
+main_green_surface
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a non-code red on the EVALUATED TREE still BLOCKS, per-run-resolved or not (exit $rc)" \
+  || fail "a non-code red on the evaluated tree was exempted — the #1353 hole reopened"
+grep -q "NOT EXEMPT ON THIS SURFACE" "$SCEN/err" && pass "…with the surface-scoped reason named" \
+  || fail "the tree refusal does not state the exemption is base-only"
+grep -q "actions/runs/8406" "$SCEN/calls" && pass "…after the per-run resolve was attempted on the tree too" \
+  || fail "the tree probe did not attempt the per-run resolve"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a tree red" || pass "no merge attempted"
+
+# (g) THE RESOLVE'S PROJECTION IS ITSELF PINNED. The fake `gh` answers the
+# per-run call by `cat`-ing an ALREADY-PROJECTED fixture and IGNORES `--jq`, so a
+# wrong field order/name in the rail's expression would pass every arm above
+# while the fix is silently ineffective in production (the #1446 over-block
+# returns, suite green). Section 64 guards the merge-state projection this way;
+# do the same for the resolve.
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq is unavailable, so the resolve projection cannot be exercised"
+else
+  RJQ="$(sed -n "s/^.*--jq '\(\[(.event.*\)' 2>.*$/\1/p" "$ADM" | head -1)"
+  [ -n "$RJQ" ] && pass "the rail's per-run resolve --jq expression is present and extractable" \
+    || fail "could not extract the resolve --jq expression from the rail"
+  rproj() { printf '%s' "$1" | jq -r "$RJQ" 2>/dev/null; }
+  t="$(rproj '{"event":"issues","name":"finding-provenance"}')"
+  [ "$t" = "$(printf 'issues\tfinding-provenance')" ] \
+    && pass "the projection emits <event><TAB><workflow>" \
+    || fail "the projection emitted [$t]"
+  t="$(rproj '{"event":"push","name":"issues"}')"
+  [ "$t" = "$(printf 'push\tissues')" ] \
+    && pass "…with the EVENT first — a swapped field order cannot pass" \
+    || fail "the projection's field order is not event-then-name ([$t])"
+  t="$(rproj '{}')"
+  [ "$t" = "$(printf '\t')" ] \
+    && pass "…an empty run projects to an EMPTY event (arm (i) pins that the rail then blocks)" \
+    || fail "an empty run projected to [$t]"
+  t="$(rproj '{"event":"issues\npush","name":"wf"}')"
+  if [ "$(printf '%s' "$t" | wc -l | tr -d ' ')" = "0" ]; then
+    pass "…and a newline inside the event is ESCAPED, so it cannot forge a second field"
+  else
+    fail "a newline in the event produced a RAW newline — a lenient parse could read a forged event ([$t])"
+  fi
+fi
+
+# (h) A LEGACY COMMIT STATUS IS NEVER RUN-RESOLVED. A status row's `url` is its
+# OWN, app-supplied `target_url`, so a `/runs/<N>` inside it names SOME run, not
+# the row's producer — and a status has NO Actions event. Without the app gate,
+# a status red whose target_url embeds a `schedule` run URL was EXEMPTED on the
+# base (the cycle-2 review reproduced that fail-open). It must BLOCK.
+new_scen base-status-runurl
+HEAD_NC9="f1f1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC9" > "$SCEN/head"
+lane_pass "$HEAD_NC9" 5949 > "$SCEN/runs-$HEAD_NC9"
+lane_pass mainnc9 5950 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5017 'ci / lint' completed success 7351 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7351 pull_request 'CI'
+# A GREEN check-run surface plus a RED legacy status whose target_url names a
+# `schedule` run that is ABSENT from the map and resolves per-run to `schedule`.
+main_green_surface
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"deploy-verify","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://ci.example.com/actions/runs/9101"}]}\n' > "$SCEN/main-statuses.json"
+printf 'schedule\tregistry-backup-cron\n' > "$SCEN/run-9101"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a STATUS red whose target_url embeds a schedule run URL still BLOCKS (exit $rc)" \
+  || fail "a legacy commit status was exempted via a run id read from its target_url — a fail-open"
+grep -q "actions/runs/9101" "$SCEN/calls" && fail "the rail run-resolved a commit-status row's target_url" \
+  || pass "…and it was never run-resolved (neither from the map nor per-run)"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a status red" || pass "no merge attempted"
+
+# (i) A TAB-PRESENT BUT EMPTY-EVENT ANSWER IS NOT A RESOLUTION. `@tsv` renders a
+# missing event as an empty first field, so the answer is a bare TAB. That must
+# stay unresolved and BLOCK — arm (g) pins the projection, this pins the rail.
+new_scen noncode-empty-event-resolve
+HEAD_NC10="f2f2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC10" > "$SCEN/head"
+lane_pass "$HEAD_NC10" 5951 > "$SCEN/runs-$HEAD_NC10"
+lane_pass mainnc10 5952 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5018 'ci / lint' completed success 7352 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7352 pull_request 'CI'
+write_main_checks "$(check_run 6016 provenance completed failure 8407 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8311 push 'Python CI'
+printf '\t\n' > "$SCEN/run-8407"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a TAB-present, EMPTY-event resolve answer still BLOCKS (exit $rc)" \
+  || fail "an empty-event resolution was read as a non-code exemption"
+grep -q "(workflow unresolved)" "$SCEN/err" && pass "…and it stays UNRESOLVED" \
+  || fail "the empty-event answer was recorded as a resolution"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an empty-event answer" || pass "no merge attempted"
+
+# (j) A TAB IN A STATUS `context` MUST NOT SHIFT THE ROW. The red row is parsed
+# POSITIONALLY, so three tabs in the free-text field move `app` off
+# "commit-status" (defeating the legacy-status gate) and land a chosen URL in
+# the field the run-id regex reads — the cycle-3 adversarial bypass. The emitter
+# now flattens every field, so the shift is impossible. BLOCK.
+new_scen status-context-tab-shift
+HEAD_NC11="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC11" > "$SCEN/head"
+lane_pass "$HEAD_NC11" 5953 > "$SCEN/runs-$HEAD_NC11"
+lane_pass mainnc11 5954 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5019 'ci / lint' completed success 7353 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7353 pull_request 'CI'
+main_green_surface
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"a\\tb\\tc\\thttps://ci.example.com/actions/runs/9101","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://ci.example.com/deploy-verify"}]}\n' > "$SCEN/main-statuses.json"
+printf 'schedule\tregistry-backup-cron\n' > "$SCEN/run-9101"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a TAB in a status context cannot shift the row: still BLOCKS (exit $rc)" \
+  || fail "a status-context tab shifted the row and exempted a code-measuring red — fail-open"
+grep -q "actions/runs/9101" "$SCEN/calls" && fail "the shifted context field was read as the row's URL" \
+  || pass "…and the forged URL was never read as the row's own"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a shifted status row" || pass "no merge attempted"
+
+# (k) THE SAME SHIFT ON A CHECK-RUN `name`. The row's genuine run (9999, event
+# `push`) is code-measuring, but three tabs in the name put a `schedule` URL in
+# the field the run-id regex reads, which would exempt the base red. BLOCK.
+new_scen checkrun-name-tab-shift
+HEAD_NC12="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC12" > "$SCEN/head"
+lane_pass "$HEAD_NC12" 5955 > "$SCEN/runs-$HEAD_NC12"
+lane_pass mainnc12 5956 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5020 'ci / lint' completed success 7354 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7354 pull_request 'CI'
+write_main_checks "$(check_run 6018 'a\tb\tc\thttps://ci.example.com/actions/runs/9101' completed failure 9999 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 9999 push 'Python CI'
+printf 'schedule\tregistry-backup-cron\n' > "$SCEN/run-9101"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a TAB in a check-run name cannot shift the row: still BLOCKS (exit $rc)" \
+  || fail "a check-run-name tab shifted the row and exempted a code-measuring red — fail-open"
+grep -q "actions/runs/9101" "$SCEN/calls" && fail "the shifted name field was read as the row's URL" \
+  || pass "…and the forged URL was never read as the row's own"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a shifted check-run row" || pass "no merge attempted"
+
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

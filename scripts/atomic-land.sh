@@ -20,7 +20,9 @@
 #                                                                  reviewed lines)
 #   3. RECORD      — record-review.sh, given the PRIOR head as the equivalence
 #                    input; its carry-forward arm (#767) re-binds the record to
-#                    the NEW head iff the reviewed diff is byte-unchanged
+#                    the NEW head iff the reviewed diff is content-unchanged
+#                    (sha256 over the NORMALIZED diff, #1362 D1 — the rendering
+#                    may re-flow across a base move; the change may not)
 #   4. land        — the repo's mandated rail, never a hand-rolled merge
 #
 # Steps 1-3 are atomic per PR: an update that ends without a record at the new
@@ -263,9 +265,19 @@ GATE_KEY="$(printf '%s' "$GATE_KEY_RAW" | tr -d '[:space:]')"
 # Can the record at the current head be RESTORED by the producer's carry-forward
 # after an update? Requires a marker that is (a) shape-valid WITH a diff= identity
 # and (b) authentically signed by the gate key. Mirrors the producer's own carry
-# regex and signature check (record-review.sh:446-458) — keep both in sync.
+# regex and signature check (record-review.sh, the carry-forward arm) — keep both in sync.
 # This is a presence + authenticity test, NOT an equivalence computation: whether
 # the marker's diff= still matches the live diff is the producer's decision alone.
+#
+# THE EQUIVALENCE PRIMITIVE IS SHARED, AND THE RAIL MUST NOT RE-IMPLEMENT IT.
+# The digest the marker carries is sha256 over the NORMALIZED diff — the ONE
+# implementation is `scripts/lib/diff-normalize.py` (agent-infra #1362 D1),
+# used by the producer (record-review.sh) and mirrored by the consumer
+# (`tortoise` .github/workflows/ai-review-gate.yml). The rail deliberately does
+# NOT re-derive it: `record-review.sh` owns the equivalence decision (see the
+# WHY below), and a second implementation here would be a second definition of
+# "unchanged" for one cross-repo contract. The rail reads the diff= value as an
+# opaque identity and cites it verbatim.
 pr_has_carry_evidence() {
   local line="" text="" sig="" expect=""
   line="$(gh_ api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null \
@@ -473,6 +485,17 @@ do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
   sed 's/^/atomic-land:     record-review: /' "$log" >&2
   if [ "$rc" -eq 3 ]; then
     err "atomic-land: the recorded verdict cannot be carried to ${HEAD:0:12}… — the reviewed diff CHANGED (or no prior signed evidence for it exists)."
+    # #1362 D1 — a PARTIAL INSTALL is a distinct cause of the same exit code. The
+    # producer computes its digest with the sibling normalizer
+    # (scripts/lib/diff-normalize.py); if that file was not farmed, the producer
+    # degrades to the raw pre-#1362 digest and EVERY base-only update refuses —
+    # so the message above would blame a diff that did not change. Name the
+    # missing file so the remedy is an install, not a re-review. Diagnostic only:
+    # the rail never re-derives the digest itself (see pr_has_carry_evidence).
+    DIFF_NORMALIZER_SH="$(dirname -- "$RECORD_SH")/lib/diff-normalize.py"
+    if [ ! -f "$DIFF_NORMALIZER_SH" ]; then
+      err "atomic-land: ⚠️ #1362: the producer's diff normalizer ($DIFF_NORMALIZER_SH) is NOT installed — the refusal above may be a partial install, not a changed artifact. Re-run pi-bootstrap/setup.sh (which farms scripts/lib/diff-normalize.py) before re-reviewing."
+    fi
     err "atomic-land: a FRESH review of the new head is required; this rail cannot author one. Nothing was merged."
     rm -f "$log"
     return 1
@@ -495,7 +518,7 @@ do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
   }
   if [ "$RECORD_HEAD" != "$HEAD" ]; then
     err "atomic-land: the record names ${RECORD_HEAD:0:12}… but the head is ${HEAD:0:12}… — this unit has NO record for the head it would land."
-    err "atomic-land: a zero exit must leave a record naming the CURRENT head (carry-forward does that only when the reviewed diff is byte-unchanged). Nothing was merged."
+    err "atomic-land: a zero exit must leave a record naming the CURRENT head (carry-forward does that only when the reviewed diff is content-unchanged). Nothing was merged."
     rm -f "$log"
     return 1
   fi
@@ -531,7 +554,7 @@ cite_reuse() { # <record-review log> <prior head>
   local body="atomic-land: reused verdict \`$RECORD_VERDICT\` for ${HEAD:0:12}… from prior head ${prior:0:12}…
 The head moved by a base-only update, and \`record-review.sh\` re-recorded the prior signed verdict"
   if [ -n "$diff" ]; then
-    body="$body for the byte-identical three-dot diff (\`diff=$diff\`)."
+    body="$body for the content-identical (normalized) three-dot diff (\`diff=$diff\`)."
   else
     body="$body after its carry-forward guard proved the reviewed diff unchanged."
   fi

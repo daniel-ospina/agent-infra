@@ -141,12 +141,32 @@ jobs:
         # admin-merge.sh (the suite above) and the record step to record-review.sh;
         # this suite pins only the sequencing and the fail-closed preconditions.
         run: bash tests/atomic-land/run.sh
+      - name: Review-evidence diff normalizer (#1362 D1)
+        # The ONE implementation of the diff normalization the review-evidence
+        # digest is computed over, plus the three byte-level D1 properties
+        # (base-move invariant, content change, whitespace change). This is a
+        # dedicated per-PR step AND the suite is registered in the one shard
+        # list (scripts/run-bash-shards.sh) that both lanes run — same
+        # deliberate double-run as the admin-merge suites above. The producer's
+        # integration pins live in scripts/record-review.test.sh §12, which is
+        # likewise in the shard list, so it runs in BOTH lanes.
+        run: bash scripts/diff-normalize.test.sh
       - name: Argv-level admin-merge guard suite (#984)
         # The layer that makes obfuscation irrelevant: the shim inspects its OWN argv,
         # where bash has already resolved `-${V:--}admin=true` into `--admin`. The
         # suite drives the real shim through a real shell with the splices that
         # defeated the string scanner, and asserts refusal.
         run: bash tests/gh-shim/run.sh
+      - name: Certificate contract suite (#1388)
+        # The ONE contract, pinned against a REAL captured evidence comment rather
+        # than a hand-written fixture. bcbb7df (#3756) renamed the producer's
+        # residual clause and BOTH gates kept requiring the old name; every admin
+        # merge was refused fleet-wide for six days with every suite green, because
+        # a hand-written fixture cannot notice that the producer moved. This suite
+        # extracts the required literals FROM the gate, asserts each exists in real
+        # evidence, mutates the producer's clause one word and requires refusal, and
+        # pins clause 6 — that the TS gate owns no copy of the clause set.
+        run: bash tests/admin-merge-evidence-contract/run.sh
 
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
@@ -546,7 +566,7 @@ jobs:
   bash-suites:
     # #1369 — Route A of the lane-split fix: the PR lane must RUN the bash work its check
     # name implies. Before this job, `ci / script-validate` ran `node --check` only (~4s)
-    # while main's `script-validate` ran the bash sweeps + fourteen hermetic suites (~5m20s)
+    # while main's `script-validate` ran the bash sweeps + the hermetic suites (~5m20s)
     # — one check name over two different bodies of work. A runner-only failure therefore
     # reached main with a GREEN PR: scripts/record-review.test.sh exited 127 on the ubuntu
     # runner (its PATH-shim vector) and reddened main (#1348 → #1369).
