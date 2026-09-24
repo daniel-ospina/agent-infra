@@ -6115,6 +6115,52 @@ grep -q "(workflow unresolved)" "$SCEN/err" && pass "…and it stays UNRESOLVED"
   || fail "the empty-event answer was recorded as a resolution"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an empty-event answer" || pass "no merge attempted"
 
+# (j) A TAB IN A STATUS `context` MUST NOT SHIFT THE ROW. The red row is parsed
+# POSITIONALLY, so three tabs in the free-text field move `app` off
+# "commit-status" (defeating the legacy-status gate) and land a chosen URL in
+# the field the run-id regex reads — the cycle-3 adversarial bypass. The emitter
+# now flattens every field, so the shift is impossible. BLOCK.
+new_scen status-context-tab-shift
+HEAD_NC11="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC11" > "$SCEN/head"
+lane_pass "$HEAD_NC11" 5953 > "$SCEN/runs-$HEAD_NC11"
+lane_pass mainnc11 5954 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5019 'ci / lint' completed success 7353 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7353 pull_request 'CI'
+main_green_surface
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"a\\tb\\tc\\thttps://ci.example.com/actions/runs/9101","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://ci.example.com/deploy-verify"}]}\n' > "$SCEN/main-statuses.json"
+printf 'schedule\tregistry-backup-cron\n' > "$SCEN/run-9101"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a TAB in a status context cannot shift the row: still BLOCKS (exit $rc)" \
+  || fail "a status-context tab shifted the row and exempted a code-measuring red — fail-open"
+grep -q "actions/runs/9101" "$SCEN/calls" && fail "the shifted context field was read as the row's URL" \
+  || pass "…and the forged URL was never read as the row's own"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a shifted status row" || pass "no merge attempted"
+
+# (k) THE SAME SHIFT ON A CHECK-RUN `name`. The row's genuine run (9999, event
+# `push`) is code-measuring, but three tabs in the name put a `schedule` URL in
+# the field the run-id regex reads, which would exempt the base red. BLOCK.
+new_scen checkrun-name-tab-shift
+HEAD_NC12="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC12" > "$SCEN/head"
+lane_pass "$HEAD_NC12" 5955 > "$SCEN/runs-$HEAD_NC12"
+lane_pass mainnc12 5956 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5020 'ci / lint' completed success 7354 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7354 pull_request 'CI'
+write_main_checks "$(check_run 6018 'a\tb\tc\thttps://ci.example.com/actions/runs/9101' completed failure 9999 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 9999 push 'Python CI'
+printf 'schedule\tregistry-backup-cron\n' > "$SCEN/run-9101"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a TAB in a check-run name cannot shift the row: still BLOCKS (exit $rc)" \
+  || fail "a check-run-name tab shifted the row and exempted a code-measuring red — fail-open"
+grep -q "actions/runs/9101" "$SCEN/calls" && fail "the shifted name field was read as the row's URL" \
+  || pass "…and the forged URL was never read as the row's own"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a shifted check-run row" || pass "no merge attempted"
+
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

@@ -1918,11 +1918,25 @@ for stamp, ctx, state, url in sbest.values():
         surface_epoch, surface_iso = int(e), stamp
 
 total = len(best) + len(sbest)
+
+def sane(v):
+    # ⛔ THE ROW IS READ POSITIONALLY (`IFS=$'\t' read -r tag name app ...`), so a
+    # TAB or NEWLINE inside ANY upstream free-text field IMPERSONATES the field
+    # separator and SHIFTS every later field: a status `context` carrying three
+    # tabs moves `app` off "commit-status" (defeating the legacy-status gate
+    # that keys on it) and lands an attacker-chosen URL in the field the run-id
+    # regex reads, so a `schedule` run is exempted for a code-measuring red. The
+    # same shift forges `started_iso`/`epoch`, which the staleness anchor uses.
+    # Every interpolated field is flattened to one line here — at the ONE
+    # producer — so the whole shift class is closed at its source.
+    return str(v).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
 for name, app, concl, url, tiso, note in reds:
-    sys.stdout.write("RED\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (name, app, concl, url, tiso, ts_epoch(tiso), note))
+    sys.stdout.write("RED\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"
+                     % tuple(sane(x) for x in (name, app, concl, url, tiso, ts_epoch(tiso), note)))
 for name, app in pend:
-    sys.stdout.write("PENDING\t%s\t%s\n" % (name, app))
-sys.stdout.write("SURFACE\t%s\t%s\n" % (surface_iso, ("" if surface_iso == "" else str(surface_epoch))))
+    sys.stdout.write("PENDING\t%s\t%s\n" % (sane(name), sane(app)))
+sys.stdout.write("SURFACE\t%s\t%s\n" % (sane(surface_iso), ("" if surface_iso == "" else str(surface_epoch))))
 sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), total - len(reds) - len(pend)))' \
     "$cr_json" "$st_json" 2>/dev/null)"
   rc=$?
