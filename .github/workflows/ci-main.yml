@@ -305,6 +305,11 @@ jobs:
           # registered-but-unmarked worktree). Hermetic: temp repo + temp root.
           bash scripts/scratch-worktree.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
+          # #1362 D1 — the review-evidence diff normalizer (the ONE implementation
+          # shared with the consumer workflow). Pins the 5 required vectors, byte
+          # preservation (trailing newline + non-ASCII) and the three D1
+          # properties. Runs beside the producer suite that consumes it.
+          bash scripts/diff-normalize.test.sh || errors=$((errors+1))
           # #930 — safe-admin-merge rail: the ONE failing-set parser
           # (scripts/ci-failure-set.sh) plus the chokepoint that consumes it
           # (scripts/admin-merge.sh). Post-merge re-check of the same hermetic

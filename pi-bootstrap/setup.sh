@@ -318,7 +318,15 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 # farmed WITH it, preserving the relative positions
 # (scripts/pi-reap-idle.sh <-> scripts/lib/pid-identity.sh). Same idempotent
 # real-copy refresh model as the farms above (real files, not symlinks: #427).
-lib_srcs=(pid-identity.sh)
+#
+# #1362 D1 adds a SECOND sibling: the merge-gate farm copies record-review.sh
+# flat into $DEST/scripts/, and it resolves its diff normalizer as
+# `$(dirname "${BASH_SOURCE[0]}")/lib/diff-normalize.py` (the ONE implementation of
+# the review-evidence normalization, shared with the consumer workflow). Farming
+# record-review.sh WITHOUT diff-normalize.py degrades the producer to the raw
+# pre-#1362 digest — no false accept, but every base-only update goes back to
+# refusing carry-forward. Farm them together.
+lib_srcs=(pid-identity.sh diff-normalize.py)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 for base in "${lib_srcs[@]}"; do
@@ -333,7 +341,7 @@ for base in "${lib_srcs[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   lib_copied=$((lib_copied+1))
 done
-echo "    scripts lib farm: $lib_copied copied (pid-identity.sh, #1178)"
+echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py, #1178)"
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
 # (templates/launchd/com.eldato.lane-liveness.plist) runs

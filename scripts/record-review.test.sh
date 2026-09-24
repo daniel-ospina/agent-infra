@@ -214,9 +214,11 @@ refs_for_any() { # <repo> <text> — boundary-anchored keyword-class scan
 
 # #2982: diff-binding runner — lets a test set the PR body AND the diff bytes
 # the stubbed `gh` returns for the `Accept: …v3.diff` fetch.
-run_record_diff() { # <pr> <sha> <body> [diff-file] [diff-fail] [extra record args…]
-    local pr="$1" sha="$2" body="$3" dfile="${4:-/dev/null}" dfail="${5:-0}"
-    shift $(( $# > 5 ? 5 : $# ))   # remaining args pass verbatim to record-review.sh
+# #1362 D1: parameterised by the record SCRIPT so a mutant copy (whose sibling
+# lib/diff-normalize.py is a different primitive) runs through the SAME harness.
+run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-fail] [extra record args…]
+    local rec="$1" pr="$2" sha="$3" body="$4" dfile="${5:-/dev/null}" dfail="${6:-0}"
+    shift $(( $# > 6 ? 6 : $# ))   # remaining args pass verbatim to record-review.sh
     local rcfile="$T/rc" errfile="$T/err" cap="$T/cap"
     : > "$LOG"; : > "$cap"; rm -f "$errfile"
     (
@@ -225,12 +227,15 @@ run_record_diff() { # <pr> <sha> <body> [diff-file] [diff-fail] [extra record ar
         export GH_STUB_LOG="$LOG"
         export STUB_BODY="$body" STUB_DIFF_FILE="$dfile" STUB_DIFF_FAIL="$dfail" STUB_CAPTURE="$cap"
         rc=0
-        bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
+        bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
     ) 2>/dev/null
     RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
     RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
     RECORD_CAP="$(cat "$cap" 2>/dev/null || true)"
+}
+run_record_diff() { # <pr> <sha> <body> [diff-file] [diff-fail] [extra record args…]
+    run_record_diff_with "$RECORD" "$@"
 }
 
 echo "── 1. Repo known → qualified key ───────────────────────────────"
@@ -740,6 +745,174 @@ json_valid "$(Q2 424513)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      persist into §10 and make its code-bearing vectors see a docs-only diff.
 unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
 
+# ─────────────────────────────────────────────────────────────────────────
+# 12. #1362 D1 — the review-evidence digest is computed over the NORMALIZED
+#     diff (owner ruling 2026-09-23), with a raw-hash backward-compat arm.
+# ─────────────────────────────────────────────────────────────────────────
+# The normalization itself is pinned BYTE-FOR-BYTE by
+# scripts/diff-normalize.test.sh. THIS section pins the PRODUCER's use of it
+# end-to-end and carries the four required mutation pins ((a)-(d)). Each mutant
+# is a real copy of record-review.sh whose SIBLING lib/diff-normalize.py is a
+# different primitive — the shared-normalizer design is what makes the mutation
+# a single-file swap — so every property test is shown to FAIL when its own
+# mechanism is removed.
+echo "── 12. #1362 D1: normalized diff digest + backward compat ──────"
+
+NFX="$T/n-b1.diff";  printf 'diff --git a/f b/f\nindex 1111111..2222222 100644\n--- a/f\n+++ b/f\n@@ -1,3 +1,4 @@\n ctx\n+added\n ctx2\n' > "$NFX"
+NFX2="$T/n-b2.diff"; printf 'diff --git a/f b/f\nindex aaaaaaa..bbbbbbb 100644\n--- a/f\n+++ b/f\n@@ -10,3 +11,4 @@\n ctx\n+added\n ctx2\n' > "$NFX2"
+NFXC="$T/n-content.diff"; printf 'diff --git a/f b/f\nindex aaaaaaa..bbbbbbb 100644\n--- a/f\n+++ b/f\n@@ -10,3 +11,4 @@\n ctx\n+added-CHANGED\n ctx2\n' > "$NFXC"
+NFXW="$T/n-ws.diff"; printf 'diff --git a/f b/f\nindex aaaaaaa..bbbbbbb 100644\n--- a/f\n+++ b/f\n@@ -10,3 +11,4 @@\n ctx\n+ added\n ctx2\n' > "$NFXW"
+
+NORM_PY="$SCRIPT_DIR/lib/diff-normalize.py"
+norm_sha_with() { python3 "$1" < "$2" | openssl dgst -sha256 | awk '{print $NF}'; }
+norm_sha() { norm_sha_with "$NORM_PY" "$1"; }
+raw_sha()  { openssl dgst -sha256 < "$1" | awk '{print $NF}'; }
+signed_marker() { # <pr> <sha> <diff> → the signed marker line
+    local pr="$1" sha="$2" diff="$3" text
+    text="review recorded: reviews/${pr}.json verdict=clean @ ${sha} diff=${diff} (daniel-ospina/agent-infra)"
+    printf '%s sig=%s' "$text" "$(printf '%s' "$text" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+}
+assert_ne() { if [ "$1" != "$2" ]; then ok "$3"; else bad "$3"; fi; }
+
+# (a) a BASE-ONLY update (same changed lines, different base) leaves the
+#     normalized digest UNCHANGED — the whole point of D1.
+NH="$(norm_sha "$NFX")"
+assert_eq "$NH" "$(norm_sha "$NFX2")" "12a direct: a base move leaves the NORMALIZED digest unchanged"
+assert_ne "$(raw_sha "$NFX")" "$(raw_sha "$NFX2")" "12a direct: the RAW digest DID move (normalization is what fixes it)"
+NPR_a=424700; rm -f "$(Q2 $NPR_a)"
+run_record_diff "$NPR_a" "$STALE" "body
+
+$(signed_marker $NPR_a "$STALE" "$NH")" "$NFX2"
+[ "$RECORD_RC" = "0" ] && ok "12a carry-forward across a base-only update (rc 0)" || bad "12a base-only update refused (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_CAP" "diff=$NH" "12a re-records the unchanged normalized digest at the current head"
+
+# (b) a real CONTENT change DOES change the digest.
+assert_ne "$NH" "$(norm_sha "$NFXC")" "12b direct: a content change changes the normalized digest"
+NPR_b=424701; rm -f "$(Q2 $NPR_b)"
+run_record_diff "$NPR_b" "$STALE" "body
+
+$(signed_marker $NPR_b "$STALE" "$NH")" "$NFXC"
+[ "$RECORD_RC" = "3" ] && ok "12b a content change is NOT carried (rc 3)" || bad "12b carried a changed diff (rc=$RECORD_RC)"
+[ ! -f "$(Q2 $NPR_b)" ] && ok "12b no record written for the changed diff" || bad "12b wrote a record for a changed diff"
+
+# (c) a WHITESPACE-ONLY change DOES change the digest — THE ANTI-patch-id PIN.
+#     `git patch-id --stable` (and the default) IGNORE whitespace, so under it
+#     this change would carry. The binding is sha256 over content.
+assert_ne "$NH" "$(norm_sha "$NFXW")" "12c direct: a whitespace-only change changes the normalized digest"
+NPR_c=424702; rm -f "$(Q2 $NPR_c)"
+run_record_diff "$NPR_c" "$STALE" "body
+
+$(signed_marker $NPR_c "$STALE" "$NH")" "$NFXW"
+[ "$RECORD_RC" = "3" ] && ok "12c a whitespace-only change is NOT carried (rc 3)" || bad "12c carried a whitespace-only change (rc=$RECORD_RC)"
+
+# (d) BACKWARD COMPAT — a LEGACY RAW-hash marker still carries forward.
+RH="$(raw_sha "$NFX2")"
+assert_ne "$RH" "$NH" "12d the raw hash differs from the normalized one (the fixture is not degenerate)"
+NPR_d=424703; rm -f "$(Q2 $NPR_d)"
+run_record_diff "$NPR_d" "$STALE" "body
+
+$(signed_marker $NPR_d "$STALE" "$RH")" "$NFX2"
+[ "$RECORD_RC" = "0" ] && ok "12d a legacy raw-hash marker carries forward (rc 0)" || bad "12d legacy raw marker refused (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_CAP" "diff=$NH" "12d the re-record UPGRADES the binding to the normalized hash"
+
+# ── 12e MUTATION PINS ──────────────────────────────────────────────────────
+mut_dir() { # <dir> — a record-review.sh copy; its sibling normalizer is swapped next
+    mkdir -p "$1/lib"
+    cp "$RECORD" "$1/record-review.sh"
+}
+# M_RAW — normalization removed (passthrough) → the pre-#1362 primitive.
+mut_dir "$T/mut-raw"
+cat > "$T/mut-raw/lib/diff-normalize.py" <<'PY'
+import sys
+sys.stdout.buffer.write(sys.stdin.buffer.read())
+PY
+# Positive control: the passthrough mutant really IS the raw primitive. Without
+# this, mutation(a) could stay green against a broken/unused mutant lib.
+assert_eq "$(norm_sha_with "$T/mut-raw/lib/diff-normalize.py" "$NFX")" "$(raw_sha "$NFX")" \
+  "12e mutation(a): the passthrough mutant really is the raw primitive"
+NPR_m=424710; rm -f "$(Q2 $NPR_m)"
+# The prior marker is the RAW hash of the base-1 diff — what the pre-change
+# producer would have minted.
+run_record_diff_with "$T/mut-raw/record-review.sh" "$NPR_m" "$STALE" "body
+
+$(signed_marker $NPR_m "$STALE" "$(raw_sha "$NFX")")" "$NFX2"
+[ "$RECORD_RC" = "3" ] && ok "12e mutation(a): with normalization REMOVED the base-only update is refused again (rc 3) — 12a is load-bearing" || bad "12e mutation(a): the raw path still carried (rc=$RECORD_RC) — 12a is NOT testing normalization"
+
+# M_NOCONTENT — drops every +/- hunk-body line → content-blind.
+mut_dir "$T/mut-nocontent"
+cat > "$T/mut-nocontent/lib/diff-normalize.py" <<'PY'
+import re, sys
+raw = sys.stdin.buffer.read().decode("latin-1")
+out = []
+for line in raw.split("\n"):
+    if re.match(r"^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]{6})?$", line):
+        continue
+    m = re.match(r"^@@ -([0-9]+)(,([0-9]+))? \+([0-9]+)(,([0-9]+))? @@(.*)$", line)
+    if m:
+        line = "@@ -0,%s +0,%s @@%s" % (m.group(3) or "1", m.group(6) or "1", m.group(7))
+    if line.startswith("+") or line.startswith("-"):
+        continue   # MUTATION: hunk content is ignored
+    out.append(line)
+sys.stdout.buffer.write("\n".join(out).encode("latin-1"))
+PY
+MNC_H="$(norm_sha_with "$T/mut-nocontent/lib/diff-normalize.py" "$NFX2")"
+assert_eq "$MNC_H" "$(norm_sha_with "$T/mut-nocontent/lib/diff-normalize.py" "$NFXC")" \
+  "12e mutation(b): a CONTENT-BLIND primitive makes the content change invisible"
+NPR_m=424711; rm -f "$(Q2 $NPR_m)"
+run_record_diff_with "$T/mut-nocontent/record-review.sh" "$NPR_m" "$STALE" "body
+
+$(signed_marker $NPR_m "$STALE" "$MNC_H")" "$NFXC"
+[ "$RECORD_RC" = "0" ] && ok "12e mutation(b): under a content-blind primitive the content change WOULD carry (rc 0) — 12b is load-bearing" || bad "12e mutation(b): expected a false carry (rc=$RECORD_RC)"
+
+# M_WSBLIND — strips all whitespace → the `patch-id --stable` hole.
+mut_dir "$T/mut-ws"
+cat > "$T/mut-ws/lib/diff-normalize.py" <<'PY'
+import re, sys
+raw = sys.stdin.buffer.read().decode("latin-1")
+out = []
+for line in raw.split("\n"):
+    if re.match(r"^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]{6})?$", line):
+        continue
+    m = re.match(r"^@@ -([0-9]+)(,([0-9]+))? \+([0-9]+)(,([0-9]+))? @@(.*)$", line)
+    if m:
+        line = "@@ -0,%s +0,%s @@%s" % (m.group(3) or "1", m.group(6) or "1", m.group(7))
+    out.append(re.sub(r"[ \t]", "", line))   # MUTATION: whitespace is ignored
+sys.stdout.buffer.write("\n".join(out).encode("latin-1"))
+PY
+MWS_H="$(norm_sha_with "$T/mut-ws/lib/diff-normalize.py" "$NFX2")"
+assert_eq "$MWS_H" "$(norm_sha_with "$T/mut-ws/lib/diff-normalize.py" "$NFXW")" \
+  "12e mutation(c): a WHITESPACE-BLIND primitive makes the ws change invisible"
+NPR_m=424712; rm -f "$(Q2 $NPR_m)"
+run_record_diff_with "$T/mut-ws/record-review.sh" "$NPR_m" "$STALE" "body
+
+$(signed_marker $NPR_m "$STALE" "$MWS_H")" "$NFXW"
+[ "$RECORD_RC" = "0" ] && ok "12e mutation(c): under a whitespace-blind primitive the ws change WOULD carry (rc 0) — 12c is load-bearing" || bad "12e mutation(c): expected a false carry (rc=$RECORD_RC)"
+
+# M_NOLEGACY — the carry grep accepts ONLY the normalized hash.
+mkdir -p "$T/mut-nolegacy/lib"
+cp "$NORM_PY" "$T/mut-nolegacy/lib/diff-normalize.py"
+sed 's#^\( *\)PRIOR_DIFF_ALT=.*#\1PRIOR_DIFF_ALT="$DIFF_HASH"#' "$RECORD" > "$T/mut-nolegacy/record-review.sh"
+if cmp -s "$T/mut-nolegacy/record-review.sh" "$RECORD"; then bad "12e mutation(d): the legacy-arm sed did not change the script"; else ok "12e mutation(d): the legacy-arm removal mutant differs from the script"; fi
+NPR_m=424713; rm -f "$(Q2 $NPR_m)"
+run_record_diff_with "$T/mut-nolegacy/record-review.sh" "$NPR_m" "$STALE" "body
+
+$(signed_marker $NPR_m "$STALE" "$RH")" "$NFX2"
+[ "$RECORD_RC" = "3" ] && ok "12e mutation(d): with the legacy arm REMOVED the raw marker is refused (rc 3) — 12d is load-bearing" || bad "12e mutation(d): the raw marker still carried (rc=$RECORD_RC) — 12d is NOT testing backward compat"
+
+# M_NOLIB — the normalizer is ABSENT (a partial install). The producer must fail
+# OPEN to the raw digest with a loud warning and NEVER mint a digest no consumer
+# can verify. REGRESSION-SENSITIVE: letting DIFF_HASH go empty here would write a
+# sha-only record and redden the first half; the warning reddens the second.
+mkdir -p "$T/mut-nolib"
+cp "$RECORD" "$T/mut-nolib/record-review.sh"   # intentionally NO lib/
+NPR_m=424714; rm -f "$(Q2 $NPR_m)"
+run_record_diff_with "$T/mut-nolib/record-review.sh" "$NPR_m" "$SHA" "body" "$NFX2"
+[ "$RECORD_RC" = "0" ] && ok "12e fail-open: a missing normalizer still records (rc 0)" || bad "12e fail-open: missing normalizer blocked the record (rc=$RECORD_RC)"
+assert_contains "$RECORD_ERR" "diff normalizer is unavailable" "12e fail-open: the missing normalizer is warned about loudly"
+assert_contains "$RECORD_CAP" "diff=$RH" "12e fail-open: the marker carries the RAW digest (a verifiable legacy hash)"
+if grep -qF "diff=$NH" <<<"$RECORD_CAP"; then bad "12e fail-open: the marker must NOT carry a normalized digest when the normalizer is missing"; else ok "12e fail-open: no normalized digest is minted without the normalizer"; fi
+
+unset NFX NFX2 NFXC NFXW NORM_PY NH RH MNC_H MWS_H NPR_a NPR_b NPR_c NPR_d NPR_m
 # ─────────────────────────────────────────────────────────────────────────
 # 10. #1348 clean-low content-shape guard — ADVERSARIAL DOMAIN
 # ─────────────────────────────────────────────────────────────────────────

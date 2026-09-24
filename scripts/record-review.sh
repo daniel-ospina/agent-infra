@@ -343,7 +343,7 @@ fi
 if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "repo must be owner/name (got '$REPO'); refusing to record" >&2; exit 2
 fi
-# ── Diff binding (#2982) ──────────────────────────────────────────────────
+# ── Diff binding (#2982, normalized by #1362 D1) ──────────────────────────
 # What a review approves is the DIFF, not the commit sha. Record the sha256 of
 # the PR's three-dot diff and carry it INSIDE the signed marker so the
 # ai-review-gate can accept a verdict across a merge-only branch update
@@ -353,6 +353,30 @@ fi
 # a still-correct verdict, so a green PR could never reach a terminal
 # mergeable state (#2982).
 #
+# #1362 D1 (owner ruling 2026-09-23): the digest is computed over the
+# NORMALIZED diff, not the raw byte rendering. A base update (rebase /
+# `gh pr update-branch`) rewrites `index <blob>..<blob>` lines and the hunk
+# headers' start-line numbers even when every changed line is identical —
+# measured on tortoise #4841: byte count identical (137,767), exactly 6 lines
+# differ, and `git patch-id --stable`/`--verbatim` both MATCH while the raw
+# diff hash did not (5 of 6 sampled BEHIND PRs refused a still-correct
+# verdict). Those refusals are false obligations: the change is identical;
+# only derived rendering moved. The normalization drops `index` lines and
+# zeros the hunk-header start lines; hunk CONTENT and COUNTS are untouched
+# (counts derive from content, so they move only when content moves).
+#
+# THE BINDING STAYS A SHA256 over content — deliberately NOT `git patch-id`:
+# `--stable` and the default both IGNORE whitespace (a false ACCEPT: a
+# whitespace-only edit would carry a verdict it does not deserve), and a SHA-1
+# sum is weaker than a sha256. `--verbatim` closes the whitespace hole but not
+# the primitive's weakness.
+#
+# The normalizer is the ONE shared implementation — scripts/lib/diff-normalize.py,
+# resolved from THIS script's own directory so the repo copy and the farmed
+# ~/.pi/agent/scripts copy both find it. It is a CROSS-REPO CONTRACT with the
+# consumer (tortoise .github/workflows/ai-review-gate.yml): both sides must
+# normalize IDENTICALLY or every freshly-signed marker stops matching.
+#
 # The bytes MUST come from the GitHub REST API, exactly as the workflow does —
 # a local `git diff` would not byte-match and every diff= marker would fail
 # closed. Hash the FILE, not a command substitution: `x="$(cmd)"` strips
@@ -360,23 +384,44 @@ fi
 #
 # Empty when gh/API/openssl is unavailable → the marker falls back to the
 # legacy sha-only shape, and the gate's sha-match path still governs.
+DIFF_NORMALIZER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/diff-normalize.py"
 DIFF_HASH=""
-diff_hash_for_pr() { # <pr> — print the sha256 of the PR's current diff, or nothing
-  local pr="$1" tmp
+# #1362 D1 — the sha256 over the RAW diff (the pre-normalization binding). Kept
+# ONLY so the carry-forward arm can accept a marker minted before this change;
+# nothing else reads it. Both hashes come from ONE diff fetch.
+LEGACY_DIFF_HASH=""
+# Sets the globals DIFF_HASH (normalized) and LEGACY_DIFF_HASH (raw) from one
+# diff fetch. It deliberately sets GLOBALS rather than printing: a `$(...)`
+# capture would run the assignment in a subshell and lose LEGACY_DIFF_HASH.
+diff_hash_for_pr() { # <pr>
+  local pr="$1" tmp norm
   command -v gh >/dev/null 2>&1 || return 0
   command -v openssl >/dev/null 2>&1 || return 0
   tmp="$(mktemp 2>/dev/null)" || return 0
+  norm="$(mktemp 2>/dev/null)" || { rm -f "$tmp"; return 0; }
   # shellcheck disable=SC2064
-  trap "rm -f '$tmp'" RETURN 2>/dev/null || true
+  trap "rm -f '$tmp' '$norm'" RETURN 2>/dev/null || true
   if gh api -H "Accept: application/vnd.github.v3.diff" \
        "repos/$REPO/pulls/$pr" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-    openssl dgst -sha256 < "$tmp" | awk '{print $NF}'
+    LEGACY_DIFF_HASH="$(openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
+    if command -v python3 >/dev/null 2>&1 && [ -f "$DIFF_NORMALIZER" ] \
+       && python3 "$DIFF_NORMALIZER" < "$tmp" > "$norm" 2>/dev/null; then
+      DIFF_HASH="$(openssl dgst -sha256 < "$norm" | awk '{print $NF}')"
+    else
+      # Fail OPEN to the pre-#1362 raw digest: the consumer still accepts it as
+      # the legacy hash, so the marker stays verifiable — but a base-only update
+      # will keep refusing carry-forward. Name that loudly rather than minting a
+      # digest no consumer can verify.
+      echo "⚠️ #1362: the diff normalizer is unavailable (need python3 + $DIFF_NORMALIZER) — hashing the RAW diff; a base-only update will keep refusing carry-forward until it is installed" >&2
+      DIFF_HASH="$LEGACY_DIFF_HASH"
+    fi
   fi
-  rm -f "$tmp"
+  rm -f "$tmp" "$norm"
 }
 if [ -n "$REPO" ]; then
-  DIFF_HASH="$(diff_hash_for_pr "$PR")"
+  diff_hash_for_pr "$PR"
   [[ "$DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || DIFF_HASH=""
+  [[ "$LEGACY_DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || LEGACY_DIFF_HASH=""
   if [ -z "$DIFF_HASH" ]; then
     echo "⚠️ #2982: could not compute this PR's diff hash (gh/API/openssl unavailable?) — recording a legacy sha-only marker; it will NOT carry across a branch update" >&2
   fi
@@ -443,7 +488,16 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       # producer IS the signer (#784). So verify the HMAC over the marker text.
       # VERDICT is pinned in the pattern too, so a prior clean-micro attestation
       # cannot authorize a full clean record.
-      PRIOR_LINE="$(grep -m1 -E "^review recorded: reviews/${PR}\.json verdict=${VERDICT} @ [0-9a-f]{40} diff=${DIFF_HASH} \(.*\) sig=[0-9a-f]{64}$" <<<"$PRIOR_BODY" || true)"
+      # #1362 D1 — BACKWARD COMPATIBILITY. A prior marker may carry EITHER the
+      # new NORMALIZED hash or the pre-#1362 RAW hash. Without the raw arm every
+      # marker minted before this change stops carrying and the required check
+      # reddens fleet-wide (the #3076 shape). Both are hashes of the CURRENT
+      # diff (same fetch), so either match proves the reviewed artifact is
+      # unchanged; the re-record below then UPGRADES the binding to the
+      # normalized hash. The alternation stays inside the ONE grep so the
+      # documented "first matching line governs" ordering is preserved.
+      PRIOR_DIFF_ALT="$( [ -n "$LEGACY_DIFF_HASH" ] && [ "$LEGACY_DIFF_HASH" != "$DIFF_HASH" ] && printf '(%s|%s)' "$DIFF_HASH" "$LEGACY_DIFF_HASH" || printf '%s' "$DIFF_HASH" )"
+      PRIOR_LINE="$(grep -m1 -E "^review recorded: reviews/${PR}\.json verdict=${VERDICT} @ [0-9a-f]{40} diff=${PRIOR_DIFF_ALT} \(.*\) sig=[0-9a-f]{64}$" <<<"$PRIOR_BODY" || true)"
       if [ -n "$PRIOR_LINE" ] && [ -n "$GATE_KEY" ]; then
         PRIOR_TEXT="${PRIOR_LINE% sig=*}"
         PRIOR_SIG="${PRIOR_LINE##* sig=}"
