@@ -40,6 +40,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseWorkflowYaml } from "./workflow-yaml.mjs";
@@ -108,6 +109,9 @@ function base(file) {
 function stepRuns(job) {
   const out = [];
   for (const step of job.steps || []) {
+    if (!step || typeof step !== "object" || Array.isArray(step)) {
+      refuse(`a step of this job is not a mapping (${JSON.stringify(step)}) — steps this guard cannot read are not a pass; exiting 2`);
+    }
     if (typeof step.run === "string") out.push(step.run);
   }
   return out;
@@ -143,34 +147,44 @@ function refusalKeys(node) {
 }
 
 /**
- * A CI_LANE_* key ANYWHERE in the document. The guard reads its inputs from the environment, and a
- * workflow-level `env:` reaches every step of every job — so a workflow that sets one of these
- * could point the guard at a different workflow, job, or runner file and buy a green parity check
- * for a lane that runs something else. Auditing only the job and its steps misses that, so the scan
- * runs over the whole parsed document, keys only, any depth.
+ * A key that changes how BASH ITSELF STARTS UP, anywhere in the document. `env: {BASH_ENV: …}` makes
+ * bash source a committed file BEFORE the guard or the runner runs a line, so the file can simply
+ * `exit 0` — nothing either program prints can then be trusted, and no self-check inside them can
+ * defend (the hijack runs first). This is a KEY-NAME assertion on parsed values, not shell
+ * modelling: it does not try to decide what the injected file does, only that a document under
+ * audit may not install one. A `PATH` rewrite that shadows `bash` is the same family and is NOT
+ * modelled here — filed as a residual (#1426), where the content lock is the tripwire.
  */
-function deepLaneKeys(node, path, out) {
+const STARTUP_INJECTION_KEYS = /^(BASH_ENV|ENV|PROMPT_COMMAND|SHELLOPTS|BASH_FUNC_.*)$/;
+
+function deepForbiddenKeys(node, path, out) {
   if (Array.isArray(node)) {
-    node.forEach((v, i) => deepLaneKeys(v, `${path}[${i}]`, out));
+    node.forEach((v, i) => deepForbiddenKeys(v, `${path}[${i}]`, out));
     return out;
   }
   if (!node || typeof node !== "object") return out;
   for (const [k, v] of Object.entries(node)) {
-    if (/^CI_LANE_/.test(k)) out.push(`${path}.${k}`);
-    deepLaneKeys(v, `${path}.${k}`, out);
+    if (/^CI_LANE_/.test(k) || STARTUP_INJECTION_KEYS.test(k)) out.push(`${path}.${k}`);
+    deepForbiddenKeys(v, `${path}.${k}`, out);
   }
   return out;
 }
 
 function checkLane(label, workflowFile, jobName) {
   const wf = parse(workflowFile);
+  if (!wf || typeof wf !== "object") {
+    refuse(
+      `${base(workflowFile)} parsed to ${wf === null ? "null" : typeof wf} — an empty or non-mapping workflow cannot certify that its lane runs anything; exiting 2`
+    );
+  }
   const file = base(workflowFile);
 
-  // The audited document must not be able to configure this guard (see deepLaneKeys).
-  const laneKeys = deepLaneKeys(wf, file, []);
+  // The audited document must not be able to configure this guard or hijack bash's startup
+  // (see deepForbiddenKeys). Keys only, any depth: a workflow-level `env:` reaches every step.
+  const laneKeys = deepForbiddenKeys(wf, file, []);
   if (laneKeys.length > 0) {
     err(
-      `${file} sets CI_LANE_* input(s) [${laneKeys.slice(0, 3).join(" ")}] anywhere in the workflow — a document under audit must not be able to redirect the guard's own view of which lane runs what (a lane that configures the gate is not coverage); exiting 2`
+      `${file} sets [${laneKeys.slice(0, 3).join(" ")}] anywhere in the workflow — a document under audit must not be able to redirect the guard's own view of which lane runs what, or to run a committed file before bash reaches the guard or the runner (a lane that configures — or pre-empts — the gate is not coverage); exiting 2`
     );
     process.exit(2);
   }
@@ -188,14 +202,18 @@ function checkLane(label, workflowFile, jobName) {
     }
     const prValue =
       on && typeof on === "object" && !Array.isArray(on) ? on.pull_request : null;
-    if (prValue && typeof prValue === "object") {
-      for (const k of ["paths", "paths-ignore"]) {
-        if (Object.prototype.hasOwnProperty.call(prValue, k)) {
-          refuse(
-            `${file} narrows its 'pull_request:' trigger with '${k}:' — a change to the bash shards or scripts/ would then never run the PR lane (exiting 2)`
-          );
-        }
-      }
+    // The bare trigger is the only form this lane needs. ANY value narrows it: `paths:`/
+    // `paths-ignore:` stop the lane running for a scripts/ change, `types: [closed]` stops it
+    // running on a PR's commits at all, `branches-ignore: ['**']` matches every base. All of them
+    // leave the parity assertion green while the lane does not run — the #1369 split re-created
+    // with a different key. Refusing the value wholesale also retires the key-by-key enumeration.
+    if (prValue !== null && prValue !== undefined) {
+      const shape = Array.isArray(prValue)
+        ? `a [types] list (${prValue.length} entr${prValue.length === 1 ? "y" : "ies"})`
+        : Object.keys(prValue).join(", ") || "an empty mapping";
+      refuse(
+        `${file} narrows its 'pull_request:' trigger with ${shape} — a filter can stop this lane running on a PR's commits while its parity assertion stays green; the bare 'pull_request:' is the form this lane needs (exiting 2)`
+      );
     }
   }
 
@@ -253,36 +271,48 @@ function checkLane(label, workflowFile, jobName) {
   return exact;
 }
 
-/** Floors on the runner: a gutted list must not certify parity. (Its own runtime sentinels prove
- *  what it actually executed; this is the static half — count and shape.) */
+/**
+ * Ask the runner for its own list. This is a BEHAVIOURAL assertion, not a text scan: the runner's
+ * `--list` prints the very lines it will execute (it derives them from its own source), so there is
+ * no second regex that could disagree with the first. A parallel regex here — the previous
+ * revision — could be satisfied by lines the runner never lists (a TAB is whitespace to a JS
+ * `\s` and not to the runner's `sed`), which let a lane run 2 of 14 shards and report success.
+ */
+function runnerList(flag, what) {
+  const r = spawnSync("bash", [RUNNER_FILE, flag], { encoding: "utf8" });
+  if (r.error) {
+    refuse(
+      `cannot run '${RUNNER_FILE} ${flag}' (${r.error.message}) — the lane's own ${what} list is unreadable; exiting 2`
+    );
+  }
+  if (r.status !== 0) {
+    refuse(
+      `'${RUNNER_FILE} ${flag}' exited ${r.status} — the lane's own ${what} list is unreadable, so nothing it prints can certify coverage; exiting 2`
+    );
+  }
+  return String(r.stdout || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+/** Floors on the runner's OWN lists: a gutted list must not certify parity. The count is read from
+ *  the runner (see runnerList); the runtime half — that the listed work actually EXECUTED, and that
+ *  a failing shard is recorded — is the runner's own sentinels, which the lane runs. */
 function checkRunner() {
-  let src;
-  try {
-    src = readFileSync(RUNNER_FILE, "utf8");
-  } catch (e) {
-    refuse(`cannot read the runner '${RUNNER_FILE}' — exiting 2`);
-  }
-  const shards = src
-    .split("\n")
-    .map((l) => l.trim())
-    // The list lines carry a trailing provenance comment; the sentinel call (`run_shard "$sentinel"`)
-    // is quoted and must NOT count.
-    .filter((l) => /^run_shard\s+[A-Za-z0-9_./-]+\.sh(\s|$)/.test(l)).length;
-  const globs = src
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => /^for\s+f\s+in\s+/.test(l)).length;
-  if (shards < MIN_SUITES) {
+  const shards = runnerList("--list", "shard");
+  if (shards.length < MIN_SUITES) {
     refuse(
-      `the runner lists ${shards} shard(s) (floor ${MIN_SUITES}) — a gutted list would certify parity over nothing; exiting 2`
+      `the runner lists ${shards.length} shard(s) (floor ${MIN_SUITES}) — a gutted list would certify parity over nothing; exiting 2`
     );
   }
-  if (globs < MIN_GLOBS) {
+  const globs = runnerList("--list-sweeps", "sweep");
+  if (globs.length < MIN_GLOBS) {
     refuse(
-      `the runner declares ${globs} syntax target(s) (floor ${MIN_GLOBS}) — the sweep half of the lane is gone; exiting 2`
+      `the runner declares ${globs.length} syntax target(s) (floor ${MIN_GLOBS}) — the sweep half of the lane is gone; exiting 2`
     );
   }
-  return { shards, globs };
+  return { shards: shards.length, globs: globs.length };
 }
 
 const prCount = checkLane("PR", PR_WORKFLOW, PR_JOB);

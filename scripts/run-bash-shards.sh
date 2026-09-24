@@ -27,18 +27,31 @@
 #   - Runs every shard; the accumulator keeps going so one failure cannot hide the others.
 #   - Exits 1 if any shard failed, 0 otherwise.
 #   - Hermetic: every suite builds its own temp repos/HOME/shims and touches no real state.
-#   - `--list` prints the shard list (used by the parity guard's floor check and by humans).
+#   - `--list` prints the shard list, `--list-sweeps` the syntax-sweep globs. Both print the lists
+#     this script EXECUTES, from one source each (the `run_shard` lines and SWEEP_GLOBS below), so
+#     `check-ci-lane-parity` can read them without keeping a second, divergent copy.
 #
 # USAGE
-#   bash scripts/run-bash-shards.sh          # run them all
-#   bash scripts/run-bash-shards.sh --list   # print the list, run nothing
+#   bash scripts/run-bash-shards.sh                 # run them all
+#   bash scripts/run-bash-shards.sh --list          # print the shard list, run nothing
+#   bash scripts/run-bash-shards.sh --list-sweeps   # print the syntax-sweep globs, run nothing
 
 set -uo pipefail
+
+# The syntax-sweep targets. A DATA list, not two literal `for f in …` lines: `--list-sweeps` prints
+# exactly what the loops below iterate, so the sweep half cannot be advertised and not performed
+# (or performed and not advertised) without editing this one line.
+SWEEP_GLOBS=("scripts/*.sh" "scripts/checkout-hygiene/*.sh")
 
 if [ "${1:-}" = "--list" ]; then
   # Only `.sh` targets: the sentinel self-check below also calls run_shard, and it must not
   # appear in the list it is checked against.
   sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}"
+  exit 0
+fi
+
+if [ "${1:-}" = "--list-sweeps" ]; then
+  printf '%s\n' "${SWEEP_GLOBS[@]}"
   exit 0
 fi
 
@@ -88,13 +101,13 @@ done <<<"$(sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}")"
 echo "── bash syntax sweeps ─────────────────────────────────────────────"
 # The `bash -n` half: before #1369 the PR lane had NO shell-syntax gate at all — the purest
 # instance of the split (a syntax error shipped green through the PR and reddened main).
-for f in scripts/*.sh; do
-  [ -f "$f" ] || continue
-  sweep_file "$f"
-done
-for f in scripts/checkout-hygiene/*.sh; do
-  [ -f "$f" ] || continue
-  sweep_file "$f"
+# The inner loop expands each PATTERN deliberately (unquoted): quoting it would pass the literal
+# string `scripts/*.sh` to `sweep_file`, so the sweep would report success having parsed nothing.
+for pattern in "${SWEEP_GLOBS[@]}"; do
+  for f in $pattern; do
+    [ -f "$f" ] || continue
+    sweep_file "$f"
+  done
 done
 
 echo "── hermetic suites ────────────────────────────────────────────────"

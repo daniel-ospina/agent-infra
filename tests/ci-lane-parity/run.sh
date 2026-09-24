@@ -190,7 +190,11 @@ fi
 
 echo ""
 echo "6. A RUNNER WITH NO SWEEPS (0 syntax targets) → rc 2"
-grep -v 'for f in' "$RUNNER" >"$TMP/runner-nosweep.sh"
+# The sweep half is DATA now (SWEEP_GLOBS) plus the loops that iterate it, and the guard reads the
+# list from the runner's own `--list-sweeps`. So the mutation must remove the LIST; deleting only
+# the loops leaves the list advertising globs nothing iterates, which the guard cannot see and the
+# RUNNER's `swept` sentinel catches at runtime (pinned by 8q below).
+grep -v -e 'for f in' -e 'SWEEP_GLOBS' "$RUNNER" >"$TMP/runner-nosweep.sh"
 if cmp -s "$RUNNER" "$TMP/runner-nosweep.sh"; then
   fail "the no-sweep mutation did not change the file"
 else
@@ -637,7 +641,7 @@ else
 fi
 
 echo ""
-echo "8x. DASH-INLINE step conditional (`- if: false`) → rc 2 (the step may not run)"
+echo '8x. DASH-INLINE step conditional (`- if: false`) -> rc 2 (the step may not run)'
 awk '{ print } /^  bash-suites:/ { injob = 1; next } injob && /^    runs-on:/ { print "      - if: false"; injob = 0 }' \
   "$PR" >"$TMP/ci-pr-dashif.yml"
 if cmp -s "$PR" "$TMP/ci-pr-dashif.yml"; then
@@ -790,18 +794,65 @@ else
 fi
 
 echo ""
-echo "8ac2. A WORKFLOW-LEVEL CI_LANE_* KEY → rc 2 (a doc under audit cannot configure the guard)"
-awk '{ print; if ($0 == "on:") { print "env:"; print "  CI_LANE_RUNNER: /tmp/fake.sh" } }' \
+echo '8ac2. A WORKFLOW-LEVEL CI_LANE_* KEY -> rc 2, NAMING THE KEY (a doc under audit cannot configure the guard)'
+# Inserted at the TOP of the document: inserted after `on:` it would land inside the trigger mapping
+# and the refusal would come from the trigger arm, leaving this arm with no effective pin.
+awk 'NR == 1 { print; print "env:"; print "  CI_LANE_RUNNER: /tmp/fake.sh"; next } { print }' \
   "$PR" >"$TMP/ci-pr-wflane.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-wflane.yml"
-if [ "$RC" -eq 2 ]; then
-  pass "a workflow-level env: CI_LANE_* key exits 2 (it would redirect the guard's own inputs)"
+if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q 'CI_LANE_RUNNER'; then
+  pass "a workflow-level env: CI_LANE_* key exits 2 and names the key (the arm is load-bearing)"
 else
-  fail "a workflow-level CI_LANE_* key returned rc $RC (want 2): $OUT"
+  fail "a workflow-level CI_LANE_* key returned rc $RC (want 2, naming the key): $OUT"
 fi
 
 echo ""
-echo "8ad. A FOLDED block scalar (`run: >`) joins its lines → the tail is visible"
+echo '8ac3. A TRIGGER FILTER under pull_request: -> rc 2 (keys other than paths: narrow it too)'
+# `types: [closed]` runs the lane only on PR-close events and `branches-ignore: ["**"]` matches
+# every base branch: in both, the lane never runs on a PR commit while parity reads green — the
+# #1369 split re-created with a different key, which the old key-by-key arm (paths/paths-ignore)
+# did not see.
+for spec in 'types: [closed]' 'branches-ignore: ["**"]' 'paths: ["src/**"]'; do
+  awk -v extra="$spec" '
+    /^  pull_request:/ { print; print "    " extra; next }
+    { print }
+  ' "$PR" >"$TMP/ci-pr-filter.yml"
+  guard_rc "$MAIN" "$TMP/ci-pr-filter.yml"
+  if [ "$RC" -eq 2 ]; then
+    pass "a pull_request filter ($spec) exits 2"
+  else
+    fail "a pull_request filter ($spec) returned rc $RC (want 2): $OUT"
+  fi
+done
+
+# The bare trigger is the shipped spelling and must stay green — the control for 8ac3: a guard that
+# refused every `pull_request:` value would make the three pins above vacuous.
+guard_rc "$MAIN" "$PR"
+if [ "$RC" -eq 0 ]; then
+  pass "the shipped bare 'pull_request:' trigger is NOT a false block (rc 0)"
+else
+  fail "the shipped trigger was refused (rc $RC): $OUT"
+fi
+
+echo ''
+echo '8ac4. A BASH-STARTUP HIJACK in env: -> rc 2 (BASH_ENV runs a committed file first)'
+# `env: {BASH_ENV: evil.sh}` makes bash source a committed file BEFORE the guard or the runner
+# executes a line, so the file can `exit 0` and nothing either prints can be trusted — no self-check
+# inside them can defend. Key-name assertion on the parsed document; a PATH rewrite that shadows
+# `bash` is the same family and stays a filed residual (#1426).
+for key in BASH_ENV PROMPT_COMMAND; do
+  awk -v k="$key" 'NR == 1 { print; print "env:"; print "  " k ": evil.sh"; next } { print }' \
+    "$PR" >"$TMP/ci-pr-inject.yml"
+  guard_rc "$MAIN" "$TMP/ci-pr-inject.yml"
+  if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q "$key"; then
+    pass "a workflow-level env: $key exits 2 and names the key"
+  else
+    fail "a workflow-level env: $key returned rc $RC (want 2, naming it): $OUT"
+  fi
+done
+
+echo ''
+echo '8ad. A FOLDED block scalar (`run: >`) joins its lines -> the tail is visible'
 awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; next } print }' \
   "$PR" >"$TMP/ci-pr-fold.yml"
@@ -867,7 +918,7 @@ else
 fi
 
 echo ""
-echo "8ah. `steps:` WITH A TRAILING COMMENT → rc 0 (still the step list)"
+echo '8ah. `steps:` WITH A TRAILING COMMENT -> rc 0 (still the step list)'
 awk '{ if ($0 ~ /^    steps:$/) { print "    steps:  # the steps"; next } print }' \
   "$PR" >"$TMP/ci-pr-stepscomment.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-stepscomment.yml"
@@ -919,7 +970,7 @@ else
 fi
 
 echo ""
-echo "8al. A BLANK LINE inside `run: >` separates commands (YAML keeps it as a newline)"
+echo '8al. A BLANK LINE inside `run: >` separates commands (YAML keeps it as a newline)'
 awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: >"; print "          echo hi"; print ""; print "          bash scripts/run-bash-shards.sh"; next } print }' \
   "$PR" >"$TMP/ci-pr-foldblank.yml"
