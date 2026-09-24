@@ -230,6 +230,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Node is pinned because the shards below include `tests/search-cost/run.sh` (Node >= 22.13 —
+      # see ci.yml's `search-cost` job). ci.yml's `bash-suites` carries the identical pin, so the two
+      # lanes run the same list under the same runtime.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Validate Node.js scripts
         run: |
           errors=0

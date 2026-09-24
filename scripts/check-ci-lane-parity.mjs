@@ -36,7 +36,8 @@
  * a gutted runner).
  *
  * Env overrides exist for the test suite only: CI_LANE_PR_WORKFLOW, CI_LANE_MAIN_WORKFLOW,
- * CI_LANE_PR_JOB, CI_LANE_MAIN_JOB, CI_LANE_RUNNER, CI_LANE_MIN_SUITES, CI_LANE_MIN_GLOBS.
+ * CI_LANE_PR_JOB, CI_LANE_MAIN_JOB, CI_LANE_RUNNER, CI_LANE_RUNNER_FILE, CI_LANE_MIN_SUITES,
+ * CI_LANE_MIN_GLOBS. A document under audit may set NONE of them (see deepForbiddenKeys).
  */
 
 import { readFileSync } from "node:fs";

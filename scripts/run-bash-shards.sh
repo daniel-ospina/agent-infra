@@ -111,8 +111,16 @@ for pattern in "${SWEEP_GLOBS[@]}"; do
 done
 
 echo "── hermetic suites ────────────────────────────────────────────────"
-# Every suite below is hermetic (temp repos / temp HOME / stubbed tools, no network). The
-# provenance notes are preserved from the workflow they were moved out of.
+# Every suite below is hermetic (temp repos / temp HOME / stubbed tools, no network).
+#
+# PROVENANCE, and one caveat: these lines were moved out of ci-main.yml's `script-validate`, so
+# each keeps the note that workflow carried. Five of them are ALSO run by a dedicated per-PR job in
+# ci.yml — the four marked "post-merge re-check of a per-PR job", plus pi-bootstrap. That
+# duplication is deliberate here: this file is the ONE list both lanes run, so the PR lane runs
+# those five twice (once in their own job, once inside this list). Dropping them from this list to
+# save the minutes would recreate the second, hand-kept list that #1369 exists to remove — the
+# alternative is to retire the dedicated jobs and let this list be the PR lane's only coverage,
+# which changes PR feedback granularity and is the owner's call, not a silent edit.
 run_shard scripts/checkout-hygiene/deepseek-balance-watch.test.sh          # #476 balance poller (network-free seam)
 run_shard scripts/checkout-hygiene/hub-state-check.test.sh                 # #1313 the DETECTOR (clean-but-stale PASS matrix)
 run_shard scripts/checkout-hygiene/hub-worktree.test.sh                    # #1309/#1313 the RECOVERY half
@@ -122,11 +130,11 @@ run_shard scripts/pi-task-session-prune.test.sh                            # #78
 run_shard scripts/pi-reap-worktrees.test.sh                                # #1095 worktree reaper gates
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
 run_shard scripts/record-review.test.sh                                    # #1348 THE INCIDENT: runner-only rc=127 shipped green
-run_shard tests/admin-merge/run.sh                                         # #930 safe-admin-merge rail
-run_shard tests/atomic-land/run.sh                                         # #1367 atomic land unit
-run_shard tests/gh-shim/run.sh                                             # #984 argv-level gh shim
-run_shard tests/search-cost/run.sh                                         # #1069 fleet search cost
-run_shard pi-bootstrap/tests/test-setup-no-nesting.sh                      # #449 setup regression (~2min)
+run_shard tests/admin-merge/run.sh                                         # #930 safe-admin-merge rail (also a per-PR job in ci.yml)
+run_shard tests/atomic-land/run.sh                                         # #1367 atomic land unit (also a per-PR job in ci.yml)
+run_shard tests/gh-shim/run.sh                                             # #984 argv-level gh shim (also a per-PR job in ci.yml)
+run_shard tests/search-cost/run.sh                                         # #1069 fleet search cost (also a per-PR job in ci.yml)
+run_shard pi-bootstrap/tests/test-setup-no-nesting.sh                      # #449 setup regression (~2min; also a per-PR step in ci.yml)
 
 echo "───────────────────────────────────────────────────────────────────"
 # Runtime self-check 1: every listed shard must have been EXECUTED. This is the arm that catches
@@ -146,7 +154,7 @@ if [ "$swept" -lt 1 ]; then
 fi
 
 # Runtime self-check 2b: the SWEEP ARM must still be wired. The `swept` counter above proves the
-# loop body RAN, but a body rewritten as `swept=$((swept+1))` alone keeps that counter at 14 while
+# loop body RAN, but a body rewritten as `swept=$((swept+1))` alone keeps that counter at 73 while
 # checking no syntax at all — so the arm is proven the same way as the shard arm: run a file that
 # MUST fail, and require the failure to be recorded.
 sentinel_sweep="$(mktemp)"

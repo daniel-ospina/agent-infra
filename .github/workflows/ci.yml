@@ -573,6 +573,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The runner below includes `tests/search-cost/run.sh`, whose harness type-strips index.ts and
+      # needs Node >= 22.13 — ci.yml's own `search-cost` job pins it for exactly this reason, with the
+      # note that inheriting the runner's Node "is not a contract". Same pin here, and the same pin in
+      # ci-main.yml's `script-validate`: one runtime for the list, in both lanes.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Lane parity — both lanes must call the one bash-shard runner (#1369)
         run: bash scripts/check-ci-lane-parity.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
