@@ -214,6 +214,37 @@ if certifies "$TMP/m-attr-indented.md"; then
 else
   bad "an indented producer attribution line was REFUSED — the anchoring over-blocks a plausible emission"
 fi
+
+# (b4) A REVIEW'S THREE FINDINGS, EACH PINNED. The first anchoring attempt allowed a
+#      line that merely CONTAINED the two framing words and ended with the counts, read
+#      the LAST counts on the line, and accepted any character between the framing and
+#      the counts. Each shape below certified against that revision and must refuse now:
+#        * prose that happens to contain `Attribution` … `tokens DROPPED` … counts;
+#        * a CLIPPED set (`PR=3`) masked by appending a valid counts tail —
+#          `[^\n]*` is greedy, so the trailing `PR=0` won;
+#        * a planted valid line alongside a clipped real one (the guard was existential);
+#        * a control character between the framing and the counts (a NUL is stripped by
+#          the shell before the filter sees it, so the probe uses SOH, which is not).
+attr_case() {  # attr_case <name> <python-replacement> <expectation: refuse|certify>
+  python3 - "$POS" "$TMP/m-attr-$1.md" "$ATTR_LINE" "$2" <<'PYEOF'
+import pathlib, sys
+src, dst, line, repl = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+text = pathlib.Path(src).read_text(encoding="utf-8")
+assert line in text, "the producer attribution line is not in the fixture"
+pathlib.Path(dst).write_text(text.replace(line, repl.replace("\\n", "\n").replace("\\x01", "\x01")), encoding="utf-8")
+PYEOF
+  if certifies "$TMP/m-attr-$1.md"; then got=certify; else got=refuse; fi
+  if [ "$got" = "$3" ]; then
+    ok "attribution guard: $1 ($got, as required)"
+  else
+    bad "attribution guard: $1 — expected the body to $3, but it $got"
+  fi
+}
+attr_case loose-framing 'Attribution is a word; the parser tokens DROPPED some, so PR=0 | main=0.' refuse
+attr_case clipped-masked 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=3 | main=0. (reported) PR=0 | main=0.' refuse
+attr_case planted-over-clipped 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=3 | main=0.\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.' refuse
+attr_case control-char 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): \x01PR=0 | main=0.' refuse
+attr_case indented-real '    Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.' certify
 if certifies "$TMP/m-attr.md"; then bad "a CLIPPED set (PR=2) still CERTIFIED (clause 5 fail-open)"; else ok "mutation: a CLIPPED set refuses"; fi
 # (c) remove the parity line from the vacuous case.
 grep -v 'lane parity: PR ⊇ main' "$TMP/vac-par.md" > "$TMP/m-parity.md"
