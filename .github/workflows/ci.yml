@@ -556,7 +556,7 @@ jobs:
   bash-suites:
     # #1369 — Route A of the lane-split fix: the PR lane must RUN the bash work its check
     # name implies. Before this job, `ci / script-validate` ran `node --check` only (~4s)
-    # while main's `script-validate` ran the bash sweeps + fourteen hermetic suites (~5m20s)
+    # while main's `script-validate` ran the bash sweeps + the hermetic suites (~5m20s)
     # — one check name over two different bodies of work. A runner-only failure therefore
     # reached main with a GREEN PR: scripts/record-review.test.sh exited 127 on the ubuntu
     # runner (its PATH-shim vector) and reddened main (#1348 → #1369).
