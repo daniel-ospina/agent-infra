@@ -914,12 +914,14 @@ assert_contains "$RECORD_ERR" "diff normalizer is unavailable" "12e fail-open: t
 assert_contains "$RECORD_CAP" "diff=$RH" "12e fail-open: the marker carries the RAW digest (a verifiable legacy hash)"
 if grep -qF "diff=$NH" <<<"$RECORD_CAP"; then bad "12e fail-open: the marker must NOT carry a normalized digest when the normalizer is missing"; else ok "12e fail-open: no normalized digest is minted without the normalizer"; fi
 
-# M_EMPTYLIB — the normalizer EXISTS but is EMPTY (a truncated / non-atomic
-# farm: setup.sh copies the lib in place). `python3 empty.py` exits 0 and prints
+# M_EMPTYLIB — the normalizer EXISTS but is EMPTY. `python3 empty.py` exits 0 and prints
 # NOTHING, so without an output guard DIFF_HASH becomes sha256("") — a CONSTANT
 # that collides for EVERY diff and lets the carry-forward arm mint head-bound
 # evidence for an unreviewed revision. The producer must treat empty output
 # exactly like an absent normalizer (raw fallback), never mint the constant.
+# The cause is a truncation between write and read; setup.sh installs the lib
+# atomically since #1362 review, but the guard must not depend on the install
+# path being atomic.
 mkdir -p "$T/mut-emptylib/lib"
 cp "$RECORD" "$T/mut-emptylib/record-review.sh"
 : > "$T/mut-emptylib/lib/diff-normalize.py"

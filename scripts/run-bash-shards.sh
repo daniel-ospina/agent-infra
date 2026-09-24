@@ -59,7 +59,7 @@ fi
 # (a list kept anywhere else would be the very duplication this file exists to remove).
 # `shard_ran` is what makes the list SELF-CHECKING at runtime: the counters are compared
 # against the listed count at the end, so a neutered helper (executing nothing while the list
-# still reads 14) fails loudly instead of reporting "all bash shards passed". A static check
+# still reads its full count) fails loudly instead of reporting "all bash shards passed". A static check
 # over this file's text could never catch that; running it can.
 shard_errors=0
 shard_ran=0
@@ -74,7 +74,7 @@ swept=0
 sweep_file() { swept=$((swept + 1)); bash -n "$1" || shard_errors=$((shard_errors + 1)); }
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
-# keeps the line count but points the list at a /tmp stub would report "14 shards passed" having
+# keeps the line count but points the list at a /tmp stub would report every shard as passed having
 # run none of the suites — the counter arm alone cannot tell the difference.
 checkout_real="$(pwd -P)"
 while IFS= read -r t; do
@@ -114,12 +114,10 @@ echo "── hermetic suites ─────────────────
 # Every suite below is hermetic (temp repos / temp HOME / stubbed tools, no network).
 #
 # PROVENANCE, and one caveat: these lines were moved out of ci-main.yml's `script-validate`, so
-# each keeps the note that workflow carried. Six of them are ALSO run by a dedicated per-PR job in
-# ci.yml — the five marked "(also a per-PR job in ci.yml)" (four "post-merge re-check of a per-PR
-# job" plus pi-bootstrap) and script/diff-normalize.test.sh, whose dedicated step is added by #1362
-# D1. That
+# each keeps the note that workflow carried. Some of them are ALSO run by a dedicated per-PR job or
+# step in ci.yml (each such line carries an "(also a per-PR … in ci.yml)" note). That
 # duplication is deliberate here: this file is the ONE list both lanes run, so the PR lane runs
-# those six twice (once in their own job, once inside this list). Dropping them from this list to
+# those twice (once in their own job, once inside this list). Dropping them from this list to
 # save the minutes would recreate the second, hand-kept list that #1369 exists to remove — the
 # alternative is to retire the dedicated jobs and let this list be the PR lane's only coverage,
 # which changes PR feedback granularity and is the owner's call, not a silent edit.
@@ -141,7 +139,7 @@ run_shard pi-bootstrap/tests/test-setup-no-nesting.sh                      # #44
 
 echo "───────────────────────────────────────────────────────────────────"
 # Runtime self-check 1: every listed shard must have been EXECUTED. This is the arm that catches
-# a helper whose execution was disabled — a text-only floor would still see 14 listed shards.
+# a helper whose execution was disabled — a text-only floor would still see the same listed count.
 listed="$(sed -n 's/^ *run_shard  *\([^ ]*\.sh\).*$/\1/p' "${BASH_SOURCE[0]}" | grep -c .)"
 if [ "$shard_ran" -ne "$listed" ]; then
   echo "❌ executed $shard_ran of $listed listed shard(s) — the list and the execution disagree"
