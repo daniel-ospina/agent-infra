@@ -236,7 +236,7 @@ function checkLane(label, workflowFile, jobName) {
     }
   }
 
-  const job = wf.jobs && wf.jobs[jobName];
+  const job = wf.jobs && Object.prototype.hasOwnProperty.call(wf.jobs, jobName) ? wf.jobs[jobName] : undefined;
   if (!job || typeof job !== "object") {
     refuse(
       `${label} lane job '${jobName}' not found in ${file} — an absent lane must never read as 'the other lane covers it'; exiting 2`

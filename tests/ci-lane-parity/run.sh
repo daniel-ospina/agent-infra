@@ -913,6 +913,51 @@ else
 fi
 
 echo ''
+echo '8ac8. A FLOW-MAPPING __proto__ KEY -> rc 2 (it must not hand the guard a node nobody declares)'
+# `jobs: {__proto__: {bash-suites: …}}` used to set the parsed object's PROTOTYPE, so the guard read
+# a `bash-suites` job the document does not declare while a real YAML parser sees no such job — a
+# false PASS, found by the security reviewer in `workflow-yaml.mjs` (flow mappings assigned with
+# `out[key] = value`, which hits Object.prototype's `__proto__` setter). Fixed at the root: the
+# parser creates OWN properties, as real YAML does. The control below proves flow mappings are still
+# READ (so this pin cannot pass merely because flow style is refused).
+printf 'name: x\non: pull_request\njobs: {__proto__: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}}\n' \
+  >"$TMP/ci-pr-proto.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-proto.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "a flow-mapping __proto__ key exits 2 (the lane is not declared, so it is not covered)"
+else
+  fail "a flow-mapping __proto__ key returned rc $RC (want 2 — a false PASS): $OUT"
+fi
+printf 'name: x\non: pull_request\njobs: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}\n' \
+  >"$TMP/ci-pr-flowok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-flowok.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "control: an ordinary flow-mapping job IS read (the pin above is not 'flow style is refused')"
+else
+  fail "an ordinary flow-mapping job returned rc $RC (want 0): $OUT"
+fi
+
+# ROOT-CAUSE PIN. The guard refusing the polluted document does not prove the PARSER is fixed —
+# the guard's own own-property lookup refuses it even with the bug present (verified: reverting
+# workflow-yaml.mjs to plain assignment leaves the guard's rc 2 unchanged). The bug is a false PASS
+# for EVERY consumer of this parser, so assert the parser's own behaviour: `__proto__` is an
+# ordinary OWN key, and the object's prototype is untouched.
+(
+  cd "$ROOT" && node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    const { parseWorkflowYaml } = await import("./scripts/workflow-yaml.mjs");
+    const wf = parseWorkflowYaml(readFileSync(process.argv[1], "utf8"));
+    console.log(Object.getPrototypeOf(wf.jobs) === Object.prototype ? "CLEAN" : "POLLUTED");
+    console.log("keys:" + Object.keys(wf.jobs).join(","));
+  ' "$TMP/ci-pr-proto.yml"
+) >"$TMP/proto-parser.txt" 2>&1
+if grep -q '^CLEAN$' "$TMP/proto-parser.txt" && grep -q '^keys:__proto__$' "$TMP/proto-parser.txt"; then
+  pass "the PARSER keeps __proto__ as an own key and does not pollute the prototype"
+else
+  fail "the parser polluted a prototype or lost the key: $(tr '\n' ' ' <"$TMP/proto-parser.txt")"
+fi
+
+echo ''
 echo '8ad. A FOLDED block scalar (`run: >`) joins its lines -> the tail is visible'
 awk -v r="        run: bash scripts/run-bash-shards.sh" \
   '{ if ($0 == r) { print "        run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; next } print }' \
