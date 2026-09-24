@@ -644,7 +644,7 @@ called "pr update-branch" && fail "spent the attestation under a rotated key (B5
 
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
-# class B1-B8 must be covered by a test that FAILS against the revision before
+# class B1-B12 must be covered by a test that FAILS against the revision before
 # its fix. This section mutates the rail and asserts the suite reddens. A mutation
 # that leaves the suite green means the class is NOT covered.
 if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
