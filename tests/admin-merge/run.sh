@@ -2139,9 +2139,87 @@ grep -qF "gh: Pull Request is still a draft" "$TMP/err" \
 [ -f "$SCEN/comment-2" ] && grep -q "RETRACTED — the admin merge of head \`$HEAD_MF\` FAILED" "$SCEN/comment-2" \
   && pass "a head-bound RETRACTION is posted, so the marker is not left standing" \
   || fail "the success marker was left standing over an unmerged PR"
-grep -q "unique to this PR: 0" "$SCEN/comment-2" \
-  && fail "the retraction must NOT be a certificate (it carries the unique line)" \
-  || pass "the retraction is not a certificate (no 'unique to this PR: 0')"
+# ── 35b. THE PRODUCER→VERIFIER CONTRACT (#1429) ────────────────────────────
+# THE DEFECT THIS PINS. `bcbb7df` (#3756) RENAMED the rail's certificate clause
+# and left the verifier demanding the old one, so a green tree was refused by its
+# own gate — every admin merge, fleet-wide. BOTH suites stayed green for six days
+# because neither fed the PRODUCER'S OWN OUTPUT to the CONSUMER: the rail's suite
+# pinned its own new line, the gate's suite pinned the old one, and nothing bound
+# them (the #3076 class — a producer/consumer literal drift). This is that bind:
+# the body the rail ACTUALLY posted above (`$SCEN/comment-1`) must verify, and
+# every way it could lie must not.
+echo "== 35b. the verifier accepts the rail's own posted certificate (#1429) =="
+VERIFY="$ROOT/scripts/verify-admin-merge-evidence.sh"
+if [ ! -f "$VERIFY" ]; then
+  fail "missing $VERIFY — the coupling test cannot run"
+elif [ ! -f "$SCEN/comment-1" ]; then
+  fail "no evidence comment was recorded — the fixture this test needs is gone"
+else
+  # The fixture must be the CURRENT shape, or the verifier would pass through its
+  # LEGACY branch and prove nothing about the rail as it stands today.
+  if grep -q 'blocked by the decision: 0' "$SCEN/comment-1" \
+     && ! grep -q 'unique to this PR: 0' "$SCEN/comment-1"; then
+    pass "the captured body is the CURRENT certificate shape (decision clause, no legacy line)"
+  else
+    fail "the captured body is not the current shape — the coupling test proves nothing"
+  fi
+  # The SEMANTIC anchor, extracted from the producer's OWN output: the residual
+  # SECTION must be present, state its emptiness, and render no entry bullet.
+  residual="$(awk '/final residual[^<]*<\/summary>/{f=1;next} /<\/details>/{f=0} f' "$SCEN/comment-1")"
+  case "$residual" in
+    *-*) fail "the rail's residual section renders an entry — the fixture is not a zero residual" ;;
+    '')  fail "the rail's residual section is absent — the recorded body is not a certificate" ;;
+    *)   pass "the rail's residual section renders no entries (the semantic zero the verifier anchors on)" ;;
+  esac
+  bash "$VERIFY" --body-file "$SCEN/comment-1" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && pass "producer → verifier: the rail's own posted evidence verifies (exit 0)" \
+    || fail "producer → verifier: the rail's own evidence is REFUSED (exit $rc) — the contract has drifted again"
+  # MUTATION 1 — the one-word producer mutation: a NON-ZERO decision count.
+  sed 's/blocked by the decision: 0/blocked by the decision: 1/' "$SCEN/comment-1" > "$TMP/evil-count"
+  bash "$VERIFY" --body-file "$TMP/evil-count" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: a non-zero decision count is REFUSED (exit $rc)" \
+    || fail "MUTATION: a non-zero decision count CERTIFIED — the gate is a rubber stamp"
+  # MUTATION 2 — a NON-ZERO RESIDUAL beside a clause that still reads 0. The
+  # clause is a literal the rail prints unconditionally, so if THIS passes, the
+  # widened predicate is certifying a body that lists new failures beside it.
+  awk '{ print } /final residual[^<]*<\/summary>/ { print ""; print "- tests/test_new.py::test_brand_new" }' \
+    "$SCEN/comment-1" > "$TMP/evil-residual"
+  if grep -q 'test_brand_new' "$TMP/evil-residual"; then
+    pass "  (the residual mutation applied — an entry bullet was injected)"
+  else
+    fail "  (the residual mutation did NOT apply; the assertion below would prove nothing)"
+  fi
+  bash "$VERIFY" --body-file "$TMP/evil-residual" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "MUTATION: a NON-ZERO residual beside a zero clause is REFUSED (exit $rc)" \
+    || fail "MUTATION: a non-zero residual CERTIFIED — the clause alone was treated as the zero"
+  # ALREADY-POSTED evidence must not be invalidated by the widening.
+  {
+    printf '<!-- admin-merge-safety: %s -->\nPR head: %s\nmain compared (union of 1 run of x): a:1\nPR failing: 0 | main failing: 0 | unique to this PR: 0\n' "$HEAD_MF" "$HEAD_MF"
+  } > "$TMP/legacy-cert"
+  bash "$VERIFY" --body-file "$TMP/legacy-cert" --head "$HEAD_MF" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && pass "the LEGACY certificate shape still verifies (posted evidence is not invalidated)" \
+    || fail "the widening invalidated the LEGACY certificate shape (exit $rc)"
+  # The RETRACTION is deliberately NOT a certificate — the retraction marker, no
+  # `PR head:` binding and no residual section. This was asserted against
+  # `unique to this PR: 0`, a line the rail no longer emits AT ALL, so the
+  # assertion passed for a reason that no longer existed; the verifier decides it
+  # now, and the body's own clauses are stated so a reader sees why.
+  if [ -f "$SCEN/comment-2" ]; then
+    bash "$VERIFY" --body-file "$SCEN/comment-2" --head "$HEAD_MF" >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -ne 0 ] && pass "the RETRACTION body is REFUSED (exit $rc — it is not a certificate)" \
+      || fail "the retraction body CERTIFIED — a non-certificate admits an admin merge"
+    grep -q 'final residual' "$SCEN/comment-2" \
+      && fail "the retraction carries a residual section (it must not — the refusal would be for the wrong reason)" \
+      || pass "  …and it carries no residual section, which is WHY it is not a certificate"
+  else
+    fail "no retraction body was recorded — the fixture this test needs is gone"
+  fi
+fi
 
 # ── 36. a DRAFT is refused EARLY, by name (not a late generic merge failure) ─
 # commit-workflow mandates opening drafts, and gh refuses to merge one. The rail

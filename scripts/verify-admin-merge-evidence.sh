@@ -16,7 +16,27 @@
 #   <!-- admin-merge-safety: <HEAD> -->   the marker, bound to the CURRENT head
 #   PR head: <HEAD>                       the body names the same revision
 #   main compared (union of …             the comparison actually happened
-#   … unique to this PR: 0                the residual is zero
+#   … the residual is zero                ONE of the two shapes below
+#
+# THE RESIDUAL IS THE ANCHOR, NOT THE CLAUSE'S WORDING (#1429). The rail emits
+# its zero as an `evidence_list` SECTION whose body is the entries of the final
+# residual (BLOCKED ∪ UNATTRIBUTABLE). `evidence_list` renders one `- ` bullet
+# per entry and falls back to its empty text ONLY when the list is empty, so the
+# section's own rendering is the semantic zero — whatever the surrounding prose
+# is worded. A body that lists residual entries is therefore refused even though
+# the rail's clause reads `blocked by the decision: 0` (that clause is a literal
+# `printf` the rail prints unconditionally, so on its own it would certify a
+# nonzero residual beside it — a fail-open).
+#
+#   CURRENT (the rail, since bcbb7df / #3756):
+#     … blocked by the decision: 0   AND the residual section renders no entries
+#   LEGACY (evidence posted before the rename — kept valid, never produced again):
+#     … unique to this PR: 0
+#
+# BOTH are accepted deliberately: widening the CONSUMER to the producer's real
+# contract is the fix; narrowing the producer back to the obsolete literal would
+# re-legalise the stronger, unsupported `unique to this PR` claim (#3756) and
+# would invalidate every already-posted certificate.
 #
 # Env:
 #   AGENT_GH_REAL   the real gh binary (set by the shim; default: `gh`). It must NOT
@@ -61,17 +81,44 @@ esac
 # One jq pass, ONE comment at a time: `select` appears inside the per-comment
 # pipeline, so every clause must hold for the SAME comment. `contains` (not
 # `test`) for the literal phrases — no regex escaping to get wrong.
-jq_program='[ .comments[].body
-  | select(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
-  | select(contains("PR head: '"$HEAD"'"))
-  | select(contains("main compared (union of "))
-  | select(test("unique to this PR: 0([ \t\r\n]|$)"))
-] | length'
+# THE CERTIFICATE PREDICATE — defined ONCE, above both call paths, so the
+# online (comment list) and offline (--body-file) forms cannot diverge.
+#
+# `residual_section` carves the `evidence_list` block out by its summary line.
+# The `[^<]*` runs matter: the summary must be a SUMMARY (no nested tag) and it
+# must still NAME the residual, so a body whose block is absent or re-titled is
+# refused rather than read as empty. `[\s\S]*?` is non-greedy, so the capture
+# stops at the FIRST `</details>` — the block's own close, not a later one.
+#
+# `residual_is_empty` requires the section to (a) be present and STATE something
+# and (b) carry no `- ` entry. (b) is the semantic zero: it does not name the
+# rail's empty-text wording, so that wording may be rephrased without breaking
+# the contract; and any non-empty list renders bullets, so a nonzero residual
+# can never satisfy it.
+CERT_JQ='
+def residual_section:
+  try (capture("<summary>[^<]*final residual[^<]*</summary>(?<r>[\\s\\S]*?)</details>") | .r) catch "";
+def residual_is_empty:
+  (residual_section) as $r
+  | (($r | gsub("\\s"; "") | length) > 0) and ((("\n" + $r) | test("- ")) | not);
+def certifies:
+  test("unique to this PR: 0([ \t\r\n]|$)")
+  or (test("blocked by the decision: 0([ \t\r\n]|$)") and residual_is_empty);
+'
+
+jq_program="$CERT_JQ
+[ .comments[].body
+  | select(contains(\"<!-- admin-merge-safety: $HEAD -->\"))
+  | select(contains(\"PR head: $HEAD\"))
+  | select(contains(\"main compared (union of \"))
+  | select(certifies)
+] | length"
 
 if [ -n "$BODY_FILE" ]; then
   # Offline mode: the body is the whole input, so wrap it as one comment.
   body="$(cat "$BODY_FILE")"
-  count="$(jq -n --arg b "$body" "[ \$b | select(contains(\"<!-- admin-merge-safety: $HEAD -->\")) | select(contains(\"PR head: $HEAD\")) | select(contains(\"main compared (union of \")) | select(test(\"unique to this PR: 0([ \t\r\n]|$)\")) ] | length" 2>/dev/null)"
+  count="$(jq -n --arg b "$body" "$CERT_JQ
+[ \$b | select(contains(\"<!-- admin-merge-safety: $HEAD -->\")) | select(contains(\"PR head: $HEAD\")) | select(contains(\"main compared (union of \")) | select(certifies) ] | length" 2>/dev/null)"
 else
   count="$("$GH" pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json comments --jq "$jq_program" 2>/dev/null)"
 fi

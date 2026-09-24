@@ -3951,6 +3951,49 @@ test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
     "a short SHA naming a DIFFERENT revision does NOT certify");
 });
 
+// ── #1429: the rail's CURRENT certificate shape ─────────────────────────────
+// The rail renamed its clause (bcbb7df, #3756) and BOTH gates kept demanding the
+// old `unique to this PR: 0`, so the rail's own certificate was refused — every
+// admin merge, fleet-wide, until a lane needed one. These pin the reconciliation:
+// the producer's real shape certifies, and the two ways a body could lie beside a
+// hardcoded zero clause do not.
+test("evidenceBodyIsCertifying: the rail's CURRENT residual shape (#1429)", () => {
+  const MARK = "e".repeat(40);
+  const residualBlock = (rendered: string) =>
+    "<details><summary>final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty</summary>\n\n" +
+    rendered + "\n\n</details>";
+  const EMPTY_RESIDUAL = "(empty — the decision exempts every failure this PR carries)";
+  const rail =
+    "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
+    "\nmain compared (union of 3 runs of python-ci.yml): s1:1,s2:2\n" +
+    "PR failing: 1 | main failing: 1 | blocked by the decision: 0\n" +
+    residualBlock(EMPTY_RESIDUAL) + "\n";
+  ok(evidenceBodyIsCertifying(rail, MARK), "the rail's own posted body certifies (empty residual section)");
+  ok(evidenceBodyIsCertifying(rail.replace("blocked by the decision: 0", "unique to this PR: 0"), MARK),
+    "the LEGACY clause still certifies (already-posted evidence stays valid)");
+  ok(!evidenceBodyIsCertifying(rail.replace("blocked by the decision: 0", "blocked by the decision: 1"), MARK),
+    "a non-zero decision count does NOT certify");
+  ok(!evidenceBodyIsCertifying(rail.replace("blocked by the decision: 0", "blocked by the decision: 0.5"), MARK),
+    "a fractional zero (`0.5`) does NOT certify");
+  ok(!evidenceBodyIsCertifying(rail.replace("blocked by the decision: 0", "blocked by the decision: 01"), MARK),
+    "`01` does NOT certify (the zero clause is exact)");
+  // THE ANTI-RUBBER-STAMP CASE. The clause is a literal the rail prints
+  // unconditionally, so a body that LISTS residual entries beside it must still be
+  // refused — that is the fail-open a clause-only widening would open.
+  ok(!evidenceBodyIsCertifying(rail.replace(EMPTY_RESIDUAL, "- tests/test_new.py::test_brand_new"), MARK),
+    "a NON-ZERO residual does NOT certify, even though the clause still reads 0");
+  ok(!evidenceBodyIsCertifying(
+    rail.replace("final residual (the exemption decision", "residual (the exemption decision"), MARK),
+    "a body with no residual SECTION does NOT certify (absence is not a measured zero)");
+  // The retraction is deliberately NOT a certificate: the retraction marker, no
+  // `PR head:` binding, and no residual section.
+  const retraction =
+    "<!-- admin-merge-retraction: " + MARK + " -->\n⚠️ RETRACTED — the admin merge of head `" + MARK +
+    "` FAILED and did NOT happen.\n\nThe evidence comment above (`admin-merge-safety: " + MARK +
+    "`) records that the safety comparison passed.";
+  ok(!evidenceBodyIsCertifying(retraction, MARK), "a retraction body does NOT certify");
+});
+
 test("evaluateAdminMergeGate: pure decisions", () => {
   const head = "b".repeat(40);
   const commented = (sha: string, body: string) => [body.split("<SHA>").join(sha)];

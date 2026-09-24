@@ -1790,12 +1790,46 @@ export function extractMergeSelector(command: string): MergeSelector {
 /**
  * Evidence must be **non-vacuous**, not merely present (#930 adversarial class
  * 2 — forgery/vacuity). A marker line alone proves nothing: the evidence body
- * must carry the comparison's own counts, with `unique to this PR: 0`. A body
- * computed over an empty or unparsed failing set cannot produce this line without
- * the comparison having produced *some* numeric line — but see the
+ * must carry the comparison's own counts AND a ZERO residual — `unique to this
+ * PR: 0` (the pre-#3756 shape) or `blocked by the decision: 0` beside an empty
+ * residual section (the shape the rail emits now). A body computed over an
+ * empty or unparsed failing set cannot produce this without the comparison
+ * having produced *some* numeric line — but see the
  * `evidenceBodyIsCertifying` docstring for what this honestly cannot prove: a
  * hand-typed line is one `printf` away, so this closes vacuity, not forgery.
  */
+
+/**
+ * The rail's residual section — the `evidence_list` block whose entries are the
+ * final residual (BLOCKED ∪ UNATTRIBUTABLE) — or null when the body carries none.
+ *
+ * `[^<]*` on either side of the phrase keeps this a SUMMARY match (no nested tag,
+ * and the block must still NAME the residual), and `[\s\S]*?` is non-greedy, so
+ * the capture stops at the block's own `</details>` rather than a later one.
+ */
+function residualSection(body: string): string | null {
+  const m = /<summary>[^<]*final residual[^<]*<\/summary>([\s\S]*?)<\/details>/.exec(body);
+  return m ? m[1] : null;
+}
+
+/**
+ * Does the residual section render NO entries?
+ *
+ * THIS is the semantic zero, not the clause's wording (#1429). The rail renders
+ * the section through `evidence_list`, which prints one `- ` bullet per entry and
+ * falls back to its empty text ONLY when the list is empty — so "the section
+ * carries no bullet" IS "the residual is zero", however either side words its
+ * prose. The clause alone is not enough: `blocked by the decision: 0` is a
+ * literal the rail prints unconditionally, so on its own it would certify a body
+ * that lists residual failures beside it — a fail-open. A missing section is NOT
+ * an empty one: absence of a measurement must never read as a measured zero.
+ */
+function residualSectionIsEmpty(body: string): boolean {
+  const section = residualSection(body);
+  if (section === null) return false;
+  if (!/\S/.test(section)) return false; // the section must STATE its emptiness
+  return !/(^|\n)\s*-\s/.test(section); // evidence_list renders one bullet per entry
+}
 /** The body's `PR head:` value, lowercased, or null when absent. */
 export function evidenceHeadInBody(body: string): string | null {
   const m = /PR head:\s*([0-9a-fA-F]{7,40})\b/.exec(body);
@@ -1827,9 +1861,21 @@ export function evidenceBodyIsCertifying(body: string, markerSha: string): boole
   // comment described a tolerance the code did not have.)
   const headNamesTheMarker =
     marker === bodyHead || marker.startsWith(bodyHead) || bodyHead.startsWith(marker);
+  // THE ZERO RESIDUAL, in EITHER accepted shape (#1429). Both are accepted
+  // deliberately: the rail is the PRODUCER and its current clause is the
+  // contract, while the legacy clause keeps evidence posted before the #3756
+  // rename valid — narrowing the rail back to the obsolete literal would
+  // re-legalise the stronger, unsupported `unique to this PR` claim.
+  // The `(?=\s|$)` tail (not `\b`) is what refuses a fractional/numeric
+  // continuation like `0.5` or `01`, mirroring the argv-level verifier.
+  const legacyZero = /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0(?=\s|$)/;
+  const decisionZero =
+    /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*blocked by the decision:\s*0(?=\s|$)/;
+  const zeroResidualCertifies =
+    legacyZero.test(body) || (decisionZero.test(body) && residualSectionIsEmpty(body));
   return (
     headNamesTheMarker &&
-    /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0\b/.test(body) &&
+    zeroResidualCertifies &&
     // The lane is named in the provenance line (`... union of N runs of
     // <lane>:`) — accept it, but never accept a missing provenance line.
     // `.+` (greedy, to the LAST `):`), not `[^:()]+`: a lane may be named by a workflow
