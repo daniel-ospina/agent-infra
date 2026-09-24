@@ -1631,12 +1631,22 @@ residual_of() {
 #                                   merge_group, workflow_dispatch, and every
 #                                   event NOT in the list above.
 # That is a DENY-list of the observed non-code events, deliberately: an
-# UNRECOGNISED event BLOCKS (fail closed). A red check whose run id cannot be
-# resolved at all (a non-Actions app, or a run outside the map window) also
-# BLOCKS — "I could not tell what this is" is not "this is noise".
+# UNRECOGNISED event BLOCKS (fail closed). The bulk run map is ONE bounded
+# `gh run list` window, so a run created after that listing was taken (or one an
+# event-scoped listing omits) can be MISSING from it; such a run is resolved
+# INDIVIDUALLY by its own run id (#1446) before the verdict is taken, because
+# otherwise a non-code base red reads as unresolved and fail-closes into a
+# code-measuring red that blocks every stale-surface PR (the observed
+# `finding-provenance` / `issues` shape). A red check whose run id cannot be
+# resolved AT ALL — a non-Actions app, or a run the individual resolve cannot
+# read either — still BLOCKS: "I could not tell what this is" is not "this is
+# noise", and the two cases must stay DISTINGUISHABLE (never default an
+# unresolved run to exempt).
 #
 # ONE `gh run list` resolves them all (id -> event, workflow name), so no single
-# red costs an extra call, and it is fetched ONLY when a red exists. BOUNDED at
+# red costs an extra call UNLESS the map missed it — then exactly ONE per-run
+# `gh api .../actions/runs/<id>` is spent on that red (the #1446 resolve above).
+# The listing is fetched ONLY when a red exists. BOUNDED at
 # 200 runs; the probed commit is the newest one, so its runs sit at the top. The
 # listing is selected by branch for a branch ref and by --commit for a sha.
 MAIN_HEALTH_RUN_MAP_LIMIT=200
@@ -1658,7 +1668,7 @@ MAIN_HEALTH_RUN_MAP_LIMIT=200
 # anomaly, because a default-branch run cannot attach to a PR head sha.
 check_surface_probe() {
   local ref="$1" label="${2:-main}" allow_noncode="${3:-0}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one
   local map_sel=()
   local blocking=0 other=0
   local repo_args=()
@@ -1972,6 +1982,34 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         if [ -n "$run_id" ] && [ -s "$map_file" ]; then
           ev="$(awk -F'\t' -v id="$run_id" '$1 == id { print $2; exit }' "$map_file")"
           wf="$(awk -F'\t' -v id="$run_id" '$1 == id { print $3; exit }' "$map_file")"
+        fi
+        # ── #1446: RESOLVE A RUN THE BOUNDED BULK MAP MISSED ────────────────
+        # The map is ONE bounded `gh run list` window (MAIN_HEALTH_RUN_MAP_LIMIT),
+        # so a run created after that listing was taken — or one an event-scoped
+        # listing omits — is simply absent from it. Left unresolved, a
+        # `schedule`/`issues` base red would classify as code-measuring and step
+        # 4.6 would refuse every stale-surface PR (the observed
+        # `finding-provenance` refusal). Resolve THIS run by its own id instead.
+        # THE TWO CASES STAY DISTINGUISHABLE and only one of them is exempt:
+        #   * the resolve SUCCEEDS and names a non-code event -> `ev` is set and
+        #     the existing base-side exemption below applies;
+        #   * the resolve SUCCEEDS and names a code event -> `ev` is set and the
+        #     red BLOCKS exactly as before (the workflow is named now, not
+        #     `(workflow unresolved)`);
+        #   * the resolve ANSWERS NOTHING -> `ev` stays empty, `wf` stays
+        #     `(workflow unresolved)`, and the red BLOCKS on BOTH surfaces — the
+        #     fail-closed arm is unchanged. Never default an unresolved run to
+        #     exempt; that would convert this guard into a fail-open.
+        if [ -z "$ev" ] && [ -n "$run_id" ]; then
+          one="$($GH api "$slug/actions/runs/$run_id" \
+                   --jq '[(.event // ""), (.name // "")] | @tsv' 2>/dev/null || true)"
+          # Accept ONLY the projected shape (an event AND the tab separator). A
+          # tab-less answer is not a resolution, so `ev` stays empty and the red
+          # stays fail-closed — the same arm as a resolve that answered nothing.
+          if [ -n "$one" ] && [ "${one#*$'\t'}" != "$one" ]; then
+            ev="${one%%$'\t'*}"
+            wf="${one#*$'\t'}"
+          fi
         fi
         [ -n "$wf" ] || wf="(workflow unresolved)"
         # WHICH NON-CODE EVENTS ARE EXEMPT, AND ON WHICH SURFACE (#1353).
