@@ -62,13 +62,20 @@ import {
   materializeGhShim,
   NEUTRAL_GH_SHIM_DIR,
   withGhShim,
+  resolveAdminMergeEvidenceVerifier,
   type ReviewRecord,
 } from "./index.js";
 // #966: the shared parser module — the drift-pin below asserts this extension's
 // exported helpers ARE these functions (one copy, not a lookalike).
 import * as sharedParse from "../shared/git-command-parse.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
-import { execSync } from "node:child_process";
+
+// This test file lives beside the extension, so this is the extension's own
+// directory — used to pin AGENT_GH_SHIM_DIR at THIS checkout's shim instead of
+// whatever the launcher pointed at (see the delegation test).
+const EXTENSION_DIR = fileURLToPath(new URL(".", import.meta.url));
+import { execSync, execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import * as fs from "node:fs";
@@ -3904,15 +3911,69 @@ test("resolveGhShimDir: resolves this checkout's shim, and an unusable override 
 
 test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
   const MARK = "a".repeat(40);
+  // (#1388) The clause set is the PRODUCER's current spelling — `blocked by the
+  // decision: 0` — plus the attribution's zero drop counts. `blocked by the
+  // decision` is what bcbb7df (#3756) renamed the residual clause to; the retired
+  // `unique to this PR: 0` is no longer accepted by either gate, because the
+  // producer can no longer prove that claim when the comparison set is clipped or
+  // not measurable.
+  const ATTR = "\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.";
   const good = "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
-    "\nmain compared (union of 10 runs of python-ci.yml): s1:1,s2:2\nPR failing: 0 | main failing: 3 | unique to this PR: 0\n";
+    "\nmain compared (union of 10 runs of python-ci.yml): s1:1,s2:2\nPR failing: 0 | main failing: 3 | blocked by the decision: 0" + ATTR + "\n";
   ok(evidenceBodyIsCertifying(good, MARK), "full evidence certifies (lane-qualified provenance accepted)");
   ok(evidenceBodyIsCertifying(good.replace(" of python-ci.yml", ""), MARK),
     "lane-less provenance from an older evidence format still certifies");
   ok(!evidenceBodyIsCertifying("<!-- admin-merge-safety: " + MARK + " -->", MARK),
     "marker only (empty/unparsed set) does NOT certify");
-  ok(!evidenceBodyIsCertifying(good.replace("unique to this PR: 0", "unique to this PR: 1"), MARK),
-    "a non-zero unique count never certifies");
+  ok(!evidenceBodyIsCertifying(good.replace("blocked by the decision: 0", "blocked by the decision: 1"), MARK),
+    "a non-zero residual never certifies");
+  // The zero clause must be BOUNDED: a substring test would accept `0.5` and `01`.
+  ok(!evidenceBodyIsCertifying(good.replace("blocked by the decision: 0", "blocked by the decision: 0.5"), MARK),
+    "a residual of '0.5' never certifies (the zero clause is exact, not a substring)");
+  ok(!evidenceBodyIsCertifying(good.replace("PR=0 | main=0.", "PR=0 | main=01."), MARK),
+    "an attribution count of '01' never certifies (the clause is bounded)");
+  // #1429: the PR side must be a MEASURED zero; the MAIN side is DISCLOSED. The
+  // producer emits `main=${main_drops}` (admin-merge.sh:3319) and a main-side drop
+  // under-reports the BASELINE, which can only make the residual look larger — the
+  // false-block direction. A disclosed count therefore certifies, while staying a
+  // BOUNDED canonical integer so it cannot be widened into "anything".
+  ok(evidenceBodyIsCertifying(good.replace("PR=0 | main=0.", "PR=0 | main=3."), MARK),
+    "a DISCLOSED main-side drop count (PR=0 | main=3) certifies (#1429 — the tortoise#5003 shape)");
+  ok(!evidenceBodyIsCertifying(good.replace("PR=0 | main=0.", "PR=0 | main=-1."), MARK),
+    "a non-canonical main-side count never certifies (the disclosed count is a bounded integer)");
+  // A MEASURED zero requires the attribution line: without it the zero cannot be
+  // distinguished from an unmeasured one.
+  ok(!evidenceBodyIsCertifying(good.replace(ATTR, ""), MARK),
+    "a certificate with no attribution line does NOT certify (the zero is unproven)");
+  // VACUOUS comparison (nothing measurable on either side): the state is stated
+  // and a positive lane-parity claim must be present. `NOT ESTABLISHED` does not
+  // certify — that is clause 5, and it is what keeps a declared-off comparison
+  // from passing as evidence (#1388; #1319 policy untouched).
+  const vac = good.replace("PR failing: 0 | main failing: 3 | blocked by the decision: 0",
+    "measured sets: PR failing=0, main failing=0\nPR failing: 0 | main failing: 0 | blocked by the decision: 0\nlane parity: NOT ESTABLISHED — declared off");
+  ok(!evidenceBodyIsCertifying(vac, MARK), "a vacuous comparison with parity NOT ESTABLISHED does NOT certify (clause 5)");
+  // THE PRODUCER'S OWN SENTENCE, not a paraphrase of it: the clause requires the
+  // producer's actual positive value, so a fixture that said something *like* it
+  // (`… main's failing node ids are a subset of the PR's`) would have hidden the
+  // fact that the gate now demands the real spelling — and a fixture is the one
+  // thing that cannot notice the producer moving (#1388).
+  const PARITY_POSITIVE = "lane parity: PR ⊇ main — the PR executed every test shard main's lane executed (parity family: ci*; 3 shard(s) on the PR side, 3 on main)";
+  ok(evidenceBodyIsCertifying(vac.replace("lane parity: NOT ESTABLISHED — declared off", PARITY_POSITIVE), MARK),
+    "a vacuous comparison WITH the producer's established-parity sentence certifies (clause 5)");
+  // …but on a VACUOUS body the main-side zero is LOAD-BEARING: it is half of the
+  // condition that selects the parity branch, and the producer's own `main side:`
+  // prose reads it as "EMPTY because the lane is GREEN". A clipped main baseline
+  // can produce that zero without the lane being green, so a disclosed main-side
+  // clip must NOT certify here (#1429) — while on a REAL comparison it does.
+  ok(!evidenceBodyIsCertifying(vac.replace("lane parity: NOT ESTABLISHED — declared off", PARITY_POSITIVE).replace("PR=0 | main=0.", "PR=0 | main=3."), MARK),
+    "a VACUOUS body with a disclosed main-side clip (main=3) never certifies (the main-side zero is load-bearing there, #1429)");
+  // …and the negation a confirming review reproduced one spelling further in: the
+  // em dash is a SEPARATOR, not a truth value, so a negation can follow it. Both
+  // spellings must refuse, and this pair is the test that keeps that closed.
+  ok(!evidenceBodyIsCertifying(vac.replace("NOT ESTABLISHED — declared off", "PR ⊇ main — NOT established: this head did NOT execute every shard main ran"), MARK),
+    "a parity line that NEGATES parity AFTER the em dash does NOT certify (clause 5)");
+  ok(!evidenceBodyIsCertifying(vac.replace("NOT ESTABLISHED — declared off", PARITY_POSITIVE.replace(" executed (parity family:", " executed (parity family: BUT parity was NOT established;")), MARK),
+    "the positive sentence with an appended disclaimer does NOT certify (the line must END at the sentence)");
   ok(!evidenceBodyIsCertifying(good.replace("main compared (union of 10 runs of python-ci.yml): s1:1,s2:2\n", ""), MARK),
     "missing main provenance does NOT certify");
   // The rail prints the runs that ACTUALLY CONTRIBUTED to the union, so a one-run
@@ -3935,32 +3996,156 @@ test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
     "body `PR head:` disagreeing with the marker does NOT certify");
   ok(!evidenceBodyIsCertifying(good.replace("PR head:", "PR sha:"), MARK),
     "a body with no `PR head:` line at all does NOT certify");
-  // Prefix tolerance must hold in BOTH directions. Until review cycle 2 the code
-  // was `marker.length >= 40 ? bodyHead === marker : …`, so a FULL marker with a
-  // SHORT `PR head:` returned false while the reverse returned true — the comment
-  // claimed a symmetry the code did not have. This test previously exercised only
-  // the marker-shortened direction (a `String.replace` of the first occurrence,
-  // which is the marker comment, not the `PR head:` line).
-  ok(evidenceBodyIsCertifying(good.replace(MARK, MARK.slice(0, 12)), MARK),
-    "a short SHA in the MARKER line names the same revision (prefix-tolerant)");
-  ok(evidenceBodyIsCertifying(good.split("PR head: " + MARK).join("PR head: " + MARK.slice(0, 12)), MARK),
-    "a short SHA in the body's `PR head:` names the same revision (the asymmetric direction)");
-  // A DIFFERENT revision must still fail, in both directions: tolerance is prefix
-  // matching, not "any short sha matches".
-  ok(!evidenceBodyIsCertifying(good.split("PR head: " + MARK).join("PR head: " + "d".repeat(12)), MARK),
-    "a short SHA naming a DIFFERENT revision does NOT certify");
+  // EXACT head binding, in BOTH lines (#1388 clause 6). These two assertions
+  // previously required PREFIX tolerance, which only the extension had — the shim,
+  // which is the layer standing between an invocation and `gh`, has always
+  // required an exact match. So the tolerance was unobservable in the allow
+  // direction (a body the extension accepted and the shim refused could not merge
+  // either way), and keeping the two layers different is exactly the divergence
+  // clause 6 exists to remove. Nothing real is lost: the producer emits the full
+  // 40-char `headRefOid` (admin-merge.sh:2240 `resolve_head` → `--json headRefOid`),
+  // and the captured evidence carries it verbatim in both lines.
+  ok(!evidenceBodyIsCertifying(good.replace(MARK, MARK.slice(0, 12)), MARK),
+    "a short SHA in the MARKER line does NOT certify (both layers bind exactly)");
+  ok(!evidenceBodyIsCertifying(good.split("PR head: " + MARK).join("PR head: " + MARK.slice(0, 12)), MARK),
+    "a short SHA in the body's `PR head:` does NOT certify (same contract as the shim)");
+  // A DIFFERENT revision must still fail: exact binding is not "any sha matches".
+  ok(!evidenceBodyIsCertifying(good.split("PR head: " + MARK).join("PR head: " + "d".repeat(40)), MARK),
+    "a full SHA naming a DIFFERENT revision does NOT certify");
+});
+
+test("evidenceBodyIsCertifying: delegation to the shim's verifier is GENUINE (#1388 clause 6)", () => {
+  // Clause 6 is only worth anything if the gate really ASKS the one
+  // implementation. Asserting that a path string exists would prove nothing —
+  // the gate could keep a copy of the clauses and merely mention the script
+  // (which is exactly the state the first cut of this change left behind, and a
+  // reference grep could not tell the difference). So this compares the gate's
+  // verdict against the SCRIPT'S OWN verdict, run for real, over a corpus that
+  // must contain both a certifying and a non-certifying body: if the two ever
+  // disagree, one of them has its own copy of the contract again.
+  const MARK = "b".repeat(40);
+  const body = (extra: string) => "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
+    "\nmain compared (union of 3 runs of python-ci.yml): a:1\n" + extra +
+    "\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.";
+  const nonVacuous = "PR failing: 2 | main failing: 7 | blocked by the decision: 0";
+  const vacuous = "PR failing: 0 | main failing: 0 | blocked by the decision: 0";
+  const corpus: Array<[string, string, boolean]> = [
+    ["a non-vacuous zero residual", body(nonVacuous), true],
+    ["a vacuous comparison WITHOUT parity", body(vacuous), false],
+    ["a vacuous comparison WITH parity", body(vacuous) + "\nlane parity: PR ⊇ main — the PR executed every test shard main's lane executed (parity family: ci*; 3 shard(s) on the PR side, 3 on main)", true],
+    ["a vacuous comparison whose parity line negates parity AFTER the em dash", body(vacuous) + "\nlane parity: PR ⊇ main — NOT established: this head did NOT execute every shard main ran", false],
+    ["a fractional residual", body("PR failing: 0 | main failing: 0 | blocked by the decision: 0.5"), false],
+    ["a zero-prefixed residual", body("PR failing: 0 | main failing: 0 | blocked by the decision: 01"), false],
+    ["a leading-zero count (a vacuous body spelled non-canonically)", body("PR failing: 00 | main failing: 0 | blocked by the decision: 0"), false],
+    ["the retired, stronger claim", body("PR failing: 0 | main failing: 0 | unique to this PR: 0"), false],
+    ["malformed provenance", body(nonVacuous).replace("union of 3 runs", "union of 1 banana"), false],
+    ["no provenance", body(nonVacuous).replace("main compared (union of 3 runs of python-ci.yml): a:1\n", ""), false],
+    ["no attribution line", body(nonVacuous).replace(/\nAttribution[^\n]*/, ""), false],
+    ["a clipped set stated as zero", body("PR failing: 2 | main failing: 0 | blocked by the decision: 0"), true],
+    ["a marker naming another revision", body(nonVacuous).split("PR head: " + MARK).join("PR head: " + "c".repeat(40)), false],
+  ];
+  // NO ENV PINNING IS NEEDED, and that is the fix for a fresh-context review's
+  // finding: an earlier draft resolved the verifier from the shim's tree
+  // (`resolveGhShimDir()`, which prefers `AGENT_GH_SHIM_DIR`), so this corpus was
+  // silently compared against whatever that variable pointed at — in this
+  // environment the MAIN checkout's script (sha 5965c094) rather than the revision
+  // under test (167940ac). The resolution is now derived from THIS file's own
+  // location, so the comparison is deterministic and the test no longer depends on
+  // the ambient environment or on file ordering.
+  const verifier = resolveAdminMergeEvidenceVerifier();
+  ok(verifier !== null && verifier.endsWith("scripts/verify-admin-merge-evidence.sh"),
+    "the ONE implementation resolves to scripts/verify-admin-merge-evidence.sh, not a copy");
+  ok(verifier !== null && verifier.startsWith(
+    fs.realpathSync(resolvePath(EXTENSION_DIR, "..", ".."))),
+    "…and it is resolved inside THIS checkout, from the extension's own location");
+  let certifying = 0;
+  for (const [name, b, expected] of corpus) {
+    const tmp = resolvePath(os.tmpdir(), `vgate-corpus-${process.pid}-${certifying}-${name.length}.md`);
+    fs.writeFileSync(tmp, b);
+    let scriptSays: boolean;
+    try {
+      execFileSync("bash", [verifier as string, "--body-file", tmp, "--head", MARK], { stdio: "ignore", timeout: 15_000 });
+      scriptSays = true;
+    } catch {
+      scriptSays = false;
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+    }
+    equal(scriptSays, expected, "the SCRIPT's own verdict for: " + name);
+    equal(evidenceBodyIsCertifying(b, MARK), scriptSays, "the gate agrees with the script on: " + name);
+    if (scriptSays) certifying++;
+  }
+  ok(certifying > 0, "the corpus contains a CERTIFYING body, so agreement is not agreement on refusing everything");
+});
+
+test("evidenceBodyIsCertifying: an environment seam CANNOT redirect the verifier (#1388)", () => {
+  // A fresh-context review of the first delegation draft reproduced this bypass:
+  // the verifier was resolved from the shim's tree, that tree is reachable through
+  // `AGENT_GH_SHIM_DIR`, and a planted script was then consulted INSTEAD of the
+  // contract — certifying an empty body. Two remedies were tried. The first was a
+  // negative-control probe, and the same reviewer defeated it correctly: a probe is
+  // distinguishable from outside (fixed all-zero head, recognisable filename), so a
+  // delegate that refuses only the probe passes it — black-box probing cannot
+  // establish "is a contract". The second, and the one this pins, is to close the
+  // SEAM: the path is derived from this file's own location, exactly as
+  // `scripts/gh-shim/gh` does it ("NO override: this path is derived from the
+  // script's own location"), after ITS own `AGENT_GH_SHIM_VERIFY` seam was found
+  // reachable in production.
+  //
+  // WHAT THIS PINS: it fails against that intermediate draft (the resolver returned
+  // the planted path), not against origin/main — pre-fix the gate kept its own
+  // clauses and delegated to nothing, so a planted file was inert.
+  const MARK = "d".repeat(40);
+  const certifying = "<!-- admin-merge-safety: " + MARK + " -->\nPR head: " + MARK +
+    "\nmain compared (union of 2 runs of python-ci.yml): s1:1\nPR failing: 2 | main failing: 7 | blocked by the decision: 0" +
+    "\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.";
+  const savedShimDir = process.env.AGENT_GH_SHIM_DIR;
+  const root = fs.mkdtempSync(resolvePath(os.tmpdir(), "vgate-stub-"));
+  const shimDir = resolvePath(root, "gh-shim");
+  fs.mkdirSync(shimDir, { recursive: true });
+  for (const rel of ["gh-shim/gh", "verify-admin-merge-evidence.sh"]) {
+    const f = resolvePath(root, rel);
+    fs.writeFileSync(f, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(f, 0o755);
+  }
+  process.env.AGENT_GH_SHIM_DIR = shimDir;
+  try {
+    const verifier = resolveAdminMergeEvidenceVerifier();
+    ok(verifier !== null && !verifier.startsWith(root),
+      "the planted tree does NOT become the verifier (the seam is closed)");
+    ok(verifier !== null && verifier.endsWith("scripts/verify-admin-merge-evidence.sh"),
+      "…it is still this checkout's ONE implementation of the contract");
+    // …so the decoy changes nothing: the verdicts are the contract's own.
+    ok(evidenceBodyIsCertifying(certifying, MARK),
+      "a real certificate still certifies with the decoy planted (the seam, not the stub, is what refuses)");
+    ok(!evidenceBodyIsCertifying("nothing here resembles evidence", MARK),
+      "and a non-certifying body is still refused");
+  } finally {
+    if (savedShimDir === undefined) delete process.env.AGENT_GH_SHIM_DIR;
+    else process.env.AGENT_GH_SHIM_DIR = savedShimDir;
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 });
 
 test("evaluateAdminMergeGate: pure decisions", () => {
   const head = "b".repeat(40);
   const commented = (sha: string, body: string) => [body.split("<SHA>").join(sha)];
-  const ev = "<!-- admin-merge-safety: <SHA> -->\nPR head: <SHA>\nmain compared (union of 10 runs): s1:1\nPR failing: 1 | main failing: 1 | unique to this PR: 0";
+  const ev = "<!-- admin-merge-safety: <SHA> -->\nPR head: <SHA>\nmain compared (union of 10 runs): s1:1\nPR failing: 1 | main failing: 1 | blocked by the decision: 0\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.";
   equal(evaluateAdminMergeGate(null, head, [], false).status, "block", "no PR number → block (fail closed)");
   equal(evaluateAdminMergeGate(1, null, [], false).status, "block", "no head → block");
   equal(evaluateAdminMergeGate(1, head, null, false).status, "block", "unreadable comments → block (fail closed)");
   equal(evaluateAdminMergeGate(1, head, commented("c".repeat(40), ev), false).status, "block", "stale evidence (head X, now Y) → block");
   equal(evaluateAdminMergeGate(1, head, ["<!-- admin-merge-safety: " + head + " -->"], false).status, "block", "vacuous marker → block");
   equal(evaluateAdminMergeGate(1, head, commented(head, ev), false).status, "allow", "head-bound non-vacuous evidence → allow");
+  // A SHORT-SHA MARKER AT THE GATE LEVEL. `bound` accepts a marker that is a prefix of
+  // the current head, but the verifier must be asked about the CURRENT HEAD — not about
+  // the marker's own value, which is self-satisfying (every comment that reaches the
+  // predicate contains that marker by construction). A confirming review found the
+  // earlier call passing the marker's value: a 12-char marker then certified HERE while
+  // the shim refused it, i.e. two layers, two verdicts, on the clause that stops stale
+  // evidence unlocking a new head. This is the production call shape.
+  equal(evaluateAdminMergeGate(1, head, [ev.split("<SHA>").join(head.slice(0, 12))], false).status, "block",
+    "a short-sha marker (a prefix of the current head, but not the head) → block");
   // A marker bound to the current head, pasted onto a body that names a DIFFERENT
   // revision: refused (the forgery case the review found open).
   equal(evaluateAdminMergeGate(1, head, [ev.split("<SHA>").join(head)
@@ -3984,8 +4169,8 @@ function adminGh(head: string, comments: string[] | null, failComments = false) 
     throw ghError(`unexpected gh call: ${cmd}`);
   };
 }
-function evidenceBody(sha: string, counts = "PR failing: 1 | main failing: 1 | unique to this PR: 0"): string {
-  return `<!-- admin-merge-safety: ${sha} -->\nPR head: ${sha}\nmain compared (union of 10 runs): s1:1,s2:2\n${counts}\n<details>raw comm -23 output</details>\nFlake classification: none needed`;
+function evidenceBody(sha: string, counts = "PR failing: 1 | main failing: 1 | blocked by the decision: 0"): string {
+  return `<!-- admin-merge-safety: ${sha} -->\nPR head: ${sha}\nmain compared (union of 10 runs): s1:1,s2:2\n${counts}\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n<details>raw comm -23 output</details>\nFlake classification: none needed`;
 }
 
 testAsync("#930 compound: a second merge in the same command is BLOCKED, not judged on the first PR", async () => {

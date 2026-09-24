@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 import { isPrintMode } from "../shared/print-mode.js";
 // #966: the command parsers are ONE copy shared with verification-gate, in
 // extensions/shared/. This file used to define its own extractPrNumber /
@@ -1803,7 +1803,12 @@ export function evidenceHeadInBody(body: string): string | null {
 }
 
 /**
- * Is `body` a CERTIFYING evidence comment for the marker SHA `markerSha`?
+ * Is `body` a CERTIFYING evidence comment for the revision `currentHead`?
+ *
+ * The second argument is the CURRENT head being merged — never the sha read out of the
+ * marker. A caller that passed the marker's own value would make the verifier's
+ * head-bound clauses self-satisfying (every comment reaching this function contains
+ * that marker by construction); see the note inside for the reproduced bypass.
  *
  * What this CANNOT do: prove the comparison actually ran. The counts line is
  * text, and a determined agent can type it. No agent-side check can close that
@@ -1816,29 +1821,176 @@ export function evidenceHeadInBody(body: string): string | null {
  * hand-typing counts beside a `PR head:` the marker does not name) no longer
  * certifies.
  */
-export function evidenceBodyIsCertifying(body: string, markerSha: string): boolean {
-  const bodyHead = evidenceHeadInBody(body);
-  if (bodyHead === null) return false;
-  const marker = markerSha.toLowerCase();
-  // Prefix-tolerant in BOTH directions, mirroring the caller's head binding: a
-  // short SHA is legitimate in either line, but the two must denote one commit.
-  // (This was asymmetric until review cycle 2: a full-length marker with a
-  // short `PR head:` returned false while the reverse returned true, so the
-  // comment described a tolerance the code did not have.)
-  const headNamesTheMarker =
-    marker === bodyHead || marker.startsWith(bodyHead) || bodyHead.startsWith(marker);
-  return (
-    headNamesTheMarker &&
-    /PR failing:\s*\d+\s*\|\s*main failing:\s*\d+\s*\|\s*unique to this PR:\s*0\b/.test(body) &&
-    // The lane is named in the provenance line (`... union of N runs of
-    // <lane>:`) — accept it, but never accept a missing provenance line.
-    // `.+` (greedy, to the LAST `):`), not `[^:()]+`: a lane may be named by a workflow
-    // NAME rather than a file, and `gh` accepts names containing `:` and `(`/`)` —
-    // `--workflow 'CI: tests'` and `--workflow 'tests (unit)'` both emitted valid rail
-    // evidence that this contract refused, blocking a legitimate merge (cycle-3 review).
-    /main compared \(union of \d+ runs?(?: of .+)?\):/.test(body)
-  );
+/**
+ * The NEGATIVE CONTROL run against the delegate before it is trusted.
+ *
+ * It asserts the one invariant EVERY revision of this contract has honoured —
+ * in the current spelling, in the retired `unique to this PR: 0` spelling, and
+ * in any faithful future one: a body whose residual is NON-ZERO can never
+ * certify. The probe is therefore contract-VERSION-agnostic: it does not name a
+ * clause, so it cannot go stale the way a hand-written fixture does, and an
+ * older-or-newer honest script passes it.
+ *
+ * It returns true only when the delegate REFUSED the probe. A script that exits 0 for
+ * it — a no-op or stub install that would answer "certifying" to everything — is not
+ * delegated to, and the merge is refused.
+ *
+ * STATED LIMIT, and it is stated because the first draft of this change claimed the
+ * opposite: this is a guard against a BROKEN delegate, NOT a defence against a
+ * HOSTILE one. The probe is distinguishable from outside — a fixed all-zero head and a
+ * recognisable filename — so a delegate that refuses only the probe passes it, and no
+ * black-box question can establish "is a contract". A fresh-context review defeated
+ * the first draft exactly that way. The hostile case is handled where it can be:
+ * by resolving the path from this file's own location, with no environment seam.
+ */
+function verifierRefusesNonZeroBody(verifier: string): boolean {
+  const head = "0".repeat(40);
+  const probe =
+    "<!-- admin-merge-safety: " + head + " -->\nPR head: " + head +
+    "\nmain compared (union of 1 run of python-ci.yml): s1:1" +
+    "\nPR failing: 1 | main failing: 0 | blocked by the decision: 1" +
+    "\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.\n";
+  let tmp: string | null = null;
+  try {
+    tmp = resolvePath(os.tmpdir(), `pi-admin-merge-probe-${process.pid}-${Date.now()}.md`);
+    fs.writeFileSync(tmp, probe, "utf8");
+    execFileSync("bash", [verifier, "--body-file", tmp, "--head", head], {
+      stdio: "ignore",
+      timeout: 15_000,
+    });
+    // Exit 0: it certified a NON-ZERO residual. No honest contract revision does.
+    return false;
+  } catch {
+    // Non-zero exit — it refused, which is exactly what an honest delegate does.
+    return true;
+  } finally {
+    if (tmp !== null) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* best effort — a leftover temp file must not change the verdict */
+      }
+    }
+  }
 }
+
+/**
+ * Resolve the ONE implementation of the certificate contract, or null when it is
+ * not installed.
+ *
+ * THE PATH IS DERIVED FROM THIS FILE'S OWN LOCATION AND FROM NOTHING ELSE. There is
+ * deliberately no environment seam, and that is the shim's own settled answer to this
+ * exact class: `scripts/gh-shim/gh` carries the comment "NO override: this path is
+ * derived from the script's own location, so a caller cannot redirect the check at a
+ * file of its choosing" — written after an earlier `AGENT_GH_SHIM_VERIFY` seam was
+ * reachable IN PRODUCTION, where `AGENT_GH_SHIM_VERIFY=/dev/null` made the check exit
+ * 0 and an unevidenced admin merge proceeded with no announcement.
+ *
+ * An earlier draft of this delegation resolved the script from the shim's tree
+ * (`resolveGhShimDir()`, which prefers `AGENT_GH_SHIM_DIR`) and tried to compensate
+ * with a probe; a fresh-context review showed a probe cannot be a trust boundary. The
+ * seam is closed rather than compensated for.
+ *
+ * Symlinks ARE followed (via `realpathSync`), because the extension is installed as
+ * one: `~/.pi/agent/extensions/review-enforcer` and
+ * `pi-bootstrap/pi-config/extensions/review-enforcer` are both symlinks into the
+ * checkout, so the path it is LOADED by is not the tree the script lives in — while
+ * `../..` from the real directory is.
+ */
+export function resolveAdminMergeEvidenceVerifier(): string | null {
+  const roots: string[] = [];
+  if (EXTENSION_DIR) {
+    try {
+      roots.push(fs.realpathSync(EXTENSION_DIR));
+    } catch {
+      /* an unresolvable extension dir is simply no candidate */
+    }
+    // Also try the load path unresolved: harmless, and it keeps a NON-symlinked
+    // install working if realpath is unavailable for any reason.
+    roots.push(EXTENSION_DIR);
+  }
+  for (const root of roots) {
+    const candidate = resolvePath(root, "..", "..", "scripts", "verify-admin-merge-evidence.sh");
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      /* an unreadable candidate is not a match */
+    }
+  }
+  return null;
+}
+
+export function evidenceBodyIsCertifying(body: string, currentHead: string): boolean {
+  // #1388 clause 6 — SINGLE SOURCE, and this is the fix for the six-day outage.
+  //
+  // This function used to re-implement the clause set as its own regexes. That
+  // made TWO implementations of one contract, and on 2026-09-17 `bcbb7df`
+  // (#3756/PR #1147) renamed the producer's residual clause in four places
+  // (`unique to this PR: 0` -> `blocked by the decision: 0`). The shim's
+  // verifier kept requiring the old name; this file kept its own copy of the
+  // same stale regex. Neither was caught, because every suite pinned HAND-WRITTEN
+  // fixtures — a fixture does not notice that the producer moved. Every admin
+  // merge fleet-wide was then refused, and the rail retracted over its own
+  // evidence.
+  //
+  // So the predicate is not restated here. The one implementation is
+  // `scripts/verify-admin-merge-evidence.sh`, which is also what the `gh` shim
+  // calls (`scripts/gh-shim/gh`), and this gate now asks it the same question.
+  // Delegating rather than mirroring is the difference between fixing the clause
+  // once and fixing it twice — and drift between two copies is what caused this.
+  //
+  // FAIL CLOSED on every failure below: a gate that cannot run its check must
+  // block, never allow. That is why a missing script or a missing `jq` refuses
+  // the merge instead of silently certifying it.
+  // THE HEAD PASSED HERE IS THE CURRENT HEAD, NOT THE MARKER'S OWN VALUE, and that
+  // distinction is the whole of this gate's head binding. A confirming adversarial
+  // review found the earlier call passing the sha CAPTURED FROM THE MARKER: since a
+  // comment only reaches this function because it contains that marker, passing the
+  // marker's own value made the verifier's head-bound clauses (`<!-- admin-merge-safety:
+  // <head> -->`, `PR head: <head>`) SELF-SATISFYING, so a marker naming a 12-char
+  // prefix certified in this layer while the shim refused it — two layers, two
+  // verdicts, on the one clause (T5) that stops stale evidence unlocking a new head.
+  // The marker's own binding is checked by `bound` at the CALL SITE (a prefix of the
+  // current head, never of an earlier one); what is checked HERE is that the evidence
+  // is the evidence for the head that is actually being merged.
+  const verifier = resolveAdminMergeEvidenceVerifier();
+  if (verifier === null) return false;
+  // …and the delegate must first prove it is a CONTRACT and not a no-op. This is a
+  // FAIL-OPEN GUARD, NOT A TRUST BOUNDARY, and the distinction is the whole point: the
+  // probe is distinguishable, so a delegate that refuses only the probe passes it.
+  // What stops a redirected delegate is the RESOLUTION below — the path comes from
+  // this file's own location, with no environment seam — exactly as the shim does it.
+  // What this catches is the honest accident: a broken or stubbed install whose
+  // verifier exits 0 for everything, which would otherwise certify every merge
+  // silently rather than loudly failing.
+  if (!verifierRefusesNonZeroBody(verifier)) return false;
+
+  let tmp: string | null = null;
+  try {
+    tmp = resolvePath(os.tmpdir(), `pi-admin-merge-evidence-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
+    fs.writeFileSync(tmp, body, "utf8");
+    // `execFileSync`, not `execSync`: no shell, so the script path and the head
+    // are argv rather than a command string. An enforcement gate should not have
+    // a shell-interpolation surface at all.
+    execFileSync("bash", [verifier, "--body-file", tmp, "--head", currentHead], {
+      stdio: "ignore",
+      timeout: 15_000,
+    });
+    return true;
+  } catch {
+    // Non-zero exit (the contract did not hold), a spawn failure, or a timeout.
+    return false;
+  } finally {
+    if (tmp !== null) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* best effort — a leftover temp file must not change the verdict */
+      }
+    }
+  }
+}
+
 
 export type AdminMergeGateResult =
   | { status: "block"; reason: string }
@@ -1915,7 +2067,7 @@ export function evaluateAdminMergeGate(
       const bound = sha.length >= 40
         ? currentHead.toLowerCase() === sha
         : currentHead.toLowerCase().startsWith(sha);
-      if (bound && evidenceBodyIsCertifying(body, sha)) {
+      if (bound && evidenceBodyIsCertifying(body, currentHead)) {
         return {
           status: "allow",
           message:
