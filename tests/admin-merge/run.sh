@@ -2152,9 +2152,27 @@ grep -qF "gh: Pull Request is still a draft" "$TMP/err" \
 [ -f "$SCEN/comment-2" ] && grep -q "RETRACTED — the admin merge of head \`$HEAD_MF\` FAILED" "$SCEN/comment-2" \
   && pass "a head-bound RETRACTION is posted, so the marker is not left standing" \
   || fail "the success marker was left standing over an unmerged PR"
-grep -q "unique to this PR: 0" "$SCEN/comment-2" \
-  && fail "the retraction must NOT be a certificate (it carries the unique line)" \
-  || pass "the retraction is not a certificate (no 'unique to this PR: 0')"
+# The retraction must not be a CERTIFICATE. The assertion that used to stand here grepped
+# for "unique to this PR: 0" — a string the producer stopped emitting when that clause was
+# renamed (`bcbb7df`), so it was green no matter what the retraction said: a no-op gate
+# over exactly the property it named (#1440). What replaces it can fail for the reason it
+# states, including a call to the gate's own verifier — the consumer contract #1432
+# established, and the cross-component binding #1429's indicator (b) asked for.
+grep -q "blocked by the decision: 0" "$SCEN/comment-2" \
+  && fail "the retraction must NOT be a certificate (it carries the producer's CURRENT residual clause)" \
+  || pass "the retraction does not carry the producer's current residual clause"
+grep -qF "<!-- admin-merge-safety: $HEAD_MF -->" "$SCEN/comment-2" \
+  && fail "the retraction carries the SAFETY marker as a comment — it claims to be the certificate it retracts" \
+  || pass "the retraction is bound to the retraction marker, not to the safety certificate's"
+if [ -f "$SCEN/comment-2" ]; then
+  if bash "$ROOT/scripts/verify-admin-merge-evidence.sh" --body-file "$SCEN/comment-2" --head "$HEAD_MF" >/dev/null 2>&1; then
+    fail "the RETRACTION body CERTIFIES under the gate's own verifier — a retraction must never be a certificate"
+  else
+    pass "the retraction is refused by the gate's own verifier (it is not a certificate)"
+  fi
+else
+  fail "no retraction body was posted, so its non-certification cannot be asserted"
+fi
 
 # ── 36. a DRAFT is refused EARLY, by name (not a late generic merge failure) ─
 # commit-workflow mandates opening drafts, and gh refuses to merge one. The rail
