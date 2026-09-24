@@ -89,6 +89,23 @@ esac
 #     measured zero, so a zero over it does not certify — that is the whole
 #     soundness rule, and it is one-sided on purpose.
 #
+#     IT MUST BE THAT LINE, NOT MERELY THOSE CHARACTERS (#1450). The clause used to
+#     require `PR=0 | main=<n>.` to appear ANYWHERE in the body, so a body whose
+#     attribution line had been replaced by prose mentioning those characters still
+#     certified — the gate attesting to an attribution line it had not seen. Measured
+#     against the pre-fix revision: two reachable shapes certified, a line that merely
+#     STARTS with the counts (`PR=0 | main=0. was the observed tail of a line the
+#     producer printed.`) and a prose line that ENDS with them (`A quoted claim in
+#     prose reads: Attribution — FAILED tokens DROPPED by the parser: PR=0 | main=0.`).
+#     The counts must therefore sit on a line that is the producer's attribution —
+#     its framing AND the counts, with the counts ending it. The line is matched as an
+#     element of `split("\n")`, NOT with a flag-based `^`/`$` anchor: Oniguruma (the
+#     system `jq` on the offline path) and Go/RE2 (gh's gojq on the LIVE path)
+#     disagree about `(?m)` — multiline DOT in Oniguruma, multiline anchors in Go — so
+#     a flag-based anchor would reintroduce the live/offline divergence that §8 of the
+#     contract suite exists to catch. Leading indentation is tolerated (the emitted
+#     comment may nest the block); a trailing CR is tolerated; nothing else is.
+#
 #     THE MAIN SIDE IS DISCLOSED WHEN THE COMPARISON IS REAL, AND ZERO WHEN IT IS
 #     VACUOUS (#1429). The producer emits `main=${main_drops}`
 #     (`admin-merge.sh:3319`) and that count is NOT clamped: a main-side `FAILED`
@@ -232,9 +249,9 @@ CLAUSE_FILTER='(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
   and (contains("<!-- admin-merge-safety: "))
   and (test("main compared \\(union of [0-9]+ runs?( of .+)?\\):"))
   and (test("PR failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*main failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*blocked by the decision:\\s*0([ \\t\\r\\n]|$)"))
-  and (test("PR=0 \\| main=(0|[1-9][0-9]*)\\.([ \\t\\r\\n]|$)"))
+  and ([ (. | split("\n"))[] | select(test("^[ \\t]*Attribution[^\\n]*tokens DROPPED[^\\n]*PR=0 \\| main=(0|[1-9][0-9]*)\\.\\r?$")) ] | length > 0)
   and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not)
-       or (test("PR=0 \\| main=0\\.([ \\t\\r\\n]|$)")))
+       or ([ (. | split("\n"))[] | select(test("^[ \\t]*Attribution[^\\n]*tokens DROPPED[^\\n]*PR=0 \\| main=0\\.\\r?$")) ] | length > 0))
   and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not)
        or (test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( \\(parity family: [^;\\n[:cntrl:]\\x{2028}\\x{2029}]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")
            and ([match("lane parity:[^\\n]*"; "g") | .string
