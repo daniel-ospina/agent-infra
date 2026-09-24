@@ -186,20 +186,24 @@ recovery_guide() {
         '!'*) n="${line#!}"
             lines+=("  $n worktree record(s) could not be shown safely (a path contains a")
             lines+=("  newline) — inspect the hub's .git/worktrees directory by hand.") ;;
-        $'T\t'*|$'X\t'*)
-            case "$line" in $'T\t'*) d="${line#$'T\t'}" ;; *) d="${line#$'X\t'}" ;; esac
+        T1$'\t'*|T0$'\t'*|X1$'\t'*|X0$'\t'*)
+            mk="${line%%$'\t'*}"; d="${line#*$'\t'}"
             IFS= read -r rec || rec=""
             lines+=("  $d")
-            case "$d" in
-              "$repo_canon"|"$repo_canon"/*) lines+=("    git resolves it UP to this hub: commits and pushes made there")
-                         lines+=("    target '$branch' (the hub's branch) and report success.") ;;
-              *)         lines+=("    git no longer treats it as a worktree. It sits OUTSIDE this hub,")
-                         lines+=("    so it does not resolve to it.") ;;
-            esac
-            case "$line" in
-              $'T\t'*) lines+=("    Restore the hub's link:")
+            # The sentence follows GIT'S OWN ANSWER (the marker), not a path prefix: a directory
+            # inside a nested repo under the hub does not resolve to the hub, so naming the hub's
+            # branch there would be false (measured).
+            if [[ "${mk#?}" == "1" ]]; then
+              lines+=("    git resolves it UP to this hub: commits and pushes made there")
+              lines+=("    target '$branch' (the hub's branch) and report success.")
+            else
+              lines+=("    git no longer treats it as a worktree, and it does NOT fall through to")
+              lines+=("    this hub — inspect what it does resolve to before committing there.")
+            fi
+            case "$mk" in
+              T*) lines+=("    Restore the hub's link:")
                         lines+=("      printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
-              *)        lines+=("    The .git entry THERE is not this worktree's link — inspect it, then")
+              *)  lines+=("    The .git entry THERE is not this worktree's link — inspect it, then")
                         lines+=("    replace the entry (rm -f removes the entry itself, never what a")
                         lines+=("    symlink points at; a directory needs a deliberate look first):")
                         lines+=("      rm -f $(printf '%q' "$d/.git") && printf 'gitdir: %s\\n' $(printf '%q' "$rec") > $(printf '%q' "$d/.git")") ;;
@@ -244,7 +248,7 @@ recovery_guide() {
 #
 # `rec` is that record, so the printed repair is exact rather than a template.
 unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the record, two lines per entry
-  local hub="$1" r dir raw out="" records mark bad=0 resolved="" nl=$'\n' tab=$'\t' 
+  local hub="$1" r dir raw out="" records mark bad=0 resolved="" up=0 nl=$'\n' tab=$'\t' 
   records="$(git -C "$hub" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$hub/.git")"
   for r in "$records"/worktrees/*/; do
     [[ -d "$r" ]] || continue
@@ -278,40 +282,46 @@ unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the reco
     # canonicalization below, which is lossy for a path that ends in a newline: a directory that
     # is genuinely gone must not be reported as an uncarryable entry forever.
     if [[ "$mark" == "T" && ! -d "$dir" ]]; then continue; fi
-    # TRANSPORT SAFETY, BEFORE canonicalization. `$( … )` strips TRAILING newlines, so a
-    # worktree whose path ends in LF would be canonicalized into a path that does not exist,
-    # dropped by the gate above, and reported as PASS — while git resolves it to the hub and
-    # commits there land on the hub's branch (measured: the hub's own main moved). Git sanitizes
-    # the record DIRECTORY name for such a path, so a guard keyed on the record cannot see it;
-    # the derived path is the only place the newline is visible. Such an entry is REPORTED, not
-    # repaired: it cannot ride in the line-oriented transport.
-    if [[ "$r" == *$'\n'* || "$dir" == *$'\n'* ]]; then bad=$((bad + 1)); continue; fi
-    # Canonicalize EVERY directory, not just relative records: git's record and the hub's
-    # `$repo` (derived from a logical pwd) otherwise live in different canonical domains, and
-    # the guide's "is this inside the hub?" test would misclassify an in-hub worktree.
-    if [[ -n "$dir" ]]; then
-      dir="$( (cd "$dir" 2>/dev/null && pwd -P) || printf '%s' "$dir" )"
-    fi
     if [[ "$mark" == "T" ]]; then
       # HEALTH IS RESOLUTION, NOT EXISTENCE (#1410, measured). A `.git` that is PRESENT but
       # is not this worktree's admin dir — a file naming another gitdir, a symlink to the
       # hub's, an empty or junk DIRECTORY — still leaves git resolving the directory to the
       # hub, where commits and pushes land on the hub's branch with no error. Ask git the
       # question it will actually answer: which git dir does THIS directory resolve to?
+      # Run against the path as recorded, BEFORE canonicalization: `$( … )` strips TRAILING
+      # newlines, and a directory whose name ends in one is healthy in git's eyes — checking
+      # health only after canonicalization reported such a worktree forever (measured).
       resolved="$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" || resolved=""
       resolved="$( (cd "$resolved" 2>/dev/null && pwd -P) || printf '%s' "$resolved" )"
+      # `up` is git's own answer to "does this directory fall through to the hub?", carried to
+      # the guide so the warning names the branch the commits would really land on: a worktree
+      # inside a nested repo under the hub resolves to THAT repo, not to the hub.
+      up=0
+      [[ "$resolved" == "$records" || -z "$resolved" ]] && up=1
       [[ "$resolved" == "$r" ]] && continue    # healthy: it resolves to its own record
-      # The link is wrong. When an entry EXISTS it is reported (`X`), never repaired blind:
-      # the printed repair's `rm -f` is what makes the write safe (a bare `>` would FOLLOW a
-      # symlink and create the link at its target, in an unrelated directory). `-L` is
-      # required as well as `-e`: a DANGLING symlink fails `-e` (which follows the link), and
-      # measured, that is exactly the shape that let the bare write through to its target.
+    fi
+    # TRANSPORT SAFETY, before canonicalization and only for an entry that is unhealthy: such
+    # an entry cannot ride the line-oriented transport, so it is COUNTED and reported instead of
+    # being dropped. (A healthy newline path never reaches this point.)
+    if [[ "$r" == *$'\n'* || "$dir" == *$'\n'* ]]; then bad=$((bad + 1)); continue; fi
+    # Canonicalize EVERY directory, not just relative records: git's record and the hub's
+    # `$repo` (derived from a logical pwd) otherwise live in different canonical domains, and
+    # the path comparisons below would misclassify an in-hub worktree.
+    if [[ -n "$dir" ]]; then
+      dir="$( (cd "$dir" 2>/dev/null && pwd -P) || printf '%s' "$dir" )"
+    fi
+    if [[ "$mark" == "T" ]]; then
+      # A wrong link that EXISTS is reported (`X`), never repaired blind: the printed repair's
+      # `rm -f` is what makes the write safe (a bare `>` would FOLLOW a symlink and create the
+      # link at its target, in an unrelated directory). `-L` is required as well as `-e`: a
+      # DANGLING symlink fails `-e` (which follows the link), and measured, that is exactly the
+      # shape that let the bare write through to its target.
       if [[ -e "${dir}/.git" || -L "${dir}/.git" ]]; then mark="X"; fi
     fi
     # $nl/$tab keep the separator out of the nested quoting above (a `$'\n'` inside
     # `${x:+...}` is literal text, not a newline — it must not ride in the transport).
     if [[ "$mark" == "M" ]]; then out="${out}${out:+$nl}M${tab}${nl}${r}"
-    else out="${out}${out:+$nl}${mark}${tab}${dir}${nl}${r}"; fi
+    else out="${out}${out:+$nl}${mark}${up}${tab}${dir}${nl}${r}"; fi
   done
   [[ "$bad" -gt 0 ]] && out="!${bad}${out:+$nl}${out}"
   printf '%s' "$out"
@@ -356,7 +366,9 @@ REPOS=()
 GH_REPORT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo) REPOS+=("${2:-}"); shift 2 ;;
+    # A missing value must be a usage error (exit 2, with the header) rather than a silent
+    # `shift 2` failure under `set -e`, which exits 1 with no output at all.
+    --repo) [[ $# -ge 2 ]] || usage; REPOS+=("$2"); shift 2 ;;
     --gh-report) GH_REPORT=1; shift ;;
     -h|--help) usage ;;
     *) usage ;;

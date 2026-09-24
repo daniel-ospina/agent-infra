@@ -605,7 +605,10 @@ git -C "$HW" worktree add -q "$WOUTSIDE" -b outside1410 HEAD
 rm -f "$WOUTSIDE/.git"
 out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "a worktree outside the hub with no link is still flagged"
-assert_contains "$out" "sits OUTSIDE this hub" "…and the hazard is stated per-directory"
+# The sentence follows GIT'S answer, so an out-of-hub offender must not be told its commits
+# would land on the hub's branch.
+assert_contains "$out" "does NOT fall through to" "…and the hazard is stated per-directory"
+assert_not_contains "$out" "resolves it UP to this hub" "…without claiming the hub's branch"
 apply_repair "$out" 2>/dev/null || true
 assert_contains "$(git -C "$WOUTSIDE" rev-parse --show-toplevel 2>/dev/null)" "$WOUTSIDE" \
   "…and its repair works too"
@@ -700,11 +703,50 @@ printf '%s\n' "$HW/.git" > "$HW/.git/worktrees/wtroot1410/gitdir"
 out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "a record naming the hub's own gitdir is reported"
 assert_contains "$out" "resolves it UP to this hub" "…with the hub-alias sentence"
-# The inverted claim is the defect: the hub root DOES resolve up to the hub, so a run whose only
-# offender is this one must not print the outside sentence at all.
-assert_not_contains "$out" "sits OUTSIDE this hub" "…and not the outside sentence"
+# The inverted claim is the defect: the hub root DOES resolve up to the hub.
+assert_not_contains "$out" "does NOT fall through to" "…and not the not-falling-through sentence"
 printf '%s\n' "$WROOT/.git" > "$HW/.git/worktrees/wtroot1410/gitdir"
 printf 'gitdir: %s\n' "$HW/.git/worktrees/wtroot1410" > "$WROOT/.git"
+
+# 10m. A worktree inside a NESTED repo under the hub resolves to THAT repo, not to the hub, so
+# naming the hub's branch there is false. The sentence must follow git's own answer rather than
+# the path prefix (`<hub>/inner/...` is under the hub by any prefix test).
+INNER="$HW/inner1410"
+git init -q -b main "$INNER"
+git -C "$INNER" config user.email t@t
+git -C "$INNER" config user.name t
+touch "$INNER/b.txt"
+git -C "$INNER" add .
+git -C "$INNER" commit -qm inner
+WINNER="$INNER/wti1410"
+# Registered by the HUB (that is what puts it in the hub's records) at a path inside the nested
+# repo — so with its link gone, git walks up to the INNER repo, not to the hub.
+git -C "$HW" worktree add -q "$WINNER" -b wti1410 HEAD
+rm -f "$WINNER/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree inside a NESTED repo under the hub is reported"
+assert_contains "$out" "does NOT fall through to" "…and is not told it resolves to the HUB's branch"
+assert_not_contains "$out" "resolves it UP to this hub" "…so the hub-alias sentence is absent"
+rm -rf "$INNER"
+git -C "$HW" worktree prune >/dev/null 2>&1 || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the hub returns to PASS once that tree is gone (fixture cleanup)"
+
+# 10n. A healthy worktree whose path contains a newline must NOT red the hub: git accepts it, so
+# reporting it would leave no route back (the transport cannot carry the path, but health is
+# decided BEFORE the transport, on the path as recorded).
+WOKNL="$HW/.worktrees/wtoknl1410"$'\n'
+git -C "$HW" worktree add -q "$WOKNL" -b wtoknl1410 HEAD
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a HEALTHY worktree with a newline in its path still PASSes"
+rm -rf "$WOKNL"
+git -C "$HW" worktree prune >/dev/null 2>&1 || true
+
+# 10o. A missing value for --repo is a USAGE error (exit 2, with the header), not a silent
+# `shift 2` failure under `set -e` that exits 1 with no output at all.
+out="$(bash "$CHECK" --repo 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 2 "--repo with no value exits 2 (usage), not 1"
+assert_contains "$out" "worktree_unlinked" "…and prints the usage header"
 
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
