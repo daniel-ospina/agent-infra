@@ -197,12 +197,7 @@ run_blocks() {
     # Called on a dedent, in END, and BEFORE a new block starts: two consecutive `run: >` steps
     # otherwise dropped the first one entirely (a fail-open, reproduced by the bug-scan reviewer).
     function flushacc() {
-      if (nacc > 0) {
-        joined = acc[1]
-        for (kk = 2; kk <= nacc; kk++) joined = joined acc[kk]
-        print joined
-        nacc = 0
-      }
+      if (hasfold) { print folded; folded = ""; hasfold = 0 }
     }
     {
       line = $0
@@ -224,6 +219,7 @@ run_blocks() {
       if (isstep && body ~ ("^-? *" q "run" q " *: *[|>]")) {
         flushacc()
         inblk = 1; blk_indent = indent; blk_fold = (body ~ /[>]/)
+        nacc = 0
         next
       }
       if (isstep && body ~ ("^-? *" q "run" q " *:")) {
@@ -240,14 +236,25 @@ run_blocks() {
         next
       }
       if (inblk) {
-        if (line ~ /^[ ]*$/) { if (!blk_fold) print ""; next }
+        if (line ~ /^[ ]*$/) {
+          if (blk_fold) { if (hasfold) { folded = folded "\n"; hasfold = 1 } }
+          else print ""
+          next
+        }
         if (indent > blk_indent) {
           # A folded scalar (`run: >`) joins its lines into ONE command, so emitting them as
           # separate lines let `run: >` + a bare call + `--list` on the next line read as a bare
           # call while YAML would run `runner --list` — zero shards, guard green. Folded content
           # is joined here; a literal block (`|`) keeps its lines.
-          if (blk_fold) { nacc++; acc[nacc] = substr(line, blk_indent + 1) }
-          else print line
+          # YAML `>` folds a single line break into a SPACE and keeps a BLANK line as a
+          # newline, so a blank line inside a folded block separates two commands. Joining
+          # everything blindly turned `echo hi` / blank / bare call into one line with no call in
+          # it (a false block), and call / blank / echo into a fake flag tail (a false refusal).
+          if (blk_fold) {
+            if (nacc == 0) { folded = substr(line, blk_indent + 1); hasfold = 1 }
+            else { folded = folded " " substr(line, blk_indent + 1); hasfold = 1 }
+            nacc++
+          } else print line
           next
         }
         flushacc()
@@ -435,7 +442,7 @@ pr_block="$(awk '
     if ($0 != "" && firstc != "#" && ind <= pi) f = 0
     if (f) print
   }
-' "$PR_WORKFLOW" | grep -v '^[[:space:]]*#')"
+' "$PR_WORKFLOW" | strip_noise)"
 # The slice stops at the next key at the SAME indentation as `pull_request:` — not at the next
 # column-0 key. Otherwise a sibling `push:` block that legitimately filters paths would be read
 # as narrowing the pull_request trigger (a false block, reproduced by the bug-scan reviewer).

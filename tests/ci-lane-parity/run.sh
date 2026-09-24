@@ -880,16 +880,53 @@ else
   fail "two consecutive folded steps returned rc $RC (want 2): $OUT"
 fi
 
+# The control makes the FIRST fold the only matching call, so losing it changes the verdict: with
+# the second fold carrying only `echo done`, the pre-fix guard dropped the bare call and returned
+# rc 1 while this asserted rc 0. (An earlier version put the call in the SECOND fold too, so it
+# passed even when the first was dropped — a vacuous assertion, found by the bug-scan reviewer.)
 awk '
-  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; pend = 1; next }
+  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "      - run: >"; print "          echo done"; pend = 1; next }
   pend && /^        run: bash scripts\/run-bash-shards\.sh$/ { pend = 0; next }
   { print }
 ' "$PR" >"$TMP/ci-pr-twofoldok.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-twofoldok.yml"
 if [ "$RC" -eq 0 ]; then
-  pass "two consecutive bare folded steps are both read (no false block from the flush)"
+  pass "two consecutive folded steps: the FIRST one's bare call is still read"
 else
-  fail "two bare folded steps returned rc $RC (want 0): $OUT"
+  fail "the first folded step was lost (rc $RC, want 0): $OUT"
+fi
+
+echo ""
+echo "8ak. A TRAILING COMMENT mentioning paths: → rc 0 (a comment is not a filter)"
+awk '{ if ($0 ~ /^  pull_request:$/) { print "  pull_request:  # no paths: filter"; next } print }' \
+  "$PR" >"$TMP/ci-pr-trailcomment.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-trailcomment.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a trailing comment mentioning 'paths:' does not read as a narrowing filter"
+else
+  fail "a trailing comment mentioning 'paths:' was read as a filter (rc $RC): $OUT"
+fi
+
+echo ""
+echo "8al. A BLANK LINE inside `run: >` separates commands (YAML keeps it as a newline)"
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: >"; print "          echo hi"; print ""; print "          bash scripts/run-bash-shards.sh"; next } print }' \
+  "$PR" >"$TMP/ci-pr-foldblank.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-foldblank.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a blank line before the call does not hide it (echo hi / blank / call)"
+else
+  fail "a folded block with a leading blank line returned rc $RC (want 0): $OUT"
+fi
+
+awk -v r="        run: bash scripts/run-bash-shards.sh" \
+  '{ if ($0 == r) { print "        run: >"; print "          bash scripts/run-bash-shards.sh"; print ""; print "          echo done"; next } print }' \
+  "$PR" >"$TMP/ci-pr-foldblank2.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-foldblank2.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "a blank line after the call does not invent a flag tail (call / blank / echo done)"
+else
+  fail "a folded block with a trailing blank line returned rc $RC (want 0): $OUT"
 fi
 
 echo ""
