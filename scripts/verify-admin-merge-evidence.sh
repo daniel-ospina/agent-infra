@@ -107,32 +107,36 @@ esac
 # review of the retired implementation). The tolerance is carried over, not
 # re-invented.
 #
+# `lane parity: PR ⊇ main` IS SHAPE-CHECKED WITH ITS SEPARATOR, not as a prefix. A
+# confirming review found that a prefix test accepts a line that NEGATES parity —
+# `lane parity: PR ⊇ main is NOT established — this head did NOT execute every
+# shard` — and certified a vacuous body, which is the #1319 fail-open this clause
+# exists to close. The producer's positive value is
+# `PR ⊇ main — the PR executed every test shard…` (built at admin-merge.sh:3354), so
+# the em dash is required: a negation cannot follow it. §6 pins that spelling in the
+# producer, so the two move together or the pin reddens first.
+#
 # VACUITY IS DERIVED FROM THE COUNTS, NOT FROM THE PRODUCER'S DESCRIPTIVE LINE, and
 # this is a fail-open that BOTH reviewers of the first revision reproduced
 # independently. Clause 5 originally treated a body as vacuous when it contained
 # `measured sets: PR failing` — a line whose only role is to DESCRIBE the state. A
 # body stating the same zeros (`PR failing: 0 | main failing: 0`) with that one line
 # deleted, renamed or reformatted therefore certified with NO parity statement at
-# all — including `lane parity: NOT ESTABLISHED`, the exact #1319 / tortoise #4263
-# wrong-lane fail-open this clause exists to close. A requirement keyed on a
-# deletable DESCRIPTION is a requirement an editor can delete; the two zeros are the
-# condition itself, so the counts are what is tested.
+# all. A requirement keyed on a deletable DESCRIPTION is a requirement an editor can
+# delete; the two zeros are the condition itself, so the counts are what is tested.
 #
 # THE COUNTS ARE CANONICAL, and that is not pedantry: a second review round found
 # that `PR failing: 00 | main failing: 0` satisfied a `[0-9]+` count while MISSING a
 # literal-`0` vacuity test, so a semantically vacuous body certified with no parity
-# line — the same fail-open as the descriptive-line defect, reachable by a
-# one-character edit. `(0|[1-9][0-9]*)` is the spelling an integer HAS (`%s` of a
-# computed count never carries a leading zero, admin-merge.sh:2250), so a
-# non-canonical zero is refused by clause 4 outright, and the vacuity test below is
-# written `0+` as a second, independent line of defence against that class.
+# line. `(0|[1-9][0-9]*)` is the spelling an integer HAS (`%s` of a computed count
+# never carries a leading zero, admin-merge.sh:2250), and the vacuity test is
+# additionally written `0+` as a second, independent line of defence.
 #
 # `contains("<!-- admin-merge-safety: ")` is kept WITHOUT the head on purpose: it is
 # the literal the drift-pin extracts and checks against a REAL capture, and the
 # head-bound literals are substituted at runtime so they cannot be pinned that way.
-# The STATIC prefixes of those head-bound literals (`<!-- admin-merge-safety: `,
-# `PR head: `) ARE pinned — against the producer, in the suite's §6, because a
-# committed capture cannot notice a later producer move.
+# The STATIC parts of those head-bound literals are pinned against the producer's
+# evidence emission in the suite's §6.
 #
 # The refusal vocabulary (`CLIPPED`, `NOT COMPARABLE`, `UNATTRIBUTABLE`) is
 # deliberately NOT matched: the attribution area prints those words as
@@ -144,7 +148,7 @@ CLAUSE_FILTER='(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
   and (test("main compared \\(union of [0-9]+ runs?( of .+)?\\):"))
   and (test("PR failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*main failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*blocked by the decision:\\s*0([ \\t\\r\\n]|$)"))
   and (test("PR=0 \\| main=0\\.([ \\t\\r\\n]|$)"))
-  and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not) or test("(^|\\n)[ \\t]*lane parity: PR ⊇ main"))'
+  and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not) or test("(^|\\n)[ \\t]*lane parity: PR ⊇ main —"))'
 jq_program='[ .comments[].body | select('"$CLAUSE_FILTER"') ] | length'
 
 if [ -n "$BODY_FILE" ]; then

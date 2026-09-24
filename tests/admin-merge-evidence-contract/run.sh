@@ -27,14 +27,17 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 # The versions under test default to this worktree. Both are overridable so the
 # suite can be pointed at the PRE-FIX revision and shown to REDDEN — that is how
-# the coverage claim is DEMONSTRATED rather than asserted:
+# the coverage claim is MEASURED rather than asserted:
 #   VERIFIER_UNDER_TEST=$(git show <base>:scripts/verify-admin-merge-evidence.sh) …
-# It reddens 5 of its assertions against origin/main, and those 5 are the honest
-# extent of what any suite can show against a gate that refuses everything: a
+# Measured against origin/main, with BOTH overrides: 6 assertions redden — the
+# non-vacuous positive, the vacuous+parity positive, the literal extraction, the
+# retired-claim pin (which now FAILS CLOSED on an empty extraction instead of
+# passing vacuously) and the two clause-6 pins. With the VERIFIER override alone it
+# is 4: the clause-6 pins test the TS gate, which the verifier override does not swap.
+# The per-class mutation tests are provable only against the CURRENT revision: a
 # pre-fix gate that refuses EVERY body carrying the new vocabulary cannot
-# distinguish a mutation from a legitimate body, so the per-class mutation tests
-# are provable only against the CURRENT revision. The classes are covered by
-# tests that FAIL against the fix they belong to, which is stated in the PR body.
+# distinguish a mutation from a legitimate body. That is stated in the PR body
+# rather than dressed up as "every class fails before its fix".
 VERIFIER="${VERIFIER_UNDER_TEST:-$ROOT/scripts/verify-admin-merge-evidence.sh}"
 TS_GATE="${TS_GATE_UNDER_TEST:-$ROOT/extensions/review-enforcer/index.ts}"
 PRODUCER="$ROOT/scripts/admin-merge.sh"
@@ -112,6 +115,17 @@ if certifies "$TMP/m-attr.md"; then bad "a CLIPPED set (PR=2) still CERTIFIED (c
 # (c) remove the parity line from the vacuous case.
 grep -v 'lane parity: PR ⊇ main' "$TMP/vac-par.md" > "$TMP/m-parity.md"
 if certifies "$TMP/m-parity.md"; then bad "vacuous WITHOUT parity still CERTIFIED (clause 5 fail-open)"; else ok "mutation: vacuous without parity refuses"; fi
+# (c2) …and a parity line that NEGATES parity must not certify either. A confirming
+#      review reproduced this against the earlier PREFIX test: `lane parity: PR ⊇ main
+#      is NOT established` matched `^(...)[ \t]*lane parity: PR ⊇ main`, so a vacuous
+#      body with an explicitly negated parity claim certified — the #1319 wrong-lane
+#      fail-open. The value is now shape-checked with its em dash.
+sed 's/^   lane parity: .*/   lane parity: PR ⊇ main is NOT established — this head did NOT execute every shard/' "$NEG" > "$TMP/m-parity-negated.md"
+if grep -q 'PR ⊇ main is NOT established' "$TMP/m-parity-negated.md"; then
+  if certifies "$TMP/m-parity-negated.md"; then bad "a NEGATED parity line ('PR ⊇ main is NOT established') CERTIFIED (clause 5 fail-open — the parity value is not shape-checked)"; else ok "mutation: a NEGATED parity line refuses (the parity value is shape-checked, not a prefix)"; fi
+else
+  bad "the negated-parity mutation did not apply, so it proves nothing"
+fi
 # (d) the marker — an unrelated body must not certify.
 grep -v 'admin-merge-safety' "$POS" > "$TMP/m-marker.md"
 if certifies "$TMP/m-marker.md"; then bad "a body with NO marker CERTIFIED"; else ok "mutation: no marker refuses"; fi
@@ -180,7 +194,7 @@ while IFS= read -r lit; do
   fi
 done <<< "$LITS"
 
-# ── 6. DRIFT-PIN — every STATIC literal the filter requires must exist in the
+# ── 6. DRIFT-PIN — every static literal the filter requires must exist in the
 # producer's evidence EMISSION.
 #
 # THIS SECTION EXISTS BECAUSE A COMMITTED CAPTURE CANNOT NOTICE A LATER PRODUCER
@@ -189,57 +203,122 @@ done <<< "$LITS"
 # a stale fixture: the six-day outage all over again. The literals are therefore
 # pinned against the producer itself.
 #
-# SCOPED TO THE EMISSION BLOCK, NOT THE FILE, and that scoping is the fix for a gap
-# a review round reproduced: a file-wide grep is satisfied by the producer's PROSE.
-# `main failing:`, `PR failing:` and `blocked by the decision: 0` all appear in the
-# producer's comments and in its log lines (e.g. :257, :2667, :3421), so renaming
-# the ONE line that posts evidence left this section green while the gate would have
-# refused every real certificate — every admin merge blocked fleet-wide with all
-# suites green, which is the failure this whole change is about. The evidence body
-# is built by `build_evidence()`, so that is what is searched.
+# SCOPED TO THE EMISSION, AND COMPLETE — both of which were review findings. An
+# earlier version grepped the producer FILE, where the same strings occur in prose
+# and log lines (:257, :2667, :3421), so renaming the ONE line that posts evidence
+# left it green. Scoping it to `build_evidence()` fixed that, but the scoped list was
+# still INCOMPLETE: the run-word (`runs?`), the ` | ` and `):` separators, and the
+# marker's ` -->` close were required by the filter and pinned by nothing, so a
+# producer rename of any of them left every suite green while the gate refused every
+# real certificate. The pins are now the producer's TEMPLATES, so a rename of any
+# part of a line the gate depends on is visible here.
 #
-# The same reproduction also showed the marker pin was loose by one character:
-# grepping `<!-- admin-merge-safety` accepted a rename to
-# `<!-- admin-merge-safety-X `. The pin now includes the `: ` suffix.
+# …and the pin is pinned: the self-test iterates over EVERY requirement and requires
+# the pin to catch each one renamed. (The earlier self-test renamed a single
+# literal, so deleting any other from the list would have gone unnoticed.)
 #
-# The parity pair is pinned at its own two sites — the assignment that builds the
-# positive value and the line that emits it — because neither lives in
-# `build_evidence()`.
+# WHAT IS *NOT* PINNED HERE, stated so the claim is not wider than the checks: the
+# two parity sites and the attribution line live outside `build_evidence()` and are
+# pinned individually below. The token cross-check at the end is a weaker,
+# mechanical sweep of the filter's own vocabulary.
 emission_block() { sed -n '/^build_evidence()/,/^}/p' "$1"; }
+# The paris emission lives in `main()`, inside the VACUOUS block's `analyzed=`
+# assignment. Scoped by that block rather than the whole file because a sibling
+# `info` line (:3418) carries the same string — renaming only the EVIDENCE line while
+# the log line keeps the old spelling is exactly the masking a review reproduced.
+parity_block() {
+  # From the `analyzed=` assignment that carries `lane parity:` through the line that
+  # closes the string (the closing `"` may be appended to the last content line, so
+  # the block ends where a line ENDS with a quote, not where one equals one).
+  awk '/analyzed="\$analyzed$/{inb=1; buf=""; next} inb{buf=buf $0 ORS; if (substr($0, length($0), 1)=="\""){ if (index(buf,"lane parity: ")>0){ printf "%s", buf; exit } inb=0 }}' "$1"
+}
+PIN_EMISSION=(
+  '<!-- admin-merge-safety: %s -->'
+  'PR head: %s'
+  'main compared (union of %s %s of %s): %s'
+  'PR failing: %s | main failing: %s | blocked by the decision: 0'
+)
+PIN_OTHER=(
+  'run_word="runs"'
+  'run_word="run"'
+  'attribution_line="Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=${pr_drops} | main=${main_drops}.'
+)
 producer_pin_missing() {  # prints the first missing requirement, or nothing when OK
-  local f="$1" blk
+  local f="$1" blk lit
   blk="$(emission_block "$f")"
   [ -n "$blk" ] || { printf 'build_evidence() block not found\n'; return; }
-  local lit
-  for lit in '<!-- admin-merge-safety: ' 'PR head: ' 'main compared (union of ' 'PR failing: ' 'main failing: ' 'blocked by the decision: 0'; do
+  for lit in "${PIN_EMISSION[@]}"; do
     if ! printf '%s' "$blk" | grep -qF "$lit"; then printf '%s\n' "$lit"; return; fi
   done
-  grep -qF 'lane parity: $parity_evidence' "$f" || { printf 'lane parity: $parity_evidence\n'; return; }
-  grep -qF 'parity_evidence="PR ⊇ main' "$f" || { printf 'parity_evidence="PR ⊇ main\n'; return; }
-  # The attribution clause requires `PR=0 | main=0.`; its static shape is built in
-  # `attribution_line`, so it is pinned there rather than by a file-wide grep.
-  grep -qF 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=${pr_drops} | main=${main_drops}.' "$f" \
-    || { printf 'the attribution line\n'; return; }
+  for lit in "${PIN_OTHER[@]}"; do
+    if ! grep -qF "$lit" "$f"; then printf '%s\n' "$lit"; return; fi
+  done
+  if ! parity_block "$f" | grep -qF 'lane parity: $parity_evidence'; then
+    printf '%s\n' 'lane parity: $parity_evidence (in the vacuous block)'
+  fi
 }
 if miss="$(producer_pin_missing "$PRODUCER")"; [ -z "$miss" ]; then
   ok "every static literal the filter requires is present in the producer's evidence EMISSION"
 else
   bad "the gate requires '$miss' and the producer's evidence emission no longer contains it (the #1388 class — a committed capture cannot notice this)"
 fi
-# …and the pin is pinned: a renamed EMISSION (not prose) must be caught by it.
-# This is the reviewer's reproduction, kept as a test so the looseness cannot return.
-sed 's/PR failing: %s | main failing: %s/PR failing: %s | main failure: %s/' "$PRODUCER" > "$TMP/producer-renamed.sh"
-if ! grep -qF 'main failure: %s' "$TMP/producer-renamed.sh"; then
-  bad "the renamed-emission mutation did not apply, so the self-test below proves nothing"
-elif [ -n "$(producer_pin_missing "$TMP/producer-renamed.sh")" ]; then
-  ok "the producer pin CATCHES a renamed emission ('$(producer_pin_missing "$TMP/producer-renamed.sh" | head -1)')"
-else
-  bad "the producer pin MISSES a renamed evidence emission — a file-wide grep would too (a reviewer reproduced exactly this)"
-fi
+# The self-test: EVERY pinned requirement, renamed EVERYWHERE in a copy, must be
+# caught. (A single-occurrence rename is not enough: a string carried by a sibling
+# log line would still satisfy a file-wide grep, and the first version of this
+# self-test was fooled by exactly that.)
+MUTN=0
+for lit in "${PIN_EMISSION[@]}" "${PIN_OTHER[@]}" 'lane parity: $parity_evidence'; do
+  MUTN=$((MUTN+1))
+  cp "$PRODUCER" "$TMP/producer-mut.sh"
+  python3 - "$TMP/producer-mut.sh" "$lit" <<'PY'
+import sys
+path, lit = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+if lit not in text:
+    sys.exit(3)
+open(path, "w", encoding="utf-8").write(text.replace(lit, lit[0] + "X" + lit[1:]))
+PY
+  if [ $? -ne 0 ]; then
+    bad "the mutation for '$lit' could not be applied, so its self-test proves nothing"
+    continue
+  fi
+  if [ -n "$(producer_pin_missing "$TMP/producer-mut.sh")" ]; then
+    ok "the producer pin CATCHES a renamed: ${lit:0:44}"
+  else
+    bad "the producer pin MISSES a renamed '$lit' — a reviewer reproduced exactly this class"
+  fi
+done
+# The token cross-check: every word inside the FILTER's own patterns must still
+# exist in the producer. Weaker than the template pins (it is file-wide), but it
+# sweeps EVERY word — `runs` -> `executions`, `parity` -> `alignment` — rather than
+# only the templates above. Only the quoted pattern arguments are tokenised; the
+# assignment's own names (CLAUSE/jq_program/comments) are the gate's, not the
+# producer's, and would be false alarms.
+FILTER_TOKENS="$(sed -n '/^CLAUSE_FILTER=/,/^jq_program=/p' "$VERIFIER" | grep -oE '(contains|test)\("[^"]*"' | grep -oE '[A-Za-z]{4,}' | sort -u | grep -vxE 'contains|test')"
+TOKN=0
+while IFS= read -r tok; do
+  [ -n "$tok" ] || continue
+  TOKN=$((TOKN+1))
+  if grep -qF "$tok" "$PRODUCER"; then
+    ok "the producer still carries a word the filter depends on: $tok"
+  else
+    bad "the filter's pattern depends on '$tok' and the producer no longer carries it (the #1388 class)"
+  fi
+done <<< "$FILTER_TOKENS"
+echo "    (producer pin: $MUTN requirements, each mutation-tested; token cross-check: $TOKN tokens)"
 # Scope to the CLAUSE FILTER, not the file: the verifier's comments DISCUSS the
 # retired name to explain the rename, so a file-wide grep reports it as still
 # required. Only the filter decides what is accepted.
-if printf '%s\n' "$LITS" | grep -qxF 'unique to this PR: 0'; then
+#
+# FAIL CLOSED when nothing could be extracted: without this the assertion reads
+# GREEN against a verifier that has no `CLAUSE_FILTER=` assignment at all — i.e.
+# against the pre-fix gate that requires the retired clause — because an empty
+# `$LITS` makes the `grep -qxF` false. A confirming review caught that: the claim
+# "the gate does not require 'unique to this PR: 0'" was passing vacuously exactly
+# when it was FALSE.
+if [ -z "$LITS" ]; then
+  bad "no literal could be extracted from the CLAUSE_FILTER, so 'the gate does not require the retired claim' cannot be evaluated — failing closed (this is what the pre-fix gate looks like)"
+elif printf '%s\n' "$LITS" | grep -qxF 'unique to this PR: 0'; then
   bad "the gate went back to requiring 'unique to this PR: 0' — the claim the producer cannot prove: #1319 fail-open"
 else
   ok "the gate does NOT require the retired, stronger claim ('unique to this PR: 0')"
