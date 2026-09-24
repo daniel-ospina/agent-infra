@@ -146,6 +146,126 @@ else
 fi
 # (b) the attribution count — a dropped token means a CLIPPED set, not a measured zero.
 sed 's/PR=0 | main=0/PR=2 | main=0/' "$POS" > "$TMP/m-attr.md"
+
+# (b2) THE ATTRIBUTION MUST BE A LINE, NOT A SUBSTRING (#1450). The clause required
+#      `PR=0 | main=<n>.` to appear SOMEWHERE in the body, so a body whose attribution
+#      line was replaced by prose that merely mentions those characters still certified.
+#      Three shapes are pinned. TWO of them were reachable against the pre-fix clause —
+#      a line that merely STARTS with the counts, and a prose line that ENDS with them
+#      (the latter is the shape a line-END-only anchor would still accept, which is why
+#      the framing is required on the same line as well). The third — counts followed by
+#      a quote — was ALREADY refused by the pre-fix clause's bounded continuation, so it
+#      is pinned here as a contract assertion, NOT as coverage of this defect (#1450). The line is matched as a `split("\n")` element, not with a
+#      flag-based anchor, because Oniguruma (offline) and Go/RE2 (live) disagree about
+#      what `(?m)` means — the divergence class §8 exists for.
+ATTR_LINE='Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.'
+for m in "$POS" "$TMP/vac-par.md"; do
+  case "$m" in /*) src="$m" ;; *) src="$TMP/$m" ;; esac
+  base="$(basename "$src" .md)"
+  if ! grep -qF -- "$ATTR_LINE" "$src"; then
+    bad "the attribution mutation's source ($m) carries no producer attribution line to replace, so its mutations prove nothing"
+    continue
+  fi
+  python3 - "$src" "$TMP/m-attr-prose-quoted-$base.md" "$ATTR_LINE" <<'PYEOF'
+import pathlib, sys
+src, dst, line = sys.argv[1], sys.argv[2], sys.argv[3]
+text = pathlib.Path(src).read_text(encoding="utf-8")
+assert line in text, "attribution line missing"
+pathlib.Path(dst).write_text(text.replace(line, 'NOTE: the producer prints an attribution whose tail looks like "PR=0 | main=0." on a clean run.'), encoding="utf-8")
+PYEOF
+  if certifies "$TMP/m-attr-prose-quoted-$base.md"; then
+    bad "a body whose attribution was replaced by PROSE quoting the counts CERTIFIED (clause 5 is unanchored — #1450)"
+  else
+    ok "mutation: counts followed by a quote (not a line end) do not satisfy the attribution ($base)"
+  fi
+  python3 - "$src" "$TMP/m-attr-planted-$base.md" "$ATTR_LINE" <<'PYEOF'
+import pathlib, sys
+src, dst, line = sys.argv[1], sys.argv[2], sys.argv[3]
+text = pathlib.Path(src).read_text(encoding="utf-8")
+pathlib.Path(dst).write_text(text.replace(line, "PR=0 | main=0. was the observed tail of a line the producer printed."), encoding="utf-8")
+PYEOF
+  if certifies "$TMP/m-attr-planted-$base.md"; then
+    bad "a line that merely STARTS with the counts CERTIFIED as the attribution (clause 5 is unanchored — #1450)"
+  else
+    ok "mutation: a line starting with the counts is not the attribution ($base)"
+  fi
+  python3 - "$src" "$TMP/m-attr-prose-tail-$base.md" "$ATTR_LINE" <<'PYEOF'
+import pathlib, sys
+src, dst, line = sys.argv[1], sys.argv[2], sys.argv[3]
+text = pathlib.Path(src).read_text(encoding="utf-8")
+pathlib.Path(dst).write_text(text.replace(line, "A quoted claim in prose reads: Attribution — FAILED tokens DROPPED by the parser: PR=0 | main=0."), encoding="utf-8")
+PYEOF
+  if certifies "$TMP/m-attr-prose-tail-$base.md"; then
+    bad "a PROSE line ENDING with the counts CERTIFIED as the attribution (a line-END-only anchor is not enough — #1450)"
+  else
+    ok "mutation: a prose line ending with the counts is not the attribution ($base)"
+  fi
+done
+# (b3) …and the guard must not over-block: the producer's own line, INDENTED, is still
+#      the producer's line (the emitted comment may nest the block), so it certifies.
+python3 - "$POS" "$TMP/m-attr-indented.md" "$ATTR_LINE" <<'PYEOF'
+import pathlib, sys
+src, dst, line = sys.argv[1], sys.argv[2], sys.argv[3]
+text = pathlib.Path(src).read_text(encoding="utf-8")
+pathlib.Path(dst).write_text(text.replace(line, "    " + line), encoding="utf-8")
+PYEOF
+if certifies "$TMP/m-attr-indented.md"; then
+  ok "an INDENTED producer attribution line still certifies (no over-block from the anchoring)"
+else
+  bad "an indented producer attribution line was REFUSED — the anchoring over-blocks a plausible emission"
+fi
+
+# (b4) A REVIEW'S THREE FINDINGS, EACH PINNED. The first anchoring attempt allowed a
+#      line that merely CONTAINED the two framing words and ended with the counts, read
+#      the LAST counts on the line, and accepted any character between the framing and
+#      the counts. Each shape below certified against that revision and must refuse now:
+#        * prose that happens to contain `Attribution` … `tokens DROPPED` … counts;
+#        * a CLIPPED set (`PR=3`) masked by appending a valid counts tail —
+#          `[^\n]*` is greedy, so the trailing `PR=0` won;
+#        * a planted valid line alongside a clipped real one (the guard was existential);
+#        * a control character between the framing and the counts (a NUL is stripped by
+#          the shell before the filter sees it, so the probe uses SOH, which is not).
+attr_case() {  # attr_case <name> <python-replacement> <expectation: refuse|certify>
+  python3 - "$POS" "$TMP/m-attr-$1.md" "$ATTR_LINE" "$2" <<'PYEOF'
+import pathlib, sys
+src, dst, line, repl = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+text = pathlib.Path(src).read_text(encoding="utf-8")
+assert line in text, "the producer attribution line is not in the fixture"
+pathlib.Path(dst).write_text(text.replace(line, repl.replace("\\n", "\n").replace("\\x01", "\x01")), encoding="utf-8")
+PYEOF
+  if certifies "$TMP/m-attr-$1.md"; then got=certify; else got=refuse; fi
+  if [ "$got" = "$3" ]; then
+    ok "attribution guard: $1 ($got, as required)"
+  else
+    bad "attribution guard: $1 — expected the body to $3, but it $got"
+  fi
+}
+attr_case loose-framing 'Attribution is a word; the parser tokens DROPPED some, so PR=0 | main=0.' refuse
+attr_case clipped-masked 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=3 | main=0. (reported) PR=0 | main=0.' refuse
+attr_case planted-over-clipped 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=3 | main=0.\nAttribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.' refuse
+attr_case control-char 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): \x01PR=0 | main=0.' refuse
+attr_case indented-real '    Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=0 | main=0.' certify
+
+# (b5) …AND THE SELECTION MUST POLICE EVERY LINE THAT CARRIES THE FRAMING. A first
+#      narrowing excluded control characters from the SELECTION as well as from the
+#      match, so a contradictory attribution line written with a TAB inside its framing
+#      span was never collected and never checked: the REAL line certified the body and
+#      the tab-framing decoy rode along unchecked. The selection is LF-only now; the
+#      exact pattern polices everything it collects, which is where control characters
+#      belong. This decoy is APPENDED (the fixture keeps its real line), because that is
+#      the shape that distinguishes the two revisions — replacing the line outright
+#      refuses on both.
+python3 - "$POS" "$TMP/m-attr-tab-decoy.md" <<'PYEOF'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+decoy = "Attribution — FAILED\ttokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=3 | main=0.\n"
+pathlib.Path(sys.argv[2]).write_text(text + decoy, encoding="utf-8")
+PYEOF
+if certifies "$TMP/m-attr-tab-decoy.md"; then
+  bad "a TAB-framing decoy line rode along unchecked beside the real attribution (the guard's SELECTION is narrower than the claim it polices)"
+else
+  ok "attribution guard: a TAB-framing decoy line is policed too (refuse, as required)"
+fi
 if certifies "$TMP/m-attr.md"; then bad "a CLIPPED set (PR=2) still CERTIFIED (clause 5 fail-open)"; else ok "mutation: a CLIPPED set refuses"; fi
 # (c) remove the parity line from the vacuous case.
 grep -v 'lane parity: PR ⊇ main' "$TMP/vac-par.md" > "$TMP/m-parity.md"
@@ -681,11 +801,20 @@ fi
 # that did not allow a newline before `(` — each leaving this whole suite green while
 # the LIVE path could not compile the filter. So the extractor's own failure modes are
 # pinned here: every case below asserts an output the CURRENT extractor produces, and a
-# regression in any of them reddens. The one limit that remains is stated, not hidden:
-# a regex called through a name outside REGEX_FUNCS is invisible to this scan (the
-# filter uses none, and the live-engine compile below is the backstop for the filter as
-# it exists — it cannot see a call the extractor never found, which is why the count
-# floor above is the guard that a smuggling edit trips first).
+# regression in any of them reddens.
+#
+# "What if a regex is smuggled through a function name this scan does not know?" The
+# scanned set is jq's regex-taking functions, and that set is CLOSED — measured, not
+# assumed: fed a pattern only a regex engine refuses (`(`), `test`, `match`, `capture`,
+# `scan`, `splits`, `sub` and `gsub` each fail with "Regex failure", while `contains`,
+# `startswith`, `endswith`, `index` and `ltrimstr` accept it as literal text, so they
+# cannot carry a regex at all. (`split` is kept in the set deliberately: it took a regex
+# in jq 1.6 and takes a string in 1.7, so checking it is fail-closed across versions.)
+# An alias does not open a way around it either — `def t(x): test(x); … t("(?!x)")`
+# leaves the `test(x)` call in the text, whose non-literal argument is UNCHECKABLE, i.e.
+# red. A name that is not a jq function is a jq compile error. So an unscanned call
+# cannot hide a RE2-rejected regex; the count floor above is what catches a call that
+# vanishes from the extraction.
 scan_case() {  # scan_case <name> <filter-text> <expected-substring>
   printf '%s' "$2" > "$TMP/case-filter.txt"
   case_out="$(python3 "$HERE/filter-patterns.py" "$TMP/case-filter.txt" 2>&1)"
