@@ -149,14 +149,23 @@ else
   bad "the post-em-dash negation mutation did not apply, so it proves nothing"
 fi
 # (c4) …and a body that states the producer's positive sentence and then DISCLAIMS it
-#      (the disclaimer inside the parenthetical the clause tolerates) must refuse too:
-#      the line must END at the sentence, and this is the second guard's job.
-sed 's/^   lane parity: .*/   lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family: ci*; 3 shard(s) — BUT parity was NOT established)/' "$NEG" > "$TMP/m-parity-trap.md"
-if grep -q 'BUT parity was NOT established' "$TMP/m-parity-trap.md"; then
-  if certifies "$TMP/m-parity-trap.md"; then bad "the positive sentence with an appended negation CERTIFIED (clause 5 fail-open)"; else ok "mutation: the positive sentence with an appended disclaimer refuses"; fi
-else
-  bad "the appended-disclaimer mutation did not apply, so it proves nothing"
-fi
+#      — INSIDE the parenthetical the clause tolerates — must refuse too. This is the
+#      third spelling of the same class: the sentence is present, so a sentence-only
+#      check passes, and the parenthetical used to accept any text. Allowed trailing
+#      text is now ENUMERATED (the producer's own parenthetical shape), and the
+#      negation guard is case-insensitive, because a case-sensitive deny-list is
+#      defeated by `Not established` / `not ESTABLISHED` (a review reproduced both).
+for trap_case in \
+  'parity family: test*; 3 shard(s) on the PR side, 3 on main — Not established: this head did NOT execute 1 shard' \
+  'parity family: test*; 3 shard(s) on the PR side, 3 on main; not ESTABLISHED — declared off' \
+  'parity family: test*; 3 shard(s) on the PR side, 3 on main — MISMATCH: this head ran a different lane'; do
+  sed "s|^   lane parity: .*|   lane parity: PR ⊇ main — the PR executed every test shard main's lane executed ($trap_case)|" "$NEG" > "$TMP/m-parity-trap.md"
+  if grep -qF "$trap_case" "$TMP/m-parity-trap.md"; then
+    if certifies "$TMP/m-parity-trap.md"; then bad "the producer's positive sentence with an appended disclaimer CERTIFIED (clause 5 fail-open): $trap_case"; else ok "mutation: the positive sentence with an appended disclaimer refuses"; fi
+  else
+    bad "the appended-disclaimer mutation did not apply, so it proves nothing: $trap_case"
+  fi
+done
 # (d) the marker — an unrelated body must not certify.
 grep -v 'admin-merge-safety' "$POS" > "$TMP/m-marker.md"
 if certifies "$TMP/m-marker.md"; then bad "a body with NO marker CERTIFIED"; else ok "mutation: no marker refuses"; fi
@@ -284,14 +293,20 @@ PIN_OTHER=(
 # (the CLIPPED/COMPARABLE explanation), which is why the terminator is the period and
 # not a quote. A reviewer reproduced the `.Z` case.
 PIN_ENDLINE=(
-  'main=${main_drops}.'
+  # THE WHOLE TAIL OF THE LINE, not the suffix a review broke: pinning only
+  # `main=${main_drops}.` left `PR=${pr_drops} | ` — the half clause (f) also requires
+  # — unpinned, so a producer edit there (`PR=0|main=0.`) would make the gate refuse
+  # every certificate with the suite still at all-green. That is the #1388 class with
+  # the gate's own pin as the thing that fails to notice it.
+  'set): PR=${pr_drops} | main=${main_drops}.'
 )
-# The producer's PARITY VALUE, pinned as a SENTENCE rather than as the delimiter the
-# gate checks. A pin on `PR ⊇ main —` is satisfied by `PR ⊇ main — NOT established: …`,
-# so a producer that reworded or negated its positive value could keep this green
-# while the gate accepted a negation. The gate now requires this sentence, so the pin
-# must cover the sentence: a producer reword reddens here, at the PR that causes it.
-PIN_PARITY_VALUE='parity_evidence="PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family:'
+# The producer's PARITY VALUE, pinned as the SENTENCE AND ITS PARENTHETICAL TEMPLATE
+# rather than as the delimiter the gate checks. A pin on `PR ⊇ main —` is satisfied by
+# `PR ⊇ main — NOT established: …`, so a producer that reworded or negated its positive
+# value could keep this green while the gate accepted a negation. The gate now requires
+# this sentence and this parenthetical shape, so the pin must cover both: a producer
+# reword reddens here, at the PR that causes it.
+PIN_PARITY_VALUE='parity_evidence="PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main)'
 endline_present() {  # the literal must END a line of the file
   python3 - "$1" "$2" <<'PY'
 import sys
@@ -361,7 +376,11 @@ done
 # only the templates above. Only the quoted pattern arguments are tokenised; the
 # assignment's own names (CLAUSE/jq_program/comments) are the gate's, not the
 # producer's, and would be false alarms.
-FILTER_TOKENS="$(sed -n '/^CLAUSE_FILTER=/,/^jq_program=/p' "$VERIFIER" | grep -oE '(contains|test)\("[^"]*"' | grep -oE '[A-Za-z]{4,}' | sort -u | grep -vxE 'contains|test')"
+# The DENY-LIST vocabulary is excluded on purpose: those words are the guard's FORBIDDEN
+# set (a line carrying them must NOT certify), so demanding the producer spell them would
+# be backwards — and the earlier run of this cross-check said exactly that about
+# `MISMATCH`, which is the check working as written and the exclusion being missing.
+FILTER_TOKENS="$(sed -n '/^CLAUSE_FILTER=/,/^jq_program=/p' "$VERIFIER" | grep -oE '(contains|test)\("[^"]*"' | grep -oE '[A-Za-z]{4,}' | sort -u | grep -vxE 'contains|test|NOT|ESTABLISHED|FAILED|MISMATCH|DID|NEVER')"
 TOKN=0
 while IFS= read -r tok; do
   [ -n "$tok" ] || continue
@@ -430,7 +449,7 @@ fi
 # see what it exists to see.
 TS_CODE="$(sed 's://.*::' "$TS_GATE" | grep -v '^[[:space:]]*[*]')"
 fold_clause_text() { tr -d ' \t' | sed 's/\\u0020//g' | sed 's/["\x27+]//g' | tr 'A-Z' 'a-z'; }
-pin_flags() { printf '%s\n' "$1" | fold_clause_text | grep -E 'blockedbythe|uniquetothis' | grep -vq 'blockedbythedecision:1'; }
+pin_flags() { printf '%s\n' "$1" | fold_clause_text | grep -E 'blocked.{0,40}by.{0,40}the.{0,40}decision|unique.{0,20}to.{0,20}this' | grep -vqE 'blocked.{0,40}by.{0,40}the.{0,40}decision.{0,3}1'; }
 if pin_flags "$TS_CODE"; then
   bad "the TS gate re-implements the contract's clauses instead of delegating (clause 6)"
 else
@@ -451,6 +470,9 @@ body.includes("blocked by the decision: 0")
 const SPLIT = "blocked by the " + "decision: 0";
 const SPLIT2 = ["blocked by the ", "decision"].join("");
 const SPLIT3 = "blocked by the\u0020decision: 0";
+const REGEXSP = /blocked\s+by\s+the\s+decision:\s*0/;
+const HEXSP = "blocked\x20by\x20the\x20decision: 0";
+const FROMCC = "blocked" + String.fromCharCode(32) + "by" + String.fromCharCode(32) + "the decision: 0";
 PROBES
 # …and the probe DATA line must NOT fire (it is the one legitimate occurrence).
 if pin_flags '    "\nPR failing: 1 | main failing: 0 | blocked by the decision: 1" +'; then
