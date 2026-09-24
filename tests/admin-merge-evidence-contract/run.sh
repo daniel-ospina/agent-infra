@@ -29,11 +29,15 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # suite can be pointed at the PRE-FIX revision and shown to REDDEN — that is how
 # the coverage claim is MEASURED rather than asserted:
 #   VERIFIER_UNDER_TEST=$(git show <base>:scripts/verify-admin-merge-evidence.sh) …
-# Measured against origin/main, with BOTH overrides: 6 assertions redden — the
-# non-vacuous positive, the vacuous+parity positive, the literal extraction, the
-# retired-claim pin (which now FAILS CLOSED on an empty extraction instead of
-# passing vacuously) and the two clause-6 pins. With the VERIFIER override alone it
-# is 4: the clause-6 pins test the TS gate, which the verifier override does not swap.
+# Measured against origin/main, with BOTH overrides: 7 assertions redden — the
+# non-vacuous positive, the vacuous+parity positive, the retired-spelling positive
+# (against origin/main a body carrying `unique to this PR: 0` CERTIFIES — that is the
+# six-day outage stated as a test), the literal extraction, the retired-claim pin
+# (which FAILS CLOSED on an empty extraction instead of passing vacuously) and the
+# two clause-6 pins. With the VERIFIER override alone it is 5: the clause-6 pins test
+# the TS gate, which the verifier override does not swap.
+# (The count is re-measured whenever an assertion is added: the two override runs are
+# the artifact, and a header that lags them is a claim the artifact does not support.)
 # The per-class mutation tests are provable only against the CURRENT revision: a
 # pre-fix gate that refuses EVERY body carrying the new vocabulary cannot
 # distinguish a mutation from a legitimate body. That is stated in the PR body
@@ -164,6 +168,31 @@ for trap_case in \
     if certifies "$TMP/m-parity-trap.md"; then bad "the producer's positive sentence with an appended disclaimer CERTIFIED (clause 5 fail-open): $trap_case"; else ok "mutation: the positive sentence with an appended disclaimer refuses"; fi
   else
     bad "the appended-disclaimer mutation did not apply, so it proves nothing: $trap_case"
+  fi
+done
+# (c5) A SECOND PARITY LINE that repeats the positive prefix and then contradicts: the
+#      prefix lookahead a review reproduced as insufficient. EVERY `lane parity:` line is
+#      now required to be the positive one, so the extra line refuses the body on its own
+#      — no vocabulary is involved.
+sed 's|^   lane parity: .*|   lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family: test*; 1 shard(s) on the PR side, 1 on main)|' "$NEG" > "$TMP/m-parity-second.md"
+printf '%s\n' "   lane parity: PR ⊇ main — NOT COMPARABLE: no comparison was performed" >> "$TMP/m-parity-second.md"
+if grep -q 'NOT COMPARABLE: no comparison was performed' "$TMP/m-parity-second.md"; then
+  if certifies "$TMP/m-parity-second.md"; then bad "a SECOND parity line contradicting the first CERTIFIED (clause 5 fail-open — the guard is a prefix test, not an every-line test)"; else ok "mutation: a second, contradicting parity line refuses"; fi
+else
+  bad "the second-parity-line mutation did not apply, so it proves nothing"
+fi
+# (c6) …and a contradictory parity statement that is NOT line-initial. The collection
+#      pattern was line-anchored for one revision, so `NOTE lane parity: …` and
+#      `-  lane parity: …` certified while the comment claimed "every parity line".
+#      The guard now collects every OCCURRENCE and requires each to be the positive
+#      one, so position is no longer a route either.
+for mid in 'NOTE lane parity: PR ⊇ main is NOT established' '-  lane parity: NOT COMPARABLE — skipped shards'; do
+  sed 's|^   lane parity: .*|   lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed (parity family: test*; 1 shard(s) on the PR side, 1 on main)|' "$NEG" > "$TMP/m-parity-mid.md"
+  printf '%s\n' "$mid" >> "$TMP/m-parity-mid.md"
+  if grep -qF -e "$mid" "$TMP/m-parity-mid.md"; then
+    if certifies "$TMP/m-parity-mid.md"; then bad "a NON-LINE-INITIAL parity statement CERTIFIED (clause 5 fail-open): $mid"; else ok "mutation: a non-line-initial parity statement refuses"; fi
+  else
+    bad "the non-line-initial mutation did not apply, so it proves nothing: $mid"
   fi
 done
 # (d) the marker — an unrelated body must not certify.
@@ -337,6 +366,17 @@ producer_pin_missing() {  # prints the first missing requirement, or nothing whe
   # substring pin stayed green. A reviewer reproduced that too.
   if ! parity_block "$f" | grep -qE '^[[:space:]]*lane parity: \$parity_evidence[[:space:]]*$'; then
     printf '%s\n' 'a line of the form `lane parity: $parity_evidence` (line-initial, nothing else on the line)'
+    return
+  fi
+  # …AND THE ATTRIBUTION MUST BE CONCATENATED INTO THE EMITTED EVIDENCE, not merely
+  # present somewhere in the file. The `PIN_ENDLINE` check is file-wide: a review
+  # reproduced a producer refactor that drops `$attribution_line` from the `analyzed=`
+  # concatenation — the literal survives in the assignment, the suite stays 62/62
+  # green, and the emitted body loses the attribution line the gate requires, so every
+  # certificate is refused. That is the #1388 class with the pin as the thing that
+  # fails to notice it, so the connection is pinned, not just the string.
+  if ! grep -A1 -F 'analyzed="$analyzed' "$f" | grep -qF '$attribution_line"'; then
+    printf '%s\n' '$attribution_line concatenated into the emitted evidence (the line after `analyzed="$analyzed`)'
   fi
 }
 if miss="$(producer_pin_missing "$PRODUCER")"; [ -z "$miss" ]; then
@@ -370,6 +410,31 @@ PY
     bad "the producer pin MISSES a renamed '$lit' — a reviewer reproduced exactly this class"
   fi
 done
+# …AND ONE REQUIREMENT CANNOT BE SELF-TESTED BY A RENAME, because it is about the
+# ABSENCE of a concatenation rather than the presence of a literal: dropping
+# `$attribution_line` from the emitted evidence. A verifier pass found this requirement
+# added but not self-tested, so the comment above claimed more coverage than the loop
+# had. It is self-tested here by the edit it exists to catch.
+cp "$PRODUCER" "$TMP/producer-unconcat.sh"
+python3 - "$TMP/producer-unconcat.sh" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+old = '  analyzed="$analyzed\n$attribution_line"'
+if old not in text:
+    sys.exit(3)
+open(path, "w", encoding="utf-8").write(text.replace(old, '  analyzed="$analyzed\n"', 1))
+PY
+if [ $? -ne 0 ]; then
+  bad "the unattributed-evidence mutation could not be applied, so its self-test proves nothing"
+else
+  MUTN=$((MUTN + 1))
+  if [ -n "$(producer_pin_missing "$TMP/producer-unconcat.sh")" ]; then
+    ok "the producer pin CATCHES evidence emitted without the attribution line"
+  else
+    bad "the producer pin MISSES a producer that stops concatenating \$attribution_line into the evidence — the emitted body would lose the line the gate requires"
+  fi
+fi
 # The token cross-check: every word inside the FILTER's own patterns must still
 # exist in the producer. Weaker than the template pins (it is file-wide), but it
 # sweeps EVERY word — `runs` -> `executions`, `parity` -> `alignment` — rather than
@@ -448,8 +513,17 @@ fi
 # historical one and the three split ones, so the pin cannot pass by being unable to
 # see what it exists to see.
 TS_CODE="$(sed 's://.*::' "$TS_GATE" | grep -v '^[[:space:]]*[*]')"
-fold_clause_text() { tr -d ' \t' | sed 's/\\u0020//g' | sed 's/["\x27+]//g' | tr 'A-Z' 'a-z'; }
-pin_flags() { printf '%s\n' "$1" | fold_clause_text | grep -E 'blocked.{0,40}by.{0,40}the.{0,40}decision|unique.{0,20}to.{0,20}this' | grep -vqE 'blocked.{0,40}by.{0,40}the.{0,40}decision.{0,3}1'; }
+# FOLD NEWLINES TOO. Matching is line-oriented, so a clause whose words sit on
+# DIFFERENT LINES was invisible — the multi-line spelling of the suite's own SPLIT
+# probe (`const CLAUSE =\n  "blocked by the " +\n  "decision: 0";`) re-acquired a
+# private copy with all 62 assertions green. A confirming review reproduced it.
+#
+# The probe DATA line is removed BEFORE folding, by value: after folding the file is
+# one line, so a `grep -v` afterwards would drop the whole text and silently disarm
+# this pin (which is exactly how the newline-blind version stayed green).
+fold_clause_text() { tr -d ' \t\n' | sed 's/\\u0020//g' | sed 's/["\x27+]//g' | tr 'A-Z' 'a-z'; }
+drop_probe_data() { grep -vE 'blocked.{0,40}by.{0,40}the.{0,40}decision.{0,3}1'; }
+pin_flags() { printf '%s\n' "$1" | drop_probe_data | fold_clause_text | grep -qE 'blocked.{0,40}by.{0,40}the.{0,40}decision|unique.{0,20}to.{0,20}this'; }
 if pin_flags "$TS_CODE"; then
   bad "the TS gate re-implements the contract's clauses instead of delegating (clause 6)"
 else
@@ -474,6 +548,17 @@ const REGEXSP = /blocked\s+by\s+the\s+decision:\s*0/;
 const HEXSP = "blocked\x20by\x20the\x20decision: 0";
 const FROMCC = "blocked" + String.fromCharCode(32) + "by" + String.fromCharCode(32) + "the decision: 0";
 PROBES
+# …and the MULTI-LINE spelling, which cannot go through the per-line loop above: a
+# clause whose words sit on different lines was invisible while the pin was
+# line-oriented. A confirming review reproduced it with exactly this shape.
+MULTILINE_PROBE='const MULTILINE_CLAUDE =
+  "blocked by the " +
+  "decision: 0";'
+if pin_flags "$MULTILINE_PROBE"; then
+  ok "the clause-6 pin catches a re-implementation split ACROSS LINES"
+else
+  bad "the clause-6 pin MISSES a clause split across lines — a private copy could be re-acquired undetected"
+fi
 # …and the probe DATA line must NOT fire (it is the one legitimate occurrence).
 if pin_flags '    "\nPR failing: 1 | main failing: 0 | blocked by the decision: 1" +'; then
   bad "the clause-6 pin flags the negative-control PROBE (data) as a re-implementation — a false positive that would block every legitimate change to it"
@@ -484,6 +569,51 @@ if grep -qF 'verify-admin-merge-evidence.sh' "$TS_GATE"; then
   ok "the TS gate references the single implementation (verify-admin-merge-evidence.sh)"
 else
   bad "the TS gate does not delegate to scripts/verify-admin-merge-evidence.sh (clause 6)"
+fi
+
+# ── 8. THE LIVE PATH RUNS THIS FILTER UNDER A DIFFERENT REGEX ENGINE ────────────
+# The offline path (`--body-file`, what every assertion above uses) runs the filter
+# under the system `jq` — Oniguruma, which supports lookaround. The LIVE path is
+# `gh … --jq`, i.e. gh's embedded gojq over Go/RE2, which REJECTS lookaround and
+# backreferences. A filter using them passes every offline test and fails to COMPILE in
+# production, where the failure surfaces as `could not read the PR comments` (exit 1)
+# for EVERY certificate — the #1388 outage class with all offline assertions green. A
+# verifier pass reproduced exactly that on gh 2.97.0; this section is the guard that
+# was missing, and it is why a green offline suite is not evidence about the live path.
+# The extraction is a companion script, and it DECODES each literal once before judging
+# it. Re-embedding the file's raw text double-escapes every pattern (`\K` → `\\K`), so a
+# compile check built that way tests regexes the filter does not use — a verifier pass
+# reproduced a green suite with an RE2-rejected `\K` in the filter because of exactly
+# that. A run that finds NO patterns is treated as a failure, never as a pass: an empty
+# extraction made both assertions below report ✅ over nothing.
+PATTERNS="$(python3 "$HERE/filter-patterns.py" "$VERIFIER")"
+PAT_COUNT="$(printf '%s\n' "$PATTERNS" | sed -n 's/^N //p')"
+if [ -z "$PAT_COUNT" ] || [ "$PAT_COUNT" -lt 6 ]; then
+  bad "the clause filter's test() patterns could not be extracted (found '${PAT_COUNT:-none}', expected at least 6) — the RE2 checks below would pass over nothing"
+elif [ -n "$(printf '%s\n' "$PATTERNS" | grep '^OFFENDER' || true)" ]; then
+  bad "the clause filter uses regex the LIVE engine (gh's gojq over Go/RE2) REJECTS: $(printf '%s\n' "$PATTERNS" | grep '^OFFENDER' | head -1 | cut -c1-120) — the live path would refuse every certificate, however green this suite is"
+else
+  ok "all $PAT_COUNT clause-filter patterns are RE2-compilable: no lookaround, no backreferences, no Oniguruma-only escapes"
+fi
+# …and compile them on the REAL engine when gh is available, rather than trusting the
+# rule above. Needs network+auth, so it prints a SKIP it cannot run: a skip that is
+# PRINTED is honest, a skip that is silent is a no-op gate.
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  PROG="$(printf '%s\n' "$PATTERNS" | sed -n 's/^P //p' | python3 -c '
+import json, sys
+lits = [json.dumps(json.loads(line)) for line in sys.stdin if line.strip()]
+if lits:
+    print("[ " + ", ".join(f"(\"\" | test({l}))" for l in lits) + " ] | @json")
+')"
+  if [ -z "$PROG" ]; then
+    echo "    (SKIP: no pattern could be extracted — the live-engine compile check did NOT run)"
+  elif gh api /rate_limit --jq "$PROG" >/dev/null 2>&1; then
+    ok "gh's own jq engine (gojq/RE2) compiles all $PAT_COUNT patterns the filter hands to test()"
+  else
+    bad "gh's own jq engine REJECTED a pattern in the filter — the LIVE path cannot certify anything, however green this suite is"
+  fi
+else
+  echo "    (SKIP: gh unavailable or unauthenticated — the live-engine compile check did NOT run)"
 fi
 
 echo

@@ -74,7 +74,7 @@ esac
 # CLAUSE 5 (#1388 §3): the zero must be MEASURED and COMPARABLE, not merely
 # printed — otherwise swapping a strong claim for a weaker one would be a net
 # LOOSENING of this gate.
-#   * `PR=0 | main=0` (the attribution line, admin-merge.sh:3318) is the
+#   * `PR=0 | main=0` (the attribution line, admin-merge.sh:3319) is the
 #     positive test that the parser dropped NO token. A clipped set is not a
 #     measured zero, so a zero over it does not certify.
 #   * when BOTH counts are zero — `PR failing: 0 | main failing: 0` — the
@@ -117,14 +117,40 @@ esac
 #       case-sensitive deny-list is defeated by `Not established` / `not ESTABLISHED`,
 #       and any contradiction word it does not name slips through. A deny-list of
 #       spellings is the same mistake as (1) and (2) one level up.
-# So the tolerated trailing text is now the PRODUCER'S OWN PARENTHETICAL TEMPLATE
+# So the tolerated trailing text is now the PRODUCER'S OWN PARENTHETICAL SHAPE
 # (`(parity family: <prefix>*; <n> shard(s) on the PR side, <m> on main)`, built at
-# admin-merge.sh:3355 and pinned in §6 of the contract suite), the line must END
-# there, and the negation vocabulary stays as a SECOND, case-insensitive guard rather
-# than as the primary one. A contradiction that is not the producer's own template
-# cannot ride along, whatever its casing: allowed text is now ENUMERATED — the
-# positive sentence and the one parenthetical shape the producer emits — instead of
-# forbidden text being blacklisted.
+# admin-merge.sh:3354 and pinned in §6 of the contract suite), the line must END
+# there, and TWO STRUCTURAL guards replace the spelling contest:
+#   (a) EVERY PARITY STATEMENT MUST BE THE POSITIVE ONE. Not "the first parity line must
+#       be positive and any other is refused" — a verifier pass found that a prefix
+#       lookahead is satisfied by a SECOND line that repeats the positive prefix and
+#       then contradicts (`lane parity: PR ⊇ main — NOT COMPARABLE: …`), and then that a
+#       LINE-ANCHORED collection still missed a contradictory statement that was not
+#       line-initial (`-  lane parity: …`, `NOTE lane parity: …`). The guard is thus a
+#       collection test over every occurrence ANYWHERE, each of which must match the
+#       full positive pattern (line-end anchor included) — so the class is closed for
+#       every vocabulary and every position, not just the spellings a blacklist names.
+#   (b) THE PREFIX CANNOT CARRY A SECOND COUNTS TAIL or a nested template: no `;` in
+#       the prefix (so `… test*; NOT COMPARABLE …; 3 shard(s) …` cannot ride along), and
+#       at most ONE `parity family:` occurrence per parity statement (so
+#       `… (parity family: FAKE) (parity family: test*; 3 shard(s) …)` cannot).
+#
+# AND THE FILTER MUST BE COMPILABLE BY THE ENGINE THAT ACTUALLY RUNS IT LIVE. That is
+# not the same engine as the offline path, and a verifier pass caught this the hard way:
+# `--body-file` tests run under the system `jq` (Oniguruma, lookaround supported), while
+# the LIVE path is `gh … --jq`, i.e. gh's embedded gojq over Go/RE2 — which REJECTS
+# lookahead. The first cut of guard (b) used `(?!parity family:)`, which made the live
+# path fail to compile the filter at all: `could not read the PR comments`, exit 1, for
+# EVERY certificate — the six-day outage class, reintroduced by this branch, with all 67
+# offline assertions green. So guard (b) is expressed as an OCCURRENCE COUNT instead, and
+# §8 of the contract suite refuses any lookaround or backreference in this filter.
+#
+# WHAT THIS STILL CANNOT DO, stated rather than papered over: a hand-crafted body can
+# put ARBITRARY PROSE inside the producer's parenthetical prefix. That is the same
+# limit as hand-typing the counts — the contract is text, and no agent-side check can
+# prove a comparison ran (see `evidenceBodyIsCertifying`'s docstring). What the clause
+# does close is every path by which the PRODUCER'S OWN vocabulary says "this was not a
+# comparison", which is the fail-open this lane exists to prevent.
 #
 # VACUITY IS DERIVED FROM THE COUNTS, NOT FROM THE PRODUCER'S DESCRIPTIVE LINE, and
 # this is a fail-open that BOTH reviewers of the first revision reproduced
@@ -159,7 +185,11 @@ CLAUSE_FILTER='(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
   and (test("PR failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*main failing:\\s*(0|[1-9][0-9]*)\\s*\\|\\s*blocked by the decision:\\s*0([ \\t\\r\\n]|$)"))
   and (test("PR=0 \\| main=0\\.([ \\t\\r\\n]|$)"))
   and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not)
-       or (test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( \\(parity family: [^\\n]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")
+       or (test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( \\(parity family: [^;\\n[:cntrl:]\\x{2028}\\x{2029}]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")
+           and ([match("lane parity:[^\\n]*"; "g") | .string
+                 | test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( \\(parity family: [^;\\n[:cntrl:]\\x{2028}\\x{2029}]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")] | all)
+           and ([match("lane parity:[^\\n]*"; "g") | .string
+                 | [match("\\(parity family:"; "g")] | length] | all(. <= 1))
            and (test("(^|\\n)[ \\t]*lane parity:[^\\n]*(NOT ESTABLISHED|FAILED|MISMATCH|DID NOT|NEVER ESTABLISHED)"; "i") | not)))'
 jq_program='[ .comments[].body | select('"$CLAUSE_FILTER"') ] | length'
 
