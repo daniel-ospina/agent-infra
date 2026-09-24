@@ -1982,6 +1982,15 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         # MAIN_HEALTH_RUN_MAP_LIMIT). The run id is in the check run's own URL.
         run_id="$(printf '%s' "$url" | sed -n 's#.*/runs/\([0-9][0-9]*\).*#\1#p' | head -1)"
         wf=""; ev=""
+        # ⛔ A LEGACY COMMIT STATUS IS NEVER RUN-RESOLVED. The `url` on a status
+        # row is the status's OWN, app-supplied `target_url` — an arbitrary link
+        # — so a `/runs/<N>` inside it names SOME run, not the run that produced
+        # this row; a commit status has NO triggering Actions event at all. Left
+        # ungated, a status red could inherit a `schedule`/`issues` event from
+        # such a URL and be EXEMPTED on the base, though an app's verdict on the
+        # commit measures code. Clearing the id closes BOTH the map path and the
+        # per-run resolve (#1446 review): the row stays code-measuring and BLOCKS.
+        [ "$app" = "commit-status" ] && run_id=""
         if [ -n "$run_id" ] && [ -s "$map_file" ]; then
           ev="$(awk -F'\t' -v id="$run_id" '$1 == id { print $2; exit }' "$map_file")"
           wf="$(awk -F'\t' -v id="$run_id" '$1 == id { print $3; exit }' "$map_file")"

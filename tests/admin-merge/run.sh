@@ -5875,15 +5875,16 @@ else
 fi
 
 # ── 65. A RUN THE BOUNDED MAP MISSED IS RESOLVED INDIVIDUALLY (#1446) ─────────
-# The base-health run map is ONE bounded `gh run list` window. A run created
-# after that listing was taken (or one an event-scoped listing omits) is ABSENT
-# from it even though `…/actions/runs/<id>` answers for it — observed on a
-# `finding-provenance` run (event `issues`) that the window missed. Left
+# The base-health run map is a SNAPSHOT — one bounded, branch- or sha-scoped
+# `gh run list` (empty when that listing fails) — so it can simply not carry a
+# red's run, even though `…/actions/runs/<id>` answers for it. (Observed on a
+# `finding-provenance` run, event `issues`, that the snapshot did not carry; WHY
+# a particular snapshot misses a run is deliberately not assumed.) Left
 # unresolved, the non-code exemption cannot match, the red classifies as
 # code-measuring, and step 4.6 refuses every stale-surface PR. The fix resolves
-# the run by id, and the two outcomes must stay DISTINGUISHABLE: a resolved
+# the run by id, and the outcomes must stay DISTINGUISHABLE: a resolved
 # non-code run is exempt, while a run that resolves to NOTHING stays unresolved
-# and BLOCKS (the fail-closed arm — never "unresolved therefore exempt").
+# and BLOCKS (never "unresolved therefore exempt").
 echo "== 65. #1446: a run the bulk map missed is resolved individually (base), and an unresolvable one still BLOCKS =="
 
 # (a) THE REPRODUCTION, FIXED. Base RED only on a non-code-event lane whose run
@@ -6056,7 +6057,7 @@ else
     || fail "the projection's field order is not event-then-name ([$t])"
   t="$(rproj '{}')"
   [ "$t" = "$(printf '\t')" ] \
-    && pass "…an empty run projects to an EMPTY event, so the rail blocks it" \
+    && pass "…an empty run projects to an EMPTY event (arm (i) pins that the rail then blocks)" \
     || fail "an empty run projected to [$t]"
   t="$(rproj '{"event":"issues\npush","name":"wf"}')"
   if [ "$(printf '%s' "$t" | wc -l | tr -d ' ')" = "0" ]; then
@@ -6065,6 +6066,54 @@ else
     fail "a newline in the event produced a RAW newline — a lenient parse could read a forged event ([$t])"
   fi
 fi
+
+# (h) A LEGACY COMMIT STATUS IS NEVER RUN-RESOLVED. A status row's `url` is its
+# OWN, app-supplied `target_url`, so a `/runs/<N>` inside it names SOME run, not
+# the row's producer — and a status has NO Actions event. Without the app gate,
+# a status red whose target_url embeds a `schedule` run URL was EXEMPTED on the
+# base (the cycle-2 review reproduced that fail-open). It must BLOCK.
+new_scen base-status-runurl
+HEAD_NC9="f1f1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC9" > "$SCEN/head"
+lane_pass "$HEAD_NC9" 5949 > "$SCEN/runs-$HEAD_NC9"
+lane_pass mainnc9 5950 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5017 'ci / lint' completed success 7351 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7351 pull_request 'CI'
+# A GREEN check-run surface plus a RED legacy status whose target_url names a
+# `schedule` run that is ABSENT from the map and resolves per-run to `schedule`.
+main_green_surface
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"deploy-verify","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://ci.example.com/actions/runs/9101"}]}\n' > "$SCEN/main-statuses.json"
+printf 'schedule\tregistry-backup-cron\n' > "$SCEN/run-9101"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a STATUS red whose target_url embeds a schedule run URL still BLOCKS (exit $rc)" \
+  || fail "a legacy commit status was exempted via a run id read from its target_url — a fail-open"
+grep -q "actions/runs/9101" "$SCEN/calls" && fail "the rail run-resolved a commit-status row's target_url" \
+  || pass "…and it was never run-resolved (neither from the map nor per-run)"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a status red" || pass "no merge attempted"
+
+# (i) A TAB-PRESENT BUT EMPTY-EVENT ANSWER IS NOT A RESOLUTION. `@tsv` renders a
+# missing event as an empty first field, so the answer is a bare TAB. That must
+# stay unresolved and BLOCK — arm (g) pins the projection, this pins the rail.
+new_scen noncode-empty-event-resolve
+HEAD_NC10="f2f2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NC10" > "$SCEN/head"
+lane_pass "$HEAD_NC10" 5951 > "$SCEN/runs-$HEAD_NC10"
+lane_pass mainnc10 5952 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5018 'ci / lint' completed success 7352 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7352 pull_request 'CI'
+write_main_checks "$(check_run 6016 provenance completed failure 8407 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8311 push 'Python CI'
+printf '\t\n' > "$SCEN/run-8407"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a TAB-present, EMPTY-event resolve answer still BLOCKS (exit $rc)" \
+  || fail "an empty-event resolution was read as a non-code exemption"
+grep -q "(workflow unresolved)" "$SCEN/err" && pass "…and it stays UNRESOLVED" \
+  || fail "the empty-event answer was recorded as a resolution"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over an empty-event answer" || pass "no merge attempted"
 
 
 if [ "$failures" -gt 0 ]; then
