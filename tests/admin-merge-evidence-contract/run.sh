@@ -681,11 +681,20 @@ fi
 # that did not allow a newline before `(` — each leaving this whole suite green while
 # the LIVE path could not compile the filter. So the extractor's own failure modes are
 # pinned here: every case below asserts an output the CURRENT extractor produces, and a
-# regression in any of them reddens. The one limit that remains is stated, not hidden:
-# a regex called through a name outside REGEX_FUNCS is invisible to this scan (the
-# filter uses none, and the live-engine compile below is the backstop for the filter as
-# it exists — it cannot see a call the extractor never found, which is why the count
-# floor above is the guard that a smuggling edit trips first).
+# regression in any of them reddens.
+#
+# "What if a regex is smuggled through a function name this scan does not know?" The
+# scanned set is jq's regex-taking functions, and that set is CLOSED — measured, not
+# assumed: fed a pattern only a regex engine refuses (`(`), `test`, `match`, `capture`,
+# `scan`, `splits`, `sub` and `gsub` each fail with "Regex failure", while `contains`,
+# `startswith`, `endswith`, `index` and `ltrimstr` accept it as literal text, so they
+# cannot carry a regex at all. (`split` is kept in the set deliberately: it took a regex
+# in jq 1.6 and takes a string in 1.7, so checking it is fail-closed across versions.)
+# An alias does not open a way around it either — `def t(x): test(x); … t("(?!x)")`
+# leaves the `test(x)` call in the text, whose non-literal argument is UNCHECKABLE, i.e.
+# red. A name that is not a jq function is a jq compile error. So an unscanned call
+# cannot hide a RE2-rejected regex; the count floor above is what catches a call that
+# vanishes from the extraction.
 scan_case() {  # scan_case <name> <filter-text> <expected-substring>
   printf '%s' "$2" > "$TMP/case-filter.txt"
   case_out="$(python3 "$HERE/filter-patterns.py" "$TMP/case-filter.txt" 2>&1)"
