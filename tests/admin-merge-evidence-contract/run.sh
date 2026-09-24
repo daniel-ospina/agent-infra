@@ -180,29 +180,61 @@ while IFS= read -r lit; do
   fi
 done <<< "$LITS"
 
-# ── 6. DRIFT-PIN — the producer still emits the clause the gate requires, and
-# the gate requires the producer's spelling (both directions, so neither can
-# move alone).
+# ── 6. DRIFT-PIN — every STATIC literal the filter requires must exist in the
+# producer's evidence EMISSION.
 #
 # THIS SECTION EXISTS BECAUSE A COMMITTED CAPTURE CANNOT NOTICE A LATER PRODUCER
-# MOVE. The drift-pin in §5 checks the gate's extractable literals against the real
-# capture — but the capture is a FILE, so renaming the producer's line leaves §1–§5
-# green with a stale fixture, which is the six-day outage all over again. Every
-# STATIC literal the filter requires is therefore also grepped in the producer
-# itself, including the two head-bound ones (`PR head: `, the marker prefix) whose
-# head-substituted forms cannot be extracted. A review round found this gap: the
-# static prefix `PR head: ` was pinned by nothing.
-for lit in '<!-- admin-merge-safety' 'PR head: ' 'main compared (union of ' 'blocked by the decision: 0'; do
-  if grep -qF "$lit" "$PRODUCER"; then
-    ok "the producer still emits: $lit"
-  else
-    bad "the gate requires '$lit' and the PRODUCER no longer emits it (the #1388 class — a committed capture cannot notice this)"
-  fi
-done
-if grep -qF 'blocked by the decision: 0' "$PRODUCER"; then
-  : # already asserted by the loop above
+# MOVE. The §5 pin checks the gate's extractable literals against the real capture —
+# but the capture is a FILE, so renaming the producer's line leaves §1–§5 green with
+# a stale fixture: the six-day outage all over again. The literals are therefore
+# pinned against the producer itself.
+#
+# SCOPED TO THE EMISSION BLOCK, NOT THE FILE, and that scoping is the fix for a gap
+# a review round reproduced: a file-wide grep is satisfied by the producer's PROSE.
+# `main failing:`, `PR failing:` and `blocked by the decision: 0` all appear in the
+# producer's comments and in its log lines (e.g. :257, :2667, :3421), so renaming
+# the ONE line that posts evidence left this section green while the gate would have
+# refused every real certificate — every admin merge blocked fleet-wide with all
+# suites green, which is the failure this whole change is about. The evidence body
+# is built by `build_evidence()`, so that is what is searched.
+#
+# The same reproduction also showed the marker pin was loose by one character:
+# grepping `<!-- admin-merge-safety` accepted a rename to
+# `<!-- admin-merge-safety-X `. The pin now includes the `: ` suffix.
+#
+# The parity pair is pinned at its own two sites — the assignment that builds the
+# positive value and the line that emits it — because neither lives in
+# `build_evidence()`.
+emission_block() { sed -n '/^build_evidence()/,/^}/p' "$1"; }
+producer_pin_missing() {  # prints the first missing requirement, or nothing when OK
+  local f="$1" blk
+  blk="$(emission_block "$f")"
+  [ -n "$blk" ] || { printf 'build_evidence() block not found\n'; return; }
+  local lit
+  for lit in '<!-- admin-merge-safety: ' 'PR head: ' 'main compared (union of ' 'PR failing: ' 'main failing: ' 'blocked by the decision: 0'; do
+    if ! printf '%s' "$blk" | grep -qF "$lit"; then printf '%s\n' "$lit"; return; fi
+  done
+  grep -qF 'lane parity: $parity_evidence' "$f" || { printf 'lane parity: $parity_evidence\n'; return; }
+  grep -qF 'parity_evidence="PR ⊇ main' "$f" || { printf 'parity_evidence="PR ⊇ main\n'; return; }
+  # The attribution clause requires `PR=0 | main=0.`; its static shape is built in
+  # `attribution_line`, so it is pinned there rather than by a file-wide grep.
+  grep -qF 'Attribution — FAILED tokens DROPPED by the parser (not test ids, so NEVER in a failing set): PR=${pr_drops} | main=${main_drops}.' "$f" \
+    || { printf 'the attribution line\n'; return; }
+}
+if miss="$(producer_pin_missing "$PRODUCER")"; [ -z "$miss" ]; then
+  ok "every static literal the filter requires is present in the producer's evidence EMISSION"
 else
-  bad "the producer no longer emits the clause-4 spelling the gate requires"
+  bad "the gate requires '$miss' and the producer's evidence emission no longer contains it (the #1388 class — a committed capture cannot notice this)"
+fi
+# …and the pin is pinned: a renamed EMISSION (not prose) must be caught by it.
+# This is the reviewer's reproduction, kept as a test so the looseness cannot return.
+sed 's/PR failing: %s | main failing: %s/PR failing: %s | main failure: %s/' "$PRODUCER" > "$TMP/producer-renamed.sh"
+if ! grep -qF 'main failure: %s' "$TMP/producer-renamed.sh"; then
+  bad "the renamed-emission mutation did not apply, so the self-test below proves nothing"
+elif [ -n "$(producer_pin_missing "$TMP/producer-renamed.sh")" ]; then
+  ok "the producer pin CATCHES a renamed emission ('$(producer_pin_missing "$TMP/producer-renamed.sh" | head -1)')"
+else
+  bad "the producer pin MISSES a renamed evidence emission — a file-wide grep would too (a reviewer reproduced exactly this)"
 fi
 # Scope to the CLAUSE FILTER, not the file: the verifier's comments DISCUSS the
 # retired name to explain the rename, so a file-wide grep reports it as still
@@ -214,7 +246,8 @@ else
 fi
 # The producer must still be able to state the positive parity half the gate
 # accepts — otherwise the vacuous case is unsatisfiable and every vacuous
-# comparison is refused whether or not it was comparable.
+# comparison is refused whether or not it was comparable. (The assignment site is
+# pinned by `producer_pin_missing` above; this keeps the older, wider check too.)
 if grep -qF 'PR ⊇ main' "$PRODUCER"; then
   ok "the producer can still state established parity ('PR ⊇ main')"
 else
