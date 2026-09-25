@@ -546,8 +546,15 @@ case "$key" in
     # is parsed out of the URL so a fixture is per-run; a bare `$SCEN/jobs.json`
     # serves every run. No fixture is an API error (never a small bound).
     id="$(printf '%s' "$a2" | sed -n 's#.*/runs/\([0-9][0-9]*\)/jobs.*#\1#p')"
+    # #1482: the discrimination between "a run WITH jobs whose log is unreadable"
+    # and "a run with ZERO jobs" IS the `.total_count` projection. A fixture
+    # `jobs-count-<id>` (or `jobs-count`) supplies that NUMBER directly. Without
+    # this seam the zero-job branch was UNREACHABLE from the whole suite: the fake
+    # ignored `--jq` and `cat`ed raw JSON, so `run_job_count` saw a non-numeric
+    # blob and fail-closed in EVERY scenario — the new branch was dead code.
+    if [ -n "$id" ] && [ -f "$SCEN/jobs-count-$id" ]; then cat "$SCEN/jobs-count-$id"; exit 0; fi
+    if [ -f "$SCEN/jobs-count" ]; then cat "$SCEN/jobs-count"; exit 0; fi
     if [ -n "$id" ] && [ -f "$SCEN/jobs-$id.json" ]; then cat "$SCEN/jobs-$id.json"; exit 0; fi
-    if [ -f "$SCEN/jobs.json" ]; then cat "$SCEN/jobs.json"; exit 0; fi
     exit 1 ;;
   *)
     exit 1 ;;
@@ -951,6 +958,71 @@ rc=$?
 [ "$rc" -ne 0 ] && pass "exit non-zero ($rc) on extraction failure" || fail "expected a non-zero exit, got 0"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the set could not be read" || pass "no evidence comment posted"
 grep -q "could not fetch the failed-step log" "$TMP/err" && pass "the parser's failure is surfaced, not swallowed" || fail "expected the parser failure on stderr"
+
+# ── 5b. #1482: a ZERO-JOB run is EMPTY, not unreadable ──────────────────────
+# A run that never started has no failure for a log to reveal, and
+# `gh run view --log-failed` fails for it IDENTICALLY to a transport error. Treating
+# the two alike blocked EVERY merge whenever such a run sat in the window.
+echo "== 5b. zero-job run contributes NOTHING (not an extraction failure) =="
+new_scen zerojob
+: > "$SCEN/fail-log-7777"                 # the log CANNOT be fetched...
+printf '0\n' > "$SCEN/jobs-count-7777"    # ...because the run has no jobs at all
+# 3 REAL failing baseline runs, so the baseline is measurable once the empty run
+# is not mistaken for an extraction failure.
+{ main_red_n main7777 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7777 7777
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zj-prov.txt" --runs-report "$TMP/zj-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "a zero-job run does not fail the baseline extraction" || fail "expected exit 0, got $rc"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && pass "the zero-job run is named on stderr" || fail "expected the zero-job note on stderr"
+# ONE verdict per run: the old shape printed the refusal AND the exemption for the
+# same run, which is the ambiguity #1482 exists to remove.
+grep -q "could not fetch the failed-step log" "$TMP/cfs-err" \
+  && fail "the refusal must NOT also be printed for the same run" \
+  || pass "one verdict per run — no contradictory pair"
+if [ -f "$TMP/zj-rep.txt" ]; then
+  v="$(sed -n 's/^tested=//p' "$TMP/zj-rep.txt")"
+  [ "$v" = "3" ] && pass "tested counts only the 3 real runs, not the zero-job one" || fail "expected tested=3, got '$v'"
+  v="$(sed -n 's/^extracted=//p' "$TMP/zj-rep.txt")"
+  [ "$v" = "3" ] && pass "all 3 real failing runs were extracted" || fail "expected extracted=3, got '$v'"
+else
+  fail "no runs-report written for the zero-job scenario"
+fi
+
+# ── 5c. #1482: the narrowing must NOT widen ────────────────────────────────
+# A run that HAS jobs and whose log cannot be read can be hiding a real failure,
+# so it must still fail closed. The exemption is ONLY for runs that could not have
+# failed because they never started.
+echo "== 5c. run WITH jobs + unreadable log → still fail-closed =="
+new_scen jobsbutnolog
+: > "$SCEN/fail-log-7778"
+printf '3\n' > "$SCEN/jobs-count-7778"   # this run DID have jobs
+{ main_red_n main7778 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7778 7778
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zjc-prov.txt" --runs-report "$TMP/zjc-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a run with jobs and an unreadable log still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "could not fetch the failed-step log" "$TMP/cfs-err" && pass "the refusal is surfaced" || fail "expected the refusal on stderr"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a zero-job note must not be printed for a run that HAS jobs" || pass "no zero-job note for a run that has jobs"
+
+# ── 5d. #1482: an UNREADABLE count is not a licence to exempt ───────────────
+echo "== 5d. unreadable job count → still fail-closed =="
+new_scen jobscountunknown
+: > "$SCEN/fail-log-7779"                 # log unreadable
+# ...and NO jobs-count-7779 fixture: the count cannot be established, so the run
+# must be treated as a possible concealment, never as empty.
+{ main_red_n main7779 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7779 7779
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zju-prov.txt" --runs-report "$TMP/zju-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unreadable job count still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "nothing may be exempted when the count is unknown" || pass "no exemption without a proven zero count"
 
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="

@@ -417,25 +417,26 @@ list_lane_runs() {
 #
 # ⚠ THE ONE EXCEPTION, and why it does not weaken the rule (#1482). A run with
 # ZERO JOBS is not "an unreadable failure set" — it is an EMPTY one, by
-# construction: there were no steps, so there is no failure for a log to
-# reveal. `gh run view --log-failed` fails IDENTICALLY for that run and for a
-# genuine transport error (both exit 1), so the log fetch alone cannot tell them
-# apart — and treating the empty case as an extraction failure is what made the
-# rail unusable for EVERY merge. See `run_job_count` for the discrimination and
-# `fetch_failed_log` for the message split.
+# construction: there were no steps, so there is no failure for a log to reveal.
+# `gh run view --log-failed` fails IDENTICALLY for that run and for a genuine
+# transport error (both exit 1), so the log fetch alone cannot tell them apart —
+# and treating the empty case as an extraction failure is what made the rail
+# unusable for EVERY merge. See `run_job_count` for the discrimination.
+#
+# Return: 0 = extracted (ids on stdout, possibly none) · 1 = FAIL CLOSED ·
+#         2 = the run has ZERO jobs and contributed NOTHING (not an error).
+# Callers MUST handle 2 explicitly: it is the only status meaning "this run
+# carried no evidence AND that is not a defect".
 extract_failed_tests() {
-  local run_id="$1" log_file rc jobs
+  local run_id="$1" log_file rc
   log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-  if ! fetch_failed_log "$run_id" "$log_file"; then
-    rm -f "$log_file"
-    # Discriminate BEFORE fail-closing. Only a run that HAS jobs can be hiding a
-    # failure in an unreadable log; a run with none contributes nothing.
-    if jobs="$(run_job_count "$run_id")" && [ "$jobs" = "0" ]; then
-      say_err "ci-failure-set: · run $run_id has ZERO jobs — nothing could have failed; contributing an EMPTY failing set (not an extraction failure)"
-      return 0
-    fi
-    return 1
-  fi
+  fetch_failed_log "$run_id" "$log_file"
+  rc=$?
+  case "$rc" in
+    0) ;;
+    2) rm -f "$log_file"; return 2 ;;
+    *) rm -f "$log_file"; return 1 ;;
+  esac
   failed_ids_from_log "$log_file"
   rc=$?
   rm -f "$log_file"
@@ -460,27 +461,43 @@ run_job_count() {
 
 # fetch_failed_log <run-id> <out-file> — the RAW `gh run view --log-failed`
 # capture, for the callers that need the failure TEXT and not only the ids.
+#
 # Same fail-closed rule as extract_failed_tests: a transport error is a FAILURE,
 # never an empty capture — an unreadable log must not read as "nothing failed"
 # (#3705).
 #
-# The message names WHICH failure this is. "gh error" used to be printed for
-# every non-zero exit, including `log not found` — which points the reader at
-# auth/network for a run whose logs GitHub has simply pruned, so the natural
-# response (re-auth, retry, wait out a rate limit) could never work (#1482).
-# Whatever the reader does next differs per case, so the case is stated.
+# Return: 0 = captured · 1 = FAIL CLOSED (unknowable) · 2 = ZERO-JOB run, which
+# contributes NOTHING and is not an error (the only non-zero status a caller may
+# treat as benign — see #1482).
+#
+# ⚠ ONE MESSAGE PER RUN, EMITTED AFTER the discrimination. Printing the refusal
+# first and then the exemption made the rail say "the failure set is UNKNOWABLE,
+# refusing" and "contributing an EMPTY set" about the SAME run — the exact
+# ambiguity #1482 exists to remove (review cycle 1, P2).
+#
+# The message also names WHICH failure this is. "gh error" used to be printed for
+# every non-zero exit, including `log not found`, pointing the reader at
+# auth/network for a run whose logs GitHub had simply pruned — so the natural
+# responses (re-auth, retry, wait out a rate limit) could not possibly work.
 fetch_failed_log() {
-  local run_id="$1" out="$2" err
+  local run_id="$1" out="$2" err jobs
   # shellcheck disable=SC2086
-  if ! err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
-    case "$err" in
-      *"log not found"*)
-        say_err "ci-failure-set: ✗ run $run_id has NO LOG (GitHub pruned it) — the failure set is UNKNOWABLE, refusing to read this as an empty failing set" ;;
-      *)
-        say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set" ;;
-    esac
-    return 1
+  if err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
+    return 0
   fi
+  # Discriminate BEFORE fail-closing. Only a run that HAS jobs can be hiding a
+  # failure in an unreadable log; a run with none contributes nothing.
+  if jobs="$(run_job_count "$run_id")" && [ "$jobs" = "0" ]; then
+    say_err "ci-failure-set: · run $run_id has ZERO jobs — nothing could have failed; contributing NOTHING for it (not an extraction failure)"
+    return 2
+  fi
+  case "$err" in
+    *"log not found"*)
+      say_err "ci-failure-set: ✗ run $run_id has NO LOG (GitHub pruned it) and DOES have jobs — the failure set is UNKNOWABLE, refusing to read this as an empty failing set" ;;
+    *)
+      say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set" ;;
+  esac
+  return 1
 }
 
 # failed_ids_from_log <log-file> → the ids, via THE canonical parser.
@@ -581,8 +598,18 @@ collect_union() {
     esac
     examined=$((examined + 1))
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
-    local one
-    one="$(extract_failed_tests "$run_id")" || { rm -f "$tmp_set"; return 1; }
+    local one rc
+    one="$(extract_failed_tests "$run_id")"
+    rc=$?
+    case "$rc" in
+      0) ;;
+      # #1482: a zero-job run was counted as `tested` by the completion block
+      # above, but it exercised NOTHING. `tested` is documented as "every run
+      # that actually exercised the revision" and is the main-side gate's signal,
+      # so the credit is taken back rather than left to dilute the rate table.
+      2) tested=$((tested > 0 ? tested - 1 : 0)); continue ;;
+      *) rm -f "$tmp_set"; return 1 ;;
+    esac
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_set"
@@ -634,8 +661,14 @@ collect_union_rates() {
     esac
     examined=$((examined + 1))
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
-    local one
-    one="$(extract_failed_tests "$run_id")" || { rm -f "$tmp_all"; return 1; }
+    local one rc
+    one="$(extract_failed_tests "$run_id")"
+    rc=$?
+    case "$rc" in
+      0) ;;
+      2) tested=$((tested > 0 ? tested - 1 : 0)); continue ;;
+      *) rm -f "$tmp_all"; return 1 ;;
+    esac
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_all"
@@ -682,7 +715,18 @@ collect_union_signatures() {
     examined=$((examined + 1))
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
     log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-    if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file" "$tmp_sigs"; return 1; fi
+    fetch_failed_log "$run_id" "$log_file"
+    local frc=$?
+    if [ "$frc" -eq 2 ]; then
+      # Zero-job run: contributes no ids AND no signature, and must not be
+      # credited as having exercised the suite (#1482).
+      tested=$((tested > 0 ? tested - 1 : 0))
+      rm -f "$log_file"
+      continue
+    fi
+    if [ "$frc" -ne 0 ]; then
+      rm -f "$log_file" "$tmp_sigs"; return 1
+    fi
     # A failing run with NO failure identity contributes nothing to either table
     # (no `FAILED <nodeid>` line AND no attributable guard-step annotation, #4469).
     # Skip the extractor for it: the `signatures` CLI exits 1 on a capture that
@@ -742,7 +786,18 @@ collect_union_rows() {
     examined=$((examined + 1))
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
     log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-    if ! fetch_failed_log "$run_id" "$log_file"; then
+    fetch_failed_log "$run_id" "$log_file"
+    local frc=$?
+    if [ "$frc" -eq 2 ]; then
+      # Zero-job run: contributes nothing (#1482). `examined` has already
+      # advanced without `extracted`, so on the PR side the `examined >
+      # extracted` gate in admin-merge.sh still refuses this run — the PR side
+      # stays fail-closed by construction, which is deliberate.
+      tested=$((tested > 0 ? tested - 1 : 0))
+      rm -f "$log_file"
+      continue
+    fi
+    if [ "$frc" -ne 0 ]; then
       rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1
     fi
     ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1; }
