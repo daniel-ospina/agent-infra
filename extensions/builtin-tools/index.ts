@@ -43,7 +43,7 @@ import * as fs from "node:fs";
 import { spawn, execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import * as path from "node:path";
-import { homedir } from "node:os";
+import { homedir, cpus, freemem } from "node:os";
 import { randomBytes } from "node:crypto";
 import { isPrintMode } from "../shared/print-mode.js";
 import { retry, createCircuitBreaker } from "../shared/retry.js";
@@ -2857,6 +2857,47 @@ export function renderRepoStateLine(repoState: RepoState | null, cwd: string): s
   return `branch=${branch} headSha=${sha} worktree=${cwd} dirty=${dirty} dirtyPaths=${dirtyPaths}`;
 }
 
+/** #1485 (from tortoise#3001): count live `pi` processes — the fleet-concurrency
+ * signal an operator had to reconstruct by hand (`ps` + tty scanning) while
+ * triaging a starved box. `-1` = unknown (ps unavailable/timed out), never a
+ * confident `0`: an absent measurement must not read as "no fleet". */
+export function countPiProcs(): number {
+  try {
+    const out = execSync("ps -Ao comm= 2>/dev/null", { encoding: "utf-8", timeout: 2000 });
+    let n = 0;
+    for (const line of out.split("\n")) {
+      const base = line.trim().split("/").pop() ?? "";
+      if (base === "pi" || base === "pi-coding-agent") n += 1;
+    }
+    return n;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * #1485 (from tortoise#3001): machine-level starvation evidence for the
+ * single-line `Alive state:` rendering.
+ *
+ * Why: the payload is the ONLY triage evidence a parent gets from an abnormal
+ * exit, and a starved box and a provider hang are timing-identical in it. On
+ * 2026-09-11 (#3001) load 131 + ~67 MB free produced four ~20-minute
+ * stream-stalls read — for 80 minutes — as a provider outage (the provider was
+ * fine: the API answered in 1.0s and a later re-dispatch under recovered load
+ * succeeded instantly).
+ *
+ * Measurements ONLY — no verdict and no threshold: whether a given load is
+ * "starved" is a causal claim the harness cannot prove from a number, the same
+ * rule the `tool-dead` headline already follows. `load1` reuses the injectable
+ * `getLoad1()` seam; `cores` makes it interpretable; `piProcs=-1` means
+ * unknown. Never a newline — the Alive state line must stay single-line.
+ */
+export function renderMachineStateLine(): string {
+  const load1 = getLoad1();
+  const freeMB = Math.round(freemem() / (1024 * 1024));
+  return `load1=${load1} cores=${cpus().length} freeMB=${freeMB} piProcs=${countPiProcs()}`;
+}
+
 // ── #783 Task 3: the ONE abnormal-exit composer ─────────────────────
 //
 // The four abnormal-exit killers — hard cap, exit-path cut, heartbeat kill,
@@ -3150,6 +3191,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       .then((s) => { repoState = s; })
       .catch(() => { repoState = null; });
     const repoStateText = (): string => renderRepoStateLine(repoState, targetCwd);
+    // #1485 (from tortoise#3001): machine-level evidence (load/cores/freeMB/pi
+    // procs) so a starved box is not misread as a provider hang. Probed once,
+    // here at the settle path — never per heartbeat tick.
+    const machineStateText = (): string => renderMachineStateLine();
 
     const appendCap = (s: string, add: string, cap: number) => {
       const merged = s + add;
@@ -3458,7 +3503,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
         {
           headline: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`,
+          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`,
           stderrSection: { delimiter: "--- last stderr ---", slice: 2000, trimFirst: false, omitWhenEmpty: false },
           stdoutSection: { delimiter: "--- last stdout ---", slice: 500, trimFirst: false, omitWhenEmpty: false },
         },
@@ -3551,7 +3596,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // zero-partial cut stays retryable by the retry wrapper, mirroring
         // the kill-clause contract.
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
         doResolve(
           !hasOutput
@@ -3781,7 +3826,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // contradicts the `effStreamAgeMs` in the payload beside it.
       const effStreamAgeMs = hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0);
       const effToolAgeMs = hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0);
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s) — treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
@@ -3847,7 +3892,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           return;
         }
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
         doResolve(composeAbnormalExit(
           { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
           {
