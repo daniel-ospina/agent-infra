@@ -1077,7 +1077,8 @@ log_failed "$SIB" > "$SCEN/log-2001"
 i=0
 while [ "$i" -lt 10 ]; do lane_fail main9999 "$((3000 + i))" >> "$SCEN/runs-main"; i=$((i + 1)); done
 # main, TEST LANE only: it fails the very sibling the PR is charged with, over
-# 3 tested runs so the decision can measure a rate (main_red_n).
+# 3 tested runs so MAIN is measurable; the PR's single run is below `min_runs`, so
+# the exemption rides the attribution path (#5250 — see main_red_n).
 main_red_n main8888 4001 3 "$SIB" > "$SCEN/runs-main.by-workflow.python-ci.yml"
 
 run_admin 42 --main-runs 10 --any-workflow >/dev/null 2>&1

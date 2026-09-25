@@ -90,11 +90,14 @@ compared** and **visible**:
 * **signature-scoped** -- an exemption covers the failure that was measured on main,
   not the whole node id. A PR that holds the same RATE while breaking a DIFFERENT
   assertion inside the same test is NOT exempt: same id, different signature.
-* **rate-compared** -- a declared ``K`` on BOTH trees; presence is never sufficient.
-  ``main 1/8`` vs ``PR 8/8`` is an eight-fold regression and must block; a presence
-  test ("it fails on main too") would excuse it.
-* **visible** -- every exemption is RECORDED with both rates. An exemption that
-  exists only as an absence is the fail-open defect itself.
+* **rate-compared** -- a declared ``K`` on the tree that has one; presence is never
+  sufficient. ``main 1/8`` vs ``PR 8/8`` is an eight-fold regression and must block; a
+  presence test ("it fails on main too") would excuse it. Where the PR sample is too
+  small to measure a rate that comparison is not made and the exemption rests on
+  attribution instead (#5250) — never on presence alone.
+* **visible** -- every exemption is RECORDED with the reason and the measurements it
+  rested on (both rates where a rate was measurable; main's rate and ``k_pr`` where it
+  was not). An exemption that exists only as an absence is the fail-open defect itself.
 
 And the parser is **fail-closed** (#3705's rule applied to the exemption parser):
 the union IS an allowlist, so junk in it is a zero-evidence pass. An unparseable or
@@ -498,9 +501,10 @@ def decide(
       removed because it was accepted and never read, which is the shape that
       produced this whole family of defects.
     * PR sample (``k_pr``) below ``min_runs`` -> the RATE dimension is
-      **NOT-MEASURABLE** and is used NEITHER to exempt nor to block (#5250) — except
-      that a main rate of exactly ``0`` is not "measured red" and still falls through
-      to the BLOCK below. The exemption then rests on the attribution question the
+      **NOT-MEASURABLE** and is used NEITHER to exempt nor to block (#5250) — with two
+      exclusions that fall through to the BLOCK below: ``k_pr == 0`` is EMPTY, not
+      thin (the caller is told "pr sample empty"), and a main rate of exactly ``0`` is
+      not "measured red". The exemption then rests on the attribution question the
       gates above already answered — id measured red on main, overlapping signatures,
       main's own row >= ``min_runs`` — and the verdict SAYS the rate was not
       measurable. ``k_pr`` is the PR's declared sample size: ``_cmd_decide`` derives
@@ -508,7 +512,7 @@ def decide(
       file), so this second use of ``min_runs`` is caller-declared and table-wide,
       UNLIKE the per-id MAIN floor above.
     * PR rate materially above main's -> **BLOCK** (the PR made it worse).
-    * otherwise -> **EXEMPT**, recorded with both rates.
+    * otherwise (the rate comparison passed) -> **EXEMPT**, recorded with both rates.
 
     ``main_rates`` is a RATE per id, not a set of ids: presence alone is never
     sufficient, because presence is what excused ``main 1/8`` against ``PR 8/8``.
@@ -889,8 +893,10 @@ _GUARD_KEY_RE = re.compile(r"^guard-step::[A-Za-z0-9_.\-]+::[A-Za-z0-9_.\-]+$")
 #: a measured value). Masked in the identity so the same guard on main and on the
 #: PR compares despite a different number, exactly as a test signature masks a
 #: per-run id. THE TRADE IS DECLARED: guard failures differing ONLY numerically
-#: collapse into one identity, and the rate comparison (plus the per-id
-#: `min_runs` floor) is the backstop that still has to hold for an exemption.
+#: collapse into one identity, and the attribution evidence (the per-id
+#: `min_runs` floor plus signature overlap) together with the rate comparison
+#: where the PR sample is measurable (#5250) is the backstop that still has to
+#: hold for an exemption.
 _GUARD_INT_RE = re.compile(r"\b\d+\b")
 
 

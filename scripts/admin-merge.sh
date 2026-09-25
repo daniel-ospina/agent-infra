@@ -42,8 +42,10 @@
 # `unique = pr-fails − union(main's failing ids over N runs)`. An id that
 # appeared even ONCE in main's window was subtracted FOREVER, so a PR that
 # genuinely BROKE it was EXCUSED and the gate reported GREEN — the more main
-# flaked, the less the gate checked. Presence is never sufficient; only a
-# measured RATE on both trees is. The module that makes that decision ships WITH
+# flaked, the less the gate checked. Presence is never sufficient: main's row must
+# be measured over `min_runs` WITH a matching signature, and the PR rate compared
+# where it is measurable — below that the exemption rests on that same attribution
+# evidence (#5250). The module that makes that decision ships WITH
 # THE RAIL (`scripts/ci_exemption.py`, next to this script) and is deliberately
 # never read from the repo being merged: a grader drawn from the graded system
 # is a bypass.

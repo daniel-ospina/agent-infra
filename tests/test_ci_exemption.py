@@ -218,7 +218,7 @@ def test_5250_a_single_sample_pr_rate_is_not_measurable_and_the_exemption_says_s
     With the PR sample below `min_runs` the rate is used NEITHER to exempt NOR to
     block; the exemption rests on signature + main presence. MUTATION: keep the
     rate comparison for a thin PR sample → this REDs (`1.00 > 0.90`). MUTATION:
-    exempt silently → the two `in lines[0]` assertions RED.
+    exempt silently → the `in lines[0]` assertions RED.
     """
     decision = decide(
         {ID: _f(1, 1, "sg")}, {ID: Rate(3, 5)},
