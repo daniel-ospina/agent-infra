@@ -414,25 +414,71 @@ list_lane_runs() {
 # A failing run whose failed-step log cannot be fetched is an EXTRACTION
 # FAILURE (exit 1), not an empty contribution: silently dropping it is exactly
 # the vacuous pass this rail exists to prevent.
+#
+# ⚠ THE ONE EXCEPTION, and why it does not weaken the rule (#1482). A run with
+# ZERO JOBS is not "an unreadable failure set" — it is an EMPTY one, by
+# construction: there were no steps, so there is no failure for a log to
+# reveal. `gh run view --log-failed` fails IDENTICALLY for that run and for a
+# genuine transport error (both exit 1), so the log fetch alone cannot tell them
+# apart — and treating the empty case as an extraction failure is what made the
+# rail unusable for EVERY merge. See `run_job_count` for the discrimination and
+# `fetch_failed_log` for the message split.
 extract_failed_tests() {
-  local run_id="$1" log_file rc
+  local run_id="$1" log_file rc jobs
   log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-  if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file"; return 1; fi
+  if ! fetch_failed_log "$run_id" "$log_file"; then
+    rm -f "$log_file"
+    # Discriminate BEFORE fail-closing. Only a run that HAS jobs can be hiding a
+    # failure in an unreadable log; a run with none contributes nothing.
+    if jobs="$(run_job_count "$run_id")" && [ "$jobs" = "0" ]; then
+      say_err "ci-failure-set: · run $run_id has ZERO jobs — nothing could have failed; contributing an EMPTY failing set (not an extraction failure)"
+      return 0
+    fi
+    return 1
+  fi
   failed_ids_from_log "$log_file"
   rc=$?
   rm -f "$log_file"
   return $rc
 }
 
+# run_job_count <run-id> → the run's job count on stdout; exit 1 when it cannot
+# be established (unknown repo, API failure, or a non-numeric answer).
+#
+# `gh api` has NO `--repo` flag — it resolves `{owner}/{repo}` from the CURRENT
+# DIRECTORY, which is the cross-repo false result of #4027 — so the path is
+# built from the RESOLVED slug taken from `--repo`. When that slug is absent the
+# count is NOT guessed: the helper fails, and the caller fail-closes exactly as
+# it did before this change.
+run_job_count() {
+  local run_id="$1" count
+  [ -n "${repo:-}" ] || return 1
+  count="$($GH api "repos/${repo}/actions/runs/${run_id}/jobs" --jq '.total_count' 2>/dev/null)" || return 1
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$count"
+}
+
 # fetch_failed_log <run-id> <out-file> — the RAW `gh run view --log-failed`
 # capture, for the callers that need the failure TEXT and not only the ids.
-# Same fail-closed rule as extract_failed_tests: a gh error is a FAILURE, never
-# an empty capture — an unreadable log must not read as "nothing failed" (#3705).
+# Same fail-closed rule as extract_failed_tests: a transport error is a FAILURE,
+# never an empty capture — an unreadable log must not read as "nothing failed"
+# (#3705).
+#
+# The message names WHICH failure this is. "gh error" used to be printed for
+# every non-zero exit, including `log not found` — which points the reader at
+# auth/network for a run whose logs GitHub has simply pruned, so the natural
+# response (re-auth, retry, wait out a rate limit) could never work (#1482).
+# Whatever the reader does next differs per case, so the case is stated.
 fetch_failed_log() {
-  local run_id="$1" out="$2"
+  local run_id="$1" out="$2" err
   # shellcheck disable=SC2086
-  if ! $GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed > "$out" 2>/dev/null; then
-    say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set"
+  if ! err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
+    case "$err" in
+      *"log not found"*)
+        say_err "ci-failure-set: ✗ run $run_id has NO LOG (GitHub pruned it) — the failure set is UNKNOWABLE, refusing to read this as an empty failing set" ;;
+      *)
+        say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set" ;;
+    esac
     return 1
   fi
 }
