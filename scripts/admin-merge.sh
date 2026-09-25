@@ -25,9 +25,11 @@
 #                    UNATTRIBUTABLE: it is neither PR-unique nor exempt (#3756 E5).
 #   residual       ← the EXEMPTION DECISION (scripts/ci_exemption.py decide):
 #                    an id is EXEMPT only when it was measured on main over
-#                    enough runs WITH a matching signature and the PR's failure
-#                    RATE is not materially higher. The residual is the
-#                    decision's BLOCKED ∪ UNATTRIBUTABLE set.
+#                    enough runs WITH a matching signature, and either the PR's
+#                    failure RATE is not materially higher or the PR sample was
+#                    below min_runs (rate not measurable — exempt on the
+#                    attribution evidence alone, stated in the EXEMPT line).
+#                    The residual is the decision's BLOCKED ∪ UNATTRIBUTABLE set.
 #   residual EMPTY          → post head-bound evidence, then merge
 #   residual NON-EMPTY      → re-run the PR's failed jobs ONCE; anything the
 #                             decision then finds EXEMPT is flaky, not new
@@ -40,8 +42,10 @@
 # `unique = pr-fails − union(main's failing ids over N runs)`. An id that
 # appeared even ONCE in main's window was subtracted FOREVER, so a PR that
 # genuinely BROKE it was EXCUSED and the gate reported GREEN — the more main
-# flaked, the less the gate checked. Presence is never sufficient; only a
-# measured RATE on both trees is. The module that makes that decision ships WITH
+# flaked, the less the gate checked. Presence is never sufficient: main's row must
+# be measured over `min_runs` WITH a matching signature, and the PR rate compared
+# where it is measurable — below that the exemption rests on that same attribution
+# evidence (#5250). The module that makes that decision ships WITH
 # THE RAIL (`scripts/ci_exemption.py`, next to this script) and is deliberately
 # never read from the repo being merged: a grader drawn from the graded system
 # is a bypass.
@@ -2318,14 +2322,15 @@ build_evidence() {
   # reaches this point with a zero residual, so every failure the PR carries IS
   # exempt-with-evidence, and recording the set is what lets a reviewer reach
   # `blocked: 0` from the comment instead of taking it on faith.
-  evidence_list "the $pr_count failure(s) this PR carries — all EXEMPT (measured on main with a matching signature and no worse rate)" \
+  evidence_list "the $pr_count failure(s) this PR carries — all EXEMPT (id measured on main with a matching signature; rate compared where the PR sample was measurable)" \
     "$(cat "$pr_fails")" "(none — this PR carries no failure of its own)"
   evidence_list "main baseline: $main_count pre-existing failure(s), for comparison" \
     "$(cat "$main_fails")" "(none)"
   # THE VISIBLE EXEMPTIONS (#3756). An exemption that exists only as an absence
-  # IS the fail-open defect, so every exempt id is printed with BOTH rates and
-  # the reason the decision permitted it.
-  evidence_list 'EXEMPT by the decision (visible — both rates, matching signature)' \
+  # IS the fail-open defect, so every exempt id is printed with the decision's
+  # own reason — which carries both rates only where a rate was measurable, and
+  # says "NOT measurable" when it was not (#5250).
+  evidence_list 'EXEMPT by the decision (visible — the reason and the measurements it rested on)' \
     "$exempt_raw" "(none — no failure was exempted)"
   # The PRE-rerun residual, when the flake path ran. Labelled for what it IS: it
   # is NOT the diff of the two sets above (those are POST-rerun), so it must not

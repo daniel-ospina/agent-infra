@@ -635,10 +635,13 @@ lane_pass() {
 lane_queued() { lane_line in_progress "" "$1" "$2"; }
 
 # A main baseline that EXEMPTS <id> under the #3756 decision: `n` tested runs (at
-# least the module's min_runs floor) in which <id> fails with the SAME signature,
-# so a PR failure at an equal rate is not "materially higher". Before the swap a
-# merge only needed the id to appear ONCE anywhere in main's window; the decision
-# needs a measured RATE, so scenarios that assert a merge must now measure one.
+# least the module's min_runs floor) in which <id> fails with the SAME signature.
+# Before the swap a merge only needed the id to appear ONCE anywhere in main's
+# window; the decision needs MAIN measured over at least min_runs, so scenarios
+# that assert a merge must measure main. These fixtures give the PR a SINGLE
+# failing run, so the PR sample is below min_runs and the exemption is granted on
+# the attribution path (#5250); the rate comparison's own path is exercised by the
+# unit tests and by the `runs=8` DEMO below.
 main_red_n() {  # <sha> <base-run-id> <n> <id>  -> lane-run lines on stdout
   local sha="$1" base="$2" n="$3" id="$4" i=0
   while [ "$i" -lt "$n" ]; do
@@ -960,7 +963,8 @@ printf '%s\n' "$HEAD_SHAPE" > "$SCEN/head"
 lane_fail "$HEAD_SHAPE" 901 > "$SCEN/runs-$HEAD_SHAPE"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-901"
 # 3 main runs failing the SAME id with the SAME signature: enough for the decision
-# to measure a rate and exempt the PR's equal one (see main_red_n).
+# to measure MAIN; the PR's single run is below `min_runs`, so the exemption rides
+# the attribution path (#5250 — see main_red_n).
 main_red_n main6666 1001 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1
 if [ -f "$SCEN/comment" ]; then
@@ -982,7 +986,7 @@ if [ -f "$SCEN/comment" ]; then
   n=$(grep -c 'tests/test_other.py::test_red_on_main' "$c" || true)
   [ "$n" -ge 2 ] && pass "both failing sets are listed verbatim ($n occurrences: PR set + main baseline)" \
     || fail "expected the failing test id in both sets, got $n — the auditable diff is not recorded"
-  grep -q 'all EXEMPT (measured on main with a matching signature and no worse rate)' "$c" \
+  grep -q 'all EXEMPT (id measured on main with a matching signature; rate compared where the PR sample was measurable)' "$c" \
     && pass "the PR-carried set is labelled as exempt-with-evidence" || fail "PR-set label missing"
   grep -q 'main baseline: 1 pre-existing failure(s), for comparison' "$c" \
     && pass "main's baseline set is listed for comparison" || fail "main baseline set missing"
@@ -1073,7 +1077,8 @@ log_failed "$SIB" > "$SCEN/log-2001"
 i=0
 while [ "$i" -lt 10 ]; do lane_fail main9999 "$((3000 + i))" >> "$SCEN/runs-main"; i=$((i + 1)); done
 # main, TEST LANE only: it fails the very sibling the PR is charged with, over
-# 3 tested runs so the decision can measure a rate (main_red_n).
+# 3 tested runs so MAIN is measurable; the PR's single run is below `min_runs`, so
+# the exemption rides the attribution path (#5250 — see main_red_n).
 main_red_n main8888 4001 3 "$SIB" > "$SCEN/runs-main.by-workflow.python-ci.yml"
 
 run_admin 42 --main-runs 10 --any-workflow >/dev/null 2>&1
@@ -1167,7 +1172,8 @@ printf '0' > "$SCEN/head-seq-count"
 lane_fail "$HEAD_HM" 7001 > "$SCEN/runs-$HEAD_HM"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7001"
 # The decision path must be CLEAN for this scenario to reach the head-move check:
-# main fails the SAME id over 3 tested runs, so the PR's equal rate is exempt.
+# main fails the SAME id over 3 tested runs, so the decision exempts the PR's
+# single-run failure on the attribution path (#5250).
 main_red_n main5555 7002 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
@@ -2100,8 +2106,9 @@ lane_fail "$HEAD_MM" 9301 > "$SCEN/runs-$HEAD_MM"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9301"
 # main's rate must be MEASURED (at or above the decision's min_runs floor) for
 # the PR failure to be exempted and the merge to be REACHED at all: the union
-# rail decides on a RATE, and a single main sample can never establish one
-# (fail-closed). Before the swap a mere presence in main's window sufficed.
+# rail cannot exempt without MAIN measured over enough runs, and a single main
+# sample can never establish one (fail-closed). Before the swap a mere presence
+# in main's window sufficed.
 main_red_n mainmm 9302 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1
 if grep -q "pr merge 42 --admin --squash --match-head-commit $HEAD_MM" "$SCEN/calls"; then
@@ -5275,10 +5282,10 @@ out="$(cat "$TMP/cfs-out")"
 grep -q "guard-steps=1" "$TMP/cfs-err" && pass "(a) …and REPORTS the attribution (guard-steps=1)" \
   || fail "(a) the attribution is silent: $(head -3 "$TMP/cfs-err")"
 
-# (b) THE RAIL: a guard-only failing head, with main red on the SAME guard at an
-# equivalent rate, is no longer REFUSED at step 1c — the comparison runs and the
-# exemption is recorded, so the merge proceeds. Main's orphan COUNT differs from
-# the PR's on purpose: the identity must survive the count moving.
+# (b) THE RAIL: a guard-only failing head, with main red on the SAME guard and the
+# PR's single run below `min_runs`, is no longer REFUSED at step 1c — the
+# attribution exemption (#5250) is recorded, so the merge proceeds. Main's orphan
+# COUNT differs from the PR's on purpose: the identity must survive the count moving.
 new_scen guardmerge
 printf '%s\n' "$HEAD_GP" > "$SCEN/head"
 lane_fail "$HEAD_GP" 9411 > "$SCEN/runs-$HEAD_GP"
