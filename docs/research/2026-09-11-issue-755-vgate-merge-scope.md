@@ -102,6 +102,9 @@ can only cost time, never coverage.
   scope) keeps pre-#755 semantics: no subtraction.
 - **Rebase / cherry-pick push-leg de-flooding** is **#737**'s deliverable; #737
   stays open and parked so this change does not silently absorb it.
+  *(Delivered 2026-09-25 as tortoise #3716 — the ancestry-conditional tier this
+  research named as the sound alternative to a reflog ref. See the fold-in in
+  `docs/plans/2026-09-11-755-vgate-merge-scope.md` §8.)*
 - **`git merge` itself remains un-gated** — tracked as **#770**. This change
   covers the *commit* and *push* that consume a merge, not the merge command.
 - The `scopeFiles` stash-recovery arm was **dropped**, not repaired: its fallback

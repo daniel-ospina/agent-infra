@@ -195,6 +195,8 @@ A first attempt at hardening the status parser was built on a **false premise** 
 
 Rebase/cherry-pick push-leg de-flooding (#737) · tier A/B/C semantics (unchanged) · `MERGE_HEAD` probing (misses `--squash`/octopus/rebase) · `verifiedSet`/bridge writes (#472 D1) · adding `npm ci` to a PR-triggered job.
 
+> **Superseded in part (2026-09-25, tortoise #3716).** Two entries above no longer hold: the rebase push-leg de-flooding **landed** — exactly the mechanism this issue's parked disposition named as the alternative to a reflog ref ("make the tier conditional on ancestry": tracking ref an ancestor ⇒ tier A 2-dot unchanged; otherwise 3-dot against the trusted base) — and "tier A/B/C semantics (unchanged)" therefore no longer describes the base SELECTION, only the argv builder. The subtraction's guards 4/5 are untouched and simply do not fire for a rewritten-history push. The narrowing is taken only on TWO explicit proofs — the tracking ref is not an ancestor AND the integration base IS one (without the second, a branch merely BEHIND the base narrows to an EMPTY range and a content-reverting force-push is reported as an up-to-date no-op; the verification dispatch caught that in the first cut). e2e scenarios 83/84/85/86 carry the two-direction pin, that fail-open guard, and the empty-range rewrite report (`#737): rebase push range excludes base-identical paths`), and the skill's push-range paragraph (`skills/commit-workflow/workflow/01-preflight.md`) was updated in the same change.
+
 ## 9. Residuals (open, tracked — not promises)
 
 - **#770** — one-shot merge verbs (`gh pr merge`) are un-gated, so a merge parent is a freely chosen input.

@@ -511,7 +511,28 @@ the push actually ships — not the whole index: `git diff
 refs/remotes/<remote>/<branch> <src>` when the remote-tracking ref exists
 (2-dot), or 3-dot against the remote's main on a first push
 (`refs/remotes/<remote>/main` when that ref exists, else the
-`refs/remotes/origin/main` fallback). A parked-WIP index from another session
+`refs/remotes/origin/main` fallback). ⛔ **A HISTORY-REWRITING push is scoped
+against the integration base, never the stale tracking ref (#3716).** When the
+remote-tracking ref is no longer an ancestor of the pushed tip — i.e. the
+branch was `rebase`d after it was pushed — the ref still points at the
+PRE-rebase tip on the OLD base, so the 2-dot range is the whole base delta
+(629 files in the field) instead of the branch's own diff (3), and the retry
+loop cannot converge. Such a push is scoped 3-dot against the integration base
+— exactly the first-push command — and the discarded commits are reported
+separately as `gate_skip: non_fast_forward_push` (a report, never a widening of
+the verify set). That switch needs TWO explicit proofs: the remote-tracking ref
+is NOT an ancestor of the pushed tip, **and** the integration base IS an
+ancestor-or-equal of it (so `merge-base(base, HEAD) == base` and every path the
+3-dot range omits is byte-identical to the base TIP's content — the trusted
+integration content). Without the second proof a branch that is merely behind
+the base would narrow to a range that omits the paths its force-push REVERTS,
+reporting a content-destroying push as an empty up-to-date one. Any other
+outcome, including an unresolvable probe, leaves the push on its pre-#3716 path
+— the narrowing is taken only on proof, so an unprovable push is never measured
+against a different base than before. A plain fast-forward push is unchanged
+(the narrow incremental range). A rewrite push is never ALSO reported as an
+up-to-date empty range — its single op-level line is the rewrite report. A
+parked-WIP index from another session
 must not block an unrelated push of already-verified committed HEAD; an
 up-to-date push is audited `gate_skip: push_range_empty`. ⛔ Fail-closed
 fallbacks (the range scope is a best-effort resolution, never a widening):
@@ -585,8 +606,12 @@ coverage for every upstream file: recorded incidents went from 39 staged files t
   never coverage.
 
 Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
-`git push` (tier A only; the tier-B/C paths keep their pre-#755 behaviour). Tier-C push
-fallback and rebase/cherry-pick push-leg de-flooding (#737) are deliberate non-goals.
+`git push` (the tracking-ref arm only while that ref is an ANCESTOR of the pushed tip;
+the tier-B/C paths keep their pre-#755 behaviour). Tier-C push fallback remains a
+deliberate non-goal; **rebase/cherry-pick push-leg de-flooding (#737, delivered in
+2026-09-25 as tortoise #3716) is no longer one** — a history-rewriting push is now
+scoped against the trusted base (3-dot), and the subtraction's guards 4/5 simply do
+not fire for it (see the push-range paragraph above).
 
 ### VGATE ceremony diagnostics & recovery (#561)
 

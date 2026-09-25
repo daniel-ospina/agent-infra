@@ -2554,6 +2554,9 @@ async function main() {
     ok(legB.reason.includes("wip55.ts"), "55b: block names the parked WIP");
     // Leg (c): force-push 2-dot over a DIVERGED origin/main — the D-row comes
     // from the REF tree (a remote-side-only file), never from a local git rm.
+    // It stays on the 2-dot path after #3716: origin/main is not an ancestor of
+    // HEAD, so the rewrite narrowing's proof (1) does not hold and the push is
+    // measured against the tracking ref exactly as before.
     // The sibling commit is PATHSpec-limited (scenario 44-leg-4 precedent) so
     // the still-staged wip55.ts is NOT swept into the sibling tree — a plain
     // add+commit would empty the main index and kill this leg's RED.
@@ -4372,6 +4375,263 @@ async function main() {
       "82: the SIBLING checkout's staged file is never named — the root is not the session's repo");
     ok(res.reason.includes(wt),
       `82: the reported Project root is the operated-on repo (${wt})`);
+  });
+
+  // ── #3716 — a REBASED branch is unpushable ────────────────────────────────
+  // The issue's reproduction, reproduced as fixture geometry: `git rebase
+  // origin/main` on an ALREADY-PUSHED branch leaves the remote-tracking ref on
+  // the pre-rebase tip (a different base), so the tier-A 2-dot range
+  // `diff refs/remotes/origin/feat HEAD` is no longer "what this push changes"
+  // — it is main's whole delta PLUS the branch's own files, and the required
+  // set explodes (3 → 629 in the field). The true change is
+  // `git diff origin/main...HEAD` = the branch's own files.
+  // ⛔ ONE DEFECT, FIVE FILINGS — do not re-file it a sixth time. The family is
+  // agent-infra #737 (the rebase repro + the recorded fix direction: make the
+  // tier CONDITIONAL ON ANCESTRY) → #811 → #914, closed out as MUTUAL duplicates
+  // (#737 ↦ #914 and #914 ↦ #737) with no fix landed, #914 having re-reproduced
+  // the bug at close time → tortoise #3716 (this one). The scenario name below
+  // carries #737's recorded greppable trigger (`#737): rebase push range
+  // excludes base-identical paths`) so the deliverable is findable.
+  test("scenario 83 (#3716/#737): rebase push range excludes base-identical paths — scoped 3-dot against the trusted base, never the stale tracking ref", async () => {
+    const remote = join(TEST_ROOT, "repo-3716-origin.git");
+    mkdirSync(remote, { recursive: true });
+    git(remote, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + remote);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    // The branch's own work, pushed BEFORE the rebase — the trigger: a real
+    // remote-tracking ref pinned to the pre-rebase tip.
+    git(repo, "checkout -q -b feat");
+    const branchFiles = ["branch-a.ts", "branch-b.ts", "branch-c.ts"];
+    for (const f of branchFiles) writeFileSync(join(repo, f), f + "\n");
+    // …plus a DELETION the branch carries (`baseline.ts` is on main). A rewrite
+    // push's range can hold D rows — the merge-base tree is the base here — so
+    // the range-path deletion policy (a D row is content-free: ENOENT-skipped,
+    // never name-blocked, never a forever-block) needs a live pin ON THIS PATH.
+    git(repo, "rm -q baseline.ts");
+    git(repo, "add .");
+    git(repo, "commit -q -m branch-work");
+    git(repo, "push -q -u origin feat");
+    const preRebaseTip = git(repo, "rev-parse refs/remotes/origin/feat");
+    // main advances with unrelated files — exactly the delta the stale ref imports.
+    git(repo, "checkout -q main");
+    const mainDelta = Array.from({ length: 6 }, (_, i) => `main-delta-${i}.ts`);
+    for (const f of mainDelta) writeFileSync(join(repo, f), f + "\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m upstream-advance");
+    git(repo, "push -q origin main");
+    // The rebase the issue describes.
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q origin");
+    git(repo, "rebase -q origin/main");
+
+    equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
+      "83: (fixture) the rebase landed cleanly — merge-base(HEAD, origin/main) == origin/main");
+    equal(git(repo, "rev-parse refs/remotes/origin/feat"), preRebaseTip,
+      "83: (fixture) the remote-tracking ref still points at the PRE-rebase tip");
+    const ownDiff = git(repo, "diff --name-only origin/main...HEAD").split("\n").filter(Boolean).sort();
+    equal(ownDiff.join(","), [...branchFiles, "baseline.ts"].sort().join(","),
+      "83: (fixture) the branch's OWN diff is its 3 authored files plus the file it deleted — the true change, not main's delta");
+    ok(git(repo, "diff --name-status origin/main...HEAD").includes("D\tbaseline.ts"),
+      "83: (fixture) the deletion is a D row on the REWRITE path (merge-base tree = the base) — this leg owns the range-path deletion policy now that a diverged tracking ref no longer takes the 2-dot path");
+    const staleRange = git(repo, "diff --name-only refs/remotes/origin/feat HEAD").split("\n").filter(Boolean);
+    ok(mainDelta.every((f) => staleRange.includes(f)),
+      `83: (fixture) the 2-dot range against the STALE ref is main's delta (${staleRange.length} files), not the branch's change (${ownDiff.length}) — the issue's explosion geometry`);
+    ok(!branchFiles.some((f) => staleRange.includes(f)),
+      "83: (fixture) the branch's OWN files are OUT of the stale range — pre-fix the gate demands main's delta and not even the rebased branch's own files");
+
+    await fire("session_start", {});
+    const before83 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease origin feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "83: the unverified rebased branch still BLOCKS — the fix must narrow the SCOPE, never allow an unverified push outright");
+    for (const f of mainDelta) {
+      ok(!res.reason.includes(f),
+        `83: the block does NOT name ${f} — main's delta is not this push's change (RED pre-fix: the stale tracking ref imports every one of them)`);
+    }
+    for (const f of branchFiles) {
+      ok(res.reason.includes(f), `83: the block names the branch's own file ${f}`);
+    }
+    ok(!res.reason.includes("baseline.ts"),
+      "83: the D row is content-free — ENOENT-skipped, never named, so a rebased branch that deletes a file main carries can never forever-block (the #487 leg-c policy, re-pinned on the path that carries the row now)");
+    // The separately-REPORTED rewrite condition (the issue's Fix section): the
+    // stale ref's real signal is "this push discards commits", which belongs in
+    // the audit, never in the verification scope.
+    const rewrite = readAuditLines().slice(before83)
+      .find((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push") as any;
+    ok(rewrite, "83: the history-rewrite condition is explicitly reported (audited) instead of silently expanding the scope");
+    equal(rewrite.discardedCommits, 1,
+      "83: the report carries the count of commits this push discards (the pre-rebase tip's own work)");
+    equal(rewrite.trackingRef, "refs/remotes/origin/feat", "83: the report names the stale ref it detected");
+    // ACCEPTANCE: verifying ONLY the branch's own changes makes the rebased push
+    // possible. A 3-file PASS cannot clear a main-delta-sized requirement — the
+    // extra paths are outside the block context, so scopeFiles drops them and
+    // the retry would re-block (zero-merge).
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: ${branchFiles.join(", ")}. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: branchFiles.map((f) => ({ path: join(repo, f), hash: sha(f + "\n") })),
+      }) }],
+    });
+    const retry = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease origin feat", cwd: repo },
+    }, { cwd: repo });
+    equal(retry, undefined,
+      "83: ACCEPTANCE — the rebased branch is PUSHABLE after verifying only its own 3 files (RED pre-fix: a main-delta-sized requirement is not cleared by 3 verified files)");
+  });
+
+  test("scenario 84 (#3716/#737): rebase push range excludes base-identical paths — CONTROL: an ancestor tracking ref still resolves 2-dot, so the tier-A fast-forward case is not silently narrowed", async () => {
+    // The counterweight to 83: the fix must key on the REWRITE (tracking ref not
+    // an ancestor of the pushed tip), not on "a branch with a tracking ref". If
+    // it narrowed every push to the branch-vs-base diff, an already-justified
+    // increment would demand its whole branch history's files — a wider scope,
+    // and this leg's first assert would still name only the increment.
+    const repo = join(TEST_ROOT, "repo-3716-ff");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base84.ts"), "b\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m base");
+    const base84 = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${base84}`);
+    git(repo, "checkout -q -b feat");
+    // Already-pushed work (tracking ref = this tip ⇒ an ordinary fast-forward push).
+    writeFileSync(join(repo, "pushed84.ts"), "p\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m already-pushed");
+    const pushed84 = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/feat ${pushed84}`);
+    // The increment this push actually ships.
+    writeFileSync(join(repo, "increment84.ts"), "i\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m increment");
+    await fire("session_start", {});
+    const before84 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true, "84: blocks on the unverified increment");
+    ok(res.reason.includes("increment84.ts"), "84: the block names the pushed increment");
+    ok(!res.reason.includes("pushed84.ts"),
+      "84: the already-pushed file is NOT demanded — a fast-forward push keeps the narrow 2-dot range (a branch-vs-base narrowing would name it)");
+    ok(!readAuditLines().slice(before84).some((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push"),
+      "84: no rewrite report on a genuine fast-forward push (the report must not cry wolf)");
+  });
+
+  test("scenario 85 (#3716/#737): the narrowing needs the integration base to BE an ancestor — a BEHIND branch that would REVERT base content keeps the 2-dot scope", async () => {
+    // The counterexample the verification dispatch found against the first cut
+    // of this fix, reproduced. That cut keyed only on "the tracking ref is not
+    // an ancestor", so a branch that is NOT based on origin/main (here: local
+    // main BEHIND origin/main after origin's base.txt moved to v2) narrowed to
+    // `git diff origin/main...HEAD` — which for a behind branch is EMPTY, so a
+    // force-push that REVERTS base.txt to the older blob was reported as an
+    // up-to-date no-op (`push_range_empty`) and ALLOWED. Measured on this
+    // fixture, untightened: 2-dot = `M base.txt` (block), 3-dot = empty (allow).
+    // Requiring the integration base itself to be an ancestor pins the 2-dot
+    // range here, so the reverted path is still demanded. Fail-closed both ways:
+    // 83 must narrow, 85 must not.
+    const repo = join(TEST_ROOT, "repo-3716-behind");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base85.txt"), "v1\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m c0");
+    // origin/main advances, modifying (not merely adding) a file the behind
+    // branch still carries at the OLD blob — the modification is what makes the
+    // 3-dot range omit a path the force-push would revert.
+    git(repo, "checkout -q -b upstream");
+    writeFileSync(join(repo, "base85.txt"), "v2\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m c1");
+    const c1 = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${c1}`);
+    git(repo, "checkout -q main"); // local main is BEHIND origin/main
+    await fire("session_start", {});
+    const before85 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force origin main", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "85: a force-push that REVERTS the integration base's content must BLOCK — the untightened fix reported this as an empty up-to-date push (fail-OPEN)");
+    ok(res.reason.includes("base85.txt"),
+      "85: the block names the path the push would revert (2-dot `M` row); a 3-dot narrowing omits it entirely");
+    ok(!readAuditLines().slice(before85).some((l) => l.event === "gate_skip" && l.reason === "push_range_empty"),
+      "85: and it is never reported as an up-to-date no-op — the audit must not claim nothing ships");
+  });
+
+  test("scenario 86 (#3716/#737): a rewrite push with an EMPTY narrowed range is reported as a history rewrite — never as an up-to-date no-op", async () => {
+    // The empty-range corner: the pushed tip's tree IS the integration base
+    // (a branch reset onto origin/main) while the remote-tracking ref still holds
+    // the branch's old, discarded commits. The narrowed range is empty, so
+    // nothing unverified ships (allow is correct), BUT the push rewrites the
+    // remote branch and discards commits — so the op must be reported as the
+    // rewrite it is. `push_range_empty` means "an up-to-date push ships
+    // nothing"; emitting it here would report a history-rewriting force-push as
+    // a no-op. The rewrite report is the op's single op-level line.
+    const remote = join(TEST_ROOT, "repo-3716-empty-origin.git");
+    mkdirSync(remote, { recursive: true });
+    git(remote, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716-empty");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + remote);
+    writeFileSync(join(repo, "base86.ts"), "b\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "work86.ts"), "w\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m branch-work");
+    git(repo, "push -q -u origin feat");
+    // main advances, then the branch is RESET onto it — the branch's pushed
+    // commit is now discarded and its tree equals the base's.
+    git(repo, "checkout -q main");
+    writeFileSync(join(repo, "upstream86.ts"), "u\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m upstream-advance");
+    git(repo, "push -q origin main");
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q origin");
+    git(repo, "reset -q --hard origin/main");
+    equal(git(repo, "diff --name-only origin/main HEAD"), "",
+      "86: (fixture) the pushed tip's tree IS the integration base — the narrowed range is empty");
+    equal(git(repo, "rev-parse refs/remotes/origin/feat").length, 40,
+      "86: (fixture) the tracking ref still holds the discarded branch commit");
+    await fire("session_start", {});
+    const before86 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease origin feat", cwd: repo },
+    }, { cwd: repo });
+    equal(res, undefined, "86: ALLOWED — the range is empty and every byte it lands is trusted base content");
+    const fresh86 = readAuditLines().slice(before86);
+    const rewrite86 = fresh86.find((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push") as any;
+    ok(rewrite86, "86: the rewrite is explicitly reported even when the narrowed range is empty");
+    equal(rewrite86.discardedCommits, 1, "86: the report carries the discarded commit count");
+    ok(!fresh86.some((l) => l.event === "gate_skip" && l.reason === "push_range_empty"),
+      "86: and the op is NOT also reported as an up-to-date empty range (RED against the unsuppressed first cut)");
   });
 
   test("scenario 1092: a DIRECTORY symlink commits its LINK TARGET — never a permanent EISDIR block (#1092)", async () => {
