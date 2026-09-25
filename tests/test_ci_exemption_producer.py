@@ -446,11 +446,51 @@ def test_cli_decide_a_single_sample_pr_rate_is_not_measurable(tmp_path, capsys):
     out = capsys.readouterr().out
 
     assert rc == 0, out
-    line = exempt.read_text(encoding="utf-8")
-    assert line.startswith("EXEMPT:")
-    assert "NOT measurable" in line, line
-    assert "signature + main presence" in line, line
+    lines = exempt.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("EXEMPT:")
+    assert "NOT measurable" in lines[0], lines[0]
+    assert "signature + main presence" in lines[0], lines[0]
+    assert "main 3/5" in lines[0], lines[0]
+    assert "5 run(s)" in lines[0], lines[0]
     assert "VERDICT\tCLEAN" in out
+
+
+def test_cli_decide_the_pr_floor_uses_the_declared_table_max(tmp_path, capsys):
+    """The CLI's `k_pr = max(row.runs)` is the floored quantity, not a row's runs.
+
+    A two-row PR file (5 and 1 runs) declares `k_pr=5`, so the `1/1` row is COMPARED
+    and both rows BLOCK. MUTATION: floor on `pr.rate.runs` instead of the declared
+    `k_pr` → the `1/1` row is floored and exempted, so `blocked` shrinks to 1 and an
+    EXEMPT line appears → RED.
+    """
+    other = "tests/test_other.py::TestT::test_other"
+    pr = _write(
+        tmp_path, "pr.txt",
+        f"{DR}\t5\t5\tAssertionError: assert 3 == 2\n"
+        f"{other}\t1\t1\tAssertionError: assert 3 == 2\n",
+    )
+    mainf = _write(tmp_path, "main.txt", f"{DR}\t3\t5\n{other}\t3\t5\n")
+    msig = _write(
+        tmp_path, "msig.txt",
+        f"{DR}\tAssertionError: assert 3 == 2\n{other}\tAssertionError: assert 3 == 2\n",
+    )
+    blocked = tmp_path / "blocked.txt"
+    exempt = tmp_path / "exempt.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig, "--blocked-out", str(blocked),
+            "--exempt-out", str(exempt),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 1, out
+    assert sorted(blocked.read_text(encoding="utf-8").split()) == [DR, other]
+    assert exempt.read_text(encoding="utf-8") == "", "the declared k=5 floors neither row"
+    assert "blocked=2" in out
 
 
 def test_cli_decide_rotation_is_unattributable_and_gates(tmp_path, capsys):

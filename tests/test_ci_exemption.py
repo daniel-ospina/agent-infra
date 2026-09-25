@@ -230,10 +230,17 @@ def test_5250_a_single_sample_pr_rate_is_not_measurable_and_the_exemption_says_s
     assert len(lines) == 1, "the exemption must be recorded, never silent"
     assert "NOT measurable" in lines[0], lines[0]
     assert "signature + main presence" in lines[0], lines[0]
+    assert "main 3/5" in lines[0], lines[0]
+    assert "k_pr=1" in lines[0], lines[0]
+    assert "5 run(s)" in lines[0], lines[0]
 
 
 def test_5250_a_thin_pr_sample_does_not_exempt_a_disjoint_signature():
-    """The fallback IS the attribution question — a different failure still BLOCKs."""
+    """The fallback IS the attribution question — a different failure still BLOCKs.
+
+    MUTATION: disable the signature gate (`if False:`) → this REDs (the thin sample
+    would fall through to the rate floor and EXEMPT a failure main never had).
+    """
     decision = decide(
         {ID: _f(1, 1, "sg-pr")}, {ID: Rate(3, 5)},
         main_signatures={ID: frozenset({"sg-main"})}, k_pr=1,
@@ -245,7 +252,16 @@ def test_5250_a_thin_pr_sample_does_not_exempt_a_disjoint_signature():
 
 
 def test_5250_a_thin_pr_sample_does_not_exempt_an_id_main_never_failed():
-    """Membership is required: an id absent from main's table is PR-unique."""
+    """Membership is required: an id absent from main's table is PR-unique.
+
+    MASKING, stated so the mutation claim is accurate: with `main_signatures` keyed
+    only by `other`, removing the `mr is None` gate makes the SIGNATURE gate
+    intercept first (the missing main signature fails the overlap check), so the
+    mutation does not surface as an exemption here — the reason assertion is what
+    pins the membership gate. MUTATION: remove the `mr is None` membership block →
+    the blocked reason changes → this REDs on the `"no main-side measurement"`
+    assertion.
+    """
     other = "tests/test_other.py::TestT::test_other"
     decision = decide(
         {ID: _f(1, 1, "sg")}, {other: Rate(3, 5)},
@@ -258,7 +274,11 @@ def test_5250_a_thin_pr_sample_does_not_exempt_an_id_main_never_failed():
 
 
 def test_5250_a_measured_pr_sample_still_compares_rates():
-    """`k_pr >= min_runs` behaviour is UNCHANGED: a materially worse PR blocks."""
+    """`k_pr >= min_runs` behaviour is UNCHANGED: a materially worse PR blocks.
+
+    MUTATION: make the PR floor unconditional (`if True:`) → this REDs (the `3/3`
+    sample is exempted instead of compared).
+    """
     decision = decide(
         {ID: _f(3, 3, "sg")}, {ID: Rate(3, 5)},
         main_signatures={ID: frozenset({"sg"})}, k_pr=3,
@@ -284,13 +304,123 @@ def test_5250_a_thin_pr_sample_does_not_bypass_the_zero_main_rate_guard():
 
 
 def test_5250_an_undeclared_pr_sample_preserves_the_rate_comparison():
-    """`k_pr=None` = the caller declared no PR sample; not a free exemption."""
+    """`k_pr=None` = the caller declared no PR sample; not a free exemption.
+
+    The HISTORICAL comparison still runs, so a materially-worse PR blocks BY THE
+    RATE COMPARISON — asserted on the reason, so a hard-block-on-`None` regression
+    is distinguishable from the comparison this test is named for. The complement
+    (equivalent rates are still exempt) is pinned by the test below.
+    """
     decision = decide(
         {ID: _f(1, 1, "sg")}, {ID: Rate(3, 5)},
         main_signatures={ID: frozenset({"sg"})},
     )
 
     assert decision.any_blocked
+    assert "materially higher" in decision.blocked[0].reason
+    assert decision.visible_exemptions() == []
+
+
+def test_5250_an_undeclared_pr_sample_can_still_exempt_on_the_rates():
+    """The complement: with `k_pr=None` the rate comparison can still EXEMPT.
+
+    Asserted on the RECORDED REASON, so the #5250 fallback's "NOT measurable" line
+    cannot satisfy it: routing `k_pr is None` through the PR-floor branch would RED
+    here. MUTATION: hard-block when `k_pr is None` (add it to the rate comparison's
+    condition) → this REDs; the sibling above names the opposite mutation.
+    """
+    decision = decide(
+        {ID: _f(3, 8, "sg")}, {ID: Rate(4, 8)},
+        main_signatures={ID: frozenset({"sg"})},
+    )
+
+    lines = decision.visible_exemptions()
+    assert not decision.any_blocked
+    assert len(lines) == 1
+    assert "rates equivalent" in lines[0], lines[0]
+
+
+def test_5250_a_thin_pr_sample_does_not_rescue_a_thin_main_row():
+    """The MAIN floor is checked BEFORE the PR floor: a thin PR sample must not
+    exempt a single-observation main row.
+
+    Both sides thin is the NORMAL production shape (`k_pr = max(row.runs)` is 1 for
+    a head tested once). If the two floors were collapsed or reordered so the
+    PR-side NOT-MEASURABLE fallback could decide first, `main 1/1` would be exempted
+    off an unmeasurable main rate — bypass 1b as a false PASS. MUTATION: make the
+    main floor skip when `k_pr < min_runs` → this REDs. MUTATION: reorder the floors
+    → same.
+    """
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {ID: Rate(1, 1)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=1,
+    )
+
+    assert decision.any_blocked
+    assert any("insufficient evidence" in n for n in decision.notes)
+    assert decision.visible_exemptions() == []
+
+
+def test_5250_a_thin_pr_sample_does_not_preempt_the_rotating_identity_gate():
+    """The UNATTRIBUTABLE (rotating) gate runs BEFORE the PR floor — even when thin.
+
+    Main has a WELL-MEASURED, signature-matching row for the id, so every other gate
+    would let a thin PR sample exempt; the rotating identity must still win. The
+    existing E5 test calls ``decide`` without ``k_pr`` (=None), so it never exercises
+    the interaction. MUTATION: hoist the PR-floor block above the rotating check →
+    this REDs (an UNATTRIBUTABLE id is EXEMPTed off a thin sample).
+    """
+    other = "tests/test_dr_endpoints.py::TestDrDrill::test_some_other"
+    rotating = detect_rotating_identity([frozenset({ID}), frozenset({other})])
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {ID: Rate(3, 5)},
+        main_signatures={ID: frozenset({"sg"})},
+        rotating=rotating, k_pr=1,
+    )
+
+    assert [v.nodeid for v in decision.unattributable] == [ID]
+    assert decision.blocked == []
+    assert decision.visible_exemptions() == []
+
+
+def test_5250_a_zero_declared_sample_is_not_an_exemption():
+    """`k_pr=0` is not "thin": it is EMPTY, and it must not take the fallback.
+
+    A `k_pr` of 0 would satisfy `< min_runs` while the caller has already been told
+    "pr sample empty — treating every failure as PR-side". The two must not
+    disagree. MUTATION: `k_pr < min_runs` without the lower bound → this REDs (the
+    row is exempted off no PR sample at all).
+    """
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {ID: Rate(3, 5)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=0,
+    )
+
+    assert decision.any_blocked
+    assert any("pr sample empty" in n for n in decision.notes)
+    assert decision.visible_exemptions() == []
+
+
+def test_5250_a_thin_pr_sample_exempts_on_attribution_at_a_low_main_rate():
+    """The #5250 boundary, stated: below the PR floor the RATE is not consulted.
+
+    The PR is red once (`1/1`) and main is measured red only `1/8`. The rate
+    comparison would block (`1.00 > 0.15`) — and did, BY CONSTRUCTION, which is the
+    defect this change removes. The exemption rests on the attribution question the
+    issue authorizes (id present, signature matching, main's OWN row >= `min_runs`)
+    and the verdict says the rate was not measurable. This is the deliberate,
+    owner-authorized re-scoping of the E1/E3 classes to `k_pr >= min_runs`; it is
+    pinned so the boundary is asserted, not only documented.
+    """
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {ID: Rate(1, 8)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=1,
+    )
+
+    lines = decision.visible_exemptions()
+    assert not decision.any_blocked
+    assert len(lines) == 1
+    assert "NOT measurable" in lines[0], lines[0]
 
 
 # ── E4 · the exemption must be VISIBLE ────────────────────────────────────

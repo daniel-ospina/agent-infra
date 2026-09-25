@@ -492,16 +492,21 @@ def decide(
     * id unknown to main's measurement -> **BLOCK** (no evidence of pre-existence).
     * signature disjoint from main's -> **BLOCK** (a DIFFERENT failure inside an id
       main also failed; same id is not same failure).
-    * THIS id's main row measured over fewer than ``min_runs`` runs -> **BLOCK**
-      (insufficient evidence; one observation cannot establish a rate). The floor is
+    * THIS id's MAIN row measured over fewer than ``min_runs`` runs -> **BLOCK**
+      (insufficient evidence; one observation cannot establish a rate). That floor is
       PER-ID and has no table-wide or caller-declared form: a ``k_main`` knob was
       removed because it was accepted and never read, which is the shape that
       produced this whole family of defects.
     * PR sample (``k_pr``) below ``min_runs`` -> the RATE dimension is
-      **NOT-MEASURABLE** and is used NEITHER to exempt nor to block (#5250). The
-      exemption then rests on the attribution question the gates above already
-      answered — id measured red on main, overlapping signatures, main's own row
-      >= ``min_runs`` — and the verdict SAYS the rate was not measurable.
+      **NOT-MEASURABLE** and is used NEITHER to exempt nor to block (#5250) — except
+      that a main rate of exactly ``0`` is not "measured red" and still falls through
+      to the BLOCK below. The exemption then rests on the attribution question the
+      gates above already answered — id measured red on main, overlapping signatures,
+      main's own row >= ``min_runs`` — and the verdict SAYS the rate was not
+      measurable. ``k_pr`` is the PR's declared sample size: ``_cmd_decide`` derives
+      it as ``max(row.runs)`` over the PR table (the producer emits one uniform K per
+      file), so this second use of ``min_runs`` is caller-declared and table-wide,
+      UNLIKE the per-id MAIN floor above.
     * PR rate materially above main's -> **BLOCK** (the PR made it worse).
     * otherwise -> **EXEMPT**, recorded with both rates.
 
@@ -596,10 +601,12 @@ def decide(
         # `k_pr is None` = the caller declared no PR sample size: in production
         # `_cmd_decide` always passes it, and it is `None` only when there are no
         # PR failures at all, so this preserves the historical rate comparison for
-        # that caller. `mr.rate == 0` is not "measured red", so it falls through
-        # to the rate comparison — which BLOCKS a PR failure main never had (the
-        # zero-main-rate guard, bypass 1a) rather than exempting it.
-        if k_pr is not None and k_pr < min_runs and mr.rate > 0:
+        # that caller. The lower bound `1 <=` keeps `k_pr == 0` out: a zero sample
+        # is EMPTY, not thin, and the caller is told so by the note above — it must
+        # not also be exempted here. `mr.rate == 0` is not "measured red", so it
+        # falls through to the rate comparison — which BLOCKS a PR failure main
+        # never had (the zero-main-rate guard, bypass 1a) rather than exempting it.
+        if k_pr is not None and 1 <= k_pr < min_runs and mr.rate > 0:
             decision.exempt.append(Verdict(
                 nodeid, False,
                 f"PR rate NOT measurable ({k_pr} run(s) < min_runs={min_runs}) — "
