@@ -15,9 +15,12 @@ Two defects motivated it:
   prose (``may``) entered the failure set as if it were a nodeid. A garbage id
   matches nothing on main: it can never be subtracted or verified, so it reads as
   "unique to this PR" on EVERY rail run for EVERY PR whose log contains that
-  fragment — a permanent false refusal. A candidate that is not a test id is
-  **DROPPED, COUNTED and REPORTED** as UNATTRIBUTABLE, never carried, never read
-  as "no failures".
+  fragment — a permanent false refusal. The remedy is split by position: the
+  payload of a **leading** ``FAILED``/``ERROR`` that is not a test id is
+  **DROPPED, COUNTED and REPORTED** as UNATTRIBUTABLE (fail-closed), while a
+  **non-leading** field whose payload is not a nodeid is PROSE and is SKIPPED —
+  counting the workflow's own echoed shell source as a drop marks every set
+  CLIPPED and blocks merges fleet-wide (#1396). See :func:`_failed_candidate`.
 * **DEFECT 2 — a MOVING identity is not an attribution.** Within one concluded
   cycle the same head's failure ids can shift across the re-run boundary (one id
   replaced by another). :func:`detect_rotating_identity` names the class that was
@@ -132,23 +135,78 @@ _NODEID_RE = re.compile(
 _FAILED_FIELDS = ("FAILED", "ERROR")
 
 
-def _failed_candidate(line: str) -> str | None:
-    """The token following the FIRST ``FAILED``/``ERROR`` whitespace field.
+def _failed_candidate(line: str, *, recover_nodeid: bool = True) -> str | None:
+    """The failure token on ``line`` — leading RECORD or mid-line RECOVERY.
 
-    This is the exact position the retired shell ``awk`` read
-    (``if ($i == "FAILED") { print $(i+1) }``), so no real id is lost by
-    routing through this module. The return is deliberately three-valued:
+    Two producers put a ``FAILED``/``ERROR`` field on a line, and the rule below
+    treats them differently on purpose — **drop accounting** and **id recovery**
+    are separate concerns:
 
-    * ``None`` — no such field on the line: it is NOT a failure record (raw logs
-      are mostly prose), and it is NOT a rejection either;
-    * ``''``  — the field was the last token: a truncated record, which IS a
+    * **A LEADING field opens a failure RECORD.** ``FAILED <payload>`` is the shape
+      pytest's ``-r fE`` summary emits. Its payload is returned as the candidate
+      for the caller to shape-check; a payload that is NOT a nodeid is a
+      malformed/truncated record and IS a DROP (:func:`parse_failed_ids` counts
+      it, which marks the set CLIPPED — fail-closed). The payload is taken the
+      SAME way the signature door takes it (``_SUMMARY_RE``: everything up to an
+      optional `` - <detail>``), NOT as the next whitespace field — a pytest
+      parameter id may contain spaces (``::test_x[chromium-Claude Desktop]``),
+      and splitting on whitespace would extract a TRUNCATED id that the signature
+      door does not produce, so ``main_signatures`` would miss and the rail would
+      block. Both doors must name the same id (module header, line 7).
+    * **A NON-LEADING field is prose UNLESS it introduces a nodeid.** A run log
+      ECHOES the workflow's own shell source, so a comment such as
+      ``# re-lists failures, so FAILED may double-count on the last tick;`` carries
+      a bare ``FAILED`` mid-sentence, and a tool's own message can too
+      (``[verification-gate] ❌ Verifier FAILED (unparseable verdict)``). Reading
+      the NEXT word there (``may``, ``lines``, ``(unparseable``) as a failed token
+      made the caller DROP it, and a dropped token marks the whole set CLIPPED /
+      NOT COMPARABLE to a measured zero — which in the vacuous branch blocks EVERY
+      merge repo-wide, green PRs with no failure included (agent-infra #1396,
+      tortoise #5194). Prose is not a record: it is SKIPPED, never counted. But a
+      non-leading field immediately followed by a **nodeid-shaped** token is an
+      authoritative identity and IS recovered — pytest-xdist's verbose progress
+      line has exactly that shape, status BEFORE nodeid
+      (``[gw0] [ 50%] FAILED tests/x.py::test_real``; pytest 9.x
+      ``_pytest/terminal.py``, the ``running_xdist`` branch). Recovering it keeps a
+      real failure in the set when the run's ``-r`` summary omits the failing
+      category. ⛔ Recovery is **raw-log only** (``recover_nodeid``); an id FILE
+      carries records, so a non-leading field there is a defect and is rejected,
+      never scanned (``raw_log=False``).
+      ⚠️ Recovery is NOT "fail-closed by construction": it ADDS an identity to
+      BOTH the PR set and main's union, and main's union is the exemption
+      ALLOWLIST — so a nodeid-shaped token that appears only in echoed prose would
+      buy a main-side id. That residue is pre-existing (the retired shell read had
+      the same reach and no nodeid requirement) and is bounded by the id's being
+      UNSIGNED in main's signature table — the subset rule then fails closed and
+      BLOCKS — but it is a declared residue, not a safety proof.
+
+    The return is deliberately three-valued:
+
+    * ``None`` — not a failure record and no recoverable nodeid (raw logs are
+      mostly prose): SKIPPED, and NOT a rejection either;
+    * ``''``  — a LEADING field was the last token: a truncated record, which IS a
       rejection;
-    * ``<token>`` — the candidate, which the caller MUST shape-check before use.
+    * ``<token>`` — the candidate (a nodeid, or a leading record's payload), which
+      the caller MUST shape-check before use.
     """
     fields = line.split()
-    for index, token in enumerate(fields):
-        if token in _FAILED_FIELDS:
-            return fields[index + 1] if index + 1 < len(fields) else ""
+    if not fields:
+        return None
+    if fields[0] in _FAILED_FIELDS:
+        if len(fields) == 1:
+            return ""
+        match = _SUMMARY_RE.match(line.strip())
+        if match:
+            return match.group("nodeid").strip()
+        return fields[1]
+    if not recover_nodeid:
+        # An id FILE holds records: a non-leading field is a defect, not a
+        # candidate. Recovery is a raw-log concern only.
+        return None
+    # Non-leading: recover only when the NEXT field is a nodeid (xdist progress).
+    for index, token in enumerate(fields[:-1]):
+        if token in _FAILED_FIELDS and _NODEID_LOOSE_RE.match(fields[index + 1]):
+            return fields[index + 1]
     return None
 
 
@@ -188,24 +246,38 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
     keep a second, weaker notion of a failure id:
 
     * ``raw_log=False`` (default) — a file of ``FAILED <nodeid>`` / ``ERROR
-      <nodeid>`` records. A non-blank line that carries no ``FAILED``/``ERROR``
-      field is **rejected**: in an id file, prose IS a defect (nothing else
-      belongs there). No guard-step pass runs here — an id file IS the set.
+      <nodeid>`` records. A line whose FIRST field is not ``FAILED``/``ERROR`` is
+      **rejected**: in an id file, prose IS a defect (nothing else belongs there),
+      and the xdist id RECOVERY is deliberately NOT applied here — an id file
+      carries records, not a run log. No guard-step pass runs here — an id file IS
+      the set.
     * ``raw_log=True`` — a raw ``gh run view --log-failed`` capture. ANSI SGR
       escapes and the ``<job>\t<step>\t<ts>Z `` prefix are stripped, then the
-      candidate after the first ``FAILED``/``ERROR`` field is shape-checked. A
-      line with no such field is not a failure record and is skipped — a raw log
-      is mostly prose, and rejecting every prose line would drown the signal.
+      leading record's payload — or a nodeid that directly follows a non-leading
+      ``FAILED``/``ERROR`` field (pytest-xdist's status-before-nodeid progress
+      line) — is shape-checked. A line with neither is not a failure record and is
+      skipped — a raw log is mostly prose, and rejecting every prose line would
+      drown the signal.
       A second pass attributes non-pytest GUARD-STEP failures (#4469) from their
       GitHub Actions error annotations, so a failure main can also be red on is
       COMPARED rather than refused.
 
-    In BOTH shapes a candidate that is not a failure id is **DROPPED, COUNTED and
-    REPORTED** (``rejected``) and never enters ``ids``. This is the #3756 ``may``
-    leak: an English word in the candidate position used to be emitted verbatim
-    as a failure id, and a garbage id matches nothing on main — it cannot be
-    subtracted or verified, so it reads as "unique to this PR" on EVERY rail run
-    for EVERY PR whose log contains that fragment. A permanent false refusal.
+    DROP ACCOUNTING IS LEADING-ONLY. The payload of a **leading**
+    ``FAILED``/``ERROR`` that is not a failure id is **DROPPED, COUNTED and
+    REPORTED** (``rejected``) and never enters ``ids`` — the #3756 ``may`` leak the
+    other way: an English word in the candidate position used to be emitted
+    verbatim as a failure id, and a garbage id matches nothing on main, so it reads
+    as "unique to this PR" on EVERY rail run for EVERY PR whose log contains that
+    fragment (a permanent false refusal). A **non-leading** field whose payload is
+    not a nodeid is PROSE: it is SKIPPED, never counted, because counting the
+    workflow's echoed shell source as a dropped token marks the whole set CLIPPED /
+    NOT COMPARABLE — which blocks EVERY merge repo-wide in the vacuous branch
+    (agent-infra #1396, tortoise #5194).
+
+    A leading record's payload is taken with :data:`_SUMMARY_RE` — the SAME match
+    the signature door uses — so both doors name the same id, including a
+    whitespace-bearing parameter id (``::test_x[chromium-Claude Desktop]``) that a
+    whitespace split would truncate.
 
     This is the fail-closed rule: unknown resolves to *"not exempt"*, never to
     *"exempt"*. Silent permissiveness here is a zero-evidence pass — and a
@@ -218,7 +290,7 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
             line = _strip_log_prefix(_ANSI_RE.sub("", raw)).strip()
             if not line:
                 continue
-            candidate = _failed_candidate(line)
+            candidate = _failed_candidate(line, recover_nodeid=raw_log)
             if candidate is None:
                 # Not a failure record. Skipped, NOT rejected.
                 continue
@@ -227,7 +299,7 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
             line = raw.strip()
             if not line:
                 continue
-            candidate = _failed_candidate(line)
+            candidate = _failed_candidate(line, recover_nodeid=raw_log)
             if candidate is None:
                 rejected.append(line)
                 continue

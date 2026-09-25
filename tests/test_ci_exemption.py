@@ -55,6 +55,7 @@ detect_rotating_identity = ci_exemption.detect_rotating_identity
 guard_step_key = ci_exemption.guard_step_key
 normalize_guard_error = ci_exemption.normalize_guard_error
 parse_failed_ids = ci_exemption.parse_failed_ids
+parse_pr_failure_text = ci_exemption.parse_pr_failure_text
 parse_rates = ci_exemption.parse_rates
 
 ID = "tests/test_dr_endpoints.py::TestDrDrill::test_restores_to_scratch"
@@ -113,6 +114,155 @@ def test_stray_line_cannot_buy_an_exemption():
 
     assert decision.any_blocked, "a junk union must not exempt anything"
     assert main_rates == {}, "the stray token bought no entry"
+
+
+# ── the anchored record rule (#1396 mechanism A / tortoise #5194) ──────────
+# A `FAILED` that does not START the line is prose, not a record. Both producers
+# below were measured: the workflow echoes its own shell source, and a tool
+# prints its own verdict. Reading the token after a bare `FAILED` DROPPED an
+# English word, and a single drop marks the set CLIPPED / NOT COMPARABLE — which
+# blocks every merge repo-wide in the vacuous branch, green PRs included.
+
+
+def test_echoed_workflow_prose_with_a_bare_FAILED_is_not_a_record():
+    """The measured `python-ci.yml` heartbeat comment must not drop tokens.
+
+    These are the exact lines (run 36083467843, main 0824b850c): they yielded
+    `may` and `lines`, which were DROPPED. The real nodeid must survive and the
+    dropped set must be EMPTY.
+    """
+    capture = (
+        "test (b)\tRun selected files\t2026-09-25T01:55:17.9136425Z "
+        "# re-lists failures, so FAILED may double-count on the last tick;\n"
+        "test (b)\tRun selected files\t2026-09-25T01:55:17.9148357Z "
+        "# line log puts the FAILED lines ~2.4k lines back), so the tail\n"
+        f"test (b)\tRun selected files\t2026-09-25T01:55:18.0000000Z FAILED {ID}\n"
+    )
+    parsed = parse_failed_ids(capture, raw_log=True)
+
+    assert parsed.ids == [ID], "the real nodeid must still be extracted"
+    assert parsed.rejected == [], (
+        "prose is not a failure record; counting it as DROPPED marked the set "
+        "CLIPPED and blocked the fleet (agent-infra #1396)"
+    )
+    assert parsed.ok
+
+
+def test_a_tool_message_with_a_bare_FAILED_is_not_a_record():
+    """agent-infra #1466: the VGATE extension's own verdict line, which blocked a
+    green PR repo-wide. It previously yielded the id `(unparseable`.
+    """
+    capture = (
+        "extension-tests / unit-test\tRun unit tests\t"
+        "2026-09-25T00:00:00.0000000Z [verification-gate] "
+        "\u274c Verifier FAILED (unparseable verdict): keep blocking, no merge\n"
+    )
+    parsed = parse_failed_ids(capture, raw_log=True)
+
+    assert parsed.ids == []
+    assert parsed.rejected == [], (
+        "a tool's prose is not a dropped failure token — six of these made "
+        "main's baseline CLIPPED and blocked every merge (#1396)"
+    )
+
+
+def test_pytest_progress_line_is_not_a_record_and_not_a_drop():
+    """`<nodeid> FAILED [ 42%]` is the -v progress line, not the -r fE summary.
+
+    It was never an id source (the token after FAILED was `[`), so skipping it
+    loses nothing — but it must not be COUNTED as a drop either.
+    """
+    capture = f"test (b)\tRun selected files\t2026-09-25T00:00:00.0000000Z {ID} FAILED                                       [ 42%]\n"
+    parsed = parse_failed_ids(capture, raw_log=True)
+
+    assert parsed.ids == []
+    assert parsed.rejected == []
+
+
+def test_a_leading_FAILED_with_a_non_nodeid_payload_is_still_counted():
+    """The anchor narrows WHERE a record starts — it does not loosen what one
+    needs. A malformed record at line start is still DROPPED and COUNTED, so the
+    fix cannot fail open.
+    """
+    parsed = parse_failed_ids("FAILED may\n", raw_log=True)
+
+    assert parsed.ids == []
+    assert parsed.rejected == ["may"], "an anchored malformed record is still a drop"
+    assert parsed.ok is False
+
+
+def test_xdist_progress_line_recovers_the_nodeid():
+    """pytest-xdist writes status BEFORE the nodeid (pytest 9.x terminal.py).
+
+    `[gw0] [ 50%] FAILED <nodeid>` is a REAL identity and the pre-anchor parser
+    recovered it. The anchor alone would have discarded it — a fail-open whenever
+    the run's `-r` summary omits the failing category — so a nodeid that follows
+    a NON-leading `FAILED`/`ERROR` is recovered, while prose is not.
+    """
+    capture = (
+        "test (b)\tRun selected files\t2026-09-25T00:00:00.0000000Z "
+        f"[gw0] [ 50%] FAILED {ID}\n"
+    )
+    parsed = parse_failed_ids(capture, raw_log=True)
+
+    assert parsed.ids == [ID], "the xdist progress nodeid must be recovered"
+    assert parsed.rejected == [], "recovery is not a drop"
+
+
+def test_a_nonleading_FAILED_with_a_non_nodeid_payload_is_skipped():
+    """The recovery half must not fire on prose: a mid-line `FAILED` followed by
+    a word is skipped, never dropped. This is the pair to the xdist case.
+    """
+    capture = (
+        "test (b)\tRun selected files\t2026-09-25T00:00:00.0000000Z "
+        "# so FAILED may double-count on the last tick\n"
+    )
+    parsed = parse_failed_ids(capture, raw_log=True)
+
+    assert parsed.ids == []
+    assert parsed.rejected == [], "prose must not be recovered NOR counted"
+
+
+def test_a_bare_leading_FAILED_is_a_blank_token_drop():
+    """A leading `FAILED` as the LAST token is a truncated record: it must be a
+    counted drop with blank token text — the path the shell renders as the
+    `CLIPPED` evidence body (admin-merge.sh #1353).
+    """
+    parsed = parse_failed_ids("FAILED\n", raw_log=True)
+
+    assert parsed.ids == []
+    assert parsed.rejected == [""], "a truncated record is a drop with blank text"
+    assert parsed.ok is False
+
+
+def test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id():
+    """A pytest parameter id may contain SPACES (::test_x[chromium-Claude Desktop]).
+
+    The id door must take the payload the same way the signature door does
+    (`_SUMMARY_RE`, up to an optional ` - <detail>`), not the next whitespace
+    field — otherwise the two doors name different ids, `main_signatures` misses
+    and the rail blocks (module header: the shell and the decision can never
+    disagree about the id universe).
+    """
+    spaced = "tests/test_x.py::test_y[chromium-Claude Desktop]"
+    capture = f"FAILED {spaced} - AssertionError: boom\n"
+
+    assert parse_failed_ids(capture, raw_log=True).ids == [spaced]
+    assert spaced in parse_pr_failure_text(capture).ids, (
+        "the signature door already names the full id — the id door must agree"
+    )
+
+
+def test_id_file_mode_does_not_recover_a_nonleading_nodeid():
+    """`recover_nodeid` is a RAW-LOG concern: an id FILE carries records, so a
+    non-leading field is a defect and is rejected, never scanned for a nodeid.
+    """
+    parsed = parse_failed_ids(f"note FAILED may, and later FAILED {ID}\n")
+
+    assert parsed.ids == []
+    assert parsed.rejected == [f"note FAILED may, and later FAILED {ID}"], (
+        "id-file mode must not widen what an id file may contain"
+    )
 
 
 # ── E1 · presence-in-window immunity ──────────────────────────────────────
