@@ -202,6 +202,97 @@ def test_E3_small_k_cannot_excuse():
     assert any("insufficient evidence" in n for n in decision.notes)
 
 
+# ── #5250 · the PR-side sample floor ──────────────────────────────────────
+#
+# A PR gets ONE run per push, so its rate is a single observation and `1/1` is
+# `100%` BY CONSTRUCTION. The rate comparison then blocks unconditionally
+# (`1.00 > 0.60 × 1.5`) whenever main is red for a check the PR merely inherited
+# — the rail unusable exactly when it is most needed (#5250; tortoise PR #5237).
+# `min_runs` must floor BOTH sides: below it the RATE dimension is NOT-MEASURABLE
+# and the decision falls back to the attribution question it has already answered.
+
+
+def test_5250_a_single_sample_pr_rate_is_not_measurable_and_the_exemption_says_so():
+    """THE defect: `k_pr=1` makes `pr_rate == 1.0` against a flaky main 3/5.
+
+    With the PR sample below `min_runs` the rate is used NEITHER to exempt NOR to
+    block; the exemption rests on signature + main presence. MUTATION: keep the
+    rate comparison for a thin PR sample → this REDs (`1.00 > 0.90`). MUTATION:
+    exempt silently → the two `in lines[0]` assertions RED.
+    """
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {ID: Rate(3, 5)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=1,
+    )
+
+    assert not decision.any_blocked, "a 1/1 rate must not block by construction"
+    lines = decision.visible_exemptions()
+    assert len(lines) == 1, "the exemption must be recorded, never silent"
+    assert "NOT measurable" in lines[0], lines[0]
+    assert "signature + main presence" in lines[0], lines[0]
+
+
+def test_5250_a_thin_pr_sample_does_not_exempt_a_disjoint_signature():
+    """The fallback IS the attribution question — a different failure still BLOCKs."""
+    decision = decide(
+        {ID: _f(1, 1, "sg-pr")}, {ID: Rate(3, 5)},
+        main_signatures={ID: frozenset({"sg-main"})}, k_pr=1,
+    )
+
+    assert decision.any_blocked
+    assert "signature differs" in decision.blocked[0].reason
+    assert decision.visible_exemptions() == []
+
+
+def test_5250_a_thin_pr_sample_does_not_exempt_an_id_main_never_failed():
+    """Membership is required: an id absent from main's table is PR-unique."""
+    other = "tests/test_other.py::TestT::test_other"
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {other: Rate(3, 5)},
+        main_signatures={other: frozenset({"sg"})}, k_pr=1,
+    )
+
+    assert decision.any_blocked
+    assert "no main-side measurement" in decision.blocked[0].reason
+    assert decision.visible_exemptions() == []
+
+
+def test_5250_a_measured_pr_sample_still_compares_rates():
+    """`k_pr >= min_runs` behaviour is UNCHANGED: a materially worse PR blocks."""
+    decision = decide(
+        {ID: _f(3, 3, "sg")}, {ID: Rate(3, 5)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=3,
+    )
+
+    assert decision.any_blocked
+    assert "materially higher" in decision.blocked[0].reason
+
+
+def test_5250_a_thin_pr_sample_does_not_bypass_the_zero_main_rate_guard():
+    """`main 0/8` is NOT "measured red" — bypass 1a survives the fallback.
+
+    MUTATION: exempt on main presence alone (drop `mr.rate > 0`) → this REDs and a
+    PR failure main never had is excused by a single-sample PR rate.
+    """
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {ID: Rate(0, 8)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=1,
+    )
+
+    assert decision.any_blocked
+    assert "materially higher" in decision.blocked[0].reason
+
+
+def test_5250_an_undeclared_pr_sample_preserves_the_rate_comparison():
+    """`k_pr=None` = the caller declared no PR sample; not a free exemption."""
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {ID: Rate(3, 5)},
+        main_signatures={ID: frozenset({"sg"})},
+    )
+
+    assert decision.any_blocked
+
+
 # ── E4 · the exemption must be VISIBLE ────────────────────────────────────
 
 
