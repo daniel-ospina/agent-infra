@@ -4287,7 +4287,7 @@ export default function (pi: ExtensionAPI) {
   ...process.env,
   PATH: augmentedPath,
   PI_SKIP_VERSION_CHECK: "1",
-  // Skip extensions sub-agents never need (one-shot, no slack/loops/vision).
+  // Skip extensions sub-agents never need (one-shot, no slack/loops).
   // Gate overrides: review DISPATCH stays parent-enforced (#825) — a sub-agent
   // must never self-satisfy the review-enforcer; the parent runs the review
   // ceremony for the PR as a whole. Git commit verification (VGATE) is
@@ -4338,7 +4338,6 @@ export default function (pi: ExtensionAPI) {
   GIT_SEQUENCE_EDITOR: "true",
   GIT_TERMINAL_PROMPT: "0",
   SLACK_BRIDGE_DISABLE: "1",
-  VISION_INTERCEPTOR_DISABLED: "1",
   // #617/#623: NO AGENT/ELDATO_ALLOW_MAIN_EDITS injection — the sub-agent runs
   // the SAME main-worktree-guard gates as its controller (M4 hub discipline +
   // M2/M3 + write/edit main block — the same surfaces an unhatched controller
