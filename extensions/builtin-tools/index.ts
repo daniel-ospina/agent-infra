@@ -1707,18 +1707,27 @@ export function getToolStallMs(): number {
  * (Linux) or `sysctl vm.loadavg` (macOS); 0 on failure (scale becomes 1).
  */
 export function getSystemLoad(): number {
+  return probeSystemLoad() ?? 0;
+}
+
+/** #1485: the load probe's TRI-STATE face — `null` when the probe could not
+ * run. `getSystemLoad()`'s `0`-on-failure is correct for BOUND SCALING (a
+ * failed probe must not scale a bound up) but wrong for REPORTING, where `0`
+ * reads as a genuinely idle box — the same absent-measurement-reads-as-real
+ * class the `piProcs=-1` sentinel exists to avoid (#1485 review P2). */
+export function probeSystemLoad(): number | null {
   try {
     if (existsSync("/proc/loadavg")) {
       const l = readFileSync("/proc/loadavg", "utf-8").trim().split(/\s+/)[0];
       const n = Number(l);
-      return Number.isFinite(n) && n >= 0 ? n : 0;
+      return Number.isFinite(n) && n >= 0 ? n : null;
     }
     const out = execSync("sysctl -n vm.loadavg 2>/dev/null", { encoding: "utf-8", timeout: 2000 })
       .trim().split(/\s+/)[1];
     const n = Number(out);
-    return Number.isFinite(n) && n >= 0 ? n : 0;
+    return Number.isFinite(n) && n >= 0 ? n : null;
   } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -2863,16 +2872,28 @@ export function renderRepoStateLine(repoState: RepoState | null, cwd: string): s
  * confident `0`: an absent measurement must not read as "no fleet". */
 export function countPiProcs(): number {
   try {
-    const out = execSync("ps -Ao comm= 2>/dev/null", { encoding: "utf-8", timeout: 2000 });
-    let n = 0;
-    for (const line of out.split("\n")) {
-      const base = line.trim().split("/").pop() ?? "";
-      if (base === "pi" || base === "pi-coding-agent") n += 1;
-    }
-    return n;
+    return countPiInPsOutput(execSync("ps -Ao comm= 2>/dev/null", { encoding: "utf-8", timeout: 2000 }));
   } catch {
     return -1;
   }
+}
+
+/** #1485 review P3: the pure parsing half of `countPiProcs`, testable without
+ * spawning `ps`. Counts basenames `pi` / `pi-coding-agent` exactly — so
+ * `node`, `spi` and `pi-extra` are never counted. */
+export function countPiInPsOutput(out: string): number {
+  let n = 0;
+  for (const line of out.split("\n")) {
+    const base = line.trim().split("/").pop() ?? "";
+    if (base === "pi" || base === "pi-coding-agent") n += 1;
+  }
+  return n;
+}
+
+/** #1485 review P2: `null` (probe failed) renders the `unknown` sentinel, never
+ * a confident `0` — a real 0 stays `0`. */
+export function formatLoad1(v: number | null): string {
+  return v === null ? "unknown" : String(v);
 }
 
 /**
@@ -2889,13 +2910,16 @@ export function countPiProcs(): number {
  * Measurements ONLY — no verdict and no threshold: whether a given load is
  * "starved" is a causal claim the harness cannot prove from a number, the same
  * rule the `tool-dead` headline already follows. `load1` reuses the injectable
- * `getLoad1()` seam; `cores` makes it interpretable; `piProcs=-1` means
- * unknown. Never a newline — the Alive state line must stay single-line.
+ * seam and renders `unknown` when the probe fails; `cores` makes it
+ * interpretable; `piProcs=-1` means unknown. Never a newline — the Alive state
+ * line must stay single-line.
  */
 export function renderMachineStateLine(): string {
-  const load1 = getLoad1();
+  // The injectable seam is a NUMBER (tests); the live probe is tri-state, so a
+  // failed probe renders `unknown` rather than a confident `0` (#1485 P2).
+  const load1: number | null = _load1Override ? _load1Override() : probeSystemLoad();
   const freeMB = Math.round(freemem() / (1024 * 1024));
-  return `load1=${load1} cores=${cpus().length} freeMB=${freeMB} piProcs=${countPiProcs()}`;
+  return `load1=${formatLoad1(load1)} cores=${cpus().length} freeMB=${freeMB} piProcs=${countPiProcs()}`;
 }
 
 // ── #783 Task 3: the ONE abnormal-exit composer ─────────────────────
