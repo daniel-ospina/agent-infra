@@ -108,7 +108,7 @@ node -e "const WebSocket=require('ws');const http=require('http');const fs=requi
 })().catch(e=>console.error(e.message));
 "
 ```
-Use `read_image` tool to visually verify the screenshot.
+Use the `read` tool on `/tmp/test.png` to visually verify the screenshot.
 
 ### Step 5 — Type text
 

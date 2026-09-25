@@ -67,7 +67,7 @@ function extractJson(text: string): any | null {
 }
 
 const SKIP_ENV = {
-  LOOP_ENFORCER_DISABLED: "1", VISION_INTERCEPTOR_DISABLED: "1",
+  LOOP_ENFORCER_DISABLED: "1",
   SKILL_ENFORCER_DISABLED: "1", SLACK_BRIDGE_DISABLE: "1",
   // #617: AGENT/ELDATO_ALLOW_MAIN_EDITS is NOT set by subAgentEnv (the #265 env
   // pivot is in force) and is deliberately absent here too — this spawned
