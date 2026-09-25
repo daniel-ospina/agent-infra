@@ -501,14 +501,15 @@ def decide(
       removed because it was accepted and never read, which is the shape that
       produced this whole family of defects.
     * PR sample (``k_pr``) below ``min_runs`` -> the RATE dimension is
-      **NOT-MEASURABLE** and is used NEITHER to exempt nor to block (#5250) — with two
-      exclusions that fall through to the BLOCK below: ``k_pr == 0`` is EMPTY, not
-      thin (the caller is told "pr sample empty"), and a main rate of exactly ``0`` is
-      not "measured red". The exemption then rests on the attribution question the
-      gates above already answered — id measured red on main, overlapping signatures,
-      main's own row >= ``min_runs`` — and the verdict SAYS the rate was not
-      measurable. ``k_pr`` is the PR's declared sample size: ``_cmd_decide`` derives
-      it as ``max(row.runs)`` over the PR table (the producer emits one uniform K per
+      **NOT-MEASURABLE** and is used NEITHER to exempt nor to block (#5250), with two
+      exclusions: ``k_pr == 0`` is EMPTY, not thin (the caller is told "pr sample
+      empty", and an empty row is refused by the per-row guard), and a main rate of
+      exactly ``0`` is not "measured red" (it reaches the rate comparison, which
+      blocks). The exemption then rests on the attribution question the gates above
+      already answered — id measured red on main, overlapping signatures, main's own
+      row >= ``min_runs`` — and the verdict SAYS the rate was not measurable. ``k_pr``
+      is the PR's declared sample size: ``_cmd_decide`` derives it as
+      ``max(row.runs)`` over the PR table (the producer emits one uniform K per
       file), so this second use of ``min_runs`` is caller-declared and table-wide,
       UNLIKE the per-id MAIN floor above.
     * PR rate materially above main's -> **BLOCK** (the PR made it worse).
