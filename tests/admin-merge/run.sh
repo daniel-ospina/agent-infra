@@ -1478,6 +1478,36 @@ CFS_GUARD_ARGS='--diff'
 run_guard "--diff with NO files" usage '-'
 CFS_GUARD_ARGS="--diff $TMP/gd-a.txt"
 run_guard "--diff with ONE file" usage '-'
+# The remaining parser-level and per-mode guards, enumerated rather than fixed
+# reactively: after TWO rounds of "the fix covered the sites the report named and
+# missed the one it did not", the mitigation is to walk the UNIVERSAL set. Every
+# `say_err`/`exit` in the CLI is listed here except the ones already driven above.
+CFS_GUARD_ARGS='--commit-rows'
+run_guard "--commit-rows with no SHA" usage '-'
+CFS_GUARD_ARGS='--totally-unknown-flag'
+run_guard "an unknown flag" usage '-'
+
+new_scen guard-commit-no-runs
+printf 'feedface0000000000000000000000000000000000\n' > "$SCEN/head"
+: > "$SCEN/fail-run-list"
+CFS_GUARD_ARGS='--commit feedface0000000000000000000000000000000000'
+run_guard "--commit whose run list fails" - "could not list runs"
+# `--commit` and `--commit-rows` carry BYTE-IDENTICAL run-list lines (both name
+# `$commit`), so a single mutation of that text hits both and looks like one
+# covered guard. Mutating them by line showed `--commit-rows`' copy was NOT
+# caught — it needs its own scenario.
+CFS_GUARD_ARGS='--commit-rows feedface0000000000000000000000000000000000'
+run_guard "--commit-rows whose run list fails" - "could not list runs"
+
+# `--help` is the ONE path that must exit 0 and print usage (not a refusal), so it
+# is asserted separately — sweeping it into a "fails closed" helper would have made
+# the helper lie about this case.
+new_scen guard-help
+cfs_run --help
+rc=$?
+[ "$rc" -eq 0 ] && pass "--help exits 0" || fail "--help expected exit 0, got $rc"
+grep -q 'usage:\|--main-union' "$TMP/cfs-out" && pass "--help prints the usage text" \
+  || fail "--help did not print usage"
 
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
