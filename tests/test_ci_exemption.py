@@ -908,19 +908,39 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
     claims are about, and each is enumerated in full:
 
     * the **key** boundary -- a clean second id must keep its rate in EVERY order.
-      That is what separates a per-key taint from a table-wide one: a global taint
-      rejects the clean id only when it arrives after the withdrawal, so the same
-      multiset yields it a rate in one order and none in another.
+      That is what separates a per-key withdrawal from a table-wide one: a global
+      withdrawal refuses the clean id only when it arrives after the withdrawal, so
+      the same multiset yields it a rate in one order and none in another. The
+      withdrawal must also be keyed on the WHOLE nodeid: the near-miss ids below
+      (a shared file, a shared function name, a shared class, a shared directory
+      basename, a case variant, and a one-character extension) each differ from the
+      withdrawn id in exactly one dimension, so a withdrawal keyed on any of those
+      coarser groupings refuses a row it must keep. A key derived by an ARBITRARY
+      function of the nodeid cannot be excluded by a black-box fixture -- see the
+      residual note at the end of this test.
     * the **equality** boundary -- an EXACT repeat withdraws the id too. The rule
       is a second valid row (agreeing or disagreeing), not a disagreeing one, so a
-      guard that taints only on a *differing* rate is caught here.
+      guard that refuses only on a *differing* rate is caught here.
     * the **validity** boundary -- a row the guards ABOVE reject (``failures >
-      runs``, ``runs <= 0``, malformed) contributes nothing and cannot taint, so a
-      valid sibling keeps its rate in every order. A taint branch placed ABOVE
-      those guards reads the same table the other way round.
+      runs``, ``runs <= 0``, malformed) contributes nothing and cannot withdraw the
+      id, so a valid sibling keeps its rate in every order. A withdrawal branch
+      placed ABOVE those guards reads the same table the other way round.
+    * the **multiplicity** boundary -- TWO independently duplicated ids plus a third
+      row for the first. One slot holding "the last duplicate" (rather than a set of
+      withdrawn ids) passes every single-duplicate fixture above and is still
+      order-dependent here.
     """
     key = "tests/test_a.py::test_a11"
     other = "tests/test_b.py::test_b48"
+    # Near-miss ids: each shares exactly ONE dimension with `key`.
+    same_file = "tests/test_a.py::test_a12"
+    same_name = "tests/test_b.py::test_a11"
+    same_class = "tests/test_a.py::TestX::test_a11"
+    same_basename = "tests/sub/test_a.py::test_a11"
+    # A case-folding key is only split by two ids that differ in NOTHING but case --
+    # a producer on a case-insensitive filesystem can emit either spelling.
+    case_variant = "tests/TEST_A.py::test_a11"
+    extended = "tests/test_a.py::test_a111"
     pr = {key: Failure(rate=Rate(8, 8), signatures=frozenset({"sg"}))}
     sig = {key: frozenset({"sg"})}
 
@@ -938,12 +958,34 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
         ("an ODD duplicate count, a clean sibling",
          [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8", f"{other}\t4\t8"],
          {other: Rate(4, 8)}),
-        ("an EXACT repeat (agreeing, not contradicting)",
+        ("an EXACT repeat (agreeing, not disagreeing)",
          [f"{key}\t8\t8", f"{key}\t8\t8", f"{other}\t4\t8"],
          {other: Rate(4, 8)}),
         ("a duplicate beside an upper-guard-rejected row",
          [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t9\t8", f"{other}\t4\t8"],
          {other: Rate(4, 8)}),
+        ("two independently duplicated ids",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8",
+          f"{other}\t4\t8", f"{other}\t5\t8"],
+         {}),
+        ("a clean sibling in the SAME FILE",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{same_file}\t4\t8"],
+         {same_file: Rate(4, 8)}),
+        ("a clean sibling with the SAME FUNCTION NAME",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{same_name}\t4\t8"],
+         {same_name: Rate(4, 8)}),
+        ("a clean sibling in the SAME CLASS",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{same_class}\t4\t8"],
+         {same_class: Rate(4, 8)}),
+        ("a clean sibling with the SAME FILE BASENAME, other dir",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{same_basename}\t4\t8"],
+         {same_basename: Rate(4, 8)}),
+        ("a clean id differing only in CASE (splits a case-folding key)",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{case_variant}\t4\t8"],
+         {case_variant: Rate(4, 8)}),
+        ("a clean id that EXTENDS the withdrawn one by one character",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{extended}\t4\t8"],
+         {extended: Rate(4, 8)}),
         ("a valid row shadowed by an upper-guard rejection",
          [f"{key}\t8\t8", f"{key}\t9\t8"], {key: Rate(8, 8)}),
         ("a valid row shadowed by runs <= 0",
@@ -969,15 +1011,27 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
             f"{label}: every order of one row multiset must yield the SAME verdict -- "
             "row order must never decide whether the PR blocks")
 
-    # The withdrawal must not EXPIRE either, and a bounded lifetime does not live
-    # on the permutation axis -- it lives on the rows that ARRIVE after it. A bound
-    # of N is defeated by a table with MORE rows following the withdrawal, so the
-    # sweep grows what follows well past any fixed bound, in BOTH directions. The
-    # following rows are OTHER keys on purpose: a later row of the WITHDRAWN key is
-    # itself refused, so only an ACCEPTED row can expire anything, and a fixture
-    # whose only accepted row sits after every row of the withdrawn key cannot see
-    # a bound at all.
-    for n in (1, 2, 3, 5, 8, 16, 40):
+    # A withdrawal must not EXPIRE, and a bounded lifetime does not live on the
+    # permutation axis -- it lives on the rows that ARRIVE after it. A bound of N
+    # is defeated by a table with MORE rows following the withdrawal, so the sweep
+    # grows what follows. The following rows are OTHER keys on purpose: a later row
+    # of the WITHDRAWN key is itself refused, so only an ACCEPTED row can expire
+    # anything, and a fixture whose only accepted row sits after every row of the
+    # withdrawn key cannot see a bound at all.
+    #
+    # FORWARD (withdrawal first, then n accepted rows, then one more row of the
+    # withdrawn key): defeats any bound of N < n accepted rows. REVERSED (a row of
+    # the withdrawn key accepted BEFORE the withdrawal): pins that a withdrawal
+    # also removes an id already in the table, which no forward order can show.
+    #
+    # RESIDUAL, stated rather than implied: a bound chosen ABOVE the largest n here
+    # still escapes, and no finite sweep can exclude one -- "permanent" is a
+    # universally quantified claim over table sizes and is not provable by
+    # black-box sampling. The structural half of the guarantee is the shape of the
+    # code, not this test: the withdrawn set is a bare local that is only ever
+    # ADDED to, and membership is tested before the accept path. The largest n here
+    # is chosen to be far past any bound a regression would plausibly pick.
+    for n in (1, 2, 3, 5, 8, 16, 64, 256):
         fillers = [f"tests/test_f{i}.py::test_f1" for i in range(n)]
         rows = ([f"{key}\t8\t8", f"{key}\t0\t8"]
                 + [f"{f}\t4\t8" for f in fillers]
