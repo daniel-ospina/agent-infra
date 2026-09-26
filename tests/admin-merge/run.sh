@@ -1089,7 +1089,14 @@ grep -q "has ZERO jobs" "$TMP/cfs-err" && pass "the zero-job run is still named"
 # `collect_union_signatures` and `collect_union_rows` (leaving `collect_union_rates`
 # intact) and the whole suite stayed GREEN: 5b-5g drive only ONE of the four call
 # sites, so a regression in the other three was invisible. Each caller is driven
-# here through the CLI mode that reaches it.
+# here through the CLI mode that ACTUALLY reaches it — these names are NOT
+# guessable from the function names, and getting one wrong left the very collector
+# this closes untested (review cycle 4, P1). The dispatch is:
+#   --pr / --commit         -> collect_union           (NOT collect_union_rows)
+#   --commit-rows           -> collect_union_rows       (the mode the gate uses)
+#   --main-union            -> collect_union
+#   --main-union-rates      -> collect_union_rates
+#   --main-union-signatures -> collect_union_signatures
 echo "== 5h. the zero-job contract holds in all four collectors =="
 new_scen allfour
 # NOTE: there must be NO `fail-log-7790` / `jobs-count-7790` fixture here. With
@@ -1132,7 +1139,7 @@ done <<'MODES'
 collect_union (--main-union)|--main-union 10
 collect_union_rates (--main-union-rates)|--main-union-rates 10
 collect_union_signatures (--main-union-signatures)|--main-union-signatures 10
-collect_union_rows (--commit)|--commit main7790
+collect_union_rows (--commit-rows)|--commit-rows main7790
 MODES
 
 # ── 5i. #1482 F2: `timed_out` MUST keep its `tested` credit ──────────────────
