@@ -1703,8 +1703,11 @@ export function getToolStallMs(): number {
   return Math.max(60_000, Math.floor(getTaskHardCapMs() * TASK_TOOL_STALL_FRACTION));
 }
 /**
- * #209: system load probe — 1-minute load average. Reads /proc/loadavg
- * (Linux) or `sysctl vm.loadavg` (macOS); 0 on failure (scale becomes 1).
+ * #209: system load probe — 1-minute load average, `0` on failure (scale
+ * becomes 1). Bound-scaling thin wrapper: the tri-state read lives in
+ * `probeSystemLoad()` (which reads /proc/loadavg on Linux or
+ * `sysctl vm.loadavg` on macOS), so a failed probe is reportable as
+ * `unknown` by the `Alive state:` renderer (#1485).
  */
 export function getSystemLoad(): number {
   return probeSystemLoad() ?? 0;

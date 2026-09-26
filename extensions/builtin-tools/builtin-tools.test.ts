@@ -5978,6 +5978,17 @@ test("#783/T2: every Alive state template appends the cached repo state (source 
   ok(source.includes("const machineStateText = (): string => renderMachineStateLine();"), "per-dispatch machine-state renderer (#1485)");
 });
 
+test("#1485 (re-review P2): probeLoad1's PRODUCTION leg goes through the tri-state probe, not getSystemLoad()", () => {
+  // The override seam only exercises the test leg; the leg production always
+  // takes is `probeSystemLoad()`. Mutating it back to `getSystemLoad()` re-arms
+  // the confident `load1=0` with every behavioural guard green (mutation-proven
+  // by review), so pin the fallback by source shape.
+  const body = source.match(/export function probeLoad1\(\)[^{]*\{([^}]*)\}/)?.[1] ?? "";
+  ok(body.length > 0, "probeLoad1 source located (a rename must update this pin)");
+  ok(body.includes("probeSystemLoad()"), "probeLoad1 must call the tri-state probe on its fallback leg");
+  ok(!body.includes("getSystemLoad()"), "probeLoad1 must NOT fall back to getSystemLoad() (re-arms the load1=0 P2)");
+});
+
 test("#1485: renderMachineStateLine — machine evidence, single line, load1 honors the injectable seam", () => {
   setLoad1Override(() => 131.25);
   try {
