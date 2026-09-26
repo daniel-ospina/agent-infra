@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent } from "./index.js";
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
@@ -2811,6 +2811,70 @@ test("tier B emits whatever base the resolver chose — NON-ORIGIN base flows th
     buildPushRangeDiffCommand("B", "refs/remotes/upstream/main", "feat/487"),
     "git diff --name-only refs/remotes/upstream/main...feat/487"
   );
+});
+
+// ── #3716 — OID pinning + the OID-only probe whitelist ──────────────────────
+test("#3716: resolveCommitOid pins a ref to an OID and refuses everything else; isAncestorOrEqual is OID-only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vgate-oid-"));
+  try {
+    execSync("git init -q -b main", { cwd: dir });
+    execSync("git config user.email t@t", { cwd: dir });
+    execSync("git config user.name t", { cwd: dir });
+    writeFileSync(join(dir, "a.txt"), "a\n");
+    execSync("git add . && git commit -q -m one", { cwd: dir });
+    const c1 = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
+    writeFileSync(join(dir, "b.txt"), "b\n");
+    execSync("git add . && git commit -q -m two", { cwd: dir });
+    const c2 = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
+    equal(resolveCommitOid(dir, "HEAD"), c2, "resolveCommitOid pins HEAD to its commit OID");
+    equal(resolveCommitOid(dir, "refs/heads/nope"), null, "an unresolvable ref → null (fail-closed)");
+    equal(resolveCommitOid(dir, "evil; rm -rf /"), null, "a non-whitelisted ref never reaches the shell");
+    equal(resolveCommitOid(dir, "-D"), null, "an option-shaped token is refused");
+    equal(resolveCommitOid(dir, "--upload-pack=x"), null, "an option-shaped token is refused (long form)");
+    // ⛔ The probe interpolates into /bin/sh -c: a ref NAME must never reach it.
+    equal(isAncestorOrEqual(dir, "HEAD", "HEAD"), null, "a refname is refused — OIDs only");
+    equal(isAncestorOrEqual(dir, c1, c1), true, "an OID is an ancestor-or-equal of itself");
+    equal(isAncestorOrEqual(dir, c1, c2), true, "the ancestor direction resolves true");
+    equal(isAncestorOrEqual(dir, c2, c1), false, "a descendant is an EXPLICIT negative, never null");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── #3716 — the kill switch must cover the NARROWING, not only #755 ────────
+test("#3716: the kill switch (subDisabled) keeps the pre-#3716 scope — a rewrite push is not narrowed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vgate-nosub-"));
+  try {
+    const g = (a: string) => execSync(`git ${a}`, { cwd: dir, encoding: "utf-8" }).trim();
+    execSync("git init -q -b main", { cwd: dir });
+    execSync("git config user.email t@t", { cwd: dir });
+    execSync("git config user.name t", { cwd: dir });
+    writeFileSync(join(dir, "baseline.ts"), "b\n");
+    execSync("git add . && git commit -q -m c0", { cwd: dir });
+    execSync("git checkout -q -b feat", { cwd: dir });
+    writeFileSync(join(dir, "feat.ts"), "f\n");
+    execSync("git add . && git commit -q -m feat", { cwd: dir });
+    const preRebase = g("rev-parse HEAD");
+    execSync(`git update-ref refs/remotes/origin/feat ${preRebase}`, { cwd: dir });
+    // main advances, then the branch is rebased onto it — the #3716 rewrite shape.
+    execSync("git checkout -q main", { cwd: dir });
+    writeFileSync(join(dir, "main-delta.ts"), "m\n");
+    execSync("git add . && git commit -q -m upstream", { cwd: dir });
+    const mainTip = g("rev-parse HEAD");
+    execSync(`git update-ref refs/remotes/origin/main ${mainTip}`, { cwd: dir });
+    // #1491 — the narrowing requires an explicit declaration of the integration ref.
+    execSync("git config vgate.integrationRef refs/remotes/origin/main", { cwd: dir });
+    execSync("git checkout -q feat && git rebase -q origin/main", { cwd: dir });
+    // Proofs hold: origin/main IS an ancestor of the rebased tip; origin/feat is not.
+    const narrowed = resolvePushRangeScope("git push --force origin feat", dir, null, false);
+    const widened = resolvePushRangeScope("git push --force origin feat", dir, null, true);
+    deepEqual(narrowed?.files, ["feat.ts"],
+      "narrowed: the branch's own diff — main's delta is base-identical (the #3716 scope)");
+    deepEqual(widened?.files, ["main-delta.ts"],
+      "kill switch: the pre-#3716 2-dot scope is kept — main's delta is demanded again");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── #490 T2: head-anchored git-global-option parse + shared verb scanner ──

@@ -1,0 +1,17 @@
+# The integration ref the #3716 push-scope narrowing may use as its base.
+# Declared explicitly (agent-infra #1491): the narrowing never infers the
+# integration ref from a ref NAME, because in a fork-as-`origin` layout or a
+# master-default repo with a legacy `main`, the name matches a ref that is NOT
+# the integration branch.
+#
+# ⛔ THIS FILE IS AN AGREEMENT TRIPWIRE, NOT AN ACTIVATION SURFACE. It is checked
+# in, so it is a SHARED, clone-relative NAME: a fork clone inherits it, and here
+# `refs/remotes/origin/main` is the FORK's main — honoring the file alone
+# reproduces the fail-open one level up. The narrowing activates on the
+# per-clone operator assertion:
+#
+#     git config vgate.integrationRef refs/remotes/origin/main
+#
+# When this file is present it must declare the SAME ref, else the declaration
+# is refused. No config ⇒ NO narrowing (fail closed): the full pre-#3716 set.
+refs/remotes/origin/main
