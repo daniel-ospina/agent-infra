@@ -990,6 +990,13 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
          [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8", f"{key}\t2\t8",
           f"{other}\t4\t8"],
          {other: Rate(4, 8)}),
+        ("a duplicate pair with DIFFERENT RUN COUNTS (the withdrawal is keyed on "
+         "the id, not on the id together with the run count)",
+         [f"{key}\t8\t8", f"{key}\t0\t4"],
+         {}),
+        ("an ODD duplicate count with different run counts",
+         [f"{key}\t0\t4", f"{key}\t1\t4", f"{key}\t8\t8"],
+         {}),
         ("two independently duplicated ids",
          [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8",
           f"{other}\t4\t8", f"{other}\t5\t8"],
@@ -1049,7 +1056,9 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
     # grows what follows. The following rows are OTHER keys on purpose: a later row
     # of the WITHDRAWN key is itself refused, so only an ACCEPTED row can expire
     # anything, and a fixture whose only accepted row sits after every row of the
-    # withdrawn key cannot see a bound at all.
+    # withdrawn key cannot see a bound at all. The run counts deliberately DIFFER
+    # between the rows of the withdrawn id, so a withdrawal keyed on (id, runs)
+    # rather than on the id is not left unpinned by the ladder either.
     #
     # FORWARD (withdrawal first, then n accepted rows, then one more row of the
     # withdrawn key): the ladder itself catches a bound up to 257 accepted rows --
@@ -1067,9 +1076,9 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
     # membership is tested before the accept path.
     for n in (1, 2, 3, 5, 8, 16, 64, 256):
         fillers = [f"tests/test_f{i}.py::test_f1" for i in range(n)]
-        rows = ([f"{key}\t8\t8", f"{key}\t0\t8"]
+        rows = ([f"{key}\t8\t8", f"{key}\t0\t4"]
                 + [f"{f}\t4\t8" for f in fillers]
-                + [f"{key}\t1\t8"])
+                + [f"{key}\t1\t4"])
         for order in (rows, list(reversed(rows))):
             main = parse_rates("\n".join(order) + "\n")
             assert main.rates == {f: Rate(4, 8) for f in fillers}, (
@@ -1078,10 +1087,12 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
 
     # The ladder above grows only ACCEPTED rows. A bound on any other counter is
     # invisible to it, so the same shape is repeated with rows that are REJECTED
-    # instead. EVERY rejection kind is used, because clearing the withdrawn set sits
-    # in a different branch for each of them: a malformed line, a whitespace-only
-    # line (skipped), a row refused for ``runs <= 0``, a row refused for
-    # ``failures > runs``, and a row that is not a failure key.
+    # instead. Each rejection KIND gets its own interleaved fixture, because the
+    # module refuses them at different places -- a malformed line and a
+    # whitespace-only line are refused in their own branches, while ``runs <= 0``,
+    # ``failures > runs`` and not-a-failure-key are separate sub-conditions of the
+    # ONE validity guard -- so a clear keyed to any single sub-condition must be
+    # crossed too.
     rejected_rows = [
         "not a rate row",                             # no tab-separated fields
         "   ",                                        # blank after strip -> skipped
@@ -1091,13 +1102,13 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
     ]
     for kind in rejected_rows:
         # Adjacent to the pair, with a LATER row of the same id: this is the shape
-        # that exposes a branch which clears the withdrawn set.
-        rows = [f"{key}\t8\t8", f"{key}\t0\t8", kind, f"{key}\t1\t8"]
+        # that exposes a branch which clears the withdrawn set. Run counts differ.
+        rows = [f"{key}\t8\t8", f"{key}\t0\t4", kind, f"{key}\t1\t4"]
         for order in itertools.permutations(rows):
             assert parse_rates("\n".join(order) + "\n").rates == {}, (
                 f"a rejection of kind {kind!r} expired a withdrawal")
     for n in (1, 2, 8, 64, 256):
-        rows = ([f"{key}\t8\t8", f"{key}\t0\t8"]
+        rows = ([f"{key}\t8\t8", f"{key}\t0\t4"]
                 + [rejected_rows[i % len(rejected_rows)] for i in range(n)]
                 + [f"{key}\t1\t8"])
         for order in (rows, list(reversed(rows))):
@@ -1168,7 +1179,7 @@ def test_the_withdrawal_is_keyed_on_the_whole_nodeid_for_every_pair_of_ids():
         for sibling in pool:
             if sibling == dup:
                 continue
-            rows = [f"{dup}\t8\t8", f"{dup}\t0\t8", f"{sibling}\t4\t8"]
+            rows = [f"{dup}\t8\t8", f"{dup}\t0\t4", f"{sibling}\t4\t8"]
             for order in itertools.permutations(rows):
                 rates = parse_rates("\n".join(order) + "\n").rates
                 assert rates == {sibling: Rate(4, 8)}, (
@@ -1203,8 +1214,8 @@ def test_the_withdrawn_set_is_neither_capacity_nor_budget_bounded():
     ids = [f"tests/test_scale.py::test_s{i}" for i in range(n_ids)]
     rows = []
     for nodeid in ids:
-        rows += [f"{nodeid}\t8\t8", f"{nodeid}\t0\t8"]
-    rows += [f"{ids[0]}\t1\t8", f"{ids[-1]}\t2\t8", "not a rate row"]
+        rows += [f"{nodeid}\t8\t8", f"{nodeid}\t0\t4"]
+    rows += [f"{ids[0]}\t1\t4", f"{ids[-1]}\t2\t4", "not a rate row"]
     for order in (rows, list(reversed(rows))):
         assert parse_rates("\n".join(order) + "\n").rates == {}, (
             "an id that fell out of a bounded withdrawal structure was "
@@ -1214,9 +1225,9 @@ def test_the_withdrawn_set_is_neither_capacity_nor_budget_bounded():
     # row count rather than on the withdrawn set: 1024 rows for one id, then one
     # more.
     many = [f"tests/test_scale.py::test_one\t8\t8",
-            f"tests/test_scale.py::test_one\t0\t8"]
+            f"tests/test_scale.py::test_one\t0\t4"]
     many += [f"tests/test_scale.py::test_one\t{k % 8}\t8" for k in range(1024)]
-    many += ["tests/test_scale.py::test_one\t1\t8"]
+    many += ["tests/test_scale.py::test_one\t1\t4"]
     assert parse_rates("\n".join(many) + "\n").rates == {}, (
         "a budget measured on the table's own size expired a withdrawal")
     assert parse_rates("\n".join(reversed(many)) + "\n").rates == {}
