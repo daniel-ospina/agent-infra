@@ -102,7 +102,7 @@ can only cost time, never coverage.
   scope) keeps pre-#755 semantics: no subtraction.
 - **Rebase / cherry-pick push-leg de-flooding** is **#737**'s deliverable; #737
   stays open and parked so this change does not silently absorb it.
-  *(Delivered 2026-09-25 as tortoise #3716 — the ancestry-conditional tier PROPOSED in agent-infra #737's 2026-09-13 comment (folded into #811's fix-direction option 1). ⛔ This research did NOT name that mechanism — it records at :103 only that rebase de-flooding is #737's deliverable — and #737's `parked` disposition named a reflog/local-state reference instead, so the mechanism SUPERSEDES that disposition rather than implementing it. See the fold-in in `docs/plans/2026-09-11-755-vgate-merge-scope.md` §8 for the provenance correction.)*
+  *(Delivered 2026-09-25 as tortoise #3716 — the ancestry-conditional tier PROPOSED in agent-infra #737's 2026-09-13 comment (the same direction as #811's fix-direction option 1, which was folded INTO #737 on 2026-09-12). ⛔ This research did NOT name that mechanism — it records at :103 only that rebase de-flooding is #737's deliverable — and #737's `parked` disposition named a reflog/local-state reference instead, so the mechanism SUPERSEDES that disposition rather than implementing it. See the fold-in in `docs/plans/2026-09-11-755-vgate-merge-scope.md` §8 for the provenance correction.)*
 - **`git merge` itself remains un-gated** — tracked as **#770**. This change
   covers the *commit* and *push* that consume a merge, not the merge command.
 - The `scopeFiles` stash-recovery arm was **dropped**, not repaired: its fallback

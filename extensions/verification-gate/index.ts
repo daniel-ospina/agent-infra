@@ -2212,6 +2212,20 @@ function symbolicRefShort(cwd: string): string | null {
 // /bin/sh -c; nothing here sets shell:false).
 const GIT_OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
+// #3716 — the ONLY ref the narrowing may take as its base: the house integration
+// branch. `resolveTrustedBase` prefers a DECLARED upstream that names another
+// branch (#3398 — for the SUBTRACTION arm, where guards (0)-(5) neutralise it).
+// That ref can be a TOPIC branch (`origin/develop`, a stacked branch, a fork's
+// `main`), and the narrowing has no guard set: it omits every path the pushed tip
+// shares with its base, so a topic base omits content the push LANDS on the remote
+// and ships it unverified. Measured fail-open (2026-09-25): a checkout on `work`
+// whose `branch.work.merge` is `refs/heads/develop`, pushing a branch rebased onto
+// `origin/develop`, returned `{"files":["F.txt"]}` where the pre-#3716 range was
+// `D.txt`, `F.txt`, `old.txt` — `D.txt` (develop-only, never integrated) was
+// landed on the remote undemanded. A non-integration base therefore keeps the
+// wider pre-#3716 scope (fail-closed, over-demand at worst).
+const INTEGRATION_BASE_REF = /^refs\/remotes\/origin\/(?:main|master)$/;
+
 // Pin a ref to its commit OID ONCE (#3716, verification follow-up). The narrowing
 // proof and the range diff MUST be about the SAME commits: `merge-base
 // --is-ancestor` and `git diff` each re-resolve whatever name they are handed, so
@@ -2265,7 +2279,7 @@ export function isAncestorOrEqual(cwd: string, a: string, b: string): boolean | 
 // branch name is rejected by the whitelist even though neither carries shell
 // metachars → bare pushes over parked WIP keep the staged check (status-quo,
 // pre-#487 behavior).
-export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBundle | null): DiffScope | null {
+export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBundle | null, subDisabled = false): DiffScope | null {
   const parsed = parsePushRefSpecs(command);
   if (!parsed.eligible) return null; // commit/gh/unmappable/wrapper/no_push — zero subprocess on bare commits
   // Bare push (no refspecs): derive remote + dst + src from the branch config
@@ -2411,24 +2425,32 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // the pre-#3716 command byte-identical.
     let narrowedBase: string | undefined;
     let narrowedSrc: string | undefined;
-    if (tier === "A") {
+    // ⛔ #3716 — the kill switch must cover the NARROWING, not only the #755
+    // subtraction. `ELDATO_VGATE_NO_SUBTRACT` is documented (01-preflight) as the
+    // scope-WIDENING escape — "restores the previous (larger) scope … it can cost
+    // time, never coverage" — so a narrowing that survives it breaks that contract
+    // and removes an operator's only escape from a misbehaving narrowing. Skipped ⇒
+    // the pre-#3716 tier-A 2-dot scope, the same as any other unprovable outcome.
+    if (tier === "A" && !subDisabled) {
       // ⛔ ONE base rule (#3398): the INTEGRATION remote's base, OID-pinned —
       // never the push remote's `main` (a push remote says where content GOES,
       // not what was integrated; trusting a fork's `main` let fork-only
       // unverified content be omitted — review F1 on #1106) and never a ref NAME,
       // which is re-resolved per command and can be retargeted between the proof
       // and the range (the tear #3716 closes).
+      // ⛔ And never a TOPIC branch — see INTEGRATION_BASE_REF above for the
+      // measured fail-open that put this test here.
       const trusted = resolveTrustedBase(cwd);
       const srcOid = resolveCommitOid(cwd, srcRef);
       const trackingOid = resolveCommitOid(cwd, tracking);
       const baseOid = trusted !== null && GIT_OID.test(trusted.oid) ? trusted.oid : null;
       const trustedRef = trusted?.ref ?? null;
-      if (baseOid !== null && trustedRef !== null && srcOid !== null && trackingOid !== null
+      if (baseOid !== null && trustedRef !== null && INTEGRATION_BASE_REF.test(trustedRef)
+          && srcOid !== null && trackingOid !== null
           && isAncestorOrEqual(cwd, baseOid, srcOid) === true
           && isAncestorOrEqual(cwd, trackingOid, srcOid) === false) {
         rewroteHistory = true;
         sawRewroteHistory = true;
-        baseRef = trustedRef;
         narrowedBase = baseOid;
         narrowedSrc = srcOid;
         const discardedRaw = gitProbe(cwd, `rev-list --count ${srcOid}..${trackingOid}`);
@@ -3717,7 +3739,7 @@ export default function (pi: ExtensionAPI) {
       // `parsePushRefSpecs` is a pure classifier (zero subprocess), so asking it
       // here costs nothing.
       const pushAttempt = parsePushRefSpecs(command).eligible;
-      const pushScope = resolvePushRangeScope(command, cwd, pushAttempt ? sub : null);
+      const pushScope = resolvePushRangeScope(command, cwd, pushAttempt ? sub : null, subDisabled);
       scope = pushScope ?? runStagedScope(cwd, pushAttempt ? null : sub);
     }
 

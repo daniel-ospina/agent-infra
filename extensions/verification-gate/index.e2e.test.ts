@@ -4385,13 +4385,17 @@ async function main() {
   // — it is main's whole delta PLUS the branch's own files, and the required
   // set explodes (3 → 629 in the field). The true change is
   // `git diff origin/main...HEAD` = the branch's own files.
-  // ⛔ ONE DEFECT, FIVE FILINGS — do not re-file it a sixth time. The family is
+  // ⛔ ONE DEFECT, MANY FILINGS — do not re-file it again. The CLOSED family is
   // agent-infra #737 (the rebase repro + the recorded fix direction: make the
   // tier CONDITIONAL ON ANCESTRY) → #811 → #914, closed out as MUTUAL duplicates
   // (#737 ↦ #914 and #914 ↦ #737) with no fix landed, #914 having re-reproduced
-  // the bug at close time → tortoise #3716 (this one). The scenario name below
-  // carries #737's recorded greppable trigger (`#737): rebase push range
-  // excludes base-identical paths`) so the deliverable is findable.
+  // the bug at close time. Still-OPEN peers of the SAME root, which this change
+  // closes, are agent-infra #1363 (tier A's base is the stale tracking ref, open
+  // since 2026-09-23) and #1490 (a rebase onto main scopes the whole upstream
+  // delta, open since 2026-09-26) — cross-linked on the root rather than re-filed.
+  // Root of record: tortoise #3716 (this one). The scenario name below carries
+  // #737's recorded greppable trigger (`#737): rebase push range excludes
+  // base-identical paths`) so the deliverable is findable.
   test("scenario 83 (#3716/#737): rebase push range excludes base-identical paths — scoped 3-dot against the trusted base, never the stale tracking ref", async () => {
     const remote = join(TEST_ROOT, "repo-3716-origin.git");
     mkdirSync(remote, { recursive: true });
@@ -4784,6 +4788,71 @@ async function main() {
       "88: the block names the STAGED file — the rewrite range was abandoned, never used");
     ok(!readAuditLines().slice(before88).some((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push"),
       "88: an abandoned op (a later refspec nulled the whole command) must not leave a rewrite audit line — RED pre-fix");
+  });
+
+  test("scenario 89 (#3716): the narrowing base is the HOUSE integration branch — a checkout whose own upstream is a TOPIC branch keeps the 2-dot scope", async () => {
+    // The review's fail-open, reproduced. `resolveTrustedBase` prefers a branch's
+    // DECLARED upstream naming another branch (#3398 — for the SUBTRACTION arm,
+    // where guards (0)-(5) neutralise it). The narrowing has no guard set: it
+    // omits every path the pushed tip SHARES with its base, so a TOPIC base omits
+    // content the push LANDS on the remote — which then ships unverified. Pre-fix
+    // on this geometry the resolver returned `["feat89.ts"]` while the pre-#3716
+    // range was `["develop-only.ts"]`: `develop-only.ts` (a sibling branch's
+    // content, never integrated into main) was landed on remote `feat` undemanded.
+    // The narrowing now requires `INTEGRATION_BASE_REF` (the house integration
+    // branch), so a topic base is a non-integration base ⇒ wider scope (fail-closed).
+    const origin = join(TEST_ROOT, "repo-3716-topicbase-origin.git");
+    mkdirSync(origin, { recursive: true });
+    git(origin, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716-topicbase");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + origin);
+    writeFileSync(join(repo, "baseline89.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    // `develop` is a SIBLING topic branch — its content is NOT integrated into main.
+    git(repo, "checkout -q -b develop");
+    writeFileSync(join(repo, "develop-only.ts"), "dev\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m develop-work");
+    git(repo, "push -q -u origin develop");
+    git(repo, "checkout -q main"); // feat must branch from MAIN, so the rebase onto develop REWRITES it
+    // `feat` is pushed from main, then REBASED onto the topic branch — so proof
+    // (1) holds against origin/develop AND origin/main; only the base choice
+    // decides the range.
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "feat89.ts"), "f\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feat-work");
+    git(repo, "push -q -u origin feat");
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q origin");
+    git(repo, "rebase -q origin/develop");
+    equal(git(repo, "merge-base HEAD origin/develop"), git(repo, "rev-parse origin/develop"),
+      "89: (fixture) the rebase landed on origin/develop — proof (1) holds against the TOPIC base");
+    equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
+      "89: (fixture) origin/main is ALSO an ancestor — only the base CHOICE decides the range");
+    // The checkout's own upstream is the TOPIC branch (branch.work.merge = develop),
+    // which is what made `resolveTrustedBase` return a non-integration base.
+    git(repo, "checkout -q -b work");
+    git(repo, "config branch.work.remote origin");
+    git(repo, "config branch.work.merge refs/heads/develop");
+    await fire("session_start", {});
+    const before89 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force origin feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "89: the force-push blocks — it LANDS develop-only.ts on remote `feat`");
+    ok(res.reason.includes("develop-only.ts"),
+      "89: the block NAMES develop-only.ts — a topic-base narrowing omits it entirely (RED pre-fix), shipping un-integrated content unverified");
+    ok(!readAuditLines().slice(before89).some((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push"),
+      "89: and no rewrite line is emitted — a non-integration base is never narrowed against");
   });
 
   test("scenario 1092: a DIRECTORY symlink commits its LINK TARGET — never a permanent EISDIR block (#1092)", async () => {

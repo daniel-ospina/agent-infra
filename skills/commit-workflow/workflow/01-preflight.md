@@ -518,7 +518,8 @@ branch was `rebase`d after it was pushed — the ref still points at the
 PRE-rebase tip on the OLD base, so the 2-dot range is the whole base delta
 (629 files in the field) instead of the branch's own diff (3), and the retry
 loop cannot converge. Such a push is scoped 3-dot against the integration base
-— exactly the first-push command — and the discarded commits are reported
+(the tier-B command form, but against the #3398 trusted base — never the push
+remote's `main`), and the discarded commits are reported
 separately as `gate_skip: non_fast_forward_push` (a report, never a widening of
 the verify set). That switch needs TWO explicit proofs: the remote-tracking ref
 is NOT an ancestor of the pushed tip, **and** the integration base IS an
@@ -603,7 +604,9 @@ coverage for every upstream file: recorded incidents went from 39 staged files t
 - **Opt out:** `ELDATO_VGATE_NO_SUBTRACT=1` restores the previous (larger) scope and is
   audited as `subtract_disabled_by_env`. Unlike `ELDATO_SKIP_VGATE` this moves in the
   **stricter** direction, so a task sub-agent is permitted to set it: it can cost time,
-  never coverage.
+  never coverage. It disables the #3716 narrowing as well, so a rewrite push keeps the
+  pre-#3716 2-dot scope too — the opt-out's "previous scope" promise holds for every
+  scope producer (substitution aside, no scope is narrowed while the flag is set).
 
 Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
 `git push` (the tracking-ref arm unless the #3716 narrowing applies: the tracking ref is
