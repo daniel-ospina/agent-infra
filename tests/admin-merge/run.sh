@@ -367,6 +367,18 @@ case "$key" in
       if [ -f "$SCEN/rerun-$id" ] && [ -f "$SCEN/log-after-$id" ]; then
         cat "$SCEN/log-after-$id"; exit 0
       fi
+      # `partial-log-<id>` models the shape the fake could not previously produce:
+      # `gh` writes a TRUNCATED log to stdout and THEN exits non-zero. Real gh
+      # does this (the capture is `2>&1 > "$out"`, so `$out` keeps whatever
+      # arrived before the failure), and it is the ONLY way the `frc -ne 0`
+      # refusals in `collect_union_signatures` / `collect_union_rows` become
+      # load-bearing: with no partial write the downstream `failed_ids_from_log`
+      # refusal catches it anyway, which is why dropping those checks left the
+      # whole suite green (review cycle 7) while a partial log is extracted as a
+      # COMPLETE failure set — a silent fail-open.
+      if [ -f "$SCEN/partial-log-$id" ]; then
+        cat "$SCEN/partial-log-$id"; exit 1
+      fi
       [ -f "$SCEN/fail-log-$id" ] && exit 1
       [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
       exit 0
@@ -1223,23 +1235,19 @@ fi
 # only the API-FAILURE sub-case (the command-level `|| return 1`); this pins the
 # other one: a SUCCESSFUL call whose `.total_count` is not a number.
 #
-# This is not hypothetical. `gh api … --jq '.total_count'` prints `null` and
-# exits 0 when the field is absent. Coercing that to 0 (`case … count=0`) passes
-# the ENTIRE suite while failing OPEN — measured by review cycle 6: with 3 real
-# failing main runs plus one run whose log is unreadable and whose count is
-# "null", pristine -> rc=1 BLOCK, coerced -> rc=0 with the run silently DROPPED
-# and its K contribution removed (a shrunk denominator inflates main's measured
-# rate — the same fail-open direction 5i exists to protect).
-#
-# A previous commit claimed the numeric guard's failure direction was "a wrong
-# diagnostic string, not a wrong decision". That is true of REMOVING the guard
-# (the `= "0"` test rejects any non-"0" string, so fall-through stays
-# fail-closed) but NOT of coercing the value — which is the natural
-# over-application of this very fix. The claim was wrong; this test is the fix.
+# ⚠️ This block feeds the literal `null`. Review cycle 7 MEASURED that real `gh`
+# (2.97.0 / go-gh v2.13.0) NEVER PRINTS `null`: `pkg/jq/jq.go` maps a nil to ""
+# and `EvaluateFormatted` writes it with `fmt.Fprintln`, so a nil projection
+# yields a bare newline (verified here: `gh api /rate_limit --jq '.total_count'`
+# -> rc=0, stdout is one `\n` byte); an HTTP 204 yields no stdout at all. Both
+# reach the shell as the EMPTY string — a DIFFERENT alternative of the same
+# `case`. So this block pins the guard's arithmetic path, and 5k pins the empty
+# path that real gh actually produces. Keeping both is the point: the `''`
+# clause is the one a reader of this comment would otherwise be misled about.
 echo "== 5j. a NON-NUMERIC job count is not zero — still fail-closed =="
 new_scen nan-count
 : > "$SCEN/fail-log-7783"
-printf 'null\n' > "$SCEN/jobs-count-7783"   # gh: a SUCCESSFUL call that answered null
+printf 'null\n' > "$SCEN/jobs-count-7783"   # a non-numeric value that is NOT empty
 { main_red_n main7783 1001 3 'tests/test_other.py::test_red_on_main'
   lane_fail main7783 7783
 } > "$SCEN/runs-main"
@@ -1247,7 +1255,7 @@ cfs_run --main-union-rates 10 --repo test-org/test-repo \
   --exclude deadbeef --provenance "$TMP/zja-prov.txt" --runs-report "$TMP/zja-rep.txt"
 rc=$?
 [ "$rc" -ne 0 ] && pass "a non-numeric count still fails closed (exit $rc)" \
-                || fail "expected a non-zero exit, got 0 — a 'null' count was read as ZERO"
+                || fail "expected a non-zero exit, got 0 — a non-numeric count was read as ZERO"
 grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a non-numeric count must NOT be reported as zero-job" \
                                         || pass "no zero-job note for a non-numeric count"
 if [ -s "$TMP/cfs-out" ]; then
@@ -1256,6 +1264,137 @@ if [ -s "$TMP/cfs-out" ]; then
 else
   pass "no rate table emitted — the baseline was not silently shrunk"
 fi
+
+# ── 5k. #1482: an EMPTY count is not zero — the shape real gh emits ───────────
+# Review cycle 7 found that 5j pins an UNREACHABLE value. A nil `.total_count`
+# never arrives as `null` through go-gh v2.13.0 — it arrives as an EMPTY string.
+# That is a different alternative of the SAME `case`, and folding just the empty
+# one into zero —
+#     case "$count" in '') count=0 ;; *[!0-9]*) return 1 ;; esac
+# — leaves 5j passing, leaves the whole 801-test suite GREEN, and turns the rail
+# from BLOCK (rc=1, `gh pr merge` never invoked) into MERGE (rc=0, a rate table
+# emitted with the run silently dropped). Both real shapes are therefore pinned:
+# an entirely empty file, and a file holding a single newline.
+for shape in empty newline; do
+echo "== 5k ($shape). an EMPTY job count is not zero — still fail-closed =="
+new_scen "nan-$shape"
+: > "$SCEN/fail-log-7784"
+case "$shape" in
+  empty)   : > "$SCEN/jobs-count-7784" ;;               # gh exit 0, NO stdout (HTTP 204)
+  newline) printf '\n' > "$SCEN/jobs-count-7784" ;;     # gh exit 0, a bare newline (nil -> "")
+esac
+{ main_red_n main7784 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7784 7784
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zk-$shape-prov.txt" --runs-report "$TMP/zk-$shape-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "an empty job count still fails closed (exit $rc)" \
+                || fail "expected a non-zero exit, got 0 — an EMPTY count was read as ZERO"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "an empty count must NOT be reported as zero-job" \
+                                        || pass "no zero-job note for an empty count"
+if [ -s "$TMP/cfs-out" ]; then
+  fail "a rate table was emitted despite an empty count (a shrunk K is a fail-open):"
+  sed 's/^/       /' "$TMP/cfs-out"
+else
+  pass "no rate table emitted — the baseline was not silently shrunk"
+fi
+done
+
+# ── 5l. #1482: `collect_union`'s fail-closed arm, on the detector's own paths ──
+# Review cycle 7 found the third collector's fail-closed arm untested. Dropping it
+# (`*) ;;`) leaves the fast harness AND the full 801-test suite GREEN, because the
+# three `--commit` tests and every `--main-union` test use READABLE logs, and `--pr`
+# is never exercised at all. The consequence is not cosmetic: on the post-merge
+# detector path an unreadable log is how `--commit` reports "I could not extract the
+# merged commit's failing set", and with the arm gone the command returns 0 with
+# EMPTY stdout — the detector then reports `✅ no unique failures carried by this
+# merge`, a FALSE CLEAN, instead of `::error:: could not extract`.
+for mode in main-union commit; do
+echo "== 5l ($mode). an unreadable log still fails closed on collect_union =="
+new_scen "union-$mode"
+if [ "$mode" = "commit" ]; then
+  sha='aa5511000000000000000000000000000000000'
+  lane_fail "$sha" 8802 > "$SCEN/runs-$sha"
+  : > "$SCEN/fail-log-8802"          # log unreadable ...
+  printf '3\n' > "$SCEN/jobs-count-8802"   # ... and the run DID have jobs
+  cfs_run --commit "$sha"
+else
+  { main_red_n main8802 1001 3 'tests/test_other.py::test_red_on_main'
+    lane_fail main8802 8802
+  } > "$SCEN/runs-main"
+  : > "$SCEN/fail-log-8802"
+  printf '3\n' > "$SCEN/jobs-count-8802"
+  cfs_run --main-union 10 --repo test-org/test-repo
+fi
+rc=$?
+[ "$rc" -ne 0 ] && pass "$mode: fails closed (exit $rc)" \
+                || fail "$mode: expected a non-zero exit, got 0 — a FALSE CLEAN on a run that had jobs"
+if [ -s "$TMP/cfs-out" ]; then
+  fail "$mode: emitted a failure set despite an unreadable log:"
+  sed 's/^/       /' "$TMP/cfs-out"
+else
+  pass "$mode: emitted NO failure set (an empty stdout is what reads as 'no failures')"
+fi
+done
+
+# ── 5m. #1482: the per-collector `frc -ne 0` refusals are pinning, not decoration ──
+# Review cycle 7 called these two verdict-NEUTRAL and found that dropping either
+# left the whole suite green. The first half of that is right and the second half
+# was a TEST-SEAM artifact, not a property of the code:
+#
+#   `fetch_failed_log` captures with `2>&1 > "$out"`, so `$out` keeps whatever
+#   `gh` wrote to stdout BEFORE it failed. Every other scenario's fake `gh` exits 1
+#   immediately and leaves `$out` EMPTY — and an empty file makes the downstream
+#   `failed_ids_from_log "$log_file" || return 1` refuse for the same reason, so
+#   `frc` looked redundant. A PARTIAL write is the case where it is not: without
+#   the refusal the truncated log is parsed, `failed_ids_from_log` SUCCEEDS, and a
+#   TRUNCATED failure set is emitted as if it were complete.
+#
+# The new `partial-log-<id>` seam models that shape, which makes the refusal
+# load-bearing and this test able to see it.
+echo "== 5m. the per-collector refusals pin a PARTIAL log, not just an empty one =="
+new_scen frc-pin
+{ main_red_n main8803 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main8803 8803
+} > "$SCEN/runs-main"
+# gh writes a TRUNCATED capture, then fails. The partial log carries ONE real
+# failure id IN THE REAL LOG SHAPE (`log_failed`), so a parser that trusts it
+# emits a set that looks complete. An earlier version of this fixture wrote a
+# bare `FAILED <nodeid>` line — the EXTRACTOR's output, not a raw log line — so
+# the downstream `failed_ids_from_log` refused it too and the mutant survived.
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/partial-log-8803"
+printf '3\n' > "$SCEN/jobs-count-8803"   # the run DID have jobs
+# The modes are the REAL entry points for the two collectors that carry the
+# refusal: `--main-union-signatures` -> collect_union_signatures, and
+# `--commit-rows` -> collect_union_rows (the PR-side input). There is no
+# `--main-union-rows`; naming a mode the CLI does not have exits 2 on USAGE and
+# would have passed this test vacuously — asserted below.
+sha8803='aa5511000000000000000000000000000000000'
+lane_fail "$sha8803" 8803 > "$SCEN/runs-$sha8803"
+cfs_run --main-union-signatures 10 --repo test-org/test-repo \
+  --runs-report "$TMP/zl-sig-rep.txt" --provenance "$TMP/zl-sig-prov.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "--main-union-signatures refuses on a PARTIAL log (exit $rc)" \
+                || fail "--main-union-signatures returned 0 on a partial log — a TRUNCATED signature set was emitted as complete"
+cfs_run --commit-rows "$sha8803" --runs-report "$TMP/zl-rows-rep.txt" \
+  --provenance "$TMP/zl-rows-prov.txt"
+rc=$?
+[ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && pass "--commit-rows refuses on a PARTIAL log (exit $rc)" \
+  || fail "--commit-rows did not refuse with a real verdict (exit $rc; 2 = usage error = the mode named is wrong, so nothing was tested)"
+# And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
+# (This is the case that made the refusals look redundant in review cycle 7.)
+new_scen frc-pin-empty
+{ main_red_n main8804 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main8804 8804
+} > "$SCEN/runs-main"
+: > "$SCEN/fail-log-8804"
+printf '3\n' > "$SCEN/jobs-count-8804"
+cfs_run --main-union-signatures 10 --repo test-org/test-repo \
+  --runs-report "$TMP/zl-sig2-rep.txt" --provenance "$TMP/zl-sig2-prov.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "--main-union-signatures also refuses on an EMPTY log (exit $rc)" \
+                || fail "--main-union-signatures returned 0 on an empty log"
 
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
