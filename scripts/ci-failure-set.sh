@@ -899,7 +899,7 @@ main() {
         fi ;;
       --commit-rows) mode="commit-rows"; commit="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --per-run) per_run="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
-      --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 ;;
+      --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 2>/dev/null || shift $# ;;
       --exclude) exclude="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --repo) repo="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --workflow) workflow="${2:-}"; shift 2 2>/dev/null || shift 1 ;;

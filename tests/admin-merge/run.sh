@@ -1467,6 +1467,17 @@ CFS_GUARD_ARGS="--diff /nonexistent-zz-1482 $TMP/gd-b.txt"
 run_guard "--diff whose FIRST file is unreadable" - "cannot read"
 CFS_GUARD_ARGS="--diff $TMP/gd-a.txt /nonexistent-zz-1482"
 run_guard "--diff whose SECOND file is unreadable" - "cannot read"
+# `--diff` is the ONLY option that consumes THREE arguments (`shift 3`), so it is
+# the one place the same spin can survive a fix applied only to `shift 2` — which
+# is exactly what happened (review cycle 9): all nine `shift 2` sites were
+# converted and `--diff` alone still hung, with the `--diff needs two files` guard
+# below UNREACHABLE because the parser spun before the mode switch was ever
+# entered. The 5n cases above pass two files, so `shift 3` always succeeded and the
+# hang was invisible. Assert the two DANGLING forms too.
+CFS_GUARD_ARGS='--diff'
+run_guard "--diff with NO files" usage '-'
+CFS_GUARD_ARGS="--diff $TMP/gd-a.txt"
+run_guard "--diff with ONE file" usage '-'
 
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
