@@ -912,14 +912,14 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
       withdrawal refuses the clean id only when it arrives after the withdrawal, so
       the same multiset yields it a rate in one order and none in another. The
       withdrawal must also be keyed on the WHOLE nodeid, so the near-miss ids below
-      each share exactly ONE dimension with the withdrawn id and must survive a
-      withdrawal keyed on that dimension: the same file, the same function name
-      across files, the same file BASENAME in another directory, the same CLASS
-      (both sides of the pair class-bearing), a case-only variant, and a
+      are each fused with the withdrawn id ONLY by the grouping their fixture names
+      and must survive a withdrawal keyed on it: the same file, the same function
+      name across files, the same file BASENAME in another directory, the same
+      CLASS (both sides of the pair class-bearing), a case-only variant, and a
       one-character extension. A class-nested sibling is a SEPARATE case from a
       case-folding or file-prefix one, because a classless id has no class to
-      share. A key derived by an ARBITRARY function of the nodeid cannot be
-      excluded by a black-box fixture -- see the residual note at the end.
+      share. That list is a hand-picked sample of an unbounded family; the
+      exhaustive-over-pairs test below does not depend on it.
     * the **equality** boundary -- an EXACT repeat withdraws the id too. The rule
       is a second valid row (agreeing or disagreeing), not a disagreeing one, so a
       guard that refuses only on a *differing* rate is caught here.
@@ -936,7 +936,7 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
     """
     key = "tests/test_a.py::test_a11"
     other = "tests/test_b.py::test_b48"
-    # Near-miss ids: each shares exactly ONE dimension with `key`.
+    # Near-miss ids: each differs from `key` along one named dimension.
     same_file = "tests/test_a.py::test_a12"
     same_name = "tests/test_b.py::test_a11"
     # A class-bearing id: `key` has NO class, so a class-sharing fixture needs one
@@ -981,6 +981,11 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
         ("a malformed row between the pair and a LATER row of the same id "
          "(catches a malformed branch that clears the withdrawn set)",
          [f"{key}\t8\t8", f"{key}\t0\t8", "not a rate row", f"{key}\t1\t8",
+          f"{other}\t4\t8"],
+         {other: Rate(4, 8)}),
+        ("an all-valid four-row duplicate, with a LATER row of the same id "
+         "(catches an 'already withdrawn' branch that un-withdraws)",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8", f"{key}\t2\t8",
           f"{other}\t4\t8"],
          {other: Rate(4, 8)}),
         ("two independently duplicated ids",
@@ -1069,6 +1074,127 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
             assert main.rates == {f: Rate(4, 8) for f in fillers}, (
                 f"n={n}: a withdrawal must not expire -- no later row, however many "
                 "arrive, may re-establish a withdrawn id")
+
+    # The ladder above grows only ACCEPTED rows. A bound on any other counter is
+    # invisible to it, so the same shape is repeated with rows that are REJECTED
+    # instead -- malformed lines, which cannot be accepted and therefore cannot
+    # expire a withdrawal under the rule the module claims.
+    for n in (1, 2, 8, 64, 256):
+        rows = ([f"{key}\t8\t8", f"{key}\t0\t8"]
+                + ["not a rate row"] * n
+                + [f"{key}\t1\t8"])
+        for order in (rows, list(reversed(rows))):
+            assert parse_rates("\n".join(order) + "\n").rates == {}, (
+                f"n={n}: no rejection -- malformed or otherwise -- may expire a "
+                "withdrawal")
+
+
+#: Structural neighbours of one nodeid: ids that differ from a given id along ONE
+#: dimension a key derivation could use (file, directory, file basename, leaf,
+#: leaf prefix/suffix, case, class, bracket/parametrize id, step). A withdrawal
+#: keyed on ANY of those coarser dimensions fuses two of these ids and is refused
+#: by the pairwise sweep below.
+_WITHDRAWAL_KEY_POOL = [
+    "tests/test_a.py::test_a11",
+    "tests/test_a.py::test_a1",
+    "tests/test_a.py::test_a111",
+    "tests/test_a.py::test_a11.extra",
+    "tests/test_a.py::test_a11[x]",
+    "tests/test_a.py::test_a11[y]",
+    "tests/test_a.py::test_a11[1-2]",
+    "tests/test_a.py::TEST_A11",
+    "tests/test_a.py::test_a12",
+    "tests/test_b.py::test_a11",
+    "tests/test_b.py::test_b48",
+    "tests/test_a.py::TestX::test_a11",
+    "tests/test_a.py::TestX::test_a12",
+    "tests/test_a.py::TestX::test_a11[x]",
+    "tests/test_a.py::TestY::test_a11",
+    "tests/TEST_A.py::test_a11",
+    "tests/tests_a.py::test_a11",
+    "tests/unit/test_a.py::test_a11",
+    "tests/sub/test_a.py::test_a11",
+    "tests/test-a.py::test_a11",
+    "guard-step::build::orphan-4-rows",
+    "guard-step::build::orphan-5-rows",
+    "guard-step::build::missing-3-artifact",
+    "guard-step::test::orphan-4-rows",
+]
+
+
+def test_the_withdrawal_is_keyed_on_the_whole_nodeid_for_every_pair_of_ids():
+    """#3766: EXHAUSTIVE over every PAIR of ids, not over a hand-picked list.
+
+    The sweep in the test above enumerates the dimensions a key derivation might
+    use, one fixture per dimension -- which means it can only catch a derivation
+    whose dimension somebody thought to write down. The property is really about
+    DISTINCTNESS: duplicating one id must not change any OTHER id's rate, and two
+    ids the module treats as the same id are by definition not distinct. That is
+    decidable by enumeration over the ids themselves.
+
+    So this test takes a pool of structurally adjacent ids -- same file, same
+    directory, same file basename, leaf prefix and suffix, case variant, class
+    suffix, bracket/parametrize id, step -- and asserts the property for EVERY
+    ordered pair of DISTINCT ids in it, over every order of the three rows. A
+    withdrawal keyed on any derivation that fuses two pool ids into one is caught
+    wherever it lands, without that derivation having been enumerated in advance:
+    the pool supplies the colliding pair for the enumeration instead of a fixture
+    having to guess it. Checked as a pair invariant, it also refuses a withdrawal
+    key that fuses the pair in one direction only.
+
+    What it does NOT reach: a derivation that fuses two ids which are NOT both in
+    the pool. That residual is unbounded in principle (any function of the nodeid),
+    and it is why the pool is structurally diverse rather than a sample -- but it is
+    still a finite pool, and the residual is stated, not closed.
+    """
+    pool = _WITHDRAWAL_KEY_POOL
+    for dup in pool:
+        for sibling in pool:
+            if sibling == dup:
+                continue
+            rows = [f"{dup}\t8\t8", f"{dup}\t0\t8", f"{sibling}\t4\t8"]
+            for order in itertools.permutations(rows):
+                rates = parse_rates("\n".join(order) + "\n").rates
+                assert rates == {sibling: Rate(4, 8)}, (
+                    f"withdrawing {dup!r} changed the rate of {sibling!r} -- the "
+                    "withdrawal is not keyed on the whole nodeid")
+
+
+def test_the_withdrawn_set_is_neither_capacity_nor_budget_bounded():
+    """#3766: a withdrawn set is a SET, not a fixed-size cache or a budget.
+
+    The fixtures above duplicate at most two ids, so a withdrawal structure that
+    keeps only the last N ids (a FIFO / LRU / two-slot cache) is invisible to them,
+    and the lifetime ladder grows only ACCEPTED rows, so a bound measured on any
+    other counter is invisible too. Both are order-dependent once the table is big
+    enough: the id that fell out of the cache is re-established by a later row.
+
+    Scale is the only axis that reaches them, so this test scales: many
+    INDEPENDENTLY duplicated ids, followed by a further row of the FIRST and of the
+    LAST one. Neither may reappear. The trailing rows are placed last on purpose --
+    an evicted id is re-established precisely by a row that arrives after the
+    eviction.
+    """
+    ids = [f"tests/test_scale.py::test_s{i}" for i in range(64)]
+    rows = []
+    for nodeid in ids:
+        rows += [f"{nodeid}\t8\t8", f"{nodeid}\t0\t8"]
+    rows += [f"{ids[0]}\t1\t8", f"{ids[-1]}\t2\t8", "not a rate row"]
+    for order in (rows, list(reversed(rows))):
+        assert parse_rates("\n".join(order) + "\n").rates == {}, (
+            "an id that fell out of a bounded withdrawal structure was "
+            "re-established -- 64 duplicated ids must ALL stay withdrawn")
+
+    # The same scale, one id only, to reach a budget measured on the whole table's
+    # row count rather than on the withdrawn set: 1024 rows for one id, then one
+    # more.
+    many = [f"tests/test_scale.py::test_one\t8\t8",
+            f"tests/test_scale.py::test_one\t0\t8"]
+    many += [f"tests/test_scale.py::test_one\t{k % 8}\t8" for k in range(1024)]
+    many += ["tests/test_scale.py::test_one\t1\t8"]
+    assert parse_rates("\n".join(many) + "\n").rates == {}, (
+        "a budget measured on the table's own size expired a withdrawal")
+    assert parse_rates("\n".join(reversed(many)) + "\n").rates == {}
 
 
 def test_a_pr_failure_with_an_empty_sample_is_not_exempt():
