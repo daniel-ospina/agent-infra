@@ -391,24 +391,24 @@ def parse_rates(lines: str) -> RatesResult:
     the same row multiset** (#3766); ``rejected`` records rows as they arrive, so
     the evidence list keeps input order (only its length is invariant), and nothing
     downstream reads it for the decision. A failure key with two or more VALID rows
-    contributes NO rate for the WHOLE table, and the contradiction TAINTS the id
-    **permanently** -- a later row for a withdrawn id is rejected too, it cannot
-    re-establish it. Rejection, not combination: a duplicate is a self-contradicting
-    table, and any silent max/sum/mean would be a rate POLICY this module has no
-    mandate to choose. The taint must outlive the withdrawn row, because
-    withdrawing it only for the row at hand let an ODD duplicate count (three
-    concatenated shards: 8/8, 0/8, 1/8) re-establish the id on the next line --
-    Rate(1,8) forward, Rate(8,8) reversed, a BLOCK against an EXEMPT from one
-    unchanged multiset. A row the guards ABOVE reject (malformed, not a failure
-    key, ``runs <= 0``, ``failures > runs``) contributes nothing and cannot taint:
-    its position must not change the outcome, or the table would be order-dependent
-    again.
+    is WITHDRAWN for the rest of THIS table -- agreeing or disagreeing, because the
+    slot holds one measurement per key and this module has no mandate to reconcile
+    two -- and the withdrawal is PERMANENT within the table: membership in the
+    withdrawn set is checked BEFORE the accept path, so no later row can put the id
+    back. (Not "permanently" across calls: nothing survives the return.) The
+    withdrawal must outlive the row that triggered it, because withdrawing only for
+    the row at hand let an ODD duplicate count (three concatenated shards: 8/8,
+    0/8, 1/8) re-establish the id on the next line -- Rate(1,8) forward, Rate(8,8)
+    reversed, a BLOCK against an EXEMPT from one unchanged multiset. A row the
+    guards ABOVE reject (malformed, not a failure key, ``runs <= 0``, ``failures >
+    runs``) contributes nothing and cannot withdraw the id: its position must not
+    change the outcome, or the table would be order-dependent again.
     """
     rates: dict[str, Rate] = {}
     rejected: list[str] = []
-    #: Ids the table contradicted. Populating ``rates`` is a ONE-WAY door: a
-    #: duplicate withdraws the id and records it here, and membership here is
-    #: checked BEFORE the accept path, so no later row can put it back.
+    #: Ids the table withdrew. Populating ``rates`` is a ONE-WAY door: a duplicate
+    #: withdraws the id and records it here, and membership here is checked BEFORE
+    #: the accept path, so no later row can put it back.
     tainted: set[str] = set()
     for raw in lines.splitlines():
         line = raw.strip("\n")
@@ -433,13 +433,12 @@ def parse_rates(lines: str) -> RatesResult:
             rejected.append(line)
             continue
         if nodeid in rates:
-            # Duplicate rows (latent finding 2): "A 8 8" then "A 0 8" yielded
-            # Rate(0,8) while the REVERSED order yielded Rate(8,8) — row order
-            # decided whether the PR blocked, an order-dependence inside the
-            # verdict-stability class. Reject rather than pick a winner: a table
-            # that contradicts itself is not evidence, and fail-closed means the id
-            # then has no rate at all (not exempt). Marking it TAINTED (not merely
-            # popping it) is what keeps the id from being re-established later.
+            # Duplicate rows (latent finding 2): the LAST row used to win, so row
+            # order decided whether the PR blocked -- an order-dependence inside
+            # the verdict-stability class. Reject rather than pick a winner: the id
+            # then has no rate at all (not exempt), which is the fail-closed
+            # direction. WITHDRAWING it (not merely popping it) is what keeps it
+            # from being re-established by a later row.
             tainted.add(nodeid)
             rejected.append(line)
             rates.pop(nodeid, None)

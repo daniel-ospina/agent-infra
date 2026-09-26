@@ -890,7 +890,7 @@ def test_a_duplicate_row_is_rejected_not_resolved_by_order():
 
 
 def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
-    """#3766: the invariant is the ROW MULTISET, not the two-row example.
+    """#3766: the invariant is the ROW MULTISET, not one sampled shape of it.
 
     ``test_a_duplicate_row_is_rejected_not_resolved_by_order`` pinned the two-row
     case, and the guard it pinned withdrew an id by POPPING it -- so the
@@ -900,34 +900,93 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
     multiset produced a BLOCK and an EXEMPT. Enumerating EVERY order is the
     assertion the invariant actually makes -- a two-order sample passes while the
     third row silently re-establishes the id, which is exactly the defect.
+
+    **A permutation sweep is only as strong as the shape it permutes.** Permuting
+    a single key whose rows are all valid and pairwise distinct pins the invariant
+    for that one shape and lets a guard that is order-dependent one boundary away
+    ship green. Each fixture below therefore CROSSES a boundary the module's
+    claims are about, and each is enumerated in full:
+
+    * the **key** boundary -- a clean second id must keep its rate in EVERY order.
+      That is what separates a per-key taint from a table-wide one: a global taint
+      rejects the clean id only when it arrives after the withdrawal, so the same
+      multiset yields it a rate in one order and none in another.
+    * the **equality** boundary -- an EXACT repeat withdraws the id too. The rule
+      is a second valid row (agreeing or disagreeing), not a disagreeing one, so a
+      guard that taints only on a *differing* rate is caught here.
+    * the **validity** boundary -- a row the guards ABOVE reject (``failures >
+      runs``, ``runs <= 0``, malformed) contributes nothing and cannot taint, so a
+      valid sibling keeps its rate in every order. A taint branch placed ABOVE
+      those guards reads the same table the other way round.
     """
     key = "tests/test_a.py::test_a11"
-    base = [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8",
-            f"{key}\t2\t8", f"{key}\t3\t8"]
+    other = "tests/test_b.py::test_b48"
     pr = {key: Failure(rate=Rate(8, 8), signatures=frozenset({"sg"}))}
     sig = {key: frozenset({"sg"})}
 
-    # Every row COUNT from 2 to 5: a taint whose lifetime is a fixed number of
-    # rows passes a single 3-row fixture (its expiry needs a 4th row), so the
-    # count is swept rather than sampled once.
-    for n in range(2, 6):
-        rows = base[:n]
-        verdicts = set()
-        rejected_counts = set()
+    def verdict_of(rates):
+        d = decide(pr, rates, main_signatures=sig, k_pr=8)
+        return (tuple(v.nodeid for v in d.blocked), tuple(d.visible_exemptions()))
+
+    def as_key(rates):
+        return tuple(sorted((k, v.failures, v.runs) for k, v in rates.items()))
+
+    cases = [
+        ("a duplicate pair, a clean sibling",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{other}\t4\t8"],
+         {other: Rate(4, 8)}),
+        ("an ODD duplicate count, a clean sibling",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8", f"{other}\t4\t8"],
+         {other: Rate(4, 8)}),
+        ("an EXACT repeat (agreeing, not contradicting)",
+         [f"{key}\t8\t8", f"{key}\t8\t8", f"{other}\t4\t8"],
+         {other: Rate(4, 8)}),
+        ("a duplicate beside an upper-guard-rejected row",
+         [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t9\t8", f"{other}\t4\t8"],
+         {other: Rate(4, 8)}),
+        ("a valid row shadowed by an upper-guard rejection",
+         [f"{key}\t8\t8", f"{key}\t9\t8"], {key: Rate(8, 8)}),
+        ("a valid row shadowed by runs <= 0",
+         [f"{key}\t8\t8", f"{key}\t8\t0"], {key: Rate(8, 8)}),
+        ("a valid row beside a malformed line",
+         [f"{key}\t8\t8", "not a rate row"], {key: Rate(8, 8)}),
+    ]
+    for label, rows, expected in cases:
+        tables, rejected_counts, verdicts = set(), set(), set()
         for order in itertools.permutations(rows):
             main = parse_rates("\n".join(order) + "\n")
-            assert main.rates == {}, (
-                "a self-contradicting table is not evidence: NO order may leave a rate")
+            tables.add(as_key(main.rates))
             rejected_counts.add(len(main.rejected))
-            d = decide(pr, main.rates, main_signatures=sig, k_pr=8)
-            verdicts.add((tuple(v.nodeid for v in d.blocked), tuple(d.visible_exemptions())))
+            verdicts.add(verdict_of(main.rates))
 
+        assert tables == {as_key(expected)}, (
+            f"{label}: row order decided the rate table")
         assert len(rejected_counts) == 1, (
-            "the NUMBER of rejected rows must not depend on row order -- which rows "
-            "are reported is the module's reporting policy and may legitimately differ")
-        assert verdicts == {((key,), ())}, (
-            "every order of one row multiset must yield the SAME verdict (BLOCK, no "
-            "exemption) -- row order must never decide whether the PR blocks")
+            f"{label}: the NUMBER of rejected rows must not depend on row order -- "
+            "which rows are reported is the module's reporting policy and may "
+            "legitimately differ")
+        assert verdicts == {verdict_of(expected)}, (
+            f"{label}: every order of one row multiset must yield the SAME verdict -- "
+            "row order must never decide whether the PR blocks")
+
+    # The withdrawal must not EXPIRE either, and a bounded lifetime does not live
+    # on the permutation axis -- it lives on the rows that ARRIVE after it. A bound
+    # of N is defeated by a table with MORE rows following the withdrawal, so the
+    # sweep grows what follows well past any fixed bound, in BOTH directions. The
+    # following rows are OTHER keys on purpose: a later row of the WITHDRAWN key is
+    # itself refused, so only an ACCEPTED row can expire anything, and a fixture
+    # whose only accepted row sits after every row of the withdrawn key cannot see
+    # a bound at all.
+    for n in (1, 2, 3, 5, 8, 16, 40):
+        fillers = [f"tests/test_f{i}.py::test_f1" for i in range(n)]
+        rows = ([f"{key}\t8\t8", f"{key}\t0\t8"]
+                + [f"{f}\t4\t8" for f in fillers]
+                + [f"{key}\t1\t8"])
+        for order in (rows, list(reversed(rows))):
+            main = parse_rates("\n".join(order) + "\n")
+            assert main.rates == {f: Rate(4, 8) for f in fillers}, (
+                f"n={n}: a withdrawal must not expire -- no later row, however many "
+                "arrive, may re-establish a withdrawn id")
 
 
 def test_a_pr_failure_with_an_empty_sample_is_not_exempt():
