@@ -518,14 +518,24 @@ branch was `rebase`d after it was pushed — the ref still points at the
 PRE-rebase tip on the OLD base, so the 2-dot range is the whole base delta
 (629 files in the field) instead of the branch's own diff (3), and the retry
 loop cannot converge. Such a push is scoped 3-dot against the integration base
-(the tier-B command form, but against the #3398 trusted base — never the push
-remote's `main`), and the discarded commits are reported
+(the tier-B command form), and the discarded commits are reported
 separately as `gate_skip: non_fast_forward_push` (a report, never a widening of
-the verify set). That switch needs TWO explicit proofs: the remote-tracking ref
-is NOT an ancestor of the pushed tip, **and** the integration base IS an
+the verify set). That switch needs THREE explicit preconditions: the integration
+ref is **declared** — a `vgate.integrationRef` git-config key (the per-clone
+operator assertion that ACTIVATES the narrowing) whose value is confirmed by a
+checked-in `.vgate/integration-ref` when that file is present (an AGREEMENT
+TRIPWIRE — a shared, clone-relative name must not activate on its own: a fork
+clone inherits `refs/remotes/origin/main`, where `origin` is the FORK, and
+honoring it alone reproduces the fail-open one level up) — and
+`resolveTrustedBase` resolves to exactly that ref
+(never a base judged an integration branch by its NAME, and never the push
+remote's `main`; agent-infra #1491); the remote-tracking ref is NOT an ancestor
+of the pushed tip; **and** the integration base IS an
 ancestor-or-equal of it (so `merge-base(base, HEAD) == base` and every path the
 3-dot range omits is byte-identical to the base TIP's content — the trusted
-integration content). Without the second proof a branch that is merely behind
+integration content). Without the declaration there is NO narrowing (fail
+closed — the full pre-#3716 set is demanded); without the second proof a branch
+that is merely behind
 the base would narrow to a range that omits the paths its force-push REVERTS,
 reporting a content-destroying push as an empty up-to-date one. Any other
 outcome, including an unresolvable probe, leaves the push on its pre-#3716 path
@@ -617,8 +627,12 @@ deliberate non-goal; **rebase/cherry-pick push-leg de-flooding (#737, delivered 
 scoped against the trusted base (3-dot), and no subtraction guard set can subtract from
 that narrowed range (guard (5) cannot pass: the tracking ref is not an ancestor of
 `srcRef`, hence not of `srcRef^1` — and every guard is required; see the push-range
-paragraph above). The narrowing is taken on pinned commit OIDs against the #3398
-trusted base, never on a ref name or the push remote's `main`.
+paragraph above). The narrowing's base must EQUAL the declared integration ref
+(the per-clone `vgate.integrationRef` config — the activation surface —
+confirmed by a checked-in `.vgate/integration-ref` agreeing tripwire when present;
+agent-infra #1491),
+is resolved on pinned commit OIDs, and is never chosen from a ref name or the
+push remote's `main`. No config ⇒ no narrowing (fail closed).
 
 ### VGATE ceremony diagnostics & recovery (#561)
 

@@ -4438,6 +4438,8 @@ async function main() {
     git(repo, "checkout -q feat");
     git(repo, "fetch -q origin");
     git(repo, "rebase -q origin/main");
+    // #1491 — the narrowing requires the integration ref to be DECLARED.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
 
     equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
       "83: (fixture) the rebase landed cleanly — merge-base(HEAD, origin/main) == origin/main");
@@ -4516,6 +4518,8 @@ async function main() {
     git(repo, "commit -q -m base");
     const base84 = git(repo, "rev-parse HEAD");
     git(repo, `update-ref refs/remotes/origin/main ${base84}`);
+    // #1491 — declared, so this is a genuine narrowing-disabled-by-proof control.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
     git(repo, "checkout -q -b feat");
     // Already-pushed work (tracking ref = this tip ⇒ an ordinary fast-forward push).
     writeFileSync(join(repo, "pushed84.ts"), "p\n");
@@ -4570,6 +4574,8 @@ async function main() {
     git(repo, "commit -q -m c1");
     const c1 = git(repo, "rev-parse HEAD");
     git(repo, `update-ref refs/remotes/origin/main ${c1}`);
+    // #1491 — declared, so the refusal is the tri-state proof, not a missing declaration.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
     git(repo, "checkout -q main"); // local main is BEHIND origin/main
     await fire("session_start", {});
     const before85 = readAuditLines().length;
@@ -4622,6 +4628,8 @@ async function main() {
     git(repo, "checkout -q feat");
     git(repo, "fetch -q origin");
     git(repo, "reset -q --hard origin/main");
+    // #1491 — declared, so the empty-range rewrite path is actually taken.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
     equal(git(repo, "diff --name-only origin/main HEAD"), "",
       "86: (fixture) the pushed tip's tree IS the integration base — the narrowed range is empty");
     equal(git(repo, "rev-parse refs/remotes/origin/feat").length, 40,
@@ -4682,6 +4690,9 @@ async function main() {
     git(repo, "checkout -q feat");
     git(repo, "fetch -q fork");
     git(repo, "rebase -q fork/main");
+    // #1491 — the operator declares `origin/main` as the integration ref (this is
+    // the trusted base the narrowing must use, never the push remote's `main`).
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
     // `merge-base --is-ancestor` is exit-status-only (empty stdout on exit 0, and
     // the `git()` helper throws on the exit-1 negative), so read the status.
     const isAnc87 = (a: string, b: string): boolean => {
@@ -4770,6 +4781,8 @@ async function main() {
     git(repo, "checkout -q feat");
     git(repo, "fetch -q origin");
     git(repo, "rebase -q origin/main");
+    // #1491 — declared, so refspec #1 would take the narrowing path if it resolved.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
     equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
       "88: (fixture) the rebase landed cleanly — refspec #1 is a rewrite push");
     // Parked WIP so the STAGED fallback (the null that abandoned the range) has
@@ -4790,7 +4803,7 @@ async function main() {
       "88: an abandoned op (a later refspec nulled the whole command) must not leave a rewrite audit line — RED pre-fix");
   });
 
-  test("scenario 89 (#3716): the narrowing base is the HOUSE integration branch — a checkout whose own upstream is a TOPIC branch keeps the 2-dot scope", async () => {
+  test("scenario 89 (#3716/#1491): the narrowing base must EQUAL the declared integration ref — a checkout whose own upstream is a TOPIC branch keeps the 2-dot scope", async () => {
     // The review's fail-open, reproduced. `resolveTrustedBase` prefers a branch's
     // DECLARED upstream naming another branch (#3398 — for the SUBTRACTION arm,
     // where guards (0)-(5) neutralise it). The narrowing has no guard set: it
@@ -4799,8 +4812,9 @@ async function main() {
     // on this geometry the resolver returned `["feat89.ts"]` while the pre-#3716
     // range was `["develop-only.ts"]`: `develop-only.ts` (a sibling branch's
     // content, never integrated into main) was landed on remote `feat` undemanded.
-    // The narrowing now requires `INTEGRATION_BASE_REF` (the house integration
-    // branch), so a topic base is a non-integration base ⇒ wider scope (fail-closed).
+    // The narrowing now requires the integration ref to be DECLARED (#1491), so a
+    // base that does not equal the declaration is a non-integration base ⇒ wider
+    // scope (fail-closed).
     const origin = join(TEST_ROOT, "repo-3716-topicbase-origin.git");
     mkdirSync(origin, { recursive: true });
     git(origin, "init -q --bare -b main");
@@ -4832,6 +4846,10 @@ async function main() {
     git(repo, "checkout -q feat");
     git(repo, "fetch -q origin");
     git(repo, "rebase -q origin/develop");
+    // #1491 — the operator declares the HOUSE integration ref. The checkout's
+    // resolved base is the topic upstream (`origin/develop`), which does NOT equal
+    // the declaration, so the narrowing must be refused (fail-closed).
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
     equal(git(repo, "merge-base HEAD origin/develop"), git(repo, "rev-parse origin/develop"),
       "89: (fixture) the rebase landed on origin/develop — proof (1) holds against the TOPIC base");
     equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
@@ -4853,6 +4871,122 @@ async function main() {
       "89: the block NAMES develop-only.ts — a topic-base narrowing omits it entirely (RED pre-fix), shipping un-integrated content unverified");
     ok(!readAuditLines().slice(before89).some((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push"),
       "89: and no rewrite line is emitted — a non-integration base is never narrowed against");
+  });
+
+  test("scenario 90 (#1491): a FORK's `main` named origin/main is not the integration base — the content the push LANDS still blocks", async () => {
+    // #1491 vector 1, at the gate level. `resolveTrustedBase` falls back to
+    // `refs/remotes/origin/main`, the FORK's main in a fork-as-`origin` layout.
+    // The retired NAME guard accepted it and narrowed against the fork, omitting
+    // `fork-only.ts` — content the push LANDS on canonical `upstream`. The #1491
+    // declaration guard refuses the narrowing (no declaration), so the pre-#3716
+    // range keeps the landed content and the gate BLOCKS.
+    const upstream = join(TEST_ROOT, "repo-1491-fork-upstream.git");
+    mkdirSync(upstream, { recursive: true });
+    git(upstream, "init -q --bare -b main");
+    const fork = join(TEST_ROOT, "repo-1491-fork.git");
+    mkdirSync(fork, { recursive: true });
+    git(fork, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-1491-fork-work");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + fork);
+    git(repo, "remote add upstream " + upstream);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u upstream main");
+    git(repo, "checkout -q -b forkbase main");
+    writeFileSync(join(repo, "fork-only.ts"), "fork\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m fork-only");
+    git(repo, "push -q origin forkbase:main");
+    git(repo, "checkout -q main");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "feat.ts"), "feat\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feat-work");
+    git(repo, "push -q -u upstream feat");
+    git(repo, "fetch -q origin");
+    git(repo, "rebase -q origin/main");
+    // The SHIPPED checked-in declaration (agent-infra/tortoise land
+    // `refs/remotes/origin/main`) is INHERITED by the fork clone, where it names
+    // the FORK's main. It must NOT activate on its own: the per-clone config is
+    // the operator's assertion, the file only an agreement tripwire. No config
+    // here ⇒ still no narrowing ⇒ still BLOCK.
+    mkdirSync(join(repo, ".vgate"), { recursive: true });
+    writeFileSync(join(repo, ".vgate", "integration-ref"), "refs/remotes/origin/main\n");
+    equal(git(repo, "config --get vgate.integrationRef || echo UNSET"), "UNSET",
+      "90: (fixture) NO per-clone config — the inherited file alone must not activate");
+    equal(git(repo, "config branch.feat.remote"), "upstream",
+      "90: (fixture) the push remote is canonical `upstream`");
+    equal(git(repo, "diff --name-only refs/remotes/upstream/feat HEAD").trim(), "fork-only.ts",
+      "90: (fixture) the pre-#3716 range is the landed `fork-only.ts`");
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force upstream feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "90: the force-push BLOCKS — the fork-only content it lands is demanded (RED on the name guard, which narrowed against the fork and ALLOWED)");
+    ok(res.reason.includes("fork-only.ts"),
+      "90: the block names `fork-only.ts` — the content the fork-scoped narrowing omitted entirely");
+  });
+
+  test("scenario 91 (#1491): a legacy `main` on a master-default remote is not the integration base — the legacy-only content still blocks", async () => {
+    // #1491 vector 2, at the gate level. A single remote whose integration branch
+    // is `master` also carries a legacy branch literally named `main`. The
+    // retired NAME guard accepted `refs/remotes/origin/main` and narrowed against
+    // the legacy branch, omitting `legacy-only.ts`. The declaration guard refuses
+    // the narrowing (no declaration), so the pre-#3716 range keeps it and the gate
+    // BLOCKS.
+    const remote = join(TEST_ROOT, "repo-1491-legacy-origin.git");
+    mkdirSync(remote, { recursive: true });
+    git(remote, "init -q --bare -b master");
+    const repo = join(TEST_ROOT, "repo-1491-legacy");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b master");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + remote);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin master");
+    git(repo, "checkout -q -b main master");
+    writeFileSync(join(repo, "legacy-only.ts"), "legacy\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m legacy");
+    git(repo, "push -q origin main");
+    git(repo, "checkout -q master");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "own.ts"), "own\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m own");
+    git(repo, "push -q -u origin feat");
+    git(repo, "fetch -q origin");
+    git(repo, "symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master");
+    git(repo, "rebase -q origin/main");
+    // Same inheritance shape as scenario 90: the shipped file names a legacy
+    // `main` here, and must not activate without a per-clone assertion.
+    mkdirSync(join(repo, ".vgate"), { recursive: true });
+    writeFileSync(join(repo, ".vgate", "integration-ref"), "refs/remotes/origin/main\n");
+    equal(git(repo, "config --get vgate.integrationRef || echo UNSET"), "UNSET",
+      "91: (fixture) NO per-clone config — the inherited file alone must not activate");
+    equal(git(repo, "symbolic-ref --short refs/remotes/origin/HEAD"), "origin/master",
+      "91: (fixture) the integration branch is `master`");
+    equal(git(repo, "diff --name-only refs/remotes/origin/feat HEAD").trim(), "legacy-only.ts",
+      "91: (fixture) the pre-#3716 range is the landed `legacy-only.ts`");
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force origin feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "91: the force-push BLOCKS — the legacy-only content it lands is demanded (RED on the name guard, which narrowed against the legacy `main` and ALLOWED)");
+    ok(res.reason.includes("legacy-only.ts"),
+      "91: the block names `legacy-only.ts` — the content the legacy-main-scoped narrowing omitted entirely");
   });
 
   test("scenario 1092: a DIRECTORY symlink commits its LINK TARGET — never a permanent EISDIR block (#1092)", async () => {

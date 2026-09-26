@@ -162,6 +162,13 @@ jobs:
         # no extra dependency.
         echo "== extensions/verification-gate/subtract-scope.test.ts =="
         npx tsx extensions/verification-gate/subtract-scope.test.ts || failures=$((failures+1))
+        # #5550/#1491 — the push-scope PROOF (D1–D3 + F1–F7). It was wired into NO
+        # lane while its three siblings ran, so a later change re-introducing the
+        # narrowing bug and re-reddening D1/F2/F3/F4/F5/F6/F7 would have merged
+        # green — the inert-enforcer failure this step closes. Same npm ci route as
+        # the unit/e2e suites above; drives the real resolver against real repos.
+        echo "== extensions/verification-gate/index.5550.test.ts =="
+        npx tsx extensions/verification-gate/index.5550.test.ts || failures=$((failures+1))
         # #476 — provider-exhaustion failover suites (the shared/provider-failover*
         # suites are auto-picked by the shared glob above; the consumer-side
         # suites live under builtin-tools/ + the extension root). The parity suite

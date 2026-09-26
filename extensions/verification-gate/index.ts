@@ -2160,7 +2160,10 @@ export function resolvePushTier(trackingExists: boolean, baseMainExists: boolean
 }
 
 // PURE argv builder — baseRef is the FULLY RESOLVED base ref (never DWIM);
-// src is the resolved local ref (refs/heads/<x> or HEAD). Tier A = 2-dot
+// src is the fully resolved source: a local ref (refs/heads/<x> or HEAD), or —
+// on the #3716 history-rewrite path — the narrowed 40-hex source OID
+// (`narrowedSrc`), because a rebased branch's local ref name is exactly what the
+// narrowing exists to avoid re-diffing. Tier A = 2-dot
 // (space form — the remote branch also LOSES remote-side-only files on a
 // diverged/force push); tier B = 3-dot first-push base. The two forms are NOT
 // an A/B property of the branch: #3716 makes a history-rewriting push call this
@@ -2206,25 +2209,62 @@ function symbolicRefShort(cwd: string): string | null {
   return v === null || v === "" ? null : v;
 }
 
-// SHA-1 (40 hex) or SHA-256 (64 hex) object id. The ONLY shape a value may have
-// before it is interpolated into an execSync string by the #3716 probes — the
-// same whitelist-before-interpolation invariant as PUSH_REFNAME (execSync runs
-// /bin/sh -c; nothing here sets shell:false).
+// SHA-1 (40 hex) or SHA-256 (64 hex) object id. The shape a value must have
+// before `isAncestorOrEqual` or the `rev-list --count` probe interpolates it into
+// an execSync string — the same whitelist-before-interpolation invariant as
+// PUSH_REFNAME (execSync runs /bin/sh -c; nothing here sets shell:false).
+// `resolveCommitOid`'s `rev-parse` probe is the exception to "OIDs only": it
+// interpolates a PUSH_REFNAME-validated ref NAME and then validates the RESULT
+// against GIT_OID, so a name never reaches the ancestry probes.
 const GIT_OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
-// #3716 — the ONLY ref the narrowing may take as its base: the house integration
-// branch. `resolveTrustedBase` prefers a DECLARED upstream that names another
-// branch (#3398 — for the SUBTRACTION arm, where guards (0)-(5) neutralise it).
-// That ref can be a TOPIC branch (`origin/develop`, a stacked branch, a fork's
-// `main`), and the narrowing has no guard set: it omits every path the pushed tip
-// shares with its base, so a topic base omits content the push LANDS on the remote
-// and ships it unverified. Measured fail-open (2026-09-25): a checkout on `work`
-// whose `branch.work.merge` is `refs/heads/develop`, pushing a branch rebased onto
-// `origin/develop`, returned `{"files":["F.txt"]}` where the pre-#3716 range was
-// `D.txt`, `F.txt`, `old.txt` — `D.txt` (develop-only, never integrated) was
-// landed on the remote undemanded. A non-integration base therefore keeps the
-// wider pre-#3716 scope (fail-closed, over-demand at worst).
-const INTEGRATION_BASE_REF = /^refs\/remotes\/origin\/(?:main|master)$/;
+// #1491 — the integration ref must be DECLARED, never inferred from a ref NAME.
+// The cycle-2 guard (`INTEGRATION_BASE_REF`) matched `refs/remotes/origin/(main|
+// master)`, which selects a NAME, not a ROLE. Two measured fail-opens followed
+// (agent-infra #1491): in a fork-as-`origin` layout the name matches the FORK's
+// `main`, so content the push LANDS on the canonical remote is omitted; and in a
+// `origin/HEAD -> master` repo a legacy `origin/main` matches while the
+// integration branch is `master`. `resolveTrustedBase` also prefers a branch's
+// DECLARED upstream naming another branch (#3398, for the subtraction arm, where
+// guards (0)-(5) neutralise it) — a TOPIC base, which the narrowing has no guard
+// for. No predicate on local ref names closes both vectors AND keeps scenario 87
+// (push to `fork`, base must stay `origin/main`): which remote is canonical is
+// carried only by an operator assertion.
+//
+// ⛔ THE ASSERTION MUST BE PER-CLONE. A checked-in `.vgate/integration-ref`
+// cannot carry it: the file is a shared, clone-relative NAME, so a fork clone
+// inherits `refs/remotes/origin/main` where `origin` is the FORK — honoring it
+// alone reproduces the fail-open one level up (the owner's stated "one outcome
+// this must not have"). Activation therefore requires the per-clone git-config
+// `vgate.integrationRef`; the checked-in file is an AGREEMENT TRIPWIRE — if it is
+// present it must declare the SAME ref, and any disagreement (or a malformed
+// file) is refused. A MISSING config returns null ⇒ NO narrowing (fail closed —
+// a missing declaration must never produce a narrowing).
+//
+// `cwd` is the git root of the gated op (the caller resolves it), but
+// `resolveGitRoot` is applied again for robustness when a subdirectory is passed.
+function readDeclaredIntegrationRefFile(cwd: string): { present: boolean; ref: string | null } {
+  try {
+    const raw = readFileSync(join(resolveGitRoot(cwd), ".vgate", "integration-ref"), "utf-8");
+    for (const line of raw.split("\n")) {
+      const t = line.trim();
+      if (t === "" || t.startsWith("#")) continue;
+      return { present: true, ref: PUSH_REFNAME.test(t) ? t : null };
+    }
+    return { present: true, ref: null }; // present but declares nothing → malformed
+  } catch {
+    return { present: false, ref: null };
+  }
+}
+
+export function resolveDeclaredIntegrationRef(cwd: string): string | null {
+  const cfgRaw = gitConfigGet(cwd, "vgate.integrationRef");
+  const cfg = cfgRaw !== null && PUSH_REFNAME.test(cfgRaw) ? cfgRaw : null;
+  if (cfg === null) return null; // no per-clone assertion ⇒ no narrowing
+  const file = readDeclaredIntegrationRefFile(cwd);
+  if (file.present && file.ref !== cfg) return null; // shared decl disagrees ⇒ fail closed
+  return cfg;
+}
 
 // Pin a ref to its commit OID ONCE (#3716, verification follow-up). The narrowing
 // proof and the range diff MUST be about the SAME commits: `merge-base
@@ -2432,20 +2472,25 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // and removes an operator's only escape from a misbehaving narrowing. Skipped ⇒
     // the pre-#3716 tier-A 2-dot scope, the same as any other unprovable outcome.
     if (tier === "A" && !subDisabled) {
-      // ⛔ ONE base rule (#3398): the INTEGRATION remote's base, OID-pinned —
-      // never the push remote's `main` (a push remote says where content GOES,
-      // not what was integrated; trusting a fork's `main` let fork-only
-      // unverified content be omitted — review F1 on #1106) and never a ref NAME,
-      // which is re-resolved per command and can be retargeted between the proof
-      // and the range (the tear #3716 closes).
-      // ⛔ And never a TOPIC branch — see INTEGRATION_BASE_REF above for the
-      // measured fail-open that put this test here.
+      // ⛔ ONE base rule (#3398 + #1491): the base must be the ref the operator
+      // DECLARED as the integration ref, OID-pinned — never the push remote's
+      // `main` (a push remote says where content GOES, not what was integrated;
+      // trusting a fork's `main` let fork-only unverified content be omitted —
+      // review F1 on #1106) and never a ref NAME, which is re-resolved per
+      // command and can be retargeted between the proof and the range (the tear
+      // #3716 closes).
+      // ⛔ DECLARED, never inferred from a name — see `resolveDeclaredIntegrationRef`
+      // above for the two measured fail-opens (#1491) a name predicate cannot
+      // close. `trustedRef === declaredRef` is the whole guard: a base that is
+      // not the declared ref (a fork's `main`, a legacy `main`, a topic upstream)
+      // keeps the wider pre-#3716 scope.
       const trusted = resolveTrustedBase(cwd);
+      const declaredRef = resolveDeclaredIntegrationRef(cwd);
       const srcOid = resolveCommitOid(cwd, srcRef);
       const trackingOid = resolveCommitOid(cwd, tracking);
       const baseOid = trusted !== null && GIT_OID.test(trusted.oid) ? trusted.oid : null;
       const trustedRef = trusted?.ref ?? null;
-      if (baseOid !== null && trustedRef !== null && INTEGRATION_BASE_REF.test(trustedRef)
+      if (declaredRef !== null && trustedRef === declaredRef && baseOid !== null
           && srcOid !== null && trackingOid !== null
           && isAncestorOrEqual(cwd, baseOid, srcOid) === true
           && isAncestorOrEqual(cwd, trackingOid, srcOid) === false) {
@@ -2458,7 +2503,7 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
         pendingRewrites.push({
           branch: dst,
           trackingRef: tracking,
-          baseRef: trustedRef,
+          baseRef: declaredRef,
           baseOid,
           trackingOid,
           discardedCommits: Number.isFinite(discardedParsed) ? discardedParsed : null,
