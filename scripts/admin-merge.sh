@@ -345,7 +345,10 @@
 #                        contain ZERO test runs, so the baseline extracts EMPTY
 #                        and every PR failure reads as new — the bogus zero. See
 #                        THE BOGUS ZERO in ci-failure-set.sh.
-#   --any-workflow       drop the lane filter (opt-out; re-opens the bogus zero)
+#   --any-workflow       drop the lane filter (opt-out; re-opens the bogus zero).
+#                        Written AFTER the `--` separator it is RECOVERED for the
+#                        parser (loudly) rather than handed to gh — but the natural
+#                        order is: parser flags BEFORE `--`, gh flags after (#4078).
 #   --rerun-timeout S    bound (seconds) on the RE-RUN wait — the wait for a
 #                        re-run run to finish. This is an EXPLICIT override;
 #                        when absent the bound is DERIVED at rail runtime from a
@@ -2434,6 +2437,32 @@ main() {
   RERUN_TIMEOUT_SOURCE=""
   [ "$RERUN_TIMEOUT_EXPLICIT" -eq 1 ] && RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"
   local MERGE_ARGS=() MERGE_METHOD_SET=0
+  # ── THE `--` BOUNDARY IS THE PARSER/gh BOUNDARY (#4078) ──────────────────
+  # Everything after `--` goes to `gh pr merge`. The lane-selector pair is the
+  # DOCUMENTED remedy for a trigger-split repo (#1003: no single --workflow spans
+  # a PR-only and a main-only lane), and the usage line prints it BEFORE `--`. An
+  # operator who writes the natural order
+  #     admin-merge.sh 42 -- --squash --any-workflow
+  # has the flag swallowed into gh's argv: ANY_WORKFLOW stays 0, the lane stays
+  # the default, and the rail blocks with a remedy its own invocation could not
+  # have applied. Nothing said the flag was ignored — a silent, documented
+  # no-op. So the boundary is now enforced in BOTH directions:
+  #   * the two LANE-SELECTOR flags are RECOVERED from after `--` and applied as
+  #     parser flags (LOUDLY, so the caller learns the boundary) — the documented
+  #     order is no longer a trap; and
+  #   * every OTHER post-`--` token must be a real `gh pr merge` flag. A parser
+  #     flag or an unrecognised token is REFUSED BY NAME, never handed to gh,
+  #     because a flag the parser silently drops is exactly this defect.
+  # A flag that TAKES A VALUE consumes the next token verbatim, so a merge body
+  # that happens to be spelled `--any-workflow` stays data, not a flag. A value may
+  # also be carried INLINE (`--body=text`); both spellings are gh's.
+  local HOISTED=() PS_TAKES_VALUE=0
+  # `gh pr merge`'s own flag set, by NAME (an inline `=value` is split off first).
+  # `-R` is gh's short `--repo`; the LONG `--repo` is the PARSER's and is refused
+  # below, because a post-`--` `--repo` would point the MERGE at a different repo
+  # than the analysis while leaving the analysis on the original one.
+  local GH_MERGE_BOOL_FLAGS=' --admin --auto --disable-auto --delete-branch -d --merge -m --rebase -r --squash -s --help -h '
+  local GH_MERGE_VALUE_FLAGS=' --author-email -A --body -b --body-file -F --subject -t --match-head-commit -R '
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -2454,8 +2483,67 @@ main() {
         shift ;;
       --help|-h) usage; exit 0 ;;
       --) shift; while [ $# -gt 0 ]; do
-            case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
-            MERGE_ARGS+=("$1"); shift
+            # The value of a value-taking gh flag is DATA, whatever it is spelled.
+            if [ "$PS_TAKES_VALUE" -eq 1 ]; then
+              PS_TAKES_VALUE=0
+              MERGE_ARGS+=("$1"); shift; continue
+            fi
+            # gh carries a value INLINE too (`--body=text`). Classify on the NAME
+            # and keep the token whole, so the `=value` half is neither dropped
+            # nor mistaken for a separate token.
+            local ps_name="$1" ps_inline=0
+            case "$ps_name" in
+              -*=*) ps_name="${ps_name%%=*}"; ps_inline=1 ;;
+            esac
+            case "$ps_name" in
+              # The documented remedy, in either order: RECOVER it for the parser.
+              --any-workflow)
+                if [ "$ps_inline" -eq 1 ]; then
+                  say_err "admin-merge: ✗ refusing '$1' — '--any-workflow' takes no value. Put it BEFORE the"
+                  say_err "   separator: admin-merge.sh <PR> --any-workflow -- <gh flags>"
+                  exit 2
+                fi
+                HOISTED+=(--any-workflow); shift; continue ;;
+              --workflow)
+                if [ "$ps_inline" -eq 1 ]; then
+                  say_err "admin-merge: ✗ refusing '$1' — the parser's --workflow takes its value as the NEXT"
+                  say_err "   argument and must precede the separator: admin-merge.sh <PR> --workflow <f> -- …"
+                  exit 2
+                fi
+                HOISTED+=(--workflow "${2:-}"); shift
+                [ $# -gt 0 ] && shift
+                continue ;;
+              # OTHER PARSER flags after `--` are refused BY NAME. They never
+              # belong to gh, and `--repo` in particular would silently point the
+              # MERGE at a different repo than the analysis.
+              --main-runs|--repo|--rerun-timeout|--no-rerun|--dry-run|--print-bounds)
+                say_err "admin-merge: ✗ refusing '$1' after the '--' separator — that is a PARSER flag, and"
+                say_err "   everything after '--' is passed to 'gh pr merge'. Put it BEFORE the separator:"
+                say_err "   admin-merge.sh <PR> $ps_name … -- --squash"
+                exit 2 ;;
+            esac
+            case " $GH_MERGE_BOOL_FLAGS " in *" $ps_name "*)
+              case "$ps_name" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
+              MERGE_ARGS+=("$1"); shift; continue ;;
+            esac
+            case " $GH_MERGE_VALUE_FLAGS " in *" $ps_name "*)
+              MERGE_ARGS+=("$1")
+              [ "$ps_inline" -eq 1 ] || PS_TAKES_VALUE=1
+              shift; continue ;;
+            esac
+            case "$1" in
+              -*)
+                say_err "admin-merge: ✗ refusing '$1' after the '--' separator — it is not a 'gh pr merge' flag,"
+                say_err "   so passing it through would either fail at gh or be dropped IN SILENCE. If it is a"
+                say_err "   parser flag, put it BEFORE the separator:"
+                say_err "   admin-merge.sh <PR> $1 -- --squash"
+                exit 2 ;;
+              *)
+                say_err "admin-merge: ✗ refusing the bare argument '$1' after the '--' separator — the PR is"
+                say_err "   already supplied, so gh would reject a second positional. Only 'gh pr merge' flags"
+                say_err "   may follow '--'."
+                exit 2 ;;
+            esac
           done ;;
       --admin|--admin=true) shift ;;  # always added by this script
       -*) case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
@@ -2465,6 +2553,24 @@ main() {
         shift ;;
     esac
   done
+
+  # Apply the lane-selector flags recovered from after `--`. LOUD, because the
+  # invocation that needs recovery is one whose author should learn the boundary;
+  # and applied AFTER the loop so a recovered flag wins, exactly as if it had been
+  # written before `--` (the parser's last-occurrence rule).
+  if [ "${#HOISTED[@]}" -gt 0 ]; then
+    say_err "admin-merge: ⚠ parser flag(s) found AFTER the '--' separator — recovering them for the parser"
+    say_err "   (everything after '--' is passed to 'gh pr merge', which would reject or ignore them)."
+    say_err "   Prefer: admin-merge.sh <PR> [--workflow <f>|--any-workflow] -- <gh flags>"
+    local hi=0 hn="${#HOISTED[@]}"
+    while [ "$hi" -lt "$hn" ]; do
+      case "${HOISTED[$hi]}" in
+        --any-workflow) ANY_WORKFLOW=1; hi=$((hi + 1)) ;;
+        --workflow) WORKFLOW="${HOISTED[$((hi + 1))]:-}"; hi=$((hi + 2)) ;;
+        *) hi=$((hi + 1)) ;;
+      esac
+    done
+  fi
 
   # The baseline WINDOW is an operator knob like the timing ones, and it is
   # validated for the same two reasons: `--main-runs abc` makes `gh run list
@@ -2686,6 +2792,8 @@ main() {
       say_err "   pick a lane that runs on pull requests."
     fi
     say_err "   Confirm the lane is the right one (--workflow) and that CI ran for this head."
+    say_err "   If this repo splits its lanes by trigger, add --any-workflow BEFORE the -- separator"
+    say_err "   and re-run (a flag after '--' is passed to gh, not to this parser)."
     exit 1
   fi
   # ── 1c. EVERY FAILING RUN MUST BE ATTRIBUTED (cycle-3 review) ────────────
@@ -2823,7 +2931,7 @@ main() {
     say_err "   safe merge is refused for the wrong reason."
     say_err "   A repo can split its lanes by TRIGGER (a PR-only lane and a main-only lane), and"
     say_err "   then no single --workflow spans both sides. Compare against every lane on main"
-    say_err "   instead: add --any-workflow."
+    say_err "   instead: add --any-workflow BEFORE the -- separator."
     exit 1
   fi
 
