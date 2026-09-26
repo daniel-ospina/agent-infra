@@ -1396,6 +1396,78 @@ rc=$?
 [ "$rc" -ne 0 ] && pass "--main-union-signatures also refuses on an EMPTY log (exit $rc)" \
                 || fail "--main-union-signatures returned 0 on an empty log"
 
+# ── 5n. #1482: the CLI's fail-closed input guards ────────────────────────────
+# Review cycle 8 found six guards with ZERO coverage: neutering any of them left
+# the ENTIRE 66-test suite green. They are pre-existing (not introduced by this
+# change), but two of them are fail-opens and the rest are fail-closed properties
+# that nothing was defending:
+#
+#   --pr with an EMPTY head (gh returns a nil projection, exit 0): pristine ->
+#     rc=1, `✗ empty head for PR #42`; neutered -> rc=0, EMPTY stdout, and a
+#     report reading `examined=0 extracted=0 completed=0 tested=0`. That report is
+#     a FALSE CLEAN — a failure set that was never measured reads as "no
+#     failures". Nothing downstream catches it on this path.
+#   --diff on an unreadable file: neutered -> rc=0 with `sort: No such file` and a
+#     silently-computed comparison.
+#
+# Each assertion below therefore checks BOTH the exit status AND that nothing was
+# emitted — an empty stdout is precisely what reads as "no failures", so a
+# non-zero exit with a report still on it would not be enough.
+echo "== 5n. the CLI guards are fail-closed, not vacuous =="
+run_guard() {  # <label> <expect-rc> <stderr-substring|-> ; runs via cfs_run
+  label="$1"; want="$2"; needle="$3"
+  cfs_run $CFS_GUARD_ARGS
+  rc=$?
+  if [ "$want" = "usage" ]; then
+    [ "$rc" -eq 2 ] && pass "$label: usage refusal (exit 2)" \
+                    || fail "$label: expected a usage exit 2, got $rc"
+  else
+    [ "$rc" -ne 0 ] && pass "$label: fails closed (exit $rc)" \
+                    || fail "$label: expected a non-zero exit, got 0 — a FALSE CLEAN"
+  fi
+  if [ "$needle" != "-" ]; then
+    grep -q "$needle" "$TMP/cfs-err" && pass "$label: the refusal is named" \
+      || fail "$label: expected '$needle' on stderr"
+  fi
+  [ -s "$TMP/cfs-out" ] && fail "$label: emitted a failure set alongside the refusal" \
+                        || pass "$label: emitted NO failure set"
+}
+
+new_scen guard-pr-empty-head
+: > "$SCEN/head"                    # gh exits 0 with an EMPTY projection
+CFS_GUARD_ARGS='--pr 42'
+run_guard "--pr with an empty head" - "empty head"
+
+new_scen guard-pr-no-head
+# No `head` / `head-seq` fixture at all: the head resolution itself fails.
+CFS_GUARD_ARGS='--pr 42'
+run_guard "--pr whose head cannot be resolved" - "could not resolve head"
+
+new_scen guard-pr-no-runs
+printf 'feedface0000000000000000000000000000000000\n' > "$SCEN/head"
+: > "$SCEN/fail-run-list"            # `gh run list` fails
+CFS_GUARD_ARGS='--pr 42'
+run_guard "--pr whose run list fails" - "could not list runs"
+
+new_scen guard-usage
+CFS_GUARD_ARGS='--pr'
+run_guard "--pr with no number" usage '-'
+CFS_GUARD_ARGS='--commit'
+run_guard "--commit with no SHA" usage '-'
+
+new_scen guard-diff
+# BOTH `--diff` readability guards must be pinned SEPARATELY. A first attempt
+# passed a missing path as BOTH files, so the `diff_b` guard refused and the
+# `diff_a` guard was never reached — neutering `diff_a` left the suite green
+# (review-cycle-8 mutant G5 survived). Each call now gives the other side a
+# READABLE file, so exactly one guard can fire.
+printf 'tests/test_a.py::test_one\n' > "$TMP/gd-a.txt"
+printf 'tests/test_a.py::test_two\n' > "$TMP/gd-b.txt"
+CFS_GUARD_ARGS="--diff /nonexistent-zz-1482 $TMP/gd-b.txt"
+run_guard "--diff whose FIRST file is unreadable" - "cannot read"
+CFS_GUARD_ARGS="--diff $TMP/gd-a.txt /nonexistent-zz-1482"
+run_guard "--diff whose SECOND file is unreadable" - "cannot read"
+
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
 new_scen shape

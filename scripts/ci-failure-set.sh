@@ -874,8 +874,8 @@ main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --pr) mode="pr"; pr="${2:-}"; shift 2 ;;
-      --commit) mode="commit"; commit="${2:-}"; shift 2 ;;
+      --pr) mode="pr"; pr="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --commit) mode="commit"; commit="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --main-union)
         mode="main-union"
         if [ $# -ge 2 ] && [ -n "${2:-}" ] && [ -z "${2##[0-9]*}" ]; then
@@ -897,15 +897,15 @@ main() {
         else
           shift 1
         fi ;;
-      --commit-rows) mode="commit-rows"; commit="${2:-}"; shift 2 ;;
-      --per-run) per_run="${2:-}"; shift 2 ;;
+      --commit-rows) mode="commit-rows"; commit="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --per-run) per_run="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 ;;
-      --exclude) exclude="${2:-}"; shift 2 ;;
-      --repo) repo="${2:-}"; shift 2 ;;
-      --workflow) workflow="${2:-}"; shift 2 ;;
+      --exclude) exclude="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --repo) repo="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --workflow) workflow="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --any-workflow) any_workflow=1; shift ;;
-      --provenance) provenance="${2:-}"; shift 2 ;;
-      --runs-report) report="${2:-}"; shift 2 ;;
+      --provenance) provenance="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --runs-report) report="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --help|-h) usage; exit 0 ;;
       *) say_err "ci-failure-set: unknown argument '$1'"; usage >&2; exit 2 ;;
     esac
