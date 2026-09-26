@@ -902,23 +902,32 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
     third row silently re-establishes the id, which is exactly the defect.
     """
     key = "tests/test_a.py::test_a11"
-    rows = [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8"]
+    base = [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8",
+            f"{key}\t2\t8", f"{key}\t3\t8"]
     pr = {key: Failure(rate=Rate(8, 8), signatures=frozenset({"sg"}))}
     sig = {key: frozenset({"sg"})}
 
-    verdicts = set()
-    for order in itertools.permutations(rows):
-        main = parse_rates("\n".join(order) + "\n")
-        assert main.rates == {}, (
-            "a self-contradicting table is not evidence: NO order may leave a rate")
-        assert len(main.rejected) == 2, (
-            "the two rows contradicting the first are the rejected ones")
-        d = decide(pr, main.rates, main_signatures=sig, k_pr=8)
-        verdicts.add((tuple(v.nodeid for v in d.blocked), tuple(d.visible_exemptions())))
+    # Every row COUNT from 2 to 5: a taint whose lifetime is a fixed number of
+    # rows passes a single 3-row fixture (its expiry needs a 4th row), so the
+    # count is swept rather than sampled once.
+    for n in range(2, 6):
+        rows = base[:n]
+        verdicts = set()
+        rejected_counts = set()
+        for order in itertools.permutations(rows):
+            main = parse_rates("\n".join(order) + "\n")
+            assert main.rates == {}, (
+                "a self-contradicting table is not evidence: NO order may leave a rate")
+            rejected_counts.add(len(main.rejected))
+            d = decide(pr, main.rates, main_signatures=sig, k_pr=8)
+            verdicts.add((tuple(v.nodeid for v in d.blocked), tuple(d.visible_exemptions())))
 
-    assert verdicts == {((key,), ())}, (
-        "every order of one row multiset must yield the SAME verdict (BLOCK, no "
-        "exemption) -- row order must never decide whether the PR blocks")
+        assert len(rejected_counts) == 1, (
+            "the NUMBER of rejected rows must not depend on row order -- which rows "
+            "are reported is the module's reporting policy and may legitimately differ")
+        assert verdicts == {((key,), ())}, (
+            "every order of one row multiset must yield the SAME verdict (BLOCK, no "
+            "exemption) -- row order must never decide whether the PR blocks")
 
 
 def test_a_pr_failure_with_an_empty_sample_is_not_exempt():

@@ -387,16 +387,22 @@ def parse_rates(lines: str) -> RatesResult:
     module exists to prevent. A rejected line simply contributes no rate, and an
     id with no rate is **not exempt** (the existing default in :func:`decide`).
 
-    The result is **invariant to row order for the same row multiset** (#3766). A
-    failure key that appears more than once contributes NO rate for the WHOLE
-    table, and the contradiction TAINTS the id **permanently** -- a later row for a
-    withdrawn id is rejected too, it cannot re-establish it. Rejection, not
-    combination: a duplicate is a self-contradicting table, and any silent
-    max/sum/mean would be a rate POLICY this module has no mandate to choose. The
-    taint must outlive the withdrawn row, because withdrawing it only for the row
-    at hand let an ODD duplicate count (three concatenated shards: 8/8, 0/8, 1/8)
-    re-establish the id on the next line -- Rate(1,8) forward, Rate(8,8) reversed,
-    a BLOCK against an EXEMPT from one unchanged multiset.
+    The **rate table -- and therefore the verdict -- is invariant to row order for
+    the same row multiset** (#3766); ``rejected`` records rows as they arrive, so
+    the evidence list keeps input order (only its length is invariant), and nothing
+    downstream reads it for the decision. A failure key with two or more VALID rows
+    contributes NO rate for the WHOLE table, and the contradiction TAINTS the id
+    **permanently** -- a later row for a withdrawn id is rejected too, it cannot
+    re-establish it. Rejection, not combination: a duplicate is a self-contradicting
+    table, and any silent max/sum/mean would be a rate POLICY this module has no
+    mandate to choose. The taint must outlive the withdrawn row, because
+    withdrawing it only for the row at hand let an ODD duplicate count (three
+    concatenated shards: 8/8, 0/8, 1/8) re-establish the id on the next line --
+    Rate(1,8) forward, Rate(8,8) reversed, a BLOCK against an EXEMPT from one
+    unchanged multiset. A row the guards ABOVE reject (malformed, not a failure
+    key, ``runs <= 0``, ``failures > runs``) contributes nothing and cannot taint:
+    its position must not change the outcome, or the table would be order-dependent
+    again.
     """
     rates: dict[str, Rate] = {}
     rejected: list[str] = []
