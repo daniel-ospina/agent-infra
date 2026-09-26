@@ -1097,6 +1097,16 @@ cfs_run --main-union-rates 10 \
 rc=$?
 [ "$rc" -eq 0 ] && pass "the exemption applies with no --repo (exit 0)" || fail "expected exit 0, got $rc — the exemption is inert without --repo"
 grep -q "has ZERO jobs" "$TMP/cfs-err" && pass "the zero-job run is still named" || fail "expected the zero-job note"
+# The OTHER half of the slug contract: with no --repo the call must fall back to
+# gh's own `{owner}/{repo}` placeholder. Asserting only the resolved-slug case
+# would leave a regression that hardcodes the placeholder — or that invents a
+# slug — invisible whenever --repo is present.
+if grep -q 'repos/{owner}/{repo}/actions/runs/7782/jobs' "$SCEN/calls"; then
+  pass "without --repo the jobs call uses gh's {owner}/{repo} placeholder"
+else
+  fail "without --repo the jobs call did not use the gh placeholder:"
+  grep -o 'repos/[^ ]*' "$SCEN/calls" | sort -u | sed 's/^/       /' || true
+fi
 
 # ── 5h. #1482: the zero-job contract is pinned in ALL FOUR callers ───────────
 # Cycle 2's reviewer mutated the paired debit away in `collect_union`,
@@ -1163,6 +1173,16 @@ while IFS='|' read -r label args; do
   [ "$ev" = "2" ] && [ "$ex" = "1" ] \
     && pass "$label: examined=2 / extracted=1 (the zero-job run stays EXAMINED)" \
     || fail "$label: expected examined=2 extracted=1, got examined='$ev' extracted='$ex' — a zero-job run dropped from \`examined\` disarms the PR-side fail-closed gate"
+  # The remaining counters are asserted for the same reason: every one of them
+  # feeds a decision, and a review-cycle count that says "the suite is green" is
+  # not evidence about a counter no test reads. `completed` is what makes an
+  # EMPTY failing set mean green rather than unmeasured (admin-merge step 2b);
+  # `pending` is what keeps a queued run from reading as finished.
+  co="$(sed -n 's/^completed=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  pe="$(sed -n 's/^pending=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  [ "$co" = "2" ] && [ "$pe" = "0" ] \
+    && pass "$label: completed=2 / pending=0" \
+    || fail "$label: expected completed=2 pending=0, got completed='$co' pending='$pe'"
 done <<'MODES'
 collect_union (--main-union)|--main-union 10
 collect_union_rates (--main-union-rates)|--main-union-rates 10
