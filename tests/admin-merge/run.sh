@@ -1024,6 +1024,66 @@ rc=$?
 [ "$rc" -ne 0 ] && pass "an unreadable job count still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
 grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "nothing may be exempted when the count is unknown" || pass "no exemption without a proven zero count"
 
+# ── 5e. #1482 P0: the debit must be PAIRED with the credit ───────────────────
+# `startup_failure` is in the EXAMINED set but NOT in the `tested` set (it never
+# exercised the suite). A startup_failure run has zero jobs AND a failing
+# conclusion, so it reaches the zero-job branch WITHOUT having been credited —
+# and an unpaired decrement then STEALS a credit from a real tested run. `tested`
+# is the rate table's denominator and the main-side gate's signal, so a stolen
+# credit raises main's measured rate and can EXEMPT a materially worse PR.
+echo "== 5e. a startup_failure run must not steal a tested credit =="
+new_scen startupfail
+: > "$SCEN/fail-log-7780"
+printf '0\n' > "$SCEN/jobs-count-7780"
+{ main_red_n main7780 1001 4 'tests/test_other.py::test_red_on_main'
+  lane_line completed startup_failure main7780 7780
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zj5-prov.txt" --runs-report "$TMP/zj5-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "the zero-job startup_failure run does not fail the extraction" || fail "expected exit 0, got $rc"
+if [ -f "$TMP/zj5-rep.txt" ]; then
+  v="$(sed -n 's/^tested=//p' "$TMP/zj5-rep.txt")"
+  [ "$v" = "4" ] && pass "tested=4 — the credit was NOT stolen by the startup_failure run" || fail "expected tested=4, got '$v' (an unpaired decrement steals a credit)"
+else
+  fail "no runs-report written for the startup_failure scenario"
+fi
+
+# ── 5f. #1482: the zero boundary is EXACT — 1 job is not 0 ──────────────────
+# Pins the `= 0` comparison itself: a mutation to `-le 1` (or any slack at the
+# boundary) would exempt a run that DID carry a job and could therefore hide a
+# failure in its unreadable log.
+echo "== 5f. a run with ONE job and an unreadable log still fails closed =="
+new_scen onejob
+: > "$SCEN/fail-log-7781"
+printf '1\n' > "$SCEN/jobs-count-7781"
+{ main_red_n main7781 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7781 7781
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zj6-prov.txt" --runs-report "$TMP/zj6-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "exactly one job is NOT zero — still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a run with 1 job must not be reported as zero-job" || pass "no zero-job note for a 1-job run"
+
+# ── 5g. #1482 P1: the exemption must work WITHOUT --repo ─────────────────────
+# `admin-merge <PR> --squash` — the DOCUMENTED invocation — passes no --repo. An
+# early `return 1` when the slug was absent made the exemption INERT there, so the
+# fleet-wide block persisted on exactly the path the fleet uses. The slug must
+# resolve the same way the rest of the rail resolves it (gh's own placeholder).
+echo "== 5g. zero-job exemption works without --repo (the documented invocation) =="
+new_scen norepo
+: > "$SCEN/fail-log-7782"
+printf '0\n' > "$SCEN/jobs-count-7782"
+{ main_red_n main7782 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7782 7782
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 \
+  --exclude deadbeef --provenance "$TMP/zj7-prov.txt" --runs-report "$TMP/zj7-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "the exemption applies with no --repo (exit 0)" || fail "expected exit 0, got $rc — the exemption is inert without --repo"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && pass "the zero-job run is still named" || fail "expected the zero-job note"
+
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
 new_scen shape
