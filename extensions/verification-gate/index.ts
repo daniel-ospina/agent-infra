@@ -2182,6 +2182,19 @@ function refExists(cwd: string, ref: string): boolean {
   return gitProbe(cwd, `rev-parse --verify --quiet ${ref}`) !== null;
 }
 
+/** True when `anc` is an ANCESTOR of `desc` (#5550).
+ *
+ *  Goes via `merge-base`, which writes its answer to STDOUT — deliberately NOT
+ *  `git merge-base --is-ancestor`, whose entire signal is an EXIT CODE, and
+ *  `gitProbe` reads only stdout, so that form would report "no output" for BOTH
+ *  answers and the ancestry test would silently collapse. */
+function isAncestor(cwd: string, anc: string, desc: string): boolean {
+  const mb = gitProbe(cwd, `merge-base ${anc} ${desc}`);
+  if (mb === null) return false; // unresolvable → NOT an ancestor (fail-closed)
+  const head = gitProbe(cwd, `rev-parse ${anc}`);
+  return head !== null && mb.trim() === head.trim();
+}
+
 function gitConfigGet(cwd: string, key: string): string | null {
   const v = gitProbe(cwd, `config --get ${key}`);
   return v === null || v === "" ? null : v;
@@ -2300,7 +2313,26 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     const baseMainExists = refExists(cwd, baseMain);
     const tier = resolvePushTier(trackingExists, baseMainExists);
     if (tier === "C") return null; // whole-command rule: ANY tier C → staged
-    const baseRef = tier === "A" ? tracking : baseMain;
+    // #5550: ONLY the diverged case needs the integration base.
+    //
+    // When the tracking ref IS an ancestor of src, the original tier-A
+    // 2-dot-on-`tracking` form is correct AND is what the push-arm base-identical
+    // subtraction is built on: `#755`/`#3398` emit `base_identical_satisfied`
+    // only when that subtraction actually RUNS, and taking `baseMain...src`
+    // unconditionally PRE-EXCLUDES the inherited paths — so the subtraction never
+    // runs. Measured on that (rejected) form: index.e2e.test.ts went 93 passed /
+    // 0 failed → 91 / 2, scenarios 80 and 81 red. Confining the change to the
+    // diverged case keeps the ordinary incremental push byte-identical.
+    //
+    // A rebase or force-push breaks the ancestry, and THERE `tracking..HEAD`
+    // becomes the whole rebase delta — every commit main gained (reproduced: 216
+    // files for a 3-file branch, #5229). That is the only case this changes.
+    //
+    // `baseMain` stays the RESOLVED ref (#3716 — a fork whose main is named
+    // `origin/main` must not satisfy the check), never re-derived by name.
+    const trackingIsAncestor = tier === "A" && isAncestor(cwd, tracking, srcRef);
+    const effTier: "A" | "B" = trackingIsAncestor ? "A" : "B";
+    const baseRef = trackingIsAncestor ? tracking : baseMain;
     if (tier === "A") sawTierA = true;
     // 2-dot (A) / 3-dot (B) `--name-status -z` diff. The builder emits the
     // FULL `git diff …` argv (unit-pinned) — run it directly (NOT through
@@ -2309,7 +2341,7 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // precedent inverted). No trim: -z rows are NUL-delimited raw path bytes.
     let diffOut: string | null = null;
     try {
-      diffOut = execSync(buildPushRangeDiffCommand(tier, baseRef, srcRef, true), {
+      diffOut = execSync(buildPushRangeDiffCommand(effTier, baseRef, srcRef, true), {
         cwd, encoding: "utf-8", timeout: 5000, maxBuffer: 64 * 1024 * 1024,
       });
     } catch {
