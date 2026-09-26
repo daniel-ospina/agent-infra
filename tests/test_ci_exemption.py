@@ -912,12 +912,14 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
       withdrawal refuses the clean id only when it arrives after the withdrawal, so
       the same multiset yields it a rate in one order and none in another. The
       withdrawal must also be keyed on the WHOLE nodeid, so the near-miss ids below
-      are each fused with the withdrawn id ONLY by the grouping their fixture names
-      and must survive a withdrawal keyed on it: the same file, the same function
-      name across files, the same file BASENAME in another directory, the same
-      CLASS (both sides of the pair class-bearing), a case-only variant, and a
-      one-character extension. A class-nested sibling is a SEPARATE case from a
-      case-folding or file-prefix one, because a classless id has no class to
+      each differ from the withdrawn id along one NAMED dimension and must survive a
+      withdrawal keyed on the grouping their fixture is named for: the same file,
+      the same function name across files, the same file BASENAME in another
+      directory, the same CLASS (both sides of the pair class-bearing), a case-only
+      variant, and a one-character extension. Exclusivity is not claimed -- two ids
+      can be fused by more than one grouping at once (a same-file pair is fused by
+      the file AND by the basename). A class-nested sibling is a SEPARATE case from
+      a case-folding or file-prefix one, because a classless id has no class to
       share. That list is a hand-picked sample of an unbounded family; the
       exhaustive-over-pairs test below does not depend on it.
     * the **equality** boundary -- an EXACT repeat withdraws the id too. The rule
@@ -1050,20 +1052,19 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
     # withdrawn key cannot see a bound at all.
     #
     # FORWARD (withdrawal first, then n accepted rows, then one more row of the
-    # withdrawn key): the ladder catches a bound up to 257 accepted rows -- measured,
-    # with the largest n=256 supplying 256 filler accepts plus the first row of the
-    # withdrawn key, so a bound at or below that total expires and re-establishes the
-    # id. REVERSED (a row of the withdrawn key accepted BEFORE the withdrawal): pins
-    # that a withdrawal also removes an id already in the table, which no forward
-    # order can show.
+    # withdrawn key): the ladder itself catches a bound up to 257 accepted rows --
+    # measured, with the largest n=256 supplying 256 filler accepts plus the first
+    # row of the withdrawn key. REVERSED (a row of the withdrawn key accepted BEFORE
+    # the withdrawal): pins that a withdrawal also removes an id already in the
+    # table, which no forward order can show.
     #
-    # RESIDUAL, stated rather than implied: a bound of 258 or larger still escapes,
-    # and no finite sweep can exclude one -- "permanent" is a universally quantified
-    # claim over table sizes and is not provable by black-box sampling. The structural
-    # half of the guarantee is the shape of the code, not this test: the withdrawn set
-    # is a bare local that is only ever ADDED to, and membership is tested before the
-    # accept path. The ladder reaches 256 because that is far past any bound a
-    # regression would plausibly pick.
+    # RESIDUAL, stated rather than implied: the suite's reach is 300 accepted rows --
+    # the 300-duplicated-id scale test below supplies those, and a bound of 301 or
+    # larger still escapes. No finite sweep can exclude one: "permanent" is a
+    # universally quantified claim over table sizes and is not provable by black-box
+    # sampling. The structural half of the guarantee is the shape of the code, not
+    # this test: the withdrawn set is a bare local that is only ever ADDED to, and
+    # membership is tested before the accept path.
     for n in (1, 2, 3, 5, 8, 16, 64, 256):
         fillers = [f"tests/test_f{i}.py::test_f1" for i in range(n)]
         rows = ([f"{key}\t8\t8", f"{key}\t0\t8"]
@@ -1077,16 +1078,31 @@ def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
 
     # The ladder above grows only ACCEPTED rows. A bound on any other counter is
     # invisible to it, so the same shape is repeated with rows that are REJECTED
-    # instead -- malformed lines, which cannot be accepted and therefore cannot
-    # expire a withdrawal under the rule the module claims.
+    # instead. EVERY rejection kind is used, because clearing the withdrawn set sits
+    # in a different branch for each of them: a malformed line, a whitespace-only
+    # line (skipped), a row refused for ``runs <= 0``, a row refused for
+    # ``failures > runs``, and a row that is not a failure key.
+    rejected_rows = [
+        "not a rate row",                             # no tab-separated fields
+        "   ",                                        # blank after strip -> skipped
+        "tests/test_r.py::test_r1\t8\t0",              # runs <= 0
+        "tests/test_r.py::test_r1\t9\t8",              # failures > runs
+        "notakey\t1\t8",                              # not a failure key
+    ]
+    for kind in rejected_rows:
+        # Adjacent to the pair, with a LATER row of the same id: this is the shape
+        # that exposes a branch which clears the withdrawn set.
+        rows = [f"{key}\t8\t8", f"{key}\t0\t8", kind, f"{key}\t1\t8"]
+        for order in itertools.permutations(rows):
+            assert parse_rates("\n".join(order) + "\n").rates == {}, (
+                f"a rejection of kind {kind!r} expired a withdrawal")
     for n in (1, 2, 8, 64, 256):
         rows = ([f"{key}\t8\t8", f"{key}\t0\t8"]
-                + ["not a rate row"] * n
+                + [rejected_rows[i % len(rejected_rows)] for i in range(n)]
                 + [f"{key}\t1\t8"])
         for order in (rows, list(reversed(rows))):
             assert parse_rates("\n".join(order) + "\n").rates == {}, (
-                f"n={n}: no rejection -- malformed or otherwise -- may expire a "
-                "withdrawal")
+                f"n={n}: no rejection -- of any kind -- may expire a withdrawal")
 
 
 #: Structural neighbours of one nodeid: ids that differ from a given id along ONE
@@ -1174,8 +1190,17 @@ def test_the_withdrawn_set_is_neither_capacity_nor_budget_bounded():
     LAST one. Neither may reappear. The trailing rows are placed last on purpose --
     an evicted id is re-established precisely by a row that arrives after the
     eviction.
+
+    REACH, stated rather than implied: a capacity of 300 or more is NOT reached by
+    300 duplicated ids (measured: 299 REDs, 300 does not), for the same reason the
+    lifetime ladder cannot exclude an arbitrarily large bound -- "bounded by a
+    constant" is not falsifiable by a finite test. What this arm does establish is
+    that the reach is set by the TEST's scale and not by any constant in the module,
+    which is the direction a regression would move. It also supplies the 300 accepted
+    rows that the lifetime residual above refers to.
     """
-    ids = [f"tests/test_scale.py::test_s{i}" for i in range(64)]
+    n_ids = 300
+    ids = [f"tests/test_scale.py::test_s{i}" for i in range(n_ids)]
     rows = []
     for nodeid in ids:
         rows += [f"{nodeid}\t8\t8", f"{nodeid}\t0\t8"]
@@ -1183,7 +1208,7 @@ def test_the_withdrawn_set_is_neither_capacity_nor_budget_bounded():
     for order in (rows, list(reversed(rows))):
         assert parse_rates("\n".join(order) + "\n").rates == {}, (
             "an id that fell out of a bounded withdrawal structure was "
-            "re-established -- 64 duplicated ids must ALL stay withdrawn")
+            f"re-established -- all {n_ids} duplicated ids must stay withdrawn")
 
     # The same scale, one id only, to reach a budget measured on the whole table's
     # row count rather than on the withdrawn set: 1024 rows for one id, then one
