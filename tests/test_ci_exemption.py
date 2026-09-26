@@ -1187,6 +1187,33 @@ def test_the_withdrawal_is_keyed_on_the_whole_nodeid_for_every_pair_of_ids():
                     "withdrawal is not keyed on the whole nodeid")
 
 
+def test_a_duplicated_id_leaves_no_rate_for_every_id_in_the_pool():
+    """#3766: the shape the pair sweep above CANNOT see.
+
+    The pair sweep always follows a duplicated id with a DIFFERENT id, so it can
+    never re-check the withdrawn id itself. That leaves one slip invisible: a
+    withdrawal RECORDED under a derived key while membership is TESTED under the
+    raw nodeid (or the mirror). The mismatch is harmless whenever the derivation is
+    the IDENTITY on the duplicated id -- and `class_key` is exactly that on a
+    classless id, which is every duplicated id in the fixtures above -- so no
+    fixture built on a classless duplicate can see it: the third row matches
+    nothing, is accepted, and the id comes back with a rate it must not have.
+
+    So every id in the pool also gets a shape whose THIRD row is the SAME id, with
+    all three run counts differing so a (id, runs)-keyed slip is crossed too. The
+    pool contains class-bearing, guard-step, bracketed and case-variant ids, so at
+    least one of them makes any add/check mismatch non-identity and the assertion
+    fails; the shipped code leaves no rate in every order.
+    """
+    for dup in _WITHDRAWAL_KEY_POOL:
+        rows = [f"{dup}\t8\t8", f"{dup}\t0\t4", f"{dup}\t1\t4"]
+        for order in itertools.permutations(rows):
+            rates = parse_rates("\n".join(order) + "\n").rates
+            assert rates == {}, (
+                f"{dup!r} left a rate behind -- its withdrawal was recorded under a "
+                "key its own later rows do not match")
+
+
 def test_the_withdrawn_set_is_neither_capacity_nor_budget_bounded():
     """#3766: a withdrawn set is a SET, not a fixed-size cache or a budget.
 
