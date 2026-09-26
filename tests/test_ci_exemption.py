@@ -1190,23 +1190,28 @@ def test_the_withdrawal_is_keyed_on_the_whole_nodeid_for_every_pair_of_ids():
 def test_a_duplicated_id_leaves_no_rate_for_every_id_in_the_pool():
     """#3766: the shape the pair sweep above CANNOT see.
 
-    The pair sweep always follows a duplicated id with a DIFFERENT id, so it can
-    never re-check the withdrawn id itself. That leaves one slip invisible: a
+    The pair sweep always follows a duplicated id with a DIFFERENT id, so it never
+    re-checks the withdrawn id itself. That is a structural blind spot, not a
+    property of the ids it happens to use: it stays blind even though its pool
+    already carries class-bearing and guard-step ids. The slip it cannot see is a
     withdrawal RECORDED under a derived key while membership is TESTED under the
-    raw nodeid (or the mirror). The mismatch is harmless whenever the derivation is
-    the IDENTITY on the duplicated id -- and `class_key` is exactly that on a
-    classless id, which is every duplicated id in the fixtures above -- so no
-    fixture built on a classless duplicate can see it: the third row matches
-    nothing, is accepted, and the id comes back with a rate it must not have.
+    raw nodeid (or the mirror) -- harmless whenever the derivation is the IDENTITY
+    on the duplicated id, because then the third, DIFFERENT id is what gets tested
+    and the derived key never has to match the withdrawn id.
 
-    So every id in the pool also gets a shape whose THIRD row is the SAME id, with
-    all three run counts differing so a (id, runs)-keyed slip is crossed too. The
-    pool contains class-bearing, guard-step, bracketed and case-variant ids, so at
-    least one of them makes any add/check mismatch non-identity and the assertion
-    fails; the shipped code leaves no rate in every order.
+    The mismatch bites only when the derivation is non-identity on the duplicated
+    id AND a later row IS that same id: the derived key does not match, the id is
+    not recognised as withdrawn, and it is accepted with a rate it must not have.
+
+    So every id in the pool also gets a shape whose three rows are the SAME id,
+    with BOTH columns pairwise distinct (runs 8/4/2, failures 8/0/1), so a slip
+    keyed on the id plus either number is crossed in every order. The pool contains
+    class-bearing, guard-step, bracketed and case-variant ids, so at least one of
+    them makes the add/check mismatch non-identity and the assertion fails; the
+    shipped code leaves no rate in every order.
     """
     for dup in _WITHDRAWAL_KEY_POOL:
-        rows = [f"{dup}\t8\t8", f"{dup}\t0\t4", f"{dup}\t1\t4"]
+        rows = [f"{dup}\t8\t8", f"{dup}\t0\t4", f"{dup}\t1\t2"]
         for order in itertools.permutations(rows):
             rates = parse_rates("\n".join(order) + "\n").rates
             assert rates == {}, (
