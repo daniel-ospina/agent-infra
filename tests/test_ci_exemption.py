@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 
 import importlib.util
+import itertools
 import sys
 from pathlib import Path
 
@@ -886,6 +887,38 @@ def test_a_duplicate_row_is_rejected_not_resolved_by_order():
     pr = {"tests/test_a.py::test_a11": Failure(rate=Rate(1, 8), signatures=frozenset({"sg"}))}
     d = decide(pr, a.rates, main_signatures={"tests/test_a.py::test_a11": frozenset({"sg"})})
     assert not d.visible_exemptions(), "no rate -> not exempt"
+
+
+def test_a_duplicate_row_set_is_order_invariant_at_any_row_count():
+    """#3766: the invariant is the ROW MULTISET, not the two-row example.
+
+    ``test_a_duplicate_row_is_rejected_not_resolved_by_order`` pinned the two-row
+    case, and the guard it pinned withdrew an id by POPPING it -- so the
+    withdrawal expired after the contradicting row and an ODD duplicate count put
+    the id back. Three shards concatenated for one id (``8 8``, ``0 8``, ``1 8``)
+    gave ``Rate(1,8)`` in one order and ``Rate(8,8)`` in the reverse: the SAME row
+    multiset produced a BLOCK and an EXEMPT. Enumerating EVERY order is the
+    assertion the invariant actually makes -- a two-order sample passes while the
+    third row silently re-establishes the id, which is exactly the defect.
+    """
+    key = "tests/test_a.py::test_a11"
+    rows = [f"{key}\t8\t8", f"{key}\t0\t8", f"{key}\t1\t8"]
+    pr = {key: Failure(rate=Rate(8, 8), signatures=frozenset({"sg"}))}
+    sig = {key: frozenset({"sg"})}
+
+    verdicts = set()
+    for order in itertools.permutations(rows):
+        main = parse_rates("\n".join(order) + "\n")
+        assert main.rates == {}, (
+            "a self-contradicting table is not evidence: NO order may leave a rate")
+        assert len(main.rejected) == 2, (
+            "the two rows contradicting the first are the rejected ones")
+        d = decide(pr, main.rates, main_signatures=sig, k_pr=8)
+        verdicts.add((tuple(v.nodeid for v in d.blocked), tuple(d.visible_exemptions())))
+
+    assert verdicts == {((key,), ())}, (
+        "every order of one row multiset must yield the SAME verdict (BLOCK, no "
+        "exemption) -- row order must never decide whether the PR blocks")
 
 
 def test_a_pr_failure_with_an_empty_sample_is_not_exempt():

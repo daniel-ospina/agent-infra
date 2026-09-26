@@ -386,9 +386,24 @@ def parse_rates(lines: str) -> RatesResult:
     and read as "main never fails this", which is the exemption-by-vacuity this
     module exists to prevent. A rejected line simply contributes no rate, and an
     id with no rate is **not exempt** (the existing default in :func:`decide`).
+
+    The result is **invariant to row order for the same row multiset** (#3766). A
+    failure key that appears more than once contributes NO rate for the WHOLE
+    table, and the contradiction TAINTS the id **permanently** -- a later row for a
+    withdrawn id is rejected too, it cannot re-establish it. Rejection, not
+    combination: a duplicate is a self-contradicting table, and any silent
+    max/sum/mean would be a rate POLICY this module has no mandate to choose. The
+    taint must outlive the withdrawn row, because withdrawing it only for the row
+    at hand let an ODD duplicate count (three concatenated shards: 8/8, 0/8, 1/8)
+    re-establish the id on the next line -- Rate(1,8) forward, Rate(8,8) reversed,
+    a BLOCK against an EXEMPT from one unchanged multiset.
     """
     rates: dict[str, Rate] = {}
     rejected: list[str] = []
+    #: Ids the table contradicted. Populating ``rates`` is a ONE-WAY door: a
+    #: duplicate withdraws the id and records it here, and membership here is
+    #: checked BEFORE the accept path, so no later row can put it back.
+    tainted: set[str] = set()
     for raw in lines.splitlines():
         line = raw.strip("\n")
         if not line.strip():
@@ -403,13 +418,23 @@ def parse_rates(lines: str) -> RatesResult:
         if not is_failure_key(nodeid) or runs <= 0 or failures > runs:
             rejected.append(line)
             continue
+        if nodeid in tainted:
+            # A WITHDRAWN id stays withdrawn (#3766). The earlier guard withdrew the
+            # id by popping it, which expired the withdrawal for the rest of the
+            # table -- so a third row re-established it and the LAST row won again.
+            # Reporting the row is what makes the refusal visible; the id still
+            # contributes no rate, so it is not exempt.
+            rejected.append(line)
+            continue
         if nodeid in rates:
             # Duplicate rows (latent finding 2): "A 8 8" then "A 0 8" yielded
             # Rate(0,8) while the REVERSED order yielded Rate(8,8) — row order
             # decided whether the PR blocked, an order-dependence inside the
             # verdict-stability class. Reject rather than pick a winner: a table
             # that contradicts itself is not evidence, and fail-closed means the id
-            # then has no rate at all (not exempt).
+            # then has no rate at all (not exempt). Marking it TAINTED (not merely
+            # popping it) is what keeps the id from being re-established later.
+            tainted.add(nodeid)
             rejected.append(line)
             rates.pop(nodeid, None)
             continue
