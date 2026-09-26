@@ -27,6 +27,8 @@ If none of those apply: **keep going.** The user can interrupt if they disagree.
 
 **Auto-file rule:** When you encounter a bug, workflow gap, missed edge case, or improvement opportunity → file a GitHub issue immediately. Never ask "should I file an issue?" — just file it — **subject to the admission control in Product Over Process below** (category A always; category B only with a stated consequence; a product bug is filed as before).
 
+**⛔ Symptom check — before you file, find the ROOT.** Search the tracker for the same **root cause**, not the same words. If what you found is a **symptom of an existing issue**, add it **as a comment on that issue, with your evidence** — do **not** file a peer. **A peer issue is how one defect became 76** (the `derived = replay(journal)` class, measured 2026-09-25): 76 peer issues, one root, and **not one of the peers was visible to whoever fixes that root**. Filing is not the duty — **recording** is. **Your duty is to record the finding, not to own a new ticket.**
+
 **Moving is not a license to build machinery.** "Keep going" means keep making progress on the **product** — not keep adding, fixing, auditing, or documenting *process*. If the only work in front of you is category B, that is a real reason to stop and say so — say it plainly rather than manufacturing more process to look busy.
 
 ---
