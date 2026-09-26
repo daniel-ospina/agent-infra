@@ -606,12 +606,16 @@ coverage for every upstream file: recorded incidents went from 39 staged files t
   never coverage.
 
 Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
-`git push` (the tracking-ref arm only while that ref is an ANCESTOR of the pushed tip;
-the tier-B/C paths keep their pre-#755 behaviour). Tier-C push fallback remains a
+`git push` (the tracking-ref arm unless the #3716 narrowing applies: the tracking ref is
+NOT an ancestor-or-equal of the pushed tip AND the integration base IS one; the tier-B/C
+paths keep their pre-#755 behaviour). Tier-C push fallback remains a
 deliberate non-goal; **rebase/cherry-pick push-leg de-flooding (#737, delivered in
 2026-09-25 as tortoise #3716) is no longer one** — a history-rewriting push is now
-scoped against the trusted base (3-dot), and the subtraction's guards 4/5 simply do
-not fire for it (see the push-range paragraph above).
+scoped against the trusted base (3-dot), and no subtraction guard set can subtract from
+that narrowed range (guard (5) cannot pass: the tracking ref is not an ancestor of
+`srcRef`, hence not of `srcRef^1` — and every guard is required; see the push-range
+paragraph above). The narrowing is taken on pinned commit OIDs against the #3398
+trusted base, never on a ref name or the push remote's `main`.
 
 ### VGATE ceremony diagnostics & recovery (#561)
 

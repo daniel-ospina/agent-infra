@@ -31,6 +31,7 @@ import {
   makeGitSubCtx,
   subtractCommitArm,
   subtractPushArm,
+  resolveTrustedBase,
   SUBTRACT_SKIP_REASONS,
   type SubBundle,
   type SubAudit,
@@ -2028,8 +2029,11 @@ export function commandRunsCommit(command: string): boolean {
 // ANY probe failure → resolvePushRangeScope returns null → the caller's
 // status-quo staged scope (runStagedScope). NEVER error→[] (the
 // runBranchScope catch→clean-empty fail-open precedent is the
-// cautionary inversion). An empty RESOLVED range is audited push_range_empty
-// and allowed (an up-to-date push ships nothing).
+// cautionary inversion). An empty RESOLVED range is allowed (an up-to-date push
+// ships nothing) and audited push_range_empty — EXCEPT when it is a
+// history-rewriting push's narrowed range (#3716), which is audited
+// non_fast_forward_push instead: the ref being REPLACED makes "up to date" the
+// wrong statement about the push even when the content is identical.
 
 // src/dst are PLAIN ref names (no colon), validated by regex; colon = the
 // refspec had an explicit `:` (src:dst split) vs the bare same-name form — the
@@ -2202,16 +2206,42 @@ function symbolicRefShort(cwd: string): string | null {
   return v === null || v === "" ? null : v;
 }
 
-// Tri-state `git merge-base --is-ancestor` probe (#3716). Exit 0 = true (an
+// SHA-1 (40 hex) or SHA-256 (64 hex) object id. The ONLY shape a value may have
+// before it is interpolated into an execSync string by the #3716 probes — the
+// same whitelist-before-interpolation invariant as PUSH_REFNAME (execSync runs
+// /bin/sh -c; nothing here sets shell:false).
+const GIT_OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+// Pin a ref to its commit OID ONCE (#3716, verification follow-up). The narrowing
+// proof and the range diff MUST be about the SAME commits: `merge-base
+// --is-ancestor` and `git diff` each re-resolve whatever name they are handed, so
+// a background `git fetch` that advances the name in the probe→diff window makes
+// proof (1) true of one commit while the range is taken against another — and the
+// range then omits paths that differ from the CURRENT base TIP, which is exactly
+// the #3398 trust proof (1) exists to guarantee. This is the invariant the #755
+// subtraction already keeps (`makeSubBundle` pins T once: "a concurrent
+// update-ref cannot tear it"); the narrowing keeps it too.
+// Export is for the unit pin (tests import from ./index.js, like resolvePushTier).
+// null = unprovable → the caller keeps its fail-closed (pre-#3716) path.
+export function resolveCommitOid(cwd: string, ref: string): string | null {
+  if (!PUSH_REFNAME.test(ref)) return null;
+  const out = gitProbe(cwd, `rev-parse --verify --quiet ${ref}^{commit}`);
+  if (out === null) return null;
+  const oid = (out.split("\n")[0] ?? "").trim();
+  return GIT_OID.test(oid) ? oid : null;
+}
+
+// Tri-state `git merge-base --is-ancestor` probe (#3716). ⛔ OIDs ONLY: this
+// function interpolates its arguments into a shell string and the #3716 caller
+// pins them with `resolveCommitOid`; a bare refname must never reach it (a name is
+// re-resolved per command, which is the tear #3716 closes). Exit 0 = true (an
 // ancestor-or-equal), exit 1 = an EXPLICIT NEGATIVE (not an ancestor — a valid
 // answer, never collapsed into the failure sentinel), anything else
 // (128/signal/spawn) = null = UNPROVABLE. The null must stay distinct from
-// `false`: the #3716 rewrite switch acts only on the explicit negative, so a
-// probe failure keeps the pre-existing (wider) scope — fail-closed.
-function isAncestorOrEqual(cwd: string, a: string, b: string): boolean | null {
-  // `a`/`b` are validated refnames (PUSH_REFNAME/PUSH_REMOTE_NAME, or the
-  // merge-config regex) — the same interpolation invariant the argv builder
-  // states above. No other value may reach this string.
+// `false`: the rewrite switch acts only on the explicit negative, so a probe
+// failure keeps the pre-existing (wider) scope — fail-closed.
+export function isAncestorOrEqual(cwd: string, a: string, b: string): boolean | null {
+  if (!GIT_OID.test(a) || !GIT_OID.test(b)) return null;
   try {
     execSync(`git merge-base --is-ancestor ${a} ${b}`, { cwd, timeout: 5000, stdio: "ignore" });
     return true;
@@ -2271,6 +2301,14 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
   // whose narrowed range is empty is NOT an up-to-date push, and must not be
   // reported as one.
   let sawRewroteHistory = false;
+  // #3716 — DEFERRED rewrite audit. `logGateSkip` must not run inside the
+  // per-refspec loop: a later refspec can still `return null` (tier C / a
+  // throw / an unresolvable src), which discards the whole union and sends the
+  // caller to the STAGED scope — an audit line written before that point would
+  // attest a base-scoped narrowing the op never used. Emitted only once the
+  // union has resolved (see `emitPendingRewrites` below), so the line can never
+  // outlive the resolution it describes.
+  const pendingRewrites: Array<Record<string, unknown>> = [];
   for (const rs of refspecs) {
     let { src, dst } = rs;
     // src = HEAD special-case — NO-COLON ONLY (a positional `HEAD` pushes to
@@ -2369,20 +2407,41 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // issue asks for: an audit line, never an expansion of the verify set.
     let baseRef = tier === "A" ? tracking : baseMain;
     let rewroteHistory = false;
-    if (tier === "A" && baseMainExists
-        && isAncestorOrEqual(cwd, baseMain, srcRef) === true
-        && isAncestorOrEqual(cwd, tracking, srcRef) === false) {
-      rewroteHistory = true;
-      sawRewroteHistory = true;
-      baseRef = baseMain;
-      const discardedRaw = gitProbe(cwd, `rev-list --count ${srcRef}..${tracking}`);
-      const discardedParsed = discardedRaw === null ? Number.NaN : Number.parseInt(discardedRaw, 10);
-      logGateSkip("non_fast_forward_push", command, cwd, {
-        branch: dst,
-        trackingRef: tracking,
-        baseRef,
-        discardedCommits: Number.isFinite(discardedParsed) ? discardedParsed : null,
-      });
+    // Pinned OIDs for the RANGE — set only on the rewrite path; `undefined` keeps
+    // the pre-#3716 command byte-identical.
+    let narrowedBase: string | undefined;
+    let narrowedSrc: string | undefined;
+    if (tier === "A") {
+      // ⛔ ONE base rule (#3398): the INTEGRATION remote's base, OID-pinned —
+      // never the push remote's `main` (a push remote says where content GOES,
+      // not what was integrated; trusting a fork's `main` let fork-only
+      // unverified content be omitted — review F1 on #1106) and never a ref NAME,
+      // which is re-resolved per command and can be retargeted between the proof
+      // and the range (the tear #3716 closes).
+      const trusted = resolveTrustedBase(cwd);
+      const srcOid = resolveCommitOid(cwd, srcRef);
+      const trackingOid = resolveCommitOid(cwd, tracking);
+      const baseOid = trusted !== null && GIT_OID.test(trusted.oid) ? trusted.oid : null;
+      const trustedRef = trusted?.ref ?? null;
+      if (baseOid !== null && trustedRef !== null && srcOid !== null && trackingOid !== null
+          && isAncestorOrEqual(cwd, baseOid, srcOid) === true
+          && isAncestorOrEqual(cwd, trackingOid, srcOid) === false) {
+        rewroteHistory = true;
+        sawRewroteHistory = true;
+        baseRef = trustedRef;
+        narrowedBase = baseOid;
+        narrowedSrc = srcOid;
+        const discardedRaw = gitProbe(cwd, `rev-list --count ${srcOid}..${trackingOid}`);
+        const discardedParsed = discardedRaw === null ? Number.NaN : Number.parseInt(discardedRaw, 10);
+        pendingRewrites.push({
+          branch: dst,
+          trackingRef: tracking,
+          baseRef: trustedRef,
+          baseOid,
+          trackingOid,
+          discardedCommits: Number.isFinite(discardedParsed) ? discardedParsed : null,
+        });
+      }
     }
     // `tier` in the push_range_empty audit names the RANGE FORM, so a rewrite
     // push (which used the 3-dot base command) must not claim tier A.
@@ -2397,7 +2456,11 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // that was actually chosen, never the tracking ref that was rejected.
     let diffOut: string | null = null;
     try {
-      diffOut = execSync(buildPushRangeDiffCommand(rewroteHistory ? "B" : tier, baseRef, srcRef, true), {
+      // #3716: the RANGE uses the SAME pinned OIDs the proof used (a name here
+      // would re-resolve and could differ from the commit the proof was about).
+      // OIDs were re-validated against GIT_OID at pin time and also match the
+      // builder's PUSH_REFNAME whitelist.
+      diffOut = execSync(buildPushRangeDiffCommand(rewroteHistory ? "B" : tier, narrowedBase ?? baseRef, narrowedSrc ?? srcRef, true), {
         cwd, encoding: "utf-8", timeout: 5000, maxBuffer: 64 * 1024 * 1024,
       });
     } catch {
@@ -2423,6 +2486,13 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
       union.subtractions = [...(union.subtractions ?? []), ...subbed.subtractions];
     }
   }
+  // #3716 — the rewrite audit is emitted HERE, once the union has resolved:
+  // every path below returns a scope, so a `non_fast_forward_push` line now
+  // describes a push the gate actually scoped, never a probe an op abandoned
+  // (see `pendingRewrites`). One line per rewriting refspec.
+  const emitPendingRewrites = (): void => {
+    for (const r of pendingRewrites) logGateSkip("non_fast_forward_push", command, cwd, r);
+  };
   if (union.files.length === 0 && union.renameOldPaths.length === 0 && union.clean) {
     // #755: suppress push_range_empty when the emptiness was CAUSED by
     // subtraction — the single emitted line is then the handler's richer
@@ -2441,9 +2511,10 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // EMPTY (the pushed tip's tree IS the integration base, e.g. a branch reset
     // onto origin/main), yet the push genuinely REWRITES the remote branch and
     // discards commits. Emitting push_range_empty here would report a
-    // history-rewriting force-push as an up-to-date no-op; the op's single
-    // op-level line is then the non_fast_forward_push audit emitted at the
-    // decision site above (same shape as the subtraction suppression).
+    // history-rewriting force-push as an up-to-date no-op; the op's
+    // non_fast_forward_push audit line(s) are then emitted once the union
+    // resolves (see emitPendingRewrites below — same shape as the subtraction
+    // suppression).
     // Up-to-date push ships nothing — audited INSIDE the resolver so the
     // caller's shared silent empty-allow never hides the range decision.
     // Note: with multi-refspec commands the tier payload is "A" iff ANY
@@ -2461,10 +2532,12 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // to computeBranchDiff's origin/main staleness); the pull --rebase
     // pre-push ceremony (01-preflight) refreshes it.
     if (!subtractedSomething && !sawRewroteHistory) logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
+    emitPendingRewrites();
     return { files: [], renameOldPaths: [], clean: true, ...(subtractedSomething ? { subtractions: union.subtractions } : {}) };
   }
   // Fresh object ⇒ any field not explicitly rebuilt is dropped. `subtractions`
   // is therefore carried explicitly and null-safely.
+  emitPendingRewrites();
   return {
     files: Array.from(new Set(union.files)),
     renameOldPaths: Array.from(new Set(union.renameOldPaths)),
@@ -3611,10 +3684,15 @@ export default function (pi: ExtensionAPI) {
       scope = combineScopes(runStagedScope(cwd, sub), namedWt);
     } else {
       // #487 T1: a content push (no git commit anywhere in the command) verifies
-      // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot, while
-      // that ref is an ANCESTOR of the pushed tip) or the branch's diff against
-      // its integration base (tier B / the first push, and #3716's
-      // history-rewriting push — 3-dot) — never the whole index, so another
+      // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot)
+      // UNLESS the #3716 narrowing applies, in which case it is the branch's diff
+      // against its integration base (3-dot: tier B / the first push, and a
+      // history-rewriting push). The narrowing applies only when BOTH proofs
+      // hold — the tracking ref is NOT an ancestor-or-equal of the pushed tip AND
+      // the integration base IS one. Every other outcome keeps the 2-dot scope,
+      // including the case where the tracking ref is NOT an ancestor and the base
+      // is not one either (a behind or sibling base) — that is the fail-closed
+      // direction, pinned by e2e scenario 85 — never the whole index, so another
       // session's parked WIP in the index cannot false-block `git push origin
       // main` of already-committed HEAD. Commit-time behavior is UNCHANGED:
       // commit-bearing commands resolve null fast inside (classifier, zero
@@ -3624,7 +3702,9 @@ export default function (pi: ExtensionAPI) {
       // (scenario 44 legs 2-3), commit/gh presence (the P0 backstop,
       // wrapper-inclusive), no usable base (tier C), any git failure — NEVER []
       // on error (the computeBranchDiff catch→[] fail-open
-      // precedent). An empty RESOLVED range is audited push_range_empty inside.
+      // precedent). An empty RESOLVED range is audited push_range_empty inside —
+      // unless it is a #3716 rewrite's narrowed range, which is audited
+      // non_fast_forward_push (the ref is replaced even when the content matches).
       // #755 — the `??` operand serves TWO different commands, and they need
       // DIFFERENT bundles:
       //   • a PUSH command: `resolvePushRangeScope` handles it; the operand fires

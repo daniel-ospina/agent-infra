@@ -4415,6 +4415,9 @@ async function main() {
     // push's range can hold D rows — the merge-base tree is the base here — so
     // the range-path deletion policy (a D row is content-free: ENOENT-skipped,
     // never name-blocked, never a forever-block) needs a live pin ON THIS PATH.
+    // (Over-demand caveat: a narrowed range can also carry a D row for a path the
+    // remote tip already lacks — see the residual note in
+    // docs/plans/2026-09-06-issue-487-vgate-push-range.md.)
     git(repo, "rm -q baseline.ts");
     git(repo, "add .");
     git(repo, "commit -q -m branch-work");
@@ -4463,7 +4466,7 @@ async function main() {
       ok(res.reason.includes(f), `83: the block names the branch's own file ${f}`);
     }
     ok(!res.reason.includes("baseline.ts"),
-      "83: the D row is content-free — ENOENT-skipped, never named, so a rebased branch that deletes a file main carries can never forever-block (the #487 leg-c policy, re-pinned on the path that carries the row now)");
+      "83: the D row is content-free FOR A PATH ABSENT FROM DISK — ENOENT-skipped, never named, so a rebased branch that deletes a file main carries does not forever-block here. (Declared residual: the narrowed 3-dot range can ALSO carry a D/R row for a path the remote tip already lacks — a deletion the branch carried before the rebase — which this push does not change; if such a path exists on disk as untracked/ignored content it is an over-demand, never an under-demand. See the #487 plan's residual note.)");
     // The separately-REPORTED rewrite condition (the issue's Fix section): the
     // stale ref's real signal is "this push discards commits", which belongs in
     // the audit, never in the verification scope.
@@ -4632,6 +4635,155 @@ async function main() {
     equal(rewrite86.discardedCommits, 1, "86: the report carries the discarded commit count");
     ok(!fresh86.some((l) => l.event === "gate_skip" && l.reason === "push_range_empty"),
       "86: and the op is NOT also reported as an up-to-date empty range (RED against the unsuppressed first cut)");
+  });
+
+  test("scenario 87 (#3716): the narrowing base is the #3398 TRUSTED base, never the push remote's main", async () => {
+    // H3: the narrowing must use the INTEGRATION remote's base (`resolveTrustedBase`
+    // — #3398), never `<push remote>/main`. A push remote says where content GOES,
+    // not what was integrated; trusting a fork's `main` let fork-only, un-merged
+    // content be treated as base-identical and OMITTED from the verified set
+    // (review F1 on #1106). Geometry: `origin/main` is the baseline (the trusted
+    // base), `fork/main` is AHEAD of it, and the branch is rebased onto `fork/main`
+    // — so proof (1) holds against BOTH bases, and only the trusted-base range
+    // carries `fork-only.ts`.
+    const origin = join(TEST_ROOT, "repo-3716-trusted-origin.git");
+    mkdirSync(origin, { recursive: true });
+    git(origin, "init -q --bare -b main");
+    const forkRemote = join(TEST_ROOT, "repo-3716-trusted-fork.git");
+    mkdirSync(forkRemote, { recursive: true });
+    git(forkRemote, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716-trusted");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + origin);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "feat.ts"), "feat\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feat-work");
+    git(repo, "remote add fork " + forkRemote);
+    git(repo, "push -q -u fork feat"); // branch.feat.remote = fork
+    const preRebaseTip = git(repo, "rev-parse refs/remotes/fork/feat");
+    // fork/main advances BEYOND origin/main with content that is NOT integrated.
+    git(repo, "checkout -q -b forkbase main");
+    writeFileSync(join(repo, "fork-only.ts"), "fork\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m fork-only");
+    git(repo, "push -q fork forkbase:main");
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q fork");
+    git(repo, "rebase -q fork/main");
+    // `merge-base --is-ancestor` is exit-status-only (empty stdout on exit 0, and
+    // the `git()` helper throws on the exit-1 negative), so read the status.
+    const isAnc87 = (a: string, b: string): boolean => {
+      try { execSync(`git merge-base --is-ancestor ${a} ${b}`, { cwd: repo, stdio: "ignore" }); return true; }
+      catch { return false; }
+    };
+
+    equal(git(repo, "merge-base HEAD refs/remotes/fork/main"), git(repo, "rev-parse refs/remotes/fork/main"),
+      "87: (fixture) the rebase landed on fork/main — merge-base(HEAD, fork/main) == fork/main");
+    equal(git(repo, "rev-parse refs/remotes/fork/feat"), preRebaseTip,
+      "87: (fixture) the push remote's tracking ref still points at the PRE-rebase tip");
+    ok(isAnc87("origin/main", "HEAD"),
+      "87: (fixture) proof 1 holds against the TRUSTED base — origin/main IS an ancestor of the rebased tip");
+    ok(isAnc87("refs/remotes/fork/main", "HEAD"),
+      "87: (fixture) the PUSH remote's main is ALSO an ancestor — so the old base choice would pick fork/main and omit fork-only.ts");
+    ok(git(repo, "diff --name-only refs/remotes/fork/main HEAD").split("\n").filter(Boolean).join(",") === "feat.ts",
+      "87: (fixture) the OLD base range is only feat.ts — fork-only.ts is base-identical to the un-integrated fork/main");
+
+    await fire("session_start", {});
+    const before87 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease fork feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "87: the unverified rebased branch still BLOCKS — the narrowing never allows a push outright");
+    ok(res.reason.includes("fork-only.ts"),
+      "87: the block names the FORK-ONLY file the trusted-base range carries (RED pre-fix: the push remote's `main` is base-identical for it, so the range omits it and the un-integrated content looks verified)");
+    const rewrite87 = readAuditLines().slice(before87)
+      .find((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push") as any;
+    ok(rewrite87, "87: the history-rewrite condition is explicitly reported");
+    equal(rewrite87.baseRef, "refs/remotes/origin/main",
+      "87: the audit names the TRUSTED base (origin/main), not the push remote's main (RED pre-fix: baseRef was refs/remotes/fork/main)");
+    equal(rewrite87.branch, "feat", "87: the audit names the pushed branch");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: feat.ts, fork-only.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [
+          { path: join(repo, "feat.ts"), hash: sha("feat\n") },
+          { path: join(repo, "fork-only.ts"), hash: sha("fork\n") },
+        ],
+      }) }],
+    });
+    const retry = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease fork feat", cwd: repo },
+    }, { cwd: repo });
+    equal(retry, undefined,
+      "87: ACCEPTANCE — verifying the trusted-base range (feat.ts + fork-only.ts) clears the push (a fork/main-scoped range would have demanded only feat.ts and still re-blocked)");
+  });
+
+  test("scenario 88 (#3716): a rewrite audit line may not outlive the op it describes — an abandoned multi-refspec push emits none", async () => {
+    // A2-1: the rewrite audit must be deferred to the point the union RESOLVES.
+    // An in-loop emit writes the line for refspec #1 and then refspec #2 returns
+    // null, discarding the whole union and sending the caller to the STAGED scope
+    // — so the audit would attest a base-scoped narrowing the op never used. The
+    // second refspec here is unresolvable (`nonexist`), which is exactly that
+    // null-for-the-whole-command path (scenario 59's whole-command rule).
+    const origin = join(TEST_ROOT, "repo-3716-abandoned-origin.git");
+    mkdirSync(origin, { recursive: true });
+    git(origin, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716-abandoned");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + origin);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "feat88.ts"), "f\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feat-work");
+    git(repo, "push -q -u origin feat");
+    // main advances, then the branch is rebased — the #3716 rewrite geometry of
+    // scenario 83, which makes refspec #1 (`feat`) take the narrowing path.
+    git(repo, "checkout -q main");
+    writeFileSync(join(repo, "main88.ts"), "m\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m upstream-advance");
+    git(repo, "push -q origin main");
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q origin");
+    git(repo, "rebase -q origin/main");
+    equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
+      "88: (fixture) the rebase landed cleanly — refspec #1 is a rewrite push");
+    // Parked WIP so the STAGED fallback (the null that abandoned the range) has
+    // something to block on (scenario 59's idiom).
+    writeFileSync(join(repo, "wip88.ts"), "w\n");
+    git(repo, "add wip88.ts");
+    await fire("session_start", {});
+    const before88 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease origin feat nonexist", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "88: the unresolvable second refspec nulls the whole command → the staged WIP blocks");
+    ok(res.reason.includes("wip88.ts"),
+      "88: the block names the STAGED file — the rewrite range was abandoned, never used");
+    ok(!readAuditLines().slice(before88).some((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push"),
+      "88: an abandoned op (a later refspec nulled the whole command) must not leave a rewrite audit line — RED pre-fix");
   });
 
   test("scenario 1092: a DIRECTORY symlink commits its LINK TARGET — never a permanent EISDIR block (#1092)", async () => {
