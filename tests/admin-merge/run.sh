@@ -1084,6 +1084,83 @@ rc=$?
 [ "$rc" -eq 0 ] && pass "the exemption applies with no --repo (exit 0)" || fail "expected exit 0, got $rc — the exemption is inert without --repo"
 grep -q "has ZERO jobs" "$TMP/cfs-err" && pass "the zero-job run is still named" || fail "expected the zero-job note"
 
+# ── 5h. #1482: the zero-job contract is pinned in ALL FOUR callers ───────────
+# Cycle 2's reviewer mutated the paired debit away in `collect_union`,
+# `collect_union_signatures` and `collect_union_rows` (leaving `collect_union_rates`
+# intact) and the whole suite stayed GREEN: 5b-5g drive only ONE of the four call
+# sites, so a regression in the other three was invisible. Each caller is driven
+# here through the CLI mode that reaches it.
+echo "== 5h. the zero-job contract holds in all four collectors =="
+new_scen allfour
+# NOTE: there must be NO `fail-log-7790` / `jobs-count-7790` fixture here. With
+# one, run A ALSO takes the zero-job path, BOTH runs debit, and `tested` lands on
+# 0 whether or not the code is correct — a fixture that agrees with every mutant.
+# Run A must be an ordinary credited run for the pairing to be observable.
+# The fixture MUST use `startup_failure` for the zero-job run, not `failure`.
+# With a zero-job `failure` run the balance-based decrement gives the SAME answer
+# as the paired one, so the test cannot tell them apart — that is exactly why the
+# cycle-2 mutation in three collectors went unnoticed. `startup_failure` is in the
+# EXAMINED set but never CREDITED, so it is the only shape that discriminates:
+#   run A  completed/failure          -> credits tested (1), log readable
+#   run B  completed/startup_failure  -> zero jobs => rc=2, NOT credited
+# Correct code => tested=1. A balance decrement on B steals A's credit => 0.
+# A missing `credited=0` reset leaks A's credit into B => 0 as well.
+# The two-run shape therefore pins the pairing AND the reset at every call site.
+#
+# The two runs MUST sit on DIFFERENT SHAs: the supersede rule (#1358) drops an
+# earlier failing run replaced by a LATER one at the same sha+workflow+event, so a
+# same-sha fixture silently collapses to one run and tests nothing. Run B also
+# needs a `fail-log-` fixture — without it the log fetch SUCCEEDS and the rc=2
+# branch is never reached at all.
+: > "$SCEN/fail-log-7791"
+printf '0\n' > "$SCEN/jobs-count-7791"
+{ lane_line completed failure 7700000000000000000000000000000000000001 7790
+  log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7790"
+  lane_line completed startup_failure 7700000000000000000000000000000000000002 7791
+} > "$SCEN/runs-main"
+cp "$SCEN/runs-main" "$SCEN/runs-main7790"
+while IFS='|' read -r label args; do
+  [ -n "$label" ] || continue
+  # shellcheck disable=SC2086
+  cfs_run $args --exclude deadbeef --provenance "$TMP/zj8-prov.txt" --runs-report "$TMP/zj8-rep.txt"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "$label: expected exit 0, got $rc"
+  v="$(sed -n 's/^tested=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  [ "$v" = "1" ] && pass "$label: tested=1 (debit paired with credit; reset holds)" \
+                 || fail "$label: expected tested=1, got '$v' (a stolen credit is the P0 fail-open)"
+done <<'MODES'
+collect_union (--main-union)|--main-union 10
+collect_union_rates (--main-union-rates)|--main-union-rates 10
+collect_union_signatures (--main-union-signatures)|--main-union-signatures 10
+collect_union_rows (--commit)|--commit main7790
+MODES
+
+# ── 5i. #1482 F2: `timed_out` MUST keep its `tested` credit ──────────────────
+# A timed_out run DID exercise the suite. Dropping it from the credit is
+# FAIL-OPEN, not cosmetic: it shrinks the rate table's denominator K, which RAISES
+# main's measured failure rate and makes a materially worse PR look equivalent.
+# Silently removing the credit left the entire 781-test suite green before this.
+echo "== 5i. a timed_out run keeps its tested credit (the rate denominator) =="
+new_scen timedout
+: > "$SCEN/runs-main"
+for i in 1 2 3; do
+  lane_line completed timed_out main9100 "$((9100 + i))"
+  log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-$((9100 + i))"
+done >> "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zj9-prov.txt" --runs-report "$TMP/zj9-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "the timed_out lane extracts (exit 0)" || fail "expected exit 0, got $rc"
+v="$(sed -n 's/^tested=//p' "$TMP/zj9-rep.txt" 2>/dev/null)"
+[ "$v" = "3" ] && pass "tested=3 — all three timed_out runs are credited" || fail "expected tested=3, got '$v'"
+tab="$(printf '\t')"
+if grep -q "${tab}3${tab}3$" "$TMP/cfs-out"; then
+  pass "the rate table's K is 3 — the denominator is not shrunk"
+else
+  fail "the rate table's K is not 3 (a shrunk K is a fail-open):"
+  sed 's/^/       /' "$TMP/cfs-out"
+fi
+
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
 new_scen shape
