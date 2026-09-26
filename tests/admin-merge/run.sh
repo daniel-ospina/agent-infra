@@ -1216,6 +1216,47 @@ else
   sed 's/^/       /' "$TMP/cfs-out"
 fi
 
+# ── 5j. #1482: a NON-NUMERIC count is not zero ─────────────────────────────────
+# `run_job_count`'s contract declares it exits 1 on "a non-numeric answer", and
+# that rejection is DECISION-BEARING — it is what stops `fetch_failed_log` from
+# reading an unestablishable count as "zero jobs, contributes NOTHING". 5d pins
+# only the API-FAILURE sub-case (the command-level `|| return 1`); this pins the
+# other one: a SUCCESSFUL call whose `.total_count` is not a number.
+#
+# This is not hypothetical. `gh api … --jq '.total_count'` prints `null` and
+# exits 0 when the field is absent. Coercing that to 0 (`case … count=0`) passes
+# the ENTIRE suite while failing OPEN — measured by review cycle 6: with 3 real
+# failing main runs plus one run whose log is unreadable and whose count is
+# "null", pristine -> rc=1 BLOCK, coerced -> rc=0 with the run silently DROPPED
+# and its K contribution removed (a shrunk denominator inflates main's measured
+# rate — the same fail-open direction 5i exists to protect).
+#
+# A previous commit claimed the numeric guard's failure direction was "a wrong
+# diagnostic string, not a wrong decision". That is true of REMOVING the guard
+# (the `= "0"` test rejects any non-"0" string, so fall-through stays
+# fail-closed) but NOT of coercing the value — which is the natural
+# over-application of this very fix. The claim was wrong; this test is the fix.
+echo "== 5j. a NON-NUMERIC job count is not zero — still fail-closed =="
+new_scen nan-count
+: > "$SCEN/fail-log-7783"
+printf 'null\n' > "$SCEN/jobs-count-7783"   # gh: a SUCCESSFUL call that answered null
+{ main_red_n main7783 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7783 7783
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zja-prov.txt" --runs-report "$TMP/zja-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a non-numeric count still fails closed (exit $rc)" \
+                || fail "expected a non-zero exit, got 0 — a 'null' count was read as ZERO"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a non-numeric count must NOT be reported as zero-job" \
+                                        || pass "no zero-job note for a non-numeric count"
+if [ -s "$TMP/cfs-out" ]; then
+  fail "a rate table was emitted despite an unestablishable count (a shrunk K is a fail-open):"
+  sed 's/^/       /' "$TMP/cfs-out"
+else
+  pass "no rate table emitted — the baseline was not silently shrunk"
+fi
+
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
 new_scen shape
