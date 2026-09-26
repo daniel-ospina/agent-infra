@@ -1009,6 +1009,20 @@ rc=$?
 grep -q "could not fetch the failed-step log" "$TMP/cfs-err" && pass "the refusal is surfaced" || fail "expected the refusal on stderr"
 grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a zero-job note must not be printed for a run that HAS jobs" || pass "no zero-job note for a run that has jobs"
 
+# The jobs-API slug must carry the RESOLVED repo (review cycle 5, P2). Forcing the
+# `{owner}/{repo}` placeholder unconditionally left the suite GREEN, because the
+# fake extracts the run id by regex and discards everything before `/runs/` — so
+# the cross-repo protection the code comments describe was untested. A wrong-repo
+# call is mostly fail-closed (it 404s), but it silently makes the exemption inert
+# cross-repo, and it can falsely exempt if a same-id run in the CWD repo answers 0.
+tab="$(printf '\t')"
+if grep -q "repos/test-org/test-repo/actions/runs/7778/jobs" "$SCEN/calls"; then
+  pass "the jobs-API call carries the RESOLVED slug (--repo), not the CWD placeholder"
+else
+  fail "the jobs-API call did not use the resolved repo slug:"
+  grep -o 'repos/[^ ]*' "$SCEN/calls" | sort -u | sed 's/^/       /' || true
+fi
+
 # ── 5d. #1482: an UNREADABLE count is not a licence to exempt ───────────────
 echo "== 5d. unreadable job count → still fail-closed =="
 new_scen jobscountunknown
@@ -1135,6 +1149,20 @@ while IFS='|' read -r label args; do
   v="$(sed -n 's/^tested=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
   [ "$v" = "1" ] && pass "$label: tested=1 (debit paired with credit; reset holds)" \
                  || fail "$label: expected tested=1, got '$v' (a stolen credit is the P0 fail-open)"
+  # `examined` is a SEPARATE safety property and must be pinned too (review
+  # cycle 5, P1). On the PR side the whole fail-closed posture RESTS on
+  # `examined` advancing WITHOUT `extracted`: that is what makes admin-merge
+  # step 1c (`pr_extracted < pr_examined`) refuse a head whose failing run could
+  # not be attributed. Measured: decrementing `examined` in the rc=2 branch left
+  # the FULL 788-test suite green AND flipped the rail from BLOCK (exit 1) to
+  # MERGED (exit 0) on identical evidence — a fail-open with no test behind it.
+  # Both runs are examined (A: failure; B: startup_failure, in the examined set);
+  # only A is extracted, so the invariant is examined=2 / extracted=1.
+  ev="$(sed -n 's/^examined=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  ex="$(sed -n 's/^extracted=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  [ "$ev" = "2" ] && [ "$ex" = "1" ] \
+    && pass "$label: examined=2 / extracted=1 (the zero-job run stays EXAMINED)" \
+    || fail "$label: expected examined=2 extracted=1, got examined='$ev' extracted='$ex' — a zero-job run dropped from \`examined\` disarms the PR-side fail-closed gate"
 done <<'MODES'
 collect_union (--main-union)|--main-union 10
 collect_union_rates (--main-union-rates)|--main-union-rates 10
