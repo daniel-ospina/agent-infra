@@ -1016,6 +1016,174 @@ dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=
 dexpect("merge origin/main → syncSource", `git fetch origin && git merge origin/main`, { verdict: "block:merge", syncSource: "origin/main" });
 dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict: "block:rebase", syncSource: "origin/main" });
 
+// ── #1144: the sync invocation's EFFECT record (not its verb) ──────────────
+// The shared-baseline ownership allowance used to fire on the VERB alone
+// (merge/pull/rebase) whenever the session sat on its own baseline branch, so
+// `git rebase origin/main` on the SHARED tortoise hub's main moved that branch
+// under 11 live sessions with NO hatch — while the comparable
+// `git reset --hard` was refused and demanded AGENT_ALLOW_MAIN_EDITS=1.
+// index.ts now decides the sync arm on this record plus the LIVE checkout
+// preconditions (see test-branch-ownership.mjs for the predicate and
+// test-module-load.mjs for the end-to-end proof).
+const seff = (cmd) => classifyGitCommandDetailed(cmd).syncEffect ?? null;
+expectBool("#1144: rebase → syncEffect.rebaseEffect (can replace the tip)",
+  seff("git rebase origin/main")?.rebaseEffect === true, true);
+expectBool("#1144: rebase → NOT ffOnly",
+  seff("git rebase origin/main")?.ffOnly === false, true);
+expectBool("#1144: pull --ff-only → ffOnly (the one provable fast-forward)",
+  seff("git pull --ff-only origin main")?.ffOnly === true, true);
+expectBool("#1144: pull --ff-only → not rebaseEffect",
+  seff("git pull --ff-only origin main")?.rebaseEffect === false, true);
+expectBool("#1144: pull --rebase → rebaseEffect (rewriting effect via a non-rebase verb)",
+  seff("git pull --rebase origin main")?.rebaseEffect === true, true);
+expectBool("#1144: pull -r → rebaseEffect",
+  seff("git pull -r origin main")?.rebaseEffect === true, true);
+expectBool("#1144: bare pull → not ffOnly (pull.rebase config can make it a rebase)",
+  seff("git pull origin main")?.ffOnly === false, true);
+expectBool("#1144: bare merge → not ffOnly (a non-ff merge mints a merge commit)",
+  seff("git merge origin/main")?.ffOnly === false, true);
+expectBool("#1144: merge --ff-only → ffOnly",
+  seff("git merge --ff-only origin/main")?.ffOnly === true, true);
+// LAST-WINS: git's parse-options applies the LAST ff-family flag, so
+// `--ff-only --no-ff` is a MERGE COMMIT, not a fast-forward. A presence-only
+// check would admit it — this is the adversarial spelling the record must kill.
+expectBool("#1144: --ff-only then --no-ff → ffOnly false (last flag wins)",
+  seff("git merge --ff-only --no-ff origin/main")?.ffOnly === false, true);
+expectBool("#1144: --no-ff then --ff-only → ffOnly true (last flag wins)",
+  seff("git merge --no-ff --ff-only origin/main")?.ffOnly === true, true);
+expectBool("#1144: --ff-only then --rebase → rebaseEffect (rebase wins → refused)",
+  seff("git pull --ff-only --rebase origin main")?.rebaseEffect === true, true);
+expectBool("#1144: merge --squash → leavesDirty (stages state in the shared tree)",
+  seff("git merge --squash origin/main")?.leavesDirty === true, true);
+expectBool("#1144: merge --no-commit → leavesDirty",
+  seff("git merge --no-commit origin/main")?.leavesDirty === true, true);
+expectBool("#1144: no sync verb (push) → no syncEffect",
+  classifyGitCommandDetailed("git push origin main").syncEffect == null, true);
+// The parsed record describes the FIRST sync op; the command-level flag says
+// whether that record can stand for the WHOLE command's effect.
+expectBool("#1144: single sync invocation → syncOnlyInvocation true",
+  classifyGitCommandDetailed("git pull --ff-only").syncOnlyInvocation === true, true);
+expectBool("#1144: `pull --ff-only && rebase` → syncOnlyInvocation false (first-op evidence cannot cover the command)",
+  classifyGitCommandDetailed("git pull --ff-only && git rebase origin/main").syncOnlyInvocation === false, true);
+// ── value slots / dynamic / terminator: a token that is not an OPTION is not evidence ──
+expectBool("#1144: `merge -m --ff-only` → NOT ffOnly (value slot; real git merges NON-ff)",
+  seff("git merge -m --ff-only origin/main")?.ffOnly === false, true);
+expectBool("#1144: `merge --message --ff-only` → NOT ffOnly (value slot)",
+  seff("git merge --message --ff-only origin/main")?.ffOnly === false, true);
+expectBool("#1144: `merge --ff-only -m msg` → ffOnly stays true (option order)",
+  seff("git merge --ff-only -m msg origin/main")?.ffOnly === true, true);
+expectBool("#1144: `merge -- --ff-only` → unverifiable (`--` makes it a ref name)",
+  seff("git merge -- --ff-only")?.unverifiable === true, true);
+expectBool("#1144: `pull --ff-only $(echo --no-ff)` → unverifiable (shell resolves after the read)",
+  seff("git pull --ff-only $(echo --no-ff) origin main")?.unverifiable === true, true);
+expectBool("#1144: plain `pull --ff-only` → verifiable",
+  seff("git pull --ff-only origin main")?.unverifiable === false, true);
+expectBool("#1144: attached short value `-Xours` consumes no next token",
+  seff("git merge --ff-only -Xours origin/main")?.ffOnly === true, true);
+// ── cycle-2 reviewer: git's left-to-right short scan + fail-closed option shapes ──
+expectBool("#1144: `merge -Xours --ff-only` → ffOnly true (attached value, real flag follows)",
+  seff("git merge -Xours --ff-only origin/main")?.ffOnly === true, true);
+expectBool("#1144: `merge -Xours --ff-only` → NOT unverifiable (known attached-value shape)",
+  seff("git merge -Xours --ff-only origin/main")?.unverifiable === false, true);
+expectBool("#1144: `merge -mX --ff-only` → ffOnly true (value attached inside the token)",
+  seff("git merge -mX --ff-only origin/main")?.ffOnly === true, true);
+expectBool("#1144: `merge -qm --ff-only` → ffOnly false (arg-taker ends the cluster → next token is its value)",
+  seff("git merge -qm --ff-only origin/main")?.ffOnly === false, true);
+expectBool("#1144: `merge --mess --ff-only` → unverifiable (ABBREVIATED value option cannot be proven)",
+  seff("git merge --mess --ff-only origin/main")?.unverifiable === true, true);
+expectBool("#1144: `merge --ff-only --gpg-sign --no-ff` → unverifiable (OPTARG does not consume `--no-ff`)",
+  seff("git merge --ff-only --gpg-sign --no-ff origin/main")?.unverifiable === true, true);
+expectBool("#1144: `merge --strategy-o --ff-only` → unverifiable (unknown abbreviation fails closed)",
+  seff("git merge --strategy-o --ff-only origin/main")?.unverifiable === true, true);
+expectBool("#1144: `pull -qr --ff-only` → rebaseEffect true (`r` in a short cluster)",
+  seff("git pull -qr --ff-only origin main")?.rebaseEffect === true, true);
+expectBool("#1144: `merge --ff-only --no-edit origin/main` → ffOnly true, verifiable (allowlisted boolean)",
+  (() => { const e = seff("git merge --ff-only --no-edit origin/main"); return e?.ffOnly === true && e?.unverifiable === false; })(), true);
+expectBool("#1144: `merge --ff-only --strategy=ort origin/main` → ffOnly true, verifiable (self-contained value)",
+  (() => { const e = seff("git merge --ff-only --strategy=ort origin/main"); return e?.ffOnly === true && e?.unverifiable === false; })(), true);
+expectBool("#1144: `checkout main && fetch origin` → stateCarveOutClean true (no refspec cannot write refs)",
+  classifyGitCommandDetailed("git checkout main && git fetch origin").stateCarveOutClean === true, true);
+expectBool("#1144: `checkout main && fetch origin +main:refs/heads/main` → stateCarveOutClean false (refspec writes refs)",
+  classifyGitCommandDetailed("git checkout main && git fetch origin +main:refs/heads/main").stateCarveOutClean === false, true);
+expectBool("#1144: invocationHints emitted per git invocation (`-C <wt> status && reset`) — 2 entries",
+  classifyGitCommandDetailed("git -C /tmp/wt status && git reset --hard origin/main").invocationHints?.length === 2, true);
+// ── M3 carve-out laundering (#1144 reviewer P1) ──
+expectBool("#1144: `checkout main` alone → stateCarveOutClean true (sanctioned return preserved)",
+  classifyGitCommandDetailed("git checkout main").stateCarveOutClean === true, true);
+expectBool("#1144: `checkout main && status` → stateCarveOutClean true (read-only sibling)",
+  classifyGitCommandDetailed("git checkout main && git status").stateCarveOutClean === true, true);
+expectBool("#1144: `checkout main && reset --hard` → stateCarveOutClean false (destructive sibling)",
+  classifyGitCommandDetailed("git checkout main && git reset --hard origin/main").stateCarveOutClean === false, true);
+expectBool("#1144: `checkout main && fetch` (bare, no refspec) → stateCarveOutClean true (cannot write refs/heads/*)",
+  classifyGitCommandDetailed("git checkout main && git fetch").stateCarveOutClean === true, true);
+expectBool("#1144: `checkout main && fetch --depth 1 --quiet origin` → stateCarveOutClean true (no refspec)",
+  classifyGitCommandDetailed("git checkout main && git fetch --depth 1 --quiet origin").stateCarveOutClean === true, true);
+
+// ── #1144 follow-up closures: B6o (short value slot) · B9d-hidden (eval payload
+// riding a visible sync) · B8-hidden (eval payload riding a worktree-exempt
+// leading segment). Each of these is an INCOMPLETE closure of a class already
+// declared in the #1144 surface, found by a fresh-context adversarial reviewer
+// against the parent commit — so they are pinned here, beside the classes they
+// extend, and end-to-end in test-module-load.mjs.
+//
+// B6o — the short value slot. `-o` is `pull`'s `--server-option`, an ARG-TAKER:
+// real git consumes `--ff-only` as its VALUE and performs a NON-fast-forward
+// pull (probe: rc 0, MERGE COMMIT, branch moved). The long twin
+// (`--server-option --ff-only`) was already unverifiable, so only the short
+// letter was open.
+expectBool("#1144 B6o: `pull -o --ff-only` → ffOnly FALSE (`--ff-only` is -o's VALUE, not a flag)",
+  seff("git pull -o --ff-only origin main")?.ffOnly === false, true);
+expectBool("#1144 B6o: `pull -o --ff-only` → verifiable (the value slot is a KNOWN arg-taker, not an unknown shape)",
+  seff("git pull -o --ff-only origin main")?.unverifiable === false, true);
+// The general rule the entry must not replace: any short letter that is neither
+// a known arg-taker nor a known boolean may be an arg-taker this table does not
+// enumerate, so the token after it is of UNKNOWN kind → fail closed.
+expectBool("#1144 B6o: an UNENUMERATED short letter fails closed (`pull -Z --ff-only` → unverifiable)",
+  seff("git pull -Z --ff-only origin main")?.unverifiable === true, true);
+// …and the short/long asymmetry self-heals: `-p` is refused exactly as its long
+// twin `--prune` is, because neither is in its allowlist.
+expectBool("#1144 B6o: `pull --ff-only -p` → unverifiable (short `-p` mirrors refused `--prune`)",
+  seff("git pull --ff-only -p origin main")?.unverifiable === true, true);
+expectBool("#1144 B6o: `pull --ff-only --prune` → unverifiable (the refused long twin)",
+  seff("git pull --ff-only --prune origin main")?.unverifiable === true, true);
+// The known-benign shorts must NOT be caught by the general rule (no false
+// block on the curated boolean set) — `-q` is the short spelling of an
+// allowlisted long (`--quiet`).
+expectBool("#1144 B6o: `pull -q --ff-only` → ffOnly true, verifiable (known-boolean short)",
+  (() => { const e = seff("git pull -q --ff-only origin main"); return e?.ffOnly === true && e?.unverifiable === false; })(), true);
+
+// B9d-hidden — `git pull --ff-only && eval "git rebase origin/main"`. The eval
+// payload executes git but contributes NO invocation, so the walk sees exactly
+// one invocation (the pull) and `syncOnlyInvocation` claimed TRUE — the sync
+// arm then trusted the pull's fast-forward record for a command that rewrites
+// the branch immediately after. "Only git invocation" is a claim about the whole
+// command; hidden substitution makes it unprovable → false.
+expectBool("#1144 B9d-hidden: `pull --ff-only && eval \"rebase\"` → syncOnlyInvocation FALSE (hidden git payload)",
+  classifyGitCommandDetailed('git pull --ff-only && eval "git rebase origin/main"').syncOnlyInvocation === false, true);
+expectBool("#1144 B9d-hidden: the same command reports hiddenStateSubst (the evidence the claim is unprovable)",
+  classifyGitCommandDetailed('git pull --ff-only && eval "git rebase origin/main"').hiddenStateSubst === true, true);
+expectBool("#1144 B9d-hidden: hidden eval BEFORE the sync op also fails closed (`eval \"pull --rebase\" && pull --ff-only`)",
+  classifyGitCommandDetailed('eval "git pull --rebase origin main" && git pull --ff-only').syncOnlyInvocation === false, true);
+expectBool("#1144 B9d-hidden control: a truly lone `pull --ff-only` → syncOnlyInvocation TRUE (allowance's purpose)",
+  classifyGitCommandDetailed("git pull --ff-only").syncOnlyInvocation === true, true);
+
+// B8-hidden — the legacy arm's per-invocation worktree exemption keys on
+// `invocationHints`, which a hidden substitution leaves COMPLETE-looking:
+// `git -C <wt> status && eval "git reset --hard origin/main"` walks to one
+// worktree-scoped invocation while the eval payload resets the SHARED hub. The
+// classifier must flag it so the exemption fails closed (index.ts →
+// `_allInvocationsWorktreeScoped`).
+expectBool("#1144 B8-hidden: `-C <wt> status && eval \"reset --hard\"` → hiddenStateSubst TRUE",
+  classifyGitCommandDetailed('git -C /tmp/wt status && eval "git reset --hard origin/main"').hiddenStateSubst === true, true);
+expectBool("#1144 B8-hidden: its visible twin reports the same worktree-complete-looking invocation list (2 entries) — the discriminator is the hidden flag",
+  (() => {
+    const hidden = classifyGitCommandDetailed('git -C /tmp/wt status && eval "git reset --hard origin/main"');
+    const visible = classifyGitCommandDetailed("git -C /tmp/wt status && git reset --hard origin/main");
+    return hidden.invocationHints?.length === 1 && visible.invocationHints?.length === 2;
+  })(), true);
+expectBool("#1144 B8-hidden control: a wholly worktree-scoped destructive op reports NO hidden substitution (exemption preserved)",
+  classifyGitCommandDetailed("git -C /tmp/wt reset --hard origin/main").hiddenStateSubst === false, true);
+
 // M3 subclassification surfaces (branchOp via shared classifyBranchOp)
 import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, resolveRepoFromInv as sharedResolveRepoFromInv, extractGitInvocation as sharedExtractGitInvocation, decideM2 as sharedDecideM2, decideM3 as sharedDecideM3, localBranchExists as sharedLocalBranchExists, ownershipAllowed as sharedOwnershipAllowed } from "../shared/branch-ownership.mjs";
 const co = (cmd) => {

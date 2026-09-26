@@ -873,7 +873,10 @@ ok("M3 #376: original is preserved across re-baselines (immutable)", (() => {
 })());
 
 // ── ownershipAllowed ───────────────────────────────────────────────────────
-ok("allow: merge own branch", ownershipAllowed({ opKind: "merge", currentBranch: "feat/1", baselineBranch: "feat/1" }) === true);
+// NOTE (#1144): the sync arm (pull/merge/rebase) is EFFECT-gated — it needs an
+// `effect` record from the caller and never fires on the verb alone. See the
+// #1144 block below for the predicate's own assertions.
+ok("allow: merge own branch w/o effect evidence → refused (fail closed)", ownershipAllowed({ opKind: "merge", currentBranch: "feat/1", baselineBranch: "feat/1" }) === false);
 ok("allow: merge off-baseline false", ownershipAllowed({ opKind: "merge", currentBranch: "main", baselineBranch: "feat/1" }) === false);
 ok("allow: push own target", ownershipAllowed({ opKind: "push", currentBranch: "feat/1", baselineBranch: "feat/1", targets: ["feat/1"] }) === true);
 ok("allow: push foreign target false", ownershipAllowed({ opKind: "push", currentBranch: "feat/1", baselineBranch: "feat/1", targets: ["main"] }) === false);
@@ -900,7 +903,61 @@ ok("allow: branch -D multi all-owned allowed", ownershipAllowed({ opKind: "branc
 ok("allow: branch -D master protected even if listed owned (never trunk)", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["master"], ownedBranches: ["master"] }) === false);
 ok("allow: branch -D owned off-baseline false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "feat/1", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === false);
 ok("allow: push of owned branch stays baseline-only", ownershipAllowed({ opKind: "push", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === false);
-ok("allow: bare pull own", ownershipAllowed({ opKind: "pull", currentBranch: "feat/1", baselineBranch: "feat/1" }) === true);
+ok("allow: bare pull own w/o effect evidence → refused (fail closed)", ownershipAllowed({ opKind: "pull", currentBranch: "feat/1", baselineBranch: "feat/1" }) === false);
+
+// ── #1144: the sync allowance is EFFECT-shaped, not verb-shaped ────────────
+// Live 2026-09-17: `git rebase origin/main` on the SHARED tortoise hub's main
+// moved that branch under 11 live sessions with NO hatch, while
+// `git reset --hard origin/main` — a comparable branch move — was refused and
+// demanded AGENT_ALLOW_MAIN_EDITS=1. The allowance fired on the VERB; it now
+// fires only on the EFFECT: own-repo scope + a clean shared tree + a PROVABLE
+// fast-forward (which cannot move the tip backwards or rewrite a commit).
+const pEff = (verb, over = {}) => ({ verb, ffOnly: false, rebaseEffect: false, leavesDirty: false, ...over });
+const syncAllow = (opKind, parsed, over = {}) => ownershipAllowed({
+  opKind, currentBranch: "main", baselineBranch: "main",
+  effect: { parsedEffect: parsed, onlyGitInvocation: true, scopeOwnRepo: true, treeClean: true, ...over },
+});
+// B1 — the reported defect: a rebase on the shared baseline branch.
+ok("#1144 B1: `rebase` on the shared baseline branch is REFUSED",
+  syncAllow("rebase", pEff("rebase", { rebaseEffect: true })) === false);
+ok("#1144 B1: `rebase` stays refused with a clean tree + own-repo scope",
+  syncAllow("rebase", pEff("rebase", { rebaseEffect: true }), { treeClean: true, scopeOwnRepo: true }) === false);
+// The allowance's genuine purpose survives: a provable fast-forward.
+ok("#1144: `pull --ff-only` on the own baseline + clean tree is ALLOWED",
+  syncAllow("pull", pEff("pull", { ffOnly: true })) === true);
+ok("#1144: `merge --ff-only` on the own baseline + clean tree is ALLOWED",
+  syncAllow("merge", pEff("merge", { ffOnly: true })) === true);
+// B2 — the same rewriting EFFECT reached through another verb spelling.
+ok("#1144 B2: `pull --rebase` is REFUSED (rewriting effect via a pull verb)",
+  syncAllow("pull", pEff("pull", { ffOnly: true, rebaseEffect: true })) === false);
+ok("#1144 B2: bare `pull` is REFUSED (pull.rebase config can make it a rebase)",
+  syncAllow("pull", pEff("pull")) === false);
+ok("#1144 B2: bare `merge` is REFUSED (a non-ff merge is not a fast-forward)",
+  syncAllow("merge", pEff("merge")) === false);
+ok("#1144 B2: `merge --squash` is REFUSED (leaves staged state in the shared tree)",
+  syncAllow("merge", pEff("merge", { ffOnly: true, leavesDirty: true })) === false);
+// B3 — per-repo scope: without it the allowance is repo-agnostic (its comment
+// says "agent-infra main" while it fires for ANY repo's main).
+ok("#1144 B3: a sync op in a DIFFERENT repo than the baseline is REFUSED",
+  syncAllow("pull", pEff("pull", { ffOnly: true }), { scopeOwnRepo: false }) === false);
+ok("#1144: a DIRTY shared tree refuses even the fast-forward form",
+  syncAllow("pull", pEff("pull", { ffOnly: true }), { treeClean: false }) === false);
+// An UNVERIFIABLE flag proof refuses: `--` makes `--ff-only` a path/ref name,
+// and a shell expansion is resolved AFTER the guard's read (`$(echo --no-ff)`).
+ok("#1144: an UNVERIFIABLE effect (`--` terminator / dynamic token) is REFUSED",
+  syncAllow("pull", pEff("pull", { ffOnly: true, unverifiable: true })) === false);
+// Compound closure: the parsed record describes the FIRST sync op, so a
+// command with ANY other git invocation (e.g. `pull --ff-only && rebase`) must
+// not ride the first op's fast-forward evidence.
+ok("#1144: a command with another git invocation is REFUSED (first-op evidence is not the command's effect)",
+  syncAllow("pull", pEff("pull", { ffOnly: true }), { onlyGitInvocation: false }) === false);
+// Fail closed on absent/incomplete evidence — the anti-bypass property: a
+// caller that supplies no effect record can never satisfy the sync arm.
+ok("#1144: no effect record at all → REFUSED",
+  ownershipAllowed({ opKind: "rebase", currentBranch: "main", baselineBranch: "main" }) === false);
+ok("#1144: no parsedEffect → REFUSED", syncAllow("pull", null) === false);
+ok("#1144: non-object effect → REFUSED",
+  ownershipAllowed({ opKind: "pull", currentBranch: "main", baselineBranch: "main", effect: "yes" }) === false);
 
 // ── Lock lifecycle ─────────────────────────────────────────────────────────
 const lockKey = repoKey(MAIN);
