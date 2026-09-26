@@ -6193,10 +6193,15 @@ grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a shifted c
 # it into gh's argv: ANY_WORKFLOW stayed 0, the lane stayed `python-ci.yml`, and
 # the rail blocked with a remedy its own invocation could not have applied. The
 # FIRST line of this section is the reproduction: both orders must select the
-# SAME lane name, which is the only visible proof the flag was read. Four claims
-# are pinned: the orders are EQUIVALENT; the recovery is LOUD; an unrecognised
+# SAME lane name, which is the only visible proof the flag was read. The headline
+# claims are: the orders are EQUIVALENT; the recovery is LOUD; an unrecognised
 # post-`--` token is REFUSED and never reaches gh; and the lane-block prints the
-# remedy in the order that works.
+# remedy in the order that works — plus the narrower pins (c)-(e7) below: a
+# RECOGNISED parser flag is refused too; BOTH repo selectors (`--repo` and gh's
+# short `-R`) are refused, so the merge cannot be desynchronised from the analysis
+# and its evidence; a valueless (or flag-valued) `--workflow` is refused rather
+# than silently widening the lane; a real `--workflow <file>` IS recovered;
+# legitimate gh flags still pass through; and a flag-spelled VALUE stays data.
 echo "== 66. #4078: a parser flag after '--' is recovered (or refused), never swallowed =="
 HEAD_AO="f6f6000000000000000000000000000000000000"
 
@@ -6293,7 +6298,7 @@ rc=$?
   || { fail "(#4078) a value-taking flag did not consume its value"; sed 's/^/      /' "$SCEN/err"; }
 grep -q "recovering them for the parser" "$SCEN/err" \
   && fail "(#4078) a merge BODY was recovered as a parser flag" \
-  || pass "(#4078) a flag-spelled value is not hoisted"
+  || pass "(#4078) a flag-spelled value is not recovered"
 
 # (e1) gh also carries a value INLINE. `--body=--any-workflow` is the same data as
 # the space-separated form: no recovery, and the whole token stays intact.
@@ -6305,7 +6310,7 @@ rc=$?
   || { fail "(#4078) an inline value was refused"; sed 's/^/      /' "$SCEN/err"; }
 grep -q "recovering them for the parser" "$SCEN/err" \
   && fail "(#4078) an inline merge BODY was recovered as a parser flag" \
-  || pass "(#4078) an inline flag-spelled value is not hoisted"
+  || pass "(#4078) an inline flag-spelled value is not recovered"
 
 # (e2) An inline BOOLEAN gh flag (`--squash=true`) is a real gh spelling and must
 # not fall into the unknown-token refusal.
@@ -6316,14 +6321,16 @@ rc=$?
 [ "$rc" -eq 1 ] && pass "(#4078) an inline BOOLEAN gh flag passes through (exit $rc = the lane block)" \
   || { fail "(#4078) '--squash=true' exited $rc, not 1 — an inline boolean was refused"; sed 's/^/      /' "$SCEN/err"; }
 
-# (e3) The name-splitting must not admit an empty NAME: a bare `=x` is not a flag
-# and an allow-list keyed on an empty name would match it (`" x "` contains `"  "`).
+# (e3) A token with no leading dash is not a flag at all, even when it contains
+# `=`: it is the second positional, which the rail refuses because the PR is
+# already supplied. (`=x` never reaches the NAME split — that split requires a
+# leading `-` — so this pins the BARE-POSITIONAL refusal, not an allow-list seam.)
 new_scen argorder-equals-bare
 printf '%s\n' "$HEAD_AO" > "$SCEN/head"
 run_admin_here 42 --main-runs 1 -- --squash =x >/dev/null 2>&1
 rc=$?
-[ "$rc" -eq 2 ] && pass "(#4078) a bare '=x' token is refused (exit 2), not matched as an empty name" \
-  || fail "(#4078) a bare '=x' exited $rc, not 2 — the empty-name allow-list match leaked"
+[ "$rc" -eq 2 ] && pass "(#4078) a bare '=x' token is refused (exit 2) as a second positional" \
+  || fail "(#4078) a bare '=x' exited $rc, not 2 — a positional with '=' reached gh"
 
 # (e4) A lane selector with an INLINE value is not a spelling the parser has, and
 # recovering it would silently DROP the value — refuse instead.
@@ -6336,6 +6343,64 @@ rc=$?
 grep -q "takes no value" "$SCEN/err" \
   && pass "(#4078) …and the refusal says the flag takes no value" \
   || fail "(#4078) the inline selector refusal does not explain itself"
+
+# (e5) BOTH REPO SELECTORS are the parser's. `-R` is gh's short `--repo`; forwarded,
+# it points the MERGE at another repo while the analysis and the head-bound evidence
+# stay on this one — the exact divergence the long `--repo` is refused for. An alias
+# that defeats its own guard is the defect, so each spelling is refused by name,
+# with NO gh call.
+for sel in '--repo other/repo' '-R other/repo' '-R=other/repo'; do
+  new_scen "argorder-reposel-$(printf '%s' "$sel" | tr -cd '[:alnum:]')"
+  printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+  # shellcheck disable=SC2086 — the split into flag+value is the point of the case
+  run_admin_here 42 --main-runs 1 -- --squash $sel >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 2 ] && pass "(#4078) '$sel' after '--' is refused (exit 2)" \
+    || fail "(#4078) '$sel' after '--' exited $rc, not 2 — the merge could target another repo"
+  grep -q "refusing" "$SCEN/err" \
+    && pass "(#4078) …('$sel') and it is refused by name" \
+    || fail "(#4078) '$sel' was not refused by name"
+  [ -s "$SCEN/calls" ] && fail "(#4078) gh was called before '$sel' was refused" \
+    || pass "(#4078) …('$sel') with no gh call made"
+done
+
+# (e6) A VALUELESS `--workflow` after `--` must be REFUSED, not recovered as an
+# empty lane: an empty WORKFLOW is read as the --any-workflow opt-out, so defaulting
+# it silently WIDENS the certificate — this section's own defect, on the recovery
+# side. A flag AS the value is the same ambiguity.
+new_scen argorder-workflow-novalue
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(#4078) a valueless '--workflow' after '--' is refused (exit 2)" \
+  || fail "(#4078) a valueless '--workflow' exited $rc, not 2 — it recovered an empty lane"
+grep -q "recovering them for the parser" "$SCEN/err" \
+  && fail "(#4078) an empty --workflow was recovered as a lane request" \
+  || pass "(#4078) …and nothing was recovered for it"
+[ -s "$SCEN/calls" ] && fail "(#4078) gh was called before the valueless --workflow was refused" \
+  || pass "(#4078) …and no gh call was made"
+
+new_scen argorder-workflow-flagvalue
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --workflow --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(#4078) a FLAG as the --workflow value after '--' is refused (exit 2)" \
+  || fail "(#4078) '--workflow --any-workflow' exited $rc, not 2 — a flag became a lane name"
+grep -q "lane: any workflow" "$SCEN/err" \
+  && fail "(#4078) the swallowed flag was still applied as a lane request" \
+  || pass "(#4078) …and the flag was not silently applied as a lane"
+
+# (e7) …and the positive half: a `--workflow <file>` with a REAL value IS recovered
+# and applied, so (e6) is a value guard, not a removal of the recovery.
+new_scen argorder-workflow-value
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash --workflow other-lane.yml >/dev/null 2>&1
+grep -q "lane: other-lane.yml" "$SCEN/err" \
+  && pass "(#4078) a post-'--' '--workflow <file>' is recovered as a parser flag" \
+  || { fail "(#4078) a post-'--' '--workflow <file>' did not select its lane"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "recovering them for the parser" "$SCEN/err" \
+  && pass "(#4078) …and the --workflow recovery is announced, not silent" \
+  || fail "(#4078) the --workflow recovery was silent"
 
 # (f) AC3 — the MAIN-side lane block (the one that PRINTS the remedy) must print
 # it in the order that works. Fixture shape is section 28(b): head tested in the
