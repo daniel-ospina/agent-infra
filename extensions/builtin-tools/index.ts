@@ -1737,13 +1737,24 @@ export function probeSystemLoad(): number | null {
  * the static bound (#198) would still cut it. Scale: load < 8 → 1x; 8–15 →
  * 2x; ≥16 → 3x (bounded). Env-overridable via TASK_LOAD_SCALE_OFF=1.
  */
-let _load1Override: (() => number) | null = null;
+let _load1Override: (() => number | null) | null = null;
 /** #272 test seam: inject a fixed load1 for the E-series (multi-tick latch
- * tests). Pass null to restore the live os.loadavg() read. */
-export function setLoad1Override(fn: (() => number) | null): void { _load1Override = fn; }
-/** #272: live 1-min loadavg (os.loadavg()[0]) unless overridden (tests). */
+ * tests). Pass null to restore the live probe. #1485 (review): the seam is
+ * TRI-STATE (`() => number | null`) so a test can drive a FAILED probe through
+ * the render path — otherwise the `0`-on-failure regression is unreachable
+ * from tests and every guard stays green while the bug returns. */
+export function setLoad1Override(fn: (() => number | null) | null): void { _load1Override = fn; }
+/** #1485: the ONE tri-state load read — the injectable seam when set, else the
+ * live probe. `null` = probe failed. Bound-scaling consumers use `getLoad1()`
+ * (which coalesces to `0`); the `Alive state:` renderer uses this directly so
+ * a failure stays visible as `unknown`. */
+export function probeLoad1(): number | null {
+  return _load1Override ? _load1Override() : probeSystemLoad();
+}
+/** #272: live 1-min loadavg (os.loadavg()[0]) unless overridden (tests).
+ * Contract: always a number, `0` on failure — callers scale bounds with it. */
 export function getLoad1(): number {
-  return _load1Override ? _load1Override() : getSystemLoad();
+  return probeLoad1() ?? 0;
 }
 
 export function loadScaledBound(baseMs: number, load = getSystemLoad()): number {
@@ -2915,9 +2926,10 @@ export function formatLoad1(v: number | null): string {
  * line must stay single-line.
  */
 export function renderMachineStateLine(): string {
-  // The injectable seam is a NUMBER (tests); the live probe is tri-state, so a
-  // failed probe renders `unknown` rather than a confident `0` (#1485 P2).
-  const load1: number | null = _load1Override ? _load1Override() : probeSystemLoad();
+  // The render path goes through the tri-state read: a failed probe must stay
+  // `unknown`, never become the confident `0` that `getLoad1()` is contracted
+  // to return for bound scaling (#1485 review P2).
+  const load1 = probeLoad1();
   const freeMB = Math.round(freemem() / (1024 * 1024));
   return `load1=${formatLoad1(load1)} cores=${cpus().length} freeMB=${freeMB} piProcs=${countPiProcs()}`;
 }

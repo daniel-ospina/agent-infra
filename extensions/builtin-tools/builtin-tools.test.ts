@@ -5995,7 +5995,21 @@ test("#1485: renderMachineStateLine — machine evidence, single line, load1 hon
   ok(Number.isInteger(n) && n >= -1, `countPiProcs is a count or -1 (got ${n})`);
 });
 
-test("#1485 (review P2): a failed load probe renders `unknown`, never a confident 0", () => {
+test("#1485 (review P2): a failed load probe renders `unknown` on the RENDER path, never a confident 0", () => {
+  // Drive the failure through renderMachineStateLine() itself — the pure
+  // formatter alone left the wiring unpinned, so putting `getLoad1()` back in
+  // the renderer kept every guard green (#1485 re-review P2, mutation-proven).
+  setLoad1Override(() => null);
+  try {
+    const line = renderMachineStateLine();
+    ok(
+      /^load1=unknown cores=\d+ freeMB=\d+ piProcs=-?\d+$/.test(line),
+      `a failed probe must render load1=unknown on the real render path (got ${line})`,
+    );
+    ok(!line.includes("load1=0"), "never a confident 0 for a failed probe");
+  } finally {
+    setLoad1Override(null);
+  }
   equal(formatLoad1(null), "unknown", "probe failure → unknown sentinel");
   equal(formatLoad1(0), "0", "a real idle 0 stays 0 — the sentinel does not swallow it");
   equal(formatLoad1(131.25), "131.25", "a live reading renders verbatim");
