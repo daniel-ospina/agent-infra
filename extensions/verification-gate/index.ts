@@ -2160,7 +2160,11 @@ export function resolvePushTier(trackingExists: boolean, baseMainExists: boolean
 }
 
 // PURE argv builder — baseRef is the FULLY RESOLVED base ref (never DWIM);
-// src is the resolved local ref (refs/heads/<x> or HEAD). Tier A = 2-dot
+// src is the fully resolved source: a local ref (refs/heads/<x> or HEAD), or —
+// on the #3716 history-rewrite path — the narrowed source OID (40- or 64-hex,
+// per GIT_OID; NOT always 40 as an earlier version of this comment said)
+// (`narrowedSrc`), because a rebased branch's local ref name is exactly what the
+// narrowing exists to avoid re-diffing. Tier A = 2-dot
 // (space form — the remote branch also LOSES remote-side-only files on a
 // diverged/force push); tier B = 3-dot first-push base. The two forms are NOT
 // an A/B property of the branch: #3716 makes a history-rewriting push call this
@@ -2206,25 +2210,144 @@ function symbolicRefShort(cwd: string): string | null {
   return v === null || v === "" ? null : v;
 }
 
-// SHA-1 (40 hex) or SHA-256 (64 hex) object id. The ONLY shape a value may have
-// before it is interpolated into an execSync string by the #3716 probes — the
-// same whitelist-before-interpolation invariant as PUSH_REFNAME (execSync runs
-// /bin/sh -c; nothing here sets shell:false).
+// Repo-scope-only config read (#1491). The declaration must be the PER-CLONE
+// operator assertion, but `git config --get` reads the MERGED scope — local +
+// `--global` + `--system` + `GIT_CONFIG_*` env + `-c`. A machine-global declaration
+// then activates the narrowing in EVERY clone on the box, with NO per-clone action
+// at all — the exact #1491 fail-open, reproduced (a review finding at head
+// 36a25d0). `--local` reads only the SHARED repository config: a linked worktree
+// shares that file REGARDLESS of `extensions.worktreeConfig` (which affects
+// `--worktree`, not `--local`), so a per-worktree declaration is invisible to this
+// gate and cannot activate it. `include.path`/`includeIf` are not followed by
+// `--local` (only `--includes` follows them).
+//
+// DECLARED RESIDUAL (not closable by any config-scope read): a machine-global
+// `init.templateDir` — or the ambient `GIT_TEMPLATE_DIR` env — makes git COPY a
+// `config` file into every freshly cloned/initialised repo's `.git/config`, so a
+// `--local` read can pick up a seed the operator did not set in that clone. That
+// requires control of the machine-global config/env (the same trust boundary as
+// `GIT_CONFIG_GLOBAL`), and the key genuinely lands in `.git/config` where no read
+// can distinguish it from an operator's own. Other `gitConfigGet` callers keep the
+// merged read — branch-upstream configs are legitimately inherited.
+//
+// ⛔ TRUST BOUNDARY (declared, per the #1491 decision): the declaration IS the
+// operator's own assertion, and `.git/config` is written by the operator. A gated
+// actor that rewrites its OWN `vgate.integrationRef` (or `branch.<cur>.merge`) — or
+// deletes the working-tree tripwire — can therefore assert a wrong base; that is
+// the accepted model, NOT a gate inference, and F3/#1491 closes the INFERENCE
+// vector, not a lying operator. Binding the declaration to an out-of-band
+// attestation the actor cannot rewrite is a larger design change that reopens the
+// decision — recorded as an owner option, not adopted here.
+function gitConfigGetLocal(cwd: string, key: string): string | null {
+  const v = gitProbe(cwd, `config --local --get ${key}`);
+  return v === null || v === "" ? null : v;
+}
+
+// SHA-1 (40 hex) or SHA-256 (64 hex) object id. The shape a value must have
+// before `isAncestorOrEqual` or the `rev-list --count` probe interpolates it into
+// an execSync string — the same whitelist-before-interpolation invariant as
+// PUSH_REFNAME (execSync runs /bin/sh -c; nothing here sets shell:false).
+// `resolveCommitOid`'s `rev-parse` probe is the exception to "OIDs only": it
+// interpolates a PUSH_REFNAME-validated ref NAME and then validates the RESULT
+// against GIT_OID, so a name never reaches the ancestry probes.
 const GIT_OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
-// #3716 — the ONLY ref the narrowing may take as its base: the house integration
-// branch. `resolveTrustedBase` prefers a DECLARED upstream that names another
-// branch (#3398 — for the SUBTRACTION arm, where guards (0)-(5) neutralise it).
-// That ref can be a TOPIC branch (`origin/develop`, a stacked branch, a fork's
-// `main`), and the narrowing has no guard set: it omits every path the pushed tip
-// shares with its base, so a topic base omits content the push LANDS on the remote
-// and ships it unverified. Measured fail-open (2026-09-25): a checkout on `work`
-// whose `branch.work.merge` is `refs/heads/develop`, pushing a branch rebased onto
-// `origin/develop`, returned `{"files":["F.txt"]}` where the pre-#3716 range was
-// `D.txt`, `F.txt`, `old.txt` — `D.txt` (develop-only, never integrated) was
-// landed on the remote undemanded. A non-integration base therefore keeps the
-// wider pre-#3716 scope (fail-closed, over-demand at worst).
-const INTEGRATION_BASE_REF = /^refs\/remotes\/origin\/(?:main|master)$/;
+// #1491 — the integration ref must be DECLARED, never inferred from a ref NAME.
+// The cycle-2 guard (`INTEGRATION_BASE_REF`) matched `refs/remotes/origin/(main|
+// master)`, which selects a NAME, not a ROLE. Two measured fail-opens followed
+// (agent-infra #1491): in a fork-as-`origin` layout the name matches the FORK's
+// `main`, so content the push LANDS on the canonical remote is omitted; and in a
+// `origin/HEAD -> master` repo a legacy `origin/main` matches while the
+// integration branch is `master`. `resolveTrustedBase` also prefers a branch's
+// DECLARED upstream naming another branch (#3398, for the subtraction arm, where
+// guards (0)-(5) neutralise it) — a TOPIC base, which the narrowing has no guard
+// for. No predicate on local ref names closes both vectors AND keeps scenario 87
+// (push to `fork`, base must stay `origin/main`): which remote is canonical is
+// carried only by an operator assertion.
+//
+// ⛔ THE ASSERTION MUST BE PER-CLONE. A checked-in `.vgate/integration-ref`
+// cannot carry it: the file is a shared, clone-relative NAME, so a fork clone
+// inherits `refs/remotes/origin/main` where `origin` is the FORK — honoring it
+// alone reproduces the fail-open one level up (the owner's stated "one outcome
+// this must not have"). Activation therefore requires the per-clone git-config
+// `vgate.integrationRef` (read `--local` ONLY — see `gitConfigGetLocal`: the
+// merged scope let a MACHINE-GLOBAL key activate every clone, a reproduced
+// fail-open); the checked-in file is an AGREEMENT TRIPWIRE — it must declare
+// exactly ONE meaningful line equal to the config, and any disagreement, extra
+// line, or present-but-unreadable file is refused. A MISSING config returns null
+// ⇒ NO narrowing (fail closed — a missing declaration must never produce a
+// narrowing).
+//
+// `cwd` is the git root of the gated op (the caller resolves it), but
+// `resolveGitRoot` is applied again for robustness when a subdirectory is passed.
+function readDeclaredIntegrationRefFile(cwd: string): { present: boolean; ref: string | null } {
+  const p = join(resolveGitRoot(cwd), ".vgate", "integration-ref");
+  // ⛔ PRESENCE is decided by lstat, NEVER by readFileSync's errno. A checked-in
+  // DANGLING SYMLINK (git mode 120000) is REPO-CARRIED content but `readFileSync`
+  // throws ENOENT — the exact errno for "no file" — so a tracked symlink could
+  // neutralise the tripwire and let the config activate. Only an lstat ENOENT is
+  // genuinely absent; any existing path is present.
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(p);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") return { present: true, ref: null };
+    // The entry itself is absent. But an INTERMEDIATE component can still be a
+    // repo-carried DANGLING SYMLINK (a committed `.vgate` symlink to a missing
+    // directory), which makes this path read as ENOENT exactly like a missing
+    // file — the same bypass class as a dangling FILE symlink. Refuse it.
+    try {
+      const d = lstatSync(dirname(p));
+      if (d.isSymbolicLink()) {
+        try {
+          statSync(dirname(p));
+        } catch {
+          return { present: true, ref: null };
+        }
+      }
+    } catch {
+      /* `.vgate` absent too → genuinely no tripwire (config alone activates) */
+    }
+    return { present: false, ref: null };
+  }
+  if (st.isSymbolicLink()) {
+    try {
+      st = statSync(p); // follow: a symlink to a regular file is readable
+    } catch {
+      return { present: true, ref: null }; // DANGLING symlink → present-but-unreadable, refuse
+    }
+  }
+  // A non-regular file (directory/EISDIR, FIFO — readFileSync would BLOCK
+  // unbounded on a FIFO — socket, device) is present-but-unreadable: refuse.
+  if (!st.isFile()) return { present: true, ref: null };
+  let raw: string;
+  try {
+    raw = readFileSync(p, "utf-8");
+  } catch {
+    return { present: true, ref: null }; // EACCES/EIO — present but unreadable → refuse
+  }
+  const lines: string[] = [];
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (t === "" || t.startsWith("#")) continue;
+    lines.push(t);
+    // A declaration is exactly ONE meaningful line. A second meaningful line is
+    // malformed (and a decoy: a first line agreeing with the config while a later
+    // line names another ref must not read as "agrees") — refuse.
+    if (lines.length > 1) return { present: true, ref: null };
+  }
+  if (lines.length === 0) return { present: true, ref: null }; // present but empty/comment-only
+  return { present: true, ref: PUSH_REFNAME.test(lines[0]) ? lines[0] : null };
+}
+
+export function resolveDeclaredIntegrationRef(cwd: string): string | null {
+  const cfgRaw = gitConfigGetLocal(cwd, "vgate.integrationRef");
+  const cfg = cfgRaw !== null && PUSH_REFNAME.test(cfgRaw) ? cfgRaw : null;
+  if (cfg === null) return null; // no per-clone assertion ⇒ no narrowing
+  const file = readDeclaredIntegrationRefFile(cwd);
+  if (file.present && file.ref !== cfg) return null; // shared decl disagrees ⇒ fail closed
+  return cfg;
+}
 
 // Pin a ref to its commit OID ONCE (#3716, verification follow-up). The narrowing
 // proof and the range diff MUST be about the SAME commits: `merge-base
@@ -2398,7 +2521,10 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // The branch's real diff is `git diff <base>...<src>` — exactly what the
     // first-push (tier B) path already computes — so a rewrite push borrows that
     // command against the branch's integration base.
-    // ⛔ TWO explicit proofs are required, and both are FAIL-CLOSED. Any other
+    // ⛔ An explicit DECLARATION plus TWO explicit proofs are required, and all
+    // are FAIL-CLOSED. The declaration is the first precondition (the base must
+    // EQUAL the declared integration ref — see `resolveDeclaredIntegrationRef`);
+    // the two proofs below are the second and third. Any other
     // outcome (including a null/unprovable probe) leaves the push on its
     // pre-#3716 path: this change can only ever take the narrowing on proof, so
     // it never silently changes what an unprovable push is measured against.
@@ -2432,20 +2558,25 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // and removes an operator's only escape from a misbehaving narrowing. Skipped ⇒
     // the pre-#3716 tier-A 2-dot scope, the same as any other unprovable outcome.
     if (tier === "A" && !subDisabled) {
-      // ⛔ ONE base rule (#3398): the INTEGRATION remote's base, OID-pinned —
-      // never the push remote's `main` (a push remote says where content GOES,
-      // not what was integrated; trusting a fork's `main` let fork-only
-      // unverified content be omitted — review F1 on #1106) and never a ref NAME,
-      // which is re-resolved per command and can be retargeted between the proof
-      // and the range (the tear #3716 closes).
-      // ⛔ And never a TOPIC branch — see INTEGRATION_BASE_REF above for the
-      // measured fail-open that put this test here.
+      // ⛔ ONE base rule (#3398 + #1491): the base must be the ref the operator
+      // DECLARED as the integration ref, OID-pinned — never the push remote's
+      // `main` (a push remote says where content GOES, not what was integrated;
+      // trusting a fork's `main` let fork-only unverified content be omitted —
+      // review F1 on #1106) and never a ref NAME, which is re-resolved per
+      // command and can be retargeted between the proof and the range (the tear
+      // #3716 closes).
+      // ⛔ DECLARED, never inferred from a name — see `resolveDeclaredIntegrationRef`
+      // above for the two measured fail-opens (#1491) a name predicate cannot
+      // close. `trustedRef === declaredRef` is the whole guard: a base that is
+      // not the declared ref (a fork's `main`, a legacy `main`, a topic upstream)
+      // keeps the wider pre-#3716 scope.
       const trusted = resolveTrustedBase(cwd);
+      const declaredRef = resolveDeclaredIntegrationRef(cwd);
       const srcOid = resolveCommitOid(cwd, srcRef);
       const trackingOid = resolveCommitOid(cwd, tracking);
       const baseOid = trusted !== null && GIT_OID.test(trusted.oid) ? trusted.oid : null;
       const trustedRef = trusted?.ref ?? null;
-      if (baseOid !== null && trustedRef !== null && INTEGRATION_BASE_REF.test(trustedRef)
+      if (declaredRef !== null && trustedRef === declaredRef && baseOid !== null
           && srcOid !== null && trackingOid !== null
           && isAncestorOrEqual(cwd, baseOid, srcOid) === true
           && isAncestorOrEqual(cwd, trackingOid, srcOid) === false) {
@@ -2458,7 +2589,7 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
         pendingRewrites.push({
           branch: dst,
           trackingRef: tracking,
-          baseRef: trustedRef,
+          baseRef: declaredRef,
           baseOid,
           trackingOid,
           discardedCommits: Number.isFinite(discardedParsed) ? discardedParsed : null,

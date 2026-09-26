@@ -2862,6 +2862,8 @@ test("#3716: the kill switch (subDisabled) keeps the pre-#3716 scope — a rewri
     execSync("git add . && git commit -q -m upstream", { cwd: dir });
     const mainTip = g("rev-parse HEAD");
     execSync(`git update-ref refs/remotes/origin/main ${mainTip}`, { cwd: dir });
+    // #1491 — the narrowing requires an explicit declaration of the integration ref.
+    execSync("git config vgate.integrationRef refs/remotes/origin/main", { cwd: dir });
     execSync("git checkout -q feat && git rebase -q origin/main", { cwd: dir });
     // Proofs hold: origin/main IS an ancestor of the rebased tip; origin/feat is not.
     const narrowed = resolvePushRangeScope("git push --force origin feat", dir, null, false);
