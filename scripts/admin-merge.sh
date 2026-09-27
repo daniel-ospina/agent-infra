@@ -1626,7 +1626,10 @@ residual_of() {
 # call.
 #
 # Sets, NEVER exits — so no caller can forget which branch it took:
-#   MAIN_HEALTH_STATUS   green | red | unmeasured | unreadable
+#   MAIN_HEALTH_STATUS   green | red | unobserved | unmeasured | unreadable
+#                        (`unobserved` = no completed red, but >=1 check STILL IN
+#                         FLIGHT, so the surface is PARTLY observed and is NOT a
+#                         green certificate — #5215, Symptom 1)
 #   MAIN_HEALTH_REF      the ref probed
 #   MAIN_HEALTH_SHA      the probed commit sha (the ref name when unresolvable)
 #   MAIN_HEALTH_SUMMARY  ONE legible line naming what was measured
@@ -2138,6 +2141,19 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   if [ "$MAIN_HEALTH_RED" -gt 0 ]; then
     MAIN_HEALTH_STATUS="red"
     MAIN_HEALTH_SUMMARY="RED — $MAIN_HEALTH_RED code-measuring check(s) FAIL on '$ref' ($sha) (of $MAIN_HEALTH_TOTAL measured, pending $MAIN_HEALTH_PENDING)"
+  elif [ "$MAIN_HEALTH_PENDING" -gt 0 ]; then
+    # ⛔ AN IN-FLIGHT CHECK IS NOT AN OBSERVED ONE (#5215 — Symptom 1). This branch
+    # used to fall through to `green`: a surface with 0 reds but N checks STILL
+    # RUNNING certified GREEN, and the evidence line said so verbatim
+    # ("GREEN — no code-measuring check fails among 16 check(s) ... (pending 5)").
+    # Main d65ff46a4 was certified GREEN that way while its `test (b)` leg — one of
+    # those 5 pending — was in flight; that leg then completed `failure`, and main
+    # had in fact been red since 4c0544d66. The certificate was about a surface the
+    # rail had NOT finished observing, and an unobserved leg is not a passing one:
+    # the rail can certify only the checks it has SEEN complete. A completed red
+    # still wins (nothing in flight can un-fail it), so `red` is tested first.
+    MAIN_HEALTH_STATUS="unobserved"
+    MAIN_HEALTH_SUMMARY="UNKNOWN — $MAIN_HEALTH_PENDING of $MAIN_HEALTH_TOTAL check(s) on '$ref' ($sha) are STILL IN FLIGHT (pending $MAIN_HEALTH_PENDING), so this surface is only PARTLY observed: the $((MAIN_HEALTH_TOTAL - MAIN_HEALTH_PENDING)) completed check(s) carry no code-measuring red, but an in-flight check is not a green one"
   else
     MAIN_HEALTH_STATUS="green"
     MAIN_HEALTH_SUMMARY="GREEN — no code-measuring check fails among $MAIN_HEALTH_TOTAL check(s) on '$ref' ($sha) (pending $MAIN_HEALTH_PENDING)"
@@ -2432,6 +2448,74 @@ attribute_residual() {
       printf '   %s\n      -> not measurable on this lane: main carries no failure in %s, so absence is NOT evidence of novelty\n' "$nodeid" "$file"
     fi
   done < "$residual"
+}
+
+# report_tree_attribution <pr-fails> <main-fails> <lane> <base-ref> — split the
+# evaluated tree's failing nodeids into INHERITED (also red on the base) and NEW
+# (not in the base's failing set) (#5215, Symptom 2).
+#
+# WHY. Step 4.5 refuses a red tree and names the red CHECKS, but "test (b) is
+# red" does not tell a lane whether the red is its own diff or the base's. On the
+# dense-leg red (`tests/test_session_semantic_retrieval.py`) main has been red
+# since 4c0544d66, and six PRs (#5842, #5696, #5697, #5384, #5414, #5393) that
+# changed nothing near that file were refused with the same tree-red message and
+# no way to see the red was inherited. Both sides are the SAME lane measured on
+# two commits — the head (step 1's `--commit-rows`) and the base (step 2's
+# `--main-union-rates`) — so membership is the lane's own comparison, not a
+# second source that could disagree with the decision.
+#
+# SCOPE IS STATED, NOT IMPLIED. The split covers only the nodeids the lane parser
+# extracted. A red check that yielded no nodeid (a non-pytest gate, or a log the
+# parser could not read) is not represented; the function SAYS SO rather than let
+# an empty NEW list read as "nothing new".
+#
+# A REPORT, NOT A VERDICT: the caller has already decided to refuse; nothing here
+# clears, downgrades or un-blocks anything.
+#
+# Deliberately NOT `comm`: the one `comm` in this rail belongs to the parser's
+# `--diff`, and a second one is the shape the suite's PARITY test forbids.
+report_tree_attribution() {
+  local pr_fails="$1" main_fails="$2" lane="$3" base_ref="$4"
+  local inherited="" new_ids="" one
+  say_err "   FAILURE ATTRIBUTION — new (this PR's) vs inherited (the base's), by nodeid (lane '$lane'):"
+  if [ ! -s "$pr_fails" ]; then
+    say_err "     (the lane yielded NO failing nodeid for this head, so the red check(s) above"
+    say_err "      could not be split by nodeid. This attribution is UNKNOWN, not 'nothing new'.)"
+    return 0
+  fi
+  if [ ! -s "$main_fails" ]; then
+    # THE SAME RULE `attribute_residual` APPLIES, one level up: a FAILURE-ONLY
+    # base set cannot tell "green on the base" from "never measured on the base",
+    # so an EMPTY base set is NOT evidence of novelty. Calling every head failure
+    # NEW here would repeat the misattribution the split exists to stop — in the
+    # opposite direction, and with a WRONG blame instead of a vague one.
+    say_err "     UNATTRIBUTABLE — the base's failing set is EMPTY for this lane, so absence is"
+    say_err "     NOT evidence of novelty. This red cannot be called NEW or INHERITED:"
+    while IFS= read -r one; do
+      [ -n "$one" ] && say_err "        $one"
+    done < "$pr_fails"
+    return 0
+  fi
+  inherited="$(grep -xF -f "$main_fails" "$pr_fails" || true)"
+  new_ids="$(grep -vxF -f "$main_fails" "$pr_fails" || true)"
+  if [ -n "$inherited" ]; then
+    say_err "     INHERITED FROM THE BASE ('$base_ref') — present in the base's own failing set,"
+    say_err "     so this red is NOT caused by this diff:"
+    while IFS= read -r one; do
+      [ -n "$one" ] && say_err "        $one"
+    done <<< "$inherited"
+  else
+    say_err "     INHERITED FROM THE BASE ('$base_ref'): none — no measured failure is in the base's failing set."
+  fi
+  if [ -n "$new_ids" ]; then
+    say_err "     NEW TO THIS PR — NOT in the base's failing set, so this diff may have caused it:"
+    while IFS= read -r one; do
+      [ -n "$one" ] && say_err "        $one"
+    done <<< "$new_ids"
+  else
+    say_err "     NEW TO THIS PR: none — every measured failure is already red on the base."
+  fi
+  return 0
 }
 
 main() {
@@ -3055,6 +3139,13 @@ main() {
   case "$BASE_STATUS" in
     green)
       info "admin-merge: base tree ('$base_ref') ${BASE_SUMMARY}" ;;
+    unobserved)
+      # PARTLY OBSERVED (#5215, Symptom 1). The base is CONTEXT and still never
+      # blocks — a check still in flight is not a red one — but the rail must not
+      # print a GREEN certificate about a surface it has not finished reading. The
+      # base red a PR would inherit is exactly what the tree gate at 4.5 then
+      # adjudicates, so a lane needs the honest UNKNOWN label here.
+      info "admin-merge: ⚠️  base tree ('$base_ref') ${BASE_SUMMARY}" ;;
     unmeasured)
       info "admin-merge: ⚠️  base tree ('$base_ref') ${BASE_SUMMARY}" ;;
     red)
@@ -3300,6 +3391,13 @@ main() {
   case "$TREE_STATUS" in
     green)
       info "admin-merge: ✅ evaluated tree ${TREE_SUMMARY}" ;;
+    unobserved)
+      # PARTLY OBSERVED (#5215, Symptom 1). This PRESERVES the existing gate
+      # strength: before this branch, a tree with 0 reds and N pending checks read
+      # `green` and PROCEEDED. It still proceeds — an in-flight check is not a red
+      # one, and step 1b already refuses a lane that has not finished — but the
+      # state is NAMED, not silently GREEN.
+      info "admin-merge: ⚠️  evaluated tree ${TREE_SUMMARY}" ;;
     unmeasured)
       info "admin-merge: ⚠️  evaluated tree ${TREE_SUMMARY}" ;;
     red)
@@ -3316,6 +3414,14 @@ main() {
         say_err "    is not expected to carry one, so this is an anomaly:)"
         printf '%s\n' "$TREE_REDS_OTHER" >&2
       fi
+      # ── NEW vs INHERITED (#5215, Symptom 2) ────────────────────────────────
+      # Naming the failing CHECK is not enough: a check red because the BASE is red
+      # and a check red because THIS diff broke it read identically, and six PRs
+      # burned a cycle on the dense-leg red that was main's. The lane's own failing
+      # nodeids on both sides are already in hand (step 1 / step 2), so the split
+      # costs no new gh call. It is REPORTING ONLY — the `exit 1` below is
+      # unchanged, so a PR-caused failure still blocks exactly as hard as before.
+      report_tree_attribution "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$lane" "$base_ref"
       say_err "   BASE CONTEXT: $BASE_SUMMARY"
       say_err "   If the base is red and THIS PR is the repair, the red should already be GONE"
       say_err "   from this tree — a red still here means the repair is incomplete. If this PR is"

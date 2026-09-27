@@ -3916,6 +3916,36 @@ rc=$?
   || fail "a PENDING check on the PR tree blocked the merge (exit $rc)"
 grep -q "pending 1" "$TMP/out" && pass "…and the pending check is COUNTED in the evidence, not dropped" \
   || fail "the pending count is not reported"
+grep -q "evaluated tree UNKNOWN" "$TMP/out" && pass "…and the tree state is UNKNOWN, not GREEN (#5215 Symptom 1: an unobserved leg is never green)" \
+  || fail "a tree with an in-flight check was certified without the UNKNOWN state: $(grep 'evaluated tree' "$TMP/out" | head -2)"
+grep -q "✅ evaluated tree" "$TMP/out" && fail "…but the rail still printed the GREEN tree certificate" \
+  || pass "…and no GREEN tree certificate was printed"
+
+# (g2) #5215 SYMPTOM 1 ON THE BASE: A BASE CHECK STILL IN FLIGHT IS **NOT** A
+# GREEN BASE. The rail used to print `base tree ('main') GREEN — no code-measuring
+# check fails among 16 check(s) … (pending 5)` while a leg that later COMPLETED
+# `failure` was one of the 5 pending (main d65ff46a4). An in-flight leg is an
+# UNOBSERVED leg, and absence of a completed red is not evidence of a green one.
+new_scen basehealth-pending
+HEAD_BP="b5b5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BP" > "$SCEN/head"
+lane_pass "$HEAD_BP" 5551 > "$SCEN/runs-$HEAD_BP"
+lane_pass mainbp 5552 > "$SCEN/runs-main"
+# The base at the moment of the false certificate: one completed success and one
+# leg STILL RUNNING (the `test (b)` that then failed).
+write_main_checks \
+  "$(check_run 7001 'test (a)' completed success 6101)" \
+  "$(check_run 7002 'test (b)' in_progress null 6101)"
+main_run_map 6101 push 'Python CI'
+pr_green_surface
+run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "an in-flight base check does not block (the base is CONTEXT, never the gate)" \
+  || fail "a pending base check blocked the merge (exit $rc)"
+grep -q "base tree ('main') UNKNOWN" "$TMP/out" && pass "…but the base is UNKNOWN, never a GREEN certificate" \
+  || fail "the base was certified without observing an in-flight leg: $(grep 'base tree' "$TMP/out" | head -2)"
+grep -q "base tree ('main') GREEN" "$TMP/out" && fail "…the rail STILL printed the GREEN base certificate" \
+  || pass "…and no GREEN base certificate was printed"
 
 # (h) AN EMPTY TREE SURFACE IS UNMEASURED — stated, never silently green. Right
 # after a push the tree's checks have not started, so refusing here would block
@@ -3992,6 +4022,48 @@ grep -q "THE TREE THIS PR PRODUCES IS RED" "$TMP/err" && pass "…as the TREE re
   || fail "the tree-red case did not report the tree refusal: $(sed -n '1,4p' "$TMP/err" 2>/dev/null)"
 grep -q "AGENT_ADMIN_MERGE_OVERRIDE" "$TMP/err" && pass "…and names the audited remedy for a repairing PR" \
   || fail "the refusal offers no remedy for the PR that repairs the base"
+
+# (k1) #5215 SYMPTOM 2: THE TREE REFUSAL NAMES WHICH REDS ARE THE PR'S AND WHICH
+# ARE THE BASE'S. `FAIL_TL` is red on main too (3/3 runs, so the decision exempts
+# it), so the refusal must call it INHERITED and say nothing is new — the one
+# glance a lane needs to know the red is not its diff.
+grep -q "FAILURE ATTRIBUTION" "$TMP/err" && pass "…and it SPLITS the red by origin (#5215 Symptom 2)" \
+  || fail "the tree refusal does not attribute the red to PR vs base"
+grep -q "INHERITED FROM THE BASE" "$TMP/err" && pass "…naming the inherited set" \
+  || fail "the inherited set is not named"
+grep -qF "        $FAIL_TL" "$TMP/err" && pass "…with the failing nodeid named as inherited, not blamed on this diff" \
+  || fail "the inherited nodeid is not named under the attribution"
+grep -q "NEW TO THIS PR: none" "$TMP/err" && pass "…and states that nothing is new to this PR" \
+  || fail "the attribution did not state the NEW set is empty"
+
+# (k2) THE ATTRIBUTION FORMATTER, PINNED DIRECTLY. The NEW branch is NOT reachable
+# through the whole rail: a failure absent from main's rate table is blocked by
+# the exemption decision at step 3, BEFORE 4.5 runs. So it is pinned here on the
+# function itself, extracted from the rail. A rename makes the extraction empty
+# and FAILS this test — never a silent skip.
+attr_src="$(awk '/^report_tree_attribution\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$ADM")"
+if [ -n "$attr_src" ]; then
+  pass "report_tree_attribution is present in the rail"
+  say_err() { printf '%s\n' "$*"; }
+  eval "$attr_src"
+  printf 'tests/a.py::one\ntests/a.py::two\ntests/new.py::three\n' > "$TMP/attr-pr"
+  printf 'tests/a.py::one\ntests/a.py::two\n' > "$TMP/attr-main"
+  : > "$TMP/attr-none"
+  out="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-main" python-ci.yml main)"
+  grep -q "INHERITED FROM THE BASE ('main')" <<<"$out" && pass "unit: the inherited set is reported" || fail "unit: inherited header missing"
+  grep -qF "        tests/a.py::one" <<<"$out" && pass "unit: an inherited nodeid is named" || fail "unit: inherited nodeid not named"
+  grep -qF "        tests/new.py::three" <<<"$out" && pass "unit: a NEW nodeid is named" || fail "unit: NEW nodeid not named"
+  awk '/NEW TO THIS PR/{f=1} f' <<<"$out" | grep -qF "tests/a.py::one" \
+    && fail "unit: an inherited id leaked into the NEW list" || pass "unit: the NEW list excludes inherited ids"
+  out2="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-none" python-ci.yml main)"
+  grep -q "UNATTRIBUTABLE" <<<"$out2" && pass "unit: an empty base set is UNATTRIBUTABLE, not 'new'" || fail "unit: an empty base set was read as novelty"
+  grep -q "NEW TO THIS PR" <<<"$out2" && fail "unit: an empty base set still produced a NEW list" || pass "unit: no NEW list when the base set is empty"
+  out3="$(report_tree_attribution "$TMP/attr-none" "$TMP/attr-main" python-ci.yml main)"
+  grep -q "This attribution is UNKNOWN" <<<"$out3" && pass "unit: no lane nodeid is UNKNOWN, not 'nothing new'" || fail "unit: an empty lane set was not reported as UNKNOWN"
+  unset -f say_err
+else
+  fail "report_tree_attribution is missing from the rail — the attribution block was reverted"
+fi
 
 # (l) A CONFLICTED PR IS REFUSED LOUDLY, before any CI work. GitHub cannot compute
 # a merge, so there is no evaluated tree; and the stale merge ref it leaves behind
@@ -5422,8 +5494,8 @@ run_admin_here 42 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "all five in-flight spellings stay PENDING and merge on a green base (exit 0)" \
   || fail "an in-flight spelling was reddened (exit $rc): $(sed -n '1,5p' "$SCEN/err" 2>/dev/null)"
-grep -q "evaluated tree GREEN" "$SCEN/out" && grep -q "pending 5" "$SCEN/out" \
-  && pass "…and all five are COUNTED as pending, not red" \
+grep -q "evaluated tree UNKNOWN" "$SCEN/out" && grep -q "pending 5" "$SCEN/out" \
+  && pass "…and all five are COUNTED as pending, not red — the surface reads UNKNOWN, never GREEN (#5215)" \
   || fail "the in-flight count is wrong: $(grep -m1 'evaluated tree' "$SCEN/out")"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge happened" || fail "no merge attempted"
 
