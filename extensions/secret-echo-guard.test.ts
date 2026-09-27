@@ -28,10 +28,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import secretEchoGuard, {
+	LABEL_VALUE_REPLACEMENT,
 	MAX_DETAILS_DEPTH,
+	MAX_SOURCE_FILE_BYTES,
 	MIN_SECRET_LENGTH,
 	SECRET_ECHO_GUARD_ENTRY_TYPE,
 	SECRET_ECHO_GUARD_LOG,
+	_secretEchoGuardCounters,
 	_setSecretEchoGuardHooksForTest,
 	_resetSecretEchoGuardAnnouncementsForTest,
 	_resetSecretEchoGuardCacheForTest,
@@ -48,7 +51,9 @@ import secretEchoGuard, {
 	loadStaticRegistry,
 	normalizeSecretValues,
 	parseEnvFile,
+	redactDetails,
 	redactString,
+	redactionMarker,
 	secretEchoGuardActive,
 } from "./secret-echo-guard.ts";
 
@@ -402,11 +407,13 @@ test("ARRAY content (the verified read/bash shape) is redacted", () => {
 	equal(content[0].text, `key=[REDACTED-SECRET:tortoise-config.json#apiKey] done`);
 	ok(!JSON.stringify(returned).includes(TORTOISE_KEY));
 });
-test("STRING content (defensive shape) is redacted", () => {
+test("STRING content (defensive shape) is CONVERTED to the array shape pi can consume", () => {
 	resetEverything();
 	const { returned } = runHandler(toolResultEvent({ content: `key=${TORTOISE_KEY}` }));
 	ok(returned);
-	equal((returned as { content: string }).content, `key=[REDACTED-SECRET:tortoise-config.json#apiKey]`);
+	const content = (returned as { content: Array<{ type: string; text: string }> }).content;
+	ok(Array.isArray(content), "pi's normalizeToolResultImages calls content.some(...) — a bare string would crash it");
+	equal(content[0].text, `key=[REDACTED-SECRET:tortoise-config.json#apiKey]`);
 });
 test("non-text content parts and extra fields are preserved BY REFERENCE", () => {
 	resetEverything();
@@ -666,6 +673,250 @@ test("gate: SECRET_ECHO_GUARD=0 registers NOTHING; default is ON", () => {
 		if (previous === undefined) delete process.env.SECRET_ECHO_GUARD;
 		else process.env.SECRET_ECHO_GUARD = previous;
 	}
+});
+
+// ── Adversarial review regressions (#5109, PR #1502) ─────────────────────────────────────────────
+
+/** Cycle-safe "does this structure still hold the raw value?" scan. */
+function deepContains(node: unknown, needle: string, seen = new Set<object>()): boolean {
+	if (typeof node === "string") return node.includes(needle);
+	if (node === null || typeof node !== "object") return false;
+	if (seen.has(node)) return false;
+	seen.add(node);
+	for (const value of Object.values(node as Record<string, unknown>)) if (deepContains(value, needle, seen)) return true;
+	return false;
+}
+
+console.log("\nP1 — the harvest must read `details`, where the full text actually lives");
+test("an unsourced .env secret that lives ONLY in details.diff is harvested and redacted", () => {
+	resetEverything();
+	const fresh = "UNSOURCED-DOTENV-SECRET-0123456789";
+	const { returned } = runHandler(
+		toolResultEvent({
+			toolName: "edit",
+			input: { path: "/repo/sub/.env" },
+			content: [{ type: "text", text: "Successfully edited /repo/sub/.env" }],
+			details: { diff: `+OPENROUTER_API_KEY=${fresh}`, patch: `+OPENROUTER_API_KEY=${fresh}`, firstChangedLine: 1 },
+		}),
+	);
+	ok(returned, "a details-only unsourced value must produce a patch");
+	ok(!JSON.stringify(returned).includes(fresh), "the details-only value must be gone");
+	ok(!deepContains(returned, fresh));
+});
+test("an unsourced .env secret in details.truncation.content (a truncated read) is harvested", () => {
+	resetEverything();
+	const fresh = "TRUNCATED-READ-ENV-KEY-0123456789";
+	const { returned } = runHandler(
+		toolResultEvent({
+			input: { path: "/repo/tortoise/.env" },
+			content: [{ type: "text", text: "… (truncated)" }],
+			details: { truncation: { content: `JEV_API_KEY=${fresh}\n`, truncated: true, truncatedBy: "lines" } },
+		}),
+	);
+	ok(returned);
+	ok(!deepContains(returned, fresh));
+});
+
+console.log("\nP2 — aliasing and cycles (the WeakSet guard leaked the second reference)");
+test("an ALIASED subtree is redacted in EVERY reference, and both resolve to one replacement", () => {
+	resetEverything();
+	const shared = [{ type: "text", text: `inner ${TORTOISE_KEY}` }];
+	const details = { a: shared, b: shared };
+	const { returned } = runHandler(toolResultEvent({ content: [{ type: "text", text: "clean" }], details }));
+	ok(returned);
+	const out = returned as { details: { a: Array<{ text: string }>; b: Array<{ text: string }> } };
+	ok(!out.details.a[0].text.includes(TORTOISE_KEY), "first reference");
+	ok(!out.details.b[0].text.includes(TORTOISE_KEY), "second reference must be redacted too");
+	strictEqual(out.details.a, out.details.b, "the memoized replacement is shared by both references");
+});
+test("a CYCLIC details containing a secret redacts the back-edge and preserves the cycle", () => {
+	resetEverything();
+	// A TWO-node cycle matters: `b` has no string of its own, so without cycle detection pass 1
+	// marks it CLEAN and pass 2 would return the ORIGINAL `b` (whose `next` is the original,
+	// still-secret `a`) — the back-edge is where the value escapes. A self-cycle does not exercise
+	// this, because the node carrying the value is already marked dirty.
+	const a: Record<string, unknown> = { name: "a", text: `x ${AUTH_KEY}` };
+	const b: Record<string, unknown> = { name: "b", next: a };
+	a.self = b;
+	const { returned } = runHandler(toolResultEvent({ content: [{ type: "text", text: "clean" }], details: { root: a } }));
+	ok(returned, "a cyclic details must not hang and must produce a patch");
+	const out = returned as { details: { root: Record<string, unknown> } };
+	ok(!deepContains(out.details, AUTH_KEY), "no reachable path may still hold the value");
+	strictEqual((out.details.root.self as Record<string, unknown>).next, out.details.root, "the cycle is preserved through rebuilt containers");
+});
+test("a shallow cycle is terminated by the cycle guard, NOT mis-reported as depth-bounded (M2)", () => {
+	// Deleting the `visiting` registration does not leak here (depth-bounding still terminates the
+	// recursion), so the observable difference is that a shallow cycle is walked 32 times and falsely
+	// trips the DEPTH bound. This pins the guard by its real effect.
+	const values = normalizeSecretValues([{ value: AUTH_KEY, label: "l" }]);
+	const a: Record<string, unknown> = { text: `x ${AUTH_KEY}` };
+	a.self = a;
+	const out = redactDetails({ root: a }, values, new Map());
+	strictEqual(out.bounded, false, "a cycle must not be mistaken for deep nesting");
+	ok(!deepContains(out.value, AUTH_KEY));
+});
+
+test("a throwing `details` walk must NOT discard the already-successful `content` redaction", () => {
+	resetEverything();
+	const hostile = {} as Record<string, unknown>;
+	Object.defineProperty(hostile, "boom", {
+		enumerable: true,
+		get() {
+			throw new Error("details walk exploded");
+		},
+	});
+	const { returned } = runHandler(toolResultEvent({ content: [{ type: "text", text: `k=${TORTOISE_KEY}` }], details: hostile }));
+	ok(returned, "the content patch was computed and must be emitted even though details failed");
+	const patch = returned as { content?: Array<{ text: string }>; details?: unknown };
+	strictEqual(patch.details, undefined, "details are left as the tool produced them (fail open)");
+	ok(!JSON.stringify(patch.content).includes(TORTOISE_KEY), "the content redaction survived");
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "the partial failure is recorded, never silent");
+	strictEqual((entry.data as { detailsRedactionFailed: boolean }).detailsRedactionFailed, true);
+	for (const line of consoleErrors) ok(!line.includes(TORTOISE_KEY), "the diagnostic must be redacted");
+});
+
+test("the error NAME is preserved in the diagnostic (M3)", () => {
+	resetEverything();
+	const custom = new Error("ordinary message");
+	custom.name = "CustomGuardError";
+	const hostile = {} as Record<string, unknown>;
+	Object.defineProperty(hostile, "boom", {
+		enumerable: true,
+		get() {
+			throw custom;
+		},
+	});
+	runHandler(toolResultEvent({ content: [{ type: "text", text: "clean" }], details: hostile }));
+	ok(consoleErrors.some((line) => line.includes("CustomGuardError")), "errName must return the real name");
+});
+test("a secret carried in error.name is redacted from the diagnostic", () => {
+	resetEverything();
+	const named = new Error("ordinary message");
+	named.name = TORTOISE_KEY;
+	const hostile = {} as Record<string, unknown>;
+	Object.defineProperty(hostile, "boom", {
+		enumerable: true,
+		get() {
+			throw named;
+		},
+	});
+	runHandler(toolResultEvent({ content: [{ type: "text", text: "clean" }], details: hostile }));
+	for (const line of consoleErrors) ok(!line.includes(TORTOISE_KEY), "error.name must be inside the redaction");
+});
+
+console.log("\nP2 — labels must not carry a value into the record or the in-band marker (M6)");
+test("a value appearing in a label is scrubbed from the label, the marker and the hits", () => {
+	const leaky = normalizeSecretValues([
+		{ value: TORTOISE_KEY, label: "tortoise-config.json#apiKey" },
+		{ value: AUTH_KEY, label: `config.json#${TORTOISE_KEY}.clientSecret` },
+	]);
+	const auth = leaky.find((entry) => entry.value === AUTH_KEY)!;
+	ok(auth.label.includes(LABEL_VALUE_REPLACEMENT), "the label carries the scrub token");
+	ok(!auth.label.includes(TORTOISE_KEY), "the label must not carry the value");
+	ok(!redactionMarker(auth.label).includes(TORTOISE_KEY), "the in-band marker must not carry it either");
+	const hits = new Map<string, number>();
+	const out = redactString(`v=${TORTOISE_KEY} w=${AUTH_KEY}`, leaky, hits);
+	ok(!out.includes(TORTOISE_KEY) && !out.includes(AUTH_KEY), "no value survives the redaction text");
+	for (const label of hits.keys()) ok(!label.includes(TORTOISE_KEY), "no recorded hit label may carry a value");
+});
+
+console.log("\nP2 — the details walk is a RUNTIME bound, not just a redaction bound (M4)");
+test("the NODE budget is a real bound (a small maxNodes marks the walk bounded)", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	const details = { items: Array.from({ length: 50 }, (_, i) => `plain text ${i}`) };
+	const out = redactDetails(details, values, new Map(), { maxNodes: 5, maxMs: 60_000 });
+	strictEqual(out.bounded, true, "exhausting the node budget must set bounded");
+	strictEqual(out.changed, false);
+});
+test("a pathological details completes quickly and is REPORTED as bounded, never silently full", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	// 400k keys is well under the node budget, so ONLY the wall-clock guard can bound this walk —
+	// the test measures the real runtime guard, not the size guard. (V8's `Object.keys` enumeration
+	// is itself O(n) and uninterruptible; this asserts the guard does not then walk every key.)
+	const wide: Record<string, string> = {};
+	for (let i = 0; i < 400_000; i++) wide["k" + i] = "ordinary value " + i;
+	const started = Date.now();
+	const out = redactDetails(wide, values, new Map(), { maxMs: 100 });
+	const elapsed = Date.now() - started;
+	ok(elapsed < 1_500, `a pathological details must not block for seconds (took ${elapsed}ms)`);
+	strictEqual(out.bounded, true, "a bounded walk must be reported, never silently presented as full");
+});
+
+test("the fleet log written to REAL disk bytes carries no value", () => {
+	resetEverything();
+	const logPath = join(HOME, ".pi", "agent", "state", SECRET_ECHO_GUARD_LOG);
+	try {
+		_setSecretEchoGuardHooksForTest({
+			appendFile: ((path: string, data: string) => writeFileSync(path, data, { flag: "a" })) as never,
+			mkdir: ((path: string) => mkdirSync(path, { recursive: true })) as never,
+		});
+		_resetSecretEchoGuardCacheForTest();
+		runHandler(toolResultEvent({ content: [{ type: "text", text: `${JEV_KEY} ${AUTH_KEY}` }], details: { truncation: { content: `${JEV_KEY}` } } }));
+		const bytes = readFileSync(logPath, "utf8");
+		ok(bytes.includes("jev-config.json#apiKey"), "the record did get written to disk");
+		for (const secret of [JEV_KEY, AUTH_KEY, TORTOISE_KEY, PROCESS_ENV_KEY]) {
+			ok(!bytes.includes(secret), `the on-disk fleet log leaked ${secret}`);
+		}
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+
+console.log("\nThe 9 previously-uncaught mutations");
+test("M8: the empty-registry fast path writes NOTHING even for a bounded-depth details", () => {
+	resetEverything();
+	try {
+		_setSecretEchoGuardHooksForTest({ homedir: () => join(HOME, "nowhere"), env: () => ({}) });
+		_resetSecretEchoGuardCacheForTest();
+		let deep: Record<string, unknown> = { leaf: "ordinary" };
+		for (let i = 0; i < MAX_DETAILS_DEPTH + 5; i++) deep = { next: deep };
+		const { returned } = runHandler(toolResultEvent({ content: [{ type: "text", text: "ordinary" }], details: deep }));
+		strictEqual(returned, undefined);
+		strictEqual(appendEntryCalls.length, 0, "an empty registry must short-circuit before the bounded-details record");
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+test("M9: a source file larger than MAX_SOURCE_FILE_BYTES is SKIPPED without being read", () => {
+	const oversize = "OVERSIZE-SOURCE-SECRET-0123456789";
+	let readCalls = 0;
+	const options = {
+		homedir: HOME,
+		cwd: join(HOME, "no-cwd-env-file"),
+		env: controlledEnv,
+		readFile: (() => {
+			readCalls++;
+			return JSON.stringify({ apiKey: oversize });
+		}) as never,
+		readdir: (() => []) as never,
+		stat: (() => ({ mtimeMs: 1, size: MAX_SOURCE_FILE_BYTES + 1 })) as never,
+	};
+	const values = loadStaticRegistry(options as never);
+	ok(!values.some((entry) => entry.value === oversize), "an over-size source must be skipped");
+	strictEqual(readCalls, 0, "the size check must skip the file BEFORE reading it");
+});
+test("M10: the harvest cap stops after maxHarvested values", () => {
+	const into: Array<{ value: string; label: string }> = [];
+	const text = Array.from({ length: 5 }, (_, i) => `API_KEY_${i}=HARVEST-CAP-SECRET-${i}-0123456789`).join("\n");
+	const added = harvestDotenvSecrets(text, into, "app.env", MIN_SECRET_LENGTH, 2);
+	strictEqual(added, 2, "the cap must stop the harvest");
+	strictEqual(into.length, 2);
+});
+test("M11: the dotenv pre-check short-circuits ordinary text (observed, not inferred)", () => {
+	_secretEchoGuardCounters.dotenvPrecheckSkips = 0;
+	const into: Array<{ value: string; label: string }> = [];
+	strictEqual(harvestDotenvSecrets("const a=1\nfunction f(){return 2}\n", into, "x.ts"), 0);
+	strictEqual(_secretEchoGuardCounters.dotenvPrecheckSkips, 1, "the cheap pre-check must have fired");
+});
+test("the harvest reads ADDED and REMOVED dotenv lines out of a unified diff", () => {
+	const into: Array<{ value: string; label: string }> = [];
+	const added = harvestDotenvSecrets(`@@ -1 +1 @@\n-OLD_KEY=OLD-DIFF-SECRET-0123456789\n+NEW_KEY=NEW-DIFF-SECRET-0123456789\n`, into, "app.env");
+	strictEqual(added, 2);
+	ok(into.some((entry) => entry.value === "OLD-DIFF-SECRET-0123456789"));
+	ok(into.some((entry) => entry.value === "NEW-DIFF-SECRET-0123456789"));
 });
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────

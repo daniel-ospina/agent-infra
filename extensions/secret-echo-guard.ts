@@ -32,10 +32,15 @@
 //   • no code path receives a secret value for any purpose other than exact-match replacement;
 //   • the durable record and the fleet log carry LABELS and COUNTS only (`env:DEEPSEEK_API_KEY`,
 //     `tortoise-config.json#apiKey`), never values;
-//   • internal errors are reported by NAME plus a message that is itself run back through the
-//     redactor before it is logged. If redacting the diagnostic fails, nothing but the name is
-//     logged. A silent guard failure is indistinguishable from a working one, so we never suppress
-//     the fact that a failure happened — only the possibility that the failure text carries a value.
+//   • internal errors are reported by NAME plus a message, and the COMPOSED string (`name: message`)
+//     is run back through the redactor before it is logged — the name is inside the redaction, not
+//     outside it. A silent guard failure is indistinguishable from a working one, so we never
+//     suppress the fact that a failure happened — only the possibility that the failure text carries
+//     a value. If redaction itself fails, nothing but a fixed placeholder is logged.
+//   • labels (the non-secret SOURCE names written to the record and embedded in the in-band
+//     `[REDACTED-SECRET:<label>]` marker) are themselves scrubbed against the registered values, so a
+//     secret that appears as a JSON KEY/ancestor (and therefore inside a label) is not written back
+//     out through the label or the marker.
 //
 // FAIL CLOSED ON THE DECISION, FAIL OPEN ON THE TURN
 // --------------------------------------------------
@@ -53,8 +58,12 @@
 // owner's key rotation resets the clock but does not rewrite history); DOES NOT stop a secret
 // reaching a NON-pi log (a shell history, a vendor's request log, a CI log, another agent's own
 // session file if it runs outside this fleet); DOES NOT protect a value that is never registered
-// (see the registry's documented gaps below); and DOES NOT redact the model's own REQUEST payload
-// or the assistant's own text — this is the tool-result persistence path only.
+// (see the registry's documented gaps below); and DOES NOT redact the model's own REQUEST payload,
+// the assistant's own text, or **tool-call ARGUMENTS** — an agent that types a secret into a
+// `write`/`bash`/`edit` argument leaks it, because those arguments are persisted verbatim in the
+// SAME transcript and this hook cannot patch them (the runner's patch contract carries only
+// `content`/`details`/`isError`/`usage`; `input` is the executed call's argument object, not a
+// patchable field). This is the tool-result persistence path only.
 //
 // REGISTRY — WHAT IS COVERED, AND WHAT IS NOT
 // -------------------------------------------
@@ -80,6 +89,11 @@
 //   4. `.env`-style files at a documented candidate list: `SECRET_ECHO_GUARD_ENV_FILES`
 //      (colon-separated, overrides), `~/.pi/agent/.env`, `<cwd>/.env`, `$AGENT_INFRA_PATH/.env`,
 //      `$TORTOISE_REPO/.env` (all relative to the seam values; only secret-named keys are taken).
+//      ⚠️ `$TORTOISE_REPO/.env` is CONDITIONAL on `TORTOISE_REPO` being set — where it is unset
+//      (the state on this machine) that candidate is INERT, and the file's values are covered ONLY
+//      by the source-5 harvest from the result being inspected. That is why the harvest must read
+//      `details` too: for a truncated `read` the full text is in `details.truncation.content`, and
+//      for an `edit` the whole change is in `details.diff`/`details.patch`, never in `content`.
 //   5. Anything that LOOKS like a dotenv assignment in the tool result being inspected
 //      (`harvestDotenvSecrets`) — but ONLY when the tool was aimed at an env-like FILE (a `read`
 //      whose `input.path` basenames to `.env`/`*.env`/`.env.*`, or a `bash` command that names such a
@@ -165,6 +179,16 @@ export const SECRET_ECHO_GUARD_LOG = "secret-echo-guard-redactions.log";
 /** Runaway guards, not expected sizes. Hitting either is RECORDED and announced, never silent. */
 export const MAX_DETAILS_DEPTH = 32;
 export const MAX_DETAILS_NODES = 1_000_000;
+/**
+ * Wall-clock runaway guard for the `details` walk. The node budget alone still bounds the NUMBER of
+ * visits, but a visit's cost scales with the string lengths it scans, so 1M visits measured ~7 s even
+ * on short strings. This caps the synchronous event-loop block. It is the SECONDARY bound: a walk
+ * that finishes inside the node budget under this deadline is fully redacted, and only a genuinely
+ * pathological `details` trips it. Checked every `DETAILS_BUDGET_CHECK_INTERVAL` nodes so `Date.now()`
+ * is not called per node. Hitting it sets `bounded`, which is RECORDED and announced.
+ */
+export const MAX_DETAILS_WALK_MS = 2_000;
+const DETAILS_BUDGET_CHECK_INTERVAL = 1_024;
 /** Source files larger than this are skipped (a config is kilobytes; this is a sanity bound). */
 export const MAX_SOURCE_FILE_BYTES = 512 * 1024;
 /** Cap on content-HARVESTED values retained per process (sources 1-4 are not capped). */
@@ -535,6 +559,31 @@ export function loadStaticRegistry(options: RegistryOptions, minLength = MIN_SEC
 	return values;
 }
 
+/**
+ * The label-safe replacement for a value found INSIDE a label. Deliberately contains no value and
+ * no per-value detail: it only says "something registered appeared in this label".
+ */
+export const LABEL_VALUE_REPLACEMENT = "<redacted>";
+
+/**
+ * Scrub registered values out of a non-secret SOURCE label.
+ *
+ * A label is built from file/field NAMES (`tortoise-config.json#apiKey`), and a name is normally not
+ * a value. But a JSON KEY can be a secret: `{ "<a registered value>": { "clientSecret": "..." } }`
+ * yields the label `<file>#<value>.clientSecret`, which then (a) is embedded in the in-band
+ * `[REDACTED-SECRET:<label>]` marker and (b) is written to the durable record and the fleet log. A
+ * guard that does that has moved the leak into its own proof. Every label is therefore run through
+ * an exact-match scrub against the full registered set before it is used.
+ */
+export function sanitizeLabel(label: string, values: readonly SecretValue[]): string {
+	let out = label;
+	for (const { value } of values) {
+		if (value.length === 0 || !out.includes(value)) continue;
+		out = out.split(value).join(LABEL_VALUE_REPLACEMENT);
+	}
+	return out;
+}
+
 /** Dedupe by value (first label wins) and sort LONGEST-FIRST so one secret can never break another. */
 export function normalizeSecretValues(values: SecretValue[]): SecretValue[] {
 	const byValue = new Map<string, SecretValue>();
@@ -542,7 +591,11 @@ export function normalizeSecretValues(values: SecretValue[]): SecretValue[] {
 		if (!value) continue;
 		if (!byValue.has(value)) byValue.set(value, { value, label });
 	}
-	return [...byValue.values()].sort((a, b) => b.value.length - a.value.length);
+	const normalized = [...byValue.values()].sort((a, b) => b.value.length - a.value.length);
+	// Labels are scrubbed against the FULL set, so a value appearing in another value's label (or
+	// its own) cannot be written back out through the record or the in-band marker.
+	for (const entry of normalized) entry.label = sanitizeLabel(entry.label, normalized);
+	return normalized;
 }
 
 // ── Redaction ───────────────────────────────────────────────────────────────────────────────────
@@ -583,14 +636,18 @@ export interface RedactOutcome<T> {
  *
  * VERIFIED SHAPE (installed pi build): for BOTH `read` and `bash`, `content` is
  * `[{ type: "text", text: "<string>" }]` — an array of `TextContent | ImageContent` parts, never a
- * plain string. The string branch below is defensive only (custom tools and future shapes), and the
- * array branch preserves every non-text part and every extra field BY REFERENCE, so an unredacted
- * result comes back as the SAME array object (`changed: false`) and the handler returns `undefined`.
+ * plain string. The string branch below is defensive only (custom tools and future shapes): pi's own
+ * `normalizeToolResultImages` calls `content.some(...)`, so a bare-string patch would CRASH pi. It
+ * therefore CONVERTS a redacted string to the array shape pi can consume instead of returning one it
+ * cannot. The array branch preserves every non-text part and every extra field BY REFERENCE, so an
+ * unredacted result comes back as the SAME array object (`changed: false`) and the handler returns
+ * `undefined`.
  */
 export function redactContent(content: unknown, values: readonly SecretValue[], hits: HitCounts): RedactOutcome<unknown> {
 	if (typeof content === "string") {
 		const redacted = redactString(content, values, hits);
-		return { value: redacted, changed: redacted !== content };
+		if (redacted === content) return { value: content, changed: false };
+		return { value: [{ type: "text", text: redacted }], changed: true };
 	}
 	if (!Array.isArray(content)) return { value: content, changed: false };
 
@@ -625,64 +682,207 @@ export function redactContent(content: unknown, values: readonly SecretValue[], 
  *   • `subagent` → `{ results: [{ ..., messages: [{ role, content, timestamp }], stderr }] }` — NESTED
  *     agent messages, which is exactly how a child's read of a config becomes a parent's leak.
  * A shallow walk would miss `details.truncation.content` and the nested `subagent` messages, so the
- * walk is recursive. It is bounded (depth/nodes) and cycle-safe; hitting a bound is REPORTED by the
- * caller, never silent. Unchanged subtrees are returned BY REFERENCE so an ordinary result is
- * byte-identical and `changed` stays false.
+ * walk is recursive.
+ *
+ * ALIASES AND CYCLES: a single-pass `WeakSet` guard that returns the ORIGINAL node on a repeat visit
+ * redacts the first reference and leaves every other one raw (`{a: shared, b: shared}` leaked the
+ * secret through `b`), and a cycle lost its back-edge redaction the same way. The walk is therefore
+ * TWO-PASS: pass 1 marks every subtree that CONTAINS a registered value (cycle-safe, bounded), and
+ * pass 2 REBUILDS only dirty subtrees while memoizing each rebuilt container (`Map<object, unknown>`),
+ * so an aliased or cyclic reference resolves to the SAME rebuilt container. Clean subtrees are
+ * returned BY REFERENCE so an ordinary result is byte-identical and `changed` stays false.
+ *
+ * BOUNDS: pass 1 stops iterating siblings the moment the node budget or the wall-clock budget is
+ * spent (a `for` loop, never `.map`), so a pathological `details` cannot make the walk O(total nodes)
+ * after the budget is exhausted. Hitting a bound sets `bounded: true`, which the caller RECORDS and
+ * ANNOUNCES — a bounded walk is never silently presented as a full redaction.
  */
+export interface DetailsWalkLimits {
+	/** Override the node budget (tests). Default `MAX_DETAILS_NODES`. */
+	maxNodes?: number;
+	/** Override the wall-clock budget in ms (tests). Default `MAX_DETAILS_WALK_MS`. */
+	maxMs?: number;
+}
+
+interface DetailsWalkBudget {
+	nodes: number;
+	deadline: number;
+	bounded: boolean;
+}
+
+function newDetailsBudget(limits: DetailsWalkLimits = {}): DetailsWalkBudget {
+	return {
+		nodes: limits.maxNodes ?? MAX_DETAILS_NODES,
+		deadline: Date.now() + (limits.maxMs ?? MAX_DETAILS_WALK_MS),
+		bounded: false,
+	};
+}
+
+/** True when the node or wall-clock budget is spent. Sets `bounded` so no caller can forget to. */
+function detailsBudgetExhausted(budget: DetailsWalkBudget): boolean {
+	if (budget.nodes <= 0) {
+		budget.bounded = true;
+		return true;
+	}
+	if (budget.nodes % DETAILS_BUDGET_CHECK_INTERVAL === 0 && Date.now() >= budget.deadline) {
+		budget.bounded = true;
+		return true;
+	}
+	return false;
+}
+
+function containsRegisteredValue(text: string, values: readonly SecretValue[]): boolean {
+	for (const { value } of values) {
+		if (value.length !== 0 && text.includes(value)) return true;
+	}
+	return false;
+}
+
+interface DetailsDirtyState extends DetailsWalkBudget {
+	dirty: WeakSet<object>;
+	clean: WeakSet<object>;
+	visiting: WeakSet<object>;
+	sawCycle: boolean;
+}
+
+/** Pass 1 — does this subtree contain any registered value? Cycle-safe; bounded; never throws by itself. */
+function markDirtyDetails(node: unknown, values: readonly SecretValue[], state: DetailsDirtyState, depth: number): boolean {
+	if (detailsBudgetExhausted(state)) return false;
+	state.nodes--;
+	if (typeof node === "string") return containsRegisteredValue(node, values);
+	if (node === null || typeof node !== "object") return false;
+	if (depth >= MAX_DETAILS_DEPTH) {
+		state.bounded = true;
+		return false;
+	}
+	if (state.dirty.has(node)) return true;
+	if (state.clean.has(node)) return false;
+	if (state.visiting.has(node)) {
+		// Back-edge. `dirty` is still correct as an OR over every directly-inspected string (every
+		// reachable node is visited before any back-edge to it), but the per-node CLEAN marking cannot
+		// be trusted inside a cycle, so pass 2 rebuilds everything when a cycle was seen.
+		state.sawCycle = true;
+		return false;
+	}
+	state.visiting.add(node);
+	let dirty = false;
+	let complete = true;
+	if (Array.isArray(node)) {
+		for (let index = 0; index < node.length; index++) {
+			if (detailsBudgetExhausted(state)) {
+				complete = false;
+				break;
+			}
+			if (markDirtyDetails(node[index], values, state, depth + 1)) dirty = true;
+		}
+	} else {
+		const source = node as Record<string, unknown>;
+		for (const key of Object.keys(source)) {
+			if (detailsBudgetExhausted(state)) {
+				complete = false;
+				break;
+			}
+			if (markDirtyDetails(source[key], values, state, depth + 1)) dirty = true;
+		}
+	}
+	state.visiting.delete(node);
+	if (dirty) state.dirty.add(node);
+	else if (complete) state.clean.add(node);
+	return dirty;
+}
+
+/**
+ * Pass 2 — rebuild only dirty subtrees (or all of them when a cycle was seen), memoizing each
+ * rebuilt container BEFORE recursing so aliases and back-edges resolve to the same replacement.
+ */
+function rebuildDetails(
+	node: unknown,
+	values: readonly SecretValue[],
+	hits: HitCounts,
+	state: DetailsDirtyState,
+	memo: Map<object, unknown>,
+	depth: number,
+): unknown {
+	if (typeof node === "string") return redactString(node, values, hits);
+	if (node === null || typeof node !== "object") return node;
+	if (memo.has(node)) return memo.get(node);
+	if (!state.sawCycle && !state.dirty.has(node)) return node;
+	if (depth >= MAX_DETAILS_DEPTH) return node;
+	if (Array.isArray(node)) {
+		const next: unknown[] = new Array(node.length);
+		memo.set(node, next);
+		for (let index = 0; index < node.length; index++) {
+			next[index] = rebuildDetails(node[index], values, hits, state, memo, depth + 1);
+		}
+		return next;
+	}
+	const source = node as Record<string, unknown>;
+	const next: Record<string, unknown> = {};
+	memo.set(node, next);
+	for (const key of Object.keys(source)) {
+		next[key] = rebuildDetails(source[key], values, hits, state, memo, depth + 1);
+	}
+	return next;
+}
+
 export function redactDetails(
 	details: unknown,
 	values: readonly SecretValue[],
 	hits: HitCounts,
+	limits: DetailsWalkLimits = {},
 ): RedactOutcome<unknown> & { bounded: boolean } {
-	const budget = { nodes: MAX_DETAILS_NODES, bounded: false };
-	const seen = new WeakSet<object>();
-	const result = walkDetails(details, values, hits, budget, seen, 0);
-	return { ...result, bounded: budget.bounded };
+	const state: DetailsDirtyState = {
+		...newDetailsBudget(limits),
+		dirty: new WeakSet<object>(),
+		clean: new WeakSet<object>(),
+		visiting: new WeakSet<object>(),
+		sawCycle: false,
+	};
+	const dirty = markDirtyDetails(details, values, state, 0);
+	if (!dirty) return { value: details, changed: false, bounded: state.bounded };
+	const value = rebuildDetails(details, values, hits, state, new Map<object, unknown>(), 0);
+	return { value, changed: true, bounded: state.bounded };
 }
 
-function walkDetails(
+/**
+ * Bounded walk collecting every string reachable in `node`. Used by the source-5 harvest to read
+ * `details` — where a truncated `read` puts the FULL text (`details.truncation.content`) and an
+ * `edit` puts the whole change (`details.diff`/`details.patch`) — BEFORE the redaction pass, so the
+ * harvested values feed the same pass. Hitting the bound sets `budget.bounded`, which is carried
+ * into the record.
+ */
+function collectDetailsStrings(
 	node: unknown,
-	values: readonly SecretValue[],
-	hits: HitCounts,
-	budget: { nodes: number; bounded: boolean },
-	seen: WeakSet<object>,
+	out: string[],
+	budget: DetailsWalkBudget,
+	visited: WeakSet<object>,
 	depth: number,
-): RedactOutcome<unknown> {
-	if (budget.nodes-- <= 0) {
-		budget.bounded = true;
-		return { value: node, changed: false };
-	}
+): void {
+	if (detailsBudgetExhausted(budget)) return;
+	budget.nodes--;
 	if (typeof node === "string") {
-		const redacted = redactString(node, values, hits);
-		return { value: redacted, changed: redacted !== node };
+		out.push(node);
+		return;
 	}
-	if (node === null || typeof node !== "object") return { value: node, changed: false };
+	if (node === null || typeof node !== "object") return;
 	if (depth >= MAX_DETAILS_DEPTH) {
 		budget.bounded = true;
-		return { value: node, changed: false };
+		return;
 	}
-	if (seen.has(node)) return { value: node, changed: false };
-	seen.add(node);
-
+	if (visited.has(node)) return;
+	visited.add(node);
 	if (Array.isArray(node)) {
-		let changed = false;
-		const next = node.map((item) => {
-			const child = walkDetails(item, values, hits, budget, seen, depth + 1);
-			if (child.changed) changed = true;
-			return child.value;
-		});
-		return { value: changed ? next : node, changed };
+		for (let index = 0; index < node.length; index++) {
+			if (detailsBudgetExhausted(budget)) return;
+			collectDetailsStrings(node[index], out, budget, visited, depth + 1);
+		}
+		return;
 	}
-
-	let changed = false;
 	const source = node as Record<string, unknown>;
-	const next: Record<string, unknown> = {};
 	for (const key of Object.keys(source)) {
-		const child = walkDetails(source[key], values, hits, budget, seen, depth + 1);
-		if (child.changed) changed = true;
-		next[key] = child.value;
+		if (detailsBudgetExhausted(budget)) return;
+		collectDetailsStrings(source[key], out, budget, visited, depth + 1);
 	}
-	return { value: changed ? next : node, changed };
 }
 
 /**
@@ -722,6 +922,24 @@ export function envSourceFromInput(input: unknown): string | undefined {
 }
 
 /**
+ * Test-only observability for the cheap pre-check. The pre-check is a pure OPTIMISATION — deleting
+ * it changes no output, only cost — so its regression pin has to observe that it fired rather than
+ * infer it from behaviour. See the `DOTENV_PRECHECK_RE` mutation test.
+ */
+export const _secretEchoGuardCounters = { dotenvPrecheckSkips: 0 };
+
+/**
+ * Strip a unified-diff line marker from each line before the dotenv parse. An `edit` result's
+ * `details.diff`/`details.patch` are unified diffs, so an added or removed `.env` assignment arrives
+ * as `+KEY=value` / `-KEY=value`; without this the parser (and the pre-check) see the leading `+`/`-`
+ * and silently miss the assignment. Env keys cannot begin with `+`/`-`, and `parseEnvFile` already
+ * trims spaces, so this is lossless for real `.env` text.
+ */
+function stripDiffMarkers(text: string): string {
+	return text.replace(/^[+-]/gm, "");
+}
+
+/**
  * Harvest dotenv-shaped secret assignments out of the text being inspected (registry source 5).
  * Only a `KEY=value` line whose KEY is secret-bearing counts, so ordinary output that happens to
  * contain `=` is untouched. Values are appended to `into` (deduped by the caller's normalize step)
@@ -734,9 +952,13 @@ export function harvestDotenvSecrets(
 	minLength = MIN_SECRET_LENGTH,
 	maxHarvested = MAX_HARVESTED_VALUES,
 ): number {
-	if (!DOTENV_PRECHECK_RE.test(text)) return 0;
+	const candidate = stripDiffMarkers(text);
+	if (!DOTENV_PRECHECK_RE.test(candidate)) {
+		_secretEchoGuardCounters.dotenvPrecheckSkips++;
+		return 0;
+	}
 	let added = 0;
-	for (const { key, value } of parseEnvFile(text)) {
+	for (const { key, value } of parseEnvFile(candidate)) {
 		if (!isSecretValueKey(key, "env")) continue;
 		if (!isUsableSecretValue(value, minLength)) continue;
 		if (into.length >= maxHarvested) break;
@@ -902,12 +1124,19 @@ function sessionInfo(ctx: unknown): { sessionId: string | null; sessionFile: str
 const announced = new Set<string>();
 
 function errName(error: unknown): string {
-	return error instanceof Error ? error.name : "Error";
+	try {
+		if (error instanceof Error && typeof error.name === "string") return error.name;
+	} catch {
+		/* a hostile `name` getter — fall through to the fixed placeholder */
+	}
+	return "Error";
 }
 
 /**
- * Build a diagnostic string that CANNOT carry a registered value: the message is run back through
- * the redactor before it is logged, and if that itself fails nothing but the error NAME is returned.
+ * Build a diagnostic string that CANNOT carry a registered value. The NAME is composed with the
+ * MESSAGE FIRST and the COMPOSED string is run back through the redactor, so a value carried by the
+ * `error.name` (not just the message) is removed before it can reach stderr. If redaction itself
+ * fails, nothing but a fixed placeholder is returned.
  */
 function safeDiagnostic(error: unknown, values: readonly SecretValue[]): string {
 	const name = errName(error);
@@ -917,12 +1146,12 @@ function safeDiagnostic(error: unknown, values: readonly SecretValue[]): string 
 	} catch {
 		message = "";
 	}
+	const composed = message ? `${name}: ${message}` : name;
 	try {
-		message = redactString(message, values, new Map());
+		return redactString(composed, values, new Map());
 	} catch {
-		message = "";
+		return "Error";
 	}
-	return message ? `${name}: ${message}` : name;
 }
 
 // ── The extension ───────────────────────────────────────────────────────────────────────────────
@@ -957,6 +1186,7 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 			// even when the static registry is empty, because an unsourced `.env` is exactly the case
 			// the config/env sources cannot see.
 			const harvested: SecretValue[] = [];
+			const harvestBudget = newDetailsBudget();
 			const sourceName = envSourceFromInput(e.input);
 			if (sourceName) {
 				for (const part of asArray(e.content)) {
@@ -966,6 +1196,13 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					}
 				}
 				if (typeof e.content === "string") harvestDotenvSecrets(e.content, harvested, sourceName);
+				// `details` is where the FULL text lives for a truncated `read` (`details.truncation.content`)
+				// and where an `edit` keeps its whole change (`details.diff`/`details.patch`). Harvesting
+				// only `content` misses the unsourced `.env` exactly when the preview is truncated or the
+				// change is in the diff — and this harvest is the ONLY source that can register it.
+				const detailStrings: string[] = [];
+				collectDetailsStrings(e.details, detailStrings, harvestBudget, new WeakSet<object>(), 0);
+				for (const text of detailStrings) harvestDotenvSecrets(text, harvested, sourceName);
 				if (harvested.length > 0) {
 					retainHarvested(harvested, hooks);
 					// Static-first concatenation: a value already known from a config/env source keeps its
@@ -978,7 +1215,27 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 
 			const hits: HitCounts = new Map();
 			const content = redactContent(e.content, values, hits);
-			const details = redactDetails(e.details, values, hits);
+			// A throw in the `details` walk must NEVER discard a `content` redaction that already
+			// succeeded — the content patch was computed and would otherwise be thrown away with the
+			// whole result (a real leak). Catch the details walk on its own, mark the walk failed/bounded
+			// so the record is loud, and emit the content patch regardless.
+			let details: RedactOutcome<unknown> & { bounded: boolean };
+			let detailsRedactionFailed = false;
+			try {
+				details = redactDetails(e.details, values, hits);
+			} catch (error) {
+				detailsRedactionFailed = true;
+				details = { value: e.details, changed: false, bounded: true };
+				globalThis.console?.error?.(
+					`[secret-echo-guard] details redaction failed; ${
+						content.changed
+							? "the content redaction is still applied, but details are left UNREDACTED"
+							: "details are left UNREDACTED"
+					}: ${safeDiagnostic(error, values)}`,
+				);
+			}
+			// A bounded HARVEST means part of `details` was never inspected for source-5 values either.
+			if (harvestBudget.bounded && !details.bounded) details = { ...details, bounded: true };
 			if (!content.changed && !details.changed && !details.bounded) return undefined;
 
 			const record = {
@@ -992,6 +1249,7 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 				total: hitsTotal(hits),
 				contentRedacted: content.changed,
 				detailsRedacted: details.changed,
+				detailsRedactionFailed,
 				detailsWalkBounded: details.bounded,
 			};
 
