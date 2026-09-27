@@ -1,8 +1,8 @@
 {
   "version": 1,
   "files": {
-    ".github/workflows/ci.yml": "1aee4b1d426ecefc1494ae0e4d30dd275c2941bde5208d1534bc21e5dc412d1e",
+    ".github/workflows/ci.yml": "b806316dacef96acb6450dbd6c5ff7993593f5ef1d3cb631827e52a650f07a29",
     ".github/workflows/node-ci.yml": "cb73d7c7b08516740a667c75771d5d7674f3b42a2c84313ae8c2988fa96a668e",
-    ".github/workflows/ci-main.yml": "559d5740655ffc6a69081b7c041c64711744fb9a69eaa95b4efed6dbdfffd2d7"
+    ".github/workflows/ci-main.yml": "7fc6a4d3b8b55c65b4f4cb6c192f54f9b74d3b6edd5b847dd4b8fb6ab924df63"
   }
 }
