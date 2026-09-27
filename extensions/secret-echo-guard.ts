@@ -31,7 +31,11 @@
 // of a security control. Therefore, by construction:
 //   • no code path receives a secret value for any purpose other than exact-match replacement;
 //   • the durable record and the fleet log carry LABELS and COUNTS only (`env:DEEPSEEK_API_KEY`,
-//     `tortoise-config.json#apiKey`), never values;
+//     `tortoise-config.json#apiKey`) plus the tool/session identity fields, ALL of which are run
+//     through the redactor before they are written — never a raw value. (Identity fields such as
+//     `toolCallId` are provider-supplied and normally opaque, but the guard does not rely on that:
+//     it redacts them like every other outbound string, because a guard that logs a value it
+//     removed has moved the leak into its own proof artifact.)
 //   • internal errors are reported by NAME plus a message, and the COMPOSED string (`name: message`)
 //     is run back through the redactor before it is logged — the name is inside the redaction, not
 //     outside it. A silent guard failure is indistinguishable from a working one, so we never
@@ -45,10 +49,27 @@
 // FAIL CLOSED ON THE DECISION, FAIL OPEN ON THE TURN
 // --------------------------------------------------
 // When a string matches a registered secret it is ALWAYS replaced — there is no "probably" path.
-// When the guard itself fails, it returns `undefined` (no patch), so the tool result is left exactly
-// as the tool produced it rather than being corrupted, and the failure is announced. The residual is
-// explicit and unavoidable: an internal failure means THAT result went to the transcript
-// unredacted. That is why the failure is loud, and why the record carries no values to leak.
+// When the guard itself fails, the result is left exactly as the tool produced it rather than being
+// corrupted, and the failure is announced. The residual is explicit and unavoidable: an internal
+// failure means THAT result went to the transcript unredacted. That is why the failure is loud, and
+// why the record carries no values to leak.
+//
+// EACH WALK IS GUARDED INDEPENDENTLY (hardening of the above). The content harvest, the `details`
+// harvest, the `content` redaction and the `details` redaction are four separate walks; a throw in
+// one must not discard the others' work. The failure mode this closes: a throwing `details` getter
+// used to escape the (unguarded) harvest into the OUTER catch, which returned `undefined` — so a
+// secret that was sitting in `content` was persisted VERBATIM and NOTHING durable was written. Now
+// a failure in one walk is recorded (`*RedactionFailed`/`harvestFailed`), the other walk's
+// successful redaction is still emitted as a partial patch, and the durable record is written
+// whenever ANY failure left data unredacted — a failure is never undetectable after the fact. (The
+// runner merges defined patch fields on this build, so a partial patch is safe.)
+//
+// RESIDUAL, STATED PLAINLY: `content` is redacted PER PART, so one hostile part cannot hide a secret
+// in a sibling part. `details` is NOT per-node tolerant — the rebuild is a coherent two-pass walk over
+// aliased and cyclic structures, and a partially-rebuilt container is not obviously safe. A throwing
+// `details` getter therefore leaves the WHOLE `details` unredacted; `content` is still redacted, the
+// durable record carries `detailsRedactionFailed`/`detailsWalkBounded`, and the pane warns. This is the
+// documented residual of fail-open-on-the-turn, not a silent one.
 //
 // SCOPE — WHAT IT DOES AND DOES NOT PROTECT (honest statement)
 // -----------------------------------------------------------
@@ -92,8 +113,15 @@
 //      ⚠️ `$TORTOISE_REPO/.env` is CONDITIONAL on `TORTOISE_REPO` being set — where it is unset
 //      (the state on this machine) that candidate is INERT, and the file's values are covered ONLY
 //      by the source-5 harvest from the result being inspected. That is why the harvest must read
-//      `details` too: for a truncated `read` the full text is in `details.truncation.content`, and
-//      for an `edit` the whole change is in `details.diff`/`details.patch`, never in `content`.
+//      `details` too. The load-bearing case is `edit`, whose whole change lives in
+//      `details.diff`/`details.patch` and NEVER in `content`; the same is true of any tool that
+//      puts text in `details` only (`task`/`subagent` nested messages, MCP tools, custom tools).
+//      ⛔ CORRECTED PREMISE (an earlier draft of this header overstated it): for `read` and `bash`
+//      the harvest from `details` adds NOTHING. The installed build sets `details = { truncation }`
+//      and `outputText = truncation.content`, so `details.truncation.content` is the SAME already-
+//      TRUNCATED text that `content` carries (and `truncateHead` returns `content: ""` when
+//      `firstLineExceedsLimit`). `read`/`bash` are therefore covered entirely by the `content`
+//      harvest; harvesting `details` is purely additive for tools whose text is details-only.
 //   5. Anything that LOOKS like a dotenv assignment in the tool result being inspected
 //      (`harvestDotenvSecrets`) — but ONLY when the tool was aimed at an env-like FILE (a `read`
 //      whose `input.path` basenames to `.env`/`*.env`/`.env.*`, or a `bash` command that names such a
@@ -110,6 +138,15 @@
 //
 // NOT COVERED (stated rather than papered over):
 //   • values SHORTER than `MIN_SECRET_LENGTH` (a deliberate floor — see its doc comment);
+//   • ⛔ a CREDENTIAL EMBEDDED IN A URL, because `NON_SECRET_TAIL_TOKENS` treats a trailing
+//     `url`/`uri` as a POINTER: `DATABASE_URL=postgres://user:pass@host/db`,
+//     `REDIS_URL=redis://:pass@host`, `SENTRY_DSN=https://key@...` are therefore never registered,
+//     and an `https://user:pass@host` in prose is not registered either. Latent on this machine
+//     (no such variable is set), documented rather than special-cased: a URL is a pointer in the
+//     ordinary case, and registering URL values wholesale would redact ordinary non-secret output
+//     (the registry is field-driven on purpose — see REGISTRY). If a credential-bearing URL is ever
+//     added to the fleet, give the variable a secret-named key (e.g. `DATABASE_PASSWORD`) or add a
+//     dedicated rule here;
 //   • a secret that is neither a value under a secret-named field, nor a secret-named env var, nor
 //     a dotenv assignment — e.g. a bare token in a prose file, or a value in a `.env` that is never
 //     read and never sourced;
@@ -643,46 +680,67 @@ export interface RedactOutcome<T> {
  * unredacted result comes back as the SAME array object (`changed: false`) and the handler returns
  * `undefined`.
  */
-export function redactContent(content: unknown, values: readonly SecretValue[], hits: HitCounts): RedactOutcome<unknown> {
+export function redactContent(
+	content: unknown,
+	values: readonly SecretValue[],
+	hits: HitCounts,
+): RedactOutcome<unknown> & { incomplete: boolean } {
 	if (typeof content === "string") {
 		const redacted = redactString(content, values, hits);
-		if (redacted === content) return { value: content, changed: false };
-		return { value: [{ type: "text", text: redacted }], changed: true };
+		if (redacted === content) return { value: content, changed: false, incomplete: false };
+		return { value: [{ type: "text", text: redacted }], changed: true, incomplete: false };
 	}
-	if (!Array.isArray(content)) return { value: content, changed: false };
+	if (!Array.isArray(content)) return { value: content, changed: false, incomplete: false };
 
 	let changed = false;
+	let incomplete = false;
 	const parts = content.map((part) => {
-		if (
-			part !== null &&
-			typeof part === "object" &&
-			(part as { type?: unknown }).type === "text" &&
-			typeof (part as { text?: unknown }).text === "string"
-		) {
-			const original = (part as { text: string }).text;
-			const redacted = redactString(original, values, hits);
-			if (redacted === original) return part;
-			changed = true;
-			return { ...(part as Record<string, unknown>), text: redacted };
+		// Each part is inspected INSIDE its own guard. A hostile part (a throwing `type` getter, a
+		// Proxy) must not stop the OTHER parts from being redacted — otherwise one bad part made the
+		// whole content walk throw and a registered secret in a SIBLING part was persisted verbatim.
+		try {
+			if (
+				part !== null &&
+				typeof part === "object" &&
+				(part as { type?: unknown }).type === "text" &&
+				typeof (part as { text?: unknown }).text === "string"
+			) {
+				const original = (part as { text: string }).text;
+				const redacted = redactString(original, values, hits);
+				if (redacted === original) return part;
+				changed = true;
+				return { ...(part as Record<string, unknown>), text: redacted };
+			}
+		} catch {
+			// Keep the part by reference: the runner would have read it anyway, and dropping content is
+			// worse than passing through a part this guard could not inspect. `incomplete` is recorded
+			// by the caller so the result is never presented as a full redaction.
+			incomplete = true;
 		}
 		return part;
 	});
-	return { value: changed ? parts : content, changed };
+	return { value: changed ? parts : content, changed, incomplete };
 }
 
 /**
  * Redact `details`, recursively.
  *
  * VERIFIED SHAPES (installed pi build, read from real session entries):
- *   • `read`  → `undefined` when untruncated; `{ truncation: { content: string, truncated, ... } }`
- *     when truncated — i.e. the FULL (untruncated) text sits in `details.truncation.content`;
+ *   • `read`  → `undefined` when untruncated; `{ truncation: { content: string, truncated, … } }`
+ *     when truncated. The truncation content is the SAME already-truncated text as `content` (see
+ *     the header's corrected premise) — so `details` here adds no coverage a `content` pass lacks;
  *   • `bash`  → the same `TruncationResult` shape plus `{ fullOutputPath?: string }`;
- *   • `edit`  → `{ diff: string, patch: string, firstChangedLine: number }`;
+ *   • `edit`  → `{ diff: string, patch: string, firstChangedLine: number }` — the whole change is
+ *     details-ONLY, which is what makes the details walk load-bearing;
  *   • `task`  → `{ model, provider, stderr: string, sawTools }`;
- *   • `subagent` → `{ results: [{ ..., messages: [{ role, content, timestamp }], stderr }] }` — NESTED
+ *   • `subagent` → `{ results: [{ …, messages: [{ role, content, timestamp }], stderr }] }` — NESTED
  *     agent messages, which is exactly how a child's read of a config becomes a parent's leak.
  * A shallow walk would miss `details.truncation.content` and the nested `subagent` messages, so the
  * walk is recursive.
+ *
+ * KEYS ARE OUTBOUND TEXT TOO: pass 1 treats a registered value found in an object KEY as dirtying the
+ * container, and pass 2 rebuilds the key through the redactor, so `{ "<secret>": … }` cannot survive
+ * in the transcript while the record and log stay clean.
  *
  * ALIASES AND CYCLES: a single-pass `WeakSet` guard that returns the ORIGINAL node on a repeat visit
  * redacts the first reference and leaves every other one raw (`{a: shared, b: shared}` leaked the
@@ -782,6 +840,12 @@ function markDirtyDetails(node: unknown, values: readonly SecretValue[], state: 
 				complete = false;
 				break;
 			}
+			// A registered value can sit in a JSON KEY as well as in a value:
+			// `{ "<secret>": { clientSecret: … } }`. Keys cannot be rebuilt in place, so a key match
+			// marks the whole container dirty and pass 2 rebuilds the key too — otherwise the
+			// transcript (the artifact this guard exists to protect) keeps the secret as a key while the
+			// record/log/marker stay clean, which is precisely the leak moved into the proof artifact.
+			if (containsRegisteredValue(key, values)) dirty = true;
 			if (markDirtyDetails(source[key], values, state, depth + 1)) dirty = true;
 		}
 	}
@@ -817,10 +881,23 @@ function rebuildDetails(
 		return next;
 	}
 	const source = node as Record<string, unknown>;
-	const next: Record<string, unknown> = {};
+	// Preserve the prototype so a dirty class instance comes back as an instance rather than a bare
+	// `{}`-shaped object. (pi's own `details` are plain, so this is defensive, but it is cheap and
+	// keeps the rebuild faithful; a hostile `getPrototypeOf` trap falls back to a plain object and
+	// marks the walk bounded instead of throwing the whole details redaction away.)
+	let next: Record<string, unknown>;
+	try {
+		next = Object.create(Object.getPrototypeOf(source)) as Record<string, unknown>;
+	} catch {
+		next = {};
+		state.bounded = true;
+	}
 	memo.set(node, next);
 	for (const key of Object.keys(source)) {
-		next[key] = rebuildDetails(source[key], values, hits, state, memo, depth + 1);
+		// The key is itself outbound text (it lands in the transcript), so a secret used as an
+		// ancestor key is redacted here, exactly like a value.
+		const rebuiltKey = redactString(key, values, hits);
+		next[rebuiltKey] = rebuildDetails(source[key], values, hits, state, memo, depth + 1);
 	}
 	return next;
 }
@@ -846,12 +923,13 @@ export function redactDetails(
 
 /**
  * Bounded walk collecting every string reachable in `node`. Used by the source-5 harvest to read
- * `details` — where a truncated `read` puts the FULL text (`details.truncation.content`) and an
- * `edit` puts the whole change (`details.diff`/`details.patch`) — BEFORE the redaction pass, so the
- * harvested values feed the same pass. Hitting the bound sets `budget.bounded`, which is carried
- * into the record.
+ * `details` — where an `edit` puts its whole change (`details.diff`/`details.patch`), which `content`
+ * never carries — BEFORE the redaction pass, so the harvested values feed the same pass. (For `read`
+ * and `bash` the details text duplicates `content`, so this walk is additive only for details-only
+ * tools; see the header.) Hitting the bound sets `budget.bounded`, which is carried into the record.
+ * EXPORTED FOR TESTS: the depth bound is a security-relevant coverage limit and is pinned directly.
  */
-function collectDetailsStrings(
+export function collectDetailsStrings(
 	node: unknown,
 	out: string[],
 	budget: DetailsWalkBudget,
@@ -990,6 +1068,13 @@ export interface SecretEchoGuardHooks {
 	env: () => Record<string, string | undefined>;
 	appendFile: typeof appendFileSync;
 	mkdir: typeof mkdirSync;
+	/**
+	 * TEST-ONLY override for the source-5 `details` HARVEST budget (never set in production). It
+	 * exists so a test can drive the real handler into the `harvestBudget.bounded &&
+	 * !details.bounded` state — a bounded harvest whose redaction walk completed — without spending
+	 * the production 2 s wall-clock deadline. See the M07 regression.
+	 */
+	detailsHarvestLimits?: () => DetailsWalkLimits;
 }
 const defaultHooks: SecretEchoGuardHooks = {
 	readFile: ((path: string) => readFileSync(path, "utf8")) as unknown as typeof readFileSync,
@@ -1011,7 +1096,10 @@ export function _resetSecretEchoGuardCacheForTest(): void {
 	cache = undefined;
 }
 export function _resetSecretEchoGuardAnnouncementsForTest(): void {
-	if (process.env.NODE_ENV === "test") announced.clear();
+	if (process.env.NODE_ENV === "test") {
+		announced.clear();
+		warnedBounded.clear();
+	}
 }
 
 function resolveMinLength(env: Record<string, string | undefined>): number {
@@ -1122,6 +1210,13 @@ function sessionInfo(ctx: unknown): { sessionId: string | null; sessionFile: str
 
 /** Sessions already announced; the redaction is loud but must not spam every tool result. */
 const announced = new Set<string>();
+/**
+ * Sessions already warned that a `details` walk was BOUNDED. Kept separate from `announced`
+ * deliberately: the redaction notice fires once per session, but a bounded walk on the SECOND
+ * result of a session must still be announced — otherwise "never silently presented as a full
+ * redaction" is true only for the first result. A bounded walk is a per-result fact.
+ */
+const warnedBounded = new Set<string>();
 
 function errName(error: unknown): string {
 	try {
@@ -1154,6 +1249,23 @@ function safeDiagnostic(error: unknown, values: readonly SecretValue[]): string 
 	}
 }
 
+/**
+ * Run an outbound string (the record's identity fields, a tool name) through the redactor before it
+ * reaches ANY sink. The record is the guard's own proof artifact, so a secret that appears in
+ * `toolCallId`/`sessionId`/`sessionFile`/`toolName` must be redacted exactly like a value in
+ * `content` — otherwise the guard has moved the leak into the artifact that documents the redaction.
+ * A throwaway hit map keeps identity scrubs out of the record's redaction counts. Returns the input
+ * unchanged when it is not a string (`null` included), and a fixed placeholder if redaction throws.
+ */
+function sanitizeOutboundString(value: unknown, values: readonly SecretValue[]): unknown {
+	if (typeof value !== "string") return value;
+	try {
+		return redactString(value, values, new Map());
+	} catch {
+		return "<unreadable>";
+	}
+}
+
 // ── The extension ───────────────────────────────────────────────────────────────────────────────
 
 export default function secretEchoGuard(pi: ExtensionAPI): void {
@@ -1163,11 +1275,18 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 		const reason = (event as { reason?: unknown } | null | undefined)?.reason;
 		if (reason === "reload") return;
 		announced.clear();
+		warnedBounded.clear();
 	});
 
 	pi.on("tool_result", (event, ctx) => {
 		const hooks = secretEchoGuardHooks;
 		let values: SecretValue[] = [];
+		// Independent failure flags: each walk is guarded on its own so a throw in one never discards
+		// another's successful redaction. `harvestFailed` covers both harvest walks.
+		let contentHarvestFailed = false;
+		let detailsHarvestFailed = false;
+		let contentRedactionFailed = false;
+		let detailsRedactionFailed = false;
 		try {
 			values = getRegistryValues(hooks);
 
@@ -1180,29 +1299,70 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 			};
 			const toolName = typeof e.toolName === "string" ? e.toolName : "tool";
 
+			// Read `content` and `details` ONCE each. The harvest walk and the redaction walk must see
+			// the SAME object, or a getter-shaped field could be inspected one way and redacted another.
+			// An unreadable field is treated as a walk failure (leave it unredacted, record it) rather
+			// than aborting the whole handler — the other field is still redacted.
+			let rawContent: unknown;
+			let rawDetails: unknown;
+			try {
+				rawContent = e.content;
+			} catch (error) {
+				contentRedactionFailed = true;
+				globalThis.console?.error?.(
+					`[secret-echo-guard] reading content failed; content is left UNREDACTED: ${safeDiagnostic(error, values)}`,
+				);
+			}
+			try {
+				rawDetails = e.details;
+			} catch (error) {
+				detailsRedactionFailed = true;
+				globalThis.console?.error?.(
+					`[secret-echo-guard] reading details failed; details are left UNREDACTED: ${safeDiagnostic(error, values)}`,
+				);
+			}
+
 			// Source 5: harvest dotenv-shaped assignments from the text about to be redacted, so a
 			// `.env` that pi never sourced is still closed for the exact read that exposed it. GATED on
 			// the tool having been aimed at an env-like file (see `envSourceFromInput`) — and attempted
 			// even when the static registry is empty, because an unsourced `.env` is exactly the case
 			// the config/env sources cannot see.
 			const harvested: SecretValue[] = [];
-			const harvestBudget = newDetailsBudget();
+			const harvestBudget = newDetailsBudget(hooks.detailsHarvestLimits?.() ?? {});
 			const sourceName = envSourceFromInput(e.input);
 			if (sourceName) {
-				for (const part of asArray(e.content)) {
-					if (part && typeof part === "object" && (part as { type?: unknown }).type === "text") {
-						const text = (part as { text?: unknown }).text;
-						if (typeof text === "string") harvestDotenvSecrets(text, harvested, sourceName);
+				// (1) The CONTENT harvest, guarded on its own. A hostile part must not abort the details
+				// harvest or the redaction pass that follows.
+				try {
+					for (const part of asArray(rawContent)) {
+						if (part && typeof part === "object" && (part as { type?: unknown }).type === "text") {
+							const text = (part as { text?: unknown }).text;
+							if (typeof text === "string") harvestDotenvSecrets(text, harvested, sourceName);
+						}
 					}
+					if (typeof rawContent === "string") harvestDotenvSecrets(rawContent, harvested, sourceName);
+				} catch (error) {
+					contentHarvestFailed = true;
+					globalThis.console?.error?.(
+						`[secret-echo-guard] content harvest failed; an unsourced .env value in this result may be UNREDACTED: ${safeDiagnostic(error, values)}`,
+					);
 				}
-				if (typeof e.content === "string") harvestDotenvSecrets(e.content, harvested, sourceName);
-				// `details` is where the FULL text lives for a truncated `read` (`details.truncation.content`)
-				// and where an `edit` keeps its whole change (`details.diff`/`details.patch`). Harvesting
-				// only `content` misses the unsourced `.env` exactly when the preview is truncated or the
-				// change is in the diff — and this harvest is the ONLY source that can register it.
-				const detailStrings: string[] = [];
-				collectDetailsStrings(e.details, detailStrings, harvestBudget, new WeakSet<object>(), 0);
-				for (const text of detailStrings) harvestDotenvSecrets(text, harvested, sourceName);
+				// (2) The DETAILS harvest, guarded on its own — this is the walk that used to run unguarded
+				// and, on a throwing getter, escaped into the outer catch and discarded the content
+				// redaction entirely (a real leak). `details` is where an `edit` keeps its whole change
+				// (`details.diff`/`details.patch`), which `content` never carries, and where
+				// `task`/`subagent` nested messages live. A throw here must NOT escape.
+				try {
+					const detailStrings: string[] = [];
+					collectDetailsStrings(rawDetails, detailStrings, harvestBudget, new WeakSet<object>(), 0);
+					for (const text of detailStrings) harvestDotenvSecrets(text, harvested, sourceName);
+				} catch (error) {
+					detailsHarvestFailed = true;
+					harvestBudget.bounded = true; // part of `details` was not inspected for source-5 values
+					globalThis.console?.error?.(
+						`[secret-echo-guard] details harvest failed; an unsourced .env value in details may be UNREDACTED: ${safeDiagnostic(error, values)}`,
+					);
+				}
 				if (harvested.length > 0) {
 					retainHarvested(harvested, hooks);
 					// Static-first concatenation: a value already known from a config/env source keeps its
@@ -1210,47 +1370,99 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					values = normalizeSecretValues([...values, ...harvested]);
 				}
 			}
-			// Nothing registered and nothing harvested → the remainder would be pure cost on every result.
-			if (values.length === 0) return undefined;
+			// Nothing registered and no harvest failure → the remainder would be pure cost on every result.
+			// A FAILED harvest still proceeds: it may have missed a value, so the durable record must be
+			// written even when there is nothing to redact.
+			if (values.length === 0 && !contentHarvestFailed && !detailsHarvestFailed) return undefined;
 
-			const hits: HitCounts = new Map();
-			const content = redactContent(e.content, values, hits);
-			// A throw in the `details` walk must NEVER discard a `content` redaction that already
-			// succeeded — the content patch was computed and would otherwise be thrown away with the
-			// whole result (a real leak). Catch the details walk on its own, mark the walk failed/bounded
-			// so the record is loud, and emit the content patch regardless.
-			let details: RedactOutcome<unknown> & { bounded: boolean };
-			let detailsRedactionFailed = false;
-			try {
-				details = redactDetails(e.details, values, hits);
-			} catch (error) {
-				detailsRedactionFailed = true;
-				details = { value: e.details, changed: false, bounded: true };
-				globalThis.console?.error?.(
-					`[secret-echo-guard] details redaction failed; ${
-						content.changed
-							? "the content redaction is still applied, but details are left UNREDACTED"
-							: "details are left UNREDACTED"
-					}: ${safeDiagnostic(error, values)}`,
-				);
+			const contentHits: HitCounts = new Map();
+			const detailsHits: HitCounts = new Map();
+			// The CONTENT redaction, guarded on its own: a throw (a hostile content part, a Proxy array)
+			// leaves content unredacted and RECORDED, while the details patch is still emitted below.
+			let content: RedactOutcome<unknown> & { incomplete: boolean } = {
+				value: rawContent,
+				changed: false,
+				incomplete: false,
+			};
+			if (!contentRedactionFailed) {
+				try {
+					content = redactContent(rawContent, values, contentHits);
+					// A hostile PART does not abort the walk now, but the walk did not inspect everything —
+					// record it so a partially-inspected result is never presented as a full redaction, and
+					// say so on stderr (a silent guard failure is indistinguishable from a working one).
+					if (content.incomplete) {
+						contentRedactionFailed = true;
+						globalThis.console?.error?.(
+							"[secret-echo-guard] content redaction could not inspect every content part; any secret in an uninspected part is left UNREDACTED.",
+						);
+					}
+				} catch (error) {
+					contentRedactionFailed = true;
+					content = { value: rawContent, changed: false, incomplete: false };
+					globalThis.console?.error?.(
+						`[secret-echo-guard] content redaction failed; the content is left UNREDACTED: ${safeDiagnostic(error, values)}`,
+					);
+				}
 			}
-			// A bounded HARVEST means part of `details` was never inspected for source-5 values either.
-			if (harvestBudget.bounded && !details.bounded) details = { ...details, bounded: true };
-			if (!content.changed && !details.changed && !details.bounded) return undefined;
+			// The DETAILS redaction, guarded on its own. A throw must NEVER discard the content
+			// redaction that already succeeded.
+			let details: RedactOutcome<unknown> & { bounded: boolean } = {
+				value: rawDetails,
+				changed: false,
+				bounded: false,
+			};
+			if (!detailsRedactionFailed) {
+				try {
+					details = redactDetails(rawDetails, values, detailsHits);
+				} catch (error) {
+					detailsRedactionFailed = true;
+					details = { value: rawDetails, changed: false, bounded: true };
+					globalThis.console?.error?.(
+						`[secret-echo-guard] details redaction failed; ${
+							content.changed
+								? "the content redaction is still applied, but details are left UNREDACTED"
+								: "details are left UNREDACTED"
+						}: ${safeDiagnostic(error, values)}`,
+					);
+				}
+			}
+			// A bounded/failed HARVEST means part of `details` was never inspected for source-5 values
+			// either. The two walks have SEPARATE budgets (the harvest's deadline is set before the
+			// content-harvest loop, so it can bound while the redaction walk completes), so the harvest's
+			// bound is ORed in explicitly — a bounded harvest is never presented as a complete walk.
+			const detailsWalkBounded = details.bounded || harvestBudget.bounded || detailsHarvestFailed;
+			const anyFailure =
+				contentHarvestFailed || detailsHarvestFailed || contentRedactionFailed || detailsRedactionFailed;
+			// A failure with nothing redacted STILL writes the record: a failure that discards data is
+			// undetectable after the fact otherwise (the previous defect).
+			if (!content.changed && !details.changed && !detailsWalkBounded && !anyFailure) return undefined;
 
+			// Counts are merged ONLY from walks whose result is actually emitted, so the record cannot
+			// claim a redaction that was discarded by a later throw.
+			const hits: HitCounts = new Map();
+			if (content.changed) for (const [label, count] of contentHits) addHit(hits, label, count);
+			if (details.changed) for (const [label, count] of detailsHits) addHit(hits, label, count);
+
+			const identity = sessionInfo(ctx);
 			const record = {
 				kind: "secret-echo-guard-redaction",
-				...sessionInfo(ctx),
+				// Identity fields are outbound text: run them through the redactor like everything else.
+				// The record is the guard's own proof artifact — a secret in `toolCallId`/`sessionId`/
+				// `sessionFile`/`toolName` must not reach it (nor the fleet log, nor `pi.appendEntry`).
+				sessionId: sanitizeOutboundString(identity.sessionId, values),
+				sessionFile: sanitizeOutboundString(identity.sessionFile, values),
 				ts: Date.now(),
-				toolName,
-				toolCallId: typeof e.toolCallId === "string" ? e.toolCallId : null,
+				toolName: sanitizeOutboundString(toolName, values),
+				toolCallId: sanitizeOutboundString(typeof e.toolCallId === "string" ? e.toolCallId : null, values),
 				// LABELS AND COUNTS ONLY. Never a value, and never derived from a value.
 				hits: [...hits.entries()].map(([label, count]) => ({ label, count })),
 				total: hitsTotal(hits),
 				contentRedacted: content.changed,
 				detailsRedacted: details.changed,
+				contentRedactionFailed,
 				detailsRedactionFailed,
-				detailsWalkBounded: details.bounded,
+				harvestFailed: contentHarvestFailed || detailsHarvestFailed,
+				detailsWalkBounded,
 			};
 
 			// (a) durable session entry
@@ -1268,33 +1480,46 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 			} catch (error) {
 				globalThis.console?.error?.(`[secret-echo-guard] fleet-log sink failed: ${safeDiagnostic(error, values)}`);
 			}
-			// (c) loud ONCE per session at the pane
+			// (c) loud at the pane. The redaction summary fires ONCE per session; a BOUNDED walk is a
+			// per-result fact and is tracked separately, so the second-and-later bounded walk of a session
+			// is still announced (it used to ride on the first notice and be silently dropped).
 			try {
 				const { sessionId, sessionFile } = sessionInfo(ctx);
 				const key = sessionId ?? sessionFile ?? "(unknown-session)";
+				const labels = record.hits.map((hit) => hit.label).join(", ") || "unknown source";
+				const boundedWarning =
+					" WARNING: the result's `details` exceeded the redaction walk bound — part of it was NOT inspected, so it was NOT fully redacted.";
+				const failureWarning =
+					" WARNING: the guard FAILED on part of this result — that part is left UNREDACTED.";
 				if (!announced.has(key)) {
 					announced.add(key);
-					const labels = record.hits.map((hit) => hit.label).join(", ") || "unknown source";
-					const text =
-						`[secret-echo-guard] redacted ${record.total} secret value(s) from a ${toolName} result (${labels}).` +
-						` The value(s) are NOT in this session transcript.` +
-						(details.bounded
-							? " WARNING: the result's `details` exceeded the redaction walk bound — part of it was NOT inspected."
-							: "");
+					const summary =
+						content.changed || details.changed
+							? `redacted ${record.total} secret value(s) from a ${String(record.toolName)} result (${labels}). The value(s) are NOT in this session transcript.`
+							: "no secret value was redacted from this result.";
+					const text = `[secret-echo-guard] ${summary}${detailsWalkBounded ? boundedWarning : ""}${anyFailure ? failureWarning : ""}`;
+					globalThis.console?.error?.(text);
+					(ctx as { ui?: { notify?: (message: string, type?: string) => void } } | null | undefined)?.ui?.notify?.(
+						text,
+						"warning",
+					);
+				} else if (detailsWalkBounded && !warnedBounded.has(key)) {
+					const text = `[secret-echo-guard]${boundedWarning}`;
 					globalThis.console?.error?.(text);
 					(ctx as { ui?: { notify?: (message: string, type?: string) => void } } | null | undefined)?.ui?.notify?.(
 						text,
 						"warning",
 					);
 				}
+				if (detailsWalkBounded) warnedBounded.add(key);
 			} catch (error) {
 				globalThis.console?.error?.(`[secret-echo-guard] announce failed: ${safeDiagnostic(error, values)}`);
 			}
 
 			// FAIL OPEN ON THE TURN: a partial patch, so omitted fields keep their current values.
 			// When a secret is found the failing-closed decision has already been made; the turn itself
-			// is never broken. An empty patch (a bounded-but-clean walk) returns undefined, which the
-			// runner treats as "no handler modified this result".
+			// is never broken. An empty patch (a bounded-but-clean walk, or a failure with nothing to
+			// patch) returns undefined, which the runner treats as "no handler modified this result".
 			const patch: { content?: unknown; details?: unknown } = {};
 			if (content.changed) patch.content = content.value;
 			if (details.changed) patch.details = details.value;
