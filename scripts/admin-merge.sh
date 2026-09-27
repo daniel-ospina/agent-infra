@@ -383,7 +383,10 @@
 #                        explicit value is a CEILING instead: an operator's cap,
 #                        not a claim about the run. See wait_for_run.
 #   --no-rerun           skip the flake re-run classification (a non-empty
-#                        unique set then blocks immediately)
+#                        unique set then blocks immediately). NOTE: the #3715
+#                        base reproduction still runs — it is a baseline
+#                        MEASUREMENT, not the PR's flake re-run, and it can
+#                        still clear a failure main's table has no row for.
 #   --print-bounds [<run-id>]
 #                        print the re-run bound + per-shard table + source. With NO
 #                        run id there is nothing to derive from, so this prints the
@@ -450,6 +453,13 @@
 #   ADMIN_MERGE_POLL_INTERVAL            seconds between re-run polls (default 10)
 #   ADMIN_MERGE_GREEN_RUNS               recent SUCCESSFUL runs sampled per shard
 #                                         for the healthy duration (default 5)
+#   ADMIN_MERGE_REPRO_CMD                the #3715 base-reproduction command
+#                                         (reads refused nodeids on STDIN, writes a
+#                                         pytest-shaped capture on stdout). Unset =
+#                                         a pristine base worktree + `uv run pytest`.
+#   ADMIN_MERGE_REPRO_TIMEOUT            the reproduction's mandatory alarm bound in
+#                                         seconds (default 900; a positive integer —
+#                                         anything else is refused)
 #   ADMIN_MERGE_RERUN_FLOOR              per-shard bound FLOOR (default 1200). A
 #                                         floor only ever RAISES the bound, so it
 #                                         cannot cause the false block the flat
@@ -997,6 +1007,14 @@ run_failure_set() {
 # is_run_id — a GitHub run id is decimal. Used to accept the OPTIONAL
 # `--print-bounds <run-id>` argument without swallowing the next flag.
 is_run_id() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# is_full_sha — a pinned 40-hex commit OID, and NOT a branch/tag ref name. Used
+# by the #3715 base reproduction: a REF resolved locally can be stale, and a
+# stale base must never certify a failure as pre-existing.
+is_full_sha() {
+  case "${1:-}" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#1}" -eq 40 ]
+}
 
 # fail_safe_rerun_timeout <reason> — install the fail-safe and say WHY, loudly.
 # NEVER small: the whole defect this replaces was a bound that was too tight.
@@ -2317,7 +2335,7 @@ build_evidence() {
   local head="$1" main_prov="$2" pr_count="$3" main_count="$4"
   local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
   local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}" exempt_raw="${12:-}"
-  local unattr_tokens="${13:-}" unattr_count="${14:-0}"
+  local unattr_tokens="${13:-}" unattr_count="${14:-0}" repro_raw="${15:-}" repro_count="${16:-0}"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
@@ -2340,7 +2358,17 @@ build_evidence() {
   # reaches this point with a zero residual, so every failure the PR carries IS
   # exempt-with-evidence, and recording the set is what lets a reviewer reach
   # `blocked: 0` from the comment instead of taking it on faith.
-  evidence_list "the $pr_count failure(s) this PR carries — all EXEMPT (id measured on main with a matching signature; rate compared where the PR sample was measurable)" \
+  # THE HEADING MUST NOT OVERCLAIM (#3715 review). When the base reproduction
+  # cleared an id, that id was neither EXEMPTed by the decision nor measured on
+  # main — it was cleared by a local re-run on the base, and the summary must say
+  # so rather than folding it into "all EXEMPT" (the evidence comment is the
+  # audit artifact, so a claim that contradicts its own `Reproduction on base:`
+  # line is a defect in the record).
+  local exempt_heading="the $pr_count failure(s) this PR carries — all EXEMPT (id measured on main with a matching signature; rate compared where the PR sample was measurable)"
+  if counter_is_positive "$repro_count"; then
+    exempt_heading="the $pr_count failure(s) this PR carries — EXEMPT by the decision, or CLEARED as reproduced on the base (the $repro_count cleared id(s) had no main-side measurement of their own); rate compared where the PR sample was measurable"
+  fi
+  evidence_list "$exempt_heading" \
     "$(cat "$pr_fails")" "(none — this PR carries no failure of its own)"
   evidence_list "main baseline: $main_count pre-existing failure(s), for comparison" \
     "$(cat "$main_fails")" "(none)"
@@ -2359,6 +2387,11 @@ build_evidence() {
   fi
   evidence_list 'final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty' \
     "$final_unique_raw" "(empty — the decision exempts every failure this PR carries)"
+  # THE BASE REPRODUCTION (#3715) — stated ALWAYS, so a reader can tell "no failure
+  # was refused" from "failures were refused and reproduced on the base". A
+  # reproduction that cleared a failure is the one thing that lets a merge proceed
+  # over a non-empty decision residual, so it is never silent.
+  printf '%s\n' "$repro_raw"
   # THE ATTRIBUTION HALF (#1353) — one line per merge, ALWAYS, so a CLIPPED set is
   # never mistaken for a measured zero and a COMPLETE set is stated rather than
   # assumed. The count itself is in the analysed block above; this is the tokens.
@@ -2388,6 +2421,224 @@ build_evidence() {
   printf '%s\n' "$flake_line"
 }
 
+# ══ reproduce_residual_on_base — THE MISSING MEASUREMENT (#3715) ═══════════
+#
+# THE DEFECT. `main-rates.txt` is a FAILURE-ONLY projection over the last N runs
+# of the lane on main. A failure that is genuinely pre-existing on main can be
+# absent from it for three different reasons, and the decision cannot tell them
+# apart:
+#
+#   (a) main ran the test in the EVALUATED SHAPE and it PASSED   -> an absent row
+#       is real evidence of novelty (the PR broke it);
+#   (b) main ran the test in a DIFFERENT shape and it passed/failed (this repo's
+#       tier-2 PR legs run `TORTOISE_TEST_CARVE_OUT=1` embedded, while main's
+#       push legs run the same files against docker — a same-nodeid row from the
+#       other shape must never decide this one);
+#   (c) main NEVER RAN the test (the selector is diff-gated, the leg ran nowhere,
+#       the file was not in the shard) -> absence is NOT evidence of anything.
+#
+# (b) is the fail-open direction: a docker failure of X on main would EXEMPT an
+# embedded failure of X in the PR, because the union is keyed on the bare
+# nodeid. (c) is the false-BLOCK direction the issue is filed about: the rail
+# attributes to the PR a failure it could not have caused, because the baseline
+# never measured it. Both are the SAME defect — the comparison's key carries no
+# shape — and no amount of set arithmetic can separate them, because the missing
+# information is a MEASUREMENT, not a membership.
+#
+# THE REPAIR, and why it is the baseline's construction rather than a waiver:
+# when the decision would BLOCK, the rail CONSTRUCTS the missing measurement by
+# running the refused nodeids on a pristine worktree of the BASE (origin/main).
+# A failure the base reproduces is one the base's code ALREADY fails in THIS
+# lane's AMBIENT shape — a MEASUREMENT the failure-only baseline did not carry.
+# It is NOT proof the PR is innocent (see the declared residue below); it is the
+# missing observation, and it is strictly stronger than a set-membership test.
+# direction ("reproduce the residual set on origin/main"). What it establishes
+# is REPRODUCED-ON-THE-BASE versus NOT — a MEASUREMENT, strictly stronger than
+# any set-membership test. It does NOT establish case (a) versus case (c) (see
+# the declared residue below): a base run cannot tell "main ran this shape and it
+# passed" from "main never ran it".
+#
+# THE MEASUREMENT SHAPE (a DECLARED RESIDUE, and it is NOT one-directional).
+# The reproduction runs in the AMBIENT test environment the rail inherits — it
+# does not re-create CI's per-leg shape (e.g. this repo's tier-2 PR legs run the
+# fast halves embedded while main's push legs run them against docker). The
+# residue therefore has TWO directions, and only the first is fail-closed:
+#   * a failure SHAPE-SPECIFIC to the evaluated lane may not reproduce here, so
+#     the rail blocks exactly as before (fail closed, harmless); but
+#   * an ambient failure main's own leg does NOT see (a missing service, an env
+#     var, an order dependence) CAN reproduce on the base and clear an id whose
+#     main-side leg is in fact GREEN — the fail-OPEN direction. Case (a) above
+#     ("main ran it in this shape and it passed") and case (c) ("main never ran
+#     it") are indistinguishable from a failure-only baseline, so this repair
+#     cannot separate them and does not pretend to: closing (a)-versus-(c) needs
+#     CI's own per-leg shape, not a local run.
+# Two things bound the blast radius, and BOTH are load-bearing:
+#   * an id is clearable only if the decision could not MEASURE it — no row for
+#     the ID, and no row for its FILE (see `repro_candidates`); a MEASURED value
+#     is never overridable by a local run; and
+#   * only ids the base ITSELF reports FAILED *and that were actually candidates*
+#     are cleared — the clearable set is `candidates ∩ reproduced`, never the
+#     base's whole failing set, so a runner/parser that volunteers an id outside
+#     its argv clears nothing.
+# It is stated here rather than smoothed over because a residue that is only
+# fail-closed in one direction must not read as "cannot fail open".
+#
+# IT IS NOT A WAIVER AND NOT AN EXCEPTION:
+#   * it runs only on a residual the decision ALREADY REFUSED — it can never
+#     widen an exemption the decision granted;
+#   * CANDIDATES ARE THE MEASUREMENT GAP ONLY, AT BOTH LEVELS. An id whose row IS
+#     in main's rate table was MEASURED by the decision — a rate regression
+#     (#3756: main 1/8 vs PR 8/8), a signature mismatch, or a sample below
+#     min_runs — and is NOT a candidate. Neither is an id whose FILE main's
+#     baseline measured (a sibling failure in the same file): the rail's own
+#     `attribute_residual` calls that MEASURED-ABSENT, "not present on main",
+#     which is evidence of novelty. Only the absence of ANY measurement of the
+#     file is the missing measurement this constructs. AND TWO REFUSAL CLASSES
+#     ARE NEVER CANDIDATES, because a base run cannot speak to what they assert:
+#     an UNATTRIBUTABLE id (a class red across runs under a MOVING id — "cannot
+#     be attributed to this PR", and therefore never a merge) and a guard-step
+#     identity (no local runner). `repro_scope` then `repro_candidates` are the
+#     one place that decision is made, and the cleared set is its intersection
+#     with the base's own failures (`intersect_sets`, below);
+#   * it runs the exact NODEIDS as argv, never their whole files — that bounds
+#     WHICH TESTS RUN on the base (an unrelated failure in the same file is never
+#     executed), while `intersect_sets` separately bounds WHAT MAY BE CLEARED, so
+#     a capture that NAMES an id outside its argv still clears nothing;
+#   * only nodeids the BASE ITSELF reports FAILED are cleared, and a nodeid whose
+#     reproduction cannot be parsed stays in the residual (fail-closed);
+#   * a base that cannot be materialised / a lane with no runnable runner / an
+#     invalid bound clears NOTHING and the rail blocks exactly as before — an
+#     unrun reproduction is never read as "pre-existing";
+#   * guard-step identities are NOT reproduced (they have no local runner) and
+#     always remain in the residual.
+#
+# The worktree is a throwaway under $TMP and is always removed.
+#
+# Env seams (tests / operator):
+#   ADMIN_MERGE_REPRO_CMD   the reproduction command, run with the residual
+#                           nodeids on stdin and its pytest-shaped output on
+#                           stdout. When set, no worktree is created and the
+#                           command runs in $PWD — this is the harness seam, in
+#                           the same spirit as ADMIN_MERGE_GH / CI_FAILURE_SET_GH.
+#   ADMIN_MERGE_REPRO_TIMEOUT  seconds (default 900). The bound is MANDATORY
+#                           and VALIDATED (positive integer): a value perl's
+#                           `alarm` cannot numify cancels the timer, and a
+#                           hanging suite must become "not reproduced" (a
+#                           block), never an unbounded merge-time stall.
+#
+# RETURN: 0 = ran (the capture was read; `$out` may be empty) · 1 = could not
+# run, so the caller clears NOTHING. "Found nothing" is NEVER reported as
+# "could not run".
+reproduce_residual_on_base() {
+  local residual="$1" out="$2" base="${3:-}"
+  : > "$out"
+  # RETURN CONTRACT — the caller reports on it, so conflating the two outcomes is
+  # itself a defect (#3715 review): 0 = the reproduction RAN (its capture was
+  # read; `$out` may legitimately be empty) · 1 = it COULD NOT RUN (no base OID,
+  # no worktree, no runner, no usable bound) — clear NOTHING. "ran and found
+  # nothing" must never be reported as "could not run".
+  [ -s "$residual" ] || return 1
+  # A guard-step identity has no pytest runner; it can never be reproduced here.
+  local nodeids
+  nodeids="$(grep -v '^guard-step::' "$residual" 2>/dev/null || true)"
+  [ -n "$nodeids" ] || return 1
+
+  # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
+  # PREDICATES. `perl alarm` numifies its argument, so `alarm "abc"` is
+  # `alarm 0` (the timer is CANCELED) and the runner becomes unbounded; and the
+  # same is true of a LEADING-ZERO spelling (`alarm 00` == `alarm 0`) or a value
+  # past the integer range (`alarm` errors, and the bound is never armed).
+  # Reusing `counter_is_positive` / `counter_has_leading_zero` /
+  # `counter_exceeds_max` is deliberate: every other timing knob in this rail is
+  # validated by exactly these three, and a hand-rolled `case` here is how the
+  # leading-zero and out-of-range holes reappear.
+  local timeout_s="${ADMIN_MERGE_REPRO_TIMEOUT:-900}"
+  if counter_has_leading_zero "$timeout_s" \
+     || ! counter_is_positive "$timeout_s" \
+     || counter_exceeds_max "$timeout_s" "$TIMING_KNOB_MAX"; then
+    say_err "admin-merge: (reproduction) refusing ADMIN_MERGE_REPRO_TIMEOUT='$timeout_s' — a POSITIVE"
+    say_err "   integer (no leading zero, within the usable range) is required: perl's alarm numifies"
+    say_err "   its argument, so a non-integer, a leading-zero spelling, or an out-of-range value"
+    say_err "   CANCELS or never arms the bound and the base run would be UNBOUNDED. Nothing"
+    say_err "   reproduced; the refusal stands (fail closed)."
+    return 1
+  fi
+  # The bound is enforced by `perl alarm` (macOS ships no `timeout`). Without perl
+  # there is NO bound, and starting an unbounded merge-time suite is exactly what
+  # this function must never do.
+  if ! command -v perl >/dev/null 2>&1; then
+    say_err "admin-merge: (reproduction) no 'perl' for the mandatory alarm bound — nothing"
+    say_err "   reproduced; the refusal stands (fail closed)."
+    return 1
+  fi
+
+  # THE REQUESTED SET IS THE NODEIDS, passed to the runner as ARGV (the seam also
+  # gets them on stdin). Running the exact nodeids — never their whole files —
+  # bounds the base's OWN output to the ids under test, so an unrelated failure
+  # in the same file can never be read as a reproduced one. Built BEFORE the
+  # worktree exists so an empty request can never leave one behind (#3715 review).
+  local -a nodeid_arr=() n
+  while IFS= read -r n; do [ -n "$n" ] && nodeid_arr+=("$n"); done <<< "$nodeids"
+  [ "${#nodeid_arr[@]}" -gt 0 ] || return 1
+
+  local work="$TMP/repro-base"
+  rm -rf "$work"; mkdir -p "$work" || return 1
+
+  local cmd_dir="$PWD" used_worktree=0
+  if [ -z "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
+    # PRODUCTION PATH: a pristine base worktree. No base ref, not a git repo, or a
+    # worktree that cannot be created -> clear NOTHING (fail closed).
+    [ -n "$base" ] || return 1
+    git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+    if ! git -C "$PWD" worktree add --detach --force "$work/tree" "$base" >/dev/null 2>&1; then
+      say_err "admin-merge: (reproduction) could not materialise the base '$base' as a worktree — the"
+      say_err "   residual is NOT reproduced and the rail blocks as before (fail closed)."
+      return 1
+    fi
+    cmd_dir="$work/tree"; used_worktree=1
+  fi
+
+  local -a runner
+  if [ -n "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
+    runner=(bash -c "$ADMIN_MERGE_REPRO_CMD")
+  elif command -v uv >/dev/null 2>&1 && [ -f "$cmd_dir/uv.lock" ]; then
+    runner=(uv run --frozen pytest "${nodeid_arr[@]}" -q -p no:cacheprovider)
+  else
+    say_err "admin-merge: (reproduction) no runnable lane runner (no ADMIN_MERGE_REPRO_CMD and no uv.lock)"
+    say_err "   — the residual is NOT reproduced and the rail blocks as before (fail closed)."
+    [ "$used_worktree" -eq 1 ] && git -C "$PWD" worktree remove --force "$work/tree" >/dev/null 2>&1
+    return 1
+  fi
+  local raw="$work/repro.raw"
+  (
+    cd "$cmd_dir" || exit 1
+    printf '%s\n' "$nodeids" > "$work/nodeids.txt"
+    perl -e 'alarm shift; exec @ARGV' "$timeout_s" "${runner[@]}" < "$work/nodeids.txt"
+  ) > "$raw" 2> "$work/repro.err"
+  [ "$used_worktree" -eq 1 ] && git -C "$PWD" worktree remove --force "$work/tree" >/dev/null 2>&1
+
+  # The reproduced set, through the CANONICAL parser so the shapes cannot drift.
+  # `ids` exits non-zero ONLY when the capture could not be READ (an empty id set
+  # is a legitimate 0), so a non-zero here is "could not run", not "found none".
+  local reproduced
+  reproduced="$("$PYTHON_BIN" "$EXEMPTION_PY" ids --log "$raw" 2>/dev/null)" || return 1
+  # THE CAPTURE IS INTERSECTED WITH WHAT WAS ACTUALLY ASKED FOR (#3715 review,
+  # P0). `ids --log` recovers nodeid-shaped tokens from ANYWHERE in the capture
+  # and the test seam can echo whatever it likes, so the base's raw output may
+  # name an id outside its argv — including a MEASURED one. Subtracting that from
+  # the residual would override a measured verdict, which is the #3756 fail-open
+  # the candidate set exists to stop. `$residual` IS the candidate set, so the
+  # intersection belongs here, and it goes through the ONE comparison
+  # implementation (never a second subtraction, never `comm -12`).
+  if [ -n "$reproduced" ]; then
+    printf '%s\n' "$reproduced" | sort -u > "$work/reproduced.all"
+    intersect_sets "$work/reproduced.all" "$residual" "$out" "$work/rep-outside.txt" || {
+      : > "$out"; return 1
+    }
+  fi
+  return 0
+}
+
 # attribute_residual <residual-file> <main-fails-file> — name WHY each residual
 # failure is not in main's baseline. This IMPROVES the diagnosis of a refusal;
 # it must never NARROW the refusal. Every caller blocks on a non-empty residual
@@ -2395,6 +2646,15 @@ build_evidence() {
 # (B1 asked for lane-matched attribution sufficient to CERTIFY; the answer is
 # no — a gate cannot adjudicate causation, and accepting it once lets the next
 # genuinely-new failure in that file ride the same argument).
+#
+# #3715 — A LABEL IS NOT A MEASUREMENT, AND THIS RULE IS ABOUT LABELS. The
+# paragraph above refuses to CERTIFY from an ATTRIBUTION LABEL, i.e. an
+# inference drawn from file proximity. The base reproduction is a different
+# thing in kind, not a softer label: it RUNS the refused nodeids on the base and
+# clears only an id the base itself reports FAILED — and only when main's rate
+# table carries NO row for it, so a MEASURED verdict (including #3756's rate
+# regression) is never overridden. "Both labels block" still holds: nothing
+# here clears, and no label may be read as a waiver.
 #
 # The UNIT is the failure's own grouping: a pytest nodeid groups by FILE (before
 # the first `::`), a guard-step identity (#4469, `guard-step::<step>::<shape>`)
@@ -2411,15 +2671,89 @@ build_evidence() {
 #       (B1: CI's docker lane reproduces ZERO occurrences of the embedded lane's
 #       redislite/GRAPH.COPY race while the embedded lane reproduces it — the old
 #       wording asserted uniqueness with nothing to compare against.)
+# main_measured_files <mainfails> — the FILE set main's failure-only baseline
+# measured. A sibling failure in the file (or a guard-step identity for it) is
+# proof main's lane RAN that file and did not show THIS id red — MEASURED-ABSENT
+# — which the rail must keep distinct from NOT-MEASURABLE (no measurement of the
+# file at all). `attribute_residual` and the #3715 candidate set read the SAME
+# derivation, so the rail's words and its clearance cannot drift apart.
+main_measured_files() {
+  local mainfails="$1"
+  [ -s "$mainfails" ] || return 0
+  {
+    sed '/^guard-step::/d; s/::.*//' "$mainfails"
+    sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+  } | sort -u
+}
+
+# intersect_sets <a> <b> <out> <scratch> — a ∩ b, as `a − (a − b)`, through the
+# ONE shared comparison. `comm -12` is forbidden in this file for the same reason
+# `comm -23` is (the parity invariant): a second set implementation is drift.
+# Returns 1 if either subtraction could not run — the caller clears NOTHING.
+intersect_sets() {
+  local a="$1" b="$2" out="$3" scratch="$4"
+  run_failure_set --diff "$a" "$b" > "$scratch" 2>/dev/null || return 1
+  run_failure_set --diff "$a" "$scratch" > "$out" 2>/dev/null || return 1
+  return 0
+}
+
+# repro_scope <residual> <unattributable> <out> <scratch> — the ids a base run
+# could even SPEAK TO: the residual minus UNATTRIBUTABLE identities and minus
+# guard-step identities. Both are excluded on doctrine, not on evidence:
+#   * UNATTRIBUTABLE is "a class red across runs under a MOVING id — the identity
+#     provably will not be the same next run, so it cannot be attributed to this
+#     PR". Reproducing ONE of the moving ids on the base says nothing about the
+#     class, and the class is never a merge (`detect_rotating_identity`, E5).
+#   * a guard-step identity has no local pytest runner, so it cannot be
+#     reproduced and must always remain in the residual.
+# Return contract: 0 = computed (out may be empty) · 1 = could not compute.
+repro_scope() {
+  local residual="$1" unattrib="$2" out="$3" scratch="$4" nid
+  if [ -s "$unattrib" ]; then
+    run_failure_set --diff "$residual" "$unattrib" > "$scratch" 2>/dev/null || return 1
+  else
+    cp "$residual" "$scratch" || return 1
+  fi
+  : > "$out"
+  while IFS= read -r nid; do
+    [ -n "$nid" ] || continue
+    case "$nid" in guard-step::*) continue ;; esac
+    printf '%s\n' "$nid" >> "$out"
+  done < "$scratch"
+  return 0
+}
+
+# repro_candidates <scoped> <mainfails> <out> <idlevel> <mainfiles> — the ids the
+# base reproduction may legitimately clear: the ones the decision could not
+# MEASURE. TWO levels, and both are the rail's own doctrine:
+#   * ID level — no row in main's rate table (the decision's `mr is None`).
+#   * FILE level — main's baseline carries no measurement of the id's FILE, so
+#     absence is not evidence of novelty. An id whose file main DID measure (a
+#     sibling failure in main-fails) is MEASURED-ABSENT: `attribute_residual`
+#     names that "measured on this lane, not present on main" — evidence of
+#     novelty — and a local base run must never clear it (#3715 review, P0).
+# `scoped` is `repro_scope`'s output. Return contract: 0 = computed (out may be
+# empty) · 1 = could not compute.
+repro_candidates() {
+  local scoped="$1" mainfails="$2" out="$3" idlevel="$4" mainfiles="$5" nid file
+  run_failure_set --diff "$scoped" "$mainfails" > "$idlevel" 2>/dev/null || return 1
+  : > "$out"
+  [ -s "$idlevel" ] || return 0
+  main_measured_files "$mainfails" > "$mainfiles"
+  while IFS= read -r nid; do
+    [ -n "$nid" ] || continue
+    file="${nid%%::*}"
+    if [ -s "$mainfiles" ] && grep -qxF -- "$file" "$mainfiles" 2>/dev/null; then
+      continue
+    fi
+    printf '%s\n' "$nid" >> "$out"
+  done < "$idlevel"
+  return 0
+}
+
 attribute_residual() {
   local residual="$1" mainfails="$2" nodeid file main_files=""
-  if [ -s "$mainfails" ]; then
-    main_files="$(
-      sed '/^guard-step::/d; s/::.*//' "$mainfails"
-      sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
-    )"
-    main_files="$(printf '%s\n' "$main_files" | sort -u)"
-  fi
+  main_files="$(main_measured_files "$mainfails")"
   while IFS= read -r nodeid; do
     [ -n "$nodeid" ] || continue
     case "$nodeid" in
@@ -3108,14 +3442,113 @@ main() {
   local unique_before
   unique_before="$(count_lines "$TMP/unique.txt")"
 
+  # ── 3b. THE MISSING MEASUREMENT (#3715) ──────────────────────────────────
+  # The decision has refused this residual because main's lane carries no
+  # measurement of it (or too thin a one). Absence is NOT evidence of novelty:
+  # main may never have run the test in the evaluated shape at all. Before the
+  # rail attributes them to this PR, it CONSTRUCTS the missing measurement by
+  # running the residual nodeids on a pristine worktree of the BASE. A failure
+  # the base itself reproduces is pre-existing by construction and is cleared
+  # from the residual; anything the base does NOT reproduce stays refused. See
+  # `reproduce_residual_on_base` for why this is the baseline's construction and
+  # not a waiver. A reproduction that cannot run clears NOTHING (fail closed).
+  #
+  # `--dry-run` MUTATES NOTHING, so it must not run the base suite either: the
+  # reproduction materialises a worktree and executes tests, and a documented
+  # no-op that runs a suite is the same defect the CI-re-run guard below closes.
+  local repro_line="Reproduction on base: not attempted (the decision blocked nothing)"
+  local repro_base="${BASE_SHA:-$base_ref}"
+  local repro_n=0
+  if [ "$unique_before" -gt 0 ] && [ "${DRY_RUN:-0}" -eq 0 ]; then
+    # THE CANDIDATES ARE ONLY THE MEASUREMENT GAP (#3715 review, P1). The
+    # residual is BLOCKED ∪ UNATTRIBUTABLE, and BLOCKED is not one class: the
+    # decision also blocks a MEASURED verdict — a rate regression (#3756:
+    # main 1/8 vs PR 8/8), a signature mismatch, or a sample below min_runs. A
+    # single ambient run on the base must never override a MEASURED verdict; the
+    # missing measurement this constructs is exactly the case where main's rate
+    # table carries NO row for the id. `main-fails.txt` IS that table's id column
+    # (step 2). An id WITH a row stays refused no matter what the base does.
+    local cand="$TMP/repro-candidates.txt"
+    if ! repro_scope "$TMP/unique.txt" "$TMP/unique.unattributable" \
+         "$TMP/repro-scope.txt" "$TMP/repro-nonattr.txt" \
+       || ! repro_candidates "$TMP/repro-scope.txt" "$TMP/main-fails.txt" "$cand" \
+         "$TMP/repro-idlevel.txt" "$TMP/main-files.txt"; then
+      repro_line="Reproduction on base: attempted on base $repro_base; the candidate set could not be computed through the shared parser — the refusal stands (fail closed)"
+    elif [ ! -s "$cand" ]; then
+      # THREE ways the candidate set is empty, and they are DIFFERENT claims:
+      # nothing is left after the UNATTRIBUTABLE/guard-step exclusion, or every id
+      # carries a main-side measurement, or every id's FILE is measured on main
+      # (MEASURED-ABSENT). Naming the wrong one would be a false report.
+      if [ ! -s "$TMP/repro-scope.txt" ]; then
+        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — the refusal stands"
+      elif [ ! -s "$TMP/repro-idlevel.txt" ]; then
+        repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to carries a main-side measurement, so there is no missing measurement to construct — the refusal stands"
+      else
+        repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to sits in a FILE main's baseline measured (MEASURED-ABSENT), which is evidence of novelty — the refusal stands"
+      fi
+    elif ! is_full_sha "$repro_base"; then
+      # A REF NAME is not a pinned base. `check_surface_probe` falls back to the
+      # REF when the commits API cannot resolve a SHA, and `git worktree add main`
+      # would then resolve the LOCAL ref — a stale, redder main would clear
+      # failures that are not pre-existing on the real base.
+      repro_line="Reproduction on base: attempted on base '$repro_base'; the base is not a pinned commit OID, so nothing was reproduced — the refusal stands (fail closed)"
+    elif reproduce_residual_on_base "$cand" "$TMP/reproduced.txt" "$repro_base"; then
+      # The subtractions are the SHARED comparison (`ci-failure-set.sh --diff`,
+      # the one `comm -23` in the rail) — a second implementation here is exactly
+      # the drift the parity invariant exists to stop. A `--diff` that cannot run
+      # clears NOTHING and the refusal stands (fail closed).
+      cp "$TMP/unique.txt" "$TMP/unique.before"
+      if run_failure_set --diff "$TMP/unique.txt" "$TMP/reproduced.txt" > "$TMP/unique.filtered" 2>/dev/null; then
+        # THE CLEARED SET IS THE ACTUAL DIFFERENCE — the ids that left the
+        # residual — never the base's whole failing set (which may include ids
+        # that were never refused). Printed and counted from this one source.
+        run_failure_set --diff "$TMP/unique.before" "$TMP/unique.filtered" > "$TMP/repro-cleared.txt" 2>/dev/null \
+          || : > "$TMP/repro-cleared.txt"
+        repro_n="$(count_lines "$TMP/repro-cleared.txt")"
+        if [ "$repro_n" -gt 0 ]; then
+          mv "$TMP/unique.filtered" "$TMP/unique.txt"
+          unique_before="$(count_lines "$TMP/unique.txt")"
+          repro_line="Reproduction on base: $repro_n of the refused failure(s) REPRODUCE on base $repro_base in this AMBIENT lane shape — cleared as pre-existing there. NOTE: a failure-only baseline cannot separate 'main ran this shape and passed' from 'main never ran it', so this is a measurement of the base in THIS shape, not proof that the PR is innocent"
+          info "admin-merge: ↩︎ $repro_n refused failure(s) reproduce on the BASE $repro_base in this AMBIENT shape — cleared (a measurement of the base here, not proof the PR is innocent)"
+          sed 's/^/   pre-existing: /' "$TMP/repro-cleared.txt" >&2
+        else
+          repro_line="Reproduction on base: attempted on base $repro_base; NO refused failure reproduced there — the refusal stands"
+        fi
+      else
+        repro_line="Reproduction on base: attempted on base $repro_base; the reproduction could not be compared through the shared parser — the refusal stands (fail closed)"
+      fi
+    else
+      repro_line="Reproduction on base: attempted on base $repro_base; the reproduction could not RUN — the refusal stands (fail closed)"
+    fi
+  fi
+
   local flake_line="Flake classification: none needed (nothing blocked before the re-run)"
   local rerun_residual=0
 
-  if [ "$unique_before" -gt 0 ]; then
-    info "admin-merge: $unique_before failure(s) are blocked by the decision — re-run classification:"
-    sed 's/^/   /' "$TMP/unique.txt"
+  # THE RE-RUN IS FORCED WHENEVER THE BASE CLEARED ANYTHING (#3715 review, P1).
+  # The re-run is the ONLY mechanism that collects the SECOND sample the E5
+  # rotation rule needs (`detect_rotating_identity` needs >= 2 samples), and a
+  # reproduction that clears the WHOLE residual would otherwise skip it — letting
+  # a single-sample MOVING identity be cleared by the base, which is the
+  # exempt-and-silent direction on the one class that may never merge. The second
+  # sample is taken BEFORE the merge decision, so a rotation that appears on retry
+  # still blocks.
+  if [ "$unique_before" -gt 0 ] || [ "${repro_n:-0}" -gt 0 ]; then
+    if [ "$unique_before" -gt 0 ]; then
+      info "admin-merge: $unique_before failure(s) are blocked by the decision — re-run classification:"
+      sed 's/^/   /' "$TMP/unique.txt"
+    else
+      info "admin-merge: the base reproduction cleared $repro_n failure(s); re-running to collect a SECOND"
+      info "admin-merge:   sample (the E5 rotation rule needs two) before deciding to merge:"
+    fi
     if [ "$NO_RERUN" -eq 1 ]; then
-      say_err "admin-merge: ✗ BLOCK — failures are blocked by the decision and --no-rerun given. No merge."
+      if [ "$unique_before" -gt 0 ]; then
+        say_err "admin-merge: ✗ BLOCK — failures are blocked by the decision and --no-rerun given. No merge."
+      else
+        say_err "admin-merge: ✗ BLOCK — the base reproduction cleared the residual, but --no-rerun denies"
+        say_err "   the E5 second sample the re-run would take. No merge."
+      fi
+      say_err "   $repro_line"
       # §37 (main): WHY each residual could not be attributed to this PR — the
       # FILE-level diagnosis. Complementary to the decision's id-level reason
       # lines below, not a replacement: the decision says WHAT it decided and on
@@ -3128,9 +3561,11 @@ main() {
     # the DRY_RUN branch would make a documented no-op re-run a caller's CI
     # (review P2, cycle 2). Report the decision instead of performing it.
     if [ "$DRY_RUN" -eq 1 ]; then
+      info "admin-merge: (dry-run) a real run would CONSTRUCT the missing main-side measurement (run"
+      info "admin-merge: (dry-run)   the residual on a pristine base worktree, #3715) before this point."
       info "admin-merge: (dry-run) a real run would re-run the failing job(s) of this head once and re-classify them."
-      info "admin-merge: (dry-run) --dry-run performs no CI re-run, posts no comment and merges nothing."
-      info "admin-merge: (dry-run) decision: BLOCK unless the residual clears on retry. No merge."
+      info "admin-merge: (dry-run) --dry-run performs no base run, no CI re-run, posts no comment and merges nothing."
+      info "admin-merge: (dry-run) decision: BLOCK unless the residual clears on the base or on retry. No merge."
       exit 0
     fi
     # Re-run every failing run of the PR head ONCE. A test that passes on retry
@@ -3216,10 +3651,33 @@ main() {
       exit 1
     fi
     residual_of "$TMP/unique2" "$TMP/unique2.txt"
+    # The base reproduction applies to the POST-rerun residual too (and only
+    # ever REMOVES ids the base itself reported FAILED): a failure cleared
+    # before the re-run must not reappear as "survived the re-run". SAME shared
+    # comparison as 3b — a failing `--diff` clears NOTHING (fail closed).
+    if [ -s "$TMP/reproduced.txt" ] \
+       && run_failure_set --diff "$TMP/unique2.txt" "$TMP/reproduced.txt" > "$TMP/unique2.filtered" 2>/dev/null; then
+      mv "$TMP/unique2.filtered" "$TMP/unique2.txt"
+      # PRESENTATION ONLY: the decision's reason lines for the ids that remain.
+      # A cleared id's reason line must not be printed under a refusal it is no
+      # longer part of. `reproduced.txt` is sorted-unique; a cleared BLOCK line
+      # is `<prefix><nodeid>  <reason>` (ci_exemption.py's render), so the nodeid
+      # is field 1 after the `BLOCK : ` prefix and the two-space reason gap.
+      awk 'NR==FNR { rep[$0]=1; next }
+           { key=$0; sub(/^BLOCK[[:space:]]*:[[:space:]]*/, "", key); sub(/  .*/, "", key);
+             if (!(key in rep)) print }' \
+        "$TMP/reproduced.txt" "$TMP/unique2.lines" > "$TMP/unique2.lines.filtered" 2>/dev/null \
+        && mv "$TMP/unique2.lines.filtered" "$TMP/unique2.lines"
+    fi
     rerun_residual="$(count_lines "$TMP/unique2.txt")"
 
     if [ "$rerun_residual" -gt 0 ]; then
       say_err "admin-merge: ✗ BLOCK — $rerun_residual failure(s) SURVIVED the re-run:"
+      # THE REPRODUCTION'S OUTCOME IS REPORTED ON EVERY REFUSAL (#3715 review):
+      # an operator must be able to tell "the base did not reproduce it" from
+      # "the reproduction could not run" / "could not be compared" — the
+      # refusal is the same either way, but the reason is not.
+      say_err "   $repro_line"
       # §33 (#1147): the REASON, not just the node id. An UNATTRIBUTABLE id (a rotating identity,
       # or one with no main-side measurement) is created with `blocked=True`, so its
       # verdict line is a `BLOCK` line whose reason names the class — and a refusal
@@ -3240,8 +3698,15 @@ main() {
       exit 1
     fi
     cp "$TMP/pr-fails2.txt" "$TMP/pr-fails.txt"
-    flake_line="Flake classification: $unique_before residual re-ran → all passed on retry (flaky, not new)"
-    info "admin-merge: ✅ all $unique_before residual failure(s) passed on retry — flaky, not new"
+    if [ "$unique_before" -gt 0 ]; then
+      flake_line="Flake classification: $unique_before residual re-ran → all passed on retry (flaky, not new)"
+      info "admin-merge: ✅ all $unique_before residual failure(s) passed on retry — flaky, not new"
+    else
+      # The residual was cleared by the BASE, not by a flake: the retry was taken
+      # only for the E5 second sample, and nothing survived it.
+      flake_line="Flake classification: the base reproduction cleared $repro_n failure(s); the re-run's second sample survived none (no E5 rotation observed)"
+      info "admin-merge: ✅ the re-run's second sample survived nothing — merging on the reproduced-on-base clearance"
+    fi
   fi
 
   # ── 4. THE HEAD IS RE-RESOLVED IMMEDIATELY BEFORE THE EVIDENCE (review P1) ─
@@ -3654,7 +4119,7 @@ $attribution_line"
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
     "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
     "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" \
-    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" > "$TMP/evidence.md"
+    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" "$repro_line" "$repro_n" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"
