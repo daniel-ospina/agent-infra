@@ -63,6 +63,10 @@
 // successful redaction is still emitted as a partial patch, and the durable record is written
 // whenever ANY failure left data unredacted — a failure is never undetectable after the fact. (The
 // runner merges defined patch fields on this build, so a partial patch is safe.)
+// The same guard applies to the event's own `toolName`/`input`/`toolCallId` reads: they are read
+// through a try/catch and an unreadable one is a RECORDED failure (`eventReadFailed`), so it cannot
+// escape into the outer catch and discard an already-computed redaction. (These are
+// harness-supplied in the installed build, so this is defense-in-depth, not a tool-reachable path.)
 //
 // RESIDUAL, STATED PLAINLY: `content` is redacted PER PART, so one hostile part cannot hide a secret
 // in a sibling part. `details` is NOT per-node tolerant — the rebuild is a coherent two-pass walk over
@@ -137,7 +141,16 @@
 //      first draft did).
 //
 // NOT COVERED (stated rather than papered over):
-//   • values SHORTER than `MIN_SECRET_LENGTH` (a deliberate floor — see its doc comment);
+//   • the length floor: values SHORTER than `MIN_SECRET_LENGTH` (see its doc comment);
+//   • CRAFTED / NON-STRING SHAPES inside `content` (verified: all leave no patch, i.e. persist as
+//     the tool produced them). Redaction is an EXACT-MATCH replacement over primitive strings, so a
+//     `text` that is a BOXED `String` object (`typeof !== "string"`, and `JSON.stringify` emits the
+//     secret), a secret SPLIT across two `text` parts, a secret with INSERTED whitespace, and a
+//     `toJSON`/private-field encoding that only materializes at serialization time all pass through.
+//     `details` is rebuilt by enumerable own keys, so a non-enumerable field is not copied (and not
+//     serialized) either. These are hostile/custom-tool shapes, not pi's own `read`/`bash` shape;
+//     they are stated rather than covered because the guard is deliberately exact-match (see the
+//     REGISTRY section for why an entropy or normalization heuristic was rejected).
 //   • ⛔ a CREDENTIAL EMBEDDED IN A URL, because `NON_SECRET_TAIL_TOKENS` treats a trailing
 //     `url`/`uri` as a POINTER: `DATABASE_URL=postgres://user:pass@host/db`,
 //     `REDIS_URL=redis://:pass@host`, `SENTRY_DSN=https://key@...` are therefore never registered,
@@ -213,7 +226,7 @@ export function redactionMarker(label: string): string {
 export const SECRET_ECHO_GUARD_ENTRY_TYPE = "secret-echo-guard";
 export const SECRET_ECHO_GUARD_LOG = "secret-echo-guard-redactions.log";
 
-/** Runaway guards, not expected sizes. Hitting either is RECORDED and announced, never silent. */
+/** Runaway guards, not expected sizes. Hitting either is RECORDED and announced on EVERY result. */
 export const MAX_DETAILS_DEPTH = 32;
 export const MAX_DETAILS_NODES = 1_000_000;
 /**
@@ -222,7 +235,8 @@ export const MAX_DETAILS_NODES = 1_000_000;
  * on short strings. This caps the synchronous event-loop block. It is the SECONDARY bound: a walk
  * that finishes inside the node budget under this deadline is fully redacted, and only a genuinely
  * pathological `details` trips it. Checked every `DETAILS_BUDGET_CHECK_INTERVAL` nodes so `Date.now()`
- * is not called per node. Hitting it sets `bounded`, which is RECORDED and announced.
+ * is not called per node. Hitting it sets `bounded`, which is RECORDED and announced on every
+ * bounded result — not just the first of a session.
  */
 export const MAX_DETAILS_WALK_MS = 2_000;
 const DETAILS_BUDGET_CHECK_INTERVAL = 1_024;
@@ -897,7 +911,16 @@ function rebuildDetails(
 		// The key is itself outbound text (it lands in the transcript), so a secret used as an
 		// ancestor key is redacted here, exactly like a value.
 		const rebuiltKey = redactString(key, values, hits);
-		next[rebuiltKey] = rebuildDetails(source[key], values, hits, state, memo, depth + 1);
+		// `Object.defineProperty`, not `next[key] = …`: an own `__proto__` key on the source (JSON.parse
+		// creates one) would hit the inherited `__proto__` SETTER on assignment and be silently DROPPED,
+		// so the rebuild lost that key entirely. defineProperty makes it an ordinary own enumerable
+		// property, so the key survives redaction like every other key.
+		Object.defineProperty(next, rebuiltKey, {
+			value: rebuildDetails(source[key], values, hits, state, memo, depth + 1),
+			enumerable: true,
+			writable: true,
+			configurable: true,
+		});
 	}
 	return next;
 }
@@ -1096,10 +1119,7 @@ export function _resetSecretEchoGuardCacheForTest(): void {
 	cache = undefined;
 }
 export function _resetSecretEchoGuardAnnouncementsForTest(): void {
-	if (process.env.NODE_ENV === "test") {
-		announced.clear();
-		warnedBounded.clear();
-	}
+	if (process.env.NODE_ENV === "test") announced.clear();
 }
 
 function resolveMinLength(env: Record<string, string | undefined>): number {
@@ -1210,13 +1230,6 @@ function sessionInfo(ctx: unknown): { sessionId: string | null; sessionFile: str
 
 /** Sessions already announced; the redaction is loud but must not spam every tool result. */
 const announced = new Set<string>();
-/**
- * Sessions already warned that a `details` walk was BOUNDED. Kept separate from `announced`
- * deliberately: the redaction notice fires once per session, but a bounded walk on the SECOND
- * result of a session must still be announced — otherwise "never silently presented as a full
- * redaction" is true only for the first result. A bounded walk is a per-result fact.
- */
-const warnedBounded = new Set<string>();
 
 function errName(error: unknown): string {
 	try {
@@ -1266,6 +1279,23 @@ function sanitizeOutboundString(value: unknown, values: readonly SecretValue[]):
 	}
 }
 
+/**
+ * Read a field off the `tool_result` event without letting a hostile getter abort the handler.
+ * `content`/`details` are read this way already; `toolName`/`input`/`toolCallId` are read the same
+ * way so an unreadable field becomes a RECORDED failure flag rather than an escape into the outer
+ * catch. That escape was itself the bug: it discarded a redaction that had already succeeded (the
+ * patch) and wrote no durable record, leaving the raw secret-bearing result to be persisted with
+ * nothing to attest it. These fields are harness-supplied in the installed build, so this is
+ * defense-in-depth for a hostile/Proxy event object, not a tool-reachable path.
+ */
+function readEventField(holder: unknown, field: string): { ok: boolean; value: unknown; error?: unknown } {
+	try {
+		return { ok: true, value: (holder as Record<string, unknown>)[field] };
+	} catch (error) {
+		return { ok: false, value: undefined, error };
+	}
+}
+
 // ── The extension ───────────────────────────────────────────────────────────────────────────────
 
 export default function secretEchoGuard(pi: ExtensionAPI): void {
@@ -1275,7 +1305,6 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 		const reason = (event as { reason?: unknown } | null | undefined)?.reason;
 		if (reason === "reload") return;
 		announced.clear();
-		warnedBounded.clear();
 	});
 
 	pi.on("tool_result", (event, ctx) => {
@@ -1287,6 +1316,10 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 		let detailsHarvestFailed = false;
 		let contentRedactionFailed = false;
 		let detailsRedactionFailed = false;
+		// An unreadable identity/argument field on the event. It is not one of the four redaction walks,
+		// but it MUST be recorded: if it escaped to the outer catch it discarded an already-computed
+		// redaction and wrote no durable record at all (the exact defect this hardening closes).
+		let eventReadFailed = false;
 		try {
 			values = getRegistryValues(hooks);
 
@@ -1297,7 +1330,26 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 				content?: unknown;
 				details?: unknown;
 			};
-			const toolName = typeof e.toolName === "string" ? e.toolName : "tool";
+			// Read the event fields ONCE each and guard every read: a throwing getter on the event object
+			// must not escape to the outer catch (which would discard the redaction and the record).
+			const toolNameField = readEventField(e, "toolName");
+			if (!toolNameField.ok) {
+				eventReadFailed = true;
+				globalThis.console?.error?.(
+					`[secret-echo-guard] reading toolName failed; the tool name is left UNREADABLE: ${safeDiagnostic(toolNameField.error, values)}`,
+				);
+			}
+			const toolName = toolNameField.ok && typeof toolNameField.value === "string" ? toolNameField.value : "tool";
+			// `toolCallId` is read HERE, before the early return, so an unreadable one is a recorded
+			// failure that forces a record even when nothing else was redacted. Reading it later (after the
+			// redactions) was the bug: a throw there escaped to the outer catch and discarded the patch.
+			const toolCallIdField = readEventField(e, "toolCallId");
+			if (!toolCallIdField.ok) {
+				eventReadFailed = true;
+				globalThis.console?.error?.(
+					`[secret-echo-guard] reading toolCallId failed; the identity field is left UNREADABLE: ${safeDiagnostic(toolCallIdField.error, values)}`,
+				);
+			}
 
 			// Read `content` and `details` ONCE each. The harvest walk and the redaction walk must see
 			// the SAME object, or a getter-shaped field could be inspected one way and redacted another.
@@ -1329,7 +1381,14 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 			// the config/env sources cannot see.
 			const harvested: SecretValue[] = [];
 			const harvestBudget = newDetailsBudget(hooks.detailsHarvestLimits?.() ?? {});
-			const sourceName = envSourceFromInput(e.input);
+			const inputField = readEventField(e, "input");
+			if (!inputField.ok) {
+				eventReadFailed = true;
+				globalThis.console?.error?.(
+					`[secret-echo-guard] reading input failed; an unsourced .env value in this result may be UNREDACTED: ${safeDiagnostic(inputField.error, values)}`,
+				);
+			}
+			const sourceName = inputField.ok ? envSourceFromInput(inputField.value) : undefined;
 			if (sourceName) {
 				// (1) The CONTENT harvest, guarded on its own. A hostile part must not abort the details
 				// harvest or the redaction pass that follows.
@@ -1370,10 +1429,10 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					values = normalizeSecretValues([...values, ...harvested]);
 				}
 			}
-			// Nothing registered and no harvest failure → the remainder would be pure cost on every result.
-			// A FAILED harvest still proceeds: it may have missed a value, so the durable record must be
-			// written even when there is nothing to redact.
-			if (values.length === 0 && !contentHarvestFailed && !detailsHarvestFailed) return undefined;
+			// Nothing registered and no harvest/event failure → the remainder would be pure cost on every result.
+			// A FAILED harvest or unreadable event field still proceeds: it may have missed a value, so the
+			// durable record must be written even when there is nothing to redact.
+			if (values.length === 0 && !contentHarvestFailed && !detailsHarvestFailed && !eventReadFailed) return undefined;
 
 			const contentHits: HitCounts = new Map();
 			const detailsHits: HitCounts = new Map();
@@ -1432,7 +1491,11 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 			// bound is ORed in explicitly — a bounded harvest is never presented as a complete walk.
 			const detailsWalkBounded = details.bounded || harvestBudget.bounded || detailsHarvestFailed;
 			const anyFailure =
-				contentHarvestFailed || detailsHarvestFailed || contentRedactionFailed || detailsRedactionFailed;
+				contentHarvestFailed ||
+				detailsHarvestFailed ||
+				contentRedactionFailed ||
+				detailsRedactionFailed ||
+				eventReadFailed;
 			// A failure with nothing redacted STILL writes the record: a failure that discards data is
 			// undetectable after the fact otherwise (the previous defect).
 			if (!content.changed && !details.changed && !detailsWalkBounded && !anyFailure) return undefined;
@@ -1453,7 +1516,10 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 				sessionFile: sanitizeOutboundString(identity.sessionFile, values),
 				ts: Date.now(),
 				toolName: sanitizeOutboundString(toolName, values),
-				toolCallId: sanitizeOutboundString(typeof e.toolCallId === "string" ? e.toolCallId : null, values),
+				toolCallId: sanitizeOutboundString(
+					toolCallIdField.ok && typeof toolCallIdField.value === "string" ? toolCallIdField.value : null,
+					values,
+				),
 				// LABELS AND COUNTS ONLY. Never a value, and never derived from a value.
 				hits: [...hits.entries()].map(([label, count]) => ({ label, count })),
 				total: hitsTotal(hits),
@@ -1462,6 +1528,7 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 				contentRedactionFailed,
 				detailsRedactionFailed,
 				harvestFailed: contentHarvestFailed || detailsHarvestFailed,
+				eventReadFailed,
 				detailsWalkBounded,
 			};
 
@@ -1480,9 +1547,11 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 			} catch (error) {
 				globalThis.console?.error?.(`[secret-echo-guard] fleet-log sink failed: ${safeDiagnostic(error, values)}`);
 			}
-			// (c) loud at the pane. The redaction summary fires ONCE per session; a BOUNDED walk is a
-			// per-result fact and is tracked separately, so the second-and-later bounded walk of a session
-			// is still announced (it used to ride on the first notice and be silently dropped).
+			// (c) loud at the pane. The redaction summary fires ONCE per session; a BOUNDED walk or a FAILED
+			// walk is a per-result fact, so EVERY such result is announced (not just the first — the earlier
+			// `warnedBounded` latch announced only one bounded walk per session while the header claimed
+			// otherwise). The durable record carries the same flags on every result, so the attestation is
+			// per-result either way; the pane warning is the best-effort loud half.
 			try {
 				const { sessionId, sessionFile } = sessionInfo(ctx);
 				const key = sessionId ?? sessionFile ?? "(unknown-session)";
@@ -1491,8 +1560,9 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					" WARNING: the result's `details` exceeded the redaction walk bound — part of it was NOT inspected, so it was NOT fully redacted.";
 				const failureWarning =
 					" WARNING: the guard FAILED on part of this result — that part is left UNREDACTED.";
-				if (!announced.has(key)) {
-					announced.add(key);
+				const isFirst = !announced.has(key);
+				if (isFirst) announced.add(key);
+				if (isFirst) {
 					const summary =
 						content.changed || details.changed
 							? `redacted ${record.total} secret value(s) from a ${String(record.toolName)} result (${labels}). The value(s) are NOT in this session transcript.`
@@ -1503,15 +1573,15 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 						text,
 						"warning",
 					);
-				} else if (detailsWalkBounded && !warnedBounded.has(key)) {
-					const text = `[secret-echo-guard]${boundedWarning}`;
+				} else if (detailsWalkBounded || anyFailure) {
+					// Per-result: a bounded OR failed walk never rides on the once-per-session summary.
+					const text = `[secret-echo-guard]${detailsWalkBounded ? boundedWarning : ""}${anyFailure ? failureWarning : ""}`;
 					globalThis.console?.error?.(text);
 					(ctx as { ui?: { notify?: (message: string, type?: string) => void } } | null | undefined)?.ui?.notify?.(
 						text,
 						"warning",
 					);
 				}
-				if (detailsWalkBounded) warnedBounded.add(key);
 			} catch (error) {
 				globalThis.console?.error?.(`[secret-echo-guard] announce failed: ${safeDiagnostic(error, values)}`);
 			}

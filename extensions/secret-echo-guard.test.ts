@@ -936,6 +936,25 @@ test("the harvest reads ADDED and REMOVED dotenv lines out of a unified diff", (
 // DISTINCT from the round-1 set pinned above ("The 9 previously-uncaught mutations" uses M8–M11 for
 // different mutants). Each test below is proven to FAIL without its fix — see the mutation ledger in
 // the PR/report: P1a, P1b, P2a, P2b×2, P2c, M07, M22×2, M09, M09b, M10, M15, P3b all caught.
+//
+// ROUND-3 MUTATION LEDGER (corrects the earlier "semantics-preserving" claim, which was not
+// reproducible — the round-3 reviewer found only THREE of the nine genuinely equivalent):
+//   • GENUINELY SEMANTICS-PRESERVING, no test can (or should) catch them:
+//       - `harvestFailed-OR-remove` — removing `detailsHarvestFailed` from `detailsWalkBounded` is a
+//         no-op because the details-harvest catch sets `harvestBudget.bounded = true` in the same
+//         block, so the OR operand is already true.
+//       - `record-hits-raw-labels` — the hits key IS already a string (the label passed to
+//         `addHit`); `String(label)` is the identity.
+//       - `merge-hits-always` — merging a walk's hit map when that walk did not `change` is a no-op
+//         because `redactString` only adds a hit when it actually replaces something.
+//   • REAL BEHAVIOUR CHANGES, now pinned (each test fails without its fix):
+//       - `harvested-not-normalized` → the harvested-label normalization tests below (the primary
+//         round-3 fix: without it a registered secret in an env-like BASENAME leaks into the marker
+//         and the record/fleet-log `hits` label).
+//       - `failgate-{content,details}Harvest-drop` + `anyFailure-contentHarvest-drop` → the
+//         "harvest failure with an EMPTY registry still writes a record" tests below.
+//       - `harvest-string-content-drop` → the bare-STRING content harvest test below.
+//       - `minlength-off-by-one` → the `SECRET_ECHO_GUARD_MIN_LENGTH` override test below.
 
 console.log("\nP1 — the harvest/details walk must not discard a content redaction");
 test("a throwing `details` getter on an ENV-LIKE read: content is redacted AND the failure is durably recorded", () => {
@@ -1056,7 +1075,7 @@ test("a secret used as an ANCESTOR KEY of details is redacted, not copied into t
 });
 
 console.log("\nP2 — a bounded walk is announced per-result, not only on the first notice");
-test("a bounded walk AFTER the first notice is still announced, and warns only once per session", () => {
+test("EVERY bounded walk of a session is announced (a bounded walk is a per-result fact)", () => {
 	resetEverything();
 	const ctx = fakeCtx();
 	// First result consumes the once-per-session redaction summary.
@@ -1064,14 +1083,23 @@ test("a bounded walk AFTER the first notice is still announced, and warns only o
 	strictEqual(notifications.length, 1);
 	let deep: Record<string, unknown> = { leaf: "ordinary" };
 	for (let i = 0; i < MAX_DETAILS_DEPTH + 5; i++) deep = { next: deep };
-	// Second result: a bounded details walk with nothing redacted. Its warning must NOT ride on (and
-	// be suppressed by) the already-fired summary.
+	// A bounded walk with nothing redacted must NOT ride on (and be suppressed by) the summary.
 	runHandler(toolResultEvent({ toolCallId: "call-2", content: [{ type: "text", text: "clean" }], details: deep }), ctx);
 	ok(notifications.length > 1, "the bounded walk must be announced even after the summary fired");
 	ok(notifications.some((note) => note.msg.includes("WARNING")), "the bounded warning must appear");
 	const afterSecond = notifications.length;
+	// The corrected invariant: the SECOND bounded walk after the first is ALSO announced. The previous
+	// `warnedBounded` latch silently dropped it, so the pane could present a bounded (incomplete) walk
+	// as if it were nothing special from the second onward — the header's "never silent" was false.
 	runHandler(toolResultEvent({ toolCallId: "call-3", content: [{ type: "text", text: "clean" }], details: deep }), ctx);
-	strictEqual(notifications.length, afterSecond, "the bounded warning does not spam the same session");
+	ok(notifications.length > afterSecond, "a SECOND bounded walk must still be announced, not silently dropped");
+	ok(notifications[notifications.length - 1].msg.includes("WARNING"));
+	// And the durable record is written on EVERY bounded result, not only the announced one.
+	strictEqual(appendEntryCalls.length, 3, "every bounded result is recorded");
+	const boundedRecords = appendEntryCalls.filter(
+		(call) => (call.data as { detailsWalkBounded: boolean }).detailsWalkBounded === true,
+	);
+	strictEqual(boundedRecords.length, 2, "both bounded results are recorded as bounded");
 });
 
 test("P3a: a credential-bearing URL is NOT registered (documented gap, pinned as deliberate)", () => {
@@ -1231,6 +1259,283 @@ test("M15: the detail-harvest walk enforces MAX_DETAILS_DEPTH and stops collecti
 	collectDetailsStrings(deep, out, budget, new WeakSet<object>(), 0);
 	strictEqual(budget.bounded, true, "the depth bound must mark the walk bounded");
 	ok(!out.includes("DEEP-LEAF-SECRET-0123456789"), "a string past the depth bound must NOT be collected");
+});
+
+// ── Round-3 adversarial review (#5109, PR #1502) ─────────────────────────────────────────────
+
+console.log("\nRound-3 — harvested labels must be normalized against the REGISTERED set");
+test("a registered secret in the env-like BASENAME is scrubbed from the marker, record, fleet log and notice", () => {
+	// The leak this closes: the harvested value's label is `read:<basename>#<key>`, and `<basename>` is
+	// attacker-influencable (an agent picks the path). Without normalizeSecretValues over the harvested
+	// set, a registered secret in the basename is embedded in the in-band marker persisted in the
+	// transcript AND in the record/fleet-log `hits` label. JEV_KEY is registered via jev-config.json.
+	resetEverything();
+	const fresh = "HARVESTED-LABEL-SECRET-0123456789";
+	const { returned } = runHandler(
+		toolResultEvent({
+			input: { path: `/repo/${JEV_KEY}.env.local` },
+			content: [{ type: "text", text: `OPENROUTER_API_KEY=${fresh}\n` }],
+		}),
+	);
+	ok(returned, "the harvested value must be redacted");
+	const out = (returned as { content: Array<{ text: string }> }).content[0].text;
+	ok(!out.includes(fresh), "the harvested value must be gone from this result");
+	ok(!out.includes(JEV_KEY), "the registered basename secret must NOT survive in the marker");
+	ok(out.includes(LABEL_VALUE_REPLACEMENT), "the basename secret is replaced by the scrub token");
+	const sinks = [
+		...appendEntryCalls.map((call) => JSON.stringify(call)),
+		...appendFileLines,
+		...notifications.map((note) => note.msg),
+		...consoleErrors,
+	];
+	for (const sink of sinks) {
+		ok(!sink.includes(JEV_KEY), "a sink carried the registered basename secret");
+		ok(!sink.includes(fresh), "a sink carried the harvested value");
+	}
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "the record is written");
+	const data = entry.data as { hits: Array<{ label: string }> };
+	ok(data.hits[0].label.includes(LABEL_VALUE_REPLACEMENT), "the record label is scrubbed");
+	ok(!data.hits[0].label.includes(JEV_KEY), "the record label must not carry the basename secret");
+});
+test("a registered secret in a bash command TOKEN is scrubbed from the harvested label too", () => {
+	resetEverything();
+	const fresh = "BASH-TOKEN-HARVEST-SECRET-0123456789";
+	const { returned } = runHandler(
+		toolResultEvent({
+			toolName: "bash",
+			input: { command: `cat /repo/${AUTH_KEY}.env` },
+			content: [{ type: "text", text: `OPENROUTER_API_KEY=${fresh}\n` }],
+		}),
+	);
+	ok(returned, "the harvested value must be redacted");
+	const all = JSON.stringify([returned, ...appendEntryCalls, ...appendFileLines, ...notifications, ...consoleErrors]);
+	ok(!all.includes(fresh), "the harvested value must reach no sink");
+	ok(!all.includes(AUTH_KEY), "the bash-token secret must reach no sink");
+	ok(all.includes(LABEL_VALUE_REPLACEMENT), "the bash-token secret is replaced by the scrub token");
+});
+
+test("a harvested value retained in the CACHE keeps a scrubbed label on later results", () => {
+	// `retainHarvested` stores the RAW label; `getRegistryValues` must normalize on the way out, so a
+	// later, unrelated result is redacted under the scrubbed label rather than the raw basename.
+	resetEverything();
+	const fresh = "RETAINED-LABEL-SECRET-0123456789";
+	runHandler(
+		toolResultEvent({
+			input: { path: `/repo/${TORTOISE_KEY}.env.local` },
+			content: [{ type: "text", text: `OPENROUTER_API_KEY=${fresh}\n` }],
+		}),
+	);
+	const { returned } = runHandler(toolResultEvent({ content: [{ type: "text", text: `echo ${fresh}` }] }));
+	ok(returned, "the retained harvested value is redacted on a later result");
+	const out = JSON.stringify(returned);
+	ok(!out.includes(TORTOISE_KEY), "the later marker must not carry the basename secret");
+	ok(out.includes(LABEL_VALUE_REPLACEMENT), "the later label is scrubbed");
+	ok(!out.includes(fresh), "the harvested value itself is redacted");
+});
+
+console.log("\nRound-3 — an unreadable event field must not discard a completed redaction");
+test("an UNREADABLE `toolCallId` still returns the computed patch and writes a durable record", () => {
+	resetEverything();
+	const event = toolResultEvent({ content: [{ type: "text", text: `k=${TORTOISE_KEY}` }] });
+	Object.defineProperty(event, "toolCallId", {
+		configurable: true,
+		get() {
+			throw new Error("tcId-boom");
+		},
+	});
+	const { returned } = runHandler(event);
+	ok(returned, "the redaction must NOT be discarded by an unreadable identity field");
+	ok(!JSON.stringify(returned).includes(TORTOISE_KEY));
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "a durable record must still be written");
+	const data = entry.data as { eventReadFailed: boolean; toolCallId: unknown };
+	strictEqual(data.eventReadFailed, true, "the unreadable field is recorded");
+	strictEqual(data.toolCallId, null, "the unreadable identity field is left null, never invented");
+	strictEqual(appendFileLines.length, 1, "the fleet log gets the record too");
+	for (const sink of [JSON.stringify(appendEntryCalls), ...appendFileLines, ...notifications.map((n) => n.msg), ...consoleErrors]) {
+		ok(!sink.includes(TORTOISE_KEY), "no sink may carry the value");
+	}
+});
+test("an UNREADABLE `toolName` does not abort the redaction or the record", () => {
+	resetEverything();
+	const event = toolResultEvent({ content: [{ type: "text", text: `k=${TORTOISE_KEY}` }] });
+	Object.defineProperty(event, "toolName", {
+		configurable: true,
+		get() {
+			throw new Error("tn-boom");
+		},
+	});
+	const { returned } = runHandler(event);
+	ok(returned, "the redaction must survive an unreadable tool name");
+	ok(!JSON.stringify(returned).includes(TORTOISE_KEY));
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "the record is written");
+	const data = entry.data as { eventReadFailed: boolean; toolName: unknown };
+	strictEqual(data.eventReadFailed, true);
+	strictEqual(data.toolName, "tool", "an unreadable tool name falls back to a fixed placeholder");
+});
+test("an UNREADABLE `input` does not abort the redaction or the record", () => {
+	resetEverything();
+	const event = toolResultEvent({ content: [{ type: "text", text: `k=${TORTOISE_KEY}` }] });
+	Object.defineProperty(event, "input", {
+		configurable: true,
+		get() {
+			throw new Error("in-boom");
+		},
+	});
+	const { returned } = runHandler(event);
+	ok(returned, "the redaction must survive an unreadable input");
+	ok(!JSON.stringify(returned).includes(TORTOISE_KEY));
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "the record is written");
+	strictEqual((entry.data as { eventReadFailed: boolean }).eventReadFailed, true);
+	ok(consoleErrors.some((line) => line.includes("reading input failed")), "the unreadable input is announced");
+});
+test("an event-read failure with an EMPTY registry still writes a durable record", () => {
+	resetEverything();
+	try {
+		_setSecretEchoGuardHooksForTest({ homedir: () => join(HOME, "nowhere"), env: () => ({}) });
+		_resetSecretEchoGuardCacheForTest();
+		const event = toolResultEvent({ content: [{ type: "text", text: "clean" }] });
+		Object.defineProperty(event, "toolCallId", {
+			configurable: true,
+			get() {
+				throw new Error("tcId-boom");
+			},
+		});
+		const { returned } = runHandler(event);
+		strictEqual(returned, undefined, "nothing was redacted, so no patch");
+		ok(
+			appendEntryCalls.some((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE),
+			"an event-read failure must still be recorded even when the registry is empty",
+		);
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+
+console.log("\nRound-3 — the harvest-failure gates and the bare-STRING content harvest");
+test("a CONTENT-harvest failure with an EMPTY registry still writes a durable record", () => {
+	// A part whose `type` throws on the FIRST read (the harvest) and resolves on the SECOND (the
+	// redaction), so ONLY the harvest fails and the redaction walk finds nothing to change. This
+	// isolates `contentHarvestFailed` in BOTH the early return and `anyFailure`.
+	resetEverything();
+	try {
+		_setSecretEchoGuardHooksForTest({ homedir: () => join(HOME, "nowhere"), env: () => ({}) });
+		_resetSecretEchoGuardCacheForTest();
+		let typeReads = 0;
+		const flakyPart = Object.create(null) as Record<string, unknown>;
+		Object.defineProperty(flakyPart, "type", {
+			enumerable: true,
+			get() {
+				typeReads++;
+				if (typeReads === 1) throw new Error("first-read-boom");
+				return "text";
+			},
+		});
+		Object.defineProperty(flakyPart, "text", { enumerable: true, get: () => "ordinary output" });
+		const { returned } = runHandler(toolResultEvent({ input: { path: "/repo/app.env" }, content: [flakyPart] }));
+		strictEqual(returned, undefined, "nothing was redacted, so no patch");
+		const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+		ok(entry, "a content-harvest-only failure must STILL write the durable record");
+		const data = entry.data as { harvestFailed: boolean; contentRedactionFailed: boolean; total: number };
+		strictEqual(data.harvestFailed, true);
+		strictEqual(data.contentRedactionFailed, false, "the redaction walk itself did not fail");
+		strictEqual(data.total, 0);
+		strictEqual(appendFileLines.length, 1);
+		ok(consoleErrors.some((line) => line.includes("content harvest failed")));
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+test("a DETAILS-harvest failure with an EMPTY registry still writes a durable record", () => {
+	resetEverything();
+	try {
+		_setSecretEchoGuardHooksForTest({ homedir: () => join(HOME, "nowhere"), env: () => ({}) });
+		_resetSecretEchoGuardCacheForTest();
+		let reads = 0;
+		const details: Record<string, unknown> = {};
+		Object.defineProperty(details, "boom", {
+			enumerable: true,
+			get() {
+				reads++;
+				if (reads === 1) throw new Error("first");
+				return "clean";
+			},
+		});
+		const { returned } = runHandler(
+			toolResultEvent({ input: { path: "/repo/app.env" }, content: [{ type: "text", text: "clean" }], details }),
+		);
+		strictEqual(returned, undefined);
+		const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+		ok(entry, "a details-harvest failure must still write the record");
+		const data = entry.data as { harvestFailed: boolean; detailsWalkBounded: boolean };
+		strictEqual(data.harvestFailed, true);
+		strictEqual(data.detailsWalkBounded, true);
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+test("a bare-STRING content (defensive shape) IS harvested when the input is env-like", () => {
+	resetEverything();
+	const fresh = "STRING-CONTENT-HARVEST-SECRET-0123456789";
+	const { returned } = runHandler(
+		toolResultEvent({ input: { path: "/repo/app.env" }, content: `OPENROUTER_API_KEY=${fresh}\n` }),
+	);
+	ok(returned, "the string-content harvest must register and redact the value");
+	ok(!JSON.stringify(returned).includes(fresh));
+});
+
+console.log("\nRound-3 — the length-floor override and the crafted-shape residuals");
+test("SECRET_ECHO_GUARD_MIN_LENGTH is honored end-to-end (the override is not silently ignored)", () => {
+	resetEverything();
+	try {
+		_setSecretEchoGuardHooksForTest({
+			env: () => ({ ...controlledEnv, SECRET_ECHO_GUARD_MIN_LENGTH: "100" }),
+		});
+		_resetSecretEchoGuardCacheForTest();
+		// PROCESS_ENV_KEY is 30 chars, over the default 12 but under the 100 override.
+		const { returned } = runHandler(toolResultEvent({ content: [{ type: "text", text: `key=${PROCESS_ENV_KEY}` }] }));
+		strictEqual(returned, undefined, "the 100-char floor must exclude a 30-char value");
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+test("R3: an own `__proto__` key survives the details rebuild (not dropped by the inherited setter)", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	// JSON.parse materializes an OWN `__proto__` key; the rebuild must keep it (and redact its value),
+	// rather than hitting the inherited `__proto__` setter and dropping the key entirely.
+	const source = JSON.parse(`{"__proto__":"x ${TORTOISE_KEY}","nested":1}`) as Record<string, unknown>;
+	deepEqual(Object.keys(source).sort(), ["__proto__", "nested"], "precondition: own __proto__ key exists");
+	const out = redactDetails(source, values, new Map());
+	strictEqual(out.changed, true);
+	const rebuilt = out.value as Record<string, unknown>;
+	ok(Object.prototype.hasOwnProperty.call(rebuilt, "__proto__"), "the own __proto__ key must survive");
+	strictEqual(rebuilt["__proto__"], `x ${redactionMarker("l")}`, "and its value must be redacted");
+	strictEqual(Object.getPrototypeOf(rebuilt), Object.prototype, "the prototype must not be replaced by the value");
+	ok(!deepContains(rebuilt, TORTOISE_KEY));
+});
+test("R3 (documented residual): a BOXED String content part is NOT redacted (exact-match only)", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	const out = redactContent([{ type: "text", text: new String(`k=${TORTOISE_KEY}`) }], values, new Map());
+	strictEqual(out.changed, false, "a boxed String slips the primitive-string exact-match check");
+});
+test("R3 (documented residual): a whitespace-inserted or split secret is NOT redacted", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	const hits = new Map<string, number>();
+	const spaced = TORTOISE_KEY.split("").join(" ");
+	strictEqual(redactString(spaced, values, hits), spaced, "inserted whitespace is not exact-matched");
+	const parts = redactContent(
+		[{ type: "text", text: `k=${TORTOISE_KEY.slice(0, 10)}` }, { type: "text", text: TORTOISE_KEY.slice(10) }],
+		values,
+		hits,
+	);
+	strictEqual(parts.changed, false, "a secret split across two parts is not joined");
 });
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────
