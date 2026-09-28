@@ -53,7 +53,7 @@ function latched(tag: string) {
   const { env } = makeEnv(tag);
   setExhausted({
     primaryProvider: "deepseek",
-    reason: "exhausted",
+    reason: "poller",
     source: "poller",
     family: FAMILY,
     fromLeg: FLASH_PRIMARY,
@@ -100,18 +100,55 @@ test("#1508 — a marker-driven write cannot latch onto an unkeyed leg", () => {
   const { env } = makeEnv("writeside");
   const st = setExhausted({
     primaryProvider: "deepseek",
-    reason: "exhausted",
+    reason: "402",
     source: "marker",
     family: FAMILY,
     fromLeg: FLASH_PRIMARY,
     env,
     unkeyed: UNKEYED_OPENROUTER,
   });
-  const active = st.primaries["deepseek"]?.families?.[FAMILY]?.activeLeg;
+  const famRec = st.primaries["deepseek"]?.families?.[FAMILY];
   ok(
-    active == null || active.provider !== "openrouter",
-    `the recorded activeLeg must not be openrouter (got ${JSON.stringify(active)})`,
+    famRec?.activeLeg == null,
+    `no leg may be latched (got ${JSON.stringify(famRec?.activeLeg)})`,
   );
+  // The exact durable shape, not a disjunction: a halt caused ONLY by the
+  // credential term must NOT be recorded terminal. The read side honours
+  // `terminal` unconditionally and BEFORE any re-walk (unlike `activeLeg`, which
+  // is re-validated), so a terminal written on this non-durable observation would
+  // freeze the family for the full 24h TTL, and it is self-sustaining because
+  // resolution halts pre-spawn and no marker-driven write can therefore clear it.
+  equal(
+    famRec?.terminal,
+    false,
+    "a credential-only halt must be re-walkable, not durable",
+  );
+});
+
+// ── 4b. the credential-only halt is NOT durable — it recovers when the oracle
+//        retracts the verdict (pins the write/read symmetry above) ──────────
+test("#1508 — a credential-only halt recovers once the registry reports the leg keyed", () => {
+  const { env } = makeEnv("recover");
+  setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: FAMILY,
+    fromLeg: FLASH_PRIMARY,
+    env,
+    unkeyed: UNKEYED_OPENROUTER,
+  });
+  const state = readLatchState(env);
+  const stillUnkeyed = resolveWithChain(FAMILY, FLASH_PRIMARY, state, { env, unkeyed: UNKEYED_OPENROUTER });
+  equal(stillUnkeyed.halted, true, "while the registry reports the leg unkeyed, resolution still halts");
+  // The operator configures the key: the verdict is retracted.
+  const recovered = resolveWithChain(FAMILY, FLASH_PRIMARY, state, { env });
+  equal(
+    recovered.halted,
+    false,
+    "a retracted credential verdict must not stay durable — a persisted `terminal` would freeze the family for the whole TTL",
+  );
+  equal(recovered.leg?.provider, "openrouter", "and resolution advances to the previously-excluded leg");
 });
 
 // ── 5. FAIL-SAFE: only a positive verdict excludes ──────────────────────────

@@ -7271,7 +7271,7 @@ test("#1508 — decidePostDispatch: a marker-driven write does not latch onto an
     });
     const active = readLatchState(env).primaries.deepseek?.families?.["deepseek-v4-flash"]?.activeLeg;
     ok(
-      active == null || active.provider !== "openrouter",
+      active == null,
       `the durable latch must not record an unkeyed leg (got ${JSON.stringify(active)})`,
     );
     ok(
@@ -7292,6 +7292,7 @@ test("#1508 — the registered tool_result handler turns a failed child into isE
   deepEqual(h({ toolName: "task", isError: false, details: { isError: true } }), { isError: true }, "a spawn error carries no exitCode but is still a failure");
   deepEqual(h({ toolName: "task", isError: false, details: { killed: true, exitCode: 0 } }), { isError: true }, "a watchdog cut records exitCode 0 but is still a failure");
   deepEqual(h({ toolName: "task", isError: false, details: { killed: true, exitCode: null } }), { isError: true }, "a cut with a null exit is still a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { fallbackStatus: "failed" } }), { isError: true }, "the #152 fallback's own failure status is a failure");
   deepEqual(h({ toolName: "task", isError: false, details: { failoverHalt: true } }), { isError: true }, "a failover halt ran no leg → a failure");
   // The TOOL layer's own terminal failures — reached with no exit code and no
   // inner-spawn marker at all. `status:"failed"` is the one a watchdog kill with

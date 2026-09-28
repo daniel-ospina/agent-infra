@@ -984,6 +984,11 @@ function recordFresh(p: PrimaryLatch, now: number, ttl: number): boolean {
  * carries `env` (RC1/RC1b, #1508). */
 export type UnkeyedLookup = (provider: string) => boolean;
 
+/** Once-per-provider guard for the diagnostic inside `unkeyedProviders` (never
+ * affects the verdict). Declared ahead of its use so a top-level call cannot hit
+ * the const's temporal dead zone. */
+const oracleErrorReported = new Set<string>();
+
 /** Build the unkeyed-provider set from `isUnkeyed`, FAILING SAFE: an unknown or
  * throwing answer is NOT treated as unkeyed. A wrongly-skipped leg is the mirror
  * of the defect this fixes — it removes a USABLE leg — and the registry cannot
@@ -995,8 +1000,17 @@ export function unkeyedProviders(ids: Iterable<string>, isUnkeyed: UnkeyedLookup
   for (const id of ids) {
     try {
       if (isUnkeyed(id)) s.add(id);
-    } catch {
-      // unknown → do NOT skip (see above)
+    } catch (err) {
+      // unknown → do NOT skip (see above). Reported once per id per process: a
+      // persistently throwing oracle makes the credential term inert for every
+      // dispatch, and WITHOUT this line that degradation is indistinguishable
+      // from "every leg is keyed". The return value is deliberately unchanged.
+      if (!oracleErrorReported.has(id)) {
+        oracleErrorReported.add(id);
+        console.error(
+          `[provider-failover] getProviderAuthStatus threw for "${id}" — credential term skipped for this provider (fail-safe: its leg is NOT excluded): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
   return s;
@@ -1008,11 +1022,18 @@ export interface AuthStatusLookup {
   getProviderAuthStatus(provider: string): { configured?: boolean } | undefined;
 }
 
-/** The unkeyed set for one dispatch, computed at a scope that holds `ctx` and
- * carried to the predicate. Shared by EVERY consumer that has a registry — the
- * dispatch path and the interactive path — so the family-to-legs mapping exists
- * in one place. A missing registry or family yields the empty set (exclude
- * nothing), the same fail-safe `unkeyedProviders` encodes. */
+/** The unkeyed set for one dispatch, computed at a call site that holds `ctx`
+ * and injected into the predicate, which reads no registry itself. Called at each
+ * `ctx`-bearing site — the two task-tool dispatch sites and the three
+ * interactive sites — so the family-to-legs mapping and the `configured === false`
+ * reading exist in ONE place rather than once per call site. A missing registry or
+ * family yields the empty set (exclude nothing), the same fail-safe
+ * `unkeyedProviders` encodes. Consumers that consult `unavailableProviders` and
+ * therefore take the set: `nextLegAfter`, `resolveWithChain`, `setExhausted`,
+ * `resolveDispatchLeg`, `decidePostDispatch`, `runFailoverDecisionLoop`,
+ * `interactiveHopTarget`. NOT `interactiveRestoreTarget` or the interactive
+ * hop-own-drain root switch — both select a family ROOT rather than a hop
+ * alternative, i.e. the cold-start path; see the recorded residual (T6/T6b). */
 export function dispatchUnkeyedSet(
   registry: AuthStatusLookup | undefined,
   family: string | undefined,
@@ -1377,11 +1398,25 @@ export function setExhausted(input: LatchInput): LatchState {
       } else {
         // every leg blocked → explicit halt class for this family (terminal:
         // resolution must not re-walk from the primary past these legs)
+        //
+        // #1508: the CREDENTIAL term is not durable evidence, so it must not be
+        // what makes this halt terminal. The read side honours `terminal`
+        // UNCONDITIONALLY and BEFORE any re-walk (`:1215`), while `activeLeg` is
+        // re-validated against the current `unavailable` set — so a `terminal`
+        // written on a credential-only walk would freeze the family for the whole
+        // TTL on an observation the oracle can retract at any moment, and it is
+        // self-sustaining: resolution halts PRE-spawn, so no marker-driven write
+        // can ever clear it (only a poller clear of the root, or TTL expiry).
+        // Re-walk WITHOUT the credential term: a leg found that way means the
+        // oracle alone emptied the chain, so record the NON-terminal shape and
+        // let the next resolution re-walk against a fresh oracle.
+        const withoutUnkeyed = nextLegAfter(fam, input.fromLeg, cur, { env, now, ttlMs: ttl });
+        const credentialOnly = !withoutUnkeyed.halted && !!withoutUnkeyed.leg;
         families[fam] = {
-          activeLeg: null,
+          activeLeg: credentialOnly ? null : step.leg,
           hopCount: prev?.hopCount ?? 0,
           lastReason: input.reason,
-          terminal: true,
+          terminal: !credentialOnly,
         };
       }
     } else if (fam && !input.fromLeg) {

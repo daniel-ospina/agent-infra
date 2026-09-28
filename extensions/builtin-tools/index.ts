@@ -68,7 +68,6 @@ import {
   latchTtlMs,
   blockedProviders,
   legIsFamilyMember,
-  unkeyedProviders,
   dispatchUnkeyedSet,
   appendLedger,
   scanStderrForExhaustion,
@@ -678,7 +677,7 @@ export function haltDispatchResult(input: {
   const detail =
     input.reason === "blocked"
       ? "TASK_EXHAUSTION_BLOCK=1 is set — a dispatch that would hop to another leg is blocked (fail-fast)."
-      : `All failover legs for alias family "${input.family}" are exhausted or auth-blocked.`;
+      : `All failover legs for alias family "${input.family}" are exhausted, auth-blocked, or have no configured credential.`;
   const blockedNote = blockedIds.length ? ` Durable auth-blocked providers: ${blockedIds.join(", ")}.` : "";
   const attemptedNote = input.attempted
     ? `The dispatch ran on ${input.provider}/${input.model} and exhausted it before the halt decision.`
@@ -4184,15 +4183,22 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
 type TaskResultDetails = {
   exitCode?: unknown;
   status?: unknown;
+  fallbackStatus?: unknown;
   isError?: unknown;
   killed?: unknown;
   failoverHalt?: unknown;
   failoverHopSpawnFailed?: unknown;
 };
 
-/** The task tool's own terminal-failure `status` vocabulary (producers cited at
- * the hook). Enumerated rather than "anything not ok", so an unrecognised status
- * stays a non-error and a future success status cannot become a false failure. */
+/** The task tool's own terminal-failure `status` vocabulary. Enumerated rather
+ * than "anything not ok", so an unrecognised status stays a non-error and a
+ * future success status cannot become a false failure.
+ *
+ * Keep in sync with the producers in this file, which set `status` and
+ * `fallbackStatus` from this domain: `invalid-cwd` (:3264), `invalid-session-id`
+ * (:4861, :4908), `circuit_open` (:5037), `failed` (:5044), and the #152
+ * fallback copy (:5027) — guarded by builtin-tools.test.ts, which asserts every
+ * member is reachable and that an unknown status stays a success. */
 const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id"]);
 
 export default function (pi: ExtensionAPI) {
@@ -4213,7 +4219,7 @@ export default function (pi: ExtensionAPI) {
   // and `finalizeExecutedToolCall` rebuilds the result from a field allow-list
   // (:507-510) — so an `isError` field on the returned object is silently
   // DROPPED. Throwing instead would flip it but destroys `details`
-  // (`createErrorToolResult` → `details: {}`, :525-528) — and `details` IS the
+  // (`createErrorToolResult` → `details: {}`, :526-531) — and `details` IS the
   // failure composition. A `tool_result` handler is the only route that both
   // flips the flag and preserves the composition (agent-session.js:269 honours
   // `hookResult?.isError`).
@@ -4236,6 +4242,10 @@ export default function (pi: ExtensionAPI) {
     const failed =
       (typeof d?.exitCode === "number" && d.exitCode !== 0) ||
       (typeof d?.status === "string" && FAILED_TASK_STATUS.has(d.status)) ||
+      // The #152 fallback chain writes the FALLBACK leg's status here rather than
+      // `status`, so a dispatch whose fallback also failed carries `failed` /
+      // `circuit_open` under this key alone.
+      (typeof d?.fallbackStatus === "string" && FAILED_TASK_STATUS.has(d.fallbackStatus)) ||
       d?.isError === true ||
       d?.killed === true ||
       d?.failoverHalt === true ||
