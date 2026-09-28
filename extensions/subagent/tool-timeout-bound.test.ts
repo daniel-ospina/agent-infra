@@ -72,25 +72,31 @@ testAsync("#1500 — an ABSENT timeout parks (the defect #1500 is about) and the
   // 20-minute park); we assert only that the call is still running well past
   // where the bounded call above already rejected — i.e. absence really does
   // mean "no bound", so Leg A alone would not have bounded anything.
+  //
+  // #1510 review: BOTH commands carry a unique per-run marker. The earlier
+  // cleanup was a bare `pkill -f 'sleep 30'`, which matches every process on the
+  // HOST whose command line contains that substring — on a shared box running a
+  // fleet of agent sessions, that is cross-session destruction of an unrelated
+  // lane's in-flight command. Kill by the marker only.
+  const marker = `pi-timeout-bound-${process.pid}-${Date.now()}`;
   const bounded = createBashTool(process.cwd(), { exposeSessionEnvironment: false });
   let boundedRejected = false;
   const boundedRun = bounded
-    .execute("tc-b", { command: "sleep 30", timeout: 2 }, undefined, undefined, { cwd: process.cwd() } as any)
+    .execute("tc-b", { command: `sleep 30 # ${marker}`, timeout: 2 }, undefined, undefined, { cwd: process.cwd() } as any)
     .then(() => undefined, () => { boundedRejected = true; });
   let unboundedSettled = false;
   const unbounded = tool
-    .execute("tc-n", { command: "sleep 30" }, undefined, undefined, { cwd: process.cwd() } as any)
+    .execute("tc-n", { command: `sleep 30 # ${marker}`, timeout: undefined }, undefined, undefined, { cwd: process.cwd() } as any)
     .then(() => { unboundedSettled = true; }, () => { unboundedSettled = true; });
 
   await sleep(6_000);
   ok(boundedRejected, "the BOUNDED twin must already have terminated by 6 s");
   equal(unboundedSettled, false, "an ABSENT timeout has no bound — this is exactly why Leg B exists");
 
-  // Clean up the still-running uninstrumented command. (`treeKill`-equivalent:
-  // pi's own executor is unreachable here, so signal the shell directly.)
+  // Clean up ONLY this test's own processes (the marker is unique per run).
   const { execSync } = await import("node:child_process");
   try {
-    execSync("pkill -f 'sleep 30' || true", { stdio: "ignore" });
+    execSync(`pkill -f ${JSON.stringify(marker)} || true`, { stdio: "ignore" });
   } catch {
     /* best effort */
   }

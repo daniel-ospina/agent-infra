@@ -2495,6 +2495,15 @@ export const KNOWN_STDERR_NOISE: RegExp[] = [
   // the #783 silent-loss failure mode under a new name. The `^` anchor is what
   // keeps this precise: only a line BEGINNING with the warning is noise.
   /^Warning: No project session found with id '[^']*'/,
+  // #1500: the child's one-time "TASK_TOOL_TIMEOUT_S is not a usable value, so
+  // the bash bound is DISARMED" diagnostic. It MUST be filtered here: an
+  // unrecognised stderr line calls `onRealOutput()`, and since the retryability
+  // contract is `resolveUndefined = !hasOutput`, an unfiltered one-time warning
+  // would mark a genuinely ZERO-OUTPUT dispatch as having produced output —
+  // re-creating exactly the #783 silent-loss failure this filter exists for.
+  // The anchor keeps it precise: the operator's value is interpolated after the
+  // prefix, so match only the fixed prefix.
+  /^\[task-heartbeat\] warn TASK_TOOL_TIMEOUT_S=/,
 ];
 
 /** True when a complete stderr line/residue is known pi-CLI noise

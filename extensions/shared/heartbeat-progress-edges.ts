@@ -883,7 +883,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: null,
     axis: "kill",
     guardedBy: BT_TEST,
-    note: "FUNCTION, not a const: env override TASK_TOOL_TIMEOUT_S — absent → DEFAULT_TOOL_TIMEOUT_S (7200 s); non-positive / non-finite / unparseable → null = DISARMED, with a once-only warning from toolTimeoutDisarmWarning; a finite positive value is clamped to the setTimeout ceiling (~24.8 days in ms), above which Node warns and fires immediately, inverting the bound into a kill. Mirrors getToolStallMs.",
+    note: "FUNCTION, not a const: env override TASK_TOOL_TIMEOUT_S — absent → DEFAULT_TOOL_TIMEOUT_S (7200 s); non-positive / non-finite / unparseable → null = DISARMED, with a once-only warning from toolTimeoutDisarmWarning; a finite positive value is CLAMPED to floor(2147483647/1000) s so pi's own resolveTimeoutMs does not reject the call (`Invalid timeout: maximum is 2147483.647 seconds`) rather than letting a Node timer overflow. Mirrors getToolStallMs.",
   },
   {
     name: "DEFAULT_MAX_DISPATCH_MS",

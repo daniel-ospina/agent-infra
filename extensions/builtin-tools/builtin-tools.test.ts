@@ -1434,6 +1434,18 @@ test("#783: fresh --session-id warning is known-noise — never flips hasOutput"
   equal(flushHeartbeatLineBuf(c3), "", "warning residue dropped on flush");
   equal(real3(), false);
 
+  // #1500: the child's one-time TASK_TOOL_TIMEOUT_S-is-disarmed diagnostic is
+  // the SAME hazard — an unrecognised stderr line would flip hasOutput on a
+  // genuinely zero-output dispatch. The operator's own value is interpolated
+  // after the fixed prefix, so the filter must anchor on the prefix alone.
+  const disarm =
+    '[task-heartbeat] warn TASK_TOOL_TIMEOUT_S="abc" is not a positive finite number — the dispatched-child bash timeout default is DISARMED; bash calls may park indefinitely.';
+  const { ctx: c5, acc: acc5, real: real5 } = makeIngest();
+  ingestHeartbeatChunk(disarm + "\n", c5, 1);
+  equal(real5(), false, "the disarm warning must NOT flip hasOutput");
+  equal(acc5(), "", "and is filtered out of the stderr accumulator");
+  equal(c5.state.markerCount, 0, "`warn` is not a heartbeat marker kind, so it must not be parsed as one");
+
   // A genuine child error line still flips hasOutput.
   const { ctx: c4, real: real4 } = makeIngest();
   ingestHeartbeatChunk(warn + "\nreal child error line\n", c4, 2);
@@ -4832,9 +4844,10 @@ test("#1500 getToolTimeoutSeconds — absent ⇒ bound ON; only a SUPPLIED bad v
   for (const bad of ["0", "-1", "-0.5", "abc", "", " ", "Infinity", "-Infinity", "NaN", "1e400"]) {
     equal(g({ TASK_TOOL_TIMEOUT_S: bad }), null, `"${bad}" must DISARM, not bound`);
   }
-  // Above the setTimeout ceiling Node warns and fires IMMEDIATELY — an unclamped
-  // value would invert the bound into an instant kill.
-  equal(g({ TASK_TOOL_TIMEOUT_S: "99999999999" }), 2147483, "clamped to the setTimeout ceiling");
+  // Above pi's own MAX_TIMEOUT_MS, `resolveTimeoutMs` THROWS
+  // `Invalid timeout: maximum is 2147483.647 seconds` — so an unclamped value
+  // would make the bash call fail outright, not merely be capped.
+  equal(g({ TASK_TOOL_TIMEOUT_S: "99999999999" }), 2147483, "clamped to pi's timeout ceiling");
   // The warning predicate mirrors the polarity exactly.
   const w = childHb.toolTimeoutDisarmWarning;
   equal(w(undefined), null, "absent is the DEFAULT, not a mistake — no warning");
@@ -4893,6 +4906,22 @@ testAsync("#1500 — the bash bound: filled when absent, NEVER overriding, bash 
       await call("bash", a);
       equal(a.timeout, childHb.DEFAULT_TOOL_TIMEOUT_S, "absent → the bound is ON");
       equal(a.timeout, 7200);
+
+      // #1510 review: the mutation must be IN PLACE on the object the handler was
+      // handed. pi passes `beforeToolCall` the SAME object it later gives the
+      // tool's `execute`, so a handler that returned a new object (or replaced
+      // `event.input`) would silently do nothing. Reading it back off `a` after
+      // the await is exactly that propagation contract.
+      const identity: Record<string, unknown> = { command: "sleep 5" };
+      const before = identity.timeout;
+      await call("bash", identity);
+      equal(before, undefined, "fixture: the input really had no timeout to begin with");
+      equal(identity.timeout, childHb.DEFAULT_TOOL_TIMEOUT_S, "the SAME object is mutated in place (the propagation contract)");
+
+      // A throw must never escape: pi does not catch a `tool_call` handler's
+      // throw, it turns it into an immediate ERROR result and SKIPS the tool —
+      // so an escaping throw would block every bash call in every child.
+      await call("bash", Object.freeze({ command: "sleep 5" }));
 
       // T2: an explicit timeout is NEVER overridden.
       const b: Record<string, unknown> = { command: "sleep 5", timeout: 30 };

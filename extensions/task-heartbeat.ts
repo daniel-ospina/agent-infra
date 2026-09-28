@@ -760,9 +760,14 @@ export const DEFAULT_TOOL_TIMEOUT_S = 7200;
  *               open here would re-create the class this fixes (an unbounded
  *               command parks the child forever — pi's own schema says
  *               "optional, no default timeout").
- *   · > 0 finite → that many seconds (clamped to the `setTimeout` ceiling
- *               below, which is ~24.8 days in ms: above it Node warns and
- *               fires IMMEDIATELY, i.e. the bound would invert into a kill).
+ *   · > 0 finite → that many seconds, clamped so pi's OWN `resolveTimeoutMs`
+ *               does not reject the call. `dist/core/tools/bash.js` THROWS
+ *               `Invalid timeout: maximum is 2147483.647 seconds` above its
+ *               `MAX_TIMEOUT_MS`, so an unclamped huge value would not overrun
+ *               a Node timer — it would fail the bash call outright.
+ *               `floor(2147483647 / 1000)` = 2147483 s is the conservative
+ *               whole-second floor of that ceiling (647 ms below the exact
+ *               limit, so no value can sit at the fractional edge).
  *   · anything else → `null` = DISARMED. Only a value the OPERATOR actually
  *               supplied can disarm it, and `toolTimeoutDisarmWarning` says so.
  */
@@ -978,30 +983,51 @@ export default function (pi: ExtensionAPI) {
   if (dispatchMarkerActive()) {
     let disarmWarned = false;
     pi.on("tool_call", async (event) => {
-      if (event.toolName !== "bash") return;
-      const input = event.input as { timeout?: unknown } | null | undefined;
-      if (!input || typeof input !== "object") return;
-      // #1500 c1: never override a caller-supplied value. An explicit `null` is
-      // treated as ABSENT, deliberately: pi's `resolveTimeoutMs` THROWS on
-      // `Invalid timeout: must be a finite number of seconds`, so passing a null
-      // through would reject the call rather than leave it unbounded.
-      if (input.timeout !== undefined && input.timeout !== null) return;
-      const seconds = getToolTimeoutSeconds();
-      if (seconds === null) {
-        const warning = toolTimeoutDisarmWarning(process.env.TASK_TOOL_TIMEOUT_S);
-        if (warning && !disarmWarned) {
-          disarmWarned = true;
-          try {
-            // stderr, unprefixed — an OBSERVER must never break the child, and
-            // the parent's marker parser ignores any kind it does not know.
+      // This handler is THE ONE hook in this extension whose throw is
+      // DESTRUCTIVE, not merely noisy. Every other `pi.on` here goes through
+      // pi's `ExtensionRunner.emit()`, which try/catches per handler; a
+      // `tool_call` handler runs through `emitToolCall()`, which does NOT — the
+      // throw propagates to `prepareToolCall`, which turns it into an immediate
+      // ERROR tool result and SKIPS execution entirely. So an unguarded throw
+      // here would not degrade the child: it would block EVERY bash call in
+      // EVERY dispatched child. The whole body is therefore best-effort and
+      // swallowed — failing to inject a bound restores exactly the pre-#1500
+      // behaviour, which is strictly better than blocking the tool.
+      try {
+        if (!event || event.toolName !== "bash") return;
+        const input = event.input as { timeout?: unknown } | null | undefined;
+        if (!input || typeof input !== "object") return;
+        // #1500 c1: never override a caller-supplied value. `undefined` means
+        // absent; a `null` is treated as absent too (see below).
+        //
+        // The `!== null` half is defence-in-depth, NOT the mechanism: pi's
+        // `validateToolArguments` runs `normalizeOptionalNulls` BEFORE
+        // `beforeToolCall`, which already DELETES an optional null the schema
+        // rejects (`timeout` is `Type.Optional(Type.Number(...))`), so by the
+        // time this runs a caller-supplied null is normally gone.
+        if (input.timeout !== undefined && input.timeout !== null) return;
+        const seconds = getToolTimeoutSeconds();
+        if (seconds === null) {
+          const warning = toolTimeoutDisarmWarning(process.env.TASK_TOOL_TIMEOUT_S);
+          if (warning && !disarmWarned) {
+            disarmWarned = true;
+            // Must stay on stderr AND stay listed in KNOWN_STDERR_NOISE
+            // (extensions/builtin-tools/index.ts): an unrecognised stderr line
+            // calls the parent's `onRealOutput()`, so an unfiltered one-time
+            // diagnostic would forge `hasOutput=true` and mis-settle a
+            // genuinely zero-output child.
             console.error(warning);
-          } catch {
-            /* ditto */
           }
+          return;
         }
-        return;
+        // Mutate IN PLACE — pi hands `beforeToolCall` the same object it later
+        // passes to the tool's `execute`, so replacing it would silently do
+        // nothing (that propagation is pinned by a test).
+        input.timeout = seconds;
+      } catch {
+        // An observer must never break the child — and here a throw would block
+        // the tool call outright, so this catch is load-bearing, not cosmetic.
       }
-      input.timeout = seconds;
     });
   }
 
