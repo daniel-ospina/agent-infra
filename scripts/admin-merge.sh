@@ -2172,8 +2172,8 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), comp
   if [ "$MAIN_HEALTH_RED" -gt 0 ]; then
     MAIN_HEALTH_STATUS="red"
     MAIN_HEALTH_SUMMARY="RED — $MAIN_HEALTH_RED code-measuring check(s) FAIL on '$ref' ($sha) (of $MAIN_HEALTH_TOTAL measured, pending $MAIN_HEALTH_PENDING)"
-  elif [ "$MAIN_HEALTH_PENDING" -gt 0 ]; then
-    # ⛔ AN IN-FLIGHT CHECK IS NOT AN OBSERVED ONE (#5215 — Symptom 1). This branch
+  elif [ "$MAIN_HEALTH_COMPLETED" -lt "$MAIN_HEALTH_TOTAL" ]; then
+    # ⛔ AN UNOBSERVED CHECK IS NOT A PASSING ONE (#5215 — Symptom 1). This branch
     # used to fall through to `green`: a surface with 0 reds but N checks STILL
     # RUNNING certified GREEN, and the evidence line said so verbatim
     # ("GREEN — no code-measuring check fails among 16 check(s) ... (pending 5)").
@@ -2183,8 +2183,17 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), comp
     # rail had NOT finished observing, and an unobserved leg is not a passing one:
     # the rail can certify only the checks it has SEEN complete. A completed red
     # still wins (nothing in flight can un-fail it), so `red` is tested first.
+    #
+    # THE TEST IS OBSERVATION, NOT THE IN-FLIGHT COUNTER (review P2). `pending`
+    # counts only the NAMED in-flight spellings, so a non-completed check-run with
+    # an unrecognised status and a non-red conclusion (the #1353 defensive arm)
+    # lands in `total` and in NEITHER `reds` nor `pend`. Gating on `pending > 0`
+    # left that surface certifying GREEN having seen 0 of its checks complete — the
+    # same false certificate by the other route. `completed < total` subsumes the
+    # in-flight case (reds==0 ⇒ completed + pending + defensively-uncounted ==
+    # total) and closes it.
     MAIN_HEALTH_STATUS="unobserved"
-    MAIN_HEALTH_SUMMARY="UNKNOWN — $MAIN_HEALTH_PENDING of $MAIN_HEALTH_TOTAL check(s) on '$ref' ($sha) are STILL IN FLIGHT (pending $MAIN_HEALTH_PENDING), so this surface is only PARTLY observed: the $MAIN_HEALTH_COMPLETED completed check(s) carry no code-measuring red, but an in-flight check is not a green one"
+    MAIN_HEALTH_SUMMARY="UNKNOWN — only $MAIN_HEALTH_COMPLETED of $MAIN_HEALTH_TOTAL check(s) on '$ref' ($sha) have been SEEN COMPLETE (pending $MAIN_HEALTH_PENDING), so this surface is only PARTLY observed: the $MAIN_HEALTH_COMPLETED completed check(s) carry no code-measuring red, but a check that is not complete is not a green one"
   else
     MAIN_HEALTH_STATUS="green"
     MAIN_HEALTH_SUMMARY="GREEN — no code-measuring check fails among $MAIN_HEALTH_TOTAL check(s) on '$ref' ($sha) (pending $MAIN_HEALTH_PENDING)"

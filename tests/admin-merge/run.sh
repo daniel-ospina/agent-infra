@@ -3967,6 +3967,71 @@ run_admin 42 --dry-run >/dev/null 2>&1
 grep -q "the 0 completed check(s)" "$TMP/out" && pass "…and the COMPLETED count is emitted, not inferred as total-pending (#5215 review)" \
   || fail "the completed count is inferred: $(grep -m1 'base tree' "$TMP/out")"
 
+# (g4) A SURFACE WITH NO CHECK SEEN COMPLETE IS UNKNOWN, not GREEN — even with NO
+# check in flight (#5215 review P2). A non-completed check run with an unrecognised
+# status and a non-red conclusion (the #1353 defensive arm) is in `total`, in
+# neither `reds` NOR `pend`, and is not completed. Gating the verdict on
+# `pending > 0` left this surface certifying GREEN with `completed` = 0 — the
+# Symptom-1 false certificate by the other route.
+new_scen basehealth-defensive-only
+HEAD_DO="b5b5000000000000000000000000000000000002"
+printf '%s\n' "$HEAD_DO" > "$SCEN/head"
+lane_pass "$HEAD_DO" 5563 > "$SCEN/runs-$HEAD_DO"
+lane_pass maindo 5564 > "$SCEN/runs-main"
+write_main_checks "$(check_run 7201 weird '' success 6104)"
+main_run_map 6104 push 'Python CI'
+write_pr_checks "$(check_run 7202 weird '' success 6104)"
+pr_run_map 6104 pull_request 'Python CI'
+run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a non-red surface with nothing in flight still does not block" \
+  || fail "a non-red surface blocked the merge (exit $rc)"
+grep -q "base tree ('main') UNKNOWN" "$TMP/out" && pass "…and a base with 0 checks seen complete is UNKNOWN, not GREEN" \
+  || fail "a base with 0 completed checks was certified: $(grep 'base tree' "$TMP/out" | head -2)"
+grep -q "evaluated tree UNKNOWN" "$TMP/out" && pass "…and the PR tree is UNKNOWN too" \
+  || fail "a tree with 0 completed checks was certified: $(grep 'evaluated tree' "$TMP/out" | head -2)"
+
+# (g5) A COMPLETED RED STILL WINS OVER AN IN-FLIGHT SIBLING (#5215 review P1). The
+# `unobserved` branch sits BETWEEN `red` and `green`, so the branch ORDER is
+# load-bearing: if a completed red ever lost to an in-flight sibling, the tree
+# would read UNKNOWN and step 4.5 would PROCEED — a measured-red tree merged with
+# `--admin`. No other fixture mixes a red with a check still running.
+new_scen treehealth-red-and-pending
+HEAD_RP="b6b6000000000000000000000000000000000004"
+printf '%s\n' "$HEAD_RP" > "$SCEN/head"
+lane_pass "$HEAD_RP" 5641 > "$SCEN/runs-$HEAD_RP"
+lane_pass mainrp 5642 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 3501 'ci / red' completed failure 7111)" \
+  "$(check_run 3502 'ci / flight' in_progress null 7111)"
+pr_run_map 7111 pull_request 'CI'
+run_admin 42 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a completed RED on the tree wins over an in-flight sibling (exit $rc)" \
+  || fail "an in-flight sibling DISARMED a completed red tree"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$TMP/err" && pass "…as the TREE refusal" \
+  || fail "the mixed surface did not report the tree refusal"
+grep -q "evaluated tree UNKNOWN" "$TMP/out" && fail "…but the tree was labelled UNKNOWN instead of RED" \
+  || pass "…and the tree state is RED, never UNKNOWN"
+
+# (g6) …and on the BASE the same order keeps 4.6/4.7 ARMED: a completed base red
+# must not be downgraded to UNKNOWN by an in-flight sibling, or the staleness
+# protection silently disarms.
+new_scen basehealth-red-and-pending
+HEAD_RB="b6b6000000000000000000000000000000000005"
+printf '%s\n' "$HEAD_RB" > "$SCEN/head"
+lane_pass "$HEAD_RB" 5651 > "$SCEN/runs-$HEAD_RB"
+lane_pass mainrb 5652 > "$SCEN/runs-main"
+write_main_checks \
+  "$(check_run 7301 'ci / red' completed failure 6106)" \
+  "$(check_run 7302 'ci / flight' in_progress null 6106)"
+main_run_map 6106 push 'Post-merge validation'
+pr_green_surface
+run_admin 42 --dry-run >/dev/null 2>&1
+grep -q "base tree ('main') RED" "$TMP/out" && pass "a completed base RED is RED, not UNKNOWN, beside an in-flight sibling (4.6/4.7 stay armed)" \
+  || fail "a completed base red was downgraded by an in-flight sibling: $(grep 'base tree' "$TMP/out" | head -2)"
+
 # (h) AN EMPTY TREE SURFACE IS UNMEASURED — stated, never silently green. Right
 # after a push the tree's checks have not started, so refusing here would block
 # the common case; the lane-scoped half of "I did not look" is step 2b.
@@ -4123,6 +4188,31 @@ rc=$?
 grep -q "FAILURE ATTRIBUTION — SKIPPED" "$TMP/err" && pass "…and the lane split is SKIPPED, not mis-attributed to it" \
   || fail "the lane's nodeids were rendered as an attribution of an out-of-lane red"
 grep -q "INHERITED FROM THE BASE" "$TMP/err" && fail "…the out-of-lane red got an INHERITED verdict" \
+  || pass "…and no INHERITED verdict was printed for it"
+
+# (k4) THE SCOPE GATE USES THE PROBE'S **GATED** RUN IDENTITY, NOT THE DISPLAY
+# STRING (#5215 review P2). A legacy commit status's `url` is an app-supplied
+# `target_url`, and the probe deliberately clears `run_id` for it (a `/runs/<N>`
+# inside it names SOME run, not the row's). If the gate re-derived identity from
+# the display string, a status whose target_url embeds the lane's failing run id
+# would set `applies=1` and render the lane split under a red the lane does not
+# explain — the very misattribution the gate exists to close.
+new_scen treehealth-status-runid
+HEAD_SR="b6b6000000000000000000000000000000000006"
+printf '%s\n' "$HEAD_SR" > "$SCEN/head"
+FAIL_SR='tests/test_main.py::test_already_red_on_main'
+lane_fail "$HEAD_SR" 5631 > "$SCEN/runs-$HEAD_SR"
+log_failed "$FAIL_SR" > "$SCEN/log-5631"
+main_red_n mainlane6 5632 3 "$FAIL_SR" > "$SCEN/runs-main"
+main_red_surface
+printf '{"state":"failure","total_count":1,"statuses":[{"context":"external/review","state":"failure","updated_at":"2026-01-02T00:00:00Z","target_url":"https://example.com/actions/runs/5631/job/9"}]}\n' > "$SCEN/pr-statuses.json"
+run_admin 42 --main-runs 3 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a commit-status tree red whose target_url embeds the lane's run id still BLOCKS" \
+  || fail "a commit-status tree red was exempted"
+grep -q "FAILURE ATTRIBUTION — SKIPPED" "$TMP/err" && pass "…and the lane split is SKIPPED — a status target_url is not a run identity" \
+  || fail "the gate revived the untrusted status URL and attributed an unrelated red to the lane"
+grep -q "INHERITED FROM THE BASE" "$TMP/err" && fail "…the status red got an INHERITED verdict" \
   || pass "…and no INHERITED verdict was printed for it"
 
 # (l) A CONFLICTED PR IS REFUSED LOUDLY, before any CI work. GitHub cannot compute
