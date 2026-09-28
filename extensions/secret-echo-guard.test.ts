@@ -2001,6 +2001,122 @@ test("R5-TEXT-FALLBACK: a non-enumerable `text` field survives the rebuild (muta
 	ok(!String(first.text).includes(FE_SECRET), "and it must be the REDACTED value");
 });
 
+// ── #5109 review round 6 ────────────────────────────────────────────────────────────────────
+//
+// Round 5 closed the STRING element of the content-array accessor snapshot. Round 6 found the same
+// attestation lie for every OTHER shape: a non-text object part, a nested value, a nested accessor,
+// and a registered value used as a KEY all passed through while `changed` was set — so the record
+// read `contentRedacted: true, total: 0` and the notice said nothing had been redacted. A rebuilt
+// part now delegates its object/array values to the SAME deep walker `details` uses.
+
+test("R6-PART-NESTED-VALUE: a non-text part's nested string is redacted, not copied by reference", () => {
+	const S = "R6-NESTED-SECRET-0123456789ABCD";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	// No own accessor and not a text part, so before this fix it fell straight through `return part`.
+	// The array accessor makes the SNAPSHOT what persists, so the nested value reached the transcript.
+	const content: unknown[] = [{ type: "image" }];
+	Object.defineProperty(content, "1", {
+		enumerable: true,
+		configurable: true,
+		get: () => ({ note: `k=${S}` }),
+	});
+	content.length = 2;
+	const out = redactContent(content, values, new Map());
+	const serialized = JSON.stringify(out.value);
+	ok(!serialized.includes(S), `a nested value is outbound text too: ${serialized}`);
+	ok(serialized.includes(REDACTION_MARKER_BASE), "the value is REPLACED, not merely dropped");
+	strictEqual(out.changed, true, "and the result is attested as changed");
+});
+
+test("R6-PART-NESTED-ARRAY: a nested array value is redacted too", () => {
+	const S = "R6-NESTED-ARRAY-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const part: Record<string, unknown> = { type: "image", blocks: [`k=${S}`] };
+	const out = redactContent([part], values, new Map());
+	ok(!JSON.stringify(out.value).includes(S), "an array inside a part is outbound too");
+	strictEqual(out.changed, true);
+});
+
+test("R6-PART-KEY: a registered value used as a part KEY is redacted, not written verbatim", () => {
+	const S = "R6-KEY-SECRET-0123456789ABCDEF";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	// A clean text part: the text does not change, so before this fix it returned BY REFERENCE with
+	// the secret still sitting as a key. `redactDetails` treats a key match as dirtying the container.
+	const out = redactContent([{ type: "text", text: "clean", [S]: "v" }], values, new Map());
+	const serialized = JSON.stringify(out.value);
+	ok(!serialized.includes(S), `a KEY lands in the transcript: ${serialized}`);
+	strictEqual(out.changed, true);
+});
+
+test("R6-PART-NESTED-ACCESSOR: a nested accessor inside a part is rebuilt to data properties", () => {
+	const S = "R6-DEEP-GETTER-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const inner: Record<string, unknown> = {};
+	Object.defineProperty(inner, "deep", { enumerable: true, configurable: true, get: () => `k=${S}` });
+	const out = redactContent([{ type: "image", meta: inner }], values, new Map());
+	ok(!JSON.stringify(out.value).includes(S), "a nested getter is a live read too");
+	strictEqual(out.changed, true);
+});
+
+test("R6-TEXT-SIBLING: a CLEAN text part with a dirty SIBLING field is not attested clean", () => {
+	const S = "R6-SIBLING-SECRET-0123456789ABCD";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const out = redactContent([{ type: "text", text: "ordinary", meta: { nested: `k=${S}` } }], values, new Map());
+	const serialized = JSON.stringify(out.value);
+	ok(!serialized.includes(S), `a sibling field is outbound too: ${serialized}`);
+	strictEqual(out.changed, true);
+});
+
+test("R6-BOUND-DETERMINISTIC: pass 2 consults the budget — pinned on a SCRIPTED CLOCK", () => {
+	// Round 5 gave pass 2 a per-node budget check, but NOTHING pinned it: on this box's usual load the
+	// 200k-key walk finishes in ~0.4s against a 2s budget, so deleting the check left the suite GREEN
+	// four runs in a row. A duration assertion cannot fix that — a wall-clock test is a load detector,
+	// which is exactly what round 6 removed — so the clock is INJECTED.
+	//
+	// Reads: #1 construction, #2 pass 1's first node (its allowance is a multiple of the check
+	// interval, so the deadline is consulted there) — both t=0, so pass 1 stays inside its budget.
+	// Every read after that is far past the deadline, and pass 2's allowance is RESET before it runs,
+	// so its first node consults the clock again. `bounded` can therefore only have come from PASS 2.
+	const S = "R6-CLOCK-SECRET-0123456789ABCDEF";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	let reads = 0;
+	const now = () => (reads++ < 2 ? 0 : 1_000_000);
+	const tree: Record<string, string> = {};
+	for (let i = 0; i < 100; i++) tree[`k${i}`] = "v";
+	tree["zzlast"] = `x-${S}`; // dirty, so pass 2 runs at all
+	const out = redactDetails(tree, values, new Map(), { maxNodes: 1024, maxMs: 1_000, now });
+	strictEqual(out.bounded, true, "pass 2 must RECORD that it hit the budget");
+	// Selectivity: deleting `if (detailsBudgetExhausted(state)) return node;` from `rebuildDetails` —
+	// or dropping the `state.nodes = state.nodeAllowance` reset — stops the clock ever being read on
+	// pass 2, so `bounded` stays false and this assertion reds.
+});
+
+test("R6-PART-KEY-DIRTY: a key is redacted even when the part is rebuilt for ANOTHER reason", () => {
+	const S = "R6-KEY-DIRTY-SECRET-0123456789AB";
+	const K = "R6-KEYNAME-SECRET-0123456789ABC";
+	const values = normalizeSecretValues([{ value: S, label: "l" }, { value: K, label: "l" }]);
+	// The TEXT is dirty, so the part is rebuilt from the RAW part and the deep scan never ran on it —
+	// this is the path where `rebuildContentPart`'s own key redaction is the only thing standing
+	// between the transcript and a secret used as a key.
+	const out = redactContent([{ type: "text", text: `k=${S}`, [K]: "v" }], values, new Map());
+	const serialized = JSON.stringify(out.value);
+	ok(!serialized.includes(S), serialized);
+	ok(!serialized.includes(K), `a key must be redacted on the rebuild path too: ${serialized}`);
+	strictEqual(out.changed, true);
+});
+
+test("R6-UNSTABLE-NESTED: a rebuilt (unstable) part's NESTED field is deep-redacted", () => {
+	const S = "R6-UNSTABLE-NESTED-SECRET-012345678";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	// `unstable` routes the RAW part into `rebuildContentPart`, whose own value handling is then the
+	// only thing covering a NESTED field (the deep scan is not re-run on this path).
+	const part: Record<string, unknown> = { type: "image", meta: { nested: `k=${S}` } };
+	Object.defineProperty(part, "caption", { enumerable: true, configurable: true, get: () => "clean" });
+	const out = redactContent([part], values, new Map());
+	ok(!JSON.stringify(out.value).includes(S), "a nested field of a rebuilt part must be redacted");
+	strictEqual(out.changed, true);
+});
+
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────
 console.error = realConsoleError;
 console.log(`\n${failures.length === 0 ? "✅" : "❌"} ${passed} passed, ${failures.length} failed`);

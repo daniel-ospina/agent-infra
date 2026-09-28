@@ -731,6 +731,14 @@ export interface RedactOutcome<T> {
  * unredacted result comes back as the SAME array object (`changed: false`) and the handler returns
  * `undefined`.
  */
+/**
+ * Budget for ONE deep `content`-part walk. Content parts are small and few, but a part is
+ * attacker-controlled (a custom or MCP tool returns it), so the bound the `details` walk uses applies
+ * here too — and hitting it sets `incomplete`, so a part the guard could not fully scan is never
+ * presented as a fully-redacted one.
+ */
+const CONTENT_PART_LIMITS: DetailsWalkLimits = { maxNodes: 200_000, maxMs: 500 };
+
 export function redactContent(
 	content: unknown,
 	values: readonly SecretValue[],
@@ -771,13 +779,36 @@ export function redactContent(
 				if ((part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
 					const original = (part as { text: string }).text;
 					const redacted = redactString(original, values, hits);
-					if (redacted === original && !unstable) return part;
+					if (redacted === original && !unstable) {
+						// A "clean" text part is not necessarily clean: it can carry a registered value (or an
+						// accessor) in a SIBLING field — `{type:"text", text:"ok", meta:{nested:"<secret>"}}`.
+						// Scan it with the deep walker before attesting `contentRedacted`.
+						const deep = redactDetails(part, values, hits, CONTENT_PART_LIMITS);
+						if (deep.bounded) incomplete = true;
+						if (!deep.changed) return part;
+						changed = true;
+						return rebuildContentPart(deep.value as Record<string, unknown>, redacted, values, hits);
+					}
 					changed = true;
 					return rebuildContentPart(part as Record<string, unknown>, redacted, values, hits);
 				}
 				if (unstable) {
 					changed = true;
 					return rebuildContentPart(part as Record<string, unknown>, undefined, values, hits);
+				}
+				// A straight object/array part may STILL carry a registered value or a nested accessor
+				// anywhere inside it, and the array-accessor snapshot makes that reachable: `content.map`
+				// already read the index, `hasOwnEnumerableAccessor(content)` sets `changed`, and so the
+				// snapshot — holding whatever the getter returned — is what persists. Returning the part by
+				// reference here is what let `{type:"image", caption:"<secret>"}` persist verbatim while the
+				// record read `contentRedacted: true, total: 0` and the notice said nothing was redacted
+				// (#5109 review round 6). The deep walker returns the SAME reference when clean, so an
+				// ordinary part is still passed through untouched.
+				const deep = redactDetails(part, values, hits, CONTENT_PART_LIMITS);
+				if (deep.bounded) incomplete = true;
+				if (deep.changed) {
+					changed = true;
+					return deep.value as Record<string, unknown>;
 				}
 			}
 		} catch {
@@ -815,14 +846,26 @@ function rebuildContentPart(
 		out = {};
 	}
 	for (const key of Object.keys(part)) {
+		// A KEY is as outbound as a value — it lands in the transcript and would be re-read by the
+		// serializer — so it is redacted too, exactly as `markDirtyDetails` treats a registered value
+		// found in a key (#5109 review round 6: the header claimed this, the code did not do it).
+		const outKey = redactString(key, values, hits);
 		const raw = key === "text" && text !== undefined ? text : part[key];
-		// Every string read out of a rebuilt part is redacted. A KEY is as outbound as a value (it lands
-		// in the transcript), and the `unstable` path reaches here for a NON-text part — where the value
-		// read out of a live accessor would otherwise be copied into the persisted part VERBATIM. The
-		// text path re-redacts an already-redacted string, which is a no-op because a marker contains no
-		// registered value.
-		const value = typeof raw === "string" ? redactString(raw, values, hits) : raw;
-		Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
+		// Every string read out of a rebuilt part is redacted. The `unstable` path reaches here for a
+		// NON-text part — where the value read out of a live accessor would otherwise be copied into the
+		// persisted part VERBATIM — and a NON-text part can carry a registered value anywhere inside it,
+		// so an object/array value is handed to the same deep walker `details` uses (which redacts nested
+		// strings, nested KEYS and nested accessors, and returns the value BY REFERENCE when clean). A
+		// shallow copy is what let `{type:"image", caption:"<secret>"}` through while the record still
+		// attested `contentRedacted: true`. The text path re-redacts an already-redacted string, a no-op
+		// because a marker contains no registered value.
+		const value =
+			typeof raw === "string"
+				? redactString(raw, values, hits)
+				: raw !== null && typeof raw === "object"
+					? redactDetails(raw, values, hits, CONTENT_PART_LIMITS).value
+					: raw;
+		Object.defineProperty(out, outKey, { value, enumerable: true, writable: true, configurable: true });
 	}
 	if (text !== undefined && !Object.prototype.hasOwnProperty.call(out, "text")) {
 		Object.defineProperty(out, "text", { value: text, enumerable: true, writable: true, configurable: true });
@@ -868,6 +911,12 @@ export interface DetailsWalkLimits {
 	maxNodes?: number;
 	/** Override the wall-clock budget in ms (tests). Default `MAX_DETAILS_WALK_MS`. */
 	maxMs?: number;
+	/**
+	 * Injectable clock (tests). Default `Date.now`. The budget is read through this, so the whole
+	 * bound is exercised DETERMINISTICALLY: a wall-clock assertion is load-dependent, and on a fleet
+	 * box that made the guard's own test non-reproducible (#5109 review round 6).
+	 */
+	now?: () => number;
 }
 
 interface DetailsWalkBudget {
@@ -884,15 +933,19 @@ interface DetailsWalkBudget {
 	nodeAllowance: number;
 	deadline: number;
 	bounded: boolean;
+	/** The clock the deadline is measured against — see `DetailsWalkLimits.now`. */
+	now: () => number;
 }
 
 function newDetailsBudget(limits: DetailsWalkLimits = {}): DetailsWalkBudget {
 	const allowance = limits.maxNodes ?? MAX_DETAILS_NODES;
+	const now = limits.now ?? Date.now;
 	return {
 		nodes: allowance,
 		nodeAllowance: allowance,
-		deadline: Date.now() + (limits.maxMs ?? MAX_DETAILS_WALK_MS),
+		deadline: now() + (limits.maxMs ?? MAX_DETAILS_WALK_MS),
 		bounded: false,
+		now,
 	};
 }
 
@@ -902,7 +955,7 @@ function detailsBudgetExhausted(budget: DetailsWalkBudget): boolean {
 		budget.bounded = true;
 		return true;
 	}
-	if (budget.nodes % DETAILS_BUDGET_CHECK_INTERVAL === 0 && Date.now() >= budget.deadline) {
+	if (budget.nodes % DETAILS_BUDGET_CHECK_INTERVAL === 0 && budget.now() >= budget.deadline) {
 		budget.bounded = true;
 		return true;
 	}
