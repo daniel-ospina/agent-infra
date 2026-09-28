@@ -231,6 +231,18 @@ jobs:
         npx tsx extensions/subagent/timeout-integration.test.ts || failures=$((failures+1))
         echo "== extensions/subagent/cache-integration.test.ts =="
         npx tsx extensions/subagent/cache-integration.test.ts || failures=$((failures+1))
+        # #1500 Leg B — the termination PROOF. `builtin-tools.test.ts` can only
+        # show that the `tool_call` guard writes a finite positive number into
+        # `input.timeout`; it cannot show that pi ACTS on it. This suite drives
+        # the REAL `createBashTool` (same pinned-pi devDep route as its siblings
+        # above) and proves the command is killed AT the bound with a recoverable
+        # message, that a call inside the bound is untouched, and — the control
+        # arm — that an ABSENT timeout really does have no bound, which is the
+        # defect itself. It must run AFTER the `npm ci` above, and it needs an
+        # explicit line here because this leg is a hard-coded list, not a glob:
+        # no glob reaches `extensions/subagent/*.test.ts`.
+        echo "== extensions/subagent/tool-timeout-bound.test.ts =="
+        npx tsx extensions/subagent/tool-timeout-bound.test.ts || failures=$((failures+1))
         # #783 Task 7.3 — subagent parity pin: the ext keeps its OWN timeout /
         # stall semantics and was NOT dragged by the builtin-tools task-constant
         # split. Zero-dep source pin (node:* + readFileSync only), wired here
