@@ -2117,6 +2117,73 @@ test("R6-UNSTABLE-NESTED: a rebuilt (unstable) part's NESTED field is deep-redac
 	strictEqual(out.changed, true);
 });
 
+// ── #5109 review round 7 ────────────────────────────────────────────────────────────────────
+//
+// Round 6 made the deep walk the single redaction path for `content` parts, but `rebuildContentPart`
+// — the walker still used for the TEXT paths — swallowed `redactDetails(...).bounded`. A nested walk
+// that hit its budget then returned the tail BY REFERENCE while `incomplete` stayed false: the record
+// read `contentRedacted: true, total: 0`, `contentRedactionFailed: false`, and the notice said no
+// value had been redacted, over a persisted secret. `bounded` is now threaded out; these pin it.
+//
+// The trigger is `MAX_DETAILS_DEPTH`: a part nested deeper than it stops pass 1 (setting `bounded`)
+// without marking anything dirty, which is deterministic — no clock, no host speed.
+
+function deepEnoughToBound(secret: string): Record<string, unknown> {
+	let node: Record<string, unknown> = { leaf: `k=${secret}` };
+	for (let i = 0; i < 40; i++) node = { nest: node };
+	return node;
+}
+
+test("R7-UNSTABLE-DEEP-BOUND: an unstable part's bounded deep walk is INCOMPLETE (round-7 [P1])", () => {
+	const S = "R7-UNSTABLE-DEEP-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const part: Record<string, unknown> = { type: "image", payload: deepEnoughToBound(S) };
+	Object.defineProperty(part, "caption", { enumerable: true, configurable: true, get: () => "clean" });
+	const out = redactContent([part], values, new Map());
+	// Before the fix this was the DEDICATED `rebuildContentPart` call, which dropped `bounded` —
+	// `incomplete` was false and the record attested a clean redaction over the persisted secret.
+	strictEqual(out.incomplete, true, "a bounded walk must never be attested as clean");
+});
+
+test("R7-TEXT-DEEP-BOUND: a bounded SIBLING scan on a clean text part is INCOMPLETE", () => {
+	const S = "R7-TEXT-DEEP-SECRET-0123456789AB";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const out = redactContent(
+		[{ type: "text", text: "ordinary", payload: deepEnoughToBound(S) }],
+		values,
+		new Map(),
+	);
+	strictEqual(out.incomplete, true, "a bounded scan must never be attested as clean");
+});
+
+test("R7-REBUILD-DEEP-BOUND: the rebuild path reports its nested walk's bound too", () => {
+	const S = "R7-REBUILD-DEEP-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	// The TEXT is dirty, so the part is rebuilt from the RAW part through `rebuildContentPart` — this
+	// is the path whose nested `bounded` was discarded (the other half of the round-7 [P1]).
+	const out = redactContent(
+		[{ type: "text", text: `k=${S}`, payload: deepEnoughToBound(S) }],
+		values,
+		new Map(),
+	);
+	strictEqual(out.incomplete, true, "the rebuild path must surface its nested bound");
+	strictEqual(out.changed, true);
+});
+
+test("R7-BOXED-STRING-RESIDUAL: a boxed `String` is NOT redacted (pinned residual, not a silent gap)", () => {
+	const S = "R7-BOXED-STRING-SECRET-01234567";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	// `typeof` is "object" for a boxed String and `Object.keys` yields character INDICES, so
+	// `containsRegisteredValue` never sees the value. `JSON.stringify` DOES serialize a boxed String,
+	// so this is a live (contrived) leak on both the top-level `text` field (the pre-existing R3
+	// residual) and, as round 7 noted, a NESTED one. Pinned deliberately: the deep walk must not be
+	// described as covering a shape it does not.
+	// eslint-disable-next-line no-new-wrappers
+	const boxed = new String(`k=${S}`);
+	const out = redactContent([{ type: "image", meta: { s: boxed } }], values, new Map());
+	ok(JSON.stringify(out.value).includes(S), "pinned: the boxed value survives — see this test's name");
+});
+
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────
 console.error = realConsoleError;
 console.log(`\n${failures.length === 0 ? "✅" : "❌"} ${passed} passed, ${failures.length} failed`);

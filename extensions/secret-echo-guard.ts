@@ -701,9 +701,25 @@ export function hitsTotal(hits: HitCounts): number {
 }
 
 /** Exact-match replacement of every registered value. `split`/`join` = literal match, no regex. */
-export function redactString(text: string, values: readonly SecretValue[], hits: HitCounts): string {
+export function redactString(
+	text: string,
+	values: readonly SecretValue[],
+	hits: HitCounts,
+	budget?: DetailsWalkBudget,
+): string {
 	let out = text;
+	let index = 0;
 	for (const { value, label } of values) {
+		// A single large string is ONE node to the deep walk's node counter, so a multi-megabyte part
+		// would never hit the wall-clock bound there — while the real cost is per REGISTERED VALUE
+		// (measured: an 8MB part against 2000 harvested values took ~1.1s). Sample the deadline INSIDE
+		// the scan so the advertised budget bounds it for real. Stopping early leaves the remaining
+		// values unscanned — the documented fail-open posture — and it is never silent: `bounded` is set,
+		// so the caller records and announces it.
+		if (budget !== undefined && (index++ & 7) === 0 && budget.now() >= budget.deadline) {
+			budget.bounded = true;
+			break;
+		}
 		if (value.length === 0 || out.length < value.length) continue;
 		if (!out.includes(value)) continue;
 		const count = out.split(value).length - 1;
@@ -787,14 +803,14 @@ export function redactContent(
 						if (deep.bounded) incomplete = true;
 						if (!deep.changed) return part;
 						changed = true;
-						return rebuildContentPart(deep.value as Record<string, unknown>, redacted, values, hits);
+						const rebuilt = rebuildContentPart(deep.value as Record<string, unknown>, redacted, values, hits);
+						if (rebuilt.bounded) incomplete = true;
+						return rebuilt.value;
 					}
 					changed = true;
-					return rebuildContentPart(part as Record<string, unknown>, redacted, values, hits);
-				}
-				if (unstable) {
-					changed = true;
-					return rebuildContentPart(part as Record<string, unknown>, undefined, values, hits);
+					const rebuilt = rebuildContentPart(part as Record<string, unknown>, redacted, values, hits);
+					if (rebuilt.bounded) incomplete = true;
+					return rebuilt.value;
 				}
 				// A straight object/array part may STILL carry a registered value or a nested accessor
 				// anywhere inside it, and the array-accessor snapshot makes that reachable: `content.map`
@@ -804,6 +820,11 @@ export function redactContent(
 				// record read `contentRedacted: true, total: 0` and the notice said nothing was redacted
 				// (#5109 review round 6). The deep walker returns the SAME reference when clean, so an
 				// ordinary part is still passed through untouched.
+				//
+				// This branch SUBSUMES the own-accessor case that used to sit above it: `markDirtyDetails`
+				// marks any container carrying an own enumerable accessor dirty, so pass 2 rebuilds it into
+				// data properties AND reports `bounded` — which the dedicated `rebuildContentPart` call it
+				// replaced did not do (round 7's [P1]). One walker, one place for `bounded` to escape.
 				const deep = redactDetails(part, values, hits, CONTENT_PART_LIMITS);
 				if (deep.bounded) incomplete = true;
 				if (deep.changed) {
@@ -838,13 +859,19 @@ function rebuildContentPart(
 	text: string | undefined,
 	values: readonly SecretValue[],
 	hits: HitCounts,
-): Record<string, unknown> {
+): { value: Record<string, unknown>; bounded: boolean } {
 	let out: Record<string, unknown>;
 	try {
 		out = Object.create(Object.getPrototypeOf(part)) as Record<string, unknown>;
 	} catch {
 		out = {};
 	}
+	// `bounded` is RETURNED, not swallowed. Dropping it was round 7's [P1]: when a nested value's walk
+	// hit its budget the tail came back BY REFERENCE, the part was still replaced, and `incomplete`
+	// stayed false — so the record read `contentRedacted: true` with `total: 0` and the notice said no
+	// value had been redacted, over a persisted secret. That is the same fabricated-clean-attestation
+	// class the whole round set out to close, on the one path that had its own walker.
+	let bounded = false;
 	for (const key of Object.keys(part)) {
 		// A KEY is as outbound as a value — it lands in the transcript and would be re-read by the
 		// serializer — so it is redacted too, exactly as `markDirtyDetails` treats a registered value
@@ -863,14 +890,27 @@ function rebuildContentPart(
 			typeof raw === "string"
 				? redactString(raw, values, hits)
 				: raw !== null && typeof raw === "object"
-					? redactDetails(raw, values, hits, CONTENT_PART_LIMITS).value
+					? rebuildNested(raw, values, hits, (b) => (bounded = bounded || b))
 					: raw;
 		Object.defineProperty(out, outKey, { value, enumerable: true, writable: true, configurable: true });
 	}
 	if (text !== undefined && !Object.prototype.hasOwnProperty.call(out, "text")) {
 		Object.defineProperty(out, "text", { value: text, enumerable: true, writable: true, configurable: true });
 	}
-	return out;
+	return { value: out, bounded };
+}
+
+/** Deep-redact a nested part value, reporting the walk's `bounded` flag to `note` (see
+ * `rebuildContentPart`, whose `bounded` is surfaced as `incomplete`). */
+function rebuildNested(
+	raw: object,
+	values: readonly SecretValue[],
+	hits: HitCounts,
+	note: (bounded: boolean) => void,
+): unknown {
+	const deep = redactDetails(raw, values, hits, CONTENT_PART_LIMITS);
+	note(deep.bounded);
+	return deep.value;
 }
 
 /**
@@ -962,8 +1002,16 @@ function detailsBudgetExhausted(budget: DetailsWalkBudget): boolean {
 	return false;
 }
 
-function containsRegisteredValue(text: string, values: readonly SecretValue[]): boolean {
+function containsRegisteredValue(text: string, values: readonly SecretValue[], budget?: DetailsWalkBudget): boolean {
+	let index = 0;
 	for (const { value } of values) {
+		// Same reasoning as `redactString`: the cost is per VALUE, not per node, so a large string is
+		// otherwise unbounded here. `bounded` is set so the caller can never present a partial scan as a
+		// complete one.
+		if (budget !== undefined && (index++ & 7) === 0 && budget.now() >= budget.deadline) {
+			budget.bounded = true;
+			return false;
+		}
 		if (value.length !== 0 && text.includes(value)) return true;
 	}
 	return false;
@@ -1001,7 +1049,7 @@ interface DetailsDirtyState extends DetailsWalkBudget {
 function markDirtyDetails(node: unknown, values: readonly SecretValue[], state: DetailsDirtyState, depth: number): boolean {
 	if (detailsBudgetExhausted(state)) return false;
 	state.nodes--;
-	if (typeof node === "string") return containsRegisteredValue(node, values);
+	if (typeof node === "string") return containsRegisteredValue(node, values, state);
 	if (node === null || typeof node !== "object") return false;
 	if (depth >= MAX_DETAILS_DEPTH) {
 		state.bounded = true;
@@ -1048,7 +1096,7 @@ function markDirtyDetails(node: unknown, values: readonly SecretValue[], state: 
 			// marks the whole container dirty and pass 2 rebuilds the key too — otherwise the
 			// transcript (the artifact this guard exists to protect) keeps the secret as a key while the
 			// record/log/marker stay clean, which is precisely the leak moved into the proof artifact.
-			if (containsRegisteredValue(key, values)) dirty = true;
+			if (containsRegisteredValue(key, values, state)) dirty = true;
 			if (markDirtyDetails(source[key], values, state, depth + 1)) dirty = true;
 		}
 	}
@@ -1084,7 +1132,7 @@ function rebuildDetails(
 	// tree larger than the budget can still get the tail through, and the record will say so.
 	if (detailsBudgetExhausted(state)) return node;
 	state.nodes--;
-	if (typeof node === "string") return redactString(node, values, hits);
+	if (typeof node === "string") return redactString(node, values, hits, state);
 	if (node === null || typeof node !== "object") return node;
 	if (memo.has(node)) return memo.get(node);
 	if (!state.sawCycle && !state.dirty.has(node)) return node;
