@@ -4215,6 +4215,31 @@ grep -q "FAILURE ATTRIBUTION — SKIPPED" "$TMP/err" && pass "…and the lane sp
 grep -q "INHERITED FROM THE BASE" "$TMP/err" && fail "…the status red got an INHERITED verdict" \
   || pass "…and no INHERITED verdict was printed for it"
 
+# (k5) THE SCOPE GATE'S MEMBERSHIP TEST IS WHOLE-LINE (#5215 review P2). Run ids
+# are compared with `grep -qxF`, so the lane's failing run 5631 must NOT be
+# satisfied by an unrelated red whose run id is 563 — a strict SUBSTRING. With
+# `grep -qF` the gate would set applies=1 and print INHERITED for a red the lane's
+# nodeids do not explain. Every other fixture uses ids that are not substrings of
+# one another, so only this pair pins the `-x`.
+new_scen treehealth-substring-runid
+HEAD_SS="b6b6000000000000000000000000000000000007"
+printf '%s\n' "$HEAD_SS" > "$SCEN/head"
+FAIL_SS='tests/test_main.py::test_already_red_on_main'
+lane_fail "$HEAD_SS" 5631 > "$SCEN/runs-$HEAD_SS"
+log_failed "$FAIL_SS" > "$SCEN/log-5631"
+main_red_n mainlane7 5632 3 "$FAIL_SS" > "$SCEN/runs-main"
+main_red_surface
+write_pr_checks "$(check_run 3407 lint completed failure 563)"
+pr_run_map 563 pull_request 'Post-merge validation'
+run_admin 42 --main-runs 3 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unrelated red whose run id is a SUBSTRING of the lane's still BLOCKS" \
+  || fail "the substring red tree merged"
+grep -q "FAILURE ATTRIBUTION — SKIPPED" "$TMP/err" && pass "…and the lane split is SKIPPED (563 is not 5631)" \
+  || fail "a substring run id satisfied the lane gate and mis-attributed the red"
+grep -q "INHERITED FROM THE BASE" "$TMP/err" && fail "…the substring red got an INHERITED verdict" \
+  || pass "…and no INHERITED verdict was printed for it"
+
 # (l) A CONFLICTED PR IS REFUSED LOUDLY, before any CI work. GitHub cannot compute
 # a merge, so there is no evaluated tree; and the stale merge ref it leaves behind
 # must never be measured as if it were current (verified: #1161's ref parents match
@@ -5194,6 +5219,15 @@ grep -q "began 2026-01-01T00:02:00Z, AFTER this PR's surface was last produced" 
 # drop the state. An unmeasured surface must stay legible.
 grep -q "pending 1" "$SCEN/out" && pass "…while the pending status is still COUNTED, not dropped" \
   || fail "the pending status vanished from the surface accounting: $(grep -m1 'evaluated tree' "$SCEN/out")"
+# THE TREE STATE, not just the count (#5215 review P1): a surface whose only
+# COMPLETED measurement is one check run, with a legacy status STILL PENDING, has
+# NOT been fully observed → UNKNOWN, never GREEN. Pins the `!= "pending"`
+# predicate in the status count — mutating it to "every status is completed" flips
+# the tree to GREEN and this fails, which is the Symptom-1 certificate.
+grep -q "evaluated tree UNKNOWN" "$SCEN/out" && pass "…and the tree with a PENDING status is UNKNOWN, not GREEN (#5215)" \
+  || fail "a pending legacy status let the tree certify GREEN unobserved: $(grep -m1 'evaluated tree' "$SCEN/out")"
+grep -q "✅ evaluated tree" "$SCEN/out" && fail "…the rail still printed the GREEN tree certificate" \
+  || pass "…and no GREEN tree certificate was printed"
 [ -f "$SCEN/comment" ] && fail "evidence was posted over a stale green" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a stale green" || pass "no merge attempted"
 
