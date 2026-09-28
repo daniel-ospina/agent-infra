@@ -9,7 +9,7 @@
  *   npx tsx extensions/shared/provider-failover-unkeyed.test.ts
  */
 
-import { ok, equal } from "node:assert/strict";
+import { ok, equal, deepEqual } from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -108,20 +108,15 @@ test("#1508 — a marker-driven write cannot latch onto an unkeyed leg", () => {
     unkeyed: UNKEYED_OPENROUTER,
   });
   const famRec = st.primaries["deepseek"]?.families?.[FAMILY];
-  ok(
-    famRec?.activeLeg == null,
-    `no leg may be latched (got ${JSON.stringify(famRec?.activeLeg)})`,
-  );
-  // The exact durable shape, not a disjunction: a halt caused ONLY by the
-  // credential term must NOT be recorded terminal. The read side honours
-  // `terminal` unconditionally and BEFORE any re-walk (unlike `activeLeg`, which
-  // is re-validated), so a terminal written on this non-durable observation would
-  // freeze the family for the full 24h TTL, and it is self-sustaining because
-  // resolution halts pre-spawn and no marker-driven write can therefore clear it.
-  equal(
-    famRec?.terminal,
-    false,
-    "a credential-only halt must be re-walkable, not durable",
+  // The WHOLE persisted family record, so the fix is pinned rather than a field
+  // that is null by construction. `activeLeg` is `null` in both arms of the write
+  // (the halt branch is only entered when the walk yielded no leg, and
+  // `nextLegAfter` returns `halted:false ⟺ leg != null`), so an assertion on
+  // `activeLeg` alone cannot fail — the load-bearing field is `terminal`.
+  deepEqual(
+    famRec,
+    { activeLeg: null, hopCount: 0, lastReason: "402", terminal: false },
+    "a credential-only halt must stay re-walkable: `terminal` must not be persisted",
   );
 });
 

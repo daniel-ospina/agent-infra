@@ -1401,19 +1401,23 @@ export function setExhausted(input: LatchInput): LatchState {
         //
         // #1508: the CREDENTIAL term is not durable evidence, so it must not be
         // what makes this halt terminal. The read side honours `terminal`
-        // UNCONDITIONALLY and BEFORE any re-walk (`:1215`), while `activeLeg` is
-        // re-validated against the current `unavailable` set — so a `terminal`
-        // written on a credential-only walk would freeze the family for the whole
-        // TTL on an observation the oracle can retract at any moment, and it is
-        // self-sustaining: resolution halts PRE-spawn, so no marker-driven write
-        // can ever clear it (only a poller clear of the root, or TTL expiry).
-        // Re-walk WITHOUT the credential term: a leg found that way means the
-        // oracle alone emptied the chain, so record the NON-terminal shape and
-        // let the next resolution re-walk against a fresh oracle.
+        // UNCONDITIONALLY and BEFORE any re-walk (the `if (fam?.terminal)` guard in
+        // `resolveWithChain`), while `activeLeg` is re-validated against the current
+        // `unavailable` set — so a `terminal` written on a credential-only walk
+        // would outlive the observation that produced it. Re-walk WITHOUT the
+        // credential term: a leg found that way means the oracle alone emptied the
+        // chain, so record the re-walkable shape and let the next resolution
+        // re-walk against a fresh oracle. (`unkeyed` can only ADD to `unavailable`,
+        // so this proves the halt was credential-only.)
+        //
+        // `activeLeg` is `null` in both arms — the halt branch is only entered when
+        // the walk yielded no leg, and `nextLegAfter` returns `halted:false ⟺ leg
+        // != null`. Writing it explicitly rather than via a ternary that cannot
+        // differ: the distinction the ternary implied does not exist here.
         const withoutUnkeyed = nextLegAfter(fam, input.fromLeg, cur, { env, now, ttlMs: ttl });
         const credentialOnly = !withoutUnkeyed.halted && !!withoutUnkeyed.leg;
         families[fam] = {
-          activeLeg: credentialOnly ? null : step.leg,
+          activeLeg: null,
           hopCount: prev?.hopCount ?? 0,
           lastReason: input.reason,
           terminal: !credentialOnly,

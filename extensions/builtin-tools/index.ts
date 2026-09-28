@@ -4194,11 +4194,15 @@ type TaskResultDetails = {
  * than "anything not ok", so an unrecognised status stays a non-error and a
  * future success status cannot become a false failure.
  *
- * Keep in sync with the producers in this file, which set `status` and
- * `fallbackStatus` from this domain: `invalid-cwd` (:3264), `invalid-session-id`
- * (:4861, :4908), `circuit_open` (:5037), `failed` (:5044), and the #152
- * fallback copy (:5027) — guarded by builtin-tools.test.ts, which asserts every
- * member is reachable and that an unknown status stays a success. */
+ * Keep in sync with the producers in this file, which set `status` (or
+ * `fallbackStatus`, for the #152 fallback leg's own status): the `invalid-cwd`
+ * refusal in the spawn path, the two `invalid-session-id` refusals, the
+ * `circuit_open` breaker result, the `failed` retry-exhaustion result, and the
+ * fallback copy. Cited by label rather than by line on purpose: this same file
+ * shifts whenever the dispatch path changes, and a stale number sends a
+ * maintainer to the wrong construct. Guarded by builtin-tools.test.ts, which
+ * exercises every member through the registered hook and pins that an unknown
+ * status stays a success. */
 const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id"]);
 
 export default function (pi: ExtensionAPI) {
