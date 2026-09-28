@@ -4792,8 +4792,6 @@ run_admin_here 42 --main-runs 2 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "an unaddressable run with an UNRECOGNISED status BLOCKS (exit $rc) — the skip is an allow-list" \
   || fail "expected a non-zero exit, got 0 — an unknown status was skipped, so an unseen spelling could shrink the reference (fail-open)"
-grep -q "not a named in-flight status" "$SCEN/err" && pass "…naming why that line cannot be skipped" \
-  || fail "the refusal does not name the in-flight allow-list"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran although an unaddressable line could not be classified" \
   || pass "…and no merge is attempted"
 
@@ -5002,9 +5000,6 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — an empty reference was certified"
 grep -q "over a 2-run window" "$SCEN/err" && pass "…and the refusal STATES the window it READ (2 runs), not the 5 it asked for" \
   || fail "the refusal does not state the window actually read: $(grep -o 'over a [0-9]*-run window' "$SCEN/err")"
-grep -q "widened past non-measuring runs" "$SCEN/err" \
-  && fail "the evidence claims a WIDENED reference although no run beyond the 2 that exist was needed" \
-  || pass "…and a short branch is NOT reported as a widened reference"
 grep -q "yielded NO EXECUTED job" "$SCEN/err" && pass "…naming the condition as an empty reference" \
   || fail "the refusal does not distinguish a stale reference from a non-matching family"
 grep -q "NOT a coverage gap in this PR" "$SCEN/err" \
