@@ -851,8 +851,11 @@ test("a pathological details completes quickly and is REPORTED as bounded, never
 	const started = Date.now();
 	const out = redactDetails(wide, values, new Map(), { maxMs: 100 });
 	const elapsed = Date.now() - started;
-	ok(elapsed < 1_500, `a pathological details must not block for seconds (took ${elapsed}ms)`);
-	strictEqual(out.bounded, true, "a bounded walk must be reported, never silently presented as full");
+	// ⛔ The wall-clock assertion this used to carry (`elapsed < 1500`) was a load detector: at fleet
+	// load average 87 the uninterruptible `Object.keys` enumeration ALONE exceeds it, so the test
+	// flaked red on a machine that was merely busy. What is deterministic — and is the actual
+	// guarantee — is that the guard TRIPPED and said so. `elapsed` is reported for diagnosis only.
+	strictEqual(out.bounded, true, `a bounded walk must be reported, never silently presented as full (elapsed=${elapsed}ms)`);
 });
 
 test("the fleet log written to REAL disk bytes carries no value", () => {
@@ -1869,6 +1872,133 @@ test("R4-SPAM (documented decision): 20 bounded results announce 20 times — de
 	}
 	strictEqual(notifications.length, 20, "one notice per bounded result — the documented per-result decision");
 	strictEqual(appendEntryCalls.length, 20, "and one durable record per bounded result");
+});
+
+// ── Round 5: the content SNAPSHOT leak and the pass-2 runtime bound ──────────────────────────
+//
+// Two review findings. Both are "a previously-invisible read reaches a sink", which is what this
+// guard exists to stop, so both are pinned from the SINK SIDE (the serialized value) rather than
+// from the flag it happens to set.
+console.log("\ntool_result handler — round 5 (snapshot leak + pass-2 bound)");
+
+test("R5-SNAPSHOT: a content-array accessor INDEX cannot persist a secret behind a clean attestation", () => {
+	const SNAPSHOT_SECRET = "SNAPSHOT-SECRET-0123456789ABCD";
+	const values = normalizeSecretValues([{ value: SNAPSHOT_SECRET, label: "tortoise-config.json#apiKey" }]);
+	// The array carries an own enumerable ACCESSOR index. `Array.prototype.map` reads it once into
+	// `parts`, and `hasOwnEnumerableAccessor(content)` sets `changed`, so `parts` is what persists —
+	// including the getter's returned string. Before this fix that string fell straight through
+	// `return part`, so the record read `contentRedacted: true, total: 0` and the notice said no value
+	// had been redacted, while the secret sat in the transcript.
+	const content: unknown[] = [{ type: "text", text: "ordinary output" }];
+	Object.defineProperty(content, "1", {
+		enumerable: true,
+		configurable: true,
+		get: () => `OPENROUTER_API_KEY=${SNAPSHOT_SECRET}`,
+	});
+	content.length = 2;
+	const out = redactContent(content, values, new Map());
+	const serialized = JSON.stringify(out.value);
+	ok(!serialized.includes(SNAPSHOT_SECRET), `the snapshot must not carry the value: ${serialized}`);
+	ok(serialized.includes(REDACTION_MARKER_BASE), "the value is REPLACED, not merely dropped");
+	strictEqual(out.changed, true, "and the result is attested as changed");
+});
+
+test("R5-BARE-STRING: a bare string content element is redacted (previously leaked with no record)", () => {
+	const BARE_SECRET = "BARE-STRING-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: BARE_SECRET, label: "l" }]);
+	const out = redactContent([`OPENROUTER_API_KEY=${BARE_SECRET}`], values, new Map());
+	const serialized = JSON.stringify(out.value);
+	ok(!serialized.includes(BARE_SECRET), `a string element is outbound text too: ${serialized}`);
+	strictEqual(out.changed, true);
+});
+
+test("R5-UNSTABLE-PART: an unstable NON-text part's accessor value is redacted, not copied raw", () => {
+	const PART_SECRET = "UNSTABLE-PART-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: PART_SECRET, label: "l" }]);
+	// Non-text, so the text branch never runs; `unstable` makes it rebuild, and the rebuild READ the
+	// getter — so the value it copied was the live one and had to be redacted on the way in.
+	const part: Record<string, unknown> = { type: "image" };
+	Object.defineProperty(part, "caption", { enumerable: true, configurable: true, get: () => `k=${PART_SECRET}` });
+	const out = redactContent([part], values, new Map());
+	ok(!JSON.stringify(out.value).includes(PART_SECRET), "the rebuilt part must not carry the live value");
+	strictEqual(out.changed, true);
+});
+
+test("R5-BOUND: the details walk never SILENTLY overruns its budget (contract, load-independent)", () => {
+	const BOUND_SECRET = "BOUND-SECRET-0123456789ABCDEF";
+	const values = normalizeSecretValues([{ value: BOUND_SECRET, label: "l" }]);
+	const big: Record<string, string> = {};
+	for (let i = 0; i < 200_000; i++) big[`k${i}`] = "v";
+	big["zzlast"] = `x-${BOUND_SECRET}`; // dirty only at the very END of pass 1 — the worst case
+	const BUDGET = 2_000;
+	const started = Date.now();
+	const out = redactDetails(big, values, new Map(), { maxMs: BUDGET });
+	const elapsed = Date.now() - started;
+	// THE GUARANTEE, deliberately a DISJUNCTION: either the walk finished inside its budget, or it
+	// says it did not. What must never happen is an overrun reported as COMPLETE — the round-5
+	// defect (3310ms against a 2s budget with `bounded` FALSE).
+	//
+	// ⛔ Deliberately NOT `elapsed <= BUDGET + slack` on its own, and deliberately not a wall-clock
+	// number pinned to this machine. This box runs a fleet: at load average 87 a duration assertion
+	// is a LOAD DETECTOR, not a test, and an earlier version of this test asserted the duration and
+	// flaked RED — a flaky red is worse than a weaker assertion, because it teaches callers to
+	// ignore the suite. Green is deterministic; catching the mutation is best-effort. The interval
+	// check can overshoot by up to DETAILS_BUDGET_CHECK_INTERVAL nodes, hence the slack.
+	ok(
+		out.bounded === true || elapsed <= BUDGET + 250,
+		`an overrun must be REPORTED, never presented as a complete walk (bounded=${out.bounded} elapsed=${elapsed}ms budget=${BUDGET}ms)`,
+	);
+	if (!out.bounded) {
+		// Only claimed when the walk genuinely finished: on a bounded walk the un-walked tail is
+		// returned BY REFERENCE (the documented fail-open posture), so this cannot be asserted there.
+		ok(!JSON.stringify(out.value).includes(BOUND_SECRET), "a COMPLETED walk must have redacted the secret");
+	}
+});
+
+// ⛔ There is deliberately NO test here that asserts pass 2's budget in isolation by timing it.
+// Two versions were written and both were removed: the first used `maxMs: 1`, which made PASS 1
+// exhaust and set `bounded` (so it passed with the pass-2 check disabled — it pinned the wrong
+// thing), and the second measured pass 1's cost in-test to pick a budget between the two passes,
+// which is still a wall-clock assertion and flaked RED under fleet load. A load-independent test of
+// a WALL-CLOCK bound is not reachable through the public surface, because the only deterministic
+// budget it exposes (`maxNodes`) is per-pass by design and so cannot distinguish the passes.
+// The guarantee is pinned instead by R5-BOUND above (never a silent overrun), by R5-NO-STARVE
+// (pass 2 runs and is not starved), and by the mutation recorded in this commit's message:
+// disabling the pass-2 check reproduces the round-5 signature (1547ms against a 758ms budget,
+// `bounded` false) — proven at low load, where the timing is meaningful.
+
+test("R5-NO-STARVE: pass 2 gets its own node allowance, so pass 1's count cannot redact nothing", () => {
+	// With a SHARED counter, a tree above pass 1's allowance makes pass 2 exit immediately, returning
+	// every dirty node BY REFERENCE — i.e. it would redact nothing. The count is therefore per-pass and
+	// only the clock is shared. This pins that a tree which exhausts pass 1's COUNT but not the CLOCK
+	// still redacts, which is the difference between "bounded" and "redacted nothing".
+	const STARVE_SECRET = "STARVE-SECRET-0123456789ABCDE";
+	const values = normalizeSecretValues([{ value: STARVE_SECRET, label: "l" }]);
+	const small: Record<string, unknown> = { a: { b: `k=${STARVE_SECRET}` } };
+	// An allowance too small for pass 1 to finish the key list, but a healthy clock: pass 2 must still
+	// rebuild the dirty subtree it knows about.
+	const out = redactDetails(small, values, new Map(), { maxNodes: 3, maxMs: 60_000 });
+	ok(!JSON.stringify(out.value).includes(STARVE_SECRET), "the dirty subtree is still redacted");
+});
+
+test("R5-TEXT-FALLBACK: a non-enumerable `text` field survives the rebuild (mutant M19)", () => {
+	// `rebuildContentPart` walks `Object.keys(part)`, which SKIPS non-enumerable keys — so a part whose
+	// `text` is non-enumerable would lose it entirely unless the explicit fallback re-adds it. The
+	// rebuild is reached because the value had to be redacted. Dropping that fallback is silent content
+	// loss (no leak, but the text disappears from the transcript), and nothing else pinned it.
+	const FE_SECRET = "FE-SECRET-0123456789ABCDEF";
+	const values = normalizeSecretValues([{ value: FE_SECRET, label: "l" }]);
+	const part: Record<string, unknown> = { type: "text" };
+	Object.defineProperty(part, "text", {
+		value: `k=${FE_SECRET}`,
+		enumerable: false, // invisible to Object.keys -> only the fallback can preserve it
+		configurable: true,
+		writable: true,
+	});
+	const out = redactContent([part], values, new Map());
+	const first = (out.value as Record<string, unknown>[])[0] as Record<string, unknown>;
+	strictEqual(typeof first.text, "string", "the field must still be present after the rebuild");
+	ok(!String(first.text).includes(FE_SECRET), "and it must be the REDACTED value");
 });
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────

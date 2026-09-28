@@ -750,6 +750,19 @@ export function redactContent(
 		// Proxy) must not stop the OTHER parts from being redacted — otherwise one bad part made the
 		// whole content walk throw and a registered secret in a SIBLING part was persisted verbatim.
 		try {
+			// A STRING element is not a `{type:"text",text}` part, so the inspect-and-rebuild path below
+			// never saw it — it fell straight through `return part` and persisted VERBATIM. That is
+			// reachable: an own enumerable accessor INDEX makes `hasOwnEnumerableAccessor(content)` set
+			// `changed`, so the already-snapshotted `parts` is what persists, and the snapshot holds the
+			// getter's returned string. The durable record then read `contentRedacted: true, total: 0` and
+			// the notice said "no secret value was redacted from this result" — a FABRICATED clean
+			// attestation over a persisted secret (#5109 review round 5). It also closes the bare
+			// `content: ["<secret>"]` shape, which previously leaked with no record at all.
+			if (typeof part === "string") {
+				const redacted = redactString(part, values, hits);
+				if (redacted !== part) changed = true;
+				return redacted;
+			}
 			if (part !== null && typeof part === "object") {
 				// An own accessor on the PART is a live read too (a `text` getter that read clean to the
 				// harvest/redaction and returns a secret at serialization). Detect it first and rebuild the
@@ -760,11 +773,11 @@ export function redactContent(
 					const redacted = redactString(original, values, hits);
 					if (redacted === original && !unstable) return part;
 					changed = true;
-					return rebuildContentPart(part as Record<string, unknown>, redacted);
+					return rebuildContentPart(part as Record<string, unknown>, redacted, values, hits);
 				}
 				if (unstable) {
 					changed = true;
-					return rebuildContentPart(part as Record<string, unknown>, undefined);
+					return rebuildContentPart(part as Record<string, unknown>, undefined, values, hits);
 				}
 			}
 		} catch {
@@ -789,7 +802,12 @@ export function redactContent(
  * guard inspected. `text` is passed in (when the part is a text part) so the already-performed and
  * already-redacted read is reused instead of the getter being invoked a second time.
  */
-function rebuildContentPart(part: Record<string, unknown>, text: string | undefined): Record<string, unknown> {
+function rebuildContentPart(
+	part: Record<string, unknown>,
+	text: string | undefined,
+	values: readonly SecretValue[],
+	hits: HitCounts,
+): Record<string, unknown> {
 	let out: Record<string, unknown>;
 	try {
 		out = Object.create(Object.getPrototypeOf(part)) as Record<string, unknown>;
@@ -797,7 +815,13 @@ function rebuildContentPart(part: Record<string, unknown>, text: string | undefi
 		out = {};
 	}
 	for (const key of Object.keys(part)) {
-		const value = key === "text" && text !== undefined ? text : part[key];
+		const raw = key === "text" && text !== undefined ? text : part[key];
+		// Every string read out of a rebuilt part is redacted. A KEY is as outbound as a value (it lands
+		// in the transcript), and the `unstable` path reaches here for a NON-text part — where the value
+		// read out of a live accessor would otherwise be copied into the persisted part VERBATIM. The
+		// text path re-redacts an already-redacted string, which is a no-op because a marker contains no
+		// registered value.
+		const value = typeof raw === "string" ? redactString(raw, values, hits) : raw;
 		Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
 	}
 	if (text !== undefined && !Object.prototype.hasOwnProperty.call(out, "text")) {
@@ -848,13 +872,25 @@ export interface DetailsWalkLimits {
 
 interface DetailsWalkBudget {
 	nodes: number;
+	/**
+	 * The per-pass node allowance. Pass 1 (mark dirty) and pass 2 (rebuild) each get a FULL allowance,
+	 * while the wall-clock `deadline` is SHARED across both — so the whole operation is still bounded
+	 * by one `MAX_DETAILS_WALK_MS`, but pass 2 is not starved by pass 1's node count. A single shared
+	 * counter would have made pass 2 exit immediately whenever pass 1 spent the allowance, which
+	 * returns every dirty node by reference — i.e. it would REDACT NOTHING. For a guard whose job is to
+	 * keep a secret out of the transcript, losing the redaction is worse than being slow, so the count
+	 * is per-pass and only the clock is shared.
+	 */
+	nodeAllowance: number;
 	deadline: number;
 	bounded: boolean;
 }
 
 function newDetailsBudget(limits: DetailsWalkLimits = {}): DetailsWalkBudget {
+	const allowance = limits.maxNodes ?? MAX_DETAILS_NODES;
 	return {
-		nodes: limits.maxNodes ?? MAX_DETAILS_NODES,
+		nodes: allowance,
+		nodeAllowance: allowance,
 		deadline: Date.now() + (limits.maxMs ?? MAX_DETAILS_WALK_MS),
 		bounded: false,
 	};
@@ -981,6 +1017,20 @@ function rebuildDetails(
 	memo: Map<object, unknown>,
 	depth: number,
 ): unknown {
+	// The budget is checked for EVERY node, STRINGS INCLUDED, and before any work. A WIDE FLAT object
+	// (200k keys whose values are strings) reaches the string branch once per value and never touches a
+	// container again — so a container-only check left pass 2 unbounded on exactly the shape the review
+	// measured (200k keys, secret at the last key: ~3.3 s against a 2 s budget while `bounded` stayed
+	// false). That was a real hole in the first version of this fix, caught by its own test.
+	//
+	// Consequence, stated honestly: when the budget is spent, this returns the node BY REFERENCE — for a
+	// string that means an UNREDACTED value. That is the documented fail-open posture (never block the
+	// turn) and it is not silent: `bounded` is set, so the record and the notice both say the walk did
+	// not finish. Losing the redaction is worse than being slow, which is why the budget is generous
+	// (1M nodes / 2 s) and why pass 2 gets a fresh node allowance — but an attacker who can return a
+	// tree larger than the budget can still get the tail through, and the record will say so.
+	if (detailsBudgetExhausted(state)) return node;
+	state.nodes--;
 	if (typeof node === "string") return redactString(node, values, hits);
 	if (node === null || typeof node !== "object") return node;
 	if (memo.has(node)) return memo.get(node);
@@ -1040,6 +1090,9 @@ export function redactDetails(
 	};
 	const dirty = markDirtyDetails(details, values, state, 0);
 	if (!dirty) return { value: details, changed: false, bounded: state.bounded };
+	// Pass 2 gets its own node allowance (the deadline is shared, so the block stays bounded): see
+	// `DetailsWalkBudget.nodeAllowance` for why starving pass 2 would redact nothing.
+	state.nodes = state.nodeAllowance;
 	const value = rebuildDetails(details, values, hits, state, new Map<object, unknown>(), 0);
 	return { value, changed: true, bounded: state.bounded };
 }
@@ -1521,6 +1574,13 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					for (const text of detailStrings) harvestDotenvSecrets(text, harvested, sourceName);
 				} catch (error) {
 					detailsHarvestFailed = true;
+					// ⛔ INVARIANT (review round 5, mutant M11): these two lines are set TOGETHER and neither is
+					// reset. The early-return gate tests both `!detailsHarvestFailed` and `!harvestBudget.bounded`,
+					// which means dropping EITHER conjunct is semantics-preserving — the gate cannot tell them
+					// apart. That equivalence rests entirely on this pairing: if these lines are ever split, or
+					// this assignment is removed while the flag stays in the gate (or vice versa), the gate can
+					// silently stop reporting a failed harvest. A test drives a details-harvest failure and
+					// asserts BOTH fields, so the pairing cannot drift unnoticed.
 					harvestBudget.bounded = true; // part of `details` was not inspected for source-5 values
 					globalThis.console?.error?.(
 						`[secret-echo-guard] details harvest failed; an unsourced .env value in details may be UNREDACTED: ${safeDiagnostic(error, values)}`,
