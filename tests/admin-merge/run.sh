@@ -4012,8 +4012,11 @@ lane_fail "$HEAD_TL" 5601 > "$SCEN/runs-$HEAD_TL"
 log_failed "$FAIL_TL" > "$SCEN/log-5601"
 main_red_n mainlane 5602 3 "$FAIL_TL" > "$SCEN/runs-main"
 main_red_surface
-write_pr_checks "$(check_run 3401 'test (a)' completed failure 6911)"
-pr_run_map 6911 pull_request 'Python CI'
+# The red check's run IS the lane's failing run (5601) — that membership is what
+# makes the attribution APPLY; a check from another workflow must NOT be
+# attributed by the lane split (see (k3)).
+write_pr_checks "$(check_run 3401 'test (a)' completed failure 5601)"
+pr_run_map 5601 pull_request 'Python CI'
 run_admin 42 --main-runs 3 --dry-run >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a red on the PR's tree BLOCKS even where the lane comparison would exempt it" \
@@ -4049,21 +4052,49 @@ if [ -n "$attr_src" ]; then
   printf 'tests/a.py::one\ntests/a.py::two\ntests/new.py::three\n' > "$TMP/attr-pr"
   printf 'tests/a.py::one\ntests/a.py::two\n' > "$TMP/attr-main"
   : > "$TMP/attr-none"
-  out="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-main" python-ci.yml main)"
+  out="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-main" python-ci.yml main 1)"
   grep -q "INHERITED FROM THE BASE ('main')" <<<"$out" && pass "unit: the inherited set is reported" || fail "unit: inherited header missing"
   grep -qF "        tests/a.py::one" <<<"$out" && pass "unit: an inherited nodeid is named" || fail "unit: inherited nodeid not named"
   grep -qF "        tests/new.py::three" <<<"$out" && pass "unit: a NEW nodeid is named" || fail "unit: NEW nodeid not named"
   awk '/NEW TO THIS PR/{f=1} f' <<<"$out" | grep -qF "tests/a.py::one" \
     && fail "unit: an inherited id leaked into the NEW list" || pass "unit: the NEW list excludes inherited ids"
-  out2="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-none" python-ci.yml main)"
+  out2="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-none" python-ci.yml main 1)"
   grep -q "UNATTRIBUTABLE" <<<"$out2" && pass "unit: an empty base set is UNATTRIBUTABLE, not 'new'" || fail "unit: an empty base set was read as novelty"
   grep -q "NEW TO THIS PR" <<<"$out2" && fail "unit: an empty base set still produced a NEW list" || pass "unit: no NEW list when the base set is empty"
-  out3="$(report_tree_attribution "$TMP/attr-none" "$TMP/attr-main" python-ci.yml main)"
+  out3="$(report_tree_attribution "$TMP/attr-none" "$TMP/attr-main" python-ci.yml main 1)"
   grep -q "This attribution is UNKNOWN" <<<"$out3" && pass "unit: no lane nodeid is UNKNOWN, not 'nothing new'" || fail "unit: an empty lane set was not reported as UNKNOWN"
+  # THE SCOPE GATE (#5215 review P1): applies=0 must NOT render a verdict about
+  # the lane's nodeids under a red they do not explain.
+  out4="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-main" python-ci.yml main 0)"
+  grep -q "SKIPPED" <<<"$out4" && pass "unit: an out-of-lane red SKIPS the split (no false attribution)" || fail "unit: the lane split was rendered for a red it does not explain"
+  grep -q "INHERITED FROM THE BASE" <<<"$out4" && fail "unit: an out-of-lane red still got an INHERITED verdict" || pass "unit: no INHERITED verdict when out of scope"
   unset -f say_err
 else
   fail "report_tree_attribution is missing from the rail — the attribution block was reverted"
 fi
+
+# (k3) THE SCOPE GATE, END TO END (#5215 review P1). The blocking red is a check
+# from ANOTHER workflow (Post-merge validation, run 6913) while the lane carries an
+# exempt inherited failure (run 5631). The lane's nodeids explain NOTHING about
+# that red, so the refusal must SKIP the split — never label an unrelated `lint`
+# red "inherited, not your diff".
+new_scen treehealth-out-oflane
+HEAD_OL="b6b6000000000000000000000000000000000003"
+printf '%s\n' "$HEAD_OL" > "$SCEN/head"
+FAIL_OL='tests/test_main.py::test_already_red_on_main'
+lane_fail "$HEAD_OL" 5631 > "$SCEN/runs-$HEAD_OL"
+log_failed "$FAIL_OL" > "$SCEN/log-5631"
+main_red_n mainlane3 5632 3 "$FAIL_OL" > "$SCEN/runs-main"
+main_red_surface
+write_pr_checks "$(check_run 3403 lint completed failure 6913)"
+pr_run_map 6913 pull_request 'Post-merge validation'
+run_admin 42 --main-runs 3 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an out-of-lane red tree still BLOCKS (exit $rc)" || fail "an out-of-lane red tree merged"
+grep -q "FAILURE ATTRIBUTION — SKIPPED" "$TMP/err" && pass "…and the lane split is SKIPPED, not mis-attributed to it" \
+  || fail "the lane's nodeids were rendered as an attribution of an out-of-lane red"
+grep -q "INHERITED FROM THE BASE" "$TMP/err" && fail "…the out-of-lane red got an INHERITED verdict" \
+  || pass "…and no INHERITED verdict was printed for it"
 
 # (l) A CONFLICTED PR IS REFUSED LOUDLY, before any CI work. GitHub cannot compute
 # a merge, so there is no evaluated tree; and the stale merge ref it leaves behind
