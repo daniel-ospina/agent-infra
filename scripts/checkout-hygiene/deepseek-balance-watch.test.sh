@@ -237,6 +237,33 @@ python3 "$LATCH" clear --primary deepseek >/dev/null 2>&1
 watch 2 "usage error on unexpected arg" --bogus
 assert_contains "$LAST_OUT" "usage:" "usage printed"
 
+echo "── regression (#1513 P2/P3): robustness of the hoisted latch resolution ──"
+# P2: a non-canonical status payload must NOT abort the poller. As a bare
+# assignment under `set -e` it used to kill the run on that line — no verdict, no
+# log, no accounting: a silent no-op. The failure must stay inside the substitution.
+reset
+bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"25.00","granted_balance":"0.00","topped_up_balance":"25.00"}]}'
+# NOTE: a failing helper (`DBW_LATCH_PY=/bin/false`) does NOT cover this: the line
+# ABOVE sanitises it with `|| echo '{}'`, so the defective assignment never sees a
+# bad payload. The stub must exit 0 and emit NON-CANONICAL JSON — that is what
+# reaches (and used to abort) the assignment.
+cat > "$T/null-status.py" <<'PYEOF'
+import sys
+if len(sys.argv) > 1 and sys.argv[1] == "status":
+    print('{"primaries": null}')
+sys.exit(0)
+PYEOF
+reset
+bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"25.00","granted_balance":"0.00","topped_up_balance":"25.00"}]}'
+watch 0 "non-canonical latch status ({\"primaries\": null}) → still reaches a verdict" DBW_LATCH_PY="$T/null-status.py"
+assert_contains "$LAST_OUT" "WARN balance=USD 25.0000" "malformed status read as 'no latch'; the run continues"
+# P3: warn < clear is a misconfiguration that would let a balance between the two
+# match no branch and be reported healthy while a latch is retained. Fail closed.
+watch 2 "warn < clear is refused at startup (fail-closed)" DBW_WARN_USD=5 DBW_CLEAR_USD=20
+assert_contains "$LAST_OUT" "must be >=" "inverted thresholds explained on stderr"
+reset
+
 echo ""
 echo "deepseek-balance-watch.test.sh: $PASS passed, $FAIL failed"
+
 [ "$FAIL" -eq 0 ]

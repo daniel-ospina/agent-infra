@@ -124,6 +124,15 @@ probe_triple() { # <output>
 gt_float() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
 ge_float() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
 
+# #1513 review (P3): the verdict chain assumes warn >= clear. With warn BELOW clear
+# (e.g. the intuitive WARN=5, CLEAR=20) a balance between them matches neither the
+# warn nor the latched-clear condition and falls to the healthy PASS — silently
+# reporting a RETAINED latch as healthy. Fail closed on the misconfiguration instead.
+if ! ge_float "$DBW_WARN_USD" "$DBW_CLEAR_USD"; then
+  echo "⛔ DBW_WARN_USD ($DBW_WARN_USD) must be >= DBW_CLEAR_USD ($DBW_CLEAR_USD): a balance between the two would match no branch and be reported healthy while a latch is retained." >&2
+  exit 2
+fi
+
 # ── latch helper wrappers (dry-run gated) ────────────────────────────────────
 latch() { # <args...> → rc of the helper (0 ok; non-zero = durable write failed)
   if [ -n "${DBW_DRY:-}" ]; then
@@ -211,7 +220,12 @@ if [ "$CODE" = "200" ]; then
   # on the latch, not on the band: latched-and-above-CLEAR clears; otherwise below
   # WARN warns.
   LATCH_JSON="$(python3 "$LATCH_PY" status 2>/dev/null || echo '{}')"
-  LATCH_PRESENT="$(printf '%s' "$LATCH_JSON" | python3 -c 'import json,sys; print("yes" if "deepseek" in json.load(sys.stdin).get("primaries", {}) else "no")' 2>/dev/null)"
+  # #1513 review (P2): the substitution MUST be non-fatal. As a bare assignment under
+  # `set -e`, a non-canonical status payload (empty, truncated, `{"primaries":null}`)
+  # makes python exit non-zero and ABORTS THE WHOLE POLLER on this line — no verdict,
+  # no log, no request-log accounting: a silent no-op run. The `|| printf 'no'` keeps
+  # the failure INSIDE the substitution so the run always reaches a verdict.
+  LATCH_PRESENT="$(printf '%s' "$LATCH_JSON" | python3 -c 'import json,sys; print("yes" if "deepseek" in (json.load(sys.stdin).get("primaries") or {}) else "no")' 2>/dev/null || printf 'no')"
   [ "$LATCH_PRESENT" = "yes" ] || LATCH_PRESENT="no"
   if [ "${USD_TOTAL:-}" = "unavailable" ]; then
     # is_available=false — account unusable (frozen/blocked/disabled). NOT a
@@ -242,31 +256,27 @@ if [ "$CODE" = "200" ]; then
     # verified positive. The chat probe (5-token) runs ONLY when a latch
     # record exists — no latch = nothing to clear = no token spend. Clear is
     # fail-closed: probe must pass or the clear is deferred.
-    # Uses the latch verdict resolved once above — re-running the pipeline here
-    # would reintroduce the `| grep -q` SIGPIPE hazard that, under `pipefail`,
-    # returns 141 and silently reports "no latch" (a false negative that skips
-    # the clear entirely).
-    if [ "$LATCH_PRESENT" = "yes" ]; then
-      CHAT_RAW="$(dbw_curl "https://api.deepseek.com/chat/completions" \
-        -H "Authorization: Bearer $DEEPSEEK_KEY" -H "Content-Type: application/json" \
-        -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Reply with the single word: OK"}],"max_tokens":5}')"
-      probe_triple "$CHAT_RAW"
-      if [ "$CODE" = "200" ]; then
-        if latch clear --primary deepseek --reason poller; then
-          latch ledger --event poller-clear --provider deepseek --detail "balance USD ${USD_TOTAL} >= clear ${DBW_CLEAR_USD} + probe 200"
-          log "$TS CLEAR balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}${CNY_TOTAL:+/ CNY ${CNY_TOTAL}}) probe=200 — exhaustion latch cleared"
-          ACTION="pass"
-        else
-          log "$TS LATCH-CLEAR-FAILED balance=USD ${USD_TOTAL} probe=200 — durable clear write failed; latch kept (fail-closed)"
-          ALERTED=1
-        fi
+    # Uses the latch verdict resolved once above. The enclosing `elif` already
+    # requires LATCH_PRESENT=yes, so the body is unconditional — an inner re-test
+    # would be always-true and its `else` dead code (which also risked re-introducing
+    # the `| grep -q` SIGPIPE hazard that under `pipefail` returns 141 and silently
+    # reports "no latch", skipping the clear entirely).
+    CHAT_RAW="$(dbw_curl "https://api.deepseek.com/chat/completions" \
+      -H "Authorization: Bearer $DEEPSEEK_KEY" -H "Content-Type: application/json" \
+      -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Reply with the single word: OK"}],"max_tokens":5}')"
+    probe_triple "$CHAT_RAW"
+    if [ "$CODE" = "200" ]; then
+      if latch clear --primary deepseek --reason poller; then
+        latch ledger --event poller-clear --provider deepseek --detail "balance USD ${USD_TOTAL} >= clear ${DBW_CLEAR_USD} + probe 200"
+        log "$TS CLEAR balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}${CNY_TOTAL:+/ CNY ${CNY_TOTAL}}) probe=200 — exhaustion latch cleared"
+        ACTION="pass"
       else
-        log "$TS HOLD balance=USD ${USD_TOTAL} but chat-probe http=${CODE} — clear deferred (fail-closed; a dead endpoint is not a restored balance)"
+        log "$TS LATCH-CLEAR-FAILED balance=USD ${USD_TOTAL} probe=200 — durable clear write failed; latch kept (fail-closed)"
         ALERTED=1
       fi
     else
-      log "$TS PASS balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}) healthy — no latch"
-      ACTION="pass"
+      log "$TS HOLD balance=USD ${USD_TOTAL} but chat-probe http=${CODE} — clear deferred (fail-closed; a dead endpoint is not a restored balance)"
+      ALERTED=1
     fi
   else
     # Healthy: above the warn threshold. No latch action — nothing to clear here
