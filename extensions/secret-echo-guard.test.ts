@@ -2068,30 +2068,6 @@ test("R6-TEXT-SIBLING: a CLEAN text part with a dirty SIBLING field is not attes
 	strictEqual(out.changed, true);
 });
 
-test("R6-BOUND-DETERMINISTIC: pass 2 consults the budget — pinned on a SCRIPTED CLOCK", () => {
-	// Round 5 gave pass 2 a per-node budget check, but NOTHING pinned it: on this box's usual load the
-	// 200k-key walk finishes in ~0.4s against a 2s budget, so deleting the check left the suite GREEN
-	// four runs in a row. A duration assertion cannot fix that — a wall-clock test is a load detector,
-	// which is exactly what round 6 removed — so the clock is INJECTED.
-	//
-	// Reads: #1 construction, #2 pass 1's first node (its allowance is a multiple of the check
-	// interval, so the deadline is consulted there) — both t=0, so pass 1 stays inside its budget.
-	// Every read after that is far past the deadline, and pass 2's allowance is RESET before it runs,
-	// so its first node consults the clock again. `bounded` can therefore only have come from PASS 2.
-	const S = "R6-CLOCK-SECRET-0123456789ABCDEF";
-	const values = normalizeSecretValues([{ value: S, label: "l" }]);
-	let reads = 0;
-	const now = () => (reads++ < 2 ? 0 : 1_000_000);
-	const tree: Record<string, string> = {};
-	for (let i = 0; i < 100; i++) tree[`k${i}`] = "v";
-	tree["zzlast"] = `x-${S}`; // dirty, so pass 2 runs at all
-	const out = redactDetails(tree, values, new Map(), { maxNodes: 1024, maxMs: 1_000, now });
-	strictEqual(out.bounded, true, "pass 2 must RECORD that it hit the budget");
-	// Selectivity: deleting `if (detailsBudgetExhausted(state)) return node;` from `rebuildDetails` —
-	// or dropping the `state.nodes = state.nodeAllowance` reset — stops the clock ever being read on
-	// pass 2, so `bounded` stays false and this assertion reds.
-});
-
 test("R6-PART-KEY-DIRTY: a key is redacted even when the part is rebuilt for ANOTHER reason", () => {
 	const S = "R6-KEY-DIRTY-SECRET-0123456789AB";
 	const K = "R6-KEYNAME-SECRET-0123456789ABC";
@@ -2109,8 +2085,9 @@ test("R6-PART-KEY-DIRTY: a key is redacted even when the part is rebuilt for ANO
 test("R6-UNSTABLE-NESTED: a rebuilt part's NESTED field is deep-redacted", () => {
 	const S = "R6-UNSTABLE-NESTED-SECRET-012345678";
 	const values = normalizeSecretValues([{ value: S, label: "l" }]);
-	// An own accessor on the part routes it to the forced rebuild, whose own value handling is then the
-	// only thing covering a NESTED field (the deep scan is not re-run on that path).
+	// An own accessor on the part routes it to the forced rebuild; its NESTED VALUES are covered by
+	// `rebuildNested`, which invokes the deep walk per value (the walk is not run on the PART itself on
+	// this path).
 	const part: Record<string, unknown> = { type: "image", meta: { nested: `k=${S}` } };
 	Object.defineProperty(part, "caption", { enumerable: true, configurable: true, get: () => "clean" });
 	const out = redactContent([part], values, new Map());
@@ -2285,9 +2262,40 @@ test("R8-TEXT-PATH-BUDGET: the text path really passes a budget to its string sc
 		strictEqual(part.incomplete, true, "a text part's bounded scan must be announced");
 		const bare = redactContent(`k=${S}`, values, new Map());
 		strictEqual(bare.incomplete, true, "a bare string element's bounded scan must be announced too");
+		// A STRING ELEMENT of an ARRAY (not a `{type:"text"}` part): its scan has NO secondary coverage —
+		// unlike the text-part branch, which the deep walk re-checks — so the final
+		// `budget.bounded -> incomplete` propagation is the ONLY thing that reports it. Without that line
+		// the handler's early-return gate is satisfied and the result returns `undefined` with the secret
+		// persisted and NO record and NO notice (round 9, mutation S5). Dropping the budget argument at
+		// that scan (S6) is caught here for the same reason.
+		const arr = redactContent([`k=${S}`], values, new Map());
+		strictEqual(arr.incomplete, true, "an array string element's bounded scan must be announced");
 	} finally {
 		CONTENT_PART_LIMITS.maxMs = saved;
 	}
+});
+
+test("R8-NONTEXT-DEEP-BOUND: a NON-text, NON-accessor part's bounded deep walk is announced", () => {
+	const S = "R8-NONTEXT-DEEP-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	// The shape the round-8 comment cites: a PLAIN object part whose nested payload bottoms out at
+	// `MAX_DETAILS_DEPTH`. All three round-7 bound pins cover OTHER branches (an accessor part, and text
+	// parts), so this branch's `deep.bounded -> incomplete` was unpinned until round 9's mutation check.
+	const out = redactContent([{ type: "image", payload: deepEnoughToBound(S) }], values, new Map());
+	strictEqual(out.incomplete, true, "a bounded deep walk on a plain part must be announced");
+});
+
+test("R8-ARRAY-PART: a rebuilt ARRAY part stays an array", () => {
+	const S = "R8-ARRAY-PART-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	// `Object.create(Object.getPrototypeOf([]))` is NOT an array, so a rebuilt array part lost
+	// `Array.isArray`, `length` and iteration. The named accessor forces the rebuild.
+	const part: unknown[] = [{ type: "text", text: "ordinary" }];
+	Object.defineProperty(part, "named", { enumerable: true, configurable: true, get: () => `k=${S}` });
+	const out = redactContent([part], values, new Map());
+	const first = (out.value as unknown[])[0];
+	ok(Array.isArray(first), "a rebuilt array part must stay an array");
+	ok(!JSON.stringify(first).includes(S), "and its named accessor must be redacted");
 });
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────

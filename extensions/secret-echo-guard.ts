@@ -804,16 +804,16 @@ export function redactContent(
 						// A "clean" text part is not necessarily clean: it can carry a registered value (or an
 						// accessor) in a SIBLING field — `{type:"text", text:"ok", meta:{nested:"<secret>"}}`.
 						// Scan it with the deep walker before attesting `contentRedacted`.
-						const deep = redactDetails(part, values, hits, CONTENT_PART_LIMITS);
+						const deep = redactDetails(part, values, hits, CONTENT_PART_LIMITS, budget);
 						if (deep.bounded) incomplete = true;
 						if (!deep.changed) return part;
 						changed = true;
-						const rebuilt = rebuildContentPart(deep.value as Record<string, unknown>, redacted, values, hits);
+						const rebuilt = rebuildContentPart(deep.value as Record<string, unknown>, redacted, values, hits, budget);
 						if (rebuilt.bounded) incomplete = true;
 						return rebuilt.value;
 					}
 					changed = true;
-					const rebuilt = rebuildContentPart(part as Record<string, unknown>, redacted, values, hits);
+					const rebuilt = rebuildContentPart(part as Record<string, unknown>, redacted, values, hits, budget);
 					if (rebuilt.bounded) incomplete = true;
 					return rebuilt.value;
 				}
@@ -828,7 +828,7 @@ export function redactContent(
 				// getter still live. `bounded` is threaded out so the shortfall is announced, never silent.
 				if (unstable) {
 					changed = true;
-					const rebuilt = rebuildContentPart(part as Record<string, unknown>, undefined, values, hits);
+					const rebuilt = rebuildContentPart(part as Record<string, unknown>, undefined, values, hits, budget);
 					if (rebuilt.bounded) incomplete = true;
 					return rebuilt.value;
 				}
@@ -840,7 +840,7 @@ export function redactContent(
 				// record read `contentRedacted: true, total: 0` and the notice said nothing was redacted
 				// (#5109 review round 6). The deep walker returns the SAME reference when clean, so an
 				// ordinary part is still passed through untouched.
-				const deep = redactDetails(part, values, hits, CONTENT_PART_LIMITS);
+				const deep = redactDetails(part, values, hits, CONTENT_PART_LIMITS, budget);
 				if (deep.bounded) incomplete = true;
 				if (deep.changed) {
 					changed = true;
@@ -876,10 +876,16 @@ function rebuildContentPart(
 	text: string | undefined,
 	values: readonly SecretValue[],
 	hits: HitCounts,
+	budget?: DetailsWalkBudget,
 ): { value: Record<string, unknown>; bounded: boolean } {
 	let out: Record<string, unknown>;
 	try {
-		out = Object.create(Object.getPrototypeOf(part)) as Record<string, unknown>;
+		// An ARRAY part must stay an array: `Object.getPrototypeOf([])` is `Array.prototype`, but
+		// `Object.create(Array.prototype)` is NOT an array, so the rebuilt part lost `Array.isArray`,
+		// `length` and iteration — a shape regression on a hostile/custom part (#5109 round 9 [P3]).
+		out = Array.isArray(part)
+			? []
+			: (Object.create(Object.getPrototypeOf(part)) as Record<string, unknown>);
 	} catch {
 		out = {};
 	}
@@ -907,7 +913,7 @@ function rebuildContentPart(
 			typeof raw === "string"
 				? redactString(raw, values, hits)
 				: raw !== null && typeof raw === "object"
-					? rebuildNested(raw, values, hits, (b) => (bounded = bounded || b))
+					? rebuildNested(raw, values, hits, (b) => (bounded = bounded || b), budget)
 					: raw;
 		Object.defineProperty(out, outKey, { value, enumerable: true, writable: true, configurable: true });
 	}
@@ -924,8 +930,9 @@ function rebuildNested(
 	values: readonly SecretValue[],
 	hits: HitCounts,
 	note: (bounded: boolean) => void,
+	budget?: DetailsWalkBudget,
 ): unknown {
-	const deep = redactDetails(raw, values, hits, CONTENT_PART_LIMITS);
+	const deep = redactDetails(raw, values, hits, CONTENT_PART_LIMITS, budget);
 	note(deep.bounded);
 	return deep.value;
 }
@@ -1198,20 +1205,36 @@ export function redactDetails(
 	values: readonly SecretValue[],
 	hits: HitCounts,
 	limits: DetailsWalkLimits = {},
+	shared?: DetailsWalkBudget,
 ): RedactOutcome<unknown> & { bounded: boolean } {
+	// `shared` lets a CALLER bound a whole operation rather than one subtree: without it every part of
+	// a `content` array spent a fresh `maxMs`, so N parts cost N x the advertised budget (measured:
+	// 40 large text parts = 20.5s) while the code claimed ONE budget for the walk (#5109 round 9).
+	// The node count and `bounded` are written back so consumption accumulates across calls, and pass
+	// 2 does NOT reset the allowance when the budget is shared — the deadline has to mean something
+	// for the operation, and any starvation is announced rather than silent.
+	const base = shared ?? newDetailsBudget(limits);
 	const state: DetailsDirtyState = {
-		...newDetailsBudget(limits),
+		...base,
 		dirty: new WeakSet<object>(),
 		clean: new WeakSet<object>(),
 		visiting: new WeakSet<object>(),
 		sawCycle: false,
 	};
 	const dirty = markDirtyDetails(details, values, state, 0);
+	if (shared !== undefined) {
+		shared.nodes = state.nodes;
+		shared.bounded = shared.bounded || state.bounded;
+	}
 	if (!dirty) return { value: details, changed: false, bounded: state.bounded };
 	// Pass 2 gets its own node allowance (the deadline is shared, so the block stays bounded): see
 	// `DetailsWalkBudget.nodeAllowance` for why starving pass 2 would redact nothing.
-	state.nodes = state.nodeAllowance;
+	if (shared === undefined) state.nodes = state.nodeAllowance;
 	const value = rebuildDetails(details, values, hits, state, new Map<object, unknown>(), 0);
+	if (shared !== undefined) {
+		shared.nodes = state.nodes;
+		shared.bounded = shared.bounded || state.bounded;
+	}
 	return { value, changed: true, bounded: state.bounded };
 }
 
