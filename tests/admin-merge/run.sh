@@ -122,7 +122,11 @@
 #      window cannot be sampled away. A listing that is only PARTLY readable is
 #      UNREADABLE, not a thinner lane (cycle-2 P1: an unparsable run line used to
 #      be skipped, silently shrinking the reference; an unterminated final line
-#      was dropped outright). A family whose every member is a workflow LIFECYCLE
+#      was dropped outright). Its one exception (#4844) is an unaddressable line
+#      whose STATUS is a named in-flight spelling: a non-completed run held no
+#      coverage, so it is reported and skipped instead of refusing the side —
+#      while an unaddressable COMPLETED line, whose shards MUST be unioned, still
+#      refuses. A family whose every member is a workflow LIFECYCLE
 #      job measured nothing and is refused (cycle-2 P1: `=changes` certified on
 #      bookkeeping while main's real shard went uncompared), which is why the
 #      evidence and the refusal both NAME the parity family. `--main-runs` is
@@ -138,7 +142,10 @@
 #      an empty FILE (a blank line used to match itself and certify); a shard
 #      main ran only INSIDE the operator's window must not be sampled away; a
 #      failed `gh run list` is a LISTING failure; a partly-readable listing is
-#      unreadable; a lifecycle-only "family" measured nothing; a misspelled
+#      unreadable for every line it cannot ACCOUNT for — a completed or unknown
+#      status with no run id (the one exception, #4844, is a line whose STATUS is a
+#      named in-flight spelling, which held no coverage); a lifecycle-only
+#      "family" measured nothing; a misspelled
 #      `ADMIN_MERGE_LANE_PARITY` is refused rather than silently read as 'off';
 #      and the certifying path DISCLOSES the family it compared. Every one of
 #      these has a test that FAILS against the revision before its fix.
@@ -4744,6 +4751,9 @@ grep -q "test (b)" "$SCEN/err" && pass "…and the shard it named is the one rep
 # (n) A LISTING THAT IS ONLY PARTLY READABLE IS UNREADABLE (#1319 cycle-2 P1). A
 # line that does not parse into a run id used to be `continue`d away — a partial
 # listing read as a THINNER LANE, which is the one thing the doctrine forbids.
+# Its `completed` status is what keeps this a REFUSAL: #4844 relaxed the same
+# shape only when the status that survived is a NAMED IN-FLIGHT spelling, which
+# cannot have held coverage — (n2) below.
 new_scen vacuouspartial
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9961 > "$SCEN/runs-$HEAD_VP"
@@ -4758,6 +4768,138 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — a partial listing was read as 'main ran fewer shards'"
 grep -q "unparsable lane-run listing line" "$SCEN/err" && pass "…named as an UNPARSABLE listing line" \
   || fail "the partial-listing refusal is not named: $(head -2 "$SCEN/err")"
+
+# (n2) A TRUNCATED LINE THAT KEEPS AN IN-FLIGHT STATUS IS NOT AN UNREADABLE
+# LISTING (#4844). The reader splits with `IFS=$'\t'`, and TAB is IFS WHITESPACE,
+# so an EMPTY field collapses the line. (n) above pins the `completed` case (a
+# HARD refusal). This pins the in-flight one, and the deciding field is the
+# STATUS: a named in-flight spelling means the run is not COMPLETED, and a
+# non-completed run contributes no shards (the `completed` test below skips it
+# regardless), so the reference set cannot shrink. Refusing it blocked the whole
+# side and reported the rail's own mid-flight lane as an unparsable listing: the
+# observed incident. It is SKIPPED and REPORTED on stderr instead.
+#
+# WHY THE FIXTURE IS THE SHAPE IT IS: the `-` sentinel in LANE_RUN_JQ (#1368)
+# means a real listing line always carries three fields, so a well-formed
+# in-flight line never reaches this guard at all — a 200-run live sample carried
+# zero lines whose field count differed from three. The shape is therefore an
+# anomaly, not the ordinary mid-flight line.
+new_scen inflightline
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9981 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainif00 9982 > "$SCEN/runs-main"
+# The malformed line: status only — no conclusion and no run id.
+printf 'in_progress\n' >> "$SCEN/runs-main"
+lane_jobset 9981 success 'test (a)' 'test (b)'
+lane_jobset 9982 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a mid-flight lane's unreadable line does not refuse the side (exit 0)" \
+  || fail "expected exit 0, got $rc — a mid-flight lane still blocked the merge: $(head -1 "$SCEN/err")"
+grep -q "unparsable lane-run listing line" "$SCEN/err" \
+  && fail "a mid-flight lane is still misdiagnosed as an unparsable listing" \
+  || pass "…and is NOT reported as an unparsable listing"
+# The report is an ANOMALY note on STDERR, never a claim that a lane is merely
+# busy: a WELL FORMED in-flight line is skipped silently, so silence here would
+# hide the signal that an unaddressable line occurred at all.
+grep -q "has no readable run id" "$SCEN/err" \
+  && pass "…reported on stderr as an unreadable-id line" \
+  || fail "the skipped line is silent: $(head -2 "$SCEN/err")"
+grep -q "status='in_progress'" "$SCEN/err" \
+  && pass "…naming the fields it read, so the next occurrence is diagnosable" \
+  || fail "the report does not name what it read: $(head -2 "$SCEN/err")"
+
+# (n3) THE COLLAPSE ON A COMPLETED RUN STILL REFUSES — that is where coverage is
+# at risk (#4844). #1368's sentinel exists so a shifted payload cannot be read
+# silently, and when the run is COMPLETED its shards MUST be unioned: an
+# unreadable id means they cannot be. The refusal therefore stays, and names the
+# three-field contract #1368 enforces.
+new_scen collapsecompleted
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9991 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainco00 9992 > "$SCEN/runs-main"
+# Adjacent tabs on a COMPLETED row: the payload shifts into the conclusion slot.
+printf 'completed\t\tmainco00:9993\n' >> "$SCEN/runs-main"
+lane_jobset 9991 success 'test (a)' 'test (b)'
+lane_jobset 9992 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a COLLAPSED completed row → BLOCK (exit $rc), never a thinner lane" \
+  || fail "expected a non-zero exit, got 0 — a completed run's shards were dropped"
+grep -q "unparsable lane-run listing line ('completed')" "$SCEN/err" \
+  && pass "…named as an unparsable listing line" \
+  || fail "the collapsed completed row is not named: $(head -2 "$SCEN/err")"
+grep -q "#1368" "$SCEN/err" \
+  && pass "…and names the three-field contract it violates, so the remedy is obvious" \
+  || fail "the refusal does not name the contract it violates (#1368)"
+
+# (n4) A TRUNCATION AT A FIELD BOUNDARY IS NOT A COLLAPSE (#4844 review). Here the
+# conclusion slot holds a perfectly valid `-` — the SENTINEL, not a shifted
+# payload — and only the run id is absent. An earlier revision keyed the refusal
+# on the conclusion slot, so it blocked this mid-flight line: a false block of the
+# exact symptom #4844 filed. The status decides it (non-completed ⇒ no shards ⇒
+# skip), so the assertion is that the merge proceeds.
+new_scen truncationatboundary
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9995 > "$SCEN/runs-$HEAD_VP"
+lane_pass maintb00 9996 > "$SCEN/runs-main"
+# Truncated after the second field: the sentinel IS present, the run id is not.
+printf 'in_progress\t-\n' >> "$SCEN/runs-main"
+lane_jobset 9995 success 'test (a)' 'test (b)'
+lane_jobset 9996 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a line truncated after the sentinel is NOT a false block (exit 0)" \
+  || fail "expected exit 0, got $rc — the sentinel was mistaken for a shifted payload: $(head -1 "$SCEN/err")"
+grep -q "has no readable run id" "$SCEN/err" \
+  && pass "…and is still reported, naming what was read" \
+  || fail "the line is silent: $(head -2 "$SCEN/err")"
+
+# (n5) A COLLAPSE ON AN IN-FLIGHT RUN IS REPORTED, NOT REFUSED (#4844). The same
+# shifted-payload shape as (n3), but the run is NOT completed, so it held no
+# shards: refusing would be a false block. The note must also show the fields it
+# read WITHOUT claiming which shape it saw — a truncation at a field boundary and
+# a collapse are indistinguishable from here.
+new_scen collapseinflight
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9997 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainci00 9998 > "$SCEN/runs-main"
+# Adjacent tabs: an EMPTY middle field, which `IFS=$'\t' read` collapses.
+printf 'in_progress\t\tmainci00:9999\n' >> "$SCEN/runs-main"
+lane_jobset 9997 success 'test (a)' 'test (b)'
+lane_jobset 9998 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a COLLAPSED in-flight row does not refuse the side (exit 0)" \
+  || fail "expected exit 0, got $rc — a non-completed run's line blocked the merge: $(head -1 "$SCEN/err")"
+grep -q "conclusion='mainci00:9999'" "$SCEN/err" \
+  && pass "…reported with the fields it actually read (the shifted payload visible)" \
+  || fail "the report does not show what it read: $(head -2 "$SCEN/err")"
+# …and it may not assert WHICH shape it saw: a truncation at a field boundary and
+# a collapse are indistinguishable from the reader's position, so the note has to
+# name both possibilities. Both errors in this area are recorded history (#4844).
+grep -q "truncated or its fields shifted" "$SCEN/err" \
+  && pass "…and states BOTH possibilities rather than asserting the shape it saw" \
+  || fail "the note asserts a shape the reader cannot know: $(head -2 "$SCEN/err")"
+
+# (n6) A WELL-FORMED IN-FLIGHT LINE IS SKIPPED SILENTLY (#4844 review). The note
+# marks an UNREADABLE line, not a busy lane — main's lane is mid-flight most of the
+# time, so firing it on the ordinary case would recreate exactly the noise this
+# change removes. Here the in-flight line carries all three of its fields, so the
+# `completed` test skips it and NOTHING is reported.
+new_scen wellformedinflight
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9961 > "$SCEN/runs-$HEAD_VP"
+{ lane_pass mainwf00 9962; lane_line in_progress "-" mainwf0a 9963; } > "$SCEN/runs-main"
+lane_jobset 9961 success 'test (a)' 'test (b)'
+lane_jobset 9962 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a well-formed in-flight line is skipped without refusing (exit 0)" \
+  || fail "expected exit 0, got $rc — the ordinary mid-flight case blocked the merge"
+grep -q "has no readable run id" "$SCEN/err" \
+  && fail "the anomaly note fires on the ORDINARY mid-flight case (noise, not signal)" \
+  || pass "…and NOTHING is reported: the note is for unreadable lines only"
 
 # (o) THE FAMILY MUST MEASURE SOMETHING (#1319 cycle-2 P1). The prefix is a family
 # SELECTOR; `ADMIN_MERGE_LANE_JOB_PREFIX=changes` matches the workflow's

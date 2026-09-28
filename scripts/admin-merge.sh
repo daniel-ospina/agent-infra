@@ -533,7 +533,12 @@ RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 #   1. All three fields must be NON-EMPTY. `lane_shard_set` splits this line with
 #      `IFS=$'\t' read`, and TAB is IFS WHITESPACE, so adjacent tabs collapse into
 #      one delimiter and the payload shifts into the wrong variable — `id` comes out
-#      empty and the guard refuses the listing.
+#      empty and the guard refuses the listing. (That refusal is KEPT for a line
+#      the listing cannot ACCOUNT for. What #4844 relaxed is only the case where
+#      the surviving STATUS is a named in-flight spelling: a non-completed run
+#      contributes no shards, so such a line is reported and skipped — whether it
+#      was truncated or its payload shifted. A COMPLETED line with unreadable
+#      fields still refuses.)
 #   2. `(.conclusion // "-")` does NOT fix it: jq's `//` fires only on false/null,
 #      and an empty string is neither.
 #
@@ -1227,17 +1232,23 @@ for n in sorted(names):
 # unobserved and certifies a PR that skipped it (cycle-1 review, reproduced).
 # A run whose jobs cannot be read — or a run LISTING that fails — makes the WHOLE
 # side unreadable (return 1): partial coverage silently read as full is the
-# fail-open this gate prevents. No name is written for an empty shard set.
+# fail-open this gate prevents. The ONE exception is an unaddressable line whose
+# STATUS is a named in-flight spelling: a non-completed run contributes no shards
+# (only COMPLETED runs are consulted above), so it is skipped and reported instead
+# (#4844 — the guard below says why that is not a hole). No name is written for an
+# empty shard set.
 lane_shard_set() {
   local flag="$1" value="$2" limit="$3" out="$4"
-  local listing="$TMP/lane-runs.tmp" status conclusion id rc=0 listed parsed=0
+  local listing="$TMP/lane-runs.tmp" status conclusion id rc=0 listed parsed=0 inflight=""
   : > "$out"
   if ! lane_run_ids "$flag" "$value" "$limit" > "$listing"; then
     say_err "admin-merge: ✗ could not list the lane runs for $flag $value — lane coverage unverifiable"
     return 1
   fi
-  # EVERY non-blank line of the listing must address a run. A listing that is
-  # only PARTLY readable is unreadable, not a thinner lane (cycle-2 P1): a line
+  # EVERY non-blank line of the listing must address a run, with ONE documented
+  # exception (#4844, the guard below): a line whose STATUS is a named in-flight
+  # spelling, which contributes no shards. Otherwise a listing that is only
+  # PARTLY readable is unreadable, not a thinner lane (cycle-2 P1): a line
   # that does not parse into a run id used to be `continue`d away, which quietly
   # SHRANK the reference set — so a truncated listing read as "main ran fewer
   # shards" and the gate certified on it. The `|| [ -n "$status" ]` also keeps a
@@ -1247,7 +1258,48 @@ lane_shard_set() {
     [ -n "$status" ] || continue
     id="${id##*:}"
     if [ -z "$id" ]; then
-      say_err "admin-merge: ✗ unparsable lane-run listing line ('${status}') for $flag $value — lane coverage unverifiable"
+      # #4844: a line with no readable run id. TWO shapes reach here — a line cut
+      # off before its id, and a #1368 COLLAPSE (an EMPTY conclusion merges adjacent
+      # tabs, so a payload shifts left into the conclusion slot and `id` comes out
+      # empty). Neither is producible by the current projection: a 200-run live
+      # sample carried zero lines whose field count differed from three.
+      #
+      # THE STATUS DECIDES IT, not the other slots — because the status is the field
+      # coverage turns on, and it is intact under BOTH shapes: truncation removes
+      # the TAIL, and a collapse leaves field 1 alone. A named in-flight spelling
+      # means the run is not COMPLETED, and a non-completed run contributes NO
+      # shards — the `completed` test below skips it however well its line parses.
+      # Skipping such a line therefore cannot shrink the reference set, which is
+      # drawn from COMPLETED runs only, while refusing it blocked the whole side and
+      # reported this rail's own mid-flight lane as an unparsable listing.
+      #
+      # Reading the other slots instead is WRONG in both directions, and both errors
+      # were made before this shape was settled: keying on the conclusion slot
+      # refuses `in_progress<TAB>-`, a line truncated at a field boundary whose `-`
+      # is the sentinel and NOT a shifted payload — a false block of the very
+      # symptom #4844 filed; and keying on “is the conclusion empty” skips an
+      # in-flight collapse that only needed reporting. The refusal message may not
+      # assert WHICH shape it saw either: from here the two are indistinguishable.
+      #
+      # Any OTHER spelling — `completed`, or a token this rail has never seen —
+      # keeps the HARD refusal. That is where coverage is genuinely at risk: the
+      # shards of an unreadable COMPLETED line cannot be unioned, and a partly
+      # readable listing must never read as a thinner lane, or a silently shrunk
+      # reference set certifies a change that skipped a shard main ran (cycle-2
+      # P1). For the same reason this set must stay an IN-FLIGHT set: adding a
+      # TERMINAL spelling here would let a truncated completed line be skipped,
+      # which is the one drift this guard cannot absorb. It matches the
+      # check-surface probe's IN_FLIGHT_STATUS (see its copy); the pending-run
+      # diagnostic names no set and treats EVERY non-completed line as pending, so
+      # it is not the artifact to keep in step.
+      case "$status" in
+        queued|in_progress|waiting|requested|pending)
+          inflight="${inflight:+$inflight; }status='$status' conclusion='${conclusion:-}'"
+          parsed=$((parsed + 1))
+          continue
+          ;;
+      esac
+      say_err "admin-merge: ✗ unparsable lane-run listing line ('${status}') for $flag $value — the projection guarantees three non-empty fields (#1368), so this line is truncated or mis-aligned and its shards cannot be counted; lane coverage unverifiable"
       return 1
     fi
     parsed=$((parsed + 1))
@@ -1263,6 +1315,16 @@ lane_shard_set() {
   if [ "$parsed" -ne "$listed" ]; then
     say_err "admin-merge: ✗ the lane-run listing for $flag $value did not parse in full ($parsed of $listed lines) — lane coverage unverifiable"
     return 1
+  fi
+  # #4844: an unaddressable IN-FLIGHT line was SKIPPED, not refused — report it on
+  # STDERR, naming the fields actually read so the next occurrence is diagnosable
+  # from the log alone. It must NOT read as the ordinary mid-flight case (a well
+  # formed in-flight line never reaches this path), and it must NOT claim which
+  # shape it saw: a truncation at a field boundary and a #1368 collapse are
+  # indistinguishable from here, and asserting one when the other happened is the
+  # defect #4844 filed.
+  if [ -n "$inflight" ]; then
+    say_err "admin-merge: ⚠ an in-flight lane-run listing line for $flag $value has no readable run id — read as [${inflight}]. A non-completed run contributes no shards, so coverage is unaffected; the projection nevertheless guarantees three non-empty fields (#1368), so this line was truncated or its fields shifted, and the listing is worth a look."
   fi
   # Drop any blank line before the union: a single blank entry would be counted
   # as a shard by `wc -l` and would match the empty pattern under `grep -xF`.

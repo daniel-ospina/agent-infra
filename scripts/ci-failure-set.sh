@@ -332,11 +332,16 @@ drop_superseded_runs() {
       # The re-emitted CONSUMPTION FORM must carry the same non-empty sentinel the
       # canonical projection uses (#1368): admin-merge.sh reads these rows with
       # `IFS=$'\t' read -r status conclusion id`, and TAB is IFS WHITESPACE, so an
-      # empty conclusion collapses the delimiter and shifts `sha:id` into `id`,
-      # which the listing guard reads as a REFUSED listing rather than a pending
-      # run. A pending run has status!=completed and an EMPTY conclusion, so this
-      # is the COMMON case, not an edge one — the raw projection may leave the
-      # conclusion empty, but nothing downstream of this rule may.
+      # empty conclusion collapses the delimiter, the payload shifts LEFT into the
+      # CONCLUSION slot and `id` comes out EMPTY — which the listing guard reads as
+      # an unaddressable line rather than as a pending run. For a COMPLETED row
+      # that is refused (its shards cannot be unioned, so the listing is
+      # unverifiable); an IN-FLIGHT row contributes no shards (the coverage loop
+      # consults completed runs only), so it is reported and skipped (#4844). A
+      # pending run has status!=completed and an
+      # EMPTY conclusion, so this is the COMMON case, not an edge one — the raw
+      # projection may leave the conclusion empty, but nothing downstream of this
+      # rule may.
       out[NR] = $1 OFS (blank($2) ? "-" : $2) OFS $3
       ref[NR] = $3
       concl[NR] = $2
