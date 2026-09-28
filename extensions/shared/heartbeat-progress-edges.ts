@@ -125,6 +125,9 @@ export const OUT_OF_FAMILY_TERMS = [
   "getCutGapMs",
   "getEffectiveCutGapMs",
   "getCpuStallMs",
+  // #5195: camelCase (not `_MS`), so the name scan cannot see it — listed
+  // deliberately, with its own value+behaviour pin in builtin-tools.test.ts.
+  "getProgressAgeMs",
   "getTaskBackstopMs",
   "FIRST_OUTPUT_TIMEOUT_MS",
   "DEFAULT_HARD_CAP_MS",
@@ -368,6 +371,7 @@ export const HEARTBEAT_KILL_REASONS = [
   "first-message-stall",
   "max-dispatch",
   "cut",
+  "no-progress",
 ] as const;
 
 export type HeartbeatKillReasonName = (typeof HEARTBEAT_KILL_REASONS)[number];
@@ -393,6 +397,10 @@ export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string
   "tool-stall": "max(60 s, TASK_TOOL_STALL_MS) override (env), else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap from DEFAULT_HARD_CAP_MS) (L) — floored further by HEARTBEAT_TIMEOUT_MS while no turn is active",
   "first-message-stall": "max(60 s, TASK_FIRST_MESSAGE_MS) override (env), else max(60 s, DEFAULT_FIRST_MESSAGE_MS) (M) — then load-scaled and latched at the dispatch site",
   "max-dispatch": "max(60 s, TASK_MAX_DISPATCH_MS) override (env), else OFF — DEFAULT_MAX_DISPATCH_MS = 0 disables the cap (D)",
+  // #5195: the ONLY progress-keyed bound. Not load-scaled and not latched — a
+  // bound that WIDENS is how the class this clause catches escaped every other
+  // clause, so widening is exactly what it must not do. 0 = explicit off.
+  "no-progress": "max(60 s, 3 × the effective heartbeat interval, TASK_PROGRESS_AGE_MS) override (env) — 0 = OFF (explicit off switch, never a typo), else DEFAULT_PROGRESS_AGE_MS (45 min), both floored at the REPORTING CADENCE (the parent can only see progress when the child reports it, and the tick interval is operator-settable to 300 s). Deliberately NOT load-scaled and NOT latched; measured against PROGRESS (a completed unit of work or content-grounded child progress), never against elapsed dispatch time",
   "cut": "getEffectiveCutGapMs() / getCutGapMs() / TASK_HEARTBEAT_CUT_GAP_MS",
 };
 
@@ -415,6 +423,15 @@ export const PROGRESS_DRIVERS: readonly ProgressDriver[] = [
     owner: "extensions/builtin-tools/index.ts",
     mechanism: "parsed child marker kinds → everSawRealActivity/everSawMsg/everSawTool/firstActivityAt",
     sharesDeclaration: true,
+  },
+  {
+    id: "child-content-progress",
+    owner: "extensions/task-heartbeat.ts",
+    mechanism:
+      "assistantMessageEvent content inspection → `progress=<0|1>` on the tick; the parent stamps lastProgressAt from it (and from a parsed tool_end)",
+    sharesDeclaration: false,
+    reason:
+      "#5195 — this is deliberately a SECOND, independent classifier, and it does NOT consume the edge table above. The edge table answers 'which pi events are LIFE SIGNS' (and every edge advances the child's activity clock). This driver answers a different question — 'did a unit of work COMPLETE, or did the model produce real CONTENT' — and it must NOT share the life-sign table, because sharing it is the bug: a tick/life-sign-only classification is forgeable by a process that is alive but doing nothing, which is exactly how the empty-turn loop and the drip stream escaped all nine existing clauses. Registered here so the divergence is DECLARED rather than accidental (the #1068 discipline: a driver that does not share the classification must say why).",
   },
   {
     id: "checkpoint-gate",
@@ -884,6 +901,22 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the EFFECTIVE `tool-dead` CPU-stall bound (C) — max(60 s, TASK_CPU_STALL_MS) when the override is a positive finite number; the VALUE 0 disables the clause outright; blank/whitespace/negative/non-finite fall back to DEFAULT_CPU_STALL_MS so a launcher typo cannot silently disarm a kill path. Registered separately from the literal for the same reason as its siblings: without it the env path, its 60 s floor and its off switch are invisible to the registry.",
+  },
+  {
+    name: "DEFAULT_PROGRESS_AGE_MS",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: "= 2_700_000;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "#5195 (X) — the shipped bound of the `no-progress` clause, and the ONLY bound in the family keyed on PROGRESS rather than liveness: 45 min with no COMPLETED unit of work (`tool_end`) or content-grounded child progress (`progress=1`) while no tool is in flight. Deliberately NOT load-scaled and NOT latched — a bound that WIDENS is how the class this clause catches (`#363` hard cap 2h→6h, `ea22897` making S per-dispatch) escaped every other clause. The EFFECTIVE bound is resolved by getProgressAgeMs (env override; 0 = OFF; floored at the REPORTING CADENCE, `max(60 s, 3 x the heartbeat interval)`, because the parent can only see progress when the child reports it). 45 min is the repo's own declared ceiling for the child's retry/hang window (`HANG_WINDOW_CEILING_MS = 2700000` in scripts/check-cost-config.sh:198; docs/ops/cost-config-policy.md:102-103 derives the real 43.0 min window and requires it <= that ceiling) — set BELOW it, X would pre-empt a chattering retrying child's own bounded visible recovery. Still ~8x below the 6h hard-cap backstop.",
+  },
+  {
+    name: "getProgressAgeMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE `no-progress` bound (X) — max(reporting-cadence floor, TASK_PROGRESS_AGE_MS) when the override is a positive finite number; the VALUE 0 disables the clause outright; blank/whitespace/negative/non-finite fall back to DEFAULT_PROGRESS_AGE_MS, so a launcher typo cannot silently disarm the one clause that bounds the content-free-loop class. The floor is the REPORTING CADENCE — `max(60 s, 3 x the effective heartbeat interval)` — NOT a bare 60 s: the parent can only see progress when the child reports it, so a bound below the cadence fires before the evidence it waits for and would cut a genuinely progressing content-only child (TASK_PROGRESS_AGE_MS=60000 with a 300 s interval is the worked case; caught in review). Registered separately from the literal for the same reason as its siblings: otherwise the env path, its floor and its off switch are invisible to the registry.",
   },
 ];
 

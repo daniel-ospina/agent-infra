@@ -19,12 +19,13 @@
  *   [task-heartbeat] tick nonce=<n> tools=<n> turn=<0|1> stream_age_ms=<n>
  *                       tool_age_max_ms=<n> tool_updates=<0|1>
  *                       cpu_ms=<n> cpu_stall_ms=<n> cpu_advanced=<0|1>
- *                       saw_msg=<0|1> saw_tool=<0|1>
+ *                       saw_msg=<0|1> saw_tool=<0|1> progress=<0|1>
  *                                               — every clamped interval
  *                                                     (#928 added cpu_ms /
  *                                                     cpu_stall_ms /
- *                                                     cpu_advanced; see the
- *                                                     CPU-liveness block
+ *                                                     cpu_advanced; #5195
+ *                                                     added progress — see
+ *                                                     `isProgressContentEvent`
  *                                                     below formatTick)
  *   [task-heartbeat] session_end nonce=<n>       — once at session_shutdown
  *                                                  (session completed — #191)
@@ -196,6 +197,25 @@ export interface TickFields {
    * philosophy exactly: only ever kill a tool that has demonstrated it works,
    * then stopped. */
   cpuAdvanced: boolean;
+  /** #5195 — PROGRESS happened since the previous tick: a unit of work
+   * COMPLETED (a tool ended, a turn ended carrying results/content), or the
+   * model produced non-whitespace CONTENT (text or thinking).
+   *
+   * This is the one signal in the wire that is content-grounded, and it exists
+   * because every other liveness field is forgeable by a process that is alive
+   * but doing nothing: `saw_msg` is set by a bare `message_update` with NO
+   * content inspection (see the handler), so a drip stream of whitespace or
+   * retry chatter latches every parent-visible signal while completing no work.
+   * `progress` is what the parent's `no-progress` clause keys on, so a genuinely
+   * working agent is never cut and a zombie cannot forge its way past it.
+   *
+   * Deliberately NOT set by: the content-free openers (`start`, `text_start`,
+   * `thinking_start`, `toolcall_start`), whitespace-only deltas, `error`, or the
+   * tick itself. Disclosed residual: a provider repeating identical
+   * non-whitespace text is indistinguishable from real work — but treating text
+   * as non-progress would cut working agents, which is the failure this exists
+   * to prevent. */
+  progress: boolean;
 }
 
 /** #783 §6.6: the output-liveness bit the tick carries — true iff there is at
@@ -224,8 +244,99 @@ export function formatTick(nonce: string, f: TickFields): string {
     `stream_age_ms=${f.streamAgeMs} tool_age_max_ms=${f.toolAgeMaxMs} ` +
     `tool_updates=${f.toolUpdates ? 1 : 0} ` +
     `cpu_ms=${f.cpuMs} cpu_stall_ms=${f.cpuStallMs} cpu_advanced=${f.cpuAdvanced ? 1 : 0} ` +
-    `saw_msg=${f.sawMsg ? 1 : 0} saw_tool=${f.sawTool ? 1 : 0}`
+    `saw_msg=${f.sawMsg ? 1 : 0} saw_tool=${f.sawTool ? 1 : 0} ` +
+    `progress=${f.progress ? 1 : 0}`
   );
+}
+
+/**
+ * #5195 — does a streaming assistant event represent PROGRESS?
+ *
+ * "Progress" is a COMPLETED unit of work, or the model producing real content —
+ * not "an update arrived". The distinction is the whole point: the supervision
+ * standard (Temporal activity heartbeats) warns that a worker which reports
+ * liveness rather than progress is indistinguishable from *"a zombie that looks
+ * alive"*, and our own `message_update` handler used to set `turnSawMessage`
+ * with no content inspection at all, so a drip of whitespace deltas latched
+ * every parent-visible signal.
+ *
+ * Pure and exported so the rule is pinned by unit tests and shared with the
+ * registry declaration, rather than living only inside a handler closure.
+ * Typed structurally (not against the SDK union) so this file keeps its
+ * single-type-import contract and stays importable without mocks.
+ */
+export function isProgressContentEvent(
+  ev: { type?: unknown; delta?: unknown; content?: unknown; toolCall?: unknown; message?: unknown } | null | undefined,
+): boolean {
+  if (!ev || typeof ev.type !== "string") return false;
+  const nonEmpty = (v: unknown): boolean => typeof v === "string" && v.trim().length > 0;
+  switch (ev.type) {
+    // The model finished a content block: progress iff it actually holds content.
+    case "text_end":
+    case "thinking_end":
+      return nonEmpty(ev.content);
+    // Incremental content: progress iff this delta is not whitespace/keepalive.
+    case "text_delta":
+    case "thinking_delta":
+      return nonEmpty(ev.delta);
+    // A tool call finished being constructed — a unit of work is about to run.
+    case "toolcall_end":
+      return ev.toolCall != null;
+    // Turn complete. CONTENT-GATED rather than unconditionally true: a bare
+    // `done` on a content-free message is not work, and stamping progress from
+    // it would be the same content-blind mistake this classifier exists to fix.
+    // (pi's agent loop currently routes `done` to `message_end` and never to
+    // `message_update`, so this arm is unreachable today — it is written
+    // defensively so that IF it becomes reachable it cannot forge progress.)
+    case "done":
+      return messageHasContent(ev.message);
+    // Deliberately NOT progress: the content-free openers (`start`,
+    // `text_start`, `thinking_start`, `toolcall_start`), the incremental JSON of
+    // `toolcall_delta` (it completes at `toolcall_end`), and `error` — a turn
+    // that FAILED completed no work, and a child retrying on provider errors is
+    // deliberately still bounded.
+    default:
+      return false;
+  }
+}
+
+/** Does one content block hold real content? Tolerant by design: the SDK types
+ * the message shape, but this file's contract is to import only the
+ * ExtensionAPI type, so the check is structural and never throws on a shape it
+ * does not recognise (an unrecognised block is NOT progress — the fail-safe
+ * direction, since a false progress is what lets a zombie survive). */
+function blockHasContent(block: unknown): boolean {
+  if (typeof block === "string") return block.trim().length > 0;
+  if (!block || typeof block !== "object") return false;
+  const o = block as Record<string, unknown>;
+  // A constructed tool call is a unit of work about to run.
+  if (o.type === "toolCall") return true;
+  for (const key of ["text", "thinking", "content"] as const) {
+    const v = o[key];
+    if (typeof v === "string" && v.trim().length > 0) return true;
+  }
+  return false;
+}
+
+/** Does an assistant/user message carry non-whitespace content? */
+export function messageHasContent(message: unknown): boolean {
+  if (typeof message === "string") return message.trim().length > 0;
+  if (!message || typeof message !== "object") return false;
+  const o = message as Record<string, unknown>;
+  if (typeof o.content === "string") return o.content.trim().length > 0;
+  if (Array.isArray(o.content)) return o.content.some(blockHasContent);
+  return false;
+}
+
+/** #5195 — did a `turn_end` complete a UNIT OF WORK? True iff the turn carried
+ * tool results, or its message holds non-whitespace content. An empty turn (the
+ * E shape: `turn_start`/`turn_end` cycling with nothing produced) is explicitly
+ * NOT progress — that is exactly what let it forge every bound. */
+export function hasTurnContent(event: { message?: unknown; toolResults?: unknown } | null | undefined): boolean {
+  if (!event) return false;
+  const results = event.toolResults;
+  if (Array.isArray(results) && results.length > 0) return true;
+  return messageHasContent(event.message);
 }
 
 // ── #928: non-output liveness for a SILENT in-flight tool ──────────────
@@ -779,6 +890,10 @@ export default function (pi: ExtensionAPI) {
   let turnActive = false;
   let turnSawMessage = false;
   let turnSawTool = false;
+  // #5195: progress observed since the previous tick. Reset by `tick()`, which
+  // reports it — the parent resets its `progressAgeMs` on a tick carrying
+  // `progress=1` (or on a `tool_end` marker it parses directly).
+  let progressSinceTick = false;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
 
   // #928 CPU-liveness state — the clock's mutable state, advanced by the pure
@@ -924,8 +1039,13 @@ export default function (pi: ExtensionAPI) {
         cpuAdvanced: cpu.cpuAdvanced,
         sawMsg: turnSawMessage,
         sawTool: turnSawTool,
+        progress: progressSinceTick,
       }),
     );
+    // Consume the interval flag AFTER reporting it — the parent resets its
+    // progress clock on each `progress=1` tick, so the flag is edge-triggered
+    // per interval, never a sticky latch (#176's lesson applied to progress).
+    progressSinceTick = false;
   };
 
   pi.on("session_start", async () => {
@@ -984,6 +1104,11 @@ export default function (pi: ExtensionAPI) {
     outstandingTools.clear();
     updatedToolIds.clear();
     touchActivity("turn_end");
+    // #5195: a turn that COMPLETED carrying results or non-whitespace content is
+    // a unit of work. An empty turn (`toolResults` empty, no content) is NOT —
+    // that is the empty-turn-loop shape (E), and marking it as progress is
+    // precisely how it forged its way past every bound.
+    if (hasTurnContent(event)) progressSinceTick = true;
     emit(formatTurnEnd(nonce, event.turnIndex));
   });
 
@@ -1019,6 +1144,8 @@ export default function (pi: ExtensionAPI) {
     outstandingTools.delete(event.toolCallId);
     updatedToolIds.delete(event.toolCallId);
     touchActivity("tool_execution_end");
+    // #5195: a finished tool is the canonical COMPLETED unit of work.
+    progressSinceTick = true;
     emit(formatToolEnd(nonce, event.toolCallId));
   });
 
@@ -1031,9 +1158,15 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("message_update", async () => {
+  pi.on("message_update", async (event) => {
     // Streaming token deltas — the primary stream-activity signal.
     turnSawMessage = true;
     touchActivity("message_update");
+    // #5195: liveness (`turnSawMessage`) and PROGRESS are different questions,
+    // and conflating them is the bug. `turnSawMessage` stays set by any delta,
+    // exactly as before (#176: the silence bound keys on signs of life); the
+    // progress clock advances ONLY when this delta carries real content, so a
+    // drip of whitespace/retry chatter no longer forges progress.
+    if (isProgressContentEvent(event.assistantMessageEvent)) progressSinceTick = true;
   });
 }

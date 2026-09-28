@@ -449,6 +449,9 @@ test("every bound a kill clause NAMES is registered (clause → registry closure
     "TASK_HEARTBEAT_TIMEOUT_MS",
     "TASK_HEARTBEAT_CUT_GAP_MS",
     "TASK_CPU_STALL_MS",
+    // #5195: the `no-progress` bound's env override — same deliberate
+    // allowlist treatment as its #928 sibling above (NOT a `TASK_` prefix rule).
+    "TASK_PROGRESS_AGE_MS",
     "TASK_HARD_CAP_MS",
     "TASK_HEARTBEAT_INTERVAL_MS",
   ]);
