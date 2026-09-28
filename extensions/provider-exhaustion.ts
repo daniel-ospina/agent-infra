@@ -52,6 +52,7 @@ import {
   isLatched,
   failoverDisabled,
   renderExhaustionMarker,
+  dispatchUnkeyedSet,
 } from "./shared/provider-failover.js";
 import type { ExhaustionMarker } from "./shared/provider-failover.js";
 
@@ -148,11 +149,12 @@ export function interactiveHopTarget(
   leg: { provider: string; model: string } | undefined,
   state: ReturnType<typeof readLatchState>,
   env: Record<string, string | undefined> = process.env,
+  unkeyed?: ReadonlySet<string>,
 ): { provider: string; model: string } | null {
   const { provider, model: id } = leg ?? { provider: "deepseek", model: "" };
   const fam = familyOf(id, provider);
   if (!fam) return null;
-  const outcome = resolveWithChain(fam, { provider, model: id }, state, { env });
+  const outcome = resolveWithChain(fam, { provider, model: id }, state, { env, unkeyed });
   if (outcome.halted || !outcome.leg) return null;
   if (outcome.leg.provider === provider && outcome.leg.model === id) return null;
   return outcome.leg;
@@ -452,6 +454,7 @@ export default function (pi: ExtensionAPI) {
       source: "interactive",
       family: fam,
       fromLeg: { provider, model },
+      unkeyed: dispatchUnkeyedSet(ctx.modelRegistry, fam),
       notice: { title: "Provider credit exhausted", body: detail },
       env: process.env,
     });
@@ -494,7 +497,7 @@ export default function (pi: ExtensionAPI) {
     }
     // ROOT exhaustion (or a chain continuation under a fresh root latch): hop
     // the NEXT turn onto the chain's next available leg.
-    const target = interactiveHopTarget({ provider, model }, state);
+    const target = interactiveHopTarget({ provider, model }, state, process.env, dispatchUnkeyedSet(ctx.modelRegistry, fam));
     if (target) {
       await switchModel(ctx, target, (ok) => {
         if (!ok) {
@@ -559,7 +562,7 @@ export default function (pi: ExtensionAPI) {
       const root = rootPrimaryOfFamily(fam);
       if (root && state.primaries?.[root] && isLatched(root, state)) latchSeenFamilies.add(fam);
     }
-    const target = interactiveHopTarget(parts, state);
+    const target = interactiveHopTarget(parts, state, process.env, dispatchUnkeyedSet(ctx.modelRegistry, fam));
     if (target) {
       await switchModel(ctx, target, (ok) => {
         if (ok) {

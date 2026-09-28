@@ -927,6 +927,9 @@ export interface LatchInput {
   notice?: { title: string; body: string } | null;
   /** Override the computed expiry (tests). */
   ttlMs?: number;
+  /** Providers the runtime registry reports as having NO usable credential.
+   * Injected for the same reason `env` is: this write path has no `ctx`. */
+  unkeyed?: ReadonlySet<string>;
   env?: Record<string, string | undefined>;
 }
 
@@ -973,20 +976,71 @@ function recordFresh(p: PrimaryLatch, now: number, ttl: number): boolean {
   return now < expiry;
 }
 
+/** Providers with no usable credential, as reported by the runtime registry.
+ * INJECTED, never read here: this module has no `ctx`, and the predicate is
+ * reached from paths that never had one — the write side (`setExhausted`) and
+ * the post-dispatch advance (`decidePostDispatch`). The set is computed ONCE at
+ * the scope that does hold `ctx` and rides the same options bag that already
+ * carries `env` (RC1/RC1b, #1508). */
+export type UnkeyedLookup = (provider: string) => boolean;
+
+/** Build the unkeyed-provider set from `isUnkeyed`, FAILING SAFE: an unknown or
+ * throwing answer is NOT treated as unkeyed. A wrongly-skipped leg is the mirror
+ * of the defect this fixes — it removes a USABLE leg — and the registry cannot
+ * distinguish "no key configured" from "fell through to a stale snapshot"
+ * through `getProviderAuthStatus` alone. Only a positive unkeyed answer skips. */
+export function unkeyedProviders(ids: Iterable<string>, isUnkeyed: UnkeyedLookup | undefined): Set<string> {
+  const s = new Set<string>();
+  if (!isUnkeyed) return s;
+  for (const id of ids) {
+    try {
+      if (isUnkeyed(id)) s.add(id);
+    } catch {
+      // unknown → do NOT skip (see above)
+    }
+  }
+  return s;
+}
+
+/** The registry surface this needs — structural, so it is testable with a plain
+ * object and needs no ExtensionContext import. */
+export interface AuthStatusLookup {
+  getProviderAuthStatus(provider: string): { configured?: boolean } | undefined;
+}
+
+/** The unkeyed set for one dispatch, computed at a scope that holds `ctx` and
+ * carried to the predicate. Shared by EVERY consumer that has a registry — the
+ * dispatch path and the interactive path — so the family-to-legs mapping exists
+ * in one place. A missing registry or family yields the empty set (exclude
+ * nothing), the same fail-safe `unkeyedProviders` encodes. */
+export function dispatchUnkeyedSet(
+  registry: AuthStatusLookup | undefined,
+  family: string | undefined,
+): Set<string> {
+  const legs = family ? familyLegs(family) : undefined;
+  if (!legs) return new Set();
+  return unkeyedProviders(legs.map((l) => l.provider), (p) => registry?.getProviderAuthStatus(p)?.configured === false);
+}
+
 /** Providers that must NOT serve as hop candidates right now: env-blocked ∪
  * durable auth blocks ∪ providers holding a FRESH own exhaustion record
  * (their own account drained — review R2 finding 1: the advance path and the
- * active-leg serve must never hop into a freshly-exhausted provider). */
+ * active-leg serve must never hop into a freshly-exhausted provider) ∪ providers
+ * the runtime registry reports as having NO usable credential (#1508 — the
+ * incident: a latched primary advanced PRE-SPAWN onto a declared-but-unkeyed
+ * leg, and the dispatch died naming a provider nobody chose). */
 function unavailableProviders(
   state: LatchState,
   env: Record<string, string | undefined>,
   now: number,
   ttl: number,
+  unkeyed?: ReadonlySet<string>,
 ): Set<string> {
   const s = blockedLegSet(state, env, now, ttl);
   for (const [prov, rec] of Object.entries(state.primaries)) {
     if (rec.status === "exhausted" && recordFresh(rec, now, ttl)) s.add(prov);
   }
+  for (const prov of unkeyed ?? []) s.add(prov);
   return s;
 }
 
@@ -1025,7 +1079,12 @@ export function nextLegAfter(
   family: string,
   after: LegRef,
   state: LatchState,
-  opts: { env?: Record<string, string | undefined>; now?: number; ttlMs?: number } = {},
+  opts: {
+    env?: Record<string, string | undefined>;
+    now?: number;
+    ttlMs?: number;
+    unkeyed?: ReadonlySet<string>;
+  } = {},
 ): ChainStep {
   const env = opts.env ?? process.env;
   const now = opts.now ?? Date.now();
@@ -1034,8 +1093,9 @@ export function nextLegAfter(
   if (!legs) return { leg: null, halted: true, skipped: [], resolutionOnly: [] };
   // Hop candidates = legs after `after`, minus: env-blocked ∪ durable auth
   // blocks ∪ providers holding a FRESH own exhaustion record (review R2 —
-  // never advance INTO a freshly-exhausted provider).
-  const unavailable = unavailableProviders(state, env, now, ttl);
+  // never advance INTO a freshly-exhausted provider) ∪ providers with no
+  // usable credential (injected — this walk has no ctx).
+  const unavailable = unavailableProviders(state, env, now, ttl, opts.unkeyed);
   // Leg identity is spelling-normalized (#715) so a legacy-spelling `after`
   // (pre-upgrade latch / in-flight old marker / old session) still matches the
   // canonical root leg — without it a canonical root table yields startIdx -1
@@ -1096,7 +1156,12 @@ export function resolveWithChain(
   family: string | undefined,
   requested: LegRef,
   state: LatchState,
-  opts: { env?: Record<string, string | undefined>; now?: number; ttlMs?: number } = {},
+  opts: {
+    env?: Record<string, string | undefined>;
+    now?: number;
+    ttlMs?: number;
+    unkeyed?: ReadonlySet<string>;
+  } = {},
 ): ResolveOutcome {
   const env = opts.env ?? process.env;
   const now = opts.now ?? Date.now();
@@ -1146,7 +1211,7 @@ export function resolveWithChain(
   }
 
   const fam = primary.families?.[family];
-  const unavailable = unavailableProviders(state, env, now, ttl);
+  const unavailable = unavailableProviders(state, env, now, ttl, opts.unkeyed);
   if (fam?.terminal) {
     return { leg: null, halted: true, reason: "halt", hop: null };
   }
@@ -1202,7 +1267,7 @@ export function resolveWithChain(
   // itself). Re-ask from the family ROOT, the same computation the family makes
   // with no activeLeg at all, so the answer is the current hop target instead of
   // a halt with an available target sitting at it.
-  let step = nextLegAfter(family, requested, state, { env, now, ttlMs: ttl });
+  let step = nextLegAfter(family, requested, state, { env, now, ttlMs: ttl, unkeyed: opts.unkeyed });
   // `!= null`, NOT `!== undefined`: a family record legitimately carries
   // `activeLeg: null` ("the primary is serving"), which is not a retired leg and
   // must not take the retry. Belt-and-braces with the predicate's own
@@ -1210,7 +1275,7 @@ export function resolveWithChain(
   // site later cannot reintroduce a null deref on the dispatch path.
   if (step.halted && fam?.activeLeg != null && isResolutionOnlyLeg(fam.activeLeg)) {
     const rootLeg = familyLegs(family)?.[0];
-    if (rootLeg) step = nextLegAfter(family, rootLeg, state, { env, now, ttlMs: ttl });
+    if (rootLeg) step = nextLegAfter(family, rootLeg, state, { env, now, ttlMs: ttl, unkeyed: opts.unkeyed });
   }
   if (step.halted) return { leg: null, halted: true, reason: "halt", hop: null };
   const hop = activeHop(requested, step.leg!);
@@ -1285,7 +1350,7 @@ export function setExhausted(input: LatchInput): LatchState {
     const fam = input.family;
     const families: Record<string, FamilyLatch> = { ...(existing?.families ?? {}) };
     if (fam && input.fromLeg) {
-      const step = nextLegAfter(fam, input.fromLeg, cur, { env, now, ttlMs: ttl });
+      const step = nextLegAfter(fam, input.fromLeg, cur, { env, now, ttlMs: ttl, unkeyed: input.unkeyed });
       const prev = families[fam];
       if (!step.halted && step.leg) {
         // Chain (re-)engagement: a marker-driven write that SETS an active

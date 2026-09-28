@@ -68,6 +68,8 @@ import {
   latchTtlMs,
   blockedProviders,
   legIsFamilyMember,
+  unkeyedProviders,
+  dispatchUnkeyedSet,
   appendLedger,
   scanStderrForExhaustion,
 } from "../shared/provider-failover.js";
@@ -714,17 +716,21 @@ export interface DispatchLegOutcome {
   family: string | undefined;
 }
 
+/** The registry surface this fix needs is `AuthStatusLookup` from the shared
+ * module; `dispatchUnkeyedSet` lives there too, because the interactive consumer
+ * (provider-exhaustion.ts) needs the same family-to-legs mapping and a second
+ * copy would be a place to drift. */
 export function resolveDispatchLeg(
   requested: LegRef,
   state: LatchState,
-  opts: { env?: Record<string, string | undefined>; now?: number } = {},
+  opts: { env?: Record<string, string | undefined>; now?: number; unkeyed?: ReadonlySet<string> } = {},
 ): DispatchLegOutcome {
   const env = opts.env ?? process.env;
   const family = familyOf(requested.model, requested.provider);
   if (!family || failoverDisabled(env)) {
     return { leg: requested, halted: false, hop: null, family };
   }
-  const outcome = resolveWithChain(family, requested, state, { env, now: opts.now });
+  const outcome = resolveWithChain(family, requested, state, { env, now: opts.now, unkeyed: opts.unkeyed });
   if (outcome.halted) {
     const reason = env.TASK_EXHAUSTION_BLOCK === "1" ? "blocked" : "halt";
     return { leg: requested, halted: true, haltReason: reason, hop: null, family };
@@ -976,6 +982,9 @@ export interface PostDispatchInput {
   /** Marker attached by spawnSubAgent (nonce-validated at capture). */
   marker: ExhaustionMarker | null;
   env?: Record<string, string | undefined>;
+  /** Providers with no usable credential, computed at the ctx scope. Injected
+   * for the same reason `env` is: this path has no ctx. */
+  unkeyed?: ReadonlySet<string>;
 }
 
 export interface PostDispatchDecision {
@@ -1027,6 +1036,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
         reason: marker.reason === "402" ? "402" : "low_balance",
         source: "marker",
         env,
+        unkeyed: input.unkeyed,
       });
       const landed = isLatched(marker.provider || dispatched.provider, readLatchState(env), { env });
       return {
@@ -1054,6 +1064,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
       family,
       fromLeg: dispatched,
       env,
+      unkeyed: input.unkeyed,
     });
     // DURABILITY VERIFICATION (deep-review finding): setExhausted returns the
     // durable state read back after its CAS loop — when every write attempt
@@ -1114,7 +1125,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
         },
       };
     }
-    const outcome = resolveWithChain(family, dispatched, latchedState, { env });
+    const outcome = resolveWithChain(family, dispatched, latchedState, { env, unkeyed: input.unkeyed });
     if (outcome.halted) {
       return { action: "halt", nextLeg: null, annotations: { failoverLatched: true, failoverMarker: marker.hop } };
     }
@@ -1175,7 +1186,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
     if (!legIsFamilyMember(family, dispatched.provider)) {
       const famLegs = familyLegs(family);
       const defaultLeg = famLegs?.[0];
-      const step = nextLegAfter(family, dispatched, readLatchState(env), { env });
+      const step = nextLegAfter(family, dispatched, readLatchState(env), { env, unkeyed: input.unkeyed });
       // nextLegAfter from a NON-table position walks legs[0..] (findIndex -1
       // → first available). Accept ONLY when the first available leg IS the
       // family default (deepseek official) — a deeper first-available leg
@@ -1228,7 +1239,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
       };
     }
     const open = recordLegStrike(dispatched);
-    const step = nextLegAfter(family, dispatched, readLatchState(env), { env });
+    const step = nextLegAfter(family, dispatched, readLatchState(env), { env, unkeyed: input.unkeyed });
     if (!step.halted && step.leg) {
       return {
         action: "advance",
@@ -1295,6 +1306,9 @@ export async function runFailoverDecisionLoop(input: {
   result: FailoverSpawnResult | undefined;
   spawn: (leg: LegRef) => Promise<FailoverSpawnResult | undefined>;
   env?: Record<string, string | undefined>;
+  /** Providers with no usable credential, computed at the ctx scope (this loop
+   * itself has no ctx). Injected for the same reason `env` is. */
+  unkeyed?: ReadonlySet<string>;
   onHop?: (leg: LegRef, hopCount: number, annotations: Record<string, unknown>) => void;
 }): Promise<FailoverLoopResult> {
   const env = input.env ?? process.env;
@@ -1324,6 +1338,7 @@ export async function runFailoverDecisionLoop(input: {
       sawToolsUnknown: inner?.details?.sawToolsUnknown === true,
       marker: ((inner?.details?.exhaustionMarker as ExhaustionMarker | undefined) ?? null),
       env,
+      unkeyed: input.unkeyed,
     });
   };
   const halted = (): FailoverLoopResult["halted"] => ({
@@ -4161,11 +4176,73 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
   });
 }
 
+/** The task-tool result `details` shapes this hook reads. Declared structurally
+ * and locally: the tool composes several shapes (an inner-spawn payload, a
+ * tool-level refusal, a failover annotation) and the framework types `details`
+ * loosely, so without this the reads below are unchecked property accesses on an
+ * unrelated type. */
+type TaskResultDetails = {
+  exitCode?: unknown;
+  status?: unknown;
+  isError?: unknown;
+  killed?: unknown;
+  failoverHalt?: unknown;
+  failoverHopSpawnFailed?: unknown;
+};
+
+/** The task tool's own terminal-failure `status` vocabulary (producers cited at
+ * the hook). Enumerated rather than "anything not ok", so an unrecognised status
+ * stays a non-error and a future success status cannot become a false failure. */
+const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id"]);
+
 export default function (pi: ExtensionAPI) {
   register("builtin-tools");
 
   // Restore TODO state from session
   restoreTodos(pi);
+
+  // ── #1508: a FAILED child must not be handed back as a clean result ────────
+  //
+  // The incident: a dispatched child exited 1 and the caller received
+  // `isError: false` with `details {model, provider, exitCode: 1}` — a failed
+  // failover indistinguishable from a clean verdict.
+  //
+  // Why a hook and not a return value: `executePreparedToolCall` sets
+  // `isError: false` UNCONDITIONALLY when `execute()` resolves
+  // (pi-agent-core/agent-loop.js:477) and `true` only when it throws (:481-486),
+  // and `finalizeExecutedToolCall` rebuilds the result from a field allow-list
+  // (:507-510) — so an `isError` field on the returned object is silently
+  // DROPPED. Throwing instead would flip it but destroys `details`
+  // (`createErrorToolResult` → `details: {}`, :525-528) — and `details` IS the
+  // failure composition. A `tool_result` handler is the only route that both
+  // flips the flag and preserves the composition (agent-session.js:269 honours
+  // `hookResult?.isError`).
+  pi.on("tool_result", (event) => {
+    const e = event as { toolName?: string; isError?: boolean; details?: TaskResultDetails };
+    if (e.toolName !== "task" || e.isError) return;
+    const d = e.details;
+    // A failed dispatch may carry any of these markers. TWO layers produce them:
+    //  * the TASK TOOL's own terminal failures are a `status` — a refusal
+    //    (invalid-cwd / invalid-session-id), an open circuit breaker, or an
+    //    exhausted retry loop. `"failed"` is the one that matters most, because a
+    //    watchdog kill with NO output resolves `undefined`, goes through
+    //    `retry()`, and arrives here as `status:"failed"` — reaching the caller
+    //    with NEITHER an inner-spawn marker NOR an exit code;
+    //  * the INNER SPAWN adds a nonzero exit code, `isError` (spawn error — pi
+    //    never started, so there is no exit status), `killed` (a watchdog cut,
+    //    whose recorded exitCode is 0 or null), or the failover annotations.
+    // An `exitCode` of 0-or-null with NONE of the others is the only settle that
+    // may read as success.
+    const failed =
+      (typeof d?.exitCode === "number" && d.exitCode !== 0) ||
+      (typeof d?.status === "string" && FAILED_TASK_STATUS.has(d.status)) ||
+      d?.isError === true ||
+      d?.killed === true ||
+      d?.failoverHalt === true ||
+      d?.failoverHopSpawnFailed === true;
+    if (!failed) return;
+    return { isError: true };
+  });
 
   // ═══════════════════════════════════════════════════════════════
   // web_search — Perplexity web search
@@ -4713,6 +4790,7 @@ export default function (pi: ExtensionAPI) {
       const failoverResolution = familyOf(model, provider)
         ? resolveDispatchLeg({ provider, model }, readLatchState(subAgentEnv), {
             env: subAgentEnv,
+            unkeyed: dispatchUnkeyedSet(ctx?.modelRegistry, familyOf(model, provider)),
           })
         : { leg: { provider, model }, halted: false, hop: null, family: undefined };
       if (failoverResolution.halted) {
@@ -4869,6 +4947,7 @@ export default function (pi: ExtensionAPI) {
         dispatchLeg,
         result,
         env: subAgentEnv,
+        unkeyed: dispatchUnkeyedSet(ctx?.modelRegistry, family),
         spawn: async (leg) => {
           const legResult = await retry((attempt) => spawnLeg(leg, attempt), retryOptions);
           return legResult;

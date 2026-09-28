@@ -13,7 +13,9 @@
  */
 
 import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning } from "./index.js";
+import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
+import builtinTools from "./index.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
@@ -7228,6 +7230,83 @@ testAsync("#1071: the report names the TARGET repo's worktree/branch/dirty (neve
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── #1508: the credential term (RC1) + the false-`isError` flip (P0-B) ────────
+//
+// Both tests drive the ACTUAL seams. The hook test calls the REAL extension
+// entry and the handler it registers, because the whole point of P0-B is that a
+// `isError` field on the returned tool result is silently DROPPED by the
+// framework's allow-list rebuild — a test that asserted on a returned field
+// would pass while the flag never flipped.
+
+test("#1508 — dispatchUnkeyedSet maps a family to its legs, and only a positive verdict excludes", () => {
+  const fam = "deepseek-v4-flash";
+  const reg = (m: Record<string, { configured?: boolean } | undefined>) => ({
+    getProviderAuthStatus: (p: string) => m[p],
+  });
+  equal(dispatchUnkeyedSet(reg({}), fam).size, 0, "no verdict → nothing excluded (a wrongly-skipped leg is the mirror defect)");
+  deepEqual([...dispatchUnkeyedSet(reg({ openrouter: { configured: false } }), fam)], ["openrouter"], "only the positively-unkeyed family leg");
+  deepEqual([...dispatchUnkeyedSet(reg({ openrouter: { configured: true } }), fam)], [], "'configured' never excludes");
+  equal(dispatchUnkeyedSet(undefined, fam).size, 0, "no registry → nothing excluded (fail-safe)");
+  equal(dispatchUnkeyedSet(reg({ openrouter: { configured: false } }), undefined).size, 0, "no family → nothing to check");
+});
+
+test("#1508 — decidePostDispatch: a marker-driven write does not latch onto an UNKEYED leg", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // Same input as the advance test above, with the registry verdict injected:
+    // openrouter declares $OPENROUTER_API_KEY and the env var is absent. WITHOUT
+    // `unkeyed` this call records activeLeg = openrouter/deepseek-v4.1-flash —
+    // the incident's own persisted state, which is what the earlier unit-level
+    // test of setExhausted could not catch.
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: mkMarker({}),
+      env,
+      unkeyed: new Set(["openrouter"]),
+    });
+    const active = readLatchState(env).primaries.deepseek?.families?.["deepseek-v4-flash"]?.activeLeg;
+    ok(
+      active == null || active.provider !== "openrouter",
+      `the durable latch must not record an unkeyed leg (got ${JSON.stringify(active)})`,
+    );
+    ok(
+      decision.nextLeg == null || decision.nextLeg.provider !== "openrouter",
+      `no unkeyed advance is handed back (got ${JSON.stringify(decision.nextLeg)})`,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("#1508 — the registered tool_result handler turns a failed child into isError:true", () => {
+  const handlers: Array<(e: any) => any> = [];
+  (builtinTools as any)({ on: (ev: string, h: any) => { if (ev === "tool_result") handlers.push(h); }, registerTool: () => {} });
+  equal(handlers.length, 1, "exactly one tool_result handler is registered");
+  const h = handlers[0];
+  deepEqual(h({ toolName: "task", isError: false, details: { exitCode: 1 } }), { isError: true }, "exit 1 is the incident's shape → reported as an error");
+  deepEqual(h({ toolName: "task", isError: false, details: { isError: true } }), { isError: true }, "a spawn error carries no exitCode but is still a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { killed: true, exitCode: 0 } }), { isError: true }, "a watchdog cut records exitCode 0 but is still a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { killed: true, exitCode: null } }), { isError: true }, "a cut with a null exit is still a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { failoverHalt: true } }), { isError: true }, "a failover halt ran no leg → a failure");
+  // The TOOL layer's own terminal failures — reached with no exit code and no
+  // inner-spawn marker at all. `status:"failed"` is the one a watchdog kill with
+  // NO output lands on: it resolves `undefined`, is retried, and arrives here.
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "failed", retries: 3, elapsedMs: 1 } }), { isError: true }, "an exhausted retry loop with no output is the incident's silent-wedge shape");
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "circuit_open", retries: 0 } }), { isError: true }, "an open circuit breaker is a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "invalid-cwd", retryable: false } }), { isError: true }, "a refused dispatch (bad cwd) is a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "invalid-session-id", retryable: false } }), { isError: true }, "a refused dispatch (bad session id) is a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { failoverHopSpawnFailed: true } }), { isError: true }, "a hop leg that never produced a result is a failure");
+  equal(h({ toolName: "task", isError: false, details: { exitCode: null } }), undefined, "a null exit is a settle (composeTaskResult's own okExit contract)");
+  equal(h({ toolName: "task", isError: false, details: { exitCode: 0 } }), undefined, "exit 0 is a settle");
+  equal(h({ toolName: "bash", isError: false, details: { exitCode: 1 } }), undefined, "never touches a non-task tool");
+  equal(h({ toolName: "task", isError: true, details: { exitCode: 1 } }), undefined, "an already-errored result is left alone");
+  equal(h({ toolName: "task", isError: false, details: undefined }), undefined, "no details → nothing to prove, stays a success");
+  equal(h({ toolName: "task", isError: false, details: { status: "ok" } }), undefined, "a status this hook does not know as a failure stays a success");
 });
 
   for (const t of asyncTests) await t();
