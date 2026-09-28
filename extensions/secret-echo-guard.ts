@@ -753,17 +753,22 @@ export interface RedactOutcome<T> {
  * here too — and hitting it sets `incomplete`, so a part the guard could not fully scan is never
  * presented as a fully-redacted one.
  */
-const CONTENT_PART_LIMITS: DetailsWalkLimits = { maxNodes: 200_000, maxMs: 500 };
+export const CONTENT_PART_LIMITS: DetailsWalkLimits = { maxNodes: 200_000, maxMs: 500 };
 
 export function redactContent(
 	content: unknown,
 	values: readonly SecretValue[],
 	hits: HitCounts,
 ): RedactOutcome<unknown> & { incomplete: boolean } {
+	// ONE budget for the whole walk, so the string scans on the TEXT path are bounded too. `read`/`bash`
+	// deliver their payload as a text part, and a bare `redactString` over a multi-megabyte string is
+	// per-VALUE cost against a single node — measured at 2.3s for a text part against 2000 harvested
+	// values, which round 7's bound did not touch (#5109 review round 8).
+	const budget = newDetailsBudget(CONTENT_PART_LIMITS);
 	if (typeof content === "string") {
-		const redacted = redactString(content, values, hits);
-		if (redacted === content) return { value: content, changed: false, incomplete: false };
-		return { value: [{ type: "text", text: redacted }], changed: true, incomplete: false };
+		const redacted = redactString(content, values, hits, budget);
+		if (redacted === content) return { value: content, changed: false, incomplete: budget.bounded };
+		return { value: [{ type: "text", text: redacted }], changed: true, incomplete: budget.bounded };
 	}
 	if (!Array.isArray(content)) return { value: content, changed: false, incomplete: false };
 
@@ -783,7 +788,7 @@ export function redactContent(
 			// attestation over a persisted secret (#5109 review round 5). It also closes the bare
 			// `content: ["<secret>"]` shape, which previously leaked with no record at all.
 			if (typeof part === "string") {
-				const redacted = redactString(part, values, hits);
+				const redacted = redactString(part, values, hits, budget);
 				if (redacted !== part) changed = true;
 				return redacted;
 			}
@@ -794,7 +799,7 @@ export function redactContent(
 				const unstable = hasOwnEnumerableAccessor(part);
 				if ((part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
 					const original = (part as { text: string }).text;
-					const redacted = redactString(original, values, hits);
+					const redacted = redactString(original, values, hits, budget);
 					if (redacted === original && !unstable) {
 						// A "clean" text part is not necessarily clean: it can carry a registered value (or an
 						// accessor) in a SIBLING field — `{type:"text", text:"ok", meta:{nested:"<secret>"}}`.
@@ -812,6 +817,21 @@ export function redactContent(
 					if (rebuilt.bounded) incomplete = true;
 					return rebuilt.value;
 				}
+				// An own accessor is a LIVE read: it can return a clean value to the guard and a registered
+				// secret to the transcript serializer moments later. Rebuild the part from a single read so the
+				// persisted part holds data properties only.
+				//
+				// ⛔ This branch is NOT subsumed by the deep walk below — round 8 refuted that claim. Pass 1
+				// marks an accessor-bearing container dirty only if it REACHES the accessor key; when the node
+				// budget is spent first (measured: a 260k-key payload with the accessor LAST), `redactDetails`
+				// returns `{changed: false, bounded: true}` and the part would go back BY REFERENCE with its
+				// getter still live. `bounded` is threaded out so the shortfall is announced, never silent.
+				if (unstable) {
+					changed = true;
+					const rebuilt = rebuildContentPart(part as Record<string, unknown>, undefined, values, hits);
+					if (rebuilt.bounded) incomplete = true;
+					return rebuilt.value;
+				}
 				// A straight object/array part may STILL carry a registered value or a nested accessor
 				// anywhere inside it, and the array-accessor snapshot makes that reachable: `content.map`
 				// already read the index, `hasOwnEnumerableAccessor(content)` sets `changed`, and so the
@@ -820,11 +840,6 @@ export function redactContent(
 				// record read `contentRedacted: true, total: 0` and the notice said nothing was redacted
 				// (#5109 review round 6). The deep walker returns the SAME reference when clean, so an
 				// ordinary part is still passed through untouched.
-				//
-				// This branch SUBSUMES the own-accessor case that used to sit above it: `markDirtyDetails`
-				// marks any container carrying an own enumerable accessor dirty, so pass 2 rebuilds it into
-				// data properties AND reports `bounded` — which the dedicated `rebuildContentPart` call it
-				// replaced did not do (round 7's [P1]). One walker, one place for `bounded` to escape.
 				const deep = redactDetails(part, values, hits, CONTENT_PART_LIMITS);
 				if (deep.bounded) incomplete = true;
 				if (deep.changed) {
@@ -844,6 +859,8 @@ export function redactContent(
 	// index exactly ONCE into `parts`, so returning `content` by reference would let the serializer
 	// re-read a live index. When the array is unstable, the already-snapshotted `parts` is what persists.
 	if (hasOwnEnumerableAccessor(content)) changed = true;
+	// A string scan that stopped at the budget must be announced, never presented as a full redaction.
+	if (budget.bounded) incomplete = true;
 	return { value: changed ? parts : content, changed, incomplete };
 }
 

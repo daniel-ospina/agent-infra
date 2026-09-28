@@ -28,6 +28,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import secretEchoGuard, {
+	CONTENT_PART_LIMITS,
 	LABEL_VALUE_REPLACEMENT,
 	MAX_DETAILS_DEPTH,
 	MAX_SOURCE_FILE_BYTES,
@@ -2105,11 +2106,11 @@ test("R6-PART-KEY-DIRTY: a key is redacted even when the part is rebuilt for ANO
 	strictEqual(out.changed, true);
 });
 
-test("R6-UNSTABLE-NESTED: a rebuilt (unstable) part's NESTED field is deep-redacted", () => {
+test("R6-UNSTABLE-NESTED: a rebuilt part's NESTED field is deep-redacted", () => {
 	const S = "R6-UNSTABLE-NESTED-SECRET-012345678";
 	const values = normalizeSecretValues([{ value: S, label: "l" }]);
-	// `unstable` routes the RAW part into `rebuildContentPart`, whose own value handling is then the
-	// only thing covering a NESTED field (the deep scan is not re-run on this path).
+	// An own accessor on the part routes it to the forced rebuild, whose own value handling is then the
+	// only thing covering a NESTED field (the deep scan is not re-run on that path).
 	const part: Record<string, unknown> = { type: "image", meta: { nested: `k=${S}` } };
 	Object.defineProperty(part, "caption", { enumerable: true, configurable: true, get: () => "clean" });
 	const out = redactContent([part], values, new Map());
@@ -2170,7 +2171,7 @@ test("R7-REBUILD-DEEP-BOUND: the rebuild path reports its nested walk's bound to
 	strictEqual(out.changed, true);
 });
 
-test("R7-BOXED-STRING-RESIDUAL: a boxed `String` is NOT redacted (pinned residual, not a silent gap)", () => {
+test("R7-BOXED-STRING-RESIDUAL: a boxed `String` is NOT redacted (documented residual — pinned, but SILENT at runtime)", () => {
 	const S = "R7-BOXED-STRING-SECRET-01234567";
 	const values = normalizeSecretValues([{ value: S, label: "l" }]);
 	// `typeof` is "object" for a boxed String and `Object.keys` yields character INDICES, so
@@ -2182,6 +2183,111 @@ test("R7-BOXED-STRING-RESIDUAL: a boxed `String` is NOT redacted (pinned residua
 	const boxed = new String(`k=${S}`);
 	const out = redactContent([{ type: "image", meta: { s: boxed } }], values, new Map());
 	ok(JSON.stringify(out.value).includes(S), "pinned: the boxed value survives — see this test's name");
+});
+
+test("R6-BOUND-DETERMINISTIC: pass 2 consults the budget — pinned on a SCRIPTED CLOCK", () => {
+	// Round 5 gave pass 2 a per-node budget check, but NOTHING pinned it: on this box's usual load the
+	// 200k-key walk finishes in ~0.4s against a 2s budget, so deleting the check left the suite GREEN
+	// four runs in a row. A duration assertion cannot fix that — a wall-clock test is a load detector,
+	// which is exactly what round 6 removed — so the clock is INJECTED.
+	//
+	// Reads: #1 construction, #2 pass 1's first node (its allowance is a multiple of the check
+	// interval, so the deadline is consulted there) — both t=0, so pass 1 stays inside its budget.
+	// Every read after that is far past the deadline, and pass 2's allowance is RESET before it runs,
+	// so its first node consults the clock again. `bounded` can therefore only have come from PASS 2.
+	//
+	// ⛔ THE LEAVES ARE NUMBERS AND `values` IS EMPTY, DELIBERATELY (#5109 review round 8).
+	// Round 7 made `redactString` AND `containsRegisteredValue` budget-aware, so a STRING leaf — or even
+	// a string KEY, since pass 1 checks every key — can set `bounded` by itself, which silently un-pinned
+	// this test: removing pass 2's check left it GREEN again. With no registered values there is nothing
+	// for either scan to iterate, so pass 1 performs no clock read beyond its first node, and the only
+	// way `bounded` can be set is PASS 2 consulting the clock. Dirtiness comes from an own ACCESSOR, so
+	// pass 2 runs at all without any registered value present.
+	const values = normalizeSecretValues([]);
+	let reads = 0;
+	const now = () => (reads++ < 2 ? 0 : 1_000_000);
+	const tree: Record<string, unknown> = {};
+	for (let i = 0; i < 100; i++) tree[`k${i}`] = i;
+	Object.defineProperty(tree, "trap", { enumerable: true, configurable: true, get: () => 1 });
+	const out = redactDetails(tree, values, new Map(), { maxNodes: 1024, maxMs: 1_000, now });
+	strictEqual(out.bounded, true, "pass 2 must RECORD that it hit the budget");
+	// Selectivity: deleting `if (detailsBudgetExhausted(state)) return node;` from `rebuildDetails`
+	// stops the clock ever being read on pass 2 — nothing else on this tree can set `bounded` — so
+	// this assertion reds.
+});
+
+test("R8-STRING-BOUND: a string scan stops at the deadline and SAYS SO", () => {
+	const S = "R8-STRING-BOUND-SECRET-0123456789";
+	// 100 values, the registered secret LAST in scan order. The deadline is already past on the first
+	// sample, so the scan stops immediately and reports `bounded` — the string scan is bounded by the
+	// advertised budget instead of running per-value over a multi-megabyte string.
+	const values = normalizeSecretValues([
+		...Array.from({ length: 100 }, (_, i) => ({ value: `filler-${i}-VALUE`, label: `f${i}` })),
+		{ value: S, label: "l" },
+	]);
+	const budget = { nodes: 1, nodeAllowance: 1, deadline: 0, bounded: false, now: () => 0 };
+	const out = redactString(`start ${S} end`, values, new Map(), budget);
+	strictEqual(budget.bounded, true, "an early stop must be reported, never silent");
+	ok(out.includes(S), "pinned: the values after the stop are left UNSCANNED — the fail-open posture");
+	// And with no budget (every non-content caller) the scan is complete and unchanged.
+	const full = redactString(`start ${S} end`, values, new Map());
+	ok(!full.includes(S), "the default path must still redact");
+});
+
+test("R8-UNSTABLE-FORCED-REBUILD: a live getter is rebuilt even when the deep walk's budget is spent", () => {
+	const S = "R8-FORCED-REBUILD-SECRET-012345678";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	// The accessor is LAST and the nested payload exceeds `CONTENT_PART_LIMITS.maxNodes`, so a bare deep
+	// walk returns `changed: false, bounded: true` and the part would go back BY REFERENCE with a LIVE
+	// getter (round 8 refuted the claim that the accessor case was subsumed by that walk). The forced
+	// rebuild reads the getter ONCE and writes a data property; its nested value walk is the part that
+	// hits the budget, and that must be announced rather than silently presented as complete.
+	const nested: Record<string, unknown> = {};
+	for (let i = 0; i < 260_000; i++) nested[`k${i}`] = i;
+	const part: Record<string, unknown> = { type: "image", payload: nested };
+	Object.defineProperty(part, "caption", { enumerable: true, configurable: true, get: () => `k=${S}` });
+	const out = redactContent([part], values, new Map());
+	const first = (out.value as unknown[])[0] as Record<string, unknown>;
+	const descriptor = Object.getOwnPropertyDescriptor(first, "caption");
+	ok(descriptor !== undefined && descriptor.get === undefined,
+		"the live getter must be replaced by a data property");
+	ok(!JSON.stringify(out.value).includes(S), "and the value it returned must be redacted");
+	strictEqual(out.incomplete, true, "the bounded nested walk must be announced");
+});
+
+test("R8-PASS1-STRING-BOUND: pass 1's string scan is bounded and reported too", () => {
+	const S = "R8-PASS1-STRING-SECRET-0123456789";
+	const values = normalizeSecretValues([
+		...Array.from({ length: 100 }, (_, i) => ({ value: `filler-${i}-VALUE`, label: `f${i}` })),
+		{ value: S, label: "l" },
+	]);
+	// A PLAIN STRING root that does NOT contain a registered value: pass 1 reaches it through
+	// `containsRegisteredValue` (same per-VALUE cost as `redactString`, same need for a bound), and
+	// because nothing matches, pass 2 NEVER RUNS — so `bounded` can only have come from pass 1's scan.
+	// ⛔ If the probe string contained the secret, pass 1 would return dirty, pass 2 would run and read
+	// the clock, and the test would pass with `containsRegisteredValue`'s check deleted.
+	let reads = 0;
+	const now = () => (reads++ < 2 ? 0 : 1_000_000);
+	const out = redactDetails("start no-secret-here end", values, new Map(), { maxNodes: 1024, maxMs: 1_000, now });
+	strictEqual(out.bounded, true, "pass 1's string scan must report its bound, never scan silently");
+});
+
+test("R8-TEXT-PATH-BUDGET: the text path really passes a budget to its string scan", () => {
+	// `read`/`bash` deliver their payload as a TEXT part, so this is the shape that most needs the
+	// bound. The deadline is made immediate through the exported limits (rather than a wall-clock sleep)
+	// so the assertion is deterministic and does not depend on the host.
+	const S = "R8-TEXT-PATH-SECRET-0123456789ABCD";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const saved = CONTENT_PART_LIMITS.maxMs;
+	try {
+		CONTENT_PART_LIMITS.maxMs = 0; // deadline == now, so the first sample is already expired
+		const part = redactContent([{ type: "text", text: `k=${S}` }], values, new Map());
+		strictEqual(part.incomplete, true, "a text part's bounded scan must be announced");
+		const bare = redactContent(`k=${S}`, values, new Map());
+		strictEqual(bare.incomplete, true, "a bare string element's bounded scan must be announced too");
+	} finally {
+		CONTENT_PART_LIMITS.maxMs = saved;
+	}
 });
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────
