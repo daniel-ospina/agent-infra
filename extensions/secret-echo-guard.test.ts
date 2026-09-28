@@ -1805,9 +1805,13 @@ test("R4-C1: a per-result FAILURE (not bounded) is announced after the summary h
 });
 test("R4-C2: a THROWING content-redaction walk is recorded and announced (never silent)", () => {
 	resetEverything();
+	// The throw is wired to the walk's FIRST access. It used to be `"map"` (the walk was a
+	// `content.map`); round 11 replaced that with an indexed loop gated on the deadline, so the same
+	// intent now rides `"length"` — a hostile part list that cannot even be MEASURED must still be
+	// recorded and announced rather than passed through silently.
 	const content = new Proxy([{ type: "text", text: "clean" }], {
 		get(target, property, receiver) {
-			if (property === "map") throw new Error("map-boom");
+			if (property === "length") throw new Error("length-boom");
 			return Reflect.get(target, property, receiver);
 		},
 	});
@@ -2338,8 +2342,90 @@ test("R9-NO-STARVE-SHARED: a shared budget must NOT starve pass 2 into losing a 
 		for (let i = 0; i < 5000; i++) tree[`k${i}`] = "v";
 		const out = redactContent([{ type: "image", payload: tree }], values, new Map());
 		ok(!JSON.stringify(out.value).includes(S), "the secret must still be REDACTED, not abandoned");
+		// ⛔ MULTI-PART (review round 11). The single-part case above distinguishes only the pass-2
+		// RESET, so sharing the node counter alone survived it — while a multi-part payload leaked parts
+		// 1..9 with the suite still green. Every part must be redacted.
+		const parts = Array.from({ length: 10 }, () => {
+			const t: Record<string, unknown> = { first: `k=${S}` };
+			for (let i = 0; i < 5000; i++) t[`k${i}`] = "v";
+			return { type: "image", payload: t };
+		});
+		const multi = redactContent(parts, values, new Map());
+		const bytes = JSON.stringify(multi.value);
+		ok(!bytes.includes(S), "NO part may be left unredacted — a shared budget starves pass 2 per part");
+		strictEqual((bytes.match(/REDACTED/g) ?? []).length, 10, "every one of the ten parts is redacted");
 	} finally {
 		CONTENT_PART_LIMITS.maxNodes = savedNodes;
+	}
+});
+
+test("R11-GLOBAL-BOUND: the walk stops at the deadline instead of scanning every part", () => {
+	const S = "R11-GLOBAL-BOUND-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const saved = { ...CONTENT_PART_LIMITS };
+	try {
+		// Deterministic clock: advance every sample so the deadline is crossed partway through the walk.
+		// This pins the GLOBAL bound — before round 11 the walk ran `content.map` to completion regardless
+		// of the deadline, so 10M numeric parts cost 27.4s and reported `incomplete: false` (nothing ever
+		// sampled the clock; the first version of this gate used `detailsBudgetExhausted`, which only
+		// reads the clock when `nodes % 1024 === 0`, and this loop does not advance `nodes`).
+		let tick = 0;
+		let nowCalls = 0;
+		CONTENT_PART_LIMITS.now = () => {
+			nowCalls++;
+			return (tick += 200);
+		};
+		CONTENT_PART_LIMITS.maxMs = 700;
+		// The CLOCK-CALL COUNT is the observable that isolates the walk's reach. A late secret cannot be
+		// used: once the deadline is spent `redactString` early-stops, so a reached element and an
+		// unreached one are byte-identical — and the stop's copy loop reads every late index anyway. With
+		// the gate the walk ends at ~index 64 (each scanned string samples the clock too); without it all
+		// 1000 parts are visited.
+		const content: unknown[] = Array.from({ length: 1000 }, () => "plain");
+		const out = redactContent(content, values, new Map());
+		strictEqual(out.incomplete, true, "stopping early MUST be announced, never attested clean");
+		strictEqual((out.value as unknown[]).length, 1000, "every element is preserved — no shape regression");
+		ok(nowCalls < 200, `the walk must stop at the deadline; sampled the clock ${nowCalls} times over 1000 parts`);
+	} finally {
+		Object.assign(CONTENT_PART_LIMITS, saved);
+	}
+});
+
+test("R11-PRESCAN-BOUND: a huge key enumeration stops at the deadline and reports UNSTABLE", () => {
+	const values = normalizeSecretValues([{ value: "R11-PRESCAN-SECRET-0123456789", label: "l" }]);
+	const saved = { ...CONTENT_PART_LIMITS };
+	try {
+		// `hasOwnEnumerableAccessor` used `Object.keys` — one string allocation per key BEFORE the first
+		// budget check could run (a 2M-key part from a custom/MCP tool). It now enumerates with `for...in`
+		// and stops at the deadline, reporting UNSTABLE, which is the fail-SAFE direction: the caller
+		// rebuilds from a single read instead of passing a possibly-live getter through.
+		//
+		// The PROBE COUNT isolates it: with the budget the enumeration stops mid-way, without it every key
+		// is probed. (Timing cannot pin this — it is a performance guard.) Each key is probed ~3-4x
+		// (`for...in`'s enumerability check, `hasOwnProperty`, then the descriptor read), so the absolute
+		// numbers are inflated; the threshold sits between the two measured arms rather than at a round
+		// number.
+		let tick = 0;
+		CONTENT_PART_LIMITS.now = () => (tick += 200);
+		CONTENT_PART_LIMITS.maxMs = 250;
+		// Calibration note: the clock must NOT already be spent at index 0, or the ARRAY gate stops before
+		// the part is looked at and the pre-scan never runs (this test read a seductive 0 probes that way,
+		// then survived its own mutation). construction -> 200, deadline 450; index 0 -> 400 (admitted);
+		// the pre-scan's first sample -> 600, which crosses 450 and stops at 256 keys.
+		let probes = 0;
+		const target: Record<string, unknown> = {};
+		for (let i = 0; i < 2000; i++) target[`k${i}`] = i;
+		const proxy = new Proxy(target, {
+			getOwnPropertyDescriptor(t, property) {
+				probes++;
+				return Reflect.getOwnPropertyDescriptor(t, property);
+			},
+		});
+		const out = redactContent([proxy], values, new Map());
+		ok(probes < 3000, `the enumeration must stop at the deadline; probed ${probes} (stop ≈ 1200, no-budget ≈ 8300)`);
+		strictEqual(out.incomplete, true, "the stopped pre-scan must be announced");
+	} finally {
+		Object.assign(CONTENT_PART_LIMITS, saved);
 	}
 });
 
