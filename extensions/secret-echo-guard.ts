@@ -748,10 +748,10 @@ export interface RedactOutcome<T> {
  * `undefined`.
  */
 /**
- * Budget for ONE deep `content`-part walk. Content parts are small and few, but a part is
- * attacker-controlled (a custom or MCP tool returns it), so the bound the `details` walk uses applies
- * here too — and hitting it sets `incomplete`, so a part the guard could not fully scan is never
- * presented as a fully-redacted one.
+ * Budget for the whole `content` walk — ONE deadline across every part and every nested value, so the
+ * aggregate is bounded by `maxMs` rather than by `parts x maxMs` (measured: 40 x 4MB text parts went
+ * from 20.5s to ~0.5s, #5109 rounds 9/10). Node allowances stay PER CALL: sharing the node counter too
+ * starved pass 2 into returning dirty nodes by reference, losing a redaction — round 10's regression.
  */
 export const CONTENT_PART_LIMITS: DetailsWalkLimits = { maxNodes: 200_000, maxMs: 500 };
 
@@ -899,7 +899,7 @@ function rebuildContentPart(
 		// A KEY is as outbound as a value — it lands in the transcript and would be re-read by the
 		// serializer — so it is redacted too, exactly as `markDirtyDetails` treats a registered value
 		// found in a key (#5109 review round 6: the header claimed this, the code did not do it).
-		const outKey = redactString(key, values, hits);
+		const outKey = redactString(key, values, hits, budget);
 		const raw = key === "text" && text !== undefined ? text : part[key];
 		// Every string read out of a rebuilt part is redacted. The `unstable` path reaches here for a
 		// NON-text part — where the value read out of a live accessor would otherwise be copied into the
@@ -909,12 +909,11 @@ function rebuildContentPart(
 		// shallow copy is what let `{type:"image", caption:"<secret>"}` through while the record still
 		// attested `contentRedacted: true`. The text path re-redacts an already-redacted string, a no-op
 		// because a marker contains no registered value.
-		const value =
-			typeof raw === "string"
-				? redactString(raw, values, hits)
-				: raw !== null && typeof raw === "object"
-					? rebuildNested(raw, values, hits, (b) => (bounded = bounded || b), budget)
-					: raw;
+		let value: unknown;
+		if (typeof raw === "string") value = redactString(raw, values, hits, budget);
+		else if (raw !== null && typeof raw === "object")
+			value = rebuildNested(raw, values, hits, (b) => (bounded = bounded || b), budget);
+		else value = raw;
 		Object.defineProperty(out, outKey, { value, enumerable: true, writable: true, configurable: true });
 	}
 	if (text !== undefined && !Object.prototype.hasOwnProperty.call(out, "text")) {
@@ -1185,7 +1184,7 @@ function rebuildDetails(
 	for (const key of Object.keys(source)) {
 		// The key is itself outbound text (it lands in the transcript), so a secret used as an
 		// ancestor key is redacted here, exactly like a value.
-		const rebuiltKey = redactString(key, values, hits);
+		const rebuiltKey = redactString(key, values, hits, state);
 		// `Object.defineProperty`, not `next[key] = …`: an own `__proto__` key on the source (JSON.parse
 		// creates one) would hit the inherited `__proto__` SETTER on assignment and be silently DROPPED,
 		// so the rebuild lost that key entirely. defineProperty makes it an ordinary own enumerable
@@ -1210,31 +1209,34 @@ export function redactDetails(
 	// `shared` lets a CALLER bound a whole operation rather than one subtree: without it every part of
 	// a `content` array spent a fresh `maxMs`, so N parts cost N x the advertised budget (measured:
 	// 40 large text parts = 20.5s) while the code claimed ONE budget for the walk (#5109 round 9).
-	// The node count and `bounded` are written back so consumption accumulates across calls, and pass
-	// 2 does NOT reset the allowance when the budget is shared — the deadline has to mean something
-	// for the operation, and any starvation is announced rather than silent.
+	//
+	// ⛔ ONLY THE CLOCK IS SHARED. Round 9 also shared the NODE counter, which starved pass 2: with the
+	// allowance already spent by pass 1, `rebuildDetails`'s first check fired and the whole rebuild
+	// returned every dirty node BY REFERENCE — so a secret the parent commit redacted was persisted
+	// (announced, but persisted). That is a redaction REGRESSION, and this guard's own rule is that
+	// losing a redaction is worse than being slow. Each call therefore keeps its own node allowance and
+	// pass 2 resets it; the shared deadline still bounds the aggregate, because both `markDirtyDetails`
+	// and `redactString` consult the clock before doing work.
 	const base = shared ?? newDetailsBudget(limits);
+	const allowance = limits.maxNodes ?? MAX_DETAILS_NODES;
 	const state: DetailsDirtyState = {
 		...base,
+		nodes: shared === undefined ? base.nodes : allowance,
+		nodeAllowance: shared === undefined ? base.nodeAllowance : allowance,
 		dirty: new WeakSet<object>(),
 		clean: new WeakSet<object>(),
 		visiting: new WeakSet<object>(),
 		sawCycle: false,
 	};
 	const dirty = markDirtyDetails(details, values, state, 0);
-	if (shared !== undefined) {
-		shared.nodes = state.nodes;
-		shared.bounded = shared.bounded || state.bounded;
-	}
+	// Only `bounded` is written back: it is the flag the caller's attestation depends on.
+	if (shared !== undefined) shared.bounded = shared.bounded || state.bounded;
 	if (!dirty) return { value: details, changed: false, bounded: state.bounded };
 	// Pass 2 gets its own node allowance (the deadline is shared, so the block stays bounded): see
 	// `DetailsWalkBudget.nodeAllowance` for why starving pass 2 would redact nothing.
-	if (shared === undefined) state.nodes = state.nodeAllowance;
+	state.nodes = state.nodeAllowance;
 	const value = rebuildDetails(details, values, hits, state, new Map<object, unknown>(), 0);
-	if (shared !== undefined) {
-		shared.nodes = state.nodes;
-		shared.bounded = shared.bounded || state.bounded;
-	}
+	if (shared !== undefined) shared.bounded = shared.bounded || state.bounded;
 	return { value, changed: true, bounded: state.bounded };
 }
 

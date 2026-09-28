@@ -2270,6 +2270,13 @@ test("R8-TEXT-PATH-BUDGET: the text path really passes a budget to its string sc
 		// that scan (S6) is caught here for the same reason.
 		const arr = redactContent([`k=${S}`], values, new Map());
 		strictEqual(arr.incomplete, true, "an array string element's bounded scan must be announced");
+		// The REBUILD path's own key/value scans (round-10 [P2]) must be bounded too. An UNSTABLE part is
+		// the shape that reaches `rebuildContentPart` without any earlier budgeted `redactString` call, so
+		// this is the assertion that binds those scans rather than the text path's.
+		const unstablePart: Record<string, unknown> = { type: "image", blob: "A".repeat(4000) };
+		Object.defineProperty(unstablePart, "trap", { enumerable: true, configurable: true, get: () => 1 });
+		const rebuilt = redactContent([unstablePart], values, new Map());
+		strictEqual(rebuilt.incomplete, true, "the rebuild path's own scans must be bounded too");
 	} finally {
 		CONTENT_PART_LIMITS.maxMs = saved;
 	}
@@ -2296,6 +2303,44 @@ test("R8-ARRAY-PART: a rebuilt ARRAY part stays an array", () => {
 	const first = (out.value as unknown[])[0];
 	ok(Array.isArray(first), "a rebuilt array part must stay an array");
 	ok(!JSON.stringify(first).includes(S), "and its named accessor must be redacted");
+});
+
+test("R9-ALIAS-RESIDUAL: the forced rebuild counts per REFERENCE and breaks the alias (pinned residual)", () => {
+	const S = "R9-ALIAS-SECRET-0123456789ABCDEF";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const hits = new Map<string, number>();
+	const inner = { caption: `k=${S}` };
+	const part: Record<string, unknown> = { type: "image", a: inner, b: inner };
+	Object.defineProperty(part, "trap", { enumerable: true, configurable: true, get: () => 1 });
+	const out = redactContent([part], values, hits);
+	const first = (out.value as Record<string, unknown>[])[0] as Record<string, unknown>;
+	ok(!JSON.stringify(out.value).includes(S), "the secret must still be redacted");
+	// PINNED RESIDUAL (round 9, now recorded in the TREE rather than only in a commit message, so it
+	// cannot drift): the forced rebuild walks each value with a FRESH memo, so one underlying
+	// occurrence is counted once per REFERENCE and the rebuilt copies are no longer the same object.
+	// The `details` deep path reports 1 and preserves the alias. No leak, no under-count — but `total`
+	// is not comparable between the two paths, so pin both facts explicitly.
+	strictEqual(hitsTotal(hits), 2, "pinned: one underlying occurrence is counted TWICE here");
+	ok(first.a !== first.b, "pinned: the alias is broken on this path (the deep path preserves it)");
+});
+
+test("R9-NO-STARVE-SHARED: a shared budget must NOT starve pass 2 into losing a redaction", () => {
+	const S = "R9-NO-STARVE-SHARED-SECRET-012345";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const savedNodes = CONTENT_PART_LIMITS.maxNodes;
+	try {
+		// A node allowance small enough that pass 1 spends it, with the secret EARLY so pass 1 marks it
+		// dirty. Round 9 also shared the NODE counter, so pass 2's first check fired and every dirty node
+		// came back BY REFERENCE — the secret the parent commit redacted was persisted. Sharing only the
+		// clock (round 10) keeps this redaction. Losing a redaction is worse than being slow.
+		CONTENT_PART_LIMITS.maxNodes = 1000;
+		const tree: Record<string, unknown> = { first: `k=${S}` };
+		for (let i = 0; i < 5000; i++) tree[`k${i}`] = "v";
+		const out = redactContent([{ type: "image", payload: tree }], values, new Map());
+		ok(!JSON.stringify(out.value).includes(S), "the secret must still be REDACTED, not abandoned");
+	} finally {
+		CONTENT_PART_LIMITS.maxNodes = savedNodes;
+	}
 });
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────
