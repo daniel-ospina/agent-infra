@@ -1494,12 +1494,20 @@ export function scanStderrForUsage(
 //                       detector. A working tool keeps emitting
 //                       `tool_execution_update`, so silence ⇒ wedged, and a
 //                       healthy tool survives however long it runs (#783 §6.6)
+//                       — but "keeps emitting" means a RENDERABLE update, not
+//                       merely an update: pi's bash emits an unconditional
+//                       zero-byte start update for EVERY call, so the child's
+//                       `tool_updates` latch arms only on a content-bearing
+//                       payload (hasRenderableOutput, #1505 — before that fix
+//                       this clause degenerated into a bare 20-min silence
+//                       timeout for bash). Silence AFTER real output is still
+//                       killed at 20 min (R-B5).
 //   tool-dead ......... in-flight tool with NO OUTPUT and NO CPU —
 //                       #928. The complement of tool-silence, and the only
 //                       bound that reaches a tool the silence detector is
-//                       structurally blind to (one that has NEVER emitted an
-//                       update, so `tool_updates` stays 0 and clause 1 cannot
-//                       fire). Evidence is process liveness, not output: the
+//                       structurally blind to (one that has NEVER emitted a
+//                       RENDERABLE update, so `tool_updates` stays 0 and clause
+//                       1 cannot fire). Evidence is process liveness, not output: the
 //                       child samples the tool's process-subtree CPU and
 //                       reports how long it has been flat — and flat-CPU
 //                       evidence is admitted ONLY for a tool that has
@@ -2106,11 +2114,16 @@ export interface HeartbeatState {
    * time-to-first-observable-activity, comparable to the child's own
    * time-to-first-activity measured from session logs (#282 sweep). */
   firstActivityAt: number;
-  /** #783 §6.6: the in-flight tool round has emitted at least one update
-   * (child `tool_updates=1`). Gates the tool-silence clause — output silence is
-   * only a valid wedge signal for a tool that has PROVEN it produces output.
-   * Only streaming tools emit `tool_execution_update` (`bash` does; `task`,
-   * `read`, `edit`, `write` pass `_onUpdate` unused), so without this gate an
+  /** #783 §6.6: the in-flight tool round has produced at least one RENDERABLE
+   * update (child `tool_updates=1`). Gates the tool-silence clause — output
+   * silence is only a valid wedge signal for a tool that has PROVEN it produces
+   * output. Only a tool with RENDERABLE output can arm this gate (`bash` does;
+   * `task`, `read`, `edit`, `write` pass `_onUpdate` unused) — and #1505: pi's
+   * bash ALSO emits an unconditional ZERO-BYTE start update before any output,
+   * so "emitted an update" is not "produced output"; the child tests the
+   * payload's text (`hasRenderableOutput`) before latching. Without that test the
+   * gate armed on the first tick of EVERY bash call and this clause degenerated
+   * into a bare 20-minute silence timeout. So without this gate an
    * outer agent awaiting a nested task — silent by construction for the whole
    * child duration, see E279a2 — is misread as wedged and killed at S. */
   toolUpdates: boolean;
@@ -2792,11 +2805,13 @@ export function heartbeatKillDecision(
   //    suite that keeps printing is never touched, a tool that has gone quiet
   //    for S is gone.
   //    Accepted trade-off: a tool that BUFFERS all its output (a suite that
-  //    prints only at the end) emits no `tool_execution_update` at all, so
-  //    `tool_updates` stays 0 and this clause cannot fire — such a tool is
+  //    prints only at the end) emits no RENDERABLE `tool_execution_update` at
+  //    all (#1505: pi's bash emits a zero-byte start update for every call),
+  //    so `tool_updates` stays 0 and this clause cannot fire — such a tool is
   //    bounded instead by the age backstop below (and by the no-tool silence
   //    clause once it ends). That is deliberate: the clause only ever kills a
-  //    tool that has DEMONSTRATED it streams and then stopped, so silence is
+  //    tool that has DEMONSTRATED it streams RENDERABLE output and then
+  //    stopped, so silence is
   //    evidence of a wedge rather than of a quiet-but-working tool.
   if (stateFresh && st.toolsInFlight > 0 && st.toolUpdates && effStreamAge > i.streamStallMs) {
     return kill("tool-silence");
@@ -2807,7 +2822,8 @@ export function heartbeatKillDecision(
   //
   //     Why clause 1 cannot cover it: `toolUpdates` is UNIVERSAL over the
   //     in-flight set (see computeToolUpdates), and a tool that has never
-  //     emitted a single `tool_execution_update` keeps it false. A `bash` that
+  //     emitted a single RENDERABLE `tool_execution_update` keeps it false. A
+  //     `bash` that
   //     buffers all of its output — and any tool that has simply not printed
   //     yet — therefore cannot trip clause 1 at ANY age. Until this clause
   //     existed the only bound left for such a tool was the 4h age backstop —
@@ -2820,7 +2836,7 @@ export function heartbeatKillDecision(
   //
   //     Why the evidence is CPU and not time: from the parent's view a wedged
   //     silent tool and a healthy nested `task` are TIMING-IDENTICAL
-  //     (toolsInFlight=1, never emitted an update, `stream_age_ms` on the same
+  //     (toolsInFlight=1, never emitted a RENDERABLE update, `stream_age_ms` on the same
   //     monotonic curve). Any age bound that fires on one fires on the other —
   //     the false kill the `toolUpdates` gate exists to prevent (E279a2). The
   //     separating signal is process liveness: the incident's `grep` had

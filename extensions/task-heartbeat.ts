@@ -180,7 +180,9 @@ export interface TickFields {
   toolAgeMaxMs: number;
   sawMsg: boolean;
   sawTool: boolean;
-  /** #783 §6.6: the in-flight tool round has emitted at least one update. */
+  /** #783 §6.6 / #1505: the in-flight tool round has produced RENDERABLE
+   * output — armed only by a content-bearing `tool_execution_update`, never by
+   * pi's unconditional zero-byte start update. */
   toolUpdates: boolean;
   /** #928: cumulative CPU (ms) of the in-flight tool's PROCESS SUBTREE.
    * 0 = not probed (no eligible tool, probe unavailable, or nothing found). */
@@ -219,8 +221,10 @@ export interface TickFields {
 }
 
 /** #783 §6.6: the output-liveness bit the tick carries — true iff there is at
- * least one in-flight tool and EVERY one of them has emitted at least one
- * `tool_execution_update`. UNIVERSAL, not existential: the parent uses this to
+ * least one in-flight tool and EVERY one of them has produced RENDERABLE
+ * output (`tool_execution_update` carrying non-whitespace text — #1505; arming
+ * on the update itself made this true from the first tick of every bash call).
+ * UNIVERSAL, not existential: the parent uses this to
  * decide whether silence means "the silent tool is wedged", which is only sound
  * if the silence cannot belong to a tool that never emits at all (a nested
  * `task` — see E279a2). Exported so the direction is pinned by a unit test
@@ -235,6 +239,35 @@ export function computeToolUpdates(
     if (!updated.has(id)) return false;
   }
   return any;
+}
+
+/** #1505: does this `tool_execution_update` payload carry output a tool
+ * actually PRODUCED?
+ *
+ * The `tool_updates` bit above is only sound if "emitted an update" means "pro-
+ * duced output". It did not: pi's `bash` tool calls
+ * `onUpdate({ content: [], details: undefined })` UNCONDITIONALLY before the
+ * command has emitted a single byte (`dist/core/tools/bash.js`, the start
+ * tick), and the bundle forwards every `partialResult` to extensions with no
+ * content filter. So the latch armed on the first tick of EVERY bash round and
+ * the parent's clause 1 degenerated into a bare 20-minute silence timeout —
+ * killing silenced-but-working tools (the wedge).
+ *
+ * The test is on the TEXT, not on array length: a real update is
+ * `{ content: [{ type: "text", text: <snapshot> }] }`, and an empty snapshot
+ * renders as `text: ""` — an array-length test would still arm on it. Fails
+ * CLOSED (`false`) on every unrecognised shape, so a payload this predicate
+ * cannot read never licenses a kill. */
+export function hasRenderableOutput(partialResult: unknown): boolean {
+  const content = (partialResult as { content?: unknown } | null | undefined)?.content;
+  if (!Array.isArray(content)) return false;
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if ((part as { type?: unknown }).type !== "text") continue;
+    const text = (part as { text?: unknown }).text;
+    if (typeof text === "string" && text.trim() !== "") return true;
+  }
+  return false;
 }
 
 export function formatTick(nonce: string, f: TickFields): string {
@@ -348,6 +381,11 @@ export function hasTurnContent(event: { message?: unknown; toolResults?: unknown
 // and why the ONLY bound left for a genuinely wedged silent tool is the
 // multi-hour age backstop (4h by default). The two states the parent must
 // separate are timing-IDENTICAL on every quantity the heartbeat carries today.
+//
+// (#1505 note: `tool_execution_update` still feeds `touchActivity()`
+// UNCONDITIONALLY — that is liveness. What Leg A gates is the EVIDENCE latch:
+// only a RENDERABLE update arms `toolUpdates`. The two are different questions
+// and must not be re-conflated in either direction.)
 //
 // The signal that does separate them is PROCESS LIVENESS. In the #928 incident
 // the in-flight `grep` had accumulated 69m50s of CPU — genuinely working, just
@@ -685,6 +723,69 @@ export function orphanWatchdogActive(env: Record<string, string | undefined> = p
   return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print" && env.ORPHAN_WATCHDOG !== "0";
 }
 
+/** #1500 / #1505 Leg B: is this process a DISPATCHED child — the population
+ * whose `bash` calls get a default timeout?
+ *
+ * Deliberately the same env-parameter seam as `orphanWatchdogActive` above (a
+ * default parameter rather than a raw env read of the print-mode key), because
+ * `extensions/shared/print-mode-wiring.test.ts` (#228) forbids production `.ts`
+ * from naming that key with the `process.env.` prefix. Do not inline the read —
+ * the guard greps the literal, not the semantics.
+ *
+ * `TASK_HEARTBEAT_DISABLE === "1"` must NOT defeat this: the subagent extension
+ * sets it to silence the EMITTER, and those children (reviewers, verification
+ * gates) are exactly the ones that must still get a bounded bash call. It is
+ * therefore NOT `taskHeartbeatActive` and NOT `orphanWatchdogActive` (whose
+ * `ORPHAN_WATCHDOG !== "0"` term is the wrong axis). */
+export function dispatchMarkerActive(env: Record<string, string | undefined> = process.env): boolean {
+  return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print";
+}
+
+/** #1500: the default wall-clock bound on a dispatched child's `bash` call.
+ *
+ * Measured (658,981 completed bash calls across 18.7k retained child
+ * transcripts): p99.9 = 1135.9 s, p99.99 = 2091.5 s, p99.999 = 3689.4 s, max
+ * 5417.8 s (90.3 min). 8 calls exceed 3600 s — 7 of them with NO explicit
+ * timeout — so the 60 min #1500 originally asserted would have destroyed
+ * measured legitimate work; 0 exceed 7200 s.
+ *
+ * The HANG population is by construction absent from a completed-call corpus,
+ * so this bound cannot be derived from what was killed — only set above
+ * demand, and made operator-adjustable. See `TASK_TOOL_TIMEOUT_S`. */
+export const DEFAULT_TOOL_TIMEOUT_S = 7200;
+
+/** #1500 c2/c3: the effective per-call bash bound, or `null` for DISARMED.
+ *
+ *   · ABSENT  → `DEFAULT_TOOL_TIMEOUT_S`. The bound is ON by default; failing
+ *               open here would re-create the class this fixes (an unbounded
+ *               command parks the child forever — pi's own schema says
+ *               "optional, no default timeout").
+ *   · > 0 finite → that many seconds (clamped to the `setTimeout` ceiling
+ *               below, which is ~24.8 days in ms: above it Node warns and
+ *               fires IMMEDIATELY, i.e. the bound would invert into a kill).
+ *   · anything else → `null` = DISARMED. Only a value the OPERATOR actually
+ *               supplied can disarm it, and `toolTimeoutDisarmWarning` says so.
+ */
+export function getToolTimeoutSeconds(
+  env: Record<string, string | undefined> = process.env,
+): number | null {
+  const raw = env.TASK_TOOL_TIMEOUT_S;
+  if (raw === undefined) return DEFAULT_TOOL_TIMEOUT_S;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.min(seconds, Math.floor(2_147_483_647 / 1000));
+}
+
+/** #1500 c3: the once-only notice for a DISARMED bound. Pure predicate (the
+ * caller owns the latch) so it is testable without a dispatch; `null` when the
+ * supplied value is fine. Precedent: `streamStallInertWarning`. */
+export function toolTimeoutDisarmWarning(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds > 0) return null;
+  return `[task-heartbeat] warn TASK_TOOL_TIMEOUT_S="${raw}" is not a positive finite number — the dispatched-child bash timeout default is DISARMED; bash calls may park indefinitely.`;
+}
+
 /** Orphan predicate: ppid CHANGED (reparented — covers Linux subreaper
  * adoption to a non-1 pid) OR ppid === 1 (launchd adoption on macOS; also the
  * boot-race arm where the parent died before this extension loaded). */
@@ -860,6 +961,50 @@ export default function (pi: ExtensionAPI) {
   if (orphanWatchdogActive()) {
     armOrphanWatchdog();
   }
+
+  // #1500 / #1505 Leg B: bound the dispatched child's `bash` calls.
+  //
+  // Registered ABOVE the `taskHeartbeatActive()` early return below and gated
+  // on `dispatchMarkerActive` rather than the emitter gate, because the
+  // emitter's own opt-out (`TASK_HEARTBEAT_DISABLE=1`, set by the subagent
+  // extension) is precisely the population whose bash calls must still be
+  // bounded. `bash` only: it is 270/271 of the measured silent-tool class, and
+  // `timeout` is not a field of any other tool's input.
+  //
+  // This is a PRE-EXECUTION hook whose only mutation is one absent field, so it
+  // cannot drift against the tool implementation the way a replacement tool
+  // (a `registerTool` override) would. A caller-supplied `timeout` is never
+  // overridden (#1500 c1) — the bound only fills a hole.
+  if (dispatchMarkerActive()) {
+    let disarmWarned = false;
+    pi.on("tool_call", async (event) => {
+      if (event.toolName !== "bash") return;
+      const input = event.input as { timeout?: unknown } | null | undefined;
+      if (!input || typeof input !== "object") return;
+      // #1500 c1: never override a caller-supplied value. An explicit `null` is
+      // treated as ABSENT, deliberately: pi's `resolveTimeoutMs` THROWS on
+      // `Invalid timeout: must be a finite number of seconds`, so passing a null
+      // through would reject the call rather than leave it unbounded.
+      if (input.timeout !== undefined && input.timeout !== null) return;
+      const seconds = getToolTimeoutSeconds();
+      if (seconds === null) {
+        const warning = toolTimeoutDisarmWarning(process.env.TASK_TOOL_TIMEOUT_S);
+        if (warning && !disarmWarned) {
+          disarmWarned = true;
+          try {
+            // stderr, unprefixed — an OBSERVER must never break the child, and
+            // the parent's marker parser ignores any kind it does not know.
+            console.error(warning);
+          } catch {
+            /* ditto */
+          }
+        }
+        return;
+      }
+      input.timeout = seconds;
+    });
+  }
+
   if (!taskHeartbeatActive()) return;
 
   // Per-dispatch nonce set by the parent task tool — echoed in every marker so
@@ -876,10 +1021,12 @@ export default function (pi: ExtensionAPI) {
   // KIND (see CPU_LIVENESS_TOOL_NAMES), so the emitter must know what is in
   // flight, not just how many.
   const outstandingTools = new Map<string, { startedAt: number; name: string }>();
-  /** #783 §6.6: which in-flight tools have emitted `tool_execution_update`.
-   * Only streaming tools emit updates — `bash` does, while `task`, `read`,
-   * `edit`, `write` pass `_onUpdate` UNUSED. The tick reports whether EVERY
-   * in-flight tool has emitted (see `computeToolUpdates`): the clause concludes
+  /** #783 §6.6: which in-flight tools have emitted a RENDERABLE
+   * `tool_execution_update` (#1505: the qualifier is load-bearing — pi's bash
+   * emits a zero-byte start update for every call, so unfiltered membership
+   * made this set a statement about the HARNESS, not about output).
+   * The tick reports whether EVERY in-flight tool has produced output (see
+   * `computeToolUpdates`): the clause concludes
    * something about the tool that went quiet, so "SOME tool produced output" is
    * the wrong direction — with a bash that emitted and ended while a nested
    * task is still in flight, an existential latch stayed true and killed the
@@ -1136,7 +1283,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_update", async (event) => {
-    updatedToolIds.add(event.toolCallId);
+    // #1505: arm the evidence latch ONLY on a renderable update.
+    //
+    // pi's bash emits an unconditional zero-byte start update before any command
+    // output, so the unfiltered `updatedToolIds.add(...)` that used to sit here
+    // armed `tool_updates` from the first tick of every bash call — which turned
+    // the parent's clause 1 into a bare 20-minute silence timeout and is the
+    // wedge this change fixes. `tool_updates` is now exactly the claim its type
+    // comment makes: this tool round has produced OUTPUT.
+    if (hasRenderableOutput(event.partialResult)) updatedToolIds.add(event.toolCallId);
+    // Liveness is UNCONDITIONAL, and must stay so: `touchActivity` feeds #279's
+    // `everSawRealActivity` and the child's own activity clock. Gating it here
+    // would re-conflate liveness with output-evidence — the same defect, in the
+    // other direction.
     touchActivity("tool_execution_update");
   });
 

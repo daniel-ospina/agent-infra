@@ -139,6 +139,14 @@ export const OUT_OF_FAMILY_TERMS = [
   // their behaviour pinned by tests/admin-merge/run.sh §41.
   "RERUN_FLOOR",
   "FAILSAFE_RERUN_TIMEOUT",
+  // #1500 Leg B: the dispatched child's default bash bound, and the getter that
+  // resolves it. Neither name carries a stall-family TOKEN (`_S` IS a bound
+  // suffix — `SCAN_BOUND_SUFFIXES` — but `inFamily` needs token AND suffix), so
+  // the name scan cannot see them. `getToolTimeoutSeconds` is a FUNCTION and is
+  // registered below as well, because every name in this list must also be a
+  // registry entry.
+  "DEFAULT_TOOL_TIMEOUT_S",
+  "getToolTimeoutSeconds",
 ] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
@@ -158,9 +166,16 @@ export function isActivityEdge(event: string): event is ActivityEdge {
   return (ACTIVITY_EDGE_EVENTS as readonly string[]).includes(event);
 }
 
-/** Every child-registered pi event (activity + lifecycle). */
+/** #783 §6.6 / #1505: the events the dispatch child registers that are not
+ * activity or lifecycle edges — a `tool_call` handler (#1500 Leg B) mutates
+ * `input.timeout` before a bash call runs and feeds no clock, so it belongs to
+ * neither table. Declared here so `childRegisteredEvents()` stays the single
+ * source of the child's registration set and the parity test keeps its bite. */
+export const PREVENTION_EVENTS = ["tool_call"] as const;
+
+/** Every `pi.on(...)` event the dispatch child registers. */
 export function childRegisteredEvents(): string[] {
-  return [...ACTIVITY_EDGE_EVENTS, ...LIFECYCLE_EVENTS];
+  return [...ACTIVITY_EDGE_EVENTS, ...LIFECYCLE_EVENTS, ...PREVENTION_EVENTS];
 }
 
 /**
@@ -853,6 +868,22 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "6h base of the EFFECTIVE hard cap (TASK_HARD_CAP_MS overrides it, 60 s floor) — the cap the tool-stall (L) derivation multiplies by 2/3.",
+  },
+  {
+    name: "DEFAULT_TOOL_TIMEOUT_S",
+    owners: ["extensions/task-heartbeat.ts"],
+    value: "= 7200;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "#1500 Leg B: the default wall-clock bound on a DISPATCHED child's `bash` call, filled in by the `tool_call` handler only when the caller supplied no `timeout`. Derived from the measured completed-call tail (max 5417.8 s over 658,981 calls; 0 > 7200 s) — deliberately NOT from the killed population, which is absent from a completed-call corpus by construction.",
+  },
+  {
+    name: "getToolTimeoutSeconds",
+    owners: ["extensions/task-heartbeat.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: env override TASK_TOOL_TIMEOUT_S — absent → DEFAULT_TOOL_TIMEOUT_S (7200 s); non-positive / non-finite / unparseable → null = DISARMED, with a once-only warning from toolTimeoutDisarmWarning; a finite positive value is clamped to the setTimeout ceiling (~24.8 days in ms), above which Node warns and fires immediately, inverting the bound into a kill. Mirrors getToolStallMs.",
   },
   {
     name: "DEFAULT_MAX_DISPATCH_MS",

@@ -3015,8 +3015,10 @@ section("#928 — silent-tool CPU liveness: the child's sample → the parent's 
 // the toolUpdates gate is UNIVERSAL and is not weakened by this change. That
 // left the multi-hour age backstop as its only bound. The populations a bound
 // must separate are timing-IDENTICAL from the parent's view (a healthy nested
-// `task` and a wedged `grep` are both toolsInFlight=1, both never emitted an
-// update, both on the same stream_age_ms curve), so the fix is a NEW INPUT —
+// `task` and a wedged `grep` are both toolsInFlight=1, both never emitted a
+// RENDERABLE update (#1505: pi's bash emits a zero-byte start update for every
+// call, so "emitted an update" is not "produced output"), both on the same
+// stream_age_ms curve), so the fix is a NEW INPUT —
 // process liveness — not a new bound.
 //
 // ⚠️ THE NEGATIVE CASE IS REQUIRED, NOT OPTIONAL. Any test of the form "a
@@ -3042,7 +3044,7 @@ const NONCE5195 = "nonce5195";
 function silentToolState(over: Partial<HeartbeatState> = {}): HeartbeatState {
   const st = createHeartbeatState();
   st.toolsInFlight = 1;
-  st.toolUpdates = false;      // never emitted an update — clause 1 cannot fire
+  st.toolUpdates = false;      // never emitted a RENDERABLE update — clause 1 cannot fire
   st.turnActive = true;
   st.everSawRealActivity = true;
   st.everSawTool = true;
@@ -3719,7 +3721,7 @@ test("#928 tool-dead NEGATIVE TWIN (mandatory) — a parent awaiting a nested `t
   equal(st.toolCpuStallMs, 0, "the child never probes `task` — the field is 0 (not probed), not a small live value");
   equal(st.toolCpuAdvanced, false, "nor is any CPU work demonstrated for it — the clause has two independent bars, both closed");
   equal(st.toolsInFlight, 1, "fixture check: one tool in flight, exactly as in the positive twin");
-  equal(st.toolUpdates, false, "fixture check: it has never emitted an update, exactly as in the positive twin");
+  equal(st.toolUpdates, false, "fixture check: it has never emitted a RENDERABLE update, exactly as in the positive twin");
   const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
   equal(d.kill, false, "MANDATORY NEGATIVE CASE: a healthy nested task in flight past S must NOT be killed by the new clause");
   equal(d.reason, undefined, "no reason at all — not even a reclassified one");
@@ -4573,7 +4575,14 @@ test("child gating matrix — inactive without TASK_HEARTBEAT=1 ∧ PI_MODE=prin
   withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }, () => {
     const { api, handlers } = stub();
     childFactory(api);
-    equal(Object.keys(handlers).length, 0, "TASK_HEARTBEAT_DISABLE=1 → inert");
+    // #1500 Leg B: the emitter is silenced, but this child must STILL get a
+    // bounded bash call — the subagent extension sets exactly this flag for the
+    // reviewer/verification children, which are the population Leg B protects.
+    deepEqual(
+      Object.keys(handlers),
+      ["tool_call"],
+      "TASK_HEARTBEAT_DISABLE=1 silences the emitter only — the tool_call guard remains",
+    );
   });
   withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined }, () => {
     const { api, handlers } = stub();
@@ -4584,12 +4593,16 @@ test("child gating matrix — inactive without TASK_HEARTBEAT=1 ∧ PI_MODE=prin
     // structurally blind in exactly the direction that matters). The child now
     // registers precisely the declared activity edges plus the two lifecycle
     // events, and this equality fails on a registration on EITHER side.
-    const expected = [...progressEdges.ACTIVITY_EDGE_EVENTS, ...progressEdges.LIFECYCLE_EVENTS].sort();
+    const expected = [
+      ...progressEdges.ACTIVITY_EDGE_EVENTS,
+      ...progressEdges.LIFECYCLE_EVENTS,
+      ...progressEdges.PREVENTION_EVENTS,
+    ].sort();
     const actual = Object.keys(handlers).sort();
     deepEqual(
       actual,
       expected,
-      `registered handlers must equal ACTIVITY_EDGE_EVENTS ∪ LIFECYCLE_EVENTS (declared in extensions/shared/heartbeat-progress-edges.ts) — actual ${JSON.stringify(actual)}`,
+      `registered handlers must equal ACTIVITY_EDGE_EVENTS ∪ LIFECYCLE_EVENTS ∪ PREVENTION_EVENTS (declared in extensions/shared/heartbeat-progress-edges.ts) — actual ${JSON.stringify(actual)}`,
     );
     for (const ev of expected) ok(handlers[ev], `handler registered for ${ev}`);
   });
@@ -4741,7 +4754,11 @@ testAsync("child lifecycle (review fix): a lost tool_execution_end must NOT leak
       await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
       // A streaming tool that emits, then its end is LOST (never delivered).
       await handlers.tool_execution_start({ toolCallId: "call_0", toolName: "bash", args: {} });
-      await handlers.tool_execution_update({ toolCallId: "call_0", toolName: "bash", args: {}, partialResult: "out" });
+      // #1505: the payload must be RENDERABLE — pi's real snapshot shape. A bare
+      // string no longer arms the latch (it is not a shape `hasRenderableOutput`
+      // can read), which is the whole point of the fix; keeping the old fixture
+      // would make this test pass for the wrong reason.
+      await handlers.tool_execution_update({ toolCallId: "call_0", toolName: "bash", args: {}, partialResult: { content: [{ type: "text", text: "out" }], details: undefined } });
       await handlers.turn_end({ turnIndex: 1, message: {}, toolResults: [] });
       // Next turn: a NON-streaming tool (a nested `task` never emits updates)
       // happens to reuse the same id.
@@ -4753,6 +4770,187 @@ testAsync("child lifecycle (review fix): a lost tool_execution_end must NOT leak
       ok(tick.includes("tool_updates=0"), `a reused id must NOT inherit the previous turn's liveness (tool-silence gate stays off): ${tick}`);
       await handlers.session_shutdown({} as any);
     });
+  } finally {
+    console.error = origErr;
+  }
+});
+
+section("#1500/#1505 — the evidence gate and the dispatched-child bash bound");
+
+test("#1505 hasRenderableOutput — 'emitted an update' must mean 'PRODUCED output'", () => {
+  const h = childHb.hasRenderableOutput;
+  // The exact payload pi's bash emits UNCONDITIONALLY, before a single byte of
+  // command output (verified live: `sleep 12; echo hi` → an update at 2 ms with
+  // `{content:[]}`). Arming the latch on this is the defect: it made clause 1 a
+  // bare 20-minute silence timeout for every bash call.
+  equal(h({ content: [], details: undefined }), false, "the zero-byte start update must NOT arm");
+  // A real snapshot that renders as nothing — the case an array-LENGTH test misses.
+  equal(h({ content: [{ type: "text", text: "" }] }), false, "empty-string snapshot must NOT arm");
+  equal(h({ content: [{ type: "text", text: "   \n\t " }] }), false, "whitespace-only must NOT arm (R-B2)");
+  // Real output.
+  equal(h({ content: [{ type: "text", text: "hi\n" }] }), true, "real output must arm");
+  equal(h({ content: [{ type: "text", text: " x " }] }), true, "padded real output must arm");
+  equal(
+    h({ content: [{ type: "text", text: "" }, { type: "text", text: "x" }] }),
+    true,
+    "ANY renderable part arms the round",
+  );
+  // Fail CLOSED on every shape this predicate cannot read: an unreadable payload
+  // must never license a kill.
+  for (const bad of [
+    undefined,
+    null,
+    "out",
+    7,
+    {},
+    { content: undefined },
+    { content: "text" },
+    { content: [null, 3, {}] },
+    { content: [{ type: "image" }] },
+    { content: [{ type: "text" }] },
+    { content: [{ type: "text", text: 7 }] },
+  ]) {
+    equal(h(bad), false, `an unreadable payload must fail CLOSED: ${JSON.stringify(bad)}`);
+  }
+});
+
+test("#1505 computeToolUpdates — still UNIVERSAL, so a never-streaming sibling suppresses clause 1 (T5)", () => {
+  const f = childHb.computeToolUpdates;
+  equal(f(["a"], new Set(["a"])), true, "the single streamed tool arms the round");
+  equal(f(["a"], new Set()), false, "a tool that produced nothing does not arm it");
+  equal(f(["a", "b"], new Set(["a"])), false, "one silent sibling suppresses the kill for BOTH (accepted residual T5)");
+  equal(f(["a", "b"], new Set(["a", "b"])), true, "all of them produced output");
+  equal(f([], new Set()), false, "nothing in flight → no evidence claim at all");
+});
+
+test("#1500 getToolTimeoutSeconds — absent ⇒ bound ON; only a SUPPLIED bad value disarms it", () => {
+  const g = childHb.getToolTimeoutSeconds;
+  equal(g({}), childHb.DEFAULT_TOOL_TIMEOUT_S, "absent → the default (failing open here re-creates the class)");
+  equal(childHb.DEFAULT_TOOL_TIMEOUT_S, 7200, "the shipped default (value pin)");
+  equal(g({ TASK_TOOL_TIMEOUT_S: "120" }), 120, "a supplied positive value is honoured");
+  equal(g({ TASK_TOOL_TIMEOUT_S: "0.5" }), 0.5, "fractional seconds are allowed");
+  for (const bad of ["0", "-1", "-0.5", "abc", "", " ", "Infinity", "-Infinity", "NaN", "1e400"]) {
+    equal(g({ TASK_TOOL_TIMEOUT_S: bad }), null, `"${bad}" must DISARM, not bound`);
+  }
+  // Above the setTimeout ceiling Node warns and fires IMMEDIATELY — an unclamped
+  // value would invert the bound into an instant kill.
+  equal(g({ TASK_TOOL_TIMEOUT_S: "99999999999" }), 2147483, "clamped to the setTimeout ceiling");
+  // The warning predicate mirrors the polarity exactly.
+  const w = childHb.toolTimeoutDisarmWarning;
+  equal(w(undefined), null, "absent is the DEFAULT, not a mistake — no warning");
+  equal(w("120"), null, "a good value is silent");
+  ok(typeof w("0") === "string", "a supplied bad value warns once");
+  ok((w("abc") ?? "").includes("DISARMED"), "the warning says the bound is off");
+});
+
+test("#1500 dispatchMarkerActive — the DISABLE-agnostic dispatch gate", () => {
+  const a = childHb.dispatchMarkerActive;
+  equal(a({ TASK_HEARTBEAT: "1", PI_MODE: "print" }), true, "a dispatched child");
+  equal(
+    a({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }),
+    true,
+    "DISABLE silences the EMITTER — the bound must survive it (reviewer children)",
+  );
+  equal(a({ TASK_HEARTBEAT: "1" }), false, "no PI_MODE=print → an interactive session is not a dispatched child");
+  equal(a({ PI_MODE: "print" }), false, "no TASK_HEARTBEAT=1 → not a dispatched child");
+  equal(a({}), false);
+});
+
+test("#1500 — the `tool_call` guard registers IFF this is a dispatched child (T4)", () => {
+  const stub = () => {
+    const handlers: Record<string, unknown> = {};
+    return { api: { on: (ev: string, h: unknown) => { handlers[ev] = h; } } as any, handlers };
+  };
+  withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }, () => {
+    const { api, handlers } = stub();
+    childFactory(api);
+    ok(handlers.tool_call, "the bash bound must survive TASK_HEARTBEAT_DISABLE=1 (Leg B's whole point)");
+  });
+  withEnv({ TASK_HEARTBEAT: undefined, PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined }, () => {
+    const { api, handlers } = stub();
+    childFactory(api);
+    equal(handlers.tool_call, undefined, "an interactive session must NOT get the guard");
+  });
+});
+
+testAsync("#1500 — the bash bound: filled when absent, NEVER overriding, bash only (T2/T3/D6)", async () => {
+  const handlers: Record<string, any> = {};
+  await withEnv(
+    {
+      TASK_HEARTBEAT: "1",
+      PI_MODE: "print",
+      TASK_HEARTBEAT_DISABLE: undefined,
+      TASK_TOOL_TIMEOUT_S: undefined,
+    },
+    async () => {
+      childFactory({ on: (ev: string, h: any) => { handlers[ev] = h; } } as any);
+      const guard = handlers.tool_call;
+      ok(guard, "tool_call guard registered");
+      const call = (toolName: string, input: unknown) => guard({ toolName, toolCallId: "c", input });
+
+      // T3a: absent → the default is injected. This is the #1500 defect itself.
+      const a: Record<string, unknown> = { command: "sleep 5" };
+      await call("bash", a);
+      equal(a.timeout, childHb.DEFAULT_TOOL_TIMEOUT_S, "absent → the bound is ON");
+      equal(a.timeout, 7200);
+
+      // T2: an explicit timeout is NEVER overridden.
+      const b: Record<string, unknown> = { command: "sleep 5", timeout: 30 };
+      await call("bash", b);
+      equal(b.timeout, 30, "an explicit timeout is never overridden (#1500 c1)");
+
+      // D6: only bash carries a timeout field.
+      const c: Record<string, unknown> = { command: "x" };
+      await call("write", c);
+      equal(c.timeout, undefined, "non-bash tools are untouched");
+
+      // Malformed input must not throw — an observer may never break the child.
+      await call("bash", undefined);
+      await call("bash", "notanobject");
+      await call("bash", null);
+    },
+  );
+});
+
+testAsync("#1505 — the evidence gate at the TICK: a zero-byte update leaves tool_updates=0 (T1)", async () => {
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  const handlers: Record<string, any> = {};
+  try {
+    await withEnv(
+      {
+        TASK_HEARTBEAT: "1",
+        PI_MODE: "print",
+        TASK_HEARTBEAT_DISABLE: undefined,
+        TASK_HEARTBEAT_INTERVAL_MS: "5000",
+        TASK_HEARTBEAT_NONCE: "gatecheck",
+      },
+      async () => {
+        childFactory({ on: (ev: string, h: any) => { handlers[ev] = h; } } as any);
+        await handlers.session_start({});
+        await handlers.tool_execution_start({ toolCallId: "c1", toolName: "bash", args: {} });
+        // The exact pre-output payload. Before this fix the latch armed HERE and
+        // the parent's clause 1 could kill a silently-working tool at 20 minutes.
+        await handlers.tool_execution_update({
+          toolCallId: "c1", toolName: "bash", args: {},
+          partialResult: { content: [], details: undefined },
+        });
+        await sleep(5_300);
+        const t1 = lines.filter((l) => l.includes(" tick ")).pop() ?? "";
+        ok(t1.includes("tool_updates=0"), `a zero-byte start update must NOT arm the kill gate: ${t1}`);
+        ok(t1.includes("tools=1"), `the tool is still counted as in flight: ${t1}`);
+        // ...and real output DOES arm it, so the gate has not simply been disabled.
+        await handlers.tool_execution_update({
+          toolCallId: "c1", toolName: "bash", args: {},
+          partialResult: { content: [{ type: "text", text: "hi\n" }] },
+        });
+        await sleep(5_000);
+        const t2 = lines.filter((l) => l.includes(" tick ")).pop() ?? "";
+        ok(t2.includes("tool_updates=1"), `real output must arm the kill gate: ${t2}`);
+        await handlers.session_shutdown({});
+      },
+    );
   } finally {
     console.error = origErr;
   }
