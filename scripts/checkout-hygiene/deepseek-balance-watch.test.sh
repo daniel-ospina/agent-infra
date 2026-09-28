@@ -89,19 +89,20 @@ bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"45
 watch 0 "PASS with CNY + USD entries (USD keyed)"
 assert_contains "$LAST_OUT" "balance=USD 45.0000" "USD entry keyed for spend decisions"
 
-echo "── low balance → SET ──"
+echo "── low balance → WARN only, NEVER a latch (owner decision: warn, don't switch) ──"
 reset
 bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"2.00","granted_balance":"0.00","topped_up_balance":"2.00"}]}'
-watch 0 "SET on balance at/below low threshold"
-assert_contains "$LAST_OUT" "SET balance=USD 2.0000" "SET line records balance"
-latched "latch record written (status exhausted)"
-python3 "$LATCH" status | python3 -c 'import json,sys; p=json.load(sys.stdin)["primaries"]["deepseek"]; assert p["reason"]=="low_balance" and p["source"]=="poller"; print("  ✅ poller source + low_balance reason stamped")'
+watch 0 "WARN on balance at/below warn threshold (a warning is not a failure — exit 0)"
+assert_contains "$LAST_OUT" "WARN balance=USD 2.0000" "WARN line records balance"
+assert_contains "$LAST_OUT" "NO latch set" "WARN states no latch was set"
+not_latched "NO latch on a low balance — a pre-emptive switch on a warning is the #1508 outage"
 
-echo "── hysteresis: mid-band holds, never clears ──"
+echo "── mid-band (below warn) still warns, and never clears an existing latch ──"
+seed_latch
 bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"12.00","granted_balance":"0.00","topped_up_balance":"12.00"}]}'
-watch 0 "mid-band balance → HOLD (latch untouched)"
-assert_contains "$LAST_OUT" "HOLD balance=USD 12.0000" "HOLD line records band"
-latched "existing latch preserved in mid-band (hysteresis)"
+watch 0 "mid-band balance → WARN (below 30), existing latch untouched"
+assert_contains "$LAST_OUT" "WARN balance=USD 12.0000" "mid-band WARN logged"
+latched "existing latch preserved — only the CLEAR branch may clear"
 
 echo "── restore: verified positive + chat probe → CLEAR ──"
 seed_latch
@@ -164,23 +165,25 @@ assert_contains "$LAST_OUT" "PASS openrouter" "openrouter healthy logged"
 
 echo "── boundary + account-state + latch-write failure (review fixes) ──"
 reset
-bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"5.00","granted_balance":"0.00","topped_up_balance":"5.00"}]}'
-watch 0 "balance EXACTLY == LOW (5.00) → SET (boundary inclusive)"
-assert_contains "$LAST_OUT" "SET balance=USD 5.0000" "SET at boundary logged"
-latched "boundary latches (at/below semantics)"
+bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"30.00","granted_balance":"0.00","topped_up_balance":"30.00"}]}'
+watch 0 "balance EXACTLY == WARN (30.00) → WARN (boundary inclusive)"
+assert_contains "$LAST_OUT" "WARN balance=USD 30.0000" "WARN at boundary logged"
+not_latched "boundary warns but never latches (at/below semantics)"
 reset
 bal '{"is_available":false,"balance_infos":[{"currency":"USD","total_balance":"50.00","granted_balance":"0.00","topped_up_balance":"50.00"}]}'
 watch 1 "is_available=false → ACCOUNT-UNAVAILABLE + exit 1 (never a false PASS)"
 assert_contains "$LAST_OUT" "ACCOUNT-UNAVAILABLE" "unusable account logged"
 not_latched "no latch change on unusable account (defer; 402 markers backstop)"
+# The durable-latch-write-failure case is GONE with the latch-SET path itself: a low
+# balance no longer writes a latch, so there is no write that can fail. An unwritable
+# state dir must therefore be a clean exit 0 with the warning still emitted.
 reset
 bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"2.00","granted_balance":"0.00","topped_up_balance":"2.00"}]}'
 chmod 555 "$T/state"
-watch 1 "durable latch write fails → LATCH-SET-FAILED + exit 1"
+watch 0 "read-only latch state dir: WARN still exits 0 (no latch write is attempted)"
 chmod 755 "$T/state"
-assert_contains "$LAST_OUT" "LATCH-SET-FAILED" "write failure reported"
-assert_not_contains "$LAST_OUT" "latch SET" "no false SET claim on failed write"
-not_latched "no latch record when the write failed"
+assert_contains "$LAST_OUT" "WARN balance=USD 2.0000" "warning emitted even with an unwritable state dir"
+not_latched "no latch record (and no write was attempted)"
 reset
 bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"88.00","granted_balance":"0.00","topped_up_balance":"88.00"}]}'
 or_resp 000 ''
@@ -206,8 +209,9 @@ assert_contains "$LAST_OUT" "SKIP no deepseek api key" "missing key skip logged"
 not_latched "no latch written without a key"
 seed_latch
 bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"2.00","granted_balance":"0.00","topped_up_balance":"2.00"}]}'
-watch 0 "DBW_DRY computes SET but never mutates state" DBW_DRY=1
-assert_contains "$LAST_OUT" "[dry-run] latch action skipped" "dry-run announces latch action"
+watch 0 "DBW_DRY on a low balance stays a WARN and never mutates state" DBW_DRY=1
+assert_contains "$LAST_OUT" "WARN balance=USD 2.0000" "dry-run still warns"
+assert_not_contains "$LAST_OUT" "latch action" "no latch action to skip — the low-balance path writes no latch"
 latched "dry-run never mutates (existing latch preserved, no new write)"
 python3 "$LATCH" clear --primary deepseek >/dev/null 2>&1
 watch 2 "usage error on unexpected arg" --bogus

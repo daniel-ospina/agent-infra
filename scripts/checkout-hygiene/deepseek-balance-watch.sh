@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # deepseek-balance-watch.sh — balance poller for the #476 provider-exhaustion
 # failover. THE single restore authority (issue #476 O/I/T 4): reads the
-# DeepSeek-official prepaid balance, sets the shared exhaustion latch at ~0,
+# DeepSeek-official prepaid balance, WARNS at/below the warn threshold and
+# never sets a latch on a balance verdict (only an observed 402 marker latches),
 # alerts below threshold, and clears ONLY on verified positive balance + a
 # 5-token chat probe. Also reports the openrouter hop leg's remaining credit
 # (the poller's "probe all latched legs" mechanism, s6).
@@ -20,7 +21,7 @@
 #   2 = usage.
 #
 # Env overrides (tests + tuning):
-#   DBW_LOW_USD        balance AT/BELOW this → SET exhaustion latch (default 5)
+#   DBW_WARN_USD       balance AT/BELOW this → WARN only, never a latch (default 30)
 #   DBW_CLEAR_USD      balance AT/ABOVE this (+ probe pass) → CLEAR (default 20)
 #   DBW_OR_MIN_USD     openrouter limit_remaining below this → ALERT (default 5)
 #   DBW_MAX_TIME_S     curl max-time per probe (default 20)
@@ -40,8 +41,16 @@
 
 set -euo pipefail
 
-DBW_LOW_USD="${DBW_LOW_USD:-5}"
+# Owner decision (probe #1508 follow-up): a low balance WARNS and never switches.
+# DBW_WARN_USD is the warning threshold. The old DBW_LOW_USD latch-SET threshold is
+# gone: pre-emptively switching on a WARNING is what caused the 2026-09-28 outage —
+# the poller latched at USD 2.90 and every dispatch hopped to a keyless provider.
+# DeepSeek's own 402 (exhaustion markers) remains the real hard-stop signal.
+DBW_WARN_USD="${DBW_WARN_USD:-30}"
 DBW_CLEAR_USD="${DBW_CLEAR_USD:-20}"
+# Retained for backward compatibility with callers that still export it; it no
+# longer drives any latch. Ignored by the verdict chain.
+DBW_LOW_USD="${DBW_LOW_USD:-0}"
 DBW_OR_MIN_USD="${DBW_OR_MIN_USD:-5}"
 MAX_TIME_S="${DBW_MAX_TIME_S:-20}"
 STAGGER_S="${DBW_STAGGER_S:-0}"
@@ -201,6 +210,22 @@ if [ "$CODE" = "200" ]; then
   elif [ -z "${USD_TOTAL:-}" ]; then
     log "$TS SCHEMA-DRIFT http=200 body-unexpected ($(printf '%s' "$BODY" | head -c 120)) — no action (schema-drift alert; consecutive escalations below)"
     ALERTED=1
+  elif ge_float "$DBW_WARN_USD" "$USD_TOTAL"; then
+    # at/below WARN (boundary inclusive) → WARN ONLY. This branch is deliberately
+    # ordered BEFORE the CLEAR branch: with WARN (30) above CLEAR (20) a `>= CLEAR`
+    # test taken first would swallow the 20–30 band and report it healthy, so the
+    # warning would never fire exactly where it is wanted.
+    #
+    # It does NOT set a latch. Setting one here is the defect this change removes:
+    # a pre-emptive switch on a balance WARNING routed every dispatch to a keyless
+    # hop leg (2026-09-28, 03:17–03:47Z). The real hard stop is DeepSeek's own 402,
+    # which raises exhaustion markers and still hops — on OBSERVED failure, which is
+    # the only thing that justifies it.
+    log "$TS WARN balance=USD ${USD_TOTAL} at/below warn (${DBW_WARN_USD}) — warning only; NO latch set (a pre-emptive switch on a warning is the #1508 outage). Top up: https://platform.deepseek.com/top_up"
+    # Deliberately NOT ALERTED=1: a low balance is a KNOWN, actionable state, not the
+    # "balance state unknown" degraded signal that ALERTED drives. Setting it here
+    # would inflate the consecutive-degraded streak and force exit 1 for a warning.
+    ACTION="warn"
   elif ge_float "$USD_TOTAL" "$DBW_CLEAR_USD"; then
     # verified positive. The chat probe (5-token) runs ONLY when a latch
     # record exists — no latch = nothing to clear = no token spend. Clear is
@@ -227,20 +252,11 @@ if [ "$CODE" = "200" ]; then
       log "$TS PASS balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}) healthy — no latch"
       ACTION="pass"
     fi
-  elif gt_float "$USD_TOTAL" "$DBW_LOW_USD"; then
-    log "$TS HOLD balance=USD ${USD_TOTAL} below-clear (${DBW_CLEAR_USD}) above-low (${DBW_LOW_USD}) — latch untouched (hysteresis)"
-    ACTION="hold"
   else
-    # at/below LOW (boundary inclusive: == LOW latches) → SET
-    if latch set --primary deepseek --reason low_balance --source poller \
-      --notice "DeepSeek balance low|Balance USD ${USD_TOTAL} is at/below \$${DBW_LOW_USD}. Top up: https://platform.deepseek.com/top_up"; then
-      latch ledger --event poller-set --provider deepseek --detail "balance USD ${USD_TOTAL} <= low ${DBW_LOW_USD}"
-      log "$TS SET balance=USD ${USD_TOTAL} at/below-low (${DBW_LOW_USD}) — exhaustion latch SET (fail-closed toward hop legs)"
-      ACTION="set"
-    else
-      log "$TS LATCH-SET-FAILED balance=USD ${USD_TOTAL} at/below-low — durable latch write failed; no latch (sessions unprotected until 402 markers)"
-      ALERTED=1
-    fi
+    # Healthy: above the warn threshold. No latch action — nothing to clear here
+    # (the CLEAR branch above handles an existing latch) and nothing to set.
+    log "$TS PASS5 balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}) healthy — above warn (${DBW_WARN_USD}), no latch"
+    ACTION="pass"
   fi
 else
   case "$CODE" in
