@@ -3947,6 +3947,26 @@ grep -q "base tree ('main') UNKNOWN" "$TMP/out" && pass "…but the base is UNKN
 grep -q "base tree ('main') GREEN" "$TMP/out" && fail "…the rail STILL printed the GREEN base certificate" \
   || pass "…and no GREEN base certificate was printed"
 
+# (g3) THE COMPLETED COUNT IS EMITTED, NOT INFERRED (#5215 review P2). A check run
+# that is NOT completed but is neither a NAMED in-flight spelling nor a red (the
+# #1353 defensive arm) sits in `total` but in neither `reds` nor `pend`, so the
+# old `total - pending` OVERSTATED how much of the surface was observed. The
+# summary must say "0 completed", not "1" — the mutation `completed = total -
+# pending` is invisible to the rest of the suite without this half.
+new_scen basehealth-completed-count
+HEAD_CC="b5b5000000000000000000000000000000000001"
+printf '%s\n' "$HEAD_CC" > "$SCEN/head"
+lane_pass "$HEAD_CC" 5553 > "$SCEN/runs-$HEAD_CC"
+lane_pass maincc 5554 > "$SCEN/runs-main"
+write_main_checks \
+  "$(check_run 7101 weird '' success 6102)" \
+  "$(check_run 7102 'test (b)' in_progress null 6102)"
+main_run_map 6102 push 'Python CI'
+pr_green_surface
+run_admin 42 --dry-run >/dev/null 2>&1
+grep -q "the 0 completed check(s)" "$TMP/out" && pass "…and the COMPLETED count is emitted, not inferred as total-pending (#5215 review)" \
+  || fail "the completed count is inferred: $(grep -m1 'base tree' "$TMP/out")"
+
 # (h) AN EMPTY TREE SURFACE IS UNMEASURED — stated, never silently green. Right
 # after a push the tree's checks have not started, so refusing here would block
 # the common case; the lane-scoped half of "I did not look" is step 2b.
@@ -4068,6 +4088,15 @@ if [ -n "$attr_src" ]; then
   out4="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-main" python-ci.yml main 0)"
   grep -q "SKIPPED" <<<"$out4" && pass "unit: an out-of-lane red SKIPS the split (no false attribution)" || fail "unit: the lane split was rendered for a red it does not explain"
   grep -q "INHERITED FROM THE BASE" <<<"$out4" && fail "unit: an out-of-lane red still got an INHERITED verdict" || pass "unit: no INHERITED verdict when out of scope"
+  # SEMANTIC EMPTINESS (#5215 review P2): a whitespace-only file is `-s` TRUE, so
+  # a byte test would fall through and let `grep -vxF` of an empty pattern set
+  # label every lane id NEW — "absence is not novelty" inverted.
+  printf '\n' > "$TMP/attr-blank"
+  outb="$(report_tree_attribution "$TMP/attr-pr" "$TMP/attr-blank" python-ci.yml main 1)"
+  grep -q "UNATTRIBUTABLE" <<<"$outb" && pass "unit: a whitespace-only base set is UNATTRIBUTABLE" || fail "unit: a whitespace-only base set was read as novelty"
+  grep -q "NEW TO THIS PR" <<<"$outb" && fail "unit: a whitespace-only base set produced a NEW list" || pass "unit: no NEW list for a whitespace-only base set"
+  outc="$(report_tree_attribution "$TMP/attr-blank" "$TMP/attr-main" python-ci.yml main 1)"
+  grep -q "This attribution is UNKNOWN" <<<"$outc" && pass "unit: a whitespace-only lane set is UNKNOWN, not 'nothing new'" || fail "unit: a whitespace-only lane set was not UNKNOWN"
   unset -f say_err
 else
   fail "report_tree_attribution is missing from the rail — the attribution block was reverted"

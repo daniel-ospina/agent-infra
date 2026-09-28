@@ -1723,6 +1723,11 @@ check_surface_probe() {
   MAIN_HEALTH_RED=0
   MAIN_HEALTH_RED_OTHER=0
   MAIN_HEALTH_PENDING=0
+  # The GATED run identity of every blocking red (newline list) — the run ids that
+  # survived the legacy-commit-status clear below. Emitted so the step-4.5 scope
+  # gate re-uses THIS identity instead of regexing the display string, which still
+  # carries an untrusted status `target_url` (#5215 review P2).
+  MAIN_HEALTH_RED_RUNS=""
   # The number of checks the surface has actually SEEN complete (check runs with
   # status `completed`, plus legacy statuses that are not `pending`). NOT
   # `TOTAL - PENDING` — see the COMPLETED COUNT note at the COUNTS emission.
@@ -2083,6 +2088,13 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), comp
           fi
         fi
         [ -n "$wf" ] || wf="(workflow unresolved)"
+        # THE GATED RUN IDENTITY (#5215 review P2). A legacy commit status is
+        # NEVER run-resolved — its `url` is an app-supplied `target_url`, so the
+        # `[ "$app" = "commit-status" ] && run_id=""` clear above zapped it. That
+        # makes `run_id` the ONLY trustworthy run identity here, so it is recorded
+        # for the step-4.5 scope gate. Re-deriving it from the DISPLAY string
+        # would revive the untrusted status URL.
+        [ -n "$run_id" ] && MAIN_HEALTH_RED_RUNS="${MAIN_HEALTH_RED_RUNS}${MAIN_HEALTH_RED_RUNS:+$'\n'}${run_id}"
         # WHICH NON-CODE EVENTS ARE EXEMPT, AND ON WHICH SURFACE (#1353).
         # `schedule`/`issues`/`issue_comment` measure no revision, so on the BASE
         # such a red is REPORTED and does not block — otherwise a repo whose cron
@@ -2510,7 +2522,7 @@ report_tree_attribution() {
     say_err "   FAILURE ATTRIBUTION — SKIPPED: none of the red check(s) above is one of lane"
     say_err "   '$lane''s failing runs, so the lane's measured failures do NOT attribute them."
     say_err "   The lane's own failing nodeids (context only — NOT the red checks above):"
-    if [ -s "$pr_fails" ]; then
+    if grep -q '[^[:space:]]' "$pr_fails" 2>/dev/null; then
       while IFS= read -r one; do
         [ -n "$one" ] && say_err "        $one"
       done < "$pr_fails"
@@ -2520,12 +2532,15 @@ report_tree_attribution() {
     return 0
   fi
   say_err "   FAILURE ATTRIBUTION — the lane's measured failures, split by whether the base also fails them (lane '$lane'):"
-  if [ ! -s "$pr_fails" ]; then
+  # SEMANTIC emptiness, not byte size (#5215 review P2): a whitespace-only file is
+  # -s TRUE, so a byte test would fall through and let `grep -vxF` of an empty
+  # pattern set label every lane id NEW — "absence is not novelty" inverted.
+  if ! grep -q '[^[:space:]]' "$pr_fails" 2>/dev/null; then
     say_err "     (the lane yielded NO failing nodeid for this head, so its failures could not be split."
     say_err "      This attribution is UNKNOWN, not 'nothing new'.)"
     return 0
   fi
-  if [ ! -s "$main_fails" ]; then
+  if ! grep -q '[^[:space:]]' "$main_fails" 2>/dev/null; then
     # THE SAME RULE `attribute_residual` APPLIES, one level up: a FAILURE-ONLY
     # base set cannot tell "green on the base" from "never measured on the base",
     # so an EMPTY base set is NOT evidence of novelty. Calling every head failure
@@ -3420,12 +3435,15 @@ main() {
   # PROCEEDS on UNMEASURED (a surface with no checks certifies nothing, but is
   # not a refusal — same rule as before) and REFUSES on UNREADABLE (failing to
   # look is never a green).
-  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH
+  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH TREE_RED_RUNS
   check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0
   TREE_STATUS="$MAIN_HEALTH_STATUS"; TREE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   TREE_REDS="$MAIN_HEALTH_REDS"; TREE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
   TREE_TOTAL="$MAIN_HEALTH_TOTAL"; TREE_RED="$MAIN_HEALTH_RED"; TREE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   TREE_PENDING="$MAIN_HEALTH_PENDING"; TREE_REF="$MAIN_HEALTH_REF"; TREE_SHA="$MAIN_HEALTH_SHA"
+  # The GATED run identity of the blocking reds (see MAIN_HEALTH_RED_RUNS): used
+  # by the step-4.5 scope gate, so that gate never re-parses a display string.
+  TREE_RED_RUNS="$MAIN_HEALTH_RED_RUNS"
   # The PR surface's own production time — the anchor step 4.6 compares a base
   # red against. Empty means the surface has produced no completed check at all.
   TREE_MAX_COMPLETED="$MAIN_HEALTH_MAX_COMPLETED"
@@ -3464,15 +3482,16 @@ main() {
       # costs no new gh call. It is REPORTING ONLY — the `exit 1` below is
       # unchanged, so a PR-caused failure still blocks exactly as hard as before.
       #
-      # THE SCOPE GATE (#5215 review P1): step 4.5 can refuse on a red from ANY
+      # THE SCOPE GATE (#5215 review P1/P2): step 4.5 can refuse on a red from ANY
       # workflow, but the split is built from the WATCHED LANE's runs. Render it
       # only when at least one red check's run IS one of the lane's failing runs
       # (the provenance list); otherwise the lane's nodeids explain nothing about
-      # the red above and `report_tree_attribution` SKIPS the verdict. That
-      # membership test is the cheapest correct one: the reds' run ids are in
-      # their own display URLs, the lane's are in `pr-runs.txt`.
+      # the red above and `report_tree_attribution` SKIPS the verdict. The reds'
+      # identities come from `$TREE_RED_RUNS` — the run ids the probe already
+      # GATED (a legacy commit status's `target_url` is not one), never a regex
+      # over the display string.
       local tri="" lri="" one_rid attr_applies=0
-      tri="$(printf '%s\n' "$TREE_REDS" | sed -n 's#.*/runs/\([0-9][0-9]*\).*#\1#p')"
+      tri="$TREE_RED_RUNS"
       lri="$(sed -n 's/^.*://p' "$TMP/pr-runs.txt" 2>/dev/null || true)"
       while IFS= read -r one_rid; do
         [ -n "$one_rid" ] || continue
