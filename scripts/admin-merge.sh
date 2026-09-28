@@ -348,6 +348,10 @@
 #                        the raw listing past those runs (doubling, bounded by 200)
 #                        while a window has yielded no executed shard at all, and
 #                        stops once N runs that FINISHED a measurement are consulted.
+#                        So N bounds the MEASUREMENT window, not the call budget: on
+#                        that widening path the gate reads at most 200 lane runs per
+#                        side (one Jobs-API call each), and the posted evidence says
+#                        when the reference came from a wider window than N.
 #   --workflow <f>       the TEST lane both sides are read from (default
 #                        `python-ci.yml`). NOT cosmetic: an unfiltered main
 #                        window is dominated by cron/watchdog lanes and can
@@ -1257,10 +1261,10 @@ for n in sorted(names):
 # The two run-state predicates the pairing below turns on. They are DIFFERENT
 # questions and the gate needs both (#4844):
 #
-#   lane_run_consultable — can this run's JOB LIST be read at all? Only a
-#     `completed` run has a settled list. This one decides whether the run's
-#     shards may enter the reference, and whether an unaddressable line is
-#     fatal; it is the OLD `status = completed` test, unchanged.
+#   lane_run_in_flight — is this run still RUNNING? Only a NAMED in-flight
+#     spelling counts (see the allow-list note below). An in-flight run has no
+#     settled job list, so it contributes no shard and cannot spend the window —
+#     there are no shards yet to miss.
 #
 #   lane_run_measured — did this run FINISH a measurement? A `completed` run may
 #     still be `cancelled`, `skipped`, `stale`, `neutral` or `startup_failure`;
@@ -1273,7 +1277,18 @@ for n in sorted(names):
 # consulted (it may have executed shards before it was cancelled, and dropping
 # those would SHRINK the reference — the #1319 fail-open), but it does not spend
 # the window.
-lane_run_consultable() { [ "$1" = "completed" ]; }
+#
+# A NON-FINISHED RUN IS TRUSTED TO BE IN FLIGHT ONLY FOR A NAMED SPELLING. The
+# polarity is an ALLOW-list, the same one the check-run surface uses (#1353: as a
+# deny-list, a spelling the rail had never seen read as non-red there). "Not a
+# known in-flight status" is NOT evidence that nothing settled: if the run HAD
+# finished, its shards belong in the reference, and skipping it would SHRINK it.
+# An unknown status is therefore CONSULTED when its line addresses a run id, and
+# REFUSED when it does not — never silently skipped.
+IN_FLIGHT_RUN_STATUS=" queued in_progress waiting requested pending "
+lane_run_in_flight() {
+  case "$IN_FLIGHT_RUN_STATUS" in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
 lane_run_measured() {
   [ "$1" = "completed" ] || return 1
   case "$2" in success|failure|timed_out) return 0 ;; *) return 1 ;; esac
@@ -1307,13 +1322,15 @@ lane_run_measured() {
 #     is exhausted, or the bound is reached. The ordinary path is unchanged —
 #     widening happens only where the old code refused.
 #
-# The Jobs-API cost still tracks the operator's window: at most $limit MEASURING
-# runs are needed per side, so widening stops as soon as that many are consulted
-# even when none of them carries a shard. A window full of cancelled runs does
-# read more job lists — that IS the fix, since each such read is the only way to
-# learn a terminal run measured nothing. The LANE_SET_* globals report what the
-# window actually held, so a refusal can name the condition it found rather than
-# a neighbouring one.
+# The Jobs-API cost does NOT track the operator's window on the widening path,
+# and that is a deliberate trade. `--main-runs` bounds the MEASUREMENT window (at
+# most $limit runs that FINISHED a measurement are spent per side); the call
+# budget is $MAIN_RUNS_MAX per side, because every CONSULTED run costs one
+# job-list read and a burst of terminal-but-unmeasured runs can leave a long run
+# of them ahead of the first measurement. Reading each one is the only way to
+# learn that a terminal run measured nothing — refusing instead is the bug this
+# fixes (#4844). The LANE_SET_* globals report what the window actually held, so
+# a refusal can name the condition it found rather than a neighbouring one.
 lane_shard_set() {
   local flag="$1" value="$2" limit="$3" out="$4"
   local listing="$TMP/lane-runs.tmp" shards="$TMP/lane-shards.tmp"
@@ -1349,17 +1366,17 @@ lane_shard_set() {
       parsed=$((parsed + 1))
       id="${id##*:}"
       if [ -z "$id" ]; then
-        if lane_run_consultable "$status"; then
-          say_err "admin-merge: ✗ unparsable lane-run listing line ('${status}') for $flag $value — a COMPLETED run's line does not address a run id, so its shard list cannot be read; lane coverage unverifiable"
-          return 1
+        if lane_run_in_flight "$status"; then
+          nonmeas=$((nonmeas + 1))
+          continue
         fi
-        nonmeas=$((nonmeas + 1))
-        continue
+        say_err "admin-merge: ✗ unparsable lane-run listing line ('${status}') for $flag $value — '${status}' is not a named in-flight status and the line addresses no run id, so the run's shard list cannot be read; lane coverage unverifiable"
+        return 1
       fi
-      if ! lane_run_consultable "$status"; then
-        # No settled job list: it cannot contribute a shard and cannot spend the
-        # window. Counted so the refusal can say how much of the window was
-        # in flight rather than implying the lane was empty.
+      if lane_run_in_flight "$status"; then
+        # In flight: no settled job list to read, so it can contribute no shard
+        # and cannot spend the window. Counted so the refusal can say how much of
+        # the window was mid-run rather than implying the lane was empty.
         nonmeas=$((nonmeas + 1))
         continue
       fi
@@ -1379,7 +1396,13 @@ lane_shard_set() {
       say_err "admin-merge: ✗ the lane-run listing for $flag $value did not parse in full ($parsed of $listed lines) — lane coverage unverifiable"
       return 1
     fi
-    LANE_SET_LISTED="$listed"; LANE_SET_WINDOW="$raw"
+    LANE_SET_LISTED="$listed"
+    # The window the gate ACTUALLY read: a listing SHORTER than the request (the
+    # branch has fewer runs than N) must not be reported as the requested width —
+    # this number is what the operator audits and what the widening disclosure is
+    # decided on.
+    LANE_SET_WINDOW="$raw"
+    [ "$listed" -lt "$raw" ] && LANE_SET_WINDOW="$listed"
     LANE_SET_CONSULTED="$consulted_n"; LANE_SET_MEASURED="$measured"
     LANE_SET_NONMEASURING="$nonmeas"
     # Widen ONLY while the window has produced no executed shard AT ALL: an empty
@@ -1436,11 +1459,11 @@ lane_has_test_shard() {
 #                        an unobserved reference certifies nothing, and an empty
 #                        set means EVERY shard is missing — never "no difference".
 LANE_PARITY_REASON=""
-# The raw window MAIN's reference was actually drawn from (#4844). Set by
+# The window MAIN's reference was actually drawn from (#4844). Set by
 # lane_parity_check so the evidence can DISCLOSE a widened reference rather than
-# let `--main-runs` describe a window the gate did not read. Read with a `:-0`
-# default: the early refusals below (no TMP dir, a side that could not be listed)
-# return before it is set, and the evidence is not printed on those paths.
+# let `--main-runs` describe a window the gate did not read. The reader defaults
+# it (`:-0`); it is set on every path that reaches the evidence, which lies behind
+# a rc==0 parity result.
 lane_parity_check() {
   local head="$1" main_runs="$2" rc=0
   LANE_PARITY_REASON=""
@@ -1471,12 +1494,12 @@ lane_parity_check() {
   if [ "$(lane_count "$TMP/lane-main.txt")" -eq 0 ]; then
     # #4844 — NAME THE CONDITION, NOT A NEIGHBOURING ONE. "no EXECUTED test shard
     # matching 'test*'" reads like a COVERAGE gap in the PR and sends the reader
-    # after ADMIN_MERGE_LANE_JOB_PREFIX, when the live cause is that the reference
-    # window yielded no EXECUTED JOB — either a completed run whose job list is
-    # unreadable (purged, zero-job, not yet served) or a job list whose names are
-    # not in the family. A lane that never TESTED main does not reach here at all:
-    # step 2b blocks it first, which is why this branch does not offer "retry once
-    # main's lane settles".
+    # after ADMIN_MERGE_LANE_JOB_PREFIX, when what is missing is the REFERENCE: no
+    # completed run in the window EXECUTED a job, either because its job list is
+    # unreadable (purged, zero-job, not yet served) or because every job it lists
+    # was skipped or cancelled. A lane that never TESTED main does not reach here
+    # at all: step 2b blocks it first, which is why this branch does not offer
+    # "retry once main's lane settles".
     # LANE_SET_JOBS is PREFIX-AGNOSTIC, so "no job list was readable at all" and
     # "job lists that do not match the family" are separable, and they have
     # different remedies: a stale/empty reference is a window or lane-selection
@@ -1484,7 +1507,7 @@ lane_parity_check() {
     # read is STATED either way, because "widened past --main-runs" is a fact the
     # operator must be able to audit.
     if [ "$main_jobs" -eq 0 ]; then
-      LANE_PARITY_REASON="main's lane window yielded NO executed job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished. The completed runs it did hold carry no executable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo). The REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' was never reached, so this is NOT a coverage gap in this PR"
+      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or every job they list was skipped or cancelled. Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
     else
       LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX"
     fi
@@ -3733,7 +3756,7 @@ $attribution_line"
   # #1319 adds the third: the two sides must also have run the SAME LANE, which
   # is what the parity line reports.
   if [ "$pr_count" -eq 0 ] && [ "$main_count" -eq 0 ]; then
-    local parity_rc=0 parity_note parity_evidence
+    local parity_rc=0 parity_note parity_evidence parity_window_note=""
     lane_parity_check "$head" "$MAIN_RUNS" || parity_rc=$?
     if [ "$parity_rc" -eq 0 ]; then
       parity_note="it certifies ONLY because LANE PARITY holds: the PR executed every test shard main's lane executed (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main). A shard main ran that this head skipped would have made this a REFUSAL (NOT COMPARABLE)."
@@ -3741,8 +3764,15 @@ $attribution_line"
       # DISCLOSE a widened reference (#4844). A reference drawn from further back
       # than the operator asked for is a different window, and the evidence must
       # say so rather than let `--main-runs` describe a window it did not read.
+      # ⛔ Its OWN line, appended AFTER the literal block below — never on the
+      # `lane parity:` line, for two independent reasons: the evidence gate
+      # (`verify-admin-merge-evidence.sh`) matches that line to its END, and the
+      # contract suite pins the producer's emission of it VERBATIM. A suffix there
+      # makes the certificate unmatchable, so the rail has its own merge refused
+      # and retracts its own evidence (the #1388 producer/gate drift — caught on
+      # this very change by that pin, after review).
       if [ "${LANE_PARITY_MAIN_WINDOW:-0}" -gt "$MAIN_RUNS" ]; then
-        parity_evidence="${parity_evidence}; main's reference was widened past non-measuring runs to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested window yielded no executed shard"
+        parity_window_note="   reference window: main's lane reference was widened past non-measuring runs to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested window yielded no executed shard"
       fi
     elif [ "$parity_rc" -eq 2 ]; then
       parity_note="lane parity was NOT ESTABLISHED: ${LANE_PARITY_REASON}."
@@ -3807,6 +3837,13 @@ $attribution_line"
    main check surface: $BASE_STATUS — $BASE_RED failing of $BASE_TOTAL measured, $BASE_PENDING pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: $TREE_STATUS — $TREE_RED failing of $TREE_TOTAL measured, $TREE_PENDING pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
    Correct when the lane is green on both sides — but ONLY when both sides ran the SAME lane. The per-side counters tell 'green' from 'never run'; the parity line tells 'the same lane' from 'two different lanes'. A wrong lane selector certifies neither."
+    # The widening disclosure is appended HERE, after the literal: the `lane
+    # parity:` line above must stay byte-identical to what the gate and the
+    # contract suite pin (#4844, #1388).
+    if [ -n "$parity_window_note" ]; then
+      analyzed="${analyzed}
+${parity_window_note}"
+    fi
     info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lane: $lane); lane parity: $parity_evidence; PR tree: $TREE_STATUS ($TREE_RED failing of $TREE_TOTAL measured); main check surface: $BASE_STATUS ($BASE_RED failing of $BASE_TOTAL measured, context only)"
   fi
 

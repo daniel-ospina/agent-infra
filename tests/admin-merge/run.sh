@@ -4771,9 +4771,31 @@ grep -q "unparsable lane-run listing line" "$SCEN/err" && pass "…named as an U
 # #4844: the guard is POLARITY-AWARE. This line is `completed`, so its missing id
 # WOULD have hidden shards — that half must keep refusing, and must SAY so, or a
 # future reader reads the skip (r4) as a hole in this guard.
-grep -q "a COMPLETED run's line does not address a run id" "$SCEN/err" \
-  && pass "…and the polarity is named: an unaddressable COMPLETED line is the one that refuses" \
-  || fail "the refusal does not say that the unaddressable line was COMPLETED (the half that must refuse)"
+grep -q "not a named in-flight status" "$SCEN/err" \
+  && pass "…and the polarity is named: an unaddressable line that is NOT a named in-flight status is the one that refuses" \
+  || fail "the refusal does not name the polarity (only a named in-flight spelling may be skipped)"
+
+# (n2) THE SKIP IS AN ALLOW-LIST, NOT A DENY-LIST. Only a NAMED in-flight status
+# may be skipped: a spelling this rail has never seen is not evidence that nothing
+# settled — if that run HAD finished, its shards belong in the reference, and
+# skipping it would shrink it. The refusal must survive an unrecognised status,
+# or the id guard becomes a hole the moment GitHub renames a state (#1353: a
+# deny-list read an unseen spelling as non-red).
+new_scen vacuousunknownstatus
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9221 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainz000 9222
+  printf 'frobnicated\t-\t\n'
+} > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unaddressable run with an UNRECOGNISED status BLOCKS (exit $rc) — the skip is an allow-list" \
+  || fail "expected a non-zero exit, got 0 — an unknown status was skipped, so an unseen spelling could shrink the reference (fail-open)"
+grep -q "not a named in-flight status" "$SCEN/err" && pass "…naming why that line cannot be skipped" \
+  || fail "the refusal does not name the in-flight allow-list"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge ran although an unaddressable line could not be classified" \
+  || pass "…and no merge is attempted"
 
 # (o) THE FAMILY MUST MEASURE SOMETHING (#1319 cycle-2 P1). The prefix is a family
 # SELECTOR; `ADMIN_MERGE_LANE_JOB_PREFIX=changes` matches the workflow's
@@ -4875,6 +4897,17 @@ grep -q -- "--limit 3" "$SCEN/calls" && grep -q -- "--limit 6" "$SCEN/calls" \
 grep -q "widened past non-measuring runs" "$SCEN/comment" \
   && pass "…and the POSTED evidence DISCLOSES the widened window, so --main-runs describes what was READ" \
   || fail "the evidence does not disclose that the reference came from a wider window than requested"
+# …and the disclosure must not cost the CERTIFICATE. The evidence gate
+# (verify-admin-merge-evidence.sh, run by the gh shim on `pr merge --admin`)
+# matches the `lane parity:` line to its END, so a disclosure appended there makes
+# the whole comment unmatchable: the rail would post valid evidence, have its own
+# merge refused, and retract it. A producer change the gate refuses while every
+# suite stays green is the #1388 drift class, so assert it with the REAL verifier.
+if bash "$ROOT/scripts/verify-admin-merge-evidence.sh" --body-file "$SCEN/comment" --head "$HEAD_VP" >/dev/null 2>&1; then
+  pass "…and the widened body is STILL a certifying certificate (the evidence verifier accepts it)"
+else
+  fail "the widened-reference disclosure makes the posted evidence unmatchable — the rail would refuse its own merge and retract its own certificate"
+fi
 
 # (r2) A SHARD MAIN EXECUTED ONLY IN THE WIDENED WINDOW IS STILL A REFERENCE.
 # Widening must make the gate STRICTER, never weaker: the reference grows, so a
@@ -4924,14 +4957,15 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — an empty reference was certified"
 grep -q -- "--limit 200" "$SCEN/calls" && pass "…and the widening STOPPED at the policy bound (--limit 200)" \
   || fail "the widening did not reach the documented bound: $(grep -o -- '--limit [0-9]*' "$SCEN/calls" | sort -u | tr '\n' ' ')"
-grep -q "yielded NO executed job" "$SCEN/err" && pass "…refusing with the STALE-reference reason, not a parse error" \
+grep -q "yielded NO EXECUTED job" "$SCEN/err" && pass "…refusing with the STALE-reference reason, not a parse error" \
   || fail "the bounded refusal does not name the empty reference: $(head -3 "$SCEN/err")"
 
 # (r4) THE ID GUARD IS POLARITY-AWARE. A listing line that does not address a run
 # used to fail the WHOLE side. For a run that has not finished there is no SETTLED
 # job list to read, so its missing id cannot hide coverage — refusing on it blocked
 # every merge for a reason unrelated to the PR. An unaddressable run whose status
-# IS `completed` (which WOULD have shards) still refuses; that half is pinned by (n).
+# IS not a NAMED IN-FLIGHT status still refuses (that half is pinned by (n)); the
+# skip is an ALLOW-list (#1353 polarity), never a deny-list.
 new_scen vacuousnonmeasid
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9111 > "$SCEN/runs-$HEAD_VP"
@@ -4952,7 +4986,9 @@ grep -q "pr merge" "$SCEN/calls" && pass "…so the merge proceeds on the refere
 # empty (purged, zero-job, or no longer served) yield no shard — and the old
 # message read as a COVERAGE gap in the PR, pointing the operator at
 # ADMIN_MERGE_LANE_JOB_PREFIX. The refusal must say which side is missing and
-# that the PR is not the subject.
+# that the PR is not the subject. `--main-runs 5` against a 2-run branch ALSO
+# pins the window the refusal states: the runs the gate could READ (2), never the
+# width it asked for (5), because that number is what the operator audits.
 new_scen vacuousstale
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9121 > "$SCEN/runs-$HEAD_VP"
@@ -4960,13 +4996,16 @@ lane_pass mainstale 9122 > "$SCEN/runs-main"
 lane_pass mainstale 9123 >> "$SCEN/runs-main"
 lane_jobs 9122
 lane_jobs 9123
-run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+run_admin_here 42 --main-runs 5 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a completed reference carrying NO job at all still refuses (exit $rc) — fail-closed" \
   || fail "expected a non-zero exit, got 0 — an empty reference was certified"
-grep -q "over a 2-run window" "$SCEN/err" && pass "…and the refusal STATES the window it read" \
-  || fail "the refusal does not state the window actually read"
-grep -q "yielded NO executed job" "$SCEN/err" && pass "…naming the condition as an empty reference" \
+grep -q "over a 2-run window" "$SCEN/err" && pass "…and the refusal STATES the window it READ (2 runs), not the 5 it asked for" \
+  || fail "the refusal does not state the window actually read: $(grep -o 'over a [0-9]*-run window' "$SCEN/err")"
+grep -q "widened past non-measuring runs" "$SCEN/err" \
+  && fail "the evidence claims a WIDENED reference although no run beyond the 2 that exist was needed" \
+  || pass "…and a short branch is NOT reported as a widened reference"
+grep -q "yielded NO EXECUTED job" "$SCEN/err" && pass "…naming the condition as an empty reference" \
   || fail "the refusal does not distinguish a stale reference from a non-matching family"
 grep -q "NOT a coverage gap in this PR" "$SCEN/err" \
   && pass "…and says explicitly that the PR is not what is missing" \
@@ -5029,7 +5068,7 @@ grep -q "NONE is named 'test\*'" "$SCEN/err" \
 grep -q "executed 2 distinct job name(s)" "$SCEN/err" \
   && pass "…counting every pass's jobs DISTINCTLY (pass 1's two names + the widened run's repeat = 2)" \
   || fail "the executed-job count is not a distinct union over all passes: got '$(grep -o 'executed [0-9]* distinct' "$SCEN/err" | head -1)'"
-grep -q "yielded NO executed job" "$SCEN/err" \
+grep -q "yielded NO EXECUTED job" "$SCEN/err" \
   && fail "the reference diagnosis must not claim no job executed when one did" || pass "…and never claims the window had no executable job list"
 
 # The parity key exists ONCE, in `lane_parity_check`, and it is not a second
