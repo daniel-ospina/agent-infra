@@ -29,7 +29,15 @@
 // A guard that logs the value it removed — to stderr, to a debug file, to a durable record, or in
 // its own error handling — has MOVED the leak, not closed it, and has done so with the authority
 // of a security control. Therefore, by construction:
-//   • no code path receives a secret value for any purpose other than exact-match replacement;
+//   • no code path WRITES a secret value to a sink (stderr, a debug file, the durable record, the
+//     fleet log, the pane notice, the in-band marker, or the transcript). Raw values exist transiently
+//     for exactly two purposes: (a) the exact-match replacement, and (b) the source-5 harvest, which
+//     receives a candidate `KEY=value` line and tests its KEY against the secret-name rule and its
+//     VALUE against the length/reference rules before retaining it. Neither purpose emits a value, and
+//     neither logs one — the harvest stores the value only in the in-memory registry it needs for
+//     later redaction. (An earlier draft claimed "no code path receives a secret value for any purpose
+//     other than exact-match replacement"; that was literally false — the harvest receives it — and it
+//     conflated "not written" with "not received".)
 //   • the durable record and the fleet log carry LABELS and COUNTS only (`env:DEEPSEEK_API_KEY`,
 //     `tortoise-config.json#apiKey`) plus the tool/session identity fields, ALL of which are run
 //     through the redactor before they are written — never a raw value. (Identity fields such as
@@ -74,6 +82,17 @@
 // `details` getter therefore leaves the WHOLE `details` unredacted; `content` is still redacted, the
 // durable record carries `detailsRedactionFailed`/`detailsWalkBounded`, and the pane warns. This is the
 // documented residual of fail-open-on-the-turn, not a silent one.
+//
+// ACCESSOR PROPERTIES (unstable reads). An own ENUMERABLE accessor (a getter) is a LIVE read: it can
+// return a clean value to the guard and a registered secret to the transcript serializer afterwards.
+// A node carrying one is therefore marked dirty by pass 1 (alongside the value/key checks), so pass 2
+// REBUILDS it and each getter is replaced by the data property captured at rebuild time. This closed a
+// real hole: a node that read clean in pass 1 was memoized `clean` and returned BY REFERENCE, so a
+// getter that returned a secret only on the serializer's later read passed through with NO patch, NO
+// `bounded`/failure flag and NO record. The identical rule is applied to every `content` part (and to
+// the `content` array itself): a part/array with an own enumerable accessor is rebuilt from a single
+// read rather than returned by reference. `toJSON`/private-field encodings are NOT covered (they
+// materialize only at serialization); see the NOT COVERED list.
 //
 // SCOPE — WHAT IT DOES AND DOES NOT PROTECT (honest statement)
 // -----------------------------------------------------------
@@ -142,6 +161,20 @@
 //
 // NOT COVERED (stated rather than papered over):
 //   • the length floor: values SHORTER than `MIN_SECRET_LENGTH` (see its doc comment);
+//   • ACCESSOR PROPERTIES / UNSTABLE READS — the fix's stated limits. An own ENUMERABLE accessor is
+//     neutralized (see the ACCESSOR PROPERTIES section), but (i) a NON-enumerable accessor is not an
+//     own enumerable key, so it is neither copied by the rebuild nor serialized by the transcript — not
+//     a leak, but also not read by the guard; (ii) a PROTOTYPE accessor is not an own key of the
+//     serialized object either; (iii) an accessor BEYOND the walk's depth/node/wall-clock bound is
+//     inspected only within the bound (which is recorded and announced, never silent); (iv) a
+//     `toJSON`/private-field encoding still materializes only at serialization time, after the guard's
+//     last read, and is not redacted; and (v) a PROXY (or other hostile object) whose `get` trap
+//     returns a different value on each read while its `getOwnPropertyDescriptor` trap reports a
+//     stable DATA property is indistinguishable from a stable object to a descriptor check, and
+//     rebuilding every object would break the byte-identical no-op guarantee — so a live read that a
+//     hostile object HIDES from `getOwnPropertyDescriptor` is out of scope. A value whose instability
+//     is observable ONLY after the guard has read it (via `toJSON`, or a hidden live read) is
+//     therefore out of scope; `toJSON` is pinned by a test so it cannot drift silently;
 //   • CRAFTED / NON-STRING SHAPES inside `content` (verified: all leave no patch, i.e. persist as
 //     the tool produced them). Redaction is an EXACT-MATCH replacement over primitive strings, so a
 //     `text` that is a BOXED `String` object (`typeof !== "string"`, and `JSON.stringify` emits the
@@ -236,7 +269,11 @@ export const MAX_DETAILS_NODES = 1_000_000;
  * that finishes inside the node budget under this deadline is fully redacted, and only a genuinely
  * pathological `details` trips it. Checked every `DETAILS_BUDGET_CHECK_INTERVAL` nodes so `Date.now()`
  * is not called per node. Hitting it sets `bounded`, which is RECORDED and announced on every
- * bounded result — not just the first of a session.
+ * bounded result — not just the first of a session. (The PANE announcement is deliberately PER-RESULT,
+ * not rate-limited: a bounded walk is a per-result fact and its durable record is per-result, so a
+ * tool that routinely exceeds the bound will produce one notice per result. That noise is the accepted
+ * cost of a security control that must never present an incomplete walk as a complete one; the
+ * once-per-session latch applies to the SUCCESS summary only — see `announced`.)
  */
 export const MAX_DETAILS_WALK_MS = 2_000;
 const DETAILS_BUDGET_CHECK_INTERVAL = 1_024;
@@ -713,17 +750,22 @@ export function redactContent(
 		// Proxy) must not stop the OTHER parts from being redacted — otherwise one bad part made the
 		// whole content walk throw and a registered secret in a SIBLING part was persisted verbatim.
 		try {
-			if (
-				part !== null &&
-				typeof part === "object" &&
-				(part as { type?: unknown }).type === "text" &&
-				typeof (part as { text?: unknown }).text === "string"
-			) {
-				const original = (part as { text: string }).text;
-				const redacted = redactString(original, values, hits);
-				if (redacted === original) return part;
-				changed = true;
-				return { ...(part as Record<string, unknown>), text: redacted };
+			if (part !== null && typeof part === "object") {
+				// An own accessor on the PART is a live read too (a `text` getter that read clean to the
+				// harvest/redaction and returns a secret at serialization). Detect it first and rebuild the
+				// part from a single read, so the persisted part holds data properties only.
+				const unstable = hasOwnEnumerableAccessor(part);
+				if ((part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
+					const original = (part as { text: string }).text;
+					const redacted = redactString(original, values, hits);
+					if (redacted === original && !unstable) return part;
+					changed = true;
+					return rebuildContentPart(part as Record<string, unknown>, redacted);
+				}
+				if (unstable) {
+					changed = true;
+					return rebuildContentPart(part as Record<string, unknown>, undefined);
+				}
 			}
 		} catch {
 			// Keep the part by reference: the runner would have read it anyway, and dropping content is
@@ -733,7 +775,35 @@ export function redactContent(
 		}
 		return part;
 	});
+	// The content ARRAY itself can carry an own accessor index. `Array.prototype.map` already read each
+	// index exactly ONCE into `parts`, so returning `content` by reference would let the serializer
+	// re-read a live index. When the array is unstable, the already-snapshotted `parts` is what persists.
+	if (hasOwnEnumerableAccessor(content)) changed = true;
 	return { value: changed ? parts : content, changed, incomplete };
+}
+
+/**
+ * Rebuild a `content` part with DATA properties, reading every own enumerable key exactly once. Used
+ * when a part is redacted OR when it carries an own accessor (`unstable`, text = undefined): a part
+ * that keeps a live getter can return a different value to the transcript serializer than the one the
+ * guard inspected. `text` is passed in (when the part is a text part) so the already-performed and
+ * already-redacted read is reused instead of the getter being invoked a second time.
+ */
+function rebuildContentPart(part: Record<string, unknown>, text: string | undefined): Record<string, unknown> {
+	let out: Record<string, unknown>;
+	try {
+		out = Object.create(Object.getPrototypeOf(part)) as Record<string, unknown>;
+	} catch {
+		out = {};
+	}
+	for (const key of Object.keys(part)) {
+		const value = key === "text" && text !== undefined ? text : part[key];
+		Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
+	}
+	if (text !== undefined && !Object.prototype.hasOwnProperty.call(out, "text")) {
+		Object.defineProperty(out, "text", { value: text, enumerable: true, writable: true, configurable: true });
+	}
+	return out;
 }
 
 /**
@@ -810,6 +880,27 @@ function containsRegisteredValue(text: string, values: readonly SecretValue[]): 
 	return false;
 }
 
+/**
+ * Is `key` an OWN accessor property (a getter/setter) on `source`?
+ *
+ * An accessor is a LIVE read: it can return a clean value to the guard and a registered secret to the
+ * transcript serializer milliseconds later. A container that carries one must therefore be REBUILT
+ * (its getters replaced by data properties captured at rebuild time) rather than returned by
+ * reference — otherwise the guard inspects one read and the transcript persists another. This is a
+ * pure descriptor lookup and never invokes the getter itself.
+ */
+function isOwnAccessorProperty(source: object, key: string): boolean {
+	const descriptor = Object.getOwnPropertyDescriptor(source, key);
+	return descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined);
+}
+
+/** Does any OWN ENUMERABLE property of `source` carry a getter/setter? (`Object.keys` = the set the
+ * transcript serializer enumerates, and the set a rebuild copies.) */
+function hasOwnEnumerableAccessor(source: object): boolean {
+	for (const key of Object.keys(source)) if (isOwnAccessorProperty(source, key)) return true;
+	return false;
+}
+
 interface DetailsDirtyState extends DetailsWalkBudget {
 	dirty: WeakSet<object>;
 	clean: WeakSet<object>;
@@ -845,6 +936,9 @@ function markDirtyDetails(node: unknown, values: readonly SecretValue[], state: 
 				complete = false;
 				break;
 			}
+			// An own accessor INDEX is an unstable read exactly like an object getter (see
+			// `isOwnAccessorProperty`): mark the array dirty so pass 2 rebuilds it as data indices.
+			if (isOwnAccessorProperty(node, String(index))) dirty = true;
 			if (markDirtyDetails(node[index], values, state, depth + 1)) dirty = true;
 		}
 	} else {
@@ -854,6 +948,12 @@ function markDirtyDetails(node: unknown, values: readonly SecretValue[], state: 
 				complete = false;
 				break;
 			}
+			// An own ACCESSOR is a live read (see `isOwnAccessorProperty`). Mark the container dirty so
+			// pass 2 rebuilds it and every getter becomes the data property captured at rebuild time.
+			// Without this, a node that read clean in pass 1 was memoized `clean` and returned BY
+			// REFERENCE — so a getter that returned a secret only on the serializer's later read passed
+			// through with no flag, no record and no notice.
+			if (isOwnAccessorProperty(source, key)) dirty = true;
 			// A registered value can sit in a JSON KEY as well as in a value:
 			// `{ "<secret>": { clientSecret: … } }`. Keys cannot be rebuilt in place, so a key match
 			// marks the whole container dirty and pass 2 rebuilds the key too — otherwise the
@@ -1228,7 +1328,11 @@ function sessionInfo(ctx: unknown): { sessionId: string | null; sessionFile: str
 	return { sessionId, sessionFile };
 }
 
-/** Sessions already announced; the redaction is loud but must not spam every tool result. */
+/**
+ * Sessions whose once-per-session redaction SUMMARY has already been announced. This latch gates the
+ * SUCCESS summary ONLY — a BOUNDED or FAILED walk is a per-result fact and is announced on EVERY such
+ * result, deliberately NOT rate-limited (see `MAX_DETAILS_WALK_MS`).
+ */
 const announced = new Set<string>();
 
 function errName(error: unknown): string {
@@ -1429,10 +1533,24 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					values = normalizeSecretValues([...values, ...harvested]);
 				}
 			}
-			// Nothing registered and no harvest/event failure → the remainder would be pure cost on every result.
-			// A FAILED harvest or unreadable event field still proceeds: it may have missed a value, so the
-			// durable record must be written even when there is nothing to redact.
-			if (values.length === 0 && !contentHarvestFailed && !detailsHarvestFailed && !eventReadFailed) return undefined;
+			// Nothing registered and no harvest/event/read failure and no bounded harvest → the remainder
+			// would be pure cost on every result. ALL of these proceed: a FAILED harvest, a FAILED redaction
+			// (or a redaction that could not inspect every part), an unreadable event field, and a BOUNDED
+			// harvest may each have MISSED a value, so the durable record must be written even when there is
+			// nothing to redact. Leaving `contentRedactionFailed`/`detailsRedactionFailed`/
+			// `harvestBudget.bounded` out of this gate was the same asymmetry round 3 closed for
+			// `eventReadFailed`: with an EMPTY registry the failure was announced on stderr but left NO
+			// durable record, so it was undetectable after the fact.
+			if (
+				values.length === 0 &&
+				!contentHarvestFailed &&
+				!detailsHarvestFailed &&
+				!eventReadFailed &&
+				!contentRedactionFailed &&
+				!detailsRedactionFailed &&
+				!harvestBudget.bounded
+			)
+				return undefined;
 
 			const contentHits: HitCounts = new Map();
 			const detailsHits: HitCounts = new Map();
@@ -1563,8 +1681,10 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 				const isFirst = !announced.has(key);
 				if (isFirst) announced.add(key);
 				if (isFirst) {
+					// Keyed on the actual HIT COUNT, not on `changed`: a rebuild that only NEUTRALIZED an
+					// accessor (changed=true, total=0) redacted nothing, and the notice must not claim it did.
 					const summary =
-						content.changed || details.changed
+						record.total > 0
 							? `redacted ${record.total} secret value(s) from a ${String(record.toolName)} result (${labels}). The value(s) are NOT in this session transcript.`
 							: "no secret value was redacted from this result.";
 					const text = `[secret-echo-guard] ${summary}${detailsWalkBounded ? boundedWarning : ""}${anyFailure ? failureWarning : ""}`;

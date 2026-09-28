@@ -1418,25 +1418,22 @@ test("an event-read failure with an EMPTY registry still writes a durable record
 
 console.log("\nRound-3 — the harvest-failure gates and the bare-STRING content harvest");
 test("a CONTENT-harvest failure with an EMPTY registry still writes a durable record", () => {
-	// A part whose `type` throws on the FIRST read (the harvest) and resolves on the SECOND (the
-	// redaction), so ONLY the harvest fails and the redaction walk finds nothing to change. This
+	// A single throw in the CONTENT HARVEST walk with nothing changed. The harvest iterates with
+	// `Symbol.iterator`, so a content array whose ITERATOR throws fails ONLY the harvest while `.map`
+	// (the redaction walk) still succeeds and finds nothing to change. The part is a plain data object
+	// (no own accessor), so the redaction walk does NOT rebuild it and `changed` stays false. This
 	// isolates `contentHarvestFailed` in BOTH the early return and `anyFailure`.
 	resetEverything();
 	try {
 		_setSecretEchoGuardHooksForTest({ homedir: () => join(HOME, "nowhere"), env: () => ({}) });
 		_resetSecretEchoGuardCacheForTest();
-		let typeReads = 0;
-		const flakyPart = Object.create(null) as Record<string, unknown>;
-		Object.defineProperty(flakyPart, "type", {
-			enumerable: true,
-			get() {
-				typeReads++;
-				if (typeReads === 1) throw new Error("first-read-boom");
-				return "text";
+		const content = new Proxy([{ type: "text", text: "ordinary output" }], {
+			get(target, property, receiver) {
+				if (property === Symbol.iterator) throw new Error("iterator-boom");
+				return Reflect.get(target, property, receiver);
 			},
 		});
-		Object.defineProperty(flakyPart, "text", { enumerable: true, get: () => "ordinary output" });
-		const { returned } = runHandler(toolResultEvent({ input: { path: "/repo/app.env" }, content: [flakyPart] }));
+		const { returned } = runHandler(toolResultEvent({ input: { path: "/repo/app.env" }, content }));
 		strictEqual(returned, undefined, "nothing was redacted, so no patch");
 		const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
 		ok(entry, "a content-harvest-only failure must STILL write the durable record");
@@ -1452,20 +1449,25 @@ test("a CONTENT-harvest failure with an EMPTY registry still writes a durable re
 	}
 });
 test("a DETAILS-harvest failure with an EMPTY registry still writes a durable record", () => {
+	// Same shape at the details level: an object whose `ownKeys` trap throws on the FIRST enumeration
+	// (the harvest) and succeeds on the second (the redaction walk). The redaction walk therefore
+	// completes with nothing to change, so `detailsHarvestFailed`/`harvestBudget.bounded` are the ONLY
+	// reason a record is written — the property this test protects.
 	resetEverything();
 	try {
 		_setSecretEchoGuardHooksForTest({ homedir: () => join(HOME, "nowhere"), env: () => ({}) });
 		_resetSecretEchoGuardCacheForTest();
-		let reads = 0;
-		const details: Record<string, unknown> = {};
-		Object.defineProperty(details, "boom", {
-			enumerable: true,
-			get() {
-				reads++;
-				if (reads === 1) throw new Error("first");
-				return "clean";
+		let keyReads = 0;
+		const details = new Proxy(
+			{ clean: "ordinary" } as Record<string, unknown>,
+			{
+				ownKeys(target) {
+					keyReads++;
+					if (keyReads === 1) throw new Error("ownKeys-boom");
+					return Reflect.ownKeys(target);
+				},
 			},
-		});
+		);
 		const { returned } = runHandler(
 			toolResultEvent({ input: { path: "/repo/app.env" }, content: [{ type: "text", text: "clean" }], details }),
 		);
@@ -1536,6 +1538,337 @@ test("R3 (documented residual): a whitespace-inserted or split secret is NOT red
 		hits,
 	);
 	strictEqual(parts.changed, false, "a secret split across two parts is not joined");
+});
+
+// ── Round-4 adversarial review (#5109, PR #1502) ────────────────────────────────────────────
+//
+// ROUND-4 MUTATION LEDGER (each new test below is proven to FAIL without its fix):
+//   • ACCESSOR PROPERTIES (own enumerable getters) — the two-pass `details` rebuild memoized a
+//     CLEAN verdict and returned the node BY REFERENCE, so a getter that read clean in-walk and a
+//     secret at serialization passed through with no patch, no flag and no record. The identical hole
+//     existed for a `content` part's `text` (and for the content ARRAY). Fix: any own enumerable
+//     accessor marks its container dirty (details) / is rebuilt from a single read (content).
+//     Tests R4-A1..A4, plus `redactContent`/`redactDetails` unit pins.
+//   • THE EARLY-RETURN GATE dropped `contentRedactionFailed`, `detailsRedactionFailed` and
+//     `harvestBudget.bounded`: with an EMPTY registry each was announced on stderr (or not at all)
+//     but left NO durable record. Tests R4-B1..B3. NOTE (mutation-verified): dropping
+//     `detailsHarvestFailed` from the gate is SEMANTICS-PRESERVING because the details-harvest catch
+//     sets `harvestBudget.bounded = true` in the same block, so that OR operand is already true —
+//     that mutant survives BY DESIGN and is recorded here rather than papered over.
+//   • THE THREE ROUND-3 MUTATION SURVIVORS:
+//       - `else if (detailsWalkBounded || anyFailure)` → `else if (detailsWalkBounded)` (R4-C1);
+//       - swallowing the content-redaction `catch` (dropping `contentRedactionFailed = true`) (R4-C2);
+//       - dropping `detailsRedactionFailed` from `anyFailure` (degrades the notice wording) (R4-C3).
+//   • `toJSON`/private-field residual pinned so it cannot drift silently (R4-RESIDUAL).
+//   • The per-result bounded/failure announcement has NO latch; the deliberate decision is PER-RESULT
+//     (not rate-limited) and is pinned at the documented 20-results shape (R4-SPAM).
+
+console.log("\nRound-4 — own ACCESSOR properties are live reads and must not escape by reference");
+test("R4-A1: a TOP-LEVEL details getter (clean in-walk, secret at serialization) is neutralized", () => {
+	resetEverything();
+	let reads = 0;
+	const details: Record<string, unknown> = {};
+	Object.defineProperty(details, "payload", {
+		enumerable: true,
+		configurable: true,
+		get() {
+			reads++;
+			return reads >= 3 ? `key=${TORTOISE_KEY}` : "ordinary";
+		},
+	});
+	const event = toolResultEvent({ input: { path: "/repo/app.env" }, content: [{ type: "text", text: "clean" }], details });
+	const { returned } = runHandler(event);
+	const persisted = returned ? (returned as { details: unknown }).details : event.details;
+	const bytes = JSON.stringify(persisted);
+	ok(!bytes.includes(TORTOISE_KEY), `the accessor must be neutralized; got ${bytes}`);
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "the rebuild is recorded (an unstable read was neutralized)");
+	for (const sink of [...appendEntryCalls.map((call) => JSON.stringify(call)), ...appendFileLines, ...notifications.map((note) => note.msg), ...consoleErrors]) {
+		ok(!sink.includes(TORTOISE_KEY), "no sink may carry the value");
+	}
+});
+test("R4-A2: a nested getter inside a DIRTY parent is rebuilt, not returned by reference", () => {
+	resetEverything();
+	let reads = 0;
+	const inner: Record<string, unknown> = {};
+	Object.defineProperty(inner, "x", {
+		enumerable: true,
+		configurable: true,
+		get() {
+			reads++;
+			return reads >= 3 ? `leak=${AUTH_KEY}` : "ordinary";
+		},
+	});
+	const event = toolResultEvent({
+		input: { path: "/repo/app.env" },
+		content: [{ type: "text", text: "clean" }],
+		details: { secret: TORTOISE_KEY, inner },
+	});
+	const { returned } = runHandler(event);
+	const persisted = returned ? (returned as { details: unknown }).details : event.details;
+	const bytes = JSON.stringify(persisted);
+	ok(!bytes.includes(AUTH_KEY), `the nested getter must not survive; got ${bytes}`);
+	ok(returned, "the dirty parent is patched");
+});
+test("R4-A3: a `content` part whose `text` getter is clean in-walk is rebuilt from a single read", () => {
+	resetEverything();
+	let reads = 0;
+	const part: Record<string, unknown> = { type: "text" };
+	Object.defineProperty(part, "text", {
+		enumerable: true,
+		configurable: true,
+		get() {
+			reads++;
+			// The content walk reads `text` THREE times in-walk (the harvest once + the redaction's
+			// `typeof` check and `original` read), so the getter must stay clean through read 3 and only
+			// return the secret on read 4 — the serializer's read. That is exactly the shape the accessor
+			// rebuild neutralizes: without it, the part is returned BY REFERENCE and read 4 leaks.
+			return reads >= 4 ? `k=${TORTOISE_KEY}` : "ordinary";
+		},
+	});
+	const event = toolResultEvent({ input: { path: "/repo/app.env" }, content: [part] });
+	const { returned } = runHandler(event);
+	const persisted = returned ? (returned as { content: unknown }).content : event.content;
+	const bytes = JSON.stringify(persisted);
+	ok(!bytes.includes(TORTOISE_KEY), `the content accessor must be neutralized; got ${bytes}`);
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "the rebuilt content part is recorded");
+	ok(
+		notifications.some((note) => note.msg.includes("no secret value was redacted")),
+		"an accessor-only rebuild must not claim it redacted a value (total=0)",
+	);
+	for (const sink of [...appendEntryCalls.map((call) => JSON.stringify(call)), ...appendFileLines, ...notifications.map((note) => note.msg), ...consoleErrors]) {
+		ok(!sink.includes(TORTOISE_KEY), "no sink may carry the value");
+	}
+});
+test("R4-A4: a harvest-REGISTERED value is not leaked by a later serializer read (nastiest variant)", () => {
+	resetEverything();
+	const fresh = "R4-HARVEST-GETTER-SECRET-0123456789";
+	let reads = 0;
+	const details: Record<string, unknown> = {};
+	Object.defineProperty(details, "payload", {
+		enumerable: true,
+		configurable: true,
+		get() {
+			reads++;
+			// Read 1 is the harvest (registers `fresh`); read 2 is pass 1 (clean, so the old code wrote no
+			// record); read 3 is pass 2 (or, without the fix, the serializer).
+			return reads === 2 ? "ordinary" : `OPENROUTER_API_KEY=${fresh}\n`;
+		},
+	});
+	const event = toolResultEvent({ input: { path: "/repo/app.env" }, content: [{ type: "text", text: "clean" }], details });
+	const { returned } = runHandler(event);
+	const persisted = returned ? (returned as { details: unknown }).details : event.details;
+	const bytes = JSON.stringify(persisted);
+	ok(!bytes.includes(fresh), `the just-registered value must not leak; got ${bytes}`);
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "the rebuild writes an attestation record");
+	for (const sink of [...appendEntryCalls.map((call) => JSON.stringify(call)), ...appendFileLines, ...notifications.map((note) => note.msg), ...consoleErrors]) {
+		ok(!sink.includes(fresh), "no sink may carry the harvested value");
+	}
+});
+test("R4-A5 (unit): `redactDetails` marks an accessor-bearing node dirty and rebuilds it as data", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	const node: Record<string, unknown> = { stable: "ordinary" };
+	Object.defineProperty(node, "live", { enumerable: true, configurable: true, get: () => "ordinary" });
+	const out = redactDetails(node, values, new Map());
+	strictEqual(out.changed, true, "an own accessor forces a rebuild even with no registered value");
+	const rebuilt = out.value as Record<string, unknown>;
+	const descriptor = Object.getOwnPropertyDescriptor(rebuilt, "live");
+	ok(descriptor && descriptor.get === undefined, "the getter is replaced by a DATA property");
+	strictEqual(rebuilt.live, "ordinary");
+});
+test("R4-A6 (unit): `redactContent` rebuilds an accessor-bearing part and the array", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	const part: Record<string, unknown> = { type: "text", text: "ordinary" };
+	Object.defineProperty(part, "extra", { enumerable: true, configurable: true, get: () => "ordinary" });
+	const out = redactContent([part], values, new Map());
+	strictEqual(out.changed, true, "a part with an own accessor is rebuilt");
+	const rebuilt = (out.value as Array<Record<string, unknown>>)[0];
+	const descriptor = Object.getOwnPropertyDescriptor(rebuilt, "extra");
+	ok(descriptor && descriptor.get === undefined, "the getter is replaced by a DATA property");
+	// The content ARRAY itself can carry an own accessor index; `map` snapshots it once and the array
+	// must be returned as that snapshot, not by reference.
+	const arrContent: unknown[] = [{ type: "text", text: "ordinary" }];
+	Object.defineProperty(arrContent, "1", { enumerable: true, configurable: true, get: () => "ordinary" });
+	arrContent.length = 2;
+	const arrOut = redactContent(arrContent, values, new Map());
+	strictEqual(arrOut.changed, true, "an accessor array index in content is snapshotted");
+});
+test("R4-A7 (unit): an accessor ARRAY index in details is rebuilt as a data index", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	const arr: unknown[] = ["ordinary"];
+	Object.defineProperty(arr, "1", { enumerable: true, configurable: true, get: () => "ordinary" });
+	arr.length = 2;
+	const out = redactDetails({ arr }, values, new Map());
+	strictEqual(out.changed, true, "an accessor array index forces a rebuild");
+	const rebuilt = (out.value as { arr: unknown[] }).arr;
+	const descriptor = Object.getOwnPropertyDescriptor(rebuilt, "1");
+	ok(descriptor && descriptor.get === undefined, "the getter is replaced by a DATA index");
+});
+
+console.log("\nRound-4 — a failure/bound with an EMPTY registry must still leave a durable record");
+test("R4-B1: an UNREADABLE `content` with an EMPTY registry still writes a durable record", () => {
+	resetEverything();
+	try {
+		_setSecretEchoGuardHooksForTest({ homedir: () => join(HOME, "nowhere"), env: () => ({}) });
+		_resetSecretEchoGuardCacheForTest();
+		const event = toolResultEvent({ details: { truncation: { content: "clean", truncated: false } } });
+		Object.defineProperty(event, "content", {
+			configurable: true,
+			get() {
+				throw new Error("content-boom");
+			},
+		});
+		const { returned } = runHandler(event);
+		strictEqual(returned, undefined);
+		const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+		ok(entry, "a content-read failure must be recorded even with an empty registry");
+		strictEqual((entry.data as { contentRedactionFailed: boolean }).contentRedactionFailed, true);
+		strictEqual(appendFileLines.length, 1, "the fleet log gets it too");
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+test("R4-B2: an UNREADABLE `details` with an EMPTY registry still writes a durable record", () => {
+	resetEverything();
+	try {
+		_setSecretEchoGuardHooksForTest({ homedir: () => join(HOME, "nowhere"), env: () => ({}) });
+		_resetSecretEchoGuardCacheForTest();
+		const event = toolResultEvent({ content: [{ type: "text", text: "clean" }] });
+		Object.defineProperty(event, "details", {
+			configurable: true,
+			get() {
+				throw new Error("details-boom");
+			},
+		});
+		const { returned } = runHandler(event);
+		strictEqual(returned, undefined);
+		const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+		ok(entry, "a details-read failure must be recorded even with an empty registry");
+		strictEqual((entry.data as { detailsRedactionFailed: boolean }).detailsRedactionFailed, true);
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+test("R4-B3: a BOUNDED source-5 harvest with an EMPTY registry is recorded and announced", () => {
+	resetEverything();
+	try {
+		_setSecretEchoGuardHooksForTest({
+			homedir: () => join(HOME, "nowhere"),
+			env: () => ({}),
+			detailsHarvestLimits: () => ({ maxNodes: 0, maxMs: 60_000 }),
+		});
+		_resetSecretEchoGuardCacheForTest();
+		const { returned } = runHandler(
+			toolResultEvent({
+				input: { path: "/repo/app.env" },
+				content: [{ type: "text", text: "clean" }],
+				details: { truncation: { content: "clean", truncated: false } },
+			}),
+		);
+		strictEqual(returned, undefined);
+		const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+		ok(entry, "a bounded harvest must be recorded even with an empty registry");
+		strictEqual((entry.data as { detailsWalkBounded: boolean }).detailsWalkBounded, true);
+		ok(notifications.some((note) => note.msg.includes("WARNING")), "and announced");
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+
+console.log("\nRound-4 — the three round-3 mutation survivors");
+test("R4-C1: a per-result FAILURE (not bounded) is announced after the summary has fired", () => {
+	resetEverything();
+	const ctx = fakeCtx();
+	runHandler(toolResultEvent({ content: [{ type: "text", text: `k=${TORTOISE_KEY}` }] }), ctx);
+	strictEqual(notifications.length, 1, "the once-per-session summary fires first");
+	const hostilePart = new Proxy(
+		{},
+		{
+			get(_target, property) {
+				if (property === "type") throw new Error("boom-type");
+				return undefined;
+			},
+		},
+	);
+	runHandler(toolResultEvent({ toolCallId: "call-2", content: [hostilePart, { type: "text", text: "clean" }] }), ctx);
+	ok(notifications.length > 1, "a failure-only result must be announced per-result");
+	ok(notifications[notifications.length - 1].msg.includes("FAILED"), "the failure warning must appear");
+});
+test("R4-C2: a THROWING content-redaction walk is recorded and announced (never silent)", () => {
+	resetEverything();
+	const content = new Proxy([{ type: "text", text: "clean" }], {
+		get(target, property, receiver) {
+			if (property === "map") throw new Error("map-boom");
+			return Reflect.get(target, property, receiver);
+		},
+	});
+	const { returned } = runHandler(toolResultEvent({ content }));
+	strictEqual(returned, undefined);
+	const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+	ok(entry, "a throwing content-redaction walk must write a record");
+	strictEqual((entry.data as { contentRedactionFailed: boolean }).contentRedactionFailed, true);
+	ok(consoleErrors.some((line) => line.includes("content redaction failed")), "the failure is announced on stderr");
+});
+test("R4-C3: a details REDACTION failure announces BOTH the bounded and the failure warning", () => {
+	resetEverything();
+	const hostile: Record<string, unknown> = {};
+	Object.defineProperty(hostile, "boom", {
+		enumerable: true,
+		configurable: true,
+		get() {
+			throw new Error("boom");
+		},
+	});
+	runHandler(toolResultEvent({ content: [{ type: "text", text: "clean" }], details: hostile }));
+	const note = notifications.find((entry) => entry.msg.includes("WARNING"));
+	ok(note, "a warning is announced");
+	ok(note!.msg.includes("FAILED"), "the FAILURE warning must accompany the bounded warning");
+});
+
+console.log("\nRound-4 — the pinned residual and the per-result announcement decision");
+test("R4-RESIDUAL: a `toJSON`/private-field encoding is NOT redacted (pinned so it cannot drift)", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	// The walk sees own enumerable DATA properties only; `toJSON` materializes an encoding at
+	// serialization time, AFTER the guard's last read. Documented in the header's NOT COVERED list.
+	const source = { safe: "ordinary", toJSON: () => ({ leaked: `k=${TORTOISE_KEY}` }) };
+	const out = redactDetails(source, values, new Map());
+	strictEqual(out.changed, false, "nothing in the enumerable data properties matched");
+	ok(JSON.stringify(out.value).includes(TORTOISE_KEY), "the documented residual: toJSON materializes at serialization");
+});
+test("R4-RESIDUAL2: a Proxy whose `get` trap changes while it reports a stable data property is NOT neutralized (pinned)", () => {
+	const values = normalizeSecretValues([{ value: TORTOISE_KEY, label: "l" }]);
+	let reads = 0;
+	const proxy = new Proxy(
+		{ live: "ordinary" },
+		{
+			get(target, property, receiver) {
+				if (property === "live") {
+					reads++;
+					return reads >= 2 ? `k=${TORTOISE_KEY}` : "ordinary";
+				}
+				return Reflect.get(target, property, receiver);
+			},
+		},
+	);
+	const out = redactDetails(proxy, values, new Map());
+	strictEqual(out.changed, false, "pass 1 sees a stable data property and returns the proxy by reference");
+	ok(JSON.stringify(out.value).includes(TORTOISE_KEY), "the documented residual: the hidden live read materializes at serialization");
+});
+test("R4-SPAM (documented decision): 20 bounded results announce 20 times — deliberate per-result, not rate-limited", () => {
+	resetEverything();
+	const ctx = fakeCtx();
+	let deep: Record<string, unknown> = { leaf: "ordinary" };
+	for (let i = 0; i < MAX_DETAILS_DEPTH + 5; i++) deep = { next: deep };
+	for (let i = 0; i < 20; i++) {
+		runHandler(toolResultEvent({ toolCallId: `call-${i}`, content: [{ type: "text", text: "clean" }], details: deep }), ctx);
+	}
+	strictEqual(notifications.length, 20, "one notice per bounded result — the documented per-result decision");
+	strictEqual(appendEntryCalls.length, 20, "and one durable record per bounded result");
 });
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────
