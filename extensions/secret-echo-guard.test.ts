@@ -2354,6 +2354,21 @@ test("R9-NO-STARVE-SHARED: a shared budget must NOT starve pass 2 into losing a 
 		const bytes = JSON.stringify(multi.value);
 		ok(!bytes.includes(S), "NO part may be left unredacted — a shared budget starves pass 2 per part");
 		strictEqual((bytes.match(/REDACTED/g) ?? []).length, 10, "every one of the ten parts is redacted");
+		// ⛔ These ten parts are asserted WITHOUT a scripted clock, so the shared 500ms deadline is real and
+		// this block is a WALL-CLOCK LOAD DETECTOR (measured 18/200 = 9% failures on a loaded host: the walk
+		// stopped mid-way, `incomplete` was set, and parts 7-9 were copied verbatim). The property that
+		// matters here is PASS-2 STARVATION — sharing the node counter makes pass 2 return dirty nodes by
+		// reference — which is node-count driven and load-independent. The scripted-clock case below pins the
+		// deadline behaviour instead, so this block must not depend on the host's speed.
+		let ticks = 0;
+		Object.assign(CONTENT_PART_LIMITS, { maxNodes: 1000, now: () => ticks++, maxMs: 1_000_000 });
+		const deterministic = redactContent(parts, values, new Map());
+		CONTENT_PART_LIMITS.maxNodes = savedNodes;
+		delete (CONTENT_PART_LIMITS as { now?: unknown }).now;
+		delete (CONTENT_PART_LIMITS as { maxMs?: unknown }).maxMs;
+		const fixed = JSON.stringify(deterministic.value);
+		ok(!fixed.includes(S), "with the deadline out of reach, pass 2 must still redact every part");
+		strictEqual((fixed.match(/REDACTED/g) ?? []).length, 10, "all ten parts, load-independently");
 	} finally {
 		CONTENT_PART_LIMITS.maxNodes = savedNodes;
 	}
@@ -2411,7 +2426,9 @@ test("R11-PRESCAN-BOUND: a huge key enumeration stops at the deadline and report
 		// Calibration note: the clock must NOT already be spent at index 0, or the ARRAY gate stops before
 		// the part is looked at and the pre-scan never runs (this test read a seductive 0 probes that way,
 		// then survived its own mutation). construction -> 200, deadline 450; index 0 -> 400 (admitted);
-		// the pre-scan's first sample -> 600, which crosses 450 and stops at 256 keys.
+		// the pre-scan's first sample -> 600, which crosses 450 and stops at 256 keys. Probes are ~2700
+		// there: each key is read by `for...in`'s enumerability check, `hasOwnProperty`, then the descriptor,
+		// so the per-key multiplier is near 10, not the 3-4 an earlier version of this comment guessed.
 		let probes = 0;
 		const target: Record<string, unknown> = {};
 		for (let i = 0; i < 2000; i++) target[`k${i}`] = i;
@@ -2424,6 +2441,38 @@ test("R11-PRESCAN-BOUND: a huge key enumeration stops at the deadline and report
 		const out = redactContent([proxy], values, new Map());
 		ok(probes < 3000, `the enumeration must stop at the deadline; probed ${probes} (stop ≈ 1200, no-budget ≈ 8300)`);
 		strictEqual(out.incomplete, true, "the stopped pre-scan must be announced");
+	} finally {
+		Object.assign(CONTENT_PART_LIMITS, saved);
+	}
+});
+
+test("R12-WIDE-ACCESSOR: a getter's value is redacted even when a WIDE part spends the budget first", () => {
+	const S = "R12-WIDE-ACCESSOR-SECRET-0123456789";
+	const values = normalizeSecretValues([{ value: S, label: "l" }]);
+	const saved = { ...CONTENT_PART_LIMITS };
+	try {
+		// Deterministic clock counted in CALLS, so the array gate ADMITS index 0 (call 0 = construction at 0,
+		// call 1 = the gate, deadline 3) and the deadline is then spent inside the part. A tick-incrementing
+		// clock cannot express this: with ONE part, any advance large enough to matter also stops the array
+		// gate before the part is looked at.
+		let calls = 0;
+		CONTENT_PART_LIMITS.now = () => calls++;
+		CONTENT_PART_LIMITS.maxMs = 3;
+		// The accessor is LAST, after enough keys that the deadline is gone before it is reached. Round 12's
+		// [P1]: the forced rebuild's string redactions were budget-gated, so the getter's value was written
+		// through as a DATA property — neutralizing the getter and persisting the secret. `R8-UNSTABLE-FORCED-REBUILD`
+		// only exercises the NARROW shape (`{type, payload, caption}`), where the accessor is reached before
+		// the budget is consumed, so it could not fail on this residual.
+		const part: Record<string, unknown> = { type: "image" };
+		for (let i = 0; i < 60; i++) part[`pad${i}`] = `filler-${i}`;
+		Object.defineProperty(part, "zzz_trap", { enumerable: true, configurable: true, get: () => `k=${S}` });
+		const out = redactContent([part], values, new Map());
+		const first = (out.value as Record<string, unknown>[])[0] as Record<string, unknown>;
+		const descriptor = Object.getOwnPropertyDescriptor(first, "zzz_trap");
+		ok(descriptor !== undefined && descriptor.get === undefined,
+			"the live getter must still be neutralized into a data property");
+		ok(!JSON.stringify(out.value).includes(S),
+			"an ACCESSOR's value must be redacted unconditionally — a preceding key must not be able to spend its budget");
 	} finally {
 		Object.assign(CONTENT_PART_LIMITS, saved);
 	}

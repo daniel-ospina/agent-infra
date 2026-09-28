@@ -753,12 +753,20 @@ export interface RedactOutcome<T> {
  * from 20.5s to ~0.5s, #5109 rounds 9-11). Node allowances stay PER CALL: sharing the node counter too
  * starved pass 2 into returning dirty nodes by reference, losing a redaction — round 10's regression.
  *
- * ⛔ WHAT THIS DOES **NOT** BOUND, stated here so the claim is not read as total: a SINGLE object with
- * millions of own keys still costs one `Object.keys` enumeration for its own walk/rebuild (~5s at 2M
- * keys, measured). The deadline gates the walk BETWEEN parts and BETWEEN sampled nodes; it cannot
- * preempt a single key enumeration, and a rebuild must preserve every key to avoid a shape regression.
- * The array/part-count dimension IS bounded (10M parts: 27.4s and `incomplete: false` before the
- * round-11 gate, 1.7s and `incomplete: true` after).
+ * ⛔ WHAT THIS DOES **NOT** BOUND, stated here so the claim is not read as total — all three measured
+ * on a loaded host, reported as CPU time where wall time was inflated:
+ *
+ *   • A SINGLE object with millions of own keys still costs its own enumeration AND its own rebuild
+ *     (~3.7s CPU at 2M keys; `Object.keys` alone is ~0.7s, the rest is the 2M-iteration
+ *     `defineProperty` rebuild). The deadline gates BETWEEN parts and BETWEEN sampled nodes; it cannot
+ *     preempt one key enumeration, and a rebuild must preserve every key to avoid a shape regression.
+ *   • The stop path COPIES the remainder (`for (let rest = index; ...) parts.push(...)`), which is
+ *     O(remaining) AFTER the deadline: measured 2.16s wall for 10M elements. A 100M-element array is
+ *     minutes past the deadline. Bounded per element, not in aggregate.
+ *   • The gate samples every 16 parts, so a 15-element array of huge parts is never cut.
+ *
+ * The array/part-count dimension IS bounded, which is the dimension that mattered: 10M parts went from
+ * 27.4s and `incomplete: false` before the round-11 gate to 1.7s and `incomplete: true` after.
  */
 export const CONTENT_PART_LIMITS: DetailsWalkLimits = { maxNodes: 200_000, maxMs: 500 };
 
@@ -803,7 +811,12 @@ export function redactContent(
 				// An own accessor on the PART is a live read too (a `text` getter that read clean to the
 				// harvest/redaction and returns a secret at serialization). Detect it first and rebuild the
 				// part from a single read, so the persisted part holds data properties only.
-				const unstable = hasOwnEnumerableAccessor(part, budget);
+				// `trapKeys` collects every own enumerable ACCESSOR key (not just the first): a value read out of
+				// a live getter is the one thing the forced rebuild MUST redact, so it is redacted there
+				// WITHOUT a budget (#5109 review round 12's [P1] — a wide part spent the deadline on preceding
+				// keys and then wrote the getter's secret through as a data property).
+				const trapKeys: string[] = [];
+				const unstable = hasOwnEnumerableAccessor(part, budget, trapKeys);
 				if ((part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
 					const original = (part as { text: string }).text;
 					const redacted = redactString(original, values, hits, budget);
@@ -815,12 +828,12 @@ export function redactContent(
 						if (deep.bounded) incomplete = true;
 						if (!deep.changed) return part;
 						changed = true;
-						const rebuilt = rebuildContentPart(deep.value as Record<string, unknown>, redacted, values, hits, budget);
+						const rebuilt = rebuildContentPart(deep.value as Record<string, unknown>, redacted, values, hits, budget, trapKeys);
 						if (rebuilt.bounded) incomplete = true;
 						return rebuilt.value;
 					}
 					changed = true;
-					const rebuilt = rebuildContentPart(part as Record<string, unknown>, redacted, values, hits, budget);
+					const rebuilt = rebuildContentPart(part as Record<string, unknown>, redacted, values, hits, budget, trapKeys);
 					if (rebuilt.bounded) incomplete = true;
 					return rebuilt.value;
 				}
@@ -835,7 +848,7 @@ export function redactContent(
 				// getter still live. `bounded` is threaded out so the shortfall is announced, never silent.
 				if (unstable) {
 					changed = true;
-					const rebuilt = rebuildContentPart(part as Record<string, unknown>, undefined, values, hits, budget);
+					const rebuilt = rebuildContentPart(part as Record<string, unknown>, undefined, values, hits, budget, trapKeys);
 					if (rebuilt.bounded) incomplete = true;
 					return rebuilt.value;
 				}
@@ -911,6 +924,7 @@ function rebuildContentPart(
 	values: readonly SecretValue[],
 	hits: HitCounts,
 	budget?: DetailsWalkBudget,
+	unconditionalKeys?: readonly string[],
 ): { value: Record<string, unknown>; bounded: boolean } {
 	let out: Record<string, unknown>;
 	try {
@@ -929,14 +943,20 @@ function rebuildContentPart(
 	// value had been redacted, over a persisted secret. That is the same fabricated-clean-attestation
 	// class the whole round set out to close, on the one path that had its own walker.
 	let bounded = false;
-	// ⛔ TWO PHASES, CHEAP-SECURITY-FIRST (#5109 review round 11). This function exists to neutralize a
-	// LIVE getter and to redact what it returns. Doing that inside the same loop as the deep nested walks
-	// let a spent deadline skip it: the nested payload (potentially huge) consumed the budget first, then
-	// the accessor's string was handed to `redactString` with the deadline already gone, which early-
-	// stopped and wrote the SECRET through as a data property — the exact leak this path closes, and a
-	// test that only passed or failed depending on whether the host crossed 500ms. The cheap,
-	// security-critical work now happens FIRST and unconditionally; only the potentially huge recursion
-	// is budget-governed.
+	// ⛔ TWO PHASES, CHEAP-SECURITY-FIRST (#5109 review rounds 11-12). This function exists to
+	// neutralize a LIVE getter and to redact what it returns. Doing that inside the same loop as the deep
+	// nested walks let a spent deadline skip it: the nested payload (potentially huge) consumed the budget
+	// first, then the accessor's string was handed to `redactString` with the deadline already gone, which
+	// early-stopped and wrote the SECRET through as a data property. Round 11 split the phases (cheap
+	// string work first, object recursion deferred) but the getter's own value was STILL budget-gated, so
+	// a part wide enough to spend the deadline on PRECEDING keys leaked it anyway (round 12's [P1],
+	// reproduced deterministically). An accessor key's value is therefore redacted with NO budget at all
+	// (`unconditionalKeys`), and that is what the ordering alone could not deliver.
+	//
+	// ⛔ WHAT IS STILL BUDGETED, stated so the claim is not read as total: a NON-accessor string value
+	// reached after the deadline is left unredacted (announced via `bounded` -> `incomplete`, never
+	// silently) — it is ordinary part content, not a live read, so it is the same fail-open-on-the-turn
+	// posture as every other scan. Only the RECURSION is deferred to phase 2.
 	const deferred: Array<[string, object]> = [];
 	for (const key of Object.keys(part)) {
 		// A KEY is as outbound as a value — it lands in the transcript and would be re-read by the
@@ -953,7 +973,14 @@ function rebuildContentPart(
 		// attested `contentRedacted: true`. The text path re-redacts an already-redacted string, a no-op
 		// because a marker contains no registered value.
 		let value: unknown;
-		if (typeof raw === "string") value = redactString(raw, values, hits, budget);
+		if (typeof raw === "string")
+			// ⛔ UNCONDITIONAL for an accessor key: the value came from a live getter, and writing it through
+			// unredacted because a PRECEDING key ate the deadline is the leak this whole path exists to
+			// close. An accessor key's value is bounded by one string, so skipping the budget here cannot
+			// unbounded the walk; the potentially huge work is the object recursion, deferred below.
+			value = unconditionalKeys !== undefined && unconditionalKeys.includes(key)
+				? redactString(raw, values, hits)
+				: redactString(raw, values, hits, budget);
 		else if (raw !== null && typeof raw === "object") {
 			// Deferred to phase 2: recursion is the only part that can be arbitrarily large, so it is the
 			// only part the budget should be able to cut short.
@@ -1106,32 +1133,39 @@ function isOwnAccessorProperty(source: object, key: string): boolean {
 
 /** Does any OWN ENUMERABLE property of `source` carry a getter/setter? (`Object.keys` = the set the
  * transcript serializer enumerates, and the set a rebuild copies.) */
-function hasOwnEnumerableAccessor(source: object, budget?: DetailsWalkBudget): boolean {
+function hasOwnEnumerableAccessor(source: object, budget?: DetailsWalkBudget, trapOut?: string[]): boolean {
 	// `for...in` rather than `Object.keys`: a part or array from a custom/MCP tool can carry millions of
 	// keys, and `Object.keys` allocates a string per key BEFORE the first budget check could run. This
 	// form allocates nothing, and can stop at the deadline (#5109 review round 11).
+	//
+	// `trapOut` collects the ACCESSOR keys instead of stopping at the first one. The caller needs them:
+	// a value read out of a live getter is exactly what the forced-rebuild path exists to protect, so its
+	// redaction must not be budget-gated (round 12's [P1]).
 	let seen = 0;
 	try {
 		for (const key in source) {
 			if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
 			seen++;
 			if (budget !== undefined && (seen & 255) === 0 && budget.now() >= budget.deadline) {
-				// The clock is read DIRECTLY. `detailsBudgetExhausted` only reads it when
-				// `nodes % 1024 === 0`, and this loop does not advance `nodes`, so routing the check through
-				// that helper left this enumeration completely unbounded (the same bug the array-level gate
-				// had — 8319 probes where the budget should have cut it to a few hundred).
 				budget.bounded = true;
-				// Could not finish the scan. Report UNSTABLE, which is the fail-SAFE direction: the caller
-				// rebuilds the container from a single read instead of passing it through with a possibly-live
-				// getter.
+				// Could not finish the scan. Return before an accessor was found is the fail-SAFE
+				// direction: the caller rebuilds the container from a single read rather than passing it
+				// through with a possibly-live getter.
 				return true;
 			}
-			if (isOwnAccessorProperty(source, key)) return true;
+			if (isOwnAccessorProperty(source, key)) {
+				if (trapOut === undefined) return true;
+				trapOut.push(key);
+			}
 		}
 	} catch {
-		return false;
+		// ⛔ FAIL-SAFE, matching the budget branch above. This used to `return false` — reporting STABLE
+		// about an enumeration that never completed, the opposite polarity to the branch immediately
+		// above, on the same function (#5109 review round 12).
+		if (budget !== undefined) budget.bounded = true;
+		return true;
 	}
-	return false;
+	return trapOut !== undefined && trapOut.length > 0;
 }
 
 interface DetailsDirtyState extends DetailsWalkBudget {
