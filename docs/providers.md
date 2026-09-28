@@ -288,7 +288,11 @@ with automatic return after balance restore.
   (`/user/balance`, openrouter `/auth/key`), WARN at balance ≤ warn (default
   $30 — a low balance NEVER sets the latch; per the #1508 decision a warning
   must not switch providers), CLEAR only on
-  verified positive balance AND a 5-token chat probe, warn/clear band (30/20), 401/403
+  verified positive balance AND a 5-token chat probe, and because warn (30) sits
+  ABOVE clear (20) the two thresholds OVERLAP: a latched provider clears from
+  $20 up, an unlatched one warns at $30 down. Clear-eligibility is keyed on the
+  latch, not on the band — a warn-first chain would swallow 20–30 and a latched
+  provider recovering to $25 could never clear. 401/403
   never latch, defer+escalate after 3 consecutive failures.
 - `scripts/checkout-hygiene/deepseek-balance-latch.py` mirrors the TS module's
   durable JSON contract so poller + sessions interoperate on one state file.

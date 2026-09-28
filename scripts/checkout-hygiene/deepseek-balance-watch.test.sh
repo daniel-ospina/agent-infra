@@ -104,6 +104,26 @@ watch 0 "mid-band balance → WARN (below 30), existing latch untouched"
 assert_contains "$LAST_OUT" "WARN balance=USD 12.0000" "mid-band WARN logged"
 latched "existing latch preserved — only the CLEAR branch may clear"
 
+echo "── regression (#1513 P0): the 20–30 overlap band must still CLEAR a latch ──"
+# The warn threshold (30) sits ABOVE the clear threshold (20), so the two bands
+# overlap. A warn-first chain swallows 20–30 and a latched provider that recovers
+# to $25 can never clear — leaving every session on the hop leg after a top-up.
+seed_latch
+bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"25.00","granted_balance":"0.00","topped_up_balance":"25.00"}]}'
+watch 0 "latched + balance 25.00 → CLEAR (not swallowed by the warn band)"
+assert_contains "$LAST_OUT" "CLEAR balance=USD 25.0000" "CLEAR at 25.00 logged"
+not_latched "latch CLEARED at 25.00 (a recovering balance must restore dispatch)"
+seed_latch
+bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"20.00","granted_balance":"0.00","topped_up_balance":"20.00"}]}'
+watch 0 "latched + balance exactly == CLEAR (20.00) → CLEAR (boundary inclusive)"
+assert_contains "$LAST_OUT" "CLEAR balance=USD 20.0000" "CLEAR at the boundary logged"
+not_latched "latch CLEARED at the CLEAR boundary"
+reset
+bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"19.99","granted_balance":"0.00","topped_up_balance":"19.99"}]}'
+watch 0 "unlatched + balance 19.99 → WARN (below CLEAR and below WARN)"
+assert_contains "$LAST_OUT" "WARN balance=USD 19.9900" "WARN at 19.99 logged"
+not_latched "no latch is created at 19.99 (warn never sets one)"
+
 echo "── restore: verified positive + chat probe → CLEAR ──"
 seed_latch
 bal '{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"91.43","granted_balance":"0.00","topped_up_balance":"91.43"}]}'

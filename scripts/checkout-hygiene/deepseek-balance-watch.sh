@@ -201,6 +201,18 @@ probe_triple "$RAW"
 
 if [ "$CODE" = "200" ]; then
   read -r USD_TOTAL USD_GRANTED USD_TOP CNY_TOTAL <<<"$(parse_deepseek_balance "$BODY")" || true
+  # #1513 review (P0): latch presence is resolved ONCE here, before the verdict chain.
+  # Ordering alone cannot serve both questions, because the two thresholds overlap:
+  # WARN (30) sits ABOVE CLEAR (20). With a warn-first chain the 20–30 band never
+  # reaches the clear path, so a latched provider that recovers to $25 can NEVER
+  # clear — and since a topped-up balance only falls through use, it stays latched
+  # indefinitely, keeping every session and dispatch on the hop leg after funds are
+  # restored. That is the #1508 outage made permanent. So clear-eligibility is keyed
+  # on the latch, not on the band: latched-and-above-CLEAR clears; otherwise below
+  # WARN warns.
+  LATCH_JSON="$(python3 "$LATCH_PY" status 2>/dev/null || echo '{}')"
+  LATCH_PRESENT="$(printf '%s' "$LATCH_JSON" | python3 -c 'import json,sys; print("yes" if "deepseek" in json.load(sys.stdin).get("primaries", {}) else "no")' 2>/dev/null)"
+  [ "$LATCH_PRESENT" = "yes" ] || LATCH_PRESENT="no"
   if [ "${USD_TOTAL:-}" = "unavailable" ]; then
     # is_available=false — account unusable (frozen/blocked/disabled). NOT a
     # balance verdict: defer + escalate (no latch change; session 402 markers
@@ -210,11 +222,11 @@ if [ "$CODE" = "200" ]; then
   elif [ -z "${USD_TOTAL:-}" ]; then
     log "$TS SCHEMA-DRIFT http=200 body-unexpected ($(printf '%s' "$BODY" | head -c 120)) — no action (schema-drift alert; consecutive escalations below)"
     ALERTED=1
-  elif ge_float "$DBW_WARN_USD" "$USD_TOTAL"; then
-    # at/below WARN (boundary inclusive) → WARN ONLY. This branch is deliberately
-    # ordered BEFORE the CLEAR branch: with WARN (30) above CLEAR (20) a `>= CLEAR`
-    # test taken first would swallow the 20–30 band and report it healthy, so the
-    # warning would never fire exactly where it is wanted.
+  elif { [ "$LATCH_PRESENT" != "yes" ] || ! ge_float "$USD_TOTAL" "$DBW_CLEAR_USD"; } && ge_float "$DBW_WARN_USD" "$USD_TOTAL"; then
+    # at/below WARN (boundary inclusive) → WARN ONLY — but this branch YIELDS to the
+    # latched-and-above-CLEAR case, which the branch below owns. Without that guard the
+    # warn condition (<= 30) matches first and the 20–30 overlap band never reaches the
+    # clear path, so a latched provider recovering to $25 could never clear (the #1513 P0).
     #
     # It does NOT set a latch. Setting one here is the defect this change removes:
     # a pre-emptive switch on a balance WARNING routed every dispatch to a keyless
@@ -226,11 +238,15 @@ if [ "$CODE" = "200" ]; then
     # "balance state unknown" degraded signal that ALERTED drives. Setting it here
     # would inflate the consecutive-degraded streak and force exit 1 for a warning.
     ACTION="warn"
-  elif ge_float "$USD_TOTAL" "$DBW_CLEAR_USD"; then
+  elif [ "$LATCH_PRESENT" = "yes" ] && ge_float "$USD_TOTAL" "$DBW_CLEAR_USD"; then
     # verified positive. The chat probe (5-token) runs ONLY when a latch
     # record exists — no latch = nothing to clear = no token spend. Clear is
     # fail-closed: probe must pass or the clear is deferred.
-    if python3 "$LATCH_PY" status 2>/dev/null | python3 -c 'import json,sys; print("yes" if "deepseek" in json.load(sys.stdin).get("primaries", {}) else "no")' | grep -q "^yes$"; then
+    # Uses the latch verdict resolved once above — re-running the pipeline here
+    # would reintroduce the `| grep -q` SIGPIPE hazard that, under `pipefail`,
+    # returns 141 and silently reports "no latch" (a false negative that skips
+    # the clear entirely).
+    if [ "$LATCH_PRESENT" = "yes" ]; then
       CHAT_RAW="$(dbw_curl "https://api.deepseek.com/chat/completions" \
         -H "Authorization: Bearer $DEEPSEEK_KEY" -H "Content-Type: application/json" \
         -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Reply with the single word: OK"}],"max_tokens":5}')"
@@ -255,7 +271,7 @@ if [ "$CODE" = "200" ]; then
   else
     # Healthy: above the warn threshold. No latch action — nothing to clear here
     # (the CLEAR branch above handles an existing latch) and nothing to set.
-    log "$TS PASS5 balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}) healthy — above warn (${DBW_WARN_USD}), no latch"
+    log "$TS PASS balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}) healthy — above warn (${DBW_WARN_USD}), no latch"
     ACTION="pass"
   fi
 else
