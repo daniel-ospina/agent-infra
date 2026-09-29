@@ -62,11 +62,20 @@ jobs:
       - uses: actions/checkout@v4
       - name: Drift-check tests (tiered exits, fixtures, workflow YAML)
         run: bash tests/drift/run.sh
+      - name: AGENTS.md materialize gate suite (#1027 — base-owned region pin)
+        # #1027 — the materialize gate's `--check` used to validate base rule
+        # headings by PRESENCE only, so a base-owned paragraph could be deleted
+        # (or a rule silently reworded) while `--check` still printed a green ✅.
+        # This suite pins the real defect surface: a missing required heading
+        # exits 1, and base-owned content drift is reported (never a plain ✅).
+        # VISIBLE here, not merge-blocking — the required check is
+        # `pipeline-compliance`, which runs the same suite.
+        run: bash tests/materialize-agents/run.sh
 
   cost-config:
-    # #341 — cost-config drift guard (config clamp @400K): asserts the shipped
+    # #341 — cost-config drift guard (config clamp @300K): asserts the shipped
     # deepseek context clamp + settings compaction/retry contract, then runs
-    # the fixture suite (backdoor drift blocks/warns, clean 400K passes,
+    # the fixture suite (backdoor drift blocks/warns, clean 300K passes,
     # override honored). Shipped-only — CI has no live ~/.pi/agent.
     runs-on: ubuntu-latest
     steps:
@@ -93,6 +102,72 @@ jobs:
       - name: SIGPIPE guard suite (detection, continuations, exceptions, positive controls)
         run: bash tests/sigpipe-grep/run.sh
 
+  search-cost:
+    # #1069 — the ignore-blind recursive search that walks .worktrees/*/node_modules
+    # (169 GB per checkout; three sessions at load ~18 on 10 CPUs for 80 minutes).
+    # Two halves, one invariant: the corpus teaches only primitives the guard allows,
+    # and the guard refuses only the shape the corpus no longer teaches. This job is
+    # the WIRING for both halves — the corpus contract and the extension's own suite.
+    # setup-node is explicit: the harness type-strips index.ts and needs Node >= 22.13
+    # (sigpipe-grep inherits the runner's Node instead, which is not a contract).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: search-guard suite (threat table, handler-driven, non-vacuity)
+        run: node extensions/search-guard/test.mjs
+      - name: search-cost harness (corpus contract, both directions)
+        run: bash tests/search-cost/run.sh
+
+  admin-merge:
+    # #930 — the safe-admin-merge rail. `--admin` bypasses required checks, so
+    # nothing makes it *safe*: it cannot tell a check already red on main from a
+    # NEW failure the PR introduces (tortoise #3420 merged carrying a test that
+    # was not in main's failing set, and main ratcheted redder). This job is the
+    # per-PR half: scripts/ci-failure-set.sh is the ONE parser, and
+    # scripts/admin-merge.sh is the chokepoint (union baseline + flake re-run +
+    # head-bound evidence). The refusal half (a raw `gh pr merge --admin`
+    # without evidence) is pinned by extensions/review-enforcer/index.test.ts.
+    # Hermetic: a fake `gh` serves every call — no network, no provider keys.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Safe admin-merge rail suite (parser, #3469 trap, flake, parity)
+        run: bash tests/admin-merge/run.sh
+      - name: Atomic land unit suite (#1367)
+        # update → verify → record → land as ONE unit. The land step DELEGATES to
+        # admin-merge.sh (the suite above) and the record step to record-review.sh;
+        # this suite pins only the sequencing and the fail-closed preconditions.
+        run: bash tests/atomic-land/run.sh
+      - name: Review-evidence diff normalizer (#1362 D1)
+        # The ONE implementation of the diff normalization the review-evidence
+        # digest is computed over, plus the three byte-level D1 properties
+        # (base-move invariant, content change, whitespace change). This is a
+        # dedicated per-PR step AND the suite is registered in the one shard
+        # list (scripts/run-bash-shards.sh) that both lanes run — same
+        # deliberate double-run as the admin-merge suites above. The producer's
+        # integration pins live in scripts/record-review.test.sh §12, which is
+        # likewise in the shard list, so it runs in BOTH lanes.
+        run: bash scripts/diff-normalize.test.sh
+      - name: Argv-level admin-merge guard suite (#984)
+        # The layer that makes obfuscation irrelevant: the shim inspects its OWN argv,
+        # where bash has already resolved `-${V:--}admin=true` into `--admin`. The
+        # suite drives the real shim through a real shell with the splices that
+        # defeated the string scanner, and asserts refusal.
+        run: bash tests/gh-shim/run.sh
+      - name: Certificate contract suite (#1388)
+        # The ONE contract, pinned against a REAL captured evidence comment rather
+        # than a hand-written fixture. bcbb7df (#3756) renamed the producer's
+        # residual clause and BOTH gates kept requiring the old name; every admin
+        # merge was refused fleet-wide for six days with every suite green, because
+        # a hand-written fixture cannot notice that the producer moved. This suite
+        # extracts the required literals FROM the gate, asserts each exists in real
+        # evidence, mutates the producer's clause one word and requires refusal, and
+        # pins clause 6 — that the TS gate owns no copy of the clause set.
+        run: bash tests/admin-merge-evidence-contract/run.sh
+
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
     # every extensions/ top-level entry except *.test.ts must be farm-wired
@@ -101,14 +176,18 @@ jobs:
     # files.extensions.entries (the consumer ship-list — a tree entry with no
     # manifest row ships on NO consumer, #498 staleness class). Repo-tree only,
     # no live ~/.pi/agent dependency, then the runtime-fixture suite exercising
-    # checks 1–4 (materialized copy / mistargeted link / unwired entry /
-    # manifest↔tree row drift) + the *.test.ts exclusion.
+    # checks 1–5 (materialized copy / mistargeted link / unwired entry /
+    # manifest↔tree row drift / dangling live-farm link) + the *.test.ts
+    # exclusion. Check 5 is the ONE machine-local check: it aims at
+    # ${PI_EXTENSIONS_DIR:-$HOME/.pi/agent/extensions}, so on a runner it prints
+    # an explicit ⏭️ skip and the CI verdict stays repo-tree-only; its
+    # fail/pass behaviour is pinned here by the fixture suite's cases 10–12.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Extension-farm parity gate (symlink farm + manifest.json into extensions/)
         run: bash scripts/check-pi-config-extensions.sh
-      - name: Extension-farm parity gate tests (fixtures, checks 1-4)
+      - name: Extension-farm parity gate tests (fixtures, checks 1-5)
         run: bash tests/pi-config-extensions/run.sh
 
   actionlint:
@@ -128,13 +207,58 @@ jobs:
       - name: Actionlint gate tests (fixtures, #394 regression)
         run: bash tests/actionlint/run.sh
 
+  test:
+    # #1349 — THE LANE-PARITY SHARD. The rail compares lane coverage by the LAST
+    # SEGMENT of each job's name, filtered by `ADMIN_MERGE_LANE_JOB_PREFIX`
+    # (default `test`), so the push lane contributes exactly one shard — `test`,
+    # from the reusable call `python-ci / test` in ci-main.yml — while the PR lane
+    # contributed none (its pytest ran inside this file's `verify` job, whose
+    # segment is `verify`). A clean merge was therefore refused as "PR lane does
+    # not cover main's lane" although the coverage was identical. This job's
+    # segment is the same `test`, and it runs the SAME command ci-main passes to
+    # python-ci.yml — byte-identical targets, flags and interpreter — so parity is
+    # an equality of MEASUREMENT, not a name mapped onto another name.
+    #
+    # WHY INLINE, NOT `uses: …/python-ci.yml@main`: inside a PR a reusable call is
+    # resolved against the BASE branch, so an edit to the reusable file cannot be
+    # exercised by the PR that makes it — the reason for the #383 landing split
+    # (docs/scoping/2026-08-29-issue-383-plan.md:70/73/290), which this job
+    # honours. Replacing this duplication with the reusable call is a deliberate
+    # reopen of that split, not a side effect of fixing the refusal.
+    #
+    # ONE canonical interpreter (3.12) across the Task 1 local env, the push
+    # lane's python-ci call and this job — a 3.11/3.12 divergence would pass PR CI
+    # and only break post-merge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest + pytest-timeout
+        run: pip install pytest pytest-timeout
+      - name: "Vendored suite + CI-exemption decision suite (#383, #3761)"
+        # ONE invocation, deliberately byte-identical to `test-command` in
+        # ci-main.yml's python-ci caller: the parity gate compares the shard NAME,
+        # so an equal name carrying a different command would be a name match over
+        # a coverage divergence — the exact fail-open this job exists to avoid.
+        # #3761 — `scripts/ci_exemption.py` is exec'd by the rail BY PATH and its
+        # 58 assertions previously lived only in tortoise, against a vendored COPY
+        # (`tools/ci_exemption.py`): a suite over a copy is a false-PASS generator,
+        # green while the real module drifts. The suite lives here, loads the
+        # canonical file BY LOCATION and pins `__file__` to it. This step is what
+        # keeps it non-inert — an unwired suite passes in CI by never running.
+        # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q
+
   verify:
-    # #383 — vendored parallel_work_check pytest suite (self-contained) +
-    # sequence-enforcer tsx suite (incl. the joint checker→enforcer token-shape
-    # test) + the Task 4 literal-path fence (machine-checked, not manual).
+    # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
+    # reports the same shard segment the push lane reports. What remains here is
+    # the sequence-enforcer tsx suite (incl. the joint checker→enforcer
+    # token-shape test) + the Task 4 literal-path fence (machine-checked, not manual).
     # Self-contained per-PR: no dependency on post-merge python-ci or the
     # private swarm checkout. ONE canonical interpreter (3.12) across the
-    # Task 1 local env, this job, and ci-main's python-ci caller — a
+    # Task 1 local env, the `test` job, and ci-main's python-ci caller — a
     # 3.11/3.12 divergence would pass PR CI and only break post-merge.
     runs-on: ubuntu-latest
     steps:
@@ -145,16 +269,76 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install pytest + pytest-timeout + pyyaml
+      - name: Install pyyaml
         # pyyaml: the sequence-enforcer's loadSteps frontmatter fallback runs
         # `python3 -c 'import yaml'` — the CI runner's python3 has no PyYAML by
         # default (local macOS python3 does), which fails the token_phase +
         # F2 activation tests (loadSteps returns null → no steps parsed).
-        run: pip install pytest pytest-timeout pyyaml
-      - name: Vendored parallel_work_check suite (pytest, B1–B34)
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q
+        # pytest/pytest-timeout moved to the `test` job with the suites that use
+        # them (#1349) — this job no longer imports pytest.
+        run: pip install pyyaml
+      - name: Fleet liveness acceptance suite (#1178, zero-dep)
+        # #1178 — the liveness classifier (tools/fleet/liveness.py) and the
+        # shared process-identity rule it shells out to
+        # (scripts/lib/pid-identity.sh — the SAME library the kill-path reaper
+        # sources) were pinned by a suite CI did not execute, and an unwired
+        # suite passes by never running. Zero-dep by construction: the suite is
+        # a standalone script (no pytest), drives the Bash probe CLI through
+        # hermetic fake PS/DATE shims, and needs only python3 + bash. VISIBLE,
+        # not merge-blocking: `pipeline-compliance` is the repo's only required
+        # check (#646); the BLOCKING backstop is the post-merge ci-main.yml
+        # script-validate job, which runs the reaper's own regression suite
+        # (scripts/pi-reap-idle.test.sh) against the same library.
+        run: python3.12 tools/fleet/liveness.test.py
+      - name: Fleet liveness mutation evidence (#1178, zero-dep)
+        # The suite above is only a pin if it can FAIL. `--mutations`
+        # reintroduces each of the 24 defects into a TEMP copy of the module (or
+        # of the identity library) and re-runs the paired test against it in a
+        # subprocess — a mutation whose paired test still passes is reported as
+        # a suite failure. Its own step, not a second command in the step above:
+        # sequencing would suppress one verdict when the other fails, and each
+        # must report on its own (the same reason every suite here is separated).
+        run: python3.12 tools/fleet/liveness.test.py --mutations
+      - name: Scheduled lane-liveness report suite (#1178 unit 3, zero-dep)
+        # #1178 unit 3 — the DELIVERY half. tools/fleet/liveness.py is a pull
+        # tool, so it is silent exactly when the orchestrator is dead; this step
+        # pins the scheduled report (tools/fleet/lane_liveness.py) that runs
+        # under launchd with no agent in the loop. Zero-dep by construction: the
+        # suite is a standalone script, drives the report as a subprocess
+        # against temp fixtures with hermetic ps/date shims and a stubbed gh, and
+        # carries a RED control that mutates the report seven ways (escalate
+        # every state / escalate nothing / drop the child exclusion / drop the
+        # open-workspace filter / drop the policy text's 24h carve-out / name
+        # one reason for a state several paths reach, #1273 / drop the
+        # markdown-cell escape, #1272) and the
+        # CLASSIFIER it consumes two more (drop the turn-ended guard and drop
+        # the compaction-tail abstention, #1254), requiring each paired leg to
+        # catch it. python3 + bash only; its own step so one
+        # verdict cannot suppress the other (same rule as every suite here).
+        run: python3.12 tools/fleet/lane_liveness.test.py
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Kill-switch / session-escape suite (#1419)
+        # #1419 — the deadlock escape. Zero-dependency (node stdlib + tsx), so it
+        # MUST run in THIS job, which performs no `npm ci`; it is also invoked
+        # post-merge from ci-main.yml. It pins the escape's CHANNEL as well as its
+        # behaviour: the state lives on `globalThis`, so two module instances (the
+        # loader gives every extension its own graph) still share one escape.
+        run: npx tsx extensions/shared/kill-switch.test.ts
+      - name: Skill-enforcer suite (#1321/#1322, zero-dep)
+        # #1321 — under the DEPLOYED (symlinked) layout the manifest was resolved
+        # from the farm directory rather than the real module, so the extension
+        # announced `✅ Loaded — enforcing 0 skill gates` and enforced nothing,
+        # and health-check called it loaded. #1322 — read identity was keyed by a
+        # path prefix pi never serves, so a skill read through
+        # `~/.pi/agent/skills/...` never cleared its own gate. Zero-dep by
+        # construction (the pi SDK import is TYPE-only and its predicate is
+        # inlined), so it MUST run in THIS job, which performs no `npm ci`. The
+        # deployed layout is reproduced in temp farms via
+        # `tsx --preserve-symlinks` — whose `__dirname` semantics the fixture
+        # asserts as a PRECONDITION before trusting any verdict — and through real
+        # jiti where jiti is resolvable (reported as skipped otherwise).
+        run: npx tsx extensions/skill-enforcer.test.ts
       - name: Merge-scope subtraction suite (#755, SDK-free)
         # #755 — zero-dependency by construction: subtract-scope.test.ts imports
         # ./index.js as a TYPE only (erased by tsx) and drives real git in temp
@@ -168,6 +352,35 @@ jobs:
         # two anchors the rule's safety depends on (`:2204`'s tracking, and the
         # push/commit discrimination at the scope-resolution site).
         run: node extensions/verification-gate/test-subtract-scope.mjs
+      - name: Compaction-watchdog guard suite (#1215, zero-dep)
+        # #1215 — the context-clamp death (#1214) must never be silent. Zero-dep
+        # by construction: the extension imports `@earendil-works/pi-coding-agent`
+        # as a TYPE only (erased by tsx) and node stdlib otherwise, so it runs in
+        # THIS job (the job that performs no `npm ci`). All four sinks are driven
+        # through the NODE_ENV=test hook seam — hermetic, never touching ~/.pi —
+        # and negative pins assert that an aborted compaction, a legitimate
+        # `length` stop, max_tokens > 1 and a missing max_tokens record NOTHING.
+        # VISIBLE, not merge-blocking: `pipeline-compliance` is the repo's only
+        # required check (#646); the BLOCKING backstop is the post-merge
+        # ci-main.yml extension-tests job.
+        run: npx tsx extensions/compaction-watchdog.test.ts
+
+      - name: Clamp-output-floor suite (#1214b — the PR-lane half, not post-merge only)
+        # #1250 — the defect this step exists to not repeat: a suite wired ONLY
+        # into ci-main.yml (push: main) is a suite that runs AFTER the merge, so
+        # it reports the breakage on main instead of on the PR that caused it.
+        # scratch-worktree.test.sh went in that way and main was red for 16h.
+        # The post-merge leg in ci-main.yml is KEPT (it is the upgrade-proof
+        # backstop for this extension) — this step is an ADDITION, not a move.
+        # Zero-dep by construction: the extension imports the pi package as a
+        # TYPE only (erased by tsx) and node stdlib otherwise, so it runs in THIS
+        # job (the job that performs no `npm ci`); every sink is driven through
+        # the NODE_ENV=test hook seam, so it never touches the real ~/.pi.
+        # Negative pins are first-class: a floor-or-above ceiling, a missing or
+        # non-numeric field, and an already-healthy payload must all be left
+        # BYTE-IDENTICAL — the guard must never rewrite a good request.
+        run: npx tsx extensions/clamp-output-floor.test.ts
+
       - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
         # VISIBLE, not merge-blocking (only pipeline-compliance is required).
         # The blocking backstop is ci-main.yml's extension-tests job, same
@@ -181,6 +394,56 @@ jobs:
         # ./provider-failover.js only, which imports `node:` only) — it must run
         # WITHOUT `npm ci`, which this job does not perform.
         run: npx tsx extensions/shared/default-coverage.test.ts
+      - name: Stall-vocabulary + progress-edge parity (#1068, zero-dep)
+        # #1068 — the declared-surface instrument (`declared-surface.ts`), the
+        # progress-edge declaration (`heartbeat-progress-edges.ts`) and both
+        # suites import `node:*` + each other ONLY, so they run in THIS job (the
+        # job that performs no `npm ci`). The suites assert that the child's
+        # clock-advancing edges, the parent's `parseHeartbeatLine` effects, the
+        # marker vocabulary, the kill-reason clause set and every declared
+        # stall/liveness bound in the repo agree with their declarations — in
+        # both directions, with non-vacuity floors so a renamed corpus FAILS
+        # instead of reporting a clean scan over nothing.
+        # VISIBLE, not merge-blocking: `pipeline-compliance` is the repo's only
+        # required check (#646), so the BLOCKING backstop is the post-merge
+        # ci-main.yml `extensions/shared/*.test.ts` glob. The `builtin-tools`
+        # half of the parity assertion (the real child factory + the real
+        # parser) needs `npm ci` and therefore runs post-merge only.
+        run: npx tsx extensions/shared/declared-surface.test.ts
+      - name: Heartbeat progress-edge declaration drift gate (#1068, zero-dep)
+        # The SECOND suite of the #1068 pair, as its own step on purpose: `&&`
+        # short-circuits, so a `declared-surface` failure would suppress this
+        # suite's verdict for that PR entirely (the same reason the accumulator
+        # at the top of this job avoids `&&`). Each suite reports on its own.
+        run: npx tsx extensions/shared/heartbeat-progress-edges.test.ts
+      - name: Shared bash/git command-parser suite (#966, zero-dep)
+        # #966 — extensions/shared/git-command-parse.ts imports `node:*` ONLY, so
+        # its suite runs in THIS job (the job that performs no `npm ci`), like
+        # the loop-enforcer and failover suites around it. VISIBLE, not
+        # merge-blocking: `pipeline-compliance` is the repo's only required
+        # check (#646), so the BLOCKING backstop remains the post-merge
+        # ci-main.yml `extensions/shared/*.test.ts` glob. What this step buys is
+        # that the parser's truth table — the artifact #966 exists to create —
+        # FAILS where the author can see it before merge, instead of only after
+        # it. The drift-pins that stop the two extensions re-declaring their own
+        # copies live in their SDK-bearing index.test.ts (post-merge glob).
+        run: npx tsx extensions/shared/git-command-parse.test.ts
+      - name: Load-scale doc↔code contract (#1073, zero-dep)
+        # #1073 — docs/ops/load-policy.md once named two watchdog scale knobs
+        # (`TASK_LOAD_SCALE_START` / `_MAX`) that no code read: an operator set
+        # one and got nothing. The root cause was a rebase that merged one #209
+        # implementation's code with the other's doc, and NOTHING compared a
+        # documented env var against an actual reader. This suite is that gate:
+        # (a) every env var the doc names must have a non-test reader
+        # (or be a declared constant), (b) §6's band sentence is parsed and must
+        # equal the code's literals, (c) the two keep-in-sync copies
+        # (`loadScaledBound` / `loadScaledTimeoutMs`) must stay byte-identical
+        # and must read exactly `TASK_LOAD_SCALE_OFF`. Zero-dep (`node:*` only),
+        # so it MUST run in THIS job — the job that performs no `npm ci`.
+        # VISIBLE, not merge-blocking (`pipeline-compliance` is the only required
+        # check, #646); the BLOCKING backstop is the post-merge ci-main.yml
+        # `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/load-scale-contract.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
@@ -206,6 +469,19 @@ jobs:
         # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
+        # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd
+        # (#1071), so ~124 dispatches/hour on the tortoise hub landed in a
+        # SHARED MAIN checkout — where one lane's unpushed commit gates git
+        # writes for every session rooted there. The gate resolves the child's
+        # target and refuses a shared main checkout, naming the worktree remedy.
+        # Behavioral: loads the REAL index.ts through loader-hooks.mjs and drives
+        # the tool_call handler against a hermetic hub + NESTED linked worktree
+        # (a path-prefix gate would false-positive on the nested worktree, which
+        # is exactly what B5/B6 pin). Zero-dep (`node:*` + the `git` binary), no
+        # `npm ci`, ~3s. Its own step (the post-merge `extensions/*/test*.mjs`
+        # glob in ci-main.yml is not PR-triggered).
+        run: node extensions/task-cwd-guard/test-cwd-guard.mjs
       - name: entry-point guard symlink regression (#708)
         # The entry-point idiom `pathToFileURL(process.argv[1]).href ===
         # import.meta.url` is symlink-SENSITIVE (pathToFileURL does no fs
@@ -220,10 +496,64 @@ jobs:
         # Positive control: spawns the REAL gates through symlinked paths.
         # Zero-dep (`node:*` only), no `npm ci`, ~3s.
         run: node extensions/shared/test-is-main.mjs
+      - name: infra-verify bounded-scan regression (#1051)
+        # `find <dir>/` dereferences a symlinked START POINT and `-P` cannot undo
+        # it, so a repo committing `templates -> /` turned infra-verify's bounded
+        # in-checkout enumeration into a filesystem-wide walk that could report
+        # green over a tree that is not the checkout's. Its own step (like
+        # #708/#744/#709 above) because the `extensions/*/test*.mjs` glob in
+        # ci-main.yml is POST-MERGE only, and a fail-open regression in a
+        # verifier should not reach main before anything reads it.
+        # Hermetic (temp fixtures, a tiny sentinel tree — never `/`), zero-dep
+        # (`node:*` + bash), no `npm ci`, ~2s. The suite is bidirectional: the
+        # vulnerable form (`find <dir>/`, `find -H`, `find -L`) is executed and
+        # asserted to LEAK, then the fixed form is asserted not to.
+        run: node extensions/shared/test-infra-verify-scan.mjs
+      - name: read-path failure contract — tortoise-memory.mjs (tortoise#3805 / #1182)
+        # The skills' memory client used to exit 0 in every direction (never
+        # configured, unreachable, and a genuinely empty store were ONE
+        # observable) and defaulted its base URL to the DASHBOARD host while the
+        # API lives on api.premiselabs.co.
+        # Its own step (like #744/#708/#709/#1051 above): the `test-command`
+        # accumulator is exact-pinned by check-pi-pin-lockstep.mjs (guard (j)), so
+        # a new suite cannot be appended there; and ci-main.yml has NO
+        # `scripts/*.test.mjs` glob (it names the older scripts suites
+        # explicitly), so a new one is not auto-collected post-merge either.
+        # The suite EXECUTES the real client as a subprocess against a local HTTP
+        # stub (a source-text scan is a false PASS) and pins both directions:
+        # RED on the defect, GREEN under a behaviour-identical reformat. Zero-dep
+        # (`node:*` only), no `npm ci`, ~4s.
+        run: node --test scripts/tortoise-memory.test.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
         run: '! grep -rE ''/Users/danielospina/swarm/operations/coordination'' skills/ extensions/ scripts/'
+
+  http-pool-hygiene:
+    # #1110 — the real-transport arms of this suite (the dead-socket RED
+    # baseline and the keepAliveMaxTimeout falsifier) need a real undici copy.
+    # The zero-dep `verify` job has none, so the glob in ci-main.yml SKIPPED
+    # them and exited 0 — a green run that tested nothing (inert gate).
+    # Install pi's pinned undici (8.9.0, the version the vendored pin carries)
+    # into a TEMP COPY of the extension and run from there — no NODE_PATH, which
+    # would leak into `require.resolve` and turn Part 5's "unresolvable" negative
+    # case into a false failure. PI_HTTP_POOL_REQUIRE_UNDICI=1 makes a missing
+    # undici a FAILURE instead of a green skip. Test-only: no repo manifest is
+    # touched and nothing is written under the checkout.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install undici for the real-transport arms (test-only)
+        run: |
+          tmp="$RUNNER_TEMP/pool-hygiene-ext"
+          mkdir -p "$tmp"
+          cp -R extensions/http-pool-hygiene/. "$tmp/"
+          npm install --no-save --no-audit --no-fund --prefix "$tmp" undici@8.9.0
+      - name: http-pool-hygiene suite (real transport REQUIRED)
+        run: PI_HTTP_POOL_REQUIRE_UNDICI=1 node "$RUNNER_TEMP/pool-hygiene-ext/test-pool-hygiene.mjs"
 
   setup-suite:
     # #449 — pi-bootstrap setup regression suite, per-PR gate: the ONLY run-site
@@ -239,6 +569,50 @@ jobs:
       - uses: actions/checkout@v4
       - name: pi-bootstrap setup regression suite
         run: bash pi-bootstrap/tests/test-setup-no-nesting.sh
+
+  bash-suites:
+    # #1369 — Route A of the lane-split fix: the PR lane must RUN the bash work its check
+    # name implies. Before this job, `ci / script-validate` ran `node --check` only (~4s)
+    # while main's `script-validate` ran the bash sweeps + the hermetic suites (~5m20s)
+    # — one check name over two different bodies of work. A runner-only failure therefore
+    # reached main with a GREEN PR: scripts/record-review.test.sh exited 127 on the ubuntu
+    # runner (its PATH-shim vector) and reddened main (#1348 → #1369).
+    #
+    # BOTH lanes call `scripts/run-bash-shards.sh`, which IS the shard list. The first repair
+    # duplicated the list into each workflow and compared the two; two independent reviews
+    # then showed every text form that reads as coverage without executing (a shard named in
+    # a heredoc body, an `env:` value, after `true ||`, on a `for f in a.sh …` continuation
+    # line, or as `env bash x.sh`). Comparing two hand-kept lists cannot be made sound — so
+    # there is now ONE list, and drift between the lanes is impossible by construction.
+    #
+    # scripts/check-ci-lane-parity.sh asserts the narrow residue: each lane calls the runner,
+    # and the runner is not gutted (vacuity floors). tests/ci-lane-parity/run.sh exercises
+    # those arms with mutations.
+    #
+    # NOT a required check: the repo's only required status is `pipeline-compliance` (#646
+    # records code CI as advisory). Making this required is a REOPEN of that decision with
+    # evidence, never a quiet branch-protection edit.
+    #
+    # `bash-suites` deliberately does NOT begin with the admin-merge rail's parity prefix
+    # (`ADMIN_MERGE_LANE_JOB_PREFIX`, default `test`), so it stays outside that family and
+    # cannot move the rail's lane-coverage comparison (#1349 — a separate remedy; nothing
+    # here helps or hinders it).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The runner below includes `tests/search-cost/run.sh`, whose harness type-strips index.ts and
+      # needs Node >= 22.13 — ci.yml's own `search-cost` job pins it for exactly this reason, with the
+      # note that inheriting the runner's Node "is not a contract". Same pin here, and the same pin in
+      # ci-main.yml's `script-validate`: one runtime for the list, in both lanes.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Lane parity — both lanes must call the one bash-shard runner (#1369)
+        run: bash scripts/check-ci-lane-parity.sh
+      - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        run: bash tests/ci-lane-parity/run.sh
+      - name: Bash shards — the ONE list both lanes run (#1369)
+        run: bash scripts/run-bash-shards.sh
 
   vendor-drift:
     # #383 — the SINGLE vendor drift gate: bash syntax + manifest verification

@@ -7,13 +7,17 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent } from "./index.js";
 import { createHash } from "node:crypto";
+import { execSync } from "node:child_process";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
-import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, symlinkSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { join, sep, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+// #966: the shared parser module — the drift-pin below asserts this extension's
+// exported helpers ARE these functions (one copy, not a lookalike).
+import * as sharedParse from "../shared/git-command-parse.js";
 
 let passed = 0;
 let failed = 0;
@@ -453,58 +457,94 @@ test("rejects substring match in longer word", () => {
 
 // ── Module load regression ───────────────────────────
 
-section("extractCdPath — worktree cwd detection");
+// ── Drift-pin: ONE copy of the command parsers (#966) ─
+//
+// The behavioural truth table for the four helpers (and the delete-the-wrong-
+// pin fix for `cd /a && cd /b`, plus the #960 newline-terminated cd) now lives
+// in the shared suite: extensions/shared/git-command-parse.test.ts. What must
+// be pinned HERE is that this extension has no private copy to drift again —
+// the copies drifted silently for a month and the two suites ended up
+// asserting OPPOSITE answers for the same input.
 
-test("extracts path from cd && pattern", () => {
-  const result = extractCdPath("cd /some/worktree && git commit -m test");
-  ok(result !== null);
-  ok(result!.endsWith("/some/worktree"));
+section("drift-pin — shared command parsers (#966)");
+
+test("the four helpers ARE the shared module's functions (no per-extension copy)", () => {
+  equal(extractCdPath, sharedParse.extractCdPath, "extractCdPath");
+  equal(extractRepoFlag, sharedParse.extractRepoFlag, "extractRepoFlag");
+  equal(extractGhRepoEnv, sharedParse.extractGhRepoEnv, "extractGhRepoEnv");
+  equal(extractPrNumber, sharedParse.extractPrNumber, "extractPrNumber");
 });
 
-test("extracts path from cd ; pattern", () => {
-  const result = extractCdPath("cd /tmp ; git push");
-  ok(result !== null);
-  ok(result!.endsWith("/tmp"));
+/** Does `src` DECLARE a local copy of `helper`? Declaration-form-agnostic: a
+ * `function` / `async function` / `export default function`, or a `const`/`let`/
+ * `var` with an optional TYPE ANNOTATION between the name and `=`. Scanning only
+ * `function` let the idiomatic TS forms through. The scan is over RAW text, so a
+ * COMMENT that quotes a declaration also trips it — deliberate: the guard fails
+ * CLOSED (a false positive costs a look; a miss re-opens #966). The one shape it
+ * cannot see is a copy relocated to a sibling module and imported under the same
+ * name, for the helpers neither extension re-exports (recorded residual). */
+function declaresHelper(src: string, helper: string): boolean {
+  return new RegExp(
+    `(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${helper}\\b` +
+      `|(?:const|let|var)\\s+${helper}\\s*(?::[^=;]*)?=`,
+  ).test(src);
+}
+
+test("the declaration scan detects every form it claims — and only those", () => {
+  // A guard only ever run against today's CLEAN sources cannot fail when the
+  // regex is weakened: it would drift OPEN silently. Pin the detector itself.
+  for (const positive of [
+    "function extractCdPath(cmd: string) { return null; }",
+    "export function extractCdPath(cmd: string) { return null; }",
+    "async function extractCdPath(cmd: string) { return null; }",
+    "export default function extractCdPath(cmd: string) { return null; }",
+    "const extractCdPath = (cmd: string) => null;",
+    "const extractCdPath: CdParser = (cmd) => null;",
+    "const extractCdPath: (c: string) => string | null = (c) => null;",
+    "let extractCdPath = function (cmd: string) { return null; };",
+    "var extractCdPath = (cmd) => null;",
+    // RAW-text scan ⇒ a comment quoting a declaration also trips it (fail-closed).
+    "// const extractCdPath = old copy;",
+  ]) {
+    ok(declaresHelper(positive, "extractCdPath"), `must detect: ${positive}`);
+  }
+  for (const decoy of [
+    "const extractCdPathRegex = /x/;",
+    "const myExtractCdPath = 1;",
+    "const x = extractCdPath(cmd);",
+    'import { extractCdPath } from "../shared/git-command-parse.js";',
+    "export { extractCdPath, extractPrNumber };",
+  ]) {
+    ok(!declaresHelper(decoy, "extractCdPath"), `must ignore: ${decoy}`);
+  }
 });
 
-test("extracts quoted path", () => {
-  const result = extractCdPath("cd '/path with spaces' && git commit");
-  ok(result !== null);
-  ok(result!.endsWith("/path with spaces"));
-});
-
-test("returns null for non-cd command", () => {
-  equal(extractCdPath("git commit -m test"), null);
-});
-
-test("returns null for cd without git op suffix", () => {
-  // The regex requires && or ; after the cd path to avoid false positives
-  equal(extractCdPath("cd /tmp"), null);
-});
-
-test("cd inside quoted prose does not poison cwd (P2-2 fix)", () => {
-  equal(extractCdPath('gh pr merge 1 --comment "see cd /tmp && x"'), null);
-  equal(extractCdPath("git commit -m 'run cd /tmp && fix'"), null);
-});
-
-test("cd after a command separator is still detected (P2-2 fix)", () => {
-  ok(extractCdPath("echo x && cd /tmp && git commit")!.endsWith("/tmp"));
-  ok(extractCdPath("cd /a && cd /b && git commit")!.endsWith("/a")); // first boundary-anchored cd wins
-});
-
-test("cd after a bare newline separator is detected (cycle-4 P2-1 fix)", () => {
-  ok(extractCdPath("echo hello\ncd /tmp && git commit")!.endsWith("/tmp"));
-});
-test("review 230 P2-3: quoted prose cd shapes never poison cwd", () => {
-  equal(extractCdPath('gh pr merge 1 --comment "see; cd /tmp && x"'), null);
-  equal(extractCdPath('gh pr merge 1 --body "first\ncd /tmp && second"'), null);
-  ok(extractCdPath('cd "/path with spaces" && git commit')!.endsWith("/path with spaces"));
-});
-
-test("review 230 P2-2: HOST/OWNER/REPO forms normalize to OWNER/REPO", () => {
-  equal(extractGhRepoEnv("GH_REPO=github.com/owner/repo gh pr merge 123"), "owner/repo");
-  equal(extractGhRepoEnv("GH_REPO=a/b/c/d gh pr merge 123"), null);
-  equal(extractRepoFlag("gh pr merge 123 --repo github.com/owner/repo"), "owner/repo");
+test("neither extension declares a local copy of the command parsers (#966)", () => {
+  const sources: Array<[string, string]> = [
+    ["verification-gate", readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8")],
+    ["review-enforcer", readFileSync(fileURLToPath(new URL("../review-enforcer/index.ts", import.meta.url)), "utf-8")],
+  ];
+  for (const [name, src] of sources) {
+    ok(src.includes("shared/git-command-parse.js"), `${name} must import the shared parser`);
+    for (const helper of [
+      "extractCdPath",
+      "extractRepoFlag",
+      "extractGhRepoEnv",
+      "extractPrNumber",
+      "parseCdChains",
+      "expandCdTarget",
+      // The quote model was promoted to shared on the #966 merge — review-enforcer's
+      // `matchUnquoted` / `countUnquotedMergeVerbs` and the shared masked PR scan are
+      // consumers of ONE model, so a local re-declaration here is the drift again.
+      "unquotedMask",
+      // The verb grammar is a shared export too (this extension's merge window
+      // matches on it). It is a `const` regex, so only the declaration scan above
+      // can see a re-declaration.
+      "GH_PR_MERGE_VERB",
+    ]) {
+      ok(!declaresHelper(src, helper), `${name} must not declare a local ${helper} (#966: one copy only)`);
+    }
+  }
 });
 
 // ── Module load regression ───────────────────────────
@@ -847,35 +887,11 @@ test("VGATE PASS overwrites even when path not in lastBlockedFiles", () => {
 
 // ── #204: gh pr merge scope — PR repo resolution ─────
 
-section("extractRepoFlag / extractGhRepoEnv — PR repo resolution (#204)");
-
-test("extractRepoFlag: --repo owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 123 --repo acme/widget"), "acme/widget");
-});
-
-test("extractRepoFlag: -R owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 123 -R acme/widget --squash"), "acme/widget");
-});
-
-test("extractRepoFlag: --repo=owner/name (equals form)", () => {
-  equal(extractRepoFlag("gh pr merge 123 --repo=acme/widget"), "acme/widget");
-});
-
-test("extractRepoFlag: absent → null", () => {
-  equal(extractRepoFlag("gh pr merge 123"), null);
-});
-
-test("extractRepoFlag: does not match git remote args", () => {
-  equal(extractRepoFlag("git remote add origin git@github.com:a/b.git"), null);
-});
-
-test("extractGhRepoEnv: GH_REPO=owner/name prefix", () => {
-  equal(extractGhRepoEnv("GH_REPO=acme/widget gh pr merge 123"), "acme/widget");
-});
-
-test("extractGhRepoEnv: absent → null", () => {
-  equal(extractGhRepoEnv("gh pr merge 123"), null);
-});
+section("repo context priority — PR repo resolution (#204)");
+// The helper-level cases for extractRepoFlag/extractGhRepoEnv (the
+// [HOST/]OWNER/REPO normalization and the garbage-identity fail-closed rule)
+// live in the shared suite. This pins the resolution ORDER the merge-scope
+// path depends on.
 
 test("repo priority: flag beats env when both present", () => {
   const command = "GH_REPO=env/repo gh pr merge 123 --repo flag/repo";
@@ -935,37 +951,6 @@ test("trailing slash / .git forms never yield a garbage identity (P2 fix)", () =
 test("local path remote → null (fail-closed, no accidental skip)", () => {
   equal(repoNameFromRemote("/tmp/some/repo.git"), null);
   equal(repoNameFromRemote("relative/path"), null);
-});
-
-// ── #204: extractPrNumber ─────────────────────────────
-
-section("extractPrNumber — PR number from merge command (#204)");
-
-test("extracts PR number from gh pr merge", () => {
-  equal(extractPrNumber("gh pr merge 123 --squash"), 123);
-});
-
-test("extracts PR number after cd prefix", () => {
-  equal(extractPrNumber("cd /wt && gh pr merge 42"), 42);
-});
-
-test("extracts PR number when flags precede the number (P2 fix: gh pr merge --squash 123)", () => {
-  equal(extractPrNumber("gh pr merge --squash 123"), 123);
-});
-
-test("extracts PR number with flags + cd prefix in either order", () => {
-  equal(extractPrNumber("cd /wt && gh pr merge --repo x/y 42"), 42);
-  equal(extractPrNumber("gh pr merge -R x/y --squash 7"), 7);
-});
-
-test("extracts PR number with global -R flag before the verb (P2-1 fix)", () => {
-  equal(extractPrNumber("gh -R owner/name pr merge 123"), 123);
-  equal(extractPrNumber("GH_REPO=a/b gh --repo=owner/name pr merge 456"), 456);
-});
-
-test("does not mistake flag values for the PR number", () => {
-  // --repo owner/name never tokenizes as a bare integer.
-  equal(extractPrNumber("gh pr merge --repo 123/owner"), null);
 });
 
 // ── #204: verb-anchored merge detection + command window ─
@@ -1199,6 +1184,114 @@ test("missing file throws (consistent with hashFile; callers fail closed)", () =
   try {
     const sha1 = createHash("sha1").update("x").digest("hex");
     throws(() => hashMatchesDisk(root, "missing.ts", sha1));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── symlink hashing (#1092) ──────────────────────────
+
+section("symlink hashing — the link TARGET is the committed blob (#1092)");
+
+test("symlink to a DIRECTORY hashes its link target — no EISDIR (#1092)", () => {
+  // The #1092 reproduction: `readFileSync` throws EISDIR on a directory
+  // symlink, and the commit loop routes every errno but ENOENT/ENOTDIR to
+  // `unverified` — so a path like pi-config/extensions/<new-dir> was
+  // PERMANENTLY un-committable. It must hash the link target instead.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "ext-real"));
+    writeFileSync(join(root, "ext-real", "index.ts"), "export const a = 1;\n");
+    symlinkSync("ext-real", join(root, "farm-entry"));
+    const stored = createHash("sha256").update("ext-real").digest("hex");
+    equal(hashMatchesDisk(root, "farm-entry", stored), true, "a dir symlink must verify by its link target");
+    // NOT the content reachable through it (which is a directory, unreadable)
+    const throughContent = createHash("sha256").update("export const a = 1;\n").digest("hex");
+    equal(hashMatchesDisk(root, "farm-entry", throughContent), false, "must not hash a file inside the linked dir");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a symlink to a FILE also hashes the link target (git 120000 blob), not the target's content", () => {
+  // Deliberate semantics (the #305 completion): git commits the TARGET STRING.
+  // Hashing followed content would miss a retarget to an equal-content file.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    writeFileSync(join(root, "target.ts"), "same bytes\n");
+    symlinkSync("target.ts", join(root, "link.ts"));
+    equal(hashMatchesDisk(root, "link.ts", createHash("sha256").update("target.ts").digest("hex")), true);
+    equal(hashMatchesDisk(root, "link.ts", createHash("sha256").update("same bytes\n").digest("hex")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a retargeted symlink is drift (anti-drift preserved) — same link, different bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "a"));
+    mkdirSync(join(root, "b"));
+    symlinkSync("a", join(root, "entry"));
+    const stored = createHash("sha256").update("a").digest("hex");
+    equal(hashMatchesDisk(root, "entry", stored), true);
+    rmSync(join(root, "entry"));
+    symlinkSync("b", join(root, "entry"));
+    equal(hashMatchesDisk(root, "entry", stored), false, "a post-verification retarget must fail closed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a broken symlink hashes its target string (lstat, never follow-through)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    symlinkSync("nowhere-at-all", join(root, "dangling"));
+    equal(hashMatchesDisk(root, "dangling", createHash("sha256").update("nowhere-at-all").digest("hex")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("non-UTF-8 link targets are hashed byte-exact ({ encoding: 'buffer' })", () => {
+  // A string readlink would decode-lossy the target and hash bytes git never
+  // stored; the digest must be over the raw link bytes.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    const rawTarget = Buffer.from([0x61, 0xff, 0xfe, 0x62]);
+    symlinkSync(rawTarget, join(root, "weird"));
+    equal(hashMatchesDisk(root, "weird", createHash("sha256").update(rawTarget).digest("hex")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("errno semantics preserved: a D/F conflict still throws ENOTDIR (not EISDIR-swallowed)", () => {
+  // The #920 branch discriminates on these errnos — lstatSync must throw the
+  // same ones readFileSync did, or a genuine D/F deletion would start blocking.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    writeFileSync(join(root, "parent"), "a regular file\n");
+    let code: string | undefined;
+    try { hashMatchesDisk(root, "parent/child.ts", "0".repeat(64)); } catch (err: any) { code = err?.code; }
+    equal(code, "ENOTDIR");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the hashed bytes are git's own blob for the link (index agreement)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "ext-real"));
+    symlinkSync("ext-real", join(root, "farm-entry"));
+    execSync("git init -q -b main && git add farm-entry", { cwd: root, stdio: "ignore" });
+    // git records the entry as a mode-120000 blob whose contents ARE the target
+    const entry = execSync("git ls-files -s -- farm-entry", { cwd: root, encoding: "utf-8" }).trim();
+    equal(entry.split(/\s+/)[0], "120000", "staging a symlink yields a mode-120000 entry");
+    const targetBytes = execSync("git cat-file -p :farm-entry", { cwd: root, encoding: "buffer" });
+    equal(hashMatchesDisk(root, "farm-entry", createHash("sha256").update(targetBytes).digest("hex")), true,
+      "the gate hashes exactly the bytes git stored for that path");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2720,6 +2813,70 @@ test("tier B emits whatever base the resolver chose — NON-ORIGIN base flows th
   );
 });
 
+// ── #3716 — OID pinning + the OID-only probe whitelist ──────────────────────
+test("#3716: resolveCommitOid pins a ref to an OID and refuses everything else; isAncestorOrEqual is OID-only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vgate-oid-"));
+  try {
+    execSync("git init -q -b main", { cwd: dir });
+    execSync("git config user.email t@t", { cwd: dir });
+    execSync("git config user.name t", { cwd: dir });
+    writeFileSync(join(dir, "a.txt"), "a\n");
+    execSync("git add . && git commit -q -m one", { cwd: dir });
+    const c1 = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
+    writeFileSync(join(dir, "b.txt"), "b\n");
+    execSync("git add . && git commit -q -m two", { cwd: dir });
+    const c2 = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
+    equal(resolveCommitOid(dir, "HEAD"), c2, "resolveCommitOid pins HEAD to its commit OID");
+    equal(resolveCommitOid(dir, "refs/heads/nope"), null, "an unresolvable ref → null (fail-closed)");
+    equal(resolveCommitOid(dir, "evil; rm -rf /"), null, "a non-whitelisted ref never reaches the shell");
+    equal(resolveCommitOid(dir, "-D"), null, "an option-shaped token is refused");
+    equal(resolveCommitOid(dir, "--upload-pack=x"), null, "an option-shaped token is refused (long form)");
+    // ⛔ The probe interpolates into /bin/sh -c: a ref NAME must never reach it.
+    equal(isAncestorOrEqual(dir, "HEAD", "HEAD"), null, "a refname is refused — OIDs only");
+    equal(isAncestorOrEqual(dir, c1, c1), true, "an OID is an ancestor-or-equal of itself");
+    equal(isAncestorOrEqual(dir, c1, c2), true, "the ancestor direction resolves true");
+    equal(isAncestorOrEqual(dir, c2, c1), false, "a descendant is an EXPLICIT negative, never null");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── #3716 — the kill switch must cover the NARROWING, not only #755 ────────
+test("#3716: the kill switch (subDisabled) keeps the pre-#3716 scope — a rewrite push is not narrowed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vgate-nosub-"));
+  try {
+    const g = (a: string) => execSync(`git ${a}`, { cwd: dir, encoding: "utf-8" }).trim();
+    execSync("git init -q -b main", { cwd: dir });
+    execSync("git config user.email t@t", { cwd: dir });
+    execSync("git config user.name t", { cwd: dir });
+    writeFileSync(join(dir, "baseline.ts"), "b\n");
+    execSync("git add . && git commit -q -m c0", { cwd: dir });
+    execSync("git checkout -q -b feat", { cwd: dir });
+    writeFileSync(join(dir, "feat.ts"), "f\n");
+    execSync("git add . && git commit -q -m feat", { cwd: dir });
+    const preRebase = g("rev-parse HEAD");
+    execSync(`git update-ref refs/remotes/origin/feat ${preRebase}`, { cwd: dir });
+    // main advances, then the branch is rebased onto it — the #3716 rewrite shape.
+    execSync("git checkout -q main", { cwd: dir });
+    writeFileSync(join(dir, "main-delta.ts"), "m\n");
+    execSync("git add . && git commit -q -m upstream", { cwd: dir });
+    const mainTip = g("rev-parse HEAD");
+    execSync(`git update-ref refs/remotes/origin/main ${mainTip}`, { cwd: dir });
+    // #1491 — the narrowing requires an explicit declaration of the integration ref.
+    execSync("git config vgate.integrationRef refs/remotes/origin/main", { cwd: dir });
+    execSync("git checkout -q feat && git rebase -q origin/main", { cwd: dir });
+    // Proofs hold: origin/main IS an ancestor of the rebased tip; origin/feat is not.
+    const narrowed = resolvePushRangeScope("git push --force origin feat", dir, null, false);
+    const widened = resolvePushRangeScope("git push --force origin feat", dir, null, true);
+    deepEqual(narrowed?.files, ["feat.ts"],
+      "narrowed: the branch's own diff — main's delta is base-identical (the #3716 scope)");
+    deepEqual(widened?.files, ["main-delta.ts"],
+      "kill switch: the pre-#3716 2-dot scope is kept — main's delta is demanded again");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── #490 T2: head-anchored git-global-option parse + shared verb scanner ──
 // Group A = RED pins (fail on the pre-fix regex family — write-first, each
 // confirmed failing before the scanner landed). Group B = green guards
@@ -3323,6 +3480,136 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
     /const sessionRoot = normalizeWorktreeRoot\(recoveryOnlyRoot\(/.test(src),
     "session-start bridge recovery is the one place adoption is permitted",
   );
+});
+
+// ── #920 (O3) cycle-4 review, P2: ASK THE INDEX, never parse stderr ──
+//
+// The cycle-2 P2-A rule read a `git cat-file -e` 128 as absence when stderr
+// carried `does not exist (neither on disk nor in the index)`. git ECHOES THE
+// PROBED PATH in its fatal messages, so a path literally NAMED after that
+// phrase satisfied the substring test. The conflicted-index form — `fatal:
+// path '<p>' is in the index, but not at stage 0` — is a 128 that echoes the
+// path, so such a path read as ABSENT, the `ENOTDIR` branch `continue`d, and
+// the op was ALLOWED. The fix replaces stderr interpretation with a direct
+// membership question, `git ls-files -z -- :(top,literal)<path>`.
+//
+// The tests below are the four pins the new rule needs — entry present ⇒
+// records content; entry absent ⇒ absent; non-zero exit ⇒ fail CLOSED;
+// ambiguous/spawn failure ⇒ fail CLOSED — plus the cycle-4 counterexample
+// itself (REAL git, conflicted index) and a structural pin that no stderr
+// substring matching survives in the helper.
+section("indexRecordsContent — membership comes from the index, never from stderr (#920 P2)");
+
+// A real file name chosen to collide with the phrase the OLD rule matched on.
+const ABSENCE_PHRASE_PATH = "does not exist (neither on disk nor in the index)";
+
+/** Initialise a scratch repo and return a blob-hash helper bound to it. */
+function scratchRepo(prefix: string) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  execSync("git init -q -b main .", { cwd: dir, stdio: "ignore" });
+  const blob = (content: string) =>
+    execSync("git hash-object -w --stdin", { cwd: dir, input: content, encoding: "utf-8" }).trim();
+  return { dir, blob };
+}
+
+test("REAL git: a staged index entry reads as RECORDS CONTENT", () => {
+  const { dir } = scratchRepo("vgate-indexprobe-staged-");
+  try {
+    writeFileSync(join(dir, "staged.ts"), "staged\n");
+    execSync("git add staged.ts", { cwd: dir, stdio: "ignore" });
+    equal(indexRecordsContent(dir, "staged.ts"), true,
+      "a non-empty `ls-files` listing — the index holds the blob a bare commit records ⇒ must block if unread");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: a path in NEITHER the index nor the worktree is ABSENT — the skip branch stays intact", () => {
+  // The other half of the discrimination: an empty listing with exit 0 must
+  // still read as ABSENT, or every D/F deletion would name-block (e2e 920(P1)
+  // leg (b)). There is no message to parse any more, so this is the only way to
+  // over-block — and it is pinned here.
+  const { dir } = scratchRepo("vgate-indexprobe-empty-");
+  try {
+    equal(indexRecordsContent(dir, "ghost.ts"), false,
+      "genuine absence (empty stdout, exit 0) must stay a skip; it must not name-block every deletion");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: a non-zero exit outside any repo reads as RECORDS CONTENT (fail CLOSED)", () => {
+  // Not a synthetic err: git itself returns 128 with `fatal: not a git
+  // repository` here. A probe that cannot answer must never read as absence.
+  const dir = mkdtempSync(join(tmpdir(), "vgate-indexprobe-norepo-"));
+  try {
+    throws(() => execSync("git rev-parse --show-toplevel", { cwd: dir, stdio: "ignore" }),
+      "precondition: the temp dir must NOT be inside a git repo");
+    equal(indexRecordsContent(dir, "a.ts"), true,
+      "outside a repo the probe cannot answer ⇒ records-content (fail CLOSED), not absence");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous/spawn failure ⇒ fail CLOSED (unanswerable cwd reads as RECORDS CONTENT)", () => {
+  // A cwd that does not exist makes `execSync` fail to spawn git at all — the
+  // pure "probe could not RUN" class, with no exit status and no stderr.
+  const ghostCwd = join(tmpdir(), "vgate-indexprobe-no-such-cwd-", String(Date.now()));
+  equal(existsSync(ghostCwd), false, "precondition: the cwd must not exist");
+  equal(indexRecordsContent(ghostCwd, "a.ts"), true,
+    "a spawn failure is ambiguous ⇒ must read as records-content (fail CLOSED), never as absence");
+});
+
+test("REAL git: a conflicted-index path NAMED like git's absence message is RECORDS CONTENT (#920 P2)", () => {
+  // The cycle-4 counterexample, with real git. An unmerged index (stages 1/2/3,
+  // no stage 0) is exactly the shape that made the OLD `cat-file -e` probe
+  // print `fatal: path '<name>' is in the index, but not at stage 0` — a 128
+  // that echoes the path. When the path is literally named after the phrase the
+  // old rule substring-matched, that echo read as absence ⇒ skip ⇒ ALLOW: the
+  // fail-open this test is RED against pre-fix.
+  const { dir, blob } = scratchRepo("vgate-indexprobe-echo-");
+  try {
+    const info = `100644 ${blob("base\n")} 1\t${ABSENCE_PHRASE_PATH}\n`
+      + `100644 ${blob("ours\n")} 2\t${ABSENCE_PHRASE_PATH}\n`
+      + `100644 ${blob("theirs\n")} 3\t${ABSENCE_PHRASE_PATH}\n`;
+    execSync("git update-index --index-info", {
+      cwd: dir, input: info, stdio: ["pipe", "ignore", "ignore"],
+    });
+    equal(indexRecordsContent(dir, ABSENCE_PHRASE_PATH), true,
+      "the index DOES hold entries at this path ⇒ records content; a path-echoing fatal message must not read as absence");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: glob metacharacters in a real file name are matched LITERALLY", () => {
+  // A plain pathspec would expand `a[1].ts` as a bracket expression and could
+  // list nothing (or the wrong entry) for a path that IS in the index —
+  // `:(top,literal)` is what makes the listing authoritative.
+  const { dir } = scratchRepo("vgate-indexprobe-glob-");
+  try {
+    writeFileSync(join(dir, "a[1].ts"), "brackets\n");
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+    equal(indexRecordsContent(dir, "a[1].ts"), true,
+      "a literal file name with glob metacharacters must resolve to its own index entry");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the index probe never substring-matches stderr (#920 P2 structural pin)", () => {
+  const src = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8");
+  const start = src.indexOf("export function indexRecordsContent");
+  ok(start >= 0, "precondition: the index probe must exist");
+  const end = src.indexOf("\n}\n", start);
+  const body = src.slice(start, end);
+  ok(/git ls-files -z -- /.test(body), "the probe must ask the index via `git ls-files -z --`");
+  ok(!/cat-file/.test(body), "`cat-file -e` must be gone from the probe — its path-echoing stderr was the defect");
+  ok(!/includes\s*\(/.test(body),
+    "no substring `includes(...)` test may remain anywhere in the probe");
+  ok(!/does not exist \(neither on disk nor in the index\)/.test(body),
+    "the absence-message constant must be gone from the probe");
 });
 
 // ── Results ───────────────────────────────────────────

@@ -28,7 +28,7 @@ contract.
 ## 1. Signal — `os.loadavg()[0]` (1-min load average)
 
 - Read via injectable getters on both consumers: `getLoad1()` in
-  `extensions/builtin-tools/index.ts` (test seam `__setGetLoad1`), `readLoad1()`
+  `extensions/builtin-tools/index.ts` (test seam `setLoad1Override()`), `readLoad1()`
   in `scripts/load-gate.mjs` (CLI tests inject through `run()`'s `deps`).
 - **1-min exponential average** — trailing by design; supports hysteresis (never
   trust a single sample).
@@ -49,16 +49,20 @@ contract.
 
 ## 2. Thresholds — per-core normalized + hysteresis band
 
-Defaults are per-core so a fixed constant means the same thing on different
-hosts, anchored to the wt-291 documented operating point (load ~25 on 10
-cores ≈ 2.5×/core):
+These two are the **load-gate** thresholds (batch suspension). Defaults are
+per-core so a fixed constant means the same thing on different hosts, anchored
+to the wt-291 documented operating point (load ~25 on 10 cores ≈ 2.5×/core):
 
 | Threshold | Default | Rule |
 |---|---|---|
-| `LOAD_SUSPEND_THRESHOLD` | `2.5 × cores` (10-core: 25) | suspend batches / saturate watchdog scale at **≥** this |
+| `LOAD_SUSPEND_THRESHOLD` | `2.5 × cores` (10-core: 25) | suspend batches at **≥** this. Does **not** drive the watchdog — the watchdog's bands are fixed and separate (#1073, see §6) |
 | `LOAD_RESUME_THRESHOLD` | `1.5 × cores` (10-core: 15) | resume only **below** this (40% hysteresis band) |
-| `TASK_LOAD_SCALE_START` | `1.5 × cores` (10-core: 15) | watchdog first-message bound begins extending at **≥** this |
-| `TASK_LOAD_SCALE_MAX` | `3` | watchdog bound multiplier cap (300s → 900s) |
+
+The watchdog does **not** share these thresholds, and it has **no operator-tunable
+scale point or multiplier cap** — its bands are fixed literals and its only *scale*
+input is `TASK_LOAD_SCALE_OFF` (§6, #1073). The bands are absolute
+magnitudes rather than per-core; that calibration is documented, not corrected,
+here (recalibrating it moves live bounds and is tracked separately, #1116).
 
 **Hysteresis:** a batch that defers waits until load drops **below** the resume
 threshold — a single-sample dip between suspend and resume never thrash-resumes
@@ -69,21 +73,24 @@ threshold — a single-sample dip between suspend and resume never thrash-resume
 
 | Env | Default | Consumer | Meaning |
 |---|---|---|---|
-| `LOAD_SUSPEND_THRESHOLD` | `2.5 × os.cpus().length` (10-core: 25) | load-gate.mjs + builtin-tools scale anchor | suspend batches / saturate watchdog scale at ≥ this |
+| `LOAD_SUSPEND_THRESHOLD` | `2.5 × os.cpus().length` (10-core: 25) | load-gate.mjs (the watchdog reads none of it — #1073) | suspend batches at ≥ this; not a watchdog scale input |
 | `LOAD_RESUME_THRESHOLD` | `1.5 × os.cpus().length` (10-core: 15) | load-gate.mjs | resume only below this (hysteresis band) |
-| `TASK_LOAD_SCALE_START` | `1.5 × os.cpus().length` (10-core: 15) | builtin-tools | first-message bound begins extending at ≥ this |
-| `TASK_LOAD_SCALE_MAX` | `3` | builtin-tools | multiplier cap on the first-message bound (300s → 900s) |
+| `TASK_HEARTBEAT_CUT_GAP_MS` | derived `1.25 ×` tick interval (`37.5s` at the 30s default), floor `15_000` | builtin-tools cut clause | marker-gap cut deadline. **An explicit value is honoured VERBATIM and never load-rescaled** — only the derived default is scaled (#1070; see §6) |
 | `LOAD_GATE_MAX_WAIT_MIN` | `10` | wrappers (bounded poll) | minutes to poll before exit 3; `0` = no poll (deterministic defer for tests) |
 | `LOAD_GATE_FORCE` | unset | load-gate.mjs / wrappers | `1` bypasses the gate (`--force` flag sets it) |
-| `TASK_FIRST_OUTPUT_TIMEOUT_MS` | `60_000` | builtin-tools tier-1 | first-output bound (NOT load-scaled) |
+| `TASK_FIRST_OUTPUT_TIMEOUT_MS` | `60_000` | builtin-tools tier-1 | first-output bound (NOT load-scaled). `60_000` is a **floor** — a smaller value is silently clamped UP to it (a shorter bound would cut a slow-starting spawn), and a larger value now takes effect: the override was documented but unwired before #1073, so a host that had it exported sees the longer bound for the first time (bounded by the `TASK_HEARTBEAT_TIMEOUT_MS` silence clause, §6) |
 | `GIT_REMOTE_TIMEOUT_MS` | load-scaled base `5_000` (x1/2/3 by loadavg tier; `TASK_LOAD_SCALE_OFF=1` → `5_000`) | slack-bridge `gitRemoteTimeoutMs()` | git config lookup cap (#196 fold, #232) |
 | `TREE_KILL_EXEC_TIMEOUT_MS` | `5_000` | tree-kill `execTimeoutMs()` | pgrep/ps cap on the kill path (#196 fold) |
+| `PROCESS_SWEEP_EXEC_TIMEOUT_MS` | `5_000` | process-sweep `sweepExecTimeoutMs()` | pgrep/ps cap on the settle-path sweep + the own-pgid probe (#1074). Aligned with `TREE_KILL_EXEC_TIMEOUT_MS` for the same binaries; the override exists so a test can force a deterministic probe timeout with a PATH shim |
+| `TASK_PROGRESS_AGE_MS` | `2_700_000` (45 min) | builtin-tools `no-progress` clause (#5195) | how long a **task** child with NO tool in flight may go without a COMPLETED unit of work (a `tool_end`) or content-grounded child progress (`progress=1` on a tick — see §6). The only bound in the family keyed on **progress** rather than liveness, and deliberately **NOT load-scaled and NOT latched**: a bound that widens is how this class escaped every other clause (`#363` 2h→6h, `ea22897` making the stream-stall bound per-dispatch). Floored at the **reporting cadence** — `max(60 s, 3 × the tick interval)` — because the parent can only see progress when the child reports it and the tick interval is settable to 300 s; the value is honoured verbatim above that floor. `0` = OFF (explicit off switch); blank/malformed → the default (never off by a typo). **45 min is the repo's own declared ceiling for the child's retry/hang window** — `HANG_WINDOW_CEILING_MS` in `scripts/check-cost-config.sh`, whose §2 counterpart (`cost-config-policy.md`, which derives the figure and calls it a *no-progress window*) requires that window to sit ≤ this ceiling. Setting this bound **below** it would pre-empt a chattering retrying child's own bounded, visible recovery (`auto_retry_end`); see §6. |
+| `TASK_CPU_STALL_MS` | `1_800_000` (30 min) | builtin-tools `tool-dead` clause (#928) | how long an in-flight, output-silent tool may consume no CPU before it is treated as deadlocked — the complement of `tool-silence`, and the only bound that reaches a tool which never emitted a **renderable** update (#1505: pi's bash emits an unconditional zero-byte start update for every call, so "emitted an update" was never the same as "produced output" — the `tool-silence` clause used to arm on the first tick of every bash call). Floored at 60 s; `0` = OFF; blank/malformed → the default. *(Pre-existing omission: the clause and its knob shipped in #928 but were never added to this table; recorded here so §3 is the complete vocabulary it claims to be.)* |
+| `TASK_TOOL_TIMEOUT_S` | `7200` (`DEFAULT_TOOL_TIMEOUT_S`) | task-heartbeat `getToolTimeoutSeconds()` (#1500) | the wall-clock bound injected into a **dispatched child's** `bash` call — filled by a `tool_call` hook only when the caller supplied no `timeout`, so an explicit value is never overridden. **Absent → ON** (the defect was that pi's own bash schema has *"optional, no default timeout"*, so an unbounded command parked the child permanently); a value the operator *supplies* that is non-positive, non-finite or unparseable → **DISARMED**, with a once-only warning on stderr. Clamped to `floor(2147483647/1000)` s so pi's own `resolveTimeoutMs` does not reject the call. Measured, not guessed: across 658,981 completed bash calls the maximum was 5417.8 s and **8 exceeded 3600 s (7 with no explicit timeout)**, so the bound sits above every observed legitimate call. Note it bounds **every** dispatched child's bash — reviewer, verification-gate and design-reviewer children included — which lowers the effective ceiling for such a call from clause 2's 4 h to 2 h. |
 
-**One-line ordering-clamp note:** watchdog scale config requires
-`suspend > start` and `resume ≤ suspend` — under misconfiguration both fall
-back to defaults (a NaN/Infinity effective bound is never produced); load-gate
-clamps `resume > suspend` down to `suspend` (safe direction; preserves the
-`LOAD_SUSPEND_THRESHOLD=0` always-defer hook). Validity: absent/empty/
+**One-line ordering-clamp note:** the watchdog has no scale config to order —
+its bands are fixed literals and it does **not** read `LOAD_SUSPEND_THRESHOLD`
+(#1073); `TASK_LOAD_SCALE_OFF=1` is its only scale input. `load-gate` clamps
+`resume > suspend` down to `suspend`
+(safe direction; preserves the `LOAD_SUSPEND_THRESHOLD=0` always-defer hook). Validity: absent/empty/
 non-finite/negative → default; `0` is **valid** for suspend/resume/maxWaitMin
 (the deterministic-defer test hook).
 
@@ -135,11 +142,23 @@ CLI: `node scripts/load-gate.mjs check [--deferred] [--json] [--force]`.
 sets `LOAD_GATE_FORCE=1` (the env var alone also works) → exit 0
 unconditionally.
 
-## 6. Watchdog side (builtin-tools) — the first-message bound
+## 6. Watchdog side (builtin-tools) — the first-message and cut-gap bounds
 
-- `effM = max(M, round(M × scale(load1)))` where `scale = 1` at
-  `load1 ≤ TASK_LOAD_SCALE_START`, `TASK_LOAD_SCALE_MAX` at `load1 ≥
-  LOAD_SUSPEND_THRESHOLD`, linear mid-band. **Load only EXTENDS the bound**
+- **The scale function** is `loadScaledBound(base, load1)`: **three discrete
+  bands, no linear region** — `1x` below load `8`, `2x` at `8 ≤ load1 < 16`, `3x`
+  at `load1 ≥ 16`; `TASK_LOAD_SCALE_OFF=1` → `1x`. There is **no operator-tunable
+  scale point and no multiplier cap**: those thresholds are fixed literals and
+  `TASK_LOAD_SCALE_OFF` is the only env var this function reads (#1073). The
+  bands are absolute magnitudes anchored to the 10-core operating point
+  (8/16 = 0.8×/1.6× per core there), so a host with fewer cores scales later and
+  a larger one earlier; correcting that is a live-bound change tracked
+  separately (#1116). The same function and the same bands are duplicated as
+  `loadScaledTimeoutMs()` in `extensions/slack-bridge/socket-mode.ts`, and
+  `extensions/shared/load-scale-contract.test.ts` pins the two copies equal and
+  pins this doc's bands to the code's literals.
+- **First-message bound:** `effM = max(M, M × scale(load1))` where
+  `scale ∈ {1,2,3}`. The scaling path does not round — `loadScaledBound`
+  multiplies by 1/2/3 exactly. **Load only EXTENDS the bound**
   (never shrinks below the env-overridable static `TASK_FIRST_MESSAGE_MS`).
 - **Per-dispatch monotonic high-water-mark latch:** an agent's effM is
   `max(previous tick's effM, recomputed effM)` — once a storm raises the bound
@@ -175,8 +194,144 @@ unconditionally.
 - **Observability:** when effM extends beyond M the loop emits
   `[task] first-message bound 300s → 900s (load1=60)` (rate-limited to bound
   increases); the kill headline shows the EFFECTIVE bound (the 905s cut once
-  printed "bound 300s" under a latched 900s bound — fixed). All four `Alive
-  state:` diagnostics expose `everSawRealActivity=` for triage.
+  printed "bound 300s" under a latched 900s bound — fixed). **The same rule now
+  holds for the ages (#1070)** on the four age-reporting clauses — tool-silence,
+  stream-stall, tool-stall and first-message-stall: they fire on the EFFECTIVE
+  ages (`raw + markerAge`), so their headlines and the
+  `[task] first-message-stall diagnostic:` line report the effective age. The raw
+  `streamAgeMs`/`toolAgeMaxMs` in the payload is the child's frozen last
+  self-reported sample, not a live reading. All four `Alive state:` diagnostics
+  expose the raw pair, `effStreamAgeMs=` / `effToolAgeMs=`, and
+  `everSawRealActivity=` for triage.
+- **Cut-gap bound (#1070):** the marker-gap cut deadline is a SECOND consumer of
+  the same scale function. `effCutGap = getEffectiveCutGapMs(latched, load1)` —
+  the derived base (`1.25 ×` tick interval, floor `15_000`) scaled 1x/2x/3x, with
+  its own per-dispatch monotonic latch (the same no-shrink rule as effM: a storm
+  that starts mid-dispatch extends the window; a post-storm load drop never
+  re-cuts). An explicit `TASK_HEARTBEAT_CUT_GAP_MS` is honoured **verbatim and is
+  never rescaled** — only the derived default scales, so pinning it is how a test
+  or an operator gets a host-independent bound. The loop emits
+  `[task] cut-gap bound 38s -> 113s (load1=60)` on a real increase (`Math.round`
+  of the 112.5s 3x bound is 113).
+  **Reachability invariant:** the clause is gated by `stateFresh`
+  (`markerAge ≤ max(2·T, 2·interval)`), so a scaled gap at or above that window
+  makes it structurally unreachable; the loop emits a one-shot
+  `[task] cut-gap bound Xs >= the stateFresh window Ys …` warning when an override
+  crosses it. Safe at the shipped defaults (T = 30min ⇒ window 60min, ~30× the 3x
+  gap).
+- **Per-dispatch inactivity bound (`stream_stall_ms`, #1030):** S (the
+  in-flight-tool silence bound, and the idle-stream bound — one constant, two
+  clauses) is resolvable **per dispatch** by the task tool's `stream_stall_ms`
+  argument: `resolveStreamStallMs(param)` → the param when it is a positive
+  finite number (floored at 60s), else `max(60 s, TASK_STREAM_STALL_MS)` when
+  that env override is a positive finite number, else
+  `DEFAULT_STREAM_STALL_MS`. **Both paths are FAIL-CLOSED:** a non-finite or
+  non-positive value *on either path* (`Infinity`, `1e400`, `NaN`, `0`,
+  negative, non-numeric) resolves to the default — an override may RAISE S,
+  never disable it, and the ambient path carries the same gate so the fallback
+  cannot re-open what the override rejects. **An accepted value is honoured VERBATIM
+  and is never load-rescaled** — the same rule §3 already states for
+  `TASK_HEARTBEAT_CUT_GAP_MS`: an operator who names a number means it. A bad
+  shape (`Infinity`, `1e400`, `NaN`, `0`, negative, non-numeric) fails **CLOSED**
+  to the ambient bound — an override may RAISE S, never disable it, and the
+  ambient bound is itself fail-closed (#1030 review cycle 1: the env path used to
+  return `Infinity` for `TASK_STREAM_STALL_MS=Infinity`). Because S is
+  the bound that gates `tool-silence`/`stream-stall` while the tool-AGE backstop
+  (2/3 of the effective hard cap) ignores output, an S **at or above** that
+  backstop makes the silence clauses structurally unreachable: the loop emits the
+  one-shot `[task] inactivity bound Xs >= the tool-age backstop Ys …` warning.
+  **Warn, never clamp** (the #1070 precedent: kill timing is an operator
+  decision). One value is resolved per dispatch and threaded to every leg, so the
+  bound applied cannot diverge from the bound reported. Raised for a dispatch
+  that knowingly runs a long, QUIET tool (a full test suite, a repo-wide search)
+  — the measured #1030 wedges were five single silent calls of 1203–1341s against
+  the 1200s default. It is **not** a workaround for a genuinely wedged tool: the
+  age backstop and the hard cap are untouched by S.
+- **The `no-progress` clause (#5195) — the only bound on PROGRESS rather than liveness.**
+  Every other clause in the detector infers "wedged?" from a *liveness* signal,
+  and every liveness signal is forgeable by a process that is alive but doing
+  nothing: `stateFresh` re-arms the **backstop** (the 6h hard cap itself is
+  one-shot and NOT gated on it), every marker
+  receipt and turn transition resets the stream clock, the first-message bound
+  latches off for the rest of the dispatch once a session has done any work, and
+  the tool clauses all need a tool. Those composed into a class bounded by
+  nothing below the 6h backstop, and two shapes reached it — a content-free
+  **empty-turn loop** and a no-progress **drip stream** (both keep heartbeat
+  ticks flowing, so silence never fires). The new clause fires when a dispatch
+  with **no tool in flight** goes longer than `TASK_PROGRESS_AGE_MS` (§3) without
+  a completed unit of work: a parsed `tool_end`, or a tick carrying `progress=1`.
+  `progress=1` is the child's content-grounded signal — a completed tool, a
+  finished turn carrying results/content, or non-whitespace streamed text.
+  **Ticks, turn boundaries and fresh markers never advance it**, which is the
+  property no other clause has.
+  - **45 min = the ceiling the repo already declares for this bound.** It is
+    `HANG_WINDOW_CEILING_MS` in `scripts/check-cost-config.sh` — the ceiling §2's
+    counterpart in `cost-config-policy.md` requires the derived IDLE-CUT window
+    (stated there, not restated here) to sit under. Setting X below *that* window
+    is a defect rather than extra safety: a child chattering on provider retries
+    with the network **up** keeps every liveness signal fresh while completing
+    nothing — exactly the shape this clause catches — so a shorter X would
+    convert the child's own visible `auto_retry_end` recovery into a
+    parent-side partial-result kill.
+  - **The gap that leaves, named (review cycle 2).** `check-cost-config.sh`
+    declares a **second, larger** window: the worst case where every attempt
+    burns its full provider timeout, carrying its own ceiling
+    (`WORST_WINDOW_CEILING_MS`). X clears the idle-cut window and sits **below**
+    that one. So it is *not* true that X always lands after the child's own
+    recovery: a child whose provider is streaming keepalive frames with no
+    content, or one past its retry budget running compaction (which emits no
+    parent-visible progress), can be cut before the `auto_retry_end` it would
+    have reported — and that settle is a **partial-result kill**, not a success.
+    This is a deliberate **policy** choice, not an oversight: no completed unit
+    of work for 45 min is treated as wedged, and 45 min is the ceiling the repo
+    already declares for this bound. `builtin-tools.test.ts` cross-reads **both**
+    declared ceilings and pins the **band** between them (the worst ceiling must
+    stay within one doubling of the idle-cut one); a *rewritten* guard is caught
+    by the guard's own coupling test (`tests/cost-config/run.sh`, "doc↔guard
+    coupling broken"), not by that cross-read. X still sits ~8×
+    below the 6 h backstop.
+  - **Deliberately NOT load-scaled and NOT latched.** Every sibling bound
+    widens under load or latches monotonically, and that widening is exactly how
+    this class escaped (`#363` raised the hard cap 2h→6h; `ea22897` made S —
+    the previous exemption's *width* — a per-dispatch dial). A progress bound
+    that scaled would reproduce the bug it exists to fix. Pinned by test.
+  - **Floored at the reporting cadence**, `max(60 s, 3 × tick interval)`: the
+    parent can only learn about progress when the child reports it, and the tick
+    interval is settable to 300 s, so a bound below the cadence would fire
+    before the evidence it waits for arrives.
+  - **Fail-closed on the wire.** A child too old to emit `progress` gets its
+    progress clock anchored at `startedAt` and still earns credit from
+    `tool_end` (every version emits it), but nothing for content: a tool-less,
+    content-only dispatch older than X on a skewed child **is** cut. Stated
+    because the alternative — treating a missing field as an exemption —
+    re-opens the hole in a less visible form.
+  - **The silence clause no longer accepts `stream_stall_ms` as an exemption.**
+    The `exempt` predicate used to be `… && (toolsInFlight > 0 ||
+    effStreamAge <= stream_stall_ms)`. Because S is settable per dispatch, that
+    made the *width of the exemption* an operator dial. It was also unreachable
+    at the shipped defaults — `effStreamAge = streamAgeMs + markerAge` and
+    `silenceMs ≤ markerAge`, so reaching `effStreamAge ≤ S` under a silence kill
+    needs `S > T`, and shipped S (20 min) is below T (30 min). Removing it costs
+    nothing at the defaults and deletes the dial (pinned by the #5195 proof
+    test). **The one population it does change:** a dispatch that RAISES S — it
+    is a model-settable `task` argument, and the fleet uses it — loses the extra
+    quiet tolerance for a **no-tool** child, whose bound drops from S to T. That
+    tightening is intended and is the point of the clause: a tool-less child
+    emitting bytes but completing nothing is this clause's target, while S is
+    still honoured verbatim by the in-flight-tool clauses it was introduced for.
+    S still owns `tool-silence`/`stream-stall` verbatim, so **#1070
+    ("warn, never clamp") is honoured — no operator-named number is clamped.**
+- A task child's git is **non-interactive by construction** (#1030): the child
+  env forces git's editor, sequence-editor and terminal-prompt variables to a
+  no-op / `0` respectively, and writes them *after* the ambient env spread so a
+  parent's own editor setting cannot leak in. A task child has no TTY
+  (`stdio: ["ignore","pipe","pipe"]`), so an interactive git invoker can never
+  succeed — it can only consume the dispatch's budget in silence (measured:
+  a merge `git commit` with no `-m`/`-F` opened vim, emitted one screen of
+  escapes, then 0 bytes for 1211s until the bound killed it). The pager class
+  and the SSH askpass hook are deliberately **not** covered here. (These are
+  SET, not read, so they are named only in code and in the builtin-tools suite —
+  the §3 doc↔reader gate exempts nothing a doc names that no source reads.)
 - Tier-1 (`TASK_FIRST_OUTPUT_TIMEOUT_MS`) is **NOT** load-scaled — scaling it
   delays hung-spawn detection, and spawn retry is cheap and stateless.
 
@@ -188,6 +343,11 @@ unconditionally.
   first-message latency up to 15 min of storm time; beyond that, capped by
   design* (uncapped scale would let hung providers linger indefinitely; the
   in-flight tool-silence clause + age backstop remain the bounds for tools).
+- **Cut-gap scaling supersedes the #208 <60s detection target at 2x/3x (#1070):**
+  at 1x the cut clause still resolves inside ~54.5s (the #271 calibration); at 2x/3x
+  the bound is 75s/112.5s, so the ≤60s figure holds at 1x only. That is the
+  deliberate trade: a machine at load 13-18 no longer cuts a child at a flat ~38s
+  marker gap. Bounded by the same 3x cap.
 - **RPO ≤ 48h (not 24h) for daily-backup:** a deferral near one daily
   invocation can slip to the next under sustained load — accepted trade for
   load safety.
@@ -202,6 +362,16 @@ unconditionally.
   defaults calibrated to Linux; set per-host env thresholds; spurious
   suspension is the safe direction.
 - **cgroup/VM-steal blindness:** accepted for a same-host fleet (see §1).
+- **The watchdog's load bands are INERT below the first band on the fleet's
+  10-core hosts:** the bands §6 declares are absolute magnitudes anchored to that
+  operating point, and the first band's threshold sits below one× the core count
+  there (the second is above it) — so every load under the first band's
+  threshold, including the 6.6–7.3 range observed in #1074, leaves the load-aware
+  machinery doing nothing at all (the bound is 1x, i.e. the static
+  env-overridable value). #1073 documents the bands rather than recalibrating
+  them; a per-core rule is tracked in #1116, which is a live-bound change and
+  therefore its own decision. Read the thresholds themselves from §6, which is
+  the single declaration.
 
 ## 8. Swarm CLI contract (documented handoff — out of scope here)
 
@@ -224,3 +394,108 @@ run fires a live BGSAVE, so bypass deliberately.
 Optional schedulers-side helpers that can coexist with the gate: a fixed
 low-load hour for daily-backup, and `nice`/`ionice` priority lowering. Reactive,
 not adaptive — complementary at most (the gate is the adaptive mechanism).
+
+## 11. Scratch checkouts — the un-metered I/O source (#1141)
+
+The load signals in §1–§6 describe a host that is *busy*; this section describes
+one that is busy for no reason. Review/probe/mutation sub-agents repeatedly
+materialised "an isolated copy of the repo" by hand under `/private/tmp`. A
+copy is a second full filesystem tree — on `tortoise` (2,361,772 files in the
+working tree, 698 MB `.git`) that is the single largest avoidable I/O generator
+on the host.
+
+### Producer evidence (2026-09-17, measured)
+
+Across 2,949 recorded pi transcripts (both `sessions/` and `task-sessions/`):
+
+| Producer | Count | Note |
+|---|---|---|
+| `git worktree add` → /tmp | 383 | the right primitive, **not** self-cleaning |
+| `git worktree remove` → /tmp | 335 | ~48 leaked admin records |
+| `cp -R …` → /tmp | 171 | full tree |
+| `git clone …` → /tmp | 66 | tree + a second `.git` |
+| `rsync -a --exclude .git …` → /tmp | 48 | full tree |
+
+No script in the repo emitted these at the time of measurement (`rg
+'/private/tmp' skills/` → 0 hits; this change *adds* mentions of the path to the
+skills, so that command returns 2 hits at the fixing commit). The producers were
+**agent improvisation** — so the durable fix is an explicit, checkable rule in the
+skill text plus a self-cleaning helper, not a reaper.
+
+Surviving artifacts on that host confirmed two copy shapes:
+`/private/tmp/rev13` and `rev14` — 126 MB each, 4,559 files, **no `.git`** (the
+`rsync` shape); `/private/tmp/p1` — 881 MB with nested `before/` + `mid/` trees.
+A third producer was **textual**: `extensions/main-worktree-guard`'s
+working-tree-discard block message *taught* `cp <file> /tmp/probe-<file>` and
+`git worktree add /tmp/probe <ref>, test inside it` with no cleanup obligation.
+
+### After-measurement — a review-shaped workload
+
+`scripts/scratch-worktree.sh` (worktree + `trap` cleanup, `--paths` sparse mode).
+Workload: 8 cycles of "obtain an isolated checkout of a ref and run a check in
+it" against `agent-infra`, measured with `ls -1 /private/tmp | wc -l` and
+`du -sk /private/tmp`.
+
+| Quantity | Value |
+|---|---|
+| `/private/tmp` entries before → after | 168 → 168 (**delta 0**) |
+| `/private/tmp` size before → after | 1,228,128 KB → 1,228,136 KB (**delta 8 KB**) |
+| Per cycle, `--paths skills/code-review` | 112 KB |
+| Per cycle, `--paths <one file>` | 8 KB |
+| Per cycle, `--full` | 22,056 KB (tree only — objects shared) |
+| Per cycle, `git clone --depth 1` (measured, independent reviewer run: tree 22,048 KB + shallow `.git` 8,508 KB) | ~30,600 KB |
+| Leftover scratch worktrees after the run | **0** |
+
+Reproduce it (from a checkout carrying `scripts/scratch-worktree.sh`):
+
+```bash
+SW=scripts/scratch-worktree.sh; R=$(git rev-parse --show-toplevel)
+E0=$(ls -1 /private/tmp | wc -l); S0=$(du -sk /private/tmp | awk '{print $1}')
+for i in 1 2 3 4 5; do bash "$SW" run --repo "$R" --ref origin/main --paths skills/code-review -- du -sk .; done
+for i in 1 2 3;     do bash "$SW" run --repo "$R" --ref origin/main --full -- du -sk .;        done
+bash "$SW" list --repo "$R" | wc -l          # leftovers: expect 0
+E1=$(ls -1 /private/tmp | wc -l); S1=$(du -sk /private/tmp | awk '{print $1}')
+echo "entries $E0 -> $E1 ; KB $S0 -> $S1"
+```
+
+(Read the per-cycle number from the `du` each `run` prints; the `/private/tmp`
+deltas are the entries/size line. Measured 2026-09-17 on Darwin 24.x.)
+
+For comparison, the debris this replaces measured 126 MB + 4,559 files **per
+cycle**, and `p1` alone 881 MB.
+
+### The rule
+
+- Scratch checkouts MUST come from `bash scripts/scratch-worktree.sh run …`
+  (`git worktree add` + `trap` on EXIT/INT/TERM/HUP). Full rule in
+  `skills/code-review/SKILL.md`, `skills/test-writing/SKILL.md`,
+  `skills/verification-before-completion/SKILL.md`.
+- `git clone`, `cp -R`/`cp -r`, `rsync` of the repo, and `git archive | tar -x`
+  into a temp dir are BANNED for scratch checkouts.
+- Leaked worktrees are recoverable by `scripts/pi-reap-worktrees.sh` (#1095) —
+  **except** ones this helper created, which carry an untracked `.scratch-worktree`
+  marker that the reaper classifies as `dirty` and PRESERVEs. Reclaim those with
+  `bash scripts/scratch-worktree.sh clean --repo <repo> --root <its root> <path>`
+  (or `... --root <its root> --all --force-all`). This section exists so they are
+  not created in the first place.
+- The mandated check is ROOT-SCOPED: `scratch-worktree.sh list --repo <repo>
+  --root <the root you used>` must not show a scratch worktree of YOURS. The
+  default root is `$SCRATCH_WORKTREE_ROOT` (else `/tmp`), so a `list` with default
+  arguments is a false PASS for a scratch worktree created under another root or by
+  the hand-rolled recipe below (`$REPO/.worktrees/scratch-$$`).
+- Cleanup deregisters **only its own record**. A bare `git worktree prune` is
+  banned: it deregisters *every* record whose directory is not stat-able at that
+  moment (unmounted volume, permission blip, stale network mount), so a routine
+  probe silently destroys an unrelated sibling worktree's checkout while its
+  files sit on disk. Since `run` is now the mandated path for every review cycle,
+  that fired constantly. The helper reads the worktree's own `gitdir:` line and
+  removes exactly that admin dir; the hand-rolled traps the skills show do the
+  same.
+- A bare `clean --all` is fail-closed (it lists candidates and exits 0): the
+  liveness probe only sees a holder whose **argv names the path**, so a cwd-only
+  holder would be swept. `clean --all --force-all` is the deliberate sibling
+  sweep, for when you have verified no sibling session is mid-probe.
+- `--paths` elements are anchored (`/foo`, not a bare `foo`): under
+  `--no-cone` a bare name is a patternspec matching at any depth, so
+  `--paths small` also pulled in `nested/small/` — inflating the I/O this tool
+  exists to cut and contradicting the "exactly these paths" contract.

@@ -102,10 +102,22 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
+    mkdir -p "$1/.pi/agent/scripts/lib"
+    touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
+    chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
+    # #1178 unit 3 — the scheduled lane-liveness report runs the FARMED tools:
+    # the driver + its sibling classifier under scripts/fleet/ (the broken-target
+    # guard refuses the install when they are absent). NOT tools/fleet/: pi's
+    # startup scan blocks interactive boot on any non-fd/rg entry there (#1277).
+    mkdir -p "$1/.pi/agent/scripts/fleet"
+    touch "$1/.pi/agent/scripts/fleet/lane_liveness.py"
+    touch "$1/.pi/agent/scripts/fleet/liveness.py"
+    chmod +x "$1/.pi/agent/scripts/fleet/lane_liveness.py"
+    chmod +x "$1/.pi/agent/scripts/fleet/liveness.py"
     mkdir -p "$1/swarm/.venv/bin"
     touch "$1/swarm/.venv/bin/python"
     chmod +x "$1/swarm/.venv/bin/python"
@@ -164,6 +176,7 @@ assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider
 assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekly installed on fresh machine (#373)"
 assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reaper installed on fresh machine (#469)"
 assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
+assert_contains "$OUT" "lane-liveness: installed + loaded" "lane-liveness installed on fresh machine (#1178)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
@@ -190,6 +203,12 @@ assert_contains "$(cat "$REAPER_INSTALLED")" "<string>0</string>" "reaper plist 
 assert_contains "$(cat "$REAPER_INSTALLED")" "StartInterval" "reaper job is interval-scheduled"
 assert_contains "$(cat "$REAPER_INSTALLED")" "<integer>3600</integer>" "reaper job hourly (StartInterval 3600)"
 assert_contains "$(cat "$REAPER_INSTALLED")" "agent-infra-plist-version: 0.1.0" "reaper template carries version marker"
+# #947 — the DEPLOYED invariant: the hourly job must never arm the stuck set
+# (arming is a manual, per-machine decision). Without this assertion a later
+# template edit adding REAP_REAP_STUCK=1 would satisfy every other plist check
+# and silently broaden the kill set on every host at the next sync.
+assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_REAP_STUCK" "reaper plist does NOT arm the STUCK set (#947)"
+assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_STUCK_HOURS" "reaper plist does not override the stuck bound (#947)"
 # #783 Task 6 — pi-task-session-prune rendered-plist content asserts (farmed
 # path, DISARMED TASK_SESSION_PRUNE_DRY_RUN=1, hourly StartInterval 3600)
 assert_contains "$(cat "$PRUNE_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-task-session-prune.sh" "prune plist rendered with fake HOME (farmed path)"
@@ -198,6 +217,19 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "<string>1</string>" "prune plist SH
 assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interval-scheduled"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
+# #1178 unit 3 — lane-liveness rendered-plist content asserts (farmed tools path,
+# the PINNED probe library, and the interval schedule). #1277: the farmed path is
+# scripts/fleet/, never tools/fleet/ (pi's startup scan blocks interactive boot on
+# any non-fd/rg entry in tools/).
+LANE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.lane-liveness.plist"
+assert_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/scripts/fleet/lane_liveness.py" "lane-liveness plist rendered with fake HOME (farmed scripts/fleet path, #1277)"
+assert_not_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/tools/fleet/lane_liveness.py" "lane-liveness plist does NOT point at the deprecated tools/fleet/ (#1277)"
+assert_contains "$(cat "$LANE_INSTALLED")" "PI_PID_IDENTITY_LIB" "lane-liveness plist pins the shared identity library"
+assert_contains "$(cat "$LANE_INSTALLED")" "$HOME1/.pi/agent/scripts/lib/pid-identity.sh" "lane-liveness plist pins the FARMED library (never ~/Documents)"
+assert_contains "$(cat "$LANE_INSTALLED")" "python3" "lane-liveness plist runs the python driver"
+assert_contains "$(cat "$LANE_INSTALLED")" "StartInterval" "lane-liveness is interval-scheduled"
+assert_contains "$(cat "$LANE_INSTALLED")" "<integer>1800</integer>" "lane-liveness every 30 min (StartInterval 1800)"
+assert_contains "$(cat "$LANE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "lane-liveness template carries version marker"
 assert_contains "$(cat "$DBW_INSTALLED")" "$HOME1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh" "balance-watch plist rendered with fake HOME (#476)"
 assert_contains "$(cat "$DBW_INSTALLED")" "agent-infra-plist-version: 0.1.0" "balance-watch template carries version marker"
 # #476 — the balance poller is the SINGLE restore authority: must run every
@@ -214,7 +246,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "6" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune)"
+assert_eq "$BOOTSTRAP_COUNT1" "7" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"
@@ -392,6 +424,89 @@ if command -v plutil >/dev/null 2>&1; then
     assert_eq "$OUT" "0" "rendered+installed canary plist lints clean"
 else
     echo "  ⚠️  plutil not found — lint checks skipped"
+fi
+
+# plutil -lint is LENIENT: it accepts a template whose XML comment contains
+# `--`, which is ILLEGAL inside an XML comment and makes the file unparseable by
+# a strict reader (launchd's own loader is strict). A strict parse is therefore
+# the real check, and it does NOT depend on plutil, so it lives OUTSIDE the plutil
+# branch — otherwise a host with python3 but no plutil would skip it. #1311.
+if command -v python3 >/dev/null 2>&1; then
+    STRICT_FAIL=""
+    for t in "$REPO_TEMPLATES"/*.plist; do
+        python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$t" >/dev/null 2>&1 \
+            || STRICT_FAIL="$STRICT_FAIL $(basename "$t")"
+    done
+    [ -z "$STRICT_FAIL" ] && ok "all repo templates parse under a strict plist reader" \
+        || bad "strict plist parse failed:$STRICT_FAIL"
+else
+    echo "  ⚠️  python3 not found — strict-parse check skipped"
+fi
+
+echo ""
+echo "── 13. worktree-reaper installs under the TCC-holding interpreter (#1311) ──"
+# This template is SKIPPED whenever {{TORTOISE_REPO}} is unresolved — and no
+# other section sets it — so without this section the installer suite would
+# never exercise the worktree-reaper template at all (it would ship green on
+# XML lint alone). A fake tortoise with its own .venv python is the minimum
+# that lets the template resolve and install.
+HOME3="$T/home3"; mkfakehome "$HOME3"
+mkdir -p "$HOME3/tortoise/.venv/bin" "$HOME3/tortoise/.git"
+touch "$HOME3/tortoise/.venv/bin/python"; chmod +x "$HOME3/tortoise/.venv/bin/python"
+WT_INSTALLED="$HOME3/Library/LaunchAgents/com.tortoise.worktree-reaper.plist"
+(
+    export HOME="$HOME3"
+    export PATH="$T/bin:$PATH"
+    export FAKE_LAUNCHCTL_LOG="$LOG"
+    export TEMPLATES_DIR="$TEMPLATES"
+    export AGENTS_DIR="$HOME3/Library/LaunchAgents"
+    export SWARM_ROOT="$HOME3/swarm"
+    export PYTHON_BIN="$HOME3/swarm/.venv/bin/python"
+    export TORTOISE_REPO="$HOME3/tortoise"
+    export ELDATO_ALLOW_TEST_HOME=1
+    bash "$INSTALLER" >/dev/null 2>&1
+)
+if [ -f "$WT_INSTALLED" ]; then
+    ok "worktree-reaper installs when {{TORTOISE_REPO}} resolves"
+    # The entry point MUST be the checkout's own interpreter: a launchd-spawned
+    # `bash` is denied BOTH the ~/Documents script read and the repo read a
+    # `git` needs, so a `bash <script>` entry point installs a job that can
+    # never classify a worktree.
+    grep -q "$HOME3/tortoise/.venv/bin/python" "$WT_INSTALLED" \
+        && ok "entry point is the TCC-holding checkout interpreter" \
+        || bad "entry point is the TCC-holding checkout interpreter"
+    grep -q "$HOME3/.pi/agent/scripts/pi-reap-worktrees-launchd.py" "$WT_INSTALLED" \
+        && ok "entry point reaches the FARMED launcher" \
+        || bad "entry point reaches the FARMED launcher"
+    grep -q "$HOME3/.pi/agent/scripts/pi-reap-worktrees.sh" "$WT_INSTALLED" \
+        && ok "launcher targets the FARMED reaper script" \
+        || bad "launcher targets the FARMED reaper script"
+    grep -q "<string>--dry-run</string>" "$WT_INSTALLED" \
+        && ok "worktree-reaper ships UNARMED (--dry-run)" \
+        || bad "worktree-reaper ships UNARMED (--dry-run)"
+    grep -q '{{' "$WT_INSTALLED" \
+        && bad "no unresolved placeholders remain" \
+        || ok "no unresolved placeholders remain"
+
+    # EXECUTE the real launcher against a fake reaper. The text assertions above
+    # cannot see an ARGUMENT-FORWARDING defect, and one shipped: the launcher
+    # once used argparse.REMAINDER, which does NOT absorb unknown OPTIONALS, so
+    # the installed job ("--script x --repo y --dry-run") exited 2 before it
+    # read the script at all — every pass a no-op, green through this suite.
+    FAKE_REAPER="$T/fake-reaper.sh"
+    printf '#!/bin/bash\necho "ARGS: $@"\n' > "$FAKE_REAPER"
+    OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
+        --script "$FAKE_REAPER" --repo /tmp/some-repo --dry-run 2>&1)"
+    assert_eq "$OUT" "ARGS: --repo /tmp/some-repo --dry-run" \
+        "launcher forwards the repo and mode args to the reaper (no separator needed)"
+    OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
+        --script /tmp/does-not-exist-launcher-probe.sh --repo /tmp/x 2>&1; echo "rc=$?")"
+    case "$OUT" in
+        *"cannot read"*rc=1) ok "launcher fails cleanly (no traceback) on an unreadable script" ;;
+        *) bad "launcher fails cleanly on an unreadable script (got: $OUT)" ;;
+    esac
+else
+    bad "worktree-reaper installs when {{TORTOISE_REPO}} resolves"
 fi
 
 echo ""

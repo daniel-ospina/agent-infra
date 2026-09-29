@@ -8,7 +8,7 @@
  * aborts (layer 2, the final arbiter), not just the extension pre-checks.
  */
 import { execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync, readlinkSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal } from "node:assert/strict";
@@ -19,6 +19,8 @@ import repoFreshness, {
   getFreshnessMode,
   freshnessDisabled,
   defaultBranch,
+  defaultBranchKnown,
+  currentBranch,
   syncState,
   behindCount,
   aheadCount,
@@ -34,6 +36,10 @@ import repoFreshness, {
   DEFAULT_FRESHNESS_INTERVAL_MS,
   MIN_FRESHNESS_INTERVAL_MS,
 } from "./repo-freshness.js";
+// #1245: the recovery primitive + the guard's disorder reader are read-only
+// imports here — this suite pins that NEITHER is changed for other-repo use.
+import { tryLosslessRecover } from "./auto-sync.js";
+import { readHubDisorder } from "./main-worktree-guard/classify-git.mjs";
 
 let passed = 0, failed = 0;
 async function test(name: string, fn: () => void | Promise<void>) {
@@ -69,6 +75,11 @@ function makeRepo(name: string): { base: string; origin: string; clone: string; 
   writeFileSync(join(clone, "a.txt"), "base\n");
   sh("git add a.txt && git commit -qm base", clone);
   sh("git push -q origin main", clone);
+  // #1245: a real clone of a NON-empty repo has refs/remotes/origin/HEAD set;
+  // this fixture clones while the origin is still empty, so set it explicitly —
+  // the recovery path requires an assertively-known default branch
+  // (defaultBranchKnown), it never acts on the "main" fallback name.
+  sh("git remote set-head origin -a", clone);
   sh(`git clone "${origin}" other`, base);
   const other = join(base, "other");
   sh("git config user.email t@t && git config user.name t", other);
@@ -78,6 +89,22 @@ function makeRepo(name: string): { base: string; origin: string; clone: string; 
 function advanceOrigin(other: string, file = "adv.txt", content = "advance\n"): void {
   writeFileSync(join(other, file), content);
   sh(`git add ${file} && git commit -qm advance && git push -q origin main`, other);
+}
+
+/**
+ * #1245 fixture — strand `repo` on a non-default branch whose TREE is
+ * byte-identical to origin/main (the squash-merge residue shape auto-sync's
+ * #203 path already recovers inside agent-infra). `unique: true` gives the
+ * branch a tree that differentially differs from origin/main — real work that
+ * must never be touched.
+ */
+function strand(repo: string, other: string, opts: { unique?: boolean; noFetch?: boolean } = {}): void {
+  sh("git checkout -qb stranded", repo);
+  writeFileSync(join(repo, "s.txt"), opts.unique ? "LOCAL-UNIQUE\n" : "same\n");
+  sh("git add s.txt && git commit -qm stranded", repo);
+  writeFileSync(join(other, "s.txt"), opts.unique ? "remote\n" : "same\n");
+  sh("git add s.txt && git commit -qm advance && git push -q origin main", other);
+  if (!opts.noFetch) sh("git fetch -q origin", repo);
 }
 
 // captured console.log
@@ -173,6 +200,18 @@ await test("worktree self-exclusion — never false-positive on own checkout (pl
   // single-worktree repos always false
   const r2 = makeRepo("wt-single");
   equal(defaultBranchInOtherWorktree(r2.clone, "main"), false);
+});
+
+await test("#1245: defaultBranchInOtherWorktree detects the default branch held by ANOTHER checkout", () => {
+  // The pre-#1245 implementation keyed self-exclusion on a `gitdir <path>` line
+  // that `git worktree list --porcelain` never emits, so it ALWAYS returned
+  // false — inert. This pins the live predicate (and is the red proof of that
+  // pre-existing bug: the second assertion failed before the fix).
+  const { clone } = makeRepo("wt-detects");
+  const wt = join(clone, "..", "sibling");
+  sh(`git worktree add -q -b feature/sibling "${wt}"`, clone);
+  equal(defaultBranchInOtherWorktree(clone, "main"), false, "the checkout holding main is not 'another' worktree");
+  equal(defaultBranchInOtherWorktree(wt, "main"), true, "a linked worktree must see main held elsewhere");
 });
 
 await test("isAgentInfraRepo — env exact match + fingerprint", () => {
@@ -522,6 +561,525 @@ await test("diverged → guidance, never pull", async () => {
   equal(sh("git rev-parse HEAD", clone), before);
 });
 
+// ── #1245: lossless recovery for ALL repos (Gap 1) + mid-run (Gap 2) ─────
+section("#1245 lossless recovery — every repo, mid-run");
+
+await test("(a) stranded-but-content-identical checkout OUTSIDE agent-infra recovers automatically", () => {
+  const { clone, other } = makeRepo("1245-strand");
+  strand(clone, other);
+  // The fixture must be a repo OUTSIDE agent-infra, i.e. exactly the set the
+  // pre-fix freshnessTick only logged a warning for.
+  equal(isAgentInfraRepo(clone, BASE_ENV), false, "fixture must be outside agent-infra");
+  equal(currentBranch(clone), "stranded");
+  equal(syncState(clone, "main"), "diverged", "fixture must be diverged vs origin/main");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "recovered-stranded", `expected auto-recovery, got ${JSON.stringify(r)}; logs: ${logs.join(" | ")}`);
+  equal(currentBranch(clone), "main", "must end on the default branch");
+  equal(sh("git rev-parse HEAD", clone), sh("git rev-parse origin/main", clone), "HEAD must equal origin/main");
+  ok(before !== sh("git rev-parse HEAD", clone), "HEAD must have moved to origin/main");
+  ok(logs.some((l) => l.includes("recovered")), `recovery must be logged, got: ${logs.join(" | ")}`);
+});
+
+await test("(b) stranded checkout with UNIQUE content still refuses — no regression", () => {
+  const { clone, other } = makeRepo("1245-unique");
+  strand(clone, other, { unique: true });
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `unique work must stay report-only, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded", "must stay on the feature branch");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+  equal(execSync("cat s.txt", { cwd: clone, encoding: "utf-8" }), "LOCAL-UNIQUE\n", "unique content must survive");
+});
+
+await test("(b2) uncommitted unique content on a stranded branch still refuses", () => {
+  const { clone, other } = makeRepo("1245-uncommitted");
+  strand(clone, other);
+  writeFileSync(join(clone, "s.txt"), "UNCOMMITTED-WORK\n");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `uncommitted work must stay report-only, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded");
+  equal(sh("git rev-parse HEAD", clone), before);
+  equal(execSync("cat s.txt", { cwd: clone, encoding: "utf-8" }), "UNCOMMITTED-WORK\n", "uncommitted content must survive");
+});
+
+await test("(c) off_main disorder classification unchanged (guard regression pin)", () => {
+  const { clone, other } = makeRepo("1245-offmain");
+  strand(clone, other, { unique: true });
+  equal(readHubDisorder(clone).disorder, "off_main", "clean off-main checkout must still classify off_main");
+  writeFileSync(join(clone, "wip.txt"), "x\n");
+  equal(readHubDisorder(clone).disorder, "both", "off-main + dirt must still classify both");
+  // and the tick must not have laundered it into main-ness for the guard
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch");
+  equal(currentBranch(clone), "stranded", "off-main checkout must not be moved");
+  equal(sh("git rev-parse HEAD", clone), before);
+  equal(readHubDisorder(clone).disorder, "both", "guard classification unchanged after the tick");
+});
+
+await test("(d) recovery is idempotent — running it twice is safe", () => {
+  const { clone, other } = makeRepo("1245-idem");
+  strand(clone, other);
+  const r1 = tryLosslessRecover(clone);
+  ok(r1.recovered, `first recovery must succeed, got ${JSON.stringify(r1)}`);
+  const sha = sh("git rev-parse HEAD", clone);
+  const r2 = tryLosslessRecover(clone);
+  ok(!r2.recovered, `second recovery must be a no-op, got ${JSON.stringify(r2)}`);
+  ok(/not diverged/.test(r2.reason ?? ""), `second reason must say not diverged, got ${r2.reason}`);
+  equal(sh("git rev-parse HEAD", clone), sha, "HEAD stable across the second run");
+  captureStart();
+  let t: any;
+  try { t = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(t.action, "current", `recovered repo must read current, got ${JSON.stringify(t)}`);
+  equal(sh("git rev-parse HEAD", clone), sha, "HEAD stable across a repeat tick");
+});
+
+await test("(e) agent-infra-fingerprint checkout is recovered too ('ALL repos')", () => {
+  const { clone, other } = makeRepo("1245-infra");
+  mkdirSync(join(clone, "pi-bootstrap"), { recursive: true });
+  writeFileSync(join(clone, "manifest.json"), "{}\n");
+  writeFileSync(join(clone, "pi-bootstrap", "setup.sh"), "#!/bin/bash\n");
+  sh("git add -A && git commit -qm infra-fingerprint && git push -q origin main", clone);
+  sh("git pull -q origin main", other);
+  strand(clone, other);
+  equal(isAgentInfraRepo(clone, BASE_ENV), true, "fixture must fingerprint as agent-infra");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "recovered-stranded", `agent-infra must recover on the tick too, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "main");
+  equal(sh("git rev-parse HEAD", clone), sh("git rev-parse origin/main", clone));
+});
+
+await test("(f) a LINKED worktree is never switched, and its residue is never deleted", () => {
+  // The hazard this pins: a worktree can look recoverable (tree byte-identical
+  // to origin/<default>, every untracked file already on origin), but
+  // `git checkout -f <default>` MUST fail there (the default branch is checked
+  // out in the main checkout). #203's step 4 removes the untracked residue
+  // BEFORE the switch, so without the defaultBranchInOtherWorktree pre-check a
+  // mid-session tick would delete that residue and then fail to recover.
+  const { clone, other } = makeRepo("1245-worktree");
+  writeFileSync(join(other, "s.txt"), "same\n");
+  writeFileSync(join(other, "u.txt"), "u\n");
+  sh("git add s.txt u.txt && git commit -qm advance && git push -q origin main", other);
+  const wt = join(clone, "..", "linked");
+  sh(`git worktree add -q -b stranded "${wt}"`, clone);
+  writeFileSync(join(wt, "s.txt"), "same\n");
+  sh("git add s.txt && git commit -qm stranded", wt);
+  writeFileSync(join(wt, "u.txt"), "u\n"); // untracked, byte-identical to origin/main
+  sh("git fetch -q origin", wt);
+  equal(syncState(wt, "main"), "diverged", "fixture must be diverged");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(wt, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `linked worktree must stay report-only, got ${JSON.stringify(r)}`);
+  equal(currentBranch(wt), "stranded", "linked worktree must not be switched");
+  equal(execSync("cat u.txt", { cwd: wt, encoding: "utf-8" }), "u\n", "residue must not be deleted");
+});
+
+await test("(g) recovery works on the FIRST tick even when the local origin ref is stale", () => {
+  // With a stale origin/main the checkout reads "ahead" (HEAD has a commit the
+  // stale ref lacks), so recovery would refuse as "not diverged" and the repo
+  // would stay stranded for another whole interval. The refresh before the
+  // attempt is what makes first-tick recovery work — without it this test
+  // reports report-feature-branch.
+  const { clone, other } = makeRepo("1245-stale");
+  strand(clone, other, { noFetch: true });
+  equal(syncState(clone, "main"), "ahead", "stale ref must misread the fixture as ahead");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "recovered-stranded", `first tick must refresh the ref and recover, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "main");
+  equal(sh("git rev-parse HEAD", clone), sh("git rev-parse origin/main", clone));
+});
+
+await test("(h) an assume-unchanged (pinned) local modification still refuses — VGATE find", () => {
+  // `git update-index --assume-unchanged` makes the file INVISIBLE to
+  // diff/status, yet a forced checkout overwrites it from the index. Before the
+  // step-3b guard the byte-identity test read CLEAN here and recovery destroyed
+  // the pinned content (reproduced end-to-end by the VGATE verifier).
+  const { clone, other } = makeRepo("1245-pinned");
+  strand(clone, other);
+  writeFileSync(join(clone, "s.txt"), "PINNED-LOCAL\n");
+  sh("git update-index --assume-unchanged s.txt", clone);
+  equal(repoClean(clone), true, "assume-unchanged must hide the edit from status (the hazard)");
+  const direct = tryLosslessRecover(clone);
+  ok(!direct.recovered, `pinned content must refuse recovery, got ${JSON.stringify(direct)}`);
+  ok(/tag 'h'/.test(direct.reason ?? ""), `reason must name the tag, got ${direct.reason}`);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse too, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded", "checkout must not be switched");
+  equal(execSync("cat s.txt", { cwd: clone, encoding: "utf-8" }), "PINNED-LOCAL\n", "pinned content must survive");
+});
+
+await test("(i) assume-unchanged content IDENTICAL to origin is still recoverable (no false refusal)", () => {
+  const { clone, other } = makeRepo("1245-pinned-same");
+  strand(clone, other);
+  sh("git update-index --assume-unchanged s.txt", clone); // pinned, but byte-identical
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "recovered-stranded", `identical pinned content must still recover, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "main");
+  equal(execSync("cat s.txt", { cwd: clone, encoding: "utf-8" }), "same\n");
+});
+
+await test("(j) a skip-worktree local modification still refuses — 2nd VGATE round", () => {
+  // diff/status are blind to 'S' exactly as to 'h'; the only other defence is
+  // git's stat-cache "Entry not uptodate" refusal, which a matching stat cache
+  // defeats (reproduced by the verifier).
+  const { clone, other } = makeRepo("1245-skipworktree");
+  strand(clone, other);
+  writeFileSync(join(clone, "s.txt"), "PINNED-LOCAL\n");
+  sh("git update-index --skip-worktree s.txt", clone);
+  equal(repoClean(clone), true, "skip-worktree must hide the edit from status (the hazard)");
+  const direct = tryLosslessRecover(clone);
+  ok(!direct.recovered, `skip-worktree content must refuse recovery, got ${JSON.stringify(direct)}`);
+  ok(/tag 'S'/.test(direct.reason ?? ""), `reason must name the tag, got ${direct.reason}`);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse too, got ${JSON.stringify(r)}`);
+  equal(execSync("cat s.txt", { cwd: clone, encoding: "utf-8" }), "PINNED-LOCAL\n", "pinned content must survive");
+});
+
+await test("(k) skip-worktree content identical to origin, and a sparse-absent entry, both still recover", () => {
+  // No false refusal: a pinned-but-identical file is lossless to overwrite...
+  const a = makeRepo("1245-sw-same");
+  strand(a.clone, a.other);
+  sh("git update-index --skip-worktree s.txt", a.clone);
+  captureStart();
+  let ra: any;
+  try { ra = freshnessTick(a.clone, BASE_ENV); } finally { captureStop(); }
+  equal(ra.action, "recovered-stranded", `identical skip-worktree content must recover, got ${JSON.stringify(ra)}`);
+  // ...and an ABSENT 'S' entry (the sparse-checkout shape) holds no content to
+  // destroy, so it must not block recovery either.
+  const b = makeRepo("1245-sw-absent");
+  strand(b.clone, b.other);
+  sh("git update-index --skip-worktree s.txt", b.clone);
+  rmSync(join(b.clone, "s.txt"), { force: true });
+  captureStart();
+  let rb: any;
+  try { rb = freshnessTick(b.clone, BASE_ENV); } finally { captureStop(); }
+  equal(rb.action, "recovered-stranded", `absent skip-worktree entry must not block recovery, got ${JSON.stringify(rb)}`);
+  equal(currentBranch(b.clone), "main");
+});
+
+await test("(l) BOTH flags set (ls-files tag 's') still refuses — the predicate is inverted, not enumerated", () => {
+  // `--assume-unchanged --skip-worktree` yields lowercase 's', which an
+  // h/S allow-list misses. The implementation checks every tag != 'H', so a
+  // flag it has never heard of fails closed instead of reopening the hole.
+  const { clone, other } = makeRepo("1245-bothflags");
+  strand(clone, other);
+  writeFileSync(join(clone, "s.txt"), "PINNED-LOCAL\n");
+  sh("git update-index --assume-unchanged s.txt && git update-index --skip-worktree s.txt", clone);
+  ok(/^s s\.txt$/m.test(sh("git ls-files -v", clone)), "fixture must carry the combined 's' tag");
+  equal(repoClean(clone), true, "both flags must hide the edit from status (the hazard)");
+  const direct = tryLosslessRecover(clone);
+  ok(!direct.recovered, `combined-flag content must refuse recovery, got ${JSON.stringify(direct)}`);
+  ok(/tag 's'/.test(direct.reason ?? ""), `reason must name the tag, got ${direct.reason}`);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse too, got ${JSON.stringify(r)}`);
+  equal(execSync("cat s.txt", { cwd: clone, encoding: "utf-8" }), "PINNED-LOCAL\n", "pinned content must survive");
+});
+
+await test("(m) a RETARGETED index-flagged symlink still refuses — 3rd VGATE round", () => {
+  // `hash-object` FOLLOWS a symlink (hashing the pointee) while `rev-parse
+  // ref:path` returns the symlink blob (the target STRING) — so the previous
+  // hash-object comparison blessed a retarget and step 4 destroyed it. The fix
+  // hashes the target string itself.
+  const { clone, other } = makeRepo("1245-symlink");
+  for (const [r, who] of [[clone, "clone"], [other, "other"]] as const) {
+    if (who === "clone") sh("git checkout -qb stranded", clone);
+    writeFileSync(join(r, "s.txt"), "same\n");
+    writeFileSync(join(r, "target.txt"), "t\n");
+    symlinkSync("target.txt", join(r, "link"));
+    // Distinct messages per side: the TREES must stay identical (that is the
+    // fixture), but an identical message + parent + timestamp can collide the
+    // commit SHA and collapse "diverged" into "current" — a flaky fixture.
+    sh(`git add s.txt target.txt link && git commit -qm ${who}-same-tree`, r);
+  }
+  sh("git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  equal(syncState(clone, "main"), "diverged", "fixture must be diverged");
+  // retarget the link, then hide the change behind assume-unchanged
+  rmSync(join(clone, "link"));
+  symlinkSync("s.txt", join(clone, "link"));
+  sh("git update-index --assume-unchanged link", clone);
+  equal(repoClean(clone), true, "the flag must hide the retarget from status (the hazard)");
+  const direct = tryLosslessRecover(clone);
+  ok(!direct.recovered, `a retargeted symlink must refuse recovery, got ${JSON.stringify(direct)}`);
+  equal(readlinkSync(join(clone, "link")), "s.txt", "the retarget must survive");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse too, got ${JSON.stringify(r)}`);
+  equal(readlinkSync(join(clone, "link")), "s.txt", "the retarget must survive the tick");
+});
+
+await test("(n) a DANGLING symlink at a flagged path is present, not 'absent'", () => {
+  // `existsSync` follows links, so a dangling symlink read as absent and was
+  // skipped — step 4 then replaced the pinned link with origin's regular file.
+  // lstat is what distinguishes ENOENT from a broken link.
+  const { clone, other } = makeRepo("1245-dangling");
+  strand(clone, other);
+  rmSync(join(clone, "s.txt"));
+  symlinkSync("does-not-exist", join(clone, "s.txt"));
+  sh("git update-index --assume-unchanged s.txt", clone);
+  equal(repoClean(clone), true, "the flag must hide the swapped symlink from status (the hazard)");
+  const direct = tryLosslessRecover(clone);
+  ok(!direct.recovered, `a dangling symlink must refuse recovery, got ${JSON.stringify(direct)}`);
+  equal(readlinkSync(join(clone, "s.txt")), "does-not-exist", "the dangling link must survive");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse too, got ${JSON.stringify(r)}`);
+  equal(readlinkSync(join(clone, "s.txt")), "does-not-exist", "the dangling link must survive the tick");
+});
+
+await test("(o) a file↔symlink MODE swap at a flagged path refuses — blob equality is not enough", () => {
+  // Origin: `link -> target.txt`. Locally the link is replaced by a REGULAR
+  // file whose bytes are exactly `target.txt` — blob-identical (the old
+  // blob-only check passed it), but the switch would replace the file with a
+  // symlink. ls-tree mode comparison is what refuses it.
+  const { clone, other } = makeRepo("1245-modeswap");
+  for (const [r, who] of [[clone, "clone"], [other, "other"]] as const) {
+    if (who === "clone") sh("git checkout -qb stranded", clone);
+    writeFileSync(join(r, "s.txt"), "same\n");
+    writeFileSync(join(r, "target.txt"), "t\n");
+    symlinkSync("target.txt", join(r, "link"));
+    sh(`git add s.txt target.txt link && git commit -qm ${who}-same-tree`, r);
+  }
+  sh("git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  rmSync(join(clone, "link"));
+  writeFileSync(join(clone, "link"), "target.txt"); // byte-equal to the symlink blob
+  sh("git update-index --assume-unchanged link", clone);
+  const localBlob = sh("git hash-object --stdin < link", clone);
+  equal(localBlob, sh("git rev-parse origin/main:link", clone), "the two blobs must be EQUAL (the point of this test)");
+  const direct = tryLosslessRecover(clone);
+  ok(!direct.recovered, `a mode swap must refuse recovery, got ${JSON.stringify(direct)}`);
+  ok(/mode/.test(direct.reason ?? ""), `the reason must name the mode conflict, got ${direct.reason}`);
+  equal(sh("cat link", clone), "target.txt", "the regular file must survive");
+  ok(!sh("test -L link && echo symlink || echo file", clone).includes("symlink"), "must still be a regular file, not a symlink");
+});
+
+await test("(p) untracked BINARY residue that differs only after UTF-8 folding still refuses — 4th VGATE round", () => {
+  // Node folds every invalid UTF-8 byte to U+FFFD, so the old decoded-STRING
+  // compare read two DIFFERENT files as equal, and step 4 removed local bytes
+  // that were never on origin. The comparison is now on Buffers.
+  const { clone, other } = makeRepo("1245-binary");
+  strand(clone, other);
+  writeFileSync(join(other, "u.bin"), Buffer.from([0xc2]));
+  sh("git add u.bin && git commit -qm advance-binary && git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  writeFileSync(join(clone, "u.bin"), Buffer.from([0xc3])); // untracked local residue
+  equal(readFileSync(join(clone, "u.bin")).toString("utf-8"), "\uFFFD", "local [0xc3] must fold to U+FFFD (origin holds [0xc2] — same folded char, different bytes)");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `differing binary residue must refuse, got ${JSON.stringify(r)}`);
+  ok(existsSync(join(clone, "u.bin")), "the local residue must still exist");
+  equal(readFileSync(join(clone, "u.bin"))[0], 0xc3, "the local byte must survive");
+});
+
+await test("(q) a GLOB metachar in an untracked name cannot hide a modified tracked file — 5th hardening", () => {
+  // `':(exclude)' + name` is a PATHSPEC: an untracked file literally named
+  // `a*.txt` excluded the TRACKED `a.txt` from step 2's diff, hiding a real
+  // modification so step 4 overwrote it. `:(exclude,literal)` is what keeps the
+  // exclusion to the exact path.
+  const { clone, other } = makeRepo("1245-glob");
+  strand(clone, other);
+  writeFileSync(join(other, "a*.txt"), "g\n");
+  sh("git add 'a*.txt' && git commit -qm advance-glob && git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  writeFileSync(join(clone, "a*.txt"), "g\n");   // untracked residue, present on origin
+  writeFileSync(join(clone, "a.txt"), "MODIFIED\n"); // tracked modification the glob would hide
+  equal(sh("git diff origin/main --quiet -- . ':(exclude)a*.txt' ; echo $?", clone), "0",
+    "control: the glob-form exclusion really does hide the tracked modification (exit 0)");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the hidden modification must refuse recovery, got ${JSON.stringify(r)}`);
+  equal(execSync("cat a.txt", { cwd: clone, encoding: "utf-8" }), "MODIFIED\n", "the tracked modification must survive");
+});
+
+await test("(r) staged-ONLY index content still refuses (the `MM` hole) — review find", () => {
+  // Step 2 compares the WORKTREE to the ref, so an index-only edit whose
+  // worktree bytes match origin reads CLEAN — yet step 4's `checkout -f` resets
+  // the index. The sibling reset path guards this exact shape (dirtySuperseded).
+  const { clone, other } = makeRepo("1245-staged");
+  strand(clone, other);
+  writeFileSync(join(clone, "s.txt"), "v3-STAGED-ONLY\n");
+  sh("git add s.txt", clone);
+  writeFileSync(join(clone, "s.txt"), "same\n"); // worktree back to origin's bytes
+  equal(sh("git diff origin/main --quiet -- . ; echo $?", clone), "0",
+    "control: step 2 (worktree vs ref) is blind to the staged-only edit");
+  const staged = sh("git show :s.txt", clone);
+  equal(staged, "v3-STAGED-ONLY", "fixture: the index holds content origin does not");
+  const direct = tryLosslessRecover(clone);
+  ok(!direct.recovered, `staged-only content must refuse recovery, got ${JSON.stringify(direct)}`);
+  ok(/staged/.test(direct.reason ?? ""), `the reason must name the staged path, got ${direct.reason}`);
+  equal(sh("git show :s.txt", clone), staged, "the staged blob must survive");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse too, got ${JSON.stringify(r)}`);
+  equal(sh("git show :s.txt", clone), staged, "the staged blob must survive the tick");
+});
+
+await test("(s) a SUBDIRECTORY cwd cannot scope the checks — the switch is worktree-wide (review P0)", () => {
+  // `ls-files`/`diff -- .` are cwd-relative; `checkout -f` is not. Before the
+  // root canonicalisation in tryLosslessRecover, calling it with a subdirectory
+  // read nothing outside that subtree and then switched the WHOLE checkout.
+  const { clone, other } = makeRepo("1245-subdir");
+  strand(clone, other);
+  mkdirSync(join(clone, "sub"), { recursive: true });
+  writeFileSync(join(clone, "a.txt"), "ROOT-MODIFIED\n"); // tracked, OUTSIDE the passed dir
+  equal(sh("git diff origin/main --quiet -- . ; echo $?", join(clone, "sub")), "0",
+    "control: from sub/ the diff sees nothing (the hazard)");
+  const direct = tryLosslessRecover(join(clone, "sub"));
+  ok(!direct.recovered, `a subdirectory call must not recover, got ${JSON.stringify(direct)}`);
+  equal(execSync("cat a.txt", { cwd: clone, encoding: "utf-8" }), "ROOT-MODIFIED\n", "root content must survive");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(join(clone, "sub"), BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `the tick must refuse from a subdirectory too, got ${JSON.stringify(r)}`);
+  equal(execSync("cat a.txt", { cwd: clone, encoding: "utf-8" }), "ROOT-MODIFIED\n", "root content must survive the tick");
+  equal(currentBranch(clone), "stranded", "the checkout must not have been switched");
+});
+
+await test("(u) an UNDETERMINED default branch (no origin/HEAD) is never acted on — review find", () => {
+  const { clone, other } = makeRepo("1245-nohead");
+  strand(clone, other);
+  sh("git remote set-head origin -d", clone);
+  equal(defaultBranchKnown(clone), false, "fixture: origin/HEAD must be gone");
+  equal(freshnessTick(clone, BASE_ENV).action, "report-feature-branch", "never recover onto a GUESSED branch name");
+  equal(currentBranch(clone), "stranded");
+});
+
+await test("(t) a PRUNABLE worktree record never blocks a pull, and never spends the residue on a doomed switch", () => {
+  const { clone, other } = makeRepo("1245-prunable");
+  strand(clone, other);
+  const wt = join(clone, "..", "prunable-wt");
+  sh(`git worktree add -q "${wt}" main`, clone); // main is free: the checkout is on `stranded`
+  equal(defaultBranchInOtherWorktree(clone, "main"), true, "a LIVE linked worktree holding main must block a pull");
+  rmSync(wt, { recursive: true, force: true });
+  equal(defaultBranchInOtherWorktree(clone, "main"), false, "a PRUNABLE record must not block a PULL forever (review find)");
+  // …but git STILL refuses `checkout -f main` for a prunable holder, so the
+  // switch must be refused BEFORE the untracked residue is removed. Residue that
+  // is byte-identical to origin is exactly what step 4 would delete.
+  writeFileSync(join(other, "res.txt"), "r\n");
+  sh("git add res.txt && git commit -qm res && git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  writeFileSync(join(clone, "res.txt"), "r\n"); // untracked, byte-identical to origin (removable)
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `a doomed switch must not be attempted, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded", "the checkout must not have been switched");
+  ok(existsSync(join(clone, "res.txt")), "the removable residue must NOT be spent on a failed switch");
+  ok(logs.some((l) => l.includes("another worktree holds")), `the refusal must be logged, got: ${logs.join(" | ")}`);
+});
+
+await test("(v) a fast-forward that CANNOT succeed refuses before moving — review find", () => {
+  // Local main carries an (empty) unpushed commit, so `checkout -f main` would
+  // move the worktree and `merge --ff-only origin/main` would then FAIL — a
+  // failed recovery that still moved the checkout and wrote main's stale tree.
+  const { clone, other } = makeRepo("1245-ffcheck");
+  sh("git commit -q --allow-empty -m main-unpushed", clone);
+  strand(clone, other);
+  equal(syncState(clone, "main"), "diverged", "fixture must be diverged");
+  ok(sh("git merge-base --is-ancestor main origin/main ; echo $?", clone) !== "0",
+    "fixture: local main must NOT be an ancestor of origin/main");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `an impossible fast-forward must refuse, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded", "the checkout must NOT have moved on a failed recovery");
+  ok(logs.some((l) => l.includes("not an ancestor")), `the refusal must be logged, got: ${logs.join(" | ")}`);
+});
+
+await test("(w) an IGNORED file where the switch writes still refuses — review find", () => {
+  // The switch writes the LOCAL branch's tree too: local main still tracks P
+  // while origin/main deleted it. P is untracked+ignored in the worktree, so
+  // `diff`/`status`/`ls-files -v` all read clean — and `checkout -f main` writes
+  // P from main's index, destroying the local file.
+  const { clone, other } = makeRepo("1245-ignored");
+  writeFileSync(join(clone, ".gitignore"), "P\n");
+  writeFileSync(join(clone, "P"), "MAIN-TRACKED\n");
+  sh("git add -f .gitignore P && git commit -qm main-tracks-P && git push -q origin main", clone);
+  sh("git pull -q origin main", other);
+  sh("git rm -q P && printf 'same\\n' > s.txt && git add s.txt && git commit -qm rm-P-and-s && git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  sh("git checkout -qb stranded", clone);
+  sh("git rm -q --cached P && printf 'same\\n' > s.txt && git add s.txt && git commit -qm stranded", clone);
+  writeFileSync(join(clone, "P"), "LOCAL-IGNORED-WORK\n"); // ignored, untracked, holds the only copy
+  ok(sh("git merge-base --is-ancestor main origin/main ; echo $?", clone) === "0",
+    "fixture: local main IS an ancestor of origin/main (so only the ignored-file gate can refuse)");
+  equal(sh("git status --porcelain", clone), "", "fixture: P must be invisible to status");
+  equal(sh("git diff origin/main --quiet -- . ; echo $?", clone), "0", "control: the tree diff reads clean");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `an ignored file in the switch's path must refuse, got ${JSON.stringify(r)}`);
+  equal(currentBranch(clone), "stranded", "the checkout must not have been switched");
+  equal(execSync("cat P", { cwd: clone, encoding: "utf-8" }), "LOCAL-IGNORED-WORK\n", "the ignored file must survive");
+});
+
+await test("(x) an ignored FILE under a tracked directory path still refuses — review find", () => {
+  // The collision test must be symmetric: local main tracks `foo/bar` while
+  // origin/main deleted `foo/`, and an ignored FILE sits at `foo`. Its own path
+  // is not in either tree, but a tracked path sits UNDER it — `checkout -f main`
+  // replaces the file with a directory and its only copy is gone.
+  const { clone, other } = makeRepo("1245-ignored-parent");
+  writeFileSync(join(clone, ".gitignore"), "foo\n");
+  mkdirSync(join(clone, "foo"), { recursive: true });
+  writeFileSync(join(clone, "foo", "bar"), "x\n");
+  sh("git add -f .gitignore foo/bar && git commit -qm main-tracks-foo && git push -q origin main", clone);
+  sh("git pull -q origin main", other);
+  sh("git rm -q -r foo && printf 'same\\n' > s.txt && git add s.txt && git commit -qm rm-foo-and-s && git push -q origin main", other);
+  sh("git fetch -q origin", clone);
+  sh("git checkout -qb stranded", clone);
+  sh("git rm -q -r --cached foo && printf 'same\\n' > s.txt && git add s.txt && git commit -qm stranded", clone);
+  rmSync(join(clone, "foo"), { recursive: true, force: true });
+  writeFileSync(join(clone, "foo"), "LOCAL-IGNORED-FILE\n"); // ignored file where main tracks foo/bar
+  ok(sh("git merge-base --is-ancestor main origin/main ; echo $?", clone) === "0",
+    "fixture: local main IS an ancestor of origin/main (so only the collision gate can refuse)");
+  equal(sh("git status --porcelain --ignored=traditional", clone), "!! foo", "fixture: the ignored file must be the only status entry");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "report-feature-branch", `an ignored file above a tracked path must refuse, got ${JSON.stringify(r)}`);
+  equal(execSync("cat foo", { cwd: clone, encoding: "utf-8" }), "LOCAL-IGNORED-FILE\n", "the ignored file must survive");
+});
+
+await test("warn mode / NO_AUTOHEAL → recovery is NOT attempted (never mutates on a hint-only setting)", () => {
+  const { clone, other } = makeRepo("1245-warnmode");
+  strand(clone, other);
+  const before = sh("git rev-parse HEAD", clone);
+  equal(freshnessTick(clone, { AGENT_REPO_FRESHNESS_MODE: "warn" } as any).action, "report-feature-branch");
+  equal(currentBranch(clone), "stranded", "warn mode must not move the checkout");
+  equal(freshnessTick(clone, { AGENT_REPO_FRESHNESS_NO_AUTOHEAL: "1" } as any).action, "report-feature-branch");
+  equal(currentBranch(clone), "stranded", "NO_AUTOHEAL must not move the checkout");
+  equal(sh("git rev-parse HEAD", clone), before);
+});
+
 await test("merge in progress → skipped-busy silently", async () => {
   const { clone, other } = makeRepo("merging");
   advanceOrigin(other);
@@ -662,6 +1220,47 @@ await test("enabled → session_start + session_shutdown registered; print mode 
     else process.env.PI_MODE = prevMode;
     if (prevDisabled === undefined) delete process.env.AGENT_REPO_FRESHNESS_DISABLED;
     else process.env.AGENT_REPO_FRESHNESS_DISABLED = prevDisabled;
+  }
+});
+
+// ── #1245 Gap 2: the MID-SESSION trigger (not session_start alone) ──────
+
+await test("Gap 2: the mid-session interval tick recovers a checkout stranded AFTER session_start", async () => {
+  const prevMode = process.env.PI_MODE;
+  const prevDisabled = process.env.AGENT_REPO_FRESHNESS_DISABLED;
+  const prevWarn = process.env.AGENT_REPO_FRESHNESS_MODE;
+  const { clone, other } = makeRepo("1245-midrun");
+  delete process.env.AGENT_REPO_FRESHNESS_DISABLED;
+  delete process.env.AGENT_REPO_FRESHNESS_MODE;
+  delete process.env.PI_MODE;
+  const { pi, handlers } = fakePi();
+  repoFreshness(pi);
+  let intervalFn: (() => void) | null = null;
+  const origSet = globalThis.setInterval;
+  const origClear = globalThis.clearInterval;
+  (globalThis as any).setInterval = (fn: any) => { intervalFn = fn; return { unref: () => {} } as any; };
+  (globalThis as any).clearInterval = () => {};
+  const prevCwd = process.cwd();
+  try {
+    process.chdir(clone);
+    await handlers.session_start(); // tick #1 — repo is CURRENT here, nothing to do
+    ok(intervalFn !== null, "the periodic mid-session tick must be registered");
+    equal(currentBranch(clone), "main", "session_start must leave a current checkout alone");
+    // The checkout goes bad MID-SESSION (hours after session_start).
+    strand(clone, other);
+    equal(currentBranch(clone), "stranded", "fixture must be stranded mid-session");
+    captureStart();
+    try { (intervalFn as any)(); } finally { captureStop(); }
+    equal(currentBranch(clone), "main", "the mid-session tick must recover the stranded checkout");
+    equal(sh("git rev-parse HEAD", clone), sh("git rev-parse origin/main", clone), "HEAD must equal origin/main");
+    ok(logs.some((l) => l.includes("recovered")), `mid-session recovery must be logged, got: ${logs.join(" | ")}`);
+  } finally {
+    process.chdir(prevCwd);
+    (globalThis as any).setInterval = origSet;
+    (globalThis as any).clearInterval = origClear;
+    if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    if (prevDisabled === undefined) delete process.env.AGENT_REPO_FRESHNESS_DISABLED; else process.env.AGENT_REPO_FRESHNESS_DISABLED = prevDisabled;
+    if (prevWarn === undefined) delete process.env.AGENT_REPO_FRESHNESS_MODE; else process.env.AGENT_REPO_FRESHNESS_MODE = prevWarn;
   }
 });
 

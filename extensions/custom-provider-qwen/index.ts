@@ -29,9 +29,15 @@
  *
  * ── Connection hygiene mechanism ────────────────────────────────────────────
  * The tuned fetch hands every request an undici `Agent` built from this
- * package's OWN undici copy (pi's global dispatcher — keepAliveTimeout driven
- * by `httpIdleTimeoutMs`, currently 10 min — is too permissive for this
- * endpoint, which kills idle connections at ~8 min). The Agent:
+ * package's OWN undici copy. pi's global dispatcher (`configureHttpDispatcher`)
+ * sets `bodyTimeout`/`headersTimeout` from `httpIdleTimeoutMs` but NO keep-alive
+ * bound, so undici's defaults apply: `keepAliveTimeout` 4s and
+ * `keepAliveMaxTimeout` **600s** — the latter is the ceiling on the server's own
+ * `Keep-Alive: timeout=N` hint, which is why this endpoint (kills idle
+ * connections at ~8 min) could poison the pool for up to 10 minutes (#1110;
+ * corrected 2026-09-15 — `httpIdleTimeoutMs` never bounded keep-alive). The
+ * general fix now lives in `extensions/http-pool-hygiene/`; this Agent remains
+ * the deliberately more aggressive per-provider variant. The Agent:
  *
  *   pipelining: 0        — undici closes the socket after EVERY response
  *                          (client-h1.js: `socket[kReset] = true` when
@@ -113,7 +119,13 @@ export const AGENT_OPTIONS = {
   connections: 4, // max concurrent sockets per origin (parallel pi sessions)
   pipelining: 0, // undici: no pipelining AND close-after-response (socket[kReset])
   headersTimeout: 300_000, // network-layer backstop only; pi's timeoutMs owns the request budget
-  bodyTimeout: 600_000, // matches pi's default httpIdleTimeoutMs request budget
+  // Silent-hang ceiling, aligned with the shipped `httpIdleTimeoutMs: 300000`
+  // (#1088). This Agent bypasses pi's global dispatcher, so the fleet contract
+  // has no other way to reach qwen-ha — and `retry.provider.timeoutMs` is also
+  // 600000, so the previous 600000 here would make a silent hang
+  // indistinguishable from a slow call on the HA path until the per-call
+  // ceiling fired (the inversion `check-cost-config.sh` blocks for settings).
+  bodyTimeout: 300_000,
   allowH2: false, // aliyuncs compatible-mode is HTTP/1.1; matches pi's dispatcher
 } as const;
 

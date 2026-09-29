@@ -71,8 +71,10 @@ SCENARIO="${"${FAKE_PI_SCENARIO:-}"}"
 NONCE_FILE="${"${FAKE_PI_NONCE_FILE:-}"}"
 [ -n "$NONCE_FILE" ] && echo "$NONCE" > "$NONCE_FILE"
 # #623: record the hatch vars THIS child actually observed, out of band.
+# #1030: also record the NON-INTERACTIVE git env, out of band — the only proof
+# that the hardening reaches the real child PROCESS, not just a built env object.
 HATCH_FILE="${"${FAKE_PI_HATCH_FILE:-}"}"
-[ -n "$HATCH_FILE" ] && printf 'agent=%s\neldato=%s\n' "${"${AGENT_ALLOW_MAIN_EDITS:-}"}" "${"${ELDATO_ALLOW_MAIN_EDITS:-}"}" > "$HATCH_FILE"
+[ -n "$HATCH_FILE" ] && printf 'agent=%s\neldato=%s\ngiteditor=%s\nseqeditor=%s\nprompt=%s\n' "${"${AGENT_ALLOW_MAIN_EDITS:-}"}" "${"${ELDATO_ALLOW_MAIN_EDITS:-}"}" "${"${GIT_EDITOR:-}"}" "${"${GIT_SEQUENCE_EDITOR:-}"}" "${"${GIT_TERMINAL_PROMPT:-}"}" > "$HATCH_FILE"
 m() { echo "[task-heartbeat] $1" >&2; }
 em() { echo "[provider-exhaustion] $1" >&2; }
 case "$SCENARIO" in
@@ -206,12 +208,15 @@ const piMock: any = new Proxy(
 );
 (builtinToolsExt as any)(piMock);
 
-function readHatchFile(file: string): { agent: string; eldato: string } | null {
+function readHatchFile(file: string): { agent: string; eldato: string; gitEditor: string; seqEditor: string; terminalPrompt: string } | null {
 	try {
 		const txt = fs.readFileSync(file, "utf-8");
 		return {
 			agent: (/agent=(.*)/.exec(txt)?.[1] ?? "").trim(),
 			eldato: (/eldato=(.*)/.exec(txt)?.[1] ?? "").trim(),
+			gitEditor: (/giteditor=(.*)/.exec(txt)?.[1] ?? "").trim(),
+			seqEditor: (/seqeditor=(.*)/.exec(txt)?.[1] ?? "").trim(),
+			terminalPrompt: (/prompt=(.*)/.exec(txt)?.[1] ?? "").trim(),
 		};
 	} catch {
 		return null;
@@ -223,7 +228,7 @@ function readHatchFile(file: string): { agent: string; eldato: string } | null {
 async function dispatchTaskTool(
 	params: Record<string, unknown>,
 	parentHatch: "both" | "none",
-): Promise<{ hatch: { agent: string; eldato: string } | null }> {
+): Promise<{ hatch: { agent: string; eldato: string; gitEditor: string; seqEditor: string; terminalPrompt: string } | null }> {
 	const hatchFile = path.join(tmpDir, `hatch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}.txt`);
 	const savedAgent = process.env.AGENT_ALLOW_MAIN_EDITS;
 	const savedEldato = process.env.ELDATO_ALLOW_MAIN_EDITS;
@@ -477,6 +482,63 @@ test("#623: allow_main_edits: true is a NO-OP for an UNHATCHED controller (canno
 	ok(hatch, "the fake pi child wrote its observed-hatch file");
 	equal(hatch!.agent, "", "unhatched parent cannot hatch a child");
 	equal(hatch!.eldato, "", "unhatched parent cannot hatch a child");
+});
+
+// ── #1030: the task child's NON-INTERACTIVE git env (runtime, not source-scan)
+// A task child has no TTY (`stdio: ["ignore","pipe","pipe"]`), so an
+// interactive git invoker can only ever hang. The incident's one genuinely
+// wedged child was a merge `git commit` with no -m/-F that opened vim and sat
+// silent for 1211s until the inactivity bound killed it. These tests read the
+// values off the REAL spawned child process via the out-of-band hatch file —
+// the only way to prove the hardening survives the env composition (the
+// `...process.env` spread, the #285/#623 strips) rather than merely existing in
+// the literal.
+test("#1030 (E2E): a task child observes a NON-INTERACTIVE git env", async () => {
+	const { hatch } = await dispatchTaskTool({ prompt: "#1030 runtime git-env probe" }, "none");
+	ok(hatch, "the fake pi child wrote its observed-env file");
+	equal(hatch!.gitEditor, "true", "GIT_EDITOR must be the non-interactive no-op in the child");
+	equal(hatch!.seqEditor, "true", "GIT_SEQUENCE_EDITOR must be the non-interactive no-op in the child");
+	equal(hatch!.terminalPrompt, "0", "GIT_TERMINAL_PROMPT=0 — a credential prompt must fail, not wait");
+});
+
+test("#1030 (E2E): a parent's OWN interactive editor env cannot leak into the child", async () => {
+	// The forced keys are written AFTER the `...process.env` spread, so the
+	// dispatch wins. Without this ordering a parent launched with
+	// GIT_EDITOR=vim (or a `core.editor`-shaped env) re-creates the hang in
+	// every child — the hardening would be decorative (raised in the #1030
+	// problem-verify review).
+	const savedEditor = process.env.GIT_EDITOR;
+	const savedSeq = process.env.GIT_SEQUENCE_EDITOR;
+	const savedPrompt = process.env.GIT_TERMINAL_PROMPT;
+	process.env.GIT_EDITOR = "vim";
+	process.env.GIT_SEQUENCE_EDITOR = "vim";
+	process.env.GIT_TERMINAL_PROMPT = "1";
+	try {
+		const { hatch } = await dispatchTaskTool({ prompt: "#1030 runtime git-env probe — hostile parent" }, "none");
+		ok(hatch, "the fake pi child wrote its observed-env file");
+		equal(hatch!.gitEditor, "true", "a hostile parent GIT_EDITOR=vim must NOT reach the child");
+		equal(hatch!.seqEditor, "true", "a hostile parent GIT_SEQUENCE_EDITOR=vim must NOT reach the child");
+		equal(hatch!.terminalPrompt, "0", "a hostile parent GIT_TERMINAL_PROMPT=1 must NOT reach the child");
+	} finally {
+		if (savedEditor === undefined) delete process.env.GIT_EDITOR;
+		else process.env.GIT_EDITOR = savedEditor;
+		if (savedSeq === undefined) delete process.env.GIT_SEQUENCE_EDITOR;
+		else process.env.GIT_SEQUENCE_EDITOR = savedSeq;
+		if (savedPrompt === undefined) delete process.env.GIT_TERMINAL_PROMPT;
+		else process.env.GIT_TERMINAL_PROMPT = savedPrompt;
+	}
+});
+
+test("#1030: the task tool schema exposes stream_stall_ms as a number (runtime)", async () => {
+	ok(
+		Object.keys(taskToolDef.parameters?.properties ?? {}).includes("stream_stall_ms"),
+		"task tool schema exposes the per-dispatch inactivity bound",
+	);
+	equal(
+		taskToolDef.parameters.properties.stream_stall_ms.type,
+		"number",
+		"stream_stall_ms must be numeric — a string would end up in Number(), where 'Infinity' is truthy",
+	);
 });
 
 function deepEqualKeys(obj: Record<string, unknown>, keys: string[], msg: string) {

@@ -298,6 +298,13 @@ function parseFlow(text, line, start = 0, depth = 0) {
   const close = open === "[" ? "]" : "}";
   const mapping = open === "{";
   const out = mapping ? {} : [];
+  // Assign as an OWN property. A plain `out[key] = value` hits Object.prototype's `__proto__`
+  // setter, so a flow mapping written `{__proto__: {...}}` would install its value as the object's
+  // PROTOTYPE — and a reader looks up through the prototype chain, so a document could hand a guard
+  // a node it does not declare (a false PASS). Real YAML treats `__proto__` as an ordinary key, and
+  // so does this parser now (the block path already used Object.fromEntries, i.e. own properties).
+  const setKey = (obj, k, v) =>
+    Object.defineProperty(obj, k, { value: v, writable: true, enumerable: true, configurable: true });
   let i = skipFlowSpace(text, start + 1);
   for (;;) {
     if (text[i] === close) return { value: out, end: i + 1 };
@@ -313,10 +320,10 @@ function parseFlow(text, line, start = 0, depth = 0) {
       }
       i = skipFlowSpace(text, key.next);
       if (text[i] === "," || text[i] === close) {
-        out[key.name] = null;
+        setKey(out, key.name, null);
       } else {
         const v = parseFlowValue(text, i, line, depth);
-        out[key.name] = v.value;
+        setKey(out, key.name, v.value);
         i = skipFlowSpace(text, v.end);
       }
     } else {

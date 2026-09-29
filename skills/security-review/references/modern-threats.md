@@ -421,18 +421,18 @@ async def websocket_handler(websocket):
 
 ```bash
 # Prototype pollution
-grep -rn "__proto__\|constructor\[" --include="*.js"
-grep -rn "Object\.assign\|\.extend\|merge(" --include="*.js"
+git grep -n -e "__proto__\|constructor\[" -- '*.js'
+git grep -n -e "Object\.assign\|\.extend\|merge(" -- '*.js'
 
 # DOM clobbering
-grep -rn "document\.\w\+\.\w\+\|document\[" --include="*.js"
+git grep -n -e "document\.\w\+\.\w\+\|document\[" -- '*.js'
 
 # WebSocket without auth
-grep -rn "new WebSocket\|websocket\." --include="*.js" | grep -v "token\|auth"
+git grep -n -e "new WebSocket\|websocket\." -- '*.js' | grep -v "token\|auth"
 
 # LLM prompt concatenation
-grep -rn "f\".*{.*prompt\|f'.*{.*prompt\|\\+.*prompt" --include="*.py"
-grep -rn "complete(\|chat(\|generate(" --include="*.py"
+git grep -n -e "f\".*{.*prompt\|f'.*{.*prompt\|\\+.*prompt" -- '*.py'
+git grep -n -e "complete(\|chat(\|generate(" -- '*.py'
 ```
 
 ---

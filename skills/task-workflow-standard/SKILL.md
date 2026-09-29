@@ -34,7 +34,7 @@ SCOPE (gate: auto)
   ▼
 SCOPE-VERIFY (gate: verifier — blocks write/edit/bash)
   │
-  ├─ Dispatch 2 parallel scope verifier sub-agents
+  ├─ Dispatch the tier's scope verifier(s) — count per issue-scoping §Tier Scaling
   ├─ Each reviews: problem definition, alternatives, complexity
   ├─ If issues found → fix → re-dispatch
   ├─ Loop until ALL verifiers return NO ISSUES FOUND
@@ -50,10 +50,10 @@ PLAN (gate: auto)
   ▼
 PLAN-VERIFY (gate: verifier — blocks write/edit/bash)
   │
-  ├─ Dispatch 2 parallel plan verifier sub-agents
+  ├─ Dispatch the plan reviewer(s) — count per `proportional-gates` §Review Cycles
   ├─ Each reviews: approach soundness, step clarity, integration surfaces
   ├─ If issues found → fix → re-dispatch
-  ├─ Loop until ALL verifiers return NO ISSUES FOUND
+  ├─ Loop until ALL plan reviewers return NO ISSUES FOUND
   │     (adversarial domain: `THREAT SURFACE COVERED`, bounded at 2 cycles — see below)
   │
   ▼
@@ -74,11 +74,11 @@ VERIFY (gate: verifier — blocks write/edit/bash)
 
 At each verifier gate (scope-verify, plan-verify, verify):
 
-1. **Dispatch 2 parallel verifier sub-agents** via the `task` tool
-2. Each verifier returns structured output with `NO ISSUES FOUND` or an issue list
-3. The gate stays locked (blocks write/edit/bash/MCP) until ALL dispatched verifiers return clean
-4. If any verifier finds issues → fix them → re-dispatch ALL verifiers
-5. Only `NO ISSUES FOUND` from every verifier advances the gate (adversarial domain: `THREAT SURFACE COVERED` substitutes — see below)
+1. **Dispatch the gate's own count** via the `task` tool — scope: `issue-scoping` §Tier Scaling; plan: `proportional-gates` §Review Cycles; verify: `verification-before-completion` (one verifier sub-agent)
+2. Each dispatched agent returns structured output with `NO ISSUES FOUND` or an issue list
+3. The gate stays locked (blocks write/edit/bash/MCP) until ALL dispatched agents return clean
+4. If any agent finds issues → fix them → re-dispatch ALL
+5. Only `NO ISSUES FOUND` from every dispatched agent advances the gate (adversarial domain: `THREAT SURFACE COVERED` substitutes — see below)
 
 **The gate does NOT advance on dispatch count alone.** Verifier content is checked. A verifier that finds issues keeps the gate locked so the agent must fix and re-verify.
 
@@ -91,7 +91,7 @@ When the scope output declares an `### Adversarial Threat Surface` (gate/enforce
 When the agent first reads this skill, the sequence-enforcer shows:
 
 ```
-🔒 Scope-verify gate ahead — you will need to dispatch 2 parallel scope verifiers.
+🔒 Scope-verify gate ahead — you will need to dispatch the tier's scope verifier(s).
    The gate blocks write/edit/bash until all verifiers return clean.
    Fix-and-reverify loops are expected. Do not bypass.
 ```
@@ -106,7 +106,7 @@ Both this skill and `project-workflow` gate standard/complex work — the differ
 |---|---|---|
 | Level | `task` | `project` |
 | Deliverable | Single atomic deliverable | Multi-deliverable, decomposes into child issues |
-| Scope/plan gates | 2 parallel verifiers (scope + plan) | Human approval + shared sub-skills, MECE decompose, wiring |
+| Scope/plan gates | Verifiers per the gate's own skill | Human approval + shared sub-skills, MECE decompose, wiring |
 
 **Escalation rule:** if Scope (via `issue-scoping`) reveals the task actually needs **MECE decomposition into child issues, wiring, or E2E** → escalate to `project-workflow` instead. A task-level standard/complex issue stays here while it remains one deliverable.
 
@@ -115,7 +115,7 @@ Both this skill and `project-workflow` gate standard/complex work — the differ
 ## Key Principles
 
 - **Scope before plan before code.** Mechanical enforcement. No shortcuts.
-- **Verifier quality over dispatch count.** 2 verifiers that actually review > 1 that says "looks good."
+- **Verifier quality over dispatch count.** A verifier that actually reviews beats one that signs off, and independent conclusions beat a single pass wherever the tier's count allows it.
 - **Loop until clean.** Fix-and-reverify is the expected pattern. The gate stays locked until it's right.
 - **Proportional depth.** Complex issues get deeper research in issue-scoping. Standard gets lighter passes. The pipeline is the same; the sub-skills scale depth.
 - **Research path (issue #231 D11).** A standard/complex task's research = issue-scoping Phase 1.5's `### Axis Research`/`### Integration Docs` artifact (scoping stage) + writing-plans Step B's `### Pattern Research` re-derivation at the concrete plan level (planning stage). Both are fresh-query surfaces at their own granularity — the scoping artifact is PRIOR_RESEARCH for planning, never a substitute.

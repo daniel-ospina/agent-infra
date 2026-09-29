@@ -391,20 +391,20 @@ def cleanup_old_logs():
 
 ```bash
 # Missing security logging
-grep -rn "def login\|def authenticate" --include="*.py" | xargs -I {} grep -L "logger\|logging" {}
+git grep -l -e "def login\|def authenticate" -- '*.py' | xargs -r grep -L "logger\|logging"
 
 # Sensitive data in logs
-grep -rn "logger.*password\|logging.*password\|log.*password" --include="*.py"
-grep -rn "logger.*token\|logger.*secret\|logger.*key" --include="*.py"
+git grep -n -e "logger.*password\|logging.*password\|log.*password" -- '*.py'
+git grep -n -e "logger.*token\|logger.*secret\|logger.*key" -- '*.py'
 
 # Unsanitized log input
-grep -rn "logger.*f\"\|logger.*%s.*%" --include="*.py"
+git grep -n -e "logger.*f\"\|logger.*%s.*%" -- '*.py'
 
 # Missing log rotation
-grep -rn "basicConfig.*filename\|FileHandler" --include="*.py" | grep -v "Rotating"
+git grep -n -e "basicConfig.*filename\|FileHandler" -- '*.py' | grep -v "Rotating"
 
 # World-readable logs
-grep -rn "chmod.*644\|chmod.*755" --include="*.py" | grep -i log
+git grep -n -e "chmod.*644\|chmod.*755" -- '*.py' | grep -i log
 ```
 
 ---

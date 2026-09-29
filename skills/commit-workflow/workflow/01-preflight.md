@@ -219,7 +219,7 @@ BEHIND=$(git rev-list --count HEAD.."origin/$DEFAULT_BRANCH" 2>/dev/null || echo
 | State | Action |
 |---|---|
 | `BEHIND = 0` | Silent — already current. |
-| `BEHIND > 0` + clean tree | `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`, then RE-RUN the affected pre-flight regression tests. If the branch was previously pushed and the post-rebase push is rejected as non-fast-forward → `git push --force-with-lease`. |
+| `BEHIND > 0` + clean tree | **Do NOT rebase for freshness.** Staleness does not block a merge unless the repo under work requires up-to-date branches. The fleet default is now `strict: false` (tortoise `main`, ruled DELIBERATE 2026-09-28 — tortoise #4764): with it there is no must-update, so rebasing here only restarts CI and re-runs the pre-flight regression tests for nothing, and that churn is exactly what left verified PRs unlandable for days. Rebase ONLY if (a) the repo under work requires up-to-date branches (`strict: true`) — check, do not assume — or (b) the branch has an actual conflict. When you do rebase: `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`, then RE-RUN the affected pre-flight regression tests. If the branch was previously pushed and the post-rebase push is rejected as non-fast-forward → `git push --force-with-lease`. |
 | `BEHIND > 0` + dirty tree | **WARN**: "Branch is N behind origin/<default> — commit or stash first, then `git -c commit.gpgsign=false pull --rebase origin <default>`." NEVER autostash (conflict-unsafe unattended). |
 
 **Pre-flight: the main-worktree-guard's branch-ownership gates (#265) run on every bash tool_call.** This skill runs from the session's WORKTREE — agent-infra included (the #99 in-main-work exemption was removed in #615; the agent-infra hub is main+clean like every hub, and in-hub `checkout -b` is BLOCKED there too, #626). In a worktree BOTH the M2/M3 gates and the legacy destructive-block arm are worktree-exempt (`eff.isWorktree`) — M2/M3 apply only to MAIN-checkout-effective mutations, and the legacy arm carries its own exemption — so the pre-flight's own-branch hygiene ops — `pull --rebase`, `rebase`, `merge origin/<default>`, `push` incl. `--force-with-lease` — run ungated on the worktree's branch. The merged-branch cleanup's remote `git push --delete <branch>` is NOT worktree-exempt: it hits the #73 coordinated-delete guard while the branch is checked out in ANY worktree (including this one), so run it after teardown (05-cleanup.md Step 3.8) or use `gh api -X DELETE`. The guard matches the LITERAL ref in the command text — a shell-variable form (`git push origin --delete "$PR_BRANCH"`) is NOT resolved by the classifier and is therefore not guard-matched. The local `git branch -D` is best-effort: git refuses it while checked out, and after teardown the HUB's main-checkout `block:branch-force-delete` gate blocks a branch that is not the session's baseline or pid-owned (a `git worktree add -b` branch is never recorded as owned — create-new is blocked, #626). A guard block rejects the bash call BEFORE the shell runs, so write the teardown note yourself — the `||` echo only covers git's own refusal. If a command is blocked with a "branch ownership violated" message, you are running against the MAIN checkout (a stray `cd`/`-C` back to the hub): return to the worktree and retry — never `git checkout -b` in a hub (blocked for agent-infra and non-infra alike; the M3 create-new carve-out was removed in #626).
@@ -337,13 +337,13 @@ Mechanism separation: the VGATE content-shape skip is extension-side and shape-b
 
 | Gate | Micro Behavior |
 |------|---------------|
-| Review-enforcer | **BLOCK at 0 dispatches — ≥1 sub-agent dispatch required at EVERY tier, micro included (#485)** (the gate counts any sub-agent dispatch — the `task` or `subagent` tool). The VGATE docs/CSS/static skip removed the backstop that made the pre-#485 micro leniency safe. Code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only sets dispatch a lightweight reviewer (even a trivial one-line review counts). The marker read (/tmp/agent-issue-complexity = micro) selects the micro remediation message only |
+| Review-enforcer | **BLOCK at 0 dispatches — ≥1 sub-agent dispatch required at EVERY tier, micro included (#485)** (the gate counts any sub-agent dispatch — the `task` or `subagent` tool). The VGATE docs/CSS/static skip removed the backstop that made the pre-#485 micro leniency safe. Code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only sets dispatch a lightweight reviewer that returns a verdict on the diff (a one-line verdict is enough — the diff is small, not the review absent). The marker read (/tmp/agent-issue-complexity = micro) selects the micro remediation message only |
 | Verification-gate (VGATE) | **shape-gated, not tier-gated** — docs/CSS/static-only sets skip regardless of tier; code sets never skip (see Pi Extension Gates → Verification Gate below) |
 | Lint/Typecheck | **KEPT** — runs in pre-commit hooks, zero agent overhead |
 | Code review (Step 3) | **SKIPPED** — per commit-workflow/03-code-review.md |
 | Pipeline-compliance CI gate (check a) | **KEPT — issue link required at EVERY tier, docs-only micro included (#488)** — the script's micro exemption skips checks b–e (scoping/review/plan evidence), and the docs-only shape exemption covers only check e (test evidence); no carve-out exists or is planned for the linked-issue requirement in a PR run. See the #488 note below. |
 
-**Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code), and VGATE's own [VGATE] verification dispatch satisfies the review-enforcer ≥1-dispatch rule before the commit — micro code sets clear the gate with no extra ceremony. The residual case the uniform block closes is the docs-only micro commit: VGATE shape-exempts it and the multi-agent code-review gate is skipped at micro, so the ≥1 dispatch must come from a lightweight reviewer dispatch (even a trivial one-line review counts).
+**Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code), and VGATE's own [VGATE] verification dispatch satisfies the review-enforcer ≥1-dispatch rule before the commit — micro code sets clear the gate with no extra ceremony. The residual case the uniform block closes is the docs-only micro commit: VGATE shape-exempts it and the multi-agent code-review gate is skipped at micro, so the ≥1 dispatch must come from a lightweight reviewer dispatch that returns a verdict on the diff (a one-line verdict is enough — the floor is content-free (#485 F2) and counts the dispatch, but the dispatch is expected to be a real review, not merely a run).
 
 **#488 decision — the pipeline-compliance issue-link requirement (check a) is KEPT for docs-only shape-exempt commits, as a deliberate audit invariant.** This holds for **every PR run** — the #792 `--issue-only` preflight evaluates the linked issue's artifacts directly (there is no PR body to parse) and never runs in CI, so the invariant below is unchanged. The audit (scripts/check-pipeline-compliance.sh): in a PR run check a is unconditional — it runs at every tier and every file shape; `complexity:micro` skips checks b–e (scoping comment, code-review evidence, plan doc) and the docs/skills/templates/config-only shape exemption covers only check e (test coverage — it exempts nothing about the linked issue). No docs-only carve-out exists in the script or the workflow. KEEP rationale: (1) a docs-only commit now skips VGATE (#472 shape exemption) and the multi-agent code-review gate (micro), so check a is the only deterministic, CI-enforced content gate left on it — the review-enforcer ≥1-dispatch floor is content-free by design (#485); (2) the #485 audit documented that the "docs are low-consequence" premise fails for the contract-doc subclass (skills/*.md edits encode agent behavior for every future session — #475/#492), so docs-only commits are exactly the class that must keep tracing to a deliberate issue; (3) friction is negligible for pipeline-shaped work — Issue Detection above resolves an issue before every PR-opening commit (the permitted `'none'` answer leaves no PR that check a would pass — a no-issue docs change must go through issue-creation first, which is the intended remedy, not a gate exemption). Relaxing would reopen a no-content-gate path for contract-doc changes and break the gate's "every PR traces to an issue" audit claim. No script or test change — this is a documented-rationale decision (#488).
 
@@ -387,14 +387,14 @@ The `review-enforcer` extension blocks git operations unless at least one sub-ag
 ```bash
 # This gate fires ON the git commit/push command itself — not as a separate check.
 # To satisfy it: dispatch a reviewer sub-agent BEFORE running git commit.
-# Even a trivial one-line review counts.
+# The reviewer must return a verdict on the diff — a one-line verdict is enough.
 ```
 
 **How to satisfy:**
 1. Before `git commit`, dispatch a `task` sub-agent (or `subagent`-tool agent) to review your changes
 2. The reviewer must return a result (even "NO ISSUES FOUND")
 3. The gate counts any sub-agent dispatch (task or subagent tool) — 1 is enough
-4. **Micro tier:** code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only micro sets (VGATE content-shape exempt) dispatch a lightweight reviewer naming the diff — the multi-agent code-review gate stays skipped per 03-code-review.md
+4. **Micro tier:** code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only micro sets (VGATE content-shape exempt) dispatch a lightweight reviewer naming the diff and returning a verdict on it (the floor counts the dispatch — content-free, #485 F2) — the multi-agent code-review gate stays skipped per 03-code-review.md
 
 **Failure:** "No reviewers were dispatched in this session before the git operation." (micro tier receives a micro-specific message directing a lightweight docs reviewer).  
 **Bypass:** `AGENT_SKIP_REVIEW_GATE=1` (emergency only)
@@ -511,7 +511,43 @@ the push actually ships — not the whole index: `git diff
 refs/remotes/<remote>/<branch> <src>` when the remote-tracking ref exists
 (2-dot), or 3-dot against the remote's main on a first push
 (`refs/remotes/<remote>/main` when that ref exists, else the
-`refs/remotes/origin/main` fallback). A parked-WIP index from another session
+`refs/remotes/origin/main` fallback). ⛔ **A HISTORY-REWRITING push is scoped
+against the integration base, never the stale tracking ref (#3716).** When the
+remote-tracking ref is no longer an ancestor of the pushed tip — i.e. the
+branch was `rebase`d after it was pushed — the ref still points at the
+PRE-rebase tip on the OLD base, so the 2-dot range is the whole base delta
+(629 files in the field) instead of the branch's own diff (3), and the retry
+loop cannot converge. Such a push is scoped 3-dot against the integration base
+(the tier-B command form), and the discarded commits are reported
+separately as `gate_skip: non_fast_forward_push` (a report, never a widening of
+the verify set). That switch needs THREE explicit preconditions: the integration
+ref is **declared** — a repo-LOCAL `git config --local vgate.integrationRef`
+(the per-clone operator assertion that ACTIVATES the narrowing; a `--global` /
+`--system` / `GIT_CONFIG_*` value does NOT activate, so a machine-global key
+cannot narrow every clone) whose value is confirmed by a checked-in
+`.vgate/integration-ref` when that file is present (an AGREEMENT TRIPWIRE —
+exactly ONE meaningful line equal to the config; a shared, clone-relative name
+must not activate on its own: a fork clone inherits `refs/remotes/origin/main`,
+where `origin` is the FORK, and honoring it alone reproduces the fail-open one
+level up; a disagreement, extra line, non-regular file, or present-but-unreadable
+file — including a tracked DANGLING SYMLINK — is refused)
+— and `resolveTrustedBase` resolves to exactly that ref
+(never a base judged an integration branch by its NAME, and never the push
+remote's `main`; agent-infra #1491); the remote-tracking ref is NOT an ancestor
+of the pushed tip; **and** the integration base IS an
+ancestor-or-equal of it (so `merge-base(base, HEAD) == base` and every path the
+3-dot range omits is byte-identical to the base TIP's content — the trusted
+integration content). Without the declaration there is NO narrowing (fail
+closed — the full pre-#3716 set is demanded); without the second proof a branch
+that is merely behind
+the base would narrow to a range that omits the paths its force-push REVERTS,
+reporting a content-destroying push as an empty up-to-date one. Any other
+outcome, including an unresolvable probe, leaves the push on its pre-#3716 path
+— the narrowing is taken only on proof, so an unprovable push is never measured
+against a different base than before. A plain fast-forward push is unchanged
+(the narrow incremental range). A rewrite push is never ALSO reported as an
+up-to-date empty range — its single op-level line is the rewrite report. A
+parked-WIP index from another session
 must not block an unrelated push of already-verified committed HEAD; an
 up-to-date push is audited `gate_skip: push_range_empty`. ⛔ Fail-closed
 fallbacks (the range scope is a best-effort resolution, never a widening):
@@ -546,8 +582,15 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 ### Scope subtraction (#755)
 
 VGATE **subtracts** a path from the scope it asks you to verify when that path's
-recorded entry is byte-identical to the same path's blob in the named trusted base
-(`refs/remotes/<remote>/<branch>`, falling back to `refs/remotes/origin/main`).
+recorded entry is byte-identical to the same path's blob in the named trusted base:
+a `branch.<cur>.merge` naming a branch **different from the current one** (or naming
+`main`/`master` even when it equals the current branch), resolved on
+`branch.<cur>.remote` else `origin`; otherwise `refs/remotes/origin/main`.
+⛔ A branch's own upstream ref is **not** a base: `git push -u` writes the branch's
+own name there, and using it made the push arm's guard (4) unsatisfiable (T equals
+HEAD^1, a *first* parent), silently disabling the subtraction and re-demanding every
+merged-in file (#3398). The push remote is never consulted as a *fallback* base, and
+`refs/remotes/<remote>/HEAD` is not used (user-settable local state).
 The **recorded entry** is per arm — there is no single answer, because the arms
 differ structurally rather than by a runtime flag:
 
@@ -575,11 +618,26 @@ coverage for every upstream file: recorded incidents went from 39 staged files t
 - **Opt out:** `ELDATO_VGATE_NO_SUBTRACT=1` restores the previous (larger) scope and is
   audited as `subtract_disabled_by_env`. Unlike `ELDATO_SKIP_VGATE` this moves in the
   **stricter** direction, so a task sub-agent is permitted to set it: it can cost time,
-  never coverage.
+  never coverage. It disables the #3716 narrowing as well, so a rewrite push keeps the
+  pre-#3716 2-dot scope too — the opt-out's "previous scope" promise holds for every
+  scope producer (substitution aside, no scope is narrowed while the flag is set).
 
 Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
-`git push` (tier A only; the tier-B/C paths keep their pre-#755 behaviour). Tier-C push
-fallback and rebase/cherry-pick push-leg de-flooding (#737) are deliberate non-goals.
+`git push` (the tracking-ref arm unless the #3716 narrowing applies: the tracking ref is
+NOT an ancestor-or-equal of the pushed tip AND the integration base IS one; the tier-B/C
+paths keep their pre-#755 behaviour). Tier-C push fallback remains a
+deliberate non-goal; **rebase/cherry-pick push-leg de-flooding (#737, delivered in
+2026-09-25 as tortoise #3716) is no longer one** — a history-rewriting push is now
+scoped against the trusted base (3-dot), and no subtraction guard set can subtract from
+that narrowed range (guard (5) cannot pass: the tracking ref is not an ancestor of
+`srcRef`, hence not of `srcRef^1` — and every guard is required; see the push-range
+paragraph above). The narrowing's base must EQUAL the declared integration ref
+(the repo-local `git config --local vgate.integrationRef` — the activation
+surface; a `--global`/env key does NOT activate — confirmed by a checked-in
+`.vgate/integration-ref` tripwire that must declare the same single ref when
+present; agent-infra #1491),
+is resolved on pinned commit OIDs, and is never chosen from a ref name or the
+push remote's `main`. No config ⇒ no narrowing (fail closed).
 
 ### VGATE ceremony diagnostics & recovery (#561)
 
@@ -591,86 +649,8 @@ fallback and rebase/cherry-pick push-leg de-flooding (#737) are deliberate non-g
 | `fail-open-refused` | Unparseable response in a task sub-agent — fail-open merge refused (#285) | Files were NOT recorded; re-dispatch a verifier that returns PASS/JSON per above |
 | `fail-verdict` | Verifier judged the files NOT ready | Do NOT re-dispatch blindly — address the failures the verifier listed, fix the files, then re-dispatch |
 | `zero-merge-pass` | Verifier PASSed but nothing matched the block/diff scope | Re-dispatch naming the EXACT blocked files printed in the block message |
-| Hash mismatch remedy line | Verifier-recorded hash ≠ disk | Either the file changed after verification OR the verifier mis-transcribed the hash — **never hand-type sha256**: run `sha256sum <file>` and re-dispatch the exact hash |
+| Hash mismatch remedy line | Verifier-recorded hash ≠ disk | Either the file changed after verification OR the verifier mis-transcribed the hash — **never hand-type sha256**: run `sha256sum <file>` and re-dispatch the exact hash. For a **symlink** that command is wrong — `sha256sum` FOLLOWS the link (and errors on a directory link) while the gate hashes the raw LINK TARGET bytes (git's mode-120000 blob), so use the buffer form: `node -e 'const f=require("fs"),c=require("crypto");console.log(c.createHash("sha256").update(f.readlinkSync(process.argv[1],{encoding:"buffer"})).digest("hex"))' -- <path>` (#1092) |
 
 **Threshold semantics (#561):** `dispatchStreak` counts only dispatch-FORMAT failures (empty/no-text/unparseable/refused) and escalates MESSAGING at 3 — it never disables or bypasses anything. The gate NEVER auto-disables for task sub-agents (#285). FAIL verdicts and zero-merge PASSes are successful dispatches (#132) — they add a remedy line but do not move the streak. Any successful merge resets the streak. In an interactive session only, 3 consecutive format failures still auto-disable the gate (unchanged), now recorded to the audit log.
 
 **Observing / clearing bridge state (#561):** `$AGENT_INFRA_PATH/scripts/vgate.sh status` prints the bridge file (`~/.pi/agent/verification/latest.json`) with per-entry root/file/stored-hash + disk match-or-drop preview and the audit tail. `vgate.sh clear` drops the CURRENT worktree root's entries; `clear --root <R>` and `clear --all` target other scopes. Fail-closed: clearing only removes verified state — the next git op re-blocks until re-verified; it is never a bypass. A live session's in-session registry is process-local (not affected by the CLI) — a stuck block inside a running session is cured by the gate's own diagnostics + escalation above, not by the CLI.
-
----
-
-### Test-Review Hash Backstop Gate
-
-**Purpose:** Ensure every test file has passed test-review before commit. Complements VGATE (which verifies file content quality) by verifying test correctness. Catches any code path that bypassed the test-writing → test-review mandatory gate.
-
-**When:** Standard+Complex tier commits where staged files include `.ts`, `.tsx`, `.py`, `.sql`, `.js`, or `.jsx`.
-
-**Skip:** Micro tier commits (tier-gated — the Mechanism below reads the issue's `complexity:*` LABEL, the same canonical channel Tier Detection above uses; #515 removed the earlier body-substring grep, which false-skipped Standard issues whose bodies merely mention `complexity:micro` in prose — prose mentions are not a tier signal, and the Standard PR class most likely to name the tier is pipeline-policy edits like this file. VGATE remains shape-gated, never micro-gated), or commits with no matching file extensions.
-
-**Mechanism:**
-
-```bash
-# Skip for micro tier — the complexity LABEL is the canonical tier source (Tier Detection
-# above reads the same label); a body-substring grep would false-positive on Standard issue
-# bodies that mention 'complexity:micro' in prose, silently skipping the gate (#515)
-IS_MICRO=$(gh issue view <N> --json labels --jq '.labels[].name' | grep -q '^complexity:micro$' && echo true || echo false)
-[ "$IS_MICRO" = "true" ] && exit 0
-
-# Check for testable files
-STAGED=$(git diff --cached --name-only)
-HAS_TESTABLE=$(echo "$STAGED" | grep -qE '\.(ts|tsx|py|sql|js|jsx)$' && echo true || echo false)
-[ "$HAS_TESTABLE" != "true" ] && exit 0
-
-# Check each test file for test-review hash
-for FILE in $(echo "$STAGED" | grep -E '\.(test|spec|e2e)\.(ts|tsx)$|\.pg$|\.py$'); do
-  # Skip deleted files
-  git diff --cached --diff-filter=D -- "$FILE" | grep -q . && continue
-  
-  ABS_PATH=$(realpath "$FILE" 2>/dev/null || readlink -f "$FILE" 2>/dev/null || echo "$FILE")
-  if command -v sha256sum >/dev/null 2>&1; then
-    FILE_HASH=$(echo -n "$ABS_PATH" | sha256sum | cut -d' ' -f1)
-  else
-    FILE_HASH=$(echo -n "$ABS_PATH" | shasum -a 256 | cut -d' ' -f1)
-  fi
-  HASH_FILE="$HOME/.pi/agent/test-review/${FILE_HASH}.json"
-  
-  if [ ! -f "$HASH_FILE" ]; then
-    echo "⛔ BLOCKED: test-review never completed for $FILE"
-    echo "   Run test-writing → test-review before committing."
-    exit 1
-  fi
-  
-  STATUS=$(python3 -c "import json; print(json.load(open('$HASH_FILE'))['status'])" 2>/dev/null || echo "ABSENT")
-  
-  case "$STATUS" in
-    CLEAN)
-      echo "✅ $FILE — test-review: CLEAN"
-      ;;
-    CAPPED)
-      ISSUES=$(python3 -c "import json; d=json.load(open('$HASH_FILE')); print('; '.join(i['description'][:80] for i in d.get('capped_issues',[])))" 2>/dev/null || echo "unknown")
-      echo "⚠️ $FILE — test-review: CAPPED ($ISSUES)"
-      ;;
-    *)
-      echo "⛔ BLOCKED: invalid hash status '$STATUS' for $FILE"
-      exit 1
-      ;;
-  esac
-done
-
-# TTL cleanup: remove hashes older than 30 days
-find "$HOME/.pi/agent/test-review/" -name '*.json' -mtime +30 -delete 2>/dev/null || true
-
-# Orphan cleanup: remove hashes where test file no longer exists
-for HF in "$HOME/.pi/agent/test-review/"*.json; do
-  [ ! -f "$HF" ] && continue
-  FP=$(python3 -c "import json; print(json.load(open('$HF')).get('test_file_path',''))" 2>/dev/null || true)
-  [ -n "$FP" ] && [ ! -f "$FP" ] && rm -f "$HF"
-done
-```
-
-**Tri-state verdict:**
-- **ABSENT** (no hash file) → **BLOCK** — test-review was never completed
-- **CAPPED** (hash exists, status=CAPPED) → **WARN** — proceed with documented issues
-- **CLEAN** (hash exists, status=CLEAN) → proceed
-
-**Post-commit cleanup:** After successful commit, delete consumed hash files for CLEAN-status files in this commit.

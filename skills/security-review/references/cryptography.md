@@ -283,24 +283,24 @@ ciphertext, tag = cipher.encrypt_and_digest(plaintext)
 
 ```bash
 # Weak algorithms
-grep -rn "MD5\|md5\|SHA1\|sha1\|DES\|des\|RC4\|rc4" --include="*.py" --include="*.js"
-grep -rn "MODE_ECB\|ecb" --include="*.py" --include="*.js"
+git grep -n -e "MD5\|md5\|SHA1\|sha1\|DES\|des\|RC4\|rc4" -- '*.py' '*.js'
+git grep -n -e "MODE_ECB\|ecb" -- '*.py' '*.js'
 
 # Insecure random
-grep -rn "Math\.random\|random\.random\|random\.randint" --include="*.py" --include="*.js"
-grep -rn "mt_rand\|rand()" --include="*.php"
+git grep -n -e "Math\.random\|random\.random\|random\.randint" -- '*.py' '*.js'
+git grep -n -e "mt_rand\|rand()" -- '*.php'
 
 # Hardcoded keys
-grep -rn "key\s*=\s*['\"]" --include="*.py" --include="*.js"
-grep -rn "secret\s*=\s*['\"]" --include="*.py" --include="*.js"
-grep -rn "AES\.new.*b'" --include="*.py"
+git grep -n -e "key\s*=\s*['\"]" -- '*.py' '*.js'
+git grep -n -e "secret\s*=\s*['\"]" -- '*.py' '*.js'
+git grep -n -e "AES\.new.*b'" -- '*.py'
 
 # Static IVs/nonces
-grep -rn "iv\s*=\s*b'\|nonce\s*=\s*b'" --include="*.py"
-grep -rn "\\x00.*\\x00.*\\x00" --include="*.py"
+git grep -n -e "iv\s*=\s*b'\|nonce\s*=\s*b'" -- '*.py'
+git grep -n -e "\\x00.*\\x00.*\\x00" -- '*.py'
 
 # CBC without HMAC
-grep -rn "MODE_CBC" --include="*.py" | grep -v "hmac\|mac\|tag"
+git grep -n -e "MODE_CBC" -- '*.py' | grep -v "hmac\|mac\|tag"
 ```
 
 ---

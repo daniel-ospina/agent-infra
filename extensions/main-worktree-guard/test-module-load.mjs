@@ -35,7 +35,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-module-load.mjs
 import { execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -384,6 +384,93 @@ async function partB() {
     const reset = await callBash("git reset --hard origin/main");
     expectTrue("B6b: `git reset --hard` is blocked by the loaded extension end-to-end",
       !!reset && reset.block === true, `handler returned ${JSON.stringify(reset)}`);
+
+    // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
+    // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE
+    // script whose only path-shaped content is a markdown code span inside a
+    // quoted heredoc must RUN (this is the #967 fleet-wide freeze), and a
+    // discard reachable only from another subcommand must not gate THIS
+    // invocation — while still blocking its own.
+    const BT = String.fromCharCode(96);
+    writeFileSync(join(repo, "probe.sh"),
+      "python3 - \"$1\" <<'PYEOF'\n# docs: a trailing " + BT + "/" + BT + " normalizes to empty\nPYEOF\n");
+    const probeRun = await callBash("bash probe.sh --probe");
+    expectTrue("B8a: git-free script w/ docstring backtick runs (#967 probe class)",
+      probeRun === undefined, `handler returned ${JSON.stringify(probeRun)}`);
+    writeFileSync(join(repo, "dispatch.sh"),
+      "case \"$1\" in\n  --reset) git reset --hard ;;\n  --status) git status ;;\nesac\n");
+    const dStatus = await callBash("bash dispatch.sh --status");
+    const dReset = await callBash("bash dispatch.sh --reset");
+    expectTrue("B8b: dispatch --status ALLOWED (discard branch unreachable)",
+      dStatus === undefined, `handler returned ${JSON.stringify(dStatus)}`);
+    expectTrue("B8c: dispatch --reset BLOCKED (discard reachable)",
+      !!dReset && dReset.block === true, `handler returned ${JSON.stringify(dReset)}`);
+    expectTrue("B8c-msg: block message drops the dead hub-worktree recovery + old wording",
+      !!dReset && /script content contains a blocked git operation/.test(dReset.reason ?? "") &&
+      !/git-bearing script in the shared main checkout/.test(dReset.reason ?? "") &&
+      !/checkout-hygiene\/hub-worktree\.sh/.test(dReset.reason ?? ""),
+      `reason=${JSON.stringify(dReset?.reason ?? "")}`);
+    // (c) the documented dodge — write /tmp/x.sh + `bash /tmp/x.sh` — stays closed.
+    const dodgePath = join(tmp, "dodge.sh");
+    writeFileSync(dodgePath, "#!/bin/bash\ngit reset --hard\n");
+    const dodge = await callBash(`bash ${dodgePath}`);
+    expectTrue("B8d: /tmp dodge (write + bash <file>) BLOCKED",
+      !!dodge && dodge.block === true, `handler returned ${JSON.stringify(dodge)}`);
+    // #743: a script OWNED by a linked worktree is labeled as such — the old
+    // message called it "the shared main checkout" and offered a recovery
+    // (hub-worktree.sh) that cannot lift a hub-rooted session's content gate.
+    const wt = join(tmp, "wt");
+    execSync(`git worktree add -q "${wt}" -b wt/label HEAD`, { cwd: repo, stdio: "ignore" });
+    writeFileSync(join(wt, "wt-discard.sh"), "#!/bin/bash\ngit reset --hard\n");
+    const wtBlock = await callBash(`bash ${join(wt, "wt-discard.sh")}`);
+    expectTrue("B8e: worktree-owned script labeled a linked worktree (not the main checkout)",
+      !!wtBlock && wtBlock.block === true &&
+      /script location: a linked worktree/.test(wtBlock.reason ?? "") &&
+      !/checkout-hygiene\/hub-worktree\.sh/.test(wtBlock.reason ?? ""),
+      `reason=${JSON.stringify(wtBlock?.reason ?? "")}`);
+
+    // ── B8f/B8g/B8h: #1129 sanctioned-framework-script exemption ──
+    // The framework's OWN mandated preflight is exempted from the content walk
+    // (it false-blocks on pure text shapes: ```bash fences inside a single-
+    // quoted test fixture, and a usage heredoc whose prose says "git remote").
+    // The exemption is REALPATH-keyed on the guard's own checkout and NAMED —
+    // so the SAME content at any other path must still block (the
+    // discriminator), and a git-DESTRUCTIVE framework helper must still block
+    // (the adversarial-review P0 boundary).
+    const sanctioned = join(HERE, "..", "..", "scripts", "check-pipeline-compliance.sh");
+    const sanctionedRun = await callBash(`bash ${sanctioned} --help`);
+    expectTrue("B8f: the framework's own mandated preflight is exempt (#1129)",
+      sanctionedRun === undefined, `handler returned ${JSON.stringify(sanctionedRun)}`);
+    const sameContent = join(repo, "check-pipeline-compliance.sh");
+    writeFileSync(sameContent, readFileSync(sanctioned, "utf-8"));
+    const copyRun = await callBash(`bash ${sameContent} --help`);
+    expectTrue("B8h: the SAME content at a non-sanctioned path is still blocked (exemption is path-keyed)",
+      !!copyRun && copyRun.block === true &&
+      /script content contains a blocked git operation/.test(copyRun.reason ?? ""),
+      `handler returned ${JSON.stringify(copyRun)}`);
+    const destructive = join(HERE, "..", "..", "scripts", "cleanup-worktree.sh");
+    const destructiveRun = await callBash(`bash ${destructive} feat/x --force`);
+    expectTrue("B8g: a git-DESTRUCTIVE framework helper is still content-gated (no directory-wide exemption)",
+      !!destructiveRun && destructiveRun.block === true &&
+      /script content contains a blocked git operation/.test(destructiveRun.reason ?? ""),
+      `handler returned ${JSON.stringify(destructiveRun)}`);
+    // B8i (#1141): the mandated scratch-checkout helper must be runnable FROM A
+    // HUB-ROOTED session — the rule in code-review / test-writing /
+    // verification-before-completion tells a hub-rooted reviewer to use it, and
+    // its content (worktree add/remove/prune, sparse-checkout, read-tree) would
+    // otherwise be content-gated, pushing the reviewer back to the /tmp copy the
+    // issue bans.
+    const scratch = join(HERE, "..", "..", "scripts", "scratch-worktree.sh");
+    const scratchRun = await callBash(`bash ${scratch} --help`);
+    expectTrue("B8i: the scratch-checkout helper is exempt from the hub content walk (#1141)",
+      scratchRun === undefined, `handler returned ${JSON.stringify(scratchRun)}`);
+    const scratchCopy = join(repo, "scratch-worktree.sh");
+    writeFileSync(scratchCopy, readFileSync(scratch, "utf-8"));
+    const scratchCopyRun = await callBash(`bash ${scratchCopy} --help`);
+    expectTrue("B8j: the SAME helper content outside the framework is still blocked (exemption is path-keyed)",
+      !!scratchCopyRun && scratchCopyRun.block === true &&
+      /script content contains a blocked git operation/.test(scratchCopyRun.reason ?? ""),
+      `handler returned ${JSON.stringify(scratchCopyRun)}`);
 
     // ── B7: write/edit gate on a DISORDERED hub (#1484/#436/#628) ──
     // Pre-#744 the import degraded mid-destructuring, so the later bindings

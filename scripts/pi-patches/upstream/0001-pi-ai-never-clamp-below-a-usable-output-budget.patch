@@ -1,0 +1,165 @@
+diff --git a/packages/ai/src/api/simple-options.ts b/packages/ai/src/api/simple-options.ts
+index 63e34f3..4a29063 100644
+--- a/packages/ai/src/api/simple-options.ts
++++ b/packages/ai/src/api/simple-options.ts
+@@ -12,10 +12,33 @@ import { estimateContextTokens } from "../utils/estimate.ts";
+ const CONTEXT_SAFETY_TOKENS = 4096;
+ const MIN_MAX_TOKENS = 1;
+ 
++/**
++ * Smallest output budget worth asking for.
++ *
++ * Below this a response cannot be a usable answer, so the request goes out with this budget
++ * instead and the PROVIDER rejects it if the prompt really is too long. That trade is
++ * deliberate: a provider rejection is a loud, recoverable `stopReason: "error"` that the
++ * overflow path already handles, whereas asking for a single token produces
++ * `stopReason: "length"` with `output: 1` — a turn that looks normal, is accounted as a
++ * normal turn, and leaves the session alive but unable to ever reply again.
++ *
++ * The headroom behind this is measured, not assumed: pi's own ceiling
++ * (`contextWindow - CONTEXT_SAFETY_TOKENS`) sits far below what providers accept — one of our
++ * routes served a 988,202-token prompt while pi was asking for 1 token. Overshooting the
++ * context-derived budget by at most this many tokens is therefore rejected only when the
++ * request genuinely exceeds the provider's limit, which is the outcome we want.
++ */
++export const MIN_USABLE_MAX_TOKENS = 1024;
++
+ export function clampMaxTokensToContext(model: Model<Api>, context: TranscriptContext, maxTokens: number): number {
+ 	if (model.contextWindow <= 0) return Math.max(MIN_MAX_TOKENS, maxTokens);
+ 	const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;
+-	return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));
++	// No usable output budget left against pi's own estimate: ask for the floor and let the
++	// provider reject an over-long request. Never silently ask for a single token.
++	if (available < MIN_USABLE_MAX_TOKENS) {
++		return Math.max(MIN_MAX_TOKENS, Math.min(maxTokens, MIN_USABLE_MAX_TOKENS));
++	}
++	return Math.min(maxTokens, available);
+ }
+ 
+ export function buildBaseOptions(
+diff --git a/packages/ai/test/context-clamp-output-floor.test.ts b/packages/ai/test/context-clamp-output-floor.test.ts
+new file mode 100644
+index 0000000..9f60894
+--- /dev/null
++++ b/packages/ai/test/context-clamp-output-floor.test.ts
+@@ -0,0 +1,120 @@
++import { describe, expect, it } from "vitest";
++import { MIN_USABLE_MAX_TOKENS, buildBaseOptions, clampMaxTokensToContext } from "../src/api/simple-options.ts";
++import type { Model } from "../src/types.ts";
++import { estimateContextTokens } from "../src/utils/estimate.ts";
++import { normalizeContext } from "../src/utils/transcript.ts";
++
++const CONTEXT_SAFETY_TOKENS = 4096;
++
++function createModel(contextWindow: number, maxTokens: number): Model<"openai-responses"> {
++	return {
++		id: "test-model",
++		name: "Test Model",
++		api: "openai-responses",
++		provider: "openai",
++		baseUrl: "https://api.openai.com/v1",
++		reasoning: false,
++		input: ["text"],
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++		contextWindow,
++		maxTokens,
++	};
++}
++
++/** A context whose token estimate is exactly `tokens` (the estimator is ceil(chars / 4)). */
++function createContextWithTokens(tokens: number) {
++	return normalizeContext({
++		messages: [{ role: "user", content: "x".repeat(tokens * 4), timestamp: 1 }],
++	});
++}
++
++/** A context chosen so that `contextWindow - estimate - CONTEXT_SAFETY_TOKENS === available`. */
++function createModelAndContext(available: number, maxTokens: number) {
++	// Keep contextWindow positive so the clamp's `contextWindow <= 0` escape hatch is never the
++	// branch under test; grow the estimate when `available` is deeply negative.
++	const estimate = Math.max(1000, CONTEXT_SAFETY_TOKENS - available + 1);
++	const contextWindow = estimate + CONTEXT_SAFETY_TOKENS + available;
++	const context = createContextWithTokens(estimate);
++	expect(estimateContextTokens(context).tokens).toBe(estimate);
++	expect(contextWindow).toBeGreaterThan(0);
++	return { model: createModel(contextWindow, maxTokens), context, estimate, available };
++}
++
++describe("clampMaxTokensToContext output floor", () => {
++	it("never asks for a single token when no output budget is available", () => {
++		const { model, context } = createModelAndContext(0, 8000);
++
++		const clamped = clampMaxTokensToContext(model, context, model.maxTokens);
++
++		expect(clamped).not.toBe(1);
++		expect(clamped).toBe(MIN_USABLE_MAX_TOKENS);
++		expect(clamped).toBeGreaterThanOrEqual(256);
++	});
++
++	it("never asks for a single token when the estimate has overrun the window", () => {
++		const { model, context } = createModelAndContext(-50_000, 8000);
++
++		const clamped = clampMaxTokensToContext(model, context, model.maxTokens);
++
++		expect(clamped).toBe(MIN_USABLE_MAX_TOKENS);
++	});
++
++	it("applies the floor across the boundary and leaves room above it untouched", () => {
++		const cases: Array<{ available: number; expected: number }> = [
++			{ available: MIN_USABLE_MAX_TOKENS - 1, expected: MIN_USABLE_MAX_TOKENS },
++			{ available: MIN_USABLE_MAX_TOKENS, expected: MIN_USABLE_MAX_TOKENS },
++			{ available: MIN_USABLE_MAX_TOKENS + 1, expected: MIN_USABLE_MAX_TOKENS + 1 },
++			{ available: MIN_USABLE_MAX_TOKENS + 5000, expected: MIN_USABLE_MAX_TOKENS + 5000 },
++		];
++
++		for (const { available, expected } of cases) {
++			const { model, context } = createModelAndContext(available, 100_000);
++			expect({ available, clamped: clampMaxTokensToContext(model, context, model.maxTokens) }).toEqual({
++				available,
++				clamped: expected,
++			});
++		}
++	});
++
++	it("never raises the budget above what the caller asked for", () => {
++		const { model, context } = createModelAndContext(0, 100);
++
++		expect(clampMaxTokensToContext(model, context, model.maxTokens)).toBe(100);
++		expect(clampMaxTokensToContext(model, context, 0)).toBe(1);
++	});
++
++	it("keeps the previous behaviour for a healthy context (negative control)", () => {
++		const { model, context } = createModelAndContext(4899, 8000);
++
++		// available is exactly 4899 here, which is above the floor, so the unfloored formula must be untouched.
++		expect(clampMaxTokensToContext(model, context, model.maxTokens)).toBe(4899);
++	});
++
++	it("keeps the previous behaviour when the model declares no context window (negative control)", () => {
++		const model = createModel(0, 8000);
++		const context = createContextWithTokens(1_000_000);
++
++		expect(clampMaxTokensToContext(model, context, model.maxTokens)).toBe(8000);
++		expect(clampMaxTokensToContext(model, context, 0)).toBe(1);
++	});
++
++	it("is monotonic and never returns a non-positive budget", () => {
++		const previous: number[] = [];
++		for (const available of [-100_000, -1, 0, 1, 100, 1023, 1024, 1025, 2000, 100_000]) {
++			const { model, context } = createModelAndContext(available, 100_000);
++			const clamped = clampMaxTokensToContext(model, context, model.maxTokens);
++			expect(clamped).toBeGreaterThanOrEqual(1);
++			if (previous.length > 0) {
++				expect(clamped).toBeGreaterThanOrEqual(previous[previous.length - 1]!);
++			}
++			previous.push(clamped);
++		}
++	});
++
++	it("propagates the floored budget through buildBaseOptions", () => {
++		const { model, context } = createModelAndContext(0, 8000);
++
++		expect(buildBaseOptions(model, context).maxTokens).toBe(MIN_USABLE_MAX_TOKENS);
++		expect(buildBaseOptions(model, context).maxTokens).not.toBe(1);
++	});
++});

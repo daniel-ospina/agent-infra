@@ -3,7 +3,7 @@ name: verification-before-completion
 description: "Proof-of-work gate before claiming any task is done. Runs verification appropriate to the task type (code → typecheck+tests, deploy → browser screenshot, content → schema validate). Use whenever Pi is about to tell the user something is 'done' or 'fixed.' Not tied to commit-workflow — covers non-commit verification (research, content, config, deploy)."
 subjects.team: organisation-design-team
 allowed-tools: read write edit bash
-version: 1.1.0
+version: 1.2.0
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
@@ -170,6 +170,51 @@ grep -E '\.(sql|edge\.ts|functions/)' /tmp/verify-changed.txt  # backend files
 | High | 3+ files, migrations, auth, shared infra, desktop app | Full suite + verifier (convergence-gated) + browser screenshot |
 | Critical | Data migrations, auth changes, payment flows | Full suite + verifier + browser on all routes + schema validate |
 
+## Isolated checkouts — never copy the repo (#1141)
+
+Verification that needs a checkout other than the one you are in (proving a ref,
+reproducing on `main`, mutation-probing a fix) MUST use a worktree, never a copy:
+
+```bash
+bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> \
+  [--paths <dir,file> | --full] -- <verify-command...>
+```
+
+`run` shares the object store (no second `.git`) and **removes the worktree on
+EXIT/INT/TERM/HUP**, so an interrupted verification leaves nothing behind.
+`--paths` is a sparse checkout (a few KB); prefer it for path-scoped checks. It is
+literal: absolute paths, `.`/`..`, and globs are refused, and an absent path fails
+rather than yielding an empty checkout.
+
+**BANNED for scratch checkouts:** `git clone`, `cp -R`, `cp -r`, `cp -a`, `rsync`
+of the repo, `git archive | tar -x` into a temp dir. One measured review loop left
+13 copies of ~126 MB each in `/private/tmp` and drove ~2.4M files of I/O per cycle
+— the cost is I/O and filesystem churn, not disk. If you create a worktree by
+hand, the trap is mandatory and MUST re-raise the status and name the repo (a trap
+that does not `exit` swallows the signal and keeps running; one without `-C`
+silently fails once the probe has changed cwd):
+`REPO=<repo>; D="$REPO/.worktrees/scratch-$$"; git -C "$REPO" worktree add --detach "$D" <ref>; GD="$(sed -n 's/^gitdir: //p' "$D/.git" 2>/dev/null)"; trap 'rc=$?; rm -rf "${D:-/nonexistent}" 2>/dev/null || true; if [ ! -e "${D:-/nonexistent}" ]; then git -C "$REPO" worktree remove --force "${D:-/nonexistent}" 2>/dev/null || true; case "${GD:-}" in /*/.git/worktrees/*) rm -rf "$GD";; esac; else echo "leftover ${D:-?} - record KEPT so list shows it" >&2; fi; exit $rc' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM`.
+The trap removes the TREE first and only then deregisters: `git worktree remove --force`
+drops the record even when it FAILS to delete the directory, so deregistering first would
+leave a surviving checkout invisible to `list`, to a second `clean <path>` and to the
+reaper (#1141).
+Cleanup is TARGETED for a reason: a bare `git worktree prune` deregisters every
+record whose directory is not currently stat-able — an unmounted volume, a
+permission blip, a stale network mount — so it can silently destroy an unrelated
+sibling worktree's checkout while its files sit on disk. Remove your own record
+(the trap above reads its own `gitdir:` line); never prune the whole repo.
+
+Before reporting done: `bash scripts/scratch-worktree.sh list --repo <repo> --root <the root you used>` must not show a
+scratch worktree of YOURS. Clean only your own path (`scratch-worktree.sh clean
+<path>`). A bare `clean --all` refuses to sweep (it cannot see a holder whose argv
+does not name the path, so it would delete a sibling's in-flight probe);
+`clean --all --force-all` is the deliberate sibling sweep — do not run it while
+sibling sessions are running.
+The check is ROOT-SCOPED (`$SCRATCH_WORKTREE_ROOT`, else `/tmp`), so a bare `list` is
+a false PASS for a worktree created under another root.
+ A verification claim that leaves scratch debris
+falsifies itself.
+
 ## Review Loop (CPI-5 — Convergence-Gated)
 
 When the verifier sub-agent returns issues: fix flagged issues → re-dispatch → repeat until clean. Max 10 cycles.
@@ -244,24 +289,55 @@ Self-audit: was research invoked? Adversarial queries run? Contradictions resolv
 | **WARNINGS** | "⚠️ Verified with warnings: <list>." Claim "done" but note warnings. |
 | **FAILURES** | "❌ Verification failed: <specific>." Do NOT claim "done." |
 
-### Approval Routing
+### Approval Routing (inlined from human-input-framework v2.1.1)
+
+> **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
+> Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session
+> without loading the framework skill first. Only the operational core is inlined; the status table,
+> store/transport contract, and Slack enablement live canonically (restating them is how the original
+> six copies drifted apart).
 
 When a human gate fires — proof adjudication: FAILURES that block the "done" claim, stuck review loops (stall / honest-stuck / zero-progress escalation), or missing gate evidence ("No Verification Gates section") — the agent MUST invoke the approval router to surface the request:
 
 ```bash
-# Role-based escalation (non-epic gates):
+# Portable invocation (works from ANY repo checkout — swarm #1402 rollout):
 python3 -c "
+import os, sys
+sys.path.insert(0, os.environ.get('SWARM_ROOT', os.path.expanduser('~/swarm')))
 from operations.coordination.approval import request_approval
 request_approval('product-implementer', artifact='<verify-evidence>.md', context='<task> proof gate for issue <N>')
 print('Approval request created')
 "
 ```
 
-This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to the per-repo store `~/.swarm/approvals/<repo>.json` and must be checked manually.
+⛔ **No dialog pops — do not wait for one.** A `pending` request fires a macOS *notification banner*
+(`osascript … display notification`), which has no buttons and no answer path; it is best-effort and
+silently no-ops on non-macOS/CI/SSH. Reaching a human on Slack needs more than `SLACK_BOT_TOKEN` +
+`SLACK_APPROVAL_CHANNEL`: the bridge derives a **different** store slug than the router, so
+`SLACK_APPROVAL_FILE` must be pinned to the router's store (agent-infra #956) or the request just
+waits in `~/.swarm/approvals/<slug>.json`.
 
-**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
+**Detect the answer — read the record, never infer from a shrinking list:**
+```bash
+SWARM="${SWARM_ROOT:-$HOME/swarm}/operations/coordination/approval.py"
+python3 "$SWARM" --pending --role human    # still open
+python3 "$SWARM" --status <req_id>         # this record's status + reviewer
+```
+A Slack thread reply sets `changes_requested`, which leaves `--pending` **without approving**;
+`is_approved(..., requires_human=True)` also returns `False` after a Slack *button* approval (the
+bridge overwrites `reviewer` with the clicking user's id — agent-infra #959). Trust `status == 'approved'`.
 
-**Role-based escalation** (for non-epic gates): use without `requires_human=True` to route through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human).
+**Role-based escalation:** with `APPROVAL_AUTO_APPROVE=0`, omitting `requires_human=True` pends for
+the requester's `reports_to` role — e.g. `product-strategist` for `product-implementer`; only
+`chain[1]` is used, so nothing walks the chain further. Under the default (`APPROVAL_AUTO_APPROVE`
+unset, which means `1`) such a request **auto-approves** and never reaches a human — **unless** an
+escalation keyword (`deploy`/`delete`/`destroy`/`migrate`/`release`) appears in the artifact/context,
+which pends for a human regardless. Pass `requires_human=True` for a real human checkpoint.
+
+⚠️ **This gate currently passes no `requires_human`**, so under the default config it auto-approves —
+a FAILURES verdict does not reach a human unless an escalation keyword happens to appear in the
+artifact/context (agent-infra #964). Raising it to `requires_human=True` is a deliberate behaviour
+change needing its own review; this excerpt documents the current truth.
 
 ## What NOT to Verify
 

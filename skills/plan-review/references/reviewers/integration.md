@@ -1,4 +1,4 @@
-> **Source:** Canonical copy at `skills/plan-review/references/reviewers/integration.md``.
+> **Source:** Derived fallback template for **Reviewer #2 — Integration** in `skills/plan-review/SKILL.md`, which is the canonical definition. This file is the Claude-path fallback and must carry the same allowed dimensions as that inline reviewer.
 
 # Integration Reviewer (Claude path) — Prompt Template
 
@@ -16,7 +16,7 @@ CODEBASE CONTEXT:
 
 CHECK THESE DIMENSIONS:
 
-4. INTERFACE & INTEGRATION IMPACT:
+1. INTERFACE & INTEGRATION IMPACT:
    - Does the plan identify ALL systems that touch or are touched by this change?
    - API contracts: if the plan modifies an API shape, does it account for all consumers?
    - Shared types: if TypeScript types change, are all importers updated?
@@ -25,23 +25,32 @@ CHECK THESE DIMENSIONS:
    - RLS policies: if table access patterns change, are RLS policies updated?
    - Frontend consumers: if API responses change, are React components updated?
 
-5. EDGE CASE COVERAGE:
+2. EDGE CASE COVERAGE:
    - Are failure modes addressed (what happens when X fails)?
    - Are auth boundaries checked (who can access what)?
    - Are concurrency issues considered (what if two requests hit simultaneously)?
    - Are empty/null states handled?
 
-6. TEST COVERAGE:
+3. TEST COVERAGE:
    - Does every integration surface have a test?
    - SQL business logic: does it have SQL-level tests (pgTAP or execute_sql), not just mocked TS?
    - Are edge cases covered by tests?
    - Do tests verify behavior, not implementation details?
 
+4. SURFACE MAP QUALITY (skip if no Integration Surface Map in plan):
+   - Are all boundaries from the feature spec captured in the map?
+   - Are test layers correctly assigned per surface? Specifically flag:
+     * SQL business logic tested with TS mocks instead of pgTAP
+     * External API calls without contract tests
+     * Auth boundaries without integration tests
+   - Are failure modes enumerated per surface (at least 2 per surface)?
+   - Does the surface map cover the user journey steps (if Journey Test Map exists)?
+
 For each issue found, return EXACTLY this format (one per issue):
 
 ISSUE:
   severity: P0|P1|P2
-  dimension: interface-impact|edge-cases|test-coverage
+  dimension: interface-impact|edge-cases|test-coverage|surface-map-quality
   location: [Task N, Step M] or [Header section name]
   description: [what's wrong]
   suggestion: [what to fix]
@@ -51,5 +60,5 @@ Severity guide:
 - P1: important gap — integration works but edge case or test is missing
 - P2: improvement — suggestion for better coverage
 
-If no issues found, return: NO ISSUES FOUND
+Do NOT emit issues with any dimension other than `interface-impact`, `edge-cases`, `test-coverage`, or `surface-map-quality`. If no issues found, return: NO ISSUES FOUND
 ```

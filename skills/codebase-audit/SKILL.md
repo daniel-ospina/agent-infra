@@ -183,7 +183,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 
 ### Phase 2.5 — External Benchmarking (NEW)
 
-After all agents return but before synthesis, run 2-3 targeted `perplexity_search` queries to benchmark findings against industry standards:
+After all agents return but before synthesis, run 2-3 targeted external-search queries **via the [research skill's Step 0.0 search ladder](../research/SKILL.md)** — rung 1 `perplexity_search` only if `mcp_load seo-intelligence` succeeds; otherwise rung 2 `web_search` with `model="sonar"` named **explicitly** (the cheapest; `sonar-pro` only when justified — never the gated models), or rung 3 `web_fetch` for primary sources. State the tool + model + rung in the output — never substitute silently. Benchmark findings against industry standards:
 1. **Security benchmark:** "common security vulnerabilities in [our stack] production applications 2025 2026"
 2. **Architecture benchmark:** "production architecture best practices [our stack] common mistakes"
 3. **Dependency benchmark:** "known vulnerable dependencies [key packages] 2025 2026"

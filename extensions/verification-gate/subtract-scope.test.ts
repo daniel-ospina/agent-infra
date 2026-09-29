@@ -274,9 +274,9 @@ function write(cwd: string, rel: string, body: string): void {
   mkdirSync(join(abs, ".."), { recursive: true });
   writeFileSync(abs, body);
 }
-function mkRepo(): string {
+function mkRepo(branch = "main"): string {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "vg756-")));
-  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["init", "-q", "-b", branch]);
   git(dir, ["config", "user.email", "t@example.com"]);
   git(dir, ["config", "user.name", "t"]);
   return dir;
@@ -416,12 +416,19 @@ test("#755 REAL GIT — resolveTrustedBase prefers the tracking remote, else ori
 test("#755 REAL GIT — the tracking remote WINS over the origin/main fallback", () => {
   // The half that was untested: a regression that ignored branch.<cur>.remote /
   // branch.<cur>.merge would still pass the origin/main-fallback test above.
+  // ⛔ This fixture is ALSO the pin for resolveTrustedBase's `main`/`master`
+  // carve-out (#3398): the branch is `main` and its upstream names `main`, i.e.
+  // upstream === current — the ONE case where the branch's own name is still a
+  // base (a `main` tracking `upstream/main`). The assertion below keeps the
+  // fixture on `main` so the carve-out cannot silently stop being covered.
   const dir = mkRepo();
   try {
     write(dir, "a.ts", "a\n");
     git(dir, ["add", "."]);
     git(dir, ["commit", "-qm", "base"]);
     const branch = git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+    assert.equal(branch, "main",
+      "this fixture must stay on `main` to keep pinning the #3398 main/master carve-out");
     // Both candidate refs exist and point at DIFFERENT commits, so which one is
     // chosen is observable.
     write(dir, "b.ts", "b\n");
@@ -436,6 +443,103 @@ test("#755 REAL GIT — the tracking remote WINS over the origin/main fallback",
     assert.equal(base!.ref, "refs/remotes/upstream/main",
       "the configured tracking remote must win over the origin/main fallback");
     assert.equal(base!.oid, git(dir, ["rev-parse", "refs/remotes/upstream/main"]).trim());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#3398 REAL GIT — the base is the INTEGRATION remote; a branch's own upstream is never the base", () => {
+  // Two halves of #3398:
+  //  (a) `git push -u` records the branch's OWN name in branch.<cur>.merge AND
+  //      creates refs/remotes/<remote>/<cur>. Here BOTH exist, so the choice is
+  //      observable: OLD code picked refs/remotes/fork/feature (the branch's own
+  //      ref) — the #3398 defect: T then equals HEAD^1, so guard (4) can never
+  //      pass and subtraction is silently disabled (an OVER-gate: more files
+  //      demanded). The F1 fail-open was the separate push-remote-`main`
+  //      fallback, closed by the same rule but a different direction.
+  //  (b) an upstream naming a DIFFERENT branch is a DECLARED base and keeps
+  //      winning over the origin/main fallback (pre-existing pin).
+  for (const [label, explicitOtherBranch, expected] of [
+    ["(a) push -u: upstream is the branch itself", false, "refs/remotes/origin/main"],
+    ["(b) declared base names another branch", true, "refs/remotes/fork/main"],
+  ] as const) {
+    const dir = mkRepo();
+    try {
+      write(dir, "a.ts", "a\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "base"]);
+      // The branch under test is a FEATURE branch: that is the shape `git push -u`
+      // creates, and the shape #3398 was measured on.
+      git(dir, ["checkout", "-q", "-b", "feature"]);
+      const branch = git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+      assert.equal(branch, "feature");
+      // origin/main and fork/main point at DIFFERENT commits, so which is chosen
+      // is observable. fork/main is AHEAD of origin/main (fork-only content).
+      write(dir, "fork-only.ts", "f\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "fork-only"]);
+      git(dir, ["update-ref", "refs/remotes/fork/main", "HEAD"]);
+      git(dir, ["update-ref", "refs/remotes/fork/HEAD", "HEAD"]);
+      // `git push -u fork feature` creates the branch's OWN remote ref too — the
+      // discriminating ref, without which case (a) is not a discriminator.
+      git(dir, ["update-ref", "refs/remotes/fork/feature", "HEAD"]);
+      git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD~"]);
+      git(dir, ["config", `branch.${branch}.remote`, "fork"]);
+      // (a) the branch's own name (what push -u writes); (b) an explicit other branch.
+      git(dir, ["config", `branch.${branch}.merge`, explicitOtherBranch ? "refs/heads/main" : `refs/heads/${branch}`]);
+      const base = resolveTrustedBase(dir);
+      assert.notEqual(base, null, label);
+      assert.equal(base!.ref, expected,
+        `${label}: expected ${expected}`);
+      assert.equal(base!.oid, git(dir, ["rev-parse", expected]).trim(), label);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("#3398 REAL GIT — a `master`-default repo keeps its base (the carve-out's master half)", () => {
+  // The carve-out accepts an upstream that names the CURRENT branch only when
+  // that name is `main`/`master`. The `master` half had no fixture at all, so
+  // deleting just `|| upstream === "master"` silently disabled subtraction for
+  // every master-based clone with all suites still green (code-review P2).
+  const dir = mkRepo("master");
+  try {
+    write(dir, "a.ts", "a\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "base"]);
+    const branch = git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+    assert.equal(branch, "master");
+    git(dir, ["update-ref", "refs/remotes/upstream/master", "HEAD"]);
+    git(dir, ["config", `branch.${branch}.remote`, "upstream"]);
+    git(dir, ["config", `branch.${branch}.merge`, "refs/heads/master"]);
+    const base = resolveTrustedBase(dir);
+    assert.notEqual(base, null, "a master-default repo must still resolve its own integration branch");
+    assert.equal(base!.ref, "refs/remotes/upstream/master");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#3398 REAL GIT — with NO origin/main the branch's own upstream is NOT a last-resort base (fail-closed)", () => {
+  // The fix's central claim is that the branch's own upstream is never the base.
+  // The case above only shows "not preferred while origin/main resolves"; a
+  // refactor that appended `refs/remotes/<remote>/<cur>` AFTER origin/main would
+  // silently reintroduce #3398 in any repo whose origin/main is absent and no
+  // existing test would fail (code-review P2). Fail CLOSED: no base ⇒ null ⇒
+  // no subtraction ⇒ the verifier is asked about everything.
+  const dir = mkRepo();
+  try {
+    write(dir, "a.ts", "a\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "base"]);
+    git(dir, ["checkout", "-q", "-b", "feature"]);
+    git(dir, ["update-ref", "refs/remotes/fork/feature", "HEAD"]);
+    git(dir, ["config", "branch.feature.remote", "fork"]);
+    git(dir, ["config", "branch.feature.merge", "refs/heads/feature"]);
+    // (no refs/remotes/origin/main at all)
+    assert.equal(resolveTrustedBase(dir), null,
+      "must fail closed — never fall back to refs/remotes/fork/feature");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

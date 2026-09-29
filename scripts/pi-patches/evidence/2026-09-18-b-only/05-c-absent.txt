@@ -1,0 +1,33 @@
+### VERIFY 5 — change (c) is provably ABSENT from the shipped patch set and the applied tree
+
+### 1. (c) markers in the manifest (0 expected):
+   _overflowRecoveryAttempted  : 0
+   _overflowRecoveryAttempt    : 0
+   MAX_OVERFLOW_RECOVERY       : 0
+   entries in manifest         : 3
+   distinct change labels      : b
+   entry ids                   : b1-clamp-floor-esm b2-clamp-floor-bundle-http b3-clamp-floor-bundle-bedrock
+
+### 2. (c) markers in the generator / applier / upstream patches (0 expected):
+   make-manifest.mjs           : 0
+   apply.mjs                   : 0
+   upstream/                   : 0
+
+### 3. upstream/ now contains ONLY the (b) patch:
+0001-pi-ai-never-clamp-below-a-usable-output-budget.patch
+
+### 4. On the APPLIED tree the (c) files are byte-identical to the pristine tree
+###    (the (b)-only manifest never touches them — so (c) is not half-applied):
+   IDENTICAL  dist/core/agent-session.js
+   IDENTICAL  dist/core/agent-session.d.ts
+   IDENTICAL  dist/bundle/chunks/chunk-JVUZSMYM.js
+
+### 5. On the APPLIED tree the latch is PRESENT and the (c) counter is ABSENT:
+   agent-session.js  _overflowRecoveryAttempted : 5
+   agent-session.js  _overflowRecoveryAttempt   : 0
+   chunk-JVUZSMYM.js _overflowRecoveryAttempted : 5
+   chunk-JVUZSMYM.js _overflowRecoveryAttempt   : 0
+
+### 6. And (b) IS applied on the same tree (the fix is in place):
+   simple-options.js MIN_USABLE_MAX_TOKENS : 3
+   chunk-AXIIZGTV.js available<...        : 1

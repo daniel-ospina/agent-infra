@@ -1128,7 +1128,12 @@ export async function runSingleAgent(
 						(code !== null && code !== 0);
 					if (shouldSweep && process.env.SUBAGENT_SWEEP !== "0" && childPgid !== null && !swept) {
 						swept = true;
-						void sweepProcessGroup(childPgid, { detached });
+						// #1074: `spawnedPid` is the AUTHORISATION — the pid of the child
+						// this call just spawned (detached ⇒ setsid ⇒ its pgid IS its
+						// pid). The shared guard signals a group ONLY when
+						// pgid === spawnedPid; a `ps` measurement can only refuse, never
+						// authorise (it can time out on a live pid under load).
+						void sweepProcessGroup(childPgid, { detached, spawnedPid: proc.pid });
 					}
 					resolve(code ?? 0);
 				};

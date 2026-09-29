@@ -48,6 +48,8 @@ Automated review-fix cycle for tests. Ensures tests are correct, complete, and a
 
 At minimum, provide the test file content. Surface map and journey map are extracted from the plan doc if available.
 
+**Also required for Reviewer #1, and passed by the `test-writing` Step 3.5 dispatch:** `TEST DIFF` (the diff of the test files in this batch) and `SABOTAGE EVIDENCE` (the observed failure against the unfixed code). Reviewer #1's discriminating-power check is decidable *only* from these; pass `"none supplied"` when either is genuinely absent (the check then names the missing evidence rather than guessing). A manual invocation that omits them runs that check blind.
+
 ## Review Cycle
 
 ```
@@ -167,6 +169,8 @@ Launch 4 reviewers **in parallel** via Pi `task`. Each receives the full test fi
 You are reviewing tests for correctness and quality. Your job is to find issues — NOT to fix them.
 
 TEST FILE: <full test file content>
+TEST DIFF: <the diff of test files in this PR, or "none supplied">
+SABOTAGE EVIDENCE: <the observed-failure output the author recorded for the changed assertions, or "none supplied">
 SURFACE MAP: <integration surface map from plan, or "none">
 JOURNEY MAP: <journey test map from plan, or "none">
 TESTING KNOWLEDGE: <Phase 0 research findings, or "none — no surface map">
@@ -180,6 +184,8 @@ CHECK THESE DIMENSIONS:
    - Are assertions testing user-visible outcomes (returned data, UI state, side effects, error messages) — NOT internal variables?
    - Are assertions precise (expected value matches actual semantics)?
    - Is there at least one assertion per test? (No tests that "pass" by running without asserting)
+   - **Discriminating power — for each assertion the TEST DIFF adds or changes, does SABOTAGE EVIDENCE show it failing against the unfixed code?** A green suite cannot distinguish a real pin from a vacuous one: both are green. This check is decidable only from the diff plus the evidence — so when TEST DIFF or SABOTAGE EVIDENCE is "none supplied", flag P0 **only** for a changed assertion whose description names a fixed defect, and name the missing evidence rather than guessing. Do not flag assertions the diff does not touch.
+   - **Could this assertion pin a race?** An equality on a value that is identical under *every* schedule cannot — the observable must *differ* between the buggy and fixed schedules. Where a changed assertion claims to pin a concurrency bug, require an operation-history oracle instead: count invocations (a `PATH` shim suffices) and assert the exact count. Flag P0 if the assertion is invariant across schedules — but schedule-invariance is not decidable from the diff alone, so when `SABOTAGE EVIDENCE` is `"none supplied"`, name the missing schedule evidence rather than asserting invariance.
 
 2. TEST QUALITY:
    - Is the test deterministic? (No Math.random(), no Date.now() without injection, no shared mutable state)
@@ -193,7 +199,7 @@ CHECK THESE DIMENSIONS:
    - Assert: are assertions grouped logically?
 
 4. FALSE POSITIVES:
-   - Could this test pass when the code is broken?
+   - Could this test pass when the code is broken? — but see the evidence rider under ASSERTION CORRECTNESS: when `SABOTAGE EVIDENCE` is `"none supplied"`, name the missing evidence rather than asserting it.
    - Are there assertions that always pass (e.g., expect(true).toBe(true))?
    - Are there missing await/async that cause tests to pass without waiting?
 
@@ -205,7 +211,7 @@ ISSUE:
   description: <what's wrong>
   suggestion: <what to fix>
 
-P0=wrong assertion (test passes but tests wrong thing, or would pass if code broken)
+P0=wrong assertion (test passes but tests wrong thing, or would pass if code broken — **a vacuous pin belongs here: it is exactly "would pass if code broken"**)
 P1=important gap (flaky, unrealistic setup, misleading name)
 P2=improvement (AAA clarity, naming polish)
 If no issues: NO ISSUES FOUND
@@ -453,12 +459,10 @@ Journey map coverage: ✓ | skipped (no journey map)
 7-point quality checklist: ✓
 ```
 
-**Hash output (test-writing caller only):** If invoked with `--caller test-writing` context, write per-file hash to `~/.pi/agent/test-review/<sha256-of-absolute-test-file-path>.json`. Schema defined in test-writing/SKILL.md Step 7. Include `PASS` on its own line in console output for VGATE compatibility. If invoked standalone or from code-review: skip hash write.
-
 ## Integration
 
 **Invoked by:**
-- `test-writing` — after Step 3 (7-point self-check) and before Step 4 (Green phase). Catches issues before implementation code is written.
+- `test-writing` — after Step 3.5 (Test Review) and before Step 4. On the TDD path this runs before implementation code is written; for a **pin added to an existing suite** the implementation already exists, and Step 4's sabotage evidence is produced *before* the dispatch.
 - `code-review` Step 0.5 — during PR review. Re-runs the same review with fresh eyes to catch issues the implementation agent missed.
 
 **Consumes:**

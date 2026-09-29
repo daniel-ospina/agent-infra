@@ -104,7 +104,7 @@ node ../../skills/carousel-b2b-design/scripts/render.cjs --input carousel.html -
 You are NOT done when you generate CSS fixes. You are done ONLY when:
 
 1. You have REBUILT and RE-RENDERED the slides with your fixes applied
-2. You have RE-READ the re-rendered PNGs with read_image
+2. You have RE-READ the re-rendered PNGs with \`read\`
 3. Your re-critique of the re-rendered PNGs returns NO ISSUES FOUND
 
 If step 3 finds ANY issue → go back to fix, rebuild, re-render, re-read, re-critique.
@@ -181,7 +181,7 @@ async function spawnClaudeOpus(
 
   const { session } = await createAgentSession({
     model: resolvedModel,
-    tools: ["read", "read_image", "write", "edit", "bash"],
+    tools: ["read", "write", "edit", "bash"],
     sessionManager: SessionManager.inMemory(),
     authStorage,
   });
@@ -292,9 +292,10 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: NOOP_MESSAGE }], details: {} };
       },
     });
-    pi.on("session_start", async (_event, ctx) => {
-      ctx.ui.notify("design-reviewer: ELDATO_ROOT not set — tool registered as no-op", "info");
-    });
+    // No `session_start` banner here: the extension is symlinked into the global
+    // farm, so ELDATO_ROOT-unset is the permanent, expected state on every
+    // non-El-Dato repo. The description above and the NOOP_MESSAGE the tool
+    // returns already say exactly this, at the moment it matters.
     return;
   }
 

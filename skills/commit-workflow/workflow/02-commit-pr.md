@@ -165,6 +165,85 @@ rm -f "${TMPDIR:-/tmp}/pi-pr-body-$(git rev-parse --absolute-git-dir | cksum | c
 
 The PostToolUse hook fires on `gh pr merge` as a safety net for manual merges outside commit-workflow. Step 2 is the primary code-review gate.
 
+### `--admin` merges: `scripts/admin-merge.sh` is the REQUIRED path (#930)
+
+`gh pr merge --admin` bypasses required checks by design, so nothing makes it
+*safe*: it cannot tell a check already red on `main` from a NEW failure the PR
+introduces. tortoise #3420 merged at 08:15 carrying
+`tests/test_markers.py::test_no_redirect_stems_registry_exact` — a test that was
+**not** in main's failing set — and main ratcheted redder. A convention is what
+produced that; this is a rail.
+
+**Never run `gh pr merge --admin` directly.** The `review-enforcer` merge gate
+REFUSES a raw `--admin` merge that carries no head-bound evidence comment, and
+the evidence is bound to the head SHA — so **every push invalidates it**.
+
+```bash
+# The MANDATED path. Computes the failing set, refuses a genuinely new failure,
+# posts the head-bound evidence, and only then runs `gh pr merge --admin`.
+# Extra flags (--squash, --rebase, --delete-branch, …) pass through.
+scripts/admin-merge.sh <PR> --squash
+
+# Inside, it is:
+#   pr-fails.txt   ← scripts/ci-failure-set.sh --commit <head>   # the head SHA,
+#                    the exact revision the evidence marker binds to
+#   main-fails.txt ← scripts/ci-failure-set.sh --main-union 10   # the UNION
+#   comm -23 pr-fails.txt main-fails.txt   ⇒ must be EMPTY
+#   non-empty → re-run the PR's failed jobs once (pass-on-retry = flaky, not new)
+#   residual non-empty → BLOCK: prints the list, exits non-zero, does NOT merge
+#
+# Both sides are lane-filtered to the same workflow (default `python-ci.yml`,
+# `--workflow` to override), and the rail BLOCKS unless the lane has actually
+# TESTED the head — a run that is queued, or one that finished `cancelled`,
+# exercised nothing, so an empty failing set would prove nothing.
+#
+# A lane is only usable if it runs on BOTH sides. The rail also BLOCKS when the
+# lane never tested `main`, because the certificate claims "every failure here is
+# already red on main" — that claim IS a comparison, and an empty baseline
+# absorbs nothing, so a pre-existing failure would be charged to the PR. This
+# matters for repos that split their lanes by TRIGGER: agent-infra's `ci.yml` is
+# `pull_request`-only and `ci-main.yml` is `push`-only, so neither spans both
+# sides. Pass `--any-workflow` there to compare against every lane on main.
+#
+# A VACUOUS comparison is NOT a certificate (#1319). `PR failing: 0 | main
+# failing: 0` is an ABSENCE of a measurement, not a clean one: the two zeros mean
+# "both lanes were green" only if both sides ran the SAME lane. tortoise #4263
+# merged on exactly that line while its tier-2 PR lane had SKIPPED shards main's
+# push lane runs; the failure lived in one of them, so it could appear in
+# NEITHER set, and the merge reddened main's required check for the whole fleet
+# (#4457). The rail therefore REFUSES a vacuous comparison — verdict `NOT
+# COMPARABLE`, distinct from "compared, clean" and "compared, dirty" — unless
+# the PR demonstrably EXECUTED every test shard main's lane executed, and it
+# fails CLOSED: an unreadable shard list is never read as "the same lane". The
+# refusal NAMES both lanes. Remedy: run the FULL lane for the head — the shards
+# named in the refusal are what main measures. If this repo's test shards are not
+# named `test*`, set `ADMIN_MERGE_LANE_JOB_PREFIX` to the prefix they use.
+#
+# A repo whose PR lane CANNOT run a shard main's push lane runs (a trigger-split
+# repo — this one: main's push calls the reusable `python-ci.yml` and no PR lane
+# does, #1349) has an AUDITED escape: `ADMIN_MERGE_LANE_PARITY=declared-off`. It
+# CERTIFIES the vacuous comparison but says so out loud — the posted evidence and
+# stderr both carry `lane parity: NOT ESTABLISHED — declared off`, and the parity
+# check still RUNS and still reports the divergent shards. Any other value is
+# refused at startup, so a typo cannot read as 'off'. Narrowing
+# `ADMIN_MERGE_LANE_JOB_PREFIX` is NOT the escape: it removes the excluded shard
+# family from the gate, which is the family the gate exists to protect.
+```
+
+⚠️ The baseline is the **union of main's last N runs** (default 10), never a
+single run. tortoise #3469: raw `comm -23` reported 1 unique failure while the
+true value was 0 — `test_import_wrong_key_422` and
+`test_import_count_mismatch_422` share one assertion and *which sibling trips
+depends on execution order*, so main fails each in different runs. A single-run
+baseline hard-blocks a SAFE merge, and a gate that false-blocks once gets
+disabled — which is how a convention comes back.
+
+Deliberate operator use only: set `AGENT_ADMIN_MERGE_OVERRIDE=1` (or the
+`ELDATO_ADMIN_MERGE_OVERRIDE` alias) — the same escape-hatch convention as
+`AGENT_SKIP_REVIEW_GATE`, and audited as `admin_merge_override`. The post-merge
+detector (`.github/workflows/admin-merge-detector.yml`) still runs and files an
+issue whenever a merge to main carried unique failures.
+
 ## Step 1.5 — Fallback Tier Classification (only if TIER = unknown)
 
 Skip if TIER was resolved in pre-flight. Proceed directly to the auto-reclassification check below.

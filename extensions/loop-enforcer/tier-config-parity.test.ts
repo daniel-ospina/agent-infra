@@ -95,7 +95,7 @@ export interface RiskRow {
   risk: string;
   /** Reviewer count parsed from the Reviewers cell. */
   reviewers: number;
-  /** Max Cycles cell; the Low row's em-dash means "review skipped" → 0. */
+  /** Max Cycles cell; the Low row's em-dash means "0 loop cycles" (the loop never runs) → 0. */
   maxCycles: number;
 }
 
@@ -273,7 +273,7 @@ export function mappingViolations(
     }
   };
 
-  check("REVIEW_CYCLE_CAPS.skip", caps.skip, 0);
+  check("REVIEW_CYCLE_CAPS.skip", caps.skip, 1);
   check("REVIEW_CYCLE_CAPS.lowMedium", caps.lowMedium, 2);
   check("REVIEW_CYCLE_CAPS.mediumHigh", caps.mediumHigh, 3);
   check("REVIEW_CYCLE_CAPS.high", caps.high, 4);
@@ -641,7 +641,7 @@ test("Review Cycles table parses to the four proportional rows", () => {
   deepEqual(
     TABLE.map((r) => [r.risk, r.reviewers, r.maxCycles]),
     [
-      ["Low", 0, 0],
+      ["Low", 1, 0],
       ["Low-Medium", 2, 3],
       ["Medium-High", 3, 5],
       ["High", 4, 10],
@@ -934,6 +934,30 @@ test("the exact-text pin is not vacuous: an empty / unrelated doc is rejected", 
 section("Stall-threshold parity (#847)");
 
 /**
+ * SIBLING INSTRUMENT — ownership split recorded on BOTH sides (#1068).
+ *
+ * `extensions/shared/heartbeat-progress-edges.test.ts` (added by #1068) is a
+ * second declared-surface gate, over a DIFFERENT vocabulary: the progress-edge
+ * classification and the runtime stall/liveness bound registry. It does not
+ * restate, replace, or de-list anything below. The split, so a reader of either
+ * file can see it:
+ *
+ *   · THIS gate owns the `stall_threshold` VALUE, across skill surfaces. It
+ *     is the only authority for that number.
+ *   · The #1068 gate owns the runtime stall-term/edge VOCABULARY and holds NO
+ *     `stall_threshold` value — its registry carries `STALL_THRESHOLD` as a
+ *     pointer with `value: null`, asserts no registered name matching
+ *     `/stall_?threshold/i` carries a value, and excludes `skills/**` from its
+ *     scan corpus by construction.
+ *
+ * The instrument (declare-surface → reverse source scan → non-vacuity floor) is
+ * shared in SPIRIT but deliberately not extracted into a common helper in that
+ * change: doing so would refactor this passing safety gate under a
+ * no-behaviour-change constraint. Extracting it is a follow-up if a third
+ * vocabulary needs it.
+ */
+
+/**
  * The stall-detector surfaces that declare a numeric `stall_threshold`
  * default. `STALL_THRESHOLD` in `termination.ts` is a MIRROR of these, not the
  * source, so drift BETWEEN them is the failure pinned here — the same class
@@ -1111,7 +1135,7 @@ test("TIER_CONFIG pins the tier → risk-row assignment, not just the pair", () 
   deepEqual(
     Object.entries(TIER_CONFIG).map(([tier, cfg]) => [tier, cfg.reviewers, cfg.maxCycles]),
     [
-      ["micro", 0, 0],
+      ["micro", 1, 0],
       ["standard", 2, 3],
       ["complex", 4, 10],
     ],
@@ -1188,7 +1212,7 @@ test("tripwire control: legitimate refactors still pass", () => {
 
 test("rejects a non-numeric Reviewers cell (same strictness as Max Cycles)", () => {
   const bogus = MARKDOWN.replace(
-    "| Low-Medium (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |",
+    "| Low-Medium (small plan, existing patterns) | 2 reviewers | 3 |",
     "| Low-Medium (small plan, existing patterns) | many reviewers | 3 |",
   );
   ok(bogus !== MARKDOWN, "control did not apply — the Low-Medium row text moved; update this control");
@@ -1202,7 +1226,7 @@ test("rejects a non-numeric Reviewers cell (same strictness as Max Cycles)", () 
 });
 
 test("rejects a non-numeric, non-skip Max Cycles cell (no silent 0)", () => {
-  const bogus = MARKDOWN.replace("| Low | 0 (skip review) | — |", "| Low | 0 (skip review) | unlimited |");
+  const bogus = MARKDOWN.replace("| Low | 1 reviewer | — |", "| Low | 1 reviewer | unlimited |");
   ok(bogus !== MARKDOWN, "control did not apply — the Low row text moved; update this control");
   let threw = false;
   try {

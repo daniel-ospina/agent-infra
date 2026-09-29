@@ -333,23 +333,24 @@ response.headers['Expires'] = '0'
 
 ```bash
 # Sensitive data in logs
-grep -rn "logger.*password\|log.*password\|print.*password" --include="*.py" --include="*.js"
-grep -rn "logger.*token\|log.*api_key\|print.*secret" --include="*.py" --include="*.js"
+git grep -n -e "logger.*password\|log.*password\|print.*password" -- '*.py' '*.js'
+git grep -n -e "logger.*token\|log.*api_key\|print.*secret" -- '*.py' '*.js'
 
 # Debug mode
-grep -rn "debug.*[Tt]rue\|DEBUG.*=.*1" --include="*.py" --include="*.js" --include="*.env"
+git grep -n -e "debug.*[Tt]rue\|DEBUG.*=.*1" -- '*.py' '*.js'
+grep -n -e "DEBUG.*=.*1" .env .env.* 2>/dev/null   # `.env` is normally gitignored — `git grep` (index) cannot see it
 
 # Stack traces in responses
-grep -rn "traceback\|stack_trace\|exc_info" --include="*.py" | grep -i "return\|response\|json"
+git grep -n -e "traceback\|stack_trace\|exc_info" -- '*.py' | grep -i "return\|response\|json"
 
 # Verbose errors
-grep -rn "str(e)\|str(exception)" --include="*.py" | grep -i "return\|response"
+git grep -n -e "str(e)\|str(exception)" -- '*.py' | grep -i "return\|response"
 
 # Technology disclosure
-grep -rn "X-Powered-By\|Server:" --include="*.py" --include="*.js" --include="*.conf"
+git grep -n -e "X-Powered-By\|Server:" -- '*.py' '*.js' '*.conf'
 
 # Missing cache headers
-grep -rn "Set-Cookie\|session" --include="*.py" | grep -v "Cache-Control"
+git grep -n -e "Set-Cookie\|session" -- '*.py' | grep -v "Cache-Control"
 ```
 
 ---

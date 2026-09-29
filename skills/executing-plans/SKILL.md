@@ -206,6 +206,69 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 
 ### Step 0: Workspace Setup
 
+**Before isolating — collision pre-flight (#3061, FAIL-CLOSED) — the FIRST action of Step 0.** The gate runs **BEFORE** any worktree or branch is created (before `using-git-worktrees`, before `hub-worktree.sh`, before `git checkout -b`), because the tool matches issue numbers **boundary-exact against branch and worktree paths** (`number_present`: `feat/4027-fix-callers` → hit, `.worktrees/4027-preflight` → hit). Run it after isolation and the agent's own `feat/<N>-…` branch and `.worktrees/<N>-…` path read as a COLLISION on the issue it was authorised to start — the gate blocks its own caller. Run it first and that cannot happen.
+
+The gate is provided by **tortoise** (the only repo carrying `tools/collision_preflight.py`) and applies to *any* issue's repo through `--repo`. It checks every in-flight surface (open + closed PRs, local + remote branches, worktrees, assignee/claim comments) and fails loudly in **both** directions: a hit, and a surface that could not be queried.
+
+```bash
+# 1. The tool lives ONLY in tortoise. Resolve that checkout EXPLICITLY — unset, `"$TORTOISE"/tools/…`
+#    collapses to `/tools/…` and PYTHON exits 2, which the exit table would report as INCOMPLETE
+#    ("a surface could not be queried"): a caller misconfiguration wearing a real verdict's face.
+#    $TORTOISE if set; else the cwd itself (when it IS tortoise), the tortoise sibling of the cwd's
+#    MAIN checkout (so it still resolves from a linked worktree), then the standard GITHUB root.
+if [ -z "${TORTOISE:-}" ]; then
+  TOPLEVEL="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
+  COMMON="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  for CAND in "$TOPLEVEL" "$(dirname "${COMMON%/.git}")/tortoise" "${HOME:-/nonexistent}/Documents/GitHub/tortoise"; do
+    if [ -n "$CAND" ] && [ -f "$CAND/tools/collision_preflight.py" ]; then
+      TORTOISE="$(cd "$CAND" && pwd -P)"; break
+    fi
+  done
+fi
+if [ ! -f "${TORTOISE:-}/tools/collision_preflight.py" ]; then
+  echo "❌ collision pre-flight: no tortoise checkout resolved (TORTOISE='${TORTOISE:-}') — #3061 pre-flight NOT run."
+  echo "   Record this in the dispatch log; do NOT silently skip. Set TORTOISE=<a tortoise worktree> and re-run."
+  exit 1   # do not start work
+fi
+
+# 2. --repo is MANDATORY. Omitted it means "cwd", and the tool then silently resolved the WRONG
+#    repository's issue — a tortoise worktree asked for an agent-infra #NNNN and returned CLEAN (#4027).
+ISSUE_NUMBER="${ISSUE_NUMBER:-<N>}"             # the issue being gated
+REPO="${REPO:-<owner/name>}"                   # the issue's repo, e.g. daniel-ospina/agent-infra
+case "$REPO" in ''|*'<'*|*'>'*) echo "❌ REPO is unset or still the literal placeholder ('$REPO') — set it to the issue's repo owner/name; #3061 pre-flight NOT run."; exit 1 ;; esac
+#    The `owner/name` form needs tortoise #3978. Until it lands, tortoise main rejects a slug with
+#    exit 3 (`--repo not a directory`), so probe the tool's own usage and pass the form it accepts.
+if python3 "$TORTOISE"/tools/collision_preflight.py --help 2>&1 | grep -q 'owner/name'; then
+  REPO_ARG="$REPO"                                # slug form
+else
+  #    Pre-#3978 only a PATH is accepted, and it must be a checkout of $REPO. Falling back to `.`
+  #    would check the CWD's repo and return CLEAN — the ONE code that authorizes dispatch, i.e.
+  #    the #4027 wrong-repo false CLEAN. Resolve a path whose origin slug really is $REPO, or stop.
+  SLOT="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed -e 's#/\.git$##')"
+  REPO_ARG=""
+  for CAND in "${ISSUE_REPO_PATH:-}" "$PWD" "$TORTOISE" "$(dirname "$SLOT")/$(basename "$REPO")"; do
+    [ -n "$CAND" ] || continue   # `git -C ""` silently uses the CWD — an empty candidate would "match" anything
+    SLUG="$(git -C "$CAND" config --get remote.origin.url 2>/dev/null | sed -e 's#.*github\.com[:/]##' -e 's#\.git$##')"
+    [ -n "$SLUG" ] && [ "$SLUG" = "$REPO" ] && { REPO_ARG="$CAND"; break; }
+  done
+  [ -n "$REPO_ARG" ] || { echo "❌ pre-#3978 tool: no local checkout of $REPO — '.' would check the WRONG repo (#4027). Set ISSUE_REPO_PATH=<a checkout of $REPO>; pre-flight NOT run."; exit 1; }
+fi
+python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_ARG"
+```
+
+| Exit | Verdict | Action |
+|------|---------|--------|
+| `0` | CLEAN | every surface queried, no in-flight work — the **only** outcome that authorizes starting work |
+| `1` | COLLISION | a worktree/branch/PR/claim already covers #N — **do NOT start work**; report the named surface |
+| `2` | INCOMPLETE | a surface could not be queried — **NOT clean**; fix `gh` auth/network, re-run |
+| `3` | usage/internal error | **stop** |
+
+**ANY non-zero exit stops the work.** There is no "warn and proceed" and no graceful degradation: if `gh` is unavailable the tool returns INCOMPLETE (`2`) **by construction** — a stop, not a fallback path. A pre-flight that cannot tell "no collision" from "could not check" is exactly the bug this gate exists to prevent.
+
+**Distinguish the two exit-`2` causes.** A `VERDICT: INCOMPLETE` line on stdout is the tool's INCOMPLETE. An argparse `usage:` line with no `VERDICT:` line is a **wrong invocation** (unsubstituted or non-integer `<N>`) — fix the argument, not `gh`.
+
+**Pre-run precondition — do NOT run this from the issue's own worktree.** This gate is the **creator's** gate: it runs before isolation, so `feat/<N>-…` and `.worktrees/<N>-…` do not exist yet. The tool has no self-exclusion: a branch/worktree this checkout already owns is reported as a `strong` hit under `[local branches]` / `[local worktrees]`, so a run from inside `feat/<N>-…` / `.worktrees/<N>-…` collides with the artifact of the very work being gated. That is a property of the tool, **not** a licence to excuse a non-zero exit: "ANY non-zero exit stops the work" is unaffected, and a surface reported INCOMPLETE is never excused either. Run the gate from a checkout that does not carry `<N>` (the dispatcher's checkout, or a separate clone of `$REPO`). If none exists — a child already placed inside `<N>`'s worktree — record in the dispatch log that the pre-flight could not be run untainted and defer to the dispatcher's pre-dispatch gate (`issue-workflow`), which runs before any worktree exists.
+
 **Proportional isolation (inlined from proportional-gates v1.0.0):**
 
 | Risk | Isolation |
@@ -249,10 +312,14 @@ ISSUE_NUMBER=<from plan doc or branch name>
 SCOPING_PLAN=$(gh issue view $ISSUE_NUMBER --json comments --jq '.comments[] | select(.body | contains("<!-- issue-scoping:")) | .body' | tail -1)
 
 if [ -n "$SCOPING_PLAN" ]; then
-  UX_RATING=$(echo "$SCOPING_PLAN" | awk '/^\| UX \|/ {print $3}')
-  ARCH_RATING=$(echo "$SCOPING_PLAN" | awk '/^\| Architecture \|/ {print $3}')
-  ONTOLOGY_RATING=$(echo "$SCOPING_PLAN" | awk '/^\| Ontology \|/ {print $3}')
-  ACCESSIBILITY_RATING=$(echo "$SCOPING_PLAN" | awk '/^\| Accessibility \|/ {print $3}')
+  # Table rows are parsed with -F'|' + whitespace strip, matching
+  # commit-workflow/workflow/03-code-review.md — the default FS makes $3
+  # the literal '|' for a '| Domain | Rating |' row, so the rating is
+  # unreachable and the complexity-axis checks silently never fire.
+  UX_RATING=$(echo "$SCOPING_PLAN" | awk -F'|' '/^\| UX \|/ {gsub(/ /,""); print $3}')
+  ARCH_RATING=$(echo "$SCOPING_PLAN" | awk -F'|' '/^\| Architecture \|/ {gsub(/ /,""); print $3}')
+  ONTOLOGY_RATING=$(echo "$SCOPING_PLAN" | awk -F'|' '/^\| Ontology \|/ {gsub(/ /,""); print $3}')
+  ACCESSIBILITY_RATING=$(echo "$SCOPING_PLAN" | awk -F'|' '/^\| Accessibility \|/ {gsub(/ /,""); print $3}')
 else
   echo "No scoping plan found — skipping complexity-axis checks"
   UX_RATING=""
@@ -645,12 +712,19 @@ If not in a worktree: skip silently.
 
 The `commit` step (Step 6 handoff) is a `human_approval` gate in this skill's frontmatter, and the checkpoint stops below ("When to Stop and Ask") are its checkpoint gates — every stop surfaces a request for human input.
 
-### Approval Routing
+### Approval Routing (inlined from human-input-framework v2.1.1)
 
-When a gate fires, the agent MUST invoke the approval router to surface the request:
+> **Canonical:** `skills/human-input-framework/SKILL.md` → "Approval Routing — Canonical".
+> Inlined operational excerpt — cross-session resilience: this skill must run in a fresh session
+> without loading the framework skill first. Only the operational core is inlined; the status table,
+> store/transport contract, and Slack enablement live canonically (restating them is how the original
+> six copies drifted apart).
+
+When a gate fires — including this skill's `commit` handoff gate and the "When to Stop and Ask"
+checkpoints — the agent MUST invoke the approval router to surface the request:
 
 ```bash
-# Portable invocation (works from ANY repo checkout — #1402 rollout):
+# Portable invocation (works from ANY repo checkout — swarm #1402 rollout):
 python3 -c "
 import os, sys
 sys.path.insert(0, os.environ.get('SWARM_ROOT', os.path.expanduser('~/swarm')))
@@ -660,21 +734,43 @@ print('Approval request created')
 "
 ```
 
-Routine gates do NOT pop a human dialog: with `requires_human=False` (the default) the request routes through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human), so the reviewer is the requester's `reports_to` role (a pi role — e.g. product-strategist for product-implementer). The request is logged to the per-repo store `~/.swarm/approvals/<repo>.json` and that role approves via `review_approval()`. Do NOT set `APPROVAL_NO_NOTIFY=0` — it overrides the daemon kill-switch.
+⚠️ **This excerpt passes `requires_human=False`**, so under the default config
+(`APPROVAL_AUTO_APPROVE` unset, which means `1`) the request **auto-approves to `policy:auto` and
+touches no human** — it does *not* route to the escalation chain (`reports_to`). Escalation-chain
+routing happens only with `APPROVAL_AUTO_APPROVE=0`; a genuine human checkpoint needs `requires_human=True`.
 
-Use `requires_human=True` for genuine human gates (epics, P0): that routes to 'human'. **Human gates are NEVER rate-limited and NEVER auto-approved** (#1402). With Slack forwarding configured (SLACK_BOT_TOKEN + SLACK_APPROVAL_CHANNEL in `~/.swarm.env`), the request is posted to Slack by the slack-bridge — the human answers there. Without Slack, the request is logged to the per-repo store `~/.swarm/approvals/<repo>.json` and an osascript notification fires (suppressed by `APPROVAL_NO_NOTIFY=1`).
+⛔ **No dialog pops — do not wait for one.** A `pending` request fires a macOS *notification banner*
+(`osascript … display notification`), which has no buttons and no answer path; it is best-effort and
+silently no-ops on non-macOS/CI/SSH. Reaching a human on Slack needs more than `SLACK_BOT_TOKEN` +
+`SLACK_APPROVAL_CHANNEL`: the bridge derives a **different** store slug than the router, so
+`SLACK_APPROVAL_FILE` must be pinned to the router's store (agent-infra #956) or the request just
+waits in `~/.swarm/approvals/<slug>.json`.
 
-**Conversation protocol (#1402) — approvals are a back-and-forth, not a one-shot:**
-1. After `request_approval(...)`, monitor feedback: `python3 -c "from operations.coordination.approval import approval_feedback; print(approval_feedback('<req_id>'))"` — human replies in the Slack thread are mirrored into `approvals.json` (`thread` entries) by the slack-bridge within ~5s.
-2. If the human asks a question or gives feedback, **answer it** — post your response as a follow-up request in the SAME thread:
-   ```python
-   request_approval('product-implementer', artifact='<same-artifact>',
-                    context='RE: <original_req_id> — <your answer to the human>',
-                    requires_human=True, parent='<original_req_id>')
-   ```
-   The slack-bridge posts follow-ups with `parent` into the parent's Slack thread, so the human sees your answer in context.
-3. Continue monitoring until the request resolves: `pending_approvals('human')` shrinks when the human accepts/rejects (Socket Mode buttons or `review_approval()`).
-4. **Approved** → proceed with the gate. **Denied/feedback** → revise per the feedback and re-request (new request, same thread via `parent`). Never silently proceed past a denied gate, and never spam: a NEW request per revision is correct — dedupe only collapses identical pending requests.
+**Detect the answer — read the record, never infer from a shrinking list:**
+```bash
+SWARM="${SWARM_ROOT:-$HOME/swarm}/operations/coordination/approval.py"
+python3 "$SWARM" --pending --role human    # still open
+python3 "$SWARM" --status <req_id>         # this record's status + reviewer
+```
+A Slack thread reply sets `changes_requested`, which leaves `--pending` **without approving**;
+`is_approved(..., requires_human=True)` also returns `False` after a Slack *button* approval (the
+bridge overwrites `reviewer` with the clicking user's id — agent-infra #959). Trust `status == 'approved'`.
+
+**Role-based escalation:** with `APPROVAL_AUTO_APPROVE=0`, omitting `requires_human=True` pends for
+the requester's `reports_to` role — e.g. `product-strategist` for `product-implementer`; only
+`chain[1]` is used, so nothing walks the chain further. Under the default (`APPROVAL_AUTO_APPROVE`
+unset, which means `1`) such a request **auto-approves** and never reaches a human — **unless** an
+escalation keyword (`deploy`/`delete`/`destroy`/`migrate`/`release`) appears in the artifact/context,
+which pends for a human regardless. `requires_human=True`
+is for genuine human gates (epics, P0) — those are never auto-approved. **Never silently proceed
+past a denied gate**, and never spam: a new request per revision is correct. Dedupe collapses
+identical `pending` requests **and** identical `policy:auto` re-fires (so respawns do not grow the
+store); human-reviewed records never dedupe.
+
+⚠️ **The former 4-step Slack conversation protocol was removed from this skill**: it called
+`approval_feedback()` and `request_approval(..., parent=…)`, neither of which exists in the current
+router (`SWARM_ROOT`) — `approval_feedback` is not importable there (an `from … import` raises
+`ImportError`) and `parent=` raises `TypeError`. See the canonical block and agent-infra #958.
 
 ## When to Stop and Ask
 

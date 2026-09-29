@@ -52,8 +52,10 @@ jobs:
         # regression pin) — no explicit line for it, that would double-run it.
         # ⚠️ This leg is POST-MERGE only (on: push → main); the per-PR run of
         # the #744 suite is wired in ci.yml — the per-PR workflow that runs the
-        # test suites (pipeline-compliance.yml is also PR-triggered, but runs
-        # no test suite).
+        # test suites. (This comment used to add "pipeline-compliance.yml is also
+        # PR-triggered, but runs no test suite" — stale since #991, which wired
+        # the pipeline-compliance fixture suite in, and since #1027, which added
+        # tests/materialize-agents/run.sh to the same required job.)
         for t in extensions/*/test*.mjs; do
           [ -f "$t" ] || continue
           echo "== $t =="
@@ -81,6 +83,7 @@ jobs:
           case "$t" in
             extensions/shared/print-mode.test.ts|extensions/shared/print-mode-wiring.test.ts) continue ;;
             extensions/shared/dispatch-record.test.ts) continue ;;
+            extensions/shared/kill-switch.test.ts) continue ;;  # #1419 — run explicitly below
           esac
           echo "== $t =="
           npx tsx "$t" || failures=$((failures+1))
@@ -93,6 +96,22 @@ jobs:
         # Zero-dep: stdlib-only; uses dynamic require for env ordering.
         echo "== extensions/reflect-hook.test.ts =="
         npx tsx extensions/reflect-hook.test.ts || failures=$((failures+1))
+        # #1215 — compaction-watchdog: the context-clamp death (#1214) must never
+        # be silent. Zero-dep (pi import is TYPE-only, node stdlib otherwise);
+        # drives all four sinks through the NODE_ENV=test hook seam, so it never
+        # touches the real ~/.pi. Negative pins: aborted compaction, legitimate
+        # `length` stop, max_tokens > 1 and missing max_tokens all record nothing.
+        echo "== extensions/compaction-watchdog.test.ts =="
+        npx tsx extensions/compaction-watchdog.test.ts || failures=$((failures+1))
+        # #1214 (b) — clamp-output-floor: the upgrade-proof half of the same fix.
+        # Wired here deliberately: the whole point of this extension is that it is
+        # the layer still standing AFTER a pi upgrade reverts scripts/pi-patches.
+        # A guard whose own test CI never runs is a guard nobody has checked.
+        # Zero-dep (no pi import at all); negative pins: a floor-or-above ceiling,
+        # a missing/non-numeric field, and an already-healthy payload must all be
+        # left BYTE-IDENTICAL — the guard must never rewrite a good request.
+        echo "== extensions/clamp-output-floor.test.ts =="
+        npx tsx extensions/clamp-output-floor.test.ts || failures=$((failures+1))
         # #723 — loop-enforcer TIER_CONFIG vs the canonical Review Cycles table
         # in skills/proportional-gates/SKILL.md: the runtime-vs-governance
         # drift class (complex.maxCycles sat at 2× the canonical bound with no
@@ -104,6 +123,24 @@ jobs:
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
         echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
         npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
+        # #1419 — the deadlock escape. `KILL_SWITCH_FILE` was a FREE identifier in
+        # loop-enforcer (5 uses, 0 definitions/imports), so every write threw
+        # ReferenceError into a swallowed catch and the documented escape was inert
+        # while still advertising a guarantee. The agent escape is now session-local
+        # and the machine-global switch stays the human's, so the suite covers the
+        # no-active-loop path, the single-home invariant, the call ORDER inside
+        # `stop`, and — because pi's loader gives every extension its own module
+        # graph — that the escape CHANNEL is process-global rather than module-local
+        # (the first version of this fix shipped the module-local bug).
+        echo "== extensions/shared/kill-switch.test.ts =="
+        npx tsx extensions/shared/kill-switch.test.ts || failures=$((failures+1))
+        # #1321/#1322 — skill-enforcer: manifest resolution under the deployed
+        # symlink layout (the `dirname(__filename)` farm bug #1321), a repeated
+        # manifest line clobbering a skill's other rules, and layout-independent
+        # read identity (#1322). Zero-dep; spawns temp farms through `npx tsx`
+        # and through real jiti where resolvable. Mirrors the ci.yml verify step.
+        echo "== extensions/skill-enforcer.test.ts =="
+        npx tsx extensions/skill-enforcer.test.ts || failures=$((failures+1))
         # #426 — review-enforcer: the merge-registry gate (gates EVERY merge in
         # this account). Needs the pi package (real runtime import): installed as
         # a devDep (package.json) from the public registry, pinned to the pi
@@ -125,6 +162,16 @@ jobs:
         # no extra dependency.
         echo "== extensions/verification-gate/subtract-scope.test.ts =="
         npx tsx extensions/verification-gate/subtract-scope.test.ts || failures=$((failures+1))
+        # #5550/#1491 — the push-scope PROOF (D1–D3 + F1–F14). It was wired into
+        # NO lane while its three siblings ran, so a previously-unrun suite could
+        # rot unobserved; this step closes that gap and runs beside its siblings.
+        # NOTE this lane is trigger `push: [main]` (post-merge, like the unit/e2e
+        # suites above): a regression is reported on main AFTER merge, not before.
+        # A PR-gating leg is the follow-up (the suite value-imports ./index.js,
+        # which imports the pi SDK, so it needs a scoped `npm ci` that ci.yml's
+        # verify job deliberately avoids — the same constraint as its siblings).
+        echo "== extensions/verification-gate/index.5550.test.ts =="
+        npx tsx extensions/verification-gate/index.5550.test.ts || failures=$((failures+1))
         # #476 — provider-exhaustion failover suites (the shared/provider-failover*
         # suites are auto-picked by the shared glob above; the consumer-side
         # suites live under builtin-tools/ + the extension root). The parity suite
@@ -177,6 +224,18 @@ jobs:
         npx tsx extensions/subagent/timeout-integration.test.ts || failures=$((failures+1))
         echo "== extensions/subagent/cache-integration.test.ts =="
         npx tsx extensions/subagent/cache-integration.test.ts || failures=$((failures+1))
+        # #1500 Leg B — the termination PROOF. `builtin-tools.test.ts` can only
+        # show that the `tool_call` guard writes a finite positive number into
+        # `input.timeout`; it cannot show that pi ACTS on it. This suite drives
+        # the REAL `createBashTool` (same pinned-pi devDep route as its siblings
+        # above) and proves the command is killed AT the bound with a recoverable
+        # message, that a call inside the bound is untouched, and — the control
+        # arm — that an ABSENT timeout really does have no bound, which is the
+        # defect itself. It must run AFTER the `npm ci` above, and it needs an
+        # explicit line here because this leg is a hard-coded list, not a glob:
+        # no glob reaches `extensions/subagent/*.test.ts`.
+        echo "== extensions/subagent/tool-timeout-bound.test.ts =="
+        npx tsx extensions/subagent/tool-timeout-bound.test.ts || failures=$((failures+1))
         # #783 Task 7.3 — subagent parity pin: the ext keeps its OWN timeout /
         # stall semantics and was NOT dragged by the builtin-tools task-constant
         # split. Zero-dep source pin (node:* + readFileSync only), wired here
@@ -205,6 +264,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Node is pinned because the shards below include `tests/search-cost/run.sh` (Node >= 22.13 —
+      # see ci.yml's `search-cost` job). ci.yml's `bash-suites` carries the identical pin, so the two
+      # lanes run the same list under the same runtime.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Validate Node.js scripts
         run: |
           errors=0
@@ -217,44 +282,20 @@ jobs:
             exit 1
           fi
           echo "✅ All scripts validated"
-      - name: Validate bash scripts + run installer tests (#304)
-        run: |
-          errors=0
-          for f in scripts/*.sh; do
-            [ -f "$f" ] || continue
-            bash -n "$f" || errors=$((errors+1))
-          done
-          # #476 — checkout-hygiene farm scripts (launchd-invoked) syntax + the
-          # balance-poller suite (network-free seam). The TS/python cross-writer
-          # parity suite (extensions/shared/provider-failover.poller.test.ts)
-          # runs separately under extension-tests via the shared glob — the two
-          # #476 poller suites cover different seams; neither runs twice.
-          for f in scripts/checkout-hygiene/*.sh; do
-            [ -f "$f" ] || continue
-            bash -n "$f" || errors=$((errors+1))
-          done
-          bash scripts/checkout-hygiene/deepseek-balance-watch.test.sh || errors=$((errors+1))
-          bash scripts/install-launchd.test.sh || errors=$((errors+1))
-          # #469 — pi-session-reaper hermetic suite (fake PS/KILL/DATE shims +
-          # temp HOME/cmux store/sessions; never signals real processes). Runs
-          # POST-merge here by family precedent (script-validate is main-push
-          # only); real-tty assertions are dev-box verification steps in the
-          # #469 plan, not CI.
-          bash scripts/pi-reap-idle.test.sh || errors=$((errors+1))
-          # #783 — task-session retention sweep: live child survives every pass,
-          # ps-probe failure deletes nothing (fail-closed), TOCTOU re-probe,
-          # dry-run default. Hermetic (fake PS shim + throwaway root/log).
-          bash scripts/pi-task-session-prune.test.sh || errors=$((errors+1))
-          bash scripts/record-review.test.sh || errors=$((errors+1))
-          # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
-          # farm-link preservation, extensions/ content parity = #447 ship-list drift
-          # tripwire, #446 launchctl isolation). Real setup.sh, hermetic (~2min).
-          bash pi-bootstrap/tests/test-setup-no-nesting.sh || errors=$((errors+1))
-          if [ $errors -gt 0 ]; then
-            echo "❌ $errors bash script(s)/test(s) failed validation"
-            exit 1
-          fi
-          echo "✅ All bash scripts validated + installer tests passed"
+      - name: Lane-parity guard — both lanes must call the one shard runner (#1369)
+        # Bare call: its exit code IS the step's. `runner || errors=$((errors+1))` was the old
+        # form and is REFUSED by scripts/check-ci-lane-parity.sh — the guard cannot see whether
+        # an accumulator is ever read, so accepting it accepts "count the failure and exit 0".
+        run: bash scripts/check-ci-lane-parity.sh
+      - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        run: bash tests/ci-lane-parity/run.sh
+      - name: Bash shards — the ONE list both lanes run (#1369)
+        # #1369 — the ONE list of bash shards is scripts/run-bash-shards.sh, and BOTH lanes
+        # call it: a shard added there is in both lanes by construction, so a lane split
+        # cannot recur by drift. The runner's runtime self-checks (executed == listed, a sweep
+        # sentinel, a failure-recording sentinel) fail the step if its arms are disabled.
+        # Bare call, one step: a shard failure must fail the RUN, not just a counter.
+        run: bash scripts/run-bash-shards.sh
 
   skill-lint:
     runs-on: ubuntu-latest
@@ -320,7 +361,12 @@ jobs:
     secrets: inherit
     with:
       python-version: '3.12'
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q'
+      # #3761 — the CI-exemption decision suite rides the SAME single pytest
+      # invocation (concrete .py targets, never a `tests/` dir-suite → no #403
+      # finding). Post-merge, a RED here reaches auto-file-on-failure through
+      # this job's `needs:` entry, same as the vendored suite above it. Test
+      # half of tortoise#3761; the canonical module never leaves this repo.
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''

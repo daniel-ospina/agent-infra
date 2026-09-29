@@ -1,0 +1,24 @@
+### drift refusal — a pristine 0.86.0 tree against a 0.85.1 manifest
+### (this is what a pi upgrade produces: nothing is written, exit 3)
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║  ⛔  PI PATCH FAILED — THE CLAMP DEATH FIX IS NOT IN PLACE
+╚══════════════════════════════════════════════════════════════════════════════
+   INSTALLED PI VERSION HAS MOVED — the patch was NOT applied and nothing was written.
+   
+   pi-coding-agent: patch written against 0.85.1, installed 0.86.0
+   
+   Why this is a hard stop: the replacement anchors below are byte-exact against the version
+   they were derived from. A moved version means the code may have changed shape — silently
+   applying a stale anchor would either do nothing or corrupt the bundle.
+   
+   To re-arm the fix after an upgrade:
+     1. read upstream #1214 and confirm the defect is still present
+     2. node /Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix/1214-pi-clamp-output-floor/scripts/pi-patches/make-manifest.mjs   # re-derives manifests/<new version>/
+     3. node /Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix/1214-pi-clamp-output-floor/scripts/pi-patches/apply.mjs
+     4. re-run the evidence tests listed in /Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix/1214-pi-clamp-output-floor/scripts/pi-patches/README.md
+   (absolute paths on purpose: the reader is often not in this directory, and a relative
+    path here is a command that silently cannot be run — use the whole line as printed)
+
+EXIT=3

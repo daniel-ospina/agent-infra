@@ -9,7 +9,14 @@
 # Coverage: PASS on main+clean | FAIL on off-main | FAIL on dirty (untracked +
 # staged + unstaged) | recovery command in FAIL output | HUB_DISORDER= line |
 # --repo arg | --gh-report creates one issue / comments on existing (dedup) |
-# exit 2 on usage | resolves the MAIN checkout from inside a worktree.
+# exit 2 on usage | resolves the MAIN checkout from inside a worktree |
+# #1313 staleness: PASS on main+clean+up-to-date | FAIL on behind | FAIL on
+# diverged (ahead-only and true divergence) | FAIL (closed) on no upstream |
+# detached HEAD reports off_main without crashing | the --gh-report leg carries
+# the SAME staleness guidance (both parse sites of the token string) |
+# #1410: a healthy worktree is PASS | a worktree whose .git link is deleted is a
+# worktree_unlinked FAIL naming the directory and the repair | empty debris under
+# .worktrees/ is not flagged | restoring the link returns the hub to PASS.
 
 set -euo pipefail
 
@@ -25,8 +32,22 @@ assert_contains() { # <haystack> <needle> <label>
   if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
 
+apply_repair() { # <check-output> — apply the FIRST printed `gitdir:` repair, verbatim.
+  # Extracted from the guide's own text, so this tests what an operator would paste. The
+  # `|| true` matters: a missing line makes the pipeline non-zero and the suite runs under
+  # `set -euo pipefail`.
+  local line
+  line="$(printf '%s\n' "$1" | grep -F "printf 'gitdir:" | head -1 | sed 's/^ *//' || true)"
+  [ -n "$line" ] || return 1
+  bash -c "$line"
+}
+
 assert_eq() { # <actual> <expected> <label>
   if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', want '$2')"; fi
+}
+
+assert_not_contains() { # <haystack> <needle> <label>
+  if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi
 }
 
 FIX="$(mktemp -d)"
@@ -44,6 +65,18 @@ for r in "$HUB" "$OTHER"; do
   git -C "$r" commit -qm init
 done
 
+# #1313: each fixture gets an upstream, so the clean case is genuinely
+# up-to-date AND the freshness fact is testable. The remote is named `upstream`
+# (not `origin`) deliberately — case 8 below adds a fresh `origin` to exercise
+# the repo-slug parse, and a bare name clash there would silently break it.
+# Local bare paths: no network, fully hermetic.
+for r in "$HUB" "$OTHER"; do
+  bare="$FIX/$(basename "$r")-origin.git"
+  git init -q --bare -b main "$bare"
+  git -C "$r" remote add upstream "$bare"
+  git -C "$r" push -qu upstream main
+done
+
 # ── 1. PASS on main+clean ─────────────────────────────────────────────────
 out="$(bash "$CHECK" --repo "$HUB" 2>&1)" && rc=$? || rc=$?
 assert_eq "$rc" 0 "clean hub exits 0"
@@ -58,6 +91,7 @@ assert_contains "$out" "FAIL  $HUB" "untracked prints FAIL"
 assert_contains "$out" "HUB_DISORDER=dirty" "untracked → HUB_DISORDER=dirty"
 assert_contains "$out" "salvage <new-branch> $HUB" "dirty-on-main FAIL prints the #435 salvage step"
 assert_contains "$out" "hub-worktree.sh salvage" "dirty-on-main FAIL prints salvage"
+assert_not_contains "$out" "UNRECOGNISED disorder class" "plain dirty hub does not print an unrecognised-class line"
 rm "$HUB/untracked.txt"
 
 # ── 3. FAIL on staged + unstaged ──────────────────────────────────────────
@@ -170,6 +204,583 @@ if [ -s "$GH_STUB_LOG" ]; then bad "not-a-git-repo: zero gh traffic"; else ok "n
 rm -f "$GH_EXISTING"
 git -C "$HUB" checkout -q main 2>/dev/null || true
 rm -f "$HUB/untracked.txt"
+
+# ── 9. Staleness (#1313): the tip vs its upstream ─────────────────────────
+# A dedicated hub + bare remote so the earlier cases' state is untouched. The
+# detector NEVER fetches (the session's freshness machinery owns that), so the
+# fixture fetches into the stale hub itself. Remote named `upstream`; a fresh
+# `origin` is added for the gh-report leg's slug parse.
+SHUB="$FIX/stale-hub"
+SREMOTE="$FIX/stale-origin.git"
+git init -q --bare -b main "$SREMOTE"
+git init -q -b main "$SHUB"
+git -C "$SHUB" config user.email t@t
+git -C "$SHUB" config user.name t
+echo base > "$SHUB/base.txt"
+git -C "$SHUB" add .
+git -C "$SHUB" commit -qm init
+git -C "$SHUB" remote add upstream "$SREMOTE"
+git -C "$SHUB" push -qu upstream main
+git -C "$SHUB" remote add origin "https://github.com/daniel-ospina/tortoise.git"
+
+# 9a. clean + on main + UP-TO-DATE → PASS. Exercise the full matrix start here:
+# a stale assertion must not be the only PASS case (a detector that reds a
+# healthy hub is its own failure).
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "clean+on-main+up-to-date → exit 0"
+assert_contains "$out" "PASS  $SHUB" "up-to-date hub prints PASS"
+assert_contains "$out" "upstream=upstream/main" "PASS line names the verified upstream"
+
+# Advance the remote, then fetch it INTO the hub (upstream/main moves; HEAD stays).
+SCLONE="$FIX/stale-clone"
+git clone -q "$SREMOTE" "$SCLONE"
+git -C "$SCLONE" config user.email t@t
+git -C "$SCLONE" config user.name t
+echo upstream > "$SCLONE/upstream.txt"
+git -C "$SCLONE" add .
+git -C "$SCLONE" commit -qm upstream
+git -C "$SCLONE" push -q origin main
+git -C "$SHUB" fetch -q upstream main
+
+# 9b. clean + on main + BEHIND → FAIL (exactly the pre-#1313 false PASS)
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "clean+on-main+behind → exit 1 (was PASS before #1313)"
+assert_contains "$out" "FAIL  $SHUB" "behind prints FAIL"
+assert_contains "$out" "HUB_DISORDER=behind" "behind → HUB_DISORDER=behind"
+assert_contains "$out" "ahead=0 behind=1" "behind line names the counts"
+assert_contains "$out" "git merge --ff-only upstream/main" "behind FAIL prints the fast-forward recovery (the resolved ref, not @{u})"
+
+# 9b2. dirty + BEHIND → the --gh-report leg must reconstruct BOTH classes. This
+# is the composed-token case: a suffix parse of `*dirty` misses the staleness
+# token appended AFTER `dirty`, so the filed issue body would claim "clean" and
+# drop the salvage step (#1324 review P1).
+touch "$SHUB/wip.txt"
+: > "$GH_STUB_LOG"
+rm -f "$GH_EXISTING"
+out="$(bash "$CHECK" --repo "$SHUB" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "dirty+behind+gh-report exits 1"
+assert_contains "$out" "HUB_DISORDER=dirty+behind" "dirty+behind composes both tokens"
+assert_contains "$(cat "$GH_STUB_LOG")" "hub-state FAIL: $SHUB (dirty+behind)" "issue title carries dirty+behind"
+assert_contains "$(cat "$GH_STUB_LOG")" "dirty ON MAIN" "issue body keeps the dirty-on-main salvage guidance"
+assert_contains "$(cat "$GH_STUB_LOG")" "also BEHIND" "issue body keeps the behind note"
+rm -f "$SHUB/wip.txt"
+
+# 9c. fast-forward the hub → PASS again (no false positive once healthy).
+git -C "$SHUB" merge -q --ff-only upstream/main
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "hub fast-forwarded to upstream → exit 0"
+assert_contains "$out" "PASS  $SHUB" "up-to-date hub prints PASS again"
+
+# 9d. local-only commit carrying content → not fast-forwardable → diverged
+# (ahead-only sub-case; `diverged` is the local-only-commit class, and the
+# emitted guide must offer a route for the CONTENT-CARRYING shape too — `refresh`
+# alone refuses it).
+echo local > "$SHUB/local.txt"
+git -C "$SHUB" add .
+git -C "$SHUB" commit -qm local-only
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "clean+on-main+ahead-only → exit 1"
+assert_contains "$out" "HUB_DISORDER=diverged" "ahead-only → HUB_DISORDER=diverged (local-only commits)"
+assert_contains "$out" "ahead=1 behind=0" "diverged line names the counts"
+
+# 9e. remote advances too → true divergence → diverged, with the refresh recovery.
+echo upstream2 > "$SCLONE/upstream2.txt"
+git -C "$SCLONE" add .
+git -C "$SCLONE" commit -qm upstream2
+git -C "$SCLONE" push -q origin main
+git -C "$SHUB" fetch -q upstream main
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "clean+on-main+diverged → exit 1"
+assert_contains "$out" "HUB_DISORDER=diverged" "true divergence → HUB_DISORDER=diverged"
+assert_contains "$out" "ahead=1 behind=1" "diverged line names both counts"
+assert_contains "$out" "hub-worktree.sh refresh" "diverged FAIL names the #1309 refresh recovery"
+assert_contains "$out" "refresh --discard-contentless" "diverged FAIL names the contentless flag"
+assert_contains "$out" "CARRY content" "diverged FAIL names the content-carrying route"
+assert_contains "$out" "git push upstream main:<new-branch>" "content-carrying route preserves the commits (on the RESOLVED remote)"
+assert_contains "$out" "git reset --hard upstream/main" "content-carrying route realigns to the resolved upstream"
+assert_contains "$out" "#1325" "non-origin diverged guide marks refresh's origin assumption (#1325)"
+assert_contains "$out" "git log --name-only --diff-merges=combined upstream/main..HEAD" "diverged inspection mirrors refresh's combined content test"
+assert_not_contains "$out" "log --stat" "diverged inspection does not use --stat (hides merge content)"
+
+# 9e2. dirty + DIVERGED → the dirty branch appends its OWN diverged inspection
+# guidance (a second emitted site). Assert the combined-diff form there too, and
+# forbid `log --stat` — a `--stat` inspection hides merge content, so a
+# content-carrying merge would read as contentless mid-recovery.
+touch "$SHUB/wip.txt"
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "dirty+diverged → exit 1"
+assert_contains "$out" "HUB_DISORDER=dirty+diverged" "dirty+diverged composes both tokens"
+assert_contains "$out" "git -C $SHUB log --name-only --diff-merges=combined upstream/main..HEAD" "dirty+diverged inspection uses the combined form"
+assert_not_contains "$out" "log --stat" "dirty+diverged inspection does not use --stat"
+rm -f "$SHUB/wip.txt"
+
+# 9f. The --gh-report leg parses the staleness token SEPARATELY (#1313: two
+# parse sites). The filed issue body must carry the SAME diverged guidance — a
+# token handled in only one place mis-fires here, silently.
+: > "$GH_STUB_LOG"
+rm -f "$GH_EXISTING"
+out="$(bash "$CHECK" --repo "$SHUB" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "diverged+gh-report exits 1"
+assert_contains "$out" "opened hub-state issue" "diverged+gh-report opens an issue"
+assert_contains "$(cat "$GH_STUB_LOG")" "hub-state FAIL: $SHUB (diverged)" "issue title carries the diverged token"
+assert_contains "$(cat "$GH_STUB_LOG")" "hub-worktree.sh refresh --discard-contentless --repo $SHUB" "issue body carries the diverged recovery guidance"
+assert_contains "$(cat "$GH_STUB_LOG")" "#1325" "issue body marks refresh's origin assumption (#1325)"
+
+# 9i. a MISTRACKED hub: branch.main's configured upstream names ANOTHER branch.
+# The comparison must be against the SAME-NAMED tracking ref (origin/main), not
+# `@{u}` — otherwise a hub arbitrarily behind mainline reports PASS, the exact
+# false PASS #1313 closes (#1324 review P1; reproduced on a deployed hub).
+MHUB="$FIX/mistracked-hub"
+MREMOTE="$FIX/mistracked-origin.git"
+git init -q --bare -b main "$MREMOTE"
+git init -q -b main "$MHUB"
+git -C "$MHUB" config user.email t@t
+git -C "$MHUB" config user.name t
+echo base > "$MHUB/base.txt"
+git -C "$MHUB" add .
+git -C "$MHUB" commit -qm init
+git -C "$MHUB" remote add origin "$MREMOTE"
+git -C "$MHUB" push -qu origin main
+git -C "$MHUB" push -q origin main:feat/other
+git -C "$MHUB" fetch -q origin
+git -C "$MHUB" branch --set-upstream-to=origin/feat/other main >/dev/null 2>&1
+# advance origin/main by one commit → the hub is genuinely behind mainline while
+# `@{u}` (origin/feat/other) still points at the hub's own HEAD.
+MSEED="$FIX/mistracked-seed"
+git clone -q "$MREMOTE" "$MSEED"
+git -C "$MSEED" config user.email t@t
+git -C "$MSEED" config user.name t
+echo next > "$MSEED/next.txt"
+git -C "$MSEED" add .
+git -C "$MSEED" commit -qm next
+git -C "$MSEED" push -q origin main
+git -C "$MHUB" fetch -q origin
+out="$(bash "$CHECK" --repo "$MHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "mistracked-upstream hub → exit 1 (compares against the same-named ref)"
+assert_contains "$out" "HUB_DISORDER=behind" "mistracked-upstream hub reports behind mainline"
+assert_contains "$out" "upstream=origin/main" "the reference of record is origin/main, not @{u}"
+
+# 9j. `@{u}` naming a LOCAL branch (`wip/main`) shares the branch's basename, so
+# a basename guard would TRUST it and compare the hub against itself — PASS while
+# arbitrarily behind mainline (#1324 review P1, residual shape). Config is
+# `branch.main.remote=.` here, so the fix falls back to origin/main.
+LHUB="$FIX/local-track-hub"
+LREMOTE="$FIX/local-track-origin.git"
+git init -q --bare -b main "$LREMOTE"
+git init -q -b main "$LHUB"
+git -C "$LHUB" config user.email t@t
+git -C "$LHUB" config user.name t
+echo base > "$LHUB/base.txt"
+git -C "$LHUB" add .
+git -C "$LHUB" commit -qm init
+git -C "$LHUB" remote add origin "$LREMOTE"
+git -C "$LHUB" push -qu origin main
+git -C "$LHUB" branch wip/main
+git -C "$LHUB" branch --set-upstream-to=wip/main main >/dev/null 2>&1
+LSEED="$FIX/local-track-seed"
+git clone -q "$LREMOTE" "$LSEED"
+git -C "$LSEED" config user.email t@t
+git -C "$LSEED" config user.name t
+echo next > "$LSEED/next.txt"
+git -C "$LSEED" add .
+git -C "$LSEED" commit -qm next
+git -C "$LSEED" push -q origin main
+git -C "$LHUB" fetch -q origin
+out="$(bash "$CHECK" --repo "$LHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "local-branch upstream hub → exit 1 (never compared against itself)"
+assert_contains "$out" "HUB_DISORDER=behind" "local-branch upstream hub reports behind mainline"
+assert_contains "$out" "upstream=origin/main" "local-branch upstream falls back to origin/main"
+
+# 9k. a remote whose NAME contains '/' (`fork/origin`), MISTRACKED: splitting
+# `@{u}` on the first '/' would derive `fork`, find no `fork/main`/`origin/main`,
+# and wrongly report `no_upstream` — a false FAIL on a hub whose same-named
+# tracking ref is present. The remote is read from
+# `branch.<branch>.remote` instead, so `fork/origin/main` resolves.
+KHUB="$FIX/slash-remote-hub"
+KREMOTE="$FIX/slash-remote-origin.git"
+git init -q --bare -b main "$KREMOTE"
+git init -q -b main "$KHUB"
+git -C "$KHUB" config user.email t@t
+git -C "$KHUB" config user.name t
+echo base > "$KHUB/base.txt"
+git -C "$KHUB" add .
+git -C "$KHUB" commit -qm init
+git -C "$KHUB" remote add fork/origin "$KREMOTE"
+git -C "$KHUB" push -qu fork/origin main
+git -C "$KHUB" push -q fork/origin main:feat/other
+git -C "$KHUB" fetch -q fork/origin
+git -C "$KHUB" branch --set-upstream-to=fork/origin/feat/other main >/dev/null 2>&1
+KSEED="$FIX/slash-remote-seed"
+git clone -q "$KREMOTE" "$KSEED"
+git -C "$KSEED" config user.email t@t
+git -C "$KSEED" config user.name t
+echo next > "$KSEED/next.txt"
+git -C "$KSEED" add .
+git -C "$KSEED" commit -qm next
+git -C "$KSEED" push -q origin main
+git -C "$KHUB" fetch -q fork/origin
+out="$(bash "$CHECK" --repo "$KHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "slash-named-remote mistracked hub → exit 1 (not no_upstream)"
+assert_contains "$out" "HUB_DISORDER=behind" "slash-named remote reports behind, not no_upstream"
+assert_contains "$out" "upstream=fork/origin/main" "slash-named remote resolves its own same-named ref"
+
+# 9g. no upstream configured → FAIL CLOSED. An unverifiable hub must never read
+# as PASS (that is the failure direction #1313 exists to close).
+NOUP="$FIX/no-upstream-hub"
+git init -q -b main "$NOUP"
+git -C "$NOUP" config user.email t@t
+git -C "$NOUP" config user.name t
+echo x > "$NOUP/x.txt"
+git -C "$NOUP" add .
+git -C "$NOUP" commit -qm init
+out="$(bash "$CHECK" --repo "$NOUP" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "clean+on-main+no upstream → exit 1 (fail closed)"
+assert_contains "$out" "HUB_DISORDER=no_upstream" "no upstream → HUB_DISORDER=no_upstream"
+assert_contains "$out" "UNVERIFIABLE" "no-upstream FAIL says freshness is unverifiable"
+assert_contains "$out" "git -C $NOUP remote -v" "no-upstream guidance names the remote instead of presuming origin"
+
+# 9h. detached HEAD must not crash: reported as off_main (no upstream to compare).
+git -C "$SHUB" checkout -q --detach HEAD
+out="$(bash "$CHECK" --repo "$SHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "detached HEAD → exit 1 (no crash)"
+assert_contains "$out" "HUB_DISORDER=off_main" "detached HEAD → HUB_DISORDER=off_main"
+assert_contains "$out" "The hub is detached." "detached HEAD prints the detached recovery guidance"
+git -C "$SHUB" checkout -q main
+
+# ── 10. #1410: a worktree under the hub whose .git LINK is gone ───────────────
+# Deleting a worktree's `.git` makes git walk UP to the hub: commits and pushes made
+# from that directory target the hub's branch and report success. From inside the
+# directory the fallback is invisible (both `$PWD` and `--show-toplevel` are the hub),
+# so the check is hub-side and is exercised from the hub here.
+echo ""
+echo "== #1410: an unlinked worktree under the hub =="
+HW="$FIX/hub1410"
+git init -q -b main "$HW"
+git -C "$HW" config user.email t@t
+git -C "$HW" config user.name t
+printf '.worktrees\n' > "$HW/.gitignore"
+touch "$HW/a.txt"
+git -C "$HW" add .
+git -C "$HW" commit -qm init
+hw_bare="$FIX/hub1410-origin.git"
+git init -q --bare -b main "$hw_bare"
+git -C "$HW" remote add upstream "$hw_bare"
+git -C "$HW" push -qu upstream main
+
+W1410="$HW/.worktrees/wt1410"
+git -C "$HW" worktree add -q "$W1410" -b wt1410 HEAD
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a healthy worktree leaves the hub PASS"
+assert_not_contains "$out" "worktree_unlinked" "…and prints no worktree_unlinked token"
+
+rm -f "$W1410/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an UNLINKED worktree → exit 1"
+assert_contains "$out" "HUB_DISORDER=worktree_unlinked" "…→ HUB_DISORDER=worktree_unlinked"
+assert_contains "$out" "$W1410" "…and names the directory that is no longer a worktree"
+# The hazard sentence is chosen per directory, comparing canonical paths. Without that, a
+# hub reached through a symlink (/var, /tmp on macOS — every mktemp fixture) misreads an
+# IN-HUB offender as sitting outside the hub and drops this load-bearing warning.
+assert_contains "$out" "resolves it UP to this hub" "…and warns that commits there land on the hub's branch"
+assert_contains "$out" "#1410" "…and points at the issue"
+assert_contains "$out" "printf 'gitdir: %s" "…and prints a printf repair line"
+assert_contains "$out" "$HW/.git/worktrees/wt1410" "…naming the hub's own record for that worktree"
+
+mkdir -p "$HW/.worktrees/debris1410"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_contains "$out" "HUB_DISORDER=worktree_unlinked" "empty debris does not mask the broken worktree"
+
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wt1410" > "$W1410/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "restoring the link returns the hub to PASS (empty debris is not flagged)"
+
+# 10a. A plain directory that CONTAINS worktrees must never be flagged, and a NESTED
+# worktree (the fleet layout: <hub>/.worktrees/<group>/<name>) must be found just the same.
+# A one-level `.worktrees/*` scan fails both: it flags the group directory — which holds
+# healthy worktrees — and tells the operator to delete it (measured on the live hub, where
+# `.worktrees/fix` holds active worktrees). Detection reads the hub's own records instead.
+GROUP="$HW/.worktrees/group1410"
+mkdir -p "$GROUP"
+touch "$GROUP/README"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a directory that merely CONTAINS no worktree is not flagged"
+assert_not_contains "$out" "group1410" "…and is not named as an unlinked worktree"
+
+WNESTED="$GROUP/wt-nested1410"
+git -C "$HW" worktree add -q "$WNESTED" -b wt-nested1410 HEAD
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a NESTED worktree is healthy → PASS (the group dir is not mistaken for one)"
+rm -f "$WNESTED/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an UNLINKED NESTED worktree → exit 1 (layout-independent: records, not a glob)"
+assert_contains "$out" "$WNESTED" "…and names the nested worktree, not its parent"
+if grep -qxF "  $GROUP" <<<"$out"; then bad "…and does not name the PARENT directory as the offender"; else ok "…and does not name the PARENT directory as the offender"; fi
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wt-nested1410" > "$WNESTED/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and restoring the nested link returns the hub to PASS (group dir still fine)"
+
+# 10b. The --gh-report leg must SURVIVE a worktree_unlinked-only hub and carry the
+# guidance into the FILED body. This leg parses each disorder back out of the token
+# string; #1410 is a filesystem fact, so if it is not re-derived there the leg reaches
+# recovery_guide with an empty staleness class. A guide that appends nothing for that
+# class returns an EMPTY array, and `${lines[@]}` on an empty array is an unbound-variable
+# ABORT under `set -u` on bash 3.2 (#431 — same hazard the FAIL_LINES comment records):
+# the leg dies before filing, so the hub-disorder issue is never opened.
+git -C "$HW" remote add origin "https://github.com/daniel-ospina/tortoise.git" 2>/dev/null || true
+rm -f "$W1410/.git"
+rm -f "$GH_STUB_LOG"
+out="$(bash "$CHECK" --repo "$HW" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "worktree_unlinked + --gh-report exits 1"
+assert_not_contains "$out" "unbound variable" "…and does not abort on an empty guide array (#431 hazard)"
+assert_contains "$out" "opened hub-state issue" "…and files the hub-disorder issue"
+gh_body="$(cat "$GH_STUB_LOG" 2>/dev/null)"
+assert_contains "$gh_body" "worktree_unlinked" "…whose FILED body names the class"
+assert_contains "$gh_body" "printf 'gitdir: %s" "…and carries the repair command, not just stdout"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wt1410" > "$W1410/.git"
+
+# 10c. A RELATIVE record must be resolved against the RECORD directory, never against the
+# invoker's CWD. Git writes these with `worktree.useRelativePaths=true` / `worktree add
+# --relative-paths`; read against $PWD, a real loss reports PASS from everywhere except the
+# record dir — a false PASS on the class itself.
+git -C "$HW" config worktree.useRelativePaths true
+WREL="$HW/.worktrees/wtrel1410"
+git -C "$HW" worktree add -q "$WREL" -b wtrel1410 HEAD
+assert_contains "$(cat "$HW/.git/worktrees/wtrel1410/gitdir" 2>/dev/null)" "../" \
+  "fixture: git wrote a RELATIVE record for this worktree"
+rm -f "$WREL/.git"
+mkdir -p "$FIX/elsewhere"
+out="$(cd "$FIX/elsewhere" && bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a RELATIVE record is flagged from a CWD outside the record dir"
+assert_contains "$out" "$WREL" "…and names that worktree"
+assert_contains "$out" "$HW/.git/worktrees/wtrel1410" "…with its own record"
+apply_repair "$out" 2>/dev/null || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the printed repair restores it"
+git -C "$HW" config --unset worktree.useRelativePaths
+
+# 10d. The transport must survive a path containing `|` or `'`. Packing `dir|record` into
+# one line split a `|` path into a wrong directory AND a wrong record, and printed a repair
+# that writes a .git file into an unrelated directory. The printed repair must also actually
+# work for such a path (an unquoted `'` turns it into a silent no-op).
+WPIPE="$HW/.worktrees/wtpipe|alt"
+git -C "$HW" worktree add -q "$WPIPE" -b wtpipe HEAD
+rm -f "$WPIPE/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree path containing | is flagged"
+assert_contains "$out" "$WPIPE" "…and carried intact, not truncated at the |"
+# The record path is printed %q-quoted (so a `|` cannot be misread when pasted), and git
+# reports the hub's common dir canonically on macOS (/var -> /private/var).
+assert_contains "$out" '.git/worktrees/wtpipe\|alt' "…with its own record, pipe escaped for pasting"
+apply_repair "$out" 2>/dev/null || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the printed repair restores it (no wrong-directory write)"
+assert_contains "$(git -C "$WPIPE" rev-parse --show-toplevel 2>/dev/null)" "$WPIPE" \
+  "…and git treats it as the worktree again"
+
+WQUOTE="$HW/.worktrees/don$(printf "'")t"
+git -C "$HW" worktree add -q "$WQUOTE" -b wtquote HEAD
+rm -f "$WQUOTE/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree path containing a single quote is flagged"
+apply_repair "$out" 2>/dev/null || true
+assert_contains "$(git -C "$WQUOTE" rev-parse --show-toplevel 2>/dev/null)" "$WQUOTE" \
+  "…and the printed repair still restores it (quote is escaped, not a silent no-op)"
+
+# 10e. An UNREADABLE record cannot be verified, so it is reported — never skipped as if the
+# hub were healthy (#1313's no_upstream doctrine: an unverifiable verdict is not a PASS).
+WUNREAD="$HW/.worktrees/wtunread1410"
+git -C "$HW" worktree add -q "$WUNREAD" -b wtunread1410 HEAD
+rm -f "$WUNREAD/.git"
+chmod 000 "$HW/.git/worktrees/wtunread1410/gitdir"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an unreadable worktree record → exit 1 (fail-closed, not a silent PASS)"
+assert_contains "$out" "UNVERIFIABLE worktree record" "…and is reported as unverifiable"
+chmod 644 "$HW/.git/worktrees/wtunread1410/gitdir"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wtunread1410" > "$WUNREAD/.git"
+
+# 10f. A worktree OUTSIDE the hub cannot resolve up to it, so the guide must not claim that
+# it does (the repair is the same; the stated hazard is not).
+WOUTSIDE="$FIX/outside1410"
+git -C "$HW" worktree add -q "$WOUTSIDE" -b outside1410 HEAD
+rm -f "$WOUTSIDE/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree outside the hub with no link is still flagged"
+# The sentence follows GIT'S answer, so an out-of-hub offender must not be told its commits
+# would land on the hub's branch.
+# Outside any repo, git cannot resolve it at all — the honest sentence, and never the claim that
+# its commits would land on the hub's branch.
+assert_contains "$out" "cannot resolve this directory" "…and the hazard is stated per-directory"
+assert_not_contains "$out" "resolves it UP to this hub" "…without claiming the hub's branch"
+apply_repair "$out" 2>/dev/null || true
+assert_contains "$(git -C "$WOUTSIDE" rev-parse --show-toplevel 2>/dev/null)" "$WOUTSIDE" \
+  "…and its repair works too"
+
+# 10g. HEALTH IS RESOLUTION, NOT EXISTENCE (#1410). A `.git` that is PRESENT but is not this
+# worktree's admin dir — a file naming another gitdir, or a symlink to the hub's own `.git` —
+# leaves git resolving the directory to the HUB, so a commit there lands on the hub's branch.
+# Measured: rc=0 "hub discipline holds" for all of these while `git -C <wt> rev-parse
+# --abbrev-ref HEAD` was the hub's branch.
+WW="$HW/.worktrees/wronglink1410"
+git -C "$HW" worktree add -q "$WW" -b wronglink1410 HEAD
+rm -f "$WW/.git"
+printf 'gitdir: %s\n' "$HW/.git" > "$WW/.git"          # a well-formed link to the WRONG gitdir
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a .git present but pointing at the hub's gitdir → exit 1 (not a healthy hub)"
+assert_contains "$out" "$WW" "…and names that worktree"
+assert_contains "$out" "is not this worktree's link" "…and says the entry is the wrong link"
+assert_contains "$out" "rm -f" "…and prints a remove-then-replace repair, not a bare write"
+apply_repair "$out" 2>/dev/null || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the printed repair restores it"
+assert_contains "$(git -C "$WW" rev-parse --absolute-git-dir 2>/dev/null)" ".git/worktrees/wronglink1410" \
+  "…so the directory resolves to its OWN record, not the hub's"
+
+# 10h. The repair must not write THROUGH a symlink: a bare `>` follows it and creates the link
+# at its target, in an unrelated directory.
+WV="$HW/.worktrees/symlink1410"
+git -C "$HW" worktree add -q "$WV" -b symlink1410 HEAD
+rm -f "$WV/.git"
+VICTIM="$FIX/victim1410"
+ln -s "$VICTIM" "$WV/.git"                              # dangling symlink
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a symlinked .git that is not this worktree's link → exit 1"
+apply_repair "$out" 2>/dev/null || true
+assert_eq "$([ -e "$VICTIM" ] && echo present || echo absent)" "absent" \
+  "…and the repair does not create the link at the symlink's TARGET"
+assert_contains "$(git -C "$WV" rev-parse --absolute-git-dir 2>/dev/null)" ".git/worktrees/symlink1410" \
+  "…and the worktree is restored"
+
+# 10i. A record that does not name a `.../.git` link cannot be verified, so it is reported —
+# never skipped as if the hub were healthy (the same doctrine as an unreadable record).
+WF2="$HW/.worktrees/mangled1410"
+git -C "$HW" worktree add -q "$WF2" -b mangled1410 HEAD
+rm -f "$WF2/.git"
+printf '%s \n' "$WF2/.git" > "$HW/.git/worktrees/mangled1410/gitdir"   # trailing space
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a mangled record with a genuinely missing link → exit 1"
+assert_contains "$out" "UNVERIFIABLE worktree record" "…and is reported as unverifiable"
+printf '%s\n' "$WF2/.git" > "$HW/.git/worktrees/mangled1410/gitdir"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/mangled1410" > "$WF2/.git"
+
+# 10j. A worktree whose path ENDS in a newline. `$( … )` strips trailing newlines, so the
+# canonicalization would produce a path that does not exist; if the `-d` gate ran first the
+# entry would be dropped and the hub would report PASS while git resolves the directory to the
+# HUB (measured against the pre-fix revision: a commit there moved the hub's main). The entry is
+# reported, not repaired: a newline cannot ride in the line-oriented transport.
+WTNL="$HW/.worktrees/wtnl1410"$'\n'
+git -C "$HW" worktree add -q "$WTNL" -b wtnl1410 HEAD
+rm -f "$WTNL/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree path ending in a newline is not a PASS"
+assert_contains "$out" "could not be shown safely" "…it is reported as uncarryable, fail-closed"
+assert_not_contains "$out" "PASS  $HW " "…and the hub is not reported healthy"
+rm -rf "$WTNL"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the hub returns to PASS once the directory is gone (no permanent red)"
+git -C "$HW" worktree prune >/dev/null 2>&1 || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and stays PASS after the record is pruned (fixture cleanup)"
+
+# 10k. A CRLF record is a shape GIT accepts: on a healthy worktree it must not red the hub
+# (measured: `git worktree list` and `status` are both fine, while the check said UNVERIFIABLE
+# with no repair line and neither `prune` nor `repair` cleared it — no route back).
+WCRLF="$HW/.worktrees/wtcrlf1410"
+git -C "$HW" worktree add -q "$WCRLF" -b wtcrlf1410 HEAD
+printf '%s\r\n' "$WCRLF/.git" > "$HW/.git/worktrees/wtcrlf1410/gitdir"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a CRLF record on a HEALTHY worktree still PASSes"
+rm -f "$WCRLF/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "…and the same record with the link GONE still FAILs"
+printf '%s\n' "$WCRLF/.git" > "$HW/.git/worktrees/wtcrlf1410/gitdir"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wtcrlf1410" > "$WCRLF/.git"
+
+# 10l. A record naming the hub's OWN gitdir makes the directory the hub root, which does
+# resolve up to the hub — the sentence must not be inverted for it.
+# The RECORD must name the hub's own gitdir: the directory then IS the hub root. (Mangling the
+# worktree's link only changes what git resolves; the offender directory comes from the record.)
+WROOT="$HW/.worktrees/wtroot1410"
+git -C "$HW" worktree add -q "$WROOT" -b wtroot1410 HEAD
+printf '%s\n' "$HW/.git" > "$HW/.git/worktrees/wtroot1410/gitdir"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a record naming the hub's own gitdir is reported"
+assert_contains "$out" "resolves it UP to this hub" "…with the hub-alias sentence"
+# The inverted claim is the defect: the hub root DOES resolve up to the hub.
+assert_not_contains "$out" "does NOT fall through to" "…and not the not-falling-through sentence"
+printf '%s\n' "$WROOT/.git" > "$HW/.git/worktrees/wtroot1410/gitdir"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wtroot1410" > "$WROOT/.git"
+
+# 10m. A worktree inside a NESTED repo under the hub resolves to THAT repo, not to the hub, so
+# naming the hub's branch there is false. The sentence must follow git's own answer rather than
+# the path prefix (`<hub>/inner/...` is under the hub by any prefix test).
+INNER="$HW/inner1410"
+git init -q -b main "$INNER"
+git -C "$INNER" config user.email t@t
+git -C "$INNER" config user.name t
+touch "$INNER/b.txt"
+git -C "$INNER" add .
+git -C "$INNER" commit -qm inner
+WINNER="$INNER/wti1410"
+# Registered by the HUB (that is what puts it in the hub's records) at a path inside the nested
+# repo — so with its link gone, git walks up to the INNER repo, not to the hub.
+git -C "$HW" worktree add -q "$WINNER" -b wti1410 HEAD
+rm -f "$WINNER/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a worktree inside a NESTED repo under the hub is reported"
+assert_contains "$out" "does NOT fall through to" "…and is not told it resolves to the HUB's branch"
+assert_not_contains "$out" "resolves it UP to this hub" "…so the hub-alias sentence is absent"
+rm -rf "$INNER"
+git -C "$HW" worktree prune >/dev/null 2>&1 || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the hub returns to PASS once that tree is gone (fixture cleanup)"
+
+# 10n. A healthy worktree whose path contains a newline must NOT red the hub: git accepts it, so
+# reporting it would leave no route back (the transport cannot carry the path, but health is
+# decided BEFORE the transport, on the path as recorded).
+WOKNL="$HW/.worktrees/wtoknl1410"$'\n'
+git -C "$HW" worktree add -q "$WOKNL" -b wtoknl1410 HEAD
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a HEALTHY worktree with a newline in its path still PASSes"
+rm -rf "$WOKNL"
+git -C "$HW" worktree prune >/dev/null 2>&1 || true
+
+# 10o. A missing value for --repo is a USAGE error (exit 2, with the header), not a silent
+# `shift 2` failure under `set -e` that exits 1 with no output at all.
+out="$(bash "$CHECK" --repo 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 2 "--repo with no value exits 2 (usage), not 1"
+assert_contains "$out" "worktree_unlinked" "…and prints the usage header"
+
+# 10p. A `.git` that is a DIRECTORY (a partial delete, or git metadata left behind) is a hazard
+# shape the header names — and `rm -f` REFUSES a directory, so the printed repair used to be a
+# silent no-op that left the hub red. The instruction must match the entry's type.
+WDIR="$HW/.worktrees/wtdir1410"
+git -C "$HW" worktree add -q "$WDIR" -b wtdir1410 HEAD
+rm -f "$WDIR/.git"
+mkdir "$WDIR/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a .git DIRECTORY that is not this worktree's link → exit 1"
+assert_contains "$out" "It is a DIRECTORY" "…and the repair says so, rather than printing rm -f"
+apply_repair "$out" 2>/dev/null || true
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the printed repair actually repairs it (no silent no-op)"
+
+# 10q. A `.git` FILE whose content git rejects (`fatal: invalid gitfile format`) makes git UNABLE
+# to resolve the directory. `cd ""` succeeds in bash 3.2, so the canonicalization of that empty
+# result substituted the INVOKER'S CWD: run from the worktree's own record dir the check reported
+# "hub discipline holds" and the broken entry was never mentioned (measured), and run from
+# `<hub>/.git` it claimed the commits would land on the hub's branch.
+WBAD="$HW/.worktrees/wtbad1410"
+git -C "$HW" worktree add -q "$WBAD" -b wtbad1410 HEAD
+rm -f "$WBAD/.git"
+printf 'not a gitdir\n' > "$WBAD/.git"
+out="$(bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an invalid .git file → exit 1 (reported, not a silent PASS)"
+assert_contains "$out" "cannot resolve this directory" "…and says git cannot resolve it"
+out="$(cd "$HW/.git/worktrees/wtbad1410" && bash "$CHECK" --repo "$HW" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "…and it is STILL reported when run from that worktree's own record dir"
+assert_not_contains "$out" "hub discipline holds" "…not a PASS that depends on the invoker's CWD"
+rm -f "$WBAD/.git"
+printf 'gitdir: %s\n' "$HW/.git/worktrees/wtbad1410" > "$WBAD/.git"
 
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"

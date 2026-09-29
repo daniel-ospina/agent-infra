@@ -401,17 +401,17 @@ class TransferValidator:
 
 ```bash
 # Race condition indicators
-grep -rn "sleep\|time\.sleep\|Thread\|async" --include="*.py"
-grep -rn "balance\|inventory\|stock" --include="*.py" | grep -v "select_for_update\|lock"
+git grep -n -e "sleep\|time\.sleep\|Thread\|async" -- '*.py'
+git grep -n -e "balance\|inventory\|stock" -- '*.py' | grep -v "select_for_update\|lock"
 
 # Price/amount from request
-grep -rn "request\.\w*\[.*price\|request\.\w*\[.*amount\|request\.\w*\[.*total" --include="*.py"
+git grep -n -e "request\.\w*\[.*price\|request\.\w*\[.*amount\|request\.\w*\[.*total" -- '*.py'
 
 # Missing validation
-grep -rn "def checkout\|def purchase\|def transfer" --include="*.py"
+git grep -n -e "def checkout\|def purchase\|def transfer" -- '*.py'
 
 # Floating point for money
-grep -rn "float.*price\|float.*amount\|float.*balance" --include="*.py"
+git grep -n -e "float.*price\|float.*amount\|float.*balance" -- '*.py'
 ```
 
 ---
