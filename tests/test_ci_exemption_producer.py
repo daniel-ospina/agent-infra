@@ -397,6 +397,39 @@ def test_cli_decide_blocks_and_writes_the_residual(tmp_path, capsys):
     assert "blocked=1" in out
 
 
+def test_cli_decide_blocks_a_TOTAL_pr_failure_the_tolerance_would_bridge(tmp_path, capsys):
+    """The closed residual, REACHABLE through the real consumer.
+
+    The shell drives the decision as a CLI over files (`admin-merge.sh`
+    ``run_exemption_decision``), and `k_pr` is derived inside `_cmd_decide` as
+    `max(row.runs)`. A change that made that derivation produce a thin sample would
+    silently route a saturated row into the #5250 attribution path and NO guard-level
+    test would catch it. This pins the whole consumer chain: `main 6/8` vs `PR 8/8`,
+    `k_pr=8`, must exit gated (rc=1) with the id in `--blocked-out`.
+
+    MUTATION: remove the totality guard -> rc becomes 0, `blocked` empties and the
+    `VERDICT\tBLOCK` assertion REDs (the measured false PASS).
+    """
+    pr = _write(tmp_path, "pr.txt", f"{DR}\t8\t8\tAssertionError: assert 3 == 2\n")
+    mainf = _write(tmp_path, "main.txt", f"{DR}\t6\t8\n")
+    msig = _write(tmp_path, "msig.txt", f"{DR}\tAssertionError: assert 3 == 2\n")
+    blocked = tmp_path / "blocked.txt"
+    verdict = tmp_path / "verdict.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig,
+            "--blocked-out", str(blocked), "--verdict-out", str(verdict),
+        ]
+    )
+
+    assert rc == 1, "a deterministic total failure must gate the merge"
+    assert blocked.read_text(encoding="utf-8") == f"{DR}\n"
+    assert verdict.read_text(encoding="utf-8").startswith("VERDICT\tBLOCK")
+    assert "TOTAL" in capsys.readouterr().out
+
+
 def test_cli_decide_exempts_with_both_rates_visible(tmp_path, capsys):
     """An exemption must be RECORDED with both rates — never an absence.
 
@@ -421,6 +454,76 @@ def test_cli_decide_exempts_with_both_rates_visible(tmp_path, capsys):
     assert line.startswith("EXEMPT:")
     assert "main 4/8" in line and "PR 4/8" in line
     assert "VERDICT\tCLEAN" in out
+
+
+def test_cli_decide_a_single_sample_pr_rate_is_not_measurable(tmp_path, capsys):
+    """#5250 end-to-end: the CLI derives `k_pr` from the row's run count.
+
+    The production path passes `k_pr = max(row.runs)`, so a head tested once is
+    `1/1` against a flaky main `3/5`. The old rate comparison blocks that by
+    construction (`1.00 > 0.90`); below `min_runs` the rate is NOT-MEASURABLE and
+    the exemption must be visible in the file the evidence poster reads.
+    MUTATION: revert the PR-side floor → rc == 1 and no EXEMPT line.
+    """
+    pr = _write(tmp_path, "pr.txt", f"{DR}\t1\t1\tAssertionError: assert 3 == 2\n")
+    mainf = _write(tmp_path, "main.txt", f"{DR}\t3\t5\n")
+    msig = _write(tmp_path, "msig.txt", f"{DR}\tAssertionError: assert 3 == 2\n")
+    exempt = tmp_path / "exempt.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig, "--exempt-out", str(exempt),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    lines = exempt.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("EXEMPT:")
+    assert "NOT measurable" in lines[0], lines[0]
+    assert "signature + main presence" in lines[0], lines[0]
+    assert "main 3/5" in lines[0], lines[0]
+    assert "5 run(s)" in lines[0], lines[0]
+    assert "VERDICT\tCLEAN" in out
+
+
+def test_cli_decide_the_pr_floor_uses_the_declared_table_max(tmp_path, capsys):
+    """The CLI's `k_pr = max(row.runs)` is the floored quantity, not a row's runs.
+
+    A two-row PR file (5 and 1 runs) declares `k_pr=5`, so the `1/1` row is COMPARED
+    and both rows BLOCK. MUTATION: floor on `pr.rate.runs` instead of the declared
+    `k_pr` → the `1/1` row is floored and exempted, so `blocked` shrinks to 1 and an
+    EXEMPT line appears → RED.
+    """
+    other = "tests/test_other.py::TestT::test_other"
+    pr = _write(
+        tmp_path, "pr.txt",
+        f"{DR}\t5\t5\tAssertionError: assert 3 == 2\n"
+        f"{other}\t1\t1\tAssertionError: assert 3 == 2\n",
+    )
+    mainf = _write(tmp_path, "main.txt", f"{DR}\t3\t5\n{other}\t3\t5\n")
+    msig = _write(
+        tmp_path, "msig.txt",
+        f"{DR}\tAssertionError: assert 3 == 2\n{other}\tAssertionError: assert 3 == 2\n",
+    )
+    blocked = tmp_path / "blocked.txt"
+    exempt = tmp_path / "exempt.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig, "--blocked-out", str(blocked),
+            "--exempt-out", str(exempt),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 1, out
+    assert sorted(blocked.read_text(encoding="utf-8").split()) == [DR, other]
+    assert exempt.read_text(encoding="utf-8") == "", "the declared k=5 floors neither row"
+    assert "blocked=2" in out
 
 
 def test_cli_decide_rotation_is_unattributable_and_gates(tmp_path, capsys):

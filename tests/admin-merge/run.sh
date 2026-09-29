@@ -117,17 +117,21 @@
 #      a failed `gh run list` is a LISTING failure and not a thinner lane, and the
 #      parity key is the VERBATIM shard name (the matrix axis is NOT normalised
 #      away — `test (a, docker)` and `test (a, embedded)` are different lanes).
-#      Both sides are read over the SAME window (the PR's lane runs for the head;
-#      main's last `--main-runs`), so a shard main ran only inside the operator's
-#      window cannot be sampled away. A listing that is only PARTLY readable is
+#      The reference is drawn from at least `--main-runs` runs: the window counts
+#      MEASUREMENTS, so a run that measured nothing does not spend it, and the
+#      listing widens past such runs while no executed shard has been found. The
+#      widened window is DISCLOSED, so a shard main ran only inside the operator's
+#      window still cannot be sampled away (#4844). A listing that is only PARTLY readable is
 #      UNREADABLE, not a thinner lane (cycle-2 P1: an unparsable run line used to
 #      be skipped, silently shrinking the reference; an unterminated final line
 #      was dropped outright). A family whose every member is a workflow LIFECYCLE
 #      job measured nothing and is refused (cycle-2 P1: `=changes` certified on
 #      bookkeeping while main's real shard went uncompared), which is why the
 #      evidence and the refusal both NAME the parity family. `--main-runs` is
-#      validated (positive, ≤ 200) before any CI work — the window is also the
-#      gate's Jobs-API call budget. `ADMIN_MERGE_LANE_PARITY=declared-off` is the
+#      validated (positive, ≤ 200) before any CI work, and the widening stops once
+#      that many MEASURING runs are consulted: the window is the Jobs-API call
+#      budget for the ordinary path, and a wider one reads more job lists only
+#      where the requested window found no shard at all. `ADMIN_MERGE_LANE_PARITY=declared-off` is the
 #      AUDITED escape (a trigger-split repo, #1349): it certifies while STATING in
 #      the evidence and on stderr that parity was NOT established, and any other
 #      value is refused at startup. Declared OUT of scope: a repo that varies the
@@ -367,6 +371,18 @@ case "$key" in
       if [ -f "$SCEN/rerun-$id" ] && [ -f "$SCEN/log-after-$id" ]; then
         cat "$SCEN/log-after-$id"; exit 0
       fi
+      # `partial-log-<id>` models the shape the fake could not previously produce:
+      # `gh` writes a TRUNCATED log to stdout and THEN exits non-zero. Real gh
+      # does this (the capture is `2>&1 > "$out"`, so `$out` keeps whatever
+      # arrived before the failure), and it is the ONLY way the `frc -ne 0`
+      # refusals in `collect_union_signatures` / `collect_union_rows` become
+      # load-bearing: with no partial write the downstream `failed_ids_from_log`
+      # refusal catches it anyway, which is why dropping those checks left the
+      # whole suite green (review cycle 7) while a partial log is extracted as a
+      # COMPLETE failure set — a silent fail-open.
+      if [ -f "$SCEN/partial-log-$id" ]; then
+        cat "$SCEN/partial-log-$id"; exit 1
+      fi
       [ -f "$SCEN/fail-log-$id" ] && exit 1
       [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
       exit 0
@@ -546,8 +562,15 @@ case "$key" in
     # is parsed out of the URL so a fixture is per-run; a bare `$SCEN/jobs.json`
     # serves every run. No fixture is an API error (never a small bound).
     id="$(printf '%s' "$a2" | sed -n 's#.*/runs/\([0-9][0-9]*\)/jobs.*#\1#p')"
+    # #1482: the discrimination between "a run WITH jobs whose log is unreadable"
+    # and "a run with ZERO jobs" IS the `.total_count` projection. A fixture
+    # `jobs-count-<id>` (or `jobs-count`) supplies that NUMBER directly. Without
+    # this seam the zero-job branch was UNREACHABLE from the whole suite: the fake
+    # ignored `--jq` and `cat`ed raw JSON, so `run_job_count` saw a non-numeric
+    # blob and fail-closed in EVERY scenario — the new branch was dead code.
+    if [ -n "$id" ] && [ -f "$SCEN/jobs-count-$id" ]; then cat "$SCEN/jobs-count-$id"; exit 0; fi
+    if [ -f "$SCEN/jobs-count" ]; then cat "$SCEN/jobs-count"; exit 0; fi
     if [ -n "$id" ] && [ -f "$SCEN/jobs-$id.json" ]; then cat "$SCEN/jobs-$id.json"; exit 0; fi
-    if [ -f "$SCEN/jobs.json" ]; then cat "$SCEN/jobs.json"; exit 0; fi
     exit 1 ;;
   *)
     exit 1 ;;
@@ -635,10 +658,13 @@ lane_pass() {
 lane_queued() { lane_line in_progress "" "$1" "$2"; }
 
 # A main baseline that EXEMPTS <id> under the #3756 decision: `n` tested runs (at
-# least the module's min_runs floor) in which <id> fails with the SAME signature,
-# so a PR failure at an equal rate is not "materially higher". Before the swap a
-# merge only needed the id to appear ONCE anywhere in main's window; the decision
-# needs a measured RATE, so scenarios that assert a merge must now measure one.
+# least the module's min_runs floor) in which <id> fails with the SAME signature.
+# Before the swap a merge only needed the id to appear ONCE anywhere in main's
+# window; the decision needs MAIN measured over at least min_runs, so scenarios
+# that assert a merge must measure main. These fixtures give the PR a SINGLE
+# failing run, so the PR sample is below min_runs and the exemption is granted on
+# the attribution path (#5250); the rate comparison's own path is exercised by the
+# unit tests and by the `runs=8` DEMO below.
 main_red_n() {  # <sha> <base-run-id> <n> <id>  -> lane-run lines on stdout
   local sha="$1" base="$2" n="$3" id="$4" i=0
   while [ "$i" -lt "$n" ]; do
@@ -952,6 +978,544 @@ rc=$?
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the set could not be read" || pass "no evidence comment posted"
 grep -q "could not fetch the failed-step log" "$TMP/err" && pass "the parser's failure is surfaced, not swallowed" || fail "expected the parser failure on stderr"
 
+# ── 5b. #1482: a ZERO-JOB run is EMPTY, not unreadable ──────────────────────
+# A run that never started has no failure for a log to reveal, and
+# `gh run view --log-failed` fails for it IDENTICALLY to a transport error. Treating
+# the two alike blocked EVERY merge whenever such a run sat in the window.
+echo "== 5b. zero-job run contributes NOTHING (not an extraction failure) =="
+new_scen zerojob
+: > "$SCEN/fail-log-7777"                 # the log CANNOT be fetched...
+printf '0\n' > "$SCEN/jobs-count-7777"    # ...because the run has no jobs at all
+# 3 REAL failing baseline runs, so the baseline is measurable once the empty run
+# is not mistaken for an extraction failure.
+{ main_red_n main7777 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7777 7777
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zj-prov.txt" --runs-report "$TMP/zj-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "a zero-job run does not fail the baseline extraction" || fail "expected exit 0, got $rc"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && pass "the zero-job run is named on stderr" || fail "expected the zero-job note on stderr"
+# ONE verdict per run: the old shape printed the refusal AND the exemption for the
+# same run, which is the ambiguity #1482 exists to remove.
+grep -q "could not fetch the failed-step log" "$TMP/cfs-err" \
+  && fail "the refusal must NOT also be printed for the same run" \
+  || pass "one verdict per run — no contradictory pair"
+if [ -f "$TMP/zj-rep.txt" ]; then
+  v="$(sed -n 's/^tested=//p' "$TMP/zj-rep.txt")"
+  [ "$v" = "3" ] && pass "tested counts only the 3 real runs, not the zero-job one" || fail "expected tested=3, got '$v'"
+  v="$(sed -n 's/^extracted=//p' "$TMP/zj-rep.txt")"
+  [ "$v" = "3" ] && pass "all 3 real failing runs were extracted" || fail "expected extracted=3, got '$v'"
+else
+  fail "no runs-report written for the zero-job scenario"
+fi
+
+# ── 5c. #1482: the narrowing must NOT widen ────────────────────────────────
+# A run that HAS jobs and whose log cannot be read can be hiding a real failure,
+# so it must still fail closed. The exemption is ONLY for runs that could not have
+# failed because they never started.
+echo "== 5c. run WITH jobs + unreadable log → still fail-closed =="
+new_scen jobsbutnolog
+: > "$SCEN/fail-log-7778"
+printf '3\n' > "$SCEN/jobs-count-7778"   # this run DID have jobs
+{ main_red_n main7778 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7778 7778
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zjc-prov.txt" --runs-report "$TMP/zjc-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a run with jobs and an unreadable log still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "could not fetch the failed-step log" "$TMP/cfs-err" && pass "the refusal is surfaced" || fail "expected the refusal on stderr"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a zero-job note must not be printed for a run that HAS jobs" || pass "no zero-job note for a run that has jobs"
+
+# The jobs-API slug must carry the RESOLVED repo (review cycle 5, P2). Forcing the
+# `{owner}/{repo}` placeholder unconditionally left the suite GREEN, because the
+# fake extracts the run id by regex and discards everything before `/runs/` — so
+# the cross-repo protection the code comments describe was untested. A wrong-repo
+# call is mostly fail-closed (it 404s), but it silently makes the exemption inert
+# cross-repo, and it can falsely exempt if a same-id run in the CWD repo answers 0.
+tab="$(printf '\t')"
+if grep -q "repos/test-org/test-repo/actions/runs/7778/jobs" "$SCEN/calls"; then
+  pass "the jobs-API call carries the RESOLVED slug (--repo), not the CWD placeholder"
+else
+  fail "the jobs-API call did not use the resolved repo slug:"
+  grep -o 'repos/[^ ]*' "$SCEN/calls" | sort -u | sed 's/^/       /' || true
+fi
+
+# ── 5d. #1482: an UNREADABLE count is not a licence to exempt ───────────────
+echo "== 5d. unreadable job count → still fail-closed =="
+new_scen jobscountunknown
+: > "$SCEN/fail-log-7779"                 # log unreadable
+# ...and NO jobs-count-7779 fixture: the count cannot be established, so the run
+# must be treated as a possible concealment, never as empty.
+{ main_red_n main7779 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7779 7779
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zju-prov.txt" --runs-report "$TMP/zju-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unreadable job count still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "nothing may be exempted when the count is unknown" || pass "no exemption without a proven zero count"
+
+# ── 5e. #1482 P0: the debit must be PAIRED with the credit ───────────────────
+# `startup_failure` is in the EXAMINED set but NOT in the `tested` set (it never
+# exercised the suite). A startup_failure run has zero jobs AND a failing
+# conclusion, so it reaches the zero-job branch WITHOUT having been credited —
+# and an unpaired decrement then STEALS a credit from a real tested run. `tested`
+# is the rate table's denominator and the main-side gate's signal, so a stolen
+# credit raises main's measured rate and can EXEMPT a materially worse PR.
+echo "== 5e. a startup_failure run must not steal a tested credit =="
+new_scen startupfail
+: > "$SCEN/fail-log-7780"
+printf '0\n' > "$SCEN/jobs-count-7780"
+{ main_red_n main7780 1001 4 'tests/test_other.py::test_red_on_main'
+  lane_line completed startup_failure main7780 7780
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zj5-prov.txt" --runs-report "$TMP/zj5-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "the zero-job startup_failure run does not fail the extraction" || fail "expected exit 0, got $rc"
+if [ -f "$TMP/zj5-rep.txt" ]; then
+  v="$(sed -n 's/^tested=//p' "$TMP/zj5-rep.txt")"
+  [ "$v" = "4" ] && pass "tested=4 — the credit was NOT stolen by the startup_failure run" || fail "expected tested=4, got '$v' (an unpaired decrement steals a credit)"
+else
+  fail "no runs-report written for the startup_failure scenario"
+fi
+
+# ── 5f. #1482: the zero boundary is EXACT — 1 job is not 0 ──────────────────
+# Pins the `= 0` comparison itself: a mutation to `-le 1` (or any slack at the
+# boundary) would exempt a run that DID carry a job and could therefore hide a
+# failure in its unreadable log.
+echo "== 5f. a run with ONE job and an unreadable log still fails closed =="
+new_scen onejob
+: > "$SCEN/fail-log-7781"
+printf '1\n' > "$SCEN/jobs-count-7781"
+{ main_red_n main7781 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7781 7781
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zj6-prov.txt" --runs-report "$TMP/zj6-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "exactly one job is NOT zero — still fails closed (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a run with 1 job must not be reported as zero-job" || pass "no zero-job note for a 1-job run"
+
+# ── 5g. #1482 P1: the exemption must work WITHOUT --repo ─────────────────────
+# `admin-merge <PR> --squash` — the DOCUMENTED invocation — passes no --repo. An
+# early `return 1` when the slug was absent made the exemption INERT there, so the
+# fleet-wide block persisted on exactly the path the fleet uses. The slug must
+# resolve the same way the rest of the rail resolves it (gh's own placeholder).
+echo "== 5g. zero-job exemption works without --repo (the documented invocation) =="
+new_scen norepo
+: > "$SCEN/fail-log-7782"
+printf '0\n' > "$SCEN/jobs-count-7782"
+{ main_red_n main7782 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7782 7782
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 \
+  --exclude deadbeef --provenance "$TMP/zj7-prov.txt" --runs-report "$TMP/zj7-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "the exemption applies with no --repo (exit 0)" || fail "expected exit 0, got $rc — the exemption is inert without --repo"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && pass "the zero-job run is still named" || fail "expected the zero-job note"
+# The OTHER half of the slug contract: with no --repo the call must fall back to
+# gh's own `{owner}/{repo}` placeholder. Asserting only the resolved-slug case
+# would leave a regression that hardcodes the placeholder — or that invents a
+# slug — invisible whenever --repo is present.
+if grep -q 'repos/{owner}/{repo}/actions/runs/7782/jobs' "$SCEN/calls"; then
+  pass "without --repo the jobs call uses gh's {owner}/{repo} placeholder"
+else
+  fail "without --repo the jobs call did not use the gh placeholder:"
+  grep -o 'repos/[^ ]*' "$SCEN/calls" | sort -u | sed 's/^/       /' || true
+fi
+
+# ── 5h. #1482: the zero-job contract is pinned in ALL FOUR callers ───────────
+# Cycle 2's reviewer mutated the paired debit away in `collect_union`,
+# `collect_union_signatures` and `collect_union_rows` (leaving `collect_union_rates`
+# intact) and the whole suite stayed GREEN: 5b-5g drive only ONE of the four call
+# sites, so a regression in the other three was invisible. Each caller is driven
+# here through the CLI mode that ACTUALLY reaches it — these names are NOT
+# guessable from the function names, and getting one wrong left the very collector
+# this closes untested (review cycle 4, P1). The dispatch is:
+#   --pr / --commit         -> collect_union           (NOT collect_union_rows)
+#   --commit-rows           -> collect_union_rows       (the mode the gate uses)
+#   --main-union            -> collect_union
+#   --main-union-rates      -> collect_union_rates
+#   --main-union-signatures -> collect_union_signatures
+echo "== 5h. the zero-job contract holds in all four collectors =="
+new_scen allfour
+# NOTE: there must be NO `fail-log-7790` / `jobs-count-7790` fixture here. With
+# one, run A ALSO takes the zero-job path, BOTH runs debit, and `tested` lands on
+# 0 whether or not the code is correct — a fixture that agrees with every mutant.
+# Run A must be an ordinary credited run for the pairing to be observable.
+# The fixture MUST use `startup_failure` for the zero-job run, not `failure`.
+# With a zero-job `failure` run the balance-based decrement gives the SAME answer
+# as the paired one, so the test cannot tell them apart — that is exactly why the
+# cycle-2 mutation in three collectors went unnoticed. `startup_failure` is in the
+# EXAMINED set but never CREDITED, so it is the only shape that discriminates:
+#   run A  completed/failure          -> credits tested (1), log readable
+#   run B  completed/startup_failure  -> zero jobs => rc=2, NOT credited
+# Correct code => tested=1. A balance decrement on B steals A's credit => 0.
+# A missing `credited=0` reset leaks A's credit into B => 0 as well.
+# The two-run shape therefore pins the pairing AND the reset at every call site.
+#
+# The two runs MUST sit on DIFFERENT SHAs: the supersede rule (#1358) drops an
+# earlier failing run replaced by a LATER one at the same sha+workflow+event, so a
+# same-sha fixture silently collapses to one run and tests nothing. Run B also
+# needs a `fail-log-` fixture — without it the log fetch SUCCEEDS and the rc=2
+# branch is never reached at all.
+: > "$SCEN/fail-log-7791"
+printf '0\n' > "$SCEN/jobs-count-7791"
+{ lane_line completed failure 7700000000000000000000000000000000000001 7790
+  log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7790"
+  lane_line completed startup_failure 7700000000000000000000000000000000000002 7791
+} > "$SCEN/runs-main"
+cp "$SCEN/runs-main" "$SCEN/runs-main7790"
+while IFS='|' read -r label args; do
+  [ -n "$label" ] || continue
+  # shellcheck disable=SC2086
+  cfs_run $args --exclude deadbeef --provenance "$TMP/zj8-prov.txt" --runs-report "$TMP/zj8-rep.txt"
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "$label: expected exit 0, got $rc"
+  v="$(sed -n 's/^tested=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  [ "$v" = "1" ] && pass "$label: tested=1 (debit paired with credit; reset holds)" \
+                 || fail "$label: expected tested=1, got '$v' (a stolen credit is the P0 fail-open)"
+  # `examined` is a SEPARATE safety property and must be pinned too (review
+  # cycle 5, P1). On the PR side the whole fail-closed posture RESTS on
+  # `examined` advancing WITHOUT `extracted`: that is what makes admin-merge
+  # step 1c (`pr_extracted < pr_examined`) refuse a head whose failing run could
+  # not be attributed. Measured: decrementing `examined` in the rc=2 branch left
+  # the FULL 788-test suite green AND flipped the rail from BLOCK (exit 1) to
+  # MERGED (exit 0) on identical evidence — a fail-open with no test behind it.
+  # Both runs are examined (A: failure; B: startup_failure, in the examined set);
+  # only A is extracted, so the invariant is examined=2 / extracted=1.
+  ev="$(sed -n 's/^examined=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  ex="$(sed -n 's/^extracted=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  [ "$ev" = "2" ] && [ "$ex" = "1" ] \
+    && pass "$label: examined=2 / extracted=1 (the zero-job run stays EXAMINED)" \
+    || fail "$label: expected examined=2 extracted=1, got examined='$ev' extracted='$ex' — a zero-job run dropped from \`examined\` disarms the PR-side fail-closed gate"
+  # The remaining counters are asserted for the same reason: every one of them
+  # feeds a decision, and a review-cycle count that says "the suite is green" is
+  # not evidence about a counter no test reads. `completed` is what makes an
+  # EMPTY failing set mean green rather than unmeasured (admin-merge step 2b);
+  # `pending` is what keeps a queued run from reading as finished.
+  co="$(sed -n 's/^completed=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  pe="$(sed -n 's/^pending=//p' "$TMP/zj8-rep.txt" 2>/dev/null)"
+  [ "$co" = "2" ] && [ "$pe" = "0" ] \
+    && pass "$label: completed=2 / pending=0" \
+    || fail "$label: expected completed=2 pending=0, got completed='$co' pending='$pe'"
+done <<'MODES'
+collect_union (--main-union)|--main-union 10
+collect_union_rates (--main-union-rates)|--main-union-rates 10
+collect_union_signatures (--main-union-signatures)|--main-union-signatures 10
+collect_union_rows (--commit-rows)|--commit-rows main7790
+MODES
+
+# ── 5i. #1482 F2: `timed_out` MUST keep its `tested` credit ──────────────────
+# A timed_out run DID exercise the suite. Dropping it from the credit is
+# FAIL-OPEN, not cosmetic: it shrinks the rate table's denominator K, which RAISES
+# main's measured failure rate and makes a materially worse PR look equivalent.
+# Silently removing the credit left the entire 781-test suite green before this.
+echo "== 5i. a timed_out run keeps its tested credit (the rate denominator) =="
+new_scen timedout
+: > "$SCEN/runs-main"
+for i in 1 2 3; do
+  lane_line completed timed_out main9100 "$((9100 + i))"
+  log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-$((9100 + i))"
+done >> "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zj9-prov.txt" --runs-report "$TMP/zj9-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "the timed_out lane extracts (exit 0)" || fail "expected exit 0, got $rc"
+v="$(sed -n 's/^tested=//p' "$TMP/zj9-rep.txt" 2>/dev/null)"
+[ "$v" = "3" ] && pass "tested=3 — all three timed_out runs are credited" || fail "expected tested=3, got '$v'"
+tab="$(printf '\t')"
+if grep -q "${tab}3${tab}3$" "$TMP/cfs-out"; then
+  pass "the rate table's K is 3 — the denominator is not shrunk"
+else
+  fail "the rate table's K is not 3 (a shrunk K is a fail-open):"
+  sed 's/^/       /' "$TMP/cfs-out"
+fi
+
+# ── 5j. #1482: a NON-NUMERIC count is not zero ─────────────────────────────────
+# `run_job_count`'s contract declares it exits 1 on "a non-numeric answer", and
+# that rejection is DECISION-BEARING — it is what stops `fetch_failed_log` from
+# reading an unestablishable count as "zero jobs, contributes NOTHING". 5d pins
+# only the API-FAILURE sub-case (the command-level `|| return 1`); this pins the
+# other one: a SUCCESSFUL call whose `.total_count` is not a number.
+#
+# ⚠️ This block feeds the literal `null`. Review cycle 7 MEASURED that real `gh`
+# (2.97.0 / go-gh v2.13.0) NEVER PRINTS `null`: `pkg/jq/jq.go` maps a nil to ""
+# and `EvaluateFormatted` writes it with `fmt.Fprintln`, so a nil projection
+# yields a bare newline (verified here: `gh api /rate_limit --jq '.total_count'`
+# -> rc=0, stdout is one `\n` byte); an HTTP 204 yields no stdout at all. Both
+# reach the shell as the EMPTY string — a DIFFERENT alternative of the same
+# `case`. So this block pins the guard's arithmetic path, and 5k pins the empty
+# path that real gh actually produces. Keeping both is the point: the `''`
+# clause is the one a reader of this comment would otherwise be misled about.
+echo "== 5j. a NON-NUMERIC job count is not zero — still fail-closed =="
+new_scen nan-count
+: > "$SCEN/fail-log-7783"
+printf 'null\n' > "$SCEN/jobs-count-7783"   # a non-numeric value that is NOT empty
+{ main_red_n main7783 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7783 7783
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zja-prov.txt" --runs-report "$TMP/zja-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a non-numeric count still fails closed (exit $rc)" \
+                || fail "expected a non-zero exit, got 0 — a non-numeric count was read as ZERO"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "a non-numeric count must NOT be reported as zero-job" \
+                                        || pass "no zero-job note for a non-numeric count"
+if [ -s "$TMP/cfs-out" ]; then
+  fail "a rate table was emitted despite an unestablishable count (a shrunk K is a fail-open):"
+  sed 's/^/       /' "$TMP/cfs-out"
+else
+  pass "no rate table emitted — the baseline was not silently shrunk"
+fi
+
+# ── 5k. #1482: an EMPTY count is not zero — the shape real gh emits ───────────
+# Review cycle 7 found that 5j pins an UNREACHABLE value. A nil `.total_count`
+# never arrives as `null` through go-gh v2.13.0 — it arrives as an EMPTY string.
+# That is a different alternative of the SAME `case`, and folding just the empty
+# one into zero —
+#     case "$count" in '') count=0 ;; *[!0-9]*) return 1 ;; esac
+# — leaves 5j passing, leaves the whole 801-test suite GREEN, and turns the rail
+# from BLOCK (rc=1, `gh pr merge` never invoked) into MERGE (rc=0, a rate table
+# emitted with the run silently dropped). Both real shapes are therefore pinned:
+# an entirely empty file, and a file holding a single newline.
+for shape in empty newline; do
+echo "== 5k ($shape). an EMPTY job count is not zero — still fail-closed =="
+new_scen "nan-$shape"
+: > "$SCEN/fail-log-7784"
+case "$shape" in
+  empty)   : > "$SCEN/jobs-count-7784" ;;               # gh exit 0, NO stdout (HTTP 204)
+  newline) printf '\n' > "$SCEN/jobs-count-7784" ;;     # gh exit 0, a bare newline (nil -> "")
+esac
+{ main_red_n main7784 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main7784 7784
+} > "$SCEN/runs-main"
+cfs_run --main-union-rates 10 --repo test-org/test-repo \
+  --exclude deadbeef --provenance "$TMP/zk-$shape-prov.txt" --runs-report "$TMP/zk-$shape-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "an empty job count still fails closed (exit $rc)" \
+                || fail "expected a non-zero exit, got 0 — an EMPTY count was read as ZERO"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "an empty count must NOT be reported as zero-job" \
+                                        || pass "no zero-job note for an empty count"
+if [ -s "$TMP/cfs-out" ]; then
+  fail "a rate table was emitted despite an empty count (a shrunk K is a fail-open):"
+  sed 's/^/       /' "$TMP/cfs-out"
+else
+  pass "no rate table emitted — the baseline was not silently shrunk"
+fi
+done
+
+# ── 5l. #1482: `collect_union`'s fail-closed arm, on the detector's own paths ──
+# Review cycle 7 found the third collector's fail-closed arm untested. Dropping it
+# (`*) ;;`) leaves the fast harness AND the full 801-test suite GREEN, because the
+# three `--commit` tests and every `--main-union` test use READABLE logs, and `--pr`
+# is never exercised at all. The consequence is not cosmetic: on the post-merge
+# detector path an unreadable log is how `--commit` reports "I could not extract the
+# merged commit's failing set", and with the arm gone the command returns 0 with
+# EMPTY stdout — the detector then reports `✅ no unique failures carried by this
+# merge`, a FALSE CLEAN, instead of `::error:: could not extract`.
+for mode in main-union commit; do
+echo "== 5l ($mode). an unreadable log still fails closed on collect_union =="
+new_scen "union-$mode"
+if [ "$mode" = "commit" ]; then
+  sha='aa5511000000000000000000000000000000000'
+  lane_fail "$sha" 8802 > "$SCEN/runs-$sha"
+  : > "$SCEN/fail-log-8802"          # log unreadable ...
+  printf '3\n' > "$SCEN/jobs-count-8802"   # ... and the run DID have jobs
+  cfs_run --commit "$sha"
+else
+  { main_red_n main8802 1001 3 'tests/test_other.py::test_red_on_main'
+    lane_fail main8802 8802
+  } > "$SCEN/runs-main"
+  : > "$SCEN/fail-log-8802"
+  printf '3\n' > "$SCEN/jobs-count-8802"
+  cfs_run --main-union 10 --repo test-org/test-repo
+fi
+rc=$?
+[ "$rc" -ne 0 ] && pass "$mode: fails closed (exit $rc)" \
+                || fail "$mode: expected a non-zero exit, got 0 — a FALSE CLEAN on a run that had jobs"
+if [ -s "$TMP/cfs-out" ]; then
+  fail "$mode: emitted a failure set despite an unreadable log:"
+  sed 's/^/       /' "$TMP/cfs-out"
+else
+  pass "$mode: emitted NO failure set (an empty stdout is what reads as 'no failures')"
+fi
+done
+
+# ── 5m. #1482: the per-collector `frc -ne 0` refusals are pinning, not decoration ──
+# Review cycle 7 called these two verdict-NEUTRAL and found that dropping either
+# left the whole suite green. The first half of that is right and the second half
+# was a TEST-SEAM artifact, not a property of the code:
+#
+#   `fetch_failed_log` captures with `2>&1 > "$out"`, so `$out` keeps whatever
+#   `gh` wrote to stdout BEFORE it failed. Every other scenario's fake `gh` exits 1
+#   immediately and leaves `$out` EMPTY — and an empty file makes the downstream
+#   `failed_ids_from_log "$log_file" || return 1` refuse for the same reason, so
+#   `frc` looked redundant. A PARTIAL write is the case where it is not: without
+#   the refusal the truncated log is parsed, `failed_ids_from_log` SUCCEEDS, and a
+#   TRUNCATED failure set is emitted as if it were complete.
+#
+# The new `partial-log-<id>` seam models that shape, which makes the refusal
+# load-bearing and this test able to see it.
+echo "== 5m. the per-collector refusals pin a PARTIAL log, not just an empty one =="
+new_scen frc-pin
+{ main_red_n main8803 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main8803 8803
+} > "$SCEN/runs-main"
+# gh writes a TRUNCATED capture, then fails. The partial log carries ONE real
+# failure id IN THE REAL LOG SHAPE (`log_failed`), so a parser that trusts it
+# emits a set that looks complete. An earlier version of this fixture wrote a
+# bare `FAILED <nodeid>` line — the EXTRACTOR's output, not a raw log line — so
+# the downstream `failed_ids_from_log` refused it too and the mutant survived.
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/partial-log-8803"
+printf '3\n' > "$SCEN/jobs-count-8803"   # the run DID have jobs
+# The modes are the REAL entry points for the two collectors that carry the
+# refusal: `--main-union-signatures` -> collect_union_signatures, and
+# `--commit-rows` -> collect_union_rows (the PR-side input). There is no
+# `--main-union-rows`; naming a mode the CLI does not have exits 2 on USAGE and
+# would have passed this test vacuously — asserted below.
+sha8803='aa5511000000000000000000000000000000000'
+lane_fail "$sha8803" 8803 > "$SCEN/runs-$sha8803"
+cfs_run --main-union-signatures 10 --repo test-org/test-repo \
+  --runs-report "$TMP/zl-sig-rep.txt" --provenance "$TMP/zl-sig-prov.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "--main-union-signatures refuses on a PARTIAL log (exit $rc)" \
+                || fail "--main-union-signatures returned 0 on a partial log — a TRUNCATED signature set was emitted as complete"
+cfs_run --commit-rows "$sha8803" --runs-report "$TMP/zl-rows-rep.txt" \
+  --provenance "$TMP/zl-rows-prov.txt"
+rc=$?
+[ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && pass "--commit-rows refuses on a PARTIAL log (exit $rc)" \
+  || fail "--commit-rows did not refuse with a real verdict (exit $rc; 2 = usage error = the mode named is wrong, so nothing was tested)"
+# And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
+# (This is the case that made the refusals look redundant in review cycle 7.)
+new_scen frc-pin-empty
+{ main_red_n main8804 1001 3 'tests/test_other.py::test_red_on_main'
+  lane_fail main8804 8804
+} > "$SCEN/runs-main"
+: > "$SCEN/fail-log-8804"
+printf '3\n' > "$SCEN/jobs-count-8804"
+cfs_run --main-union-signatures 10 --repo test-org/test-repo \
+  --runs-report "$TMP/zl-sig2-rep.txt" --provenance "$TMP/zl-sig2-prov.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "--main-union-signatures also refuses on an EMPTY log (exit $rc)" \
+                || fail "--main-union-signatures returned 0 on an empty log"
+
+# ── 5n. #1482: the CLI's fail-closed input guards ────────────────────────────
+# Review cycle 8 found six guards with ZERO coverage: neutering any of them left
+# the ENTIRE 66-test suite green. They are pre-existing (not introduced by this
+# change), but two of them are fail-opens and the rest are fail-closed properties
+# that nothing was defending:
+#
+#   --pr with an EMPTY head (gh returns a nil projection, exit 0): pristine ->
+#     rc=1, `✗ empty head for PR #42`; neutered -> rc=0, EMPTY stdout, and a
+#     report reading `examined=0 extracted=0 completed=0 tested=0`. That report is
+#     a FALSE CLEAN — a failure set that was never measured reads as "no
+#     failures". Nothing downstream catches it on this path.
+#   --diff on an unreadable file: neutered -> rc=0 with `sort: No such file` and a
+#     silently-computed comparison.
+#
+# Each assertion below therefore checks BOTH the exit status AND that nothing was
+# emitted — an empty stdout is precisely what reads as "no failures", so a
+# non-zero exit with a report still on it would not be enough.
+echo "== 5n. the CLI guards are fail-closed, not vacuous =="
+run_guard() {  # <label> <expect-rc> <stderr-substring|-> ; runs via cfs_run
+  label="$1"; want="$2"; needle="$3"
+  cfs_run $CFS_GUARD_ARGS
+  rc=$?
+  if [ "$want" = "usage" ]; then
+    [ "$rc" -eq 2 ] && pass "$label: usage refusal (exit 2)" \
+                    || fail "$label: expected a usage exit 2, got $rc"
+  else
+    [ "$rc" -ne 0 ] && pass "$label: fails closed (exit $rc)" \
+                    || fail "$label: expected a non-zero exit, got 0 — a FALSE CLEAN"
+  fi
+  if [ "$needle" != "-" ]; then
+    grep -q "$needle" "$TMP/cfs-err" && pass "$label: the refusal is named" \
+      || fail "$label: expected '$needle' on stderr"
+  fi
+  [ -s "$TMP/cfs-out" ] && fail "$label: emitted a failure set alongside the refusal" \
+                        || pass "$label: emitted NO failure set"
+}
+
+new_scen guard-pr-empty-head
+: > "$SCEN/head"                    # gh exits 0 with an EMPTY projection
+CFS_GUARD_ARGS='--pr 42'
+run_guard "--pr with an empty head" - "empty head"
+
+new_scen guard-pr-no-head
+# No `head` / `head-seq` fixture at all: the head resolution itself fails.
+CFS_GUARD_ARGS='--pr 42'
+run_guard "--pr whose head cannot be resolved" - "could not resolve head"
+
+new_scen guard-pr-no-runs
+printf 'feedface0000000000000000000000000000000000\n' > "$SCEN/head"
+: > "$SCEN/fail-run-list"            # `gh run list` fails
+CFS_GUARD_ARGS='--pr 42'
+run_guard "--pr whose run list fails" - "could not list runs"
+
+new_scen guard-usage
+CFS_GUARD_ARGS='--pr'
+run_guard "--pr with no number" usage '-'
+CFS_GUARD_ARGS='--commit'
+run_guard "--commit with no SHA" usage '-'
+
+new_scen guard-diff
+# BOTH `--diff` readability guards must be pinned SEPARATELY. A first attempt
+# passed a missing path as BOTH files, so the `diff_b` guard refused and the
+# `diff_a` guard was never reached — neutering `diff_a` left the suite green
+# (review-cycle-8 mutant G5 survived). Each call now gives the other side a
+# READABLE file, so exactly one guard can fire.
+printf 'tests/test_a.py::test_one\n' > "$TMP/gd-a.txt"
+printf 'tests/test_a.py::test_two\n' > "$TMP/gd-b.txt"
+CFS_GUARD_ARGS="--diff /nonexistent-zz-1482 $TMP/gd-b.txt"
+run_guard "--diff whose FIRST file is unreadable" - "cannot read"
+CFS_GUARD_ARGS="--diff $TMP/gd-a.txt /nonexistent-zz-1482"
+run_guard "--diff whose SECOND file is unreadable" - "cannot read"
+# `--diff` is the ONLY option that consumes THREE arguments (`shift 3`), so it is
+# the one place the same spin can survive a fix applied only to `shift 2` — which
+# is exactly what happened (review cycle 9): all nine `shift 2` sites were
+# converted and `--diff` alone still hung, with the `--diff needs two files` guard
+# below UNREACHABLE because the parser spun before the mode switch was ever
+# entered. The 5n cases above pass two files, so `shift 3` always succeeded and the
+# hang was invisible. Assert the two DANGLING forms too.
+CFS_GUARD_ARGS='--diff'
+run_guard "--diff with NO files" usage '-'
+CFS_GUARD_ARGS="--diff $TMP/gd-a.txt"
+run_guard "--diff with ONE file" usage '-'
+# The remaining parser-level and per-mode guards, enumerated rather than fixed
+# reactively: after TWO rounds of "the fix covered the sites the report named and
+# missed the one it did not", the mitigation is to walk the UNIVERSAL set. Every
+# `say_err`/`exit` in the CLI is listed here except the ones already driven above.
+CFS_GUARD_ARGS='--commit-rows'
+run_guard "--commit-rows with no SHA" usage '-'
+CFS_GUARD_ARGS='--totally-unknown-flag'
+run_guard "an unknown flag" usage '-'
+
+new_scen guard-commit-no-runs
+printf 'feedface0000000000000000000000000000000000\n' > "$SCEN/head"
+: > "$SCEN/fail-run-list"
+CFS_GUARD_ARGS='--commit feedface0000000000000000000000000000000000'
+run_guard "--commit whose run list fails" - "could not list runs"
+# `--commit` and `--commit-rows` carry BYTE-IDENTICAL run-list lines (both name
+# `$commit`), so a single mutation of that text hits both and looks like one
+# covered guard. Mutating them by line showed `--commit-rows`' copy was NOT
+# caught — it needs its own scenario.
+CFS_GUARD_ARGS='--commit-rows feedface0000000000000000000000000000000000'
+run_guard "--commit-rows whose run list fails" - "could not list runs"
+
+# `--help` is the ONE path that must exit 0 and print usage (not a refusal), so it
+# is asserted separately — sweeping it into a "fails closed" helper would have made
+# the helper lie about this case.
+new_scen guard-help
+cfs_run --help
+rc=$?
+[ "$rc" -eq 0 ] && pass "--help exits 0" || fail "--help expected exit 0, got $rc"
+grep -q 'usage:\|--main-union' "$TMP/cfs-out" && pass "--help prints the usage text" \
+  || fail "--help did not print usage"
+
 # ── 6. evidence structure ─────────────────────────────────────────────────
 echo "== 6. evidence structure (marker + counts + provenance) =="
 new_scen shape
@@ -960,7 +1524,8 @@ printf '%s\n' "$HEAD_SHAPE" > "$SCEN/head"
 lane_fail "$HEAD_SHAPE" 901 > "$SCEN/runs-$HEAD_SHAPE"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-901"
 # 3 main runs failing the SAME id with the SAME signature: enough for the decision
-# to measure a rate and exempt the PR's equal one (see main_red_n).
+# to measure MAIN; the PR's single run is below `min_runs`, so the exemption rides
+# the attribution path (#5250 — see main_red_n).
 main_red_n main6666 1001 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1
 if [ -f "$SCEN/comment" ]; then
@@ -982,7 +1547,7 @@ if [ -f "$SCEN/comment" ]; then
   n=$(grep -c 'tests/test_other.py::test_red_on_main' "$c" || true)
   [ "$n" -ge 2 ] && pass "both failing sets are listed verbatim ($n occurrences: PR set + main baseline)" \
     || fail "expected the failing test id in both sets, got $n — the auditable diff is not recorded"
-  grep -q 'all EXEMPT (measured on main with a matching signature and no worse rate)' "$c" \
+  grep -q 'all EXEMPT (id measured on main with a matching signature; rate compared where the PR sample was measurable)' "$c" \
     && pass "the PR-carried set is labelled as exempt-with-evidence" || fail "PR-set label missing"
   grep -q 'main baseline: 1 pre-existing failure(s), for comparison' "$c" \
     && pass "main's baseline set is listed for comparison" || fail "main baseline set missing"
@@ -1073,7 +1638,8 @@ log_failed "$SIB" > "$SCEN/log-2001"
 i=0
 while [ "$i" -lt 10 ]; do lane_fail main9999 "$((3000 + i))" >> "$SCEN/runs-main"; i=$((i + 1)); done
 # main, TEST LANE only: it fails the very sibling the PR is charged with, over
-# 3 tested runs so the decision can measure a rate (main_red_n).
+# 3 tested runs so MAIN is measurable; the PR's single run is below `min_runs`, so
+# the exemption rides the attribution path (#5250 — see main_red_n).
 main_red_n main8888 4001 3 "$SIB" > "$SCEN/runs-main.by-workflow.python-ci.yml"
 
 run_admin 42 --main-runs 10 --any-workflow >/dev/null 2>&1
@@ -1167,7 +1733,8 @@ printf '0' > "$SCEN/head-seq-count"
 lane_fail "$HEAD_HM" 7001 > "$SCEN/runs-$HEAD_HM"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7001"
 # The decision path must be CLEAN for this scenario to reach the head-move check:
-# main fails the SAME id over 3 tested runs, so the PR's equal rate is exempt.
+# main fails the SAME id over 3 tested runs, so the decision exempts the PR's
+# single-run failure on the attribution path (#5250).
 main_red_n main5555 7002 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
@@ -2100,8 +2667,9 @@ lane_fail "$HEAD_MM" 9301 > "$SCEN/runs-$HEAD_MM"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9301"
 # main's rate must be MEASURED (at or above the decision's min_runs floor) for
 # the PR failure to be exempted and the merge to be REACHED at all: the union
-# rail decides on a RATE, and a single main sample can never establish one
-# (fail-closed). Before the swap a mere presence in main's window sufficed.
+# rail cannot exempt without MAIN measured over enough runs, and a single main
+# sample can never establish one (fail-closed). Before the swap a mere presence
+# in main's window sufficed.
 main_red_n mainmm 9302 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
 run_admin 42 --main-runs 3 >/dev/null 2>&1
 if grep -q "pr merge 42 --admin --squash --match-head-commit $HEAD_MM" "$SCEN/calls"; then
@@ -4043,6 +4611,12 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — an empty reference certified a vacuous comparison"
 grep -q "ADMIN_MERGE_LANE_JOB_PREFIX" "$SCEN/err" && pass "…naming the knob for a differently-named lane" \
   || fail "the refusal does not name ADMIN_MERGE_LANE_JOB_PREFIX"
+# #4844: the refusal must also name the FAMILY that selected nothing, so the
+# operator can tell "jobs ran and none matched the prefix" from "no job list was
+# readable at all" — the two have different remedies and the old message
+# conflated them.
+grep -q "NONE is named 'test\*'" "$SCEN/err" && pass "…and names the FAMILY that selected nothing (not a stale reference)" \
+  || fail "the refusal does not distinguish a prefix mismatch from an empty reference"
 
 # (h) A LISTING FAILURE IS NOT "FEWER SHARDS". `lane_run_ids` swallowed gh's exit
 # status, so an auth/network failure produced an EMPTY listing — which read as
@@ -4194,6 +4768,32 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — a partial listing was read as 'main ran fewer shards'"
 grep -q "unparsable lane-run listing line" "$SCEN/err" && pass "…named as an UNPARSABLE listing line" \
   || fail "the partial-listing refusal is not named: $(head -2 "$SCEN/err")"
+# #4844: the guard is POLARITY-AWARE. This line is `completed`, so its missing id
+# WOULD have hidden shards — that half must keep refusing, and must SAY so, or a
+# future reader reads the skip (r4) as a hole in this guard.
+grep -q "not a named in-flight status" "$SCEN/err" \
+  && pass "…and the polarity is named: an unaddressable line that is NOT a named in-flight status is the one that refuses" \
+  || fail "the refusal does not name the polarity (only a named in-flight spelling may be skipped)"
+
+# (n2) THE SKIP IS AN ALLOW-LIST, NOT A DENY-LIST. Only a NAMED in-flight status
+# may be skipped: a spelling this rail has never seen is not evidence that nothing
+# settled — if that run HAD finished, its shards belong in the reference, and
+# skipping it would shrink it. The refusal must survive an unrecognised status,
+# or the id guard becomes a hole the moment GitHub renames a state (#1353: a
+# deny-list read an unseen spelling as non-red).
+new_scen vacuousunknownstatus
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9221 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainz000 9222
+  printf 'frobnicated\t-\t\n'
+} > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unaddressable run with an UNRECOGNISED status BLOCKS (exit $rc) — the skip is an allow-list" \
+  || fail "expected a non-zero exit, got 0 — an unknown status was skipped, so an unseen spelling could shrink the reference (fail-open)"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge ran although an unaddressable line could not be classified" \
+  || pass "…and no merge is attempted"
 
 # (o) THE FAMILY MUST MEASURE SOMETHING (#1319 cycle-2 P1). The prefix is a family
 # SELECTOR; `ADMIN_MERGE_LANE_JOB_PREFIX=changes` matches the workflow's
@@ -4254,6 +4854,226 @@ rc=$?
 [ "$rc" -eq 2 ] && pass "an UNBOUNDED --main-runs window is refused (exit 2)" \
   || fail "expected the startup refusal (exit 2), got $rc — an unbounded window is an unbounded call budget"
 grep -q "beyond the usable window" "$SCEN/err" && pass "…naming the bound" || fail "the window bound is not named"
+
+# ── (r) THE WINDOW IS SPENT ON MEASUREMENTS, NOT ON RAW RUNS (#4844) ────────
+# The lane-coverage gate read `--main-runs` RAW runs and consulted only the
+# completed ones, so a push burst (each push CANCELLING its predecessor) filled
+# the window with cancelled/queued runs and pushed the last usable reference OUT
+# of it. The gate then reported "no EXECUTED test shard matching 'test*'" — which
+# reads as a coverage gap in the PR and sends the reader after
+# ADMIN_MERGE_LANE_JOB_PREFIX — and refused every merge until main's lane settled.
+# A run that MEASURED NOTHING must not spend the operator's window: when a window
+# yields no executed shard at all, the listing widens (bounded) until one is
+# found. The scenarios below pin the widening, its bound, its fail-CLOSED
+# direction, and the polarity of the id guard that used to refuse a whole side
+# when a listing line carried no run id.
+
+# (r1) THE REPRODUCTION. Main's requested 3-run window is [completed-but-no-test-
+# shard, in flight, in flight]; the run that carries `test (a)` sits at position
+# 4. The PR ran `test (a)`. The OLD gate saw an empty reference and refused; the
+# widened gate reaches position 4, establishes parity and merges.
+new_scen vacuouswiden
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9101 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainw000 9102
+  lane_line in_progress - mainw000 9103
+  lane_line in_progress - mainw000 9104
+  lane_pass mainw000 9105
+} > "$SCEN/runs-main"
+lane_jobset 9102 success 'changes'
+lane_jobset 9105 success 'test (a)'
+run_admin_here 42 --main-runs 3 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a window of non-measuring runs no longer blocks — the reference WIDENS to a completed run (exit 0)" \
+  || fail "expected exit 0, got $rc — the reference is still unreachable from a window full of non-measuring runs (#4844)"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on the widened reference" \
+  || fail "no merge issued although the widened window carries a real reference"
+grep -q -- "--limit 3" "$SCEN/calls" && grep -q -- "--limit 6" "$SCEN/calls" \
+  && pass "…because the listing WIDENED (--limit 3 → --limit 6), not because the window was ignored" \
+  || fail "the reference was not reached by widening the listing: $(grep -c 'run list --branch main' "$SCEN/calls") main listing(s), none at --limit 6"
+grep -q "widened past non-measuring runs" "$SCEN/comment" \
+  && pass "…and the POSTED evidence DISCLOSES the widened window, so --main-runs describes what was READ" \
+  || fail "the evidence does not disclose that the reference came from a wider window than requested"
+# …and the disclosure must not cost the CERTIFICATE. The evidence gate
+# (verify-admin-merge-evidence.sh, run by the gh shim on `pr merge --admin`)
+# matches the `lane parity:` line to its END, so a disclosure appended there makes
+# the whole comment unmatchable: the rail would post valid evidence, have its own
+# merge refused, and retract it. A producer change the gate refuses while every
+# suite stays green is the #1388 drift class, so assert it with the REAL verifier.
+if bash "$ROOT/scripts/verify-admin-merge-evidence.sh" --body-file "$SCEN/comment" --head "$HEAD_VP" >/dev/null 2>&1; then
+  pass "…and the widened body is STILL a certifying certificate (the evidence verifier accepts it)"
+else
+  fail "the widened-reference disclosure makes the posted evidence unmatchable — the rail would refuse its own merge and retract its own certificate"
+fi
+
+# (r2) A SHARD MAIN EXECUTED ONLY IN THE WIDENED WINDOW IS STILL A REFERENCE.
+# Widening must make the gate STRICTER, never weaker: the reference grows, so a
+# PR that skipped a shard only the older run executed must BLOCK. Same fixture
+# shape as (r1), but the widened run carries `test (b)` and the PR does not.
+new_scen vacuouswidenbad
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9131 > "$SCEN/runs-$HEAD_VP"
+# The PR ran ONLY `test (a)` — `lane_pass`'s default job set includes `test (b)`,
+# which is exactly the shard the widened window introduces.
+lane_jobset 9131 success 'test (a)'
+{
+  lane_pass mainw100 9132
+  lane_line in_progress - mainw100 9133
+  lane_pass mainw100 9134
+} > "$SCEN/runs-main"
+lane_jobset 9132 success 'changes'
+lane_jobset 9134 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a shard main ran ONLY in the widened window is still a reference → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — widening WEAKENED the gate instead of extending the reference"
+grep -q "test (b)" "$SCEN/err" && pass "…and the widened-window shard is the one named as missing" \
+  || fail "the shard that exists only in the widened window is not reported"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a failed parity across the widened window" \
+  || pass "no merge attempted"
+
+# (r3) WIDENING IS BOUNDED. A window whose runs carry no measurable reference at
+# all — one completed run whose job list is empty, then a long tail of in-flight
+# runs — must refuse with a reason, not widen forever. The listing is capped at the
+# policy bound, and the refusal names the stale reference.
+new_scen vacuouswidenbound
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9141 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainwb00 9142
+  i=0
+  while [ "$i" -lt 260 ]; do
+    lane_line in_progress - mainwb00 $((9150 + i))
+    i=$((i + 1))
+  done
+} > "$SCEN/runs-main"
+lane_jobs 9142
+run_admin_here 42 --main-runs 5 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a window with no reference at all still REFUSES (exit $rc) — widening is bounded" \
+  || fail "expected a non-zero exit, got 0 — an empty reference was certified"
+grep -q -- "--limit 200" "$SCEN/calls" && pass "…and the widening STOPPED at the policy bound (--limit 200)" \
+  || fail "the widening did not reach the documented bound: $(grep -o -- '--limit [0-9]*' "$SCEN/calls" | sort -u | tr '\n' ' ')"
+grep -q "yielded NO EXECUTED job" "$SCEN/err" && pass "…refusing with the STALE-reference reason, not a parse error" \
+  || fail "the bounded refusal does not name the empty reference: $(head -3 "$SCEN/err")"
+
+# (r4) THE ID GUARD IS POLARITY-AWARE. A listing line that does not address a run
+# used to fail the WHOLE side. For a run that is still running there is nothing
+# settled to compare against, so refusing on it blocked every merge for a reason
+# unrelated to the PR — while reading its still-changing job list would block every
+# merge WHILE main's lane runs. An unaddressable run whose status is NOT a named
+# in-flight spelling still refuses (that half is pinned by (n)); the skip is an
+# ALLOW-list (#1353 polarity), never a deny-list.
+new_scen vacuousnonmeasid
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9111 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainn000 9112
+  printf 'in_progress\t-\t\n'
+} > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "an unaddressable NON-MEASURING line is skipped, not a whole-side refusal (exit 0)" \
+  || fail "expected exit 0, got $rc — a non-measuring run with no addressable id still blocks the side (#4844)"
+grep -q "unparsable lane-run listing line" "$SCEN/err" \
+  && fail "a non-measuring line was named as an unparsable listing" || pass "…and it is never named as an unparsable listing"
+grep -q "pr merge" "$SCEN/calls" && pass "…so the merge proceeds on the reference the window DID carry" \
+  || fail "no merge issued although main's completed run carries a real reference"
+# …and a window that needed NO widening must not CLAIM one: the disclosure is
+# decided on `${LANE_PARITY_MAIN_WINDOW} -gt ${MAIN_RUNS}`, and a false "widened"
+# in posted evidence is a lie the operator has no way to check. Of the widening
+# scenarios below, this is the one that certifies with a reference that FITS the
+# requested window.
+grep -q "reference window:" "$SCEN/comment" \
+  && fail "the certificate CLAIMS a widened reference although the requested window carried one" \
+  || pass "…and a reference that FIT the requested window is not disclosed as widened"
+
+# (r5) THE STALE REFERENCE IS NAMED AS STALE. Completed runs whose job lists are
+# empty (purged, zero-job, or no longer served) yield no shard — and the old
+# message read as a COVERAGE gap in the PR, pointing the operator at
+# ADMIN_MERGE_LANE_JOB_PREFIX. The refusal must say which side is missing and
+# that the PR is not the subject. `--main-runs 5` against a 2-run branch ALSO
+# pins the window the refusal states: the runs the gate could READ (2), never the
+# width it asked for (5), because that number is what the operator audits.
+new_scen vacuousstale
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9121 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainstale 9122 > "$SCEN/runs-main"
+lane_pass mainstale 9123 >> "$SCEN/runs-main"
+lane_jobs 9122
+lane_jobs 9123
+run_admin_here 42 --main-runs 5 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a completed reference carrying NO job at all still refuses (exit $rc) — fail-closed" \
+  || fail "expected a non-zero exit, got 0 — an empty reference was certified"
+grep -q "over a 2-run window" "$SCEN/err" && pass "…and the refusal STATES the window it READ (2 runs), not the 5 it asked for" \
+  || fail "the refusal does not state the window actually read: $(grep -o 'over a [0-9]*-run window' "$SCEN/err")"
+grep -q "yielded NO EXECUTED job" "$SCEN/err" && pass "…naming the condition as an empty reference" \
+  || fail "the refusal does not distinguish a stale reference from a non-matching family"
+grep -q "NOT a coverage gap in this PR" "$SCEN/err" \
+  && pass "…and says explicitly that the PR is not what is missing" \
+  || fail "the refusal still reads as a coverage gap in the PR"
+
+# (r6) A CANCELLED RUN IS `completed` AND MEASURED NOTHING. This is the shape a
+# push burst actually leaves — each push CANCELS its predecessor, so the window
+# fills with terminal runs whose conclusion is `cancelled`, not with `in_progress`
+# ones. Budgeting on run STATUS therefore still refused every merge: this 2-run
+# window holds one measured-but-shardless run (`changes`) and one CANCELLED run,
+# and charging the window for the cancelled one stops the search before the run
+# that actually carries a test shard. The budget counts runs that FINISHED a
+# measurement.
+new_scen vacuouscancelled
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9201 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainc000 9202
+  lane_line completed cancelled mainc000 9203
+  lane_line completed cancelled mainc000 9204
+  lane_pass mainc000 9205
+} > "$SCEN/runs-main"
+lane_jobset 9202 success 'changes'
+lane_jobs 9203
+lane_jobs 9204
+lane_jobset 9205 success 'test (a)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a run that measured nothing does not SPEND the window — the search reaches the measured one (exit 0)" \
+  || fail "expected exit 0, got $rc — a cancelled run still spends the window, so a push burst still blocks every merge (#4844)"
+grep -q -- "--limit 4" "$SCEN/calls" && pass "…by widening past the cancelled runs to the last MEASURED one" \
+  || fail "the window was not widened past the completed/cancelled runs"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on that reference" \
+  || fail "no merge issued although the widened window carries a real reference"
+
+# (r7) THE EMPTY-REFERENCE DIAGNOSIS SURVIVES WIDENING. The executed-job count is a
+# DISTINCT union over every pass, not per-pass state: a run consulted in an earlier
+# pass must neither be dropped (which would mis-report "no job list at all") nor
+# counted twice (two runs executing 'changes' is ONE name). The only executed jobs
+# live in the pass-1 run (9212: 'changes', 'lint') and the widened run (9214:
+# 'changes'), and none matches the family — so the refusal must name the FAMILY and
+# report TWO distinct names, which no per-pass or non-distinct count can produce.
+new_scen vacuousunionjobs
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9211 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainu000 9212
+  lane_line in_progress - mainu000 9213
+  lane_pass mainu000 9214
+} > "$SCEN/runs-main"
+lane_jobset 9212 success 'changes' 'lint'
+lane_jobset 9214 success 'changes'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a window that executed a job but no test shard still refuses (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — a family mismatch was certified"
+grep -q "NONE is named 'test\*'" "$SCEN/err" \
+  && pass "…naming the FAMILY mismatch, not an empty reference" \
+  || fail "the reference diagnosis names something other than the family mismatch: $(head -3 "$SCEN/err")"
+grep -q "executed 2 distinct job name(s)" "$SCEN/err" \
+  && pass "…counting every pass's jobs DISTINCTLY (pass 1's two names + the widened run's repeat = 2)" \
+  || fail "the executed-job count is not a distinct union over all passes: got '$(grep -o 'executed [0-9]* distinct' "$SCEN/err" | head -1)'"
+grep -q "yielded NO EXECUTED job" "$SCEN/err" \
+  && fail "the reference diagnosis must not claim no job executed when one did" || pass "…and never claims the window had no executable job list"
 
 # The parity key exists ONCE, in `lane_parity_check`, and it is not a second
 # `comm -23`: the one `comm` in this rail belongs to the parser's `--diff` (test
@@ -5275,10 +6095,10 @@ out="$(cat "$TMP/cfs-out")"
 grep -q "guard-steps=1" "$TMP/cfs-err" && pass "(a) …and REPORTS the attribution (guard-steps=1)" \
   || fail "(a) the attribution is silent: $(head -3 "$TMP/cfs-err")"
 
-# (b) THE RAIL: a guard-only failing head, with main red on the SAME guard at an
-# equivalent rate, is no longer REFUSED at step 1c — the comparison runs and the
-# exemption is recorded, so the merge proceeds. Main's orphan COUNT differs from
-# the PR's on purpose: the identity must survive the count moving.
+# (b) THE RAIL: a guard-only failing head, with main red on the SAME guard and the
+# PR's single run below `min_runs`, is no longer REFUSED at step 1c — the
+# attribution exemption (#5250) is recorded, so the merge proceeds. Main's orphan
+# COUNT differs from the PR's on purpose: the identity must survive the count moving.
 new_scen guardmerge
 printf '%s\n' "$HEAD_GP" > "$SCEN/head"
 lane_fail "$HEAD_GP" 9411 > "$SCEN/runs-$HEAD_GP"
@@ -6178,6 +6998,249 @@ rc=$?
 grep -q "actions/runs/9101" "$SCEN/calls" && fail "the shifted name field was read as the row's URL" \
   || pass "…and the forged URL was never read as the row's own"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted over a shifted check-run row" || pass "no merge attempted"
+
+# ── 66. #4078: A PARSER FLAG AFTER `--` IS NOT A `gh` FLAG ──────────────────
+# `--any-workflow` is the DOCUMENTED remedy for a trigger-split repo (#1003), and
+# the usage line prints it BEFORE `--`. Written in the most natural order —
+# `admin-merge.sh 42 -- --squash --any-workflow` — the old `--` branch swallowed
+# it into gh's argv: ANY_WORKFLOW stayed 0, the lane stayed `python-ci.yml`, and
+# the rail blocked with a remedy its own invocation could not have applied. The
+# FIRST line of this section is the reproduction: both orders must select the
+# SAME lane name, which is the only visible proof the flag was read. The headline
+# claims are: the orders are EQUIVALENT; the recovery is LOUD; an unrecognised
+# post-`--` token is REFUSED and never reaches gh; and the lane-block prints the
+# remedy in the order that works — plus the narrower pins (c)-(e7) below: a
+# RECOGNISED parser flag is refused too; BOTH repo selectors (`--repo` and gh's
+# short `-R`) are refused, so the merge cannot be desynchronised from the analysis
+# and its evidence; a valueless (or flag-valued) `--workflow` is refused rather
+# than silently widening the lane; a real `--workflow <file>` IS recovered;
+# legitimate gh flags still pass through; and a flag-spelled VALUE stays data.
+echo "== 66. #4078: a parser flag after '--' is recovered (or refused), never swallowed =="
+HEAD_AO="f6f6000000000000000000000000000000000000"
+
+# (a) EQUIVALENCE, both directions. The lane name is the discriminator: on the
+# OLD revision the AFTER run reports `lane: python-ci.yml` (the flag swallowed)
+# while the BEFORE run reports `lane: any workflow`.
+new_scen argorder-before
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 --any-workflow -- --squash >/dev/null 2>&1
+rc_before=$?
+before_err="$(cat "$SCEN/err")"
+before_calls="$(cat "$SCEN/calls")"
+
+new_scen argorder-after
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash --any-workflow >/dev/null 2>&1
+rc_after=$?
+after_err="$(cat "$SCEN/err")"
+after_calls="$(cat "$SCEN/calls")"
+
+grep -q "lane: any workflow" <<<"$before_err" \
+  && pass "(#4078) the BEFORE-'--' spelling selects the any-workflow lane" \
+  || fail "(#4078) the BEFORE-'--' spelling did not select any-workflow — the equivalence fixture is broken"
+grep -q "lane: any workflow" <<<"$after_err" \
+  && pass "(#4078) the AFTER-'--' spelling selects the SAME lane (recovered, not swallowed)" \
+  || { fail "(#4078) --any-workflow after '--' was swallowed — the lane stayed 'python-ci.yml'"; sed 's/^/      /' <<<"$after_err"; }
+[ "$rc_before" = "$rc_after" ] \
+  && pass "(#4078) both orders exit identically (exit $rc_before)" \
+  || fail "(#4078) the two orders diverge: before=$rc_before after=$rc_after"
+grep -q -- '--any-workflow' <<<"$after_calls" \
+  && fail "(#4078) the recovered flag still reached gh" \
+  || pass "(#4078) the recovered flag never reaches gh"
+
+# …and the recovery is LOUD — a silent recovery is the same class of defect as
+# the silent swallow, one level down.
+grep -q "found AFTER the '--' separator — recovering them for the parser" <<<"$after_err" \
+  && pass "(#4078) the recovery is announced on stderr" \
+  || fail "(#4078) the flag was recovered SILENTLY"
+grep -q "recovering them for the parser" <<<"$before_err" \
+  && fail "(#4078) the recovery warning fired for a flag written BEFORE '--'" \
+  || pass "(#4078) a correctly-placed flag produces no recovery warning"
+
+# (b) AC2 — an UNRECOGNISED post-`--` token is refused BY NAME, before any gh
+# call. `--squahs` is a typo for a real gh flag; the rail must not shrug and hand
+# it over (gh's error would arrive long after the parse, and a typo'd PARSER flag
+# would be dropped in silence, which is the defect this whole section is about).
+new_scen argorder-unknown
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash --squahs >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(#4078) an unknown post-'--' token is refused (exit 2)" \
+  || fail "(#4078) an unknown post-'--' token exited $rc, not 2 — it may have reached gh"
+grep -q "refusing '--squahs' after the '--' separator" "$SCEN/err" \
+  && pass "(#4078) the refusal names the offending token" \
+  || fail "(#4078) the refusal does not name the token"
+grep -q "BEFORE the separator" "$SCEN/err" \
+  && pass "(#4078) the refusal names the correct order" \
+  || fail "(#4078) the refusal does not name the correct order"
+[ -s "$SCEN/calls" ] && fail "(#4078) gh was called before the unknown flag was refused" \
+  || pass "(#4078) no gh call is made for a refused token"
+
+# (c) A KNOWN PARSER flag after `--` is refused by name too: `--repo` in
+# particular would silently point the MERGE at a different repo than the analysis.
+new_scen argorder-parserflag
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(#4078) a PARSER flag after '--' is refused (exit 2)" \
+  || fail "(#4078) '--dry-run' after '--' exited $rc, not 2"
+grep -q "refusing '--dry-run' after the '--' separator" "$SCEN/err" \
+  && pass "(#4078) …and the refusal names it as the parser's flag" \
+  || fail "(#4078) the parser-flag refusal does not name the flag"
+
+# (d) LEGITIMATE PASS-THROUGH IS NOT BROKEN. `--` still forwards real
+# `gh pr merge` flags; the run reaches the LANE BLOCK (exit 1), never a refusal
+# (exit 2), and nothing is reported as refused.
+new_scen argorder-legit
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash --delete-branch --auto >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && pass "(#4078) gh merge flags after '--' still pass through (exit $rc = the lane block)" \
+  || { fail "(#4078) legitimate passthrough was refused (exit $rc)"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "refusing" "$SCEN/err" && fail "(#4078) a real gh flag was reported as refused" \
+  || pass "(#4078) no real gh flag is refused"
+
+# (e) A VALUE that SPELLS a parser flag stays DATA. `--body --any-workflow` is a
+# merge body, not a lane selector: the value-taking flag consumes the next token
+# verbatim, so no recovery fires and no refusal is raised.
+new_scen argorder-value
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash --body --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 2 ] && pass "(#4078) a flag-spelled VALUE is not refused (exit $rc)" \
+  || { fail "(#4078) a value-taking flag did not consume its value"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "recovering them for the parser" "$SCEN/err" \
+  && fail "(#4078) a merge BODY was recovered as a parser flag" \
+  || pass "(#4078) a flag-spelled value is not recovered"
+
+# (e1) gh also carries a value INLINE. `--body=--any-workflow` is the same data as
+# the space-separated form: no recovery, and the whole token stays intact.
+new_scen argorder-inline-value
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash --body=--any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 2 ] && pass "(#4078) an INLINE flag value is not refused (exit $rc)" \
+  || { fail "(#4078) an inline value was refused"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "recovering them for the parser" "$SCEN/err" \
+  && fail "(#4078) an inline merge BODY was recovered as a parser flag" \
+  || pass "(#4078) an inline flag-spelled value is not recovered"
+
+# (e2) An inline BOOLEAN gh flag (`--squash=true`) is a real gh spelling and must
+# not fall into the unknown-token refusal.
+new_scen argorder-inline-bool
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash=true >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && pass "(#4078) an inline BOOLEAN gh flag passes through (exit $rc = the lane block)" \
+  || { fail "(#4078) '--squash=true' exited $rc, not 1 — an inline boolean was refused"; sed 's/^/      /' "$SCEN/err"; }
+
+# (e3) A token with no leading dash is not a flag at all, even when it contains
+# `=`: it is the second positional, which the rail refuses because the PR is
+# already supplied. (`=x` never reaches the NAME split — that split requires a
+# leading `-` — so this pins the BARE-POSITIONAL refusal, not an allow-list seam.)
+new_scen argorder-equals-bare
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash =x >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(#4078) a bare '=x' token is refused (exit 2) as a second positional" \
+  || fail "(#4078) a bare '=x' exited $rc, not 2 — a positional with '=' reached gh"
+
+# (e4) A lane selector with an INLINE value is not a spelling the parser has, and
+# recovering it would silently DROP the value — refuse instead.
+new_scen argorder-selector-inline
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --any-workflow=1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(#4078) '--any-workflow=1' is refused (exit 2) rather than silently dropping '=1'" \
+  || fail "(#4078) '--any-workflow=1' exited $rc, not 2"
+grep -q "takes no value" "$SCEN/err" \
+  && pass "(#4078) …and the refusal says the flag takes no value" \
+  || fail "(#4078) the inline selector refusal does not explain itself"
+
+# (e5) BOTH REPO SELECTORS are the parser's. `-R` is gh's short `--repo`; forwarded,
+# it points the MERGE at another repo while the analysis and the head-bound evidence
+# stay on this one — the exact divergence the long `--repo` is refused for. An alias
+# that defeats its own guard is the defect, so each spelling is refused by name,
+# with NO gh call.
+for sel in '--repo other/repo' '-R other/repo' '-R=other/repo'; do
+  new_scen "argorder-reposel-$(printf '%s' "$sel" | tr -cd '[:alnum:]')"
+  printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+  # shellcheck disable=SC2086 — the split into flag+value is the point of the case
+  run_admin_here 42 --main-runs 1 -- --squash $sel >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 2 ] && pass "(#4078) '$sel' after '--' is refused (exit 2)" \
+    || fail "(#4078) '$sel' after '--' exited $rc, not 2 — the merge could target another repo"
+  grep -q "refusing" "$SCEN/err" \
+    && pass "(#4078) …('$sel') and it is refused by name" \
+    || fail "(#4078) '$sel' was not refused by name"
+  [ -s "$SCEN/calls" ] && fail "(#4078) gh was called before '$sel' was refused" \
+    || pass "(#4078) …('$sel') with no gh call made"
+done
+
+# (e6) A VALUELESS `--workflow` after `--` must be REFUSED, not recovered as an
+# empty lane: an empty WORKFLOW is read as the --any-workflow opt-out, so defaulting
+# it silently WIDENS the certificate — this section's own defect, on the recovery
+# side. A flag AS the value is the same ambiguity.
+new_scen argorder-workflow-novalue
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(#4078) a valueless '--workflow' after '--' is refused (exit 2)" \
+  || fail "(#4078) a valueless '--workflow' exited $rc, not 2 — it recovered an empty lane"
+grep -q "recovering them for the parser" "$SCEN/err" \
+  && fail "(#4078) an empty --workflow was recovered as a lane request" \
+  || pass "(#4078) …and nothing was recovered for it"
+[ -s "$SCEN/calls" ] && fail "(#4078) gh was called before the valueless --workflow was refused" \
+  || pass "(#4078) …and no gh call was made"
+
+new_scen argorder-workflow-flagvalue
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --workflow --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(#4078) a FLAG as the --workflow value after '--' is refused (exit 2)" \
+  || fail "(#4078) '--workflow --any-workflow' exited $rc, not 2 — a flag became a lane name"
+grep -q "lane: any workflow" "$SCEN/err" \
+  && fail "(#4078) the swallowed flag was still applied as a lane request" \
+  || pass "(#4078) …and the flag was not silently applied as a lane"
+
+# (e7) …and the positive half: a `--workflow <file>` with a REAL value IS recovered
+# and applied, so (e6) is a value guard, not a removal of the recovery.
+new_scen argorder-workflow-value
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash --workflow other-lane.yml >/dev/null 2>&1
+grep -q "lane: other-lane.yml" "$SCEN/err" \
+  && pass "(#4078) a post-'--' '--workflow <file>' is recovered as a parser flag" \
+  || { fail "(#4078) a post-'--' '--workflow <file>' did not select its lane"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "recovering them for the parser" "$SCEN/err" \
+  && pass "(#4078) …and the --workflow recovery is announced, not silent" \
+  || fail "(#4078) the --workflow recovery was silent"
+
+# (f) AC3 — the MAIN-side lane block (the one that PRINTS the remedy) must print
+# it in the order that works. Fixture shape is section 28(b): head tested in the
+# lane, main never in it.
+new_scen argorder-remedy-main
+HEAD_RM="f7f7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_RM" > "$SCEN/head"
+lane_fail "$HEAD_RM" 8801 > "$SCEN/runs-$HEAD_RM"
+log_failed 'tests/test_new.py::test_new' > "$SCEN/log-8801"
+lane_fail mainbusy1 8802 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_main' > "$SCEN/log-8802"
+: > "$SCEN/runs-main.by-workflow.python-ci.yml"
+run_admin_here 42 --main-runs 10 --dry-run >/dev/null 2>&1
+grep -q "add --any-workflow BEFORE the -- separator" "$SCEN/err" \
+  && pass "(#4078) the lane block prints the remedy in the order that WORKS" \
+  || { fail "(#4078) the lane block still prints an order-dependent remedy"; sed 's/^/      /' "$SCEN/err"; }
+
+# (g) …and so must the HEAD-side lane block — the exact output the issue observed.
+new_scen argorder-remedy-head
+printf '%s\n' "$HEAD_AO" > "$SCEN/head"
+run_admin_here 42 --main-runs 1 -- --squash >/dev/null 2>&1
+grep -q "no run of the lane actually TESTED" "$SCEN/err" \
+  && pass "(#4078) the head-side block is the one under test" \
+  || fail "(#4078) the head-side block did not fire — fixture broken"
+grep -q "add --any-workflow BEFORE the -- separator" "$SCEN/err" \
+  && pass "(#4078) the head-side block names the remedy in the working order too" \
+  || fail "(#4078) the head-side block does not name a usable remedy"
 
 
 if [ "$failures" -gt 0 ]; then

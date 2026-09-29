@@ -414,27 +414,105 @@ list_lane_runs() {
 # A failing run whose failed-step log cannot be fetched is an EXTRACTION
 # FAILURE (exit 1), not an empty contribution: silently dropping it is exactly
 # the vacuous pass this rail exists to prevent.
+#
+# ⚠ THE ONE EXCEPTION, and why it does not weaken the rule (#1482). A run with
+# ZERO JOBS is not "an unreadable failure set" — it is an EMPTY one, by
+# construction: there were no steps, so there is no failure for a log to reveal.
+# `gh run view --log-failed` fails IDENTICALLY for that run and for a genuine
+# transport error (both exit 1), so the log fetch alone cannot tell them apart —
+# and treating the empty case as an extraction failure is what made the rail
+# unusable for EVERY merge. See `run_job_count` for the discrimination.
+#
+# Return: 0 = extracted (ids on stdout, possibly none) · 1 = FAIL CLOSED ·
+#         2 = the run has ZERO jobs and contributed NOTHING (not an error).
+# Callers MUST handle 2 explicitly: it is the only status meaning "this run
+# carried no evidence AND that is not a defect".
 extract_failed_tests() {
   local run_id="$1" log_file rc
   log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-  if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file"; return 1; fi
+  fetch_failed_log "$run_id" "$log_file"
+  rc=$?
+  case "$rc" in
+    0) ;;
+    2) rm -f "$log_file"; return 2 ;;
+    *) rm -f "$log_file"; return 1 ;;
+  esac
   failed_ids_from_log "$log_file"
   rc=$?
   rm -f "$log_file"
   return $rc
 }
 
+# run_job_count <run-id> → the run's job count on stdout; exit 1 when it cannot
+# be established (unknown repo, API failure, or a non-numeric answer).
+#
+# `gh api` has NO `--repo` flag — it resolves `{owner}/{repo}` from the CURRENT
+# DIRECTORY, which is the cross-repo false result of #4027 — so the path is
+# built from the RESOLVED slug taken from `--repo`. When that slug is absent the
+# count is NOT guessed: the helper fails, and the caller fail-closes exactly as
+# it did before this change.
+run_job_count() {
+  local run_id="$1" count slug
+  # Same slug resolution the rest of the rail uses (admin-merge.sh:900/961): the
+  # RESOLVED slug when --repo was given, else gh's own `{owner}/{repo}`
+  # placeholder, which gh resolves from the repository containing the CWD.
+  # Returning early here instead made the exemption INERT for the documented
+  # invocation (`admin-merge <PR> --squash`, no --repo), so the fleet-wide
+  # #1482 block persisted on exactly the path the fleet uses (review P1, cycle 2).
+  if [ -n "${repo:-}" ]; then slug="repos/$repo"; else slug="repos/{owner}/{repo}"; fi
+  count="$($GH api "$slug/actions/runs/${run_id}/jobs" --jq '.total_count' 2>/dev/null)" || return 1
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$count"
+}
+
 # fetch_failed_log <run-id> <out-file> — the RAW `gh run view --log-failed`
 # capture, for the callers that need the failure TEXT and not only the ids.
-# Same fail-closed rule as extract_failed_tests: a gh error is a FAILURE, never
-# an empty capture — an unreadable log must not read as "nothing failed" (#3705).
+#
+# Same fail-closed rule as extract_failed_tests: a transport error is a FAILURE,
+# never an empty capture — an unreadable log must not read as "nothing failed"
+# (#3705).
+#
+# Return: 0 = captured · 1 = FAIL CLOSED (unknowable) · 2 = ZERO-JOB run, which
+# contributes NOTHING and is not an error (the only non-zero status a caller may
+# treat as benign — see #1482).
+#
+# ⚠ ONE MESSAGE PER RUN, EMITTED AFTER the discrimination. Printing the refusal
+# first and then the exemption made the rail say "the failure set is UNKNOWABLE,
+# refusing" and "contributing an EMPTY set" about the SAME run — the exact
+# ambiguity #1482 exists to remove (review cycle 1, P2).
+#
+# The message also names WHICH failure this is. "gh error" used to be printed for
+# every non-zero exit, including `log not found`, pointing the reader at
+# auth/network for a run whose logs GitHub had simply pruned — so the natural
+# responses (re-auth, retry, wait out a rate limit) could not possibly work.
 fetch_failed_log() {
-  local run_id="$1" out="$2"
+  local run_id="$1" out="$2" err jobs
   # shellcheck disable=SC2086
-  if ! $GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed > "$out" 2>/dev/null; then
-    say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error) — refusing to read this as an empty failing set"
-    return 1
+  if err="$($GH run view "$run_id" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --log-failed 2>&1 > "$out")"; then
+    return 0
   fi
+  # Discriminate BEFORE fail-closing. Only a run that HAS jobs can be hiding a
+  # failure in an unreadable log; a run with none contributes nothing.
+  if jobs="$(run_job_count "$run_id")" && [ "$jobs" = "0" ]; then
+    say_err "ci-failure-set: · run $run_id has ZERO jobs — nothing could have failed; contributing NOTHING for it (not an extraction failure)"
+    return 2
+  fi
+  # THREE-WAY, because the count is not always PROVEN at this point. The old
+  # wording asserted "DOES have jobs" whenever the count was not exactly 0 —
+  # including when `run_job_count` FAILED, i.e. when nothing was established.
+  # Only a proven count may be stated as fact; an unknown one is named as
+  # unknown, which is also the reason the refusal stands.
+  case "${jobs:-}" in
+    '') jobs_note="could not be established (the jobs API did not answer)" ;;
+    *)  jobs_note="DID answer with $jobs job(s), so a failure could be hidden in it" ;;
+  esac
+  case "$err" in
+    *"log not found"*)
+      say_err "ci-failure-set: ✗ run $run_id has NO LOG (GitHub pruned it); its job count $jobs_note — the failure set is UNKNOWABLE, refusing to read this as an empty failing set" ;;
+    *)
+      say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error); its job count $jobs_note — refusing to read this as an empty failing set" ;;
+  esac
+  return 1
 }
 
 # failed_ids_from_log <log-file> → the ids, via THE canonical parser.
@@ -501,7 +579,7 @@ extract_failed_signatures() {
 # provenance/counts when requested. Returns 1 on extraction failure.
 collect_union() {
   local lane_file="$1" provenance="$2" report="$3"
-  local tmp_set="" examined=0 extracted=0 completed=0 tested=0 pending=0 run_id line
+  local tmp_set="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
   tmp_set="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_set"
   # The provenance file must exist even when NOTHING failed — callers build the
@@ -516,6 +594,7 @@ collect_union() {
     conclusion="${rest%%$'\t'*}"
     runref="${rest#*$'\t'}"
     run_id="${runref##*:}"
+    credited=0
     # Completion is counted for EVERY run, failures included: a queued run is
     # exactly what a failures-only listing cannot see.
     if [ "$status" = "completed" ]; then
@@ -524,7 +603,7 @@ collect_union() {
       # running the suite, so they must not count toward "this revision was
       # tested" (review P1, cycle 2).
       case "$conclusion" in
-        success|failure|timed_out) tested=$((tested + 1)) ;;
+        success|failure|timed_out) tested=$((tested + 1)); credited=1 ;;
       esac
     else
       pending=$((pending + 1))
@@ -535,8 +614,18 @@ collect_union() {
     esac
     examined=$((examined + 1))
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
-    local one
-    one="$(extract_failed_tests "$run_id")" || { rm -f "$tmp_set"; return 1; }
+    local one rc
+    one="$(extract_failed_tests "$run_id")"
+    rc=$?
+    case "$rc" in
+      0) ;;
+      # #1482: a zero-job run was counted as `tested` by the completion block
+      # above, but it exercised NOTHING. `tested` is documented as "every run
+      # that actually exercised the revision" and is the main-side gate's signal,
+      # so the credit is taken back rather than left to dilute the rate table.
+      2) [ "$credited" = "1" ] && tested=$((tested - 1)); continue ;;
+      *) rm -f "$tmp_set"; return 1 ;;
+    esac
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_set"
@@ -562,7 +651,7 @@ collect_union() {
 # baseline must never read as "no failures".
 collect_union_rates() {
   local lane_file="$1" provenance="$2" report="$3"
-  local tmp_all="" examined=0 extracted=0 completed=0 tested=0 pending=0 run_id line
+  local tmp_all="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
   tmp_all="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_all"
   [ -n "$provenance" ] && : > "$provenance"
@@ -574,10 +663,11 @@ collect_union_rates() {
     conclusion="${rest%%$'\t'*}"
     runref="${rest#*$'\t'}"
     run_id="${runref##*:}"
+    credited=0
     if [ "$status" = "completed" ]; then
       completed=$((completed + 1))
       case "$conclusion" in
-        success|failure|timed_out) tested=$((tested + 1)) ;;
+        success|failure|timed_out) tested=$((tested + 1)); credited=1 ;;
       esac
     else
       pending=$((pending + 1))
@@ -588,8 +678,14 @@ collect_union_rates() {
     esac
     examined=$((examined + 1))
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
-    local one
-    one="$(extract_failed_tests "$run_id")" || { rm -f "$tmp_all"; return 1; }
+    local one rc
+    one="$(extract_failed_tests "$run_id")"
+    rc=$?
+    case "$rc" in
+      0) ;;
+      2) [ "$credited" = "1" ] && tested=$((tested - 1)); continue ;;
+      *) rm -f "$tmp_all"; return 1 ;;
+    esac
     if [ -n "$one" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$one" >> "$tmp_all"
@@ -614,7 +710,7 @@ collect_union_rates() {
 # failure returns 1, and nothing is emitted when no run exercised the suite.
 collect_union_signatures() {
   local lane_file="$1" provenance="$2" report="$3"
-  local tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 run_id line
+  local tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
   tmp_sigs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_sigs"
   [ -n "$provenance" ] && : > "$provenance"
@@ -626,9 +722,10 @@ collect_union_signatures() {
     conclusion="${rest%%$'\t'*}"
     runref="${rest#*$'\t'}"
     run_id="${runref##*:}"
+    credited=0
     if [ "$status" = "completed" ]; then
       completed=$((completed + 1))
-      case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)) ;; esac
+      case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)); credited=1 ;; esac
     else
       pending=$((pending + 1))
     fi
@@ -636,7 +733,18 @@ collect_union_signatures() {
     examined=$((examined + 1))
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
     log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-    if ! fetch_failed_log "$run_id" "$log_file"; then rm -f "$log_file" "$tmp_sigs"; return 1; fi
+    fetch_failed_log "$run_id" "$log_file"
+    local frc=$?
+    if [ "$frc" -eq 2 ]; then
+      # Zero-job run: contributes no ids AND no signature, and must not be
+      # credited as having exercised the suite (#1482).
+      [ "$credited" = "1" ] && tested=$((tested - 1))
+      rm -f "$log_file"
+      continue
+    fi
+    if [ "$frc" -ne 0 ]; then
+      rm -f "$log_file" "$tmp_sigs"; return 1
+    fi
     # A failing run with NO failure identity contributes nothing to either table
     # (no `FAILED <nodeid>` line AND no attributable guard-step annotation, #4469).
     # Skip the extractor for it: the `signatures` CLI exits 1 on a capture that
@@ -672,7 +780,7 @@ collect_union_signatures() {
 # `--per-run` writes the per-run id sets detect_rotating_identity() consumes.
 collect_union_rows() {
   local lane_file="$1" provenance="$2" report="$3" per_run="$4"
-  local tmp_ids="" tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 run_id line
+  local tmp_ids="" tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
   tmp_ids="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   tmp_sigs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_ids"; : > "$tmp_sigs"
@@ -686,9 +794,10 @@ collect_union_rows() {
     conclusion="${rest%%$'\t'*}"
     runref="${rest#*$'\t'}"
     run_id="${runref##*:}"
+    credited=0
     if [ "$status" = "completed" ]; then
       completed=$((completed + 1))
-      case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)) ;; esac
+      case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)); credited=1 ;; esac
     else
       pending=$((pending + 1))
     fi
@@ -696,7 +805,18 @@ collect_union_rows() {
     examined=$((examined + 1))
     printf '%s\n' "$runref" >> "${provenance:-/dev/null}"
     log_file="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
-    if ! fetch_failed_log "$run_id" "$log_file"; then
+    fetch_failed_log "$run_id" "$log_file"
+    local frc=$?
+    if [ "$frc" -eq 2 ]; then
+      # Zero-job run: contributes nothing (#1482). `examined` has already
+      # advanced without `extracted`, so on the PR side the `examined >
+      # extracted` gate in admin-merge.sh still refuses this run — the PR side
+      # stays fail-closed by construction, which is deliberate.
+      [ "$credited" = "1" ] && tested=$((tested - 1))
+      rm -f "$log_file"
+      continue
+    fi
+    if [ "$frc" -ne 0 ]; then
       rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1
     fi
     ids="$(failed_ids_from_log "$log_file")" || { rm -f "$log_file" "$tmp_ids" "$tmp_sigs"; return 1; }
@@ -754,8 +874,8 @@ main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --pr) mode="pr"; pr="${2:-}"; shift 2 ;;
-      --commit) mode="commit"; commit="${2:-}"; shift 2 ;;
+      --pr) mode="pr"; pr="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --commit) mode="commit"; commit="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --main-union)
         mode="main-union"
         if [ $# -ge 2 ] && [ -n "${2:-}" ] && [ -z "${2##[0-9]*}" ]; then
@@ -777,15 +897,15 @@ main() {
         else
           shift 1
         fi ;;
-      --commit-rows) mode="commit-rows"; commit="${2:-}"; shift 2 ;;
-      --per-run) per_run="${2:-}"; shift 2 ;;
-      --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 ;;
-      --exclude) exclude="${2:-}"; shift 2 ;;
-      --repo) repo="${2:-}"; shift 2 ;;
-      --workflow) workflow="${2:-}"; shift 2 ;;
+      --commit-rows) mode="commit-rows"; commit="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --per-run) per_run="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 2>/dev/null || shift $# ;;
+      --exclude) exclude="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --repo) repo="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --workflow) workflow="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --any-workflow) any_workflow=1; shift ;;
-      --provenance) provenance="${2:-}"; shift 2 ;;
-      --runs-report) report="${2:-}"; shift 2 ;;
+      --provenance) provenance="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --runs-report) report="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --help|-h) usage; exit 0 ;;
       *) say_err "ci-failure-set: unknown argument '$1'"; usage >&2; exit 2 ;;
     esac

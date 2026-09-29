@@ -25,9 +25,11 @@
 #                    UNATTRIBUTABLE: it is neither PR-unique nor exempt (#3756 E5).
 #   residual       ← the EXEMPTION DECISION (scripts/ci_exemption.py decide):
 #                    an id is EXEMPT only when it was measured on main over
-#                    enough runs WITH a matching signature and the PR's failure
-#                    RATE is not materially higher. The residual is the
-#                    decision's BLOCKED ∪ UNATTRIBUTABLE set.
+#                    enough runs WITH a matching signature, and either the PR's
+#                    failure RATE is not materially higher or the PR sample was
+#                    below min_runs (rate not measurable — exempt on the
+#                    attribution evidence alone, stated in the EXEMPT line).
+#                    The residual is the decision's BLOCKED ∪ UNATTRIBUTABLE set.
 #   residual EMPTY          → post head-bound evidence, then merge
 #   residual NON-EMPTY      → re-run the PR's failed jobs ONCE; anything the
 #                             decision then finds EXEMPT is flaky, not new
@@ -40,8 +42,10 @@
 # `unique = pr-fails − union(main's failing ids over N runs)`. An id that
 # appeared even ONCE in main's window was subtracted FOREVER, so a PR that
 # genuinely BROKE it was EXCUSED and the gate reported GREEN — the more main
-# flaked, the less the gate checked. Presence is never sufficient; only a
-# measured RATE on both trees is. The module that makes that decision ships WITH
+# flaked, the less the gate checked. Presence is never sufficient: main's row must
+# be measured over `min_runs` WITH a matching signature, and the PR rate compared
+# where it is measurable — below that the exemption rests on that same attribution
+# evidence (#5250). The module that makes that decision ships WITH
 # THE RAIL (`scripts/ci_exemption.py`, next to this script) and is deliberately
 # never read from the repo being merged: a grader drawn from the graded system
 # is a bypass.
@@ -327,7 +331,7 @@
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
 #                              [--workflow <file|name>] [--any-workflow]
 #                              [--no-rerun] [--rerun-timeout S] [--dry-run]
-#                              [-- <extra gh pr merge flags>]
+#                              [-- <gh pr merge flags>]
 #
 #   --main-runs N        union over main's last N runs (default 10 — see the
 #                        #3469 trap in ci-failure-set.sh; a single run is not a
@@ -335,13 +339,37 @@
 #                        Jobs API call, and an unbounded window turns a
 #                        correctness knob into a cost one. A non-numeric or
 #                        non-positive N is refused before any CI work.
+#                        For the LANE-COVERAGE gate the window counts MEASUREMENTS,
+#                        never raw positions (#4844): a push burst that cancels its
+#                        own predecessors leaves terminal-but-unmeasured
+#                        (`completed/cancelled`) runs, which used to fill the window
+#                        and push the last measured run out of it — refusing every
+#                        merge on a condition unrelated to the PR. The gate widens
+#                        the raw listing past those runs (doubling, bounded by 200)
+#                        while a window has yielded no executed shard at all, and
+#                        stops once N runs that FINISHED a measurement are consulted.
+#                        So N is the widening's STOPPING RULE, not a bound on
+#                        what one pass reads or on the call budget: a widened pass
+#                        reads its whole listing (at most 200 lane runs per side,
+#                        one Jobs-API call each), and the posted evidence says when
+#                        the reference came from a wider window than N.
 #   --workflow <f>       the TEST lane both sides are read from (default
 #                        `python-ci.yml`). NOT cosmetic: an unfiltered main
 #                        window is dominated by cron/watchdog lanes and can
 #                        contain ZERO test runs, so the baseline extracts EMPTY
 #                        and every PR failure reads as new — the bogus zero. See
 #                        THE BOGUS ZERO in ci-failure-set.sh.
-#   --any-workflow       drop the lane filter (opt-out; re-opens the bogus zero)
+#   --any-workflow       drop the lane filter (opt-out; re-opens the bogus zero).
+#                        Written AFTER the `--` separator it is RECOVERED for the
+#                        parser (loudly) rather than handed to gh — but the natural
+#                        order is: parser flags BEFORE `--`, gh flags after (#4078).
+#                        After `--` an argument is NOT a free-form tail: it must be
+#                        one of `gh pr merge`'s own flags (or a value one of them
+#                        consumes). An unrecognised token, a bare positional, or one
+#                        of THIS parser's flags is refused by name before any gh
+#                        call. (`--workflow` is recovered the same way, but it needs
+#                        a real value — a missing one, or a flag as the value, is
+#                        refused rather than silently widening the lane.)
 #   --rerun-timeout S    bound (seconds) on the RE-RUN wait — the wait for a
 #                        re-run run to finish. This is an EXPLICIT override;
 #                        when absent the bound is DERIVED at rail runtime from a
@@ -379,10 +407,18 @@
 #                        reports and exits 0 (it is an inspection, not a verdict;
 #                        a real run would re-run and re-classify). Add --no-rerun
 #                        to get the no-reclassification verdict as the exit code.
-#   --repo owner/repo    repo for the gh calls
+#   --repo owner/repo    repo for the gh calls. This is the ONLY way to select a
+#                        repo: `--repo` and its short `-R` after the `--` separator
+#                        are refused by name, because a forwarded repo selector
+#                        points the MERGE at a different repo than the analysis and
+#                        the head-bound evidence — which stay on the original one.
 #   Extra flags (`--squash`, `--merge`, `--rebase`, `--delete-branch`, `--auto`,
-#   …) are passed through to `gh pr merge` rather than hardcoded. `--admin` is
-#   always added by this script; a caller-supplied `--admin` is dropped.
+#   …) are passed through to `gh pr merge` rather than hardcoded — but after `--`
+#   the pass-through is an ALLOW-LIST of `gh pr merge`'s own flags, not a free-form
+#   tail, and an unrecognised token exits 2 (a new gh flag needs adding here). It
+#   is names, not spellings: a COMBINED shorthand like `-sd` is refused, so write
+#   `-s -d`. `--admin` is always added by this script; a caller-supplied `--admin`
+#   is dropped.
 #
 #   MERGE METHOD DEFAULT. `gh pr merge` REQUIRES exactly one of
 #   `--merge`/`--rebase`/`--squash` when it is NOT interactive; with none it
@@ -737,9 +773,10 @@ POLL_INTERVAL_MAX=3600
 # MAIN_RUNS_MAX — the largest `--main-runs` window. A POLICY bound like
 # POLL_INTERVAL_MAX, and for a cost reason, not a correctness one: the #3469
 # union is already saturated long before this, while the lane-coverage gate
-# fetches ONE Jobs API listing per run on EACH side, so the window is also the
-# gate's call budget. 200 runs is far beyond any baseline that would change a
-# verdict.
+# fetches ONE Jobs API listing per run on EACH side — so this is also that gate's
+# CALL budget, since a burst of terminal-but-unmeasured runs can push its search
+# for a reference past `--main-runs` (#4844). 200 runs is far beyond any baseline
+# that would change a verdict.
 MAIN_RUNS_MAX=200
 
 # validate_timing_knobs — REFUSE a timing knob that is not a positive integer.
@@ -1052,6 +1089,19 @@ GREEN_RUNS="${ADMIN_MERGE_GREEN_RUNS:-5}"
 #     fail-open (a shard present only in an older run vanished from the
 #     reference), so there is no independent sampling cap any more — instead the
 #     window itself is BOUNDED and validated (--main-runs, $MAIN_RUNS_MAX).
+#     The window counts MEASUREMENTS, not raw positions (#4844): a run that did not
+#     finish a measurement does not SPEND the window. A push burst cancels its own
+#     predecessors, and a cancelled run is `completed` — terminal, but measured
+#     nothing; charging the window for it pushed the last usable reference out of
+#     a window the operator asked for. It is still CONSULTED (a cancelled run may
+#     have executed shards before it was cancelled, and dropping those would SHRINK
+#     the reference — the #1319 fail-open). When a window yields no executed shard
+#     at all the listing widens past those runs (bounded by $MAIN_RUNS_MAX), and the
+#     evidence SAYS SO — a reference drawn from a wider window than requested is
+#     disclosed, never implied. DECLARED RESIDUAL: a run still IN FLIGHT is not
+#     consulted, so a shard such a run has ALREADY executed is unobserved until it
+#     concludes. Consulting a still-changing job list instead would make main's
+#     mid-flight lane block every merge — the failure this change removes.
 #   * the family must actually MEASURE something. A prefix is a family selector,
 #     not a family EXCLUDER: `ADMIN_MERGE_LANE_JOB_PREFIX=c` matches `changes`
 #     and would compare the workflow's bookkeeping while main's `test-slow (a)`
@@ -1131,7 +1181,8 @@ lane_count() {
   printf '%s' "${n:-0}"
 }
 
-# lane_shards <run-id> — the TEST shards this run EXECUTED, one name per line.
+# lane_shards <run-id> <all-names-out> — the TEST shards this run EXECUTED, one
+# name per line on stdout.
 #   * TEST shard: the job name (caller prefix stripped) begins with
 #     $LANE_JOB_PREFIX. The workflow's bookkeeping/gate jobs (`changes`,
 #     `manifest-integrity`, `python-ci-gate`, `surface-guard`, `canary-streak`, …)
@@ -1146,8 +1197,16 @@ lane_count() {
 # the empty pattern under `grep -xF` — i.e. it turns "nothing was observed" into
 # "no difference". Returns 1 when the job list cannot be READ (gh error, empty,
 # unparsable): an unreadable shard list is NEVER an empty one.
+#
+# EVERY executed job name it saw is APPENDED to <all-names-out>, PREFIX-AGNOSTIC
+# (a job the family filter excluded is still recorded). That union is what lets
+# an empty reference say WHY it is empty (#4844): a window whose runs carry no
+# executed job at all (purged, zero-job, not yet served) is a different
+# condition, with a different remedy, from one whose jobs simply are not named
+# `test*` — and the two sets alone cannot tell them apart. Passing `/dev/null`
+# disables the record.
 lane_shards() {
-  local run_id="$1" json_file out rc=0
+  local run_id="$1" allnames="${2:-/dev/null}" json_file out rc=0
   json_file="$(mktemp "${TMPDIR:-/tmp}/admin-merge-lane.XXXXXX")"
   if ! fetch_run_jobs "$run_id" > "$json_file" 2>/dev/null || [ ! -s "$json_file" ]; then
     rm -f "$json_file"
@@ -1155,7 +1214,7 @@ lane_shards() {
   fi
   # shellcheck disable=SC2016
   out="$("$PYTHON_BIN" -c 'import json, sys
-path, prefix = sys.argv[1], sys.argv[2]
+path, prefix, allpath = sys.argv[1], sys.argv[2], sys.argv[3]
 raw = open(path, "r", encoding="utf-8", errors="replace").read()
 dec, i, docs = json.JSONDecoder(), 0, []
 while i < len(raw):
@@ -1170,6 +1229,7 @@ while i < len(raw):
     docs.append(obj)
 saw = False
 names = set()
+allnames = set()
 for d in docs:
     if not isinstance(d, dict) or not isinstance(d.get("jobs"), list):
         continue
@@ -1182,14 +1242,20 @@ for d in docs:
         n = (j.get("name") or "").strip()
         if " / " in n:
             n = n.rsplit(" / ", 1)[1].strip()
+        if n:
+            allnames.add(n)
         if prefix and not n.startswith(prefix):
             continue
         if n:
             names.add(n)
 if not saw:
     raise SystemExit(2)
+if allpath != "/dev/null":
+    with open(allpath, "a", encoding="utf-8") as fh:
+        for n in sorted(allnames):
+            fh.write(n + "\n")
 for n in sorted(names):
-    print(n)' "$json_file" "$LANE_JOB_PREFIX")" || rc=$?
+    print(n)' "$json_file" "$LANE_JOB_PREFIX" "$allnames")" || rc=$?
   rm -f "$json_file"
   [ "$rc" -eq 0 ] || return 1
   [ -n "$out" ] || return 0
@@ -1197,51 +1263,174 @@ for n in sorted(names):
   return 0
 }
 
+# The two run-state predicates the pairing below turns on. They are DIFFERENT
+# questions and the gate needs both (#4844):
+#
+#   lane_run_in_flight — is this run still RUNNING? Only a NAMED in-flight
+#     spelling counts (see the allow-list note below). An in-flight run cannot
+#     spend the window and is not consulted — its job list is still changing, so
+#     the lane's shard set is not settled (the declared residual above).
+#
+#   lane_run_measured — did this run FINISH a measurement? A `completed` run may
+#     still be `cancelled`, `skipped`, `stale`, `neutral` or `startup_failure`;
+#     those measured nothing, and a push burst leaves a window FULL of them (each
+#     push cancels its predecessor, and a cancelled run is `completed`). This is
+#     what spends the operator's `--main-runs` window. It is the parser's own
+#     vocabulary (`success|failure|timed_out` credit `tested`), not a new one.
+#
+# CONSULTING and SPENDING are therefore separate: a cancelled run is still
+# consulted (it may have executed shards before it was cancelled, and dropping
+# those would SHRINK the reference — the #1319 fail-open), but it does not spend
+# the window.
+#
+# A NON-FINISHED RUN IS TRUSTED TO BE IN FLIGHT ONLY FOR A NAMED SPELLING. The
+# polarity is an ALLOW-list, the same one the check-run surface uses (#1353: as a
+# deny-list, a spelling the rail had never seen read as non-red there). "Not a
+# known in-flight status" is NOT evidence that nothing settled: if the run HAD
+# finished, its shards belong in the reference, and skipping it would SHRINK it.
+# An unknown status is therefore CONSULTED when its line addresses a run id, and
+# REFUSED when it does not — never silently skipped.
+IN_FLIGHT_RUN_STATUS=" queued in_progress waiting requested pending "
+lane_run_in_flight() {
+  case "$IN_FLIGHT_RUN_STATUS" in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+lane_run_measured() {
+  [ "$1" = "completed" ] || return 1
+  case "$2" in success|failure|timed_out) return 0 ;; *) return 1 ;; esac
+}
+
 # lane_shard_set <flag> <value> <list-limit> <out-file> — the union of EXECUTED
 # test shards across the side's lane runs, for the SAME window the operator's
-# comparison uses. Only COMPLETED runs are consulted (a queued run has no job
-# list). There is deliberately NO independent sampling cap: sampling fewer runs
-# than the window the baseline was drawn from lets a shard main executed go
-# unobserved and certifies a PR that skipped it (cycle-1 review, reproduced).
-# A run whose jobs cannot be read — or a run LISTING that fails — makes the WHOLE
-# side unreadable (return 1): partial coverage silently read as full is the
-# fail-open this gate prevents. No name is written for an empty shard set.
+# comparison uses. There is deliberately NO independent sampling cap: sampling
+# fewer runs than the window the baseline was drawn from lets a shard main
+# executed go unobserved and certifies a PR that skipped it (cycle-1 review,
+# reproduced). A run whose jobs cannot be read — or a run LISTING that fails —
+# makes the WHOLE side unreadable (return 1): partial coverage silently read as
+# full is the fail-open this gate prevents. No name is written for an empty
+# shard set.
+#
+# #4844 — the window is spent on MEASUREMENTS, not on raw positions.
+#
+#   * The id guard failed the WHOLE side for a line whose run could not be
+#     addressed — including a run that had not finished. Refusing on a
+#     not-yet-finished run blocked every merge for a reason unrelated to the PR,
+#     and reading its still-changing job list instead would block every merge
+#     while main's lane runs (the declared residual above). So the guard is now
+#     POLARITY-AWARE: an unaddressable run that is NOT a named in-flight spelling
+#     is a hard refusal (it may well be finished, and its shards would then be
+#     lost); an unaddressable named-in-flight one is skipped and counted.
+#   * `--limit` named a RAW window, so a push burst — each push cancelling its
+#     predecessor, leaving `completed/cancelled` runs that are terminal but
+#     MEASURED NOTHING — filled it and pushed the last usable reference OUT of
+#     it. The gate then refused every PR, naming a shard family when the missing
+#     thing was the reference. Now a run spends the window only if it FINISHED a
+#     measurement; when a window yields no executed shard at all the listing
+#     WIDENS (doubling, bounded by $MAIN_RUNS_MAX) until one appears, the history
+#     is exhausted, or the bound is reached. The ordinary path is unchanged —
+#     widening happens only where the old code refused.
+#
+# The Jobs-API cost does NOT track the operator's window on the widening path,
+# and that is a deliberate trade. `--main-runs` is the widening's STOPPING RULE
+# (it widens while fewer than $limit runs that FINISHED a measurement have been
+# counted), not a bound on what one pass reads: a widened pass consults its whole
+# listing, so both the runs read and the measured runs counted can exceed $limit —
+# bounded by $MAIN_RUNS_MAX per side, which is the call budget, because every
+# CONSULTED run costs one job-list read. Reading each one is the only way to learn
+# that a terminal run measured nothing — refusing instead is the bug this fixes
+# (#4844). The LANE_SET_* globals report what the window actually held, so a
+# refusal can name the condition it found rather than a neighbouring one.
 lane_shard_set() {
   local flag="$1" value="$2" limit="$3" out="$4"
-  local listing="$TMP/lane-runs.tmp" status conclusion id rc=0 listed parsed=0
+  local listing="$TMP/lane-runs.tmp" shards="$TMP/lane-shards.tmp"
+  local consulted="$TMP/lane-consulted.tmp" allnames="$out.alljobs"
+  local status conclusion id rc=0 listed parsed=0
+  local raw="$limit" consulted_n=0 measured=0 nonmeas=0
   : > "$out"
-  if ! lane_run_ids "$flag" "$value" "$limit" > "$listing"; then
-    say_err "admin-merge: ✗ could not list the lane runs for $flag $value — lane coverage unverifiable"
-    return 1
-  fi
-  # EVERY non-blank line of the listing must address a run. A listing that is
-  # only PARTLY readable is unreadable, not a thinner lane (cycle-2 P1): a line
-  # that does not parse into a run id used to be `continue`d away, which quietly
-  # SHRANK the reference set — so a truncated listing read as "main ran fewer
-  # shards" and the gate certified on it. The `|| [ -n "$status" ]` also keeps a
-  # FINAL line with no trailing newline in scope instead of dropping it.
-  listed="$(grep -c '[^[:space:]]' "$listing" 2>/dev/null || true)"; listed="${listed:-0}"
-  while IFS=$'\t' read -r status conclusion id || [ -n "${status:-}" ]; do
-    [ -n "$status" ] || continue
-    id="${id##*:}"
-    if [ -z "$id" ]; then
-      say_err "admin-merge: ✗ unparsable lane-run listing line ('${status}') for $flag $value — lane coverage unverifiable"
+  : > "$consulted"
+  : > "$allnames"
+  LANE_SET_LISTED=0; LANE_SET_WINDOW="$limit"; LANE_SET_CONSULTED=0
+  LANE_SET_MEASURED=0; LANE_SET_NONMEASURING=0; LANE_SET_JOBS=0
+  while :; do
+    if ! lane_run_ids "$flag" "$value" "$raw" > "$listing"; then
+      say_err "admin-merge: ✗ could not list the lane runs for $flag $value — lane coverage unverifiable"
       return 1
     fi
-    parsed=$((parsed + 1))
-    [ "$status" = "completed" ] || continue
-    rc=0
-    lane_shards "$id" > "$TMP/lane-shards.tmp" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-      say_err "admin-merge: ✗ could not read the job list of lane run $id — lane coverage unverifiable"
+    # EVERY non-blank line of the listing must be ACCOUNTED FOR. A listing that is
+    # only PARTLY readable is unreadable, not a thinner lane (cycle-2 P1): a line
+    # that does not parse into a run id used to be `continue`d away, which quietly
+    # SHRANK the reference set — so a truncated listing read as "main ran fewer
+    # shards" and the gate certified on it. The `|| [ -n "$status" ]` also keeps a
+    # FINAL line with no trailing newline in scope instead of dropping it.
+    #
+    # #4844 keeps that invariant while removing the FALSE refusal: every non-blank
+    # line increments $parsed exactly once — consulted, skipped as a NAMED in-flight
+    # run, or re-listed from an earlier pass. The invariant that replaces "fail on
+    # any line we cannot address" is "fail on every unaddressable line EXCEPT a
+    # named in-flight one" — that single skip is the declared residual above, not a
+    # claim that the skipped run contributed nothing.
+    listed="$(grep -c '[^[:space:]]' "$listing" 2>/dev/null || true)"; listed="${listed:-0}"
+    parsed=0; consulted_n=0; measured=0; nonmeas=0
+    while IFS=$'\t' read -r status conclusion id || [ -n "${status:-}" ]; do
+      [ -n "$status" ] || continue
+      parsed=$((parsed + 1))
+      id="${id##*:}"
+      if [ -z "$id" ]; then
+        if lane_run_in_flight "$status"; then
+          nonmeas=$((nonmeas + 1))
+          continue
+        fi
+        say_err "admin-merge: ✗ unparsable lane-run listing line ('${status}') for $flag $value — '${status}' is not a named in-flight status and the line addresses no run id, so the run's shard list cannot be read; lane coverage unverifiable"
+        return 1
+      fi
+      if lane_run_in_flight "$status"; then
+        # In flight: not read at all (the declared residual above), and it cannot
+        # spend the window. Counted so the refusal can say how much of the window
+        # was mid-run rather than implying the lane was empty.
+        nonmeas=$((nonmeas + 1))
+        continue
+      fi
+      consulted_n=$((consulted_n + 1))
+      lane_run_measured "$status" "$conclusion" && measured=$((measured + 1))
+      grep -qxF "$id" "$consulted" 2>/dev/null && continue
+      printf '%s\n' "$id" >> "$consulted"
+      rc=0
+      lane_shards "$id" "$allnames" > "$shards" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        say_err "admin-merge: ✗ could not read the job list of lane run $id — lane coverage unverifiable"
+        return 1
+      fi
+      if [ -s "$shards" ]; then cat "$shards" >> "$out"; fi
+    done < "$listing"
+    if [ "$parsed" -ne "$listed" ]; then
+      say_err "admin-merge: ✗ the lane-run listing for $flag $value did not parse in full ($parsed of $listed lines) — lane coverage unverifiable"
       return 1
     fi
-    if [ -s "$TMP/lane-shards.tmp" ]; then cat "$TMP/lane-shards.tmp" >> "$out"; fi
-  done < "$listing"
-  if [ "$parsed" -ne "$listed" ]; then
-    say_err "admin-merge: ✗ the lane-run listing for $flag $value did not parse in full ($parsed of $listed lines) — lane coverage unverifiable"
-    return 1
-  fi
+    LANE_SET_LISTED="$listed"
+    # The window the gate ACTUALLY read: a listing SHORTER than the request (the
+    # branch has fewer runs than N) must not be reported as the requested width —
+    # this number is what the operator audits and what the widening disclosure is
+    # decided on.
+    LANE_SET_WINDOW="$raw"
+    [ "$listed" -lt "$raw" ] && LANE_SET_WINDOW="$listed"
+    LANE_SET_CONSULTED="$consulted_n"; LANE_SET_MEASURED="$measured"
+    LANE_SET_NONMEASURING="$nonmeas"
+    # Widen ONLY while the window has produced no executed shard AT ALL: an empty
+    # reference is the one condition more runs can repair. Stop once the
+    # operator's window is spent on runs that FINISHED a measurement, once the
+    # history is exhausted, or at the policy bound.
+    [ -s "$out" ] && break
+    [ "$measured" -ge "$limit" ] && break
+    [ "$listed" -lt "$raw" ] && break
+    [ "$raw" -ge "$MAIN_RUNS_MAX" ] && break
+    raw=$((raw * 2))
+    [ "$raw" -gt "$MAIN_RUNS_MAX" ] && raw="$MAIN_RUNS_MAX"
+  done
+  # The distinct executed job names the window ACTUALLY carried, over ALL passes
+  # (the accumulator is a union, so a run consulted in an earlier pass is not
+  # double-counted and not dropped).
+  LANE_SET_JOBS="$(sort -u "$allnames" 2>/dev/null | grep -c '[^[:space:]]' || true)"
+  LANE_SET_JOBS="${LANE_SET_JOBS:-0}"
+  rm -f "$allnames"
   # Drop any blank line before the union: a single blank entry would be counted
   # as a shard by `wc -l` and would match the empty pattern under `grep -xF`.
   if [ -s "$out" ]; then
@@ -1279,6 +1468,11 @@ lane_has_test_shard() {
 #                        an unobserved reference certifies nothing, and an empty
 #                        set means EVERY shard is missing — never "no difference".
 LANE_PARITY_REASON=""
+# The window MAIN's reference was actually drawn from (#4844). Set by
+# lane_parity_check so the evidence can DISCLOSE a widened reference rather than
+# let `--main-runs` describe a window the gate did not read. The reader defaults
+# it (`:-0`); it is set on every path that reaches the evidence, which lies behind
+# a rc==0 parity result.
 lane_parity_check() {
   local head="$1" main_runs="$2" rc=0
   LANE_PARITY_REASON=""
@@ -1298,9 +1492,35 @@ lane_parity_check() {
     LANE_PARITY_REASON="main's lane runs could not be listed or read"
     return 2
   fi
+  # Capture MAIN's window accounting NOW: the LANE_SET_* globals are overwritten
+  # by every lane_shard_set call, and the reason below is a claim about MAIN.
+  local main_listed="$LANE_SET_LISTED" main_window="$LANE_SET_WINDOW"
+  local main_consulted="$LANE_SET_CONSULTED" main_nonmeas="$LANE_SET_NONMEASURING"
+  local main_measured="$LANE_SET_MEASURED"
+  local main_jobs="$LANE_SET_JOBS"
+  LANE_PARITY_MAIN_WINDOW="$main_window"
   # Decide on NAMES, never on file size (see lane_count).
   if [ "$(lane_count "$TMP/lane-main.txt")" -eq 0 ]; then
-    LANE_PARITY_REASON="main's lane runs showed no EXECUTED test shard matching '${LANE_JOB_PREFIX}*', so there is no reference to compare against"
+    # #4844 — NAME THE CONDITION, NOT A NEIGHBOURING ONE. "no EXECUTED test shard
+    # matching 'test*'" reads like a COVERAGE gap in the PR and sends the reader
+    # after ADMIN_MERGE_LANE_JOB_PREFIX, when what is missing is the REFERENCE: no
+    # completed run in the window EXECUTED a job, either because its job list is
+    # unreadable (purged, zero-job, not yet served) or because no job it lists
+    # carries an executed conclusion (skipped, cancelled, neutral, stale, …). A
+    # lane that never TESTED main does not reach here
+    # at all: step 2b blocks it first, which is why this branch does not offer
+    # "retry once main's lane settles".
+    # LANE_SET_JOBS is PREFIX-AGNOSTIC, so "no job list was readable at all" and
+    # "job lists that do not match the family" are separable, and they have
+    # different remedies: a stale/empty reference is a window or lane-selection
+    # question; a non-matching family is a PREFIX question. The window actually
+    # read is STATED either way, because "widened past --main-runs" is a fact the
+    # operator must be able to audit.
+    if [ "$main_jobs" -eq 0 ]; then
+      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
+    else
+      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX"
+    fi
     return 2
   fi
   if ! lane_has_test_shard "$TMP/lane-main.txt"; then
@@ -2318,14 +2538,15 @@ build_evidence() {
   # reaches this point with a zero residual, so every failure the PR carries IS
   # exempt-with-evidence, and recording the set is what lets a reviewer reach
   # `blocked: 0` from the comment instead of taking it on faith.
-  evidence_list "the $pr_count failure(s) this PR carries — all EXEMPT (measured on main with a matching signature and no worse rate)" \
+  evidence_list "the $pr_count failure(s) this PR carries — all EXEMPT (id measured on main with a matching signature; rate compared where the PR sample was measurable)" \
     "$(cat "$pr_fails")" "(none — this PR carries no failure of its own)"
   evidence_list "main baseline: $main_count pre-existing failure(s), for comparison" \
     "$(cat "$main_fails")" "(none)"
   # THE VISIBLE EXEMPTIONS (#3756). An exemption that exists only as an absence
-  # IS the fail-open defect, so every exempt id is printed with BOTH rates and
-  # the reason the decision permitted it.
-  evidence_list 'EXEMPT by the decision (visible — both rates, matching signature)' \
+  # IS the fail-open defect, so every exempt id is printed with the decision's
+  # own reason — which carries both rates only where a rate was measurable, and
+  # says "NOT measurable" when it was not (#5250).
+  evidence_list 'EXEMPT by the decision (visible — the reason and the measurements it rested on)' \
     "$exempt_raw" "(none — no failure was exempted)"
   # The PRE-rerun residual, when the flake path ran. Labelled for what it IS: it
   # is NOT the diff of the two sets above (those are POST-rerun), so it must not
@@ -2429,6 +2650,39 @@ main() {
   RERUN_TIMEOUT_SOURCE=""
   [ "$RERUN_TIMEOUT_EXPLICIT" -eq 1 ] && RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"
   local MERGE_ARGS=() MERGE_METHOD_SET=0
+  # ── THE `--` BOUNDARY IS THE PARSER/gh BOUNDARY (#4078) ──────────────────
+  # Everything after `--` goes to `gh pr merge`. The lane-selector pair is the
+  # DOCUMENTED remedy for a trigger-split repo (#1003: no single --workflow spans
+  # a PR-only and a main-only lane), and the usage line prints it BEFORE `--`. An
+  # operator who writes the natural order
+  #     admin-merge.sh 42 -- --squash --any-workflow
+  # has the flag swallowed into gh's argv: ANY_WORKFLOW stays 0, the lane stays
+  # the default, and the rail blocks with a remedy its own invocation could not
+  # have applied. Nothing said the flag was ignored — a silent, documented
+  # no-op. So the boundary is now enforced in BOTH directions:
+  #   * the two LANE-SELECTOR flags are RECOVERED from after `--` and applied as
+  #     parser flags (LOUDLY, so the caller learns the boundary) — the documented
+  #     order is no longer a trap; and
+  #   * every OTHER post-`--` token must be one of `gh pr merge`'s own flags. An
+  #     unrecognised token, a bare positional, or one of THIS parser's flags is
+  #     REFUSED BY NAME, never handed to gh, because a token the parser silently
+  #     drops or forwards is exactly this defect. The only parser flags that are
+  #     ALSO gh's own (`--admin`, `--help`) are forwarded, since refusing them
+  #     would be a false block on a real gh invocation.
+  # A flag that TAKES A VALUE consumes the next token verbatim, so a merge body
+  # that happens to be spelled `--any-workflow` stays data, not a flag. A value may
+  # also be carried INLINE (`--body=text`); both spellings are gh's.
+  local RECOVERED=() PS_TAKES_VALUE=0
+  # `gh pr merge`'s own flag set, by NAME (an inline `=value` is split off first).
+  # NO REPO SELECTOR IS FORWARDED. `--repo` and its short `-R` are THIS PARSER's
+  # (they belong BEFORE `--`, where they route to the analysis AND the merge via
+  # ${repo_args[@]}). Forwarded, either spelling points the MERGE at a different
+  # repo than the analysis, and the analysis and the head-bound evidence stay on
+  # the original one — so both are refused by name below. The allow-list is the
+  # gh 2.97.0 `gh pr merge` set exactly; a genuinely new gh flag needs adding here,
+  # and a COMBINED shorthand (`-sd`) is refused (names are matched, not spellings).
+  local GH_MERGE_BOOL_FLAGS=' --admin --auto --disable-auto --delete-branch -d --merge -m --rebase -r --squash -s --help -h '
+  local GH_MERGE_VALUE_FLAGS=' --author-email -A --body -b --body-file -F --subject -t --match-head-commit '
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -2449,8 +2703,84 @@ main() {
         shift ;;
       --help|-h) usage; exit 0 ;;
       --) shift; while [ $# -gt 0 ]; do
-            case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
-            MERGE_ARGS+=("$1"); shift
+            # The value of a value-taking gh flag is DATA, whatever it is spelled.
+            if [ "$PS_TAKES_VALUE" -eq 1 ]; then
+              PS_TAKES_VALUE=0
+              MERGE_ARGS+=("$1"); shift; continue
+            fi
+            # gh carries a value INLINE too (`--body=text`). Classify on the NAME
+            # and keep the token whole, so the `=value` half is neither dropped
+            # nor mistaken for a separate token.
+            local ps_name="$1" ps_inline=0
+            case "$ps_name" in
+              -*=*) ps_name="${ps_name%%=*}"; ps_inline=1 ;;
+            esac
+            case "$ps_name" in
+              # The documented remedy, in either order: RECOVER it for the parser.
+              --any-workflow)
+                if [ "$ps_inline" -eq 1 ]; then
+                  say_err "admin-merge: ✗ refusing '$1' — '--any-workflow' takes no value. Put it BEFORE the"
+                  say_err "   separator: admin-merge.sh <PR> --any-workflow -- <gh flags>"
+                  exit 2
+                fi
+                RECOVERED+=(--any-workflow); shift; continue ;;
+              --workflow)
+                if [ "$ps_inline" -eq 1 ]; then
+                  say_err "admin-merge: ✗ refusing '$1' — the parser's --workflow takes its value as the NEXT"
+                  say_err "   argument and must precede the separator: admin-merge.sh <PR> --workflow <f> -- …"
+                  exit 2
+                fi
+                # A MISSING VALUE IS REFUSED, not defaulted. Recovering an
+                # empty --workflow would leave WORKFLOW empty, and an empty lane
+                # reads as the --any-workflow opt-out — a SILENT widening to the
+                # weaker certificate, i.e. this defect's own class. A value that
+                # is ITSELF a flag is refused for the same reason. Both refusals
+                # are pre-gh, like the inline spelling above.
+                if [ $# -lt 2 ] || [ -z "${2:-}" ] || [ "${2#-}" != "$2" ]; then
+                  say_err "admin-merge: ✗ refusing '--workflow' after the '--' separator — it needs its"
+                  say_err "   value as the NEXT argument, and a flag cannot be that value. Put it BEFORE the"
+                  say_err "   separator: admin-merge.sh <PR> --workflow <file> -- <gh flags>"
+                  exit 2
+                fi
+                RECOVERED+=(--workflow "$2"); shift 2
+                continue ;;
+              # THIS PARSER's flags after `--` are refused BY NAME. `--repo` and
+              # its short `-R` are the repo selectors: forwarded, either would
+              # point the MERGE at another repo while the analysis and the
+              # head-bound evidence stayed on this one.
+              --main-runs|--repo|-R|--rerun-timeout|--no-rerun|--dry-run|--print-bounds)
+                local ps_hint="$ps_name"
+                [ "$ps_name" = "-R" ] && ps_hint="--repo owner/repo"
+                say_err "admin-merge: ✗ refusing '$ps_name' after the '--' separator — that is a PARSER flag,"
+                say_err "   and only 'gh pr merge' flags may follow '--'. Repo selection belongs to this"
+                say_err "   parser, where it routes to the analysis AND the merge:"
+                say_err "   admin-merge.sh <PR> $ps_hint … -- --squash"
+                exit 2 ;;
+            esac
+            case " $GH_MERGE_BOOL_FLAGS " in *" $ps_name "*)
+              case "$ps_name" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
+              MERGE_ARGS+=("$1"); shift; continue ;;
+            esac
+            case " $GH_MERGE_VALUE_FLAGS " in *" $ps_name "*)
+              MERGE_ARGS+=("$1")
+              [ "$ps_inline" -eq 1 ] || PS_TAKES_VALUE=1
+              shift; continue ;;
+            esac
+            case "$1" in
+              -*)
+                say_err "admin-merge: ✗ refusing '$1' after the '--' separator — it is not one of the 'gh pr"
+                say_err "   merge' flags this rail forwards, so passing it through would either fail at gh or"
+                say_err "   be dropped IN SILENCE. If it is a parser flag, put it BEFORE the separator:"
+                say_err "   admin-merge.sh <PR> $1 -- --squash"
+                say_err "   (A COMBINED shorthand such as '-sd' is valid at gh but is not matched here —"
+                say_err "    write it as '-s -d'.)"
+                exit 2 ;;
+              *)
+                say_err "admin-merge: ✗ refusing the bare argument '$1' after the '--' separator — the PR is"
+                say_err "   already supplied, so gh would reject a second positional. Only 'gh pr merge' flags"
+                say_err "   may follow '--'."
+                exit 2 ;;
+            esac
           done ;;
       --admin|--admin=true) shift ;;  # always added by this script
       -*) case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
@@ -2460,6 +2790,27 @@ main() {
         shift ;;
     esac
   done
+
+  # Apply the lane-selector flags RECOVERED from after `--`. LOUD, because the
+  # invocation that needs recovery is one whose author should learn the boundary;
+  # and applied AFTER the loop so a recovered flag wins, exactly as if it had been
+  # written before `--` (the parser's last-occurrence rule — where a `--workflow`
+  # with no value, or with a flag as its value, is refused in the loop above, so
+  # nothing applied here can be empty).
+  if [ "${#RECOVERED[@]}" -gt 0 ]; then
+    say_err "admin-merge: ⚠ parser flag(s) found AFTER the '--' separator — recovering them for the parser"
+    say_err "   (only 'gh pr merge' flags belong after '--'; a lane selector is recovered instead of being"
+    say_err "    handed to gh, which would reject it)."
+    say_err "   Prefer: admin-merge.sh <PR> [--workflow <f>|--any-workflow] -- <gh flags>"
+    local ri=0 rn="${#RECOVERED[@]}"
+    while [ "$ri" -lt "$rn" ]; do
+      case "${RECOVERED[$ri]}" in
+        --any-workflow) ANY_WORKFLOW=1; ri=$((ri + 1)) ;;
+        --workflow) WORKFLOW="${RECOVERED[$((ri + 1))]:-}"; ri=$((ri + 2)) ;;
+        *) ri=$((ri + 1)) ;;
+      esac
+    done
+  fi
 
   # The baseline WINDOW is an operator knob like the timing ones, and it is
   # validated for the same two reasons: `--main-runs abc` makes `gh run list
@@ -2681,6 +3032,9 @@ main() {
       say_err "   pick a lane that runs on pull requests."
     fi
     say_err "   Confirm the lane is the right one (--workflow) and that CI ran for this head."
+    say_err "   If this repo splits its lanes by trigger, add --any-workflow BEFORE the -- separator"
+    say_err "   and re-run (after '--' only 'gh pr merge' flags belong; a lane selector written there is"
+    say_err "    recovered with a warning, and any other parser flag is refused)."
     exit 1
   fi
   # ── 1c. EVERY FAILING RUN MUST BE ATTRIBUTED (cycle-3 review) ────────────
@@ -2818,7 +3172,7 @@ main() {
     say_err "   safe merge is refused for the wrong reason."
     say_err "   A repo can split its lanes by TRIGGER (a PR-only lane and a main-only lane), and"
     say_err "   then no single --workflow spans both sides. Compare against every lane on main"
-    say_err "   instead: add --any-workflow."
+    say_err "   instead: add --any-workflow BEFORE the -- separator."
     exit 1
   fi
 
@@ -3412,11 +3766,26 @@ $attribution_line"
   # #1319 adds the third: the two sides must also have run the SAME LANE, which
   # is what the parity line reports.
   if [ "$pr_count" -eq 0 ] && [ "$main_count" -eq 0 ]; then
-    local parity_rc=0 parity_note parity_evidence
+    local parity_rc=0 parity_note parity_evidence parity_window_note=""
     lane_parity_check "$head" "$MAIN_RUNS" || parity_rc=$?
     if [ "$parity_rc" -eq 0 ]; then
       parity_note="it certifies ONLY because LANE PARITY holds: the PR executed every test shard main's lane executed (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main). A shard main ran that this head skipped would have made this a REFUSAL (NOT COMPARABLE)."
       parity_evidence="PR ⊇ main — the PR executed every test shard main's lane executed (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main)"
+      # DISCLOSE a widened reference (#4844). A reference drawn from further back
+      # than the operator asked for is a different window, and the evidence must
+      # say so rather than let `--main-runs` describe a window it did not read.
+      # ⛔ Its OWN line, appended AFTER the literal block below — never on the
+      # `lane parity:` line. The evidence gate (`verify-admin-merge-evidence.sh`)
+      # matches that line to its END, so a suffix makes the whole certificate
+      # unmatchable and the rail then has its own merge refused and retracts its
+      # own evidence. Two assertions pin that apart: the contract suite checks the
+      # producer's `lane parity: $parity_evidence` SOURCE line is unadorned
+      # (tests/admin-merge-evidence-contract), and (r1) runs the REAL verifier over
+      # a WIDENED body (tests/admin-merge) — the source-line check alone cannot
+      # catch a suffix added to the line's VALUE.
+      if [ "${LANE_PARITY_MAIN_WINDOW:-0}" -gt "$MAIN_RUNS" ]; then
+        parity_window_note="   reference window: main's lane reference was widened past non-measuring runs to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested window yielded no executed shard"
+      fi
     elif [ "$parity_rc" -eq 2 ]; then
       parity_note="lane parity was NOT ESTABLISHED: ${LANE_PARITY_REASON}."
       parity_evidence="NOT ESTABLISHED — declared off; ${parity_note}"
@@ -3480,6 +3849,13 @@ $attribution_line"
    main check surface: $BASE_STATUS — $BASE_RED failing of $BASE_TOTAL measured, $BASE_PENDING pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: $TREE_STATUS — $TREE_RED failing of $TREE_TOTAL measured, $TREE_PENDING pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
    Correct when the lane is green on both sides — but ONLY when both sides ran the SAME lane. The per-side counters tell 'green' from 'never run'; the parity line tells 'the same lane' from 'two different lanes'. A wrong lane selector certifies neither."
+    # The widening disclosure is appended HERE, after the literal: the `lane
+    # parity:` line above must stay byte-identical to what the gate and the
+    # contract suite pin (#4844, #1388).
+    if [ -n "$parity_window_note" ]; then
+      analyzed="${analyzed}
+${parity_window_note}"
+    fi
     info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lane: $lane); lane parity: $parity_evidence; PR tree: $TREE_STATUS ($TREE_RED failing of $TREE_TOTAL measured); main check surface: $BASE_STATUS ($BASE_RED failing of $BASE_TOTAL measured, context only)"
   fi
 
