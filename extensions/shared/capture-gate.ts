@@ -24,9 +24,11 @@
 //      corrupt `.git`), or an opt-out file that exists but cannot be read or
 //      parsed, DENIES rather than silently skipping the deny check — the same
 //      fail-closed rule that stops a key alone from enabling egress. A directory
-//      git DEFINITIVELY reports as "not a git repository" is not a failure: it
-//      has no repo root and therefore no repo-scoped deny file to miss, so the
-//      explicit opt-in stands there.
+//      git DEFINITIVELY reports as "not a git repository" is not a failure ONLY
+//      once every ancestor has been checked for an opt-out: a directory with no
+//      repo root can still sit UNDER a directory that declares one (the deny file
+//      is honoured at any `projectDir`), so the opt-in stands only when that
+//      deny-only ancestor walk has found nothing.
 //
 // Precedence note (deliberate): env still wins over the file for CREDENTIALS
 // (TORTOISE_API_KEY / TORTOISE_API_URL) — a credential is not a consent gate.
@@ -34,7 +36,7 @@
 // the operator file is the only enable, the env flag and the project file can
 // only deny. Env-wins for a data-egress switch is what made #803 surprising.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 
@@ -66,6 +68,40 @@ export interface CaptureGateInput {
   env?: NodeJS.ProcessEnv;
 }
 
+/**
+ * Config-file string guard, SHARED by both capture extensions (#803 review
+ * cycle 3 P2). A hand-written config field can be any JSON type, and a SILENT
+ * drop of a mistyped `apiUrl` sends full transcripts to the DEFAULT hosted
+ * endpoint instead of the operator's intended host — carrying the Bearer key
+ * with them. That is the #775 "wrong host, silently" class, so the drop must
+ * never be silent. ONLY `undefined` counts as ABSENT: `null` (and every other
+ * non-string) is PRESENT-and-wrong, and is warned about and dropped.
+ */
+export function asConfigStringField(args: {
+  /** The owning extension's log tag, e.g. `[reflect-hook]`. */
+  prefix: string;
+  /** The config key, used verbatim in the warning. */
+  field: string;
+  value: unknown;
+  /** Named in the warning when `field` is `apiUrl`. */
+  defaultApiUrl: string;
+}): string | undefined {
+  const { prefix, field, value, defaultApiUrl } = args;
+  if (value === undefined) return undefined;
+  if (typeof value === "string") return value;
+  const consequence =
+    field === "apiUrl"
+      ? ` — hosted capture will target the DEFAULT endpoint ${defaultApiUrl} instead`
+      : field === "apiKey"
+        ? " — hosted capture will be treated as keyless (no upload)"
+        : "";
+  const got = value === null ? "null" : typeof value;
+  console.warn(
+    `${prefix} config "${field}" is present but not a string (got ${got}); ignoring it${consequence}`,
+  );
+  return undefined;
+}
+
 /** The deny vocabulary shared by the env flag and the repo file. */
 const DISABLE_VALUES = new Set([
   "",
@@ -94,17 +130,51 @@ const PROJECT_ROOT_CACHE = new Map<string, string>();
 const NOT_A_REPO_RE = /not a git repository/i;
 
 /**
- * Does `cwd` or ANY ancestor carry a `.git` entry (dir or file)? git reports a
- * corrupt/incomplete repository boundary with the SAME `fatal: not a git
- * repository` (exit 128) it uses for a plain directory, so the message alone
+ * Does `cwd` or ANY ancestor carry a `.git` entry (dir, file, OR symlink)? git
+ * reports a corrupt/incomplete repository boundary with the SAME `fatal: not a
+ * git repository` (exit 128) it uses for a plain directory, so the message alone
  * cannot tell them apart. If a boundary exists but git rejected it, the repo
- * scope is UNRESOLVABLE (fail closed); only a walk that finds no `.git` anywhere
- * is the definitive "not a repository" answer.
+ * scope is UNRESOLVABLE (fail closed); only a walk that finds no `.git` entry
+ * anywhere is the definitive "not a repository" answer.
+ *
+ * `lstat`, NOT `existsSync`/`stat`: `existsSync` FOLLOWS symlinks, so a broken or
+ * looping `.git` symlink (unmounted volume, deleted central gitdir, a `git
+ * archive`/ZIP export, a `cp -r` that excluded the target) read as ABSENT —
+ * flipping a repository boundary git REJECTS into the definitive "not a repo"
+ * answer and enabling capture (review cycle 3 P0). A `.git` ENTRY of any kind is
+ * a boundary. A non-ENOENT stat failure is likewise a boundary: fail closed.
  */
 function hasGitBoundary(cwd: string): boolean {
   let dir = resolve(cwd);
   for (;;) {
-    if (existsSync(join(dir, ".git"))) return true;
+    try {
+      lstatSync(join(dir, ".git"));
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return true;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return false;
+    dir = parent;
+  }
+}
+
+/**
+ * Is there a repo-scoped opt-out at `cwd` or ANY ancestor? DENY-ONLY, so it can
+ * only ever narrow egress (#803 review cycle 3 P0). Two cases need it:
+ *
+ *   - the cwd is NOT in a repository (`.git` absent, renamed away, or a broken
+ *     symlink), so there is no resolved main root to read — but an ancestor
+ *     opt-out still exists and must be honoured. "No repo root" does NOT imply
+ *     "no deny to miss": `PROJECT_CAPTURE_RELPATH` is honoured at ANY directory;
+ *   - the cwd IS in a repo but the opt-out sits at an INTERMEDIATE ancestor
+ *     (`R/pkg/{src/deep}` with the deny at `R/pkg`), which the two-candidate-root
+ *     check (cwd + main root) never reads.
+ */
+function ancestorDenyExists(cwd: string): boolean {
+  let dir = resolve(cwd);
+  for (;;) {
+    if (readOptOutFile(dir)) return true;
     const parent = dirname(dir);
     if (parent === dir) return false;
     dir = parent;
@@ -119,13 +189,27 @@ interface MainRootResolution {
    * True when git answered DEFINITIVELY that `cwd` is not inside any repository
    * (`fatal: not a git repository`, exit 128) AND no ancestor carries a `.git`
    * boundary. That is a resolved answer with no roots to search, so there is no
-   * repo-scoped deny file the gate could miss — the operator's explicit
-   * `cloud: true` opt-in stands (a plain directory or `$HOME` is a legitimate
-   * launch cwd). `resolved:false` is reserved for a genuine failure — git absent,
+   * repo-scoped deny file at a REPO root the gate could miss — the operator's
+   * explicit `cloud: true` opt-in stands (a plain directory or `$HOME` is a
+   * legitimate launch cwd). An opt-out at any other ancestor is still honoured:
+   * the caller walks ancestors with {@link ancestorDenyExists} before trusting
+   * this answer. `resolved:false` is reserved for a genuine failure — git absent,
    * a timeout, a corrupt `.git` (git reports it with the same message), or a
    * layout whose main root cannot be named (see {@link resolveMainRepoRoot}).
    */
   notARepo: boolean;
+  /**
+   * True when git answered DEFINITIVELY `fatal: not a git repository` (exit 128)
+   * but a `.git` boundary DOES exist above — a corrupt/incomplete repository, or
+   * a boundary git rejects (a broken/looping symlink left by an unmounted volume,
+   * a deleted central gitdir, a `cp -r` that excluded the target, a ZIP export).
+   * This is NOT a genuine git failure, so an ancestor opt-out — a purely
+   * filesystem read that does not depend on git — is still trustworthy and must
+   * be honoured before failing closed (review cycle 3 P0). It is tracked
+   * separately from `notARepo` precisely because a genuine failure (git absent,
+   * a timeout) must NOT be treated as a definitive answer.
+   */
+  boundaryRejected: boolean;
 }
 
 /**
@@ -151,7 +235,7 @@ export function resolveMainRepoRoot(cwd: string): string | null {
 
 function resolveMainRootDetailed(cwd: string): MainRootResolution {
   const cached = MAIN_ROOT_CACHE.get(cwd);
-  if (cached !== undefined) return { root: cached, notARepo: false };
+  if (cached !== undefined) return { root: cached, notARepo: false, boundaryRejected: false };
   const result = resolveMainRootUncached(cwd);
   // Only a resolved ROOT is memoized (see cache note).
   if (result.root !== null) MAIN_ROOT_CACHE.set(cwd, result.root);
@@ -172,20 +256,22 @@ function resolveMainRootUncached(cwd: string): MainRootResolution {
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
     const [gitDir, commonDir, topLevel] = raw.split("\n").map((l) => l.trim());
-    if (!gitDir || !commonDir || !topLevel) return { root: null, notARepo: false };
+    if (!gitDir || !commonDir || !topLevel) {
+      return { root: null, notARepo: false, boundaryRejected: false };
+    }
     const absGitDir = resolve(cwd, gitDir);
     const absCommonDir = resolve(cwd, commonDir);
     if (absGitDir === absCommonDir) {
       // The current worktree IS the main worktree of the shared repo.
-      return { root: resolve(cwd, topLevel), notARepo: false };
+      return { root: resolve(cwd, topLevel), notARepo: false, boundaryRejected: false };
     }
     const candidate = dirname(absCommonDir);
     if (existsSync(join(candidate, ".git"))) {
-      return { root: candidate, notARepo: false };
+      return { root: candidate, notARepo: false, boundaryRejected: false };
     }
     // Composite layout (`--separate-git-dir` checkout or submodule): the common
     // dir's parent is not a checkout root. Fail closed — see the docstring.
-    return { root: null, notARepo: false };
+    return { root: null, notARepo: false, boundaryRejected: false };
   } catch (err) {
     // NOT memoized (see cache note). A definitive "not a git repository" (exit
     // 128) is a resolved answer, not a failure — but ONLY when no `.git` boundary
@@ -194,8 +280,9 @@ function resolveMainRootUncached(cwd: string): MainRootResolution {
     // timeout) is unresolvable.
     const e = err as { status?: number; stderr?: unknown } | undefined;
     const stderr = typeof e?.stderr === "string" ? e.stderr : "";
-    const notARepo = e?.status === 128 && NOT_A_REPO_RE.test(stderr) && !hasGitBoundary(cwd);
-    return { root: null, notARepo };
+    const answered = e?.status === 128 && NOT_A_REPO_RE.test(stderr);
+    const boundary = answered && hasGitBoundary(cwd);
+    return { root: null, notARepo: answered && !boundary, boundaryRejected: boundary };
   }
 }
 
@@ -290,21 +377,39 @@ export interface ProjectCaptureScope {
  * timeout/corrupt `.git`) or an unnameable layout (see
  * {@link resolveMainRepoRoot}) — so the gate fails closed instead of assuming
  * "no deny". A directory git definitively reports as NOT a repository is
- * resolved: it has no repo root and no deny file to miss. Checks BOTH the
- * session root and the main checkout root, so a deny at
- * `<main>/.pi/tortoise-capture.json` still applies inside a linked worktree.
+ * resolved — but ONLY after every ancestor has been checked for an opt-out
+ * (a non-repo cwd can still sit under a directory that declares one).
+ * Checks the session root, ANY ancestor, and the main checkout root, so a deny at
+ * `<main>/.pi/tortoise-capture.json` still applies inside a linked worktree and a
+ * deny at an intermediate package directory still applies to its descendants.
  */
 export function resolveProjectCaptureScope(projectDir?: string): ProjectCaptureScope {
   if (!projectDir) return { denied: false, resolved: true };
   if (readOptOutFile(projectDir)) return { denied: true, resolved: true };
-  const { root: mainRoot, notARepo } = resolveMainRootDetailed(projectDir);
+  const { root: mainRoot, notARepo, boundaryRejected } = resolveMainRootDetailed(projectDir);
   if (mainRoot === null) {
-    // "not a git repository" is a definitive answer, not a failure.
+    // Before trusting a definitive "not a repository" — or resolving a REJECTED
+    // boundary as a failure — walk ancestors for the deny file itself (review
+    // cycle 3 P0). "No repo root" does NOT imply "no deny to miss": the opt-out
+    // is honoured at ANY directory, so a cwd inside a repo whose `.git` is absent,
+    // renamed away, or a broken/looping symlink could still sit under an ancestor
+    // `{"cloud":false}`. Deny-only, so it can only ever narrow. A GENUINE git
+    // failure (`boundaryRejected` false, `notARepo` false) is excluded on purpose:
+    // it already fails closed below, and the reason must stay
+    // `repo-root-unresolved`/`no-api-key` rather than claim a deny we did not
+    // verify (review cycle 2 P2).
+    if ((notARepo || boundaryRejected) && ancestorDenyExists(projectDir)) {
+      return { denied: true, resolved: true };
+    }
     return { denied: false, resolved: notARepo };
   }
   if (mainRoot !== projectDir && readOptOutFile(mainRoot)) {
     return { denied: true, resolved: true };
   }
+  // Resolved path, same root cause: the opt-out may sit at an INTERMEDIATE
+  // ancestor between the cwd and the main root (`R/pkg` for `R/pkg/src/deep`),
+  // which the two candidate roots above never read.
+  if (ancestorDenyExists(projectDir)) return { denied: true, resolved: true };
   return { denied: false, resolved: true };
 }
 

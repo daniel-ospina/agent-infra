@@ -46,6 +46,7 @@ import {
   type SessionAttribution,
 } from "./shared/capture-attribution.js";
 import {
+  asConfigStringField,
   captureStatusLine,
   resolveCaptureGate,
   resolveProjectRoot,
@@ -85,15 +86,31 @@ export function loadConfig(opts?: {
     // config file absent/unreadable — env vars or defaults apply
   }
   const file = (fromFile["_"] as Record<string, unknown>) ?? {};
-  const apiKey =
-    env.TORTOISE_API_KEY ||
-    (typeof file.apiKey === "string" ? (file.apiKey as string) : "");
-  const apiUrl =
-    env.TORTOISE_API_URL ||
-    (typeof file.apiUrl === "string" ? (file.apiUrl as string) : "") ||
-    DEFAULT_API_URL;
-  const team =
-    (typeof file.team === "string" ? (file.team as string) : "") || DEFAULT_TEAM;
+  // Shared boundary guard (#803 review cycle 3 P2): a config field that is
+  // PRESENT and not a string must never be dropped SILENTLY — a mistyped
+  // `apiUrl` would send the full quit transcript AND the Bearer key to the
+  // DEFAULT hosted endpoint with no warning (#775 class). `null` is present.
+  const fileApiKey = asConfigStringField({
+    prefix: "[reflect-hook]",
+    field: "apiKey",
+    value: file.apiKey,
+    defaultApiUrl: DEFAULT_API_URL,
+  });
+  const fileApiUrl = asConfigStringField({
+    prefix: "[reflect-hook]",
+    field: "apiUrl",
+    value: file.apiUrl,
+    defaultApiUrl: DEFAULT_API_URL,
+  });
+  const fileTeam = asConfigStringField({
+    prefix: "[reflect-hook]",
+    field: "team",
+    value: file.team,
+    defaultApiUrl: DEFAULT_API_URL,
+  });
+  const apiKey = env.TORTOISE_API_KEY || fileApiKey || "";
+  const apiUrl = env.TORTOISE_API_URL || fileApiUrl || DEFAULT_API_URL;
+  const team = fileTeam || DEFAULT_TEAM;
   // #803: egress opt-in is read from the operator FILE only. `cloud` is NOT read
   // from env — env may deny (TORTOISE_CAPTURE_CLOUD) but never grants upload rights.
   const cloud = file.cloud === true;

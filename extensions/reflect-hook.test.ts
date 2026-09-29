@@ -220,6 +220,58 @@ async function testLoadConfig() {
     });
     equal(config.apiUrl, "https://example.com");
   });
+
+  await test("a non-string apiUrl warns, naming the default endpoint (#775 class)", () => {
+    // The SILENT drop sent the full quit transcript AND the Bearer key to the
+    // default hosted endpoint with no warning. The value is still dropped (the
+    // default applies) — but it must never be silent.
+    const dir = tmpProject("reflect-loadcfg-badurl");
+    const configPath = join(dir, "tortoise-config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({ cloud: true, apiUrl: 12345, apiKey: "tt_secret" }),
+      "utf-8",
+    );
+    const warned: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+    let config: any;
+    try {
+      config = loadConfig({ env: {}, configPath });
+    } finally {
+      console.warn = origWarn;
+    }
+    equal(config.apiUrl, "https://api.premiselabs.co");
+    const text = warned.join("\n");
+    ok(text.includes("[reflect-hook]"), `warning is attributed to reflect-hook: ${text}`);
+    ok(text.includes('"apiUrl" is present but not a string'), `warning names the field: ${text}`);
+    ok(
+      text.includes("DEFAULT endpoint https://api.premiselabs.co"),
+      `warning names the endpoint the transcript would target: ${text}`,
+    );
+  });
+
+  await test("a null apiUrl is PRESENT-and-wrong (warned), not silently absent", () => {
+    const dir = tmpProject("reflect-loadcfg-nullurl");
+    const configPath = join(dir, "tortoise-config.json");
+    writeFileSync(configPath, JSON.stringify({ cloud: true, apiUrl: null }), "utf-8");
+    const warned: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+    try {
+      loadConfig({ env: {}, configPath });
+    } finally {
+      console.warn = origWarn;
+    }
+    ok(
+      warned.join("\n").includes('"apiUrl" is present but not a string (got null)'),
+      `null apiUrl must warn (not be treated as absent): ${warned.join(" | ")}`,
+    );
+  });
 }
 
 // ── Tests: extractTurns (export seam) ──────────────────────────────────────

@@ -47,6 +47,7 @@ import {
   type SessionAttribution,
 } from "../shared/capture-attribution.js";
 import {
+  asConfigStringField,
   resolveCaptureGate,
   resolveProjectRoot,
   type CaptureGateResult,
@@ -92,21 +93,17 @@ const asString = (v: unknown): string | undefined => (typeof v === "string" ? v 
  * `apiUrl`, which then sent transcripts to the DEFAULT hosted endpoint instead of
  * the operator's intended host — the #775 "wrong host, silently" class. The
  * warning fires per config LOAD, which is once per process for the default path
- * (`loadConfig` caches).
+ * (`loadConfig` caches). THE SAME guard is shared with reflect-hook
+ * ({@link asConfigStringField}), which uploads the FULL transcript at quit time.
+ * `null` counts as PRESENT (it is dropped with a warning, not treated as absent).
  */
 function asConfigString(field: string, v: unknown): string | undefined {
-  if (v === undefined || v === null) return undefined;
-  if (typeof v === "string") return v;
-  const consequence =
-    field === "apiUrl"
-      ? ` — hosted capture will target the DEFAULT endpoint ${DEFAULT_API_URL} instead`
-      : field === "apiKey"
-        ? " — hosted capture will be treated as keyless (no upload)"
-        : "";
-  console.warn(
-    `[tortoise-capture] config "${field}" is present but not a string (got ${typeof v}); ignoring it${consequence}`,
-  );
-  return undefined;
+  return asConfigStringField({
+    prefix: "[tortoise-capture]",
+    field,
+    value: v,
+    defaultApiUrl: DEFAULT_API_URL,
+  });
 }
 
 function configPath(): string {

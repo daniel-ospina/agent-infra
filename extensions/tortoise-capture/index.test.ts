@@ -878,6 +878,31 @@ describe("config boundary normalisation (#803 review P1)", () => {
     }
   });
 
+  test("a null apiUrl is PRESENT-and-wrong: warned and dropped, never silent", () => {
+    // Review cycle 3 P2: `asConfigString` returned early for `null`, so
+    // `"apiUrl": null` silently targeted the default endpoint while the
+    // docstring promised a warning for any present non-string. Only `undefined`
+    // is ABSENT now.
+    const dir = mkdtempSync(join(tmpdir(), "tc-config-null-"));
+    const configPath = join(dir, "tortoise-config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({ autoCapture: true, cloud: true, apiKey: "tt_x", apiUrl: null }),
+      "utf-8",
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const cfg = loadConfig({ configPath });
+      expect(cfg.apiUrl).toBeUndefined();
+      const warnings = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(warnings).toContain('"apiUrl" is present but not a string (got null)');
+      expect(warnings).toContain("DEFAULT endpoint https://api.premiselabs.co");
+    } finally {
+      warn.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a non-object JSON parse result is rejected", () => {
     expect(normalizeConfig(123).autoCapture).toBe(false);
     expect(normalizeConfig([]).autoCapture).toBe(false);

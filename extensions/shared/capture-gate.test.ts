@@ -10,7 +10,7 @@
  */
 
 import { ok, equal } from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, chmodSync, renameSync, symlinkSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -144,6 +144,83 @@ try {
     "repo-root-unresolved",
     "a corrupt .git boundary denies rather than silently enabling",
   );
+
+  // ── Review cycle 3 P0: an ANCESTOR deny must be honoured even when the cwd's
+  // repo root cannot be resolved. `existsSync` FOLLOWS symlinks, so `.git`
+  // absent/renamed/broken-symlink read as "no repository boundary" → `notARepo`
+  // → capture ENABLED while the ancestor `{"cloud":false}` was never read —
+  // and the transcript plus the Bearer key went to the DEFAULT endpoint. The
+  // deny-only ancestor walk closes it; `lstat` keeps a rejected `.git` symlink a
+  // boundary instead of an absence.
+  for (const [label, mutate] of [
+    ["no .git", (_root: string) => {}],
+    ["renamed .git", (root: string) => renameSync(join(root, ".git"), join(root, ".git-bak"))],
+    [
+      "broken .git symlink",
+      (root: string) => {
+        rmSync(join(root, ".git"), { recursive: true, force: true });
+        symlinkSync(join(root, "missing-target"), join(root, ".git"));
+      },
+    ],
+    [
+      "looping .git symlink",
+      (root: string) => {
+        rmSync(join(root, ".git"), { recursive: true, force: true });
+        symlinkSync(join(root, ".git"), join(root, ".git"));
+      },
+    ],
+  ] as const) {
+    const root = tmpProject("gate-ancestor", { cloud: false });
+    execSync("git init -q", { cwd: root });
+    mutate(root);
+    const deep = join(root, "packages", "x");
+    mkdirSync(deep, { recursive: true });
+    equal(projectCaptureOptOut(deep), true, `${label}: an ancestor opt-out is honoured`);
+    equal(
+      resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: deep, env: {} }).reason,
+      "repo-opt-out",
+      `${label}: cloud:true + key from a descendant → repo-opt-out`,
+    );
+  }
+
+  // Same root cause on the RESOLVED path: the deny sits at an INTERMEDIATE
+  // ancestor (`R/pkg`) between the cwd and the main root, so neither candidate
+  // root the gate read (cwd + main root) could see it.
+  {
+    const root = tmpProject("gate-intermediate");
+    execSync("git init -q", { cwd: root });
+    const pkg = join(root, "pkg");
+    mkdirSync(join(pkg, ".pi"), { recursive: true });
+    writeFileSync(join(pkg, ".pi", "tortoise-capture.json"), JSON.stringify({ cloud: false }), "utf-8");
+    const deep = join(pkg, "src", "deep");
+    mkdirSync(deep, { recursive: true });
+    equal(projectCaptureOptOut(pkg), true, "a deny at the package dir applies to the package dir");
+    equal(
+      projectCaptureOptOut(deep),
+      true,
+      "a deny at an INTERMEDIATE ancestor applies to its descendants (was enabled)",
+    );
+    equal(
+      resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: deep, env: {} }).reason,
+      "repo-opt-out",
+      "intermediate-ancestor deny yields repo-opt-out",
+    );
+  }
+
+  // Negative control for the ancestor walk: a VALID repo with no deny anywhere
+  // must stay ENABLED (the walk is deny-only, so it may only ever narrow).
+  {
+    const root = tmpProject("gate-ancestor-none");
+    execSync("git init -q", { cwd: root });
+    const deep = join(root, "packages", "x");
+    mkdirSync(deep, { recursive: true });
+    equal(projectCaptureOptOut(deep), false, "a valid repo with no deny anywhere is not an opt-out");
+    equal(
+      resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: deep, env: {} }).enabled,
+      true,
+      "a valid repo with no deny anywhere stays enabled",
+    );
+  }
 
   // Review cycle 1 P1: the repo file must accept the SAME deny vocabulary as the
   // env flag (a repo author mirroring TORTOISE_CAPTURE_CLOUD=off used to be
