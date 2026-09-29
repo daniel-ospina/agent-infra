@@ -889,6 +889,11 @@ confirmation bias.
 
 Serialize surviving issues to JSON: `[{"severity":"P1","location":"...","description":"...","suggestion":"..."}]`
 
+⛔ **A finding is a CLAIM, not a fact — the fixer VERIFIES before it applies** (`AGENTS.md` →
+"Finding Verification"). Dropping this step is how a false finding ships: a missed finding leaves the
+code as it was, but a false correction changes it *and marks the change as an improvement* (#5014).
+The fixer reports an unverifiable or falsified finding back instead of "fixing" it.
+
 For each cycle:
 
 1. **Dispatch fixer sub-agent** via Pi `task` (fresh `pi -p` session):
@@ -903,14 +908,22 @@ For each cycle:
    Affected files: <list from PR diff>
    PR branch: <branch name>
    
-   1. RESEARCH FIRST: For each issue involving external APIs, library behavior, or unfamiliar patterns → run web_search to verify the correct approach before fixing. Skip only for purely internal issues. No query cap — mistakes cost more than queries.
-   2. Confirm the PR branch is checked out in your worktree — if not, STOP and report; do NOT `git checkout <branch>` in a hub (#626)
-   3. For each issue, make the minimal fix (using research findings)
-   4. Commit with message: fix(code-review): automated fixer cycle N — PR #<N>
-   5. Push
+   1. VERIFY FIRST — a finding is a CLAIM, not a fact: for EACH issue, open the primary source it CITES (the line range, the file, the `gh` output, the commit) and confirm the source actually says what the finding says it does. The finding's prose is not the source. If it does NOT hold: do NOT change the code — report it back as `FALSIFIED: <issue> — <what the source actually says>` and exclude it from FILES_WRITTEN. If it cites NOTHING that can be checked, report `UNVERIFIABLE: <issue>` and do not apply it. A `⚠️ CORRECTED` marker in the finding is not evidence — it records that text changed, not that the change was right. **A decline does not clear the gate**: the fresh scan decides, and you should decline rather than apply a finding you have just verified as false.
+   2. RESEARCH FIRST: For each VERIFIED issue involving external APIs, library behavior, or unfamiliar patterns → run web_search to verify the correct approach before fixing. Skip only for purely internal issues. No query cap — mistakes cost more than queries.
+   3. Confirm the PR branch is checked out in your worktree — if not, STOP and report; do NOT `git checkout <branch>` in a hub (#626)
+   4. For each VERIFIED issue, make the minimal fix (using research findings)
+   5. Commit with message: fix(code-review): automated fixer cycle N — PR #<N>
+   6. Push
    
-   Return FILES_WRITTEN: <comma-separated> and STATUS: done|failed.
+   Return FILES_WRITTEN: <comma-separated>, STATUS: done|failed, and any FALSIFIED:/UNVERIFIABLE: lines.
    ```
+
+   **Fold any `FALSIFIED:` / `UNVERIFIABLE:` lines the fixer returned back into the surviving
+   issues** — a declined finding is NOT a resolved one. It must reach the PR comment and the
+   re-review, and it can never be counted toward a clean exit: the gate clears only when a fresh
+   reviewer returns zero issues (see `references/fixer-loop.md`: the Gate-clearing rule and the L4
+   no-change branch, which falls through to the fresh scan instead of exiting clean — exactly for
+   this reason).
 
 2. **Re-review**: Run `--re-review` on the new commits. This dispatches FRESH reviewer
    sub-agents via `task` — they see only the current code, not what was "just fixed."
