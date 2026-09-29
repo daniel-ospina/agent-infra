@@ -19,12 +19,13 @@
  *   [task-heartbeat] tick nonce=<n> tools=<n> turn=<0|1> stream_age_ms=<n>
  *                       tool_age_max_ms=<n> tool_updates=<0|1>
  *                       cpu_ms=<n> cpu_stall_ms=<n> cpu_advanced=<0|1>
- *                       saw_msg=<0|1> saw_tool=<0|1>
+ *                       saw_msg=<0|1> saw_tool=<0|1> progress=<0|1>
  *                                               — every clamped interval
  *                                                     (#928 added cpu_ms /
  *                                                     cpu_stall_ms /
- *                                                     cpu_advanced; see the
- *                                                     CPU-liveness block
+ *                                                     cpu_advanced; #5195
+ *                                                     added progress — see
+ *                                                     `isProgressContentEvent`
  *                                                     below formatTick)
  *   [task-heartbeat] session_end nonce=<n>       — once at session_shutdown
  *                                                  (session completed — #191)
@@ -179,7 +180,9 @@ export interface TickFields {
   toolAgeMaxMs: number;
   sawMsg: boolean;
   sawTool: boolean;
-  /** #783 §6.6: the in-flight tool round has emitted at least one update. */
+  /** #783 §6.6 / #1505: the in-flight tool round has produced RENDERABLE
+   * output — armed only by a content-bearing `tool_execution_update`, never by
+   * pi's unconditional zero-byte start update. */
   toolUpdates: boolean;
   /** #928: cumulative CPU (ms) of the in-flight tool's PROCESS SUBTREE.
    * 0 = not probed (no eligible tool, probe unavailable, or nothing found). */
@@ -196,11 +199,32 @@ export interface TickFields {
    * philosophy exactly: only ever kill a tool that has demonstrated it works,
    * then stopped. */
   cpuAdvanced: boolean;
+  /** #5195 — PROGRESS happened since the previous tick: a unit of work
+   * COMPLETED (a tool ended, a turn ended carrying results/content), or the
+   * model produced non-whitespace CONTENT (text or thinking).
+   *
+   * This is the one signal in the wire that is content-grounded, and it exists
+   * because every other liveness field is forgeable by a process that is alive
+   * but doing nothing: `saw_msg` is set by a bare `message_update` with NO
+   * content inspection (see the handler), so a drip stream of whitespace or
+   * retry chatter latches every parent-visible signal while completing no work.
+   * `progress` is what the parent's `no-progress` clause keys on, so a genuinely
+   * working agent is never cut and a zombie cannot forge its way past it.
+   *
+   * Deliberately NOT set by: the content-free openers (`start`, `text_start`,
+   * `thinking_start`, `toolcall_start`), whitespace-only deltas, `error`, or the
+   * tick itself. Disclosed residual: a provider repeating identical
+   * non-whitespace text is indistinguishable from real work — but treating text
+   * as non-progress would cut working agents, which is the failure this exists
+   * to prevent. */
+  progress: boolean;
 }
 
 /** #783 §6.6: the output-liveness bit the tick carries — true iff there is at
- * least one in-flight tool and EVERY one of them has emitted at least one
- * `tool_execution_update`. UNIVERSAL, not existential: the parent uses this to
+ * least one in-flight tool and EVERY one of them has produced RENDERABLE
+ * output (`tool_execution_update` carrying non-whitespace text — #1505; arming
+ * on the update itself made this true from the first tick of every bash call).
+ * UNIVERSAL, not existential: the parent uses this to
  * decide whether silence means "the silent tool is wedged", which is only sound
  * if the silence cannot belong to a tool that never emits at all (a nested
  * `task` — see E279a2). Exported so the direction is pinned by a unit test
@@ -217,6 +241,35 @@ export function computeToolUpdates(
   return any;
 }
 
+/** #1505: does this `tool_execution_update` payload carry output a tool
+ * actually PRODUCED?
+ *
+ * The `tool_updates` bit above is only sound if "emitted an update" means "pro-
+ * duced output". It did not: pi's `bash` tool calls
+ * `onUpdate({ content: [], details: undefined })` UNCONDITIONALLY before the
+ * command has emitted a single byte (`dist/core/tools/bash.js`, the start
+ * tick), and the bundle forwards every `partialResult` to extensions with no
+ * content filter. So the latch armed on the first tick of EVERY bash round and
+ * the parent's clause 1 degenerated into a bare 20-minute silence timeout —
+ * killing silenced-but-working tools (the wedge).
+ *
+ * The test is on the TEXT, not on array length: a real update is
+ * `{ content: [{ type: "text", text: <snapshot> }] }`, and an empty snapshot
+ * renders as `text: ""` — an array-length test would still arm on it. Fails
+ * CLOSED (`false`) on every unrecognised shape, so a payload this predicate
+ * cannot read never licenses a kill. */
+export function hasRenderableOutput(partialResult: unknown): boolean {
+  const content = (partialResult as { content?: unknown } | null | undefined)?.content;
+  if (!Array.isArray(content)) return false;
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if ((part as { type?: unknown }).type !== "text") continue;
+    const text = (part as { text?: unknown }).text;
+    if (typeof text === "string" && text.trim() !== "") return true;
+  }
+  return false;
+}
+
 export function formatTick(nonce: string, f: TickFields): string {
   return (
     `${HEARTBEAT_MARKER_PREFIX} tick nonce=${nonce} ` +
@@ -224,8 +277,99 @@ export function formatTick(nonce: string, f: TickFields): string {
     `stream_age_ms=${f.streamAgeMs} tool_age_max_ms=${f.toolAgeMaxMs} ` +
     `tool_updates=${f.toolUpdates ? 1 : 0} ` +
     `cpu_ms=${f.cpuMs} cpu_stall_ms=${f.cpuStallMs} cpu_advanced=${f.cpuAdvanced ? 1 : 0} ` +
-    `saw_msg=${f.sawMsg ? 1 : 0} saw_tool=${f.sawTool ? 1 : 0}`
+    `saw_msg=${f.sawMsg ? 1 : 0} saw_tool=${f.sawTool ? 1 : 0} ` +
+    `progress=${f.progress ? 1 : 0}`
   );
+}
+
+/**
+ * #5195 — does a streaming assistant event represent PROGRESS?
+ *
+ * "Progress" is a COMPLETED unit of work, or the model producing real content —
+ * not "an update arrived". The distinction is the whole point: the supervision
+ * standard (Temporal activity heartbeats) warns that a worker which reports
+ * liveness rather than progress is indistinguishable from *"a zombie that looks
+ * alive"*, and our own `message_update` handler used to set `turnSawMessage`
+ * with no content inspection at all, so a drip of whitespace deltas latched
+ * every parent-visible signal.
+ *
+ * Pure and exported so the rule is pinned by unit tests and shared with the
+ * registry declaration, rather than living only inside a handler closure.
+ * Typed structurally (not against the SDK union) so this file keeps its
+ * single-type-import contract and stays importable without mocks.
+ */
+export function isProgressContentEvent(
+  ev: { type?: unknown; delta?: unknown; content?: unknown; toolCall?: unknown; message?: unknown } | null | undefined,
+): boolean {
+  if (!ev || typeof ev.type !== "string") return false;
+  const nonEmpty = (v: unknown): boolean => typeof v === "string" && v.trim().length > 0;
+  switch (ev.type) {
+    // The model finished a content block: progress iff it actually holds content.
+    case "text_end":
+    case "thinking_end":
+      return nonEmpty(ev.content);
+    // Incremental content: progress iff this delta is not whitespace/keepalive.
+    case "text_delta":
+    case "thinking_delta":
+      return nonEmpty(ev.delta);
+    // A tool call finished being constructed — a unit of work is about to run.
+    case "toolcall_end":
+      return ev.toolCall != null;
+    // Turn complete. CONTENT-GATED rather than unconditionally true: a bare
+    // `done` on a content-free message is not work, and stamping progress from
+    // it would be the same content-blind mistake this classifier exists to fix.
+    // (pi's agent loop currently routes `done` to `message_end` and never to
+    // `message_update`, so this arm is unreachable today — it is written
+    // defensively so that IF it becomes reachable it cannot forge progress.)
+    case "done":
+      return messageHasContent(ev.message);
+    // Deliberately NOT progress: the content-free openers (`start`,
+    // `text_start`, `thinking_start`, `toolcall_start`), the incremental JSON of
+    // `toolcall_delta` (it completes at `toolcall_end`), and `error` — a turn
+    // that FAILED completed no work, and a child retrying on provider errors is
+    // deliberately still bounded.
+    default:
+      return false;
+  }
+}
+
+/** Does one content block hold real content? Tolerant by design: the SDK types
+ * the message shape, but this file's contract is to import only the
+ * ExtensionAPI type, so the check is structural and never throws on a shape it
+ * does not recognise (an unrecognised block is NOT progress — the fail-safe
+ * direction, since a false progress is what lets a zombie survive). */
+function blockHasContent(block: unknown): boolean {
+  if (typeof block === "string") return block.trim().length > 0;
+  if (!block || typeof block !== "object") return false;
+  const o = block as Record<string, unknown>;
+  // A constructed tool call is a unit of work about to run.
+  if (o.type === "toolCall") return true;
+  for (const key of ["text", "thinking", "content"] as const) {
+    const v = o[key];
+    if (typeof v === "string" && v.trim().length > 0) return true;
+  }
+  return false;
+}
+
+/** Does an assistant/user message carry non-whitespace content? */
+export function messageHasContent(message: unknown): boolean {
+  if (typeof message === "string") return message.trim().length > 0;
+  if (!message || typeof message !== "object") return false;
+  const o = message as Record<string, unknown>;
+  if (typeof o.content === "string") return o.content.trim().length > 0;
+  if (Array.isArray(o.content)) return o.content.some(blockHasContent);
+  return false;
+}
+
+/** #5195 — did a `turn_end` complete a UNIT OF WORK? True iff the turn carried
+ * tool results, or its message holds non-whitespace content. An empty turn (the
+ * E shape: `turn_start`/`turn_end` cycling with nothing produced) is explicitly
+ * NOT progress — that is exactly what let it forge every bound. */
+export function hasTurnContent(event: { message?: unknown; toolResults?: unknown } | null | undefined): boolean {
+  if (!event) return false;
+  const results = event.toolResults;
+  if (Array.isArray(results) && results.length > 0) return true;
+  return messageHasContent(event.message);
 }
 
 // ── #928: non-output liveness for a SILENT in-flight tool ──────────────
@@ -237,6 +381,11 @@ export function formatTick(nonce: string, f: TickFields): string {
 // and why the ONLY bound left for a genuinely wedged silent tool is the
 // multi-hour age backstop (4h by default). The two states the parent must
 // separate are timing-IDENTICAL on every quantity the heartbeat carries today.
+//
+// (#1505 note: `tool_execution_update` still feeds `touchActivity()`
+// UNCONDITIONALLY — that is liveness. What Leg A gates is the EVIDENCE latch:
+// only a RENDERABLE update arms `toolUpdates`. The two are different questions
+// and must not be re-conflated in either direction.)
 //
 // The signal that does separate them is PROCESS LIVENESS. In the #928 incident
 // the in-flight `grep` had accumulated 69m50s of CPU — genuinely working, just
@@ -574,6 +723,74 @@ export function orphanWatchdogActive(env: Record<string, string | undefined> = p
   return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print" && env.ORPHAN_WATCHDOG !== "0";
 }
 
+/** #1500 / #1505 Leg B: is this process a DISPATCHED child — the population
+ * whose `bash` calls get a default timeout?
+ *
+ * Deliberately the same env-parameter seam as `orphanWatchdogActive` above (a
+ * default parameter rather than a raw env read of the print-mode key), because
+ * `extensions/shared/print-mode-wiring.test.ts` (#228) forbids production `.ts`
+ * from naming that key with the `process.env.` prefix. Do not inline the read —
+ * the guard greps the literal, not the semantics.
+ *
+ * `TASK_HEARTBEAT_DISABLE === "1"` must NOT defeat this: the subagent extension
+ * sets it to silence the EMITTER, and those children (reviewers, verification
+ * gates) are exactly the ones that must still get a bounded bash call. It is
+ * therefore NOT `taskHeartbeatActive` and NOT `orphanWatchdogActive` (whose
+ * `ORPHAN_WATCHDOG !== "0"` term is the wrong axis). */
+export function dispatchMarkerActive(env: Record<string, string | undefined> = process.env): boolean {
+  return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print";
+}
+
+/** #1500: the default wall-clock bound on a dispatched child's `bash` call.
+ *
+ * Measured (658,981 completed bash calls across 18.7k retained child
+ * transcripts): p99.9 = 1135.9 s, p99.99 = 2091.5 s, p99.999 = 3689.4 s, max
+ * 5417.8 s (90.3 min). 8 calls exceed 3600 s — 7 of them with NO explicit
+ * timeout — so the 60 min #1500 originally asserted would have destroyed
+ * measured legitimate work; 0 exceed 7200 s.
+ *
+ * The HANG population is by construction absent from a completed-call corpus,
+ * so this bound cannot be derived from what was killed — only set above
+ * demand, and made operator-adjustable. See `TASK_TOOL_TIMEOUT_S`. */
+export const DEFAULT_TOOL_TIMEOUT_S = 7200;
+
+/** #1500 c2/c3: the effective per-call bash bound, or `null` for DISARMED.
+ *
+ *   · ABSENT  → `DEFAULT_TOOL_TIMEOUT_S`. The bound is ON by default; failing
+ *               open here would re-create the class this fixes (an unbounded
+ *               command parks the child forever — pi's own schema says
+ *               "optional, no default timeout").
+ *   · > 0 finite → that many seconds, clamped so pi's OWN `resolveTimeoutMs`
+ *               does not reject the call. `dist/core/tools/bash.js` THROWS
+ *               `Invalid timeout: maximum is 2147483.647 seconds` above its
+ *               `MAX_TIMEOUT_MS`, so an unclamped huge value would not overrun
+ *               a Node timer — it would fail the bash call outright.
+ *               `floor(2147483647 / 1000)` = 2147483 s is the conservative
+ *               whole-second floor of that ceiling (647 ms below the exact
+ *               limit, so no value can sit at the fractional edge).
+ *   · anything else → `null` = DISARMED. Only a value the OPERATOR actually
+ *               supplied can disarm it, and `toolTimeoutDisarmWarning` says so.
+ */
+export function getToolTimeoutSeconds(
+  env: Record<string, string | undefined> = process.env,
+): number | null {
+  const raw = env.TASK_TOOL_TIMEOUT_S;
+  if (raw === undefined) return DEFAULT_TOOL_TIMEOUT_S;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.min(seconds, Math.floor(2_147_483_647 / 1000));
+}
+
+/** #1500 c3: the once-only notice for a DISARMED bound. Pure predicate (the
+ * caller owns the latch) so it is testable without a dispatch; `null` when the
+ * supplied value is fine. Precedent: `streamStallInertWarning`. */
+export function toolTimeoutDisarmWarning(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds > 0) return null;
+  return `[task-heartbeat] warn TASK_TOOL_TIMEOUT_S="${raw}" is not a positive finite number — the dispatched-child bash timeout default is DISARMED; bash calls may park indefinitely.`;
+}
+
 /** Orphan predicate: ppid CHANGED (reparented — covers Linux subreaper
  * adoption to a non-1 pid) OR ppid === 1 (launchd adoption on macOS; also the
  * boot-race arm where the parent died before this extension loaded). */
@@ -749,6 +966,71 @@ export default function (pi: ExtensionAPI) {
   if (orphanWatchdogActive()) {
     armOrphanWatchdog();
   }
+
+  // #1500 / #1505 Leg B: bound the dispatched child's `bash` calls.
+  //
+  // Registered ABOVE the `taskHeartbeatActive()` early return below and gated
+  // on `dispatchMarkerActive` rather than the emitter gate, because the
+  // emitter's own opt-out (`TASK_HEARTBEAT_DISABLE=1`, set by the subagent
+  // extension) is precisely the population whose bash calls must still be
+  // bounded. `bash` only: it is 270/271 of the measured silent-tool class, and
+  // `timeout` is not a field of any other tool's input.
+  //
+  // This is a PRE-EXECUTION hook whose only mutation is one absent field, so it
+  // cannot drift against the tool implementation the way a replacement tool
+  // (a `registerTool` override) would. A caller-supplied `timeout` is never
+  // overridden (#1500 c1) — the bound only fills a hole.
+  if (dispatchMarkerActive()) {
+    let disarmWarned = false;
+    pi.on("tool_call", async (event) => {
+      // This handler is THE ONE hook in this extension whose throw is
+      // DESTRUCTIVE, not merely noisy. Every other `pi.on` here goes through
+      // pi's `ExtensionRunner.emit()`, which try/catches per handler; a
+      // `tool_call` handler runs through `emitToolCall()`, which does NOT — the
+      // throw propagates to `prepareToolCall`, which turns it into an immediate
+      // ERROR tool result and SKIPS execution entirely. So an unguarded throw
+      // here would not degrade the child: it would block EVERY bash call in
+      // EVERY dispatched child. The whole body is therefore best-effort and
+      // swallowed — failing to inject a bound restores exactly the pre-#1500
+      // behaviour, which is strictly better than blocking the tool.
+      try {
+        if (!event || event.toolName !== "bash") return;
+        const input = event.input as { timeout?: unknown } | null | undefined;
+        if (!input || typeof input !== "object") return;
+        // #1500 c1: never override a caller-supplied value. `undefined` means
+        // absent; a `null` is treated as absent too (see below).
+        //
+        // The `!== null` half is defence-in-depth, NOT the mechanism: pi's
+        // `validateToolArguments` runs `normalizeOptionalNulls` BEFORE
+        // `beforeToolCall`, which already DELETES an optional null the schema
+        // rejects (`timeout` is `Type.Optional(Type.Number(...))`), so by the
+        // time this runs a caller-supplied null is normally gone.
+        if (input.timeout !== undefined && input.timeout !== null) return;
+        const seconds = getToolTimeoutSeconds();
+        if (seconds === null) {
+          const warning = toolTimeoutDisarmWarning(process.env.TASK_TOOL_TIMEOUT_S);
+          if (warning && !disarmWarned) {
+            disarmWarned = true;
+            // Must stay on stderr AND stay listed in KNOWN_STDERR_NOISE
+            // (extensions/builtin-tools/index.ts): an unrecognised stderr line
+            // calls the parent's `onRealOutput()`, so an unfiltered one-time
+            // diagnostic would forge `hasOutput=true` and mis-settle a
+            // genuinely zero-output child.
+            console.error(warning);
+          }
+          return;
+        }
+        // Mutate IN PLACE — pi hands `beforeToolCall` the same object it later
+        // passes to the tool's `execute`, so replacing it would silently do
+        // nothing (that propagation is pinned by a test).
+        input.timeout = seconds;
+      } catch {
+        // An observer must never break the child — and here a throw would block
+        // the tool call outright, so this catch is load-bearing, not cosmetic.
+      }
+    });
+  }
+
   if (!taskHeartbeatActive()) return;
 
   // Per-dispatch nonce set by the parent task tool — echoed in every marker so
@@ -765,10 +1047,12 @@ export default function (pi: ExtensionAPI) {
   // KIND (see CPU_LIVENESS_TOOL_NAMES), so the emitter must know what is in
   // flight, not just how many.
   const outstandingTools = new Map<string, { startedAt: number; name: string }>();
-  /** #783 §6.6: which in-flight tools have emitted `tool_execution_update`.
-   * Only streaming tools emit updates — `bash` does, while `task`, `read`,
-   * `edit`, `write` pass `_onUpdate` UNUSED. The tick reports whether EVERY
-   * in-flight tool has emitted (see `computeToolUpdates`): the clause concludes
+  /** #783 §6.6: which in-flight tools have emitted a RENDERABLE
+   * `tool_execution_update` (#1505: the qualifier is load-bearing — pi's bash
+   * emits a zero-byte start update for every call, so unfiltered membership
+   * made this set a statement about the HARNESS, not about output).
+   * The tick reports whether EVERY in-flight tool has produced output (see
+   * `computeToolUpdates`): the clause concludes
    * something about the tool that went quiet, so "SOME tool produced output" is
    * the wrong direction — with a bash that emitted and ended while a nested
    * task is still in flight, an existential latch stayed true and killed the
@@ -779,6 +1063,10 @@ export default function (pi: ExtensionAPI) {
   let turnActive = false;
   let turnSawMessage = false;
   let turnSawTool = false;
+  // #5195: progress observed since the previous tick. Reset by `tick()`, which
+  // reports it — the parent resets its `progressAgeMs` on a tick carrying
+  // `progress=1` (or on a `tool_end` marker it parses directly).
+  let progressSinceTick = false;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
 
   // #928 CPU-liveness state — the clock's mutable state, advanced by the pure
@@ -924,8 +1212,13 @@ export default function (pi: ExtensionAPI) {
         cpuAdvanced: cpu.cpuAdvanced,
         sawMsg: turnSawMessage,
         sawTool: turnSawTool,
+        progress: progressSinceTick,
       }),
     );
+    // Consume the interval flag AFTER reporting it — the parent resets its
+    // progress clock on each `progress=1` tick, so the flag is edge-triggered
+    // per interval, never a sticky latch (#176's lesson applied to progress).
+    progressSinceTick = false;
   };
 
   pi.on("session_start", async () => {
@@ -984,6 +1277,11 @@ export default function (pi: ExtensionAPI) {
     outstandingTools.clear();
     updatedToolIds.clear();
     touchActivity("turn_end");
+    // #5195: a turn that COMPLETED carrying results or non-whitespace content is
+    // a unit of work. An empty turn (`toolResults` empty, no content) is NOT —
+    // that is the empty-turn-loop shape (E), and marking it as progress is
+    // precisely how it forged its way past every bound.
+    if (hasTurnContent(event)) progressSinceTick = true;
     emit(formatTurnEnd(nonce, event.turnIndex));
   });
 
@@ -1011,7 +1309,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_update", async (event) => {
-    updatedToolIds.add(event.toolCallId);
+    // #1505: arm the evidence latch ONLY on a renderable update.
+    //
+    // pi's bash emits an unconditional zero-byte start update before any command
+    // output, so the unfiltered `updatedToolIds.add(...)` that used to sit here
+    // armed `tool_updates` from the first tick of every bash call — which turned
+    // the parent's clause 1 into a bare 20-minute silence timeout and is the
+    // wedge this change fixes. `tool_updates` is now exactly the claim its type
+    // comment makes: this tool round has produced OUTPUT.
+    if (hasRenderableOutput(event.partialResult)) updatedToolIds.add(event.toolCallId);
+    // Liveness is UNCONDITIONAL, and must stay so: `touchActivity` feeds #279's
+    // `everSawRealActivity` and the child's own activity clock. Gating it here
+    // would re-conflate liveness with output-evidence — the same defect, in the
+    // other direction.
     touchActivity("tool_execution_update");
   });
 
@@ -1019,6 +1329,8 @@ export default function (pi: ExtensionAPI) {
     outstandingTools.delete(event.toolCallId);
     updatedToolIds.delete(event.toolCallId);
     touchActivity("tool_execution_end");
+    // #5195: a finished tool is the canonical COMPLETED unit of work.
+    progressSinceTick = true;
     emit(formatToolEnd(nonce, event.toolCallId));
   });
 
@@ -1031,9 +1343,15 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("message_update", async () => {
+  pi.on("message_update", async (event) => {
     // Streaming token deltas — the primary stream-activity signal.
     turnSawMessage = true;
     touchActivity("message_update");
+    // #5195: liveness (`turnSawMessage`) and PROGRESS are different questions,
+    // and conflating them is the bug. `turnSawMessage` stays set by any delta,
+    // exactly as before (#176: the silence bound keys on signs of life); the
+    // progress clock advances ONLY when this delta carries real content, so a
+    // drip of whitespace/retry chatter no longer forges progress.
+    if (isProgressContentEvent(event.assistantMessageEvent)) progressSinceTick = true;
   });
 }

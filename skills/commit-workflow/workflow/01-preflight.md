@@ -219,7 +219,7 @@ BEHIND=$(git rev-list --count HEAD.."origin/$DEFAULT_BRANCH" 2>/dev/null || echo
 | State | Action |
 |---|---|
 | `BEHIND = 0` | Silent — already current. |
-| `BEHIND > 0` + clean tree | `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`, then RE-RUN the affected pre-flight regression tests. If the branch was previously pushed and the post-rebase push is rejected as non-fast-forward → `git push --force-with-lease`. |
+| `BEHIND > 0` + clean tree | **Do NOT rebase for freshness.** Staleness does not block a merge unless the repo under work requires up-to-date branches. The fleet default is now `strict: false` (tortoise `main`, ruled DELIBERATE 2026-09-28 — tortoise #4764): with it there is no must-update, so rebasing here only restarts CI and re-runs the pre-flight regression tests for nothing, and that churn is exactly what left verified PRs unlandable for days. Rebase ONLY if (a) the repo under work requires up-to-date branches (`strict: true`) — check, do not assume — or (b) the branch has an actual conflict. When you do rebase: `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`, then RE-RUN the affected pre-flight regression tests. If the branch was previously pushed and the post-rebase push is rejected as non-fast-forward → `git push --force-with-lease`. |
 | `BEHIND > 0` + dirty tree | **WARN**: "Branch is N behind origin/<default> — commit or stash first, then `git -c commit.gpgsign=false pull --rebase origin <default>`." NEVER autostash (conflict-unsafe unattended). |
 
 **Pre-flight: the main-worktree-guard's branch-ownership gates (#265) run on every bash tool_call.** This skill runs from the session's WORKTREE — agent-infra included (the #99 in-main-work exemption was removed in #615; the agent-infra hub is main+clean like every hub, and in-hub `checkout -b` is BLOCKED there too, #626). In a worktree BOTH the M2/M3 gates and the legacy destructive-block arm are worktree-exempt (`eff.isWorktree`) — M2/M3 apply only to MAIN-checkout-effective mutations, and the legacy arm carries its own exemption — so the pre-flight's own-branch hygiene ops — `pull --rebase`, `rebase`, `merge origin/<default>`, `push` incl. `--force-with-lease` — run ungated on the worktree's branch. The merged-branch cleanup's remote `git push --delete <branch>` is NOT worktree-exempt: it hits the #73 coordinated-delete guard while the branch is checked out in ANY worktree (including this one), so run it after teardown (05-cleanup.md Step 3.8) or use `gh api -X DELETE`. The guard matches the LITERAL ref in the command text — a shell-variable form (`git push origin --delete "$PR_BRANCH"`) is NOT resolved by the classifier and is therefore not guard-matched. The local `git branch -D` is best-effort: git refuses it while checked out, and after teardown the HUB's main-checkout `block:branch-force-delete` gate blocks a branch that is not the session's baseline or pid-owned (a `git worktree add -b` branch is never recorded as owned — create-new is blocked, #626). A guard block rejects the bash call BEFORE the shell runs, so write the teardown note yourself — the `||` echo only covers git's own refusal. If a command is blocked with a "branch ownership violated" message, you are running against the MAIN checkout (a stray `cd`/`-C` back to the hub): return to the worktree and retry — never `git checkout -b` in a hub (blocked for agent-infra and non-infra alike; the M3 create-new carve-out was removed in #626).
@@ -511,7 +511,43 @@ the push actually ships — not the whole index: `git diff
 refs/remotes/<remote>/<branch> <src>` when the remote-tracking ref exists
 (2-dot), or 3-dot against the remote's main on a first push
 (`refs/remotes/<remote>/main` when that ref exists, else the
-`refs/remotes/origin/main` fallback). A parked-WIP index from another session
+`refs/remotes/origin/main` fallback). ⛔ **A HISTORY-REWRITING push is scoped
+against the integration base, never the stale tracking ref (#3716).** When the
+remote-tracking ref is no longer an ancestor of the pushed tip — i.e. the
+branch was `rebase`d after it was pushed — the ref still points at the
+PRE-rebase tip on the OLD base, so the 2-dot range is the whole base delta
+(629 files in the field) instead of the branch's own diff (3), and the retry
+loop cannot converge. Such a push is scoped 3-dot against the integration base
+(the tier-B command form), and the discarded commits are reported
+separately as `gate_skip: non_fast_forward_push` (a report, never a widening of
+the verify set). That switch needs THREE explicit preconditions: the integration
+ref is **declared** — a repo-LOCAL `git config --local vgate.integrationRef`
+(the per-clone operator assertion that ACTIVATES the narrowing; a `--global` /
+`--system` / `GIT_CONFIG_*` value does NOT activate, so a machine-global key
+cannot narrow every clone) whose value is confirmed by a checked-in
+`.vgate/integration-ref` when that file is present (an AGREEMENT TRIPWIRE —
+exactly ONE meaningful line equal to the config; a shared, clone-relative name
+must not activate on its own: a fork clone inherits `refs/remotes/origin/main`,
+where `origin` is the FORK, and honoring it alone reproduces the fail-open one
+level up; a disagreement, extra line, non-regular file, or present-but-unreadable
+file — including a tracked DANGLING SYMLINK — is refused)
+— and `resolveTrustedBase` resolves to exactly that ref
+(never a base judged an integration branch by its NAME, and never the push
+remote's `main`; agent-infra #1491); the remote-tracking ref is NOT an ancestor
+of the pushed tip; **and** the integration base IS an
+ancestor-or-equal of it (so `merge-base(base, HEAD) == base` and every path the
+3-dot range omits is byte-identical to the base TIP's content — the trusted
+integration content). Without the declaration there is NO narrowing (fail
+closed — the full pre-#3716 set is demanded); without the second proof a branch
+that is merely behind
+the base would narrow to a range that omits the paths its force-push REVERTS,
+reporting a content-destroying push as an empty up-to-date one. Any other
+outcome, including an unresolvable probe, leaves the push on its pre-#3716 path
+— the narrowing is taken only on proof, so an unprovable push is never measured
+against a different base than before. A plain fast-forward push is unchanged
+(the narrow incremental range). A rewrite push is never ALSO reported as an
+up-to-date empty range — its single op-level line is the rewrite report. A
+parked-WIP index from another session
 must not block an unrelated push of already-verified committed HEAD; an
 up-to-date push is audited `gate_skip: push_range_empty`. ⛔ Fail-closed
 fallbacks (the range scope is a best-effort resolution, never a widening):
@@ -582,11 +618,26 @@ coverage for every upstream file: recorded incidents went from 39 staged files t
 - **Opt out:** `ELDATO_VGATE_NO_SUBTRACT=1` restores the previous (larger) scope and is
   audited as `subtract_disabled_by_env`. Unlike `ELDATO_SKIP_VGATE` this moves in the
   **stricter** direction, so a task sub-agent is permitted to set it: it can cost time,
-  never coverage.
+  never coverage. It disables the #3716 narrowing as well, so a rewrite push keeps the
+  pre-#3716 2-dot scope too — the opt-out's "previous scope" promise holds for every
+  scope producer (substitution aside, no scope is narrowed while the flag is set).
 
 Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
-`git push` (tier A only; the tier-B/C paths keep their pre-#755 behaviour). Tier-C push
-fallback and rebase/cherry-pick push-leg de-flooding (#737) are deliberate non-goals.
+`git push` (the tracking-ref arm unless the #3716 narrowing applies: the tracking ref is
+NOT an ancestor-or-equal of the pushed tip AND the integration base IS one; the tier-B/C
+paths keep their pre-#755 behaviour). Tier-C push fallback remains a
+deliberate non-goal; **rebase/cherry-pick push-leg de-flooding (#737, delivered in
+2026-09-25 as tortoise #3716) is no longer one** — a history-rewriting push is now
+scoped against the trusted base (3-dot), and no subtraction guard set can subtract from
+that narrowed range (guard (5) cannot pass: the tracking ref is not an ancestor of
+`srcRef`, hence not of `srcRef^1` — and every guard is required; see the push-range
+paragraph above). The narrowing's base must EQUAL the declared integration ref
+(the repo-local `git config --local vgate.integrationRef` — the activation
+surface; a `--global`/env key does NOT activate — confirmed by a checked-in
+`.vgate/integration-ref` tripwire that must declare the same single ref when
+present; agent-infra #1491),
+is resolved on pinned commit OIDs, and is never chosen from a ref name or the
+push remote's `main`. No config ⇒ no narrowing (fail closed).
 
 ### VGATE ceremony diagnostics & recovery (#561)
 

@@ -555,38 +555,63 @@ def decide(
     rotating: dict[str, frozenset[str]] | None = None,
     k_pr: int | None = None,
 
-    # ⚠️ KNOWN, ACCEPTED, DOCUMENTED GAP — owner-authorized "Option B" on tortoise #3756.
+    # THE RATE TOLERANCE — owner-authorized "Option B" on tortoise #3756, whose deferred
+    # residual is PARTLY CLOSED by the TOTAL-failure guard below.
     #
-    # THIS IS A FAIL-OPEN IN THE EXEMPTION PATH. It is documented, not fixed, and the fix is
-    # deferred BY THE OWNER — do not "fix" it here by surprise, and do not mistake it for an
+    # This parameter still carries an accepted fail-open, and its remaining shape is stated
+    # here so the next reader neither "fixes" it by surprise nor mistakes it for an
     # undiscovered bug.
     #
-    # THE FAILURE MODE (state it plainly — the next reader needs this, not the arithmetic):
-    # the tolerance is MULTIPLICATIVE, so the band that counts as "rates equivalent" WIDENS in
-    # absolute terms as main's rate rises. A PR that fails EVERY SINGLE RUN is therefore EXCUSED
-    # once main is broken enough — A DETERMINISTIC TOTAL FAILURE TREATED AS A RATE FLUCTUATION.
+    # THE FAILURE MODE it carried (kept, in the PAST tense, because the shape recurs and the
+    # next reader needs to know why this parameter stays suspicious): the tolerance is
+    # MULTIPLICATIVE, so the band that counts as "rates equivalent" WIDENS in absolute terms as
+    # main's rate rises. A PR that failed EVERY SINGLE RUN WAS therefore EXCUSED once main was
+    # broken enough — A DETERMINISTIC TOTAL FAILURE TREATED AS A RATE FLUCTUATION.
     #
     # Concretely, with the default 1.5, THE RATE CONDITION for exemption is
     # `pr_rate <= mr.rate * 1.5` — and note that this is the NECESSARY rate test, not the whole
     # rule: FIVE earlier gates BLOCK first and are checked in order ahead of it — an empty PR
     # sample, a rotating/UNATTRIBUTABLE identity, an id absent from `main_rates`, non-overlapping
     # signatures, and `mr.runs < min_runs`. Only if all five pass does the rate test decide.
-    # A PR failing every run has `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — ONCE MAIN IS
-    # ABOUT TWO-THIRDS BROKEN (~0.667) — the rate test no longer stops it, and it is EXEMPTED
-    # provided those earlier gates held. Past that point the gate reads a total, deterministic
-    # failure as "no worse than main", and the more broken main gets, the wider this door opens.
+    # A PR failing every run has `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — once main was
+    # about two-thirds broken (~0.667) — the rate test did not stop it, and it was EXEMPTED
+    # provided those earlier gates held. THE TOTAL-FAILURE GUARD BELOW CLOSES THAT BAND FOR
+    # EVERY MAIN THAT IS NOT ITSELF SATURATED; the main-total point inside the band is left to
+    # the rate test, per #3756 §11 (see CLOSED below).
     #
-    # Note the asymmetry, which is why this is a fail-open and not a tuning complaint: the input
+    # Note the asymmetry, which is why this WAS a fail-open and not a tuning complaint: the input
     # on the PR side is a TOTAL failure (every run failed) while the input on the main side is a
-    # SAMPLE over a finite `k`. The comparison therefore weighs a stronger signal against a weaker
-    # one, and the tolerance grows as the weaker side degrades. (`pr_rate` is still a rate over a
-    # finite sample, so "total" here means "every observed run", not an infinite certainty — the
-    # asymmetry is real but it is one of evidence strength, not of logical certainty.)
+    # SAMPLE over a finite `k`. The comparison therefore weighed a stronger signal against a
+    # weaker one, and the tolerance grew as the weaker side degraded. (`pr_rate` is still a rate
+    # over a finite sample, so "total" here means "every observed run", not an infinite certainty
+    # — the asymmetry is real but it is one of evidence strength, not of logical certainty.) The
+    # guard below closes this asymmetry FOR THE TOTAL CASE; its NON-total shadow survives and is
+    # stated under REMAINING RESIDUAL.
     #
-    # DEFERRED FIX DIRECTION (owner-authorized as a follow-up, NOT to be applied here): a tolerance
-    # that cannot excuse a TOTAL failure — e.g. an absolute floor, or refusing to exempt whenever
-    # `pr_rate` is exactly 1.0 — since no rate comparison can make a 100% failure equivalent to
-    # anything.
+    # CLOSED in this module by the total-failure guard below (the residual Option B deferred —
+    # agent-infra #1209/#1211; tortoise #3762 tracked the vendored tortoise copy, whose fix
+    # arrives by the vendor sync): a TOTAL PR failure is no longer excusable by this tolerance.
+    # The guard refuses a saturated PR rate WHEN THE PR SAMPLE IS MEASURABLE (`k_pr >= min_runs`)
+    # unless main's measured rate is ALSO saturated, because the one case where "as broken as
+    # main" is literally true is when main is total too. A thinner PR sample never reaches the
+    # guard at all — it is decided earlier on attribution (#5250) WHEN MAIN'S RATE IS NON-ZERO
+    # (`mr.rate > 0`; a zero main rate never satisfies that branch and is blocked on the rate
+    # comparison), where saturation is not evidence of determinism. Lowering `rate_tolerance`
+    # cannot make that separation without over-blocking: at `tol == 1.0` the band closes for
+    # every non-total main rate (so `6/8` vs `8/8` blocks) while saturated-on-saturated still
+    # exempts, but the authorized non-total residual `6/8` vs `7/8` is blocked too. So the
+    # distinction is expressed as a PREDICATE, not as a constant. The
+    # guard is deliberately NARROWER than a blanket "`pr_rate == 1.0` -> BLOCK": that would refuse
+    # `main 4/4` vs `PR 4/4`, which #3756 §11 PERMITS as an exemption (it requires the RECORDING,
+    # not the refusal), and total-on-total is the one case where the exemption is literally
+    # "no worse than main".
+    #
+    # REMAINING RESIDUAL (still accepted, unchanged): for a NON-total PR rate the tolerance still
+    # widens as main degrades — `main 6/8` vs `PR 7/8` is exempt. That is the authorized trade;
+    # only the deterministic-TOTAL case is closed, and it is the case the comparison has no
+    # information to decide. (A saturated PR whose sample is thinner than `min_runs` is likewise
+    # still exempt on attribution WHEN MAIN'S RATE IS NON-ZERO — the #5250 path above, not this
+    # tolerance; with a zero main rate it blocks on the rate comparison.)
     rate_tolerance: float = 1.5,
     min_runs: int = 3,
 ) -> Decision:
@@ -615,6 +640,14 @@ def decide(
       file), so this second use of ``min_runs`` is caller-declared and table-wide,
       UNLIKE the per-id MAIN floor above.
     * PR rate materially above main's -> **BLOCK** (the PR made it worse).
+    * PR failure is TOTAL (every observed run failed) while main's measured rate is
+      NOT total -> **BLOCK** (a deterministic failure is not a rate fluctuation, and
+      no tolerance makes it equivalent to a sampled one — the residual Option B
+      deferred, tortoise #3762). Applies only to a MEASURABLE PR sample
+      (``k_pr >= min_runs``); a thinner one is decided earlier on attribution. Checked
+      AFTER the tolerance test, so a case the tolerance already refuses keeps its
+      "materially higher" reason; when main IS total this is skipped and the rate
+      test decides, so ``main 4/4`` vs ``PR 4/4`` stays exempt.
     * otherwise (the rate comparison passed) -> **EXEMPT**, recorded with both rates.
 
     ``main_rates`` is a RATE per id, not a set of ids: presence alone is never
@@ -730,12 +763,30 @@ def decide(
         # strongest exemption was bought with no evidence at all. A PR failure main
         # never had is a NEW failure, and `pr_rate > 0` against a zero main rate
         # blocks it.
+        # A TOTAL PR failure is NOT a rate fluctuation (the closed residual above,
+        # tortoise #3762). Saturation is tested on the MEASURED counts, not a float
+        # compare. The exemption survives only when main is saturated too — the one
+        # case where "no worse than main" is literally true.
+        #
+        # It sits AFTER the tolerance test deliberately: a failure the tolerance
+        # ALREADY refuses keeps its "materially higher" verdict, so this guard adds
+        # exactly the case the ratio cannot decide rather than re-labelling cases it
+        # can. Nothing in the tolerance's arithmetic can be trusted not to bridge a
+        # degenerate signal, which is why the case is carved out rather than tuned.
         pr_rate = pr.rate.rate
         if pr_rate > mr.rate * rate_tolerance:
             decision.blocked.append(Verdict(
                 nodeid, True,
                 f"PR rate {pr.rate} materially higher than main {mr} "
                 f"(>{rate_tolerance}x) — the PR made it worse"))
+            continue
+
+        if pr.rate.failures == pr.rate.runs and mr.failures != mr.runs:
+            decision.blocked.append(Verdict(
+                nodeid, True,
+                f"PR failure is TOTAL ({pr.rate}) while main is {mr} — a "
+                "deterministic failure is not a rate fluctuation, and the "
+                f"{rate_tolerance}x tolerance does not bridge a saturated signal"))
             continue
 
         decision.exempt.append(Verdict(

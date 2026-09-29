@@ -1,0 +1,32 @@
+# The integration ref the #3716 push-scope narrowing may use as its base.
+# Declared explicitly (agent-infra #1491): the narrowing never infers the
+# integration ref from a ref NAME, because in a fork-as-`origin` layout or a
+# master-default repo with a legacy `main`, the name matches a ref that is NOT
+# the integration branch.
+#
+# ⛔ THIS FILE IS AN AGREEMENT TRIPWIRE, NOT AN ACTIVATION SURFACE. It is checked
+# in, so it is a SHARED, clone-relative NAME: a fork clone inherits it, and here
+# `refs/remotes/origin/main` is the FORK's main — honoring the file alone
+# reproduces the fail-open one level up. The narrowing activates on the
+# per-clone operator assertion, and ONLY the repo-local scope counts:
+#
+#     git config --local vgate.integrationRef refs/remotes/origin/main
+#
+# (A `--global`/`--system`/`GIT_CONFIG_*` declaration does NOT activate — the
+# read is `--local`, so a machine-global key cannot narrow every clone.)
+#
+# When this file is present it must declare EXACTLY ONE meaningful line equal to
+# the config (a `#` comment or blank line is ignored). Any disagreement, a second
+# meaningful line, a dangling symlink (in the file OR in `.vgate` itself), any
+# non-regular file (directory/FIFO), or a present-but-unreadable file is refused.
+# Presence is decided by `lstat`, not by the read's errno — a tracked dangling
+# symlink is still present. No config ⇒ NO narrowing (fail closed): the full
+# pre-#3716 set.
+#
+# ⚠️ In a clone where `origin` is NOT the canonical remote (a fork clone), leave
+# the per-clone `vgate.integrationRef` UNSET. `resolveTrustedBase` returns the
+# FORK's `origin/main`, and this checked-in file also declares `origin/main` — so
+# declaring `refs/remotes/origin/main` is the one value that AGREES with both, and
+# it would narrow the push against the FORK. Any other declared ref disagrees with
+# this file and is refused. No config ⇒ no narrowing is the safe state.
+refs/remotes/origin/main

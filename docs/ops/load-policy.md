@@ -82,6 +82,9 @@ threshold — a single-sample dip between suspend and resume never thrash-resume
 | `GIT_REMOTE_TIMEOUT_MS` | load-scaled base `5_000` (x1/2/3 by loadavg tier; `TASK_LOAD_SCALE_OFF=1` → `5_000`) | slack-bridge `gitRemoteTimeoutMs()` | git config lookup cap (#196 fold, #232) |
 | `TREE_KILL_EXEC_TIMEOUT_MS` | `5_000` | tree-kill `execTimeoutMs()` | pgrep/ps cap on the kill path (#196 fold) |
 | `PROCESS_SWEEP_EXEC_TIMEOUT_MS` | `5_000` | process-sweep `sweepExecTimeoutMs()` | pgrep/ps cap on the settle-path sweep + the own-pgid probe (#1074). Aligned with `TREE_KILL_EXEC_TIMEOUT_MS` for the same binaries; the override exists so a test can force a deterministic probe timeout with a PATH shim |
+| `TASK_PROGRESS_AGE_MS` | `2_700_000` (45 min) | builtin-tools `no-progress` clause (#5195) | how long a **task** child with NO tool in flight may go without a COMPLETED unit of work (a `tool_end`) or content-grounded child progress (`progress=1` on a tick — see §6). The only bound in the family keyed on **progress** rather than liveness, and deliberately **NOT load-scaled and NOT latched**: a bound that widens is how this class escaped every other clause (`#363` 2h→6h, `ea22897` making the stream-stall bound per-dispatch). Floored at the **reporting cadence** — `max(60 s, 3 × the tick interval)` — because the parent can only see progress when the child reports it and the tick interval is settable to 300 s; the value is honoured verbatim above that floor. `0` = OFF (explicit off switch); blank/malformed → the default (never off by a typo). **45 min is the repo's own declared ceiling for the child's retry/hang window** — `HANG_WINDOW_CEILING_MS` in `scripts/check-cost-config.sh`, whose §2 counterpart (`cost-config-policy.md`, which derives the figure and calls it a *no-progress window*) requires that window to sit ≤ this ceiling. Setting this bound **below** it would pre-empt a chattering retrying child's own bounded, visible recovery (`auto_retry_end`); see §6. |
+| `TASK_CPU_STALL_MS` | `1_800_000` (30 min) | builtin-tools `tool-dead` clause (#928) | how long an in-flight, output-silent tool may consume no CPU before it is treated as deadlocked — the complement of `tool-silence`, and the only bound that reaches a tool which never emitted a **renderable** update (#1505: pi's bash emits an unconditional zero-byte start update for every call, so "emitted an update" was never the same as "produced output" — the `tool-silence` clause used to arm on the first tick of every bash call). Floored at 60 s; `0` = OFF; blank/malformed → the default. **Since #5389 this bound is also the PROGRESS GATE for the `tool-silence` clause**: that clause now fires only when output has been silent past `TASK_STREAM_STALL_MS` **and** this channel reports no progress (demonstrated CPU work, then flat past this bound), so `TASK_CPU_STALL_MS=0` stands **both** in-flight tool clauses down to the `tool-stall` age backstop rather than leaving one of them armed on silence alone. The `unknown` population that falls back is larger than a failed probe — an ineligible tool kind, an unattributable sample, `0`, or a round whose CPU never increased (including work that finished before the first sample tick) — and at the shipped defaults C binds, so `tool-silence` fires at max(S, C) = 30 min. *(Pre-existing omission: the clause and its knob shipped in #928 but were never added to this table; recorded here so §3 is the complete vocabulary it claims to be.)* |
+| `TASK_TOOL_TIMEOUT_S` | `7200` (`DEFAULT_TOOL_TIMEOUT_S`) | task-heartbeat `getToolTimeoutSeconds()` (#1500) | the wall-clock bound injected into a **dispatched child's** `bash` call — filled by a `tool_call` hook only when the caller supplied no `timeout`, so an explicit value is never overridden. **Absent → ON** (the defect was that pi's own bash schema has *"optional, no default timeout"*, so an unbounded command parked the child permanently); a value the operator *supplies* that is non-positive, non-finite or unparseable → **DISARMED**, with a once-only warning on stderr. Clamped to `floor(2147483647/1000)` s so pi's own `resolveTimeoutMs` does not reject the call. Measured, not guessed: across 658,981 completed bash calls the maximum was 5417.8 s and **8 exceeded 3600 s (7 with no explicit timeout)**, so the bound sits above every observed legitimate call. Note it bounds **every** dispatched child's bash — reviewer, verification-gate and design-reviewer children included — which lowers the effective ceiling for such a call from clause 2's 4 h to 2 h. |
 
 **One-line ordering-clamp note:** the watchdog has no scale config to order —
 its bands are fixed literals and it does **not** read `LOAD_SUSPEND_THRESHOLD`
@@ -244,6 +247,85 @@ unconditionally.
   — the measured #1030 wedges were five single silent calls of 1203–1341s against
   the 1200s default. It is **not** a workaround for a genuinely wedged tool: the
   age backstop and the hard cap are untouched by S.
+- **The `no-progress` clause (#5195) — the only bound on PROGRESS rather than liveness.**
+  Every other clause in the detector infers "wedged?" from a *liveness* signal,
+  and every liveness signal is forgeable by a process that is alive but doing
+  nothing: `stateFresh` re-arms the **backstop** (the 6h hard cap itself is
+  one-shot and NOT gated on it), every marker
+  receipt and turn transition resets the stream clock, the first-message bound
+  latches off for the rest of the dispatch once a session has done any work, and
+  the tool clauses all need a tool. Those composed into a class bounded by
+  nothing below the 6h backstop, and two shapes reached it — a content-free
+  **empty-turn loop** and a no-progress **drip stream** (both keep heartbeat
+  ticks flowing, so silence never fires). The new clause fires when a dispatch
+  with **no tool in flight** goes longer than `TASK_PROGRESS_AGE_MS` (§3) without
+  a completed unit of work: a parsed `tool_end`, or a tick carrying `progress=1`.
+  `progress=1` is the child's content-grounded signal — a completed tool, a
+  finished turn carrying results/content, or non-whitespace streamed text.
+  **Ticks, turn boundaries and fresh markers never advance it**, which is the
+  property no other clause has.
+  - **45 min = the ceiling the repo already declares for this bound.** It is
+    `HANG_WINDOW_CEILING_MS` in `scripts/check-cost-config.sh` — the ceiling §2's
+    counterpart in `cost-config-policy.md` requires the derived IDLE-CUT window
+    (stated there, not restated here) to sit under. Setting X below *that* window
+    is a defect rather than extra safety: a child chattering on provider retries
+    with the network **up** keeps every liveness signal fresh while completing
+    nothing — exactly the shape this clause catches — so a shorter X would
+    convert the child's own visible `auto_retry_end` recovery into a
+    parent-side partial-result kill.
+  - **The gap that leaves, named (review cycle 2).** `check-cost-config.sh`
+    declares a **second, larger** window: the worst case where every attempt
+    burns its full provider timeout, carrying its own ceiling
+    (`WORST_WINDOW_CEILING_MS`). X clears the idle-cut window and sits **below**
+    that one. So it is *not* true that X always lands after the child's own
+    recovery: a child whose provider is streaming keepalive frames with no
+    content, or one past its retry budget running compaction (which emits no
+    parent-visible progress), can be cut before the `auto_retry_end` it would
+    have reported — and that settle is a **partial-result kill**, not a success.
+    This is a deliberate **policy** choice, not an oversight: no completed unit
+    of work for 45 min is treated as wedged, and 45 min is the ceiling the repo
+    already declares for this bound. `builtin-tools.test.ts` cross-reads **both**
+    declared ceilings and pins the **band** between them (the worst ceiling must
+    stay within one doubling of the idle-cut one); a *rewritten* guard is caught
+    by the guard's own coupling test (`tests/cost-config/run.sh`, "doc↔guard
+    coupling broken"), not by that cross-read. X still sits ~8×
+    below the 6 h backstop.
+  - **Deliberately NOT load-scaled and NOT latched.** Every sibling bound
+    widens under load or latches monotonically, and that widening is exactly how
+    this class escaped (`#363` raised the hard cap 2h→6h; `ea22897` made S —
+    the previous exemption's *width* — a per-dispatch dial). A progress bound
+    that scaled would reproduce the bug it exists to fix. Pinned by test.
+  - **Floored at the reporting cadence**, `max(60 s, 3 × tick interval)`: the
+    parent can only learn about progress when the child reports it, and the tick
+    interval is settable to 300 s, so a bound below the cadence would fire
+    before the evidence it waits for arrives.
+  - **Fail-closed on the wire.** A child too old to emit `progress` gets its
+    progress clock anchored at `startedAt` and still earns credit from
+    `tool_end` (every version emits it), but nothing for content: a tool-less,
+    content-only dispatch older than X on a skewed child **is** cut. Stated
+    because the alternative — treating a missing field as an exemption —
+    re-opens the hole in a less visible form.
+  - **The silence clause no longer accepts `stream_stall_ms` as an exemption.**
+    The `exempt` predicate used to be `… && (toolsInFlight > 0 ||
+    effStreamAge <= stream_stall_ms)`. Because S is settable per dispatch, that
+    made the *width of the exemption* an operator dial. It was also unreachable
+    at the shipped defaults — `effStreamAge = streamAgeMs + markerAge` and
+    `silenceMs ≤ markerAge`, so reaching `effStreamAge ≤ S` under a silence kill
+    needs `S > T`, and shipped S (20 min) is below T (30 min). Removing it costs
+    nothing at the defaults and deletes the dial (pinned by the #5195 proof
+    test). **The one population it does change:** a dispatch that RAISES S — it
+    is a model-settable `task` argument, and the fleet uses it — loses the extra
+    quiet tolerance for a **no-tool** child, whose bound drops from S to T. That
+    tightening is intended and is the point of the clause: a tool-less child
+    emitting bytes but completing nothing is this clause's target, while S is
+    still honoured verbatim by the in-flight-tool clauses it was introduced for.
+    S still owns `stream-stall` verbatim, and is never clamped. **Since #5389
+    `tool-silence` is `S ∧ C`, not `S` alone** (the clause now also requires
+    positive no-progress evidence from the CPU channel), and at the shipped
+    defaults C (30 min) is the binding bound — so `TASK_CPU_STALL_MS=0` stands
+    that clause down too. The #1070 rule this sentence defends is unchanged: no
+    operator-named number is clamped, only conjoined. **#1070
+    ("warn, never clamp") is honoured — no operator-named number is clamped.**
 - A task child's git is **non-interactive by construction** (#1030): the child
   env forces git's editor, sequence-editor and terminal-prompt variables to a
   no-op / `0` respectively, and writes them *after* the ambient env spread so a
