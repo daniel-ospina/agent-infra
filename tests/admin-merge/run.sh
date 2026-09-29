@@ -4959,11 +4959,12 @@ grep -q "yielded NO EXECUTED job" "$SCEN/err" && pass "…refusing with the STAL
   || fail "the bounded refusal does not name the empty reference: $(head -3 "$SCEN/err")"
 
 # (r4) THE ID GUARD IS POLARITY-AWARE. A listing line that does not address a run
-# used to fail the WHOLE side. For a run that has not finished there is no SETTLED
-# job list to read, so its missing id cannot hide coverage — refusing on it blocked
-# every merge for a reason unrelated to the PR. An unaddressable run whose status
-# IS not a NAMED IN-FLIGHT status still refuses (that half is pinned by (n)); the
-# skip is an ALLOW-list (#1353 polarity), never a deny-list.
+# used to fail the WHOLE side. For a run that is still running there is nothing
+# settled to compare against, so refusing on it blocked every merge for a reason
+# unrelated to the PR — while reading its still-changing job list would block every
+# merge WHILE main's lane runs. An unaddressable run whose status is NOT a named
+# in-flight spelling still refuses (that half is pinned by (n)); the skip is an
+# ALLOW-list (#1353 polarity), never a deny-list.
 new_scen vacuousnonmeasid
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9111 > "$SCEN/runs-$HEAD_VP"
@@ -4979,6 +4980,14 @@ grep -q "unparsable lane-run listing line" "$SCEN/err" \
   && fail "a non-measuring line was named as an unparsable listing" || pass "…and it is never named as an unparsable listing"
 grep -q "pr merge" "$SCEN/calls" && pass "…so the merge proceeds on the reference the window DID carry" \
   || fail "no merge issued although main's completed run carries a real reference"
+# …and a window that needed NO widening must not CLAIM one: the disclosure is
+# decided on `${LANE_PARITY_MAIN_WINDOW} -gt ${MAIN_RUNS}`, and a false "widened"
+# in posted evidence is a lie the operator has no way to check. Of the widening
+# scenarios below, this is the one that certifies with a reference that FITS the
+# requested window.
+grep -q "reference window:" "$SCEN/comment" \
+  && fail "the certificate CLAIMS a widened reference although the requested window carried one" \
+  || pass "…and a reference that FIT the requested window is not disclosed as widened"
 
 # (r5) THE STALE REFERENCE IS NAMED AS STALE. Completed runs whose job lists are
 # empty (purged, zero-job, or no longer served) yield no shard — and the old

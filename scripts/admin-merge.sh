@@ -1312,11 +1312,13 @@ lane_run_measured() {
 # #4844 — the window is spent on MEASUREMENTS, not on raw positions.
 #
 #   * The id guard failed the WHOLE side for a line whose run could not be
-#     addressed — including a run that had not finished. Skipping a
-#     non-consultable run cannot hide coverage (its shard list is not settled),
-#     so refusing on it blocked every merge for a reason unrelated to the PR. The
-#     guard is now POLARITY-AWARE: an unaddressable CONSULTABLE run is still a
-#     hard refusal; an unaddressable non-consultable one is skipped and counted.
+#     addressed — including a run that had not finished. Refusing on a
+#     not-yet-finished run blocked every merge for a reason unrelated to the PR,
+#     and reading its still-changing job list instead would block every merge
+#     while main's lane runs (the declared residual above). So the guard is now
+#     POLARITY-AWARE: an unaddressable run that is NOT a named in-flight spelling
+#     is a hard refusal (it may well be finished, and its shards would then be
+#     lost); an unaddressable named-in-flight one is skipped and counted.
 #   * `--limit` named a RAW window, so a push burst — each push cancelling its
 #     predecessor, leaving `completed/cancelled` runs that are terminal but
 #     MEASURED NOTHING — filled it and pushed the last usable reference OUT of
@@ -1361,10 +1363,11 @@ lane_shard_set() {
     # FINAL line with no trailing newline in scope instead of dropping it.
     #
     # #4844 keeps that invariant while removing the FALSE refusal: every non-blank
-    # line increments $parsed exactly once — consulted, skipped as non-consultable,
-    # re-listed from an earlier pass, or ranked beyond the window. The invariant
-    # that replaces "fail on any line we cannot address" is "never fail on a line
-    # whose run provably contributes no shard".
+    # line increments $parsed exactly once — consulted, skipped as a NAMED in-flight
+    # run, or re-listed from an earlier pass. The invariant that replaces "fail on
+    # any line we cannot address" is "fail on every unaddressable line EXCEPT a
+    # named in-flight one" — that single skip is the declared residual above, not a
+    # claim that the skipped run contributed nothing.
     listed="$(grep -c '[^[:space:]]' "$listing" 2>/dev/null || true)"; listed="${listed:-0}"
     parsed=0; consulted_n=0; measured=0; nonmeas=0
     while IFS=$'\t' read -r status conclusion id || [ -n "${status:-}" ]; do
@@ -1380,9 +1383,9 @@ lane_shard_set() {
         return 1
       fi
       if lane_run_in_flight "$status"; then
-        # In flight: no settled job list to read, so it can contribute no shard
-        # and cannot spend the window. Counted so the refusal can say how much of
-        # the window was mid-run rather than implying the lane was empty.
+        # In flight: not read at all (the declared residual above), and it cannot
+        # spend the window. Counted so the refusal can say how much of the window
+        # was mid-run rather than implying the lane was empty.
         nonmeas=$((nonmeas + 1))
         continue
       fi
