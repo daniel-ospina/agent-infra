@@ -889,6 +889,11 @@ confirmation bias.
 
 Serialize surviving issues to JSON: `[{"severity":"P1","location":"...","description":"...","suggestion":"..."}]`
 
+⛔ **A finding is a CLAIM, not a fact — the fixer VERIFIES before it applies** (`AGENTS.md` →
+"Finding Verification"). Dropping this step is how a false finding ships: a missed finding leaves the
+code as it was, but a false correction changes it *and marks the change as an improvement* (#5014).
+The fixer reports an unverifiable or falsified finding back instead of "fixing" it.
+
 For each cycle:
 
 1. **Dispatch fixer sub-agent** via Pi `task` (fresh `pi -p` session):
@@ -903,14 +908,22 @@ For each cycle:
    Affected files: <list from PR diff>
    PR branch: <branch name>
    
-   1. RESEARCH FIRST: For each issue involving external APIs, library behavior, or unfamiliar patterns → run web_search to verify the correct approach before fixing. Skip only for purely internal issues. No query cap — mistakes cost more than queries.
-   2. Confirm the PR branch is checked out in your worktree — if not, STOP and report; do NOT `git checkout <branch>` in a hub (#626)
-   3. For each issue, make the minimal fix (using research findings)
-   4. Commit with message: fix(code-review): automated fixer cycle N — PR #<N>
-   5. Push
+   1. VERIFY FIRST — a finding is a CLAIM, not a fact: for EACH issue, open the primary source it CITES (the line range, the file, the `gh` output, the commit) and confirm the source actually says what the finding says it does. The finding's prose is not the source. If it does NOT hold: do NOT change the code — report it back as `FALSIFIED: <issue> — <what the source actually says>` and exclude it from FILES_WRITTEN. If it cites NOTHING that can be checked, report `UNVERIFIABLE: <issue>` and do not apply it. A `⚠️ CORRECTED` marker in the finding is not evidence — it records that text changed, not that the change was right. **A decline does not clear the gate**: the fresh scan decides, and you should decline rather than apply a finding you have just verified as false.
+   2. RESEARCH FIRST: For each VERIFIED issue involving external APIs, library behavior, or unfamiliar patterns → run web_search to verify the correct approach before fixing. Skip only for purely internal issues. No query cap — mistakes cost more than queries.
+   3. Confirm the PR branch is checked out in your worktree — if not, STOP and report; do NOT `git checkout <branch>` in a hub (#626)
+   4. For each VERIFIED issue, make the minimal fix (using research findings)
+   5. Commit with message: fix(code-review): automated fixer cycle N — PR #<N>
+   6. Push
    
-   Return FILES_WRITTEN: <comma-separated> and STATUS: done|failed.
+   Return FILES_WRITTEN: <comma-separated>, STATUS: done|failed, and any FALSIFIED:/UNVERIFIABLE: lines.
    ```
+
+   **Fold any `FALSIFIED:` / `UNVERIFIABLE:` lines the fixer returned back into the surviving
+   issues** — a declined finding is NOT a resolved one. It must reach the PR comment and the
+   re-review, and it can never be counted toward a clean exit: the gate clears only when a fresh
+   reviewer returns zero issues (see `references/fixer-loop.md`: the Gate-clearing rule and the L4
+   no-change branch, which falls through to the fresh scan instead of exiting clean — exactly for
+   this reason).
 
 2. **Re-review**: Run `--re-review` on the new commits. This dispatches FRESH reviewer
    sub-agents via `task` — they see only the current code, not what was "just fixed."
@@ -1183,6 +1196,97 @@ Recorder = the micro flow (03-code-review.md Step 2). The merge ceremony must
 NOT self-certify a fresh record: if the gate blocks, run the review
 appropriate to the tier (this skill at standard/complex; the micro flow at
 micro), then record.
+
+### Step 10b — Low-risk content-only recording: verdict `clean-low` (#1348)
+
+The canonical tier table's Low *code-impact* class — the `Code impact` column's
+Low value in `proportional-gates` §Change Classification (`docs`/CSS/strings,
+mapped by that file's §Review Cycles to a single reviewer and no cycle loop) —
+had no representation in the merge gate. A PR whose DIFF is
+content-only but whose LINKED ISSUE is `complexity:standard`/`complex` could
+record neither verdict honestly: `clean` attests a code-review convergence
+that, per the Low class, did not happen; `clean-micro` is refused (exit 4) by
+the #513 tier guard, because that guard reads the LINKED ISSUE's tier, not the
+DIFF's shape. `clean-low` is that missing representation. It attests:
+
+> every changed path of the recorded revision is prose or a stylesheet — no
+> program code, no config file, no enforcement input. (The class is path+extension
+> based and does not consult a build graph: a repo may package or consume a
+> `docs/**` file as build data. That is accepted, declared, and the attestation
+> wording is scoped to what the guard can actually read. The Low tier's single
+> reviewer pass is your obligation — nothing in the script can observe it.)
+
+Use it ONLY when the whole diff is content-only. `record-review.sh` verifies the
+shape itself, from the diff AT THE RECORDED SHA, and REFUSES (exit 4, no record,
+no marker) otherwise. The class is deliberately NARROWER than the tier table's
+Low *code-impact* class: **config and i18n strings are excluded** (a config change is where a
+runtime-behaviour change hides), and so are root-level instruction files
+(`AGENTS.md`, `MEMORY.md`, `VENDOR.md`), `skills/**`, `.github/**`,
+`templates/**`, `scripts/**` and `extensions/**`. Admitted: `docs/**` with a
+content extension (`.md`, `.markdown`, `.txt`, `.rst`, `.adoc`, `.css`,
+`.scss`) and the named root prose files (`README.md`, `CHANGELOG.md`,
+`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`). `.mdx` and `.html` are
+NOT admitted — both are build-consumed program content. Because the class is an
+ALLOWLIST, a docs change that ALSO adds a non-prose file (an image, `.json`,
+`.csv`, `.svg`) is refused as well: it has no honest Low verdict, so it takes
+the normal route — the code-review skill, then `clean`.
+
+```bash
+# ~/.pi/agent/scripts/record-review.sh is not on PATH — use the explicit path.
+~/.pi/agent/scripts/record-review.sh <PR_NUMBER> <FULL_HEAD_SHA> clean-low <owner/repo>
+```
+
+Every guard arm is FAIL-CLOSED — an unverifiable shape is never "certified
+Low". Unlike `clean-micro`, whose fail-open arm is safe because its label only
+cross-checks a flow that already ran, there is no second evidence behind
+`clean-low`: the shape IS the attestation. Refused: repo undetectable or `gh`
+missing; the PR-meta or diff read fails; an empty file list; a file list at
+GitHub's 300-entry compare cap (it may be truncated); a distinct-path count
+that disagrees with the PR's `.changed_files`; a malformed diff row, a rename
+without its old path, a copy, or an unknown status; `--force-stale` (refused at
+**exit 2** as an argument-level contradiction, not exit 4 — the attestation must
+describe the revision a consumer will actually read); and any
+path outside the class — including a content-only path mixed into a diff that
+also touches code. Re-record at the current head after any push.
+
+The local merge gate accepts `clean-low` under the SAME head binding as `clean`
+PLUS a content binding. The record carries the **merge base** of the three-dot
+diff `compare/<base>...<head>` — the commit that identifies the certified
+content — and the gate re-derives it, refusing with reason `base_advanced` when
+it no longer matches and `base_unverifiable` when either side cannot be read
+(absent/invalid in the record, or a `gh`/API failure). A benign advance of the
+base branch, which changes its tip but not the merge base, does NOT block: the
+certified diff is unchanged. It does NOT re-derive the content shape (the record
+is the attestation, and the producer guard is the only place the shape is read).
+
+The two `base_*` refusals are different events, and they are NOT cleared the same
+way. `base_advanced` means the certified diff ITSELF changed — re-check whether
+the current diff is still content-only and only then re-record `clean-low`; if it
+is not, take the normal route (the code-review skill, then `clean`).
+`base_unverifiable` is a read failure (a `gh`/API error, an absent or invalid
+field in the record) and is cleared by re-recording once the base is readable —
+and, as with `base_advanced`, only if the diff is still content-only; otherwise
+take the normal route (the code-review skill, then `clean`).
+
+Three boundaries worth knowing, all declared rather than silent:
+
+- **The #138 interactive fail-open also bypasses the content binding.** When the
+  HEAD itself cannot be fetched, an interactive session's merge gets fail-open
+  (a task sub-agent's is fail-closed) BEFORE the merge-base branch is reached, so
+  a `clean-low` record can merge there with its merge base never compared. That is
+  the pre-existing #138 posture — the same path already merged `clean`/
+  `clean-micro` with no head verification at all, so the content binding is
+  strictly additive — and narrowing it is #138's decision to make, not this
+  verdict's.
+- **The remote `ai-review-gate` required check must accept the verdict.** It is a
+  cross-repo contract (the marker regex lives in the consuming repo), so a repo
+  whose workflow still matches `verdict=clean(-micro)?` will keep failing the
+  check on a `clean-low` marker. `record-review.sh` says so on stderr at record
+  time (widening tracked in `daniel-ospina/tortoise#4755`); the record and the
+  local merge gate are unaffected.
+- **The remote check is still base-blind for every verdict**, `clean-low`
+  included — the signed marker binds the head only. Tracked with the widening
+  requirement above.
 
 ## Standard-Tier Review (`--standard-tier`)
 

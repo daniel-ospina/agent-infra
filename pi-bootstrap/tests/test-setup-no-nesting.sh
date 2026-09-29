@@ -151,6 +151,18 @@ check_record_review_farmed() {
   else
     fail "$label: farmed record-review.sh differs from scripts/record-review.sh (stale copy!)"
   fi
+  # #1362 D1 — record-review.sh resolves its diff normalizer from a SIBLING
+  # directory (`<script dir>/lib/diff-normalize.py`). Farming the producer
+  # without the normalizer degrades it to the raw pre-#1362 digest, so the
+  # sibling must be farmed too and byte-match the repo copy.
+  local norm="$DEST/scripts/lib/diff-normalize.py"
+  [ -f "$norm" ] \
+    || { fail "$label: lib/diff-normalize.py not farmed into scripts/lib/ (#1362 normalizer farm missing)"; return; }
+  if diff -q "$ROOT/scripts/lib/diff-normalize.py" "$norm" >/dev/null 2>&1; then
+    echo "ok: $label farmed lib/diff-normalize.py == repo copy (#1362)"
+  else
+    fail "$label: farmed lib/diff-normalize.py differs from scripts/lib/diff-normalize.py (stale copy!)"
+  fi
 }
 
 # #1178 — shared-library farm: scripts/lib/pid-identity.sh must land at
@@ -541,8 +553,8 @@ check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
 grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
-grep -q "scripts lib farm: 1 copied (pid-identity.sh, #1178)" "$RUNS_LOG" \
-  || fail "run 1 did not report the shared-library farm copy (#1178)"
+grep -q "scripts lib farm: 2 copied (pid-identity.sh + diff-normalize.py, #1178)" "$RUNS_LOG" \
+  || fail "run 1 did not report the shared-library farm copies (#1178/#1362)"
 grep -q "scripts/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
   || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
 check_tools_dir_clean "run1-final"
@@ -617,6 +629,9 @@ echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm r
 if [ -f "$DEST/scripts/lib/pid-identity.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/lib/pid-identity.sh"  # #1178 farm refresh
 fi
+if [ -f "$DEST/scripts/lib/diff-normalize.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/lib/diff-normalize.py"  # #1362 farm refresh
+fi
 if [ -f "$DEST/scripts/fleet/lane_liveness.py" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/fleet/lane_liveness.py"   # #1178 unit 3 farm refresh
 fi
@@ -679,6 +694,13 @@ elif grep -q "stale farm mutation" "$DEST/scripts/lib/pid-identity.sh"; then
   fail "stale farm mutation survived re-run (farmed lib/pid-identity.sh was not refreshed)"
 else
   echo "ok: farmed lib/pid-identity.sh refreshed on re-run (#1178)"
+fi
+if [ ! -f "$DEST/scripts/lib/diff-normalize.py" ]; then
+  : # already reported by check_record_review_farmed "run2" (missing file is not "refreshed")
+elif grep -q "stale farm mutation" "$DEST/scripts/lib/diff-normalize.py"; then
+  fail "stale farm mutation survived re-run (farmed lib/diff-normalize.py was not refreshed)"
+else
+  echo "ok: farmed lib/diff-normalize.py refreshed on re-run (#1362)"
 fi
 [ ! -d "$DEST/agents/agents" ] || fail "nesting appeared after re-run"
 check_no_nesting "$DEST" "dest-after-rerun"

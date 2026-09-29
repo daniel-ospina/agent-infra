@@ -285,8 +285,14 @@ with automatic return after balance restore.
   (`pi.setModel`) + restore, session_start pre-prompt hop for latched families.
 - `scripts/checkout-hygiene/deepseek-balance-watch.sh` + `deepseek-balance-latch.py`
   — the SINGLE restore authority (launchd, 15 min): zero-token probes
-  (`/user/balance`, openrouter `/auth/key`), SET at balance ≤ LOW, CLEAR only on
-  verified positive balance AND a 5-token chat probe, hysteresis band, 401/403
+  (`/user/balance`, openrouter `/auth/key`), WARN at balance ≤ warn (default
+  $30 — a low balance NEVER sets the latch; per the #1508 decision a warning
+  must not switch providers), CLEAR only on
+  verified positive balance AND a 5-token chat probe, and because warn (30) sits
+  ABOVE clear (20) the two thresholds OVERLAP: a latched provider clears from
+  $20 up, an unlatched one warns at $30 down. Clear-eligibility is keyed on the
+  latch, not on the band — a warn-first chain would swallow 20–30 and a latched
+  provider recovering to $25 could never clear. 401/403
   never latch, defer+escalate after 3 consecutive failures.
 - `scripts/checkout-hygiene/deepseek-balance-latch.py` mirrors the TS module's
   durable JSON contract so poller + sessions interoperate on one state file.
