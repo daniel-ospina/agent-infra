@@ -211,7 +211,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (T1–T20 with 24 paired mutations) and by the
+> all pinned by `tools/fleet/liveness.test.py` (T1–T23 with 29 paired mutations) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
@@ -259,16 +259,47 @@ verdict.
    tested, but **unreachable for a fleet lane today**. Consequence: **for fleet sessions `wedged`
    rests on JSONL freeze + no un-expired tool veto + no fresh record + a positively OPEN turn in
    the transcript tail** (the only open-turn signal — boundary 2 below) — nothing more. This was
-   flagged, not hidden, by the unit-1 report.
+   flagged, not hidden, by the unit-1 report. Since #5389 the tool veto IS fed from the transcript
+   (item 2), but the CPU pair is still absent there, so a fleet lane's in-flight tool reads
+   `"unknown"` and is bounded by the AGE backstop rather than by `tool-silence`'s 20 min. The
+   attribution refinement remains correct — and remains unfed.
 
-2. **The tool-veto layer is inert in the CLI path.** `_tool_from_record` builds a `Tool` from the
-   store record's `toolsInFlight` / `toolAgeMaxMs` / `streamAgeMs` / `toolUpdates` fields — and **no
-   record in the fleet store carries them** (measured 2026-09-20: **0 of 1409** records; the unit
-   report recorded 0 of 701). `gather` therefore leaves `ev.tool = None` for every lane, the veto
-   never fires, and **the transcript tail is the only open-turn signal**. The layer is live and
-   tested for a consumer that injects a `Tool` (tests T9/T11); it simply has no fleet input today.
-   A consumer supplying the fields from a `ps` child scan or a heartbeat would make it live — that
-   is a wiring change, not a new rule.
+2. **The tool-veto layer is LIVE for fleet lanes, fed from the lane's own transcript (#5389).**
+   `_tool_from_record` builds a `Tool` from the store record's `toolsInFlight` / `toolAgeMaxMs` /
+   `streamAgeMs` / `toolUpdates` fields — and **no record in the fleet store carries them**
+   (measured 2026-09-20: **0 of 1409**; re-measured 2026-09-29: **0 of 1011**; the unit report
+   recorded 0 of 701). That route is still inert, and **no `ps` child scan was added to make it
+   live**. Instead `gather` falls back to `tool_from_jsonl`, which derives the in-flight tool from
+   the transcript this module **already reads** for its turn boundary: an assistant message carrying
+   tool calls with no `toolResult` after it **is** a tool in flight, and its entry timestamp dates
+   the call. Positive control over the **300 most recently modified** lane transcripts: **31–37
+   carried a derivable in-flight tool** across repeated runs (`bash` and `task` dominate; `write`
+   and `subagent` appear occasionally) where the record path supplies nothing. The corpus is live
+   and written to continuously, so the exact integer moves run to run — the durable claim is the
+   one that reproduces: the check FIRES, on real transcripts, in the tens.
+   The store route stays authoritative when a producer supplies it — it carries two fields the
+   transcript cannot (`toolUpdates`, and the `cpuAdvanced`/`cpuStallMs` pair from the task-child
+   heartbeat, gated to `TASK_HEARTBEAT=1 AND PI_MODE=print`).
+
+   **What is disclosed rather than implied:** because a derived tool HAS no CPU channel, its
+   `in_flight_progress` is `"unknown"` by construction, so on today's fleet inputs the
+   `progressing` / `no-progress` arms of the mirrored tri-state do no production work. The live
+   behaviour change is (a) itself plus the `unknown` fall-through — the classifier no longer lets an
+   unreadable channel expire the veto at S. The tri-state is mirrored so the rule has ONE definition
+   for the day a producer supplies the fields, which is what §6 requires; it is not claimed to be
+   exercised by fleet lanes today.
+
+   **The derived tool leaves both of those at their fail-closed default**, so `tool_veto_expired`
+   takes the AGE backstop (4 h; the derived tool sets `turn_active=True`, the fail-closed choice, so
+   the 30 min branch is not reachable from it) rather than `tool-silence`'s 20 min. That is a
+   reprieve from S, not an exemption from the ceiling: the watchdog's own `tool-stall` backstop is
+   **progress-blind** (no CPU conjunct), so for a tool with no readable CPU channel the watchdog's
+   cut and this veto land on the SAME bound. The classifier therefore does not stand quiet where
+   the watchdog had already cut — it holds LONGER than `tool-silence` would, and exactly as long as
+   `tool-stall` does — and every shape with a readable tool age is bounded (T9: never forever), because a clause that does not fire falls through to the backstop rather than holding the veto open. §5 item 2's
+   pre-authorisation ("a consumer supplying the fields ... would make it live — that is a wiring
+   change, not a new rule") is discharged by a READER change, not a new writer; the other clause it
+   offered — "a `ps` child scan" — was not needed and was not built.
 
 3. **The turn boundary is a bounded, backwards read.** The scan reads at most 256 KiB from EOF
    (growing to a 16 MiB cap only if no message entry is found — a shape pi does not write). The
@@ -305,6 +336,14 @@ A reader must not trust two contracts for one rule. Concretely:
 - **The pre-#1254 rule "a frozen transcript ⇒ `wedged`" is retired.** `wedged` now requires
   positive per-case evidence of an **open turn** (§1). The retired rule mislabelled the fleet's
   normal resting state as a stall.
+- **The pre-#5389 rule "silence alone expires the tool veto" is retired.** `tool_veto_expired`'s
+  `tool_updates` branch required only `silence_age_ms > S`, while the watchdog's `tool-silence`
+  clause now requires output silence **AND** positive no-progress evidence
+  (`inFlightProgress === "no-progress"`, `extensions/builtin-tools/index.ts`). Two contracts for
+  one rule — the defect this section exists to name — so the classifier was updated in the SAME
+  change: `progressing` SUPPRESSES the expiry, `no-progress` expires it at S, and `unknown` falls
+  through to the AGE backstop. A streamed-then-silent tool with no CPU channel reads
+  `running-quiet` until that backstop, never `wedged` on silence alone.
 - **The three `~/.pi/agent/state/` detectors are not the liveness authority** and never were a
   tracked one: `map-sessions.py` reads no process, and `stall-sweep.py` / `stale-stuck.py` derive
   their population from live processes, so none can emit `dead`. They also **disagree with each
@@ -352,7 +391,7 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 20 tests
+python3 tools/fleet/liveness.test.py               # 23 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 ```
