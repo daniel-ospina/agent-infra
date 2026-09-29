@@ -397,6 +397,39 @@ def test_cli_decide_blocks_and_writes_the_residual(tmp_path, capsys):
     assert "blocked=1" in out
 
 
+def test_cli_decide_blocks_a_TOTAL_pr_failure_the_tolerance_would_bridge(tmp_path, capsys):
+    """The closed residual, REACHABLE through the real consumer.
+
+    The shell drives the decision as a CLI over files (`admin-merge.sh`
+    ``run_exemption_decision``), and `k_pr` is derived inside `_cmd_decide` as
+    `max(row.runs)`. A change that made that derivation produce a thin sample would
+    silently route a saturated row into the #5250 attribution path and NO guard-level
+    test would catch it. This pins the whole consumer chain: `main 6/8` vs `PR 8/8`,
+    `k_pr=8`, must exit gated (rc=1) with the id in `--blocked-out`.
+
+    MUTATION: remove the totality guard -> rc becomes 0, `blocked` empties and the
+    `VERDICT\tBLOCK` assertion REDs (the measured false PASS).
+    """
+    pr = _write(tmp_path, "pr.txt", f"{DR}\t8\t8\tAssertionError: assert 3 == 2\n")
+    mainf = _write(tmp_path, "main.txt", f"{DR}\t6\t8\n")
+    msig = _write(tmp_path, "msig.txt", f"{DR}\tAssertionError: assert 3 == 2\n")
+    blocked = tmp_path / "blocked.txt"
+    verdict = tmp_path / "verdict.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig,
+            "--blocked-out", str(blocked), "--verdict-out", str(verdict),
+        ]
+    )
+
+    assert rc == 1, "a deterministic total failure must gate the merge"
+    assert blocked.read_text(encoding="utf-8") == f"{DR}\n"
+    assert verdict.read_text(encoding="utf-8").startswith("VERDICT\tBLOCK")
+    assert "TOTAL" in capsys.readouterr().out
+
+
 def test_cli_decide_exempts_with_both_rates_visible(tmp_path, capsys):
     """An exemption must be RECORDED with both rates — never an absence.
 

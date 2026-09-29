@@ -353,6 +353,120 @@ def test_E3_small_k_cannot_excuse():
     assert any("insufficient evidence" in n for n in decision.notes)
 
 
+# ── E3b · the TOTAL-failure residual (tortoise #3756 residual / #3762) ─────
+#
+# `rate_tolerance` is MULTIPLICATIVE, so its absolute width grows as main's rate
+# rises. A PR that fails EVERY observed run therefore rode main's breakage into a
+# green: `main 6/8` vs `PR 8/8` was EXEMPT (0.75 x 1.5 = 1.125 >= 1.0). This is
+# the deferred residual Option B authorized as a follow-up (agent-infra #1209).
+# The BLOCKING cases below RED if the guard is removed; the EXEMPTION cases alongside them are
+# their negative controls (they RED if the guard is over-widened instead).
+
+
+def test_E3b_a_total_pr_failure_is_not_bridged_by_the_tolerance():
+    """The measured false PASS: `main 6/8` vs `PR 8/8` must BLOCK.
+
+    MUTATION: delete the `pr_total and not main_total` guard -> the tolerance test
+    admits 1.00 <= 0.75 x 1.5 and this assertion REDs — a DETERMINISTIC total
+    regression must not ship on the tolerance.
+    """
+    decision = decide(
+        {ID: _f(8, 8, "sg")}, {ID: Rate(6, 8)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=8,
+    )
+
+    assert decision.any_blocked, "a deterministic total failure must not ship"
+    assert not decision.exempt
+    assert "TOTAL" in decision.blocked[0].reason
+
+
+def test_E3b_a_total_pr_failure_is_not_bridged_at_main_two_of_three():
+    """The exact number measured on #3762: `main 2/3` vs `PR 3/3` must BLOCK.
+
+    MUTATION: same as above — without the guard `1.00 > 0.667 x 1.5` is False, so
+    this reads as "rates equivalent" and is EXEMPT.
+    """
+    decision = decide(
+        {ID: _f(3, 3, "sg")}, {ID: Rate(2, 3)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=3,
+    )
+
+    assert decision.any_blocked
+    assert not decision.exempt
+
+
+def test_E3b_a_total_pr_failure_is_not_bridged_at_main_seven_of_eight():
+    """The band edge: `main 7/8` (the highest non-total rate at k=8) vs `PR 8/8`.
+
+    This pins the guard to the real predicate rather than a threshold someone
+    might substitute later: a mis-fix such as `mr.rate < 0.8` leaves the 6/8 and
+    2/3 cases BLOCKing while this one EXEMPTs. MUTATION: replace the guard with a
+    rate-threshold form whose cutoff is BELOW the band edge (e.g. `mr.rate < 0.8`)
+    -> this assertion REDs. (An over-blocking threshold at or above the edge is
+    caught by the total-on-total exemption control below, not by this test.)
+    """
+    decision = decide(
+        {ID: _f(8, 8, "sg")}, {ID: Rate(7, 8)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=8,
+    )
+
+    assert decision.any_blocked
+    assert not decision.exempt
+    assert "TOTAL" in decision.blocked[0].reason
+
+
+def test_E3b_a_total_pr_failure_IS_exempt_when_main_is_also_total():
+    """The boundary that keeps the guard honest: total-on-total stays EXEMPT.
+
+    The issue's own acceptance (§11) requires `main 4/4` vs `PR 4/4` to be
+    permitted and RECORDED with both rates — refusing every saturated PR rate
+    would be the wrong fix. MUTATION: widen the guard to `if pr_total:` -> this
+    assertion REDs (the exemption disappears and main is blamed for nothing).
+    """
+    decision = decide(
+        {ID: _f(4, 4, "sg")}, {ID: Rate(4, 4)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=4,
+    )
+
+    assert not decision.any_blocked
+    lines = decision.visible_exemptions()
+    assert len(lines) == 1, "a permitted exemption must still be recorded"
+    assert "4/4" in lines[0] and "k_pr=4" in lines[0]
+
+
+def test_E3b_the_non_total_residual_is_unchanged():
+    """Pin the SURVIVING authorized residual, so the guard is not over-read.
+
+    `main 6/8` vs `PR 7/8` is a non-total rate inside the 1.5x band and stays
+    EXEMPT. MUTATION: make the guard `pr.rate.rate >= mr.rate` (or any stricter
+    comparison) -> this assertion REDs.
+    """
+    decision = decide(
+        {ID: _f(7, 8, "sg")}, {ID: Rate(6, 8)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=8,
+    )
+
+    assert not decision.any_blocked
+    assert len(decision.exempt) == 1
+
+
+def test_E3b_the_thin_pr_sample_path_is_untouched():
+    """The #5250 floor still exempts a thin PR sample on attribution.
+
+    MUTATION: move the TOTAL guard ABOVE the `k_pr < min_runs` branch -> the
+    deliberate #5250 re-scope (a PR that merely inherited a red at 1/1) REDs, and
+    the false-block #5237 was filed about returns.
+    """
+    decision = decide(
+        {ID: _f(1, 1, "sg")}, {ID: Rate(3, 5)},
+        main_signatures={ID: frozenset({"sg"})}, k_pr=1,
+    )
+
+    assert not decision.any_blocked
+    assert len(decision.exempt) == 1
+    assert "NOT measurable" in decision.exempt[0].reason
+
+
 # ── #5250 · the PR-side sample floor ──────────────────────────────────────
 #
 # A PR gets ONE run per push, so its rate is a single observation and `1/1` is
@@ -738,6 +852,28 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
     assert [v.nodeid for v in decision.blocked] == ["tests/a.py::T::t1"]
     assert decision.visible_exemptions() == []
     assert "rates" in decision.report().lower() or "BLOCK" in decision.report()
+
+
+def test_the_total_failure_blocks_through_the_real_wire_format():
+    """The closed residual, driven through the table the shell actually emits.
+
+    `main 6/8` vs `PR 8/8` is the case the MULTIPLICATIVE tolerance bridged:
+    `1.00 <= 0.75 x 1.5`. It must BLOCK, and the verdict must name the total
+    failure rather than a ratio, because the ratio has no information here.
+
+    MUTATION: remove the totality guard -> this EXEMPTs (the measured false PASS)
+    and the `visible_exemptions() == []` assertion REDs.
+    """
+    main = parse_rates("tests/a.py::T::t1\t6\t8\n")
+    pr = {"tests/a.py::T::t1": Failure(rate=Rate(8, 8), signatures=frozenset({"sg"}))}
+    decision = decide(
+        pr, main.rates,
+        main_signatures={"tests/a.py::T::t1": frozenset({"sg"})},
+        k_pr=8, rate_tolerance=1.5,
+    )
+    assert [v.nodeid for v in decision.blocked] == ["tests/a.py::T::t1"]
+    assert decision.visible_exemptions() == []
+    assert "TOTAL" in decision.report()
 
 
 def test_the_gate_does_not_loosen_as_the_substrate_degrades():
