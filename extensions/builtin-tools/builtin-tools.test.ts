@@ -12,8 +12,10 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress } from "./index.js";
+import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
+import builtinTools from "./index.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
@@ -1434,6 +1436,18 @@ test("#783: fresh --session-id warning is known-noise — never flips hasOutput"
   equal(flushHeartbeatLineBuf(c3), "", "warning residue dropped on flush");
   equal(real3(), false);
 
+  // #1500: the child's one-time TASK_TOOL_TIMEOUT_S-is-disarmed diagnostic is
+  // the SAME hazard — an unrecognised stderr line would flip hasOutput on a
+  // genuinely zero-output dispatch. The operator's own value is interpolated
+  // after the fixed prefix, so the filter must anchor on the prefix alone.
+  const disarm =
+    '[task-heartbeat] warn TASK_TOOL_TIMEOUT_S="abc" is not a positive finite number — the dispatched-child bash timeout default is DISARMED; bash calls may park indefinitely.';
+  const { ctx: c5, acc: acc5, real: real5 } = makeIngest();
+  ingestHeartbeatChunk(disarm + "\n", c5, 1);
+  equal(real5(), false, "the disarm warning must NOT flip hasOutput");
+  equal(acc5(), "", "and is filtered out of the stderr accumulator");
+  equal(c5.state.markerCount, 0, "`warn` is not a heartbeat marker kind, so it must not be parsed as one");
+
   // A genuine child error line still flips hasOutput.
   const { ctx: c4, real: real4 } = makeIngest();
   ingestHeartbeatChunk(warn + "\nreal child error line\n", c4, 2);
@@ -1451,6 +1465,11 @@ const INT = 30_000; // tick interval
 // in pre-#271 scenarios (marker gaps there are ≤ ~70s). E271/E271b inject the
 // real floor (15s) explicitly.
 const CUT_GAP_FIXTURE = 3_600_000;
+// #5389: the CPU-stall bound used by the in-flight-tool progress fixtures. It
+// sits in this shared block because the first of them (E-silence-1) precedes the
+// #928 section by ~1,500 lines, and a `const` cannot be hoisted — the #928
+// section's `C` is this same value, aliased there.
+const CPU_STALL_FIXTURE = 600_000;
 
 function dinput(over: Partial<HeartbeatDecisionInput> & { state?: HeartbeatState } = {}): HeartbeatDecisionInput {
   return {
@@ -1467,6 +1486,13 @@ function dinput(over: Partial<HeartbeatDecisionInput> & { state?: HeartbeatState
     intervalMs: INT,
     maxDispatchMs: 0,
     cutGapMs: CUT_GAP_FIXTURE,
+    // #5195: explicit 0 = the no-progress clause is inert in every pre-#5195
+    // fixture. It is not the production default (45 min / DEFAULT_PROGRESS_AGE_MS)
+    // — the fixtures pin
+    // clauses one at a time, and arming a new clause globally would make every
+    // existing fixture assert two things at once. The clause's own behaviour is
+    // pinned by the #5195 tests, and its DEFAULT is pinned via the getter.
+    progressAgeMs: 0,
     // #928: explicit 0 = the dead-tool clause is inert in every pre-#928
     // fixture (it is the default state of a child that cannot be probed).
     cpuStallMs: 0,
@@ -1531,12 +1557,73 @@ test("E1: turn + tool in flight with fresh markers → exempt from silence kill"
   // silence exceeds T, but state fresh + turn active + tool in flight
   const d = heartbeatKillDecision(dinput({ now: 100_000 + T + 1, lastLifeSignAt: 100_000, state: st }));
   equal(d.kill, false, "working agent with tool in flight is not killed");
-  // stream fresh, no tools → also exempt
-  const st2 = createHeartbeatState();
-  st2.turnActive = true;
-  st2.streamAgeMs = 1_000;
-  st2.lastMarkerAt = 100_000;
-  equal(heartbeatKillDecision(dinput({ now: 100_000 + T + 1, lastLifeSignAt: 100_000, state: st2 })).kill, false);
+});
+
+// #5195 — the SECOND half of the old E1 pin, deliberately INVERTED.
+//
+// The old pin asserted that a child reporting a FRESH `stream_age_ms` with no
+// tool in flight was exempt from the silence kill even with no life sign for T.
+// That exemption was `effStreamAge <= streamStallMs` inside `exempt`, and the
+// proof below shows it could NEVER be reached at the default bounds — so the pin
+// was locking in a claim that was already unreachable, and the only thing it
+// actually did at runtime was let an OPERATOR widen the exemption by raising S.
+//
+test("#5195 / E1b: a fresh self-reported stream age no longer buys a silence exemption", () => {
+  const st = createHeartbeatState();
+  st.turnActive = true;
+  st.streamAgeMs = 1_000; // the child claims its stream is 1s old
+  st.lastMarkerAt = 100_000;
+  const d = heartbeatKillDecision(dinput({ now: 100_000 + T + 1, lastLifeSignAt: 100_000, state: st }));
+  equal(d.kill, true, "no life sign for T is a dead child, whatever its self-reported stream age says");
+  equal(d.reason, "silence-threshold", "and the silence clause owns it — not a widened exemption");
+});
+
+test("#5195 / E1c: PROOF that the removed hatch required S > T — it is inert at the default", () => {
+  // The old predicate was `toolsInFlight > 0 || effStreamAge <= streamStallMs`,
+  // with `effStreamAge = streamAgeMs + markerAge`.
+  //
+  //   * `onLifeSign()` is called on EVERY chunk (ingestHeartbeatChunk), and
+  //     `lastMarkerAt` is only ever set while processing a chunk — so
+  //     `markerAge >= silenceMs` always.
+  //   * The silence clause only fires once `silenceMs > T`.
+  //   ⟹ reaching `effStreamAge <= S` there requires `S >= effStreamAge > T`.
+  //
+  // At the shipped defaults (S = 20 min, T = 30 min) that is unreachable: the
+  // hatch was dead code whose only effect was to let a caller raise S and
+  // disable the silence clause. These cases pin both halves:
+  const mk = (streamAgeMs: number) => {
+    const st = createHeartbeatState();
+    st.turnActive = true;
+    st.streamAgeMs = streamAgeMs;
+    st.lastMarkerAt = 100_000;
+    return st;
+  };
+  const now = 100_000 + T + 1;
+  // (a) SHIPPED BOUNDS: S (20 min) sits below T's default (30 min — the
+  //     `|| 1_800_000` floor in the heartbeat runner), which is what makes the
+  //     old hatch unreachable in production.
+  ok(
+    DEFAULT_STREAM_STALL_MS < 1_800_000,
+    "SHIPPED: the default S must be below the default T, which is exactly why the removed hatch was unreachable",
+  );
+  // (b) THE HATCH WAS LIVE IN THIS SUITE — the fixtures invert the shipped
+  //     relation (S = 120s > T = 60s), so with the OLD predicate this very state
+  //     WOULD have been exempt. That is what makes E1b above a real test of the
+  //     removal rather than a restatement of dead code.
+  const effStreamAge = 1_000 + (now - 100_000);
+  equal(effStreamAge <= S, true, "FIXTURE: with the inverted test bounds the old hatch WAS live (effStreamAge <= S)");
+  // The "any raised S" half is asserted below against a HOSTILE 10x S. Asserting
+  // it here as well would be a DUPLICATE predicate: in this fixture S == 2T ==
+  // T + 60_000 (the coincidences that make the hatch live here at all), so
+  // `effStreamAge <= T + 60_000` is `effStreamAge <= S` restated — it could never
+  // fail independently of the line above (review finding: a test that cannot fail).
+  // And the new predicate ignores S entirely, so the verdict holds however wide
+  // S is set — including a hostile 10x:
+  const raised = heartbeatKillDecision(
+    dinput({ now, lastLifeSignAt: 100_000, state: mk(1_000), streamStallMs: 10 * S }),
+  );
+  equal(raised.kill, true, "raising S no longer widens the silence exemption");
+  equal(raised.reason, "silence-threshold", "the clause is the same one, fired on the same evidence");
 });
 
 test("E5: stream-stall at S — turn active, saw_msg latched, no tools", () => {
@@ -1609,8 +1696,16 @@ test("E-silence-1: WEDGED tool in flight → killed at the SILENCE bound, not th
   st.toolAgeMaxMs = S + 60_000; // far BELOW L (1h in fixtures)
   st.streamAgeMs = S + 1;       // …but no output for S: the wedge signal
   st.toolUpdates = true;        // the tool HAD been producing output, then stopped
+  // #5389: the clause now requires BOTH conditions — output silence AND
+  // positive no-progress evidence. This is the WEDGED shape, so the CPU channel
+  // must say `no-progress`: demonstrated CPU work, then flat PAST the bound.
+  // With these two lines absent the state is `unknown`, and the clause correctly
+  // BLOCKS (the #5389 tests below pin that direction, and the age backstop that
+  // still bounds it).
+  st.toolCpuAdvanced = true;
+  st.toolCpuStallMs = CPU_STALL_FIXTURE + 1;
   st.lastMarkerAt = 500_000;
-  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
+  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, cpuStallMs: CPU_STALL_FIXTURE }));
   equal(d.kill, true, "a silent in-flight tool is killed at the SILENCE bound");
   equal(d.reason, "tool-silence", "reason is distinct from the age backstop");
   ok(S + 60_000 < L, "fixture sanity: this shape sits far below the age bound");
@@ -1710,6 +1805,132 @@ test("E-silence-5: MIXED round (one tool emitted and ended, one still silent) �
   st.toolUpdates = childHb.computeToolUpdates(["bash-1", "task-2"], new Set(["bash-1"]));
   const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
   equal(d.kill, false, "the healthy nested child survives the mixed round");
+});
+
+// ── #5389: progress is a FIRST-CLASS signal — the in-flight bound requires
+// BOTH silence and no-progress evidence ──────────────────────────────────────
+// THE DEFECT: `tool-silence` fired on output silence ALONE, reading ABSENCE OF
+// OUTPUT as ABSENCE OF WORK. Measured (tortoise #5387): the clause fired at
+// 1203 s against its 1200 s bound with `toolCpuAdvanced=true` and 154
+// CPU-seconds burned — KILLED WHILE PROGRESSING. The CPU channel the child had
+// been reporting all along was parsed here and never consulted by that clause.
+//
+// The rule is now ONE tri-state (`inFlightProgress`) that BOTH in-flight tool
+// bounds read, and CPU stays a SPARE signal: it protects, it never convicts.
+//   progressing → SUPPRESS   (positive evidence the tool is still working)
+//   no-progress → LICENSE    (demonstrated work, then flat past the bound)
+//   unknown     → BLOCK      (no evidence either way; a bound may not fire on
+//                             a channel it cannot read)
+
+/** The #5389 fixture shape: one in-flight tool that streamed output and has
+ * since gone silent past S. `over` is the ONLY thing the twins vary — the
+ * progress channel. */
+function progressShape(over: Partial<HeartbeatState> = {}): HeartbeatState {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = S + 60_000; // far below the age backstop
+  st.streamAgeMs = S + 3_000;   // 1203 s of output silence against the 1200 s bound
+  st.toolUpdates = true;        // it HAD emitted renderable output, then stopped
+  st.lastMarkerAt = 500_000;
+  return Object.assign(st, over);
+}
+
+const progressDecide = (st: HeartbeatState) =>
+  heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, cpuStallMs: CPU_STALL_FIXTURE }));
+
+test("#5389 inFlightProgress — the tri-state, and which state may convict", () => {
+  const v = (toolCpuStallMs: number, toolCpuAdvanced: boolean, cpuStallMs = CPU_STALL_FIXTURE) =>
+    inFlightProgress({ toolCpuStallMs, toolCpuAdvanced }, cpuStallMs);
+  // UNKNOWN — the states that may NOT convict. Each is a channel that cannot be
+  // read, or a reading that proves nothing.
+  equal(v(0, false), "unknown", "not probed (a tool outside the child's allowlist, a failed ps, no descendant rows)");
+  equal(
+    v(10 * CPU_STALL_FIXTURE, false),
+    "unknown",
+    "flat CPU on a tool that never burned a cycle is the #928 I/O-bound case, not a deadlock",
+  );
+  equal(v(CPU_STALL_FIXTURE + 1, true, 0), "unknown", "TASK_CPU_STALL_MS=0 disables the channel; a disabled channel cannot convict");
+  // The two READABLE states — the ones the in-flight bounds branch on.
+  // `stall=0` WITH the demonstrated-work latch armed is PROGRESS, not an absent
+  // measurement: `stepCpuLiveness` stamps `lastAdvanceAt = now` on a rise, so a
+  // tool advancing on THIS tick reports the same `cpu_stall_ms=0` the not-probed
+  // branch reports. This is a MEASURED production shape — a real `tool-silence`
+  // cut carried `toolCpuMs=135910 toolCpuStallMs=0 toolCpuAdvanced=true` — and
+  // reading it as `unknown` would file the strongest evidence there is under
+  // "no measurement".
+  equal(v(0, true), "progressing", "probed and advancing on THIS tick (lastAdvanceAt === now) is the strongest progress evidence there is");
+  equal(v(1, true), "progressing", "advancing CPU is POSITIVE progress evidence");
+  equal(v(CPU_STALL_FIXTURE, true), "progressing", "flat exactly AT the bound is still inside it (strict >)");
+  equal(v(CPU_STALL_FIXTURE + 1, true), "no-progress", "demonstrated work, then flat PAST the bound — the only convicting state");
+});
+
+test("#5389 tool-silence NEGATIVE — the #5387 false cut: silence + ADVANCING CPU is never cut", () => {
+  // The measured incident, reproduced: streamed, then silent 1203 s against this
+  // clause's 1200 s bound, with `toolCpuAdvanced=true` and 154 CPU-seconds burned.
+  // Pre-#5389 this returned `kill: true` / `reason: "tool-silence"`.
+  const d = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: INT }));
+  equal(d.kill, false, "a tool that is still BURNING CPU is working, however long its output has been quiet");
+  equal(d.reason, undefined, "…and it is not relabelled onto another clause");
+  // The MEASURED shape, exactly as the live defect instance recorded it:
+  // `toolCpuMs=135910 toolCpuStallMs=0 toolCpuAdvanced=true` — the tool advanced
+  // CPU on the very tick the cut was taken. `stall=0` with the latch armed is
+  // PROGRESS, not a missing measurement (the child's not-probed sentinel always
+  // arrives with the latch CLEARED), so this pins the decision path the unit
+  // test above pins at the predicate.
+  const measured = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: 0 }));
+  equal(measured.kill, false, "the measured production shape (stall=0, advanced=true) is PROGRESSING, not `unknown`");
+  equal(measured.reason, undefined, "…and no clause is reached");
+  // STILL BOUNDED — the suppression is a veto from the progress evidence, not an
+  // exemption from every bound: the age backstop owns it exactly as before.
+  const huge = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: INT, toolAgeMaxMs: L + 1 }));
+  equal(huge.reason, "tool-stall", "a tool that advances CPU forever is bounded by the AGE backstop, never by nothing");
+});
+
+test("#5389 tool-silence NEGATIVE — `unknown` progress BLOCKS the cut (no proof, no kill)", () => {
+  const d = progressDecide(progressShape()); // not probed → unknown
+  equal(d.kill, false, "unknown BLOCKS: a bound may not fire on a channel it cannot read");
+  equal(d.reason, undefined, "no clause is reached at all");
+  // CONTROL — the ONLY change is positive no-progress evidence, and the same
+  // shape IS cut. So the assertion above pins the progress gate, not an inert
+  // fixture.
+  const proven = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: CPU_STALL_FIXTURE + 1 }));
+  equal(proven.kill, true, "CONTROL: with positive no-progress evidence the SAME shape is cut");
+  equal(proven.reason, "tool-silence");
+  // …and the blocked shape is still BOUNDED rather than unbounded: that is the
+  // deliberate cost of `unknown`, stated in the predicate's own comment.
+  equal(progressDecide(progressShape({ toolAgeMaxMs: L + 1 })).reason, "tool-stall", "unknown falls back to the age backstop");
+});
+
+test("#5389 tool-silence POSITIVE — silence AND proven no-progress IS the cut (the fail-fast trigger)", () => {
+  // (b)+(e) together: both channels agree the tool has stopped ⇒ cut at
+  // max(S, C), which is the "no progress for N minutes" fail-fast trigger.
+  // Without it such a child burned the age backstop instead (#3404).
+  const d = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: CPU_STALL_FIXTURE + 1 }));
+  equal(d.kill, true);
+  equal(d.reason, "tool-silence", "its own reason — the model is told which evidence fired");
+});
+
+test("#5389 tool-silence — a no-tool state reaches its OWN bound, never the in-flight gate", () => {
+  // Scope guard: the progress gate is an IN-FLIGHT bound. With no tool in flight
+  // the decision reaches `stream-stall` here — and, in particular, an unreadable
+  // CPU channel must not reach across and suppress a no-tool bound. (Named for
+  // what it asserts: this fixture sets `progressAgeMs: 0`, so the #5195
+  // `no-progress` clause is OFF and is NOT what is being exercised. That clause's
+  // own no-tool scoping is pinned by the pre-existing `#5195: the clause is
+  // SCOPED to no-tool` test, whose positive twin arms `DEFAULT_PROGRESS_AGE_MS`.)
+  const st = progressShape({ toolsInFlight: 0, toolUpdates: false });
+  const d = heartbeatKillDecision(
+    dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, cpuStallMs: CPU_STALL_FIXTURE, progressAgeMs: 0 }),
+  );
+  equal(d.reason, "stream-stall", "the no-tool bound is unchanged (and never the in-flight clause)");
+  // CONTROL: arm #5195's clock instead and the SAME no-tool state is cut by it —
+  // so the assertion above pins the no-tool path and not an inert fixture.
+  const np = heartbeatKillDecision(
+    dinput({ now: 500_010, startedAt: 0, lastLifeSignAt: 500_000, state: st, cpuStallMs: CPU_STALL_FIXTURE, progressAgeMs: 60_000 }),
+  );
+  equal(np.reason, "no-progress", "CONTROL: the no-tool state is bounded by its own progress clause — and the CPU channel neither suppresses nor authorises it");
 });
 
 test("E11: between-turn wedge — ticks stop → silence at T (S > max(2T,2×interval) pin)", () => {
@@ -1874,11 +2095,14 @@ test("#1030-B1: the override CHANGES THE VERDICT — the bound applied is the bo
     st.toolAgeMaxMs = S + 60_000; // far BELOW the age backstop…
     st.streamAgeMs = S + 1;       // …but no output for S: the wedge signal
     st.toolUpdates = true;        // it HAD emitted, then stopped
+    // #5389: the clause requires no-progress evidence on the CPU channel too.
+    st.toolCpuAdvanced = true;
+    st.toolCpuStallMs = CPU_STALL_FIXTURE + 1;
     st.lastMarkerAt = 500_000;
     return st;
   };
   const decide = (st: HeartbeatState, bound: number) =>
-    heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, streamStallMs: bound }));
+    heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, streamStallMs: bound, cpuStallMs: CPU_STALL_FIXTURE }));
 
   equal(decide(silentToolShape(), S).reason, "tool-silence", "fixture sanity: at the default bound this shape is a wedge");
 
@@ -2280,6 +2504,18 @@ test("E279f: diagnostics — latch in all alive summaries + effective-bound head
   ok(
     src.includes("(decision.firstMessageMs ?? hbThresholds.firstMessageMs)"),
     "first-message headline prints the EFFECTIVE (latched) bound, not the base (905s display bug)",
+  );
+  // #5389: the decision-time CPU sample must be READABLE beside the live one.
+  // The `tool-silence`/`tool-dead` headline prints `decision.toolCpuStallMs`,
+  // and it ships in the SAME message as one of these summaries — so if the summary
+  // shows only the live `toolCpuStallMs`, a `tool_start`/`tool_end`/`turn_end`
+  // marker ingested while the kill path awaits its network probe resets the live
+  // pair to 0/false and the message contradicts its own headline. `.some()`, not a
+  // loop: only the heartbeat-kill site pairs with a decision, and a 5th site must
+  // not be forced to carry a field it has no decision to read.
+  ok(
+    aliveTemplates.some((s) => s.includes("decToolCpuStallMs=")),
+    "the heartbeat-kill alive summary carries the DECISION-TIME CPU sample, not only the live one",
   );
 });
 
@@ -2912,7 +3148,7 @@ test("full-format round-trip: every child formatter parses through the parent pa
   ok(st.everSawRealActivity, "formatToolStart latches through the parent parser");
   equal(parseHeartbeatLine(childHb.formatTurnStart(N, 3), st, 3, N), true);
   ok(st.turnActive);
-  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, toolUpdates: true, cpuMs: 65_000, cpuStallMs: 1_500, cpuAdvanced: true, sawMsg: true, sawTool: false }), st, 4, N), true);
+  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, toolUpdates: true, cpuMs: 65_000, cpuStallMs: 1_500, cpuAdvanced: true, sawMsg: true, sawTool: false, progress: true }), st, 4, N), true);
   equal(st.toolsInFlight, 1);
   equal(st.turnActive, true);
   equal(st.streamAgeMs, 4242);
@@ -2947,8 +3183,10 @@ section("#928 — silent-tool CPU liveness: the child's sample → the parent's 
 // the toolUpdates gate is UNIVERSAL and is not weakened by this change. That
 // left the multi-hour age backstop as its only bound. The populations a bound
 // must separate are timing-IDENTICAL from the parent's view (a healthy nested
-// `task` and a wedged `grep` are both toolsInFlight=1, both never emitted an
-// update, both on the same stream_age_ms curve), so the fix is a NEW INPUT —
+// `task` and a wedged `grep` are both toolsInFlight=1, both never emitted a
+// RENDERABLE update (#1505: pi's bash emits a zero-byte start update for every
+// call, so "emitted an update" is not "produced output"), both on the same
+// stream_age_ms curve), so the fix is a NEW INPUT —
 // process liveness — not a new bound.
 //
 // ⚠️ THE NEGATIVE CASE IS REQUIRED, NOT OPTIONAL. Any test of the form "a
@@ -2959,13 +3197,14 @@ section("#928 — silent-tool CPU liveness: the child's sample → the parent's 
 // state the CHILD actually produces (driven through the real parser), so they
 // cannot be satisfied by leaving a field unset.
 
-const C = 600_000; // #928 CPU-stall bound used by the fixtures below (a fixed
-//        fixture value, deliberately NOT read from the env: the clause tests are
-//        about the RULE, so they pass C explicitly. The SHIPPED default is
-//        pinned separately — see the `DEFAULT_CPU_STALL_MS` assertion at the end
-//        of the tool-dead block — because a silent drift of the default is the
-//        one change no clause fixture can catch.
+const C = CPU_STALL_FIXTURE; // #928's fixture bound — ONE value with the
+//        #5389 fixtures above, so the two sections cannot drift apart about
+//        what the CPU bound is. Deliberately NOT read from the env: the clause
+//        tests are about the RULE, so they pass C explicitly. The SHIPPED
+//        default is pinned separately — see the `DEFAULT_CPU_STALL_MS`
+//        assertion at the end of the tool-dead block.
 const NONCE928 = "nonce928";
+const NONCE5195 = "nonce5195";
 
 /** The decision-input shape shared by the positive twin and its negative twins:
  * one silent in-flight tool, silent for longer than S, in a fresh-marker
@@ -2973,7 +3212,7 @@ const NONCE928 = "nonce928";
 function silentToolState(over: Partial<HeartbeatState> = {}): HeartbeatState {
   const st = createHeartbeatState();
   st.toolsInFlight = 1;
-  st.toolUpdates = false;      // never emitted an update — clause 1 cannot fire
+  st.toolUpdates = false;      // never emitted a RENDERABLE update — clause 1 cannot fire
   st.turnActive = true;
   st.everSawRealActivity = true;
   st.everSawTool = true;
@@ -3638,6 +3877,10 @@ test("#928 tool-dead NEGATIVE TWIN (mandatory) — a parent awaiting a nested `t
     cpuAdvanced: false, // …and no demonstrated work, the second independent bar
     sawMsg: true,
     sawTool: true,
+    // #5195: this tool was declared (`formatToolStart`) but never completed, so
+    // nothing has PROGRESSED — the fixture must say so explicitly, or it would
+    // be asserting the new clause is inert rather than testing #928.
+    progress: false,
   });
   const st = createHeartbeatState();
   equal(parseHeartbeatLine(childHb.formatReady(NONCE928), st, 1_000_000, NONCE928), true);
@@ -3646,7 +3889,7 @@ test("#928 tool-dead NEGATIVE TWIN (mandatory) — a parent awaiting a nested `t
   equal(st.toolCpuStallMs, 0, "the child never probes `task` — the field is 0 (not probed), not a small live value");
   equal(st.toolCpuAdvanced, false, "nor is any CPU work demonstrated for it — the clause has two independent bars, both closed");
   equal(st.toolsInFlight, 1, "fixture check: one tool in flight, exactly as in the positive twin");
-  equal(st.toolUpdates, false, "fixture check: it has never emitted an update, exactly as in the positive twin");
+  equal(st.toolUpdates, false, "fixture check: it has never emitted a RENDERABLE update, exactly as in the positive twin");
   const d = heartbeatKillDecision(dinput({ now: NOW_928, lastLifeSignAt: 1_000_000, state: st, cpuStallMs: C }));
   equal(d.kill, false, "MANDATORY NEGATIVE CASE: a healthy nested task in flight past S must NOT be killed by the new clause");
   equal(d.reason, undefined, "no reason at all — not even a reclassified one");
@@ -3702,7 +3945,7 @@ test("#928 tool-dead NEGATIVE TWIN 2 (mandatory) — a nested `task` carrying a 
   // A's tick: silent past S, CPU demonstrated then flat for far past C.
   equal(
     parseHeartbeatLine(
-      childHb.formatTick(NONCE928, { tools: 1, turn: true, streamAgeMs: S + 60_000, toolAgeMaxMs: S + 60_000, toolUpdates: false, cpuMs: 700_000, cpuStallMs: 10 * C, cpuAdvanced: true, sawMsg: true, sawTool: true }),
+      childHb.formatTick(NONCE928, { tools: 1, turn: true, streamAgeMs: S + 60_000, toolAgeMaxMs: S + 60_000, toolUpdates: false, cpuMs: 700_000, cpuStallMs: 10 * C, cpuAdvanced: true, sawMsg: true, sawTool: true, progress: false }),
       st,
       1_000_000,
       NONCE928,
@@ -3957,6 +4200,529 @@ test("#928 tool-dead NEGATIVE — CPU-liveness resets at every tool/turn boundar
   equal(st3.toolAgeMaxMs, 0, "sibling check: tool_age_max_ms clears at the same edge");
 });
 
+section("#5195 heartbeat — the `no-progress` clause (the ONLY progress-keyed bound)");
+
+// ── The bound and its resolver ──────────────────────────────────────────────
+
+test("#5195: DEFAULT_PROGRESS_AGE_MS is the shipped bound, and getProgressAgeMs resolves it like its siblings", () => {
+  equal(DEFAULT_PROGRESS_AGE_MS, 2_700_000, "the shipped X is 45 min — the repo's own declared ceiling for the child's IDLE-CUT window (HANG_WINDOW_CEILING_MS in scripts/check-cost-config.sh). See the two-window cross-read below for the accepted gap this leaves");
+  // CROSS-READ, not a restated literal (review finding): X must not sit below the
+  // child's own bounded recovery, or it converts the child's visible
+  // `auto_retry_end` recovery into a parent-side partial-result kill. The repo
+  // declares TWO such windows; BOTH are read out of the guard that declares them,
+  // because asserting the literal twice would not notice a ceiling moving.
+  //
+  // X is sized to clear the IDLE-CUT window. It deliberately sits BELOW the
+  // WORST-CASE window — where every attempt burns its full provider timeout — so
+  // a child streaming keepalive frames with no content, or one past its retry
+  // budget running compaction (which emits no parent-visible progress), CAN be
+  // cut before the `auto_retry_end` it would have reported. That is the accepted,
+  // documented policy trade (index.ts getProgressAgeMs, load-policy.md §6). The
+  // second assertion pins that gap as EXISTING and BOUNDED, so it cannot widen
+  // unnoticed and so nothing here can be read as claiming X always lands after
+  // recovery.
+  {
+    const guard = readFileSync(resolve(__dirname, "../../scripts/check-cost-config.sh"), "utf-8");
+    const idle = guard.match(/HANG_WINDOW_CEILING_MS=(\d+)/);
+    ok(idle !== null, "FIXTURE: the guard declares HANG_WINDOW_CEILING_MS (if this moved, re-point the cross-read rather than deleting it)");
+    const idleCeiling = Number(idle?.[1]);
+    ok(idleCeiling > 0, `FIXTURE: the declared idle-cut ceiling parses (${idle?.[1]})`);
+    ok(
+      DEFAULT_PROGRESS_AGE_MS <= idleCeiling,
+      `X (${DEFAULT_PROGRESS_AGE_MS}) must not exceed the declared idle-cut ceiling (${idleCeiling}) — below it, X pre-empts the child's own bounded recovery`,
+    );
+
+    const worst = guard.match(/WORST_WINDOW_CEILING_MS=(\d+)/);
+    ok(worst !== null, "FIXTURE: the guard declares WORST_WINDOW_CEILING_MS — the larger window X deliberately sits below (if this moved, re-point the cross-read rather than deleting it)");
+    const worstCeiling = Number(worst?.[1]);
+    ok(worstCeiling > 0, `FIXTURE: the declared worst-case ceiling parses (${worst?.[1]})`);
+    ok(
+      worstCeiling > idleCeiling,
+      `FIXTURE: the worst-case ceiling (${worstCeiling}) exceeds the idle-cut ceiling (${idleCeiling}) — the gap below only means anything if the windows are genuinely ordered`,
+    );
+    ok(
+      worstCeiling <= 2 * idleCeiling,
+      `the worst-case ceiling (${worstCeiling}) must stay within ONE DOUBLING of the idle-cut ceiling (${idleCeiling}) — the two windows are ordered, and a materially wider band changes the policy trade in load-policy.md §6 and must be re-derived with it`,
+    );
+    // NOTE (review cycle 3): the gap itself (`X < worstCeiling`) is NOT asserted
+    // separately — it is implied by the two assertions above and could never fail
+    // on its own, which is exactly the sort of restated consequence this suite
+    // bans elsewhere. A *widened* guard is also not caught here: the guard's own
+    // coupling test (`tests/cost-config/run.sh`, `doc↔guard coupling broken`) is
+    // what catches a rewritten `check-cost-config.sh`. What THIS pins is the band.
+  }
+  withEnv({ TASK_PROGRESS_AGE_MS: undefined }, () => {
+    equal(getProgressAgeMs(), DEFAULT_PROGRESS_AGE_MS, "unset → the default (the clause is ARMED by default, never opt-in)");
+  });
+  withEnv({ TASK_PROGRESS_AGE_MS: "3600000" }, () => {
+    equal(getProgressAgeMs(), 3_600_000, "a positive override is honoured verbatim");
+  });
+  withEnv({ TASK_PROGRESS_AGE_MS: "0" }, () => {
+    equal(getProgressAgeMs(), 0, "the VALUE 0 is the explicit off switch");
+  });
+  withEnv({ TASK_PROGRESS_AGE_MS: "0.0" }, () => {
+    equal(getProgressAgeMs(), 0, "…as is 0.0 (an operator who wrote either meant it)");
+  });
+  // #5195 review fix (P1): the floor is the REPORTING CADENCE, not a bare 60 s.
+  // The parent can only see progress when the child reports it, so a bound below
+  // the tick cadence fires before the evidence it waits for. `max(60 s, 3 x
+  // interval)` — at the default interval the 3x term is the binding one.
+  withEnv({ TASK_PROGRESS_AGE_MS: "1000", TASK_HEARTBEAT_INTERVAL_MS: undefined }, () => {
+    const floor = 3 * getHeartbeatIntervalMs();
+    ok(floor > 60_000, `FIXTURE: at the default interval the cadence term binds (3 x ${getHeartbeatIntervalMs()} = ${floor})`);
+    equal(getProgressAgeMs(), floor, "a sub-cadence bound is floored at 3 x the reporting interval");
+  });
+  // The OTHER half of the floor: at the MINIMUM interval the cadence term is
+  // 15 s, i.e. BELOW the 60 s term, so the literal is the binding one. Without
+  // this case the `60_000` could be replaced by any smaller constant with the
+  // whole suite still green (review finding: the 60 s term was never the binding
+  // term in any test, yet HEARTBEAT_INTERVAL_MIN_MS makes it reachable).
+  withEnv({ TASK_PROGRESS_AGE_MS: "1000", TASK_HEARTBEAT_INTERVAL_MS: String(HEARTBEAT_INTERVAL_MIN_MS) }, () => {
+    equal(getHeartbeatIntervalMs(), HEARTBEAT_INTERVAL_MIN_MS, "the minimum interval is honoured");
+    ok(
+      3 * getHeartbeatIntervalMs() < 60_000,
+      `FIXTURE: here the 60 s term is the binding one (3 x ${getHeartbeatIntervalMs()} = ${3 * getHeartbeatIntervalMs()})`,
+    );
+    equal(getProgressAgeMs(), 60_000, "a sub-cadence bound is floored at the 60 s literal when the cadence term is the smaller one");
+  });
+  // THE P1 CASE: a raised tick interval with a small explicit X. The old
+  // hard-coded 60 s floor let this through, cutting a genuinely PROGRESSING
+  // content-only child roughly six minutes into a healthy run because the parent
+  // could not yet see the progress it was making.
+  withEnv({ TASK_PROGRESS_AGE_MS: "60000", TASK_HEARTBEAT_INTERVAL_MS: "300000" }, () => {
+    equal(getHeartbeatIntervalMs(), 300_000, "the raised interval is honoured");
+    equal(
+      getProgressAgeMs(),
+      900_000,
+      "X is floored at 3 x the REPORTING cadence — a bound below it measures nothing and would false-kill a progressing child",
+    );
+  });
+  // …and the floor never SHRINKS a deliberate, larger value.
+  withEnv({ TASK_PROGRESS_AGE_MS: "4500000", TASK_HEARTBEAT_INTERVAL_MS: "300000" }, () => {
+    equal(getProgressAgeMs(), 4_500_000, "an explicit value above the cadence is honoured verbatim");
+  });
+  for (const bad of ["", "   ", "abc", "-5", "NaN", "Infinity", "1e400"]) {
+    withEnv({ TASK_PROGRESS_AGE_MS: bad }, () => {
+      equal(
+        getProgressAgeMs(),
+        DEFAULT_PROGRESS_AGE_MS,
+        `FAIL-CLOSED: ${JSON.stringify(bad)} must NOT disarm the one clause that bounds the content-free-loop class`,
+      );
+    });
+  }
+});
+
+// ── The clause ─────────────────────────────────────────────────────────────
+
+/**
+ * The E/E2 shape in one place: a child that keeps emitting markers (so every
+ * liveness signal stays fresh) while completing NOTHING.
+ *
+ * `toolsInFlight === 0`, a marker a moment ago, a stream the child claims is
+ * fresh — i.e. every field an empty-turn loop or a drip stream can forge.
+ * Only `lastProgressAt` is absent, and that is the point.
+ */
+function loopingChild(over: Partial<HeartbeatDecisionInput> & { state?: HeartbeatState } = {}) {
+  const now = over.now ?? 1_000_000;
+  const st = over.state ?? createHeartbeatState();
+  if (over.state === undefined) {
+    // A TICKING loop: the marker clock is kept FRESH (that is what makes
+    // `stateFresh` true and keeps the silence clause quiet), the child claims a
+    // fresh stream (turn_start resets it and no content follows), and every
+    // latch that could rescue it is armed. The only thing it cannot produce is
+    // progress.
+    st.lastMarkerAt = now - 60_000;
+    st.streamAgeMs = 0;
+    st.turnActive = true;
+    st.turnSawMessage = true;
+    st.everSawWork = true;
+    st.everSawRealActivity = true;
+    st.tickCount = 400;
+    st.markerCount = 400;
+  }
+  return dinput({
+    now,
+    startedAt: over.startedAt ?? 1_000_000,
+    lastLifeSignAt: now - 30_000, // inside T — silence is quiet too
+    state: st,
+    progressAgeMs: DEFAULT_PROGRESS_AGE_MS,
+    ...over,
+  });
+}
+
+test("#5195: the E shape — a content-free turn loop with FRESH ticks is killed at X, where every other clause is silent", () => {
+  // The CONTROL is the whole point of this test: one second inside X, NO clause
+  // fires. That is the proof the clause is load-bearing rather than a duplicate
+  // of something that was already firing — ticks keep liveness fresh, turn_start
+  // keeps the claimed stream age fresh, and #279's latch suppresses
+  // first-message-stall.
+  const before = heartbeatKillDecision(loopingChild({ now: 1_000_000 + DEFAULT_PROGRESS_AGE_MS - 1_000 }));
+  equal(before.kill, false, "CONTROL: one second inside X, no clause fires — exactly the state that used to be unbounded");
+  equal(before.reason, undefined, "CONTROL: and no reason is even classified");
+  // Then: one second past X.
+  const d = heartbeatKillDecision(loopingChild({ now: 1_000_000 + DEFAULT_PROGRESS_AGE_MS + 1_000 }));
+  equal(d.kill, true, "past X the dispatch is cut");
+  equal(d.reason, "no-progress", "…by `no-progress`, not by a repurposed clause");
+});
+
+test("#5195: the CLOCK INVARIANT — ticks, turn boundaries and fresh markers can NEVER reset the progress bound", () => {
+  // This is the property no other clause has, and the whole reason E/E2 escaped:
+  // every other bound is reset by a liveness signal a *looping* child emits for
+  // free. Drive the real parser through a long run of ticks — each one updating
+  // lastMarkerAt, streamAgeMs, tickCount — and assert the verdict does not move.
+  const st = createHeartbeatState();
+  st.lastMarkerAt = 1_000_000;
+  let now = 1_000_000;
+  for (let i = 0; i < 6; i++) {
+    now += 600_000; // 10 min between ticks
+    equal(parseHeartbeatLine(childHb.formatReady(NONCE5195), st, now, NONCE5195), true);
+    equal(parseHeartbeatLine(childHb.formatTurnStart(NONCE5195, i + 1), st, now, NONCE5195), true);
+    equal(
+      parseHeartbeatLine(
+        childHb.formatTick(NONCE5195, {
+          tools: 0,
+          turn: true,
+          streamAgeMs: 0,
+          toolAgeMaxMs: 0,
+          toolUpdates: false,
+          cpuMs: 0,
+          cpuStallMs: 0,
+          cpuAdvanced: false,
+          sawMsg: true,
+          sawTool: false,
+          progress: false,
+        }),
+        st,
+        now,
+        NONCE5195,
+      ),
+      true,
+    );
+    equal(st.lastMarkerAt, now, `FIXTURE check @${i}: the marker clock IS refreshed by the loop (this is what defeats every other clause)`);
+    equal(st.streamAgeMs, 0, `FIXTURE check @${i}: the child claims a fresh stream (turn_start reset it, no content followed)`);
+  }
+  equal(st.lastProgressAt, 0, "INVARIANT: not one of those six rounds advanced the PROGRESS clock");
+  const d = heartbeatKillDecision(
+    dinput({ now, lastLifeSignAt: now, state: st, progressAgeMs: DEFAULT_PROGRESS_AGE_MS }),
+  );
+  equal(d.kill, true, "an hour of honest-looking ticks and an empty turn loop is still cut");
+  equal(d.reason, "no-progress", "by the progress clock, which ticks cannot reset");
+});
+
+test("#5195: the clock is anchored on startedAt, so a dispatch that NEVER progresses is bounded too", () => {
+  // The discriminator: the MARKER clock is 30 s old (fresh, so stateFresh holds
+  // and no stale-state clause is in play), while the DISPATCH is X (45 min) old
+  // and has completed nothing. If X were anchored on the first marker — or worse,
+  // restarted whenever the parent looked — a child that merely ticks would be
+  // unbounded forever. It is anchored on `startedAt`, so it is not.
+  const base = 1_000_000;
+  const at = (now: number) => {
+    const st = createHeartbeatState();
+    st.turnActive = true;
+    st.lastMarkerAt = now - 30_000; // a FRESH marker clock
+    equal(st.lastProgressAt, 0, "FIXTURE: this child has never completed anything");
+    return dinput({
+      now,
+      startedAt: base,
+      lastLifeSignAt: now - 30_000,
+      state: st,
+      progressAgeMs: DEFAULT_PROGRESS_AGE_MS,
+    });
+  };
+  const early = heartbeatKillDecision(at(base + DEFAULT_PROGRESS_AGE_MS - 1_000));
+  equal(early.kill, false, "CONTROL: inside X it is untouched — the anchor is X-wide, not immediate");
+  const late = heartbeatKillDecision(at(base + DEFAULT_PROGRESS_AGE_MS + 1_000));
+  equal(late.kill, true, "X runs from `startedAt`: 45 min of dispatch with 30 s of marker freshness is still 45 min of no work");
+  equal(late.reason, "no-progress", "and it is the progress clock that owns it, not the marker clock");
+});
+
+test("#5195: a completed tool END advances the clock — the parent's own wire evidence, independent of the tick", () => {
+  const t0 = 1_000_000;
+  const now = t0 + DEFAULT_PROGRESS_AGE_MS - 1_000;
+  const mk = () => {
+    const st = createHeartbeatState();
+    st.turnActive = true;
+    equal(parseHeartbeatLine(childHb.formatToolEnd(NONCE5195, "call-1"), st, t0, NONCE5195), true);
+    // A content-free tick a moment ago, so the state is FRESH. Without this the
+    // fixture is not testing the progress clause at all: a stale marker makes
+    // `stateFresh` false, which gates the clause off and would let this pass
+    // with the clause DELETED (a vacuous pin — caught in review).
+    equal(
+      parseHeartbeatLine(
+        childHb.formatTick(NONCE5195, {
+          tools: 0, turn: true, streamAgeMs: 0, toolAgeMaxMs: 0, toolUpdates: false,
+          cpuMs: 0, cpuStallMs: 0, cpuAdvanced: false, sawMsg: true, sawTool: false, progress: false,
+        }),
+        st,
+        now - 30_000,
+        NONCE5195,
+      ),
+      true,
+    );
+    return st;
+  };
+  const decide = (st: HeartbeatState) =>
+    heartbeatKillDecision(
+      dinput({
+        now,
+        startedAt: t0 - 5_000_000,
+        lastLifeSignAt: now - 30_000,
+        state: st,
+        progressAgeMs: DEFAULT_PROGRESS_AGE_MS,
+      }),
+    );
+  const st = mk();
+  equal(st.lastProgressAt, t0, "tool_end is a COMPLETED UNIT OF WORK and stamps the clock directly");
+  equal(decide(st).kill, false, "progress 29 min ago is still inside X — the clock measures PROGRESS, not elapsed time");
+  // FAILS-IF-REMOVED TWIN: identical state, progress credit withheld. Now the
+  // clock anchors on `startedAt` (6.8 M ms back) and the clause MUST fire — so
+  // the assertion above is about the credit, not about an inert fixture.
+  const noCredit = mk();
+  noCredit.lastProgressAt = 0;
+  const killed = decide(noCredit);
+  equal(killed.kill, true, "control: the same state WITHOUT the tool_end credit is cut — the credit is what spares it");
+  equal(killed.reason, "no-progress", "…by the progress clause, anchored on startedAt");
+});
+
+test("#5195: only a content-grounded `progress=1` tick advances the clock; `progress=0` never does", () => {
+  const st = createHeartbeatState();
+  st.lastMarkerAt = 1_000_000;
+  const tick = (progress: boolean, at: number) => {
+    equal(
+      parseHeartbeatLine(
+        childHb.formatTick(NONCE5195, {
+          tools: 0, turn: true, streamAgeMs: 0, toolAgeMaxMs: 0, toolUpdates: false,
+          cpuMs: 0, cpuStallMs: 0, cpuAdvanced: false, sawMsg: true, sawTool: false, progress,
+        }),
+        st,
+        at,
+        NONCE5195,
+      ),
+      true,
+    );
+  };
+  tick(false, 1_000_100);
+  equal(st.lastProgressAt, 0, "a tick WITHOUT progress evidence must not move the clock (this is E/E2's whole trick)");
+  tick(true, 1_000_200);
+  equal(st.lastProgressAt, 1_000_200, "a tick WITH progress evidence stamps it");
+  tick(false, 1_000_300);
+  equal(st.lastProgressAt, 1_000_200, "…and a later content-free tick does not un-stamp it (it is a timestamp, not a flag)");
+});
+
+test("#5195: the clause is SCOPED to no-tool — a declared in-flight tool keeps its own clauses", () => {
+  // A tool in flight is a DECLARED long operation. It is owned by
+  // tool-silence/tool-dead/tool-stall, which use the CPU and `tool_updates`
+  // evidence those clauses need. Arming X there would cut a legitimate long tool
+  // for the very reason those clauses exist.
+  //
+  // The fixture must be FRESH for this to pin the SCOPE rather than the
+  // stateFresh gate: a stale marker gates every clause off, so a fixture with a
+  // stale marker stays green with `toolsInFlight === 0` deleted from the clause
+  // (a vacuous pin — caught in review).
+  const NOW_NP = 1_000_000 + 10_000_000;
+  const withTools = (toolsInFlight: number): HeartbeatState => {
+    const s = createHeartbeatState();
+    s.lastMarkerAt = NOW_NP - 30_000; // fresh
+    s.turnActive = true;
+    s.toolsInFlight = toolsInFlight;
+    s.toolUpdates = true; // keeps tool-silence quiet: a silent tool would own this state
+    s.toolAgeMaxMs = 0;
+    return s;
+  };
+  const decide = (s: HeartbeatState) =>
+    heartbeatKillDecision(
+      dinput({ now: NOW_NP, startedAt: 0, lastLifeSignAt: NOW_NP - 30_000, state: s, progressAgeMs: DEFAULT_PROGRESS_AGE_MS }),
+    );
+  // POSITIVE TWIN first: the SAME fresh, no-progress state with no tool in
+  // flight IS cut. Together the pair isolates `toolsInFlight` as the difference.
+  const positive = decide(withTools(0));
+  equal(positive.kill, true, "POSITIVE TWIN: the identical state with no tool in flight is cut");
+  equal(positive.reason, "no-progress", "…by the progress clause");
+  // …and the same state with a declared tool in flight is spared.
+  const d = decide(withTools(1));
+  equal(d.kill, false, "MANDATORY NEGATIVE: no kill at all for a declared tool in flight, however long");
+  equal(d.reason === "no-progress", false, "MANDATORY NEGATIVE: no `no-progress` while a tool is in flight, however long");
+});
+
+test("#5195: an OLDER child that emits no `progress` field is bounded (fail-closed), and tool_end still credits it", () => {
+  // Skew IS reachable in this fleet (review correction): the extensions are
+  // SYMLINKS into the main checkout while a parent's modules are snapshotted at
+  // process start, so a long-lived parent holding this code can outlive an
+  // on-disk revert/stash/branch switch of `task-heartbeat.ts`.
+  // The honest direction is therefore to stay BOUNDED: a child that never
+  // reports progress cannot be given an unbounded exemption — that would
+  // re-open the exact hole #5195 closes, in a less visible form. It is still
+  // credited for its completed tools, which every version emits. Stated
+  // consequence: a content-only, tool-less dispatch older than X on a skewed
+  // child IS cut (fail-closed, not fail-safe).
+  const st = createHeartbeatState();
+  st.lastMarkerAt = 1_000_000;
+  st.turnActive = true;
+  const tickNoProgressField = `[task-heartbeat] tick nonce=${NONCE5195} tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 tool_updates=0 cpu_ms=0 cpu_stall_ms=0 cpu_advanced=0 saw_msg=1 saw_tool=0`;
+  equal(parseHeartbeatLine(tickNoProgressField, st, 1_000_000 + DEFAULT_PROGRESS_AGE_MS + 1_000, NONCE5195), true, "the old-field tick still parses");
+  equal(st.lastProgressAt, 0, "…and contributes no progress evidence");
+  const d = heartbeatKillDecision(dinput({ now: 1_000_000 + DEFAULT_PROGRESS_AGE_MS + 1_000, lastLifeSignAt: 1_000_000 + DEFAULT_PROGRESS_AGE_MS + 1_000, state: st, progressAgeMs: DEFAULT_PROGRESS_AGE_MS }));
+  equal(d.kill, true, "an older child is bounded by X — never unbounded");
+  equal(d.reason, "no-progress");
+  // …but a completed tool credits it regardless of version:
+  equal(parseHeartbeatLine(childHb.formatToolEnd(NONCE5195, "call-old"), st, 1_000_000 + DEFAULT_PROGRESS_AGE_MS + 1_000, NONCE5195), true);
+  equal(st.lastProgressAt > 0, true, "tool_end is version-independent credit");
+});
+
+test("#5195: X is NOT load-scaled and NOT latched — a bound that widens is the defect this clause exists to fix", () => {
+  // Pinned because it is a DELIBERATE departure from firstMessageMs (M) and
+  // cutGapMs, which DO scale under load and latch monotonically. Raising a bound
+  // under load is how #363 (hard cap 2h→6h) and ea22897 (S per-dispatch) turned a
+  // bounded class into an unbounded one. Asserted on the source, because the
+  // whole failure mode is a future edit "for consistency" adding the scaling.
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  // Anchored on the clause's RETURN, not on its `if` header (review fix): the
+  // header's exact conjunct list is a shape a semantically-NEUTRAL refactor
+  // legitimately changes — a reordered conjunct, an added defensive term, or a
+  // trailing inline comment all red the previous form while altering no
+  // behaviour. The return IS the behaviour.
+  const anchor = src.indexOf('kill("no-progress")');
+  ok(anchor > 0, "the no-progress clause's return was located in the source");
+  const window = src.slice(Math.max(0, anchor - 400), anchor + 40);
+  // Strip BLOCK and TRAILING comments, not only line-leading ones: the previous
+  // version stripped only line-leading, so `// never latched` appended to a code
+  // line false-red a behaviour gate.
+  const clause = window
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .map((l) => l.replace(/\/\/.*$/, ""))
+    .join("\n");
+  ok(clause.includes("stateFresh"), "the slice is the clause body, not an empty or unrelated window");
+  ok(clause.includes("i.progressAgeMs"), "…and it carries the bound");
+  for (const forbidden of ["loadScaledBound", "latched", "effFirstMessageMs", "load1"]) {
+    ok(
+      !clause.includes(forbidden),
+      `VIOLATION: the no-progress clause must not consult \`${forbidden}\` — widening under load or latching is exactly what made this class unbounded`,
+    );
+  }
+  ok(clause.includes("st.toolsInFlight === 0"), "…and it stays scoped to no-tool");
+  ok(clause.includes("i.progressAgeMs > 0"), "…with 0 as the explicit off switch");
+});
+
+test("#5195: X is not widened by load AT THE CALL SITE either", () => {
+  // The source slice above can only see the clause BODY. Widening would enter at
+  // the dispatch site — `progressAgeMs: loadScaledBound(getProgressAgeMs(), getLoad1())`
+  // — which the entire suite was blind to (review finding: with that mutation
+  // applied the suite still passed 303).
+  //
+  // The guard is STRUCTURAL: comments are stripped and the walk is anchored on the
+  // per-dispatch `hbThresholds` literal, so a benign edit (a reworded comment, a
+  // new field, a reformat) cannot red it — while the widening mutation above still
+  // does (verified: mutation → 305/1).
+  //
+  // RESIDUAL, stated rather than papered over (review cycle 2 removed a second arm
+  // here that was VACUOUS — it re-asserted the clause body through a literal
+  // `progressAgeMs`, so deleting this pin + applying the mutation still passed
+  // 306/0). There is no behavioural arm because the resolver is not exported, and
+  // exporting production code to satisfy a test is more machinery than this bound
+  // warrants.
+  //
+  // The pin is anchored on the per-dispatch `hbThresholds` literal, comments are
+  // stripped, and the key is required to occur EXACTLY ONCE — because a JS object
+  // literal silently takes the LAST duplicate key at runtime while a `.match()`
+  // returns the FIRST, so without the count an appended
+  // `progressAgeMs: loadScaledBound(...)` would win live and leave this green
+  // (review cycle 3 demonstrated exactly that evasion green at 307/0).
+  //
+  // KNOWN LIMIT, stated exactly: a caller that widens `progressAgeMs` inside a
+  // DIFFERENT literal is not caught here (the `ok(...)` below catches only a
+  // caller that MOVES it out of this one). "The only place widening can enter" is
+  // therefore NOT true and is not claimed.
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  const start = src.indexOf("const hbThresholds = {");
+  ok(start > 0, "the per-dispatch hbThresholds literal exists (the anchor for this pin)");
+  const end = src.indexOf("\n    };", start);
+  ok(end > start, "the hbThresholds literal has a boundary");
+  const body = src
+    .slice(start, end)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  const hits = body.match(/["']?progressAgeMs["']?\s*:/g) ?? [];
+  equal(
+    hits.length,
+    1,
+    "the hbThresholds literal must define `progressAgeMs` EXACTLY ONCE — a duplicate key wins at runtime but is invisible to a first-match regex, which is a live widening this pin would otherwise miss. The pattern is deliberately quote- and space-tolerant (`progressAgeMs :`, `\"progressAgeMs\":` are both valid keys that win at runtime), because there is no typecheck/lint in CI to catch a duplicate object key",
+  );
+  const m = body.match(/progressAgeMs:\s*([^\n,]+),/);
+  ok(m !== null, "the per-dispatch thresholds resolve progressAgeMs");
+  equal(
+    (m?.[1] ?? "").trim(),
+    "getProgressAgeMs()",
+    "the dispatch site must pass getProgressAgeMs() UNWRAPPED — wrapping it in loadScaledBound is the widening this clause exists to prevent",
+  );
+});
+
+test("#5195: the `no-progress` headline reports the OBSERVED age, not the bound (the #1070 defect class)", () => {
+  // `#1070`'s rule is "warn, never clamp" — and its corollary is that a warning
+  // must carry the REAL number. A headline that prints the BOUND instead of the
+  // observed age tells an operator "no work for 2700s" about a child actually cut
+  // at 5000s, so the extent past the line is unreadable. Structural pin: the
+  // observable is `decision.progressAgeMs`, with the bound only as a fallback for
+  // a decision that somehow carries none.
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  const i = src.indexOf('"no-progress": `');
+  ok(i > 0, "the no-progress headline exists (if this moved, re-point the pin rather than deleting it)");
+  const slice = src.slice(i, i + 400);
+  ok(
+    /decision\.progressAgeMs/.test(slice),
+    "the headline must interpolate the OBSERVED progressAgeMs off the decision — reverting to the bound alone is the #1070 defect",
+  );
+});
+
+test("#5195: the clause is NOT silenced by the network-aware suppression (the DEFAULT configuration)", () => {
+  // The #318/#1088 suppression returns EARLY — kill:false — whenever the probe
+  // reports an outage AND the child is demonstrably alive (fresh markers).
+  // Placed BELOW it, this clause was INERT in exactly that state, and that state
+  // is the DEFAULT (network wait enabled), so the class it exists to close
+  // stayed bounded only by the 6 h hard cap. Both reviewers found this
+  // independently, and it is the reason the clause is now evaluated BEFORE the
+  // suppression: the clause keys on PROGRESS, which an outage does not fabricate,
+  // so the suppression's premise — that a WAITING child looks stalled — does not
+  // reach it. X clears the child's IDLE-CUT window (~43 min) but NOT its
+  // worst-case one (~83 min), so a child cut under an outage is treated as wedged
+  // by POLICY; it may not yet have outlived an `auto_retry_end` it would have
+  // reported. That is the SAME accepted partial-result trade documented at
+  // index.ts (this clause's comment and `getProgressAgeMs`) and
+  // load-policy.md §6 — and this comment must NOT restate it as "already
+  // outlived". The pair below pins BOTH directions,
+  // so neither 'it fires' nor 'the suppression still protects a waiting child'
+  // can be satisfied by deleting the other.
+  const NOW = 11_000_000;
+  const fresh = (): HeartbeatState => {
+    const s = createHeartbeatState();
+    s.lastMarkerAt = NOW - 30_000; // fresh: markerAge 30s << 2*T, so stateFresh is true
+    s.turnActive = true;
+    s.toolsInFlight = 0;
+    s.toolUpdates = true;
+    s.toolAgeMaxMs = 0;
+    return s;
+  };
+  const at = (startedAt: number, networkDown: boolean) =>
+    heartbeatKillDecision(
+      dinput({ now: NOW, startedAt, lastLifeSignAt: NOW - 30_000, networkDown, state: fresh(), progressAgeMs: DEFAULT_PROGRESS_AGE_MS }),
+    );
+  // Under X: NOT cut — and asserted with the probe UP as well, so the assertion
+  // is pinned to X rather than passing for free via the suppression.
+  const underNoOutage = at(NOW - DEFAULT_PROGRESS_AGE_MS + 1_000, false);
+  equal(underNoOutage.reason === "no-progress", false, "under X is not cut (no outage, so this is X's own doing)");
+  const underOutage = at(NOW - DEFAULT_PROGRESS_AGE_MS + 1_000, true);
+  equal(underOutage.reason === "no-progress", false, "…and not during an outage either (the suppression's purpose: a waiting child survives it)");
+  // Past X WITH an outage reported: the clause still fires. This is the fix.
+  const over = at(NOW - DEFAULT_PROGRESS_AGE_MS - 1_000, true);
+  equal(over.kill, true, "past X under a reported outage the clause FIRES — otherwise the class is bounded only by the 6 h hard cap");
+  equal(over.reason, "no-progress");
+  equal(
+    (over.progressAgeMs ?? 0) > DEFAULT_PROGRESS_AGE_MS,
+    true,
+    "…and the decision carries the OBSERVED age (not the bound) — the #1070 defect class for every other age-reporting clause",
+  );
+});
+
 section("#176 heartbeat — child emitter (fake-pi harness)");
 
 test("child gating matrix — inactive without TASK_HEARTBEAT=1 ∧ PI_MODE=print ∧ ¬DISABLE", () => {
@@ -3977,7 +4743,14 @@ test("child gating matrix — inactive without TASK_HEARTBEAT=1 ∧ PI_MODE=prin
   withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }, () => {
     const { api, handlers } = stub();
     childFactory(api);
-    equal(Object.keys(handlers).length, 0, "TASK_HEARTBEAT_DISABLE=1 → inert");
+    // #1500 Leg B: the emitter is silenced, but this child must STILL get a
+    // bounded bash call — the subagent extension sets exactly this flag for the
+    // reviewer/verification children, which are the population Leg B protects.
+    deepEqual(
+      Object.keys(handlers),
+      ["tool_call"],
+      "TASK_HEARTBEAT_DISABLE=1 silences the emitter only — the tool_call guard remains",
+    );
   });
   withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined }, () => {
     const { api, handlers } = stub();
@@ -3988,12 +4761,16 @@ test("child gating matrix — inactive without TASK_HEARTBEAT=1 ∧ PI_MODE=prin
     // structurally blind in exactly the direction that matters). The child now
     // registers precisely the declared activity edges plus the two lifecycle
     // events, and this equality fails on a registration on EITHER side.
-    const expected = [...progressEdges.ACTIVITY_EDGE_EVENTS, ...progressEdges.LIFECYCLE_EVENTS].sort();
+    const expected = [
+      ...progressEdges.ACTIVITY_EDGE_EVENTS,
+      ...progressEdges.LIFECYCLE_EVENTS,
+      ...progressEdges.PREVENTION_EVENTS,
+    ].sort();
     const actual = Object.keys(handlers).sort();
     deepEqual(
       actual,
       expected,
-      `registered handlers must equal ACTIVITY_EDGE_EVENTS ∪ LIFECYCLE_EVENTS (declared in extensions/shared/heartbeat-progress-edges.ts) — actual ${JSON.stringify(actual)}`,
+      `registered handlers must equal ACTIVITY_EDGE_EVENTS ∪ LIFECYCLE_EVENTS ∪ PREVENTION_EVENTS (declared in extensions/shared/heartbeat-progress-edges.ts) — actual ${JSON.stringify(actual)}`,
     );
     for (const ev of expected) ok(handlers[ev], `handler registered for ${ev}`);
   });
@@ -4145,7 +4922,11 @@ testAsync("child lifecycle (review fix): a lost tool_execution_end must NOT leak
       await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
       // A streaming tool that emits, then its end is LOST (never delivered).
       await handlers.tool_execution_start({ toolCallId: "call_0", toolName: "bash", args: {} });
-      await handlers.tool_execution_update({ toolCallId: "call_0", toolName: "bash", args: {}, partialResult: "out" });
+      // #1505: the payload must be RENDERABLE — pi's real snapshot shape. A bare
+      // string no longer arms the latch (it is not a shape `hasRenderableOutput`
+      // can read), which is the whole point of the fix; keeping the old fixture
+      // would make this test pass for the wrong reason.
+      await handlers.tool_execution_update({ toolCallId: "call_0", toolName: "bash", args: {}, partialResult: { content: [{ type: "text", text: "out" }], details: undefined } });
       await handlers.turn_end({ turnIndex: 1, message: {}, toolResults: [] });
       // Next turn: a NON-streaming tool (a nested `task` never emits updates)
       // happens to reuse the same id.
@@ -4157,6 +4938,411 @@ testAsync("child lifecycle (review fix): a lost tool_execution_end must NOT leak
       ok(tick.includes("tool_updates=0"), `a reused id must NOT inherit the previous turn's liveness (tool-silence gate stays off): ${tick}`);
       await handlers.session_shutdown({} as any);
     });
+  } finally {
+    console.error = origErr;
+  }
+});
+
+section("#1500/#1505 — the evidence gate and the dispatched-child bash bound");
+
+test("#1505 hasRenderableOutput — 'emitted an update' must mean 'PRODUCED output'", () => {
+  const h = childHb.hasRenderableOutput;
+  // The exact payload pi's bash emits UNCONDITIONALLY, before a single byte of
+  // command output (verified live: `sleep 12; echo hi` → an update at 2 ms with
+  // `{content:[]}`). Arming the latch on this is the defect: it made clause 1 a
+  // bare 20-minute silence timeout for every bash call.
+  equal(h({ content: [], details: undefined }), false, "the zero-byte start update must NOT arm");
+  // A real snapshot that renders as nothing — the case an array-LENGTH test misses.
+  equal(h({ content: [{ type: "text", text: "" }] }), false, "empty-string snapshot must NOT arm");
+  equal(h({ content: [{ type: "text", text: "   \n\t " }] }), false, "whitespace-only must NOT arm (R-B2)");
+  // Real output.
+  equal(h({ content: [{ type: "text", text: "hi\n" }] }), true, "real output must arm");
+  equal(h({ content: [{ type: "text", text: " x " }] }), true, "padded real output must arm");
+  equal(
+    h({ content: [{ type: "text", text: "" }, { type: "text", text: "x" }] }),
+    true,
+    "ANY renderable part arms the round",
+  );
+  // Fail CLOSED on every shape this predicate cannot read: an unreadable payload
+  // must never license a kill.
+  for (const bad of [
+    undefined,
+    null,
+    "out",
+    7,
+    {},
+    { content: undefined },
+    { content: "text" },
+    { content: [null, 3, {}] },
+    { content: [{ type: "image" }] },
+    { content: [{ type: "text" }] },
+    { content: [{ type: "text", text: 7 }] },
+  ]) {
+    equal(h(bad), false, `an unreadable payload must fail CLOSED: ${JSON.stringify(bad)}`);
+  }
+});
+
+test("#1505 computeToolUpdates — still UNIVERSAL, so a never-streaming sibling suppresses clause 1 (T5)", () => {
+  const f = childHb.computeToolUpdates;
+  equal(f(["a"], new Set(["a"])), true, "the single streamed tool arms the round");
+  equal(f(["a"], new Set()), false, "a tool that produced nothing does not arm it");
+  equal(f(["a", "b"], new Set(["a"])), false, "one silent sibling suppresses the kill for BOTH (accepted residual T5)");
+  equal(f(["a", "b"], new Set(["a", "b"])), true, "all of them produced output");
+  equal(f([], new Set()), false, "nothing in flight → no evidence claim at all");
+});
+
+test("#1500 getToolTimeoutSeconds — absent ⇒ bound ON; only a SUPPLIED bad value disarms it", () => {
+  const g = childHb.getToolTimeoutSeconds;
+  equal(g({}), childHb.DEFAULT_TOOL_TIMEOUT_S, "absent → the default (failing open here re-creates the class)");
+  equal(childHb.DEFAULT_TOOL_TIMEOUT_S, 7200, "the shipped default (value pin)");
+  equal(g({ TASK_TOOL_TIMEOUT_S: "120" }), 120, "a supplied positive value is honoured");
+  equal(g({ TASK_TOOL_TIMEOUT_S: "0.5" }), 0.5, "fractional seconds are allowed");
+  for (const bad of ["0", "-1", "-0.5", "abc", "", " ", "Infinity", "-Infinity", "NaN", "1e400"]) {
+    equal(g({ TASK_TOOL_TIMEOUT_S: bad }), null, `"${bad}" must DISARM, not bound`);
+  }
+  // Above pi's own MAX_TIMEOUT_MS, `resolveTimeoutMs` THROWS
+  // `Invalid timeout: maximum is 2147483.647 seconds` — so an unclamped value
+  // would make the bash call fail outright, not merely be capped.
+  equal(g({ TASK_TOOL_TIMEOUT_S: "99999999999" }), 2147483, "clamped to pi's timeout ceiling");
+  // The warning predicate mirrors the polarity exactly.
+  const w = childHb.toolTimeoutDisarmWarning;
+  equal(w(undefined), null, "absent is the DEFAULT, not a mistake — no warning");
+  equal(w("120"), null, "a good value is silent");
+  ok(typeof w("0") === "string", "a supplied bad value warns once");
+  ok((w("abc") ?? "").includes("DISARMED"), "the warning says the bound is off");
+});
+
+test("#1500 dispatchMarkerActive — the DISABLE-agnostic dispatch gate", () => {
+  const a = childHb.dispatchMarkerActive;
+  equal(a({ TASK_HEARTBEAT: "1", PI_MODE: "print" }), true, "a dispatched child");
+  equal(
+    a({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }),
+    true,
+    "DISABLE silences the EMITTER — the bound must survive it (reviewer children)",
+  );
+  equal(a({ TASK_HEARTBEAT: "1" }), false, "no PI_MODE=print → an interactive session is not a dispatched child");
+  equal(a({ PI_MODE: "print" }), false, "no TASK_HEARTBEAT=1 → not a dispatched child");
+  equal(a({}), false);
+});
+
+test("#1500 — the `tool_call` guard registers IFF this is a dispatched child (T4)", () => {
+  const stub = () => {
+    const handlers: Record<string, unknown> = {};
+    return { api: { on: (ev: string, h: unknown) => { handlers[ev] = h; } } as any, handlers };
+  };
+  withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }, () => {
+    const { api, handlers } = stub();
+    childFactory(api);
+    ok(handlers.tool_call, "the bash bound must survive TASK_HEARTBEAT_DISABLE=1 (Leg B's whole point)");
+  });
+  withEnv({ TASK_HEARTBEAT: undefined, PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined }, () => {
+    const { api, handlers } = stub();
+    childFactory(api);
+    equal(handlers.tool_call, undefined, "an interactive session must NOT get the guard");
+  });
+});
+
+testAsync("#1500 — the bash bound: filled when absent, NEVER overriding, bash only (T2/T3/D6)", async () => {
+  const handlers: Record<string, any> = {};
+  await withEnv(
+    {
+      TASK_HEARTBEAT: "1",
+      PI_MODE: "print",
+      TASK_HEARTBEAT_DISABLE: undefined,
+      TASK_TOOL_TIMEOUT_S: undefined,
+    },
+    async () => {
+      childFactory({ on: (ev: string, h: any) => { handlers[ev] = h; } } as any);
+      const guard = handlers.tool_call;
+      ok(guard, "tool_call guard registered");
+      const call = (toolName: string, input: unknown) => guard({ toolName, toolCallId: "c", input });
+
+      // T3a: absent → the default is injected. This is the #1500 defect itself.
+      const a: Record<string, unknown> = { command: "sleep 5" };
+      await call("bash", a);
+      equal(a.timeout, childHb.DEFAULT_TOOL_TIMEOUT_S, "absent → the bound is ON");
+      equal(a.timeout, 7200);
+
+      // #1510 review: the mutation must be IN PLACE on the object the handler was
+      // handed. pi passes `beforeToolCall` the SAME object it later gives the
+      // tool's `execute`, so a handler that returned a new object (or replaced
+      // `event.input`) would silently do nothing. Reading it back off `a` after
+      // the await is exactly that propagation contract.
+      const identity: Record<string, unknown> = { command: "sleep 5" };
+      const before = identity.timeout;
+      await call("bash", identity);
+      equal(before, undefined, "fixture: the input really had no timeout to begin with");
+      equal(identity.timeout, childHb.DEFAULT_TOOL_TIMEOUT_S, "the SAME object is mutated in place (the propagation contract)");
+
+      // A throw must never escape: pi does not catch a `tool_call` handler's
+      // throw, it turns it into an immediate ERROR result and SKIPS the tool —
+      // so an escaping throw would block every bash call in every child.
+      await call("bash", Object.freeze({ command: "sleep 5" }));
+
+      // T2: an explicit timeout is NEVER overridden.
+      const b: Record<string, unknown> = { command: "sleep 5", timeout: 30 };
+      await call("bash", b);
+      equal(b.timeout, 30, "an explicit timeout is never overridden (#1500 c1)");
+
+      // D6: only bash carries a timeout field.
+      const c: Record<string, unknown> = { command: "x" };
+      await call("write", c);
+      equal(c.timeout, undefined, "non-bash tools are untouched");
+
+      // Malformed input must not throw — an observer may never break the child.
+      await call("bash", undefined);
+      await call("bash", "notanobject");
+      await call("bash", null);
+    },
+  );
+});
+
+testAsync("#1505 — the evidence gate at the TICK: a zero-byte update leaves tool_updates=0 (T1)", async () => {
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  const handlers: Record<string, any> = {};
+  try {
+    await withEnv(
+      {
+        TASK_HEARTBEAT: "1",
+        PI_MODE: "print",
+        TASK_HEARTBEAT_DISABLE: undefined,
+        TASK_HEARTBEAT_INTERVAL_MS: "5000",
+        TASK_HEARTBEAT_NONCE: "gatecheck",
+      },
+      async () => {
+        childFactory({ on: (ev: string, h: any) => { handlers[ev] = h; } } as any);
+        await handlers.session_start({});
+        await handlers.tool_execution_start({ toolCallId: "c1", toolName: "bash", args: {} });
+        // The exact pre-output payload. Before this fix the latch armed HERE and
+        // the parent's clause 1 could kill a silently-working tool at 20 minutes.
+        await handlers.tool_execution_update({
+          toolCallId: "c1", toolName: "bash", args: {},
+          partialResult: { content: [], details: undefined },
+        });
+        await sleep(5_300);
+        const t1 = lines.filter((l) => l.includes(" tick ")).pop() ?? "";
+        ok(t1.includes("tool_updates=0"), `a zero-byte start update must NOT arm the kill gate: ${t1}`);
+        ok(t1.includes("tools=1"), `the tool is still counted as in flight: ${t1}`);
+        // ...and real output DOES arm it, so the gate has not simply been disabled.
+        await handlers.tool_execution_update({
+          toolCallId: "c1", toolName: "bash", args: {},
+          partialResult: { content: [{ type: "text", text: "hi\n" }] },
+        });
+        await sleep(5_000);
+        const t2 = lines.filter((l) => l.includes(" tick ")).pop() ?? "";
+        ok(t2.includes("tool_updates=1"), `real output must arm the kill gate: ${t2}`);
+        await handlers.session_shutdown({});
+      },
+    );
+  } finally {
+    console.error = origErr;
+  }
+});
+
+section("#5195 heartbeat — child content-grounded PROGRESS (the E2 defence)");
+
+test("#5195 isProgressContentEvent — the content classifier, exhaustively pinned", () => {
+  // The full SDK `AssistantMessageEvent` union, one case each. The parent's
+  // `no-progress` clause rests on this table, so a change here changes the
+  // fleet's kill behaviour: pin every member, including the ones that are
+  // deliberately NOT progress.
+  const yes: [string, Record<string, unknown>][] = [
+    ["text_delta with real text", { type: "text_delta", delta: "hello" }],
+    ["text_delta with a single non-space char", { type: "text_delta", delta: "x" }],
+    ["text_delta with surrounding whitespace", { type: "text_delta", delta: " \n hi \t" }],
+    ["thinking_delta with real content", { type: "thinking_delta", delta: "reasoning" }],
+    ["text_end with content", { type: "text_end", content: "final text" }],
+    ["thinking_end with content", { type: "thinking_end", content: "final reasoning" }],
+    ["toolcall_end with a constructed toolCall", { type: "toolcall_end", toolCall: { name: "bash" } }],
+    // #5195 review fix: `done` is CONTENT-GATED, not unconditionally progress.
+    ["done carrying a message with content", { type: "done", message: { content: "answer" } }],
+    ["done carrying a tool-call message", { type: "done", message: { content: [{ type: "toolCall", toolCall: { name: "bash" } }] } }],
+  ];
+  for (const [label, ev] of yes) ok(childHb.isProgressContentEvent(ev), `PROGRESS: ${label}`);
+
+  const no: [string, unknown][] = [
+    // ── THE DRIP (E2). This is the exact shape that forged every
+    // parent-visible signal: whitespace/keepalive deltas. ──
+    ["text_delta whitespace only", { type: "text_delta", delta: "\n\n" }],
+    ["text_delta spaces only", { type: "text_delta", delta: "    " }],
+    ["text_delta empty", { type: "text_delta", delta: "" }],
+    ["text_delta non-string", { type: "text_delta", delta: 7 }],
+    ["thinking_delta whitespace only", { type: "thinking_delta", delta: "  \n " }],
+    ["text_end whitespace only", { type: "text_end", content: "\n\n" }],
+    ["text_end empty", { type: "text_end", content: "" }],
+    ["thinking_end empty", { type: "thinking_end", content: "" }],
+    ["toolcall_end with no toolCall", { type: "toolcall_end", toolCall: null }],
+    // ── Content-free openers: an announcement is not work. ──
+    ["start", { type: "start" }],
+    ["text_start", { type: "text_start" }],
+    ["thinking_start", { type: "thinking_start" }],
+    ["toolcall_start", { type: "toolcall_start" }],
+    // ── Incremental JSON: it becomes a unit of work at `toolcall_end`. ──
+    ["toolcall_delta", { type: "toolcall_delta", delta: '{"path":"a"}' }],
+    // ── Error/absent: never progress. ──
+    ["error", { type: "error", error: "boom" }],
+    // #5195 review fix: a bare `done` is NOT work (content-blind stamping is
+    // the exact failure this classifier exists to prevent). pi never routes
+    // `done` to message_update today, so this is the defensive arm.
+    ["done with no message", { type: "done" }],
+    ["done with an empty message", { type: "done", message: {} }],
+    ["done with whitespace-only content", { type: "done", message: { content: "\n\n" } }],
+    ["unrecognised type", { type: "some_future_event" }],
+    ["no type", { delta: "hello" }],
+    ["null", null],
+    ["undefined", undefined],
+  ];
+  for (const [label, ev] of no) equal(childHb.isProgressContentEvent(ev as any), false, `NOT progress: ${label}`);
+});
+
+test("#5195 hasTurnContent / messageHasContent — an EMPTY turn is not a completed unit of work", () => {
+  // The E shape in one assertion: `turn_end` is a boundary, not work. Marking
+  // it as progress unconditionally is exactly how an empty-turn loop forged the
+  // parent's clock.
+  equal(childHb.hasTurnContent({ toolResults: [], message: {} }), false, "THE E SHAPE: an empty turn is NOT progress");
+  equal(childHb.hasTurnContent({ toolResults: [] }), false, "no message, no results → not progress");
+  equal(childHb.hasTurnContent({ message: { content: "" } }), false, "empty content → not progress");
+  equal(childHb.hasTurnContent({ message: { content: "\n\n" } }), false, "whitespace-only content → not progress");
+  equal(childHb.hasTurnContent({ message: { content: [] } }), false, "no content blocks → not progress");
+  equal(childHb.hasTurnContent({ message: { content: [{ type: "text", text: "" }] } }), false, "an empty text block → not progress");
+  equal(childHb.hasTurnContent(null), false, "absent event → not progress");
+  equal(childHb.hasTurnContent(undefined), false);
+  // …and the positive twins, so the negatives above are not vacuous.
+  equal(childHb.hasTurnContent({ toolResults: [{ toolCallId: "t1" }], message: {} }), true, "a tool result is work");
+  equal(childHb.hasTurnContent({ toolResults: [], message: { content: "answer" } }), true, "real content is work");
+  equal(childHb.hasTurnContent({ message: { content: [{ type: "text", text: "answer" }] } }), true, "a content block with text is work");
+  equal(childHb.hasTurnContent({ message: { content: [{ type: "toolCall", toolCall: { name: "bash" } }] } }), true, "a tool-call block is work");
+  equal(childHb.hasTurnContent({ message: "plain string content" }), true, "a bare string message with content is work");
+  equal(childHb.messageHasContent({ content: [{ type: "text", text: "\n  x " }] }), true, "the positive control for the trim() check");
+});
+
+testAsync("#5195 E2 — a DRIP of whitespace deltas never carries progress=1 on any tick", async () => {
+  // The strongest form of the E2 test: drive the REAL child factory with the
+  // real `message_update` handler and read the tick it actually emits. A unit
+  // test on the classifier would not catch the handler being wired to the wrong
+  // predicate; this catches the wiring.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  try {
+    await withEnv(
+      { TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: "nonce5195e2" },
+      async () => {
+        childFactory(api);
+        await handlers.session_start({} as any);
+        await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+        // The drip: only content-free events, exactly the zombie's repertoire.
+        await handlers.message_start({ message: { role: "assistant" } });
+        for (const ev of [
+          { type: "start" },
+          { type: "text_start" },
+          { type: "text_delta", delta: "\n" },
+          { type: "text_delta", delta: "  " },
+          { type: "thinking_start" },
+          { type: "thinking_delta", delta: "\n" },
+        ]) {
+          await handlers.message_update({ message: { role: "assistant" }, assistantMessageEvent: ev });
+        }
+        await sleep(5_300);
+        const tick = lines.filter((l) => l.startsWith("[task-heartbeat] tick")).pop() ?? "";
+        ok(tick.length > 0, "FIXTURE: a tick was emitted");
+        ok(tick.includes("progress=0"), `THE E2 DEFENCE: every liveness flag is forged, but progress is not: ${tick}`);
+        ok(tick.includes("saw_msg=1"), "FIXTURE/contrast: the drip DOES latch saw_msg — liveness and progress are different questions");
+        // Control: real content on the SAME wiring does report progress.
+        await handlers.message_update({ message: { role: "assistant" }, assistantMessageEvent: { type: "text_delta", delta: "real" } });
+        await sleep(5_000);
+        const tick2 = lines.filter((l) => l.startsWith("[task-heartbeat] tick")).pop() ?? "";
+        ok(tick2.includes("progress=1"), `POSITIVE CONTROL: real content text does report progress: ${tick2}`);
+        // …and the flag is EDGE-triggered per interval, not a sticky latch:
+        await sleep(5_000);
+        const tick3 = lines.filter((l) => l.startsWith("[task-heartbeat] tick")).pop() ?? "";
+        ok(tick3.includes("progress=0"), `EDGE-TRIGGERED: the next interval with no new content reports 0 again (not a permanent latch): ${tick3}`);
+        await handlers.session_shutdown({} as any);
+      },
+    );
+  } finally {
+    console.error = origErr;
+  }
+});
+
+testAsync("#5195 E — an empty-turn LOOP reports progress only when a turn actually carries work", async () => {
+  // The E shape driven through the real wiring: turns cycling with nothing in
+  // them must not advance the parent's clock, while a turn that DID produce a
+  // tool result must.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  const lastTick = () => lines.filter((l) => l.startsWith("[task-heartbeat] tick")).pop() ?? "";
+  try {
+    await withEnv(
+      { TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: "nonce5195e" },
+      async () => {
+        childFactory(api);
+        await handlers.session_start({} as any);
+        // Two EMPTY turns, each shorter than the tick interval, then a tick.
+        for (const i of [1, 2]) {
+          await handlers.turn_start({ turnIndex: i, timestamp: Date.now() });
+          await handlers.turn_end({ turnIndex: i, message: {}, toolResults: [] });
+        }
+        await sleep(5_300);
+        ok(lastTick().includes("progress=0"), `THE E SHAPE: two empty turns produce NO progress: ${lastTick()}`);
+        // Now a turn that completed real work.
+        await handlers.turn_start({ turnIndex: 3, timestamp: Date.now() });
+        await handlers.tool_execution_start({ toolCallId: "x1", toolName: "bash", args: {} });
+        await handlers.tool_execution_end({ toolCallId: "x1", toolName: "bash", result: {}, isError: false });
+        await sleep(5_000);
+        ok(lastTick().includes("progress=1"), `POSITIVE TWIN: a completed tool IS progress: ${lastTick()}`);
+        // An empty turn AFTER that must not un-set it either — it is the last
+        // interval's answer, not a reset.
+        await handlers.turn_end({ turnIndex: 3, message: {}, toolResults: [] });
+        await sleep(5_000);
+        ok(lastTick().includes("progress=0"), `the NEXT interval is honestly empty again: ${lastTick()}`);
+        await handlers.session_shutdown({} as any);
+      },
+    );
+  } finally {
+    console.error = origErr;
+  }
+});
+
+testAsync("#5195 E3 — the child-side `turn_end` credit is WIRED (a content-bearing turn is progress)", async () => {
+  // Review finding: deleting `if (hasTurnContent(event)) progressSinceTick = true;`
+  // left the whole suite green. E fires EMPTY turns and credits progress through
+  // the TOOL path, so the `turn_end` path was unwired and unproven. This is its
+  // FAILS-IF-REMOVED twin: the turn carries no tool call and no streaming deltas,
+  // so its content exists ONLY in the `turn_end` message and NOTHING else can
+  // credit it.
+  const handlers: Record<string, (ev: any) => Promise<void>> = {};
+  const api: any = { on: (ev: string, h: (e: any) => Promise<void>) => { handlers[ev] = h; } };
+  const lines: string[] = [];
+  const origErr = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  const lastTick = () => lines.filter((l) => l.startsWith("[task-heartbeat] tick")).pop() ?? "";
+  try {
+    await withEnv(
+      { TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: "nonce5195e3" },
+      async () => {
+        childFactory(api);
+        await handlers.session_start({} as any);
+        // CONTROL: a turn that completes with NOTHING is not a unit of work.
+        await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
+        await handlers.turn_end({ turnIndex: 1, message: { content: [] }, toolResults: [] });
+        await sleep(5_300);
+        ok(lastTick().includes("progress=0"), `CONTROL: an empty turn is not progress: ${lastTick()}`);
+        // THE CREDIT: the identical shape, but the turn's message carries content.
+        await handlers.turn_start({ turnIndex: 2, timestamp: Date.now() });
+        await handlers.turn_end({ turnIndex: 2, message: { content: [{ type: "text", text: "a real answer" }] }, toolResults: [] });
+        await sleep(5_000);
+        ok(lastTick().includes("progress=1"), `THE turn_end CREDIT: a completed turn carrying content IS a unit of work: ${lastTick()}`);
+        await handlers.session_shutdown({} as any);
+      },
+    );
   } finally {
     console.error = origErr;
   }
@@ -6198,6 +7384,84 @@ testAsync("#1071: the report names the TARGET repo's worktree/branch/dirty (neve
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── #1508: the credential term (RC1) + the false-`isError` flip (P0-B) ────────
+//
+// Both tests drive the ACTUAL seams. The hook test calls the REAL extension
+// entry and the handler it registers, because the whole point of P0-B is that a
+// `isError` field on the returned tool result is silently DROPPED by the
+// framework's allow-list rebuild — a test that asserted on a returned field
+// would pass while the flag never flipped.
+
+test("#1508 — dispatchUnkeyedSet maps a family to its legs, and only a positive verdict excludes", () => {
+  const fam = "deepseek-v4-flash";
+  const reg = (m: Record<string, { configured?: boolean } | undefined>) => ({
+    getProviderAuthStatus: (p: string) => m[p],
+  });
+  equal(dispatchUnkeyedSet(reg({}), fam).size, 0, "no verdict → nothing excluded (a wrongly-skipped leg is the mirror defect)");
+  deepEqual([...dispatchUnkeyedSet(reg({ openrouter: { configured: false } }), fam)], ["openrouter"], "only the positively-unkeyed family leg");
+  deepEqual([...dispatchUnkeyedSet(reg({ openrouter: { configured: true } }), fam)], [], "'configured' never excludes");
+  equal(dispatchUnkeyedSet(undefined, fam).size, 0, "no registry → nothing excluded (fail-safe)");
+  equal(dispatchUnkeyedSet(reg({ openrouter: { configured: false } }), undefined).size, 0, "no family → nothing to check");
+});
+
+test("#1508 — decidePostDispatch: a marker-driven write does not latch onto an UNKEYED leg", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // Same input as the advance test above, with the registry verdict injected:
+    // openrouter declares $OPENROUTER_API_KEY and the env var is absent. WITHOUT
+    // `unkeyed` this call records activeLeg = openrouter/deepseek-v4.1-flash —
+    // the incident's own persisted state, which is what the earlier unit-level
+    // test of setExhausted could not catch.
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: mkMarker({}),
+      env,
+      unkeyed: new Set(["openrouter"]),
+    });
+    const active = readLatchState(env).primaries.deepseek?.families?.["deepseek-v4-flash"]?.activeLeg;
+    ok(
+      active == null,
+      `the durable latch must not record an unkeyed leg (got ${JSON.stringify(active)})`,
+    );
+    ok(
+      decision.nextLeg == null || decision.nextLeg.provider !== "openrouter",
+      `no unkeyed advance is handed back (got ${JSON.stringify(decision.nextLeg)})`,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("#1508 — the registered tool_result handler turns a failed child into isError:true", () => {
+  const handlers: Array<(e: any) => any> = [];
+  (builtinTools as any)({ on: (ev: string, h: any) => { if (ev === "tool_result") handlers.push(h); }, registerTool: () => {} });
+  equal(handlers.length, 1, "exactly one tool_result handler is registered");
+  const h = handlers[0];
+  deepEqual(h({ toolName: "task", isError: false, details: { exitCode: 1 } }), { isError: true }, "exit 1 is the incident's shape → reported as an error");
+  deepEqual(h({ toolName: "task", isError: false, details: { isError: true } }), { isError: true }, "a spawn error carries no exitCode but is still a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { killed: true, exitCode: 0 } }), { isError: true }, "a watchdog cut records exitCode 0 but is still a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { killed: true, exitCode: null } }), { isError: true }, "a cut with a null exit is still a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { fallbackStatus: "failed" } }), { isError: true }, "the #152 fallback's own failure status is a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { failoverHalt: true } }), { isError: true }, "a failover halt ran no leg → a failure");
+  // The TOOL layer's own terminal failures — reached with no exit code and no
+  // inner-spawn marker at all. `status:"failed"` is the one a watchdog kill with
+  // NO output lands on: it resolves `undefined`, is retried, and arrives here.
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "failed", retries: 3, elapsedMs: 1 } }), { isError: true }, "an exhausted retry loop with no output is the incident's silent-wedge shape");
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "circuit_open", retries: 0 } }), { isError: true }, "an open circuit breaker is a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "invalid-cwd", retryable: false } }), { isError: true }, "a refused dispatch (bad cwd) is a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "invalid-session-id", retryable: false } }), { isError: true }, "a refused dispatch (bad session id) is a failure");
+  deepEqual(h({ toolName: "task", isError: false, details: { failoverHopSpawnFailed: true } }), { isError: true }, "a hop leg that never produced a result is a failure");
+  equal(h({ toolName: "task", isError: false, details: { exitCode: null } }), undefined, "a null exit is a settle (composeTaskResult's own okExit contract)");
+  equal(h({ toolName: "task", isError: false, details: { exitCode: 0 } }), undefined, "exit 0 is a settle");
+  equal(h({ toolName: "bash", isError: false, details: { exitCode: 1 } }), undefined, "never touches a non-task tool");
+  equal(h({ toolName: "task", isError: true, details: { exitCode: 1 } }), undefined, "an already-errored result is left alone");
+  equal(h({ toolName: "task", isError: false, details: undefined }), undefined, "no details → nothing to prove, stays a success");
+  equal(h({ toolName: "task", isError: false, details: { status: "ok" } }), undefined, "a status this hook does not know as a failure stays a success");
 });
 
   for (const t of asyncTests) await t();

@@ -280,16 +280,18 @@ if [ -d "$scripts_dir" ]; then
   echo "    scripts/checkout-hygiene farm: $copied copied (real files, #427)"
 fi
 
-# Fleet-scripts farm (#373 + #469 + #783): the weekly fleet-cost cadence runs
-# under launchd (com.eldato.fleet-cost-weekly plist), the pi-session reaper runs
-# hourly (com.eldato.pi-session-reaper plist), and the Task 6 child-session
-# retention sweep runs hourly (com.eldato.pi-task-session-prune plist) —
+# Fleet-scripts farm (#373 + #469 + #783 + #1311): the weekly fleet-cost cadence
+# runs under launchd (com.eldato.fleet-cost-weekly plist), the pi-session reaper
+# runs hourly (com.eldato.pi-session-reaper plist), the Task 6 child-session
+# retention sweep runs hourly (com.eldato.pi-task-session-prune plist), and the
+# worktree reaper runs daily (com.tortoise.worktree-reaper plist) —
 # launchd cannot read ~/Documents (same TCC wall as #427).
 # session-postmortem.sh (the shared parser), the report, the watch, the weekly
-# driver, the reaper, and the prune sweep must ALL sit in ~/.pi/agent/scripts so
+# driver, the reaper, the prune sweep, and the worktree reaper must ALL sit in
+# ~/.pi/agent/scripts so
 # the drivers' sibling calls resolve and the plists' ProgramArguments targets
 # exist (broken-target guard). Same idempotent real-copy refresh model.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -316,22 +318,50 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 # farmed WITH it, preserving the relative positions
 # (scripts/pi-reap-idle.sh <-> scripts/lib/pid-identity.sh). Same idempotent
 # real-copy refresh model as the farms above (real files, not symlinks: #427).
-lib_srcs=(pid-identity.sh)
+#
+# #1362 D1 adds a SECOND sibling: the merge-gate farm copies record-review.sh
+# flat into $DEST/scripts/, and it resolves its diff normalizer as
+# `$(dirname "${BASH_SOURCE[0]}")/lib/diff-normalize.py` (the ONE implementation of
+# the review-evidence normalization, shared with the consumer workflow). Farming
+# record-review.sh WITHOUT diff-normalize.py degrades the producer to the raw
+# pre-#1362 digest — no false accept, but every base-only update goes back to
+# refusing carry-forward. Farm them together.
+lib_srcs=(pid-identity.sh diff-normalize.py)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
+lib_failed=0
 for base in "${lib_srcs[@]}"; do
   f="$INFRA_ROOT/scripts/lib/$base"
-  [ -f "$f" ] || continue
+  if [ ! -f "$f" ]; then
+    echo "    scripts lib farm: MISSING $f — a declared sibling did not land, so the producer will fall back to the RAW digest" >&2
+    lib_failed=$((lib_failed+1))
+    continue
+  fi
   dest="$DEST/scripts/lib/$base"
   if [ -L "$dest" ]; then
     echo "    replacing farm symlink with real copy: lib/$base"
     rm -f "$dest"
   fi
-  cp -f "$f" "$dest"
-  chmod +x "$dest" 2>/dev/null || true
-  lib_copied=$((lib_copied+1))
+  # Atomic install (#1362 review): copy to a sibling temp then rename, so a
+  # concurrent reader (record-review.sh runs during merges; this farm runs at
+  # session_start) can NEVER observe a truncated/zero-byte lib. An empty
+  # normalizer exits 0 printing nothing, which would hash the EMPTY string into
+  # a constant digest — a false accept — so the reader also guards `[ -s ]`.
+  if cp -f "$f" "$dest.tmp.$$" 2>/dev/null \
+     && chmod +x "$dest.tmp.$$" 2>/dev/null \
+     && mv -f "$dest.tmp.$$" "$dest" 2>/dev/null; then
+    lib_copied=$((lib_copied+1))
+  else
+    echo "    scripts lib farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
+    rm -f "$dest.tmp.$$"
+    lib_failed=$((lib_failed+1))
+  fi
 done
-echo "    scripts lib farm: $lib_copied copied (pid-identity.sh, #1178)"
+if [ "$lib_failed" -gt 0 ]; then
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py, #1178)" >&2
+else
+  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py, #1178)"
+fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
 # (templates/launchd/com.eldato.lane-liveness.plist) runs

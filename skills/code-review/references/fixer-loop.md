@@ -95,7 +95,17 @@ FIXER_PLAN_TEXT=$(python3 -c "
 import os, json
 issues = json.loads(os.environ['__SURVIVING_JSON'])
 allowlist = json.loads(os.environ['__ALLOWLIST_JSON'])
-lines = ['Fix the following code-review issues in PR #$PR_NUMBER:', '']
+lines = ['Fix the following code-review issues in PR #$PR_NUMBER:', '',
+         'VERIFY FIRST — a finding is a CLAIM, not a fact. For EACH issue, open',
+         'the primary source it CITES (line range, file, gh output, commit) and',
+         'confirm the source says what the finding says. If it does NOT hold: do',
+         'not change the code — return FALSIFIED: <issue> — <what the source',
+         'actually says>. If it cites nothing checkable: return',
+         'UNVERIFIABLE: <issue> and do not apply it. A CORRECTED marker is not',
+         'evidence. A decline does NOT clear the gate: write nothing and return',
+         'the FALSIFIED:/UNVERIFIABLE: lines — the fresh scan at L6 decides, and',
+         'if it re-flags the issue the loop stops after 2 no-change cycles.',
+         'Never apply a finding you have just verified as false.', '']
 for i in issues:
     lines += [f\"[{i.get('severity','')}] {i.get('location','')}\",
               f\"Problem: {i.get('description','')}\",
@@ -117,7 +127,7 @@ STATUS dispatch (read from first line of MCP result in Claude's context):
 | `ok` | Continue to L4 |
 | `unavailable` | `EXIT_REASON="tool-unavailable"`, break |
 | `capped` | `EXIT_REASON="cycle-cap"`, break |
-| `no-op` | `EXIT_REASON="clean"`, break |
+| `no-op` | No break — fall through to L4 → L5 → L6. A fixer SELF-REPORT never clears the gate (line 13: "the implementation_agent's self-report — DONE, no-op, tests green — is necessary but never sufficient"). If nothing actually changed, the L6 zero-progress detector escalates after 2 consecutive cycles; `clean` can only come from the fresh scan at L6. This row used to `EXIT_REASON="clean"`, break — a self-report clearing the gate with issues outstanding |
 | `paused-needs-files` | Read FILES_NEEDED section; if absent/empty, proceed with current allowlist (no retry); if non-empty, merge into allowlist and retry L3 once |
 
 Read FILES_WRITTEN section (comma-separated). Set `FILES_WRITTEN_CSV` from Claude's context, then:
@@ -129,15 +139,22 @@ CYCLE_FILE_COUNT=$(echo "$FILES_WRITTEN_CSV" | tr ',' '\n' | \
 
 ### L4 — Detect changes and stage/commit
 
-`implementation_agent` may commit internally. Check both uncommitted changes AND unpushed commits:
+`implementation_agent` may commit internally. Stage and commit any uncommitted changes; an
+internal commit is pushed unconditionally at L5, so only the uncommitted set is checked here:
 
 ```bash
 UNCOMMITTED=$(git -C "$WORKTREE_PATH" diff --name-only)
-UNPUSHED=$(git -C "$WORKTREE_PATH" log --oneline "origin/${PR_BRANCH}..HEAD" 2>/dev/null || echo "")
 
-if [ -z "$UNCOMMITTED" ] && [ -z "$UNPUSHED" ]; then
-  EXIT_REASON="clean"; break
-fi
+# ⛔ A no-change cycle does NOT exit here — it FALLS THROUGH to L5/L6. This
+# branch used to `EXIT_REASON="clean"; break`, which contradicted line 13 ("a
+# cycle clears the gate ONLY when a fresh reviewer pass returns zero issues")
+# and short-circuited the L6 zero-progress detector (which needs 2 consecutive
+# no-change cycles) — so a single fixer that wrote nothing, including one that
+# legitimately DECLINED every finding as FALSIFIED:/UNVERIFIABLE: (a finding is
+# a CLAIM — #5014), reached `clean` having resolved nothing. Falling through
+# keeps ONE threshold for zero progress (the L6 detector), lets the fresh scan
+# at L6 decide, and keeps the clean exit reachable ONLY through it. The
+# `if [ -n "$UNCOMMITTED" ]` guard below already handles the empty change set.
 
 if [ -n "$UNCOMMITTED" ]; then
   # file --mime-type -b returns e.g. `text/plain; charset=utf-8` — filter on `text/` prefix
@@ -148,7 +165,9 @@ if [ -n "$UNCOMMITTED" ]; then
   git -C "$WORKTREE_PATH" commit -m "fix(code-review): automated fixer cycle $CYCLE — PR #$PR_NUMBER" \
     || { EXIT_REASON="git-error"; break; }
 fi
-# If only UNPUSHED (agent committed internally): fall through to L5
+# No staged changes and/or an internally-committed (unpushed) commit both fall
+# through to L5 — this path is now UNCONDITIONAL, so a no-change cycle reaches
+# the L6 detector and the fresh scan rather than exiting clean here.
 ```
 
 ### L5 — Push

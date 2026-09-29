@@ -15,14 +15,55 @@ Two defects motivated it:
   prose (``may``) entered the failure set as if it were a nodeid. A garbage id
   matches nothing on main: it can never be subtracted or verified, so it reads as
   "unique to this PR" on EVERY rail run for EVERY PR whose log contains that
-  fragment — a permanent false refusal. A candidate that is not a test id is
-  **DROPPED, COUNTED and REPORTED** as UNATTRIBUTABLE, never carried, never read
-  as "no failures".
+  fragment — a permanent false refusal. The remedy is split by position: the
+  payload of a **leading** ``FAILED``/``ERROR`` that is not a test id is
+  **DROPPED, COUNTED and REPORTED** as UNATTRIBUTABLE (fail-closed), while a
+  **non-leading** field whose payload is not a nodeid is PROSE and is SKIPPED —
+  counting the workflow's own echoed shell source as a drop marks every set
+  CLIPPED and blocks merges fleet-wide (#1396). See :func:`_failed_candidate`.
 * **DEFECT 2 — a MOVING identity is not an attribution.** Within one concluded
   cycle the same head's failure ids can shift across the re-run boundary (one id
   replaced by another). :func:`detect_rotating_identity` names the class that was
   red across runs with a NON-CONSTANT id, so a decision sees UNATTRIBUTABLE
   rather than a PR-unique failure (or a silent exemption) it cannot justify.
+
+HALF 1b — GUARD-STEP ATTRIBUTION (#4469)
+
+The id universe was pytest nodeids ONLY, so a failing run whose failure lives in a
+non-pytest **guard step** (an orphan-count assert, a packaging guard, a health
+gate) yielded NO id. ``examined=1 / extracted=0`` then tripped the rail's
+fail-closed refusal ("yielded NO parseable 'FAILED <nodeid>' line … This is a
+refusal") and the merge could not proceed through the sanctioned path — even
+though the failure was real, attributable, and often a flaky guard owned by
+another lane. That class is the one most likely to be flaky, and the rail could
+neither compare it against main nor certify it as new.
+
+A GitHub Actions error ANNOTATION in a failing step therefore becomes an identity
+in the set — keyed by the failing STEP plus the error shape — so it participates
+in the PR-vs-main comparison exactly like a test nodeid. The fail-closed refusal
+is PRESERVED, on THREE conditions that are the whole safety of this half:
+
+* the annotation is only an identity when it comes from a step the RUNNER ITSELF
+  marked failed (its non-zero ``Process completed with exit code <N>.``), because
+  an annotation printed by a step that did not fail the run is not evidence of a
+  failure — junk in the union is a zero-evidence pass;
+* the run's ROOT failing step — the FIRST one the runner marked, keyed by
+  **(job, step)** because matrix legs run same-NAMED steps — must YIELD an
+  identity (a ``FAILED`` nodeid on its lines, or a substantive annotation);
+  otherwise the run contributes NO guard identity even when a LATER step carries a
+  perfectly good annotation; and
+* a step that shows pytest's own failure output (``E   <exception>``) must yield a
+  NODEID. An annotation is not that classification, so the run is refused — the
+  cycle-3 ``ImportError: no module named y`` case, which prints ``E   ImportError``
+  and no ``FAILED`` line, and which would otherwise be LAUNDERED by a sibling — or
+  same-step — annotation, letting ``examined > extracted`` pass and ``decide``
+  certify a run whose real failure was never classified.
+
+A DECLARED RESIDUAL remains (agent-infra #1366): an unparseable failure that
+leaves NO pytest-shaped line AND whose step is not the root — e.g. a guard root
+attributed first, then a non-pytest step failing with bare prose. Closing it needs
+per-step conclusions from the run metadata. See :func:`guard_step_failures` and
+the measured capture this is grounded on.
 
 HALF 2 — THE PRE-MERGE EXEMPTION DECISION (``signatures``, ``decide``)
 
@@ -52,16 +93,21 @@ compared** and **visible**:
 * **signature-scoped** -- an exemption covers the failure that was measured on main,
   not the whole node id. A PR that holds the same RATE while breaking a DIFFERENT
   assertion inside the same test is NOT exempt: same id, different signature.
-* **rate-compared** -- a declared ``K`` on BOTH trees; presence is never sufficient.
-  ``main 1/8`` vs ``PR 8/8`` is an eight-fold regression and must block; a presence
-  test ("it fails on main too") would excuse it.
-* **visible** -- every exemption is RECORDED with both rates. An exemption that
-  exists only as an absence is the fail-open defect itself.
+* **rate-compared** -- a declared ``K`` on the tree that has one; presence is never
+  sufficient. ``main 1/8`` vs ``PR 8/8`` is an eight-fold regression and must block; a
+  presence test ("it fails on main too") would excuse it. Where the PR sample is too
+  small to measure a rate that comparison is not made and the exemption rests on
+  attribution instead (#5250) — never on presence alone.
+* **visible** -- every exemption is RECORDED with the reason and the measurements it
+  rested on (both rates where a rate was measurable; main's rate and ``k_pr`` where it
+  was not). An exemption that exists only as an absence is the fail-open defect itself.
 
 And the parser is **fail-closed** (#3705's rule applied to the exemption parser):
 the union IS an allowlist, so junk in it is a zero-evidence pass. An unparseable or
 non-nodeid line must REFUSE the exemption and be COUNTED AND REPORTED -- never
-silently swallowed, never read as "no failures".
+silently swallowed, never read as "no failures". Since #4469 the failure-key
+universe is a pytest nodeid OR an attributable guard-step annotation (HALF 1b);
+a line that is NEITHER is still refused, counted and reported.
 
 Pure functions only: no I/O, no network, no git — except :func:`_read`, the
 ``ids`` CLI and the ``signatures`` CLI, which read the caller's own capture file.
@@ -92,23 +138,78 @@ _NODEID_RE = re.compile(
 _FAILED_FIELDS = ("FAILED", "ERROR")
 
 
-def _failed_candidate(line: str) -> str | None:
-    """The token following the FIRST ``FAILED``/``ERROR`` whitespace field.
+def _failed_candidate(line: str, *, recover_nodeid: bool = True) -> str | None:
+    """The failure token on ``line`` — leading RECORD or mid-line RECOVERY.
 
-    This is the exact position the retired shell ``awk`` read
-    (``if ($i == "FAILED") { print $(i+1) }``), so no real id is lost by
-    routing through this module. The return is deliberately three-valued:
+    Two producers put a ``FAILED``/``ERROR`` field on a line, and the rule below
+    treats them differently on purpose — **drop accounting** and **id recovery**
+    are separate concerns:
 
-    * ``None`` — no such field on the line: it is NOT a failure record (raw logs
-      are mostly prose), and it is NOT a rejection either;
-    * ``''``  — the field was the last token: a truncated record, which IS a
+    * **A LEADING field opens a failure RECORD.** ``FAILED <payload>`` is the shape
+      pytest's ``-r fE`` summary emits. Its payload is returned as the candidate
+      for the caller to shape-check; a payload that is NOT a nodeid is a
+      malformed/truncated record and IS a DROP (:func:`parse_failed_ids` counts
+      it, which marks the set CLIPPED — fail-closed). The payload is taken the
+      SAME way the signature door takes it (``_SUMMARY_RE``: everything up to an
+      optional `` - <detail>``), NOT as the next whitespace field — a pytest
+      parameter id may contain spaces (``::test_x[chromium-Claude Desktop]``),
+      and splitting on whitespace would extract a TRUNCATED id that the signature
+      door does not produce, so ``main_signatures`` would miss and the rail would
+      block. Both doors must name the same id (module header, line 7).
+    * **A NON-LEADING field is prose UNLESS it introduces a nodeid.** A run log
+      ECHOES the workflow's own shell source, so a comment such as
+      ``# re-lists failures, so FAILED may double-count on the last tick;`` carries
+      a bare ``FAILED`` mid-sentence, and a tool's own message can too
+      (``[verification-gate] ❌ Verifier FAILED (unparseable verdict)``). Reading
+      the NEXT word there (``may``, ``lines``, ``(unparseable``) as a failed token
+      made the caller DROP it, and a dropped token marks the whole set CLIPPED /
+      NOT COMPARABLE to a measured zero — which in the vacuous branch blocks EVERY
+      merge repo-wide, green PRs with no failure included (agent-infra #1396,
+      tortoise #5194). Prose is not a record: it is SKIPPED, never counted. But a
+      non-leading field immediately followed by a **nodeid-shaped** token is an
+      authoritative identity and IS recovered — pytest-xdist's verbose progress
+      line has exactly that shape, status BEFORE nodeid
+      (``[gw0] [ 50%] FAILED tests/x.py::test_real``; pytest 9.x
+      ``_pytest/terminal.py``, the ``running_xdist`` branch). Recovering it keeps a
+      real failure in the set when the run's ``-r`` summary omits the failing
+      category. ⛔ Recovery is **raw-log only** (``recover_nodeid``); an id FILE
+      carries records, so a non-leading field there is a defect and is rejected,
+      never scanned (``raw_log=False``).
+      ⚠️ Recovery is NOT "fail-closed by construction": it ADDS an identity to
+      BOTH the PR set and main's union, and main's union is the exemption
+      ALLOWLIST — so a nodeid-shaped token that appears only in echoed prose would
+      buy a main-side id. That residue is pre-existing (the retired shell read had
+      the same reach and no nodeid requirement) and is bounded by the id's being
+      UNSIGNED in main's signature table — the subset rule then fails closed and
+      BLOCKS — but it is a declared residue, not a safety proof.
+
+    The return is deliberately three-valued:
+
+    * ``None`` — not a failure record and no recoverable nodeid (raw logs are
+      mostly prose): SKIPPED, and NOT a rejection either;
+    * ``''``  — a LEADING field was the last token: a truncated record, which IS a
       rejection;
-    * ``<token>`` — the candidate, which the caller MUST shape-check before use.
+    * ``<token>`` — the candidate (a nodeid, or a leading record's payload), which
+      the caller MUST shape-check before use.
     """
     fields = line.split()
-    for index, token in enumerate(fields):
-        if token in _FAILED_FIELDS:
-            return fields[index + 1] if index + 1 < len(fields) else ""
+    if not fields:
+        return None
+    if fields[0] in _FAILED_FIELDS:
+        if len(fields) == 1:
+            return ""
+        match = _SUMMARY_RE.match(line.strip())
+        if match:
+            return match.group("nodeid").strip()
+        return fields[1]
+    if not recover_nodeid:
+        # An id FILE holds records: a non-leading field is a defect, not a
+        # candidate. Recovery is a raw-log concern only.
+        return None
+    # Non-leading: recover only when the NEXT field is a nodeid (xdist progress).
+    for index, token in enumerate(fields[:-1]):
+        if token in _FAILED_FIELDS and _NODEID_LOOSE_RE.match(fields[index + 1]):
+            return fields[index + 1]
     return None
 
 
@@ -123,6 +224,10 @@ class ParseResult:
 
     ids: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from a non-pytest GUARD-STEP annotation
+    #: (#4469). Recorded separately so the caller REPORTS the attribution instead
+    #: of leaving it invisible among the nodeids.
+    guard_steps: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -137,28 +242,45 @@ class ParseResult:
 
 
 def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
-    """Extract test ids from failure records — THE canonical id parser.
+    """Extract failure ids from a log — THE canonical id parser.
 
     Two input shapes, ONE candidate rule (:func:`_failed_candidate`) and ONE
     definition of "is this a test id" (``_NODEID_LOOSE_RE``), so the shell cannot
     keep a second, weaker notion of a failure id:
 
     * ``raw_log=False`` (default) — a file of ``FAILED <nodeid>`` / ``ERROR
-      <nodeid>`` records. A non-blank line that carries no ``FAILED``/``ERROR``
-      field is **rejected**: in an id file, prose IS a defect (nothing else
-      belongs there).
+      <nodeid>`` records. A line whose FIRST field is not ``FAILED``/``ERROR`` is
+      **rejected**: in an id file, prose IS a defect (nothing else belongs there),
+      and the xdist id RECOVERY is deliberately NOT applied here — an id file
+      carries records, not a run log. No guard-step pass runs here — an id file IS
+      the set.
     * ``raw_log=True`` — a raw ``gh run view --log-failed`` capture. ANSI SGR
       escapes and the ``<job>\t<step>\t<ts>Z `` prefix are stripped, then the
-      candidate after the first ``FAILED``/``ERROR`` field is shape-checked. A
-      line with no such field is not a failure record and is skipped — a raw log
-      is mostly prose, and rejecting every prose line would drown the signal.
+      leading record's payload — or a nodeid that directly follows a non-leading
+      ``FAILED``/``ERROR`` field (pytest-xdist's status-before-nodeid progress
+      line) — is shape-checked. A line with neither is not a failure record and is
+      skipped — a raw log is mostly prose, and rejecting every prose line would
+      drown the signal.
+      A second pass attributes non-pytest GUARD-STEP failures (#4469) from their
+      GitHub Actions error annotations, so a failure main can also be red on is
+      COMPARED rather than refused.
 
-    In BOTH shapes a candidate that is not a test id is **DROPPED, COUNTED and
-    REPORTED** (``rejected``) and never enters ``ids``. This is the #3756 ``may``
-    leak: an English word in the candidate position used to be emitted verbatim
-    as a failure id, and a garbage id matches nothing on main — it cannot be
-    subtracted or verified, so it reads as "unique to this PR" on EVERY rail run
-    for EVERY PR whose log contains that fragment. A permanent false refusal.
+    DROP ACCOUNTING IS LEADING-ONLY. The payload of a **leading**
+    ``FAILED``/``ERROR`` that is not a failure id is **DROPPED, COUNTED and
+    REPORTED** (``rejected``) and never enters ``ids`` — the #3756 ``may`` leak the
+    other way: an English word in the candidate position used to be emitted
+    verbatim as a failure id, and a garbage id matches nothing on main, so it reads
+    as "unique to this PR" on EVERY rail run for EVERY PR whose log contains that
+    fragment (a permanent false refusal). A **non-leading** field whose payload is
+    not a nodeid is PROSE: it is SKIPPED, never counted, because counting the
+    workflow's echoed shell source as a dropped token marks the whole set CLIPPED /
+    NOT COMPARABLE — which blocks EVERY merge repo-wide in the vacuous branch
+    (agent-infra #1396, tortoise #5194).
+
+    A leading record's payload is taken with :data:`_SUMMARY_RE` — the SAME match
+    the signature door uses — so both doors name the same id, including a
+    whitespace-bearing parameter id (``::test_x[chromium-Claude Desktop]``) that a
+    whitespace split would truncate.
 
     This is the fail-closed rule: unknown resolves to *"not exempt"*, never to
     *"exempt"*. Silent permissiveness here is a zero-evidence pass — and a
@@ -171,7 +293,7 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
             line = _strip_log_prefix(_ANSI_RE.sub("", raw)).strip()
             if not line:
                 continue
-            candidate = _failed_candidate(line)
+            candidate = _failed_candidate(line, recover_nodeid=raw_log)
             if candidate is None:
                 # Not a failure record. Skipped, NOT rejected.
                 continue
@@ -180,7 +302,7 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
             line = raw.strip()
             if not line:
                 continue
-            candidate = _failed_candidate(line)
+            candidate = _failed_candidate(line, recover_nodeid=raw_log)
             if candidate is None:
                 rejected.append(line)
                 continue
@@ -192,7 +314,18 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
             rejected.append(unit)
             continue
         ids.append(candidate)
-    return ParseResult(ids=sorted(set(ids)), rejected=rejected)
+    guard_steps: list[str] = []
+    if raw_log:
+        # Pass 2 — GUARD-STEP failures (#4469). A non-pytest step announces its
+        # failure with a GitHub Actions error ANNOTATION, which the FAILED-field
+        # pass above cannot see. Those become ids too, so a guard-step failure is
+        # COMPARED instead of refused. Deliberately not done for an id-file
+        # (raw_log=False): there the file IS the id set already.
+        guard_steps, _guard_signatures = guard_step_failures(lines)
+        ids.extend(guard_steps)
+    return ParseResult(
+        ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps
+    )
 
 
 # --------------------------------------------------------------------------
@@ -245,16 +378,38 @@ def parse_rates(lines: str) -> RatesResult:
     Fail-closed, for the same reason as :func:`parse_failed_ids`: this table feeds
     the comparison that OVERRIDES a failure, so a line the reader does not fully
     understand must never become evidence of main-side unhealth. Anything not
-    exactly three tab-separated fields -- a valid nodeid, a non-negative failure
-    count, and a **positive** run count -- is rejected, counted and reported.
+    exactly three tab-separated fields -- a valid failure key (a pytest nodeid
+    OR a guard-step identity, #4469), a non-negative failure count, and a
+    **positive** run count -- is rejected, counted and reported.
 
     ``runs`` must be positive: ``X\\t0\\t0`` would give a ``0/0`` rate of ``0.0``
     and read as "main never fails this", which is the exemption-by-vacuity this
     module exists to prevent. A rejected line simply contributes no rate, and an
     id with no rate is **not exempt** (the existing default in :func:`decide`).
+
+    The **rate table -- and therefore the verdict -- is invariant to row order for
+    the same row multiset** (#3766); ``rejected`` records rows as they arrive, so
+    the evidence list keeps input order (only its length is invariant), and nothing
+    downstream reads it for the decision. A failure key with two or more VALID rows
+    is WITHDRAWN for the rest of THIS table -- agreeing or disagreeing, because the
+    slot holds one measurement per key and this module has no mandate to reconcile
+    two -- and the withdrawal is PERMANENT within the table: membership in the
+    withdrawn set is checked BEFORE the accept path, so no later row can put the id
+    back. (Not "permanently" across calls: nothing survives the return.) The
+    withdrawal must outlive the row that triggered it, because withdrawing only for
+    the row at hand let an ODD duplicate count (three concatenated shards: 8/8,
+    0/8, 1/8) re-establish the id on the next line -- Rate(1,8) forward, Rate(8,8)
+    reversed, a BLOCK against an EXEMPT from one unchanged multiset. A row the
+    guards ABOVE reject (malformed, not a failure key, ``runs <= 0``, ``failures >
+    runs``) contributes nothing and cannot withdraw the id: its position must not
+    change the outcome, or the table would be order-dependent again.
     """
     rates: dict[str, Rate] = {}
     rejected: list[str] = []
+    #: Ids the table withdrew. Populating ``rates`` is a ONE-WAY door: a duplicate
+    #: withdraws the id and records it here, and membership here is checked BEFORE
+    #: the accept path, so no later row can put it back.
+    tainted: set[str] = set()
     for raw in lines.splitlines():
         line = raw.strip("\n")
         if not line.strip():
@@ -266,16 +421,25 @@ def parse_rates(lines: str) -> RatesResult:
         nodeid = m.group("nodeid")
         failures = int(m.group("failures"))
         runs = int(m.group("runs"))
-        if not _NODEID_RE.match(nodeid) or runs <= 0 or failures > runs:
+        if not is_failure_key(nodeid) or runs <= 0 or failures > runs:
+            rejected.append(line)
+            continue
+        if nodeid in tainted:
+            # A WITHDRAWN id stays withdrawn (#3766). The earlier guard withdrew the
+            # id by popping it, which expired the withdrawal for the rest of the
+            # table -- so a third row re-established it and the LAST row won again.
+            # Reporting the row is what makes the refusal visible; the id still
+            # contributes no rate, so it is not exempt.
             rejected.append(line)
             continue
         if nodeid in rates:
-            # Duplicate rows (latent finding 2): "A 8 8" then "A 0 8" yielded
-            # Rate(0,8) while the REVERSED order yielded Rate(8,8) — row order
-            # decided whether the PR blocked, an order-dependence inside the
-            # verdict-stability class. Reject rather than pick a winner: a table
-            # that contradicts itself is not evidence, and fail-closed means the id
-            # then has no rate at all (not exempt).
+            # Duplicate rows (latent finding 2): the LAST row used to win, so row
+            # order decided whether the PR blocked -- an order-dependence inside
+            # the verdict-stability class. Reject rather than pick a winner: the id
+            # then has no rate at all (not exempt), which is the fail-closed
+            # direction. WITHDRAWING it (not merely popping it) is what keeps it
+            # from being re-established by a later row.
+            tainted.add(nodeid)
             rejected.append(line)
             rates.pop(nodeid, None)
             continue
@@ -391,38 +555,63 @@ def decide(
     rotating: dict[str, frozenset[str]] | None = None,
     k_pr: int | None = None,
 
-    # ⚠️ KNOWN, ACCEPTED, DOCUMENTED GAP — owner-authorized "Option B" on tortoise #3756.
+    # THE RATE TOLERANCE — owner-authorized "Option B" on tortoise #3756, whose deferred
+    # residual is PARTLY CLOSED by the TOTAL-failure guard below.
     #
-    # THIS IS A FAIL-OPEN IN THE EXEMPTION PATH. It is documented, not fixed, and the fix is
-    # deferred BY THE OWNER — do not "fix" it here by surprise, and do not mistake it for an
+    # This parameter still carries an accepted fail-open, and its remaining shape is stated
+    # here so the next reader neither "fixes" it by surprise nor mistakes it for an
     # undiscovered bug.
     #
-    # THE FAILURE MODE (state it plainly — the next reader needs this, not the arithmetic):
-    # the tolerance is MULTIPLICATIVE, so the band that counts as "rates equivalent" WIDENS in
-    # absolute terms as main's rate rises. A PR that fails EVERY SINGLE RUN is therefore EXCUSED
-    # once main is broken enough — A DETERMINISTIC TOTAL FAILURE TREATED AS A RATE FLUCTUATION.
+    # THE FAILURE MODE it carried (kept, in the PAST tense, because the shape recurs and the
+    # next reader needs to know why this parameter stays suspicious): the tolerance is
+    # MULTIPLICATIVE, so the band that counts as "rates equivalent" WIDENS in absolute terms as
+    # main's rate rises. A PR that failed EVERY SINGLE RUN WAS therefore EXCUSED once main was
+    # broken enough — A DETERMINISTIC TOTAL FAILURE TREATED AS A RATE FLUCTUATION.
     #
     # Concretely, with the default 1.5, THE RATE CONDITION for exemption is
     # `pr_rate <= mr.rate * 1.5` — and note that this is the NECESSARY rate test, not the whole
     # rule: FIVE earlier gates BLOCK first and are checked in order ahead of it — an empty PR
     # sample, a rotating/UNATTRIBUTABLE identity, an id absent from `main_rates`, non-overlapping
     # signatures, and `mr.runs < min_runs`. Only if all five pass does the rate test decide.
-    # A PR failing every run has `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — ONCE MAIN IS
-    # ABOUT TWO-THIRDS BROKEN (~0.667) — the rate test no longer stops it, and it is EXEMPTED
-    # provided those earlier gates held. Past that point the gate reads a total, deterministic
-    # failure as "no worse than main", and the more broken main gets, the wider this door opens.
+    # A PR failing every run has `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — once main was
+    # about two-thirds broken (~0.667) — the rate test did not stop it, and it was EXEMPTED
+    # provided those earlier gates held. THE TOTAL-FAILURE GUARD BELOW CLOSES THAT BAND FOR
+    # EVERY MAIN THAT IS NOT ITSELF SATURATED; the main-total point inside the band is left to
+    # the rate test, per #3756 §11 (see CLOSED below).
     #
-    # Note the asymmetry, which is why this is a fail-open and not a tuning complaint: the input
+    # Note the asymmetry, which is why this WAS a fail-open and not a tuning complaint: the input
     # on the PR side is a TOTAL failure (every run failed) while the input on the main side is a
-    # SAMPLE over a finite `k`. The comparison therefore weighs a stronger signal against a weaker
-    # one, and the tolerance grows as the weaker side degrades. (`pr_rate` is still a rate over a
-    # finite sample, so "total" here means "every observed run", not an infinite certainty — the
-    # asymmetry is real but it is one of evidence strength, not of logical certainty.)
+    # SAMPLE over a finite `k`. The comparison therefore weighed a stronger signal against a
+    # weaker one, and the tolerance grew as the weaker side degraded. (`pr_rate` is still a rate
+    # over a finite sample, so "total" here means "every observed run", not an infinite certainty
+    # — the asymmetry is real but it is one of evidence strength, not of logical certainty.) The
+    # guard below closes this asymmetry FOR THE TOTAL CASE; its NON-total shadow survives and is
+    # stated under REMAINING RESIDUAL.
     #
-    # DEFERRED FIX DIRECTION (owner-authorized as a follow-up, NOT to be applied here): a tolerance
-    # that cannot excuse a TOTAL failure — e.g. an absolute floor, or refusing to exempt whenever
-    # `pr_rate` is exactly 1.0 — since no rate comparison can make a 100% failure equivalent to
-    # anything.
+    # CLOSED in this module by the total-failure guard below (the residual Option B deferred —
+    # agent-infra #1209/#1211; tortoise #3762 tracked the vendored tortoise copy, whose fix
+    # arrives by the vendor sync): a TOTAL PR failure is no longer excusable by this tolerance.
+    # The guard refuses a saturated PR rate WHEN THE PR SAMPLE IS MEASURABLE (`k_pr >= min_runs`)
+    # unless main's measured rate is ALSO saturated, because the one case where "as broken as
+    # main" is literally true is when main is total too. A thinner PR sample never reaches the
+    # guard at all — it is decided earlier on attribution (#5250) WHEN MAIN'S RATE IS NON-ZERO
+    # (`mr.rate > 0`; a zero main rate never satisfies that branch and is blocked on the rate
+    # comparison), where saturation is not evidence of determinism. Lowering `rate_tolerance`
+    # cannot make that separation without over-blocking: at `tol == 1.0` the band closes for
+    # every non-total main rate (so `6/8` vs `8/8` blocks) while saturated-on-saturated still
+    # exempts, but the authorized non-total residual `6/8` vs `7/8` is blocked too. So the
+    # distinction is expressed as a PREDICATE, not as a constant. The
+    # guard is deliberately NARROWER than a blanket "`pr_rate == 1.0` -> BLOCK": that would refuse
+    # `main 4/4` vs `PR 4/4`, which #3756 §11 PERMITS as an exemption (it requires the RECORDING,
+    # not the refusal), and total-on-total is the one case where the exemption is literally
+    # "no worse than main".
+    #
+    # REMAINING RESIDUAL (still accepted, unchanged): for a NON-total PR rate the tolerance still
+    # widens as main degrades — `main 6/8` vs `PR 7/8` is exempt. That is the authorized trade;
+    # only the deterministic-TOTAL case is closed, and it is the case the comparison has no
+    # information to decide. (A saturated PR whose sample is thinner than `min_runs` is likewise
+    # still exempt on attribution WHEN MAIN'S RATE IS NON-ZERO — the #5250 path above, not this
+    # tolerance; with a zero main rate it blocks on the rate comparison.)
     rate_tolerance: float = 1.5,
     min_runs: int = 3,
 ) -> Decision:
@@ -433,13 +622,33 @@ def decide(
     * id unknown to main's measurement -> **BLOCK** (no evidence of pre-existence).
     * signature disjoint from main's -> **BLOCK** (a DIFFERENT failure inside an id
       main also failed; same id is not same failure).
-    * THIS id's main row measured over fewer than ``min_runs`` runs -> **BLOCK**
-      (insufficient evidence; one observation cannot establish a rate). The floor is
+    * THIS id's MAIN row measured over fewer than ``min_runs`` runs -> **BLOCK**
+      (insufficient evidence; one observation cannot establish a rate). That floor is
       PER-ID and has no table-wide or caller-declared form: a ``k_main`` knob was
       removed because it was accepted and never read, which is the shape that
       produced this whole family of defects.
+    * PR sample (``k_pr``) below ``min_runs`` -> the RATE dimension is
+      **NOT-MEASURABLE** and is used NEITHER to exempt nor to block (#5250), with two
+      exclusions: ``k_pr == 0`` is EMPTY, not thin (the caller is told "pr sample
+      empty", and an empty row is refused by the per-row guard), and a main rate of
+      exactly ``0`` is not "measured red" (it reaches the rate comparison, which
+      blocks). The exemption then rests on the attribution question the gates above
+      already answered — id measured red on main, overlapping signatures, main's own
+      row >= ``min_runs`` — and the verdict SAYS the rate was not measurable. ``k_pr``
+      is the PR's declared sample size: ``_cmd_decide`` derives it as
+      ``max(row.runs)`` over the PR table (the producer emits one uniform K per
+      file), so this second use of ``min_runs`` is caller-declared and table-wide,
+      UNLIKE the per-id MAIN floor above.
     * PR rate materially above main's -> **BLOCK** (the PR made it worse).
-    * otherwise -> **EXEMPT**, recorded with both rates.
+    * PR failure is TOTAL (every observed run failed) while main's measured rate is
+      NOT total -> **BLOCK** (a deterministic failure is not a rate fluctuation, and
+      no tolerance makes it equivalent to a sampled one — the residual Option B
+      deferred, tortoise #3762). Applies only to a MEASURABLE PR sample
+      (``k_pr >= min_runs``); a thinner one is decided earlier on attribution. Checked
+      AFTER the tolerance test, so a case the tolerance already refuses keeps its
+      "materially higher" reason; when main IS total this is skipped and the rate
+      test decides, so ``main 4/4`` vs ``PR 4/4`` stays exempt.
+    * otherwise (the rate comparison passed) -> **EXEMPT**, recorded with both rates.
 
     ``main_rates`` is a RATE per id, not a set of ids: presence alone is never
     sufficient, because presence is what excused ``main 1/8`` against ``PR 8/8``.
@@ -517,6 +726,34 @@ def decide(
                 f"min_runs={min_runs}) — one observation cannot establish a rate"))
             continue
 
+        # THE PR-SIDE SAMPLE FLOOR (#5250). A PR gets ONE run per push, so its
+        # rate is a single observation and `1/1` is `100%` BY CONSTRUCTION — the
+        # comparison below then blocks unconditionally (`1.00 > 0.60 * 1.5`)
+        # whenever main is red for a check the PR merely inherited, so the rail
+        # was unusable exactly when it was most needed. `min_runs` is required on
+        # BOTH sides: when the PR's sample is below it the RATE dimension is
+        # NOT-MEASURABLE and is used NEITHER to exempt NOR to block. The
+        # exemption that follows rests on the ATTRIBUTION evidence the gates
+        # above already established (id measured red on main, overlapping
+        # signatures, main's own row >= `min_runs`) and SAYS the rate was not
+        # measurable — never a silent exemption.
+        #
+        # `k_pr is None` = the caller declared no PR sample size: in production
+        # `_cmd_decide` always passes it, and it is `None` only when there are no
+        # PR failures at all, so this preserves the historical rate comparison for
+        # that caller. The lower bound `1 <=` keeps `k_pr == 0` out: a zero sample
+        # is EMPTY, not thin, and the caller is told so by the note above — it must
+        # not also be exempted here. `mr.rate == 0` is not "measured red", so it
+        # falls through to the rate comparison — which BLOCKS a PR failure main
+        # never had (the zero-main-rate guard, bypass 1a) rather than exempting it.
+        if k_pr is not None and 1 <= k_pr < min_runs and mr.rate > 0:
+            decision.exempt.append(Verdict(
+                nodeid, False,
+                f"PR rate NOT measurable ({k_pr} run(s) < min_runs={min_runs}) — "
+                f"exempt on signature + main presence: main {mr} measured over "
+                f"{mr.runs} run(s), k_pr={k_pr}"))
+            continue
+
         # THE RATE COMPARISON — the heart of the fix. Compares the two RATES
         # (floats), never the two presences.
         #
@@ -526,12 +763,30 @@ def decide(
         # strongest exemption was bought with no evidence at all. A PR failure main
         # never had is a NEW failure, and `pr_rate > 0` against a zero main rate
         # blocks it.
+        # A TOTAL PR failure is NOT a rate fluctuation (the closed residual above,
+        # tortoise #3762). Saturation is tested on the MEASURED counts, not a float
+        # compare. The exemption survives only when main is saturated too — the one
+        # case where "no worse than main" is literally true.
+        #
+        # It sits AFTER the tolerance test deliberately: a failure the tolerance
+        # ALREADY refuses keeps its "materially higher" verdict, so this guard adds
+        # exactly the case the ratio cannot decide rather than re-labelling cases it
+        # can. Nothing in the tolerance's arithmetic can be trusted not to bridge a
+        # degenerate signal, which is why the case is carved out rather than tuned.
         pr_rate = pr.rate.rate
         if pr_rate > mr.rate * rate_tolerance:
             decision.blocked.append(Verdict(
                 nodeid, True,
                 f"PR rate {pr.rate} materially higher than main {mr} "
                 f"(>{rate_tolerance}x) — the PR made it worse"))
+            continue
+
+        if pr.rate.failures == pr.rate.runs and mr.failures != mr.runs:
+            decision.blocked.append(Verdict(
+                nodeid, True,
+                f"PR failure is TOTAL ({pr.rate}) while main is {mr} — a "
+                "deterministic failure is not a rate fluctuation, and the "
+                f"{rate_tolerance}x tolerance does not bridge a saturated signal"))
             continue
 
         decision.exempt.append(Verdict(
@@ -653,6 +908,8 @@ class SignatureParse:
     rejected: list[str] = field(default_factory=list)
     unsigned: list[str] = field(default_factory=list)
     unattributed: list[str] = field(default_factory=list)
+    #: The guard-step ids that entered ``ids`` (#4469) — REPORTED, never silent.
+    guard_steps: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -698,10 +955,316 @@ def _signature_from(e_line: str | None, exc: str | None) -> str:
     return core
 
 
-def parse_pr_failure_text(text: str) -> SignatureParse:
-    """Extract ``{nodeid: signature}`` from a raw ``--log-failed`` capture.
+# ==========================================================================
+# HALF 1b (#4469) — GUARD-STEP ATTRIBUTION
+# ==========================================================================
+#
+# THE DEFECT. The id universe was pytest nodeids ONLY, so a failing run whose
+# failure lived in a non-pytest GUARD STEP (an orphan-count assert, a packaging
+# guard, a health gate) yielded NO id. The rail then could not certify it:
+# `examined=1 extracted=0` tripped the fail-closed refusal in admin-merge.sh
+# ("yielded NO parseable 'FAILED <nodeid>' line … This is a refusal") and a green,
+# review-clean PR became unmergeable through the sanctioned path — even though
+# the failure was a real, attributable, and often FLAKY guard owned by another
+# lane. A genuinely new guard-step regression could never be CERTIFIED as new,
+# only refused.
+#
+# GROUNDED IN THE REAL CAPTURE, not an invented format. tortoise PR #4672, run
+# 35785085760 (python-ci.yml, 2026-09-23), `gh run view --log-failed`:
+#
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z orphaned redislite servers after suite: 16 (pytest rc: 0, threshold: 12)
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z ##[error]redislite server leak: 16 orphans after suite, threshold 12 (issue #1005 / epic #1647 E2E-7)
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z ##[error]Process completed with exit code 1.
+#   python-ci-gate\tAggregate matrix result\t<ts>Z ##[error]Process completed with exit code 1.
+#
+# Four facts from that capture shape this parser, and each is load-bearing:
+#
+#   * `pytest` exited rc 0; the failure is the POST-SUITE guard, not a test.
+#   * ANNOTATIONS ARE ANCHORED. The log also ECHOES the script source
+#     (line 40 of the capture: `echo "::error::redislite server leak: $COUNT …"`),
+#     so a mid-line search would manufacture a second, `$COUNT`-bearing identity
+#     for the SAME run and put a phantom failure in the set.
+#   * THE RUNNER'S OWN EXIT ANNOTATION IS NOT AN IDENTITY. `##[error]Process
+#     completed with exit code <N>.` is emitted for EVERY failing step — the
+#     pytest step included, and the aggregate gate step too. Attributing it
+#     would convert a genuinely unparseable run (log format moved; pytest rc≠0
+#     with no FAILED line) into a "guard-step" id, i.e. exactly the fail-closed
+#     refusal this change must PRESERVE. It is excluded, and a step carrying
+#     ONLY it stays unattributable.
+#   * THE IDENTITY IS (STEP, ERROR SHAPE) AND IS WHITESPACE-FREE. The main RATE
+#     table is built with `uniq -c | awk` and is whitespace-delimited (the count
+#     is field 1, the id field 2), so a key containing a space is mangled there;
+#     and the comparison needs the same identity on both trees despite an orphan
+#     COUNT that changes every run. So the step is slugged into the key and the
+#     error SHAPE rides the key tail AND the signature column the decision
+#     already carries.
 
-    Two passes over the same normalized lines:
+#: The one prefix no pytest nodeid can produce, so a guard key cannot collide
+#: with a test id.
+_GUARD_KEY_PREFIX = "guard-step::"
+
+#: The runner's OWN annotations for a failing step, emitted for EVERY failing
+#: step. They name no failure, so they are never an identity (see above).
+#: The RUNNER's and its container-hook's own WRAPPERS around a failed step — the
+#: generic messages the harness emits for a step that failed, not the step's own
+#: logic. They are emitted for EVERY failing step, so they name no failure: they
+#: are NEVER an identity, and (where they carry an exit code) they are the positive
+#: signal for "the runner marked this step failed". A closed, documented list
+#: because each entry is a measured harness string — the runner's
+#: `ScriptHandler.cs` form and the container hooks' `core.error` wrappers. A form
+#: MISSING from this list costs BOTH roles at once (the step is not marked failed,
+#: and its wrapper can become a phantom identity), so every form is pinned by a
+#: test: `test_no_runner_or_hook_wrapper_is_ever_an_identity`.
+_RUNNER_GENERIC_ANNOTATIONS = (
+    re.compile(r"^Process completed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^The process .+ failed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^Bash exited with code '?-?\d+'?\.?$"),
+    re.compile(r"^Docker failed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^Failed to run container step:?\b.*$"),
+    re.compile(r"^Failed to initialize containers,?\b.*$"),
+    re.compile(r"^The action .+ has timed out after .+$"),
+)
+
+#: A GitHub Actions error annotation, ANCHORED at the start of the line content.
+#: `gh run view` renders it as `##[error]<message>`; the workflow-command form is
+#: `::error[ props]::<message>`. The anchor is what keeps the echoed script
+#: source (`echo "::error::…"`) out of the id set.
+_ANNOTATION_RE = re.compile(r"^(?:##\[error\]|::error(?: [^:]*)?::)(?P<msg>.*)$")
+
+#: The `<job>\t<step>\t\ufeff<ISO>Z ` head, used to recover the STEP. Split on
+#: tabs (never a greedy `.*`) so the step is the real second column, and require
+#: the timestamp head so a content line that merely contains tabs is not mistaken
+#: for a prefix.
+_TS_HEAD_RE = re.compile(
+    r"^\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]"
+)
+
+#: The CLI's whitespace-free guard key — see the section header for WHY one token
+#: is mandatory. The charset is exactly what :func:`_slug` emits.
+_GUARD_KEY_RE = re.compile(r"^guard-step::[A-Za-z0-9_.\-]+::[A-Za-z0-9_.\-]+$")
+
+#: An integer RUN — the run-varying quantity in a guard message (an orphan COUNT,
+#: a measured value). Masked in the identity so the same guard on main and on the
+#: PR compares despite a different number, exactly as a test signature masks a
+#: per-run id. THE TRADE IS DECLARED: guard failures differing ONLY numerically
+#: collapse into one identity, and the attribution evidence (the per-id
+#: `min_runs` floor plus signature overlap) together with the rate comparison
+#: where the PR sample is measurable (#5250) is the backstop that still has to
+#: hold for an exemption.
+_GUARD_INT_RE = re.compile(r"\b\d+\b")
+
+
+def is_failure_key(key: str) -> bool:
+    """Is ``key`` in the universe the RATE table accepts (#4469)?
+
+    A pytest nodeid AND a guard-step identity are both failure keys; the same
+    predicate must gate :func:`parse_rates`, or main's rate row is dropped and
+    every guard failure reads as PR-unique forever.
+    """
+    return bool(_NODEID_RE.match(key) or _GUARD_KEY_RE.match(key))
+
+
+def is_failure_key_loose(key: str) -> bool:
+    """The LOOSE (parameter-space-permitting) form of :func:`is_failure_key`."""
+    return bool(_NODEID_LOOSE_RE.match(key) or _GUARD_KEY_RE.match(key))
+
+
+def _split_log_line(line: str) -> tuple[str, str, str]:
+    """``(job, step, content)`` from a gh ``--log-failed`` line.
+
+    Returns ``('', '', line)`` when the line carries no ``<job>\t<step>\t<ts>Z ``
+    head — the caller then has no step and must not invent one. The guard pass
+    SKIPS such a line entirely (``guard_step_failures``), so a stripped capture
+    cannot manufacture a step nor an attribution.
+
+    A tab INSIDE the job or step name defeats the field split, so the same greedy
+    prefix the nodeid pass uses (:data:`_LOG_PREFIX_RE`) is the fallback — the two
+    passes must not disagree about one capture.
+    """
+    parts = line.split("\t", 2)
+    if len(parts) == 3:
+        head = _TS_HEAD_RE.match(parts[2])
+        if head:
+            return parts[0], parts[1], parts[2][head.end():]
+    m = _LOG_PREFIX_RE.match(line)
+    if m:
+        fields = m.group(0).split("\t")
+        if len(fields) >= 3:
+            return fields[0], "\t".join(fields[1:-1]), line[m.end():]
+    return "", "", line
+
+
+def _slug(text: str) -> str:
+    """A whitespace-free token for a guard key; never empty."""
+    slug = re.sub(r"[^A-Za-z0-9_.\-]+", "-", text).strip("-")
+    return slug or "unknown"
+
+
+def normalize_guard_error(message: str) -> str:
+    """The STABLE shape of a guard-step error message, or ``''``.
+
+    Whitespace is collapsed and the SAME closed volatile-identifier list as
+    :func:`normalize_signature` is applied, then integer runs are masked too (see
+    ``_GUARD_INT_RE`` for the declared trade).
+    """
+    shape = normalize_signature(message)
+    if not shape:
+        return ""
+    return _GUARD_INT_RE.sub("<N>", shape)
+
+
+def guard_step_key(step: str, error_shape: str) -> str:
+    """``guard-step::<step>::<error shape>`` — one whitespace-free identity."""
+    return f"{_GUARD_KEY_PREFIX}{_slug(step)}::{_slug(error_shape)}"
+
+
+def _attributable_annotation(content: str) -> str:
+    """The guard failure message on ``content``, or ``''`` when there is none.
+
+    The runner's generic exit annotations are deliberately NOT attribution — see
+    the section header. A step carrying only them stays unattributable, which is
+    what keeps the rail's refusal for a genuinely unparseable run.
+    """
+    m = _ANNOTATION_RE.match(content)
+    if not m:
+        return ""
+    message = " ".join(m.group("msg").split())
+    if not message:
+        return ""
+    if any(generic.match(message) for generic in _RUNNER_GENERIC_ANNOTATIONS):
+        return ""
+    return message
+
+
+def _runner_step_failure(content: str) -> int | None:
+    """The exit code in the runner's OWN step-failure annotation, else ``None``.
+
+    gh renders ``##[error]Process completed with exit code <N>.`` as the LAST
+    annotation of every step whose command failed. It names no failure — so it is
+    never an identity — but it is the ONLY signal a ``--log-failed`` capture
+    carries for *this step failed the run*, independent of what the step printed.
+    """
+    m = _ANNOTATION_RE.match(content)
+    if not m:
+        return None
+    message = " ".join(m.group("msg").split())
+    if not any(generic.match(message) for generic in _RUNNER_GENERIC_ANNOTATIONS):
+        return None
+    tail = re.search(r"(-?\d+)'?\.?$", message)
+    return int(tail.group(1)) if tail else None
+
+
+def guard_step_failures(text: str) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(keys, {key: signatures})`` for the guard-step failures in a capture.
+
+    THREE conditions, ALL required — and it is their conjunction that keeps the
+    rail's cycle-3 refusal intact while making a guard failure comparable:
+
+    1. **A guard identity comes only from a step the RUNNER marked failed** — one
+       that emitted its own non-zero ``Process completed with exit code <N>.``. An
+       annotation printed by a step that did NOT fail the run says nothing about a
+       failure, and ``_slug('')`` must never let a head-less line found one.
+    2. **The run's ROOT failing step must itself yield an identity.** The root is
+       the FIRST step the runner marked failed, keyed by **(job, step)** — a
+       matrix leg runs steps with the SAME NAME as its siblings, so a step NAME
+       alone would let leg ``b``'s annotation stand in for leg ``a``'s
+       unparseable failure. The root is attributed only when its own lines carry a
+       ``FAILED``/``ERROR`` nodeid or a substantive annotation. If it does not,
+       the run contributes NO guard identity AT ALL — even when a LATER step
+       carries a perfectly good annotation. This is what refuses the mixed run (an
+       unparseable pytest failure PLUS a sibling guard annotation) that the
+       refusal exists for; see the HALF 1b header.
+    3. **A step that shows pytest failure output must yield a NODEID.** An
+       ``E   <exception>`` line is pytest's own report of a failure, so a step
+       carrying one has a pytest failure the parser did not classify. An
+       ANNOTATION from that step is NOT that classification (it is a wrapper, at
+       best), so the run is refused — the cycle-3 ``ImportError: no module named
+       y`` case, which prints ``E   ImportError`` and no ``FAILED`` line.
+       This clause is STEP-scoped: it refuses when the whole step yielded no
+       nodeid. A pytest run that prints BOTH a classified nodeid and an
+       unclassified block in one step (``--continue-on-collection-errors``) is a
+       PRE-EXISTING gap in the per-run refusal — ``main``'s parser returns the
+       same single nodeid — so it is filed (agent-infra #1372), not claimed here.
+
+    A line with no ``<job>\t<step>\t<ts>Z `` head has NO step, so it can neither
+    found the failing-step set nor be attributed: the step is never invented.
+
+    DECLARED RESIDUAL (agent-infra #1366): clauses 2 and 3 are the strongest
+    guarantee a ``--log-failed`` capture ALONE can give. What survives is an
+    unparseable failure that leaves NO pytest-shaped line AND whose step is not
+    the root — e.g. a guard root attributed first, then a non-pytest step failing
+    with bare prose. A source line that ITSELF starts with the annotation marker
+    (an echoed heredoc, not the ``echo "::error::…"`` form) is likewise
+    indistinguishable from a real annotation. Both need data the capture does not
+    carry; the measured capture places the guard before its aggregate gate, carries
+    no ``E   `` line and no line-start marker, so the guard IS the root and IS
+    attributed.
+    """
+    failing: list[tuple[str, str]] = []   # (job, step) pairs the runner failed
+    evidence: set[tuple[str, str]] = set()  # pairs that yielded an identity
+    nodeid_steps: set[tuple[str, str]] = set()  # pairs that yielded a NODEID
+    e_line_steps: set[tuple[str, str]] = set()  # pairs showing pytest output
+    candidates: list[tuple[tuple[str, str], str, str]] = []  # (unit, step, msg)
+    for raw in text.splitlines():
+        job, step, content = _split_log_line(_ANSI_RE.sub("", raw))
+        if not step:
+            continue
+        # The unit is the RAW pair, not a slug of it: `_slug` is lossy, so
+        # slugging both fields would let two DIFFERENT (job, step) pairs collapse
+        # (`test (py 3.12)`/`test (py-3.12)`, `Run-tests`/`Run tests`) and one
+        # leg's evidence attest another leg's unparseable failure. The slug is only
+        # ever the WIRE key's step component.
+        unit = (job, step)
+        payload = content.strip()
+        code = _runner_step_failure(payload)
+        if code is not None:
+            if code != 0 and unit not in failing:
+                failing.append(unit)
+            continue
+        if _E_LINE_RE.match(payload):
+            e_line_steps.add(unit)
+        message = _attributable_annotation(payload)
+        if message:
+            candidates.append((unit, step, message))
+            evidence.add(unit)
+            continue
+        candidate = _failed_candidate(payload)
+        if candidate is not None and _NODEID_LOOSE_RE.match(candidate):
+            evidence.add(unit)
+            nodeid_steps.add(unit)
+
+    if not failing or failing[0] not in evidence:
+        # No step the runner failed, or the ROOT failing step carries nothing we
+        # can attribute: the run is NOT attributed (fail-closed). An annotation
+        # from a later step is NOT allowed to stand in for it.
+        return [], {}
+    if e_line_steps - nodeid_steps:
+        # A step reported a pytest failure that produced no nodeid, so the run
+        # carries an UNCLASSIFIED failure. An annotation elsewhere in the run — or
+        # in that very step — does not classify it.
+        return [], {}
+
+    keys: list[str] = []
+    signatures: dict[str, set[str]] = {}
+    failing_set = set(failing)
+    for unit, step, message in candidates:
+        if unit not in failing_set:
+            # Clause 1: printed by a step the runner did NOT fail — a same-NAMED
+            # step in another leg is a different unit.
+            continue
+        shape = normalize_guard_error(message)
+        if not shape:
+            continue  # defensive: a future normalizer may void a message
+        key = guard_step_key(step, shape)
+        keys.append(key)
+        signatures.setdefault(key, set()).add(shape)
+    return sorted(set(keys)), {k: frozenset(v) for k, v in signatures.items()}
+
+
+def parse_pr_failure_text(text: str) -> SignatureParse:
+    """Extract ``{id: signature}`` from a raw ``--log-failed`` capture.
+
+    Three passes over the same normalized lines:
 
     1. the ``FAILED <nodeid> [- <detail>]`` short-summary lines — the
        authoritative id set, the same lines ``extract_failed_tests`` reads;
@@ -793,12 +1356,23 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
             signatures[nodeid] = frozenset(details[nodeid])
         else:
             unsigned.append(nodeid)
+
+    # Pass 3 — GUARD-STEP failures (#4469). Their ids and signatures come from the
+    # SAME helper the `ids` CLI uses, so the two doors cannot disagree about the
+    # guard universe. Merged AFTER the nodeid attribution so a guard key can
+    # never be pulled into the `by_name` join above.
+    guard_keys, guard_signatures = guard_step_failures(text)
+    for key, sigs in guard_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(guard_keys)
+
     return SignatureParse(
         ids=sorted(set(id_list)),
         signatures=signatures,
         rejected=rejected,
         unsigned=unsigned,
         unattributed=unattributed,
+        guard_steps=guard_keys,
     )
 
 
@@ -865,7 +1439,7 @@ def parse_failure_rows(text: str) -> FailureRowsResult:
         failures_n = int(m.group("failures"))
         runs_n = int(m.group("runs"))
         if (
-            not _NODEID_LOOSE_RE.match(nodeid)
+            not is_failure_key_loose(nodeid)
             or runs_n <= 0
             or failures_n > runs_n
         ):
@@ -908,7 +1482,7 @@ def parse_signature_rows(text: str) -> dict[str, frozenset[str]]:
             continue
         nodeid = m.group("nodeid")
         sig = normalize_signature(m.group("sig"))
-        if not sig or not _NODEID_LOOSE_RE.match(nodeid):
+        if not sig or not is_failure_key_loose(nodeid):
             continue
         out.setdefault(nodeid, set()).add(sig)
     return {k: frozenset(v) for k, v in out.items()}
@@ -940,7 +1514,8 @@ def _read(path: str) -> str:
 def _cmd_ids(args: argparse.Namespace) -> int:
     """`ids --log <capture>` — the canonical FAILED-id extraction (the shell's door).
 
-    stdout: the test ids, sorted and unique, one per line (possibly empty).
+    stdout: the failure ids — pytest nodeids AND attributable guard-step
+    identities (#4469) — sorted and unique, one per line (possibly empty).
     stderr: every rejected candidate, tagged UNATTRIBUTABLE, plus counts.
 
     Exits 0 whenever the capture was READ — an empty id set is a legitimate
@@ -959,9 +1534,15 @@ def _cmd_ids(args: argparse.Namespace) -> int:
         )
     print(
         f"ci-exemption: ids={len(parsed.ids)} "
-        f"unattributable={len(parsed.rejected)}",
+        f"unattributable={len(parsed.rejected)} "
+        f"guard-steps={len(parsed.guard_steps)}",
         file=sys.stderr,
     )
+    for key in parsed.guard_steps:
+        print(
+            f"ci-exemption: guard-step failure ATTRIBUTED (no test nodeid): {key}",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -985,7 +1566,8 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
     print(
         f"ci-exemption: ids={len(parsed.ids)} signed={len(parsed.signatures)} "
         f"unsigned={len(parsed.unsigned)} rejected={len(parsed.rejected)} "
-        f"unattributed={len(parsed.unattributed)}",
+        f"unattributed={len(parsed.unattributed)} "
+        f"guard-steps={len(parsed.guard_steps)}",
         file=sys.stderr,
     )
     return 0 if parsed.ok else 1
@@ -1080,14 +1662,16 @@ def main(argv: list[str] | None = None) -> int:
 
     sig = sub.add_parser(
         "signatures",
-        help="extract stable signatures from a raw `gh run view --log-failed` capture",
+        help="extract stable signatures from a raw `gh run view --log-failed` capture "
+        "(pytest nodeids AND guard-step annotations, #4469)",
     )
     sig.add_argument("--log", required=True, help="raw --log-failed file")
     sig.set_defaults(func=_cmd_signatures)
 
     ids = sub.add_parser(
         "ids",
-        help="THE canonical FAILED-id extraction from a raw `gh run view --log-failed` capture",
+        help="THE canonical FAILED-id extraction from a raw `gh run view --log-failed` "
+        "capture — pytest nodeids plus attributable guard-step failures (#4469)",
     )
     ids.add_argument("--log", required=True, help="raw --log-failed file")
     ids.set_defaults(func=_cmd_ids)

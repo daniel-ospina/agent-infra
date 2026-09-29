@@ -105,26 +105,17 @@ tests.push(test("LOOP_ENFORCER_DISABLED=1 skips loop-enforcer init", async () =>
      `loop-enforcer should be skipped. stderr: ${stderr.slice(0, 300)}`);
 }));
 
-tests.push(test("VISION_INTERCEPTOR_DISABLED=1 skips vision-interceptor init", async () => {
-  if (!process.env.DEEPSEEK_API_KEY) { console.log("  ⏭️ no DEEPSEEK_API_KEY — pi won't finish startup (dev-machine suite)"); return; }
-  const stderr = await spawnAndCapture({ VISION_INTERCEPTOR_DISABLED: "1" });
-  ok(stderr.includes("[vision-interceptor] ⏭️  Disabled") || !stderr.includes("[vision-interceptor] Loaded"),
-     `vision-interceptor should be skipped. stderr: ${stderr.slice(0, 300)}`);
-}));
-
-tests.push(test("All 4 skip env vars suppress all non-essential extensions", async () => {
+tests.push(test("All 3 skip env vars suppress all non-essential extensions", async () => {
   // Needs a pi that finishes startup — in CI (no DEEPSEEK_API_KEY) pi stalls
   // during provider/MCP init and later extension messages never arrive.
   if (!process.env.DEEPSEEK_API_KEY) { console.log("  ⏭️ no DEEPSEEK_API_KEY — pi won't finish startup here"); return; }
   const stderr = await spawnAndCapture({
     LOOP_ENFORCER_DISABLED: "1",
-    VISION_INTERCEPTOR_DISABLED: "1",
     SKILL_ENFORCER_DISABLED: "1",
     SLACK_BRIDGE_DISABLE: "1",
   });
   // These should NOT appear
   ok(!stderr.includes("[loop-enforcer] ✅ Loaded"), "loop-enforcer should not load");
-  ok(!stderr.includes("[vision-interceptor] Loaded"), "vision-interceptor should not load");
   ok(!stderr.includes("[slack-bridge] ✅ Loaded"), "slack-bridge should not load");
   // These SHOULD still appear — core enforcers always load, even when the
   // slower optional extensions (mcp-client, builtin-tools) miss the window in CI

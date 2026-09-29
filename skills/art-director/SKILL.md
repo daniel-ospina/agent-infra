@@ -199,7 +199,7 @@ Compares rendered PNGs against baseline templates. Catches CSS regressions and r
 ```
 /carousel-designer image_paths=docs/carousels/<slug>/slides/*.png
 ```
-Uses Claude vision (`read_image`) + DeepSeek with design tokens. Reviews: brand compliance, typography, contrast, safe zones, composition, rendering quality.
+Uses Claude vision (`read` on each PNG) + DeepSeek with design tokens. Reviews: brand compliance, typography, contrast, safe zones, composition, rendering quality.
 
 All three run in parallel via `task` sub-agents. Aggregate results into a single pass/fail report.
 

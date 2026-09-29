@@ -6,10 +6,13 @@
     <!-- deepseek-balance-watch (#476): every 15min read the DeepSeek-official
          prepaid balance (/user/balance, zero-token) and the openrouter hop-leg
          credit (/auth/key). The poller is the SINGLE restore authority for the
-         provider-exhaustion latch: it SETS the shared latch at balance
-         at/below-low and CLEARS only on verified positive balance + a 5-token
-         chat probe (fail-closed; 401/403 = SKIP, never latch on auth failure;
-         5xx/timeout = defer + escalate after 3 consecutive). Latch state
+         provider-exhaustion latch: it CLEARS only on verified positive balance
+         + a 5-token chat probe (fail-closed; 401/403 = SKIP, never latch on
+         auth failure; 5xx/timeout = defer + escalate after 3 consecutive). It
+         never SETS a latch on a low balance: at/below DBW_WARN_USD (default 30)
+         it only WARNS — per #1508 a balance warning must not switch providers;
+         the latch-set trigger is an observed 402 marker, never a warning.
+         Latch state
          written via deepseek-balance-latch.py which mirrors the session
          extension's state contract, so poller + pi sessions interoperate on
          ~/.pi/agent/state/provider-exhaustion.json. PASS/SKIP runs are quiet

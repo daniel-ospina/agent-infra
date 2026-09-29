@@ -12,7 +12,8 @@
 // This test drives the REAL code path (`generateSummaryWithUsage`) with a stub `streamFn` that
 // records the options it is called with, and asserts the budget HANDED TO THE STREAM FUNCTION —
 // the PRE-CLAMP value. The real clamp (`clampMaxTokensToContext`) runs later, inside
-// `buildBaseOptions`, so this probe never exercises it (README gap 10); it observes what the
+// `buildBaseOptions`, so this probe never exercises it (README §(e) — the residual (d) left open,
+// since closed by change (e)); it observes what the
 // summarizer asks for, not what a provider finally receives. It is
 // hermetic: it builds its own pristine tree and its own patched tree by copying the INSTALLED
 // `dist/` into a temp dir (with a symlinked `node_modules`), then reverting / applying the exact

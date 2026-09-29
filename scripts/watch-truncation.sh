@@ -15,11 +15,16 @@
 #   A) re-read volume OR LLM call count per compacting session > 2× the
 #      regenerated Aug baseline over any 3 consecutive days, OR
 #   B) ≥1 stopReason:"length" record in the window
-#   → REVERT TO 1M. The rollback commit updates the guard's threshold
-#     (scripts/check-cost-config.sh) in the SAME commit. COST_CLAMP_OVERRIDE=1
-#     is the in-window escape. Owner: the weekly report reader (this exit 1 +
-#     the printed procedure is the escalation — the instrument does NOT
-#     auto-revert; a revert is a deliberate committed change).
+#   → REVERT TO 1M. The rollback commit moves the WHOLE geometry in the SAME
+#     commit — the deepseek `contextWindow` in `models.json`, the guard's
+#     `CLAMP` (scripts/check-cost-config.sh), and the regime-floor literal in
+#     BOTH instruments (scripts/fleet-cost-report.sh's `FLEET_REGIME_TB:-<n>`
+#     and this file's labelled clamp-bucket boundary) — leaving `reserveTokens`
+#     at the reviewed 16384. The printed procedure below states the same list.
+#     `COST_CLAMP_OVERRIDE=1` covers the models.json clamp class only, not the
+#     geometry and not the retry/hang contract. Owner: the weekly report reader
+#     (this exit 1 + the printed procedure is the escalation — the instrument
+#     does NOT auto-revert; a revert is a deliberate committed change).
 #
 # Note on the length leg (expected week-1 behavior): the clamp DOES produce
 # mid-turn overruns in the real fleet — measured under the 400K clamp (91
@@ -283,9 +288,18 @@ print("")
 print("Pre-committed procedure (policy §7 — the weekly report reader is the owner):")
 print("  1. Revert the clamp: models.json contextWindow 300000 → 1000000 for every")
 print("     deepseek-served id (and models-store.json checkedAt bump, defense-in-depth).")
-print("  2. Update the guard threshold scripts/check-cost-config.sh in the SAME commit")
-print("     (the revert must not leave the drift guard asserting ≤300K).")
-print("  3. Window: COST_CLAMP_OVERRIDE=1 silences the guard for the rollback run;")
+print("  2. Move the WHOLE geometry in the SAME commit (#1316): the guard's CLAMP and")
+print("     the floor literal in BOTH instruments — fleet-cost-report.sh's")
+print("     FLEET_REGIME_TB:-<n> default and this file's labelled clamp-bucket boundary.")
+print("     settings.json's reserveTokens STAYS at the reviewed 16384: the 1M geometry")
+print("     only needs the window, the guard clamp and the two floors to move, and moving")
+print("     the reserve is the inflation the #1227 directive forbids (if it ever moves")
+print("     legitimately, the guard's REVIEWED_RESERVE moves with it in the same commit).")
+print("     Keep this file's clamp-bucket label and the guard's label anchor in step —")
+print("     an unlabelled bucket makes the floor unreadable and the guard refuses (exit 2).")
+print("     Flipping only CLAMP trips a settings-class block that COST_CLAMP_OVERRIDE=1")
+print("     does NOT silence, so make the guard green BEFORE the revert commit.")
+print("  3. Window: COST_CLAMP_OVERRIDE=1 silences the CLAMP block for the rollback run;")
 print("     it never enables a live 1M session past the window.")
 print("  4. Re-clamping to 300K afterwards requires re-approval (policy §7).")
 print("")

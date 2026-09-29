@@ -34,8 +34,6 @@
         "slack-bridge/",
         "subagent/",
         "tortoise-capture/",
-        "vision-interceptor/",
-        "vision-interceptor.json",
         "http-pool-hygiene/",
         "task-cwd-guard/"
       ]

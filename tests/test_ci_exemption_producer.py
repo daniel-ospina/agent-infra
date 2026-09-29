@@ -397,6 +397,39 @@ def test_cli_decide_blocks_and_writes_the_residual(tmp_path, capsys):
     assert "blocked=1" in out
 
 
+def test_cli_decide_blocks_a_TOTAL_pr_failure_the_tolerance_would_bridge(tmp_path, capsys):
+    """The closed residual, REACHABLE through the real consumer.
+
+    The shell drives the decision as a CLI over files (`admin-merge.sh`
+    ``run_exemption_decision``), and `k_pr` is derived inside `_cmd_decide` as
+    `max(row.runs)`. A change that made that derivation produce a thin sample would
+    silently route a saturated row into the #5250 attribution path and NO guard-level
+    test would catch it. This pins the whole consumer chain: `main 6/8` vs `PR 8/8`,
+    `k_pr=8`, must exit gated (rc=1) with the id in `--blocked-out`.
+
+    MUTATION: remove the totality guard -> rc becomes 0, `blocked` empties and the
+    `VERDICT\tBLOCK` assertion REDs (the measured false PASS).
+    """
+    pr = _write(tmp_path, "pr.txt", f"{DR}\t8\t8\tAssertionError: assert 3 == 2\n")
+    mainf = _write(tmp_path, "main.txt", f"{DR}\t6\t8\n")
+    msig = _write(tmp_path, "msig.txt", f"{DR}\tAssertionError: assert 3 == 2\n")
+    blocked = tmp_path / "blocked.txt"
+    verdict = tmp_path / "verdict.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig,
+            "--blocked-out", str(blocked), "--verdict-out", str(verdict),
+        ]
+    )
+
+    assert rc == 1, "a deterministic total failure must gate the merge"
+    assert blocked.read_text(encoding="utf-8") == f"{DR}\n"
+    assert verdict.read_text(encoding="utf-8").startswith("VERDICT\tBLOCK")
+    assert "TOTAL" in capsys.readouterr().out
+
+
 def test_cli_decide_exempts_with_both_rates_visible(tmp_path, capsys):
     """An exemption must be RECORDED with both rates — never an absence.
 
@@ -421,6 +454,76 @@ def test_cli_decide_exempts_with_both_rates_visible(tmp_path, capsys):
     assert line.startswith("EXEMPT:")
     assert "main 4/8" in line and "PR 4/8" in line
     assert "VERDICT\tCLEAN" in out
+
+
+def test_cli_decide_a_single_sample_pr_rate_is_not_measurable(tmp_path, capsys):
+    """#5250 end-to-end: the CLI derives `k_pr` from the row's run count.
+
+    The production path passes `k_pr = max(row.runs)`, so a head tested once is
+    `1/1` against a flaky main `3/5`. The old rate comparison blocks that by
+    construction (`1.00 > 0.90`); below `min_runs` the rate is NOT-MEASURABLE and
+    the exemption must be visible in the file the evidence poster reads.
+    MUTATION: revert the PR-side floor → rc == 1 and no EXEMPT line.
+    """
+    pr = _write(tmp_path, "pr.txt", f"{DR}\t1\t1\tAssertionError: assert 3 == 2\n")
+    mainf = _write(tmp_path, "main.txt", f"{DR}\t3\t5\n")
+    msig = _write(tmp_path, "msig.txt", f"{DR}\tAssertionError: assert 3 == 2\n")
+    exempt = tmp_path / "exempt.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig, "--exempt-out", str(exempt),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    lines = exempt.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("EXEMPT:")
+    assert "NOT measurable" in lines[0], lines[0]
+    assert "signature + main presence" in lines[0], lines[0]
+    assert "main 3/5" in lines[0], lines[0]
+    assert "5 run(s)" in lines[0], lines[0]
+    assert "VERDICT\tCLEAN" in out
+
+
+def test_cli_decide_the_pr_floor_uses_the_declared_table_max(tmp_path, capsys):
+    """The CLI's `k_pr = max(row.runs)` is the floored quantity, not a row's runs.
+
+    A two-row PR file (5 and 1 runs) declares `k_pr=5`, so the `1/1` row is COMPARED
+    and both rows BLOCK. MUTATION: floor on `pr.rate.runs` instead of the declared
+    `k_pr` → the `1/1` row is floored and exempted, so `blocked` shrinks to 1 and an
+    EXEMPT line appears → RED.
+    """
+    other = "tests/test_other.py::TestT::test_other"
+    pr = _write(
+        tmp_path, "pr.txt",
+        f"{DR}\t5\t5\tAssertionError: assert 3 == 2\n"
+        f"{other}\t1\t1\tAssertionError: assert 3 == 2\n",
+    )
+    mainf = _write(tmp_path, "main.txt", f"{DR}\t3\t5\n{other}\t3\t5\n")
+    msig = _write(
+        tmp_path, "msig.txt",
+        f"{DR}\tAssertionError: assert 3 == 2\n{other}\tAssertionError: assert 3 == 2\n",
+    )
+    blocked = tmp_path / "blocked.txt"
+    exempt = tmp_path / "exempt.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig, "--blocked-out", str(blocked),
+            "--exempt-out", str(exempt),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 1, out
+    assert sorted(blocked.read_text(encoding="utf-8").split()) == [DR, other]
+    assert exempt.read_text(encoding="utf-8") == "", "the declared k=5 floors neither row"
+    assert "blocked=2" in out
 
 
 def test_cli_decide_rotation_is_unattributable_and_gates(tmp_path, capsys):
@@ -521,3 +624,227 @@ def test_decision_type_is_importable_for_the_cli():
     drive). MUTATION: rename ``Decision`` → AttributeError → RED."""
     assert isinstance(decide({}, {}), Decision)
     assert Failure(rate=Rate(0, 0)).signatures == frozenset()
+
+
+# ==========================================================================
+# #4469 — GUARD-STEP ATTRIBUTION THROUGH THE PRODUCER AND THE WIRE
+# ==========================================================================
+#
+# The measured capture (tortoise PR #4672, run 35785085760): pytest rc 0, the
+# post-suite orphan guard red. The producer must emit a SIGNATURE ROW for it — a
+# guard id with no signature would make ``_signatures_overlap`` fail closed and
+# no guard exemption could ever be recorded. The echoed script SOURCE and the
+# runner's generic exit annotation are in the fixture on purpose: neither may
+# become an identity.
+_GUARD_JOB = "test (b)"
+_GUARD_STEP = "Assert no redislite orphans (issue"
+_GUARD_KEY = (
+    "guard-step::Assert-no-redislite-orphans-issue::"
+    "redislite-server-leak-N-orphans-after-suite-threshold-N-issue-N-epic-N-E2E--N"
+)
+_GUARD_SIG = (
+    "redislite server leak: <N> orphans after suite, threshold <N> "
+    "(issue #<N> / epic #<N> E2E-<N>)"
+)
+_GUARD_RUNNER_EXIT = "##[error]Process completed with exit code 1."
+
+
+def _guard_capture(orphans: int = 16) -> str:
+    """The real `--log-failed` shape, wrapped like the measured capture."""
+    prefix = f"{_GUARD_JOB}\t{_GUARD_STEP}\t"
+    echo_source = (
+        '2026-09-23T01:19:53.8474165Z \x1b[36;1m    echo "::error::redislite server'
+        ' leak: $COUNT orphans after suite, threshold $THRESHOLD (issue #1005 /'
+        ' epic #1647 E2E-7)"\x1b[0m'
+    )
+    return "\n".join(
+        [
+            prefix + echo_source,
+            prefix
+            + f"2026-09-23T01:19:53.8645102Z ##[error]redislite server leak: {orphans}"
+            + " orphans after suite, threshold 12 (issue #1005 / epic #1647 E2E-7)",
+            prefix + f"2026-09-23T01:19:53.8649910Z {_GUARD_RUNNER_EXIT}",
+            "python-ci-gate\tAggregate matrix result\t2026-09-23T01:20:00Z "
+            + _GUARD_RUNNER_EXIT,
+        ]
+    ) + "\n"
+
+
+def test_guard_step_annotation_becomes_a_signature_row():
+    """The producer emits the guard id AND its (masked) error shape.
+
+    MUTATION: skip the guard pass in ``parse_pr_failure_text`` → ``ids == []``,
+    the producer exits 1, and the rail can never build a guard row → RED.
+    MUTATION: store the raw message instead of the shape → the orphan COUNT
+    differs between main and the PR and no exemption can match → the exact-string
+    assertion REDs.
+    """
+    parsed = parse_pr_failure_text(_guard_capture())
+
+    assert parsed.ids == [_GUARD_KEY]
+    assert parsed.guard_steps == [_GUARD_KEY]
+    assert parsed.signatures[_GUARD_KEY] == frozenset({_GUARD_SIG})
+    assert parsed.unsigned == [], "a signed guard failure is not unsigned"
+    assert parsed.ok is True
+
+
+def test_the_echoed_source_and_the_runner_exit_are_not_identities():
+    """Both negative fixtures must stay out of the id set (the exact id count).
+
+    The echoed `echo "::error::…"` line is a MID-LINE mention and the aggregate
+    step carries only the runner's own exit annotation; if either became an
+    identity the capture would yield 2–3 ids instead of 1.
+    """
+    parsed = parse_pr_failure_text(_guard_capture())
+
+    assert len(parsed.ids) == 1
+    assert all("$COUNT" not in i for i in parsed.ids)
+    assert all("Python-ci-gate" not in i for i in parsed.ids)
+
+
+def test_cli_ids_reports_the_guard_step_attribution(tmp_path, capsys):
+    """The shell's door: `ids` emits the guard key and REPORTS the attribution.
+
+    MUTATION: drop the guard-steps summary line → the `guard-steps=1` assertion
+    REDs, and the attribution becomes invisible in the rail's evidence.
+    """
+    log = _write(tmp_path, "guard.log", _guard_capture())
+
+    rc = main(["ids", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out == f"{_GUARD_KEY}\n"
+    assert "guard-steps=1" in captured.err
+    assert "guard-step failure ATTRIBUTED" in captured.err
+
+
+def test_cli_signatures_emits_the_guard_row(tmp_path, capsys):
+    """The producer's stdout is the shell-joinable guard row.
+
+    MUTATION: emit no signature for the guard id → the empty-stdout / rc-1
+    assertions RED, and the decision would fail closed on every guard failure.
+    """
+    log = _write(tmp_path, "guard.log", _guard_capture())
+
+    rc = main(["signatures", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out == f"{_GUARD_KEY}\t{_GUARD_SIG}\n"
+    assert "guard-steps=1" in captured.err
+
+
+def test_cli_signatures_still_fails_closed_on_a_generic_only_capture(tmp_path, capsys):
+    """The refusal is PRESERVED at the producer door (#4469).
+
+    A failing step whose only annotation is the runner's `Process completed with
+    exit code 1.` names no failure, so the capture proves nothing and the
+    producer must still exit non-zero with ZERO guard steps.
+
+    MUTATION: treat the generic exit annotation as attribution → rc flips to 0,
+    `ids=1`, and the rail would certify an unparseable run → RED.
+    """
+    log = _write(
+        tmp_path,
+        "generic.log",
+        f"test (a)\tRun fast test suite\t2026-09-23T01:00:00Z {_GUARD_RUNNER_EXIT}\n",
+    )
+
+    rc = main(["signatures", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == ""
+    assert "guard-steps=0" in captured.err
+
+
+def test_cli_signatures_refuses_a_mixed_capture(tmp_path, capsys):
+    """The producer door refuses an unparseable ROOT failure beside a guard hit.
+
+    A sibling annotation must not stand in for the run's root failure: the
+    `signatures` CLI still exits 1 with ZERO ids, so the rail's step-1c refusal
+    fires. This is the shell-facing half of
+    `test_an_unparseable_test_failure_is_not_laundered_by_a_sibling_guard`.
+
+    MUTATION: drop the root-step condition in `guard_step_failures` → rc flips to
+    0 with `ids=1`, and the cycle-3 false certificate is back → RED.
+    """
+    mixed = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00Z "
+        "E   ImportError: no module named y\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:01Z "
+        + _GUARD_RUNNER_EXIT
+        + "\n"
+        + _guard_capture()
+    )
+    log = _write(tmp_path, "mixed.log", mixed)
+
+    rc = main(["signatures", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == ""
+    assert "guard-steps=0" in captured.err
+
+
+def test_cli_signatures_refuses_a_wrapper_annotation_in_the_failing_step(
+    tmp_path, capsys
+):
+    """A same-step wrapper annotation is not pytest's classification.
+
+    The cycle-2 finding at the producer door: a step that prints `E   ImportError`
+    (pytest's own failure report) AND a substantive annotation must still refuse,
+    because the annotation does not classify the failure. Without this the run is
+    certified off a key that never names the failure.
+
+    MUTATION: drop the `e_line_steps - nodeid_steps` clause → rc flips to 0 with
+    `ids=1` → RED.
+    """
+    wrapped = (
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:00Z "
+        "E   ImportError: no module named y\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:01Z ##[error]tests failed\n"
+        "test (a)\tRun fast test suite\t2026-09-23T01:00:02Z " + _GUARD_RUNNER_EXIT + "\n"
+    )
+    log = _write(tmp_path, "wrapped.log", wrapped)
+
+    rc = main(["signatures", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == ""
+    assert "guard-steps=0" in captured.err
+
+
+def test_guard_key_flows_through_the_wire_rows_into_an_exemption():
+    """END TO END through the producer's own wire formats: a guard exemption.
+
+    The id derived from the REAL annotation is fed back through
+    ``parse_failure_rows`` / ``parse_signature_rows`` (the two files the rail
+    writes) and the decision EXEMPTS it — i.e. the guard failure participates in
+    the PR-vs-main comparison exactly like a test nodeid.
+    """
+    key = parse_pr_failure_text(_guard_capture()).ids[0]
+
+    rows = parse_failure_rows(f"{key}\t3\t8\t{_GUARD_SIG}\n")
+    assert rows.rejected == [] and rows.unsigned == []
+    main_rates = {key: Rate(3, 8)}
+    main_sigs = parse_signature_rows(f"{key}\t{_GUARD_SIG}\n")
+    assert main_sigs == {key: frozenset({_GUARD_SIG})}
+
+    d = decide(rows.failures, main_rates, main_signatures=main_sigs, k_pr=8)
+    assert not d.any_blocked, d.report()
+    assert d.visible_exemptions()
+
+
+def test_a_test_nodeid_still_flows_through_unchanged():
+    """NO REGRESSION: the widened key predicate does not re-key a nodeid row.
+
+    MUTATION: make the guard branch swallow every row → the nodeid row is
+    rejected, ``failures`` is empty, and the exemption disappears → RED.
+    """
+    rows = parse_failure_rows(f"{DR}\t4\t8\tAssertionError: assert 3 == 2\n")
+    assert list(rows.failures) == [DR]
+    assert rows.rejected == []
+    assert list(parse_signature_rows(f"{DR}\tAssertionError: assert 3 == 2\n")) == [DR]

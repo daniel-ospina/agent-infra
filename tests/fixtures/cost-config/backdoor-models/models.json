@@ -48,9 +48,7 @@
           "id": "deepseek-v4-flash",
           "name": "DeepSeek V4.1 Flash (legacy alias)",
           "reasoning": true,
-          "input": [
-            "text"
-          ],
+          "input": ["text","image"],
           "contextWindow": 1000000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
@@ -71,9 +69,7 @@
           "id": "deepseek-flash",
           "name": "DeepSeek V4.1 Flash",
           "reasoning": true,
-          "input": [
-            "text"
-          ],
+          "input": ["text","image"],
           "contextWindow": 1000000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
