@@ -120,6 +120,10 @@ case "${1:-} ${2:-}" in
         esac
         exit 0 ;;
       */compare/*)
+        # the MEASURED distance (B13): a distinct field from the merge base
+        case "$jqprog" in
+          *behind_by*) cat "$SCEN/behind" 2>/dev/null || echo 0; exit 0 ;;
+        esac
         # model a base REWRITE inside the unit: the Nth compare returns the Nth line
         if [ -f "$SCEN/mb-seq" ]; then
           n=$(( $(cat "$SCEN/mb-count" 2>/dev/null || echo 0) + 1 ))
@@ -229,6 +233,7 @@ new_scen() {
   printf 'MERGED\n' > "$SCEN/merged"
   printf 'cccccccccccccccccccccccccccccccccccccccc\n' > "$SCEN/merge-base"
   printf '9999999999999999999999999999999999999999\n' > "$SCEN/base-tip"
+  printf '0\n' > "$SCEN/behind"
   mkdir -p "$SCEN/tmp"
   : > "$SCEN/calls"
   # default fixture record: verdict clean at the OLD head
@@ -383,6 +388,54 @@ rc=$?
 called "pr update-branch" && fail "updated a PR that was not BEHIND" || pass "no update (not BEHIND)"
 called "record-review" && fail "re-recorded an unchanged head (dilutes the evidence)" || pass "no re-record of a fresh head"
 called "admin-merge 42" && pass "landed directly" || fail "did not land"
+
+# ═══ 9b. B13 — a BLOCKED, MEASURABLY-behind PR is updated ═══════════════
+# The deadlock: a branch more than the drift-guard's 20 commits behind main has
+# its drift-guard check FAIL, so GitHub reports `BLOCKED`, not `BEHIND` — and an
+# update predicate keyed on the enum skipped the very update that would clear it
+# (tortoise #6210 / #6169). The rail must MEASURE the distance and update when it
+# is non-zero, so the behind PR REACHES the B5 presence check.
+echo "── 9b. B13 — mergeStateStatus=BLOCKED with a measured lag is updated"
+new_scen blockedbehind
+printf 'BLOCKED\n' > "$SCEN/state"
+printf '39\n' > "$SCEN/behind"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the unit completes (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch 42" && pass "B13: a BLOCKED, 39-behind PR was updated (the deadlock is closed)" \
+  || fail "B13: BLOCKED still skipped the update — the deadlock is intact"
+called "record-review 42 $HEAD_OLD clean $REPO" && pass "the update reached step 3 (record at the new head)" \
+  || fail "no record after the update"
+called "admin-merge 42" && pass "the unit landed" || fail "did not land"
+
+# ═══ 9c. B13 — a measured distance of 0 keeps the no-op under BLOCKED ═══
+echo "── 9c. B13 — a measured distance of 0 keeps the no-op even under BLOCKED"
+new_scen blockedclean
+printf 'BLOCKED\n' > "$SCEN/state"
+printf '0\n' > "$SCEN/behind"
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "completes (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" && fail "updated despite a measured distance of 0" || pass "measured 0 → no update"
+called "admin-merge 42" && pass "landed directly (fresh head)" || fail "did not land"
+
+# ═══ 9d. B13 — an unmeasurable BLOCKED state fails closed ═════════════
+# An unreadable distance is not proof the head is current. `CLEAN` keeps its
+# no-op, but a state GitHub calls blocked must not be read as up to date.
+echo "── 9d. B13 — an unreadable distance under BLOCKED stops, not \"up to date\""
+new_scen blockedunmeasured
+printf 'BLOCKED\n' > "$SCEN/state"
+: > "$SCEN/behind"   # the compare read yields nothing usable (empty distance)
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) — did not certify an unmeasured base relation" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "updated on an unmeasured distance" || pass "no update on an unmeasured distance"
+called "admin-merge" && fail "landed on an unmeasured base relation (B13 fail-open)" || pass "did NOT land unmeasured"
+grep -q "could not measure the head/base divergence" "$SCEN/err" && pass "the stop names the unmeasured divergence" || fail "the stop does not name the unmeasured divergence"
 
 # ═══ 10. the merge is never hand-rolled, and the rail never reads protection ═
 echo "── 10. the rail never issues a raw merge, and has no branch-protection dependency"
@@ -707,6 +760,10 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # B12b: the CAPTURE read must fail closed — an empty capture must not silently
   # disable the pre-land comparison (the path the reviewer reproduced).
   mutate_and_expect_fail B12b 's/if \[ -z "\$CERT_BASE_TIP" \]; then/if false; then/'
+  # B13: trust `mergeStateStatus` alone — a FAILING required check masks a stale
+  # head as BLOCKED, the measuring arm is skipped, and the >20-behind PR that the
+  # drift-guard is blocking never gets the update that would clear it.
+  mutate_and_expect_fail B13  's/behind="\$\(behind_by "\$BASE" "\$HEAD"\)"/behind=""/'
   # B11: never take the per-PR lock
   mutate_and_expect_fail B11  's/\[ "\$DRY_RUN" -eq 0 \] && acquire_lock//'
   # D1d (#1362): the partial-install diagnostic is not a bypass class, but it is

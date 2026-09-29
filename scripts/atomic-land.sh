@@ -249,6 +249,21 @@ base_tip() {
   gh_ api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true
 }
 
+# HOW FAR the head lags the base — the MEASURED head/base divergence.
+#
+# WHY `mergeStateStatus` CANNOT CARRY THIS. The enum reports ONE state, and a
+# FAILING required check MASKS a stale head: a branch more than the drift-guard's
+# 20 commits behind main has its drift-guard check FAIL, so GitHub reports
+# `BLOCKED` (a failing required check) and never `BEHIND`. A predicate keyed on the
+# enum therefore skips the update for exactly the PRs the 20-commit rule
+# deadlocks — reproduced 2026-09-29 on tortoise #6210 (behind 39) and #6169
+# (behind 42), both `mergeStateStatus=BLOCKED`, both still open after the unit
+# "ran". `behind_by` is the number of commits in `base` that are not in `head`;
+# it cannot be masked by another check's conclusion. Empty on an unreadable read.
+behind_by() { # <base> <head>
+  gh_ api "repos/$REPO/compare/$1...$2" --jq .behind_by 2>/dev/null || true
+}
+
 # The review gate key — the SAME source and normalisation as the producer
 # (scripts/record-review.sh: AI_REVIEW_GATE_KEY, else ~/.pi/agent/.ai-review-gate-key).
 # The PR body is attacker-writable, so a matching marker SHAPE is not evidence that
@@ -371,7 +386,7 @@ verdict_accepted() {
 
 # ── step 1: update ───────────────────────────────────────────────────────
 do_update() { # 0 = updated, 3 = not behind (no-op)
-  local before="$HEAD" after="" i t=0
+  local before="$HEAD" after="" i t=0 behind=""
   case "$MERGE_STATE" in
     UNKNOWN|""|null)
       # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
@@ -394,12 +409,34 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
   esac
   case "$MERGE_STATE" in
     BEHIND) : ;;
-    CLEAN)
-      say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
-      return 3 ;;
     *)
-      say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND — nothing to update"
-      return 3 ;;
+      # B13 — `mergeStateStatus` CANNOT CARRY head/base divergence on its own.
+      # The enum reports ONE state, and a FAILING required check MASKS a stale
+      # head: a branch >20 commits behind main fails the drift-guard check, and
+      # GitHub then reports `BLOCKED` (a failing required check) rather than
+      # `BEHIND`. Keying the update on the enum skipped the update for exactly the
+      # PRs the 20-commit rule was deadlocking (tortoise #6210 / #6169,
+      # 2026-09-29: behind 39/42, state=BLOCKED, "not BEHIND — nothing to update",
+      # unchanged afterwards). MEASURE the distance and fall through to the update
+      # path — and so to the B5 presence check below — when it is non-zero.
+      behind="$(behind_by "$BASE" "$HEAD")"
+      case "$behind" in
+        0)
+          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured 0 commits behind $BASE — nothing to update"
+          return 3 ;;
+        ''|*[!0-9]*)
+          # An unreadable distance is NOT proof of divergence. `CLEAN` already
+          # asserted there is none, so keep that no-op; for any OTHER state the
+          # silent "up to date" read is the exact defect this arm closes, so stop
+          # and name it instead of proceeding on an unmeasured base relation.
+          if [ "$MERGE_STATE" = "CLEAN" ]; then
+            say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
+            return 3
+          fi
+          stop "could not measure the head/base divergence of $REPO#$PR (mergeStateStatus=$MERGE_STATE, compare API read failed) — refusing to treat a blocked head as up to date (B13)" ;;
+        *)
+          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, but measured ${behind} commit(s) behind $BASE — treating as BEHIND (B13)" ;;
+      esac ;;
   esac
   # B5 — never SPEND an attestation the unit cannot restore. A branch update moves
   # the head and invalidates the record; the #767 carry-forward can re-bind it only
