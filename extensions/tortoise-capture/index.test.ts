@@ -9,9 +9,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSy
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
+import tortoiseCapture, {
   cloudConfig,
   isCloudEnabled,
+  loadConfig,
+  normalizeConfig,
   writeCloudFallback,
   captureToHosted,
   buildCloudPayload,
@@ -449,27 +451,59 @@ describe("#125/#167 deriveTopics/deriveStoryArch", () => {
 // #312 delta 2 — hosted-cloud capture path (real module, mocked fetch)
 
 describe("#312 cloudConfig/isCloudEnabled", () => {
+  const dirs: string[] = [];
+  // Hermetic scope: a real git repo so the shared gate can resolve a repo root,
+  // and no ambient TORTOISE_CAPTURE_CLOUD (review cycle 1 P1 — ambient env made
+  // these red for any developer with the deny flag exported).
+  function gitProject(): string {
+    const dir = mkdtempSync(join(tmpdir(), "capture-cloud-"));
+    dirs.push(dir);
+    execSync("git init -q .", { cwd: dir });
+    return resolveProjectRoot(dir);
+  }
+  afterEach(() => {
+    while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
   beforeEach(() => {
     delete process.env.TORTOISE_API_KEY;
     delete process.env.TORTOISE_API_URL;
+    delete process.env.TORTOISE_CAPTURE_CLOUD;
   });
 
   test("cloud unset/false → NOT enabled (local ingest path unchanged)", () => {
-    expect(isCloudEnabled({ autoCapture: true })).toBe(false);
-    expect(isCloudEnabled({ autoCapture: true, cloud: false })).toBe(false);
+    expect(isCloudEnabled({ autoCapture: true }, { projectDir: gitProject(), env: {} })).toBe(false);
+    expect(
+      isCloudEnabled({ autoCapture: true, cloud: false }, { projectDir: gitProject(), env: {} }),
+    ).toBe(false);
     // even with a key, cloud must be explicitly true to switch paths
-    expect(isCloudEnabled({ autoCapture: true, cloud: false, apiKey: "tt_x" })).toBe(false);
+    expect(
+      isCloudEnabled(
+        { autoCapture: true, cloud: false, apiKey: "tt_x" },
+        { projectDir: gitProject(), env: {} },
+      ),
+    ).toBe(false);
   });
 
   test("cloud:true requires an api key", () => {
-    expect(isCloudEnabled({ autoCapture: true, cloud: true })).toBe(false);
-    expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "" })).toBe(false);
-    expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "  " })).toBe(false);
-    expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "tt_x" })).toBe(true);
+    expect(isCloudEnabled({ autoCapture: true, cloud: true }, { projectDir: gitProject(), env: {} })).toBe(false);
+    expect(
+      isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "" }, { projectDir: gitProject(), env: {} }),
+    ).toBe(false);
+    expect(
+      isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "  " }, { projectDir: gitProject(), env: {} }),
+    ).toBe(false);
+    expect(
+      isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "tt_x" }, { projectDir: gitProject(), env: {} }),
+    ).toBe(true);
   });
 
   test("apiKey is trimmed before the emptiness check", () => {
-    expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "  tt_x  " })).toBe(true);
+    expect(
+      isCloudEnabled(
+        { autoCapture: true, cloud: true, apiKey: "  tt_x  " },
+        { projectDir: gitProject(), env: {} },
+      ),
+    ).toBe(true);
     expect(cloudConfig({ autoCapture: true, apiKey: "  tt_x  " }).apiKey).toBe("tt_x");
   });
 
@@ -494,7 +528,12 @@ describe("#312 cloudConfig/isCloudEnabled", () => {
       const fromEnv = cloudConfig({ autoCapture: true, apiUrl: "https://file.example.com", apiKey: "tt_file" });
       expect(fromEnv.apiKey).toBe("tt_env");
       expect(fromEnv.apiUrl).toBe("https://env.example.com");
-      expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "tt_file" })).toBe(true);
+      expect(
+        isCloudEnabled(
+          { autoCapture: true, cloud: true, apiKey: "tt_file" },
+          { projectDir: gitProject(), env: {} },
+        ),
+      ).toBe(true);
     } finally {
       delete process.env.TORTOISE_API_KEY;
       delete process.env.TORTOISE_API_URL;
@@ -521,8 +560,15 @@ describe("#803 capture egress gate (repo opt-out + env deny)", () => {
   });
 
   test("cloud:true + key with no deny → enabled", () => {
+    // A resolvable (git) scope with no deny is required for "enabled" now that
+    // an unresolvable scope fails closed (review cycle 1 P0).
+    const dir = tmpProject();
+    execSync("git init -q .", { cwd: dir });
     expect(
-      isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "tt_x" }, { projectDir: tmpProject(), env: {} }),
+      isCloudEnabled(
+        { autoCapture: true, cloud: true, apiKey: "tt_x" },
+        { projectDir: resolveProjectRoot(dir), env: {} },
+      ),
     ).toBe(true);
   });
 
@@ -784,6 +830,73 @@ describe("#611 buildCloudPayload attribution", () => {
     expect(model.length).toBeLessThanOrEqual(128);
     expect(/[\x00-\x1f\x7f]/.test(machineId)).toBe(false);
     expect(/[\x00-\x1f\x7f]/.test(model)).toBe(false);
+  });
+});
+
+// #803 review cycle 1 P1 — config boundary normalisation + registration safety
+// A hand-written config can hold any JSON type; a non-string apiKey used to
+// throw inside the extension entry point (`...trim is not a function`), killing
+// registration and losing even LOCAL capture.
+
+describe("config boundary normalisation (#803 review P1)", () => {
+  const savedKey = process.env.TORTOISE_API_KEY;
+
+  beforeEach(() => {
+    delete process.env.TORTOISE_API_KEY;
+  });
+  afterEach(() => {
+    if (savedKey === undefined) delete process.env.TORTOISE_API_KEY;
+    else process.env.TORTOISE_API_KEY = savedKey;
+  });
+
+  test("loadConfig coerces a non-string apiKey/apiUrl instead of throwing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tc-config-"));
+    const configPath = join(dir, "tortoise-config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({ autoCapture: true, cloud: true, apiKey: 12345, apiUrl: 67890 }),
+      "utf-8",
+    );
+    try {
+      const cfg = loadConfig({ configPath });
+      expect(cfg.autoCapture).toBe(true);
+      expect(cfg.cloud).toBe(true);
+      expect(cfg.apiKey).toBeUndefined();
+      expect(cfg.apiUrl).toBeUndefined();
+      expect(() => cloudConfig(cfg)).not.toThrow();
+      expect(cloudConfig(cfg).apiKey).toBe("");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a non-object JSON parse result is rejected", () => {
+    expect(normalizeConfig(123).autoCapture).toBe(false);
+    expect(normalizeConfig([]).autoCapture).toBe(false);
+    expect(normalizeConfig(null).autoCapture).toBe(false);
+    expect(normalizeConfig("nope").autoCapture).toBe(false);
+    expect(normalizeConfig(undefined).autoCapture).toBe(false);
+  });
+
+  test("registration with a non-string apiKey does not throw; local capture is kept", () => {
+    const home = mkdtempSync(join(tmpdir(), "tc-home-"));
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(home, ".pi", "agent", "tortoise-config.json"),
+      JSON.stringify({ autoCapture: true, apiKey: 12345 }),
+      "utf-8",
+    );
+    const savedHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const handlers: string[] = [];
+      const pi = { on: (name: string) => handlers.push(name) } as any;
+      expect(() => tortoiseCapture(pi)).not.toThrow();
+      expect(handlers).toContain("agent_end");
+    } finally {
+      process.env.HOME = savedHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

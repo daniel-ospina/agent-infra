@@ -5,8 +5,11 @@
 // and extracts decisions/claims.
 //
 // Honest reporting (issue #94 mandate): a success line is logged ONLY when
-// the hosted capture actually returns 2xx. If no API key is configured, or
-// the endpoint is unreachable/errors, an accurate warning is logged. Every
+// the hosted capture actually returns 2xx. The API key is a CREDENTIAL, not a
+// consent gate — required but never sufficient (#803): upload additionally needs
+// the explicit `cloud: true` opt-in and no repo/env deny
+// (extensions/shared/capture-gate.ts). If the gate denies, or the endpoint is
+// unreachable/errors, an accurate warning naming the reason is logged. Every
 // quit session is also appended to a local JSONL event log
 // (~/.tortoise/session-events/) BEFORE the network attempt — written
 // synchronously so a quit teardown mid-fetch can never lose data silently.

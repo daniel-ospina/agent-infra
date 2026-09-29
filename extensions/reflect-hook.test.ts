@@ -415,7 +415,10 @@ async function testShutdownUploadGate() {
   });
 
   await test("cloud:true + key → exactly one POST to /v1/sessions with the Bearer key", async () => {
+    // A resolvable (git) scope with no deny is required for the POST now that
+    // an unresolvable repo scope fails closed (#803 review cycle 1 P0).
     const dir = tmpProject("reflect-upload-on");
+    execSync("git init -q", { cwd: dir });
     const config = {
       apiUrl: "https://api.premiselabs.co",
       apiKey: "tt_x",

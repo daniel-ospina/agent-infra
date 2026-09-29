@@ -20,6 +20,10 @@
 //   3. `TORTOISE_CAPTURE_CLOUD=0|false|off|no` (or empty) forces capture OFF for
 //      a session. The env flag may tighten, never loosen: setting it to `1`
 //      with no config opt-in does NOT enable capture.
+//   4. Failure is never a skip. A transient git failure (3s timeout, git absent,
+//      corrupt `.git`), or an opt-out file that exists but cannot be read, DENIES
+//      rather than silently skipping the deny check — the same fail-closed rule
+//      that stops a key alone from enabling egress.
 //
 // Precedence note (deliberate): env still wins over the file for CREDENTIALS
 // (TORTOISE_API_KEY / TORTOISE_API_URL) — a credential is not a consent gate.
@@ -41,6 +45,7 @@ export type CaptureGateReason =
   | "cloud-not-enabled"
   | "no-api-key"
   | "repo-opt-out"
+  | "repo-root-unresolved"
   | "env-disabled";
 
 export interface CaptureGateResult {
@@ -58,50 +63,108 @@ export interface CaptureGateInput {
   env?: NodeJS.ProcessEnv;
 }
 
-const DISABLE_VALUES = new Set(["", "0", "false", "off", "no"]);
+/** The deny vocabulary shared by the env flag and the repo file. */
+const DISABLE_VALUES = new Set([
+  "",
+  "0",
+  "false",
+  "off",
+  "no",
+  "n",
+  "disable",
+  "disabled",
+  "never",
+]);
 
 // Per-process memoization: these git lookups are stable for a given path and the
 // default `isCloudEnabled(config)` path evaluates the gate repeatedly (once per
 // agent_end), so an uncached execSync made the gate cost a subprocess per call.
-const MAIN_ROOT_CACHE = new Map<string, string | null>();
+// ONLY successful resolutions are cached: memoizing a FAILURE is what let one
+// transient git error (timeout, git absent, corrupt `.git`) disable the repo
+// opt-out for the rest of the process — a fail-open (#803 review cycle 1 P0).
+const MAIN_ROOT_CACHE = new Map<string, string>();
 const PROJECT_ROOT_CACHE = new Map<string, string>();
 
 /**
- * Parent of the shared git dir — the MAIN checkout root. For a linked worktree
- * (`git worktree add`, including this repo's own `.worktrees/<branch>` layout)
- * `--show-toplevel` is the worktree path, so a repo-local deny file at the main
- * root would otherwise be bypassed. Returns null outside a git repo.
+ * The MAIN checkout root for a cwd, or null when it cannot be resolved (not a
+ * git repo, git missing, or git failed). For a linked worktree (`git worktree
+ * add`, including this repo's own `.worktrees/<branch>` layout) `--show-toplevel`
+ * is the worktree path, so a repo-local deny file at the main root would
+ * otherwise be bypassed. `dirname(--git-common-dir)` alone is NOT a checkout
+ * root: for `--separate-git-dir` it yields the PARENT of the worktree, and for a
+ * submodule it yields `.git/modules`. Resolve the current worktree explicitly —
+ * when the current git dir IS the shared dir we are in the MAIN worktree, so
+ * `--show-toplevel` is its root; only a linked worktree has a distinct git dir,
+ * and there the shared dir's parent is the main root.
  */
 export function resolveMainRepoRoot(cwd: string): string | null {
   const cached = MAIN_ROOT_CACHE.get(cwd);
   if (cached !== undefined) return cached;
-  let result: string | null = null;
-  try {
-    const common = execSync("git rev-parse --git-common-dir", {
-      encoding: "utf-8",
-      cwd,
-      timeout: 3000,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (common) {
-      result = dirname(common.startsWith("/") ? common : join(cwd, common));
-    }
-  } catch {
-    result = null;
-  }
-  MAIN_ROOT_CACHE.set(cwd, result);
-  return result;
+  const resolved = resolveMainRootUncached(cwd);
+  if (resolved !== null) MAIN_ROOT_CACHE.set(cwd, resolved);
+  return resolved;
 }
 
-function readOptOutFile(root: string): boolean {
+function resolveMainRootUncached(cwd: string): string | null {
   try {
-    const raw = JSON.parse(
-      readFileSync(join(root, PROJECT_CAPTURE_RELPATH), "utf-8"),
-    ) as { cloud?: unknown };
-    return raw?.cloud === false;
+    const raw = execSync(
+      "git rev-parse --path-format=absolute --git-dir --git-common-dir --show-toplevel",
+      {
+        encoding: "utf-8",
+        cwd,
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    ).trim();
+    const [gitDir, commonDir, topLevel] = raw.split("\n").map((l) => l.trim());
+    if (!gitDir || !commonDir || !topLevel) return null;
+    return gitDir === commonDir ? topLevel : dirname(commonDir);
   } catch {
-    return false;
+    // NOT memoized (see cache note); the gate treats an unresolvable scope as a
+    // deny rather than skipping the deny check.
+    return null;
   }
+}
+
+/**
+ * True when the given root carries a repo-scoped DENY. Only an explicit
+ * `{"cloud": false}` — or a value in the SAME deny vocabulary the env flag
+ * accepts, so a repo author can mirror it — denies. `cloud: true` is ignored (a
+ * repo can never grant itself egress, see policy note above). Malformed JSON is
+ * NOT a deny (documented, tested choice). A file that EXISTS but cannot be read
+ * (EACCES/ENOTDIR/EISDIR) IS a deny: silently skipping it lets an opt-out fail
+ * open. An unrecognised `cloud` value also denies, and warns.
+ */
+function readOptOutFile(root: string): boolean {
+  const file = join(root, PROJECT_CAPTURE_RELPATH);
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") return false; // absent is not a deny
+    console.warn(
+      `[capture-gate] repo opt-out ${file} exists but cannot be read (${code ?? String(err)}) — treating it as a DENY (fail closed)`,
+    );
+    return true;
+  }
+  let parsed: { cloud?: unknown } | null;
+  try {
+    parsed = JSON.parse(raw) as { cloud?: unknown } | null;
+  } catch {
+    return false; // malformed JSON is not a deny (documented choice)
+  }
+  const cloud = parsed?.cloud;
+  if (cloud === undefined || cloud === null) return false; // nothing declared
+  if (cloud === true) return false; // a repo can never grant itself egress
+  if (cloud === false) return true;
+  if (typeof cloud === "string" && DISABLE_VALUES.has(cloud.trim().toLowerCase())) {
+    return true; // same deny vocabulary as the env flag
+  }
+  console.warn(
+    `[capture-gate] repo opt-out ${file} has an unrecognised "cloud" value ${JSON.stringify(cloud)} — treating it as a DENY (fail closed)`,
+  );
+  return true;
 }
 
 /**
@@ -110,38 +173,59 @@ function readOptOutFile(root: string): boolean {
  * still resolve the repo root that owns `.pi/tortoise-capture.json`, otherwise
  * the repo opt-out is silently bypassed. stderr is discarded so a non-git cwd
  * does not print `fatal: not a git repository` at extension registration.
+ * A FAILURE (git absent/failed) is not cached, so a transient error does not
+ * pin the fallback for the rest of the process.
  */
 export function resolveProjectRoot(cwd: string): string {
   const cached = PROJECT_ROOT_CACHE.get(cwd);
   if (cached !== undefined) return cached;
-  let result = cwd;
+  let resolved: string | null = null;
   try {
-    result =
+    resolved =
       execSync("git rev-parse --show-toplevel", {
         encoding: "utf-8",
         cwd,
         timeout: 3000,
         stdio: ["ignore", "pipe", "ignore"],
-      }).trim() || cwd;
+      }).trim() || null;
   } catch {
-    result = cwd;
+    resolved = null;
   }
-  PROJECT_ROOT_CACHE.set(cwd, result);
-  return result;
+  if (resolved === null) return cwd; // not cached: a failure must be retryable
+  PROJECT_ROOT_CACHE.set(cwd, resolved);
+  return resolved;
+}
+
+/** The resolved repo scope for the gate, plus whether that scope is trustworthy. */
+export interface ProjectCaptureScope {
+  /** A deny was found, or the opt-out exists but could not be honoured. */
+  denied: boolean;
+  /** The git roots resolved, so "no deny found" is trustworthy. */
+  resolved: boolean;
 }
 
 /**
- * Read the repo-scoped opt-out. Only an explicit `{"cloud": false}` denies —
- * a missing/unreadable/malformed file is not a deny, and `cloud: true` in a repo
- * file is ignored (a repo cannot grant itself egress, see policy note above).
- * Checks BOTH the session root and the main checkout root, so a deny at
+ * Read the repo-scoped opt-out for a project dir. An omitted `projectDir`
+ * deliberately skips the repo check (`resolved: true`). `resolved: false` means
+ * the git scope could not be determined (git absent/failed, or not a git repo),
+ * so the gate fails closed instead of assuming "no deny". Checks BOTH the
+ * session root and the main checkout root, so a deny at
  * `<main>/.pi/tortoise-capture.json` still applies inside a linked worktree.
  */
-export function projectCaptureOptOut(projectDir?: string): boolean {
-  if (!projectDir) return false;
-  if (readOptOutFile(projectDir)) return true;
+export function resolveProjectCaptureScope(projectDir?: string): ProjectCaptureScope {
+  if (!projectDir) return { denied: false, resolved: true };
+  if (readOptOutFile(projectDir)) return { denied: true, resolved: true };
   const mainRoot = resolveMainRepoRoot(projectDir);
-  return mainRoot !== null && mainRoot !== projectDir && readOptOutFile(mainRoot);
+  if (mainRoot === null) return { denied: false, resolved: false };
+  if (mainRoot !== projectDir && readOptOutFile(mainRoot)) {
+    return { denied: true, resolved: true };
+  }
+  return { denied: false, resolved: true };
+}
+
+/** Boolean form of {@link resolveProjectCaptureScope}: was an opt-out honoured? */
+export function projectCaptureOptOut(projectDir?: string): boolean {
+  return resolveProjectCaptureScope(projectDir).denied;
 }
 
 /** True when the env flag explicitly turns capture OFF for this session. */
@@ -165,8 +249,14 @@ export function resolveCaptureGate(input: CaptureGateInput): CaptureGateResult {
   if (envCaptureDisabled(input.env)) {
     return { enabled: false, reason: "env-disabled" };
   }
-  if (projectCaptureOptOut(input.projectDir)) {
+  const scope = resolveProjectCaptureScope(input.projectDir);
+  if (scope.denied) {
     return { enabled: false, reason: "repo-opt-out" };
+  }
+  // Skipping the deny check because git failed is a fail-open: a transient git
+  // error must never turn a repo opt-out into an upload. Deny instead.
+  if (!scope.resolved) {
+    return { enabled: false, reason: "repo-root-unresolved" };
   }
   if (!input.apiKey || input.apiKey.trim().length === 0) {
     return { enabled: false, reason: "no-api-key" };
@@ -194,6 +284,8 @@ export function captureStatusLine(args: {
   switch (gate.reason) {
     case "repo-opt-out":
       return `[reflect-hook] capture OFF — repo opt-out${projectDir ? ` (${join(projectDir, PROJECT_CAPTURE_RELPATH)})` : ""}; ${local}`;
+    case "repo-root-unresolved":
+      return `[reflect-hook] capture OFF — could not resolve the repo root to check for a per-repo opt-out${projectDir ? ` (${projectDir})` : ""}; failing closed; ${local}`;
     case "env-disabled":
       return `[reflect-hook] capture OFF — ${CLOUD_ENV_FLAG} disables capture for this session; ${local}`;
     case "no-api-key":

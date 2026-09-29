@@ -10,7 +10,7 @@
  */
 
 import { ok, equal } from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, chmodSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +21,7 @@ import {
   projectCaptureOptOut,
   resolveCaptureGate,
   resolveMainRepoRoot,
+  resolveProjectCaptureScope,
   resolveProjectRoot,
 } from "./capture-gate.js";
 
@@ -96,6 +97,39 @@ try {
   writeFileSync(join(malformed, ".pi", "tortoise-capture.json"), "{not json", "utf-8");
   equal(projectCaptureOptOut(malformed), false, "malformed project file is not a deny (fail-open on deny)");
 
+  // Review cycle 1 P1: the repo file must accept the SAME deny vocabulary as the
+  // env flag (a repo author mirroring TORTOISE_CAPTURE_CLOUD=off used to be
+  // silently ignored), and an unrecognised value must fail closed.
+  for (const value of ["false", "off", "no", "n", "disable", "disabled", "never", "0", ""]) {
+    const dir = tmpProject("gate-vocab", { cloud: value });
+    equal(
+      projectCaptureOptOut(dir),
+      true,
+      `repo file {cloud: ${JSON.stringify(value)}} is a deny`,
+    );
+  }
+  const unrecognised = tmpProject("gate-unrecognised", { cloud: "banana" });
+  equal(
+    projectCaptureOptOut(unrecognised),
+    true,
+    "unrecognised repo cloud value fails closed",
+  );
+  equal(
+    resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: unrecognised, env: {} }).reason,
+    "repo-opt-out",
+    "unrecognised repo cloud value yields repo-opt-out",
+  );
+
+  // Review cycle 1 P1: a file that EXISTS but cannot be read must deny, not
+  // silently skip (ENOENT is the ONLY "absent"). `.pi` as a FILE forces ENOTDIR.
+  const unreadable = tmpProject("gate-unreadable");
+  writeFileSync(join(unreadable, ".pi"), "not a directory", "utf-8");
+  equal(
+    projectCaptureOptOut(unreadable),
+    true,
+    "opt-out path that cannot be read (ENOTDIR) denies (fail closed)",
+  );
+
   // ── Linked worktrees: a deny at the MAIN root still applies ──────────────
   // Regression (review cycle 2 P1): --show-toplevel returns the worktree path,
   // so a main-root deny was bypassed whenever pi ran from `.worktrees/<branch>`.
@@ -116,12 +150,111 @@ try {
     "worktree gate honors the main-root deny",
   );
 
+  // ── Review cycle 1 P0: a git FAILURE must (a) fail closed and (b) never be
+  // memoized — one transient error may not disable the repo opt-out until the
+  // process restarts.
+  {
+    const main2 = tmpProject("gate-fail-main", { cloud: false });
+    execSync("git init -q .", { cwd: main2 });
+    execSync("git -c user.email=t@t -c user.name=t commit --allow-empty -qm init", { cwd: main2 });
+    const wt2 = join(main2, ".worktrees", "branch");
+    execSync(`git worktree add --detach -q ${JSON.stringify(wt2)}`, { cwd: main2 });
+
+    const shimDir = mkdtempSync(join(tmpdir(), "gate-git-shim-"));
+    dirs.push(shimDir);
+    writeFileSync(join(shimDir, "git"), "#!/bin/sh\nexit 1\n", "utf-8");
+    chmodSync(join(shimDir, "git"), 0o755);
+
+    const realPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${realPath}`;
+    let brokenResolved = true;
+    let brokenReason = "enabled";
+    try {
+      brokenResolved = resolveProjectCaptureScope(resolveProjectRoot(wt2)).resolved;
+      brokenReason = resolveCaptureGate({
+        cloud: true,
+        apiKey: "tt_x",
+        projectDir: resolveProjectRoot(wt2),
+        env: {},
+      }).reason;
+    } finally {
+      process.env.PATH = realPath;
+    }
+    equal(brokenResolved, false, "git failure → the repo scope is not trustworthy");
+    equal(
+      brokenReason,
+      "repo-root-unresolved",
+      "git failure → the gate fails closed instead of silently enabling",
+    );
+
+    // The failure must NOT be memoized: once git recovers, the main-root deny applies.
+    const recoveredRoot = resolveProjectRoot(wt2);
+    equal(realpathSync(recoveredRoot), realpathSync(wt2), "worktree toplevel resolves after recovery");
+    equal(
+      resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: recoveredRoot, env: {} }).reason,
+      "repo-opt-out",
+      "after git recovers the main-root deny is honoured (failure was not memoized)",
+    );
+  }
+
+  // ── Review cycle 1 P2: non-standard git layouts must resolve the CHECKOUT
+  // root. `dirname(--git-common-dir)` alone is the PARENT of a
+  // --separate-git-dir worktree, and `.git/modules` for a submodule.
+  {
+    const base = mkdtempSync(join(tmpdir(), "gate-layouts-"));
+    dirs.push(base);
+
+    // --separate-git-dir: worktree at <base>/ws, git dir at <base>/gitdir
+    const ws = join(base, "ws");
+    mkdirSync(join(ws, ".pi"), { recursive: true });
+    writeFileSync(join(ws, ".pi", "tortoise-capture.json"), JSON.stringify({ cloud: false }), "utf-8");
+    const pkg = join(ws, "pkg");
+    mkdirSync(pkg, { recursive: true });
+    execSync(`git init -q --separate-git-dir=${JSON.stringify(join(base, "gitdir"))} .`, { cwd: ws });
+    equal(
+      resolveMainRepoRoot(pkg),
+      realpathSync(ws),
+      "--separate-git-dir: main root is the checkout, not the git-dir parent",
+    );
+    equal(
+      resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: resolveProjectRoot(pkg), env: {} }).reason,
+      "repo-opt-out",
+      "--separate-git-dir: the checkout's opt-out still applies from a subdir",
+    );
+
+    // submodule-shaped: worktree at <base>/super/sub, git dir at
+    // <base>/super/.git/modules/sub (exactly what `git submodule add` creates).
+    const superDir = join(base, "super");
+    mkdirSync(join(superDir, ".git", "modules"), { recursive: true });
+    execSync("git init -q .", { cwd: superDir });
+    const sub = join(superDir, "sub");
+    mkdirSync(join(sub, ".pi"), { recursive: true });
+    writeFileSync(join(sub, ".pi", "tortoise-capture.json"), JSON.stringify({ cloud: false }), "utf-8");
+    const subPkg = join(sub, "pkg");
+    mkdirSync(subPkg, { recursive: true });
+    execSync(
+      `git init -q --separate-git-dir=${JSON.stringify(join(superDir, ".git", "modules", "sub"))} .`,
+      { cwd: sub },
+    );
+    equal(
+      resolveMainRepoRoot(subPkg),
+      realpathSync(sub),
+      "submodule layout: main root is the submodule checkout, not .git/modules",
+    );
+    equal(
+      resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: resolveProjectRoot(subPkg), env: {} }).reason,
+      "repo-opt-out",
+      "submodule layout: the submodule's opt-out still applies from a subdir",
+    );
+  }
+
   // ── Env flag: may tighten, never loosen ──────────────────────────────────
-  for (const value of ["0", "false", "off", "no", "FALSE", ""]) {
+  for (const value of ["0", "false", "off", "no", "n", "disable", "disabled", "never", "FALSE", ""]) {
     equal(envCaptureDisabled({ [CLOUD_ENV_FLAG]: value }), true, `${CLOUD_ENV_FLAG}=${JSON.stringify(value)} disables`);
   }
   equal(envCaptureDisabled({}), false, "unset env flag does not disable");
   equal(envCaptureDisabled({ [CLOUD_ENV_FLAG]: "1" }), false, `=1 is an enable ATTEMPT, ignored`);
+  equal(envCaptureDisabled({ [CLOUD_ENV_FLAG]: "yes" }), false, `=yes is an enable ATTEMPT, ignored`);
   equal(
     resolveCaptureGate({ cloud: true, apiKey: "tt_x", env: { [CLOUD_ENV_FLAG]: "0" } }).reason,
     "env-disabled",
@@ -147,6 +280,7 @@ try {
     ["cloud-not-enabled", "explicit opt-in"],
     ["no-api-key", "no TORTOISE_API_KEY"],
     ["repo-opt-out", "tortoise-capture.json"],
+    ["repo-root-unresolved", "could not resolve"],
     ["env-disabled", CLOUD_ENV_FLAG],
   ] as const) {
     const line = captureStatusLine({
