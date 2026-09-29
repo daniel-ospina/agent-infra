@@ -95,6 +95,13 @@ try {
 } catch {
   /* a platform that refuses symlinks to `/` — the T28 row then pins the R1 refusal */
 }
+// #1100: a root whose vendored carrier sorts PAST the old 200-child probe window.
+// `readdirSync` had already enumerated every entry, so the cap saved no I/O — it
+// truncated the EVIDENCE, `zz-carrier` was never probed, and the walk was ALLOWed.
+const BIGFAN = join(FIX, "bigfan");
+mkdirSync(BIGFAN, { recursive: true });
+for (let i = 0; i < 250; i++) mkdirSync(join(BIGFAN, `d${String(i).padStart(3, "0")}`), { recursive: true });
+put(BIGFAN, "zz-carrier", "node_modules", "dep.js");
 
 // ── the threat table ───────────────────────────────────────────────────────
 // [name, command, expected, rule-or-null, cwd]
@@ -252,6 +259,30 @@ const ROWS = [
   // (cycle-2 D9). An absolute operand carries its own root and proceeds.
   ["T29 unattributable cd + relative operand", "cd $X && grep -rn p src/", "BLOCK", "cwd", SAFE],
   ["T29 control unattributable cd + absolute operand", `cd $X && grep -rn p ${HUB}/nonexistent`, "ALLOW", null, SAFE],
+  // T30 (#1097) — git GLOBAL OPTIONS must not hide the subcommand. The R4b test
+  // read the token IMMEDIATELY after `git`, so any global option put itself there
+  // and the whole --no-index/--untracked refusal was skipped (cycle-2 D11).
+  ["T30 git -C grep --no-index", "git -C . grep --no-index -n -e p", "BLOCK", "R4", HUB],
+  ["T30 git --no-pager grep --no-index", "git --no-pager grep --no-index -n -e p", "BLOCK", "R4", HUB],
+  ["T30 git -c k=v grep --untracked", "git -c core.pager=cat grep --untracked -n -e p", "BLOCK", "R4", HUB],
+  ["T30 control git -C grep (index)", "git -C . grep -n -e p -- '*.py'", "ALLOW", null, HUB],
+  ["T30 control git --no-pager status", "git --no-pager status", "ALLOW", null, HUB],
+  ["T30 control --exclude-standard", "git -C . grep --no-index --exclude-standard -n -e p", "ALLOW", null, HUB],
+  // T31 (#1099) — `pushd`/`popd` change the cwd for the FOLLOWING command exactly
+  // like `cd`. Unmodelled, the chain was attributed to the SESSION cwd while bash
+  // ran the search in the pushed directory (cycle-2 D12).
+  ["T31 pushd then implicit root", `pushd ${HUB} >/dev/null && grep -rn p`, "BLOCK", "cwd", SAFE],
+  ["T31 control cd twin", `cd ${HUB} && grep -rn p`, "BLOCK", "R2", SAFE],
+  ["T31 control pushd + absolute operand", `pushd ${SAFE} >/dev/null && grep -rn p ${SAFE}`, "ALLOW", null, SAFE],
+  // T32 (#1100) — a vendored carrier past the old 200-child probe window
+  ["T32 carrier past the child window", "grep -rn p .", "BLOCK", "R2", BIGFAN],
+  // T33 (#1098) — a `-path` prune that cannot match the directory itself buys no
+  // exemption: `*/node_modules/*` matches the CHILDREN, so nothing is pruned while
+  // the walk descends (cycle-2 D13). `-name` needs no such test.
+  ["T33 -path child glob", "find . -path '*/node_modules/*' -prune -o -name '*.ts' -print", "BLOCK", "R3", HUB],
+  ["T33 -path bare name", "find . -path node_modules -prune -o -name '*.ts' -print", "BLOCK", "R3", HUB],
+  ["T33 control -path dir form", "find . -path '*/node_modules' -prune -o -name '*.ts' -print", "ALLOW", null, HUB],
+  ["T33 control -name dir form", "find . -name node_modules -prune -o -name '*.ts' -print", "ALLOW", null, HUB],
   // Scope controls
   ["scope non-recursive grep", `grep -n MARKER ${HUB}/tracked.txt`, "ALLOW", null, HUB],
   ["scope non-recursive file operand", "grep -i x ~/Library/Logs/nonexistent-1069.log", "ALLOW", null, HUB],

@@ -68,9 +68,6 @@ const SYSTEM_PREFIXES = [
 /** R2/R3: the trees whose presence makes a walk expensive. */
 const VENDORED = ["node_modules", ".worktrees"];
 
-/** Bounded child scan so the hook stays O(1)-ish per command. */
-const MAX_CHILDREN = 200;
-
 const KILL_SWITCH = "SEARCH_GUARD_DISABLED";
 
 export interface SearchVerdict {
@@ -246,7 +243,14 @@ export function carriesVendoredTrees(root: string, warn: Warn = defaultWarn): bo
     for (const name of VENDORED) {
       if (existsSync(join(root, name))) return true;
     }
-    const entries = readdirSync(root, { withFileTypes: true }).slice(0, MAX_CHILDREN);
+    // #1100 — do NOT cap this scan. `readdirSync` has already read every entry,
+    // so the old `.slice(0, 200)` saved no I/O: it truncated the EVIDENCE. A root
+    // whose vendored carrier sorted past the window (a repo with >200 top-level
+    // directories — `extensions/` here is one of dozens) then probed "clean" and
+    // an unbounded recursive search over it was ALLOWed. The cost the cap avoided
+    // is one `existsSync` per child directory, per classified command — orders of
+    // magnitude below the 169 GB walk it was letting through.
+    const entries = readdirSync(root, { withFileTypes: true });
     for (const e of entries) {
       if (!e.isDirectory()) continue;
       for (const name of VENDORED) {
@@ -435,6 +439,34 @@ function isRecursiveGrep(flags: string[]): boolean {
   return false;
 }
 
+const VENDORED_NAME = /(node_modules|\.worktrees|\.git|\.\*|_\*)/;
+
+
+/**
+ * #1098 — does this `-path` predicate's value name the vendored DIRECTORY?
+ *
+ * A `-path` whose value matches the directory's CHILDREN (a trailing slash-star,
+ * as in the glob-name-star form) makes `-prune` fire on nothing while the walk
+ * descends the whole subtree — the pattern bought the exemption it was supposed
+ * to earn. `-name`/`-iname` need no such test: a name predicate matches the
+ * directory's own basename by construction.
+ *
+ * Accepted: a star- or dot-parent segment followed by the vendored name as the
+ * final segment (e.g. the glob-parent form, `./node_modules`) and absolute paths.
+ * Rejected: a bare `node_modules` (find reports `./node_modules`, so it matches
+ * nothing), and any value whose final segment is a glob or is not the name.
+ */
+function pathNamesDir(val: string): boolean {
+  const v = val.replace(/\/+$/, "");
+  const slash = v.lastIndexOf("/");
+  if (slash < 0) return false; // `node_modules` never matches `./node_modules`
+  const last = v.slice(slash + 1);
+  if (/[*?[\]]/.test(last)) return false; // a glob segment is not the name
+  if (!VENDORED_NAME.test(last)) return false;
+  const parent = v.slice(0, slash);
+  return parent === "*" || parent === "." || parent.startsWith("/") || /(^|\/)(\*|\.)$/.test(parent);
+}
+
 /**
  * R3p's guard test: the predicate IMMEDIATELY before `-prune` must name a
  * directory-blocking target — `-name X -prune` / `-path X -prune`, or a
@@ -447,8 +479,12 @@ function isRecursiveGrep(flags: string[]): boolean {
  * (`-name node_modules -print -o -name '*.ts' -prune`) is not a bound either.
  */
 function pruneGuardIsVendored(words: string[], i: number): boolean {
-  const VENDORED_NAME = /(node_modules|\.worktrees|\.git|\.\*|_\*)/;
   const isNameOp = (w: string) => /^-(i?name|i?path)$/.test(w);
+  const isPathOp = (w: string) => /^-(i?path)$/.test(w);
+  // A `-name`/`-iname` predicate always qualifies; a `-path`/`-ipath` one only
+  // when it can match the directory itself (#1098).
+  const gates = (op: string, val: string) =>
+    isNameOp(op) && VENDORED_NAME.test(val) && (!isPathOp(op) || pathNamesDir(val));
   if (words[i - 1] === ")") {
     // The group is the immediately-preceding atom: walking back to its matching
     // `(` is exact, and every `-name` inside that group genuinely gates the prune
@@ -460,7 +496,7 @@ function pruneGuardIsVendored(words: string[], i: number): boolean {
         depth--;
         if (depth === 0) {
           for (let k = j; k + 1 < i; k++) {
-            if (isNameOp(words[k]) && VENDORED_NAME.test(words[k + 1])) return true;
+            if (gates(words[k], words[k + 1])) return true;
           }
           return false;
         }
@@ -470,7 +506,7 @@ function pruneGuardIsVendored(words: string[], i: number): boolean {
   }
   const op = words[i - 2];
   const val = words[i - 1];
-  return Boolean(op !== undefined && val !== undefined && isNameOp(op) && VENDORED_NAME.test(val));
+  return Boolean(op !== undefined && val !== undefined && gates(op, val));
 }
 
 /** R3p: does this `find` carry a genuine bound? */
@@ -490,6 +526,36 @@ function findBound(args: Token[]): { bounded: boolean; maxdepth: boolean } {
 }
 
 const IGNORE_DEFEAT_LONG = /^--no-ignore/;
+
+/**
+ * The index of `git`'s SUBCOMMAND in a tokenized segment, or null when the
+ * segment ends inside the global-option run.
+ *
+ * #1097: the R4b test used to read `seg[head + 1]` — the token IMMEDIATELY after
+ * `git` — so any git GLOBAL OPTION put the option there instead and the whole
+ * `--no-index`/`--untracked` refusal was skipped. `git -C . grep --no-index`,
+ * `git --no-pager grep --no-index` and `git -c core.pager=cat grep --untracked`
+ * re-walked ignore-blind while the bare `git grep --no-index` was refused. Git's
+ * global options come BEFORE the subcommand, so skip them (consuming each
+ * value word) and test the token that actually names the verb.
+ */
+function gitSubcommand(seg: Token[], from: number): number | null {
+  // Global options that take a SEPARATE value word. The `=`-spelled forms
+  // (`--git-dir=/x`) are a single token and need no entry here.
+  const VALUE_OPTS = new Set([
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env",
+  ]);
+  let i = from;
+  while (i < seg.length) {
+    const { value } = seg[i];
+    if (value === "--") { i++; break; }
+    if (!value.startsWith("-")) break; // the subcommand itself
+    // Attached-value spellings (`-C/path`, `-ckey=val`) are one token.
+    if (/^-[Cc]./.test(value)) { i++; continue; }
+    i += VALUE_OPTS.has(value) ? 2 : 1;
+  }
+  return i < seg.length ? i : null;
+}
 
 /** R4: ignore-defeat flags. */
 function ignoreDefeat(toks: Token[], from: number, binary: string): string | null {
@@ -561,7 +627,18 @@ export function classifySearchCommand(
 
   const chain = parseCdChains(command);
   let cwd = execCwd;
-  const cwdUnattributable = chain.unattributable;
+  // #1099 — `pushd`/`popd` change the cwd for the FOLLOWING commands exactly
+  // like `cd`, but the shared parser models only `cd` (it is consumed by
+  // review-enforcer too, so widening `cd` detection there is a bigger blast
+  // radius than this guard needs). Left unmodelled, the chain is attributed to
+  // the SESSION cwd while bash runs the search elsewhere: `pushd <hub> &&
+  // grep -rn p` was ALLOWed where its `cd` twin was blocked on a 169 GB hub. A
+  // directory-stack token makes the chain UNATTRIBUTABLE rather than WRONG —
+  // cwd-dependent operands then fail closed, while an absolute operand is still
+  // attested and proceeds.
+  const cwdUnattributable =
+    chain.unattributable ||
+    tokenize(command).some((t) => t.value === "pushd" || t.value === "popd");
   if (chain.last) cwd = chain.last;
 
   for (const raw of splitSegments(command)) {
@@ -578,8 +655,9 @@ export function classifySearchCommand(
     // `git` is not a walker binary, so after it the branch was dead code and
     // `git grep --no-index` strolled past (caught by the cycle-2 probe).
     if (binary === "git") {
-      if (seg[head + 1]?.value === "grep") {
-        const gwords = seg.slice(head + 2).map((t) => t.value);
+      const sub = gitSubcommand(seg, head + 1);
+      if (sub !== null && seg[sub].value === "grep") {
+        const gwords = seg.slice(sub + 1).map((t) => t.value);
         const defeat = gwords.find((w) => w === "--no-index" || w === "--untracked");
         if (defeat && !gwords.includes("--exclude-standard")) {
           return { block: true, reason: ignoreDefeatReason("git grep", defeat) };
