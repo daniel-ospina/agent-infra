@@ -803,6 +803,16 @@ test("interactiveHopTarget: latched root → first available leg; clear/terminal
       provider: "openrouter",
       model: "deepseek/deepseek-v4.1-flash",
     });
+    // #1508: the INTERACTIVE path is the second consumer that was
+    // credential-blind. Without the set, the assertion above hops to
+    // openrouter; with openrouter reported unkeyed, it must not.
+    const hop = interactiveHopTarget(
+      { provider: "deepseek", model: "deepseek-v4-flash" },
+      readLatchState(env),
+      env,
+      new Set(["openrouter"]),
+    );
+    ok(hop == null || hop.provider !== "openrouter", `no unkeyed interactive hop (got ${JSON.stringify(hop)})`);
     // #715 migration window: the CANONICAL-spelling session leg hops identically
     // (an un-migrated legacy session and a canonical one share the chain).
     deepEqual(interactiveHopTarget({ provider: "deepseek", model: "deepseek-flash" }, readLatchState(env), env), {

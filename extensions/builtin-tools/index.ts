@@ -68,6 +68,7 @@ import {
   latchTtlMs,
   blockedProviders,
   legIsFamilyMember,
+  dispatchUnkeyedSet,
   appendLedger,
   scanStderrForExhaustion,
 } from "../shared/provider-failover.js";
@@ -676,7 +677,7 @@ export function haltDispatchResult(input: {
   const detail =
     input.reason === "blocked"
       ? "TASK_EXHAUSTION_BLOCK=1 is set — a dispatch that would hop to another leg is blocked (fail-fast)."
-      : `All failover legs for alias family "${input.family}" are exhausted or auth-blocked.`;
+      : `All failover legs for alias family "${input.family}" are exhausted, auth-blocked, or have no configured credential.`;
   const blockedNote = blockedIds.length ? ` Durable auth-blocked providers: ${blockedIds.join(", ")}.` : "";
   const attemptedNote = input.attempted
     ? `The dispatch ran on ${input.provider}/${input.model} and exhausted it before the halt decision.`
@@ -714,17 +715,21 @@ export interface DispatchLegOutcome {
   family: string | undefined;
 }
 
+/** The registry surface this fix needs is `AuthStatusLookup` from the shared
+ * module; `dispatchUnkeyedSet` lives there too, because the interactive consumer
+ * (provider-exhaustion.ts) needs the same family-to-legs mapping and a second
+ * copy would be a place to drift. */
 export function resolveDispatchLeg(
   requested: LegRef,
   state: LatchState,
-  opts: { env?: Record<string, string | undefined>; now?: number } = {},
+  opts: { env?: Record<string, string | undefined>; now?: number; unkeyed?: ReadonlySet<string> } = {},
 ): DispatchLegOutcome {
   const env = opts.env ?? process.env;
   const family = familyOf(requested.model, requested.provider);
   if (!family || failoverDisabled(env)) {
     return { leg: requested, halted: false, hop: null, family };
   }
-  const outcome = resolveWithChain(family, requested, state, { env, now: opts.now });
+  const outcome = resolveWithChain(family, requested, state, { env, now: opts.now, unkeyed: opts.unkeyed });
   if (outcome.halted) {
     const reason = env.TASK_EXHAUSTION_BLOCK === "1" ? "blocked" : "halt";
     return { leg: requested, halted: true, haltReason: reason, hop: null, family };
@@ -976,6 +981,9 @@ export interface PostDispatchInput {
   /** Marker attached by spawnSubAgent (nonce-validated at capture). */
   marker: ExhaustionMarker | null;
   env?: Record<string, string | undefined>;
+  /** Providers with no usable credential, computed at the ctx scope. Injected
+   * for the same reason `env` is: this path has no ctx. */
+  unkeyed?: ReadonlySet<string>;
 }
 
 export interface PostDispatchDecision {
@@ -1027,6 +1035,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
         reason: marker.reason === "402" ? "402" : "low_balance",
         source: "marker",
         env,
+        unkeyed: input.unkeyed,
       });
       const landed = isLatched(marker.provider || dispatched.provider, readLatchState(env), { env });
       return {
@@ -1054,6 +1063,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
       family,
       fromLeg: dispatched,
       env,
+      unkeyed: input.unkeyed,
     });
     // DURABILITY VERIFICATION (deep-review finding): setExhausted returns the
     // durable state read back after its CAS loop — when every write attempt
@@ -1114,7 +1124,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
         },
       };
     }
-    const outcome = resolveWithChain(family, dispatched, latchedState, { env });
+    const outcome = resolveWithChain(family, dispatched, latchedState, { env, unkeyed: input.unkeyed });
     if (outcome.halted) {
       return { action: "halt", nextLeg: null, annotations: { failoverLatched: true, failoverMarker: marker.hop } };
     }
@@ -1175,7 +1185,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
     if (!legIsFamilyMember(family, dispatched.provider)) {
       const famLegs = familyLegs(family);
       const defaultLeg = famLegs?.[0];
-      const step = nextLegAfter(family, dispatched, readLatchState(env), { env });
+      const step = nextLegAfter(family, dispatched, readLatchState(env), { env, unkeyed: input.unkeyed });
       // nextLegAfter from a NON-table position walks legs[0..] (findIndex -1
       // → first available). Accept ONLY when the first available leg IS the
       // family default (deepseek official) — a deeper first-available leg
@@ -1228,7 +1238,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
       };
     }
     const open = recordLegStrike(dispatched);
-    const step = nextLegAfter(family, dispatched, readLatchState(env), { env });
+    const step = nextLegAfter(family, dispatched, readLatchState(env), { env, unkeyed: input.unkeyed });
     if (!step.halted && step.leg) {
       return {
         action: "advance",
@@ -1295,6 +1305,9 @@ export async function runFailoverDecisionLoop(input: {
   result: FailoverSpawnResult | undefined;
   spawn: (leg: LegRef) => Promise<FailoverSpawnResult | undefined>;
   env?: Record<string, string | undefined>;
+  /** Providers with no usable credential, computed at the ctx scope (this loop
+   * itself has no ctx). Injected for the same reason `env` is. */
+  unkeyed?: ReadonlySet<string>;
   onHop?: (leg: LegRef, hopCount: number, annotations: Record<string, unknown>) => void;
 }): Promise<FailoverLoopResult> {
   const env = input.env ?? process.env;
@@ -1324,6 +1337,7 @@ export async function runFailoverDecisionLoop(input: {
       sawToolsUnknown: inner?.details?.sawToolsUnknown === true,
       marker: ((inner?.details?.exhaustionMarker as ExhaustionMarker | undefined) ?? null),
       env,
+      unkeyed: input.unkeyed,
     });
   };
   const halted = (): FailoverLoopResult["halted"] => ({
@@ -1502,6 +1516,15 @@ export function scanStderrForUsage(
 //                       this clause degenerated into a bare 20-min silence
 //                       timeout for bash). Silence AFTER real output is still
 //                       killed at 20 min (R-B5).
+//                       ⚠️ #5389 — SILENCE IS NECESSARY, NOT SUFFICIENT.
+//                       Silence alone reads ABSENCE OF OUTPUT as ABSENCE OF
+//                       WORK: it cut a tool that had streamed and then gone
+//                       quiet while still BURNING CPU (measured 1203 s against
+//                       this 1200 s bound with `toolCpuAdvanced=true` and 154
+//                       CPU-seconds burned — tortoise #5387). The bound now
+//                       requires BOTH conditions: this silence AND positive
+//                       no-progress evidence from the child's CPU channel
+//                       (`inFlightProgress === "no-progress"`). See the clause.
 //   tool-dead ......... in-flight tool with NO OUTPUT and NO CPU —
 //                       #928. The complement of tool-silence, and the only
 //                       bound that reaches a tool the silence detector is
@@ -1859,7 +1882,9 @@ export function getCutGapMs(): number {
  * other direction is the #363/#489 kill-productive-agents class.
  *
  * `TASK_CPU_STALL_MS=0` DISABLES the clause — an explicit off switch for a new
- * kill path. The test is the VALUE being zero, not the exact spelling `"0"`:
+ * kill path — and since #5389 it stands BOTH in-flight tool clauses down, because
+ * `tool-silence` now requires positive no-progress evidence from this channel.
+ * The test is the VALUE being zero, not the exact spelling `"0"`:
  * `"0"`, `"0.0"`, `"+0"`, `" 0 "` all disable, because an operator who wrote
  * any of those meant to switch it off and silently arming it anyway is a
  * surprise with no upside. What is NOT an off switch is a BLANK value: a
@@ -2601,6 +2626,14 @@ export interface HeartbeatKillDecision {
    * matters here because the `networkDown` early return can suppress the kill
    * for hours, so the first firing may be far past the bound. */
   progressAgeMs?: number;
+  /** #5389: the OBSERVED `toolCpuStallMs` at the moment the in-flight clause
+   * fired. Snapshotted for the same reason `progressAgeMs` is: the kill path
+   * `await`s the network probe between the decision and the headline, and a
+   * `tool_end`/`tool_start` marker ingested inside that window resets the live
+   * `hbCtx.state.toolCpuStallMs` to 0 — so a headline re-reading live state can
+   * render "consumed no CPU for 0s" beside "no progress on either channel" and
+   * contradict itself in the operator's post-mortem. */
+  toolCpuStallMs?: number;
   /** Kill resolves `undefined` (retryable) instead of a defined result —
    * true iff the kill fired and no REAL output ever arrived (#5926 retry
    * preservation). */
@@ -2660,6 +2693,88 @@ export interface HeartbeatDecisionInput {
    * (dead child) or a reachable network fail open to the legacy decision. */
   networkDown?: boolean;
 
+}
+
+/**
+ * #5389 — the in-flight tool's PROGRESS verdict: the ONE tri-state the two
+ * in-flight tool bounds consult, and the single place "is this child still
+ * working?" is answered.
+ *
+ * THE DEFECT THIS REMOVES. The harness read ABSENCE OF OUTPUT as ABSENCE OF
+ * WORK. Two consequences, both measured: (1) a tool that had streamed and then
+ * gone quiet while still burning CPU was cut at the silence bound — the
+ * `tool-silence` clause fired at 1203 s against a 1200 s bound with
+ * `toolCpuAdvanced=true` and 154 CPU-seconds burned (tortoise #5387) — because
+ * that clause never consulted the CPU channel the child already reports; and
+ * (2) when a child genuinely stopped there was no progress term to fire on, so
+ * the parent waited out the age backstop (tortoise #5389, #3404).
+ *
+ * THREE STATES, and the direction of each is deliberate:
+ *
+ *  · `"progressing"` — the in-flight tool's process subtree has DEMONSTRATED
+ *    CPU work in this round and is still advancing (flat for at most
+ *    `cpuStallMs`). POSITIVE progress evidence: it VETOES every in-flight cut.
+ *    This is the SPARE-signal direction the #5389 research found every mature
+ *    implementation taking (CPU incrementing protects, it never convicts), and
+ *    the same reason `docs/ops/fleet-liveness.md` §5 item 1 keeps `task`
+ *    outside `CPU_LIVENESS_TOOL_NAMES`.
+ *  · `"no-progress"` — demonstrated CPU work, then flat past `cpuStallMs`. The
+ *    ONLY state that may license an in-flight cut: the tool proved it works and
+ *    then stopped. This is #928's shape, kept verbatim and now shared instead of
+ *    re-derived per clause.
+ *  · `"unknown"` — NO evidence either way, and it BLOCKS: a bound may not fire
+ *    on a channel that cannot be read. This is `extensions/task-heartbeat.ts`'s
+ *    own rule for this channel ("Absence of evidence must never arm a kill; a
+ *    parent that cannot prove a tool is dead must fall back to its existing
+ *    bounds"), and `tools/fleet/liveness.py` states the same one for its
+ *    vetoes ("absence of evidence must never arm an escalation").
+ *
+ *    THE POPULATION IS NAMED EXACTLY, because it is larger than "the probe
+ *    failed" and every part of it falls back:
+ *      (a) a tool kind outside `CPU_LIVENESS_TOOL_NAMES` (only `bash` is in it);
+ *      (b) a `ps` probe that failed, or a sample the child refused as
+ *          unattributable (a second tool in flight, a foreign detached group);
+ *      (c) `TASK_CPU_STALL_MS=0`;
+ *      (d) a round in which no CPU INCREASE was ever observed between two
+ *          consecutive ticks. That includes an I/O-bound tool that never burned
+ *          CPU at all — and, deliberately, a tool whose CPU work completed
+ *          BEFORE the first sample tick, since `stepCpuLiveness`'s baseline
+ *          branch starts the clock without arming the latch. A child older than
+ *          the field also lands here.
+ *
+ * THE COST OF `"unknown"`, stated rather than hidden and MEASURED: both
+ * in-flight tool bounds stand down, and such a tool is bounded instead by the
+ * `tool-stall` AGE backstop (`TASK_TOOL_STALL_MS`, 4 h at the 6 h cap), or by
+ * `TASK_MAX_DISPATCH_MS` where an operator set one. That is a LATENCY cost on a
+ * fail-safe path, never an unbounded wait. Measured over the parent session
+ * corpus: of in-flight settles that carry the CPU channel at all, ~49% read
+ * `"progressing"` and ~51% `"unknown"` — this is the LARGER half of the
+ * population, which is why the age backstop is load-bearing rather than a
+ * formality.
+ */
+export type InFlightProgress = "progressing" | "no-progress" | "unknown";
+
+export function inFlightProgress(
+  st: Pick<HeartbeatState, "toolCpuStallMs" | "toolCpuAdvanced">,
+  cpuStallMs: number,
+): InFlightProgress {
+  // `toolCpuAdvanced` is read FIRST, and the property that matters is which test
+  // does NOT exist: an "absent measurement" must never be decided by a
+  // `toolCpuStallMs <= 0` test placed before the latch. The child's not-probed
+  // sentinel is `cpu_stall_ms=0` AND `cpu_advanced=0` — every unmeasurable branch
+  // routes through `clearCpuEvidence`, which clears the demonstrated-work latch.
+  // But a PROBED tool that advanced on this very tick ALSO reports
+  // `cpu_stall_ms=0`: `stepCpuLiveness` stamps `lastAdvanceAt = now` on a strict
+  // increase, so `now - lastAdvanceAt === 0`. A sentinel test ahead of the latch
+  // would file the STRONGEST progress evidence there is (`advanced`, just moved)
+  // under "unknown" — measured live: a real `tool-silence` cut whose Alive state
+  // read `toolCpuMs=135910 toolCpuStallMs=0 toolCpuAdvanced=true`. So the latch
+  // decides: no demonstrated CPU work in this round ⇒ unknown.
+  if (!st.toolCpuAdvanced) return "unknown";
+  // The CPU bound is disabled (`TASK_CPU_STALL_MS=0`): an operator who switched
+  // the channel off has not thereby authorised a cut on it.
+  if (cpuStallMs <= 0) return "unknown";
+  return st.toolCpuStallMs > cpuStallMs ? "no-progress" : "progressing";
 }
 
 /**
@@ -2822,8 +2937,36 @@ export function heartbeatKillDecision(
   //    tool that has DEMONSTRATED it streams RENDERABLE output and then
   //    stopped, so silence is
   //    evidence of a wedge rather than of a quiet-but-working tool.
-  if (stateFresh && st.toolsInFlight > 0 && st.toolUpdates && effStreamAge > i.streamStallMs) {
-    return kill("tool-silence");
+  //    #5389 — SILENCE IS NECESSARY, NOT SUFFICIENT. This clause used to fire
+  //    on output silence ALONE, which reads ABSENCE OF OUTPUT as ABSENCE OF
+  //    WORK: a tool that had streamed and then gone quiet while still burning
+  //    CPU was cut at S — measured, 1203 s against a 1200 s bound with
+  //    `toolCpuAdvanced=true` and 154 CPU-seconds burned (tortoise #5387). The
+  //    CPU channel the child already reports was parsed here and never
+  //    consulted. The bound now requires BOTH conditions: output silence past S
+  //    AND positive no-progress evidence (`inFlightProgress === "no-progress"`).
+  //    `"progressing"` SUPPRESSES the cut, and `"unknown"` BLOCKS it. The
+  //    residual is disclosed, not hidden: an `"unknown"` tool is bounded by the
+  //    `tool-stall` AGE backstop below (`TASK_TOOL_STALL_MS`, 4 h at the 6 h
+  //    cap), or by `TASK_MAX_DISPATCH_MS` where one is set — a SLOWER bound,
+  //    never an unbounded wait — and that population is larger than "the probe
+  //    failed" (see `inFlightProgress` for the exact list: an ineligible tool
+  //    kind, a failed/unattributable sample, `TASK_CPU_STALL_MS=0`, or a round
+  //    whose CPU never increased, which includes a tool whose CPU work finished
+  //    before the first sample tick).
+  //    At the shipped defaults C (30 min) EXCEEDS S (20 min), so for the
+  //    `"no-progress"` case it is C that binds: `tool-silence` fires at
+  //    max(S, C) = 30 min rather than at S alone. That is the deliberate cost of
+  //    requiring BOTH conditions, and the #5389 tests pin it.
+  const progress = inFlightProgress(st, i.cpuStallMs);
+  if (
+    stateFresh &&
+    st.toolsInFlight > 0 &&
+    st.toolUpdates &&
+    effStreamAge > i.streamStallMs &&
+    progress === "no-progress"
+  ) {
+    return { ...kill("tool-silence"), toolCpuStallMs: st.toolCpuStallMs };
   }
 
   // 1b. tool-dead — #928. The COMPLEMENT of clause 1, and the only bound that
@@ -2898,16 +3041,23 @@ export function heartbeatKillDecision(
   //     The kill resolves as a partial result and is reported to the model
   //     with its own headline naming the CPU evidence — a silent bound would
   //     be only a shorter timeout, not a diagnostic the model can act on.
+  //
+  //     #5389: the clause's four CPU conditions are now the SHARED predicate
+  //     (`progress === "no-progress"`) rather than a second, hand-written copy
+  //     of the same rule. One definition, so the two in-flight bounds cannot
+  //     drift apart about what "no progress" means — and the `TASK_CPU_STALL_MS=0`
+  //     disable valve, the never-demonstrated-CPU bar and the not-probed
+  //     sentinel are all preserved inside it (each maps to `"unknown"`, which
+  //     blocks). This clause is still the strict complement of clause 1: it
+  //     owns `tool_updates=0`, clause 1 owns `tool_updates=1`.
   if (
     stateFresh &&
     st.toolsInFlight > 0 &&
     !st.toolUpdates &&
-    i.cpuStallMs > 0 &&
-    st.toolCpuAdvanced &&
-    st.toolCpuStallMs > i.cpuStallMs &&
+    progress === "no-progress" &&
     effToolAge > i.streamStallMs
   ) {
-    return kill("tool-dead");
+    return { ...kill("tool-dead"), toolCpuStallMs: st.toolCpuStallMs };
   }
 
   // 2. tool-stall — AGE BACKSTOP, demoted from primary detector. It now owns
@@ -4013,11 +4163,25 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // contradicts the `effStreamAgeMs` in the payload beside it.
       const effStreamAgeMs = hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0);
       const effToolAgeMs = hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0);
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+      // #5389 review P2: the CPU pair below is read LIVE, after the network probe
+      // was awaited — so a marker ingested in that window resets it to 0/false
+      // and the summary can contradict the headline it ships beside. The two are
+      // therefore labelled apart, exactly as `streamAgeMs`/`effStreamAgeMs` above
+      // already are: `toolCpuStallMs` is the live sample, `decToolCpuStallMs` is
+      // the value the DECISION actually used.
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s) — treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "tool-dead": `⚠️ Sub-agent's in-flight tool has produced no output for ${Math.round(effStreamAgeMs / 1000)}s AND consumed no CPU for ${Math.round(hbCtx.state.toolCpuStallMs / 1000)}s (bound ${Math.round(hbThresholds.cpuStallMs / 1000)}s) — no progress on either channel; a deadlock and a long I/O block are indistinguishable here. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        // #5389 — the headline names the evidence on BOTH channels, because the
+        // cut now REQUIRES no progress on each of them. It still states the
+        // evidence rather than a cause: a deadlock and a long I/O block are
+        // indistinguishable here, which is the discipline the `tool-dead`
+        // headline beside it already keeps. The CPU number is the DECISION's
+        // snapshot, not live state — the network probe is awaited between the
+        // two, and a marker ingested in that window would reset the live value
+        // to 0 and make the headline contradict itself.
+        "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(effStreamAgeMs / 1000)}s AND consumed no CPU for ${Math.round((decision.toolCpuStallMs ?? hbCtx.state.toolCpuStallMs) / 1000)}s (bounds ${Math.round(hbThresholds.streamStallMs / 1000)}s / ${Math.round(hbThresholds.cpuStallMs / 1000)}s) — no progress on either channel; treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "tool-dead": `⚠️ Sub-agent's in-flight tool has produced no output for ${Math.round(effStreamAgeMs / 1000)}s AND consumed no CPU for ${Math.round((decision.toolCpuStallMs ?? hbCtx.state.toolCpuStallMs) / 1000)}s (bound ${Math.round(hbThresholds.cpuStallMs / 1000)}s) — no progress on either channel; a deadlock and a long I/O block are indistinguishable here. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(effToolAgeMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
@@ -4161,11 +4325,88 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
   });
 }
 
+/** The task-tool result `details` shapes this hook reads. Declared structurally
+ * and locally: the tool composes several shapes (an inner-spawn payload, a
+ * tool-level refusal, a failover annotation) and the framework types `details`
+ * loosely, so without this the reads below are unchecked property accesses on an
+ * unrelated type. */
+type TaskResultDetails = {
+  exitCode?: unknown;
+  status?: unknown;
+  fallbackStatus?: unknown;
+  isError?: unknown;
+  killed?: unknown;
+  failoverHalt?: unknown;
+  failoverHopSpawnFailed?: unknown;
+};
+
+/** The task tool's own terminal-failure `status` vocabulary. Enumerated rather
+ * than "anything not ok", so an unrecognised status stays a non-error and a
+ * future success status cannot become a false failure.
+ *
+ * Keep in sync with the producers in this file, which set `status` (or
+ * `fallbackStatus`, for the #152 fallback leg's own status): the `invalid-cwd`
+ * refusal in the spawn path, the two `invalid-session-id` refusals, the
+ * `circuit_open` breaker result, the `failed` retry-exhaustion result, and the
+ * fallback copy. Cited by label rather than by line on purpose: this same file
+ * shifts whenever the dispatch path changes, and a stale number sends a
+ * maintainer to the wrong construct. Guarded by builtin-tools.test.ts, which
+ * exercises every member through the registered hook and pins that an unknown
+ * status stays a success. */
+const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id"]);
+
 export default function (pi: ExtensionAPI) {
   register("builtin-tools");
 
   // Restore TODO state from session
   restoreTodos(pi);
+
+  // ── #1508: a FAILED child must not be handed back as a clean result ────────
+  //
+  // The incident: a dispatched child exited 1 and the caller received
+  // `isError: false` with `details {model, provider, exitCode: 1}` — a failed
+  // failover indistinguishable from a clean verdict.
+  //
+  // Why a hook and not a return value: `executePreparedToolCall` sets
+  // `isError: false` UNCONDITIONALLY when `execute()` resolves
+  // (pi-agent-core/agent-loop.js:477) and `true` only when it throws (:481-486),
+  // and `finalizeExecutedToolCall` rebuilds the result from a field allow-list
+  // (:507-510) — so an `isError` field on the returned object is silently
+  // DROPPED. Throwing instead would flip it but destroys `details`
+  // (`createErrorToolResult` → `details: {}`, :526-531) — and `details` IS the
+  // failure composition. A `tool_result` handler is the only route that both
+  // flips the flag and preserves the composition (agent-session.js:269 honours
+  // `hookResult?.isError`).
+  pi.on("tool_result", (event) => {
+    const e = event as { toolName?: string; isError?: boolean; details?: TaskResultDetails };
+    if (e.toolName !== "task" || e.isError) return;
+    const d = e.details;
+    // A failed dispatch may carry any of these markers. TWO layers produce them:
+    //  * the TASK TOOL's own terminal failures are a `status` — a refusal
+    //    (invalid-cwd / invalid-session-id), an open circuit breaker, or an
+    //    exhausted retry loop. `"failed"` is the one that matters most, because a
+    //    watchdog kill with NO output resolves `undefined`, goes through
+    //    `retry()`, and arrives here as `status:"failed"` — reaching the caller
+    //    with NEITHER an inner-spawn marker NOR an exit code;
+    //  * the INNER SPAWN adds a nonzero exit code, `isError` (spawn error — pi
+    //    never started, so there is no exit status), `killed` (a watchdog cut,
+    //    whose recorded exitCode is 0 or null), or the failover annotations.
+    // An `exitCode` of 0-or-null with NONE of the others is the only settle that
+    // may read as success.
+    const failed =
+      (typeof d?.exitCode === "number" && d.exitCode !== 0) ||
+      (typeof d?.status === "string" && FAILED_TASK_STATUS.has(d.status)) ||
+      // The #152 fallback chain writes the FALLBACK leg's status here rather than
+      // `status`, so a dispatch whose fallback also failed carries `failed` /
+      // `circuit_open` under this key alone.
+      (typeof d?.fallbackStatus === "string" && FAILED_TASK_STATUS.has(d.fallbackStatus)) ||
+      d?.isError === true ||
+      d?.killed === true ||
+      d?.failoverHalt === true ||
+      d?.failoverHopSpawnFailed === true;
+    if (!failed) return;
+    return { isError: true };
+  });
 
   // ═══════════════════════════════════════════════════════════════
   // web_search — Perplexity web search
@@ -4713,6 +4954,7 @@ export default function (pi: ExtensionAPI) {
       const failoverResolution = familyOf(model, provider)
         ? resolveDispatchLeg({ provider, model }, readLatchState(subAgentEnv), {
             env: subAgentEnv,
+            unkeyed: dispatchUnkeyedSet(ctx?.modelRegistry, familyOf(model, provider)),
           })
         : { leg: { provider, model }, halted: false, hop: null, family: undefined };
       if (failoverResolution.halted) {
@@ -4869,6 +5111,7 @@ export default function (pi: ExtensionAPI) {
         dispatchLeg,
         result,
         env: subAgentEnv,
+        unkeyed: dispatchUnkeyedSet(ctx?.modelRegistry, family),
         spawn: async (leg) => {
           const legResult = await retry((attempt) => spawnLeg(leg, attempt), retryOptions);
           return legResult;

@@ -157,6 +157,36 @@ Every review cycle MUST re-review in a FRESH context — via `task` where the sk
 - The model defends prior decisions rather than critically re-evaluating
 - `task` spawns `pi -p` in a new process with no session memory — the closest available proxy for an independent reviewer
 
+#### Finding Verification — a review finding is a CLAIM, not a fact
+
+**Before applying ANY review finding, verify it against the primary source it cites.** Open the line
+range, the frozen file, the `gh` output, the commit. The reviewer's prose is not the source; the source
+is. **A finding that cites nothing is not applicable** — report it back as `unverifiable` and do not
+apply it. This applies to every consumer of a finding: the fixer loop, a plan's disposition table, a
+scoping comment, an artifact correction.
+
+- **A `⚠️ CORRECTED` marker is NOT evidence.** It records that the text *changed* — never that the
+  change was *right*. That is what makes it dangerous: it asserts "the previous text was wrong", so a
+  reader who trusts the marker is actively steered to the falsehood, and the replaced text was the
+  correct one.
+- **"Also present elsewhere" is not "absent here".** A value that appears in both `H3` and `H4` has
+  not been shown to belong to `H4` alone.
+- **A disposition is not done until it is verified.** "All 6 corrected" is a claim about process with
+  no artifact behind it — check the artifact, or delete the claim rather than reword it.
+- **When a finding is falsified, correct the review record in place** — mark it `⛔ DO NOT APPLY`
+  where it lives, so the next lane cannot re-apply it to an artifact that has already been fixed.
+
+**Why this is a gate, not advice.** A missed finding leaves the artifact as it was. A **false
+correction changes it, and marks the change as an improvement** — and the review document is the
+record other lanes read, so the error propagates to artifacts that were already correct. The measured
+cost: five false corrections applied verbatim in one review cycle, three originating in the review
+document itself, and one of them moved a pipeline order so that entity resolution would have degraded
+to the ambiguous bare-form path — **a false correction was one merge away from shipping the exact
+duplicate-manufacturing failure the design exists to prevent** (`tortoise#5014`; mechanism:
+`tortoise`'s `docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md` §16.2 — the section whose four binding
+rules this one is taken from — and its evidence record, `tortoise`'s
+`docs/architecture/REVIEW-CONSOLIDATED-2026-09-23.md` B2.1).
+
 #### Exit Conditions — ALL Must Be True (Clean Completion)
 
 - [ ] Last reviewer response was the skill's clean verdict — `NO ISSUES FOUND`, or the skill's defined equivalent (e.g. the verifier's `PASS`, the loop's `CLEAN`) — verbatim, not paraphrased
