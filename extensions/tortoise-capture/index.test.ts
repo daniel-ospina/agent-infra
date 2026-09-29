@@ -857,6 +857,7 @@ describe("config boundary normalisation (#803 review P1)", () => {
       JSON.stringify({ autoCapture: true, cloud: true, apiKey: 12345, apiUrl: 67890 }),
       "utf-8",
     );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const cfg = loadConfig({ configPath });
       expect(cfg.autoCapture).toBe(true);
@@ -865,7 +866,14 @@ describe("config boundary normalisation (#803 review P1)", () => {
       expect(cfg.apiUrl).toBeUndefined();
       expect(() => cloudConfig(cfg)).not.toThrow();
       expect(cloudConfig(cfg).apiKey).toBe("");
+      // Review cycle 2 P2: a dropped non-string apiUrl must not be SILENT — the
+      // warning names the default endpoint the capture would otherwise target.
+      const warnings = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(warnings).toContain('"apiUrl" is present but not a string');
+      expect(warnings).toContain("DEFAULT endpoint https://api.premiselabs.co");
+      expect(warnings).toContain('"apiKey" is present but not a string');
     } finally {
+      warn.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -95,7 +95,55 @@ try {
   const malformed = tmpProject("gate-malformed");
   mkdirSync(join(malformed, ".pi"), { recursive: true });
   writeFileSync(join(malformed, ".pi", "tortoise-capture.json"), "{not json", "utf-8");
-  equal(projectCaptureOptOut(malformed), false, "malformed project file is not a deny (fail-open on deny)");
+  equal(
+    projectCaptureOptOut(malformed),
+    true,
+    "malformed project file DENIES (policy rule 4: unparseable is not a skip)",
+  );
+  equal(
+    resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: malformed, env: {} }).reason,
+    "repo-opt-out",
+    "malformed project file yields repo-opt-out",
+  );
+
+  // ── Review cycle 2 P1: a NON-GIT cwd is a definitive answer, not a failure ─
+  // A plain directory (e.g. $HOME) has no repo root and therefore no repo-scoped
+  // deny file to miss, so the operator's explicit `cloud: true` opt-in stands.
+  // Cycle 1 mapped it to `repo-root-unresolved` and permanently denied capture
+  // outside a repo — the over-correction this pins shut.
+  const notARepo = tmpProject("gate-not-a-repo");
+  equal(
+    resolveProjectCaptureScope(notARepo).resolved,
+    true,
+    "a non-git cwd resolves (definitively no repo) rather than failing closed",
+  );
+  equal(
+    resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: notARepo, env: {} }).enabled,
+    true,
+    "cloud:true + key in a non-git cwd → enabled (no repo root means no deny to miss)",
+  );
+  // The actionable reason must not be masked by the scope: with no key the gate
+  // reports `no-api-key`, not a nonexistent git problem.
+  equal(
+    resolveCaptureGate({ cloud: true, apiKey: "", projectDir: notARepo, env: {} }).reason,
+    "no-api-key",
+    "no key in a non-git cwd → no-api-key, not repo-root-unresolved",
+  );
+  // A corrupt/incomplete repo boundary must NOT be mistaken for "not a repo":
+  // git reports both with the same exit-128 message, so the gate checks for an
+  // ancestor `.git` entry and fails closed when one exists (policy rule 4).
+  const corruptRepo = tmpProject("gate-corrupt-repo");
+  mkdirSync(join(corruptRepo, ".git"), { recursive: true });
+  equal(
+    resolveProjectCaptureScope(corruptRepo).resolved,
+    false,
+    "a corrupt .git boundary fails closed, not resolved as a plain directory",
+  );
+  equal(
+    resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: corruptRepo, env: {} }).reason,
+    "repo-root-unresolved",
+    "a corrupt .git boundary denies rather than silently enabling",
+  );
 
   // Review cycle 1 P1: the repo file must accept the SAME deny vocabulary as the
   // env flag (a repo author mirroring TORTOISE_CAPTURE_CLOUD=off used to be
@@ -169,11 +217,19 @@ try {
     process.env.PATH = `${shimDir}:${realPath}`;
     let brokenResolved = true;
     let brokenReason = "enabled";
+    let brokenNoKeyReason = "enabled";
     try {
       brokenResolved = resolveProjectCaptureScope(resolveProjectRoot(wt2)).resolved;
       brokenReason = resolveCaptureGate({
         cloud: true,
         apiKey: "tt_x",
+        projectDir: resolveProjectRoot(wt2),
+        env: {},
+      }).reason;
+      // Review cycle 2 P2: the scope failure must not mask the actionable reason.
+      brokenNoKeyReason = resolveCaptureGate({
+        cloud: true,
+        apiKey: "",
         projectDir: resolveProjectRoot(wt2),
         env: {},
       }).reason;
@@ -185,6 +241,11 @@ try {
       brokenReason,
       "repo-root-unresolved",
       "git failure → the gate fails closed instead of silently enabling",
+    );
+    equal(
+      brokenNoKeyReason,
+      "no-api-key",
+      "git failure with no key → the actionable no-api-key reason, not repo-root-unresolved",
     );
 
     // The failure must NOT be memoized: once git recovers, the main-root deny applies.
@@ -220,6 +281,24 @@ try {
       resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: resolveProjectRoot(pkg), env: {} }).reason,
       "repo-opt-out",
       "--separate-git-dir: the checkout's opt-out still applies from a subdir",
+    );
+    // Linked worktree OF a --separate-git-dir checkout: git cannot name the main
+    // worktree (neither `core.worktree` nor `git worktree list` yields the
+    // checkout — the latter reports the git dir as the main worktree), so the
+    // main root is UNRESOLVABLE. Declared unsupported; the gate fails closed
+    // rather than reading a deny file at a WRONG root and silently missing it.
+    execSync("git -c user.email=t@t -c user.name=t commit --allow-empty -qm init", { cwd: ws });
+    const sepWt = realpathSync(base) + "/sep-wt";
+    execSync(`git worktree add --detach -q ${JSON.stringify(sepWt)}`, { cwd: ws });
+    equal(
+      resolveMainRepoRoot(sepWt),
+      null,
+      "--separate-git-dir + linked worktree: main root is unresolvable (unsupported layout)",
+    );
+    equal(
+      resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: sepWt, env: {} }).reason,
+      "repo-root-unresolved",
+      "--separate-git-dir + linked worktree fails closed instead of checking a wrong root",
     );
 
     // submodule-shaped: worktree at <base>/super/sub, git dir at

@@ -80,8 +80,34 @@ function expandTilde(p: string): string {
   return p;
 }
 
-/** String-or-nothing guard: a hand-written config field can be any JSON type. */
+/**
+ * String-or-nothing guard: a hand-written config field can be any JSON type.
+ * `asString` is the silent guard used for env vars (always string|undefined).
+ */
 const asString = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+
+/**
+ * The config-file guard: like {@link asString}, but a field that is PRESENT and
+ * not a string is warned about and dropped. A silent drop hid a mistyped
+ * `apiUrl`, which then sent transcripts to the DEFAULT hosted endpoint instead of
+ * the operator's intended host — the #775 "wrong host, silently" class. The
+ * warning fires per config LOAD, which is once per process for the default path
+ * (`loadConfig` caches).
+ */
+function asConfigString(field: string, v: unknown): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === "string") return v;
+  const consequence =
+    field === "apiUrl"
+      ? ` — hosted capture will target the DEFAULT endpoint ${DEFAULT_API_URL} instead`
+      : field === "apiKey"
+        ? " — hosted capture will be treated as keyless (no upload)"
+        : "";
+  console.warn(
+    `[tortoise-capture] config "${field}" is present but not a string (got ${typeof v}); ignoring it${consequence}`,
+  );
+  return undefined;
+}
 
 function configPath(): string {
   return join(homedir(), ".pi", "agent", "tortoise-config.json");
@@ -101,18 +127,18 @@ export function normalizeConfig(parsed: unknown): TortoiseConfig {
   }
   const raw = parsed as Record<string, unknown>;
   const cfg: TortoiseConfig = { autoCapture: Boolean(raw.autoCapture) };
-  const dbPath = asString(raw.dbPath);
+  const dbPath = asConfigString("dbPath", raw.dbPath);
   if (dbPath !== undefined) cfg.dbPath = dbPath;
-  const docsDir = asString(raw.docsDir);
+  const docsDir = asConfigString("docsDir", raw.docsDir);
   if (docsDir !== undefined) cfg.docsDir = docsDir;
-  const tortoiseSrcDir = asString(raw.tortoiseSrcDir);
+  const tortoiseSrcDir = asConfigString("tortoiseSrcDir", raw.tortoiseSrcDir);
   if (tortoiseSrcDir !== undefined) cfg.tortoiseSrcDir = tortoiseSrcDir;
-  const pointModel = asString(raw.pointModel);
+  const pointModel = asConfigString("pointModel", raw.pointModel);
   if (pointModel !== undefined) cfg.pointModel = pointModel;
   if (raw.cloud === true) cfg.cloud = true;
-  const apiUrl = asString(raw.apiUrl);
+  const apiUrl = asConfigString("apiUrl", raw.apiUrl);
   if (apiUrl !== undefined) cfg.apiUrl = apiUrl;
-  const apiKey = asString(raw.apiKey);
+  const apiKey = asConfigString("apiKey", raw.apiKey);
   if (apiKey !== undefined) cfg.apiKey = apiKey;
   return cfg;
 }
@@ -591,9 +617,11 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
   // Ensure PID directory exists (same as db dir for default, but explicit for custom paths)
   mkdirSync(join(homedir(), ".tortoise"), { recursive: true });
 
-  const initProjectDir = resolveProjectRoot(process.cwd());
-  // Lazy gate evaluation: unless `cloud: true`, do not touch the key or spawn git
-  // at all (the default local-capture case).
+  // Lazy evaluation: unless `cloud: true`, do NOT spawn git or resolve the key at
+  // all — the default local-capture case must not pay a git subprocess on every
+  // event (a non-git cwd would otherwise re-spawn on each agent_end, because a
+  // failed resolution is deliberately never cached).
+  const initProjectDir = config.cloud === true ? resolveProjectRoot(process.cwd()) : process.cwd();
   const initialGate: CaptureGateResult =
     config.cloud === true
       ? resolveCaptureGate({
@@ -694,7 +722,8 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
       // Update tracking state
       state.lastMessageCount = conversation.length;
 
-      const egressProjectDir = resolveProjectRoot(ctx.cwd ?? process.cwd());
+      const egressProjectDir =
+        config.cloud === true ? resolveProjectRoot(ctx.cwd ?? process.cwd()) : (ctx.cwd ?? process.cwd());
       const egressGate: CaptureGateResult =
         config.cloud === true
           ? resolveCaptureGate({
