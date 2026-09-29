@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -1465,6 +1465,11 @@ const INT = 30_000; // tick interval
 // in pre-#271 scenarios (marker gaps there are ≤ ~70s). E271/E271b inject the
 // real floor (15s) explicitly.
 const CUT_GAP_FIXTURE = 3_600_000;
+// #5389: the CPU-stall bound used by the in-flight-tool progress fixtures. It
+// sits in this shared block because the first of them (E-silence-1) precedes the
+// #928 section by ~1,500 lines, and a `const` cannot be hoisted — the #928
+// section's `C` is this same value, aliased there.
+const CPU_STALL_FIXTURE = 600_000;
 
 function dinput(over: Partial<HeartbeatDecisionInput> & { state?: HeartbeatState } = {}): HeartbeatDecisionInput {
   return {
@@ -1691,8 +1696,16 @@ test("E-silence-1: WEDGED tool in flight → killed at the SILENCE bound, not th
   st.toolAgeMaxMs = S + 60_000; // far BELOW L (1h in fixtures)
   st.streamAgeMs = S + 1;       // …but no output for S: the wedge signal
   st.toolUpdates = true;        // the tool HAD been producing output, then stopped
+  // #5389: the clause now requires BOTH conditions — output silence AND
+  // positive no-progress evidence. This is the WEDGED shape, so the CPU channel
+  // must say `no-progress`: demonstrated CPU work, then flat PAST the bound.
+  // With these two lines absent the state is `unknown`, and the clause correctly
+  // BLOCKS (the #5389 tests below pin that direction, and the age backstop that
+  // still bounds it).
+  st.toolCpuAdvanced = true;
+  st.toolCpuStallMs = CPU_STALL_FIXTURE + 1;
   st.lastMarkerAt = 500_000;
-  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
+  const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, cpuStallMs: CPU_STALL_FIXTURE }));
   equal(d.kill, true, "a silent in-flight tool is killed at the SILENCE bound");
   equal(d.reason, "tool-silence", "reason is distinct from the age backstop");
   ok(S + 60_000 < L, "fixture sanity: this shape sits far below the age bound");
@@ -1792,6 +1805,132 @@ test("E-silence-5: MIXED round (one tool emitted and ended, one still silent) �
   st.toolUpdates = childHb.computeToolUpdates(["bash-1", "task-2"], new Set(["bash-1"]));
   const d = heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st }));
   equal(d.kill, false, "the healthy nested child survives the mixed round");
+});
+
+// ── #5389: progress is a FIRST-CLASS signal — the in-flight bound requires
+// BOTH silence and no-progress evidence ──────────────────────────────────────
+// THE DEFECT: `tool-silence` fired on output silence ALONE, reading ABSENCE OF
+// OUTPUT as ABSENCE OF WORK. Measured (tortoise #5387): the clause fired at
+// 1203 s against its 1200 s bound with `toolCpuAdvanced=true` and 154
+// CPU-seconds burned — KILLED WHILE PROGRESSING. The CPU channel the child had
+// been reporting all along was parsed here and never consulted by that clause.
+//
+// The rule is now ONE tri-state (`inFlightProgress`) that BOTH in-flight tool
+// bounds read, and CPU stays a SPARE signal: it protects, it never convicts.
+//   progressing → SUPPRESS   (positive evidence the tool is still working)
+//   no-progress → LICENSE    (demonstrated work, then flat past the bound)
+//   unknown     → BLOCK      (no evidence either way; a bound may not fire on
+//                             a channel it cannot read)
+
+/** The #5389 fixture shape: one in-flight tool that streamed output and has
+ * since gone silent past S. `over` is the ONLY thing the twins vary — the
+ * progress channel. */
+function progressShape(over: Partial<HeartbeatState> = {}): HeartbeatState {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = S + 60_000; // far below the age backstop
+  st.streamAgeMs = S + 3_000;   // 1203 s of output silence against the 1200 s bound
+  st.toolUpdates = true;        // it HAD emitted renderable output, then stopped
+  st.lastMarkerAt = 500_000;
+  return Object.assign(st, over);
+}
+
+const progressDecide = (st: HeartbeatState) =>
+  heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, cpuStallMs: CPU_STALL_FIXTURE }));
+
+test("#5389 inFlightProgress — the tri-state, and which state may convict", () => {
+  const v = (toolCpuStallMs: number, toolCpuAdvanced: boolean, cpuStallMs = CPU_STALL_FIXTURE) =>
+    inFlightProgress({ toolCpuStallMs, toolCpuAdvanced }, cpuStallMs);
+  // UNKNOWN — the states that may NOT convict. Each is a channel that cannot be
+  // read, or a reading that proves nothing.
+  equal(v(0, false), "unknown", "not probed (a tool outside the child's allowlist, a failed ps, no descendant rows)");
+  equal(
+    v(10 * CPU_STALL_FIXTURE, false),
+    "unknown",
+    "flat CPU on a tool that never burned a cycle is the #928 I/O-bound case, not a deadlock",
+  );
+  equal(v(CPU_STALL_FIXTURE + 1, true, 0), "unknown", "TASK_CPU_STALL_MS=0 disables the channel; a disabled channel cannot convict");
+  // The two READABLE states — the ones the in-flight bounds branch on.
+  // `stall=0` WITH the demonstrated-work latch armed is PROGRESS, not an absent
+  // measurement: `stepCpuLiveness` stamps `lastAdvanceAt = now` on a rise, so a
+  // tool advancing on THIS tick reports the same `cpu_stall_ms=0` the not-probed
+  // branch reports. This is a MEASURED production shape — a real `tool-silence`
+  // cut carried `toolCpuMs=135910 toolCpuStallMs=0 toolCpuAdvanced=true` — and
+  // reading it as `unknown` would file the strongest evidence there is under
+  // "no measurement".
+  equal(v(0, true), "progressing", "probed and advancing on THIS tick (lastAdvanceAt === now) is the strongest progress evidence there is");
+  equal(v(1, true), "progressing", "advancing CPU is POSITIVE progress evidence");
+  equal(v(CPU_STALL_FIXTURE, true), "progressing", "flat exactly AT the bound is still inside it (strict >)");
+  equal(v(CPU_STALL_FIXTURE + 1, true), "no-progress", "demonstrated work, then flat PAST the bound — the only convicting state");
+});
+
+test("#5389 tool-silence NEGATIVE — the #5387 false cut: silence + ADVANCING CPU is never cut", () => {
+  // The measured incident, reproduced: streamed, then silent 1203 s against this
+  // clause's 1200 s bound, with `toolCpuAdvanced=true` and 154 CPU-seconds burned.
+  // Pre-#5389 this returned `kill: true` / `reason: "tool-silence"`.
+  const d = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: INT }));
+  equal(d.kill, false, "a tool that is still BURNING CPU is working, however long its output has been quiet");
+  equal(d.reason, undefined, "…and it is not relabelled onto another clause");
+  // The MEASURED shape, exactly as the live defect instance recorded it:
+  // `toolCpuMs=135910 toolCpuStallMs=0 toolCpuAdvanced=true` — the tool advanced
+  // CPU on the very tick the cut was taken. `stall=0` with the latch armed is
+  // PROGRESS, not a missing measurement (the child's not-probed sentinel always
+  // arrives with the latch CLEARED), so this pins the decision path the unit
+  // test above pins at the predicate.
+  const measured = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: 0 }));
+  equal(measured.kill, false, "the measured production shape (stall=0, advanced=true) is PROGRESSING, not `unknown`");
+  equal(measured.reason, undefined, "…and no clause is reached");
+  // STILL BOUNDED — the suppression is a veto from the progress evidence, not an
+  // exemption from every bound: the age backstop owns it exactly as before.
+  const huge = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: INT, toolAgeMaxMs: L + 1 }));
+  equal(huge.reason, "tool-stall", "a tool that advances CPU forever is bounded by the AGE backstop, never by nothing");
+});
+
+test("#5389 tool-silence NEGATIVE — `unknown` progress BLOCKS the cut (no proof, no kill)", () => {
+  const d = progressDecide(progressShape()); // not probed → unknown
+  equal(d.kill, false, "unknown BLOCKS: a bound may not fire on a channel it cannot read");
+  equal(d.reason, undefined, "no clause is reached at all");
+  // CONTROL — the ONLY change is positive no-progress evidence, and the same
+  // shape IS cut. So the assertion above pins the progress gate, not an inert
+  // fixture.
+  const proven = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: CPU_STALL_FIXTURE + 1 }));
+  equal(proven.kill, true, "CONTROL: with positive no-progress evidence the SAME shape is cut");
+  equal(proven.reason, "tool-silence");
+  // …and the blocked shape is still BOUNDED rather than unbounded: that is the
+  // deliberate cost of `unknown`, stated in the predicate's own comment.
+  equal(progressDecide(progressShape({ toolAgeMaxMs: L + 1 })).reason, "tool-stall", "unknown falls back to the age backstop");
+});
+
+test("#5389 tool-silence POSITIVE — silence AND proven no-progress IS the cut (the fail-fast trigger)", () => {
+  // (b)+(e) together: both channels agree the tool has stopped ⇒ cut at
+  // max(S, C), which is the "no progress for N minutes" fail-fast trigger.
+  // Without it such a child burned the age backstop instead (#3404).
+  const d = progressDecide(progressShape({ toolCpuAdvanced: true, toolCpuStallMs: CPU_STALL_FIXTURE + 1 }));
+  equal(d.kill, true);
+  equal(d.reason, "tool-silence", "its own reason — the model is told which evidence fired");
+});
+
+test("#5389 tool-silence — a no-tool state reaches its OWN bound, never the in-flight gate", () => {
+  // Scope guard: the progress gate is an IN-FLIGHT bound. With no tool in flight
+  // the decision reaches `stream-stall` here — and, in particular, an unreadable
+  // CPU channel must not reach across and suppress a no-tool bound. (Named for
+  // what it asserts: this fixture sets `progressAgeMs: 0`, so the #5195
+  // `no-progress` clause is OFF and is NOT what is being exercised. That clause's
+  // own no-tool scoping is pinned by the pre-existing `#5195: the clause is
+  // SCOPED to no-tool` test, whose positive twin arms `DEFAULT_PROGRESS_AGE_MS`.)
+  const st = progressShape({ toolsInFlight: 0, toolUpdates: false });
+  const d = heartbeatKillDecision(
+    dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, cpuStallMs: CPU_STALL_FIXTURE, progressAgeMs: 0 }),
+  );
+  equal(d.reason, "stream-stall", "the no-tool bound is unchanged (and never the in-flight clause)");
+  // CONTROL: arm #5195's clock instead and the SAME no-tool state is cut by it —
+  // so the assertion above pins the no-tool path and not an inert fixture.
+  const np = heartbeatKillDecision(
+    dinput({ now: 500_010, startedAt: 0, lastLifeSignAt: 500_000, state: st, cpuStallMs: CPU_STALL_FIXTURE, progressAgeMs: 60_000 }),
+  );
+  equal(np.reason, "no-progress", "CONTROL: the no-tool state is bounded by its own progress clause — and the CPU channel neither suppresses nor authorises it");
 });
 
 test("E11: between-turn wedge — ticks stop → silence at T (S > max(2T,2×interval) pin)", () => {
@@ -1956,11 +2095,14 @@ test("#1030-B1: the override CHANGES THE VERDICT — the bound applied is the bo
     st.toolAgeMaxMs = S + 60_000; // far BELOW the age backstop…
     st.streamAgeMs = S + 1;       // …but no output for S: the wedge signal
     st.toolUpdates = true;        // it HAD emitted, then stopped
+    // #5389: the clause requires no-progress evidence on the CPU channel too.
+    st.toolCpuAdvanced = true;
+    st.toolCpuStallMs = CPU_STALL_FIXTURE + 1;
     st.lastMarkerAt = 500_000;
     return st;
   };
   const decide = (st: HeartbeatState, bound: number) =>
-    heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, streamStallMs: bound }));
+    heartbeatKillDecision(dinput({ now: 500_010, lastLifeSignAt: 500_000, state: st, streamStallMs: bound, cpuStallMs: CPU_STALL_FIXTURE }));
 
   equal(decide(silentToolShape(), S).reason, "tool-silence", "fixture sanity: at the default bound this shape is a wedge");
 
@@ -3043,12 +3185,12 @@ section("#928 — silent-tool CPU liveness: the child's sample → the parent's 
 // state the CHILD actually produces (driven through the real parser), so they
 // cannot be satisfied by leaving a field unset.
 
-const C = 600_000; // #928 CPU-stall bound used by the fixtures below (a fixed
-//        fixture value, deliberately NOT read from the env: the clause tests are
-//        about the RULE, so they pass C explicitly. The SHIPPED default is
-//        pinned separately — see the `DEFAULT_CPU_STALL_MS` assertion at the end
-//        of the tool-dead block — because a silent drift of the default is the
-//        one change no clause fixture can catch.
+const C = CPU_STALL_FIXTURE; // #928's fixture bound — ONE value with the
+//        #5389 fixtures above, so the two sections cannot drift apart about
+//        what the CPU bound is. Deliberately NOT read from the env: the clause
+//        tests are about the RULE, so they pass C explicitly. The SHIPPED
+//        default is pinned separately — see the `DEFAULT_CPU_STALL_MS`
+//        assertion at the end of the tool-dead block.
 const NONCE928 = "nonce928";
 const NONCE5195 = "nonce5195";
 

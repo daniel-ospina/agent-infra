@@ -1516,6 +1516,15 @@ export function scanStderrForUsage(
 //                       this clause degenerated into a bare 20-min silence
 //                       timeout for bash). Silence AFTER real output is still
 //                       killed at 20 min (R-B5).
+//                       ⚠️ #5389 — SILENCE IS NECESSARY, NOT SUFFICIENT.
+//                       Silence alone reads ABSENCE OF OUTPUT as ABSENCE OF
+//                       WORK: it cut a tool that had streamed and then gone
+//                       quiet while still BURNING CPU (measured 1203 s against
+//                       this 1200 s bound with `toolCpuAdvanced=true` and 154
+//                       CPU-seconds burned — tortoise #5387). The bound now
+//                       requires BOTH conditions: this silence AND positive
+//                       no-progress evidence from the child's CPU channel
+//                       (`inFlightProgress === "no-progress"`). See the clause.
 //   tool-dead ......... in-flight tool with NO OUTPUT and NO CPU —
 //                       #928. The complement of tool-silence, and the only
 //                       bound that reaches a tool the silence detector is
@@ -1873,7 +1882,9 @@ export function getCutGapMs(): number {
  * other direction is the #363/#489 kill-productive-agents class.
  *
  * `TASK_CPU_STALL_MS=0` DISABLES the clause — an explicit off switch for a new
- * kill path. The test is the VALUE being zero, not the exact spelling `"0"`:
+ * kill path — and since #5389 it stands BOTH in-flight tool clauses down, because
+ * `tool-silence` now requires positive no-progress evidence from this channel.
+ * The test is the VALUE being zero, not the exact spelling `"0"`:
  * `"0"`, `"0.0"`, `"+0"`, `" 0 "` all disable, because an operator who wrote
  * any of those meant to switch it off and silently arming it anyway is a
  * surprise with no upside. What is NOT an off switch is a BLANK value: a
@@ -2615,6 +2626,14 @@ export interface HeartbeatKillDecision {
    * matters here because the `networkDown` early return can suppress the kill
    * for hours, so the first firing may be far past the bound. */
   progressAgeMs?: number;
+  /** #5389: the OBSERVED `toolCpuStallMs` at the moment the in-flight clause
+   * fired. Snapshotted for the same reason `progressAgeMs` is: the kill path
+   * `await`s the network probe between the decision and the headline, and a
+   * `tool_end`/`tool_start` marker ingested inside that window resets the live
+   * `hbCtx.state.toolCpuStallMs` to 0 — so a headline re-reading live state can
+   * render "consumed no CPU for 0s" beside "no progress on either channel" and
+   * contradict itself in the operator's post-mortem. */
+  toolCpuStallMs?: number;
   /** Kill resolves `undefined` (retryable) instead of a defined result —
    * true iff the kill fired and no REAL output ever arrived (#5926 retry
    * preservation). */
@@ -2674,6 +2693,88 @@ export interface HeartbeatDecisionInput {
    * (dead child) or a reachable network fail open to the legacy decision. */
   networkDown?: boolean;
 
+}
+
+/**
+ * #5389 — the in-flight tool's PROGRESS verdict: the ONE tri-state the two
+ * in-flight tool bounds consult, and the single place "is this child still
+ * working?" is answered.
+ *
+ * THE DEFECT THIS REMOVES. The harness read ABSENCE OF OUTPUT as ABSENCE OF
+ * WORK. Two consequences, both measured: (1) a tool that had streamed and then
+ * gone quiet while still burning CPU was cut at the silence bound — the
+ * `tool-silence` clause fired at 1203 s against a 1200 s bound with
+ * `toolCpuAdvanced=true` and 154 CPU-seconds burned (tortoise #5387) — because
+ * that clause never consulted the CPU channel the child already reports; and
+ * (2) when a child genuinely stopped there was no progress term to fire on, so
+ * the parent waited out the age backstop (tortoise #5389, #3404).
+ *
+ * THREE STATES, and the direction of each is deliberate:
+ *
+ *  · `"progressing"` — the in-flight tool's process subtree has DEMONSTRATED
+ *    CPU work in this round and is still advancing (flat for at most
+ *    `cpuStallMs`). POSITIVE progress evidence: it VETOES every in-flight cut.
+ *    This is the SPARE-signal direction the #5389 research found every mature
+ *    implementation taking (CPU incrementing protects, it never convicts), and
+ *    the same reason `docs/ops/fleet-liveness.md` §5 item 1 keeps `task`
+ *    outside `CPU_LIVENESS_TOOL_NAMES`.
+ *  · `"no-progress"` — demonstrated CPU work, then flat past `cpuStallMs`. The
+ *    ONLY state that may license an in-flight cut: the tool proved it works and
+ *    then stopped. This is #928's shape, kept verbatim and now shared instead of
+ *    re-derived per clause.
+ *  · `"unknown"` — NO evidence either way, and it BLOCKS: a bound may not fire
+ *    on a channel that cannot be read. This is `extensions/task-heartbeat.ts`'s
+ *    own rule for this channel ("Absence of evidence must never arm a kill; a
+ *    parent that cannot prove a tool is dead must fall back to its existing
+ *    bounds"), and `tools/fleet/liveness.py` states the same one for its
+ *    vetoes ("absence of evidence must never arm an escalation").
+ *
+ *    THE POPULATION IS NAMED EXACTLY, because it is larger than "the probe
+ *    failed" and every part of it falls back:
+ *      (a) a tool kind outside `CPU_LIVENESS_TOOL_NAMES` (only `bash` is in it);
+ *      (b) a `ps` probe that failed, or a sample the child refused as
+ *          unattributable (a second tool in flight, a foreign detached group);
+ *      (c) `TASK_CPU_STALL_MS=0`;
+ *      (d) a round in which no CPU INCREASE was ever observed between two
+ *          consecutive ticks. That includes an I/O-bound tool that never burned
+ *          CPU at all — and, deliberately, a tool whose CPU work completed
+ *          BEFORE the first sample tick, since `stepCpuLiveness`'s baseline
+ *          branch starts the clock without arming the latch. A child older than
+ *          the field also lands here.
+ *
+ * THE COST OF `"unknown"`, stated rather than hidden and MEASURED: both
+ * in-flight tool bounds stand down, and such a tool is bounded instead by the
+ * `tool-stall` AGE backstop (`TASK_TOOL_STALL_MS`, 4 h at the 6 h cap), or by
+ * `TASK_MAX_DISPATCH_MS` where an operator set one. That is a LATENCY cost on a
+ * fail-safe path, never an unbounded wait. Measured over the parent session
+ * corpus: of in-flight settles that carry the CPU channel at all, ~49% read
+ * `"progressing"` and ~51% `"unknown"` — this is the LARGER half of the
+ * population, which is why the age backstop is load-bearing rather than a
+ * formality.
+ */
+export type InFlightProgress = "progressing" | "no-progress" | "unknown";
+
+export function inFlightProgress(
+  st: Pick<HeartbeatState, "toolCpuStallMs" | "toolCpuAdvanced">,
+  cpuStallMs: number,
+): InFlightProgress {
+  // `toolCpuAdvanced` is read FIRST, and the property that matters is which test
+  // does NOT exist: an "absent measurement" must never be decided by a
+  // `toolCpuStallMs <= 0` test placed before the latch. The child's not-probed
+  // sentinel is `cpu_stall_ms=0` AND `cpu_advanced=0` — every unmeasurable branch
+  // routes through `clearCpuEvidence`, which clears the demonstrated-work latch.
+  // But a PROBED tool that advanced on this very tick ALSO reports
+  // `cpu_stall_ms=0`: `stepCpuLiveness` stamps `lastAdvanceAt = now` on a strict
+  // increase, so `now - lastAdvanceAt === 0`. A sentinel test ahead of the latch
+  // would file the STRONGEST progress evidence there is (`advanced`, just moved)
+  // under "unknown" — measured live: a real `tool-silence` cut whose Alive state
+  // read `toolCpuMs=135910 toolCpuStallMs=0 toolCpuAdvanced=true`. So the latch
+  // decides: no demonstrated CPU work in this round ⇒ unknown.
+  if (!st.toolCpuAdvanced) return "unknown";
+  // The CPU bound is disabled (`TASK_CPU_STALL_MS=0`): an operator who switched
+  // the channel off has not thereby authorised a cut on it.
+  if (cpuStallMs <= 0) return "unknown";
+  return st.toolCpuStallMs > cpuStallMs ? "no-progress" : "progressing";
 }
 
 /**
@@ -2836,8 +2937,36 @@ export function heartbeatKillDecision(
   //    tool that has DEMONSTRATED it streams RENDERABLE output and then
   //    stopped, so silence is
   //    evidence of a wedge rather than of a quiet-but-working tool.
-  if (stateFresh && st.toolsInFlight > 0 && st.toolUpdates && effStreamAge > i.streamStallMs) {
-    return kill("tool-silence");
+  //    #5389 — SILENCE IS NECESSARY, NOT SUFFICIENT. This clause used to fire
+  //    on output silence ALONE, which reads ABSENCE OF OUTPUT as ABSENCE OF
+  //    WORK: a tool that had streamed and then gone quiet while still burning
+  //    CPU was cut at S — measured, 1203 s against a 1200 s bound with
+  //    `toolCpuAdvanced=true` and 154 CPU-seconds burned (tortoise #5387). The
+  //    CPU channel the child already reports was parsed here and never
+  //    consulted. The bound now requires BOTH conditions: output silence past S
+  //    AND positive no-progress evidence (`inFlightProgress === "no-progress"`).
+  //    `"progressing"` SUPPRESSES the cut, and `"unknown"` BLOCKS it. The
+  //    residual is disclosed, not hidden: an `"unknown"` tool is bounded by the
+  //    `tool-stall` AGE backstop below (`TASK_TOOL_STALL_MS`, 4 h at the 6 h
+  //    cap), or by `TASK_MAX_DISPATCH_MS` where one is set — a SLOWER bound,
+  //    never an unbounded wait — and that population is larger than "the probe
+  //    failed" (see `inFlightProgress` for the exact list: an ineligible tool
+  //    kind, a failed/unattributable sample, `TASK_CPU_STALL_MS=0`, or a round
+  //    whose CPU never increased, which includes a tool whose CPU work finished
+  //    before the first sample tick).
+  //    At the shipped defaults C (30 min) EXCEEDS S (20 min), so for the
+  //    `"no-progress"` case it is C that binds: `tool-silence` fires at
+  //    max(S, C) = 30 min rather than at S alone. That is the deliberate cost of
+  //    requiring BOTH conditions, and the #5389 tests pin it.
+  const progress = inFlightProgress(st, i.cpuStallMs);
+  if (
+    stateFresh &&
+    st.toolsInFlight > 0 &&
+    st.toolUpdates &&
+    effStreamAge > i.streamStallMs &&
+    progress === "no-progress"
+  ) {
+    return { ...kill("tool-silence"), toolCpuStallMs: st.toolCpuStallMs };
   }
 
   // 1b. tool-dead — #928. The COMPLEMENT of clause 1, and the only bound that
@@ -2912,16 +3041,23 @@ export function heartbeatKillDecision(
   //     The kill resolves as a partial result and is reported to the model
   //     with its own headline naming the CPU evidence — a silent bound would
   //     be only a shorter timeout, not a diagnostic the model can act on.
+  //
+  //     #5389: the clause's four CPU conditions are now the SHARED predicate
+  //     (`progress === "no-progress"`) rather than a second, hand-written copy
+  //     of the same rule. One definition, so the two in-flight bounds cannot
+  //     drift apart about what "no progress" means — and the `TASK_CPU_STALL_MS=0`
+  //     disable valve, the never-demonstrated-CPU bar and the not-probed
+  //     sentinel are all preserved inside it (each maps to `"unknown"`, which
+  //     blocks). This clause is still the strict complement of clause 1: it
+  //     owns `tool_updates=0`, clause 1 owns `tool_updates=1`.
   if (
     stateFresh &&
     st.toolsInFlight > 0 &&
     !st.toolUpdates &&
-    i.cpuStallMs > 0 &&
-    st.toolCpuAdvanced &&
-    st.toolCpuStallMs > i.cpuStallMs &&
+    progress === "no-progress" &&
     effToolAge > i.streamStallMs
   ) {
-    return kill("tool-dead");
+    return { ...kill("tool-dead"), toolCpuStallMs: st.toolCpuStallMs };
   }
 
   // 2. tool-stall — AGE BACKSTOP, demoted from primary detector. It now owns
@@ -4030,8 +4166,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s) — treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "tool-dead": `⚠️ Sub-agent's in-flight tool has produced no output for ${Math.round(effStreamAgeMs / 1000)}s AND consumed no CPU for ${Math.round(hbCtx.state.toolCpuStallMs / 1000)}s (bound ${Math.round(hbThresholds.cpuStallMs / 1000)}s) — no progress on either channel; a deadlock and a long I/O block are indistinguishable here. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        // #5389 — the headline names the evidence on BOTH channels, because the
+        // cut now REQUIRES no progress on each of them. It still states the
+        // evidence rather than a cause: a deadlock and a long I/O block are
+        // indistinguishable here, which is the discipline the `tool-dead`
+        // headline beside it already keeps. The CPU number is the DECISION's
+        // snapshot, not live state — the network probe is awaited between the
+        // two, and a marker ingested in that window would reset the live value
+        // to 0 and make the headline contradict itself.
+        "tool-silence": `⚠️ Sub-agent's in-flight tool stopped producing output for ${Math.round(effStreamAgeMs / 1000)}s AND consumed no CPU for ${Math.round((decision.toolCpuStallMs ?? hbCtx.state.toolCpuStallMs) / 1000)}s (bounds ${Math.round(hbThresholds.streamStallMs / 1000)}s / ${Math.round(hbThresholds.cpuStallMs / 1000)}s) — no progress on either channel; treated as wedged. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "tool-dead": `⚠️ Sub-agent's in-flight tool has produced no output for ${Math.round(effStreamAgeMs / 1000)}s AND consumed no CPU for ${Math.round((decision.toolCpuStallMs ?? hbCtx.state.toolCpuStallMs) / 1000)}s (bound ${Math.round(hbThresholds.cpuStallMs / 1000)}s) — no progress on either channel; a deadlock and a long I/O block are indistinguishable here. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(effToolAgeMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(effStreamAgeMs / 1000)}s (bound ${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
