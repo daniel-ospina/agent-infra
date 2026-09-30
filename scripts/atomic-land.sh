@@ -446,7 +446,16 @@ wait_terminal() {
     return 0
   fi
   say "atomic-land: [2/4] verify — waiting (≤${WAIT_TIMEOUT}s) for the checks at ${HEAD:0:12}… to be terminal"
-  local elapsed=0 pending completed
+  # B14 (#1395 item 1): the bound is WALL-CLOCK, not a poll count. The old
+  # `elapsed=$((elapsed + POLL))` credited $POLL per iteration while each
+  # iteration first spends TWO `gh api` round trips, so the rail outlived its own
+  # documented bound (MEASURED: #5797 sat at [2/4] verify for 93 min against a
+  # nominal 90) — and `--poll 0` advanced the counter by ZERO, so the bound could
+  # never be reached at all and the rail looped forever while holding the PR's
+  # lock and a landing slot. Both are one defect: a counter that is not a clock.
+  # Reading the real clock fixes both, and cannot regress on `--poll 0`.
+  local started elapsed pending completed
+  started="$(date +%s)"
   while :; do
     pending="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs" \
                  --jq '[.check_runs[] | select(.status != "completed")] | length' 2>/dev/null || echo "?")"
@@ -456,10 +465,11 @@ wait_terminal() {
       say "atomic-land:     checks terminal — $completed completed, 0 pending"
       return 0
     fi
+    elapsed=$(( $(date +%s) - started ))
     if [ "$elapsed" -ge "$WAIT_TIMEOUT" ]; then
       stop "the checks at ${HEAD:0:12}… were not terminal within ${WAIT_TIMEOUT}s (pending=${pending}, completed=${completed}) — re-run the rail later; nothing was recorded or merged"
     fi
-    sleep "$POLL"; elapsed=$((elapsed + POLL))
+    sleep "$POLL"
   done
 }
 

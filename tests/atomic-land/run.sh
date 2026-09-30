@@ -24,7 +24,8 @@
 #  5. A MERGE IS CONFIRMED, NOT INFERRED: admin-merge.sh exiting 0 while the PR
 #     is still OPEN is a FAILURE (the #1359 false-success shape).
 #  6. A NON-TERMINAL HEAD IS NOT LANDED: the wait is bounded and its expiry stops
-#     the rail without recording or merging.
+#     the rail without recording or merging. The bound is a WALL CLOCK, so it
+#     holds even when `--poll 0` is passed (#1395 item 1 — see 7b).
 #  7. A DRAFT IS REFUSED BEFORE ANY CI WORK.
 #  8. AN UNACCEPTED VERDICT IS REFUSED.
 #  9. `--dry-run` MUTATES NOTHING (no update, no record, no comment, no merge).
@@ -258,6 +259,30 @@ calls() { cat "$SCEN/calls"; }
 called() { grep -qF -- "$1" "$SCEN/calls"; }
 count_call() { grep -cF -- "$1" "$SCEN/calls"; }
 
+# Run the rail under a hard wall-clock watchdog and report its exit status.
+#
+# This exists because the wait bound can fail by HANGING rather than by
+# returning: `--poll 0` makes a nominal poll-count bound unreachable (#1395 item
+# 1), so a guard for that class must be able to kill the rail it is guarding.
+# macOS has no `timeout`, hence the explicit poll-and-kill. 124 = the watchdog
+# fired, i.e. the rail was still running past the limit.
+run_rail_watchdog() { # <limit-secs> <extra args...>
+  local limit="$1"; shift
+  ( run_rail "$@" ) &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$limit" ]; then
+      kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null
+  return $?
+}
+
 # ═══ 1. the ordered atomic unit on a BEHIND PR ═══════════════════════════
 echo "── 1. BEHIND PR with an unchanged diff: update → verify → record → land"
 new_scen happy
@@ -351,6 +376,27 @@ printf '3\n' > "$SCEN/pending"
 run_rail 42 --repo "$REPO" --poll 0 --wait-timeout 0
 rc=$?
 [ "$rc" -eq 1 ] && pass "stops on wait expiry (rc 1)" || fail "expected rc 1, got $rc"
+called "record-review" && fail "recorded without terminal checks" || pass "no record before terminal checks"
+called "admin-merge" && fail "landed without terminal checks" || pass "no land before terminal checks"
+grep -q "not terminal" "$SCEN/err" && pass "the refusal names the wait" || fail "the refusal does not name the wait"
+
+# ═══ 7b. the wait bound is a CLOCK, not a poll count (#1395 item 1) ══
+echo "── 7b. the wait bound holds even when --poll 0 makes a poll-count bound inert"
+new_scen pending-poll0
+printf '3\n' > "$SCEN/pending"
+# A permanently-pending check plus `--poll 0 --wait-timeout 2`. Under a
+# nominal-poll-count bound, `elapsed` advances by 0 every iteration, so the
+# documented bound is UNREACHABLE and the rail loops forever holding the PR's
+# lock. The watchdog is what makes the regression a failure rather than a hang.
+run_rail_watchdog 30 42 --repo "$REPO" --poll 0 --wait-timeout 2
+rc=$?
+if [ "$rc" -eq 124 ]; then
+  fail "the rail HUNG: --poll 0 made the wait bound unreachable (the #1395 item-1 defect)"
+elif [ "$rc" -eq 1 ]; then
+  pass "stops on wait expiry (rc 1) — the bound is wall-clock, so --poll 0 cannot defeat it"
+else
+  fail "expected rc 1 (bounded stop), got $rc"
+fi
 called "record-review" && fail "recorded without terminal checks" || pass "no record before terminal checks"
 called "admin-merge" && fail "landed without terminal checks" || pass "no land before terminal checks"
 grep -q "not terminal" "$SCEN/err" && pass "the refusal names the wait" || fail "the refusal does not name the wait"
@@ -690,6 +736,9 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B11b 's/if \[ "\$age" -lt "\${ATOMIC_LAND_LOCK_GRACE:-60}" \]; then/if false; then/'
   # B6: never stop on the terminal-check wait expiry
   mutate_and_expect_fail B6   's/^      stop "the checks at.*$/      return 0/m'
+  # B14 (#1395 item 1): credit `elapsed` from a NOMINAL poll count instead of a
+  # real clock — with `--poll 0` the bound is then unreachable and the rail hangs
+  mutate_and_expect_fail B14  's/^\s*elapsed=\$\(\( \$\(date \+%s\) - started \)\).*$/        elapsed=\$((elapsed + POLL))/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
