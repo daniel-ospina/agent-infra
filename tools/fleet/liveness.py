@@ -249,7 +249,7 @@ _TOOL_STALL_NUM, _TOOL_STALL_DEN = 2, 3
 RECORD_VETO_MS = 72 * 3600 * 1000
 # The reaper's idle proof bound (`REAP_IDLE_HOURS` default 24h).
 IDLE_MS = 24 * 3600 * 1000
-# `CPU_LIVENESS_TOOL_NAMES`, extensions/task-heartbeat.ts:281 — allowlist by
+# `CPU_LIVENESS_TOOL_NAMES`, extensions/task-heartbeat.ts:430 — allowlist by
 # design; `task` is deliberately ABSENT (a nested sub-agent's quiet is
 # legitimate), pinned by builtin-tools.test.ts test id E279a2.
 CPU_LIVENESS_TOOL_NAMES = frozenset({"bash"})
@@ -544,7 +544,7 @@ def tool_veto_expired(tool: Optional[Tool]) -> bool:
     # `"progressing"`, `"unknown"`, a non-attributable tool kind, and a
     # `no-progress` shape whose clause is not yet due ALL reach the watchdog's
     # AGE backstop, and that is the faithful mirror: the watchdog's `tool-stall`
-    # clause (index.ts:3063-3071) has NO CPU or progress conjunct —
+    # clause (index.ts:3068-3072) has NO CPU or progress conjunct —
     # `effToolAge > bound` alone — so it cuts a tool whose CPU is STILL ADVANCING
     # once the age backstop is passed. Progress evidence buys a reprieve from
     # `tool-silence`/`tool-dead` (S = 20 min), never an exemption from the
