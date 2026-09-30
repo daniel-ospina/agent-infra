@@ -440,6 +440,44 @@ fi
 called "record-review" && fail "recorded despite a refused bound" || pass "no record"
 called "admin-merge" && fail "landed despite a refused bound" || pass "no land"
 
+# ═══ 7d. the bound is not overshot by the poll interval ═════════════
+echo "── 7d. --poll cannot push the stop past --wait-timeout"
+new_scen pending-overshoot
+printf '3\n' > "$SCEN/pending"
+# The bound is tested BEFORE the sleep, so an unclamped `sleep "$POLL"` lets the
+# rail outlive its documented bound by up to a whole poll interval — measured on
+# the revision before the clamp: `--wait-timeout 2 --poll 8` ran 10 s wall while
+# printing "waiting (≤2s)". A watchdog at 6 s separates the clamped stop (~2 s)
+# from the unclamped one (~8 s), and turns the regression into a FAILED TEST.
+run_rail_watchdog 6 42 --repo "$REPO" --poll 8 --wait-timeout 2
+rc=$?
+if [ "$rc" -eq 124 ]; then
+  fail "the rail overshot its 2s bound — --poll 8 pushed the stop past the bound"
+elif [ "$rc" -eq 1 ]; then
+  pass "stops at the bound, not a full poll interval later (rc 1)"
+else
+  fail "expected rc 1 (bounded stop), got $rc"
+fi
+grep -q "not terminal" "$SCEN/err" && pass "the refusal names the wait" || fail "the refusal does not name the wait"
+
+# ═══ 7e. an oversized poll interval is refused ═════════════════
+echo "── 7e. an oversized --poll is refused (it multiplies the count-bounded waits)"
+new_scen pending-huge-poll
+printf '3\n' > "$SCEN/pending"
+# Two other waits in the rail are bounded by an ITERATION COUNT (5 polls for a
+# lazy merge state, 20 for the async ref update), so `/bin/sleep` accepting ~68
+# years turns a "bounded" poll into a rail that outlives the run holding the
+# lock. Refusal must be immediate (rc 2).
+run_rail_watchdog 30 42 --repo "$REPO" --poll 99999999999999999999999999 --wait-timeout 2
+rc=$?
+if [ "$rc" -eq 124 ]; then
+  fail "the rail HUNG: an oversized --poll made a sleep outlast every bound"
+elif [ "$rc" -eq 2 ]; then
+  pass "refuses an oversized --poll (rc 2)"
+else
+  fail "expected rc 2 (refused), got $rc"
+fi
+
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
 echo "── 8. --dry-run mutates nothing"
 new_scen dryrun
@@ -791,6 +829,13 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # failing `[` is FALSE — so the bound goes silently OFF and the rail hangs. This
   # proves 7c's refusal is load-bearing rather than decorative.
   mutate_and_expect_fail B15  's/^\[ "\$WAIT_TIMEOUT" -le 86400 \].*$/true/m'
+  # B16 (#1395 item 1, third door): drop the clamp on the final sleep, so the
+  # rail overshoots its own bound by up to a whole poll interval (the bound is
+  # tested before the sleep). 7d's 6 s watchdog then fires at 8 s.
+  mutate_and_expect_fail B16  's/^    remaining=\$\(\( WAIT_TIMEOUT - elapsed \)\)\n    if \[ "\$remaining" -gt "\$POLL" \]; then remaining="\$POLL"; fi\n    sleep "\$remaining"/    sleep "\044POLL"/m'
+  # B17 (#1395 item 1, fourth door): drop the `--poll` cap, so an oversized
+  # interval reaches /bin/sleep and multiplies the count-bounded waits as well.
+  mutate_and_expect_fail B17  's/^\[ "\$POLL" -le 300 \].*$/true/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh

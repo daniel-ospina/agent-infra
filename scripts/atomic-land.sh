@@ -162,6 +162,15 @@ case "$WAIT_TIMEOUT" in ''|*[!0-9]*) err "atomic-land: --wait-timeout must be a 
 # 86400 = 24h.
 [ "$WAIT_TIMEOUT" -le 86400 ] 2>/dev/null || { err "atomic-land: --wait-timeout must be at most 86400s (24h)"; exit 2; }
 case "$POLL" in ''|*[!0-9]*) err "atomic-land: --poll must be a non-negative integer"; exit 2 ;; esac
+# `--poll` is capped for the same reason, and it is the fix for the OTHER waits:
+# two loops in this rail are bounded by an ITERATION COUNT (5 polls for a lazy
+# merge state, 20 for the async ref update), so an unbounded interval multiplies
+# their bound instead of honouring it — `/bin/sleep` takes up to ~68 years, i.e.
+# a "bounded" poll that outlives the run while holding the per-PR lock. The
+# default is 30; 300 is well past any sane re-check cadence, and it keeps those
+# two loops to 25 min and 100 min instead of 68 years. Fails closed on an
+# oversized literal via the same comparison error as the cap above.
+[ "$POLL" -le 300 ] 2>/dev/null || { err "atomic-land: --poll must be at most 300s"; exit 2; }
 case "$MAX_ROUNDS" in ''|*[!0-9]*) err "atomic-land: --max-rounds must be a positive integer"; exit 2 ;; esac
 [ "$MAX_ROUNDS" -ge 1 ] || { err "atomic-land: --max-rounds must be >= 1"; exit 2; }
 [ "$MAX_ROUNDS" -le 5 ] || { err "atomic-land: --max-rounds is bounded at 5"; exit 2; }
@@ -471,7 +480,7 @@ wait_terminal() {
   # loop, bounded by the clock above, not a second way to defeat the bound.
   # Residual: like any wall clock it can step BACKWARDS on an NTP adjustment,
   # which would delay the stop rather than defeat it permanently.
-  local started elapsed pending completed
+  local started elapsed remaining pending completed
   started="$SECONDS"
   while :; do
     pending="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs" \
@@ -486,7 +495,16 @@ wait_terminal() {
     if [ "$elapsed" -ge "$WAIT_TIMEOUT" ]; then
       stop "the checks at ${HEAD:0:12}… were not terminal within ${WAIT_TIMEOUT}s (pending=${pending}, completed=${completed}) — re-run the rail later; nothing was recorded or merged"
     fi
-    sleep "$POLL"
+    # The bound was checked JUST ABOVE, so an unclamped `sleep "$POLL"` lets the
+    # rail overshoot its own bound by up to a whole poll interval — MEASURED on the
+    # revision before this line: `--wait-timeout 2 --poll 8` ran 10 s wall while
+    # printing "waiting (≤2s)". That is the #1395 symptom again (a rail outliving
+    # the bound it reports, holding the per-PR lock), so clamp the final sleep to
+    # what is actually left. min(remaining, POLL) keeps polling at the requested
+    # cadence while making the bound exact to within one poll of the remainder.
+    remaining=$(( WAIT_TIMEOUT - elapsed ))
+    if [ "$remaining" -gt "$POLL" ]; then remaining="$POLL"; fi
+    sleep "$remaining"
   done
 }
 
