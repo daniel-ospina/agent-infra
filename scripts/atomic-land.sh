@@ -502,7 +502,12 @@ wait_terminal() {
     # the bound it reports, holding the per-PR lock), so clamp the final sleep to
     # what is actually left. min(remaining, POLL) keeps polling at the requested
     # cadence while making the bound exact to within one poll of the remainder.
-    remaining=$(( WAIT_TIMEOUT - elapsed ))
+    # `10#` forces BASE 10. The validator and the `-ge` test above read the argument
+    # as DECIMAL, while bare arithmetic reads a leading zero as OCTAL — so
+    # `--wait-timeout 010` would compare as 10 but subtract as 8, and `08` is not a
+    # valid octal literal AT ALL: the arithmetic error unwinds this loop SILENTLY
+    # (bash 3.2), after step [1/4] has already moved the head. Same base everywhere.
+    remaining=$(( 10#$WAIT_TIMEOUT - elapsed ))
     if [ "$remaining" -gt "$POLL" ]; then remaining="$POLL"; fi
     sleep "$remaining"
   done

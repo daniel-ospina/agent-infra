@@ -465,10 +465,12 @@ echo "── 7e. an oversized --poll is refused (it multiplies the count-bounded
 new_scen pending-huge-poll
 printf '3\n' > "$SCEN/pending"
 # Two other waits in the rail are bounded by an ITERATION COUNT (5 polls for a
-# lazy merge state, 20 for the async ref update), so `/bin/sleep` accepting ~68
-# years turns a "bounded" poll into a rail that outlives the run holding the
-# lock. Refusal must be immediate (rc 2).
-run_rail_watchdog 30 42 --repo "$REPO" --poll 99999999999999999999999999 --wait-timeout 2
+# lazy merge state, 20 for the async ref update), so an unbounded interval turns a
+# "bounded" poll into a rail that outlives the run holding the lock — /bin/sleep
+# ACCEPTS 999999999 (~31 years), so this is a real interval and not one the sleep
+# itself rejects. `wait_terminal` is separately clamped, so what this test pins is
+# the REFUSAL (rc 2); the watchdog is a safety net that turns a hang into a FAIL.
+run_rail_watchdog 30 42 --repo "$REPO" --poll 999999999 --wait-timeout 2
 rc=$?
 if [ "$rc" -eq 124 ]; then
   fail "the rail HUNG: an oversized --poll made a sleep outlast every bound"
@@ -476,6 +478,28 @@ elif [ "$rc" -eq 2 ]; then
   pass "refuses an oversized --poll (rc 2)"
 else
   fail "expected rc 2 (refused), got $rc"
+fi
+
+# ═══ 7f. the wait bound is compared and subtracted in the SAME base ═════
+echo "── 7f. a leading-zero --wait-timeout cannot silently abort the wait"
+new_scen pending-octal-bound
+printf '3\n' > "$SCEN/pending"
+# The validator and `[ "$elapsed" -ge "$WAIT_TIMEOUT" ]` both read a leading zero
+# as DECIMAL, but bare `$(( WAIT_TIMEOUT - elapsed ))` reads it as OCTAL — and `08`
+# is not a valid octal literal, so the arithmetic ERROR unwound the loop silently
+# (rc 1, NO stop line) after step [1/4] had already moved the head and staled the
+# record. `10#` pins base 10. The assertion is the STOP LINE, because both the bug
+# and the fix exit non-zero: rc alone cannot tell them apart.
+run_rail_watchdog 30 42 --repo "$REPO" --poll 0 --wait-timeout 08
+rc=$?
+if [ "$rc" -eq 124 ]; then
+  fail "the rail HUNG on a leading-zero --wait-timeout"
+elif grep -q "not terminal" "$SCEN/err"; then
+  pass "stops on the wait bound and names it (same base, rc $rc)"
+elif grep -q "value too great for base" "$SCEN/err"; then
+  fail "the arithmetic read 08 as octal and aborted silently (no stop, no record)"
+else
+  fail "expected a bounded stop naming the wait, got rc $rc"
 fi
 
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
@@ -773,6 +797,16 @@ called "pr update-branch" && fail "spent the attestation under a rotated key (B5
 if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   echo "── 18. mutation coverage — each declared bypass class must be caught"
   MUT="$TMP/mut"; mkdir -p "$MUT"
+  # Two perl traps have cost this harness real coverage (all four instances fixed
+  # here, found by a fresh review of this file): (1) `$` is NOT literal in a perl
+  # REPLACEMENT — `"$GH"` becomes `""` unless it is spelled `\044GH`, silently
+  # emptying the injected command; (2) `||` in a perl PATTERN is alternation with
+  # an EMPTY branch, so it matches at OFFSET 0 and corrupts the file instead of
+  # replacing the target guard — it must be spelled `\|\|`. The `bash -n` gate
+  # below makes trap (2) LOUD. It CANNOT catch trap (1): an emptied replacement is
+  # still perfectly valid bash, so it reddens for the WRONG reason while the
+  # harness still prints "class covered". Trap (1) is caught only by reading the
+  # diff, which is why every expression here is hand-audited.
   mutate_and_expect_fail() { # <name> <perl-expr>
     local name="$1"
     local expr="$2"
@@ -780,6 +814,16 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
     cp "$RAIL" "$src"
     if ! perl -0pi -e "$expr" "$src" 2>/dev/null; then fail "mutation $name: perl failed"; return; fi
     if cmp -s "$src" "$RAIL"; then fail "mutation $name reddened nothing — the mutation did not apply"; return; fi
+    # A mutation that CORRUPTS the file "reddens" the suite too — every scenario
+    # fails because the rail cannot be parsed — which is a FALSE "class covered"
+    # for the guard it claims. `cmp` cannot tell corruption from mutation, so the
+    # result must still PARSE. This catches the `||`-in-a-pattern trap only; it
+    # does NOT catch an emptied-`$` replacement, which still parses and still
+    # reddens for the wrong reason (see the traps note above).
+    if ! bash -n "$src" 2>/dev/null; then
+      fail "mutation $name produced a file that does not PARSE — corrupt mutation, not coverage"
+      return
+    fi
     ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_SUITE_RAIL="$src" bash "$0" >"$MUT/$name.log" 2>&1
     if [ $? -ne 0 ]; then
       pass "mutation $name reddens the suite (class covered)"
@@ -788,13 +832,13 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
     fi
   }
   # B1: pass the CURRENT head to record-review instead of the prior head
-  mutate_and_expect_fail B1   's/"\$RECORD_SH" "\$PR" "\$prior"/"$RECORD_SH" "$PR" "$HEAD"/'
+  mutate_and_expect_fail B1   's/"\$RECORD_SH" "\$PR" "\$prior"/"\044RECORD_SH" "\044PR" "\044HEAD"/'
   # B2a: drop the record precondition
   mutate_and_expect_fail B2a  's/if ! read_record; then/if false; then/'
   # B2b: accept every verdict (BOTH the pre-unit gate and the post-record re-read guard)
   mutate_and_expect_fail B2b  's/if ! verdict_accepted "\$RECORD_VERDICT"; then/if false; then/g'
   # B3: add a hand-rolled --admin merge beside the mandated rail
-  mutate_and_expect_fail B3   's/bash "\$ADMIN_MERGE" "\$PR"/"$GH" pr merge "$PR" --admin; bash "$ADMIN_MERGE" "$PR"/'
+  mutate_and_expect_fail B3   's/bash "\$ADMIN_MERGE" "\$PR"/"\044GH" pr merge "\044PR" --admin; bash "\044ADMIN_MERGE" "\044PR"/'
   # B4: never confirm the merge
   mutate_and_expect_fail B4   's/confirm_merged\(\) \{/confirm_merged() { return 0;/'
   # B5: allow a draft
@@ -832,10 +876,15 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # B16 (#1395 item 1, third door): drop the clamp on the final sleep, so the
   # rail overshoots its own bound by up to a whole poll interval (the bound is
   # tested before the sleep). 7d's 6 s watchdog then fires at 8 s.
-  mutate_and_expect_fail B16  's/^    remaining=\$\(\( WAIT_TIMEOUT - elapsed \)\)\n    if \[ "\$remaining" -gt "\$POLL" \]; then remaining="\$POLL"; fi\n    sleep "\$remaining"/    sleep "\044POLL"/m'
+  mutate_and_expect_fail B16  's/^    remaining=\$\(\( 10#\$WAIT_TIMEOUT - elapsed \)\)\n    if \[ "\$remaining" -gt "\$POLL" \]; then remaining="\$POLL"; fi\n    sleep "\$remaining"/    sleep "\044POLL"/m'
   # B17 (#1395 item 1, fourth door): drop the `--poll` cap, so an oversized
   # interval reaches /bin/sleep and multiplies the count-bounded waits as well.
   mutate_and_expect_fail B17  's/^\[ "\$POLL" -le 300 \].*$/true/m'
+  # B18 (#1395 item 1, fifth door): drop the `10#` base pin, so bare arithmetic
+  # reads a leading-zero `--wait-timeout` as OCTAL while the comparison reads it
+  # as DECIMAL — and `08` is not a valid octal literal, so the arithmetic error
+  # unwinds the wait loop SILENTLY. Base 10 must be stated, not assumed.
+  mutate_and_expect_fail B18  's/remaining=\$\(\( 10#\$WAIT_TIMEOUT - elapsed \)\)/remaining=\044(( WAIT_TIMEOUT - elapsed ))/'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
@@ -845,9 +894,9 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # B10a: never re-check the base BRANCH before landing
   mutate_and_expect_fail B10a 's/if \[ "\$now_base" != "\$CERT_BASE" \]; then/if false; then/'
   # B10b: never re-check the base's MERGE BASE before landing
-  mutate_and_expect_fail B10b 's/if \[ -z "\$now_mb" \] || \[ "\$now_mb" != "\$CERT_MB" \]; then/if false; then/'
+  mutate_and_expect_fail B10b 's/if \[ -z "\$now_mb" \] \|\| \[ "\$now_mb" != "\$CERT_MB" \]; then/if false; then/'
   # B10c: never compare the record's own merge base to the live one (pre-unit)
-  mutate_and_expect_fail B10c 's/if \[ -z "\$live_mb" \] || \[ "\$live_mb" != "\$RECORD_MB" \]; then/if false; then/'
+  mutate_and_expect_fail B10c 's/if \[ -z "\$live_mb" \] \|\| \[ "\$live_mb" != "\$RECORD_MB" \]; then/if false; then/'
   # B12: never detect a concurrent base ADVANCE
   mutate_and_expect_fail B12  's/if \[ "\$now_tip" != "\$CERT_BASE_TIP" \]; then/if false; then/'
   # B12b: the CAPTURE read must fail closed — an empty capture must not silently
