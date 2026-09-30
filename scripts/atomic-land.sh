@@ -151,6 +151,16 @@ done
 [ -n "$PR" ] || { err "atomic-land: a PR number is required"; usage >&2; exit 2; }
 case "$PR" in *[!0-9]*) err "atomic-land: PR must be numeric (got $PR)"; exit 2 ;; esac
 case "$WAIT_TIMEOUT" in ''|*[!0-9]*) err "atomic-land: --wait-timeout must be a non-negative integer"; exit 2 ;; esac
+# A CAP, not just a shape check. `[ "$elapsed" -ge "$WAIT_TIMEOUT" ]` compares as
+# a machine integer, and a literal too wide for that comparison ERRORS — and a
+# failing `[` is FALSE, so an oversized value silently DISABLES the bound and the
+# rail loops forever while holding the PR's lock. That is the #1395 item-1 defect
+# arriving by a second door, and it is the same class B12b pins (a guard a failed
+# comparison turns OFF). Capping it also rejects an oversized literal HERE, via
+# that very error, so this line fails closed by construction. `2>/dev/null` hides
+# that raw `[: integer expression expected`, which is bash's, not our diagnostic.
+# 86400 = 24h.
+[ "$WAIT_TIMEOUT" -le 86400 ] 2>/dev/null || { err "atomic-land: --wait-timeout must be at most 86400s (24h)"; exit 2; }
 case "$POLL" in ''|*[!0-9]*) err "atomic-land: --poll must be a non-negative integer"; exit 2 ;; esac
 case "$MAX_ROUNDS" in ''|*[!0-9]*) err "atomic-land: --max-rounds must be a positive integer"; exit 2 ;; esac
 [ "$MAX_ROUNDS" -ge 1 ] || { err "atomic-land: --max-rounds must be >= 1"; exit 2; }
@@ -453,8 +463,12 @@ wait_terminal() {
   # nominal 90) — and `--poll 0` advanced the counter by ZERO, so the bound could
   # never be reached at all and the rail looped forever while holding the PR's
   # lock and a landing slot. Both are one defect: a counter that is not a clock.
-  # $SECONDS is bash's own elapsed-time counter: fork-free (so `--poll 0` does
-  # not fork once per iteration), and it cannot be affected by the poll interval.
+  # $SECONDS is bash's own elapsed-time counter: it removes the CLOCK's fork (the
+  # `$(date +%s)` that the first cut of this fix ran every iteration) and it
+  # cannot be affected by the poll interval. It does NOT remove the loop's own
+  # fork: with `--poll 0`, `sleep 0` is still /bin/sleep and forks (measured ~143
+  # iterations/s, against ~98k for a pure builtin loop) — that is just a busy
+  # loop, bounded by the clock above, not a second way to defeat the bound.
   # Residual: like any wall clock it can step BACKWARDS on an NTP adjustment,
   # which would delay the stop rather than defeat it permanently.
   local started elapsed pending completed

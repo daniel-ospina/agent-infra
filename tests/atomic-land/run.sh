@@ -25,7 +25,9 @@
 #     is still OPEN is a FAILURE (the #1359 false-success shape).
 #  6. A NON-TERMINAL HEAD IS NOT LANDED: the wait is bounded and its expiry stops
 #     the rail without recording or merging. The bound is a WALL CLOCK, so it
-#     holds even when `--poll 0` is passed (#1395 item 1 — see 7b).
+#     holds even when `--poll 0` is passed (#1395 item 1 — see 7b), and it is
+#     CAPPED, so a bound `[` cannot compare is REFUSED rather than silently
+#     inert (7c).
 #  7. A DRAFT IS REFUSED BEFORE ANY CI WORK.
 #  8. AN UNACCEPTED VERDICT IS REFUSED.
 #  9. `--dry-run` MUTATES NOTHING (no update, no record, no comment, no merge).
@@ -416,6 +418,28 @@ called "record-review" && fail "recorded without terminal checks" || pass "no re
 called "admin-merge" && fail "landed without terminal checks" || pass "no land before terminal checks"
 grep -q "not terminal" "$SCEN/err" && pass "the refusal names the wait" || fail "the refusal does not name the wait"
 
+# ═══ 7c. an unrepresentable wait bound is refused, not silently inert ════
+echo "── 7c. an oversized --wait-timeout is refused instead of disabling the bound"
+new_scen pending-huge-timeout
+printf '3\n' > "$SCEN/pending"
+# `[ "$elapsed" -ge "$WAIT_TIMEOUT" ]` compares machine integers. A literal too
+# wide for that comparison makes the `[` ERROR, and a failing `[` is FALSE — so
+# before the cap this value left the bound silently OFF and the rail looped
+# forever holding the PR's lock: the #1395 item-1 hang by a second door.
+# Refusal must be immediate (rc 2). The watchdog is what turns a regression back
+# into a HANG into a FAILED TEST.
+run_rail_watchdog 30 42 --repo "$REPO" --poll 0 --wait-timeout 99999999999999999999999999
+rc=$?
+if [ "$rc" -eq 124 ]; then
+  fail "the rail HUNG: an oversized --wait-timeout silently disabled the bound"
+elif [ "$rc" -eq 2 ]; then
+  pass "refuses an unrepresentable --wait-timeout (rc 2) instead of looping"
+else
+  fail "expected rc 2 (refused), got $rc"
+fi
+called "record-review" && fail "recorded despite a refused bound" || pass "no record"
+called "admin-merge" && fail "landed despite a refused bound" || pass "no land"
+
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
 echo "── 8. --dry-run mutates nothing"
 new_scen dryrun
@@ -762,6 +786,11 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # if that declaration is later narrowed, which is what makes the pre-fix
   # `elapsed=$((elapsed + POLL))` spelling reproduce its hang on every bash.
   mutate_and_expect_fail B14  's/^\s*elapsed=\$\(\( SECONDS - started \)\).*$/        elapsed=\044(( \044{elapsed:-0} + POLL ))/m'
+  # B15 (#1395 item 1, second door): drop the `--wait-timeout` cap. An oversized
+  # literal then reaches `[ "$elapsed" -ge "$WAIT_TIMEOUT" ]`, which ERRORS, and a
+  # failing `[` is FALSE — so the bound goes silently OFF and the rail hangs. This
+  # proves 7c's refusal is load-bearing rather than decorative.
+  mutate_and_expect_fail B15  's/^\[ "\$WAIT_TIMEOUT" -le 86400 \].*$/true/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
