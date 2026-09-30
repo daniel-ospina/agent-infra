@@ -753,7 +753,7 @@ PR DIFF:
 
 Dispatch to the real reviewer definitions — do not work from the gloss below: read
 `skills/reviewers/integration/SKILL.md` (INT1–INT7) and
-`skills/reviewers/architectural-soundness/SKILL.md` (AS1–AS7) in full, plus
+`skills/reviewers/architectural-soundness/SKILL.md` (AS1–AS7, incl. **AS3** — a common architectural concern left unaddressed: scalability, observability, security, deployment) in full, plus
 `skills/reviewers/contract-completeness/SKILL.md` (CC1–CC9) at `ARCH_RATING=high`, and apply
 their checks to the diff.
 ```

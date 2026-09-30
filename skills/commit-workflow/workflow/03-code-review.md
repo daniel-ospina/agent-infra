@@ -24,7 +24,7 @@ fi
 : ${ONTOLOGY_RATING:=""}
 ```
 
-Pass these ratings to code-review Step 4 dispatch logic. When all empty, the always-on merged reviewers (**A** Guidance & History; **B** Correctness & Security — bug scan two-pass + security) still run, and the surface-matched sections apply at default depth.
+Pass these ratings to code-review Step 4 dispatch logic. When all empty, the panel is still filled by the risk class: **A** (Guidance & History) and **B** (Correctness & Security — bug scan two-pass + security) run at every class **above Low**, while at **Low** the panel is **B alone**; the surface-matched sections apply at default depth and never add a reviewer.
 
 ## Step 2 — Code-Review Gate
 
