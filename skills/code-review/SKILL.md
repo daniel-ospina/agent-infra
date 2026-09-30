@@ -53,7 +53,7 @@ steps:
 >
 > **Unified v3.3.0** — agent-neutral. Consolidates Claude (v1.8.0) and Pi (v2.0.0) versions. Test coverage Step 0, **5 merged reviewers** (A Guidance & History, B Correctness & Security with the bug scan's two ordered passes, C Architecture & Data, D Surface & Config, E Infrastructure — conditional), convergence-gated fixer loop, `--standard-tier` flag, Supabase error logging, merge-dedup step. Uses agent-neutral sub-agent dispatch.
 >
-> **v3.3.0 (reviewer merge).** The 11 dispatch slots are merged into 5 reviewers **by concern** — every former lens is covered by exactly one merged reviewer, and the bug scan's two passes stay two passes in order. `RISK_CLASS` (from `proportional-gates` §Change Classification) now **caps the count**: Low → reviewer B only, one pass, no re-review loop. File surfaces (`UI_TOUCHED`/`ARCH_TOUCHED`/`DATA_TOUCHED`/`CONFIG_TOUCHED`) select which **sections** of C/D apply and never add a reviewer; `INFRA_RISK` scales depth inside the single reviewer E. `ISSUE:` block shape and `check_type` values are unchanged. Supersedes the reviewer-*count* clause of agent-infra #80 (owner directive 2026-09-30, *"let's merge reviewers"*); surface-first **detection** is preserved.
+> **v3.3.0 (reviewer merge).** The 11 dispatch slots are merged into 5 reviewers **by concern** — every former lens is covered by exactly one merged reviewer, and the bug scan's two passes stay two passes in order. `RISK_CLASS` (from `proportional-gates` §Change Classification) now **caps the count of the A/B/C/D panel**, at the counts `proportional-gates` §Review Cycles owns (Low 1, Low-Medium 2, Medium-High 3, High 4 — read its table; it is the single owner). The panel is filled in priority order — **B** (Correctness & Security), then the first surface-matched reviewer, then **A** (Guidance & History), then the second — and truncated to the class's count. File surfaces (`UI_TOUCHED`/`ARCH_TOUCHED`/`DATA_TOUCHED`/`CONFIG_TOUCHED`) therefore select **which** reviewers fill the panel and which **sections** of C/D apply — never **how many** run. `INFRA_RISK` scales depth inside the single reviewer E, which is appended whenever it is set — **at every class, Low included** (infra files are never trivial, Step 0.8) — and is never counted against the panel cap. The Low class runs **one reviewer round (both of B's bug-scan passes, in order), no re-review loop**. `ISSUE:` block shape and `check_type` values are unchanged. Supersedes the reviewer-*count* clause of agent-infra #80 (owner directive 2026-09-30, *"let's merge reviewers"*); surface-first **detection** is preserved.
 
 # Code Review
 
@@ -402,7 +402,23 @@ Resolve the change's **risk class** and extract complexity ratings from the link
 
 **0. Resolve the risk class — BEFORE dispatch (do not skip):**
 
-Classify the **change** with `proportional-gates` §Change Classification (overall risk = the highest dimension), and read the reviewer count and cycle cap from `proportional-gates` §Review Cycles — the **single owner** of reviewer counts and cycle caps. Do **not** restate its cells here. Store `RISK_CLASS=low|low-medium|medium-high|high` (the tier crosswalk maps `micro`→Low, `standard`→Low-Medium, `complex`→High).
+Classify the **change** with `proportional-gates` §Change Classification (overall risk = the highest dimension), and read the reviewer count and cycle cap from `proportional-gates` §Review Cycles — the **single owner** of reviewer counts and cycle caps. Do **not** restate its cells here. This step must produce **one** of the four values §Review Cycles' own row labels name, and Step 4 consumes that exact value:
+
+| Classification result (overall = the highest dimension) | `RISK_CLASS` |
+|---|---|
+| Highest dimension = **Low** — docs/CSS/strings only, no runtime change, existing pattern, trivially revertible | `low` |
+| Highest dimension = **Medium**, small change following an existing pattern | `low-medium` |
+| Highest dimension = **Medium**, large change with some novelty | `medium-high` |
+| Highest dimension = **High** — multi-file/shared types/DB/auth, new integration, new pattern, destructive | `high` |
+
+```bash
+# Resolve RISK_CLASS per the table above and store it for Step 4. It MUST be set —
+# Step 4's panel cap reads it, and an unset value would otherwise silently shrink the panel.
+# Tier crosswalk (secondary route, proportional-gates §Review Cycles): complexity:micro ->
+# low, complexity:standard -> low-medium, complexity:complex -> high. The crosswalk cannot
+# produce `medium-high`; that value comes from the two Medium rows in the table above.
+RISK_CLASS=<low|low-medium|medium-high|high>
+```
 
 The Low **code-impact** class is a property of the **CHANGE**, not of the linked issue (#1348): a docs/stylesheet-only PR linked to a `complexity:standard` issue is still Low.
 
@@ -444,7 +460,8 @@ CONFIG_TOUCHED=$(echo "$FILES_CHANGED" | grep -qE '\.(yaml|yml|toml)$|(\.mcp\.js
 **3. Section matrix (applied in Step 4) — the surface selects a SECTION, never a reviewer:**
 
 The merged reviewer named in each row is dispatched **once**; the surface flag selects which
-of its sections apply. A surface match must never increase the number of reviewers
+of its sections apply — and, through Step 4's priority fill, **which** surface reviewer occupies
+a slot in the capped panel. A surface match must never increase the number of reviewers
 (`proportional-gates` §Review Cycles owns the count; the risk class caps it).
 
 | Surface | Default (no rating) | `medium` rating | `high` rating | Reviewer |
@@ -457,23 +474,38 @@ of its sections apply. A surface match must never increase the number of reviewe
 Store all variables (`RISK_CLASS`, `UX_RATING`, `ARCH_RATING`, `ONTOLOGY_RATING`, the four
 `*_TOUCHED` flags, and `INFRA_RISK`) for Step 4 dispatch.
 
+> Whether a matched surface reviewer actually **runs** is Step 4's panel cap: at the smaller
+> classes a second surface reviewer may not win a slot. That is the cap doing its job — the
+> match selected it, the class's count decided the panel — not a silent coverage loss.
+
 ---
 
-### Step 4 — Parallel Review (risk class caps the count; the surface selects sections)
+### Step 4 — Parallel Review (the risk class caps the panel; the surface selects which reviewers)
 
-**The risk class caps the count. The file surface selects what is examined — never how many
-reviewers run.** Read the count and the cycle cap from `proportional-gates` §Review Cycles
-(the single owner of reviewer counts and cycle caps — do not restate its cells here) and the
-class from §Change Classification (`RISK_CLASS`, resolved in Step 3.6).
+**The risk class caps the count of the A/B/C/D panel. The file surface selects *which*
+reviewers fill it — it never decides how many run.** Read the count and the cycle cap from
+`proportional-gates` §Review Cycles (the single owner of reviewer counts and cycle caps — do
+not restate its cells here) and the class from §Change Classification (`RISK_CLASS`, resolved
+in Step 3.6).
 
-- **`RISK_CLASS=low` → reviewer B only** (Correctness & Security): **one pass, no re-review
-  loop**. `proportional-gates` §Review Cycles gives the Low row the skip sentinel (`—`) — one
-  reviewer pass, no re-review. Do **not** add surface-matched reviewers or reviewer E on a Low
-  change, however many surface flags match: a surface flag is not a reason to expand the panel.
-- **Any class above Low** → dispatch the always-on pair (**A** Guidance & History, **B**
-  Correctness & Security) plus the surface-matched **C** and/or **D**, plus **E** when
-  `INFRA_RISK` is set. The class and the ratings scale **depth inside** each merged reviewer —
-  they never add a reviewer.
+- **Fill in priority order, then truncate.** **B** (Correctness & Security) first, then the
+  first surface-matched reviewer, then **A** (Guidance & History), then the second
+  surface-matched reviewer — truncated to the class's count. So a surface match can *displace*
+  A at the smaller classes; it can never extend the panel.
+- **Surface tiebreak:** when both surfaces match, **C** (Architecture & Data) takes the earlier
+  slot and **D** (Surface & Config) is the second — the reviewer-table order below.
+- **A class whose count exceeds the eligible roles is not padded.** With no surface match the
+  panel is just B + A, whatever the class — the count is a ceiling, not a quota.
+- **`RISK_CLASS=low` → one reviewer round (both of B's bug-scan passes, in order), no re-review
+  loop.** `proportional-gates` §Review Cycles gives the Low row the skip sentinel (`—`) — one
+  reviewer pass, no re-review. Both of B's passes run; what Low skips is the re-review loop,
+  not the deep caller/callee pass (that pass is skipped only by `--standard-tier`).
+- **`INFRA_RISK` is orthogonal to the panel cap.** Reviewer **E** is appended whenever
+  `INFRA_RISK` is set — **at every class, Low included** (Step 0.8: skills, ontology, templates
+  and extensions are never trivial) — and is never counted against the class's count. The
+  largest dispatched set is therefore the class's panel **plus** E. Surface flags never add E.
+- The **ratings** scale **depth inside** each merged reviewer. The class does not — it selects
+  the panel and its size.
 
 Five merged reviewers, each covering the lenses that were previously separate agents
 (11 → 5; for a normal, non-infrastructure PR only the primary set fires):
@@ -481,48 +513,85 @@ Five merged reviewers, each covering the lenses that were previously separate ag
 | Reviewer | Covers | Fires when |
 |----------|--------|------------|
 | **A — Guidance & History** | CLAUDE.md + code-comment compliance; git history/blame; previous PR comments | always (class above Low) |
-| **B — Correctness & Security** | bug scan — **two ordered passes** (blind diff scan, then deep caller/callee); security review | always (Low class: the only reviewer) |
-| **C — Architecture & Data** | `ARCH_TOUCHED` → integration + architectural soundness (+ contract completeness at `ARCH_RATING=high`); `DATA_TOUCHED` → schema correctness (+ ontology alignment at `ONTOLOGY_RATING=high`) | `ARCH_TOUCHED` or `DATA_TOUCHED` |
-| **D — Surface & Config** | `UI_TOUCHED` → UX consistency/coverage (+ realism at `UX_RATING=high`); `CONFIG_TOUCHED` → config validation | `UI_TOUCHED` or `CONFIG_TOUCHED` |
+| **B — Correctness & Security** | bug scan — **two ordered passes** (blind diff scan, then deep caller/callee); security review | always (at the Low class it is the only panel member) |
+| **C — Architecture & Data** | `ARCH_TOUCHED` → integration + architectural soundness (+ contract completeness at `ARCH_RATING=high`); `DATA_TOUCHED` → schema correctness (+ ontology alignment at `ONTOLOGY_RATING=high`) | `ARCH_TOUCHED` or `DATA_TOUCHED`, **and** it wins a slot in the class's panel (priority fill above) |
+| **D — Surface & Config** | `UI_TOUCHED` → UX consistency/coverage (+ realism at `UX_RATING=high`); `CONFIG_TOUCHED` → config validation | `UI_TOUCHED` or `CONFIG_TOUCHED`, **and** it wins a slot in the class's panel (priority fill above) |
 | **E — Infrastructure** | skill infrastructure; ontology & templates; extension safety — `INFRA_RISK` low/medium/high scales **depth inside this one reviewer** | `INFRA_RISK` is set |
+
+Reviewer **C**'s and **D**'s sections are implemented by the catalog skills under
+`skills/reviewers/` — each section below names the catalog it dispatches to, and that catalog is
+the specification (these sections are routing glosses, not a second copy of the checks).
 
 Each selected reviewer runs in parallel via Pi `task`. Each receives the PR diff, CLAUDE.md
 paths, affected files, and research context (if any), and returns `ISSUE:` blocks or
 `NO ISSUES FOUND`. The `ISSUE:` block shape and every `check_type` value are unchanged.
 
-**Dispatch logic:**
+**Dispatch logic** (bash; run it as written — the panel cap must be the class's count and
+nothing else):
+
 ```bash
-# Risk class caps the COUNT (proportional-gates §Review Cycles owns the numbers; do not restate them here).
-# Surface flags select SECTIONS of reviewers C and D — they must never add a reviewer.
+#!/usr/bin/env bash
+# ── Reviewer panel selection ───────────────────────────────────────────────────
+# The risk class caps the COUNT. The counts below are `proportional-gates` §Review
+# Cycles' — that table owns them; this `case` is its implementation, not a second source.
+# The surface flags select WHICH reviewers fill the panel — never how many.
+# Reviewer E is orthogonal: appended on INFRA_RISK at every class (Step 0.8).
 
-if [ "$RISK_CLASS" = "low" ]; then
-  # one reviewer pass, no re-review loop
-  AGENTS="Reviewer B (Correctness & Security)"
-  echo "[code-review] RISK_CLASS=low — the class caps the count at one reviewer: B only, no re-review loop"
-else
-  # Always-on pair
-  AGENTS="Reviewer A (Guidance & History), Reviewer B (Correctness & Security)"
+case "$RISK_CLASS" in
+  low)         PANEL_MAX=1 ;;   # §Review Cycles row "Low"
+  low-medium)  PANEL_MAX=2 ;;   # §Review Cycles row "Low-Medium"
+  medium-high) PANEL_MAX=3 ;;   # §Review Cycles row "Medium-High"
+  high)        PANEL_MAX=4 ;;   # §Review Cycles row "High"
+  *)
+    PANEL_MAX=4
+    echo "[code-review] RISK_CLASS unset or unrecognised ('${RISK_CLASS:-}') — Step 3.6 must resolve it before dispatch; failing safe to the widest panel (high)"
+    ;;
+esac
 
-  # Surface-matched reviewers — one dispatch each, sections selected by the flags
-  [ "$UI_TOUCHED" = "true" ] || [ "$CONFIG_TOUCHED" = "true" ] && AGENTS="$AGENTS, Reviewer D (Surface & Config)"
-  [ "$ARCH_TOUCHED" = "true" ] || [ "$DATA_TOUCHED" = "true" ] && AGENTS="$AGENTS, Reviewer C (Architecture & Data)"
-
-  if [ -z "$UX_RATING$ARCH_RATING$ONTOLOGY_RATING" ]; then
-    echo "[code-review] No complexity ratings in issue — surface-matched sections still apply (default depth); ratings scale depth when present"
-  fi
-
-  # Infrastructure dispatch — ONE merged reviewer; the tier scales depth INSIDE E, never the reviewer count
-  if [ -n "$INFRA_RISK" ]; then
-    AGENTS="$AGENTS, Reviewer E (Infrastructure — depth: $INFRA_RISK)"
-    echo "[code-review] Infrastructure files detected (risk: $INFRA_RISK) — dispatching reviewer E; the tier scales depth inside it"
-  fi
+# Surface-matched reviewers — C before D (the reviewer-table order is the tiebreak).
+SURFACE=()
+if [ "$ARCH_TOUCHED" = "true" ] || [ "$DATA_TOUCHED" = "true" ]; then
+  SURFACE+=("Reviewer C (Architecture & Data)")
 fi
+if [ "$UI_TOUCHED" = "true" ] || [ "$CONFIG_TOUCHED" = "true" ]; then
+  SURFACE+=("Reviewer D (Surface & Config)")
+fi
+
+# Priority order: B, first surface reviewer, A, second surface reviewer — then truncate.
+CANDIDATES=("Reviewer B (Correctness & Security)")
+if [ "${#SURFACE[@]}" -gt 0 ]; then CANDIDATES+=("${SURFACE[0]}"); fi
+CANDIDATES+=("Reviewer A (Guidance & History)")
+if [ "${#SURFACE[@]}" -gt 1 ]; then CANDIDATES+=("${SURFACE[1]}"); fi
+
+PANEL=()
+for ((i = 0; i < PANEL_MAX && i < ${#CANDIDATES[@]}; i++)); do
+  PANEL+=("${CANDIDATES[$i]}")
+done
+
+AGENTS=""
+for r in "${PANEL[@]}"; do AGENTS="${AGENTS:+$AGENTS, }$r"; done
+
+# Ratings scale depth INSIDE a reviewer; they never add one.
+if [ -z "$UX_RATING$ARCH_RATING$ONTOLOGY_RATING" ]; then
+  echo "[code-review] No complexity ratings in issue — surface-matched sections still apply (default depth); ratings scale depth when present"
+fi
+
+# Reviewer E — Infrastructure: ONE reviewer, appended whenever INFRA_RISK is set, at EVERY
+# class (Low included), because infra files are never trivial (Step 0.8). Orthogonal to the
+# panel cap: it is appended after truncation and is never counted against PANEL_MAX.
+if [ -n "$INFRA_RISK" ]; then
+  AGENTS="${AGENTS:+$AGENTS, }Reviewer E (Infrastructure — depth: $INFRA_RISK)"
+  echo "[code-review] Infrastructure files detected (risk: $INFRA_RISK) — dispatching reviewer E; the tier scales depth inside it"
+fi
+
+echo "[code-review] RISK_CLASS=${RISK_CLASS:-<unset>} panel_max=$PANEL_MAX — dispatching: $AGENTS"
 ```
 
 > ⛔ **A surface match is not a reviewer.** `UI_TOUCHED`/`ARCH_TOUCHED`/`DATA_TOUCHED`/
-> `CONFIG_TOUCHED` decide *what a reviewer looks at*; `RISK_CLASS` and the ratings decide *how
-> many reviewers run and how deep*. Inverting that — letting a file extension raise the panel —
-> is the defect this section exists to prevent.
+> `CONFIG_TOUCHED` decide *what a reviewer looks at* and *which* surface reviewer occupies a
+> panel slot; `RISK_CLASS` caps the panel's **size** and the ratings decide how deep each
+> reviewer goes. Inverting that — letting a file extension raise the panel past the class's
+> count — is the defect this section exists to prevent.
 
 **Shared dispatch preamble — inject into EVERY reviewer prompt below** (#1141):
 ```
@@ -594,7 +663,7 @@ ISSUE:
   suggestion: <what to fix>
 ```
 
-**Reviewer B — Correctness & Security** (always-on; at `RISK_CLASS=low` this is the only reviewer — one pass, no re-review loop; absorbs the former Bug Scan and Security Review agents):
+**Reviewer B — Correctness & Security** (always-on; at `RISK_CLASS=low` this reviewer is the whole panel — **one reviewer round: BOTH bug-scan passes below run, in order**, and the round carries no re-review loop; absorbs the former Bug Scan and Security Review agents):
 
 **Part 1 — Bug scan (two passes, in order):**
 
@@ -664,7 +733,7 @@ ISSUE:
   suggestion: <fix>
 If no high-confidence findings: NO ISSUES FOUND
 
-At `RISK_CLASS=low` this is the whole review: one pass, no re-review loop (`proportional-gates` §Review Cycles — the Low row's skip sentinel). Return this reviewer's findings and stop.
+At `RISK_CLASS=low` this is the whole review: **one reviewer round, and BOTH bug-scan passes above run in it, in order** — the skipped thing is the re-review loop (`proportional-gates` §Review Cycles — the Low row's skip sentinel), never pass 2. Return this reviewer's findings and stop.
 
 **Reviewer C — Architecture & Data** (surface: `ARCH_TOUCHED` or `DATA_TOUCHED` — one dispatch; the flags select which sections apply, ratings scale depth inside them; absorbs the former Architecture and Data + Schema agents):
 
@@ -681,6 +750,12 @@ PR DIFF:
 ```
 
 *Section C1 — Architecture* (`ARCH_TOUCHED`; rating absent or `medium` → integration + architectural-soundness; `ARCH_RATING = high` → also contract-completeness):
+
+Dispatch to the real reviewer definitions — do not work from the gloss below: read
+`skills/reviewers/integration/SKILL.md` (INT1–INT7) and
+`skills/reviewers/architectural-soundness/SKILL.md` (AS1–AS7) in full, plus
+`skills/reviewers/contract-completeness/SKILL.md` (CC1–CC9) at `ARCH_RATING=high`, and apply
+their checks to the diff.
 ```
 Review the change for integration correctness and architectural soundness:
 - integration: does the change fit the surrounding system's contracts, wiring, and call sites?
@@ -689,6 +764,11 @@ Review the change for integration correctness and architectural soundness:
 ```
 
 *Section C2 — Data + Schema* (`DATA_TOUCHED`; rating absent or `medium` → schema-correctness; `ONTOLOGY_RATING = high` → also ontology-alignment):
+
+Dispatch to the real reviewer definitions — do not work from the gloss below: read
+`skills/reviewers/schema-correctness/SKILL.md` (SC1–SC9) in full, plus
+`skills/reviewers/ontology-alignment/SKILL.md` (OA1–OA6) at `ONTOLOGY_RATING=high`, and apply
+their checks to the diff.
 ```
 Review the change for data/schema correctness:
 - schema-correctness: are migrations/schema/types correct, ordered, and safe? Do types match the stored shape?
@@ -720,6 +800,12 @@ PR DIFF:
 ```
 
 *Section D1 — UX* (`UI_TOUCHED`; rating absent or `medium` → ux-consistency + ux-coverage; `UX_RATING = high` → also ux-realism):
+
+Dispatch to the real reviewer definitions — do not work from the gloss below: read
+`skills/reviewers/ux-consistency/SKILL.md` (UXN1–UXN6) and `skills/reviewers/ux-coverage/SKILL.md`
+(UXC1–UXC6, incl. UXC5 — focus management, screen-reader announcements, reduced-motion) in
+full, plus `skills/reviewers/ux-realism/SKILL.md` (UXR1–UXR7, incl. UXR6 — device constraint)
+at `UX_RATING=high`, and apply their checks to the diff.
 ```
 Review the UI change through the UX lenses:
 - ux-consistency: does the change follow the established component/pattern conventions?
@@ -801,6 +887,8 @@ ISSUE:
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>
+
+If no issues: NO ISSUES FOUND
 ```
 
 *Section E2 — Ontology & Templates* (`INFRA_RISK` = medium and above):
@@ -843,6 +931,8 @@ ISSUE:
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>
+
+If no issues: NO ISSUES FOUND
 ```
 
 *Section E3 — Extension Safety* (`INFRA_RISK` = high only):
@@ -881,9 +971,9 @@ ISSUE:
   location: <file path>:<line>
   description: <what's wrong>
   suggestion: <what to fix>
-```
 
 If no issues: NO ISSUES FOUND
+```
 
 
 ### Step 4.5 — Merge-Dedup Bug Scan Results
@@ -1006,11 +1096,14 @@ For each cycle:
 - [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
 > **`RISK_CLASS=low` does not enter this loop.** `proportional-gates` §Review Cycles gives the
-> Low row the skip sentinel (`—`): **one reviewer pass, no re-review loop** (Step 4 dispatches
-> reviewer B and nothing else). So for a Low change the exit conditions above are not the
-> gate — B's single pass is the whole budget. If that pass returns no issues, record the
-> verdict (Step 10). If it returns issues, post them with the fix (Step 8) and escalate rather
-> than claiming a convergence the Low class's `—` cell says was never run.
+> Low row the skip sentinel (`—`): **one reviewer round (both of B's bug-scan passes, in
+> order), no re-review loop** — Step 4 dispatches reviewer B (plus E if `INFRA_RISK` is set)
+> and nothing else. So for a Low change the exit conditions above are not the gate — B's
+> single round is the whole budget. If that round returns no issues, record the verdict
+> **`clean`** (Step 10): `clean` attests that the review ran at this head and found nothing —
+> not that a re-review loop converged — so a single-round Low review satisfies it (see
+> Step 10's class note). If the round returns issues, post them with the fix (Step 8) and
+> escalate to a human; do **not** run a re-review loop the `—` cell never budgeted.
 
 **No hard cap.** The fix loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (prevents runaway loops from bugs, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
 
@@ -1180,9 +1273,19 @@ true
 
 ### Step 10 — Record Review Verdict (ai-review-gate evidence, #2058)
 
-When the review converged clean (0 P0, 0 P1, 0 P2 — all findings with
+When the review completed clean (0 P0, 0 P1, 0 P2 — all findings with
 confidence ≥ 50 resolved), record the verdict so the `ai-review-gate` required
 check can go green. Best-effort — NEVER fails the workflow:
+
+**Which verdict, by class.** `record-review.sh` accepts `clean`, `clean-micro` and `clean-low`:
+
+- **`clean`** — the normal verdict, and the one a **Low code-impact** change records when its
+  single reviewer round returns no issues. `clean` carries no tier guard in `record-review.sh`:
+  it attests that the review ran at this head and found nothing, **not** that a re-review loop
+  converged. The Low row's `—` cycle cell is a *budget*, not a verdict.
+- **`clean-micro`** — micro tier, which skips this skill entirely (Step 10a).
+- **`clean-low`** — a deliberately narrower class: the **diff shape** is content-only
+  (Step 10b). It is not the verdict for a general Low-class change.
 
 ```bash
 # Resolve record-review.sh explicitly — ~/.pi/agent/scripts is not on PATH.

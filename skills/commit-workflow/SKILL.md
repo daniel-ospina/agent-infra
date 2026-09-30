@@ -65,7 +65,9 @@ passes, blind diff scan first then deep caller/callee, plus the security-review 
 HIGH-confidence findings only, research-before-report); surface-matched **C** (Architecture &
 Data) and **D** (Surface & Config — UX consistency/coverage/realism + config validation); and
 **E** (Infrastructure — Skill Infrastructure / Ontology & Templates / Extension Safety) only when
-`INFRA_RISK` is set. Low risk class → B only, one pass, no re-review loop. UX verification
+`INFRA_RISK` is set. Low risk class → the panel is B alone (one reviewer round, both of B's
+bug-scan passes, no re-review loop); reviewer E still fires whenever `INFRA_RISK` is set, at
+every class. UX verification
 additionally routes through `ux-verification` (test-routing); research/docs → proportional review.
 No human approval required for technical merges.
 **Human escalation (only):** P0 findings requiring an architectural or security decision
