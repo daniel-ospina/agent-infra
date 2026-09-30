@@ -112,10 +112,15 @@ case "${1:-} ${2:-}" in
     prev=""
     for x in "$@"; do [ "$prev" = "--jq" ] && jqprog="$x"; prev="$x"; done
     case "$ep" in
-      */commits/*/check-runs)
+      */commits/*/check-runs*)
+        # A read without --paginate sees ONE page only. The rail's terminal verdict
+        # must be computed over ALL pages, so the fake models the page boundary:
+        # the fixture is multi-line (one line per page), and only a paginated read
+        # is served every line. A single-line fixture is unaffected.
+        page() { local f="$1"; shift; if [[ " $* " == *" --paginate "* ]]; then cat "$SCEN/$f"; else head -1 "$SCEN/$f"; fi; }
         case "$jqprog" in
-          *'!= "completed"'*) cat "$SCEN/pending" 2>/dev/null || echo 0 ;;
-          *'== "completed"'*) cat "$SCEN/completed" 2>/dev/null || echo 1 ;;
+          *'!= "completed"'*) page pending "$@" 2>/dev/null || echo 0 ;;
+          *'== "completed"'*) page completed "$@" 2>/dev/null || echo 1 ;;
           *) echo 0 ;;
         esac
         exit 0 ;;
@@ -642,6 +647,27 @@ rc=$?
 [ "$rc" -eq 1 ] && pass "refused (rc 1) — no line verified under the current key" || fail "expected rc 1, got $rc"
 called "pr update-branch" && fail "spent the attestation under a rotated key (B5)" || pass "did NOT update"
 
+# 17k. the check-runs read spans PAGES — a partial page is not a verdict.
+# Measured 2026-09-29: a real head carried 47 check-runs and the bare endpoint
+# returned 30, so the rail was answering "are the checks terminal" from a
+# truncated surface. The dangerous direction is a FALSE TERMINAL: pending checks
+# beyond page 1 read as zero and are handed to the land step.
+echo "── 17k. multi-page check-runs: the pages are summed, not truncated"
+new_scen crpages
+printf '0\n3\n' > "$SCEN/pending"   # page 1: none pending · page 2: three
+printf '5\n2\n' > "$SCEN/completed"
+run_rail 42 --repo "$REPO" --poll 0 --wait-timeout 0
+rc=$?
+called "per_page=100" \
+  && pass "reads check-runs with per_page=100 — not the default 30-item page" \
+  || fail "check-runs read without per_page (the default page was 30 of 47 measured)"
+[ "$rc" -eq 1 ] && pass "refused (rc 1) — page 2's pending checks were COUNTED" \
+               || fail "expected rc 1, got $rc — page 2's 3 pending checks were invisible (false terminal)"
+grep -q "not terminal" "$SCEN/err" \
+  && pass "the refusal names the wait" \
+  || fail "the refusal does not name the wait"
+called "admin-merge 42" && fail "LANDED on a truncated read" || pass "did not land"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -712,6 +738,12 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # D1d (#1362): the partial-install diagnostic is not a bypass class, but it is
   # a D1 behavior the suite pins — removing its guard must redden scenario 2.
   mutate_and_expect_fail D1d  's/if \[ ! -f "\$DIFF_NORMALIZER_SH" \]; then/if false; then/'
+  # D2a (2026-09-29): the check-runs read must not use the default 30-item page —
+  # the terminal verdict is computed over a truncated surface otherwise.
+  mutate_and_expect_fail D2a  's/\?per_page=100//'
+  # D2b: --paginate emits ONE result per page; reading only the first page hides a
+  # later pending check and turns it into a false terminal verdict.
+  mutate_and_expect_fail D2b  's/ --paginate//g'
 fi
 
 if [ "$failures" -gt 0 ]; then
