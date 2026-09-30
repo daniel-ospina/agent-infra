@@ -453,9 +453,12 @@ wait_terminal() {
   # nominal 90) — and `--poll 0` advanced the counter by ZERO, so the bound could
   # never be reached at all and the rail looped forever while holding the PR's
   # lock and a landing slot. Both are one defect: a counter that is not a clock.
-  # Reading the real clock fixes both, and cannot regress on `--poll 0`.
+  # $SECONDS is bash's own elapsed-time counter: fork-free (so `--poll 0` does
+  # not fork once per iteration), and it cannot be affected by the poll interval.
+  # Residual: like any wall clock it can step BACKWARDS on an NTP adjustment,
+  # which would delay the stop rather than defeat it permanently.
   local started elapsed pending completed
-  started="$(date +%s)"
+  started="$SECONDS"
   while :; do
     pending="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs" \
                  --jq '[.check_runs[] | select(.status != "completed")] | length' 2>/dev/null || echo "?")"
@@ -465,7 +468,7 @@ wait_terminal() {
       say "atomic-land:     checks terminal — $completed completed, 0 pending"
       return 0
     fi
-    elapsed=$(( $(date +%s) - started ))
+    elapsed=$(( SECONDS - started ))
     if [ "$elapsed" -ge "$WAIT_TIMEOUT" ]; then
       stop "the checks at ${HEAD:0:12}… were not terminal within ${WAIT_TIMEOUT}s (pending=${pending}, completed=${completed}) — re-run the rail later; nothing was recorded or merged"
     fi

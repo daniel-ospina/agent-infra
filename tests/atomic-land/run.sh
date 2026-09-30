@@ -243,7 +243,14 @@ new_scen() {
   marker_fixture 42 clean "$HEAD_OLD" > "$SCEN/pr-body"
 }
 
-run_rail() { # <extra args...>
+# The fixture environment plus the rail invocation, ending in `exec` so the
+# CALLER's process BECOMES the rail. That indirection is what lets the watchdog
+# kill the rail itself: `( run_rail ... ) &` backgrounds a SUBSHELL, and killing
+# the subshell leaves the rail orphaned — and a rail stuck on the wait bound
+# never exits, so the orphan spins forever, one per suite run (#1395 P1, measured
+# with PPID 1). This helper is only ever called in a subshell or backgrounded, so
+# the `exec` cannot replace this test script.
+rail_exec() { # <extra args...>
   SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="$REPO" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
@@ -252,7 +259,11 @@ run_rail() { # <extra args...>
   SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
   ATOMIC_LAND_GH="$FAKE" ATOMIC_LAND_RECORD_SH="$REC" ATOMIC_LAND_ADMIN_MERGE="$ADM" \
-    bash "$RAIL" "$@" >"$SCEN/out" 2>"$SCEN/err"
+    exec bash "$RAIL" "$@"
+}
+
+run_rail() { # <extra args...>
+  ( rail_exec "$@" >"$SCEN/out" 2>"$SCEN/err" )
 }
 
 calls() { cat "$SCEN/calls"; }
@@ -266,9 +277,13 @@ count_call() { grep -cF -- "$1" "$SCEN/calls"; }
 # 1), so a guard for that class must be able to kill the rail it is guarding.
 # macOS has no `timeout`, hence the explicit poll-and-kill. 124 = the watchdog
 # fired, i.e. the rail was still running past the limit.
+#
+# The rail is launched through `rail_exec` directly (NOT `( run_rail ... ) &`) so
+# that `$!` is the RAIL: killing a wrapper subshell would leave the rail
+# orphaned, and an orphan on the wait bound spins forever.
 run_rail_watchdog() { # <limit-secs> <extra args...>
   local limit="$1"; shift
-  ( run_rail "$@" ) &
+  rail_exec "$@" >"$SCEN/out" 2>"$SCEN/err" &
   local pid=$! waited=0
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$waited" -ge "$limit" ]; then
@@ -738,7 +753,15 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B6   's/^      stop "the checks at.*$/      return 0/m'
   # B14 (#1395 item 1): credit `elapsed` from a NOMINAL poll count instead of a
   # real clock — with `--poll 0` the bound is then unreachable and the rail hangs
-  mutate_and_expect_fail B14  's/^\s*elapsed=\$\(\( \$\(date \+%s\) - started \)\).*$/        elapsed=\$((elapsed + POLL))/m'
+  # NB: `$` is not literal in a perl replacement, so the `$(` and `${` are spelled
+  # with `\044` (octal). The `${elapsed:-0}` default is belt-and-braces rather
+  # than a version fix: `local started elapsed …` above already DECLARES `elapsed`,
+  # and a declared-but-null name expands to 0 in arithmetic even under `set -u`
+  # (measured: `f(){ local x; echo $((x + 1)); }` -> 1, whereas an UNDECLARED `x`
+  # aborts with "unbound variable"). The default keeps the mutation faithful even
+  # if that declaration is later narrowed, which is what makes the pre-fix
+  # `elapsed=$((elapsed + POLL))` spelling reproduce its hang on every bash.
+  mutate_and_expect_fail B14  's/^\s*elapsed=\$\(\( SECONDS - started \)\).*$/        elapsed=\044(( \044{elapsed:-0} + POLL ))/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
