@@ -151,7 +151,26 @@ done
 [ -n "$PR" ] || { err "atomic-land: a PR number is required"; usage >&2; exit 2; }
 case "$PR" in *[!0-9]*) err "atomic-land: PR must be numeric (got $PR)"; exit 2 ;; esac
 case "$WAIT_TIMEOUT" in ''|*[!0-9]*) err "atomic-land: --wait-timeout must be a non-negative integer"; exit 2 ;; esac
+# A CAP, not just a shape check. `[ "$elapsed" -ge "$WAIT_TIMEOUT" ]` compares as
+# a machine integer, and a literal too wide for that comparison ERRORS — and a
+# failing `[` is FALSE, so an oversized value silently DISABLES the bound and the
+# rail loops forever while holding the PR's lock. That is the #1395 item-1 defect
+# arriving by a second door, and it is the same class B12b pins (a guard a failed
+# comparison turns OFF). Capping it also rejects an oversized literal HERE, via
+# that very error, so this line fails closed by construction. `2>/dev/null` hides
+# that raw `[: integer expression expected`, which is bash's, not our diagnostic.
+# 86400 = 24h.
+[ "$WAIT_TIMEOUT" -le 86400 ] 2>/dev/null || { err "atomic-land: --wait-timeout must be at most 86400s (24h)"; exit 2; }
 case "$POLL" in ''|*[!0-9]*) err "atomic-land: --poll must be a non-negative integer"; exit 2 ;; esac
+# `--poll` is capped for the same reason, and it is the fix for the OTHER waits:
+# two loops in this rail are bounded by an ITERATION COUNT (5 polls for a lazy
+# merge state, 20 for the async ref update), so an unbounded interval multiplies
+# their bound instead of honouring it — `/bin/sleep` takes up to ~68 years, i.e.
+# a "bounded" poll that outlives the run while holding the per-PR lock. The
+# default is 30; 300 is well past any sane re-check cadence, and it keeps those
+# two loops to 25 min and 100 min instead of 68 years. Fails closed on an
+# oversized literal via the same comparison error as the cap above.
+[ "$POLL" -le 300 ] 2>/dev/null || { err "atomic-land: --poll must be at most 300s"; exit 2; }
 case "$MAX_ROUNDS" in ''|*[!0-9]*) err "atomic-land: --max-rounds must be a positive integer"; exit 2 ;; esac
 [ "$MAX_ROUNDS" -ge 1 ] || { err "atomic-land: --max-rounds must be >= 1"; exit 2; }
 [ "$MAX_ROUNDS" -le 5 ] || { err "atomic-land: --max-rounds is bounded at 5"; exit 2; }
@@ -446,7 +465,23 @@ wait_terminal() {
     return 0
   fi
   say "atomic-land: [2/4] verify — waiting (≤${WAIT_TIMEOUT}s) for the checks at ${HEAD:0:12}… to be terminal"
-  local elapsed=0 pending completed
+  # B14 (#1395 item 1): the bound is WALL-CLOCK, not a poll count. The old
+  # `elapsed=$((elapsed + POLL))` credited $POLL per iteration while each
+  # iteration first spends TWO `gh api` round trips, so the rail outlived its own
+  # documented bound (MEASURED: #5797 sat at [2/4] verify for 93 min against a
+  # nominal 90) — and `--poll 0` advanced the counter by ZERO, so the bound could
+  # never be reached at all and the rail looped forever while holding the PR's
+  # lock and a landing slot. Both are one defect: a counter that is not a clock.
+  # $SECONDS is bash's own elapsed-time counter: it removes the CLOCK's fork (the
+  # `$(date +%s)` that the first cut of this fix ran every iteration) and it
+  # cannot be affected by the poll interval. It does NOT remove the loop's own
+  # fork: with `--poll 0`, `sleep 0` is still /bin/sleep and forks (measured ~143
+  # iterations/s, against ~98k for a pure builtin loop) — that is just a busy
+  # loop, bounded by the clock above, not a second way to defeat the bound.
+  # Residual: like any wall clock it can step BACKWARDS on an NTP adjustment,
+  # which would delay the stop rather than defeat it permanently.
+  local started elapsed remaining pending completed
+  started="$SECONDS"
   while :; do
     pending="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs" \
                  --jq '[.check_runs[] | select(.status != "completed")] | length' 2>/dev/null || echo "?")"
@@ -456,10 +491,25 @@ wait_terminal() {
       say "atomic-land:     checks terminal — $completed completed, 0 pending"
       return 0
     fi
+    elapsed=$(( SECONDS - started ))
     if [ "$elapsed" -ge "$WAIT_TIMEOUT" ]; then
       stop "the checks at ${HEAD:0:12}… were not terminal within ${WAIT_TIMEOUT}s (pending=${pending}, completed=${completed}) — re-run the rail later; nothing was recorded or merged"
     fi
-    sleep "$POLL"; elapsed=$((elapsed + POLL))
+    # The bound was checked JUST ABOVE, so an unclamped `sleep "$POLL"` lets the
+    # rail overshoot its own bound by up to a whole poll interval — MEASURED on the
+    # revision before this line: `--wait-timeout 2 --poll 8` ran 10 s wall while
+    # printing "waiting (≤2s)". That is the #1395 symptom again (a rail outliving
+    # the bound it reports, holding the per-PR lock), so clamp the final sleep to
+    # what is actually left. min(remaining, POLL) keeps polling at the requested
+    # cadence while making the bound exact to within one poll of the remainder.
+    # `10#` forces BASE 10. The validator and the `-ge` test above read the argument
+    # as DECIMAL, while bare arithmetic reads a leading zero as OCTAL — so
+    # `--wait-timeout 010` would compare as 10 but subtract as 8, and `08` is not a
+    # valid octal literal AT ALL: the arithmetic error unwinds this loop SILENTLY
+    # (bash 3.2), after step [1/4] has already moved the head. Same base everywhere.
+    remaining=$(( 10#$WAIT_TIMEOUT - elapsed ))
+    if [ "$remaining" -gt "$POLL" ]; then remaining="$POLL"; fi
+    sleep "$remaining"
   done
 }
 
