@@ -1,8 +1,9 @@
 # Landing-lane instruments
 
-Three small, read-only-by-default tools for a **merge-duty lane** — a session whose job is to
-drive existing PRs through the sanctioned landing rail (`scripts/atomic-land.sh`) and report what
-actually happened.
+Three small tools for a **merge-duty lane** — a session whose job is to drive existing PRs
+through the sanctioned landing rail (`scripts/atomic-land.sh`) and report what actually happened.
+Two (`landability.py`, `bulk.py`) only read. One (`rail-bg.sh`) **drives the rail**, which updates
+the branch, posts to the PR and merges: its `start` subcommand is not read-only.
 
 They are **advisory**. Nothing here is wired into a gate: they answer questions, and their answers
 are inputs to a decision. The rail, the review record and the merge gate stay where they are.
@@ -28,22 +29,39 @@ covers the code that would merge:
 | Verdict | Meaning |
 |---|---|
 | `AT` | the record names the **current head** |
-| `CARRY` | the record is from an older head but its `diff_sha256` equals today's normalized diff — the head moved by a **base-only** update, so `record-review.sh`'s carry-forward can re-bind it |
+| `CARRY` | the record is from an older head but its `diff_sha256` equals today's normalized diff — the reviewed **content** is unchanged by the head move (see *What `CARRY` does not prove*) |
 | `NEEDS-REVIEW` | no record, an unaccepted verdict, a changed diff, or no `diff_sha256` to compare |
-| `BLOCKED` | the PR cannot go through the rail right now: not open, draft, merge conflict, or its checks are failed / in flight / untested |
+| `BLOCKED` | the PR cannot go through the rail right now: not open, draft, merge conflict, base repointed, no check-run at all, or checks that are failed / in flight / untested |
 
 `BLOCKED` wins the `VERDICT:` line when it applies, and the record answer is always printed
 separately on the `record-binding:` line — so a blocked PR still tells you whether a fresh review
-is needed. Precedence is fixed and documented in the module docstring: not-open → draft → merge
-conflict → checks failed → checks in flight → checks untested → record binding.
+is needed. Precedence is fixed and in the module docstring: not-open → draft → merge conflict →
+base repointed → no check-run at all → checks failed → checks in flight → checks untested →
+record binding.
 
-The three check buckets come from the **newest attempt per `(app slug, job name)`**:
+The check buckets come from the **newest attempt per `(app slug, job name)`**:
 
 - `in-flight` — newest attempt not `completed`;
-- `failed` — newest attempt completed with a conclusion outside `success`/`neutral`/`skipped`/`cancelled`/`stale`;
-- `untested` — newest attempt is `cancelled`/`stale`, i.e. that job ran and **exercised nothing**.
-  This is not the same as green, and not the same as red: `atomic-land.sh`'s own merge precondition
-  is that the lane actually *tested* the head, and a cancelled run tested nothing.
+- `failed` — newest attempt completed with a conclusion outside `success`/`neutral`/`skipped`/`cancelled`/`stale` — an undocumented or null conclusion lands here, which is the fail-closed direction;
+- `untested` — newest attempt is `cancelled`/`stale`: the job ran and **exercised nothing**. Not green, and not red either — a cancelled newest attempt is anomalous, so it blocks;
+- `not-tested` — newest attempt is `neutral`/`skipped`. Counted and reported, **never** a blocking
+  reason: conditional jobs are skipped on every PR, so blocking on them would refuse every PR
+  rather than the vacuous ones.
+
+⚠️ `not-tested` is where this instrument's clear-set is **wider than the rail's**. The rail's own
+vacuity guard credits only `success`/`failure`/`timed_out` as having *tested* a revision
+(`scripts/check-lane-tested.sh`), so a head whose **lane** is entirely `skipped`/`neutral` reads
+clear here and is still refused by `admin-merge.sh` with `BLOCK — no run of the lane actually
+TESTED head <sha>`. That guard is evaluated per-lane; this instrument reports per-check and does
+not attempt to guess which lane the rail will select.
+
+**Declared residual — the grouping key.** `(app slug, job name)` cannot separate two *different*
+workflows that publish the same job name (every Actions check-run carries the same app slug), so
+the newest attempt of one can mask the other. The repo's rule for this question is
+`(app slug, workflow, job name)`, resolved from `details_url`; `scripts/admin-merge.sh` keys the
+same way this tool does and AGENTS.md records that as the rail's accepted residual. Separating
+them here would cost one extra API call **per check-run** (tens per PR), so this tool adopts the
+rail's key and declares the residual instead.
 
 The check-run read uses `?filter=all&per_page=100` **with `--paginate`**, because the default filter
 is not "all" and a single page is not the whole set — a truncated page reads as absent checks, which
@@ -69,10 +87,40 @@ python3.12 scripts/landing/landability.py 6872 \
   normalization (agent-infra #1362 D1), and without it the `CARRY` answer is unprovable. A silent
   raw-diff fallback would answer a different question with the same word.
 - The digest is computed over the normalizer's **bytes** (not a decoded string) with the same
-  interpreter that runs the tool, and it was checked against the producer: for three tortoise PRs
-  whose recorded head equals the current head, the recomputed digest equals the record's
-  `diff_sha256` exactly. That is the whole basis of `CARRY`.
-- Exit code: `0` = a verdict was printed; `2` = it could not answer. It never guesses.
+  interpreter that runs the tool, and it was checked against the producer: for tortoise PRs whose
+  recorded head equals the current head (6762, 6731, 6791), the recomputed digest equals the
+  record's `diff_sha256` exactly. That equality is what `CARRY`'s content comparison rests on, and a
+  real head-moved case was observed on tortoise #6794 (record head `5b861947…`, live head
+  `f0105965…`, identical digest → `record-binding: CARRY`).
+- Exit code: `0` = a verdict was printed; `2` = it could not answer. It never guesses. An
+  unexecutable `gh` is exit 2, not a traceback.
+- The record's `merge_base_sha` is used when the record carries one (a `clean-low` record does): a
+  record bound to a *different* merge base than the PR has now is `BLOCKED(base-repointed)`. This
+  mirrors the rail's own pre-unit check (`atomic-land.sh`, B10) — a base repoint leaves every
+  head-bound check passing while the certified diff is no longer the diff that would merge.
+  `clean`/`clean-micro` records carry no base field, so the arm cannot fire for them: the same
+  declared residual the rail documents.
+
+### What `CARRY` does not prove
+
+The producer's carry-forward needs **two** conditions and this tool can see one of them:
+
+1. the reviewed content is unchanged — the local record's `diff_sha256` vs the live normalized
+   diff. **This is what `CARRY` reports.**
+2. the PR body carries **verifiable signed evidence** — an HMAC-signed
+   `review recorded: … diff=<hash> … sig=<hash>` marker whose digest matches. `record-review.sh`
+   refuses to carry without it, and this tool does not read it.
+
+The two can disagree in **both** directions, so `CARRY` means "the reviewed content is unchanged",
+**not** "the rail's carry-forward will fire":
+
+- a record whose `diff_sha256` still matches but whose **body marker was edited away** reads
+  `CARRY` here and is refused by the producer (the documented way a PR-body edit destroys an
+  attestation);
+- a pre-#1362 marker carrying the legacy **raw** digest is *accepted* by the producer's
+  `PRIOR_DIFF_ALT` alternation but reads `NEEDS-REVIEW(no-diff-identity)` here.
+
+Read the rail's step `[3/4] record` output for the producer's own answer.
 
 ### ⛔ Why it is not called `preflight.py` — read before renaming it
 
@@ -151,6 +199,12 @@ LANDED` is printed only on a read that returned `true`.
 
 Exit `0` means the wait/start completed. It is **not** a landing verdict. Read the printed value.
 
+**One rail per PR.** `start` refuses when a rail for that PR is still alive. Without that refusal a
+second `start` truncates the first run's log and replaces its pid file, so `pid_alive` sees only the
+new pid, `wait` reports the PR finished, and the API read reports a rail that is still running —
+while the README's own advice (fact 3 below) is to re-run the rail after a base-side fix. `wait` for
+the first rail, or stop it and remove the pid file, before starting another.
+
 ---
 
 ## `bulk.py`
@@ -180,8 +234,10 @@ gh pr list --repo daniel-ospina/tortoise --state open --limit 45 --json number -
 Blank lines and `#` comments are skipped. `--jobs` (default 8) sets concurrency.
 
 Exit `0` = every row is `AT`/`CARRY`; `1` = at least one row needs attention; `2` = it could not
-answer. **It is a report: it does not claim, queue, record or land anything** — claims still go
-through the queue tool.
+answer at all — usage, bad input, missing normalizer, or a `gh` failure that made **every** row
+unreadable. A single unreadable row among readable ones is reported as a row and exits `1`, because
+the report itself succeeded. **It is a report: it does not claim, queue, record or land anything** —
+claims still go through the queue tool.
 
 ---
 
@@ -196,14 +252,15 @@ landing only on `merged=true` from the API.
 
 ### 2. A base-state refusal is usually about the **base**, not the PR
 
-`admin-merge.sh` refuses with statements about **main's** measurement state:
+`admin-merge.sh` — and the `ci_exemption.py` it calls — refuses with statements about **main's**
+measurement state:
 
 - `BLOCK — no run of the lane actually TESTED head <sha>` — the lane's run was queued or cancelled,
   so it exercised nothing;
 - `BLOCK — the lane '<lane>' never TESTED main, so there is no baseline` — main's side of the
   comparison is empty, and an empty baseline absorbs nothing;
-- `no main-side measurement — NOT exempt` — main's baseline carries no measurement of that file, so
-  absence is **not** exemption.
+- `no main-side measurement (PR <rate>) — NOT exempt` — main's baseline carries no measurement of
+  that file, so absence is **not** exemption.
 
 None of those are defects in the PR. Read them as "the base is not measurable right now", fix the
 base side, and re-run.
@@ -212,11 +269,14 @@ base side, and re-run.
 
 This is the part that gets misremembered, so it is stated exactly:
 
-- **Re-running the rail re-reads the base.** `atomic-land.sh` fetches `pulls/<n> .base.sha`,
-  `compare/<base>...<head> .merge_base_commit.sha` and `.behind_by` on *every* run. So re-running the
-  rail against an unchanged head **does** evaluate that same head against the base as it is **now**.
-  That is the command to reach for after a base-side fix: `rail-bg.sh start <pr>` (or
-  `scripts/atomic-land.sh <pr>`).
+- **Re-running the rail re-reads the base.** `atomic-land.sh` resolves the base relation from the
+  API on each pass — `merge_base_of()` (`compare/<base>...<head>` `.merge_base_commit.sha`) and
+  `base_tip()` (`pulls/<n>` `.base.sha`) on every round, and `behind_by_of()` (`.behind_by`)
+  whenever the merge state is not already `BEHIND`. So re-running the rail against an unchanged head
+  **does** evaluate that same head against the base as it is **now**. That is the command to reach
+  for after a base-side fix: `rail-bg.sh start <pr>` (or `scripts/atomic-land.sh <pr>`). A run that
+  stops early — e.g. at `read_record`, before the loop — reads none of them, so there is no base
+  measurement in that log.
 - **`gh run rerun <run-id>` re-executes one CI lane at the commit that run was created for.** Per
   GitHub's own documentation, a re-run "will also use the same `GITHUB_SHA` (commit SHA) and
   `GITHUB_REF` (git ref) of the original event that triggered the workflow run". So a re-run is the

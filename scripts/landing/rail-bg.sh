@@ -94,6 +94,16 @@ cmd_start() {
   [ -n "$pr" ] || die_usage "start needs a PR number"
   is_numeric "$pr" || die_usage "PR must be numeric (got '$pr')"
   [ -f "$LAND_DIR/$RAIL" ] || die "no $RAIL in $LAND_DIR — set LAND_DIR to the checkout holding the rail"
+  # ONE rail per PR. Two rails on one PR interleave update/record/land, and each can
+  # move the head the other verified. Worse, they share this PR's log and pid file, so
+  # a second `start` truncates the first's log and REPLACES its pid — after which
+  # `pid_alive` sees only the new pid, `wait` reports the PR finished, and the API read
+  # prints the result of a rail that is still running. Refuse rather than clobber.
+  # (`atomic-land.sh` takes its own per-PR lock, so a second rail would refuse anyway —
+  # but only after this bookkeeping was already destroyed.)
+  if pid_alive "$pr"; then
+    die "a rail for $pr is still running (pid $(cat "$(pid_file "$pr")")) — wait for it with 'rail-bg.sh wait $pr', or stop it and remove $(pid_file "$pr") first"
+  fi
   mkdir -p "$LAND_LOG_DIR" || die "cannot create $LAND_LOG_DIR"
   local log pidf
   log="$(log_file "$pr")"; pidf="$(pid_file "$pr")"
