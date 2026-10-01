@@ -488,6 +488,21 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
 }
 
 # ── step 2: verify (the head's checks must be terminal) ──────────────────
+# check-runs defaults to 30 per page (measured: 30 of 47 at a real head), so a
+# count read from one page is not a verdict — a partial surface is never CLEAN.
+# --paginate emits ONE result per page, so the pages are SUMMED here; a FAILED
+# read stays "?" so the caller keeps waiting instead of reading an error as zero
+# pending (a false terminal hands in-flight checks to the land step).
+check_count() { # $1 = jq program applied to one page of check-runs
+  local raw
+  if ! raw="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs?per_page=100" --paginate \
+                        --jq "$1" 2>/dev/null)"; then
+    echo "?"
+    return
+  fi
+  printf '%s\n' "$raw" | awk '{n+=$1} END {print n+0}'
+}
+
 wait_terminal() {
   if [ "$NO_WAIT" -eq 1 ]; then
     say "atomic-land: [2/4] verify — --no-wait: admin-merge.sh's tested-head precondition decides"
@@ -516,10 +531,8 @@ wait_terminal() {
   local started elapsed remaining pending completed
   started="$SECONDS"
   while :; do
-    pending="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs" \
-                 --jq '[.check_runs[] | select(.status != "completed")] | length' 2>/dev/null || echo "?")"
-    completed="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs" \
-                 --jq '[.check_runs[] | select(.status == "completed")] | length' 2>/dev/null || echo "?")"
+    pending="$(check_count '[.check_runs[] | select(.status != "completed")] | length')"
+    completed="$(check_count '[.check_runs[] | select(.status == "completed")] | length')"
     if [ "$pending" = "0" ] && [ "$completed" != "0" ] && [ "$completed" != "?" ]; then
       say "atomic-land:     checks terminal — $completed completed, 0 pending"
       return 0
