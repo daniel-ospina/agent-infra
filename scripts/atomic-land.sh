@@ -448,8 +448,17 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       elif [ "$MERGE_STATE" = "CLEAN" ]; then
         say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
         return 3
+      elif [ -z "$behind" ]; then
+        # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
+        # current, and the silent "up to date" read is the exact defect this arm
+        # exists to close. `CLEAN` was checked above and already asserts there is no
+        # divergence, so it keeps its no-op; any OTHER state means GitHub has told
+        # us something is wrong with this head and the compare API could not tell us
+        # how stale it is. Stop and name it rather than proceeding on an unmeasured
+        # base relation (tortoise #6210 / #6169 are the measured population).
+        stop "could not measure the head/base divergence of $REPO#$PR (mergeStateStatus=$MERGE_STATE, compare API read failed) — refusing to treat a blocked head as up to date (B13)"
       else
-        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND, behind_by=${behind:-unreadable} — nothing to update"
+        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE — nothing to update"
         return 3
       fi ;;
   esac
