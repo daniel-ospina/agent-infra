@@ -2706,6 +2706,14 @@ build_evidence() {
 # groups by STEP — it has no `.py` path, and reporting the bare `guard-step`
 # prefix would name the whole mechanism instead of the failing check.
 #
+# The two NON-NODEID families (#6798) each bring their own unit, and both must
+# be handled EXPLICITLY: the generic `s/::.*//` would collapse
+# `collect-error::tests/a.py` and `collect-error::tests/other.py` onto the
+# literal `collect-error`, so a main baseline for a DIFFERENT file would be
+# reported as "measured on this lane" — the exact wrong remedy. An identity
+# keyed on the file therefore groups by FILE (like a nodeid); an environmental
+# kill has no file, so it groups by its own constant (like a guard step).
+#
 #   measured on this lane, not present on main
 #       main's baseline carries a failure in the SAME unit, so the lane is
 #       demonstrably measuring it and does not show this one red.
@@ -2720,8 +2728,10 @@ attribute_residual() {
   local residual="$1" mainfails="$2" nodeid file main_files=""
   if [ -s "$mainfails" ]; then
     main_files="$(
-      sed '/^guard-step::/d; s/::.*//' "$mainfails"
+      sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; s/::.*//' "$mainfails"
       sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+      sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
+      sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
     )"
     main_files="$(printf '%s\n' "$main_files" | sort -u)"
   fi
@@ -2729,6 +2739,11 @@ attribute_residual() {
     [ -n "$nodeid" ] || continue
     case "$nodeid" in
       guard-step::*::*) file="${nodeid#guard-step::}"; file="${file%%::*}" ;;
+      # #6798: group by FILE — the id is file-keyed, so a different file on main
+      # must NOT read as a pre-existing failure in the same unit.
+      collect-error::*) file="${nodeid#collect-error::}" ;;
+      # #6798: an environmental kill has no file; group by the mechanism.
+      watchdog-kill::*) file="watchdog-kill" ;;
       *) file="${nodeid%%::*}" ;;
     esac
     if [ -n "$main_files" ] && grep -qxF -- "$file" <<<"$main_files"; then

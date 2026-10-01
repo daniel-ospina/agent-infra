@@ -1465,6 +1465,131 @@ cfs_run --commit-rows "$sha8803" --runs-report "$TMP/zl-rows-rep.txt" \
 rc=$?
 [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && pass "--commit-rows refuses on a PARTIAL log (exit $rc)" \
   || fail "--commit-rows did not refuse with a real verdict (exit $rc; 2 = usage error = the mode named is wrong, so nothing was tested)"
+
+# ── #6798 — a NON-NODEID failure must be EXTRACTED, on the RAIL's own path ──
+# The unit suite drives `parse_failed_ids` directly, which is why it stayed green
+# while the rail was still broken: `collect_union_rows` (the `--commit-rows` mode,
+# the ONLY PR-side path — admin-merge.sh calls it) runs `failed_ids_from_log` and
+# then, ONLY when ids is non-empty, `extracted_failed_signatures`, and treats a
+# non-zero exit from that second call as FATAL (`return 1`). `_cmd_signatures`
+# exits 1 when the capture yields no id. So correcting the `ids` door ALONE
+# relocates the per-run refusal into the `signatures` door: still zero PRs
+# merged, with a new message. This scenario is the one that catches it.
+echo "== #6798. a non-nodeid-only failing run must be EXTRACTED (both doors) =="
+new_scen nonnodeid
+sha_kill='aa6798000000000000000000000000000000000'
+printf '%s\n' "$sha_kill" > "$SCEN/head"
+lane_fail "$sha_kill" 6798 > "$SCEN/runs-$sha_kill"
+# The record's ONLY evidence is the watchdog banner: a genuine SIGKILL (rc=137)
+# leaves no nodeid, no FAILED line, and no error annotation.
+printf 'test (h)\tRun fast test suite\t2026-10-01T02:57:36.4464344Z ==================== WATCHDOG: pytest killed after 15m (0 passed, 0 failed, 0 errored so far) — last test lines above ====================\n' > "$SCEN/log-6798"
+printf 'test (h)\tRun fast test suite\t2026-10-01T02:57:36.4464344Z ==================== pytest exit code: 137 ====================\n' >> "$SCEN/log-6798"
+printf '3\n' > "$SCEN/jobs-count-6798"
+cfs_run --commit-rows "$sha_kill" --runs-report "$TMP/kk-rep.txt" --provenance "$TMP/kk-prov.txt"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  pass "a watchdog-killed run is EXTRACTED, not a fatal extraction failure (exit 0)"
+else
+  fail "--commit-rows exited $rc on a KILL-ONLY capture — the signature door aborts where the ids door now succeeds, so the #6798 refusal is RELOCATED, not fixed"
+fi
+kk_examined="$(sed -n 's/^examined=//p' "$TMP/kk-rep.txt" 2>/dev/null)"
+kk_extracted="$(sed -n 's/^extracted=//p' "$TMP/kk-rep.txt" 2>/dev/null)"
+if [ "$kk_examined" = "1" ] && [ "$kk_extracted" = "1" ]; then
+  pass "the killed run counts as examined AND extracted (1/1) — step 1c can no longer refuse it forever"
+else
+  fail "expected examined=1 extracted=1 for a killed leg, got examined='$kk_examined' extracted='$kk_extracted' (extracted < examined is the permanent refusal)"
+fi
+if grep -q '^watchdog-kill::pytest' "$TMP/cfs-out"; then
+  pass "the kill identity is in the extracted set — the run is COMPARABLE, not refused"
+else
+  fail "the kill identity never reached the id set (stdout: $(tr '\n' ' ' < "$TMP/cfs-out"))"
+fi
+
+# THE FAIL-CLOSED DIRECTION, on the same path: a genuinely unattributable run
+# that was NOT killed must STILL refuse. If this scenario starts passing, the
+# change has opened the hole #6798 was mis-diagnosed against.
+new_scen nonnodeid-refuse
+sha_plain='aa6799000000000000000000000000000000000'
+printf '%s\n' "$sha_plain" > "$SCEN/head"
+lane_fail "$sha_plain" 6799 > "$SCEN/runs-$sha_plain"
+printf 'test (h)\tRun fast test suite\t2026-10-01T03:00:00.0000000Z ImportError: no module named y\n' > "$SCEN/log-6799"
+printf '3\n' > "$SCEN/jobs-count-6799"
+cfs_run --commit-rows "$sha_plain" --runs-report "$TMP/kr-rep.txt" --provenance "$TMP/kr-prov.txt"
+kr_examined="$(sed -n 's/^examined=//p' "$TMP/kr-rep.txt" 2>/dev/null)"
+kr_extracted="$(sed -n 's/^extracted=//p' "$TMP/kr-rep.txt" 2>/dev/null)"
+if [ "$kr_examined" = "1" ] && [ "$kr_extracted" = "0" ]; then
+  pass "an unattributable run that was NOT killed still yields 0/1 — the refusal SURVIVES"
+else
+  fail "expected examined=1 extracted=0 for an un-killed unattributable run, got '$kr_examined'/'$kr_extracted' — a hole is open"
+fi
+
+# ── the DECISION door: no SILENT FALSE PASS ───────────────────────────────
+# `is_failure_key_loose` gates `parse_failure_rows` (the PR's own row) and
+# `is_failure_key` gates `parse_rates` (main's). A family missing from EITHER is
+# not a shrug: a dropped PR row makes `decide` see an EMPTY set, and the rail
+# reads an empty set as CLEAN — so a red PR is certified and MERGED. That is a
+# silent false PASS, strictly WORSE than the permanent refusal it replaced, and
+# it is invisible to every parser-level test because they build Failure objects
+# directly. Assert the VERDICT, not the parse.
+printf 'watchdog-kill::pytest\t1\t3\twatchdog-kill\n' > "$TMP/kk-dec-pr.txt"
+: > "$TMP/kk-empty-tbl.txt"
+kk_dec() {
+  python3 "$ROOT/scripts/ci_exemption.py" decide \
+    --pr-failures "$TMP/kk-dec-pr.txt" --main-rates "$1" --main-signatures "$2" \
+    --blocked-out "$TMP/kk-blocked.txt" 2>"$TMP/kk-dec.err"
+}
+kk_dec "$TMP/kk-empty-tbl.txt" "$TMP/kk-empty-tbl.txt" > "$TMP/kk-dec.out"
+if grep -q 'CLEAN' "$TMP/kk-dec.out"; then
+  fail "decide certified a NON-EMPTY PR failure set as CLEAN — the PR's own row was REJECTED at the decision door, so the rail merges a red PR (silent false PASS)"
+elif grep -q '^watchdog-kill::pytest$' "$TMP/kk-blocked.txt" 2>/dev/null; then
+  pass "main GREEN on the kill => BLOCKED by name, not silently certified clean"
+else
+  fail "expected the kill to be BLOCKED with no main-side measurement; verdict='$(tr '\n' ' ' < "$TMP/kk-dec.out")'"
+fi
+# And the COMPARABLE direction: main red on the same identity at the same rate
+# must EXEMPT — otherwise the door is admitted but the comparison still fails.
+printf 'watchdog-kill::pytest\t1\t3\n' > "$TMP/kk-main-rates.txt"
+printf 'watchdog-kill::pytest\twatchdog-kill\n' > "$TMP/kk-main-sigs.txt"
+kk_dec "$TMP/kk-main-rates.txt" "$TMP/kk-main-sigs.txt" > "$TMP/kk-dec2.out"
+# NOTE: `[[:space:]]`, never `\t` — GNU grep (CI) does NOT read `\t` as a tab in
+# an ERE while BSD grep (macOS) does, so a `\t`-anchored assertion PASSES on the
+# dev machine and FAILS in CI. That is exactly how this one shipped: 931 green
+# locally, 1 red on the runner. Keep every whitespace anchor dialect-portable.
+if grep -qE '^VERDICT[[:space:]]+CLEAN[[:space:]]+.*exempt=1' "$TMP/kk-dec2.out" && grep -q '^EXEMPT: watchdog-kill::pytest' "$TMP/kk-dec2.out"; then
+  pass "main ALSO red on the kill at the same rate => EXEMPT (the comparison works, both directions)"
+else
+  fail "expected the kill to be EXEMPT when main carries the same id/signature/rate; verdict='$(tr '\n' ' ' < "$TMP/kk-dec2.out")'"
+fi
+
+# ── the RESIDUAL must group a non-nodeid id by its OWN unit (#6798) ──────
+# The verdict is only half the diagnosis: `attribute_residual` labels each
+# residual id "measured on this lane" or "not measurable". It derives the UNIT
+# with the generic `s/::.*//`, which collapses `collect-error::tests/a.py` onto
+# the literal `collect-error` — so a main baseline for a DIFFERENT file reads as
+# the SAME unit and the operator is told the lane is re-measuring main's failure
+# when it is not. The file-keyed family must group by FILE; the environmental
+# kill, which has no file, must group by its own constant (like a guard step).
+new_scen nonnodeid-resid
+sha_ce='aa6798000000000000000000000000000000001'
+printf '%s\n' "$sha_ce" > "$SCEN/head"
+lane_fail "$sha_ce" 6798 > "$SCEN/runs-$sha_ce"
+printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/a.py - ImportError: no module named x\n' > "$SCEN/log-6798"
+printf '3\n' > "$SCEN/jobs-count-6798"
+# main is red on the SAME family but a DIFFERENT file, so the PR's unit is NOT on main.
+lane_fail maince 6800 > "$SCEN/runs-main"
+printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/other.py - ImportError: no module named y\n' > "$SCEN/log-6800"
+printf '3\n' > "$SCEN/jobs-count-6800"
+run_admin 43 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(f) a collect-error main has on a DIFFERENT file BLOCKS (exit $rc)" \
+  || fail "(f) a PR-unique collect-error was certified (exit $rc)"
+grep -q "no failure in collect-error" "$TMP/err" && fail "(f) the bare 'collect-error' prefix was reported as the unit" \
+  || pass "(f) …never the bare 'collect-error' prefix as a unit"
+grep -q "no failure in tests/a.py" "$TMP/err" && pass "(f) …the FILE is named as the unit" \
+  || fail "(f) the residual did not name the file: $(grep 'no failure in' "$TMP/err" | head -1)"
+grep -q "not measurable on this lane" "$TMP/err" && pass "(f) …as not-measurable (a different file on main is not this failure)" \
+  || fail "(f) a different-file main baseline was mis-reported: $(grep -c . "$TMP/err") line(s)"
+grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted on a PR-unique collect-error" \
+  || pass "(f) no merge attempted"
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)
 new_scen frc-pin-empty
