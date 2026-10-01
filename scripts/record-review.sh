@@ -496,7 +496,7 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 # still governs. Nothing here can accept what the old arm rejected except by
 # proving the reviewed artifact unchanged.
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
-  local reviewed="$1" current="$2" base="" p2="" merged="" ctree=""
+  local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
   [ -n "$reviewed" ] && [ -n "$current" ] || return 1
   [ "$reviewed" != "$current" ] || return 1
 
@@ -510,28 +510,50 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # even when its lane commits look equivalent, so it must never carry this way.
   git merge-base --is-ancestor "$reviewed" "$current" 2>/dev/null || return 1
 
-  # (C) NO LANE COMMITS IN BETWEEN. The base branch comes from the PR; the marker
-  # does not carry it. Every intervening commit NOT reachable from the base must be
-  # a MERGE. A single non-merge commit is lane work => a fresh review is owed
-  # (this is exactly the #5421 counter-example: cfe2bad0afaa is a non-merge).
-  base="$(gh api "repos/$REPO/pulls/$PR" --jq .base.ref 2>/dev/null || true)"
-  [ -n "$base" ] && [ "$base" != "null" ] || return 1
-  git cat-file -e "origin/$base^{commit}" 2>/dev/null || return 1
-  if [ -n "$(git rev-list --no-merges "$reviewed..$current" --not "origin/$base" 2>/dev/null)" ]; then
-    return 1
-  fi
-
-  # (D) NO CONFLICT RESOLUTION — and this is the clause that makes the arm sound.
-  # (C) alone is NOT sufficient: a lane can merge the base LOCALLY with conflict
-  # resolutions, and that merge is indistinguishable from a clean one by commit
-  # shape. So recompute the merge and compare TREES rather than patch text: if the
-  # head's tree is exactly what a CLEAN merge of (reviewed, the head's second
-  # parent) produces, then no resolution was made and the lane's contribution is
-  # byte-identical. This is the clause that retires the declared residual instead
-  # of leaving it to a judgement call.
+  # (C) THE BASE IS AN AUTHORITATIVE COMMIT FROM THE API — NOT A LOCAL REF.
+  # An earlier cut of this function asked `--not origin/$base`, trusting a LOCAL
+  # remote-tracking ref. That was a FAIL-OPEN: a stale or divergent `origin/main`
+  # makes everything reachable from IT count as "base content", so a commit the
+  # review never saw is classified as base and the verdict carries. Reproduced by
+  # pointing refs/remotes/origin/main at a branch containing an unreviewed file and
+  # merging that branch: (C) came out empty and the predicate CARRIED. The local ref
+  # was never fetched and never compared to the API, so it could not be trusted.
+  # The authority is `.base.sha` from the API. Two things must then hold:
+  #   - the head's SECOND PARENT (the base it actually merged) must be reachable
+  #     from that authoritative base, so "base content" means the real base; and
+  #   - the object must be present locally, so the walk below is meaningful.
+  # `.base.sha` is the CURRENT base tip, which is normally AHEAD of what the head
+  # merged, so it is checked as the ANCESTOR of the head's second parent — not as an
+  # ancestor of the head itself.
+  base_sha="$(gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+  [ -n "$base_sha" ] && [ "$base_sha" != "null" ] || return 1
+  git cat-file -e "$base_sha^{commit}" 2>/dev/null || return 1
   p2="$(git rev-parse "$current^2" 2>/dev/null || true)"
   [ -n "$p2" ] || return 1
-  merged="$(git merge-tree --write-tree "$reviewed" "$p2" 2>/dev/null | head -1 || true)"
+  git merge-base --is-ancestor "$p2" "$base_sha" 2>/dev/null || return 1
+
+  # (C2) NO LANE COMMITS IN BETWEEN: every intervening commit not reachable from the
+  # AUTHORITATIVE base must be a MERGE. A single non-merge commit is lane work and a
+  # fresh review is owed (that is the #5421 counter-example: cfe2bad0afaa is one).
+  # The walk's STATUS IS CHECKED EXPLICITLY: a failed walk prints nothing to stdout,
+  # and "nothing" here would read as "no lane commits" — the fail-open direction.
+  extra="$(git rev-list --no-merges "$reviewed..$current" --not "$base_sha" 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  [ -z "$extra" ] || return 1
+
+  # (D) NO CONFLICT RESOLUTION — the clause that makes the arm sound. (C2) alone is
+  # NOT sufficient: a lane can merge the base LOCALLY with conflict resolutions, and
+  # that merge is indistinguishable from a clean one by commit shape. So recompute
+  # the merge and compare TREES rather than patch text.
+  # rc IS CHECKED, AND THIS IS LOAD-BEARING: `git merge-tree --write-tree` PRINTS A
+  # TREE OID ON LINE 1 EVEN WHEN IT CONFLICTS (exit 1). An earlier cut discarded the
+  # status and piped through `head -1`, so a conflicted merge looked like a
+  # successful merge-tree and the guard rested on the tree inequality alone — which
+  # contradicts this function's own fail-closed claim and was refuted by a reviewer
+  # reproduction. Requiring rc=0 restores "conflict => refuse" as a real gate.
+  merged="$(git merge-tree --write-tree "$reviewed" "$p2" 2>/dev/null)" || mrc=$?
+  [ "$mrc" -eq 0 ] || return 1
+  merged="$(printf '%s' "$merged" | head -1)"
   [ -n "$merged" ] || return 1
   ctree="$(git rev-parse "$current^{tree}" 2>/dev/null || true)"
   [ -n "$ctree" ] || return 1
@@ -601,18 +623,20 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     if [ -n "$PRIOR_DIFF" ]; then
       echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
       SHA="$CURRENT_HEAD"
-    elif lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
-      # The rendered patch moved (a base merge), but the LANE's artifact is
-      # provably unchanged: the head only moved forward, no lane commit is in
-      # between, and a clean re-merge of (reviewed, base) reproduces the head's
-      # tree exactly. Re-record against the CURRENT head, exactly as the arm above
-      # does — the binding is to the head that will merge.
-      echo "#6072/#6213/#4823 lane-dimension carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff changed but the LANE's commits are provably identical (forward move; no non-base commit in between; the head's tree is exactly a clean merge of reviewed and its base parent) — recording against the CURRENT head" >&2
-      SHA="$CURRENT_HEAD"
     elif [ "$FORCE_STALE" -ne 1 ]; then
-      echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
-      echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
-      exit 3
+      if lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
+        # The rendered patch moved (a base merge), but the LANE's artifact is
+        # provably unchanged: the head only moved forward, no lane commit is in
+        # between, and a clean re-merge of (reviewed, its base parent) reproduces
+        # the head's tree exactly. Re-record against the CURRENT head, exactly as
+        # the arm above does — the binding is to the head that will merge.
+        echo "#6072/#6213/#4823 lane-dimension carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff changed but the LANE's commits are provably identical (forward move; no non-base commit in between; the head's tree is exactly a clean merge of reviewed and its base parent) — recording against the CURRENT head" >&2
+        SHA="$CURRENT_HEAD"
+      else
+        echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
+        echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
+        exit 3
+      fi
     else
       # #784: a stale sha's diff CANNOT be shown to be the current diff — by
       # construction the two were never observed together. Emitting `diff=` here
