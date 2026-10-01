@@ -500,9 +500,12 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   [ -n "$reviewed" ] && [ -n "$current" ] || return 1
   [ "$reviewed" != "$current" ] || return 1
 
-  # (A) BOTH revisions must be present locally. Deliberately NOT fetching here:
-  # this is the trust boundary of the merge gate, and a network side effect inside
-  # it is a worse failure than a missed carry. Absent object => refuse.
+  # (A) BOTH revisions must be present locally. Deliberately NO `git fetch` here:
+  # this is the trust boundary of the merge gate, and pulling objects from the
+  # remote inside it is a worse failure than a missed carry. Absent object =>
+  # refuse. (The base IDENTITY below still comes from the API — that is a read of
+  # the PR's declared base, not a fetch of content, and an earlier version of this
+  # comment wrongly implied the function made no network call at all.)
   git cat-file -e "$reviewed^{commit}" 2>/dev/null || return 1
   git cat-file -e "$current^{commit}" 2>/dev/null || return 1
 
