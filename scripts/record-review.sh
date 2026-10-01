@@ -494,9 +494,16 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 # FAIL-CLOSED: every clause below returns non-zero on any doubt (missing object,
 # unreadable base, merge-tree unavailable, conflict), so the existing refusal path
 # still governs. Nothing here can accept what the old arm rejected except by
-# proving the reviewed artifact unchanged.
+# proving the reviewed artifact unchanged. Replace/graft refs, which could present a
+# different commit graph to this check, are neutralised for its duration below.
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
   local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
+  # Replace/graft refs rewrite what rev-list, rev-parse and rev-parse^{tree} SEE, so a
+  # local `refs/replace/*` can present a different commit graph to this predicate than
+  # the one that is really there — a reviewer built exactly that and turned a REFUSE
+  # fixture into a CARRY. `local -x` scopes the export to this function, so the git
+  # subprocesses here ignore them and the rest of the script is unaffected.
+  local -x GIT_NO_REPLACE_OBJECTS=1
   [ -n "$reviewed" ] && [ -n "$current" ] || return 1
   [ "$reviewed" != "$current" ] || return 1
 
@@ -529,7 +536,14 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # merged, so it is checked as the ANCESTOR of the head's second parent — not as an
   # ancestor of the head itself.
   base_sha="$(gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
-  [ -n "$base_sha" ] && [ "$base_sha" != "null" ] || return 1
+  # Reject everything that is not a 40-hex sha, exactly as the head fetch above does.
+  # Empty/null/error-body already failed closed (measured), but any non-empty string
+  # that happens to resolve as a LOCAL revision was accepted as "the authoritative
+  # base" (a reviewer got `branch` through). A non-sha cannot come from the real API,
+  # so this is hardening — but this function calls itself the trust boundary, and a
+  # name is not an authority.
+  case "$base_sha" in *[!0-9a-f]*|"") return 1 ;; esac
+  [ "${#base_sha}" -eq 40 ] || return 1
   git cat-file -e "$base_sha^{commit}" 2>/dev/null || return 1
   p2="$(git rev-parse "$current^2" 2>/dev/null || true)"
   [ -n "$p2" ] || return 1
