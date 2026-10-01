@@ -1475,7 +1475,11 @@ fi
 printf 'watchdog-kill::pytest\t1\t3\n' > "$TMP/kk-main-rates.txt"
 printf 'watchdog-kill::pytest\twatchdog-kill\n' > "$TMP/kk-main-sigs.txt"
 kk_dec "$TMP/kk-main-rates.txt" "$TMP/kk-main-sigs.txt" > "$TMP/kk-dec2.out"
-if grep -qE '^VERDICT\tCLEAN\t.*exempt=1' "$TMP/kk-dec2.out" && grep -q '^EXEMPT: watchdog-kill::pytest' "$TMP/kk-dec2.out"; then
+# NOTE: `[[:space:]]`, never `\t` — GNU grep (CI) does NOT read `\t` as a tab in
+# an ERE while BSD grep (macOS) does, so a `\t`-anchored assertion PASSES on the
+# dev machine and FAILS in CI. That is exactly how this one shipped: 931 green
+# locally, 1 red on the runner. Keep every whitespace anchor dialect-portable.
+if grep -qE '^VERDICT[[:space:]]+CLEAN[[:space:]]+.*exempt=1' "$TMP/kk-dec2.out" && grep -q '^EXEMPT: watchdog-kill::pytest' "$TMP/kk-dec2.out"; then
   pass "main ALSO red on the kill at the same rate => EXEMPT (the comparison works, both directions)"
 else
   fail "expected the kill to be EXEMPT when main carries the same id/signature/rate; verdict='$(tr '\n' ' ' < "$TMP/kk-dec2.out")'"
