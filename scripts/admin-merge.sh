@@ -3395,6 +3395,10 @@ main() {
         say_err "   The half that WAS read already carries this code-measuring red:"
         printf '%s\n' "$BASE_REDS" | sed 's/^/      /' >&2
       fi
+      if [ -n "$BASE_REDS_OTHER" ]; then
+        say_err "   Reported but NOT blocking (not counted against the PR):"
+        printf '%s\n' "$BASE_REDS_OTHER" | sed 's/^/      /' >&2
+      fi
       say_err "   Consuming the readable endpoint is not enough on its own: the endpoint that"
       say_err "   failed could carry a red this PR has not measured, and 4.6/4.7 are BOTH gated"
       say_err "   on the base being RED — so a half-read base is exactly the disarm this refusal"
@@ -3834,6 +3838,14 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
   local health_line
   health_line="PR evaluated-tree surface (every workflow and app on head $head): ${TREE_STATUS} — ${TREE_RED} failing of ${TREE_TOTAL} measured, ${TREE_PENDING} pending
 Base check surface (every workflow and app on head of '$base_ref'): ${BASE_STATUS} — ${BASE_RED} failing of ${BASE_TOTAL} measured, ${BASE_PENDING} pending (reported for CONTEXT, never blocking)"
+  # #6807: an exemption that lives only on ephemeral stderr is indistinguishable,
+  # in the DURABLE posted record, from a silent drop. The base reds this rail did
+  # NOT count against the PR belong in the evidence the reviewer reads later.
+  if [ -n "$BASE_REDS_OTHER" ]; then
+    health_line="$health_line
+Base red(s) reported but NOT blocking:
+$BASE_REDS_OTHER"
+  fi
   analyzed="$analyzed
 $health_line"
 

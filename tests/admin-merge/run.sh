@@ -7364,6 +7364,17 @@ else
 fi
 grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
   && fail "(a) the rail still refused at §4.6" || pass "(a) …and §4.6 did not refuse"
+# …and the DURABLE posted evidence must carry it too. stderr is ephemeral; a
+# reviewed merge is audited from the posted comment, and an exemption visible
+# only in a terminal log is indistinguishable there from a silent drop. Removing
+# the health_line disclosure in admin-merge.sh must fail THIS assertion.
+if [ -f "$SCEN/comment" ] \
+   && grep -q "Base red(s) reported but NOT blocking:" "$SCEN/comment" \
+   && grep -q "NOT pull-request-evaluable" "$SCEN/comment"; then
+  pass "(a) …and the DURABLE evidence comment carries the exempted red, not just stderr"
+else
+  fail "(a) the exemption is absent from the posted evidence — an ephemeral-only report is a silent drop in the durable record"
+fi
 
 # (b) THE MANDATORY GUARD — THE CHANGE MUST NOT BE A BLANKET EXEMPTION. The SAME
 # shape, but the workflow DECLARES pull_request, so the PR's own evaluation DOES
@@ -7522,6 +7533,35 @@ n_leak=$(find "$SCEN/rtmp" -name 'admin-merge-wfpr.*' 2>/dev/null | wc -l | tr -
 [ "$n_leak" = "0" ] && pass "(f) …and the cache file was cleaned up (no admin-merge-wfpr.* left in TMPDIR)" \
   || fail "(f) $n_leak admin-merge-wfpr.* file(s) leaked in TMPDIR"
 
+# (h) THE FAIL-OPEN IS CLOSED: A PARTIAL READ IS NOT AUTHORITATIVE. The parser
+# terminates the `on:` region at the next column-0 line — but a MULTI-LINE flow
+# collection or quoted scalar puts a CONTINUATION at column 0, so an early break
+# reads only PART of the block and can answer `no` for a workflow that DOES
+# declare pull_request. That exempts a measurable red and disarms §4.6: the #1261
+# stale-green merge, reached by FILE FORMATTING alone. The state machine in
+# scripts/ci-workflow-pr-evaluable.sh must keep such a red BLOCKING.
+new_scen preeval-flow-continuation
+HEAD_PE8="f8f8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE8" > "$SCEN/head"
+lane_pass "$HEAD_PE8" 5995 > "$SCEN/runs-$HEAD_PE8"
+lane_pass mainpe8 5996 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5041 'ci / lint' completed success 7401 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7401 pull_request 'CI'
+write_main_checks "$(check_run 6041 'deploy-api' completed failure 8501 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8501 push 'Mixed'
+printf 'push\tMixed\t.github/workflows/mixed.yml\n' > "$SCEN/run-8501"
+# The workflow DOES declare pull_request — behind a column-0 continuation.
+mkdir -p "$SCEN/wf-contents/.github/workflows"
+printf 'name: fixture\non:\n  push:\n    branches: [main,\nzzz-release]\n  pull_request:\n    types: [opened]\njobs:\n  x:\n    runs-on: ubuntu-latest\n' > "$SCEN/wf-contents/.github/workflows/mixed.yml"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a column-0 flow continuation cannot hide pull_request — the base red STILL BLOCKS (exit $rc)" \
+  || fail "(h) FAIL-OPEN: a red on a workflow that DECLARES pull_request was exempted because the parse stopped at the continuation"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && pass "(h) …and it refuses at §4.6" || fail "(h) the refusal is not the §4.6 one"
+grep -q "pr merge" "$SCEN/calls" && fail "(h) a merge was attempted over a stale surface" || pass "(h) no merge attempted"
+
 # (e) THE PREDICATE ITSELF, IN BOTH DIRECTIONS. The measured workflows of
 # tortoise, as `on:` shapes: the ones that declare NO pull_request must be `no`,
 # the ones that DO must be `yes`. A hardcoded name list is NOT the rule (it rots);
@@ -7544,6 +7584,27 @@ pe_case "scalar"                   yes 'on: pull_request'
 pe_case "no on block fails closed" unknown $'name: x\njobs:\n  a:\n'
 pe_case "merge key fails closed"   unknown $'on:\n  push:\n  <<: *extra\n'
 pe_case "tab indent fails closed"  unknown $'on:\n\tpush:\n'
+# ── A PARTIAL READ IS NEVER AUTHORITATIVE (adversarial review, #6807) ──────
+# These are the shapes that made the FIRST revision answer `no` for a workflow
+# that declares pull_request — each one a fail-open on the merge gate. They pin
+# the state machine in scripts/ci-workflow-pr-evaluable.sh: a column-0
+# continuation inside an open flow/quote is NOT the terminator, and an
+# unrecognised key shape is refused rather than silently dropped.
+pe_case "column-0 flow continuation"  yes $'on:\n  push:\n    branches: [main,\nzzz-release]\n  pull_request:\n    types: [opened]\n'
+pe_case "multi-line quoted scalar"    yes $'on:\n  push:\n    branches: "main\nx"\n  pull_request:\n'
+pe_case "quoted bare scalar"          yes 'on: "pull_request"'
+pe_case "explicit key fails closed"   unknown $'on:\n  push: null\n  ? pull_request\n  : null\n'
+pe_case "unterminated flow fails closed" unknown $'on:\n  push: [\n  pull_request:\n'
+# A `[`/`{` inside a PLAIN SCALAR is not a flow collection: counting it would make
+# the region look unterminated, skip the trigger keys after it, and answer `no`
+# for a workflow that DOES declare pull_request. (`paths: foo[bar` is legal YAML.)
+pe_case "bracket inside a plain scalar" yes $'on:\n  push:\n    paths: foo[bar\n  pull_request:\n    types: [opened]\n  workflow_dispatch:\n    inputs:\n      y:\n        default: a]b\n'
+# The SAFETY NET: when the region walk ends at a column-0 line and the collected
+# keys carry no PR trigger, any `pull_request` KEY after that point means the
+# "terminator" was a continuation the parser did not recognise. A partial read
+# may not answer `no` — it must refuse. (The caller treats `unknown` as blocking,
+# the same verdict this PR-evaluable workflow deserves.)
+pe_case "safety net: unparsed truncation fails closed" unknown $'on:\n  push:\n    branches:\n      - [main,\nzzz-release]\n  pull_request:\n'
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
