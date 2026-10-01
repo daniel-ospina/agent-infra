@@ -21,16 +21,19 @@
 # which removals the suite caught, so this is enumerated rather than asserted):
 #   - COVERED individually: the second-parent rev-parse, the merge-tree rc capture and
 #     rc check, the `head -1` tree parse, the tree-equality check (§9), each half of the
-#     base shape validation (§8a), the (C2) lane-commit check (§11), the base identity.
-#   - DEFENCE-IN-DEPTH, NOT individually covered: the presence checks (A), the
-#     forward-move check (B), the second-parent ancestry check, the base `cat-file`,
-#     the rev-list rc check, the non-empty-tree/name checks, and the replace-blind
-#     export. Removing any ONE of them still refuses, because another clause catches the
-#     same case — for §8b specifically, (D) refuses that fixture even with the export
-#     gone (measured), so §8b proves the graft is LIVE and that the function still
-#     refuses, but it does NOT prove the export is what refuses. A reviewer caught the
-#     commit message claiming otherwise. No end-to-end carry that the export ALONE
-#     prevents could be constructed, so this is documented rather than asserted.
+#     base shape validation (§8a), the (C2) lane-commit check (§11), the base identity,
+#     and the replace-blind export (§12, a HEAD graft).
+#   - DEFENCE-IN-DEPTH, NOT individually covered — this list names EVERY non-comment line
+#     whose removal leaves the suite GREEN, measured by deleting every line of the function
+#     one at a time: the argument-presence check, the two `cat-file` presence checks, the
+#     forward-move check (B), the base `cat-file`, the `p2` non-empty check, the
+#     second-parent ancestry check, the rev-list rc check, the non-empty-tree and
+#     non-empty-ctree checks, and the function's final `return 0` (which is redundant —
+#     falling off the end returns the status of the last test, which is 0). Removing any
+#     ONE still refuses, because another clause catches the same case. They are kept to
+#     make the failure explicit and fail closed. THREE revisions of this header have now
+#     claimed exhaustiveness and been caught short (the p2 check, the argument check, and
+#     the final return), so the rule is: this paragraph is re-measured, not reasoned about.
 #   - The CALL SITE (`--force-stale` precedence in the #2982 arm) is NOT driven by this
 #     suite; it extracts and calls the function directly. That guard is verified by
 #     reading, and a test that runs the real script with --force-stale is a follow-up,
@@ -453,17 +456,63 @@ else
   fail "mutation NOC2: could not apply it (reformatting (C2)?) — coverage is blind"
 fi
 
+echo "── 12. A HEAD graft: the replace-blind export is the SOLE defence and must be covered"
+# §8b grafts the BASE, and (D) catches that. Grafting the CURRENT HEAD is a DIFFERENT
+# vector: `git replace` changes what rev-parse and rev-list SEE, while the tree that
+# merge-tree recomputes is unchanged — so a fake head whose tree IS merge-tree(reviewed,
+# base) satisfies every other clause, and neither (D) nor the tree equality can catch it.
+# Only GIT_NO_REPLACE_OBJECTS=1 does. An earlier commit of mine claimed "no end-to-end
+# carry that the export ALONE prevents could be constructed"; a reviewer constructed
+# exactly this, so that claim was FALSE. This fixture replaces it: without the export a
+# signed verdict is minted for a revision carrying an unreviewed lane commit.
+D="$(new_repo headgraft)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+advance_base "$D"
+git checkout -q pr
+printf 'UNREVIEWED LANE WORK\n' > pwn.txt; git add -A; git commit -qm "unreviewed lane work"
+git merge -q --no-edit main
+CURRENT="$(git rev-parse HEAD)"
+BASE="$(git rev-parse main)"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "(12 control) without any graft this is REFUSED — the lane commit is seen" \
+  || fail "(12) control failed: the fixture does not refuse to begin with"
+MT12="$(git merge-tree --write-tree "$REVIEWED" "$BASE" | head -1)"
+FAKE="$(git commit-tree "$MT12" -p "$REVIEWED" -p "$BASE" -m grafted)"
+git replace "$CURRENT" "$FAKE"
+[ "$(git rev-parse "$CURRENT^{tree}")" = "$MT12" ] \
+  && pass "(12) the graft is LIVE: the replaced head's tree IS the recomputed merge tree, so the tree equality cannot catch it" \
+  || fail "(12) the graft did not take — the fixture is vacuous"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "(12) WITH the export the grafted head is still REFUSED" \
+  || fail "(12) a HEAD graft CARRIED unreviewed lane work — FAIL-OPEN"
+M12="$TMP/mut-norepl.sh"
+if mutate '  local -x GIT_NO_REPLACE_OBJECTS=1' '  :' "$M12"; then
+  [ "$(verdict_with "$D" "$M12" "$REVIEWED" "$CURRENT")" = 0 ] \
+    && pass "mutation NOREPL is caught: without the export the HEAD graft CARRIES unreviewed work, so the export IS load-bearing and is covered here" \
+    || fail "mutation NOREPL NOT caught — the export is not what refuses the HEAD graft"
+else
+  fail "mutation NOREPL: could not apply it — coverage is blind"
+fi
+
 echo
 # AN EXACT PIN, NOT A FLOOR WITH SLACK. $PASS only has to be non-zero for the suite to
 # be green, so a whole section can be deleted with no signal — a reviewer deleted one
 # and the suite still reported ALL PASSED. A floor of 32 against 35 assertions was tried
-# first and MEASURED insufficient: sections 2, 4, 10 and 11 (1–3 assertions each) could
-# still be deleted quietly. Equality means ANY loss trips it, and so does ADDING an
-# assertion — deliberate, so the number is kept in step on purpose rather than drifting.
-MIN_ASSERTIONS=35
-if [ "$FAIL" -eq 0 ] && [ "$PASS" -ne "$MIN_ASSERTIONS" ]; then
-  echo "❌ $PASS assertion(s) ran but this suite declares $MIN_ASSERTIONS — a section was deleted or skipped, or an assertion was added without updating the pin"
-  FAIL=$((FAIL+1))
-fi
+# first and MEASURED insufficient (sections of 1–3 assertions still vanished quietly), so
+# this is an equality: ANY loss trips it, and so does ADDING an assertion — deliberate,
+# so the number is maintained on purpose rather than drifting. The numeric guard exists
+# because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
+# `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
+MIN_ASSERTIONS=39
+case "$MIN_ASSERTIONS" in
+  ''|*[!0-9]*)
+    echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
+    FAIL=$((FAIL+1)) ;;
+  *)
+    if [ "$FAIL" -eq 0 ] && [ "$PASS" -ne "$MIN_ASSERTIONS" ]; then
+      echo "❌ $PASS assertion(s) ran but this suite declares $MIN_ASSERTIONS — a section was deleted or skipped, or an assertion was added without updating the pin"
+      FAIL=$((FAIL+1))
+    fi ;;
+esac
 if [ "$FAIL" -eq 0 ]; then echo "ALL PASSED ($PASS assertion(s))"; exit 0; fi
 echo "FAILED: $FAIL of $((PASS+FAIL)) assertion(s)"; exit 1
