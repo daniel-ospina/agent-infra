@@ -7,19 +7,34 @@ word alone is not the answer):
 
     AT             the review record names the CURRENT head
     CARRY          the record is from an older head but its `diff_sha256` equals
-                   today's normalized diff — the head moved by a base-only
-                   update, so the rail's carry-forward can re-bind it
+                   today's normalized diff — i.e. the reviewed CONTENT is
+                   unchanged by the head move (see "What CARRY does not prove")
     NEEDS-REVIEW   no record, an unaccepted verdict, or the reviewed content
                    changed
     BLOCKED        the PR cannot be driven through the rail right now: not open,
-                   draft, in a merge conflict, or the head's checks are not all
-                   clear
+                   draft, merge conflict, base repointed, or the head's checks
+                   are not all clear
 
 `BLOCKED` wins the VERDICT line when it applies, but the record answer is always
 printed on the `record-binding:` line — so a blocked PR still reports whether a
 fresh review is needed. Precedence, in order: not-open/draft, merge conflict,
-checks failed, checks in flight, checks untested (newest attempt of a job was
-cancelled/stale, so that job never exercised the head), then the record binding.
+base repointed, checks unmeasured (no check-run at all), checks failed, checks in
+flight, checks untested, then the record binding.
+
+WHAT `CARRY` DOES NOT PROVE — the producer's carry-forward needs TWO conditions,
+and this tool can only see one of them.
+    This tool compares the LOCAL record file's `diff_sha256` against the live
+    normalized diff: that is the content-unchanged condition. `record-review.sh`'s
+    carry-forward additionally requires VERIFIABLE SIGNED EVIDENCE in the PR BODY
+    (an HMAC-signed `review recorded: … diff=<hash> … sig=<hash>` marker whose
+    digest matches), and it refuses when the marker is absent, edited away, or
+    signed with a different key. Those two conditions can disagree in both
+    directions: a record whose `diff_sha256` still matches but whose body marker
+    is gone reads `CARRY` here and is REFUSED by the producer; and a pre-#1362
+    marker carrying the legacy raw digest is ACCEPTED by the producer (its
+    `PRIOR_DIFF_ALT` alternation) but reads `NEEDS-REVIEW(no-diff-identity)` here.
+    `CARRY` therefore means "the reviewed content is unchanged", NOT "the rail's
+    carry-forward will fire". Read the rail's step [3/4] output for that.
 
 WHY IT IS NOT CALLED `preflight.py` — read this before renaming it
 -----------------------------------------------------------------
@@ -63,10 +78,18 @@ import sys
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
 ACCEPTED_VERDICTS = ("clean", "clean-micro", "clean-low")
 
+# The green allow-list AGENTS.md's "Reading verification state" rule defines:
+# only these are green. Anything completed that is not green and not UNTESTED is
+# RED — including a conclusion GitHub has not documented yet, and a null one.
 GREEN = ("success", "neutral", "skipped")
 # Non-red, but NOT green: the job ran and exercised nothing, so it cannot count
-# as the head having been TESTED (atomic-land.sh's own precondition).
+# as the head having been TESTED.
 UNTESTED = ("cancelled", "stale")
+# Green for the tree-health question, but NOT "tested" for the rail's: the rail's
+# own vacuity guard credits only success|failure|timed_out
+# (`scripts/check-lane-tested.sh`, `admin-merge.sh`). Reported, never used to
+# block — see the note in check_state().
+NOT_TESTED = ("neutral", "skipped")
 
 
 class Failure(Exception):
@@ -78,10 +101,18 @@ def gh_bytes(args, cwd):
 
     Bytes matter for the diff: the review digest is sha256 over the normalizer's
     byte output, and a text decode/replace would change it.
+
+    An exec failure (gh absent from PATH) is raised as a `Failure`, not an
+    `OSError`: the documented contract is "2 = it could not answer", and an
+    uncaught exception here would exit 1 with a traceback — and would kill a whole
+    bulk.py batch, since its per-row handler catches only this type.
     """
-    return subprocess.run(
-        ["gh", *args], capture_output=True, cwd=cwd, input=None
-    )
+    try:
+        return subprocess.run(["gh", *args], capture_output=True, cwd=cwd, input=None)
+    except OSError as exc:
+        raise Failure(
+            f"could not execute gh ({exc}) — is the GitHub CLI installed and on PATH?"
+        )
 
 
 def gh_text(args, cwd):
@@ -122,9 +153,12 @@ def resolve_normalizer(repo_dir):
 
 
 def normalize(raw, normalizer):
-    r = subprocess.run(
-        [sys.executable, normalizer], input=raw, capture_output=True
-    )
+    try:
+        r = subprocess.run(
+            [sys.executable, normalizer], input=raw, capture_output=True
+        )
+    except OSError as exc:
+        raise Failure(f"could not execute {sys.executable} on {normalizer}: {exc}")
     if r.returncode != 0:
         raise Failure(
             f"{normalizer} exited {r.returncode}: "
@@ -194,6 +228,9 @@ def head_matches(record_sha, head):
 
 
 def record_binding(record, head, live_diff):
+    """The record's binding to the head. Reads the LOCAL record file only —
+    see "WHAT `CARRY` DOES NOT PROVE" in the module docstring for what that means
+    and what the rail checks on top of it."""
     if record is None:
         return "NEEDS-REVIEW(no-record)"
     verdict = record.get("verdict")
@@ -209,16 +246,43 @@ def record_binding(record, head, live_diff):
     return "NEEDS-REVIEW(diff-changed)"
 
 
-def newest_per_app_and_name(runs):
-    """One attempt per (app slug, check name), newest by id.
+def merge_base_of(repo, base, head, repo_dir):
+    """The merge base of base...head — the commit that identifies the certified
+    content. INVARIANT under a base that merely ADVANCES; it moves exactly when
+    the base is repointed or rewritten. Mirrors atomic-land.sh's `merge_base_of`."""
+    rc, out, _err = gh_text(
+        ["api", f"repos/{repo}/compare/{base}...{head}", "--jq", ".merge_base_commit.sha"],
+        repo_dir,
+    )
+    return out.strip() if rc == 0 else ""
 
-    do NOT group by check_suite.id — every re-run gets its own suite, which would
-    shatter one check into one group per attempt. `name` is the JOB name, so two
-    workflows can publish the same one, which is why the app slug is part of the key.
+
+def newest_per_app_and_name(runs):
+    """One attempt per check, newest by id.
+
+    Grouping key: `(app slug, job name)`, with the run's OWN id joining the key
+    when the name is empty. Two deliberate decisions:
+
+    * NOT `check_suite.id` — every re-run gets its own suite, so grouping by suite
+      would shatter one check into one group per attempt and "newest" would stop
+      meaning anything.
+    * The run id joins the key for an UNNAMED run, mirroring the rail's own fix
+      (#1353): "a newer unnamed non-red" must not "SUPERSEDE an older unnamed red
+      and discard it before classification". Two unnamed runs would otherwise
+      collapse into one group and the newer would hide the older.
+
+    DECLARED RESIDUAL — accepted, not fixed: this key cannot separate two
+    DIFFERENT workflows that publish the same job name (every Actions check-run
+    carries the same app slug, so the slug does not separate them), and the newest
+    of one can mask the other. `scripts/admin-merge.sh` keys the same way and
+    AGENTS.md records this as that rail's accepted residual; this instrument
+    adopts it deliberately to stay within ~3 API calls, because separating them
+    needs a per-run workflow resolution — one extra API call per check-run.
     """
     groups = {}
     for r in runs:
-        key = ((r.get("app") or {}).get("slug"), r.get("name"))
+        name = r.get("name")
+        key = ((r.get("app") or {}).get("slug"), name or f"\x00unnamed:{r.get('id')}")
         if key not in groups or r.get("id", 0) > groups[key].get("id", 0):
             groups[key] = r
     return list(groups.values())
@@ -242,7 +306,19 @@ def check_state(runs):
             if r.get("status") == "completed" and r.get("conclusion") in UNTESTED
         }
     )
-    return groups, in_flight, failed, untested
+    # `neutral`/`skipped` are green for the tree-health question but credit nothing
+    # in the rail's own `tested` vocabulary. Reported so the lane can see it; NOT a
+    # blocking reason, because conditional jobs are routinely skipped on every PR
+    # and blocking on them would refuse every PR rather than the vacuous ones. The
+    # rail's per-lane vacuity guard is what actually decides "was THIS lane tested".
+    not_tested = sorted(
+        {
+            r.get("name")
+            for r in groups
+            if r.get("status") == "completed" and r.get("conclusion") in NOT_TESTED
+        }
+    )
+    return groups, in_flight, failed, untested, not_tested
 
 
 def check(pr, repo, repo_dir, normalizer):
@@ -262,12 +338,15 @@ def check(pr, repo, repo_dir, normalizer):
         raise Failure(f"gh pr view {pr} returned unparseable JSON: {out.strip()[:200]}")
 
     head = d.get("headRefOid") or ""
+    base = d.get("baseRefName") or ""
     record, record_file = read_record(repo, pr)
 
     state = d.get("state")
     draft = bool(d.get("isDraft"))
-    in_flight = failed = untested = []
+    in_flight = failed = untested = not_tested = []
+    runs = []
     live_diff = ""
+    base_repointed = False
     if state == "OPEN" and not draft:
         r = gh_bytes(
             ["api", f"repos/{repo}/pulls/{pr}",
@@ -285,7 +364,7 @@ def check(pr, repo, repo_dir, normalizer):
         # `filter=all` is required: the default is not all, and it has returned
         # 26 of 40 on a real commit. `--paginate` merges every page (gh applies
         # --jq per page, so this is NDJSON); a truncated page reads as absent
-        # checks, which is how "are the checks terminal" becomes a false yes.
+        # checks, which is how "are the checks terminal?" becomes a false yes.
         rc, out, err = gh_text(
             ["api", f"repos/{repo}/commits/{head}/check-runs?per_page=100&filter=all",
              "--paginate", "--jq", ".check_runs[]"],
@@ -297,9 +376,17 @@ def check(pr, repo, repo_dir, normalizer):
                 f"{err.strip()[:200] or 'no stderr'}"
             )
         runs = parse_ndjson(out)
-        _groups, in_flight, failed, untested = check_state(runs)
-    else:
-        runs = []
+        _groups, in_flight, failed, untested, not_tested = check_state(runs)
+        # A record that NAMES its merge base (clean-low, #1348) must be bound to
+        # the SAME merge base the PR has now: a base repoint leaves every
+        # head-bound check passing while the certified diff is no longer the diff
+        # that would merge. This mirrors the rail's own pre-unit arm (B10). A
+        # `clean`/`clean-micro` record carries no base field, so this cannot fire
+        # for it — the same declared residual the rail documents.
+        rec_mb = (record or {}).get("merge_base_sha")
+        if rec_mb and head_matches((record or {}).get("head_sha"), head):
+            live_mb = merge_base_of(repo, base, head, repo_dir)
+            base_repointed = not live_mb or live_mb != rec_mb
 
     binding = record_binding(record, head, live_diff)
     if state != "OPEN":
@@ -311,6 +398,13 @@ def check(pr, repo, repo_dir, normalizer):
         # merge cannot happen. `UNKNOWN` is transient (GitHub computes
         # mergeability lazily), so it is deliberately NOT read as a conflict.
         verdict = "BLOCKED(merge-conflict)"
+    elif base_repointed:
+        verdict = "BLOCKED(base-repointed)"
+    elif not runs:
+        # AN EMPTY SURFACE IS UNMEASURED, NOT GREEN — the same rule
+        # `admin-merge.sh` applies. Nothing ran at this head, so nothing about it
+        # has been checked and no green can be read from the absence.
+        verdict = "BLOCKED(checks-unmeasured)"
     elif failed:
         verdict = "BLOCKED(checks-failed)"
     elif in_flight:
@@ -327,7 +421,7 @@ def check(pr, repo, repo_dir, normalizer):
         "draft": draft,
         "head": head,
         "branch": d.get("headRefName") or "",
-        "base": d.get("baseRefName") or "",
+        "base": base,
         "mergeable": d.get("mergeable"),
         "merge_state": d.get("mergeStateStatus"),
         "record": record,
@@ -337,6 +431,8 @@ def check(pr, repo, repo_dir, normalizer):
         "in_flight": in_flight,
         "failed": failed,
         "untested": untested,
+        "not_tested": not_tested,
+        "base_repointed": base_repointed,
         "binding": binding,
         "verdict": verdict,
     }
@@ -356,14 +452,18 @@ def report(res):
         print(
             f"record: verdict={rec.get('verdict')} head={(rec.get('head_sha') or '')[:12]} "
             f"diff={(rec.get('diff_sha256') or '')[:12] or 'none'} "
+            f"merge_base={(rec.get('merge_base_sha') or '')[:12] or 'none'} "
             f"reviewed={rec.get('reviewed_at')} file={res['record_file']}"
         )
     print(f"live diff: {res['live_diff'][:12] or 'none'}")
     if res["state"] == "OPEN" and not res["draft"]:
         print(
             f"checks: total={res['checks_total']} in-flight={res['in_flight']} "
-            f"failed(newest)={res['failed']} untested(newest)={res['untested']}"
+            f"failed(newest)={res['failed']} untested(newest)={res['untested']} "
+            f"not-tested(newest)={len(res['not_tested'])}"
         )
+        if res["base_repointed"]:
+            print("base: the record's merge base is not this PR's merge base (repointed or rewritten)")
     else:
         print("checks: not read (PR is not an open, non-draft pull request)")
     print(f"record-binding: {res['binding']}")

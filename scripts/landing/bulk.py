@@ -25,7 +25,9 @@ Usage:
   --prs-file FILE     read PR numbers from FILE (`-` = stdin)
 
 Exit: 0 = every row is AT or CARRY; 1 = at least one row needs attention; 2 = it
-      could not answer (usage, bad input, missing normalizer, gh failure).
+      could not answer at all — usage, bad input, missing normalizer, or a gh
+      failure that made EVERY row unreadable. One unreadable row among readable
+      ones is reported as a row and exits 1, because the report itself succeeded.
 """
 
 from __future__ import annotations
@@ -153,6 +155,15 @@ def main(argv=None):
     print("verdicts:", dict(sorted(counts.items())))
     landable = sum(1 for r in rows if r["verdict"] in ("AT", "CARRY"))
     print(f"landable now (AT or CARRY): {landable}/{len(rows)}")
+    # A row that could not be read is not a row that needs attention — it is a row
+    # the report answered nothing about. If NOTHING could be read, this is exit 2
+    # ("it could not answer"), so a caller branching on 2 is not silently handed a
+    # report whose rows all look like failures. With at least one readable row the
+    # report did its job, and 1 means "something needs attention".
+    unreadable = sum(1 for r in rows if "error" in r)
+    if unreadable == len(rows):
+        print(f"bulk: no PR could be read ({unreadable}/{len(rows)} unreadable) — nothing was answered", file=sys.stderr)
+        return 2
     return 0 if landable == len(rows) else 1
 
 
