@@ -259,6 +259,25 @@ CERT_BASE=""; CERT_MB=""; CERT_BASE_TIP=""
 merge_base_of() { # <base> <head>
   gh_ api "repos/$REPO/compare/$1...$2" --jq .merge_base_commit.sha 2>/dev/null || true
 }
+# How many commits the HEAD is behind the BASE. Same compare call merge_base_of()
+# already makes — the response carries `behind_by`, so this is a second read of an
+# existing response, not new machinery and not a new API.
+#
+# ⛔ Why the rail must not route on `mergeStateStatus` alone: a red REQUIRED check
+# makes GitHub report BLOCKED, not BEHIND. Measured live over the non-draft PRs:
+# 90 BLOCKED / 10 UNSTABLE / 6 DIRTY / 0 BEHIND. So a head that predates a base
+# commit which is itself required for a gate leg (e.g. `9c432c6a4`, which CLASSIFIES
+# `test_pack_extraction_slots_v31.py` for `manifest-integrity` — a leg of the
+# required `python-ci-gate`) reads as BLOCKED, do_update did not fire, and the
+# failure was self-sustaining: the stale head keeps failing the leg, the red keeps
+# reading as BLOCKED, and nothing ever refreshes it. `behind_by` is the condition
+# we actually want; the enum is a coarse proxy that NEVER says it for these PRs.
+behind_by_of() { # <base> <head> -> N (empty on any unreadable/non-numeric reply)
+  local n
+  n="$(gh_ api "repos/$REPO/compare/$1...$2" --jq '.behind_by // 0' 2>/dev/null || true)"
+  case "$n" in ''|*[!0-9]*) echo ""; return 0 ;; esac
+  echo "$n"
+}
 # The base branch's TIP at a moment in time. A concurrent merge ADVANCES it while
 # leaving the merge base unchanged, so it is the signal for B12: the checks were
 # verified against the old tip and did not cover the new one. `--admin` bypasses
@@ -390,7 +409,7 @@ verdict_accepted() {
 
 # ── step 1: update ───────────────────────────────────────────────────────
 do_update() { # 0 = updated, 3 = not behind (no-op)
-  local before="$HEAD" after="" i t=0
+  local before="$HEAD" after="" i t=0 behind=""
   case "$MERGE_STATE" in
     UNKNOWN|""|null)
       # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
@@ -411,14 +430,28 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
           stop "the merge state of $REPO#$PR is still undetermined after $t re-poll(s) (mergeStateStatus=${MERGE_STATE:-<none>}) — refusing to certify a head whose base relation is unknown (B6/B12)" ;;
       esac ;;
   esac
+  # ── the update trigger: the ENUM, OR the base-drift condition ──────────────
+  # #6424's ruling applied to the TRIGGER (route, do not exempt): the rail already
+  # has the signal it needs in a response it already fetches, so it fires on
+  # behind_by > 0 as well as on BEHIND. A PR whose head predates a base commit that
+  # a required gate leg depends on is BLOCKED (not BEHIND) and could otherwise never
+  # be refreshed — see behind_by_of(). The threshold is 0 by default: any real base
+  # drift is a reason to refresh, and an already-current head reports 0, which is
+  # the pre-existing no-op. ATOMIC_LAND_DRIFT_TRIGGER exists only to make the
+  # boundary testable; it is not a tuning knob.
   case "$MERGE_STATE" in
     BEHIND) : ;;
-    CLEAN)
-      say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
-      return 3 ;;
     *)
-      say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND — nothing to update"
-      return 3 ;;
+      behind="$(behind_by_of "$BASE" "$HEAD")"
+      if [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
+        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
+      elif [ "$MERGE_STATE" = "CLEAN" ]; then
+        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
+        return 3
+      else
+        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND, behind_by=${behind:-unreadable} — nothing to update"
+        return 3
+      fi ;;
   esac
   # B5 — never SPEND an attestation the unit cannot restore. A branch update moves
   # the head and invalidates the record; the #767 carry-forward can re-bind it only

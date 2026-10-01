@@ -83,6 +83,19 @@ jobs:
           # AGENT_INFRA_READ_TOKEN secret (secrets: inherit) when required.
           token: ${{ secrets.AGENT_INFRA_READ_TOKEN || github.token }}
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # The check below is `node bin/agent-infra.js`, run from a `shell:
+          # bash` step, so `node` must be on the SHELL PATH of a LATER step.
+          # Actions runs its own JS actions (checkout, this one) on an internal
+          # runtime that is not on that PATH, so a runner with no system node
+          # aborts the check at 127 (`node: command not found`) — which the gate
+          # then mis-reported as drift (#1545). This step installs the version
+          # and prepends it to the job PATH (`core.addPath`), which is what makes
+          # the step below resolve `node`.
+          node-version: '22'
+
       - name: Run agent-infra check (CI mode)
         id: drift
         shell: bash
@@ -93,10 +106,26 @@ jobs:
           # name `consumer`, so pass the real repo name explicitly.
           AGENT_INFRA_REPO_NAME: ${{ github.event.repository.name }}
         run: |
+          # `shell: bash` under Actions is `bash -eo pipefail` (#1545). Under -e
+          # a non-zero check exit would abort this script at the very line that
+          # produces the code, so `drift_exit` was never written — for a genuine
+          # drift failure as much as for a missing interpreter — and the gate
+          # below then read an empty string and reported "drift detected" either
+          # way. Capture the exit explicitly instead; the gate owns the verdict.
+          set +e
           cmd="${{ inputs.check-command }}"
           if [ -n "$cmd" ]; then
             bash -c "$cmd"
             code=$?
+          elif ! command -v node >/dev/null 2>&1; then
+            echo "::error::the drift check did NOT run — 'node' is not on this runner's PATH (exit 127). This is an environment fault, not drift: nothing was checked."
+            # A distinct marker, not the bare 127: a caller's custom
+            # `check-command` can itself exit 127 (a missing tool of its own),
+            # and that is NOT an interpreter fault — overloading the number would
+            # send that reader after the wrong repair, the exact defect this
+            # fixes (#1545).
+            echo "drift_kind=interpreter-missing" >> "$GITHUB_OUTPUT"
+            code=127
           else
             node "$AGENT_INFRA_PATH/bin/agent-infra.js" check . --ci
             code=$?
@@ -108,7 +137,18 @@ jobs:
         if: always()
         shell: bash
         run: |
+          # Fail-closed in every branch; the branch decides WHICH cause is named,
+          # so a red points at the repair that applies (#1545).
+          kind="${{ steps.drift.outputs.drift_kind }}"
           code="${{ steps.drift.outputs.drift_exit }}"
+          if [ "$kind" = "interpreter-missing" ]; then
+            echo "::error::the drift check did NOT run — 'node' is not on this runner's PATH. This is an ENVIRONMENT fault, not drift, and nothing was checked. Do NOT run 'agent-infra update' — fix the runner's PATH or the 'Set up Node' step instead."
+            exit 1
+          fi
+          if [ -z "$code" ]; then
+            echo "::error::the drift check produced NO result — the check step did not run to completion (skipped, cancelled, or timed out) and wrote no exit code. See the steps above; this red does not mean drift."
+            exit 1
+          fi
           if [ "$code" != "0" ]; then
             echo "::error::agent-infra drift detected — run \`agent-infra update\` in this repo (or \`./sync --all\` from agent-infra to batch-fix all linked repos). See the 'Run agent-infra check (CI mode)' step for the failing surfaces."
             exit 1
