@@ -479,10 +479,53 @@ case "$key" in
     # rail must treat as fail-closed — never as a non-code exemption.
     if [ -n "$(printf '%s' "$a2" | sed -n 's#.*/actions/runs/[0-9][0-9]*$#&#p')" ]; then
       id="$(printf '%s' "$a2" | sed -n 's#.*/actions/runs/\([0-9][0-9]*\)$#\1#p')"
-      if [ -f "$SCEN/run-$id" ]; then cat "$SCEN/run-$id"; exit 0; fi
+      if [ -f "$SCEN/run-$id" ]; then
+        # #6807: the rail also resolves the workflow FILE (`.path`) for the
+        # PR-evaluability predicate. A fixture is `<event>\t<name>[\t<path>]`;
+        # the path projection answers from the THIRD field, so a two-field
+        # (legacy) fixture simply has no path. The shared event/name projection
+        # is left at two fields — several tests pin that shape.
+        jexpr="$(flag_val --jq "$@")"
+        if [ -n "$jexpr" ] && [ "${jexpr#*.path}" != "$jexpr" ]; then
+          IFS=$'\t' read -r fev fwf fpath < "$SCEN/run-$id"
+          [ -n "$fpath" ] && printf '%s\n' "$fpath"
+          exit 0
+        fi
+        cat "$SCEN/run-$id"; exit 0
+      fi
       exit 1
     fi
     case "$a2" in
+      */contents/*)
+        # ── #6807: THE WORKFLOW FILE, for the PR-evaluability predicate. The
+        # rail reads it AS OF the ref being measured (`-f ref=<base_ref>`): the
+        # contents API otherwise defaults to the repository's DEFAULT branch — the
+        # wrong revision when a PR targets a non-default base. The fixture tree
+        # mirrors that: `$SCEN/wf-contents/<ref>/<path>` (written by
+        # `wf_declares_ref`) models a workflow that DIFFERS on the base branch, and
+        # the bare `$SCEN/wf-contents/<path>` is the default-branch file. A `?ref=`
+        # query is honoured too. NO FIXTURE means the contents API answers nothing
+        # (a 404, or an outage) — the workflow file is UNREADABLE and the rail must
+        # FAIL CLOSED (the red stays blocking). There is no separate hard-error
+        # marker: a non-2xx and a 404 both yield an empty body, which the rail
+        # treats identically (`unknown`).
+        wref=""
+        wprev=""
+        for x in "$@"; do
+          case "$wprev" in -f|--raw-field) [ -n "$wref" ] || wref="$x" ;; esac
+          wprev="$x"
+        done
+        wref="${wref#ref=}"
+        case "${a2##*\?}" in ref=*) [ -n "$wref" ] || wref="${a2##*ref=}" ;; esac
+        wpath="$(printf '%s' "$a2" | sed -n 's#.*/contents/\(.*\)$#\1#p')"
+        wpath="${wpath%%\?*}"
+        if [ -n "$wref" ] && [ -n "$wpath" ] && [ -f "$SCEN/wf-contents/$wref/$wpath" ]; then
+          cat "$SCEN/wf-contents/$wref/$wpath"; exit 0
+        fi
+        if [ -n "$wpath" ] && [ -f "$SCEN/wf-contents/$wpath" ]; then
+          cat "$SCEN/wf-contents/$wpath"; exit 0
+        fi
+        exit 1 ;;
       */pulls/*)
         # ONE projected line, matching the rail's `gh api ... --jq` expression:
         # "<mergeable>\t<merge_commit_sha>".
@@ -802,6 +845,36 @@ pr_green_surface() {
   pr_run_map 7101 pull_request 'CI'
 }
 
+# ── #6807: the workflow FILE, for the PR-evaluability predicate ────────────
+# wf_declares <workflow-path> <trigger>... → the fake's contents fixture for
+#   <workflow-path>: a workflow whose `on:` block declares exactly <trigger>…
+#   (block form). Served by the fake's `*/contents/*` arm. NO fixture means the
+#   contents API could not answer, which the rail must treat as FAIL-CLOSED.
+wf_declares() {
+  local path="$1"; shift
+  mkdir -p "$SCEN/wf-contents/$(dirname "$path")"
+  {
+    printf 'name: fixture\non:\n'
+    local t
+    for t in "$@"; do printf '  %s:\n' "$t"; done
+    printf 'jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n'
+  } > "$SCEN/wf-contents/$path"
+}
+
+# wf_declares_ref <ref> <workflow-path> <trigger>... → the REF-SCOPED variant:
+#   the fake serves it only when the rail pins the fetch to <ref>. Used to model a
+#   workflow that DIFFERS on a non-default base branch (#6807).
+wf_declares_ref() {
+  local ref="$1" path="$2"; shift 2
+  mkdir -p "$SCEN/wf-contents/$ref/$(dirname "$path")"
+  {
+    printf 'name: fixture\non:\n'
+    local t
+    for t in "$@"; do printf '  %s:\n' "$t"; done
+    printf 'jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n'
+  } > "$SCEN/wf-contents/$ref/$path"
+}
+
 # A BASE surface that is genuinely MEASURED AND RED on a NON-watched workflow:
 # the #1261 shape — a lint gate red on main while the watched lane is green.
 main_red_surface() {
@@ -838,6 +911,9 @@ cfs_run() {
 # a classifier defect: the commit that mentioned "the #1484 classifier" was the one
 # that introduced the pattern).
 lane_tested() { bash "$ROOT/scripts/check-lane-tested.sh" "$@"; }
+
+# #6807: the PR-evaluability predicate, called the same guard-safe way.
+wf_eval() { bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh"; }
 
 # ── 1. --diff is set subtraction on unsorted, duplicated input ─────────────
 echo "== 1. --diff (the single shared comparison) =="
@@ -1389,6 +1465,131 @@ cfs_run --commit-rows "$sha8803" --runs-report "$TMP/zl-rows-rep.txt" \
 rc=$?
 [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && pass "--commit-rows refuses on a PARTIAL log (exit $rc)" \
   || fail "--commit-rows did not refuse with a real verdict (exit $rc; 2 = usage error = the mode named is wrong, so nothing was tested)"
+
+# ── #6798 — a NON-NODEID failure must be EXTRACTED, on the RAIL's own path ──
+# The unit suite drives `parse_failed_ids` directly, which is why it stayed green
+# while the rail was still broken: `collect_union_rows` (the `--commit-rows` mode,
+# the ONLY PR-side path — admin-merge.sh calls it) runs `failed_ids_from_log` and
+# then, ONLY when ids is non-empty, `extracted_failed_signatures`, and treats a
+# non-zero exit from that second call as FATAL (`return 1`). `_cmd_signatures`
+# exits 1 when the capture yields no id. So correcting the `ids` door ALONE
+# relocates the per-run refusal into the `signatures` door: still zero PRs
+# merged, with a new message. This scenario is the one that catches it.
+echo "== #6798. a non-nodeid-only failing run must be EXTRACTED (both doors) =="
+new_scen nonnodeid
+sha_kill='aa6798000000000000000000000000000000000'
+printf '%s\n' "$sha_kill" > "$SCEN/head"
+lane_fail "$sha_kill" 6798 > "$SCEN/runs-$sha_kill"
+# The record's ONLY evidence is the watchdog banner: a genuine SIGKILL (rc=137)
+# leaves no nodeid, no FAILED line, and no error annotation.
+printf 'test (h)\tRun fast test suite\t2026-10-01T02:57:36.4464344Z ==================== WATCHDOG: pytest killed after 15m (0 passed, 0 failed, 0 errored so far) — last test lines above ====================\n' > "$SCEN/log-6798"
+printf 'test (h)\tRun fast test suite\t2026-10-01T02:57:36.4464344Z ==================== pytest exit code: 137 ====================\n' >> "$SCEN/log-6798"
+printf '3\n' > "$SCEN/jobs-count-6798"
+cfs_run --commit-rows "$sha_kill" --runs-report "$TMP/kk-rep.txt" --provenance "$TMP/kk-prov.txt"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  pass "a watchdog-killed run is EXTRACTED, not a fatal extraction failure (exit 0)"
+else
+  fail "--commit-rows exited $rc on a KILL-ONLY capture — the signature door aborts where the ids door now succeeds, so the #6798 refusal is RELOCATED, not fixed"
+fi
+kk_examined="$(sed -n 's/^examined=//p' "$TMP/kk-rep.txt" 2>/dev/null)"
+kk_extracted="$(sed -n 's/^extracted=//p' "$TMP/kk-rep.txt" 2>/dev/null)"
+if [ "$kk_examined" = "1" ] && [ "$kk_extracted" = "1" ]; then
+  pass "the killed run counts as examined AND extracted (1/1) — step 1c can no longer refuse it forever"
+else
+  fail "expected examined=1 extracted=1 for a killed leg, got examined='$kk_examined' extracted='$kk_extracted' (extracted < examined is the permanent refusal)"
+fi
+if grep -q '^watchdog-kill::pytest' "$TMP/cfs-out"; then
+  pass "the kill identity is in the extracted set — the run is COMPARABLE, not refused"
+else
+  fail "the kill identity never reached the id set (stdout: $(tr '\n' ' ' < "$TMP/cfs-out"))"
+fi
+
+# THE FAIL-CLOSED DIRECTION, on the same path: a genuinely unattributable run
+# that was NOT killed must STILL refuse. If this scenario starts passing, the
+# change has opened the hole #6798 was mis-diagnosed against.
+new_scen nonnodeid-refuse
+sha_plain='aa6799000000000000000000000000000000000'
+printf '%s\n' "$sha_plain" > "$SCEN/head"
+lane_fail "$sha_plain" 6799 > "$SCEN/runs-$sha_plain"
+printf 'test (h)\tRun fast test suite\t2026-10-01T03:00:00.0000000Z ImportError: no module named y\n' > "$SCEN/log-6799"
+printf '3\n' > "$SCEN/jobs-count-6799"
+cfs_run --commit-rows "$sha_plain" --runs-report "$TMP/kr-rep.txt" --provenance "$TMP/kr-prov.txt"
+kr_examined="$(sed -n 's/^examined=//p' "$TMP/kr-rep.txt" 2>/dev/null)"
+kr_extracted="$(sed -n 's/^extracted=//p' "$TMP/kr-rep.txt" 2>/dev/null)"
+if [ "$kr_examined" = "1" ] && [ "$kr_extracted" = "0" ]; then
+  pass "an unattributable run that was NOT killed still yields 0/1 — the refusal SURVIVES"
+else
+  fail "expected examined=1 extracted=0 for an un-killed unattributable run, got '$kr_examined'/'$kr_extracted' — a hole is open"
+fi
+
+# ── the DECISION door: no SILENT FALSE PASS ───────────────────────────────
+# `is_failure_key_loose` gates `parse_failure_rows` (the PR's own row) and
+# `is_failure_key` gates `parse_rates` (main's). A family missing from EITHER is
+# not a shrug: a dropped PR row makes `decide` see an EMPTY set, and the rail
+# reads an empty set as CLEAN — so a red PR is certified and MERGED. That is a
+# silent false PASS, strictly WORSE than the permanent refusal it replaced, and
+# it is invisible to every parser-level test because they build Failure objects
+# directly. Assert the VERDICT, not the parse.
+printf 'watchdog-kill::pytest\t1\t3\twatchdog-kill\n' > "$TMP/kk-dec-pr.txt"
+: > "$TMP/kk-empty-tbl.txt"
+kk_dec() {
+  python3 "$ROOT/scripts/ci_exemption.py" decide \
+    --pr-failures "$TMP/kk-dec-pr.txt" --main-rates "$1" --main-signatures "$2" \
+    --blocked-out "$TMP/kk-blocked.txt" 2>"$TMP/kk-dec.err"
+}
+kk_dec "$TMP/kk-empty-tbl.txt" "$TMP/kk-empty-tbl.txt" > "$TMP/kk-dec.out"
+if grep -q 'CLEAN' "$TMP/kk-dec.out"; then
+  fail "decide certified a NON-EMPTY PR failure set as CLEAN — the PR's own row was REJECTED at the decision door, so the rail merges a red PR (silent false PASS)"
+elif grep -q '^watchdog-kill::pytest$' "$TMP/kk-blocked.txt" 2>/dev/null; then
+  pass "main GREEN on the kill => BLOCKED by name, not silently certified clean"
+else
+  fail "expected the kill to be BLOCKED with no main-side measurement; verdict='$(tr '\n' ' ' < "$TMP/kk-dec.out")'"
+fi
+# And the COMPARABLE direction: main red on the same identity at the same rate
+# must EXEMPT — otherwise the door is admitted but the comparison still fails.
+printf 'watchdog-kill::pytest\t1\t3\n' > "$TMP/kk-main-rates.txt"
+printf 'watchdog-kill::pytest\twatchdog-kill\n' > "$TMP/kk-main-sigs.txt"
+kk_dec "$TMP/kk-main-rates.txt" "$TMP/kk-main-sigs.txt" > "$TMP/kk-dec2.out"
+# NOTE: `[[:space:]]`, never `\t` — GNU grep (CI) does NOT read `\t` as a tab in
+# an ERE while BSD grep (macOS) does, so a `\t`-anchored assertion PASSES on the
+# dev machine and FAILS in CI. That is exactly how this one shipped: 931 green
+# locally, 1 red on the runner. Keep every whitespace anchor dialect-portable.
+if grep -qE '^VERDICT[[:space:]]+CLEAN[[:space:]]+.*exempt=1' "$TMP/kk-dec2.out" && grep -q '^EXEMPT: watchdog-kill::pytest' "$TMP/kk-dec2.out"; then
+  pass "main ALSO red on the kill at the same rate => EXEMPT (the comparison works, both directions)"
+else
+  fail "expected the kill to be EXEMPT when main carries the same id/signature/rate; verdict='$(tr '\n' ' ' < "$TMP/kk-dec2.out")'"
+fi
+
+# ── the RESIDUAL must group a non-nodeid id by its OWN unit (#6798) ──────
+# The verdict is only half the diagnosis: `attribute_residual` labels each
+# residual id "measured on this lane" or "not measurable". It derives the UNIT
+# with the generic `s/::.*//`, which collapses `collect-error::tests/a.py` onto
+# the literal `collect-error` — so a main baseline for a DIFFERENT file reads as
+# the SAME unit and the operator is told the lane is re-measuring main's failure
+# when it is not. The file-keyed family must group by FILE; the environmental
+# kill, which has no file, must group by its own constant (like a guard step).
+new_scen nonnodeid-resid
+sha_ce='aa6798000000000000000000000000000000001'
+printf '%s\n' "$sha_ce" > "$SCEN/head"
+lane_fail "$sha_ce" 6798 > "$SCEN/runs-$sha_ce"
+printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/a.py - ImportError: no module named x\n' > "$SCEN/log-6798"
+printf '3\n' > "$SCEN/jobs-count-6798"
+# main is red on the SAME family but a DIFFERENT file, so the PR's unit is NOT on main.
+lane_fail maince 6800 > "$SCEN/runs-main"
+printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/other.py - ImportError: no module named y\n' > "$SCEN/log-6800"
+printf '3\n' > "$SCEN/jobs-count-6800"
+run_admin 43 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(f) a collect-error main has on a DIFFERENT file BLOCKS (exit $rc)" \
+  || fail "(f) a PR-unique collect-error was certified (exit $rc)"
+grep -q "no failure in collect-error" "$TMP/err" && fail "(f) the bare 'collect-error' prefix was reported as the unit" \
+  || pass "(f) …never the bare 'collect-error' prefix as a unit"
+grep -q "no failure in tests/a.py" "$TMP/err" && pass "(f) …the FILE is named as the unit" \
+  || fail "(f) the residual did not name the file: $(grep 'no failure in' "$TMP/err" | head -1)"
+grep -q "not measurable on this lane" "$TMP/err" && pass "(f) …as not-measurable (a different file on main is not this failure)" \
+  || fail "(f) a different-file main baseline was mis-reported: $(grep -c . "$TMP/err") line(s)"
+grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted on a PR-unique collect-error" \
+  || pass "(f) no merge attempted"
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)
 new_scen frc-pin-empty
@@ -7242,6 +7443,304 @@ grep -q "add --any-workflow BEFORE the -- separator" "$SCEN/err" \
   && pass "(#4078) the head-side block names the remedy in the working order too" \
   || fail "(#4078) the head-side block does not name a usable remedy"
 
+
+# ── 67. THE §4.6 INPUT SET: A NOT-PR-EVALUABLE BASE RED IS NOT COUNTED (#6807) ─
+# Step 4.6 compares a PR's evaluated surface against the base's BLOCKING reds. The
+# input set (`MAIN_HEALTH_RED_TS`) classifies each base red by its run's EVENT:
+# `schedule`/`issues`/`issue_comment` are non-code and exempt, and `push` falls to
+# code-measuring. But a push-only workflow (`.github/workflows/deploy-hosted.yml`:
+# `on: push` + `workflow_dispatch`, NO pull_request) can NEVER attach a check to a
+# PR head sha, so NO PR can measure it — yet the red entered MAIN_HEALTH_RED_TS and
+# §4.6 refused EVERY PR, prescribing a remedy (`gh run rerun` this PR's runs) that
+# is UNSATISFIABLE BY CONSTRUCTION. The correct property is the workflow's
+# DECLARABILITY, read from the workflow FILE — not an event-name whitelist. The
+# predicate is scripts/ci-workflow-pr-evaluable.sh; the exemption is BASE-only (on
+# the tree such a red is an anomaly, exactly like a non-code red).
+echo "== 67. §4.6 input set: a not-PR-evaluable base red does not block (#6807) =="
+
+# (a) THE FIX — the observed block. Base RED on a `push` run of a PUSH-ONLY
+# workflow, begun AFTER the PR's surface: before the fix this is a §4.6 refusal.
+new_scen preeval-pushonly-base
+HEAD_PE1="f1f1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE1" > "$SCEN/head"
+lane_pass "$HEAD_PE1" 5951 > "$SCEN/runs-$HEAD_PE1"
+lane_pass mainpe1 5952 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5021 'ci / lint' completed success 7351 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7351 pull_request 'CI'
+write_main_checks "$(check_run 6021 'deploy-api' completed failure 8451 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8451 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8451"
+wf_declares .github/workflows/deploy-hosted.yml push workflow_dispatch
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) a PUSH-ONLY base red is NOT counted against the PR — it merges (exit 0)" \
+  || fail "(a) a not-PR-evaluable base red still refused every PR (exit $rc) — the #6807 defect: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge actually happened" || fail "(a) no merge attempted"
+# The DETAIL (job, workflow, verdict, URL) must be printed, not just counted: the
+# summary alone would make the exemption unauditable. Deleting the BASE_REDS_OTHER
+# print in admin-merge.sh must fail THIS assertion.
+if grep -q "Base red(s) reported but NOT blocking:" "$SCEN/err" \
+   && grep -q "NOT pull-request-evaluable" "$SCEN/err" \
+   && grep -q "deploy-api" "$SCEN/err" && grep -q "Deploy hosted" "$SCEN/err"; then
+  pass "(a) …and the red's DETAIL (job, workflow, verdict) is REPORTED on stderr, not silently dropped"
+else
+  fail "(a) the not-PR-evaluable red's detail is SILENT — the exemption must report the red it excluded"
+fi
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && fail "(a) the rail still refused at §4.6" || pass "(a) …and §4.6 did not refuse"
+# …and the DURABLE posted evidence must carry it too. stderr is ephemeral; a
+# reviewed merge is audited from the posted comment, and an exemption visible
+# only in a terminal log is indistinguishable there from a silent drop. Removing
+# the health_line disclosure in admin-merge.sh must fail THIS assertion.
+if [ -f "$SCEN/comment" ] \
+   && grep -q "Base red(s) reported but NOT blocking:" "$SCEN/comment" \
+   && grep -q "NOT pull-request-evaluable" "$SCEN/comment"; then
+  pass "(a) …and the DURABLE evidence comment carries the exempted red, not just stderr"
+else
+  fail "(a) the exemption is absent from the posted evidence — an ephemeral-only report is a silent drop in the durable record"
+fi
+
+# (b) THE MANDATORY GUARD — THE CHANGE MUST NOT BE A BLANKET EXEMPTION. The SAME
+# shape, but the workflow DECLARES pull_request, so the PR's own evaluation DOES
+# carry that check and the staleness comparison is meaningful: the red STILL
+# enters MAIN_HEALTH_RED_TS and §4.6 STILL BLOCKS. If (b) stops holding, the fix is
+# WRONG even though (a) passes.
+new_scen preeval-prevaluable-base
+HEAD_PE2="f2f2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE2" > "$SCEN/head"
+lane_pass "$HEAD_PE2" 5961 > "$SCEN/runs-$HEAD_PE2"
+lane_pass mainpe2 5962 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5022 'ci / lint' completed success 7361 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7361 pull_request 'CI'
+write_main_checks "$(check_run 6022 'python-ci / test' completed failure 8461 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8461 push 'Python CI'
+printf 'push\tPython CI\t.github/workflows/python-ci.yml\n' > "$SCEN/run-8461"
+wf_declares .github/workflows/python-ci.yml push pull_request
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) a base red on a workflow that DECLARES pull_request STILL BLOCKS (exit $rc)" \
+  || fail "(b) a PR-EVALUABLE base red was exempted — the fix became a blanket exemption"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && pass "(b) …and it is the §4.6 staleness refusal, not something else" \
+  || fail "(b) the refusal is not the §4.6 staleness one: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+[ -f "$SCEN/comment" ] && fail "(b) evidence was posted over a stale surface" || pass "(b) no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) a merge was attempted over a stale surface" || pass "(b) no merge attempted"
+
+# (b') `pull_request_target` counts too — it is the OTHER trigger that attaches a
+# check to a PR head sha, and two of tortoise's 6 PR-evaluable workflows
+# (`ai-review-gate`, `inbound-relay`) declare only it.
+new_scen preeval-prtarget-base
+HEAD_PE2B="f2b2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE2B" > "$SCEN/head"
+lane_pass "$HEAD_PE2B" 5963 > "$SCEN/runs-$HEAD_PE2B"
+lane_pass mainpe2b 5964 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5023 'ci / lint' completed success 7363 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7363 pull_request 'CI'
+write_main_checks "$(check_run 6023 'review-gate' completed failure 8463 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8463 push 'AI review gate'
+printf 'push\tAI review gate\t.github/workflows/ai-review-gate.yml\n' > "$SCEN/run-8463"
+wf_declares .github/workflows/ai-review-gate.yml pull_request_target
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b') a base red on a pull_request_target workflow STILL BLOCKS (exit $rc)" \
+  || fail "(b') a pull_request_target base red was exempted — the other PR trigger was missed"
+
+# (c) THE SECOND GUARD — a GENUINELY PR-INTRODUCED failure still BLOCKS. The tree
+# surface is never subject to this exemption (allow_noncode=0): a red on the PR's
+# OWN evaluated tree is the PR's failure, and even a push-only attribution there
+# blocks (the impossible-but-observed shape #1353 pinned for `schedule`).
+new_scen preeval-tree-red
+HEAD_PE3="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE3" > "$SCEN/head"
+lane_pass "$HEAD_PE3" 5971 > "$SCEN/runs-$HEAD_PE3"
+lane_pass mainpe3 5972 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 3321 'deploy-api' completed failure 6961)"
+pr_run_map 6961 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-6961"
+wf_declares .github/workflows/deploy-hosted.yml push workflow_dispatch
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) a not-PR-evaluable red on the PR's TREE still BLOCKS (exit $rc) — the exemption is BASE-only" \
+  || fail "(c) a red on the evaluated tree was exempted — the PR's own failure no longer blocks"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(c) …as the tree-red refusal" || fail "(c) the refusal is not the tree-red one"
+grep -q "pr merge" "$SCEN/calls" && fail "(c) a merge was attempted over a red tree" || pass "(c) no merge attempted"
+
+# (d) FAIL CLOSED — an UNREADABLE workflow file keeps the red blocking. The
+# contents API cannot answer (no fixture), so the predicate returns `unknown`,
+# which the caller MUST treat as PR-evaluable. An unresolvable workflow is never
+# an exemption — the same discipline as an unresolved RUN.
+new_scen preeval-unreadable
+HEAD_PE4="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE4" > "$SCEN/head"
+lane_pass "$HEAD_PE4" 5981 > "$SCEN/runs-$HEAD_PE4"
+lane_pass mainpe4 5982 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5024 'ci / lint' completed success 7381 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7381 pull_request 'CI'
+write_main_checks "$(check_run 6024 'deploy-api' completed failure 8481 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8481 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8481"
+# NO wf-contents fixture -> the workflow file is UNREADABLE.
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) an UNREADABLE workflow file FAILS CLOSED — the base red still BLOCKS (exit $rc)" \
+  || fail "(d) an unreadable workflow file was read as an exemption — fail-open"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && pass "(d) …and it refuses at §4.6" || fail "(d) the refusal is not the §4.6 one"
+grep -q "pr merge" "$SCEN/calls" && fail "(d) a merge was attempted on an unreadable workflow" || pass "(d) no merge attempted"
+
+# (g) THE FETCH IS PINNED TO THE MEASURED REF. The contents API defaults to the
+# repository's DEFAULT branch, but a PR can target a NON-default base, and the
+# workflow definition that governs that PR's evaluation is the one on the BASE
+# branch. A red on `release`'s deploy-hosted.yml — which declares pull_request
+# THERE but not on the default branch — is measurable by PRs targeting `release`,
+# so it must BLOCK. An unpinned fetch reads the default branch, returns `no`, and
+# exempts it: the fail-open this pins.
+new_scen preeval-refpin
+HEAD_PE7="f7f7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE7" > "$SCEN/head"
+printf 'release\n' > "$SCEN/base-ref"
+lane_pass "$HEAD_PE7" 5991 > "$SCEN/runs-$HEAD_PE7"
+lane_pass mainpe7 5992 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5031 'ci / lint' completed success 7391 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7391 pull_request 'CI'
+write_main_checks "$(check_run 6031 'deploy-api' completed failure 8491 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8491 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8491"
+# The DEFAULT branch's file is push-only; the `release` branch's file declares
+# pull_request. Only a ref-pinned fetch sees the latter.
+wf_declares .github/workflows/deploy-hosted.yml push workflow_dispatch
+wf_declares_ref release .github/workflows/deploy-hosted.yml push pull_request
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(g) a PR-evaluable red on a NON-DEFAULT base still BLOCKS (exit $rc) — the fetch is ref-pinned" \
+  || fail "(g) a red whose workflow declares pull_request on the base branch was EXEMPTED — the contents fetch read the default branch (fail-open)"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && pass "(g) …and it refuses at §4.6" || fail "(g) the refusal is not the §4.6 one"
+grep -q "pr merge" "$SCEN/calls" && fail "(g) a merge was attempted over a stale surface" || pass "(g) no merge attempted"
+
+# (f) THE CACHE IS REAL AND BOUNDED — two base reds on the SAME workflow cost ONE
+# contents fetch, and the cache file is cleaned up. The predicate is called once
+# per red; the call site must not be a command substitution (a subshell would
+# discard the cache-path assignment, making the cache dead and leaking one mktemp
+# file per red). A TMPDIR private to this scenario makes the leak check exact.
+new_scen preeval-cache
+HEAD_PE6="f6f6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE6" > "$SCEN/head"
+lane_pass "$HEAD_PE6" 5955 > "$SCEN/runs-$HEAD_PE6"
+lane_pass mainpe6 5956 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5026 'ci / lint' completed success 7356 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7356 pull_request 'CI'
+write_main_checks \
+  "$(check_run 6026 'deploy-api' completed failure 8456 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6027 'deploy-hosted' completed failure 8457 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8456 push 'Deploy hosted' 8457 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8456"
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8457"
+wf_declares .github/workflows/deploy-hosted.yml push workflow_dispatch
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+mkdir -p "$SCEN/rtmp"
+SCEN="$SCEN" TMPDIR="$SCEN/rtmp" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(f) two push-only base reds on one workflow both exempt — merges (exit 0)" \
+  || fail "(f) the cache scenario did not merge (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+n_contents=$(grep -c 'contents/.github/workflows/deploy-hosted.yml' "$SCEN/calls" || true)
+[ "$n_contents" = "1" ] && pass "(f) …and the workflow file was fetched exactly ONCE (the cache is live, not a per-red mktemp)" \
+  || fail "(f) the contents API was fetched $n_contents time(s) for two reds on one workflow — the cache is dead"
+n_leak=$(find "$SCEN/rtmp" -name 'admin-merge-wfpr.*' 2>/dev/null | wc -l | tr -d ' ')
+[ "$n_leak" = "0" ] && pass "(f) …and the cache file was cleaned up (no admin-merge-wfpr.* left in TMPDIR)" \
+  || fail "(f) $n_leak admin-merge-wfpr.* file(s) leaked in TMPDIR"
+
+# (h) THE FAIL-OPEN IS CLOSED: A PARTIAL READ IS NOT AUTHORITATIVE. The parser
+# terminates the `on:` region at the next column-0 line — but a MULTI-LINE flow
+# collection or quoted scalar puts a CONTINUATION at column 0, so an early break
+# reads only PART of the block and can answer `no` for a workflow that DOES
+# declare pull_request. That exempts a measurable red and disarms §4.6: the #1261
+# stale-green merge, reached by FILE FORMATTING alone. The state machine in
+# scripts/ci-workflow-pr-evaluable.sh must keep such a red BLOCKING.
+new_scen preeval-flow-continuation
+HEAD_PE8="f8f8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE8" > "$SCEN/head"
+lane_pass "$HEAD_PE8" 5995 > "$SCEN/runs-$HEAD_PE8"
+lane_pass mainpe8 5996 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5041 'ci / lint' completed success 7401 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7401 pull_request 'CI'
+write_main_checks "$(check_run 6041 'deploy-api' completed failure 8501 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8501 push 'Mixed'
+printf 'push\tMixed\t.github/workflows/mixed.yml\n' > "$SCEN/run-8501"
+# The workflow DOES declare pull_request — behind a column-0 continuation.
+mkdir -p "$SCEN/wf-contents/.github/workflows"
+printf 'name: fixture\non:\n  push:\n    branches: [main,\nzzz-release]\n  pull_request:\n    types: [opened]\njobs:\n  x:\n    runs-on: ubuntu-latest\n' > "$SCEN/wf-contents/.github/workflows/mixed.yml"
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a column-0 flow continuation cannot hide pull_request — the base red STILL BLOCKS (exit $rc)" \
+  || fail "(h) FAIL-OPEN: a red on a workflow that DECLARES pull_request was exempted because the parse stopped at the continuation"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && pass "(h) …and it refuses at §4.6" || fail "(h) the refusal is not the §4.6 one"
+grep -q "pr merge" "$SCEN/calls" && fail "(h) a merge was attempted over a stale surface" || pass "(h) no merge attempted"
+
+# (e) THE PREDICATE ITSELF, IN BOTH DIRECTIONS. The measured workflows of
+# tortoise, as `on:` shapes: the ones that declare NO pull_request must be `no`,
+# the ones that DO must be `yes`. A hardcoded name list is NOT the rule (it rots);
+# this is its CROSS-CHECK, and it also pins the fail-closed shapes.
+echo "== 67e. the predicate (scripts/ci-workflow-pr-evaluable.sh) =="
+pe_case() {  # <label> <expected> <yaml>
+  local got
+  got="$(printf '%s' "$3" | wf_eval)"
+  [ "$got" = "$2" ] && pass "predicate: $1 -> $2" || fail "predicate: $1 -> expected $2, got '$got'"
+}
+pe_case "push only"                no  $'on:\n  push:\n'
+pe_case "push + workflow_dispatch" no  $'on:\n  push:\n  workflow_dispatch:\n'
+pe_case "schedule + push"          no  $'on:\n  schedule:\n    - cron: \x270 */2 * * *\x27\n  push:\n    branches: [main]\n'
+pe_case "pull_request only"        yes $'on:\n  pull_request:\n'
+pe_case "push + pull_request"      yes $'on:\n  push:\n  pull_request:\n'
+pe_case "pull_request_target"      yes $'on:\n  pull_request_target:\n  workflow_dispatch:\n'
+pe_case "flow sequence"            yes 'on: [push, pull_request]'
+pe_case "flow mapping"             yes 'on: {push: null, pull_request_target: null}'
+pe_case "scalar"                   yes 'on: pull_request'
+pe_case "no on block fails closed" unknown $'name: x\njobs:\n  a:\n'
+pe_case "merge key fails closed"   unknown $'on:\n  push:\n  <<: *extra\n'
+pe_case "tab indent fails closed"  unknown $'on:\n\tpush:\n'
+# ── A PARTIAL READ IS NEVER AUTHORITATIVE (adversarial review, #6807) ──────
+# These are the shapes that made the FIRST revision answer `no` for a workflow
+# that declares pull_request — each one a fail-open on the merge gate. They pin
+# the state machine in scripts/ci-workflow-pr-evaluable.sh: a column-0
+# continuation inside an open flow/quote is NOT the terminator, and an
+# unrecognised key shape is refused rather than silently dropped.
+pe_case "column-0 flow continuation"  yes $'on:\n  push:\n    branches: [main,\nzzz-release]\n  pull_request:\n    types: [opened]\n'
+pe_case "multi-line quoted scalar"    yes $'on:\n  push:\n    branches: "main\nx"\n  pull_request:\n'
+pe_case "quoted bare scalar"          yes 'on: "pull_request"'
+pe_case "explicit key fails closed"   unknown $'on:\n  push: null\n  ? pull_request\n  : null\n'
+pe_case "unterminated flow fails closed" unknown $'on:\n  push: [\n  pull_request:\n'
+# A `[`/`{` inside a PLAIN SCALAR is not a flow collection: counting it would make
+# the region look unterminated, skip the trigger keys after it, and answer `no`
+# for a workflow that DOES declare pull_request. (`paths: foo[bar` and
+# `default: a:[b` are legal YAML.)
+pe_case "bracket inside a plain scalar" yes $'on:\n  push:\n    paths: foo[bar\n  pull_request:\n    types: [opened]\n  workflow_dispatch:\n    inputs:\n      y:\n        default: a]b\n'
+pe_case "bracket after a bare colon in a scalar" yes $'on:\n  push:\n    paths: a:[b\n  pull_request:\n'
+# Apostrophes/quotes inside PLAIN scalars are ordinary characters, not scalar
+# openers: `a:'b` must not OPEN a quote (which would swallow the next line) and
+# `don't` must not CLOSE one. This single case fails under BOTH a looser guard
+# (`prev in "[{,:"`) and an unconditional opener, so the token-boundary rule is
+# pinned rather than merely exercised.
+pe_case "apostrophe in a plain scalar" yes $'on:\n  push:\n    paths: a:\'b\n  pull_request: don\'t\n'
+# A depth-1 `- [flow,` sequence item still keeps the column-0 continuation inside
+# an open flow, so the trigger key after it is read.
+pe_case "dash-then-multiline flow"    yes $'on:\n  push:\n    branches:\n      - [main,\nzzz-release]\n  pull_request:\n'
+# The SAFETY NET: an ANCHORED or TAGGED key is a real trigger key that the key
+# regex cannot name, so the walk silently skips it and answers `no` on a PARTIAL
+# read. Any `pull_request` KEY anywhere in the document forces `unknown`. The
+# net can only turn `no` into `unknown`, never the reverse.
+pe_case "anchored key fails closed"   unknown $'on:\n  push:\n  &a pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
+pe_case "tagged key fails closed"     unknown $'on:\n  push:\n  !!str pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
