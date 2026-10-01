@@ -54,10 +54,14 @@ Rate = ci_exemption.Rate
 decide = ci_exemption.decide
 detect_rotating_identity = ci_exemption.detect_rotating_identity
 guard_step_key = ci_exemption.guard_step_key
+is_failure_key = ci_exemption.is_failure_key
+is_failure_key_loose = ci_exemption.is_failure_key_loose
 normalize_guard_error = ci_exemption.normalize_guard_error
 parse_failed_ids = ci_exemption.parse_failed_ids
+parse_failure_rows = ci_exemption.parse_failure_rows
 parse_pr_failure_text = ci_exemption.parse_pr_failure_text
 parse_rates = ci_exemption.parse_rates
+parse_signature_rows = ci_exemption.parse_signature_rows
 
 ID = "tests/test_dr_endpoints.py::TestDrDrill::test_restores_to_scratch"
 
@@ -1978,4 +1982,485 @@ def test_declared_residual_an_unparseable_failure_with_no_pytest_signal():
     assert parsed.ids == [_GUARD_KEY], (
         "the guard is the ROOT failing step so it is attributed — the residual is "
         "that a LATER unparseable, pytest-signal-free failure is invisible; #1366"
+    )
+
+
+# ── a NON-NODEID failure identity must be COMPARED, not REFUSED (#6798) ────
+# MEASURED DEFECT (main @ 4eb27bc0b, run 36806577265; reproduced on a live run):
+#
+#   `tools/ci-failure-set.sh --commit-rows <sha>` reported
+#       examined=1  extracted=0
+#     for a run whose ONLY failure evidence was a pytest COLLECTION ERROR:
+#       ERROR tests/test_gmm_proofs.py - AttributeError: partially initialized
+#       module 'torch' has no attribute 'Tensor' (most likely due to a circular import)
+#     and, on the brief's shard, a WATCHDOG KILL with no nodeid at all:
+#       ==================== WATCHDOG: pytest killed after 15m
+#       (0 passed, 0 failed, 0 errored so far) ====================
+#       ==================== pytest exit code: 137 ====================
+#
+# `admin-merge.sh` step 1c refuses while `extracted < examined`:
+#
+#     if [ "$pr_extracted" -lt "$pr_examined" ]; then … exit 1
+#
+# and it has NO exit: a killed leg can never produce a nodeid, so a
+# clean-reviewed PR is refused forever. Both causes are ONE defect — a failing
+# run that yields no `::nodeid` — and one fix: admit a STABLE, COMPARABLE
+# identity from evidence the nodeid pass cannot shape-check, exactly as the
+# GUARD-STEP pass (#4469) already does for annotations.
+#
+# WHY IT IS FAIL-CLOSED: main's union is the EXEMPTION ALLOWLIST, so a PR-side
+# identity only excuses a failure main is ALSO red on. A PR that breaks
+# collection on a file main collects fine contributes an identity main does not
+# carry, so it stays BLOCKED — the comparison is untouched; only its INPUT is
+# corrected. (This is the guard-step argument, unchanged.)
+
+
+# THE KILL BANNER, exactly as the runner's failed-step log carries it. Note the
+# `<job>\t<step>\t<ts>Z ` head: that is what makes it a RECORD in a raw log.
+_KILL_HEAD = (
+    "test (h)\tRun fast test suite (slow files run in the test-slow job)\t"
+    "2026-10-01T02:57:36.4464344Z "
+)
+_KILL_BANNER_137 = (
+    "==================== WATCHDOG: pytest killed after 15m "
+    "(0 passed, 0 failed, 0 errored so far) — last test lines above "
+    "===================="
+)
+_KILL_BANNER_ZERO_ZERO = (
+    "==================== WATCHDOG: pytest killed after 15m "
+    "(75 passed, 0 failed, 0 errored so far) — last test lines above "
+    "===================="
+)
+_COLLECT_ERROR = (
+    "ERROR tests/test_gmm_proofs.py - AttributeError: partially initialized "
+    "module 'torch' has no attribute 'Tensor' (most likely due to a circular import)"
+)
+
+
+def _log(*lines: str) -> str:
+    """A raw `gh run view --log-failed` capture: every line carries the head."""
+    return "".join(_KILL_HEAD + line + "\n" for line in lines)
+
+
+def test_6798_a_watchdog_killed_leg_yields_a_comparable_identity():
+    """(a) THE UNBLOCK: a killed leg is not an un-measured surface.
+
+    Measured: the kill banner carries NO nodeid, so the nodeid pass yields
+    nothing, `extracted` stays 0 against `examined=1`, and step 1c refuses with
+    no exit. The kill IS the failure identity — and it must be STABLE, so the
+    identity is keyed on the pytest watchdog, not on the shard, the minute
+    count, or the tick's passed/failed counters (all of which move run to run
+    and would make main's baseline un-matchable — the rotating-identity class).
+    """
+    parsed = parse_failed_ids(_log(_KILL_BANNER_137), raw_log=True)
+
+    assert parsed.ids == ["watchdog-kill::pytest"], (
+        "a watchdog-killed leg must yield a comparable identity, or the rail "
+        "refuses it forever (§1c: extracted < examined, exit 1)"
+    )
+    assert parsed.ok is True, "the set is READ, not empty: the run is attributable"
+    assert parsed.rejected == [], "the banner is a RECORD, never a dropped token"
+    assert parsed.non_nodeid == ["watchdog-kill::pytest"], (
+        "the kill must be reported AS a non-nodeid attribution so the rail can "
+        "say WHICH signal it read (a kill is re-runnable; a collection error is "
+        "the PR's own breakage — the remedies differ)"
+    )
+
+
+def test_6798_the_kill_identity_does_not_track_the_tick_counters():
+    """THE STABILITY REQUIREMENT: 0 passed and 75 passed name the SAME id.
+
+    The banner's passed/failed/errored counters are a snapshot of the tick the
+    watchdog fired on. Keying the identity on them would make it rotate between
+    runs, so it could never match main's baseline and EVERY killed leg would
+    read as "unique to this PR" — the #3756 permanent-false-refusal, rebuilt.
+    """
+    zero = parse_failed_ids(_log(_KILL_BANNER_137), raw_log=True)
+    mid = parse_failed_ids(_log(_KILL_BANNER_ZERO_ZERO), raw_log=True)
+
+    assert zero.ids == mid.ids == ["watchdog-kill::pytest"], (
+        "the identity must not vary with the kill tick's counters"
+    )
+
+
+def test_6798_a_killed_leg_with_REPORTED_FAILURES_is_not_a_bare_kill():
+    """FAIL-CLOSED: a kill is a bare failure ONLY at zero failures.
+
+    A pytest run killed AFTER failures have been reported has real nodeids, and
+    those are the PR's failures. Emitting a bare `watchdog-kill::pytest` there
+    would let a genuine assertion failure ride an environmental exemption — the
+    one direction this must never open.
+    """
+    banner_with_failures = (
+        "==================== WATCHDOG: pytest killed after 15m "
+        "(120 passed, 3 failed, 2 errored so far) — last test lines above "
+        "===================="
+    )
+    parsed = parse_failed_ids(_log(banner_with_failures), raw_log=True)
+
+    assert "watchdog-kill::pytest" not in parsed.ids, (
+        "a kill at 3 failed / 2 errored is NOT a bare kill — those failures "
+        "must be named by their nodeids, never excused as environmental"
+    )
+
+
+def test_6798_the_echoed_script_source_does_not_emit_a_kill_identity():
+    """THE MEASURED TRAP: the workflow ECHOES the banner's own source line.
+
+    `--log-failed` contains the shell source — measured at run 36809707842 line
+    85, the letter-for-letter text `echo "==================== WATCHDOG: pytest
+    killed after 15m …"`. A substring match fires on EVERY run, green included,
+    and would exempt the whole fleet unconditionally. The record must be the
+    BANNER (the runner's own output line), never its source echo.
+    """
+    echoed_source = (
+        "\x1b[36;1m  echo \"==================== WATCHDOG: pytest killed after "
+        "15m ($passed passed, $failed failed, $errored errored so far) — last "
+        "test lines above ====================\"\x1b[0m"
+    )
+    parsed = parse_failed_ids(_log(echoed_source), raw_log=True)
+
+    assert "watchdog-kill::pytest" not in parsed.ids, (
+        "the echoed shell source names unset variables, not a measurement — "
+        "emitting an id here exempts every run repo-wide"
+    )
+
+
+def test_6798_a_kill_banner_at_any_budget_is_recognised():
+    """The MINUTE COUNT is not fixed — `test-slow` kills at 10m, `test` at 15m.
+
+    MEASURED: run 36811187065's echoed source carries a 10m banner for the
+    `test-slow` job while the `test` job's is 15m, so a pattern pinned to one
+    budget silently misses every kill on the other leg — a fix that fires on the
+    shard that was measured tonight and not on the next one, which is the
+    per-shard failure mode (#1266 -> #1371 -> #3395 -> #6145).
+    """
+    ten_minute = (
+        "==================== WATCHDOG: pytest killed after 10m "
+        "(40 passed, 0 failed, 0 errored so far) — last test lines above "
+        "===================="
+    )
+    parsed = parse_failed_ids(_log(ten_minute), raw_log=True)
+
+    assert parsed.ids == ["watchdog-kill::pytest"], (
+        "the kill identity must not be pinned to one watchdog budget"
+    )
+
+
+def test_6798_a_FAILED_file_level_record_is_NOT_a_collection_error():
+    """THE KEYWORD IS LOAD-BEARING: pytest emits collection errors under `ERROR`.
+
+    `FAILED tests/x.py` with no `::` is a malformed/truncated record, and the
+    drop accounting exists precisely for it (`FAILED may` is the measured form).
+    Admitting any `.py`-suffixed payload would let a truncated nodeid — whose
+    module happens to end in `.py` — buy an identity, and the shape check is the
+    only thing standing between the set and the #3756 leak.
+    """
+    parsed = parse_failed_ids(_log("FAILED tests/test_gmm_proofs.py"), raw_log=True)
+
+    assert parsed.ids == [], (
+        "only pytest's ERROR-led collection record is an attribution; a "
+        "file-level FAILED record stays a DROP"
+    )
+    assert len(parsed.rejected) == 1, "and it must be COUNTED, as a drop"
+
+
+def test_6798_b_an_unattributable_run_that_was_NOT_killed_still_blocks():
+    """(b) THE REFUSAL THAT MUST SURVIVE — the hole-closer.
+
+    A genuinely unattributable run (prose, no nodeid, no kill banner) must
+    yield NOTHING, so `extracted < examined` still refuses it. If this test
+    passes with an id in the set, the change has opened the exact hole #6798
+    was mis-diagnosed against and is WRONG.
+    """
+    unattributable = _log(
+        "ImportError: no module named y",
+        "##[error]Process completed with exit code 1.",
+    )
+    parsed = parse_failed_ids(unattributable, raw_log=True)
+
+    assert parsed.ids == [], (
+        "an unattributable, un-killed run must keep its zero-residual refusal"
+    )
+    assert parsed.ok is False, "zero ids from no evidence must not read as a valid set"
+
+
+def test_6798_c_a_parseable_nodeid_is_unchanged_by_the_new_pass():
+    """(c) NO REGRESSION: the nodeid path is untouched.
+
+    A leg that fails WITH a nodeid must produce exactly that nodeid — the new
+    pass may not add, rename, or swallow it.
+    """
+    parsed = parse_failed_ids(_log(f"FAILED {ID}"), raw_log=True)
+
+    assert parsed.ids == [ID], "the nodeid path must be byte-for-byte unchanged"
+
+
+def test_6798_a_collection_error_yields_a_comparable_identity():
+    """THE SECOND MEASURED CAUSE — same defect, same fix.
+
+    Reproduced live: a run whose only failure was a collection error produced
+    `examined=1 extracted=0`. pytest's record is `ERROR <path> - <reason>` — a
+    FILE-level identity the nodeid pass cannot address. The reason string
+    VARIES run to run (it is an exception message), so the identity is keyed on
+    the FILE, which is stable.
+    """
+    parsed = parse_failed_ids(_log(_COLLECT_ERROR), raw_log=True)
+
+    assert parsed.ids == ["collect-error::tests/test_gmm_proofs.py"], (
+        "a collection error is an attribution, not an unattributable token"
+    )
+    assert parsed.rejected == [], (
+        "it must be EXTRACTED, not dropped — a drop still marks the set CLIPPED"
+    )
+    assert parsed.non_nodeid == ["collect-error::tests/test_gmm_proofs.py"], (
+        "the id must ALSO be recorded per-KIND, or the report prints "
+        "`non-nodeid=0` beside an id that came from exactly that pass and the "
+        "operator reads which signal it was backwards"
+    )
+
+
+def test_6798_a_collection_error_identity_is_file_scoped_not_reason_scoped():
+    """STABILITY: the same file with a different exception is the SAME id."""
+    other_reason = "ERROR tests/test_gmm_proofs.py - ModuleNotFoundError: No module named 'x'"
+    a = parse_failed_ids(_log(_COLLECT_ERROR), raw_log=True)
+    b = parse_failed_ids(_log(other_reason), raw_log=True)
+
+    assert a.ids == b.ids, "an identity that tracks the exception message can never match main"
+
+
+def test_6798_an_id_file_admits_neither_identity():
+    """SCOPE: both passes are RAW-LOG only (as the guard-step pass is).
+
+    An id FILE is the failure set already — an `ERROR <path>` or a banner line
+    there is malformed input, not evidence, and must stay REJECTED so a
+    hand-written file cannot buy an identity.
+    """
+    for line in (_COLLECT_ERROR, _KILL_BANNER_137):
+        parsed = parse_failed_ids(line + "\n", raw_log=False)
+        assert parsed.ids == [], f"id-file mode must not admit {line[:40]!r}"
+        assert parsed.rejected == [line], "an id file's bad record is a DROP, not prose"
+
+
+# ── THE DECISION, not just the parser (verifier-found gap) ────────────────
+# The FIRST fix corrected only the `ids` half. The rail reads TWO doors, and
+# `decide` compares SIGNATURES with a subset rule (`_signatures_overlap`), which
+# returns False when EITHER side is empty. So an id with no signature does not
+# "compare" at all — it BLOCKS. Worse, `ci_failure-set.sh:839` runs the
+# signature extractor inside `if [ -n "$ids" ]` and treats a non-zero exit as
+# FATAL, and `_cmd_signatures` returns non-zero when the capture yields no id —
+# so an ids-only fix RELOCATED the per-run refusal into the signature door.
+# These tests exercise the decision, which the unit suite had not.
+
+
+def test_6798_the_signature_door_emits_the_same_non_nodeid_universe():
+    """BOTH doors must agree — an id signed by one door only BLOCKS.
+
+    `ci-failure-set.sh` calls `ids` and then, only when ids is non-empty,
+    `signatures`. A non-zero exit from that second call is FATAL for the run, so
+    "ids only" is not a partial fix: it is the SAME refusal with a new message.
+    """
+    capture = _log(_COLLECT_ERROR)
+    ids_door = parse_failed_ids(capture, raw_log=True)
+    sig_door = parse_pr_failure_text(capture)
+
+    assert sig_door.ok is True, (
+        "the signatures CLI returns 0 only when ok — False here makes "
+        "ci-failure-set.sh abort the run as a fatal extraction failure"
+    )
+    assert sig_door.ids == ids_door.ids == ["collect-error::tests/test_gmm_proofs.py"]
+    assert sig_door.non_nodeid == ["collect-error::tests/test_gmm_proofs.py"]
+    assert sig_door.rejected == [], (
+        "a non-empty `rejected` marks the set CLIPPED — and the OTHER door "
+        "already calls this line extracted, so the two must not disagree"
+    )
+    assert sig_door.signatures["collect-error::tests/test_gmm_proofs.py"] == frozenset(
+        {"collect-error"}
+    )
+
+
+def test_6798_the_signature_door_signs_the_watchdog_kill():
+    """The kill must be signed by the same door, and signed STABLY."""
+    sig_door = parse_pr_failure_text(_log(_KILL_BANNER_137))
+
+    assert sig_door.ok is True
+    assert sig_door.ids == ["watchdog-kill::pytest"]
+    assert sig_door.signatures["watchdog-kill::pytest"] == frozenset({"watchdog-kill"})
+
+
+def test_6798_the_carve_out_banner_is_recognised():
+    """A third REACHABLE banner shape (tortoise python-ci.yml:1810).
+
+    `WATCHDOG: carve-out pytest killed after 35m (…)` — a pattern pinned to the
+    bare `WATCHDOG: pytest killed after` silently misses it, so a carve-out kill
+    stays zero-id: the same permanent refusal, one shape over.
+    """
+    carve_out = (
+        "==================== WATCHDOG: carve-out pytest killed after 35m "
+        "(12 passed, 0 failed, 0 errored so far) ===================="
+    )
+    parsed = parse_failed_ids(_log(carve_out), raw_log=True)
+
+    assert parsed.ids == ["watchdog-kill::pytest"], (
+        "the carve-out leg is a reachable kill shape and must be attributed"
+    )
+
+
+def test_6798_a_non_nodeid_identity_is_COMPARED_not_BLOCKED():
+    """THE POINT OF THE WHOLE CHANGE, proven at the DECISION.
+
+    With main carrying the same identity, the PR's occurrence is EXEMPT — which
+    is what the brief means by "the rail does not permanently refuse". A parser
+    result that never reaches this state has fixed nothing.
+    """
+    capture = _log(_KILL_BANNER_137)
+    ids = parse_failed_ids(capture, raw_log=True).ids
+    sigs = parse_pr_failure_text(capture).signatures
+    assert ids == ["watchdog-kill::pytest"] and "watchdog-kill::pytest" in sigs
+
+    # EQUAL rates: the question here is REFUSAL vs COMPARISON, not severity. The
+    # first version of this test used a PR rate 1.5x main's and the decision
+    # (correctly) blocked on the RATE — which is the comparison working, not a
+    # refusal. Making the rates equal isolates the thing under test.
+    pr = {i: Failure(rate=Rate(2, 8), signatures=sigs[i]) for i in ids}
+    main_rates = {i: Rate(2, 8) for i in ids}
+
+    d = decide(pr, main_rates, main_signatures={i: sigs[i] for i in ids}, k_pr=8)
+
+    assert not d.any_blocked, (
+        f"a non-nodeid identity main is ALSO red on at the same rate must be "
+        f"exempt, not blocked; blocked={[(v.nodeid, v.reason) for v in d.blocked]}"
+    )
+
+
+def test_6798_a_non_nodeid_identity_main_never_had_STILL_BLOCKS():
+    """FAIL-CLOSED, at the decision: the allowlist direction is unchanged.
+
+    A PR whose collection error main is NOT red on is the PR's own breakage and
+    must BLOCK. If this passes as exempt, the change has opened the hole.
+    """
+    capture = _log(_COLLECT_ERROR)
+    ids = parse_failed_ids(capture, raw_log=True).ids
+    sigs = parse_pr_failure_text(capture).signatures
+
+    pr = {i: Failure(rate=Rate(3, 8), signatures=sigs[i]) for i in ids}
+    # main is GREEN for this file: zero rate, no signature entry.
+    d = decide(pr, {}, main_signatures={}, k_pr=8)
+
+    assert d.any_blocked, (
+        "an identity main never carried must block — the exemption set is "
+        "main's union, and this id is not in it"
+    )
+
+
+def test_6798_a_KILL_does_not_excuse_a_NAMED_test_failure():
+    """CRITICAL fail-open check: the kill identity must not launder a nodeid.
+
+    A PR that fails a real test AND was also killed carries BOTH ids. The kill
+    being exempt must not exempt the named failure — the subset rule requires
+    EVERY PR signature to be on main, and main has no signature for that test.
+    """
+    # A REAL failure line carries a detail (` - <reason>`); without one the nodeid
+    # is UNSIGNED and blocks for a DIFFERENT reason, which would make this test
+    # pass or fail for the wrong cause.
+    capture = _log(_KILL_BANNER_137, f"FAILED {ID} - AssertionError: boom")
+    ids = parse_failed_ids(capture, raw_log=True).ids
+    sigs = parse_pr_failure_text(capture).signatures
+
+    assert "watchdog-kill::pytest" in ids and ID in ids, "both must be present"
+    assert ID in sigs, "the named failure must be SIGNED, or it blocks unsigned"
+
+    pr = {i: Failure(rate=Rate(2, 8), signatures=sigs[i]) for i in ids}
+    # main was killed too, but never failed ID.
+    main_rates = {"watchdog-kill::pytest": Rate(1, 8)}
+    main_sigs = {"watchdog-kill::pytest": frozenset({"watchdog-kill"})}
+
+    d = decide(pr, main_rates, main_signatures=main_sigs, k_pr=8)
+
+    assert d.any_blocked, (
+        "the kill must not clean the sheet for a named test failure — a PR that "
+        "asserted false must stay blocked"
+    )
+
+
+# ── THE THIRD LAYER: the ROW / RATE doors (verifier round-2 finding) ───────
+# Round 2 found that fixing both PARSERS was still not enough, and that the
+# failure mode was WORSE than the refusal it replaced. `is_failure_key_loose`
+# gated the row doors and admitted only nodeids and guard-step keys, so the new
+# ids were REJECTED: `parse_failure_rows` dropped the PR's OWN row, `decide` saw
+# an EMPTY PR set, and the verdict became `CLEAN blocked=0 rejected=1`. A red PR
+# certified clean and MERGED — a silent false PASS, strictly worse than the
+# permanent refusal. Measured on the real CLI, before and after.
+#
+# Every unit test above still passed through this, because they build `Failure`
+# dicts by hand and never exercise the row parsers. Hence these.
+
+
+def test_6798_the_row_door_admits_the_non_nodeid_families():
+    """F5: the predicates that gate the row/rate doors must admit them."""
+    for key in ("watchdog-kill::pytest", "collect-error::tests/test_a.py"):
+        assert is_failure_key(key), f"parse_rates would DROP main's row for {key}"
+        assert is_failure_key_loose(key), f"parse_failure_rows would DROP the PR row for {key}"
+
+
+def test_6798_the_row_door_still_rejects_junk():
+    """FAIL-CLOSED: the widened predicate must not become a wildcard.
+
+    `is_failure_key` gates MAIN's rate table — the exemption allowlist. Admitting
+    a loose string there is a false-exemption vector, not a formatting nicety.
+    """
+    for junk in (
+        "random-string",
+        "watchdog-kill::OTHER",          # not the one identity we emit
+        "collect-error::notapyfile",     # must be a .py path
+        "collect-error::",               # empty path
+        "collect-error::tests/a.py::x",  # a nodeid is NOT a collect-error key
+    ):
+        assert not is_failure_key_loose(junk), f"{junk!r} must NOT buy a failure key"
+
+
+def test_6798_a_kill_only_PR_row_is_NOT_silently_dropped():
+    """THE SILENT FALSE PASS ITSELF, at the door that produced it.
+
+    Before the fix this returned `failures == {}` with the row in `rejected`, and
+    the rail reads an empty PR set as "clean" — it does NOT read `rejected`.
+    """
+    rows = "watchdog-kill::pytest\t1\t3\twatchdog-kill\n"
+    parsed = parse_failure_rows(rows)
+
+    assert set(parsed.failures) == {"watchdog-kill::pytest"}, (
+        f"the PR's own row must not be dropped (rejected={parsed.rejected}) — an "
+        f"empty PR set reads as CLEAN to the rail"
+    )
+    assert parsed.rejected == []
+    assert parsed.failures["watchdog-kill::pytest"].signatures == frozenset(
+        {"watchdog-kill"}
+    )
+
+
+def test_6798_main_rates_admit_the_non_nodeid_families():
+    """F6: main's rate row must survive, or main reads empty and always BLOCKS."""
+    parsed = parse_rates("watchdog-kill::pytest\t1\t3\n")
+
+    assert "watchdog-kill::pytest" in parsed.rates, (
+        f"main's rate row was dropped (rejected={parsed.rejected}) — with main "
+        f"empty, the COMPARISON half cannot work in either direction"
+    )
+    assert parsed.rejected == []
+
+
+def test_6798_a_collection_error_rate_row_survives_main_side():
+    """The other family, on main's side, through the strict predicate."""
+    parsed = parse_rates("collect-error::tests/test_a.py\t2\t4\n")
+
+    assert "collect-error::tests/test_a.py" in parsed.rates
+    assert parsed.rejected == []
+
+
+def test_6798_main_signature_rows_admit_the_non_nodeid_families():
+    """The main-side signature table is a separate door and needs it too."""
+    sigs = parse_signature_rows("watchdog-kill::pytest\twatchdog-kill\n")
+
+    assert sigs.get("watchdog-kill::pytest") == frozenset({"watchdog-kill"}), (
+        "a dropped main signature fails `_signatures_overlap` closed"
     )
