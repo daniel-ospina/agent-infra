@@ -470,6 +470,75 @@ fi
 # file/env key may carry stray whitespace).
 GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 
+# ── LANE-DIMENSION CARRY (#6072/#6213/#4823) ─────────────────────────────
+# The #2982 arm below asks whether the RENDERED patch is byte-identical. A base
+# move breaks that whenever main's landed commits OVERLAP the files the PR
+# touches, because the patch's "before" side then becomes main's new content while
+# the LANE's contribution is unchanged. Measured on three PRs, all with zero lane
+# commits between the reviewed head and the live head:
+#   #6072  two base merges  -> record dead (stored diff != live diff)
+#   #6213  one base merge   -> ai-review-gate SUCCESS at the reviewed head, then
+#                             FAILURE 7 SECONDS after the rail moved the head
+#   #4823  one base merge   -> a replacement record had to be produced (a fresh
+#                             review paid for work that did not change)
+# And one counter-example that fixes the boundary: #5421 also moved its head, but a
+# real lint fix (cfe2bad0afaa) landed in between, so the refusal was CORRECT, a
+# fresh review was owed, was produced, and the PR merged. This arm must fire on the
+# first three and NOT on that one.
+#
+# This does NOT relax the head binding: the carry is re-recorded against
+# CURRENT_HEAD, so the marker still names the head that merges. It widens WHEN a
+# carry is permitted, from "the rendered text is identical" to "the LANE's commits
+# are provably identical".
+#
+# FAIL-CLOSED: every clause below returns non-zero on any doubt (missing object,
+# unreadable base, merge-tree unavailable, conflict), so the existing refusal path
+# still governs. Nothing here can accept what the old arm rejected except by
+# proving the reviewed artifact unchanged.
+lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
+  local reviewed="$1" current="$2" base="" p2="" merged="" ctree=""
+  [ -n "$reviewed" ] && [ -n "$current" ] || return 1
+  [ "$reviewed" != "$current" ] || return 1
+
+  # (A) BOTH revisions must be present locally. Deliberately NOT fetching here:
+  # this is the trust boundary of the merge gate, and a network side effect inside
+  # it is a worse failure than a missed carry. Absent object => refuse.
+  git cat-file -e "$reviewed^{commit}" 2>/dev/null || return 1
+  git cat-file -e "$current^{commit}" 2>/dev/null || return 1
+
+  # (B) THE HEAD MOVED FORWARD. A rewritten/rebased head is a DIFFERENT artifact
+  # even when its lane commits look equivalent, so it must never carry this way.
+  git merge-base --is-ancestor "$reviewed" "$current" 2>/dev/null || return 1
+
+  # (C) NO LANE COMMITS IN BETWEEN. The base branch comes from the PR; the marker
+  # does not carry it. Every intervening commit NOT reachable from the base must be
+  # a MERGE. A single non-merge commit is lane work => a fresh review is owed
+  # (this is exactly the #5421 counter-example: cfe2bad0afaa is a non-merge).
+  base="$(gh api "repos/$REPO/pulls/$PR" --jq .base.ref 2>/dev/null || true)"
+  [ -n "$base" ] && [ "$base" != "null" ] || return 1
+  git cat-file -e "origin/$base^{commit}" 2>/dev/null || return 1
+  if [ -n "$(git rev-list --no-merges "$reviewed..$current" --not "origin/$base" 2>/dev/null)" ]; then
+    return 1
+  fi
+
+  # (D) NO CONFLICT RESOLUTION — and this is the clause that makes the arm sound.
+  # (C) alone is NOT sufficient: a lane can merge the base LOCALLY with conflict
+  # resolutions, and that merge is indistinguishable from a clean one by commit
+  # shape. So recompute the merge and compare TREES rather than patch text: if the
+  # head's tree is exactly what a CLEAN merge of (reviewed, the head's second
+  # parent) produces, then no resolution was made and the lane's contribution is
+  # byte-identical. This is the clause that retires the declared residual instead
+  # of leaving it to a judgement call.
+  p2="$(git rev-parse "$current^2" 2>/dev/null || true)"
+  [ -n "$p2" ] || return 1
+  merged="$(git merge-tree --write-tree "$reviewed" "$p2" 2>/dev/null | head -1 || true)"
+  [ -n "$merged" ] || return 1
+  ctree="$(git rev-parse "$current^{tree}" 2>/dev/null || true)"
+  [ -n "$ctree" ] || return 1
+  [ "$merged" = "$ctree" ] || return 1
+  return 0
+}
+
 # #2982 — carry-forward arm: when the head has moved but the PR already carries
 # signed evidence for EXACTLY this diff (a marker whose diff= equals the live
 # diff hash), the head moved without the reviewed artifact changing (a
@@ -531,6 +600,14 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     fi
     if [ -n "$PRIOR_DIFF" ]; then
       echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
+      SHA="$CURRENT_HEAD"
+    elif lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
+      # The rendered patch moved (a base merge), but the LANE's artifact is
+      # provably unchanged: the head only moved forward, no lane commit is in
+      # between, and a clean re-merge of (reviewed, base) reproduces the head's
+      # tree exactly. Re-record against the CURRENT head, exactly as the arm above
+      # does — the binding is to the head that will merge.
+      echo "#6072/#6213/#4823 lane-dimension carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff changed but the LANE's commits are provably identical (forward move; no non-base commit in between; the head's tree is exactly a clean merge of reviewed and its base parent) — recording against the CURRENT head" >&2
       SHA="$CURRENT_HEAD"
     elif [ "$FORCE_STALE" -ne 1 ]; then
       echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
