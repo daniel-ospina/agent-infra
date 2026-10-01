@@ -83,6 +83,19 @@ jobs:
           # AGENT_INFRA_READ_TOKEN secret (secrets: inherit) when required.
           token: ${{ secrets.AGENT_INFRA_READ_TOKEN || github.token }}
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # The check below is `node bin/agent-infra.js`, run from a `shell:
+          # bash` step, so `node` must be on the SHELL PATH. Actions runs its own
+          # JS actions (checkout, this one) on a BUNDLED runtime it does not
+          # export to the shell, so a hosted runner's system node is what really
+          # satisfies this — and a self-hosted runner with none aborts the check
+          # at 127 (`node: command not found`), which the gate then mis-reported
+          # as drift (#1545). Every other workflow in the fleet wires this step
+          # before its first `node` invocation; this one did not.
+          node-version: '22'
+
       - name: Run agent-infra check (CI mode)
         id: drift
         shell: bash
@@ -93,10 +106,20 @@ jobs:
           # name `consumer`, so pass the real repo name explicitly.
           AGENT_INFRA_REPO_NAME: ${{ github.event.repository.name }}
         run: |
+          # `shell: bash` under Actions is `bash -eo pipefail` (#1545). Under -e
+          # a non-zero check exit would abort this script at the very line that
+          # produces the code, so `drift_exit` was never written — for a genuine
+          # drift failure as much as for a missing interpreter — and the gate
+          # below then read an empty string and reported "drift detected" either
+          # way. Capture the exit explicitly instead; the gate owns the verdict.
+          set +e
           cmd="${{ inputs.check-command }}"
           if [ -n "$cmd" ]; then
             bash -c "$cmd"
             code=$?
+          elif ! command -v node >/dev/null 2>&1; then
+            echo "::error::the drift check did NOT run — 'node' is not on this runner's PATH (exit 127). This is an environment fault, not drift: nothing was checked."
+            code=127
           else
             node "$AGENT_INFRA_PATH/bin/agent-infra.js" check . --ci
             code=$?
@@ -108,7 +131,17 @@ jobs:
         if: always()
         shell: bash
         run: |
+          # Fail-closed in every branch; the branch only decides WHICH cause is
+          # named, so a red never sends a reader after the wrong repair (#1545).
           code="${{ steps.drift.outputs.drift_exit }}"
+          if [ "$code" = "127" ]; then
+            echo "::error::the drift check did NOT run — the checker could not be started (exit 127: command not found). This is an ENVIRONMENT fault, not drift, and nothing was checked. Do NOT run 'agent-infra update' — fix the runner's PATH or the 'Set up Node' step instead."
+            exit 1
+          fi
+          if [ -z "$code" ]; then
+            echo "::error::the drift check produced NO result — the previous step failed before writing its exit code. See that step's log; this red does not mean drift."
+            exit 1
+          fi
           if [ "$code" != "0" ]; then
             echo "::error::agent-infra drift detected — run \`agent-infra update\` in this repo (or \`./sync --all\` from agent-infra to batch-fix all linked repos). See the 'Run agent-infra check (CI mode)' step for the failing surfaces."
             exit 1
