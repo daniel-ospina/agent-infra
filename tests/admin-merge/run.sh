@@ -479,10 +479,53 @@ case "$key" in
     # rail must treat as fail-closed — never as a non-code exemption.
     if [ -n "$(printf '%s' "$a2" | sed -n 's#.*/actions/runs/[0-9][0-9]*$#&#p')" ]; then
       id="$(printf '%s' "$a2" | sed -n 's#.*/actions/runs/\([0-9][0-9]*\)$#\1#p')"
-      if [ -f "$SCEN/run-$id" ]; then cat "$SCEN/run-$id"; exit 0; fi
+      if [ -f "$SCEN/run-$id" ]; then
+        # #6807: the rail also resolves the workflow FILE (`.path`) for the
+        # PR-evaluability predicate. A fixture is `<event>\t<name>[\t<path>]`;
+        # the path projection answers from the THIRD field, so a two-field
+        # (legacy) fixture simply has no path. The shared event/name projection
+        # is left at two fields — several tests pin that shape.
+        jexpr="$(flag_val --jq "$@")"
+        if [ -n "$jexpr" ] && [ "${jexpr#*.path}" != "$jexpr" ]; then
+          IFS=$'\t' read -r fev fwf fpath < "$SCEN/run-$id"
+          [ -n "$fpath" ] && printf '%s\n' "$fpath"
+          exit 0
+        fi
+        cat "$SCEN/run-$id"; exit 0
+      fi
       exit 1
     fi
     case "$a2" in
+      */contents/*)
+        # ── #6807: THE WORKFLOW FILE, for the PR-evaluability predicate. The
+        # rail reads it AS OF the ref being measured (`-f ref=<base_ref>`): the
+        # contents API otherwise defaults to the repository's DEFAULT branch — the
+        # wrong revision when a PR targets a non-default base. The fixture tree
+        # mirrors that: `$SCEN/wf-contents/<ref>/<path>` (written by
+        # `wf_declares_ref`) models a workflow that DIFFERS on the base branch, and
+        # the bare `$SCEN/wf-contents/<path>` is the default-branch file. A `?ref=`
+        # query is honoured too. NO FIXTURE means the contents API answers nothing
+        # (a 404, or an outage) — the workflow file is UNREADABLE and the rail must
+        # FAIL CLOSED (the red stays blocking). There is no separate hard-error
+        # marker: a non-2xx and a 404 both yield an empty body, which the rail
+        # treats identically (`unknown`).
+        wref=""
+        wprev=""
+        for x in "$@"; do
+          case "$wprev" in -f|--raw-field) [ -n "$wref" ] || wref="$x" ;; esac
+          wprev="$x"
+        done
+        wref="${wref#ref=}"
+        case "${a2##*\?}" in ref=*) [ -n "$wref" ] || wref="${a2##*ref=}" ;; esac
+        wpath="$(printf '%s' "$a2" | sed -n 's#.*/contents/\(.*\)$#\1#p')"
+        wpath="${wpath%%\?*}"
+        if [ -n "$wref" ] && [ -n "$wpath" ] && [ -f "$SCEN/wf-contents/$wref/$wpath" ]; then
+          cat "$SCEN/wf-contents/$wref/$wpath"; exit 0
+        fi
+        if [ -n "$wpath" ] && [ -f "$SCEN/wf-contents/$wpath" ]; then
+          cat "$SCEN/wf-contents/$wpath"; exit 0
+        fi
+        exit 1 ;;
       */pulls/*)
         # ONE projected line, matching the rail's `gh api ... --jq` expression:
         # "<mergeable>\t<merge_commit_sha>".
@@ -802,6 +845,36 @@ pr_green_surface() {
   pr_run_map 7101 pull_request 'CI'
 }
 
+# ── #6807: the workflow FILE, for the PR-evaluability predicate ────────────
+# wf_declares <workflow-path> <trigger>... → the fake's contents fixture for
+#   <workflow-path>: a workflow whose `on:` block declares exactly <trigger>…
+#   (block form). Served by the fake's `*/contents/*` arm. NO fixture means the
+#   contents API could not answer, which the rail must treat as FAIL-CLOSED.
+wf_declares() {
+  local path="$1"; shift
+  mkdir -p "$SCEN/wf-contents/$(dirname "$path")"
+  {
+    printf 'name: fixture\non:\n'
+    local t
+    for t in "$@"; do printf '  %s:\n' "$t"; done
+    printf 'jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n'
+  } > "$SCEN/wf-contents/$path"
+}
+
+# wf_declares_ref <ref> <workflow-path> <trigger>... → the REF-SCOPED variant:
+#   the fake serves it only when the rail pins the fetch to <ref>. Used to model a
+#   workflow that DIFFERS on a non-default base branch (#6807).
+wf_declares_ref() {
+  local ref="$1" path="$2"; shift 2
+  mkdir -p "$SCEN/wf-contents/$ref/$(dirname "$path")"
+  {
+    printf 'name: fixture\non:\n'
+    local t
+    for t in "$@"; do printf '  %s:\n' "$t"; done
+    printf 'jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n'
+  } > "$SCEN/wf-contents/$ref/$path"
+}
+
 # A BASE surface that is genuinely MEASURED AND RED on a NON-watched workflow:
 # the #1261 shape — a lint gate red on main while the watched lane is green.
 main_red_surface() {
@@ -838,6 +911,9 @@ cfs_run() {
 # a classifier defect: the commit that mentioned "the #1484 classifier" was the one
 # that introduced the pattern).
 lane_tested() { bash "$ROOT/scripts/check-lane-tested.sh" "$@"; }
+
+# #6807: the PR-evaluability predicate, called the same guard-safe way.
+wf_eval() { bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh"; }
 
 # ── 1. --diff is set subtraction on unsorted, duplicated input ─────────────
 echo "== 1. --diff (the single shared comparison) =="
@@ -7242,6 +7318,232 @@ grep -q "add --any-workflow BEFORE the -- separator" "$SCEN/err" \
   && pass "(#4078) the head-side block names the remedy in the working order too" \
   || fail "(#4078) the head-side block does not name a usable remedy"
 
+
+# ── 67. THE §4.6 INPUT SET: A NOT-PR-EVALUABLE BASE RED IS NOT COUNTED (#6807) ─
+# Step 4.6 compares a PR's evaluated surface against the base's BLOCKING reds. The
+# input set (`MAIN_HEALTH_RED_TS`) classifies each base red by its run's EVENT:
+# `schedule`/`issues`/`issue_comment` are non-code and exempt, and `push` falls to
+# code-measuring. But a push-only workflow (`.github/workflows/deploy-hosted.yml`:
+# `on: push` + `workflow_dispatch`, NO pull_request) can NEVER attach a check to a
+# PR head sha, so NO PR can measure it — yet the red entered MAIN_HEALTH_RED_TS and
+# §4.6 refused EVERY PR, prescribing a remedy (`gh run rerun` this PR's runs) that
+# is UNSATISFIABLE BY CONSTRUCTION. The correct property is the workflow's
+# DECLARABILITY, read from the workflow FILE — not an event-name whitelist. The
+# predicate is scripts/ci-workflow-pr-evaluable.sh; the exemption is BASE-only (on
+# the tree such a red is an anomaly, exactly like a non-code red).
+echo "== 67. §4.6 input set: a not-PR-evaluable base red does not block (#6807) =="
+
+# (a) THE FIX — the observed block. Base RED on a `push` run of a PUSH-ONLY
+# workflow, begun AFTER the PR's surface: before the fix this is a §4.6 refusal.
+new_scen preeval-pushonly-base
+HEAD_PE1="f1f1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE1" > "$SCEN/head"
+lane_pass "$HEAD_PE1" 5951 > "$SCEN/runs-$HEAD_PE1"
+lane_pass mainpe1 5952 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5021 'ci / lint' completed success 7351 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7351 pull_request 'CI'
+write_main_checks "$(check_run 6021 'deploy-api' completed failure 8451 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8451 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8451"
+wf_declares .github/workflows/deploy-hosted.yml push workflow_dispatch
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) a PUSH-ONLY base red is NOT counted against the PR — it merges (exit 0)" \
+  || fail "(a) a not-PR-evaluable base red still refused every PR (exit $rc) — the #6807 defect: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge actually happened" || fail "(a) no merge attempted"
+# The DETAIL (job, workflow, verdict, URL) must be printed, not just counted: the
+# summary alone would make the exemption unauditable. Deleting the BASE_REDS_OTHER
+# print in admin-merge.sh must fail THIS assertion.
+if grep -q "Base red(s) reported but NOT blocking:" "$SCEN/err" \
+   && grep -q "NOT pull-request-evaluable" "$SCEN/err" \
+   && grep -q "deploy-api" "$SCEN/err" && grep -q "Deploy hosted" "$SCEN/err"; then
+  pass "(a) …and the red's DETAIL (job, workflow, verdict) is REPORTED on stderr, not silently dropped"
+else
+  fail "(a) the not-PR-evaluable red's detail is SILENT — the exemption must report the red it excluded"
+fi
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && fail "(a) the rail still refused at §4.6" || pass "(a) …and §4.6 did not refuse"
+
+# (b) THE MANDATORY GUARD — THE CHANGE MUST NOT BE A BLANKET EXEMPTION. The SAME
+# shape, but the workflow DECLARES pull_request, so the PR's own evaluation DOES
+# carry that check and the staleness comparison is meaningful: the red STILL
+# enters MAIN_HEALTH_RED_TS and §4.6 STILL BLOCKS. If (b) stops holding, the fix is
+# WRONG even though (a) passes.
+new_scen preeval-prevaluable-base
+HEAD_PE2="f2f2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE2" > "$SCEN/head"
+lane_pass "$HEAD_PE2" 5961 > "$SCEN/runs-$HEAD_PE2"
+lane_pass mainpe2 5962 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5022 'ci / lint' completed success 7361 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7361 pull_request 'CI'
+write_main_checks "$(check_run 6022 'python-ci / test' completed failure 8461 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8461 push 'Python CI'
+printf 'push\tPython CI\t.github/workflows/python-ci.yml\n' > "$SCEN/run-8461"
+wf_declares .github/workflows/python-ci.yml push pull_request
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) a base red on a workflow that DECLARES pull_request STILL BLOCKS (exit $rc)" \
+  || fail "(b) a PR-EVALUABLE base red was exempted — the fix became a blanket exemption"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && pass "(b) …and it is the §4.6 staleness refusal, not something else" \
+  || fail "(b) the refusal is not the §4.6 staleness one: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+[ -f "$SCEN/comment" ] && fail "(b) evidence was posted over a stale surface" || pass "(b) no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) a merge was attempted over a stale surface" || pass "(b) no merge attempted"
+
+# (b') `pull_request_target` counts too — it is the OTHER trigger that attaches a
+# check to a PR head sha, and two of tortoise's 6 PR-evaluable workflows
+# (`ai-review-gate`, `inbound-relay`) declare only it.
+new_scen preeval-prtarget-base
+HEAD_PE2B="f2b2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE2B" > "$SCEN/head"
+lane_pass "$HEAD_PE2B" 5963 > "$SCEN/runs-$HEAD_PE2B"
+lane_pass mainpe2b 5964 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5023 'ci / lint' completed success 7363 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7363 pull_request 'CI'
+write_main_checks "$(check_run 6023 'review-gate' completed failure 8463 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8463 push 'AI review gate'
+printf 'push\tAI review gate\t.github/workflows/ai-review-gate.yml\n' > "$SCEN/run-8463"
+wf_declares .github/workflows/ai-review-gate.yml pull_request_target
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b') a base red on a pull_request_target workflow STILL BLOCKS (exit $rc)" \
+  || fail "(b') a pull_request_target base red was exempted — the other PR trigger was missed"
+
+# (c) THE SECOND GUARD — a GENUINELY PR-INTRODUCED failure still BLOCKS. The tree
+# surface is never subject to this exemption (allow_noncode=0): a red on the PR's
+# OWN evaluated tree is the PR's failure, and even a push-only attribution there
+# blocks (the impossible-but-observed shape #1353 pinned for `schedule`).
+new_scen preeval-tree-red
+HEAD_PE3="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE3" > "$SCEN/head"
+lane_pass "$HEAD_PE3" 5971 > "$SCEN/runs-$HEAD_PE3"
+lane_pass mainpe3 5972 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks "$(check_run 3321 'deploy-api' completed failure 6961)"
+pr_run_map 6961 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-6961"
+wf_declares .github/workflows/deploy-hosted.yml push workflow_dispatch
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) a not-PR-evaluable red on the PR's TREE still BLOCKS (exit $rc) — the exemption is BASE-only" \
+  || fail "(c) a red on the evaluated tree was exempted — the PR's own failure no longer blocks"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(c) …as the tree-red refusal" || fail "(c) the refusal is not the tree-red one"
+grep -q "pr merge" "$SCEN/calls" && fail "(c) a merge was attempted over a red tree" || pass "(c) no merge attempted"
+
+# (d) FAIL CLOSED — an UNREADABLE workflow file keeps the red blocking. The
+# contents API cannot answer (no fixture), so the predicate returns `unknown`,
+# which the caller MUST treat as PR-evaluable. An unresolvable workflow is never
+# an exemption — the same discipline as an unresolved RUN.
+new_scen preeval-unreadable
+HEAD_PE4="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE4" > "$SCEN/head"
+lane_pass "$HEAD_PE4" 5981 > "$SCEN/runs-$HEAD_PE4"
+lane_pass mainpe4 5982 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5024 'ci / lint' completed success 7381 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7381 pull_request 'CI'
+write_main_checks "$(check_run 6024 'deploy-api' completed failure 8481 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8481 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8481"
+# NO wf-contents fixture -> the workflow file is UNREADABLE.
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) an UNREADABLE workflow file FAILS CLOSED — the base red still BLOCKS (exit $rc)" \
+  || fail "(d) an unreadable workflow file was read as an exemption — fail-open"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && pass "(d) …and it refuses at §4.6" || fail "(d) the refusal is not the §4.6 one"
+grep -q "pr merge" "$SCEN/calls" && fail "(d) a merge was attempted on an unreadable workflow" || pass "(d) no merge attempted"
+
+# (g) THE FETCH IS PINNED TO THE MEASURED REF. The contents API defaults to the
+# repository's DEFAULT branch, but a PR can target a NON-default base, and the
+# workflow definition that governs that PR's evaluation is the one on the BASE
+# branch. A red on `release`'s deploy-hosted.yml — which declares pull_request
+# THERE but not on the default branch — is measurable by PRs targeting `release`,
+# so it must BLOCK. An unpinned fetch reads the default branch, returns `no`, and
+# exempts it: the fail-open this pins.
+new_scen preeval-refpin
+HEAD_PE7="f7f7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE7" > "$SCEN/head"
+printf 'release\n' > "$SCEN/base-ref"
+lane_pass "$HEAD_PE7" 5991 > "$SCEN/runs-$HEAD_PE7"
+lane_pass mainpe7 5992 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5031 'ci / lint' completed success 7391 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7391 pull_request 'CI'
+write_main_checks "$(check_run 6031 'deploy-api' completed failure 8491 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8491 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8491"
+# The DEFAULT branch's file is push-only; the `release` branch's file declares
+# pull_request. Only a ref-pinned fetch sees the latter.
+wf_declares .github/workflows/deploy-hosted.yml push workflow_dispatch
+wf_declares_ref release .github/workflows/deploy-hosted.yml push pull_request
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(g) a PR-evaluable red on a NON-DEFAULT base still BLOCKS (exit $rc) — the fetch is ref-pinned" \
+  || fail "(g) a red whose workflow declares pull_request on the base branch was EXEMPTED — the contents fetch read the default branch (fail-open)"
+grep -q "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT" "$SCEN/err" \
+  && pass "(g) …and it refuses at §4.6" || fail "(g) the refusal is not the §4.6 one"
+grep -q "pr merge" "$SCEN/calls" && fail "(g) a merge was attempted over a stale surface" || pass "(g) no merge attempted"
+
+# (f) THE CACHE IS REAL AND BOUNDED — two base reds on the SAME workflow cost ONE
+# contents fetch, and the cache file is cleaned up. The predicate is called once
+# per red; the call site must not be a command substitution (a subshell would
+# discard the cache-path assignment, making the cache dead and leaking one mktemp
+# file per red). A TMPDIR private to this scenario makes the leak check exact.
+new_scen preeval-cache
+HEAD_PE6="f6f6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PE6" > "$SCEN/head"
+lane_pass "$HEAD_PE6" 5955 > "$SCEN/runs-$HEAD_PE6"
+lane_pass mainpe6 5956 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5026 'ci / lint' completed success 7356 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+pr_run_map 7356 pull_request 'CI'
+write_main_checks \
+  "$(check_run 6026 'deploy-api' completed failure 8456 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6027 'deploy-hosted' completed failure 8457 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8456 push 'Deploy hosted' 8457 push 'Deploy hosted'
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8456"
+printf 'push\tDeploy hosted\t.github/workflows/deploy-hosted.yml\n' > "$SCEN/run-8457"
+wf_declares .github/workflows/deploy-hosted.yml push workflow_dispatch
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+mkdir -p "$SCEN/rtmp"
+SCEN="$SCEN" TMPDIR="$SCEN/rtmp" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(f) two push-only base reds on one workflow both exempt — merges (exit 0)" \
+  || fail "(f) the cache scenario did not merge (exit $rc): $(sed -n '1,4p' "$SCEN/err" 2>/dev/null)"
+n_contents=$(grep -c 'contents/.github/workflows/deploy-hosted.yml' "$SCEN/calls" || true)
+[ "$n_contents" = "1" ] && pass "(f) …and the workflow file was fetched exactly ONCE (the cache is live, not a per-red mktemp)" \
+  || fail "(f) the contents API was fetched $n_contents time(s) for two reds on one workflow — the cache is dead"
+n_leak=$(find "$SCEN/rtmp" -name 'admin-merge-wfpr.*' 2>/dev/null | wc -l | tr -d ' ')
+[ "$n_leak" = "0" ] && pass "(f) …and the cache file was cleaned up (no admin-merge-wfpr.* left in TMPDIR)" \
+  || fail "(f) $n_leak admin-merge-wfpr.* file(s) leaked in TMPDIR"
+
+# (e) THE PREDICATE ITSELF, IN BOTH DIRECTIONS. The measured workflows of
+# tortoise, as `on:` shapes: the ones that declare NO pull_request must be `no`,
+# the ones that DO must be `yes`. A hardcoded name list is NOT the rule (it rots);
+# this is its CROSS-CHECK, and it also pins the fail-closed shapes.
+echo "== 67e. the predicate (scripts/ci-workflow-pr-evaluable.sh) =="
+pe_case() {  # <label> <expected> <yaml>
+  local got
+  got="$(printf '%s' "$3" | wf_eval)"
+  [ "$got" = "$2" ] && pass "predicate: $1 -> $2" || fail "predicate: $1 -> expected $2, got '$got'"
+}
+pe_case "push only"                no  $'on:\n  push:\n'
+pe_case "push + workflow_dispatch" no  $'on:\n  push:\n  workflow_dispatch:\n'
+pe_case "schedule + push"          no  $'on:\n  schedule:\n    - cron: \x270 */2 * * *\x27\n  push:\n    branches: [main]\n'
+pe_case "pull_request only"        yes $'on:\n  pull_request:\n'
+pe_case "push + pull_request"      yes $'on:\n  push:\n  pull_request:\n'
+pe_case "pull_request_target"      yes $'on:\n  pull_request_target:\n  workflow_dispatch:\n'
+pe_case "flow sequence"            yes 'on: [push, pull_request]'
+pe_case "flow mapping"             yes 'on: {push: null, pull_request_target: null}'
+pe_case "scalar"                   yes 'on: pull_request'
+pe_case "no on block fails closed" unknown $'name: x\njobs:\n  a:\n'
+pe_case "merge key fails closed"   unknown $'on:\n  push:\n  <<: *extra\n'
+pe_case "tab indent fails closed"  unknown $'on:\n\tpush:\n'
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
