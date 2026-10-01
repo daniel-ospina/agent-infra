@@ -1480,6 +1480,36 @@ if grep -qE '^VERDICT\tCLEAN\t.*exempt=1' "$TMP/kk-dec2.out" && grep -q '^EXEMPT
 else
   fail "expected the kill to be EXEMPT when main carries the same id/signature/rate; verdict='$(tr '\n' ' ' < "$TMP/kk-dec2.out")'"
 fi
+
+# ── the RESIDUAL must group a non-nodeid id by its OWN unit (#6798) ──────
+# The verdict is only half the diagnosis: `attribute_residual` labels each
+# residual id "measured on this lane" or "not measurable". It derives the UNIT
+# with the generic `s/::.*//`, which collapses `collect-error::tests/a.py` onto
+# the literal `collect-error` — so a main baseline for a DIFFERENT file reads as
+# the SAME unit and the operator is told the lane is re-measuring main's failure
+# when it is not. The file-keyed family must group by FILE; the environmental
+# kill, which has no file, must group by its own constant (like a guard step).
+new_scen nonnodeid-resid
+sha_ce='aa6798000000000000000000000000000000001'
+printf '%s\n' "$sha_ce" > "$SCEN/head"
+lane_fail "$sha_ce" 6798 > "$SCEN/runs-$sha_ce"
+printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/a.py - ImportError: no module named x\n' > "$SCEN/log-6798"
+printf '3\n' > "$SCEN/jobs-count-6798"
+# main is red on the SAME family but a DIFFERENT file, so the PR's unit is NOT on main.
+lane_fail maince 6800 > "$SCEN/runs-main"
+printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/other.py - ImportError: no module named y\n' > "$SCEN/log-6800"
+printf '3\n' > "$SCEN/jobs-count-6800"
+run_admin 43 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(f) a collect-error main has on a DIFFERENT file BLOCKS (exit $rc)" \
+  || fail "(f) a PR-unique collect-error was certified (exit $rc)"
+grep -q "no failure in collect-error" "$TMP/err" && fail "(f) the bare 'collect-error' prefix was reported as the unit" \
+  || pass "(f) …never the bare 'collect-error' prefix as a unit"
+grep -q "no failure in tests/a.py" "$TMP/err" && pass "(f) …the FILE is named as the unit" \
+  || fail "(f) the residual did not name the file: $(grep 'no failure in' "$TMP/err" | head -1)"
+grep -q "not measurable on this lane" "$TMP/err" && pass "(f) …as not-measurable (a different file on main is not this failure)" \
+  || fail "(f) a different-file main baseline was mis-reported: $(grep -c . "$TMP/err") line(s)"
+grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted on a PR-unique collect-error" \
+  || pass "(f) no merge attempted"
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)
 new_scen frc-pin-empty
