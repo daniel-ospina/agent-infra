@@ -7597,14 +7597,25 @@ pe_case "explicit key fails closed"   unknown $'on:\n  push: null\n  ? pull_requ
 pe_case "unterminated flow fails closed" unknown $'on:\n  push: [\n  pull_request:\n'
 # A `[`/`{` inside a PLAIN SCALAR is not a flow collection: counting it would make
 # the region look unterminated, skip the trigger keys after it, and answer `no`
-# for a workflow that DOES declare pull_request. (`paths: foo[bar` is legal YAML.)
+# for a workflow that DOES declare pull_request. (`paths: foo[bar` and
+# `default: a:[b` are legal YAML.)
 pe_case "bracket inside a plain scalar" yes $'on:\n  push:\n    paths: foo[bar\n  pull_request:\n    types: [opened]\n  workflow_dispatch:\n    inputs:\n      y:\n        default: a]b\n'
-# The SAFETY NET: when the region walk ends at a column-0 line and the collected
-# keys carry no PR trigger, any `pull_request` KEY after that point means the
-# "terminator" was a continuation the parser did not recognise. A partial read
-# may not answer `no` — it must refuse. (The caller treats `unknown` as blocking,
-# the same verdict this PR-evaluable workflow deserves.)
-pe_case "safety net: unparsed truncation fails closed" unknown $'on:\n  push:\n    branches:\n      - [main,\nzzz-release]\n  pull_request:\n'
+pe_case "bracket after a bare colon in a scalar" yes $'on:\n  push:\n    paths: a:[b\n  pull_request:\n'
+# Apostrophes/quotes inside PLAIN scalars are ordinary characters, not scalar
+# openers: `a:'b` must not OPEN a quote (which would swallow the next line) and
+# `don't` must not CLOSE one. This single case fails under BOTH a looser guard
+# (`prev in "[{,:"`) and an unconditional opener, so the token-boundary rule is
+# pinned rather than merely exercised.
+pe_case "apostrophe in a plain scalar" yes $'on:\n  push:\n    paths: a:\'b\n  pull_request: don\'t\n'
+# A depth-1 `- [flow,` sequence item still keeps the column-0 continuation inside
+# an open flow, so the trigger key after it is read.
+pe_case "dash-then-multiline flow"    yes $'on:\n  push:\n    branches:\n      - [main,\nzzz-release]\n  pull_request:\n'
+# The SAFETY NET: an ANCHORED or TAGGED key is a real trigger key that the key
+# regex cannot name, so the walk silently skips it and answers `no` on a PARTIAL
+# read. Any `pull_request` KEY anywhere in the document forces `unknown`. The
+# net can only turn `no` into `unknown`, never the reverse.
+pe_case "anchored key fails closed"   unknown $'on:\n  push:\n  &a pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
+pe_case "tagged key fails closed"     unknown $'on:\n  push:\n  !!str pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

@@ -76,6 +76,12 @@ _TOP_ON_RE = re.compile(r"^(?:\"on\"|'on'|on)\s*:(.*)$")
 _BLOCK_KEY_RE = re.compile(
     r"^([ \t]*)(?:\"([^\"]*)\"|'([^']*)'|([A-Za-z0-9_\-\.]+))\s*:(.*)$")
 
+# THE SAFETY NET's matcher: a `pull_request` / `pull_request_target` KEY anywhere
+# in the document, however it is spelled (quoted, anchored, tagged). It is
+# deliberately looser than `_BLOCK_KEY_RE` — a node this parser cannot name must
+# still be able to force a refusal.
+_PR_KEY_RE = re.compile(r"(?<![\w-])[\"']?pull_request(?:_target)?[\"']?\s*:")
+
 text = os.fdopen(3, "r").read()
 
 lines = text.splitlines()
@@ -154,6 +160,23 @@ def from_inline(value):
     return None
 
 
+def _opens_node(prev, sep, depth):
+    """May a flow collection / quoted scalar START at this character?
+
+    A plain scalar's characters are not indicators. In BLOCK context (`depth == 0`)
+    a node starts only where a mapping/sequence separator is followed by
+    WHITESPACE (`key: [a, b]`, `- [a, b]`) or at the start of the line's content —
+    because a bare `:`/`,` with no space is part of a PLAIN SCALAR
+    (`default: a:[b`, `paths: a:{b`), and reading one character of that scalar as
+    a flow opener swallows the rest of the block and can answer `no` for a
+    workflow that declares pull_request. In FLOW context a node may follow any of
+    `[`/`{`/`,`/`:` with no space (`{a:[b]}`).
+    """
+    if depth > 0:
+        return prev in "[{,:"
+    return prev is None or (prev in ":-" and sep)
+
+
 def scan_flow_state(text_part, depth, quote):
     """Advance (flow_depth, open_quote) over ONE physical line.
 
@@ -174,6 +197,7 @@ def scan_flow_state(text_part, depth, quote):
     i = 0
     n = len(text_part)
     prev = None  # last significant (non-space) character seen on this line
+    sep = True   # the char immediately before i is whitespace (or i is line start)
     while i < n:
         ch = text_part[i]
         if quote == '"':
@@ -195,29 +219,31 @@ def scan_flow_state(text_part, depth, quote):
         if ch == "#" and (prev is None or prev in " \t"):
             break  # comment to end of line
         if ch in "\"'":
-            if prev is None or prev in "[{,:":
+            if _opens_node(prev, sep, depth):
                 quote = ch
             i += 1
             prev = ch
+            sep = False
             continue
         if ch == "[" or ch == "{":
-            # A flow collection OPENS only at a value position. A bracket INSIDE a
-            # plain scalar (`paths: src/[a-z]*`, `paths: foo[bar`) does NOT open
-            # one — and counting it would make the region look unterminated, skip
-            # the trigger keys after it, and answer `no` for a workflow that DOES
-            # declare pull_request. Same token-boundary rule as a quoted scalar.
-            if prev is None or prev in "[{,:":
+            # A flow collection OPENS only where a node may start. A bracket INSIDE
+            # a plain scalar (`paths: foo[bar`, `paths: a:{b`) does NOT open one —
+            # counting it would make the region look unterminated, skip the trigger
+            # keys after it, and answer `no` for a workflow that DOES declare
+            # pull_request.
+            if _opens_node(prev, sep, depth):
                 depth += 1
         elif ch == "]" or ch == "}":
             if depth > 0:
                 depth -= 1
-        if ch not in " \t":
+        if ch in " \t":
+            sep = True
+        else:
             prev = ch
+            sep = False
         i += 1
     return depth, quote
 
-
-broke_at = None  # set by the block-form walk when a column-0 key ends the region
 
 if inline:
     triggers = from_inline(inline)
@@ -239,15 +265,13 @@ else:
     merges = []
     flow_depth = 0
     open_quote = ""
-    broke_at = None
-    for line_no, raw in enumerate(lines[on_index + 1:]):
+    for raw in lines[on_index + 1:]:
         if flow_depth == 0 and not open_quote:
             if not raw.strip():
                 continue
             if raw.lstrip().startswith("#"):
                 continue
             if raw[:1] not in (" ", "\t"):
-                broke_at = on_index + 1 + line_no
                 break  # next top-level key genuinely ends the `on:` block
             indent = len(raw) - len(raw.lstrip(" \t"))
             if "\t" in raw[:indent]:
@@ -300,20 +324,20 @@ else:
         sys.exit(0)
     triggers = {k for ind, k in collected if ind == depth}
 
-if broke_at is not None and not (triggers & PR_TRIGGERS):
-    # SAFETY NET (#6807). The block walk terminated at a column-0 line and found
-    # no PR trigger. If a `pull_request` / `pull_request_target` KEY appears after
-    # that point, the "terminator" was a continuation this parser did not
-    # recognise — a PARTIAL read. A partial read that answers `no` exempts a red a
-    # PR can measure, so refuse instead (fail closed). This can only turn `no`
-    # into `unknown`, never the reverse.
-    for raw in lines[broke_at + 1:]:
-        m = _BLOCK_KEY_RE.match(raw)
-        if not m:
+if not (triggers & PR_TRIGGERS):
+    # SAFETY NET (#6807). The walk may have missed a PR trigger — a column-0
+    # continuation it did not recognise, an ANCHORED or TAGGED key
+    # (`&a pull_request:`, `!!str pull_request:`) that `_BLOCK_KEY_RE` cannot
+    # name, or any shape it silently skipped. A PARTIAL read that answers `no`
+    # exempts a red a PR can measure, so if the document contains a
+    # `pull_request` / `pull_request_target` KEY ANYWHERE, refuse (fail closed).
+    # The matcher is deliberately looser than the key regex, so a node this
+    # parser cannot NAME can still force a refusal. This can only turn `no` into
+    # `unknown`, never the reverse — it cannot itself fail open.
+    for raw in lines:
+        if raw.lstrip().startswith("#"):
             continue
-        k = m.group(2) if m.group(2) is not None else (
-            m.group(3) if m.group(3) is not None else m.group(4))
-        if k in PR_TRIGGERS:
+        if _PR_KEY_RE.search(raw):
             sys.stdout.write(UNKNOWN + "\n")
             sys.exit(0)
 
