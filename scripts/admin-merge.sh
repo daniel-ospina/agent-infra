@@ -1874,6 +1874,75 @@ residual_of() {
 # listing is selected by branch for a branch ref and by --commit for a sha.
 MAIN_HEALTH_RUN_MAP_LIMIT=200
 
+# ── #6807: THE WORKFLOW'S DECLARABILITY, ANSWERED FROM THE FILE ─────────────
+# workflow_pr_evaluable <slug> <workflow-path> <ref> — answers "can this workflow
+# attach a check to a pull-request head sha?" (does its `on:` block declare
+# pull_request or pull_request_target?). The result lands in the global
+# `WPE_VERDICT` (`yes`/`no`/`unknown`). The parse is delegated to
+# scripts/ci-workflow-pr-evaluable.sh; the function does only the fetch and the
+# per-invocation cache.
+#
+# ⛔ THE FILE IS READ AS OF <ref>. The contents API defaults `ref` to the
+# repository's DEFAULT branch, but a PR can target a NON-default branch, and the
+# workflow definition that governs that PR's evaluation is the one on the BASE
+# branch. Fetching the default branch would read a different revision and could
+# return `no` for a workflow that IS PR-evaluable on the base — a fail-open. The
+# fetch is therefore pinned with `-f ref=<ref>` (gh URL-encodes the value, so a
+# branch name containing `/`, `#`, `&`, … cannot break the request).
+#
+# WHY THE EVENT IS NOT THE QUESTION. The gate this feeds used to ask "did the red
+# arrive on a schedule/issues event?" — an allow-list of unmeasurable EVENT NAMES.
+# A push-only workflow reddens on `push`, which is not on that list, so its base
+# red entered the §4.6 comparison and refused EVERY PR with a remedy no rebase can
+# satisfy (no PR can make a push-only job run). Declarability is a property of the
+# workflow FILE, so the set of unmeasurable workflows is DERIVED, not maintained.
+#
+# FAIL CLOSED. A missing path, a missing ref, a failed fetch, or an unparsable file
+# is `unknown`, which the caller treats as PR-EVALUABLE (blocking). Only an
+# affirmative `no` exempts. An EMPTY body is `unknown` too: it is never parsed, so
+# a failed fetch cannot be read as "declares no PR trigger”.
+# The cache is per-invocation: a base surface carries many reds, often on the same
+# workflow, and both the ref and the answer are constant within one probe.
+WF_PR_EVAL_CACHE=""
+# The verdict lands HERE, never on stdout. WHY NOT a return value: the call site
+# MUST NOT be a command substitution (`case "$(workflow_pr_evaluable …)"`), or the
+# function would run in a SUBSHELL — an assignment to a global inside it would be
+# discarded, WF_PR_EVAL_CACHE would stay empty in the parent, every call would make
+# a FRESH empty cache (the cache would be dead) and leak that mktemp file. The
+# function sets this global and the caller reads it, keeping the call a plain
+# (non-subshell) call. §67(f) pins both the cache hit and the absence of a leak.
+WPE_VERDICT="unknown"
+workflow_pr_evaluable() {
+  local slug="$1" wf_path="$2" wf_ref="$3" cached body verdict
+  WPE_VERDICT="unknown"
+  [ -n "$wf_path" ] || return 0
+  [ -n "$wf_ref" ] || return 0
+  if [ -n "$WF_PR_EVAL_CACHE" ] && [ -f "$WF_PR_EVAL_CACHE" ]; then
+    cached="$(awk -F'\t' -v p="$wf_path" '$1 == p { print $2; exit }' "$WF_PR_EVAL_CACHE")"
+    [ -n "$cached" ] && { WPE_VERDICT="$cached"; return 0; }
+  fi
+  # The raw body (`Accept: ...vnd.github.raw`) is what the predicate parses. A
+  # failed fetch leaves `body` empty, and an empty body is NEVER parsed — it is
+  # `unknown` by construction, so a network failure cannot be read as `no`.
+  body=""
+  body="$($GH api "$slug/contents/$wf_path" -X GET -f "ref=$wf_ref" \
+              -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)"
+  if [ -z "$body" ]; then
+    verdict="unknown"
+  else
+    verdict="$(printf '%s' "$body" | bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
+  fi
+  case "$verdict" in
+    yes|no) ;;
+    *) verdict="unknown" ;;
+  esac
+  if [ -z "$WF_PR_EVAL_CACHE" ]; then
+    WF_PR_EVAL_CACHE="$(mktemp "${TMPDIR:-/tmp}/admin-merge-wfpr.XXXXXX")"
+  fi
+  printf '%s\t%s\n' "$wf_path" "$verdict" >> "$WF_PR_EVAL_CACHE"
+  WPE_VERDICT="$verdict"
+}
+
 # check_surface_probe <ref> <label> [<exempt-noncode-events>] — measure EVERY
 # workflow's check runs and commit statuses attached to <ref> (a branch name OR a
 # sha), into the MAIN_HEALTH_* scratch set. The `label` names the surface in the
@@ -1891,9 +1960,9 @@ MAIN_HEALTH_RUN_MAP_LIMIT=200
 # anomaly, because a default-branch run cannot attach to a PR head sha.
 check_surface_probe() {
   local ref="$1" label="${2:-main}" allow_noncode="${3:-0}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one wf_path pr_evaluable
   local map_sel=()
-  local blocking=0 other=0
+  local blocking=0 other=0 other_noneval=0
   local repo_args=()
   [ -n "${REPO:-}" ] && repo_args=(--repo "$REPO")
   MAIN_HEALTH_STATUS=""
@@ -2215,7 +2284,7 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         # measures no revision, and blocking on it would refuse every merge (see
         # MAIN_HEALTH_RUN_MAP_LIMIT). The run id is in the check run's own URL.
         run_id="$(printf '%s' "$url" | sed -n 's#.*/runs/\([0-9][0-9]*\).*#\1#p' | head -1)"
-        wf=""; ev=""
+        wf=""; ev=""; wf_path=""
         # ⛔ A LEGACY COMMIT STATUS IS NEVER RUN-RESOLVED. The `url` on a status
         # row is the status's OWN, app-supplied `target_url` — an arbitrary link
         # — so a `/runs/<N>` inside it names SOME run, not the run that produced
@@ -2273,6 +2342,31 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
           schedule|issues|issue_comment) noncode=1 ;;
           *) noncode=0 ;;
         esac
+        # ── #6807: IS THE WORKFLOW MEASURABLE FROM A PR AT ALL? ─────────────
+        # The base-side exemption above keys on the EVENT, so `push` falls through
+        # to code-measuring even when the WORKFLOW cannot possibly run on a PR
+        # (`deploy-hosted.yml`: `on: push` + `workflow_dispatch`, no
+        # pull_request). Such a red then enters MAIN_HEALTH_RED_TS and §4.6 refuses
+        # every PR with an unsatisfiable remedy. Ask the WORKFLOW FILE instead.
+        # SCOPED TO THE BASE: on the PR's evaluated tree a red whose workflow
+        # cannot attach to a head sha is an ANOMALY, not noise (the same reasoning
+        # as the non-code exemption), so the tree never consults this. The path is
+        # resolved from the RUN itself — the one unambiguous source (`gh run list`
+        # cannot project a path, and a name-keyed index could let a PR-evaluable
+        # red borrow a push-only workflow's path: a fail-open) — and only when the
+        # event has not already decided the red's fate. An affirmative `no`
+        # exempts; `yes`/`unknown` block.
+        pr_evaluable=1
+        if [ "$allow_noncode" -eq 1 ] && [ "$noncode" -eq 0 ]; then
+          if [ -z "$wf_path" ] && [ -n "$run_id" ]; then
+            wf_path="$($GH api "$slug/actions/runs/$run_id" --jq '.path // ""' 2>/dev/null || true)"
+          fi
+          workflow_pr_evaluable "$slug" "$wf_path" "$ref"
+          case "$WPE_VERDICT" in
+            no) pr_evaluable=0 ;;
+            *) pr_evaluable=1 ;;
+          esac
+        fi
         # The reason a NON-CODE red blocks. Only reachable when allow_noncode is
         # 0 (the base exempts and returns above), so the reason is stated in the
         # display line rather than left to be inferred.
@@ -2280,7 +2374,11 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         if [ "$noncode" -eq 1 ]; then
           blocking_reason=" — NOT EXEMPT ON THIS SURFACE: a non-code event on the PR's evaluated tree is an ANOMALY, so BLOCKING"
         fi
-        if [ "$noncode" -eq 1 ] && [ "$allow_noncode" -eq 1 ]; then
+        if [ "$allow_noncode" -eq 1 ] && [ "$pr_evaluable" -eq 0 ]; then
+            [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
+            MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev:-(unresolved)}' — ${concl}${red_note_suffix} — NOT pull-request-evaluable (this workflow declares no pull_request/pull_request_target trigger, so no PR can attach its checks to a head sha), so NOT blocking — ${url}"
+            other_noneval=$((other_noneval + 1))
+        elif [ "$noncode" -eq 1 ] && [ "$allow_noncode" -eq 1 ]; then
             [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
             MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev}' — ${concl}${red_note_suffix} — NOT a code measurement, so NOT blocking — ${url}"
             other=$((other + 1))
@@ -2302,6 +2400,12 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
     esac
   done <<< "$py_out"
   [ -n "$map_file" ] && rm -f "$map_file"
+  # #6807: the per-invocation workflow-declarability cache, if the base surface
+  # built one.
+  if [ -n "$WF_PR_EVAL_CACHE" ]; then
+    rm -f "$WF_PR_EVAL_CACHE"
+    WF_PR_EVAL_CACHE=""
+  fi
   if ! counter_is_number "$MAIN_HEALTH_TOTAL"; then
     MAIN_HEALTH_STATUS="unreadable"
     MAIN_HEALTH_SUMMARY="UNREADABLE — the check surface for '$ref' ($sha) produced unreadable counters"
@@ -2342,6 +2446,9 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   fi
   if [ "$other" -gt 0 ]; then
     MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $other further red check(s) on NON-code events (schedule/issues) — reported, not blocking"
+  fi
+  if [ "$other_noneval" -gt 0 ]; then
+    MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $other_noneval further red check(s) on workflows that declare NO pull_request/pull_request_target trigger — NOT pull-request-evaluable, so reported, not blocking (no PR can attach their checks to a head sha, so no PR could ever measure them; #6807)"
   fi
   return 0
 }
@@ -3267,14 +3374,25 @@ main() {
   BASE_MAX_COMPLETED_EPOCH="$MAIN_HEALTH_MAX_COMPLETED_EPOCH"
   case "$BASE_STATUS" in
     green)
-      info "admin-merge: base tree ('$base_ref') ${BASE_SUMMARY}" ;;
+      info "admin-merge: base tree ('$base_ref') ${BASE_SUMMARY}"
+      if [ -n "$BASE_REDS_OTHER" ]; then
+        # The base's NON-blocking reds carry the identifying detail (job,
+        # workflow, run URL): the summary names only a count, and an exemption
+        # that cannot be audited is indistinguishable from a silent drop.
+        say_err "admin-merge:    Base red(s) reported but NOT blocking:"
+        printf '%s\n' "$BASE_REDS_OTHER" | sed 's/^/      /' >&2
+      fi ;;
     unmeasured)
       info "admin-merge: ⚠️  base tree ('$base_ref') ${BASE_SUMMARY}" ;;
     red)
       info "admin-merge: ⚠️  base tree ('$base_ref') ${BASE_SUMMARY}"
       info "admin-merge:    NOT blocking — the base is context. The gate is the PR's OWN tree"
       info "admin-merge:    (step 4.5): a PR that repairs this red must still be able to land."
-      printf '%s\n' "$BASE_REDS" | sed 's/^/      /' >&2 ;;
+      printf '%s\n' "$BASE_REDS" | sed 's/^/      /' >&2
+      if [ -n "$BASE_REDS_OTHER" ]; then
+        say_err "admin-merge:    Base red(s) reported but NOT blocking:"
+        printf '%s\n' "$BASE_REDS_OTHER" | sed 's/^/      /' >&2
+      fi ;;
     unreadable)
       say_err "admin-merge: ✗ BLOCK — THE BASE BRANCH'S CHECK SURFACE COULD NOT BE READ."
       say_err "   ${BASE_SUMMARY}"
@@ -3291,6 +3409,10 @@ main() {
       if [ -n "$BASE_REDS" ]; then
         say_err "   The half that WAS read already carries this code-measuring red:"
         printf '%s\n' "$BASE_REDS" | sed 's/^/      /' >&2
+      fi
+      if [ -n "$BASE_REDS_OTHER" ]; then
+        say_err "   Reported but NOT blocking (not counted against the PR):"
+        printf '%s\n' "$BASE_REDS_OTHER" | sed 's/^/      /' >&2
       fi
       say_err "   Consuming the readable endpoint is not enough on its own: the endpoint that"
       say_err "   failed could carry a red this PR has not measured, and 4.6/4.7 are BOTH gated"
@@ -3731,6 +3853,14 @@ Lane completion: PR completed=$(report_value "$TMP/pr-report.txt" completed) tes
   local health_line
   health_line="PR evaluated-tree surface (every workflow and app on head $head): ${TREE_STATUS} — ${TREE_RED} failing of ${TREE_TOTAL} measured, ${TREE_PENDING} pending
 Base check surface (every workflow and app on head of '$base_ref'): ${BASE_STATUS} — ${BASE_RED} failing of ${BASE_TOTAL} measured, ${BASE_PENDING} pending (reported for CONTEXT, never blocking)"
+  # #6807: an exemption that lives only on ephemeral stderr is indistinguishable,
+  # in the DURABLE posted record, from a silent drop. The base reds this rail did
+  # NOT count against the PR belong in the evidence the reviewer reads later.
+  if [ -n "$BASE_REDS_OTHER" ]; then
+    health_line="$health_line
+Base red(s) reported but NOT blocking:
+$BASE_REDS_OTHER"
+  fi
   analyzed="$analyzed
 $health_line"
 
