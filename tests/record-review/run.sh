@@ -16,10 +16,27 @@
 # These fixtures reproduce those SHAPES hermetically (no network, no live PRs), and
 # section 6 MUTATES the function to prove the clauses it relies on are load-bearing —
 # a suite that only proves the acceptance path would let a fail-open land green.
-# That claim is deliberately NOT "every clause": a reviewer measured that removing
-# (A), (B) or the second-parent check ALONE still refuses, because another clause
-# catches it. Those are defence-in-depth; section 7 covers the one clause whose
-# removal, on its own, turns a REFUSE into a CARRY.
+#
+# SCOPE OF THAT CLAIM, measured (a reviewer removed EVERY production line and recorded
+# which removals the suite caught, so this is enumerated rather than asserted):
+#   - COVERED individually: the second-parent rev-parse, the merge-tree rc capture and
+#     rc check, the `head -1` tree parse, the tree-equality check (§9), each half of the
+#     base shape validation (§8a), the (C2) lane-commit check (§11), the base identity.
+#   - DEFENCE-IN-DEPTH, NOT individually covered: the presence checks (A), the
+#     forward-move check (B), the second-parent ancestry check, the base `cat-file`,
+#     the rev-list rc check, the non-empty-tree/name checks, and the replace-blind
+#     export. Removing any ONE of them still refuses, because another clause catches the
+#     same case — for §8b specifically, (D) refuses that fixture even with the export
+#     gone (measured), so §8b proves the graft is LIVE and that the function still
+#     refuses, but it does NOT prove the export is what refuses. A reviewer caught the
+#     commit message claiming otherwise. No end-to-end carry that the export ALONE
+#     prevents could be constructed, so this is documented rather than asserted.
+#   - The CALL SITE (`--force-stale` precedence in the #2982 arm) is NOT driven by this
+#     suite; it extracts and calls the function directly. That guard is verified by
+#     reading, and a test that runs the real script with --force-stale is a follow-up,
+#     not a claim made here.
+# An assertion-count floor at the tail exists because a whole section was once deleted
+# in an unrelated commit and the suite still reported ALL PASSED.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -74,6 +91,31 @@ carry_verdict() { # <repo> <reviewed> <current> -> 0 carry / 1 refuse
     export FIXTURE_BASE_SHA; FIXTURE_BASE_SHA="$(git rev-parse main)"
     source "$TMP/fn.sh"; PR=1
     if lane_dimension_carry "$a" "$b"; then echo 0; else echo 1; fi )
+}
+
+# verdict_with <repo> <fnfile> <reviewed> <current> [base-value] — run ANY function file
+# against a fixture, so a MUTATED copy can be compared with the real one on the same
+# inputs. `mutate <perl-expr> <dest>` applies an edit that must parse and must actually
+# change the file, so a mutation can never silently no-op and fake coverage.
+verdict_with() {
+  local d="$1" f="$2" a="$3" b="$4" v="${5:-}"
+  ( cd "$d" || exit 9
+    export FIXTURE_BASE_SHA; FIXTURE_BASE_SHA="${v:-$(git rev-parse main)}"
+    source "$f"; PR=1
+    if lane_dimension_carry "$a" "$b"; then echo 0; else echo 1; fi )
+}
+mutate() { # <literal-from> <literal-to> <dest> ; 0 only if applied, changed, parses
+  python3 - "$TMP/fn.sh" "$1" "$2" "$3" <<'PY' || return 1
+import sys
+src, frm, to, dst = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+code = open(src).read()
+if frm not in code:
+    sys.exit(1)
+open(dst, 'w').write(code.replace(frm, to, 1))
+PY
+  cmp -s "$3" "$TMP/fn.sh" && return 1
+  bash -n "$3" 2>/dev/null || return 1
+  return 0
 }
 
 # advance_base <repo>: move main forward, publish it, and refresh the local ref
@@ -276,12 +318,37 @@ PURE_BASE="$(cd "$D" && git rev-parse main)"
 [ "$(base_verdict "$D" "$PURE_REVIEWED" "$PURE_CURRENT" "$PURE_BASE")" = 0 ] \
   && pass "(8a control) with the true 40-hex sha this fixture DOES carry, so 8a isolates the shape check" \
   || fail "(8a) control failed — the fixture does not reach the carry path, so 8a proves nothing"
-[ "$(base_verdict "$D" "$PURE_REVIEWED" "$PURE_CURRENT" "main")" = 1 ] \
-  && pass "(8a) a base NAME is refused — only a 40-hex sha counts as authoritative" \
-  || fail "(8a) a base NAME was ACCEPTED as authoritative — hardening absent"
+# Each HALF of the validation must be covered on its own. A reviewer measured that each
+# removal alone left the suite green, because the two probes masked each other: "main"
+# (4 chars) is caught by the LENGTH check, and "deadbeef" (8 hex) fails only because no
+# such object exists. So each probe below is a name that EXISTS as a local ref and fails
+# exactly ONE half.
+( cd "$D" && git branch "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" "$PURE_BASE" ) \
+  && ( cd "$D" && git branch deadbeef "$PURE_BASE" ) \
+  && pass "(8a) fixture refs created: a 40-char NON-hex name and a short all-hex name" \
+  || fail "(8a) could not create the isolating refs"
+FORTYZ="zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+[ "$(base_verdict "$D" "$PURE_REVIEWED" "$PURE_CURRENT" "$FORTYZ")" = 1 ] \
+  && pass "(8a) a 40-char NON-hex base is refused — the SHAPE half is load-bearing" \
+  || fail "(8a) a 40-char non-hex base was ACCEPTED — the shape half is absent"
 [ "$(base_verdict "$D" "$PURE_REVIEWED" "$PURE_CURRENT" "deadbeef")" = 1 ] \
-  && pass "(8a) a short/non-sha string is refused too" \
-  || fail "(8a) a short string was accepted as the base"
+  && pass "(8a) a short all-hex base is refused — the LENGTH half is load-bearing" \
+  || fail "(8a) a short all-hex base was ACCEPTED — the length half is absent"
+for _half in shape length; do
+  MH="$TMP/mut-$_half.sh"
+  if [ "$_half" = shape ]; then
+    mutate '  case "$base_sha" in *[!0-9a-f]*|"") return 1 ;; esac' '  :' "$MH" \
+      || { fail "mutation SHAPE: could not apply it (reformatting the case clause?)"; continue; }
+    probe="$FORTYZ"; label="SHAPE"
+  else
+    mutate '  [ "${#base_sha}" -eq 40 ] || return 1' '  :' "$MH" \
+      || { fail "mutation LENGTH: could not apply it (reformatting the length test?)"; continue; }
+    probe="deadbeef"; label="LENGTH"
+  fi
+  [ "$(verdict_with "$D" "$MH" "$PURE_REVIEWED" "$PURE_CURRENT" "$probe")" = 0 ] \
+    && pass "mutation $label is caught: dropping it CARRIES its probe, so that half IS load-bearing" \
+    || fail "mutation $label NOT caught — that half is not what refuses its probe"
+done
 
 # (8b) `refs/replace/*` rewrites what rev-list and rev-parse SEE. A reviewer grafted the
 # base so the lane commit looked reachable from it, turning a REFUSE into a CARRY.
@@ -305,9 +372,98 @@ git replace "$TRUE_BASE" "$GRAFT"
   && pass "(8b) the graft really hides the lane commit from the walk (the vector is live)" \
   || fail "(8b) the graft did not take — this assertion would be vacuous"
 [ "$(carry_verdict "$D" "$REVIEWED" "$CURRENT")" = 1 ] \
-  && pass "(8b) WITH replace refs installed the function still REFUSES — its git reads are replace-blind" \
+  && pass "(8b) WITH the graft installed the function still REFUSES (note: (D) also refuses this fixture, so this alone does not prove the export is the clause refusing)" \
   || fail "(8b) a local graft CARRIED lane work the review never saw — FAIL-OPEN"
 
+echo "── 9. (D)'s TREE EQUALITY must be load-bearing on its own: rc=0 AND the tree differs"
+# Sections 3 and 7 both assert REFUSE, but BOTH refuse via merge-tree's EXIT STATUS —
+# `mrc != 0` short-circuits BEFORE the equality check. So the clause (D) exists for
+# ("recompute the merge and compare TREES") was never exercised: a reviewer deleted it
+# and the suite stayed 22/22 green, while it IS the only defence against a CLEAN merge
+# whose commit was staged with extra unreviewed content.
+D="$(new_repo cleanmerge)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+advance_base "$D"
+git checkout -q pr
+git merge -q --no-edit main                 # a CLEAN merge: no conflict at all
+printf 'UNREVIEWED\n' > pwn.txt; git add pwn.txt
+git commit -q --amend --no-edit            # the merge commit now carries extra content
+CURRENT="$(git rev-parse HEAD)"
+P2="$(git rev-parse "$CURRENT^2")"
+git merge-tree --write-tree "$REVIEWED" "$P2" > "$TMP/mt9.out" 2>/dev/null; RC9=$?
+TREE9="$(head -1 "$TMP/mt9.out")"
+CTREE9="$(git rev-parse "$CURRENT^{tree}")"
+[ "$RC9" -eq 0 ] \
+  && pass "(9) merge-tree SUCCEEDS here (rc=0), so the rc check cannot be what refuses" \
+  || fail "(9) fixture is wrong: merge-tree conflicted, so this does not isolate the equality check"
+[ "$TREE9" != "$CTREE9" ] \
+  && pass "(9) and its clean tree DIFFERS from the committed head tree — only the equality check refuses" \
+  || fail "(9) fixture is wrong: the trees match, so the equality check is still not exercised"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "REFUSE (1) — a clean merge carrying extra unreviewed content is NOT carried" \
+  || fail "CARRIED unreviewed content in a merge commit — FAIL-OPEN"
+MUT9="$TMP/mut-noeq.sh"
+if mutate '  [ "$merged" = "$ctree" ] || return 1' '  :' "$MUT9"; then
+  [ "$(verdict_with "$D" "$MUT9" "$REVIEWED" "$CURRENT")" = 0 ] \
+    && pass "mutation NOEQ is caught: dropping the tree equality CARRIES the extra content, so it IS load-bearing" \
+    || fail "mutation NOEQ NOT caught — the equality check is not what refuses the extra content"
+else
+  fail "mutation NOEQ: could not apply it (reformatting the equality?) — coverage is blind"
+fi
+
+echo "── 10. FAIL-CLOSED ON DOUBT (these fixtures were dropped by an earlier commit)"
+D="$(new_repo doubt)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+advance_base "$D"
+git checkout -q pr && git merge -q --no-edit main
+CURRENT="$(git rev-parse HEAD)"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$CURRENT" "$CURRENT")" = 1 ] \
+  && pass "same sha (no move) → REFUSE" || fail "a no-move pair was CARRIED"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "0000000000000000000000000000000000000000" "$CURRENT")" = 1 ] \
+  && pass "an object absent from the repo → REFUSE" || fail "an absent object was CARRIED"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT" "1111111111111111111111111111111111111111")" = 1 ] \
+  && pass "an unresolvable base sha → REFUSE" || fail "an unresolvable base was CARRIED"
+
+echo "── 11. (C2) must refuse a LANE commit that (D) would ACCEPT: an EMPTY lane commit"
+# Section 2 is captioned as testing (C2)/#5421, but with (C2) deleted it still refuses —
+# via (D)'s tree inequality, because the lane's file is absent from the recomputed
+# merge. So (C2) had no effective test. An EMPTY lane commit isolates it: it changes no
+# tree, so the clean merge EQUALS the head tree and (D) passes, leaving only (C2).
+D="$(new_repo emptycommit)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+advance_base "$D"
+git checkout -q pr
+git commit -q --allow-empty -m "an empty lane commit"
+git merge -q --no-edit main
+CURRENT="$(git rev-parse HEAD)"
+P2="$(git rev-parse "$CURRENT^2")"
+TREE11="$(git merge-tree --write-tree "$REVIEWED" "$P2" 2>/dev/null | head -1)"
+[ "$TREE11" = "$(git rev-parse "$CURRENT^{tree}")" ] \
+  && pass "(11) (D) would ACCEPT this head, so only (C2) can refuse it" \
+  || fail "(11) fixture is wrong: (D) refuses it, so (C2) is still not isolated"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "REFUSE (1) — a lane commit in between is refused by (C2) ALONE" \
+  || fail "CARRIED a lane commit — FAIL-OPEN"
+MUT11="$TMP/mut-noc2.sh"
+if mutate '  [ -z "$extra" ] || return 1' '  :' "$MUT11"; then
+  [ "$(verdict_with "$D" "$MUT11" "$REVIEWED" "$CURRENT")" = 0 ] \
+    && pass "mutation NOC2 is caught: dropping (C2) CARRIES the empty lane commit, so (C2) IS load-bearing" \
+    || fail "mutation NOC2 NOT caught — (C2) is not what refuses the lane commit"
+else
+  fail "mutation NOC2: could not apply it (reformatting (C2)?) — coverage is blind"
+fi
+
 echo
+# AN EXACT PIN, NOT A FLOOR WITH SLACK. $PASS only has to be non-zero for the suite to
+# be green, so a whole section can be deleted with no signal — a reviewer deleted one
+# and the suite still reported ALL PASSED. A floor of 32 against 35 assertions was tried
+# first and MEASURED insufficient: sections 2, 4, 10 and 11 (1–3 assertions each) could
+# still be deleted quietly. Equality means ANY loss trips it, and so does ADDING an
+# assertion — deliberate, so the number is kept in step on purpose rather than drifting.
+MIN_ASSERTIONS=35
+if [ "$FAIL" -eq 0 ] && [ "$PASS" -ne "$MIN_ASSERTIONS" ]; then
+  echo "❌ $PASS assertion(s) ran but this suite declares $MIN_ASSERTIONS — a section was deleted or skipped, or an assertion was added without updating the pin"
+  FAIL=$((FAIL+1))
+fi
 if [ "$FAIL" -eq 0 ]; then echo "ALL PASSED ($PASS assertion(s))"; exit 0; fi
 echo "FAILED: $FAIL of $((PASS+FAIL)) assertion(s)"; exit 1
