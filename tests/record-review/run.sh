@@ -1231,7 +1231,106 @@ bash -n "$M22" 2>/dev/null || fail "mutation NOC4 did not parse"
   && pass "mutation NOC4 is caught: WITHOUT (C4) this exact head CARRYs the union leak — so (C4) is load-bearing and this fixture is that leak shape, not an arbitrary refusal" \
   || fail "mutation NOC4 NOT caught — this fixture does not exercise (C4), so its REFUSE above proves nothing"
 
-MIN_ASSERTIONS=96
+# ── 23. (C4)'s PATH NAMES must be read RAW and must RESOLVE — a C-quoted name silently disables
+# the clause. MEASURED (round 26): with `merge=union` on a path needing quoting, the landing
+# re-admitted a line the base tip had deleted and the verdict was CARRY, while the ASCII control
+# of the SAME fixture REFUSED; `core.quotePath=false` alone flipped it back. The clause is
+# therefore a function of the CALLER's git config without the `-c` below, and a name that
+# resolves against neither input tree now REFUSES rather than being skipped.
+D4="$TMP/c23quoted"; rm -rf "$D4"; mkdir -p "$D4"; cd "$D4" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'a\n' > 'caf\303\251.txt'
+printf '*.txt merge=union\n' > .gitattributes
+git add -A; git commit -qm base; git branch -M main
+git update-ref refs/remotes/origin/main refs/heads/main
+git checkout -qb pr
+printf 'a\nLANE\n' > 'caf\303\251.txt'; git add -A; git commit -qm 'lane adds LANE (REVIEWED)'
+REVIEWED="$(git rev-parse HEAD)"
+( cd "$D4" || exit 9
+  git checkout -q main
+  printf 'a\nSECRET\n' > 'caf\303\251.txt'; git add -A; git commit -qm 'base ancestor adds SECRET'
+  printf 'a\nb\n' > 'caf\303\251.txt'; git add -A; git commit -qm 'base tip DELETES SECRET'
+  printf 'more\n' > more.txt; git add -A; git commit -qm 'base tip advances again' )
+B1="$(git rev-parse main~2)"
+( cd "$D4" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the base ancestor' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+BASETIP="$(git rev-parse main)"
+P2B="$(git rev-parse "$CURRENT^2" 2>/dev/null)"
+{ [ "$P2B" = "$B1" ] && [ "$(git merge-base --all "$CURRENT" "$BASETIP")" = "$B1" ]; } \
+  && pass "(23) PRECONDITION: (C3) passes, so only (C4) can refuse this head" \
+  || fail "(23) fixture is VACUOUS: (C3) would already refuse"
+LAND="$(git merge-tree --write-tree "$BASETIP" "$CURRENT" 2>/dev/null | command head -1)"
+git show "$LAND:caf\303\251.txt" > "$TMP/c23-land.txt" 2>/dev/null
+git show "$BASETIP:caf\303\251.txt" > "$TMP/c23-tip.txt" 2>/dev/null
+{ grep -q SECRET "$TMP/c23-land.txt" && ! grep -q SECRET "$TMP/c23-tip.txt"; } \
+  && pass "(23) the STAKE is real: the landing re-admits SECRET even though the base tip deleted it" \
+  || fail "(23) fixture is vacuous: no resurrection to catch"
+# The name needs QUOTING, which is what made the clause blind — assert that, or this fixture is
+# just §22 with a different filename.
+git -c core.quotePath=true diff --name-only "$P2B" "$BASETIP" | grep -q '\\' \
+  && pass "(23) PRECONDITION: the path name really IS C-quoted by default git, which is what disabled the clause" \
+  || fail "(23) fixture is VACUOUS: the name needs no quoting, so it exercises nothing new"
+[ "$(verdict_with "$D4" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "(23) the head is REFUSED — a quoted name no longer hides the path from (C4)" \
+  || fail "(23) the head was CARRIED: (C4) is blind to a quoted path name"
+
+# ── 24. The KNOWN-LINE set must separate the two blobs: with no separator, a blob whose last line
+# is unterminated CONCATENATES with the next blob's first line, so a line that genuinely is in the
+# tip or in REVIEWED is reported as new — a FALSE REFUSAL on a plain clean landing merge with NO
+# attribute anywhere. MEASURED (round 26): tip ending `...X\nC` glued `C`+`A` into `CA`.
+D5="$TMP/c24nonl"; rm -rf "$D5"; mkdir -p "$D5"; cd "$D5" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'a\nX\nc\n' > F
+git add -A; git commit -qm base; git branch -M main
+git update-ref refs/remotes/origin/main refs/heads/main
+git checkout -qb pr
+printf 'A\nX\nc\n' > F; git add -A; git commit -qm 'lane edits line 1 (REVIEWED)'
+REVIEWED="$(git rev-parse HEAD)"
+( cd "$D5" || exit 9
+  git checkout -q main
+  printf 'more\n' > more.txt; git add -A; git commit -qm 'base ancestor adds a file (F untouched)'
+  printf 'a\nX\nC' > F; git add -A; git commit -qm 'base tip edits line 3 with NO trailing newline' )
+B1="$(git rev-parse main~1)"
+( cd "$D5" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the base ancestor' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+BASETIP="$(git rev-parse main)"
+P2B="$(git rev-parse "$CURRENT^2" 2>/dev/null)"
+{ [ "$P2B" = "$B1" ] && [ "$(git merge-base --all "$CURRENT" "$BASETIP")" = "$B1" ]; } \
+  && pass "(24) PRECONDITION: (C3) passes and (D) holds, so a refusal here can only be the line check" \
+  || fail "(24) fixture is VACUOUS: another clause would refuse"
+git show "$BASETIP:F" > "$TMP/c24-tip.txt" 2>/dev/null
+{ [ -s "$TMP/c24-tip.txt" ] && [ -n "$(tail -c 1 "$TMP/c24-tip.txt")" ]; } \
+  && pass "(24) PRECONDITION: the tip's blob is NON-EMPTY and does NOT end in a newline — the gluing condition" \
+  || fail "(24) fixture is VACUOUS: the tip's blob is empty or newline-terminated, so nothing can glue"
+[ "$(verdict_with "$D5" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
+  && pass "(24) the head is CARRIED — an unterminated blob no longer makes a known line look new" \
+  || fail "(24) the head was FALSELY REFUSED: the two blobs are still being glued"
+M24="$TMP/mut-nosep.sh"
+python3 - "$TMP/fn.sh" "$M24" <<'PY' || fail "mutation NOSEP: could not build it — coverage is blind"
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+frag = '  lsep="\n"'
+if src.count(frag) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(frag, '  lsep=""'))
+PY
+if bash -n "$M24" 2>/dev/null; then
+  [ "$(verdict_with "$D5" "$M24" "$REVIEWED" "$CURRENT")" = 1 ] \
+    && pass "mutation NOSEP is caught: with the separator emptied this clean head is FALSELY REFUSED — so the separator is load-bearing and §24 is the gluing shape" \
+    || fail "mutation NOSEP NOT caught — the separator is not what makes §24 CARRY"
+else
+  fail "mutation NOSEP: could not apply it — coverage is blind"
+fi
+
+MIN_ASSERTIONS=104
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

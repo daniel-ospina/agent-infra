@@ -505,6 +505,13 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
   local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
   local ltree="" lpath="" lhb="" thb="" rhb="" lpaths=""
+  # Terminates an unterminated blob's last line when the known-line set is built below. A
+  # LITERAL newline, deliberately NOT `$(printf '\n')`: command substitution STRIPS trailing
+  # newlines, so that spelling assigns an EMPTY string and silently restores the very gluing
+  # defect this separates (MEASURED — the suite's §24 caught exactly that, after the fix had
+  # already been written once). Named so a mutation can neutralise it at one site.
+  lsep="
+"
   # Replace refs AND the grafts FILE both rewrite what rev-list, rev-parse and
   # rev-parse^{tree} SEE, so either one can present a different commit graph to this
   # predicate than the one that is really there — reviewers built BOTH and turned a
@@ -719,14 +726,29 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # denial-of-service on the merge gate. Where the tip changed nothing there is no deletion to
   # resurrect, so the narrowed set IS the whole risk surface. The common case — §17's, where
   # p2 IS the tip — therefore costs one `git diff --name-only` and nothing else.
-  lpaths="$(command git diff --name-only "$p2" "$base_sha" 2>/dev/null)" || return 1
+  # `-c core.quotePath=false` is LOAD-BEARING, not cosmetics: the default C-QUOTES any path
+  # with a byte outside printable ASCII (or a `"` or `\`), and a quoted entry resolves against
+  # NOTHING — every lookup below then yields empty, `comm` compares empty with empty, and the
+  # path is silently never inspected. MEASURED (round 26): with `merge=union` on `café.txt` the
+  # landing re-admitted a base-tip-deleted line and the verdict was CARRY, while the ASCII
+  # control of the SAME fixture REFUSED; setting core.quotePath=false flipped the verdict back,
+  # so the clause's behaviour depended on the caller's git config.
+  lpaths="$(command git -c core.quotePath=false diff --name-only "$p2" "$base_sha" 2>/dev/null)" || return 1
   if [ -n "$lpaths" ]; then
   ltree="$(command git merge-tree --write-tree "$base_sha" "$current" 2>/dev/null)" || return 1
   ltree="$(printf '%s\n' "$ltree" | command head -1)"
   [ -n "$ltree" ] || return 1
   while IFS= read -r lpath; do
     [ -n "$lpath" ] || continue
-    lhb="$(command git rev-parse "$ltree:$lpath" 2>/dev/null || true)"
+    # THE NAME MUST BE REAL. A path from `git diff --name-only` exists in p2 or in the base
+    # tip by construction, so a name that resolves against NEITHER was not read as a raw name
+    # and every lookup below would silently see nothing. This is the fail-closed backstop to
+    # `core.quotePath=false` above — `git rev-parse <tree>:<path>` PRINTS the argument and exits
+    # 128 on failure, so the previous `[ -n "$lhb" ]` test could never fire.
+    command git cat-file -e "$p2:$lpath" 2>/dev/null \
+      || command git cat-file -e "$base_sha:$lpath" 2>/dev/null || return 1
+    # Absent from the LANDING is legitimate (the merge took a deletion), so it is not a refusal.
+    lhb="$(command git rev-parse --verify --quiet "$ltree:$lpath" 2>/dev/null)" || continue
     [ -n "$lhb" ] || continue
     thb="$(command git rev-parse "$base_sha:$lpath" 2>/dev/null || true)"
     rhb="$(command git rev-parse "$reviewed:$lpath" 2>/dev/null || true)"
@@ -735,9 +757,17 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
     # A genuinely merged blob: every line must exist in the tip's or `reviewed`'s version.
     # `p2` is DELIBERATELY absent from the known set — a line that only p2 had is exactly the
     # content the tip deleted, and its reappearance in the landing is the leak.
+    # The newline after each show is LOAD-BEARING: without it a blob that does not end in one
+    # has its final line CONCATENATED with the next blob's first line, so a line that genuinely
+    # IS in the tip or in `reviewed` is reported as new. MEASURED (round 26) as a FALSE REFUSAL
+    # on a clean three-way landing merge with NO attribute at all (tip F ending `...X\nC`, so
+    # `C`+`A` became `CA`). It costs one blank line in the known set, which can only make a BLANK
+    # line in the landing count as known — a blank line carries no content.
     [ -z "$(comm -23 <(command git show "$ltree:$lpath" 2>/dev/null | sort -u) \
                        <({ command git show "$base_sha:$lpath" 2>/dev/null || true
-                           command git show "$reviewed:$lpath" 2>/dev/null || true; } | sort -u))" ] \
+                           printf '%s' "$lsep"
+                           command git show "$reviewed:$lpath" 2>/dev/null || true
+                           printf '%s' "$lsep"; } | sort -u))" ] \
       || return 1
   done <<EOF
 $lpaths
