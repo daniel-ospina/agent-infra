@@ -37,14 +37,33 @@
 # required. It never writes a record itself, and it never merges directly.
 #
 # FAIL-CLOSED INVARIANTS (this is gate/enforcement code):
-#   * NO DEPENDENCY ON `strict` / branch protection. The rail never reads a
-#     protection setting and is correct with `strict` ON or OFF — that is the
-#     point of the rail: the T2 protection window must become unnecessary. Its
-#     inputs are the PR's own state (head, base, base MERGE BASE, checks) and the
-#     two scripts that own the review and the merge. `BEHIND` is used only as a
-#     head/base DIVERGENCE signal ("the head is out of date"), never as a proxy
-#     for a protection setting: the documented enum semantics say BEHIND can
-#     occur with or without strict, and strict is only what makes it block.
+#   * THE REFRESH DOES NOT DEPEND ON A PROTECTION SETTING — WITH ONE DECLARED,
+#     LIVE, NARROW EXCEPTION (#1565). The rail's inputs are the PR's own state
+#     (head, base, base MERGE BASE, checks) and the two scripts that own the
+#     review and the merge. `BEHIND` is used only as a head/base DIVERGENCE
+#     signal ("the head is out of date"), never as a proxy for a protection
+#     setting: the documented enum semantics say BEHIND can occur with or without
+#     strict, and strict is only what makes it block.
+#     OVERRIDES: the former "the rail never reads a protection setting, and is
+#     correct with strict ON or OFF" invariant — narrowed to ONE positive read of
+#     `strict` per invocation (strict_of()), at the step-1 decision point ONLY.
+#     Rationale, measured (#1565): the refresh's cost is a head move, which
+#     invalidates the head-bound review record (clause B5), forces a full CI run at
+#     the new head (critical path 17.1m median / 19.8m max), and then makes the rail
+#     wait up to 5400s for those checks to go terminal — while `strict: false` means
+#     the pin buys no mergeability at all (nine PRs sat OPEN+MERGEABLE unlanded for
+#     ~2h paying it). The read is LIVE and per-invocation (never cached: a stored
+#     belief about branch protection cannot disagree with GitHub, it can only be
+#     silently wrong) and it FAILS CLOSED — anything but a positive `false`
+#     (404/403/`null`/empty: protection unconfigured, or a token without admin on
+#     the repo) keeps the refresh exactly as it was. The merge and the record never
+#     consult it. ATOMIC_LAND_REFRESH_ALWAYS=1 restores the unconditional refresh.
+#     The gate applies to the BEHIND arm ONLY: the base-drift arm below remains
+#     conditional on behind_by > 0 and is NOT gated on this predicate, because it
+#     exists for the #1533 case — a BLOCKED branch whose drift red could never
+#     resolve without an update — and a BLOCKED PR is still `mergeable: true` (no
+#     conflicts; it has a red required leg). Gating that arm would skip exactly the
+#     refresh #1533 needed.
 #   * No accepted-verdict review record → refuse before any mutation.
 #   * A draft → refuse before any CI work (`gh` refuses to merge a draft).
 #   * A changed/unprovable diff → the record step refuses (exit 3) → STOP.
@@ -93,6 +112,8 @@
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
 #   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
 #                           before failing closed (default: 5).
+#   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a BEHIND head, ignoring the live
+#                               `strict` read (the #1565 fail-safe restore)
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
@@ -278,6 +299,41 @@ behind_by_of() { # <base> <head> -> N (empty on any unreadable/non-numeric reply
   case "$n" in ''|*[!0-9]*) echo ""; return 0 ;; esac
   echo "$n"
 }
+# ── the refresh gate: is the base pin worth its cost? (#1565) ─────────────
+# THE ONE PLACE THIS RAIL READS A PROTECTION SETTING. Declared, LIVE (read at the
+# decision point, never cached at startup), and NARROW: it gates ONLY the step-1
+# refresh — never the merge, the record, the wait, or the check verdict.
+#
+# FAIL-CLOSED DIRECTION (this is gate code): the skip fires only on a POSITIVE
+# `false` read of `required_status_checks.strict` AND a POSITIVE `true` mergeable.
+# Every other outcome — an unreadable protection (404 when protection is not
+# configured, or when the token lacks admin on the repo; 403; a rate-limited or
+# empty reply), a null `required_status_checks`, or an unreadable `mergeable` —
+# keeps the refresh exactly as it was before this gate existed.
+strict_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refreshes)
+  local v
+  v="$(gh_ api "repos/$REPO/branches/$BASE/protection" --jq '.required_status_checks.strict' 2>/dev/null || true)"
+  case "$v" in true|false) printf '%s' "$v" ;; *) printf '' ;; esac
+}
+mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refreshes)
+  # ⛔ `gh pr view --json mergeable` IS NOT A BOOLEAN — it is the GraphQL enum STRING
+  # (api/queries_pr.go: PullRequestMergeable = "MERGEABLE" | "CONFLICTING" |
+  # "UNKNOWN"). MEASURED on PR #1566: `gh pr view 1566 --json mergeable --jq
+  # .mergeable` prints `MERGEABLE`, while `gh api repos/…/pulls/1566 --jq .mergeable`
+  # prints `true` for the SAME PR. A predicate that accepts only `true|false`
+  # therefore NEVER matches the real CLI, which silently turns this gate INERT — and
+  # the suite keeps passing as long as its fixture speaks the REST shape. Both the
+  # predicate and the fixture were wrong in the first cut of #1565; a review caught
+  # it. Do not "simplify" this back to a boolean test.
+  local v
+  v="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json mergeable --jq .mergeable 2>/dev/null || true)"
+  case "$v" in
+    MERGEABLE)   printf 'true'  ;;
+    CONFLICTING) printf 'false' ;;
+    *)           printf ''      ;;
+  esac
+}
+
 # The base branch's TIP at a moment in time. A concurrent merge ADVANCES it while
 # leaving the merge base unchanged, so it is the signal for B12: the checks were
 # verified against the old tip and did not cover the new one. `--admin` bypasses
@@ -440,7 +496,36 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
   # the pre-existing no-op. ATOMIC_LAND_DRIFT_TRIGGER exists only to make the
   # boundary testable; it is not a tuning knob.
   case "$MERGE_STATE" in
-    BEHIND) : ;;
+    BEHIND)
+      # #1565 — a BEHIND head is not by itself a reason to refresh. Refresh only
+      # when something REQUIRES an up-to-date branch: read that live rather than
+      # assume it (see strict_of()). A PR that is positively mergeable under
+      # strict=false is already landable, so moving its head buys no mergeability
+      # and costs a record invalidation + a full CI run + up to 5400s of waiting.
+      #
+      # WHY THIS ARM AND NOT THE BASE-DRIFT ARM BELOW: the drift arm is already
+      # conditional (behind_by > 0) and exists for #1533 — a BLOCKED branch whose
+      # drift red could never resolve without an update. A BLOCKED PR is still
+      # `mergeable: true` (no conflicts, but a red required leg), so applying this
+      # predicate there would skip precisely the refresh #1533 needed. This arm is
+      # where the update is UNCONDITIONAL — it fires on the enum alone — and that is
+      # the blast radius measured in #1565.
+      if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
+        say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
+      else
+        local strict mergeable
+        strict="$(strict_of)"
+        if [ "$strict" = false ]; then
+          mergeable="$(mergeable_of)"
+          if [ "$mergeable" = true ]; then
+            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
+            return 3
+          fi
+          say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
+        else
+          say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=${strict:-unreadable} (read live) — refreshing"
+        fi
+      fi ;;
     *)
       behind="$(behind_by_of "$BASE" "$HEAD")"
       if [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
