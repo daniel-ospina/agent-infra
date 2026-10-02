@@ -184,6 +184,38 @@ def test_pytest_progress_line_is_not_a_record_and_not_a_drop():
     assert parsed.rejected == []
 
 
+def test_a_leading_FAILED_before_a_PROGRESS_FRAGMENT_is_skipped_not_dropped():
+    """`FAILED [  2%]` is a progress bar in front of the record anchor, not a record.
+
+    ⛔ THIS IS NOT A LOOSENING. A run log echoes pytest's progress output, and a
+    leading `FAILED` can land in front of a bare percentage. That payload is not a
+    malformed id — there is NO id on the line at all — so counting it as a drop
+    marks the whole set CLIPPED, and a CLIPPED set is NOT COMPARABLE to a measured
+    zero (#1319). The PR then cannot be certified however green it is, and every
+    re-run RETRACTS the evidence (`<!-- admin-merge-retraction: … -->`) and fails
+    the same way.
+
+    Measured on tortoise #6917: `PR=0` failing tests, refused permanently by
+    `PR=2 | main=0` drops whose only named token was `[  2%]`.
+
+    ⚠️ `_SUMMARY_RE` must NOT be consulted first: its nodeid group is `.+?`, so it
+    accepts `[  2%]` AS a nodeid and returns it. The first attempt at this fix put
+    the check after the summary match, was unreachable, and silently did nothing.
+    """
+    parsed = parse_failed_ids("FAILED [  2%]\n", raw_log=True)
+
+    assert parsed.ids == []
+    assert parsed.rejected == [], "a progress bar is not a record, so not a drop"
+
+    # The NARROWNESS that keeps it fail-closed: only an ENTIRELY bracketed
+    # percentage qualifies. Anything else is still a malformed record -> DROPPED.
+    for malformed in ("FAILED [ 47%] something-extra\n", "FAILED garbage\n"):
+        p = parse_failed_ids(malformed, raw_log=True)
+        assert p.ids == [], malformed
+        assert p.rejected, f"{malformed!r} must still be a counted drop"
+        assert p.ok is False
+
+
 def test_a_leading_FAILED_with_a_non_nodeid_payload_is_still_counted():
     """The anchor narrows WHERE a record starts — it does not loosen what one
     needs. A malformed record at line start is still DROPPED and COUNTED, so the
