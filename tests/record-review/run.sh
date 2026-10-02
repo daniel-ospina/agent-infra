@@ -659,8 +659,21 @@ git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
   && pass "(18) the head tree really CARRIES the unreviewed file — the forging fixture is hostile" \
   || fail "(18) fixture is wrong: the head does not carry pwn.txt, so nothing is at stake"
 [ "$(git rev-parse "$CURRENT^2")" = "$P2" ] \
-  && pass "(18) the second parent is the real base, so (C) passes and only (D) can refuse" \
-  || fail "(18) fixture is wrong: the second parent is not the base"
+  && pass "(18) the head's second parent IS $P2, so (C) passes and only (D) can refuse" \
+  || fail "(18) fixture is wrong: the second parent is not $P2"
+# NOT a tautology: the line above compares the parent to the SAME variable used to BUILD the
+# head, so a reviewer mutating P2 to main^ stayed GREEN. Pin that P2 IS the base tip.
+[ "$P2" = "$(git rev-parse main)" ] \
+  && pass "(18) and $P2 IS the base tip — not merely 'whatever built the head'" \
+  || fail "(18) fixture is wrong: the second parent is not the base tip"
+# CONTENT, not path: a reviewer replaced the injected blob with one already in the base and
+# §18 stayed GREEN, printing 'the unreviewed file' about reviewed bytes.
+[ "$(git show "$CURRENT:pwn.txt" 2>/dev/null)" = "UNREVIEWED" ] \
+  && pass "(18) the injected file carries UNREVIEWED bytes — the fixture pins CONTENT, not just a path" \
+  || fail "(18) fixture is VACUOUS: pwn.txt exists but does not carry unreviewed bytes"
+git ls-tree -r --name-only "$REVIEWED" | grep -qx pwn.txt \
+  && fail "(18) fixture is wrong: the REVIEWED commit already carries pwn.txt" \
+  || pass "(18) the reviewed commit does not carry pwn.txt, so the injected file is genuinely unreviewed"
 # The forged git makes `merge-tree` return the HEAD's own tree, so (D)'s equality holds by
 # construction. Every other clause is satisfied by the real graph, so the function is exactly
 # what stands between this head and a carry.
@@ -680,6 +693,30 @@ gitforge_verdict() { # <fnfile> -> 0 carry / 1 refuse
 [ "$(gitforge_verdict "$TMP/fn.sh")" = 1 ] \
   && pass "(18) a shell FUNCTION named git cannot forge merge-tree — the real git is used, and the head is REFUSED" \
   || fail "(18) a shell FUNCTION named git forged (D) and CARRIED unreviewed content — FAIL-OPEN"
+# The `head` forge (cycle 15, P0): `merged=... | head -1` was BARE, and bash `local` is
+# DYNAMICALLY scoped, so a function named head can read the caller's `$current` and return
+# the head's own tree — satisfying (D) while the head carries unreviewed content. PROVEN
+# against the real script there: honest rc=3 with no record, hijacked rc=0 with a `clean`
+# record minted at the live head.
+headforge_verdict() { # <fnfile> -> 0 carry / 1 refuse
+  ( cd "$D" || exit 9
+    export FIXTURE_BASE_SHA; FIXTURE_BASE_SHA="$(command git rev-parse main)"
+    export VICTIM_TREE; VICTIM_TREE="$(command git rev-parse "$CURRENT^{tree}")"
+    head() { printf '%s\n' "$VICTIM_TREE"; }   # dynamic scoping reaches the caller
+    source "$1"; PR=1
+    if lane_dimension_carry "$REVIEWED" "$CURRENT"; then echo 0; else echo 1; fi )
+}
+[ "$(headforge_verdict "$TMP/fn.sh")" = 1 ] \
+  && pass "(18) a shell FUNCTION named head cannot forge (D) by reading the caller's variables — the real head is used, REFUSED" \
+  || fail "(18) a shell FUNCTION named head forged the tree equality and CARRIED unreviewed content — FAIL-OPEN"
+MH="$TMP/mut-nocommandhead.sh"
+if mutate '| command head -1' '| head -1' "$MH"; then
+  [ "$(headforge_verdict "$MH")" = 0 ] \
+    && pass "mutation NOCOMMANDHEAD is caught: without \`command\` the forged head CARRIES unreviewed content, so \`command head\` IS load-bearing" \
+    || fail "mutation NOCOMMANDHEAD NOT caught — \`command head\` is not what refuses the forgery"
+else
+  fail "mutation NOCOMMANDHEAD: could not apply it — coverage is blind"
+fi
 M18="$TMP/mut-nocommandgit.sh"
 if mutate 'merged="$(command git merge-tree' 'merged="$(git merge-tree' "$M18"; then
   [ "$(gitforge_verdict "$M18")" = 0 ] \
@@ -968,7 +1005,7 @@ UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
   && pass "CARRY (0) — a union-merged base move is carried, per tortoise#5373's declared semantics" \
   || fail "REFUSED a legitimately union-merged head — a blob-level purity check here would break the append-only registries"
 
-MIN_ASSERTIONS=70
+MIN_ASSERTIONS=75
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

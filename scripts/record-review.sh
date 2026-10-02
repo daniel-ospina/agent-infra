@@ -414,12 +414,12 @@ diff_hash_for_pr() { # <pr>
   trap "rm -f '$tmp' '$norm'" RETURN 2>/dev/null || true
   if command gh api -H "Accept: application/vnd.github.v3.diff" \
        "repos/$REPO/pulls/$pr" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-    LEGACY_DIFF_HASH="$(openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
+    LEGACY_DIFF_HASH="$(command openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
     if command -v python3 >/dev/null 2>&1 && [ -f "$DIFF_NORMALIZER" ] \
        && [ -s "$DIFF_NORMALIZER" ] \
        && python3 "$DIFF_NORMALIZER" < "$tmp" > "$norm" 2>/dev/null \
        && [ -s "$norm" ]; then
-      DIFF_HASH="$(openssl dgst -sha256 < "$norm" | awk '{print $NF}')"
+      DIFF_HASH="$(command openssl dgst -sha256 < "$norm" | awk '{print $NF}')"
     else
       # Fail OPEN to the pre-#1362 raw digest: the consumer still accepts it as
       # the legacy hash, so the marker stays verifiable — but a base-only update
@@ -560,13 +560,24 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # MEASURED on a real pair: `--is-ancestor p2 base_sha` is TRUE while
   # `--is-ancestor base_sha p2` is FALSE. Read the argument order, not the prose.
   base_sha="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
-  # `command` is applied to BOTH external commands this function runs, `gh` AND `git`,
-  # because the shell-FUNCTION vector is the same for each: an EXPORTED function is
-  # inherited by `bash record-review.sh`. A reviewer PROVED the `git` half end-to-end —
-  # an exported function named git forging `merge-tree` made a head carrying unreviewed
-  # content CARRY, since every clause here is computed through bare git. A function is
-  # skipped by `command`; a PATH shim or a config redirect is NOT, and stays declared out
-  # (an actor who controls this process's environment can write the review record itself).
+  # THE SHELL-FUNCTION VECTOR IS A CLASS, NOT THREE COMMANDS. An EXPORTED bash function is
+  # inherited by `bash record-review.sh`, and it can intercept ANY external this script runs.
+  # Reviewers PROVED three separate instances end-to-end, each minting a `clean` record for a
+  # revision nobody reviewed: a function named `gh` nominating the base; one named `git`
+  # forging `merge-tree`; and one named `head` reading the caller's `$current` through
+  # DYNAMIC SCOPING to satisfy the tree equality in (D). `command` closes a name; it does not
+  # close the class. This function therefore uses `command` for every external whose result
+  # it DECIDES on: `gh`, `git`, and `head`. The rest of the script additionally routes
+  # `openssl` (the diff hash and the prior-marker HMAC) through `command`, for the same
+  # reason.
+  # ⛔ DECLARED BOUNDARY, stated plainly rather than implied: this is NOT a closed class.
+  # `python3`, `awk`, `grep`, `sed`, `cut`, `tr`, `jq`, `mktemp` and `dirname` remain
+  # interceptable, and so does `$GATE_KEY`, which is in this process's memory. An actor who
+  # controls this process's environment can therefore still forge a record — including by
+  # writing the review record directly, which this same script authors. Closing every name
+  # would be theatre while that is true; the three closed here are the ones a reviewer
+  # actually demonstrated, and each has a fixture or a note saying which. What is NOT
+  # claimed: that `command` makes this predicate safe against a hostile environment.
   # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
   # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
   # 40-hex, so the shape check does not stop it).
@@ -654,7 +665,11 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # reproduction. Requiring rc=0 restores "conflict => refuse" as a real gate.
   merged="$(command git merge-tree --write-tree "$reviewed" "$p2" 2>/dev/null)" || mrc=$?
   [ "$mrc" -eq 0 ] || return 1
-  merged="$(printf '%s' "$merged" | head -1)"
+  # `command head`, not bare head: an EXPORTED shell function named head can read the
+  # caller's `$current` (bash `local` is DYNAMICALLY scoped) and hand back the head's own
+  # tree, satisfying the equality below. A reviewer PROVED it against the real script:
+  # honest rc=3 with no record, hijacked rc=0 with a `clean` record minted at the live head.
+  merged="$(printf '%s' "$merged" | command head -1)"
   [ -n "$merged" ] || return 1
   ctree="$(command git rev-parse "$current^{tree}" 2>/dev/null || true)"
   [ -n "$ctree" ] || return 1
@@ -713,7 +728,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       if [ -n "$PRIOR_LINE" ] && [ -n "$GATE_KEY" ]; then
         PRIOR_TEXT="${PRIOR_LINE% sig=*}"
         PRIOR_SIG="${PRIOR_LINE##* sig=}"
-        PRIOR_EXPECT="$(printf '%s' "$PRIOR_TEXT" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+        PRIOR_EXPECT="$(printf '%s' "$PRIOR_TEXT" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
         if [ -n "$PRIOR_EXPECT" ] && [ "$PRIOR_SIG" = "$PRIOR_EXPECT" ]; then
           PRIOR_DIFF="$DIFF_HASH"
         else
@@ -1014,7 +1029,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} (${REPO})"
   fi
   if [ -n "$GATE_KEY" ]; then
-    SIG="$(printf '%s' "$MARKER" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+    SIG="$(printf '%s' "$MARKER" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
     if [ -n "$SIG" ]; then
       MARKER="${MARKER} sig=${SIG}"
     else
