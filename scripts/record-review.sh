@@ -554,9 +554,11 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   #     the base tip, but in a base ANCESTOR, is carried — that is intended, and the
   #     reason is lineage, not "the real base"; and
   #   - the object must be present locally, so the walk below is meaningful.
-  # `.base.sha` is the CURRENT base tip, which is normally AHEAD of what the head
-  # merged, so it is checked as the ANCESTOR of the head's second parent — not as an
-  # ancestor of the head itself.
+  # `.base.sha` is the CURRENT base tip, which is normally AHEAD of what the head merged,
+  # so the check runs `--is-ancestor <head's second parent> <base_sha>`: the SECOND PARENT
+  # must be an ancestor OF the authoritative base. The direction is NOT symmetric —
+  # MEASURED on a real pair: `--is-ancestor p2 base_sha` is TRUE while
+  # `--is-ancestor base_sha p2` is FALSE. Read the argument order, not the prose.
   base_sha="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
   # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
   # arbitrary local commit as the base and carry unreviewed content (a shim can emit only

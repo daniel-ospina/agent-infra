@@ -659,21 +659,21 @@ src = src.replace("\\\n", " ")
 
 
 def executable_text(s):
-    """Blank every character the shell does NOT execute as a command word.
+    """A BEST-EFFORT text scan, NOT a shell parser. It is a REGRESSION TRIPWIRE, not a
+    proof, and the SELF-TEST is its specification: the spellings it must count, and the
+    non-invocations it must ignore, are the ones pinned there.
 
-    WHOLE-FILE, not per-line. A reviewer measured the per-line version going blind on a
-    MULTI-LINE string, and the earlier quote-blanking version blind to `"$(gh api ...)"`
-    — which is the exact shape of the head read this guard exists to protect: deleting
-    `command ` from that one line left the counter at 0. So `$( ... )` and backticks are
-    KEPT, even inside double quotes, because they ARE executed.
+    Every absolute claim this docstring used to make — that it blanks exactly the text
+    the shell does not execute, that comments are always cut, that only an unquoted `)`
+    closes a substitution — was FALSIFIED by a reviewer with the shell as the oracle, so
+    the claims are DELETED rather than reworded. It OVER-counts some non-invocations
+    (loud, hence fail-closed) and some unusual spelling can still make it UNDER-count;
+    anything it reports is confirmed by reading the line.
 
-    Also kept: a quoted token that is EXACTLY gh (`"gh" api q`, `'gh' api q`) — a shell
-    FUNCTION intercepts a quoted command word, so that is a real invocation.
-
-    Comments are cut, so prose ABOUT gh is not counted. CAVEAT, named rather than
-    implied: a HEREDOC BODY is treated as code, so a bare `gh` line inside one would be
-    counted though it is only data — a FALSE POSITIVE, i.e. loud and fail-closed. The
-    file's own heredoc bodies contain no `gh`, and the counter is asserted to be 0."""
+    What it is FOR: the head read is spelled HEAD="$(command gh api ...)", inside double
+    quotes. A version that blanked quoted tokens wholesale reported 0 there while
+    `command ` had been deleted from exactly that line. `$( ... )` and backticks are
+    therefore kept inside double quotes, because they ARE executed."""
     out, i, n = [], 0, len(s)
     while i < n:
         c = s[i]
@@ -705,6 +705,15 @@ def executable_text(s):
                     k0, depth, k, qq = k, 0, k + 2, None
                     while k < n:
                         ch = s[k]
+                        # A BACKSLASH escapes the next char even OUTSIDE quotes, so `\)`
+                        # does not close the substitution. Without this branch the scan
+                        # closed early and blanked the real `gh` after it — the reviewer
+                        # reintroduced a bare gh into the real file and the suite stayed
+                        # GREEN. (Inside SINGLE quotes a backslash is literal, so the
+                        # escape branch is skipped there.)
+                        if ch == "\\" and qq != "'":
+                            k += 2
+                            continue
                         if qq is not None:
                             if ch == "\\" and qq == '"':
                                 k += 2
@@ -748,19 +757,30 @@ def executable_text(s):
 # restricting the pattern to api|repo|auth|run|pr|issue left every other subcommand
 # uncounted — a re-introduction spelling `gh secret list` reported 0.
 code = executable_text(src)
-rx = re.compile(r'(?<![\w/-])["\']?gh["\']?(?=[\s$);|&>])')
+rx = re.compile(r'(?<![\w/-])["\']?gh["\']?(?=[\s$);|&><]|$)')
 n = 0
 for m in rx.finditer(code):
+    # LINE-SCOPED, not file-scoped. `before` used to be `code[:m.start()]`, i.e. the whole
+    # FILE prefix, so a command word at the start of a line inherited whatever the previous
+    # line ended with: `"gh" api q` on its own line was never counted, because the prefix
+    # above it ended in a word character. Caught by counting the self-test file per line
+    # (11 by line, 10 whole) instead of trusting the number.
     line_start = code.rfind("\n", 0, m.start()) + 1
     if code[line_start:].lstrip().startswith("#"):
         continue
-    before = code[:m.start()].rstrip()
+    before = code[line_start:m.start()].rstrip()
     # `command` must itself start a WORD: a plain endswith("command") also accepts
     # `X=command gh api`, which IS a bare invocation and must be counted.
     if re.search(r"(^|[\s(|&;])command$", before):
         continue
     # `command -v gh` is a LOOKUP, not an invocation.
     if re.search(r"(^|[\s(|&;])command\s+-[vV]$", before):
+        continue
+    # A QUOTED token that is exactly gh is kept only in COMMAND POSITION. `"gh" api q`
+    # IS an invocation (a function intercepts a quoted command word), but `echo "gh"`
+    # is an ARGUMENT that no function can intercept — and a reviewer measured the guard
+    # REDDENING on legitimate code because of it.
+    if code[m.start()] in ('"', "'") and not re.search(r"(^|[;|&({$=])\s*$", before):
         continue
     n += 1
 print(n)
@@ -788,8 +808,15 @@ printf 'CURRENT_HEAD="$(gh api q)"\n' >> "$ST"
 printf 'X="$(echo '\''a)b'\''; gh api q)"\n' >> "$ST"
 # A command separator other than whitespace/`$`/`)` after gh (all were 0).
 printf 'gh;api q\n' >> "$ST"
-[ "$(bare_gh_count "$ST")" = 9 ] \
-  && pass "(15 self-test) the counter catches all NINE bare-gh spellings (including a command substitution inside double quotes, a quoted close-paren within one, and a semicolon separator) and does not count the two controls" \
+# A BACKSLASH-escaped paren must not close the substitution early (was 0).
+printf 'X="$(echo x\\)y; gh api q)"\n' >> "$ST"
+# `<` is a real redirect separator (was 0 for gh<&0, gh<<X, gh<<<q).
+printf 'gh</dev/null api q\n' >> "$ST"
+# CONTROL: a quoted gh ADJACENT TO A WORD is an ARGUMENT, not a command word, and no
+# function can intercept it. Counting it made the guard accuse legitimate code.
+printf 'REPO="$(echo "gh" >/dev/null; command gh repo view)"\n' >> "$ST"
+[ "$(bare_gh_count "$ST")" = 11 ] \
+  && pass "(15 self-test) the counter catches all ELEVEN bare-gh spellings (including an escaped close-paren and a redirect separator) and does not count the three controls" \
   || fail "(15 self-test) the counter is broken — it cannot detect an indented bare gh (the false-PASS the grep had)"
 BARE_GH="$(bare_gh_count "$SRC")"
 [ "$BARE_GH" = 0 ] \
