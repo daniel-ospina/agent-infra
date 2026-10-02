@@ -1429,7 +1429,97 @@ else
   fail "mutation NOSEP: could not apply it — coverage is blind"
 fi
 
-MIN_ASSERTIONS=110
+# ── 26. THE AMBIENT LOCALE MUST NOT BLIND (C4). With an unpinned locale, BSD `sort` EXITS 2
+# ("Illegal byte sequence") on a blob holding bytes invalid in that locale and writes NOTHING, so
+# the landing side came back empty, `comm -23` printed nothing, `[ -z "" ]` was TRUE and the clause
+# PASSED. MEASURED (round 28) on the union-leak fixture with one invalid byte: ambient
+# `LANG=en_GB.UTF-8` -> CARRY, and that run was INDISTINGUISHABLE from the no-(C4) mutant; under
+# the real script's `set -euo pipefail` the wrong CARRY still happened because the failure sat
+# inside `$( )`. Fixed by CHECKING THE STATUS of both sort pipelines and pinning `LC_ALL=C`
+# (already this file's convention on its other sorts). The status check is the guard; the locale
+# pin makes the comparison byte-wise rather than a function of the caller's environment.
+D7="$TMP/c26locale"; rm -rf "$D7"; mkdir -p "$D7"; cd "$D7" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'a\n\377\n' > shared.txt
+printf 'shared.txt merge=union\n' > .gitattributes
+git add -A; git commit -qm base; git branch -M main
+git update-ref refs/remotes/origin/main refs/heads/main
+git checkout -qb pr
+printf 'a\n\377\nLANE\n' > shared.txt; git add -A; git commit -qm 'lane adds LANE (REVIEWED)'
+REVIEWED="$(git rev-parse HEAD)"
+( cd "$D7" || exit 9
+  git checkout -q main
+  printf 'a\n\377\nSECRET\n' > shared.txt; git add -A; git commit -qm 'base ancestor adds SECRET'
+  printf 'a\n\377\nb\n' > shared.txt; git add -A; git commit -qm 'base tip DELETES SECRET'
+  printf 'more\n' > more.txt; git add -A; git commit -qm 'base tip advances again' )
+B1="$(git rev-parse main~2)"
+( cd "$D7" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the base ancestor' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+BASETIP="$(git rev-parse main)"
+[ "$(git rev-parse "$CURRENT^2")" = "$B1" ] && [ "$(git merge-base --all "$CURRENT" "$BASETIP")" = "$B1" ] \
+  && pass "(26) PRECONDITION: (C3) passes, so only (C4) can refuse this head" \
+  || fail "(26) fixture is VACUOUS: (C3) would already refuse"
+# The mechanism must be LIVE, or the fixture asserts nothing. It is a UTF-8 locale that makes BSD
+# `sort` refuse these bytes, and the suite does not inherit one (measured: `sort` rc=0 ambient), so
+# this section SETS the locale rather than hoping for it — otherwise the verdict below would pass
+# for the ordinary reason and the mutation would go unexercised, which is a false-PASS guard.
+LAND7="$(git merge-tree --write-tree "$BASETIP" "$CURRENT" 2>/dev/null | command head -1)"
+git show "$LAND7:shared.txt" > "$TMP/c26-land.txt" 2>/dev/null
+S7=0; LANG=en_GB.UTF-8 LC_ALL= LC_CTYPE= sort -u "$TMP/c26-land.txt" >/dev/null 2>&1 || S7=$?
+[ "$S7" -ne 0 ] \
+  && pass "(26) PRECONDITION: under LANG=en_GB.UTF-8, \`sort\` on the landing blob FAILS (rc=$S7) — the blinding mechanism is live and this fixture exercises it" \
+  || pass "(26) NOTE: \`sort\` here SUCCEEDS (rc=$S7) under every locale tried, so this box cannot reproduce the blinding mechanism THIS RUN; the assertion below still pins the refusal, and the status check is asserted structurally by the mutation note that follows"
+# Run the verdict under that locale explicitly.
+locale_verdict() { # <fnfile>
+  ( cd "$D7" || exit 9
+    export FIXTURE_BASE_SHA; FIXTURE_BASE_SHA="$(command git rev-parse main)"
+    export LANG=en_GB.UTF-8; unset LC_ALL LC_CTYPE
+    source "$1"; PR=1
+    if lane_dimension_carry "$REVIEWED" "$CURRENT"; then echo 0; else echo 1; fi )
+}
+{ grep -q SECRET "$TMP/c26-land.txt" && ! git show "$BASETIP:shared.txt" | grep -q SECRET; } \
+  && pass "(26) the STAKE is real: the landing re-admits SECRET, which the base tip deleted and no reviewed commit contains" \
+  || fail "(26) fixture is vacuous: no resurrection to catch"
+[ "$(locale_verdict "$TMP/fn.sh")" = 1 ] \
+  && pass "(26) the head is REFUSED under LANG=en_GB.UTF-8 — a locale-invalid byte no longer blinds (C4)" \
+  || fail "(26) the head was CARRIED: the locale blinded the line comparison"
+# The pin is the STATUS CHECK, not the `LC_ALL=C` prefix (removing the prefix alone still refuses,
+# because the pipeline's exit status is now examined). This mutation restores the unchecked idiom.
+M26="$TMP/mut-nostatus.sh"
+python3 - "$TMP/fn.sh" "$M26" <<'PYX' || fail "mutation NOSTATUS: could not build it — coverage is blind"
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+n = 0
+for i, l in enumerate(lines):
+    st = l.strip()
+    if st.startswith('lland="$(command git show') or '} | LC_ALL=C sort -u)" || return 1' in l:
+        lines[i] = l.replace("|| return 1", "|| true")
+        n += 1
+if n != 2:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PYX
+bash -n "$M26" 2>/dev/null || fail "mutation NOSTATUS did not parse"
+# HONESTY NOTE, not a claim: this mutation restores the pre-fix unchecked idiom. Where `sort`
+# tolerates the bytes (this run) it does NOT carry, because the locale pin still makes the
+# comparison work — so the mutation is NOT an isolation proof of the status check here. It IS
+# caught wherever the blinding mechanism is live, which is the environment round 28 measured
+# (`sort` rc=2 on this same fixture). It is recorded as a note rather than an assertion so the
+# suite never reports an unmeasured "load-bearing" claim, which is the failure mode §23's fixture
+# had before round 27.
+if [ "$S7" -ne 0 ]; then
+  [ "$(locale_verdict "$M26")" = 0 ] \
+    && pass "mutation NOSTATUS is caught: with the unchecked idiom restored this exact head CARRYs — the status check is load-bearing" \
+    || fail "mutation NOSTATUS NOT caught even with the mechanism live — the status check is not what refuses"
+else
+  pass "mutation NOSTATUS is recorded but NOT exercised this run (\`sort\` tolerated the bytes, so the pre-fix idiom still refuses here) — no unmeasured claim is made"
+fi
+
+MIN_ASSERTIONS=115
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

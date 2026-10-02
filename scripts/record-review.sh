@@ -504,7 +504,7 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 # duration below — the two are DIFFERENT mechanisms and need different env vars.
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
   local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
-  local ltree="" lpath="" lhb="" thb="" rhb="" lpaths=""
+  local ltree="" lpath="" lhb="" thb="" rhb="" lpaths="" lland="" lknown=""
   # Terminates an unterminated blob's last line when the known-line set is built below. A
   # LITERAL newline, deliberately NOT `$(printf '\n')`: command substitution STRIPS trailing
   # newlines, so that spelling assigns an EMPTY string and silently restores the very gluing
@@ -782,11 +782,25 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
     # on a clean three-way landing merge with NO attribute at all (tip F ending `...X\nC`, so
     # `C`+`A` became `CA`). It costs one blank line in the known set, which can only make a BLANK
     # line in the landing count as known — a blank line carries no content.
-    [ -z "$(comm -23 <(command git show "$ltree:$lpath" 2>/dev/null | sort -u) \
-                       <({ command git show "$base_sha:$lpath" 2>/dev/null || true
-                           printf '%s' "$lsep"
-                           command git show "$reviewed:$lpath" 2>/dev/null || true
-                           printf '%s' "$lsep"; } | sort -u))" ] \
+    # THE STATUSES OF THESE PIPELINES ARE LOAD-BEARING, and so is the LOCALE. With an unpinned
+    # locale, BSD `sort` EXITS 2 ("Illegal byte sequence") on a blob containing bytes that are
+    # invalid in that locale and writes NOTHING; the old `[ -z "$(...)" ]` form — which is the
+    # round-16 `head`/`openssl` lesson repeated — DISCARDED that status, so the landing side came
+    # back empty, `comm -23` printed nothing, `[ -z "" ]` was TRUE, and (C4) PASSED. MEASURED
+    # (round 28) on the union-leak fixture with one invalid byte in the file: ambient
+    # `LANG=en_GB.UTF-8` -> CARRY, and the ambient run was INDISTINGUISHABLE from the no-(C4)
+    # mutant, i.e. the clause contributed nothing; `LC_ALL=C` -> REFUSE; and under the real
+    # script's own `set -euo pipefail` the wrong CARRY still happened, because the failure sat
+    # inside `$( )`. The landing re-admitted a line the base tip deleted and that is in no
+    # reviewed commit. Two fixes, matching this file's own convention (`LC_ALL=C` is already
+    # pinned on its other sort pipelines): CHECK THE STATUS, and pin the locale so the comparison
+    # is byte-wise rather than a function of the caller's environment.
+    lland="$(command git show "$ltree:$lpath" 2>/dev/null | LC_ALL=C sort -u)" || return 1
+    lknown="$({ command git show "$base_sha:$lpath" 2>/dev/null || true
+                printf '%s' "$lsep"
+                command git show "$reviewed:$lpath" 2>/dev/null || true
+                printf '%s' "$lsep"; } | LC_ALL=C sort -u)" || return 1
+    [ -z "$(LC_ALL=C comm -23 <(printf '%s\n' "$lland") <(printf '%s\n' "$lknown"))" ] \
       || return 1
   done <<EOF
 $lpaths
