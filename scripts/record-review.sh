@@ -102,8 +102,8 @@ closing_issue_refs() {
   while IFS= read -r m; do
     [ -z "$m" ] && continue
     local repo num
-    repo="$(printf '%s' "$m" | tr 'A-Z' 'a-z' | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | head -1 || true)"
-    num="$(printf '%s' "$m" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+' | head -1 || true)"
+    repo="$(printf '%s' "$m" | tr 'A-Z' 'a-z' | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | command head -1 || true)"
+    num="$(printf '%s' "$m" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+' | command head -1 || true)"
     if [ -n "$repo" ] && [ -n "$num" ]; then
       printf '%s#%s\n' "$repo" "$num"
     fi
@@ -570,14 +570,23 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # it DECIDES on: `gh`, `git`, and `head`. The rest of the script additionally routes
   # `openssl` (the diff hash and the prior-marker HMAC) through `command`, for the same
   # reason.
-  # ⛔ DECLARED BOUNDARY, stated plainly rather than implied: this is NOT a closed class.
-  # `python3`, `awk`, `grep`, `sed`, `cut`, `tr`, `jq`, `mktemp` and `dirname` remain
-  # interceptable, and so does `$GATE_KEY`, which is in this process's memory. An actor who
-  # controls this process's environment can therefore still forge a record — including by
-  # writing the review record directly, which this same script authors. Closing every name
-  # would be theatre while that is true; the three closed here are the ones a reviewer
-  # actually demonstrated, and each has a fixture or a note saying which. What is NOT
-  # claimed: that `command` makes this predicate safe against a hostile environment.
+  # ⛔ THIS IS NOT A CLOSED CLASS, AND `command` DOES NOT CLOSE IT EITHER. `command` is a bash
+  # BUILTIN, so a FUNCTION named `command` shadows it — a reviewer PROVED that exported
+  # function minting a `clean` record for a head carrying unreviewed content, defeating every
+  # `command` in this file at once; `builtin` is shadowable the same way, so `builtin command`
+  # is no better. There is therefore NO shell-level way to guarantee an un-intercepted
+  # external from inside the script, and no list of names can make one.
+  # WHAT THE `command` PREFIXES ARE ACTUALLY FOR: an ACCIDENTAL shadow — a stale exported
+  # function left in an operator's environment, which is not hypothetical (an exported `gh`
+  # did exactly that and is why `command gh` exists). They are defence in depth against
+  # accident, NOT a security boundary.
+  # THE REAL TRUST BOUNDARY: the environment this script runs in. `python3`, `awk`, `grep`,
+  # `sed`, `cut`, `tr`, `tail`, `jq`, `cat`, `mktemp`, `date`, `$GATE_KEY` (in this process's
+  # memory) and the review record itself are all writable by an actor who controls it, and
+  # such an actor can write the record directly. That boundary is DECLARED, not defended.
+  # NO ENUMERATION IS ATTEMPTED HERE, and that is deliberate: earlier versions of this note
+  # listed "the remaining surface" and were wrong every time (they omitted `head`, then
+  # `tail`), because the surface is "everything", and a list of it re-stales.
   # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
   # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
   # 40-hex, so the shape check does not stop it).
@@ -834,7 +843,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
             continue
           fi
           if grep -qE '^complexity:' <<<"$LABELS"; then
-            OFFENDING_LABEL="$(printf '%s\n' "$LABELS" | grep -E '^complexity:' | head -1)"
+            OFFENDING_LABEL="$(printf '%s\n' "$LABELS" | grep -E '^complexity:' | command head -1)"
             REFUSED=1
             echo "❌ clean-micro tier guard: $REPO#$PR closes $ref, whose complexity label is \"$OFFENDING_LABEL\" — clean-micro certifies the MICRO process only and is REFUSED for a non-micro linked issue." >&2
             echo "   → Run the code-review skill on the current head and record clean:" >&2
@@ -903,8 +912,8 @@ if [ "$VERDICT" = "clean-low" ]; then
   # only when the content can actually differ. Pinning the tip instead would
   # false-block every clean-low PR on the next unrelated merge to main.
   CMP="$(command gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
-  MB="$(printf '%s\n' "$CMP" | head -1 | cut -f2)"
-  RAW="$(printf '%s\n' "$CMP" | tail -n +2)"
+  MB="$(printf '%s\n' "$CMP" | command head -1 | cut -f2)"
+  RAW="$(printf '%s\n' "$CMP" | command tail -n +2)"
   if ! [[ "$MB" =~ ^[0-9a-f]{40}$ ]]; then
     # Empty diff, a compare/API failure, a fork head not reachable from the
     # base repo (compare 404s there), or a response with no merge base. All are
@@ -994,7 +1003,7 @@ mv "$TMP" "$FILE"
 # anything else (foreign repo, formatted JSON we can't parse, no field) is
 # LEFT ALONE — never delete a file that might be another repo's data.
 if [ -n "$LEGACY" ] && [ -f "$LEGACY" ]; then
-  LEGACY_REPO="$(sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$LEGACY" | head -1)"
+  LEGACY_REPO="$(sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$LEGACY" | command head -1)"
   if [ -n "$LEGACY_REPO" ] && [ "$LEGACY_REPO" = "$REPO" ]; then
     rm -f "$LEGACY"
   fi
