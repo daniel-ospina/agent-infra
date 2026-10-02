@@ -504,6 +504,7 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 # duration below — the two are DIFFERENT mechanisms and need different env vars.
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
   local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
+  local ltree="" lpath="" lhb="" thb="" rhb="" lpaths=""
   # Replace refs AND the grafts FILE both rewrite what rev-list, rev-parse and
   # rev-parse^{tree} SEE, so either one can present a different commit graph to this
   # predicate than the one that is really there — reviewers built BOTH and turned a
@@ -695,6 +696,53 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   mb="$(command git merge-base --all "$current" "$base_sha" 2>/dev/null)" || return 1
   [ "$(printf '%s\n' "$mb" | command grep -c .)" = 1 ] || return 1
   [ "$mb" = "$p2" ] || return 1
+
+  # (C4) THE LANDING MERGE MUST NOT INTRODUCE CONTENT ABSENT FROM BOTH THE BASE TIP AND THE
+  # REVIEWED COMMIT. (C3) fixes the landing merge BASE; it does not constrain the landing
+  # RESULT — and `git merge-tree` OBEYS .gitattributes, so a `merge=union` attribute synthesises
+  # a blob keeping BOTH sides' lines and RE-ADDS what the base tip deleted. MEASURED (round 25):
+  # with `shared.txt merge=union` present, a head satisfying (A)-(D) AND (C3) lands into the
+  # base a line the tip had deleted, and the SAME head without the attribute is REFUSED — so
+  # union is what admits it. §17's union tolerance exists so a legitimately union-merged head
+  # carries (tortoise#5373), and it cannot be closed by forbidding synthesis outright.
+  # WHY THIS IS NOT THE BLOB-PURITY GUARD §17 REJECTS: it inspects the LANDING, and only for
+  # paths where the landing blob is NEITHER the tip's NOR `reviewed`'s — i.e. genuinely merged
+  # paths. There it requires every LINE to come from one of those two. A plain three-way merge
+  # never resurrects a deletion (only the deleting side changed the line, so deletion wins),
+  # which is why #6072/#6213/#4823/#5421 and §20/§20b are untouched; a union merge does, which
+  # is the leak. A first draft of this clause instead required the HEAD's blob on a tip-changed
+  # path to be one of the two inputs, and MEASURED as a FALSE REFUSAL on #6072 — a legitimate
+  # combined merge produces a blob in neither input. That is why the check is here.
+  # BOUNDED ITERATION: only a path the base tip CHANGED relative to p2 can carry a p2-era
+  # deletion for the landing to undo, so walking the whole tree (a first draft did — measured
+  # at ~2000 paths x 3 git calls, past a 90s bound on a real repo) is both needless and a
+  # denial-of-service on the merge gate. Where the tip changed nothing there is no deletion to
+  # resurrect, so the narrowed set IS the whole risk surface. The common case — §17's, where
+  # p2 IS the tip — therefore costs one `git diff --name-only` and nothing else.
+  lpaths="$(command git diff --name-only "$p2" "$base_sha" 2>/dev/null)" || return 1
+  if [ -n "$lpaths" ]; then
+  ltree="$(command git merge-tree --write-tree "$base_sha" "$current" 2>/dev/null)" || return 1
+  ltree="$(printf '%s\n' "$ltree" | command head -1)"
+  [ -n "$ltree" ] || return 1
+  while IFS= read -r lpath; do
+    [ -n "$lpath" ] || continue
+    lhb="$(command git rev-parse "$ltree:$lpath" 2>/dev/null || true)"
+    [ -n "$lhb" ] || continue
+    thb="$(command git rev-parse "$base_sha:$lpath" 2>/dev/null || true)"
+    rhb="$(command git rev-parse "$reviewed:$lpath" 2>/dev/null || true)"
+    # The landing took one side verbatim: nothing new can have entered.
+    { [ "$lhb" = "$thb" ] || [ "$lhb" = "$rhb" ]; } && continue
+    # A genuinely merged blob: every line must exist in the tip's or `reviewed`'s version.
+    # `p2` is DELIBERATELY absent from the known set — a line that only p2 had is exactly the
+    # content the tip deleted, and its reappearance in the landing is the leak.
+    [ -z "$(comm -23 <(command git show "$ltree:$lpath" 2>/dev/null | sort -u) \
+                       <({ command git show "$base_sha:$lpath" 2>/dev/null || true
+                           command git show "$reviewed:$lpath" 2>/dev/null || true; } | sort -u))" ] \
+      || return 1
+  done <<EOF
+$lpaths
+EOF
+  fi
 
   # (C2) NO LANE COMMITS IN BETWEEN: every intervening commit not reachable from the
   # AUTHORITATIVE base must be a MERGE. A single non-merge commit is lane work and a

@@ -89,6 +89,17 @@ new_repo() {
   echo "$d"
 }
 
+strip_c4() { # <mutated-fn-file> ; remove the (C4) block so a mutant isolates its OWN clause
+  python3 - "$1" <<'PY' || return 1
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+i = src.index("  # BOUNDED ITERATION:")
+j = src.index("  # (C2) NO LANE")
+open(p, "w", encoding="utf-8").write(src[:i] + src[j:])
+PY
+}
+
 carry_verdict() { # <repo> <reviewed> <current> -> 0 carry / 1 refuse
   local d="$1" a="$2" b="$3"
   ( cd "$d" || exit 9
@@ -126,6 +137,12 @@ if line.lstrip().startswith('#'):
 # ` #` was accepted as an applied mutation (the check above covers only line-leading ones).
 hashpos = line.find(' #')
 if hashpos >= 0 and (i - (code.rfind('\n', 0, i) + 1)) > hashpos:
+    sys.exit(1)
+n = code.count(frm)
+if n != 1:
+    # 0 = not found (handled above); >1 = AMBIGUOUS. The first occurrence may be in a DIFFERENT
+    # clause than the one under test, which is how a mutation becomes a silent no-op.
+    sys.stderr.write("literal occurs %d times - refusing to guess which site to mutate\n" % n)
     sys.exit(1)
 open(dst, 'w').write(code.replace(frm, to, 1))
 PY
@@ -756,9 +773,10 @@ headforge_verdict() { # <fnfile> -> 0 carry / 1 refuse
   && pass "(18) a shell FUNCTION named head cannot forge (D) by reading the caller's variables — the real head is used, REFUSED" \
   || fail "(18) a shell FUNCTION named head forged the tree equality and CARRIED unreviewed content — FAIL-OPEN"
 MH="$TMP/mut-nocommandhead.sh"
-if mutate '| command head -1' '| head -1' "$MH"; then
+if mutate '"$merged" | command head -1' '"$merged" | head -1' "$MH"; then
+  strip_c4 "$MH" || fail "mutation NOCOMMANDHEAD: could not neutralise (C4) — the mutant is masked"
   [ "$(headforge_verdict "$MH")" = 0 ] \
-    && pass "mutation NOCOMMANDHEAD is caught: without \`command\` the forged head CARRIES unreviewed content, so \`command head\` IS load-bearing" \
+    && pass "mutation NOCOMMANDHEAD is caught (with (C4) neutralised so this isolates \`command head\`): without \`command\` the forged head CARRIES unreviewed content, so \`command head\` IS load-bearing" \
     || fail "mutation NOCOMMANDHEAD NOT caught — \`command head\` is not what refuses the forgery"
 else
   fail "mutation NOCOMMANDHEAD: could not apply it — coverage is blind"
@@ -922,8 +940,9 @@ for f in frags:
 open(sys.argv[2], "w", encoding="utf-8").write(src)
 PY
 bash -n "$M16" 2>/dev/null || fail "mutation NOANCESTORPAIR did not parse"
+strip_c4 "$M16" || fail "mutation NOANCESTORPAIR: could not neutralise (C4) — the mutant is masked"
 [ "$(verdict_with "$D" "$M16" "$REVIEWED" "$CURRENT")" = 0 ] \
-  && pass "mutation NOANCESTORPAIR is caught: dropping BOTH the ancestry check and (C3) CARRIES this unreviewed head — the pair is load-bearing (neither alone is, since round 23)" \
+  && pass "mutation NOANCESTORPAIR is caught (with (C4) neutralised — it refuses this head independently, which masked this mutant until round 25): dropping BOTH the ancestry check and (C3) CARRIES this unreviewed head — the pair is load-bearing" \
   || fail "mutation NOANCESTORPAIR NOT caught — the ancestry/(C3) pair is not what refuses this head"
 
 echo "── 17. A UNION-MERGED head is TOLERATED (a RECORDED DECISION, pinned against a wrong 'fix')"
@@ -1100,8 +1119,9 @@ j = src.index(frag) + len(frag)
 open(sys.argv[2], "w", encoding="utf-8").write(src[:i] + src[j:])
 PY
 bash -n "$M21" 2>/dev/null || fail "mutation NOC3 did not parse"
+strip_c4 "$M21" || fail "mutation NOC3: could not neutralise (C4) — the mutant is masked"
 [ "$(verdict_with "$D" "$M21" "$REVIEWED" "$CURRENT")" = 0 ] \
-  && pass "mutation NOC3 is caught: WITHOUT (C3) this exact head CARRYs the leak — so (C3) is load-bearing and this fixture is the leak shape, not an arbitrary refusal" \
+  && pass "mutation NOC3 is caught (with (C4) neutralised — (C4) refuses this head independently, which masked this mutant until round 25): WITHOUT (C3) this exact head CARRYs the leak — so (C3) is load-bearing" \
   || fail "mutation NOC3 NOT caught — this fixture does not exercise (C3), so its REFUSE above proves nothing"
 
 # ── 20b. The case that makes byte-identity IMPOSSIBLE as the reason: a base ancestor that edits
@@ -1147,7 +1167,71 @@ cmp -s "$TMP/c20b-before.patch" "$TMP/c20b-after.patch" \
   && pass "(20b) the head is STILL carried even though the patch changed — so byte-identity is NOT the reason, and a 'tighten to byte-identity' fix reddens here" \
   || fail "(20b) the head was refused: the arm has become the #2982 byte-identity test and no longer carries the class it exists for"
 
-MIN_ASSERTIONS=92
+# ── 22. THE UNION LEAK — the SECOND route to what (C3) closed, and the reason (C4) exists.
+# (C3) fixes the landing merge BASE; it does not constrain the landing RESULT, and
+# `git merge-tree` OBEYS .gitattributes — so a TRACKED `merge=union` attribute synthesises a
+# blob keeping BOTH sides' lines and RE-ADDS what the base tip deleted. MEASURED (round 25):
+# this exact head satisfied (A)-(D) AND (C3), and landing it put a deleted line back into the
+# base. A first draft of (C4) required the HEAD's blob on a tip-changed path to be one of the
+# two inputs and was MEASURED a FALSE REFUSAL on a real PR (a legitimate combined merge
+# produces a blob in neither input) — so the clause inspects the LANDING instead. If a
+# "tighten it" change makes this section pass for the wrong reason, the changed-set predicate
+# or the landing comparison has been loosened.
+D3="$TMP/c22union"; rm -rf "$D3"; mkdir -p "$D3"; cd "$D3" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'a\n' > shared.txt
+printf 'shared.txt merge=union\n' > .gitattributes
+git add -A; git commit -qm base; git branch -M main
+git update-ref refs/remotes/origin/main refs/heads/main
+git checkout -qb pr
+printf 'a\nLANE\n' > shared.txt; git add -A; git commit -qm 'lane adds LANE (REVIEWED)'
+REVIEWED="$(git rev-parse HEAD)"
+( cd "$D3" || exit 9
+  git checkout -q main
+  printf 'a\nSECRET\n' > shared.txt; git add -A; git commit -qm 'base ancestor adds SECRET'
+  printf 'a\nb\n' > shared.txt; git add -A; git commit -qm 'base tip DELETES SECRET'
+  printf 'more\n' > more.txt; git add -A; git commit -qm 'base tip advances again (p2 is now an OLDER ancestor)' )
+B1="$(git rev-parse main~2)"
+( cd "$D3" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the base ancestor' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+BASETIP="$(git rev-parse main)"
+P2B="$(git rev-parse "$CURRENT^2" 2>/dev/null)"
+{ [ "$P2B" = "$B1" ] \
+  && [ "$(git merge-base --all "$CURRENT" "$BASETIP" | wc -l | tr -d ' ')" = 1 ] \
+  && [ "$(git merge-base --all "$CURRENT" "$BASETIP")" = "$B1" ]; } \
+  && pass "(22) PRECONDITION: the landing merge base IS p2, so (C3) PASSES — this leak is reached DOWNSTREAM of (C3), not through it" \
+  || fail "(22) fixture is VACUOUS: (C3) would already refuse, so this is not the union route"
+# The stake, measured on the real landing tree rather than asserted: the resurrected line must
+# be absent from BOTH the base tip AND the reviewed commit, or this is not unreviewed content.
+LAND="$(git merge-tree --write-tree "$BASETIP" "$CURRENT" 2>/dev/null | command head -1)"
+git show "$LAND:shared.txt" > "$TMP/c22-land.txt" 2>/dev/null
+git show "$BASETIP:shared.txt" > "$TMP/c22-tip.txt" 2>/dev/null
+git show "$REVIEWED:shared.txt" > "$TMP/c22-rev.txt" 2>/dev/null
+{ grep -q SECRET "$TMP/c22-land.txt" && ! grep -q SECRET "$TMP/c22-tip.txt" \
+  && ! grep -q SECRET "$TMP/c22-rev.txt"; } \
+  && pass "(22) the STAKE is real: landing this head RE-INTRODUCES a line the base tip deleted, and that line is in NO reviewed commit — unreviewed content entering the base" \
+  || fail "(22) fixture is vacuous: the landing does not resurrect a deleted line, so there is no leak to close"
+[ "$(verdict_with "$D3" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "(22) the head is REFUSED — (C4) sees the landing introduce content absent from both the tip and REVIEWED" \
+  || fail "(22) the head was CARRIED: the union leak is OPEN"
+M22="$TMP/mut-noc4.sh"
+python3 - "$TMP/fn.sh" "$M22" <<'PY' || fail "mutation NOC4: could not build it — coverage is blind"
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+i = src.index("  # BOUNDED ITERATION:")
+j = src.index("  # (C2) NO LANE")
+open(sys.argv[2], "w", encoding="utf-8").write(src[:i] + src[j:])
+PY
+bash -n "$M22" 2>/dev/null || fail "mutation NOC4 did not parse"
+[ "$(verdict_with "$D3" "$M22" "$REVIEWED" "$CURRENT")" = 0 ] \
+  && pass "mutation NOC4 is caught: WITHOUT (C4) this exact head CARRYs the union leak — so (C4) is load-bearing and this fixture is that leak shape, not an arbitrary refusal" \
+  || fail "mutation NOC4 NOT caught — this fixture does not exercise (C4), so its REFUSE above proves nothing"
+
+MIN_ASSERTIONS=96
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
