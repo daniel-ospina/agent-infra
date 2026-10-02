@@ -733,7 +733,18 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # landing re-admitted a base-tip-deleted line and the verdict was CARRY, while the ASCII
   # control of the SAME fixture REFUSED; setting core.quotePath=false flipped the verdict back,
   # so the clause's behaviour depended on the caller's git config.
-  lpaths="$(command git -c core.quotePath=false diff --name-only "$p2" "$base_sha" 2>/dev/null)" || return 1
+  # `-c diff.relative=false` is the SAME CLASS of defect as the quotePath above and is NOT
+  # cosmetic: `diff.relative` (a documented git config) makes this command report paths relative
+  # to the CALLER'S CWD and OMIT every path outside it, so a leaking path elsewhere in the repo
+  # never enters the set and (C4) is skipped entirely. MEASURED (round 27): with
+  # `diff.relative=true` and the function called from a subdirectory, the union-leak fixture
+  # returned CARRY; the same invocation from the repo root REFUSED; and with the leaking path
+  # inside the cwd the emitted name was cwd-relative and resolved against a DECOY path of the
+  # same name at the root, so the leaking path was never inspected either. It fires from a
+  # `~/.gitconfig` setting. `atomic-land.sh` never cds to the repo root, so the caller's cwd and
+  # config reach this function — which is why both flags are pinned explicitly rather than
+  # inherited.
+  lpaths="$(command git -c core.quotePath=false -c diff.relative=false diff --name-only "$p2" "$base_sha" 2>/dev/null)" || return 1
   if [ -n "$lpaths" ]; then
   ltree="$(command git merge-tree --write-tree "$base_sha" "$current" 2>/dev/null)" || return 1
   ltree="$(printf '%s\n' "$ltree" | command head -1)"
@@ -745,6 +756,14 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
     # and every lookup below would silently see nothing. This is the fail-closed backstop to
     # `core.quotePath=false` above — `git rev-parse <tree>:<path>` PRINTS the argument and exits
     # 128 on failure, so the previous `[ -n "$lhb" ]` test could never fire.
+    # TWO DECLARED TOLERANCES, both FAIL-CLOSED (a false refusal, never a wrong carry), both
+    # MEASURED (round 27): (i) git C-quotes `\`, `"` and control characters EVEN with
+    # quotePath=false, so a clean base-only move touching such a name is refused — as is one
+    # touching a SUBMODULE path, because `git cat-file -e <rev>:<sub>` fails when the gitlink's
+    # commit is absent from the superproject, which is the normal case. Neither repository in
+    # this fleet has submodules and neither has such a filename. `-z` with `read -d ''` would
+    # remove both, at the cost of a scratch file (command substitution STRIPS NULs, so `-z`
+    # cannot be captured in a variable).
     command git cat-file -e "$p2:$lpath" 2>/dev/null \
       || command git cat-file -e "$base_sha:$lpath" 2>/dev/null || return 1
     # Absent from the LANDING is legitimate (the merge took a deletion), so it is not a refusal.

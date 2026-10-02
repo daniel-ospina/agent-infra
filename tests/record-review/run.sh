@@ -1237,19 +1237,26 @@ bash -n "$M22" 2>/dev/null || fail "mutation NOC4 did not parse"
 # of the SAME fixture REFUSED; `core.quotePath=false` alone flipped it back. The clause is
 # therefore a function of the CALLER's git config without the `-c` below, and a name that
 # resolves against neither input tree now REFUSES rather than being skipped.
+# WHAT THIS SECTION PINS, EXACTLY (round 27 measured that the claim here used to overstate it):
+# the REFUSE below does NOT isolate the `-c core.quotePath=false` flag, because removing that flag
+# alone still refuses this fixture — via the fail-closed backstop, for a different reason. What
+# isolates the flag is the CLEAN-move assertion further down: there the backstop is what a missing
+# flag reddens, so the flag is load-bearing and this fixture pair shows it.
 D4="$TMP/c23quoted"; rm -rf "$D4"; mkdir -p "$D4"; cd "$D4" || exit 2
+# The real bytes (0xC3 0xA9), not a literal escape sequence — see the note above §23.
+QN="$(printf 'caf\303\251.txt')"
 git init -q .; git config user.email t@t; git config user.name t
-printf 'a\n' > 'caf\303\251.txt'
+printf 'a\n' > "$QN"
 printf '*.txt merge=union\n' > .gitattributes
 git add -A; git commit -qm base; git branch -M main
 git update-ref refs/remotes/origin/main refs/heads/main
 git checkout -qb pr
-printf 'a\nLANE\n' > 'caf\303\251.txt'; git add -A; git commit -qm 'lane adds LANE (REVIEWED)'
+printf 'a\nLANE\n' > "$QN"; git add -A; git commit -qm 'lane adds LANE (REVIEWED)'
 REVIEWED="$(git rev-parse HEAD)"
 ( cd "$D4" || exit 9
   git checkout -q main
-  printf 'a\nSECRET\n' > 'caf\303\251.txt'; git add -A; git commit -qm 'base ancestor adds SECRET'
-  printf 'a\nb\n' > 'caf\303\251.txt'; git add -A; git commit -qm 'base tip DELETES SECRET'
+  printf 'a\nSECRET\n' > "$QN"; git add -A; git commit -qm 'base ancestor adds SECRET'
+  printf 'a\nb\n' > "$QN"; git add -A; git commit -qm 'base tip DELETES SECRET'
   printf 'more\n' > more.txt; git add -A; git commit -qm 'base tip advances again' )
 B1="$(git rev-parse main~2)"
 ( cd "$D4" || exit 9
@@ -1264,8 +1271,8 @@ P2B="$(git rev-parse "$CURRENT^2" 2>/dev/null)"
   && pass "(23) PRECONDITION: (C3) passes, so only (C4) can refuse this head" \
   || fail "(23) fixture is VACUOUS: (C3) would already refuse"
 LAND="$(git merge-tree --write-tree "$BASETIP" "$CURRENT" 2>/dev/null | command head -1)"
-git show "$LAND:caf\303\251.txt" > "$TMP/c23-land.txt" 2>/dev/null
-git show "$BASETIP:caf\303\251.txt" > "$TMP/c23-tip.txt" 2>/dev/null
+git show "$LAND:$QN" > "$TMP/c23-land.txt" 2>/dev/null
+git show "$BASETIP:$QN" > "$TMP/c23-tip.txt" 2>/dev/null
 { grep -q SECRET "$TMP/c23-land.txt" && ! grep -q SECRET "$TMP/c23-tip.txt"; } \
   && pass "(23) the STAKE is real: the landing re-admits SECRET even though the base tip deleted it" \
   || fail "(23) fixture is vacuous: no resurrection to catch"
@@ -1277,6 +1284,98 @@ git -c core.quotePath=true diff --name-only "$P2B" "$BASETIP" | grep -q '\\' \
 [ "$(verdict_with "$D4" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
   && pass "(23) the head is REFUSED — a quoted name no longer hides the path from (C4)" \
   || fail "(23) the head was CARRIED: (C4) is blind to a quoted path name"
+# A CLEAN base-only move touching the SAME name must CARRY. This is the assertion that isolates
+# the `-c core.quotePath=false` flag: without it the name is C-quoted, the backstop refuses, and
+# this reddens — while the leak assertion above stays green either way.
+D4b="$TMP/c23clean"; rm -rf "$D4b"; mkdir -p "$D4b"; cd "$D4b" || exit 2
+QN="$(printf 'caf\303\251.txt')"
+git init -q .; git config user.email t@t; git config user.name t
+printf 'a\nX\nc\n' > "$QN"
+git add -A; git commit -qm base; git branch -M main
+git update-ref refs/remotes/origin/main refs/heads/main
+git checkout -qb pr
+printf 'A\nX\nc\n' > "$QN"; git add -A; git commit -qm 'lane edits line 1 (REVIEWED)'
+REVIEWED="$(git rev-parse HEAD)"
+( cd "$D4b" || exit 9
+  git checkout -q main
+  printf 'more\n' > more.txt; git add -A; git commit -qm 'base ancestor adds a file'
+  printf 'a\nX\nC\n' > "$QN"; git add -A; git commit -qm 'base tip edits a DIFFERENT line, so the landing merge does not conflict'
+  printf 'more2\n' > more2.txt; git add -A; git commit -qm 'base tip advances again' )
+B1="$(git rev-parse main~2)"
+# PRECONDITION: the landing merge must be CLEAN — a conflicted landing rightly refuses, and that
+# would say nothing about the flag (measured: the first draft of this fixture conflicted).
+{ [ "$(git merge-tree --write-tree "$(git rev-parse main)" "$(git rev-parse pr)" 2>/dev/null | wc -l | tr -d ' ')" -ge 1 ]; } \
+  && pass "(23) PRECONDITION: the clean-move fixture's landing merge-tree ran" \
+  || fail "(23) clean-move fixture: landing merge-tree failed"
+( cd "$D4b" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the base ancestor' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+[ "$(verdict_with "$D4b" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
+  && pass "(23) a CLEAN base-only move touching the quoted name is CARRIED — this is what isolates \`-c core.quotePath=false\` (a bare-name version of this same check CARRIES, so the name needs quoting for the assertion to bite)" \
+  || fail "(23) a clean base-only move touching a quoted name was FALSELY REFUSED — a caller's git config is deciding the verdict"
+
+# ── 25. (C4)'s path set must not depend on the CALLER'S CWD or config. `diff.relative` is a
+# documented git config that makes `diff --name-only` report paths relative to the cwd and OMIT
+# everything outside it, so a leaking path elsewhere in the repo never enters the set and (C4) is
+# skipped entirely. MEASURED (round 27): with `diff.relative=true` and the function called from a
+# subdirectory the union-leak fixture CARRYed, from the repo root it REFUSED.
+D6="$TMP/c25relative"; rm -rf "$D6"; mkdir -p "$D6/sub"; cd "$D6" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+git config diff.relative true
+printf 'a\n' > shared.txt; printf 'keep\n' > sub/keep.txt
+printf 'shared.txt merge=union\n' > .gitattributes
+git add -A; git commit -qm base; git branch -M main
+git update-ref refs/remotes/origin/main refs/heads/main
+git checkout -qb pr
+printf 'a\nLANE\n' > shared.txt; git add -A; git commit -qm 'lane adds LANE (REVIEWED)'
+REVIEWED="$(git rev-parse HEAD)"
+( cd "$D6" || exit 9
+  git checkout -q main
+  printf 'a\nSECRET\n' > shared.txt; git add -A; git commit -qm 'base ancestor adds SECRET'
+  printf 'a\nb\n' > shared.txt; git add -A; git commit -qm 'base tip DELETES SECRET'
+  printf 'x\n' > more.txt; git add -A; git commit -qm 'base tip advances again (OUTSIDE the cwd used below, so the attack is C4 being skipped, not a decoy name)' )
+B1="$(git rev-parse main~2)"
+( cd "$D6" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the base ancestor' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+BASETIP="$(git rev-parse main)"
+# PRECONDITION: from the ROOT the changed path IS reported (so the attack is the cwd, not the graph).
+git diff --name-only "$B1" "$BASETIP" | grep -qx shared.txt \
+  && pass "(25) PRECONDITION: from the repo ROOT the leaking path IS reported" \
+  || fail "(25) fixture is VACUOUS: the path is not reported even from the root"
+# ...and from the SUBDIRECTORY the same command omits it — the attack, measured.
+( cd "$D6/sub" && git diff --name-only "$B1" "$BASETIP" ) | grep -qx shared.txt \
+  && fail "(25) fixture is VACUOUS: this git version does not honour diff.relative from a subdirectory" \
+  || pass "(25) PRECONDITION: from the SUBDIRECTORY the same command OMITS the leaking path — the attack is real"
+# Invoke the REAL function with cwd = the subdirectory.
+subdir_verdict() { # <fnfile>
+  ( cd "$D6/sub" || exit 9
+    export FIXTURE_BASE_SHA; FIXTURE_BASE_SHA="$BASETIP"
+    source "$1"; PR=1
+    if lane_dimension_carry "$REVIEWED" "$CURRENT"; then echo 0; else echo 1; fi )
+}
+[ "$(subdir_verdict "$TMP/fn.sh")" = 1 ] \
+  && pass "(25) REFUSED even though the function is called from a subdirectory with diff.relative=true — (C4) no longer depends on the caller's cwd or config" \
+  || fail "(25) CARRIED the union leak: (C4) was skipped because the caller's cwd hid the path"
+M25="$TMP/mut-norel.sh"
+python3 - "$TMP/fn.sh" "$M25" <<'PY' || fail "mutation NOREL: could not build it — coverage is blind"
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+frag = "-c core.quotePath=false -c diff.relative=false"
+if src.count(frag) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(frag, "-c core.quotePath=false"))
+PY
+bash -n "$M25" 2>/dev/null || fail "mutation NOREL did not parse"
+[ "$(subdir_verdict "$M25")" = 0 ] \
+  && pass "mutation NOREL is caught: without \`-c diff.relative=false\` this exact head CARRYs the union leak from a subdirectory — so that flag is load-bearing" \
+  || fail "mutation NOREL NOT caught — the flag is not what makes §25 refuse"
 
 # ── 24. The KNOWN-LINE set must separate the two blobs: with no separator, a blob whose last line
 # is unterminated CONCATENATES with the next blob's first line, so a line that genuinely is in the
@@ -1330,7 +1429,7 @@ else
   fail "mutation NOSEP: could not apply it — coverage is blind"
 fi
 
-MIN_ASSERTIONS=104
+MIN_ASSERTIONS=110
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
