@@ -214,7 +214,7 @@ else
   pass "(4) the new head is NOT a descendant of the reviewed one — it is genuinely a rewrite"
 fi
 [ "$(carry_verdict "$D" "$REVIEWED" "$CURRENT")" = 1 ] \
-  && pass "REFUSE (1) — a rewritten head is refused (MEASURED: by the absent second parent, not by the ancestry clause — deleting (B) alone leaves the suite green, so this fixture does not decide (B))" \
+  && pass "REFUSE (1) — a rewritten head is refused (MEASURED with an instrumented copy: clause (B) refuses first, the ancestry check short-circuits behind it — so this fixture does NOT decide the ancestry clause; an earlier note here claimed the opposite)" \
   || fail "CARRIED across a rewrite — FAIL-OPEN"
 
 echo "── 5. THE P0 REGRESSION: a local ref that LIES about the base must not be trusted"
@@ -299,13 +299,14 @@ leaked=0
   || fail "mutation REVERTED NOT caught — the authoritative base pair is not what stops the P0 fail-open"
 
 echo "── 7. (D)'s rc check must be load-bearing on its own: a CONFLICT whose tree EQUALS the head"
-# The failure of section 3's fixture: it resolves the conflict BY HAND, so the automatic
-# tree differs from the committed one and the TREE INEQUALITY catches it — the rc check
-# is never exercised. A modify/delete conflict is different: `merge-tree --write-tree`
-# exits 1, but the tree it prints keeps the modified side, which is exactly what the
-# committed merge contains. So the trees MATCH and only rc can refuse. A reviewer found
-# that deleting the rc check left the whole suite green — i.e. it could regress to the
-# fail-open a previous review had just fixed, unnoticed. This fixture closes that.
+# A modify/delete conflict: `merge-tree --write-tree` exits 1, but the tree it prints keeps
+# the modified side, which is exactly what the committed merge contains. So the trees MATCH
+# and only rc can refuse. A reviewer found that deleting the rc check left the whole suite
+# green — i.e. it could regress to the fail-open a previous review had just fixed, unnoticed.
+# This fixture closes that. (An earlier version of this comment said section 3's fixture never
+# exercises the rc check because it resolves by hand; a round-23 reviewer MEASURED the §3
+# shape refusing AT the rc check — `merge-tree` exits 1 there too — and §9 already said so.
+# The corrected claim is only the one this fixture carries.)
 D="$(new_repo moddel)"; cd "$D" || exit 2
 printf 'pr version\n' > shared.txt; git add -A; git commit -qm "lane edits shared.txt"
 REVIEWED="$(git rev-parse HEAD)"
@@ -868,12 +869,16 @@ BARE_GH="$(bare_gh_count "$SRC")"
   && pass "(15) every gh INVOCATION in record-review.sh uses \`command gh\` (occurrence-based count = 0)" \
   || fail "(15) $BARE_GH bare gh invocation(s) in record-review.sh — a shell function named gh can intercept them"
 
-echo "── 16. The SECOND-PARENT ANCESTRY check is load-bearing on its own (NOT redundant)"
-# §6's comment used to call this clause redundant with (C2) and say removing either alone
-# still refuses. A reviewer FALSIFIED that: on a head whose second parent M is a HAND-BUILT
-# merge of two base commits, (C2) is empty (M is a merge, dropped by --no-merges, and its
-# parents are base commits) and (D) passes by construction — only the ancestry check
-# refuses. M's tree carries an unreviewed file, so the stake is real.
+echo "── 16. A hand-built base-merge head is REFUSED by the ancestry/(C3) PAIR"
+# §6's comment used to call the ancestry clause redundant with (C2). On a head whose second
+# parent M is a HAND-BUILT merge of two base commits, (C2) is empty (M is a merge, dropped by
+# --no-merges, and its parents are base commits) and (D) passes by construction — so something
+# else must refuse. M's tree carries an unreviewed file, so the stake is real.
+# WHAT THIS SECTION NO LONGER CLAIMS: that the ancestry check is load-bearing ON ITS OWN. That
+# was true until (C3) was added in round 23; (C3) refuses this head too, so removing EITHER
+# clause alone leaves it refusing. The honest statement is that the PAIR is load-bearing, and
+# that is what the mutation below now removes. A claim of the form "clause X is load-bearing on
+# its own" re-stales every time a clause is added — this one lasted three rounds.
 D="$(new_repo c2ancestor)"; cd "$D" || exit 2
 REVIEWED="$(git rev-parse HEAD)"
 advance_base "$D"
@@ -902,14 +907,22 @@ git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
 [ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
   && pass "REFUSE (1) — only the second-parent ancestry check can refuse this head" \
   || fail "CARRIED a head whose second parent is not base-derived — FAIL-OPEN"
-M16="$TMP/mut-noancestor.sh"
-if mutate 'git merge-base --is-ancestor "$p2" "$base_sha" 2>/dev/null || return 1' ':' "$M16"; then
-  [ "$(verdict_with "$D" "$M16" "$REVIEWED" "$CURRENT")" = 0 ] \
-    && pass "mutation NOANCESTOR is caught: dropping the ancestry check CARRIES unreviewed content, so it IS load-bearing on its own" \
-    || fail "mutation NOANCESTOR NOT caught — the ancestry check is not what refuses this head"
-else
-  fail "mutation NOANCESTOR: could not apply it — coverage is blind"
-fi
+M16="$TMP/mut-noancestor-pair.sh"
+python3 - "$TMP/fn.sh" "$M16" <<'PY' || fail "mutation NOANCESTORPAIR: could not build it — coverage is blind"
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+frags = ['  command git merge-base --is-ancestor "$p2" "$base_sha" 2>/dev/null || return 1\n',
+         '  [ "$mb" = "$p2" ] || return 1\n']
+for f in frags:
+    if f not in src:
+        sys.exit(1)
+    src = src.replace(f, "", 1)
+open(sys.argv[2], "w", encoding="utf-8").write(src)
+PY
+bash -n "$M16" 2>/dev/null || fail "mutation NOANCESTORPAIR did not parse"
+[ "$(verdict_with "$D" "$M16" "$REVIEWED" "$CURRENT")" = 0 ] \
+  && pass "mutation NOANCESTORPAIR is caught: dropping BOTH the ancestry check and (C3) CARRIES this unreviewed head — the pair is load-bearing (neither alone is, since round 23)" \
+  || fail "mutation NOANCESTORPAIR NOT caught — the ancestry/(C3) pair is not what refuses this head"
 
 echo "── 17. A UNION-MERGED head is TOLERATED (a RECORDED DECISION, pinned against a wrong 'fix')"
 # (D) compares `merge-tree(reviewed, p2)` to the head's tree, and `git merge-tree` OBEYS
@@ -1018,16 +1031,75 @@ HB="$(git rev-parse "$CURRENT:leaked.env" 2>/dev/null || echo none)"
 [ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
   && pass "(20) the head IS carried (the declared tolerance, pinned)" \
   || fail "(20) the head was refused — the tolerance changed without this pin being updated"
-# THE LANDING PROPERTY — the half that makes the tolerance leak-free: the base TIP's version of
-# the file the LANE never modified must SURVIVE the landing merge.
+# THE LANDING PROPERTY, for THIS fixture only. It is NOT a general property of the arm: a
+# round-23 reviewer built a head in this same class for which the landing merge RESURRECTS the
+# deleted file, and the fix for it is clause (C3), pinned in §21. An earlier note here called the
+# tolerance "leak-free" without qualification; that was false until (C3) existed.
 LANDED="$(git merge-tree --write-tree "$B2" "$CURRENT" 2>/dev/null | command head -1)"
 git cat-file -e "$LANDED:leaked.env" 2>/dev/null \
   && fail "(20) the base tip's DELETION did not survive the landing merge — the head resurrects it into the base, which WOULD be a leak" \
-  || pass "(20) landing the head keeps the base TIP's version of the lane-untouched file — the tip's deletion survives (the tolerance is leak-free)"
+  || pass "(20) landing THIS head keeps the base TIP's version of the lane-untouched file — the tip's deletion survives (a property of THIS fixture; the general guarantee is (C3), pinned in §21)"
 # The 'fix it to the base TIP' form would refuse this head (false-refusal generator).
 [ "$(git merge-tree --write-tree "$REVIEWED" "$B2" 2>/dev/null | command head -1)" != "$(git rev-parse "$CURRENT^{tree}")" ] \
   && pass "(20) comparing against the base TIP instead would REFUSE this head — the 'fix' is a false-refusal generator, pinned" \
   || fail "(20) the base-tip form would NOT refuse this head, so the boundary this section pins is not real"
+
+echo "── 21. The (C3) LEAK: a base-ancestor merge whose LANDING base is a LATER base commit"
+# Round 23's P0, reproduced from the reviewer's own fixture. (C) admits ANY base-lineage
+# ancestor as the second parent, so a head can carry commits NEWER than that ancestor which are
+# still base lineage; the LANDING merge then takes that newer commit as its base and RESURRECTS
+# content the base tip has since deleted. Here B1 adds leaked.env, B3 (a later base commit)
+# deletes it, B2 advances, and the head merges B1 while B3 is in its ancestry — so the landing
+# merge base is B3 and the deletion is undone. Clause (C3) requires merge-base(current,base_tip)
+# to BE p2, which refuses it. MEASURED both directions: with (C3) removed this head CARRYs
+# (asserted as a PRECONDITION below, so the fixture proves it is the leak shape); with it, REFUSE.
+D="$(new_repo c21leak)"; cd "$D" || exit 2
+BB=$(printf 'base\n' | git hash-object -w --stdin)
+BL=$(printf 'lane work\n' | git hash-object -w --stdin)
+BS=$(printf 'SECRET\n' | git hash-object -w --stdin)
+BO=$(printf 'other tip\n' | git hash-object -w --stdin)
+T0=$(printf '100644 blob %s\tshared.txt\n' "$BB" | git mktree)
+TR=$(printf '100644 blob %s\tlane.txt\n100644 blob %s\tshared.txt\n' "$BL" "$BB" | git mktree)
+T1=$(printf '100644 blob %s\tleaked.env\n100644 blob %s\tshared.txt\n' "$BS" "$BB" | git mktree)
+T2=$(printf '100644 blob %s\tother.txt\n100644 blob %s\tshared.txt\n' "$BO" "$BB" | git mktree)
+B0="$(git commit-tree "$T0" -m base)"
+REVIEWED="$(git commit-tree "$TR" -p "$B0" -m 'lane work')"
+B1="$(git commit-tree "$T1" -p "$B0" -m 'base ancestor adds leaked.env')"
+B3="$(git commit-tree "$T0" -p "$B1" -m 'later base commit DELETES leaked.env')"
+B2="$(git commit-tree "$T2" -p "$B3" -m 'base tip advances')"
+git update-ref refs/heads/main "$B2"
+X="$(git commit-tree "$TR" -p "$REVIEWED" -p "$B3" -m 'puts B3 in the ancestry')"
+MT21="$(git merge-tree --write-tree "$REVIEWED" "$B1" 2>/dev/null)"
+CURRENT="$(git commit-tree "$MT21" -p "$X" -p "$B1" -m head)"
+git update-ref refs/heads/pr "$CURRENT"
+git update-ref refs/remotes/origin/main refs/heads/main
+P221="$(git rev-parse "$CURRENT^2")"
+{ [ "$P221" = "$B1" ] && [ "$(git merge-base "$B2" "$CURRENT")" = "$B3" ] \
+  && [ "$(git rev-parse "$CURRENT^{tree}")" = "$MT21" ] \
+  && git cat-file -e "$CURRENT:leaked.env" 2>/dev/null \
+  && ! git cat-file -e "$B2:leaked.env" 2>/dev/null; } \
+  && pass "(21) PRECONDITION: the head passes (A)-(D)'s shape, its second parent is an OLDER base ancestor, and the LANDING merge base is the LATER base commit B3" \
+  || fail "(21) fixture is wrong: the leak shape was not constructed"
+LANDED21="$(git merge-tree --write-tree "$B2" "$CURRENT" 2>/dev/null | command head -1)"
+git cat-file -e "$LANDED21:leaked.env" 2>/dev/null \
+  && pass "(21) the STAKE is real: landing this head WOULD carry leaked.env into the base (content in no reviewed commit and not in the base tip)" \
+  || fail "(21) fixture is vacuous: landing would not carry the file, so there is no leak to close"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "(21) the head is REFUSED — (C3) requires the landing merge base to BE the second parent" \
+  || fail "(21) the head was CARRIED: the (C3) leak is OPEN"
+M21="$TMP/mut-noc3.sh"
+python3 - "$TMP/fn.sh" "$M21" <<'PY' || fail "mutation NOC3: could not build it — coverage is blind"
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+i = src.index("  # (C3) THE MERGE BASE MUST")
+frag = '  [ "$mb" = "$p2" ] || return 1\n'
+j = src.index(frag) + len(frag)
+open(sys.argv[2], "w", encoding="utf-8").write(src[:i] + src[j:])
+PY
+bash -n "$M21" 2>/dev/null || fail "mutation NOC3 did not parse"
+[ "$(verdict_with "$D" "$M21" "$REVIEWED" "$CURRENT")" = 0 ] \
+  && pass "mutation NOC3 is caught: WITHOUT (C3) this exact head CARRYs the leak — so (C3) is load-bearing and this fixture is the leak shape, not an arbitrary refusal" \
+  || fail "mutation NOC3 NOT caught — this fixture does not exercise (C3), so its REFUSE above proves nothing"
 
 # ── 20b. The case that makes byte-identity IMPOSSIBLE as the reason: a base ancestor that edits
 # a line inside the LANE's hunk CONTEXT. The rendered patch CHANGES; the carry is still correct.
@@ -1072,7 +1144,7 @@ cmp -s "$TMP/c20b-before.patch" "$TMP/c20b-after.patch" \
   && pass "(20b) the head is STILL carried even though the patch changed — so byte-identity is NOT the reason, and a 'tighten to byte-identity' fix reddens here" \
   || fail "(20b) the head was refused: the arm has become the #2982 byte-identity test and no longer carries the class it exists for"
 
-MIN_ASSERTIONS=88
+MIN_ASSERTIONS=92
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

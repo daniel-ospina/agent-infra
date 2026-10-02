@@ -674,6 +674,25 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   [ -n "$p2" ] || return 1
   command git merge-base --is-ancestor "$p2" "$base_sha" 2>/dev/null || return 1
 
+  # (C3) THE MERGE BASE MUST **BE** p2 — not merely lie somewhere in the base's lineage.
+  # THE LEAK THIS CLOSES, MEASURED with the real function: (C) admits ANY base-lineage
+  # ancestor, so a head can carry commits NEWER than p2 that are still base lineage, and the
+  # LANDING merge then takes that newer commit as its base — resurrecting content the base tip
+  # has since DELETED into the base. A round-23 reviewer built exactly that head: it passes
+  # (A), (B), (C), (C2) and (D), the verdict is CARRY, and `merge-tree(base_tip, current)`
+  # carries a `leaked.env` that is in NO reviewed commit and NOT in the base tip.
+  # THIS IS THE INVARIANT a previous revision ASSERTED IN PROSE AND THEN DELETED: it read "at
+  # landing time the merge base of the head and the base tip is that same base-lineage commit".
+  # A reviewer correctly falsified the sentence as written (it is false of the accepted set)
+  # and it was removed — but removing the SENTENCE while leaving the CLAUSE out is what turned
+  # a stated invariant into an unenforced one. The fix is the clause, not better prose.
+  # EXACTLY ONE merge base is required: a criss-cross history has two or more, and p2 being one
+  # of several does not carry the landing argument, so ambiguity fails CLOSED.
+  local mb=""
+  mb="$(command git merge-base --all "$current" "$base_sha" 2>/dev/null)" || return 1
+  [ "$(printf '%s\n' "$mb" | command grep -c .)" = 1 ] || return 1
+  [ "$mb" = "$p2" ] || return 1
+
   # (C2) NO LANE COMMITS IN BETWEEN: every intervening commit not reachable from the
   # AUTHORITATIVE base must be a MERGE. A single non-merge commit is lane work and a
   # fresh review is owed (that is the #5421 counter-example: cfe2bad0afaa is one).
