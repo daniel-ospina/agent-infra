@@ -552,17 +552,20 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   #     the base" does not make a blob something a review saw. A head whose only
   #     non-reviewed file exists in no reviewed commit and NOT in the base tip, but in a
   #     base ANCESTOR, IS carried (MEASURED twice, independently). What makes that SOUND is
-  #     narrower and measurable — and the reason is the LANE dimension, NOT the rendered
-  #     patch. The rendered patch is EXPECTED to change here: that is why this arm exists at
-  #     all (§2982's byte-identity test cannot carry any base move that lands in a PR's hunk
-  #     context, and a reviewer MEASURED a head in this very class whose three-dot patch
-  #     DIFFERS while all five clauses hold). What makes the carry sound is what (C)/(D)
-  #     already pin: the head is the AUTOMATIC merge of `reviewed` with a base-LINEAGE commit,
-  #     so everything the head contributes beyond base lineage comes from the commit the
-  #     review approved; and at landing time the merge base of the head and the base tip is
-  #     that same base-lineage commit, so every file the LANE did not modify resolves to the
-  #     base TIP's version — MEASURED: the tip's deletion of a base-ancestor file survives the
-  #     landing merge rather than being resurrected. A head TREE exceeding `reviewed + base
+  #     narrower: the reason is the LANE dimension, NOT the rendered patch. The rendered patch
+  #     is EXPECTED to change here — that is why this arm exists at all, since §2982's
+  #     byte-identity test cannot carry a base move that lands in a PR's hunk context (a
+  #     reviewer MEASURED a head in this very class whose three-dot patch DIFFERS while all
+  #     five clauses hold). The reason the carry is sound, stated as narrowly as it can be
+  #     justified: (D) pins the head to the AUTOMATIC merge of `reviewed` with a base-LINEAGE
+  #     commit, so the only content the head adds beyond that base lineage is `reviewed`'s own
+  #     contribution — the commit the review approved.
+  #     WHAT IS NOT CLAIMED HERE: no merge-base identity and no general theorem about landing.
+  #     An earlier draft asserted the head/base-tip merge base "is that base-lineage commit";
+  #     that is FALSE of the accepted set (a fabricated head can pass all five clauses with a
+  #     NEWER merge base), and a criss-cross history has TWO merge bases, so the singular is
+  #     ill-defined anyway. The landing property is PINNED BY MEASUREMENT in §20 of the suite,
+  #     which is where a reader should take it from. A head TREE exceeding `reviewed + base
   #     tip` is a DECLARED TOLERANCE, not a proof of safety, and §20 of the suite pins BOTH
   #     halves — including a fixture where the patch CHANGES and the head is still carried, so
   #     that a future tightening toward byte-identity reddens instead of landing; and

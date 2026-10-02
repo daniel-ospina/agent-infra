@@ -9,15 +9,15 @@ blind to a case the original handled.
 than left to inference, because FOUR successive designs of it were measured unsound and the
 honest thing is to name the limit instead of widening it a fifth time:
 
-  * It matches the command word through `^`, `|`, `&`, `;`, `(` and a normalised `$(`. A
-    reviewer MEASURED that this is NOT the shell's command-position grammar: bash executes
-    command words this pattern does not count, and the pattern counts things bash does not
-    execute. The SUITE's self-test is the specification of what the check can and cannot
-    see, and it is the only list kept here — because this docstring previously carried an
-    ENUMERATED gap list and two of its entries were then FALSIFIED by measurement (one
-    spelling was not executed as claimed, and the `case` over-count held only for the
-    parenthesised/alternation form). An enumeration of the gap re-stales; the self-test does
-    not, because it runs.
+  * It matches the command word through `^`, `|`, `&`, `;`, `(` and a normalised `$(`. That is
+    NOT the shell's command-position grammar: bash executes command words this pattern does
+    not count (a backslash-escaped name, and a continuation between the name and its
+    argument are both VERIFIED), and the pattern counts text bash does not execute. THE GAP
+    IS A CLASS AND IS NOT ENUMERATED. This docstring carried an enumerated gap list and two
+    of its entries were then FALSIFIED by measurement — one spelling was not executed as
+    claimed, and the `case` over-count held only for the parenthesised/alternation form — so
+    the list was DELETED rather than corrected a fourth time. The suite's self-test is the
+    specification of what the check CAN see; nothing here bounds what it MISSES.
 
 Therefore it does NOT establish "no unqualified invocation exists", and no text scan can:
 the property is about the shell's grammar, which is not a regular language. What it does

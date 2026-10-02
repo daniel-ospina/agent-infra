@@ -650,7 +650,7 @@ echo "── 19. STATIC GUARD: no UNQUALIFIED invocation of head/tail/openssl in
 # count (`\tail`, a continuation after the name, `tail""`, `{ tail; }`, `case ... x) tail`,
 # `then`/`do`/`else`, backticks, a quoted command word, `v=1 tail`, `! tail`), and it
 # over-counts heredoc bodies and array elements. Those are given as the SHAPE of the gap,
-# not as an inventory. See lib_scan.py's header.
+# not as an inventory. See lib_scan.py's header for why the gap is a class, not a list.
 # SELF-TEST FIRST: a fixture pinning both directions, so the check cannot silently go blind.
 QS="$TMP/qual-selftest.sh"
 {
@@ -970,15 +970,17 @@ UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
 echo "── 20. The base-ANCESTOR tolerance is DECLARED and PINNED (do not 'fix' it into a false refusal)"
 # A head whose TREE carries content in no reviewed commit and not in the base tip, but in a base
-# ANCESTOR, IS carried — by design. The reason is the LANE DIMENSION, not the rendered patch:
-# the head is the AUTOMATIC merge of `reviewed` with a base-LINEAGE commit, so everything the
-# head adds beyond base lineage comes from the commit the review approved; and at landing time
-# the merge base of the head and the base tip is that same base-lineage commit, so every file
-# the LANE did not modify resolves to the base TIP's version. This section pins all of that.
-# It also pins the case a "tighten it" fix would break: a base ancestor that edits a line inside
-# the LANE's hunk CONTEXT makes the RENDERED PATCH CHANGE while the carry is still correct —
-# which is why byte-identity cannot be the reason (§2982's arm already covers that case, and
-# would be sufficient if it were). Two fixtures, because one cannot distinguish the two.
+# ANCESTOR, IS carried — by design, and the reason is the LANE dimension rather than the rendered
+# patch. WHAT THIS SECTION ACTUALLY ASSERTS, and nothing more: the preconditions (the head's blob
+# for the file is in neither the reviewed nor the base-tip tree; the head's second parent is an
+# OLDER ancestor, not the tip); that the head is CARRIED; that the base TIP's version of the
+# LANE-UNTOUCHED file survives the landing merge; and that comparing against the base TIP instead
+# would refuse. §20b then pins the case a "tighten it" fix would break — a base ancestor editing
+# a line inside the LANE's hunk CONTEXT makes the RENDERED PATCH CHANGE while the carry is still
+# correct, which is why byte-identity cannot be the reason (§2982's arm would suffice if it
+# were). An earlier draft of this comment said the section "pins all of" a landing THEOREM; it
+# pins the properties listed, by measurement, and no theorem — the theorem-form claim was false
+# (a fabricated head passes all five clauses with a different merge base).
 D="$(new_repo c20ancestor)"; cd "$D" || exit 2
 REVIEWED="$(git rev-parse HEAD)"
 B0="$(git rev-parse main)"
@@ -1029,10 +1031,8 @@ git cat-file -e "$LANDED:leaked.env" 2>/dev/null \
 
 # ── 20b. The case that makes byte-identity IMPOSSIBLE as the reason: a base ancestor that edits
 # a line inside the LANE's hunk CONTEXT. The rendered patch CHANGES; the carry is still correct.
-# Built inline rather than with new_repo: new_repo leaves `pr` AHEAD of `main`, so a base edit
-# cannot be fast-forwarded into `pr`, and the first two drafts of this fixture (a) committed the
-# base content on the wrong branch and then (b) produced a CONFLICTED merge, which made the
-# section vacuous — and a vacuous fixture passes for the wrong reason.
+# Built inline because this fixture needs a MULTI-LINE file whose line 3 is the LANE's hunk
+# context, and new_repo's shared.txt is a single line.
 D2="$TMP/c20context"; rm -rf "$D2"; mkdir -p "$D2"; cd "$D2" || exit 2
 git init -q .; git config user.email t@t; git config user.name t
 printf 'a\nb\nc\n' > shared.txt; printf 'base\n' > other.txt
