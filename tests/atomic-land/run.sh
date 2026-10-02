@@ -989,6 +989,16 @@ new_scen strictunreadable
 printf 'BEHIND\n' > "$SCEN/state"
 # NO $SCEN/strict fixture: the read 404s/403s, exactly as it does when protection is
 # unconfigured or the token has no admin on the repo.
+#
+# ⛔ THIS FIXTURE IS LOAD-BEARING FOR MUTATION B19 — do not remove it. With the
+# `mergeable` fixture ABSENT, the fake answers `UNKNOWN` (the fail-closed default), so a
+# rail that wrongly treated an unreadable `strict` as `false` would STILL not skip — and
+# B19 would silently stop reddening. MEASURED in CI (the `admin-merge` job): B19 reported
+# "did NOT redden the suite" for exactly this reason, because the fail-closed default was
+# introduced by the round-2 review and B19 was last verified BEFORE it. Pinning
+# `mergeable` to a mergeable token makes the `strict` read the ONLY thing that can decide
+# this scenario — which is what B3 claims to test and what B19 claims to cover.
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
 SCEN_RECORD_LOG=1
 run_rail 42 --repo "$REPO" --poll 0
 called "pr update-branch" \
