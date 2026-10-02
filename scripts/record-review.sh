@@ -576,17 +576,21 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # `command` in this file at once; `builtin` is shadowable the same way, so `builtin command`
   # is no better. There is therefore NO shell-level way to guarantee an un-intercepted
   # external from inside the script, and no list of names can make one.
-  # WHAT THE `command` PREFIXES ARE ACTUALLY FOR: an ACCIDENTAL shadow — a stale exported
-  # function left in an operator's environment, which is not hypothetical (an exported `gh`
-  # did exactly that and is why `command gh` exists). They are defence in depth against
-  # accident, NOT a security boundary.
-  # THE REAL TRUST BOUNDARY: the environment this script runs in. `python3`, `awk`, `grep`,
-  # `sed`, `cut`, `tr`, `tail`, `jq`, `cat`, `mktemp`, `date`, `$GATE_KEY` (in this process's
-  # memory) and the review record itself are all writable by an actor who controls it, and
-  # such an actor can write the record directly. That boundary is DECLARED, not defended.
-  # NO ENUMERATION IS ATTEMPTED HERE, and that is deliberate: earlier versions of this note
-  # listed "the remaining surface" and were wrong every time (they omitted `head`, then
-  # `tail`), because the surface is "everything", and a list of it re-stales.
+  # WHAT THE `command` PREFIXES ARE ACTUALLY FOR, stated without flattering them: they narrow
+  # a shadow to FUNCTION-named invocations. The recorded instance that added `command gh` was
+  # ADVERSARIAL, not an operator accident — a cycle-8 reviewer exported a `gh` function to
+  # mint a signed marker — so they did not stop that actor and would not stop another. Their
+  # real value is narrow and unglamorous: a non-adversarial shadow (some other tool exporting
+  # a `head`, say) cannot silently flip a verdict. Defence in depth, NOT a security boundary.
+  # THE REAL TRUST BOUNDARY: the environment this script runs in. EVERY external it invokes,
+  # `$GATE_KEY` in this process's memory, and the review record itself are reachable by an
+  # actor who controls it, and such an actor can write the record directly.
+  # NO LIST OF THE REMAINING SURFACE IS GIVEN, here or below, and that is now ENFORCED by
+  # keeping it out of the prose rather than intended: earlier versions enumerated "what is
+  # left" and were wrong EVERY time (they omitted `head`; then omitted `tail`, `wc`,
+  # `dirname`, `rm`, `mv`, `mkdir`, `env`, and contradicted themselves two lines later). The
+  # surface is "everything the script runs", and any list of it re-stales. Enumerating it
+  # would be the same mistake a fourth time.
   # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
   # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
   # 40-hex, so the shape check does not stop it).

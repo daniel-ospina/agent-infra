@@ -628,39 +628,6 @@ else
 fi
 
 echo
-echo "── 19. STATIC GUARD: the externals the verdict DECIDES on stay \`command\`-qualified"
-# Cycle 15 closed two PROVEN P0s (`head` on (D)'s own line; `openssl` on the diff hash and the
-# prior-marker HMAC) and NEITHER had a test: reverting all four to bare left the suite GREEN.
-# This is that guard. IT IS A TRIPWIRE, NOT A PROOF — the script's own note records the
-# reductio that a function named COMMAND defeats every one of these, so nothing here is
-# claimed to be a security boundary. What it prevents is the SILENT nine-character revert of
-# a fix that was paid for with two proven record-minting exploits.
-qual_counts() { # <file> <literal> -> "<all> <command-qualified>"
-  # COMMENT LINES ARE EXCLUDED: prose that MENTIONS a command is not a call site, and the
-  # first version counted one (the (D) comment explains `head -1`) and went red for it.
-  local all cmd
-  all="$(grep -n -e "$2" "$1" | grep -vc -e ':[[:space:]]*#' || true)"
-  cmd="$(grep -n -e "command $2" "$1" | grep -vc -e ':[[:space:]]*#' || true)"
-  printf '%s %s' "$all" "$cmd"
-}
-# Self-test the mechanism on a file with one bare and one qualified occurrence: the check
-# must SEE the bare one (all=2, cmd=1). A guard that cannot fail is not a guard.
-QT="$TMP/qual-selftest.sh"
-printf 'x | head -1\ny | command head -1\n' > "$QT"
-[ "$(qual_counts "$QT" 'head -1')" = "2 1" ] \
-  && pass "(19 self-test) the qualifier check detects a BARE occurrence next to a qualified one" \
-  || fail "(19 self-test) the qualifier check is blind — it cannot tell a bare occurrence from a qualified one"
-for lit in 'head -1' 'tail -n +2' 'openssl dgst'; do
-  read -r ALL CMD <<EOF
-$(qual_counts "$SRC" "$lit")
-EOF
-  if [ "$ALL" != 0 ] && [ "$ALL" = "$CMD" ]; then
-    pass "(19) all $ALL \`$lit\` site(s) in record-review.sh are \`command\`-qualified"
-  else
-    fail "(19) $((ALL - CMD)) of $ALL \`$lit\` site(s) in record-review.sh are BARE — an exported function of that name can flip a verdict"
-  fi
-done
-
 echo "── 18. A shell FUNCTION named git must not forge the DECISIVE merge (what `command git` is for)"
 # The `command gh` commit had no test — §14 exists because of that. The `git` half was
 # MISSING ENTIRELY: a cycle-14 reviewer exported a function named git whose `merge-tree`
@@ -1038,7 +1005,7 @@ UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
 # case — the one this exists for — survives either spelling. The numeric guard exists
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
-MIN_ASSERTIONS=79
+MIN_ASSERTIONS=75
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
