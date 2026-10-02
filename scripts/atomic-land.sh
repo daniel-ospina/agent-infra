@@ -58,6 +58,12 @@
 #     (404/403/`null`/empty: protection unconfigured, or a token without admin on
 #     the repo) keeps the refresh exactly as it was. The merge and the record never
 #     consult it. ATOMIC_LAND_REFRESH_ALWAYS=1 restores the unconditional refresh.
+#     The gate applies to the BEHIND arm ONLY: the base-drift arm below remains
+#     conditional on behind_by > 0 and is NOT gated on this predicate, because it
+#     exists for the #1533 case — a BLOCKED branch whose drift red could never
+#     resolve without an update — and a BLOCKED PR is still `mergeable: true` (no
+#     conflicts; it has a red required leg). Gating that arm would skip exactly the
+#     refresh #1533 needed.
 #   * No accepted-verdict review record → refuse before any mutation.
 #   * A draft → refuse before any CI work (`gh` refuses to merge a draft).
 #   * A changed/unprovable diff → the record step refuses (exit 3) → STOP.
@@ -483,6 +489,14 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       # assume it (see strict_of()). A PR that is positively mergeable under
       # strict=false is already landable, so moving its head buys no mergeability
       # and costs a record invalidation + a full CI run + up to 5400s of waiting.
+      #
+      # WHY THIS ARM AND NOT THE BASE-DRIFT ARM BELOW: the drift arm is already
+      # conditional (behind_by > 0) and exists for #1533 — a BLOCKED branch whose
+      # drift red could never resolve without an update. A BLOCKED PR is still
+      # `mergeable: true` (no conflicts, but a red required leg), so applying this
+      # predicate there would skip precisely the refresh #1533 needed. This arm is
+      # where the update is UNCONDITIONAL — it fires on the enum alone — and that is
+      # the blast radius measured in #1565.
       if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
         say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
       else
