@@ -245,8 +245,187 @@ def scan_flow_state(text_part, depth, quote):
     return depth, quote
 
 
+# ── #1542: the trigger's FILTERS decide measurability, not just its name ─────
+# A trigger NAME alone cannot answer "can this workflow attach a check to THIS
+# PR's head sha?". Two limbs:
+#   OVER-BLOCK — `pull_request` with a `paths:` filter that the PR's changed set
+#     cannot match never runs for that PR, so it cannot have measured the red we
+#     are comparing it against.
+#   FAIL-OPEN  — a `push:` with NO `branches` filter DOES run on a PR's head
+#     branch, so its checks CAN attach; exempting its base red exempts a red the
+#     PR could have measured. The fail-open dominates: a fix that closes only the
+#     over-block would leave this gate MORE permissive than it is now.
+# BOTH inputs are optional env vars. ABSENT MEANS UNDECIDABLE, NOT EMPTY: with no
+# changed set a filtered `pull_request` is `unknown` (which the caller treats as
+# blocking), never `no`. Only an affirmative, *measured* mismatch exempts.
+PR_HEAD_BRANCH = os.environ.get("PR_HEAD_BRANCH") or None
+_raw_paths = os.environ.get("PR_CHANGED_PATHS")
+PR_CHANGED_PATHS = [p for p in _raw_paths.split("\n") if p.strip()] if _raw_paths else None
+
+_FILTER_KEYS = {"paths", "paths-ignore", "branches", "branches-ignore",
+                "tags", "tags-ignore"}
+
+
+def collect_filters(lines, on_index):
+    """{trigger: {filter_key: [patterns]}} for the BLOCK form, else None.
+
+    Returns None when the region does not fit the shape this reads, and the
+    caller then fails closed PER TRIGGER. It reads only a depth-1 `trigger:`, a
+    depth-2 filter key under it, and `- 'pattern'` items (or an inline `[a, b]`).
+    Anything else — an inline value on the trigger key, a deeper nesting, a
+    non-list scalar — abandons the attribution rather than guessing it.
+    """
+    out = {}
+    cur_trig = None
+    cur_filter = None
+    base = None
+
+    def _unquote(s):
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+            return s[1:-1]
+        return s
+
+    for raw in lines[on_index + 1:]:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if raw[:1] not in (" ", "\t"):
+            break
+        indent = len(raw) - len(raw.lstrip(" \t"))
+        s = raw.strip()
+        if base is None:
+            base = indent
+        if indent == base:
+            m = _BLOCK_KEY_RE.match(raw)
+            if not m:
+                return None
+            cur_trig = m.group(2) if m.group(2) is not None else (
+                m.group(3) if m.group(3) is not None else m.group(4))
+            cur_filter = None
+            out.setdefault(cur_trig, {})
+            rest = (m.group(5) or "").strip()
+            if rest and rest not in ("|", ">"):
+                return None  # an inline value on the trigger key
+            continue
+        if cur_trig is None:
+            return None
+        if s.startswith("-"):
+            # A list item. It is a FILTER pattern only when it follows a filter
+            # key we read; a list under some other key (`schedule: - cron: …`) is
+            # not ours to interpret, and bailing to `None` for it would fail
+            # EVERY trigger closed (a `push` alongside a `schedule` would stop
+            # being exempt). Ignore it and keep reading.
+            if cur_filter in _FILTER_KEYS:
+                out[cur_trig].setdefault(cur_filter, []).append(_unquote(s[1:].strip()))
+            continue
+        m = _BLOCK_KEY_RE.match(raw)
+        if not m:
+            return None
+        cur_filter = m.group(2) if m.group(2) is not None else (
+            m.group(3) if m.group(3) is not None else m.group(4))
+        rest = (m.group(5) or "").strip()
+        pats = []
+        if rest.startswith("["):
+            if not rest.endswith("]"):
+                return None
+            for part in rest[1:-1].split(","):
+                part = part.strip()
+                if part:
+                    pats.append(_unquote(part))
+        elif rest and rest not in ("|", ">"):
+            return None
+        out[cur_trig][cur_filter] = pats
+    return out
+
+
+def _glob_re(pat):
+    """A GitHub filter pattern as a regex. `**` spans `/`, `*`/`?` do not."""
+    out = []
+    i, n = 0, len(pat)
+    while i < n:
+        c = pat[i]
+        if c == "*":
+            if i + 1 < n and pat[i + 1] == "*":
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def matches_any(value, patterns):
+    """GitHub's ordered semantics: match a positive, then no `!` pattern."""
+    pos = [p for p in patterns if not p.startswith("!")]
+    neg = [p[1:] for p in patterns if p.startswith("!")]
+    if not pos:
+        return None  # a `!`-only list is not a decidable filter
+    if not any(_glob_re(p).match(value) for p in pos):
+        return False
+    if any(_glob_re(p).match(value) for p in neg):
+        return False
+    return True
+
+
+def matches_multi(values, patterns):
+    for v in values:
+        m = matches_any(v, patterns)
+        if m is None:
+            return None
+        if m:
+            return True
+    return False
+
+
+def trigger_measurable(trig, flt):
+    """True = measurable (blocks) / False = never attaches (exempt) / None = fail closed."""
+    if flt is None:
+        # Filters unattributed (an inline `on:` form, or a shape collect_filters
+        # refused). A PR trigger is measurable whatever it filters on, so `yes`
+        # keeps the pre-#1542 answer; a `push` may be unfiltered and measurable,
+        # and we cannot tell — refuse rather than exempt.
+        return True if trig in PR_TRIGGERS else None
+    if trig in PR_TRIGGERS:
+        if "paths" in flt and "paths-ignore" in flt:
+            return None  # GitHub rejects both; never guess which wins
+        if "paths" in flt:
+            return None if PR_CHANGED_PATHS is None else matches_multi(PR_CHANGED_PATHS, flt["paths"])
+        if "paths-ignore" in flt:
+            if PR_CHANGED_PATHS is None:
+                return None
+            m = matches_multi(PR_CHANGED_PATHS, flt["paths-ignore"])
+            return None if m is None else (not m)
+        return True
+    if trig == "push":
+        # ⛔ NOT PR-EVALUABLE, FILTERED OR NOT — and this is a DECISION, not an
+        # oversight. A `push` workflow runs on a push to a BRANCH; its checks land
+        # on the pushed commit, never on `refs/pull/<N>/merge`, which is the
+        # surface the rail compares. So no `push` run can appear on a PR's
+        # evaluated tree, whether or not it carries a `branches` filter.
+        #
+        # A FIRST DRAFT OF #1542 CLAIMED THIS LIMB WAS A FAIL-OPEN (an unfiltered
+        # `push` runs on a PR's head branch, so its red "could have been
+        # measured"). That claim is WITHDRAWN: it contradicts the contract this
+        # file documents above, and implementing it regressed #6807's merged fix
+        # (9 of 979 admin-merge tests, including #6807's own fixture — the
+        # unfiltered `on: push` `deploy-hosted` — because it stopped exempting
+        # exactly the base reds #6807 was merged to stop refusing). Re-creating
+        # that over-block is worse than the latent risk it was traded for.
+        # If the unfiltered-`push` case is genuinely wanted, it needs its own
+        # issue and a decision — NOT a silent widening here.
+        return False
+    # schedule / workflow_dispatch / issues / … never attach a check to a head.
+    return False
+
+
 if inline:
     triggers = from_inline(inline)
+    filters = None
     if triggers is None:
         sys.stdout.write(UNKNOWN + "\n")
         sys.exit(0)
@@ -323,6 +502,7 @@ else:
         sys.stdout.write(UNKNOWN + "\n")
         sys.exit(0)
     triggers = {k for ind, k in collected if ind == depth}
+    filters = collect_filters(lines, on_index)
 
 if not (triggers & PR_TRIGGERS):
     # SAFETY NET (#6807). The walk may have missed a PR trigger — a column-0
@@ -341,5 +521,11 @@ if not (triggers & PR_TRIGGERS):
             sys.stdout.write(UNKNOWN + "\n")
             sys.exit(0)
 
-sys.stdout.write((YES if (triggers & PR_TRIGGERS) else NO) + "\n")
+# ── #1542: decide PER TRIGGER, and refuse rather than exempt ──────────────
+verdicts = [trigger_measurable(t, (filters or {}).get(t) if filters is not None else None)
+            for t in triggers]
+sys.stdout.write(
+    (YES if any(v is True for v in verdicts)
+     else UNKNOWN if any(v is None for v in verdicts)
+     else NO) + "\n")
 PYEOF
