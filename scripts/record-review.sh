@@ -493,8 +493,13 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 #
 # FAIL-CLOSED: every clause below returns non-zero on any doubt (missing object,
 # unreadable base, merge-tree unavailable, conflict), so the existing refusal path
-# still governs. Nothing here can accept what the old arm rejected except by
-# proving the reviewed artifact unchanged. Replace refs and the grafts FILE, either of
+# still governs. It DOES accept verdicts the #2982 arm rejected — that is its purpose,
+# and the call site prints the reason ("the rendered diff changed"). What it proves is
+# NARROWER than "the reviewed artifact unchanged": it proves the LANE's commits are
+# identical, i.e. the head's tree is exactly a clean merge of the reviewed tree with the
+# head's base parent. An earlier version of this line claimed the opposite and a reviewer
+# falsified it — the claim would have licensed reverting this to a no-op extension.
+# Replace refs and the grafts FILE, either of
 # which could present a different commit graph to this check, are neutralised for its
 # duration below — the two are DIFFERENT mechanisms and need different env vars.
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
@@ -536,7 +541,13 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # was never fetched and never compared to the API, so it could not be trusted.
   # The authority is `.base.sha` from the API. Two things must then hold:
   #   - the head's SECOND PARENT (the base it actually merged) must be reachable
-  #     from that authoritative base, so "base content" means the real base; and
+  #     from that authoritative base, so the head's OTHER parent is base LINEAGE.
+  #     Reachability does NOT bound the head by the base TIP's tree: a commit the
+  #     base tip has since deleted or reverted is still lineage, so a head carrying
+  #     a file the base tip no longer has is base-DERIVED, not unreviewed. MEASURED:
+  #     a head whose only non-reviewed file exists in no reviewed commit and NOT in
+  #     the base tip, but in a base ANCESTOR, is carried — that is intended, and the
+  #     reason is lineage, not "the real base"; and
   #   - the object must be present locally, so the walk below is meaningful.
   # `.base.sha` is the CURRENT base tip, which is normally AHEAD of what the head
   # merged, so it is checked as the ANCESTOR of the head's second parent — not as an
@@ -560,6 +571,24 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # script authors it, so no boundary is left to defend at that point; sanitising the env
   # would add machinery that closes one spelling while a config in the default location still
   # works. That is theatre, not a guard.
+  # A MERGE DRIVER is a RESIDUAL, and it is declared rather than closed because closing it
+  # would REVERSE A RECORDED DECISION. `git merge-tree` obeys .gitattributes, so (D) inherits
+  # the repo's DECLARED merge semantics. tortoise#5373 deliberately sets `merge=union` on
+  # config/ci-surfaces.yml and config/surface-manifest.yml (tortoise/.gitattributes, measured
+  # 2026-09-26: 25 of 44 conflicted PRs conflicted on ci-surfaces.yml alone), and the SAME
+  # file rejects a custom driver. A guard requiring the merged tree's BLOBS to be verbatim
+  # copies of the inputs was proposed and MEASURED to REFUSE a legitimately union-merged
+  # head — i.e. it would break the carry on exactly the two append-only registries most
+  # lanes touch. So the fix would be worse than the vector. WHAT THE VECTOR ACTUALLY IS:
+  # `merge=union` DOES emit a blob present in NEITHER input (measured), and a custom driver
+  # (`.git/config`, or the equally local `.git/info/attributes`) can emit content from NO
+  # ancestor at all. WHAT IT IS NOT, for an actor who can only PUSH A BRANCH: the built-in
+  # drivers reachable from a TRACKED .gitattributes are text/union/binary, and NONE can
+  # invent a LINE — union keeps both sides' lines, binary conflicts (and a conflict is
+  # refused by the rc check), text merges — so content purity holds. The inventing case needs
+  # a write under .git/, which is this script's OWN trust surface: a local writer can forge
+  # the review body this function reads, so no boundary is left there to defend. §17 of the
+  # suite pins the tolerance so a future blob-level "fix" reddens instead of landing.
   # Reject everything that is not a 40-hex sha, exactly as the head fetch above does.
   # Empty/null/error-body already failed closed (measured), but any non-empty string
   # that happens to resolve as a LOCAL revision was accepted as "the authoritative

@@ -653,17 +653,62 @@ import re, sys
 # CURRENT_HEAD="$("gh" api ...)" (a quoted word IS intercepted by a function) and
 # `gh \<newline> api ...` — with the guard still reporting 0.
 src = re.sub(r"\\\n", " ", open(sys.argv[1]).read())
-rx = re.compile(r'(?<![\w-])["\']?gh["\']?\s+(?=(?:api|repo|auth|run|pr|issue)\b)')
+
+
+def code_only(ln):
+    """Cut an UNQUOTED trailing comment, and BLANK the content of quoted strings.
+
+    A reviewer measured two holes in the previous cut, re.sub(r"\\s+#.*$"):
+      * an in-string `#` is not a comment, so `X="a # b"; gh api q` lost everything
+        from the `#` and a REAL bare gh went uncounted; and
+      * with the subcommand allowlist dropped, quoted PROSE that names gh (`gh
+        missing`, `gh or API failure`) and the lookup `command -v gh` were counted —
+        false positives that made the guard red for the wrong reason.
+    Blanking string CONTENT excludes the prose case without an ad-hoc word list, while
+    a quoted token that is EXACTLY gh (`"gh" api q`) is kept: a function intercepts a
+    quoted command word, so that IS a real invocation."""
+    out, i = [], 0
+    while i < len(ln):
+        c = ln[i]
+        if c in ("'", '"'):
+            j = i + 1
+            while j < len(ln):
+                if c == '"' and ln[j] == "\\":
+                    j += 2
+                    continue
+                if ln[j] == c:
+                    break
+                j += 1
+            tok = ln[i:j + 1]
+            out.append(tok if tok in ('"gh"', "'gh'") else ('""' if c == '"' else "''"))
+            i = j + 1
+            continue
+        if c == "#" and (i == 0 or ln[i - 1] in " \t"):
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+# NO SUBCOMMAND ALLOWLIST: a function named gh intercepts `gh <anything>`, so
+# restricting the pattern to api|repo|auth|run|pr|issue left every other subcommand
+# uncounted — a re-introduction spelling `gh secret list` reported 0.
+rx = re.compile(r'(?<![\w/-])["\']?gh["\']?(?=[\s$)])')
 n = 0
 for ln in src.split("\n"):
     if ln.lstrip().startswith("#"):
         continue
-    code = re.sub(r"\s+#.*$", "", ln)
+    code = code_only(ln)
     for m in rx.finditer(code):
+        before = code[:m.start()].rstrip()
         # `command` must itself start a WORD: a plain endswith("command") also accepts
-        # `X=command gh api`, which is a bare invocation.
-        if not re.search(r"(^|[\s(|&;])command$", code[:m.start()].rstrip()):
-            n += 1
+        # `X=command gh api`, which IS a bare invocation and must be counted.
+        if re.search(r"(^|[\s(|&;])command$", before):
+            continue
+        # `command -v gh` is a LOOKUP, not an invocation.
+        if re.search(r"(^|[\s(|&;])command\s+-[vV]$", before):
+            continue
+        n += 1
 print(n)
 PY
 }
@@ -673,8 +718,17 @@ ST="$TMP/bare-gh-selftest.sh"
 printf '  if gh api x\n    | command gh api y\nX=command gh api z\n' > "$ST"
 printf '"gh" api q\n' >> "$ST"
 printf 'gh \\\n    api r\n' >> "$ST"
-[ "$(bare_gh_count "$ST")" = 4 ] \
-  && pass "(15 self-test) the counter catches an INDENTED bare gh, \`X=command gh\`, a QUOTED \`\"gh\"\`, and a \\-continued gh; and ignores a real \`command gh\`" \
+# A `#` inside a STRING is not a comment, so this is a REAL bare gh; the old cut stripped
+# from the `#` and never saw it. And a subcommand OUTSIDE the old allowlist must count.
+printf 'X="a # b"; gh api q\n' >> "$ST"
+printf '  gh secret list\n' >> "$ST"
+# CONTROLS — these must NOT count. The reviewer measured that the previous self-test
+# pinned a fixed number and therefore could not see the counter go blind OR go over-eager:
+# quoted PROSE that names gh, and the `command -v gh` LOOKUP, are not invocations.
+printf 'echo "gh missing"\n' >> "$ST"
+printf 'command -v gh >/dev/null 2>&1\n' >> "$ST"
+[ "$(bare_gh_count "$ST")" = 6 ] \
+  && pass "(15 self-test) the counter catches all six bare-gh spellings (indented, X=command gh, quoted, backslash-continued, after an in-string #, and a subcommand outside the old allowlist) and ignores a real command gh" \
   || fail "(15 self-test) the counter is broken — it cannot detect an indented bare gh (the false-PASS the grep had)"
 BARE_GH="$(bare_gh_count "$SRC")"
 [ "$BARE_GH" = 0 ] \
@@ -724,7 +778,53 @@ else
   fail "mutation NOANCESTOR: could not apply it — coverage is blind"
 fi
 
-MIN_ASSERTIONS=61
+echo "── 17. A UNION-MERGED head is TOLERATED (a RECORDED DECISION, pinned against a wrong 'fix')"
+# (D) compares `merge-tree(reviewed, p2)` to the head's tree, and `git merge-tree` OBEYS
+# .gitattributes — so the arm inherits the repo's DECLARED merge semantics. tortoise#5373
+# deliberately sets `merge=union` on config/ci-surfaces.yml and config/surface-manifest.yml
+# (44 of 130 open PRs conflicted; 25 on ci-surfaces.yml alone) and the SAME file REJECTS a
+# custom driver. A cycle-10 reviewer found that a merge DRIVER can make merge-tree emit a blob
+# present in NEITHER input, and proposed requiring every merged blob to be a verbatim copy of
+# an input. MEASURED: that guard would REFUSE a legitimately union-merged head — break the
+# carry on exactly the two append-only registries most lanes touch — so the "fix" would be
+# worse than the vector. This section pins the tolerance: add the blob check and it reddens.
+# The inventing case needs a write under .git/ (.git/config, .git/info/attributes), which is
+# this script's OWN trust surface (a local writer can forge the review body it reads); the
+# built-ins reachable from a TRACKED .gitattributes cannot invent a LINE, so content purity
+# holds for an actor who can only push a branch. Both facts are recorded in the script.
+D="$(new_repo c17union)"; cd "$D" || exit 2
+printf 'f.txt merge=union\n' > .gitattributes
+printf 'top\n  lane\n' > f.txt
+git add -A; git commit -qm "union for f.txt, plus the lane's change"
+REVIEWED="$(git rev-parse HEAD)"
+# The base changes the SAME region — under a NORMAL merge this CONFLICTS.
+( cd "$D" || exit 9
+  git checkout -q main
+  printf 'f.txt merge=union\n' > .gitattributes
+  printf 'top\n  base\n' > f.txt
+  git add -A; git commit -qm "base changes the same region"
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+P2="$(git rev-parse main)"
+MT="$(git merge-tree --write-tree "$REVIEWED" "$P2" 2>/dev/null)"; MTRC=$?
+CURRENT="$(git commit-tree "$MT" -p "$REVIEWED" -p "$P2" -m head 2>/dev/null)"
+git update-ref refs/heads/pr "$CURRENT"
+git checkout -q pr
+UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
+{ [ "$MTRC" = 0 ] && [ -n "$UB" ] && [ "$UB" != "$(git rev-parse "$REVIEWED:f.txt")" ] && [ "$UB" != "$(git rev-parse "$P2:f.txt")" ]; } \
+  && pass "(17) PRECONDITION: merge-tree ran CLEAN and emitted a blob that is NEITHER input's — union really synthesised it" \
+  || fail "(17) fixture is VACUOUS: no synthesis happened (rc=$MTRC), so union tolerance is not being tested"
+[ "$(git rev-parse "$CURRENT^{tree}" 2>/dev/null)" = "$MT" ] \
+  && pass "(17) (D) passes by construction — the head tree IS the union merge tree" \
+  || fail "(17) fixture is wrong: (D) would refuse, so the tolerance is not isolated"
+[ "$(git rev-list --no-merges "$REVIEWED..$CURRENT" --not refs/heads/main | wc -l | tr -d ' ')" = 0 ] \
+  && pass "(17) (C2) is EMPTY — the head has no lane commits, so the arm's other clauses hold too" \
+  || fail "(17) fixture is wrong: (C2) is not empty"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
+  && pass "CARRY (0) — a union-merged base move is carried, per tortoise#5373's declared semantics" \
+  || fail "REFUSED a legitimately union-merged head — a blob-level purity check here would break the append-only registries"
+
+MIN_ASSERTIONS=65
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
