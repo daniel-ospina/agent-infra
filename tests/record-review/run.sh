@@ -698,11 +698,28 @@ def executable_text(s):
                 if s[k] == '"':
                     break
                 if s.startswith("$(", k):
-                    k0, depth, k = k, 0, k + 2
+                    # QUOTE-AWARE. A reviewer measured `X="$(echo 'a)b'; gh api q)"`
+                    # counting 0: the `)` inside the quoted run closed the substitution
+                    # early, and the real `gh` after it was blanked as inert text while
+                    # bash executed it. Skip quoted runs so only an unquoted `)` closes.
+                    k0, depth, k, qq = k, 0, k + 2, None
                     while k < n:
-                        if s[k] == "(":
+                        ch = s[k]
+                        if qq is not None:
+                            if ch == "\\" and qq == '"':
+                                k += 2
+                                continue
+                            if ch == qq:
+                                qq = None
+                            k += 1
+                            continue
+                        if ch in ("'", '"'):
+                            qq = ch
+                            k += 1
+                            continue
+                        if ch == "(":
                             depth += 1
-                        elif s[k] == ")":
+                        elif ch == ")":
                             if depth == 0:
                                 break
                             depth -= 1
@@ -731,7 +748,7 @@ def executable_text(s):
 # restricting the pattern to api|repo|auth|run|pr|issue left every other subcommand
 # uncounted — a re-introduction spelling `gh secret list` reported 0.
 code = executable_text(src)
-rx = re.compile(r'(?<![\w/-])["\']?gh["\']?(?=[\s$)])')
+rx = re.compile(r'(?<![\w/-])["\']?gh["\']?(?=[\s$);|&>])')
 n = 0
 for m in rx.finditer(code):
     line_start = code.rfind("\n", 0, m.start()) + 1
@@ -767,8 +784,12 @@ printf 'command -v gh >/dev/null 2>&1\n' >> "$ST"
 # The EXACT shape of the head read this guard protects, and the spelling the previous
 # version was blind to: `$( )` inside double quotes IS executed. Must COUNT.
 printf 'CURRENT_HEAD="$(gh api q)"\n' >> "$ST"
-[ "$(bare_gh_count "$ST")" = 7 ] \
-  && pass "(15 self-test) the counter catches all SEVEN bare-gh spellings, including a command substitution INSIDE double quotes (the head read's exact shape), and does not count the two controls" \
+# A `)` INSIDE A QUOTED RUN within a substitution must not close it early (was 0).
+printf 'X="$(echo '\''a)b'\''; gh api q)"\n' >> "$ST"
+# A command separator other than whitespace/`$`/`)` after gh (all were 0).
+printf 'gh;api q\n' >> "$ST"
+[ "$(bare_gh_count "$ST")" = 9 ] \
+  && pass "(15 self-test) the counter catches all NINE bare-gh spellings (including a command substitution inside double quotes, a quoted close-paren within one, and a semicolon separator) and does not count the two controls" \
   || fail "(15 self-test) the counter is broken — it cannot detect an indented bare gh (the false-PASS the grep had)"
 BARE_GH="$(bare_gh_count "$SRC")"
 [ "$BARE_GH" = 0 ] \

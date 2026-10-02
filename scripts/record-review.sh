@@ -541,11 +541,12 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # was never fetched and never compared to the API, so it could not be trusted.
   # The authority is `.base.sha` from the API. Two things must then hold:
   #   - the head's SECOND PARENT (the base it actually merged) must be reachable
-  #     from that authoritative base, so the head's SECOND parent — the base it actually
-  #     merged — is base LINEAGE. (It says nothing about the head's FIRST parent: that is
-  #     the reviewed lane commit, and bounding it is (B)'s job. An earlier rewrite of this
-  #     line said "the head's OTHER parent", which inverted what the check proves — a cycle-11
-  #     reviewer caught it, and it is corrected here rather than re-worded.)
+  #     from that authoritative base, so the base the head merged is base LINEAGE.
+  #     This clause claims ONLY that much: it does not constrain the head's FIRST parent,
+  #     and a head whose first parent is itself a merge IS carried (MEASURED with the real
+  #     function — `current^1` was a merge, not the reviewed commit, and the verdict was
+  #     CARRY). Which side is base-derived is settled by (A)/(B)/(C2)/(D), never by the
+  #     shape of `current^1`.
   #     Reachability does NOT bound the head by the base TIP's tree: a commit the
   #     base tip has since deleted or reverted is still lineage, so a head carrying
   #     a file the base tip no longer has is base-DERIVED, not unreviewed. MEASURED:
@@ -589,13 +590,27 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # ancestor at all. WHAT IT IS NOT, for an actor who can only PUSH A BRANCH: the built-in
   # drivers reachable from the WORKING TREE's attributes are text/union/binary, and, AS BUILT
   # IN, none can invent a LINE — union keeps both sides' lines, binary conflicts (rc refused),
-  # text merges. `git merge-tree` reads attributes from the WORKING TREE, not from the merged
-  # trees, so a PR's pushed .gitattributes takes effect once its branch is checked out; and a
-  # config entry can SHADOW a built-in NAME (`merge.union.driver`). The inventing case therefore
-  # needs a write to git's LOCAL CONFIGURATION — the repo's .git/config or .git/info/attributes,
-  # OR the user's global config — which is this script's OWN trust surface: a local writer can
-  # forge the review body this function reads, so no boundary is left there to defend §17 of the
-  # suite pins the tolerance so a future blob-level "fix" reddens instead of landing.
+  # text merges — so no built-in invents a LINE.`git merge-tree` reads attributes from the
+  # WORKING TREE, not from the merged trees, so a PR's pushed .gitattributes takes effect once
+  # its branch is checked out; and a config entry can SHADOW a built-in NAME
+  # (`merge.union.driver`). The inventing case therefore needs a write to git's LOCAL
+  # CONFIGURATION — the repo's .git/config or .git/info/attributes, OR the user's global config
+  # — which is this script's OWN trust surface: a local writer can forge the review body this
+  # function reads, so no boundary is left there to defend.
+  # CONSEQUENCE OF THE WORKING-TREE SOURCE, stated because it is not obvious: the verdict is a
+  # function of the CALLER's checkout, not only of the commits under review. MEASURED — for the
+  # SAME (reviewed, current, base_sha), an UNTRACKED working-tree .gitattributes flips it: with
+  # `f.txt merge=union` present the arm CARRYs (0), with it absent the merge conflicts and the
+  # arm REFUSES (1). Absent attributes therefore fail CLOSED, which is the safe direction, but
+  # anyone reading a verdict must know the checkout is an input to it.
+  # ALSO NAMED: `.base.sha` is trusted as the authority and is NOT checked against
+  # `.base.ref`, so a PR whose base has been REPOINTED to a branch carrying unreviewed content
+  # has that content classified as base and the verdict carries (MEASURED with the real
+  # function: `grep -c base.ref` = 0, and a repointed base yields CARRY with the base branch's
+  # file in the head). That is a SYMPTOM of the known base-blindness already filed for the
+  # clean/clean-micro tiers — agent-infra#1362 — so it is NAMED here rather than re-filed as a
+  # peer. §17 of the suite pins the union tolerance so a future blob-level "fix" reddens
+  # instead of landing.
   # Reject everything that is not a 40-hex sha, exactly as the head fetch above does.
   # Empty/null/error-body already failed closed (measured), but any non-empty string
   # that happens to resolve as a LOCAL revision was accepted as "the authoritative
