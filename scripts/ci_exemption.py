@@ -1547,6 +1547,15 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
             # only form pytest emits for a collection error.
             if _collection_error_id(stripped) is not None:
                 continue
+            # #6917: the SAME rule as `_failed_candidate`, in the SAME order — a
+            # pytest PROGRESS fragment is not a record, so it is not a drop here
+            # either. The module's header promises ONE candidate rule across both
+            # doors; `_SUMMARY_RE`'s nodeid group is `.+?` and accepts `[  2%]`,
+            # so without this the sibling door reported `rejected=1` for a line
+            # the `ids` door had already declined to count — the exact asymmetry
+            # the collection-error intercept above exists to avoid.
+            if _PROGRESS_FRAGMENT_RE.match(nodeid):
+                continue
             rejected.append(stripped)
             continue
         id_list.append(nodeid)
