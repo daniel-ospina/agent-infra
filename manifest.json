@@ -24,6 +24,7 @@
         "session-checks.ts",
         "compaction-watchdog.ts",
         "clamp-output-floor.ts",
+        "secret-echo-guard.ts",
         "provider-exhaustion.ts",
         "carousel-designer.ts",
         "cmux-session.ts",
