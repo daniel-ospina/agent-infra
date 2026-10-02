@@ -121,6 +121,11 @@ if i < 0:
 line = code[code.rfind('\n', 0, i) + 1:code.find('\n', i)]
 if line.lstrip().startswith('#'):
     sys.exit(1)
+# A TRAILING comment counts too: a reviewer showed that a literal occurring only after a
+# ` #` was accepted as an applied mutation (the check above covers only line-leading ones).
+hashpos = line.find(' #')
+if hashpos >= 0 and (i - (code.rfind('\n', 0, i) + 1)) > hashpos:
+    sys.exit(1)
 open(dst, 'w').write(code.replace(frm, to, 1))
 PY
   cmp -s "$3" "$TMP/fn.sh" && return 1
@@ -248,13 +253,15 @@ git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
 LIE_REVIEWED="$REVIEWED"; LIE_CURRENT="$CURRENT"
 
 echo "── 6. MUTATION COVERAGE: the base-authority clause must be load-bearing"
-# A suite that only proves the ACCEPTANCE path lets a fail-open land green. The P0
-# this suite exists to prevent was trusting a LOCAL ref as the base. The fix is TWO
-# redundant clauses — the authoritative base in (C2) AND the head's-second-parent
-# ancestry check — and measured, removing EITHER ONE ALONE still refuses, because the
-# other catches it. That is defence-in-depth, so the mutation must revert BOTH to
-# prove the pair is load-bearing. Written out explicitly rather than patched with a
-# regex, so the mutation is legible and cannot silently fail to apply.
+# A suite that only proves the ACCEPTANCE path lets a fail-open land green. The P0 this
+# suite exists to prevent was trusting a LOCAL ref as the base, and the fix has two parts:
+# the authoritative base in (C2) and the head's-second-parent ancestry check. An earlier
+# version of this comment called them "TWO redundant clauses" and said removing EITHER
+# ALONE still refuses — a reviewer FALSIFIED that: the ancestry check is LOAD-BEARING on a
+# head whose second parent is a hand-built merge of two base commits, which only that check
+# refuses (§16). So this mutation reverts the LOCAL-REF spelling of (C2) TOGETHER WITH the
+# ancestry check, and §16 covers the ancestry check on its own. Written out explicitly
+# rather than patched with a regex, so the mutation is legible and cannot silently fail.
 MUT="$TMP/mut-reverted.sh"
 cat > "$MUT" <<'REVERTED'
 # The FIRST CUT, reverted: trusts the LOCAL remote-tracking ref and has no
@@ -618,11 +625,12 @@ else
 fi
 
 echo
-# AN EXACT PIN (not a floor with slack — an earlier version was a `-lt` floor, and a
-# reviewer measured that a 3-assertion section could still be deleted under it). $PASS only
-# has to be non-zero for the suite to be green, so a whole section can otherwise vanish with
-# no signal. Equality means ANY loss trips it, and so does ADDING an assertion — deliberate,
-# so the number is maintained on purpose rather than drifting. The numeric guard exists
+# AN EXACT PIN (not a floor with slack). $PASS only has to be non-zero for the suite to be
+# green, so a whole section can otherwise vanish with no signal. With MIN equal to the
+# ACTUAL count, `-ne` and a `-lt` floor both catch any LOSS; `-ne` additionally catches an
+# ADDED assertion, which is why it is used. A reviewer noted that nothing catches a silent
+# revert of the comparison to `-lt`; that is stated rather than guarded, because the loss
+# case — the one this exists for — survives either spelling. The numeric guard exists
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
 echo "── 15. STATIC GUARD: no bare \`gh\` invocation may be reintroduced"
@@ -640,15 +648,20 @@ echo "── 15. STATIC GUARD: no bare \`gh\` invocation may be reintroduced"
 bare_gh_count() { # <file> -> number of gh INVOCATIONS not using `command `
   python3 - "$1" <<'PY'
 import re, sys
-rx = re.compile(r"gh\s+(?=(?:api|repo|auth|run|pr|issue)\b)")
+# Join \-continuations first, and allow the command word to be QUOTED: a reviewer
+# reintroduced the exact HEAD read twice with spellings this scan missed —
+# CURRENT_HEAD="$("gh" api ...)" (a quoted word IS intercepted by a function) and
+# `gh \<newline> api ...` — with the guard still reporting 0.
+src = re.sub(r"\\\n", " ", open(sys.argv[1]).read())
+rx = re.compile(r'(?<![\w-])["\']?gh["\']?\s+(?=(?:api|repo|auth|run|pr|issue)\b)')
 n = 0
-for ln in open(sys.argv[1]).read().split("\n"):
+for ln in src.split("\n"):
     if ln.lstrip().startswith("#"):
         continue
     code = re.sub(r"\s+#.*$", "", ln)
     for m in rx.finditer(code):
-        # `command` must itself start a WORD: a verifier noted that a plain endswith(
-        # "command") also accepts `X=command gh api`, which is a bare invocation.
+        # `command` must itself start a WORD: a plain endswith("command") also accepts
+        # `X=command gh api`, which is a bare invocation.
         if not re.search(r"(^|[\s(|&;])command$", code[:m.start()].rstrip()):
             n += 1
 print(n)
@@ -658,15 +671,60 @@ PY
 # bare `if gh api` must be counted (the case the grep missed) and `command gh` must not.
 ST="$TMP/bare-gh-selftest.sh"
 printf '  if gh api x\n    | command gh api y\nX=command gh api z\n' > "$ST"
-[ "$(bare_gh_count "$ST")" = 2 ] \
-  && pass "(15 self-test) the counter catches an INDENTED bare \`if gh api\` AND \`X=command gh api\`, and ignores a real \`command gh\`" \
+printf '"gh" api q\n' >> "$ST"
+printf 'gh \\\n    api r\n' >> "$ST"
+[ "$(bare_gh_count "$ST")" = 4 ] \
+  && pass "(15 self-test) the counter catches an INDENTED bare gh, \`X=command gh\`, a QUOTED \`\"gh\"\`, and a \\-continued gh; and ignores a real \`command gh\`" \
   || fail "(15 self-test) the counter is broken — it cannot detect an indented bare gh (the false-PASS the grep had)"
 BARE_GH="$(bare_gh_count "$SRC")"
 [ "$BARE_GH" = 0 ] \
   && pass "(15) every gh INVOCATION in record-review.sh uses \`command gh\` (occurrence-based count = 0)" \
   || fail "(15) $BARE_GH bare gh invocation(s) in record-review.sh — a shell function named gh can intercept them"
 
-MIN_ASSERTIONS=56
+echo "── 16. The SECOND-PARENT ANCESTRY check is load-bearing on its own (NOT redundant)"
+# §6's comment used to call this clause redundant with (C2) and say removing either alone
+# still refuses. A reviewer FALSIFIED that: on a head whose second parent M is a HAND-BUILT
+# merge of two base commits, (C2) is empty (M is a merge, dropped by --no-merges, and its
+# parents are base commits) and (D) passes by construction — only the ancestry check
+# refuses. M's tree carries an unreviewed file, so the stake is real.
+D="$(new_repo c2ancestor)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+advance_base "$D"
+B2="$(git rev-parse main)"
+B1="$(git rev-parse main^)"
+TI="$(mktemp)"; rm -f "$TI"
+GIT_INDEX_FILE="$TI" git read-tree "$B2^{tree}"
+BLOB="$(printf 'UNREVIEWED\n' | git hash-object -w --stdin)"
+GIT_INDEX_FILE="$TI" git update-index --add --cacheinfo "100644,$BLOB,pwn.txt"
+TREE_PWN="$(GIT_INDEX_FILE="$TI" git write-tree)"
+rm -f "$TI"
+M="$(git commit-tree "$TREE_PWN" -p "$B1" -p "$B2" -m 'hand-built merge of two base commits')"
+MT="$(git merge-tree --write-tree "$REVIEWED" "$M" | head -1)"
+CURRENT="$(git commit-tree "$MT" -p "$REVIEWED" -p "$M" -m head)"
+git update-ref refs/heads/pr "$CURRENT"
+git checkout -q pr
+git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
+  && pass "(16) the head tree really CARRIES the unreviewed file" \
+  || fail "(16) fixture is wrong: the head does not carry pwn.txt, so nothing is at stake"
+[ "$(git rev-list --no-merges "$REVIEWED..$CURRENT" --not refs/heads/main | wc -l | tr -d ' ')" = 0 ] \
+  && pass "(16) (C2) is EMPTY here, so it cannot be what refuses" \
+  || fail "(16) fixture is wrong: (C2) is not empty, so the ancestry check is still not isolated"
+[ "$(git rev-parse "$CURRENT^{tree}")" = "$MT" ] \
+  && pass "(16) (D) passes by construction — the head tree IS the recomputed merge tree" \
+  || fail "(16) fixture is wrong: (D) would refuse, so the ancestry check is not isolated"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "REFUSE (1) — only the second-parent ancestry check can refuse this head" \
+  || fail "CARRIED a head whose second parent is not base-derived — FAIL-OPEN"
+M16="$TMP/mut-noancestor.sh"
+if mutate 'git merge-base --is-ancestor "$p2" "$base_sha" 2>/dev/null || return 1' ':' "$M16"; then
+  [ "$(verdict_with "$D" "$M16" "$REVIEWED" "$CURRENT")" = 0 ] \
+    && pass "mutation NOANCESTOR is caught: dropping the ancestry check CARRIES unreviewed content, so it IS load-bearing on its own" \
+    || fail "mutation NOANCESTOR NOT caught — the ancestry check is not what refuses this head"
+else
+  fail "mutation NOANCESTOR: could not apply it — coverage is blind"
+fi
+
+MIN_ASSERTIONS=61
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
