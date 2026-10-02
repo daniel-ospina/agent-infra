@@ -504,14 +504,6 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 # duration below — the two are DIFFERENT mechanisms and need different env vars.
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
   local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
-  local ltree="" lpath="" lhb="" thb="" rhb="" lpaths="" lland="" lknown="" ldiff=""
-  # Terminates an unterminated blob's last line when the known-line set is built below. A
-  # LITERAL newline, deliberately NOT `$(printf '\n')`: command substitution STRIPS trailing
-  # newlines, so that spelling assigns an EMPTY string and silently restores the very gluing
-  # defect this separates (MEASURED — the suite's §24 caught exactly that, after the fix had
-  # already been written once). Named so a mutation can neutralise it at one site.
-  lsep="
-"
   # Replace refs AND the grafts FILE both rewrite what rev-list, rev-parse and
   # rev-parse^{tree} SEE, so either one can present a different commit graph to this
   # predicate than the one that is really there — reviewers built BOTH and turned a
@@ -705,126 +697,121 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   [ "$mb" = "$p2" ] || return 1
 
   # (C4) THE LANDING MERGE MUST NOT INTRODUCE CONTENT ABSENT FROM BOTH THE BASE TIP AND THE
-  # REVIEWED COMMIT. (C3) fixes the landing merge BASE; it does not constrain the landing
-  # RESULT — and `git merge-tree` OBEYS .gitattributes, so a `merge=union` attribute synthesises
-  # a blob keeping BOTH sides' lines and RE-ADDS what the base tip deleted. MEASURED (round 25):
-  # with `shared.txt merge=union` present, a head satisfying (A)-(D) AND (C3) lands into the
-  # base a line the tip had deleted, and the SAME head without the attribute is REFUSED — so
-  # union is what admits it. §17's union tolerance exists so a legitimately union-merged head
-  # carries (tortoise#5373), and it cannot be closed by forbidding synthesis outright.
-  # WHY THIS IS NOT THE BLOB-PURITY GUARD §17 REJECTS: it inspects the LANDING, and only for
-  # paths where the landing blob is NEITHER the tip's NOR `reviewed`'s — i.e. genuinely merged
-  # paths. There it requires every LINE to come from one of those two. A plain three-way merge
-  # never resurrects a deletion (only the deleting side changed the line, so deletion wins),
-  # which is why #6072/#6213/#4823/#5421 and §20/§20b are untouched; a union merge does, which
-  # is the leak. A first draft of this clause instead required the HEAD's blob on a tip-changed
-  # path to be one of the two inputs, and MEASURED as a FALSE REFUSAL on #6072 — a legitimate
-  # combined merge produces a blob in neither input. That is why the check is here.
-  # BOUNDED ITERATION: only a path the base tip CHANGED relative to p2 can carry a p2-era
-  # deletion for the landing to undo, so walking the whole tree (a first draft did — measured
-  # at ~2000 paths x 3 git calls, past a 90s bound on a real repo) is both needless and a
-  # denial-of-service on the merge gate. Where the tip changed nothing there is no deletion to
-  # resurrect, so the narrowed set IS the whole risk surface. The common case — §17's, where
-  # p2 IS the tip — therefore costs one `git diff --name-only` and nothing else.
-  # `-c core.quotePath=false` is LOAD-BEARING, not cosmetics: the default C-QUOTES any path
-  # with a byte outside printable ASCII (or a `"` or `\`), and a quoted entry resolves against
-  # NOTHING — every lookup below then yields empty, `comm` compares empty with empty, and the
-  # path is silently never inspected. MEASURED (round 26): with `merge=union` on `café.txt` the
-  # landing re-admitted a base-tip-deleted line and the verdict was CARRY, while the ASCII
-  # control of the SAME fixture REFUSED; setting core.quotePath=false flipped the verdict back,
-  # so the clause's behaviour depended on the caller's git config.
-  # `-c diff.relative=false` is the SAME CLASS of defect as the quotePath above and is NOT
-  # cosmetic: `diff.relative` (a documented git config) makes this command report paths relative
-  # to the CALLER'S CWD and OMIT every path outside it, so a leaking path elsewhere in the repo
-  # never enters the set and (C4) is skipped entirely. MEASURED (round 27): with
-  # `diff.relative=true` and the function called from a subdirectory, the union-leak fixture
-  # returned CARRY; the same invocation from the repo root REFUSED; and with the leaking path
-  # inside the cwd the emitted name was cwd-relative and resolved against a DECOY path of the
-  # same name at the root, so the leaking path was never inspected either. It fires from a
-  # `~/.gitconfig` setting. `atomic-land.sh` never cds to the repo root, so the caller's cwd and
-  # config reach this function — which is why both flags are pinned explicitly rather than
-  # inherited.
-  lpaths="$(command git -c core.quotePath=false -c diff.relative=false diff --name-only "$p2" "$base_sha" 2>/dev/null)" || return 1
-  if [ -n "$lpaths" ]; then
-  ltree="$(command git merge-tree --write-tree "$base_sha" "$current" 2>/dev/null)" || return 1
-  ltree="$(printf '%s\n' "$ltree" | command head -1)"
-  [ -n "$ltree" ] || return 1
-  while IFS= read -r lpath; do
-    [ -n "$lpath" ] || continue
-    # THE NAME MUST BE REAL. A path from `git diff --name-only` exists in p2 or in the base
-    # tip by construction, so a name that resolves against NEITHER was not read as a raw name
-    # and every lookup below would silently see nothing. This is the fail-closed backstop to
-    # `core.quotePath=false` above — `git rev-parse <tree>:<path>` PRINTS the argument and exits
-    # 128 on failure, so the previous `[ -n "$lhb" ]` test could never fire.
-    # TWO DECLARED TOLERANCES, both FAIL-CLOSED (a false refusal, never a wrong carry), both
-    # MEASURED (round 27): (i) git C-quotes `\`, `"` and control characters EVEN with
-    # quotePath=false, so a clean base-only move touching such a name is refused — as is one
-    # touching a SUBMODULE path, because `git cat-file -e <rev>:<sub>` fails when the gitlink's
-    # commit is absent from the superproject, which is the normal case. Neither repository in
-    # this fleet has submodules and neither has such a filename. `-z` with `read -d ''` would
-    # remove both, at the cost of a scratch file (command substitution STRIPS NULs, so `-z`
-    # cannot be captured in a variable).
-    command git cat-file -e "$p2:$lpath" 2>/dev/null \
-      || command git cat-file -e "$base_sha:$lpath" 2>/dev/null || return 1
-    # Absent from the LANDING is legitimate (the merge took a deletion), so it is not a refusal.
-    lhb="$(command git rev-parse --verify --quiet "$ltree:$lpath" 2>/dev/null)" || continue
-    [ -n "$lhb" ] || continue
-    thb="$(command git rev-parse "$base_sha:$lpath" 2>/dev/null || true)"
-    rhb="$(command git rev-parse "$reviewed:$lpath" 2>/dev/null || true)"
-    # The landing took one side verbatim: nothing new can have entered.
-    { [ "$lhb" = "$thb" ] || [ "$lhb" = "$rhb" ]; } && continue
-    # A genuinely merged blob: every line must exist in the tip's or `reviewed`'s version.
-    # `p2` is DELIBERATELY absent from the known set — a line that only p2 had is exactly the
-    # content the tip deleted, and its reappearance in the landing is the leak.
-    # The newline after each show is LOAD-BEARING: without it a blob that does not end in one
-    # has its final line CONCATENATED with the next blob's first line, so a line that genuinely
-    # IS in the tip or in `reviewed` is reported as new. MEASURED (round 26) as a FALSE REFUSAL
-    # on a clean three-way landing merge with NO attribute at all (tip F ending `...X\nC`, so
-    # `C`+`A` became `CA`). It costs one blank line in the known set, which can only make a BLANK
-    # line in the landing count as known — a blank line carries no content.
-    # THE STATUSES OF THESE PIPELINES ARE LOAD-BEARING, and so is the LOCALE. With an unpinned
-    # locale, BSD `sort` EXITS 2 ("Illegal byte sequence") on a blob containing bytes that are
-    # invalid in that locale and writes NOTHING; the old `[ -z "$(...)" ]` form — which is the
-    # round-16 `head`/`openssl` lesson repeated — DISCARDED that status, so the landing side came
-    # back empty, `comm -23` printed nothing, `[ -z "" ]` was TRUE, and (C4) PASSED. MEASURED
-    # (round 28) on the union-leak fixture with one invalid byte in the file: ambient
-    # `LANG=en_GB.UTF-8` -> CARRY, and the ambient run was INDISTINGUISHABLE from the no-(C4)
-    # mutant, i.e. the clause contributed nothing; `LC_ALL=C` -> REFUSE; and under the real
-    # script's own `set -euo pipefail` the wrong CARRY still happened, because the failure sat
-    # inside `$( )`. The landing re-admitted a line the base tip deleted and that is in no
-    # reviewed commit. Two fixes, matching this file's own convention (`LC_ALL=C` is already
-    # pinned on its other sort pipelines): CHECK THE STATUS, and pin the locale so the comparison
-    # is byte-wise rather than a function of the caller's environment.
-    lland="$(command git show "$ltree:$lpath" 2>/dev/null | LC_ALL=C command sort -u)" || return 1
-    lknown="$({ command git show "$base_sha:$lpath" 2>/dev/null || true
-                printf '%s' "$lsep"
-                command git show "$reviewed:$lpath" 2>/dev/null || true
-                printf '%s' "$lsep"; } | LC_ALL=C command sort -u)" || return 1
-    # ...AND THE THIRD ONE, which round 29 measured still discarded: with `comm` failing and
-    # printing NOTHING, `[ -z "" ]` was TRUE and (C4) PASSED. Reproduced end-to-end on the union
-    # leak with a failing `comm` on PATH (empty stdout -> CARRY, unreviewed line lands), under the
-    # real script's own `set -euo pipefail`. It is a PATH shim to reach, so it is the declared
-    # residual — but a discarded status is a wrong CARRY waiting for a mechanism, and `comm` was
-    # also the only one of this block's externals NOT `command`-qualified, so a shell function
-    # named `comm` defeated it outright. Both are fixed here; every external below is qualified.
-    # ...AND THE PRODUCERS, not just the consumer. Round 29 qualified and status-checked `comm`
-    # and said "every external below is qualified"; round 30 MEASURED that false for these two
-    # `printf`s. `printf` is a bash BUILTIN, so `command printf` does not protect it — a shell
-    # FUNCTION named `printf` shadows it, is inherited by a child bash, is visible inside these
-    # process substitutions, and if it fails (or prints nothing) for the LANDING input only, then
-    # `comm -23` has an empty file1, prints nothing, exits 0, and the status check never fires:
-    # MEASURED on the union leak as a wrong CARRY, including under the real script's own
-    # `set -euo pipefail`. `builtin` is the only spelling that bypasses a function here.
-    # (A `printf` that ALWAYS fails is caught earlier, by (C3)'s non-empty-base check; the attack
-    # must be selective, which is why this is a real but environment-dependent hole — the same
-    # residual class as the exported-function vector the file's boundary paragraph declares.)
-    ldiff="$(LC_ALL=C command comm -23 <(builtin printf '%s\n' "$lland") <(builtin printf '%s\n' "$lknown"))" \
-      || return 1
-    [ -z "$ldiff" ] || return 1
-  done <<EOF
-$lpaths
-EOF
-  fi
+  # REVIEWED COMMIT. (C3) fixes the landing merge BASE; it does not constrain the landing RESULT.
+  #
+  # THIS IS A BYTE-EXACT SEAM, NOT A SHELL PIPELINE, and the reason is measured. Rounds 26-30 each
+  # found a DIFFERENT wrong-CARRY in the shell form — `core.quotePath` C-quoted path names,
+  # `diff.relative` + the caller's cwd, the locale making `sort` exit 2 with empty stdout, the
+  # `comm` exit status discarded inside `[ -z "$( ... )" ]`, and finally a shell FUNCTION named
+  # `printf` shadowing the bash BUILTIN that produced `comm`'s inputs. Six of those eight ambient
+  # inputs existed only because the comparison was expressed in the shell: command substitution
+  # strips NULs and trailing newlines, `sort`/`comm` are locale- and status-sensitive, and path
+  # names have to be quoted and unquoted. The comparison is therefore done in ONE place, in bytes,
+  # where none of those can apply.
+  #
+  # MEASURED against ten hermetic fixtures before this replacement: it agrees with the shell form
+  # on every case where the shell form is RIGHT (union leak / quoted-name leak / locale-invalid
+  # leak / two late-NUL leaks / binary leak all REFUSE; legitimate union carry / quoted-name clean
+  # move / unterminated last line / legitimate binary union carry all CARRY), and it is right in
+  # two places the shell form was WRONG (a locale-invalid leak reached from a subdirectory, and a
+  # quoted-name leak with raw byte names and no quotePath pin).
+  #
+  # DELIBERATELY NO "fail closed on a binary blob" GUARD: the guard was measured to buy nothing —
+  # a leak IS a line absent from tip + reviewed, so byte-exact line comparison already catches the
+  # binary leak — and it produced the ONLY false refusal measured, on a legitimate binary union
+  # carry that the shell form CARRIES. `--no-renames` also retires `diff.renames` as an input.
+  #
+  # FAIL CLOSED everywhere the model cannot represent the state: python3 absent (the heredoc cannot
+  # run), `merge-tree` non-zero (a conflicted landing), a landing entry that is present but not a
+  # readable blob (gitlink/tree/error), or an unreadable tip/reviewed entry. An entry ABSENT from
+  # the landing is legitimate — the merge took a deletion.
+  command python3 - "$reviewed" "$current" "$base_sha" <<'PYC4' || return 1
+import os, subprocess, sys
+
+reviewed, current, base_sha = sys.argv[1], sys.argv[2], sys.argv[3]
+env = dict(os.environ)
+env["GIT_NO_REPLACE_OBJECTS"] = "1"
+env["GIT_GRAFT_FILE"] = "/dev/null"
+env["LC_ALL"] = "C"
+
+
+def git(bargs):
+    p = subprocess.run([b"git"] + bargs, cwd=".", env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return p.returncode, p.stdout
+
+
+def exists(spec):
+    return git([b"cat-file", b"-e", spec])[0] == 0
+
+
+def read_blob(spec):
+    rc, out = git([b"cat-file", b"blob", spec])
+    return out if rc == 0 else None
+
+
+def lines(b):
+    if not b:
+        return set()
+    parts = b.split(b"\n")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    return set(parts)
+
+
+rc, out = git([b"merge-tree", b"--write-tree", base_sha.encode(), current.encode()])
+if rc != 0:
+    sys.stderr.write("(C4) landing merge-tree failed (rc=%d)\n" % rc)
+    sys.exit(1)
+ltree = out.split(b"\n")[0]
+if not ltree:
+    sys.stderr.write("(C4) no landing tree\n")
+    sys.exit(1)
+
+# The path set: every path the base tip changed relative to the head's second parent. Read
+# NUL-separated so no name is ever quoted, and no name can be split or dropped by a shell.
+rc2, out = git([b"rev-parse", current.encode() + b"^2"])
+if rc2 != 0:
+    sys.stderr.write("(C4) no second parent\n")
+    sys.exit(1)
+p2 = out.strip()
+rc3, out = git([b"-c", b"core.quotePath=false", b"-c", b"diff.relative=false",
+                 b"diff", b"--name-only", b"-z", b"--no-renames", p2, base_sha.encode()])
+if rc3 != 0:
+    sys.stderr.write("(C4) path listing failed (rc=%d)\n" % rc3)
+    sys.exit(1)
+paths = [x for x in out.split(b"\0") if x]
+
+for path in paths:
+    lspec = ltree + b":" + path
+    if not exists(lspec):
+        continue
+    landing = read_blob(lspec)
+    if landing is None:
+        sys.stderr.write("(C4) landing entry unreadable: %r\n" % path)
+        sys.exit(1)
+    tip = rev = None
+    for spec, which in ((base_sha.encode() + b":" + path, "tip"),
+                        (reviewed.encode() + b":" + path, "reviewed")):
+        if not exists(spec):
+            continue
+        blob = read_blob(spec)
+        if blob is None:
+            sys.stderr.write("(C4) %s entry unreadable: %r\n" % (which, path))
+            sys.exit(1)
+        if which == "tip":
+            tip = blob
+        else:
+            rev = blob
+    if landing == tip or landing == rev:
+        continue
+    new_lines = lines(landing) - (lines(tip or b"") | lines(rev or b""))
+    if new_lines:
+        sys.stderr.write("(C4) LEAK %r -> %r\n" % (path, sorted(new_lines)[:5]))
+        sys.exit(1)
+
+sys.exit(0)
+PYC4
 
   # (C2) NO LANE COMMITS IN BETWEEN: every intervening commit not reachable from the
   # AUTHORITATIVE base must be a MERGE. A single non-merge commit is lane work and a
