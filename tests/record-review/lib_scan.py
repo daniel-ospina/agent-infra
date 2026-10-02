@@ -10,14 +10,14 @@ than left to inference, because FOUR successive designs of it were measured unso
 honest thing is to name the limit instead of widening it a fifth time:
 
   * It matches the command word through `^`, `|`, `&`, `;`, `(` and a normalised `$(`. A
-    reviewer MEASURED that this is not the shell's command-position grammar: `\\tail`, a
-    continuation right after the name, `tail""`, `{ tail ...; }`, `case x in x) tail`,
-    `then`/`do`/`else`, a backtick substitution, a quoted command word, `v=1 tail`, and
-    `! tail` are ALL executed by bash and NONE is counted. That list is given as a WARNING,
-    not as an inventory: it is the shape of the gap, and there is no reason to think it is
-    complete. NO enumeration of it is attempted below.
-  * It over-counts: a heredoc BODY, an array element and a `case` pattern are reported as
-    invocations. (Loud, hence fail-closed.)
+    reviewer MEASURED that this is NOT the shell's command-position grammar: bash executes
+    command words this pattern does not count, and the pattern counts things bash does not
+    execute. The SUITE's self-test is the specification of what the check can and cannot
+    see, and it is the only list kept here — because this docstring previously carried an
+    ENUMERATED gap list and two of its entries were then FALSIFIED by measurement (one
+    spelling was not executed as claimed, and the `case` over-count held only for the
+    parenthesised/alternation form). An enumeration of the gap re-stales; the self-test does
+    not, because it runs.
 
 Therefore it does NOT establish "no unqualified invocation exists", and no text scan can:
 the property is about the shell's grammar, which is not a regular language. What it does

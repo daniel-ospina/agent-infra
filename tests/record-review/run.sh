@@ -969,15 +969,16 @@ UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
 echo "── 20. The base-ANCESTOR tolerance is DECLARED and PINNED (do not 'fix' it into a false refusal)"
-# A round-20 reviewer found a head whose TREE carries a file in NO reviewed commit and NOT in
-# the base tip, but in a base ANCESTOR, and called it a gate bypass. Its CONSEQUENCE claims
-# were refuted by measurement (the PR's three-dot diff — the artifact this gate attests,
-# fetched via `gh api .../pulls/N` — is byte-identical before and after the move, and landing
-# the head keeps the base tip's version of the file). The INVARIANT is real, so it is declared
-# in the script rather than denied, and pinned HERE for the same reason §17 is: the obvious
-# "fix" — compare against the base TIP instead of the head's second parent — REFUSES this head,
-# and would also refuse legitimate partial merges, i.e. it is a false-refusal generator. Add it
-# and this section reddens.
+# A head whose TREE carries content in no reviewed commit and not in the base tip, but in a base
+# ANCESTOR, IS carried — by design. The reason is the LANE DIMENSION, not the rendered patch:
+# the head is the AUTOMATIC merge of `reviewed` with a base-LINEAGE commit, so everything the
+# head adds beyond base lineage comes from the commit the review approved; and at landing time
+# the merge base of the head and the base tip is that same base-lineage commit, so every file
+# the LANE did not modify resolves to the base TIP's version. This section pins all of that.
+# It also pins the case a "tighten it" fix would break: a base ancestor that edits a line inside
+# the LANE's hunk CONTEXT makes the RENDERED PATCH CHANGE while the carry is still correct —
+# which is why byte-identity cannot be the reason (§2982's arm already covers that case, and
+# would be sufficient if it were). Two fixtures, because one cannot distinguish the two.
 D="$(new_repo c20ancestor)"; cd "$D" || exit 2
 REVIEWED="$(git rev-parse HEAD)"
 B0="$(git rev-parse main)"
@@ -998,31 +999,80 @@ B2="$(git rev-parse main)"
 git checkout -q pr
 CURRENT="$(git rev-parse HEAD)"
 P2="$(git rev-parse "$CURRENT^2" 2>/dev/null)"
-# PRECONDITION: the head really carries content in neither reviewed nor the base tip.
-{ git cat-file -e "$CURRENT:leaked.env" 2>/dev/null \
+# PRECONDITION — pin CONTENT, not just a path: the head's blob for the file must be absent from
+# BOTH the reviewed tree and the base-tip tree. A §18-style mutation (the same bytes at another
+# path in a reviewed commit) must redden this, so compare OIDS.
+HB="$(git rev-parse "$CURRENT:leaked.env" 2>/dev/null || echo none)"
+{ [ "$HB" != none ] \
   && ! git cat-file -e "$REVIEWED:leaked.env" 2>/dev/null \
-  && ! git cat-file -e "$B2:leaked.env" 2>/dev/null; } \
-  && pass "(20) PRECONDITION: the head tree carries a blob in NO reviewed commit and NOT in the base tip" \
-  || fail "(20) fixture is VACUOUS: the head carries nothing unseen, so the tolerance is not exercised"
-# PRECONDITION: the base merged is an OLDER ancestor, not the tip — the branch that matters.
+  && ! git cat-file -e "$B2:leaked.env" 2>/dev/null \
+  && [ "$(git ls-tree -r "$REVIEWED" | awk -v b="$HB" '$3 == b' | wc -l | tr -d ' ')" = 0 ] \
+  && [ "$(git ls-tree -r "$B2" | awk -v b="$HB" '$3 == b' | wc -l | tr -d ' ')" = 0 ]; } \
+  && pass "(20) PRECONDITION: the head's blob for the file is present in NEITHER the reviewed tree NOR the base-tip tree (CONTENT, not just a path)" \
+  || fail "(20) fixture is VACUOUS: the head's bytes exist in a reviewed/base-tip tree, so the tolerance is not exercised"
 { [ "$P2" = "$B1" ] && [ "$P2" != "$B2" ] && git merge-base --is-ancestor "$P2" "$B2"; } \
-  && pass "(20) PRECONDITION: the head's second parent IS the older base ancestor B1, not the base tip" \
+  && pass "(20) PRECONDITION: the head's second parent IS the older base ancestor, not the base tip" \
   || fail "(20) fixture is wrong: the head did not merge an older base ancestor, so (C) is not being tested"
-# THE SUBSTANTIVE CLAIM: the attested artifact — the three-dot patch — is UNCHANGED.
-git diff "$B0"..."$REVIEWED" > "$TMP/c20-before.patch" 2>/dev/null
-git diff "$B2"..."$CURRENT" > "$TMP/c20-after.patch" 2>/dev/null
-cmp -s "$TMP/c20-before.patch" "$TMP/c20-after.patch" \
-  && pass "(20) the PR's three-dot diff is BYTE-IDENTICAL before and after the move — the review's binding survives (this is WHY the tolerance is sound)" \
-  || fail "(20) the three-dot diff CHANGED across the move, so the carry does not preserve the attested artifact"
 [ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
   && pass "(20) the head IS carried (the declared tolerance, pinned)" \
   || fail "(20) the head was refused — the tolerance changed without this pin being updated"
-# The boundary: the 'tighten it to the base TIP' form WOULD refuse, which is why it is wrong.
+# THE LANDING PROPERTY — the half that makes the tolerance leak-free: the base TIP's version of
+# the file the LANE never modified must SURVIVE the landing merge.
+LANDED="$(git merge-tree --write-tree "$B2" "$CURRENT" 2>/dev/null | command head -1)"
+git cat-file -e "$LANDED:leaked.env" 2>/dev/null \
+  && fail "(20) the base tip's DELETION did not survive the landing merge — the head resurrects it into the base, which WOULD be a leak" \
+  || pass "(20) landing the head keeps the base TIP's version of the lane-untouched file — the tip's deletion survives (the tolerance is leak-free)"
+# The 'fix it to the base TIP' form would refuse this head (false-refusal generator).
 [ "$(git merge-tree --write-tree "$REVIEWED" "$B2" 2>/dev/null | command head -1)" != "$(git rev-parse "$CURRENT^{tree}")" ] \
   && pass "(20) comparing against the base TIP instead would REFUSE this head — the 'fix' is a false-refusal generator, pinned" \
   || fail "(20) the base-tip form would NOT refuse this head, so the boundary this section pins is not real"
 
-MIN_ASSERTIONS=84
+# ── 20b. The case that makes byte-identity IMPOSSIBLE as the reason: a base ancestor that edits
+# a line inside the LANE's hunk CONTEXT. The rendered patch CHANGES; the carry is still correct.
+# Built inline rather than with new_repo: new_repo leaves `pr` AHEAD of `main`, so a base edit
+# cannot be fast-forwarded into `pr`, and the first two drafts of this fixture (a) committed the
+# base content on the wrong branch and then (b) produced a CONFLICTED merge, which made the
+# section vacuous — and a vacuous fixture passes for the wrong reason.
+D2="$TMP/c20context"; rm -rf "$D2"; mkdir -p "$D2"; cd "$D2" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'a\nb\nc\n' > shared.txt; printf 'base\n' > other.txt
+git add -A; git commit -qm base; git branch -M main
+git update-ref refs/remotes/origin/main refs/heads/main
+git checkout -qb pr
+printf 'A\nb\nc\n' > shared.txt; git add -A; git commit -qm 'lane edits line 1 (REVIEWED)'
+REVIEWED="$(git rev-parse HEAD)"
+B0="$(git rev-parse main)"
+( cd "$D2" || exit 9
+  git checkout -q main
+  printf 'a\nb\nC\n' > shared.txt; git add -A; git commit -qm 'base ancestor edits line 3 (the lane hunk CONTEXT)'
+  printf 'more\n' > more.txt; git add -A; git commit -qm 'base tip advances again (so p2 is an OLDER ancestor)' )
+B1="$(git rev-parse main^)"
+( cd "$D2" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the base ancestor' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+P2B="$(git rev-parse "$CURRENT^2" 2>/dev/null)"
+# PRECONDITION: the head really IS the automatic merge with that base ancestor (a conflicted
+# merge would leave CURRENT == REVIEWED, and every assertion below would then be meaningless).
+{ [ "$P2B" = "$B1" ] && [ "$CURRENT" != "$REVIEWED" ] \
+  && [ "$(git rev-parse "$CURRENT^{tree}")" = "$(git merge-tree --write-tree "$REVIEWED" "$B1" 2>/dev/null | command head -1)" ]; } \
+  && pass "(20b) PRECONDITION: the head IS the clean automatic merge of REVIEWED with the base ancestor" \
+  || fail "(20b) fixture is VACUOUS: the merge conflicted or did not happen, so nothing is distinguished"
+git diff "$B0"..."$REVIEWED" > "$TMP/c20b-before.patch" 2>/dev/null
+git diff main..."$CURRENT" > "$TMP/c20b-after.patch" 2>/dev/null
+{ [ -s "$TMP/c20b-before.patch" ] && [ -s "$TMP/c20b-after.patch" ]; } \
+  && pass "(20b) PRECONDITION: both patches are non-empty, so 'changed' is distinguishable from 'absent'" \
+  || fail "(20b) fixture is wrong: a patch is empty"
+cmp -s "$TMP/c20b-before.patch" "$TMP/c20b-after.patch" \
+  && fail "(20b) fixture is VACUOUS: the patch did NOT change, so this is not the distinguishing case" \
+  || pass "(20b) PRECONDITION: the rendered three-dot patch really DID change across the move (hunk context c -> C)"
+[ "$(verdict_with "$D2" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
+  && pass "(20b) the head is STILL carried even though the patch changed — so byte-identity is NOT the reason, and a 'tighten to byte-identity' fix reddens here" \
+  || fail "(20b) the head was refused: the arm has become the #2982 byte-identity test and no longer carries the class it exists for"
+
+MIN_ASSERTIONS=88
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

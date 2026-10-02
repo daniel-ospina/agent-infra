@@ -552,15 +552,20 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   #     the base" does not make a blob something a review saw. A head whose only
   #     non-reviewed file exists in no reviewed commit and NOT in the base tip, but in a
   #     base ANCESTOR, IS carried (MEASURED twice, independently). What makes that SOUND is
-  #     narrower and measurable: the artifact this gate attests is the rendered PATCH, the
-  #     head is the AUTOMATIC merge with a base-lineage commit (pinned by (D)'s tree
-  #     equality), and base-lineage content the tip later removed therefore sits on BOTH
-  #     sides of that patch and is never PROPOSED. MEASURED on that fixture: the PR's
-  #     three-dot diff is BYTE-IDENTICAL before and after the move, and landing the head
-  #     keeps the base tip's version of the file, because the branch does not modify it
-  #     relative to the merge base. A head TREE exceeding `reviewed + base tip` is a
-  #     DECLARED TOLERANCE, not a proof of safety — §20 of the suite pins it so that a
-  #     future tightening reddens instead of landing a false refusal; and
+  #     narrower and measurable — and the reason is the LANE dimension, NOT the rendered
+  #     patch. The rendered patch is EXPECTED to change here: that is why this arm exists at
+  #     all (§2982's byte-identity test cannot carry any base move that lands in a PR's hunk
+  #     context, and a reviewer MEASURED a head in this very class whose three-dot patch
+  #     DIFFERS while all five clauses hold). What makes the carry sound is what (C)/(D)
+  #     already pin: the head is the AUTOMATIC merge of `reviewed` with a base-LINEAGE commit,
+  #     so everything the head contributes beyond base lineage comes from the commit the
+  #     review approved; and at landing time the merge base of the head and the base tip is
+  #     that same base-lineage commit, so every file the LANE did not modify resolves to the
+  #     base TIP's version — MEASURED: the tip's deletion of a base-ancestor file survives the
+  #     landing merge rather than being resurrected. A head TREE exceeding `reviewed + base
+  #     tip` is a DECLARED TOLERANCE, not a proof of safety, and §20 of the suite pins BOTH
+  #     halves — including a fixture where the patch CHANGES and the head is still carried, so
+  #     that a future tightening toward byte-identity reddens instead of landing; and
   #   - the object must be present locally, so the walk below is meaningful.
   # `.base.sha` is the CURRENT base tip, which is normally AHEAD of what the head merged,
   # so the check runs `--is-ancestor <head's second parent> <base_sha>`: the SECOND PARENT
