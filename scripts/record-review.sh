@@ -807,7 +807,18 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
     # residual — but a discarded status is a wrong CARRY waiting for a mechanism, and `comm` was
     # also the only one of this block's externals NOT `command`-qualified, so a shell function
     # named `comm` defeated it outright. Both are fixed here; every external below is qualified.
-    ldiff="$(LC_ALL=C command comm -23 <(printf '%s\n' "$lland") <(printf '%s\n' "$lknown"))" \
+    # ...AND THE PRODUCERS, not just the consumer. Round 29 qualified and status-checked `comm`
+    # and said "every external below is qualified"; round 30 MEASURED that false for these two
+    # `printf`s. `printf` is a bash BUILTIN, so `command printf` does not protect it — a shell
+    # FUNCTION named `printf` shadows it, is inherited by a child bash, is visible inside these
+    # process substitutions, and if it fails (or prints nothing) for the LANDING input only, then
+    # `comm -23` has an empty file1, prints nothing, exits 0, and the status check never fires:
+    # MEASURED on the union leak as a wrong CARRY, including under the real script's own
+    # `set -euo pipefail`. `builtin` is the only spelling that bypasses a function here.
+    # (A `printf` that ALWAYS fails is caught earlier, by (C3)'s non-empty-base check; the attack
+    # must be selective, which is why this is a real but environment-dependent hole — the same
+    # residual class as the exported-function vector the file's boundary paragraph declares.)
+    ldiff="$(LC_ALL=C command comm -23 <(builtin printf '%s\n' "$lland") <(builtin printf '%s\n' "$lknown"))" \
       || return 1
     [ -z "$ldiff" ] || return 1
   done <<EOF
