@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Twenty tests with twenty-four paired mutations: every mutation re-
+Twenty-three tests with twenty-nine paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven of the twenty (#1254) pin the TURN-BOUNDARY rule:
+evidence mechanical. Seven of the twenty-three (#1254) pin the TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
@@ -17,7 +17,7 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 20 tests, green
+    python3 tools/fleet/liveness.test.py                # the 23 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
@@ -33,6 +33,8 @@ Injected, never guessed:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import datetime
 import importlib.util
 import json
 import os
@@ -92,6 +94,12 @@ def check(cond, msg):
 
 def C(pid, observed, kind="tag", start=None):
     return liv.Candidate(pid=pid, observed=observed, kind=kind, start_seconds=start)
+
+
+def _iso(ms):
+    """pi's entry-level `timestamp`: ISO-8601 UTC, millisecond precision."""
+    return datetime.datetime.fromtimestamp(ms / 1000.0, datetime.timezone.utc) \
+        .strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (ms % 1000)
 
 
 def ev(**kw):
@@ -406,14 +414,20 @@ def t9_hung_tool_bound():
                          tool=hung(tool_age_ms=30 * M, turn_active=False)))
     check(v4.state == "running-quiet", "exactly at the bound must NOT expire (strict >); got %s" % v4.state)
 
-    # (e) tool-silence shape: S = 20min, not load-scaled, and not 4h.
+    # (e) tool-silence shape: S = 20min, not load-scaled, and not 4h. Since
+    #     #5389 the clause ALSO requires positive no-progress evidence, so the
+    #     fixture arms the CPU channel (as the watchdog's own #5389 fixtures do)
+    #     instead of relying on silence alone — silence alone is now `unknown`,
+    #     which correctly falls to the age backstop rather than expiring.
+    stopped = dict(tool_updates=True, cpu_advanced=True, cpu_stall_ms=31 * M)
     v5 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M,
-                         tool=hung(tool_updates=True, silence_age_ms=21 * M, tool_age_ms=21 * M),
+                         tool=hung(silence_age_ms=21 * M, tool_age_ms=31 * M, **stopped),
                          jsonl_turn=OPEN_TURN))
     check(v5.state == "wedged",
-          "a streamed-then-silent tool past S=20min is wedged-eligible; got %s/%s" % (v5.state, v5.reason))
+          "a streamed-then-silent, CPU-flat tool past S=20min is wedged-eligible; got %s/%s"
+          % (v5.state, v5.reason))
     v6 = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=19 * M,
-                         tool=hung(tool_updates=True, silence_age_ms=19 * M, tool_age_ms=19 * M)))
+                         tool=hung(silence_age_ms=19 * M, tool_age_ms=31 * M, **stopped)))
     check(v6.state == "running-quiet", "19min is inside S; got %s" % v6.state)
 
     check(liv.tool_stall_ms() == 4 * H,
@@ -906,6 +920,258 @@ def t20_unrecognized_stop_reason_abstains():
 # ══════════════════════════════════════════════════════════════════════════
 # The mutation map: each entry reintroduces the defect its test catches.
 # ══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# T21 — #5389 (a): the in-flight tool is read from the lane's OWN transcript.
+# `docs/ops/fleet-liveness.md` §5 item 2 measured that NO store record carries
+# `toolsInFlight`, so `ev.tool` was always None and the veto never fired. The
+# fixtures below use pi's REAL entry shape — `timestamp` at the ENTRY level,
+# `message` nested — because a shape the parser cannot read is exactly how a
+# check silently never matches.
+# ═══════════════════════════════════════════════════════════════════
+@test("T21 the in-flight tool is derived from the lane's own transcript (#5389 a)")
+def t21_tool_from_jsonl():
+    d = tempfile.mkdtemp(prefix="liv-jsonl-")
+    try:
+        path = os.path.join(d, "session.jsonl")
+
+        def real(role, ts_ms, **msg):
+            base = {"role": role}
+            base.update(msg)
+            return {"type": "message", "id": "e", "parentId": None,
+                    "timestamp": _iso(ts_ms), "message": base}
+
+        def write(entries):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(json.dumps(e) for e in entries) + "\n")
+
+        started = NOW_MS - 21 * M  # frozen 21 min: past S=20min, inside 4h
+
+        # (a) the tail is an assistant message carrying a call with no result
+        #     — a tool IS in flight, and its age is the CALL's age.
+        write([
+            real("user", started - 60_000, content=[{"type": "text", "text": "go"}]),
+            real("assistant", started, stopReason="toolUse",
+                 content=[{"type": "toolCall", "name": "bash", "id": "call_A"}]),
+        ])
+        t = liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M)
+        check(t is not None and t.tools_in_flight == 1, "one call in flight; got %s" % t)
+        check(t.name == "bash", "the in-flight call's name; got %r" % t.name)
+        check(t.tool_age_ms == 21 * M, "the age is the CALL's age; got %s" % t.tool_age_ms)
+        check(t.tool_updates is False and t.cpu_advanced is False and t.cpu_stall_ms == 0,
+              "the two underivable fields stay at the FAIL-CLOSED default; got %s" % t)
+
+        # (b) an answered call is not in flight.
+        write([
+            real("assistant", started, stopReason="toolUse",
+                 content=[{"type": "toolCall", "name": "bash", "id": "call_A"}]),
+            real("toolResult", started + 1000, toolName="bash", toolCallId="call_A",
+                 content=[{"type": "text", "text": "done"}]),
+        ])
+        check(liv.tool_from_jsonl(path, NOW_MS) is None,
+              "a matching toolResult means nothing is in flight")
+
+        # (c) a call the stop reason DISCARDS is not in flight either — the veto
+        #     and the turn boundary must not disagree about openness.
+        write([real("assistant", started, stopReason="error",
+                    content=[{"type": "toolCall", "name": "bash", "id": "call_A"}])])
+        check(liv.tool_from_jsonl(path, NOW_MS) is None,
+              "`error` discards its calls (CALL_DISCARDING_STOP_REASONS)")
+
+        # (d) a compaction trailer abstains, exactly as the turn boundary does.
+        write([
+            real("assistant", started, stopReason="toolUse",
+                 content=[{"type": "toolCall", "name": "bash", "id": "call_A"}]),
+            {"type": "compaction", "summary": "…"},
+        ])
+        check(liv.tool_from_jsonl(path, NOW_MS) is None,
+              "a compaction trailer decides nothing, so no tool is asserted")
+
+        # (e) an UNREADABLE entry timestamp must NOT leave the age UNKNOWN.
+        #     An unknown age never expires (`_exceeds(None, ...)` is False) and a
+        #     derived tool can reach ONLY the age backstop — so `None` would make
+        #     the veto PERMANENT: the lane would read `running-quiet/tool-in-flight`
+        #     forever and `idle` would become unreachable (T9: the veto must never
+        #     be forever). The fallback is the transcript's OWN mtime, which is a
+        #     real measurement and still grows while the file is frozen.
+        write([{"type": "message", "id": "e", "message": {
+            "role": "assistant", "stopReason": "toolUse",
+            "content": [{"type": "toolCall", "name": "bash", "id": "call_A"}]}}])
+        os.utime(path, ((NOW_MS - 26 * M) / 1000.0,) * 2)
+        unaged = liv.tool_from_jsonl(path, NOW_MS)
+        check(unaged is not None and unaged.tool_age_ms is not None,
+              "an undated call must fall back to the transcript's age, never None")
+        check(abs(unaged.tool_age_ms - 26 * M) <= 2000,
+              "the fallback is the transcript's own mtime age; got %s" % unaged.tool_age_ms)
+        check(liv.tool_veto_expired(unaged) is False,
+              "26min is inside the 4h backstop, so the veto still holds")
+        check(liv.tool_veto_expired(dataclasses.replace(unaged, tool_age_ms=5 * H)) is True,
+              "and past the 4h backstop it EXPIRES — the veto is BOUNDED (T9)")
+
+        # (g) cycle-3: if the call cannot be dated from ANY source (the entry
+        #     stamp is absent AND the file cannot be stat'd) then NO Tool is
+        #     asserted. A Tool with an unmeasurable age would make the veto
+        #     permanent (`_exceeds(None, bound)` is False) \u2014 the one outcome
+        #     T9 forbids \u2014 and the honest reading is the module's own
+        #     `jsonl-age-unknown` abstention, never a phantom veto.
+        write([{"type": "message", "id": "e", "message": {
+            "role": "assistant", "stopReason": "toolUse",
+            "content": [{"type": "toolCall", "name": "bash", "id": "call_A"}]}}])
+        real_stat = os.stat
+        attempts = []
+
+        def flaky(target, *a, **k):
+            attempts.append(target)
+            if len(attempts) > 1:      # let _last_message_entry read; fail the fallback
+                raise OSError("simulated stat failure")
+            return real_stat(target, *a, **k)
+
+        try:
+            os.stat = flaky
+            undatable = liv.tool_from_jsonl(path, NOW_MS)
+        finally:
+            os.stat = real_stat
+        check(len(attempts) >= 2,
+              "the fixture must actually reach the mtime fallback; got %d stat(s)" % len(attempts))
+        check(undatable is None,
+              "an undateable call must assert NO veto (an unmeasurable age would be FOREVER)")
+
+        # (f) no file / an empty file is an ABSTENTION, never a tool.
+        check(liv.tool_from_jsonl(None, NOW_MS) is None, "no path -> no assertion")
+        check(liv.tool_from_jsonl(os.path.join(d, "absent.jsonl"), NOW_MS) is None,
+              "a missing transcript -> no assertion")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# T22 — #5389 (b)/(c) on the FLEET side: the veto mirrors the watchdog's new
+# rule. CPU is a SPARE signal: `progressing` SUPPRESSES the expiry, and an
+# `unknown` channel may not expire it either — it falls to the AGE backstop, so
+# the veto is slower but never forever (T9's own law).
+# ═══════════════════════════════════════════════════════════════════
+@test("T22 the veto requires no-progress evidence; progressing suppresses; unknown falls to the age backstop (#5389 b/c)")
+def t22_in_flight_progress_mirror():
+    def tool(**kw):
+        base = dict(tools_in_flight=1, tool_updates=True)
+        base.update(kw)
+        return liv.Tool(**base)
+
+    # The sentinel trap, pinned FIRST: `cpu_stall_ms=0` with the latch ARMED is
+    # the strongest progress evidence there is (advanced on this very tick),
+    # never "unknown". The measured #5387 cut had exactly this shape.
+    check(liv.in_flight_progress(tool(cpu_advanced=True, cpu_stall_ms=0)) == "progressing",
+          "armed latch + cpu_stall_ms=0 is PROGRESSING, not unknown")
+    check(liv.in_flight_progress(tool(cpu_advanced=False, cpu_stall_ms=0)) == "unknown",
+          "an unarmed latch is the not-probed sentinel -> unknown")
+    check(liv.in_flight_progress(tool(cpu_advanced=True, cpu_stall_ms=31 * M)) == "no-progress",
+          "demonstrated work then flat past C=30min -> no-progress")
+    check(liv.in_flight_progress(tool(cpu_advanced=True, cpu_stall_ms=29 * M)) == "progressing",
+          "flat under C is still progressing")
+    # TASK_CPU_STALL_MS=0 disables the channel; the operator did not thereby
+    # authorise a cut on it.
+    check(liv.in_flight_progress(tool(cpu_advanced=True, cpu_stall_ms=99 * M), 0) == "unknown",
+          "a disabled CPU bound reads unknown, never no-progress")
+    check(liv.in_flight_progress(tool(cpu_advanced=True, cpu_stall_ms=None)) == "unknown",
+          "an unmeasured stall is unknown")
+
+    # (b) silence past S with PROGRESS -> the veto HOLDS (was: expired -> wedged).
+    check(liv.tool_veto_expired(tool(cpu_advanced=True, cpu_stall_ms=0,
+                                     silence_age_ms=60 * M, tool_age_ms=60 * M)) is False,
+          "tool-silence must not expire on a PROGRESSING tool")
+    # ...but progress is a reprieve from S, NEVER an exemption from the age
+    # backstop: the watchdog's `tool-stall` clause has no CPU conjunct, so it
+    # cuts a tool whose CPU is still advancing once the backstop is passed.
+    check(liv.tool_veto_expired(tool(cpu_advanced=True, cpu_stall_ms=0,
+                                     silence_age_ms=5 * H, tool_age_ms=5 * H)) is True,
+          "a PROGRESSING tool is still bounded at the 4h age backstop")
+    # silence past S with demonstrated-then-flat CPU -> the watchdog WOULD cut.
+    check(liv.tool_veto_expired(tool(cpu_advanced=True, cpu_stall_ms=31 * M,
+                                     silence_age_ms=21 * M, tool_age_ms=31 * M)) is True,
+          "no-progress past S expires the veto")
+    # (c) unknown does NOT expire on S — but it is not forever either.
+    check(liv.tool_veto_expired(tool(cpu_advanced=False, silence_age_ms=21 * M,
+                                     tool_age_ms=21 * M, turn_active=True)) is False,
+          "an unreadable CPU channel may not expire the veto at S")
+    check(liv.tool_veto_expired(tool(cpu_advanced=False, silence_age_ms=5 * H,
+                                     tool_age_ms=5 * H, turn_active=True)) is True,
+          "...but the 4h AGE backstop still bounds it — never forever")
+
+    # F1 (#5389 review, cycle 2): a clause that does NOT fire must fall through
+    # to the backstop. A no-progress tool whose silence is still inside S used to
+    # hold the veto open at ANY age; the watchdog cuts it at the progress-blind
+    # `tool-stall` backstop, so the classifier must too (T9: never forever).
+    check(liv.tool_veto_expired(tool(cpu_advanced=True, cpu_stall_ms=31 * M,
+                                     silence_age_ms=19 * M, tool_age_ms=5 * H)) is True,
+          "a no-progress tool inside S is still bounded by the age backstop")
+    check(liv.tool_veto_expired(tool(cpu_advanced=True, cpu_stall_ms=31 * M,
+                                     silence_age_ms=None, tool_age_ms=5 * H)) is True,
+          "an OMITTED streamAgeMs must not hold the veto open forever either")
+
+    # End-to-end: the SAME evidence reads running-quiet with the fix.
+    v = liv.evaluate(ev(candidates=[C(1, "holder")], jsonl_age_ms=60 * M, jsonl_turn=OPEN_TURN,
+                        tool=tool(cpu_advanced=True, cpu_stall_ms=0,
+                                  silence_age_ms=60 * M, tool_age_ms=60 * M)))
+    check(v.state == "running-quiet" and v.reason == "tool-in-flight",
+          "a progressing tool keeps the lane off `wedged`; got %s/%s" % (v.state, v.reason))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# T23 — the measured #5387 false cut, reproduced end to end and hermetic:
+# a fenced holder, a transcript frozen 21 min, the tail carrying an unanswered
+# `bash`. `gather` must derive the tool from that transcript and the lane must
+# read `running-quiet/tool-in-flight` — NOT `wedged/turn-open:pending-tool-call`.
+# The control (the same evidence with `tool=None`, i.e. today's wiring) is
+# asserted too, so the test proves the veto is LOAD-BEARING and not vacuous.
+# ═══════════════════════════════════════════════════════════════════
+@test("T23 the #5387 false cut: an unanswered transcript call keeps the lane off `wedged` (#5389 a+b)")
+def t23_false_cut_reproduced():
+    d = tempfile.mkdtemp(prefix="liv-jsonl-")
+    try:
+        frozen = NOW_MS - 21 * M
+        sessions = os.path.join(d, "sessions")
+        os.makedirs(os.path.join(sessions, "--x--"))
+        sfile = os.path.join(sessions, "--x--", "2026-01-01T00-00-00-000Z_sid-1.jsonl")
+        entries = [
+            {"type": "message", "id": "a", "timestamp": _iso(frozen - 60_000),
+             "message": {"role": "user", "content": [{"type": "text", "text": "grep"}]}},
+            # The measured shape: an in-flight `bash` that has streamed and then
+            # gone quiet, with the turn still OPEN (no toolResult after it).
+            {"type": "message", "id": "b", "timestamp": _iso(frozen),
+             "message": {"role": "assistant", "stopReason": "toolUse",
+                         "content": [{"type": "toolCall", "name": "bash", "id": "call_A"}]}},
+        ]
+        with open(sfile, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e) for e in entries) + "\n")
+        os.utime(sfile, (frozen / 1000.0, frozen / 1000.0))
+
+        payload = {"sessions": {"sid-1": {"pid": 555, "pidStartSeconds": PROBE_EPOCH,
+                                           "cwd": "/x", "agentLifecycle": "idle",
+                                           "runtimeStatus": "idle"}}}
+        with temp_store(payload) as (store, _sd):
+            with ps_env([ps_row(555)]):
+                e = liv.gather("sid-1", store_path=store, sessions_dir=sessions, now_ms=NOW_MS)
+
+        check(e.tool is not None and e.tool.tools_in_flight == 1,
+              "gather must derive the in-flight tool from the transcript; got %s" % e.tool)
+        check(e.jsonl_turn is not None and e.jsonl_turn.stalled is True,
+              "the tail is a positively OPEN turn; got %s" % e.jsonl_turn)
+        check(e.jsonl_age_ms > liv.STREAM_STALL_MS, "the fixture is frozen past S")
+
+        v = liv.evaluate(e)
+        check(v.state == "running-quiet" and v.reason == "tool-in-flight",
+              "a lane inside one long read is quiet, never wedged; got %s/%s" % (v.state, v.reason))
+
+        # THE CONTROL: strip the derived tool (today's wiring, 0 of 1011 records)
+        # and the same evidence reads `wedged`. Without this the test could pass
+        # on a lane that was never wedged-shaped to begin with.
+        v_no_tool = liv.evaluate(dataclasses.replace(e, tool=None))
+        check(v_no_tool.state == "wedged",
+              "control: with NO tool the same evidence IS wedged; got %s/%s"
+              % (v_no_tool.state, v_no_tool.reason))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -988,8 +1254,10 @@ MUTATIONS = [
     ),
     Mutation(
         "T11", "module",
-        '    if cpu_attributable(tool) and tool.cpu_advanced:',
-        '    if tool.cpu_advanced:',
+        '        if (not tool.tool_updates and cpu_attributable(tool)\n'
+        '                and _exceeds(tool.tool_age_ms, STREAM_STALL_MS)):\n',
+        '        if (not tool.tool_updates\n'
+        '                and _exceeds(tool.tool_age_ms, STREAM_STALL_MS)):\n',
         "CPU-flatness of a non-attributable tool (nested `task`) arms the kill (C8)",
     ),
     Mutation(
@@ -1085,6 +1353,45 @@ MUTATIONS = [
         '        return Turn(False, "turn-unknown:%s" % stop, abstain=True)\n',
         '        return Turn(False, "turn-ended", "terminal stopReason=%s" % stop)\n',
         "the pre-fix fall-through returns: an unrecognized stop reason reads RESTING (fail-open, #1272)",
+    ),
+    Mutation(
+        "T21", "module",
+        '    if not isinstance(stamp, str) or not stamp:\n        return None\n',
+        '    if not isinstance(stamp, str) or not stamp:\n        return 0\n',
+        "an unreadable entry timestamp is read as 0, so the derived age becomes `now - 0` (~56 "
+        "years) and EXCEEDS every backstop — the veto is EXPIRED on evidence the parser could not "
+        "read, which is the FAIL-OPEN direction (#5389 a)",
+    ),
+    Mutation(
+        "T22", "module",
+        '    if progress == NO_PROGRESS:\n',
+        '    if True:\n',
+        "the pre-#5389 rule returns: silence ALONE expires the veto, so a tool still burning CPU "
+        "is expired while progressing (tortoise #5387) — the false cut this mirrors (#5389 b)",
+    ),
+    Mutation(
+        "T22", "module",
+        '        if tool.tool_updates and _exceeds(tool.silence_age_ms, STREAM_STALL_MS):\n'
+        '            return True\n',
+        '        if tool.tool_updates:\n'
+        '            return _exceeds(tool.silence_age_ms, STREAM_STALL_MS)\n',
+        "the clause returns UNCONDITIONALLY, so a no-progress shape whose silence is still inside "
+        "S never falls through to the age backstop and the veto is forever (T9; #5389 cycle-2 F1)",
+    ),
+    Mutation(
+        "T21", "module",
+        '    age = max(0, now_ms - started)\n',
+        '    age = None\n',
+        "the derived age is left UNMEASURABLE, and an unknown age never expires "
+        "(`_exceeds(None, ...)` is False) — so the veto becomes PERMANENT and `idle` becomes "
+        "unreachable (T9; #5389 review, cycles 1 and 3)",
+    ),
+    Mutation(
+        "T23", "module",
+        '        tool = tool_from_jsonl(sfile, now, silence_age_ms=age)\n',
+        '        tool = None\n',
+        "the #5389 (a) wiring is removed: no store record carries the fields (0 of 1011), so the "
+        "veto is dead again and a lane inside one long read reads `wedged`",
     ),
 ]
 
