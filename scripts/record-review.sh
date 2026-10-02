@@ -541,7 +541,11 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # was never fetched and never compared to the API, so it could not be trusted.
   # The authority is `.base.sha` from the API. Two things must then hold:
   #   - the head's SECOND PARENT (the base it actually merged) must be reachable
-  #     from that authoritative base, so the head's OTHER parent is base LINEAGE.
+  #     from that authoritative base, so the head's SECOND parent — the base it actually
+  #     merged — is base LINEAGE. (It says nothing about the head's FIRST parent: that is
+  #     the reviewed lane commit, and bounding it is (B)'s job. An earlier rewrite of this
+  #     line said "the head's OTHER parent", which inverted what the check proves — a cycle-11
+  #     reviewer caught it, and it is corrected here rather than re-worded.)
   #     Reachability does NOT bound the head by the base TIP's tree: a commit the
   #     base tip has since deleted or reverted is still lineage, so a head carrying
   #     a file the base tip no longer has is base-DERIVED, not unreviewed. MEASURED:
@@ -583,11 +587,14 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # `merge=union` DOES emit a blob present in NEITHER input (measured), and a custom driver
   # (`.git/config`, or the equally local `.git/info/attributes`) can emit content from NO
   # ancestor at all. WHAT IT IS NOT, for an actor who can only PUSH A BRANCH: the built-in
-  # drivers reachable from a TRACKED .gitattributes are text/union/binary, and NONE can
-  # invent a LINE — union keeps both sides' lines, binary conflicts (and a conflict is
-  # refused by the rc check), text merges — so content purity holds. The inventing case needs
-  # a write under .git/, which is this script's OWN trust surface: a local writer can forge
-  # the review body this function reads, so no boundary is left there to defend. §17 of the
+  # drivers reachable from the WORKING TREE's attributes are text/union/binary, and, AS BUILT
+  # IN, none can invent a LINE — union keeps both sides' lines, binary conflicts (rc refused),
+  # text merges. `git merge-tree` reads attributes from the WORKING TREE, not from the merged
+  # trees, so a PR's pushed .gitattributes takes effect once its branch is checked out; and a
+  # config entry can SHADOW a built-in NAME (`merge.union.driver`). The inventing case therefore
+  # needs a write to git's LOCAL CONFIGURATION — the repo's .git/config or .git/info/attributes,
+  # OR the user's global config — which is this script's OWN trust surface: a local writer can
+  # forge the review body this function reads, so no boundary is left there to defend §17 of the
   # suite pins the tolerance so a future blob-level "fix" reddens instead of landing.
   # Reject everything that is not a 40-hex sha, exactly as the head fetch above does.
   # Empty/null/error-body already failed closed (measured), but any non-empty string

@@ -189,6 +189,9 @@ CURRENT="$(git rev-parse HEAD)"
 [ "$(git rev-list --no-merges "$REVIEWED..$CURRENT" --not refs/heads/main | wc -l | tr -d ' ')" = 0 ] \
   && pass "(C2) is satisfied (only the merge is in between), so only (D) can catch it" \
   || fail "fixture is wrong: the conflict case leaks a lane commit"
+[ "$(git show "$CURRENT:shared.txt")" = "resolved by hand" ] \
+  && pass "PRECONDITION: the head really CARRIES the hand resolution (not git's conflict markers), so (D) refuses for that reason" \
+  || fail "fixture is VACUOUS: the head does not carry the resolution — the refusal would come from conflict markers"
 [ "$(carry_verdict "$D" "$REVIEWED" "$CURRENT")" = 1 ] \
   && pass "REFUSE (1) — a hand resolution is NOT carried" \
   || fail "CARRIED a conflict resolution the review never saw — FAIL-OPEN"
@@ -648,43 +651,77 @@ echo "── 15. STATIC GUARD: no bare \`gh\` invocation may be reintroduced"
 bare_gh_count() { # <file> -> number of gh INVOCATIONS not using `command `
   python3 - "$1" <<'PY'
 import re, sys
-# Join \-continuations first, and allow the command word to be QUOTED: a reviewer
-# reintroduced the exact HEAD read twice with spellings this scan missed —
-# CURRENT_HEAD="$("gh" api ...)" (a quoted word IS intercepted by a function) and
-# `gh \<newline> api ...` — with the guard still reporting 0.
-src = re.sub(r"\\\n", " ", open(sys.argv[1]).read())
+
+src = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+# Join \-continuations first: a reviewer reintroduced the exact HEAD read as `gh \` +
+# newline + `api`, and the `command` look-behind used to miss it.
+src = src.replace("\\\n", " ")
 
 
-def code_only(ln):
-    """Cut an UNQUOTED trailing comment, and BLANK the content of quoted strings.
+def executable_text(s):
+    """Blank every character the shell does NOT execute as a command word.
 
-    A reviewer measured two holes in the previous cut, re.sub(r"\\s+#.*$"):
-      * an in-string `#` is not a comment, so `X="a # b"; gh api q` lost everything
-        from the `#` and a REAL bare gh went uncounted; and
-      * with the subcommand allowlist dropped, quoted PROSE that names gh (`gh
-        missing`, `gh or API failure`) and the lookup `command -v gh` were counted —
-        false positives that made the guard red for the wrong reason.
-    Blanking string CONTENT excludes the prose case without an ad-hoc word list, while
-    a quoted token that is EXACTLY gh (`"gh" api q`) is kept: a function intercepts a
-    quoted command word, so that IS a real invocation."""
-    out, i = [], 0
-    while i < len(ln):
-        c = ln[i]
-        if c in ("'", '"'):
-            j = i + 1
-            while j < len(ln):
-                if c == '"' and ln[j] == "\\":
-                    j += 2
-                    continue
-                if ln[j] == c:
-                    break
-                j += 1
-            tok = ln[i:j + 1]
-            out.append(tok if tok in ('"gh"', "'gh'") else ('""' if c == '"' else "''"))
+    WHOLE-FILE, not per-line. A reviewer measured the per-line version going blind on a
+    MULTI-LINE string, and the earlier quote-blanking version blind to `"$(gh api ...)"`
+    — which is the exact shape of the head read this guard exists to protect: deleting
+    `command ` from that one line left the counter at 0. So `$( ... )` and backticks are
+    KEPT, even inside double quotes, because they ARE executed.
+
+    Also kept: a quoted token that is EXACTLY gh (`"gh" api q`, `'gh' api q`) — a shell
+    FUNCTION intercepts a quoted command word, so that is a real invocation.
+
+    Comments are cut, so prose ABOUT gh is not counted. CAVEAT, named rather than
+    implied: a HEREDOC BODY is treated as code, so a bare `gh` line inside one would be
+    counted though it is only data — a FALSE POSITIVE, i.e. loud and fail-closed. The
+    file's own heredoc bodies contain no `gh`, and the counter is asserted to be 0."""
+    out, i, n = [], 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "#" and (i == 0 or s[i - 1] in " \t\n"):
+            while i < n and s[i] != "\n":
+                i += 1
+            continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j == -1:
+                j = n - 1
+            out.append("'gh'" if s[i:j + 1] == "'gh'" else " " * (j + 1 - i))
             i = j + 1
             continue
-        if c == "#" and (i == 0 or ln[i - 1] in " \t"):
-            break
+        if c == '"':
+            parts, k = ['"'], i + 1
+            while k < n:
+                if s[k] == "\\" and k + 1 < n:
+                    parts.append("  ")
+                    k += 2
+                    continue
+                if s[k] == '"':
+                    break
+                if s.startswith("$(", k):
+                    k0, depth, k = k, 0, k + 2
+                    while k < n:
+                        if s[k] == "(":
+                            depth += 1
+                        elif s[k] == ")":
+                            if depth == 0:
+                                break
+                            depth -= 1
+                        k += 1
+                    parts.append(s[k0:k + 1])
+                    k += 1
+                    continue
+                if s[k] == "`":
+                    k2 = s.find("`", k + 1)
+                    if k2 == -1:
+                        k2 = n - 1
+                    parts.append(s[k:k2 + 1])
+                    k = k2 + 1
+                    continue
+                parts.append(s[k] if s[k] == "$" else " ")
+                k += 1
+            out.append('"gh"' if s[i:k + 1] == '"gh"' else "".join(parts) + '"')
+            i = k + 1
+            continue
         out.append(c)
         i += 1
     return "".join(out)
@@ -693,22 +730,22 @@ def code_only(ln):
 # NO SUBCOMMAND ALLOWLIST: a function named gh intercepts `gh <anything>`, so
 # restricting the pattern to api|repo|auth|run|pr|issue left every other subcommand
 # uncounted — a re-introduction spelling `gh secret list` reported 0.
+code = executable_text(src)
 rx = re.compile(r'(?<![\w/-])["\']?gh["\']?(?=[\s$)])')
 n = 0
-for ln in src.split("\n"):
-    if ln.lstrip().startswith("#"):
+for m in rx.finditer(code):
+    line_start = code.rfind("\n", 0, m.start()) + 1
+    if code[line_start:].lstrip().startswith("#"):
         continue
-    code = code_only(ln)
-    for m in rx.finditer(code):
-        before = code[:m.start()].rstrip()
-        # `command` must itself start a WORD: a plain endswith("command") also accepts
-        # `X=command gh api`, which IS a bare invocation and must be counted.
-        if re.search(r"(^|[\s(|&;])command$", before):
-            continue
-        # `command -v gh` is a LOOKUP, not an invocation.
-        if re.search(r"(^|[\s(|&;])command\s+-[vV]$", before):
-            continue
-        n += 1
+    before = code[:m.start()].rstrip()
+    # `command` must itself start a WORD: a plain endswith("command") also accepts
+    # `X=command gh api`, which IS a bare invocation and must be counted.
+    if re.search(r"(^|[\s(|&;])command$", before):
+        continue
+    # `command -v gh` is a LOOKUP, not an invocation.
+    if re.search(r"(^|[\s(|&;])command\s+-[vV]$", before):
+        continue
+    n += 1
 print(n)
 PY
 }
@@ -727,8 +764,11 @@ printf '  gh secret list\n' >> "$ST"
 # quoted PROSE that names gh, and the `command -v gh` LOOKUP, are not invocations.
 printf 'echo "gh missing"\n' >> "$ST"
 printf 'command -v gh >/dev/null 2>&1\n' >> "$ST"
-[ "$(bare_gh_count "$ST")" = 6 ] \
-  && pass "(15 self-test) the counter catches all six bare-gh spellings (indented, X=command gh, quoted, backslash-continued, after an in-string #, and a subcommand outside the old allowlist) and ignores a real command gh" \
+# The EXACT shape of the head read this guard protects, and the spelling the previous
+# version was blind to: `$( )` inside double quotes IS executed. Must COUNT.
+printf 'CURRENT_HEAD="$(gh api q)"\n' >> "$ST"
+[ "$(bare_gh_count "$ST")" = 7 ] \
+  && pass "(15 self-test) the counter catches all SEVEN bare-gh spellings, including a command substitution INSIDE double quotes (the head read's exact shape), and does not count the two controls" \
   || fail "(15 self-test) the counter is broken — it cannot detect an indented bare gh (the false-PASS the grep had)"
 BARE_GH="$(bare_gh_count "$SRC")"
 [ "$BARE_GH" = 0 ] \
@@ -788,10 +828,13 @@ echo "── 17. A UNION-MERGED head is TOLERATED (a RECORDED DECISION, pinned a
 # an input. MEASURED: that guard would REFUSE a legitimately union-merged head — break the
 # carry on exactly the two append-only registries most lanes touch — so the "fix" would be
 # worse than the vector. This section pins the tolerance: add the blob check and it reddens.
-# The inventing case needs a write under .git/ (.git/config, .git/info/attributes), which is
-# this script's OWN trust surface (a local writer can forge the review body it reads); the
-# built-ins reachable from a TRACKED .gitattributes cannot invent a LINE, so content purity
-# holds for an actor who can only push a branch. Both facts are recorded in the script.
+# The inventing case needs a write to git's LOCAL CONFIGURATION (.git/config,
+# .git/info/attributes, or the user's GLOBAL config -- a config entry can SHADOW a built-in
+# name), which is this script's OWN trust surface: a local writer can forge the review body it
+# reads. The built-ins, AS BUILT IN, cannot invent a LINE. NOTE the attribute SOURCE, measured
+# by a cycle-11 reviewer: `git merge-tree` reads .gitattributes from the WORKING TREE, not from
+# the merged trees -- this fixture still passes with .gitattributes left UNTRACKED, which is why
+# the wording here says working-tree, not "tracked". Both facts are recorded in the script.
 D="$(new_repo c17union)"; cd "$D" || exit 2
 printf 'f.txt merge=union\n' > .gitattributes
 printf 'top\n  lane\n' > f.txt
@@ -824,7 +867,7 @@ UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
   && pass "CARRY (0) — a union-merged base move is carried, per tortoise#5373's declared semantics" \
   || fail "REFUSED a legitimately union-merged head — a blob-level purity check here would break the append-only registries"
 
-MIN_ASSERTIONS=65
+MIN_ASSERTIONS=66
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
