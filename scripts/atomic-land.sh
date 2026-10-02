@@ -383,19 +383,29 @@ pr_has_carry_evidence() {
   [ -n "$expect" ] || return 1
   [ "$sig" = "$expect" ]
 }
-# WHY the FIRST matching line, and not any line: the producer's carry pins
-# `diff=${DIFF_HASH}` — the LIVE diff — which is a post-update property the rail
-# cannot know without computing equivalence (the producer's decision, not the
-# rail's). So the rail cannot tell a stale-diff line from a live-diff one, and the
-# two candidate behaviours are:
-#   narrow (this one): over-block a body whose first matching line is stale;
-#   wide:              accept it, call the update, and SPEND an attestation the
-#                      producer then refuses to carry.
-# Over-blocking is friction (recoverable, visible); spending is silent destruction
-# of a fresh attestation (the 22-updated / 17-invalidated / 0-landed mode this
-# guard exists to prevent). Fail-closed wins. The over-block is a DECLARED residual
-# (B), retired by #1397 (content identity) — with identity on the record an update
-# stops invalidating it at all.
+# WHY the FIRST matching line: this guard is a PRESENCE test, not a freshness
+# test. It checks only that the body carries a shape-valid marker whose HMAC
+# verifies — it never reads or compares `diff=`. (The rail computes no live diff
+# by design: the equivalence primitive is shared, and re-implementing it here
+# would be a second definition of "unchanged" for one cross-repo contract — see
+# the note above.) So a stale first matching line SATISFIES this guard rather
+# than blocking it: the "over-block" reading of a previous version of this
+# comment was wrong.
+#
+# The residual is therefore the OTHER direction: a head move that changed the
+# diff can leave the first matching line stale, and this guard still passes. The
+# other two consumers are STRICTER, in different ways:
+#   - the CI gate (`ai-review-gate.yml`) enumerates ALL markers and keeps a
+#     candidate only when it is bound to the head OR its `diff=` matches the
+#     live diff — so a body whose ONLY marker is stale is REJECTED;
+#   - the producer (`record-review.sh`) greps for the LIVE diff and APPENDS when
+#     it does not match, so stale older markers accumulate.
+# What none of them does is reject a body *merely because its first matching
+# line is stale* — which is why the over-block claimed here never occurred.
+#
+# Owner of the remaining work: #1397. (The content identity itself already
+# landed — `record-review.sh` writes `diff_sha256` into the signed evidence,
+# #2982/#767; #1397 tracks what remains.)
 
 resolve_repo() {
   if [ -z "$REPO" ]; then
