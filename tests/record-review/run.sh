@@ -636,6 +636,59 @@ echo
 # case — the one this exists for — survives either spelling. The numeric guard exists
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
+echo "── 18. A shell FUNCTION named git must not forge the DECISIVE merge (what `command git` is for)"
+# The `command gh` commit had no test — §14 exists because of that. The `git` half was
+# MISSING ENTIRELY: a cycle-14 reviewer exported a function named git whose `merge-tree`
+# returned a tree of its choosing, and a head carrying unreviewed content CARRYed. MEASURED
+# there: REFUSE without the function, CARRY with it. Only (D) stands between this head and a
+# carry, so forging git is enough to break the gate.
+D="$(new_repo gitfunc)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+advance_base "$D"
+TI="$(mktemp)"; rm -f "$TI"
+GIT_INDEX_FILE="$TI" git read-tree "$(git rev-parse main^{tree})"
+BLOB="$(printf 'UNREVIEWED\n' | git hash-object -w --stdin)"
+GIT_INDEX_FILE="$TI" git update-index --add --cacheinfo "100644,$BLOB,pwn.txt"
+TREE_PWN="$(GIT_INDEX_FILE="$TI" git write-tree)"
+rm -f "$TI"
+P2="$(git rev-parse main)"
+CURRENT="$(git commit-tree "$TREE_PWN" -p "$REVIEWED" -p "$P2" -m head)"
+git update-ref refs/heads/pr "$CURRENT"
+git checkout -q pr
+git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
+  && pass "(18) the head tree really CARRIES the unreviewed file — the forging fixture is hostile" \
+  || fail "(18) fixture is wrong: the head does not carry pwn.txt, so nothing is at stake"
+[ "$(git rev-parse "$CURRENT^2")" = "$P2" ] \
+  && pass "(18) the second parent is the real base, so (C) passes and only (D) can refuse" \
+  || fail "(18) fixture is wrong: the second parent is not the base"
+# The forged git makes `merge-tree` return the HEAD's own tree, so (D)'s equality holds by
+# construction. Every other clause is satisfied by the real graph, so the function is exactly
+# what stands between this head and a carry.
+gitforge_verdict() { # <fnfile> -> 0 carry / 1 refuse
+  ( cd "$D" || exit 9
+    export FIXTURE_BASE_SHA; FIXTURE_BASE_SHA="$(git rev-parse main)"
+    export VICTIM_TREE; VICTIM_TREE="$(git rev-parse "$CURRENT^{tree}")"
+    git() {
+      case "$1" in
+        merge-tree) echo "$VICTIM_TREE"; return 0 ;;
+      esac
+      command git "$@"
+    }
+    source "$1"; PR=1
+    if lane_dimension_carry "$REVIEWED" "$CURRENT"; then echo 0; else echo 1; fi )
+}
+[ "$(gitforge_verdict "$TMP/fn.sh")" = 1 ] \
+  && pass "(18) a shell FUNCTION named git cannot forge merge-tree — the real git is used, and the head is REFUSED" \
+  || fail "(18) a shell FUNCTION named git forged (D) and CARRIED unreviewed content — FAIL-OPEN"
+M18="$TMP/mut-nocommandgit.sh"
+if mutate 'merged="$(command git merge-tree' 'merged="$(git merge-tree' "$M18"; then
+  [ "$(gitforge_verdict "$M18")" = 0 ] \
+    && pass "mutation NOCOMMANDGIT is caught: without \`command\` the forged merge-tree CARRIES unreviewed content, so \`command git\` IS load-bearing" \
+    || fail "mutation NOCOMMANDGIT NOT caught — \`command git\` is not what refuses the forged merge"
+else
+  fail "mutation NOCOMMANDGIT: could not apply it — coverage is blind"
+fi
+
 echo "── 15. STATIC GUARD: no bare \`gh\` invocation may be reintroduced"
 # A reviewer found the HEAD read still calling bare `gh`, which let an exported bash
 # FUNCTION named gh make CURRENT_HEAD == SHA and skip the stale-sha guard, minting a signed
@@ -915,7 +968,7 @@ UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
   && pass "CARRY (0) — a union-merged base move is carried, per tortoise#5373's declared semantics" \
   || fail "REFUSED a legitimately union-merged head — a blob-level purity check here would break the append-only registries"
 
-MIN_ASSERTIONS=66
+MIN_ASSERTIONS=70
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

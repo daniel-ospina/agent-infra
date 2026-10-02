@@ -524,12 +524,12 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # refuse. (The base IDENTITY below still comes from the API — that is a read of
   # the PR's declared base, not a fetch of content, and an earlier version of this
   # comment wrongly implied the function made no network call at all.)
-  git cat-file -e "$reviewed^{commit}" 2>/dev/null || return 1
-  git cat-file -e "$current^{commit}" 2>/dev/null || return 1
+  command git cat-file -e "$reviewed^{commit}" 2>/dev/null || return 1
+  command git cat-file -e "$current^{commit}" 2>/dev/null || return 1
 
   # (B) THE HEAD MOVED FORWARD. A rewritten/rebased head is a DIFFERENT artifact
   # even when its lane commits look equivalent, so it must never carry this way.
-  git merge-base --is-ancestor "$reviewed" "$current" 2>/dev/null || return 1
+  command git merge-base --is-ancestor "$reviewed" "$current" 2>/dev/null || return 1
 
   # (C) THE BASE IS AN AUTHORITATIVE COMMIT FROM THE API — NOT A LOCAL REF.
   # An earlier cut of this function asked `--not origin/$base`, trusting a LOCAL
@@ -560,6 +560,13 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # MEASURED on a real pair: `--is-ancestor p2 base_sha` is TRUE while
   # `--is-ancestor base_sha p2` is FALSE. Read the argument order, not the prose.
   base_sha="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+  # `command` is applied to BOTH external commands this function runs, `gh` AND `git`,
+  # because the shell-FUNCTION vector is the same for each: an EXPORTED function is
+  # inherited by `bash record-review.sh`. A reviewer PROVED the `git` half end-to-end —
+  # an exported function named git forging `merge-tree` made a head carrying unreviewed
+  # content CARRY, since every clause here is computed through bare git. A function is
+  # skipped by `command`; a PATH shim or a config redirect is NOT, and stays declared out
+  # (an actor who controls this process's environment can write the review record itself).
   # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
   # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
   # 40-hex, so the shape check does not stop it).
@@ -621,17 +628,17 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # name is not an authority.
   case "$base_sha" in *[!0-9a-f]*|"") return 1 ;; esac
   [ "${#base_sha}" -eq 40 ] || return 1
-  git cat-file -e "$base_sha^{commit}" 2>/dev/null || return 1
-  p2="$(git rev-parse "$current^2" 2>/dev/null || true)"
+  command git cat-file -e "$base_sha^{commit}" 2>/dev/null || return 1
+  p2="$(command git rev-parse "$current^2" 2>/dev/null || true)"
   [ -n "$p2" ] || return 1
-  git merge-base --is-ancestor "$p2" "$base_sha" 2>/dev/null || return 1
+  command git merge-base --is-ancestor "$p2" "$base_sha" 2>/dev/null || return 1
 
   # (C2) NO LANE COMMITS IN BETWEEN: every intervening commit not reachable from the
   # AUTHORITATIVE base must be a MERGE. A single non-merge commit is lane work and a
   # fresh review is owed (that is the #5421 counter-example: cfe2bad0afaa is one).
   # The walk's STATUS IS CHECKED EXPLICITLY: a failed walk prints nothing to stdout,
   # and "nothing" here would read as "no lane commits" — the fail-open direction.
-  extra="$(git rev-list --no-merges "$reviewed..$current" --not "$base_sha" 2>/dev/null)" || rc=$?
+  extra="$(command git rev-list --no-merges "$reviewed..$current" --not "$base_sha" 2>/dev/null)" || rc=$?
   [ "$rc" -eq 0 ] || return 1
   [ -z "$extra" ] || return 1
 
@@ -645,11 +652,11 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # successful merge-tree and the guard rested on the tree inequality alone — which
   # contradicts this function's own fail-closed claim and was refuted by a reviewer
   # reproduction. Requiring rc=0 restores "conflict => refuse" as a real gate.
-  merged="$(git merge-tree --write-tree "$reviewed" "$p2" 2>/dev/null)" || mrc=$?
+  merged="$(command git merge-tree --write-tree "$reviewed" "$p2" 2>/dev/null)" || mrc=$?
   [ "$mrc" -eq 0 ] || return 1
   merged="$(printf '%s' "$merged" | head -1)"
   [ -n "$merged" ] || return 1
-  ctree="$(git rev-parse "$current^{tree}" 2>/dev/null || true)"
+  ctree="$(command git rev-parse "$current^{tree}" 2>/dev/null || true)"
   [ -n "$ctree" ] || return 1
   [ "$merged" = "$ctree" ] || return 1
   return 0
