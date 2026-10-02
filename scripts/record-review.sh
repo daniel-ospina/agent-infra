@@ -494,16 +494,22 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 # FAIL-CLOSED: every clause below returns non-zero on any doubt (missing object,
 # unreadable base, merge-tree unavailable, conflict), so the existing refusal path
 # still governs. Nothing here can accept what the old arm rejected except by
-# proving the reviewed artifact unchanged. Replace/graft refs, which could present a
-# different commit graph to this check, are neutralised for its duration below.
+# proving the reviewed artifact unchanged. Replace refs and the grafts FILE, either of
+# which could present a different commit graph to this check, are neutralised for its
+# duration below — the two are DIFFERENT mechanisms and need different env vars.
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
   local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
-  # Replace/graft refs rewrite what rev-list, rev-parse and rev-parse^{tree} SEE, so a
-  # local `refs/replace/*` can present a different commit graph to this predicate than
-  # the one that is really there — a reviewer built exactly that and turned a REFUSE
-  # fixture into a CARRY. `local -x` scopes the export to this function, so the git
-  # subprocesses here ignore them and the rest of the script is unaffected.
-  local -x GIT_NO_REPLACE_OBJECTS=1
+  # Replace refs AND the grafts FILE both rewrite what rev-list, rev-parse and
+  # rev-parse^{tree} SEE, so either one can present a different commit graph to this
+  # predicate than the one that is really there — reviewers built BOTH and turned a
+  # REFUSE fixture into a CARRY with unreviewed content in the head tree.
+  # `GIT_NO_REPLACE_OBJECTS` covers ONLY `refs/replace/*`. A reviewer measured that a
+  # `.git/info/grafts` line STILL carried under it (walk emptied, verdict CARRY), and that
+  # `GIT_GRAFT_FILE=/dev/null` is what actually disables the file mechanism — reproduced
+  # independently before this line was written, because the first version of this comment
+  # claimed "Replace/graft refs ... are neutralised" while only replace refs were.
+  # `local -x` scopes both exports to this function; the rest of the script is unaffected.
+  local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
   [ -n "$reviewed" ] && [ -n "$current" ] || return 1
   [ "$reviewed" != "$current" ] || return 1
 

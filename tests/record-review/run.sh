@@ -19,10 +19,13 @@
 #
 # SCOPE OF THAT CLAIM, measured (a reviewer removed EVERY production line and recorded
 # which removals the suite caught, so this is enumerated rather than asserted):
-#   - COVERED individually: the second-parent rev-parse, the merge-tree rc capture and
-#     rc check, the `head -1` tree parse, the tree-equality check (§9), each half of the
-#     base shape validation (§8a), the (C2) lane-commit check (§11), the base identity,
-#     and the replace-blind export (§12, a HEAD graft).
+#   - COVERED individually — removal turns the suite RED. The interior lines that are
+#     load-bearing: the same-sha check, the two base-identity reads, each half of the base
+#     shape validation (§8a), the second-parent rev-parse, the `rev-list` capture and its
+#     rc check, the (C2) lane-commit check (§11), the merge-tree rc capture, its rc check
+#     and the `head -1` tree parse (§7), the `ctree` capture and the tree-equality check
+#     (§9), the replace-blind export (§12, a HEAD graft), the grafts-file export (§13), and
+#     the `local` declaration that carries both exports.
 #   - DEFENCE-IN-DEPTH, NOT individually covered — this list names EVERY non-comment line
 #     whose removal leaves the suite GREEN, measured by deleting every line of the function
 #     one at a time: the argument-presence check, the two `cat-file` presence checks, the
@@ -150,6 +153,11 @@ git checkout -q pr
 printf 'a real fix\n' > fix.txt && git add -A && git commit -qm "fix(lint): a real lane commit"
 git merge -q --no-edit main
 CURRENT="$(git rev-parse HEAD)"
+# The premise is stated in the caption, so it is ENFORCED: a reviewer made this commit
+# empty and the suite stayed green, meaning the caption's claim was untested.
+[ -n "$(git diff --name-only "$REVIEWED" "$CURRENT^1")" ] \
+  && pass "(2) the lane commit really CHANGED content — the caption's premise holds" \
+  || fail "(2) fixture is wrong: the lane commit is empty, so the premise is unenforced"
 [ "$(carry_verdict "$D" "$REVIEWED" "$CURRENT")" = 1 ] \
   && pass "REFUSE (1) — lane work in between is not carried (the #5421 counter-example)" \
   || fail "CARRIED a head whose lane commits changed — FAIL-OPEN"
@@ -175,6 +183,17 @@ D="$(new_repo rewritten)"; cd "$D" || exit 2
 REVIEWED="$(git rev-parse HEAD)"
 git commit -q --amend -m "lane work (amended)"
 CURRENT="$(git rev-parse HEAD)"
+# A reviewer mutated this fixture's SETUP (a descendant commit instead of a rewrite) and
+# the suite stayed green, so the assertion was not exercising a rewrite at all. Without
+# these two the caption is a claim, not a test.
+[ "$REVIEWED" != "$CURRENT" ] \
+  && pass "(4) the amend really produced a DIFFERENT head" \
+  || fail "(4) fixture is wrong: the head did not change, so this tests the same-sha check instead"
+if git merge-base --is-ancestor "$REVIEWED" "$CURRENT" 2>/dev/null; then
+  fail "(4) fixture is wrong: the new head DESCENDS from the reviewed one — it is not a rewrite"
+else
+  pass "(4) the new head is NOT a descendant of the reviewed one — it is genuinely a rewrite"
+fi
 [ "$(carry_verdict "$D" "$REVIEWED" "$CURRENT")" = 1 ] \
   && pass "REFUSE (1) — the reviewed head is not an ancestor of the rewritten one" \
   || fail "CARRIED across a rewrite — FAIL-OPEN"
@@ -494,6 +513,45 @@ else
   fail "mutation NOREPL: could not apply it — coverage is blind"
 fi
 
+echo "── 13. The GRAFTS FILE is a DIFFERENT mechanism from replace refs: cover both"
+# A reviewer built this and it is the reason the export line changed. A head whose tree
+# carries an unreviewed file, with a `.git/info/grafts` line making the base reachable
+# from the lane commit. Under GIT_NO_REPLACE_OBJECTS=1 ALONE the (C2) walk emptied and the
+# verdict CARRIED — the grafts file is NOT covered by that variable. Reproduced
+# independently before the fix: `GIT_GRAFT_FILE=/dev/null` is what disables it, so BOTH
+# variables are now set. This fixture is the regression guard for that.
+D="$(new_repo graftfile)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+advance_base "$D"
+BASE="$(git rev-parse main)"
+git checkout -q pr
+printf 'UNREVIEWED\n' > pwn.txt; git add -A; git commit -qm "unreviewed lane work"
+LANE="$(git rev-parse HEAD)"
+# the head: its tree is LANE's (it carries pwn.txt), and its second parent IS LANE.
+M13HEAD="$(git commit-tree "$(git rev-parse "$LANE^{tree}")" -p "$REVIEWED" -p "$LANE" -m head)"
+git update-ref refs/heads/pr "$M13HEAD"
+git checkout -q pr
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$M13HEAD")" = 1 ] \
+  && pass "(13 control) without any graft this is REFUSED — the lane commit is seen" \
+  || fail "(13) control failed: the fixture does not refuse to begin with"
+printf '%s %s\n' "$BASE" "$LANE" > .git/info/grafts
+if git merge-base --is-ancestor "$LANE" "$BASE" 2>/dev/null; then
+  pass "(13) the grafts FILE is live: it makes the lane commit reachable from the base, emptying the (C2) walk"
+else
+  fail "(13) the grafts file did not take — the fixture is vacuous"
+fi
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$M13HEAD")" = 1 ] \
+  && pass "(13) WITH GIT_GRAFT_FILE set the grafted head is still REFUSED" \
+  || fail "(13) a grafts-file graft CARRIED unreviewed lane work — FAIL-OPEN"
+M13="$TMP/mut-nograftfile.sh"
+if mutate ' GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null' ' GIT_NO_REPLACE_OBJECTS=1' "$M13"; then
+  [ "$(verdict_with "$D" "$M13" "$REVIEWED" "$M13HEAD")" = 0 ] \
+    && pass "mutation NOGRAFTFILE is caught: with only the replace export the grafts-file vector CARRIES unreviewed work, so GIT_GRAFT_FILE IS load-bearing" \
+    || fail "mutation NOGRAFTFILE NOT caught — the grafts-file export is not what refuses this"
+else
+  fail "mutation NOGRAFTFILE: could not apply it — coverage is blind"
+fi
+
 echo
 # AN EXACT PIN, NOT A FLOOR WITH SLACK. $PASS only has to be non-zero for the suite to
 # be green, so a whole section can be deleted with no signal — a reviewer deleted one
@@ -503,7 +561,7 @@ echo
 # so the number is maintained on purpose rather than drifting. The numeric guard exists
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
-MIN_ASSERTIONS=39
+MIN_ASSERTIONS=46
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
