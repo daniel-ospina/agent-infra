@@ -7742,6 +7742,39 @@ pe_case "dash-then-multiline flow"    yes $'on:\n  push:\n    branches:\n      -
 pe_case "anchored key fails closed"   unknown $'on:\n  push:\n  &a pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 pe_case "tagged key fails closed"     unknown $'on:\n  push:\n  !!str pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 
+# ── #1542: the trigger's FILTERS decide measurability, not just its name ────
+# A `pull_request` that declares `paths:` can only attach a check to a PR whose
+# changed set matches. So the SAME workflow must answer `yes` for a matching PR
+# and `no` for a non-matching one — a name-only rule cannot tell them apart, and
+# the direction that matters is the MATCHING one: mis-evaluating a matching
+# filter as "cannot attach" exempts a red the PR COULD have measured, which is a
+# fail-open on the merge gate. Without the changed set the answer must be
+# `unknown` (blocking), never `no` — absent is not empty.
+pe_paths() {  # <label> <expected> <changed-paths> <yaml>
+  local got
+  got="$(printf '%s' "$4" | PR_CHANGED_PATHS="$3" wf_eval)"
+  [ "$got" = "$2" ] && pass "predicate[paths]: $1 -> $2" || fail "predicate[paths]: $1 -> expected $2, got '$got'"
+}
+PR_PATHS_YAML=$'on:\n  pull_request:\n    paths:\n      - src/**\n      - tools/x.py\n'
+pe_paths "matching changed set"        yes 'src/a.c'             "$PR_PATHS_YAML"
+pe_paths "non-matching changed set"    no  'README.md'           "$PR_PATHS_YAML"
+pe_paths "one of several matches"      yes $'README.md\nsrc/b.c'   "$PR_PATHS_YAML"
+pe_paths "NO changed set fails closed" unknown ''                "$PR_PATHS_YAML"
+pe_paths "star does not span slash"    no  'src/deep/a.c'        $'on:\n  pull_request:\n    paths:\n      - src/*.c\n'
+pe_paths "globstar spans slash"         yes 'src/deep/a.c'        $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+pe_paths "negation excludes"            no  'src/gen/a.c'         $'on:\n  pull_request:\n    paths:\n      - src/**\n      - !src/gen/**\n'
+pe_paths "unfiltered PR ignores paths"  yes ''                    $'on:\n  pull_request:\n'
+pe_paths "inline flow paths match"      yes 'src/a.c'             $'on:\n  pull_request:\n    paths: [src/**]\n'
+pe_paths "inline flow paths no match"   no  'README.md'           $'on:\n  pull_request:\n    paths: [src/**]\n'
+pe_paths "paths-ignore excludes"        no  'docs/a.md'           $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+pe_paths "paths-ignore non-matching"    yes 'src/a.c'             $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+pe_paths "both paths keys fails closed" unknown 'src/a.c'        $'on:\n  pull_request:\n    paths:\n      - src/**\n    paths-ignore:\n      - docs/**\n'
+# The push exemptions must be UNTOUCHED by this: a `push` is never PR-evaluable,
+# filtered or not. (This is the #6807 contract; a draft of #1542 briefly widened
+# it and regressed #6807's own fixture.)
+pe_paths "push + branches still exempt" no 'src/a.c'             $'on:\n  push:\n    branches: [main]\n'
+pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\n'
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1

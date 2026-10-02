@@ -115,14 +115,27 @@ case "${1:-} ${2:-}" in
     prev=""
     for x in "$@"; do [ "$prev" = "--jq" ] && jqprog="$x"; prev="$x"; done
     case "$ep" in
-      */commits/*/check-runs)
+      */commits/*/check-runs*)
+        # A read without --paginate sees ONE page only. The rail's terminal verdict
+        # must be computed over ALL pages, so the fake models the page boundary:
+        # the fixture is multi-line (one line per page), and only a paginated read
+        # is served every line. A single-line fixture is unaffected.
+        page() { local f="$1"; shift; if [[ " $* " == *" --paginate "* ]]; then cat "$SCEN/$f"; else head -1 "$SCEN/$f"; fi; }
         case "$jqprog" in
-          *'!= "completed"'*) cat "$SCEN/pending" 2>/dev/null || echo 0 ;;
-          *'== "completed"'*) cat "$SCEN/completed" 2>/dev/null || echo 1 ;;
+          *'!= "completed"'*) page pending "$@" 2>/dev/null || echo 0 ;;
+          *'== "completed"'*) page completed "$@" 2>/dev/null || echo 1 ;;
           *) echo 0 ;;
         esac
         exit 0 ;;
       */compare/*)
+        # the MEASURED distance (B13) — a DISTINCT field from the merge base, read
+        # by its own jq program. Without this arm the harness would answer the
+        # behind_by read with a merge-base sha (non-numeric), so behind_by_of would
+        # report "unreadable" in EVERY scenario and the drift-refresh path could
+        # never be exercised at all.
+        case "$jqprog" in
+          *behind_by*) cat "$SCEN/behind" 2>/dev/null || echo 0; exit 0 ;;
+        esac
         # model a base REWRITE inside the unit: the Nth compare returns the Nth line
         if [ -f "$SCEN/mb-seq" ]; then
           n=$(( $(cat "$SCEN/mb-count" 2>/dev/null || echo 0) + 1 ))
@@ -232,6 +245,7 @@ new_scen() {
   printf 'MERGED\n' > "$SCEN/merged"
   printf 'cccccccccccccccccccccccccccccccccccccccc\n' > "$SCEN/merge-base"
   printf '9999999999999999999999999999999999999999\n' > "$SCEN/base-tip"
+  printf '0\n' > "$SCEN/behind"
   mkdir -p "$SCEN/tmp"
   : > "$SCEN/calls"
   # default fixture record: verdict clean at the OLD head
@@ -531,6 +545,55 @@ called "pr update-branch" && fail "updated a PR that was not BEHIND" || pass "no
 called "record-review" && fail "re-recorded an unchanged head (dilutes the evidence)" || pass "no re-record of a fresh head"
 called "admin-merge 42" && pass "landed directly" || fail "did not land"
 
+# ═══ 9b. B13 — a BLOCKED, MEASURABLY-behind PR is updated ═══════════════
+# The deadlock: a branch more than the drift-guard's 20 commits behind main has
+# its drift-guard check FAIL, so GitHub reports `BLOCKED`, not `BEHIND` — and an
+# update predicate keyed on the enum skipped the very update that would clear it
+# (tortoise #6210 behind 39, #6169 behind 42). The rail must MEASURE the distance
+# and update when it is non-zero, so the behind PR REACHES the B5 presence check.
+echo "── 9b. B13 — mergeStateStatus=BLOCKED with a measured lag is updated"
+new_scen blockedbehind
+printf 'BLOCKED\n' > "$SCEN/state"
+printf '39\n' > "$SCEN/behind"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the unit completes (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch 42" && pass "B13: a BLOCKED, 39-behind PR was updated (the deadlock is closed)" \
+  || fail "B13: BLOCKED still skipped the update — the deadlock is intact"
+called "admin-merge 42" && pass "the unit landed" || fail "did not land"
+
+# ═══ 9c. B13 — a measured distance of 0 keeps the no-op under BLOCKED ═══
+# The other direction: the measurement must not become an excuse to refresh
+# everything. A BLOCKED head GitHub already reports as level with its base is a
+# genuine no-op, and re-cutting it would spend the attestation for nothing.
+echo "── 9c. B13 — a measured distance of 0 keeps the no-op even under BLOCKED"
+new_scen blockedclean
+printf 'BLOCKED\n' > "$SCEN/state"
+printf '0\n' > "$SCEN/behind"
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "completes (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" && fail "updated despite a measured distance of 0" || pass "measured 0 → no update"
+called "admin-merge 42" && pass "landed directly (fresh head)" || fail "did not land"
+
+# ═══ 9d. B13 — an unmeasurable BLOCKED state fails closed ═════════════
+# An unreadable distance is not proof the head is current. `CLEAN` keeps its
+# no-op, but a state GitHub calls blocked must never be read as up to date.
+echo "── 9d. B13 — an unreadable distance under BLOCKED stops, not \"up to date\""
+new_scen blockedunmeasured
+printf 'BLOCKED\n' > "$SCEN/state"
+: > "$SCEN/behind"   # the compare read yields nothing usable (empty distance)
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) — did not certify an unmeasured base relation" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "updated on an unmeasured distance" || pass "no update on an unmeasured distance"
+called "admin-merge" && fail "landed on an unmeasured base relation (B13 fail-open)" || pass "did NOT land unmeasured"
+grep -q "could not measure the head/base divergence" "$SCEN/err" && pass "the stop names the unmeasured divergence" || fail "the stop does not name the unmeasured divergence"
+
 # ═══ 10. the merge is never hand-rolled, and the rail never reads protection ═
 echo "── 10. the rail never issues a raw merge, and has no branch-protection dependency"
 new_scen norewrite
@@ -789,6 +852,27 @@ rc=$?
 [ "$rc" -eq 1 ] && pass "refused (rc 1) — no line verified under the current key" || fail "expected rc 1, got $rc"
 called "pr update-branch" && fail "spent the attestation under a rotated key (B5)" || pass "did NOT update"
 
+# 17k. the check-runs read spans PAGES — a partial page is not a verdict.
+# Measured 2026-09-29: a real head carried 47 check-runs and the bare endpoint
+# returned 30, so the rail was answering "are the checks terminal" from a
+# truncated surface. The dangerous direction is a FALSE TERMINAL: pending checks
+# beyond page 1 read as zero and are handed to the land step.
+echo "── 17k. multi-page check-runs: the pages are summed, not truncated"
+new_scen crpages
+printf '0\n3\n' > "$SCEN/pending"   # page 1: none pending · page 2: three
+printf '5\n2\n' > "$SCEN/completed"
+run_rail 42 --repo "$REPO" --poll 0 --wait-timeout 0
+rc=$?
+called "per_page=100" \
+  && pass "reads check-runs with per_page=100 — not the default 30-item page" \
+  || fail "check-runs read without per_page (the default page was 30 of 47 measured)"
+[ "$rc" -eq 1 ] && pass "refused (rc 1) — page 2's pending checks were COUNTED" \
+               || fail "expected rc 1, got $rc — page 2's 3 pending checks were invisible (false terminal)"
+grep -q "not terminal" "$SCEN/err" \
+  && pass "the refusal names the wait" \
+  || fail "the refusal does not name the wait"
+called "admin-merge 42" && fail "LANDED on a truncated read" || pass "did not land"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -902,11 +986,22 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # B12b: the CAPTURE read must fail closed — an empty capture must not silently
   # disable the pre-land comparison (the path the reviewer reproduced).
   mutate_and_expect_fail B12b 's/if \[ -z "\$CERT_BASE_TIP" \]; then/if false; then/'
+  # B13: neutralise the MEASUREMENT — trust `mergeStateStatus` alone. A FAILING
+  # required check masks a stale head as BLOCKED, so the measuring arm is the only
+  # thing that sees the lag; with the distance always reading 0 the >20-behind PR
+  # the drift-guard is blocking never gets the update that would clear it.
+  mutate_and_expect_fail B13 's/behind="\$\(behind_by_of "\$BASE" "\$HEAD"\)"/behind=0/'
   # B11: never take the per-PR lock
   mutate_and_expect_fail B11  's/\[ "\$DRY_RUN" -eq 0 \] && acquire_lock//'
   # D1d (#1362): the partial-install diagnostic is not a bypass class, but it is
   # a D1 behavior the suite pins — removing its guard must redden scenario 2.
   mutate_and_expect_fail D1d  's/if \[ ! -f "\$DIFF_NORMALIZER_SH" \]; then/if false; then/'
+  # D2a (2026-09-29): the check-runs read must not use the default 30-item page —
+  # the terminal verdict is computed over a truncated surface otherwise.
+  mutate_and_expect_fail D2a  's/\?per_page=100//'
+  # D2b: --paginate emits ONE result per page; reading only the first page hides a
+  # later pending check and turns it into a false terminal verdict.
+  mutate_and_expect_fail D2b  's/ --paginate//g'
 fi
 
 if [ "$failures" -gt 0 ]; then

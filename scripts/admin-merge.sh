@@ -1912,6 +1912,12 @@ WF_PR_EVAL_CACHE=""
 # function sets this global and the caller reads it, keeping the call a plain
 # (non-subshell) call. §67(f) pins both the cache hit and the absence of a leak.
 WPE_VERDICT="unknown"
+# #1542: the PR's changed set, read ONCE per invocation (a base surface carries
+# many reds). EMPTY on a failed read, which the predicate reads as UNDECIDABLE
+# (`unknown`) — never as "no paths changed", which would exempt a red the PR
+# could have measured.
+WF_PR_CHANGED_PATHS=""
+WF_PR_PATHS_READ=0
 workflow_pr_evaluable() {
   local slug="$1" wf_path="$2" wf_ref="$3" cached body verdict
   WPE_VERDICT="unknown"
@@ -1930,7 +1936,18 @@ workflow_pr_evaluable() {
   if [ -z "$body" ]; then
     verdict="unknown"
   else
-    verdict="$(printf '%s' "$body" | bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
+    # #1542: a `paths:`-filtered `pull_request` workflow can only attach a check
+    # to this PR's head if one of the PR's changed files matches its filter.
+    # Without that filter the predicate could only answer `yes` for every
+    # filtered workflow — comparing the PR against a base red it can never
+    # produce (an over-block with a remedy no rebase satisfies).
+    if [ "$WF_PR_PATHS_READ" -eq 0 ]; then
+      WF_PR_PATHS_READ=1
+      WF_PR_CHANGED_PATHS="$($GH api "repos/$slug/pulls/$PR/files?per_page=100" --paginate \
+                                 --jq '.[].filename' 2>/dev/null || true)"
+    fi
+    verdict="$(printf '%s' "$body" | PR_CHANGED_PATHS="$WF_PR_CHANGED_PATHS" \
+                 bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
   fi
   case "$verdict" in
     yes|no) ;;
