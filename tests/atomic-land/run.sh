@@ -104,7 +104,11 @@ case "${1:-} ${2:-}" in
         # boolean (MEASURED: `MERGEABLE`). This fixture must speak the CLI's language:
         # when it spoke REST's (`true`) the suite certified a predicate that could
         # never match in production — the #1565 review P0.
-        cat "$SCEN/mergeable" 2>/dev/null || echo MERGEABLE; exit 0 ;;
+        # The DEFAULT when the fixture is absent is deliberately the NON-matching token:
+        # defaulting to MERGEABLE would let a future scenario that sets strict=false and
+        # forgets the fixture silently take the SKIP path instead of reddening (round-2
+        # review). Absent ⇒ unreadable ⇒ refresh — the fail-closed direction.
+        cat "$SCEN/mergeable" 2>/dev/null || echo UNKNOWN; exit 0 ;;
       *isDraft*)
         printf '%s\t%s\t%s\t%s\n' "$(cur_head)" "$(cat "$SCEN/base" 2>/dev/null || echo main)" \
           "$(cur_state)" "$(cat "$SCEN/draft" 2>/dev/null || echo false)"
@@ -625,6 +629,11 @@ for s in "$TMP/scen-happy" "$TMP/scen-fresh" "$TMP/scen-dryrun"; do
   # read could ship green — the very thing this pin exists to stop. The declaration is
   # "ONE positive read of `strict` per invocation", so pin the FIELD, the SHAPE and
   # the COUNT, not merely the endpoint.
+  # RESIDUAL (documented, deliberately not fixed): this greps the lowercase REST
+  # endpoint, so a differently-named route to the same datum (e.g. the GraphQL
+  # `branchProtectionRules`) would evade it — exactly as it evaded the pin before this
+  # change. Today the rail reads REST, so the pin covers every read that exists; a
+  # future GraphQL read must extend this pin with it.
   if grep -E 'protection' "$s/calls" | grep -vE '/branches/[^/]+/protection[[:space:]]+--jq \.required_status_checks\.strict$' | grep -q .; then
     fail "$(basename "$s") read a protection setting other than the declared \`strict\` field read"
   else
