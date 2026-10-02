@@ -560,12 +560,12 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   #     justified: (D) pins the head to the AUTOMATIC merge of `reviewed` with a base-LINEAGE
   #     commit, so the only content the head adds beyond that base lineage is `reviewed`'s own
   #     contribution — the commit the review approved.
-  #     WHAT IS NOT CLAIMED HERE: no merge-base identity and no general theorem about landing.
-  #     An earlier draft asserted the head/base-tip merge base "is that base-lineage commit";
-  #     that is FALSE of the accepted set (a fabricated head can pass all five clauses with a
-  #     NEWER merge base), and a criss-cross history has TWO merge bases, so the singular is
-  #     ill-defined anyway. The landing property is PINNED BY MEASUREMENT in §20 of the suite,
-  #     which is where a reader should take it from. A head TREE exceeding `reviewed + base
+  #     WHAT IS NOT CLAIMED HERE: no general theorem about landing — that is pinned by
+  #     MEASUREMENT in §20/§21 of the suite. A merge-base IDENTITY **is** required, by clause
+  #     (C3) below, and it is required precisely because an earlier revision asserted it in
+  #     prose, a reviewer falsified the prose, the prose was deleted, and the invariant was left
+  #     UNENFORCED — which is exactly how the round-23 leak existed. A head TREE exceeding
+  #     `reviewed + base
   #     tip` is a DECLARED TOLERANCE, not a proof of safety, and §20 of the suite pins BOTH
   #     halves — including a fixture where the patch CHANGES and the head is still carried, so
   #     that a future tightening toward byte-identity reddens instead of landing; and
@@ -686,8 +686,11 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # A reviewer correctly falsified the sentence as written (it is false of the accepted set)
   # and it was removed — but removing the SENTENCE while leaving the CLAUSE out is what turned
   # a stated invariant into an unenforced one. The fix is the clause, not better prose.
-  # EXACTLY ONE merge base is required: a criss-cross history has two or more, and p2 being one
-  # of several does not carry the landing argument, so ambiguity fails CLOSED.
+  # AMBIGUITY FAILS CLOSED, and it is the EQUALITY line below that does it: a criss-cross
+  # history makes `mb` a MULTI-LINE string, which can never equal the single-sha `p2`
+  # (MEASURED: `--all` prints 2 bases, the verdict is REFUSE, and deleting the count line below
+  # changes no verdict). The count line is RETAINED AS DEFENCE — one line, with no decider role
+  # today — because it would matter if `mb` were ever narrowed to its first line.
   local mb=""
   mb="$(command git merge-base --all "$current" "$base_sha" 2>/dev/null)" || return 1
   [ "$(printf '%s\n' "$mb" | command grep -c .)" = 1 ] || return 1

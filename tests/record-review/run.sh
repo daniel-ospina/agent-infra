@@ -874,11 +874,13 @@ echo "── 16. A hand-built base-merge head is REFUSED by the ancestry/(C3) PA
 # parent M is a HAND-BUILT merge of two base commits, (C2) is empty (M is a merge, dropped by
 # --no-merges, and its parents are base commits) and (D) passes by construction — so something
 # else must refuse. M's tree carries an unreviewed file, so the stake is real.
-# WHAT THIS SECTION NO LONGER CLAIMS: that the ancestry check is load-bearing ON ITS OWN. That
-# was true until (C3) was added in round 23; (C3) refuses this head too, so removing EITHER
-# clause alone leaves it refusing. The honest statement is that the PAIR is load-bearing, and
-# that is what the mutation below now removes. A claim of the form "clause X is load-bearing on
-# its own" re-stales every time a clause is added — this one lasted three rounds.
+# WHAT THIS SECTION NO LONGER CLAIMS: that the ancestry check is load-bearing ON ITS OWN, or
+# even that the PAIR is. MEASURED (round 24): (C3)'s equality line ALONE refuses this head —
+# `git merge-base --all` returning exactly p2 implies p2 is an ancestor of the base tip, so
+# (C3) implies the ancestry check and the ancestry check cannot refuse anything (C3) admits.
+# Deleting the ancestry line alone changes NO verdict. The ancestry check is therefore RETAINED
+# AS DEFENCE, not as a decider: one line, and it would matter again if (C3) were ever narrowed.
+# The mutation below removes both, which is the honest statement of what is covered.
 D="$(new_repo c2ancestor)"; cd "$D" || exit 2
 REVIEWED="$(git rev-parse HEAD)"
 advance_base "$D"
@@ -905,7 +907,7 @@ git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
   && pass "(16) (D) passes by construction — the head tree IS the recomputed merge tree" \
   || fail "(16) fixture is wrong: (D) would refuse, so the ancestry check is not isolated"
 [ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
-  && pass "REFUSE (1) — only the second-parent ancestry check can refuse this head" \
+  && pass "REFUSE (1) — the ancestry/(C3) pair refuses this head (MEASURED: on this head, deleting the ancestry line alone changes NO verdict — (C3)'s equality refuses it; an earlier label here said the ancestry check alone does)" \
   || fail "CARRIED a head whose second parent is not base-derived — FAIL-OPEN"
 M16="$TMP/mut-noancestor-pair.sh"
 python3 - "$TMP/fn.sh" "$M16" <<'PY' || fail "mutation NOANCESTORPAIR: could not build it — coverage is blind"
@@ -992,8 +994,9 @@ echo "── 20. The base-ANCESTOR tolerance is DECLARED and PINNED (do not 'fix
 # a line inside the LANE's hunk CONTEXT makes the RENDERED PATCH CHANGE while the carry is still
 # correct, which is why byte-identity cannot be the reason (§2982's arm would suffice if it
 # were). An earlier draft of this comment said the section "pins all of" a landing THEOREM; it
-# pins the properties listed, by measurement, and no theorem — the theorem-form claim was false
-# (a fabricated head passes all five clauses with a different merge base).
+# pins the properties listed, by measurement, and no theorem. (The fabricated head that made
+# the theorem-form claim false is now REFUSED by (C3) — see §21 — but the claim was false when it
+# was written and would be false again if (C3) were removed, which is why it stays deleted.)
 D="$(new_repo c20ancestor)"; cd "$D" || exit 2
 REVIEWED="$(git rev-parse HEAD)"
 B0="$(git rev-parse main)"
