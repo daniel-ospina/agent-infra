@@ -338,7 +338,7 @@ if [ -z "$REPO" ]; then
   REPO="${GH_REPO:-}"
 fi
 if [ -z "$REPO" ]; then
-  REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  REPO="$(command gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
 fi
 if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "repo must be owner/name (got '$REPO'); refusing to record" >&2; exit 2
@@ -412,7 +412,7 @@ diff_hash_for_pr() { # <pr>
   norm="$(mktemp 2>/dev/null)" || { rm -f "$tmp"; return 0; }
   # shellcheck disable=SC2064
   trap "rm -f '$tmp' '$norm'" RETURN 2>/dev/null || true
-  if gh api -H "Accept: application/vnd.github.v3.diff" \
+  if command gh api -H "Accept: application/vnd.github.v3.diff" \
        "repos/$REPO/pulls/$pr" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
     LEGACY_DIFF_HASH="$(openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
     if command -v python3 >/dev/null 2>&1 && [ -f "$DIFF_NORMALIZER" ] \
@@ -545,11 +545,14 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
   # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
   # 40-hex, so the shape check does not stop it).
-  # RESIDUAL — the vectors NOT covered, NAMED rather than implied: a shell FUNCTION (closed
-  # by `command gh`), a hostile BINARY earlier on PATH, and ENV/CONFIG redirection of the
-  # real binary (GH_HOST, GH_CONFIG_DIR, or an `http_unix_socket` in its config) — a reviewer
-  # demonstrated the last carrying unreviewed content through the REAL gh. An earlier version
-  # of this note named only the binary, which was false about what remains.
+  # RESIDUAL — the vectors NOT covered, NAMED rather than implied: a hostile BINARY earlier
+  # on PATH, and ENV/CONFIG redirection of the real binary (GH_HOST, GH_CONFIG_DIR, or an
+  # `http_unix_socket` in its config) — a reviewer demonstrated the last carrying unreviewed
+  # content through the REAL gh. (A shell FUNCTION named gh is CLOSED, not residual: every
+  # gh invocation in this script uses `command gh`. An earlier version of this note listed
+  # the function under "NOT covered" AND claimed it closed in the same breath, and the claim
+  # was untrue for the HEAD read, which a reviewer used to mint a signed
+  # `@ <stale> diff=<live>` pair.)
   # WHY THOSE ARE DECLARED OUT RATHER THAN CLOSED: this predicate's threat surface is REPO
   # STATE — a stale ref, a replace ref, a grafts file, a lying remote-tracking ref: things
   # wrong by accident or residue, which is what the rails actually met. An actor who controls
@@ -606,7 +609,7 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
 # which is precisely what the gate needs — instead of refusing and deadlocking.
 # When no such marker exists the diff is genuinely unreviewed → still refuse.
 if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
-  CURRENT_HEAD="$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
+  CURRENT_HEAD="$(command gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
   # gh api prints 4xx error bodies to stdout — only a well-formed 40-hex
   # sha counts as a successful fetch; anything else fails open.
   if ! [[ "$CURRENT_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
@@ -627,7 +630,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     # exact diff? Only then is the head-move provably a no-op to the artifact.
     PRIOR_DIFF=""
     if [ -n "$DIFF_HASH" ]; then
-      PRIOR_BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+      PRIOR_BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
       [ "$PRIOR_BODY" = "null" ] && PRIOR_BODY=""
       # The prior marker is evidence ONLY if it is AUTHENTIC. The PR body is
       # attacker-writable, so matching `sig=[0-9a-f]{64}` is not enough: a forged
@@ -720,7 +723,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     echo "⚠️ clean-micro tier guard: repo undetectable or gh missing — tier attestation UNVERIFIED (record proceeds; a non-micro linked issue should never be recorded clean-micro)" >&2
   else
-    BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+    BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
     [ "$BODY" = "null" ] && BODY=""
     if [ -z "$BODY" ]; then
       echo "⚠️ clean-micro tier guard: could not read the PR body of $REPO#$PR (gh/API failure or empty body?) — tier attestation UNVERIFIED (record proceeds)" >&2
@@ -745,7 +748,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
         while IFS= read -r ref; do
           [ -z "$ref" ] && continue
           num="${ref##*#}"
-          LABELS="$(gh api "repos/$REPO/issues/$num/labels" --jq '.[].name' 2>/dev/null || true)"
+          LABELS="$(command gh api "repos/$REPO/issues/$num/labels" --jq '.[].name' 2>/dev/null || true)"
           # A failed/filtered fetch yields nothing — undeterminable ref.
           if [ -z "$LABELS" ]; then
             echo "⚠️ clean-micro tier guard: could not fetch labels of $ref — that ref is undeterminable (record proceeds unless another ref is non-micro)" >&2
@@ -804,7 +807,7 @@ if [ "$VERDICT" = "clean-low" ]; then
   fi
   # One read for head + base + the authoritative changed-file count (the count
   # is GitHub's own, so a truncated or forged file list cannot pass unnoticed).
-  META="$(gh api "repos/$REPO/pulls/$PR" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null || true)"
+  META="$(command gh api "repos/$REPO/pulls/$PR" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null || true)"
   META_HEAD="$(printf '%s' "$META" | cut -f1)"
   META_BASE="$(printf '%s' "$META" | cut -f2)"
   META_COUNT="$(printf '%s' "$META" | cut -f3)"
@@ -824,7 +827,7 @@ if [ "$VERDICT" = "clean-low" ]; then
   # record pins the merge base, the consumer re-derives it, and the gate blocks
   # only when the content can actually differ. Pinning the tip instead would
   # false-block every clean-low PR on the next unrelated merge to main.
-  CMP="$(gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
+  CMP="$(command gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
   MB="$(printf '%s\n' "$CMP" | head -1 | cut -f2)"
   RAW="$(printf '%s\n' "$CMP" | tail -n +2)"
   if ! [[ "$MB" =~ ^[0-9a-f]{40}$ ]]; then
@@ -962,7 +965,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   fi
   # Read the PR body — distinguish a genuinely EMPTY body (post marker-only)
   # from a GET FAILURE (skip the post loudly — never clobber the description).
-  if BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
+  if BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
     [ "$BODY" = "null" ] && BODY=""
   else
     echo "⚠️ record-review: could not read PR body (transient API failure?) — evidence post skipped; record still saved. Re-run record-review.sh to retry the post." >&2
@@ -983,7 +986,7 @@ ${MISSING}"
       NEWBODY="$MISSING"
     fi
     jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
-      | gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
+      | command gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
       && echo "review evidence posted to $REPO#$PR body" \
       || echo "note: could not post review evidence to PR body (record still saved)" >&2
   fi

@@ -140,6 +140,12 @@ echo "── 1. a PURE base merge (no lane work): the reviewed artifact is uncha
 D="$(new_repo pure)"; cd "$D" || exit 2
 REVIEWED="$(git rev-parse HEAD)"
 advance_base "$D"
+# A reviewer made the base advance an EMPTY commit and this acceptance fixture stayed
+# green — "zero lane commits" still held, so nothing was actually being accepted. Assert
+# the base really moved CONTENT (the shape of the reported defect: #6072 two base merges).
+[ -n "$(git diff-tree --no-commit-id --name-only -r "$(git rev-parse main)")" ] \
+  && pass "(1) the base advance really carries CONTENT — the acceptance fixture's premise" \
+  || fail "(1) fixture is wrong: the base advanced by an EMPTY commit, so nothing is being accepted"
 git checkout -q pr && git merge -q --no-edit main
 CURRENT="$(git rev-parse HEAD)"
 [ "$(git rev-list --no-merges "$REVIEWED..$CURRENT" --not refs/heads/main | wc -l | tr -d ' ')" = 0 ] \
@@ -199,7 +205,7 @@ else
   pass "(4) the new head is NOT a descendant of the reviewed one — it is genuinely a rewrite"
 fi
 [ "$(carry_verdict "$D" "$REVIEWED" "$CURRENT")" = 1 ] \
-  && pass "REFUSE (1) — the reviewed head is not an ancestor of the rewritten one" \
+  && pass "REFUSE (1) — a rewritten head is refused (MEASURED: by the absent second parent, not by the ancestry clause — deleting (B) alone leaves the suite green, so this fixture does not decide (B))" \
   || fail "CARRIED across a rewrite — FAIL-OPEN"
 
 echo "── 5. THE P0 REGRESSION: a local ref that LIES about the base must not be trusted"
@@ -619,7 +625,48 @@ echo
 # so the number is maintained on purpose rather than drifting. The numeric guard exists
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
-MIN_ASSERTIONS=53
+echo "── 15. STATIC GUARD: no bare \`gh\` invocation may be reintroduced"
+# A reviewer found the HEAD read still calling bare `gh`, which let an exported bash
+# FUNCTION named gh make CURRENT_HEAD == SHA and skip the stale-sha guard, minting a signed
+# `@ <stale> diff=<live>` pair. Every gh call now uses `command gh`. This is a TEXT check,
+# not a behavioural one, and it is labelled as such — the alternative is an integration
+# harness driving the whole script, which is far more machinery for the same property.
+# What it prevents: the nine-character regression that reintroduces the vector in a file
+# nobody re-reads.
+# IT IS OCCURRENCE-BASED, NOT LINE-BASED, and that is a correction: the first version was a
+# grep that a verifier MEASURED blind to an INDENTED `if gh api` (so the diff-fetch site
+# could regress with the guard green) and that filtered whole LINES, suppressing a line
+# holding both a bare and a `command gh` call. It was a false-PASS guard.
+bare_gh_count() { # <file> -> number of gh INVOCATIONS not using `command `
+  python3 - "$1" <<'PY'
+import re, sys
+rx = re.compile(r"gh\s+(?=(?:api|repo|auth|run|pr|issue)\b)")
+n = 0
+for ln in open(sys.argv[1]).read().split("\n"):
+    if ln.lstrip().startswith("#"):
+        continue
+    code = re.sub(r"\s+#.*$", "", ln)
+    for m in rx.finditer(code):
+        # `command` must itself start a WORD: a verifier noted that a plain endswith(
+        # "command") also accepts `X=command gh api`, which is a bare invocation.
+        if not re.search(r"(^|[\s(|&;])command$", code[:m.start()].rstrip()):
+            n += 1
+print(n)
+PY
+}
+# Self-test the guard's own mechanism, so it cannot silently stop detecting: an INDENTED
+# bare `if gh api` must be counted (the case the grep missed) and `command gh` must not.
+ST="$TMP/bare-gh-selftest.sh"
+printf '  if gh api x\n    | command gh api y\nX=command gh api z\n' > "$ST"
+[ "$(bare_gh_count "$ST")" = 2 ] \
+  && pass "(15 self-test) the counter catches an INDENTED bare \`if gh api\` AND \`X=command gh api\`, and ignores a real \`command gh\`" \
+  || fail "(15 self-test) the counter is broken — it cannot detect an indented bare gh (the false-PASS the grep had)"
+BARE_GH="$(bare_gh_count "$SRC")"
+[ "$BARE_GH" = 0 ] \
+  && pass "(15) every gh INVOCATION in record-review.sh uses \`command gh\` (occurrence-based count = 0)" \
+  || fail "(15) $BARE_GH bare gh invocation(s) in record-review.sh — a shell function named gh can intercept them"
+
+MIN_ASSERTIONS=56
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
