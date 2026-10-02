@@ -13,8 +13,8 @@
 # lint fix (cfe2bad0afaa) landed in between — the refusal was CORRECT, a fresh
 # review was owed, was produced, and the PR MERGED.
 #
-# These fixtures reproduce those SHAPES hermetically (no network, no live PRs), and
-# section 6 MUTATES the function to prove the clauses it relies on are load-bearing —
+# These fixtures reproduce those SHAPES hermetically (no network, no live PRs), and the
+# mutation guards below assert that the clauses the work most depends on are load-bearing —
 # a suite that only proves the acceptance path would let a fail-open land green.
 #
 # SCOPE OF THAT CLAIM, and why there is NO line-by-line list here. This header used to
@@ -27,14 +27,19 @@
 # it is re-worded, so it is DELETED rather than re-worded a sixth time. The gate is the
 # MEASUREMENT, and it is one command: delete each non-comment interior line of
 # lane_dimension_carry in a scratch copy, run this suite, and the lines whose removal turns
-# it RED are the individually-covered set. Every other clause must be covered by another
-# clause, and the in-suite `mutate` guards below assert the ones that matter most.
+# it RED are the individually-covered set. Two caveats that are NOT exhaustive lists but
+# ARE named because reviewers found them: the `rev-list` rc check has NO fixture and no
+# other clause covers its arm (a failed walk leaves `extra` empty and the next line passes),
+# so it is kept as fail-closed defence and is KNOWN-UNCOVERED; and the function's final
+# `return 0` is not "covered", it is redundant.
 #   - The CALL SITE (`--force-stale` precedence in the #2982 arm) is NOT driven by this
 #     suite; it extracts and calls the function directly. That guard is verified by
 #     reading, and a test that runs the real script with --force-stale is a follow-up,
 #     not a claim made here.
-# An assertion-count floor at the tail exists because a whole section was once deleted
-# in an unrelated commit and the suite still reported ALL PASSED.
+# An assertion-count PIN at the tail exists because a whole section was once deleted
+# in an unrelated commit and the suite still reported ALL PASSED. It is a tripwire for
+# section loss — it cannot guard its own deletion, and that limit is stated here rather
+# than implied to be stronger.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -220,6 +225,11 @@ CURRENT="$(git rev-parse HEAD)"
 [ "$(git rev-parse --verify -q "$CURRENT^2" >/dev/null 2>&1 && echo yes)" = yes ] \
   && pass "the fixture really produced a MERGE commit (has a second parent)" \
   || fail "fixture is wrong: the lie fixture fast-forwarded, so the mutation is vacuous"
+# A reviewer emptied this fixture's hostile commit and the suite stayed green, so the pass
+# text below ("the unreviewed file is NOT carried") was unenforced. Check the stake exists.
+git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
+  && pass "(5) the head tree really CARRIES the unreviewed file — the refusal claim is enforced" \
+  || fail "(5) fixture is wrong: the head tree does not carry pwn.txt, so the refusal says nothing"
 ( cd "$D" && [ "$(git rev-parse refs/remotes/origin/main)" = "$(git rev-parse refs/heads/carrier)" ] ) \
   && pass "the fixture really has a LYING local origin/main (absent a fetch)" \
   || fail "fixture is wrong: the local ref is not diverged"
@@ -491,6 +501,11 @@ printf 'UNREVIEWED LANE WORK\n' > pwn.txt; git add -A; git commit -qm "unreviewe
 git merge -q --no-edit main
 CURRENT="$(git rev-parse HEAD)"
 BASE="$(git rev-parse main)"
+# A reviewer emptied this fixture's hostile commit and the suite stayed green (§12/§13 same
+# gap), so assert the stake before asserting the refusal.
+git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
+  && pass "(12) the head tree really CARRIES the unreviewed file" \
+  || fail "(12) fixture is wrong: the head does not carry pwn.txt, so the refusal says nothing"
 [ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
   && pass "(12 control) without any graft this is REFUSED — the lane commit is seen" \
   || fail "(12) control failed: the fixture does not refuse to begin with"
@@ -530,6 +545,9 @@ LANE="$(git rev-parse HEAD)"
 M13HEAD="$(git commit-tree "$(git rev-parse "$LANE^{tree}")" -p "$REVIEWED" -p "$LANE" -m head)"
 git update-ref refs/heads/pr "$M13HEAD"
 git checkout -q pr
+git ls-tree -r --name-only "$M13HEAD" | grep -qx pwn.txt \
+  && pass "(13) the head tree really CARRIES the unreviewed file" \
+  || fail "(13) fixture is wrong: the head does not carry pwn.txt, so the refusal says nothing"
 [ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$M13HEAD")" = 1 ] \
   && pass "(13 control) without any graft this is REFUSED — the lane commit is seen" \
   || fail "(13) control failed: the fixture does not refuse to begin with"
@@ -551,16 +569,57 @@ else
   fail "mutation NOGRAFTFILE: could not apply it — coverage is blind"
 fi
 
+echo "── 14. A shell FUNCTION named gh must not nominate the base (what \`command gh\` is for)"
+# The commit that added `command gh` HAD NO TEST: a reviewer deleted the `command ` and the
+# suite stayed green, so the exact fail-open that commit fixed could be reintroduced by
+# removing nine characters. This is that regression test. It uses a SIBLING unreviewed commit
+# so that forging the base to it satisfies (C), empties (C2) and leaves (D) intact — a shim
+# can emit 40 hex, so the shape check cannot stop it.
+D="$(new_repo ghfunc)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+advance_base "$D"
+# The unreviewed work goes on its OWN branch: committing it on main would make it the TRUE
+# base and the fixture would then carry legitimately, proving nothing.
+git checkout -qb unreviewed main
+printf 'UNREVIEWED\n' > pwn.txt; git add -A; git commit -qm "unreviewed work beside the lane"
+U="$(git rev-parse HEAD)"
+git checkout -q pr
+git merge -q --no-edit --no-ff "$U"
+CURRENT="$(git rev-parse HEAD)"
+git ls-tree -r --name-only "$CURRENT" | grep -qx pwn.txt \
+  && pass "(14) the head tree really CARRIES the unreviewed file — the forging fixture is hostile" \
+  || fail "(14) fixture is wrong: the head does not carry pwn.txt, so nothing is at stake"
+[ "$(git rev-parse "$CURRENT^2")" = "$U" ] \
+  && pass "(14) the unreviewed commit really IS the second parent — forging the base to it is coherent" \
+  || fail "(14) fixture is wrong: the second parent is not the unreviewed commit"
+ghforge_verdict() { # <fnfile> -> 0 carry / 1 refuse
+  ( cd "$D" || exit 9
+    export FIXTURE_BASE_SHA; FIXTURE_BASE_SHA="$(git rev-parse main)"
+    gh() { case "$*" in *".base.sha"*) echo "$U"; return 0 ;; esac; return 1; }
+    source "$1"; PR=1
+    if lane_dimension_carry "$REVIEWED" "$CURRENT"; then echo 0; else echo 1; fi )
+}
+[ "$(ghforge_verdict "$TMP/fn.sh")" = 1 ] \
+  && pass "(14) a shell FUNCTION named gh cannot nominate the base — the real gh is used, and it refuses" \
+  || fail "(14) a shell FUNCTION named gh nominated the base and CARRIED unreviewed work — FAIL-OPEN"
+M14="$TMP/mut-nocommand.sh"
+if mutate 'command gh api' 'gh api' "$M14"; then
+  [ "$(ghforge_verdict "$M14")" = 0 ] \
+    && pass "mutation NOCOMMAND is caught: without \`command\` the forged base CARRIES unreviewed work, so \`command gh\` IS load-bearing" \
+    || fail "mutation NOCOMMAND NOT caught — \`command gh\` is not what refuses the forged base"
+else
+  fail "mutation NOCOMMAND: could not apply it — coverage is blind"
+fi
+
 echo
-# AN EXACT PIN, NOT A FLOOR WITH SLACK. $PASS only has to be non-zero for the suite to
-# be green, so a whole section can be deleted with no signal — a reviewer deleted one
-# and the suite still reported ALL PASSED. A floor of 32 against 35 assertions was tried
-# first and MEASURED insufficient (sections of 1–3 assertions still vanished quietly), so
-# this is an equality: ANY loss trips it, and so does ADDING an assertion — deliberate,
+# AN EXACT PIN (not a floor with slack — an earlier version was a `-lt` floor, and a
+# reviewer measured that a 3-assertion section could still be deleted under it). $PASS only
+# has to be non-zero for the suite to be green, so a whole section can otherwise vanish with
+# no signal. Equality means ANY loss trips it, and so does ADDING an assertion — deliberate,
 # so the number is maintained on purpose rather than drifting. The numeric guard exists
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
-MIN_ASSERTIONS=46
+MIN_ASSERTIONS=53
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

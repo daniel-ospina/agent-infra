@@ -544,10 +544,19 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   base_sha="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
   # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
   # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
-  # 40-hex, so the shape check does not stop it). RESIDUAL, stated rather than implied: this
-  # does NOT defend against a hostile BINARY earlier on PATH — that needs a resolved trusted
-  # path, which is broader than this predicate's declared threat surface (local commit-graph
-  # rewriting) and is left to the caller's environment.
+  # 40-hex, so the shape check does not stop it).
+  # RESIDUAL — the vectors NOT covered, NAMED rather than implied: a shell FUNCTION (closed
+  # by `command gh`), a hostile BINARY earlier on PATH, and ENV/CONFIG redirection of the
+  # real binary (GH_HOST, GH_CONFIG_DIR, or an `http_unix_socket` in its config) — a reviewer
+  # demonstrated the last carrying unreviewed content through the REAL gh. An earlier version
+  # of this note named only the binary, which was false about what remains.
+  # WHY THOSE ARE DECLARED OUT RATHER THAN CLOSED: this predicate's threat surface is REPO
+  # STATE — a stale ref, a replace ref, a grafts file, a lying remote-tracking ref: things
+  # wrong by accident or residue, which is what the rails actually met. An actor who controls
+  # THIS PROCESS'S ENVIRONMENT can already write the review record directly, since this same
+  # script authors it, so no boundary is left to defend at that point; sanitising the env
+  # would add machinery that closes one spelling while a config in the default location still
+  # works. That is theatre, not a guard.
   # Reject everything that is not a 40-hex sha, exactly as the head fetch above does.
   # Empty/null/error-body already failed closed (measured), but any non-empty string
   # that happens to resolve as a LOCAL revision was accepted as "the authoritative
