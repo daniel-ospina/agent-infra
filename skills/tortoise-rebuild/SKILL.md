@@ -61,12 +61,19 @@ print(result)  # {recovered, log_points, db_points, reason}
 ```
 
 **Lossy fallback — `python -m tortoise rebuild --dir <jsonl-dir> --db <db>`:**
-This CLI runs `rebuild_all()` — an unconditional `MATCH (n) DETACH DELETE n` followed
-by replay. It does NOT apply the `recover_from_log` guards, and it drops `context` for
-v2+ events (#49). Only use after confirming the DB is fully lost (0 nodes + single
-unambiguous log) and you accept the lossiness:
-- **Embedded mode (`path=`)** has no graph-name guard — the wipe runs unconditionally.
-- **Server/URI mode** is refused on non-`test_*` graph names by the bulk-wipe guard.
+This CLI runs `rebuild_all()` — a `MATCH (n) DETACH DELETE n` followed by replay,
+gated by the per-call `confirm_destructive=True` token the CLI passes (#2944). It does
+NOT apply the `recover_from_log` guards, and it drops `context` for v2+ events (#49).
+Only use after confirming the DB is fully lost (0 nodes + single unambiguous log) and
+you accept the lossiness:
+- **Structural wipe guard (#2944):** `rebuild_all()` / `rebuild()` are keyword-only
+  `confirm_destructive: bool = False` and **refuse by default, embedded mode
+  included**. The CLI is the operator authorization point; the old `_skip_guard`
+  bypass is removed. A direct Python call must pass the token explicitly.
+- **Embedded mode (`path=`)** is exempt from the graph-**name** check (L2), but it is
+  **not** exempt from the token: an embedded wipe no longer runs unconditionally.
+- **Server/URI mode** is refused on non-`test_*` graph names by the bulk-wipe guard
+  (L2 defence in depth) **even when the token was passed**.
 
 ```bash
 # Lossy rebuild (only for a confirmed-lost embedded DB)
