@@ -44,12 +44,25 @@ The write operations appear once in this skill (by operation name). Invoke them 
 | Invalidate point | `tortoise_invalidate` | `sdk.supersede(old, new, transfer_edges=False)` |
 | Delete point | `tortoise_delete_point` | `sdk.delete_point(id)` |
 | Update point | `tortoise_update_point` | `sdk.update_point(id, **props)` |
+| **Edit an operator edge** (relabel) | `tortoise_update` | `sdk.update(<operator_id>, label=…)` |
+| **Remove an operator edge** | `tortoise_delete` | `sdk.delete(<operator_id>)` |
 | Compute confidence | `tortoise_compute_confidence` | `sdk.compute_confidence(anchors=…)` |
 | Check structure | `tortoise_check_structure` | `sdk.check_structure()` |
 
+> **An operator IS a Point.** Operators carry `is_operator=true` on a `:Point` node, so they take
+> the *generic* verbs above — `sdk.update(<operator_id>, label=…)` relabels an operator edge in
+> place and `sdk.delete(<operator_id>)` removes it. `operator_action`'s refusal (`"must be
+> 'mitigate' or 'annotate'"`) is **not** the whole operator vocabulary; that action set exists only
+> for the two operations needing a reason or epistemic dimensions.
+>
+> One asymmetry worth knowing before you choose a verb: **relabelling does not validate.**
+> `create_operator(label=…)` returns a structured `undeclared_relation` warning when no installed
+> pack declares the predicate, but `update(<operator_id>, label=…)` performs **no declaredness
+> check** and stores the label silently. Take valid predicates from `list_relations()`.
+
 ## Hard Gate
 
-**Any graph write** (create_point, create_operator, mitigate_operator, supersede_point, delete_point, annotate_point, invalidate_point) **MUST** go through this skill. Bypassing it risks:
+**Any graph write** (create_point, create_operator, mitigate_operator, supersede_point, delete_point, annotate_point, invalidate_point, and the operator-taking `update(<operator_id>, …)` / `delete(<operator_id>)`) **MUST** go through this skill. Bypassing it risks:
 - EP weights nuked by batch-connected mitigations
 - Orphaned NAND edges with no cleanup
 - Superseded operators with active edges still propagating
