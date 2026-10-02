@@ -547,12 +547,20 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   #     function — `current^1` was a merge, not the reviewed commit, and the verdict was
   #     CARRY). Which side is base-derived is settled by (A)/(B)/(C2)/(D), never by the
   #     shape of `current^1`.
-  #     Reachability does NOT bound the head by the base TIP's tree: a commit the
-  #     base tip has since deleted or reverted is still lineage, so a head carrying
-  #     a file the base tip no longer has is base-DERIVED, not unreviewed. MEASURED:
-  #     a head whose only non-reviewed file exists in no reviewed commit and NOT in
-  #     the base tip, but in a base ANCESTOR, is carried — that is intended, and the
-  #     reason is lineage, not "the real base"; and
+  #     Reachability does NOT bound the head by the base TIP's tree, and the reason is
+  #     NOT "lineage is safe" — that reason was FALSIFIED and is deleted: "it came from
+  #     the base" does not make a blob something a review saw. A head whose only
+  #     non-reviewed file exists in no reviewed commit and NOT in the base tip, but in a
+  #     base ANCESTOR, IS carried (MEASURED twice, independently). What makes that SOUND is
+  #     narrower and measurable: the artifact this gate attests is the rendered PATCH, the
+  #     head is the AUTOMATIC merge with a base-lineage commit (pinned by (D)'s tree
+  #     equality), and base-lineage content the tip later removed therefore sits on BOTH
+  #     sides of that patch and is never PROPOSED. MEASURED on that fixture: the PR's
+  #     three-dot diff is BYTE-IDENTICAL before and after the move, and landing the head
+  #     keeps the base tip's version of the file, because the branch does not modify it
+  #     relative to the merge base. A head TREE exceeding `reviewed + base tip` is a
+  #     DECLARED TOLERANCE, not a proof of safety — §20 of the suite pins it so that a
+  #     future tightening reddens instead of landing a false refusal; and
   #   - the object must be present locally, so the walk below is meaningful.
   # `.base.sha` is the CURRENT base tip, which is normally AHEAD of what the head merged,
   # so the check runs `--is-ancestor <head's second parent> <base_sha>`: the SECOND PARENT
@@ -640,8 +648,8 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # ALSO NAMED: `.base.sha` is trusted as the authority and is NOT checked against
   # `.base.ref`, so a PR whose base has been REPOINTED to a branch carrying unreviewed content
   # has that content classified as base and the verdict carries (MEASURED with the real
-  # function: `grep -c base.ref` = 0, and a repointed base yields CARRY with the base branch's
-  # file in the head). That is a SYMPTOM of the known base-blindness already filed for the
+  # function: a repointed base yields CARRY with the base branch's file in the head). That is a
+  # SYMPTOM of the known base-blindness already filed for the
   # clean/clean-micro tiers — agent-infra#1362 — so it is NAMED here rather than re-filed as a
   # peer. §17 of the suite pins the union tolerance so a future blob-level "fix" reddens
   # instead of landing.

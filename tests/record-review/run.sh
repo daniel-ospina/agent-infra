@@ -968,7 +968,61 @@ UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
 # case — the one this exists for — survives either spelling. The numeric guard exists
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
-MIN_ASSERTIONS=79
+echo "── 20. The base-ANCESTOR tolerance is DECLARED and PINNED (do not 'fix' it into a false refusal)"
+# A round-20 reviewer found a head whose TREE carries a file in NO reviewed commit and NOT in
+# the base tip, but in a base ANCESTOR, and called it a gate bypass. Its CONSEQUENCE claims
+# were refuted by measurement (the PR's three-dot diff — the artifact this gate attests,
+# fetched via `gh api .../pulls/N` — is byte-identical before and after the move, and landing
+# the head keeps the base tip's version of the file). The INVARIANT is real, so it is declared
+# in the script rather than denied, and pinned HERE for the same reason §17 is: the obvious
+# "fix" — compare against the base TIP instead of the head's second parent — REFUSES this head,
+# and would also refuse legitimate partial merges, i.e. it is a false-refusal generator. Add it
+# and this section reddens.
+D="$(new_repo c20ancestor)"; cd "$D" || exit 2
+REVIEWED="$(git rev-parse HEAD)"
+B0="$(git rev-parse main)"
+( cd "$D" || exit 9
+  git checkout -q main
+  printf 'SECRET\n' > leaked.env; git add -A; git commit -qm 'base ancestor ADDS leaked.env'
+  git update-ref refs/remotes/origin/main refs/heads/main )
+B1="$(git rev-parse main)"
+( cd "$D" || exit 9
+  git checkout -q main
+  git rm -q leaked.env; git commit -qm 'base TIP deletes leaked.env'
+  git update-ref refs/remotes/origin/main refs/heads/main )
+B2="$(git rev-parse main)"
+( cd "$D" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the OLD base ancestor B1' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+P2="$(git rev-parse "$CURRENT^2" 2>/dev/null)"
+# PRECONDITION: the head really carries content in neither reviewed nor the base tip.
+{ git cat-file -e "$CURRENT:leaked.env" 2>/dev/null \
+  && ! git cat-file -e "$REVIEWED:leaked.env" 2>/dev/null \
+  && ! git cat-file -e "$B2:leaked.env" 2>/dev/null; } \
+  && pass "(20) PRECONDITION: the head tree carries a blob in NO reviewed commit and NOT in the base tip" \
+  || fail "(20) fixture is VACUOUS: the head carries nothing unseen, so the tolerance is not exercised"
+# PRECONDITION: the base merged is an OLDER ancestor, not the tip — the branch that matters.
+{ [ "$P2" = "$B1" ] && [ "$P2" != "$B2" ] && git merge-base --is-ancestor "$P2" "$B2"; } \
+  && pass "(20) PRECONDITION: the head's second parent IS the older base ancestor B1, not the base tip" \
+  || fail "(20) fixture is wrong: the head did not merge an older base ancestor, so (C) is not being tested"
+# THE SUBSTANTIVE CLAIM: the attested artifact — the three-dot patch — is UNCHANGED.
+git diff "$B0"..."$REVIEWED" > "$TMP/c20-before.patch" 2>/dev/null
+git diff "$B2"..."$CURRENT" > "$TMP/c20-after.patch" 2>/dev/null
+cmp -s "$TMP/c20-before.patch" "$TMP/c20-after.patch" \
+  && pass "(20) the PR's three-dot diff is BYTE-IDENTICAL before and after the move — the review's binding survives (this is WHY the tolerance is sound)" \
+  || fail "(20) the three-dot diff CHANGED across the move, so the carry does not preserve the attested artifact"
+[ "$(verdict_with "$D" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
+  && pass "(20) the head IS carried (the declared tolerance, pinned)" \
+  || fail "(20) the head was refused — the tolerance changed without this pin being updated"
+# The boundary: the 'tighten it to the base TIP' form WOULD refuse, which is why it is wrong.
+[ "$(git merge-tree --write-tree "$REVIEWED" "$B2" 2>/dev/null | command head -1)" != "$(git rev-parse "$CURRENT^{tree}")" ] \
+  && pass "(20) comparing against the base TIP instead would REFUSE this head — the 'fix' is a false-refusal generator, pinned" \
+  || fail "(20) the base-tip form would NOT refuse this head, so the boundary this section pins is not real"
+
+MIN_ASSERTIONS=84
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
