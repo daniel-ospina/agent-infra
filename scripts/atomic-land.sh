@@ -111,9 +111,9 @@
 #   ATOMIC_LAND_LOCK_GRACE  seconds a pid-less lock is treated as LIVE, not stale
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
 #   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
+#                           before failing closed (default: 5).
 #   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a BEHIND head, ignoring the live
 #                               `strict` read (the #1565 fail-safe restore)
-#                           before failing closed (default: 5).
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
@@ -316,9 +316,22 @@ strict_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refreshe
   case "$v" in true|false) printf '%s' "$v" ;; *) printf '' ;; esac
 }
 mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refreshes)
+  # ⛔ `gh pr view --json mergeable` IS NOT A BOOLEAN — it is the GraphQL enum STRING
+  # (api/queries_pr.go: PullRequestMergeable = "MERGEABLE" | "CONFLICTING" |
+  # "UNKNOWN"). MEASURED on PR #1566: `gh pr view 1566 --json mergeable --jq
+  # .mergeable` prints `MERGEABLE`, while `gh api repos/…/pulls/1566 --jq .mergeable`
+  # prints `true` for the SAME PR. A predicate that accepts only `true|false`
+  # therefore NEVER matches the real CLI, which silently turns this gate INERT — and
+  # the suite keeps passing as long as its fixture speaks the REST shape. Both the
+  # predicate and the fixture were wrong in the first cut of #1565; a review caught
+  # it. Do not "simplify" this back to a boolean test.
   local v
   v="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json mergeable --jq .mergeable 2>/dev/null || true)"
-  case "$v" in true|false) printf '%s' "$v" ;; *) printf '' ;; esac
+  case "$v" in
+    MERGEABLE)   printf 'true'  ;;
+    CONFLICTING) printf 'false' ;;
+    *)           printf ''      ;;
+  esac
 }
 
 # The base branch's TIP at a moment in time. A concurrent merge ADVANCES it while

@@ -100,7 +100,11 @@ case "${1:-} ${2:-}" in
     case "$json" in
       *mergeable*)
         # #1565: read ONLY when the live `strict` read positively said false.
-        cat "$SCEN/mergeable" 2>/dev/null || echo true; exit 0 ;;
+        # ⛔ The REAL `gh pr view --json mergeable` prints the GraphQL ENUM, not a
+        # boolean (MEASURED: `MERGEABLE`). This fixture must speak the CLI's language:
+        # when it spoke REST's (`true`) the suite certified a predicate that could
+        # never match in production — the #1565 review P0.
+        cat "$SCEN/mergeable" 2>/dev/null || echo MERGEABLE; exit 0 ;;
       *isDraft*)
         printf '%s\t%s\t%s\t%s\n' "$(cur_head)" "$(cat "$SCEN/base" 2>/dev/null || echo main)" \
           "$(cur_state)" "$(cat "$SCEN/draft" 2>/dev/null || echo false)"
@@ -616,11 +620,20 @@ for s in "$TMP/scen-happy" "$TMP/scen-fresh" "$TMP/scen-dryrun"; do
   # #1565 NARROWED this pin rather than deleting it. The rail's protection
   # dependency is now DECLARED, LIVE and NARROW, so the property to pin is no
   # longer "never reads protection" but (a) below, plus the two post-loop checks.
-  if grep -E 'protection' "$s/calls" | grep -vE '/branches/[^/]+/protection' | grep -q .; then
-    fail "$(basename "$s") read a protection setting OTHER than the declared live \`strict\` endpoint"
+  # STRENGTHENED after review of #1565: the first cut allowed ANY field, ANY shape
+  # and ANY number of reads at the declared endpoint, so a new undeclared protection
+  # read could ship green — the very thing this pin exists to stop. The declaration is
+  # "ONE positive read of `strict` per invocation", so pin the FIELD, the SHAPE and
+  # the COUNT, not merely the endpoint.
+  if grep -E 'protection' "$s/calls" | grep -vE '/branches/[^/]+/protection[[:space:]]+--jq \.required_status_checks\.strict$' | grep -q .; then
+    fail "$(basename "$s") read a protection setting other than the declared \`strict\` field read"
   else
-    pass "$(basename "$s") read no undeclared protection setting"
+    pass "$(basename "$s") read no undeclared protection setting (field and shape pinned)"
   fi
+  n_reads="$(grep -cE '/branches/[^/]+/protection' "$s/calls")"
+  [ "$n_reads" -le 1 ] \
+    && pass "$(basename "$s") read protection at most once ($n_reads)" \
+    || fail "$(basename "$s") read protection $n_reads times (the declaration says at most one)"
 done
 
 # (b) A CLEAN PR (no BEHIND decision point) must read NO protection at all. This is
@@ -915,7 +928,7 @@ echo "── 17g-A. strict=false live + mergeable ⇒ the refresh is SKIPPED and
 new_scen skipbehind
 printf 'BEHIND\n' > "$SCEN/state"
 printf 'false\n' > "$SCEN/strict"
-printf 'true\n' > "$SCEN/mergeable"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
 SCEN_RECORD_LOG=1
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
@@ -952,7 +965,7 @@ echo "── 17g-B2. strict=false live but NOT mergeable ⇒ the refresh STILL H
 new_scen unmergeable
 printf 'BEHIND\n' > "$SCEN/state"
 printf 'false\n' > "$SCEN/strict"
-printf 'false\n' > "$SCEN/mergeable"
+printf 'CONFLICTING\n' > "$SCEN/mergeable"
 SCEN_RECORD_LOG=1
 run_rail 42 --repo "$REPO" --poll 0
 called "pr update-branch" \
@@ -973,11 +986,28 @@ called "pr update-branch" \
   && pass "refreshed with an unreadable protection read" \
   || fail "did NOT refresh (fail-OPEN)"
 
+echo "── 17g-B4. mergeable=UNKNOWN (GitHub computes it lazily) ⇒ the refresh STILL HAPPENS"
+new_scen mergeunknown
+printf 'BEHIND\n' > "$SCEN/state"
+printf 'false\n' > "$SCEN/strict"
+printf 'UNKNOWN\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (UNKNOWN is not a positive true)" \
+  || fail "did NOT refresh on mergeable=UNKNOWN (fail-OPEN)"
+# Contract pin (the #1565 review P0): the tokens the rail maps must be the CLI's enum
+# tokens. Scenario A exercises MERGEABLE, so a predicate that only accepted `true`
+# fails there; this states the contract once more in its own right.
+grep -q 'MERGEABLE' "$RAIL" && grep -q 'CONFLICTING' "$RAIL" \
+  && pass "the mergeable mapping names the CLI's enum tokens (MERGEABLE/CONFLICTING)" \
+  || fail "the mergeable mapping does not name the CLI's enum tokens"
+
 echo "── 17g-C. ATOMIC_LAND_REFRESH_ALWAYS=1 restores the unconditional refresh"
 new_scen refreshalways
 printf 'BEHIND\n' > "$SCEN/state"
 printf 'false\n' > "$SCEN/strict"
-printf 'true\n' > "$SCEN/mergeable"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
 SCEN_RECORD_LOG=1
 ATOMIC_LAND_REFRESH_ALWAYS=1 run_rail 42 --repo "$REPO" --poll 0
 unset ATOMIC_LAND_REFRESH_ALWAYS
@@ -1084,11 +1114,14 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # as DECIMAL — and `08` is not a valid octal literal, so the arithmetic error
   # unwinds the wait loop SILENTLY. Base 10 must be stated, not assumed.
   mutate_and_expect_fail B18  's/remaining=\$\(\( 10#\$WAIT_TIMEOUT - elapsed \)\)/remaining=\044(( WAIT_TIMEOUT - elapsed ))/'
-  # B19 (#1565): make the live `strict` read FAIL OPEN — drop `false` from the
-  # accepted values, so an unreadable-or-false read collapses to "unreadable" and
-  # the direction-A scenario (strict=false + mergeable) refreshes again. Proves the
-  # skip arm is load-bearing rather than decorative.
-  mutate_and_expect_fail B19  's/case "\044v" in true\|false\) printf .%s. "\044v"/case "\044v" in true) printf .%s. "\044v"/'
+  # B19 (#1565): make the live `strict` read FAIL OPEN — an UNREADABLE protection
+  # (404/403/absent) is then treated as `false` instead of unreadable, so the
+  # direction-B3 scenario (unreadable ⇒ MUST refresh) skips instead. This is the true
+  # fail-open: it is the fail-closed arm that the mutation removes. (The first cut of
+  # this mutation targeted the `true|false` arm instead and was mislabelled — dropping
+  # `false` fails CLOSED, i.e. it refreshes MORE — and its perl replacement was also
+  # corrupt. Caught by review.)
+  mutate_and_expect_fail B19  's/if \[ "\044strict" = false \]; then/if [ "\044strict" != true ]; then/'
   # B20 (#1565): let the skip ignore `mergeable`, so an UNMERGEABLE PR (the #1533
   # shape, which genuinely needs the refresh) is skipped instead. The direction-B2
   # scenario must redden.
