@@ -45,7 +45,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 SRC="$ROOT/scripts/record-review.sh"
-export SCAN_LIB="$HERE"  # so the heredocs can import lib_scan regardless of cwd
+export SCAN_LIB="$HERE"  # so python consumers (one heredoc, one -c) can import lib_scan regardless of cwd
 
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); printf '   ✅ %s\n' "$*"; }
@@ -640,9 +640,17 @@ echo "── 19. STATIC GUARD: no UNQUALIFIED invocation of head/tail/openssl in
 # It was restored as a PROPERTY, not as the old code: the previous version counted LINES
 # (so one line holding both a bare and a qualified call passed — the false PASS §15's own
 # docstring documents as corrected) and matched exact LITERALS (so `head -n1` and
-# `openssl sha256`, identical in effect, evaded it). It now counts OCCURRENCES of
-# UNQUALIFIED INVOCATIONS IN COMMAND POSITION over the shared blanker, so quoted prose and
-# comments are inert and variable reads like `$head` are not invocations.
+# `openssl sha256`, identical in effect, evaded it). It now counts OCCURRENCES over the
+# shared blanker, so quoted prose and comments are inert and variable reads like `$head` are
+# not invocations.
+# WHAT IT IS: a tripwire on a DELETED `command ` prefix. WHAT IT IS NOT, and this section
+# does not claim otherwise — no text scan can establish "no unqualified invocation exists",
+# because command position is the shell's grammar and not a regular language. A reviewer
+# measured TEN rewrites of the command word that bash executes and this pattern does not
+# count (`\tail`, a continuation after the name, `tail""`, `{ tail; }`, `case ... x) tail`,
+# `then`/`do`/`else`, backticks, a quoted command word, `v=1 tail`, `! tail`), and it
+# over-counts heredoc bodies and array elements. Those are given as the SHAPE of the gap,
+# not as an inventory. See lib_scan.py's header.
 # SELF-TEST FIRST: a fixture pinning both directions, so the check cannot silently go blind.
 QS="$TMP/qual-selftest.sh"
 {
@@ -670,7 +678,7 @@ for name in head tail openssl; do
   n="$(scan_count "$SRC" "$name")"
   [ "$n" = 0 ] \
     && pass "(19) no unqualified command-position \`$name\` invocation in record-review.sh" \
-    || fail "(19) $n unqualified command-position \`$name\` invocation(s) in record-review.sh — an exported function of that name can flip a verdict"
+    || fail "(19) $n unqualified command-position \`$name\` SIGHTING(s) in record-review.sh — READ THE LINE: either a \`command \` prefix was deleted (the regression this guards), or it is a heredoc body / array element / case pattern the scanner cannot tell apart"
 done
 
 echo "── 18. A shell FUNCTION named git must not forge the DECISIVE merge (what `command git` is for)"

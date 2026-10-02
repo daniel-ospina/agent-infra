@@ -2,29 +2,35 @@
 
 `executable_text()` was previously defined inside the `bare_gh_count` heredoc. It is
 promoted here so the qualification guard can use the SAME blanker instead of a second,
-weaker lexer — a hand-rolled second copy is how this suite has three times produced a
-guard that was blind to a case the original handled.
+weaker lexer — a hand-rolled second copy is how this suite has repeatedly produced a guard
+blind to a case the original handled.
+
+`unqualified_invocations()` is a TRIPWIRE ON A REVERT, and its scope is stated here rather
+than left to inference, because FOUR successive designs of it were measured unsound and the
+honest thing is to name the limit instead of widening it a fifth time:
+
+  * It matches the command word through `^`, `|`, `&`, `;`, `(` and a normalised `$(`. A
+    reviewer MEASURED that this is not the shell's command-position grammar: `\\tail`, a
+    continuation right after the name, `tail""`, `{ tail ...; }`, `case x in x) tail`,
+    `then`/`do`/`else`, a backtick substitution, a quoted command word, `v=1 tail`, and
+    `! tail` are ALL executed by bash and NONE is counted. That list is given as a WARNING,
+    not as an inventory: it is the shape of the gap, and there is no reason to think it is
+    complete. NO enumeration of it is attempted below.
+  * It over-counts: a heredoc BODY, an array element and a `case` pattern are reported as
+    invocations. (Loud, hence fail-closed.)
+
+Therefore it does NOT establish "no unqualified invocation exists", and no text scan can:
+the property is about the shell's grammar, which is not a regular language. What it does
+establish is the regression this lane actually pays for — a `command ` prefix DELETED from
+one of the spellings the script uses today, which is how this vector was reintroduced
+before. A rewrite of the command word is a different act, and the guard does not see it.
+Anything it reports is confirmed by READING THE LINE, which is why the failure text says so.
 """
 
 import re
 
 
-def executable_text(s):
-    """A BEST-EFFORT text scan, NOT a shell parser. It is a REGRESSION TRIPWIRE, not a
-    proof, and the SELF-TEST is its specification: the spellings it must count, and the
-    non-invocations it must ignore, are the ones pinned there.
-
-    Every absolute claim this docstring used to make — that it blanks exactly the text
-    the shell does not execute, that comments are always cut, that only an unquoted `)`
-    closes a substitution — was FALSIFIED by a reviewer with the shell as the oracle, so
-    the claims are DELETED rather than reworded. It OVER-counts some non-invocations
-    (loud, hence fail-closed) and some unusual spelling can still make it UNDER-count;
-    anything it reports is confirmed by reading the line.
-
-    What it is FOR: the head read is spelled HEAD="$(command gh api ...)", inside double
-    quotes. A version that blanked quoted tokens wholesale reported 0 there while
-    `command ` had been deleted from exactly that line. `$( ... )` and backticks are
-    therefore kept inside double quotes, because they ARE executed."""
+def executable_text(s):  # noqa: D103 (docstring is the module header above)
     out, i, n = [], 0, len(s)
     while i < n:
         c = s[i]
@@ -49,19 +55,9 @@ def executable_text(s):
                 if s[k] == '"':
                     break
                 if s.startswith("$(", k):
-                    # QUOTE-AWARE. A reviewer measured `X="$(echo 'a)b'; gh api q)"`
-                    # counting 0: the `)` inside the quoted run closed the substitution
-                    # early, and the real `gh` after it was blanked as inert text while
-                    # bash executed it. Skip quoted runs so only an unquoted `)` closes.
                     k0, depth, k, qq = k, 0, k + 2, None
                     while k < n:
                         ch = s[k]
-                        # A BACKSLASH escapes the next char even OUTSIDE quotes, so `\)`
-                        # does not close the substitution. Without this branch the scan
-                        # closed early and blanked the real `gh` after it — the reviewer
-                        # reintroduced a bare gh into the real file and the suite stayed
-                        # GREEN. (Inside SINGLE quotes a backslash is literal, so the
-                        # escape branch is skipped there.)
                         if ch == "\\" and qq != "'":
                             k += 2
                             continue
@@ -105,16 +101,11 @@ def executable_text(s):
 
 
 def unqualified_invocations(src, name):
-    """Count invocations of `name` in COMMAND POSITION that are not `command`-qualified.
+    """Count sightings of `name` in command position that are not `command`-qualified.
 
-    Command position = start of a line, or just after `|`, `&`, `;`, `(`, or a `$(` (which
-    is normalised to `|` so `X="$(head -1)"` is seen, while `$head` — a VARIABLE read — is
-    not). Matching the NAME rather than a literal also catches equivalent spellings
-    (`head -n1`, `tail --lines=+2`), which a literal match missed entirely.
-
-    Cannot see: a dynamically constructed invocation (`eval`, a variable holding the
-    command word), and a function named `command`. Both are recorded as out of reach in
-    the script's declared-boundary note; this is a tripwire on a REVERT, not a proof.
+    See the module header: this is a REVERT tripwire, it over-counts non-invocations, and
+    it is blind to every rewrite of the command word that reaches it through a construct
+    outside `^ | & ; ( $(`. It does not prove the absence of an unqualified invocation.
     """
     code = executable_text(src).replace("$(", "|")
     rx = re.compile(r"(?:^|[|&;(])\s*" + re.escape(name) + r"(?=[\s;|&)<>]|$)", re.MULTILINE)
