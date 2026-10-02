@@ -45,6 +45,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 SRC="$ROOT/scripts/record-review.sh"
+export SCAN_LIB="$HERE"  # so the heredocs can import lib_scan regardless of cwd
 
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); printf '   ✅ %s\n' "$*"; }
@@ -628,6 +629,50 @@ else
 fi
 
 echo
+echo "── 19. STATIC GUARD: no UNQUALIFIED invocation of head/tail/openssl in command position"
+# Restored after cycle 18 MEASURED what deleting it cost. At the previous commit the suite
+# was GREEN on a bare revert of all ten sites except (D)'s; four of them are verdict-
+# relevant: a shadowed `tail` with SUBSTITUTED rows of the same count mints `clean-low` for
+# a `.py` diff; the `head` at the closing-refs URL branch empties REFS and drops the
+# clean-micro tier guard into its arm-(c) PROCEED; `openssl` is the proven record-minter; and
+# the `head` feeding `LEGACY_REPO` drives `rm -f "$LEGACY"`. Deleting the check was an
+# OVER-correction — it removed a rail that prevents a real failure.
+# It was restored as a PROPERTY, not as the old code: the previous version counted LINES
+# (so one line holding both a bare and a qualified call passed — the false PASS §15's own
+# docstring documents as corrected) and matched exact LITERALS (so `head -n1` and
+# `openssl sha256`, identical in effect, evaded it). It now counts OCCURRENCES of
+# UNQUALIFIED INVOCATIONS IN COMMAND POSITION over the shared blanker, so quoted prose and
+# comments are inert and variable reads like `$head` are not invocations.
+# SELF-TEST FIRST: a fixture pinning both directions, so the check cannot silently go blind.
+QS="$TMP/qual-selftest.sh"
+{
+  printf 'x | head -1\n'                       # bare, after a pipe        -> COUNT
+  printf 'y | command head -1\n'               # qualified                 -> no
+  printf 'X="$(openssl dgst -sha256)"\n'       # bare inside $( )          -> COUNT
+  printf 'head -n1\n'                          # EQUIVALENT SPELLING       -> COUNT
+  printf 'z | head -1; w | head -1\n'          # TWO bare on ONE line      -> COUNT 2
+  printf 'echo "head -1 and openssl dgst"\n'   # quoted PROSE              -> no
+  printf '# head -1\n'                         # comment                   -> no
+  printf '$head -1\n'                          # a VARIABLE read           -> no
+  printf 'command tail -n +2\n'                # qualified                 -> no
+  printf 'tail --lines=+2\n'                   # EQUIVALENT SPELLING       -> COUNT
+} > "$QS"
+scan_count() { # <file> <name>
+  python3 -c 'import os, sys; sys.path.insert(0, os.environ["SCAN_LIB"]); from lib_scan import unqualified_invocations as u; print(u(open(sys.argv[1], encoding="utf-8").read(), sys.argv[2]))' "$1" "$2"
+}
+qs_head="$(scan_count "$QS" head)"
+qs_ossl="$(scan_count "$QS" openssl)"
+qs_tail="$(scan_count "$QS" tail)"
+[ "$qs_head" = 4 ] && [ "$qs_ossl" = 1 ] && [ "$qs_tail" = 1 ] \
+  && pass "(19 self-test) the guard counts 4 head / 1 openssl / 1 tail unqualified invocations: equivalent spellings and two-on-one-line ARE seen; quoted prose, comments and \$head are NOT" \
+  || fail "(19 self-test) the guard is blind or over-eager — got head=$qs_head (want 4), openssl=$qs_ossl (want 1), tail=$qs_tail (want 1)"
+for name in head tail openssl; do
+  n="$(scan_count "$SRC" "$name")"
+  [ "$n" = 0 ] \
+    && pass "(19) no unqualified command-position \`$name\` invocation in record-review.sh" \
+    || fail "(19) $n unqualified command-position \`$name\` invocation(s) in record-review.sh — an exported function of that name can flip a verdict"
+done
+
 echo "── 18. A shell FUNCTION named git must not forge the DECISIVE merge (what `command git` is for)"
 # The `command gh` commit had no test — §14 exists because of that. The `git` half was
 # MISSING ENTIRELY: a cycle-14 reviewer exported a function named git whose `merge-tree`
@@ -740,99 +785,9 @@ src = open(sys.argv[1], encoding="utf-8", errors="replace").read()
 src = src.replace("\\\n", " ")
 
 
-def executable_text(s):
-    """A BEST-EFFORT text scan, NOT a shell parser. It is a REGRESSION TRIPWIRE, not a
-    proof, and the SELF-TEST is its specification: the spellings it must count, and the
-    non-invocations it must ignore, are the ones pinned there.
-
-    Every absolute claim this docstring used to make — that it blanks exactly the text
-    the shell does not execute, that comments are always cut, that only an unquoted `)`
-    closes a substitution — was FALSIFIED by a reviewer with the shell as the oracle, so
-    the claims are DELETED rather than reworded. It OVER-counts some non-invocations
-    (loud, hence fail-closed) and some unusual spelling can still make it UNDER-count;
-    anything it reports is confirmed by reading the line.
-
-    What it is FOR: the head read is spelled HEAD="$(command gh api ...)", inside double
-    quotes. A version that blanked quoted tokens wholesale reported 0 there while
-    `command ` had been deleted from exactly that line. `$( ... )` and backticks are
-    therefore kept inside double quotes, because they ARE executed."""
-    out, i, n = [], 0, len(s)
-    while i < n:
-        c = s[i]
-        if c == "#" and (i == 0 or s[i - 1] in " \t\n"):
-            while i < n and s[i] != "\n":
-                i += 1
-            continue
-        if c == "'":
-            j = s.find("'", i + 1)
-            if j == -1:
-                j = n - 1
-            out.append("'gh'" if s[i:j + 1] == "'gh'" else " " * (j + 1 - i))
-            i = j + 1
-            continue
-        if c == '"':
-            parts, k = ['"'], i + 1
-            while k < n:
-                if s[k] == "\\" and k + 1 < n:
-                    parts.append("  ")
-                    k += 2
-                    continue
-                if s[k] == '"':
-                    break
-                if s.startswith("$(", k):
-                    # QUOTE-AWARE. A reviewer measured `X="$(echo 'a)b'; gh api q)"`
-                    # counting 0: the `)` inside the quoted run closed the substitution
-                    # early, and the real `gh` after it was blanked as inert text while
-                    # bash executed it. Skip quoted runs so only an unquoted `)` closes.
-                    k0, depth, k, qq = k, 0, k + 2, None
-                    while k < n:
-                        ch = s[k]
-                        # A BACKSLASH escapes the next char even OUTSIDE quotes, so `\)`
-                        # does not close the substitution. Without this branch the scan
-                        # closed early and blanked the real `gh` after it — the reviewer
-                        # reintroduced a bare gh into the real file and the suite stayed
-                        # GREEN. (Inside SINGLE quotes a backslash is literal, so the
-                        # escape branch is skipped there.)
-                        if ch == "\\" and qq != "'":
-                            k += 2
-                            continue
-                        if qq is not None:
-                            if ch == "\\" and qq == '"':
-                                k += 2
-                                continue
-                            if ch == qq:
-                                qq = None
-                            k += 1
-                            continue
-                        if ch in ("'", '"'):
-                            qq = ch
-                            k += 1
-                            continue
-                        if ch == "(":
-                            depth += 1
-                        elif ch == ")":
-                            if depth == 0:
-                                break
-                            depth -= 1
-                        k += 1
-                    parts.append(s[k0:k + 1])
-                    k += 1
-                    continue
-                if s[k] == "`":
-                    k2 = s.find("`", k + 1)
-                    if k2 == -1:
-                        k2 = n - 1
-                    parts.append(s[k:k2 + 1])
-                    k = k2 + 1
-                    continue
-                parts.append(s[k] if s[k] == "$" else " ")
-                k += 1
-            out.append('"gh"' if s[i:k + 1] == '"gh"' else "".join(parts) + '"')
-            i = k + 1
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out)
+import os
+sys.path.insert(0, os.environ["SCAN_LIB"])  # the suite cd's; cwd is not the repo
+from lib_scan import executable_text  # noqa: E402  (shared blanker, see lib_scan.py)
 
 
 # NO SUBCOMMAND ALLOWLIST: a function named gh intercepts `gh <anything>`, so
@@ -1005,7 +960,7 @@ UB="$(git rev-parse "$MT:f.txt" 2>/dev/null)"
 # case — the one this exists for — survives either spelling. The numeric guard exists
 # because a reviewer measured that an EMPTY MIN_ASSERTIONS silently disables the pin:
 # `[ "$PASS" -ne "" ]` errors, the `&&` list is false, and the body is skipped.
-MIN_ASSERTIONS=75
+MIN_ASSERTIONS=79
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

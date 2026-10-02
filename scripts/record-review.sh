@@ -576,21 +576,22 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # `command` in this file at once; `builtin` is shadowable the same way, so `builtin command`
   # is no better. There is therefore NO shell-level way to guarantee an un-intercepted
   # external from inside the script, and no list of names can make one.
-  # WHAT THE `command` PREFIXES ARE ACTUALLY FOR, stated without flattering them: they narrow
-  # a shadow to FUNCTION-named invocations. The recorded instance that added `command gh` was
-  # ADVERSARIAL, not an operator accident — a cycle-8 reviewer exported a `gh` function to
-  # mint a signed marker — so they did not stop that actor and would not stop another. Their
-  # real value is narrow and unglamorous: a non-adversarial shadow (some other tool exporting
-  # a `head`, say) cannot silently flip a verdict. Defence in depth, NOT a security boundary.
+  # WHAT THE `command` PREFIXES ACTUALLY DO, stated without flattering them: `command X`
+  # REMOVES the FUNCTION-named shadow (that is what the builtin does); what survives it is a
+  # NON-function shadow — a binary earlier on PATH, or env/config redirection of the real
+  # binary. The recorded instance that added `command gh` was ADVERSARIAL, not an operator
+  # accident (a reviewer exported a `gh` function to mint a signed marker), so the prefixes
+  # did not stop that actor and would not stop another. Nor do they make it true that "a
+  # non-adversarial shadow cannot flip a verdict": only five names are qualified, while the
+  # rest of the script's externals are invoked bare, and a shadowed one of THOSE decides a
+  # verdict just as well. Defence in depth against a narrow accident, NOT a boundary.
   # THE REAL TRUST BOUNDARY: the environment this script runs in. EVERY external it invokes,
   # `$GATE_KEY` in this process's memory, and the review record itself are reachable by an
   # actor who controls it, and such an actor can write the record directly.
-  # NO LIST OF THE REMAINING SURFACE IS GIVEN, here or below, and that is now ENFORCED by
-  # keeping it out of the prose rather than intended: earlier versions enumerated "what is
-  # left" and were wrong EVERY time (they omitted `head`; then omitted `tail`, `wc`,
-  # `dirname`, `rm`, `mv`, `mkdir`, `env`, and contradicted themselves two lines later). The
-  # surface is "everything the script runs", and any list of it re-stales. Enumerating it
-  # would be the same mistake a fourth time.
+  # NO LIST OF THE REMAINING SURFACE IS GIVEN BELOW. Earlier versions enumerated "what is
+  # left" and were wrong EVERY time, then contradicted themselves in the same paragraph by
+  # naming names while denying the list. The surface is "everything the script runs", a list
+  # of it re-stales, and so none is written.
   # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
   # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
   # 40-hex, so the shape check does not stop it).
@@ -827,7 +828,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
       # word boundary the unanchored scan did not.
       REFS="$({ closing_issue_refs "$BODY"; closing_issue_refs "$BODY" "\b${CLOSING_KW}"; } | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
       if [ -z "$REFS" ]; then
-        echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | head -c 200 || true))" >&2
+        echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | command head -c 200 || true))" >&2
       else
         # Per-ref label fetch. A fetch failure marks THAT ref undeterminable —
         # never refuse on a failed fetch (mirrors the stale-sha fail-open).
