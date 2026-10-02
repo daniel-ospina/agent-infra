@@ -505,7 +505,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         if [ "$strict" = false ]; then
           mergeable="$(mergeable_of)"
           if [ "$mergeable" = true ]; then
-            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so the record at this head stays valid and its checks are already terminal (#1565)"
+            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so the record at this head stays valid and no check is invalidated (the verify step below still waits for whatever is not yet terminal) (#1565)"
             return 3
           fi
           say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
