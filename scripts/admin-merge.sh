@@ -1451,6 +1451,122 @@ lane_has_test_shard() {
   grep -vxF -f "$TMP/lane-lifecycle.txt" "$f" | grep -q '[^[:space:]]'
 }
 
+# ── #6928: A SHARD THE DIFF SELECTOR *DECLINED* IS NOT A COVERAGE GAP ─────
+# The lane-parity gate demands the PR lane execute every shard main's lane
+# executed. For a repo whose PR lane is DIFF-SELECTED that is unsatisfiable BY
+# CONSTRUCTION: the target's `tools/ci_selection.py` turns `slow_run` /
+# `carve_out_run` off for a docs-only diff, so the `test-slow (a)`,
+# `test-slow (b)` and `test-carve-out` jobs skip on their own `if:` triggers,
+# while main is ALWAYS FULL (`_full_selection()` runs the whole matrix plus both
+# diff-gated legs, so the trunk can never lose that coverage). Every docs-only /
+# config-only PR was therefore unlandable behind a refusal no re-run can clear
+# (measured: 0 docs-only commits in the last 60 of tortoise main).
+#
+# THE RULE IS FORGIVENESS, NOT EXEMPTION — and it is the CI's own rule, pinned by
+# tortoise's `tests/test_ci_selection.py`: "a `skipped` leg is forgiven only when
+# the selector DECLINED it". This removes ONLY the shards the target's selector
+# declined for THIS head's diff; every other shard main executed is still
+# demanded, which is why a non-declined leg deliberately carries no event filter.
+#
+# lane_declined_shards <out-file> — ask the TARGET repo's selector which of the
+# two diff-gated legs it declined for this PR's diff, and write those shard names
+# (one per line) to <out-file>. Returns 0 when the selector ANSWERED (the file may
+# then be empty), non-zero when it did not, setting LANE_DECLINED_REASON.
+#
+# ⛔ FAIL CLOSED. An absent selector, an unreadable changed-file list, a non-zero
+# exit, empty output, or an answer that does not carry BOTH booleans AS BOOLEANS
+# forgives NOTHING, and the caller then refuses the raw gap exactly as it does
+# today. A missing selector answer is NOT a declined leg: "I could not ask" is the
+# opposite of "the selector declined it", and a PARTIAL answer is treated as no
+# answer, because a leg whose boolean is missing was never shown to be declined.
+#
+lane_declined_shards() {
+  local out="$1"
+  local selector="$PWD/tools/ci_selection.py"
+  local slug changed json verdict rc=0 sp cp
+  LANE_DECLINED_REASON=""
+  LANE_PARITY_SELECTOR_VERDICT=""
+  : > "$out"
+  # The selector lives in the TARGET repo's checkout — the working directory the
+  # rail is invoked from — and is run EXACTLY as the workflow runs it
+  # (`.github/workflows/python-ci.yml:234`):
+  #   printf '%s\n' "$CHANGED" | python3 tools/ci_selection.py --changed-files - --event pull_request
+  # It is deliberately NOT taken from agent-infra: this rail is repo-generic, and
+  # only the target's own selector knows which legs ITS diff declines.
+  if [ ! -r "$selector" ]; then
+    LANE_DECLINED_REASON="no readable target-repo diff selector at $selector"
+    return 1
+  fi
+  # The changed-file list is fetched HERE rather than read from
+  # WF_PR_CHANGED_PATHS. That global is populated only as a LAZY SIDE EFFECT of
+  # the base-surface probe's workflow fetch (#1542), so it is empty whenever no
+  # base red needed a PR-evaluability verdict — the common case — and reading it
+  # would then fail closed on most merges for a reason unrelated to the diff.
+  # This fetch is written in that site's own style.
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  changed="$($GH api "$slug/pulls/$PR/files?per_page=100" --paginate --jq '.[].filename' 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    LANE_DECLINED_REASON="the PR's changed-file list could not be read ($slug/pulls/$PR/files)"
+    return 1
+  fi
+  # An EMPTY list is an unavailable answer too: a PR always has at least one
+  # changed file, so a success response carrying no filename is a silently failed
+  # read, and handing it to the selector would ask it a question we know is
+  # malformed — the one way this path could forgive on nothing.
+  if [ -z "$changed" ]; then
+    LANE_DECLINED_REASON="the PR's changed-file list came back EMPTY ($slug/pulls/$PR/files) — an unavailable answer, not a diff with no files"
+    return 1
+  fi
+  json="$(printf '%s\n' "$changed" | "$PYTHON_BIN" "$selector" --changed-files - --event pull_request 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    LANE_DECLINED_REASON="the target-repo diff selector failed (exit $rc running $selector)"
+    return 1
+  fi
+  if [ -z "$json" ]; then
+    LANE_DECLINED_REASON="the target-repo diff selector emitted nothing ($selector)"
+    return 1
+  fi
+  # BOTH booleans, as BOOLEANS. `json.loads` accepts anything, so the isinstance
+  # check is what makes a partial or mistyped answer a REFUSAL rather than a
+  # silent "true": a MISSING key would otherwise read as falsy and FORGIVE the
+  # leg — the one direction that must never happen.
+  verdict="$(printf '%s' "$json" | "$PYTHON_BIN" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    s = d.get("slow_run"); c = d.get("carve_out_run")
+    ok = isinstance(s, bool) and isinstance(c, bool)
+except Exception:
+    ok = False
+if not ok:
+    sys.exit(1)
+print("true" if s else "false")
+print("true" if c else "false")
+' 2>/dev/null)"
+  rc=$?
+  sp="$(printf '%s\n' "$verdict" | sed -n '1p')"
+  cp="$(printf '%s\n' "$verdict" | sed -n '2p')"
+  if [ "$rc" -ne 0 ] || [ -z "$verdict" ] \
+     || { [ "$sp" != "true" ] && [ "$sp" != "false" ]; } \
+     || { [ "$cp" != "true" ] && [ "$cp" != "false" ]; }; then
+    LANE_DECLINED_REASON="the target-repo diff selector's answer carried no parseable slow_run/carve_out_run ($selector)"
+    return 1
+  fi
+  LANE_PARITY_SELECTOR_VERDICT="slow_run=$sp, carve_out_run=$cp"
+  # The workflow's OWN shard names for the two diff-gated legs. Forgiving by EXACT
+  # name (never by pattern) keeps the rule narrow: a repo whose legs are named
+  # differently simply is not forgiven, which is the fail-closed direction.
+  if [ "$sp" = "false" ]; then
+    printf '%s\n' 'test-slow (a)' 'test-slow (b)' >> "$out"
+  fi
+  if [ "$cp" = "false" ]; then
+    printf '%s\n' 'test-carve-out' >> "$out"
+  fi
+  return 0
+}
+
 # lane_parity_check <head> <main-run-limit> — decide whether the two sides are
 # comparable AT ALL, and leave both named shard sets behind so the evidence and
 # the refusal can state the lanes instead of asserting a bare `0 | 0`.
@@ -1468,6 +1584,13 @@ lane_has_test_shard() {
 #                        an unobserved reference certifies nothing, and an empty
 #                        set means EVERY shard is missing — never "no difference".
 LANE_PARITY_REASON=""
+# #6928: the diff-gated shards the target's selector DECLINED for this head, and
+# the verdict it answered. Set by lane_parity_check on the forgiveness path; read
+# by the evidence builder so a certified `PR ⊇ main` line is DISCLOSED as resting
+# on the selector's own decision rather than standing as a bare assertion. Empty
+# when nothing was forgiven.
+LANE_PARITY_FORGIVEN=""
+LANE_PARITY_SELECTOR_VERDICT=""
 # The window MAIN's reference was actually drawn from (#4844). Set by
 # lane_parity_check so the evidence can DISCLOSE a widened reference rather than
 # let `--main-runs` describe a window the gate did not read. The reader defaults
@@ -1544,6 +1667,53 @@ lane_parity_check() {
     fi
   else
     cp "$TMP/lane-main.txt" "$TMP/lane-missing.txt"
+  fi
+  # ── #6928: FORGIVE THE LEGS THE TARGET'S DIFF SELECTOR *DECLINED* ──────
+  # Computed ONLY when the raw subtraction left a shard to explain, so a repo
+  # with no diff-gated legs and no selector pays nothing and refuses exactly as
+  # it did before. See the block above `lane_declined_shards` for the rule and its
+  # fail-closed boundary.
+  LANE_PARITY_FORGIVEN=""
+  LANE_PARITY_SELECTOR_VERDICT=""
+  if [ "$(lane_count "$TMP/lane-missing.txt")" -gt 0 ]; then
+    if lane_declined_shards "$TMP/lane-declined.txt"; then
+      if [ "$(lane_count "$TMP/lane-declined.txt")" -gt 0 ]; then
+        # The shards ACTUALLY in this head's gap that the selector DECLINED — the
+        # INTERSECTION, so the disclosure names only legs this head really did not
+        # run. Same subtraction shape as the coverage gap above, same fail-CLOSED
+        # reading of grep's status: 0 = some matched, 1 = none (nothing to
+        # forgive), >1 = a grep ERROR, which is never "nothing to forgive".
+        grep -xF -f "$TMP/lane-declined.txt" "$TMP/lane-missing.txt" > "$TMP/lane-forgiven.txt"
+        rc=$?
+        if [ "$rc" -gt 1 ]; then
+          say_err "admin-merge: ✗ the declined-leg subtraction failed (grep rc $rc) — lane coverage unverifiable"
+          LANE_PARITY_REASON="the declined-leg subtraction itself failed (grep rc $rc)"
+          return 2
+        fi
+        if [ "$rc" -eq 0 ]; then
+          # The declined shards are IN the gap, so removing them is exactly the
+          # change; `lane-forgiven.txt` is what the disclosure names.
+          grep -vxF -f "$TMP/lane-forgiven.txt" "$TMP/lane-missing.txt" > "$TMP/lane-kept.txt"
+          rc=$?
+          if [ "$rc" -gt 1 ]; then
+            say_err "admin-merge: ✗ the declined-leg subtraction failed (grep rc $rc) — lane coverage unverifiable"
+            LANE_PARITY_REASON="the declined-leg subtraction itself failed (grep rc $rc)"
+            return 2
+          fi
+          mv "$TMP/lane-kept.txt" "$TMP/lane-missing.txt"
+          LANE_PARITY_FORGIVEN="$(cat "$TMP/lane-forgiven.txt")"
+          # DISCLOSE, on the path that CERTIFIES and on the path that still
+          # refuses: an operator reading either one must be able to see why a
+          # shard was not required.
+          say_err "admin-merge: ⚠️  lane-coverage forgiveness (#6928) — $(lane_count "$TMP/lane-forgiven.txt") shard(s) this head did not run were DECLINED by its diff selector and are NOT required of it: $(tr '\n' ' ' < "$TMP/lane-forgiven.txt")[selector: ${LANE_PARITY_SELECTOR_VERDICT}]"
+        fi
+      fi
+    else
+      # FAIL CLOSED: an unavailable answer forgives NOTHING, and the raw gap is
+      # refused exactly as it is today — with the reason the selector was not
+      # consulted to close it, so a missing answer is never read as a declined leg.
+      say_err "admin-merge: ⚠️  lane-coverage forgiveness (#6928) NOT applied — ${LANE_DECLINED_REASON}; refusing on the raw gap (a missing selector answer is not a declined leg)"
+    fi
   fi
   [ -s "$TMP/lane-missing.txt" ] && return 1
   return 0
@@ -3928,7 +4098,7 @@ $attribution_line"
   # #1319 adds the third: the two sides must also have run the SAME LANE, which
   # is what the parity line reports.
   if [ "$pr_count" -eq 0 ] && [ "$main_count" -eq 0 ]; then
-    local parity_rc=0 parity_note parity_evidence parity_window_note=""
+    local parity_rc=0 parity_note parity_evidence parity_window_note="" parity_forgiven_note=""
     lane_parity_check "$head" "$MAIN_RUNS" || parity_rc=$?
     if [ "$parity_rc" -eq 0 ]; then
       parity_note="it certifies ONLY because LANE PARITY holds: the PR executed every test shard main's lane executed (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main). A shard main ran that this head skipped would have made this a REFUSAL (NOT COMPARABLE)."
@@ -3947,6 +4117,14 @@ $attribution_line"
       # catch a suffix added to the line's VALUE.
       if [ "${LANE_PARITY_MAIN_WINDOW:-0}" -gt "$MAIN_RUNS" ]; then
         parity_window_note="   reference window: main's lane reference was widened past non-measuring runs to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested window yielded no executed shard"
+      fi
+      # DISCLOSE the #6928 forgiveness the SAME way, and for the same reason: a
+      # certificate that says `PR ⊇ main` must state the one case where the PR did
+      # NOT execute every shard main did, or the line overstates what was measured.
+      # Its OWN line, appended after the literal block below, and never carrying
+      # `lane parity:` (that line is matched to its END by the evidence gate).
+      if [ -n "$LANE_PARITY_FORGIVEN" ]; then
+        parity_forgiven_note="   lane-coverage forgiveness (#6928): these shard(s) main's lane executed were DECLINED by this head's diff selector and are therefore NOT required of it: $(printf '%s' "$LANE_PARITY_FORGIVEN" | tr '\n' ' ')Selector verdict: ${LANE_PARITY_SELECTOR_VERDICT}. This is the SELECTOR's own decision — the same rule the CI aggregate applies to a selector-declined leg — not a blanket exemption: every shard the selector did not decline still had to be executed, and was."
       fi
     elif [ "$parity_rc" -eq 2 ]; then
       parity_note="lane parity was NOT ESTABLISHED: ${LANE_PARITY_REASON}."
@@ -4017,6 +4195,10 @@ $attribution_line"
     if [ -n "$parity_window_note" ]; then
       analyzed="${analyzed}
 ${parity_window_note}"
+    fi
+    if [ -n "$parity_forgiven_note" ]; then
+      analyzed="${analyzed}
+${parity_forgiven_note}"
     fi
     info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lane: $lane); lane parity: $parity_evidence; PR tree: $TREE_STATUS ($TREE_RED failing of $TREE_TOTAL measured); main check surface: $BASE_STATUS ($BASE_RED failing of $BASE_TOTAL measured, context only)"
   fi
