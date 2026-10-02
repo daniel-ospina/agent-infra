@@ -17,26 +17,18 @@
 # section 6 MUTATES the function to prove the clauses it relies on are load-bearing —
 # a suite that only proves the acceptance path would let a fail-open land green.
 #
-# SCOPE OF THAT CLAIM, measured (a reviewer removed EVERY production line and recorded
-# which removals the suite caught, so this is enumerated rather than asserted):
-#   - COVERED individually — removal turns the suite RED. The interior lines that are
-#     load-bearing: the same-sha check, the two base-identity reads, each half of the base
-#     shape validation (§8a), the second-parent rev-parse, the `rev-list` capture and its
-#     rc check, the (C2) lane-commit check (§11), the merge-tree rc capture, its rc check
-#     and the `head -1` tree parse (§7), the `ctree` capture and the tree-equality check
-#     (§9), the replace-blind export (§12, a HEAD graft), the grafts-file export (§13), and
-#     the `local` declaration that carries both exports.
-#   - DEFENCE-IN-DEPTH, NOT individually covered — this list names EVERY non-comment line
-#     whose removal leaves the suite GREEN, measured by deleting every line of the function
-#     one at a time: the argument-presence check, the two `cat-file` presence checks, the
-#     forward-move check (B), the base `cat-file`, the `p2` non-empty check, the
-#     second-parent ancestry check, the rev-list rc check, the non-empty-tree and
-#     non-empty-ctree checks, and the function's final `return 0` (which is redundant —
-#     falling off the end returns the status of the last test, which is 0). Removing any
-#     ONE still refuses, because another clause catches the same case. They are kept to
-#     make the failure explicit and fail closed. THREE revisions of this header have now
-#     claimed exhaustiveness and been caught short (the p2 check, the argument check, and
-#     the final return), so the rule is: this paragraph is re-measured, not reasoned about.
+# SCOPE OF THAT CLAIM, and why there is NO line-by-line list here. This header used to
+# enumerate which clauses the suite catches individually and which are defence-in-depth.
+# That enumeration was WRONG FIVE TIMES: a verifier or reviewer deleted the lines and
+# caught it on every attempt (the p2 check, the argument check, `return 0`, the rev-list rc
+# check listed as individually covered while being GREEN — and simultaneously listed as
+# defence-in-depth, i.e. self-contradictory — and the primary `local` declaration named by
+# nothing while being RED). A claim about which of our own guards works re-stales every time
+# it is re-worded, so it is DELETED rather than re-worded a sixth time. The gate is the
+# MEASUREMENT, and it is one command: delete each non-comment interior line of
+# lane_dimension_carry in a scratch copy, run this suite, and the lines whose removal turns
+# it RED are the individually-covered set. Every other clause must be covered by another
+# clause, and the in-suite `mutate` guards below assert the ones that matter most.
 #   - The CALL SITE (`--force-stale` precedence in the #2982 arm) is NOT driven by this
 #     suite; it extracts and calls the function directly. That guard is verified by
 #     reading, and a test that runs the real script with --force-stale is a follow-up,
@@ -115,7 +107,14 @@ mutate() { # <literal-from> <literal-to> <dest> ; 0 only if applied, changed, pa
 import sys
 src, frm, to, dst = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 code = open(src).read()
-if frm not in code:
+i = code.find(frm)
+if i < 0:
+    sys.exit(1)
+# A literal that matches only inside a COMMENT satisfies every other check and would be a
+# semantic no-op reported as a successful mutation (a reviewer demonstrated this). Refuse
+# when the first match sits on a comment line; the clauses mutated here are all code.
+line = code[code.rfind('\n', 0, i) + 1:code.find('\n', i)]
+if line.lstrip().startswith('#'):
     sys.exit(1)
 open(dst, 'w').write(code.replace(frm, to, 1))
 PY

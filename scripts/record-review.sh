@@ -541,7 +541,13 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # `.base.sha` is the CURRENT base tip, which is normally AHEAD of what the head
   # merged, so it is checked as the ANCESTOR of the head's second parent — not as an
   # ancestor of the head itself.
-  base_sha="$(gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+  base_sha="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+  # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
+  # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
+  # 40-hex, so the shape check does not stop it). RESIDUAL, stated rather than implied: this
+  # does NOT defend against a hostile BINARY earlier on PATH — that needs a resolved trusted
+  # path, which is broader than this predicate's declared threat surface (local commit-graph
+  # rewriting) and is left to the caller's environment.
   # Reject everything that is not a 40-hex sha, exactly as the head fetch above does.
   # Empty/null/error-body already failed closed (measured), but any non-empty string
   # that happens to resolve as a LOCAL revision was accepted as "the authoritative
