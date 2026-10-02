@@ -1496,7 +1496,7 @@ lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
 n = 0
 for i, l in enumerate(lines):
     st = l.strip()
-    if st.startswith('lland="$(command git show') or '} | LC_ALL=C sort -u)" || return 1' in l:
+    if st.startswith('lland="$(command git show') or 'sort -u)" || return 1' in l:
         lines[i] = l.replace("|| return 1", "|| true")
         n += 1
 if n != 2:
@@ -1519,7 +1519,71 @@ else
   pass "mutation NOSTATUS is recorded but NOT exercised this run (\`sort\` tolerated the bytes, so the pre-fix idiom still refuses here) — no unmeasured claim is made"
 fi
 
-MIN_ASSERTIONS=115
+# ── 27. THE THIRD PIPELINE'S STATUS. Round 28 checked the two `sort` statuses and left `comm`
+# inside `[ -z "$( ... )" ]`, which discards it: with `comm` FAILING and printing NOTHING, `[ -z "" ]`
+# was TRUE and (C4) PASSED. MEASURED (round 29) end-to-end on the union leak — with a failing `comm`
+# on PATH the same head that REFUSEs carried an unreviewed line into the base, under the real
+# script's own `set -euo pipefail`. `comm` was also the only external in that block NOT
+# `command`-qualified. This section attacks with the shim rather than a mutated function, because the
+# shim is the deterministic form of the attack (`LC_ALL=C` cannot be relied on to make `sort` fail).
+D8="$TMP/c27commfail"; rm -rf "$D8"; mkdir -p "$D8"; cd "$D8" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'a\n' > shared.txt; printf 'shared.txt merge=union\n' > .gitattributes
+git add -A; git commit -qm base; git branch -M main
+git update-ref refs/remotes/origin/main refs/heads/main
+git checkout -qb pr
+printf 'a\nLANE\n' > shared.txt; git add -A; git commit -qm 'lane adds LANE (REVIEWED)'
+REVIEWED="$(git rev-parse HEAD)"
+( cd "$D8" || exit 9
+  git checkout -q main
+  printf 'a\nSECRET\n' > shared.txt; git add -A; git commit -qm 'base ancestor adds SECRET'
+  printf 'a\nb\n' > shared.txt; git add -A; git commit -qm 'base tip DELETES SECRET'
+  printf 'more\n' > more.txt; git add -A; git commit -qm 'base tip advances again' )
+B1="$(git rev-parse main~2)"
+( cd "$D8" || exit 9
+  git checkout -q pr
+  git merge -q --no-ff -m 'head merges the base ancestor' "$B1" >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main refs/heads/main )
+git checkout -q pr
+CURRENT="$(git rev-parse HEAD)"
+BASETIP="$(git rev-parse main)"
+[ "$(git rev-parse "$CURRENT^2")" = "$B1" ] \
+  && pass "(27) PRECONDITION: the head's second parent IS the base ancestor, so only (C4) can refuse" \
+  || fail "(27) fixture is VACUOUS: another clause would refuse"
+[ "$(verdict_with "$D8" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
+  && pass "(27) BASELINE: with the real \`comm\` this head is REFUSED" \
+  || fail "(27) BASELINE FAILED: the leak is not even caught without the attack"
+# The attack: a `comm` that fails and prints nothing. 0 = CARRY (wrong), 1 = REFUSE (correct).
+SHIM="$TMP/shimcf"; rm -rf "$SHIM"; mkdir -p "$SHIM"
+printf '#!/bin/sh\nexit 1\n' > "$SHIM/comm"; chmod +x "$SHIM/comm"
+"$SHIM/comm" -23 /dev/null /dev/null > "$TMP/c27-shim-out.txt" 2>/dev/null
+[ "$?" -ne 0 ] && [ ! -s "$TMP/c27-shim-out.txt" ] \
+  && pass "(27) PRECONDITION: the shimmed \`comm\` really fails AND prints nothing — the blinding condition" \
+  || fail "(27) fixture is VACUOUS: the shim does not reproduce a silent failure"
+shim_verdict() { # <fnfile>
+  ( cd "$D8" || exit 9
+    export FIXTURE_BASE_SHA; FIXTURE_BASE_SHA="$BASETIP"
+    PATH="$SHIM:$PATH"
+    source "$1"; PR=1
+    if lane_dimension_carry "$REVIEWED" "$CURRENT"; then echo 0; else echo 1; fi )
+}
+[ "$(shim_verdict "$TMP/fn.sh")" = 1 ] \
+  && pass "(27) a silently-failing \`comm\` no longer makes the clause pass — its status is checked like the two \`sort\` pipelines" \
+  || fail "(27) CARRIED the leak: a failing \`comm\` with empty output still makes (C4) pass"
+
+# ── 28. The clause is a PIN-PILE, and that is a DESIGN finding, recorded here as an assertion of
+# fact rather than a claim: the C4 verdict is a function of at least eight independent ambient inputs
+# (core.quotePath, diff.relative+cwd, LANG/LC_*, the three pipeline statuses, $( ) NUL stripping,
+# PATH, attributes/merge drivers, replace refs/grafts), each discovered by a different review round.
+# It is pinned rather than fixed so a future "tidy" does not silently drop a member, and so the
+# follow-up (a byte-exact comparison seam — python3 is already a dependency — with the path list read
+# with -z) has a recorded starting point.
+PINS="$(grep -cE 'core\.quotePath=false|diff\.relative=false|LC_ALL=C|GIT_NO_REPLACE_OBJECTS|GIT_GRAFT_FILE' "$SRC")"
+[ "$PINS" -ge 5 ] \
+  && pass "(28) the clause carries $PINS pin sites — recorded as a DESIGN finding (a pin-pile, one member discovered per review round), with the follow-up being ONE byte-exact comparison seam rather than a ninth pin" \
+  || fail "(28) the pin count changed unexpectedly ($PINS) — re-derive the design finding before landing"
+
+MIN_ASSERTIONS=120
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

@@ -504,7 +504,7 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 # duration below — the two are DIFFERENT mechanisms and need different env vars.
 lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
   local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
-  local ltree="" lpath="" lhb="" thb="" rhb="" lpaths="" lland="" lknown=""
+  local ltree="" lpath="" lhb="" thb="" rhb="" lpaths="" lland="" lknown="" ldiff=""
   # Terminates an unterminated blob's last line when the known-line set is built below. A
   # LITERAL newline, deliberately NOT `$(printf '\n')`: command substitution STRIPS trailing
   # newlines, so that spelling assigns an EMPTY string and silently restores the very gluing
@@ -795,13 +795,21 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
     # reviewed commit. Two fixes, matching this file's own convention (`LC_ALL=C` is already
     # pinned on its other sort pipelines): CHECK THE STATUS, and pin the locale so the comparison
     # is byte-wise rather than a function of the caller's environment.
-    lland="$(command git show "$ltree:$lpath" 2>/dev/null | LC_ALL=C sort -u)" || return 1
+    lland="$(command git show "$ltree:$lpath" 2>/dev/null | LC_ALL=C command sort -u)" || return 1
     lknown="$({ command git show "$base_sha:$lpath" 2>/dev/null || true
                 printf '%s' "$lsep"
                 command git show "$reviewed:$lpath" 2>/dev/null || true
-                printf '%s' "$lsep"; } | LC_ALL=C sort -u)" || return 1
-    [ -z "$(LC_ALL=C comm -23 <(printf '%s\n' "$lland") <(printf '%s\n' "$lknown"))" ] \
+                printf '%s' "$lsep"; } | LC_ALL=C command sort -u)" || return 1
+    # ...AND THE THIRD ONE, which round 29 measured still discarded: with `comm` failing and
+    # printing NOTHING, `[ -z "" ]` was TRUE and (C4) PASSED. Reproduced end-to-end on the union
+    # leak with a failing `comm` on PATH (empty stdout -> CARRY, unreviewed line lands), under the
+    # real script's own `set -euo pipefail`. It is a PATH shim to reach, so it is the declared
+    # residual — but a discarded status is a wrong CARRY waiting for a mechanism, and `comm` was
+    # also the only one of this block's externals NOT `command`-qualified, so a shell function
+    # named `comm` defeated it outright. Both are fixed here; every external below is qualified.
+    ldiff="$(LC_ALL=C command comm -23 <(printf '%s\n' "$lland") <(printf '%s\n' "$lknown"))" \
       || return 1
+    [ -z "$ldiff" ] || return 1
   done <<EOF
 $lpaths
 EOF
