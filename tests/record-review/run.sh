@@ -554,12 +554,12 @@ git replace "$CURRENT" "$FAKE"
   && pass "(12) WITH the export the grafted head is still REFUSED" \
   || fail "(12) a HEAD graft CARRIED unreviewed lane work — FAIL-OPEN"
 M12="$TMP/mut-norepl.sh"
-if mutate 'env["GIT_NO_REPLACE_OBJECTS"] = "1"' 'env["GIT_NO_REPLACE_OBJECTS"] = "0"' "$M12"; then
+if mutate 'local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null' 'local -x GIT_GRAFT_FILE=/dev/null' "$M12"; then
   [ "$(verdict_with "$D" "$M12" "$REVIEWED" "$CURRENT")" = 0 ] \
     && pass "mutation NOREPL is caught: without the export the HEAD graft CARRIES unreviewed work, so the export IS load-bearing and is covered here" \
-    || pass "NOTE (seam): mutation NOREPL is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+    || fail "mutation NOREPL could not be built — the export line moved"
 else
-  pass "NOTE (seam): mutation NOREPL is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+  fail "mutation NOREPL could not be built — the export line moved"
 fi
 
 echo "── 13. The GRAFTS FILE is a DIFFERENT mechanism from replace refs: cover both"
@@ -596,12 +596,12 @@ fi
   && pass "(13) WITH GIT_GRAFT_FILE set the grafted head is still REFUSED" \
   || fail "(13) a grafts-file graft CARRIED unreviewed lane work — FAIL-OPEN"
 M13="$TMP/mut-nograftfile.sh"
-if mutate 'env["GIT_GRAFT_FILE"] = "/dev/null"' 'env["GIT_GRAFT_FILE"] = "/nonexistent"' "$M13"; then
+if mutate 'local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null' 'local -x GIT_NO_REPLACE_OBJECTS=1' "$M13"; then
   [ "$(verdict_with "$D" "$M13" "$REVIEWED" "$M13HEAD")" = 0 ] \
     && pass "mutation NOGRAFTFILE is caught: with only the replace export the grafts-file vector CARRIES unreviewed work, so GIT_GRAFT_FILE IS load-bearing" \
-    || pass "NOTE (seam): mutation NOGRAFTFILE is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+    || fail "mutation NOGRAFTFILE could not be built — the export line moved"
 else
-  pass "NOTE (seam): mutation NOGRAFTFILE is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+  fail "mutation NOGRAFTFILE could not be built — the export line moved"
 fi
 
 echo "── 14. A shell FUNCTION named gh must not nominate the base (what \`command gh\` is for)"
@@ -1568,7 +1568,7 @@ shim_verdict() { # <fnfile>
     if lane_dimension_carry "$REVIEWED" "$CURRENT"; then echo 0; else echo 1; fi )
 }
 [ "$(shim_verdict "$TMP/fn.sh")" = 1 ] \
-  && pass "(27) a silently-failing \`comm\` no longer makes the clause pass — its status is checked like the two \`sort\` pipelines" \
+  && pass "(27) under a hostile PATH a silently-failing comm cannot make the clause pass: the seam calls no comm and no sort at all, so the mechanism it mutated no longer exists — this is the §22 baseline re-run under that PATH, and it is kept as a regression tripwire on the seam's PATH-independence, NOT as evidence about a status check" \
   || fail "(27) CARRIED the leak: a failing \`comm\` with empty output still makes (C4) pass"
 
 # ── 28. The clause is a PIN-PILE, and that is a DESIGN finding, recorded here as an assertion of
@@ -1580,7 +1580,7 @@ shim_verdict() { # <fnfile>
 # with -z) has a recorded starting point.
 PINS="$(grep -cE 'core\.quotePath=false|diff\.relative=false|LC_ALL=C|GIT_NO_REPLACE_OBJECTS|GIT_GRAFT_FILE' "$SRC")"
 [ "$PINS" -ge 5 ] \
-  && pass "(28) the clause carries $PINS pin sites — recorded as a DESIGN finding (a pin-pile, one member discovered per review round), with the follow-up being ONE byte-exact comparison seam rather than a ninth pin" \
+  && pass "(28) DESIGN note, now HISTORICAL: the retired shell form of (C4) pin-piled ambient inputs, one member discovered per review round; the byte-exact seam replaced it. $PINS lines anywhere in the script still mention LC_ALL/unset/PATH — a REMAINING count, not a proof about this clause" \
   || fail "(28) the pin count changed unexpectedly ($PINS) — re-derive the design finding before landing"
 
 MIN_ASSERTIONS=125

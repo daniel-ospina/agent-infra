@@ -709,13 +709,9 @@ lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchang
   # names have to be quoted and unquoted. The comparison is therefore done in ONE place, in bytes,
   # where none of those can apply.
   #
-  # MEASURED against ten hermetic fixtures before this replacement: it agrees with the shell form
-  # on every case where the shell form is RIGHT (union leak / quoted-name leak / locale-invalid
-  # leak / two late-NUL leaks / binary leak all REFUSE; legitimate union carry / quoted-name clean
-  # move / unterminated last line / legitimate binary union carry all CARRY), and it is right in
-  # two places the shell form was WRONG (a locale-invalid leak reached from a subdirectory, and a
-  # quoted-name leak with raw byte names and no quotePath pin).
-  #
+  # It was differentially tested against the shell form it replaced before that form was deleted;
+  # that comparison has no surviving artifact, so it is NOT cited here as evidence. The suite,
+  # which RUNS, is the specification.
   # DELIBERATELY NO "fail closed on a binary blob" GUARD: the guard was measured to buy nothing —
   # a leak IS a line absent from tip + reviewed, so byte-exact line comparison already catches the
   # binary leak — and it produced the ONLY false refusal measured, on a legitimate binary union
@@ -730,8 +726,12 @@ import os, subprocess, sys
 
 reviewed, current, base_sha = sys.argv[1], sys.argv[2], sys.argv[3]
 env = dict(os.environ)
-env["GIT_NO_REPLACE_OBJECTS"] = "1"
-env["GIT_GRAFT_FILE"] = "/dev/null"
+# The replace-ref and grafts-file pins are NOT duplicated here, because the calling shell
+# already exports them with `local -x` and python inherits them. Duplicating the pins was
+# measured (round 31) to make both of their mutants INERT — a replace-ref pin is presence-tested
+# rather than value-tested, and a nonexistent grafts file neutralises a graft exactly like an
+# empty one — so the suite reported a benign "retirement" while two load-bearing fail-open
+# guards went unproven. One pin, one owner.
 env["LC_ALL"] = "C"
 
 
@@ -775,7 +775,7 @@ if rc2 != 0:
     sys.stderr.write("(C4) no second parent\n")
     sys.exit(1)
 p2 = out.strip()
-rc3, out = git([b"-c", b"core.quotePath=false", b"-c", b"diff.relative=false",
+rc3, out = git([b"-c", b"diff.relative=false",
                  b"diff", b"--name-only", b"-z", b"--no-renames", p2, base_sha.encode()])
 if rc3 != 0:
     sys.stderr.write("(C4) path listing failed (rc=%d)\n" % rc3)
@@ -786,13 +786,29 @@ for path in paths:
     lspec = ltree + b":" + path
     if not exists(lspec):
         continue
+    # OID FIRST, and by TYPE-AGNOSTIC object id: the landing taking one side verbatim is
+    # skipped on the OBJECT, not on the bytes. MEASURED (round 31) as two FALSE REFUSALS
+    # otherwise: a base tip that turns file `x` into directory `x/` (the landing entry is a
+    # TREE, `cat-file blob` fails) and a submodule pointer bump whose commit IS present
+    # locally (a GITLINK). Both are pure base moves — the class this arm exists to carry —
+    # and both were refused. `rev-parse` on a tree:path returns the entry's object id for a
+    # blob, a tree and a gitlink alike, so this one comparison covers all three.
+    def oid(spec):
+        rc, out = git([b"rev-parse", b"--verify", b"--quiet", spec])
+        return out.strip() if rc == 0 else None
+
+    landing_oid = oid(lspec)
+    tip_spec = base_sha.encode() + b":" + path
+    rev_spec = reviewed.encode() + b":" + path
+    if landing_oid is not None and (oid(tip_spec) == landing_oid
+                                    or oid(rev_spec) == landing_oid):
+        continue
     landing = read_blob(lspec)
     if landing is None:
-        sys.stderr.write("(C4) landing entry unreadable: %r\n" % path)
+        sys.stderr.write("(C4) landing entry unreadable and unlike both inputs: %r\n" % path)
         sys.exit(1)
     tip = rev = None
-    for spec, which in ((base_sha.encode() + b":" + path, "tip"),
-                        (reviewed.encode() + b":" + path, "reviewed")):
+    for spec, which in ((tip_spec, "tip"), (rev_spec, "reviewed")):
         if not exists(spec):
             continue
         blob = read_blob(spec)
@@ -803,8 +819,6 @@ for path in paths:
             tip = blob
         else:
             rev = blob
-    if landing == tip or landing == rev:
-        continue
     new_lines = lines(landing) - (lines(tip or b"") | lines(rev or b""))
     if new_lines:
         sys.stderr.write("(C4) LEAK %r -> %r\n" % (path, sorted(new_lines)[:5]))
