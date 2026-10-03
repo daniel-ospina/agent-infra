@@ -37,14 +37,33 @@
 # required. It never writes a record itself, and it never merges directly.
 #
 # FAIL-CLOSED INVARIANTS (this is gate/enforcement code):
-#   * NO DEPENDENCY ON `strict` / branch protection. The rail never reads a
-#     protection setting and is correct with `strict` ON or OFF — that is the
-#     point of the rail: the T2 protection window must become unnecessary. Its
-#     inputs are the PR's own state (head, base, base MERGE BASE, checks) and the
-#     two scripts that own the review and the merge. `BEHIND` is used only as a
-#     head/base DIVERGENCE signal ("the head is out of date"), never as a proxy
-#     for a protection setting: the documented enum semantics say BEHIND can
-#     occur with or without strict, and strict is only what makes it block.
+#   * THE REFRESH DOES NOT DEPEND ON A PROTECTION SETTING — WITH ONE DECLARED,
+#     LIVE, NARROW EXCEPTION (#1565). The rail's inputs are the PR's own state
+#     (head, base, base MERGE BASE, checks) and the two scripts that own the
+#     review and the merge. `BEHIND` is used only as a head/base DIVERGENCE
+#     signal ("the head is out of date"), never as a proxy for a protection
+#     setting: the documented enum semantics say BEHIND can occur with or without
+#     strict, and strict is only what makes it block.
+#     OVERRIDES: the former "the rail never reads a protection setting, and is
+#     correct with strict ON or OFF" invariant — narrowed to ONE positive read of
+#     `strict` per invocation (strict_of()), at the step-1 decision point ONLY.
+#     Rationale, measured (#1565): the refresh's cost is a head move, which
+#     invalidates the head-bound review record (clause B5), forces a full CI run at
+#     the new head (critical path 17.1m median / 19.8m max), and then makes the rail
+#     wait up to 5400s for those checks to go terminal — while `strict: false` means
+#     the pin buys no mergeability at all (nine PRs sat OPEN+MERGEABLE unlanded for
+#     ~2h paying it). The read is LIVE and per-invocation (never cached: a stored
+#     belief about branch protection cannot disagree with GitHub, it can only be
+#     silently wrong) and it FAILS CLOSED — anything but a positive `false`
+#     (404/403/`null`/empty: protection unconfigured, or a token without admin on
+#     the repo) keeps the refresh exactly as it was. The merge and the record never
+#     consult it. ATOMIC_LAND_REFRESH_ALWAYS=1 restores the unconditional refresh.
+#     The gate applies to the BEHIND arm ONLY: the base-drift arm below remains
+#     conditional on behind_by > 0 and is NOT gated on this predicate, because it
+#     exists for the #1533 case — a BLOCKED branch whose drift red could never
+#     resolve without an update — and a BLOCKED PR is still `mergeable: true` (no
+#     conflicts; it has a red required leg). Gating that arm would skip exactly the
+#     refresh #1533 needed.
 #   * No accepted-verdict review record → refuse before any mutation.
 #   * A draft → refuse before any CI work (`gh` refuses to merge a draft).
 #   * A changed/unprovable diff → the record step refuses (exit 3) → STOP.
@@ -93,6 +112,8 @@
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
 #   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
 #                           before failing closed (default: 5).
+#   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a BEHIND head, ignoring the live
+#                               `strict` read (the #1565 fail-safe restore)
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
@@ -151,7 +172,26 @@ done
 [ -n "$PR" ] || { err "atomic-land: a PR number is required"; usage >&2; exit 2; }
 case "$PR" in *[!0-9]*) err "atomic-land: PR must be numeric (got $PR)"; exit 2 ;; esac
 case "$WAIT_TIMEOUT" in ''|*[!0-9]*) err "atomic-land: --wait-timeout must be a non-negative integer"; exit 2 ;; esac
+# A CAP, not just a shape check. `[ "$elapsed" -ge "$WAIT_TIMEOUT" ]` compares as
+# a machine integer, and a literal too wide for that comparison ERRORS — and a
+# failing `[` is FALSE, so an oversized value silently DISABLES the bound and the
+# rail loops forever while holding the PR's lock. That is the #1395 item-1 defect
+# arriving by a second door, and it is the same class B12b pins (a guard a failed
+# comparison turns OFF). Capping it also rejects an oversized literal HERE, via
+# that very error, so this line fails closed by construction. `2>/dev/null` hides
+# that raw `[: integer expression expected`, which is bash's, not our diagnostic.
+# 86400 = 24h.
+[ "$WAIT_TIMEOUT" -le 86400 ] 2>/dev/null || { err "atomic-land: --wait-timeout must be at most 86400s (24h)"; exit 2; }
 case "$POLL" in ''|*[!0-9]*) err "atomic-land: --poll must be a non-negative integer"; exit 2 ;; esac
+# `--poll` is capped for the same reason, and it is the fix for the OTHER waits:
+# two loops in this rail are bounded by an ITERATION COUNT (5 polls for a lazy
+# merge state, 20 for the async ref update), so an unbounded interval multiplies
+# their bound instead of honouring it — `/bin/sleep` takes up to ~68 years, i.e.
+# a "bounded" poll that outlives the run while holding the per-PR lock. The
+# default is 30; 300 is well past any sane re-check cadence, and it keeps those
+# two loops to 25 min and 100 min instead of 68 years. Fails closed on an
+# oversized literal via the same comparison error as the cap above.
+[ "$POLL" -le 300 ] 2>/dev/null || { err "atomic-land: --poll must be at most 300s"; exit 2; }
 case "$MAX_ROUNDS" in ''|*[!0-9]*) err "atomic-land: --max-rounds must be a positive integer"; exit 2 ;; esac
 [ "$MAX_ROUNDS" -ge 1 ] || { err "atomic-land: --max-rounds must be >= 1"; exit 2; }
 [ "$MAX_ROUNDS" -le 5 ] || { err "atomic-land: --max-rounds is bounded at 5"; exit 2; }
@@ -240,6 +280,60 @@ CERT_BASE=""; CERT_MB=""; CERT_BASE_TIP=""
 merge_base_of() { # <base> <head>
   gh_ api "repos/$REPO/compare/$1...$2" --jq .merge_base_commit.sha 2>/dev/null || true
 }
+# How many commits the HEAD is behind the BASE. Same compare call merge_base_of()
+# already makes — the response carries `behind_by`, so this is a second read of an
+# existing response, not new machinery and not a new API.
+#
+# ⛔ Why the rail must not route on `mergeStateStatus` alone: a red REQUIRED check
+# makes GitHub report BLOCKED, not BEHIND. Measured live over the non-draft PRs:
+# 90 BLOCKED / 10 UNSTABLE / 6 DIRTY / 0 BEHIND. So a head that predates a base
+# commit which is itself required for a gate leg (e.g. `9c432c6a4`, which CLASSIFIES
+# `test_pack_extraction_slots_v31.py` for `manifest-integrity` — a leg of the
+# required `python-ci-gate`) reads as BLOCKED, do_update did not fire, and the
+# failure was self-sustaining: the stale head keeps failing the leg, the red keeps
+# reading as BLOCKED, and nothing ever refreshes it. `behind_by` is the condition
+# we actually want; the enum is a coarse proxy that NEVER says it for these PRs.
+behind_by_of() { # <base> <head> -> N (empty on any unreadable/non-numeric reply)
+  local n
+  n="$(gh_ api "repos/$REPO/compare/$1...$2" --jq '.behind_by // 0' 2>/dev/null || true)"
+  case "$n" in ''|*[!0-9]*) echo ""; return 0 ;; esac
+  echo "$n"
+}
+# ── the refresh gate: is the base pin worth its cost? (#1565) ─────────────
+# THE ONE PLACE THIS RAIL READS A PROTECTION SETTING. Declared, LIVE (read at the
+# decision point, never cached at startup), and NARROW: it gates ONLY the step-1
+# refresh — never the merge, the record, the wait, or the check verdict.
+#
+# FAIL-CLOSED DIRECTION (this is gate code): the skip fires only on a POSITIVE
+# `false` read of `required_status_checks.strict` AND a POSITIVE `true` mergeable.
+# Every other outcome — an unreadable protection (404 when protection is not
+# configured, or when the token lacks admin on the repo; 403; a rate-limited or
+# empty reply), a null `required_status_checks`, or an unreadable `mergeable` —
+# keeps the refresh exactly as it was before this gate existed.
+strict_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refreshes)
+  local v
+  v="$(gh_ api "repos/$REPO/branches/$BASE/protection" --jq '.required_status_checks.strict' 2>/dev/null || true)"
+  case "$v" in true|false) printf '%s' "$v" ;; *) printf '' ;; esac
+}
+mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refreshes)
+  # ⛔ `gh pr view --json mergeable` IS NOT A BOOLEAN — it is the GraphQL enum STRING
+  # (api/queries_pr.go: PullRequestMergeable = "MERGEABLE" | "CONFLICTING" |
+  # "UNKNOWN"). MEASURED on PR #1566: `gh pr view 1566 --json mergeable --jq
+  # .mergeable` prints `MERGEABLE`, while `gh api repos/…/pulls/1566 --jq .mergeable`
+  # prints `true` for the SAME PR. A predicate that accepts only `true|false`
+  # therefore NEVER matches the real CLI, which silently turns this gate INERT — and
+  # the suite keeps passing as long as its fixture speaks the REST shape. Both the
+  # predicate and the fixture were wrong in the first cut of #1565; a review caught
+  # it. Do not "simplify" this back to a boolean test.
+  local v
+  v="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json mergeable --jq .mergeable 2>/dev/null || true)"
+  case "$v" in
+    MERGEABLE)   printf 'true'  ;;
+    CONFLICTING) printf 'false' ;;
+    *)           printf ''      ;;
+  esac
+}
+
 # The base branch's TIP at a moment in time. A concurrent merge ADVANCES it while
 # leaving the merge base unchanged, so it is the signal for B12: the checks were
 # verified against the old tip and did not cover the new one. `--admin` bypasses
@@ -371,7 +465,7 @@ verdict_accepted() {
 
 # ── step 1: update ───────────────────────────────────────────────────────
 do_update() { # 0 = updated, 3 = not behind (no-op)
-  local before="$HEAD" after="" i t=0
+  local before="$HEAD" after="" i t=0 behind=""
   case "$MERGE_STATE" in
     UNKNOWN|""|null)
       # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
@@ -392,14 +486,66 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
           stop "the merge state of $REPO#$PR is still undetermined after $t re-poll(s) (mergeStateStatus=${MERGE_STATE:-<none>}) — refusing to certify a head whose base relation is unknown (B6/B12)" ;;
       esac ;;
   esac
+  # ── the update trigger: the ENUM, OR the base-drift condition ──────────────
+  # #6424's ruling applied to the TRIGGER (route, do not exempt): the rail already
+  # has the signal it needs in a response it already fetches, so it fires on
+  # behind_by > 0 as well as on BEHIND. A PR whose head predates a base commit that
+  # a required gate leg depends on is BLOCKED (not BEHIND) and could otherwise never
+  # be refreshed — see behind_by_of(). The threshold is 0 by default: any real base
+  # drift is a reason to refresh, and an already-current head reports 0, which is
+  # the pre-existing no-op. ATOMIC_LAND_DRIFT_TRIGGER exists only to make the
+  # boundary testable; it is not a tuning knob.
   case "$MERGE_STATE" in
-    BEHIND) : ;;
-    CLEAN)
-      say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
-      return 3 ;;
+    BEHIND)
+      # #1565 — a BEHIND head is not by itself a reason to refresh. Refresh only
+      # when something REQUIRES an up-to-date branch: read that live rather than
+      # assume it (see strict_of()). A PR that is positively mergeable under
+      # strict=false is already landable, so moving its head buys no mergeability
+      # and costs a record invalidation + a full CI run + up to 5400s of waiting.
+      #
+      # WHY THIS ARM AND NOT THE BASE-DRIFT ARM BELOW: the drift arm is already
+      # conditional (behind_by > 0) and exists for #1533 — a BLOCKED branch whose
+      # drift red could never resolve without an update. A BLOCKED PR is still
+      # `mergeable: true` (no conflicts, but a red required leg), so applying this
+      # predicate there would skip precisely the refresh #1533 needed. This arm is
+      # where the update is UNCONDITIONAL — it fires on the enum alone — and that is
+      # the blast radius measured in #1565.
+      if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
+        say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
+      else
+        local strict mergeable
+        strict="$(strict_of)"
+        if [ "$strict" = false ]; then
+          mergeable="$(mergeable_of)"
+          if [ "$mergeable" = true ]; then
+            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
+            return 3
+          fi
+          say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
+        else
+          say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=${strict:-unreadable} (read live) — refreshing"
+        fi
+      fi ;;
     *)
-      say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, not BEHIND — nothing to update"
-      return 3 ;;
+      behind="$(behind_by_of "$BASE" "$HEAD")"
+      if [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
+        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
+      elif [ "$MERGE_STATE" = "CLEAN" ]; then
+        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
+        return 3
+      elif [ -z "$behind" ]; then
+        # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
+        # current, and the silent "up to date" read is the exact defect this arm
+        # exists to close. `CLEAN` was checked above and already asserts there is no
+        # divergence, so it keeps its no-op; any OTHER state means GitHub has told
+        # us something is wrong with this head and the compare API could not tell us
+        # how stale it is. Stop and name it rather than proceeding on an unmeasured
+        # base relation (tortoise #6210 / #6169 are the measured population).
+        stop "could not measure the head/base divergence of $REPO#$PR (mergeStateStatus=$MERGE_STATE, compare API read failed) — refusing to treat a blocked head as up to date (B13)"
+      else
+        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE — nothing to update"
+        return 3
+      fi ;;
   esac
   # B5 — never SPEND an attestation the unit cannot restore. A branch update moves
   # the head and invalidates the record; the #767 carry-forward can re-bind it only
@@ -436,6 +582,21 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
 }
 
 # ── step 2: verify (the head's checks must be terminal) ──────────────────
+# check-runs defaults to 30 per page (measured: 30 of 47 at a real head), so a
+# count read from one page is not a verdict — a partial surface is never CLEAN.
+# --paginate emits ONE result per page, so the pages are SUMMED here; a FAILED
+# read stays "?" so the caller keeps waiting instead of reading an error as zero
+# pending (a false terminal hands in-flight checks to the land step).
+check_count() { # $1 = jq program applied to one page of check-runs
+  local raw
+  if ! raw="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs?per_page=100" --paginate \
+                        --jq "$1" 2>/dev/null)"; then
+    echo "?"
+    return
+  fi
+  printf '%s\n' "$raw" | awk '{n+=$1} END {print n+0}'
+}
+
 wait_terminal() {
   if [ "$NO_WAIT" -eq 1 ]; then
     say "atomic-land: [2/4] verify — --no-wait: admin-merge.sh's tested-head precondition decides"
@@ -446,20 +607,49 @@ wait_terminal() {
     return 0
   fi
   say "atomic-land: [2/4] verify — waiting (≤${WAIT_TIMEOUT}s) for the checks at ${HEAD:0:12}… to be terminal"
-  local elapsed=0 pending completed
+  # B14 (#1395 item 1): the bound is WALL-CLOCK, not a poll count. The old
+  # `elapsed=$((elapsed + POLL))` credited $POLL per iteration while each
+  # iteration first spends TWO `gh api` round trips, so the rail outlived its own
+  # documented bound (MEASURED: #5797 sat at [2/4] verify for 93 min against a
+  # nominal 90) — and `--poll 0` advanced the counter by ZERO, so the bound could
+  # never be reached at all and the rail looped forever while holding the PR's
+  # lock and a landing slot. Both are one defect: a counter that is not a clock.
+  # $SECONDS is bash's own elapsed-time counter: it removes the CLOCK's fork (the
+  # `$(date +%s)` that the first cut of this fix ran every iteration) and it
+  # cannot be affected by the poll interval. It does NOT remove the loop's own
+  # fork: with `--poll 0`, `sleep 0` is still /bin/sleep and forks (measured ~143
+  # iterations/s, against ~98k for a pure builtin loop) — that is just a busy
+  # loop, bounded by the clock above, not a second way to defeat the bound.
+  # Residual: like any wall clock it can step BACKWARDS on an NTP adjustment,
+  # which would delay the stop rather than defeat it permanently.
+  local started elapsed remaining pending completed
+  started="$SECONDS"
   while :; do
-    pending="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs" \
-                 --jq '[.check_runs[] | select(.status != "completed")] | length' 2>/dev/null || echo "?")"
-    completed="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs" \
-                 --jq '[.check_runs[] | select(.status == "completed")] | length' 2>/dev/null || echo "?")"
+    pending="$(check_count '[.check_runs[] | select(.status != "completed")] | length')"
+    completed="$(check_count '[.check_runs[] | select(.status == "completed")] | length')"
     if [ "$pending" = "0" ] && [ "$completed" != "0" ] && [ "$completed" != "?" ]; then
       say "atomic-land:     checks terminal — $completed completed, 0 pending"
       return 0
     fi
+    elapsed=$(( SECONDS - started ))
     if [ "$elapsed" -ge "$WAIT_TIMEOUT" ]; then
       stop "the checks at ${HEAD:0:12}… were not terminal within ${WAIT_TIMEOUT}s (pending=${pending}, completed=${completed}) — re-run the rail later; nothing was recorded or merged"
     fi
-    sleep "$POLL"; elapsed=$((elapsed + POLL))
+    # The bound was checked JUST ABOVE, so an unclamped `sleep "$POLL"` lets the
+    # rail overshoot its own bound by up to a whole poll interval — MEASURED on the
+    # revision before this line: `--wait-timeout 2 --poll 8` ran 10 s wall while
+    # printing "waiting (≤2s)". That is the #1395 symptom again (a rail outliving
+    # the bound it reports, holding the per-PR lock), so clamp the final sleep to
+    # what is actually left. min(remaining, POLL) keeps polling at the requested
+    # cadence while making the bound exact to within one poll of the remainder.
+    # `10#` forces BASE 10. The validator and the `-ge` test above read the argument
+    # as DECIMAL, while bare arithmetic reads a leading zero as OCTAL — so
+    # `--wait-timeout 010` would compare as 10 but subtract as 8, and `08` is not a
+    # valid octal literal AT ALL: the arithmetic error unwinds this loop SILENTLY
+    # (bash 3.2), after step [1/4] has already moved the head. Same base everywhere.
+    remaining=$(( 10#$WAIT_TIMEOUT - elapsed ))
+    if [ "$remaining" -gt "$POLL" ]; then remaining="$POLL"; fi
+    sleep "$remaining"
   done
 }
 
