@@ -1237,11 +1237,13 @@ bash -n "$M22" 2>/dev/null || fail "mutation NOC4 did not parse"
 # of the SAME fixture REFUSED; `core.quotePath=false` alone flipped it back. The clause is
 # therefore a function of the CALLER's git config without the `-c` below, and a name that
 # resolves against neither input tree now REFUSES rather than being skipped.
-# WHAT THIS SECTION PINS, EXACTLY (round 27 measured that the claim here used to overstate it):
-# the REFUSE below does NOT isolate the `-c core.quotePath=false` flag, because removing that flag
-# alone still refuses this fixture — via the fail-closed backstop, for a different reason. What
-# isolates the flag is the CLEAN-move assertion further down: there the backstop is what a missing
-# flag reddens, so the flag is load-bearing and this fixture pair shows it.
+# WHAT THIS SECTION PINS, EXACTLY (round 32 corrected it a second time). The seam's path listing
+# carries NO `-c core.quotePath=false`: round 31 measured it to be a DEAD pin (the `-z` that the
+# seam uses is byte-transparent whatever `core.quotePath` says — measured equal under `true`,
+# `false` and the default). So there is no flag here to isolate, and any caption claiming this
+# fixture isolates one would be unfalsifiable. What the pair still proves is the behaviour that
+# matters: a quoted-multibyte name cannot blind the clause (leak -> REFUSE, above) and a CLEAN
+# base-only move touching that same name still CARRIES (below).
 D4="$TMP/c23quoted"; rm -rf "$D4"; mkdir -p "$D4"; cd "$D4" || exit 2
 # The real bytes (0xC3 0xA9), not a literal escape sequence — see the note above §23.
 QN="$(printf 'caf\303\251.txt')"
@@ -1284,9 +1286,9 @@ git -c core.quotePath=true diff --name-only "$P2B" "$BASETIP" | grep -q '\\' \
 [ "$(verdict_with "$D4" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 1 ] \
   && pass "(23) the head is REFUSED — a quoted name no longer hides the path from (C4)" \
   || fail "(23) the head was CARRIED: (C4) is blind to a quoted path name"
-# A CLEAN base-only move touching the SAME name must CARRY. This is the assertion that isolates
-# the `-c core.quotePath=false` flag: without it the name is C-quoted, the backstop refuses, and
-# this reddens — while the leak assertion above stays green either way.
+# A CLEAN base-only move touching the SAME name must CARRY. Note this is NOT an assertion about a
+# `core.quotePath` flag (there is none — see the header): it is the counterweight to the leak
+# assertion above, showing the quoted-name handling is not simply "refuse anything unfamiliar".
 D4b="$TMP/c23clean"; rm -rf "$D4b"; mkdir -p "$D4b"; cd "$D4b" || exit 2
 QN="$(printf 'caf\303\251.txt')"
 git init -q .; git config user.email t@t; git config user.name t
@@ -1314,7 +1316,7 @@ B1="$(git rev-parse main~2)"
 git checkout -q pr
 CURRENT="$(git rev-parse HEAD)"
 [ "$(verdict_with "$D4b" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
-  && pass "(23) a CLEAN base-only move touching the quoted name is CARRIED — this is what isolates \`-c core.quotePath=false\` (a bare-name version of this same check CARRIES, so the name needs quoting for the assertion to bite)" \
+  && pass "(23) a CLEAN base-only move touching the quoted name is CARRIED — the counterweight to the leak assertion above (NOT a `core.quotePath` flag assertion: the seam pins no such flag, because `-z` is byte-transparent)" \
   || fail "(23) a clean base-only move touching a quoted name was FALSELY REFUSED — a caller's git config is deciding the verdict"
 
 # ── 25. (C4)'s path set must not depend on the CALLER'S CWD or config. `diff.relative` is a
@@ -1583,7 +1585,102 @@ PINS="$(grep -cE 'core\.quotePath=false|diff\.relative=false|LC_ALL=C|GIT_NO_REP
   && pass "(28) DESIGN note, now HISTORICAL: the retired shell form of (C4) pin-piled ambient inputs, one member discovered per review round; the byte-exact seam replaced it. $PINS lines anywhere in the script still mention LC_ALL/unset/PATH — a REMAINING count, not a proof about this clause" \
   || fail "(28) the pin count changed unexpectedly ($PINS) — re-derive the design finding before landing"
 
-MIN_ASSERTIONS=125
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §29  THE OID-FIRST SKIP IS LOAD-BEARING AND IS PINNED HERE  (round 32)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# (C4)'s seam skips a path when the landing entry's OBJECT ID equals the tip's or `reviewed`'s
+# entry id — one type-agnostic comparison covering a blob, a TREE and a GITLINK. Round 31 added it
+# for two MEASURED false refusals (a base tip that turns a file into a directory; a submodule
+# pointer bump whose commit is present locally) in the very class this arm exists to carry. Round
+# 32 then measured that DELETING the whole block leaves this suite green, and that no fixture
+# reached it with a tree or a gitlink: a live guard with inert coverage, which a later
+# "simplification" could delete in silence.
+# Deleting this section harms the PRODUCT (the false refusals return unnoticed); it prevents a real
+# regression, so it earns its place.
+
+# (29a) a base tip that turns FILE `x` into DIRECTORY `x/`
+D29a="$TMP/r29a"; rm -rf "$D29a"; mkdir -p "$D29a"; cd "$D29a" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'base\n' > keep.txt; git add -A; git commit -qm base; git branch -M main
+git checkout -qb lane
+printf 'lane\n' > lane.txt; git add -A; git commit -qm "lane work"
+REV29A="$(git rev-parse HEAD)"
+git checkout -q main
+printf 'x is a file\n' > x; git add -A; git commit -qm "B1: x is a file"
+B1_29A="$(git rev-parse HEAD)"
+git checkout -q lane
+git merge --no-ff -q "$B1_29A" -m "merge the base ancestor into the lane"
+CUR29A="$(git rev-parse HEAD)"
+git checkout -q main
+rm x; mkdir x; printf 'inner\n' > x/inner.txt; git add -A; git commit -qm "B2: x becomes a directory"
+B2_29A="$(git rev-parse HEAD)"
+git update-ref refs/remotes/origin/main refs/heads/main
+[ "$(git merge-base --all "$CUR29A" "$B2_29A" | wc -l | tr -d ' ')" = 1 ] \
+  && pass "(29a) PRECONDITION: the merge base is exactly one commit, so (C3) can pass and only (C4) can decide" \
+  || fail "(29a) the fixture does not isolate (C4)"
+L29A="$(git merge-tree --write-tree "$B2_29A" "$CUR29A" | head -1)"
+[ "$(git cat-file -t "$L29A:x")" = tree ] \
+  && pass "(29a) PRECONDITION: the LANDING entry for \`x\` is a TREE — the class that needs the OID skip" \
+  || fail "(29a) the landing entry is not a tree — the fixture does not reach the skip"
+[ "$(verdict_with "$D29a" "$TMP/fn.sh" "$REV29A" "$CUR29A" "$B2_29A")" = 0 ] \
+  && pass "(29a) a base-only file->directory move is CARRIED (this was a measured FALSE REFUSAL before the OID skip)" \
+  || fail "(29a) an honest base-only file->directory move was REFUSED — the OID skip regressed"
+
+# (29b) a submodule pointer bump whose target commit EXISTS locally
+D29b="$TMP/r29b"; rm -rf "$D29b"; mkdir -p "$D29b"; cd "$D29b" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'base\n' > keep.txt; git add -A; git commit -qm base; git branch -M main
+git checkout -qb lane
+printf 'lane\n' > lane.txt; git add -A; git commit -qm "lane work"
+REV29B="$(git rev-parse HEAD)"
+git checkout -q main
+git update-index --add --cacheinfo "160000,$REV29B,sub2"
+git commit -qm "B1: sub2 at the lane commit"
+B1_29B="$(git rev-parse HEAD)"
+git checkout -q lane
+git merge --no-ff -q "$B1_29B" -m "merge the base ancestor into the lane"
+CUR29B="$(git rev-parse HEAD)"
+git checkout -q main
+git update-index --add --cacheinfo "160000,$B1_29B,sub2"
+git commit -qm "B2: sub2 bumped"
+B2_29B="$(git rev-parse HEAD)"
+git update-ref refs/remotes/origin/main refs/heads/main
+L29B="$(git merge-tree --write-tree "$B2_29B" "$CUR29B" | head -1)"
+[ "$(git ls-tree "$L29B" sub2 | awk '{print $1}')" = 160000 ] \
+  && pass "(29b) PRECONDITION: the LANDING entry for \`sub2\` is a GITLINK whose commit is present locally" \
+  || fail "(29b) the landing entry is not a gitlink — the fixture does not reach the skip"
+[ "$(verdict_with "$D29b" "$TMP/fn.sh" "$REV29B" "$CUR29B" "$B2_29B")" = 0 ] \
+  && pass "(29b) a base-only submodule pointer bump is CARRIED (also a measured FALSE REFUSAL before the OID skip)" \
+  || fail "(29b) an honest base-only submodule bump was REFUSED — the OID skip regressed"
+
+# THE MUTATION THAT MAKES THE SUITE ABLE TO SEE THE SKIP AT ALL: delete it and both fixtures must
+# redden. Without this, the block that exists for these two classes can be deleted in silence.
+M29="$TMP/mut-noskip.sh"
+if python3 - "$TMP/fn.sh" "$M29" <<'PYSKIP'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+block = """    if landing_oid is not None and (oid(tip_spec) == landing_oid
+                                    or oid(rev_spec) == landing_oid):
+        continue
+"""
+if src.count(block) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(block, ""))
+PYSKIP
+then
+  bash -n "$M29" 2>/dev/null || fail "mutation NOSKIP produced an unparseable function"
+  [ "$(verdict_with "$D29a" "$M29" "$REV29A" "$CUR29A" "$B2_29A")" = 1 ] \
+    && pass "mutation NOSKIP is caught: without the OID skip the file->directory fixture REFUSES, so the skip IS load-bearing" \
+    || fail "mutation NOSKIP is NOT caught: the file->directory fixture still CARRIES without the skip (the fixture is vacuous)"
+  [ "$(verdict_with "$D29b" "$M29" "$REV29B" "$CUR29B" "$B2_29B")" = 1 ] \
+    && pass "mutation NOSKIP is caught on the gitlink fixture too: without the skip it REFUSES" \
+    || fail "mutation NOSKIP is NOT caught on the gitlink fixture"
+else
+  fail "mutation NOSKIP could not be built — the OID-skip block was not found verbatim in the function"
+fi
+
+
+MIN_ASSERTIONS=132
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
