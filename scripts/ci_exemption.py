@@ -198,6 +198,28 @@ def _failed_candidate(line: str, *, recover_nodeid: bool = True) -> str | None:
     if fields[0] in _FAILED_FIELDS:
         if len(fields) == 1:
             return ""
+        # ⛔ A PROGRESS FRAGMENT IS NOT A FAILURE RECORD (#6917). A run log
+        # ECHOES pytest's progress output, and a leading `FAILED` can land in
+        # front of a bare percentage — `FAILED [  2%]`. That payload is not a
+        # malformed id: there is no id on the line AT ALL, it is progress output.
+        # Counting it as a DROP marks the whole set CLIPPED, and a CLIPPED set is
+        # NOT COMPARABLE to a measured zero (#1319) — so the PR cannot be
+        # certified however green it is, and every re-run RETRACTS the evidence
+        # and fails the same way. Measured on tortoise #6917: a PR with `PR=0`
+        # failing tests was refused, permanently, by `PR=2 | main=0` drops whose
+        # only named token was `[  2%]`.
+        #
+        # ⚠️ THIS TEST MUST RUN BEFORE `_SUMMARY_RE`. That pattern matches ANY
+        # `FAILED <payload>` (its nodeid group is `.+?`), so it accepts
+        # `[  2%]` as a nodeid and returns it — the check placed after it was
+        # unreachable, which is how the first attempt at this fix did nothing
+        # while looking correct.
+        #
+        # The test is deliberately NARROW — the ENTIRE payload must be a
+        # bracketed percentage, so a genuine malformed record still DROPS and
+        # still fails closed. This only stops a progress bar being read as one.
+        if _PROGRESS_FRAGMENT_RE.match(" ".join(fields[1:])):
+            return None
         match = _SUMMARY_RE.match(line.strip())
         if match:
             return match.group("nodeid").strip()
@@ -897,6 +919,11 @@ _SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<deta
 # unblocked id), which is why this path is deliberately the permissive one.
 _NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
 
+# A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the
+# percentage pytest's progress line prints, and it is NOT an id of any kind.
+# Used to keep a progress bar from being read as a failure RECORD (#6917).
+_PROGRESS_FRAGMENT_RE = re.compile(r"^\[\s*\d{1,3}%\]$")
+
 # ── NON-NODEID failure identities (#6798) ────────────────────────────────
 # A failing run does not always name a `::nodeid`. Two measured shapes carry a
 # REAL failure and are not nodeids, so the shape check above drops them, the run
@@ -1519,6 +1546,15 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
             # `_collection_error_id` requires the `ERROR` keyword, which is the
             # only form pytest emits for a collection error.
             if _collection_error_id(stripped) is not None:
+                continue
+            # #6917: the SAME rule as `_failed_candidate`, in the SAME order — a
+            # pytest PROGRESS fragment is not a record, so it is not a drop here
+            # either. The module's header promises ONE candidate rule across both
+            # doors; `_SUMMARY_RE`'s nodeid group is `.+?` and accepts `[  2%]`,
+            # so without this the sibling door reported `rejected=1` for a line
+            # the `ids` door had already declined to count — the exact asymmetry
+            # the collection-error intercept above exists to avoid.
+            if _PROGRESS_FRAGMENT_RE.match(nodeid):
                 continue
             rejected.append(stripped)
             continue
