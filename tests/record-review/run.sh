@@ -1374,10 +1374,13 @@ if src.count(frag) != 1:
     sys.exit(1)
 open(sys.argv[2], "w", encoding="utf-8").write(src.replace(frag, "-c core.quotePath=false"))
 PY
-bash -n "$M25" 2>/dev/null || pass "NOTE (seam): mutation NOREL is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
-[ "$(subdir_verdict "$M25")" = 0 ] \
-  && pass "mutation NOREL is caught: without \`-c diff.relative=false\` this exact head CARRYs the union leak from a subdirectory — so that flag is load-bearing" \
-  || pass "NOTE (seam): mutation NOREL is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+if bash -n "$M25" 2>/dev/null; then
+  [ "$(subdir_verdict "$M25")" = 0 ] \
+    && pass "mutation NOREL is caught: without \`-c diff.relative=false\` this exact head CARRYs the union leak from a subdirectory — so that flag is load-bearing" \
+    || pass "NOTE (seam): mutation NOREL is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+else
+  pass "NOTE (seam): mutation NOREL is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+fi
 
 # ── 24. The KNOWN-LINE set must separate the two blobs: with no separator, a blob whose last line
 # is unterminated CONCATENATES with the next blob's first line, so a line that genuinely is in the
@@ -1758,7 +1761,15 @@ else
 fi
 
 
-MIN_ASSERTIONS=138
+# 138 -> 137 (round 36, PR #1554). Section 25's retired-mutant tail printed the SAME "RETIRED"
+# note from TWO places — a bare `bash -n "$M25" || pass NOTE` and then the `[ ... ] || pass NOTE`
+# verdict — so a mutant that was never built (the python fragment no longer matches, so $M25 does
+# not exist) scored the note TWICE, sourced a missing file on EVERY run (a hard shell error on
+# stderr that no assertion could see), and still reported the section green. That is the round-35
+# defect class. The tail now mirrors section 24's single `if bash -n …; then … else … fi`, which
+# emits the note exactly once and never sources an unbuilt mutant. One duplicate assertion retired
+# with it, so this pin is EXACT: 137, not a floor.
+MIN_ASSERTIONS=137
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
