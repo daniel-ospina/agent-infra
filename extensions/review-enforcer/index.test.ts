@@ -56,6 +56,7 @@ import {
   _setRunGhOverride,
   BLOCK_MESSAGE,
   MICRO_BLOCK_MESSAGE,
+  auditCommand,
   TIER_RULE,
   default as reviewEnforcerFactory,
   resolveGhShimDir,
@@ -1965,6 +1966,15 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
         equal(microBlockAudits[0].reason, "no_reviewers_dispatch", "micro gate_block audit pins reason no_reviewers_dispatch");
         equal(microBlockAudits[0].tier, "micro", "micro gate_block audit carries tier micro (TIER_RULE vocabulary)");
         equal(microBlockAudits[0].extension, "review-enforcer", "micro gate_block audit carries the extension name");
+        // #1492: the entry must name the REFUSED COMMAND, not just the reason. Without it a
+        // false block cannot be reconstructed from the audit — the reporter had to rediscover
+        // which command tripped the gate by hand across several turns. End-to-end here:
+        // the audit line must carry the very command this cell fired.
+        equal(
+          microBlockAudits[0].command,
+          "git commit -m x",
+          "#1492: the gate_block audit records WHICH command was refused (field was absent before)"
+        );
         // Complement cell: micro marker + ≥1 dispatch → ALLOWED (the #485
         // uniform policy is ≥1-dispatch, not "micro always blocks"). The
         // dispatch-count early return must precede the marker read — a reorder
@@ -3444,6 +3454,28 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   ok(!hasAdminMergeFlag("gh pr merge 123 --no-admin"), "`--no-admin` is not the flag");
 });
 
+test("#1492: a block is a NO-OP — the refused command is recorded, and the message says nothing ran", () => {
+  // The field #1492 asks for: `gate_block` carried reason + tier, never WHICH command was
+  // refused, so a false block could not be reconstructed from the audit and had to be
+  // rediscovered by A/B by hand (four rounds, several turns).
+  const short = 'gh pr list --json number | sort';
+  equal(auditCommand(short), short, "a normal command is recorded verbatim");
+  const long = "x".repeat(2500);
+  const bounded = auditCommand(long);
+  ok(bounded.length < long.length, "a pathological command is bounded, not logged whole");
+  ok(bounded.startsWith("x".repeat(100)), "the HEAD is kept (it names the operation)");
+  ok(/truncated, 2500 chars/.test(bounded), "truncation is STATED, never silent");
+  equal(auditCommand("abc", 3), "abc", "the boundary is inclusive");
+  ok(auditCommand("abcd", 3).includes("truncated"), "one char over the bound truncates");
+  // The abort is the documented harm (a bundled child launch that silently never started),
+  // so both remediation messages must say the command did not run — the agent cannot be
+  // left to infer it.
+  for (const [name, msg] of [["BLOCK_MESSAGE", BLOCK_MESSAGE], ["MICRO_BLOCK_MESSAGE", MICRO_BLOCK_MESSAGE]] as const) {
+    ok(/NOTHING IN THE BLOCKED COMMAND RAN/.test(msg), `${name} states the call was a no-op (#1492)`);
+    ok(/DID NOT HAPPEN/.test(msg), `${name} names the dropped-launch hazard (#1492)`);
+  }
+});
+
 test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs", () => {
   // Cycle-4 review P2: the `$VAR`-supplied-flag BRANCH could be deleted with the
   // suite still green, because the only class-6 case in the table (`V=--admin; gh
@@ -3460,55 +3492,6 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
   ok(!isAdminMergeCommand('gh pr merge 999 -F "$tmpfile"'), "a dynamic --body-file is NOT the flag");
   ok(!isAdminMergeCommand('cd "$HOME/wt" && gh pr merge 7'), "a `$` BEFORE the merge word is not the flag");
   ok(!isAdminMergeCommand("gh pr view $X"), "a non-merge gh call with a `$VAR` is NOT gated");
-});
-
-test("#1492: the merge question is asked per SEGMENT — an unrelated stage cannot grade a read-only command", () => {
-  // The reproduction (#1155 class, minimal): the two characters `$` + `'` used as a
-  // TAB separator in an unrelated pipeline stage. Nothing here merges, writes, or
-  // mentions admin. Before the fix this was refused as an unevidenced admin merge.
-  const listing =
-    "gh pr list --state open --limit 2 --json number,mergeStateStatus | sort -t$'\\t' -k2";
-  ok(!isAdminMergeCommand(listing), "another stage's ANSI-C quoting is NOT an admin merge (#1492)");
-  ok(!isGhPrMergeCommand(listing), "…nor a `gh pr merge` (#1492)");
-  ok(!isGitOp(listing), "…so the read-only listing is not gate-relevant at all (#1492)");
-  // The `$` that merely ENDS a quoted argument (#1425 round 4) — in another stage.
-  ok(!isGitOp('gh label list --repo o/r --json name | grep -E "bug$"'), "a trailing `$` in another stage");
-  ok(!isGitOp("gh issue list --limit 5 --json title | awk '{print $2}'"), "a brace/$ stage that could not hide a verb");
-  // NOT a blanket allow: the whole-command predicate is unchanged where it belongs.
-  ok(isGhPrMergeCommand("gh pr m$'erge' 999"), "a spliced verb in the gh segment is still a merge");
-  // SAFETY PINS — every spelling that HIDES the flag still reaches the admin gate.
-  // If co-location were the wrong cut, one of these would go red (that is the test).
-  const hidden = [
-    "gh pr merge 999 $'--admin'",
-    "gh p$'r' merge 999 $'--admin'",
-    "$'gh' p$'r' m$'erge' 999 $'\\x2d\\x2d\\x61dmin'",
-    "bash -c \"gh pr merge 999 $'\\x2d\\x2d\\x61dmin'\"",
-    "V=$'\\x2d\\x2d\\x61dmin'; gh pr merge 999 $V",
-    "V=pr; gh $V merge 999 --admin=true",
-    "gh pr merge 999 -${V:--}admin=true",
-    "D=--admin; gh pr merge 999 $D",
-    // Adversarial cycle 1 — the CONTINUATION family. bash deletes a backslash-newline
-    // before tokenizing, so these are ONE command whose verb is spliced across the
-    // continuation. Treating it as a segment boundary was a real FAIL-OPEN (this lane's
-    // own change, caught by the cycle-1 reviewer): both predicates returned false and no
-    // gate ran, where the shipped code had blocked. Pin all four forms.
-    "G=erge; gh pr m\\\n$G 999 --admin",
-    "G=erge; gh pr m\\\r\n$G 999 --admin",
-    "gh pr \\\n$(printf '\\x6d\\x65\\x72\\x67\\x65') 999 --admin",
-    "gh \\\n$(printf '\\x70\\x72') merge 999 --admin",
-    // Adversarial cycle 2 — the SPLICED-NAME family. bash re-joins the quoted/escaped
-    // pieces of the command name into `gh`; the word test must read the NORMALIZED text,
-    // or co-location is unobservable and no gate runs (a real fail-open, this lane's own
-    // change). Each form below was confirmed to run `gh pr merge 999 --admin` at bash.
-    "g\"h\" p$'r' merge 999 --admin",
-    "g'h' p$'r' merge 999 --admin",
-    "g\\h p$'r' merge 999 --admin",
-    "g\"\"h p$'r' merge 999 --admin",
-    "g'h' p$'r' m$'erge' 999 $'--admin'",
-  ];
-  for (const c of hidden) {
-    ok(isAdminMergeCommand(c), `a HIDDEN flag is still an admin merge: ${JSON.stringify(c)}`);
-  }
 });
 
 test("countMergeVerbs: a compound command must fail closed", () => {

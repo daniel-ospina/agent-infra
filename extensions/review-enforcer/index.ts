@@ -279,86 +279,6 @@ function hasUnresolvableConstruct(command: string): boolean {
 }
 
 /**
- * Does an unresolvable construct share a TOP-LEVEL COMMAND SEGMENT with `wordRe`?
- *
- * This is a RELEVANCE question — *could this segment be the merge?* — not a detector
- * question. A shell runs a `;`/`&&`/`||`/`|`/newline-separated list as separate
- * commands, so a construct that lives in one segment cannot be part of the token
- * stream of another. Testing the WHOLE command instead let an unrelated stage's
- * construct grade an innocent one: the `$'\t'` field separator in
- * `gh pr list … | sort -t$'\t'` made a read-only listing an *admin merge*
- * (`isAdminMergeCommand` returned true) — and, via the same widening in
- * `isGhPrMergeCommand`, made the whole command `isGitOp`.
- *
- * SAFETY: co-location is not a narrowing of a fail-closed detector; it is asking the
- * merge question where the merge question is actually asked (agent-infra #1425 names
- * exactly this site as the remedy, and its `OVERRIDES:` marker forbids touching the
- * `$'`-detection itself). A flag that this scanner cannot see is hidden by a
- * `$`/backtick/brace IN the segment that runs `gh` — that is the only route by which
- * the token reaches gh. A construct in a DIFFERENT segment cannot supply it: the shell
- * evaluates that segment first, so the value reaches the merge segment as a `$VAR`
- * reference, and that reference is itself a construct in the merge segment. Hence a
- * real admin merge always has a construct co-located with its `gh` word.
- *
- * THIS HOLDS ONLY IF THE SEGMENT BOUNDARIES ARE BASH'S. Where this helper's text model
- * differs from the shell's, a construct can be separated from its `gh` word and the
- * safety argument does not apply — so every divergence found is a DEFECT to fix here,
- * not a residual to tolerate. Two are closed below: backslash-newline continuations
- * (bash deletes them; a real fail-open, adversarial cycle 1) and backslash-escaped
- * separators (literal to the shell).
- */
-function constructSharesSegment(command: string, wordRe: RegExp): boolean {
-  return splitTopLevelSegments(command).some(
-    (segment) =>
-      hasUnresolvableConstruct(segment) &&
-      // The word test runs on the NORMALIZED segment, exactly as the whole-command test
-      // it replaces ran on `normalizeForFlagScan(bare)` — bash re-joins `g"h"`, `g'h'`,
-      // `g\h` and `g""h` into `gh`, so a raw-text test matches none of them and leaves
-      // co-location unobservable (a measured FAIL-OPEN; adversarial cycle 2, #1492).
-      // The CONSTRUCT test stays on the raw segment: that is where the `$`/backtick/brace
-      // actually is, and normalization would strip the quoting that makes it visible.
-      wordRe.test(normalizeForFlagScan(segment))
-  );
-}
-
-/**
- * The top-level command segments of `command`, as a shell would run them.
- *
- * Two divergences from a naive `split(/[;|&\n]/)` are load-bearing, and both were
- * found by measurement rather than reasoning — a mis-split can only ever SEPARATE a
- * construct from the `gh` word it completes, which is the fail-open direction:
- *
- *   1. A backslash-newline is deleted by the shell BEFORE it tokenizes, so it is not a
- *      boundary. `scanTokens` and `normalizeForFlagScan` already remove it; this must
- *      share that model. (Not doing so was a real fail-open — see the docstring above.)
- *   2. A backslash-escaped separator is LITERAL to the shell. `unquotedMask` leaves the
- *      escaped character marked TRUE (it is outside any quote), so the escape has to be
- *      honoured explicitly here.
- *
- * A separator inside a quoted region is not a boundary either, which is what the mask
- * gives us for free. The tail is ALWAYS flushed, so a trailing escape cannot swallow the
- * last segment.
- */
-function splitTopLevelSegments(command: string): string[] {
-  const joined = command.replace(/\\\r?\n/g, "");
-  const mask = unquotedMask(joined);
-  const segments: string[] = [];
-  let start = 0;
-  for (let i = 0; i < joined.length; i++) {
-    if (mask[i] && joined[i] === "\\") {
-      i++; // the escaped character is literal, never a separator
-      continue;
-    }
-    if (mask[i] && /[;&|\n]/.test(joined[i])) {
-      segments.push(joined.slice(start, i));
-      start = i + 1;
-    }
-  }
-  segments.push(joined.slice(start));
-  return segments;
-}
-
-/**
  * Is this a `gh pr merge` command?
  *
  * Two ways to answer yes, and both are needed:
@@ -426,15 +346,7 @@ export function isGhPrMergeCommand(command: string): boolean {
   // `gh` + `pr` under a construct is enough to treat the text as a merge too.
   // That is still narrow: the caller also requires an admin flag, so a
   // `gh pr comment --body "$(…)"` is not gate-relevant.
-  //
-  // #1492: `hasGh`/`hasPr` are whole-COMMAND tests, so an unrelated stage's
-  // construct used to make a read-only listing gate-relevant — `gh pr list … |
-  // sort -t$'\t'` was `isGitOp` and then blocked by the dispatch-count gate. The
-  // construct must now be in the SAME segment as the `gh` word it could hide a
-  // verb inside; see `constructSharesSegment` for why that cannot lose a real
-  // merge. `(hasPr && hasMerge)` is left whole-command: it already needs BOTH
-  // verb words, so a single stray `merge` argument cannot trip it.
-  return (hasPr && hasMerge) || (hasGh && hasPr && constructSharesSegment(bare, /(^|\W)gh\b/));
+  return (hasPr && hasMerge) || (hasGh && hasPr);
 }
 
 const GH_PR_PATTERN = /(^|[\s;&|(){!])gh\s+pr\s+(create|merge)(?=\s|$)/;
@@ -701,13 +613,8 @@ export function isAdminMergeCommand(command: string): boolean {
     // Unreadable AND possibly a merge: a `gh` word, or both `pr` and `merge`.
     // This is what catches `gh p$'r' merge …`, `$'gh' pr merge …`, `g$'h' pr
     // merge …` WITHOUT the word list that rounds 6-8 kept re-finding a seam in.
-    //
-    // #1492 / #1425: `gh` was matched against the WHOLE command, so a construct in
-    // any OTHER stage made an innocent one a merge — the `$'\t'` in
-    // `gh pr list … | sort -t$'\t'` was refused as an unevidenced admin merge. The
-    // words must now share a segment with the construct (see `constructSharesSegment`).
     return (
-      constructSharesSegment(bare, /(^|[^\w])gh\b/) ||
+      /(^|[^\w])gh\b/.test(probe) ||
       (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
     );
   }
@@ -2219,11 +2126,35 @@ function _adminMergeOverride(): boolean {
 const BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation.",
+  "   → NOTHING IN THE BLOCKED COMMAND RAN. A blocked tool call is a no-op: if it bundled a",
+  "     sub-agent launch alongside the git op, the launch DID NOT HAPPEN (#1492). Verify the",
+  "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
+
+/**
+ * The command a block REFUSED, bounded, for the durable audit trail (#1492).
+ *
+ * The #516 entry records `gate_block` + `reason` + `tier` — enough to COUNT blocks,
+ * and not enough to tell WHICH command was blocked, or whether it contained a git
+ * operation at all. On a gate whose reported failure mode is "blocked something that
+ * was never a git op", that is the single field that settles it, and the neighbouring
+ * hub-state gate already carries a `command` field in the same stream, so the shape is
+ * established. Without it a false block cost an A/B hunt across several turns, because
+ * the report could not be reconstructed from the audit and had to be rediscovered by
+ * hand (#1492).
+ *
+ * Bounded so one pathological command cannot grow the log without limit: the head is
+ * kept (it names the operation) and the truncation is stated rather than silent.
+ */
+export function auditCommand(command: string, limit = 2000): string {
+  return command.length <= limit
+    ? command
+    : `${command.slice(0, limit)}… [truncated, ${command.length} chars]`;
+}
 
 // #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static
 // shape skip (#472) removed the backstop that made that leniency safe (a
@@ -2235,6 +2166,9 @@ export { BLOCK_MESSAGE };
 export const MICRO_BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation (micro tier).",
+  "   → NOTHING IN THE BLOCKED COMMAND RAN. A blocked tool call is a no-op: if it bundled a",
+  "     sub-agent launch alongside the git op, the launch DID NOT HAPPEN (#1492). Verify the",
+  "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Micro skips the multi-agent code-review GATE (commit-workflow 03-code-review.md) — the review-enforcer ≥1-dispatch rule still applies (#485).",
   "   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch that names the diff and returns a verdict on it — a one-line verdict is enough. The floor counts the dispatch; the dispatch is expected to be a real review that returns a verdict, not a sign-off:",
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
@@ -2398,6 +2332,7 @@ export default function (pi: ExtensionAPI) {
           logGateEvent("merge_gate_block", {
             pr: adminPr,
             reason: "admin_merge_no_evidence",
+            command: auditCommand(command), // #1492: the refused command, not just the reason
           });
           return { block: true, reason: adminResult.reason };
         }
@@ -2525,12 +2460,20 @@ export default function (pi: ExtensionAPI) {
       // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
       if (tier === "micro") {
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
-        logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: "micro" }); // #516: durable audit
+        logGateEvent("gate_block", {
+          reason: "no_reviewers_dispatch",
+          tier: "micro",
+          command: auditCommand(command), // #1492: the refused command, not just the reason
+        }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
 
       console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
-      logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: tier === "" ? "unlabeled" : tier }); // #516: durable audit
+      logGateEvent("gate_block", {
+        reason: "no_reviewers_dispatch",
+        tier: tier === "" ? "unlabeled" : tier,
+        command: auditCommand(command), // #1492: the refused command, not just the reason
+      }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
     });
 
